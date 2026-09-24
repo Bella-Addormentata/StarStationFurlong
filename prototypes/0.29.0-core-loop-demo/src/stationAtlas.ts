@@ -35,6 +35,7 @@ import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
 import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
+import { halfAlongWall } from './doorMatch';
 
 export interface AtlasDoor {
   /** The far room's SEED LINK (from the door record) — also the click-to-
@@ -69,11 +70,46 @@ export interface AtlasEntry {
   dims?: { cols: number; rows: number };
   /** Keyed by DOOR ID — cardinal or free `d:`. */
   doors: Record<string, AtlasDoor>;
+  /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
+   *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
+   *  ranking that decides what the player KEEPS or SEES must not read it:
+   *  sorting a capped list by this hands a peer control of which of your own
+   *  rooms survive the cap or reach the screen (#144). Use
+   *  `compareAtlasRecency` for every such ordering. */
   lastSeen: number;
+  /** LOCAL recency — when THIS install last had first-hand contact with the
+   *  room (a visit, or first learning of it). No peer can set it, which is what
+   *  makes it safe for eviction ordering. Optional: entries persisted before
+   *  this field existed fall back to `lastSeen` in writeAtlas. */
+  localSeenAt?: number;
+  /** 🛰️ Set by seedAtlasDefaults: this entry's geometry came from the build's
+   *  bundled default station, not from anything this install observed. It is
+   *  what pushAtlasToDoc refuses to publish. Dropped the moment a harvest or a
+   *  gossip pull rebuilds the entry — both construct it afresh. */
+  bundled?: true;
 }
 
 const KEY = 'ssf-station-atlas';
-const MAX_ENTRIES = 64;
+export const MAX_ENTRIES = 64;
+/** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
+ *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
+ *  peer-written object that isSharedAtlasEntry does not size-check, and every
+ *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
+ *  scan), so without this one entry could carry an arbitrarily large set. */
+export const MAX_DOORS_PER_ENTRY = 64;
+/** Raw `doors` keys a shared entry may carry before the whole entry is refused
+ *  at ingest. An honest publisher never exceeds MAX_DOORS_PER_ENTRY (it pushes
+ *  what readAllDoors read); the slack tolerates junk keys among real ones
+ *  without letting one entry make every pull walk an unbounded object
+ *  (review, round 3 — the kept-count cap alone still scanned it all). */
+const MAX_RAW_DOORS_PER_ENTRY = 4 * MAX_DOORS_PER_ENTRY;
+
+/** 🕒 How far ahead of OUR clock a peer's gossip stamp may sit before the whole
+ *  shared entry is refused (#144). The comparison is against the reader's own
+ *  clock and a browser mesh has no NTP guarantee, so this must cover honest
+ *  skew — but whatever slack it allows is the head start an attacker keeps.
+ *  Matches the venture-record bound in ventures.ts (#143). */
+const MAX_GOSSIP_SKEW_MS = 6 * 60 * 60 * 1000;
 
 export function roomIdFromSeed(seed: string): string {
   // REAL pass format (decodeBootstrapSeed): base64(JSON{ roomId, wtUrl, … }),
@@ -106,13 +142,89 @@ export function readAtlas(): Record<string, AtlasEntry> {
     const raw = localStorage.getItem(KEY);
     if (!raw) return {};
     const obj = JSON.parse(raw);
-    return typeof obj === 'object' && obj !== null ? obj as Record<string, AtlasEntry> : {};
+    if (typeof obj !== 'object' || obj === null) return {};
+    const atlas = obj as Record<string, AtlasEntry>;
+    // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
+    // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
+    // — and it does not just sit there: pushAtlasToDoc republishes it as
+    // `updatedAt` (`Math.max(entry.lastSeen, known.updatedAt + 1)`), so a
+    // legacy far-future value would be broadcast into every room doc we join,
+    // where the new validator then REFUSES the entry — leaving that room
+    // unmergeable for everyone until the poison is cleared at its source.
+    // Zeroing it is the self-heal: the entry survives, and the next honest
+    // gossip outranks it (`prior.lastSeen >= value.updatedAt` no longer holds).
+    // The repair must be PERSISTED, not just applied to the value we return.
+    // The ceiling moves with the clock, so an in-memory-only fix is temporary:
+    // a stamp seven hours ahead reads as 0 now and, an hour later, is back
+    // under the ceiling and returns unrepaired — ready to be republished.
+    const ceiling = Date.now() + MAX_GOSSIP_SKEW_MS;
+    let repaired = false;
+    for (const e of Object.values(atlas)) {
+      if (typeof e?.lastSeen === 'number' && e.lastSeen > ceiling) { e.lastSeen = 0; repaired = true; }
+      if (typeof e?.localSeenAt === 'number' && e.localSeenAt > ceiling) { e.localSeenAt = 0; repaired = true; }
+      // 🚪 An oversized door set persisted by a build before the ingest cap
+      // (MAX_DOORS_PER_ENTRY) would otherwise stay oversized forever: the
+      // pull's `prior` guard can skip the entry, and writeAtlas caps rooms,
+      // not doors (review, round 2). Truncate in entry order and PERSIST, the
+      // same way as the stamp repair — every consumer walks this set.
+      if (e && typeof e.doors === 'object' && e.doors !== null) {
+        const ids = Object.keys(e.doors);
+        if (ids.length > MAX_DOORS_PER_ENTRY) {
+          for (const id of ids.slice(MAX_DOORS_PER_ENTRY)) delete e.doors[id];
+          repaired = true;
+        }
+      }
+    }
+    if (repaired) writeAtlas(atlas);
+    return atlas;
   } catch { return {}; }
+}
+
+/**
+ * 🗄️ The ONE ordering for any capped or truncated view of the atlas — the
+ * eviction sort, and every UI that slices a "most recent" list.
+ *
+ * Two tiers, and never the gossip stamp:
+ *   1. FIRST-HAND — rooms we visited, or whose seed we were handed. They carry
+ *      `localSeenAt`, which only this install ever writes.
+ *   2. GOSSIP-ONLY — learned from a peer's shared atlas. No local stamp, so
+ *      they rank below any first-hand room however fresh a peer claims to be.
+ *
+ * Sorting such a list by `lastSeen` instead hands a peer the decision (#144),
+ * whether the cap is localStorage retention (64) or a picker's slice (24). A
+ * single join absorbs a whole station's atlas, so that is not a rare edge.
+ *
+ * Legacy entries predate `localSeenAt` and land in tier 2, ordered among
+ * themselves by `lastSeen` — an upgrade loses the distinction for old entries
+ * rather than mis-ranking them.
+ */
+export function compareAtlasRecency(a: AtlasEntry, b: AtlasEntry): number {
+  const rank = (e: AtlasEntry): [number, number] =>
+    e.localSeenAt === undefined ? [0, e.lastSeen] : [1, e.localSeenAt];
+  const [at, ar] = rank(a);
+  const [bt, br] = rank(b);
+  return bt !== at ? bt - at : br - ar;
 }
 
 function writeAtlas(atlas: Record<string, AtlasEntry>): void {
   try {
-    const entries = Object.values(atlas).sort((a, b) => b.lastSeen - a.lastSeen).slice(0, MAX_ENTRIES);
+    // 🗄️ Evict in two tiers, and never on the gossip stamp. `lastSeen` is
+    // derived from a peer's `updatedAt`, so ordering retention by it let a peer
+    // float its own entries to the top of a 64-deep list and push out rooms the
+    // player actually walked through (#144).
+    //
+    // Tier 1 — FIRST-HAND: rooms we visited, or whose seed we were handed.
+    // They carry `localSeenAt`, which only this install ever writes.
+    // Tier 2 — GOSSIP-ONLY: learned from a peer's shared atlas. No local stamp,
+    // so they are evicted before any visited room regardless of how fresh a
+    // peer claims they are. A single join absorbs a whole station's atlas, so
+    // without this tiering one hop into a busy station could evict the player's
+    // own history.
+    //
+    // Legacy entries written before the field existed have no stamp and so land
+    // in tier 2, ordered among themselves by `lastSeen` — an upgrade loses the
+    // visited/gossip distinction for old entries rather than mis-ranking them.
+    const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
     for (const e of entries) out[e.roomId] = e;
     localStorage.setItem(KEY, JSON.stringify(out));
@@ -155,6 +267,8 @@ export function harvestIntoAtlas(entry: {
     dims: entry.dims ?? prior?.dims,
     doors,
     lastSeen: Date.now(),
+    // We are standing in it — the strongest possible local recency signal.
+    localSeenAt: Date.now(),
   };
   // Stub entries for neighbors we now know exist (their seed reaches them —
   // clicking them from space can connect even before we ever visit).
@@ -166,12 +280,29 @@ export function harvestIntoAtlas(entry: {
       seed: d.targetSeed,
       doors: {},
       lastSeen: Date.now(),
+      // NO local stamp. These targets come from `readAllDoors()`, whose room-doc
+      // map is explicitly untrusted ("any value READ is untrusted — a peer could
+      // write junk", doorsDoc.ts:16-17) and accepts up to MAX_PAIRINGS = 64
+      // pairings — exactly MAX_ENTRIES. Stamping them first-hand would let one
+      // peer write 64 fake pairings, have us mint 64 tier-1 stubs on join, and
+      // evict every room we had actually visited: the precise attack this
+      // tiering exists to stop. A door we can see is still only a peer's claim
+      // that it leads somewhere, so the stub stays gossip-tier until we go.
     };
   }
   writeAtlas(atlas);
 }
 
-/** Record a reach-this-room seed learned elsewhere (ledger mints, passes). */
+/**
+ * Record a reach-this-room seed learned elsewhere (ledger mints, passes).
+ *
+ * ⚠️ NO PRODUCTION CALLERS as of this commit — it predates #144 and the seed
+ * paths (`addPass`, ledger mints) never wired up to it. So although a handed
+ * seed *would* count as first-hand below, in practice `harvestIntoAtlas` is
+ * the only thing that mints `localSeenAt` today: standing in a room is what
+ * earns tier 1. Left as-is rather than wired here, which would be a behaviour
+ * change beyond the retention fix.
+ */
 export function noteRoomSeed(roomId: string, name: string, seed: string): void {
   if (!roomId || !seed) return;
   const atlas = readAtlas();
@@ -182,8 +313,93 @@ export function noteRoomSeed(roomId: string, name: string, seed: string): void {
     seed,
     doors: prior?.doors ?? {},
     lastSeen: prior?.lastSeen ?? Date.now(),
+    // A seed we were handed is first-hand knowledge, but it says nothing new
+    // about a room we already knew — so keep the prior recency when there is
+    // one and only stamp on first learn.
+    localSeenAt: prior?.localSeenAt ?? Date.now(),
   };
   writeAtlas(atlas);
+}
+
+/**
+ * 🛰️ A build-time atlas entry — the shape defaultStation.atlas.json ships
+ * (see defaultStation.ts). Geometry, names and the connection graph only: the
+ * ONE seed a bundle may carry is the welcome room's own link, attached by
+ * defaultStation.ts from its single link constant, never read from the file.
+ */
+export interface BundledAtlasEntry {
+  roomId: string;
+  name: string;
+  dims?: { cols: number; rows: number };
+  /** A reach-this-room link — the welcome room only (defaultStation.ts). */
+  seed?: string;
+  doors: Record<string, {
+    targetRoomId: string;
+    segments?: ConnectorSegment[];
+    farDoor?: string;
+    farWall?: DoorWall;
+    farLateral?: number;
+    farYawDeg?: 0 | 45;
+    wall?: DoorWall;
+    lateral?: number;
+  }>;
+}
+
+/**
+ * 🛰️ Merge a build's bundled station into the local atlas — at GOSSIP tier,
+ * below everything this install learned itself. Called once per boot, so a
+ * brand-new install renders the default station from space before the welcome
+ * room's doc has synced (defaultStation.ts). Who outranks whom:
+ *   · an entry with ANY first-hand recency (`localSeenAt`) or any door
+ *     geometry is left exactly as it is — the bundle only fills rooms we know
+ *     nothing about and neighbour stubs (a name, no doors, no size);
+ *   · a filled entry keeps whatever gossip stamp it had, else `lastSeen: 0`,
+ *     and never gains a local stamp — so the first honest gossip about it wins
+ *     the pull's `prior.lastSeen >= updatedAt` check and it evicts before any
+ *     visited room — and it is flagged `bundled`, which is what keeps
+ *     pushAtlasToDoc from ever publishing it as something we observed.
+ * Returns the number of entries written.
+ */
+export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
+  const atlas = readAtlas();
+  let written = 0;
+  for (const b of bundle) {
+    if (!b.roomId) continue;
+    const prior = atlas[b.roomId];
+    if (prior && (prior.localSeenAt !== undefined || Object.keys(prior.doors).length > 0)) continue;
+    const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
+    for (const [d, door] of Object.entries(b.doors)) {
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
+      if (!door || !door.targetRoomId) continue;
+      doors[d] = {
+        targetSeed: '',
+        targetRoomId: door.targetRoomId,
+        segments: door.segments,
+        farDoor: door.farDoor,
+        farWall: door.farWall,
+        farLateral: door.farLateral,
+        farYawDeg: door.farYawDeg,
+        wall: door.wall,
+        lateral: door.lateral,
+      };
+      kept++;
+    }
+    atlas[b.roomId] = {
+      roomId: b.roomId,
+      // A stub's placeholder name yields to the bundle's; a real one stays.
+      name: prior?.name && prior.name !== 'Module' ? prior.name : (b.name || 'Module'),
+      seed: prior?.seed || b.seed,
+      dims: prior?.dims ?? b.dims,
+      doors,
+      lastSeen: prior?.lastSeen ?? 0,
+      // Deliberately no localSeenAt: bundled knowledge is second-hand.
+      bundled: true,
+    };
+    written++;
+  }
+  if (written) writeAtlas(atlas);
+  return written;
 }
 
 export interface AtlasPose {
@@ -245,9 +461,14 @@ export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
       // NEIGHBOUR room's door poses from its harvested wall+lateral — this
       // client's snapshot knows nothing about it. Old gossip without geometry
       // falls back to the live-pose path, which is the pre-redo behaviour.
+      // 🛑📐 The far module's half-extent along its door's wall normal when its
+      // size is known: the chain meets its TRUE face, so its centre sits that
+      // far beyond the chain's end (review, round 8). Unknown ⇒ the adapter's
+      // uniform default, as before.
+      const farHalf = farWall ? halfAlongWall(atlas[door.targetRoomId]?.dims, farWall) : undefined;
       const local = fromId !== currentRoomId && door.wall !== undefined
-        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral)
-        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral);
+        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral, farHalf)
+        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral, farHalf);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
@@ -396,7 +617,21 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
   return typeof e.roomId === 'string' && e.roomId.length > 0
     && typeof e.name === 'string'
     && typeof e.doors === 'object' && e.doors !== null
+    // Counted with early exit, not Object.keys: that allocates an array of
+    // every raw key before the comparison, so a huge peer object still cost
+    // O(n) on every notification (review, round 5).
+    && !ownKeysExceed(e.doors, MAX_RAW_DOORS_PER_ENTRY)
+    // 🕒 `updatedAt` is peer-written and drives merge arbitration (pullSharedAtlas
+    // skips on `prior.lastSeen >= value.updatedAt`). Unbounded, a planted
+    // far-future stamp wins every future comparison and — before the retention
+    // split below — pinned the top of the 64-deep eviction list too (#144).
+    // This is a real ingest boundary (the doc is not the store; pullSharedAtlas
+    // writes localStorage), so bounding here keeps the stored value stable
+    // rather than time-varying. Whatever slack is allowed is the head start an
+    // attacker keeps, hence hours rather than days.
     && typeof e.updatedAt === 'number'
+    && Number.isFinite(e.updatedAt)
+    && e.updatedAt <= Date.now() + MAX_GOSSIP_SKEW_MS
     && (e.seed === undefined || typeof e.seed === 'string')
     // 🛑📐 dims drives GEOMETRY straight into the exterior renderer, and this
     // value came off the wire from a peer. Bounded to the same envelope the
@@ -406,7 +641,18 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     && (e.dims === undefined || isSaneDims(e.dims));
 }
 
-function isSaneDims(d: unknown): d is { cols: number; rows: number } {
+/** True once `obj` has more than `limit` own keys — stops counting there, so
+ *  an oversized peer object is never enumerated past the bound. */
+function ownKeysExceed(obj: object, limit: number): boolean {
+  let n = 0;
+  for (const k in obj) {
+    if (!Object.prototype.hasOwnProperty.call(obj, k)) continue;
+    if (++n > limit) return true;
+  }
+  return false;
+}
+
+export function isSaneDims(d: unknown): d is { cols: number; rows: number } {
   if (typeof d !== 'object' || d === null) return false;
   const v = d as { cols?: unknown; rows?: unknown };
   const ok = (n: unknown) =>
@@ -456,11 +702,33 @@ function pullSharedAtlas(): void {
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
     const prior = atlas[rid];
+    // Compared against what the value NORMALIZES to — the count of VALID
+    // records, capped — never its raw key count: a stored 64 against a raw
+    // 100, or a stored 1 against 100 malformed keys plus one valid, would
+    // re-process the same entry on every notification (review, rounds 3–4).
+    // The raw object is bounded by isSharedAtlasEntry, so this pass is too.
+    let incoming = 0;
+    for (const door of Object.values(value.doors)) {
+      if (door && typeof door.targetRoomId === 'string' && door.targetRoomId) incoming++;
+      if (incoming >= MAX_DOORS_PER_ENTRY) break;
+    }
+    // 🛰️ A BUNDLED prior (seedAtlasDefaults) never wins this comparison: it is
+    // second-hand build data at `lastSeen: 0`, and 0 is a legitimate gossip
+    // stamp — the #144 repair republishes a corrected legacy entry at
+    // `updatedAt: 0`, which the `>=` below would otherwise let the bundle
+    // outrank when the door counts tie, leaving the flag stuck forever
+    // (review of #156, round 3). Any valid shared record replaces it.
     if (prior
+      && !prior.bundled
       && prior.lastSeen >= value.updatedAt
-      && Object.keys(prior.doors).length >= Object.keys(value.doors).length) continue;
+      && Object.keys(prior.doors).length >= incoming) continue;
     const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
     for (const [d, door] of Object.entries(value.doors)) {
+      // Bounded (MAX_DOORS_PER_ENTRY): a room cannot honestly have more
+      // pairings than doorsDoc reads back, so past the cap the rest is dropped,
+      // deterministically, in entry order.
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
       if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
       // 🧭 Wall/lateral drive GEOMETRY straight into the exterior renderer and
       // arrive from a peer — exact wall names and a finite lateral or they are
@@ -487,6 +755,7 @@ function pullSharedAtlas(): void {
           ? (door.lateral as number)
           : prior?.doors[d]?.lateral,
       };
+      kept++;
     }
     // ⚠️ This REBUILDS the entry rather than merging into it, so every field
     // must be named explicitly or it is destroyed. `dims` was not, which meant
@@ -500,6 +769,12 @@ function pullSharedAtlas(): void {
       dims: value.dims ?? prior?.dims,
       doors,
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
+      // Gossip is SECOND-hand and must never mint local recency: stamping it
+      // here would let one peer's station sweep outrank every room the player
+      // actually walked through (#144). Carry a prior stamp forward when we
+      // have one — that room was visited — and otherwise leave it absent, which
+      // is what marks this entry gossip-only for eviction.
+      localSeenAt: prior?.localSeenAt,
     };
     changed = true;
   }
@@ -520,6 +795,14 @@ export function pushAtlasToDoc(): void {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
       if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
+      // 🛰️ Never publish what this install never observed: an entry the
+      // build's bundled default station wrote (seedAtlasDefaults) would reach
+      // every room we join as if we had seen it. The room we are standing in
+      // included — until a harvest of its SYNCED replica rebuilds the entry,
+      // it is still second-hand. (A repaired legacy stamp is a different
+      // case: that entry WAS observed, and #144 republishes it at 0 so honest
+      // gossip outranks it.)
+      if (entry.bundled) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
       if (known && !isOwn
@@ -554,7 +837,38 @@ export function pushAtlasToDoc(): void {
         // re-push with the same second's stamp would lose the LWW tie against
         // the poisoned entry it is correcting (pull skips on >=); bumping past
         // the known stamp guarantees a content change always propagates.
-        updatedAt: known ? Math.max(entry.lastSeen, known.updatedAt + 1) : entry.lastSeen,
+        // 🕒 Clamped to the SAME ceiling the ingest guard enforces. The `+1`
+        // monotonic bump (F5) exists so a corrective re-push always outranks
+        // the record it corrects, but unclamped it can land one millisecond
+        // past the bound — and then our own isSharedAtlasEntry, and every peer
+        // on a similar clock, refuses the record we just wrote. A writer must
+        // never emit what its own reader rejects.
+        //
+        // ⚠️ Accepted degradation, stated precisely — an earlier version of
+        // this comment claimed it "self-resolves", which is wrong.
+        //
+        // When `known.updatedAt` is AT the ceiling, the clamp returns that same
+        // value, so the record we publish ties instead of out-ranking. A peer
+        // already holding the boundary-stamped entry then skips it
+        // (`prior.lastSeen >= value.updatedAt`, same door count) and our
+        // correction does not reach them. It is not lost: once our clock passes
+        // the stamp, `known.updatedAt + 1` fits under the ceiling again and the
+        // correction propagates — but only at the NEXT push, and pushes are
+        // event-driven (join, door change), never on a timer. Time passing
+        // alone changes nothing.
+        //
+        // Reaching this needs an existing record stamped a full 6h into our
+        // future, which an honest clock does not produce; it is the adversarial
+        // and badly-skewed edge. Publishing a record no peer can ingest would
+        // be worse, and the ceiling cannot be beaten from below — bounding the
+        // stamp, out-ranking an adversary sitting at the bound, and having
+        // peers accept the result are not simultaneously satisfiable. A
+        // scheduled retry at the moment the ceiling clears would close it; that
+        // is a timer this module does not currently own.
+        updatedAt: Math.min(
+          known ? Math.max(entry.lastSeen, known.updatedAt + 1) : entry.lastSeen,
+          Date.now() + MAX_GOSSIP_SKEW_MS,
+        ),
       };
       if (isOwn && entry.seed && ctx.isPassagePublic()) rec.seed = entry.seed;
       if (known

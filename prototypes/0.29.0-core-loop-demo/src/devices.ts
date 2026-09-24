@@ -30,11 +30,23 @@ import { FURNITURE, FURNITURE_DEFS, buildDeviceList, itemAabb } from './furnitur
 import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
-import type { DoorDockingPortSystem, DockingState } from './docking';
+import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
+// ⚓ #163: the helm's docking computer draws the ship atlas in room metres.
+import { roomHalfExtents } from './floorPlanDoc';
 import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
+import { readChainSyncStatus, readRoomBindingResult, treasuryDocBound } from './treasuryDoc';
+import { treasuryNetwork } from './treasuryNetwork';
+import {
+  type FundingReadAccess,
+  TREASURY_MUTED,
+  displayHeight,
+  formatHeight,
+  roomFundingView,
+  shortId,
+} from './treasuryView';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -54,7 +66,7 @@ import {
   B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
 } from './games/chess';
 import type { ChessState, ChessColor } from './games/chess';
-import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
@@ -481,6 +493,136 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         : 'NO ADJACENT MODULE DATA';
     }
 
+    // 🏦 FUNDING (plan §10.2): what the room's signed binding cache says
+    // about a company funding this room — or, just as often, that it says
+    // nothing. It never concludes the costs are therefore personal: no record
+    // is not evidence of no company, and this panel's whole job is to keep
+    // those apart.
+    // Read-only by design in this PR — the terminal never spends, never asks
+    // for a treasury key, and funding a room grants nobody edit rights (§9.4).
+    const fundEl = panel.querySelector<HTMLElement>('#device-terminal-funding-source');
+    const fundDetailEl = panel.querySelector<HTMLElement>('#device-terminal-funding-detail');
+    if (fundEl && fundDetailEl) {
+      const roomId =
+        (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+      // treasuryDocBound() only says a room document is attached: with no
+      // network pinned, every treasury read is disabled and returns null,
+      // which is NOT the same as there being no funding record. Gate on the
+      // network too so a disabled read is never reported as an absence.
+      // Three obstacles, not one. Collapsing them into a single boolean made
+      // this panel blame the room connection for an unconfigured build —
+      // which is every build with no VITE_SSF_TREASURY_GENESIS set, so a
+      // player in a perfectly healthy room read "cannot reach the room's
+      // records" while their own phone correctly said no network is
+      // configured. Two surfaces in one PR, contradicting each other.
+      const access: FundingReadAccess = !treasuryNetwork().configured
+        ? 'no-network'
+        : !roomId || !treasuryDocBound()
+          ? 'no-room'
+          : 'readable';
+      const connected = access === 'readable';
+      // Only a peer-reported height exists today. It is enough to flag a
+      // record whose end height looks passed (the conservative direction),
+      // but it can never establish that one is still live — the colour below
+      // treats every case that leans on it as unsettled.
+      const height = connected
+        ? displayHeight(readChainSyncStatus()).height
+        : null;
+      // Result form, so a record refused on size reads as a refusal rather
+      // than as an absence — the panel's whole job is keeping those apart.
+      const bindingResult = connected ? readRoomBindingResult(roomId) : null;
+      const funding = roomFundingView(
+        bindingResult?.status === 'ok' ? bindingResult.binding : null,
+        height,
+        // Every held-but-unusable state travels — see main.ts.
+        bindingResult && bindingResult.status !== 'ok' && bindingResult.status !== 'absent'
+          ? bindingResult.status
+          : access,
+        // Who the room's owner is, read live — the signer verdict rests on
+        // it, and this panel must agree with the phone about it. (Issue #138:
+        // readRoomOwnerKey is the seam an NFT-deed authority head replaces.)
+        readRoomOwnerKey(),
+      );
+      // No record is NOT the same fact as "funded personally", and an
+      // unreachable room document is a third state again — say which one.
+      // The trust status rides the headline: the read-only chain caveat says
+      // nothing about whether this record's signature was checked.
+      fundEl.textContent = connected
+        ? `${funding.headline.toUpperCase()} · ${funding.trust.label}`
+        : 'FUNDING RECORDS UNAVAILABLE · NO DATA';
+      // No green anywhere on this panel. Green reads as "funded, currently",
+      // and nothing available here establishes that: a valid signature shows
+      // who wrote the record, not that they were entitled to, that the chain
+      // confirmed it, or that it has not since been unbound. So a held record
+      // is neutral blue whatever its end height says, amber marks the two
+      // cases needing attention (no record, or one that looks ended), and grey
+      // means the lookup could not run. Green returns with a local chain
+      // verdict, not before.
+      fundEl.style.color = !connected
+        ? TREASURY_MUTED
+        : !funding.bound || funding.expiryStatus === 'passed'
+          ? '#F0C060'
+          : '#3E92B8';
+      const lines = !connected
+        ? [
+            // The model already worked out which obstacle this is and said so
+            // in the player's words. Substituting a hard-coded sentence here
+            // threw that away and named the wrong cause.
+            funding.detail,
+            funding.readOnlyNote,
+          ]
+        : funding.bound
+          ? [
+              `COMPANY ${shortId(funding.companyId ?? '')} · TREASURY ${shortId(funding.treasuryId ?? '')}`,
+              `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
+              `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+              // The signer, always: a record whose author is never shown is
+              // one a peer can forge without anyone noticing whose key it is.
+              // "BOUND BY" only when the signer is the room owner.
+              `${funding.signer === 'owner' ? 'BOUND BY' : 'SIGNED BY'} ${(funding.signerLabel ?? '—').toUpperCase()}`,
+              // And the half of §10.1 this device cannot check, said so.
+              `COMPANY APPROVAL ${(funding.companyApproval ?? '—').toUpperCase()}`,
+              funding.trust.detail,
+              // Only shown when the record names an end height at all. The
+              // note carries the verdict; the height it was judged against is
+              // named here so the player can see what the guess rests on.
+              ...(funding.expiryNote
+                ? [
+                    height === null
+                      ? funding.expiryNote.toUpperCase()
+                      : `${funding.expiryNote.toUpperCase()} REPORTED HEIGHT ${formatHeight(height)}.`,
+                  ]
+                : []),
+              funding.readOnlyNote,
+              funding.detail,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ]
+          : [
+              // A held record under someone else's key is still named by its
+              // signer, so "not the room owner" is a fact on screen and not a
+              // silence.
+              ...(funding.signerLabel ? [`SIGNED BY ${funding.signerLabel.toUpperCase()}`] : []),
+              funding.detail,
+              funding.readOnlyNote,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ];
+      fundDetailEl.textContent = lines.join('  ');
+
+      // §10.2's link to the phone Treasury app. A <button> so it answers the
+      // keyboard; the phone router only delegates inside the phone shell and
+      // this terminal is mounted elsewhere, so it goes through the same
+      // window seam other cross-module callers use.
+      const openBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-open-treasury');
+      if (openBtn && !openBtn.dataset.wired) {
+        openBtn.dataset.wired = '1';
+        openBtn.addEventListener('click', () => {
+          const open = (window as unknown as { __ssfOpenTreasury?: () => void })
+            .__ssfOpenTreasury;
+          if (open) open();
+        });
+      }
+    }
+
     // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
     // change (e.g. set via console for the non-owner test path) shows up live.
     const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
@@ -488,6 +630,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     const editNote = panel.querySelector<HTMLElement>('#device-terminal-edit-room-note');
     if (editBtn && deps.editRoom) {
       const perm = deps.editRoom.permission();
+      // Captured BEFORE anything is disabled. Browsers blur a focused button
+      // the moment it becomes disabled, so reading document.activeElement
+      // afterwards always found focus already outside the panel and the
+      // recovery below never ran at all.
+      const focusedBefore = document.activeElement as HTMLElement | null;
+      const hadFocusInPanel = Boolean(panel && focusedBefore && panel.contains(focusedBefore));
       for (const btn of [editBtn, hullBtn]) {
         if (!btn) continue;
         btn.disabled = !perm.ok;
@@ -501,6 +649,25 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           : perm.reason;
       }
       if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
+      // A permission change can disable the button that currently HAS focus.
+      // The browser then moves focus out of the panel, so the arrow-key
+      // listener bound to it never fires again and the enabled treasury link
+      // becomes unreachable — the traversal defeating itself. Catch that here,
+      // where the disabling happens, and land on a stop that still works.
+      //
+      // Tested against the SAVED reference and the state now: focus was ours,
+      // the element that held it is disabled, and focus has since left.
+      const lostFocus =
+        hadFocusInPanel &&
+        focusedBefore instanceof HTMLButtonElement &&
+        focusedBefore.disabled &&
+        !panel?.contains(document.activeElement);
+      if (lostFocus && panel) {
+        const stops = [
+          ...panel.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]'),
+        ].filter((el) => el.offsetParent !== null);
+        stops[0]?.focus({ preventScroll: true });
+      }
     }
 
     drawWireframe();
@@ -651,7 +818,27 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <div style="height:12px; border:1px solid rgba(212,168,75,0.22); border-radius:3px; background:repeating-linear-gradient(45deg, rgba(74,85,96,0.25) 0 6px, transparent 6px 12px);"></div>
         </div>
         <div id="device-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
-        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only</div>
+        <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+          <div style="font-size:10px; color:${TREASURY_MUTED}; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
+          <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:${TREASURY_MUTED};">READING FUNDING RECORDS…</div>
+          <div id="device-terminal-funding-detail" style="font-size:9px; color:${TREASURY_MUTED}; margin-top:3px; line-height:1.5;"></div>
+          <!-- Disabled controls leave the tab order, so the reason they are
+               disabled cannot live only in their title attributes. -->
+          <div id="device-terminal-command-note" style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:6px;">These actions are not available yet — they arrive with the treasury and node lanes. This terminal never spends.</div>
+          <div role="group" aria-label="Funding commands, all currently unavailable" aria-describedby="device-terminal-command-note" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">
+            <button type="button" disabled title="Arrives with the treasury lane — the terminal cannot spend."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">SELECT PROFILE</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">UNBIND</button>
+            <button type="button" disabled title="Asks this player's own node for chain state — that lane has not shipped."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REFRESH PROOF</button>
+          </div>
+          <button type="button" id="device-terminal-open-treasury"
+            style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>
+        </div>
+        <div style="font-size:9px; color:${TREASURY_MUTED}; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only · ↑↓ MOVE · ENTER SELECT · ESC STEP BACK</div>
       `;
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.
@@ -673,8 +860,45 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           editRoom.requestHull();
         });
       }
+      // Keyboard traversal for the panel's controls.
+      //
+      // Tab cannot do it: main.ts binds Tab globally as the phone's open/close
+      // toggle and preventDefaults EVERY press, so the browser never cycles
+      // focus. Without this the panel's buttons — EDIT ROOM, EDIT HULL and the
+      // treasury link — are reachable by pointer only. Escape is left alone;
+      // it belongs to the device-focus controller that steps the player back
+      // out of the terminal.
+      //
+      // Enter and Space need no handling: these are real <button> elements and
+      // answer both natively once they can be focused. Disabled controls are
+      // skipped, which is also why the reason they are disabled is written in
+      // the note beside them rather than in their title attributes.
+      // Bound once here rather than read from the module-level `panel`, which
+      // unmount() sets to null — a late keydown would otherwise throw.
+      const mounted = panel;
+      const focusStops = (): HTMLElement[] =>
+        [...mounted.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]')]
+          .filter((el) => el.offsetParent !== null);
+      mounted.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        const stops = focusStops();
+        if (stops.length === 0) return;
+        e.preventDefault();
+        const here = stops.indexOf(document.activeElement as HTMLElement);
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+      });
       deps.onEngagedChange?.(true);
+      // refresh() BEFORE choosing where focus lands. It applies the EDIT ROOM
+      // permission gate, so picking first would land a non-owner on EDIT ROOM
+      // and then disable the very button holding focus — dropping focus out of
+      // the panel and leaving the enabled treasury link unreachable by the
+      // arrow traversal.
       refresh();
+      // Somewhere to start from: arrow traversal is useless if nothing in the
+      // panel holds focus when it opens. preventScroll because the panel is
+      // positioned over the canvas and must not drag the page under it.
+      focusStops()[0]?.focus({ preventScroll: true });
     },
 
     unmount(): void {
@@ -1643,21 +1867,71 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   };
 }
 
-// ── 🚀 #30 SH1: the HELM console — ship status, no flight yet ────────────────
+// ── 🚀 #30 SH1: the HELM console — ship status + ⚓ #163 docking computer ────
+
+/**
+ * ⚓ #163: what the helm's DOCKING COMPUTER reads and does. world.ts wires it
+ * to the room's docking system — the same DOCK / UNDOCK the door panel runs,
+ * so the two surfaces can never disagree about a port.
+ */
+export interface HelmDockingDeps {
+  /** Every dock port of this module, in door order. */
+  ports: () => DockPortView[];
+  /** Every module connected to this one, posed in this room's frame. */
+  connected: () => ReturnType<DoorDockingPortSystem['connectedModules']>;
+  /** Subscribe to port changes; returns the unsubscribe. */
+  subscribe: (cb: () => void) => () => void;
+  undock: (doorId: string) => void;
+  dock: (doorId: string) => void;
+}
+
+/** Port marker colours on the ship atlas (and the status words beside them). */
+const PORT_TONE: Record<DockPortView['state']['kind'], string> = {
+  docked: '#00E676',
+  undocked: '#FFB300',
+  free: '#80D8FF',
+  gangway: 'rgba(212,168,75,0.6)',
+};
+
+function portStatusText(p: DockPortView): string {
+  const who = p.partnerName ?? 'the other module';
+  switch (p.state.kind) {
+    case 'docked': return `DOCKED → ${who}`;
+    case 'undocked': return `UNDOCKED · last berth ${who}`;
+    case 'gangway': return 'connected by a gangway';
+    default: return 'FREE · no berth on record';
+  }
+}
 
 /**
  * The helm's focused UI: a SHIP STATUS checklist derived LIVE from the room's
  * furniture (the fittings ARE the requirements — #62's physical-item ruling
- * applied to ships). No doc state of its own in SH1: presence of fittings is
- * already shared truth via the furniture map. Flight controls arrive with the
- * flight slices (spaceship-conversion-plan.md); the panel says so honestly.
+ * applied to ships), and — ⚓ #163 — a DOCKING COMPUTER: DOCK / UNDOCK for
+ * the module's docking-adapter ports. One port gets a plain button; several
+ * get the SHIP ATLAS, a top-down map of this module, its ports and what they
+ * are docked to, to choose from. Flight itself (destinations, travel) still
+ * arrives with the flight slices (spaceship-conversion-plan.md SH3).
  */
-export function createHelmUI(): DeviceUI {
+export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
+  let unsubscribeDocks: (() => void) | null = null;
+  /** The port the docking computer acts on (several ports ⇒ picked on the map). */
+  let selected: string | null = null;
+  /** Port marker hit areas on the atlas canvas, CSS px — rebuilt every draw. */
+  let markers: Array<{ doorId: string; x: number; y: number }> = [];
+
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
   const render = (): void => {
     if (!panel) return;
+    // Every render swaps the whole panel (a dock landing re-renders it too):
+    // remember which docking control had keyboard focus, and give it back.
+    const focused = document.activeElement as HTMLElement | null;
+    const refocus = focused && panel.contains(focused)
+      ? { pick: focused.dataset.helmPick, dock: focused.dataset.helmDock !== undefined }
+      : null;
     const engines = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('engine')).length;
     const tanks = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank')).length;
     const check = (ok: boolean) => ok
@@ -1668,6 +1942,26 @@ export function createHelmUI(): DeviceUI {
         <span style="color:rgba(212,168,75,0.75);">${label}</span><span>${value}</span>
       </div>`;
     const ready = engines >= 1 && tanks >= 1;
+    const ports = docking?.ports() ?? [];
+    if (!ports.some((p) => p.doorId === selected)) {
+      selected = (ports.find((p) => p.state.kind === 'docked') ?? ports[0])?.doorId ?? null;
+    }
+    const docked = ports.filter((p) => p.state.kind === 'docked');
+    const dockingRow = ports.length === 0
+      ? '— <span style="color:rgba(212,168,75,0.45);">no dock port</span>'
+      : `${check(true)} ${ports.length} port${ports.length === 1 ? '' : 's'} · ${
+          docked.length ? `docked to ${esc(docked.map((p) => p.partnerName ?? 'module').join(', '))}` : 'undocked'
+        }`;
+    // A GANGWAY holds a module as surely as a dock does — it is structure,
+    // and UNDOCK does not release it. "Free" means neither.
+    const bolted = [...new Set((docking?.connected() ?? []).filter((m) => !m.dock).map((m) => m.name))];
+    const message = !ready
+      ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
+      : bolted.length
+        ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
+        : docked.length
+          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. UNDOCK below and it is free to fly away; flight itself (destinations, travel) arrives with the flight update.'
+          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Flight itself arrives with the flight update; DOCK brings it back to a berth.';
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
         <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — SHIP STATUS</span>
@@ -1676,17 +1970,212 @@ export function createHelmUI(): DeviceUI {
       ${row('ENGINES', `${check(engines >= 1)} ${engines} mounted`)}
       ${row('FUEL', `${check(tanks >= 1)} ${tanks} tank${tanks === 1 ? '' : 's'}${tanks > 0 ? ' · FULL' : ' — install a fuel tank'}`)}
       ${row('HELM', `${check(true)} online`)}
+      ${row('DOCKING', dockingRow)}
       ${row('PROVISIONS', '— <span style="color:rgba(212,168,75,0.45);">galley update coming</span>')}
       ${row('HULL', `${check(true)} sealed`)}
       <div style="margin-top:10px; padding:10px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.6; color:${ready ? '#00E676' : 'rgba(212,168,75,0.7)'};">
-        ${ready
-          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. Undocking and flight arrive with the flight update; the station keeps you safely berthed until then.'
-          : 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'}
+        ${message}
       </div>
+      ${docking ? renderDockingComputer(ports) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
-        SSF FLIGHT SYSTEMS v0 · status only — controls arrive with the flight update
+        SSF FLIGHT SYSTEMS v0 · docking live — flight controls arrive with the flight update
       </div>
     `;
+    const canvas = panel.querySelector<HTMLCanvasElement>('#helm-ship-atlas');
+    if (canvas && docking) drawShipAtlas(canvas, ports, docking.connected());
+    if (refocus) {
+      const target = refocus.pick !== undefined
+        ? [...panel.querySelectorAll<HTMLElement>('[data-helm-pick]')].find((b) => b.dataset.helmPick === refocus.pick)
+        : refocus.dock
+          ? panel.querySelector<HTMLElement>('[data-helm-dock]')
+          : null;
+      target?.focus();
+    }
+  };
+
+  /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
+   *  atlas + a port list for several. */
+  const renderDockingComputer = (ports: DockPortView[]): string => {
+    const screen = (inner: string) => `
+      <div style="margin-top:10px; border:1px solid #1E88A8; border-radius:8px; background:#06121C; padding:10px 12px; color:#80D8FF; font-size:10px; line-height:1.5; box-shadow: inset 0 0 18px rgba(0,229,255,0.08);">
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:#00E5FF; margin-bottom:6px;">⚓ DOCKING COMPUTER${ports.length > 1 ? ' · SHIP ATLAS' : ''}</div>
+        ${inner}
+      </div>`;
+    if (ports.length === 0) {
+      return screen(`NO DOCK PORT on this module. Fit one at any door — door panel › CONNECTION ASSEMBLY › <b>+DOCK</b>. A dock has two halves: one on your door, one on the berth's.`);
+    }
+    const sel = ports.find((p) => p.doorId === selected) ?? ports[0];
+    const action = (p: DockPortView): string => {
+      const canAct = p.canOperate && !p.busy;
+      const btn = (verb: 'undock' | 'dock', label: string, color: string) =>
+        `<button type="button" data-helm-dock="${verb}" data-door="${esc(p.doorId)}" ${canAct ? '' : 'disabled'} style="width:100%; margin-top:8px; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.3); color:${color}; font-size:11px; font-weight:800; padding:8px; cursor:${canAct ? 'pointer' : 'not-allowed'}; opacity:${canAct ? '1' : '0.45'}; letter-spacing:1px;">${label}</button>`;
+      const who = esc(p.partnerName ?? 'the other module');
+      const verb = p.state.kind === 'docked'
+        ? btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80')
+        : p.state.kind === 'undocked'
+          ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
+          : p.state.kind === 'free'
+            ? `<div style="margin-top:6px; color:rgba(128,216,255,0.7);">No berth on record — dock this port from its door panel: pick a station and INITIATE.</div>`
+            : '';
+      const note = p.note
+        ? `<div style="margin-top:6px; color:${p.busy ? '#FFB300' : p.tone === 'ok' ? '#00E676' : p.tone === 'bad' ? '#FF8A80' : '#FFB300'};">${p.busy ? '⏳ ' : ''}${esc(p.note)}</div>`
+        : '';
+      const rights = !p.canOperate && (p.state.kind === 'docked' || p.state.kind === 'undocked')
+        ? `<div style="margin-top:6px; color:rgba(128,216,255,0.55);">Only the owner — or a builder at that door — can dock and undock it.</div>`
+        : '';
+      return verb + note + rights;
+    };
+    if (ports.length === 1) {
+      const p = ports[0];
+      return screen(`
+        <div><b style="color:#F2EFE6;">${esc(p.label)}</b> · <span style="color:${PORT_TONE[p.state.kind]};">${esc(portStatusText(p))}</span></div>
+        ${action(p)}`);
+    }
+    // Real buttons, so every port is reachable and selectable from the
+    // keyboard (Tab, then Enter / Space) — the atlas canvas is pointer-only.
+    const list = ports.map((p, i) => `
+        <button type="button" data-helm-pick="${esc(p.doorId)}" aria-pressed="${p.doorId === sel.doorId}" aria-label="Port ${i + 1}: ${esc(p.label)}, ${esc(portStatusText(p))}" style="display:flex; width:100%; gap:8px; align-items:center; padding:3px 6px; margin-top:2px; border:none; border-radius:5px; background:${p.doorId === sel.doorId ? 'rgba(0,229,255,0.12)' : 'transparent'}; box-shadow:${p.doorId === sel.doorId ? 'inset 0 0 0 1px rgba(0,229,255,0.4)' : 'none'}; color:inherit; font:inherit; text-align:left; cursor:pointer;">
+          <span style="display:inline-block; flex-shrink:0; width:16px; height:16px; line-height:16px; text-align:center; border-radius:50%; background:${PORT_TONE[p.state.kind]}; color:#06121C; font-weight:800; font-size:9px;">${i + 1}</span>
+          <span style="color:#F2EFE6;">${esc(p.label)}</span>
+          <span style="color:${PORT_TONE[p.state.kind]}; margin-left:auto; text-align:right;">${esc(portStatusText(p))}</span>
+        </button>`).join('');
+    return screen(`
+      <canvas id="helm-ship-atlas" width="652" height="400" style="width:326px; height:200px; display:block; border-radius:6px; background:#030A10; cursor:pointer;" title="Pick a port on the ship atlas"></canvas>
+      ${list}
+      <div style="margin-top:6px; color:#F2EFE6;">SELECTED: <b>${esc(sel.label)}</b></div>
+      ${action(sel)}`);
+  };
+
+  /** ⚓ The SHIP ATLAS: this module top-down, every module connected to it
+   *  (docked berths dashed white, bolted-on gangway modules gold), and the
+   *  ports as numbered round markers — green docked, amber undocked with a
+   *  berth on record, blue free. North (−z) is up, like the wall computer. */
+  const drawShipAtlas = (
+    canvas: HTMLCanvasElement,
+    ports: DockPortView[],
+    connected: ReturnType<DoorDockingPortSystem['connectedModules']>,
+  ): void => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const W = canvas.width, H = canvas.height;
+    const cssScale = canvas.clientWidth ? canvas.width / canvas.clientWidth : 2;
+    const { halfX, halfZ } = roomHalfExtents();
+    // Module outline corners, rotated into this room's frame (three.js
+    // rotation.y: x' = x·cos + z·sin, z' = −x·sin + z·cos).
+    const corners = (m: { x: number; z: number; rotY: number; halfX: number; halfZ: number }) => {
+      const c = Math.cos(m.rotY), s = Math.sin(m.rotY);
+      return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => {
+        const lx = sx * m.halfX, lz = sz * m.halfZ;
+        return { x: m.x + lx * c + lz * s, z: m.z - lx * s + lz * c };
+      });
+    };
+    // Where each port's round half sits: just outside its door (the stub's
+    // middle), so the marker lands on the adapter itself.
+    const portAt = (doorId: string) => {
+      const p = physicalDoorPose(doorId);
+      const out = 1.6;
+      return { x: p.x + Math.sin(p.outwardYaw) * out, z: p.z + Math.cos(p.outwardYaw) * out };
+    };
+    const pts: Array<{ x: number; z: number }> = [
+      { x: -halfX, z: -halfZ }, { x: halfX, z: halfZ },
+      ...connected.flatMap((m) => corners(m)),
+      ...ports.map((p) => portAt(p.doorId)),
+    ];
+    const minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
+    const minZ = Math.min(...pts.map((p) => p.z)), maxZ = Math.max(...pts.map((p) => p.z));
+    const PAD = 36;
+    const scale = Math.min((W - PAD * 2) / Math.max(1, maxX - minX), (H - PAD * 2) / Math.max(1, maxZ - minZ));
+    const ox = W / 2 - ((minX + maxX) / 2) * scale;
+    const oz = H / 2 - ((minZ + maxZ) / 2) * scale;
+    const px = (x: number) => ox + x * scale;
+    const pz = (z: number) => oz + z * scale;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#030A10';
+    ctx.fillRect(0, 0, W, H);
+    const poly = (cs: Array<{ x: number; z: number }>) => {
+      ctx.beginPath();
+      cs.forEach((c, i) => (i ? ctx.lineTo(px(c.x), pz(c.z)) : ctx.moveTo(px(c.x), pz(c.z))));
+      ctx.closePath();
+    };
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // Connected modules first (under the ports).
+    for (const m of connected) {
+      const door = physicalDoorPose(m.doorId);
+      ctx.strokeStyle = m.dock ? 'rgba(242,239,230,0.55)' : 'rgba(212,168,75,0.45)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(px(door.x), pz(door.z));
+      ctx.lineTo(px(m.x), pz(m.z));
+      ctx.stroke();
+      poly(corners(m));
+      ctx.fillStyle = m.dock ? 'rgba(242,239,230,0.07)' : 'rgba(212,168,75,0.10)';
+      ctx.fill();
+      ctx.setLineDash(m.dock ? [10, 8] : []);
+      ctx.strokeStyle = m.dock ? '#F2EFE6' : '#D4A84B';
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = m.dock ? '#F2EFE6' : '#D4A84B';
+      ctx.fillText(m.name.slice(0, 18).toUpperCase(), px(m.x), pz(m.z));
+    }
+    // This module.
+    poly(corners({ x: 0, z: 0, rotY: 0, halfX, halfZ }));
+    ctx.fillStyle = 'rgba(62,146,184,0.16)';
+    ctx.fill();
+    ctx.strokeStyle = '#3E92B8';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.fillStyle = '#80D8FF';
+    ctx.fillText('THIS MODULE', px(0), pz(0));
+    // Ports.
+    markers = [];
+    ports.forEach((p, i) => {
+      const at = portAt(p.doorId);
+      const cx = px(at.x), cy = pz(at.z);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+      ctx.fillStyle = PORT_TONE[p.state.kind];
+      ctx.fill();
+      ctx.lineWidth = p.doorId === selected ? 5 : 2;
+      ctx.strokeStyle = p.doorId === selected ? '#FFFFFF' : '#06121C';
+      ctx.stroke();
+      ctx.fillStyle = '#06121C';
+      ctx.fillText(String(i + 1), cx, cy + 1);
+      markers.push({ doorId: p.doorId, x: cx / cssScale, y: cy / cssScale });
+    });
+  };
+
+  const onClick = (e: MouseEvent): void => {
+    if (!panel || !docking) return;
+    const target = e.target as HTMLElement;
+    const act = target.closest<HTMLElement>('[data-helm-dock]');
+    if (act && !(act as HTMLButtonElement).disabled) {
+      const doorId = act.dataset.door ?? '';
+      if (act.dataset.helmDock === 'undock') docking.undock(doorId);
+      else docking.dock(doorId);
+      return;
+    }
+    const pick = target.closest<HTMLElement>('[data-helm-pick]');
+    if (pick) {
+      selected = pick.dataset.helmPick ?? selected;
+      render();
+      return;
+    }
+    if (target.id === 'helm-ship-atlas') {
+      const r = target.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      let best: { doorId: string; d: number } | null = null;
+      for (const m of markers) {
+        const d = Math.hypot(m.x - x, m.y - y);
+        if (d < 18 && (!best || d < best.d)) best = { doorId: m.doorId, d };
+      }
+      if (best) {
+        selected = best.doorId;
+        render();
+      }
+    }
   };
 
   return {
@@ -1702,16 +2191,23 @@ export function createHelmUI(): DeviceUI {
         color: #d4a84b; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         box-sizing: border-box; pointer-events: auto;
       `;
-      panel.addEventListener('click', (e) => e.stopPropagation());
+      panel.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onClick(e);
+      });
       host.appendChild(panel);
       unsubscribe = subscribeFurnitureForHelm(() => render());
+      unsubscribeDocks = docking?.subscribe(() => render()) ?? null;
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      unsubscribeDocks?.();
+      unsubscribeDocks = null;
       panel?.remove();
       panel = null;
+      markers = [];
     },
 
     update(): void { /* status is observer-driven; nothing per-frame */ },

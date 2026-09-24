@@ -77,3 +77,11 @@ src-tauri/gen/schemas/
 
 # node_modules as a SYMLINK too (a stray link once slipped past the dir-only pattern)
 node_modules
+
+# Private local secrets (identity recovery key etc.) — never committed
+.local/
+
+# Local tooling & personal workspace files — never committed
+.claude/
+.vscode/
+images/

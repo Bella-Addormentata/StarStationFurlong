@@ -1,0 +1,520 @@
+{
+  "home-faa222a14898": {
+    "roomId": "home-faa222a14898",
+    "name": "SSF-WELCOME",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "north": {
+        "targetRoomId": "module-1d4f29",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:a3313fdd",
+        "farWall": "x+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "ext",
+            "bays": 8,
+            "skin": "solid"
+          },
+          {
+            "kind": "ext",
+            "bays": 6,
+            "skin": "solid"
+          },
+          {
+            "kind": "ext",
+            "bays": 6,
+            "skin": "solid"
+          },
+          {
+            "kind": "ext",
+            "bays": 6,
+            "skin": "solid"
+          }
+        ]
+      }
+    }
+  },
+  "module-1d4f29": {
+    "roomId": "module-1d4f29",
+    "name": "module-1d4f29",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:a3313fdd": {
+        "targetRoomId": "home-faa222a14898",
+        "wall": "x+",
+        "lateral": 0,
+        "farDoor": "north",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "ext",
+            "bays": 6,
+            "skin": "solid"
+          },
+          {
+            "kind": "ext",
+            "bays": 6,
+            "skin": "solid"
+          },
+          {
+            "kind": "ext",
+            "bays": 6,
+            "skin": "solid"
+          },
+          {
+            "kind": "ext",
+            "bays": 8,
+            "skin": "solid"
+          }
+        ]
+      },
+      "d:ed12101e-e045-4306-b574-23126ccfd111": {
+        "targetRoomId": "module-2c99f2",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:73dffabc-f2fa-470a-9463-6abddc856f1e",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.499999999999922
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.499999999999922
+          }
+        ]
+      },
+      "d:424bb465-7b91-4a4b-8998-f150163e62bc": {
+        "targetRoomId": "module-ae53e6",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:b67d07a7",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      }
+    }
+  },
+  "module-2c99f2": {
+    "roomId": "module-2c99f2",
+    "name": "module-2c99f2",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:2dc288ea": {
+        "targetRoomId": "module-002485",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:bb398d51-54b0-4e6a-9c20-adc0a823a3be",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      },
+      "d:73dffabc-f2fa-470a-9463-6abddc856f1e": {
+        "targetRoomId": "module-1d4f29",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:ed12101e-e045-4306-b574-23126ccfd111",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.499999999999922
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.499999999999922
+          }
+        ]
+      }
+    }
+  },
+  "module-002485": {
+    "roomId": "module-002485",
+    "name": "module-002485",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:06fd81a7": {
+        "targetRoomId": "module-98b6a6",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:7a9f54a8-770c-465e-b761-370d912d440b",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      },
+      "d:bb398d51-54b0-4e6a-9c20-adc0a823a3be": {
+        "targetRoomId": "module-2c99f2",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:2dc288ea",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      }
+    }
+  },
+  "module-98b6a6": {
+    "roomId": "module-98b6a6",
+    "name": "module-98b6a6",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:39a1f744": {
+        "targetRoomId": "module-d3532f",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:4cf72d2f-c0bc-4ee8-8481-ca1c8a9e0864",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      },
+      "d:7a9f54a8-770c-465e-b761-370d912d440b": {
+        "targetRoomId": "module-002485",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:06fd81a7",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      }
+    }
+  },
+  "module-d3532f": {
+    "roomId": "module-d3532f",
+    "name": "module-d3532f",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:4cf72d2f-c0bc-4ee8-8481-ca1c8a9e0864": {
+        "targetRoomId": "module-98b6a6",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:39a1f744",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      },
+      "d:d3cdbac9": {
+        "targetRoomId": "module-b1ada8",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:f266078a-e42a-47d7-82a4-c3817a82de40",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      }
+    }
+  },
+  "module-b1ada8": {
+    "roomId": "module-b1ada8",
+    "name": "module-b1ada8",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:f266078a-e42a-47d7-82a4-c3817a82de40": {
+        "targetRoomId": "module-d3532f",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:d3cdbac9",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      },
+      "d:17281a63": {
+        "targetRoomId": "module-cb1351",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:7548859c-ed68-4bf4-bc25-2f8a6baac176",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      }
+    }
+  },
+  "module-cb1351": {
+    "roomId": "module-cb1351",
+    "name": "module-cb1351",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:7548859c-ed68-4bf4-bc25-2f8a6baac176": {
+        "targetRoomId": "module-b1ada8",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:17281a63",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      },
+      "d:c80b07c6": {
+        "targetRoomId": "module-ae53e6",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:4b5fc518-9439-48ce-934b-d92daf378b45",
+        "farWall": "y+",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      }
+    }
+  },
+  "module-ae53e6": {
+    "roomId": "module-ae53e6",
+    "name": "module-ae53e6",
+    "dims": {
+      "cols": 2,
+      "rows": 2
+    },
+    "doors": {
+      "d:b67d07a7": {
+        "targetRoomId": "module-1d4f29",
+        "wall": "y-",
+        "lateral": 0,
+        "farDoor": "d:424bb465-7b91-4a4b-8998-f150163e62bc",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": -22.5
+          }
+        ]
+      },
+      "d:4b5fc518-9439-48ce-934b-d92daf378b45": {
+        "targetRoomId": "module-cb1351",
+        "wall": "y+",
+        "lateral": 0,
+        "farDoor": "d:c80b07c6",
+        "farWall": "y-",
+        "farLateral": 0,
+        "segments": [
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          },
+          {
+            "kind": "ext",
+            "bays": 4,
+            "skin": "solid"
+          },
+          {
+            "kind": "flex",
+            "bendDeg": 22.5
+          }
+        ]
+      }
+    }
+  }
+}

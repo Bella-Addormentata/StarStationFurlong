@@ -44,14 +44,63 @@ import {
   ysyncSigner,
   hasStoredIdentity,
 } from "./keypair";
-import { bindTreasuryDoc } from "./treasuryDoc";
-// Dev placeholder network pin for the treasury cache layer — deliberately
-// matches NO real chain genesis, so every foreign record is rejected until
-// real network configuration arrives with PR C (plan §17.5).
-const TREASURY_DEV_GENESIS = "0".repeat(64);
+import {
+  bindTreasuryDoc,
+  readChainSyncStatusResult,
+  readPolicyCacheResult,
+  readProposalResult,
+  readProposalPayloadResult,
+  readRegistrationResult,
+  readRoomBindingResult,
+  readWindowsCacheResult,
+  scanCheckpoints,
+  scanProposals,
+  scanSigningSessions,
+  scanVotes,
+  subscribeTreasury,
+  treasuryDocBound,
+} from "./treasuryDoc";
+import { treasuryNetwork } from "./treasuryNetwork";
+import {
+  approvalsView,
+  balanceView,
+  bindingStanding,
+  type BindingStanding,
+  boardThresholdFor,
+  boardView,
+  cursorPastEnd,
+  displayHeight,
+  droppedRecordsNote,
+  formatHeight,
+  governanceRuleFor,
+  pageRange,
+  pagerNeeded,
+  payloadView,
+  phaseLabel,
+  proposalKindLabel,
+  proposalPhase,
+  proposalRows,
+  companyScope,
+  type FundingReadAccess,
+  TREASURY_LABEL,
+  TREASURY_MUTED,
+  roomFundingView,
+  scopeCheckpoints,
+  scopeProposals,
+  scopeSessions,
+  advanceCursorPair,
+  missingProposalNote,
+  retreatCursorPair,
+  shareClassViews,
+  shortId,
+  syncView,
+  trustTag,
+  voteTallyView,
+  windowsView,
+} from "./treasuryView";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
-import { bindGamesDoc } from "./games/gamesDoc";
+import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -73,8 +122,18 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readDoor,
   subscribeDoors,
+  transactDoorWrites,
 } from "./doorsDoc";
+// ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
+// and the far room's end of every DOCK / UNDOCK.
+import { isDockChain } from "./adapter";
+import { mirrorMayWrite } from "./dockRules";
+import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
+import type { FarDockRequest, FarDockResult } from "./docking";
+// 🚪🩹 The far-door correction compares a record's target room by id.
+import { roomIdFromSeed } from "./stationAtlas";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -87,6 +146,7 @@ import {
   bindDoorPolicy,
   subscribeDoorPolicy,
   readDoorPolicy,
+  writeDoorPolicy,
 } from "./doorPolicy";
 import { bindExteriorDoc, subscribeExterior } from "./exteriorDoc";
 import {
@@ -131,8 +191,15 @@ import {
   writeVentureLink,
   refreshVentureLink,
   removeVentureLink,
+  detachOfficeRecord,
   isOfficeHere,
 } from "./ventures";
+import {
+  isDeedHolder,
+  isRoomOwner,
+  legacyOwnerMarker,
+  ownerGateRefusal as ownerGateRefusalText,
+} from "./roomOwner";
 import { deedsLedger, upsertDeed, removeDeed } from "./deeds";
 import {
   refreshExteriorView,
@@ -149,7 +216,14 @@ import {
   bindStationAtlasDoc,
   pushAtlasToDoc,
   subscribeSharedAtlas,
+  seedAtlasDefaults,
 } from "./stationAtlas";
+// 🛰️ Default station: where a first run docks, and the layout it ships with.
+import {
+  DEFAULT_STATION,
+  atlasForBundle,
+  defaultStationAtlas,
+} from "./defaultStation";
 // 🚶 FP click model: bare-floor clicks toggle free look, but seats stay
 // clickable — the floor branch needs the seat hit test.
 import { findSeatAt } from "./seats";
@@ -337,6 +411,18 @@ const networkProvider = new NetworkProvider();
   count: () => peerCount(),
   list: () => listPeers(),
   hintsFor,
+  // 🛰️ The default-station bundle: the connected component of the room you
+  // are standing in (or of `roomId`), stripped of everything personal — see
+  // the "Changing the default station" steps in defaultStation.ts.
+  exportDefaultStationAtlas: (roomId?: string) =>
+    JSON.stringify(
+      atlasForBundle(
+        readAtlas(),
+        roomId ?? activeBootstrap?.roomId ?? DEFAULT_STATION.welcomeRoomId,
+      ),
+      null,
+      2,
+    ),
 };
 let yjsSync: YjsSync | null = null;
 /** 💾 Tier A: the active room's snapshot writer (leaveRoom flushes + detaches). */
@@ -368,9 +454,19 @@ const REMOTE_PEER_TIMEOUT_MS = 10_000;
 const REMOTE_REAPER_SWEEP_MS = 2_000;
 let lastReaperSweep = 0;
 let pendingBootstrapOverride: RoomBootstrap | null = null;
+/** 🔗 The in-flight ?seed= import (setupNetworkDetailsPanel): the raw pass is
+ *  registered as the override synchronously, and bootstrapNetworking awaits
+ *  this so it dials the BRIDGED form — an explicit link is never raced by the
+ *  last-room resume or the default station (review of #156). */
+let urlSeedImport: Promise<void> | null = null;
 let activeBootstrap: RoomBootstrap | null = null;
 /** 🆕 #79 P4: guards a single home-fallback if resuming the last room fails. */
 let resumeRetried = false;
+/** 🛰️ "Is this a first run" — snapshotted before anything can lazily mint the
+ *  identity seed, so the boot and the title screen agree (defaultStation.ts). */
+const IS_FIRST_RUN_INSTALL = !hasStoredIdentity();
+/** 🛰️ Guards a single default-station attempt per boot (defaultStation.ts). */
+let defaultStationAttempted = false;
 let networkPanelInitialized = false;
 let phoneOverlayInitialized = false;
 // ── Adapter transit state (T1 of issue #30) ──────────────────────────────────
@@ -391,6 +487,37 @@ let sessionReturnRoute: {
   doorId: DoorId;
   seed: string;
 } | null = null;
+/**
+ * 🚪🩹 A near-side record correction owed to a room we just LEFT. When the
+ * arrival lands on a different door than the departure record named (the
+ * record carried a wall-centre hypothetical's compass id, and the room hangs
+ * that name elsewhere — or the named door was already taken), the record is
+ * wrong about its own far end, and the exterior draws the vestibule into the
+ * wrong door of the far room until it is fixed. Only one room doc is bound at
+ * a time, so the fix waits here until the traveler is back in that room, then
+ * rewrites farDoor/farWall/farLateral — and nothing else — if the record still
+ * points at the room they arrived in. Session-scoped, like sessionReturnRoute.
+ *
+ * Keyed by `${roomId}:${doorId}`, never a single slot: a correction owed to
+ * room A must survive a later mismatched transit out of room B before the
+ * traveler is back in A (review F4). Bounded; the oldest entry goes first.
+ */
+interface PendingFarDoorFix {
+  roomId: string;
+  doorId: string;
+  targetRoomId: string;
+  farDoor: string;
+  farWall?: DoorWall;
+  farLateral?: number;
+  /** The far-end fields the record carried when this was queued. The repair
+   *  is a compare-and-swap on them: if the record has since been corrected by
+   *  anyone else — a peer's re-pair, another traveler's repair, the far side's
+   *  mirror — that newer geometry wins and this stale note is dropped
+   *  (review, round 5). */
+  expect: { farDoor?: string; farWall?: DoorWall; farLateral?: number };
+}
+const pendingFarDoorFixes = new Map<string, PendingFarDoorFix>();
+const MAX_PENDING_FAR_DOOR_FIXES = 32;
 /**
  * Room ids minted by THIS client THIS session via PROVISION NEW MODULE.
  * Transiting into one of them is a first-entry into a fresh room nobody
@@ -415,6 +542,9 @@ interface MintedModule {
   /** The birth door's ID, minted at provision time so the near room's pairing
    *  names the exact far door before anyone has walked through. */
   birthDoorId?: string;
+  /** ⚓ #163: the module was provisioned through a staged DOCK — its birth door
+   *  is fitted with the mating half of the docking adapter at first claim. */
+  birthPort?: boolean;
 }
 const mintedRoomTemplates = new Map<string, MintedModule>();
 
@@ -723,11 +853,20 @@ async function bootstrapNetworking() {
   // 🆕 #79 P4: true while this boot is resuming a persisted last room, so a
   // dial failure (that room's host offline) can fall back to home once.
   let resumingLastRoom = false;
+  // 🛰️ True while this boot is a FIRST RUN docking at the default station
+  // (defaultStation.ts), so a station that does not answer falls back to home
+  // once, the same way.
+  let arrivingAtDefaultStation = false;
   try {
     // One-time UI init: phone input behaviors, hooks, and date-stamps
     // (Task 4.1). Internally guarded (phoneOverlayInitialized) so re-entry
     // via Retry-node / Use-link never re-binds listeners (issue #30 T0).
     setupSpacePhoneOverlay();
+    // 🔗 An explicit ?seed= link is registered synchronously and bridged
+    // asynchronously (setupNetworkDetailsPanel) — wait for the bridged form so
+    // the dial goes through the local node, and so the resume/default-station
+    // branches below see the override whatever the timing.
+    if (urlSeedImport) await urlSeedImport;
     // 🆕 #79 P4: resume the room the player last shut down in (persisted on
     // entry). Only when there's no explicit override — a ?seed=/Use-link import
     // always wins — and it becomes a normal JOIN into that room.
@@ -784,14 +923,73 @@ async function bootstrapNetworking() {
       return;
     }
 
+    // 🛰️ Default station (defaultStation.ts): a genuine first run — no stored
+    // identity, no ?seed=/Use-link override, nothing to resume — docks at the
+    // default station's welcome room instead of an empty freshly-minted home
+    // module. It rides the imported-pass path exactly: the pass is merged with
+    // the LOCAL node (resolveBridgeBootstrap), so the browser dials its own
+    // node and the node bridges to the station's iroh hints, and it is a JOIN,
+    // never a claim. Once per boot — after the fallback in the catch below
+    // this block is skipped and the boot proceeds home. The install that HOSTS
+    // the welcome room never treats its own home as a foreign join.
+    if (
+      !override &&
+      IS_FIRST_RUN_INSTALL &&
+      !defaultStationAttempted &&
+      DEFAULT_STATION.welcomeRoomId &&
+      DEFAULT_STATION.welcomeRoomId !== getDefaultRoomId()
+    ) {
+      defaultStationAttempted = true;
+      const welcome = decodeBootstrapInput(DEFAULT_STATION.welcomeRoomLink);
+      if (welcome) {
+        boot = await resolveBridgeBootstrap(welcome);
+        // Persists like every override: a Retry-node stays classified as a
+        // join and re-dials the station rather than claiming home.
+        pendingBootstrapOverride = boot;
+        arrivingAtDefaultStation = true;
+        console.info(
+          `🛰️ First run — docking at ${DEFAULT_STATION.name}, the default station.`,
+        );
+      }
+    }
+
     // Room-defaults claim gate (S2 review fix): only the DEFAULT-bootstrap
     // path — our own node's own room — may claim roomInfo owner/name
-    // defaults. Imported seeds (?seed= URL, Use-link) are JOINS into someone
-    // else's room and must never write defaults; see the claimRoomDefaults
-    // comment in joinRoomAtEpoch for the initial-sync race this prevents.
-    // pendingBootstrapOverride intentionally persists after use, so a
-    // Retry-node following a seed import stays classified as a join.
-    await joinRoom(boot, /* claimRoomDefaults */ !override);
+    // defaults. Imported seeds (?seed= URL, Use-link) and the default station
+    // are JOINS into someone else's room and must never write defaults; see
+    // the claimRoomDefaults comment in joinRoomAtEpoch for the initial-sync
+    // race this prevents. pendingBootstrapOverride intentionally persists
+    // after use, so a Retry-node following a seed import stays classified as
+    // a join.
+    await joinRoom(
+      boot,
+      /* claimRoomDefaults */ !override && !arrivingAtDefaultStation,
+    );
+
+    if (arrivingAtDefaultStation) {
+      // The join above only proves the LOCAL node answered. The station is
+      // reached when its host's room state lands over the bridge — the same
+      // signal the transit curtain waits on (linkedSynced, or roomInfo
+      // owner+name). Nothing is held meanwhile: the exterior already shows the
+      // station (bundled atlas), and entering early lands in a replica that
+      // fills in as the sync arrives.
+      const epochAtJoin = sessionEpoch;
+      await awaitInitialRoomState(DEFAULT_STATION_SYNC_GATE_MS);
+      if (epochAtJoin !== sessionEpoch) return; // a newer session owns the state
+      const sync = yjsSync;
+      const reached = !!sync && initialRoomStateReady(sync);
+      if (!reached) {
+        throw new Error(
+          `${DEFAULT_STATION.name} did not answer within ${DEFAULT_STATION_SYNC_GATE_MS / 1000}s`,
+        );
+      }
+      // Into MY ROOMS (no prefetch — it is the active room), so the station
+      // is one tap away on every later visit.
+      addPass(DEFAULT_STATION.welcomeRoomLink);
+      logToPhoneSystem(
+        `🛰️ Welcome aboard ${DEFAULT_STATION.name}. Any door's keypad can PROVISION NEW MODULE when you want a room of your own.`,
+      );
+    }
   } catch (err) {
     // Review fix (T0 of #30): a join can fail AFTER the transport connected
     // (openChannel/start) — tear the half-open session down first
@@ -800,6 +998,37 @@ async function bootstrapNetworking() {
     // this catch (superseded joins return silently from joinRoom), so the
     // epoch bump inside leaveRoom cannot cancel a newer in-flight join.
     await leaveRoom();
+    // 🛰️ The default station did not answer this first run (or its join failed
+    // outright) — forget it and boot HOME once, the way a failed resume does;
+    // defaultStationAttempted keeps the retry out of the station branch. The
+    // station still lands in MY ROOMS (after home is up, so the pass manager
+    // is initialised) — one tap away once its host is back; its row reads
+    // OFFLINE until then.
+    if (arrivingAtDefaultStation) {
+      console.warn(
+        `${DEFAULT_STATION.name} unreachable — falling back to home:`,
+        err,
+      );
+      try {
+        localStorage.removeItem("ssf-last-room"); // persisted at connect time
+      } catch {
+        /* privacy mode */
+      }
+      pendingBootstrapOverride = null;
+      // ⚠️ Forget the station as the ACTIVE room too. The connect succeeded
+      // before the gate gave up, so activeBootstrap names the station, and
+      // leaveRoom keeps it as last-room memory — fetchDefaultBootstrap would
+      // then mint the "home" boot from the station's id and key, rejoin a
+      // local replica of it with claimRoomDefaults=true, and CLAIM that fork
+      // (review of #156, round 2). Home is getDefaultRoomId(), nothing else.
+      activeBootstrap = null;
+      logToPhoneSystem(
+        `⚠️ ${DEFAULT_STATION.name} did not answer — booting your own module instead. It stays in ACCESS → ROOMS; enter it from there once it reads READY.`,
+      );
+      await bootstrapNetworking();
+      addPass(DEFAULT_STATION.welcomeRoomLink);
+      return;
+    }
     // 🆕 #79 P4: if the RESUME into the last room failed (its host is offline),
     // forget it and fall back to the home station — once (resumeRetried guards
     // an infinite loop if home also fails). A normal pass-import failure is NOT
@@ -808,6 +1037,10 @@ async function bootstrapNetworking() {
       resumeRetried = true;
       localStorage.removeItem("ssf-last-room");
       pendingBootstrapOverride = null;
+      // Same fork-claim hazard as the default-station fallback above: a resume
+      // that failed AFTER its connect leaves activeBootstrap on the last room,
+      // and fetchDefaultBootstrap would rebuild "home" from it.
+      activeBootstrap = null;
       console.warn("Resume into last room failed — falling back to home.");
       return bootstrapNetworking();
     }
@@ -1203,6 +1436,29 @@ async function joinRoomAtEpoch(
   // the same room.
   setAtlasHarvestArmed(true);
   harvestStationAtlas();
+  // 🛑🛰️ #157: the first-person shells are laid out AROUND THE CURRENT ROOM, so
+  // they are re-posed the moment that room changes — not only when a door or
+  // shared-atlas event happens to follow. On the first join of a launch neither
+  // does: the shells were built at boot in the HOME id's frame, the doors doc
+  // notified above before the listeners below exist, and a resume into a
+  // warm-cached room syncs nothing new. The window then showed the station
+  // laid out around the wrong room while the exterior (rebuilt on every
+  // activation) had it right.
+  world?.refreshFpNeighbourShells();
+  // 🛰️ …and again once the host's state has actually landed: the call above
+  // is a no-op on an unsynced replica (see harvestStationAtlas), and a room
+  // with no door changes after the sync would otherwise never be harvested
+  // this visit. Epoch-guarded like every post-await write; a gate timeout
+  // leaves the room unharvested rather than recording an empty replica.
+  void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
+    if (epoch !== sessionEpoch || yjsSync !== sync) return;
+    harvestStationAtlas();
+    refreshExteriorView();
+    // #157: this harvest can rewrite the current room's own edges (hop 1 of
+    // every pose) without any doc event — the shells follow it like the
+    // exterior does.
+    world?.refreshFpNeighbourShells();
+  });
 
   // 🚀 #68 V1: the room's venture record (joint ownership) rides the doc too;
   // whenever it shows us as a shareholder, refresh the personal ledger that
@@ -1216,13 +1472,20 @@ async function joinRoomAtEpoch(
   bindOffers(sync.doc);
   // 🏦 Treasury caches: signed display records over this room's doc (plan §14).
   // Verify-on-read only — nothing here is authoritative (invariant 5). The
-  // genesis pin (§17.5) rejects records from any other network; the value is
-  // a DEV PLACEHOLDER that matches no real chain — replace with the release
-  // network configuration when PR C wires real treasury flows.
+  // genesis pin (§17.5) rejects records from any other network.
   bindTreasuryDoc(sync.doc, {
     verifySig: verifyIdentity,
-    networkGenesisChallenge: TREASURY_DEV_GENESIS,
+    // An unconfigured build passes null, which treasuryDoc reads as "no
+    // network configured" and closes the cache: no record can match, so none
+    // is displayed. Substituting a plausible-looking hex placeholder here
+    // would instead make it the live network, and any peer could publish
+    // records under it.
+    networkGenesisChallenge: treasuryNetwork().genesisChallenge,
   });
+  // A new document means a new key space: every treasury cursor, offset and
+  // open-detail id was minted against the previous room's map and is junk
+  // here. See resetTreasuryNavigation for what applying them anyway did.
+  resetTreasuryNavigation();
   // Debug handle alongside __ssfRoomId — the live room doc for console
   // inspection and test harnesses (dev-stage posture, like __ssfIdentity).
   (window as any).__ssfDoc = sync.doc;
@@ -1281,7 +1544,8 @@ async function joinRoomAtEpoch(
     subscribeContacts(() => renderPhonePlayersList());
     // #67 D1b: policy/request/grant changes repaint an OPEN keypad live — a
     // grant landing while the guest stares at the pane unlocks it in place.
-    // D2: adapter installs also re-dress the hull (the IDA collar in space).
+    // ⚓ #163: a port fitted or removed re-dresses the space view too (the world
+    // draws the port itself; the exterior's atlas links follow the doors doc).
     subscribeDoorPolicy(() => {
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
@@ -1298,12 +1562,16 @@ async function joinRoomAtEpoch(
       renderVenturesApp();
       renderBankApp(); // the portfolio mirrors the same records
     });
+    // 🏦 PR C: a treasury record landing (proposal, vote, policy cache) repaints
+    // an open TREASURY view. Registered once — the listener set is module-level
+    // in treasuryDoc, so it survives every rebind.
+    subscribeTreasury(() => queueTreasuryRepaint());
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
     // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
     // the door slide), refresh an open keypad's POSITION row, and re-dress
-    // the exterior (a slid door carries its adapter collar).
+    // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       world?.reconcileDoorPlacements();
       world?.dockingSystem?.refreshPolicyUI();
@@ -1322,6 +1590,10 @@ async function joinRoomAtEpoch(
       // 🛑🛰️ #80 S5: the local room's own edges just changed the atlas → re-pose
       // the station-through-the-window shells (they depend only on the atlas).
       world?.refreshFpNeighbourShells();
+      // ⚓ #163: a dock made or released — here, by a peer, or by the far
+      // room's write landing — repaints an open door pane's DOCK row and the
+      // helm's docking computer.
+      world?.dockingSystem?.refreshPolicyUI();
     });
     // The exterior's atlas walk starts from the CURRENT room.
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
@@ -1372,7 +1644,8 @@ async function joinRoomAtEpoch(
   if (claimRoomDefaults && !roomMap.has("owner")) {
     sync.doc.transact(() => {
       // S2: the owner is a player ID (stable across reloads), not a display
-      // name. Legacy rooms hold 'Local-Clone' here — see isLocalPlayerRoomOwner.
+      // name. Legacy rooms hold 'Local-Clone' here — a marker that records the
+      // ABSENCE of an owner and (since 🔒 #141) grants nothing.
       roomMap.set("owner", getPlayerId());
       roomMap.set("name", boot.roomId || "Lobby");
     });
@@ -1399,6 +1672,15 @@ async function joinRoomAtEpoch(
         mintedHere.birthLateral ?? 0,
         mintedHere.birthDoorId,
       );
+      // ⚓ #163: docked into being — the birth door wears the other half of
+      // the adapter from its first moment (the staged mating half), so the
+      // new ship or station can UNDOCK and fly free. The layout record is
+      // written first: doorPolicy only accepts doors the room knows. (The id
+      // defaults to the wall label exactly as seedDoorLayoutSingle's does.)
+      if (mintedHere.birthPort) {
+        const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
+        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true });
+      }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
       // so the door sits centred on `birthWall` whatever the room is called.
       // This stamp used to be load-bearing — a single door only landed centred
@@ -1571,7 +1853,20 @@ async function joinRoomAtEpoch(
       ownerEl.textContent = resolveOwnerLabel(ownerVal);
     }
     // #52: the ACCESS app's MY PASS room row mirrors the same doc state.
+    // (This also repaints the access-mode selector, whose enabled state is the
+    // deed check — same live dependency as the co-host section below.)
     refreshAccessRoomRow();
+    // 🔒 #142: the co-host controls gate on `currentRoomDeedIsMine()`, which
+    // reads roomInfo.owner AND players[owner].keyB64 — so it now depends on
+    // BOTH maps this function observes, where the old shareholder gate
+    // compared against our player id alone and needed neither. Without this
+    // line the section repainted only on a roles-map change or on opening the
+    // app, so a deed hand-over — or the owner's players entry simply landing
+    // late, which is the ordinary join order — left the new holder with no
+    // controls and the old holder with REVOKE buttons the handler silently
+    // refuses. Exactly the treasury's OWNER UNKNOWN → OWNER-SIGNED flip noted
+    // on the players observer below, on a surface that had not needed it.
+    renderCoHostsSection();
     // Recategorise the room list: owner (roomInfo) and the owner's pubkey (its
     // players entry) can sync in after entry, moving the current room into its
     // correct section (My Rooms / Friends' / Visited) instead of Unreached.
@@ -1587,6 +1882,12 @@ async function joinRoomAtEpoch(
 
   roomMap.observe((_event) => {
     updateRoomUI();
+    // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
+    // is, read live from this map and the players map — so an owner change
+    // must repaint it, or a demoted binding keeps its badge until some
+    // unrelated treasury write happens along. Coalesced, and a no-op while
+    // the view is off screen.
+    queueTreasuryRepaint();
     // 🌌 Re-paint the room's backdrop + lighting when its theme syncs in or an
     // owner flips it (a provisioned deck arrives 'interior' pre-sync, then the
     // host's roomInfo['theme'] lands — repaint to outdoor-deck). Guarded so
@@ -1607,6 +1908,9 @@ async function joinRoomAtEpoch(
     renderPhonePlayersList();
     updateRoomUI();
     harvestRoomPlayersIntoMesh(playersMap);
+    // 🏦 The owner's identity key lives in THIS map (players[owner].keyB64)
+    // and can land after roomInfo — the OWNER UNKNOWN → OWNER-SIGNED flip.
+    queueTreasuryRepaint();
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -1840,6 +2144,21 @@ const SWAP_WATCHDOG_MS = 15_000;
  *  values. On timeout we enter with defaults, which the roomInfo observer
  *  (main.ts ~577) repaints live the moment the real state does arrive. */
 const SYNC_GATE_MS = 8_000;
+/** 🛰️ How long a FIRST RUN waits for the default station's room state before
+ *  giving up on it and booting home (defaultStation.ts). Longer than the
+ *  transit gate: this is a first cross-internet dial — DHT lookup, hole punch —
+ *  the ACCESS app's own "up to ~30s". Nothing is held while it runs. */
+const DEFAULT_STATION_SYNC_GATE_MS = 30_000;
+
+/** 🛰️ The ONE rule for "has this room's shared state arrived": a post-link
+ *  SyncStep2 (`linkedSynced`), or the host's roomInfo owner+name — the
+ *  reasoning lives in awaitInitialRoomState below. It also gates the atlas
+ *  harvest: until this holds the replica is EMPTY, and an empty replica is not
+ *  knowledge about the room. */
+function initialRoomStateReady(sync: YjsSync): boolean {
+  const roomMap = sync.doc.getMap("roomInfo");
+  return sync.linkedSynced || (roomMap.has("owner") && roomMap.has("name"));
+}
 
 /**
  * Resolve once the freshly-joined room's shared state has converged, or after
@@ -1868,8 +2187,7 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
   // opens on a SyncStep2 received after the peer linked — i.e. real host state.
   // Keys present ⇒ we know the room; post-link sync ⇒ we know there are no keys
   // coming. The timeout covers a genuinely ownerless/never-linking room.
-  const ready = () =>
-    sync.linkedSynced || (roomMap.has("owner") && roomMap.has("name"));
+  const ready = () => initialRoomStateReady(sync);
   if (ready()) return Promise.resolve();
   return new Promise<void>((resolve) => {
     let done = false;
@@ -2082,6 +2400,47 @@ async function performRoomSwap(
 }
 
 /**
+ * An address OTHER rooms can reach `roomId` by — what a mirror record, or a
+ * far room's end of a dock, must point back at. The walker's own rooms are
+ * exactly the rooms never in their own pass list, so: pass list → minted-
+ * module ledger → mint a fresh link against the local node. Null only when
+ * all three fail (no node).
+ */
+async function resolveOwnRoomAddress(roomId: string): Promise<string | null> {
+  const known =
+    passSeed(roomId) ??
+    moduleLedger().find((e) => e.roomId === roomId)?.seed ??
+    null;
+  if (known) return known;
+  try {
+    return (await mintBootstrapLink(undefined, roomId)).link ?? null;
+  } catch (e) {
+    console.warn(`🪞 Could not mint a link for ${roomId}:`, e);
+    return null;
+  }
+}
+
+/**
+ * ⚓ #163: DOCK / UNDOCK's far end — the docking system asks, we answer with a
+ * short background session to the far room's doc (farDoorWrite.ts). `near` is
+ * THIS end, captured now: a transit mid-write must not re-aim it.
+ */
+async function farDockWrite(req: FarDockRequest): Promise<FarDockResult> {
+  // The request's own room: a take-back can run after the player walked on.
+  const roomId = req.nearRoomId || activeBootstrap?.roomId;
+  if (!roomId) return { ok: false, reason: "no-address" };
+  const address = await resolveOwnRoomAddress(roomId);
+  if (!address) return { ok: false, reason: "no-address" };
+  return writeFarDock(req, {
+    roomId,
+    address,
+    doorId: req.nearDoorId,
+    wall: req.nearWall,
+    lateral: req.nearLateral,
+  });
+}
+
+/**
  * The adapter transit (T1 of #30), invoked by the World when the avatar
  * reaches the vestibule hold point (mid ADAPTER_HOLD): the shared room swap
  * with door choreography on both ends — reposition at the arrival door and
@@ -2115,6 +2474,21 @@ async function transitTo(
         farYawDeg: depState.farYawDeg,
       }
     : null;
+  // 🧭 The departure record's description of the FAR door — name, wall,
+  // lateral — passed whether or not a chain was assembled: a plain pairing
+  // minted at provision names its birth door too, and the WALL is what the
+  // arrival trusts (doorMatch.chooseArrivalDoor); the name is a hint.
+  const depFarDoor = depState?.farDoor;
+  const depFarWall = depState?.farWall;
+  const depFarLateral = depState?.farLateral;
+  // ⚓ #163: the connection's dock facts, captured NOW like depGeometry — the
+  // door-state object is shared across rooms by id, so after the swap it may
+  // already describe the ARRIVAL room's door of the same name.
+  const depTransient = depState?.transient;
+  const depDock = {
+    isDock: isDockChain(depState?.segments),
+    dockedAt: depState?.dockedAt,
+  };
   const depRoomId = activeBootstrap?.roomId ?? null;
   const returnRoute =
     sessionReturnRoute?.roomId === depRoomId &&
@@ -2124,21 +2498,14 @@ async function transitTo(
 
   // Vestibule-findings fix (root cause 2): the walker's own rooms are exactly
   // the rooms NEVER in their own pass list, so passSeed alone silently killed
-  // most mirrors. Resolution ladder: pass list → minted-module ledger → mint a
-  // fresh link (local node op; done PRE-swap while the departure room's state
-  // is definitely alive).
-  let depAddress = depRoomId ? (passSeed(depRoomId) ?? null) : null;
-  if (depPaired && depRoomId && !depAddress) {
-    depAddress =
-      moduleLedger().find((e) => e.roomId === depRoomId)?.seed ?? null;
-  }
-  if (depPaired && depRoomId && !depAddress) {
-    try {
-      depAddress = (await mintBootstrapLink(undefined, depRoomId)).link ?? null;
-    } catch (e) {
-      console.warn("🪞 Mirror: could not mint a departure-room link:", e);
-    }
-  }
+  // most mirrors. Resolution ladder (resolveOwnRoomAddress): pass list →
+  // minted-module ledger → mint a fresh link (local node op; done PRE-swap
+  // while the departure room's state is definitely alive).
+  const depAddress = depRoomId
+    ? depPaired
+      ? await resolveOwnRoomAddress(depRoomId)
+      : (passSeed(depRoomId) ?? null)
+    : null;
 
   const result = await performRoomSwap(returnRoute?.seed ?? seedString, {
     // 🩹 Birth-door healing (owner ask): a room whose door doc was lost — node
@@ -2180,9 +2547,12 @@ async function transitTo(
     arrive: () =>
       world.completeAdapterArrival(
         departureDoorId,
-        depGeometry?.farDoor,
+        depFarDoor,
         depRoomId ?? undefined,
         depWall,
+        depFarWall,
+        depFarLateral,
+        depLateral,
       ),
     fail: () => world.failAdapterTransit(departureDoorId),
   });
@@ -2195,14 +2565,116 @@ async function transitTo(
   // write below is keyed on that door, so with none there is nothing to write
   // — and nothing to walk through either (world.completeAdapterArrival warns
   // and skips its own walk-in for the same reason).
+  const arrivalInfo = { conflict: false };
   const arrivalDoorId = world.resolveArrivalDoor(
     departureDoorId,
-    depGeometry?.farDoor,
+    depFarDoor,
     depRoomId ?? undefined,
     depWall,
+    depFarWall,
+    depFarLateral,
+    depLateral,
+    arrivalInfo,
   )?.id;
   if (!arrivalDoorId) return;
   const arrivalRoomId = activeBootstrap?.roomId;
+
+  // 🚪🩹 Back in a room that owes far-door corrections (see pendingFarDoorFixes):
+  // apply every one for THIS room now that its doc is bound — only where the
+  // record still points at the room the traveler arrived in back then, and
+  // only the far-end fields (id, wall, lateral — a lateral-only repair is a
+  // repair too, review F3).
+  if (arrivalRoomId) {
+    for (const [key, fix] of [...pendingFarDoorFixes]) {
+      if (fix.roomId !== arrivalRoomId) continue;
+      pendingFarDoorFixes.delete(key);
+      const rec = readAllDoors().get(fix.doorId);
+      // Still the same connection, still carrying the far end we saw when we
+      // queued this (compare-and-swap — a record someone else has corrected
+      // since is newer than this note and is left alone), and not already
+      // what we would write.
+      const unchangedSince =
+        rec?.paired &&
+        rec.farDoor === fix.expect.farDoor &&
+        rec.farWall === fix.expect.farWall &&
+        (rec.farLateral ?? 0) === (fix.expect.farLateral ?? 0);
+      if (
+        rec?.paired &&
+        roomIdFromSeed(rec.connectedRoomAddress) === fix.targetRoomId &&
+        unchangedSince &&
+        (rec.farDoor !== fix.farDoor ||
+          rec.farWall !== fix.farWall ||
+          (rec.farLateral ?? 0) !== (fix.farLateral ?? 0))
+      ) {
+        writeDoorPairing(fix.doorId, rec.connectedRoomAddress, {
+          segments: rec.segments,
+          farDoor: fix.farDoor,
+          farWall: fix.farWall,
+          farLateral: fix.farLateral,
+          farYawDeg: rec.farYawDeg,
+          transient: rec.transient,
+          // ⚓ #163: a dock's stamp survives the rewrite — dropped, an UNDOCK
+          // from a trailing clock could read as older than the far end's dock.
+          dockedAt: rec.dockedAt,
+        });
+        console.log(
+          `🩹 Far-door correction applied: ${fix.doorId} → ${fix.targetRoomId} now names ${fix.farDoor}${fix.farWall ? ` on ${fix.farWall}` : ""} (was ${rec.farDoor ?? "unnamed"}${rec.farWall ? ` on ${rec.farWall}` : ""}).`,
+        );
+      }
+    }
+  }
+  // …and note one for the room we just LEFT when the arrival did not land
+  // where its record said: a different door, or the same door on a different
+  // wall or at a different lateral than the record claims. Every reason it
+  // can differ is a reason the record is wrong about its far end: a compass
+  // id from a wall-centre hypothetical that this room hangs on another wall,
+  // a door that was already taken, a plain pairing that never named one.
+  if (depPaired && depRoomId && arrivalRoomId) {
+    const pose = physicalDoorPoseOrNull(arrivalDoorId);
+    const arrivalWall = pose?.wall;
+    const arrivalLateral = pose
+      ? pose.tangent === "x" ? pose.x : pose.z
+      : undefined;
+    const mismatch =
+      depFarDoor !== arrivalDoorId ||
+      (arrivalWall !== undefined && depFarWall !== arrivalWall) ||
+      (arrivalLateral !== undefined &&
+        Math.abs((depFarLateral ?? 0) - arrivalLateral) > 1e-6);
+    // Never note a repair onto a door that belongs to ANOTHER connection: when
+    // every door here was paired elsewhere the chooser's last resort is such a
+    // door (it warns), the mirror rightly refuses it, and a repair pointing the
+    // departure record at it would manufacture the very duplicate this change
+    // exists to prevent (review, round 7).
+    const arrivalRec = readAllDoors().get(arrivalDoorId);
+    const arrivalIsAnothers =
+      !!arrivalRec?.paired &&
+      !!arrivalRec.connectedRoomAddress &&
+      roomIdFromSeed(arrivalRec.connectedRoomAddress) !== depRoomId;
+    // …nor onto a door the chooser itself flagged as another connection's —
+    // that covers a back door of a DIFFERENT link to the same room, which the
+    // room-id test above cannot see (review, round 8).
+    if (mismatch && (arrivalIsAnothers || arrivalInfo.conflict)) {
+      console.warn(
+        `🩹 No far-door correction noted for ${departureDoorId}: arrived through ${arrivalDoorId}, which belongs to another connection.`,
+      );
+    } else if (mismatch) {
+      const key = `${depRoomId}:${departureDoorId}`;
+      pendingFarDoorFixes.delete(key); // re-insert as the newest
+      if (pendingFarDoorFixes.size >= MAX_PENDING_FAR_DOOR_FIXES) {
+        const oldest = pendingFarDoorFixes.keys().next().value;
+        if (oldest !== undefined) pendingFarDoorFixes.delete(oldest);
+      }
+      pendingFarDoorFixes.set(key, {
+        roomId: depRoomId,
+        doorId: departureDoorId,
+        targetRoomId: arrivalRoomId,
+        farDoor: arrivalDoorId,
+        farWall: arrivalWall,
+        farLateral: arrivalLateral,
+        expect: { farDoor: depFarDoor, farWall: depFarWall, farLateral: depFarLateral },
+      });
+    }
+  }
   if (depPaired && depAddress && arrivalRoomId) {
     sessionReturnRoute = {
       roomId: arrivalRoomId,
@@ -2237,7 +2709,9 @@ async function transitTo(
   // Never clobbers an existing pairing on the arrival door.
   if (depPaired && depAddress) {
     // 🔗 Mirror onto the SAME door the player actually arrived through.
-    const existing = readAllDoors().get(arrivalDoorId);
+    // ⚓ #163: read that one door itself — the capped snapshot could hide it
+    // and make a live pairing (or a tombstone) look absent.
+    const existing = readDoor(arrivalDoorId);
     // ⏏ #91: an UNDOCKED door leaves a tombstone (a present, unpaired record
     // naming the module that was cast off), and re-pairing it here would undo
     // the owner's undock on the next walk-through. Refuse the mirror only for
@@ -2251,25 +2725,51 @@ async function transitTo(
     // room's doc — a doc this client does not own. That cross-room write is an
     // existing property of the lazy-mirror design, not something introduced
     // here, but free doors make it fire on many more doors.
-    const retired =
-      existing && !existing.paired && existing.retiredAddress === depAddress;
-    if (!existing?.paired && !retired) {
-      writeDoorPairing(arrivalDoorId, depAddress, {
-        segments: depGeometry
-          ? mirrorSegments(depGeometry.segments)
-          : undefined,
-        farDoor: departureDoorId,
-        // 🧭 The mirror is the one writer that KNOWS the far wall exactly: the
-        // traveler just departed through that door and captured its wall
-        // before the swap tore the departure room down. This is how a pairing
-        // whose INITIATE could not know the far side (free door, unvisited
-        // room) becomes fully described after one walk-through.
-        farWall: depWall,
-        farLateral: depLateral,
-        farYawDeg: depGeometry?.farYawDeg,
-        // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
-        // detaching either side casts the whole connection off.
-        transient: depState?.transient,
+    // ⚓ #163 (dockRules.mirrorMayWrite): the tombstone is matched by ROOM, not
+    // by seed string — two different passes to one module used to slip past
+    // it — and a DOCK made after that door's own undock is a deliberate
+    // re-dock the mirror completes, while an older one is a stale berth. A
+    // DOCK never lands on a tombstoned door whose port was removed: it would
+    // re-fit the port below.
+    if (
+      depRoomId &&
+      mirrorMayWrite(existing, depRoomId, depDock, {
+        portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
+      })
+    ) {
+      // ⚓ ONE transaction for the pairing and, for a dock, its port: were the
+      // pairing to land alone (a session cut between two updates), the port
+      // would exist only while docked — isPortDoor infers it from the live
+      // chain — and vanish at UNDOCK, leaving a berth no one could DOCK again.
+      transactDoorWrites(() => {
+        writeDoorPairing(arrivalDoorId, depAddress, {
+          segments: depGeometry
+            ? mirrorSegments(depGeometry.segments)
+            : undefined,
+          farDoor: departureDoorId,
+          // 🧭 The mirror is the one writer that KNOWS the far wall exactly:
+          // the traveler just departed through that door and captured its
+          // wall before the swap tore the departure room down. This is how a
+          // pairing whose INITIATE could not know the far side (free door,
+          // unvisited room) becomes fully described after one walk-through.
+          farWall: depWall,
+          farLateral: depLateral,
+          farYawDeg: depGeometry?.farYawDeg,
+          // #67 D2: a berth's mirror (into the SHIP's own doc) stays
+          // transient — detaching either side casts the whole connection off.
+          transient: depTransient,
+          // ⚓ …and a dock's mirror carries the dock's stamp.
+          dockedAt: depDock.isDock ? depDock.dockedAt : undefined,
+        });
+        // ⚓ A dock has a half on BOTH doors: the arrival door wears the
+        // mating half the connection brought (staged on the far side, or the
+        // visiting ship's own), so it can UNDOCK and DOCK from this side too.
+        if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+          writeDoorPolicy(arrivalDoorId, {
+            ...readDoorPolicy(arrivalDoorId),
+            adapter: true,
+          });
+        }
       });
       console.log(
         `🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`,
@@ -2322,7 +2822,12 @@ function wireAdapterTransit(): void {
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,
-    placement?: { wall: DoorWall; lateral: number; doorId?: string },
+    placement?: {
+      wall: DoorWall;
+      lateral: number;
+      doorId?: string;
+      port?: boolean;
+    },
   ): Promise<string | null> => {
     const bytes = new Uint8Array(3);
     crypto.getRandomValues(bytes);
@@ -2356,6 +2861,7 @@ function wireAdapterTransit(): void {
       birthWall,
       birthLateral: placement?.lateral ?? 0,
       birthDoorId: placement?.doorId,
+      birthPort: birthWall !== undefined && placement?.port === true,
     });
     // #62 P4: the ledger keeps every minted seed (building 9 rooms needs more
     // than a clipboard that holds one) and powers auto-accept.
@@ -2363,13 +2869,28 @@ function wireAdapterTransit(): void {
     return minted.link;
   };
   world.dockingSystem?.onProvisionModule(provisionModuleSeed);
+  // ⚓ #163: DOCK / UNDOCK tell the far room (farDoorWrite.ts) — its own
+  // background session on the local node, like a pass prefetch.
+  initFarDoorWrite({
+    decode: decodeBootstrapInput,
+    resolve: resolveBridgeBootstrap,
+    // Our home and every module we minted live on this machine's node: its
+    // replica is the room's own copy. Any other room has a host elsewhere.
+    hostedHere: (roomId) =>
+      roomId === getDefaultRoomId() ||
+      moduleLedger().some((e) => e.roomId === roomId),
+    // A dock between two doors of the room we stand in: the bound doc.
+    activeRoomDoc: (roomId) =>
+      roomId === activeBootstrap?.roomId && yjsSync ? yjsSync.doc : null,
+  });
+  world.dockingSystem?.onFarDockWrite(farDockWrite);
   // #62 P4: auto-accept decider — a pairing may complete without a far-side
   // human only for rooms THIS client minted (the ledger / this session's
   // mints) or its own current room, and only while the DEV toggle is on.
   // Vestibule-findings fix: connection changes (request / approve / assembly)
   // are limited to the room's OWNER — the same gate the room-name editor and
-  // edit mode use. Legacy 'Local-Clone' rooms stay editable by everyone, per
-  // the S2 convention inside isLocalPlayerRoomOwner.
+  // edit mode use. 🔒 #141: legacy 'Local-Clone' rooms are NO LONGER editable
+  // by everyone — that S2 convention was the wildcard, and it is gone.
   world.dockingSystem?.onOwnerCheck(() => {
     const ownerVal =
       (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
@@ -2475,17 +2996,61 @@ function resolveOwnerLabel(owner: string): string {
   return owner.length > 16 ? `${owner.slice(0, 8)}…` : owner;
 }
 
-/** True when WE hold owner authority here: owner is our player id, the room
- *  predates S2 (legacy 'Local-Clone' owner — those rooms stay editable), or —
+/** True when WE hold owner authority here: owner is our player id, or —
  *  🚀 #68 V1 owner rule — the room belongs to a VENTURE and we hold ANY of
- *  its shares (joint owners are owner-equivalent everywhere: docking, edit
- *  mode, policies, co-hosts — every gate funnels through this check). */
+ *  its shares.
+ *
+ *  📋 THE AUTHORITY SPLIT, and this docblock is the one place it is written
+ *  out — `roomOwner.ts` and `ventures.ts` point here rather than keeping
+ *  their own copies, because three hand-maintained lists is three chances to
+ *  describe a boundary that has moved.
+ *
+ *  Shareholder-extended (every caller of THIS predicate, as of #142):
+ *    · room edit mode ......... setRoomEditPermission
+ *    · docking + door policy .. dockingSystem.onOwnerCheck
+ *    · the room-NAME editor ... the roomInfo 'name' write
+ *    · the exterior view ...... setExteriorOwnerCheck
+ *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
+ *
+ *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
+ *    · the deed hand-over          · the sole-croupier election
+ *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *
+ *  The reason for the split: `isVentureShareholder` reads the current room's
+ *  own venture map entry, which is peer-written, shape-checked only, and tied
+ *  to nothing about this room or its owner — so a fabricated office record
+ *  passes this predicate. That is acceptable reach for editing and docking.
+ *  It was not acceptable for locking a room out or unseating the people
+ *  keeping it alive, which is what moved those four.
+ *
+ *  🔒 #141: the legacy `owner === 'Local-Clone'` clause is GONE. It granted
+ *  owner authority over a room to EVERY peer at once, across every gate in
+ *  the list above, so one string made pre-S2 rooms writable by anyone who
+ *  walked in. It was a deliberate S2 convention, not an oversight
+ *  — which is why removing it is a BREAKING change and not a pure fix.
+ *
+ *  What breaks, said plainly: a room whose `roomInfo.owner` is the literal
+ *  'Local-Clone' (or unset) now has NO ONE who passes this check, including
+ *  the person who built it. Those rooms become read-only. There is no
+ *  migration, because there is nothing to migrate FROM — the marker records
+ *  the absence of an owner, so no owner can be recovered from the doc. A
+ *  keyed room id (the ownership-root item on the critical path) is what gives
+ *  these rooms a verifiable owner again; until then the refusal is stated in
+ *  the UI rather than left to read as a bug.
+ *
+ *  The predicate itself lives in roomOwner.ts so it can be unit-tested — this
+ *  is a thin wrapper that supplies the live getters. */
 function isLocalPlayerRoomOwner(owner: string): boolean {
-  return (
-    owner === getPlayerId() ||
-    owner === "Local-Clone" ||
-    isVentureShareholder(getIdentityPub())
-  );
+  return isRoomOwner(owner, {
+    playerId: getPlayerId(),
+    isVentureShareholder: isVentureShareholder(getIdentityPub()),
+  });
+}
+
+/** The refusal text for an owner-gated action (roomOwner.ts), bound to this
+ *  module's label resolver. */
+function ownerGateRefusal(owner: string, action: string): string {
+  return ownerGateRefusalText(owner, action, resolveOwnerLabel);
 }
 
 /**
@@ -2626,6 +3191,16 @@ function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
   const roomId = activeBootstrap?.roomId;
   if (!roomId) return;
+  // 🛰️ Never harvest an UNSYNCED replica. Before the host's state lands the
+  // doc is empty, and recording that as first-hand — "Module", no doors, a
+  // fresh local stamp — erased what the atlas already knew about this room (a
+  // bundled default station, or gossip) and published the placeholder into
+  // the room doc (review of #156). The join schedules a harvest for when the
+  // state arrives; door changes after that harvest as before. A room whose
+  // host never answers is simply not harvested this visit — the exterior draws
+  // the module we stand in from its live geometry, not from the atlas.
+  const sync = yjsSync;
+  if (!sync || !initialRoomStateReady(sync)) return;
   const name =
     (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) ||
     "Module";
@@ -2753,6 +3328,1331 @@ function renderBankApp(): void {
   `;
 }
 
+// ── 🏦 TREASURY view (PR C) ──────────────────────────────────────────────────
+// Read-only company treasury, reached from VENTURES. Everything here is a
+// DISPLAY of the room's signed caches (treasuryDoc) — the phone holds no
+// treasury key, decides no balance, and declares nothing executable (plan
+// §4.1). Each panel carries a badge saying how much checking actually
+// happened, because the cache validates record classes differently: signed,
+// self-checked (content matches its own fingerprint), or unverified shape.
+// Display logic lives in treasuryView.ts so it stays unit-tested.
+
+/** Which proposal detail is open ('' = the list). */
+let treasuryDetailId = "";
+
+/**
+ * Where the proposal list is paged to.
+ *
+ * A per-repaint check budget bounds cost but, on its own, made the list
+ * censorable: the scan restarted at the beginning every time, so the first
+ * two dozen prefix-matching entries — junk included, since rejecting one costs
+ * a check too — could hide every real proposal permanently. Paging is what
+ * makes the bound survivable rather than exploitable.
+ */
+let treasuryListCursors: (string | null)[] = [null];
+
+/**
+ * The `nextCursor` each paged scan handed back on the last repaint.
+ *
+ * The click handler runs BEFORE the repaint that would recompute them, so it
+ * needs the value from the render it is reacting to — which is exactly the
+ * page the player was looking at when they pressed the control.
+ */
+let lastListNext: string | null = null;
+let lastVoteNext: string | null = null;
+let lastCheckpointNext: string | null = null;
+let lastApprovalNext: string | null = null;
+
+/**
+ * How many share classes one page of the COMPANY panel shows, and where that
+ * page starts. An offset rather than a cursor stack — see shareClassViews for
+ * why this one list is different from the map scans.
+ */
+const CLASS_PAGE = 24;
+let treasuryClassOffset = 0;
+
+// pageRange, pagerNeeded and cursorPastEnd live in treasuryView.ts now, where
+// they are unit-tested against real scan shapes. Pinned here only by regexes
+// over this file's source, pageRange shipped an inverted "9–8 of 8" for a
+// cursor left past the end.
+
+/**
+ * Every piece of treasury navigation state, back to the first page.
+ *
+ * All of it is module-level and until now nothing at the join seam touched
+ * it, so it outlived the room it described: a cursor stack built from room
+ * A's proposal keys was applied to room B's map on the next paint — keys are
+ * content hashes, so roughly half of B's records were skipped and the first
+ * screen read "Showing records 5–9 of 9" with a PREVIOUS control — and an
+ * open detail id from room A was looked up in room B and reported as no
+ * longer in the room's records. A cursor is a key in ONE document's key
+ * space; it means nothing in another.
+ */
+function resetTreasuryNavigation(): void {
+  treasuryDetailId = "";
+  treasuryListCursors = [null];
+  treasuryApprovalCursors = [null];
+  treasuryVoteCursors = [null];
+  treasuryCheckpointCursors = [null];
+  treasuryClassOffset = 0;
+  lastListNext = null;
+  lastVoteNext = null;
+  lastCheckpointNext = null;
+  lastApprovalNext = null;
+}
+
+/**
+ * Where the open proposal's approval rounds are paged to.
+ *
+ * Same reason as the list, and the same attack: session shells are UNSIGNED
+ * and peer-writable, so two dozen self-consistent decoys sorted ahead of the
+ * genuine round consume the check budget before sessionsFor can filter them
+ * out — and with no way to reach the next page, that round's real progress
+ * was permanently invisible. Reset whenever a different proposal is opened,
+ * or a page number from one proposal would carry over to another.
+ */
+let treasuryApprovalCursors: (string | null)[] = [null];
+
+/**
+ * Where the open proposal's vote and vote-record scans are paged to.
+ *
+ * The fifth and last place this was missing. Vote and checkpoint keys are
+ * peer-writable too, so a page of decoys sorted ahead of the genuine records
+ * hid them with no way through — the panel warned it was partial and offered
+ * nothing to do about it, exactly as the proposal list and the approval rounds
+ * did before they were paged. One offset for both, because they are counted
+ * into a single tally and advancing them apart would make the figures answer
+ * different questions.
+ */
+let treasuryVoteCursors: (string | null)[] = [null];
+
+/** Checkpoints have their OWN key space, so they need their own cursor. */
+let treasuryCheckpointCursors: (string | null)[] = [null];
+
+/**
+ * How many records one repaint may VERIFY, as opposed to walk past.
+ *
+ * Verifying a record costs about 1.4 ms — a canonical id or hash recomputed
+ * and an ed25519 signature checked. The traversal budget below bounds how far
+ * a scan walks, which a cheap skipped key needs, but it never bounded this: a
+ * page of 800 verifiable records is over a second of blocked main thread. Nor
+ * does treasuryDoc's identity memo rescue it, because a peer who keeps writing
+ * NEW records writes new object identities, and every one of those is a miss.
+ *
+ * 24 keeps the verification cost of a repaint near 35 ms even under a flood,
+ * and 24 rows is already more than a phone screen shows at once. What falls
+ * outside the budget is not hidden: `truncated` drives an on-screen line
+ * saying the view is partial and its contents are an arbitrary subset.
+ *
+ * The budget is PER REPAINT, not per scan. The list screen runs one scan, so
+ * LIST_CHECKS is both; the detail screen runs three and splits DETAIL_CHECKS
+ * between them — see DETAIL_PAGE below.
+ *
+ * The real fix is validating off the render path with cancellation, alongside
+ * the per-class index treasuryDoc's scanPrefixed comment describes.
+ */
+const LIST_CHECKS = 24;
+
+/**
+ * The detail screen's budget for the whole repaint, and the per-scan share
+ * that adds up to it.
+ *
+ * DETAIL_CHECKS was handed to each of the three scans — votes, vote records
+ * and approval rounds — so it bounded one scan while the repaint did up to
+ * THREE times the documented work, and the comment above claiming it bounds a
+ * repaint was simply wrong. A peer replacing records under all three prefixes
+ * defeats the memo in each of them at once, so the aggregate is exactly the
+ * number that matters.
+ *
+ * Split rather than shared dynamically: a scan's page size has to be FIXED or
+ * an offset stops meaning the same thing twice, and resumable paging is what
+ * keeps a bound from becoming a way to hide records. Three fixed pages of 8
+ * come to the same 24, and DETAIL_PAGE is what every page calculation on that
+ * screen uses.
+ */
+const DETAIL_CHECKS = 24;
+const DETAIL_SCANS = 3;
+const DETAIL_PAGE = DETAIL_CHECKS / DETAIL_SCANS;
+
+/**
+ * Repaint, preserving keyboard focus across the innerHTML replacement.
+ *
+ * Every repaint — including one triggered by a record arriving from a peer —
+ * destroys the focused element. Tab is the phone's toggle rather than a tab
+ * stop, so a keyboard player left on `body` is stranded with no way back into
+ * the view. Focus is restored to the same control where it still exists, and
+ * to the first one otherwise.
+ */
+function renderTreasuryApp(): void {
+  const view = document.getElementById("phone-app-treasury");
+  if (!view) return;
+  const active = document.activeElement as HTMLElement | null;
+  const hadFocus = Boolean(active && view.contains(active));
+  // Trust badges are focus stops too — the qualification behind a badge is
+  // the whole reason it is readable from the keyboard, so a player parked on
+  // one while a peer's record lands must not be thrown to the top of the
+  // screen. Their slot name is checked first because it is the most specific
+  // identity an element here can carry.
+  const key = hadFocus
+    ? active?.dataset.treasuryBadge
+      ? `[data-treasury-badge="${CSS.escape(active.dataset.treasuryBadge)}"]`
+      : active?.dataset.proposalId
+        ? `[data-proposal-id="${CSS.escape(active.dataset.proposalId)}"]`
+        : active?.dataset.treasuryAction
+          ? `[data-treasury-action="${active.dataset.treasuryAction}"]`
+          : active?.dataset.phoneApp
+            ? `[data-phone-app="${active.dataset.phoneApp}"]`
+            : null
+    : null;
+  paintTreasuryApp(view);
+  if (!hadFocus) return;
+  const target =
+    (key ? view.querySelector<HTMLElement>(key) : null) ??
+    view.querySelector<HTMLElement>("[data-treasury-action], [data-phone-app]") ??
+    view;
+  target.focus({ preventScroll: true });
+}
+
+/**
+ * Coalesces repaints. The bounded scans cap the work of ONE render, but a
+ * peer chooses how often records land, and each Y.Map transaction notifies
+ * synchronously — so a stream of small writes could still saturate the main
+ * thread with back-to-back scans. Bursts collapse into a single trailing
+ * render on the next frame.
+ */
+/**
+ * Minimum gap between PEER-DRIVEN repaints — the room terminal's own cadence
+ * (`devices.ts`, "4 Hz is plenty for status + wireframe").
+ *
+ * ⚠️ Coalescing alone was not enough, and the difference matters. A trailing
+ * timer collapses a BURST that lands inside one window; it does nothing about
+ * a SUSTAINED stream, because each window admits a fresh full scan. A peer
+ * writing once per window therefore bought a complete treasury render ~31
+ * times a second, and a cold repaint is budgeted at roughly 35 ms of
+ * signature work — more than the main thread has to give. The bounded scans
+ * cap the cost of ONE render; only a rate limit caps how many.
+ */
+const TREASURY_MIN_REPAINT_MS = 250;
+let treasuryRepaintQueued = false;
+let treasuryLastRepaintAt = 0;
+function queueTreasuryRepaint(): void {
+  if (treasuryRepaintQueued) return;
+  treasuryRepaintQueued = true;
+  // First write after a quiet spell still paints on the next frame; only a
+  // stream is held to the floor, so an arriving record (the OWNER UNKNOWN →
+  // OWNER-SIGNED flip, a vote landing) is never more than 250 ms late.
+  const wait = Math.max(
+    32,
+    TREASURY_MIN_REPAINT_MS - (Date.now() - treasuryLastRepaintAt),
+  );
+  // A timer rather than requestAnimationFrame: rAF does not fire at all
+  // while the tab is hidden, which would leave a queued repaint pending
+  // indefinitely instead of merely deferred.
+  setTimeout(() => {
+    treasuryRepaintQueued = false;
+    // Stamped BEFORE the render, so a render that throws cannot leave the
+    // floor unset and let the next write start a hot loop.
+    treasuryLastRepaintAt = Date.now();
+    renderTreasuryApp();
+  }, wait);
+}
+
+/**
+ * Is the treasury view actually on screen?
+ *
+ * Two conditions, because the view's own class is not enough. Tab closes the
+ * phone by toggling `#spacephone-container.active` and never calls
+ * showPhoneView, so `#phone-app-treasury` keeps its `active` class while the
+ * container is merely slid offscreen — it is never display:none, so the
+ * subtree stays laid out. Checking only the view meant a player who opened
+ * TREASURY, pressed Tab and walked away still paid a full rebuild, relayout
+ * and a page of signature checks for every key any peer wrote, with no
+ * treasury screen anywhere in sight. (That was at up to 31 Hz when this was
+ * written; the repaint floor above now holds peer-driven renders to 4 Hz, so
+ * this check saves less than it did — and is still the difference between
+ * paying for an invisible screen and not.)
+ */
+function treasuryViewOnScreen(view: HTMLElement): boolean {
+  const phone = document.getElementById("spacephone-container");
+  return Boolean(phone?.classList.contains("active"))
+    && view.classList.contains("active");
+}
+
+function paintTreasuryApp(view: HTMLElement): void {
+  // Every treasury record that lands fires this. Re-verifying the whole cache
+  // for a view nobody is looking at is wasted signature work, and the app
+  // repaints on open anyway — showPhoneView("treasury") always renders.
+  //
+  // Unconditional: this used to also require `view.dataset.wired`, which is
+  // set INSIDE this function, so on a fresh load the latch was unset and the
+  // first record any peer synced painted the hidden view in full — the one
+  // pass where no memo is warm. The listeners it was protecting are wired
+  // below, off the painted path, so nothing needs the paint to have run.
+  if (!treasuryViewOnScreen(view)) return;
+  // Same black-inheritance fix as the BANK/VENTURES apps.
+  view.style.color = "#e8d5a3";
+  wireTreasuryView(view);
+  paintTreasuryBody(view);
+}
+
+/** One-time listener wiring, kept out of the paint so the guard can precede it. */
+function wireTreasuryView(view: HTMLElement): void {
+  if (!view.dataset.wired) {
+    view.dataset.wired = "1";
+    const activate = (target: EventTarget | null) => {
+      const el = (target as HTMLElement | null)?.closest<HTMLElement>(
+        "[data-treasury-action]",
+      );
+      if (!el) return false;
+      const action = el.dataset.treasuryAction;
+      if (action === "open") {
+        treasuryDetailId = el.dataset.proposalId ?? "";
+        // Page numbers are per proposal.
+        treasuryApprovalCursors = [null];
+        treasuryVoteCursors = [null];
+        treasuryCheckpointCursors = [null];
+      }
+      if (action === "back") treasuryDetailId = "";
+      // Forward pushes the cursor the scan just handed back; back pops to the
+      // one before. A stack rather than arithmetic because a cursor is a KEY,
+      // not a position — which is the point: a position can be pushed forward
+      // indefinitely by a peer prepending records between repaints, and a
+      // "next" that never arrives is not paging.
+      const pageForward = (stack: (string | null)[], next: string | null) => {
+        if (next !== null) stack.push(next);
+      };
+      const pageBack = (stack: (string | null)[]) => {
+        if (stack.length > 1) stack.pop();
+      };
+      if (action === "rounds-next") pageForward(treasuryApprovalCursors, lastApprovalNext);
+      if (action === "rounds-prev") pageBack(treasuryApprovalCursors);
+      // One control, two key spaces: paged as a pair so the two histories
+      // stay the same height. See advanceCursorPair for why.
+      if (action === "votes-next" || action === "votes-prev") {
+        const pair = { a: treasuryVoteCursors, b: treasuryCheckpointCursors };
+        const moved =
+          action === "votes-next"
+            ? advanceCursorPair(pair, lastVoteNext, lastCheckpointNext)
+            : retreatCursorPair(pair);
+        treasuryVoteCursors = [...moved.a];
+        treasuryCheckpointCursors = [...moved.b];
+      }
+      if (action === "page-next") pageForward(treasuryListCursors, lastListNext);
+      if (action === "page-prev") pageBack(treasuryListCursors);
+      // Share classes page by offset, not cursor — one array inside one
+      // record, shown in the order the policy declares it. The paint clamps
+      // this against the policy's real length before using it, so an offset
+      // left past the end after a shrink cannot strand the reader.
+      if (action === "classes-next") treasuryClassOffset += CLASS_PAGE;
+      if (action === "classes-prev") {
+        treasuryClassOffset = Math.max(0, treasuryClassOffset - CLASS_PAGE);
+      }
+      // renderTreasuryApp preserves focus across the repaint for us.
+      renderTreasuryApp();
+      return true;
+    };
+    view.addEventListener("click", (e) => activate(e.target));
+    // The rows advertise role="button"/tabindex="0", so they must answer the
+    // keyboard too — otherwise the affordance is decorative. Tab cannot do
+    // the traversal: the app reserves it globally as the phone's open/close
+    // toggle (it preventDefaults every press), so this view carries its own
+    // arrow-key movement between controls, and opening it lands focus here.
+    view.addEventListener("keydown", (e) => {
+      // Nothing here acts on a phone that is put away. The phone only slides
+      // offscreen, so a control left focused inside it still receives keys —
+      // and moving focus between rows nobody can see is worse than useless.
+      if (!treasuryViewOnScreen(view)) return;
+      if (e.key === "Enter" || e.key === " ") {
+        if (activate(e.target)) e.preventDefault();
+        return;
+      }
+      if (e.key !== "ArrowDown" && e.key !== "ArrowUp") return;
+      const stops = [
+        ...view.querySelectorAll<HTMLElement>("[data-treasury-action], [data-phone-app], [tabindex='0']"),
+      ].filter((el) => el.offsetParent !== null);
+      if (stops.length === 0) return;
+      e.preventDefault();
+      const here = stops.indexOf(
+        (e.target as HTMLElement).closest<HTMLElement>(
+          "[data-treasury-action], [data-phone-app], [tabindex='0']",
+        ) as HTMLElement,
+      );
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      const next = here < 0 ? 0 : (here + step + stops.length) % stops.length;
+      stops[next].focus();
+    });
+  }
+}
+
+function paintTreasuryBody(view: HTMLElement): void {
+  const esc = (s: string) =>
+    s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+  const header = (t: string) =>
+    `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL}; margin-top:12px;">${t}</div>`;
+  const dim = (t: string) =>
+    `<div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:4px; line-height:1.6;">${t}</div>`;
+  // `id` names the badge's slot on the screen ("board", "sync", …) so focus
+  // can be restored to THIS badge across a repaint. It is the first argument
+  // and has no default because a focusable control without a stable identity
+  // silently loses keyboard focus on every peer update — passing `null` is
+  // how a caller says "not focusable", and there is no way to ask for a
+  // focusable badge without naming it.
+  //
+  // `null` is for badges rendered INSIDE an activating control: a focusable
+  // note nested in a role="button" would swallow a tab stop and then bubble
+  // Enter/Space into the row's action, and descendants of a button are not
+  // reliably exposed with their own semantics. Those callers fold the detail
+  // into the row's own accessible label instead.
+  const badge = (
+    id: string | null,
+    tag: { level: string; label: string; detail: string },
+    /**
+     * Overrides the level's colour. Used by the funding badge alone: the room
+     * terminal refuses green on that panel because green reads as "funded,
+     * currently", which nothing here establishes — and the phone painted the
+     * very same state green. Blue is the terminal's held-record colour.
+     */
+    colorOverride?: string,
+  ) => {
+    const focusable = id !== null;
+    // UNVERIFIED and NO DATA were a 45%-alpha gold, which composites over the
+    // phone's near-black screen to about 2.6:1 — under the 4.5:1 this 8px text
+    // needs, and dimmest on exactly the two states a player most needs to
+    // read. Opaque, and measured against #04060F: 5.5:1. Still visibly quieter
+    // than the ~12:1 SIGNED and SELF-CHECKED badges, so the hierarchy the
+    // dimming was for survives without costing legibility.
+    const color =
+      colorOverride ??
+      (tag.level === "signed"
+        ? "#7ddb8f"
+        : tag.level === "self-checked"
+          ? "#f0c060"
+          : TREASURY_MUTED);
+    // Focusable and labelled: the qualification behind a badge (a signature
+    // shows authorship, not authority) is the whole point of showing it, and
+    // a title tooltip on an inert span never reaches a keyboard user.
+    // The detail rides in data-detail, which .ssf-trust-badge reveals on
+    // hover AND focus — a title tooltip never opens from the keyboard.
+    const a11y = focusable
+      ? ` role="note" tabindex="0" data-treasury-badge="${esc(id!)}" aria-label="${esc(`${tag.label}. ${tag.detail}`)}"`
+      : ` aria-hidden="true"`;
+    return `<span class="ssf-trust-badge"${a11y} data-detail="${esc(tag.detail)}" style="display:inline-block; padding:1px 6px; border-radius:5px; font-size:8px; font-weight:800; letter-spacing:0.5px; border:1px solid ${color}; color:${color};">${esc(tag.label)}</span>`;
+  };
+  const row = (label: string, value: string) =>
+    `<div style="display:flex; justify-content:space-between; gap:8px; margin-top:5px; font-size:10px;">
+      <span style="color:${TREASURY_LABEL};">${label}</span>
+      <span style="flex-shrink:0; color:#f0c060; text-align:right;">${value}</span>
+    </div>`;
+
+  const bound = treasuryDocBound();
+  const net = treasuryNetwork();
+  // One gate for every cache read on this screen. A room document alone is
+  // not enough: with no network pinned nothing read from it can be tied to a
+  // chain, so an unconfigured build would otherwise render a peer's claim —
+  // and, for the sync entry, take a height from it — walking straight around
+  // the fail-closed boundary. treasuryDoc now refuses these reads on its own
+  // side too; keeping the gate here as well leaves the boundary visible at
+  // the call site instead of only in the reader.
+  const cacheReadable = bound && net.configured;
+  // Read once and feed both models from that value.
+  const syncResult = cacheReadable ? readChainSyncStatusResult() : null;
+  const peerSync = syncResult?.status === "ok" ? syncResult.sync : null;
+  // An entry a player wrote but this device cannot read is not the same as
+  // nobody having written one — the badge has to be able to say which.
+  const sync = syncView(
+    peerSync,
+    cacheReadable,
+    syncResult?.status === "unreadable",
+  );
+  const { height, source: heightSource } = displayHeight(peerSync);
+  // The result form, not the plain read: "held but this device declined to
+  // read it" and "held but unreadable" are held records, and reporting either
+  // as absence would tell a player there is no policy while one sits in the
+  // room they are standing in.
+  const policyResult = cacheReadable ? readPolicyCacheResult() : null;
+  const policyStatus = policyResult?.status ?? "absent";
+  const policyCache = policyResult?.status === "ok" ? policyResult : null;
+  // Which company this screen may present, shared by BOTH branches: an open
+  // detail must obey the same scope as the list, or a binding or policy
+  // changing under it would leave a proposal on screen that the list has
+  // since withheld.
+  const roomId = activeBootstrap?.roomId ?? "";
+  // Which obstacle, not just whether there is one — an unconfigured build and
+  // a missing room document are different facts and the player gets told
+  // which. The terminal panel derives the same three states.
+  // `bound` belongs in here, not only in the early return further down.
+  // leaveRoom() destroys the treasury document but deliberately KEEPS
+  // activeBootstrap as last-room memory, so a roomId outlives the document it
+  // named — and this gate, reading roomId alone, called that readable. The
+  // early return below happens to stop anything being painted from it today,
+  // which makes this latent rather than live; it is still a gate that depends
+  // on a guard 30 lines away to stay honest, and the room terminal has
+  // included the document in its own version of this check all along. Two
+  // surfaces disagreeing about what "readable" means is how this screen
+  // produced a contradiction once already.
+  const access: FundingReadAccess = !net.configured
+    ? "no-network"
+    : !roomId || !bound
+      ? "no-room"
+      : "readable";
+  const readable = access === "readable";
+  // Read ONCE, in result form, and share it with the funding panel below: the
+  // scope decision and the funding headline must not disagree about whether a
+  // binding is here. The plain reader's null hid "held but unusable", which
+  // let a peer neutralise the signed binding and have their own policy name
+  // the company for the whole screen.
+  const bindingResult = readable ? readRoomBindingResult(roomId) : null;
+  const heldBinding = bindingResult?.status === "ok" ? bindingResult.binding : null;
+  // WHO signed it, read live from the room document — the room-side half of
+  // plan §10.1. The cache layer proved authorship under the record's own key
+  // and nothing more: any peer can mint a key and write a binding naming any
+  // company over this slot. Only the room owner's signature makes it the
+  // room's binding, and only that binding may decide which company this
+  // screen presents. (Issue #138: readRoomOwnerKey is where an NFT-deed
+  // authority head would replace the players-map chain; nothing here moves.)
+  const ownerKey = readRoomOwnerKey();
+  // WHO signed it, and then WHETHER IT HAS ENDED — both, because either alone
+  // lets a record anchor the screen it should not. The signer check answered
+  // only the first: an owner-signed binding past its own `expiresAfterHeight`
+  // still returned 'owner', so the funding panel below said the record had
+  // ended while that same record went on choosing which company's board and
+  // proposal list the whole screen presented. `bindingExpiry` is shared with
+  // that panel so the two cannot part company again.
+  const standing: BindingStanding = bindingStanding(bindingResult, ownerKey, height);
+  const scope = companyScope(
+    standing === "owner" ? heldBinding : null,
+    policyCache?.policy ?? null,
+    standing,
+  );
+
+  // The local verdict, always first: this device is not verifying the chain,
+  // so the whole app is read-only and says so (amendment §6/§15.3).
+  const verdictBanner = `
+    <div style="border:1px solid rgba(212,168,75,0.25); border-left:3px solid #f0c060; border-radius:6px; padding:8px 10px; background:rgba(212,168,75,0.05);">
+      <div style="font-size:10px; font-weight:800; color:#f0c060;">READ-ONLY · NOT VERIFIED HERE</div>
+      <div style="font-size:9px; color:${TREASURY_LABEL}; margin-top:3px; line-height:1.6;">${esc(sync.localNote)}</div>
+      ${
+        net.configured
+          ? ""
+          : `<div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:4px;">No company network is configured for this build, so nothing shown here is tied to a real chain.</div>`
+      }
+    </div>`;
+
+  // An in-view return, needed on EVERY branch that can be the whole screen.
+  // The phone header's own Back button sits outside this view, arrow-key
+  // traversal only searches inside it, and Escape goes to Home rather than to
+  // the parent app — so a branch without this leaves a keyboard-only player
+  // with no way back to VENTURES. The "not connected" branch had exactly that
+  // hole: it is the one screen with nothing else on it, so it offered no
+  // focusable element at all. Declared once here rather than pasted per
+  // branch, since the copy that was missing is how it went wrong.
+  const backToVentures = `
+    <div data-phone-app="ventures" role="button" tabindex="0" aria-label="Back to Ventures"
+      style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer; margin-top:8px;">← VENTURES</div>`;
+
+  if (!bound) {
+    view.innerHTML = `${verdictBanner}${backToVentures}
+      ${header("COMPANY TREASURY")}
+      ${dim("Not connected to a room yet — treasury records ride the room you are standing in.")}`;
+    return;
+  }
+
+  // ── Proposal detail ────────────────────────────────────────────────────
+  if (treasuryDetailId) {
+    // Gated like every other read on this screen. This was the one that was
+    // not, and it is the one that makes a positive claim about the room from
+    // what it gets back: the reader answers "the map could not be read" and
+    // "no such proposal" with the same `absent`, so an ungated call turned a
+    // disabled read into "this proposal was removed".
+    const proposalResult = cacheReadable ? readProposalResult(treasuryDetailId) : null;
+    const back = `<div data-treasury-action="back" role="button" tabindex="0" style="font-size:10px; font-weight:700; color:#f0c060; cursor:pointer;">← ALL PROPOSALS</div>`;
+    if (proposalResult === null || proposalResult.status !== "ok") {
+      // A peer can replace the open slot with something malformed or
+      // oversized. The record is still there — saying it is "no longer in the
+      // room's records" would be the absence claim every other panel refuses.
+      // A null result is the read that never ran, which claims less still.
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        missingProposalNote(
+          proposalResult === null ? "unavailable" : proposalResult.status,
+        ),
+      )}`;
+      return;
+    }
+    const proposal = proposalResult.proposal;
+    // The list would withhold this proposal now — a binding or policy landing
+    // while the detail was open can change whose company this screen shows.
+    // Mirror the list exactly: it withholds every row when no company can be
+    // identified, so an open detail must not survive that state either.
+    if (scope.mismatch) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(esc(scope.warning ?? ""))}`;
+      return;
+    }
+    if (scope.companyId === null) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        "Without company details there is no way to tell whose proposal this is, so it is no longer listed here.",
+      )}`;
+      return;
+    }
+    if (proposal.companyId !== scope.companyId) {
+      view.innerHTML = `${verdictBanner}${back}${header("PROPOSAL")}${dim(
+        "This proposal belongs to a different company than the one this room now shows, so it is no longer listed here.",
+      )}`;
+      return;
+    }
+    const registrationResult = readRegistrationResult(proposal.proposalId);
+    // Only a policy for the SAME company and version governs this proposal.
+    const rule = governanceRuleFor(proposal, policyCache?.policy ?? null);
+    // A same-company policy at a DIFFERENT revision is why clocks and the
+    // board threshold may be missing — say so instead of leaving the player
+    // to wonder.
+    const otherRevision =
+      policyCache && policyCache.policy.companyId === proposal.companyId
+        ? policyCache.policy.policyVersion
+        : null;
+    const windowsResult = readWindowsCacheResult(proposal.proposalId);
+    const w = windowsView(
+      proposal,
+      registrationResult.status === "ok" ? registrationResult.registration : null,
+      rule,
+      windowsResult.status === "ok" ? windowsResult.windows : null,
+      // A record the room holds but the reader could not return is a conflict,
+      // not an absence — windowsView cannot tell without being told.
+      registrationResult.status === "unreadable",
+      windowsResult.status === "unreadable",
+    );
+    // Bounded reads: votes, vote records and approval rounds all sit in
+    // peer-writable slots that nothing prunes, and this screen repaints on
+    // every treasury event, so unbounded scans would let spam stall the UI.
+    // Two budgets, because the entries do not cost the same — see scanPrefixed.
+    // The walk guard is generous on purpose: it is a runaway stop, and any
+    // value small enough to be a page becomes a horizon a peer can hide
+    // records behind. What bounds a repaint is DETAIL_CHECKS, of which each of
+    // the three scans below takes DETAIL_PAGE — they run on every repaint, so
+    // the aggregate is the figure that matters, not any one scan's share.
+    const DETAIL_SCAN = 50_000;
+    // Paged, like the proposal list and the approval rounds. These keys are
+    // peer-writable too, so without a way through, decoys sorted ahead of the
+    // genuine records hid them for good.
+    // Each scan carries its OWN cursor, and they are NOT interchangeable. A
+    // cursor is a key from one key space: every `checkpoint:` key sorts before
+    // any `vote:` cursor, so handing the vote cursor to the checkpoint scan
+    // sent it straight to its end, and the reverse would have restarted the
+    // vote scan and re-counted votes already shown. One control still advances
+    // both, but each advances along its own keys.
+    const scanVotePair = () => ({
+      votes: scanVotes(proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryVoteCursors[treasuryVoteCursors.length - 1]),
+      checkpoints: scanCheckpoints(proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryCheckpointCursors[treasuryCheckpointCursors.length - 1]),
+    });
+    let { votes: voteScan, checkpoints: cpScan } = scanVotePair();
+    // Records LEAVING can put a cursor past every remaining key, exactly as
+    // they can on the list — and this screen had no rewind, so it printed
+    // "Votes: 9–8 of 8" and a tally of 0 for a room still holding a page of
+    // verified votes behind the cursor. Rewound as a PAIR, because the two
+    // histories must stay the same height (see advanceCursorPair): a side that
+    // is not past its end goes back one page with the other, which is what
+    // PREVIOUS would have done. Same condition as the list — past the end,
+    // never merely empty. An all-rejected page is empty with its keys still
+    // there, and rewinding on that is the censorship hole the list closed.
+    while (
+      (cursorPastEnd(voteScan) || cursorPastEnd(cpScan)) &&
+      (treasuryVoteCursors.length > 1 || treasuryCheckpointCursors.length > 1)
+    ) {
+      const moved = retreatCursorPair({ a: treasuryVoteCursors, b: treasuryCheckpointCursors });
+      treasuryVoteCursors = [...moved.a];
+      treasuryCheckpointCursors = [...moved.b];
+      ({ votes: voteScan, checkpoints: cpScan } = scanVotePair());
+    }
+    lastVoteNext = voteScan.nextCursor;
+    lastCheckpointNext = cpScan.nextCursor;
+    // Paged, for the same reason the proposal list is: shells are unsigned and
+    // peer-writable, so decoys sorted ahead of the genuine round would
+    // otherwise put it permanently out of reach.
+    const scanRounds = () =>
+      scanSigningSessions(proposal.proposalId, DETAIL_SCAN, DETAIL_PAGE, treasuryApprovalCursors[treasuryApprovalCursors.length - 1]);
+    let sessionScan = scanRounds();
+    // The same rewind, on this screen's own key space.
+    while (cursorPastEnd(sessionScan) && treasuryApprovalCursors.length > 1) {
+      treasuryApprovalCursors.pop();
+      sessionScan = scanRounds();
+    }
+    lastApprovalNext = sessionScan.nextCursor;
+    // Only the two scans that FEED the vote panel. Including the approval scan
+    // made a proposal with many approval rounds tell the VOTES panel its own
+    // figures were partial when they were complete — and approval truncation
+    // already has its own warning where it belongs.
+    const votesPartial = voteScan.truncated || cpScan.truncated;
+    // Vote records are keyed by proposal id alone, so one filed under another
+    // company must not be counted among this proposal's — and what the filter
+    // drops is said on screen, not swallowed.
+    const scopedCheckpoints = scopeCheckpoints(cpScan.items, proposal);
+    const votes = voteTallyView(voteScan.items, scopedCheckpoints.kept);
+    const droppedVoteRecords = droppedRecordsNote(scopedCheckpoints.dropped, "vote record");
+    // Rounds and thresholds only count when they belong to THIS proposal's
+    // company and policy revision — both are peer-writable.
+    const scopedSessions = scopeSessions(sessionScan.items, proposal);
+    const droppedRounds = droppedRecordsNote(scopedSessions.dropped, "approval round");
+    const approvals = approvalsView(
+      scopedSessions.kept,
+      boardThresholdFor(proposal, policyCache?.policy ?? null),
+      height,
+      // Whether these rounds are ALL of them. Anything cut short, paged over,
+      // rejected, refused — or set aside as another company's — means the
+      // panel must not assert that no round is open. The filter was the gap:
+      // the scan-level counts saw a clean page while the one round the room
+      // held under this proposal's keys was discarded for its company id, and
+      // the panel said "No approval round open in this room" as fact.
+      !sessionScan.truncated &&
+        sessionScan.rejected === 0 &&
+        sessionScan.refusedTooLarge === 0 &&
+        sessionScan.matched <= DETAIL_PAGE &&
+        scopedSessions.dropped === 0,
+    );
+    // Only the round whose count is on screen. A scan-wide flag put an
+    // "at least" on a complete round whenever some OTHER round — expired,
+    // or belonging to another company — happened to hit the signature cap.
+    const selectedRoundPartial =
+      approvals.selectedSessionId !== null &&
+      sessionScan.partialSessionIds.includes(approvals.selectedSessionId);
+    const phase = w.windows ? proposalPhase(w.windows, height) : "no-clocks";
+    const payload = payloadView(readProposalPayloadResult(proposal.payloadHash).status);
+
+    view.innerHTML = `${verdictBanner}${back}
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:8px;">
+        <span style="font-size:13px; font-weight:800; color:#f0c060;">${esc(proposalKindLabel(proposal.kind))}</span>
+        ${badge("proposal", trustTag("signed"))}
+      </div>
+      <div style="font-size:9px; color:${TREASURY_MUTED}; margin-top:2px;">Made under policy version ${proposal.policyVersion}${
+        otherRevision !== null && otherRevision !== proposal.policyVersion
+          ? ` · the company details held here are version ${otherRevision}, so that board and its clocks do not apply to this proposal`
+          : ""
+      }</div>
+      <div style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:2px; word-break:break-all;">${esc(proposal.proposalId)}</div>
+      ${dim("The proposal itself is signed by its proposer, and that signature was checked on this device.")}
+
+      ${header("CLOCKS")}
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+        <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(phaseLabel(phase))}</span>
+        ${badge("clocks", w.trust)}
+      </div>
+      ${
+        w.windows
+          ? row("Accepted at", formatHeight(w.windows.acceptedHeight)) +
+            row("Voting ends", formatHeight(w.windows.votingEndsHeight)) +
+            row("Veto ends", formatHeight(w.windows.vetoEndsHeight)) +
+            row("Board may act", formatHeight(w.windows.executableFromHeight)) +
+            row("Expires", formatHeight(w.windows.expiresAfterHeight))
+          : ""
+      }
+      ${dim(esc(w.note))}
+      ${dim(
+        heightSource === "peer-reported"
+          ? `Position on the clocks uses a height another player reported (${formatHeight(height ?? 0)}) — not checked here.`
+          : "No chain height available on this device, so the phone will not say which window is open.",
+      )}
+
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">VOTES HELD IN THIS ROOM</span>
+        ${badge("votes", votes.trust)}
+      </div>
+      ${row("Held here", `${votes.held}`)}
+      ${row("Yes · No", `${votes.yes} · ${votes.no}`)}
+      ${row("Abstain · Veto", `${votes.abstain} · ${votes.veto}`)}
+      ${row("Vote records held", `${votes.records}`)}
+      ${dim(esc(votes.note))}
+      ${dim(esc(votes.caveat))}
+      ${droppedVoteRecords ? dim(esc(droppedVoteRecords)) : ""}
+      ${
+        votesPartial
+          ? dim(
+              "This room holds more vote records than were read for this screen, so these figures cover only part of what is here.",
+            )
+          : ""
+      }
+      ${
+        voteScan.refusedTooLarge + cpScan.refusedTooLarge > 0
+          ? dim(
+              `${voteScan.refusedTooLarge + cpScan.refusedTooLarge} record${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${voteScan.refusedTooLarge + cpScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted here. That is this device's limit, not a fault in the records.`,
+            )
+          : ""
+      }
+      ${
+        // Reachability for the tally too. Without it the partial warning above
+        // told the player their figures were incomplete and gave them no way
+        // to see the rest — the same hole the list and the rounds had.
+        // TWO ranges, reported separately. These are different key spaces
+        // scanned to different depths, so one range against the larger of the
+        // two described neither: 8 votes plus 8 vote records rendered 16
+        // inputs while claiming "records 1–8 of 8".
+        pagerNeeded(voteScan, DETAIL_PAGE, treasuryVoteCursors) ||
+        pagerNeeded(cpScan, DETAIL_PAGE, treasuryCheckpointCursors)
+          ? `${dim(
+              `Votes: ${pageRange(voteScan, DETAIL_PAGE)}. Vote records: ${pageRange(cpScan, DETAIL_PAGE)}. Only these pages were read.`,
+            )}
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              ${
+                treasuryVoteCursors.length > 1 || treasuryCheckpointCursors.length > 1
+                  ? `<div data-treasury-action="votes-prev" role="button" tabindex="0" aria-label="Previous page of vote records"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                  : ""
+              }
+              ${
+                lastVoteNext !== null || lastCheckpointNext !== null
+                  ? `<div data-treasury-action="votes-next" role="button" tabindex="0" aria-label="Next page of vote records"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                  : ""
+              }
+            </div>`
+          : ""
+      }
+      ${
+        // A rejected record is still a record the room holds. Without this,
+        // a slot full of forgeries rendered as a flat "0 held" — absence
+        // presented as fact, about entries this screen had just thrown out.
+        voteScan.rejected + cpScan.rejected > 0
+          ? dim(
+              `${voteScan.rejected + cpScan.rejected} record${voteScan.rejected + cpScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of — wrong shape, wrong network, or a signature that did not check out — so ${voteScan.rejected + cpScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        // Whole-map, like the list's own line. Both vote key spaces folded
+        // into one figure because the player is being told the room holds
+        // junk under this proposal, not which prefix carried it.
+        voteScan.malformedKeys + cpScan.malformedKeys > 0
+          ? dim(
+              `${voteScan.malformedKeys + cpScan.malformedKeys} entr${voteScan.malformedKeys + cpScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any vote, so ${voteScan.malformedKeys + cpScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+            )
+          : ""
+      }
+      ${
+        voteScan.discoveryCutShort || cpScan.discoveryCutShort
+          ? dim(
+              "This room holds more entries than this device will search in one go, so there may be votes here that paging cannot reach.",
+            )
+          : ""
+      }
+
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">BOARD APPROVALS</span>
+        ${badge("approvals", approvals.trust)}
+      </div>
+      ${
+        approvals.sessions > 0
+          ? row(
+              "Gathered in one round",
+              // Never a bare figure when the set behind it was cut short: a
+              // partial count read as a complete one is the same invented
+              // certainty as reporting a held record as absent.
+              selectedRoundPartial
+                ? `at least ${approvals.collected} of ${approvals.required ?? "—"}`
+                : `${approvals.collected} of ${approvals.required ?? "—"}`,
+            ) +
+            (selectedRoundPartial
+              ? dim(
+                  "More approvals for this round are held here than this device would read, so the figure above is a floor, not a total.",
+                )
+              : "") +
+            (approvals.required !== null && !approvals.requiredFromPolicy
+              ? dim("The number needed comes from the round itself, not the company policy.")
+              : "")
+          : ""
+      }
+      ${dim(esc(approvals.note))}
+      ${droppedRounds ? dim(esc(droppedRounds)) : ""}
+      ${
+        // Reachability, not just disclosure. Rounds are peer-writable, so
+        // without a way to page past planted ones the genuine round's progress
+        // could be hidden for good — the same hole the proposal list had.
+        pagerNeeded(sessionScan, DETAIL_PAGE, treasuryApprovalCursors)
+          ? `${dim(
+              `Showing rounds ${pageRange(sessionScan, DETAIL_PAGE)} held under this proposal's approval keys. Only this page was read.`,
+            )}
+            <div style="display:flex; gap:6px; margin-top:6px;">
+              ${
+                treasuryApprovalCursors.length > 1
+                  ? `<div data-treasury-action="rounds-prev" role="button" tabindex="0" aria-label="Previous page of approval rounds"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                  : ""
+              }
+              ${
+                lastApprovalNext !== null
+                  ? `<div data-treasury-action="rounds-next" role="button" tabindex="0" aria-label="Next page of approval rounds"
+                       style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                  : ""
+              }
+            </div>`
+          : ""
+      }
+      ${
+        sessionScan.refusedTooLarge > 0
+          ? dim(
+              `${sessionScan.refusedTooLarge} approval round${sessionScan.refusedTooLarge === 1 ? " was" : "s were"} too large for this device to read, so ${sessionScan.refusedTooLarge === 1 ? "it is" : "they are"} not counted above. That is this device's limit, not a fault in the records.`,
+            )
+          : ""
+      }
+      ${
+        // Same rule as the votes panel: rounds this device rejected are still
+        // rounds the room holds, and "no approval round open" would deny them.
+        sessionScan.rejected > 0
+          ? dim(
+              `${sessionScan.rejected} approval round${sessionScan.rejected === 1 ? " is" : "s are"} held here that this device could not make sense of, so ${sessionScan.rejected === 1 ? "it is" : "they are"} not counted above.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.malformedKeys > 0
+          ? dim(
+              `${sessionScan.malformedKeys} entr${sessionScan.malformedKeys === 1 ? "y is" : "ies are"} filed under a name too long to belong to any approval round, so ${sessionScan.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+            )
+          : ""
+      }
+      ${
+        sessionScan.discoveryCutShort
+          ? dim(
+              "This room holds more entries than this device will search in one go, so there may be approval rounds here that paging cannot reach.",
+            )
+          : ""
+      }
+      ${
+        sessionScan.truncated
+          ? dim(
+              "Only part of this room's records was read for this, so an approval round may be held here that is not counted above.",
+            )
+          : ""
+      }
+
+      <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+        <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">WHAT IT WOULD DO</span>
+        ${badge("payload", payload.trust)}
+      </div>
+      <div style="font-size:11px; font-weight:800; color:${TREASURY_LABEL}; margin-top:5px;">${esc(payload.headline)}</div>
+      ${dim(esc(payload.detail))}`;
+    return;
+  }
+
+  // ── List screen ────────────────────────────────────────────────────────
+  // roomId, readable and scope come from above, so this branch and the detail
+  // branch always agree about whose company is on screen.
+  // bindingResult comes from above — one read, so the funding headline and the
+  // company scope can never disagree about whether a binding is here.
+  const binding = roomFundingView(
+    heldBinding,
+    height,
+    // Every held-but-unusable state travels, not just the size refusal: a
+    // binding this room HAS but this device will not or cannot read is never
+    // reported as there being none.
+    bindingResult && bindingResult.status !== "ok" && bindingResult.status !== "absent"
+      ? bindingResult.status
+      : access,
+    ownerKey,
+  );
+  const balances = balanceView();
+  const showPolicy = policyCache && !scope.mismatch ? policyCache : null;
+  // Bounded read: verifying every proposal in an unbounded, never-pruned map
+  // would let ordinary history — or a peer publishing many valid self-signed
+  // proposals — stall each repaint. One page at a time, and the page is
+  // honest about being one.
+  //
+  // Two budgets. LIST_SCAN counts ENTRIES TRAVERSED, not records kept, because
+  // the map is peer-writable and unpruned so unrelated keys must cost budget
+  // or they are free. LIST_CHECKS counts the entries actually VERIFIED, which
+  // is the expensive half and the one that decides how long a repaint blocks
+  // for; it also caps how many rows this screen can be made to render.
+  // LIST_SCAN is a runaway stop on the walk, deliberately far above any real
+  // room: a page-sized value there is a horizon, and paging cannot cross one.
+  const LIST_SCAN = 50_000;
+  // Paged by CURSOR, not merely capped and not by index. A cap alone let a
+  // peer bury every real proposal behind two dozen pieces of junk with no way
+  // to look past them; an index-based page then let the same peer prepend a
+  // page of keys after every "next", pushing the genuine record forward as
+  // fast as the reader advanced — see scanPrefixed.
+  let page = scanProposals(
+    LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
+  );
+  // A cursor cannot outrun the list, but records LEAVING can still put it past
+  // the end. Rewind on THAT — the cursor being past every matching key — and
+  // not on an empty page: `items` holds only ACCEPTED records, so a page whose
+  // entries were all rejected or refused is legitimately empty while its keys
+  // are still there. Rewinding on that let a peer plant one full invalid page
+  // in front of an honest proposal: "next" reached the bad page, this loop
+  // bounced straight back, and the honest page after it was unreachable —
+  // the censorship hole rebuilt inside the guard meant to prevent stranding.
+  // The condition is cursorPastEnd, shared with the detail screen and
+  // unit-tested there — not a hand-rolled copy, which is how the detail scans
+  // came to have no rewind at all.
+  while (cursorPastEnd(page) && treasuryListCursors.length > 1) {
+    treasuryListCursors.pop();
+    page = scanProposals(
+      LIST_SCAN, LIST_CHECKS, treasuryListCursors[treasuryListCursors.length - 1],
+    );
+  }
+  lastListNext = page.nextCursor;
+  const truncated = page.truncated;
+  const scoped = scopeProposals(page.items, scope.companyId);
+  const rows = proposalRows(
+    scoped.shown,
+    (p) => {
+      // Both slots report held-but-unreadable, exactly as the detail screen
+      // does — otherwise the same proposal reads NO DATA in the list and
+      // "a record is held" when opened.
+      const reg = readRegistrationResult(p.proposalId);
+      const win = readWindowsCacheResult(p.proposalId);
+      return windowsView(
+        p,
+        reg.status === "ok" ? reg.registration : null,
+        governanceRuleFor(p, policyCache?.policy ?? null),
+        win.status === "ok" ? win.windows : null,
+        reg.status === "unreadable",
+        win.status === "unreadable",
+      );
+    },
+    height,
+    heightSource,
+  );
+
+  view.innerHTML = `${verdictBanner}${backToVentures}
+
+    ${header("THIS ROOM")}
+    <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+      <span style="font-size:11px; font-weight:800; color:#f0c060;">${esc(binding.headline)}</span>
+      ${badge("funding", binding.trust, binding.trust.level === "signed" ? "#3E92B8" : undefined)}
+    </div>
+    ${
+      binding.bound
+        ? row("Company", esc(shortId(binding.companyId ?? ""))) +
+          row("Treasury", esc(shortId(binding.treasuryId ?? ""))) +
+          row("Funding profile", esc(binding.profileId ?? "—")) +
+          row("Policy version", `${binding.policyVersion}`) +
+          row("Bound at", formatHeight(binding.boundAtHeight ?? 0)) +
+          (binding.expiresAfterHeight !== null
+            ? row("Ends at", formatHeight(binding.expiresAfterHeight))
+            : "")
+        : ""
+    }
+    ${
+      // The signer, ALWAYS named when a record is held. A binding whose
+      // author the screen never shows is one a peer can forge without anyone
+      // noticing whose key it carries. "Bound by" only when the signer IS the
+      // room owner; a record refused, or not yet tied to the owner, is merely
+      // "signed by" — the rows above may still show it as the claim it is,
+      // but this label must not upgrade it.
+      binding.signerLabel
+        ? row(binding.signer === "owner" ? "Bound by" : "Signed by", esc(binding.signerLabel))
+        : ""
+    }
+    ${
+      // The company-side half of §10.1, stated as not checked, so the owner's
+      // signature is never read as the company's consent.
+      binding.companyApproval ? row("Company approval", esc(binding.companyApproval)) : ""
+    }
+    ${dim(esc(binding.detail))}
+    ${binding.expiryNote ? dim(esc(binding.expiryNote)) : ""}
+    ${dim(esc(binding.readOnlyNote))}
+    ${dim(`Not shown yet: ${esc(binding.unavailable.join("; "))}.`)}
+
+    ${header("BALANCES")}
+    <div style="font-size:11px; font-weight:800; color:${TREASURY_LABEL}; margin-top:5px;">${esc(balances.headline)}</div>
+    ${dim(esc(balances.detail))}
+
+    ${header("COMPANY")}
+    ${
+      // What the company below rests on, when it is the policy cache alone.
+      // Every HELD binding state withholds this block; only an empty slot lets
+      // the freely writable policy name the company — which makes deleting
+      // the binding a hostile peer's cheapest move, so the fallback says what
+      // it is rather than looking like an anchored one.
+      scope.note ? dim(esc(scope.note)) : ""
+    }
+    ${
+      scope.warning
+        ? dim(esc(scope.warning))
+        : showPolicy
+        ? (() => {
+            const b = boardView(showPolicy.policy);
+            const classes = shareClassViews(
+              showPolicy.policy, CLASS_PAGE, treasuryClassOffset,
+            );
+            // The clamped value, so a policy that shrank under the offset
+            // leaves the reader on a real page rather than one press from
+            // nowhere. Read back rather than recomputed: the view already
+            // did the clamping and this must not disagree with it.
+            treasuryClassOffset = classes.startIndex;
+            return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                <span style="font-size:11px; font-weight:800; color:#f0c060;">Board: ${b.threshold} of ${b.signers} must approve</span>
+                ${badge("board", b.trust)}
+              </div>
+              ${row("Policy version", `${b.policyVersion}`)}
+              ${row("Fee ceiling per spend", esc(b.maxFee))}
+              <div style="font-size:10px; color:${TREASURY_LABEL}; margin-top:5px;">Policy fingerprint</div>
+              <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against the chain">${esc(showPolicy.policyHash)}</div>
+              ${classes.items
+                .map((c) =>
+                  row(
+                    `Share class · ${esc(c.id)}`,
+                    `${c.votesPerWholeShare} vote${c.votesPerWholeShare === 1 ? "" : "s"} per share${c.grantsRoomAccess ? " · room access" : ""}`,
+                  ),
+                )
+                .join("")}
+              ${
+                classes.truncated
+                  ? `${dim(
+                      `Showing share classes ${classes.startIndex + 1}–${classes.startIndex + classes.items.length} of ${classes.total}. How many a policy declares is chosen by whoever wrote it.`,
+                    )}
+                    <div style="display:flex; gap:6px; margin-top:6px;">
+                      ${
+                        classes.startIndex > 0
+                          ? `<div data-treasury-action="classes-prev" role="button" tabindex="0" aria-label="Previous page of share classes"
+                               style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                          : ""
+                      }
+                      ${
+                        classes.hasMore
+                          ? `<div data-treasury-action="classes-next" role="button" tabindex="0" aria-label="Next page of share classes"
+                               style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                          : ""
+                      }
+                    </div>`
+                  : ""
+              }
+              ${dim(esc(b.note))}`;
+          })()
+        : // A badge here too. Every other cache-backed panel carries one, and
+          // this branch is where the panel is LEAST certain — an absent policy
+          // and one the device refused should not both be silent about how
+          // much checking happened.
+          (() => {
+            const held = policyStatus === "too-large" || policyStatus === "unreadable";
+            const tag = !readable
+              ? { ...trustTag("absent"), detail: "No lookup was possible, so nothing is known either way." }
+              : held
+                ? {
+                    ...trustTag("unverified"),
+                    label: "UNREAD",
+                    detail:
+                      policyStatus === "too-large"
+                        ? "A policy is held here, but this device would not read it: it is larger than this device is willing to process."
+                        : "A policy is held here, but this device could not make sense of it.",
+                  }
+                : trustTag("absent");
+            return `<div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:5px;">
+                <span style="font-size:11px; font-weight:800; color:#f0c060;">${
+                  !readable
+                    ? "Company details unavailable"
+                    : held
+                      ? "Company policy cannot be read"
+                      : "No company policy"
+                }</span>
+                ${badge("policy", tag)}
+              </div>
+              ${dim(
+                !readable
+                  ? "Company details cannot be read on this device, so nothing is known about the company either way."
+                  // A record this device declined to read is NOT an absent
+                  // record. The size cap is a local display decision, so a
+                  // policy that is perfectly valid on the wire can trip it —
+                  // and answering that with "none cached" would deny a policy
+                  // the room is holding.
+                  : policyStatus === "too-large"
+                    ? "A company policy is held in this room, but it is too large for this device to read. That is this device's limit, not a fault in the record."
+                    : policyStatus === "unreadable"
+                      ? "A company policy is held in this room, but this device cannot make sense of it — wrong shape, wrong network, or damaged."
+                      : "No company policy cached in this room yet.",
+              )}`;
+          })()
+    }
+
+    ${header(`PROPOSALS${rows.length ? ` · ${rows.length}` : ""}`)}
+    ${
+      rows.length
+        ? rows
+            .map(
+              (r) => `<div data-treasury-action="open" data-proposal-id="${esc(r.proposalId)}" role="button" tabindex="0"
+                aria-label="${esc(`${r.kindLabel}, policy version ${r.policyVersion}. ${r.phaseLabel}.${r.clockSourceLabel ? ` Clocks ${r.clockSourceLabel.toLowerCase()}.` : ""} ${r.clockTrust.label}: ${r.clockTrust.detail}`)}"
+                style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:6px 8px; border:1px solid rgba(212,168,75,0.2); border-radius:6px; cursor:pointer; font-size:10px;">
+                <span style="min-width:0;">
+                  <span style="font-weight:700; color:#f0c060;">${esc(r.kindLabel)}</span>
+                  <span style="display:block; font-size:8.5px; color:${TREASURY_MUTED};">${esc(r.shortId)} · policy v${r.policyVersion}</span>
+                </span>
+                <span style="flex-shrink:0; font-size:9px; color:${TREASURY_LABEL}; text-align:right;">
+                  ${esc(r.phaseLabel)}<br />${badge(null, r.clockTrust)}
+                  ${
+                    // Both clock paths badge as UNVERIFIED — correctly, since
+                    // both rest on peer-written inputs. Without the source
+                    // beside it, a window copied wholesale from another player
+                    // read exactly like one worked out here.
+                    r.clockSourceLabel
+                      ? `<br /><span style="font-size:8px; color:${TREASURY_MUTED};">${esc(r.clockSourceLabel)}</span>`
+                      : ""
+                  }
+                </span>
+              </div>`,
+            )
+            .join("") +
+          dim(
+            heightSource === "peer-reported"
+              ? `Where each one sits on its clocks is worked out from a height another player reported (${formatHeight(height ?? 0)}) — this device has not checked it.`
+              : "This device has no chain height, so these are listed without saying which window each is in.",
+          )
+        : scoped.otherCompanies > 0
+          ? "" // records exist; the line below explains why none are listed
+          : dim(
+              !readable
+                ? "Proposals cannot be read on this device, so none can be listed — that is not the same as there being none."
+                : truncated
+                  ? // The scan stopped before the end of the map, so "none"
+                    // is a claim this screen cannot make.
+                    "No proposals were found in the part of this room's records that was read, and the rest was not looked at."
+                  : // PAGE-LOCAL counts, not `matched`. matched is every key
+                    // across every page, so a final page of rejects used to
+                    // claim that records shown perfectly well on earlier pages
+                    // were unreadable.
+                    page.rejected + page.refusedTooLarge > 0
+                    ? `No proposals could be listed on this page. ${page.rejected + page.refusedTooLarge} record${page.rejected + page.refusedTooLarge === 1 ? " here is" : "s here are"} held but could not be read.`
+                    : "No proposals in this room's records yet.",
+            )
+    }
+    ${
+      // Both counts, rendered independently and whether or not any row
+      // survived. Gating them on `rows.length > 0` hid them exactly when a
+      // page was all failures, and gating on the company filter hid them
+      // whenever the surviving rows belonged to another company — the two
+      // cases where the player most needs to know something was dropped.
+      page.refusedTooLarge > 0
+        ? dim(
+            `${page.refusedTooLarge} record${page.refusedTooLarge === 1 ? " on this page was" : "s on this page were"} too large for this device to read, so ${page.refusedTooLarge === 1 ? "it is" : "they are"} not listed. That is this device's limit, not a fault in the records.`,
+          )
+        : ""
+    }
+    ${
+      page.rejected > 0
+        ? dim(
+            `${page.rejected} record${page.rejected === 1 ? " on this page is" : "s on this page are"} held but could not be made sense of — wrong shape, wrong network, or a signature that did not check out — so ${page.rejected === 1 ? "it is" : "they are"} not listed.`,
+          )
+        : ""
+    }
+    ${
+      // Worded "in this room", not "on this page": unlike the two counts
+      // above, this one is found while walking the WHOLE map, and a map-wide
+      // figure under a page-local heading would be its own small dishonesty.
+      page.malformedKeys > 0
+        ? dim(
+            `${page.malformedKeys} entr${page.malformedKeys === 1 ? "y is" : "ies are"} filed in this room under a name too long to belong to any proposal, so ${page.malformedKeys === 1 ? "it was" : "they were"} not read at all.`,
+          )
+        : ""
+    }
+    ${
+      // A different claim from "there is another page", and the stronger one:
+      // the search that BUILDS the pages stopped early, so paging cannot be
+      // relied on to reach what it missed. Said plainly rather than folded
+      // into the ordinary partial-list note, which would present a record
+      // nothing can reach as merely one that is further along.
+      page.discoveryCutShort
+        ? dim(
+            "This room holds more entries than this device will search in one go, so there may be proposals here that paging cannot reach.",
+          )
+        : ""
+    }
+    ${
+      // A way to actually reach what the page does not show. Without this the
+      // partial-list warning told the player their view was incomplete and
+      // offered them nothing to do about it — which is what made a small
+      // junk flood enough to hide every real proposal.
+      pagerNeeded(page, LIST_CHECKS, treasuryListCursors)
+        ? `${dim(
+            `Showing records ${pageRange(page, LIST_CHECKS)} held under this room's proposal keys. Only this page was read.`,
+          )}
+          <div style="display:flex; gap:6px; margin-top:6px;">
+            ${
+              // Neutral labels. Pages are ordered by record key, which is a
+              // content hash — so the previous page is not the earlier one in
+              // any sense a player would mean, and "EARLIER" implied a
+              // chronology this ordering does not have. Rows WITHIN a page are
+              // sorted by acceptance height; across pages there is no time
+              // order at all.
+              treasuryListCursors.length > 1
+                ? `<div data-treasury-action="page-prev" role="button" tabindex="0" aria-label="Previous page of proposals"
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">‹ PREVIOUS PAGE</div>`
+                : ""
+            }
+            ${
+              lastListNext !== null
+                ? `<div data-treasury-action="page-next" role="button" tabindex="0" aria-label="Next page of proposals"
+                     style="font-size:9px; font-weight:700; color:#f0c060; cursor:pointer; padding:4px 8px; border:1px solid rgba(212,168,75,0.3); border-radius:5px;">NEXT PAGE ›</div>`
+                : ""
+            }
+          </div>`
+        : ""
+    }
+    ${
+      // Page-local, and said so. `scoped` is built from this page's items, so
+      // "held in this room" made a partial count sound like the room's total —
+      // and on a multi-page list it under-reports, which is the same shape of
+      // false certainty as the counts above.
+      scoped.scopeUnknown && scoped.otherCompanies > 0
+        ? dim(
+            `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? "" : "s"} on this page ${scoped.otherCompanies === 1 ? "is" : "are"} held without company details, so there is no way to tell whose ${scoped.otherCompanies === 1 ? "it is" : "they are"} and ${scoped.otherCompanies === 1 ? "it is" : "they are"} not listed.`,
+          )
+        : scoped.otherCompanies > 0
+          ? dim(
+              `${scoped.otherCompanies} proposal${scoped.otherCompanies === 1 ? "" : "s"} on this page belong${scoped.otherCompanies === 1 ? "s" : ""} to a different company and ${scoped.otherCompanies === 1 ? "is" : "are"} not listed here.`,
+            )
+          : ""
+    }
+    ${
+      truncated
+        ? dim(
+            "This room holds more records than were read for this screen, so the list is partial and in no particular order.",
+          )
+        : ""
+    }
+
+    <div class="ssf-badge-row" style="display:flex; align-items:center; gap:6px; margin-top:12px;">
+      <span style="font-size:10px; font-weight:800; letter-spacing:1px; color:${TREASURY_LABEL};">CHAIN VIEW</span>
+      ${badge("sync", sync.trust)}
+    </div>
+    ${
+      // WHICH network these records are pinned to, named on the one panel
+      // that is about chain trust. `label` was documented as player-facing
+      // and configured through VITE_SSF_TREASURY_NETWORK, but nothing read
+      // it — so the option changed nothing a player could see, and a build
+      // pinned to a test network looked exactly like one pinned to the real
+      // one. For a screen about money that is the distinction most worth
+      // showing. The unconfigured case keeps its fuller explanation in the
+      // banner above and is not repeated here.
+      net.configured ? row("Records pinned to", esc(net.label)) : ""
+    }
+    ${
+      // The pin ITSELF, not only its name. `label` is an operator's free-text
+      // string with no tie to the genesis the cache is pinned to, so two
+      // builds pinned to different networks under one label looked identical
+      // on screen, and a build with only the required genesis set read
+      // "Records pinned to configured network" — a row naming no network at
+      // all. Shown in full and selectable, like the policy fingerprint above,
+      // because a shortened hash cannot be compared against anything.
+      net.configured && net.genesisChallenge
+        ? `<div style="font-size:10px; color:${TREASURY_LABEL}; margin-top:5px;">Network genesis</div>
+           <div style="font-size:8.5px; color:#f0c060; margin-top:2px; word-break:break-all; user-select:all;" title="Select to copy — compare every character against your own node's network">${esc(net.genesisChallenge)}</div>`
+        : ""
+    }
+    ${row("This device", "not verifying")}
+    ${
+      !sync.readable
+        ? row("Another player reports", "not read")
+        : sync.peerClaim
+          ? row(
+              "Another player reports",
+              `${esc(sync.peerClaim)}${sync.peerHeight !== null ? ` · ${formatHeight(sync.peerHeight)}` : ""}`,
+            )
+          // "nothing" only when the slot is genuinely empty. A held-but-
+          // unreadable claim gets its own wording, or this row would flatly
+          // contradict the UNREAD badge the panel just rendered.
+          : syncResult?.status === "unreadable"
+            ? row("Another player reports", "something unreadable")
+            : row("Another player reports", "nothing")
+    }
+    ${dim("Reports from other players are shown as claims only — your own node's view is what will decide, once that lane ships.")}`;
+}
+
 // ── 🚀 VENTURES app (#68 V1) ─────────────────────────────────────────────────
 // Screen 1: YOUR STAKES (every entity you hold shares in) + REAL ESTATE (every
 // module you personally own — the deeds ledger). Screen 2a: venture detail —
@@ -2769,6 +4669,12 @@ let deedDetailRoomId = "";
  *  a second click on the SAME recipient executes. Any repaint keeps it — only
  *  back/open/select-change re-arm. */
 let deedHandoverArmed = "";
+/** 🩹 #142 two-step guard, same idiom as the hand-over above. Deregistering an
+ *  office destroys the venture's ONLY authoritative cap table and cannot be
+ *  undone, and the button is rendered for every visitor (the action is ungated
+ *  by design — see detachOfficeRecord). Ungated is about WHO may act; it does
+ *  not mean one stray tap should be able to do it. */
+let officeDetachArmed = false;
 
 function syncVentureLedgerFromCurrentRoom(): void {
   const v = ventureRecord();
@@ -2783,7 +4689,14 @@ function syncVentureLedgerFromCurrentRoom(): void {
   //  - the OFFICE (or a NEWER link) refreshes the ledger's cap-table snapshot;
   //  - a STALE link gets rewritten from the ledger (freshness travels with us).
   const seenAt = isOffice ? Date.now() : (v.snapshotAt ?? 0);
-  const ledgerFresher = (prior?.capSeenAt ?? 0) > seenAt;
+  // 🏢 At the REGISTERED OFFICE the doc is authoritative by definition
+  // (ventures.ts header: "the office is THE authoritative cap table"), so the
+  // ledger must never outrank it. Without the `!isOffice` guard a cached
+  // capSeenAt stamped ahead of our clock stayed "fresher" than every office
+  // visit, so a poisoned cap table survived standing in the very room that
+  // could correct it — and then rode onward to the venture's other property
+  // links. Now one office visit repairs the ledger. (#143)
+  const ledgerFresher = !isOffice && (prior?.capSeenAt ?? 0) > seenAt;
   const properties = new Set(prior?.properties ?? []);
   if (!isOffice) properties.add(roomId);
   const entry = {
@@ -2808,18 +4721,28 @@ function syncVentureLedgerFromCurrentRoom(): void {
 /** Is the CURRENT room's `roomInfo.owner` value ME, personally? Deliberately
  *  the RAW owner — NOT the shareholder-extended `isLocalPlayerRoomOwner` gate:
  *  a deed belongs to the personal owner alone (venture co-owners get access,
- *  not the right to hand the module away). Legacy 'Local-Clone' rooms count
- *  as mine, matching `categorizeRoom`. */
+ *  not the right to hand the module away). 🔒 #141: legacy 'Local-Clone' rooms
+ *  no longer count as mine — they counted as EVERYONE's — matching
+ *  `categorizeRoom`, which now files them as 'visited'. */
 function currentRoomDeedIsMine(): boolean {
-  const ownerVal = yjsSync?.doc.getMap("roomInfo").get("owner") as
-    | string
-    | undefined;
-  if (typeof ownerVal !== "string" || !ownerVal) return false;
-  if (ownerVal === getPlayerId() || ownerVal === "Local-Clone") return true;
-  const entry = yjsSync?.doc.getMap("players").get(ownerVal) as
-    | Partial<PlayerEntry>
-    | undefined;
-  return typeof entry?.keyB64 === "string" && entry.keyB64 === getIdentityPub();
+  // The decision lives in roomOwner.ts so it can be unit-tested; this wrapper
+  // supplies the live getters, exactly as isLocalPlayerRoomOwner does.
+  //
+  // ⚠️ `ownerKeyB64` is passed as a LOOKUP, never as a resolved key. #141's
+  // invariant is that the legacy marker must never be RESOLVED — `players` is
+  // peer-written and the marker is used as a KEY into it, so resolving it here
+  // and handing the result over would reopen the hole with roomOwner.ts still
+  // looking correct. isDeedHolder calls this only after refusing the marker.
+  return isDeedHolder(
+    yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined,
+    {
+      playerId: getPlayerId(),
+      identityPub: getIdentityPub(),
+      ownerKeyB64: (owner) =>
+        (yjsSync?.doc.getMap("players").get(owner) as Partial<PlayerEntry> | undefined)
+          ?.keyB64,
+    },
+  );
 }
 
 /** Visitation harvest (the atlas/venture-ledger pattern): the room we're IN
@@ -3237,16 +5160,19 @@ function renderVenturesApp(): void {
         ventureDetailId = el.dataset.id ?? "";
         deedDetailRoomId = "";
         deedHandoverArmed = "";
+        officeDetachArmed = false;
         offerCutNote = "";
       } else if (action === "back") {
         ventureDetailId = "";
         deedDetailRoomId = "";
         deedHandoverArmed = "";
+        officeDetachArmed = false;
         offerCutNote = "";
       } else if (action === "deed-open") {
         deedDetailRoomId = el.dataset.id ?? "";
         ventureDetailId = "";
         deedHandoverArmed = "";
+        officeDetachArmed = false;
         offerCutNote = "";
       } else if (action === "deed-transfer") {
         const sel = document.getElementById(
@@ -3291,6 +5217,19 @@ function renderVenturesApp(): void {
       } else if (action === "detach-property") {
         // Personal owner of a property room casts it out of the venture.
         removeVentureLink();
+      } else if (action === "detach-office") {
+        // 🩹 #142: deregister an office record. Ungated — see detachOfficeRecord
+        // — but two-step, because this destroys the venture's only
+        // authoritative cap table with no undo and no re-registration path.
+        if (!officeDetachArmed) {
+          officeDetachArmed = true; // first click ARMS; the repaint shows CONFIRM
+        } else {
+          officeDetachArmed = false;
+          if (detachOfficeRecord()) {
+            syncVentureLedgerFromCurrentRoom();
+            ventureDetailId = "";
+          }
+        }
       } else if (action === "transfer") {
         const pubInput = document.getElementById(
           "venture-transfer-pub",
@@ -3694,6 +5633,7 @@ function renderVenturesApp(): void {
         .join("")}
       <div style="font-size:9px; color:rgba(212,168,75,0.65); margin-top:2px;">Every shareholder has full access to venture property.${detail.snapshotAt !== undefined ? " Cap table is a snapshot — trades happen at the office." : ""}</div>
       ${detail.snapshotAt !== undefined && ownerValIsMe() ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-property" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH THIS MODULE</button></div>` : ""}
+      ${detail.snapshotAt === undefined ? `<div style="margin-top:6px;"><button type="button" data-venture-action="detach-office" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">${officeDetachArmed ? "⚠ CONFIRM DEREGISTER" : "⏏ DEREGISTER THIS OFFICE"}</button><div style="font-size:9px; color:#ffb300; margin-top:3px; min-height:10px;">${officeDetachArmed ? `Deregister 🚀 ${esc(detail.name)}? This erases its cap table — all ${detail.totalShares} shares — from the only room that holds it. There is no undo and no way to re-register.` : ""}</div><div style="font-size:9px; color:rgba(212,168,75,0.65);">Ungated on purpose (#142): a planted office record is otherwise unremovable, and nothing authorizes room-doc writes yet, so a gate would only block the cleanup. Two taps, because it cannot be undone.</div></div>` : ""}
       ${
         mine > 0 && detail.snapshotAt === undefined
           ? `
@@ -3991,6 +5931,12 @@ function renderVenturesApp(): void {
     ${redeemBlock}
     ${foundBlock}
     ${addBlock}
+    <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:rgba(212,168,75,0.95); margin-top:14px;">COMPANY</div>
+    <div data-phone-app="treasury" role="button" tabindex="0" aria-label="Open the company Treasury"
+      style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-top:6px; padding:8px 10px; border:1px solid rgba(212,168,75,0.25); border-radius:6px; cursor:pointer;">
+      <span style="font-size:10px; font-weight:700; color:#f0c060;">🏦 TREASURY</span>
+      <span style="font-size:9px; color:${TREASURY_MUTED};">board · proposals · funding ›</span>
+    </div>
   `;
 }
 const CHARTER_TOTAL_SHARES_LABEL = 100;
@@ -4019,10 +5965,11 @@ function renderCoHostsSection(): void {
       if (!el) return;
       const pub = el.dataset.pub ?? "";
       const action = el.dataset.cohostAction;
-      const ownerVal =
-        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-        "";
-      const amOwner = isLocalPlayerRoomOwner(ownerVal);
+      // 🔒 #142: the RAW deed holder, not the shareholder-extended gate.
+      // Accept/deny/revoke decide who keeps the room alive, so they sit with
+      // the deed like the hand-over and the croupier election — see the note
+      // on currentRoomDeedIsMine.
+      const amOwner = currentRoomDeedIsMine();
       if (action === "volunteer") {
         writeCoHostRequest(getIdentityPub(), getPlayerName());
       } else if (action === "withdraw") {
@@ -4040,9 +5987,9 @@ function renderCoHostsSection(): void {
     });
   }
 
-  const ownerVal =
-    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
-  const amOwner = isLocalPlayerRoomOwner(ownerVal);
+  // 🔒 #142: matches the handler's gate above — the render must not offer a
+  // REVOKE button the click handler will refuse.
+  const amOwner = currentRoomDeedIsMine();
   const myPub = getIdentityPub();
   const esc = (s: string) =>
     s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
@@ -4210,6 +6157,7 @@ function setupSpacePhoneOverlay() {
     | "bank"
     | "access"
     | "ventures"
+    | "treasury"
     | "settings"
     | "setnet"
     | "setstats";
@@ -4247,6 +6195,11 @@ function setupSpacePhoneOverlay() {
       title: "🚀 VENTURES",
       subtitle: "Charters · Shares · Real Estate",
     },
+    treasury: {
+      elId: "phone-app-treasury",
+      title: "🏦 TREASURY",
+      subtitle: "Company · Board · Proposals",
+    },
     settings: {
       elId: "phone-app-settings",
       title: "⚙️ SETTINGS",
@@ -4267,6 +6220,8 @@ function setupSpacePhoneOverlay() {
   const phoneViewParent: Partial<Record<PhoneViewId, PhoneViewId>> = {
     setnet: "settings",
     setstats: "settings",
+    // 🏦 The treasury opens from VENTURES (plan §11), so BACK returns there.
+    treasury: "ventures",
   };
 
   // 📦 De-overlay (owner request): the Network Details, stats and room-info
@@ -4377,21 +6332,77 @@ function setupSpacePhoneOverlay() {
       renderVenturesApp();
     }
     if (id === "bank") renderBankApp();
+    if (id === "treasury") {
+      treasuryDetailId = "";
+      renderTreasuryApp();
+      // Land focus in the view so its arrow-key traversal is reachable
+      // without a pointer (Tab is the app's phone toggle, not a tab stop).
+      const tv = document.getElementById("phone-app-treasury");
+      if (tv) {
+        tv.setAttribute("tabindex", "-1");
+        tv.focus({ preventScroll: true });
+      }
+    }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
   };
 
-  // App tiles on the home screen route into their views
-  document
-    .querySelectorAll<HTMLButtonElement>(".phone-app-tile")
-    .forEach((tile) => {
-      tile.addEventListener("click", () => {
-        const target = tile.dataset.phoneApp as PhoneViewId | undefined;
-        if (target && target in phoneViewMeta) {
-          showPhoneView(target);
-        }
-      });
-    });
+  // App tiles on the home screen route into their views. Delegated from the
+  // phone shell rather than bound per tile, so links rendered INSIDE an app
+  // (VENTURES → 🏦 TREASURY) survive that app's innerHTML repaints.
+  const phoneShell = document.getElementById("phone-screen") ?? document;
+  const routeFrom = (target: EventTarget | null): boolean => {
+    const el = (target as HTMLElement | null)?.closest<HTMLElement>(
+      "[data-phone-app]",
+    );
+    const id = el?.dataset.phoneApp as PhoneViewId | undefined;
+    if (!id || !(id in phoneViewMeta)) return false;
+    showPhoneView(id);
+    return true;
+  };
+  /**
+   * The control outside the phone that opened it, if any.
+   *
+   * The phone is only slid offscreen, never display:none, so focus left inside
+   * it stays live and keeps answering arrow keys against rows nobody can see.
+   * A keyboard player who reached TREASURY from the room terminal would then
+   * have no way back to the terminal.
+   */
+  let phoneOpener: HTMLElement | null = null;
+  const releasePhoneOpener = (): void => {
+    const opener = phoneOpener;
+    phoneOpener = null;
+    // Only if it is still in the document and still focusable: the terminal
+    // panel is torn down on unmount, and focusing a detached node silently
+    // sends focus to <body> instead.
+    if (opener?.isConnected) opener.focus({ preventScroll: true });
+  };
+  // 🏦 Cross-surface entry point, same posture as __ssfRoomId: the room
+  // terminal's FUNDING panel is mounted outside the phone shell, so it cannot
+  // use the delegated router. It opens the phone straight to TREASURY.
+  (
+    window as unknown as { __ssfOpenTreasury?: () => void }
+  ).__ssfOpenTreasury = () => {
+    // Remember who sent us here, so closing the phone can hand focus back.
+    // Only for openers OUTSIDE the phone: a control within it is about to be
+    // hidden anyway, and would be a worse place to land than the game.
+    const opener = document.activeElement as HTMLElement | null;
+    phoneOpener = opener && !phoneShell.contains(opener) ? opener : null;
+    // Quick chat first. It leaves the phone in `peek`, and `.peek` is declared
+    // after `.active` at equal specificity, so adding `active` alone left the
+    // phone at bottom:-386px — mostly offscreen — and this link appeared to do
+    // nothing. Closing it also returns the chat form to its home slot, which
+    // is what the Tab handler does on the same transition.
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView("treasury");
+  };
+  phoneShell.addEventListener("click", (e) => routeFrom(e.target));
+  phoneShell.addEventListener("keydown", (e) => {
+    const ev = e as KeyboardEvent;
+    if (ev.key !== "Enter" && ev.key !== " ") return;
+    if (routeFrom(ev.target)) ev.preventDefault();
+  });
 
   if (backBtn) {
     backBtn.addEventListener("click", () => {
@@ -4526,6 +6537,12 @@ function setupSpacePhoneOverlay() {
           logToPhoneSystem("Entering SpacePhone net...");
         } else {
           chatInput?.blur();
+          // Hand focus back to whatever opened the phone from outside it. The
+          // phone is only moved offscreen, never display:none, so a control
+          // left focused inside it keeps answering the arrow keys against
+          // hidden rows — a keyboard player who opened TREASURY from the room
+          // terminal could not get back to the terminal at all.
+          releasePhoneOpener();
         }
       }
     }
@@ -4667,6 +6684,37 @@ function setupSpacePhoneOverlay() {
     });
   }
 
+  // 🛰️ DEFAULT STATION (defaultStation.ts): one tap adds the welcome room's
+  // pass and auto-enters it — the ADD PASS path with the bundled link. The
+  // whole section hides when a build ships without a default station.
+  const accessDefaultSection = document.getElementById(
+    "access-default-station-section",
+  );
+  const accessDefaultBtn = document.getElementById(
+    "access-default-station-btn",
+  );
+  if (!DEFAULT_STATION.welcomeRoomId) {
+    if (accessDefaultSection) accessDefaultSection.style.display = "none";
+  } else if (accessDefaultBtn) {
+    accessDefaultBtn.textContent = `🛰️ GO TO ${DEFAULT_STATION.name}`;
+    accessDefaultBtn.addEventListener("click", () => {
+      if (activeBootstrap?.roomId === DEFAULT_STATION.welcomeRoomId) {
+        setAccessFeedback(`You are already aboard ${DEFAULT_STATION.name}.`);
+        return;
+      }
+      const result = addPass(DEFAULT_STATION.welcomeRoomLink);
+      if (!result.ok) {
+        setAccessFeedback(result.error);
+        return;
+      }
+      autoEnterRoomId = result.roomId;
+      setAccessFeedback(
+        `🛰️ Connecting to ${DEFAULT_STATION.name} — you'll be taken in automatically once it's ready. ` +
+          `A first cross-internet connect can take up to ~30s.`,
+      );
+    });
+  }
+
   renderPassesList();
   subscribePasses(renderPassesList);
   // Re-categorise rooms when the friends list changes (a room's owner moving
@@ -4698,9 +6746,10 @@ function setupSpacePhoneOverlay() {
     }
   });
 
-  // Room access mode selector (public-doors): owner sets PUBLIC/PASS/KEYED;
-  // the roomInfo observer repaints it live for everyone (setRoomAccessMode is
-  // owner-gated, so a non-owner click is inert).
+  // Room access mode selector (public-doors): the DEED HOLDER sets
+  // PUBLIC/PASS/KEYED; the roomInfo observer repaints it live for everyone
+  // (setRoomAccessMode is deed-holder-gated since #142, so anyone else's click
+  // is inert — a venture shareholder's included).
   const accessModeRow = document.getElementById("access-mode-row");
   if (accessModeRow) {
     accessModeRow.addEventListener("click", (e) => {
@@ -5199,16 +7248,16 @@ function setupNetworkDetailsPanel() {
         if (newVal) {
           if (yjsSync) {
             const rMap = yjsSync.doc.getMap("roomInfo");
-            const ownerVal = (rMap.get("owner") as string) || "Local-Clone";
-            // S2 gate: owner is our player id, or a legacy pre-S2 room
-            // ('Local-Clone' owner) — those stay editable by everyone.
+            // 🔒 #141: do NOT substitute 'Local-Clone' for an absent owner —
+            // manufacturing the marker is how an unset field became a grant.
+            const ownerVal = (rMap.get("owner") as string) || "";
             if (isLocalPlayerRoomOwner(ownerVal)) {
               yjsSync.doc.transact(() => {
                 rMap.set("name", newVal);
               });
             } else {
               if (feedback)
-                feedback.textContent = `Only the owner (${resolveOwnerLabel(ownerVal)}) can edit the room name.`;
+                feedback.textContent = ownerGateRefusal(ownerVal, "rename");
               setTimeout(() => {
                 if (feedback) feedback.textContent = "";
               }, 4000);
@@ -5301,13 +7350,23 @@ function setupNetworkDetailsPanel() {
   if (urlSeed) {
     const imported = decodeBootstrapSeed(urlSeed);
     if (imported) {
-      resolveBridgeBootstrap(imported).then((resolved) => {
-        pendingBootstrapOverride = resolved;
-        if (feedback) {
-          feedback.textContent =
-            "Zero-config P2P Seed loaded from URL. Entering lobby...";
-        }
-      });
+      // Registered SYNCHRONOUSLY, then refined: the boot reads the override
+      // before this resolution can settle (it awaits the local node), so the
+      // raw pass claims the slot at once — an explicit link outranks the
+      // last-room resume and the default station whatever the timing — and
+      // bootstrapNetworking awaits `urlSeedImport` to dial the bridged form.
+      pendingBootstrapOverride = imported;
+      urlSeedImport = resolveBridgeBootstrap(imported)
+        .then((resolved) => {
+          pendingBootstrapOverride = resolved;
+          if (feedback) {
+            feedback.textContent =
+              "Zero-config P2P Seed loaded from URL. Entering lobby...";
+          }
+        })
+        .catch(() => {
+          /* the raw pass stays registered — the loopback guard refreshes its cert */
+        });
       const accessPassInput = document.getElementById(
         "access-pass-input",
       ) as HTMLInputElement | null;
@@ -5478,24 +7537,27 @@ function getRoomAccessMode(): AccessMode {
   return m === "public" || m === "keyed" ? m : "pass";
 }
 
-function isLocalOwnerOfCurrentRoom(): boolean {
-  const owner = yjsSync?.doc.getMap("roomInfo").get("owner") as
-    | string
-    | undefined;
-  return !!owner && isLocalPlayerRoomOwner(owner);
-}
-
+/** 🔒 #142: access mode is the lock-out surface — set it to `keyed` and nobody
+ *  else gets in — so it belongs to the RAW deed holder, not to
+ *  `isLocalPlayerRoomOwner`'s shareholder-extended set. `isVentureShareholder`
+ *  reads the current room's own venture map entry, which is shape-checked and
+ *  peer-written with nothing tying it to this room or its owner, so a
+ *  fabricated office record used to carry the right to lock the room. It no
+ *  longer does. The deed, the croupier election and co-host management already
+ *  sit here for the same reason. Cost, accepted deliberately: on a venture
+ *  property only the deed holder sets access mode; shareholders keep room
+ *  edits, docking and door policy. */
 function setRoomAccessMode(mode: AccessMode): void {
-  if (!yjsSync || !isLocalOwnerOfCurrentRoom()) return; // owner-gated
+  if (!yjsSync || !currentRoomDeedIsMine()) return; // deed-holder-gated
   const rm = yjsSync.doc.getMap("roomInfo");
   yjsSync.doc.transact(() => rm.set("accessMode", mode));
 }
 
 /** Reflect the current access mode: tint the door LEDs + paint the ACCESS
- *  app's selector (owner-editable, everyone else read-only). */
+ *  app's selector (deed-holder-editable, everyone else read-only). */
 function applyAccessModeUI(mode: AccessMode): void {
   world.dockingSystem?.setAccessMode(mode);
-  const isOwner = isLocalOwnerOfCurrentRoom();
+  const isOwner = currentRoomDeedIsMine();
   const row = document.getElementById("access-mode-row");
   if (row) {
     for (const btn of row.querySelectorAll<HTMLButtonElement>(
@@ -5507,7 +7569,7 @@ function applyAccessModeUI(mode: AccessMode): void {
       btn.classList.toggle("is-disabled", !isOwner);
       btn.title = isOwner
         ? `Set room access to ${btnMode}`
-        : "Only the room owner can change access mode";
+        : "Only this module’s deed holder can change access mode";
     }
   }
   const note = document.getElementById("access-mode-note");
@@ -6070,6 +8132,12 @@ function roomOwnerInfo(roomId: string): {
     const doc = yjsSync.doc;
     const ownerId = doc.getMap("roomInfo").get("owner");
     if (typeof ownerId !== "string" || !ownerId) return {};
+    // 🔒 #141 defence in depth: never RESOLVE the legacy marker through the
+    // peer-written `players` map. There is no honest entry to find — the
+    // marker names no player — so any hit is planted, and a resolved pub is
+    // exactly what lets a caller conclude the room is theirs. Callers still
+    // get `ownerId` for display; they just get no key to match against.
+    if (legacyOwnerMarker(ownerId)) return { ownerId };
     const entry = doc.getMap("players").get(ownerId) as
       | { keyB64?: string }
       | undefined;
@@ -6087,12 +8155,16 @@ function roomOwnerInfo(roomId: string): {
 function categorizeRoom(roomId: string, friendPubs: Set<string>): RoomCategory {
   const { ownerId, ownerPub } = roomOwnerInfo(roomId);
   if (!ownerId) return "unreached";
-  // 'Local-Clone' is the legacy self-owned marker (pre-keyed-identity rooms).
-  if (
-    ownerId === getPlayerId() ||
-    ownerId === "Local-Clone" ||
-    (ownerPub && ownerPub === getIdentityPub())
-  ) {
+  // 🔒 #141: the legacy 'Local-Clone' marker no longer files a room as MINE —
+  // it filed every legacy room into every player's "mine" list at once. Those
+  // rooms are 'visited', which is what they honestly are.
+  //
+  // ⚠️ Returned BEFORE `ownerPub` is consulted. That value comes from
+  // resolving `ownerId` through the peer-written `players` map, so with the
+  // marker as the key an attacker plants their own `keyB64` there and files
+  // every legacy room as theirs. Same path as currentRoomDeedIsMine.
+  if (legacyOwnerMarker(ownerId)) return "visited";
+  if (ownerId === getPlayerId() || (ownerPub && ownerPub === getIdentityPub())) {
     return "mine";
   }
   if (ownerPub && friendPubs.has(ownerPub)) return "friend";
@@ -6476,27 +8548,29 @@ async function init() {
   setEditWorldProvider(() => world);
 
   // ── Room-edit owner gate (E2 of #25, plan §1), on S2's identity:
-  // isLocalPlayerRoomOwner accepts the local playerId AND the legacy
-  // 'Local-Clone' owner (pre-S2 rooms stay editable). The reason string
+  // isLocalPlayerRoomOwner accepts the local playerId and venture
+  // shareholders only — 🔒 #141 removed the legacy 'Local-Clone' owner, so
+  // pre-S2 rooms are now READ-ONLY for everyone. The reason string
   // resolves the owner's display name through the players map.
   setRoomEditPermission(() => {
     if (!yjsSync) return { ok: true }; // offline: your room
+    // 🔒 #141: an absent owner is NOT the legacy marker and grants nothing.
     const owner =
-      (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-      "Local-Clone";
+      (yjsSync.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
     return isLocalPlayerRoomOwner(owner)
       ? { ok: true }
-      : {
-          ok: false,
-          reason: `Only the owner (${resolveOwnerLabel(owner)}) can edit this room.`,
-        };
+      : { ok: false, reason: ownerGateRefusal(owner, "edit") };
   });
 
   // 🎰🤖 #77B: elect the SOLE auto-croupier operator. Unlike the edit gate above
   // (owner-equivalent — every venture shareholder passes), this is the RAW deed
   // holder, so a personal/solo room has exactly ONE operator and no double-settle.
-  // Venture / legacy 'Local-Clone' rooms make everyone owner ⇒ NO auto-operator;
-  // they keep the manual SPIN button. Offline (no sync) ⇒ we are the only client.
+  // Venture rooms make every shareholder owner ⇒ NO auto-operator; they keep
+  // the manual SPIN button. Offline (no sync) ⇒ we are the only client.
+  // 🔒 #141: legacy rooms no longer make everyone owner (the wildcard is gone),
+  // so currentRoomDeedIsMine already returns false for them. The explicit check
+  // below is now redundant — kept because it states the intent directly and
+  // costs nothing, rather than relying on a second function to stay correct.
   setSoleCroupierPredicate(() => {
     if (!yjsSync) return true;
     const owner = yjsSync.doc.getMap("roomInfo").get("owner");
@@ -6618,7 +8692,7 @@ function setupClickToEnter() {
   // 🆕 #79 P1: a genuine first run (no stored identity seed) holds the title on
   // a New Player / Load-from-Backup choice before the station reveals; a
   // returning install auto-reveals its station as before (proceedChosen = true).
-  const firstRun = !hasStoredIdentity();
+  const firstRun = IS_FIRST_RUN_INSTALL;
   let proceedChosen = !firstRun;
 
   const maybeFade = () => {
@@ -6761,6 +8835,13 @@ function setupClickToEnter() {
   // startMorph built the docking system synchronously — wire the adapter
   // transit driver + PROVISION NEW MODULE minting onto it (T1 of #30).
   wireAdapterTransit();
+  // 🛰️ Default station: merge the bundled layout into the local atlas (gossip
+  // tier) BEFORE the first exterior frame, so a first run docked at the welcome
+  // room sees the whole station from space while its doc is still syncing.
+  seedAtlasDefaults(defaultStationAtlas());
+  // #157: startMorph above already built the first-person shells, from the
+  // atlas as it stood BEFORE this seed — every atlas write re-poses them.
+  world?.refreshFpNeighbourShells();
   bootstrapNetworking();
 
   // 🛰️ #65 boot flow: once the intro morph settles, open IN the exterior —

@@ -8,9 +8,8 @@ import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
 import {
-  physicalDoorPose, setDoorRecords, isCardinalDoorId, poseFromWall,
-  type PhysicalDoorId,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
 } from "./doorLayout";
 import { Player } from "./player";
 import {
@@ -18,7 +17,9 @@ import {
   POOL_PATROL,
   LOBBY_PATROL,
   CASINO_PATROL,
+  ROBOT_BUBBLE_Y,
 } from "./poolWaiter";
+import type { WorkoutPose } from "./voxelCharacter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
@@ -75,6 +76,7 @@ import {
   colToWorld,
   rowToWorld,
   findPath,
+  nearestWalkableCell,
 } from "./pathfinding";
 import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
@@ -89,6 +91,8 @@ import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
+// 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
+import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -102,6 +106,7 @@ import type { DoorLayoutRecord } from "./doorLayoutDoc";
 import {
   buildVestibule,
   buildConnectorChain,
+  buildDockPortStub,
   setVestibuleLightState,
   setVestibuleOpacity,
 } from "./adapter";
@@ -136,6 +141,8 @@ import {
   tickManualSlotMachine,
 } from "./slotCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
+import { registerFurnitureHandles } from "./furnitureHandles";
+import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
   TrunkLidHandle,
@@ -156,7 +163,7 @@ import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
 import type { OutfitDef } from "./outfits";
 import { buildOctagonHull, buildOctagonShell } from "./octagonHull";
-import type { OctagonHull, HullWallpapers } from "./octagonHull";
+import type { OctagonHull, HullWallpapers, HullDoorOpening } from "./octagonHull";
 import {
   readAllWindowLayout,
   subscribeWindowLayout,
@@ -173,7 +180,7 @@ import {
 } from "./windowLayout";
 import { computeOctagonProfile } from "./hullSection";
 import type { OctagonProfile, HullSurface } from "./hullSection";
-import { getCameraYaw, addStationBias, resetStationBias } from "./cameraRig";
+import { getCameraYaw, getCameraForwardYaw, addStationBias, resetStationBias } from "./cameraRig";
 
 /**
  * A networked peer replica: a full fox rig plus interpolation state (issue #21
@@ -230,18 +237,8 @@ function doorAnchor(door: {
     : undefined;
 }
 
-/** 🚪 #91: the wall physically facing a given wall — the same axis, the
- *  opposite sign. Walking out of a room's y− side must bring you in through
- *  the next room's y+ side. */
-function oppositeWall(wall: DoorWall): DoorWall {
-  return wall === "y-"
-    ? "y+"
-    : wall === "y+"
-      ? "y-"
-      : wall === "x+"
-        ? "x-"
-        : "x+";
-}
+// 🚪 #91: "the wall physically facing a given wall" now lives in
+// doorMatch.oppositeWallOf, beside the arrival chooser that is its only user.
 
 export class World {
   private scene: THREE.Scene;
@@ -272,6 +269,14 @@ export class World {
   private robots = new Map<string, PoolWaiter>();
   /** Route the live robots were built with — a change rebuilds them all. */
   private robotsPatrol: Array<[number, number]> | null = null;
+  /** 🏋️ Cooldown (s) between row-formation escort walks, so a blocked path
+   *  can't re-issue navigation every frame. */
+  private coachEscortCooldown = 0;
+  /** 🔇 Robot lines are held until this timestamp — stamped 1 s past every
+   *  room entry so nothing barks during the load/entry flash. */
+  private robotQuietUntil = 0;
+  /** Edge detector for the player-entered-the-room moment (see above). */
+  private hadActivePlayer = false;
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -293,6 +298,14 @@ export class World {
   private capsuleOuterWalls: THREE.Mesh[] = [];
   // 🛑📐 #80 S1: the octagon hull barrel (only built under the ?octagon=1 flag).
   private octagonHull: OctagonHull | null = null;
+  /** 🚪 #159: what the live hull's door apertures were cut from (see
+   *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
+  private octagonHullDoorSig = "";
+  /** 🚪 #159: the apertures may be stale — the docking system said a frame
+   *  moved or vanished, or a door began to open or finished closing
+   *  (onDoorApertureChange). Settled once per frame in update(), so a join
+   *  that opens three doors in one tick re-cuts the hull once. */
+  private hullDoorsDirty = false;
   /** 🛑🛰️ #80 S5: the STATION seen from inside — neighbour module octagon shells
    *  + their connector tubes, posed around the current room; shown ONLY in first
    *  person (update() gate) so looking OUT a window shows the real station. */
@@ -386,6 +399,10 @@ export class World {
   private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
+  /** Unsubscribe for the #45 board-mirror games listener — held so a
+   *  createPlatform re-run (morph restart) swaps the listener instead of
+   *  stacking a duplicate. */
+  private unsubscribeGameBoards: (() => void) | null = null;
   // Atmosphere effects (animated each frame)
   private particleGeo: THREE.BufferGeometry | null = null;
   private particlePositions: Float32Array | null = null;
@@ -1047,14 +1064,57 @@ export class World {
       this.octagonHull = null;
     }
     const { halfX, halfZ } = roomHalfExtents();
+    const doorOpenings = this.collectHullDoorOpenings();
     this.octagonHull = buildOctagonHull(
       { halfX, halfZ },
       collectWindowOpenings(),
       this.collectWallpaper(),
+      doorOpenings,
     );
+    this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
-    // 🪟 keep the window click-boxes in lock-step with the (re)built hull.
+    // 🪟 keep the window click-boxes in lock-step with the (re)built hull…
     this.rebuildWindowClickBoxes();
+    // …and a live edit session's raycast index in step with THEM. The boxes
+    // were just disposed and rebuilt fresh, whoever asked for the hull — a
+    // window or wallpaper change, or (#159) a door opening, closing or moving —
+    // so the re-index lives here, where no caller can forget it. A targeted
+    // window-slice rebuild that preserves the current selection by id (mirrors
+    // reconcileDoorLayout → onDoorLayoutChanged); a no-op outside edit mode.
+    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+  }
+
+  /**
+   * 🚪 #159: the hull is cut open behind every door whose leaves are not shut —
+   * so an open door shows its vestibule instead of the wall panel it used to
+   * slide aside in front of. Behind a SHUT door the wall stays whole (see
+   * DoorDockingPortSystem.ajarDoorFrames for why, and for why the list comes
+   * from the frames themselves), which also means nothing is cut at boot,
+   * before the docking ports exist. The size is the frame's clear opening.
+   */
+  private collectHullDoorOpenings(): HullDoorOpening[] {
+    return (this.dockingSystem?.ajarDoorFrames() ?? []).map((frame) => ({
+      ...frame,
+      width: DOOR_OPENING_WIDTH,
+      height: DOOR_OPENING_HEIGHT,
+    }));
+  }
+
+  /** Everything the hull's door apertures depend on: the openings, and the
+   *  room size they are clamped to. */
+  private hullDoorSignature(openings: HullDoorOpening[]): string {
+    return JSON.stringify([roomHalfExtents(), openings]);
+  }
+
+  /** 🚪 #159: settle a dirty hull — re-cut it only if its apertures really
+   *  changed. Most of what marks it dirty changes nothing: a re-pose that moves
+   *  no door (the reconciles of every join), a slide landing OPEN. */
+  private settleHullDoorOpenings(): void {
+    if (!this.hullDoorsDirty) return;
+    this.hullDoorsDirty = false;
+    if (!OCTAGON_HULL || !this.octagonHull) return;
+    const sig = this.hullDoorSignature(this.collectHullDoorOpenings());
+    if (sig !== this.octagonHullDoorSig) this.addOctagonHull();
   }
 
   /** 🖼️ #80 S6: the current room's wall coverings as surface → preset, for the
@@ -1346,11 +1406,9 @@ export class World {
    */
   private reconcileWindowLayout(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull(); // rebuilds hull holes + glass AND the click-boxes
-    // 🪟 keep a live edit session's raycast index in sync with the window
-    // boxes just rebuilt — a targeted window-slice rebuild that preserves the
-    // current selection by id (mirrors reconcileDoorLayout → onDoorLayoutChanged).
-    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+    // Rebuilds hull holes + glass, the click-boxes, AND a live edit session's
+    // window raycast index (addOctagonHull does all three).
+    this.addOctagonHull();
   }
 
   /**
@@ -1360,8 +1418,7 @@ export class World {
    */
   private reconcileWallpaper(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
-    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes
-    if (roomEdit.isEditModeActive()) roomEdit.onWindowLayoutChanged();
+    this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes + edit index
   }
 
   /**
@@ -1457,15 +1514,20 @@ export class World {
     // from the doc-synced `games` map, so spectators see the live game
     // without focusing (the wall-screen hybrid idiom, §D0.4). The
     // subscription survives room rebinds — gamesDoc re-notifies on bind.
-    if (this.gameTableTops.size > 0) {
-      const repaintBoards = () => {
-        for (const [id, top] of this.gameTableTops) {
-          top.setBoard(readGame(id)?.board ?? null);
-        }
-      };
-      subscribeGames(repaintBoards);
-      repaintBoards();
-    }
+    // Subscribed UNCONDITIONALLY (not size-gated): the closure iterates the
+    // LIVE map, so a table added at runtime (DEV spawn, E4 reconcile) into a
+    // room built with zero game tables still repaints — a size>0 gate here
+    // left such rooms without any mirror until reload. Over an empty map the
+    // callback is a free no-op. A createPlatform re-run (morph restart) drops
+    // the previous listener first, so rebuilds never stack duplicates.
+    this.unsubscribeGameBoards?.();
+    const repaintBoards = () => {
+      for (const [id, top] of this.gameTableTops) {
+        top.setBoard(readGame(id)?.board ?? null);
+      }
+    };
+    this.unsubscribeGameBoards = subscribeGames(repaintBoards);
+    repaintBoards();
   }
 
   /**
@@ -1479,47 +1541,30 @@ export class World {
    *    on a client already past the morph) which no fade-in will ever touch.
    * ⚠ Every per-item collection here MUST have its inverse delete in
    * removeFurnitureVisuals, or removal leaves a live driven handle (#45 F1).
+   * The drive-handle filing itself lives in furnitureHandles.ts — ONE list
+   * shared with devMenu's registerSpawnedGroup (#117 was the two-copy drift).
    */
   private registerFurnitureGroup(item: FurnitureItem, reveal: boolean): void {
     const group = buildItemGroup(item);
     this.platformGroup.add(group);
     this.furnitureGroups.set(item.id, group);
+    const sinks = this.furnitureHandleSinks();
     group.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {
         this.furnitureMeshes.push(obj);
-        if (obj.userData.wallScreen) {
-          this.wallScreens.set(
-            item.id,
-            obj.userData.wallScreen as WallScreenHandle,
-          );
-        }
-        if (typeof obj.userData.holoSpin === "number") {
-          this.holoSpinners.push({ mesh: obj, speed: obj.userData.holoSpin });
-        }
-        if (obj.userData.trunkLid) {
-          this.trunkLids.set(item.id, obj.userData.trunkLid as TrunkLidHandle);
-        }
-        if (obj.userData.gameTableTop) {
-          this.gameTableTops.set(
-            item.id,
-            obj.userData.gameTableTop as GameTableTopHandle,
-          );
-        }
-        if (obj.userData.cloneVat) {
-          this.cloneVats.set(item.id, obj.userData.cloneVat as CloneVatHandle);
-        }
-        if (obj.userData.slotMachineVisual) {
-          this.slotMachineVisuals.set(
-            item.id,
-            obj.userData.slotMachineVisual as SlotMachineVisualHandle,
-          );
-        }
-        if (obj.userData.coinPusherVisual) {
-          this.coinPusherVisuals.set(
-            item.id,
-            obj.userData.coinPusherVisual as CoinPusherVisualHandle,
-          );
-        }
+        registerFurnitureHandles(sinks, item.id, obj);
+        // Paint the CURRENT doc state now: a runtime-added table (E4
+        // reconcile on a joiner) must show a game already in progress —
+        // the games listener only fires on the NEXT map change.
+        //
+        // Read back the FILED handle instead of reaching into the mesh for
+        // the table key again: the helper owns that key list, and a second
+        // copy of it here is exactly what let the two spawn paths drift
+        // apart (furnitureHandles.test.ts pins this). Reading the sink also
+        // degrades correctly — if the helper ever stops filing this kind,
+        // the paint no-ops rather than driving a handle nothing tracks.
+        const spawnedTop = sinks.gameTableTops.get(item.id);
+        if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1537,6 +1582,32 @@ export class World {
         if (reveal) obj.intensity = targetIntensity;
       }
     });
+  }
+
+  /**
+   * 🗂️ World's per-item drive collections as the sinks the shared handle
+   * list files into (furnitureHandles.ts). Private like the collections it
+   * exposes: devMenu's runtime spawn registers through the SAME list by
+   * reaching this method through its WorldInternals cast — one name to keep
+   * in sync instead of the six field names its old mirror copied (and let
+   * drift, #117) — and World's public API stays clean, per devMenu's header.
+   * Returns the live collections, not copies: filing into the result is
+   * filing into World. Take it fresh per registration and don't cache it —
+   * removeFurnitureVisuals replaces `holoSpinners` by filter, so a stale
+   * result would file spinners into a list nobody drives.
+   * The literal doubles as the compile-time exhaustiveness proof: a sink
+   * added to FurnitureHandleSinks without a World collection fails here.
+   */
+  private furnitureHandleSinks(): FurnitureHandleSinks {
+    return {
+      wallScreens: this.wallScreens,
+      holoSpinners: this.holoSpinners,
+      trunkLids: this.trunkLids,
+      gameTableTops: this.gameTableTops,
+      cloneVats: this.cloneVats,
+      slotMachineVisuals: this.slotMachineVisuals,
+      coinPusherVisuals: this.coinPusherVisuals,
+    };
   }
 
   /**
@@ -1595,6 +1666,7 @@ export class World {
             farLateral: rec.farLateral,
             farYawDeg: rec.farYawDeg,
             transient: rec.transient, // #67 D2
+            dockedAt: rec.dockedAt, // ⚓ #163
           },
         );
       } else {
@@ -2865,8 +2937,10 @@ export class World {
 
   /**
    * Despawn ONE furniture item's visuals and deregister every per-item
-   * handle — the exact inverse of addLobbyFurniture's per-item registration
-   * (#53 remove-to-inventory). Scene-graph and World-collection side only:
+   * handle — the exact inverse of the per-item registration that both
+   * registerFurnitureGroup and devMenu's registerSpawnedGroup perform through
+   * registerFurnitureHandles (#53 remove-to-inventory). Scene-graph and
+   * World-collection side only:
    * the FURNITURE registry splice and the rebake pipeline (obstacles → grid
    * → seats → devices → replan) are the CALLER's responsibility, mirroring
    * how commitCarry/spawnFurniture own that pipeline around their mutation.
@@ -3545,6 +3619,7 @@ export class World {
     // Advance door leaf slides (update-loop driven, completion-signalled)
     if (this.dockingSystem) {
       this.dockingSystem.update(deltaTime);
+      this.settleHullDoorOpenings(); // 🚪 #159: after the slides — a landing counts
       // #51 camera-facing door fade: only while the ortho room camera is
       // live (zoom 2–4 — visually it only matters at 2), never during the
       // morph, first person (level 1) or a device-focus camera.
@@ -3596,8 +3671,24 @@ export class World {
     this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
-    const activePlayer = this.isPlayerActive() ? this.player : null;
+    // To the robots a player is "there" only INSIDE the room (iso room view
+    // or first person, zoom ≤ 2): isPlayerActive() alone stays true in the
+    // level-3 exterior after the morph, which would arm the entry edge —
+    // and let call-outs / the class escort reach a fox still on the ENTER
+    // ROOM prompt — before anyone has actually entered.
+    const activePlayer =
+      this.isPlayerActive() && zoomLevel <= 2 ? this.player : null;
+    // 🔇 The moment the player actually ENTERS the room (boot flow's ENTER
+    // ROOM, a door transit, morph end) re-arms the robot quiet window — the
+    // world runs behind the welcome overlay, so "1 s after room build" alone
+    // would let a greeting bark while the player is still on the menu.
+    if (activePlayer && !this.hadActivePlayer) {
+      this.robotQuietUntil = performance.now() + 1000;
+    }
+    this.hadActivePlayer = !!activePlayer;
     for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
+
+    this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
 
     // 🎰🤖 #77B: post the robot at the roulette wheel-head, narrate the calls
     // (all clients), and drive the betting timer (the elected operator only).
@@ -4129,8 +4220,15 @@ export class World {
    */
   /** #62 P3: build the door's connector from its pairing RECORD — an
    *  assembled chain when segments exist, the legacy straight gangway
-   *  otherwise. The geometry key on userData drives rebuild-on-diff. */
-  private buildDoorConnector(doorId: DoorId): THREE.Group {
+   *  otherwise. The geometry key on userData drives rebuild-on-diff.
+   *  ⚓ #163: `portStub` builds an UNPAIRED port door's own sealed half
+   *  instead (a dock chain itself comes through buildConnectorChain). */
+  private buildDoorConnector(doorId: DoorId, portStub = false): THREE.Group {
+    if (portStub) {
+      const stub = buildDockPortStub(doorId);
+      stub.userData.segmentsKey = this.portStubKey(doorId);
+      return stub;
+    }
     const segments = this.dockingSystem?.getDockingState(doorId)?.segments;
     const group =
       segments && segments.length > 0
@@ -4138,6 +4236,18 @@ export class World {
         : buildVestibule(doorId);
     group.userData.segmentsKey = JSON.stringify(segments ?? null);
     return group;
+  }
+
+  /** ⚓ #163: rebuild key for a lone port stub — never equal to a chain's
+   *  JSON key, so docking/undocking swaps stub ⇄ tunnel through the same
+   *  rebuild-on-diff path a chain edit uses. It carries the door's POSE too:
+   *  an unpaired door may still slide along its wall (paired ones may not),
+   *  and the stub it wears must follow instead of hanging where it was. */
+  private portStubKey(doorId: string): string {
+    const p = physicalDoorPoseOrNull(doorId);
+    return p
+      ? `⚓port-stub@${p.wall}:${p.x.toFixed(2)},${p.z.toFixed(2)}`
+      : "⚓port-stub";
   }
 
   private spawnTransitVestibule(doorId: DoorId): void {
@@ -4324,9 +4434,13 @@ export class World {
       // (fixed light translucency) so the builder sees the connection curve
       // before pairing — the plan's live-preview affordance.
       const ghost = !paired && (state?.segments?.length ?? 0) > 0;
+      // ⚓ #163: an UNPAIRED door wearing a dock port shows its own half of the
+      // adapter, hatch sealed — a real fitting, so it is solid like any
+      // vestibule (same proximity fade), not a ghost.
+      const portStub = !paired && !ghost && readDoorPolicy(door.id).adapter;
       let vestibule = this.pairedVestibules.get(door.id);
 
-      if (!paired && !ghost) {
+      if (!paired && !ghost && !portStub) {
         // Defer disposal while EITHER a transit or a plain walk-through is on
         // this door — mid-PEEK the avatar physically stands in the gangway,
         // and an unpair must not pop the tube out around them (review L1;
@@ -4345,7 +4459,9 @@ export class World {
       // rebuild this door's connector to match — but never mid-transit or
       // mid-walk-through (same deferral rule as unpair; the next frame after
       // the door sequence ends picks the rebuild up).
-      const wantKey = JSON.stringify(state?.segments ?? null);
+      const wantKey = portStub
+        ? this.portStubKey(door.id)
+        : JSON.stringify(state?.segments ?? null);
       if (
         vestibule &&
         vestibule.userData.segmentsKey !== wantKey &&
@@ -4357,7 +4473,7 @@ export class World {
       }
 
       if (!vestibule) {
-        vestibule = this.buildDoorConnector(door.id);
+        vestibule = this.buildDoorConnector(door.id, portStub);
         setVestibuleOpacity(vestibule, 0); // fades up to the resting level
         this.platformGroup.add(vestibule);
         this.pairedVestibules.set(door.id, vestibule);
@@ -4427,111 +4543,86 @@ export class World {
     return readAllDoorLayout().get(id)?.wall ?? "y-";
   }
 
-  /** The door a traveler arrives through, or NULL when the room has none — a
-   *  doorless station is now a real state, so this can no longer promise one. */
+  /**
+   * The door a traveler arrives through, or NULL when the room has none — a
+   * doorless station is now a real state, so this can no longer promise one.
+   *
+   * The choice itself is doorMatch.chooseArrivalDoor — pure, and pinned by
+   * doorMatch.test.ts. Its tiers, in order: the ARRIVAL room's own record
+   * pointing BACK at the room we came from (owner's octagon findings — the
+   * highest truth; a hub with four spokes routes each arrival to ITS door);
+   * the departure record's far WALL (+ lateral); its farDoor by id, but only
+   * when the record names no wall or the id's wall agrees — a compass id
+   * stamped by a wall-centre hypothetical is a guess about a NAME, and the far
+   * room may hang that name on another wall (that is how the closing vestibule
+   * reached the wrong side of room 1); the wall facing the departure wall
+   * (#91: walls always mirror, ids are logical slots); the cardinal
+   * id-opposite (the fireplace-blocked south departure under the pairs
+   * layouts); then east / any enabled door.
+   *
+   * ONE VESTIBULE PER DOOR: no tier below the back-pointing one ever picks a
+   * door that is paired to a DIFFERENT room while a free door exists, so the
+   * arrival — and the mirror main.ts writes onto the arrival door — lands on a
+   * door that can actually take it. This method only assembles the live room
+   * for the chooser: each door's wall, lateral, walkability, and whom its own
+   * pairing record points at.
+   */
   public resolveArrivalDoor(
     departureDoorId: string,
     farDoor?: string,
     fromRoomId?: string,
     // 🧭 The wall the traveler DEPARTED through, captured in the departure
-    // room before the swap. Without it this method inferred the wall from the
-    // id via the ARRIVAL room's records — wrong whenever the two rooms park
-    // the same id on different walls, and always wrong for a free door, whose
-    // id exists in no other room. Falls back to the old inference when the
-    // caller has nothing better (e.g. a stale session-restore route).
+    // room before the swap — an id says nothing about position, and the same
+    // id can sit on different walls in the two rooms. Falls back to the old
+    // inference when the caller has nothing better (a stale restore route).
     departureWall?: DoorWall,
+    // 🧭 The departure record's description of THIS room's door — the wall the
+    // connection was aimed at and where along it. The record's farDoor is the
+    // name it guessed; these are the geometry it knew.
+    farWall?: DoorWall,
+    farLateral?: number,
+    // 🧭 …and the departure door's own lateral, so a back record's counterpart
+    // description can be matched against the door we actually left through.
+    departureLateral?: number,
+    // Set to the chooser's conflict flag when given: the pick is another
+    // connection's door, so the caller must not record a repair onto it.
+    out?: { conflict: boolean },
   ): DoorTarget | null {
     const depWall = departureWall ?? this.wallOfDoor(departureDoorId);
-    // 🔗 HIGHEST TRUTH (owner's octagon findings): the ARRIVAL room's own
-    // records — the door whose pairing points BACK at the room we came from.
-    // This survives every other keypad/vestibule change on either side: a
-    // center hub with four spokes routes each arrival to ITS door, no matter
-    // which cardinal you departed from or what farDoor a stale record names.
-    // (Callable only after the arrival doc is bound — both call sites are.)
-    if (fromRoomId) {
-      const backs: DoorTarget[] = [];
-      for (const [doorId, rec] of readAllDoors()) {
-        if (!rec.paired || !rec.connectedRoomAddress) continue;
-        if (roomIdFromSeed(rec.connectedRoomAddress) !== fromRoomId) continue;
-        const d = findDoor(doorId);
-        if (d && d.enabled) backs.push(d);
-      }
-      if (backs.length === 1) return backs[0];
-      if (backs.length > 1) {
-        // Same room docked twice — let the record's farDoor break the tie, and
-        // failing that the door OPPOSITE the one we departed through. 🚪 #91:
-        // the old `?? backs[0]` fell back to doors-map iteration order, which
-        // always starts at 'north' — so both directions of a double-docked
-        // loop came out the same door.
-        const named = farDoor ? backs.find((b) => b.id === farDoor) : undefined;
-        const facing = backs.find(
-          (b) => this.wallOfDoor(b.id) === oppositeWall(depWall),
-        );
-        return named ?? facing ?? backs[0];
-      }
+    const records = readAllDoors();
+    const doors: ArrivalDoor[] = DOORS.map((d) => {
+      const pose = physicalDoorPoseOrNull(d.id);
+      const rec = records.get(d.id);
+      const paired = rec?.paired && rec.connectedRoomAddress ? rec : null;
+      return {
+        id: d.id,
+        wall: pose?.wall ?? this.wallOfDoor(d.id),
+        lateral: pose ? (pose.tangent === "x" ? pose.x : pose.z) : 0,
+        enabled: d.enabled,
+        cardinal: isCardinalDoorId(d.id),
+        pairedTo: paired ? roomIdFromSeed(paired.connectedRoomAddress) : null,
+        pairedFarDoor: paired?.farDoor,
+        pairedFarWall: paired?.farWall,
+        pairedFarLateral: paired?.farLateral,
+      };
+    });
+    const pick = chooseArrivalDoor(doors, {
+      departureDoorId,
+      departureWall: depWall,
+      departureLateral,
+      fromRoomId,
+      farDoor,
+      farWall,
+      farLateral,
+    });
+    if (!pick) return null;
+    if (out) out.conflict = pick.conflict;
+    if (pick.conflict) {
+      console.warn(
+        `[doors] no door here is free for this connection — arriving through ${pick.id}, which belongs to another one.`,
+      );
     }
-    // #62 P2: an assembled connection knows exactly which far door it lands on
-    // (the record's farDoor) — prefer it when enabled. The angled octagon links
-    // routinely land on NON-opposite doors (e.g. depart east, arrive north).
-    if (farDoor) {
-      const preferred = findDoor(farDoor);
-      if (preferred && preferred.enabled) return preferred;
-    }
-    // 🚪 #91: come out the door on the OPPOSITE WALL — matched by physical
-    // wall, not by door id. Door ids are logical slots, and a layout can park
-    // them anywhere (the pairs layouts put logical 'south' on the NORTH wall),
-    // so the old id→id opposite table would send you in through the north door
-    // and straight back out of the next room's north door: "traveling into a
-    // north door … exiting out of the north door of the other room, instead of
-    // exiting the south door heading north" (#91). Walls always mirror.
-    // Any door on that wall, free or cardinal. The old cardinal restriction
-    // existed because a mirror could not be written for a free arrival door, so
-    // arriving at one stranded the return; readAllDoors now iterates the map
-    // and main.ts writes the mirror for any id, so the restriction is retired.
-    // Prefer a cardinal when several doors share the facing wall, purely so the
-    // choice does not depend on DOORS insertion order.
-    const want = oppositeWall(depWall);
-    const onWall = DOORS.filter(
-      (d) => d.enabled && this.wallOfDoor(d.id) === want,
-    );
-    const facing = onWall.find((d) => isCardinalDoorId(d.id)) ?? onWall[0];
-    if (facing) return facing;
-    // 🚪 #91: no door on the facing wall — which is the NORM under the paired
-    // layouts, where all four cardinals share the north and west walls. Fall
-    // back to the pre-#91 id-opposite pairing so each departure still resolves
-    // to its OWN door; without this tier every arrival collapses onto the one
-    // `east` fallback below, dropping the traveler at the same spot no matter
-    // where they came from (and, at PAIR_OFFSET 3.0, inside the casino's
-    // authored furniture).
-    // 🚪 A CARDINAL-only tier by construction: it maps an id to its opposite
-    // ID, which only means anything for the four berths. A free door has no
-    // id-opposite — it is matched by WALL in the tier above, which is the
-    // honest test and already ran. Left in place for cardinals rather than
-    // deleted, because it is what rescues the fireplace-blocked south
-    // departure when no door sits on the facing wall.
-    const oppositeId: Record<PhysicalDoorId, PhysicalDoorId> = {
-      north: "south",
-      south: "north",
-      east: "west",
-      west: "east",
-    };
-    if (isCardinalDoorId(departureDoorId)) {
-      const counterpart = findDoor(oppositeId[departureDoorId]);
-      if (counterpart && counterpart.enabled) return counterpart;
-    }
-    // 🚪↔🛰️ #28 S3: don't assume a SPECIFIC cardinal exists once doors go free
-    // (slice 4+). Keep today's canonical EAST fallback for the fireplace-blocked
-    // south departure, but degrade to any enabled door / any door at all instead
-    // of throwing when east is absent. DOORS is always non-empty (≥1 door).
-    const east = findDoor("east");
-    // ...and only when it is actually walkable — an arrival scripted through a
-    // DISABLED door walks the avatar through whatever is blocking it (#91).
-    // 🚪 DOORS can now legitimately be EMPTY (a doorless station), so the old
-    // `DOORS[0]!` non-emptiness assumption would deref undefined. You cannot
-    // WALK into a doorless room — transit needs a paired door — so this is
-    // unreachable in practice; returning null rather than asserting means a
-    // future caller that finds a way here fails a check instead of crashing.
-    return (east?.enabled ? east : undefined) ?? DOORS.find((d) => d.enabled) ?? DOORS[0] ?? null;
+    return findDoor(pick.id);
   }
 
   /**
@@ -4545,6 +4636,9 @@ export class World {
     farDoor?: string,
     fromRoomId?: string,
     departureWall?: DoorWall,
+    farWall?: DoorWall,
+    farLateral?: number,
+    departureLateral?: number,
   ): void {
     this.endTransitVestibule();
     // 🚶 FP auto-doors: the player materializes AT the arrival door, inside
@@ -4561,6 +4655,9 @@ export class World {
       farDoor,
       fromRoomId,
       departureWall,
+      farWall,
+      farLateral,
+      departureLateral,
     );
     if (!arrival) {
       // Doorless arrival room: nothing to walk in through. Unreachable while
@@ -4817,6 +4914,10 @@ export class World {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
       this.robotsPatrol = waiterPatrol;
+      // 🔇 Fresh room: hold every robot line for the first second (owner
+      // request — no greeting barked mid-load/entry; the class opens its
+      // mouth only once you're actually standing in the room).
+      this.robotQuietUntil = performance.now() + 1000;
     }
     if (!waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
@@ -4868,9 +4969,14 @@ export class World {
   /** 🤖💬 THE robot-speech seam: overhead bubble + speaker voice, together.
    *  Every robot line (script 'say', small talk, serve lines, croupier beats)
    *  must go through here so no source can get bubble-without-voice. */
-  private robotSay(anchorId: string, text: string, x: number, z: number): void {
-    spawnFixedBubble(anchorId, text, x, z);
+  private robotSay(anchorId: string, text: string, x: number, z: number): boolean {
+    // No one in the room (welcome overlay / exterior view) ⇒ no lines at all;
+    // then hold through the 1 s entry quiet window.
+    if (!this.hadActivePlayer) return false;
+    if (performance.now() < this.robotQuietUntil) return false; // entry quiet window
+    spawnFixedBubble(anchorId, text, x, z, ROBOT_BUBBLE_Y);
     speakRobotLine(text, x, z);
+    return true;
   }
 
   /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
@@ -4886,6 +4992,103 @@ export class World {
       // per robot, replaced each line) — local, like the croupier's narration.
       bot.setSayHandler((text, x, z) => this.robotSay(`robotsay:${key}`, text, x, z));
     }
+  }
+
+  /** 🏋️🎥 #77 follow-the-coach — the class is staged FOR THE SCREEN (P2P
+   *  hangout: the human at the computer follows along). A coaching bot
+   *  performs facing the CAMERA like a workout video; a fox that stands in
+   *  the 6 m circle is escorted to a side slot of the row, turns to the
+   *  camera too, and mirrors the demo in lockstep (the bot supplies the
+   *  chibi-scaled pose — getFollowerPose). The pose only applies while
+   *  idle, so walking away or sitting down breaks the follow. */
+  /** Can the local fox route to (x, z)? Start snapped to solid ground first
+   *  (the vat spawn cell is non-walkable, and findPath from there is empty);
+   *  standing next to the goal counts. Same test pickFreeStand applies. */
+  private playerCanReach(x: number, z: number): boolean {
+    const me = this.player.getPosition();
+    if (Math.hypot(x - me.x, z - me.z) < 0.6) return true;
+    const start = nearestWalkableCell(me.x, me.z, 3);
+    if (!start) return false;
+    return (
+      findPath(worldToRow(start.z), worldToCol(start.x), worldToRow(z), worldToCol(x))
+        .length > 0
+    );
+  }
+
+  private updateCoachFollow(
+    deltaTime: number,
+    activePlayer: Player | null,
+    firstPerson: boolean,
+  ): void {
+    // 🎥 "The screen" in the iso room view is the rig's forward on the
+    // ground; in FIRST PERSON (#49) the camera is a perspective camera on
+    // mouse-look — the player's own eyes — so the class faces the fox.
+    const rigYaw = getCameraForwardYaw();
+    this.coachEscortCooldown = Math.max(0, this.coachEscortCooldown - deltaTime);
+    let workout: WorkoutPose | null = null;
+    let inCircle = false;
+    for (const bot of this.robots.values()) {
+      const bp = bot.getPosition();
+      const pp = this.player.mesh.position;
+      const stageYaw = firstPerson
+        ? Math.atan2(pp.x - bp.x, pp.z - bp.z)
+        : rigYaw;
+      bot.setStageYaw(bot.isCoaching() ? stageYaw : null);
+      if (!activePlayer || !bot.isCoaching()) continue;
+      if (Math.hypot(bp.x - pp.x, bp.z - pp.z) > 6) continue; // the 6 m circle
+      // 🚪 Door-zone exemption: a fox walking out pauses BESIDE the door
+      // while it opens — never escort (or mirror) from there, or the class
+      // would kidnap anyone trying to leave the room.
+      let nearDoor = false;
+      for (const [, g] of this.dockingSystem?.getDoorGroups() ?? []) {
+        if (Math.hypot(g.position.x - pp.x, g.position.z - pp.z) < 2.2) {
+          nearDoor = true;
+          break;
+        }
+      }
+      if (nearDoor) continue;
+      inCircle = true;
+      if (!activePlayer.isStandingIdle()) continue; // acts only once standing
+      // 🚶 Row formation (owner rule): inside the circle the fox stands at
+      // the robot's SIDES only — never in front of or behind it. A fox that
+      // stops anywhere else is escorted to the nearest walkable side slot
+      // (retry on a short cooldown, so a failed path can't spam). With BOTH
+      // side slots blocked there is no row to join — no escort, no mirror —
+      // rather than letting a fox in front of / behind the coach follow.
+      const slots = bot
+        .getFollowerSlots()
+        .filter((c) => walkable[worldToRow(c.z)]?.[worldToCol(c.x)])
+        .map((c) => ({ ...c, d: Math.hypot(c.x - pp.x, c.z - pp.z) }));
+      const nearest = slots.length
+        ? slots.reduce((a, b) => (a.d <= b.d ? a : b))
+        : null;
+      if (!nearest) continue;
+      if (nearest.d >= 0.6) {
+        if (this.coachEscortCooldown <= 0) {
+          this.coachEscortCooldown = 2;
+          // Walkable ≠ reachable: a slot across a furniture partition would
+          // be re-issued forever (navigateTo drops the empty path). Route-
+          // check the candidates only here, per escort, never per frame.
+          const routed = slots
+            .filter((c) => this.playerCanReach(c.x, c.z))
+            .sort((a, b) => a.d - b.d);
+          if (routed.length) activePlayer.navigateTo(routed[0].x, routed[0].z);
+        }
+        continue;
+      }
+      // In the row: face the screen with the coach and mirror its rep.
+      activePlayer.faceToward(
+        pp.x + Math.sin(stageYaw),
+        pp.z + Math.cos(stageYaw),
+      );
+      workout = bot.getFollowerPose();
+      break;
+    }
+    if (!inCircle) this.coachEscortCooldown = 0; // fresh entry escorts at once
+    // Always write the LOCAL player's pose: with no activePlayer (exterior
+    // view, morph) `workout` is null and this is what clears a pose captured
+    // on the last interior frame — the mesh stays visible out there.
+    (activePlayer ?? this.player).setWorkoutPose(workout);
   }
 
   private updateCroupier(): void {
@@ -4957,6 +5160,7 @@ export class World {
       this.robots.has(k) &&
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
+      routineOf(k) !== "coach" && // a coach runs its class, never a table
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,
@@ -5021,10 +5225,13 @@ export class World {
         beat = s ? croupierBeatLine(s) : null;
       }
       if (!beat || this.croupierNarrated.get(t.id) === beat.key) continue;
-      this.croupierNarrated.set(t.id, beat.key);
       const head = standsForItem(t.id).find((x) => x.role != null);
-      if (head) {
-        this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z);
+      if (!head) continue;
+      // 🔇 Record the beat only once it is actually delivered — a beat first
+      // seen behind the overlay or inside the entry quiet window retries next
+      // frame instead of being lost (same contract as every other robot line).
+      if (this.robotSay(`croupier:${t.id}`, beat.text, head.front.x, head.front.z)) {
+        this.croupierNarrated.set(t.id, beat.key);
       }
     }
   }
@@ -5179,8 +5386,25 @@ export class World {
 
     if (device.kind === "helm") {
       // 🚀 #30 SH1: ship-status readout (flight controls come with the
-      // flight slices — the panel says so).
-      deviceFocus.beginFocus(this.player, device, createHelmUI());
+      // flight slices — the panel says so). ⚓ #163: plus the DOCKING
+      // COMPUTER — the very DOCK / UNDOCK the door panel runs, so the two
+      // surfaces can never disagree about a port.
+      const ds = this.dockingSystem;
+      deviceFocus.beginFocus(
+        this.player,
+        device,
+        createHelmUI(
+          ds
+            ? {
+                ports: () => ds.listDockPorts(),
+                connected: () => ds.connectedModules(),
+                subscribe: (cb) => ds.onDockChange(cb),
+                undock: (doorId) => void ds.undockPort(doorId),
+                dock: (doorId) => void ds.redockPort(doorId),
+              }
+            : undefined,
+        ),
+      );
       return;
     }
 
@@ -5388,6 +5612,15 @@ export class World {
   private initializeDockingPorts() {
     this.dockingSystem = new DoorDockingPortSystem(this.platformGroup);
     this.dockingSystem.buildPorts();
+    // 🚪 #159: the hull opens behind a door as its leaves part, follows its
+    // frame when that moves, and heals once the leaves have shut or the door
+    // is gone — see collectHullDoorOpenings.
+    this.dockingSystem.onDoorApertureChange(() => {
+      this.hullDoorsDirty = true;
+    });
+    // A morph restart lands here with a NEW system whose doors are all shut,
+    // after createPlatform cut the hull from the old one's — re-check it.
+    this.hullDoorsDirty = true;
 
     // Hook P2P sync routing events (Task: Room pairings over Yjs awareness)
     this.dockingSystem.onConnectionRequest((doorId, address) => {
@@ -5416,6 +5649,7 @@ export class World {
             farLateral: st.farLateral,
             farYawDeg: st.farYawDeg,
             transient: st.transient, // #67 D2: guest berths carry the flag
+            dockedAt: st.dockedAt, // ⚓ #163: a dock's stamp (re-dock rule)
           });
         }
       } else if (status === "REJECTED") {

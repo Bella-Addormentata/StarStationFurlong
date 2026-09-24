@@ -14,9 +14,15 @@ import { findDoor } from "./doors";
 import type { DoorId } from "./doors";
 import {
   physicalDoorPose, portForDoor, poseFromWall,
-  DOOR_OPENING_WIDTH, DOOR_POST_WIDTH,
+  DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
   DOOR_LEAF_SHUT_OFFSET, DOOR_LEAF_OPEN_OFFSET,
+  MIN_DOOR_GAP,
 } from "./doorLayout";
+// 🚪🧲 Which door of a KNOWN module a chain connects to — pure, tested.
+import {
+  candidateFarDoors, pickFacingDoor, moduleHalves, halfAlongWall,
+  FACE_MATCH_TOLERANCE, WALL_YAW,
+} from "./doorMatch";
 import type { PhysicalDoorPose } from "./doorLayout";
 import type { DoorLayoutRecord, DoorWall } from "./doorLayoutDoc";
 import {
@@ -30,6 +36,7 @@ import {
   LEGACY_ID_WALL,
   writeDoorLayout,
   defaultDoorLayoutRecords,
+  doorSetIsAuthoritative,
 } from "./doorLayoutDoc";
 import { validateDoorPlacement } from "./editMode";
 import { ROOM_TEMPLATES } from "./roomTemplates";
@@ -38,8 +45,27 @@ import {
   projectionPoseForDoor,
   solveChain,
   foldChainEnd,
+  ROOM_HALF,
+  dockChain,
+  isDockChain,
+  DOCK_ENVELOPE_R,
   type ConnectorSegment,
 } from "./adapter";
+// ⚓ #163: the two-part docking adapter's shared rules (pure, tested).
+import {
+  classifyDockPort,
+  isPortDoor,
+  nextDockStep,
+  gangwayPartRefusal,
+  berthMemoryFrom,
+  redockRecord,
+  holdsOurRedock,
+  farWriteMayStand,
+  initiateChainRefusal,
+  stampAfter,
+  FAR_DOCK_REFUSAL,
+  type DockPortState,
+} from "./dockRules";
 // 🛰️ Hull space: built chains register their swept boxes so exterior mounts
 // can't be placed through a vestibule — and the assembly UI warns the other
 // way when a chain would run through mounted equipment.
@@ -72,7 +98,13 @@ import {
 } from "./doorPolicy";
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
-import { deleteDoorPairing, writeDoorTombstone } from "./doorsDoc";
+import {
+  deleteDoorPairing,
+  writeDoorTombstone,
+  writeDoorPairing,
+  readDoor,
+  transactDoorWrites,
+} from "./doorsDoc";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -80,7 +112,7 @@ import {
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
-  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed,
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency,
 } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -117,6 +149,99 @@ export interface DockingState {
   farYawDeg?: 0 | 45;
   /** #67 D2: this pairing is a TRANSIENT guest berth (docking adapter). */
   transient?: boolean;
+  /** ⚓ #163: when this DOCK was made (mirrored from the record) — carried
+   *  into every re-publish so a chain-geometry refresh never makes an old
+   *  dock look newer than a later undock. */
+  dockedAt?: number;
+  /** ⚓ LOCAL only: the staged MATING half was paid for with an adapter part
+   *  (+DOCK's second press), so clearing or a rejected pairing refunds it —
+   *  until a pairing lands or PROVISION NEW MODULE spends it on the module it
+   *  mints. The port itself is a door fitting, paid and refunded on its own —
+   *  never through the working chain, which would count it twice. */
+  dockMatePaid?: boolean;
+  /** 🚪 The pending request on this door came IN from a peer (as opposed to
+   *  our own INITIATE). An inbound request carries only an address — not
+   *  which of the far module's doors it is from — so it can never prove it is
+   *  the connection this door already has, and must not be allowed to touch a
+   *  live pairing (review, round 6). */
+  inboundRequest?: boolean;
+}
+
+/**
+ * ⚓ #163: what DOCK / UNDOCK ask of the FAR room — its end of the same
+ * connection. main.ts answers it (farDoorWrite.ts: a short background session
+ * to that room's doc); docking.ts never imports main.ts.
+ */
+export type FarDockRequest =
+  | {
+      kind: "undock";
+      /** The room THIS end is in — the room the operation started in, which
+       *  an awaited far write may have outlived (absent: the active room). */
+      nearRoomId?: string;
+      farAddress: string;
+      /** The far door, when this side's record names it. */
+      farDoor?: string;
+      nearDoorId: string;
+      nearWall?: DoorWall;
+      nearLateral?: number;
+      undockedAt: number;
+      /** Take back exactly ONE far dock — the one this client wrote with this
+       *  stamp — and nothing else (redockPort's compensation when its own
+       *  side changed under it). */
+      onlyDockedAt?: number;
+    }
+  | {
+      kind: "dock";
+      nearRoomId?: string;
+      /** The undock this DOCK re-makes the dock after (the berth memory's
+       *  stamp): a far record still holding that released dock is a leftover
+       *  to write over, never a newer claim (dockRules.farDockPatch). */
+      replacesUndockedAt?: number;
+      farAddress: string;
+      farDoor: string;
+      nearDoorId: string;
+      nearWall?: DoorWall;
+      nearLateral?: number;
+      dockedAt: number;
+    };
+
+export type FarDockResult =
+  | { ok: true; detail: "written" | "nothing-to-undo" }
+  | {
+      ok: false;
+      reason:
+        | "unreachable"
+        | "no-address"
+        | "no-far-door"
+        | "occupied"
+        | "closed"
+        | "gone"
+        /** The berth holds a dock of this very port with another stamp — a
+         *  claim made at the same moment that the CRDT kept, or one made
+         *  from the far side: it stands, this one yields (and may join it). */
+        | "superseded";
+      /** With `superseded`: the stamp of the dock of this port the berth holds. */
+      stamp?: number;
+      /** With `unreachable`: the far write WAS made, but its acknowledgment
+       *  never came — it may still land (redockPort takes it back anyway). */
+      unconfirmed?: boolean;
+    };
+
+/** ⚓ One dock port as the helm's docking computer and the pane list it. */
+export interface DockPortView {
+  doorId: string;
+  /** The door's display name (its sign, else DOOR n). */
+  label: string;
+  state: DockPortState;
+  /** The module on (or last on) the other side, by name when known. */
+  partnerName: string | null;
+  /** May the local player dock/undock here (construction rights). */
+  canOperate: boolean;
+  /** A dock/undock is running on this port right now. */
+  busy: boolean;
+  /** The last operation's outcome, player-facing. */
+  note?: string;
+  tone?: "ok" | "warn" | "bad";
 }
 
 export class DoorDockingPortSystem {
@@ -137,6 +262,24 @@ export class DoorDockingPortSystem {
    *  render when the live address no longer matches. */
   private undockArmed = new Map<string, string>();
 
+  // ── ⚓ #163: the two-part docking adapter ───────────────────────────────────
+  /** The far-room writer main.ts injects (onFarDockWrite). Absent ⇒ DOCK and
+   *  UNDOCK stay one-sided, and say so. */
+  private farDockWriter:
+    | ((req: FarDockRequest) => Promise<FarDockResult>)
+    | null = null;
+  /** Per-port dock operation, keyed `${roomId}|${doorId}` (see dockOp): in
+   *  flight, and the last outcome to show. */
+  private dockOps = new Map<
+    string,
+    { busy: boolean; note?: string; tone?: "ok" | "warn" | "bad" }
+  >();
+  /** One line under the assembly chips — a refused +DOCK or gangway part. */
+  private assemblyNotice: { doorId: string; text: string } | null = null;
+  /** Told whenever a port's state or an operation's status changes (the
+   *  helm's docking computer re-renders from listDockPorts). */
+  private dockListeners = new Set<() => void>();
+
   // ── Update-loop-driven leaf slides ─────────────────────────────────────────
   /** In-flight slide per door; a new open/close overwrites the entry. */
   private slideAnims = new Map<
@@ -145,6 +288,9 @@ export class DoorDockingPortSystem {
   >();
   /** Leaf slide speed (metres/second). */
   private readonly SLIDE_SPEED = 2.2;
+  /** 🚪 #159: told whenever the hull's door apertures may have changed
+   *  (onDoorApertureChange). */
+  private doorApertureListener: (() => void) | null = null;
 
   // ── Camera-facing door fade (#51) ──────────────────────────────────────────
   /**
@@ -215,7 +361,14 @@ export class DoorDockingPortSystem {
     | ((
         templateId: string,
         parentDoorId?: string,
-        placement?: { wall: DoorWall; lateral: number; doorId?: string },
+        placement?: {
+          wall: DoorWall;
+          lateral: number;
+          doorId?: string;
+          /** ⚓ #163: a dock is staged — the module is born with its door
+           *  wearing the other half (fitted at its first claim). */
+          port?: boolean;
+        },
       ) => Promise<string | null>)
     | null = null;
 
@@ -450,11 +603,21 @@ export class DoorDockingPortSystem {
     return out;
   }
 
-  /** One door's chain, folded joint by joint into padded world-XZ boxes. */
+  /** One door's chain, folded joint by joint into padded world-XZ boxes.
+   *  ⚓ #163: a door wearing a dock port with nothing staged still owns the
+   *  space its sealed half sticks out into — a mount may not go through it. */
   private chainBoxesFor(doorId: string): Box[] {
-    const segs = this.doorState.get(doorId)?.segments ?? [];
+    const staged = this.doorState.get(doorId)?.segments ?? [];
+    const segs: ConnectorSegment[] =
+      staged.length === 0 && readDoorPolicy(doorId).adapter
+        ? [{ kind: "dock" }]
+        : staged;
     if (segs.length === 0) return [];
+    // A gangway part's half-width; a dock half pads by the adapter's own
+    // widest radius (hull flange, ~1.94 m), not the gangway's.
     const PAD = 0.85;
+    const padFor = (seg: ConnectorSegment) =>
+      seg.kind === "dock" ? Math.max(PAD, DOCK_ENVELOPE_R) : PAD;
     // 🚪 #91: anchor on the door's LIVE pose (slide delta included). Without
     // the delta these occupancy/clash boxes sat at the unslid position while
     // buildConnectorChain drew the tube at the slid one — the warnings and the
@@ -473,11 +636,12 @@ export class DoorDockingPortSystem {
     for (let i = 1; i <= segs.length; i++) {
       const p = foldChainEnd(segs.slice(0, i));
       const cur = toWorld(p.x, p.z);
+      const pad = padFor(segs[i - 1]);
       out.push({
-        x0: Math.min(prev.x, cur.x) - PAD,
-        z0: Math.min(prev.z, cur.z) - PAD,
-        x1: Math.max(prev.x, cur.x) + PAD,
-        z1: Math.max(prev.z, cur.z) + PAD,
+        x0: Math.min(prev.x, cur.x) - pad,
+        z0: Math.min(prev.z, cur.z) - pad,
+        x1: Math.max(prev.x, cur.x) + pad,
+        z1: Math.max(prev.z, cur.z) + pad,
       });
       prev = cur;
     }
@@ -611,7 +775,7 @@ export class DoorDockingPortSystem {
       // again (they did: the old 2.4/1.4 openings matched no whole number of
       // cells while the validators assumed 2/1).
       const openingWidth = DOOR_OPENING_WIDTH;
-      const OPEN_H = 3.0; // opening height (local y -2 .. 1)
+      const OPEN_H = DOOR_OPENING_HEIGHT; // opening height (local y -2 .. 1)
       const POST_W = DOOR_POST_WIDTH; // side post width
       const FRAME_D = 0.5; // frame depth
       const FLOOR_Y = -2; // local floor level
@@ -919,6 +1083,7 @@ export class DoorDockingPortSystem {
     this.slideAnims.delete(id);
     this.removeAdjacentRoomProjection(id as DoorId); // tear down any projection
     this.untouchedPrefills.delete(id);
+    this.doorApertureListener?.(); // 🚪 #159: an open door just left the wall
   }
 
   /**
@@ -1013,6 +1178,12 @@ export class DoorDockingPortSystem {
           <input type="text" id="docking-label-input" maxlength="${DOOR_LABEL_MAX}" placeholder="e.g. POOL, CASINO, DOCK 3 — blank for none" style="width:100%; border-radius:6px; border:1px solid rgba(212,168,75,0.18); background:rgba(0,0,0,0.3); color:#d4a84b; padding:6px 10px; font-size:11px; outline:none; font-family:monospace; box-sizing:border-box;">
         </div>
 
+        <!-- ⚓ #163 DOCK row: a door wearing a docking-adapter port says what
+             is on the other side of it and offers DOCK / UNDOCK right here,
+             at the top — not inside the collapsed policy section, where the
+             old transient DETACH was hard to find. Rendered by renderDockRow. -->
+        <div id="docking-dock-row" style="display:none;"></div>
+
         <!-- Lock config -->
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <span>LOCK STATE CONFIG:</span>
@@ -1034,6 +1205,10 @@ export class DoorDockingPortSystem {
           <div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
             <button id="docking-add-flex" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">+FLEX</button>
             <button id="docking-add-ext" style="background:rgba(212,168,75,0.10); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:#d4a84b; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">+EXT</button>
+            <!-- ⚓ #163: the docking-adapter vestibule. First press fits THIS
+                 door's half (a round port); second press stages the MATING
+                 half the connection brings to the far door. -->
+            <button id="docking-add-dock" type="button" title="Docking adapter — first press fits this door's round port, second adds the other half for the module on the far side" style="background:rgba(242,239,230,0.10); border:1px solid rgba(242,239,230,0.45); border-radius:5px; color:#f2efe6; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">+DOCK</button>
             <button id="docking-clear-chain" style="background:rgba(255,23,68,0.08); border:1px solid rgba(255,23,68,0.3); border-radius:5px; color:#ff8a80; font-size:9px; font-weight:700; padding:3px 8px; cursor:pointer;">CLEAR</button>
             <span style="flex:1;"></span>
             <span style="font-size:9px; color:rgba(212,168,75,0.55);">FAR:</span>
@@ -1188,11 +1363,39 @@ export class DoorDockingPortSystem {
           const birthDoorId = choice
             ? `d:${crypto.randomUUID().slice(0, 8)}`
             : undefined;
+          // ⚓ #163: a staged, PAID mating half makes the new module a ship (or
+          // station) docked by adapter — its birth door is born wearing that
+          // half. The half goes to exactly ONE module: it is spent here (no
+          // refund on unstaging, and a second provision from this door gets
+          // none for free). Reserved before the await, so a double click can't
+          // claim it twice; handed back if minting fails.
+          const parentState = parentDoorId
+            ? this.doorState.get(parentDoorId)
+            : undefined;
+          const mateForModule =
+            !!choice &&
+            !!parentState &&
+            isDockChain(parentState.segments) &&
+            parentState.dockMatePaid === true;
+          if (mateForModule) parentState!.dockMatePaid = false;
           const seed = await this.provisionModuleCallback(
             templateId,
             parentDoorId,
-            choice ? { ...choice, doorId: birthDoorId } : undefined,
+            choice
+              ? { ...choice, doorId: birthDoorId, port: mateForModule }
+              : undefined,
           );
+          if (!seed && mateForModule && parentState) {
+            // Not spent after all. Back on the door while it still stages an
+            // UNPAID mate (the one reserved); otherwise — unstaged meanwhile,
+            // or re-staged with a freshly paid half — back in stock, so a
+            // reserved half is never lost.
+            if (isDockChain(parentState.segments) && !parentState.dockMatePaid) {
+              parentState.dockMatePaid = true;
+            } else {
+              refundPart("adapter");
+            }
+          }
           // 🧭 The pairing this address is about to INITIATE already knows the
           // far side exactly — it is the door we just chose. Stash it so the
           // published record is fully described from birth, no walk-through
@@ -1234,24 +1437,35 @@ export class DoorDockingPortSystem {
           "docking-pin-input",
         ) as HTMLInputElement | null;
 
-        // #67 D1/D2: construction rights per the door's policy — EXCEPT at an
-        // adapter door, where anyone may TRANSIENTLY berth a ship (no chains).
-        if (activeDoorId && !this.canConstruct(activeDoorId)) {
-          const berthState = this.doorState.get(activeDoorId);
-          if (
-            readDoorPolicy(activeDoorId).adapter &&
-            !berthState?.segments?.length
-          ) {
-            if (berthState) berthState.transient = true; // guest berth, not construction
-          } else {
+        // #67 D1/D2: construction rights per the door's policy — EXCEPT at a
+        // docking-adapter PORT, where anyone may berth a ship.
+        // ⚓ #163: a port door connects ONLY by docking, for everyone: the
+        // connection is a DOCK — this door's half plus the far door's (staged
+        // here as the mating half, or brought by the visiting ship) — always
+        // transient and stamped. The old guest berth was exactly this door
+        // with a plain gangway; it is round now.
+        // The dock chain itself is assigned only after the gates below pass —
+        // a refused INITIATE must not leave a ghost tunnel on the door.
+        const willDock = this.doorHasPort(activeDoorId);
+        // A port door connects only by docking — and a staged mating half on
+        // a door whose port was removed meanwhile (by a peer, while this pane
+        // sat open) must not go out as a dock with no port behind it.
+        const chainRefusal = initiateChainRefusal(willDock, state?.segments);
+        if (chainRefusal) {
+          alert(chainRefusal);
+          return;
+        }
+        if (!willDock) {
+          if (!this.canConstruct(activeDoorId)) {
             alert(
               "No construction rights on this port — ask the owner (REQUEST BUILD RIGHTS below).",
             );
             return;
           }
-        } else if (activeDoorId) {
-          const st = this.doorState.get(activeDoorId);
-          if (st) st.transient = false; // rights-holder pairing = permanent structure
+          if (state) {
+            state.transient = false; // rights-holder pairing = permanent structure
+            state.dockedAt = undefined;
+          }
         }
         if (activeDoorId) this.untouchedPrefills.delete(activeDoorId); // INITIATE = intentional
         if (state && addrInput && pinInput) {
@@ -1263,6 +1477,65 @@ export class DoorDockingPortSystem {
             return;
           }
 
+          // 🚪 ONE VESTIBULE PER DOOR — both ends, before the request goes out.
+          // THIS door: a live pairing to some other module must be UNDOCKED
+          // first. The DOC record, not the local state — a peer may have paired
+          // it while this pane sat open. The FAR door: whatever the atlas knows
+          // to be connected already, on the far room's own record or as another
+          // room's far end, is refused here (the arrival refuses it too, but by
+          // then the near record is published and the tube is drawn).
+          {
+            // ⚓ #163: this one door, read itself — never through the capped
+            // snapshot, which could hide a live dock that doorHasPort sees.
+            const own = readDoor(activeDoorId);
+            if (
+              own?.paired &&
+              own.connectedRoomAddress &&
+              own.connectedRoomAddress !== state.connectedRoomAddress
+            ) {
+              alert(
+                "This door already has a vestibule — UNDOCK it before connecting it somewhere else.",
+              );
+              return;
+            }
+            const farRid = roomIdFromSeed(state.connectedRoomAddress);
+            const currentRid =
+              (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+            const taken = farRid
+              ? this.farDoorTakenBy(farRid, state.farDoor, state.farWall, state.farLateral)
+              : null;
+            // Exempt only THIS door's own existing connection (re-initiating
+            // it). Another door of this same room counts as taken — otherwise
+            // two of our doors would share one far door (review, round 3).
+            const ours =
+              taken?.roomId === currentRid && taken.doorId === activeDoorId;
+            if (taken && !ours) {
+              const name =
+                taken.roomId === currentRid
+                  ? "another door of this module"
+                  : (readAtlas()[taken.roomId]?.name ?? "another module");
+              alert(
+                `That door of the target module already has a vestibule (to ${name}). Pick a free door, or re-route the chain to another wall.`,
+              );
+              return;
+            }
+          }
+
+          // ⚓ #163: every gate above passed — a port door's connection IS a
+          // dock from here on (the overlap gate below poses the module at the
+          // dock's length). A clash refusal puts the working chain back.
+          const chainBefore = state.segments;
+          if (willDock) {
+            state.segments = dockChain();
+            state.transient = true;
+            // Causally after this port's own last undock (a re-dock by
+            // INITIATE must not read as a stale berth to the far mirror).
+            const prior = classifyDockPort(readDoor(activeDoorId));
+            state.dockedAt = stampAfter(
+              prior.kind === "undocked" ? prior.memory.undockedAt : undefined,
+            );
+          }
+
           // 🛰️ #28 S6a: BLOCK a pairing whose module would dock ON TOP of an
           // existing station module (the WARN's hard-stop half). Only when a
           // chain projects the module, and only for a cardinal berth (the pose
@@ -1271,17 +1544,26 @@ export class DoorDockingPortSystem {
           if (state.segments && state.segments.length > 0) {
             const currentId =
               (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+            // The SAME pose the final projection and atlasLayout use — far
+            // wall, lateral AND the target's true half-extent — or the gate
+            // tests a centre metres from where the module will be drawn
+            // (reviews, rounds 7 and 9).
+            const gateWall = this.farWallFor(state);
+            const gateDims = readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims;
             const clash = currentId
               ? moduleOverlapAt(
                   currentId,
                   projectionPoseForDoor(
                     activeDoorId,
                     state.segments,
-                    this.farWallFor(state),
+                    gateWall,
+                    state.farLateral ?? 0,
+                    gateWall ? halfAlongWall(gateDims, gateWall) : undefined,
                   ),
                 )
               : null;
             if (clash) {
+              if (willDock) state.segments = chainBefore;
               alert(
                 `Can't dock here — the module would overlap ${clash.name}. Re-route the connector chain to a clear berth.`,
               );
@@ -1290,6 +1572,7 @@ export class DoorDockingPortSystem {
           }
 
           state.pairingPending = true;
+          state.inboundRequest = false; // ours — INITIATE, not a peer's request
           this.syncLEDStatus(activeDoorId, state);
 
           if (this.onConnectionRequestCallback) {
@@ -1380,6 +1663,15 @@ export class DoorDockingPortSystem {
       if (!st || st.pairedSuccessfully) return;
       st.farWall = undefined;
       st.farLateral = undefined;
+      // …the far door ID too: it named a door of the PREVIOUS target, and a
+      // stale id is exactly what the arrival must never be handed — left in
+      // place it would ride the published record to module B as if it had
+      // been chosen there (review, round 4). The select falls back to auto.
+      st.farDoor = undefined;
+      const farSel = document.getElementById(
+        "docking-far-door",
+      ) as HTMLSelectElement | null;
+      if (farSel) farSel.value = "";
       // …and the FAR options follow the new target's real door set.
       if (doorId) this.renderFarDoorOptions(doorId);
     });
@@ -1442,6 +1734,12 @@ export class DoorDockingPortSystem {
         const doorId = activeDoor();
         const state = doorId ? this.doorState.get(doorId) : null;
         if (!doorId || !state || !this.canConstruct(doorId)) return;
+        // ⚓ #163: a port door connects by docking only.
+        const refusal = gangwayPartRefusal(this.doorHasPort(doorId));
+        if (refusal) {
+          this.showAssemblyNotice(doorId, refusal);
+          return;
+        }
         this.untouchedPrefills.delete(doorId); // deliberate edit — chain is intentional now
         if (!consumePart("flex")) {
           this.renderAssemblyStrip(doorId, "no FLEX parts — DEV menu › PARTS");
@@ -1461,6 +1759,11 @@ export class DoorDockingPortSystem {
         const doorId = activeDoor();
         const state = doorId ? this.doorState.get(doorId) : null;
         if (!doorId || !state || !this.canConstruct(doorId)) return;
+        const refusal = gangwayPartRefusal(this.doorHasPort(doorId));
+        if (refusal) {
+          this.showAssemblyNotice(doorId, refusal);
+          return;
+        }
         this.untouchedPrefills.delete(doorId);
         if (!consumePart("ext")) {
           this.renderAssemblyStrip(
@@ -1483,11 +1786,61 @@ export class DoorDockingPortSystem {
         const doorId = activeDoor();
         const state = doorId ? this.doorState.get(doorId) : null;
         if (!doorId || !state || !this.canConstruct(doorId)) return;
+        // ⚓ A live dock's halves are not a working chain — UNDOCK releases
+        // them. (CLEAR on a paired door would republish an EMPTY chain and
+        // turn a round dock into a plain gangway.)
+        if (state.pairedSuccessfully && isDockChain(state.segments)) {
+          this.showAssemblyNotice(doorId, "Docked — use ⏏ UNDOCK above to release it.");
+          return;
+        }
         this.untouchedPrefills.delete(doorId);
-        if (state.segments?.length) refundForSegments(state.segments);
+        this.refundWorkingChain(state);
         state.segments = undefined;
         this.renderAssemblyStrip(doorId);
         this.publishIfPaired(doorId);
+      });
+
+    // ⚓ #163 +DOCK — the docking-adapter vestibule option. First press fits
+    // THIS door's round port (a door fitting: shared, survives any dock);
+    // second press stages the MATING half the connection will bring to the far
+    // door — then PROVISION NEW MODULE for a new independent ship or station,
+    // or pick a target and INITIATE. dockRules.nextDockStep decides.
+    document
+      .getElementById("docking-add-dock")
+      ?.addEventListener("click", () => {
+        const doorId = activeDoor();
+        const state = doorId ? this.doorState.get(doorId) : null;
+        if (!doorId || !state) return;
+        if (!this.canConstruct(doorId)) {
+          this.showAssemblyNotice(doorId, "No build rights on this door — a port can only be fitted by its owner.");
+          return;
+        }
+        const step = nextDockStep({
+          hasPort: this.doorHasPort(doorId),
+          record: readDoor(doorId),
+          staged: state.segments,
+        });
+        if (step.kind === "refuse") {
+          this.showAssemblyNotice(doorId, step.reason);
+          return;
+        }
+        if (!consumePart("adapter")) {
+          this.renderAssemblyStrip(doorId, "no ADAPTER parts — DEV menu › PARTS");
+          return;
+        }
+        this.untouchedPrefills.delete(doorId);
+        if (step.kind === "fit-port") {
+          // SEED-FIRST is not needed here: writeDoorPolicy refuses a door the
+          // layout does not know, and every door with a pane is known.
+          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: true });
+        } else {
+          state.segments = dockChain();
+          state.dockMatePaid = true;
+        }
+        this.assemblyNotice = null;
+        this.renderAssemblyStrip(doorId);
+        this.renderDockRow(doorId);
+        this.notifyDockChange();
       });
 
     // Chip interactions (delegated): cycle the main parameter, toggle skin,
@@ -1509,6 +1862,9 @@ export class DoorDockingPortSystem {
       )
         return;
       if (!this.canConstruct(doorId)) return;
+      // ⚓ Dock halves have their own chips (data-dock-chip) — never cycled,
+      // skinned or refunded as gangway parts here.
+      if (state.segments[i].kind === "dock") return;
       this.untouchedPrefills.delete(doorId);
       const seg = { ...state.segments[i] };
       const action = el.dataset.chipAction;
@@ -1533,6 +1889,61 @@ export class DoorDockingPortSystem {
       }
       this.renderAssemblyStrip(doorId);
       this.publishIfPaired(doorId);
+    });
+
+    // ⚓ #163: the dock chips — ✕ on the PORT removes this door's half
+    // (refund; refused while docked, and it closes the remembered berth), ✕ on
+    // the MATING HALF unstages it (refund).
+    document.getElementById("docking-chips")?.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>("[data-dock-chip]");
+      if (!el) return;
+      const doorId = activeDoor();
+      const state = doorId ? this.doorState.get(doorId) : null;
+      if (!doorId || !state || !this.canConstruct(doorId)) return;
+      if (this.dockOp(doorId)?.busy) return; // a dock/undock is running
+      const record = readDoor(doorId);
+      if (el.dataset.dockChip === "unstage-mate") {
+        if (state.pairedSuccessfully || !isDockChain(state.segments)) return;
+        this.refundWorkingChain(state);
+        state.segments = undefined;
+      } else if (el.dataset.dockChip === "remove-port") {
+        const port = classifyDockPort(record);
+        if (port.kind === "docked") {
+          this.showAssemblyNotice(doorId, "Docked — UNDOCK before removing the port.");
+          return;
+        }
+        // A staged mating half has nothing to mate with any more.
+        if (isDockChain(state.segments) && !state.pairedSuccessfully) {
+          this.refundWorkingChain(state);
+          state.segments = undefined;
+        }
+        if (readDoorPolicy(doorId).adapter) refundPart("adapter");
+        // Removing the port CLOSES the berth: the tombstone keeps refusing
+        // the old dock's mirror, but loses its memory, so neither this door's
+        // DOCK nor the far side's may re-make the connection (dockRules
+        // farDockPatch reads a plain tombstone naming it — or any tombstone
+        // on a door without a port — as "closed"). ONE transaction: a far
+        // room's DOCK session reading this room never sees the port gone
+        // while the old berth memory still stands.
+        transactDoorWrites(() => {
+          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
+          if (port.kind === "undocked") writeDoorTombstone(doorId, port.address);
+        });
+      }
+      this.assemblyNotice = null;
+      this.renderAssemblyStrip(doorId);
+      this.renderDockRow(doorId);
+      this.notifyDockChange();
+    });
+
+    // ⚓ #163 DOCK row actions (delegated — the row re-renders on every change).
+    document.getElementById("docking-dock-row")?.addEventListener("click", (e) => {
+      const el = (e.target as HTMLElement).closest<HTMLElement>("[data-dock-action]");
+      if (!el) return;
+      const doorId = activeDoor();
+      if (!doorId) return;
+      if (el.dataset.dockAction === "undock") void this.undockPort(doorId);
+      else if (el.dataset.dockAction === "dock") void this.redockPort(doorId);
     });
 
     (
@@ -1666,20 +2077,6 @@ export class DoorDockingPortSystem {
           // The record is the sole position — clear legacy slide residue, or
           // the read-boundary fold re-adds the old drag on top (door jump).
           clearDoorSlide(doorId);
-        } else if (action === "install-adapter") {
-          // #67 D2: consumes an ADAPTER part; the flag is shared room truth.
-          if (consumePart("adapter")) {
-            writeDoorPolicy(doorId, {
-              ...readDoorPolicy(doorId),
-              adapter: true,
-            });
-          }
-        } else if (action === "remove-adapter") {
-          refundPart("adapter");
-          writeDoorPolicy(doorId, {
-            ...readDoorPolicy(doorId),
-            adapter: false,
-          });
         } else if (action === "undock-module") {
           // ⏏ Owner removes a PERMANENT docked module (transient berths have
           // their own DETACH row above the owner gate). Two-click arm/confirm.
@@ -1717,7 +2114,6 @@ export class DoorDockingPortSystem {
   private renderPolicySection(doorId: string): void {
     const body = document.getElementById("docking-policy-body");
     if (!body) return;
-    const isCardinal = isCardinalDoorId(doorId);
     const policy = readDoorPolicy(doorId);
     const owner = this.isRoomOwner();
     const myPub = getIdentityPub();
@@ -1728,9 +2124,11 @@ export class DoorDockingPortSystem {
 
     // #67 D2: a live transient berth shows a DETACH row to EVERYONE — either
     // side may cast off a guest ship without owner ceremony.
+    // ⚓ #163: only a LEGACY berth (a transient gangway from before docks were
+    // round) — a dock has its own DOCK row with UNDOCK at the top of the pane.
     const st = this.doorState.get(doorId);
     const detachRow =
-      st?.pairedSuccessfully && st.transient
+      st?.pairedSuccessfully && st.transient && !isDockChain(st.segments)
         ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>`
         : "";
@@ -1773,20 +2171,11 @@ export class DoorDockingPortSystem {
             })()}</span>
             <button type="button" data-policy-action="slide-pos" ${st?.pairedSuccessfully ? "disabled" : ""} style="${pill}">▶</button>
           </span></div>`;
-    // 🔌 EVERY door, cardinal or free (owner's ruling: "any door should allow a
-    // vestibule or docking adapter"). Deliberately NOT gated on isCardinal like
-    // positionRow above, and it needs no store work to get here: doorPolicy has
-    // been free-door native on both sides since #91 — isKnownDoorId accepts any
-    // id in the room's layout (doorPolicy.ts), and its own comment records that
-    // the remaining gap was "a UI-only change rather than another store
-    // migration". This is that change. The adapter is a per-door capability
-    // flag, so nothing about it was ever cardinal except this ternary.
-    const adapterRow = `<div style="${row}"><span>🔌 DOCK ADAPTER <span style="color:rgba(212,168,75,0.4);">· guest berthing</span></span>
-          ${
-            policy.adapter
-              ? `<button type="button" data-policy-action="remove-adapter" style="${pill} background:rgba(0,229,255,0.10); border-color:rgba(0,229,255,0.4); color:#80d8ff;">INSTALLED · ✕</button>`
-              : `<button type="button" data-policy-action="install-adapter" style="${pill}" ${partsCount("adapter") === 0 ? 'disabled title="no ADAPTER parts — DEV menu › PARTS"' : ""}>INSTALL (×${partsCount("adapter")})</button>`
-          }</div>`;
+    // ⚓ #163: the docking adapter moved OUT of this collapsed section — it is a
+    // vestibule now, fitted with +DOCK in the connection assembly (its chip ✕
+    // removes it) and docked/undocked from the DOCK row at the top of the pane.
+    // Same per-door `adapter` flag, so every port installed from here before
+    // is simply a port.
 
     if (owner) {
       const requests = readDoorRequests(doorId);
@@ -1831,7 +2220,6 @@ export class DoorDockingPortSystem {
         <div style="${row}"><span>CONSTRUCTION <span style="color:rgba(212,168,75,0.4);">· dock/build</span></span>
           <button type="button" data-policy-action="cycle-construction" style="${pill}">${policy.construction.toUpperCase()}</button></div>
         ${positionRow}
-        ${adapterRow}
         ${undockRow}
         ${detachRow}
         ${requests.length ? `<div style="font-size:9px; font-weight:800; color:rgba(255,179,0,0.7); letter-spacing:1px; margin-top:2px;">RIGHTS REQUESTS</div>${reqRows}` : ""}
@@ -1853,8 +2241,10 @@ export class DoorDockingPortSystem {
       body.innerHTML = `
         <div style="${row}"><span>PASSAGE: ${passageLabel(policy)}</span>${buildLine}</div>
         ${
-          isCardinal && policy.adapter && !this.canConstruct(doorId)
-            ? `<div style="color:#80d8ff;">🔌 BERTHING OPEN — enter your ship's address above and INITIATE to dock transiently</div>`
+          // ⚓ #163: any door (the cardinal-only gate here was a leftover) —
+          // a port is a berth any visitor may dock a ship at.
+          policy.adapter && !this.canConstruct(doorId)
+            ? `<div style="color:#f2efe6;">⚓ DOCK PORT — enter your ship's address above and INITIATE to dock it here</div>`
             : ""
         }
         ${detachRow}
@@ -1880,8 +2270,33 @@ export class DoorDockingPortSystem {
         ?.value || st?.connectedRoomAddress || "";
     const rid = addr ? roomIdFromSeed(addr) : "";
     const doors = rid ? readAtlas()[rid]?.doors ?? {} : {};
+    const currentId =
+      (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+    // 🚪 ONE VESTIBULE PER DOOR: the atlas lists a far room's doors BECAUSE
+    // they are paired (that is how it learns them), so every entry here is an
+    // occupied berth unless it is THIS door's own existing connection (being
+    // re-initiated) — another door of this room is a second vestibule too
+    // (review, round 3). That reciprocity is decided from THIS door's own
+    // live record — paired to that room, naming that door by id or by wall +
+    // lateral — never from the peer record's farDoor, which may be a stale
+    // compass guess that happens to name the open door (review, round 9).
+    // Offered greyed-out and unselectable, never as a target — this list used
+    // to be exactly the set of doors that must not take a second vestibule.
+    const ownRec = readDoor(doorId); // ⚓ #163: uncapped, like every named-door read
+    const ownTarget =
+      ownRec?.paired && ownRec.connectedRoomAddress
+        ? roomIdFromSeed(ownRec.connectedRoomAddress)
+        : "";
+    const reciprocal = (id: string, d: { wall?: DoorWall; lateral?: number } | undefined): boolean =>
+      !!ownRec?.paired &&
+      ownTarget === rid &&
+      (ownRec.farDoor === id ||
+        (!!ownRec.farWall &&
+          ownRec.farWall === d?.wall &&
+          Math.abs((ownRec.farLateral ?? 0) - (d?.lateral ?? 0)) < MIN_DOOR_GAP));
     const entries = Object.entries(doors).map(([id, d]) => ({
       id, wall: d?.wall, lateral: d?.lateral,
+      inUse: !!d?.targetRoomId && !(d.targetRoomId === currentId && reciprocal(id, d)),
     }));
     const ordinals = doorOrdinals(entries);
     const esc = (s: string) =>
@@ -1891,24 +2306,33 @@ export class DoorDockingPortSystem {
       `<option value="">auto</option>` +
       entries
         .sort((a, b) => (ordinals.get(a.id) ?? 9) - (ordinals.get(b.id) ?? 9))
-        .map((e) => `<option value="${esc(e.id)}">DOOR ${ordinals.get(e.id)}</option>`)
+        .map((e) =>
+          `<option value="${esc(e.id)}"${e.inUse ? " disabled" : ""}>DOOR ${ordinals.get(e.id)}${e.inUse ? " · in use" : ""}</option>`)
         .join("");
     // Keep the current selection when it survives the repopulation; a farDoor
     // naming a door the atlas does not list yet degrades to auto IN THE UI
-    // while the state keeps the precise id (the mirror wrote it).
+    // while the state keeps the precise id (the mirror wrote it). A selection
+    // that turned out to be in use degrades to auto too.
     farSel.value = prev;
-    if (farSel.value !== prev) farSel.value = "";
+    if (farSel.value !== prev || entries.find((e) => e.id === prev)?.inUse)
+      farSel.value = "";
   }
 
   /** #67: re-paint policy + assembly for the OPEN pane (doc-change refresh —
    *  a grant landing while a guest stares at the keypad unlocks it live). */
   public refreshPolicyUI(): void {
+    // ⚓ The helm's docking computer listens too — a port fitted, a dock made
+    // or released anywhere in the room repaints it, pane open or not.
+    this.notifyDockChange();
     const pane = document.getElementById("docking-control-pane");
     if (!pane || pane.style.display === "none") return;
     const doorId = (pane as any).activeDoorId as string | null;
     if (!doorId) return;
     this.renderPolicySection(doorId);
-    if (isCardinalDoorId(doorId)) this.renderAssemblyStrip(doorId);
+    // ⚓ Every door, not just cardinals: the strip shows a door's PORT, which a
+    // policy change (a port fitted from another client) can add or remove.
+    this.renderAssemblyStrip(doorId);
+    this.renderDockRow(doorId);
   }
 
   /** #62 P4: paint the assembly strip from the door's working chain. */
@@ -1949,15 +2373,66 @@ export class DoorDockingPortSystem {
       const currentId =
         (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
       if (!currentId) return null;
-      const wouldBe = projectionPoseForDoor(doorId, segs, this.farWallFor(state));
+      // Same pose the final projection uses — far wall, lateral AND the
+      // target's true half-extent — or the warning validates a module metres
+      // from where it will be drawn (reviews, rounds 7 and 9).
+      const warnWall = this.farWallFor(state);
+      const warnDims = state.connectedRoomAddress
+        ? readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims
+        : undefined;
+      const wouldBe = projectionPoseForDoor(
+        doorId, segs, warnWall, state.farLateral ?? 0,
+        warnWall ? halfAlongWall(warnDims, warnWall) : undefined,
+      );
       const hit = moduleOverlapAt(currentId, wouldBe);
       return hit ? hit.name : null;
     })();
     const escName = (s: string) =>
       s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
-    chips.innerHTML =
-      segs.length === 0
-        ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway</span>`
+    // ⚓ #163: a door wearing a dock port shows the ADAPTER, not a chain: the
+    // port chip (this door's half) and the mating half — staged, or mated
+    // with the far door's when docked. White, like the adapter itself.
+    const dockChip = (text: string, action?: string, title?: string) => `
+            <span style="display:inline-flex; align-items:center; gap:4px; background:rgba(242,239,230,0.10); border:1px solid rgba(242,239,230,0.45); border-radius:10px; padding:2px 8px; font-size:9px; font-weight:700; color:#f2efe6;"${title ? ` title="${escName(title)}"` : ""}>
+              ⚓ ${text}
+              ${action ? `<button type="button" data-dock-chip="${action}" title="Remove (refunds the part)" style="background:none; border:none; color:#ff8a80; font-size:9px; cursor:pointer; padding:0 1px;">✕</button>` : ""}
+            </span>`;
+    const hasPort = this.doorHasPort(doorId);
+    const docked = state.pairedSuccessfully && isDockChain(segs);
+    const mateStaged = !state.pairedSuccessfully && isDockChain(segs);
+    const mayEdit = this.canConstruct(doorId);
+    const notice =
+      this.assemblyNotice?.doorId === doorId
+        ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ ${escName(this.assemblyNotice.text)}</div>`
+        : "";
+    const warnings =
+      (chainClash
+        ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ chain sweeps through mounted equipment (${chainClash}) — bend around it or move the mount</div>`
+        : "") +
+      (moduleClash
+        ? `<div style="font-size:9px; color:#FF7043; margin-top:4px;">⛔ would overlap <b>${escName(moduleClash)}</b> — this module can't dock here; re-route the chain</div>`
+        : "");
+    if (hasPort || mateStaged) {
+      chips.innerHTML =
+        dockChip(
+          "PORT · this door",
+          mayEdit && !docked ? "remove-port" : undefined,
+          docked ? "UNDOCK before removing the port" : "This door's half of the docking adapter",
+        ) +
+        (docked
+          ? dockChip("MATED · far door's half", undefined, "Both halves locked together — UNDOCK releases them")
+          : mateStaged
+            ? dockChip("MATING HALF · far door", mayEdit ? "unstage-mate" : undefined, "The half this dock brings to the far door")
+            : `<span style="font-size:9px; color:rgba(242,239,230,0.45);">${
+                mayEdit
+                  ? "+DOCK again adds the other half — then PROVISION NEW MODULE, or INITIATE to a module with a port"
+                  : "a ship docks here with its own half — INITIATE below"
+              }</span>`) +
+        warnings +
+        notice;
+    } else chips.innerHTML =
+      (segs.length === 0
+        ? `<span style="font-size:9px; color:rgba(212,168,75,0.35);">no chain — a plain pairing uses the straight gangway · +DOCK fits a round docking port</span>`
         : segs
             .map((s, i) => {
               const label =
@@ -1975,32 +2450,568 @@ export class DoorDockingPortSystem {
               <button type="button" data-chip-action="remove" data-i="${i}" title="Remove (refunds the part)" style="background:none; border:none; color:#ff8a80; font-size:9px; cursor:pointer; padding:0 1px;">✕</button>
             </span>`;
             })
-            .join("") +
-          (chainClash
-            ? `<div style="font-size:9px; color:#FFB300; margin-top:4px;">⚠ chain sweeps through mounted equipment (${chainClash}) — bend around it or move the mount</div>`
-            : "") +
-          (moduleClash
-            ? `<div style="font-size:9px; color:#FF7043; margin-top:4px;">⛔ would overlap <b>${escName(moduleClash)}</b> — this module can't dock here; re-route the chain</div>`
-            : "");
+            .join("") + warnings) + notice;
     if (partsNote) {
       partsNote.textContent =
         note ??
         (this.canConstruct(doorId)
-          ? `· stock F×${partsCount("flex")} E×${partsCount("ext")}`
+          ? `· stock F×${partsCount("flex")} E×${partsCount("ext")} A×${partsCount("adapter")}`
           : readDoorPolicy(doorId).construction === "request"
             ? "· no build rights — REQUEST below"
             : "· owner only on this port");
     }
     this.renderFarDoorOptions(doorId);
-    if (farSel) farSel.value = state.farDoor ?? "";
+    // Restore the state's far door onto the select only when its option is
+    // there AND enabled: a programmatic assignment selects a DISABLED option
+    // just as happily, which showed an in-use door as chosen after the
+    // options had marked it so (review, round 5). Otherwise the UI reads auto
+    // while the state keeps its precise id (the mirror may have written it).
+    if (farSel) {
+      const opt = state.farDoor
+        ? [...farSel.options].find((o) => o.value === state.farDoor)
+        : undefined;
+      farSel.value = opt && !opt.disabled ? state.farDoor! : "";
+    }
     if (yawBtn)
       yawBtn.textContent = `YAW ${state.farYawDeg === undefined ? "—" : state.farYawDeg}`;
+    // ⚓ A port door connects by docking: the gangway parts dim (a click
+    // still explains why), and +DOCK says what its next press does.
+    for (const id of ["docking-add-flex", "docking-add-ext"]) {
+      const b = document.getElementById(id);
+      if (!b) continue;
+      b.style.opacity = hasPort ? "0.35" : "1";
+      b.title = hasPort ? (gangwayPartRefusal(true) ?? "") : "";
+    }
+    const dockBtn = document.getElementById("docking-add-dock");
+    if (dockBtn) {
+      const step = nextDockStep({
+        hasPort,
+        record: readDoor(doorId),
+        staged: state.segments,
+      });
+      dockBtn.style.opacity = step.kind === "refuse" || !mayEdit ? "0.35" : "1";
+      dockBtn.title =
+        step.kind === "fit-port"
+          ? "Fit this door's half of a docking adapter — a round port (1 ADAPTER part)"
+          : step.kind === "stage-mate"
+            ? "Add the OTHER half — the one the module on the far side will wear (1 ADAPTER part)"
+            : step.reason;
+    }
     // 🧲 Every chain edit re-tests whether the far end now reaches a known
     // module — the connect prompt appears/disappears as you build.
     this.detectChainContact(doorId);
     // …and carries the placement ghost with it: the ghost sits at the chain's
     // END, so every +FLEX/+EXT/chip edit moves where the module would land.
     if (this.provisionGhost) this.updateProvisionGhost(doorId);
+  }
+
+  // ── ⚓ #163: dock ports, DOCK and UNDOCK ────────────────────────────────────
+
+  /** Does this door wear a dock port? Its policy flag — or a live dock, which
+   *  always has both halves whatever a lagging policy map says. */
+  public doorHasPort(doorId: string): boolean {
+    return isPortDoor(readDoorPolicy(doorId).adapter === true, readDoor(doorId));
+  }
+
+  /** May the local player dock / undock at this door? The door's own
+   *  construction rights — the same gate as building a connection there. */
+  public canOperateDock(doorId: string): boolean {
+    return this.canConstruct(doorId);
+  }
+
+  private showAssemblyNotice(doorId: string, text: string): void {
+    this.assemblyNotice = { doorId, text };
+    this.renderAssemblyStrip(doorId);
+  }
+
+  /** Refund what the WORKING chain cost: gangway parts one per segment; for a
+   *  staged dock only the mating half, and only if it was paid for (+DOCK) —
+   *  the port is a door fitting with its own refund, and an INITIATE-made
+   *  dock chain (the far ship brings its half) cost nothing. */
+  private refundWorkingChain(state: DockingState): void {
+    const segs = state.segments ?? [];
+    if (segs.length > 0 && segs.every((s) => s.kind === "dock")) {
+      if (state.dockMatePaid) refundPart("adapter");
+    } else if (segs.length > 0) {
+      refundForSegments(segs);
+    }
+    state.dockMatePaid = false;
+  }
+
+  /** Register for dock-port changes (the helm's docking computer). */
+  public onDockChange(cb: () => void): () => void {
+    this.dockListeners.add(cb);
+    return () => this.dockListeners.delete(cb);
+  }
+
+  private notifyDockChange(): void {
+    for (const listener of [...this.dockListeners]) {
+      try {
+        listener();
+      } catch (err) {
+        console.error("[docking] dock listener threw:", err);
+      }
+    }
+  }
+
+  /** The room this client stands in. */
+  private roomNow(): string {
+    return (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
+  }
+
+  /** This room's operation on `doorId`. Operations are keyed by room AND door:
+   *  this system outlives room swaps, and door ids repeat from room to room —
+   *  a note (or a busy flag) from `north` in one room must never show on, or
+   *  lock, `north` in the next. */
+  private dockOp(doorId: string) {
+    return this.dockOps.get(`${this.roomNow()}|${doorId}`);
+  }
+
+  /** Record an operation's state for `doorId` in `roomId` — the room the
+   *  operation STARTED in, which an await may since have left. */
+  private setDockOp(
+    doorId: string,
+    op: { busy?: boolean; note?: string; tone?: "ok" | "warn" | "bad" },
+    roomId = this.roomNow(),
+  ): void {
+    this.dockOps.set(`${roomId}|${doorId}`, { busy: op.busy ?? false, note: op.note, tone: op.tone });
+    const pane = document.getElementById("docking-control-pane");
+    if (
+      roomId === this.roomNow() &&
+      pane &&
+      pane.style.display !== "none" &&
+      (pane as unknown as { activeDoorId?: string }).activeDoorId === doorId
+    ) {
+      this.renderDockRow(doorId);
+      this.renderAssemblyStrip(doorId);
+    }
+    this.notifyDockChange();
+  }
+
+  /** The module on the other side, by name when the atlas knows it. */
+  private partnerLabel(roomId: string): string {
+    const name = roomId ? readAtlas()[roomId]?.name : undefined;
+    return name && name !== "Module" ? name : "the other module";
+  }
+
+  /** This door's along-wall centre, in the currency pairing records use. */
+  private doorLateral(doorId: string): { wall: DoorWall; lateral: number } {
+    const pose = this.poseForDoor(doorId);
+    return { wall: pose.wall, lateral: pose.tangent === "x" ? pose.x : pose.z };
+  }
+
+  /** Every dock port of the room, in door order — the helm's list and map. */
+  public listDockPorts(): DockPortView[] {
+    // An AUTHORITATIVE door set is the whole truth, even when it is empty
+    // ("this room has no doors"); only an un-migrated room stands on the four
+    // defaults. (Removing a door leaves its policy behind, so resurrecting the
+    // cardinals here would list a removed port as a phantom one.)
+    const doors = doorSetIsAuthoritative()
+      ? readAllDoorLayout()
+      : defaultDoorLayoutRecords();
+    const ids = [...doors.keys()];
+    const ordinals = doorOrdinals([...doors.values()]);
+    const out: DockPortView[] = [];
+    for (const id of ids) {
+      const record = readDoor(id);
+      if (!isPortDoor(readDoorPolicy(id).adapter === true, record)) continue;
+      const state = classifyDockPort(record);
+      const partnerRoom =
+        state.kind === "docked" || state.kind === "undocked" ? state.roomId : "";
+      const op = this.dockOp(id);
+      out.push({
+        doorId: id,
+        label: doorDisplayName(id),
+        state,
+        partnerName: partnerRoom ? this.partnerLabel(partnerRoom) : null,
+        canOperate: this.canConstruct(id),
+        busy: op?.busy ?? false,
+        note: op?.note,
+        tone: op?.tone,
+      });
+    }
+    return out.sort(
+      (a, b) => (ordinals.get(a.doorId) ?? 99) - (ordinals.get(b.doorId) ?? 99),
+    );
+  }
+
+  /**
+   * ⚓ The helm's SHIP ATLAS: every module connected to this one, posed in this
+   * room's frame exactly as the gray-box projection poses it (the same pure
+   * function, far wall, lateral and true half) — docks and gangways alike, so
+   * the pilot sees what is bolted on (ship) and what is only docked (berth).
+   */
+  public connectedModules(): Array<{
+    doorId: string;
+    roomId: string;
+    name: string;
+    x: number;
+    z: number;
+    rotY: number;
+    halfX: number;
+    halfZ: number;
+    dock: boolean;
+  }> {
+    const out: ReturnType<DoorDockingPortSystem["connectedModules"]> = [];
+    for (const [doorId, st] of this.doorState) {
+      if (!st.pairedSuccessfully || !st.connectedRoomAddress) continue;
+      if (!this.doorObjects.has(doorId)) continue; // this room's doors only
+      const roomId = roomIdFromSeed(st.connectedRoomAddress);
+      const farWall = this.farWallFor(st);
+      const dims = roomId ? readAtlas()[roomId]?.dims : undefined;
+      const pose = projectionPoseForDoor(
+        doorId,
+        st.segments,
+        farWall,
+        st.farLateral ?? 0,
+        farWall ? halfAlongWall(dims, farWall) : undefined,
+      );
+      out.push({
+        doorId,
+        roomId,
+        name: this.partnerLabel(roomId),
+        ...pose,
+        ...moduleHalves(dims),
+        dock: isDockChain(st.segments),
+      });
+    }
+    return out;
+  }
+
+  /**
+   * ⏏ UNDOCK — release a dock: the module on the far side is free to fly.
+   * THIS side first (the tombstone keeps the berth memory, so DOCK can come
+   * back), then the far room's end through the injected writer — best effort;
+   * an unreachable far room is said, not hidden.
+   */
+  public async undockPort(doorId: string): Promise<boolean> {
+    if (this.dockOp(doorId)?.busy) return false;
+    // Every status this call reports belongs to the room it started in — the
+    // far write is awaited, and the player may walk on meanwhile.
+    const roomId = this.roomNow();
+    const port = classifyDockPort(readDoor(doorId));
+    if (port.kind !== "docked") return false;
+    if (!this.canConstruct(doorId)) {
+      this.setDockOp(doorId, {
+        note: "Only this door's owner (or a builder here) can undock it.",
+        tone: "bad",
+      });
+      return false;
+    }
+    // Causally after the dock it releases, whatever this client's clock says
+    // (the far side's newer-dock guard and the mirror compare these stamps).
+    const undockedAt = stampAfter(port.record.dockedAt);
+    writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt));
+    const name = this.partnerLabel(port.roomId);
+    if (!this.farDockWriter) {
+      this.setDockOp(doorId, {
+        note: `Undocked from ${name}. Its side will show the dock until it undocks too.`,
+        tone: "warn",
+      });
+      return true;
+    }
+    this.setDockOp(doorId, { busy: true, note: `Undocked — telling ${name}…` }, roomId);
+    const near = this.doorLateral(doorId);
+    let result: FarDockResult;
+    try {
+      result = await this.farDockWriter({
+        kind: "undock",
+        nearRoomId: roomId,
+        farAddress: port.address,
+        farDoor: port.record.farDoor,
+        nearDoorId: doorId,
+        nearWall: near.wall,
+        nearLateral: near.lateral,
+        undockedAt,
+      });
+    } catch (err) {
+      console.warn("[dock] far undock threw:", err);
+      result = { ok: false, reason: "unreachable" };
+    }
+    this.setDockOp(
+      doorId,
+      result.ok
+        ? { note: `Undocked from ${name} — free to fly.`, tone: "ok" }
+        : {
+            note: `Undocked. ${name} could not be reached — its side shows the dock until it undocks too.`,
+            tone: "warn",
+          },
+      roomId,
+    );
+    return true;
+  }
+
+  /**
+   * ⚓ DOCK — re-make the dock this port remembers. The BERTH is asked first
+   * (the far room's end, compare-and-swap: still free, still a port), so a
+   * refused dock never flickers into existence; then this side. A far room
+   * that cannot be reached docks this side alone — the first walk-through's
+   * mirror completes it (dockRules.mirrorMayWrite: a dock newer than the
+   * berth's undock re-docks). If this port changes while the berth is asked,
+   * this side is left alone and the far write is taken back
+   * (settleChangedRedock).
+   */
+  public async redockPort(doorId: string): Promise<boolean> {
+    if (this.dockOp(doorId)?.busy) return false;
+    // The room this DOCK belongs to: its status is reported there, and this
+    // side is written only while the player still stands in it.
+    const roomId = this.roomNow();
+    const port = classifyDockPort(readDoor(doorId));
+    if (port.kind !== "undocked" || !readDoorPolicy(doorId).adapter) return false;
+    if (!this.canConstruct(doorId)) {
+      this.setDockOp(doorId, {
+        note: "Only this door's owner (or a builder here) can dock it.",
+        tone: "bad",
+      });
+      return false;
+    }
+    const name = this.partnerLabel(port.roomId);
+    const { farDoor, farWall, farLateral } = port.memory;
+    // The same near-side gates INITIATE applies: the far door must not be
+    // known to be taken, and the module must not land on another.
+    const taken = this.farDoorTakenBy(port.roomId, farDoor, farWall, farLateral);
+    if (taken && !(taken.roomId === roomId && taken.doorId === doorId)) {
+      this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL.occupied, tone: "bad" });
+      return false;
+    }
+    if (roomId) {
+      const dims = readAtlas()[port.roomId]?.dims;
+      const clash = moduleOverlapAt(
+        roomId,
+        projectionPoseForDoor(
+          doorId,
+          dockChain(),
+          farWall ?? null,
+          farLateral ?? 0,
+          farWall ? halfAlongWall(dims, farWall) : undefined,
+        ),
+      );
+      if (clash) {
+        this.setDockOp(doorId, {
+          note: `Can't dock — ${name} would overlap ${clash.name}.`,
+          tone: "bad",
+        });
+        return false;
+      }
+    }
+    // Causally after the undock it replaces, whatever this client's clock
+    // says — or the far side's walk-through mirror would read this deliberate
+    // re-dock as a stale berth (dockRules.mirrorMayWrite) and never heal it.
+    const dockedAt = stampAfter(port.memory.undockedAt);
+    const near = this.doorLateral(doorId);
+    // The far berth is asked over an await, and a peer may dock, re-connect or
+    // strip this port meanwhile — or the player may walk into another room,
+    // whose doc is the bound one now: this side is only ever written over the
+    // very tombstone read above, in the room it was read in.
+    const unchanged = () => {
+      if (this.roomNow() !== roomId) return false;
+      const now = classifyDockPort(readDoor(doorId));
+      return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
+    };
+    let far: FarDockResult | null = null;
+    if (this.farDockWriter && farDoor) {
+      this.setDockOp(doorId, { busy: true, note: `Requesting the berth at ${name}…` }, roomId);
+      try {
+        far = await this.farDockWriter({
+          kind: "dock",
+          nearRoomId: roomId,
+          replacesUndockedAt: port.memory.undockedAt,
+          farAddress: port.address,
+          farDoor,
+          nearDoorId: doorId,
+          nearWall: near.wall,
+          nearLateral: near.lateral,
+          dockedAt,
+        });
+      } catch (err) {
+        console.warn("[dock] far dock threw:", err);
+        far = { ok: false, reason: "unreachable" };
+      }
+      if (!far.ok && far.reason === "superseded") {
+        // The berth already holds a dock of THIS very port, stamped after our
+        // undock — made from the far side, or by a crew member here at the
+        // same moment. That dock stands. Join it: this side takes that dock's
+        // own stamp (exactly what the walk-through mirror would write), so
+        // both ends hold one dock — and still only over the tombstone read
+        // above, in the room it was read in.
+        if (
+          far.stamp !== undefined &&
+          far.stamp > port.memory.undockedAt &&
+          unchanged()
+        ) {
+          const joined = redockRecord(port, far.stamp);
+          writeDoorPairing(doorId, joined.connectedRoomAddress, joined);
+          this.setDockOp(
+            doorId,
+            { note: `Docked to ${name} — joining the dock already made to this port.`, tone: "ok" },
+            roomId,
+          );
+          return true;
+        }
+        this.setDockOp(
+          doorId,
+          { note: `Another DOCK of this port reached ${name} at the same moment — that one stands.`, tone: "warn" },
+          roomId,
+        );
+        return false;
+      }
+      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone")) {
+        // A closed or vanished berth is not coming back: drop the memory so
+        // this port stops offering it. An occupied one may free up.
+        if (far.reason !== "occupied" && unchanged()) writeDoorTombstone(doorId, port.address);
+        this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" }, roomId);
+        return false;
+      }
+      if (!unchanged()) {
+        return this.settleChangedRedock(doorId, port, far, {
+          roomId,
+          farDoor,
+          dockedAt,
+          near,
+          name,
+        });
+      }
+    }
+    const next = redockRecord(port, dockedAt);
+    writeDoorPairing(doorId, next.connectedRoomAddress, next);
+    this.setDockOp(
+      doorId,
+      far?.ok
+        ? { note: `Docked to ${name}.`, tone: "ok" }
+        : {
+            note: `Docked to ${name} on this side — it could not be told now; walking through completes it.`,
+            tone: "warn",
+          },
+      roomId,
+    );
+    return true;
+  }
+
+  /**
+   * ⚓ redockPort's far berth answered, but THIS port changed while it was
+   * asked (a peer docked, re-connected or stripped it — or the player left
+   * the room, so this side can no longer be written). Docked meanwhile to
+   * this very berth under OUR stamp — a crew member here joining our dock, or
+   * the walk-through mirror of our far write — both sides hold one dock and
+   * nothing is taken back (dockRules.holdsOurRedock). Anything else, the far
+   * side's own DOCK crossing ours included, would leave the berth holding a
+   * dock this port does not have: take back exactly the far write this call
+   * made (the far side undoes only a dock carrying our stamp, never anyone
+   * else's), and say so.
+   */
+  private async settleChangedRedock(
+    doorId: string,
+    port: Extract<DockPortState, { kind: "undocked" }>,
+    far: FarDockResult,
+    ask: {
+      roomId: string;
+      farDoor: string;
+      dockedAt: number;
+      near: { wall: DoorWall; lateral: number };
+      name: string;
+    },
+  ): Promise<boolean> {
+    // Only the room this DOCK started in can say what its port holds now.
+    const now =
+      this.roomNow() === ask.roomId ? classifyDockPort(readDoor(doorId)) : null;
+    if (holdsOurRedock(now, { roomId: port.roomId, farDoor: ask.farDoor }, ask.dockedAt)) {
+      this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" }, ask.roomId);
+      return true;
+    }
+    // Acknowledged, or made but never acknowledged (it may still land): either
+    // way the berth may hold our write, and it is taken back.
+    if (!farWriteMayStand(far) || !this.farDockWriter) {
+      this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" }, ask.roomId);
+      return false;
+    }
+    this.setDockOp(
+      doorId,
+      {
+        busy: true,
+        note: `This port changed while docking — releasing the berth at ${ask.name}…`,
+      },
+      ask.roomId,
+    );
+    let undone: FarDockResult;
+    try {
+      undone = await this.farDockWriter({
+        kind: "undock",
+        // The room the DOCK was made from — possibly not the one we stand in.
+        nearRoomId: ask.roomId,
+        farAddress: port.address,
+        farDoor: ask.farDoor,
+        nearDoorId: doorId,
+        nearWall: ask.near.wall,
+        nearLateral: ask.near.lateral,
+        undockedAt: stampAfter(ask.dockedAt),
+        onlyDockedAt: ask.dockedAt,
+      });
+    } catch (err) {
+      console.warn("[dock] far take-back threw:", err);
+      undone = { ok: false, reason: "unreachable" };
+    }
+    this.setDockOp(
+      doorId,
+      undone.ok
+        ? {
+            note: `This port changed while docking — the berth at ${ask.name} was released again. Try again.`,
+            tone: "warn",
+          }
+        : {
+            note: far.ok
+              ? `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`
+              : `This port changed while docking, and ${ask.name} could not be reached to let go — its side may show the dock until it undocks.`,
+            tone: "bad",
+          },
+      ask.roomId,
+    );
+    return false;
+  }
+
+  /** ⚓ The DOCK row at the top of the pane (see its markup). */
+  private renderDockRow(doorId: string): void {
+    const rowEl = document.getElementById("docking-dock-row");
+    if (!rowEl) return;
+    const record = readDoor(doorId);
+    if (!isPortDoor(readDoorPolicy(doorId).adapter === true, record)) {
+      rowEl.style.display = "none";
+      rowEl.innerHTML = "";
+      return;
+    }
+    const esc = (s: string) =>
+      s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+    const port = classifyDockPort(record);
+    const op = this.dockOp(doorId);
+    const may = this.canConstruct(doorId);
+    const btn = (action: "dock" | "undock", label: string, color: string) =>
+      `<button type="button" data-dock-action="${action}" ${op?.busy ? "disabled" : ""} style="flex-shrink:0; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.25); color:${color}; font-size:10px; font-weight:800; padding:5px 12px; cursor:${op?.busy ? "wait" : "pointer"}; opacity:${op?.busy ? "0.5" : "1"};">${label}</button>`;
+    let status = "";
+    let action = "";
+    if (port.kind === "docked") {
+      status = `⚓ DOCKED → <b>${esc(this.partnerLabel(port.roomId))}</b>`;
+      if (may) action = btn("undock", "⏏ UNDOCK", "#ff8a80");
+    } else if (port.kind === "undocked") {
+      status = `⚓ UNDOCKED · last berth <b>${esc(this.partnerLabel(port.roomId))}</b>`;
+      if (may) action = btn("dock", "⚓ DOCK", "#00e676");
+    } else if (port.kind === "gangway") {
+      status = "⚓ DOCK PORT · this door is connected by a gangway";
+    } else {
+      status = may
+        ? "⚓ DOCK PORT · free — +DOCK stages the other half, or pick a target and INITIATE"
+        : "⚓ DOCK PORT · free";
+    }
+    const toneColor =
+      op?.tone === "ok" ? "#00e676" : op?.tone === "bad" ? "#ff8a80" : "#ffb300";
+    rowEl.innerHTML = `
+      <div style="border:1px solid rgba(242,239,230,0.35); border-radius:8px; padding:8px 10px; background:rgba(242,239,230,0.05); display:flex; flex-direction:column; gap:6px;">
+        <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
+          <span style="font-size:10.5px; color:#f2efe6; line-height:1.35;">${status}</span>
+          ${action}
+        </div>
+        ${op?.note ? `<div style="font-size:9.5px; color:${op.busy ? "#ffb300" : toneColor}; line-height:1.3;">${op.busy ? "⏳ " : ""}${esc(op.note)}</div>` : ""}
+        ${!may && (port.kind === "docked" || port.kind === "undocked") ? `<div style="font-size:9px; color:rgba(242,239,230,0.5);">Docking here is up to the owner — or undock from your ship's own door or helm.</div>` : ""}
+      </div>`;
+    rowEl.style.display = "block";
   }
 
   /** #62 P4: a post-pairing chain edit re-fires the ACCEPTED publish so the
@@ -2136,7 +3147,9 @@ export class DoorDockingPortSystem {
       if (
         this.canConstruct(doorId) &&
         !state.pairedSuccessfully &&
-        (!state.segments || state.segments.length === 0)
+        (!state.segments || state.segments.length === 0) &&
+        // ⚓ A port door connects by docking — never prefill a gangway there.
+        !this.doorHasPort(doorId)
       ) {
         const preset = armedPreset();
         if (preset) {
@@ -2149,11 +3162,14 @@ export class DoorDockingPortSystem {
           }
         }
       }
+      // ⚓ A fresh pane starts without a stale notice.
+      this.assemblyNotice = null;
       this.renderAssemblyStrip(doorId);
       this.undockArmed.delete(doorId); // ⏏ arming never survives a pane re-open
       this.renderKnownModules(); // 🗺️ atlas picker
     }
     this.renderPolicySection(doorId); // #67 D1
+    this.renderDockRow(doorId); // ⚓ #163
   }
 
   /**
@@ -2192,73 +3208,137 @@ export class DoorDockingPortSystem {
       seed?: string;
       dist: number;
       door: { id: string; wall: DoorWall; lateral: number };
+      /** An OCCUPIED door that fit better than the pick — said in the prompt. */
+      blocked?: { id: string; wall: DoorWall };
     } | null = null;
-    // The outward yaw of each wall — poseFromWall's values, stated once.
-    const WALL_YAW: Record<DoorWall, number> = {
-      'y+': 0,
-      'x+': Math.PI / 2,
-      'y-': Math.PI,
-      'x-': -Math.PI / 2,
+    /** The nearest module whose ONLY fitting door is already taken — the
+     *  refusal the prompt explains instead of offering CONNECT. */
+    let blockedOnly: { name: string; wall: DoorWall } | null = null;
+    // The chain's END in this room's frame: the far module's centre sits
+    // ROOM_HALF past it along the arrival heading (projectionPoseFromWall),
+    // and with no far wall known the pose's rotY IS that heading.
+    const heading = wouldBe.rotY;
+    const arrival = {
+      x: wouldBe.x - Math.sin(heading) * ROOM_HALF,
+      z: wouldBe.z - Math.cos(heading) * ROOM_HALF,
+      heading,
     };
-    const angDiff = (a: number, b: number) => {
-      let d = (a - b) % (Math.PI * 2);
-      if (d > Math.PI) d -= Math.PI * 2;
-      if (d < -Math.PI) d += Math.PI * 2;
-      return Math.abs(d);
-    };
-    // 🧭 A module's candidate doors are its REAL gossiped door set — id, wall
-    // and lateral from the atlas, so a free `d:` door is as connectable as any
-    // cardinal. Only a module whose gossip predates door geometry falls back to
-    // the four hypothetical wall-centre doors the matcher used to assume.
-    const candidateDoors = (
-      roomId: string,
-    ): Array<{ id: string; wall: DoorWall; lateral: number }> => {
-      const out: Array<{ id: string; wall: DoorWall; lateral: number }> = [];
-      // Real doors the atlas knows about — but a door with a targetRoomId is
-      // PAIRED, i.e. an occupied berth, not a candidate for a NEW connection.
-      // (Today the atlas learns doors only FROM pairings, so this arm is empty
-      // until full-layout gossip ships; it is here so free unpaired doors
-      // become candidates the moment that lands. Redo review F1: an
-      // atlas-only candidate set could offer nothing but occupied doors and
-      // broke ring-closing entirely.)
-      for (const [did, ad] of Object.entries(readAtlas()[roomId]?.doors ?? {})) {
-        if (ad?.wall && !ad.targetRoomId)
-          out.push({ id: did, wall: ad.wall, lateral: ad.lateral ?? 0 });
+    const atlas = readAtlas();
+    // 🚪 Every door some room's record already LANDS ON, indexed by the far
+    // room — ONE pass over the atlas per detection, not one per candidate
+    // module (review F1: the atlas is peer-writable and this runs on every
+    // chain edit). Entries are bounded at ingest — MAX_ENTRIES rooms of at most
+    // MAX_DOORS_PER_ENTRY doors — so this is a small, fixed cost.
+    const claimsByRoom = new Map<
+      string,
+      Array<{ id?: string; wall?: DoorWall; lateral?: number; from: string }>
+    >();
+    for (const [otherId, entry] of Object.entries(atlas)) {
+      for (const od of Object.values(entry?.doors ?? {})) {
+        if (!od?.targetRoomId) continue;
+        let list = claimsByRoom.get(od.targetRoomId);
+        if (!list) claimsByRoom.set(od.targetRoomId, (list = []));
+        list.push({ id: od.farDoor, wall: od.farWall, lateral: od.farLateral, from: otherId });
       }
-      // The four wall-centre hypotheticals — the pre-redo candidate set. A
-      // room can grow a door anywhere, so CONNECT may aim at a wall centre;
-      // the far owner's seed/editor takes it from there.
-      for (const [id, wall] of Object.entries(LEGACY_ID_WALL)) {
-        out.push({ id, wall, lateral: 0 });
+    }
+    // A module's candidate doors (doorMatch.candidateFarDoors). Its REAL
+    // gossiped doors, with a paired one KEPT and flagged occupied rather than
+    // dropped — dropping it was the octagon bug: the wall-centre hypothetical
+    // then re-offered the very wall the paired door sat on, and the closing
+    // vestibule went onto a door that already had one. Plus every door some
+    // OTHER room's record already lands on (its far end, by wall + lateral,
+    // or by id when that is all it knows). Plus a wall-centre hypothetical for
+    // each wall with no known door near its centre. Today the atlas learns
+    // doors only FROM pairings, so the free real doors it will one day gossip
+    // are the empty arm here; hypotheticals carry ring-closing until then.
+    const candidateDoors = (roomId: string) => {
+      const known: Array<{ id: string; wall?: DoorWall; lateral?: number; occupied: boolean }> = [];
+      const claimedIds = new Set<string>();
+      for (const [did, ad] of Object.entries(atlas[roomId]?.doors ?? {})) {
+        if (!ad) continue;
+        known.push({ id: did, wall: ad.wall, lateral: ad.lateral, occupied: !!ad.targetRoomId });
+        if (ad.targetRoomId) claimedIds.add(did);
       }
-      return out;
-    };
-    for (const mod of layout) {
-      const dist = Math.hypot(mod.x - wouldBe.x, mod.z - wouldBe.z);
-      if (dist > 4.5 || (best && dist >= best.dist)) continue;
-      // The chain arrives heading wouldBe.rotY (no far wall ⇒ rotY = heading);
-      // the matching door of the module faces BACK along it.
-      const arrivalFacing = wouldBe.rotY + Math.PI;
-      let doorPick: { id: string; wall: DoorWall; lateral: number } | null = null;
-      let doorErr = Math.PI;
-      for (const d of candidateDoors(mod.roomId)) {
-        const err = angDiff(mod.rotY + WALL_YAW[d.wall], arrivalFacing);
-        if (err < doorErr) {
-          doorErr = err;
-          doorPick = d;
+      for (const claim of claimsByRoom.get(roomId) ?? []) {
+        if (claim.from === roomId) continue; // its own records are the loop above
+        if (claim.wall) {
+          // A claim WITH geometry blocks by geometry, under a key of its own —
+          // never its farDoor id, which may be a stale compass guess that the
+          // target room hangs on another wall. Keyed by id it was deduplicated
+          // away against the room's real door of that name, and the wall it
+          // actually lands on came back as a free hypothetical (review, round 2).
+          known.push({
+            id: `claim:${claim.from}:${claim.wall}:${claim.lateral ?? 0}`,
+            wall: claim.wall,
+            lateral: claim.lateral ?? 0,
+            occupied: true,
+          });
+        } else if (claim.id) {
+          // No geometry — the id is all it knows, so it blocks by id.
+          claimedIds.add(claim.id);
         }
       }
-      if (doorPick && doorErr < Math.PI / 3) {
+      const out = candidateFarDoors(known);
+      for (const c of out) if (claimedIds.has(c.id)) c.occupied = true;
+      return out;
+    };
+    // Reach: any face of a module lies within its half-diagonal of its
+    // centre, so that (plus slack) is how far a module centre may sit from
+    // the chain's END and still own the door the chain meets. The old filter
+    // measured from `wouldBe`, which assumes a CENTRED far door, and so
+    // rejected a module whose matching door sits 5 m along its wall — and
+    // ranked by centre distance, which can prefer a worse face (review,
+    // round 6). Modules are ranked by the face error the matcher returns.
+    const ANG_W = 2 / (Math.PI / 3); // pickFacingDoor's own tie-break weight
+    for (const layoutMod of layout) {
+      // 🛑📐 The module's TRUE half-extents when the atlas learned them, else
+      // the default 2×2 — the same rule the exterior renders with. Reach and
+      // face positions both scale with it (review, round 7).
+      const mod = { ...layoutMod, ...moduleHalves(layoutMod.dims) };
+      // Half-diagonal plus the matcher's own face tolerance — the same
+      // constant, so this coarse filter can never discard a module whose door
+      // the matcher would have accepted (review, round 8).
+      const reach = Math.hypot(mod.halfX, mod.halfZ) + FACE_MATCH_TOLERANCE;
+      const dist = Math.hypot(mod.x - arrival.x, mod.z - arrival.z);
+      if (dist > reach) continue;
+      const cands = candidateDoors(mod.roomId);
+      // Position first, angle as the fence and tie-break; never an occupied
+      // door (doorMatch.pickFacingDoor).
+      const pick = pickFacingDoor(mod, cands, arrival);
+      if (pick) {
+        const score = pick.posErr + pick.angErr * ANG_W;
+        if (best && score >= best.dist) continue;
         best = {
           roomId: mod.roomId,
           name: mod.name,
           seed: mod.seed,
-          dist,
-          door: doorPick,
+          dist: score,
+          door: pick.door,
+          blocked: pick.blockedBetter,
         };
+      } else if (!blockedOnly) {
+        // Would the chain have matched a door here if occupancy did not count?
+        const ifFree = pickFacingDoor(
+          mod,
+          cands.map((c) => ({ ...c, occupied: false })),
+          arrival,
+        );
+        if (ifFree) blockedOnly = { name: mod.name, wall: ifFree.door.wall };
       }
     }
-    if (!best || !best.seed) return;
+    if (!best) {
+      if (blockedOnly) {
+        const esc = (s: string) =>
+          s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;");
+        slot.innerHTML = `
+          <div style="border:1px solid rgba(255,23,68,0.35); border-radius:6px; padding:6px 10px; background:rgba(255,23,68,0.06); font-size:9.5px; color:#ff8a80;">
+            🧲 CHAIN REACHES <b>${esc(blockedOnly.name)}</b>, but the door it lands on is already connected — one vestibule per door. Re-route the chain to a free wall.
+          </div>`;
+        slot.style.display = "block";
+      }
+      return;
+    }
+    if (!best.seed) return;
 
     // 🛬 JETBRIDGE FIT: solve the chain's free parameters (continuous bends,
     // flex + telescoping ext stretch) so the fold lands EXACTLY on the
@@ -2267,14 +3347,15 @@ export class DoorDockingPortSystem {
     // slides). Target = the matched door's face, in this door's chain frame.
     const mod = layout.find((m) => m.roomId === best!.roomId)!;
     // The matched door's face in ITS module's local frame: on its wall, at its
-    // lateral. (Uniform module half — per-module dims are a later refinement,
-    // matching the exterior's uniform shells.)
+    // lateral, at the module's TRUE half-extent (the matcher aimed there; the
+    // solve must target the same face).
     const pick = best.door;
+    const mh = moduleHalves(mod.dims);
     const doorFaceLocal =
-      pick.wall === "y-" ? { x: pick.lateral, z: -6 }
-      : pick.wall === "y+" ? { x: pick.lateral, z: 6 }
-      : pick.wall === "x+" ? { x: 6, z: pick.lateral }
-      : { x: -6, z: pick.lateral };
+      pick.wall === "y-" ? { x: pick.lateral, z: -mh.halfZ }
+      : pick.wall === "y+" ? { x: pick.lateral, z: mh.halfZ }
+      : pick.wall === "x+" ? { x: mh.halfX, z: pick.lateral }
+      : { x: -mh.halfX, z: pick.lateral };
     const mc = Math.cos(mod.rotY),
       ms = Math.sin(mod.rotY);
     const faceWorld = {
@@ -2314,9 +3395,14 @@ export class DoorDockingPortSystem {
           return ` · auto-fit ${bends}`;
         })()
       : " · rigid (fit out of range)";
+    // 🚪 Say when the natural door was skipped for being taken, so the owner
+    // is not surprised by which door the tube goes to.
+    const blockedNote = best.blocked
+      ? " · its nearest door is already connected, using the next free one"
+      : "";
     slot.innerHTML = `
       <div style="display:flex; align-items:center; gap:8px; border:1px solid rgba(0,230,118,0.35); border-radius:6px; padding:6px 10px; background:rgba(0,230,118,0.06);">
-        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its facing door?<span style="color:rgba(0,230,118,0.6);">${fitNote}</span></span>
+        <span style="flex:1; font-size:9.5px; color:#00e676;">🧲 CHAIN REACHES <b>${esc(best.name)}</b> — connect via its facing door?<span style="color:rgba(0,230,118,0.6);">${fitNote}${blockedNote}</span></span>
         <button type="button" id="docking-dock-connect" style="background:rgba(0,230,118,0.15); border:1px solid rgba(0,230,118,0.4); border-radius:5px; color:#00e676; font-size:9px; font-weight:800; padding:3px 10px; cursor:pointer;">CONNECT</button>
       </div>`;
     slot.style.display = "block";
@@ -2341,9 +3427,11 @@ export class DoorDockingPortSystem {
         if (st) {
           st.farDoor = best!.door.id;
           // 🧭 The matcher KNOWS the far wall — it just aimed the chain at it.
-          // Stashing it here is what makes the published pairing fully
-          // described before anyone ever walks through.
+          // Stashing it (and the lateral) is what makes the published pairing
+          // fully described before anyone ever walks through — and the WALL is
+          // what the arrival trusts; for a hypothetical the id is only a name.
           st.farWall = best!.door.wall;
+          st.farLateral = best!.door.lateral;
         }
         // Fire the normal INITIATE path (all its gates apply).
         document
@@ -2363,7 +3451,11 @@ export class DoorDockingPortSystem {
       (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? "";
     const entries = Object.values(readAtlas())
       .filter((e) => e.seed && e.roomId !== currentId)
-      .sort((a, b) => b.lastSeen - a.lastSeen)
+      // 🗄️ Same rule as atlas retention: first-hand rooms before gossip-only
+      // ones. This list is SLICED to 24, so sorting it by the peer-written
+      // `lastSeen` let a peer's fresh gossip crowd the player's own visited
+      // modules out of the picker entirely (#144).
+      .sort(compareAtlasRecency)
       .slice(0, 24);
     sel.innerHTML =
       '<option value="">🗺️ … or pick a KNOWN MODULE</option>' +
@@ -2437,6 +3529,10 @@ export class DoorDockingPortSystem {
     if (state) {
       state.connectedRoomAddress = targetAddr;
       state.pairingPending = true;
+      // 🚪 A peer's request: only an address, never which of its doors — so it
+      // can never prove it is this door's existing connection. completePairing
+      // refuses it, accept or reject, while a live pairing sits on this door.
+      state.inboundRequest = true;
       this.syncLEDStatus(doorId, state);
 
       // Start Flash LED animation inside tick
@@ -2471,10 +3567,55 @@ export class DoorDockingPortSystem {
     const state = this.doorState.get(doorId);
     if (!state) return;
 
+    // 🚪 ONE VESTIBULE PER DOOR: a request that lands on a door with a LIVE
+    // pairing may neither be accepted (that would overwrite the record) nor
+    // rejected the ordinary way (the REJECTED publish deletes the door's
+    // record — i.e. the EXISTING connection, not the request; review, round
+    // 4). "Lands on a live pairing" means: a different module's address, OR
+    // any INBOUND request at all — a peer's request carries only an address,
+    // never which of its doors it is from, so a request from the same
+    // module's OTHER door is indistinguishable from a refresh of this very
+    // connection and must be refused too (review, round 6). Only our own
+    // INITIATE to the same address (re-publishing geometry) may proceed.
+    // Either way the existing connection is untouched: the local state is
+    // restored from the record and the request simply cannot land here.
+    {
+      // ⚓ #163: this one door, read itself — the capped snapshot could hide
+      // the live connection this guard exists to protect.
+      const own = readDoor(doorId);
+      if (
+        own?.paired &&
+        own.connectedRoomAddress &&
+        (own.connectedRoomAddress !== state.connectedRoomAddress ||
+          state.inboundRequest === true)
+      ) {
+        if (accept) {
+          alert(
+            "This door already has a vestibule to another module — undock it before accepting a new connection.",
+          );
+        }
+        state.pairingPending = false;
+        state.pairedSuccessfully = true;
+        state.connectedRoomAddress = own.connectedRoomAddress;
+        state.segments = own.segments;
+        state.farDoor = own.farDoor;
+        state.farWall = own.farWall;
+        state.farLateral = own.farLateral;
+        state.farYawDeg = own.farYawDeg;
+        state.transient = own.transient === true;
+        state.dockedAt = own.dockedAt;
+        state.locked = false;
+        this.syncLEDStatus(doorId, state);
+        return;
+      }
+    }
+
     state.pairingPending = false;
     state.pairedSuccessfully = accept;
 
     if (accept) {
+      // ⚓ A staged mating half is spent: it went with the far door.
+      state.dockMatePaid = false;
       this.removeProvisionGhost(); // the real module replaces the hypothesis
       state.locked = false; // Open door on success
       // 🧭 Best-effort far wall at pairing time: the atlas may already gossip
@@ -2492,8 +3633,10 @@ export class DoorDockingPortSystem {
       // chain must not linger as a ghost tube on an unpaired door — refund the
       // parts and drop it. The far geometry goes with it — it described the
       // connection that was just refused (F2, redo review).
-      if (state.segments?.length) refundForSegments(state.segments);
+      // ⚓ A dock chain refunds only a PAID mating half (refundWorkingChain).
+      this.refundWorkingChain(state);
       state.segments = undefined;
+      state.dockedAt = undefined;
       state.farDoor = undefined;
       state.farWall = undefined;
       state.farLateral = undefined;
@@ -2526,6 +3669,7 @@ export class DoorDockingPortSystem {
       farLateral?: number;
       farYawDeg?: 0 | 45;
       transient?: boolean;
+      dockedAt?: number;
     },
   ): void {
     // 🚪 CREATE the state when it is missing rather than silently dropping the
@@ -2554,7 +3698,9 @@ export class DoorDockingPortSystem {
       // and the projection would keep its unrotated pose until a reload.
       state.farWall === geometry?.farWall &&
       state.farLateral === geometry?.farLateral &&
-      state.farYawDeg === geometry?.farYawDeg;
+      state.farYawDeg === geometry?.farYawDeg &&
+      // ⚓ A re-dock to the same berth is the same geometry with a new stamp.
+      state.dockedAt === geometry?.dockedAt;
     if (
       state.pairedSuccessfully &&
       state.connectedRoomAddress === address &&
@@ -2568,6 +3714,10 @@ export class DoorDockingPortSystem {
     state.farLateral = geometry?.farLateral;
     state.farYawDeg = geometry?.farYawDeg;
     state.transient = geometry?.transient === true; // #67 D2
+    state.dockedAt = geometry?.dockedAt; // ⚓ #163
+    // ⚓ A staged mating half is spent the moment a pairing lands on the door
+    // (ours, published by another of our tabs, or a peer's).
+    state.dockMatePaid = false;
     state.pairingPending = false;
     state.pairedSuccessfully = true;
     state.locked = false;
@@ -2598,6 +3748,8 @@ export class DoorDockingPortSystem {
     state.farLateral = undefined;
     state.farYawDeg = undefined;
     state.transient = false;
+    state.dockedAt = undefined;
+    state.dockMatePaid = false;
     state.locked = true;
     this.removeAdjacentRoomProjection(doorId);
     this.closeDoor(doorId);
@@ -2628,6 +3780,54 @@ export class DoorDockingPortSystem {
   /** Request the door leaves to slide closed. */
   public closeDoor(doorId: string, onComplete?: () => void): void {
     this.startSlide(doorId, false, onComplete);
+  }
+
+  /**
+   * 🚪 #159: where the hull must stand open — one entry per door whose leaves
+   * are not shut, at the pose its FRAME is hung from (poseForDoor, the very
+   * call repositionDoorGroups places the group with). Membership is the frames
+   * that exist and position is where they are, so an aperture can only ever
+   * sit behind its own frame: a removed door heals the wall, a moved one takes
+   * its opening with it. `lateral` is the along-wall WORLD coordinate, which is
+   * what the hull's faces are measured in.
+   */
+  public ajarDoorFrames(): Array<{ wall: DoorWall; lateral: number }> {
+    const out: Array<{ wall: DoorWall; lateral: number }> = [];
+    for (const id of this.doorObjects.keys()) {
+      if (!this.isDoorAjar(id)) continue;
+      const pose = this.poseForDoor(id);
+      out.push({ wall: pose.wall, lateral: pose.tangent === "x" ? pose.x : pose.z });
+    }
+    return out;
+  }
+
+  /**
+   * 🚪 #159: are this door's leaves anywhere but fully shut — open, opening or
+   * closing? The hull is cut open behind exactly these doors. Behind SHUT
+   * leaves the wall stays whole: they meet at a deliberate 4 cm seam, and a cut
+   * wall shows through it as a bright hairline down the middle of every closed
+   * door.
+   */
+  private isDoorAjar(doorId: string): boolean {
+    // Opening counts from its first frame, so the wall parts WITH the leaves.
+    if (this.slideAnims.get(doorId)?.openTarget === DOOR_LEAF_OPEN_OFFSET)
+      return true;
+    // Otherwise shut or closing, and the leaves say which — update() is the
+    // only writer of their position, and snaps it exactly on landing.
+    const left = this.doorObjects.get(doorId)?.getObjectByName("leftLeaf");
+    return !!left && Math.abs(left.position.x + DOOR_LEAF_SHUT_OFFSET) >= 0.01;
+  }
+
+  /**
+   * 🚪 #159: `cb` fires whenever ajarDoorFrames may have changed — a slide
+   * starting or landing (isDoorAjar), a frame re-posed or removed. This
+   * system owns the frames, so it is the one that says so: a caller that moves
+   * them (repositionDoorGroups has more than one) cannot forget to. One
+   * listener — the world's hull, which re-checks cheaply and only re-cuts on a
+   * real change.
+   */
+  public onDoorApertureChange(cb: () => void): void {
+    this.doorApertureListener = cb;
   }
 
   /**
@@ -2682,6 +3882,7 @@ export class DoorDockingPortSystem {
     }
 
     this.slideAnims.set(doorId, { openTarget, onComplete });
+    this.doorApertureListener?.(); // 🚪 #159: an opening door is ajar from now
   }
 
   /**
@@ -2690,6 +3891,7 @@ export class DoorDockingPortSystem {
    */
   public update(deltaTime: number): void {
     if (this.slideAnims.size === 0) return;
+    let landed = false;
     for (const [doorId, anim] of Array.from(this.slideAnims.entries())) {
       const group = this.doorObjects.get(doorId);
       const left = group?.getObjectByName("leftLeaf");
@@ -2708,9 +3910,11 @@ export class DoorDockingPortSystem {
         left.position.x = -anim.openTarget;
         right.position.x = anim.openTarget;
         this.slideAnims.delete(doorId);
+        landed = true;
         if (anim.onComplete) anim.onComplete();
       }
     }
+    if (landed) this.doorApertureListener?.(); // 🚪 #159: a door that shut is no longer ajar
   }
 
   /**
@@ -2810,11 +4014,18 @@ export class DoorDockingPortSystem {
     });
 
     const adjRoom = new THREE.Mesh(roomGeo, roomMat);
+    // 🛑📐 The connected module's true half along the far wall when the atlas
+    // knows its size — the same offset atlasLayout composes with, so the
+    // gray box sits where the exterior will draw the module.
+    const farDims = state?.connectedRoomAddress
+      ? readAtlas()[roomIdFromSeed(state.connectedRoomAddress)]?.dims
+      : undefined;
     const pose = projectionPoseForDoor(
       doorId,
       state?.segments,
       farWall, // resolved once above — the same value the poseKey hashed
       state?.farLateral ?? 0,
+      farWall ? halfAlongWall(farDims, farWall) : undefined,
     );
     adjRoom.position.set(pose.x, 2, pose.z);
     adjRoom.rotation.y = pose.rotY;
@@ -2849,6 +4060,55 @@ export class DoorDockingPortSystem {
    * renders as no rotation. NEVER inferred from the far door's id: an id names
    * a door, it does not place one.
    */
+  /**
+   * 🚪 Who already has a vestibule on the far room's door this pairing is
+   * aimed at — the room id, or null when the atlas knows of none. Three
+   * places a claim can live: the far room's own record for that door id; a
+   * paired door of the far room within MIN_DOOR_GAP of the aimed wall +
+   * lateral (a hypothetical's compass id names no real door, its geometry
+   * does); and any OTHER room's record whose far end is that door. "auto"
+   * (no id, no wall) cannot be checked here — the arrival enforces it.
+   */
+  private farDoorTakenBy(
+    farRoomId: string,
+    farDoor?: string,
+    farWall?: DoorWall,
+    farLateral?: number,
+  ): { roomId: string; doorId?: string } | null {
+    const atlas = readAtlas();
+    const farDoors = atlas[farRoomId]?.doors ?? {};
+    // Geometry decides whenever the wall is known; the id decides only when
+    // it is all we have. A farDoor id may be a wall-centre hypothetical's
+    // compass guess that the far room hangs on another wall — trusting it
+    // first would refuse a free wall because a DIFFERENT door carries the
+    // name, or clear a taken one (review, round 2).
+    // The answer names the claimant's DOOR as well as its room, so the caller
+    // can exempt exactly this door's own existing connection and nothing
+    // else — another door of the same room is a second vestibule too
+    // (review, round 3).
+    const nearOnWall = (wall?: DoorWall, lateral?: number) =>
+      wall === farWall && Math.abs((lateral ?? 0) - (farLateral ?? 0)) < MIN_DOOR_GAP;
+    if (farWall) {
+      for (const d of Object.values(farDoors)) {
+        if (d?.targetRoomId && nearOnWall(d.wall, d.lateral))
+          return { roomId: d.targetRoomId, doorId: d.farDoor };
+      }
+    } else if (farDoor && farDoors[farDoor]?.targetRoomId) {
+      return { roomId: farDoors[farDoor].targetRoomId, doorId: farDoors[farDoor].farDoor };
+    }
+    for (const [otherId, entry] of Object.entries(atlas)) {
+      if (otherId === farRoomId) continue;
+      for (const [odid, od] of Object.entries(entry?.doors ?? {})) {
+        if (!od || od.targetRoomId !== farRoomId) continue;
+        const taken = farWall
+          ? nearOnWall(od.farWall, od.farLateral)
+          : !!farDoor && od.farDoor === farDoor;
+        if (taken) return { roomId: otherId, doorId: odid };
+      }
+    }
+    return null;
+  }
+
   private farWallFor(state: DockingState | undefined): DoorWall | null {
     if (!state) return null;
     if (state.farWall) return state.farWall;
@@ -2936,6 +4196,11 @@ export class DoorDockingPortSystem {
       group.position.set(pose.x, 2, pose.z);
       group.rotation.y = pose.frameYaw;
     }
+    // 🚪 #159: an open door's aperture is cut where its frame WAS. Every
+    // re-pose says so here, whoever asked for it — a door reconcile, a room
+    // resize, or applyRoomVisuals re-reading the records under a new legacy
+    // layout kind (review of #160).
+    this.doorApertureListener?.();
   }
 
   public refreshDoorInteractivity(): void {
@@ -2989,10 +4254,19 @@ export class DoorDockingPortSystem {
     cb: (
       templateId: string,
       parentDoorId?: string,
-      placement?: { wall: DoorWall; lateral: number; doorId?: string },
+      placement?: {
+        wall: DoorWall;
+        lateral: number;
+        doorId?: string;
+        port?: boolean;
+      },
     ) => Promise<string | null>,
   ) {
     this.provisionModuleCallback = cb;
   }
 
+  /** ⚓ #163: main.ts wires the far-room writer (farDoorWrite.ts). */
+  public onFarDockWrite(cb: (req: FarDockRequest) => Promise<FarDockResult>) {
+    this.farDockWriter = cb;
+  }
 }

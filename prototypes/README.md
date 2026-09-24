@@ -5,14 +5,20 @@ This directory is for quick, throwaway code, proof-of-concepts, and playable dem
 ## Available Demos
 
 Folders are named `<release-version>-<demo-name>` — the version prefix records
-which release line the demo targeted. `0.0.x` demos are frozen snapshots from
-before versioned releases began; the highest-versioned core-loop folder is the
-live game.
+the release line the demo was **started** on, not the version it currently
+ships. `0.0.x` demos are frozen snapshots from before versioned releases began.
+
+**The live one is whichever folder `RELEASE_FRONTEND` names in
+[release.yml](../.github/workflows/release.yml)** — that is what a tagged release
+actually builds. Today that is `0.29.0-core-loop-demo`, which ships **v0.35.0**.
+Read the version prefix as the starting release line, not a claim about what is current.
 
 | Demo | Description |
 |---|---|
-| [`0.27.0-core-loop-demo`](0.27.0-core-loop-demo/) | **Queued next line** (re-cut from 0.26.0 after its release). Carries the staged room-list ACCESS UX (a persisted MY ROOMS list that background-loads each pass and lets you enter once ready), and — in progress — public/unlocked door access modes and the first slice of cryptographic keyed identity. Not yet tagged. |
-| [`0.26.0-core-loop-demo`](0.26.0-core-loop-demo/) | **The game (current release target).** The 0.25.0 game plus the issue #60 cross-internet connect/sync fixes: the joiner can see the host's avatar (peer tick fan-out symmetry), faster first contact (off-loop retrying dial), a sync-before-enter gate so you land in a room already showing its real name/owner, and **E4 furniture-layout sync** — a joiner sees the host's arrangement on entry and owner edits propagate live. Same-machine two-tab play now syncs room state, not just movement. |
+| [`0.29.0-core-loop-demo`](0.29.0-core-loop-demo/) | **The game — what releases ship** (`RELEASE_FRONTEND`; currently v0.35.0). Carries the treasury lane (signed caches plus the read-only 🏦 TREASURY phone view and the terminal FUNDING panel), the 🎰 slot machine, the 🏋️ fitness-coach robot, and the room-authority hardening that retired the `Local-Clone` owner wildcard. See [CHANGELOG.md](../CHANGELOG.md) for the release history. |
+| [`0.28.0-core-loop-demo`](0.28.0-core-loop-demo/) | Frozen intermediate line between 0.27.0 and the current 0.29.0 folder. |
+| [`0.27.0-core-loop-demo`](0.27.0-core-loop-demo/) | Frozen. Was "queued next line" (re-cut from 0.26.0 after its release). Carries the staged room-list ACCESS UX (a persisted MY ROOMS list that background-loads each pass and lets you enter once ready), and — in progress — public/unlocked door access modes and the first slice of cryptographic keyed identity. Not yet tagged. |
+| [`0.26.0-core-loop-demo`](0.26.0-core-loop-demo/) | Frozen. Was the release target through the 0.26 line. The 0.25.0 game plus the issue #60 cross-internet connect/sync fixes: the joiner can see the host's avatar (peer tick fan-out symmetry), faster first contact (off-loop retrying dial), a sync-before-enter gate so you land in a room already showing its real name/owner, and **E4 furniture-layout sync** — a joiner sees the host's arrangement on entry and owner edits propagate live. Same-machine two-tab play now syncs room state, not just movement. |
 | [`0.25.0-core-loop-demo`](0.25.0-core-loop-demo/) | Frozen at the v0.25.0 release snapshot. Game night on the station: first-person WASD with pointer-lock mouse look (zoom level 1 is a real camera now), modules spaced apart with continuous gangway vestibules that fade with camera facing, the ACCESS phone app (generate/use room passes — using one beams you straight to the room), edit-mode furniture removal into a per-room inventory with dev-menu re-placement, and a flippable game table with fully playable doc-synced checkers (VS BOT included). |
 | [`0.24.0-core-loop-demo`](0.24.0-core-loop-demo/) | Frozen at the v0.24.0 release snapshot. The 0.23.0 hangout update plus the camera rig — rotate the room view in 45° detents (bottom-left HUD arrows, `←`/`→`, `Shift+<`/`Shift+>`) with screen-relative WASD — and internet reachability by default: the node auto-advertises its public IPv4 (opt out with `SSF_EXTERNAL_ADDRS=off`), a live REACHABILITY row shows whether UDP 44442 needs a router forward, and Copy Invite warns before you share a link that can't be reached. |
 | [`0.23.0-core-loop-demo`](0.23.0-core-loop-demo/) | Frozen at the v0.23.0 line (plus the post-release camera-rig work that ships in 0.24.0). The hangout update: N-player rooms with real peer identity (fox avatars, names, outfits), sci-fi doors you walk through — including same-node room transit via the gangway vestibule — diegetic devices (wall computer, holo map table, storage trunk), room editing (move furniture with pathfinding-aware validity), and a temporary DEV spawn menu for the demo phase. |
@@ -40,10 +46,12 @@ live game.
 
 ## Releasing a different demo as the app
 
-The packaged release always uses the Tauri shell from
-[`0.26.0-core-loop-demo/src-tauri`](0.26.0-core-loop-demo/src-tauri/) (window, Rust
-WebTransport node, icons, app version) — but the **frontend it renders is
-switchable**. The [release workflow](../.github/workflows/release.yml) builds
+The packaged release builds the Tauri project — shell and frontend together —
+from whichever folder `RELEASE_FRONTEND` names, so the shell (window, Rust
+WebTransport node, icons, app version) comes from **that folder's**
+`src-tauri/`, today [`0.29.0-core-loop-demo/src-tauri`](0.29.0-core-loop-demo/src-tauri/).
+The workflow passes `projectPath: ${{ env.RELEASE_FRONTEND }}` to `tauri-action`;
+there is no fixed shell path. The [release workflow](../.github/workflows/release.yml) builds
 whichever prototype `env.RELEASE_FRONTEND` points at and merges a config
 overlay (`--config release-frontend.json`) so `frontendDist` targets that
 demo's `dist/`.
