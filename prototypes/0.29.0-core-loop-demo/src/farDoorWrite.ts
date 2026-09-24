@@ -86,9 +86,13 @@ function farBerth(doc: Y.Doc, farDoor: string): { exists: boolean; portFlag: boo
  * berth, write its own claim concurrently, and have it acknowledged too; the
  * CRDT then keeps exactly ONE of the two — the same one on every replica. So,
  * once concurrent writes have had a settle window to arrive (the session calls
- * this after it), only the writer the berth still names has docked: this
- * returns null for it, and the refusal to report for anyone else, whose own
- * side must then stay undocked. Pure over the far doc.
+ * this after it), only the writer whose EXACT claim the berth still holds —
+ * our room, our door, our stamp — has docked: this returns null for it, and
+ * the refusal to report for anyone else, whose own side must then stay
+ * undocked. A claim on the same berth from this very port with another stamp
+ * (a second client docking it at the same moment) is `superseded`: that dock
+ * stands, and only its writer commits its side, so both ends keep one stamp.
+ * Pure over the far doc.
  */
 export function berthAfterSettle(
   doc: Y.Doc,
@@ -96,7 +100,11 @@ export function berthAfterSettle(
   near: NearEnd,
 ): FarDockResult | null {
   const record = readDoorFrom(doc, req.farDoor);
-  if (holdsDockTo(record, near)) return null;
+  if (holdsDockTo(record, near)) {
+    return record?.paired && record.dockedAt === req.dockedAt
+      ? null
+      : { ok: false, reason: 'superseded' };
+  }
   const now = farDockPatch(record, farBerth(doc, req.farDoor), near, req.dockedAt);
   return { ok: false, reason: now.action === 'refuse' ? now.reason : 'occupied' };
 }
@@ -160,26 +168,43 @@ export function writeFarDock(req: FarDockRequest, near: NearEnd): Promise<FarDoc
   if (!d) return Promise.resolve({ ok: false, reason: 'unreachable' });
   const imported = d.decode(req.farAddress);
   if (!imported) return Promise.resolve({ ok: false, reason: 'no-address' });
-  // A dock between two doors of ONE module: its far end is the OTHER door of
-  // the room this client stands in. Same decision, applied to the bound doc —
-  // no session to open, and no other replica of that door to wait for.
-  if (imported.roomId === near.roomId) {
-    const doc = d.activeRoomDoc(near.roomId);
-    if (!doc) return Promise.resolve({ ok: false, reason: 'unreachable' });
-    return Promise.resolve(applyFarDockRequest(doc, req, near).result);
-  }
+  // A dock between two doors of ONE module keeps its far end in the room this
+  // client stands in (sameRoomWrite); anything else needs a session.
+  const write = imported.roomId === near.roomId
+    ? () => sameRoomWrite(d, req, near)
+    : () => session(d, imported, req, near);
   const key = imported.roomId;
   const prior = queues.get(key) ?? Promise.resolve();
-  const run = prior.then(
-    () => session(d, imported, req, near),
-    () => session(d, imported, req, near),
-  );
+  const run = prior.then(write, write);
   const tail = run.catch(() => undefined);
   queues.set(key, tail);
   void tail.then(() => {
     if (queues.get(key) === tail) queues.delete(key);
   });
   return run;
+}
+
+/**
+ * The far end of a dock between two doors of ONE module: the OTHER door of the
+ * room this client stands in. Same decision, applied to the bound doc — and,
+ * for a DOCK, the same settle-and-verify as a far room's: two clients in this
+ * room may re-dock two of its doors to the same third one at once, and the
+ * CRDT keeps one claim. If the player leaves the room during the settle, the
+ * write is reported as made, and the caller's own room check (redockPort)
+ * tries to take it back — and says so when it cannot.
+ */
+async function sameRoomWrite(
+  d: FarDoorWriteDeps,
+  req: FarDockRequest,
+  near: NearEnd,
+): Promise<FarDockResult> {
+  const doc = d.activeRoomDoc(near.roomId);
+  if (!doc) return { ok: false, reason: 'unreachable' };
+  const { result, wrote } = applyFarDockRequest(doc, req, near);
+  if (!wrote || req.kind !== 'dock') return result;
+  await new Promise((r) => setTimeout(r, SETTLE_MS));
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return result;
+  return berthAfterSettle(doc, req, near) ?? result;
 }
 
 async function session(

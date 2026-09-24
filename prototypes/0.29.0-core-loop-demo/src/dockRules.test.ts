@@ -330,6 +330,11 @@ describe('dockRules — the far end', () => {
     expect(farUndockPatch(named, near, 20).action).toBe('write');
   });
 
+  it('UNDOCK never takes down a GANGWAY that has since re-connected the same two doors', () => {
+    const gangway = buildDoorPairing(seedFor(SHIP), { farDoor: near.doorId }); // no dock chain, no stamp
+    expect(farUndockPatch(gangway, near, 20)).toEqual({ action: 'skip', reason: 'not-this-dock' });
+  });
+
   it('a take-back (onlyDockedAt) undoes exactly our own far dock, never anyone else\'s', () => {
     const mine = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, dockedAt: 40 });
     expect(farUndockPatch(mine, near, 41, 40).action).toBe('write');

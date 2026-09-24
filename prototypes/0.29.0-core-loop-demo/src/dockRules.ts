@@ -222,10 +222,11 @@ function namesAnotherNearDoor(record: DoorPairing, nearDoorId: string): boolean 
 }
 
 /** UNDOCK's far end: tombstone the far record only while it still describes
- *  THIS dock — ours (our room AND our door), and not a dock made after this
- *  undock (a late write from a quick undock→dock must never undo the newer
- *  dock). `onlyDockedAt` narrows it to exactly one dock: the take-back of a
- *  far DOCK this client wrote, which must never undo anyone else's. */
+ *  THIS dock — ours (our room AND our door), still a dock, and not a dock made
+ *  after this undock (a late write from a quick undock→dock must never undo
+ *  the newer dock). `onlyDockedAt` narrows it to exactly one dock: the
+ *  take-back of a far DOCK this client wrote, which must never undo anyone
+ *  else's. */
 export function farUndockPatch(
   farRecord: DoorRecord | undefined,
   near: NearEnd,
@@ -239,6 +240,12 @@ export function farUndockPatch(
     namesAnotherNearDoor(farRecord, near.doorId)
   ) {
     return { action: 'skip', reason: 'not-ours' };
+  }
+  // Only a DOCK is undocked. A delayed UNDOCK must never take down a gangway
+  // that has since re-connected these very two doors (it carries no dock
+  // stamp for the newer-dock guard below to catch).
+  if (!isDockChain(farRecord.segments)) {
+    return { action: 'skip', reason: 'not-this-dock' };
   }
   if (typeof farRecord.dockedAt === 'number' && farRecord.dockedAt > undockedAt) {
     return { action: 'skip', reason: 'newer-dock' };

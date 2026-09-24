@@ -151,9 +151,10 @@ export interface DockingState {
    *  dock look newer than a later undock. */
   dockedAt?: number;
   /** ⚓ LOCAL only: the staged MATING half was paid for with an adapter part
-   *  (+DOCK's second press), so clearing or a rejected pairing refunds it.
-   *  The port itself is a door fitting, paid and refunded on its own — never
-   *  through the working chain, which would count it twice. */
+   *  (+DOCK's second press), so clearing or a rejected pairing refunds it —
+   *  until a pairing lands or PROVISION NEW MODULE spends it on the module it
+   *  mints. The port itself is a door fitting, paid and refunded on its own —
+   *  never through the working chain, which would count it twice. */
   dockMatePaid?: boolean;
   /** 🚪 The pending request on this door came IN from a peer (as opposed to
    *  our own INITIATE). An inbound request carries only an address — not
@@ -207,7 +208,10 @@ export type FarDockResult =
         | "no-far-door"
         | "occupied"
         | "closed"
-        | "gone";
+        | "gone"
+        /** Another DOCK of this very port made the same claim at the same
+         *  moment, and the CRDT kept that one: it stands, this one yields. */
+        | "superseded";
     };
 
 /** ⚓ One dock port as the helm's docking computer and the pane list it. */
@@ -1341,19 +1345,34 @@ export class DoorDockingPortSystem {
           const birthDoorId = choice
             ? `d:${crypto.randomUUID().slice(0, 8)}`
             : undefined;
-          // ⚓ #163: a staged dock means the new module is a ship (or station)
-          // docked by adapter, not bolted on by gangway — its birth door wears
-          // the mating half.
-          const dockStaged = parentDoorId
-            ? isDockChain(this.doorState.get(parentDoorId)?.segments)
-            : false;
+          // ⚓ #163: a staged, PAID mating half makes the new module a ship (or
+          // station) docked by adapter — its birth door is born wearing that
+          // half. The half goes to exactly ONE module: it is spent here (no
+          // refund on unstaging, and a second provision from this door gets
+          // none for free). Reserved before the await, so a double click can't
+          // claim it twice; handed back if minting fails.
+          const parentState = parentDoorId
+            ? this.doorState.get(parentDoorId)
+            : undefined;
+          const mateForModule =
+            !!choice &&
+            !!parentState &&
+            isDockChain(parentState.segments) &&
+            parentState.dockMatePaid === true;
+          if (mateForModule) parentState!.dockMatePaid = false;
           const seed = await this.provisionModuleCallback(
             templateId,
             parentDoorId,
             choice
-              ? { ...choice, doorId: birthDoorId, port: dockStaged }
+              ? { ...choice, doorId: birthDoorId, port: mateForModule }
               : undefined,
           );
+          if (!seed && mateForModule && parentState) {
+            // Not spent after all: back on the door — or back in stock if it
+            // was unstaged meanwhile.
+            if (isDockChain(parentState.segments)) parentState.dockMatePaid = true;
+            else refundPart("adapter");
+          }
           // 🧭 The pairing this address is about to INITIATE already knows the
           // far side exactly — it is the door we just chose. Stash it so the
           // published record is fully described from birth, no walk-through
@@ -2775,6 +2794,17 @@ export class DoorDockingPortSystem {
       } catch (err) {
         console.warn("[dock] far dock threw:", err);
         far = { ok: false, reason: "unreachable" };
+      }
+      if (!far.ok && far.reason === "superseded") {
+        // Another DOCK of this very port (a crew member here, at the same
+        // moment) holds the berth: that dock stands, and its own side is
+        // that client's to write — nothing to write or take back here.
+        this.setDockOp(
+          doorId,
+          { note: `Another DOCK of this port reached ${name} at the same moment — that one stands.`, tone: "warn" },
+          roomId,
+        );
+        return false;
       }
       if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone")) {
         // A closed or vanished berth is not coming back: drop the memory so

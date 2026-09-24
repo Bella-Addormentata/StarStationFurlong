@@ -9,7 +9,7 @@
  *    waits for before it hangs up — driven against an in-memory node that
  *    answers SyncStep1 from its own replica, exactly as the real one does.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom, readDoorFrom } from './doorsDoc';
@@ -192,6 +192,12 @@ describe('berthAfterSettle — two modules claiming one berth', () => {
     expect([aOut, bOut].find((o) => o !== null)).toEqual({ ok: false, reason: 'occupied' });
   });
 
+  it('the same port claimed twice at once: only the claim the CRDT kept — its stamp too — has docked', () => {
+    const doc = stationDoc(); // d:bay holds this port's dock, stamped 100
+    expect(berthAfterSettle(doc, dockReq(near.doorId, 300), near)).toEqual({ ok: false, reason: 'superseded' });
+    expect(berthAfterSettle(doc, dockReq(near.doorId, 100), near)).toBeNull();
+  });
+
   it('a berth closed under the claim reports closed', () => {
     const doc = stationDoc();
     doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP)));
@@ -220,32 +226,85 @@ describe('writeFarDock — a dock between two doors of ONE module', () => {
   }
 
   it('writes the OTHER door in the bound doc — UNDOCK and DOCK alike', async () => {
-    const ship = shipDoc();
-    initFarDoorWrite({
-      decode: () => boot,
-      resolve: async (b) => b,
-      hostedHere: () => true,
-      activeRoomDoc: (roomId) => (roomId === SHIP ? ship : null),
-    });
-    // UNDOCK at d:a (its own tombstone is the caller's): d:b lets go too.
-    ship.getMap('doors').set('d:a', buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:b', undockedAt: 101 }));
-    expect(
-      await writeFarDock(
-        { kind: 'undock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', undockedAt: 101 },
-        nearA,
-      ),
-    ).toEqual({ ok: true, detail: 'written' });
-    expect(readDoorFrom(ship, 'd:b')).toEqual(
-      buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:a', farWall: 'x-', farLateral: 0, undockedAt: 101 }),
-    );
-    // DOCK again from d:a: d:b is re-made in the same doc.
-    expect(
-      await writeFarDock(
+    vi.useFakeTimers();
+    try {
+      const ship = shipDoc();
+      initFarDoorWrite({
+        decode: () => boot,
+        resolve: async (b) => b,
+        hostedHere: () => true,
+        activeRoomDoc: (roomId) => (roomId === SHIP ? ship : null),
+      });
+      // UNDOCK at d:a (its own tombstone is the caller's): d:b lets go too.
+      ship.getMap('doors').set('d:a', buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:b', undockedAt: 101 }));
+      expect(
+        await writeFarDock(
+          { kind: 'undock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', undockedAt: 101 },
+          nearA,
+        ),
+      ).toEqual({ ok: true, detail: 'written' });
+      expect(readDoorFrom(ship, 'd:b')).toEqual(
+        buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:a', farWall: 'x-', farLateral: 0, undockedAt: 101 }),
+      );
+      // DOCK again from d:a: d:b is re-made in the same doc, once it settles.
+      const docking = writeFarDock(
         { kind: 'dock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', dockedAt: 102 },
         nearA,
-      ),
-    ).toEqual({ ok: true, detail: 'written' });
-    expect(readDoorFrom(ship, 'd:b')).toMatchObject({ paired: true, farDoor: 'd:a', dockedAt: 102 });
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await docking).toEqual({ ok: true, detail: 'written' });
+      expect(readDoorFrom(ship, 'd:b')).toMatchObject({ paired: true, farDoor: 'd:a', dockedAt: 102 });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a same-room DOCK settles too — of two doors re-docked to one at once, only the kept claim holds', async () => {
+    vi.useFakeTimers();
+    try {
+      // A third port d:c; d:a ↔ d:b undocked, so d:b is a free berth.
+      const base = shipDoc();
+      base.getMap('doorLayout').set('d:c', { id: 'd:c', wall: 'y+', lateral: 0, placed: true });
+      base.getMap('doorPolicy').set('d:c', { passage: 'public', construction: 'owner', adapter: true });
+      base.getMap('doors').set('d:a', buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:b', undockedAt: 150 }));
+      base.getMap('doors').set('d:b', buildDoorTombstone(seedFor(SHIP), { farDoor: 'd:a', undockedAt: 150 }));
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(base));
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(base));
+      initFarDoorWrite({
+        decode: () => boot,
+        resolve: async (x) => x,
+        hostedHere: () => true,
+        activeRoomDoc: (roomId) => (roomId === SHIP ? a : null),
+      });
+      // This client re-docks d:a → d:b …
+      const mine = writeFarDock(
+        { kind: 'dock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:a', dockedAt: 300 },
+        nearA,
+      );
+      await vi.advanceTimersByTimeAsync(0); // its claim is written
+      // … while another client, on its own replica, docks d:c → d:b.
+      const nearC: NearEnd = { roomId: SHIP, address: seedFor(SHIP), doorId: 'd:c', wall: 'y+', lateral: 0 };
+      expect(
+        applyFarDockRequest(
+          b,
+          { kind: 'dock', farAddress: seedFor(SHIP), farDoor: 'd:b', nearDoorId: 'd:c', dockedAt: 301 },
+          nearC,
+        ).wrote,
+      ).toBe(true);
+      // The settle window: the replicas exchange their claims.
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      await vi.advanceTimersByTimeAsync(2_000);
+      const out = await mine;
+      const kept = readDoorFrom(a, 'd:b');
+      expect(kept).toEqual(readDoorFrom(b, 'd:b')); // one berth, one answer
+      const ours = kept?.paired === true && kept.farDoor === 'd:a';
+      expect(out).toEqual(ours ? { ok: true, detail: 'written' } : { ok: false, reason: 'occupied' });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('says unreachable — and writes nothing — once this client stands elsewhere', async () => {
