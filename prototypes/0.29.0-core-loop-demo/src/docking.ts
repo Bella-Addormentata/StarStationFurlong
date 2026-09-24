@@ -48,6 +48,7 @@ import {
   ROOM_HALF,
   dockChain,
   isDockChain,
+  DOCK_ENVELOPE_R,
   type ConnectorSegment,
 } from "./adapter";
 // ⚓ #163: the two-part docking adapter's shared rules (pure, tested).
@@ -189,6 +190,10 @@ export type FarDockRequest =
   | {
       kind: "dock";
       nearRoomId?: string;
+      /** The undock this DOCK re-makes the dock after (the berth memory's
+       *  stamp): a far record still holding that released dock is a leftover
+       *  to write over, never a newer claim (dockRules.farDockPatch). */
+      replacesUndockedAt?: number;
       farAddress: string;
       farDoor: string;
       nearDoorId: string;
@@ -208,9 +213,12 @@ export type FarDockResult =
         | "occupied"
         | "closed"
         | "gone"
-        /** Another DOCK of this very port made the same claim at the same
-         *  moment, and the CRDT kept that one: it stands, this one yields. */
+        /** The berth holds a dock of this very port with another stamp — a
+         *  claim made at the same moment that the CRDT kept, or one made
+         *  from the far side: it stands, this one yields (and may join it). */
         | "superseded";
+      /** With `superseded`: the stamp of the dock of this port the berth holds. */
+      stamp?: number;
     };
 
 /** ⚓ One dock port as the helm's docking computer and the pane list it. */
@@ -599,7 +607,11 @@ export class DoorDockingPortSystem {
         ? [{ kind: "dock" }]
         : staged;
     if (segs.length === 0) return [];
+    // A gangway part's half-width; a dock half pads by the adapter's own
+    // widest radius (hull flange, ~1.94 m), not the gangway's.
     const PAD = 0.85;
+    const padFor = (seg: ConnectorSegment) =>
+      seg.kind === "dock" ? Math.max(PAD, DOCK_ENVELOPE_R) : PAD;
     // 🚪 #91: anchor on the door's LIVE pose (slide delta included). Without
     // the delta these occupancy/clash boxes sat at the unslid position while
     // buildConnectorChain drew the tube at the slid one — the warnings and the
@@ -618,11 +630,12 @@ export class DoorDockingPortSystem {
     for (let i = 1; i <= segs.length; i++) {
       const p = foldChainEnd(segs.slice(0, i));
       const cur = toWorld(p.x, p.z);
+      const pad = padFor(segs[i - 1]);
       out.push({
-        x0: Math.min(prev.x, cur.x) - PAD,
-        z0: Math.min(prev.z, cur.z) - PAD,
-        x1: Math.max(prev.x, cur.x) + PAD,
-        z1: Math.max(prev.z, cur.z) + PAD,
+        x0: Math.min(prev.x, cur.x) - pad,
+        z0: Math.min(prev.z, cur.z) - pad,
+        x1: Math.max(prev.x, cur.x) + pad,
+        z1: Math.max(prev.z, cur.z) + pad,
       });
       prev = cur;
     }
@@ -2790,6 +2803,7 @@ export class DoorDockingPortSystem {
         far = await this.farDockWriter({
           kind: "dock",
           nearRoomId: roomId,
+          replacesUndockedAt: port.memory.undockedAt,
           farAddress: port.address,
           farDoor,
           nearDoorId: doorId,
@@ -2802,9 +2816,26 @@ export class DoorDockingPortSystem {
         far = { ok: false, reason: "unreachable" };
       }
       if (!far.ok && far.reason === "superseded") {
-        // Another DOCK of this very port (a crew member here, at the same
-        // moment) holds the berth: that dock stands, and its own side is
-        // that client's to write — nothing to write or take back here.
+        // The berth already holds a dock of THIS very port, stamped after our
+        // undock — made from the far side, or by a crew member here at the
+        // same moment. That dock stands. Join it: this side takes that dock's
+        // own stamp (exactly what the walk-through mirror would write), so
+        // both ends hold one dock — and still only over the tombstone read
+        // above, in the room it was read in.
+        if (
+          far.stamp !== undefined &&
+          far.stamp > port.memory.undockedAt &&
+          unchanged()
+        ) {
+          const joined = redockRecord(port, far.stamp);
+          writeDoorPairing(doorId, joined.connectedRoomAddress, joined);
+          this.setDockOp(
+            doorId,
+            { note: `Docked to ${name} — joining the dock already made to this port.`, tone: "ok" },
+            roomId,
+          );
+          return true;
+        }
         this.setDockOp(
           doorId,
           { note: `Another DOCK of this port reached ${name} at the same moment — that one stands.`, tone: "warn" },

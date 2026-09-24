@@ -63,9 +63,22 @@ export function applyFarDockRequest(
     writeDoorRecordTo(doc, farDoor, patch.record);
     return { result: { ok: true, detail: 'written' }, wrote: true };
   }
-  const patch = farDockPatch(readDoorFrom(doc, req.farDoor), farBerth(doc, req.farDoor), near, req.dockedAt);
+  const patch = farDockPatch(
+    readDoorFrom(doc, req.farDoor),
+    farBerth(doc, req.farDoor),
+    near,
+    req.dockedAt,
+    req.replacesUndockedAt,
+  );
   if (patch.action === 'refuse') {
-    return { result: { ok: false, reason: patch.reason }, wrote: false };
+    return {
+      result: {
+        ok: false,
+        reason: patch.reason,
+        ...(patch.stamp !== undefined ? { stamp: patch.stamp } : {}),
+      },
+      wrote: false,
+    };
   }
   // One transaction: the berth's record and its port land together, so no
   // peer ever sees a dock on a door without its half.
@@ -100,12 +113,15 @@ export function berthAfterSettle(
   near: NearEnd,
 ): FarDockResult | null {
   const record = readDoorFrom(doc, req.farDoor);
-  if (holdsDockTo(record, near)) {
-    return record?.paired && record.dockedAt === req.dockedAt
-      ? null
-      : { ok: false, reason: 'superseded' };
+  if (holdsDockTo(record, near) && record?.paired) {
+    if (record.dockedAt === req.dockedAt) return null;
+    return {
+      ok: false,
+      reason: 'superseded',
+      ...(record.dockedAt !== undefined ? { stamp: record.dockedAt } : {}),
+    };
   }
-  const now = farDockPatch(record, farBerth(doc, req.farDoor), near, req.dockedAt);
+  const now = farDockPatch(record, farBerth(doc, req.farDoor), near, req.dockedAt, req.replacesUndockedAt);
   return { ok: false, reason: now.action === 'refuse' ? now.reason : 'occupied' };
 }
 
@@ -253,7 +269,9 @@ async function session(
     provider = new NetworkProvider();
     const p = provider;
     await withTimeout(p.connect(boot), READY_TIMEOUT_MS, 'far room dial');
-    const channel = await p.openChannel('ysync');
+    // Bounded like the dial: a stream that never opens must still reach the
+    // teardown below, or the provider would outlive the session.
+    const channel = await withTimeout(p.openChannel('ysync'), READY_TIMEOUT_MS, 'far room channel');
     sync = new YjsSync({
       roomId: boot.roomId,
       channel,
@@ -328,19 +346,13 @@ async function session(
   } finally {
     // Hang up WITHOUT holding the result: it is decided, and a transport that
     // wedges on close must not keep the caller (or this room's queue) waiting.
+    // Both at once: a sync whose writer close is stuck behind a wedged write
+    // never finishes stop() — disconnecting the provider is what breaks it,
+    // so it must not wait its turn. (Every write that mattered was already
+    // acknowledged before the result was decided.)
     const closing = { sync, provider };
-    void (async () => {
-      try {
-        await closing.sync?.stop();
-      } catch {
-        /* the doc may be gone */
-      }
-      try {
-        await closing.provider?.disconnect();
-      } catch {
-        /* the transport may be gone */
-      }
-    })();
+    void closing.sync?.stop().catch(() => undefined);
+    void closing.provider?.disconnect().catch(() => undefined);
   }
 }
 

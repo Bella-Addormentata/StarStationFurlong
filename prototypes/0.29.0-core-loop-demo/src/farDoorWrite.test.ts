@@ -93,6 +93,32 @@ describe('applyFarDockRequest — DOCK', () => {
     near,
   );
 
+  it('a berth already docked to this port by a newer DOCK is not overwritten — its stamp comes back', () => {
+    const doc = stationDoc(); // d:bay docked to this very port, stamped 100
+    const before = Y.encodeStateVector(doc);
+    const out = applyFarDockRequest(
+      doc,
+      {
+        kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId,
+        dockedAt: 300, replacesUndockedAt: 50, // our undock came BEFORE that dock
+      },
+      near,
+    );
+    expect(out).toEqual({ result: { ok: false, reason: 'superseded', stamp: 100 }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    // …while the leftover of the dock our undock released (stamped before it) is written over.
+    const retry = applyFarDockRequest(
+      doc,
+      {
+        kind: 'dock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId,
+        dockedAt: 300, replacesUndockedAt: 150,
+      },
+      near,
+    );
+    expect(retry.wrote).toBe(true);
+    expect(readDoorFrom(doc, 'd:bay')).toMatchObject({ paired: true, dockedAt: 300 });
+  });
+
   it('re-docks a remembered berth on its port', () => {
     const doc = stationDoc();
     doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
@@ -205,7 +231,9 @@ describe('berthAfterSettle — two modules claiming one berth', () => {
 
   it('the same port claimed twice at once: only the claim the CRDT kept — its stamp too — has docked', () => {
     const doc = stationDoc(); // d:bay holds this port's dock, stamped 100
-    expect(berthAfterSettle(doc, dockReq(near.doorId, 300), near)).toEqual({ ok: false, reason: 'superseded' });
+    expect(berthAfterSettle(doc, dockReq(near.doorId, 300), near)).toEqual({
+      ok: false, reason: 'superseded', stamp: 100,
+    });
     expect(berthAfterSettle(doc, dockReq(near.doorId, 100), near)).toBeNull();
   });
 

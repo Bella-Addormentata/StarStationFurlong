@@ -10,7 +10,7 @@ import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import * as THREE from 'three';
 import {
-  DOCK_HALF_LEN, CHAIN_PORTAL_MARGIN, ROOM_HALF,
+  DOCK_ENVELOPE_R, DOCK_HALF_LEN, CHAIN_PORTAL_MARGIN, ROOM_HALF,
   buildConnectorChain, buildDockPortStub, dockChain, foldChainEnd,
   isAllDockSegments, isDockChain, projectionPoseFromWall, setVestibuleLightState,
   type ConnectorSegment,
@@ -103,6 +103,31 @@ describe('dock segment — the round tunnel', () => {
     expect(glows.length).toBeGreaterThan(0);
     for (const m of glows) {
       expect((m.material as THREE.MeshBasicMaterial).color.getHex()).toBe(0xff1744);
+    }
+  });
+
+  it('DOCK_ENVELOPE_R bounds every part of a port and a dock, and the flange reaches it', () => {
+    // What the occupancy boxes pad a dock by: the widest horizontal reach of
+    // any vertex from the tube axis (x = 0 in the chain's own frame).
+    const widest = (g: THREE.Object3D) => {
+      g.updateMatrixWorld(true);
+      let max = 0;
+      const v = new THREE.Vector3();
+      g.traverse((o) => {
+        const mesh = o as THREE.Mesh;
+        if (!mesh.isMesh) return;
+        const pos = mesh.geometry.getAttribute('position');
+        for (let i = 0; i < pos.count; i++) {
+          v.fromBufferAttribute(pos, i).applyMatrix4(mesh.matrixWorld);
+          max = Math.max(max, Math.abs(v.x));
+        }
+      });
+      return max;
+    };
+    for (const g of [buildDockPortStub('d:x'), buildConnectorChain('d:x', dockChain())]) {
+      const w = widest(g);
+      expect(w).toBeLessThanOrEqual(DOCK_ENVELOPE_R + 1e-6);
+      expect(w).toBeGreaterThan(DOCK_ENVELOPE_R - 0.01);
     }
   });
 
@@ -374,8 +399,6 @@ describe('dockRules — the far end', () => {
     expect(farDockPatch(buildDoorTombstone(seedFor(SHIP), { undockedAt: 5 }), port, near, 40)).toEqual({ action: 'write', record: want });
     expect(farDockPatch(buildDoorTombstone(seedFor('someone'), { undockedAt: 5 }), port, near, 40).action).toBe('write');
     expect(farDockPatch(buildDoorTombstone(seedFor('someone')), port, near, 40).action).toBe('write');
-    expect(farDockPatch(buildDoorPairing(seedFor(SHIP)), port, near, 40).action).toBe('write'); // already us
-    expect(farDockPatch(buildDoorPairing(seedFor(SHIP), { farDoor: near.doorId }), port, near, 40).action).toBe('write');
     expect(farDockPatch(buildDoorPairing(seedFor('someone')), port, near, 40)).toEqual(occupied);
     // Paired to our room, but through ANOTHER of our doors: that connection's berth.
     expect(farDockPatch(buildDoorPairing(seedFor(SHIP), { farDoor: 'd:shipport2' }), port, near, 40)).toEqual(occupied);
@@ -391,6 +414,23 @@ describe('dockRules — the far end', () => {
     expect(holdsDockTo(buildDoorPairing(seedFor(SHIP), { farDoor: near.doorId }), near)).toBe(false); // a gangway
     expect(holdsDockTo(buildDoorTombstone(seedFor(SHIP), { undockedAt: 5 }), near)).toBe(false);
     expect(holdsDockTo(undefined, near)).toBe(false);
+  });
+
+  it('a live pairing to THIS end: only our own claim, or the released dock\'s leftover, is written over', () => {
+    const dockTo = (dockedAt?: number) =>
+      buildDoorPairing(seedFor(SHIP), { segments: dockChain(), farDoor: near.doorId, transient: true, dockedAt });
+    // Our own claim (a retry) and the dock our undock at 20 released but never reached here.
+    expect(farDockPatch(dockTo(40), port, near, 40, 20).action).toBe('write');
+    expect(farDockPatch(dockTo(10), port, near, 40, 20).action).toBe('write');
+    expect(farDockPatch(dockTo(20), port, near, 40, 20).action).toBe('write');
+    expect(farDockPatch(dockTo(undefined), port, near, 40, 20).action).toBe('write'); // unstamped: a leftover
+    // A dock of this port made after that undock is a newer claim — never
+    // overwritten; its stamp comes back so this side can join it.
+    expect(farDockPatch(dockTo(30), port, near, 40, 20)).toEqual({ action: 'refuse', reason: 'superseded', stamp: 30 });
+    expect(farDockPatch(dockTo(30), port, near, 40)).toEqual({ action: 'refuse', reason: 'superseded', stamp: 30 });
+    // A gangway between these very doors is another connection.
+    expect(farDockPatch(buildDoorPairing(seedFor(SHIP), { farDoor: near.doorId }), port, near, 40, 20)).toEqual(occupied);
+    expect(farDockPatch(buildDoorPairing(seedFor(SHIP)), port, near, 40, 20)).toEqual(occupied);
   });
 
   it('DOCK never re-fits a port someone removed — even mid-removal', () => {

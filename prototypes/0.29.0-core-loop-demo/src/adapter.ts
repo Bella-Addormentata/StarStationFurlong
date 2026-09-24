@@ -716,6 +716,11 @@ const DOCK_R_IN = 1.6;
  *  MIN_DOOR_GAP (4 m) never touch. */
 const DOCK_R_OUT = 1.72;
 const DOCK_RING_TUBE = 0.14;
+/** ⚓ The adapter's widest radius about its tube axis: the hull flange's rim.
+ *  The soft-capture ring (1.86), the latches (~1.87) and the truss struts
+ *  (~1.89) all stay inside it — so it is what anything testing the space a
+ *  port or dock occupies must pad its axis by (docking.ts chainBoxesFor). */
+export const DOCK_ENVELOPE_R = DOCK_R_OUT + 0.22;
 
 const COL_SOFT_GOODS = 0xf2efe6;
 const COL_LATCH = 0x14161c;
@@ -851,7 +856,7 @@ export function buildDockHalf(opts: {
   if (opts.hullEnd) {
     // Hull flange: a gunmetal annulus just proud of the door frame.
     const flange = add(
-      new THREE.Mesh(new THREE.RingGeometry(DOCK_R_IN, DOCK_R_OUT + 0.22, 40), mats.frame),
+      new THREE.Mesh(new THREE.RingGeometry(DOCK_R_IN, DOCK_ENVELOPE_R, 40), mats.frame),
     );
     flange.position.set(0, DOCK_CY, zHull);
     // Blue truss struts bracing back across the portal margin to the wall.
