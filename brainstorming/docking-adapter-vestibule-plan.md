@@ -151,9 +151,10 @@ deciding on the named door read directly (never through the 64-record snapshot c
 then a SyncStep1 with the pre-write state vector; the node's answer holds our structs only once it
 applied them) → for a DOCK, a settle window for concurrent claims on the same berth, after which only
 the claim the CRDT kept has docked (a DOCK is not a lock) → teardown. Serialized per far room; bounded
-by timeouts. A claim that arrives only after the settle window is the residual no client can close
-alone: exactly-once arbitration needs an authority for the berth (the room host). The decisions are
-pure (`dockRules.ts`, unit-tested):
+by timeouts. A claim that arrives only after the settle window — or a DOCK's own near-side write
+racing the far end's claim on that same door — is the residual no client can close alone:
+exactly-once arbitration needs an authority for the berth (the room host). The decisions are pure
+(`dockRules.ts`, unit-tested):
 
 - **UNDOCK far patch:** the far door's record is paired to us — our room, and our door or none named
   — and is not a newer dock (a take-back also requires our exact stamp) → dock tombstone naming us,
@@ -162,6 +163,11 @@ pure (`dockRules.ts`, unit-tested):
   through this door → dock pairing to us (+ its port when the door never had a connection); paired
   elsewhere, or to another of our doors → *occupied*; a plain tombstone naming us, or any tombstone
   on a door without a port → *closed*.
+- **DOCK near side, after the far answer:** written only over the tombstone it read. If the port
+  changed meanwhile, a dock of the same berth counts as ours only under our own stamp
+  (`holdsOurRedock`); anything else — the far side's own DOCK crossing ours included, when both ends
+  press DOCK at once — takes our far write back, so the two ends never keep two different stamps (a
+  crossing ends with both undocked; one more DOCK makes it).
 
 Our own address for the far record: pass → minted-module ledger → mint (the transit's ladder,
 factored out).
@@ -172,7 +178,9 @@ factored out).
   used to slip past a tombstone).
 - A dock departure newer than the arrival door's dock tombstone re-pairs it (a deliberate re-dock);
   an older one is refused (a stale berth).
-- A dock arrival fits the arrival door with its port if it has none, and the mirror carries `dockedAt`.
+- A dock arrival fits the arrival door with its port if it has none — in the same transaction as the
+  pairing, so no peer ever holds the dock without its port (which would vanish at UNDOCK) — and the
+  mirror carries `dockedAt`.
 
 ## 9. Slices (one PR, reviewable in this order)
 

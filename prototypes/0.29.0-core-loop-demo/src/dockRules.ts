@@ -147,6 +147,29 @@ export function redockRecord(
   });
 }
 
+/**
+ * A DOCK asked its berth, and THIS port changed while it waited: does the port
+ * now hold the very dock that DOCK made? Only that berth under that DOCK's own
+ * stamp counts — the walk-through mirror of our far write, or a crew member
+ * here joining it. The same berth under ANOTHER stamp is the far side's own
+ * DOCK crossing ours (its far write landed on this door while ours landed on
+ * its door): keeping both would leave the two ends holding different stamps,
+ * so the port changed like any other, and our far write is taken back — as
+ * the far side, finding our claim on its own door, takes back its own.
+ */
+export function holdsOurRedock(
+  now: DockPortState | null,
+  berth: { roomId: string; farDoor: string },
+  dockedAt: number,
+): boolean {
+  return (
+    now?.kind === 'docked' &&
+    now.roomId === berth.roomId &&
+    (!now.record.farDoor || now.record.farDoor === berth.farDoor) &&
+    now.record.dockedAt === dockedAt
+  );
+}
+
 // ── The transit mirror ───────────────────────────────────────────────────────
 
 /**

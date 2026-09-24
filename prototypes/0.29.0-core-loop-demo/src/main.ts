@@ -124,6 +124,7 @@ import {
   readAllDoors,
   readDoor,
   subscribeDoors,
+  transactDoorWrites,
 } from "./doorsDoc";
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
 // and the far room's end of every DOCK / UNDOCK.
@@ -2729,34 +2730,40 @@ async function transitTo(
     // it — and a DOCK made after that door's own undock is a deliberate
     // re-dock the mirror completes, while an older one is a stale berth.
     if (depRoomId && mirrorMayWrite(existing, depRoomId, depDock)) {
-      writeDoorPairing(arrivalDoorId, depAddress, {
-        segments: depGeometry
-          ? mirrorSegments(depGeometry.segments)
-          : undefined,
-        farDoor: departureDoorId,
-        // 🧭 The mirror is the one writer that KNOWS the far wall exactly: the
-        // traveler just departed through that door and captured its wall
-        // before the swap tore the departure room down. This is how a pairing
-        // whose INITIATE could not know the far side (free door, unvisited
-        // room) becomes fully described after one walk-through.
-        farWall: depWall,
-        farLateral: depLateral,
-        farYawDeg: depGeometry?.farYawDeg,
-        // #67 D2: a berth's mirror (into the SHIP's own doc) stays transient —
-        // detaching either side casts the whole connection off.
-        transient: depTransient,
-        // ⚓ …and a dock's mirror carries the dock's stamp.
-        dockedAt: depDock.isDock ? depDock.dockedAt : undefined,
-      });
-      // ⚓ A dock has a half on BOTH doors: the arrival door wears the mating
-      // half the connection brought (staged on the far side, or the visiting
-      // ship's own), so it can UNDOCK and DOCK from this side too.
-      if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
-        writeDoorPolicy(arrivalDoorId, {
-          ...readDoorPolicy(arrivalDoorId),
-          adapter: true,
+      // ⚓ ONE transaction for the pairing and, for a dock, its port: were the
+      // pairing to land alone (a session cut between two updates), the port
+      // would exist only while docked — isPortDoor infers it from the live
+      // chain — and vanish at UNDOCK, leaving a berth no one could DOCK again.
+      transactDoorWrites(() => {
+        writeDoorPairing(arrivalDoorId, depAddress, {
+          segments: depGeometry
+            ? mirrorSegments(depGeometry.segments)
+            : undefined,
+          farDoor: departureDoorId,
+          // 🧭 The mirror is the one writer that KNOWS the far wall exactly:
+          // the traveler just departed through that door and captured its
+          // wall before the swap tore the departure room down. This is how a
+          // pairing whose INITIATE could not know the far side (free door,
+          // unvisited room) becomes fully described after one walk-through.
+          farWall: depWall,
+          farLateral: depLateral,
+          farYawDeg: depGeometry?.farYawDeg,
+          // #67 D2: a berth's mirror (into the SHIP's own doc) stays
+          // transient — detaching either side casts the whole connection off.
+          transient: depTransient,
+          // ⚓ …and a dock's mirror carries the dock's stamp.
+          dockedAt: depDock.isDock ? depDock.dockedAt : undefined,
         });
-      }
+        // ⚓ A dock has a half on BOTH doors: the arrival door wears the
+        // mating half the connection brought (staged on the far side, or the
+        // visiting ship's own), so it can UNDOCK and DOCK from this side too.
+        if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+          writeDoorPolicy(arrivalDoorId, {
+            ...readDoorPolicy(arrivalDoorId),
+            adapter: true,
+          });
+        }
+      });
       console.log(
         `🪞 Mirror pairing written: ${arrivalDoorId} → departure room (${depRoomId}).`,
       );

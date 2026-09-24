@@ -17,7 +17,7 @@ import {
   applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, writeFarDock,
 } from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
-import type { NearEnd } from './dockRules';
+import { classifyDockPort, holdsOurRedock, type NearEnd } from './dockRules';
 
 const seedFor = (roomId: string): string => btoa(JSON.stringify({ roomId }));
 const SHIP = 'module-ship';
@@ -242,6 +242,60 @@ describe('berthAfterSettle — two modules claiming one berth', () => {
     doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP)));
     doc.getMap('doorPolicy').set('d:bay', { passage: 'public', construction: 'owner', adapter: false });
     expect(berthAfterSettle(doc, dockReq(near.doorId, 300), near)).toEqual({ ok: false, reason: 'closed' });
+  });
+});
+
+describe('DOCK pressed at both ends at once', () => {
+  it('neither end keeps a crossed stamp: each finds the other\'s claim on its port and takes its own far write back', () => {
+    // The ship's d:shipport and the station's d:bay were undocked at 200;
+    // both ends remember the berth.
+    const station = stationDoc();
+    station.getMap('doors').set(
+      'd:bay',
+      buildDoorTombstone(seedFor(SHIP), { farDoor: near.doorId, farWall: 'x-', farLateral: 0, undockedAt: 200 }),
+    );
+    const ship = new Y.Doc();
+    ship.getMap('doorLayout').set(near.doorId, { id: near.doorId, wall: 'x-', lateral: 0, placed: true });
+    ship.getMap('doorPolicy').set(near.doorId, { passage: 'public', construction: 'owner', adapter: true });
+    ship.getMap('doors').set(
+      near.doorId,
+      buildDoorTombstone(seedFor(STATION), { farDoor: 'd:bay', farWall: 'y+', farLateral: 0, undockedAt: 200 }),
+    );
+    const bayEnd: NearEnd = { roomId: STATION, address: seedFor(STATION), doorId: 'd:bay', wall: 'y+', lateral: 0 };
+    // Both press DOCK: each far write lands on the OTHER end's door.
+    const shipDock = {
+      kind: 'dock' as const, farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId,
+      dockedAt: 300, replacesUndockedAt: 200,
+    };
+    const bayDock = {
+      kind: 'dock' as const, farAddress: seedFor(SHIP), farDoor: near.doorId, nearDoorId: 'd:bay',
+      dockedAt: 301, replacesUndockedAt: 200,
+    };
+    expect(applyFarDockRequest(station, shipDock, near).wrote).toBe(true);
+    expect(applyFarDockRequest(ship, bayDock, bayEnd).wrote).toBe(true);
+    // Left like this, the two ends would hold two different stamps…
+    expect([readDoorFrom(ship, near.doorId), readDoorFrom(station, 'd:bay')].map((r) => r?.paired && r.dockedAt))
+      .toEqual([301, 300]);
+    // …so neither DOCK counts the dock on its own port as its own…
+    const port = (doc: Y.Doc, id: string) => classifyDockPort(readDoorFrom(doc, id));
+    expect(holdsOurRedock(port(ship, near.doorId), { roomId: STATION, farDoor: 'd:bay' }, 300)).toBe(false);
+    expect(holdsOurRedock(port(station, 'd:bay'), { roomId: SHIP, farDoor: near.doorId }, 301)).toBe(false);
+    // …and each takes back exactly its own far write.
+    const takeBack = (doc: Y.Doc, req: typeof shipDock, end: NearEnd) => applyFarDockRequest(
+      doc,
+      {
+        kind: 'undock', farAddress: req.farAddress, farDoor: req.farDoor, nearDoorId: req.nearDoorId,
+        undockedAt: req.dockedAt + 1, onlyDockedAt: req.dockedAt,
+      },
+      end,
+    );
+    expect(takeBack(station, shipDock, near).wrote).toBe(true);
+    expect(takeBack(ship, bayDock, bayEnd).wrote).toBe(true);
+    // Both ends are undocked again, still remembering each other: one DOCK re-makes it.
+    const shipPort = port(ship, near.doorId);
+    const bayPort = port(station, 'd:bay');
+    expect(shipPort.kind === 'undocked' && shipPort.memory.farDoor).toBe('d:bay');
+    expect(bayPort.kind === 'undocked' && bayPort.memory.farDoor).toBe(near.doorId);
   });
 });
 

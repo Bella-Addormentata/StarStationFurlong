@@ -59,6 +59,7 @@ import {
   gangwayPartRefusal,
   berthMemoryFrom,
   redockRecord,
+  holdsOurRedock,
   stampAfter,
   FAR_DOCK_REFUSAL,
   type DockPortState,
@@ -2879,11 +2880,13 @@ export class DoorDockingPortSystem {
    * ⚓ redockPort's far berth answered, but THIS port changed while it was
    * asked (a peer docked, re-connected or stripped it — or the player left
    * the room, so this side can no longer be written). Docked meanwhile to
-   * this very berth — another crew member's DOCK, or the far side's own — both
-   * sides hold a dock and nothing is taken back. Anything else would leave the
-   * berth holding a dock this port no longer has: take back exactly the far
-   * write this call made (the far side undoes only a dock carrying our stamp,
-   * never anyone else's), and say so.
+   * this very berth under OUR stamp — a crew member here joining our dock, or
+   * the walk-through mirror of our far write — both sides hold one dock and
+   * nothing is taken back (dockRules.holdsOurRedock). Anything else, the far
+   * side's own DOCK crossing ours included, would leave the berth holding a
+   * dock this port does not have: take back exactly the far write this call
+   * made (the far side undoes only a dock carrying our stamp, never anyone
+   * else's), and say so.
    */
   private async settleChangedRedock(
     doorId: string,
@@ -2900,11 +2903,7 @@ export class DoorDockingPortSystem {
     // Only the room this DOCK started in can say what its port holds now.
     const now =
       this.roomNow() === ask.roomId ? classifyDockPort(readDoor(doorId)) : null;
-    if (
-      now?.kind === "docked" &&
-      now.roomId === port.roomId &&
-      (!now.record.farDoor || now.record.farDoor === ask.farDoor)
-    ) {
+    if (holdsOurRedock(now, { roomId: port.roomId, farDoor: ask.farDoor }, ask.dockedAt)) {
       this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" }, ask.roomId);
       return true;
     }

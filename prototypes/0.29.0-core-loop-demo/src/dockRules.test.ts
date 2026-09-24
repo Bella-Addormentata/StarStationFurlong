@@ -17,13 +17,14 @@ import {
 } from './adapter';
 import {
   bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readAllDoors,
-  readAllDoorsFrom, writeDoorRecordTo,
+  readAllDoorsFrom, readDoorFrom, transactDoorWrites, writeDoorPairing, writeDoorRecordTo,
 } from './doorsDoc';
+import { bindDoorPolicy, dockPortFlagIn, readDoorPolicy, writeDoorPolicy } from './doorPolicy';
 import { mirrorSegments, partForSegment } from './stationParts';
 import {
   berthMemoryFrom, classifyDockPort, farDockPatch, farUndockPatch, findFarDoor,
-  gangwayPartRefusal, holdsDockTo, isPortDoor, mirrorMayWrite, nextDockStep, redockRecord,
-  stampAfter, type NearEnd,
+  gangwayPartRefusal, holdsDockTo, holdsOurRedock, isPortDoor, mirrorMayWrite, nextDockStep,
+  redockRecord, stampAfter, type NearEnd,
 } from './dockRules';
 
 /** A pass in the real format roomIdFromSeed parses: base64(JSON{roomId}). */
@@ -178,6 +179,25 @@ describe('dock — the wire', () => {
     expect(rec?.paired && isDockChain(rec.segments)).toBe(true);
     expect(rec?.paired && rec.dockedAt).toBe(7);
   });
+
+  it('a dock and its port leave as ONE update (transactDoorWrites — how the arrival mirror publishes a dock)', () => {
+    const doc = new Y.Doc();
+    bindDoorsDoc(doc);
+    bindDoorPolicy(doc);
+    const updates: Uint8Array[] = [];
+    doc.on('update', (u: Uint8Array) => updates.push(u));
+    transactDoorWrites(() => {
+      writeDoorPairing('north', seedFor(SHIP), { segments: dockChain(), transient: true, dockedAt: 7 });
+      writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: true });
+    });
+    expect(updates).toHaveLength(1);
+    // A peer holding that one update has the dock AND its port — never a dock
+    // whose port would vanish at UNDOCK.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, updates[0]);
+    expect(readDoorFrom(peer, 'north')?.paired).toBe(true);
+    expect(dockPortFlagIn(peer, 'north')).toBe(true);
+  });
 });
 
 describe('dock — parts and mirror', () => {
@@ -300,6 +320,25 @@ describe('dockRules — undock memory and re-dock', () => {
     expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: 900 })).toBe(false);
     // A DOCK after it, stamped by the same trailing clock, still re-docks.
     expect(mirrorMayWrite(t, SHIP, { isDock: true, dockedAt: stampAfter(undockedAt, 500) })).toBe(true);
+  });
+
+  it('holdsOurRedock: a port that changed mid-DOCK holds our dock only under our own stamp', () => {
+    const berth = { roomId: STATION, farDoor: 'd:bay' };
+    const dockAs = (dockedAt: number | undefined, farDoor = 'd:bay', room = STATION) =>
+      classifyDockPort(buildDoorPairing(seedFor(room), { segments: dockChain(), farDoor, transient: true, dockedAt }));
+    // The mirror of our far write, or a crew member here joining our dock.
+    expect(holdsOurRedock(dockAs(300), berth, 300)).toBe(true);
+    // (A record naming no door is taken as ours, as findFarDoor does.)
+    expect(holdsOurRedock(dockAs(300, ''), berth, 300)).toBe(true);
+    // The far side's own DOCK crossing ours: the same berth under ITS stamp.
+    expect(holdsOurRedock(dockAs(301), berth, 300)).toBe(false);
+    expect(holdsOurRedock(dockAs(undefined), berth, 300)).toBe(false);
+    // Another berth, another module, a gangway, a release — or another room stood in.
+    expect(holdsOurRedock(dockAs(300, 'd:other'), berth, 300)).toBe(false);
+    expect(holdsOurRedock(dockAs(300, 'd:bay', 'elsewhere'), berth, 300)).toBe(false);
+    expect(holdsOurRedock(classifyDockPort(buildDoorPairing(seedFor(STATION), { farDoor: 'd:bay' })), berth, 300)).toBe(false);
+    expect(holdsOurRedock(classifyDockPort(buildDoorTombstone(seedFor(STATION), { undockedAt: 299 })), berth, 300)).toBe(false);
+    expect(holdsOurRedock(null, berth, 300)).toBe(false);
   });
 });
 
