@@ -5127,8 +5127,9 @@ export class World {
       if (autoCroupier) tickCoinPusherMachine(machine.id);
       else stopCoinPusherOperator(machine.id);
     }
-    // …and finish any removed cabinet's teardown left to a session that has
-    // since gone away (closeCoinPusher).
+    // …and carry on with removed cabinets: the batched sweep of their
+    // per-player keys, and any teardown left to a session that has since gone
+    // away (closeCoinPusher).
     tickCoinPusherTeardowns();
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's

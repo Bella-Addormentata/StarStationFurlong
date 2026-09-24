@@ -17,8 +17,10 @@ import {
   buyInChips,
   cancelCoinPusherRequest,
   commitCoinPusherEmpty,
+  continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
   PUSHER_REQUEST_SCAN,
+  PUSHER_SWEEP_BATCH,
   readChips,
   readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
@@ -30,6 +32,7 @@ import {
   refuseCoinPusherEmpty,
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
+  startCoinPusherKeySweep,
   writeCoinPusherEmptyRequest,
   writeCoinPusherOperatorLease,
   writeCoinPusherRequest,
@@ -107,6 +110,15 @@ function countTransactions(d: Y.Doc): () => number {
   let n = 0;
   d.on('afterTransaction', () => { n += 1; });
   return () => n;
+}
+
+/** Sweep a drained machine's per-player keys to the end (the operator does it
+ *  a batch per frame); returns how many batches it took. */
+function sweepAll(machineId: string): number {
+  const sweep = startCoinPusherKeySweep(machineId);
+  let batches = 1;
+  while (!continueCoinPusherKeySweep(sweep)) batches += 1;
+  return batches;
 }
 
 /** Run `work` asserting it never walks a Y.Map; returns what it returned. */
@@ -497,7 +509,7 @@ describe('refuseCoinPusherEmpty', () => {
 // ── drainAndClearCoinPusher (cabinet removed) ────────────────────────────────
 
 describe('drainAndClearCoinPusher', () => {
-  it('pays the chips inside to the caller (the deed holder) and deletes every key the machine used', () => {
+  it('pays the chips inside to the caller (the deed holder) and deletes the machine\'s own keys in one transaction', () => {
     const base = machineWith(30);
     writeCoinPusherState(MACHINE, base);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
@@ -510,14 +522,57 @@ describe('drainAndClearCoinPusher', () => {
     refuseCoinPusherInsert(MACHINE, request(PLAYER, 'req-1'), 'expired', 1);
     expect(readCoinPusherResult(MACHINE, PLAYER)).not.toBeNull();
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2'));
+    const transactions = countTransactions(doc);
     expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(chipsInMachine(base));
-    expect(readCoinPusherResult(MACHINE, PLAYER)).toBeNull();
+    expect(transactions()).toBe(1);
     expect(readChips(OWNER)).toBe(chipsInMachine(base));
     expect(readCoinPusherState(MACHINE)).toBeNull();
-    expect(readCoinPusherRequests(MACHINE)).toEqual([]);
     expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
     expect(doc.getMap('casino').has(`pusher-door:${MACHINE}`)).toBe(false);
     expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+    // Its per-player keys carry no chips; the sweep deletes them afterwards.
+    expect(readCoinPusherResult(MACHINE, PLAYER)).not.toBeNull();
+    sweepAll(MACHINE);
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toBeNull();
+    expect(readCoinPusherRequests(MACHINE)).toEqual([]);
+    expect(readChips(OWNER)).toBe(chipsInMachine(base));
+  });
+
+  it('sweeps a flood of per-player keys a batch at a time', () => {
+    const map = doc.getMap('casino');
+    writeCoinPusherState(MACHINE, machineWith(5));
+    const flood = 3 * PUSHER_SWEEP_BATCH + 5;
+    for (let i = 0; i < flood; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    const left = () => [...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`)).length;
+    drainAndClearCoinPusher(MACHINE, OWNER);
+    expect(left()).toBe(flood);
+    const sweep = startCoinPusherKeySweep(MACHINE);
+    for (let batch = 1; batch <= 3; batch++) {
+      const transactions = countTransactions(doc);
+      expect(continueCoinPusherKeySweep(sweep)).toBe(false);
+      expect(transactions()).toBe(1);
+      const late = batch > 1 ? 1 : 0;
+      expect(left()).toBe(flood + late - batch * PUSHER_SWEEP_BATCH);
+      // A stale answer landing mid-sweep is swept too.
+      if (batch === 1) map.set(`pusher-result:${MACHINE}:late`, 'junk');
+    }
+    expect(continueCoinPusherKeySweep(sweep)).toBe(true);
+    expect(left()).toBe(0);
+  });
+
+  it('a sweep ends when the room changes, writing to neither room\'s doc', () => {
+    const map = doc.getMap('casino');
+    writeCoinPusherState(MACHINE, machineWith(5));
+    for (let i = 0; i < 10; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    drainAndClearCoinPusher(MACHINE, OWNER);
+    const sweep = startCoinPusherKeySweep(MACHINE);
+    const nextRoom = new Y.Doc();
+    bindCasinoDoc(nextRoom);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'theirs'));
+    expect(continueCoinPusherKeySweep(sweep)).toBe(true);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('theirs');
+    // The room it left is left alone too: it may be torn down already.
+    expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`))).toHaveLength(10);
   });
 
   it('refunds nothing for pending or forged requests — they never held chips', () => {
@@ -530,6 +585,7 @@ describe('drainAndClearCoinPusher', () => {
       map.set(`pusher-esc:${MACHINE}:${ATTACKER}:forged-${i}`, { requestId: `forged-${i}`, player: ATTACKER, ante: 100, escrowedAt: 0 });
     }
     drainAndClearCoinPusher(MACHINE, OWNER);
+    sweepAll(MACHINE);
     expect(readChips(PLAYER)).toBe(4);
     expect(readChips(ATTACKER)).toBe(0);
     // The escrow-shaped records an earlier revision used go with the machine.
@@ -560,7 +616,11 @@ describe('drainAndClearCoinPusher', () => {
     const neighbour = `${MACHINE}0`;
     writeCoinPusherRequest(neighbour, request(PLAYER, 'n-1'));
     map.set(`pusher-result:${neighbour}:${PLAYER}`, { kind: 'refused', requestId: 'n-0', reason: 'expired', atMs: 1 });
-    expect(withoutWalking(() => drainAndClearCoinPusher(MACHINE, OWNER))).toBe(chipsInMachine(base));
+    expect(withoutWalking(() => {
+      const credit = drainAndClearCoinPusher(MACHINE, OWNER);
+      sweepAll(MACHINE);
+      return credit;
+    })).toBe(chipsInMachine(base));
     expect([...map.keys()].filter((k) => k.includes(MACHINE)).sort()).toEqual([
       `pusher-req:${neighbour}:${PLAYER}`, `pusher-result:${neighbour}:${PLAYER}`,
     ]);
@@ -572,6 +632,7 @@ describe('drainAndClearCoinPusher', () => {
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
     expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBe(0);
     expect(doc.getMap('casino').has(`pusher:${MACHINE}`)).toBe(false);
+    sweepAll(MACHINE);
     expect(readCoinPusherRequests(MACHINE)).toEqual([]);
   });
 });

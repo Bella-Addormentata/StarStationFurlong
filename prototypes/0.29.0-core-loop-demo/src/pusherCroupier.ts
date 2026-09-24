@@ -32,7 +32,10 @@
  * TEARDOWN: a removed cabinet is drained by the same rule. Only a session that
  * may operate the machine (it holds the lease, or could take it over) pays
  * out the chips inside and deletes its keys, so the drain never merges with a
- * settle still in flight on another tab (see closeCoinPusher).
+ * settle still in flight on another tab (see closeCoinPusher). The chips and
+ * the machine's own keys go in one transaction; its per-player keys, which
+ * carry no chips, are swept a batch per frame so a flood of them can't stall
+ * one.
  *
  * WORK (at most every REQUEST_POLL_MS): the owner's door request first
  * (carried out, or answered with a refusal when its requester doesn't own the
@@ -53,6 +56,7 @@ import {
   casinoDocEpoch,
   clearCoinPusherOperatorLease,
   commitCoinPusherEmpty,
+  continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
   readChips,
   readCoinPusherEmptyRequest,
@@ -62,9 +66,11 @@ import {
   refuseCoinPusherEmpty,
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
+  startCoinPusherKeySweep,
   writeCoinPusherOperatorLease,
   writeCoinPusherState,
 } from './casinoDoc';
+import type { CoinPusherKeySweep } from './casinoDoc';
 import { canRunCroupier } from './croupier';
 import {
   chipsInMachine,
@@ -96,6 +102,9 @@ const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
  *  operating them (closeCoinPusher), with the doc epoch each was removed in:
  *  one never reads or writes a different room's doc. */
 const pendingTeardowns = new Map<string, number>();
+/** Drained machines whose per-player keys this session is still deleting, a
+ *  batch a frame (tickCoinPusherTeardowns). */
+const sweeps = new Map<string, CoinPusherKeySweep>();
 /** Short: a drop's timing window (MAX_DROP_LAG_MS) has to cover this wait. */
 const REQUEST_POLL_MS = 100;
 /** Inserts settled or refused per poll (≤ 40 a second per machine). */
@@ -193,8 +202,9 @@ export function isCoinPusherOperator(machineId: string, now = Date.now()): boole
  */
 export function tickCoinPusherMachine(machineId: string, now = Date.now()): void {
   // World ticks only cabinets in the room, so one put back before its
-  // teardown ran is no longer to be torn down.
+  // teardown ran (or finished) is no longer to be torn down.
   pendingTeardowns.delete(machineId);
+  sweeps.delete(machineId);
   if (!canRunCroupier()) {
     stopCoinPusherOperator(machineId);
     return;
@@ -353,6 +363,7 @@ export function closeCoinPusher(
   lastPolls.delete(machineId);
   if (!canManage) {
     pendingTeardowns.delete(machineId);
+    sweeps.delete(machineId);
     leaseFirstSeen.delete(machineId);
     if (readCoinPusherOperatorLease(machineId)?.sessionId === operatorSessionId) {
       clearCoinPusherOperatorLease(machineId);
@@ -378,17 +389,26 @@ function tearDownIfFree(machineId: string, now: number): void {
     && now < takeoverAt(machineId, lease, playerId, now)) return;
   pendingTeardowns.delete(machineId);
   leaseFirstSeen.delete(machineId);
+  // The chips and the machine's own keys go in one transaction; its
+  // per-player keys (no chips in any) follow a batch per frame.
   drainAndClearCoinPusher(machineId, playerId);
+  const sweep = startCoinPusherKeySweep(machineId);
+  if (!continueCoinPusherKeySweep(sweep)) sweeps.set(machineId, sweep);
 }
 
-/** World calls this every frame. It finishes the teardowns this session left
- *  to another session that has since gone away still holding the lease. */
+/** World calls this every frame. It carries each removed cabinet's key sweep
+ *  on by one batch, and finishes the teardowns this session left to another
+ *  session that has since gone away still holding the lease. */
 export function tickCoinPusherTeardowns(now = Date.now()): void {
-  if (pendingTeardowns.size === 0) return;
+  if (pendingTeardowns.size === 0 && sweeps.size === 0) return;
   if (!canRunCroupier()) {
     for (const machineId of pendingTeardowns.keys()) leaseFirstSeen.delete(machineId);
     pendingTeardowns.clear();
+    sweeps.clear();
     return;
+  }
+  for (const [machineId, sweep] of [...sweeps]) {
+    if (continueCoinPusherKeySweep(sweep)) sweeps.delete(machineId);
   }
   for (const machineId of [...pendingTeardowns.keys()]) tearDownIfFree(machineId, now);
 }

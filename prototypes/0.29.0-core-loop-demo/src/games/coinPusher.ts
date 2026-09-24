@@ -574,10 +574,10 @@ export function settlePiles(
 
 /**
  * Add chips at `landX` to a platform, merging with a pile within one chip
- * diameter (they stack), else opening a new pile. Then a settle pass shoves
- * any piles AHEAD of the landing pile forward by contact — chips landing
- * on top of a pile press the front pile forward by exactly one chip
- * diameter (the cascade rule in the spec).
+ * diameter (they stack), else opening a new pile. Chips landing on a stack
+ * press the contact chain ahead of it forward, and either way a column taller
+ * than MAX_STACK_HEIGHT spills forward (the cascade rules in the spec). A
+ * settle pass then evicts anything pushed past the front edge.
  */
 export function insertOnPlatform(
   piles: Pile[],
@@ -592,11 +592,13 @@ export function insertOnPlatform(
   // stack (chip stacks on top of chip). Snap tolerance ≤ CHIP_R keeps two
   // near-neighbour piles from being spuriously merged.
   const idx = merged.findIndex((p) => Math.abs(p.x - landX) <= CHIP_R);
+  let landed: Pile;
   if (idx >= 0) {
-    merged[idx].count += chipIds.length;
-    merged[idx].chipIds = [...merged[idx].chipIds, ...chipIds];
+    landed = merged[idx];
+    landed.count += chipIds.length;
+    landed.chipIds = [...landed.chipIds, ...chipIds];
     merged.sort((a, b) => a.x - b.x);
-    const landedIdx = merged.findIndex((p) => Math.abs(p.x - landX) <= CHIP_R);
+    const landedIdx = merged.indexOf(landed);
 
     // (A) CONTACT IMPULSE. The falling chips deliver a horizontal impulse
     //     to the underlying stack (via each disc's spin from the peg
@@ -610,45 +612,46 @@ export function insertOnPlatform(
       if (gap > PILE_STEP + 1e-9) break;
       merged[i].x += shove;
     }
+  } else {
+    landed = { x: landX, count: chipIds.length, chipIds: [...chipIds] };
+    merged.push(landed);
+    merged.sort((a, b) => a.x - b.x);
+  }
 
-    // (B) COLUMN OVERFLOW (spill cascade). Chip columns are physically
-    //     unstable past ~MAX_STACK_HEIGHT chips: the top chip slides
-    //     forward onto the next column. If the next column is also full,
-    //     it spills further, and the chain propagates until the excess
-    //     finds a partially-filled column or FALLS off the front edge.
-    //     Combined with the pusher's steady forward stroke on the upper
-    //     platform, this is the primary path that puts chips into the
-    //     payout tray.
-    let cur = landedIdx;
-    // Safety cap: an unbounded loop here would burn the physics substep.
-    // Even a fully-packed platform (~10 columns × MAX_STACK_HEIGHT) yields
-    // a chain-length far below this ceiling.
-    for (let safety = 0; safety < PLATFORM_MAX_PILES * 4; safety++) {
-      if (merged[cur].count <= MAX_STACK_HEIGHT) break;
-      const overflow = merged[cur].count - MAX_STACK_HEIGHT;
-      const overflowIds = merged[cur].chipIds.splice(MAX_STACK_HEIGHT, overflow);
-      merged[cur].count = MAX_STACK_HEIGHT;
-      const spillX = merged[cur].x + PILE_STEP;
-      // Look for a spill target within one chip radius of the spillX.
-      let spillTarget = -1;
-      for (let i = 0; i < merged.length; i++) {
-        if (i !== cur && Math.abs(merged[i].x - spillX) <= CHIP_R) {
-          spillTarget = i;
-          break;
-        }
-      }
-      if (spillTarget >= 0) {
-        merged[spillTarget].count += overflow;
-        merged[spillTarget].chipIds.push(...overflowIds);
-        cur = spillTarget;
-      } else {
-        merged.push({ x: spillX, count: overflow, chipIds: overflowIds });
-        cur = merged.length - 1;
+  // (B) COLUMN OVERFLOW (spill cascade), for a new pile as for a stack — a
+  //     multi-chip pile can fall onto open floor. Chip columns are physically
+  //     unstable past ~MAX_STACK_HEIGHT chips: the top chip slides forward
+  //     onto the next column. If the next column is also full, it spills
+  //     further, and the chain propagates until the excess finds a
+  //     partially-filled column or FALLS off the front edge. Combined with
+  //     the pusher's steady forward stroke on the upper platform, this is the
+  //     primary path that puts chips into the payout tray.
+  let cur = merged.indexOf(landed);
+  // Safety cap: an unbounded loop here would burn the physics substep.
+  // Even a fully-packed platform (~10 columns × MAX_STACK_HEIGHT) yields
+  // a chain-length far below this ceiling.
+  for (let safety = 0; safety < PLATFORM_MAX_PILES * 4; safety++) {
+    if (merged[cur].count <= MAX_STACK_HEIGHT) break;
+    const overflow = merged[cur].count - MAX_STACK_HEIGHT;
+    const overflowIds = merged[cur].chipIds.splice(MAX_STACK_HEIGHT, overflow);
+    merged[cur].count = MAX_STACK_HEIGHT;
+    const spillX = merged[cur].x + PILE_STEP;
+    // Look for a spill target within one chip radius of the spillX.
+    let spillTarget = -1;
+    for (let i = 0; i < merged.length; i++) {
+      if (i !== cur && Math.abs(merged[i].x - spillX) <= CHIP_R) {
+        spillTarget = i;
+        break;
       }
     }
-  } else {
-    merged.push({ x: landX, count: chipIds.length, chipIds: [...chipIds] });
-    merged.sort((a, b) => a.x - b.x);
+    if (spillTarget >= 0) {
+      merged[spillTarget].count += overflow;
+      merged[spillTarget].chipIds.push(...overflowIds);
+      cur = spillTarget;
+    } else {
+      merged.push({ x: spillX, count: overflow, chipIds: overflowIds });
+      cur = merged.length - 1;
+    }
   }
 
   // A final settle pass: it catches the edge case where a landing pile

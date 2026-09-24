@@ -541,6 +541,18 @@ describe('insertOnPlatform', () => {
     // Something must have fallen off the front (the chain-cascaded overflow).
     expect(fallen.length).toBeGreaterThan(0);
   });
+
+  it('caps a multi-chip pile that lands on open floor too', () => {
+    // A tall pile falling onto an empty stretch of platform: no stack to
+    // merge with, but the column still can't stand past MAX_STACK_HEIGHT.
+    const n = { id: 1 };
+    const tall = pileN(0.40, MAX_STACK_HEIGHT + 2, n);
+    const { piles, fallen } = insertOnPlatform([], 0.80, tall.chipIds, PLAT_LOW_FRONT);
+    expect(fallen).toEqual([]);
+    expect(piles.map((p) => p.count)).toEqual([MAX_STACK_HEIGHT, 2]);
+    expect(piles[1].x).toBeCloseTo(0.80 + PILE_STEP, 12);
+    expect(piles.flatMap((p) => p.chipIds)).toEqual(tall.chipIds);
+  });
 });
 
 // ── simulatePeg ──────────────────────────────────────────────────────────────

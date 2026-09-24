@@ -10,6 +10,7 @@ import {
   bindCasinoDoc,
   buyInChips,
   drainAndClearCoinPusher,
+  PUSHER_SWEEP_BATCH,
   readChips,
   readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
@@ -398,12 +399,42 @@ describe('closeCoinPusher', () => {
   it('the session operating the machine drains it at once', () => {
     const base = machineWith(30);
     writeCoinPusherState(MACHINE, base);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', 0.5));
     tickCoinPusherMachine(MACHINE, NOW); // takes the lease
     expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
     closeCoinPusher(MACHINE, true, NOW + 10);
     expect(readChips(OPERATOR)).toBe(chipsInMachine(base));
     expect(readCoinPusherState(MACHINE)).toBeNull();
     expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull(); // a first batch, at once
+  });
+
+  it('sweeps a removed cabinet\'s per-player keys a batch per frame', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    const map = doc.getMap('casino');
+    const flood = 2 * PUSHER_SWEEP_BATCH + 10;
+    for (let i = 0; i < flood; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    const left = () => [...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`)).length;
+    closeCoinPusher(MACHINE, true, NOW); // no lease: this session drains
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(left()).toBe(flood - PUSHER_SWEEP_BATCH);
+    tickCoinPusherTeardowns(NOW + 16);
+    expect(left()).toBe(flood - 2 * PUSHER_SWEEP_BATCH);
+    tickCoinPusherTeardowns(NOW + 32);
+    expect(left()).toBe(0);
+  });
+
+  it('stops sweeping when the cabinet is put back', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    closeCoinPusher(MACHINE, true, NOW);
+    tickCoinPusherMachine(MACHINE, NOW + 16); // World ticks it again: it is back
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'fresh', 0.5));
+    tickCoinPusherTeardowns(NOW + 32);
+    tickCoinPusherTeardowns(NOW + 48);
+    expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`))).toHaveLength(PUSHER_SWEEP_BATCH);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('fresh');
   });
 
   it('another tab leaves the drain to the tab operating the machine, finishing it only if that tab goes away', () => {

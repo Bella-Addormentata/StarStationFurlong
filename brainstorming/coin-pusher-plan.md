@@ -56,7 +56,10 @@ past `1.20` falls into the tray and is paid out.
   forward stroke pushes; it never drags chips back.
 - A drop falls through five peg rows (a seeded left/right hash per row),
   lands on the upper platform, stacks (at most `MAX_STACK_HEIGHT` per column,
-  the excess spills forward) and nudges the contact chain ahead of it.
+  the excess spills forward) and nudges the contact chain ahead of it. The
+  same column cap holds wherever chips land, on a stack or on open floor (a
+  pile falling off the upper front onto an empty stretch of the lower
+  platform spills too).
 - After every drop the engine runs one full pusher cycle. Each substep uses
   the pusher's true furthest reach within it, so that cycle compresses the
   piles all the way: **the machine is at rest between drops**, and the
@@ -180,17 +183,19 @@ Records in the room's `casino` map:
 - **Removal.** Every client sees the cabinet go and stops operating it. The
   records are cleared only by a deed-holder session that may operate the
   machine by the election's rule: the one holding its lease, or one that
-  could take it over. That session pays the chips still inside to the deed
-  holder and deletes every key (including any `pusher-esc:` records an
-  earlier revision left, which credit nothing), in one transaction
-  (`drainAndClearCoinPusher`). Every settle happens on the lease holder, so
+  could take it over. In one transaction (`drainAndClearCoinPusher`) that
+  session pays the chips still inside to the deed holder and deletes the
+  machine's own keys, a fixed few. Its per-player keys (requests, answers,
+  and any `pusher-esc:` records an earlier revision left) carry no chips.
+  They are then swept a batch of 64 per frame through the index, so a flood
+  of them can't stall a frame. Every settle happens on the lease holder, so
   the drain never merges with a drop another tab is still settling (that
   would bring the machine back and pay its chips twice). Another
   deed-holder session keeps the teardown pending, and finishes it only if the
   operator goes away still holding the lease (after the same wait as a
-  takeover). A cabinet put back first is left alone, and a pending teardown
-  is dropped if the session moves to another room's doc, so it never touches
-  a cabinet there. The recipient is the caller's own
+  takeover). A cabinet put back first is left alone (its sweep stops too),
+  and a pending teardown or sweep is dropped if the session moves to another
+  room's doc, so it never touches either room's doc again. The recipient is the caller's own
   identity, never the owner named in the peer-writable machine, so chips only
   ever leave the machine to the player whose drop pushed them or to the
   operator itself — forging the machine can't pay the forger.
