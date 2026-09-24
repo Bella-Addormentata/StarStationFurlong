@@ -117,7 +117,10 @@ export function gangwayPartRefusal(hasPort: boolean): string | null {
  * whatever the two clients' clocks say.
  */
 export function stampAfter(after: number | undefined, now = Date.now()): number {
-  return typeof after === 'number' && Number.isFinite(after) && after >= now ? after + 1 : now;
+  // Only a safe integer can be stepped past (the sanitizer admits no other);
+  // at the very top of that range the stamp can only hold, never overflow.
+  if (typeof after !== 'number' || !Number.isSafeInteger(after) || after < now) return now;
+  return Math.min(after + 1, Number.MAX_SAFE_INTEGER);
 }
 
 /** What an UNDOCK remembers of the berth it releases. */

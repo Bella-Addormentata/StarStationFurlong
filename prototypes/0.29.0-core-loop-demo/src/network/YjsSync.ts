@@ -78,6 +78,18 @@ function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/** Does `p` settle (either way) within `ms`? Never rejects; clears its timer. */
+function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    const done = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    p.then(done, done);
+  });
+}
+
 export class YjsSync {
   readonly doc: Y.Doc;
   /**
@@ -225,11 +237,15 @@ export class YjsSync {
    * a SyncStep1 from its replica, and the writes went out first on the same
    * ordered stream (flush() runs before the probe is emitted, so signing
    * cannot reorder them) — they are in that reply iff the node applied them.
-   * False on timeout. Additive: no other path changes behaviour.
+   * False on timeout — and the deadline covers the flush as well: a transport
+   * whose write never completes must not hold the caller (a far session, and
+   * with it that room's queue) past `timeoutMs`. Additive: no other path
+   * changes behaviour.
    */
   async confirmOwnWrites(since: Uint8Array, timeoutMs = 5000): Promise<boolean> {
     if (!this.#active || !this.#writer) return false;
-    await this.flush();
+    const deadline = Date.now() + timeoutMs;
+    if (!(await settlesWithin(this.flush(), timeoutMs))) return false;
     const me = this.doc.clientID;
     return new Promise<boolean>((resolve) => {
       let settled = false;
@@ -251,7 +267,7 @@ export class YjsSync {
         if (mine) finish(true);
       };
       this.#ackWaiters.push(waiter);
-      timer = setTimeout(() => finish(false), timeoutMs);
+      timer = setTimeout(() => finish(false), Math.max(0, deadline - Date.now()));
       void this.#emitEnvelope('ysync', this.#packYSyncPayload(0, 0, since));
     });
   }

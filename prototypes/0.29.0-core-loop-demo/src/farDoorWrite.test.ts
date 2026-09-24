@@ -361,8 +361,9 @@ const b64 = (u: Uint8Array) => btoa(String.fromCharCode(...u));
 const unb64 = (s: string) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
 
 /** A node holding `nodeDoc`: applies Updates (unless `dropUpdates`), answers
- *  every SyncStep1 with a SyncStep2 from its replica, in stream order. */
-function fakeNode(nodeDoc: Y.Doc, opts: { dropUpdates?: boolean } = {}) {
+ *  every SyncStep1 with a SyncStep2 from its replica, in stream order. With
+ *  `wedge.on`, every write from then on never completes (a stuck transport). */
+function fakeNode(nodeDoc: Y.Doc, opts: { dropUpdates?: boolean; wedge?: { on: boolean } } = {}) {
   let toClient!: ReadableStreamDefaultController<Uint8Array>;
   const readable = new ReadableStream<Uint8Array>({ start: (c) => { toClient = c; } });
   let pending = new Uint8Array(0);
@@ -376,6 +377,7 @@ function fakeNode(nodeDoc: Y.Doc, opts: { dropUpdates?: boolean } = {}) {
   };
   const writable = new WritableStream<Uint8Array>({
     write: (chunk) => {
+      if (opts.wedge?.on) return new Promise<void>(() => {});
       const merged = new Uint8Array(pending.length + chunk.length);
       merged.set(pending);
       merged.set(chunk, pending.length);
@@ -400,7 +402,7 @@ function fakeNode(nodeDoc: Y.Doc, opts: { dropUpdates?: boolean } = {}) {
 }
 
 describe('YjsSync.confirmOwnWrites — the far write\'s acknowledgment', () => {
-  const connected = async (nodeDoc: Y.Doc, opts?: { dropUpdates?: boolean }) => {
+  const connected = async (nodeDoc: Y.Doc, opts?: { dropUpdates?: boolean; wedge?: { on: boolean } }) => {
     // bootRecord supplied, so the envelope builder never reaches for `window`.
     const sync = new YjsSync({ roomId: 'r', channel: fakeNode(nodeDoc, opts), bootRecord: () => ({}) });
     await sync.start();
@@ -427,5 +429,17 @@ describe('YjsSync.confirmOwnWrites — the far write\'s acknowledgment', () => {
     expect(await sync.confirmOwnWrites(since, 150)).toBe(false);
     expect(readAllDoorsFrom(nodeDoc).get('d:bay')?.paired).toBe(true);
     await sync.stop();
+  });
+
+  it('times out false even when the write itself never leaves (the deadline covers the flush)', async () => {
+    const wedge = { on: false };
+    const sync = await connected(stationDoc(), { wedge });
+    wedge.on = true; // from here the transport swallows every write, forever
+    const since = Y.encodeStateVector(sync.doc);
+    sync.doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 1 }));
+    const started = Date.now();
+    expect(await sync.confirmOwnWrites(since, 150)).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    void sync.stop(); // its close waits on the wedged writes — never awaited
   });
 });

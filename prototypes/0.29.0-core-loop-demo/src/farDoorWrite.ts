@@ -155,6 +155,9 @@ const ACK_TIMEOUT_MS = 5_000;
 const SETTLE_MS = 1_500;
 /** Re-ask for state this often while waiting (a cross-node host links late). */
 const RESYNC_EVERY_MS = 2_000;
+/** The longest one far session may take, end to end (boundedSession). Every
+ *  step it waits on is bounded, with room to spare for a slow dial. */
+const SESSION_DEADLINE_MS = 60_000;
 
 /** One far write at a time per far room. */
 const queues = new Map<string, Promise<unknown>>();
@@ -172,7 +175,7 @@ export function writeFarDock(req: FarDockRequest, near: NearEnd): Promise<FarDoc
   // client stands in (sameRoomWrite); anything else needs a session.
   const write = imported.roomId === near.roomId
     ? () => sameRoomWrite(d, req, near)
-    : () => session(d, imported, req, near);
+    : () => boundedSession(d, imported, req, near);
   const key = imported.roomId;
   const prior = queues.get(key) ?? Promise.resolve();
   const run = prior.then(write, write);
@@ -207,11 +210,41 @@ async function sameRoomWrite(
   return berthAfterSettle(doc, req, near) ?? result;
 }
 
+/**
+ * A far session under one overall deadline. Each step inside is bounded, but a
+ * transport can still wedge where no step expects it (a channel that never
+ * opens, a write that never completes). Past the deadline the caller hears
+ * `unreachable`, this room's queue moves on — and the session, should it ever
+ * wake, is barred from writing (it checks `late` right before its decision).
+ */
+function boundedSession(
+  d: FarDoorWriteDeps,
+  imported: RoomBootstrap,
+  req: FarDockRequest,
+  near: NearEnd,
+): Promise<FarDockResult> {
+  let late = false;
+  return new Promise<FarDockResult>((resolve) => {
+    const timer = setTimeout(() => {
+      late = true;
+      console.warn(
+        `[farDoorWrite] ${imported.roomId}: no outcome within ${SESSION_DEADLINE_MS} ms — abandoned`,
+      );
+      resolve({ ok: false, reason: 'unreachable' });
+    }, SESSION_DEADLINE_MS);
+    void session(d, imported, req, near, () => late).then((result) => {
+      clearTimeout(timer);
+      resolve(result);
+    });
+  });
+}
+
 async function session(
   d: FarDoorWriteDeps,
   imported: RoomBootstrap,
   req: FarDockRequest,
   near: NearEnd,
+  abandoned: () => boolean,
 ): Promise<FarDockResult> {
   let provider: NetworkProvider | null = null;
   let sync: YjsSync | null = null;
@@ -261,6 +294,9 @@ async function session(
       );
       return { ok: false, reason: 'unreachable' };
     }
+    // The caller has already been told `unreachable`: it must not now find a
+    // write it was never told about.
+    if (abandoned()) return { ok: false, reason: 'unreachable' };
     // Read-before-write: the decision sees the far room's real state, so the
     // write is causally AFTER the record it replaces and wins everywhere.
     const since = Y.encodeStateVector(s.doc);
@@ -290,16 +326,21 @@ async function session(
     console.warn('[farDoorWrite] far room session failed:', err);
     return { ok: false, reason: 'unreachable' };
   } finally {
-    try {
-      await sync?.stop();
-    } catch {
-      /* the doc may be gone */
-    }
-    try {
-      await provider?.disconnect();
-    } catch {
-      /* the transport may be gone */
-    }
+    // Hang up WITHOUT holding the result: it is decided, and a transport that
+    // wedges on close must not keep the caller (or this room's queue) waiting.
+    const closing = { sync, provider };
+    void (async () => {
+      try {
+        await closing.sync?.stop();
+      } catch {
+        /* the doc may be gone */
+      }
+      try {
+        await closing.provider?.disconnect();
+      } catch {
+        /* the transport may be gone */
+      }
+    })();
   }
 }
 

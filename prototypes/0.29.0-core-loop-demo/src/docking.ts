@@ -98,7 +98,6 @@ import {
   deleteDoorPairing,
   writeDoorTombstone,
   writeDoorPairing,
-  readAllDoors,
   readDoor,
   transactDoorWrites,
 } from "./doorsDoc";
@@ -1456,7 +1455,9 @@ export class DoorDockingPortSystem {
           // room's far end, is refused here (the arrival refuses it too, but by
           // then the near record is published and the tube is drawn).
           {
-            const own = readAllDoors().get(activeDoorId);
+            // ⚓ #163: this one door, read itself — never through the capped
+            // snapshot, which could hide a live dock that doorHasPort sees.
+            const own = readDoor(activeDoorId);
             if (
               own?.paired &&
               own.connectedRoomAddress &&
@@ -2251,7 +2252,7 @@ export class DoorDockingPortSystem {
     // compass guess that happens to name the open door (review, round 9).
     // Offered greyed-out and unselectable, never as a target — this list used
     // to be exactly the set of doors that must not take a second vestibule.
-    const ownRec = readAllDoors().get(doorId);
+    const ownRec = readDoor(doorId); // ⚓ #163: uncapped, like every named-door read
     const ownTarget =
       ownRec?.paired && ownRec.connectedRoomAddress
         ? roomIdFromSeed(ownRec.connectedRoomAddress)
@@ -3529,7 +3530,9 @@ export class DoorDockingPortSystem {
     // Either way the existing connection is untouched: the local state is
     // restored from the record and the request simply cannot land here.
     {
-      const own = readAllDoors().get(doorId);
+      // ⚓ #163: this one door, read itself — the capped snapshot could hide
+      // the live connection this guard exists to protect.
+      const own = readDoor(doorId);
       if (
         own?.paired &&
         own.connectedRoomAddress &&

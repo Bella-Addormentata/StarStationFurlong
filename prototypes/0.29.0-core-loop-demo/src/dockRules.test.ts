@@ -245,6 +245,25 @@ describe('dockRules — undock memory and re-dock', () => {
     expect(stampAfter(900, 500)).toBe(901); // this client's clock trails the other's
     expect(stampAfter(500, 500)).toBe(501); // equal is not after
     expect(stampAfter(Number.NaN, 500)).toBe(500);
+    // Past 2^53 `+ 1` is a no-op (and MAX_VALUE is no stamp at all): ignored,
+    // and the very top of the safe range holds instead of overflowing.
+    expect(stampAfter(Number.MAX_VALUE, 500)).toBe(500);
+    expect(stampAfter(Number.MAX_SAFE_INTEGER, 500)).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('stamps outside the safe-integer range are junk at the read boundary', () => {
+    const doc = new Y.Doc();
+    const doors = doc.getMap('doors');
+    doors.set('d:a', { paired: true, connectedRoomAddress: 'x', segments: dockChain(), dockedAt: Number.MAX_VALUE });
+    doors.set('d:b', { paired: false, retiredAddress: 'x', dock: { undockedAt: 2 ** 60 } });
+    doors.set('d:c', { paired: true, connectedRoomAddress: 'x', segments: dockChain(), dockedAt: 1.5 });
+    const read = readAllDoorsFrom(doc);
+    const a = read.get('d:a');
+    expect(a?.paired && a.dockedAt).toBeUndefined();
+    const b = read.get('d:b');
+    expect(b && !b.paired && b.dock).toBeUndefined(); // no usable stamp ⇒ no berth memory
+    const c = read.get('d:c');
+    expect(c?.paired && c.dockedAt).toBeUndefined();
   });
 
   it('an UNDOCK stamped by a trailing clock still releases the far end, and bars the mirror', () => {

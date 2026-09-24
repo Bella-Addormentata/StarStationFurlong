@@ -222,12 +222,14 @@ function sanitizeDoorGeometry(r: DoorRecord): DoorRecord {
   return out;
 }
 
-/** A writer-clock stamp we will compare: finite and positive. (No future
- *  bound: a peer inflating its own stamp only makes its OWN dock look newer
- *  than an undock of that same door — the posture of every honest-client
- *  record here, #67 D3.) */
+/** A writer-clock stamp we will compare: a positive SAFE integer (epoch ms
+ *  always is). Past 2^53 `+ 1` stops changing the value, so stampAfter could
+ *  no longer make a later event read as later — anything out there is junk.
+ *  (No future bound: a peer inflating its own stamp only makes its OWN dock
+ *  look newer than an undock of that same door — the posture of every
+ *  honest-client record here, #67 D3.) */
 function isSaneStamp(v: unknown): v is number {
-  return typeof v === 'number' && Number.isFinite(v) && v > 0;
+  return typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
 }
 
 /** ⚓ Shape-check a tombstone's berth memory: the stamp is required (it is what
