@@ -253,13 +253,41 @@ export interface VatFloorBox {
   z1: number;
 }
 
+/** Half the vat's 2×2 footprint (furniture.ts FURNITURE_DEFS["clone-vat"]). */
+export const VAT_FOOTPRINT_HALF = 1;
+
+/** Is (x, z) off-limits for a player of collision radius `radius`: outside
+ *  the walkable box, or inside an obstacle inflated by the radius? */
+function spotBlocked(
+  x: number,
+  z: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+  skip?: (b: VatFloorBox) => boolean,
+): boolean {
+  if (Math.abs(x) > bounds.boundX + 1e-9 || Math.abs(z) > bounds.boundZ + 1e-9) {
+    return true;
+  }
+  return obstacles.some(
+    (b) =>
+      !skip?.(b) &&
+      x > b.x0 - radius &&
+      x < b.x1 + radius &&
+      z > b.z0 - radius &&
+      z < b.z1 + radius,
+  );
+}
+
 /**
  * How far out (metres from the vat axis) the scripted walk-out can go in
  * this room: VAT_EXIT_ALONG when the whole path is free, else the last free
  * spot (5 cm steps) before the path leaves the walkable box or comes within
  * `radius` of another obstacle — a movable vat can face a wall or furniture.
- * The vat's own footprint (the box around its axis) is where the walk
- * starts, so it is ignored. Never less than the plinth lip.
+ * The vat's own footprint is where the walk starts, so it is ignored along
+ * the way; but the end must clear it too (VAT_FOOTPRINT_HALF + radius out)
+ * to be a genuinely collision-free spot. null when the path is blocked
+ * before that — no walk-out can end anywhere valid (vatFallbackRelease).
  */
 export function vatFreeExitAlong(
   centre: { x: number; z: number },
@@ -267,32 +295,44 @@ export function vatFreeExitAlong(
   obstacles: readonly VatFloorBox[],
   bounds: { boundX: number; boundZ: number },
   radius: number,
-): number {
+): number | null {
   const dirX = Math.sin(facing);
   const dirZ = Math.cos(facing);
   const isOwn = (b: VatFloorBox) =>
     centre.x > b.x0 && centre.x < b.x1 && centre.z > b.z0 && centre.z < b.z1;
-  const blocked = (along: number) => {
+  let free: number | null = null;
+  for (let along = VAT_PLINTH_R; ; along = Math.min(VAT_EXIT_ALONG, along + 0.05)) {
     const x = centre.x + dirX * along;
     const z = centre.z + dirZ * along;
-    if (Math.abs(x) > bounds.boundX + 1e-9 || Math.abs(z) > bounds.boundZ + 1e-9) {
-      return true;
-    }
-    return obstacles.some(
-      (b) =>
-        !isOwn(b) &&
-        x > b.x0 - radius &&
-        x < b.x1 + radius &&
-        z > b.z0 - radius &&
-        z < b.z1 + radius,
-    );
-  };
-  let free = VAT_PLINTH_R;
-  for (let along = VAT_PLINTH_R; ; along = Math.min(VAT_EXIT_ALONG, along + 0.05)) {
-    if (blocked(along)) return free;
+    if (spotBlocked(x, z, obstacles, bounds, radius, isOwn)) break;
     free = along;
-    if (along >= VAT_EXIT_ALONG) return free;
+    if (along >= VAT_EXIT_ALONG) break;
   }
+  return free !== null && free >= VAT_FOOTPRINT_HALF + radius ? free : null;
+}
+
+/**
+ * Where a clone steps out when its door path is blocked (vatFreeExitAlong
+ * gave null): the nearest collision-free spot around the vat — rings from
+ * just clear of its footprint outward, door side first — or null when the
+ * room has no free spot within 4 m.
+ */
+export function vatFallbackRelease(
+  centre: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): { x: number; z: number } | null {
+  for (let r = VAT_FOOTPRINT_HALF + radius + 0.05; r <= 4; r += 0.25) {
+    for (let k = 0; k < 16; k++) {
+      const turn = (k % 2 === 1 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
+      const x = centre.x + Math.sin(facing + turn) * r;
+      const z = centre.z + Math.cos(facing + turn) * r;
+      if (!spotBlocked(x, z, obstacles, bounds, radius)) return { x, z };
+    }
+  }
+  return null;
 }
 
 /** Root height while walking out: on the pad inside, easing down off the

@@ -27,7 +27,9 @@ import {
   VAT_Q_NECK,
   VAT_TANK_H,
   vatClearOfDoorAt,
+  VAT_FOOTPRINT_HALF,
   vatDoorClear,
+  vatFallbackRelease,
   vatFloorY,
   vatFreeExitAlong,
   vatGaugeAt,
@@ -207,23 +209,44 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
 
   it('stops inside the walkable box when the vat faces a wall', () => {
     // A 2×2 vat against the south placement edge, door facing the wall.
-    const end = vatFreeExitAlong({ x: 0, z: 4 }, 0, [box(0, 4, 1, 1)], ROOM, R);
+    const end = vatFreeExitAlong({ x: 0, z: 4 }, 0, [box(0, 4, 1, 1)], ROOM, R)!;
     expect(4 + end).toBeLessThanOrEqual(ROOM.boundZ);
-    expect(end).toBeGreaterThan(1); // still out past the footprint
+    // Clear of the vat's own collision box, not just past its footprint.
+    expect(end).toBeGreaterThanOrEqual(VAT_FOOTPRINT_HALF + R);
     expect(end).toBeLessThan(VAT_EXIT_ALONG);
   });
 
   it('stops a collision radius short of furniture across the path', () => {
-    // Door facing +x (rot 1); a 1×1 item 1.6–2.6 m out along the path.
-    const blocker = box(2.1, 0, 0.5, 0.5);
-    const end = vatFreeExitAlong({ x: 0, z: 0 }, Math.PI / 2, [box(0, 0, 1, 1), blocker], ROOM, R);
+    // Door facing +x (rot 1); a 1×1 item 1.9–2.9 m out along the path.
+    const blocker = box(2.4, 0, 0.5, 0.5);
+    const end = vatFreeExitAlong({ x: 0, z: 0 }, Math.PI / 2, [box(0, 0, 1, 1), blocker], ROOM, R)!;
     expect(end).toBeLessThanOrEqual(blocker.x0 - R);
     expect(end).toBeGreaterThan(blocker.x0 - R - 0.06);
   });
 
-  it('never ends inside the tank, even when the doorway is blocked', () => {
-    const end = vatFreeExitAlong({ x: 0, z: 0 }, 0, [box(0, 0, 1, 1), box(0, 1.5, 1, 0.5)], ROOM, R);
-    expect(end).toBe(VAT_PLINTH_R);
+  it('gives no walk-out end when the doorway itself is blocked', () => {
+    // Furniture flush against the door face; or one only just too close.
+    const own = box(0, 0, 1, 1);
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, box(0, 1.5, 1, 0.5)], ROOM, R)).toBeNull();
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, box(0, 2.2, 1, 0.5)], ROOM, R)).toBeNull();
+  });
+
+  it('then steps the clone out at the nearest free spot, door side first', () => {
+    const own = box(0, 0, 1, 1);
+    const blocker = box(0, 1.5, 1, 0.5); // x[-1,1] z[1,2] across the door
+    const obstacles = [own, blocker];
+    const spot = vatFallbackRelease({ x: 0, z: 0 }, 0, obstacles, ROOM, R)!;
+    for (const b of obstacles) {
+      const inside =
+        spot.x > b.x0 - R && spot.x < b.x1 + R && spot.z > b.z0 - R && spot.z < b.z1 + R;
+      expect(inside).toBe(false);
+    }
+    expect(Math.abs(spot.x)).toBeLessThanOrEqual(ROOM.boundX);
+    expect(Math.abs(spot.z)).toBeLessThanOrEqual(ROOM.boundZ);
+    expect(spot.z).toBeGreaterThan(0); // still on the door's side of the vat
+    // A room with nowhere free gives no spot rather than an overlapping one.
+    const full = box(0, 0, 6, 6);
+    expect(vatFallbackRelease({ x: 0, z: 0 }, 0, [full], ROOM, R)).toBeNull();
   });
 
   it('is unobstructed for the default vat in the default lobby', () => {
@@ -237,7 +260,10 @@ describe('2×2 clone vat in the default layout', () => {
   const vat = FURNITURE.find((i) => i.id === 'clone-vat')!;
 
   it('has a 2×2 footprint and sits centred on a lattice 2×2 square', () => {
-    expect(FURNITURE_DEFS['clone-vat'].footprint).toEqual({ w: 2, d: 2 });
+    expect(FURNITURE_DEFS['clone-vat'].footprint).toEqual({
+      w: 2 * VAT_FOOTPRINT_HALF,
+      d: 2 * VAT_FOOTPRINT_HALF,
+    });
     expect(snapItemPos('clone-vat', vat.rot, vat.pos.x, vat.pos.z)).toEqual(vat.pos);
     const box = itemAabb(vat)!;
     expect(box.x1 - box.x0).toBe(2);

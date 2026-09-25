@@ -75,6 +75,7 @@ import {
   VAT_HOLD_ALONG,
   vatClearOfDoorAt,
   vatDoorClear,
+  vatFallbackRelease,
   vatFloorY,
   vatFreeExitAlong,
   vatSqueezeAt,
@@ -2524,19 +2525,27 @@ export class Player {
    * and easing back to full size in the room. The walk ends at
    * VAT_EXIT_ALONG, or sooner where a wall or other furniture cuts the path
    * short (vatFreeExitAlong) — the clone then eases to full size where it
-   * stands. Returns false when the HOLD was already released (its seal has
-   * fired), so the caller knows no walk-out follows.
+   * stands. If the path is blocked right at the doorway, the clone steps
+   * out at the nearest free spot around the vat instead (_placeClearOfVat).
+   * Returns false when the HOLD was already released (its seal has fired),
+   * so the caller knows no walk-out follows.
    */
   public walkOutOfVat(): boolean {
     if (this.vatPhase !== "HOLD") return false; // released meanwhile
-    this.vatPhase = "WALK_OUT";
-    this.vatExitAlong = vatFreeExitAlong(
+    const exit = vatFreeExitAlong(
       this.vatCentre,
       this.vatFacing,
       OBSTACLES,
       this.roomBounds(),
       PLAYER_R,
     );
+    if (exit === null) {
+      this._placeClearOfVat(null);
+      this._releaseVat(); // the door shuts once the clone is clear of it
+      return true;
+    }
+    this.vatPhase = "WALK_OUT";
+    this.vatExitAlong = exit;
     return true;
   }
 
@@ -2585,6 +2594,29 @@ export class Player {
   }
 
   /**
+   * Stand the clone somewhere collision-free outside the vat: `along` metres
+   * out on its door path when there is one (vatFreeExitAlong), else the
+   * nearest free spot around the vat, door side first (vatFallbackRelease);
+   * in a room with neither, it stays put.
+   */
+  private _placeClearOfVat(along: number | null): void {
+    if (along !== null) {
+      this._applyVatPose(along);
+      return;
+    }
+    const spot = vatFallbackRelease(
+      this.vatCentre,
+      this.vatFacing,
+      OBSTACLES,
+      this.roomBounds(),
+      PLAYER_R,
+    );
+    if (!spot) return;
+    this.mesh.position.x = spot.x;
+    this.mesh.position.z = spot.z;
+  }
+
+  /**
    * Stand the clone `along` metres out from the vat's axis toward its door:
    * on the pad or the floor (stepping down off the plinth lip) and scaled to
    * the hourglass gauge there — plan scale on x/z, height scale on y.
@@ -2605,7 +2637,7 @@ export class Player {
         // Watchdog: the vat never opened (handle lost mid-cycle?) — step the
         // clone out in front of the door rather than soft-locking the session
         // (or leaving it inside the glass); the vat, still shut, seals.
-        this._applyVatPose(
+        this._placeClearOfVat(
           vatFreeExitAlong(
             this.vatCentre,
             this.vatFacing,
