@@ -855,7 +855,13 @@ export function clearSlotMachineKeys(machineId: string): void {
 // every read shape-guards so junk in these keys reads as "no machine". Chips
 // only ever leave the machine to the player whose drop pushed them or to the
 // operator itself (the door, a removed cabinet) — never to a party named in a
-// peer-writable record, so forging the machine can't pay the forger.
+// peer-writable record, so forging the machine can't pay the forger. Nor are
+// the requests authenticated: like every key in this map, a peer can write a
+// request naming another player (a drop at that player's cost, paid to that
+// player) or a door request naming the owner (the owner's own chips, back to
+// the owner). That is no more than writing that player's `bal:` directly,
+// which any peer can already do; authenticated accounts come with the
+// Registry chips.
 //
 // PARTITIONS: the operator lease is a Y.Map record, not a mutex; see
 // pusherCroupier.ts for how a second session of the same deed holder is kept

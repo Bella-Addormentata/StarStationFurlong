@@ -503,11 +503,12 @@ describe('tickCoinPusherRoom', () => {
   });
 
   it('honors a lease record for one lease term at most, however far ahead it claims to run', () => {
-    // A peer-written lease with a far-future expiry, from someone else…
-    writeCoinPusherOperatorLease({ playerId: OTHER, sessionId: 'rogue:tab', expiresAt: Number.MAX_VALUE });
+    // A peer-written lease with a far-future expiry, claiming this device…
+    const device = coinPusherOperatorSession().split(':')[0];
+    writeCoinPusherOperatorLease({ playerId: OTHER, sessionId: `${device}:rogue-tab`, expiresAt: Number.MAX_VALUE });
     tickCoinPusherRoom([MACHINE], NOW);
     tickCoinPusherRoom([MACHINE], NOW + 7_999);
-    expect(readCoinPusherOperatorLease()?.sessionId).toBe('rogue:tab');
+    expect(readCoinPusherOperatorLease()?.sessionId).toBe(`${device}:rogue-tab`);
     tickCoinPusherRoom([MACHINE], NOW + 8_000);
     expect(readCoinPusherOperatorLease()?.sessionId).toBe(coinPusherOperatorSession());
   });
@@ -530,16 +531,21 @@ describe('tickCoinPusherRoom', () => {
     writeCoinPusherOperatorLease(rogue);
     tickCoinPusherRoom([MACHINE], NOW + 100_000);
     expect(readCoinPusherOperatorLease()?.sessionId).toBe('rogue:tab');
-    tickCoinPusherRoom([MACHINE], NOW + 100_000 + 8_000);
+    tickCoinPusherRoom([MACHINE], NOW + 100_000 + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS - 1);
+    expect(readCoinPusherOperatorLease()?.sessionId).toBe('rogue:tab');
+    tickCoinPusherRoom([MACHINE], NOW + 100_000 + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS);
     expect(readCoinPusherOperatorLease()?.sessionId).toBe(coinPusherOperatorSession());
   });
 
-  it('a lease of someone else (a previous deed holder) is taken one term after this page last saw it renewed', () => {
+  it('treats another device\'s lease as the deed holder\'s own, whatever player id it names', () => {
+    // An install that restored the deed holder's identity key has a player
+    // id of its own, and it may only be cut off from us.
     writeCoinPusherOperatorLease({ playerId: OTHER, sessionId: 'their-device:tab', expiresAt: NOW + 5_000 });
     tickCoinPusherRoom([MACHINE], NOW);
-    tickCoinPusherRoom([MACHINE], NOW + 7_999);
+    tickCoinPusherRoom([MACHINE], NOW + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS - 1);
     expect(readCoinPusherOperatorLease()?.playerId).toBe(OTHER);
-    tickCoinPusherRoom([MACHINE], NOW + 8_000);
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    tickCoinPusherRoom([MACHINE], NOW + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS);
     expect(readCoinPusherOperatorLease()?.playerId).toBe(OPERATOR);
   });
 

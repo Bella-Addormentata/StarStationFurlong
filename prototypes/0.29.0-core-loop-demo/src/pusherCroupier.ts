@@ -21,8 +21,10 @@
  * survives where both debited it). Settling can't be made partition-safe
  * without an authoritative ledger (the Registry-anchored chips), so the rule
  * here keeps a second operator from ever starting while the first may only be
- * cut off: a session of the SAME deed holder on ANOTHER device may take over a
- * lapsed lease only after OPERATOR_UNCLEAN_TAKEOVER_MS more. Tabs on one
+ * cut off: a session on ANOTHER device may take over a lapsed lease only after
+ * OPERATOR_UNCLEAN_TAKEOVER_MS more. (Only the deed holder operates, so
+ * another device's lease is the deed holder's own, whatever player id it
+ * names: an install that restored their identity key has its own.) Tabs on one
  * device share its local node, so they take over as soon as the lease lapses
  * (a reload, a closed tab); a session that stops operating releases its lease
  * so a successor needn't wait. Only a split outlasting that window can still
@@ -204,16 +206,13 @@ function isThisDevice(lease: CoinPusherOperatorLease): boolean {
 }
 
 /** Earliest time this session may take `lease` over: when it lapses, plus
- *  the split window for another device of the same deed holder (SPLITS). */
-function takeoverAt(
-  lease: CoinPusherOperatorLease,
-  playerId: string,
-  now: number,
-): number {
+ *  the split window when it is another device's (SPLITS). Only the deed
+ *  holder operates, so a lease from another device is the deed holder's own,
+ *  whatever player id it names: an install that restored the deed holder's
+ *  identity key has a player id of its own. */
+function takeoverAt(lease: CoinPusherOperatorLease, now: number): number {
   const lapsesAt = leaseLapsesAt(lease, now);
-  return lease.playerId === playerId && !isThisDevice(lease)
-    ? lapsesAt + OPERATOR_UNCLEAN_TAKEOVER_MS
-    : lapsesAt;
+  return isThisDevice(lease) ? lapsesAt : lapsesAt + OPERATOR_UNCLEAN_TAKEOVER_MS;
 }
 
 /** The room's coin-pusher operator as this page can tell it: none with a
@@ -329,7 +328,7 @@ function electCoinPusherOperator(lease: CoinPusherOperatorLease | null, now: num
     || operator.docEpoch !== casinoDocEpoch()
     || operator.playerId !== playerId) {
     if (lease && lease.sessionId !== operatorSessionId
-      && now < takeoverAt(lease, playerId, now)) return null;
+      && now < takeoverAt(lease, now)) return null;
     writeCoinPusherOperatorLease({
       playerId,
       sessionId: operatorSessionId,
@@ -499,7 +498,7 @@ function tearDownIfFree(machineId: string, now: number): void {
   const playerId = getPlayerId();
   const lease = readCoinPusherOperatorLease();
   if (lease && lease.sessionId !== operatorSessionId
-    && now < takeoverAt(lease, playerId, now)) return;
+    && now < takeoverAt(lease, now)) return;
   pendingTeardowns.delete(machineId);
   // The chips and the machine's own keys go in one transaction; its
   // per-player keys (no chips in any) follow a batch per frame.

@@ -156,18 +156,20 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   Registry-anchored chips), and reconciling afterwards from receipts would
   only move the problem (a forged receipt would pay its writer). So the rule
   is to never start a second operator while the first may only be cut off:
-  another *device* of the same deed holder takes over a lapsed lease only
-  after a further 60 s; tabs on one device share its local node and take over
-  as soon as the lease lapses; a session that stops operating releases its
-  lease, including when it leaves the room (before the room's doc goes, the
-  release sent first) and when the page closes. A session that finds its own
-  lease lapsed (a tab that got no frames for a while) clears the record at
-  once and takes the lease afresh on the next frame, so a page leaving in
-  between leaves no record of its own for a successor to wait out. While it
-  leaves the room, it operates and watches nothing more in that room, so no
-  frame takes a lease back as the release goes out, and the room's lease
-  observation, pending teardowns and sweeps go with it. Only a split
-  outlasting that window can still put two operators in one room.
+  another *device* takes over a lapsed lease only after a further 60 s (only
+  the deed holder operates, so another device's lease is the deed holder's
+  own, whatever player id it names: an install that restored their identity
+  key has its own); tabs on one device share its local node and take over as
+  soon as the lease lapses; a session that stops operating releases its lease,
+  including when it leaves the room (before the room's doc goes, the release
+  sent first) and when the page closes. A session that finds its own lease
+  lapsed (a tab that got no frames for a while) clears the record at once and
+  takes the lease afresh on the next frame, so a page leaving in between
+  leaves no record of its own for a successor to wait out. While it leaves the
+  room, it operates and watches nothing more in that room, so no frame takes a
+  lease back as the release goes out, and the room's lease observation,
+  pending teardowns and sweeps go with it. Only a split outlasting that window
+  can still put two operators in one room.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). The chips inside stay put and go with the room, like its furniture.
@@ -244,6 +246,13 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   casino map: the operator is trusted to run the physics honestly, and every
   read shape-guards so junk in these keys reads as "no machine" (including a
   machine whose own ledger doesn't balance, or with a pile off its platform).
+  The requests aren't authenticated either. Like every key in the map, a
+  peer can write a request naming another player (a drop at that player's
+  cost, paid to that player, never to the writer) or a door request naming
+  the owner (the owner's own chips, back to the owner). That is no more than
+  writing the player's `bal:` directly, which any peer can already do (the
+  sync layer checks who sent an update, not which keys the sender may
+  write). Authenticated accounts come with the Registry chips.
 
 ## Conservation invariant
 
