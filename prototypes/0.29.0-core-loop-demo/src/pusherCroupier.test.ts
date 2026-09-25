@@ -9,6 +9,7 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  clearCoinPusherOperatorLease,
   drainAndClearCoinPusher,
   PUSHER_SWEEP_BATCH,
   readChips,
@@ -45,6 +46,7 @@ import { getPlayerId } from './identity';
 import {
   closeCoinPusher,
   coinPusherOperatorSession,
+  coinPusherOperatorState,
   coinPusherWatchCount,
   isCoinPusherOperator,
   isCoinPusherOperatorLive,
@@ -339,6 +341,44 @@ describe('tickCoinPusherMachine', () => {
     // Its own lease is judged by its own clock: live until it expires.
     expect(isCoinPusherOperatorLive(MACHINE, NOW + 7_999)).toBe(true);
     expect(isCoinPusherOperatorLive(MACHINE, NOW + 8_000)).toBe(false);
+  });
+
+  it('shows its own machine starting up until its settling wait is over', () => {
+    // A record naming this session while it operates nothing (a leftover, or
+    // forged) has no one at work behind it.
+    writeCoinPusherOperatorLease(MACHINE, { playerId: OPERATOR, sessionId: coinPusherOperatorSession(), expiresAt: NOW + 8_000 });
+    expect(coinPusherOperatorState(MACHINE, NOW)).toBe('offline');
+    tickCoinPusherMachine(MACHINE, NOW);
+    expect(coinPusherOperatorState(MACHINE, NOW + 1_999)).toBe('starting');
+    expect(coinPusherOperatorState(MACHINE, NOW + 2_000)).toBe('ready');
+  });
+
+  it('tells a player the operator is starting up until its settling wait is over', () => {
+    setSoleCroupierPredicate(() => false); // a player at the cabinet
+    const lease = (t: number, sessionId = 'their-device:tab') =>
+      writeCoinPusherOperatorLease(MACHINE, { playerId: OTHER, sessionId, expiresAt: t + 8_000 });
+    lease(NOW);
+    tickCoinPusherMachine(MACHINE, NOW); // first seen held now
+    // A drop made now would reach an operator that doesn't work yet.
+    expect(coinPusherOperatorState(MACHINE, NOW + 1_999)).toBe('starting');
+    expect(coinPusherOperatorState(MACHINE, NOW + 2_000)).toBe('ready');
+    // A renewal is the same holder: still ready.
+    lease(NOW + 3_000);
+    tickCoinPusherMachine(MACHINE, NOW + 3_000);
+    expect(coinPusherOperatorState(MACHINE, NOW + 3_001)).toBe('ready');
+    // Another session taking over starts its own wait.
+    lease(NOW + 4_000, 'their-other-device:tab');
+    tickCoinPusherMachine(MACHINE, NOW + 4_000);
+    expect(coinPusherOperatorState(MACHINE, NOW + 5_999)).toBe('starting');
+    expect(coinPusherOperatorState(MACHINE, NOW + 6_000)).toBe('ready');
+    // So does the same session taking it again after letting it go.
+    clearCoinPusherOperatorLease(MACHINE);
+    tickCoinPusherMachine(MACHINE, NOW + 7_000);
+    expect(coinPusherOperatorState(MACHINE, NOW + 7_000)).toBe('offline');
+    lease(NOW + 7_500, 'their-other-device:tab');
+    tickCoinPusherMachine(MACHINE, NOW + 7_500);
+    expect(coinPusherOperatorState(MACHINE, NOW + 9_499)).toBe('starting');
+    expect(coinPusherOperatorState(MACHINE, NOW + 9_500)).toBe('ready');
   });
 
   it('another tab on this device takes over as soon as the lease lapses', () => {

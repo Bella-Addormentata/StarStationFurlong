@@ -90,9 +90,9 @@ import {
   isCoinPusherRecordUnreadable,
   subscribeCasinoKey,
 } from './casinoDoc';
-// 🪙 Whether the machine is operated, judged without comparing clocks across
-// devices (pusherCroupier.ts CLOCKS).
-import { isCoinPusherOperatorLive } from './pusherCroupier';
+// 🪙 Whether the machine is operated, and ready for a drop, judged without
+// comparing clocks across devices (pusherCroupier.ts CLOCKS).
+import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
 import { crapsBackend } from './crapsBackend';
@@ -4254,8 +4254,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let door: string | null = null;
   /** The machine as last read — the per-frame gauge draws from this. */
   let cached: CoinPusherState | null = null;
-  /** Whether the last render showed the machine operated. */
-  let shownOnline: boolean | null = null;
+  /** The operator state the last render showed. */
+  let shownOperator: CoinPusherOperatorState | null = null;
   const myId = getPlayerId();
 
   const stopExpiry = (): void => {
@@ -4282,8 +4282,13 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
 
   const insert = (): void => {
     const state = readCoinPusherState(deps.itemId);
-    if (!state || !isCoinPusherOperatorLive(deps.itemId)) {
-      flash = 'MACHINE OFFLINE — ITS OWNER RUNS IT';
+    const operator = coinPusherOperatorState(deps.itemId);
+    if (!state || operator !== 'ready') {
+      // A drop made while the operator is still starting up would reach it
+      // too late to keep its timing.
+      flash = operator === 'starting'
+        ? 'THE MACHINE IS STARTING UP — ONE MOMENT'
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT';
     } else if (pending || readCoinPusherRequest(deps.itemId, myId)) {
       flash = 'YOUR LAST CHIP IS STILL DROPPING';
     } else if (readChips(myId) < PUSHER_ANTE) {
@@ -4323,7 +4328,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const state = readCoinPusherState(deps.itemId);
     if (!state || state.ownerId !== myId) {
       flash = 'ONLY THE OWNER HAS THE KEY';
-    } else if (!isCoinPusherOperatorLive(deps.itemId)) {
+    } else if (coinPusherOperatorState(deps.itemId) === 'offline') {
       flash = 'MACHINE OFFLINE — TRY AGAIN IN A MOMENT';
     } else if (door || readCoinPusherEmptyRequest(deps.itemId)) {
       flash = 'THE DOOR IS ALREADY OPENING';
@@ -4412,12 +4417,15 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const state = readCoinPusherState(deps.itemId);
     cached = state;
     readResults();
-    const online = state !== null && isCoinPusherOperatorLive(deps.itemId);
-    shownOnline = online;
+    // A new cabinet's machine appears with its operator's first poll, after
+    // the settling wait: until then it is starting up, not offline.
+    const operator = coinPusherOperatorState(deps.itemId);
+    shownOperator = operator;
+    const online = state !== null && operator === 'ready';
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
-    status.textContent = flash || (online
-      ? 'PICK A HOLE AND TIME YOUR DROP'
-      : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
+    status.textContent = flash || (online ? 'PICK A HOLE AND TIME YOUR DROP'
+      : operator === 'starting' ? 'THE MACHINE IS STARTING UP…'
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
     panel.querySelector<HTMLElement>('#cp-timing-note')!.textContent = timingNote;
     for (let i = 0; i < HOLE_COUNT; i++) {
       const btn = panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`);
@@ -4433,11 +4441,12 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const chips = readChips(myId);
     const full = state !== null && chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS;
     insertBtn.disabled = !online || pending !== null || chips < PUSHER_ANTE || full;
-    insertBtn.textContent = !online ? 'MACHINE OFFLINE'
-      : pending ? 'DROPPING…'
-        : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
-          : full ? 'MACHINE FULL'
-            : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
+    insertBtn.textContent = operator === 'starting' ? 'STARTING UP…'
+      : !online ? 'MACHINE OFFLINE'
+        : pending ? 'DROPPING…'
+          : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
+            : full ? 'MACHINE FULL'
+              : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
     paintTray('cp-rack', chipsFor(chips), 'Your chips', 'NO CHIPS — VISIT THE CASHIER');
     paintTray('cp-won', chipsFor(lastPaid ?? 0), 'Your last drop paid',
       lastPaid === 0 ? 'NOTHING FELL' : '');
@@ -4456,7 +4465,9 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       // Chips, never a total, outside the cashier (the physical-chip rule).
       paintTray('cp-inside', chipsFor(chipsInMachine(state)), 'In the machine', 'THE MACHINE IS EMPTY');
       const emptyBtn = panel.querySelector<HTMLButtonElement>('#cp-empty')!;
-      emptyBtn.disabled = !online || door !== null;
+      // The door has no timing to lose: it may be asked for while the
+      // operator starts up, and is answered once it is at work.
+      emptyBtn.disabled = operator === 'offline' || door !== null;
     }
     drawGauge();
   };
@@ -4566,9 +4577,9 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       cached = null;
     },
     update(_dt: number): void {
-      // A lease can lapse with no key changing: show the machine going offline
-      // (or coming back) as soon as this page can tell.
-      if (panel && (cached !== null && isCoinPusherOperatorLive(deps.itemId)) !== shownOnline) render();
+      // A lease can lapse, or its operator finish starting up, with no key
+      // changing: show it as soon as this page can tell.
+      if (panel && coinPusherOperatorState(deps.itemId) !== shownOperator) render();
       drawGauge();
     },
   };

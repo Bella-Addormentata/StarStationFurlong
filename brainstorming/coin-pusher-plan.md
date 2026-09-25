@@ -130,7 +130,11 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   the same device, which shares the clock, is also held to its own expiry.
   Every client watches the renewals (World ticks every cabinet on every
   client), and that is also how the panel tells whether the machine is
-  operated. The lease record is peer-writable, so a record claiming a
+  operated. Its DROP waits (STARTING UP) until the operator is past its 2 s
+  settling wait: its own, or for another session 2 s after this client
+  first saw that holder take the lease, which is never sooner than the
+  holder's own. A drop made sooner would reach the operator too late to keep
+  its timing. The lease record is peer-writable, so a record claiming a
   far-future expiry holds a machine for one term, not forever. "Last saw it
   renewed" counts in the bound room's doc only, so an identical record seen
   earlier in another room isn't cut short.

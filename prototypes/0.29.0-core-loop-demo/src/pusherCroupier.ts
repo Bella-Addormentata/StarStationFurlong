@@ -28,7 +28,8 @@
  * OPERATOR_LEASE_MS after this page last saw it renewed (leaseLapsesAt). Only
  * a tab on this device, which shares the clock, is also held to its own
  * expiry. Every client watches the renewals (World ticks every cabinet on
- * every client), and the panel asks the same question (isCoinPusherOperatorLive).
+ * every client), and the panel asks the same question: its DROP waits until
+ * the operator is past its settling wait (coinPusherOperatorState).
  *
  * OWNERSHIP: the operator creates a missing machine with itself as owner and
  * re-owns one whose owner is anyone else (a deed transfer, or a peer-written
@@ -147,10 +148,11 @@ export function coinPusherOperatorSession(): string {
   return operatorSessionId;
 }
 
-/** When this page first saw each machine's current lease record in this
- *  room's doc. The operator rewrites its record at every renewal, so this is
- *  when this page last saw the lease renewed. */
-const leaseFirstSeen = new Map<string, { id: string; at: number }>();
+/** Per machine, as this page saw it in this room's doc: when it first saw
+ *  the current lease record (`at` — the operator rewrites its record at every
+ *  renewal, so this is when this page last saw the lease renewed), and when it
+ *  first saw the record's holder hold it (`heldSince`). */
+const leaseFirstSeen = new Map<string, { id: string; holder: string; at: number; heldSince: number }>();
 
 /** The doc epoch of the room this session is leaving (leaveCoinPusherRoom):
  *  nothing there is operated or watched again, even while its last writes
@@ -171,15 +173,22 @@ function isLeavingRoom(): boolean {
  * forever.
  */
 function leaseLapsesAt(machineId: string, lease: CoinPusherOperatorLease, now: number): number {
+  const heldUntil = seeLease(machineId, lease, now).at + OPERATOR_LEASE_MS;
+  return isThisDevice(lease) ? Math.min(lease.expiresAt, heldUntil) : heldUntil;
+}
+
+/** Note the machine's lease as this page sees it now (leaseFirstSeen). A new
+ *  record by the same holder is a renewal: it keeps `heldSince`. */
+function seeLease(machineId: string, lease: CoinPusherOperatorLease, now: number) {
   // Scoped to the bound doc: another room's same record starts afresh.
-  const id = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.expiresAt}`;
+  const holder = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}`;
+  const id = `${holder}|${lease.expiresAt}`;
   let seen = leaseFirstSeen.get(machineId);
   if (seen?.id !== id) {
-    seen = { id, at: now };
+    seen = { id, holder, at: now, heldSince: seen?.holder === holder ? seen.heldSince : now };
     leaseFirstSeen.set(machineId, seen);
   }
-  const heldUntil = seen.at + OPERATOR_LEASE_MS;
-  return isThisDevice(lease) ? Math.min(lease.expiresAt, heldUntil) : heldUntil;
+  return seen;
 }
 
 /** Whether a lease was written by a session on this device (its tabs share
@@ -202,15 +211,36 @@ function takeoverAt(
     : lapsesAt;
 }
 
-/** Whether some session is operating the machine, as far as this page can
- *  tell (the panel's DROP and door): this session by its own live lease, any
- *  other while its lease hasn't lapsed by leaseLapsesAt. */
-export function isCoinPusherOperatorLive(machineId: string, now = Date.now()): boolean {
-  if (isLeavingRoom()) return false;
+/** A machine's operator as this page can tell it: none with a live lease
+ *  (`offline`), one still in its OPERATOR_LEASE_SETTLE_MS wait after taking
+ *  the lease (`starting` — a drop made now would reach it too late to keep
+ *  its timing), or one at work (`ready`). */
+export type CoinPusherOperatorState = 'offline' | 'starting' | 'ready';
+
+/**
+ * The machine's operator state (the panel's DROP and door): this session by
+ * its own lease and wait, any other while its lease hasn't lapsed by
+ * leaseLapsesAt, ready OPERATOR_LEASE_SETTLE_MS after this page first saw its
+ * holder take it — never sooner than the holder itself, which waits that long
+ * from its own write. Renewals don't restart the wait.
+ */
+export function coinPusherOperatorState(machineId: string, now = Date.now()): CoinPusherOperatorState {
+  if (isLeavingRoom()) return 'offline';
   const lease = readCoinPusherOperatorLease(machineId);
-  if (!lease) return false;
-  if (lease.sessionId === operatorSessionId) return lease.expiresAt > now;
-  return now < leaseLapsesAt(machineId, lease, now);
+  if (!lease) return 'offline';
+  if (lease.sessionId === operatorSessionId) {
+    const operator = operators.get(machineId);
+    if (!operator || lease.expiresAt <= now) return 'offline';
+    return now < operator.readyAt ? 'starting' : 'ready';
+  }
+  if (now >= leaseLapsesAt(machineId, lease, now)) return 'offline';
+  return now < seeLease(machineId, lease, now).heldSince + OPERATOR_LEASE_SETTLE_MS ? 'starting' : 'ready';
+}
+
+/** Whether some session is operating the machine (starting or at work), as
+ *  far as this page can tell. */
+export function isCoinPusherOperatorLive(machineId: string, now = Date.now()): boolean {
+  return coinPusherOperatorState(machineId, now) !== 'offline';
 }
 
 /** A fresh 32-bit peg-field seed from the platform CSPRNG. The operator
@@ -253,9 +283,11 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
   pendingTeardowns.delete(machineId);
   sweeps.delete(machineId);
   // Every client watches the lease's renewals, a frame at a time: that is
-  // how it tells a live operator from a lapsed one (CLOCKS above).
+  // how it tells a live operator from a lapsed one (CLOCKS above). With no
+  // lease, whoever takes it next starts its wait afresh.
   const lease = readCoinPusherOperatorLease(machineId);
-  if (lease && lease.sessionId !== operatorSessionId) leaseLapsesAt(machineId, lease, now);
+  if (!lease) leaseFirstSeen.delete(machineId);
+  else if (lease.sessionId !== operatorSessionId) seeLease(machineId, lease, now);
   if (!canRunCroupier()) {
     stopCoinPusherOperator(machineId);
     return;
