@@ -36,6 +36,7 @@ import {
   initialCoinPusherState,
   insertOnPlatform,
   isCoinPusherState,
+  isPusherDoorResult,
   isPusherEmptyRequest,
   isPusherInsertRequest,
   isPusherResult,
@@ -43,6 +44,7 @@ import {
   MAX_DROP_LAG_MS,
   MAX_DROP_LEAD_MS,
   MAX_STACK_HEIGHT,
+  MAX_TIMESTAMP_MS,
   normalizeCoinPusherState,
   PEG_ROWS,
   PILE_STEP,
@@ -282,6 +284,30 @@ describe('shape guards', () => {
     expect(isPusherEmptyRequest({ ...door, requester: '' })).toBe(false);
     expect(isPusherEmptyRequest({ ...door, requestedAt: 'now' })).toBe(false);
   });
+
+  it('refuses every timestamp outside the Date range, where the phase arithmetic overflows', () => {
+    const s = initialCoinPusherState(OWNER, 0);
+    const drop = {
+      requestId: 'r1', player: PLAYER1, hole: 1, chipId: 1, landedX: 0.3,
+      paid: 0, phase: 0.25, honored: true, atMs: 5,
+    };
+    const answer = { kind: 'drop', requestId: 'r1', paid: 2, honored: true, atMs: 5 };
+    const insert = { requestId: 'r1', player: PLAYER1, hole: 1, phase: 0.5, requestedAt: 0 };
+    const door = { requestId: 'd1', requester: OWNER, requestedAt: 0 };
+    const doorAnswer = { kind: 'opened', requestId: 'd1', emptied: 3, atMs: 5 };
+    for (const t of [MAX_TIMESTAMP_MS, -MAX_TIMESTAMP_MS]) {
+      expect(isCoinPusherState({ ...s, pusherAtMs: t })).toBe(true);
+      expect(isPusherInsertRequest({ ...insert, requestedAt: t })).toBe(true);
+    }
+    for (const t of [Number.MAX_VALUE, -Number.MAX_VALUE, MAX_TIMESTAMP_MS * 2, -MAX_TIMESTAMP_MS - 1]) {
+      expect(isCoinPusherState({ ...s, pusherAtMs: t })).toBe(false);
+      expect(isCoinPusherState({ ...s, lastDrop: { ...drop, atMs: t } })).toBe(false);
+      expect(isPusherResult({ ...answer, atMs: t })).toBe(false);
+      expect(isPusherDoorResult({ ...doorAnswer, atMs: t })).toBe(false);
+      expect(isPusherInsertRequest({ ...insert, requestedAt: t })).toBe(false);
+      expect(isPusherEmptyRequest({ ...door, requestedAt: t })).toBe(false);
+    }
+  });
 });
 
 describe('normalizeCoinPusherState', () => {
@@ -426,6 +452,22 @@ describe('currentPusherPhase', () => {
     expect(currentPusherPhase(s, 10_000 + PUSHER_PERIOD_MS / 4)).toBeCloseTo(0.5, 12);
     expect(currentPusherPhase(s, 10_000 - PUSHER_PERIOD_MS / 4)).toBeCloseTo(0, 12);
     expect(currentPusherPhase(s, 10_000 - PUSHER_PERIOD_MS / 2)).toBeCloseTo(0.75, 12);
+  });
+
+  it('stays a phase for any two times in the Date range, however far apart', () => {
+    for (const anchor of [-MAX_TIMESTAMP_MS, 0, MAX_TIMESTAMP_MS]) {
+      const s = { ...initialCoinPusherState(OWNER, 0), pusherAtMs: anchor, pusherPhase: 0.4 };
+      expect(isCoinPusherState(s)).toBe(true);
+      for (const t of [-MAX_TIMESTAMP_MS, 0, MAX_TIMESTAMP_MS]) {
+        const p = currentPusherPhase(s, t);
+        expect(p).toBeGreaterThanOrEqual(0);
+        expect(p).toBeLessThan(1);
+      }
+    }
+    // Past the range the arithmetic is gone (MAX_VALUE − −MAX_VALUE is
+    // Infinity): such a time is refused, and the anchor's own phase kept.
+    const s = { ...initialCoinPusherState(OWNER, 0), pusherPhase: 0.4 };
+    expect(currentPusherPhase(s, Number.MAX_VALUE)).toBe(0.4);
   });
 });
 

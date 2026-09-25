@@ -157,6 +157,21 @@ describe('coin-pusher machine record', () => {
   });
 });
 
+describe('coin-pusher operator lease record', () => {
+  it('reads a tenure only as a short token, and a record with none', () => {
+    const base = { playerId: OWNER, sessionId: 'device:tab', expiresAt: 99 };
+    writeCoinPusherOperatorLease({ ...base, tenure: 't1' });
+    expect(readCoinPusherOperatorLease()).toEqual({ ...base, tenure: 't1' });
+    const map = doc.getMap('casino');
+    for (const tenure of ['', 'x'.repeat(65), 7, null]) {
+      map.set('pusher-operator', { ...base, tenure });
+      expect(readCoinPusherOperatorLease()).toBeNull();
+    }
+    map.set('pusher-operator', base);
+    expect(readCoinPusherOperatorLease()).toEqual(base);
+  });
+});
+
 describe('coin-pusher requests', () => {
   it('writing a request moves no chips', () => {
     buyInChips(PLAYER, 5);

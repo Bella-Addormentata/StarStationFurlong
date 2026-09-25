@@ -870,8 +870,20 @@ export function clearSlotMachineKeys(machineId: string): void {
 /** The room's coin-pusher operator lease: one for every cabinet in the room. */
 export const COIN_PUSHER_OPERATOR_KEY = 'pusher-operator';
 
-/** Same field-for-field record the slot operator uses. */
-export type CoinPusherOperatorLease = SlotOperatorLease;
+/** The slot operator's record, plus the holder's tenure: a fresh token each
+ *  time a session takes the lease, kept across its renewals. A peer that
+ *  never saw the lease go (a release and a retake between two of its frames)
+ *  still tells a new tenure, with its settling wait, from a renewal. */
+export interface CoinPusherOperatorLease extends SlotOperatorLease {
+  tenure?: string;
+}
+
+function isCoinPusherOperatorLease(value: unknown): value is CoinPusherOperatorLease {
+  if (!isSlotOperatorLease(value)) return false;
+  const tenure = (value as { tenure?: unknown }).tenure;
+  return tenure === undefined
+    || (typeof tenure === 'string' && tenure.length > 0 && tenure.length <= 64);
+}
 
 export function readCoinPusherState(machineId: string): CoinPusherState | null {
   const value = ensureMap().get(`pusher:${machineId}`);
@@ -1212,11 +1224,11 @@ export function refuseCoinPusherEmpty(
 /** The room's coin-pusher operator lease (one for every cabinet). */
 export function readCoinPusherOperatorLease(): CoinPusherOperatorLease | null {
   const value = ensureMap().get(COIN_PUSHER_OPERATOR_KEY);
-  return isSlotOperatorLease(value) ? value : null;
+  return isCoinPusherOperatorLease(value) ? value : null;
 }
 
 export function writeCoinPusherOperatorLease(lease: CoinPusherOperatorLease): void {
-  if (!isSlotOperatorLease(lease)) return;
+  if (!isCoinPusherOperatorLease(lease)) return;
   ensureMap().set(COIN_PUSHER_OPERATOR_KEY, lease);
 }
 

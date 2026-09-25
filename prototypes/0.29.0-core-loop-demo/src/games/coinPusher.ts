@@ -376,6 +376,17 @@ function isPhase(v: unknown): v is number {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 && v < 1;
 }
 
+/** The Date range (±8.64e15 ms, the ECMAScript time value limit). Every
+ *  timestamp a record carries lies in it, so the difference of any two stays
+ *  finite. A peer-written one outside it (±Number.MAX_VALUE, say) is refused
+ *  at the trust boundary: against another at the other extreme, the phase
+ *  arithmetic overflows to NaN. */
+export const MAX_TIMESTAMP_MS = 8.64e15;
+
+function isTimestamp(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= MAX_TIMESTAMP_MS;
+}
+
 function isLastDrop(v: unknown): v is PusherLastDrop {
   if (typeof v !== 'object' || v === null) return false;
   const d = v as Partial<PusherLastDrop>;
@@ -384,7 +395,7 @@ function isLastDrop(v: unknown): v is PusherLastDrop {
     && typeof d.landedX === 'number' && Number.isFinite(d.landedX)
     && isCountInt(d.paid) && (d.paid as number) <= MACHINE_MAX_CHIPS
     && isPhase(d.phase) && typeof d.honored === 'boolean'
-    && typeof d.atMs === 'number' && Number.isFinite(d.atMs);
+    && isTimestamp(d.atMs);
 }
 
 /** Marks of drops the machine has made: each chip id below its nextChipId. */
@@ -401,7 +412,7 @@ const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-fu
 export function isPusherResult(v: unknown): v is PusherResult {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as { kind?: unknown; requestId?: unknown; atMs?: unknown; paid?: unknown; honored?: unknown; reason?: unknown };
-  if (!isBoundedId(r.requestId) || typeof r.atMs !== 'number' || !Number.isFinite(r.atMs)) return false;
+  if (!isBoundedId(r.requestId) || !isTimestamp(r.atMs)) return false;
   if (r.kind === 'drop') {
     return isCountInt(r.paid) && (r.paid as number) <= MACHINE_MAX_CHIPS && typeof r.honored === 'boolean';
   }
@@ -411,7 +422,7 @@ export function isPusherResult(v: unknown): v is PusherResult {
 export function isPusherDoorResult(v: unknown): v is PusherDoorResult {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as { kind?: unknown; requestId?: unknown; emptied?: unknown; atMs?: unknown };
-  if (!isBoundedId(r.requestId) || typeof r.atMs !== 'number' || !Number.isFinite(r.atMs)) return false;
+  if (!isBoundedId(r.requestId) || !isTimestamp(r.atMs)) return false;
   if (r.kind === 'opened') return isCountInt(r.emptied) && (r.emptied as number) <= MACHINE_MAX_CHIPS;
   return r.kind === 'refused';
 }
@@ -431,7 +442,7 @@ export function isCoinPusherState(v: unknown): v is CoinPusherState {
     && isPileArray(s.lower, PLAT_LOW_BACK, PLAT_LOW_FRONT)
     && isCountInt(s.nextChipId)
     && isPhase(s.pusherPhase)
-    && typeof s.pusherAtMs === 'number' && Number.isFinite(s.pusherAtMs)
+    && isTimestamp(s.pusherAtMs)
     && isCountInt(s.tick)
     && isCountInt(s.totalInserted)
     && isCountInt(s.totalPaid)
@@ -490,14 +501,14 @@ export function isPusherInsertRequest(v: unknown): v is PusherInsertRequest {
   const r = v as Partial<PusherInsertRequest>;
   return isBoundedId(r.requestId) && isBoundedId(r.player) && isHole(r.hole)
     && isPhase(r.phase)
-    && typeof r.requestedAt === 'number' && Number.isFinite(r.requestedAt);
+    && isTimestamp(r.requestedAt);
 }
 
 export function isPusherEmptyRequest(v: unknown): v is PusherEmptyRequest {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<PusherEmptyRequest>;
   return isBoundedId(r.requestId) && isBoundedId(r.requester)
-    && typeof r.requestedAt === 'number' && Number.isFinite(r.requestedAt);
+    && isTimestamp(r.requestedAt);
 }
 
 // ── Initial state factory ────────────────────────────────────────────────────
@@ -513,7 +524,7 @@ export function initialCoinPusherState(ownerId: string, nowMs = 0): CoinPusherSt
     lower: [],
     nextChipId: 1,
     pusherPhase: 0,
-    pusherAtMs: Number.isFinite(nowMs) ? nowMs : 0,
+    pusherAtMs: isTimestamp(nowMs) ? nowMs : 0,
     tick: 0,
     totalInserted: 0,
     totalPaid: 0,
@@ -852,7 +863,7 @@ export function resolveDropTiming(
   maxLeadMs: number = MAX_DROP_LEAD_MS,
 ): { dropPhase: number; honored: boolean; lagMs: number } {
   const nowPhase = currentPusherPhase(state, receivedAtMs);
-  if (!isPhase(claimedPhase) || !Number.isFinite(claimedAtMs) || !Number.isFinite(receivedAtMs)) {
+  if (!isPhase(claimedPhase) || !isTimestamp(claimedAtMs) || !isTimestamp(receivedAtMs)) {
     return { dropPhase: nowPhase, honored: false, lagMs: NaN };
   }
   const lagMs = receivedAtMs - claimedAtMs;
@@ -1018,6 +1029,6 @@ export function chipsInMachine(state: CoinPusherState): number {
  *  before the anchor (another client's clock running behind) still gets its
  *  true phase. The engine never calls Date.now(); callers pass the time in. */
 export function currentPusherPhase(state: CoinPusherState, nowMs: number): number {
-  if (!Number.isFinite(nowMs)) return state.pusherPhase;
+  if (!isTimestamp(nowMs)) return state.pusherPhase;
   return mod1(state.pusherPhase + (nowMs - state.pusherAtMs) / PUSHER_PERIOD_MS);
 }

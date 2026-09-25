@@ -441,6 +441,39 @@ describe('tickCoinPusherRoom', () => {
     expect(coinPusherOperatorState(NOW + 9_500)).toBe('ready');
   });
 
+  it('reads a new tenure as a new take, even when it never saw the lease go', () => {
+    setSoleCroupierPredicate(() => false); // a player at the cabinet
+    const lease = (t: number, tenure: string) => writeCoinPusherOperatorLease({
+      playerId: OTHER, sessionId: 'their-device:tab', tenure, expiresAt: t + 8_000,
+    });
+    lease(NOW, 'first');
+    tickCoinPusherRoom([MACHINE], NOW);
+    expect(coinPusherOperatorState(NOW + 2_000)).toBe('ready');
+    lease(NOW + 3_000, 'first'); // a renewal
+    tickCoinPusherRoom([MACHINE], NOW + 3_000);
+    expect(coinPusherOperatorState(NOW + 3_001)).toBe('ready');
+    // The holder let the lease go and took it again between two of this
+    // page's frames: a new take, with a settling wait of its own.
+    lease(NOW + 4_000, 'second');
+    tickCoinPusherRoom([MACHINE], NOW + 4_000);
+    expect(coinPusherOperatorState(NOW + 5_999)).toBe('starting');
+    expect(coinPusherOperatorState(NOW + 6_000)).toBe('ready');
+  });
+
+  it('writes a fresh tenure each time it takes the lease, and keeps it when renewing', () => {
+    tickCoinPusherRoom([MACHINE], NOW);
+    const first = readCoinPusherOperatorLease()?.tenure;
+    expect(first).toMatch(/^[0-9a-f-]{36}$/);
+    tickCoinPusherRoom([MACHINE], NOW + 3_000); // a renewal
+    expect(readCoinPusherOperatorLease()?.expiresAt).toBe(NOW + 3_000 + 8_000);
+    expect(readCoinPusherOperatorLease()?.tenure).toBe(first);
+    tickCoinPusherRoom([], NOW + 3_016); // lets it go…
+    tickCoinPusherRoom([MACHINE], NOW + 3_032); // …and takes it again
+    const second = readCoinPusherOperatorLease()?.tenure;
+    expect(second).toMatch(/^[0-9a-f-]{36}$/);
+    expect(second).not.toBe(first);
+  });
+
   it('another tab on this device takes over as soon as the lease lapses', () => {
     const device = coinPusherOperatorSession().split(':')[0];
     const otherTab = `${device}:other-tab`;

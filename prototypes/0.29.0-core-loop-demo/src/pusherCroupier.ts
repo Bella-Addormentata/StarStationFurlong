@@ -110,6 +110,9 @@ import { getPlayerId } from './identity';
 interface PusherOperatorSession {
   docEpoch: number;
   playerId: string;
+  /** This turn's token in the lease record, fresh for every take and kept
+   *  across its renewals (CoinPusherOperatorLease.tenure). */
+  tenure: string;
   readyAt: number;
   renewedAt: number;
 }
@@ -161,7 +164,7 @@ export function coinPusherOperatorSession(): string {
 /** The room's lease as this page saw it in this room's doc: when it first
  *  saw the current record (`at` — the operator rewrites its record at every
  *  renewal, so this is when this page last saw the lease renewed), and when it
- *  first saw the record's holder hold it (`heldSince`). */
+ *  first saw the record's holder hold it in this tenure (`heldSince`). */
 let leaseSeen: { id: string; holder: string; at: number; heldSince: number } | null = null;
 
 /** The doc epoch of the room this session is leaving (leaveCoinPusherRoom):
@@ -188,10 +191,12 @@ function leaseLapsesAt(lease: CoinPusherOperatorLease, now: number): number {
 }
 
 /** Note the room's lease as this page sees it now (leaseSeen). A new record
- *  by the same holder is a renewal: it keeps `heldSince`. */
+ *  by the same holder in the same tenure is a renewal: it keeps `heldSince`.
+ *  A new tenure is a new take, with its own settling wait, even when this
+ *  page never saw the lease go. */
 function seeLease(lease: CoinPusherOperatorLease, now: number) {
   // Scoped to the bound doc: another room's same record starts afresh.
-  const holder = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}`;
+  const holder = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.tenure ?? ''}`;
   const id = `${holder}|${lease.expiresAt}`;
   let seen = leaseSeen;
   if (seen?.id !== id) {
@@ -228,7 +233,8 @@ export type CoinPusherOperatorState = 'offline' | 'starting' | 'ready';
  * its own lease and wait, any other while its lease hasn't lapsed by
  * leaseLapsesAt, ready OPERATOR_LEASE_SETTLE_MS after this page first saw its
  * holder take it — never sooner than the holder itself, which waits that long
- * from its own write. Renewals don't restart the wait.
+ * from its own write. Renewals don't restart the wait; a new take does (its
+ * record carries a new tenure), even one this page saw no gap before.
  */
 export function coinPusherOperatorState(now = Date.now()): CoinPusherOperatorState {
   if (isLeavingRoom()) return 'offline';
@@ -331,14 +337,17 @@ function electCoinPusherOperator(lease: CoinPusherOperatorLease | null, now: num
     || operator.playerId !== playerId) {
     if (lease && lease.sessionId !== operatorSessionId
       && now < takeoverAt(lease, now)) return null;
+    const tenure = crypto.randomUUID();
     writeCoinPusherOperatorLease({
       playerId,
       sessionId: operatorSessionId,
+      tenure,
       expiresAt: now + OPERATOR_LEASE_MS,
     });
     operator = {
       docEpoch: casinoDocEpoch(),
       playerId,
+      tenure,
       readyAt: now + OPERATOR_LEASE_SETTLE_MS,
       renewedAt: now,
     };
@@ -358,6 +367,7 @@ function electCoinPusherOperator(lease: CoinPusherOperatorLease | null, now: num
     writeCoinPusherOperatorLease({
       playerId,
       sessionId: operatorSessionId,
+      tenure: operator.tenure,
       expiresAt: now + OPERATOR_LEASE_MS,
     });
     operator.renewedAt = now;
