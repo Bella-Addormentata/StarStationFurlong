@@ -264,14 +264,12 @@ function spotBlocked(
   obstacles: readonly VatFloorBox[],
   bounds: { boundX: number; boundZ: number },
   radius: number,
-  skip?: (b: VatFloorBox) => boolean,
 ): boolean {
   if (Math.abs(x) > bounds.boundX + 1e-9 || Math.abs(z) > bounds.boundZ + 1e-9) {
     return true;
   }
   return obstacles.some(
     (b) =>
-      !skip?.(b) &&
       x > b.x0 - radius &&
       x < b.x1 + radius &&
       z > b.z0 - radius &&
@@ -298,13 +296,22 @@ export function vatFreeExitAlong(
 ): number | null {
   const dirX = Math.sin(facing);
   const dirZ = Math.cos(facing);
-  const isOwn = (b: VatFloorBox) =>
-    centre.x > b.x0 && centre.x < b.x1 && centre.z > b.z0 && centre.z < b.z1;
+  // Skip exactly ONE box: this vat's own footprint (centre ± half). Anything
+  // else that merely overlaps the vat — furniture records are peer-written,
+  // untrusted data — still blocks the path.
+  const ownIndex = obstacles.findIndex(
+    (b) =>
+      Math.abs(b.x0 - (centre.x - VAT_FOOTPRINT_HALF)) < 1e-6 &&
+      Math.abs(b.x1 - (centre.x + VAT_FOOTPRINT_HALF)) < 1e-6 &&
+      Math.abs(b.z0 - (centre.z - VAT_FOOTPRINT_HALF)) < 1e-6 &&
+      Math.abs(b.z1 - (centre.z + VAT_FOOTPRINT_HALF)) < 1e-6,
+  );
+  const others = obstacles.filter((_, i) => i !== ownIndex);
   let free: number | null = null;
   for (let along = VAT_PLINTH_R; ; along = Math.min(VAT_EXIT_ALONG, along + 0.05)) {
     const x = centre.x + dirX * along;
     const z = centre.z + dirZ * along;
-    if (spotBlocked(x, z, obstacles, bounds, radius, isOwn)) break;
+    if (spotBlocked(x, z, others, bounds, radius)) break;
     free = along;
     if (along >= VAT_EXIT_ALONG) break;
   }
@@ -314,8 +321,9 @@ export function vatFreeExitAlong(
 /**
  * Where a clone steps out when its door path is blocked (vatFreeExitAlong
  * gave null): the nearest collision-free spot around the vat — rings from
- * just clear of its footprint outward, door side first — or null when the
- * room has no free spot within 4 m.
+ * just clear of its footprint out to 4 m, door side first — else the
+ * nearest free spot anywhere in the walkable box (0.25 m grid). null only
+ * when nowhere in the room is free; the caller then keeps the clone held.
  */
 export function vatFallbackRelease(
   centre: { x: number; z: number },
@@ -332,7 +340,22 @@ export function vatFallbackRelease(
       if (!spotBlocked(x, z, obstacles, bounds, radius)) return { x, z };
     }
   }
-  return null;
+  let best: { x: number; z: number } | null = null;
+  let bestD = Infinity;
+  const nx = Math.floor(bounds.boundX / 0.25);
+  const nz = Math.floor(bounds.boundZ / 0.25);
+  for (let i = -nx; i <= nx; i++) {
+    for (let j = -nz; j <= nz; j++) {
+      const x = i * 0.25;
+      const z = j * 0.25;
+      const d = Math.hypot(x - centre.x, z - centre.z);
+      if (d < bestD && !spotBlocked(x, z, obstacles, bounds, radius)) {
+        best = { x, z };
+        bestD = d;
+      }
+    }
+  }
+  return best;
 }
 
 /** Root height while walking out: on the pad inside, easing down off the

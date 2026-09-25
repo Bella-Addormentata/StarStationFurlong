@@ -249,6 +249,24 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     expect(vatFallbackRelease({ x: 0, z: 0 }, 0, [full], ROOM, R)).toBeNull();
   });
 
+  it('searches the whole room when nothing near the vat is free', () => {
+    // Everything but a strip along the east wall (x > 4.5) is covered.
+    const cover = { x0: -6, z0: -6, x1: 4.5, z1: 6 };
+    const spot = vatFallbackRelease({ x: 0, z: 0 }, 0, [cover], ROOM, R)!;
+    expect(spot.x).toBeGreaterThanOrEqual(cover.x1 + R);
+    expect(spot.x).toBeLessThanOrEqual(ROOM.boundX);
+  });
+
+  it('skips only the vat\'s own box, not other obstacles overlapping it', () => {
+    const own = box(0, 0, 1, 1);
+    // Peer-written furniture is untrusted: a box around the vat (or the
+    // whole room) must still block the path, not be skipped as "the vat".
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, box(0, 0, 1.2, 1.2)], ROOM, R)).toBeNull();
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, box(0, 0, 6, 6)], ROOM, R)).toBeNull();
+    // …while the vat's own box alone never blocks its own doorway.
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own], ROOM, R)).toBe(VAT_EXIT_ALONG);
+  });
+
   it('is unobstructed for the default vat in the default lobby', () => {
     const vat = FURNITURE.find((i) => i.id === 'clone-vat')!;
     const boxes = FURNITURE.map((i) => itemAabb(i)).filter((b) => b !== null);
