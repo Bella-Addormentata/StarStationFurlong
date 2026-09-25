@@ -39,10 +39,12 @@
  * operator is past its settling wait (coinPusherOperatorState).
  *
  * OWNERSHIP: the operator creates a missing machine with itself as owner and
- * re-owns one whose owner is anyone else (a deed transfer, or a peer-written
- * owner). The chips inside stay where they are and go with the room, like its
+ * re-owns one whose owner is anyone else (a deed transfer, a peer-written
+ * owner, or another install of the deed holder, which has a player id of its
+ * own). The chips inside stay where they are and go with the room, like its
  * furniture — nothing is paid out on a takeover, so a forged owner earns
- * nothing.
+ * nothing. The owner is therefore the install operating the room, and only
+ * its panel offers the door.
  *
  * TEARDOWN: a removed cabinet is drained by the same rule. Only a session that
  * may operate the room (it holds the lease, or could take it over) pays out

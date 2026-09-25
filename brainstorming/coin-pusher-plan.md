@@ -309,6 +309,13 @@ model as it is.
 - A network split between two of the deed holder's devices that outlasts the
   takeover window can still settle drops, or drain a removed cabinet, on both
   sides (see *Splits*).
+- The machine's owner is the player id of the install operating the room (the
+  operator re-owns every machine it runs). The deed holder's other installs
+  each have a player id of their own, so OPEN THE DOOR shows only on the
+  install operating at the time, and the chips it returns go to that
+  install's balance, like every casino balance (keyed by player id). No chips
+  are at risk. Owning by identity key instead would need casino accounts
+  keyed the same way.
 - Other casino games elect their own operators (a slot machine's is per
   machine, as on main), so a slot operator and the pusher operator writing
   the same player's balance in the same instant can still lose one of the two
