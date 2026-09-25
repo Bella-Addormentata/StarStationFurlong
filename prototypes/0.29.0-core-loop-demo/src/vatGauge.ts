@@ -37,17 +37,22 @@
 /** Glass tube radius — the tank fills the 2×2 footprint (±1 m). */
 export const VAT_GLASS_R = 0.8;
 /** Glass tube bottom (it sits just inside the plinth). */
-export const VAT_GLASS_BASE_Y = 0.3;
+export const VAT_GLASS_BASE_Y = 0.08;
 /** Glass tube height; the cap sits on its top edge. */
 export const VAT_GLASS_H = 2.7;
 /** Plinth outer radius — the lip the avatar steps down from. */
 export const VAT_PLINTH_R = 0.92;
-/** The interior floor pad the avatar stands on while inside. */
-export const VAT_PAD_Y = 0.33;
+/**
+ * The interior floor pad the avatar stands on while inside. Kept LOW on
+ * purpose: the clone steps off it with its heels and drooping tail (~0.13 m
+ * off the floor) still over the plinth, so a tall plinth would swallow them
+ * on the way down.
+ */
+export const VAT_PAD_Y = 0.1;
 /** Front door leaf arc (the rest of the tube is the fixed back shell). */
 export const VAT_DOOR_ARC = (Math.PI * 7) / 9; // 140°
 /** Top of the door leaf; the fixed transom band fills the tube above it. */
-export const VAT_DOOR_TOP_Y = 2.72;
+export const VAT_DOOR_TOP_Y = 2.49;
 /** Radius the spinning door leaf (and its edge rails) sweep around the axis. */
 export const VAT_DOOR_SWEEP_R = VAT_GLASS_R + 0.04;
 
@@ -226,11 +231,12 @@ export function vatDoorClear(along: number, horizontal: number): boolean {
   return along - horizontal * AVATAR_BACK > VAT_DOOR_SWEEP_R + VAT_CLEARANCE;
 }
 
-/** Root height while walking out: on the pad inside, stepping down off the
- *  plinth lip as the front foot clears it, on the floor beyond. */
+/** Root height while walking out: on the pad inside, easing down off the
+ *  plinth lip from when the front foot reaches it until the heels are past
+ *  it, on the floor beyond. */
 export function vatFloorY(along: number): number {
-  const from = VAT_PLINTH_R - 0.15;
-  const to = VAT_PLINTH_R + 0.2;
+  const from = VAT_PLINTH_R - 0.12;
+  const to = VAT_PLINTH_R + 0.3;
   if (along <= from) return VAT_PAD_Y;
   if (along >= to) return 0;
   const t = (along - from) / (to - from);

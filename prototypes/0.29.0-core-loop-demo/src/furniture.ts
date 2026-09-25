@@ -5364,19 +5364,21 @@ function buildCloneVat(ctx: BuildCtx) {
   const CAP_H = 0.26;
   const CAP_Y = GLASS_TOP + CAP_H / 2 - 0.02;
 
-  // ── Plinth + interior floor pad (the held clone stands ON the pad)
+  // ── Low plinth + interior floor pad (the held clone stands ON the pad; it
+  //    stays low so the clone's heels and tail clear it stepping off)
+  const plinthH = VAT_PAD_Y - 0.01;
   place(
-    new THREE.CylinderGeometry(VAT_PLINTH_R + 0.02, VAT_PLINTH_R + 0.05, 0.08, 36),
+    new THREE.CylinderGeometry(VAT_PLINTH_R + 0.05, VAT_PLINTH_R + 0.05, 0.03, 36),
     m(TRIM, 0.6, 0.4),
     0,
-    0.04,
+    0.015,
     0,
   );
   place(
-    new THREE.CylinderGeometry(VAT_PLINTH_R - 0.02, VAT_PLINTH_R, 0.24, 36),
+    new THREE.CylinderGeometry(VAT_PLINTH_R - 0.02, VAT_PLINTH_R, plinthH, 36),
     m(BODY, 0.55, 0.45),
     0,
-    0.2,
+    plinthH / 2,
     0,
   );
   place(
@@ -5386,20 +5388,21 @@ function buildCloneVat(ctx: BuildCtx) {
     VAT_PAD_Y - 0.015,
     0,
   );
-  // Drain grate + green-lit outflow at the door side (concept art's spout)
+  // Drain grate + green-lit outflow at the door side (concept art's spout),
+  // set flush into the plinth face so the stepping clone has nothing to snag
   place(
-    new THREE.BoxGeometry(0.4, 0.07, 0.12),
+    new THREE.BoxGeometry(0.4, 0.045, 0.08),
     m(0x14181e, 0.8, 0.2),
     0,
-    0.1,
-    VAT_PLINTH_R - 0.04,
+    0.04,
+    VAT_PLINTH_R - 0.035,
   );
   place(
-    new THREE.BoxGeometry(0.26, 0.02, 0.03),
+    new THREE.BoxGeometry(0.26, 0.015, 0.02),
     flat(VAT_GREEN),
     0,
-    0.1,
-    VAT_PLINTH_R + 0.03,
+    0.04,
+    VAT_PLINTH_R,
   );
 
   // ── Cap + head-end greebles
@@ -5450,13 +5453,13 @@ function buildCloneVat(ctx: BuildCtx) {
     opacity: 0,
   });
   place(new THREE.PlaneGeometry(0.56, 0.2), plateMat, 0, CAP_Y, R + 0.125);
-  // Green status pip strip on the plinth front
+  // Green status pip strip along the cap's lower rim, under the plate
   place(
-    new THREE.BoxGeometry(0.36, 0.04, 0.02),
+    new THREE.BoxGeometry(0.36, 0.025, 0.02),
     flat(VAT_GREEN),
     0,
-    0.24,
-    VAT_PLINTH_R - 0.005,
+    CAP_Y - CAP_H / 2 + 0.015,
+    R + 0.125,
   );
 
   // ── Glass: fixed back shell + fixed transom over the doorway + the
@@ -5597,12 +5600,20 @@ function buildCloneVat(ctx: BuildCtx) {
   let onOpenCb: (() => void) | null = null;
   const smooth = (v: number) => v * v * (3 - 2 * v);
 
+  // World re-shows every furniture mesh each frame while the room view is up
+  // (zoom ≤ 2) and hides them all from space, so the bath is never forced
+  // VISIBLE here — but a drained one is re-hidden every frame, idle phases
+  // included, or the empty column renders as a flat green disc on the pad.
+  const hideIfDrained = () => {
+    if (level > 0.005) return;
+    liquid.visible = false;
+    core.visible = false;
+  };
   const applyPose = () => {
     const l = Math.max(0.0001, level); // scale 0 breaks matrix inversion
     liquid.scale.y = l;
     core.scale.y = l;
-    liquid.visible = level > 0.005;
-    core.visible = level > 0.005;
+    hideIfDrained();
     doorGroup.rotation.y = doorAngle;
   };
 
@@ -5626,7 +5637,10 @@ function buildCloneVat(ctx: BuildCtx) {
       onOpenCb = null; // a pending open is superseded — never fire it late
     },
     update(deltaTime: number): void {
-      if (phase === "IDLE_FULL" || phase === "IDLE_OPEN") return;
+      if (phase === "IDLE_FULL" || phase === "IDLE_OPEN") {
+        hideIfDrained();
+        return;
+      }
       t += Math.max(0, deltaTime);
       switch (phase) {
         case "BEAT":
