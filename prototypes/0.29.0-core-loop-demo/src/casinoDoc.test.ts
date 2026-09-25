@@ -16,7 +16,8 @@ import {
   bindCasinoDoc,
   buyInChips,
   cancelCoinPusherRequest,
-  coinPusherKeySweepsUnderWay,
+  coinPusherRequestKey,
+  coinPusherResultKey,
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
@@ -34,7 +35,6 @@ import {
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
   startCoinPusherKeySweep,
-  stopCoinPusherKeySweep,
   writeCoinPusherEmptyRequest,
   writeCoinPusherOperatorLease,
   writeCoinPusherRequest,
@@ -209,16 +209,37 @@ describe('coin-pusher requests', () => {
       .toEqual(['a-1']);
   });
 
-  it('files a request by its own player, so a colon in an id never files it under another machine', () => {
+  it('keys escape their ids: plain ids are written as they are, and a key splits one way only', () => {
+    expect(coinPusherRequestKey(MACHINE, PLAYER)).toBe(`pusher-req:${MACHINE}:${PLAYER}`);
+    expect(coinPusherResultKey(MACHINE, PLAYER)).toBe(`pusher-result:${MACHINE}:${PLAYER}`);
+    // `(a, b:p)` and `(a:b, p)` would both be `pusher-req:a:b:p` unescaped.
+    expect(coinPusherRequestKey('a', 'b:p')).toBe('pusher-req:a:b%3Ap');
+    expect(coinPusherRequestKey('a:b', 'p')).toBe('pusher-req:a%3Ab:p');
+    expect(coinPusherResultKey('50%:x', 'p')).toBe('pusher-result:50%25%3Ax:p');
+    // Each files under the machine and player its own key names.
+    writeCoinPusherRequest('a', request('b:p', 'r-a'));
+    writeCoinPusherRequest('a:b', request('p', 'r-ab'));
+    writeCoinPusherRequest('50%:x', request('p', 'r-odd'));
+    expect(readCoinPusherRequests('a').map((r) => r.requestId)).toEqual(['r-a']);
+    expect(readCoinPusherRequests('a:b').map((r) => r.requestId)).toEqual(['r-ab']);
+    expect(readCoinPusherRequests('50%:x').map((r) => r.requestId)).toEqual(['r-odd']);
+    expect(readCoinPusherRequest('a', 'b:p')?.requestId).toBe('r-a');
+    expect(readCoinPusherRequest('a:b', 'p')?.requestId).toBe('r-ab');
+    // Still only under its own player's key (the cross-key guard).
+    doc.getMap('casino').set(coinPusherRequestKey('a', 'q'), request('b:p', 'wrong-key'));
+    expect(readCoinPusherRequests('a').map((r) => r.requestId)).toEqual(['r-a']);
+  });
+
+  it('a key that isn\'t its ids escaped exactly once names no machine', () => {
     const map = doc.getMap('casino');
-    // One key, two readings: machine 'a' with player 'b:p', or machine 'a:b'
-    // with player 'p'. The request's player decides which.
-    map.set('pusher-req:a:b:p', request('p', 'for-a:b'));
-    expect(readCoinPusherRequests('a:b').map((r) => r.requestId)).toEqual(['for-a:b']);
-    expect(readCoinPusherRequests('a')).toEqual([]);
-    map.set('pusher-req:a:b:p', request('b:p', 'for-a'));
-    expect(readCoinPusherRequests('a').map((r) => r.requestId)).toEqual(['for-a']);
-    expect(readCoinPusherRequests('a:b')).toEqual([]);
+    map.set('pusher-req:a:b:p', request('b:p', 'bare-colons'));
+    map.set('pusher-req:a:b:p2', request('b', 'extra-part'));
+    map.set('pusher-req:a%3a:p', request('p', 'lower-case'));
+    map.set('pusher-req:a%:p', request('p', 'bare-percent'));
+    map.set('pusher-req::p', request('p', 'no-machine'));
+    map.set('pusher-req:x%3A:p', request('p', 'fine'));
+    for (const machine of ['a', 'a:b', 'a:', 'a%', '']) expect(readCoinPusherRequests(machine)).toEqual([]);
+    expect(readCoinPusherRequests('x:').map((r) => r.requestId)).toEqual(['fine']);
   });
 
   it('keeps the index current as requests come, change and go — from this peer or another', () => {
@@ -558,14 +579,17 @@ describe('drainAndClearCoinPusher', () => {
       // A stale answer landing mid-sweep is swept too.
       if (batch === 1) map.set(`pusher-result:${MACHINE}:late`, 'junk');
     }
-    // A key was written during the pass, so the pass that deletes the last
-    // few is followed by one that finds nothing and ends the sweep.
+    // The batch that deletes the last few ends the pass, each key deleted
+    // once; the next finds none of the machine's keys left and ends the sweep.
+    const deletes = vi.spyOn(Y.Map.prototype, 'delete');
     expect(continueCoinPusherKeySweep(sweep)).toBe(false);
+    expect(deletes).toHaveBeenCalledTimes(flood + 1 - 3 * PUSHER_SWEEP_BATCH);
+    deletes.mockRestore();
     expect(left()).toBe(0);
     expect(continueCoinPusherKeySweep(sweep)).toBe(true);
   });
 
-  it('a key added to a family the pass already went through is swept by the next pass', () => {
+  it('a key written for the machine mid-sweep is swept too', () => {
     const map = doc.getMap('casino');
     writeCoinPusherState(MACHINE, machineWith(5));
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
@@ -574,7 +598,7 @@ describe('drainAndClearCoinPusher', () => {
     const sweep = startCoinPusherKeySweep(MACHINE);
     expect(continueCoinPusherKeySweep(sweep)).toBe(false); // the request, then answers
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
-    // A stale request lands after its family was passed, answers still left.
+    // A stale request lands while answers are still left.
     writeCoinPusherRequest(MACHINE, request(OTHER, 'stale'));
     let batches = 1;
     while (!continueCoinPusherKeySweep(sweep)) batches += 1;
@@ -583,61 +607,65 @@ describe('drainAndClearCoinPusher', () => {
     expect(batches).toBeLessThan(10);
   });
 
-  // A colon in an id: `bank:7` shares its buckets with a neighbour's keys.
-  const COLON_MACHINE = 'bank:7';
-  const NEIGHBOUR = 'bank:8';
-
-  /** COLON_MACHINE drained, its buckets full of NEIGHBOUR's keys, so a pass
-   *  over them takes three batches. */
-  function drainedBesideNeighbour(): Y.Map<unknown> {
+  it('a key written after a pass went by is swept by the next', () => {
     const map = doc.getMap('casino');
-    writeCoinPusherState(COLON_MACHINE, machineWith(5));
-    writeCoinPusherRequest(NEIGHBOUR, request(PLAYER, 'n-1'));
-    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${NEIGHBOUR}:p${i}`, 'junk');
-    drainAndClearCoinPusher(COLON_MACHINE, OWNER);
-    return map;
-  }
-
-  it('a pass that finds nothing still sweeps a key of the machine\'s written into a family it has passed', () => {
-    const map = drainedBesideNeighbour();
-    const sweep = startCoinPusherKeySweep(COLON_MACHINE);
-    expect(continueCoinPusherKeySweep(sweep)).toBe(false); // requests passed, answers under way
-    // A stale request lands in the family the pass is done with.
-    writeCoinPusherRequest(COLON_MACHINE, request(OTHER, 'stale'));
-    let batches = 1;
-    while (!continueCoinPusherKeySweep(sweep)) batches += 1;
-    expect(readCoinPusherRequest(COLON_MACHINE, OTHER)).toBeNull();
-    expect(batches).toBeLessThan(10);
-    // The neighbour's keys are left alone.
-    expect(readCoinPusherRequest(NEIGHBOUR, PLAYER)?.requestId).toBe('n-1');
-    expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${NEIGHBOUR}:`))).toHaveLength(2 * PUSHER_SWEEP_BATCH);
+    // A pass that ends on a full batch, and one that ends part-way through one.
+    for (const extra of [0, 10]) {
+      writeCoinPusherState(MACHINE, machineWith(5));
+      for (let i = 0; i < PUSHER_SWEEP_BATCH + extra; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+      drainAndClearCoinPusher(MACHINE, OWNER);
+      const sweep = startCoinPusherKeySweep(MACHINE);
+      expect(continueCoinPusherKeySweep(sweep)).toBe(false);
+      if (extra > 0) expect(continueCoinPusherKeySweep(sweep)).toBe(false); // the last few
+      expect([...map.keys()].filter((k) => k.includes(`${MACHINE}:`))).toEqual([]);
+      // Every key the pass saw is gone when a stale request lands.
+      writeCoinPusherRequest(MACHINE, request(OTHER, `stale-${extra}`));
+      expect(continueCoinPusherKeySweep(sweep)).toBe(false);
+      expect(readCoinPusherRequest(MACHINE, OTHER)).toBeNull();
+      expect(continueCoinPusherKeySweep(sweep)).toBe(true);
+    }
   });
 
-  it('keys written for a neighbour sharing its buckets don\'t hold the sweep up', () => {
-    const map = drainedBesideNeighbour();
-    const sweep = startCoinPusherKeySweep(COLON_MACHINE);
-    expect(continueCoinPusherKeySweep(sweep)).toBe(false);
-    map.set(`pusher-result:${NEIGHBOUR}:late-1`, 'junk');
-    writeCoinPusherRequest(NEIGHBOUR, request(OTHER, 'n-2'));
-    expect(continueCoinPusherKeySweep(sweep)).toBe(false);
-    map.set(`pusher-result:${NEIGHBOUR}:late-2`, 'junk');
-    // One pass, three batches: the neighbour's writes start no other.
-    expect(continueCoinPusherKeySweep(sweep)).toBe(true);
-    expect(coinPusherKeySweepsUnderWay()).toBe(0);
+  it('sweeping a machine leaves the keys of one whose id extends its own alone', () => {
+    const map = doc.getMap('casino');
+    for (const machine of ['a', 'a:b']) {
+      writeCoinPusherState(machine, machineWith(5));
+      writeCoinPusherRequest(machine, request(PLAYER, `req-${machine}`));
+      map.set(coinPusherResultKey(machine, OTHER), 'junk');
+    }
+    drainAndClearCoinPusher('a', OWNER);
+    sweepAll('a');
+    expect(readCoinPusherRequest('a', PLAYER)).toBeNull();
+    expect(map.has(coinPusherResultKey('a', OTHER))).toBe(false);
+    expect(readCoinPusherRequest('a:b', PLAYER)?.requestId).toBe('req-a:b');
+    expect(map.has(coinPusherResultKey('a:b', OTHER))).toBe(true);
+    // And the other way round.
+    writeCoinPusherRequest('a', request(PLAYER, 'req-a-again'));
+    drainAndClearCoinPusher('a:b', OWNER);
+    sweepAll('a:b');
+    expect(readCoinPusherRequest('a:b', PLAYER)).toBeNull();
+    expect(readCoinPusherRequest('a', PLAYER)?.requestId).toBe('req-a-again');
   });
 
-  it('a sweep that has ended, or been stopped, is told of no more writes', () => {
-    writeCoinPusherState(MACHINE, machineWith(5));
-    drainAndClearCoinPusher(MACHINE, OWNER);
-    const ended = startCoinPusherKeySweep(MACHINE);
-    const stopped = startCoinPusherKeySweep(MACHINE);
-    expect(coinPusherKeySweepsUnderWay()).toBe(2);
-    expect(continueCoinPusherKeySweep(ended)).toBe(true);
-    stopCoinPusherKeySweep(stopped);
-    expect(coinPusherKeySweepsUnderWay()).toBe(0);
-    writeCoinPusherRequest(MACHINE, request(PLAYER, 'late'));
-    expect(ended.written).toBe(false);
-    expect(stopped.written).toBe(false);
+  it('keys written for another machine can\'t hold a sweep up', () => {
+    const map = doc.getMap('casino');
+    writeCoinPusherState('a', machineWith(5));
+    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(coinPusherResultKey('a', `p${i}`), 'junk');
+    drainAndClearCoinPusher('a', OWNER);
+    const sweep = startCoinPusherKeySweep('a');
+    let batches = 0;
+    let done = false;
+    while (!done && batches < 10) {
+      done = continueCoinPusherKeySweep(sweep);
+      batches += 1;
+      // A peer floods a neighbour, faster than a sweep's batch, every frame.
+      for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) {
+        map.set(coinPusherResultKey('a:b', `f${batches}-${i}`), 'junk');
+      }
+    }
+    expect(done).toBe(true);
+    expect(batches).toBe(3); // two batches of its own keys, then none left
+    expect([...map.keys()].filter((k) => k.startsWith('pusher-result:a:'))).toEqual([]);
   });
 
   it('a sweep ends when the room changes, writing to neither room\'s doc', () => {
@@ -653,9 +681,6 @@ describe('drainAndClearCoinPusher', () => {
     expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('theirs');
     // The room it left is left alone too: it may be torn down already.
     expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`))).toHaveLength(10);
-    // And that room's index no longer tells it of writes there.
-    map.set(`pusher-result:${MACHINE}:after`, 'junk');
-    expect(sweep.written).toBe(false);
   });
 
   it('refunds nothing for pending or forged requests — they never held chips', () => {

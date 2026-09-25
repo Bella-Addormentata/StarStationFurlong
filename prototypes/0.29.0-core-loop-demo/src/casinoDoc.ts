@@ -833,6 +833,12 @@ export function clearSlotMachineKeys(machineId: string): void {
 //   pusher-door:<mid>       → PusherDoorResult  (the operator's answer to it)
 //   pusher-operator:<mid>   → operator lease     (one browser session operates)
 //
+// In the per-player keys each id is escaped (`%` → `%25`, `:` → `%3A`; see
+// coinPusherRequestKey), so a key splits one way only whatever the ids hold:
+// `(a, b:p)` and `(a:b, p)` are different keys, and no machine's keys start
+// with another's prefix. Ids with neither character (the UUID player ids,
+// `<kind>-<n>` item ids) are written as they are.
+//
 // MONEY: a request is a wish, not a payment. The operator debits the player's
 // one chip, credits exactly what the drop paid out, publishes the new machine
 // and clears the request in ONE transaction (settleCoinPusherInsert). The
@@ -884,205 +890,179 @@ export const PUSHER_REQUEST_SCAN = 64;
 // — a join, where the doc is usually still empty, or the offline fallback)
 // and from then on kept current by an observer that looks only at the keys
 // each transaction changed, local or remote. No poll, and no removal, ever
-// walks the map.
+// walks the map. The keys escape their ids, so each is filed under exactly
+// one machine: the one it names.
 interface PusherRequestIndex {
-  /** machineId → the keys holding its filed requests, in arrival order. */
+  /** machineId → the keys holding its well-formed requests, in arrival order. */
   byMachine: Map<string, Set<string>>;
-  /** key → the machine it is filed under (to unfile it when it changes). */
-  machineOf: Map<string, string>;
-  /** `<family><first segment of mid>` → every key of the per-player families
-   *  that begins so, filed by name alone whatever it holds (a removal sweeps
-   *  a machine's keys from here — see startCoinPusherKeySweep). */
-  byBucket: Map<string, Set<string>>;
-  /** The key sweeps under way on this map, each told when one of its
-   *  machine's keys is written (a pass may already be past that family). */
-  sweeps: Set<CoinPusherKeySweep>;
+  /** machineId → every per-player key naming that machine, whatever it holds
+   *  (a removal sweeps them from here — see startCoinPusherKeySweep). */
+  playerKeys: Map<string, Set<string>>;
 }
 
 const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, PusherRequestIndex>();
 const PUSHER_REQUEST_PREFIX = 'pusher-req:';
-/** The per-player key families under `<family><mid>:` (`pusher-esc:` is an
- *  earlier revision's escrow, still cleared with its machine). */
-const PUSHER_PLAYER_FAMILIES = [PUSHER_REQUEST_PREFIX, 'pusher-result:', 'pusher-esc:'] as const;
+const PUSHER_RESULT_PREFIX = 'pusher-result:';
+/** The per-player key families, each with how many ids follow it, the
+ *  machine's first (`pusher-esc:<mid>:<pid>:<requestId>` is an earlier
+ *  revision's escrow, still cleared with its machine). */
+const PUSHER_PLAYER_FAMILIES: readonly (readonly [family: string, ids: number])[] = [
+  [PUSHER_REQUEST_PREFIX, 2],
+  [PUSHER_RESULT_PREFIX, 2],
+  ['pusher-esc:', 3],
+];
 
-/** `<family><first segment of the rest>`: the bucket a per-player key is filed
- *  in. Machine ids never need to be told apart here — a sweep deletes only the
- *  keys that start with the machine's full prefix. */
-function pusherBucketOf(family: string, key: string): string | null {
-  const cut = key.indexOf(':', family.length);
-  return cut < 0 ? null : key.slice(0, cut);
+/** One id as a key component: `%` and `:` escaped, so the colons between
+ *  components are the only ones in a key. */
+function pusherKeyPart(id: string): string {
+  return id.replace(/[%:]/g, (c) => (c === '%' ? '%25' : '%3A'));
 }
 
-/** Keys a sweep looks at per batch (continueCoinPusherKeySweep). */
+/** The id a key component stands for, or null unless pusherKeyPart writes it
+ *  exactly so (non-empty, every `%` starting `%25` or `%3A`). */
+function pusherIdOf(part: string): string | null {
+  const id = part.replace(/%(25|3A)/g, (_escape, code: string) => (code === '25' ? '%' : ':'));
+  return id !== '' && pusherKeyPart(id) === part ? id : null;
+}
+
+/** `pusher-req:<mid>:<pid>`, the ids escaped: a player's request key. */
+export function coinPusherRequestKey(machineId: string, playerId: string): string {
+  return `${PUSHER_REQUEST_PREFIX}${pusherKeyPart(machineId)}:${pusherKeyPart(playerId)}`;
+}
+
+/** `pusher-result:<mid>:<pid>`, the ids escaped: the operator's answer to
+ *  that player. */
+export function coinPusherResultKey(machineId: string, playerId: string): string {
+  return `${PUSHER_RESULT_PREFIX}${pusherKeyPart(machineId)}:${pusherKeyPart(playerId)}`;
+}
+
+/** A per-player key's family and ids (the machine's first). Null for any other
+ *  key, and for one that isn't its family and exactly that many escaped ids:
+ *  such a key names no machine, and nothing reads it. */
+function parsePusherPlayerKey(key: string): { family: string; ids: string[] } | null {
+  for (const [family, count] of PUSHER_PLAYER_FAMILIES) {
+    if (!key.startsWith(family)) continue;
+    // One part past the count is enough to reject a key, however long.
+    const parts = key.slice(family.length).split(':', count + 1);
+    if (parts.length !== count) return null;
+    const ids: string[] = [];
+    for (const part of parts) {
+      const id = pusherIdOf(part);
+      if (id === null) return null;
+      ids.push(id);
+    }
+    return { family, ids };
+  }
+  return null;
+}
+
+/** Keys a sweep deletes per batch (continueCoinPusherKeySweep). */
 export const PUSHER_SWEEP_BATCH = 64;
 
 /**
  * A removed machine's per-player keys (requests, answers, and `pusher-esc:`
  * escrows an earlier revision left), deleted a batch at a time after the
  * drain, so a flood of them can't stall a frame. None of them carries chips.
- * It works in passes over the index's buckets for the machine, with live
- * iterators: a pass sees every key there was when it began, skipping any
- * deleted meanwhile. A key written meanwhile (a stale request, a late answer)
- * may land in a family the pass is already past, so the index tells the sweep
- * whenever one of its machine's keys is written, and such a pass is followed
- * by another. The sweep ends after a pass during which none was written,
- * however many frames it took. Keys of other machines sharing a bucket (a
- * colon in an id) are neither deleted nor waited for.
+ * It walks the keys the index files under the machine, and no other
+ * machine's, with a live iterator: a key deleted meanwhile is skipped, and
+ * one written meanwhile is deleted too, by this pass or, if it lands after
+ * the pass went by, the next. The sweep ends when the index files no key
+ * under the machine.
  */
 export interface CoinPusherKeySweep {
   readonly machineId: string;
   /** The map it was started on — a sweep never touches another room's. */
   readonly map: Y.Map<unknown>;
-  /** `<family><mid>:` for each per-player family: the keys it deletes. */
-  readonly prefixes: readonly string[];
-  /** This pass's iterators, one per family bucket still to walk. */
-  cursors: Iterator<string>[];
-  /** Whether one of the machine's keys has been written since this pass
-   *  began (set by the index). */
-  written: boolean;
-}
-
-/** Fresh iterators over the machine's buckets in the index, one per family. */
-function sweepCursors(map: Y.Map<unknown>, machineId: string): Iterator<string>[] {
-  const index = pusherRequestIndex(map);
-  const cursors: Iterator<string>[] = [];
-  for (const family of PUSHER_PLAYER_FAMILIES) {
-    const bucket = pusherBucketOf(family, `${family}${machineId}:`);
-    const keys = bucket === null ? undefined : index.byBucket.get(bucket);
-    if (keys) cursors.push(keys.values());
-  }
-  return cursors;
+  /** This pass's iterator (null between passes). */
+  cursor: Iterator<string> | null;
 }
 
 export function startCoinPusherKeySweep(machineId: string): CoinPusherKeySweep {
-  const map = ensureMap();
-  const sweep: CoinPusherKeySweep = {
-    machineId,
-    map,
-    prefixes: PUSHER_PLAYER_FAMILIES.map((family) => `${family}${machineId}:`),
-    cursors: sweepCursors(map, machineId),
-    written: false,
-  };
-  pusherRequestIndex(map).sweeps.add(sweep);
-  return sweep;
-}
-
-/** Give up a sweep that won't be carried on (its cabinet is back, or this
- *  session may no longer manage it): the index stops telling it of writes.
- *  One that has ended (continueCoinPusherKeySweep returned true) is already
- *  stopped. */
-export function stopCoinPusherKeySweep(sweep: CoinPusherKeySweep): void {
-  pusherRequestIndexes.get(sweep.map)?.sweeps.delete(sweep);
-}
-
-/** How many key sweeps are under way on the bound map (debug and tests). */
-export function coinPusherKeySweepsUnderWay(): number {
-  return pusherRequestIndex(ensureMap()).sweeps.size;
+  return { machineId, map: ensureMap(), cursor: null };
 }
 
 /**
- * Look at up to `max` more of the sweep's keys and delete those that are the
- * machine's, in one transaction. True once a whole pass has gone by with none
- * of its keys written, or when the bound doc is no longer the one it started
- * on (nothing is touched then). Either way the sweep is stopped.
+ * Delete up to `max` more of the machine's keys, in one transaction. True
+ * once the index files none under it, or when the bound doc is no longer the
+ * one it started on (nothing is touched then).
  */
 export function continueCoinPusherKeySweep(
   sweep: CoinPusherKeySweep,
   max: number = PUSHER_SWEEP_BATCH,
 ): boolean {
-  if (!docAlive() || casinoMap !== sweep.map) {
-    stopCoinPusherKeySweep(sweep);
-    return true;
-  }
+  if (!docAlive() || casinoMap !== sweep.map) return true;
   const doomed: string[] = [];
-  let looked = 0;
   let finished = false;
-  while (looked < max) {
-    if (sweep.cursors.length === 0) {
-      // The pass is over, having seen every key there was when it began.
-      // Unless one of the machine's keys was written since, none is left;
-      // otherwise start another, once this batch's deletions are in.
-      if (!sweep.written) {
+  while (doomed.length < max) {
+    if (sweep.cursor === null) {
+      // A pass over what the index files under the machine now: none means
+      // none of its keys is left in the map.
+      const keys = pusherRequestIndex(sweep.map).playerKeys.get(sweep.machineId);
+      if (!keys || keys.size === 0) {
         finished = true;
         break;
       }
-      if (doomed.length > 0) break;
-      sweep.cursors = sweepCursors(sweep.map, sweep.machineId);
-      sweep.written = false;
-      continue;
+      sweep.cursor = keys.values();
     }
-    const next = sweep.cursors[0].next();
+    const next = sweep.cursor.next();
     if (next.done) {
-      sweep.cursors.shift();
+      // The pass is over; the next starts once this batch's deletions are in
+      // (until then the index still files them).
+      sweep.cursor = null;
+      if (doomed.length > 0) break;
       continue;
     }
-    looked += 1;
-    // A bucket also holds the keys of a machine whose id extends this one's
-    // first segment (a colon in an id): those are left alone.
-    if (sweep.prefixes.some((prefix) => next.value.startsWith(prefix))) doomed.push(next.value);
+    doomed.push(next.value);
   }
   if (doomed.length > 0) {
     boundDoc!.transact(() => {
       for (const key of doomed) sweep.map.delete(key);
     });
   }
-  if (finished) stopCoinPusherKeySweep(sweep);
   return finished;
 }
 
-/** The machine a value under `key` is a request for, or null when it is not
- *  a well-formed request filed under its own player's key
- *  (`pusher-req:<mid>:<pid>` with `<pid>` its player — the cross-key guard).
- *  The player fixes where `<mid>` ends, so a colon in either id can't file a
- *  request under the wrong machine. */
-function filedRequestMachine(key: string, value: unknown): string | null {
-  if (!key.startsWith(PUSHER_REQUEST_PREFIX) || !isPusherInsertRequest(value)) return null;
-  const tail = `:${value.player}`;
-  const end = key.length - tail.length;
-  if (end <= PUSHER_REQUEST_PREFIX.length || !key.endsWith(tail)) return null;
-  return key.slice(PUSHER_REQUEST_PREFIX.length, end);
-}
-
-/** File `key` afresh: any change is a new arrival, so it goes to the back. */
-function reindexPusherRequest(index: PusherRequestIndex, key: string, value: unknown): void {
-  const was = index.machineOf.get(key);
-  if (was !== undefined) {
-    const keys = index.byMachine.get(was);
-    keys?.delete(key);
-    if (keys?.size === 0) index.byMachine.delete(was);
-    index.machineOf.delete(key);
-  }
-  const machineId = filedRequestMachine(key, value);
-  if (machineId === null) return;
+/** File a request key afresh under its machine: any change is a new arrival,
+ *  so it goes to the back. One that no longer holds a well-formed request of
+ *  the player its key names (the cross-key guard) is unfiled. */
+function reindexPusherRequest(
+  index: PusherRequestIndex,
+  key: string,
+  machineId: string,
+  playerId: string,
+  value: unknown,
+): void {
   let keys = index.byMachine.get(machineId);
-  if (!keys) {
-    keys = new Set();
-    index.byMachine.set(machineId, keys);
+  keys?.delete(key);
+  if (isPusherInsertRequest(value) && value.player === playerId) {
+    if (!keys) {
+      keys = new Set();
+      index.byMachine.set(machineId, keys);
+    }
+    keys.add(key);
+  } else if (keys?.size === 0) {
+    index.byMachine.delete(machineId);
   }
-  keys.add(key);
-  index.machineOf.set(key, machineId);
 }
 
 /** Re-file one changed key of the casino map (a no-op for other keys). */
 function reindexPusherKey(index: PusherRequestIndex, map: Y.Map<unknown>, key: string): void {
-  const family = PUSHER_PLAYER_FAMILIES.find((f) => key.startsWith(f));
-  if (family === undefined) return;
-  if (family === PUSHER_REQUEST_PREFIX) reindexPusherRequest(index, key, map.get(key));
-  const bucket = pusherBucketOf(family, key);
-  if (bucket === null) return;
-  let keys = index.byBucket.get(bucket);
+  const parsed = parsePusherPlayerKey(key);
+  if (parsed === null) return;
+  const [machineId, playerId] = parsed.ids;
+  if (parsed.family === PUSHER_REQUEST_PREFIX) {
+    reindexPusherRequest(index, key, machineId, playerId, map.get(key));
+  }
+  let keys = index.playerKeys.get(machineId);
   if (map.has(key)) {
     if (!keys) {
       keys = new Set();
-      index.byBucket.set(bucket, keys);
+      index.playerKeys.set(machineId, keys);
     }
     keys.add(key);
-    for (const sweep of index.sweeps) {
-      if (sweep.prefixes.some((prefix) => key.startsWith(prefix))) sweep.written = true;
-    }
   } else if (keys) {
     keys.delete(key);
-    if (keys.size === 0) index.byBucket.delete(bucket);
+    if (keys.size === 0) index.playerKeys.delete(machineId);
   }
 }
 
@@ -1090,9 +1070,7 @@ function reindexPusherKey(index: PusherRequestIndex, map: Y.Map<unknown>, key: s
 function pusherRequestIndex(map: Y.Map<unknown>): PusherRequestIndex {
   const existing = pusherRequestIndexes.get(map);
   if (existing) return existing;
-  const index: PusherRequestIndex = {
-    byMachine: new Map(), machineOf: new Map(), byBucket: new Map(), sweeps: new Set(),
-  };
+  const index: PusherRequestIndex = { byMachine: new Map(), playerKeys: new Map() };
   for (const key of map.keys()) reindexPusherKey(index, map, key);
   map.observe((event) => {
     for (const key of event.keysChanged) reindexPusherKey(index, map, key);
@@ -1130,7 +1108,7 @@ export function readCoinPusherRequest(
   machineId: string,
   playerId: string,
 ): PusherInsertRequest | null {
-  const value = ensureMap().get(`pusher-req:${machineId}:${playerId}`);
+  const value = ensureMap().get(coinPusherRequestKey(machineId, playerId));
   return isPusherInsertRequest(value) && value.player === playerId ? value : null;
 }
 
@@ -1145,7 +1123,7 @@ export function writeCoinPusherRequest(
   if (!isPusherInsertRequest(request)) return false;
   // A guarded read, not map.has: junk under the key must not lock the player out.
   if (readCoinPusherRequest(machineId, request.player)) return false;
-  ensureMap().set(`pusher-req:${machineId}:${request.player}`, request);
+  ensureMap().set(coinPusherRequestKey(machineId, request.player), request);
   return true;
 }
 
@@ -1159,13 +1137,13 @@ export function cancelCoinPusherRequest(
   requestId: string,
 ): boolean {
   if (readCoinPusherRequest(machineId, playerId)?.requestId !== requestId) return false;
-  ensureMap().delete(`pusher-req:${machineId}:${playerId}`);
+  ensureMap().delete(coinPusherRequestKey(machineId, playerId));
   return true;
 }
 
 /** The operator's answer to `playerId`'s latest request (null before the first). */
 export function readCoinPusherResult(machineId: string, playerId: string): PusherResult | null {
-  const value = ensureMap().get(`pusher-result:${machineId}:${playerId}`);
+  const value = ensureMap().get(coinPusherResultKey(machineId, playerId));
   return isPusherResult(value) ? value : null;
 }
 
@@ -1299,8 +1277,8 @@ export function settleCoinPusherInsert(
   boundDoc!.transact(() => {
     map.set(`pusher:${machineId}`, normalized);
     map.set(balanceKey, nextBalance);
-    map.set(`pusher-result:${machineId}:${request.player}`, result);
-    map.delete(`pusher-req:${machineId}:${request.player}`);
+    map.set(coinPusherResultKey(machineId, request.player), result);
+    map.delete(coinPusherRequestKey(machineId, request.player));
   });
   return 'ok';
 }
@@ -1323,8 +1301,8 @@ export function refuseCoinPusherInsert(
   const result: PusherResult = { kind: 'refused', requestId: request.requestId, reason, atMs };
   const map = ensureMap();
   boundDoc!.transact(() => {
-    map.set(`pusher-result:${machineId}:${request.player}`, result);
-    map.delete(`pusher-req:${machineId}:${request.player}`);
+    map.set(coinPusherResultKey(machineId, request.player), result);
+    map.delete(coinPusherRequestKey(machineId, request.player));
   });
   return true;
 }
@@ -1429,6 +1407,6 @@ if (typeof window !== 'undefined') {
     releaseSlotSharedBankrollLease,
     readCoinPusherState, readCoinPusherRequests, readCoinPusherRequest,
     readCoinPusherResult, readCoinPusherEmptyRequest, readCoinPusherDoorResult,
-    readCoinPusherOperatorLease, coinPusherKeySweepsUnderWay,
+    readCoinPusherOperatorLease, coinPusherRequestKey, coinPusherResultKey,
   };
 }

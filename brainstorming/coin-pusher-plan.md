@@ -114,6 +114,11 @@ Records in the room's `casino` map:
 | `pusher-door:<mid>` | the operator | its answer to the latest door request |
 | `pusher-operator:<mid>` | the operator | its lease |
 
+In the per-player keys each id is escaped (`%` → `%25`, `:` → `%3A`), so a
+key splits one way only: `(a, b:p)` and `(a:b, p)` are different keys, and
+no machine's keys begin with another machine's prefix. Ordinary ids (the UUID
+player ids, `<kind>-<n>` item ids) are written as they are.
+
 - **Election.** Only the room's deed holder operates (`canRunCroupier`, the
   rule every casino operator follows since #141/#142), and only one of their
   browser sessions: the lease is written, the session waits 2 s for the doc to
@@ -157,11 +162,12 @@ Records in the room's `casino` map:
   the keys each transaction changed. No poll, not even a machine's first,
   walks the map, and a read looks at no more than 64 requests (in arrival
   order), so a poll costs the same however many keys peers write. A request
-  is filed by its own player: the `<pid>` at the end of its key must be its
-  player, which also fixes where `<mid>` ends if either id contains a colon.
-  The same index files every key of the per-player families (`pusher-req:`,
-  `pusher-result:`, `pusher-esc:`) by name, so a removal finds a machine's
-  keys without walking the map either.
+  is filed only under the machine and player its key names, and only if the
+  request's own player is that player. The same index files every per-player
+  key (`pusher-req:`, `pusher-result:`, `pusher-esc:`) under the one machine
+  it names, so a removal finds a machine's keys, and no other machine's,
+  without walking the map either. A key that isn't its ids escaped exactly
+  once names no machine, and nothing reads it.
 - **Answers.** Each player's answer lives under their own
   `pusher-result:<mid>:<pid>` until their next request is answered. The
   machine's `lastDrop` (the settle's check on the payout) and `recentDrops`
@@ -190,13 +196,12 @@ Records in the room's `casino` map:
   machine's own keys, a fixed few. Its per-player keys (requests, answers,
   and any `pusher-esc:` records an earlier revision left) carry no chips.
   They are then swept a batch of 64 per frame through the index, so a flood
-  of them can't stall a frame. The sweep works in passes, each seeing every
-  key there was when it began. A key written meanwhile (a stale request, a
-  late answer) may land in a family the pass is already past, so the index
-  tells the sweep whenever one of its machine's keys is written, and such a
-  pass is followed by another. The sweep ends after a pass during which none
-  was, however many frames it took; writes for other machines sharing a
-  bucket (a colon in an id) don't hold it up. Every settle happens on the
+  of them can't stall a frame. The sweep walks only the keys the index files
+  under the machine, with a live iterator, so a key written meanwhile (a
+  stale request, a late answer) goes too: in the same pass, or in the next
+  if it lands after the pass went by. The sweep ends when the index files
+  none under the machine. Another machine's keys never enter its walk, so
+  they can neither be deleted nor keep it going. Every settle happens on the
   lease holder, so the drain never merges with a drop another tab is still
   settling (that would bring the machine back and pay its chips twice).
   Another deed-holder session keeps the teardown pending, and finishes it

@@ -67,7 +67,6 @@ import {
   refuseCoinPusherInsert,
   settleCoinPusherInsert,
   startCoinPusherKeySweep,
-  stopCoinPusherKeySweep,
   writeCoinPusherOperatorLease,
   writeCoinPusherState,
 } from './casinoDoc';
@@ -107,16 +106,6 @@ const pendingTeardowns = new Map<string, number>();
 /** Drained machines whose per-player keys this session is still deleting, a
  *  batch a frame (tickCoinPusherTeardowns). */
 const sweeps = new Map<string, CoinPusherKeySweep>();
-
-/** Give up the machine's key sweep, if any (the index stops telling it of
- *  writes). */
-function dropSweep(machineId: string): void {
-  const sweep = sweeps.get(machineId);
-  if (!sweep) return;
-  stopCoinPusherKeySweep(sweep);
-  sweeps.delete(machineId);
-}
-
 /** Short: a drop's timing window (MAX_DROP_LAG_MS) has to cover this wait. */
 const REQUEST_POLL_MS = 100;
 /** Inserts settled or refused per poll (≤ 40 a second per machine). */
@@ -218,7 +207,7 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
   // World ticks only cabinets in the room, so one put back before its
   // teardown ran (or finished) is no longer to be torn down.
   pendingTeardowns.delete(machineId);
-  dropSweep(machineId);
+  sweeps.delete(machineId);
   if (!canRunCroupier()) {
     stopCoinPusherOperator(machineId);
     return;
@@ -383,7 +372,7 @@ export function closeCoinPusher(
   lastPolls.delete(machineId);
   if (!canManage) {
     pendingTeardowns.delete(machineId);
-    dropSweep(machineId);
+    sweeps.delete(machineId);
     leaseFirstSeen.delete(machineId);
     if (readCoinPusherOperatorLease(machineId)?.sessionId === operatorSessionId) {
       clearCoinPusherOperatorLease(machineId);
@@ -412,7 +401,6 @@ function tearDownIfFree(machineId: string, now: number): void {
   // The chips and the machine's own keys go in one transaction; its
   // per-player keys (no chips in any) follow a batch per frame.
   drainAndClearCoinPusher(machineId, playerId);
-  dropSweep(machineId); // an earlier removal's, never ticked since
   const sweep = startCoinPusherKeySweep(machineId);
   if (!continueCoinPusherKeySweep(sweep)) sweeps.set(machineId, sweep);
 }
@@ -425,7 +413,7 @@ export function tickCoinPusherTeardowns(now = Date.now()): void {
   if (!canRunCroupier()) {
     for (const machineId of pendingTeardowns.keys()) leaseFirstSeen.delete(machineId);
     pendingTeardowns.clear();
-    for (const machineId of [...sweeps.keys()]) dropSweep(machineId);
+    sweeps.clear();
     return;
   }
   for (const [machineId, sweep] of [...sweeps]) {

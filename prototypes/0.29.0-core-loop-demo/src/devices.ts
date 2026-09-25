@@ -85,7 +85,7 @@ import {
   // 🪙 Coin pusher (#135) — the player's and owner's request keys; the
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
-  cancelCoinPusherRequest, readCoinPusherResult,
+  cancelCoinPusherRequest, coinPusherRequestKey, coinPusherResultKey, readCoinPusherResult,
   readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
   readCoinPusherOperatorLease,
   subscribeCasinoKey,
@@ -4539,8 +4539,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       deps.onSelectedHoleChange?.(selectedHole);
       for (const key of [
         `pusher:${deps.itemId}`,
-        `pusher-req:${deps.itemId}:${myId}`,
-        `pusher-result:${deps.itemId}:${myId}`,
+        coinPusherRequestKey(deps.itemId, myId),
+        coinPusherResultKey(deps.itemId, myId),
         `pusher-empty:${deps.itemId}`,
         `pusher-door:${deps.itemId}`,
         `pusher-operator:${deps.itemId}`,
