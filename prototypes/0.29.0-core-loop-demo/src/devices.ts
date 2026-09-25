@@ -247,13 +247,16 @@ export interface TrunkLidHandle {
  */
 export interface CloneVatHandle {
   /**
-   * Snap to the full+closed attract state, hold a short beat, then drain the
-   * liquid and spin the glass door open. onOpen fires exactly once when the
+   * Snap to the full+closed attract state, hold a short beat, drain the
+   * liquid, hold the drained tank shut a beat (so it visibly reads EMPTY),
+   * then spin the glass door open. onOpen fires exactly once when the
    * doorway is clear (the avatar may walk out). Restarts cleanly if called
    * mid-cycle.
    */
   beginSpawnCycle(onOpen: () => void): void;
-  /** Spin the door shut, then slowly refill the tank (idle attract state). */
+  /** Spin the door shut from wherever it stands, then slowly refill the tank
+   *  (idle attract state) — the tank never refills behind an open door. A
+   *  pending onOpen is dropped; a no-op when already sealed or sealing. */
   closeAndRefill(): void;
   /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
   update(deltaTime: number): void;

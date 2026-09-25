@@ -108,6 +108,7 @@ import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
   migrateDefaultLayout,
+  relocateLegacyDefaultVat,
   furnitureDocSize,
   subscribeFurniture,
   writeFurnitureItem,
@@ -1767,6 +1768,14 @@ async function joinRoomAtEpoch(
       if (!roomMap.get("lobbyDoorClearV5")) {
         migrateDefaultLayout();
         roomMap.set("lobbyDoorClearV5", true);
+      }
+      // 🧬 #165 one-time: the clone vat grew to a 2×2 tank centred on the NW
+      // corner square — an unmoved default vat (and the corner cherry tree it
+      // would swallow) moves to the new default pose. Its own marker, after
+      // V5 (which already writes the new pose into rooms it upgrades).
+      if (!roomMap.get("cloneVat2x2V1")) {
+        relocateLegacyDefaultVat();
+        roomMap.set("cloneVat2x2V1", true);
       }
       // 🕯️ Additive one-time: give already-migrated lobbies the new ceiling
       // chandelier WITHOUT re-snapping the rest of the layout (a full

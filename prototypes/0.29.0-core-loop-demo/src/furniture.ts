@@ -47,6 +47,17 @@ import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./
 // it, and DoorWall is type-only — no cycle either way.)
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import type { DoorWall } from "./doorLayoutDoc";
+// 🧬 #165: the clone vat's tank dimensions live with the avatar's clearance
+// gauge (pure, no imports) so the glass and the squeeze never drift apart.
+import {
+  VAT_GLASS_R,
+  VAT_GLASS_BASE_Y,
+  VAT_GLASS_H,
+  VAT_PLINTH_R,
+  VAT_PAD_Y,
+  VAT_DOOR_ARC,
+  VAT_DOOR_TOP_Y,
+} from "./vatGauge";
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box {
@@ -3273,21 +3284,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.85, z: 0 },
     },
   },
-  // 🧬 Clone vat — the diegetic spawn point (owner request). 1×1 obstacle,
-  // no seats. The DEVICE panel is the spawn-point picker ("wake up here");
-  // the decant choreography itself stays with World.respawnAtVat. Front is
-  // the door face (+z at rot 0 — the walk-out side).
+  // 🧬 Clone vat — the diegetic spawn point (owner request). 2×2 obstacle
+  // (#165: the tank sits centred on a 2×2 square — even extents snap its
+  // centre to the integer lattice), no seats. The DEVICE panel is the
+  // spawn-point picker ("wake up here"); the decant choreography itself stays
+  // with World.respawnAtVat. Front is the door face (+z at rot 0 — the
+  // walk-out side), the first cell past the footprint edge.
   "clone-vat": {
     kind: "clone-vat",
     build: buildCloneVat,
-    footprint: { w: 1, d: 1 },
+    footprint: { w: 2, d: 2 },
     functions: ["cloneVat"],
     device: {
       kind: "cloneVat",
-      front: { x: 0, z: 1.0 },
+      front: { x: 0, z: 1.5 },
       faceAngle: Math.PI,
-      eye: { x: 0, y: 1.6, z: 0.95 },
-      anchor: { x: 0, y: 1.2, z: 0 },
+      eye: { x: 0, y: 1.9, z: 1.45 },
+      anchor: { x: 0, y: 1.6, z: 0 },
     },
   },
   // 🛏️ Bunk bed — two lie-down berths (SeatTemplates with sitY + lie), no
@@ -5299,19 +5312,21 @@ function buildBunkBed({ m, place }: BuildCtx) {
 // ── 🧬 Clone vat (owner request) — the diegetic spawn point ──────────────────
 // Concept-art-faithful cloning tank: gunmetal plinth + cap, a glass cylinder
 // full of glowing green nutrient bath, orange feed pipes and a status plate.
-// Local frame (rot 0): the DOOR faces +z. The spawn choreography (drain the
-// liquid, then SPIN the front glass segment around the cylinder axis until it
-// tucks behind the fixed back shell) is driven by a CloneVatHandle stowed in
-// a base mesh's userData.cloneVat — World collects it and drives update(dt)
-// every frame (trunk-lid idiom, never a detached rAF).
-const VAT_GLASS_R = 0.4; // glass tube radius
-const VAT_GLASS_H = 1.8; // glass tube height (y 0.30 → 2.10)
-const VAT_DOOR_ARC = (Math.PI * 2) / 3; // 120° front door segment
-const VAT_DOOR_OPEN = Math.PI * 0.72; // spun back behind the shell
+// Local frame (rot 0): the DOOR faces +z. #165 grew the tank to fill its 2×2
+// square; every tank dimension comes from vatGauge.ts, which also holds the
+// hourglass clearance the avatar is squeezed to on its way out. The spawn
+// choreography (drain the liquid, hold the tank visibly EMPTY, then SPIN the
+// front glass leaf around the cylinder axis until it tucks behind the fixed
+// back shell — and once the clone is clear, spin it shut and only THEN
+// refill) is driven by a CloneVatHandle stowed in a base mesh's
+// userData.cloneVat — World collects it and drives update(dt) every frame
+// (trunk-lid idiom, never a detached rAF).
+const VAT_DOOR_OPEN = Math.PI; // leaf spun round to the back, behind the shell
 const VAT_BEAT_TIME = 0.5; // full-tank hold before the drain starts
-const VAT_DRAIN_TIME = 1.4;
-const VAT_DOOR_TIME = 0.9;
-const VAT_REFILL_TIME = 2.6;
+const VAT_DRAIN_TIME = 1.6;
+const VAT_EMPTY_TIME = 0.5; // drained tank held shut so "empty" reads first
+const VAT_DOOR_TIME = 1.1;
+const VAT_REFILL_TIME = 2.8;
 const VAT_GREEN = 0x39ff6a;
 
 /** One-shot status-plate decal (trunk stencil idiom, two-line variant). */
@@ -5344,77 +5359,88 @@ function buildCloneVat(ctx: BuildCtx) {
   const TRIM = 0x3d4a5e; // bezel slate
   const PIPE_O = 0xe8760a; // trunk orange conduits
   const STEEL = 0x8a93a0;
+  const R = VAT_GLASS_R;
+  const GLASS_TOP = VAT_GLASS_BASE_Y + VAT_GLASS_H; // the cap sits here
+  const CAP_H = 0.26;
+  const CAP_Y = GLASS_TOP + CAP_H / 2 - 0.02;
 
-  // ── Plinth + interior floor pad
+  // ── Plinth + interior floor pad (the held clone stands ON the pad)
   place(
-    new THREE.CylinderGeometry(0.5, 0.52, 0.08, 20),
+    new THREE.CylinderGeometry(VAT_PLINTH_R + 0.02, VAT_PLINTH_R + 0.05, 0.08, 36),
     m(TRIM, 0.6, 0.4),
     0,
     0.04,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.46, 0.48, 0.24, 20),
+    new THREE.CylinderGeometry(VAT_PLINTH_R - 0.02, VAT_PLINTH_R, 0.24, 36),
     m(BODY, 0.55, 0.45),
     0,
     0.2,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.38, 0.38, 0.03, 20),
+    new THREE.CylinderGeometry(R - 0.03, R - 0.03, 0.03, 36),
     m(0x14181e, 0.9, 0.1),
     0,
-    0.315,
+    VAT_PAD_Y - 0.015,
     0,
   );
   // Drain grate + green-lit outflow at the door side (concept art's spout)
   place(
-    new THREE.BoxGeometry(0.22, 0.07, 0.1),
+    new THREE.BoxGeometry(0.4, 0.07, 0.12),
     m(0x14181e, 0.8, 0.2),
     0,
     0.1,
-    0.48,
+    VAT_PLINTH_R - 0.04,
   );
-  place(new THREE.BoxGeometry(0.14, 0.02, 0.03), flat(VAT_GREEN), 0, 0.1, 0.53);
+  place(
+    new THREE.BoxGeometry(0.26, 0.02, 0.03),
+    flat(VAT_GREEN),
+    0,
+    0.1,
+    VAT_PLINTH_R + 0.03,
+  );
 
   // ── Cap + head-end greebles
   place(
-    new THREE.CylinderGeometry(0.48, 0.46, 0.22, 20),
+    new THREE.CylinderGeometry(R + 0.1, R + 0.12, CAP_H, 36),
     m(BODY, 0.55, 0.45),
     0,
-    2.21,
+    CAP_Y,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.14, 0.14, 0.34, 12),
+    new THREE.CylinderGeometry(0.26, 0.26, 0.3, 16),
     m(TRIM, 0.5, 0.5),
     0,
-    2.49,
+    CAP_Y + CAP_H / 2 + 0.15,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.05, 0.05, 0.2, 8),
+    new THREE.CylinderGeometry(0.08, 0.08, 0.18, 10),
     m(STEEL, 0.45, 0.6),
     0,
-    2.72,
+    CAP_Y + CAP_H / 2 + 0.39,
     0,
   );
-  // Orange feed conduits arcing down the back
+  // Orange feed conduits down the back, outside the leaf's sweep (the open
+  // door parks behind the shell between them and the glass)
   for (const sx of [-1, 1]) {
     const pipe = place(
-      new THREE.CylinderGeometry(0.035, 0.035, 1.9, 8),
+      new THREE.CylinderGeometry(0.045, 0.045, VAT_GLASS_H, 8),
       m(PIPE_O, 0.5, 0.4),
-      sx * 0.3,
-      1.2,
-      -0.4,
+      sx * 0.42,
+      VAT_GLASS_BASE_Y + VAT_GLASS_H / 2,
+      -(R + 0.06),
     );
-    pipe.rotation.x = 0.08;
+    pipe.rotation.x = 0.04;
     place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.1, 8),
+      new THREE.CylinderGeometry(0.06, 0.06, 0.12, 8),
       m(STEEL, 0.45, 0.6),
-      sx * 0.3,
-      2.18,
-      -0.42,
+      sx * 0.42,
+      GLASS_TOP - 0.03,
+      -(R + 0.09),
     );
   }
   // Status plate on the cap front (faces the door side)
@@ -5423,19 +5449,20 @@ function buildCloneVat(ctx: BuildCtx) {
     transparent: true,
     opacity: 0,
   });
-  place(new THREE.PlaneGeometry(0.34, 0.17), plateMat, 0, 2.21, 0.475);
+  place(new THREE.PlaneGeometry(0.56, 0.2), plateMat, 0, CAP_Y, R + 0.125);
   // Green status pip strip on the plinth front
   place(
-    new THREE.BoxGeometry(0.2, 0.035, 0.02),
+    new THREE.BoxGeometry(0.36, 0.04, 0.02),
     flat(VAT_GREEN),
     0,
     0.24,
-    0.475,
+    VAT_PLINTH_R - 0.005,
   );
 
-  // ── Glass: fixed back shell (240°) + spinning front door segment (120°).
-  //    CylinderGeometry θ=0 sits on +z (vertex = (sinθ, y, cosθ)), so a door
-  //    centred on the +z axis is thetaStart −60° for 120°.
+  // ── Glass: fixed back shell + fixed transom over the doorway + the
+  //    spinning front door leaf (VAT_DOOR_ARC wide, VAT_DOOR_TOP_Y tall).
+  //    CylinderGeometry θ=0 sits on +z (vertex = (sinθ, y, cosθ)), so a leaf
+  //    centred on the +z axis starts at −arc/2.
   const glassMat = () => {
     const gm = m(0x9bd4e8, 0.05, 0.1);
     gm.side = THREE.DoubleSide;
@@ -5444,30 +5471,67 @@ function buildCloneVat(ctx: BuildCtx) {
   };
   place(
     new THREE.CylinderGeometry(
-      VAT_GLASS_R,
-      VAT_GLASS_R,
+      R,
+      R,
       VAT_GLASS_H,
-      28,
+      40,
       1,
       true,
-      Math.PI / 3,
-      (Math.PI * 4) / 3,
+      VAT_DOOR_ARC / 2,
+      Math.PI * 2 - VAT_DOOR_ARC,
     ),
     glassMat(),
     0,
-    0.3 + VAT_GLASS_H / 2,
+    VAT_GLASS_BASE_Y + VAT_GLASS_H / 2,
     0,
   );
+  const transomH = GLASS_TOP - VAT_DOOR_TOP_Y;
+  place(
+    new THREE.CylinderGeometry(
+      R,
+      R,
+      transomH,
+      20,
+      1,
+      true,
+      -VAT_DOOR_ARC / 2,
+      VAT_DOOR_ARC,
+    ),
+    glassMat(),
+    0,
+    VAT_DOOR_TOP_Y + transomH / 2,
+    0,
+  );
+  // Steel lintel strip along the transom's lower edge — frames the doorway
+  const lintelMat = m(STEEL, 0.5, 0.5);
+  lintelMat.side = THREE.DoubleSide;
+  place(
+    new THREE.CylinderGeometry(
+      R + 0.015,
+      R + 0.015,
+      0.05,
+      20,
+      1,
+      true,
+      -VAT_DOOR_ARC / 2,
+      VAT_DOOR_ARC,
+    ),
+    lintelMat,
+    0,
+    VAT_DOOR_TOP_Y + 0.025,
+    0,
+  );
+  const leafH = VAT_DOOR_TOP_Y - VAT_GLASS_BASE_Y;
   const doorGroup = new THREE.Group();
   doorGroup.name = "cloneVatDoor";
-  doorGroup.position.set(0, 0.3 + VAT_GLASS_H / 2, 0); // on the tube axis
+  doorGroup.position.set(0, VAT_GLASS_BASE_Y + leafH / 2, 0); // on the tube axis
   attach(doorGroup);
   const doorMesh = new THREE.Mesh(
     new THREE.CylinderGeometry(
-      VAT_GLASS_R + 0.012,
-      VAT_GLASS_R + 0.012,
-      VAT_GLASS_H,
-      12,
+      R + 0.012,
+      R + 0.012,
+      leafH,
+      20,
       1,
       true,
       -VAT_DOOR_ARC / 2,
@@ -5476,47 +5540,48 @@ function buildCloneVat(ctx: BuildCtx) {
     glassMat(),
   );
   doorGroup.add(doorMesh);
-  // Thin steel edge rails on the door segment so the spin reads from afar
+  // Thin steel edge rails on the door leaf so the spin reads from afar
   for (const edge of [-VAT_DOOR_ARC / 2, VAT_DOOR_ARC / 2]) {
     const rail = new THREE.Mesh(
-      new THREE.BoxGeometry(0.03, VAT_GLASS_H, 0.03),
+      new THREE.BoxGeometry(0.035, leafH, 0.035),
       m(STEEL, 0.5, 0.5),
     );
     rail.position.set(
-      Math.sin(edge) * (VAT_GLASS_R + 0.02),
+      Math.sin(edge) * (R + 0.02),
       0,
-      Math.cos(edge) * (VAT_GLASS_R + 0.02),
+      Math.cos(edge) * (R + 0.02),
     );
     doorGroup.add(rail);
   }
 
-  // ── Nutrient bath: emissive green column, origin at its BOTTOM so scale.y
-  //    is the fill level (drains downward like the art's outflow panels).
-  const liquidGeo = new THREE.CylinderGeometry(
-    0.355,
-    0.355,
-    VAT_GLASS_H - 0.1,
-    24,
-  );
-  liquidGeo.translate(0, (VAT_GLASS_H - 0.1) / 2, 0);
+  // ── Nutrient bath: emissive green column, origin at its BOTTOM (the pad)
+  //    so scale.y is the fill level (drains downward like the art's outflow
+  //    panels).
+  const liquidH = GLASS_TOP - 0.05 - VAT_PAD_Y;
+  const liquidGeo = new THREE.CylinderGeometry(R - 0.04, R - 0.04, liquidH, 36);
+  liquidGeo.translate(0, liquidH / 2, 0);
   const liquidMat = flat(VAT_GREEN);
   liquidMat.userData.baseOpacity = 0.5;
-  const liquid = place(liquidGeo, liquidMat, 0, 0.33, 0);
+  const liquid = place(liquidGeo, liquidMat, 0, VAT_PAD_Y, 0);
   // Inner glow core (brighter, thinner — reads as depth in the bath)
-  const coreGeo = new THREE.CylinderGeometry(0.16, 0.16, VAT_GLASS_H - 0.3, 12);
-  coreGeo.translate(0, (VAT_GLASS_H - 0.3) / 2, 0);
+  const coreH = liquidH - 0.25;
+  const coreGeo = new THREE.CylinderGeometry(0.28, 0.28, coreH, 16);
+  coreGeo.translate(0, coreH / 2, 0);
   const coreMat = flat(0x9fffb8);
   coreMat.userData.baseOpacity = 0.35;
-  const core = place(coreGeo, coreMat, 0, 0.36, 0);
+  const core = place(coreGeo, coreMat, 0, VAT_PAD_Y + 0.03, 0);
   // Bath glow light (dims as the tank drains — handle-owned post-morph)
-  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 4.5);
-  addLight(bathLight, 0, 1.3, 0, 1.4);
+  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 5.5);
+  addLight(bathLight, 0, 1.7, 0, 1.6);
 
-  // ── Handle: BEAT → DRAIN → OPEN (onOpen) / CLOSE → REFILL state machine.
+  // ── Handle: BEAT → DRAIN → EMPTY → OPEN (onOpen) / CLOSE → REFILL.
+  //    The door only ever opens on a drained tank (OPEN follows EMPTY), and
+  //    the tank only ever refills behind a shut door (REFILL follows CLOSE).
   type VatPhase =
     | "IDLE_FULL"
     | "BEAT"
     | "DRAIN"
+    | "EMPTY"
     | "OPEN"
     | "IDLE_OPEN"
     | "CLOSE"
@@ -5525,6 +5590,10 @@ function buildCloneVat(ctx: BuildCtx) {
   let t = 0;
   let level = 1; // liquid fill 0..1
   let doorAngle = 0; // 0 closed → VAT_DOOR_OPEN tucked behind
+  // Where CLOSE / REFILL start from: a cycle cut short mid-drain or mid-spin
+  // eases home from where it is instead of snapping wide open first.
+  let closeFrom = 0;
+  let refillFrom = 0;
   let onOpenCb: (() => void) | null = null;
   const smooth = (v: number) => v * v * (3 - 2 * v);
 
@@ -5547,8 +5616,13 @@ function buildCloneVat(ctx: BuildCtx) {
       applyPose();
     },
     closeAndRefill(): void {
+      // Idempotent: already sealed, or already sealing.
+      if (phase === "IDLE_FULL" || phase === "CLOSE" || phase === "REFILL") {
+        return;
+      }
       phase = "CLOSE";
       t = 0;
+      closeFrom = doorAngle;
       onOpenCb = null; // a pending open is superseded — never fire it late
     },
     update(deltaTime: number): void {
@@ -5565,6 +5639,13 @@ function buildCloneVat(ctx: BuildCtx) {
           level = 1 - smooth(Math.min(1, t / VAT_DRAIN_TIME));
           if (t >= VAT_DRAIN_TIME) {
             level = 0;
+            phase = "EMPTY";
+            t = 0;
+          }
+          break;
+        case "EMPTY":
+          // Hold the drained tank shut a beat — the reveal reads "empty".
+          if (t >= VAT_EMPTY_TIME) {
             phase = "OPEN";
             t = 0;
           }
@@ -5582,16 +5663,18 @@ function buildCloneVat(ctx: BuildCtx) {
           }
           break;
         case "CLOSE":
-          doorAngle =
-            VAT_DOOR_OPEN * (1 - smooth(Math.min(1, t / VAT_DOOR_TIME)));
-          if (t >= VAT_DOOR_TIME) {
+          doorAngle = closeFrom * (1 - smooth(Math.min(1, t / VAT_DOOR_TIME)));
+          if (t >= VAT_DOOR_TIME || closeFrom === 0) {
             doorAngle = 0;
             phase = "REFILL";
             t = 0;
+            refillFrom = level;
           }
           break;
         case "REFILL":
-          level = smooth(Math.min(1, t / VAT_REFILL_TIME));
+          level =
+            refillFrom +
+            (1 - refillFrom) * smooth(Math.min(1, t / VAT_REFILL_TIME));
           if (t >= VAT_REFILL_TIME) {
             level = 1;
             phase = "IDLE_FULL";
@@ -5601,7 +5684,7 @@ function buildCloneVat(ctx: BuildCtx) {
       // Bath glow follows the liquid (idle phases return early above, so the
       // morph fade-in owns the light until a spawn cycle actually runs).
       bathLight.intensity =
-        ((bathLight.userData.targetIntensity as number) ?? 1.4) *
+        ((bathLight.userData.targetIntensity as number) ?? 1.6) *
         (0.2 + 0.8 * level);
       applyPose();
     },
@@ -6359,10 +6442,15 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 0,
     movable: true,
   }, // moved — bar occupies right-front corner
+  // 🧬 #165: moved out of the NW corner, which the 2×2 clone vat now fills
+  // (its canopy was already clipping the old 1×1 tank). West wall, between
+  // the paired west door's lane (z[-4,-2]) and armchair-left-0; its canopy
+  // (reaching z≈-2.1) stays clear of the clone's muzzle where the vat
+  // walk-out stops (z≈-2.25).
   {
     id: "cherry-tree-back-left",
     kind: "cherry-tree",
-    pos: { x: -5.3, z: -5.3 },
+    pos: { x: -5.35, z: -1.6 },
     rot: 0,
     movable: true,
   },
@@ -6468,17 +6556,22 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 1,
     movable: true,
   },
-  // 🧬 Clone vat in the NW pocket: AABB x[-4,-3] z[-5,-4] fills the 1×1
-  // dead-end between the back-left lamp table (x[-5,-4] z[-5,-4]) and the
-  // storage trunk (x[-3,-2] z[-5,-4]), flush against the fireplace line
-  // (z=-5) — zero residual gaps, same wedge-trap-safe-by-construction
-  // reasoning as the bunk bed's nook. rot 0 ⇒ the glass door faces +z into
-  // the open x[-4,-3] z[-4,-3] cell; the spawn walk-out exits to (-3.5,-3.5).
-  // Parity: w=1/d=1 both odd → centre at n+0.5 on both axes ✓.
+  // 🧬 Clone vat centred on the NW corner's 2×2 square x[-6,-4] z[-6,-4]
+  // (#165), flush against both walls — zero residual gaps, the same
+  // wedge-trap-safe-by-construction reasoning as the bunk bed's nook. It is
+  // the only 2×2 in that corner clear of the paired lobby doors (north wall
+  // x=-3 → lane x[-4,-2]; west wall z=-3 → lane z[-4,-2]) as well as the
+  // centred ones. Like the map table and lamp tables it hugs the wall past
+  // the edit-mode placement box (±5), so a drag can't return it exactly here.
+  // rot 0 ⇒ the glass door faces +z along the west wall; the panel front is
+  // (-5,-3.5) and the spawn walk-out ends VAT_EXIT_ALONG (~2.1 m) out, at
+  // about (-5,-2.9). Parity: w=2/d=2 both even → centre at integer n ✓. The
+  // previous 1×1 default pose (-4.7,-4.9) is migrated here once
+  // (furnitureDoc.relocateLegacyDefaultVat).
   {
     id: "clone-vat",
     kind: "clone-vat",
-    pos: { x: -4.7, z: -4.9 },
+    pos: { x: -5, z: -5 },
     rot: 0,
     movable: true,
   },
@@ -6537,8 +6630,7 @@ if (import.meta.env.DEV) assertPlacementClear("clone-vat");
 // ── Derivation helpers ────────────────────────────────────────────────────────
 
 /** Rotate a local XZ offset by quarter-turns CCW about +y (exact — no FP
- *  drift). Exported for the clone-vat spawn choreography (world.ts derives
- *  the walk-out exit point from the vat item's rot). */
+ *  drift). */
 export function rotXZ(
   x: number,
   z: number,

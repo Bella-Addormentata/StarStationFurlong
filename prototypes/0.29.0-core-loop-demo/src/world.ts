@@ -53,7 +53,6 @@ import {
   buildItemGroup,
   furnitureVisualYaw,
   BUNK_TOP_Y,
-  rotXZ,
   POOL_SWIM_Y,
   POOL_WATER_Y,
   DIVE_TIME,
@@ -5498,26 +5497,29 @@ export class World {
 
   /**
    * Run the full spawn ceremony at the room's clone vat: the avatar is held
-   * inside the tube, the nutrient bath drains, the glass door spins open,
-   * and the clone walks out to the cell in front of the door — then the vat
-   * seals and slowly refills behind them. Used at boot (deferred via
-   * pendingVatSpawn), by the DEV RESPAWN button, and by any future death
-   * flow. Returns false when the room has no vat (legacy spawn applies).
+   * inside the tube (squeezed to fit it — vatGauge.ts), the nutrient bath
+   * drains and the empty tank is held a beat, the glass door spins open, and
+   * the clone walks out through the doorway's hourglass gauge — then, once
+   * it is clear of the door, the vat shuts and slowly refills behind it. Used
+   * at boot (deferred via pendingVatSpawn), by the DEV RESPAWN button, and by
+   * any future death flow. Returns false when the room has no vat (legacy
+   * spawn applies).
    */
   public respawnAtVat(): boolean {
     const found = this.findSpawnVat();
     if (!found || this.isMorphing) return false;
     const { item, handle } = found;
-    // Exit = one tile out through the door face (local +z, rotated with the
-    // item) — for the default NW-pocket vat that is the open (-3.5, -3.5).
-    const exitOff = rotXZ(0, 1.0, item.rot);
-    const exit = { x: item.pos.x + exitOff.x, z: item.pos.z + exitOff.z };
+    // The door faces local +z, rotated with the item: rot quarter-turns CCW
+    // map onto facing angles (atan2(x, z)) one-for-one.
     this.player.beginVatSpawn(
       { x: item.pos.x, z: item.pos.z },
       item.rot * (Math.PI / 2),
     );
     handle.beginSpawnCycle(() => {
-      this.player.walkOutOfVat(exit, () => handle.closeAndRefill());
+      const seal = () => handle.closeAndRefill();
+      // A clone released meanwhile (HOLD watchdog) never walks out, so seal
+      // here — the vat must not stand open and dry.
+      if (!this.player.walkOutOfVat(seal)) seal();
     });
     return true;
   }
