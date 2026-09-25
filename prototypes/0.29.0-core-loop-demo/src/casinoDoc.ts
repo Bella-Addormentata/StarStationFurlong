@@ -831,7 +831,9 @@ export function clearSlotMachineKeys(machineId: string): void {
 //                             machine-wide lastDrop the next drop overwrites)
 //   pusher-empty:<mid>      → PusherEmptyRequest (the owner's door request)
 //   pusher-door:<mid>       → PusherDoorResult  (the operator's answer to it)
-//   pusher-operator:<mid>   → operator lease     (one browser session operates)
+//   pusher-operator         → the room's operator lease (ONE browser session
+//                             operates every coin pusher in the room, so a
+//                             player's balance has a single pusher writer)
 //
 // In the per-player keys each id is escaped (`%` → `%25`, `:` → `%3A`; see
 // coinPusherRequestKey), so a key splits one way only whatever the ids hold:
@@ -858,6 +860,9 @@ export function clearSlotMachineKeys(machineId: string): void {
 // PARTITIONS: the operator lease is a Y.Map record, not a mutex; see
 // pusherCroupier.ts for how a second session of the same deed holder is kept
 // from operating while the first may only be cut off.
+
+/** The room's coin-pusher operator lease: one for every cabinet in the room. */
+export const COIN_PUSHER_OPERATOR_KEY = 'pusher-operator';
 
 /** Same field-for-field record the slot operator uses. */
 export type CoinPusherOperatorLease = SlotOperatorLease;
@@ -1198,21 +1203,19 @@ export function refuseCoinPusherEmpty(
   return true;
 }
 
-export function readCoinPusherOperatorLease(machineId: string): CoinPusherOperatorLease | null {
-  const value = ensureMap().get(`pusher-operator:${machineId}`);
+/** The room's coin-pusher operator lease (one for every cabinet). */
+export function readCoinPusherOperatorLease(): CoinPusherOperatorLease | null {
+  const value = ensureMap().get(COIN_PUSHER_OPERATOR_KEY);
   return isSlotOperatorLease(value) ? value : null;
 }
 
-export function writeCoinPusherOperatorLease(
-  machineId: string,
-  lease: CoinPusherOperatorLease,
-): void {
+export function writeCoinPusherOperatorLease(lease: CoinPusherOperatorLease): void {
   if (!isSlotOperatorLease(lease)) return;
-  ensureMap().set(`pusher-operator:${machineId}`, lease);
+  ensureMap().set(COIN_PUSHER_OPERATOR_KEY, lease);
 }
 
-export function clearCoinPusherOperatorLease(machineId: string): void {
-  ensureMap().delete(`pusher-operator:${machineId}`);
+export function clearCoinPusherOperatorLease(): void {
+  ensureMap().delete(COIN_PUSHER_OPERATOR_KEY);
 }
 
 /** The fields that change on every operator write — two states that agree on
@@ -1390,6 +1393,8 @@ export function drainAndClearCoinPusher(machineId: string, recipientId: string):
     map.delete(`pusher:${machineId}`);
     map.delete(`pusher-empty:${machineId}`);
     map.delete(`pusher-door:${machineId}`);
+    // A per-machine lease an earlier revision wrote. The room's lease stays:
+    // it covers the room's other cabinets.
     map.delete(`pusher-operator:${machineId}`);
   });
   return credit;

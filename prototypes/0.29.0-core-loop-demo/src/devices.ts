@@ -86,12 +86,13 @@ import {
   // operator (pusherCroupier.ts) moves the chips.
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
   cancelCoinPusherRequest, coinPusherRequestKey, coinPusherResultKey, readCoinPusherResult,
+  COIN_PUSHER_OPERATOR_KEY,
   readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
   isCoinPusherRecordUnreadable,
   subscribeCasinoKey,
 } from './casinoDoc';
-// 🪙 Whether the machine is operated, and ready for a drop, judged without
-// comparing clocks across devices (pusherCroupier.ts CLOCKS).
+// 🪙 Whether the room's coin pushers are operated, and ready for a drop,
+// judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
 import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
@@ -4287,7 +4288,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
 
   const insert = (): void => {
     const state = readCoinPusherState(deps.itemId);
-    const operator = coinPusherOperatorState(deps.itemId);
+    const operator = coinPusherOperatorState();
     if (!state || operator !== 'ready') {
       // A drop made while the operator is still starting up would reach it
       // too late to keep its timing.
@@ -4333,7 +4334,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const state = readCoinPusherState(deps.itemId);
     if (!state || state.ownerId !== myId) {
       flash = 'ONLY THE OWNER HAS THE KEY';
-    } else if (coinPusherOperatorState(deps.itemId) === 'offline') {
+    } else if (coinPusherOperatorState() === 'offline') {
       flash = 'MACHINE OFFLINE — TRY AGAIN IN A MOMENT';
     } else if (door || readCoinPusherEmptyRequest(deps.itemId)) {
       flash = 'THE DOOR IS ALREADY OPENING';
@@ -4424,7 +4425,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     readResults();
     // A new cabinet's machine appears with its operator's first poll, after
     // the settling wait: until then it is starting up, not offline.
-    const operator = coinPusherOperatorState(deps.itemId);
+    const operator = coinPusherOperatorState();
     shownOperator = operator;
     const online = state !== null && operator === 'ready';
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
@@ -4561,7 +4562,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         coinPusherResultKey(deps.itemId, myId),
         `pusher-empty:${deps.itemId}`,
         `pusher-door:${deps.itemId}`,
-        `pusher-operator:${deps.itemId}`,
+        COIN_PUSHER_OPERATOR_KEY,
         `bal:${myId}`,
       ]) {
         unsubscribers.push(subscribeCasinoKey(key, render));
@@ -4584,7 +4585,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     update(_dt: number): void {
       // A lease can lapse, or its operator finish starting up, with no key
       // changing: show it as soon as this page can tell.
-      if (panel && coinPusherOperatorState(deps.itemId) !== shownOperator) render();
+      if (panel && coinPusherOperatorState() !== shownOperator) render();
       drawGauge();
     },
   };

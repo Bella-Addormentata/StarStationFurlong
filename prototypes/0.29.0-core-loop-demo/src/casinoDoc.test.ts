@@ -560,7 +560,9 @@ describe('drainAndClearCoinPusher', () => {
     refuseCoinPusherEmpty(MACHINE, refused, 1);
     expect(readCoinPusherDoorResult(MACHINE)).not.toBeNull();
     writeCoinPusherEmptyRequest(MACHINE, { requestId: 'd', requester: OWNER, requestedAt: 0 });
-    writeCoinPusherOperatorLease(MACHINE, { playerId: OWNER, sessionId: 's', expiresAt: 99 });
+    writeCoinPusherOperatorLease({ playerId: OWNER, sessionId: 's', expiresAt: 99 });
+    // A per-machine lease an earlier revision wrote.
+    doc.getMap('casino').set(`pusher-operator:${MACHINE}`, { playerId: OWNER, sessionId: 's', expiresAt: 99 });
     refuseCoinPusherInsert(MACHINE, request(PLAYER, 'req-1'), 'expired', 1);
     expect(readCoinPusherResult(MACHINE, PLAYER)).not.toBeNull();
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2'));
@@ -571,7 +573,9 @@ describe('drainAndClearCoinPusher', () => {
     expect(readCoinPusherState(MACHINE)).toBeNull();
     expect(readCoinPusherEmptyRequest(MACHINE)).toBeNull();
     expect(doc.getMap('casino').has(`pusher-door:${MACHINE}`)).toBe(false);
-    expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+    expect(doc.getMap('casino').has(`pusher-operator:${MACHINE}`)).toBe(false);
+    // The room's lease covers its other cabinets: it stays.
+    expect(readCoinPusherOperatorLease()).not.toBeNull();
     // Its per-player keys carry no chips; the sweep deletes them afterwards.
     expect(readCoinPusherResult(MACHINE, PLAYER)).not.toBeNull();
     sweepAll(MACHINE);

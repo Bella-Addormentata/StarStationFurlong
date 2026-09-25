@@ -134,7 +134,7 @@ import {
 } from "./slotCroupier";
 import {
   closeCoinPusher,
-  tickCoinPusherMachine,
+  tickCoinPusherRoom,
   tickCoinPusherTeardowns,
 } from "./pusherCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
@@ -5096,7 +5096,7 @@ export class World {
     const crapsTables = FURNITURE.filter((i) => i.kind === "craps-table");
     const slotMachines = FURNITURE.filter((i) => i.kind === "slot-machine");
     // 🪙 Coin pushers need no robot at the cabinet (the operator runs
-    // headless), only an elected operator session (below).
+    // headless), only the room's elected operator session (below).
     const coinPushers = FURNITURE.filter((i) => i.kind === "coin-pusher");
     const tables = [...rouletteTables, ...crapsTables];
 
@@ -5123,11 +5123,12 @@ export class World {
       }
     }
 
-    // 🪙 Coin pushers: one of the deed holder's sessions operates each
-    // (lease-elected in pusherCroupier.ts). Every client ticks every cabinet:
-    // it watches the lease's renewals (how the panel tells a live operator),
-    // and a client that may not operate stops operating there.
-    for (const machine of coinPushers) tickCoinPusherMachine(machine.id);
+    // 🪙 Coin pushers: ONE of the deed holder's sessions operates every
+    // cabinet in the room (one lease, pusherCroupier.ts), so a player's
+    // balance has a single pusher writer. Every client ticks the room: it
+    // watches the lease's renewals (how the panel tells a live operator), and
+    // a client that may not operate stops operating there.
+    tickCoinPusherRoom(coinPushers.map((machine) => machine.id));
     // …and carry on with removed cabinets: the batched sweep of their
     // per-player keys, and any teardown left to a session that has since gone
     // away (closeCoinPusher).

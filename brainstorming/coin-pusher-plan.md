@@ -118,7 +118,7 @@ Records in the room's `casino` map:
 | `pusher-result:<mid>:<pid>` | the operator | its answer to that player's latest request |
 | `pusher-empty:<mid>` | the owner | a door request |
 | `pusher-door:<mid>` | the operator | its answer to the latest door request |
-| `pusher-operator:<mid>` | the operator | its lease |
+| `pusher-operator` | the operator | the room's lease, one for every cabinet |
 
 In the per-player keys each id is escaped (`%` → `%25`, `:` → `%3A`), so a
 key splits one way only: `(a, b:p)` and `(a:b, p)` are different keys, and
@@ -127,23 +127,28 @@ player ids, `<kind>-<n>` item ids) are written as they are.
 
 - **Election.** Only the room's deed holder operates (`canRunCroupier`, the
   rule every casino operator follows since #141/#142), and only one of their
-  browser sessions: the lease is written, the session waits 2 s for the doc to
-  converge, renews every 3 s, and lapses after 8 s. World ticks the election
-  every frame, so there is no start/stop control. Devices' clocks aren't
-  synchronised, so a lease written on another device is never judged by the
-  expiry it claims: it lapses one lease term (8 s) after this session last
+  browser sessions, for every coin pusher in the room: the room's lease is
+  written, the session waits 2 s for the doc to converge, renews every 3 s,
+  and lapses after 8 s. One operator for the room, not one per cabinet: a
+  player's `bal:` is a whole value, so two sessions settling that player's
+  drops on two cabinets at once would each write it, and the merge would keep
+  only one of the two writes (a chip dropped for free). World ticks the room
+  every frame (`tickCoinPusherRoom`), so there is no start/stop control, and a
+  session whose room has no cabinet left lets the lease go. Devices' clocks
+  aren't synchronised, so a lease written on another device is never judged by
+  the expiry it claims: it lapses one lease term (8 s) after this session last
   saw it renewed (the operator rewrites it at every renewal). Only a tab on
   the same device, which shares the clock, is also held to its own expiry.
-  Every client watches the renewals (World ticks every cabinet on every
-  client), and that is also how the panel tells whether the machine is
-  operated. Its DROP waits (STARTING UP) until the operator is past its 2 s
-  settling wait: its own, or for another session 2 s after this client
-  first saw that holder take the lease, which is never sooner than the
-  holder's own. A drop made sooner would reach the operator too late to keep
-  its timing. The lease record is peer-writable, so a record claiming a
-  far-future expiry holds a machine for one term, not forever. "Last saw it
-  renewed" counts in the bound room's doc only, so an identical record seen
-  earlier in another room isn't cut short.
+  Every client watches the renewals (World ticks the room on every client),
+  and that is also how the panel tells whether the machines are operated. Its
+  DROP waits (STARTING UP) until the operator is past its 2 s settling wait:
+  its own, or for another session 2 s after this client first saw that holder
+  take the lease, which is never sooner than the holder's own. A drop made
+  sooner would reach the operator too late to keep its timing. The lease
+  record is peer-writable, so a record claiming a far-future expiry holds the
+  room for one term, not forever. "Last saw it renewed" counts in the bound
+  room's doc only, so an identical record seen earlier in another room isn't
+  cut short.
 - **Splits.** A Y.Map lease is not a mutex. Two operator sessions cut off from
   each other could each settle a drop from the same machine; when the docs
   merge only one machine value survives while both players' balance writes do.
@@ -161,8 +166,8 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   between leaves no record of its own for a successor to wait out. While it
   leaves the room, it operates and watches nothing more in that room, so no
   frame takes a lease back as the release goes out, and the room's lease
-  observations, pending teardowns and sweeps go with it. Only a split
-  outlasting that window can still put two operators on one machine.
+  observation, pending teardowns and sweeps go with it. Only a split
+  outlasting that window can still put two operators in one room.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). The chips inside stay put and go with the room, like its furniture.
@@ -212,30 +217,29 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   (`refuseCoinPusherEmpty`). The panel goes by `pusher-door:<mid>`, since a
   request that merely vanished says nothing about whether the door opened.
 - **Removal.** Every client sees the cabinet go and stops operating it. The
-  records are cleared only by a deed-holder session that may operate the
-  machine by the election's rule: the one holding its lease, or one that
-  could take it over. In one transaction (`drainAndClearCoinPusher`) that
-  session pays the chips still inside to the deed holder and deletes the
-  machine's own keys, a fixed few. Its per-player keys (requests, answers,
-  and any `pusher-esc:` records an earlier revision left) carry no chips.
-  They are then swept a batch of 64 per frame through the index, so a flood
-  of them can't stall a frame. The sweep walks only the keys the index files
-  under the machine, with a live iterator, so a key written meanwhile (a
-  stale request, a late answer) goes too: in the same pass, or in the next
-  if it lands after the pass went by. The sweep ends when the index files
-  none under the machine. Another machine's keys never enter its walk, so
-  they can neither be deleted nor keep it going. Every settle happens on the
-  lease holder, so the drain never merges with a drop another tab is still
-  settling (that would bring the machine back and pay its chips twice).
-  Another deed-holder session keeps the teardown pending, and finishes it
-  only if the operator goes away still holding the lease (after the same
-  wait as a takeover). A cabinet put back first is left alone (its sweep
-  stops too), and a pending teardown or sweep is dropped if the session
-  moves to another room's doc, so it never touches either room's doc again.
-  The recipient is the caller's own identity, never the owner named in the
-  peer-writable machine, so chips only ever leave the machine to the player
-  whose drop pushed them or to the operator itself — forging the machine
-  can't pay the forger.
+  records are cleared only by a deed-holder session that may operate the room
+  by the election's rule: the one holding its lease, or one that could take it
+  over. In one transaction (`drainAndClearCoinPusher`) that session pays the
+  chips still inside to the deed holder and deletes the machine's own keys, a
+  fixed few. Its per-player keys (requests, answers, and any `pusher-esc:`
+  records an earlier revision left) carry no chips. They are then swept a
+  batch of 64 per frame through the index, so a flood of them can't stall a
+  frame. The sweep walks only the keys the index files under the machine, with
+  a live iterator, so a key written meanwhile (a stale request, a late answer)
+  goes too: in the same pass, or in the next if it lands after the pass went
+  by. The sweep ends when the index files none under the machine. Another
+  machine's keys never enter its walk, so they can neither be deleted nor keep
+  it going. Every settle happens on the lease holder, so the drain never
+  merges with a drop another tab is still settling (that would bring the
+  machine back and pay its chips twice). Another deed-holder session keeps the
+  teardown pending, and finishes it only if the operator goes away still
+  holding the lease (after the same wait as a takeover). A cabinet put back
+  first is left alone (its sweep stops too), and a pending teardown or sweep
+  is dropped if the session moves to another room's doc, so it never touches
+  either room's doc again. The recipient is the caller's own identity, never
+  the owner named in the peer-writable machine, so chips only ever leave the
+  machine to the player whose drop pushed them or to the operator itself —
+  forging the machine can't pay the forger.
 - **Trust.** The same dev-phase honest-client model as the rest of the
   casino map: the operator is trusted to run the physics honestly, and every
   read shape-guards so junk in these keys reads as "no machine" (including a
@@ -296,5 +300,10 @@ model as it is.
 - A network split between two of the deed holder's devices that outlasts the
   takeover window can still settle drops, or drain a removed cabinet, on both
   sides (see *Splits*).
+- Other casino games elect their own operators (a slot machine's is per
+  machine, as on main), so a slot operator and the pusher operator writing
+  the same player's balance in the same instant can still lose one of the two
+  writes: the casino map's documented v1 semantics for `bal:`, which the G4
+  Registry chips close.
 - The operator is trusted. Verifying drops (publishing the seed and letting
   clients replay the transition) is possible with this engine but not built.
