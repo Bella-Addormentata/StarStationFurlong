@@ -99,7 +99,10 @@ most `MAX_DROP_LEAD_MS` (250 ms) before it (a player clock running a little
 fast). Comparing phases alone would take a request one or more whole cycles
 old for a fresh one. Anything else drops at the operator's current phase, so a
 claim outside the window gains nothing. The result says which happened
-(`lastDrop.honored`), and the panel tells the player. Browser clocks aren't
+(`lastDrop.honored`), and the panel tells the player. Every timestamp a
+record carries must lie in the Date range (±8.64e15 ms, `MAX_TIMESTAMP_MS`):
+the guards refuse a peer-written one outside it, so the phase arithmetic
+between any two stays finite. Browser clocks aren't
 synchronised: a device whose clock is off by more than the window never has
 its timing kept (it still plays, dropping where the pusher is), and the panel
 says the drop was late or the device's clock is off.
@@ -143,7 +146,9 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   and that is also how the panel tells whether the machines are operated. Its
   DROP waits (STARTING UP) until the operator is past its 2 s settling wait:
   its own, or for another session 2 s after this client first saw that holder
-  take the lease, which is never sooner than the holder's own. A drop made
+  take the lease, which is never sooner than the holder's own. Each take
+  writes a fresh tenure into the record (its renewals keep it), so a release
+  and retake that a client never saw still restarts that wait. A drop made
   sooner would reach the operator too late to keep its timing. The lease
   record is peer-writable, so a record claiming a far-future expiry holds the
   room for one term, not forever. "Last saw it renewed" counts in the bound
