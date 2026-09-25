@@ -23,6 +23,13 @@
  * wait. Only a split outlasting that window can still put two operators on
  * one machine.
  *
+ * CLOCKS: devices' clocks aren't synchronised, so a lease written on another
+ * device is never judged by the expiry it claims: it lapses one
+ * OPERATOR_LEASE_MS after this page last saw it renewed (leaseLapsesAt). Only
+ * a tab on this device, which shares the clock, is also held to its own
+ * expiry. Every client watches the renewals (World ticks every cabinet on
+ * every client), and the panel asks the same question (isCoinPusherOperatorLive).
+ *
  * OWNERSHIP: the operator creates a missing machine with itself as owner and
  * re-owns one whose owner is anyone else (a deed transfer, or a peer-written
  * owner). The chips inside stay where they are and go with the room, like its
@@ -70,7 +77,7 @@ import {
   writeCoinPusherOperatorLease,
   writeCoinPusherState,
 } from './casinoDoc';
-import type { CoinPusherKeySweep } from './casinoDoc';
+import type { CoinPusherKeySweep, CoinPusherOperatorLease } from './casinoDoc';
 import { canRunCroupier } from './croupier';
 import {
   chipsInMachine,
@@ -140,24 +147,21 @@ export function coinPusherOperatorSession(): string {
   return operatorSessionId;
 }
 
-/** When this page first saw each machine's current lease record. */
+/** When this page first saw each machine's current lease record in this
+ *  room's doc. The operator rewrites its record at every renewal, so this is
+ *  when this page last saw the lease renewed. */
 const leaseFirstSeen = new Map<string, { id: string; at: number }>();
 
 /**
- * Earliest time this session may take `lease` over. The record is
- * peer-writable, so its `expiresAt` is honored for at most OPERATOR_LEASE_MS
- * after this page first saw that exact record in this room's doc (what a
- * previous room's doc showed never counts) — what a live operator's lease
- * is worth anyway, since it rewrites it every OPERATOR_LEASE_RENEW_MS. A
- * record written with a far-future expiry can therefore hold a machine for
- * one lease term, not forever.
+ * When `lease` lapses as far as this page can tell, without comparing clocks
+ * across devices (CLOCKS above): one OPERATOR_LEASE_MS after this page first
+ * saw that exact record in this room's doc (what a previous room's doc showed
+ * never counts). A tab on this device shares this clock, so its own expiry
+ * counts too, though never past that. The record is peer-writable: one
+ * claiming a far-future expiry holds a machine for one lease term, not
+ * forever.
  */
-function takeoverAt(
-  machineId: string,
-  lease: { playerId: string; sessionId: string; expiresAt: number },
-  playerId: string,
-  now: number,
-): number {
+function leaseLapsesAt(machineId: string, lease: CoinPusherOperatorLease, now: number): number {
   // Scoped to the bound doc: another room's same record starts afresh.
   const id = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.expiresAt}`;
   let seen = leaseFirstSeen.get(machineId);
@@ -165,11 +169,38 @@ function takeoverAt(
     seen = { id, at: now };
     leaseFirstSeen.set(machineId, seen);
   }
-  const expiresAt = Math.min(lease.expiresAt, seen.at + OPERATOR_LEASE_MS);
-  const sameDevice = lease.sessionId.startsWith(`${deviceId}:`);
-  return lease.playerId === playerId && !sameDevice
-    ? expiresAt + OPERATOR_UNCLEAN_TAKEOVER_MS
-    : expiresAt;
+  const heldUntil = seen.at + OPERATOR_LEASE_MS;
+  return isThisDevice(lease) ? Math.min(lease.expiresAt, heldUntil) : heldUntil;
+}
+
+/** Whether a lease was written by a session on this device (its tabs share
+ *  the clock and the local node). */
+function isThisDevice(lease: CoinPusherOperatorLease): boolean {
+  return lease.sessionId.startsWith(`${deviceId}:`);
+}
+
+/** Earliest time this session may take `lease` over: when it lapses, plus
+ *  the split window for another device of the same deed holder (SPLITS). */
+function takeoverAt(
+  machineId: string,
+  lease: CoinPusherOperatorLease,
+  playerId: string,
+  now: number,
+): number {
+  const lapsesAt = leaseLapsesAt(machineId, lease, now);
+  return lease.playerId === playerId && !isThisDevice(lease)
+    ? lapsesAt + OPERATOR_UNCLEAN_TAKEOVER_MS
+    : lapsesAt;
+}
+
+/** Whether some session is operating the machine, as far as this page can
+ *  tell (the panel's DROP and door): this session by its own live lease, any
+ *  other while its lease hasn't lapsed by leaseLapsesAt. */
+export function isCoinPusherOperatorLive(machineId: string, now = Date.now()): boolean {
+  const lease = readCoinPusherOperatorLease(machineId);
+  if (!lease) return false;
+  if (lease.sessionId === operatorSessionId) return lease.expiresAt > now;
+  return now < leaseLapsesAt(machineId, lease, now);
 }
 
 /** A fresh 32-bit peg-field seed from the platform CSPRNG. The operator
@@ -208,12 +239,15 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
   // teardown ran (or finished) is no longer to be torn down.
   pendingTeardowns.delete(machineId);
   sweeps.delete(machineId);
+  // Every client watches the lease's renewals, a frame at a time: that is
+  // how it tells a live operator from a lapsed one (CLOCKS above).
+  const lease = readCoinPusherOperatorLease(machineId);
+  if (lease && lease.sessionId !== operatorSessionId) leaseLapsesAt(machineId, lease, now);
   if (!canRunCroupier()) {
     stopCoinPusherOperator(machineId);
     return;
   }
   const playerId = getPlayerId();
-  const lease = readCoinPusherOperatorLease(machineId);
   const operator = operators.get(machineId);
   if (!operator
     || operator.docEpoch !== casinoDocEpoch()
@@ -422,10 +456,13 @@ export function tickCoinPusherTeardowns(now = Date.now()): void {
   for (const machineId of [...pendingTeardowns.keys()]) tearDownIfFree(machineId, now);
 }
 
-// Leaving the page releases every lease this session holds, so another tab
-// or device needn't wait out the lapse (best effort: the write may not flush).
-if (typeof window !== 'undefined') {
-  window.addEventListener('pagehide', () => {
-    for (const machineId of [...operators.keys()]) stopCoinPusherOperator(machineId);
-  });
+/** Stop operating every machine here, releasing the leases this session
+ *  holds, so another tab or device needn't wait them out. Leaving the room
+ *  calls it while the room's doc is still bound (main.ts leaveRoom), and so
+ *  does leaving the page. */
+export function releaseCoinPusherLeases(): void {
+  for (const machineId of [...operators.keys()]) stopCoinPusherOperator(machineId);
 }
+
+// Best effort on page close: the write may not flush.
+if (typeof window !== 'undefined') window.addEventListener('pagehide', releaseCoinPusherLeases);

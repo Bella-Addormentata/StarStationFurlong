@@ -87,9 +87,12 @@ import {
   readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
   cancelCoinPusherRequest, coinPusherRequestKey, coinPusherResultKey, readCoinPusherResult,
   readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
-  readCoinPusherOperatorLease,
+  isCoinPusherRecordUnreadable,
   subscribeCasinoKey,
 } from './casinoDoc';
+// 🪙 Whether the machine is operated, judged without comparing clocks across
+// devices (pusherCroupier.ts CLOCKS).
+import { isCoinPusherOperatorLive } from './pusherCroupier';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
 import { crapsBackend } from './crapsBackend';
@@ -115,7 +118,7 @@ import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
 // 🪙 Coin pusher engine (#135) — pure physics, no doc / DOM access. The panel
 // reads the sweep clock and the machine's meter from it.
 import {
-  chipsInMachine, computeConservation, currentPusherPhase, pusherFaceX,
+  chipsInMachine, currentPusherPhase, pusherFaceX,
   HOLE_COUNT, HOLE_XS, MACHINE_MAX_CHIPS, PLAT_UP_FRONT, PUSHER_ANTE,
   PUSHER_REQUEST_TTL_MS,
 } from './games/coinPusher';
@@ -4228,12 +4231,6 @@ const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
   expired: 'YOUR DROP WAITED TOO LONG — NOTHING WAS TAKEN',
 };
 
-/** True while some session holds a live operator lease on the machine. */
-function coinPusherOperatorOnline(machineId: string, now = Date.now()): boolean {
-  const lease = readCoinPusherOperatorLease(machineId);
-  return lease !== null && lease.expiresAt > now;
-}
-
 /**
  * The coin-pusher panel: a live pusher gauge (the same clock the cabinet
  * draws from), three drop holes, INSERT, the player's chips as a physical
@@ -4257,6 +4254,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let door: string | null = null;
   /** The machine as last read — the per-frame gauge draws from this. */
   let cached: CoinPusherState | null = null;
+  /** Whether the last render showed the machine operated. */
+  let shownOnline: boolean | null = null;
   const myId = getPlayerId();
 
   const stopExpiry = (): void => {
@@ -4283,7 +4282,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
 
   const insert = (): void => {
     const state = readCoinPusherState(deps.itemId);
-    if (!state || !coinPusherOperatorOnline(deps.itemId)) {
+    if (!state || !isCoinPusherOperatorLive(deps.itemId)) {
       flash = 'MACHINE OFFLINE — ITS OWNER RUNS IT';
     } else if (pending || readCoinPusherRequest(deps.itemId, myId)) {
       flash = 'YOUR LAST CHIP IS STILL DROPPING';
@@ -4324,7 +4323,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const state = readCoinPusherState(deps.itemId);
     if (!state || state.ownerId !== myId) {
       flash = 'ONLY THE OWNER HAS THE KEY';
-    } else if (!coinPusherOperatorOnline(deps.itemId)) {
+    } else if (!isCoinPusherOperatorLive(deps.itemId)) {
       flash = 'MACHINE OFFLINE — TRY AGAIN IN A MOMENT';
     } else if (door || readCoinPusherEmptyRequest(deps.itemId)) {
       flash = 'THE DOOR IS ALREADY OPENING';
@@ -4413,7 +4412,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const state = readCoinPusherState(deps.itemId);
     cached = state;
     readResults();
-    const online = state !== null && coinPusherOperatorOnline(deps.itemId);
+    const online = state !== null && isCoinPusherOperatorLive(deps.itemId);
+    shownOnline = online;
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
     status.textContent = flash || (online
       ? 'PICK A HOLE AND TIME YOUR DROP'
@@ -4442,11 +4442,13 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     paintTray('cp-won', chipsFor(lastPaid ?? 0), 'Your last drop paid',
       lastPaid === 0 ? 'NOTHING FELL' : '');
     const meter = panel.querySelector<HTMLElement>('#cp-meter')!;
-    const balanced = state ? computeConservation(state).balanced : true;
-    meter.textContent = balanced
-      ? 'METER ✓ EVERY CHIP INSIDE, PAID OUT OR EMPTIED IS ACCOUNTED FOR'
-      : '!! THE METER DOES NOT BALANCE — TELL THE OWNER';
-    meter.style.color = balanced ? GT_DIM : '#FF6060';
+    // A machine that reads at all balances (the guard checks its ledger), so
+    // the warning is for a record that is there but won't read.
+    const unreadable = state === null && isCoinPusherRecordUnreadable(deps.itemId);
+    meter.textContent = state ? 'METER ✓ EVERY CHIP INSIDE, PAID OUT OR EMPTIED IS ACCOUNTED FOR'
+      : unreadable ? '!! THE METER CAN\'T BE READ — TELL THE OWNER'
+        : '';
+    meter.style.color = unreadable ? '#FF6060' : GT_DIM;
     const owner = panel.querySelector<HTMLElement>('#cp-owner')!;
     const isOwner = state?.ownerId === myId;
     owner.style.display = isOwner ? 'flex' : 'none';
@@ -4564,6 +4566,9 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       cached = null;
     },
     update(_dt: number): void {
+      // A lease can lapse with no key changing: show the machine going offline
+      // (or coming back) as soon as this page can tell.
+      if (panel && (cached !== null && isCoinPusherOperatorLive(deps.itemId)) !== shownOnline) render();
       drawGauge();
     },
   };

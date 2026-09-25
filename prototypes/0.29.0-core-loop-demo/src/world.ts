@@ -134,7 +134,6 @@ import {
 } from "./slotCroupier";
 import {
   closeCoinPusher,
-  stopCoinPusherOperator,
   tickCoinPusherMachine,
   tickCoinPusherTeardowns,
 } from "./pusherCroupier";
@@ -5122,11 +5121,10 @@ export class World {
     }
 
     // 🪙 Coin pushers: one of the deed holder's sessions operates each
-    // (lease-elected in pusherCroupier.ts); every other client only watches.
-    for (const machine of coinPushers) {
-      if (autoCroupier) tickCoinPusherMachine(machine.id);
-      else stopCoinPusherOperator(machine.id);
-    }
+    // (lease-elected in pusherCroupier.ts). Every client ticks every cabinet:
+    // it watches the lease's renewals (how the panel tells a live operator),
+    // and a client that may not operate stops operating there.
+    for (const machine of coinPushers) tickCoinPusherMachine(machine.id);
     // …and carry on with removed cabinets: the batched sweep of their
     // per-player keys, and any teardown left to a session that has since gone
     // away (closeCoinPusher).

@@ -21,6 +21,7 @@ import {
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
+  isCoinPusherRecordUnreadable,
   PUSHER_REQUEST_SCAN,
   PUSHER_SWEEP_BATCH,
   readChips,
@@ -137,6 +138,24 @@ function withoutWalking<T>(work: () => T): T {
 }
 
 // ── Requests: a wish, not a payment ──────────────────────────────────────────
+
+describe('coin-pusher machine record', () => {
+  it('tells a record that won\'t read from no record at all', () => {
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(false);
+    const base = machineWith(5);
+    writeCoinPusherState(MACHINE, base);
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(false);
+    const map = doc.getMap('casino');
+    // A ledger that doesn't balance reads as no machine, but it is there.
+    map.set(`pusher:${MACHINE}`, { ...base, totalPaid: base.totalPaid + 1 });
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(true);
+    map.set(`pusher:${MACHINE}`, 'junk');
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(true);
+    map.delete(`pusher:${MACHINE}`);
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(false);
+  });
+});
 
 describe('coin-pusher requests', () => {
   it('writing a request moves no chips', () => {

@@ -102,6 +102,7 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMod
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+import { releaseCoinPusherLeases } from "./pusherCroupier";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -2072,6 +2073,9 @@ async function joinRoomAtEpoch(
  * re-derives the same roomId/roomKey from it via fetchDefaultBootstrap, and
  * the bootstrap error path reports the last attempted seed.
  */
+/** How long leaving a room waits for its last local writes to be sent. */
+const LEAVE_FLUSH_MS = 1000;
+
 async function leaveRoom(): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   sessionEpoch++;
@@ -2099,6 +2103,17 @@ async function leaveRoom(): Promise<void> {
   const sync = yjsSync;
   yjsSync = null;
   if (sync) {
+    // 🪙 Hand back this session's coin-pusher leases while the room's doc is
+    // still the bound casino doc, and send the release before the doc goes:
+    // another of the deed holder's devices then takes over at once instead
+    // of waiting out the lapse and the split window. stop() doesn't wait for
+    // sends in flight, so flush first (bounded: a stalled transport must not
+    // hold the swap).
+    releaseCoinPusherLeases();
+    await Promise.race([
+      sync.flush(),
+      new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),
+    ]);
     // 💾 Tier A: final snapshot BEFORE stop() destroys the doc (encode is
     // synchronous; the IndexedDB put is fire-and-forget and survives us).
     try {

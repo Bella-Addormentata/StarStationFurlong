@@ -867,6 +867,15 @@ export function readCoinPusherState(machineId: string): CoinPusherState | null {
   return isCoinPusherState(value) ? value : null;
 }
 
+/** True when something is stored under `pusher:<mid>` that isn't a machine
+ *  the guard accepts (junk, or a ledger that doesn't balance), which the
+ *  panel reports rather than taking it for no machine at all. */
+export function isCoinPusherRecordUnreadable(machineId: string): boolean {
+  const map = ensureMap();
+  const key = `pusher:${machineId}`;
+  return map.has(key) && !isCoinPusherState(map.get(key));
+}
+
 /** Operator only (pusherCroupier.ts): create or re-own a machine. Writes the
  *  normalized state (unknown fields dropped); false when the shape guard
  *  rejects it. Drops and empties go through the settle helpers below. */

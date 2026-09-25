@@ -123,11 +123,17 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   rule every casino operator follows since #141/#142), and only one of their
   browser sessions: the lease is written, the session waits 2 s for the doc to
   converge, renews every 3 s, and lapses after 8 s. World ticks the election
-  every frame, so there is no start/stop control. The lease record is
-  peer-writable, so a session honors any one record for at most one lease
-  term (8 s) after it first sees it: a record claiming a far-future expiry
-  can't hold a machine forever. "First sees" counts in the bound room's doc
-  only, so an identical record seen earlier in another room isn't cut short.
+  every frame, so there is no start/stop control. Devices' clocks aren't
+  synchronised, so a lease written on another device is never judged by the
+  expiry it claims: it lapses one lease term (8 s) after this session last
+  saw it renewed (the operator rewrites it at every renewal). Only a tab on
+  the same device, which shares the clock, is also held to its own expiry.
+  Every client watches the renewals (World ticks every cabinet on every
+  client), and that is also how the panel tells whether the machine is
+  operated. The lease record is peer-writable, so a record claiming a
+  far-future expiry holds a machine for one term, not forever. "Last saw it
+  renewed" counts in the bound room's doc only, so an identical record seen
+  earlier in another room isn't cut short.
 - **Splits.** A Y.Map lease is not a mutex. Two operator sessions cut off from
   each other could each settle a drop from the same machine; when the docs
   merge only one machine value survives while both players' balance writes
@@ -138,8 +144,9 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   off: another *device* of the same deed holder takes over a lapsed lease only
   after a further 60 s; tabs on one device share its local node and take over
   as soon as the lease lapses; a session that stops operating releases its
-  lease. Only a split outlasting that window can still put two operators on
-  one machine.
+  lease, including when it leaves the room (before the room's doc goes, the
+  release sent first) and when the page closes. Only a split outlasting that
+  window can still put two operators on one machine.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). The chips inside stay put and go with the room, like its furniture.
@@ -225,8 +232,10 @@ totalInserted = chipsInMachine + totalPaid + totalEmptied
 ```
 
 Every reducer keeps it; the settle and empty helpers refuse a transition that
-breaks it; the panel's meter shows it as a check mark (no totals — outside the
-cashier, chips are shown as chips, never as numbers).
+breaks it; the guard rejects a machine whose ledger doesn't balance. The
+panel's meter shows a check mark for a machine that reads (no totals —
+outside the cashier, chips are shown as chips, never as numbers), and a
+warning for a record that is there but won't read.
 
 ## Data flow at a drop
 
