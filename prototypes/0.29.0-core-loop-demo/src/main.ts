@@ -435,6 +435,11 @@ let roomCacheHandle: RoomCacheHandle | null = null;
 // interleaves two joins and the older one binds a live YjsSync to the newer
 // session's transport/room.
 let sessionEpoch = 0;
+// Room leaves under way (leaveRoom). While one runs, `yjsSync` is already
+// null, but the old room's doc is still bound and, until its sync stops, what
+// this client writes still goes out. The edit and croupier gates must not
+// read that as "offline, so this client is alone" and hand it the old room.
+let roomLeavesUnderWay = 0;
 // Y.Doc lifecycle counter (issue #30 T0 verification aid): joinRoom()
 // increments `created`, teardown increments `destroyed` once YjsSync.stop()
 // has destroyed the doc. Live docs = created - destroyed and must never
@@ -2064,6 +2069,9 @@ async function joinRoomAtEpoch(
   });
 }
 
+/** How long leaving a room waits for its last local writes to be sent. */
+const LEAVE_FLUSH_MS = 1000;
+
 /**
  * Tear down the active room session (issue #30 T0): stop the yrs sync —
  * closing its writer and DESTROYING the Y.Doc (the pre-T0 leak: rejoin used
@@ -2072,11 +2080,18 @@ async function joinRoomAtEpoch(
  * `activeBootstrap` intentionally survives as last-room memory: Retry-node
  * re-derives the same roomId/roomKey from it via fetchDefaultBootstrap, and
  * the bootstrap error path reports the last attempted seed.
+ * Until it returns, the edit and croupier gates refuse (roomLeavesUnderWay).
  */
-/** How long leaving a room waits for its last local writes to be sent. */
-const LEAVE_FLUSH_MS = 1000;
-
 async function leaveRoom(): Promise<void> {
+  roomLeavesUnderWay++;
+  try {
+    await leaveRoomNow();
+  } finally {
+    roomLeavesUnderWay--;
+  }
+}
+
+async function leaveRoomNow(): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   sessionEpoch++;
   // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,
@@ -2107,10 +2122,10 @@ async function leaveRoom(): Promise<void> {
     // still the bound casino doc, and send the release before the doc goes:
     // another of the deed holder's devices then takes over at once instead
     // of waiting out the lapse and the split window. Frames keep running
-    // meanwhile, so nothing is operated in this room again (the croupier
-    // predicate reads true with no sync). stop() doesn't wait for sends in
-    // flight, so flush first (bounded: a stalled transport must not hold the
-    // swap).
+    // meanwhile, but nothing is operated or edited in this room again: the
+    // gates refuse while a leave is under way (roomLeavesUnderWay). stop()
+    // doesn't wait for sends in flight, so flush first (bounded: a stalled
+    // transport must not hold the swap).
     leaveCoinPusherRoom();
     await Promise.race([
       sync.flush(),
@@ -8570,6 +8585,9 @@ async function init() {
   // pre-S2 rooms are now READ-ONLY for everyone. The reason string
   // resolves the owner's display name through the players map.
   setRoomEditPermission(() => {
+    // Leaving: the old room's doc is still bound and its writes still go out,
+    // but it isn't this client's room any more (roomLeavesUnderWay).
+    if (roomLeavesUnderWay > 0) return { ok: false, reason: "Leaving this room." };
     if (!yjsSync) return { ok: true }; // offline: your room
     // 🔒 #141: an absent owner is NOT the legacy marker and grants nothing.
     const owner =
@@ -8589,6 +8607,7 @@ async function init() {
   // below is now redundant — kept because it states the intent directly and
   // costs nothing, rather than relying on a second function to stay correct.
   setSoleCroupierPredicate(() => {
+    if (roomLeavesUnderWay > 0) return false; // leaving: see the edit gate above
     if (!yjsSync) return true;
     const owner = yjsSync.doc.getMap("roomInfo").get("owner");
     if (owner === "Local-Clone") return false;
