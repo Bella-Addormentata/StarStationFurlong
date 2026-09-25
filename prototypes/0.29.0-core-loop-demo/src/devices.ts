@@ -29,6 +29,7 @@ import { FURNITURE, FURNITURE_DEFS, buildDeviceList, itemAabb } from './furnitur
 // (an engine landing while someone reads the status flips the row live).
 import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
+import type { VatAperture } from './vatFit';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
 // ⚓ #163: the helm's docking computer draws the ship atlas in room metres.
@@ -246,6 +247,10 @@ export interface TrunkLidHandle {
  * player's scripted walk-out.
  */
 export interface CloneVatHandle {
+  /** 🧬 #165: the hourglass mouth this vat enforces. Read by World when it
+   *  starts the ceremony, so the squeeze is always the one THIS vat implies
+   *  rather than a constant copied out of the builder. */
+  readonly aperture: VatAperture;
   /**
    * Snap to the full+closed attract state, hold a short beat, then drain the
    * liquid and spin the glass door open. onOpen fires exactly once when the

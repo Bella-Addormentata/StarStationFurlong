@@ -54,6 +54,7 @@
 
 import * as THREE from 'three';
 import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
+import type { RigSilhouette, SilhouetteBand } from './vatFit';
 
 export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep' | 'swim' | 'dive';
 
@@ -459,6 +460,9 @@ export class VoxelCharacter {
   >();
   /** Currently attached head accessory (one slot), or null. */
   private accessoryGroup: THREE.Group | null = null;
+  /** Lazily measured rig silhouette (#165). Invalidated by attach/remove
+   *  accessory — a cap or a scarf changes the outline the vat has to pass. */
+  private silhouetteCache: RigSilhouette | null = null;
 
   constructor(scene: THREE.Scene) {
     // ── 1. Master / visual group hierarchy ───────────────────────────────────
@@ -1706,6 +1710,7 @@ export class VoxelCharacter {
     g.name = `accessory:${kind}`;
     this.head.add(g);
     this.accessoryGroup = g;
+    this.silhouetteCache = null; // new outline — the vat must remeasure
   }
 
   /** Detach and dispose the current accessory (if any). Follows the despawn
@@ -1731,6 +1736,91 @@ export class VoxelCharacter {
       }
     });
     this.accessoryGroup = null;
+    this.silhouetteCache = null; // outline shrank back — remeasure on demand
+  }
+
+  // ── 🧬 Silhouette measurement + clone-vat squeeze (#165) ────────────────────
+
+  /**
+   * Measured silhouette of the rig, feet at y=0, in 0.1 m bands — the input
+   * the clone vat's hourglass aperture is fitted against (see vatFit.ts).
+   *
+   * Measured, never hard-coded: the sculpt has been re-cut several times
+   * (reference-sheet pass, chibi proportions, ear rebuild) and a constant
+   * copied out of one of those passes would quietly stop describing the fox.
+   * Every vertex of every mesh is walked once, including the outline shells —
+   * an outline that pokes through the glass clips just as visibly as fur.
+   *
+   * Taken in the VISUAL group's frame, so an active squeeze cannot feed back
+   * into its own input, and cached because the geometry only changes when an
+   * accessory is attached or removed (both invalidate it).
+   *
+   * The pose at measurement time is whatever the rig currently holds; limb
+   * animation moves the arms fore/aft and sways the tail by a few centimetres,
+   * which is why the aperture keeps a skin margin rather than sitting flush
+   * against these numbers.
+   */
+  public silhouette(): RigSilhouette {
+    if (this.silhouetteCache) return this.silhouetteCache;
+
+    const BAND = 0.1; // m — fine enough to resolve the ears from the skull
+    this.visualGroup.updateMatrixWorld(true);
+    const toLocal = new THREE.Matrix4()
+      .copy(this.visualGroup.matrixWorld)
+      .invert();
+    const rel = new THREE.Matrix4();
+    const v = new THREE.Vector3();
+    const acc = new Map<number, { halfWidth: number; maxRadius: number }>();
+    let height = 0;
+
+    this.visualGroup.traverse((obj) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh || !mesh.geometry) return;
+      const pos = mesh.geometry.attributes.position as
+        | THREE.BufferAttribute
+        | undefined;
+      if (!pos) return;
+      rel.multiplyMatrices(toLocal, mesh.matrixWorld);
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(rel);
+        if (v.y > height) height = v.y;
+        const key = Math.floor(v.y / BAND);
+        const band = acc.get(key) ?? { halfWidth: 0, maxRadius: 0 };
+        band.halfWidth = Math.max(band.halfWidth, Math.abs(v.x));
+        band.maxRadius = Math.max(band.maxRadius, Math.hypot(v.x, v.z));
+        acc.set(key, band);
+      }
+    });
+
+    const bands: SilhouetteBand[] = [...acc.keys()]
+      .sort((a, b) => a - b)
+      .map((key) => ({
+        y0: key * BAND,
+        y1: (key + 1) * BAND,
+        halfWidth: acc.get(key)!.halfWidth,
+        maxRadius: acc.get(key)!.maxRadius,
+      }));
+    this.silhouetteCache = { height, bands };
+    return this.silhouetteCache;
+  }
+
+  /**
+   * Scale the fox to pass the vat's aperture. Applied to the VISUAL group,
+   * never the master group: the visual group carries the 8-way SNAPPED facing,
+   * so its local x really is the body's left-right axis. The master group's
+   * local x follows the continuous angle, which would make the squeeze axis
+   * drift away from the door as the fox turned.
+   *
+   * Feet sit at the rig's y=0, so a vertical factor below 1 shortens the fox
+   * from the top down and leaves it standing on the floor.
+   */
+  public setSqueeze(horizontal: number, vertical: number): void {
+    this.visualGroup.scale.set(horizontal, vertical, horizontal);
+  }
+
+  /** Drop any squeeze and return to natural size. Idempotent. */
+  public clearSqueeze(): void {
+    this.visualGroup.scale.set(1, 1, 1);
   }
 
   /**

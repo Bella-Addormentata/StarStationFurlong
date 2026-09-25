@@ -60,6 +60,7 @@ import {
   DIVE_ARC_LIFT,
   bridgeDeckY,
   poolHoleOutline,
+  itemAabb,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -366,6 +367,13 @@ export class World {
   private trunkLids: Map<string, TrunkLidHandle> = new Map();
   /** 🧬 Clone-vat tanks, keyed by item id (driven every frame like the lids). */
   private cloneVats: Map<string, CloneVatHandle> = new Map();
+  /** 🧬 #165 — the vat whose spawn cycle World last started, while that
+   *  cycle is still in flight. The cycle's TAIL (close + refill) rides the
+   *  walk-out callback, which `beginVatSpawn` drops when it re-arms the
+   *  player; a cycle abandoned for a DIFFERENT vat would therefore leave
+   *  its chamber standing open and empty, and its pending open would later
+   *  walk a fox that is being decanted somewhere else. Cleared by the tail. */
+  private vatCycleHandle: CloneVatHandle | null = null;
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
@@ -2968,8 +2976,13 @@ export class World {
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
-    if (this.cloneVats.delete(itemId) && this.player.isVatSpawning()) {
-      this.player.abortVatSpawn();
+    const removedVat = this.cloneVats.get(itemId);
+    if (this.cloneVats.delete(itemId)) {
+      // 🧬 #165 — the handle dies with the group below, so the cycle tracker
+      // must let go of it: a later respawn would otherwise call closeAndRefill
+      // on a vat whose geometry and materials are already disposed.
+      if (this.vatCycleHandle === removedVat) this.vatCycleHandle = null;
+      if (this.player.isVatSpawning()) this.player.abortVatSpawn();
     }
 
     const groupMeshes = new Set<THREE.Object3D>();
@@ -3344,6 +3357,7 @@ export class World {
         this.player.beginVatSpawn(
           { x: vat.item.pos.x, z: vat.item.pos.z },
           vat.item.rot * (Math.PI / 2),
+          vat.handle.aperture,
         );
         this.pendingVatSpawn = true;
         this.vatSawExterior = false;
@@ -5472,6 +5486,12 @@ export class World {
 
   // ── 🧬 Clone-vat spawn choreography (owner request) ─────────────────────────
 
+  /** Metres the decanted clone walks BEYOND the vat's own footprint edge
+   *  (#165). Must exceed PLAYER_R (0.38) so the exit tile is legal the
+   *  instant collision resumes; one metre also reads as a deliberate step
+   *  out of the chamber rather than a shuffle. */
+  private static readonly VAT_EXIT_CLEARANCE = 1.0;
+
   /** My preferred vat when saved (spawnPoint.ts — the vat panel's "wake up
    *  here"), else the first clone-vat item with a live handle, else null
    *  (vat-less room). */
@@ -5508,16 +5528,51 @@ export class World {
     const found = this.findSpawnVat();
     if (!found || this.isMorphing) return false;
     const { item, handle } = found;
-    // Exit = one tile out through the door face (local +z, rotated with the
-    // item) — for the default NW-pocket vat that is the open (-3.5, -3.5).
-    const exitOff = rotXZ(0, 1.0, item.rot);
+    // Exit = clear of the vat's OWN footprint, through the door face (local
+    // +z, rotated with the item). #165 made the vat a 2×2 walk-in chamber, so
+    // a hard-coded 1.0 m would have left the clone standing inside the glass:
+    // the offset is derived from the obstacle the item actually declares.
+    // rot 1/3 swap which world axis the local depth runs along, which is why
+    // the AABB is read per-axis rather than assumed to be z.
+    //   half-depth + VAT_EXIT_CLEARANCE ⇒ 2×2 vat: 1.0 + 1.0 = 2.0 m out.
+    // One metre is comfortably past the PLAYER_R-inflated obstacle (0.38 m),
+    // so the clone is standing on a legal tile the instant collision resumes.
+    const box = itemAabb(item);
+    const halfDepth = box
+      ? (item.rot % 2 === 1 ? box.x1 - box.x0 : box.z1 - box.z0) / 2
+      : 0.5; // decorative vat (no footprint) — nothing to clear but itself
+    const exitOff = rotXZ(0, halfDepth + World.VAT_EXIT_CLEARANCE, item.rot);
     const exit = { x: item.pos.x + exitOff.x, z: item.pos.z + exitOff.z };
     this.player.beginVatSpawn(
       { x: item.pos.x, z: item.pos.z },
       item.rot * (Math.PI / 2),
+      handle.aperture,
     );
+    // A cycle still running on ANOTHER vat is about to lose its walk-out
+    // callback (beginVatSpawn above re-armed the player), so shut it before it
+    // is orphaned: closeAndRefill also drops its pending open, which would
+    // otherwise fire into THIS decant and walk the fox to the other vat's exit
+    // point. The same handle needs nothing — beginSpawnCycle restarts it from
+    // the top and replaces the callback.
+    const superseded = this.vatCycleHandle;
+    if (superseded && superseded !== handle) superseded.closeAndRefill();
+    this.vatCycleHandle = handle;
+    /** End this cycle — releasing the tracker only while the claim is still
+     *  ours, so a newer cycle on another vat keeps its own. */
+    const endCycle = () => {
+      if (this.vatCycleHandle === handle) this.vatCycleHandle = null;
+      handle.closeAndRefill();
+    };
     handle.beginSpawnCycle(() => {
-      this.player.walkOutOfVat(exit, () => handle.closeAndRefill());
+      // The hold can be cancelled between the door opening and this callback
+      // (beam-out, watchdog, vat removed). walkOutOfVat would then no-op and
+      // nothing would ever fire closeAndRefill, leaving the vat standing open
+      // and empty forever — so close it here instead.
+      if (!this.player.isVatSpawning()) {
+        endCycle();
+        return;
+      }
+      this.player.walkOutOfVat(exit, endCycle);
     });
     return true;
   }

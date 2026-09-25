@@ -36,6 +36,10 @@ import type {
   CloneVatHandle,
   SlotMachineVisualHandle,
 } from "./devices";
+// 🧬 #165: the clone vat's hourglass mouth is a HARD LIMIT, and the same
+// profile has to cut the glass here and squeeze the avatar in player.ts.
+import { apertureHalfWidthAtY } from "./vatFit";
+import type { VatAperture } from "./vatFit";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
@@ -3273,21 +3277,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.85, z: 0 },
     },
   },
-  // 🧬 Clone vat — the diegetic spawn point (owner request). 1×1 obstacle,
-  // no seats. The DEVICE panel is the spawn-point picker ("wake up here");
-  // the decant choreography itself stays with World.respawnAtVat. Front is
-  // the door face (+z at rot 0 — the walk-out side).
+  // 🧬 Clone vat — the diegetic spawn point (owner request). 2×2 obstacle
+  // (#165: it is a walk-in chamber now, and its mesh fills that square), no
+  // seats. The DEVICE panel is the spawn-point picker ("wake up here"); the
+  // decant choreography itself stays with World.respawnAtVat. Front is the
+  // door face (+z at rot 0 — the walk-out side); 1.5 m out matches the other
+  // 2×2 device (map-table), i.e. half a metre clear of the footprint edge.
   "clone-vat": {
     kind: "clone-vat",
     build: buildCloneVat,
-    footprint: { w: 1, d: 1 },
+    footprint: { w: 2, d: 2 },
     functions: ["cloneVat"],
     device: {
       kind: "cloneVat",
-      front: { x: 0, z: 1.0 },
+      front: { x: 0, z: 1.5 },
       faceAngle: Math.PI,
-      eye: { x: 0, y: 1.6, z: 0.95 },
-      anchor: { x: 0, y: 1.2, z: 0 },
+      eye: { x: 0, y: 1.6, z: 1.45 },
+      anchor: { x: 0, y: 1.4, z: 0 },
     },
   },
   // 🛏️ Bunk bed — two lie-down berths (SeatTemplates with sitY + lie), no
@@ -5297,22 +5303,159 @@ function buildBunkBed({ m, place }: BuildCtx) {
 }
 
 // ── 🧬 Clone vat (owner request) — the diegetic spawn point ──────────────────
-// Concept-art-faithful cloning tank: gunmetal plinth + cap, a glass cylinder
+// Concept-art-faithful cloning tank: gunmetal collar + cap, a glass cylinder
 // full of glowing green nutrient bath, orange feed pipes and a status plate.
+//
+// #165 rebuilt it as a WALK-IN chamber. It used to be a 1×1 pod barely wider
+// than the fox's head, which meant the avatar stood half outside its own glass
+// and walked out through a hole narrower than its shoulders. Now:
+//   • it sits centred on a 2×2 tile square, and the widest part of the mesh
+//     (VAT_COLLAR_R) stays inside that square's 1.0 m half-extent;
+//   • its floor IS the room floor — no plinth to step off, so the walk-out
+//     reads as walking, not levitating;
+//   • the doorway is an HOURGLASS (VAT_APERTURE): wide at the feet, pinched at
+//     the waist, wide again overhead. That shape is a hard limit — the avatar
+//     is scaled down just far enough to pass it and eased back to full size
+//     once clear (vatFit.ts does the arithmetic, player.ts applies it).
+// The mouth you SEE is cut from the same profile the limit is computed from,
+// so the hole and the rule can never drift apart.
+//
 // Local frame (rot 0): the DOOR faces +z. The spawn choreography (drain the
-// liquid, then SPIN the front glass segment around the cylinder axis until it
-// tucks behind the fixed back shell) is driven by a CloneVatHandle stowed in
-// a base mesh's userData.cloneVat — World collects it and drives update(dt)
-// every frame (trunk-lid idiom, never a detached rAF).
-const VAT_GLASS_R = 0.4; // glass tube radius
-const VAT_GLASS_H = 1.8; // glass tube height (y 0.30 → 2.10)
-const VAT_DOOR_ARC = (Math.PI * 2) / 3; // 120° front door segment
-const VAT_DOOR_OPEN = Math.PI * 0.72; // spun back behind the shell
+// liquid, hold it visibly empty, then SPIN the front glass segment around the
+// cylinder axis until it tucks behind the fixed back shell) is driven by a
+// CloneVatHandle stowed in a base mesh's userData.cloneVat — World collects it
+// and drives update(dt) every frame (trunk-lid idiom, never a detached rAF).
+const VAT_GLASS_R = 0.86; // glass tube radius
+const VAT_COLLAR_R = 0.98; // widest mesh radius — inside the 2×2's 1.0 half-extent
+const VAT_COLLAR_H = 0.07; // back-side sill ring; absent across the door mouth
+const VAT_GLASS_H = 2.86; // glass tube height (y 0 → 2.86, standing on the floor)
+const VAT_RAIL_INSET = 0.03; // edge-rail centre line, in from the glass skin
+const VAT_RAIL_R = 0.018; // edge-rail tube radius — the tightest ring in the tube
+const VAT_DOOR_ARC = Math.PI * (140 / 180); // 140° mouth at the hourglass lobes
+const VAT_DOOR_OPEN = Math.PI; // leaf parked dead astern, fully clear of a 140° mouth
 const VAT_BEAT_TIME = 0.5; // full-tank hold before the drain starts
 const VAT_DRAIN_TIME = 1.4;
+const VAT_EMPTY_TIME = 0.35; // #165: the tank is SEEN empty before the door moves
 const VAT_DOOR_TIME = 0.9;
 const VAT_REFILL_TIME = 2.6;
 const VAT_GREEN = 0x39ff6a;
+
+/**
+ * The vat's hourglass mouth, as a hard limit on whatever walks out of it.
+ *
+ * Exported because three very different consumers need the SAME shape: the
+ * glass shell built below, the squeeze player.ts applies, and the tests that
+ * prove the fox actually fits. `height` is measured from the room floor —
+ * legitimate because the chamber is walk-in, so the avatar's own y=0 and the
+ * aperture's y=0 are the same plane.
+ *
+ * lobeHalfWidth is derived from the door arc rather than written out, so
+ * widening VAT_DOOR_ARC widens the limit by exactly as much as it widens the
+ * hole. The waist is the number that actually bites: at 0.60 m a rig measuring
+ * 0.862 m across the ears has to come in to ~70% to pass.
+ */
+export const VAT_APERTURE: VatAperture = {
+  height: VAT_GLASS_H - 0.01, // a hair under the cap ring — never touch it
+  lobeHalfWidth: VAT_GLASS_R * Math.sin(VAT_DOOR_ARC / 2),
+  waistHalfWidth: 0.6,
+  waistAt: 0.5, // a true hourglass: the pinch sits midway up the mouth
+  curve: 1.6, // >1 rounds the waist out; 1 would be a hard double cone
+  doorPlaneRadius: VAT_GLASS_R,
+  // NOT the glass: the tightest ring inside the tube is the pair of steel
+  // edge rails, and a hard limit that ignores them is not a hard limit.
+  // Measured against the built mesh by cloneVat.test.ts.
+  innerRadius: VAT_GLASS_R - VAT_RAIL_INSET - VAT_RAIL_R,
+};
+
+/** Half-angle of the mouth at height y — the mouth profile in ANGLE terms.
+ *  asin is exact here: a chord of half-width w on a circle of radius r
+ *  subtends asin(w/r) from the axis. Clamped because a lobe wider than the
+ *  tube would otherwise produce NaN instead of a fully open side. */
+function vatMouthHalfAngle(y: number): number {
+  return Math.asin(
+    Math.min(1, apertureHalfWidthAtY(VAT_APERTURE, y) / VAT_GLASS_R),
+  );
+}
+
+/**
+ * An open cylindrical shell whose angular span varies with height — the piece
+ * that makes the mouth an hourglass instead of a slot.
+ *
+ * `fill: "door"` returns the leaf (the mouth itself, −φ..+φ about +z);
+ * `fill: "back"` returns its complement (the fixed glass, φ..2π−φ). Both are
+ * generated from vatMouthHalfAngle, so the leaf always plugs the hole exactly.
+ * Vertices carry ABSOLUTE y, which lets the leaf's group sit on the tube axis
+ * at the origin and still spin correctly.
+ */
+function makeVatShell(
+  radius: number,
+  y0: number,
+  y1: number,
+  rings: number,
+  segments: number,
+  fill: "door" | "back",
+): THREE.BufferGeometry {
+  const position: number[] = [];
+  const uv: number[] = [];
+  const index: number[] = [];
+  for (let r = 0; r <= rings; r++) {
+    const v = r / rings;
+    const y = y0 + (y1 - y0) * v;
+    const phi = vatMouthHalfAngle(y);
+    const start = fill === "door" ? -phi : phi;
+    const span = fill === "door" ? 2 * phi : Math.PI * 2 - 2 * phi;
+    for (let s = 0; s <= segments; s++) {
+      const u = s / segments;
+      const theta = start + span * u;
+      // θ=0 on +z, matching THREE.CylinderGeometry's convention, so the door
+      // faces +z exactly like every other front-facing piece in this frame.
+      position.push(Math.sin(theta) * radius, y, Math.cos(theta) * radius);
+      uv.push(u, v);
+    }
+  }
+  const stride = segments + 1;
+  for (let r = 0; r < rings; r++) {
+    for (let s = 0; s < segments; s++) {
+      const a = r * stride + s;
+      const b = a + 1;
+      const c = a + stride;
+      const d = c + 1;
+      index.push(a, c, b, b, c, d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(position, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uv, 2));
+  geo.setIndex(index);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+/** One steel edge rail traced along a mouth edge, so the hourglass reads as a
+ *  machined opening rather than a hole in the glass. `side` is −1 or +1. */
+function makeVatRail(
+  side: number,
+  y0: number,
+  y1: number,
+  radius: number,
+): THREE.BufferGeometry {
+  const pts: THREE.Vector3[] = [];
+  const STEPS = 24;
+  for (let i = 0; i <= STEPS; i++) {
+    const y = y0 + (y1 - y0) * (i / STEPS);
+    const theta = side * vatMouthHalfAngle(y);
+    pts.push(
+      new THREE.Vector3(Math.sin(theta) * radius, y, Math.cos(theta) * radius),
+    );
+  }
+  return new THREE.TubeGeometry(
+    new THREE.CatmullRomCurve3(pts),
+    STEPS,
+    VAT_RAIL_R,
+    6,
+    false,
+  );
+}
 
 /** One-shot status-plate decal (trunk stencil idiom, two-line variant). */
 function makeVatPlateTexture(): THREE.CanvasTexture {
@@ -5344,98 +5487,136 @@ function buildCloneVat(ctx: BuildCtx) {
   const TRIM = 0x3d4a5e; // bezel slate
   const PIPE_O = 0xe8760a; // trunk orange conduits
   const STEEL = 0x8a93a0;
+  const TOP = VAT_GLASS_H; // tube crown — everything above stacks from here
 
-  // ── Plinth + interior floor pad
-  place(
-    new THREE.CylinderGeometry(0.5, 0.52, 0.08, 20),
-    m(TRIM, 0.6, 0.4),
-    0,
-    0.04,
-    0,
+  // ── Floor: flat plates, not a plinth. The avatar stands on the ROOM floor
+  //    inside this chamber, so anything with thickness here would swallow its
+  //    paws. Both discs are zero-thickness circles laid face-up.
+  const deckGeo = new THREE.CircleGeometry(VAT_GLASS_R - 0.03, 32);
+  deckGeo.rotateX(-Math.PI / 2);
+  // Also the handle's host — see the end of this builder.
+  const deck = place(deckGeo, m(0x14181e, 0.9, 0.1), 0, 0.006, 0);
+  const grateGeo = new THREE.RingGeometry(0.16, 0.34, 24);
+  grateGeo.rotateX(-Math.PI / 2);
+  place(grateGeo, flat(VAT_GREEN), 0, 0.012, 0);
+
+  // ── Sill collar: a low ring hugging the OUTSIDE of the glass, and only
+  //    around the back. Carrying it across the mouth would put a 7 cm lip
+  //    exactly where the fox's paws cross, which is the clipping #165 is
+  //    about. LatheGeometry's φ=0 is on +z, same as the shell above.
+  const mouthPhi0 = vatMouthHalfAngle(0);
+  const collarMat = m(TRIM, 0.6, 0.4);
+  collarMat.side = THREE.DoubleSide; // the ring's cut ends face the doorway
+  const collarGeo = new THREE.LatheGeometry(
+    [
+      new THREE.Vector2(VAT_GLASS_R + 0.02, 0),
+      new THREE.Vector2(VAT_GLASS_R + 0.02, VAT_COLLAR_H - 0.02),
+      new THREE.Vector2(VAT_GLASS_R + 0.06, VAT_COLLAR_H),
+      new THREE.Vector2(VAT_COLLAR_R, VAT_COLLAR_H),
+      new THREE.Vector2(VAT_COLLAR_R, 0),
+    ],
+    36,
+    mouthPhi0,
+    Math.PI * 2 - 2 * mouthPhi0,
   );
+  place(collarGeo, collarMat, 0, 0, 0);
+
+  // ── Cap + head-end greebles, stacked off the tube crown
+  const CAP_RT = VAT_COLLAR_R - 0.04; // cap radius at its crown
+  const CAP_RB = VAT_COLLAR_R - 0.08; // … and at its base: the cap is tapered
+  const CAP_H = 0.26;
+  const CAP_Y = TOP + 0.13;
   place(
-    new THREE.CylinderGeometry(0.46, 0.48, 0.24, 20),
+    new THREE.CylinderGeometry(CAP_RT, CAP_RB, CAP_H),
     m(BODY, 0.55, 0.45),
     0,
-    0.2,
+    CAP_Y,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.38, 0.38, 0.03, 20),
-    m(0x14181e, 0.9, 0.1),
-    0,
-    0.315,
-    0,
-  );
-  // Drain grate + green-lit outflow at the door side (concept art's spout)
-  place(
-    new THREE.BoxGeometry(0.22, 0.07, 0.1),
-    m(0x14181e, 0.8, 0.2),
-    0,
-    0.1,
-    0.48,
-  );
-  place(new THREE.BoxGeometry(0.14, 0.02, 0.03), flat(VAT_GREEN), 0, 0.1, 0.53);
-
-  // ── Cap + head-end greebles
-  place(
-    new THREE.CylinderGeometry(0.48, 0.46, 0.22, 20),
-    m(BODY, 0.55, 0.45),
-    0,
-    2.21,
-    0,
-  );
-  place(
-    new THREE.CylinderGeometry(0.14, 0.14, 0.34, 12),
+    new THREE.CylinderGeometry(0.26, 0.26, 0.26, 16),
     m(TRIM, 0.5, 0.5),
     0,
-    2.49,
+    TOP + 0.39,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.05, 0.05, 0.2, 8),
+    new THREE.CylinderGeometry(0.09, 0.09, 0.14, 8),
     m(STEEL, 0.45, 0.6),
     0,
-    2.72,
+    TOP + 0.59,
     0,
   );
-  // Orange feed conduits arcing down the back
+  // ── Orange feed conduits down the back, threaded through the ANNULUS
+  //    between the glass skin and the sill collar. The pair used to ride a
+  //    0.89 m centre line, which put 2 cm of every pipe through the glass and
+  //    left an orange sliver hanging inside the chamber the avatar stands in
+  //    (measured on the built mesh, not eyeballed). Bearing is unchanged —
+  //    only the radius moved — so the back of the vat reads exactly as before.
+  const CONDUIT_D = 0.92; // centre line: clears 0.86 and stays under 0.98
+  const CONDUIT_BEARING = 0.666; // rad off dead astern, i.e. the old ±0.55/-0.70
+  const conduitH = TOP - 0.36;
   for (const sx of [-1, 1]) {
-    const pipe = place(
-      new THREE.CylinderGeometry(0.035, 0.035, 1.9, 8),
-      m(PIPE_O, 0.5, 0.4),
-      sx * 0.3,
-      1.2,
-      -0.4,
-    );
-    pipe.rotation.x = 0.08;
+    const cx = sx * Math.sin(CONDUIT_BEARING) * CONDUIT_D;
+    const cz = -Math.cos(CONDUIT_BEARING) * CONDUIT_D;
     place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.1, 8),
+      new THREE.CylinderGeometry(0.05, 0.05, conduitH, 8),
+      m(PIPE_O, 0.5, 0.4),
+      cx,
+      0.3 + conduitH / 2,
+      cz,
+    );
+    // Ferrule: 0.055, not 0.065 — the annulus is only 0.12 m wide and the
+    // widest ring on this vat has to stay the collar (VAT_COLLAR_R).
+    place(
+      new THREE.CylinderGeometry(0.055, 0.055, 0.12, 8),
       m(STEEL, 0.45, 0.6),
-      sx * 0.3,
-      2.18,
-      -0.42,
+      cx,
+      TOP + 0.02,
+      cz,
     );
   }
-  // Status plate on the cap front (faces the door side)
+  // ── Status plate on the cap front (faces the door side). A CURVED decal,
+  //    not a flat plane: the cap is a tapered cylinder, and a plane mounted on
+  //    it is buried at the crown and floating at the base. (Measured: the flat
+  //    version lost 5% of the decal — a wedge across the top line of text —
+  //    inside the cap hull.) This shell matches the taper and rides a constant
+  //    4 mm proud at every height. An open CylinderGeometry runs u 0→1 from
+  //    −x to +x and v 0→1 bottom to top, exactly like the plane it replaces,
+  //    so the decal is neither mirrored nor flipped.
   const plateMat = new THREE.MeshBasicMaterial({
     map: makeVatPlateTexture(),
     transparent: true,
     opacity: 0,
   });
-  place(new THREE.PlaneGeometry(0.34, 0.17), plateMat, 0, 2.21, 0.475);
-  // Green status pip strip on the plinth front
+  const PLATE_H = 0.2; // 77% of the cap's height — the old prop's proportion
+  const PLATE_Y = CAP_Y + 0.02; // in the upper band, clear of the pip below
+  const PLATE_W = 2 * PLATE_H; // arc LENGTH; the decal texture is 2:1
+  /** The cap's radius at height y — it is a cone, not a cylinder, so the
+   *  decal's two ends need different radii or it would bury one of them. */
+  const capR = (y: number): number =>
+    CAP_RB + ((y - (CAP_Y - CAP_H / 2)) / CAP_H) * (CAP_RT - CAP_RB);
+  const plateArc = PLATE_W / capR(PLATE_Y);
   place(
-    new THREE.BoxGeometry(0.2, 0.035, 0.02),
-    flat(VAT_GREEN),
+    new THREE.CylinderGeometry(
+      capR(PLATE_Y + PLATE_H / 2) + 0.004,
+      capR(PLATE_Y - PLATE_H / 2) + 0.004,
+      PLATE_H,
+      24,
+      1,
+      true,
+      -plateArc / 2,
+      plateArc,
+    ),
+    plateMat,
     0,
-    0.24,
-    0.475,
+    PLATE_Y,
+    0,
   );
+  // Green status pip strip just under the plate
+  place(new THREE.BoxGeometry(0.3, 0.04, 0.02), flat(VAT_GREEN), 0, TOP, 0.9);
 
-  // ── Glass: fixed back shell (240°) + spinning front door segment (120°).
-  //    CylinderGeometry θ=0 sits on +z (vertex = (sinθ, y, cosθ)), so a door
-  //    centred on the +z axis is thetaStart −60° for 120°.
+  // ── Glass: fixed back shell + the hourglass leaf that plugs its mouth.
   const glassMat = () => {
     const gm = m(0x9bd4e8, 0.05, 0.1);
     gm.side = THREE.DoubleSide;
@@ -5443,80 +5624,70 @@ function buildCloneVat(ctx: BuildCtx) {
     return gm;
   };
   place(
-    new THREE.CylinderGeometry(
-      VAT_GLASS_R,
-      VAT_GLASS_R,
-      VAT_GLASS_H,
-      28,
-      1,
-      true,
-      Math.PI / 3,
-      (Math.PI * 4) / 3,
-    ),
+    makeVatShell(VAT_GLASS_R, 0, TOP, 24, 40, "back"),
     glassMat(),
     0,
-    0.3 + VAT_GLASS_H / 2,
+    0,
     0,
   );
   const doorGroup = new THREE.Group();
   doorGroup.name = "cloneVatDoor";
-  doorGroup.position.set(0, 0.3 + VAT_GLASS_H / 2, 0); // on the tube axis
+  doorGroup.position.set(0, 0, 0); // on the tube axis; the mesh carries its own y
   attach(doorGroup);
-  const doorMesh = new THREE.Mesh(
-    new THREE.CylinderGeometry(
-      VAT_GLASS_R + 0.012,
-      VAT_GLASS_R + 0.012,
-      VAT_GLASS_H,
-      12,
-      1,
-      true,
-      -VAT_DOOR_ARC / 2,
-      VAT_DOOR_ARC,
+  doorGroup.add(
+    new THREE.Mesh(
+      makeVatShell(VAT_GLASS_R + 0.012, 0, TOP, 24, 24, "door"),
+      glassMat(),
     ),
-    glassMat(),
   );
-  doorGroup.add(doorMesh);
-  // Thin steel edge rails on the door segment so the spin reads from afar
-  for (const edge of [-VAT_DOOR_ARC / 2, VAT_DOOR_ARC / 2]) {
-    const rail = new THREE.Mesh(
-      new THREE.BoxGeometry(0.03, VAT_GLASS_H, 0.03),
-      m(STEEL, 0.5, 0.5),
+  // Edge rails ride INSIDE the tube: outside they would sweep through the
+  // collar as the leaf spins, and the leaf only ever opens on an empty tank.
+  for (const side of [-1, 1]) {
+    doorGroup.add(
+      new THREE.Mesh(
+        makeVatRail(side, 0.02, TOP - 0.02, VAT_GLASS_R - VAT_RAIL_INSET),
+        m(STEEL, 0.5, 0.5),
+      ),
     );
-    rail.position.set(
-      Math.sin(edge) * (VAT_GLASS_R + 0.02),
-      0,
-      Math.cos(edge) * (VAT_GLASS_R + 0.02),
-    );
-    doorGroup.add(rail);
   }
 
   // ── Nutrient bath: emissive green column, origin at its BOTTOM so scale.y
   //    is the fill level (drains downward like the art's outflow panels).
+  const liquidH = VAT_GLASS_H - 0.06;
   const liquidGeo = new THREE.CylinderGeometry(
-    0.355,
-    0.355,
-    VAT_GLASS_H - 0.1,
-    24,
+    VAT_GLASS_R - 0.09,
+    VAT_GLASS_R - 0.09,
+    liquidH,
+    28,
   );
-  liquidGeo.translate(0, (VAT_GLASS_H - 0.1) / 2, 0);
+  liquidGeo.translate(0, liquidH / 2, 0);
   const liquidMat = flat(VAT_GREEN);
   liquidMat.userData.baseOpacity = 0.5;
-  const liquid = place(liquidGeo, liquidMat, 0, 0.33, 0);
+  const liquid = place(liquidGeo, liquidMat, 0, 0.03, 0);
+  // Named so the fill level is observable from outside the closure (the
+  // ordering invariants in cloneVat.test.ts read it, and it is the obvious
+  // handle in the inspector) — same idiom as cloneVatDoor above.
+  liquid.name = "cloneVatLiquid";
   // Inner glow core (brighter, thinner — reads as depth in the bath)
-  const coreGeo = new THREE.CylinderGeometry(0.16, 0.16, VAT_GLASS_H - 0.3, 12);
-  coreGeo.translate(0, (VAT_GLASS_H - 0.3) / 2, 0);
+  const coreH = VAT_GLASS_H - 0.3;
+  const coreGeo = new THREE.CylinderGeometry(0.3, 0.3, coreH, 16);
+  coreGeo.translate(0, coreH / 2, 0);
   const coreMat = flat(0x9fffb8);
   coreMat.userData.baseOpacity = 0.35;
-  const core = place(coreGeo, coreMat, 0, 0.36, 0);
+  const core = place(coreGeo, coreMat, 0, 0.12, 0);
   // Bath glow light (dims as the tank drains — handle-owned post-morph)
-  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 4.5);
-  addLight(bathLight, 0, 1.3, 0, 1.4);
+  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 6);
+  addLight(bathLight, 0, 1.5, 0, 1.4);
 
-  // ── Handle: BEAT → DRAIN → OPEN (onOpen) / CLOSE → REFILL state machine.
+  // ── Handle: BEAT → DRAIN → EMPTY → OPEN (onOpen) / CLOSE → REFILL.
+  //    The EMPTY beat is not decoration: the owner asked for the tank to be
+  //    SEEN empty before the door opens (#165). Draining straight into the
+  //    door swing let the last frames of liquid overlap the leaf's first.
   type VatPhase =
     | "IDLE_FULL"
     | "BEAT"
     | "DRAIN"
+    | "EMPTY"
     | "OPEN"
     | "IDLE_OPEN"
     | "CLOSE"
@@ -5538,6 +5709,7 @@ function buildCloneVat(ctx: BuildCtx) {
   };
 
   const handle: CloneVatHandle = {
+    aperture: VAT_APERTURE,
     beginSpawnCycle(onOpen: () => void): void {
       phase = "BEAT";
       t = 0;
@@ -5554,6 +5726,8 @@ function buildCloneVat(ctx: BuildCtx) {
     update(deltaTime: number): void {
       if (phase === "IDLE_FULL" || phase === "IDLE_OPEN") return;
       t += Math.max(0, deltaTime);
+      // Deferred to the end of the frame — see the call below.
+      let fire: (() => void) | null = null;
       switch (phase) {
         case "BEAT":
           if (t >= VAT_BEAT_TIME) {
@@ -5564,7 +5738,13 @@ function buildCloneVat(ctx: BuildCtx) {
         case "DRAIN":
           level = 1 - smooth(Math.min(1, t / VAT_DRAIN_TIME));
           if (t >= VAT_DRAIN_TIME) {
-            level = 0;
+            level = 0; // INVARIANT: the tank is empty before the door is touched
+            phase = "EMPTY";
+            t = 0;
+          }
+          break;
+        case "EMPTY":
+          if (t >= VAT_EMPTY_TIME) {
             phase = "OPEN";
             t = 0;
           }
@@ -5575,9 +5755,8 @@ function buildCloneVat(ctx: BuildCtx) {
             doorAngle = VAT_DOOR_OPEN;
             phase = "IDLE_OPEN";
             if (onOpenCb) {
-              const cb = onOpenCb;
+              fire = onOpenCb;
               onOpenCb = null; // exactly once
-              cb();
             }
           }
           break;
@@ -5585,7 +5764,7 @@ function buildCloneVat(ctx: BuildCtx) {
           doorAngle =
             VAT_DOOR_OPEN * (1 - smooth(Math.min(1, t / VAT_DOOR_TIME)));
           if (t >= VAT_DOOR_TIME) {
-            doorAngle = 0;
+            doorAngle = 0; // INVARIANT: shut before a drop of liquid returns
             phase = "REFILL";
             t = 0;
           }
@@ -5604,20 +5783,24 @@ function buildCloneVat(ctx: BuildCtx) {
         ((bathLight.userData.targetIntensity as number) ?? 1.4) *
         (0.2 + 0.8 * level);
       applyPose();
+      // LAST, and only now: this callback hands the avatar to World, which
+      // releases it to walk out. Run from inside the OPEN case it would have
+      // observed the previous frame's pose — the fox stepping off while the
+      // door mesh was still a few milliradians short of fully open. The
+      // visible state and the logical state must agree at the instant control
+      // changes hands. Anything the callback does re-entrantly (closeAndRefill
+      // when the hold was cancelled) simply lands on the next frame.
+      fire?.();
     },
   };
-  // Stow on a tiny carrier mesh inside the plinth — collected by
-  // registerFurnitureHandles (furnitureHandles.ts, the one list both World
-  // and devMenu's registerSpawnedGroup file through) exactly like
-  // userData.trunkLid.
-  const carrier = place(
-    new THREE.BoxGeometry(0.01, 0.01, 0.01),
-    m(BODY, 0.5, 0.5),
-    0,
-    0.05,
-    0,
-  );
-  carrier.userData.cloneVat = handle;
+  // Stow on the deck plate — collected by registerFurnitureHandles
+  // (furnitureHandles.ts, the one list both World and devMenu's
+  // registerSpawnedGroup file through) exactly like userData.trunkLid and
+  // userData.gameTableTop. A real mesh rather than a throwaway carrier cube:
+  // the cube sat 2 mm below the room floor, and in a chamber whose entire
+  // premise is "the avatar stands on the room floor" there should be nothing
+  // under the floor at all.
+  deck.userData.cloneVat = handle;
 }
 
 // ── 🎰 Slot machine (issue #109) — upright cabinet + built-in chair ──────────
@@ -6362,7 +6545,15 @@ export const FURNITURE: FurnitureItem[] = [
   {
     id: "cherry-tree-back-left",
     kind: "cherry-tree",
-    pos: { x: -5.3, z: -5.3 },
+    // 🌸 Slid out of the corner (#165): the clone vat's 2×2 now owns
+    // x[-6,-4] z[-6,-4] and the old (-5.3, -5.3) sat inside the glass. The
+    // canopy reaches 0.70 m in -x and 0.68 m in +x, so x=-3.05 leaves 0.27 m
+    // to the vat's collar (x ≥ -4.02) and 0.27 m to lamp-table-back-left
+    // (AABB x[-2.1,-1.1]). z is unchanged, keeping it on the back-wall line
+    // with its right-hand twin. Cherry trees have footprint: null, so this is
+    // a visual clearance, not a collision one — nothing about the walkable
+    // grid changes with this move.
+    pos: { x: -3.05, z: -5.3 },
     rot: 0,
     movable: true,
   },
@@ -6468,17 +6659,24 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 1,
     movable: true,
   },
-  // 🧬 Clone vat in the NW pocket: AABB x[-4,-3] z[-5,-4] fills the 1×1
-  // dead-end between the back-left lamp table (x[-5,-4] z[-5,-4]) and the
-  // storage trunk (x[-3,-2] z[-5,-4]), flush against the fireplace line
-  // (z=-5) — zero residual gaps, same wedge-trap-safe-by-construction
-  // reasoning as the bunk bed's nook. rot 0 ⇒ the glass door faces +z into
-  // the open x[-4,-3] z[-4,-3] cell; the spawn walk-out exits to (-3.5,-3.5).
-  // Parity: w=1/d=1 both odd → centre at n+0.5 on both axes ✓.
+  // 🧬 Clone vat, flush in the back-left corner: footprint 2×2 ⇒ AABB
+  // x[-6,-4] z[-6,-4]. #165 turned the vat into a walk-in chamber, so the
+  // obstacle is now the whole square it stands on. The player clamp is ±5.5
+  // and the walls' inner faces are at ±5.825, so this footprint swallows the
+  // entire non-walkable margin along both back edges: zero residual gap,
+  // therefore no wedge trap (a sub-1.5 m slot between two boxes is walkable
+  // on the A* grid but impassable to a PLAYER_R-inflated body — see the note
+  // above the bunk bed). Clear of both door openings (north x[-1,1], west
+  // z[-1,1]). Parity: w=2/d=2 both even → centre on integers ✓. The mesh's
+  // widest ring is VAT_COLLAR_R = 0.98 < 1.0, so no part of it leaves its own
+  // obstacle; the 0.155 m that reaches past the wall's inner face is buried
+  // inside the 0.35 m wall panel. rot 0 ⇒ the door faces +z, and the decant
+  // walk-out exits to (-5, -3) — one metre clear of the footprint edge, which
+  // World.respawnAtVat derives from the footprint depth rather than assuming.
   {
     id: "clone-vat",
     kind: "clone-vat",
-    pos: { x: -4.7, z: -4.9 },
+    pos: { x: -5, z: -5 },
     rot: 0,
     movable: true,
   },

@@ -211,3 +211,30 @@ export function migrateDefaultLayout(): void {
     }
   });
 }
+
+/**
+ * 🧱 Additive one-time migration: snap ONLY the named default items back to
+ * the shipped arrangement, leaving every other item exactly where the players
+ * left it. The narrow counterpart to migrateDefaultLayout, for the common case
+ * where one default's geometry changed and a full re-snap would be collateral
+ * damage (#165 grew the clone vat from a 1×1 prop into a 2×2 walk-in chamber
+ * and had to slide the cherry tree out of the square it now owns).
+ *
+ * Reads from the same pristine DEFAULT_LAYOUT snapshot rather than taking
+ * literals from the caller: a hand-copied position in a migration is a second
+ * source of truth that silently rots the moment the default moves again.
+ * Unknown ids are skipped rather than throwing — a migration is not the place
+ * to take a room down. Caller gates it with its own roomInfo marker; one
+ * transaction, so the furniture reconcile rebuilds the room once.
+ */
+export function upsertDefaultItems(ids: readonly string[]): void {
+  if (!docAlive()) return;
+  const wanted = new Set(ids);
+  const items = DEFAULT_LAYOUT.filter((item) => wanted.has(item.id));
+  if (items.length === 0) return;
+  boundDoc!.transact(() => {
+    for (const item of items) {
+      furnitureMap!.set(item.id, toRecord(item));
+    }
+  });
+}

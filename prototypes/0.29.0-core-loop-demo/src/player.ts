@@ -84,6 +84,16 @@ import {
 import type { Seat } from "./seats";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
 import type { DeviceTarget, DeviceFocusHooks } from "./devices";
+// 🧬 #165: the clone vat's hourglass mouth is a hard limit on the avatar.
+// The fit is pure arithmetic in its own module so the hole furniture.ts
+// BUILDS and the scale applied here can never drift apart.
+import {
+  fitVatSqueeze,
+  lerpSqueeze,
+  vatSqueezeWeight,
+  NO_SQUEEZE,
+} from "./vatFit";
+import type { VatAperture, VatSqueeze } from "./vatFit";
 
 // ── Static obstacle AABB list (XZ plane) ─────────────────────────────────────
 /** Collision radius — exported for the E3 move-furniture player-overlap check. */
@@ -292,6 +302,19 @@ export class Player {
   private readonly VAT_HOLD_TIMEOUT = 15;
   /** Deliberate first steps — slower than SPEED so the reveal reads. */
   private readonly VAT_WALK_SPEED = 1.6;
+  /** 🧬 #165 — the tube's axis in world space. The squeeze releases by
+   *  DISTANCE from it, not by a timer, so the fox always regains its size in
+   *  the doorway no matter how the walk speed is tuned. */
+  private vatAxis: { x: number; z: number } | null = null;
+  /** The mouth we are currently passing. Supplied by the vat itself (its
+   *  handle), never a constant copied out of the builder. */
+  private vatAperture: VatAperture | null = null;
+  /** Scale that fits THIS rig through THAT mouth. Computed once, when the
+   *  hold begins — the silhouette cannot change mid-decant. */
+  private vatFit: VatSqueeze = NO_SQUEEZE;
+  /** Distance from the axis at which the squeeze has fully released (the
+   *  exit point). Zero until walkOutOfVat sets the exit. */
+  private vatReleaseDist = 0;
 
   // ── FINE stuck watchdog (E3 review F2) ─────────────────────────────────────
   /** Seconds without positional progress while in a FINE phase. */
@@ -2420,6 +2443,12 @@ export class Player {
   beamTo(x: number, z: number): void {
     this.doorSeq++; // invalidate any in-flight requestOpen completion
     this._cancelDeviceApproach();
+    // 🧬 #165: a beam cancels an in-flight decant. Without this the avatar
+    // would arrive in the destination room still squeezed to vat size and
+    // stay that way until the HOLD watchdog expired. beginVatSpawn calls us
+    // FIRST and re-arms afterwards, so this is not self-defeating — it just
+    // means a second spawn supersedes the first, which is what we want.
+    if (this.vatPhase !== "NONE") this.abortVatSpawn();
     this.pendingDest = null;
     this.pendingSeat = null;
     this.pendingDoor = null;
@@ -2461,6 +2490,7 @@ export class Player {
   public beginVatSpawn(
     inside: { x: number; z: number },
     faceAngle: number,
+    aperture: VatAperture,
   ): void {
     this.beamTo(inside.x, inside.z);
     this.vatPhase = "HOLD";
@@ -2470,6 +2500,14 @@ export class Player {
     this.vatFacing = faceAngle;
     this.logicalAngle = faceAngle;
     this.character.setState("idle", faceAngle);
+    // 🧬 #165 — fit the rig to THIS vat's mouth, once. The silhouette is
+    // measured from the live meshes (accessories included) rather than read
+    // from a constant, so a fox wearing a hat is squeezed for the hat.
+    this.vatAxis = { x: inside.x, z: inside.z };
+    this.vatAperture = aperture;
+    this.vatFit = fitVatSqueeze(this.character.silhouette(), aperture);
+    this.vatReleaseDist = 0;
+    this.character.setSqueeze(this.vatFit.horizontal, this.vatFit.vertical);
   }
 
   /**
@@ -2485,6 +2523,12 @@ export class Player {
     this.vatPhase = "WALK_OUT";
     this.vatExit = exit;
     this.vatDone = onDone ?? null;
+    // 🧬 #165 — the squeeze eases out over the walk, reaching natural size
+    // exactly as the fox lands on the exit tile. Measured from the axis the
+    // vat actually stands on, so a moved vat needs no retuning.
+    this.vatReleaseDist = this.vatAxis
+      ? Math.hypot(exit.x - this.vatAxis.x, exit.z - this.vatAxis.z)
+      : 0;
   }
 
   /** True while the spawn choreography owns the avatar (HOLD or WALK_OUT). */
@@ -2502,12 +2546,24 @@ export class Player {
     this.vatExit = null;
     this.vatDone = null;
     this.navMode = "MANUAL";
+    // 🧬 #165 — however the cycle ends (arrival, watchdog, vat removed
+    // under us, beam-out), the fox goes back to full size. clearSqueeze is
+    // idempotent, so the uncontested paths pay nothing for this.
+    this.vatAxis = null;
+    this.vatAperture = null;
+    this.vatFit = NO_SQUEEZE;
+    this.vatReleaseDist = 0;
+    this.character.clearSqueeze();
   }
 
   private _updateVatPhase(deltaTime: number): void {
     const pos = this.mesh.position;
     if (this.vatPhase === "HOLD") {
       this.character.setState("idle", this.vatFacing);
+      // Re-applied every frame, exactly like the idle pose above: the squeeze
+      // is then self-healing against anything that resets the rig's scale
+      // mid-hold, and it costs one Vector3 write.
+      this.character.setSqueeze(this.vatFit.horizontal, this.vatFit.vertical);
       this.vatHoldTimer += deltaTime;
       if (this.vatHoldTimer >= this.VAT_HOLD_TIMEOUT) {
         // Watchdog: the vat never opened (handle lost mid-cycle?) — release
@@ -2532,7 +2588,7 @@ export class Player {
       this.logicalAngle = this.vatFacing;
       this.character.setState("idle", this.logicalAngle);
       const done = this.vatDone;
-      this.abortVatSpawn(); // clears state, MANUAL
+      this.abortVatSpawn(); // clears state + squeeze, MANUAL
       done?.();
       return;
     }
@@ -2540,6 +2596,20 @@ export class Player {
     pos.x += (dx / dist) * step;
     pos.z += (dz / dist) * step;
     this.character.setState("walk", this.logicalAngle);
+    // 🧬 #165 — ease the squeeze out by distance from the tube axis: full
+    // strength while any part of the body is still inside the glass (up to
+    // the door plane), natural size on the exit tile. Done AFTER the step so
+    // the weight describes where the fox now is, not where it was.
+    const ap = this.vatAperture;
+    if (ap) {
+      const axis = this.vatAxis;
+      const out = axis ? Math.hypot(pos.x - axis.x, pos.z - axis.z) : 0;
+      const eased = lerpSqueeze(
+        this.vatFit,
+        vatSqueezeWeight(out, ap.doorPlaneRadius, this.vatReleaseDist),
+      );
+      this.character.setSqueeze(eased.horizontal, eased.vertical);
+    }
   }
 
   // ── Device-focus sequence (#33 D0) ──────────────────────────────────────────

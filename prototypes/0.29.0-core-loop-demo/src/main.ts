@@ -108,6 +108,7 @@ import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
   migrateDefaultLayout,
+  upsertDefaultItems,
   furnitureDocSize,
   subscribeFurniture,
   writeFurnitureItem,
@@ -1767,6 +1768,25 @@ async function joinRoomAtEpoch(
       if (!roomMap.get("lobbyDoorClearV5")) {
         migrateDefaultLayout();
         roomMap.set("lobbyDoorClearV5", true);
+      }
+      // 🧬 Additive one-time (#165): the clone vat became a 2×2 walk-in
+      // chamber, so the DEFAULT vat moves to the flush back-left corner and
+      // the back-left cherry tree slides out of the square it now owns. Only
+      // those two ids are re-snapped — a full re-migrate here would undo every
+      // furniture move made since V5, which is precisely what this narrow
+      // idiom (see the chandelier below) exists to avoid.
+      //
+      // KNOWN, DELIBERATE GAP: a DEV-spawned vat with a unique id keeps its
+      // own position and simply grows a 2×2 obstacle around the same centre.
+      // Those were snapped on the 1×1 parity lattice (centre at n+0.5) so the
+      // bigger box lands half a tile off the even lattice a 2×2 wants. Nothing
+      // breaks — the grid bakes whatever box it is given — but the residual gap
+      // against a close neighbour can be under the 1.5 m a PLAYER_R-inflated
+      // body needs. Moving a player's own item without being asked is the
+      // worse failure, so this is documented rather than "fixed".
+      if (!roomMap.get("lobbyVatChamberV1")) {
+        upsertDefaultItems(["clone-vat", "cherry-tree-back-left"]);
+        roomMap.set("lobbyVatChamberV1", true);
       }
       // 🕯️ Additive one-time: give already-migrated lobbies the new ceiling
       // chandelier WITHOUT re-snapping the rest of the layout (a full
