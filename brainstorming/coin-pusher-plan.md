@@ -190,16 +190,19 @@ Records in the room's `casino` map:
   machine's own keys, a fixed few. Its per-player keys (requests, answers,
   and any `pusher-esc:` records an earlier revision left) carry no chips.
   They are then swept a batch of 64 per frame through the index, so a flood
-  of them can't stall a frame. The sweep works in passes: a pass that deleted
-  anything is followed by another over every family, so a key added
-  meanwhile (a stale request, a late answer) goes too, even in a family
-  already passed; it ends after a pass that finds none. Every settle happens
-  on the lease holder, so the drain never merges with a drop another tab is
-  still settling (that would bring the machine back and pay its chips
-  twice). Another deed-holder session keeps the teardown pending, and
-  finishes it only if the operator goes away still holding the lease (after
-  the same wait as a takeover). A cabinet put back first is left alone (its
-  sweep stops too), and a pending teardown or sweep is dropped if the session
+  of them can't stall a frame. The sweep works in passes, each seeing every
+  key there was when it began. A key written meanwhile (a stale request, a
+  late answer) may land in a family the pass is already past, so the index
+  tells the sweep whenever one of its machine's keys is written, and such a
+  pass is followed by another. The sweep ends after a pass during which none
+  was, however many frames it took; writes for other machines sharing a
+  bucket (a colon in an id) don't hold it up. Every settle happens on the
+  lease holder, so the drain never merges with a drop another tab is still
+  settling (that would bring the machine back and pay its chips twice).
+  Another deed-holder session keeps the teardown pending, and finishes it
+  only if the operator goes away still holding the lease (after the same
+  wait as a takeover). A cabinet put back first is left alone (its sweep
+  stops too), and a pending teardown or sweep is dropped if the session
   moves to another room's doc, so it never touches either room's doc again.
   The recipient is the caller's own identity, never the owner named in the
   peer-writable machine, so chips only ever leave the machine to the player

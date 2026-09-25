@@ -894,6 +894,9 @@ interface PusherRequestIndex {
    *  that begins so, filed by name alone whatever it holds (a removal sweeps
    *  a machine's keys from here — see startCoinPusherKeySweep). */
   byBucket: Map<string, Set<string>>;
+  /** The key sweeps under way on this map, each told when one of its
+   *  machine's keys is written (a pass may already be past that family). */
+  sweeps: Set<CoinPusherKeySweep>;
 }
 
 const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, PusherRequestIndex>();
@@ -918,19 +921,25 @@ export const PUSHER_SWEEP_BATCH = 64;
  * escrows an earlier revision left), deleted a batch at a time after the
  * drain, so a flood of them can't stall a frame. None of them carries chips.
  * It works in passes over the index's buckets for the machine, with live
- * iterators: a key deleted meanwhile is skipped. A pass that deleted anything
- * is followed by another over every family, so a key added meanwhile (a stale
- * request, or a late answer) is swept too, even in a family already passed.
- * The sweep ends after a whole pass that finds nothing to delete.
+ * iterators: a pass sees every key there was when it began, skipping any
+ * deleted meanwhile. A key written meanwhile (a stale request, a late answer)
+ * may land in a family the pass is already past, so the index tells the sweep
+ * whenever one of its machine's keys is written, and such a pass is followed
+ * by another. The sweep ends after a pass during which none was written,
+ * however many frames it took. Keys of other machines sharing a bucket (a
+ * colon in an id) are neither deleted nor waited for.
  */
 export interface CoinPusherKeySweep {
   readonly machineId: string;
   /** The map it was started on — a sweep never touches another room's. */
   readonly map: Y.Map<unknown>;
+  /** `<family><mid>:` for each per-player family: the keys it deletes. */
+  readonly prefixes: readonly string[];
   /** This pass's iterators, one per family bucket still to walk. */
   cursors: Iterator<string>[];
-  /** Whether this pass has found any of the machine's keys. */
-  found: boolean;
+  /** Whether one of the machine's keys has been written since this pass
+   *  began (set by the index). */
+  written: boolean;
 }
 
 /** Fresh iterators over the machine's buckets in the index, one per family. */
@@ -947,35 +956,59 @@ function sweepCursors(map: Y.Map<unknown>, machineId: string): Iterator<string>[
 
 export function startCoinPusherKeySweep(machineId: string): CoinPusherKeySweep {
   const map = ensureMap();
-  return { machineId, map, cursors: sweepCursors(map, machineId), found: false };
+  const sweep: CoinPusherKeySweep = {
+    machineId,
+    map,
+    prefixes: PUSHER_PLAYER_FAMILIES.map((family) => `${family}${machineId}:`),
+    cursors: sweepCursors(map, machineId),
+    written: false,
+  };
+  pusherRequestIndex(map).sweeps.add(sweep);
+  return sweep;
+}
+
+/** Give up a sweep that won't be carried on (its cabinet is back, or this
+ *  session may no longer manage it): the index stops telling it of writes.
+ *  One that has ended (continueCoinPusherKeySweep returned true) is already
+ *  stopped. */
+export function stopCoinPusherKeySweep(sweep: CoinPusherKeySweep): void {
+  pusherRequestIndexes.get(sweep.map)?.sweeps.delete(sweep);
+}
+
+/** How many key sweeps are under way on the bound map (debug and tests). */
+export function coinPusherKeySweepsUnderWay(): number {
+  return pusherRequestIndex(ensureMap()).sweeps.size;
 }
 
 /**
  * Look at up to `max` more of the sweep's keys and delete those that are the
- * machine's, in one transaction. True once a whole pass has found none of its
- * keys, or when the bound doc is no longer the one it started on (nothing is
- * touched then).
+ * machine's, in one transaction. True once a whole pass has gone by with none
+ * of its keys written, or when the bound doc is no longer the one it started
+ * on (nothing is touched then). Either way the sweep is stopped.
  */
 export function continueCoinPusherKeySweep(
   sweep: CoinPusherKeySweep,
   max: number = PUSHER_SWEEP_BATCH,
 ): boolean {
-  if (!docAlive() || casinoMap !== sweep.map) return true;
-  const prefixes = PUSHER_PLAYER_FAMILIES.map((family) => `${family}${sweep.machineId}:`);
+  if (!docAlive() || casinoMap !== sweep.map) {
+    stopCoinPusherKeySweep(sweep);
+    return true;
+  }
   const doomed: string[] = [];
   let looked = 0;
   let finished = false;
   while (looked < max) {
     if (sweep.cursors.length === 0) {
-      // The pass is over. One that found nothing ends the sweep; otherwise
-      // start another, once this batch's deletions are in.
-      if (!sweep.found) {
+      // The pass is over, having seen every key there was when it began.
+      // Unless one of the machine's keys was written since, none is left;
+      // otherwise start another, once this batch's deletions are in.
+      if (!sweep.written) {
         finished = true;
         break;
       }
       if (doomed.length > 0) break;
       sweep.cursors = sweepCursors(sweep.map, sweep.machineId);
-      sweep.found = false;
+      sweep.written = false;
       continue;
     }
     const next = sweep.cursors[0].next();
@@ -986,16 +1019,14 @@ export function continueCoinPusherKeySweep(
     looked += 1;
     // A bucket also holds the keys of a machine whose id extends this one's
     // first segment (a colon in an id): those are left alone.
-    if (prefixes.some((prefix) => next.value.startsWith(prefix))) {
-      doomed.push(next.value);
-      sweep.found = true;
-    }
+    if (sweep.prefixes.some((prefix) => next.value.startsWith(prefix))) doomed.push(next.value);
   }
   if (doomed.length > 0) {
     boundDoc!.transact(() => {
       for (const key of doomed) sweep.map.delete(key);
     });
   }
+  if (finished) stopCoinPusherKeySweep(sweep);
   return finished;
 }
 
@@ -1046,6 +1077,9 @@ function reindexPusherKey(index: PusherRequestIndex, map: Y.Map<unknown>, key: s
       index.byBucket.set(bucket, keys);
     }
     keys.add(key);
+    for (const sweep of index.sweeps) {
+      if (sweep.prefixes.some((prefix) => key.startsWith(prefix))) sweep.written = true;
+    }
   } else if (keys) {
     keys.delete(key);
     if (keys.size === 0) index.byBucket.delete(bucket);
@@ -1057,7 +1091,7 @@ function pusherRequestIndex(map: Y.Map<unknown>): PusherRequestIndex {
   const existing = pusherRequestIndexes.get(map);
   if (existing) return existing;
   const index: PusherRequestIndex = {
-    byMachine: new Map(), machineOf: new Map(), byBucket: new Map(),
+    byMachine: new Map(), machineOf: new Map(), byBucket: new Map(), sweeps: new Set(),
   };
   for (const key of map.keys()) reindexPusherKey(index, map, key);
   map.observe((event) => {
@@ -1395,6 +1429,6 @@ if (typeof window !== 'undefined') {
     releaseSlotSharedBankrollLease,
     readCoinPusherState, readCoinPusherRequests, readCoinPusherRequest,
     readCoinPusherResult, readCoinPusherEmptyRequest, readCoinPusherDoorResult,
-    readCoinPusherOperatorLease,
+    readCoinPusherOperatorLease, coinPusherKeySweepsUnderWay,
   };
 }

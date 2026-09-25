@@ -9,6 +9,7 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  coinPusherKeySweepsUnderWay,
   drainAndClearCoinPusher,
   PUSHER_SWEEP_BATCH,
   readChips,
@@ -460,10 +461,12 @@ describe('closeCoinPusher', () => {
     closeCoinPusher(MACHINE, true, NOW); // no lease: this session drains
     expect(readCoinPusherState(MACHINE)).toBeNull();
     expect(left()).toBe(flood - PUSHER_SWEEP_BATCH);
+    expect(coinPusherKeySweepsUnderWay()).toBe(1);
     tickCoinPusherTeardowns(NOW + 16);
     expect(left()).toBe(flood - 2 * PUSHER_SWEEP_BATCH);
     tickCoinPusherTeardowns(NOW + 32);
     expect(left()).toBe(0);
+    expect(coinPusherKeySweepsUnderWay()).toBe(0);
   });
 
   it('stops sweeping when the cabinet is put back', () => {
@@ -472,11 +475,44 @@ describe('closeCoinPusher', () => {
     for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
     closeCoinPusher(MACHINE, true, NOW);
     tickCoinPusherMachine(MACHINE, NOW + 16); // World ticks it again: it is back
+    expect(coinPusherKeySweepsUnderWay()).toBe(0);
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'fresh', 0.5));
     tickCoinPusherTeardowns(NOW + 32);
     tickCoinPusherTeardowns(NOW + 48);
     expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`))).toHaveLength(PUSHER_SWEEP_BATCH);
     expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('fresh');
+  });
+
+  it('gives its sweeps up once it may no longer manage the room', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    closeCoinPusher(MACHINE, true, NOW);
+    expect(coinPusherKeySweepsUnderWay()).toBe(1);
+    setSoleCroupierPredicate(() => false);
+    tickCoinPusherTeardowns(NOW + 16);
+    expect(coinPusherKeySweepsUnderWay()).toBe(0);
+    expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`))).toHaveLength(PUSHER_SWEEP_BATCH);
+  });
+
+  it('a client that may not manage the machine gives up its sweep on removal', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    closeCoinPusher(MACHINE, true, NOW);
+    expect(coinPusherKeySweepsUnderWay()).toBe(1);
+    closeCoinPusher(MACHINE, false, NOW + 16);
+    expect(coinPusherKeySweepsUnderWay()).toBe(0);
+  });
+
+  it('a cabinet removed again before a frame went by is swept once, not twice', () => {
+    const map = doc.getMap('casino');
+    for (const round of [1, 2]) {
+      writeCoinPusherState(MACHINE, machineWith(5));
+      for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:r${round}-${i}`, 'junk');
+      closeCoinPusher(MACHINE, true, NOW + round);
+    }
+    expect(coinPusherKeySweepsUnderWay()).toBe(1);
   });
 
   it('another tab leaves the drain to the tab operating the machine, finishing it only if that tab goes away', () => {
