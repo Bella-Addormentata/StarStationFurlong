@@ -45,8 +45,10 @@ import { getPlayerId } from './identity';
 import {
   closeCoinPusher,
   coinPusherOperatorSession,
+  coinPusherWatchCount,
   isCoinPusherOperator,
   isCoinPusherOperatorLive,
+  leaveCoinPusherRoom,
   MAX_REQUESTS_PER_POLL,
   OPERATOR_UNCLEAN_TAKEOVER_MS,
   operateCoinPusher,
@@ -441,7 +443,7 @@ describe('tickCoinPusherMachine', () => {
     expect(readCoinPusherOperatorLease(MACHINE)?.playerId).toBe(OPERATOR);
   });
 
-  it('releases every lease this session holds, and stops operating (leaving the room)', () => {
+  it('releases every lease this session holds, and stops operating (leaving the page)', () => {
     tickCoinPusherMachine(MACHINE, NOW);
     tickCoinPusherMachine('pusher-2', NOW);
     expect(isCoinPusherOperatorLive(MACHINE, NOW + 1)).toBe(true);
@@ -451,6 +453,45 @@ describe('tickCoinPusherMachine', () => {
       expect(isCoinPusherOperator(machine, NOW + 1)).toBe(false);
       expect(isCoinPusherOperatorLive(machine, NOW + 1)).toBe(false);
     }
+  });
+
+  it('leaving the room releases its leases and takes none back while the release is sent', () => {
+    tickCoinPusherMachine(MACHINE, NOW);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
+    leaveCoinPusherRoom();
+    // Frames go on while the release is flushed, and with no sync the
+    // croupier predicate still reads true.
+    for (const t of [NOW + 16, NOW + 3_000, NOW + 9_000]) tickCoinPusherMachine(MACHINE, t);
+    expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+    expect(isCoinPusherOperator(MACHINE, NOW + 9_000)).toBe(false);
+    expect(isCoinPusherOperatorLive(MACHINE, NOW + 9_000)).toBe(false);
+    // The next room's doc lifts it.
+    bindCasinoDoc(new Y.Doc());
+    tickCoinPusherMachine(MACHINE, NOW + 10_000);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
+  });
+
+  it('leaving the room forgets its lease observations, teardowns and sweeps', () => {
+    // A remote operator's leases watched on two cabinets, and a removed third
+    // one whose keys are still being swept.
+    for (const machine of [MACHINE, 'pusher-2']) {
+      writeCoinPusherOperatorLease(machine, { playerId: OTHER, sessionId: 'their-device:tab', expiresAt: NOW + 5_000 });
+      tickCoinPusherMachine(machine, NOW);
+    }
+    writeCoinPusherState('pusher-3', machineWith(5));
+    const map = doc.getMap('casino');
+    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:pusher-3:p${i}`, 'junk');
+    closeCoinPusher('pusher-3', true, NOW);
+    expect(coinPusherWatchCount()).toBe(3);
+    leaveCoinPusherRoom();
+    expect(coinPusherWatchCount()).toBe(0);
+    // Nor is anything watched there again: the remote lease reads as no
+    // operator at all, and isn't recorded.
+    expect(isCoinPusherOperatorLive(MACHINE, NOW + 1)).toBe(false);
+    tickCoinPusherMachine('pusher-2', NOW + 16);
+    expect(coinPusherWatchCount()).toBe(0);
+    tickCoinPusherTeardowns(NOW + 16);
+    expect([...map.keys()].filter((k) => k.startsWith('pusher-result:pusher-3:'))).toHaveLength(PUSHER_SWEEP_BATCH);
   });
 
   it('stops and releases the lease when this client is no longer the deed holder', () => {
@@ -619,6 +660,16 @@ describe('closeCoinPusher', () => {
     bindCasinoDoc(doc);
     tickCoinPusherTeardowns(NOW + 10_000);
     expect(readCoinPusherState(MACHINE)).not.toBeNull();
+    expect(readChips(OPERATOR)).toBe(0);
+  });
+
+  it('a cabinet removed while this session leaves the room is left to the sessions still in it', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    leaveCoinPusherRoom();
+    closeCoinPusher(MACHINE, true, NOW);
+    tickCoinPusherTeardowns(NOW + 16);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
     expect(readChips(OPERATOR)).toBe(0);
   });
 

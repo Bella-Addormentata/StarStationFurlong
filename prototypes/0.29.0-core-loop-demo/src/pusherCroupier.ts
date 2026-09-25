@@ -152,6 +152,15 @@ export function coinPusherOperatorSession(): string {
  *  when this page last saw the lease renewed. */
 const leaseFirstSeen = new Map<string, { id: string; at: number }>();
 
+/** The doc epoch of the room this session is leaving (leaveCoinPusherRoom):
+ *  nothing there is operated or watched again, even while its last writes
+ *  are being sent. The next room's doc has another epoch. */
+let leavingDocEpoch: number | null = null;
+
+function isLeavingRoom(): boolean {
+  return leavingDocEpoch === casinoDocEpoch();
+}
+
 /**
  * When `lease` lapses as far as this page can tell, without comparing clocks
  * across devices (CLOCKS above): one OPERATOR_LEASE_MS after this page first
@@ -197,6 +206,7 @@ function takeoverAt(
  *  tell (the panel's DROP and door): this session by its own live lease, any
  *  other while its lease hasn't lapsed by leaseLapsesAt. */
 export function isCoinPusherOperatorLive(machineId: string, now = Date.now()): boolean {
+  if (isLeavingRoom()) return false;
   const lease = readCoinPusherOperatorLease(machineId);
   if (!lease) return false;
   if (lease.sessionId === operatorSessionId) return lease.expiresAt > now;
@@ -235,6 +245,9 @@ export function isCoinPusherOperator(machineId: string, now = Date.now()): boole
  * session (or not), keeps the lease, and runs the operator's work when due.
  */
 export function tickCoinPusherMachine(machineId: string, now = Date.now()): void {
+  // A room this session is leaving isn't operated again: its released leases
+  // stay released while the release is being sent (leaveCoinPusherRoom).
+  if (isLeavingRoom()) return;
   // World ticks only cabinets in the room, so one put back before its
   // teardown ran (or finished) is no longer to be torn down.
   pendingTeardowns.delete(machineId);
@@ -404,7 +417,8 @@ export function closeCoinPusher(
 ): void {
   operators.delete(machineId);
   lastPolls.delete(machineId);
-  if (!canManage) {
+  // A room this session is leaving is left to the sessions still in it.
+  if (!canManage || isLeavingRoom()) {
     pendingTeardowns.delete(machineId);
     sweeps.delete(machineId);
     leaseFirstSeen.delete(machineId);
@@ -457,12 +471,32 @@ export function tickCoinPusherTeardowns(now = Date.now()): void {
 }
 
 /** Stop operating every machine here, releasing the leases this session
- *  holds, so another tab or device needn't wait them out. Leaving the room
- *  calls it while the room's doc is still bound (main.ts leaveRoom), and so
- *  does leaving the page. */
+ *  holds, so another tab or device needn't wait them out. */
 export function releaseCoinPusherLeases(): void {
   for (const machineId of [...operators.keys()]) stopCoinPusherOperator(machineId);
 }
 
-// Best effort on page close: the write may not flush.
+/**
+ * Leaving the room (main.ts leaveRoom, while the room's doc is still bound):
+ * release the leases this session holds, and operate or watch nothing more
+ * in this room, so no frame takes a lease back while the release is being
+ * sent. The room's lease observations, pending teardowns and key sweeps go
+ * with it. The next room's doc lifts this by its own epoch.
+ */
+export function leaveCoinPusherRoom(): void {
+  leavingDocEpoch = casinoDocEpoch();
+  releaseCoinPusherLeases();
+  leaseFirstSeen.clear();
+  pendingTeardowns.clear();
+  sweeps.clear();
+}
+
+/** How many machines this session is watching or tidying up (lease
+ *  observations, pending teardowns, key sweeps): tests and debugging. */
+export function coinPusherWatchCount(): number {
+  return leaseFirstSeen.size + pendingTeardowns.size + sweeps.size;
+}
+
+// Best effort on page close: the write may not flush. (A page restored from
+// the back/forward cache simply takes its leases again.)
 if (typeof window !== 'undefined') window.addEventListener('pagehide', releaseCoinPusherLeases);

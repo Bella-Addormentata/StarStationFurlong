@@ -145,8 +145,11 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   after a further 60 s; tabs on one device share its local node and take over
   as soon as the lease lapses; a session that stops operating releases its
   lease, including when it leaves the room (before the room's doc goes, the
-  release sent first) and when the page closes. Only a split outlasting that
-  window can still put two operators on one machine.
+  release sent first) and when the page closes. While it leaves, it operates
+  and watches nothing more in that room, so no frame takes a lease back as
+  the release goes out, and the room's lease observations, pending teardowns
+  and sweeps go with it. Only a split outlasting that window can still put
+  two operators on one machine.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). The chips inside stay put and go with the room, like its furniture.

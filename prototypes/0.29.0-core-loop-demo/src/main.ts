@@ -102,7 +102,7 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMod
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
-import { releaseCoinPusherLeases } from "./pusherCroupier";
+import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -2106,10 +2106,12 @@ async function leaveRoom(): Promise<void> {
     // 🪙 Hand back this session's coin-pusher leases while the room's doc is
     // still the bound casino doc, and send the release before the doc goes:
     // another of the deed holder's devices then takes over at once instead
-    // of waiting out the lapse and the split window. stop() doesn't wait for
-    // sends in flight, so flush first (bounded: a stalled transport must not
-    // hold the swap).
-    releaseCoinPusherLeases();
+    // of waiting out the lapse and the split window. Frames keep running
+    // meanwhile, so nothing is operated in this room again (the croupier
+    // predicate reads true with no sync). stop() doesn't wait for sends in
+    // flight, so flush first (bounded: a stalled transport must not hold the
+    // swap).
+    leaveCoinPusherRoom();
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),
