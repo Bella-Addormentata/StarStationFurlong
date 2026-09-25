@@ -315,7 +315,11 @@ export function tickCoinPusherMachine(machineId: string, now = Date.now()): void
   if (lease?.playerId !== playerId
     || lease.sessionId !== operatorSessionId
     || lease.expiresAt <= now) {
-    operators.delete(machineId);
+    // Lost, or lapsed. A lapsed record of this session's own goes now:
+    // releaseCoinPusherLeases finds only the machines still operated, so a
+    // page leaving before the next frame would otherwise leave it for another
+    // device to wait out. The next frame takes the lease afresh.
+    stopCoinPusherOperator(machineId);
     return;
   }
   if (now - operator.renewedAt >= OPERATOR_LEASE_RENEW_MS) {

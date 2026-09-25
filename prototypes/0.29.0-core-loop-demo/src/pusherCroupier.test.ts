@@ -495,6 +495,29 @@ describe('tickCoinPusherMachine', () => {
     }
   });
 
+  it('clears its own lapsed lease at once, so a page leaving before the next frame leaves none behind', () => {
+    tickCoinPusherMachine(MACHINE, NOW); // expires at NOW + 8_000
+    // No frames for a while (a background tab), then one past the expiry.
+    tickCoinPusherMachine(MACHINE, NOW + 9_000);
+    expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+    // Leaving now has nothing left to release, and leaves nothing behind.
+    releaseCoinPusherLeases();
+    expect(readCoinPusherOperatorLease(MACHINE)).toBeNull();
+    // Staying, the next frame takes the lease afresh, settling wait and all.
+    tickCoinPusherMachine(MACHINE, NOW + 9_016);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
+    expect(coinPusherOperatorState(MACHINE, NOW + 9_016)).toBe('starting');
+  });
+
+  it('leaves a lease another session took over alone when it stops operating', () => {
+    tickCoinPusherMachine(MACHINE, NOW);
+    const theirs = { playerId: OPERATOR, sessionId: 'our-other-device:tab', expiresAt: NOW + 10_000 };
+    writeCoinPusherOperatorLease(MACHINE, theirs); // their write won the merge
+    tickCoinPusherMachine(MACHINE, NOW + 16);
+    expect(isCoinPusherOperator(MACHINE, NOW + 16)).toBe(false);
+    expect(readCoinPusherOperatorLease(MACHINE)).toEqual(theirs);
+  });
+
   it('leaving the room releases its leases and takes none back while the release is sent', () => {
     tickCoinPusherMachine(MACHINE, NOW);
     expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());

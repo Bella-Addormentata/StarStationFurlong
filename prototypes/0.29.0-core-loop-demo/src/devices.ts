@@ -307,6 +307,11 @@ export interface CoinPusherVisualHandle {
   /** A short light pulse at a hole that fades back out. The cabinet fires it
    *  itself for every settled drop, so spectators see drops too. */
   triggerDropFx(hole: 0 | 1 | 2): void;
+  /** Free the chip geometry and both chip materials. They exist before any
+   *  chip is drawn, and each chip mesh holds only one material, so a
+   *  traversal of the cabinet can't reach them all. World calls this once,
+   *  as it removes the cabinet. */
+  dispose(): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────

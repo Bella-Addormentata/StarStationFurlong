@@ -34,15 +34,21 @@ The build follows the slot machine on main: a pure engine
 - **`src/furniture.ts`** — `buildCoinPusher(ctx)`: cabinet, marquee (shows the
   panel's short messages), three holes, the two platforms, the pusher bar and
   a chip pool, all drawn as the engine's cross-section (below). Registers a
-  `CoinPusherVisualHandle` on the upper platform.
+  `CoinPusherVisualHandle` on the upper platform. The handle's `dispose()`
+  frees the chip geometry and both chip materials: they exist before any chip
+  is drawn, and a chip mesh holds only one of the two, so a traversal of the
+  cabinet can't reach them all.
 - **`src/world.ts`** — files the visual handle, ticks the operator election
   for every cabinet, opens the panel on focus, and closes the machine when the
-  cabinet is removed.
+  cabinet is removed (calling the handle's `dispose()` before its own
+  traversal frees the rest).
 - **`src/furnitureHandles.ts`** — the `coinPusherVisual` handle kind in the
   shared registration list.
 - **`src/devMenu.ts`** — 🪙 COIN PUSHER spawn label.
 - Tests: `games/coinPusher.test.ts` (engine), `casinoDoc.test.ts` (records
-  and money, including a two-doc merge), `pusherCroupier.test.ts` (operator).
+  and money, including a two-doc merge), `pusherCroupier.test.ts` (operator),
+  `coinPusherCabinet.test.ts` (removing a cabinet frees everything it made,
+  each once).
 
 ## Physics model — a 1-D cross-section
 
@@ -140,20 +146,23 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   earlier in another room isn't cut short.
 - **Splits.** A Y.Map lease is not a mutex. Two operator sessions cut off from
   each other could each settle a drop from the same machine; when the docs
-  merge only one machine value survives while both players' balance writes
-  do. Settling can't be made partition-safe without an authoritative ledger
-  (the Registry-anchored chips), and reconciling afterwards from receipts
-  would only move the problem (a forged receipt would pay its writer). So the
-  rule is to never start a second operator while the first may only be cut
-  off: another *device* of the same deed holder takes over a lapsed lease only
+  merge only one machine value survives while both players' balance writes do.
+  Settling can't be made partition-safe without an authoritative ledger (the
+  Registry-anchored chips), and reconciling afterwards from receipts would
+  only move the problem (a forged receipt would pay its writer). So the rule
+  is to never start a second operator while the first may only be cut off:
+  another *device* of the same deed holder takes over a lapsed lease only
   after a further 60 s; tabs on one device share its local node and take over
   as soon as the lease lapses; a session that stops operating releases its
   lease, including when it leaves the room (before the room's doc goes, the
-  release sent first) and when the page closes. While it leaves, it operates
-  and watches nothing more in that room, so no frame takes a lease back as
-  the release goes out, and the room's lease observations, pending teardowns
-  and sweeps go with it. Only a split outlasting that window can still put
-  two operators on one machine.
+  release sent first) and when the page closes. A session that finds its own
+  lease lapsed (a tab that got no frames for a while) clears the record at
+  once and takes the lease afresh on the next frame, so a page leaving in
+  between leaves no record of its own for a successor to wait out. While it
+  leaves the room, it operates and watches nothing more in that room, so no
+  frame takes a lease back as the release goes out, and the room's lease
+  observations, pending teardowns and sweeps go with it. Only a split
+  outlasting that window can still put two operators on one machine.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). The chips inside stay put and go with the room, like its furniture.

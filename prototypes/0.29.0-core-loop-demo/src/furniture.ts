@@ -6441,6 +6441,14 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       fxLeft[hole] = DROP_FX_S;
       paintHoles();
     },
+    dispose(): void {
+      // The chip meshes come out of the cabinet first, so the removal's
+      // traversal doesn't free their geometry and material a second time.
+      pileGroup.clear();
+      chipPool.length = 0;
+      chipGeometry.dispose();
+      for (const mat of chipMaterials) mat.dispose();
+    },
   };
   // The upper platform mesh carries the handle so world.ts collects it the
   // same way it collects SlotMachineVisualHandle.
