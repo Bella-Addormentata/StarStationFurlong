@@ -41,7 +41,7 @@ import type {
 // the pusher bar from the sweep clock, the piles from the shared state.
 import {
   CHIP_R, HOLE_XS, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT,
-  currentPusherPhase, pusherFaceX,
+  currentPusherPhase, pusherFaceX, unseenDropHoles,
 } from "./games/coinPusher";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
@@ -6363,15 +6363,16 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
     return chip;
   };
 
-  // ── Hole lighting: the selected hole glows; a drop flashes and fades ──────
+  // ── Hole lighting: the selected hole glows; each drop flashes and fades ───
   const DROP_FX_S = 0.6;
   let selected: 0 | 1 | 2 = 1;
-  let fx: { hole: 0 | 1 | 2; left: number } | null = null;
+  /** Seconds of flash left per hole — several drops can land in one frame. */
+  const fxLeft = [0, 0, 0];
   const paintHoles = (): void => {
     for (let i = 0; i < holeRimMeshes.length; i++) {
       const std = holeRimMeshes[i].material as THREE.MeshStandardMaterial;
       let intensity = i === selected ? 0.4 : 0;
-      if (fx && fx.hole === i) intensity = Math.max(intensity, 0.9 * (fx.left / DROP_FX_S));
+      if (fxLeft[i] > 0) intensity = Math.max(intensity, 0.9 * (fxLeft[i] / DROP_FX_S));
       std.emissive.setHex(intensity > 0 ? GOLD : 0x000000);
       std.emissiveIntensity = intensity;
     }
@@ -6379,20 +6380,21 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
   paintHoles();
 
   let messageLeft = 0;
-  /** The last drop this cabinet has shown; undefined until the first read, so
-   *  the drop already on the record when the cabinet loads doesn't flash. */
-  let seenDropId: string | null | undefined;
+  /** The machine's nextChipId when this cabinet last looked; undefined until
+   *  the first read, so drops already on the record when it loads don't
+   *  flash. */
+  let shownUpTo: number | undefined;
 
   const handle: CoinPusherVisualHandle = {
     update(dt: number): void {
       const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
       const state = readCoinPusherState(itemId);
 
-      const dropId = state?.lastDrop?.requestId ?? null;
-      if (seenDropId !== undefined && dropId !== null && dropId !== seenDropId) {
-        handle.triggerDropFx(state!.lastDrop!.hole);
+      // Every drop settled since the last frame, even several at once.
+      if (state && shownUpTo !== undefined) {
+        for (const hole of unseenDropHoles(state, shownUpTo)) handle.triggerDropFx(hole);
       }
-      seenDropId = dropId;
+      shownUpTo = state?.nextChipId;
 
       if (state) {
         const face = pusherFaceX(currentPusherPhase(state, Date.now()));
@@ -6418,9 +6420,8 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       }
       for (let i = idx; i < chipPool.length; i++) chipPool[i].visible = false;
 
-      if (fx) {
-        fx.left -= step;
-        if (fx.left <= 0) fx = null;
+      if (fxLeft.some((left) => left > 0)) {
+        for (let i = 0; i < fxLeft.length; i++) fxLeft[i] = Math.max(0, fxLeft[i] - step);
         paintHoles();
       }
       if (messageLeft > 0) {
@@ -6437,7 +6438,7 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       messageLeft = 2;
     },
     triggerDropFx(hole: 0 | 1 | 2): void {
-      fx = { hole, left: DROP_FX_S };
+      fxLeft[hole] = DROP_FX_S;
       paintHoles();
     },
   };

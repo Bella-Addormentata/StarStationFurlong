@@ -556,8 +556,28 @@ describe('drainAndClearCoinPusher', () => {
       // A stale answer landing mid-sweep is swept too.
       if (batch === 1) map.set(`pusher-result:${MACHINE}:late`, 'junk');
     }
-    expect(continueCoinPusherKeySweep(sweep)).toBe(true);
+    // The pass ends deleting the last few; the next finds nothing and ends it.
+    expect(continueCoinPusherKeySweep(sweep)).toBe(false);
     expect(left()).toBe(0);
+    expect(continueCoinPusherKeySweep(sweep)).toBe(true);
+  });
+
+  it('a key added to a family the pass already went through is swept by the next pass', () => {
+    const map = doc.getMap('casino');
+    writeCoinPusherState(MACHINE, machineWith(5));
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+    for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    drainAndClearCoinPusher(MACHINE, OWNER);
+    const sweep = startCoinPusherKeySweep(MACHINE);
+    expect(continueCoinPusherKeySweep(sweep)).toBe(false); // the request, then answers
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
+    // A stale request lands after its family was passed, answers still left.
+    writeCoinPusherRequest(MACHINE, request(OTHER, 'stale'));
+    let batches = 1;
+    while (!continueCoinPusherKeySweep(sweep)) batches += 1;
+    expect(readCoinPusherRequest(MACHINE, OTHER)).toBeNull();
+    expect([...map.keys()].filter((k) => k.includes(`${MACHINE}:`))).toEqual([]);
+    expect(batches).toBeLessThan(10);
   });
 
   it('a sweep ends when the room changes, writing to neither room\'s doc', () => {

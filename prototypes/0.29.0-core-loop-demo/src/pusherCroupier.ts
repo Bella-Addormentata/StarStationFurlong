@@ -80,6 +80,7 @@ import {
   processInsert,
   PUSHER_ANTE,
   PUSHER_STALE_REQUEST_MS,
+  RECENT_DROPS_MAX,
   resolveDropTiming,
 } from './games/coinPusher';
 import type {
@@ -145,7 +146,8 @@ const leaseFirstSeen = new Map<string, { id: string; at: number }>();
 /**
  * Earliest time this session may take `lease` over. The record is
  * peer-writable, so its `expiresAt` is honored for at most OPERATOR_LEASE_MS
- * after this page first saw that exact record — what a live operator's lease
+ * after this page first saw that exact record in this room's doc (what a
+ * previous room's doc showed never counts) — what a live operator's lease
  * is worth anyway, since it rewrites it every OPERATOR_LEASE_RENEW_MS. A
  * record written with a far-future expiry can therefore hold a machine for
  * one lease term, not forever.
@@ -156,7 +158,8 @@ function takeoverAt(
   playerId: string,
   now: number,
 ): number {
-  const id = `${lease.playerId}|${lease.sessionId}|${lease.expiresAt}`;
+  // Scoped to the bound doc: another room's same record starts afresh.
+  const id = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.expiresAt}`;
   let seen = leaseFirstSeen.get(machineId);
   if (seen?.id !== id) {
     seen = { id, at: now };
@@ -331,6 +334,12 @@ function settleOneInsert(
       honored: timing.honored,
       atMs: now,
     },
+    // Every settled drop, for the cabinet: a poll can settle several, and
+    // lastDrop keeps only the latest.
+    recentDrops: [
+      ...(state.recentDrops ?? []),
+      { chipId: drop.chipId, hole: request.hole },
+    ].slice(-RECENT_DROPS_MAX),
   };
   const result = settleCoinPusherInsert(machineId, state, next, request);
   if (result === 'no-chips') return refuse('no-chips');

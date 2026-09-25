@@ -121,7 +121,8 @@ Records in the room's `casino` map:
   every frame, so there is no start/stop control. The lease record is
   peer-writable, so a session honors any one record for at most one lease
   term (8 s) after it first sees it: a record claiming a far-future expiry
-  can't hold a machine forever.
+  can't hold a machine forever. "First sees" counts in the bound room's doc
+  only, so an identical record seen earlier in another room isn't cut short.
 - **Splits.** A Y.Map lease is not a mutex. Two operator sessions cut off from
   each other could each settle a drop from the same machine; when the docs
   merge only one machine value survives while both players' balance writes
@@ -163,10 +164,11 @@ Records in the room's `casino` map:
   keys without walking the map either.
 - **Answers.** Each player's answer lives under their own
   `pusher-result:<mid>:<pid>` until their next request is answered. The
-  machine's `lastDrop` only lights the cabinet: the next player's drop
-  overwrites it, so a panel that missed updates would misread it. A panel that
-  withdraws an unanswered request keeps watching for an answer that raced the
-  withdrawal.
+  machine's `lastDrop` (the settle's check on the payout) and `recentDrops`
+  (the holes of the last 8 drops, which light the cabinet) move on with the
+  next player's drop, so a panel that missed updates would misread them. A
+  panel that withdraws an unanswered request keeps watching for an answer
+  that raced the withdrawal.
 - **Nothing to claim, nothing to refund.** There is no escrow and no pending
   credit. A cancelled, abandoned or withdrawn request costs nothing (the panel
   withdraws its own after 15 s without an answer, and when the player walks
@@ -188,17 +190,21 @@ Records in the room's `casino` map:
   machine's own keys, a fixed few. Its per-player keys (requests, answers,
   and any `pusher-esc:` records an earlier revision left) carry no chips.
   They are then swept a batch of 64 per frame through the index, so a flood
-  of them can't stall a frame. Every settle happens on the lease holder, so
-  the drain never merges with a drop another tab is still settling (that
-  would bring the machine back and pay its chips twice). Another
-  deed-holder session keeps the teardown pending, and finishes it only if the
-  operator goes away still holding the lease (after the same wait as a
-  takeover). A cabinet put back first is left alone (its sweep stops too),
-  and a pending teardown or sweep is dropped if the session moves to another
-  room's doc, so it never touches either room's doc again. The recipient is the caller's own
-  identity, never the owner named in the peer-writable machine, so chips only
-  ever leave the machine to the player whose drop pushed them or to the
-  operator itself — forging the machine can't pay the forger.
+  of them can't stall a frame. The sweep works in passes: a pass that deleted
+  anything is followed by another over every family, so a key added
+  meanwhile (a stale request, a late answer) goes too, even in a family
+  already passed; it ends after a pass that finds none. Every settle happens
+  on the lease holder, so the drain never merges with a drop another tab is
+  still settling (that would bring the machine back and pay its chips
+  twice). Another deed-holder session keeps the teardown pending, and
+  finishes it only if the operator goes away still holding the lease (after
+  the same wait as a takeover). A cabinet put back first is left alone (its
+  sweep stops too), and a pending teardown or sweep is dropped if the session
+  moves to another room's doc, so it never touches either room's doc again.
+  The recipient is the caller's own identity, never the owner named in the
+  peer-writable machine, so chips only ever leave the machine to the player
+  whose drop pushed them or to the operator itself — forging the machine
+  can't pay the forger.
 - **Trust.** The same dev-phase honest-client model as the rest of the
   casino map: the operator is trusted to run the physics honestly, and every
   read shape-guards so junk in these keys reads as "no machine" (including a
@@ -224,7 +230,8 @@ cashier, chips are shown as chips, never as numbers).
    runs `processInsert` with its own seed, and settles it (step *A drop*
    above).
 3. Every client sees `pusher:<mid>` change: the cabinet redraws the piles and
-   flashes the hole of the new `lastDrop`; the player's panel reads its result
+   flashes the hole of every drop it hasn't shown yet (`recentDrops`, by chip
+   id, since one poll can settle several); the player's panel reads its result
    (paid chips into the tray, timing kept or not) or its refusal.
 4. The owner presses OPEN THE DOOR → `pusher-empty:<mid>` → the operator
    empties the machine onto the owner's rack and answers under

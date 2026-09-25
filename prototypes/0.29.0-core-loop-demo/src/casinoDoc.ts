@@ -917,19 +917,24 @@ export const PUSHER_SWEEP_BATCH = 64;
  * A removed machine's per-player keys (requests, answers, and `pusher-esc:`
  * escrows an earlier revision left), deleted a batch at a time after the
  * drain, so a flood of them can't stall a frame. None of them carries chips.
- * It walks the index's buckets for the machine with live iterators: a key
- * deleted meanwhile is skipped, and one added meanwhile (a stale request, or
- * a late answer) is swept too.
+ * It works in passes over the index's buckets for the machine, with live
+ * iterators: a key deleted meanwhile is skipped. A pass that deleted anything
+ * is followed by another over every family, so a key added meanwhile (a stale
+ * request, or a late answer) is swept too, even in a family already passed.
+ * The sweep ends after a whole pass that finds nothing to delete.
  */
 export interface CoinPusherKeySweep {
   readonly machineId: string;
   /** The map it was started on — a sweep never touches another room's. */
   readonly map: Y.Map<unknown>;
+  /** This pass's iterators, one per family bucket still to walk. */
   cursors: Iterator<string>[];
+  /** Whether this pass has found any of the machine's keys. */
+  found: boolean;
 }
 
-export function startCoinPusherKeySweep(machineId: string): CoinPusherKeySweep {
-  const map = ensureMap();
+/** Fresh iterators over the machine's buckets in the index, one per family. */
+function sweepCursors(map: Y.Map<unknown>, machineId: string): Iterator<string>[] {
   const index = pusherRequestIndex(map);
   const cursors: Iterator<string>[] = [];
   for (const family of PUSHER_PLAYER_FAMILIES) {
@@ -937,13 +942,19 @@ export function startCoinPusherKeySweep(machineId: string): CoinPusherKeySweep {
     const keys = bucket === null ? undefined : index.byBucket.get(bucket);
     if (keys) cursors.push(keys.values());
   }
-  return { machineId, map, cursors };
+  return cursors;
+}
+
+export function startCoinPusherKeySweep(machineId: string): CoinPusherKeySweep {
+  const map = ensureMap();
+  return { machineId, map, cursors: sweepCursors(map, machineId), found: false };
 }
 
 /**
  * Look at up to `max` more of the sweep's keys and delete those that are the
- * machine's, in one transaction. True once it has looked at them all, or when
- * the bound doc is no longer the one it started on (nothing is touched then).
+ * machine's, in one transaction. True once a whole pass has found none of its
+ * keys, or when the bound doc is no longer the one it started on (nothing is
+ * touched then).
  */
 export function continueCoinPusherKeySweep(
   sweep: CoinPusherKeySweep,
@@ -953,7 +964,20 @@ export function continueCoinPusherKeySweep(
   const prefixes = PUSHER_PLAYER_FAMILIES.map((family) => `${family}${sweep.machineId}:`);
   const doomed: string[] = [];
   let looked = 0;
-  while (sweep.cursors.length > 0 && looked < max) {
+  let finished = false;
+  while (looked < max) {
+    if (sweep.cursors.length === 0) {
+      // The pass is over. One that found nothing ends the sweep; otherwise
+      // start another, once this batch's deletions are in.
+      if (!sweep.found) {
+        finished = true;
+        break;
+      }
+      if (doomed.length > 0) break;
+      sweep.cursors = sweepCursors(sweep.map, sweep.machineId);
+      sweep.found = false;
+      continue;
+    }
     const next = sweep.cursors[0].next();
     if (next.done) {
       sweep.cursors.shift();
@@ -962,14 +986,17 @@ export function continueCoinPusherKeySweep(
     looked += 1;
     // A bucket also holds the keys of a machine whose id extends this one's
     // first segment (a colon in an id): those are left alone.
-    if (prefixes.some((prefix) => next.value.startsWith(prefix))) doomed.push(next.value);
+    if (prefixes.some((prefix) => next.value.startsWith(prefix))) {
+      doomed.push(next.value);
+      sweep.found = true;
+    }
   }
   if (doomed.length > 0) {
     boundDoc!.transact(() => {
       for (const key of doomed) sweep.map.delete(key);
     });
   }
-  return sweep.cursors.length === 0;
+  return finished;
 }
 
 /** The machine a value under `key` is a request for, or null when it is not

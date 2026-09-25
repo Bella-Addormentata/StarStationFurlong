@@ -34,6 +34,8 @@ import {
   processInsert,
   PUSHER_PERIOD_MS,
   PUSHER_STALE_REQUEST_MS,
+  RECENT_DROPS_MAX,
+  unseenDropHoles,
   type CoinPusherState,
   type Pile,
   type PusherHole,
@@ -183,6 +185,33 @@ describe('operateCoinPusher', () => {
     expect(readChips(PLAYER) + readChips(OTHER)).toBe(
       6 - 2 + (readCoinPusherState(MACHINE)!.totalPaid - machineWith(10).totalPaid),
     );
+  });
+
+  it('records every drop a poll settles for the cabinet, not just the last', () => {
+    const base = machineWith(10);
+    writeCoinPusherState(MACHINE, base);
+    const holes: PusherHole[] = [0, 2, 1];
+    holes.forEach((hole, i) => {
+      buyInChips(`p${i}`, 1);
+      writeCoinPusherRequest(MACHINE, request(`p${i}`, `r-${i}`, 0.5, NOW - 100, hole));
+    });
+    operateCoinPusher(MACHINE, OPERATOR, NOW, () => 7);
+    const after = readCoinPusherState(MACHINE)!;
+    expect(after.lastDrop!.requestId).toBe('r-2');
+    // A cabinet that last looked before the poll lights all three holes.
+    expect(unseenDropHoles(after, base.nextChipId)).toEqual(holes);
+  });
+
+  it('keeps the recent drops to RECENT_DROPS_MAX', () => {
+    writeCoinPusherState(MACHINE, machineWith(10));
+    for (let i = 0; i < RECENT_DROPS_MAX + 3; i++) {
+      buyInChips(`q${i}`, 1);
+      writeCoinPusherRequest(MACHINE, request(`q${i}`, `r-${String(i).padStart(2, '0')}`, 0.5, NOW - 100, (i % 3) as PusherHole));
+      operateCoinPusher(MACHINE, OPERATOR, NOW, () => i);
+    }
+    const after = readCoinPusherState(MACHINE)!;
+    expect(after.recentDrops).toHaveLength(RECENT_DROPS_MAX);
+    expect(after.recentDrops!.at(-1)!.chipId).toBe(after.nextChipId - 1);
   });
 
   it('refuses a request from a player without a chip, and nothing moves', () => {
@@ -349,6 +378,19 @@ describe('tickCoinPusherMachine', () => {
     tickCoinPusherMachine(MACHINE, NOW + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS - 1);
     expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe('rogue:tab2');
     tickCoinPusherMachine(MACHINE, NOW + 8_000 + OPERATOR_UNCLEAN_TAKEOVER_MS);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
+  });
+
+  it('a lease record seen in another room\'s doc starts afresh here', () => {
+    const rogue = { playerId: OTHER, sessionId: 'rogue:tab', expiresAt: Number.MAX_VALUE };
+    writeCoinPusherOperatorLease(MACHINE, rogue);
+    tickCoinPusherMachine(MACHINE, NOW); // first seen here, in this room
+    // Much later, another room whose same-id machine carries the same record.
+    bindCasinoDoc(new Y.Doc());
+    writeCoinPusherOperatorLease(MACHINE, rogue);
+    tickCoinPusherMachine(MACHINE, NOW + 100_000);
+    expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe('rogue:tab');
+    tickCoinPusherMachine(MACHINE, NOW + 100_000 + 8_000);
     expect(readCoinPusherOperatorLease(MACHINE)?.sessionId).toBe(coinPusherOperatorSession());
   });
 

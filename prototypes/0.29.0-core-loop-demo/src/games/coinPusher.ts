@@ -229,6 +229,18 @@ export interface PusherLastDrop {
   atMs: number;
 }
 
+/** One settled drop as the cabinet shows it: the hole it came through. */
+export interface PusherDropMark {
+  /** The chip it dropped (a machine's chip ids rise by one a drop). */
+  chipId: number;
+  hole: PusherHole;
+}
+
+/** Settled drops the machine remembers for the cabinet (recentDrops). A poll
+ *  settles at most a handful, so this covers several polls' worth landing
+ *  between two frames. */
+export const RECENT_DROPS_MAX = 8;
+
 /** Why the operator turned an insert down. No chip moves on a refusal. */
 export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired';
 
@@ -284,9 +296,13 @@ export interface CoinPusherState {
   totalPaid: number;
   /** Lifetime chips removed by an owner-triggered door-open. */
   totalEmptied: number;
-  /** The last settled drop (absent until the first one) — the cabinet's
-   *  drop light; each player's own answer is their PusherResult. */
+  /** The last settled drop (absent until the first one); each player's own
+   *  answer is their PusherResult. */
   lastDrop?: PusherLastDrop;
+  /** The last RECENT_DROPS_MAX settled drops, oldest first (absent until the
+   *  first one). The cabinet lights the hole of every one it hasn't shown yet
+   *  (unseenDropHoles), even when several land between two of its frames. */
+  recentDrops?: PusherDropMark[];
 }
 
 /** Insert request a player writes under `pusher-req:<machineId>:<playerId>`.
@@ -371,6 +387,15 @@ function isLastDrop(v: unknown): v is PusherLastDrop {
     && typeof d.atMs === 'number' && Number.isFinite(d.atMs);
 }
 
+/** Marks of drops the machine has made: each chip id below its nextChipId. */
+function isRecentDrops(v: unknown, nextChipId: number): v is PusherDropMark[] {
+  return Array.isArray(v) && v.length <= RECENT_DROPS_MAX && v.every((d: unknown) => {
+    if (typeof d !== 'object' || d === null) return false;
+    const m = d as Partial<PusherDropMark>;
+    return isCountInt(m.chipId) && (m.chipId as number) < nextChipId && isHole(m.hole);
+  });
+}
+
 const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired'];
 
 export function isPusherResult(v: unknown): v is PusherResult {
@@ -411,7 +436,8 @@ export function isCoinPusherState(v: unknown): v is CoinPusherState {
     && isCountInt(s.totalInserted)
     && isCountInt(s.totalPaid)
     && isCountInt(s.totalEmptied)
-    && (s.lastDrop === undefined || isLastDrop(s.lastDrop)))) return false;
+    && (s.lastDrop === undefined || isLastDrop(s.lastDrop))
+    && (s.recentDrops === undefined || isRecentDrops(s.recentDrops, s.nextChipId as number)))) return false;
   let chips = 0;
   for (const p of s.upper as Pile[]) chips += p.count;
   for (const p of s.lower as Pile[]) chips += p.count;
@@ -443,7 +469,20 @@ export function normalizeCoinPusherState(v: unknown): CoinPusherState | null {
       landedX: d.landedX, paid: d.paid, phase: d.phase, honored: d.honored, atMs: d.atMs,
     };
   }
+  if (v.recentDrops) {
+    out.recentDrops = v.recentDrops.map((d) => ({ chipId: d.chipId, hole: d.hole }));
+  }
   return out;
+}
+
+/**
+ * The holes of the settled drops a viewer hasn't shown yet, oldest first:
+ * every recent drop whose chip is at or past `shownUpTo`, the machine's
+ * `nextChipId` when the viewer last looked. (A new machine's chip ids start
+ * again below it, so none of its drops counts until the viewer looks again.)
+ */
+export function unseenDropHoles(state: CoinPusherState, shownUpTo: number): PusherHole[] {
+  return (state.recentDrops ?? []).filter((d) => d.chipId >= shownUpTo).map((d) => d.hole);
 }
 
 export function isPusherInsertRequest(v: unknown): v is PusherInsertRequest {

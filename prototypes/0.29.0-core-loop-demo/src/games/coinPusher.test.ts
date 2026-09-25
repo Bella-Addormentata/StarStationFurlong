@@ -55,11 +55,13 @@ import {
   PUSHER_MIN_X,
   PUSHER_PERIOD_MS,
   pusherFaceX,
+  RECENT_DROPS_MAX,
   resolveDropTiming,
   SETTLE_MS,
   settlePiles,
   simulatePeg,
   stepMachine,
+  unseenDropHoles,
   type CoinPusherState,
   type Pile,
   type PusherHole,
@@ -299,6 +301,48 @@ describe('normalizeCoinPusherState', () => {
   it('returns null for a state the guard rejects', () => {
     expect(normalizeCoinPusherState({ ...initialCoinPusherState(OWNER), tick: -1 })).toBeNull();
     expect(normalizeCoinPusherState('junk')).toBeNull();
+  });
+
+  it('keeps the recent drop marks, and only their known fields', () => {
+    const s = { ...fill(5), recentDrops: [{ chipId: 4, hole: 2, extra: 'x' }, { chipId: 5, hole: 0 }] };
+    expect(normalizeCoinPusherState(s)!.recentDrops).toEqual([{ chipId: 4, hole: 2 }, { chipId: 5, hole: 0 }]);
+  });
+});
+
+// ── Recent drops (the cabinet's drop lights) ─────────────────────────────────
+
+describe('recent drops', () => {
+  const base = fill(6); // nextChipId 7
+  const marks = (...holes: PusherHole[]) =>
+    holes.map((hole, i) => ({ chipId: base.nextChipId - holes.length + i, hole }));
+
+  it('the guard takes up to RECENT_DROPS_MAX well-formed marks and nothing else', () => {
+    expect(isCoinPusherState({ ...base, recentDrops: marks(0, 1, 2) })).toBe(true);
+    const many = Array.from({ length: RECENT_DROPS_MAX + 1 }, (_, i) => ({ chipId: i, hole: 0 }));
+    for (const bad of [
+      many,
+      [{ chipId: 1, hole: 3 }],
+      [{ chipId: -1, hole: 0 }],
+      [{ chipId: 1.5, hole: 1 }],
+      [{ hole: 1 }],
+      // A mark for a chip the machine hasn't dropped.
+      [{ chipId: base.nextChipId, hole: 0 }],
+      'marks',
+    ]) {
+      expect(isCoinPusherState({ ...base, recentDrops: bad as never })).toBe(false);
+    }
+  });
+
+  it('shows a viewer every drop since it last looked, however many landed at once', () => {
+    const s = { ...base, recentDrops: marks(1, 0, 2, 2) };
+    // It last looked when nextChipId was 4: chips 4, 5 and 6 are new.
+    expect(unseenDropHoles(s, 4)).toEqual([0, 2, 2]);
+    expect(unseenDropHoles(s, base.nextChipId)).toEqual([]);
+  });
+
+  it('shows nothing of a new machine whose chip ids start again', () => {
+    const fresh = { ...fill(2), recentDrops: [{ chipId: 1, hole: 0 as PusherHole }, { chipId: 2, hole: 1 as PusherHole }] };
+    expect(unseenDropHoles(fresh, 40)).toEqual([]);
   });
 });
 
