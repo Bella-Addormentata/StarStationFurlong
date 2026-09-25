@@ -5021,6 +5021,17 @@ export class World {
       }
       if (nearDoor) continue;
       inCircle = true;
+      // 💪 A SEATED fox follows an arms-only class right where it sits — no
+      // escort, no turn (the seat owns its facing). The character applies an
+      // arms-only pose in the sit states and ignores any other pose there.
+      if (activePlayer.isSeated()) {
+        const pose = bot.getFollowerPose();
+        if (pose?.armsOnly) {
+          workout = pose;
+          break;
+        }
+        continue;
+      }
       if (!activePlayer.isStandingIdle()) continue; // acts only once standing
       // 🚶 Row formation (owner rule): inside the circle the fox stands at
       // the robot's SIDES only — never in front of or behind it. A fox that
@@ -5049,11 +5060,8 @@ export class World {
         }
         continue;
       }
-      // In the row: face the screen with the coach and mirror its rep.
-      activePlayer.faceToward(
-        pp.x + Math.sin(stageYaw),
-        pp.z + Math.cos(stageYaw),
-      );
+      // In the row: face the SAME way as the coach and mirror its rep.
+      activePlayer.setFacing(bot.getClassFacing() ?? stageYaw);
       workout = bot.getFollowerPose();
       break;
     }
@@ -5115,6 +5123,7 @@ export class World {
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
       routineOf(k) !== "coach" && // a coach runs its class, never a table
+      routineOf(k) !== "arms" &&
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,

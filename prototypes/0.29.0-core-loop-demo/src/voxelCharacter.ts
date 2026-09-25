@@ -72,6 +72,9 @@ export interface WorkoutPose {
   /** Per-leg X overrides — the lunge split; omit to keep the state pose. */
   legLX?: number;
   legRX?: number;
+  /** 💪 Arms-only move (the arm coach): also followed while SEATED, and never
+   *  touches the torso or legs. */
+  armsOnly?: boolean;
 }
 
 interface PoseState {
@@ -1895,7 +1898,16 @@ export class VoxelCharacter {
     // simply standing; any other state (walk/sit/swim) ignores the pose, so
     // stepping away breaks the follow with no bookkeeping. Applied before the
     // drink hold: a fox holding a drink does the one-armed version.
-    if (this.workoutPose && this.currentState === 'idle') {
+    const seatedArms = this.workoutPose?.armsOnly === true
+      && (this.currentState === 'sit_chair' || this.currentState === 'sit_ground');
+    if (this.workoutPose && seatedArms) {
+      // 💪 Seated follow: arms only — the sit pose keeps the torso and legs.
+      const w = this.workoutPose;
+      this.leftArm.rotation.x = w.armLX;
+      this.rightArm.rotation.x = w.armRX;
+      this.leftArm.rotation.z = -w.armZ;
+      this.rightArm.rotation.z = w.armZ;
+    } else if (this.workoutPose && this.currentState === 'idle') {
       const w = this.workoutPose;
       // ABSOLUTE root + dip: section 1's lerp only partially restores the base
       // each frame, so an additive dip would compound (~6× at 60 fps).
@@ -1951,7 +1963,12 @@ export class VoxelCharacter {
     // ── 3. 8-way decoupled snapping ───────────────────────────────────────────
     this.masterGroup.rotation.y = this.logicalRotation;
     this.visualGroup.rotation.y = -this.logicalRotation;
-    this.visualGroup.rotation.y += snapTo8Ways(this.logicalRotation);
+    // 🏋️ A fox following a class (standing) shows its EXACT heading, so it
+    // can match the coach's off-grid class facing; otherwise the 8-way look.
+    const exactFacing = this.workoutPose !== null && this.currentState === 'idle';
+    this.visualGroup.rotation.y += exactFacing
+      ? this.logicalRotation
+      : snapTo8Ways(this.logicalRotation);
   }
 
   private _updateFaceRig(blink: number, smile: number): void {
