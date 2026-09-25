@@ -5510,16 +5510,18 @@ export class World {
     if (!found || this.isMorphing) return false;
     const { item, handle } = found;
     // The door faces local +z, rotated with the item: rot quarter-turns CCW
-    // map onto facing angles (atan2(x, z)) one-for-one.
+    // map onto facing angles (atan2(x, z)) one-for-one. The seal is armed
+    // with the hold, so a cycle abandoned mid-drain shuts down at once.
+    const seal = () => handle.closeAndRefill();
     this.player.beginVatSpawn(
       { x: item.pos.x, z: item.pos.z },
       item.rot * (Math.PI / 2),
+      seal,
     );
     handle.beginSpawnCycle(() => {
-      const seal = () => handle.closeAndRefill();
-      // A clone released meanwhile (HOLD watchdog) never walks out, so seal
-      // here — the vat must not stand open and dry.
-      if (!this.player.walkOutOfVat(seal)) seal();
+      // A released clone has already sealed the vat (which drops this
+      // callback); belt and braces — never leave the door open and dry.
+      if (!this.player.walkOutOfVat()) seal();
     });
     return true;
   }

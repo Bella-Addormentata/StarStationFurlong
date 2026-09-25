@@ -8,6 +8,7 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
+  AVATAR_REACH,
   AVATAR_SILHOUETTE,
   VAT_DOOR_ARC,
   VAT_DOOR_SWEEP_R,
@@ -25,8 +26,10 @@ import {
   VAT_Q_LIP,
   VAT_Q_NECK,
   VAT_TANK_H,
+  vatClearOfDoorAt,
   vatDoorClear,
   vatFloorY,
+  vatFreeExitAlong,
   vatGaugeAt,
   vatSqueezeAt,
 } from './vatGauge';
@@ -169,11 +172,64 @@ describe('door, floor and exit along the walk-out', () => {
     }
   });
 
+  it('seals a released clone only once its whole reach is past the door', () => {
+    // The reach is the tail tip, whichever way the clone turns.
+    expect(AVATAR_REACH).toBeGreaterThan(1.1);
+    const clearAt = VAT_DOOR_SWEEP_R + AVATAR_REACH;
+    expect(vatClearOfDoorAt(clearAt - 0.01, 1)).toBe(false);
+    expect(vatClearOfDoorAt(clearAt + 0.1, 1)).toBe(true);
+    // Conservative next to the along-axis test at the normal exit.
+    expect(vatDoorClear(VAT_EXIT_ALONG, 1)).toBe(true);
+  });
+
   it('builds a tank that fits its footprint with a leaf that can park behind the shell', () => {
     expect(VAT_GLASS_R).toBeLessThan(VAT_DOOR_SWEEP_R);
     expect(VAT_DOOR_SWEEP_R).toBeLessThan(VAT_PLINTH_R);
     expect(VAT_PLINTH_R + 0.05).toBeLessThanOrEqual(1); // base ring, 2×2 ⇒ ±1 m
     expect(VAT_DOOR_ARC).toBeLessThanOrEqual(Math.PI);
+  });
+});
+
+describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
+  const R = 0.38; // player collision radius (player.ts PLAYER_R)
+  const ROOM = { boundX: 5.5, boundZ: 5.5 }; // default walkable box
+  const box = (cx: number, cz: number, hw: number, hd: number) => ({
+    x0: cx - hw,
+    z0: cz - hd,
+    x1: cx + hw,
+    z1: cz + hd,
+  });
+
+  it('walks the full exit on open floor, ignoring the vat\'s own footprint', () => {
+    const own = box(0, 0, 1, 1);
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own], ROOM, R)).toBe(VAT_EXIT_ALONG);
+  });
+
+  it('stops inside the walkable box when the vat faces a wall', () => {
+    // A 2×2 vat against the south placement edge, door facing the wall.
+    const end = vatFreeExitAlong({ x: 0, z: 4 }, 0, [box(0, 4, 1, 1)], ROOM, R);
+    expect(4 + end).toBeLessThanOrEqual(ROOM.boundZ);
+    expect(end).toBeGreaterThan(1); // still out past the footprint
+    expect(end).toBeLessThan(VAT_EXIT_ALONG);
+  });
+
+  it('stops a collision radius short of furniture across the path', () => {
+    // Door facing +x (rot 1); a 1×1 item 1.6–2.6 m out along the path.
+    const blocker = box(2.1, 0, 0.5, 0.5);
+    const end = vatFreeExitAlong({ x: 0, z: 0 }, Math.PI / 2, [box(0, 0, 1, 1), blocker], ROOM, R);
+    expect(end).toBeLessThanOrEqual(blocker.x0 - R);
+    expect(end).toBeGreaterThan(blocker.x0 - R - 0.06);
+  });
+
+  it('never ends inside the tank, even when the doorway is blocked', () => {
+    const end = vatFreeExitAlong({ x: 0, z: 0 }, 0, [box(0, 0, 1, 1), box(0, 1.5, 1, 0.5)], ROOM, R);
+    expect(end).toBe(VAT_PLINTH_R);
+  });
+
+  it('is unobstructed for the default vat in the default lobby', () => {
+    const vat = FURNITURE.find((i) => i.id === 'clone-vat')!;
+    const boxes = FURNITURE.map((i) => itemAabb(i)).filter((b) => b !== null);
+    expect(vatFreeExitAlong(vat.pos, vat.rot * (Math.PI / 2), boxes, ROOM, R)).toBe(VAT_EXIT_ALONG);
   });
 });
 

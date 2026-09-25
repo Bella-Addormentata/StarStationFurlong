@@ -104,6 +104,14 @@ export const AVATAR_SILHOUETTE: readonly AvatarSlice[] = [
 /** Tail tip — the silhouette's rearmost point (door-clearance test). */
 const AVATAR_BACK = -AVATAR_SILHOUETTE[0].z0;
 
+/** The silhouette's horizontal reach from its root in ANY direction (the
+ *  tail tip) — the door-clearance test once the clone may face anywhere. */
+export const AVATAR_REACH = Math.max(
+  ...AVATAR_SILHOUETTE.map((s) =>
+    Math.hypot(s.halfWidth, Math.max(Math.abs(s.z0), Math.abs(s.z1))),
+  ),
+);
+
 // ── The hourglass ─────────────────────────────────────────────────────────────
 
 const R_IN = VAT_GLASS_R - VAT_CLEARANCE;
@@ -229,6 +237,62 @@ export function vatSqueezeAt(along: number): VatSqueeze {
  *  i.e. may the door spin shut without cutting through the tail? */
 export function vatDoorClear(along: number, horizontal: number): boolean {
   return along - horizontal * AVATAR_BACK > VAT_DOOR_SWEEP_R + VAT_CLEARANCE;
+}
+
+/** A released clone `distance` metres from the vat axis, plan-scaled by
+ *  `horizontal` and facing anywhere: is all of it past the door's sweep? */
+export function vatClearOfDoorAt(distance: number, horizontal: number): boolean {
+  return distance - horizontal * AVATAR_REACH > VAT_DOOR_SWEEP_R + VAT_CLEARANCE;
+}
+
+/** An axis-aligned floor box (structurally furniture.ts's Box). */
+export interface VatFloorBox {
+  x0: number;
+  z0: number;
+  x1: number;
+  z1: number;
+}
+
+/**
+ * How far out (metres from the vat axis) the scripted walk-out can go in
+ * this room: VAT_EXIT_ALONG when the whole path is free, else the last free
+ * spot (5 cm steps) before the path leaves the walkable box or comes within
+ * `radius` of another obstacle — a movable vat can face a wall or furniture.
+ * The vat's own footprint (the box around its axis) is where the walk
+ * starts, so it is ignored. Never less than the plinth lip.
+ */
+export function vatFreeExitAlong(
+  centre: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): number {
+  const dirX = Math.sin(facing);
+  const dirZ = Math.cos(facing);
+  const isOwn = (b: VatFloorBox) =>
+    centre.x > b.x0 && centre.x < b.x1 && centre.z > b.z0 && centre.z < b.z1;
+  const blocked = (along: number) => {
+    const x = centre.x + dirX * along;
+    const z = centre.z + dirZ * along;
+    if (Math.abs(x) > bounds.boundX + 1e-9 || Math.abs(z) > bounds.boundZ + 1e-9) {
+      return true;
+    }
+    return obstacles.some(
+      (b) =>
+        !isOwn(b) &&
+        x > b.x0 - radius &&
+        x < b.x1 + radius &&
+        z > b.z0 - radius &&
+        z < b.z1 + radius,
+    );
+  };
+  let free = VAT_PLINTH_R;
+  for (let along = VAT_PLINTH_R; ; along = Math.min(VAT_EXIT_ALONG, along + 0.05)) {
+    if (blocked(along)) return free;
+    free = along;
+    if (along >= VAT_EXIT_ALONG) return free;
+  }
 }
 
 /** Root height while walking out: on the pad inside, easing down off the
