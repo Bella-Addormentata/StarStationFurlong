@@ -324,3 +324,56 @@ describe('isDeedHolder — the deed, not owner-equivalence', () => {
     expect(isDeedHolder('player-them', noEntries)).toBe(false);
   });
 });
+
+/**
+ * Leaving a room hands this client none of it. `leaveRoom` gives up `yjsSync`
+ * before it waits for the sync to flush and stop, and both main.ts gates fall
+ * back to "offline: this client is alone" when there is no sync. Without the
+ * leaving check first, a departing client — a visitor included — ran the old
+ * room's croupiers and its owner-gated paths (the manual slot operator among
+ * them) while its writes still went out (PR #137 review).
+ *
+ * ⚠️ Like the #142 block above, this SCANS the source: main.ts can't be loaded
+ * by vitest. It pins the wiring (both gates check the flag before the offline
+ * fallback, and leaveRoom holds the flag across the whole leave), not that a
+ * frame lands inside the window.
+ */
+describe('leaving a room hands this client none of it (source scan)', () => {
+  const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
+
+  /** The body of the predicate registered with `setter(() => { … });`. */
+  const gate = (setter: string): string => {
+    const start = main.indexOf(`${setter}(() => {`);
+    expect(start, `${setter} not found in main.ts`).toBeGreaterThan(-1);
+    return main.slice(start, main.indexOf('\n  });', start));
+  };
+
+  /** The body of a named top-level (async) function, up to the next one. */
+  const bodyOf = (name: string): string => {
+    const start = main.indexOf(`function ${name}(`);
+    expect(start, `${name} not found in main.ts`).toBeGreaterThan(-1);
+    const next = main.slice(start + 1).search(/\n(async )?function /);
+    return main.slice(start, next === -1 ? main.length : start + 1 + next);
+  };
+
+  it('both gates refuse while a leave is under way, before their offline fallback', () => {
+    for (const setter of ['setRoomEditPermission', 'setSoleCroupierPredicate']) {
+      const body = gate(setter);
+      const leaving = body.indexOf('if (roomLeavesUnderWay > 0)');
+      expect(leaving, `${setter} must refuse while leaving`).toBeGreaterThan(-1);
+      expect(leaving, `${setter} must refuse before "no sync ⇒ alone"`).toBeLessThan(body.indexOf('if (!yjsSync)'));
+    }
+  });
+
+  it('leaveRoom holds the flag for the whole leave, the flush and the stop included', () => {
+    expect(bodyOf('leaveRoom')).toMatch(
+      /roomLeavesUnderWay\+\+;\s*try \{\s*await leaveRoomNow\(\);\s*\} finally \{\s*roomLeavesUnderWay--;\s*\}/,
+    );
+    const now = bodyOf('leaveRoomNow');
+    expect(now).toContain('yjsSync = null');
+    expect(now).toContain('sync.flush()');
+    expect(now).toContain('await sync.stop()');
+    // Nothing else lowers it: the leave's own finally is the only place.
+    expect(main.match(/roomLeavesUnderWay--/g)).toHaveLength(1);
+  });
+});

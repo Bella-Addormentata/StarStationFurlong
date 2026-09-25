@@ -125,12 +125,7 @@ import {
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
-import {
-  closeSlotMachine,
-  stopAutoSlotMachine,
-  tickAutoSlotMachine,
-  tickManualSlotMachine,
-} from "./slotCroupier";
+import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
@@ -5077,7 +5072,7 @@ export class World {
     // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
     const autoCroupier = canRunCroupier();
-    if ((tables.length || slotMachines.length) && autoCroupier) {
+    if (tables.length && autoCroupier) {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
@@ -5086,14 +5081,18 @@ export class World {
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
       }
-      for (const machine of slotMachines) tickAutoSlotMachine(machine.id);
-    } else {
-      const authorized = canEditRoom().ok;
-      for (const machine of slotMachines) {
-        stopAutoSlotMachine(machine.id);
-        tickManualSlotMachine(machine.id, authorized);
-      }
     }
+
+    // 🎰 Slot machines: ONE session operates every machine in the room (one
+    // lease, slotCroupier.ts), so a player's balance has a single slot
+    // writer: the deed holder's, or in a venture room (nobody runs the
+    // croupier) the owner who started machines by hand. Every client ticks
+    // the room: it watches the lease's renewals, and a client that may not
+    // operate stops operating there.
+    tickSlotMachineRoom(
+      slotMachines.map((machine) => machine.id),
+      !autoCroupier && canEditRoom().ok,
+    );
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's
     // reserved operator slot (roulette wheel-head / craps stickman). The owner

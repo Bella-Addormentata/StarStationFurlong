@@ -504,20 +504,34 @@ function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
     && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt);
 }
 
-export function readSlotOperatorLease(machineId: string): SlotOperatorLease | null {
+/** 🎰 The room's slot operator lease: ONE session operates every slot machine
+ *  in the room (slotCroupier.ts), so a player's `bal:` has one slot writer. */
+export const SLOT_OPERATOR_KEY = 'slot-operator';
+
+export function readSlotOperatorLease(): SlotOperatorLease | null {
+  const value = ensureMap().get(SLOT_OPERATOR_KEY);
+  return isSlotOperatorLease(value) ? value : null;
+}
+
+export function writeSlotOperatorLease(lease: SlotOperatorLease): void {
+  if (!isSlotOperatorLease(lease)) return;
+  ensureMap().set(SLOT_OPERATOR_KEY, lease);
+}
+
+export function clearSlotOperatorLease(): void {
+  ensureMap().delete(SLOT_OPERATOR_KEY);
+}
+
+/** The per-machine lease (`slot-operator:<mid>`) that builds before the
+ *  room's lease took. This build never writes one: while one is being
+ *  renewed, an earlier build is operating that machine (slotCroupier.ts,
+ *  EARLIER BUILDS). */
+export function readLegacySlotOperatorLease(machineId: string): SlotOperatorLease | null {
   const value = ensureMap().get(`slot-operator:${machineId}`);
   return isSlotOperatorLease(value) ? value : null;
 }
 
-export function writeSlotOperatorLease(
-  machineId: string,
-  lease: SlotOperatorLease,
-): void {
-  if (!isSlotOperatorLease(lease)) return;
-  ensureMap().set(`slot-operator:${machineId}`, lease);
-}
-
-export function clearSlotOperatorLease(machineId: string): void {
+export function clearLegacySlotOperatorLease(machineId: string): void {
   ensureMap().delete(`slot-operator:${machineId}`);
 }
 
