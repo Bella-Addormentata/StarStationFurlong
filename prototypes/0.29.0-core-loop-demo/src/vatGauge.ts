@@ -233,6 +233,24 @@ export function vatSqueezeAt(along: number): VatSqueeze {
   return { horizontal, vertical: Math.max(VAT_MIN_SCALE, vertical) };
 }
 
+/**
+ * Does the FULL-SIZE silhouette, root `along` metres out, clear the vat
+ * itself: every slice still in the tank or the doorway fitting the gauge
+ * there? Past the lip is open room — the gauge's outer cone only paces the
+ * walk-out's easing, it is not a wall — so slices out there are free.
+ */
+export function vatFullSizeFitsAt(along: number): boolean {
+  for (const slice of AVATAR_SILHOUETTE) {
+    const q0 = along + slice.z0;
+    if (q0 > VAT_Q_LIP) continue;
+    const g = tightestIn(q0, Math.min(along + slice.z1, VAT_Q_LIP));
+    if (slice.halfWidth > g.halfWidth + 1e-9 || slice.top > g.height + 1e-9) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** Is every part of the (plan-scaled) avatar outside the door leaf's sweep —
  *  i.e. may the door spin shut without cutting through the tail? */
 export function vatDoorClear(along: number, horizontal: number): boolean {
@@ -279,13 +297,17 @@ function spotBlocked(
 
 /**
  * How far out (metres from the vat axis) the scripted walk-out can go in
- * this room: VAT_EXIT_ALONG when the whole path is free, else the last free
- * spot (5 cm steps) before the path leaves the walkable box or comes within
+ * this room: VAT_EXIT_ALONG when the path is free, else the last free spot
+ * (5 cm steps) before the path leaves the walkable box or comes within
  * `radius` of another obstacle — a movable vat can face a wall or furniture.
- * The vat's own footprint is where the walk starts, so it is ignored along
- * the way; but the end must clear it too (VAT_FOOTPRINT_HALF + radius out)
- * to be a genuinely collision-free spot. null when the path is blocked
- * before that — no walk-out can end anywhere valid (vatFallbackRelease).
+ * The path is scanned from `from` outward (the clone's current spot, when
+ * re-planning mid-walk: what is behind it no longer matters). The vat's own
+ * footprint is where the walk starts, so it is ignored along the way; but
+ * the end must be a valid release: clear of that footprint too
+ * (VAT_FOOTPRINT_HALF + radius out) and far enough that the clone, eased
+ * back to full size there, clears the vat (VAT_MIN_RELEASE_ALONG). null when
+ * the path is blocked before that — the walk-out cannot end anywhere valid
+ * (vatFallbackRelease).
  */
 export function vatFreeExitAlong(
   centre: { x: number; z: number },
@@ -293,6 +315,7 @@ export function vatFreeExitAlong(
   obstacles: readonly VatFloorBox[],
   bounds: { boundX: number; boundZ: number },
   radius: number,
+  from: number = VAT_PLINTH_R,
 ): number | null {
   const dirX = Math.sin(facing);
   const dirZ = Math.cos(facing);
@@ -308,14 +331,19 @@ export function vatFreeExitAlong(
   );
   const others = obstacles.filter((_, i) => i !== ownIndex);
   let free: number | null = null;
-  for (let along = VAT_PLINTH_R; ; along = Math.min(VAT_EXIT_ALONG, along + 0.05)) {
+  for (
+    let along = Math.min(from, VAT_EXIT_ALONG);
+    ;
+    along = Math.min(VAT_EXIT_ALONG, along + 0.05)
+  ) {
     const x = centre.x + dirX * along;
     const z = centre.z + dirZ * along;
     if (spotBlocked(x, z, others, bounds, radius)) break;
     free = along;
     if (along >= VAT_EXIT_ALONG) break;
   }
-  return free !== null && free >= VAT_FOOTPRINT_HALF + radius ? free : null;
+  const minEnd = Math.max(VAT_FOOTPRINT_HALF + radius, VAT_MIN_RELEASE_ALONG);
+  return free !== null && free >= minEnd ? free : null;
 }
 
 /**
@@ -396,6 +424,16 @@ export const VAT_EXIT_ALONG: number = (() => {
     const a = cm / 100;
     const s = vatSqueezeAt(a);
     if (s.horizontal >= 1 && s.vertical >= 1 && vatDoorClear(a, 1)) return a;
+  }
+  return 4;
+})();
+
+/** The nearest a walk-out may END (metres toward the door): from here out
+ *  the clone, eased back to full size in place, clears the tank, doorway
+ *  and transom (vatFullSizeFitsAt). Scanned once, on a centimetre grid. */
+export const VAT_MIN_RELEASE_ALONG: number = (() => {
+  for (let cm = Math.ceil(VAT_Q_LIP * 100); cm < 400; cm++) {
+    if (vatFullSizeFitsAt(cm / 100)) return cm / 100;
   }
   return 4;
 })();

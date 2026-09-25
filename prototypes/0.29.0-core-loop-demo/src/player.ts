@@ -73,6 +73,7 @@ import { roomWalkBounds } from "./floorPlanDoc";
 import { OBSTACLES } from "./obstacles";
 import {
   VAT_HOLD_ALONG,
+  VAT_PLINTH_R,
   vatClearOfDoorAt,
   vatDoorClear,
   vatFallbackRelease,
@@ -316,6 +317,8 @@ export class Player {
   private readonly VAT_RELAX_TIME = 0.4;
   /** WAIT_CLEAR: seconds between tries for somewhere to step out to. */
   private readonly VAT_WAIT_RETRY = 0.5;
+  /** WAIT_CLEAR: where on the door path the clone is held (to look from). */
+  private vatWaitFrom = 0;
   /** Seconds spent in HOLD — watchdog releases a stranded clone (a vat
    *  animation that never calls walkOutOfVat must not soft-lock input). */
   private vatHoldTimer = 0;
@@ -2535,7 +2538,7 @@ export class Player {
    */
   public walkOutOfVat(): boolean {
     if (this.vatPhase !== "HOLD") return false; // released meanwhile
-    this._leaveVat();
+    this._leaveVat(VAT_PLINTH_R);
     return true;
   }
 
@@ -2546,14 +2549,17 @@ export class Player {
    * once clear; else — nowhere in the room is free — stay held in the tank,
    * where the clone fits, and try again shortly (WAIT_CLEAR). The clone is
    * never released anywhere it would overlap the vat or other furniture.
+   * `from` is where on the door path to look from (the plinth lip, or the
+   * clone's current spot when re-planning mid-walk).
    */
-  private _leaveVat(): void {
+  private _leaveVat(from: number): void {
     const exit = vatFreeExitAlong(
       this.vatCentre,
       this.vatFacing,
       OBSTACLES,
       this.roomBounds(),
       PLAYER_R,
+      from,
     );
     if (exit !== null) {
       this.vatPhase = "WALK_OUT";
@@ -2568,6 +2574,7 @@ export class Player {
       return;
     }
     this.vatPhase = "WAIT_CLEAR";
+    this.vatWaitFrom = from;
     this.vatHoldTimer = 0;
   }
 
@@ -2691,7 +2698,7 @@ export class Player {
       this.vatHoldTimer += deltaTime;
       if (this.vatHoldTimer >= this.VAT_WAIT_RETRY) {
         this.vatHoldTimer = 0;
-        this._leaveVat();
+        this._leaveVat(this.vatWaitFrom);
       }
       return;
     }
@@ -2717,6 +2724,22 @@ export class Player {
     const along =
       (pos.x - this.vatCentre.x) * Math.sin(this.vatFacing) +
       (pos.z - this.vatCentre.z) * Math.cos(this.vatFacing);
+    // Furniture can change mid-walk (owner edits, synced moves): re-plan the
+    // end from where the clone now stands, every frame, so it is never
+    // walked onto — or released at — a spot that has since been taken.
+    const end = vatFreeExitAlong(
+      this.vatCentre,
+      this.vatFacing,
+      OBSTACLES,
+      this.roomBounds(),
+      PLAYER_R,
+      along,
+    );
+    if (end === null) {
+      this._leaveVat(along); // step out elsewhere, or hold here
+      return;
+    }
+    this.vatExitAlong = end;
     const next = Math.min(
       this.vatExitAlong,
       along + this.VAT_WALK_SPEED * Math.max(0, deltaTime),

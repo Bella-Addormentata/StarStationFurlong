@@ -18,6 +18,7 @@ import {
   VAT_GLASS_H,
   VAT_GLASS_R,
   VAT_HOLD_ALONG,
+  VAT_MIN_RELEASE_ALONG,
   VAT_MIN_SCALE,
   VAT_NECK_H,
   VAT_NECK_HALF_W,
@@ -32,6 +33,7 @@ import {
   vatFallbackRelease,
   vatFloorY,
   vatFreeExitAlong,
+  vatFullSizeFitsAt,
   vatGaugeAt,
   vatSqueezeAt,
 } from './vatGauge';
@@ -255,6 +257,56 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     const spot = vatFallbackRelease({ x: 0, z: 0 }, 0, [cover], ROOM, R)!;
     expect(spot.x).toBeGreaterThanOrEqual(cover.x1 + R);
     expect(spot.x).toBeLessThanOrEqual(ROOM.boundX);
+  });
+
+  it('only ends a walk-out where the full-size clone clears the vat', () => {
+    // Copilot's example: at 1.42 m the full-size ears are still under the
+    // transom, so easing back to full size there would cross it.
+    expect(vatFullSizeFitsAt(1.42)).toBe(false);
+    expect(VAT_MIN_RELEASE_ALONG).toBeGreaterThanOrEqual(VAT_FOOTPRINT_HALF + R);
+    expect(VAT_MIN_RELEASE_ALONG).toBeLessThan(VAT_EXIT_ALONG);
+    for (let cm = Math.round(VAT_MIN_RELEASE_ALONG * 100); cm <= VAT_EXIT_ALONG * 100; cm++) {
+      expect(vatFullSizeFitsAt(cm / 100)).toBe(true);
+    }
+    // A free stretch that stops just short of the minimum is no end at all…
+    const own = box(0, 0, 1, 1);
+    const tooClose = { x0: -1, z0: 1.815, x1: 1, z1: 2.5 }; // path free to 1.42
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, tooClose], ROOM, R)).toBeNull();
+    // …one just past it is.
+    const farEnough = { x0: -1, z0: 1.87, x1: 1, z1: 2.5 }; // path free to 1.47
+    const end = vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, farEnough], ROOM, R)!;
+    expect(end).toBeGreaterThanOrEqual(VAT_MIN_RELEASE_ALONG);
+  });
+
+  it('eases a short exit back to full size without crossing the vat', () => {
+    // RELAX lerps from the squeeze at the end to full size in place: every
+    // intermediate size must still clear the tank, doorway and transom.
+    for (let end = VAT_MIN_RELEASE_ALONG; end <= VAT_EXIT_ALONG + 1e-9; end += 0.05) {
+      const from = vatSqueezeAt(end);
+      for (let k = 0; k <= 10; k++) {
+        const h = from.horizontal + ((1 - from.horizontal) * k) / 10;
+        const v = from.vertical + ((1 - from.vertical) * k) / 10;
+        for (const slice of AVATAR_SILHOUETTE) {
+          for (let j = 0; j <= 4; j++) {
+            const q = end + h * (slice.z0 + ((slice.z1 - slice.z0) * j) / 4);
+            if (q > VAT_Q_LIP) continue; // out in the room
+            const g = vatGaugeAt(q);
+            expect(h * slice.halfWidth).toBeLessThanOrEqual(g.halfWidth + EPS);
+            expect(v * slice.top).toBeLessThanOrEqual(g.height + EPS);
+          }
+        }
+      }
+    }
+  });
+
+  it('re-plans from the clone\'s current spot, ignoring what is behind it', () => {
+    const own = box(0, 0, 1, 1);
+    const behind = { x0: -1, z0: 1.0, x1: 1, z1: 1.2 }; // across the path near the door
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, behind], ROOM, R)).toBeNull();
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, behind], ROOM, R, 1.7)).toBe(VAT_EXIT_ALONG);
+    // …and a spot taken right where it stands blocks the rest of the walk.
+    const onTop = box(0, 1.7, 0.3, 0.3);
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, onTop], ROOM, R, 1.7)).toBeNull();
   });
 
   it('skips only the vat\'s own box, not other obstacles overlapping it', () => {
