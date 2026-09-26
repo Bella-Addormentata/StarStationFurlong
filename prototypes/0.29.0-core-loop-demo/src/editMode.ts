@@ -235,6 +235,17 @@ export function validatePlacement(
   }
 
   const box = footprintAabb(item.kind, pos, rot);
+  // 🏝️ A kind with no footprint but a GENERATED blocked area (the sea, the
+  // infinity pool, the river): its obstacle boxes at this pose are what the
+  // overlap / clearance / connectivity checks below must see — without this
+  // an anchored feature was added under players and through furniture
+  // unchecked (Copilot review, PR #169).
+  const generated = FURNITURE_DEFS[item.kind].obstacleBoxes;
+  const featureBoxes: Box[] =
+    !box && generated
+      ? generated({ ...item, pos, rot }, FURNITURE.filter((o) => o.id !== item.id).concat([{ ...item, pos, rot }]))
+      : [];
+  const blocking: Box[] = box ? [box] : featureBoxes;
 
   // Placement box: 1 m inside each wall (floorPlanDoc.roomPlaceBounds —
   // deliberately tighter than the WALKABLE box; that function explains why).
@@ -259,13 +270,13 @@ export function validatePlacement(
   const wallVerdict = wallMountVerdict(item, pos, rot);
   if (!wallVerdict.ok) return wallVerdict;
 
-  if (box) {
+  for (const b of blocking) {
     // 2. Overlap with every other item's CURRENT footprint.
     for (const other of FURNITURE) {
       if (other.id === item.id) continue;
       const ob = itemAabb(other);
       if (!ob) continue;
-      if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
+      if (b.x0 < ob.x1 && b.x1 > ob.x0 && b.z0 < ob.z1 && b.z1 > ob.z0) {
         return { ok: false, reason: `overlaps ${other.id}` };
       }
     }
@@ -273,8 +284,8 @@ export function validatePlacement(
     // 3. Player clearance (footprint inflated by the collision radius).
     for (const p of ctx.playerPositions) {
       if (
-        p.x > box.x0 - PLAYER_R && p.x < box.x1 + PLAYER_R &&
-        p.z > box.z0 - PLAYER_R && p.z < box.z1 + PLAYER_R
+        p.x > b.x0 - PLAYER_R && p.x < b.x1 + PLAYER_R &&
+        p.z > b.z0 - PLAYER_R && p.z < b.z1 + PLAYER_R
       ) {
         return { ok: false, reason: 'a player is in the way' };
       }
@@ -291,8 +302,8 @@ export function validatePlacement(
     const STAND_R = PLAYER_R + 0.06;
     for (const pt of ctx.requiredReachable) {
       if (
-        pt.x > box.x0 - STAND_R && pt.x < box.x1 + STAND_R &&
-        pt.z > box.z0 - STAND_R && pt.z < box.z1 + STAND_R
+        pt.x > b.x0 - STAND_R && pt.x < b.x1 + STAND_R &&
+        pt.z > b.z0 - STAND_R && pt.z < b.z1 + STAND_R
       ) {
         return { ok: false, reason: 'would block a stand-point' };
       }
@@ -308,11 +319,11 @@ export function validatePlacement(
   // (revalidateCarry runs from update()), and devMenu's spawn search would do
   // it for each of ~500 candidates × 3 margin passes — all to compute a grid
   // that, with no candidate box in it, is identical to the pre-move one.
-  if (!box && !isWallMounted(item.kind)) return { ok: true };
+  if (blocking.length === 0 && !isWallMounted(item.kind)) return { ok: true };
 
-  // 5. Connectivity on a scratch grid: candidate box + every OTHER item's
+  // 5. Connectivity on a scratch grid: candidate box(es) + every OTHER item's
   //    current box (the original spot is vacated, the candidate is applied).
-  const scratch: Box[] = box ? [box] : [];
+  const scratch: Box[] = [...blocking];
   for (const other of FURNITURE) {
     if (other.id === item.id) continue;
     const ob = itemAabb(other);

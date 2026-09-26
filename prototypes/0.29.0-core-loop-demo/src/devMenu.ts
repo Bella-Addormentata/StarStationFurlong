@@ -52,7 +52,7 @@ import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
 import { findFreeExteriorSpot } from './hull';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
-import { writeFurnitureItem } from './furnitureDoc';
+import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 // #45 board mirror: spawned game tables paint the doc's current game at once.
 import { readGame } from './games/gamesDoc';
 import {
@@ -393,6 +393,30 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
  * walkable grid), then replan — shared by the free-spawn (FURNITURE section)
  * and inventory re-place (#53 INVENTORY section) paths.
  */
+/** Commit a BATCH the way commitSpawn commits one: every item pushed and
+ *  built, then the obstacle / grid / seat / device rebuild ONCE and one doc
+ *  transaction — ROSE WALLS hangs dozens at a time, and a full pipeline per
+ *  rose stalled the frame and burst the network (Copilot review, PR #169). */
+function commitSpawnMany(world: World, items: FurnitureItem[]): void {
+  if (items.length === 0) return;
+  for (const item of items) {
+    FURNITURE.push(item);
+    registerSpawnedGroup(world, item);
+  }
+  rebuildObstacles();
+  rebakeWalkableGrid();
+  rebuildSeats();
+  rebuildDevices();
+  world.getPlayer().onObstaclesChanged();
+  world.refreshOutdoorFloor();
+  if (items.some((i) => i.kind === 'charging-dock')) world.refreshRobots();
+  addFurniture(items); // ids are already unique (uniqueSpawnId), so none are renamed
+  if (roomEdit.isEditModeActive()) {
+    roomEdit.forceExit();
+    roomEdit.enter(world);
+  }
+}
+
 function commitSpawn(world: World, item: FurnitureItem): void {
   FURNITURE.push(item);
   registerSpawnedGroup(world, item);
@@ -515,14 +539,14 @@ function fillRoseWalls(): void {
   });
   plans.sort((a, b) => b.slots.length - a.slots.length);
   const chosen = plans.slice(0, 2).filter((p) => p.slots.length > 0);
-  let placed = 0;
+  const batch: FurnitureItem[] = [];
   for (const w of chosen) {
     for (const pos of w.slots) {
-      const item: FurnitureItem = { id: uniqueSpawnId('climbing-rose'), kind: 'climbing-rose', pos, rot: w.rot, movable: true };
-      commitSpawn(world, item);
-      placed++;
+      batch.push({ id: uniqueSpawnId('climbing-rose'), kind: 'climbing-rose', pos, rot: w.rot, movable: true });
     }
   }
+  commitSpawnMany(world, batch);
+  const placed = batch.length;
   showHint(placed
     ? `DEV: 🌹 hung ${placed} climbing roses along the ${chosen.map((w) => w.name).join(' and ')} wall${chosen.length > 1 ? 's' : ''} — synced to the room (E4).`
     : 'DEV: 🌹 no open wall for roses (doorways, windows and the hedge take every slot).', 5000);

@@ -583,10 +583,30 @@ export function findTemplate(id: string): RoomTemplate | null {
  * wall coverage afterwards (world.reconcileDoorPlacements) so the geometry
  * matches the (unchanged) door set against the new layout.
  */
+/**
+ * The items a template puts in THIS room. A fitted template is generated
+ * from the room's real extents and doors at apply time — its `items` field
+ * (the 2×2 envelope, evaluated once at module load) is only a preview; PLACE
+ * reused that frozen 12×12 result in any room (Copilot review, PR #169).
+ * The fitted set's own terminal rides along at the real south wall.
+ */
+function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
+  if (!t.layout) return cloneItems(t.items);
+  const half = roomHalfExtents();
+  const terminal: FurnitureItem = {
+    id: `${t.id}-computer`,
+    kind: "wall-computer",
+    pos: { x: Math.min(1.8, Math.max(0, half.halfX - 1.0)), z: half.halfZ - 0.03 },
+    rot: 2,
+    movable: true,
+  };
+  return [terminal, ...t.layout(half)];
+}
+
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
-  replaceAllFurniture(cloneItems(t.items));
+  replaceAllFurniture(templateItemsFor(t));
   // 🌌 …and the room IS this now: stamping the theme makes the change
   // persistent and shared, instead of a look that lasted until the next
   // reload re-resolved it from nothing.
@@ -632,7 +652,7 @@ export function addRoomTemplateItems(
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
-  replaceAllFurniture(cloneItems(t.items));
+  replaceAllFurniture(templateItemsFor(t));
   return true;
 }
 
