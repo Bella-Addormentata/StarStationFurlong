@@ -327,7 +327,9 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     // 💃 Somewhere to dance, and the switch for it.
     { kind: "dance-floor", at: [0.68, -0.34] },
     // On the floor's near edge: its back edge is where the cake cluster ends.
-    { kind: "party-speaker", at: [0.68, -0.05] },
+    // Just OFF the pad's front edge (the pad is kept clear while fitting):
+    // the speaker stands at the floor's end, not on it.
+    { kind: "party-speaker", at: [0.68, 0.1] },
 
     // 🍹 The bar, anchored in the FAR CORNER and laid out in metres from it so
     // the shelf, counter and stools keep their spacing in any room: shelf at

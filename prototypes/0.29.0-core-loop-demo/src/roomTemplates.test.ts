@@ -122,10 +122,11 @@ describe('walkable overlays', () => {
 describe('keep-clear ground (+ ADD)', () => {
   it('lands nothing on a player or a stand-point boxed by the caller', () => {
     const fresh = layout();
-    const speaker = fresh.find((i) => i.kind === 'party-speaker')!;
-    // A fox standing where the speaker would go, and a stand-point in front of the bar.
+    const cake = fresh.find((i) => i.kind === 'cake-table')!;
+    expect(cake).toBeDefined();
+    // A fox standing where the cake would go, and a stand-point mid-room.
     const keep: Box[] = [
-      { x0: speaker.pos.x - 0.5, z0: speaker.pos.z - 0.5, x1: speaker.pos.x + 0.5, z1: speaker.pos.z + 0.5 },
+      { x0: cake.pos.x - 0.5, z0: cake.pos.z - 0.5, x1: cake.pos.x + 0.5, z1: cake.pos.z + 0.5 },
       { x0: -0.44, z0: -0.44, x1: 0.44, z1: 0.44 },
     ];
     const fitted = layout(keep);
