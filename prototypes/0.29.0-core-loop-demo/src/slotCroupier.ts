@@ -373,7 +373,13 @@ function electSlotOperator(lease: SlotOperatorLease | null, playerId: string, no
   if (!operator
     || operator.docEpoch !== casinoDocEpoch()
     || operator.playerId !== playerId) {
-    if (heldElsewhere(lease, now)) return null;
+    if (heldElsewhere(lease, now)) {
+      // Another session holds the lease: machines run by hand here, kept
+      // across a lapse of this page's own lease, are forgotten, as when the
+      // lease is taken from a take still running. RUN starts them again.
+      manualMachines.clear();
+      return null;
+    }
     takeOperatorLease(playerId, now);
     return null;
   }

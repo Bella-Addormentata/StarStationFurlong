@@ -336,11 +336,15 @@ describe('isDeedHolder — the deed, not owner-equivalence', () => {
  * the first leave then tears down only what was its own room's (PR #167
  * review).
  *
+ * A leave holds the gates only while its room can still send: once its sync's
+ * writer is closing, a stalled close must not keep them shut in a room joined
+ * meanwhile (PR #167 review).
+ *
  * ⚠️ Like the #142 block above, this SCANS the source: main.ts can't be loaded
  * by vitest. It pins the wiring (both gates check the flag before the offline
- * fallback, leaveRoom holds the flag across the whole leave, and a leave claims
- * its room's resources before the wait), not that a frame lands inside the
- * window.
+ * fallback, a leave holds the flag until its sync is closed to new writes and
+ * no longer, and a leave claims its room's resources before the wait), not
+ * that a frame lands inside the window.
  */
 describe('leaving a room hands this client none of it (source scan)', () => {
   const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
@@ -369,16 +373,30 @@ describe('leaving a room hands this client none of it (source scan)', () => {
     }
   });
 
-  it('leaveRoom holds the flag for the whole leave, the flush and the stop included', () => {
+  it('a leave holds the flag until its sync is closed to new writes, and no longer', () => {
+    // leaveRoom raises it and lowers it once: when the leave says its room can
+    // send nothing more, or at the leave's end, whichever comes first.
     expect(bodyOf('leaveRoom')).toMatch(
-      /roomLeavesUnderWay\+\+;\s*try \{\s*await leaveRoomNow\(\);\s*\} finally \{\s*roomLeavesUnderWay--;\s*\}/,
+      /roomLeavesUnderWay\+\+;[\s\S]*if \(!sending\) return;\s*sending = false;\s*roomLeavesUnderWay--;[\s\S]*try \{\s*await leaveRoomNow\(closed\);\s*\} finally \{\s*closed\(\);\s*\}/,
     );
+    // Nothing else lowers it.
+    expect(main.match(/roomLeavesUnderWay--/g)).toHaveLength(1);
     const now = bodyOf('leaveRoomNow');
     expect(now).toContain('yjsSync = null');
-    expect(now).toContain('sync.flush()');
-    expect(now).toContain('await sync.stop()');
-    // Nothing else lowers it: the leave's own finally is the only place.
-    expect(main.match(/roomLeavesUnderWay--/g)).toHaveLength(1);
+    // Held through the flush wait: the room's last writes still go out then.
+    const wait = now.indexOf('sync.flush()');
+    const stop = now.indexOf('const stopping = sync.stop();');
+    expect(wait).toBeGreaterThan(-1);
+    expect(stop, 'stop the sync after the flush wait').toBeGreaterThan(wait);
+    // Lowered once stop() has asked the writer to close, before the close is
+    // awaited: a stalled transport can hold the close indefinitely.
+    const lowered = now.indexOf('closed();');
+    expect(lowered, 'lower the flag once the sync is stopping, not before').toBeGreaterThan(stop);
+    expect(lowered).toBeLessThan(now.indexOf('await stopping;'));
+    // A leave that claimed no sync lowers it before it drops the link.
+    const noSync = now.indexOf('closed();', lowered + 1);
+    expect(noSync, 'a leave with no sync lowers it too').toBeGreaterThan(now.indexOf('await stopping;'));
+    expect(noSync).toBeLessThan(now.indexOf('networkProvider.disconnect()'));
   });
 
   it('a leave that a newer leave or join overlaps tears down only its own room', () => {

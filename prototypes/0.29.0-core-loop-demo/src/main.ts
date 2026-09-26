@@ -436,10 +436,13 @@ let roomCacheHandle: RoomCacheHandle | null = null;
 // interleaves two joins and the older one binds a live YjsSync to the newer
 // session's transport/room.
 let sessionEpoch = 0;
-// Room leaves under way (leaveRoom). While one runs, `yjsSync` is already
-// null, but the old room's doc is still bound and, until its sync stops, what
-// this client writes still goes out. The edit and croupier gates must not
-// read that as "offline, so this client is alone" and hand it the old room.
+// Room leaves that can still send (leaveRoom). From when a leave gives up
+// `yjsSync` until it has closed that sync to new writes, the old room's doc
+// is still bound and what this client writes still goes out. The edit and
+// croupier gates must not read that as "offline, so this client is alone"
+// and hand it the old room. A leave lowers this once its sync's writer is
+// closing, not once the close is done: a stalled transport can hold the close
+// indefinitely, and a room joined meanwhile must not stay gated behind it.
 let roomLeavesUnderWay = 0;
 // Y.Doc lifecycle counter (issue #30 T0 verification aid): joinRoom()
 // increments `created`, teardown increments `destroyed` once YjsSync.stop()
@@ -2089,18 +2092,26 @@ const LEAVE_FLUSH_MS = 1000;
  * `activeBootstrap` intentionally survives as last-room memory: Retry-node
  * re-derives the same roomId/roomKey from it via fetchDefaultBootstrap, and
  * the bootstrap error path reports the last attempted seed.
- * Until it returns, the edit and croupier gates refuse (roomLeavesUnderWay).
+ * Until its room's sync is closed to new writes, the edit and croupier gates
+ * refuse (roomLeavesUnderWay).
  */
 async function leaveRoom(): Promise<void> {
   roomLeavesUnderWay++;
-  try {
-    await leaveRoomNow();
-  } finally {
+  let sending = true;
+  /** This leave's room can send nothing more: stop gating (once). */
+  const closed = (): void => {
+    if (!sending) return;
+    sending = false;
     roomLeavesUnderWay--;
+  };
+  try {
+    await leaveRoomNow(closed);
+  } finally {
+    closed();
   }
 }
 
-async function leaveRoomNow(): Promise<void> {
+async function leaveRoomNow(closed: () => void): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   const epoch = ++sessionEpoch;
   // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,
@@ -2137,10 +2148,10 @@ async function leaveRoomNow(): Promise<void> {
     // is still the bound casino doc, and send the release before the doc
     // goes: another of the operator's devices then takes over at once instead
     // of waiting out the lapse and the split window. Frames keep running
-    // meanwhile, but nothing is operated or edited in this room again: the
-    // gates refuse while a leave is under way (roomLeavesUnderWay). stop()
-    // doesn't wait for sends in flight, so flush first (bounded: a stalled
-    // transport must not hold the swap).
+    // meanwhile, but nothing is operated or edited in this room while it can
+    // still send: the gates refuse until its sync is closed to new writes
+    // (roomLeavesUnderWay). stop() doesn't wait for sends in flight, so flush
+    // first (bounded: a stalled transport must not hold the swap).
     leaveSlotMachineRoom();
     await Promise.race([
       sync.flush(),
@@ -2155,8 +2166,13 @@ async function leaveRoomNow(): Promise<void> {
     }
     cache?.detach();
     const oldDoc = sync.doc;
+    // stop() asks the writer to close before it awaits the close, and from
+    // then on nothing written to the old doc goes out, so the gates lift
+    // here. The close itself can wait on a stalled transport indefinitely.
+    const stopping = sync.stop(); // closes the ysync writer + doc.destroy()
+    closed();
     try {
-      await sync.stop(); // closes the ysync writer + doc.destroy()
+      await stopping;
     } catch (err) {
       console.warn("Error stopping yjs room sync:", err);
     }
@@ -2166,6 +2182,8 @@ async function leaveRoomNow(): Promise<void> {
       console.warn("leaveRoom: previous Y.Doc was not destroyed by stop()");
     }
   }
+  // A leave that claimed no sync had nothing that could send.
+  closed();
   // A leave or join begun while this one waited has claimed the session
   // (sessionEpoch), and the shared link with it: a newer leave drops the link
   // itself, and a newer join is using it. Dropping it here would cut that

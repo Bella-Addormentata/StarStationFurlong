@@ -762,6 +762,25 @@ describe('running machines by hand', () => {
     expect(readSlotOperatorLease()).toBeNull();
   });
 
+  it('forgets them too when another session takes the lease between its own lapse and its next frame', () => {
+    fund(M1);
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(true);
+    tickSlotMachineRoom([M1], true, at(T0 + SETTLE_MS));
+    // No frames for a while: its own lease lapses, and this frame clears it.
+    tickSlotMachineRoom([M1], true, at(T0 + 20_000));
+    expect(readSlotOperatorLease()).toBeNull();
+    // Another session takes the room before this page's next frame.
+    writeSlotOperatorLease(lease(T0 + 20_000 + LEASE_MS));
+    tickSlotMachineRoom([M1], true, at(T0 + 20_001));
+    expect(isManualSlotMachineRunning(M1, OPERATOR)).toBe(false);
+    // Not taken back up when that session lets go: RUN is pressed again.
+    doc.getMap('casino').delete(SLOT_OPERATOR_KEY);
+    tickSlotMachineRoom([M1], true, at(T0 + 20_100));
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0 + 20_200))).toBe(true);
+    expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+  });
+
   it('RUN takes the lease afresh when the record naming this page carries another take', () => {
     fund(M1);
     fund(M2);
