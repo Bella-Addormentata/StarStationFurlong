@@ -118,8 +118,7 @@ import {
 import {
   seedRoomTemplate,
   findTemplate,
-  setRoomThemeWriter,
-} from "./roomTemplates";
+  setRoomThemeWriter, reconcileConcurrentAdds } from "./roomTemplates";
 import {
   bindDoorsDoc,
   writeDoorPairing,
@@ -1574,6 +1573,9 @@ async function joinRoomAtEpoch(
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
     // tanks appear in the exterior as fittings land inside).
     subscribeFurniture(() => refreshExteriorView());
+    // ⚖️ Two + ADD presses that raced each other settle to one (every peer
+    // reaches the same verdict from the doc alone).
+    subscribeFurniture(() => { reconcileConcurrentAdds(); });
     // 🪟 #80 S4: window changes recut the CURRENT room's exterior shell (holes +
     // glass) while at zoom 3 — refreshExteriorView early-returns off-level.
     subscribeWindowLayout(() => refreshExteriorView());

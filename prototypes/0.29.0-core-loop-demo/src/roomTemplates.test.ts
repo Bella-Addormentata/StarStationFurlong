@@ -15,7 +15,7 @@ import { bindFloorPlan, writeRoomDims } from './floorPlanDoc';
 import { bindRobotDoc, readRobotConfig } from './robotDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
 import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag } from './furnitureDoc';
-import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, addRoomTemplateItems, applyRoomTemplate, type PlacementSpec } from './roomTemplates';
+import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, roomOccupancy, addRoomTemplateItems, applyRoomTemplate, reconcileConcurrentAdds, type PlacementSpec } from './roomTemplates';
 import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, type Box, type FurnitureItem } from './furniture';
 
 const HALF = { halfX: 6, halfZ: 6 }; // the default 2×2 module
@@ -215,7 +215,7 @@ describe('+ ADD', () => {
     });
     bindFurnitureDoc(new Y.Doc());
     expect(FURNITURE.length).toBeGreaterThan(0);
-    const occupied = [...buildObstacleList(FURNITURE), ...overlayEnvelopeBoxes(FURNITURE)];
+    const occupied = roomOccupancy(FURNITURE);
     const first = addRoomTemplateItems('party-2')!;
     expect(first).not.toBeNull();
     // What landed is the set fitted around the lobby; what was skipped is
@@ -287,6 +287,8 @@ describe('the banner', () => {
   });
 });
 
+const batchTags = (ids: string[]): string[] => [...new Set(ids.map((id) => id.slice(id.lastIndexOf('~') + 1)))];
+
 describe('+ ADD from two peers', () => {
   it('mints ids the other peer cannot, so both sets survive the merge', () => {
     const a = new Y.Doc();
@@ -297,7 +299,7 @@ describe('+ ADD from two peers', () => {
     addRoomTemplateItems('party-2');
     const idsA = [...readAllFurniture().keys()];
     expect(idsA.length).toBeGreaterThan(0);
-    for (const id of idsA) expect(id.endsWith(`-${tagA}`)).toBe(true);
+    for (const id of idsA) expect(id.includes(`~${tagA}.`)).toBe(true);
     bindFurnitureDoc(b); // the other peer, same room, same press
     addRoomTemplateItems('party-2');
     const idsB = [...readAllFurniture().keys()];
@@ -305,6 +307,33 @@ describe('+ ADD from two peers', () => {
     expect(idsA.filter((id) => idsB.includes(id))).toEqual([]); // no id in common…
     Y.applyUpdate(a, Y.encodeStateAsUpdate(b)); // …so the merge keeps both sets whole
     expect(a.getMap('furniture').size).toBe(idsA.length + idsB.length);
+    // …and the race is then SETTLED: the two presses fitted the same room and
+    // landed on the same coordinates, so one batch — the same one on every
+    // peer, by tag order — is removed.
+    bindFurnitureDoc(a);
+    const removed = reconcileConcurrentAdds();
+    expect(removed.length).toBe(idsA.length);
+    expect(a.getMap('furniture').size).toBe(idsA.length);
+    const loser = [...batchTags(idsA), ...batchTags(idsB)].sort()[1];
+    for (const id of removed) expect(id.endsWith(`~${loser}`)).toBe(true);
+    expect(reconcileConcurrentAdds()).toEqual([]); // settled once
+  });
+
+  it('leaves two presses made one after the other alone: the second fitted around the first', () => {
+    bindFurnitureDoc(new Y.Doc());
+    const mirror = subscribeFurniture(() => {
+      const recs = readAllFurniture();
+      if (recs.size === 0) return;
+      FURNITURE.splice(0, FURNITURE.length, ...[...recs].map(([id, r]) => ({ id, kind: r.kind, pos: { x: r.x, z: r.z }, rot: r.rot, movable: r.movable })));
+    });
+    const before = [...FURNITURE];
+    const first = addRoomTemplateItems('party-2')!;
+    const second = addRoomTemplateItems('party-2')!;
+    expect(second.placed).toBeGreaterThan(0);
+    expect(reconcileConcurrentAdds()).toEqual([]);
+    expect(readAllFurniture().size).toBe(first.placed + second.placed);
+    mirror();
+    FURNITURE.splice(0, FURNITURE.length, ...before);
   });
 });
 
@@ -353,5 +382,20 @@ describe('the dancer', () => {
     expect(addedDocks).toHaveLength(1);
     expect(addedDocks[0]).not.toBe(placedDocks[0]);
     expect(readRobotConfig(addedDocks[0])?.routine).toBe('dance');
+  });
+});
+
+describe('what + ADD keeps off', () => {
+  it('includes the slab of a wall-hung terminal, so no hedge is generated over it', () => {
+    const terminal: FurnitureItem = { id: 't', kind: 'wall-computer', pos: { x: -4.72, z: -5.97 }, rot: 0, movable: true };
+    expect(buildObstacleList([terminal])).toHaveLength(0);
+    const occ = roomOccupancy([terminal]);
+    expect(occ).toHaveLength(1);
+    expect(occ[0].x0).toBeLessThan(-4.72); expect(occ[0].x1).toBeGreaterThan(-4.72);
+    // The hedge wants a plant at (-4.72, -5.72) — the slot the terminal hangs over.
+    const fresh = layout();
+    expect(fresh.some((i) => i.kind === 'jungle-plant' && Math.abs(i.pos.x + 4.72) < 0.01 && Math.abs(i.pos.z + 5.72) < 0.01)).toBe(true);
+    const fitted = layout(occ);
+    for (const b of boxesOf(fitted)) expect(overlaps(b, occ[0])).toBe(false);
   });
 });

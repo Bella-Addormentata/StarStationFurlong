@@ -856,40 +856,39 @@ export class PoolWaiter {
    *  and only a cell INSIDE the pad counts — a reachable cell beside it is
    *  not the floor (Copilot review, PR #169); with none, the bot waits. No
    *  floor → the coach's stage. */
-  /** The dance floor nearest this bot's dock (or the bot itself, dockless):
-   *  with several sets in one room each dancer takes its own set's floor,
-   *  not the first one in the list (Copilot review, PR #169). */
-  private nearestDanceFloor(): FurnitureItem | undefined {
+  /** The room's dance floors, nearest this bot's dock first (or the bot
+   *  itself, dockless): with several sets in one room each dancer takes its
+   *  own set's floor, not the first one in the list, and a floor it cannot
+   *  reach is passed over for the next (Copilot review, PR #169). */
+  private danceFloorsByDistance(): FurnitureItem[] {
     const from = this.dockTarget ?? { x: this.group.position.x, z: this.group.position.z };
-    let best: FurnitureItem | undefined;
-    let bestD = Infinity;
-    for (const i of FURNITURE) {
-      if (i.kind !== "dance-floor") continue;
-      const d = Math.hypot(i.pos.x - from.x, i.pos.z - from.z);
-      if (d < bestD) { bestD = d; best = i; }
-    }
-    return best;
+    return FURNITURE.filter((i) => i.kind === "dance-floor")
+      .map((i) => ({ i, d: Math.hypot(i.pos.x - from.x, i.pos.z - from.z) }))
+      .sort((a, b) => a.d - b.d)
+      .map((e) => e.i);
   }
 
   private findDanceSpot(): { x: number; z: number } | null {
     const here = { x: this.group.position.x, z: this.group.position.z };
-    const floor = this.nearestDanceFloor();
-    if (!floor) return this.findCoachStage();
+    const floors = this.danceFloorsByDistance();
+    if (floors.length === 0) return this.findCoachStage();
     const d = this.dockTarget;
     const INSET = 1.5; // the pad is ±2 m; stay half a metre inside its edge
     const clamp = (v: number, c: number) => Math.max(c - INSET, Math.min(c + INSET, v));
-    const onPad = (p: { x: number; z: number }) =>
-      Math.abs(p.x - floor.pos.x) <= INSET + 0.26 && Math.abs(p.z - floor.pos.z) <= INSET + 0.26;
-    const candidates: Array<{ x: number; z: number }> = [
-      { x: d ? clamp(d.x, floor.pos.x) : floor.pos.x, z: d ? clamp(d.z, floor.pos.z) : floor.pos.z },
-      { x: floor.pos.x, z: floor.pos.z },
-    ];
-    for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
-      candidates.push({ x: floor.pos.x + ox * 1.0, z: floor.pos.z + oz * 1.0 });
-    }
-    for (const c of candidates) {
-      const cell = nearestReachableCell(c.x, c.z, 1, here);
-      if (cell && onPad(cell)) return cell;
+    for (const floor of floors) {
+      const onPad = (p: { x: number; z: number }) =>
+        Math.abs(p.x - floor.pos.x) <= INSET + 0.26 && Math.abs(p.z - floor.pos.z) <= INSET + 0.26;
+      const candidates: Array<{ x: number; z: number }> = [
+        { x: d ? clamp(d.x, floor.pos.x) : floor.pos.x, z: d ? clamp(d.z, floor.pos.z) : floor.pos.z },
+        { x: floor.pos.x, z: floor.pos.z },
+      ];
+      for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+        candidates.push({ x: floor.pos.x + ox * 1.0, z: floor.pos.z + oz * 1.0 });
+      }
+      for (const c of candidates) {
+        const cell = nearestReachableCell(c.x, c.z, 1, here);
+        if (cell && onPad(cell)) return cell;
+      }
     }
     return null;
   }
@@ -909,9 +908,11 @@ export class PoolWaiter {
     // derived FROM moves or goes, or the walkable grid is rebaked (something
     // may now stand on the cell) — a furniture edit re-applies the same
     // routine without touching it (Copilot review, PR #169).
-    const floor = this.nearestDanceFloor();
+    // Every floor, in the order they are tried: a move of any of them, or of
+    // the dock the order comes from, re-derives the spot.
+    const floors = this.danceFloorsByDistance().map((f) => `${f.pos.x},${f.pos.z}`).join(";") || "-";
     const d = this.dockTarget;
-    const key = `${floor ? `${floor.pos.x},${floor.pos.z}` : "-"}|${d ? `${d.x},${d.z}` : "-"}|${walkableGridRevision()}`;
+    const key = `${floors}|${d ? `${d.x},${d.z}` : "-"}|${walkableGridRevision()}`;
     if (key !== this.danceSpotKey) {
       this.danceSpot = this.findDanceSpot();
       this.danceSpotKey = key;

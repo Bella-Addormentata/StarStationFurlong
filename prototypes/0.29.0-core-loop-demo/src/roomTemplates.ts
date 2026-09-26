@@ -28,9 +28,9 @@
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
   DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList, wallMountHalfWidth,
-  seaCorner, roomDoorPoints, itemOccupancyBox,
+  seaCorner, roomDoorPoints, itemOccupancyBox, itemAabb,
 } from "./furniture";
-import { replaceAllFurniture, readAllFurniture, addFurniture, peerIdTag } from "./furnitureDoc";
+import { replaceAllFurniture, readAllFurniture, addFurniture, deleteFurnitureItems, peerIdTag } from "./furnitureDoc";
 import { writeRobotConfig, type RobotRoutine } from "./robotDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { doorSetIsAuthoritative } from "./doorLayoutDoc";
@@ -138,6 +138,21 @@ const OVERLAY_ENVELOPE: Partial<Record<FurnitureKind, { w: number; d: number }>>
   "dance-floor": { w: 4.1, d: 4.1 },
 };
 const OVERLAY_MARGIN = 0.3; // a pad may lie closer to a wall than a chair, but not in it
+
+/** Everything already in the room that a fitted set must keep off: every
+ *  obstacle box (generated ones included), the slab of every wall-hung piece
+ *  — the terminal, a rose — which has no floor box and so was invisible to
+ *  + ADD (a hedge could be generated over the terminal; Copilot review,
+ *  PR #169), and the pad of every walkable overlay. */
+export function roomOccupancy(items: readonly FurnitureItem[]): Box[] {
+  const slabs: Box[] = [];
+  for (const it of items) {
+    if (itemAabb(it)) continue; // on the floor: buildObstacleList has it
+    const slab = itemOccupancyBox(it);
+    if (slab) slabs.push(slab);
+  }
+  return [...buildObstacleList([...items]), ...slabs, ...overlayEnvelopeBoxes(items)];
+}
 
 /** The pads of walkable overlays ALREADY in the room, boxed the way
  *  placeFitting boxes a candidate one. buildObstacleList leaves footprintless
@@ -817,6 +832,47 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
   return t;
 }
 
+const BATCH_SEP = "~"; // id ~ batch-tag; no other writer puts a ~ in an id
+let addBatchSeq = 0;
+
+/**
+ * ⚖️ Settle + ADD presses that raced. Two peers pressing at the same moment
+ * each fit the set to the SAME room and compute the SAME coordinates; the
+ * peer tags keep both sets in the map, one exactly on top of the other —
+ * two speakers, two docks, two cakes in one spot. Deterministic, from the
+ * doc alone, so every peer reaches the same answer: batches are taken in
+ * tag order, and a batch that coincides with an earlier surviving one — the
+ * same kind at the same coordinates for at least two pieces and half of the
+ * smaller batch — loses and is deleted. Two presses made one after the
+ * other never coincide (the second fitted around the first). Run on every
+ * furniture change; returns the ids it removed (Copilot review, PR #169).
+ */
+export function reconcileConcurrentAdds(): string[] {
+  const batches = new Map<string, Array<{ id: string; sig: string }>>();
+  for (const [id, r] of readAllFurniture()) {
+    const at = id.lastIndexOf(BATCH_SEP);
+    if (at < 0) continue;
+    const tag = id.slice(at + 1);
+    batches.set(tag, [...(batches.get(tag) ?? []), { id, sig: `${r.kind}@${r.x},${r.z}` }]);
+  }
+  if (batches.size < 2) return [];
+  const survivors: Array<Set<string>> = [];
+  const losers: string[] = [];
+  for (const tag of [...batches.keys()].sort()) {
+    const items = batches.get(tag)!;
+    const sigs = new Set(items.map((i) => i.sig));
+    const clash = survivors.some((s) => {
+      let n = 0;
+      for (const sig of sigs) if (s.has(sig)) n++;
+      return n >= Math.max(2, Math.ceil(Math.min(s.size, sigs.size) / 2));
+    });
+    if (clash) losers.push(...items.map((i) => i.id));
+    else survivors.push(sigs);
+  }
+  deleteFurnitureItems(losers);
+  return losers;
+}
+
 /**
  * ➕ ADD a template's set to the CURRENT room without replacing anything.
  *
@@ -845,15 +901,18 @@ export function addRoomTemplateItems(
   // their authored coordinates straight through the furniture (Copilot
   // review, PR #169). Those templates PLACE (replace everything) only.
   if (!t || !t.layout) return null;
-  // Occupied: every obstacle box, every overlay pad already down, and the
-  // ground the caller asked to keep clear.
-  const wanted = t.layout(roomHalfExtents(), [...buildObstacleList(FURNITURE), ...overlayEnvelopeBoxes(FURNITURE), ...keepClear]);
-  // Ids carry this peer's tag: addFurniture only de-duplicates against the
-  // LOCAL map, so two peers pressing + ADD together minted the same ids and
-  // the map's per-key LWW collapsed each pair to one item while both
-  // reported everything written (Copilot review, PR #169).
-  const tag = peerIdTag();
-  const written = addFurniture(wanted.map((i) => ({ ...i, id: `${i.id}-${tag}` })));
+  // Occupied: everything in the room (roomOccupancy) and the ground the
+  // caller asked to keep clear.
+  const wanted = t.layout(roomHalfExtents(), [...roomOccupancy(FURNITURE), ...keepClear]);
+  // Ids carry this PRESS's batch tag — the peer's id and a press counter —
+  // after a `~`: addFurniture only de-duplicates against the LOCAL map, so
+  // two peers pressing + ADD together minted the same ids and the map's
+  // per-key LWW collapsed each pair to one item while both reported
+  // everything written; and the tag is what reconcileConcurrentAdds reads
+  // to settle two presses that fitted the same room at the same moment
+  // (Copilot review, PR #169).
+  const tag = `${peerIdTag()}.${++addBatchSeq}`;
+  const written = addFurniture(wanted.map((i) => ({ ...i, id: `${i.id}${BATCH_SEP}${tag}` })));
   configureTemplateDocks(t, wanted, written);
   // "Skipped" against what THIS room holds when empty — the set fitted to
   // these extents with nothing in the way — not against a 30 m room's longer

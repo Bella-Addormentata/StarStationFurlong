@@ -156,6 +156,15 @@ export function deleteFurnitureItem(id: string): void {
   });
 }
 
+/** Remove several items in ONE transaction (a losing + ADD batch, see
+ *  roomTemplates.reconcileConcurrentAdds) — one reconcile, not one per item. */
+export function deleteFurnitureItems(ids: readonly string[]): void {
+  if (!docAlive() || ids.length === 0) return;
+  boundDoc!.transact(() => {
+    for (const id of ids) furnitureMap!.delete(id);
+  });
+}
+
 /**
  * Owner-only seed: on the first claim of a room, publish the current (default)
  * layout so joiners converge to it. Idempotent — a no-op once the map has any
