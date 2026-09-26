@@ -492,6 +492,10 @@ export interface SlotOperatorLease {
   playerId: string;
   sessionId: string;
   expiresAt: number;
+  /** The room's lease only: a fresh token each time a session takes it, kept
+   *  across its renewals, so a peer tells a new take from a renewal even when
+   *  it never saw the lease go. Earlier builds' per-machine leases have none. */
+  tenure?: string;
 }
 
 function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
@@ -501,7 +505,9 @@ function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
     && lease.playerId.length <= 128
     && typeof lease.sessionId === 'string' && lease.sessionId.length > 0
     && lease.sessionId.length <= 128
-    && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt);
+    && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt)
+    && (lease.tenure === undefined
+      || (typeof lease.tenure === 'string' && lease.tenure.length > 0 && lease.tenure.length <= 64));
 }
 
 /** 🎰 The room's slot operator lease: ONE session operates every slot machine
@@ -533,6 +539,11 @@ export function readLegacySlotOperatorLease(machineId: string): SlotOperatorLeas
 
 export function clearLegacySlotOperatorLease(machineId: string): void {
   ensureMap().delete(`slot-operator:${machineId}`);
+}
+
+/** Whether a round's reserve is locked on this machine (`slot-escrow:<mid>`). */
+export function hasSlotEscrow(machineId: string): boolean {
+  return ensureMap().has(`slot-escrow:${machineId}`);
 }
 
 export interface SlotSharedBankrollLease {

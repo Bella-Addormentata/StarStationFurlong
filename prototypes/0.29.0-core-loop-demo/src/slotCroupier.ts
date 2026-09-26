@@ -18,8 +18,10 @@
  * Machines whose bankroll another player owns wait until that player's
  * session holds the lease. World ticks the room every frame on every client
  * (tickSlotMachineRoom); there is no per-machine lease to fight over. A
- * session with no machine left to operate lets the lease go, unless a round it
- * accepted is still settling; then the lease lapses on its own.
+ * session with no machine left to operate lets the lease go. A round's settle
+ * and refunds write only while this session still holds the lease
+ * (stillOperates), so a lease let go, lost or lapsed mid-settle is never
+ * written behind: the round stays on its machine for the next operator.
  *
  * WIND-DOWN: a round this session accepted on a machine it no longer operates
  * (the bankroll changed hands, or its run by hand ended) can't wait for that
@@ -59,6 +61,7 @@ import {
   clearSlotPlayRequest,
   clearSlotReveal,
   drainSlotMachineFunding,
+  hasSlotEscrow,
   readLegacySlotOperatorLease,
   readSlotFundingConfig,
   readSlotMachineState,
@@ -114,6 +117,9 @@ interface AcceptedSlotRound {
 interface SlotOperatorSession {
   docEpoch: number;
   playerId: string;
+  /** This turn's token in the lease record, fresh for every take and kept
+   *  across its renewals (SlotOperatorLease.tenure). */
+  tenure: string;
   readyAt: number;
   renewedAt: number;
 }
@@ -198,10 +204,12 @@ function leaseLapsesAt(lease: SlotOperatorLease, now: number): number {
   return isThisDevice(lease) ? Math.min(lease.expiresAt, heldUntil) : heldUntil;
 }
 
-/** Note the room's lease as this page sees it now (leaseSeen). */
+/** Note the room's lease as this page sees it now (leaseSeen). Each take
+ *  carries a new tenure, so a release and retake this page never saw the gap
+ *  between still starts a full term. */
 function seeLease(lease: SlotOperatorLease, now: number): { id: string; at: number } {
   // Scoped to the bound doc: another room's same record starts afresh.
-  const id = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.expiresAt}`;
+  const id = `${casinoDocEpoch()}|${lease.playerId}|${lease.sessionId}|${lease.tenure ?? ''}|${lease.expiresAt}`;
   if (leaseSeen?.id !== id) leaseSeen = { id, at: now };
   return leaseSeen;
 }
@@ -284,43 +292,48 @@ export function isSlotOperator(now = Date.now()): boolean {
   return ownsOperatorLease(getPlayerId(), now);
 }
 
-/** Whether a round this session accepted, in this room's doc, may still be
- *  settling or refunding. */
-function hasRoundsInFlight(): boolean {
-  if (accepting.size > 0 || settling.size > 0) return true;
-  const docEpoch = casinoDocEpoch();
-  for (const accepted of acceptedRounds.values()) {
-    if (accepted.docEpoch === docEpoch) return true;
-  }
-  return false;
+/**
+ * Whether this session still operates the room, in the doc of `docEpoch`.
+ * A round's settle and refunds check it after their last await, just before
+ * they write: a session that has let the lease go (a room it is leaving, a
+ * page put away in the back/forward cache, a lease lost or lapsed) never
+ * writes behind whoever took over. The round stays on its machine, and that
+ * machine's next operator finishes it.
+ */
+function stillOperates(docEpoch: number): boolean {
+  return operator !== null
+    && operator.docEpoch === docEpoch
+    && docEpoch === casinoDocEpoch()
+    && ownsOperatorLease(operator.playerId);
 }
 
 function takeOperatorLease(playerId: string, now: number): void {
+  const tenure = crypto.randomUUID();
   writeSlotOperatorLease({
     playerId,
     sessionId: operatorSessionId,
+    tenure,
     expiresAt: now + OPERATOR_LEASE_MS,
   });
   operator = {
     docEpoch: casinoDocEpoch(),
     playerId,
+    tenure,
     readyAt: now + OPERATOR_LEASE_SETTLE_MS,
     renewedAt: now,
   };
 }
 
 /** Stop operating the room's slot machines here, and forget the machines
- *  this page ran by hand. The lease record goes too (a successor needn't wait
- *  it out), unless a round this session accepted may still be settling: then
- *  it lapses on its own, so a successor never races that settle. */
+ *  this page ran by hand. The lease record goes too, so a successor needn't
+ *  wait it out: a round still settling here writes nothing once this session
+ *  no longer operates (stillOperates). */
 function stopSlotOperator(): void {
   manualMachines.clear();
   if (!operator) return;
   operator = null;
   requestPolls.clear();
-  if (readSlotOperatorLease()?.sessionId === operatorSessionId && !hasRoundsInFlight()) {
-    clearSlotOperatorLease();
-  }
+  if (readSlotOperatorLease()?.sessionId === operatorSessionId) clearSlotOperatorLease();
 }
 
 /**
@@ -350,6 +363,7 @@ function electSlotOperator(lease: SlotOperatorLease | null, playerId: string, no
     writeSlotOperatorLease({
       playerId,
       sessionId: operatorSessionId,
+      tenure: operator.tenure,
       expiresAt: now + OPERATOR_LEASE_MS,
     });
     operator.renewedAt = now;
@@ -405,6 +419,12 @@ export function tickSlotMachineRoom(
     // lease, so any work here could settle alongside it (EARLIER BUILDS).
     stopSlotOperator();
     return;
+  }
+  // A round of a machine that has left the room (removed by a peer, and not
+  // torn down here) is done with here: nobody operates that machine again.
+  for (const machineId of [...acceptedRounds.keys()]) {
+    if (!machineIds.includes(machineId)
+      && !settling.has(machineId) && !accepting.has(machineId)) acceptedRounds.delete(machineId);
   }
   const operated = machineIds.filter((machineId) =>
     (auto || manualMachines.has(machineId))
@@ -545,14 +565,22 @@ function runTerminal(
 function tickSlotMachine(machineId: string, operatorId?: string): void {
   if (settling.has(machineId) || accepting.has(machineId)) return;
   const state = readSlotMachineState(machineId);
-  const activeAccepted = currentAcceptedRound(machineId);
+  let activeAccepted = currentAcceptedRound(machineId);
   if (activeAccepted
     && (state?.phase !== 'spinning'
       || state.requestId !== activeAccepted.requestId
       || state.player !== activeAccepted.player)) {
-    runTerminal(machineId, 'state-change refund', () =>
-      cancelForHouseCommit(machineId, state));
-    return;
+    if (state?.phase === 'spinning' || !hasSlotEscrow(machineId)) {
+      // Resolved without this session (a lease it lost for a while): another
+      // round is spinning here, whose escrow this is, or nothing is locked.
+      // Nothing of this round is left to refund.
+      acceptedRounds.delete(machineId);
+      activeAccepted = undefined;
+    } else {
+      runTerminal(machineId, 'state-change refund', () =>
+        cancelForHouseCommit(machineId, state));
+      return;
+    }
   }
   if (operatorId) {
     const configuredFunding = readSlotFundingConfig(machineId);
@@ -638,6 +666,7 @@ async function settleRevealTimeout(
 ): Promise<void> {
   const token = accepted.sharedLeaseToken ?? undefined;
   if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
+  if (!stillOperates(accepted.docEpoch)) return;
   if (!refundSlotWager(
     machineId,
     accepted.player,
@@ -665,8 +694,8 @@ async function cancelForHouseCommit(
   machineId: string,
   state: SlotMachineState | null,
 ): Promise<void> {
+  const docEpoch = casinoDocEpoch();
   const accepted = currentAcceptedRound(machineId);
-  if (state?.player) clearSlotReveal(machineId, state.player);
   const player = accepted?.player ?? state?.player;
   const bet = accepted?.bet ?? state?.bet;
   const funding = accepted?.funding ?? state?.funding;
@@ -676,20 +705,20 @@ async function cancelForHouseCommit(
     accepted,
     state?.sharedLeaseToken,
   );
-  if (player && bet && funding) {
-    if (!await ensureTerminalFundingLease(
-      machineId,
-      funding,
-      sharedLeaseToken,
-    )) return;
-    if (!refundSlotWager(
-      machineId,
-      player,
-      bet,
-      funding,
-      sharedLeaseToken,
-    )) return;
-  }
+  const refund = player && bet && funding ? { player, bet, funding } : null;
+  const fundingReady = !refund
+    || await ensureTerminalFundingLease(machineId, refund.funding, sharedLeaseToken);
+  // Nothing is written once this session no longer operates the room.
+  if (!stillOperates(docEpoch)) return;
+  if (state?.player) clearSlotReveal(machineId, state.player);
+  if (!fundingReady) return;
+  if (refund && !refundSlotWager(
+    machineId,
+    refund.player,
+    refund.bet,
+    refund.funding,
+    sharedLeaseToken,
+  )) return;
   writeSlotMachineState(machineId, {
     ...(state ?? initialSlotMachineState()),
     ...(accepted ? {
@@ -905,6 +934,7 @@ async function settle(
   }
   const token = accepted.sharedLeaseToken ?? undefined;
   if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
+  if (!stillOperates(accepted.docEpoch)) return;
   const terminalState = readSlotMachineState(machineId);
   if (terminalState?.phase !== 'spinning'
     || terminalState.requestId !== state.requestId
@@ -1013,8 +1043,8 @@ async function closeSlotMachineManaged(machineId: string): Promise<void> {
 
 /** Stop operating here and release the room's lease if this session holds
  *  it, so another tab or device needn't wait it out. A round still settling
- *  here stops with the page or the room: whoever takes over finds its spin
- *  and refunds it. */
+ *  here writes nothing more (stillOperates), even on a page restored from the
+ *  back/forward cache: whoever takes over finds its spin and refunds it. */
 export function releaseSlotOperatorLease(): void {
   operator = null;
   requestPolls.clear();
@@ -1040,6 +1070,15 @@ export function leaveSlotMachineRoom(): void {
  *  builds' leases): tests and debugging. */
 export function slotOperatorWatchCount(): number {
   return (leaseSeen ? 1 : 0) + earlierBuildLeasesSeen.size;
+}
+
+/** Rounds this session accepted in this room's doc and still holds: tests
+ *  and debugging. */
+export function slotRoundsInHand(): number {
+  const docEpoch = casinoDocEpoch();
+  let n = 0;
+  for (const accepted of acceptedRounds.values()) if (accepted.docEpoch === docEpoch) n += 1;
+  return n;
 }
 
 // Best effort on page close: the write may not flush. (A page restored from
