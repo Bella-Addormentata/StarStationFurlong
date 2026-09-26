@@ -54,7 +54,6 @@ import {
   buildItemGroup,
   furnitureVisualYaw,
   BUNK_TOP_Y,
-  rotXZ,
   POOL_SWIM_Y,
   POOL_WATER_Y,
   isPoolKind,
@@ -384,6 +383,9 @@ export class World {
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
+  /** 🧬 The vat item the clone is bound to (its ceremony, or its pending
+   *  seal) — the clone follows it if the vat is moved mid-ceremony. */
+  private activeVatId: string | null = null;
   /** 🧬 True once the queued spawn has seen the exterior boot view (zoom ≥ 3)
    *  — the PRIMARY arming signal: the reveal then fires on the zoom-in
    *  transition, however long the v0.32.20 auto-boot's join-under-intro takes
@@ -3043,10 +3045,16 @@ export class World {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
     }
-    // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
+    // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
-    if (this.cloneVats.delete(itemId) && this.player.isVatSpawning()) {
+    // The clone is released on its next update, once the vat has left the
+    // obstacles, where it stands or at the nearest free spot. A clone already
+    // released but with the seal still pending is unbound too, so nothing
+    // keeps pointing at the removed vat (or rebinds to a new item with the
+    // same id). Removing some other vat leaves the ceremony alone.
+    if (this.cloneVats.delete(itemId) && itemId === this.activeVatId) {
       this.player.abortVatSpawn();
+      this.activeVatId = null;
     }
 
     const groupMeshes = new Set<THREE.Object3D>();
@@ -3430,6 +3438,7 @@ export class World {
           { x: vat.item.pos.x, z: vat.item.pos.z },
           vat.item.rot * (Math.PI / 2),
         );
+        this.activeVatId = vat.item.id;
         this.pendingVatSpawn = true;
         this.vatSawExterior = false;
         this.pendingVatSpawnGrace = 8; // fallback only — see the field docs
@@ -3668,6 +3677,24 @@ export class World {
     // 🪐 Overhead deck ocean-planet: a slow, calm spin (only while on a deck).
     if (this.isOutdoorDeck && this.deckPlanet) {
       this.deckPlanet.rotation.y += deltaTime * 0.015;
+    }
+
+    // 🧬 The vat running the clone's ceremony can be moved or turned under it
+    // (edit mode, a synced move — its group moves in place and the handle
+    // survives): keep the clone and its door-clearance bound to it — BEFORE the
+    // player's update, whose walk-out re-plan measures from the vat's pose.
+    if (this.activeVatId !== null) {
+      const bound = this.player.isVatBound()
+        ? FURNITURE.find((i) => i.id === this.activeVatId)
+        : undefined;
+      if (bound) {
+        this.player.rebindVat(
+          { x: bound.pos.x, z: bound.pos.z },
+          bound.rot * (Math.PI / 2),
+        );
+      } else if (!this.player.isVatBound()) {
+        this.activeVatId = null;
+      }
     }
 
     // Keep updating while device-FOCUSED too: the mesh is hidden then, but
@@ -5642,26 +5669,32 @@ export class World {
 
   /**
    * Run the full spawn ceremony at the room's clone vat: the avatar is held
-   * inside the tube, the nutrient bath drains, the glass door spins open,
-   * and the clone walks out to the cell in front of the door — then the vat
-   * seals and slowly refills behind them. Used at boot (deferred via
-   * pendingVatSpawn), by the DEV RESPAWN button, and by any future death
-   * flow. Returns false when the room has no vat (legacy spawn applies).
+   * inside the tube (squeezed to fit it — vatGauge.ts), the nutrient bath
+   * drains and the empty tank is held a beat, the glass door spins open, and
+   * the clone walks out through the doorway's hourglass gauge — then, once
+   * it is clear of the door, the vat shuts and slowly refills behind it. Used
+   * at boot (deferred via pendingVatSpawn), by the DEV RESPAWN button, and by
+   * any future death flow. Returns false when the room has no vat (legacy
+   * spawn applies).
    */
   public respawnAtVat(): boolean {
     const found = this.findSpawnVat();
     if (!found || this.isMorphing) return false;
     const { item, handle } = found;
-    // Exit = one tile out through the door face (local +z, rotated with the
-    // item) — for the default NW-pocket vat that is the open (-3.5, -3.5).
-    const exitOff = rotXZ(0, 1.0, item.rot);
-    const exit = { x: item.pos.x + exitOff.x, z: item.pos.z + exitOff.z };
+    // The door faces local +z, rotated with the item: rot quarter-turns CCW
+    // map onto facing angles (atan2(x, z)) one-for-one. The seal is armed
+    // with the hold, so a cycle abandoned mid-drain shuts down at once.
+    const seal = () => handle.closeAndRefill();
     this.player.beginVatSpawn(
       { x: item.pos.x, z: item.pos.z },
       item.rot * (Math.PI / 2),
+      seal,
     );
+    this.activeVatId = item.id;
     handle.beginSpawnCycle(() => {
-      this.player.walkOutOfVat(exit, () => handle.closeAndRefill());
+      // A released clone has already sealed the vat (which drops this
+      // callback); belt and braces — never leave the door open and dry.
+      if (!this.player.walkOutOfVat()) seal();
     });
     return true;
   }

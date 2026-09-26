@@ -254,3 +254,44 @@ export function migrateDefaultLayout(): void {
     }
   });
 }
+
+/** Default poses from BEFORE #165 grew the clone vat to 2×2 — the only poses
+ *  relocateLegacyDefaultVat moves anything from. */
+const LEGACY_VAT_POSE = { x: -4.7, z: -4.9, rot: 0 };
+const LEGACY_CORNER_TREE_POSE = { x: -5.3, z: -5.3, rot: 0 };
+
+/**
+ * 🧬 One-time #165 migration: the clone vat is a 2×2 tank centred on the NW
+ * corner square now. A room whose DEFAULT vat still sits at the old 1×1
+ * default pose gets it moved to the new default, and the corner cherry tree
+ * the bigger tank would swallow moves to its new default too — but only
+ * while the tree is still at ITS old default and the vat now fills that
+ * corner. Anything the owner moved, and DEV-spawned vats (unique ids), keep
+ * their spot. Caller marker-gates it (main.ts), like migrateDefaultLayout.
+ */
+export function relocateLegacyDefaultVat(): void {
+  if (!docAlive()) return;
+  const vat = DEFAULT_LOBBY_FURNITURE.find((item) => item.id === 'clone-vat');
+  const tree = DEFAULT_LOBBY_FURNITURE.find((item) => item.id === 'cherry-tree-back-left');
+  if (!vat || !tree) return;
+  const isAt = (id: string, pose: { x: number; z: number; rot: number }) => {
+    const rec = furnitureMap!.get(id);
+    return (
+      isFurnitureRecord(rec) &&
+      rec.x === pose.x &&
+      rec.z === pose.z &&
+      rec.rot === pose.rot
+    );
+  };
+  boundDoc!.transact(() => {
+    if (isAt(vat.id, LEGACY_VAT_POSE)) {
+      furnitureMap!.set(vat.id, toRecord(vat));
+    }
+    if (
+      isAt(vat.id, { x: vat.pos.x, z: vat.pos.z, rot: vat.rot }) &&
+      isAt(tree.id, LEGACY_CORNER_TREE_POSE)
+    ) {
+      furnitureMap!.set(tree.id, toRecord(tree));
+    }
+  });
+}

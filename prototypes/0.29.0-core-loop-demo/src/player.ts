@@ -72,6 +72,18 @@ import { findPath, worldToCol, worldToRow } from "./pathfinding";
 import { roomWalkBounds } from "./floorPlanDoc";
 import { OBSTACLES } from "./obstacles";
 import {
+  VAT_HOLD_ALONG,
+  vatPallorAt,
+  vatClearOfDoorAt,
+  vatDoorClear,
+  vatFallbackRelease,
+  vatFloorY,
+  vatFreeExitAlong,
+  vatShutDoorReleaseAlong,
+  vatSqueezeAt,
+  vatStrandedRelease,
+} from "./vatGauge";
+import {
   POOL_WATER_Y,
   POOL_SWIM_Y,
   HOT_TUB_WATER_Y,
@@ -288,11 +300,45 @@ export class Player {
   private deviceStuck = 0;
 
   // ── 🧬 Clone-vat spawn state (owner request — diegetic spawn point) ────────
-  /** HOLD = frozen inside the tube; WALK_OUT = scripted straight exit walk. */
-  private vatPhase: "NONE" | "HOLD" | "WALK_OUT" = "NONE";
-  private vatExit: { x: number; z: number } | null = null;
+  /** HOLD = frozen inside the tube; WAIT_CLEAR = door open but nowhere in
+   *  the room to stand, so still held (retrying); WALK_OUT = scripted
+   *  straight exit walk; RELAX = back to full size in place when the exit
+   *  path was cut short; ORPHANED = the vat was removed mid-ceremony, so the
+   *  clone is held where it stood until there is a free spot to release it. */
+  private vatPhase:
+    | "NONE"
+    | "HOLD"
+    | "WAIT_CLEAR"
+    | "WALK_OUT"
+    | "RELAX"
+    | "ORPHANED" = "NONE";
+  /** The vat's axis on the floor. The clone stands on the line from here
+   *  through the door, and the clearance gauge (vatGauge.ts) that squeezes
+   *  it is measured along that line. */
+  private vatCentre = { x: 0, z: 0 };
+  /** Door direction (= the clone's facing) — the line's heading. */
   private vatFacing = 0;
-  private vatDone: (() => void) | null = null;
+  /** Seals the vat behind the clone (door shut, then refill). Armed when the
+   *  clone enters the tube; fires exactly once — the moment the clone is
+   *  clear of the door's sweep, or at once when the cycle is abandoned — so a
+   *  vat is never left open and dry. */
+  private vatOnClear: (() => void) | null = null;
+  /** Where this walk-out ends (metres from the axis): VAT_EXIT_ALONG unless
+   *  a wall or furniture cuts the path short (vatFreeExitAlong). */
+  private vatExitAlong = 0;
+  /** RELAX: seconds in, and the squeeze / height it eases out from. */
+  private vatRelaxT = 0;
+  private vatRelaxFrom = { horizontal: 1, vertical: 1, y: 0 };
+  private readonly VAT_RELAX_TIME = 0.4;
+  /** 🧬 performance.now() when the clone left the vat and its colours began
+   *  coming back; -1 when no fade is running (in the vat it is held fully
+   *  pale). Wall-clock, not accumulated frame time: the fade runs its 30 s
+   *  even while update() is gated off (station view, a hidden tab). */
+  private pallorFrom = -1;
+  /** WAIT_CLEAR / ORPHANED: seconds between tries for somewhere to step out to. */
+  private readonly VAT_WAIT_RETRY = 0.5;
+  /** WAIT_CLEAR: where on the door path the clone is held (to look from). */
+  private vatWaitFrom = 0;
   /** Seconds spent in HOLD — watchdog releases a stranded clone (a vat
    *  animation that never calls walkOutOfVat must not soft-lock input). */
   private vatHoldTimer = 0;
@@ -795,6 +841,12 @@ export class Player {
   update(deltaTime: number, inputManager: InputManager): void {
     const dir = inputManager.getMoveDirection();
     const manualInput = dir.x !== 0 || dir.z !== 0;
+
+    // 🧬 A clone released short of the door's sweep seals its vat as soon as
+    // it has walked clear (normally the walk-out itself does this), and a
+    // fresh clone's colours ease back from the pallor grey.
+    this._sealVatWhenClear();
+    this._updatePallor();
 
     // ── 🧬 Clone-vat spawn choreography: fully scripted (HOLD inside the
     //    tube while it drains/opens, then the straight walk-out). Input is
@@ -2482,6 +2534,14 @@ export class Player {
     this.doorHooks = null;
     this.adapterOutTarget = null;
     this.doorTimer = 0;
+    // 🧬 Vat teardown: a beam ends any spawn choreography — its vat seals
+    // behind us — and drops the clearance squeeze (beginVatSpawn beams first,
+    // then re-arms its own). A clone beamed out mid-ceremony is out of the
+    // vat all the same: its colour starts coming back.
+    if (this.vatPhase !== "NONE") this.pallorFrom = performance.now();
+    this.vatPhase = "NONE";
+    this._sealVat();
+    this.mesh.scale.set(1, 1, 1);
 
     this.mesh.position.x = x;
     this.mesh.position.z = z;
@@ -2494,93 +2554,388 @@ export class Player {
   // ── 🧬 Clone-vat spawn choreography ─────────────────────────────────────────
 
   /**
-   * Place the avatar inside the vat tube, frozen and facing the door.
-   * Reuses beamTo's full teardown (any sit/door/device/path state dies), then
-   * enters the scripted HOLD — update() swallows all input until the walk-out
-   * completes. World sequences the vat animation and calls walkOutOfVat when
-   * the doorway is clear.
+   * Place the avatar inside the vat tube, frozen and facing the door: on the
+   * interior pad, at the hold spot, squeezed to fit the tank (#165 — the fox
+   * is far bigger than any tank, so vatGauge.ts scales it to the largest size
+   * that clears the glass). Reuses beamTo's full teardown (any sit/door/
+   * device/path state dies — including a previous spawn cycle, whose vat
+   * seals), then enters the scripted HOLD — update() swallows all input until
+   * the walk-out completes. World sequences the vat animation and calls
+   * walkOutOfVat once the tank is drained and the door is open.
+   *
+   * `onSeal` shuts and refills the vat running this cycle. It is armed from
+   * the start and fires exactly once: when the clone is clear of the door's
+   * sweep, or at once if the cycle is abandoned (beam, abort, watchdog), so a
+   * vat never keeps draining for a clone that has gone. Omitted when no cycle
+   * runs yet (the boot hold, before the reveal).
    */
   public beginVatSpawn(
-    inside: { x: number; z: number },
+    centre: { x: number; z: number },
     faceAngle: number,
+    onSeal?: () => void,
   ): void {
-    this.beamTo(inside.x, inside.z);
+    this.beamTo(centre.x, centre.z);
     this.vatPhase = "HOLD";
-    this.vatExit = null;
-    this.vatDone = null;
+    this.vatCentre = { x: centre.x, z: centre.z };
     this.vatHoldTimer = 0;
     this.vatFacing = faceAngle;
+    this.vatOnClear = onSeal ?? null;
     this.logicalAngle = faceAngle;
+    this._applyVatPose(VAT_HOLD_ALONG);
     this.character.setState("idle", faceAngle);
+    // 🧬 A fresh clone decants almost-white grey; its own colours come back
+    // over VAT_PALLOR_FADE_S once it is out (_releaseVat starts the fade).
+    this.pallorFrom = -1;
+    this.character.setPallor(1);
   }
 
   /**
-   * Release the HOLD and walk straight out to the exit point (collision OFF —
-   * the vat's own footprint is an obstacle, exactly like the seat slides).
-   * onDone fires once on arrival; control returns to MANUAL.
+   * Release the HOLD and walk straight out through the door along the vat's
+   * axis (collision OFF — the vat's own footprint is an obstacle, exactly
+   * like the seat slides), squeezed through the doorway's hourglass gauge
+   * and easing back to full size in the room. The walk ends at
+   * VAT_EXIT_ALONG, or sooner where a wall or other furniture cuts the path
+   * short (vatFreeExitAlong) — the clone then eases to full size where it
+   * stands. Returns false when the HOLD was already released (its seal has
+   * fired), so the caller knows no walk-out follows.
    */
-  public walkOutOfVat(
-    exit: { x: number; z: number },
-    onDone?: () => void,
-  ): void {
-    if (this.vatPhase === "NONE") return; // aborted meanwhile — stay released
-    this.vatPhase = "WALK_OUT";
-    this.vatExit = exit;
-    this.vatDone = onDone ?? null;
+  public walkOutOfVat(): boolean {
+    if (this.vatPhase !== "HOLD") return false; // released meanwhile
+    // Scan from where the clone actually stands — the hold spot inside the
+    // tank — so nothing overlapping the vat is skipped.
+    this._leaveVat(VAT_HOLD_ALONG);
+    return true;
   }
 
-  /** True while the spawn choreography owns the avatar (HOLD or WALK_OUT). */
+  /**
+   * Leave the open tank by the best route the room allows: walk out along
+   * the door path (vatFreeExitAlong); else, the doorway being blocked, step
+   * out at the nearest free spot (vatFallbackRelease) and let the door shut
+   * once clear; else — nowhere in the room is free — stay held in the tank,
+   * where the clone fits, and try again shortly (WAIT_CLEAR). The clone is
+   * never released anywhere it would overlap the vat or other furniture.
+   * `from` is where on the door path to look from (the plinth lip, or the
+   * clone's current spot when re-planning mid-walk).
+   */
+  private _leaveVat(from: number): void {
+    const exit = vatFreeExitAlong(
+      this.vatCentre,
+      this.vatFacing,
+      OBSTACLES,
+      this.roomBounds(),
+      PLAYER_R,
+      from,
+    );
+    if (exit !== null) {
+      this.vatPhase = "WALK_OUT";
+      this.vatExitAlong = exit;
+      return;
+    }
+    const spot = this._fallbackSpot();
+    if (spot) {
+      this.mesh.position.x = spot.x;
+      this.mesh.position.z = spot.z;
+      this._releaseVat(); // the door shuts once the clone is clear of it
+      return;
+    }
+    this.vatPhase = "WAIT_CLEAR";
+    this.vatWaitFrom = from;
+    this.vatHoldTimer = 0;
+  }
+
+  private _fallbackSpot(): { x: number; z: number } | null {
+    return vatFallbackRelease(
+      this.vatCentre,
+      this.vatFacing,
+      OBSTACLES,
+      this.roomBounds(),
+      PLAYER_R,
+    );
+  }
+
+  /** True while the spawn choreography owns the avatar. */
   public isVatSpawning(): boolean {
     return this.vatPhase !== "NONE";
   }
 
   /**
-   * Instantly release the choreography at the current position (vat removed
-   * mid-cycle, room teardown). The pending onDone is dropped — the cycle is
-   * over, nothing should resume.
+   * The vat this clone is bound to is being removed (edit mode, a synced
+   * removal). A pending seal fires now, so nothing stays tied to the removed
+   * vat, including after a short exit that released the clone before the door
+   * sealed. A running ceremony ends too. The clone is not released on the
+   * spot, because World calls this before the vat leaves the obstacle list,
+   * and that spot may be inside other furniture. It is held where it stands
+   * (ORPHANED), and the next update releases it there or at the nearest free
+   * spot once the obstacles are rebuilt. If nowhere is free it stays held and
+   * retries.
    */
   public abortVatSpawn(): void {
+    if (!this.isVatBound()) return;
+    this._sealVat();
+    if (this.vatPhase === "NONE") return; // already released: nothing to hold
+    this.vatPhase = "ORPHANED";
+    this.vatHoldTimer = this.VAT_WAIT_RETRY; // try on the very next update
+  }
+
+  /** Hand control back: full size, on the floor, MANUAL. Leaves a pending
+   *  seal armed — update() fires it once the clone is clear of the door. */
+  private _releaseVat(): void {
     this.vatPhase = "NONE";
-    this.vatExit = null;
-    this.vatDone = null;
+    this.mesh.scale.set(1, 1, 1);
+    this.mesh.position.y = 0;
     this.navMode = "MANUAL";
+    this.pallorFrom = performance.now(); // out of the vat: colour starts coming back
+  }
+
+  /** 🧬 Ease a released clone's colours back from the pallor grey. */
+  private _updatePallor(): void {
+    if (this.pallorFrom < 0) return;
+    const k = vatPallorAt((performance.now() - this.pallorFrom) / 1000);
+    this.character.setPallor(k);
+    if (k <= 0) this.pallorFrom = -1;
+  }
+
+  /**
+   * The vat running this ceremony was moved or turned under the clone (edit
+   * mode, a synced move — the group moves in place, the handle survives):
+   * re-anchor to it. The clone keeps its progress along the door path, so a
+   * held clone stays in the tank and a walking one stays in its doorway, and
+   * the door-clearance check measures from where the door now is. A no-op
+   * while the pose is unchanged (World calls it every frame).
+   */
+  public rebindVat(centre: { x: number; z: number }, faceAngle: number): void {
+    // ORPHANED: that vat is gone. The clone is no longer tied to it, even if
+    // an item with the same id comes back.
+    if (!this.isVatBound() || this.vatPhase === "ORPHANED") return;
+    if (
+      centre.x === this.vatCentre.x &&
+      centre.z === this.vatCentre.z &&
+      faceAngle === this.vatFacing
+    ) {
+      return;
+    }
+    const pos = this.mesh.position;
+    const along =
+      (pos.x - this.vatCentre.x) * Math.sin(this.vatFacing) +
+      (pos.z - this.vatCentre.z) * Math.cos(this.vatFacing);
+    this.vatCentre = { x: centre.x, z: centre.z };
+    this.vatFacing = faceAngle;
+    if (this.vatPhase === "NONE") return; // released: the seal check re-aims
+    this.logicalAngle = faceAngle;
+    if (this.vatPhase === "RELAX") {
+      // Mid-ease: keep the size it has reached, just move with the vat (the
+      // next RELAX frame re-checks the spot before easing on).
+      pos.x = centre.x + Math.sin(faceAngle) * along;
+      pos.z = centre.z + Math.cos(faceAngle) * along;
+    } else if (this.vatPhase === "WALK_OUT") {
+      this._applyVatPose(along); // the next frame re-plans from here
+    } else if (this.vatPhase === "WAIT_CLEAR") {
+      this._applyVatPose(this.vatWaitFrom);
+    } else {
+      this._applyVatPose(VAT_HOLD_ALONG);
+    }
+    this.character.setState("idle", faceAngle);
+  }
+
+  /** Still tied to a vat: in its ceremony, or out but with its seal pending. */
+  public isVatBound(): boolean {
+    return this.vatPhase !== "NONE" || this.vatOnClear !== null;
+  }
+
+  /** Fire the pending vat seal, exactly once. */
+  private _sealVat(): void {
+    const seal = this.vatOnClear;
+    this.vatOnClear = null;
+    seal?.();
+  }
+
+  /** A clone released before it was clear of the door (short exit
+   *  corridor): seal the vat as soon as it has walked out of the sweep,
+   *  whichever way it faces. */
+  private _sealVatWhenClear(): void {
+    if (!this.vatOnClear) return;
+    if (
+      this.vatPhase === "HOLD" ||
+      this.vatPhase === "WAIT_CLEAR" ||
+      this.vatPhase === "WALK_OUT"
+    ) {
+      return;
+    }
+    const pos = this.mesh.position;
+    const distance = Math.hypot(pos.x - this.vatCentre.x, pos.z - this.vatCentre.z);
+    if (vatClearOfDoorAt(distance, this.mesh.scale.x)) this._sealVat();
+  }
+
+  /**
+   * A collision-free spot outside the vat for a clone that must leave
+   * without walking (HOLD watchdog). The door never opened and seals at once,
+   * so the full-size clone must stand wholly past its sweep. That is on its
+   * door path when the path reaches that far (vatShutDoorReleaseAlong), else
+   * the nearest free spot (vatFallbackRelease). null when nowhere in the
+   * room is free.
+   */
+  private _spotClearOfVat(): { x: number; z: number } | null {
+    const along = vatShutDoorReleaseAlong(
+      this.vatCentre,
+      this.vatFacing,
+      OBSTACLES,
+      this.roomBounds(),
+      PLAYER_R,
+    );
+    if (along === null) return this._fallbackSpot();
+    return {
+      x: this.vatCentre.x + Math.sin(this.vatFacing) * along,
+      z: this.vatCentre.z + Math.cos(this.vatFacing) * along,
+    };
+  }
+
+  /**
+   * Stand the clone `along` metres out from the vat's axis toward its door:
+   * on the pad or the floor (stepping down off the plinth lip) and scaled to
+   * the hourglass gauge there — plan scale on x/z, height scale on y.
+   */
+  private _applyVatPose(along: number): void {
+    const squeeze = vatSqueezeAt(along);
+    this.mesh.position.x = this.vatCentre.x + Math.sin(this.vatFacing) * along;
+    this.mesh.position.z = this.vatCentre.z + Math.cos(this.vatFacing) * along;
+    this.mesh.position.y = vatFloorY(along);
+    this.mesh.scale.set(squeeze.horizontal, squeeze.vertical, squeeze.horizontal);
   }
 
   private _updateVatPhase(deltaTime: number): void {
-    const pos = this.mesh.position;
     if (this.vatPhase === "HOLD") {
       this.character.setState("idle", this.vatFacing);
       this.vatHoldTimer += deltaTime;
       if (this.vatHoldTimer >= this.VAT_HOLD_TIMEOUT) {
-        // Watchdog: the vat never opened (handle lost mid-cycle?) — release
-        // where we stand rather than soft-locking the session.
-        this.abortVatSpawn();
+        // Watchdog: the vat never opened (handle lost mid-cycle?) — step the
+        // clone out to a free spot rather than soft-locking the session (or
+        // leaving it inside the glass); the vat, still shut, seals. With
+        // nowhere free in the room it stays held and the watchdog re-arms.
+        const spot = this._spotClearOfVat();
+        if (spot) {
+          this.mesh.position.x = spot.x;
+          this.mesh.position.z = spot.z;
+          this._releaseVat();
+          this._sealVat();
+        } else {
+          this.vatHoldTimer = 0;
+        }
       }
       return;
     }
-    // WALK_OUT — straight constant-speed exit, no collision, no pathfinding.
-    const exit = this.vatExit;
-    if (!exit) {
-      this.abortVatSpawn();
+    if (this.vatPhase === "WAIT_CLEAR") {
+      // Door open but nowhere to stand: stay held in the tank, retrying.
+      this.character.setState("idle", this.vatFacing);
+      this.vatHoldTimer += deltaTime;
+      if (this.vatHoldTimer >= this.VAT_WAIT_RETRY) {
+        this.vatHoldTimer = 0;
+        this._leaveVat(this.vatWaitFrom);
+      }
       return;
     }
-    const dx = exit.x - pos.x;
-    const dz = exit.z - pos.z;
-    const dist = Math.hypot(dx, dz);
-    const step = this.VAT_WALK_SPEED * deltaTime;
-    if (dist <= Math.max(step, 0.02)) {
-      pos.x = exit.x;
-      pos.z = exit.z;
-      this.logicalAngle = this.vatFacing;
+    if (this.vatPhase === "ORPHANED") {
+      // The vat was removed around the clone: no tank is left to clip, so
+      // release it where it stands if that is free, else at the nearest free
+      // spot. With nowhere free it stays held, retrying.
       this.character.setState("idle", this.logicalAngle);
-      const done = this.vatDone;
-      this.abortVatSpawn(); // clears state, MANUAL
-      done?.();
+      this.vatHoldTimer += deltaTime;
+      if (this.vatHoldTimer >= this.VAT_WAIT_RETRY) {
+        this.vatHoldTimer = 0;
+        const spot = vatStrandedRelease(
+          this.mesh.position,
+          this.logicalAngle,
+          OBSTACLES,
+          this.roomBounds(),
+          PLAYER_R,
+        );
+        if (spot) {
+          this.mesh.position.x = spot.x;
+          this.mesh.position.z = spot.z;
+          this._releaseVat();
+        }
+      }
       return;
     }
-    this.logicalAngle = snapTo8Ways(Math.atan2(dx / dist, dz / dist));
-    pos.x += (dx / dist) * step;
-    pos.z += (dz / dist) * step;
+    if (this.vatPhase === "RELAX") {
+      // The spot must stay a valid release all the way through the ease: a
+      // vat moved under the clone (rebindVat carries it along) or furniture
+      // moved onto it re-plans like the walk-out — walk on, step out
+      // elsewhere, or hold.
+      const pos = this.mesh.position;
+      const at =
+        (pos.x - this.vatCentre.x) * Math.sin(this.vatFacing) +
+        (pos.z - this.vatCentre.z) * Math.cos(this.vatFacing);
+      if (
+        vatFreeExitAlong(
+          this.vatCentre,
+          this.vatFacing,
+          OBSTACLES,
+          this.roomBounds(),
+          PLAYER_R,
+          at,
+        ) === null
+      ) {
+        this._leaveVat(at);
+        return;
+      }
+      // Short exit: ease back to full size and down onto the floor in place.
+      this.vatRelaxT += Math.max(0, deltaTime);
+      const k = Math.min(1, this.vatRelaxT / this.VAT_RELAX_TIME);
+      const e = k * k * (3 - 2 * k);
+      const from = this.vatRelaxFrom;
+      this.mesh.scale.set(
+        from.horizontal + (1 - from.horizontal) * e,
+        from.vertical + (1 - from.vertical) * e,
+        from.horizontal + (1 - from.horizontal) * e,
+      );
+      this.mesh.position.y = from.y * (1 - e);
+      this.character.setState("idle", this.logicalAngle);
+      if (k >= 1) this._releaseVat();
+      return;
+    }
+    // WALK_OUT — straight constant-speed exit along the door axis, no
+    // collision, no pathfinding; the gauge sizes the clone at every step.
+    const pos = this.mesh.position;
+    const along =
+      (pos.x - this.vatCentre.x) * Math.sin(this.vatFacing) +
+      (pos.z - this.vatCentre.z) * Math.cos(this.vatFacing);
+    // Furniture can change mid-walk (owner edits, synced moves): re-plan the
+    // end from where the clone now stands, every frame, so it is never
+    // walked onto — or released at — a spot that has since been taken.
+    const end = vatFreeExitAlong(
+      this.vatCentre,
+      this.vatFacing,
+      OBSTACLES,
+      this.roomBounds(),
+      PLAYER_R,
+      along,
+    );
+    if (end === null) {
+      this._leaveVat(along); // step out elsewhere, or hold here
+      return;
+    }
+    this.vatExitAlong = end;
+    const next = Math.min(
+      this.vatExitAlong,
+      along + this.VAT_WALK_SPEED * Math.max(0, deltaTime),
+    );
+    this._applyVatPose(next);
+    this.logicalAngle = this.vatFacing;
+    // Door shuts (then the tank refills) the moment the tail is past it.
+    if (vatDoorClear(next, this.mesh.scale.x)) this._sealVat();
+    if (next >= this.vatExitAlong) {
+      this.character.setState("idle", this.logicalAngle);
+      const s = this.mesh.scale;
+      if (s.x < 1 || s.y < 1 || pos.y > 0) {
+        // Cut short by a wall or furniture: still squeezed here.
+        this.vatPhase = "RELAX";
+        this.vatRelaxT = 0;
+        this.vatRelaxFrom = { horizontal: s.x, vertical: s.y, y: pos.y };
+      } else {
+        this._releaseVat(); // full size at the exit (the seal has fired)
+      }
+      return;
+    }
     this.character.setState("walk", this.logicalAngle);
   }
 
