@@ -425,6 +425,20 @@ export function writeSlotMachineState(machineId: string, state: SlotMachineState
   });
 }
 
+/**
+ * Run several casino writes as one transaction, so a peer sees all of them or
+ * none (the writes' own transactions nest inside it). Returns what `writes`
+ * returns.
+ */
+export function transactCasino<T>(writes: () => T): T {
+  ensureMap();
+  let result!: T;
+  boundDoc!.transact(() => {
+    result = writes();
+  });
+  return result;
+}
+
 export function readSlotPlayRequests(machineId: string): SlotPlayRequest[] {
   const prefix = `slot-request:${machineId}:`;
   const requests: SlotPlayRequest[] = [];

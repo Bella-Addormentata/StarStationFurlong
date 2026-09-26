@@ -19,6 +19,7 @@ import {
   readSlotMachineState,
   readSlotOperatorLease,
   readSlotPlayRequests,
+  readSlotReveal,
   refundSlotWager,
   reserveSlotWager,
   SLOT_OPERATOR_KEY,
@@ -351,6 +352,60 @@ describe('one operator for the room', () => {
     expect(readSlotPlayRequests(M1)).toHaveLength(1);
     expect(readChips(PLAYER)).toBe(100);
   });
+
+  it('takes no wager once this client may no longer run the machine while it is accepting', async () => {
+    fund(M1);
+    const ready = becomeOperator([M1]);
+    await requestSpin(M1);
+    tickSlotMachineRoom([M1], false, at(ready + 300)); // the accept starts, then awaits its hashes
+    setSoleCroupierPredicate(() => false); // the deed changed hands meanwhile
+    tickSlotMachineRoom([M1], false, at(ready + 301)); // the lease is kept while the accept is at work
+    await acceptsDone();
+    expect(spinning(M1)).toBe(false);
+    expect(readSlotPlayRequests(M1)).toHaveLength(1);
+    expect(readChips(PLAYER)).toBe(100);
+  });
+
+  it('ends its take when the record naming this page carries another take, then takes the lease afresh with its settling wait', async () => {
+    fund(M1);
+    const ready = becomeOperator([M1]);
+    const mine = readSlotOperatorLease()!;
+    writeSlotOperatorLease({ ...mine, tenure: 'forged' }); // a peer, naming this page
+    expect(isSlotOperator()).toBe(false);
+    tickSlotMachineRoom([M1], false, at(ready + 100));
+    expect(readSlotOperatorLease()).toBeNull(); // not renewed over
+    await requestSpin(M1);
+    tickSlotMachineRoom([M1], false, at(ready + 200)); // a fresh take
+    const retaken = readSlotOperatorLease()!;
+    expect(retaken.sessionId).toBe(slotOperatorSession());
+    expect([mine.tenure, 'forged']).not.toContain(retaken.tenure);
+    tickSlotMachineRoom([M1], false, at(ready + 500));
+    await acceptsDone();
+    expect(spinning(M1)).toBe(false); // still settling
+    tickSlotMachineRoom([M1], false, at(ready + 200 + SETTLE_MS));
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+  });
+
+  it('locks the stake and publishes the spin in one update, so no peer sees one without the other', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    const consistent: boolean[] = [];
+    doc.on('update', (update: Uint8Array) => {
+      Y.applyUpdate(peer, update);
+      const casino = peer.getMap('casino');
+      const state = casino.get(`slot:${M1}`) as { phase?: string } | undefined;
+      consistent.push(!casino.has(`slot-escrow:${M1}`) || state?.phase === 'spinning');
+    });
+    becomeOperator([M1]);
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(hasSlotEscrow(M1)).toBe(true);
+    expect(consistent.length).toBeGreaterThan(0);
+    expect(consistent.every(Boolean)).toBe(true);
+  });
 });
 
 // ── Winding a round down ─────────────────────────────────────────────────────
@@ -558,6 +613,48 @@ describe('a round once this session no longer holds the lease', () => {
     expect(hasSlotEscrow(M1)).toBe(true);
   });
 
+  it("writes nothing from a settle paused at an await once an earlier build's lease appears", async () => {
+    fund(M1);
+    fund(M2);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1, M2]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const t = ready + SLOT_SPIN_MS + 10;
+    tickSlotMachineRoom([M1, M2], false, at(t)); // the settle starts, then awaits
+    // An earlier build takes up machine 2 before the next frame.
+    doc.getMap('casino').set(`slot-operator:${M2}`, {
+      playerId: OPERATOR, sessionId: 'a'.repeat(64), expiresAt: t + LEASE_MS,
+    });
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  it('leaves a mismatched reveal alone once the take is over while the settle checks it', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, randomSlotSeed()); // not the seed the player committed to
+    tickSlotMachineRoom([M1], false, at(ready + SLOT_SPIN_MS + 10)); // the settle starts, then awaits
+    releaseSlotOperatorLease();
+    await acceptsDone();
+    expect(readSlotReveal(M1, PLAYER)).not.toBeNull();
+  });
+
+  it('clears a mismatched reveal while it operates', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, randomSlotSeed());
+    tickSlotMachineRoom([M1], false, at(ready + SLOT_SPIN_MS + 10));
+    await acceptsDone();
+    expect(readSlotReveal(M1, PLAYER)).toBeNull();
+    expect(spinning(M1)).toBe(true);
+  });
+
   it('writes nothing from a reveal-timeout refund paused at an await', async () => {
     fund(M1);
     await requestSpin(M1);
@@ -663,6 +760,18 @@ describe('running machines by hand', () => {
     doc.getMap('casino').delete(SLOT_OPERATOR_KEY);
     tickSlotMachineRoom([M1], true, at(T0 + 200));
     expect(readSlotOperatorLease()).toBeNull();
+  });
+
+  it('RUN takes the lease afresh when the record naming this page carries another take', () => {
+    fund(M1);
+    fund(M2);
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(true);
+    const first = readSlotOperatorLease()!;
+    writeSlotOperatorLease({ ...first, tenure: 'forged' });
+    expect(isManualSlotMachineRunning(M1, OPERATOR)).toBe(false);
+    expect(setManualSlotMachineRunning(M2, OPERATOR, true, at(T0 + 10))).toBe(true);
+    expect([first.tenure, 'forged']).not.toContain(readSlotOperatorLease()!.tenure);
+    expect(isManualSlotMachineRunning(M2, OPERATOR)).toBe(true);
   });
 
   it('STOP lets the lease go on the next frame once no machine is run here', () => {
