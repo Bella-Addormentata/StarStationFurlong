@@ -115,6 +115,14 @@ function boxesOverlap(a: Box, b: Box): boolean {
   return a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
 }
 
+/** Footprintless kinds that still cover ground when FITTED: their full extent
+ *  is checked against the walls and the furniture, though they block nothing
+ *  once placed. */
+const OVERLAY_ENVELOPE: Partial<Record<FurnitureKind, { w: number; d: number }>> = {
+  "dance-floor": { w: 4.1, d: 4.1 },
+};
+const OVERLAY_MARGIN = 0.3; // a pad may lie closer to a wall than a chair, but not in it
+
 function pointInAny(x: number, z: number, boxes: readonly Box[]): boolean {
   return boxes.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
 }
@@ -230,8 +238,24 @@ export function placeFitting(
         // Decoration with no footprint (banner, balloons, towel, ball, the
         // dance floor, the pergola roof). It cannot COLLIDE, but it must not
         // be standing in the river either, and it still has to be in the room.
-        if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
-        if (!spec.overhead && pointInAny(x, z, blockedFor(false))) continue;
+        // A WALKABLE OVERLAY (the dance floor) is a 4 m pad, not a point: it
+        // is fitted by its whole envelope — inside the walls, off the
+        // furniture — while staying a non-obstacle at runtime (Copilot
+        // review, PR #169: the 4.1 m pad centred at x 4.08 ran through the
+        // east wall of a 12 m room).
+        const env = OVERLAY_ENVELOPE[spec.kind];
+        if (env) {
+          const eb: Box = { x0: x - env.w / 2, z0: z - env.d / 2, x1: x + env.w / 2, z1: z + env.d / 2 };
+          if (eb.x0 < -halfX + OVERLAY_MARGIN || eb.x1 > halfX - OVERLAY_MARGIN || eb.z0 < -halfZ + OVERLAY_MARGIN || eb.z1 > halfZ - OVERLAY_MARGIN) continue;
+          if (blockedFor(false).some((o) => boxesOverlap(eb, o))) continue;
+          // The pad is a place to BE: later pieces keep off it (fitting-time
+          // only — it blocks nothing once placed).
+          occupied.push(eb);
+          if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), eb]);
+        } else {
+          if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
+          if (!spec.overhead && pointInAny(x, z, blockedFor(false))) continue;
+        }
       }
       placed = item;
       break;

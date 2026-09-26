@@ -86,15 +86,36 @@ describe('doors', () => {
   });
 
   it('reserves nothing for a room whose owner removed every door', () => {
-    const doc = new Y.Doc();
-    bindDoorLayoutDoc(doc);
+    // A crate that wants the middle of the south doorway's lane.
+    // (0, 4.8): its 1 m box reaches z 5.3 — inside the wall margin, inside the lane.
+    const wantsLane: PlacementSpec[] = [{ kind: 'beach-crate', at: [0, 0.8] }];
+    // Under the four default doors the lane is reserved: the crate is nudged
+    // away from it (or not placed at all).
+    expect(roomDoorPoints()).toHaveLength(4);
+    const withDoors = placeFitting(wantsLane, 6, 6, 't');
+    for (const b of boxesOf(withDoors)) expect(overlaps(b, southLane)).toBe(false);
+    // With an authoritative-EMPTY door set there is no door there to keep
+    // clear: the same crate lands exactly where it asked.
+    bindDoorLayoutDoc(new Y.Doc());
     seedDoorLayoutEmpty();
     expect(doorSetIsMarkedEmpty()).toBe(true);
-    expect(roomDoorPoints()).toHaveLength(0); // no phantom defaults
-    // …so the set may use the wall where the south door used to be.
-    const withDoors = layout().length;
-    bindDoorLayoutDoc(doc);
-    expect(layout().length).toBeGreaterThanOrEqual(withDoors);
+    expect(roomDoorPoints()).toHaveLength(0);
+    const noDoors = placeFitting(wantsLane, 6, 6, 't');
+    expect(noDoors).toHaveLength(1);
+    expect(noDoors[0].pos).toEqual({ x: 0, z: 4.8 });
+    expect(boxesOf(noDoors).some((b) => overlaps(b, southLane))).toBe(true);
+  });
+});
+
+describe('walkable overlays', () => {
+  it('fits the dance floor by its whole 4 m pad — inside the walls, off the furniture', () => {
+    const floor = layout().find((i) => i.kind === 'dance-floor')!;
+    expect(floor).toBeDefined();
+    expect(floor.pos.x + 2.05).toBeLessThanOrEqual(6 - 0.3);
+    expect(floor.pos.z + 2.05).toBeLessThanOrEqual(6 - 0.3);
+    // And nothing the set placed stands on it — the pad is kept clear while fitting.
+    const pad: Box = { x0: floor.pos.x - 2.05, z0: floor.pos.z - 2.05, x1: floor.pos.x + 2.05, z1: floor.pos.z + 2.05 };
+    for (const b of boxesOf(layout())) expect(overlaps(b, pad)).toBe(false);
   });
 });
 
