@@ -153,3 +153,18 @@ describe('the fitted set\'s terminal', () => {
     }
   });
 });
+
+describe('the default room', () => {
+  it('ships the whole party — cake, banner, floor, speaker, gifts, bar, sea — in a 2×2 module', () => {
+    const k = kinds(layout());
+    for (const need of ['beach-sea', 'beach-raft', 'cake-table', 'birthday-banner', 'dance-floor', 'party-speaker', 'gift-box', 'tiki-bar-counter', 'tiki-back-bar', 'tiki-bar-stool']) {
+      expect(k, `${need} missing from the default layout`).toContain(need);
+    }
+    // The speaker stands at the floor's end, off the pad.
+    const floor = layout().find((i) => i.kind === 'dance-floor')!;
+    const speaker = layout().find((i) => i.kind === 'party-speaker')!;
+    const pad: Box = { x0: floor.pos.x - 2.05, z0: floor.pos.z - 2.05, x1: floor.pos.x + 2.05, z1: floor.pos.z + 2.05 };
+    expect(overlaps(boxesOf([speaker])[0], pad)).toBe(false);
+    expect(Math.hypot(speaker.pos.x - floor.pos.x, speaker.pos.z - floor.pos.z)).toBeLessThan(4);
+  });
+});

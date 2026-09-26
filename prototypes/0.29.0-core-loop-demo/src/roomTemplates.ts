@@ -326,11 +326,18 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     { kind: "birthday-balloons", at: [0.06, -0.86] },
 
     // 💃 Somewhere to dance, and the switch for it.
-    { kind: "dance-floor", at: [0.68, -0.34] },
-    // On the floor's near edge: its back edge is where the cake cluster ends.
+    // The 4.1 m pad is fitted whole (OVERLAY_ENVELOPE), so its target is
+    // where it LANDS in a 2×2 module without a nudge: x 2.88 keeps the pad's
+    // west edge (0.85) east of the bar counter's end (0.6) and its east edge
+    // (4.93) west of the east door's lane (5.2); z −1.62 keeps its back edge
+    // (−3.67) off the gift boxes (−3.88). A nudge toward the centre was what
+    // ran it into the counter and the third stool, and the bar was lost
+    // (Copilot review, PR #169 — "default layout omits the party-2 speaker").
+    { kind: "dance-floor", at: [0.48, -0.27] },
     // Just OFF the pad's front edge (the pad is kept clear while fitting):
-    // the speaker stands at the floor's end, not on it.
-    { kind: "party-speaker", at: [0.68, 0.1] },
+    // the speaker stands at the floor's end, not on it — its box starts at
+    // z 0.82, the pad ends at 0.43 in a 2×2 module.
+    { kind: "party-speaker", at: [0.48, 0.22] },
 
     // 🍹 The bar, anchored in the FAR CORNER and laid out in metres from it so
     // the shelf, counter and stools keep their spacing in any room: shelf at
