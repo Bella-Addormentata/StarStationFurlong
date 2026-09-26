@@ -5229,10 +5229,11 @@ export class World {
     // balance has a single pusher writer. Every client ticks the room: it
     // watches the lease's renewals (how the panel tells a live operator), and
     // a client that may not operate stops operating there.
+    // The operator also drains removed cabinets there, once past its settling
+    // wait (closeCoinPusher).
     tickCoinPusherRoom(coinPushers.map((machine) => machine.id));
     // …and carry on with removed cabinets: the batched sweep of their
-    // per-player keys, and any teardown left to a session that has since gone
-    // away (closeCoinPusher).
+    // per-player keys.
     tickCoinPusherTeardowns();
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's

@@ -228,9 +228,9 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   (`refuseCoinPusherEmpty`). The panel goes by `pusher-door:<mid>`, since a
   request that merely vanished says nothing about whether the door opened.
 - **Removal.** Every client sees the cabinet go and stops operating it. The
-  records are cleared only by a deed-holder session that may operate the room
-  by the election's rule: the one holding its lease, or one that could take it
-  over. In one transaction (`drainAndClearCoinPusher`) that session pays the
+  records are cleared only by the room's operator, past its settling wait: by
+  then a previous holder's last settles have reached its doc. In one
+  transaction (`drainAndClearCoinPusher`) that session pays the
   chips still inside to the deed holder and deletes the machine's own keys, a
   fixed few. Its per-player keys (requests, answers, and any `pusher-esc:`
   records an earlier revision left) carry no chips. They are then swept a
@@ -242,9 +242,11 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   machine's keys never enter its walk, so they can neither be deleted nor keep
   it going. Every settle happens on the lease holder, so the drain never
   merges with a drop another tab is still settling (that would bring the
-  machine back and pay its chips twice). Another deed-holder session keeps the
-  teardown pending, and finishes it only if the operator goes away still
-  holding the lease (after the same wait as a takeover). A cabinet put back
+  machine back and pay its chips twice). Any other deed-holder session keeps
+  the teardown pending, and its room tick keeps the election going for it,
+  even with no cabinet left. It takes the lease once it may: at once if nobody
+  holds it, or after the same wait as a takeover if the operator goes away
+  still holding it. It drains once past its own settling wait. A cabinet put back
   first is left alone (its sweep stops too), and a pending teardown or sweep
   is dropped if the session moves to another room's doc, so it never touches
   either room's doc again. The recipient is the caller's own identity, never
