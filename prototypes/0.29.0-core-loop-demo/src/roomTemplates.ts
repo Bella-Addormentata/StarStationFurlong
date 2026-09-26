@@ -27,7 +27,7 @@
 
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
-  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList,
+  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList, wallMountHalfWidth,
   seaCorner, roomDoorPoints,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
@@ -611,10 +611,27 @@ export function findTemplate(id: string): RoomTemplate | null {
 function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
   if (!t.layout) return cloneItems(t.items);
   const half = roomHalfExtents();
+  // The terminal hangs on the south wall at the first half-metre station,
+  // outward from the usual 1.8, that no door claims (its opening + a post
+  // each side, plus the panel's half-width) — doors move, and a PLACE that
+  // hung the room's only edit entry across a doorway left it unusable
+  // (Copilot review, PR #169).
+  const doorHalf = 1.3;
+  const panelHalf = wallMountHalfWidth("wall-computer");
+  const doors = roomDoorPoints().filter((d) => Math.abs(d.z - half.halfZ) < 0.6);
+  const clear = (x: number) => doors.every((d) => Math.abs(d.x - x) >= doorHalf + panelHalf);
+  const stations: number[] = [];
+  const base = Math.min(1.8, Math.max(0, half.halfX - 1.0));
+  for (let k = 0; k * 0.5 <= half.halfX; k++) {
+    for (const x of [base + k * 0.5, base - k * 0.5]) {
+      if (Math.abs(x) <= half.halfX - 1.0 - panelHalf) stations.push(x);
+    }
+  }
+  const x = stations.find(clear) ?? base;
   const terminal: FurnitureItem = {
     id: `${t.id}-computer`,
     kind: "wall-computer",
-    pos: { x: Math.min(1.8, Math.max(0, half.halfX - 1.0)), z: half.halfZ - 0.03 },
+    pos: { x: +x.toFixed(2), z: half.halfZ - 0.03 },
     rot: 2,
     movable: true,
   };

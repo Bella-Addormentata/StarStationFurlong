@@ -98,12 +98,12 @@ import {
   voteTallyView,
   windowsView,
 } from "./treasuryView";
-import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
-import { bindPartyDoc } from "./partyDoc";
+import { bindPartyDoc, setPartyHostPredicate } from "./partyDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -8439,6 +8439,9 @@ async function init() {
   // shareholders only — 🔒 #141 removed the legacy 'Local-Clone' owner, so
   // pre-S2 rooms are now READ-ONLY for everyone. The reason string
   // resolves the owner's display name through the players map.
+  // 🔒 The party's host-gated writes (a guest's wish may be tidied by the
+  // host) ask the same owner seam edit mode does.
+  setPartyHostPredicate(() => canEditRoom().ok);
   setRoomEditPermission(() => {
     if (!yjsSync) return { ok: true }; // offline: your room
     // 🔒 #141: an absent owner is NOT the legacy marker and grants nothing.

@@ -262,23 +262,33 @@ export function closeGift(itemId: string): void {
   write(giftKey(itemId), { opened: false, byName: '' } satisfies GiftBox);
 }
 
+/** 🔒 Host authority for the party's gated writes. main.ts registers the
+ *  real check (the same room-owner seam edit mode funnels through); the
+ *  caller does not get to assert it (Copilot review, PR #169). Default:
+ *  not the host. */
+let hostPredicate: () => boolean = () => false;
+export function setPartyHostPredicate(predicate: () => boolean): void {
+  hostPredicate = predicate;
+}
+
 /**
  * 💌 Write the wish on a gift's tag. A box with no wish takes anyone's; a
- * box that has one is changed only by its writer or the room owner (the
- * host may tidy a tag, a guest may not overwrite another guest's). An empty
- * text, by someone allowed, takes the wish off. Gated HERE, not only in the
- * panel, so an edited client cannot scribble over the others' tags.
+ * box that has one is changed only by its writer or the room's HOST (the
+ * host may tidy a tag, a guest may not overwrite another guest's) — host
+ * authority comes from the registered room-owner predicate, never from the
+ * caller. An empty text, by someone allowed, takes the wish off. Gated HERE,
+ * not only in the panel, so an edited client cannot scribble over the
+ * others' tags.
  */
 export function writeGiftWish(
   itemId: string,
   text: string,
   myPub: string,
   myName: string,
-  isOwner: boolean,
 ): PartyAction {
   const cur = readGiftWish(itemId);
   const wish = text.replace(/\s+/g, ' ').trim().slice(0, MAX_WISH);
-  if (cur.wish && cur.wishBy !== myPub && !isOwner) {
+  if (cur.wish && cur.wishBy !== myPub && !hostPredicate()) {
     return { ok: false, error: `${cur.wishByName || 'Someone'} already wrote on this one.` };
   }
   if (!wish && !cur.wish) return { ok: false, error: 'Write a few words first.' };

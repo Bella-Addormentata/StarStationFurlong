@@ -190,7 +190,7 @@ export function createCakeTableUI(deps: PartyDeviceDeps): DeviceUI {
       hostBlock = `
         <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:10px; display:flex; flex-direction:column; gap:8px;">
           <div style="font-size:9px; color:${DIM}; letter-spacing:1.5px;">HOST — GUEST OF HONOUR</div>
-          <select data-honouree="1" style="
+          <select data-honouree="1" aria-label="Guest of honour" style="
             width:100%; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
             border-radius:5px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:11px; padding:5px 6px;">
             <option value=""${birthday === '' ? ' selected' : ''}>— nobody —</option>
@@ -260,7 +260,7 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
             : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 Leave a wish on the tag — it is read when the box is opened.</div>`}
          ${mayWrite
            ? `<div style="display:flex; gap:6px; margin-top:6px;">
-                <input data-wish="1" data-draft="wish" type="text" maxlength="${MAX_WISH}" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
+                <input data-wish="1" data-draft="wish" type="text" maxlength="${MAX_WISH}" aria-label="Wish on the gift tag" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
                   flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
                   border-radius:4px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:11px; padding:5px 7px;">
                 <button data-wish-save="1" style="background:rgba(212,168,75,0.12); border:1px solid rgba(212,168,75,0.4); border-radius:6px; color:${GOLD}; font-family:inherit; font-size:10px; font-weight:800; padding:0 9px; cursor:pointer;">${gift.wish ? 'SAVE' : 'WRITE'}</button>
@@ -288,7 +288,7 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
     const input = panel.querySelector<HTMLInputElement>('[data-wish]');
     const save = () => {
       if (!input) return;
-      const result = writeGiftWish(deps.itemId, input.value, me, deps.myName(), deps.canEdit());
+      const result = writeGiftWish(deps.itemId, input.value, me, deps.myName());
       if (!result.ok) showPanelNote(panel, result.error);
     };
     panel.querySelector<HTMLButtonElement>('[data-wish-save]')?.addEventListener('click', save);
