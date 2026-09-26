@@ -4260,7 +4260,13 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   const unsubscribers: Array<() => void> = [];
   let selectedHole: PusherHole = 1;
+  /** The last action's message: its answer, or why it wasn't done. It stays
+   *  until the next action, or until the machine's state moves on (the
+   *  operator's state, or whether DROP is open), since it may have been about
+   *  exactly that state. */
   let flash = '';
+  /** That state as the panel first showed `flash` (null until then). */
+  let flashShownIn: string | null = null;
   let timingNote = '';
   /** My request in flight (DROP is disabled while it is set). */
   let pending: string | null = null;
@@ -4278,6 +4284,11 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let shownOperator: CoinPusherOperatorState | null = null;
   const myId = getPlayerId();
 
+  const say = (message: string): void => {
+    flash = message;
+    flashShownIn = null;
+  };
+
   const stopExpiry = (): void => {
     if (expiryTimer) window.clearTimeout(expiryTimer);
     expiryTimer = 0;
@@ -4290,7 +4301,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     stopExpiry();
     cancelCoinPusherRequest(deps.itemId, myId, pending);
     pending = null;
-    flash = message;
+    say(message);
     render();
   };
 
@@ -4306,16 +4317,16 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     if (!state || operator !== 'ready') {
       // A drop made while the operator is still starting up would reach it
       // too late to keep its timing.
-      flash = operator === 'starting'
+      say(operator === 'starting'
         ? 'THE MACHINE IS STARTING UP — ONE MOMENT'
-        : 'MACHINE OFFLINE — ITS OWNER RUNS IT';
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
     } else if (pending || readCoinPusherRequest(deps.itemId, myId)) {
-      flash = 'YOUR LAST CHIP IS STILL DROPPING';
+      say('YOUR LAST CHIP IS STILL DROPPING');
     } else if (readChips(myId) < PUSHER_ANTE) {
-      flash = 'NO CHIPS — VISIT THE CASHIER';
+      say('NO CHIPS — VISIT THE CASHIER');
       deps.onMessage?.('NO CHIPS');
     } else if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) {
-      flash = PUSHER_REFUSAL_TEXT['machine-full'];
+      say(PUSHER_REFUSAL_TEXT['machine-full']);
     } else {
       const requestedAt = Date.now();
       const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
@@ -4335,10 +4346,10 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
         );
         lastPaid = null;
         timingNote = '';
-        flash = 'DROPPING…';
+        say('DROPPING…');
         deps.onMessage?.('DROP');
       } else {
-        flash = 'YOUR LAST CHIP IS STILL DROPPING';
+        say('YOUR LAST CHIP IS STILL DROPPING');
       }
     }
     render();
@@ -4347,17 +4358,17 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   const openDoor = (): void => {
     const state = readCoinPusherState(deps.itemId);
     if (!state || state.ownerId !== myId) {
-      flash = 'ONLY THE OWNER HAS THE KEY';
+      say('ONLY THE OWNER HAS THE KEY');
     } else if (coinPusherOperatorState() === 'offline') {
-      flash = 'MACHINE OFFLINE — TRY AGAIN IN A MOMENT';
+      say('MACHINE OFFLINE — TRY AGAIN IN A MOMENT');
     } else if (door || readCoinPusherEmptyRequest(deps.itemId)) {
-      flash = 'THE DOOR IS ALREADY OPENING';
+      say('THE DOOR IS ALREADY OPENING');
     } else {
       const requestedAt = Date.now();
       const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
       if (writeCoinPusherEmptyRequest(deps.itemId, { requestId, requester: myId, requestedAt })) {
         door = requestId;
-        flash = 'OPENING THE DOOR…';
+        say('OPENING THE DOOR…');
       }
     }
     render();
@@ -4373,13 +4384,13 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       watching = null;
       if (result.kind === 'drop') {
         lastPaid = result.paid;
-        flash = result.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME';
+        say(result.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME');
         timingNote = result.honored
           ? 'YOUR TIMING WAS KEPT'
           : 'TOO LATE, OR THIS DEVICE\'S CLOCK IS OFF — IT DROPPED WHERE THE PUSHER WAS';
         deps.onMessage?.(result.paid > 0 ? 'WINNER' : 'DROP');
       } else {
-        flash = PUSHER_REFUSAL_TEXT[result.reason];
+        say(PUSHER_REFUSAL_TEXT[result.reason]);
       }
     } else if (pending && readCoinPusherRequest(deps.itemId, myId)?.requestId !== pending) {
       // Gone without an answer: withdrawn here, in another tab, or by the
@@ -4387,19 +4398,19 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       // withdrawal still shows.
       stopExpiry();
       pending = null;
-      flash = 'YOUR DROP WAS WITHDRAWN';
+      say('YOUR DROP WAS WITHDRAWN');
     }
     if (door) {
       // The operator answers in the transaction that clears the request, so
       // a request gone without this answer tells us nothing about the door.
       const answer = readCoinPusherDoorResult(deps.itemId);
       if (answer?.requestId === door) {
-        flash = answer.kind === 'refused' ? 'THE DOOR STAYED SHUT — ONLY THE OWNER HAS THE KEY'
+        say(answer.kind === 'refused' ? 'THE DOOR STAYED SHUT — ONLY THE OWNER HAS THE KEY'
           : answer.emptied > 0 ? 'DOOR OPENED — THE CHIPS ARE ON YOUR RACK'
-            : 'THE DOOR OPENED ON AN EMPTY MACHINE';
+            : 'THE DOOR OPENED ON AN EMPTY MACHINE');
         door = null;
       } else if (readCoinPusherEmptyRequest(deps.itemId)?.requestId !== door) {
-        flash = 'NO ANSWER FROM THE DOOR — TRY AGAIN';
+        say('NO ANSWER FROM THE DOOR — TRY AGAIN');
         door = null;
       }
     }
@@ -4442,6 +4453,12 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const operator = coinPusherOperatorState();
     shownOperator = operator;
     const online = state !== null && operator === 'ready';
+    const chips = readChips(myId);
+    const full = state !== null && chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS;
+    const dropOpen = online && pending === null && chips >= PUSHER_ANTE && !full;
+    const shownIn = `${operator}|${dropOpen}`;
+    if (flashShownIn === null) flashShownIn = shownIn;
+    else if (flashShownIn !== shownIn) flash = '';
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
     status.textContent = flash || (online ? 'PICK A HOLE AND TIME YOUR DROP'
       : operator === 'starting' ? 'THE MACHINE IS STARTING UP…'
@@ -4458,9 +4475,7 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
       if (mark) mark.style.background = i === selectedHole ? '#D4A84B' : '#3A424C';
     }
     const insertBtn = panel.querySelector<HTMLButtonElement>('#cp-insert')!;
-    const chips = readChips(myId);
-    const full = state !== null && chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS;
-    insertBtn.disabled = !online || pending !== null || chips < PUSHER_ANTE || full;
+    insertBtn.disabled = !dropOpen;
     insertBtn.textContent = operator === 'starting' ? 'STARTING UP…'
       : !online ? 'MACHINE OFFLINE'
         : pending ? 'DROPPING…'
