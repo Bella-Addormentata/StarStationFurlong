@@ -21,8 +21,8 @@ import {
   readGift, openGift, closeGift, writeGiftWish, MAX_WISH,
   readSpeaker, toggleSpeaker, setSpeakerTrack,
   readBirthdayPub, setBirthdayPub,
-  subscribeParty,
-  cakeKey, giftKey, speakerKey,
+  subscribeParty, subscribePartyKey,
+  cakeKey, giftKey, giftWishKey, speakerKey,
 } from './partyDoc';
 
 const GOLD = '#d4a84b';
@@ -93,11 +93,30 @@ function title(text: string, sub: string): string {
 function panelUI(
   id: string,
   render: (panel: HTMLDivElement) => void,
+  /** Party keys this panel shows; omitted = repaint on ANY party write. */
+  keys?: string[],
 ): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
   const repaint = (): void => {
-    if (panel) render(panel);
+    if (!panel) return;
+    // A repaint replaces the DOM. Whatever the guest was TYPING in a text
+    // field comes back afterwards, with the caret, so a peer's write cannot
+    // eat an unsaved draft (Copilot review, PR #169).
+    const active = document.activeElement as HTMLInputElement | null;
+    const draft =
+      active && active.tagName === 'INPUT' && active.type === 'text' && panel.contains(active)
+        ? { name: active.dataset.draft ?? '', value: active.value, start: active.selectionStart, end: active.selectionEnd }
+        : null;
+    render(panel);
+    if (draft && draft.name) {
+      const again = panel.querySelector<HTMLInputElement>(`input[data-draft="${draft.name}"]`);
+      if (again) {
+        again.value = draft.value;
+        again.focus();
+        try { again.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
+      }
+    }
   };
   return {
     mount(host: HTMLElement): void {
@@ -106,9 +125,15 @@ function panelUI(
       panel.style.cssText = PANEL_CSS;
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
-      // Repaint on ANY party write: a peer blowing the candles must update the
-      // panel I am standing in front of.
-      unsubscribe = subscribeParty(repaint);
+      // Repaint on the writes this panel shows (a peer blowing the candles
+      // must update the panel I am standing in front of) — and only those,
+      // so unrelated party traffic does not churn it.
+      if (keys && keys.length) {
+        const subs = keys.map((k) => subscribePartyKey(k, repaint));
+        unsubscribe = () => { for (const s of subs) s(); };
+      } else {
+        unsubscribe = subscribeParty(repaint);
+      }
       repaint();
     },
     unmount(): void {
@@ -235,7 +260,7 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
             : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 Leave a wish on the tag — it is read when the box is opened.</div>`}
          ${mayWrite
            ? `<div style="display:flex; gap:6px; margin-top:6px;">
-                <input data-wish="1" type="text" maxlength="${MAX_WISH}" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
+                <input data-wish="1" data-draft="wish" type="text" maxlength="${MAX_WISH}" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
                   flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
                   border-radius:4px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:11px; padding:5px 7px;">
                 <button data-wish-save="1" style="background:rgba(212,168,75,0.12); border:1px solid rgba(212,168,75,0.4); border-radius:6px; color:${GOLD}; font-family:inherit; font-size:10px; font-weight:800; padding:0 9px; cursor:pointer;">${gift.wish ? 'SAVE' : 'WRITE'}</button>
@@ -272,7 +297,7 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
       if (e.key === 'Enter') save();
     });
     input?.addEventListener('keyup', (e) => e.stopPropagation());
-  });
+  }, [giftKey(deps.itemId), giftWishKey(deps.itemId)]);
 }
 
 // ── 🔊 The speaker ───────────────────────────────────────────────────────────
@@ -309,7 +334,7 @@ export function createPartySpeakerUI(deps: PartyDeviceDeps): DeviceUI {
         toggleSpeaker(deps.itemId);
       }
     });
-  });
+  }, [speakerKey(deps.itemId)]);
   return {
     ...ui,
     mount(host: HTMLElement): void {

@@ -35,6 +35,9 @@ export interface Track {
   title: string;
   credit: string;
   file: string | null;
+  /** Beats per minute — exact for the music box (its score), listened-for
+   *  on the recordings (they carry no tempo data). The dancer's clock. */
+  bpm: number;
 }
 export const TRACKS: Track[] = [
   {
@@ -42,24 +45,28 @@ export const TRACKS: Track[] = [
     title: 'Happy Birthday — sung (English & German)',
     credit: 'Alexander Stephens & Hanns Christian Müller · CC BY-SA 3.0 · Wikimedia Commons',
     file: '/audio/happy-birthday-sung.ogg',
+    bpm: 72,
   },
   {
     id: 'choir',
     title: 'Happy Birthday — choir',
     credit: 'Tom Kincaid / VOLE.wtf · CC0',
     file: '/audio/happy-birthday-choir.mp3',
+    bpm: 100,
   },
   {
     id: 'jazz',
     title: 'Happy Birthday — jazz trio',
     credit: 'Tom Kincaid / VOLE.wtf · CC0',
     file: '/audio/happy-birthday-jazz-trio.mp3',
+    bpm: 120,
   },
   {
     id: 'music-box',
     title: 'Happy Birthday — music box',
     credit: 'synthesised in WebAudio',
     file: null,
+    bpm: 92, // == TEMPO_BPM
   },
 ];
 export function trackById(id: string): Track {
@@ -243,6 +250,9 @@ export interface SpeakerVoice {
   update(dt: number, state: { on: boolean; inRoom: boolean; distance: number; track?: string }): void;
   /** Is anything sounding right now (the entry round or the loop)? */
   playing(): boolean;
+  /** 🕺 Where the music is: beats since the current round began, and the
+   *  track's tempo — null between rounds. What the dancer keeps time to. */
+  beat(): { beat: number; bpm: number } | null;
   /** 🔇 Stop, locally: fades out whatever is sounding, including the entry
    *  round. The loop only resumes if the doc switch is turned on again. */
   stop(): void;
@@ -262,6 +272,11 @@ export function stopSpeakerLocally(itemId: string): void {
   voices.get(itemId)?.stop();
 }
 
+/** 🕺 The beat this speaker is on right now (null while silent). */
+export function speakerBeat(itemId: string): { beat: number; bpm: number } | null {
+  return voices.get(itemId)?.beat() ?? null;
+}
+
 /** Full volume within this radius of the speaker… */
 const NEAR_M = 3;
 /** …fading to FAR_GAIN at this radius. */
@@ -275,6 +290,11 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
   let live: OscillatorNode[] = []; // everything scheduled and not yet stopped
   let roundEnd = -1; // ctx time the current/last round ends; <0 = none
   let wasInRoom = false;
+  /** Seconds the player has been continuously OUT of the room. Presence
+   *  blinks for a frame or two as a room builds (the walk-in flipped
+   *  true → false → true a second apart), and that blink paused the entry
+   *  recording before it had started — so "left" needs 0.6 s of absence. */
+  let away = 0;
   let looping = false;
   /** Set by stop(): the doc switch has to go off→on again to restart. */
   let held = false;
@@ -285,6 +305,9 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
   let audio: HTMLAudioElement | null = null;
   let audioSrc: MediaElementAudioSourceNode | null = null;
   let fileBroken = false;
+  /** The current round was started on the recording (so a refused play()
+   *  means "fall back", once) — cleared the moment the music box takes over. */
+  let fileRound = false;
   let pauseTimer: ReturnType<typeof setTimeout> | null = null;
 
   const graph = (): boolean => {
@@ -340,10 +363,15 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
         const delayMs = Math.max(0, (t0 - ctx.currentTime) * 1000);
         roundStart = t0;
         roundEnd = t0 + (Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 60);
+        fileRound = true;
         const go = () => {
           if (!audio || audio !== el) return;
           el.currentTime = 0;
-          el.play().catch(() => { fileBroken = true; });
+          el.play().catch((e: unknown) => {
+            fileBroken = true;
+            const err = e as { name?: string; message?: string } | undefined;
+            console.warn('[partyAudio] the recording would not play — music box instead:', err?.name, err?.message);
+          });
         };
         // Timers are throttled in background tabs; anything under a beat or
         // so starts now rather than late.
@@ -356,14 +384,16 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
     }
     // The music box never plays over a recording.
     if (audio) { audio.pause(); if (pauseTimer) { clearTimeout(pauseTimer); pauseTimer = null; } }
+    fileRound = false;
     const r = scheduleRound(ctx, master, t0);
     live.push(...r.oscs);
+    roundStart = t0;
     roundEnd = r.end;
     // Forget oscillators that have surely finished.
     if (live.length > 600) live = live.slice(-400);
   };
 
-  const silence = (fadeSeconds: number) => {
+  const silence = (fadeSeconds: number, _why: string) => {
     if (!ctx || !master) return;
     const now = ctx.currentTime;
     master.gain.cancelScheduledValues(now);
@@ -394,15 +424,19 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
         const wanted = looping || (ctx !== null && roundEnd > 0 && ctx.currentTime < roundEnd);
         trackId = track;
         fileBroken = false;
-        if (wanted) { silence(0.3); startRound(ctx ? ctx.currentTime + 0.35 : 0); }
+        if (wanted) { silence(0.3, 'track-switch'); startRound(ctx ? ctx.currentTime + 0.35 : 0); }
       }
       if (!inRoom) {
-        if (wasInRoom) silence(0.6);
-        wasInRoom = false;
-        looping = false;
-        held = false;
+        away += _dt;
+        if (wasInRoom && away > 0.6) {
+          silence(0.6, 'left-room');
+          wasInRoom = false;
+          looping = false;
+          held = false;
+        }
         return;
       }
+      away = 0;
       // 🎉 The fox has just walked in: strike up, whatever the switch says.
       if (!wasInRoom) {
         wasInRoom = true;
@@ -415,12 +449,16 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
       } else if (!on && looping) {
         looping = false;
         // The switch is a stop, not a "finish the verse": fade out now.
-        silence(0.8);
+        silence(0.8, 'switch-off');
       }
       if (!ctx || !master) return;
       const now = ctx.currentTime;
-      // A recording that failed to load: fall back to the music box now.
-      if (fileBroken && audio && roundEnd > 0 && audio.paused && now < roundEnd) {
+      // A recording that failed to load or play: fall back to the music box
+      // — ONCE. `fileRound` is what makes this edge-triggered: the synth
+      // round clears it, so this cannot re-arm every frame (it did, and
+      // scheduled a fresh round of oscillators per frame — caught while
+      // verifying PR #169's beat sync).
+      if (fileBroken && fileRound && audio && audio.paused && roundEnd > 0 && now < roundEnd) {
         roundEnd = -1;
         startRound(0);
       }
@@ -436,13 +474,25 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
     playing() {
       return !!ctx && roundEnd > 0 && ctx.currentTime < roundEnd + 1.5;
     },
+    beat() {
+      if (!ctx || roundEnd < 0 || ctx.currentTime >= roundEnd) return null;
+      const track = trackById(trackId);
+      // A recording reports its own clock (it may have started late, loading);
+      // the music box runs on the context clock it was scheduled against.
+      const onFile = fileRound && !!audio && !audio.paused;
+      const seconds = onFile ? audio!.currentTime : ctx.currentTime - roundStart;
+      // Between the music box's tempo and the recording's: whichever is sounding.
+      const bpm = onFile ? track.bpm : TEMPO_BPM;
+      if (seconds < 0) return null;
+      return { beat: (seconds * bpm) / 60, bpm };
+    },
     stop() {
-      silence(0.5);
+      silence(0.5, 'stop');
       looping = false;
       held = true;
     },
     dispose() {
-      silence(0.3);
+      silence(0.3, 'dispose');
       if (audio) { const el = audio; setTimeout(() => { el.pause(); el.removeAttribute('src'); el.load(); }, 400); audio = null; }
       if (audioSrc) { const src = audioSrc; setTimeout(() => src.disconnect(), 500); audioSrc = null; }
       if (master) {

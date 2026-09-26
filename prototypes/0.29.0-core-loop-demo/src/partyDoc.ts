@@ -11,7 +11,8 @@
  *   birthday            → string   the guest of honour's identity pubkey
  *                                  (base64url, keypair.ts). '' ⇒ nobody yet.
  *   cake:<itemId>       → CakeState    { lit, candles }
- *   gift:<itemId>       → GiftState    { opened, byName }
+ *   gift:<itemId>       → { opened, byName }
+ *   giftwish:<itemId>   → { wish, wishBy, wishByName } — the tag, its own record
  *   speaker:<itemId>    → SpeakerState { on }
  *
  * WHY A PUBKEY AND NOT A PLAYER ID: player ids are per-session, so a birthday
@@ -63,7 +64,6 @@ export const DEFAULT_CANDLES = 5;
 const MAX_CANDLES = 12;
 
 const CAKE_DEFAULT: CakeState = { lit: true, candles: DEFAULT_CANDLES };
-const GIFT_DEFAULT: GiftState = { opened: false, byName: '', wish: '', wishBy: '', wishByName: '' };
 export const DEFAULT_TRACK = 'sung';
 const SPEAKER_DEFAULT: SpeakerState = { on: true, track: DEFAULT_TRACK };
 
@@ -224,37 +224,42 @@ export function relightCandles(itemId: string, candles = DEFAULT_CANDLES): void 
 export function giftKey(itemId: string): string {
   return `gift:${itemId}`;
 }
+/** 💌 The tag is its OWN record: a wish written while someone else opens the
+ *  box must not lose to that write (whole-value LWW per key — Copilot review,
+ *  PR #169). readGift merges the two. */
+export function giftWishKey(itemId: string): string {
+  return `giftwish:${itemId}`;
+}
 
+type GiftBox = Pick<GiftState, 'opened' | 'byName'>;
+type GiftWish = Pick<GiftState, 'wish' | 'wishBy' | 'wishByName'>;
+const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
+function readGiftBox(itemId: string): GiftBox {
+  const raw = ensureMap().get(giftKey(itemId)) as Partial<GiftBox> | undefined;
+  if (!raw || typeof raw !== 'object') return { opened: false, byName: '' };
+  return { opened: raw.opened === true, byName: str(raw.byName, 32) };
+}
+function readGiftWish(itemId: string): GiftWish {
+  const raw = ensureMap().get(giftWishKey(itemId)) as Partial<GiftWish> | undefined;
+  if (!raw || typeof raw !== 'object') return { wish: '', wishBy: '', wishByName: '' };
+  return { wish: str(raw.wish, MAX_WISH), wishBy: str(raw.wishBy, 128), wishByName: str(raw.wishByName, 32) };
+}
 export function readGift(itemId: string): GiftState {
-  const raw = ensureMap().get(giftKey(itemId)) as Partial<GiftState> | undefined;
-  if (!raw || typeof raw !== 'object') return { ...GIFT_DEFAULT };
-  const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
-  return {
-    opened: raw.opened === true,
-    byName: str(raw.byName, 32),
-    wish: str(raw.wish, MAX_WISH),
-    wishBy: str(raw.wishBy, 128),
-    wishByName: str(raw.wishByName, 32),
-  };
+  return { ...readGiftBox(itemId), ...readGiftWish(itemId) };
 }
 
 /** Anyone may open a gift — it is the small, ungated echo of the cake moment.
  *  The wish on the tag survives the opening: that is when it gets read. */
 export function openGift(itemId: string, myName: string): PartyAction {
-  const cur = readGift(itemId);
-  if (cur.opened) return { ok: false, error: 'Already opened.' };
-  write(giftKey(itemId), {
-    ...cur,
-    opened: true,
-    byName: (myName || 'A clone').slice(0, 32),
-  } satisfies GiftState);
+  if (readGiftBox(itemId).opened) return { ok: false, error: 'Already opened.' };
+  write(giftKey(itemId), { opened: true, byName: (myName || 'A clone').slice(0, 32) } satisfies GiftBox);
   return { ok: true };
 }
 
-/** Wrap it again (owner): closed, nobody's — the wish stays on the tag. */
+/** Wrap it again (owner): closed, nobody's — the wish stays on the tag
+ *  (its own key, untouched here). */
 export function closeGift(itemId: string): void {
-  const cur = readGift(itemId);
-  write(giftKey(itemId), { ...GIFT_DEFAULT, wish: cur.wish, wishBy: cur.wishBy, wishByName: cur.wishByName });
+  write(giftKey(itemId), { opened: false, byName: '' } satisfies GiftBox);
 }
 
 /**
@@ -271,18 +276,17 @@ export function writeGiftWish(
   myName: string,
   isOwner: boolean,
 ): PartyAction {
-  const cur = readGift(itemId);
+  const cur = readGiftWish(itemId);
   const wish = text.replace(/\s+/g, ' ').trim().slice(0, MAX_WISH);
   if (cur.wish && cur.wishBy !== myPub && !isOwner) {
     return { ok: false, error: `${cur.wishByName || 'Someone'} already wrote on this one.` };
   }
   if (!wish && !cur.wish) return { ok: false, error: 'Write a few words first.' };
-  write(giftKey(itemId), {
-    ...cur,
+  write(giftWishKey(itemId), {
     wish,
     wishBy: wish ? myPub : '',
     wishByName: wish ? (myName || 'A clone').slice(0, 32) : '',
-  } satisfies GiftState);
+  } satisfies GiftWish);
   return { ok: true };
 }
 

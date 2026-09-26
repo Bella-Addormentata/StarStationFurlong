@@ -68,6 +68,9 @@ describe('the recordings', () => {
     expect(TRACKS[3].file).toBeNull();
     // Every recording names its performer and licence (public/audio/LICENSES.md).
     for (const t of TRACKS.filter((t) => t.file)) expect(t.credit).toMatch(/CC BY-SA|CC0/);
+    // Every track carries the tempo the dancer keeps; the music box's is its score's.
+    for (const t of TRACKS) expect(t.bpm).toBeGreaterThanOrEqual(60);
+    expect(trackById('music-box').bpm).toBe(TEMPO_BPM);
   });
 
   it('cycles tracks and falls back to the first for an unknown id', () => {

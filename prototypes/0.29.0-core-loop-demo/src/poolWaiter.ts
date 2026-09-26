@@ -23,7 +23,7 @@ import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
 import { FURNITURE } from "./furniture";
 import { readSpeaker } from "./partyDoc";
-import { isSpeakerPlaying } from "./partyAudio";
+import { isSpeakerPlaying, speakerBeat } from "./partyAudio";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -157,6 +157,9 @@ const COACH_REST_LINES: readonly string[] = [
  *  spin, and a punch-the-air cheer with a shouted line. Every move's pose is
  *  a half-sine per beat, so it starts and ends at neutral and the joins are
  *  clean. Off the music the dancer waits on the floor and asks for a song. */
+/** Fallback tempo when no speaker reports a beat (the doc switch is on but
+ *  this client's voice is between rounds) — otherwise the dancer keeps time
+ *  to the speaker's playback (partyAudio speakerBeat). */
 const DANCE_BPM = 100;
 /** 👙 Bikini colours: the service red, and the dancer's black (owner request 2026-09-26). */
 const BIKINI_RED = 0xe0243a;
@@ -312,6 +315,9 @@ export class PoolWaiter {
   private danceStepBeat = 0;
   private danceCheerSaid = false;
   private danceWaitTimer = DANCE_WAIT_EVERY;
+  /** Heading at the start of the turn phrase — the turn is a function of
+   *  the phrase's progress, not of frame time. */
+  private danceTurnFrom = 0;
   /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
    *  walk goal (routes around furniture / through door openings instead of
    *  clipping straight through), and the goal they were computed for. */
@@ -898,15 +904,34 @@ export class PoolWaiter {
       return;
     }
     this.danceWaitTimer = DANCE_WAIT_EVERY; // ask again the moment it stops
-    const beatSecs = 60 / DANCE_BPM;
-    this.danceStepBeat += dt / beatSecs;
-    let step = DANCE_STEPS[this.danceStepIdx];
-    if (this.danceStepBeat >= step.beats) {
-      this.danceStepBeat -= step.beats;
-      this.danceStepIdx = (this.danceStepIdx + 1) % DANCE_STEPS.length;
-      this.danceCheerSaid = false;
-      step = DANCE_STEPS[this.danceStepIdx];
+    // 🕺 Keep time to the MUSIC: the first speaker with a live beat sets the
+    // phrase and the position in it, so the knees land on the recording's
+    // beats and every client dancing to the same file is in step. With no
+    // beat to read (between rounds), free-run at the fallback tempo.
+    const live = FURNITURE.map((i) => (i.kind === "party-speaker" ? speakerBeat(i.id) : null)).find((b) => b !== null) ?? null;
+    const total = DANCE_STEPS.reduce((n, st) => n + st.beats, 0);
+    const prevIdx = this.danceStepIdx;
+    if (live) {
+      let rem = live.beat % total;
+      let idx = 0;
+      while (rem >= DANCE_STEPS[idx].beats) {
+        rem -= DANCE_STEPS[idx].beats;
+        idx = (idx + 1) % DANCE_STEPS.length;
+      }
+      this.danceStepIdx = idx;
+      this.danceStepBeat = rem;
+    } else {
+      this.danceStepBeat += dt / (60 / DANCE_BPM);
+      if (this.danceStepBeat >= DANCE_STEPS[this.danceStepIdx].beats) {
+        this.danceStepBeat -= DANCE_STEPS[this.danceStepIdx].beats;
+        this.danceStepIdx = (this.danceStepIdx + 1) % DANCE_STEPS.length;
+      }
     }
+    if (this.danceStepIdx !== prevIdx) {
+      this.danceCheerSaid = false;
+      this.danceTurnFrom = this.heading;
+    }
+    const step = DANCE_STEPS[this.danceStepIdx];
     const b = this.danceStepBeat;
     const TAU = Math.PI * 2;
     // The phrase's feature fades in over its first beat and out over its last.
@@ -948,10 +973,11 @@ export class PoolWaiter {
         break;
       }
       case "turn": {
-        // One smooth full turn across the phrase: the rate follows 6p(1−p),
-        // which starts from rest, peaks mid-turn and lands back at rest.
-        const pr = b / step.beats;
-        this.heading += (TAU * 6 * pr * (1 - pr)) / (step.beats * beatSecs) * dt;
+        // One smooth full turn across the phrase, as a function of where the
+        // phrase IS (smoothstep: from rest, fastest mid-turn, back to rest) —
+        // so it stays in step with the music however the frames fall.
+        const pr = Math.min(1, b / step.beats);
+        this.heading = this.danceTurnFrom + TAU * pr * pr * (3 - 2 * pr);
         yaw = this.heading;
         armLZ += e * (-0.7 - armLZ);
         armRZ += e * (0.7 - armRZ);
