@@ -16,12 +16,25 @@
  * The lobby / casino / pool built-ins reuse the EXACT manifests the two
  * originally-authored rooms shipped, so provisioning one reproduces them.
  *
- * Not yet: R2 room-size presets.
+ * THE ROOM'S STRUCTURE IS NEVER A TEMPLATE'S TO CHANGE (owner ruling
+ * 2026-09-20). A module's envelope, walls and doors are fixed when it is born;
+ * every room carries its own base furnishing (Alluxia's Home keeps its stock
+ * lounge, an Empty Room its one terminal), and a set is something you put ON
+ * TOP of that. So templates never write floorPlan, and the additive path —
+ * addRoomTemplateItems, fitted to the room's real extents — is the one to
+ * reach for. A resize-carrying `dims` field was tried and removed.
  */
 
-import type { FurnitureItem, RoomTheme } from "./furniture";
-import { FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE } from "./furniture";
-import { replaceAllFurniture, readAllFurniture } from "./furnitureDoc";
+import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
+import {
+  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList, wallMountHalfWidth,
+  seaCorner, roomDoorPoints, itemOccupancyBox, itemAabb,
+} from "./furniture";
+import { replaceAllFurniture, readAllFurniture, addFurniture, deleteFurnitureItems, peerIdTag } from "./furnitureDoc";
+import { writeRobotConfig, type RobotRoutine } from "./robotDoc";
+import { roomHalfExtents } from "./floorPlanDoc";
+import { doorSetIsAuthoritative } from "./doorLayoutDoc";
+import { PLAYER_R } from "./player";
 
 /** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
  *  room's theme into its own roomInfo doc, so "this module is a casino now"
@@ -31,6 +44,7 @@ export function setRoomThemeWriter(cb: (theme: RoomTheme) => void): void {
   roomThemeWriter = cb;
 }
 
+
 /** The room "type"; each can have multiple design variants (casino-1, -2, …).
  *  "blank" is the empty starting point (folds in empty-by-default); "deck" is
  *  an open-air sky terrace (outdoor-deck theme without a pool). */
@@ -39,7 +53,8 @@ export type TemplateCategory =
   | "lobby"
   | "casino"
   | "pool"
-  | "deck";
+  | "deck"
+  | "party";
 
 export interface RoomTemplate {
   /** Unique variant id, `${category}-${n}` (e.g. "casino-1", "pool-2"). */
@@ -56,6 +71,397 @@ export interface RoomTemplate {
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
   theme: RoomTheme;
+  /** 🤖 The routine every charging-dock this template places is configured
+   *  with when it lands (PLACE, provisioning and + ADD alike). Robots come
+   *  only from placed docks, and an unconfigured dock serves drinks: a party
+   *  set that advertises a dancer has to bring the dock AND set it dancing
+   *  (Copilot review, PR #169). */
+  dockRoutine?: RobotRoutine;
+  /**
+   * 🧩 A layout GENERATED for the room it is going into, instead of the fixed
+   * `items` list. A room's structure is fixed once it is built — you cannot
+   * resize it, you can only put things in it — so a set that is worth adding
+   * to somebody's existing room has to fit the room they actually have. The
+   * generator is handed the real half-extents and places what fits, in
+   * priority order, skipping what does not. See layoutBeachParty.
+   */
+  layout?: (half: { halfX: number; halfZ: number }, seed?: readonly Box[]) => FurnitureItem[];
+}
+
+// ── 🧩 Fitted layouts ────────────────────────────────────────────────────────
+
+/** One thing to try to place, at a position given as a FRACTION of the room's
+ *  half-extents so the same recipe works in a 12 m room and a 30 m one. */
+export interface PlacementSpec {
+  kind: FurnitureKind;
+  /** Target, in room-fractions: [-1, 1] on each axis. Ignored with `over`. */
+  at?: [number, number];
+  /** Hangs over the most recently placed piece of THAT kind in this set: its
+   *  target is where that piece LANDED (plus `off`), never nudged, and it is
+   *  left out when that piece did not land. The banner is strung over the
+   *  cake — the cake as fitted, not the cake's first choice: with the target
+   *  taken, the cake was nudged and the banner still hung at the old spot,
+   *  through whatever stood there (Copilot review, PR #169). */
+  over?: FurnitureKind;
+  /** Metres added AFTER the fraction — for rigid clusters. A bar counter and
+   *  the shelf behind it are a fixed distance apart in any room; fractions
+   *  would squeeze them together in a small one and tear them apart in a big
+   *  one. Anchor the cluster with `at`, lay it out with `off`. */
+  off?: [number, number];
+  rot?: Rot;
+  /** Spans the room on purpose (the sea, a bridge) — skip the bounds check;
+   *  crossing the room is the point. It still yields to furniture already
+   *  standing where it would go. */
+  spanning?: boolean;
+  /** Rigid group: if any member fails to place, the whole group is dropped.
+   *  A pergola roof with two of its four posts is not a pergola. */
+  group?: string;
+  /** Stands AGAINST the wall (a hedge): its box may run into the wall line
+   *  (the part beyond it is inside the wall, harmless), and it is never
+   *  nudged toward the centre — off the wall it is not a hedge. */
+  hugWall?: boolean;
+  /** Hangs ABOVE the furniture it is placed over (the banner strung over the
+   *  cake, the pergola roof over its posts and the bar): a footprintless
+   *  item is otherwise refused wherever its centre is inside an occupied
+   *  box, which nudged the banner off the cake (Copilot review, PR #169). */
+  overhead?: boolean;
+}
+
+function boxesOverlap(a: Box, b: Box): boolean {
+  return a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
+}
+
+/** Footprintless kinds that still cover ground when FITTED: their full extent
+ *  is checked against the walls and the furniture, though they block nothing
+ *  once placed. */
+const OVERLAY_ENVELOPE: Partial<Record<FurnitureKind, { w: number; d: number }>> = {
+  "dance-floor": { w: 4.1, d: 4.1 },
+};
+const OVERLAY_MARGIN = 0.3; // a pad may lie closer to a wall than a chair, but not in it
+
+/** Everything already in the room that a fitted set must keep off: every
+ *  obstacle box (generated ones included), the slab of every wall-hung piece
+ *  — the terminal, a rose — which has no floor box and so was invisible to
+ *  + ADD (a hedge could be generated over the terminal; Copilot review,
+ *  PR #169), and the pad of every walkable overlay. */
+export function roomOccupancy(items: readonly FurnitureItem[]): Box[] {
+  const slabs: Box[] = [];
+  for (const it of items) {
+    if (itemAabb(it)) continue; // on the floor: buildObstacleList has it
+    const slab = itemOccupancyBox(it);
+    if (slab) slabs.push(slab);
+  }
+  return [...buildObstacleList([...items]), ...slabs, ...overlayEnvelopeBoxes(items)];
+}
+
+/** The pads of walkable overlays ALREADY in the room, boxed the way
+ *  placeFitting boxes a candidate one. buildObstacleList leaves footprintless
+ *  items out, so without these + ADD would lay a set straight across an
+ *  existing dance floor (Copilot review, PR #169). */
+export function overlayEnvelopeBoxes(items: readonly FurnitureItem[]): Box[] {
+  const out: Box[] = [];
+  for (const it of items) {
+    const env = OVERLAY_ENVELOPE[it.kind];
+    if (env) out.push({ x0: it.pos.x - env.w / 2, z0: it.pos.z - env.d / 2, x1: it.pos.x + env.w / 2, z1: it.pos.z + env.d / 2 });
+  }
+  return out;
+}
+
+function pointInAny(x: number, z: number, boxes: readonly Box[]): boolean {
+  return boxes.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
+}
+
+/**
+ * Place a list of specs into a room of the given half-extents, in order,
+ * keeping only what fits. Later specs lose to earlier ones, so the list IS the
+ * priority order: the cake before the parasols, always.
+ *
+ * Each candidate gets a few tries — its target, then nudged toward the room's
+ * centre — because in a small room a target derived from fractions can land a
+ * little inside a wall while a metre in would have been fine.
+ */
+/** 🚪 Every door's opening plus a lane into the room — reserved before a
+ *  fitted set lands, so no piece stands in a doorway or its approach in a
+ *  room whose doors were moved (Copilot review, PR #169). The doors come
+ *  from the room's layout, not from a wall's centre. */
+function doorLanes(halfX: number, halfZ: number): Box[] {
+  const HALF_W = 1.12; // the 2 m opening + a post each side
+  const LANE = 0.8; // metres into the room kept clear — the doorway and its
+  // threshold. Deeper lanes evicted the pergola's near post and, in a 2×2
+  // room, the sea; the door FRONTS themselves are protected as stand-points
+  // (+ ADD boxes them, PLACE keeps the lane), which is what reachability needs.
+  return roomDoorPoints().map((d) => {
+    const onZ = Math.abs(Math.abs(d.z) - halfZ) < Math.abs(Math.abs(d.x) - halfX); // a north/south wall
+    if (onZ) {
+      const inward = d.z > 0 ? -1 : 1;
+      return { x0: d.x - HALF_W, x1: d.x + HALF_W, z0: Math.min(d.z, d.z + inward * LANE), z1: Math.max(d.z, d.z + inward * LANE) };
+    }
+    const inward = d.x > 0 ? -1 : 1;
+    return { z0: d.z - HALF_W, z1: d.z + HALF_W, x0: Math.min(d.x, d.x + inward * LANE), x1: Math.max(d.x, d.x + inward * LANE) };
+  });
+}
+
+export function placeFitting(
+  specs: PlacementSpec[],
+  halfX: number,
+  halfZ: number,
+  idPrefix: string,
+  /** What already stands in the room — a set ADDED to a furnished room fits
+   *  around it instead of through it (Copilot review, PR #169). */
+  seed: readonly Box[] = [],
+): FurnitureItem[] {
+  const out: FurnitureItem[] = [];
+  const occupied: Box[] = [...seed];
+  const lastPlaced = new Map<FurnitureKind, FurnitureItem>(); // anchors for `over`
+  // Doorways are reserved for everything that STANDS; a spanning water
+  // feature keeps its own door rule (the sea's dry lanes, the pool's
+  // landings) and is not refused for touching a lane's box.
+  const lanes = doorLanes(halfX, halfZ);
+  const blockedFor = (spanning: boolean): readonly Box[] => (spanning ? occupied : [...occupied, ...lanes]);
+  const MARGIN = 0.6; // keep furniture off the walls
+  let n = 0;
+
+  const groupMembers = new Map<string, FurnitureItem[]>();
+  const groupFailed = new Set<string>();
+  /** Obstacle boxes each rigid group has claimed so far — handed back if it fails. */
+  const groupBoxes = new Map<string, Box[]>();
+  for (const spec of specs) {
+    // A rigid group that already lost a member places nothing more.
+    if (spec.group && groupFailed.has(spec.group)) continue;
+    const anchor = spec.over ? lastPlaced.get(spec.over) : undefined;
+    if (spec.over && !anchor) continue; // nothing to hang over
+    const tx = (anchor ? anchor.pos.x : (spec.at?.[0] ?? 0) * halfX) + (spec.off?.[0] ?? 0);
+    const tz = (anchor ? anchor.pos.z : (spec.at?.[1] ?? 0) * halfZ) + (spec.off?.[1] ?? 0);
+    // Nudges pull toward the centre, which is where the room is. A rigid
+    // group gets no nudge — moving one member relative to the others is
+    // exactly what `off` exists to prevent — and neither does a piece hung
+    // OVER another: it goes where its anchor went.
+    const tries: Array<[number, number]> = spec.group || spec.hugWall || anchor
+      ? [[tx, tz]]
+      : [
+          [tx, tz],
+          [tx * 0.88, tz * 0.88],
+          [tx * 0.76, tz * 0.92],
+          [tx * 0.92, tz * 0.76],
+          [tx * 0.62, tz * 0.82],
+        ];
+    let placed: FurnitureItem | null = null;
+    for (const [x, z] of tries) {
+      const item: FurnitureItem = {
+        id: `${idPrefix}-${spec.kind}-${++n}`,
+        kind: spec.kind,
+        pos: { x: +x.toFixed(2), z: +z.toFixed(2) },
+        rot: spec.rot ?? 0,
+        // Everything a set puts in a room is the owner's to move or stow —
+        // the river and its bridge included, the same ruling that made the
+        // pool movable (furnitureDoc MOVABLE_KIND_OVERRIDE, 2026-07-20).
+        movable: true,
+      };
+      const boxes = buildObstacleList([item]);
+      if (spec.spanning) {
+        // Spanning skips the BOUNDS check (crossing the room is the point),
+        // not the collision one: the sea must not be laid through furniture
+        // already standing in its corner (Copilot review, PR #169). Its own
+        // set's later pieces then keep clear of it as before.
+        if (boxes.some((b) => blockedFor(true).some((o) => boxesOverlap(b, o)))) continue;
+        occupied.push(...boxes);
+        if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
+        placed = item;
+        break;
+      }
+      if (boxes.length > 0) {
+        const margin = spec.hugWall ? -0.6 : MARGIN;
+        const outside =
+          !spec.spanning &&
+          boxes.some(
+            (b) =>
+              b.x0 < -halfX + margin || b.x1 > halfX - margin ||
+              b.z0 < -halfZ + margin || b.z1 > halfZ - margin,
+          );
+        if (outside) continue;
+        if (boxes.some((b) => blockedFor(false).some((o) => boxesOverlap(b, o)))) continue;
+        occupied.push(...boxes);
+        if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
+      } else {
+        // Decoration with no footprint (banner, balloons, towel, ball, the
+        // dance floor, the pergola roof). It cannot COLLIDE, but it must not
+        // be standing in the river either, and it still has to be in the room.
+        // A WALKABLE OVERLAY (the dance floor) is a 4 m pad, not a point: it
+        // is fitted by its whole envelope — inside the walls, off the
+        // furniture — while staying a non-obstacle at runtime (Copilot
+        // review, PR #169: the 4.1 m pad centred at x 4.08 ran through the
+        // east wall of a 12 m room).
+        const env = OVERLAY_ENVELOPE[spec.kind];
+        if (env) {
+          const eb: Box = { x0: x - env.w / 2, z0: z - env.d / 2, x1: x + env.w / 2, z1: z + env.d / 2 };
+          if (eb.x0 < -halfX + OVERLAY_MARGIN || eb.x1 > halfX - OVERLAY_MARGIN || eb.z0 < -halfZ + OVERLAY_MARGIN || eb.z1 > halfZ - OVERLAY_MARGIN) continue;
+          if (blockedFor(false).some((o) => boxesOverlap(eb, o))) continue;
+          // The pad is a place to BE: later pieces keep off it (fitting-time
+          // only — it blocks nothing once placed).
+          occupied.push(eb);
+          if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), eb]);
+        } else {
+          if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
+          if (!spec.overhead && !anchor && pointInAny(x, z, blockedFor(false))) continue;
+        }
+      }
+      placed = item;
+      break;
+    }
+    if (placed) lastPlaced.set(spec.kind, placed);
+    if (spec.group) {
+      if (!placed) {
+        // The group is out — and so are the boxes its earlier members
+        // claimed, or invisible furniture would keep blocking every later
+        // expansion item (Copilot review, PR #169).
+        groupFailed.add(spec.group);
+        const mine = new Set(groupBoxes.get(spec.group) ?? []);
+        if (mine.size) {
+          for (let i = occupied.length - 1; i >= 0; i--) if (mine.has(occupied[i])) occupied.splice(i, 1);
+          groupBoxes.delete(spec.group);
+        }
+      } else {
+        groupMembers.set(spec.group, [...(groupMembers.get(spec.group) ?? []), placed]);
+      }
+      continue;
+    }
+    if (placed) out.push(placed);
+  }
+  // Rigid groups land whole or not at all.
+  for (const [g, members] of groupMembers) {
+    if (!groupFailed.has(g)) out.push(...members);
+  }
+  return out;
+}
+
+/**
+ * 🏝️ The beach birthday party, fitted to whatever room it is going into.
+ *
+ * Zone fractions, not metres: water across the FRONT, the bar in the far
+ * corner, the cake cluster beside it along the back facing in, the dance floor
+ * off to one side, and the middle left alone because in a multiplayer room the
+ * crowd needs somewhere to stand.
+ *
+ * Priority order is the point. A small room gets the river, the cake and a
+ * couple of palms and stops; a big one keeps going all the way to the towels.
+ * Nothing is scaled — a bar counter is 4 m wide wherever it is — so the set
+ * thins out rather than shrinking.
+ */
+function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly Box[] = []): FurnitureItem[] {
+  const { halfX, halfZ } = half;
+  const specs: PlacementSpec[] = [
+    // 🌊 THE SEA first: flat water in the west-south corner of the sand, with
+    // a staircase shoreline (furniture.ts seaWaterTiles). Everything after
+    // avoids it. (The river was tried and never looked right inside a room.)
+    { kind: "beach-sea", at: [0, 0], spanning: true, group: "sea" },
+    // 🛶 A raft ON the water — spanning so the occupancy check lets it float —
+    // in whichever front corner the sea chose (furniture.ts seaCorner). In the
+    // sea's rigid group: no sea (furniture already in its corner), no raft
+    // beached on the floor (Copilot review, PR #169).
+    { kind: "beach-raft", at: [seaCorner() === "SE" ? 0.72 : -0.72, 0.72], spanning: true, group: "sea" },
+
+    // 🎂 The anchor and its cluster, along the back.
+    // Right of centre along the back, clear of the bar's shelf in the corner.
+    { kind: "cake-table", at: [0.42, -0.78] },
+    // Strung OVER the cake table — where the cake LANDED (the poles stand
+    // just past its ends and the cloth hangs well above the cake); behind it
+    // is the hedge. No cake, no banner.
+    { kind: "birthday-banner", over: "cake-table" },
+    // Gifts in METRES from the cake AS FITTED — one each side — so they sit
+    // beside it wherever it landed, never nudged away on their own, and stay
+    // out with it (Copilot review, PR #169: the cluster came apart when the
+    // cake was nudged around existing furniture).
+    { kind: "gift-box", over: "cake-table", off: [-1.6, 0.3] },
+    { kind: "gift-box", over: "cake-table", off: [1.6, 0.3] },
+    { kind: "birthday-balloons", at: [0.72, -0.82] },
+    { kind: "birthday-balloons", at: [0.06, -0.86] },
+
+    // 💃 Somewhere to dance, and the switch for it.
+    // The 4.1 m pad is fitted whole (OVERLAY_ENVELOPE), so its target is
+    // where it LANDS in a 2×2 module without a nudge: x 2.88 keeps the pad's
+    // west edge (0.85) east of the bar counter's end (0.6) and its east edge
+    // (4.93) west of the east door's lane (5.2); z −1.62 keeps its back edge
+    // (−3.67) off the gift boxes (−3.88). A nudge toward the centre was what
+    // ran it into the counter and the third stool, and the bar was lost
+    // (Copilot review, PR #169 — "default layout omits the party-2 speaker").
+    { kind: "dance-floor", at: [0.48, -0.27] },
+    // Just OFF the pad's front edge (the pad is kept clear while fitting):
+    // the speaker stands at the floor's end, not on it — its box starts at
+    // z 0.82, the pad ends at 0.43 in a 2×2 module.
+    { kind: "party-speaker", at: [0.48, 0.22] },
+    // 🤖 The dancer's dock, in the strip between the floor and the east wall,
+    // below the east door's lane and inside the walk bounds (±5 in a 2×2:
+    // the robot starts ON its dock), facing the floor (rot 3: front toward
+    // -x). Its robot is configured `dance` when the set lands
+    // (RoomTemplate.dockRoutine).
+    { kind: "charging-dock", at: [0.8, 0.3], rot: 3 },
+
+    // 🍹 The bar, anchored in the FAR CORNER and laid out in metres from it so
+    // the shelf, counter and stools keep their spacing in any room: shelf at
+    // the back, counter in front, stools on the camera side. Never mirrored.
+    { kind: "tiki-back-bar", at: [-1, -1], off: [4.6, 1.7] },
+    { kind: "tiki-bar-counter", at: [-1, -1], off: [4.6, 3.3] },
+    { kind: "tiki-bar-stool", at: [-1, -1], off: [3.1, 4.4] },
+    { kind: "tiki-bar-stool", at: [-1, -1], off: [4.6, 4.4] },
+    { kind: "tiki-bar-stool", at: [-1, -1], off: [6.1, 4.4] },
+
+    // 🏖️ THE BEACH — the whole front of the room: loungers under parasols in
+    // two small groups, palms at the sides where they frame rather than
+    // occlude, and the middle still left for the crowd.
+    { kind: "sun-lounger", at: [-0.28, 0.62] },
+    { kind: "tiki-parasol", at: [-0.1, 0.5] },
+    { kind: "sun-lounger", at: [0.48, 0.64] },
+    { kind: "tiki-parasol", at: [0.66, 0.5] },
+    { kind: "palm-tree", at: [-0.86, 0.3] },
+    // Clear of the speaker's front (a palm at 0.26 wedged it shut).
+    { kind: "palm-tree", at: [0.86, 0.5] },
+    { kind: "palm-tree", at: [-0.88, -0.44] },
+    { kind: "tiki-torch", at: [-0.2, -0.66] },
+    { kind: "tiki-torch", at: [-0.9, -0.66] },
+    { kind: "tiki-parasol", at: [0.86, -0.86] },
+    { kind: "palm-tree", at: [0.74, 0.88] },
+
+    // Everything past here is expansion — it lands only if there is room.
+    { kind: "party-standing-table", at: [-0.34, -0.3] },
+    // Beside the cake, not on its front point.
+    { kind: "party-standing-table", at: [0.16, -0.55] },
+    { kind: "cooler", at: [-1, -1], off: [1.3, 3.4] },
+    { kind: "beach-crate", at: [-1, -1], off: [2.3, 0.9] },
+    // The pergola is a RIGID GROUP: four posts 6.6 × 3.6 apart (the roof's
+    // size) or nothing — a roof floating over two posts is worse than no roof.
+    { kind: "pergola-post", at: [-1, -1], off: [1.3, 1.7], group: "pergola" },
+    { kind: "pergola-post", at: [-1, -1], off: [7.9, 1.7], group: "pergola" },
+    { kind: "pergola-post", at: [-1, -1], off: [1.3, 5.3], group: "pergola" },
+    { kind: "pergola-post", at: [-1, -1], off: [7.9, 5.3], group: "pergola" },
+    { kind: "pergola-roof", at: [-1, -1], off: [4.6, 3.5], group: "pergola", overhead: true },
+    { kind: "gift-box", at: [0.86, -0.72] },
+    { kind: "surfboard", at: [-0.94, 0.62] },
+    { kind: "beach-ball", at: [-0.42, 0.3] },
+    { kind: "beach-ball", at: [0.3, 0.86] },
+    { kind: "beach-towel", at: [0.1, 0.72] },
+    { kind: "beach-towel", at: [-0.72, 0.86] },
+  ];
+  // 🌿 THE HEDGE: one jungle plant per tile along BOTH back walls (the −x and
+  // −z walls, the two the camera looks at), the way the reference fences its
+  // beach in with greenery in its last twelve seconds. Doors keep a lane;
+  // anything already standing against those walls (the bar, the cake) simply
+  // interrupts the row — placeFitting skips the collisions.
+  const doors = roomDoorPoints();
+  const clearOfDoors = (x: number, z: number) =>
+    doors.every((d) => Math.hypot(d.x - x, d.z - z) >= 1.6);
+  const hedge: PlacementSpec[] = [];
+  const inset = 0.28; // stems right up against the wall (owner spec), fronds into it
+  for (let x = -halfX + inset; x < halfX; x += 1) {
+    if (clearOfDoors(x, -halfZ + inset)) hedge.push({ kind: "jungle-plant", at: [x / halfX, (-halfZ + inset) / halfZ], hugWall: true });
+  }
+  for (let z = -halfZ + inset + 1; z < halfZ - 1; z += 1) {
+    if (clearOfDoors(-halfX + inset, z)) hedge.push({ kind: "jungle-plant", at: [(-halfX + inset) / halfX, z / halfZ], hugWall: true });
+  }
+  // The hedge goes AFTER the bar and the cake cluster (they win the wall) and
+  // BEFORE the beach dressing, which has the whole front to itself anyway.
+  const expansionAt = specs.findIndex((sp) => sp.kind === "party-standing-table");
+  const ordered = [...specs.slice(0, expansionAt), ...hedge, ...specs.slice(expansionAt)];
+  return placeFitting(ordered, halfX, halfZ, "beach", seed);
 }
 
 /** Clone so applying a template never aliases the shared manifest arrays. */
@@ -97,7 +503,10 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     name: "Grand Lobby",
     description:
       "Clone-vat lounge — centre sofa cluster, map table, bunk, storage, paired doors.",
-    items: FURNITURE,
+    // The FROZEN manifest. `FURNITURE` itself mirrors the live room (World
+    // splices it on every reconcile), so `items: FURNITURE` placed "whatever
+    // is here already" — nothing, in an empty room.
+    items: [...DEFAULT_LOBBY_FURNITURE],
 
     theme: "interior",
   },
@@ -155,6 +564,96 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     theme: "outdoor-deck",
   },
   {
+    id: "party-1",
+    category: "party",
+    name: "Birthday Party",
+    description:
+      "Cake table and gifts along the back wall under the bunting, a lit dance floor with its speaker, the bar in the corner — and an empty middle for the crowd.",
+    // ── LAYOUT NOTES (the element-checklist zoning rules, applied to a square
+    //    12×12 m module rather than a beach):
+    //
+    //  · THE MIDDLE IS EMPTY ON PURPOSE. x ∈ [-2.5, 2.5], z ∈ [-2, 3] carries
+    //    nothing. In a multiplayer room the crowd needs somewhere to be, and
+    //    that is the zone every decoration was pushed out of.
+    //  · THE PARTY CLUSTER IS AT THE BACK (north, z ≈ -4). Cake, gifts, banner
+    //    and balloons together, all rot 0 so their approach side (local +z)
+    //    faces the middle — guests turn toward the cake from the open floor
+    //    instead of standing inside the cluster.
+    //  · THE TALLEST THINGS FRAME THE SCENE. Banner (2.35 m) and the cherry
+    //    trees sit on the back wall where they never occlude the cake.
+    //  · TWO MORE PLACES TO BE. The dance floor east of centre and the bar in
+    //    the far corner, so the room has three social zones, not one.
+    //  · CORRIDORS. ≥ 2 m clear between the cluster (z ≤ -3.7) and the dance
+    //    floor (z ≥ -1.8), and the banner is footprint-null so people walk
+    //    under it rather than round it.
+    //
+    // Shipped DELIBERATELY SPARSE: more balloons, hats and tables are what
+    // guests add in edit mode, and a room that arrives finished leaves them
+    // nothing to do.
+    items: [
+      // Edit-mode entry. NOT the reserved id "wall-computer" (see "empty").
+      { id: "party-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
+
+      // 🎂 The anchor, and the cluster around it.
+      { id: "party-cake", kind: "cake-table", pos: { x: -1.0, z: -4.2 }, rot: 0, movable: true },
+      { id: "party-banner", kind: "birthday-banner", pos: { x: -1.0, z: -4.2 }, rot: 0, movable: true },
+      { id: "party-gift-1", kind: "gift-box", pos: { x: -2.7, z: -4.0 }, rot: 0, movable: true },
+      { id: "party-gift-2", kind: "gift-box", pos: { x: -3.5, z: -4.7 }, rot: 0, movable: true },
+      { id: "party-gift-3", kind: "gift-box", pos: { x: 0.7, z: -4.3 }, rot: 0, movable: true },
+      { id: "party-balloons-w", kind: "birthday-balloons", pos: { x: -4.6, z: -4.2 }, rot: 0, movable: true },
+      { id: "party-balloons-e", kind: "birthday-balloons", pos: { x: 2.2, z: -4.4 }, rot: 0, movable: true },
+
+      // 💃 The floor and its switch. The speaker sits on the floor's north
+      // edge so the walk to it is across the dance floor itself.
+      { id: "party-floor", kind: "dance-floor", pos: { x: 2.6, z: 0.2 }, rot: 0, movable: true },
+      { id: "party-speaker", kind: "party-speaker", pos: { x: 2.6, z: -2.2 }, rot: 0, movable: true },
+
+      // 🍸 Somewhere to put a drink down, out at the edges.
+      { id: "party-stand-1", kind: "party-standing-table", pos: { x: -4.4, z: 1.4 }, rot: 0, movable: true },
+      { id: "party-stand-2", kind: "party-standing-table", pos: { x: -3.1, z: 3.6 }, rot: 0, movable: true },
+
+      // 🍹 The second social zone — the lobby bar, in its usual corner.
+      { id: "party-bar", kind: "bar-corner", pos: { x: 5.24, z: 3.1 }, rot: 0, movable: true },
+
+      // 🌸 Back-wall greenery: tall, and therefore at the back.
+      { id: "party-tree-nw", kind: "cherry-tree", pos: { x: -5.2, z: -5.2 }, rot: 0, movable: true },
+      { id: "party-tree-ne", kind: "cherry-tree", pos: { x: 4.8, z: -5.2 }, rot: 0, movable: true },
+      { id: "party-pot-s", kind: "blossom-pot", pos: { x: -5.3, z: 4.6 }, rot: 0, movable: true },
+
+      // ✨ Light for the middle, so the empty floor still reads as a room.
+      { id: "party-chandelier", kind: "chandelier", pos: { x: 0, z: 0.5 }, rot: 0, movable: true },
+    ],
+
+    theme: "interior",
+  },
+  {
+    id: "party-2",
+    category: "party",
+    name: "Beach Birthday Party",
+    description:
+      "Sand underfoot and a flat sea in the corner, thatched parasols with party bulbs, a tiki bar in the far corner, cake and gifts along the back, a lit dance floor — and an empty middle.",
+    // PLACE and ADD share one source: the fitted layout, here at the DEFAULT
+    // 2×2 envelope every room is born with. A hand-authored 5×5 list lived
+    // here before and put every piece outside the walls of a real room.
+    // The Empty Room's own terminal rides along so PLACE never strands a room
+    // without its edit-mode entry (id ≠ the reserved "wall-computer").
+    items: [
+      { id: "beach-computer", kind: "wall-computer", pos: { x: 1.8, z: 5.97 }, rot: 2, movable: true },
+      ...layoutBeachParty({ halfX: 6, halfZ: 6 }),
+    ],
+
+    // 🧩 …and the version that FITS: ADD SET runs this against the room's real
+    // extents instead of the fixed list above, which was drawn for a 5×5.
+    layout: layoutBeachParty,
+    // 🎉 The dock the set places is the party dancer's.
+    dockRoutine: "dance",
+
+    // 🏖️ The beach theme: the deck's open sky and sunward light over a SAND
+    // floor (world.ts applyRoomVisuals) — the reference build's whole look is
+    // sand under your feet and a flat sea in the corner.
+    theme: "beach",
+  },
+  {
     id: "deck-1",
     category: "deck",
     name: "Sky Deck",
@@ -205,15 +704,236 @@ export function findTemplate(id: string): RoomTemplate | null {
  * wall coverage afterwards (world.reconcileDoorPlacements) so the geometry
  * matches the (unchanged) door set against the new layout.
  */
+/**
+ * The items a template puts in THIS room. A fitted template is generated
+ * from the room's real extents and doors at apply time — its `items` field
+ * (the 2×2 envelope, evaluated once at module load) is only a preview; PLACE
+ * reused that frozen 12×12 result in any room (Copilot review, PR #169).
+ * The fitted set's own terminal rides along at the real south wall.
+ */
+export function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
+  const half = roomHalfExtents();
+  if (!t.layout) {
+    // A fixed manifest was drawn for the default 2×2 envelope; a 1×1 room
+    // has 3 m half-extents, and PLACE wrote its far pieces outside the
+    // walls (Copilot review, PR #169). Keep what the room can hold — and
+    // if that lost the terminal, hang one on this room's own wall.
+    // …and off the room's doorways: the manifest knows nothing of where
+    // THIS room's doors are, and a tree or the terminal across a moved door
+    // is a door nobody can use (Copilot review, PR #169). A rejected
+    // terminal is re-hung by terminalFor below. Only a door set the room
+    // has STATED counts: the legacy four-cardinal fallback is what the
+    // Grand Lobby was drawn against — its armchairs flank the south door
+    // and its map table stands at the north one — and an un-migrated room
+    // must not lose them to a fallback.
+    const lanes = doorSetIsAuthoritative() ? doorLanes(half.halfX, half.halfZ) : [];
+    const kept = cloneItems(t.items).filter((i) => fitsRoom(i, half) && !inDoorLane(i, lanes));
+    if (kept.some((i) => i.kind === "wall-computer")) return kept;
+    return [terminalFor(t, half, buildObstacleList(kept)), ...kept];
+  }
+  // The terminal hangs on the south wall at the first half-metre station,
+  // outward from the usual 1.8, that no door claims (its opening + a post
+  // each side, plus the panel's half-width) — doors move, and a PLACE that
+  // hung the room's only edit entry across a doorway left it unusable
+  // (Copilot review, PR #169).
+  // The set first; the terminal's station is then chosen with the set's
+  // blocked area in hand, so its stand-point (1 m in front of the panel) is
+  // never in the sea — in a doorless room the sea reaches the south wall's
+  // middle, where the terminal used to go (Copilot review, PR #169). The
+  // south wall is tried first (where it has always hung), then the others:
+  // a doorless 2×2 room's south wall can be sea and loungers end to end.
+  const items = t.layout(half);
+  return [terminalFor(t, half, buildObstacleList(items)), ...items];
+}
+
+/** Is this item inside the walls of a room with these half-extents? Its
+ *  centre must be; its box (floor, wall slab, or overlay pad) may run past
+ *  the wall line by the wall-flush allowance — the bar's cabinet, the map
+ *  table against the north wall and a hung panel's slab all do, on purpose
+ *  (the same 0.6 m placeFitting grants a hedge). */
+function fitsRoom(item: FurnitureItem, half: { halfX: number; halfZ: number }): boolean {
+  if (Math.abs(item.pos.x) > half.halfX || Math.abs(item.pos.z) > half.halfZ) return false;
+  const box = itemOccupancyBox(item) ?? overlayEnvelopeBoxes([item])[0];
+  if (!box) return true;
+  const FLUSH = 0.6;
+  return box.x0 >= -half.halfX - FLUSH && box.x1 <= half.halfX + FLUSH && box.z0 >= -half.halfZ - FLUSH && box.z1 <= half.halfZ + FLUSH;
+}
+
+/** Does this item — by its box (floor, wall slab, or overlay pad) or else
+ *  its centre — stand in any of the room's door lanes? */
+function inDoorLane(item: FurnitureItem, lanes: readonly Box[]): boolean {
+  const box = itemOccupancyBox(item) ?? overlayEnvelopeBoxes([item])[0];
+  if (box) return lanes.some((l) => boxesOverlap(box, l));
+  return pointInAny(item.pos.x, item.pos.z, lanes);
+}
+
+/** The room terminal for a template's set: on the first dry, door-free
+ *  station of the south wall, else the other walls (see templateItemsFor). */
+function terminalFor(t: RoomTemplate, half: { halfX: number; halfZ: number }, blocked: readonly Box[]): FurnitureItem {
+  const doorHalf = 1.3;
+  const panelHalf = wallMountHalfWidth("wall-computer");
+  const REACH = PLAYER_R + 0.06; // the FINE-arrival clearance validatePlacement demands
+  const doors = roomDoorPoints();
+  const dry = (fx: number, fz: number) =>
+    !blocked.some((b) => fx > b.x0 - REACH && fx < b.x1 + REACH && fz > b.z0 - REACH && fz < b.z1 + REACH);
+  type Wall = { rot: Rot; along: number; pose: (a: number) => { x: number; z: number }; front: (a: number) => { x: number; z: number }; door: (d: { x: number; z: number }) => number | null };
+  const walls: Wall[] = [
+    { rot: 2, along: half.halfX, pose: (a) => ({ x: a, z: half.halfZ - 0.03 }), front: (a) => ({ x: a, z: half.halfZ - 1.0 }), door: (d) => (Math.abs(d.z - half.halfZ) < 0.6 ? d.x : null) },
+    { rot: 3, along: half.halfZ, pose: (a) => ({ x: half.halfX - 0.03, z: a }), front: (a) => ({ x: half.halfX - 1.0, z: a }), door: (d) => (Math.abs(d.x - half.halfX) < 0.6 ? d.z : null) },
+    { rot: 1, along: half.halfZ, pose: (a) => ({ x: -half.halfX + 0.03, z: a }), front: (a) => ({ x: -half.halfX + 1.0, z: a }), door: (d) => (Math.abs(d.x + half.halfX) < 0.6 ? d.z : null) },
+    { rot: 0, along: half.halfX, pose: (a) => ({ x: a, z: -half.halfZ + 0.03 }), front: (a) => ({ x: a, z: -half.halfZ + 1.0 }), door: (d) => (Math.abs(d.z + half.halfZ) < 0.6 ? d.x : null) },
+  ];
+  let chosen: { pos: { x: number; z: number }; rot: Rot } | null = null;
+  for (const w of walls) {
+    const laterals = doors.map(w.door).filter((v): v is number => v !== null);
+    const base = w.rot === 2 ? Math.min(1.8, Math.max(0, w.along - 1.0)) : 0;
+    const stations: number[] = [];
+    for (let k = 0; k * 0.5 <= w.along; k++) {
+      for (const a of [base + k * 0.5, base - k * 0.5]) {
+        if (Math.abs(a) <= w.along - 1.0 - panelHalf) stations.push(a);
+      }
+    }
+    const a = stations.find((s) => laterals.every((l) => Math.abs(l - s) >= doorHalf + panelHalf) && dry(w.front(s).x, w.front(s).z));
+    if (a !== undefined) {
+      const p = w.pose(a);
+      chosen = { pos: { x: +p.x.toFixed(2), z: +p.z.toFixed(2) }, rot: w.rot };
+      break;
+    }
+  }
+  return {
+    id: `${t.id}-computer`,
+    kind: "wall-computer",
+    pos: chosen?.pos ?? { x: Math.min(1.8, Math.max(0, half.halfX - 1.0)), z: half.halfZ - 0.03 },
+    rot: chosen?.rot ?? 2,
+    movable: true,
+  };
+}
+
+/** 🤖 Configure every charging-dock a template just placed with the routine
+ *  it asks for (RoomTemplate.dockRoutine); `ids` are the ids as WRITTEN,
+ *  aligned with `items`. */
+function configureTemplateDocks(t: RoomTemplate, items: readonly FurnitureItem[], ids: readonly string[]): void {
+  if (!t.dockRoutine) return;
+  items.forEach((item, i) => {
+    if (item.kind === "charging-dock" && ids[i]) writeRobotConfig(ids[i], { routine: t.dockRoutine! });
+  });
+}
+
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
-  replaceAllFurniture(cloneItems(t.items));
+  const items = templateItemsFor(t);
+  replaceAllFurniture(items);
+  configureTemplateDocks(t, items, items.map((i) => i.id));
   // 🌌 …and the room IS this now: stamping the theme makes the change
   // persistent and shared, instead of a look that lasted until the next
   // reload re-resolved it from nothing.
   roomThemeWriter?.(t.theme);
   return t;
+}
+
+const BATCH_SEP = "~"; // id ~ batch-tag; no other writer puts a ~ in an id
+let addBatchSeq = 0;
+/** Two presses are a RACE only if they were made within this window of each
+ *  other (the tag carries the press's clock): a set edited down over weeks
+ *  to a few pieces must never settle a fresh press by coincidence (Copilot
+ *  review, PR #169). Clocks differ a little between peers; a race is seconds. */
+const RACE_WINDOW_MS = 30_000;
+const batchTime = (tag: string): number => {
+  const ts = tag.slice(tag.lastIndexOf(".") + 1);
+  const t = parseInt(ts, 36);
+  return Number.isFinite(t) ? t : NaN;
+};
+
+/**
+ * ⚖️ Settle + ADD presses that raced. Two peers pressing at the same moment
+ * each fit the set to the SAME room and compute the SAME coordinates; the
+ * peer tags keep both sets in the map, one exactly on top of the other —
+ * two speakers, two docks, two cakes in one spot. Deterministic, from the
+ * doc alone, so every peer reaches the same answer: batches are taken in
+ * tag order, and a batch that coincides with an earlier surviving one — the
+ * same kind at the same coordinates for at least two pieces and half of the
+ * smaller batch, and made within RACE_WINDOW_MS of it — loses and is
+ * deleted. Two presses made one after the other never coincide (the second
+ * fitted around the first), and an old batch's leftovers are outside the
+ * window. Run on every furniture change; returns the ids it removed
+ * (Copilot review, PR #169).
+ */
+export function reconcileConcurrentAdds(): string[] {
+  const batches = new Map<string, Array<{ id: string; sig: string }>>();
+  for (const [id, r] of readAllFurniture()) {
+    const at = id.lastIndexOf(BATCH_SEP);
+    if (at < 0) continue;
+    const tag = id.slice(at + 1);
+    batches.set(tag, [...(batches.get(tag) ?? []), { id, sig: `${r.kind}@${r.x},${r.z}` }]);
+  }
+  if (batches.size < 2) return [];
+  const survivors: Array<{ sigs: Set<string>; t: number }> = [];
+  const losers: string[] = [];
+  for (const tag of [...batches.keys()].sort()) {
+    const items = batches.get(tag)!;
+    const sigs = new Set(items.map((i) => i.sig));
+    const t = batchTime(tag);
+    const clash = Number.isFinite(t) && survivors.some((s) => {
+      if (!(Math.abs(s.t - t) <= RACE_WINDOW_MS)) return false;
+      let n = 0;
+      for (const sig of sigs) if (s.sigs.has(sig)) n++;
+      return n >= Math.max(2, Math.ceil(Math.min(s.sigs.size, sigs.size) / 2));
+    });
+    if (clash) losers.push(...items.map((i) => i.id));
+    else survivors.push({ sigs, t });
+  }
+  deleteFurnitureItems(losers);
+  return losers;
+}
+
+/**
+ * ➕ ADD a template's set to the CURRENT room without replacing anything.
+ *
+ * This is the one to reach for. A room's structure — its size, its walls, its
+ * doors — is fixed when the module is born and cannot be changed afterwards,
+ * so the useful operation on somebody's existing room is "put this set in it",
+ * not "make it a different room". Nothing is deleted, the envelope and the
+ * theme are left alone, and a template with a `layout` generator fits itself
+ * to the room's real extents: it places what fits in priority order and skips
+ * the rest, so the same set gives a small room its cake and a big room its
+ * whole beach.
+ *
+ * Returns what actually landed, and how much of the set did not.
+ */
+export function addRoomTemplateItems(
+  id: string,
+  /** Ground the set must also keep clear of — every player standing in the
+   *  room and every seat / door / device stand-point, boxed by the caller
+   *  (Copilot review, PR #169: a set landed on the fox and across the
+   *  terminal's front). */
+  keepClear: readonly Box[] = [],
+): { name: string; placed: number; skipped: number } | null {
+  const t = findTemplate(id);
+  // Only a FITTED set can be added: a fixed manifest knows nothing about the
+  // room it lands in or what is already there — it would write its items at
+  // their authored coordinates straight through the furniture (Copilot
+  // review, PR #169). Those templates PLACE (replace everything) only.
+  if (!t || !t.layout) return null;
+  // Occupied: everything in the room (roomOccupancy) and the ground the
+  // caller asked to keep clear.
+  const wanted = t.layout(roomHalfExtents(), [...roomOccupancy(FURNITURE), ...keepClear]);
+  // Ids carry this PRESS's batch tag — the peer's id and a press counter —
+  // after a `~`: addFurniture only de-duplicates against the LOCAL map, so
+  // two peers pressing + ADD together minted the same ids and the map's
+  // per-key LWW collapsed each pair to one item while both reported
+  // everything written; and the tag is what reconcileConcurrentAdds reads
+  // to settle two presses that fitted the same room at the same moment
+  // (Copilot review, PR #169).
+  const tag = `${peerIdTag()}.${++addBatchSeq}.${Date.now().toString(36)}`;
+  const written = addFurniture(wanted.map((i) => ({ ...i, id: `${i.id}${BATCH_SEP}${tag}` })));
+  configureTemplateDocks(t, wanted, written);
+  // "Skipped" against what THIS room holds when empty — the set fitted to
+  // these extents with nothing in the way — not against a 30 m room's longer
+  // hedge and fuller inventory, which reported pieces skipped in a default
+  // room where every generated piece had landed (Copilot review, PR #169).
+  const total = t.layout(roomHalfExtents()).length;
+  return { name: t.name, placed: written.length, skipped: Math.max(0, total - written.length) };
 }
 
 /**
@@ -225,7 +945,9 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
-  replaceAllFurniture(cloneItems(t.items));
+  const items = templateItemsFor(t);
+  replaceAllFurniture(items);
+  configureTemplateDocks(t, items, items.map((i) => i.id));
   return true;
 }
 

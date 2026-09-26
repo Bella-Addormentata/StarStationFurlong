@@ -7,6 +7,7 @@
 import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
+import { setLocalPresence } from "./localPresence";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
@@ -56,10 +57,12 @@ import {
   rotXZ,
   POOL_SWIM_Y,
   POOL_WATER_Y,
+  isPoolKind,
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
-  poolHoleOutline,
+  floorCutOutlines,
+  isFloorCutKind,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -135,6 +138,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  PropAnimHandle,
   SlotMachineCabinetControl,
   DeviceUI,
   DeviceTarget,
@@ -143,6 +147,14 @@ import { subscribeGames, readGame } from "./games/gamesDoc";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom } from "./editMode";
 import { showHint } from "./hud";
+// 🎉 Party props: the focused panels and the doc the moment lives in.
+import {
+  createCakeTableUI, createGiftBoxUI, createPartySpeakerUI,
+  type PartyDeviceDeps,
+} from "./partyUI";
+import { getIdentityPub } from "./keypair";
+import { getPlayerName } from "./identity";
+import { listContacts, getContact } from "./contacts";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -379,6 +391,8 @@ export class World {
   private pendingVatSpawnGrace = 0;
   /** Flippable game-table tops, keyed by item id (#45 — driven every frame). */
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
+  /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
+  private propAnims: Map<string, PropAnimHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -404,17 +418,19 @@ export class World {
   private woodTex: THREE.Texture | null = null;
   /** Lazy-created outdoor stone tile texture (created on first outdoor entry). */
   private outdoorFloorTex: THREE.Texture | null = null;
+  private sandFloorTex: THREE.Texture | null = null;
   /** Lazy-created casino carpet texture (created on first casino entry). */
   private casinoFloorTex: THREE.Texture | null = null;
-  /** 🌌 Legacy mirror of isOutdoorDeck — kept in sync with the room's THEME so
-   *  the platform-floor visibility read in the render loop (world.ts:3427)
-   *  still hides the floor for an outdoor-deck room on a non-octagon hull.
-   *  Was once the id-keyed "outdoor casino pool room" flag; now theme-driven. */
-  private isOutdoorRoom = false;
+  /** 🏊 Legacy hull (no octagon) only: the floor is hidden because a SWIM
+   *  pool's deck slabs are the flooring. Decided by what the room CONTAINS
+   *  (refreshOutdoorFloor), never by its theme — deriving it from the theme
+   *  hid the beach's sand floor under the party set every frame (Copilot
+   *  review, PR #169). The render loop reads it when restoring the interior. */
+  private legacyDeckHidesFloor = false;
   /** 🌌 True while the active room's THEME is 'outdoor-deck' (space seen through
    *  the glass ceiling + warm bright light). Drives the space backdrop
-   *  visibility toggle in applyRoomVisuals; isOutdoorRoom mirrors it for the
-   *  legacy floor-visibility read. */
+   *  visibility toggle in applyRoomVisuals. (The legacy floor visibility is
+   *  legacyDeckHidesFloor's, from the furniture, not this flag's.) */
   private isOutdoorDeck = false;
   /** 🪐 Overhead ocean-planet for the outdoor-deck backdrop — the "beach" world
    *  the station orbits, seen up through the skylights. Built once, spun slowly,
@@ -1586,6 +1602,7 @@ export class World {
       gameTableTops: this.gameTableTops,
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
+      propAnims: this.propAnims,
     };
   }
 
@@ -2328,13 +2345,14 @@ export class World {
     // carries (stamped by a template or its owner); unstamped ⇒ plain
     // interior. `roomId` is now only ever logged from here.
     const resolvedTheme: RoomTheme = theme ?? "interior";
-    const deck = resolvedTheme === "outdoor-deck";
+    // 🏖️ "beach" is an outdoor deck whose floor is SAND — same sky, same
+    // sunward light, ghost doors; only the floor texture differs below.
+    const beach = resolvedTheme === "beach";
+    const deck = resolvedTheme === "outdoor-deck" || beach;
     const casinoTheme = resolvedTheme === "casino";
     this.isOutdoorDeck = deck;
-    // Keep the legacy floor-visibility flag in lockstep with the theme: the
-    // render loop still reads isOutdoorRoom (world.ts:3427) to hide the
-    // platform floor under an outdoor deck on non-octagon hulls.
-    this.isOutdoorRoom = deck;
+    // (The legacy floor-visibility decision is NOT the theme's: see
+    // legacyDeckHidesFloor / refreshOutdoorFloor.)
     // 🚪 The room's RETIRED door-layout kind — compat only. A door's physical
     // slot now comes from its own layout record (wall + lateral), which is what
     // lets a wall carry zero or many doors; this line only tells the doc layer
@@ -2490,7 +2508,13 @@ export class World {
     this.dockingSystem?.setGhostDoors(deck);
 
     if (this.floorMat) {
-      if (deck) {
+      if (beach) {
+        if (!this.sandFloorTex) this.sandFloorTex = this.makeSandFloorTex();
+        this.floorMat.map = this.sandFloorTex;
+        this.floorMat.color.setHex(0xffffff);
+        this.floorMat.roughness = 0.98;
+        this.floorMat.metalness = 0.0;
+      } else if (deck) {
         // Swap to a stone-tile texture (created once, cached).
         if (!this.outdoorFloorTex)
           this.outdoorFloorTex = this.makeOutdoorFloorTex();
@@ -2532,7 +2556,9 @@ export class World {
         mat.needsUpdate = true;
       }
     });
-    const themeLabel = deck
+    const themeLabel = beach
+      ? "sand floor"
+      : deck
       ? "stone deck floor"
       : casinoTheme
         ? "festival carpet"
@@ -2599,29 +2625,36 @@ export class World {
    * covers remote changes; editMode's local splice/spawn does not).
    */
   public refreshOutdoorFloor(): void {
-    // A pool (either style) sinks its water below the floor.
-    const hasPool = FURNITURE.some(
-      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+    // A pool (either style) sinks its water below the floor; so does the
+    // 🏊 infinity pool, whose terraces are cut into it (isFloorCutKind).
+    const hasCut = FURNITURE.some(
+      (i) => isFloorCutKind(i.kind),
     );
     if (OCTAGON_HULL) {
-      // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the pool water
-      // is — the deck keeps its floor. The hole is the water's EXACT outline
-      // (poolHoleOutline), so no solid floor peeks over the organic water (the
-      // old 1 m cell holes couldn't match the curve). The pool's basin (with its
-      // drawn-in bottom) sinks into the basement through the hole. No pool ⇒ no
-      // holes, plus any demo rect hole.
+      // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the water is
+      // — the deck keeps its floor. The hole is the water's EXACT outline
+      // (floorCutOutlines: the swim pool's curve, or the infinity pool's staircase),
+      // so no solid floor peeks over the water (the old 1 m cell holes couldn't
+      // match the curve). The basin (with its drawn-in bottom) sinks into the
+      // basement through the hole. Nothing sunk ⇒ no holes, plus any demo rect.
       const rects: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
       if (this.demoFloorHole) rects.push(this.demoFloorHole);
-      const outline = hasPool ? poolHoleOutline(FURNITURE) : null;
-      this.setFloorHoles(rects, outline ? [outline] : []);
+      this.setFloorHoles(rects, hasCut ? floorCutOutlines(FURNITURE) : []);
       if (this.platformFloor) this.platformFloor.visible = true;
-      if (this.platformGrid) this.platformGrid.visible = !hasPool;
+      if (this.platformGrid) this.platformGrid.visible = !hasCut;
       return;
     }
-    // Legacy (no octagon): hide the whole floor/grid wherever a pool is present
-    // — the pool's deck slabs provide the visible flooring instead.
-    if (this.platformFloor) this.platformFloor.visible = !hasPool;
-    if (this.platformGrid) this.platformGrid.visible = !hasPool;
+    // Legacy (no octagon): hide the whole floor/grid wherever a SWIM pool is
+    // present — its deck slabs provide the visible flooring instead. The
+    // infinity pool has no deck, so it must not trigger this (Copilot review,
+    // PR #169); without the octagon hull it simply sits in the floor.
+    // …and only the pools that HAVE deck slabs: the beach river is a cut in
+    // the floor with a sand apron, not a deck — hiding the floor for it left
+    // the room a void (Copilot review, PR #169).
+    const hasDeck = FURNITURE.some((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+    this.legacyDeckHidesFloor = hasDeck;
+    if (this.platformFloor) this.platformFloor.visible = !hasDeck;
+    if (this.platformGrid) this.platformGrid.visible = !hasDeck;
   }
 
   /**
@@ -2677,6 +2710,49 @@ export class World {
         slot.role ? 0xffb733 : 0x35e0ff,
       );
     });
+  }
+
+  /**
+   * 🏖️ Beach sand: a warm yellow ground with thousands of grains in four
+   * tones — the noisy Habbo sand tile, not a smooth colour. Deterministic
+   * PRNG so every client draws the same grain.
+   */
+  private makeSandFloorTex(): THREE.Texture {
+    const W = 512,
+      H = 512;
+    const cv = document.createElement("canvas");
+    cv.width = W;
+    cv.height = H;
+    const c = cv.getContext("2d")!;
+    // 🏖️ WHITE beach sand (owner ruling 2026-09-25): the party skill's
+    // reference palette (#fbf7ee), not the golden sand tried first — the
+    // grain is the same pixel noise in four near-white tones, so it still
+    // reads as sand rather than as a blank floor.
+    c.fillStyle = "#FBF7EE";
+    c.fillRect(0, 0, W, H);
+    let seed = 0x9e3779b9;
+    const rnd = () => {
+      seed = (Math.imul(seed ^ (seed >>> 15), 0x2c1b3c6d) >>> 0);
+      seed = (Math.imul(seed ^ (seed >>> 12), 0x297a2d39) >>> 0);
+      return ((seed ^ (seed >>> 15)) >>> 0) / 4294967296;
+    };
+    const TONES = ["#EBE3D2", "#FFFDF7", "#D4C9B2", "#F3ECDC"];
+    for (let n = 0; n < 26000; n++) {
+      c.fillStyle = TONES[n % 4];
+      c.globalAlpha = 0.35 + rnd() * 0.4;
+      const sz = rnd() < 0.8 ? 1 : 2;
+      c.fillRect(Math.floor(rnd() * W), Math.floor(rnd() * H), sz, sz);
+    }
+    c.globalAlpha = 1;
+    const tex = new THREE.CanvasTexture(cv);
+    tex.wrapS = THREE.RepeatWrapping;
+    tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(3.5, 3.5);
+    tex.minFilter = THREE.NearestFilter;
+    tex.magFilter = THREE.NearestFilter;
+    tex.generateMipmaps = false;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    return tex;
   }
 
   /**
@@ -2947,6 +3023,7 @@ export class World {
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
     this.slotMachineVisuals.delete(itemId);
+    this.propAnims.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -2971,8 +3048,16 @@ export class World {
     const groupLights = new Set<THREE.PointLight>();
     const disposed = new Set<THREE.BufferGeometry | THREE.Material>();
     group.traverse((obj) => {
-      const disposeSlotPaytable = obj.userData.disposeSlotPaytable;
-      if (typeof disposeSlotPaytable === "function") disposeSlotPaytable();
+      // 🧹 Any `dispose*` entry on userData is a teardown hook (a doc
+      // subscription, a timer). Scanning by PREFIX instead of naming each one
+      // means a new prop that subscribes to the room doc cannot leak a live
+      // listener just because nobody remembered to add its key here — which is
+      // exactly the drift furnitureHandles.ts was written to stop.
+      for (const key of Object.keys(obj.userData)) {
+        if (!key.startsWith("dispose")) continue;
+        const hook = obj.userData[key];
+        if (typeof hook === "function") hook();
+      }
       if (obj instanceof THREE.PointLight) {
         groupLights.add(obj);
         obj.dispose();
@@ -3526,11 +3611,12 @@ export class World {
       this.furnitureMeshes.forEach((mesh) => {
         mesh.visible = true;
       });
-      // 🏊 Outdoor pool room: legacy hides the floor (deck slabs are the floor;
-      // sunken water shows through). Under the octagon flag the floor stays
-      // SOLID with a pool hole cut (refreshOutdoorFloor), so keep it visible.
+      // 🏊 Legacy hull: the floor stays hidden only where a SWIM pool's deck
+      // slabs are the flooring (refreshOutdoorFloor's ruling, from the
+      // furniture — not the theme). Under the octagon flag the floor stays
+      // SOLID with a pool hole cut, so keep it visible.
       if (this.platformFloor)
-        this.platformFloor.visible = OCTAGON_HULL || !this.isOutdoorRoom;
+        this.platformFloor.visible = OCTAGON_HULL || !this.legacyDeckHidesFloor;
       // 🛑📐 #80: the octagon floor is SOLID by default now (basement hidden
       // beneath it); a hole is cut only where a pool sinks into the basement
       // (setFloorHoles → makeFloorGeometry). No blanket hide.
@@ -3636,6 +3722,21 @@ export class World {
 
     // 🎰 Keep physical cabinet reels synchronized for nearby spectators.
     for (const slot of this.slotMachineVisuals.values()) slot.update(deltaTime);
+
+    // 🧍 Tell the props whether the local player is IN the room, and where —
+    // the party speaker strikes up on the fox walking in and fades with
+    // distance (localPresence.ts). Change-detected inside, so this is cheap.
+    // "In the room" is the robots' predicate below (active AND the iso room
+    // view): isPlayerActive() alone is already true behind the ENTER ROOM
+    // prompt, which would mark presence before the walk-in and lose the
+    // entry transition the speaker fires on (Copilot review, PR #169).
+    {
+      const p = this.player.getPosition();
+      setLocalPresence(this.isPlayerActive() && zoomLevel <= 2, p.x, p.z);
+    }
+    // 💃 Dance floors run their travelling light wave (no-op while the room's
+    // speaker is off — the handle reads that itself).
+    for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
     this.updateSeatedSlotSession();
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
@@ -4865,7 +4966,7 @@ export class World {
    *  live, with no re-entry and no theme stamp required. */
   private computeRobotPatrol(): Array<[number, number]> {
     const hasPool = FURNITURE.some(
-      (i) => i.kind === "lazy-pool" || i.kind === "classic-pool",
+      (i) => isPoolKind(i.kind),
     );
     if (hasPool) return POOL_PATROL;
     // 🎰 A room is a casino because it HOLDS casino tables — the content-driven
@@ -5001,7 +5102,7 @@ export class World {
       const stageYaw = firstPerson
         ? Math.atan2(pp.x - bp.x, pp.z - bp.z)
         : rigYaw;
-      bot.setStageYaw(bot.isCoaching() ? stageYaw : null);
+      bot.setStageYaw(bot.isPerforming() ? stageYaw : null);
       if (!activePlayer || !bot.isCoaching()) continue;
       if (Math.hypot(bp.x - pp.x, bp.z - pp.z) > 6) continue; // the 6 m circle
       // 🚪 Door-zone exemption: a fox walking out pauses BESIDE the door
@@ -5114,6 +5215,7 @@ export class World {
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
       routineOf(k) !== "coach" && // a coach runs its class, never a table
+      routineOf(k) !== "dance" && // 🎉 a dancer is on the floor, never at a table
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,
@@ -5409,6 +5511,48 @@ export class World {
           onMessage: (message) => visual?.showMessage(message),
         }),
       );
+      return;
+    }
+
+    // 🎉 Party props. The cake carries the gated moment; the other two are
+    // ungated (anyone may open a present or kill the music).
+    if (
+      device.kind === "cakeTable" ||
+      device.kind === "giftBox" ||
+      device.kind === "partySpeaker"
+    ) {
+      const deps: PartyDeviceDeps = {
+        itemId: deviceId,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        nameForPub: (pub) =>
+          pub === getIdentityPub()
+            ? getPlayerName()
+            : getContact(pub)?.name ?? "a clone",
+        canEdit: () => canEditRoom().ok,
+        // v1 scope: the host picks the guest of honour from CONTACTS (plus
+        // themselves) — the same source the share-offer recipient picker uses.
+        // Naming a stranger who is standing right here needs the room's keyed
+        // players map, which lives on the other side of the T0 seam.
+        honourees: () => [
+          { pub: getIdentityPub(), name: `${getPlayerName()} (me)` },
+          ...listContacts().map((c) => ({ pub: c.pub, name: c.name })),
+        ],
+        // 🍰 A slice is carried in the same paw the waiter-bot's drinks use.
+        // The slice MESH is still to come; the pose and the line are what make
+        // a crowd read as guests, and they are the cheap half.
+        onSlice: () => {
+          this.player.setDrinkHold(1);
+          showHint("🍰 A slice of birthday cake.");
+        },
+      };
+      const ui =
+        device.kind === "cakeTable"
+          ? createCakeTableUI(deps)
+          : device.kind === "giftBox"
+            ? createGiftBoxUI(deps)
+            : createPartySpeakerUI(deps);
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

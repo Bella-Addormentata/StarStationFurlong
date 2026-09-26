@@ -78,8 +78,11 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   FURNITURE,
-  getPoolBasin,
+  poolBasinAt,
   getPoolIsland,
+  poolWaterContains,
+  riverSwimWaypoints,
+  riverClimbOut,
 } from "./furniture";
 import type { Seat } from "./seats";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -279,6 +282,10 @@ export class Player {
   private deviceHooks: DeviceFocusHooks | null = null;
   /** Phase timer (TURN dwell — reuses TURN_TIME). */
   private deviceTimer = 0;
+  /** 🧱 Seconds the FINE step has made no headway toward the device front —
+   *  the "wedge": a neighbour's box plus PLAYER_R can put the exact front
+   *  point out of reach (a palm beside the speaker, a table by the cake). */
+  private deviceStuck = 0;
 
   // ── 🧬 Clone-vat spawn state (owner request — diegetic spawn point) ────────
   /** HOLD = frozen inside the tube; WALK_OUT = scripted straight exit walk. */
@@ -350,14 +357,10 @@ export class Player {
     // 🏊 Free swim: in-basin targets are a straight swim; out-of-basin targets
     // climb out at the nearest edge first, then resume the walk.
     if (this.swimMode) {
-      const basin = getPoolBasin(FURNITURE);
-      if (
-        basin &&
-        targetX >= basin.x0 &&
-        targetX <= basin.x1 &&
-        targetZ >= basin.z0 &&
-        targetZ <= basin.z1
-      ) {
+      // 🏊 Shape-aware, not the basin RECTANGLE: the beach river's band bends
+      // away from its own bounding box, and a rect test would swim someone
+      // toward the dry sand at a bend.
+      if (poolWaterContains(FURNITURE, targetX, targetZ)) {
         this.swimTo(targetX, targetZ);
       } else {
         this.pendingDest = { x: targetX, z: targetZ };
@@ -1261,14 +1264,9 @@ export class Player {
     // restored session position, a pre-obstacle walk-in, any edge case —
     // converts to swimming on the spot. Nobody walks on water.
     if (!this.swimMode) {
-      const basin = getPoolBasin(FURNITURE);
       const island = getPoolIsland(FURNITURE);
       if (
-        basin &&
-        pos.x > basin.x0 &&
-        pos.x < basin.x1 &&
-        pos.z > basin.z0 &&
-        pos.z < basin.z1 &&
+        poolWaterContains(FURNITURE, pos.x, pos.z) &&
         (!island || !this._insidePoolIsland(pos.x, pos.z, island))
       ) {
         this.swimMode = true;
@@ -1282,7 +1280,7 @@ export class Player {
     // collision. Self-heals to dry land if the pool vanished under us
     // (room swap / layout edit).
     if (this.swimMode) {
-      const basin = getPoolBasin(FURNITURE);
+      const basin = poolBasinAt(FURNITURE, pos.x, pos.z); // the pool we are IN
       if (!basin) {
         this.swimMode = false;
         pos.y = 0;
@@ -1301,7 +1299,12 @@ export class Player {
           basin.z0,
           Math.min(basin.z1, pos.z + nz * this.SWIM_SPEED * deltaTime),
         );
-        const resolved = this._resolvePoolIsland(nextX, nextZ);
+        // 🌊 The basin is a RECTANGLE; the water may not be (the river bends).
+        // A step that would leave the water slides along it, or holds.
+        const inWater = (x: number, z: number) => poolWaterContains(FURNITURE, x, z);
+        const stepX = inWater(nextX, nextZ) ? nextX : inWater(nextX, pos.z) ? nextX : pos.x;
+        const stepZ = inWater(stepX, nextZ) ? nextZ : pos.z;
+        const resolved = this._resolvePoolIsland(stepX, stepZ);
         pos.x = resolved.x;
         pos.z = resolved.z;
       }
@@ -1363,6 +1366,7 @@ export class Player {
         // Arrived at (or started on) the device's front cell — fine-step next.
         this._removeReticle();
         this.devicePhase = "FINE";
+        this.deviceStuck = 0;
         return;
       }
       this.character.setState(
@@ -1400,6 +1404,7 @@ export class Player {
         if (this.devicePhase === "APPROACH") {
           this._removeReticle();
           this.devicePhase = "FINE";
+          this.deviceStuck = 0;
           return;
         }
         this.character.setState("idle", this.logicalAngle);
@@ -1432,6 +1437,8 @@ export class Player {
       const candX = pos.x + nx * step;
       const candZ = pos.z + nz * step;
       const { boundX, boundZ } = this.roomBounds();
+      const fromX = pos.x;
+      const fromZ = pos.z;
       const r1 = resolveObstacles(
         Math.max(-boundX, Math.min(boundX, candX)),
         pos.z,
@@ -1442,6 +1449,32 @@ export class Player {
       );
       pos.x = r2.x;
       pos.z = r2.z;
+
+      // 🧱 Wedged on a device approach (owner report 2026-09-25): the A*
+      // grid bakes raw boxes but the body collides against boxes inflated by
+      // PLAYER_R, so a cell can be grid-walkable while its centre is
+      // physically out of reach — the palm beside the party speaker pinned
+      // the fox 0.2 m short of the front and the panel never opened. Two
+      // tiers, both only within arm's reach (1.6 m — a table is reachable
+      // across a stool; the doc gate is what guards the action itself):
+      //  · on the LAST leg, no headway for half a second hands off to the
+      //    fine step, which has the same tolerance;
+      //  · with route still ahead, the same only after a long stall (1.5 s)
+      //    — the route is given every chance to lead round the obstacle
+      //    first (Copilot review, PR #169).
+      if (this.devicePhase === "APPROACH" && this.deviceTarget) {
+        const headway = Math.hypot(pos.x - fromX, pos.z - fromZ);
+        this.deviceStuck = headway < step * 0.25 ? this.deviceStuck + deltaTime : 0;
+        const toFront = Math.hypot(this.deviceTarget.front.x - pos.x, this.deviceTarget.front.z - pos.z);
+        const stall = this.waypointPath.length <= 1 ? 0.5 : 1.5;
+        if (this.deviceStuck > stall && toFront < 1.6) {
+          this.waypointPath = [];
+          this._removeReticle();
+          this.devicePhase = "FINE";
+          this.deviceStuck = 0;
+          return;
+        }
+      }
 
       this.character.setState("walk", this.logicalAngle);
     }
@@ -1626,16 +1659,19 @@ export class Player {
   /** 🏊 Straight-line swim to a point inside the basin (clamped). */
   public swimTo(tx: number, tz: number): void {
     if (!this.swimMode || this.sitPhase !== "NONE") return;
-    const basin = getPoolBasin(FURNITURE);
+    const at = this.mesh.position;
+    const basin = poolBasinAt(FURNITURE, at.x, at.z); // the pool we are IN
     if (!basin) return;
     const clampedX = Math.max(basin.x0, Math.min(basin.x1, tx));
     const clampedZ = Math.max(basin.z0, Math.min(basin.z1, tz));
     const destination = this._resolvePoolIsland(clampedX, clampedZ);
     this._clearPath();
-    this.waypointPath = this._swimPathAroundIsland(
-      destination.x,
-      destination.z,
-    );
+    // 🌊 In a winding river the route follows the water (riverSwimWaypoints);
+    // rectangular water keeps the island-aware straight path.
+    const here = this.mesh.position;
+    this.waypointPath =
+      riverSwimWaypoints(FURNITURE, { x: here.x, z: here.z }, destination) ??
+      this._swimPathAroundIsland(destination.x, destination.z);
     this.navMode = "WAYPOINT";
     this.reticle = new WaypointReticle(
       this.scene,
@@ -1728,12 +1764,18 @@ export class Player {
    * final stretch, then resumes whatever the climb was for (pending slots).
    */
   private _beginClimbOut(tx: number, tz: number): void {
-    const basin = getPoolBasin(FURNITURE);
     const pos = this.mesh.position;
+    const basin = poolBasinAt(FURNITURE, pos.x, pos.z); // the pool we are IN
     this._clearPath();
     let ex = pos.x,
       ez = pos.z;
-    if (basin) {
+    // 🌊 A river's exit is its near bank, straight across the flow — not a
+    // corner of the basin rectangle (which lies across the sand at a bend).
+    const bank = riverClimbOut(FURNITURE, { x: pos.x, z: pos.z }, { x: tx, z: tz });
+    if (bank) {
+      ex = bank.x;
+      ez = bank.z;
+    } else if (basin) {
       // Exit over the side with the LARGER overshoot toward the target;
       // fall back to the nearest edge when the target is inside the basin.
       const dxOut =
@@ -2599,9 +2641,26 @@ export class Player {
         const nz = dz / dist;
         this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
         const step = Math.min(this.SPEED * deltaTime, dist);
+        const fromX = pos.x;
+        const fromZ = pos.z;
         const r = resolveObstacles(pos.x + nx * step, pos.z + nz * step);
         pos.x = r.x;
         pos.z = r.z;
+        // 🧱 Wedged short of the front point (owner report 2026-09-25: the
+        // party speaker's front lay inside the palm beside it once the box
+        // was inflated by PLAYER_R, so the fox stood 0.2 m off and the panel
+        // never opened). No headway for a beat while already within arm's
+        // reach counts as arrived; from further away we keep pushing.
+        const headway = Math.hypot(pos.x - fromX, pos.z - fromZ);
+        this.deviceStuck = headway < step * 0.25 ? this.deviceStuck + deltaTime : 0;
+        if (this.deviceStuck > 0.4 && dist < 1.6) {
+          this.deviceStuck = 0;
+          this.logicalAngle = device.faceAngle;
+          this.character.setState("idle", this.logicalAngle);
+          this.deviceTimer = 0;
+          this.devicePhase = "TURN";
+          return;
+        }
         this.character.setState("walk", this.logicalAngle);
         return;
       }

@@ -98,11 +98,13 @@ import {
   voteTallyView,
   windowsView,
 } from "./treasuryView";
-import { roomEdit, setRoomEditPermission, setEditWorldProvider } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
+// 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
+import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -117,8 +119,7 @@ import {
 import {
   seedRoomTemplate,
   findTemplate,
-  setRoomThemeWriter,
-} from "./roomTemplates";
+  setRoomThemeWriter, reconcileConcurrentAdds } from "./roomTemplates";
 import {
   bindDoorsDoc,
   writeDoorPairing,
@@ -1368,6 +1369,11 @@ async function joinRoomAtEpoch(
   // 🤖 #77C: bind the shared robot map — per-dock routine config. Same T0 seam.
   bindRobotDoc(sync.doc);
 
+  // 🎉 Bind the shared party map: who the guest of honour is, and each cake's
+  // candles / gift's lid / speaker's switch. Same T0 seam — a joiner must walk
+  // into a party that has already happened and see the candles already out.
+  bindPartyDoc(sync.doc);
+
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the
   // whole station from space immediately. Seeds don't travel (credential
@@ -1586,6 +1592,9 @@ async function joinRoomAtEpoch(
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
     // tanks appear in the exterior as fittings land inside).
     subscribeFurniture(() => refreshExteriorView());
+    // ⚖️ Two + ADD presses that raced each other settle to one (every peer
+    // reaches the same verdict from the doc alone).
+    subscribeFurniture(() => { reconcileConcurrentAdds(); });
     // 🪟 #80 S4: window changes recut the CURRENT room's exterior shell (holes +
     // glass) while at zoom 3 — refreshExteriorView early-returns off-level.
     subscribeWindowLayout(() => refreshExteriorView());
@@ -8584,6 +8593,10 @@ async function init() {
   // shareholders only — 🔒 #141 removed the legacy 'Local-Clone' owner, so
   // pre-S2 rooms are now READ-ONLY for everyone. The reason string
   // resolves the owner's display name through the players map.
+  // 🔒 The party's host-gated writes (a guest's wish may be tidied by the
+  // host) ask the same owner seam edit mode does.
+  setPartyHostPredicate(() => canEditRoom().ok);
+  setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   setRoomEditPermission(() => {
     // Leaving: the old room's doc is still bound and its writes still go out,
     // but it isn't this client's room any more (roomLeavesUnderWay).
