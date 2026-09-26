@@ -412,6 +412,11 @@ export function vatStrandedRelease(
   return nearestFreeSpot(at, facing, 0, 0.25, obstacles, bounds, radius);
 }
 
+/** Past this many obstacles in the walkable box, nearestFreeSpot gives up
+ *  rather than search: a real room has a few dozen, and furniture records
+ *  are peer-written and unbounded. */
+export const VAT_SEARCH_MAX_OBSTACLES = 1000;
+
 /**
  * The nearest spot at least `minR` from `centre` that a player of `radius`
  * may stand on: rings from `firstR` out to 4.5 m (16 bearings, the `facing`
@@ -422,9 +427,16 @@ export function vatStrandedRelease(
  * is made of rectangles whose edges lie on the bounds or on inflated
  * obstacle edges. Every corner of such a rectangle is free, and in a
  * rectangle that reaches `minR` from `centre` at least one corner does too
- * (a disc is convex). So trying every pairing of those coordinates finds a
- * spot whenever one exists. The centre's own coordinates and a 0.25 m
- * lattice join them, so the spot found is the nearest, or close to it.
+ * (a disc is convex). So it walks the columns at those x coordinates (plus
+ * the centre's own and a 0.25 m lattice). On each it takes the exact free
+ * stretches of z between the obstacles crossing it, and the nearest point
+ * of each to `centre`. That finds a spot whenever one exists, in time
+ * quadratic in the obstacle count.
+ *
+ * Furniture records are peer-written and unbounded, so a room with more
+ * than VAT_SEARCH_MAX_OBSTACLES obstacles in the walkable box is not
+ * searched at all: null, and the clone stays held rather than the client
+ * stalling on the search.
  */
 function nearestFreeSpot(
   centre: { x: number; z: number },
@@ -435,46 +447,74 @@ function nearestFreeSpot(
   bounds: { boundX: number; boundZ: number },
   radius: number,
 ): { x: number; z: number } | null {
+  const { boundX, boundZ } = bounds;
+  // Only obstacles that reach into the walkable box matter.
+  const live = obstacles.filter(
+    (b) =>
+      b.x1 + radius > -boundX &&
+      b.x0 - radius < boundX &&
+      b.z1 + radius > -boundZ &&
+      b.z0 - radius < boundZ,
+  );
+  if (live.length > VAT_SEARCH_MAX_OBSTACLES) return null;
   for (let r = firstR; r <= 4.5; r += 0.25) {
     for (let k = 0; k < 16; k++) {
       const turn = (k % 2 === 1 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
       const x = centre.x + Math.sin(facing + turn) * r;
       const z = centre.z + Math.cos(facing + turn) * r;
-      if (!spotBlocked(x, z, obstacles, bounds, radius)) return { x, z };
+      if (!spotBlocked(x, z, live, bounds, radius)) return { x, z };
     }
   }
-  const xs = candidateCoords(
-    bounds.boundX,
-    centre.x,
-    obstacles.flatMap((b) => [b.x0 - radius, b.x1 + radius]),
-  );
-  const zs = candidateCoords(
-    bounds.boundZ,
-    centre.z,
-    obstacles.flatMap((b) => [b.z0 - radius, b.z1 + radius]),
-  );
+  const xs = new Set<number>([-boundX, boundX, centre.x]);
+  for (const b of live) {
+    xs.add(b.x0 - radius);
+    xs.add(b.x1 + radius);
+  }
+  const n = Math.floor(boundX / 0.25);
+  for (let i = -n; i <= n; i++) xs.add(i * 0.25);
   let best: { x: number; z: number } | null = null;
   let bestD = Infinity;
-  for (const x of xs) {
-    for (const z of zs) {
-      const d = Math.hypot(x - centre.x, z - centre.z);
-      if (d >= minR && d < bestD && !spotBlocked(x, z, obstacles, bounds, radius)) {
-        best = { x, z };
-        bestD = d;
-      }
+  const consider = (x: number, z: number) => {
+    const d = Math.hypot(x - centre.x, z - centre.z);
+    if (d >= minR && d < bestD) {
+      best = { x, z };
+      bestD = d;
     }
+  };
+  for (const x of xs) {
+    if (Math.abs(x) > boundX + 1e-9) continue;
+    const dx = x - centre.x;
+    if (Math.abs(dx) >= bestD) continue; // nothing on this column can be nearer
+    // Where this column is blocked: the open z-intervals of the obstacles
+    // it crosses (spotBlocked's strict test), sorted by start.
+    const cuts: Array<[number, number]> = [];
+    for (const b of live) {
+      if (x > b.x0 - radius && x < b.x1 + radius) cuts.push([b.z0 - radius, b.z1 + radius]);
+    }
+    cuts.sort((a, c) => a[0] - c[0]);
+    // The free closed stretches between them, and the nearest point of each
+    // (clamped centre, the ends, or where the column meets the minR circle).
+    const reach = minR > Math.abs(dx) ? Math.sqrt(minR * minR - dx * dx) + 1e-6 : 0;
+    const stretch = (z0: number, z1: number) => {
+      if (z1 < z0) return;
+      consider(x, Math.min(z1, Math.max(z0, centre.z)));
+      consider(x, z0);
+      consider(x, z1);
+      if (reach > 0) {
+        for (const z of [centre.z - reach, centre.z + reach]) {
+          if (z >= z0 && z <= z1) consider(x, z);
+        }
+      }
+    };
+    let from = -boundZ;
+    for (const [c0, c1] of cuts) {
+      if (from > boundZ) break;
+      if (c0 >= from) stretch(from, Math.min(c0, boundZ));
+      from = Math.max(from, c1);
+    }
+    if (from <= boundZ) stretch(from, boundZ);
   }
   return best;
-}
-
-/** One axis of nearestFreeSpot's search: the bounds, the centre's own
- *  coordinate, the inflated obstacle edges and a 0.25 m lattice, kept inside
- *  the walkable box, without duplicates. */
-function candidateCoords(bound: number, own: number, edges: number[]): number[] {
-  const out = new Set<number>([-bound, bound, own, ...edges]);
-  const n = Math.floor(bound / 0.25);
-  for (let i = -n; i <= n; i++) out.add(i * 0.25);
-  return [...out].filter((v) => Math.abs(v) <= bound + 1e-9);
 }
 
 /** Root height while walking out: on the pad inside, easing down off the

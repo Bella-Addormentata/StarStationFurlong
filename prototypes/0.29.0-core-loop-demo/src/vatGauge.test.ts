@@ -30,6 +30,7 @@ import {
   VAT_PLINTH_R,
   VAT_Q_LIP,
   VAT_Q_NECK,
+  VAT_SEARCH_MAX_OBSTACLES,
   VAT_TANK_H,
   vatClearOfDoorAt,
   VAT_FOOTPRINT_HALF,
@@ -46,6 +47,7 @@ import {
   vatStrandedRelease,
 } from './vatGauge';
 import * as THREE from 'three';
+import type { CloneVatHandle } from './devices';
 import { FURNITURE, FURNITURE_DEFS, buildItemGroup, itemAabb, snapItemPos } from './furniture';
 import {
   bindFurnitureDoc,
@@ -54,6 +56,28 @@ import {
 } from './furnitureDoc';
 
 const EPS = 1e-9;
+
+/** Build the clone vat's mesh in node. Its status plate draws on a canvas,
+ *  so the builder gets a no-op one while it runs. */
+function buildVat(): THREE.Group {
+  const noop = (): any =>
+    new Proxy(function () {}, {
+      get: (t: any, k) =>
+        k === 'width' || k === 'height' ? 0 : typeof k === 'symbol' ? undefined : k in t ? t[k] : noop(),
+      apply: () => noop(),
+      set: () => true,
+    });
+  const g = globalThis as { document?: unknown };
+  const hadDocument = 'document' in g;
+  const saved = g.document;
+  g.document ??= { createElement: () => ({ width: 0, height: 0, getContext: () => noop(), style: {} }) };
+  try {
+    return buildItemGroup({ id: 'v', kind: 'clone-vat', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+  } finally {
+    if (hadDocument) g.document = saved;
+    else delete g.document;
+  }
+}
 /** The walk-out path, root positions every 5 mm. */
 function pathSamples(): number[] {
   const out: number[] = [];
@@ -203,39 +227,123 @@ describe('door, floor and exit along the walk-out', () => {
   });
 
   it('keeps every vertex of the built vat within VAT_OUTER_R of its axis', () => {
-    // The status plate draws on a canvas: give the builder a no-op one.
-    const noop = (): any =>
-      new Proxy(function () {}, {
-        get: (t: any, k) =>
-          k === 'width' || k === 'height' ? 0 : typeof k === 'symbol' ? undefined : k in t ? t[k] : noop(),
-        apply: () => noop(),
-        set: () => true,
-      });
-    const g = globalThis as { document?: unknown };
-    const hadDocument = 'document' in g;
-    const saved = g.document;
-    g.document ??= { createElement: () => ({ width: 0, height: 0, getContext: () => noop(), style: {} }) };
-    try {
-      const vat = buildItemGroup({ id: 'v', kind: 'clone-vat', pos: { x: 0, z: 0 }, rot: 0, movable: true });
-      vat.updateMatrixWorld(true);
-      let reach = 0;
-      const v = new THREE.Vector3();
-      vat.traverse((o) => {
-        const pos = (o as THREE.Mesh).isMesh ? (o as THREE.Mesh).geometry.attributes.position : null;
-        if (!pos) return;
-        for (let i = 0; i < pos.count; i++) {
-          v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
-          reach = Math.max(reach, Math.hypot(v.x, v.z));
-        }
-      });
-      expect(reach).toBeGreaterThan(VAT_PLINTH_R); // the rear pipes stand proud of the plinth
-      expect(reach).toBeLessThanOrEqual(VAT_OUTER_R);
-      // A fallback release clears all of it by the clone's whole reach.
-      expect(VAT_FALLBACK_MIN_R - AVATAR_REACH).toBeGreaterThan(reach);
-    } finally {
-      if (hadDocument) g.document = saved;
-      else delete g.document;
+    const vat = buildVat();
+    vat.updateMatrixWorld(true);
+    let reach = 0;
+    const v = new THREE.Vector3();
+    vat.traverse((o) => {
+      const pos = (o as THREE.Mesh).isMesh ? (o as THREE.Mesh).geometry.attributes.position : null;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+        reach = Math.max(reach, Math.hypot(v.x, v.z));
+      }
+    });
+    expect(reach).toBeGreaterThan(VAT_PLINTH_R); // the rear pipes stand proud of the plinth
+    expect(reach).toBeLessThanOrEqual(VAT_OUTER_R);
+    // A fallback release clears all of it by the clone's whole reach.
+    expect(VAT_FALLBACK_MIN_R - AVATAR_REACH).toBeGreaterThan(reach);
+  });
+});
+
+describe('the vat handle: drain, hold empty, open; then close, then refill', () => {
+  const DT = 1 / 60;
+  /** A built vat's handle, its door group and its liquid column. */
+  function rig() {
+    const vat = buildVat();
+    let handle: CloneVatHandle | undefined;
+    let door: THREE.Object3D | undefined;
+    let liquid: THREE.Mesh | undefined;
+    vat.traverse((o) => {
+      if (o.userData.cloneVat) handle = o.userData.cloneVat as CloneVatHandle;
+      if (o.name === 'cloneVatDoor') door = o;
+      const geo = (o as THREE.Mesh).geometry as THREE.CylinderGeometry | undefined;
+      if (
+        (o as THREE.Mesh).isMesh &&
+        geo?.type === 'CylinderGeometry' &&
+        Math.abs(geo.parameters.radiusTop - (VAT_GLASS_R - 0.04)) < 1e-9
+      ) {
+        liquid = o as THREE.Mesh;
+      }
+    });
+    expect(handle && door && liquid).toBeTruthy();
+    return {
+      handle: handle!,
+      door: () => door!.rotation.y,
+      level: () => liquid!.scale.y, // 0.0001 when drained (never a zero scale)
+    };
+  }
+  const drained = 0.001;
+
+  it('opens only once drained and seen empty, and fires onOpen once, fully open', () => {
+    const { handle, door, level } = rig();
+    let opened = 0;
+    handle.beginSpawnCycle(() => {
+      opened++;
+      expect(door()).toBeCloseTo(Math.PI, 6);
+    });
+    let emptyAndShut = 0;
+    for (let i = 0; i < 8 / DT; i++) {
+      handle.update(DT);
+      if (door() > 0) expect(level()).toBeLessThan(drained); // the door moves on a drained tank only
+      if (door() === 0 && level() < drained) emptyAndShut += DT;
     }
+    expect(opened).toBe(1);
+    expect(door()).toBeCloseTo(Math.PI, 6);
+    expect(emptyAndShut).toBeGreaterThanOrEqual(0.4); // held shut and visibly empty first
+
+    // Then close and refill: the tank stays dry until the door is shut.
+    handle.closeAndRefill();
+    let prevDoor = door();
+    for (let i = 0; i < 6 / DT; i++) {
+      handle.update(DT);
+      expect(door()).toBeLessThanOrEqual(prevDoor + 1e-12);
+      if (door() > 0) expect(level()).toBeLessThan(drained);
+      prevDoor = door();
+      if (i === 10) handle.closeAndRefill(); // idempotent: the close carries on
+    }
+    expect(door()).toBe(0);
+    expect(level()).toBeCloseTo(1, 6);
+    expect(opened).toBe(1);
+  });
+
+  it('cut short mid-drain: never opens, refills from where the level stands', () => {
+    const { handle, door, level } = rig();
+    let opened = 0;
+    handle.beginSpawnCycle(() => opened++);
+    while (level() > 0.5) handle.update(DT);
+    handle.closeAndRefill();
+    let prev = level();
+    for (let i = 0; i < 6 / DT; i++) {
+      handle.update(DT);
+      expect(door()).toBe(0);
+      expect(level()).toBeGreaterThanOrEqual(prev - 1e-12); // no snap down to empty
+      prev = level();
+    }
+    expect(level()).toBeCloseTo(1, 6);
+    expect(opened).toBe(0); // the pending onOpen was dropped
+  });
+
+  it('cut short mid-spin: closes from the angle it reached, then refills', () => {
+    const { handle, door, level } = rig();
+    let opened = 0;
+    handle.beginSpawnCycle(() => opened++);
+    while (door() < 1) handle.update(DT);
+    const reached = door();
+    handle.closeAndRefill();
+    handle.update(DT);
+    expect(door()).toBeLessThanOrEqual(reached);
+    expect(door()).toBeGreaterThan(reached - 0.1); // eases from there, no snap open or shut
+    let prevDoor = door();
+    for (let i = 0; i < 6 / DT; i++) {
+      handle.update(DT);
+      expect(door()).toBeLessThanOrEqual(prevDoor + 1e-12);
+      if (door() > 0) expect(level()).toBeLessThan(drained);
+      prevDoor = door();
+    }
+    expect(door()).toBe(0);
+    expect(level()).toBeCloseTo(1, 6);
+    expect(opened).toBe(0);
   });
 });
 
@@ -320,6 +428,29 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
       s !== null && s.x >= 3.1 - 1e-9 && s.x <= 3.14 + 1e-9;
     expect(inPocket(vatFallbackRelease({ x: 0, z: 0 }, 0, [left, right], ROOM, R))).toBe(true);
     expect(inPocket(vatStrandedRelease({ x: 0, z: 0 }, 0, [left, right], ROOM, R))).toBe(true);
+  });
+
+  it('keeps the whole-room search quick with many obstacles, and refuses a flood', () => {
+    // Covered but for a strip by the east wall, so the rings fail and the
+    // whole-room pass runs, plus ~1000 tiny boxes each on its own x and z
+    // (the worst case for the candidate count).
+    const cover = { x0: -6, z0: -6, x1: 4.5, z1: 6 };
+    const many = [cover];
+    for (let i = 0; i < VAT_SEARCH_MAX_OBSTACLES - 1; i++) {
+      const x = -5 + i * 0.0088;
+      const z = -5 + i * 0.0097;
+      many.push({ x0: x, z0: z, x1: x + 0.01, z1: z + 0.01 });
+    }
+    const t0 = performance.now();
+    const spot = vatFallbackRelease({ x: 0, z: 0 }, 0, many, ROOM, R);
+    expect(performance.now() - t0).toBeLessThan(2000);
+    expect(spot!.x).toBeGreaterThanOrEqual(cover.x1 + R);
+    // Past the cap it does not search: no spot, so the clone stays held.
+    const flood = [...many, { x0: -5, z0: -5, x1: -4.99, z1: -4.99 }];
+    expect(vatFallbackRelease({ x: 0, z: 0 }, 0, flood, ROOM, R)).toBeNull();
+    // Boxes wholly outside the walkable box don't count toward the cap.
+    const outside = Array.from({ length: 2000 }, (_, i) => ({ x0: 7 + i, z0: 7, x1: 7.5 + i, z1: 7.5 }));
+    expect(vatFallbackRelease({ x: 0, z: 0 }, 0, [cover, ...outside], ROOM, R)).not.toBeNull();
   });
 
   it('puts a clone down past the shut door only where its tail clears the sweep', () => {

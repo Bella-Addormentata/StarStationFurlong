@@ -5888,6 +5888,9 @@ function buildCloneVat(ctx: BuildCtx) {
         return;
       }
       t += Math.max(0, deltaTime);
+      // onOpen fires only after this frame's pose is on the meshes, so the
+      // clone never starts out through a door still a frame short of open.
+      let fireOnOpen: (() => void) | null = null;
       switch (phase) {
         case "BEAT":
           if (t >= VAT_BEAT_TIME) {
@@ -5915,11 +5918,8 @@ function buildCloneVat(ctx: BuildCtx) {
           if (t >= VAT_DOOR_TIME) {
             doorAngle = VAT_DOOR_OPEN;
             phase = "IDLE_OPEN";
-            if (onOpenCb) {
-              const cb = onOpenCb;
-              onOpenCb = null; // exactly once
-              cb();
-            }
+            fireOnOpen = onOpenCb;
+            onOpenCb = null; // exactly once
           }
           break;
         case "CLOSE":
@@ -5947,6 +5947,7 @@ function buildCloneVat(ctx: BuildCtx) {
         ((bathLight.userData.targetIntensity as number) ?? 1.6) *
         (0.2 + 0.8 * level);
       applyPose();
+      fireOnOpen?.();
     },
   };
   // Stow on a tiny carrier mesh inside the plinth — collected by
