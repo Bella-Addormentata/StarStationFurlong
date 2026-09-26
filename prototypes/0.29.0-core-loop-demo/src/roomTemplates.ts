@@ -834,6 +834,16 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
 
 const BATCH_SEP = "~"; // id ~ batch-tag; no other writer puts a ~ in an id
 let addBatchSeq = 0;
+/** Two presses are a RACE only if they were made within this window of each
+ *  other (the tag carries the press's clock): a set edited down over weeks
+ *  to a few pieces must never settle a fresh press by coincidence (Copilot
+ *  review, PR #169). Clocks differ a little between peers; a race is seconds. */
+const RACE_WINDOW_MS = 30_000;
+const batchTime = (tag: string): number => {
+  const ts = tag.slice(tag.lastIndexOf(".") + 1);
+  const t = parseInt(ts, 36);
+  return Number.isFinite(t) ? t : NaN;
+};
 
 /**
  * ⚖️ Settle + ADD presses that raced. Two peers pressing at the same moment
@@ -843,9 +853,11 @@ let addBatchSeq = 0;
  * doc alone, so every peer reaches the same answer: batches are taken in
  * tag order, and a batch that coincides with an earlier surviving one — the
  * same kind at the same coordinates for at least two pieces and half of the
- * smaller batch — loses and is deleted. Two presses made one after the
- * other never coincide (the second fitted around the first). Run on every
- * furniture change; returns the ids it removed (Copilot review, PR #169).
+ * smaller batch, and made within RACE_WINDOW_MS of it — loses and is
+ * deleted. Two presses made one after the other never coincide (the second
+ * fitted around the first), and an old batch's leftovers are outside the
+ * window. Run on every furniture change; returns the ids it removed
+ * (Copilot review, PR #169).
  */
 export function reconcileConcurrentAdds(): string[] {
   const batches = new Map<string, Array<{ id: string; sig: string }>>();
@@ -856,18 +868,20 @@ export function reconcileConcurrentAdds(): string[] {
     batches.set(tag, [...(batches.get(tag) ?? []), { id, sig: `${r.kind}@${r.x},${r.z}` }]);
   }
   if (batches.size < 2) return [];
-  const survivors: Array<Set<string>> = [];
+  const survivors: Array<{ sigs: Set<string>; t: number }> = [];
   const losers: string[] = [];
   for (const tag of [...batches.keys()].sort()) {
     const items = batches.get(tag)!;
     const sigs = new Set(items.map((i) => i.sig));
-    const clash = survivors.some((s) => {
+    const t = batchTime(tag);
+    const clash = Number.isFinite(t) && survivors.some((s) => {
+      if (!(Math.abs(s.t - t) <= RACE_WINDOW_MS)) return false;
       let n = 0;
-      for (const sig of sigs) if (s.has(sig)) n++;
-      return n >= Math.max(2, Math.ceil(Math.min(s.size, sigs.size) / 2));
+      for (const sig of sigs) if (s.sigs.has(sig)) n++;
+      return n >= Math.max(2, Math.ceil(Math.min(s.sigs.size, sigs.size) / 2));
     });
     if (clash) losers.push(...items.map((i) => i.id));
-    else survivors.push(sigs);
+    else survivors.push({ sigs, t });
   }
   deleteFurnitureItems(losers);
   return losers;
@@ -911,7 +925,7 @@ export function addRoomTemplateItems(
   // everything written; and the tag is what reconcileConcurrentAdds reads
   // to settle two presses that fitted the same room at the same moment
   // (Copilot review, PR #169).
-  const tag = `${peerIdTag()}.${++addBatchSeq}`;
+  const tag = `${peerIdTag()}.${++addBatchSeq}.${Date.now().toString(36)}`;
   const written = addFurniture(wanted.map((i) => ({ ...i, id: `${i.id}${BATCH_SEP}${tag}` })));
   configureTemplateDocks(t, wanted, written);
   // "Skipped" against what THIS room holds when empty — the set fitted to

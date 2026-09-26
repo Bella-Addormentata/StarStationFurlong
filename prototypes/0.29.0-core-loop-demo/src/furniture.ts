@@ -9786,9 +9786,10 @@ export function poolWaterContains(items: FurnitureItem[], wx: number, wz: number
       });
       return !onBridge;
     }
-    const basin = getPoolBasin(items);
-    if (!basin) return false;
-    return wx > basin.x0 && wx < basin.x1 && wz > basin.z0 && wz < basin.z1;
+    // Each rectangular pool by ITS OWN basin — the first pool's rectangle
+    // reported the second pool dry (Copilot review, PR #169).
+    const basin = poolBasinOf(item);
+    if (wx > basin.x0 && wx < basin.x1 && wz > basin.z0 && wz < basin.z1) return true;
   }
   return false;
 }
@@ -9908,15 +9909,45 @@ export function floorCutOutlines(items: FurnitureItem[]): Array<Array<{ x: numbe
   return out;
 }
 
-export function getPoolBasin(items: FurnitureItem[]): {
+export interface PoolBasin {
   x0: number;
   z0: number;
   x1: number;
   z1: number;
   exit: { x0: number; z0: number; x1: number; z1: number };
-} | null {
+}
+
+/** The FIRST pool's basin — kept for callers that only ask "is there water";
+ *  anything about a point or a swimmer wants poolBasinAt, which resolves the
+ *  pool the point is actually in (Copilot review, PR #169: with two pools
+ *  the second was judged by the first's rectangle). */
+export function getPoolBasin(items: FurnitureItem[]): PoolBasin | null {
   for (const item of items) {
     if (!isPoolKind(item.kind)) continue;
+    return poolBasinOf(item);
+  }
+  return null;
+}
+
+/** 🏊 The basin of the pool whose water holds (wx, wz) — the swimmer's OWN
+ *  pool, kept through the swim and the climb-out — else, out of the water,
+ *  the nearest pool's; null with no pool in the room. */
+export function poolBasinAt(items: FurnitureItem[], wx: number, wz: number): PoolBasin | null {
+  let nearest: PoolBasin | null = null;
+  let nearestD = Infinity;
+  for (const item of items) {
+    if (!isPoolKind(item.kind)) continue;
+    const basin = poolBasinOf(item);
+    if (poolWaterContains([item, ...items.filter((b) => b.kind === "plank-bridge")], wx, wz)) return basin;
+    const d = Math.hypot(item.pos.x - wx, item.pos.z - wz);
+    if (d < nearestD) { nearestD = d; nearest = basin; }
+  }
+  return nearest;
+}
+
+/** One pool's basin rectangle (world space) and its exit corridor. */
+export function poolBasinOf(item: FurnitureItem): PoolBasin {
+  {
     if (item.kind === "beach-river") {
       // The band's bounding box. Swim CLAMPING and climb-out both want a
       // rectangle, and over-covering is safe here because ENTRY is gated by
@@ -9946,6 +9977,7 @@ export function getPoolBasin(items: FurnitureItem[]): {
     // Margin keeps the avatar's bulk off walls/edges; a "west" climb-out
     // lands back inside the basin and the auto-swim converts it — by design
     // (there is no deck out there, only horizon).
+    // (Rect pools: lazy-pool and classic-pool share this basin.)
     const a = rotXZ(-4.8, -2.55, item.rot); // west/deep corner (WX - margin)
     const b = rotXZ(3.05, 2.55, item.rot); // east corner (HX - margin)
     const e1 = rotXZ(-4.6, -3.25, item.rot); // exits: corridor cell centres
@@ -9963,7 +9995,6 @@ export function getPoolBasin(items: FurnitureItem[]): {
       },
     };
   }
-  return null;
 }
 
 /** 🌊 The lazy-river water outline (irregular bank + central island hole) in

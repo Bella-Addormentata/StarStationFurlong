@@ -16,7 +16,7 @@ import { bindRobotDoc, readRobotConfig } from './robotDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
 import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag } from './furnitureDoc';
 import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, roomOccupancy, addRoomTemplateItems, applyRoomTemplate, reconcileConcurrentAdds, type PlacementSpec } from './roomTemplates';
-import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, type Box, type FurnitureItem } from './furniture';
+import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, poolWaterContains, poolBasinAt, type Box, type FurnitureItem } from './furniture';
 
 const HALF = { halfX: 6, halfZ: 6 }; // the default 2×2 module
 const party = ROOM_TEMPLATES.find((t) => t.id === 'party-2')!;
@@ -382,6 +382,49 @@ describe('the dancer', () => {
     expect(addedDocks).toHaveLength(1);
     expect(addedDocks[0]).not.toBe(placedDocks[0]);
     expect(readRobotConfig(addedDocks[0])?.routine).toBe('dance');
+  });
+});
+
+describe('a race is a matter of seconds', () => {
+  const rec = (kind: string, x: number, z: number) => ({ kind, x, z, rot: 0, movable: true });
+  it('never lets an old batch\'s leftovers settle a fresh press, and settles a pair made within the window', () => {
+    const doc = new Y.Doc();
+    bindFurnitureDoc(doc);
+    const m = doc.getMap('furniture');
+    const now = Date.now();
+    const old = (now - 3_600_000).toString(36); // an hour ago, edited down to two pieces
+    m.set(`p-cake-table-1~a.1.${old}`, rec('cake-table', 2.52, -4.68));
+    m.set(`p-beach-ball-2~a.1.${old}`, rec('beach-ball', 1.8, 5.16));
+    const fresh = (now - 2_000).toString(36); // a press just now, coinciding on both
+    m.set(`p-cake-table-1~b.1.${fresh}`, rec('cake-table', 2.52, -4.68));
+    m.set(`p-beach-ball-2~b.1.${fresh}`, rec('beach-ball', 1.8, 5.16));
+    m.set(`p-gift-box-3~b.1.${fresh}`, rec('gift-box', 0.92, -4.38));
+    expect(reconcileConcurrentAdds()).toEqual([]);
+    expect(m.size).toBe(5);
+    // The same coincidence from a press 4 s after the fresh one IS a race: the
+    // later tag loses.
+    const racing = (now - 1_000).toString(36);
+    m.set(`p-cake-table-1~c.1.${racing}`, rec('cake-table', 2.52, -4.68));
+    m.set(`p-beach-ball-2~c.1.${racing}`, rec('beach-ball', 1.8, 5.16));
+    const removed = reconcileConcurrentAdds();
+    expect(removed.sort()).toEqual([`p-beach-ball-2~c.1.${racing}`, `p-cake-table-1~c.1.${racing}`]);
+    expect(m.size).toBe(5);
+  });
+});
+
+describe('two pools', () => {
+  const pool = (id: string, x: number, z: number): FurnitureItem => ({ id, kind: 'classic-pool', pos: { x, z }, rot: 0, movable: true });
+  it('judges each point by its OWN pool, and a swimmer keeps the pool they are in', () => {
+    const items = [pool('p1', -8, 0), pool('p2', 8, 0)];
+    expect(poolWaterContains(items, -8, 0)).toBe(true);
+    expect(poolWaterContains(items, 8, 0)).toBe(true); // the second pool was reported dry
+    expect(poolWaterContains(items, 0, 0)).toBe(false);
+    const b2 = poolBasinAt(items, 8, 0)!;
+    expect(b2.x0).toBeGreaterThan(0); // the second pool's rectangle, not the first's
+    expect(poolBasinAt(items, -8, 0)!.x1).toBeLessThan(0);
+    // Out of the water: the nearest pool's.
+    expect(poolBasinAt(items, 5, 0)!.x0).toBeGreaterThan(0);
+    expect(poolBasinAt([], 0, 0)).toBeNull();
   });
 });
 

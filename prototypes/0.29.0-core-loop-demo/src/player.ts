@@ -78,7 +78,7 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   FURNITURE,
-  getPoolBasin,
+  poolBasinAt,
   getPoolIsland,
   poolWaterContains,
   riverSwimWaypoints,
@@ -1280,7 +1280,7 @@ export class Player {
     // collision. Self-heals to dry land if the pool vanished under us
     // (room swap / layout edit).
     if (this.swimMode) {
-      const basin = getPoolBasin(FURNITURE);
+      const basin = poolBasinAt(FURNITURE, pos.x, pos.z); // the pool we are IN
       if (!basin) {
         this.swimMode = false;
         pos.y = 0;
@@ -1659,7 +1659,8 @@ export class Player {
   /** 🏊 Straight-line swim to a point inside the basin (clamped). */
   public swimTo(tx: number, tz: number): void {
     if (!this.swimMode || this.sitPhase !== "NONE") return;
-    const basin = getPoolBasin(FURNITURE);
+    const at = this.mesh.position;
+    const basin = poolBasinAt(FURNITURE, at.x, at.z); // the pool we are IN
     if (!basin) return;
     const clampedX = Math.max(basin.x0, Math.min(basin.x1, tx));
     const clampedZ = Math.max(basin.z0, Math.min(basin.z1, tz));
@@ -1763,8 +1764,8 @@ export class Player {
    * final stretch, then resumes whatever the climb was for (pending slots).
    */
   private _beginClimbOut(tx: number, tz: number): void {
-    const basin = getPoolBasin(FURNITURE);
     const pos = this.mesh.position;
+    const basin = poolBasinAt(FURNITURE, pos.x, pos.z); // the pool we are IN
     this._clearPath();
     let ex = pos.x,
       ez = pos.z;
