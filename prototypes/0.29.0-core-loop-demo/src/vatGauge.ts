@@ -346,12 +346,18 @@ export function vatFreeExitAlong(
   return free !== null && free >= minEnd ? free : null;
 }
 
+/** A fallback release is at full size at once and may face any way, so it
+ *  must clear the vat by the clone's whole reach, not just its collision
+ *  radius: the plinth's base ring plus AVATAR_REACH from the vat's axis. */
+export const VAT_FALLBACK_MIN_R = VAT_PLINTH_R + 0.05 + AVATAR_REACH;
+
 /**
  * Where a clone steps out when its door path is blocked (vatFreeExitAlong
- * gave null): the nearest collision-free spot around the vat — rings from
- * just clear of its footprint out to 4 m, door side first — else the
- * nearest free spot anywhere in the walkable box (0.25 m grid). null only
- * when nowhere in the room is free; the caller then keeps the clone held.
+ * gave null): the nearest collision-free spot around the vat far enough
+ * that the full-size clone clears it (VAT_FALLBACK_MIN_R) — rings from
+ * there out to 4.5 m, door side first — else the nearest such spot
+ * anywhere in the walkable box (0.25 m grid). null only when nowhere in the
+ * room qualifies; the caller then keeps the clone held.
  */
 export function vatFallbackRelease(
   centre: { x: number; z: number },
@@ -360,7 +366,8 @@ export function vatFallbackRelease(
   bounds: { boundX: number; boundZ: number },
   radius: number,
 ): { x: number; z: number } | null {
-  for (let r = VAT_FOOTPRINT_HALF + radius + 0.05; r <= 4; r += 0.25) {
+  const minR = Math.max(VAT_FOOTPRINT_HALF + radius, VAT_FALLBACK_MIN_R);
+  for (let r = minR + 0.05; r <= 4.5; r += 0.25) {
     for (let k = 0; k < 16; k++) {
       const turn = (k % 2 === 1 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
       const x = centre.x + Math.sin(facing + turn) * r;
@@ -377,7 +384,7 @@ export function vatFallbackRelease(
       const x = i * 0.25;
       const z = j * 0.25;
       const d = Math.hypot(x - centre.x, z - centre.z);
-      if (d < bestD && !spotBlocked(x, z, obstacles, bounds, radius)) {
+      if (d >= minR && d < bestD && !spotBlocked(x, z, obstacles, bounds, radius)) {
         best = { x, z };
         bestD = d;
       }

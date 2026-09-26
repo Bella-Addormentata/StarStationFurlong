@@ -14,6 +14,7 @@ import {
   VAT_DOOR_SWEEP_R,
   VAT_DOOR_TOP_Y,
   VAT_EXIT_ALONG,
+  VAT_FALLBACK_MIN_R,
   VAT_GLASS_BASE_Y,
   VAT_GLASS_H,
   VAT_GLASS_R,
@@ -250,6 +251,13 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     expect(Math.abs(spot.x)).toBeLessThanOrEqual(ROOM.boundX);
     expect(Math.abs(spot.z)).toBeLessThanOrEqual(ROOM.boundZ);
     expect(spot.z).toBeGreaterThan(0); // still on the door's side of the vat
+    // Released full-size at once, facing anywhere: its whole reach must clear
+    // the vat (plinth ring + tail), not just its collision radius — and so
+    // the door can seal straight away.
+    const d = Math.hypot(spot.x, spot.z);
+    expect(d).toBeGreaterThanOrEqual(VAT_FALLBACK_MIN_R);
+    expect(d - AVATAR_REACH).toBeGreaterThan(VAT_PLINTH_R);
+    expect(vatClearOfDoorAt(d, 1)).toBe(true);
     // A room with nowhere free gives no spot rather than an overlapping one.
     const full = box(0, 0, 6, 6);
     expect(vatFallbackRelease({ x: 0, z: 0 }, 0, [full], ROOM, R)).toBeNull();
