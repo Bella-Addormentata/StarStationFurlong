@@ -428,6 +428,33 @@ export const VAT_EXIT_ALONG: number = (() => {
   return 4;
 })();
 
+// ── Fresh-clone pallor (#165 follow-up) ───────────────────────────────────────
+
+/** The almost-white grey a fresh clone decants in (body colours only — the
+ *  dark eyes, nose and mouth stay dark so the face still reads). */
+export const VAT_PALLOR_HEX = 0xe3e5e8;
+/** Seconds after leaving the vat for the clone's own colours to come back. */
+export const VAT_PALLOR_FADE_S = 30;
+
+/** Pallor (1 = fully pale, 0 = its own colours) `seconds` after the clone
+ *  left the vat: a smooth ease back over VAT_PALLOR_FADE_S. */
+export function vatPallorAt(seconds: number): number {
+  const t = Math.min(1, Math.max(0, seconds / VAT_PALLOR_FADE_S));
+  return 1 - t * t * (3 - 2 * t);
+}
+
+/** A colour `pallor` of the way from `baseHex` to the clone grey (per-channel
+ *  sRGB lerp — the hexes the materials are authored in). */
+export function vatPallorHex(baseHex: number, pallor: number): number {
+  const k = Math.min(1, Math.max(0, pallor));
+  const mix = (shift: number) => {
+    const a = (baseHex >> shift) & 0xff;
+    const b = (VAT_PALLOR_HEX >> shift) & 0xff;
+    return Math.round(a + (b - a) * k) << shift;
+  };
+  return mix(16) | mix(8) | mix(0);
+}
+
 /** The nearest a walk-out may END (metres toward the door): from here out
  *  the clone, eased back to full size in place, clears the tank, doorway
  *  and transom (vatFullSizeFitsAt). Scanned once, on a centimetre grid. */

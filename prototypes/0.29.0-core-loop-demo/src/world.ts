@@ -371,6 +371,9 @@ export class World {
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
+  /** 🧬 The vat item the clone is bound to (its ceremony, or its pending
+   *  seal) — the clone follows it if the vat is moved mid-ceremony. */
+  private activeVatId: string | null = null;
   /** 🧬 True once the queued spawn has seen the exterior boot view (zoom ≥ 3)
    *  — the PRIMARY arming signal: the reveal then fires on the zoom-in
    *  transition, however long the v0.32.20 auto-boot's join-under-intro takes
@@ -3344,6 +3347,7 @@ export class World {
           { x: vat.item.pos.x, z: vat.item.pos.z },
           vat.item.rot * (Math.PI / 2),
         );
+        this.activeVatId = vat.item.id;
         this.pendingVatSpawn = true;
         this.vatSawExterior = false;
         this.pendingVatSpawnGrace = 8; // fallback only — see the field docs
@@ -3581,6 +3585,24 @@ export class World {
     // 🪐 Overhead deck ocean-planet: a slow, calm spin (only while on a deck).
     if (this.isOutdoorDeck && this.deckPlanet) {
       this.deckPlanet.rotation.y += deltaTime * 0.015;
+    }
+
+    // 🧬 The vat running the clone's ceremony can be moved or turned under it
+    // (edit mode, a synced move — its group moves in place and the handle
+    // survives): keep the clone and its door-clearance bound to it — BEFORE the
+    // player's update, whose walk-out re-plan measures from the vat's pose.
+    if (this.activeVatId !== null) {
+      const bound = this.player.isVatBound()
+        ? FURNITURE.find((i) => i.id === this.activeVatId)
+        : undefined;
+      if (bound) {
+        this.player.rebindVat(
+          { x: bound.pos.x, z: bound.pos.z },
+          bound.rot * (Math.PI / 2),
+        );
+      } else if (!this.player.isVatBound()) {
+        this.activeVatId = null;
+      }
     }
 
     // Keep updating while device-FOCUSED too: the mesh is hidden then, but
@@ -5518,6 +5540,7 @@ export class World {
       item.rot * (Math.PI / 2),
       seal,
     );
+    this.activeVatId = item.id;
     handle.beginSpawnCycle(() => {
       // A released clone has already sealed the vat (which drops this
       // callback); belt and braces — never leave the door open and dry.

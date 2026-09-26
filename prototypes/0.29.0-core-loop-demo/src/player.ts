@@ -73,7 +73,7 @@ import { roomWalkBounds } from "./floorPlanDoc";
 import { OBSTACLES } from "./obstacles";
 import {
   VAT_HOLD_ALONG,
-  VAT_PLINTH_R,
+  vatPallorAt,
   vatClearOfDoorAt,
   vatDoorClear,
   vatFallbackRelease,
@@ -315,6 +315,9 @@ export class Player {
   private vatRelaxT = 0;
   private vatRelaxFrom = { horizontal: 1, vertical: 1, y: 0 };
   private readonly VAT_RELAX_TIME = 0.4;
+  /** 🧬 Seconds since release while the clone's colours come back; -1 when
+   *  no fade is running (in the vat it is held fully pale). */
+  private pallorT = -1;
   /** WAIT_CLEAR: seconds between tries for somewhere to step out to. */
   private readonly VAT_WAIT_RETRY = 0.5;
   /** WAIT_CLEAR: where on the door path the clone is held (to look from). */
@@ -827,8 +830,10 @@ export class Player {
     const manualInput = dir.x !== 0 || dir.z !== 0;
 
     // 🧬 A clone released short of the door's sweep seals its vat as soon as
-    // it has walked clear (normally the walk-out itself does this).
+    // it has walked clear (normally the walk-out itself does this), and a
+    // fresh clone's colours ease back from the pallor grey.
     this._sealVatWhenClear();
+    this._updatePallor(deltaTime);
 
     // ── 🧬 Clone-vat spawn choreography: fully scripted (HOLD inside the
     //    tube while it drains/opens, then the straight walk-out). Input is
@@ -2524,6 +2529,10 @@ export class Player {
     this.logicalAngle = faceAngle;
     this._applyVatPose(VAT_HOLD_ALONG);
     this.character.setState("idle", faceAngle);
+    // 🧬 A fresh clone decants almost-white grey; its own colours come back
+    // over VAT_PALLOR_FADE_S once it is out (_releaseVat starts the fade).
+    this.pallorT = -1;
+    this.character.setPallor(1);
   }
 
   /**
@@ -2538,7 +2547,9 @@ export class Player {
    */
   public walkOutOfVat(): boolean {
     if (this.vatPhase !== "HOLD") return false; // released meanwhile
-    this._leaveVat(VAT_PLINTH_R);
+    // Scan from where the clone actually stands — the hold spot inside the
+    // tank — so nothing overlapping the vat is skipped.
+    this._leaveVat(VAT_HOLD_ALONG);
     return true;
   }
 
@@ -2612,6 +2623,60 @@ export class Player {
     this.mesh.scale.set(1, 1, 1);
     this.mesh.position.y = 0;
     this.navMode = "MANUAL";
+    this.pallorT = 0; // out of the vat: colour starts coming back
+  }
+
+  /** 🧬 Ease a released clone's colours back from the pallor grey. */
+  private _updatePallor(deltaTime: number): void {
+    if (this.pallorT < 0) return;
+    this.pallorT += Math.max(0, deltaTime);
+    const k = vatPallorAt(this.pallorT);
+    this.character.setPallor(k);
+    if (k <= 0) this.pallorT = -1;
+  }
+
+  /**
+   * The vat running this ceremony was moved or turned under the clone (edit
+   * mode, a synced move — the group moves in place, the handle survives):
+   * re-anchor to it. The clone keeps its progress along the door path, so a
+   * held clone stays in the tank and a walking one stays in its doorway, and
+   * the door-clearance check measures from where the door now is. A no-op
+   * while the pose is unchanged (World calls it every frame).
+   */
+  public rebindVat(centre: { x: number; z: number }, faceAngle: number): void {
+    if (!this.isVatBound()) return;
+    if (
+      centre.x === this.vatCentre.x &&
+      centre.z === this.vatCentre.z &&
+      faceAngle === this.vatFacing
+    ) {
+      return;
+    }
+    const pos = this.mesh.position;
+    const along =
+      (pos.x - this.vatCentre.x) * Math.sin(this.vatFacing) +
+      (pos.z - this.vatCentre.z) * Math.cos(this.vatFacing);
+    this.vatCentre = { x: centre.x, z: centre.z };
+    this.vatFacing = faceAngle;
+    if (this.vatPhase === "NONE") return; // released: the seal check re-aims
+    this.logicalAngle = faceAngle;
+    if (this.vatPhase === "RELAX") {
+      // Mid-ease: keep the size it has reached, just move with the vat.
+      pos.x = centre.x + Math.sin(faceAngle) * along;
+      pos.z = centre.z + Math.cos(faceAngle) * along;
+    } else if (this.vatPhase === "WALK_OUT") {
+      this._applyVatPose(along); // the next frame re-plans from here
+    } else if (this.vatPhase === "WAIT_CLEAR") {
+      this._applyVatPose(this.vatWaitFrom);
+    } else {
+      this._applyVatPose(VAT_HOLD_ALONG);
+    }
+    this.character.setState("idle", faceAngle);
+  }
+
+  /** Still tied to a vat: in its ceremony, or out but with its seal pending. */
+  public isVatBound(): boolean {
+    return this.vatPhase !== "NONE" || this.vatOnClear !== null;
   }
 
   /** Fire the pending vat seal, exactly once. */

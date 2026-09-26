@@ -23,6 +23,8 @@ import {
   VAT_NECK_H,
   VAT_NECK_HALF_W,
   VAT_PAD_Y,
+  VAT_PALLOR_FADE_S,
+  VAT_PALLOR_HEX,
   VAT_PLINTH_R,
   VAT_Q_LIP,
   VAT_Q_NECK,
@@ -35,6 +37,8 @@ import {
   vatFreeExitAlong,
   vatFullSizeFitsAt,
   vatGaugeAt,
+  vatPallorAt,
+  vatPallorHex,
   vatSqueezeAt,
 } from './vatGauge';
 import { FURNITURE, FURNITURE_DEFS, itemAabb, snapItemPos } from './furniture';
@@ -309,6 +313,15 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, onTop], ROOM, R, 1.7)).toBeNull();
   });
 
+  it('scans from where the held clone stands, not the plinth lip', () => {
+    // A peer-written 1×1 box centred in the tank is inflated only out to
+    // q = 0.88: a scan starting at the lip (0.92) would miss it entirely.
+    const own = box(0, 0, 1, 1);
+    const inTank = box(0, 0, 0.5, 0.5);
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, inTank], ROOM, R)).toBe(VAT_EXIT_ALONG);
+    expect(vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, inTank], ROOM, R, VAT_HOLD_ALONG)).toBeNull();
+  });
+
   it('skips only the vat\'s own box, not other obstacles overlapping it', () => {
     const own = box(0, 0, 1, 1);
     // Peer-written furniture is untrusted: a box around the vat (or the
@@ -323,6 +336,45 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     const vat = FURNITURE.find((i) => i.id === 'clone-vat')!;
     const boxes = FURNITURE.map((i) => itemAabb(i)).filter((b) => b !== null);
     expect(vatFreeExitAlong(vat.pos, vat.rot * (Math.PI / 2), boxes, ROOM, R)).toBe(VAT_EXIT_ALONG);
+  });
+});
+
+describe('fresh-clone pallor', () => {
+  it('starts fully pale and eases back to full colour over ~30 s', () => {
+    expect(VAT_PALLOR_FADE_S).toBe(30);
+    expect(vatPallorAt(0)).toBe(1);
+    expect(vatPallorAt(VAT_PALLOR_FADE_S / 2)).toBeCloseTo(0.5, 9);
+    expect(vatPallorAt(VAT_PALLOR_FADE_S)).toBe(0);
+    expect(vatPallorAt(VAT_PALLOR_FADE_S + 5)).toBe(0);
+    let prev = 1;
+    for (let t = 0; t <= VAT_PALLOR_FADE_S; t += 0.25) {
+      const k = vatPallorAt(t);
+      expect(k).toBeLessThanOrEqual(prev + EPS);
+      expect(prev - k).toBeLessThan(0.02); // slow: no visible step per frame
+      prev = k;
+    }
+  });
+
+  it('blends a colour to the almost-white grey and back exactly', () => {
+    const fur = 0xe07a2c; // the fox's orange
+    expect(vatPallorHex(fur, 0)).toBe(fur);
+    expect(vatPallorHex(fur, 1)).toBe(VAT_PALLOR_HEX);
+    // Almost white, but grey: light and near-neutral.
+    const r = (VAT_PALLOR_HEX >> 16) & 0xff;
+    const g = (VAT_PALLOR_HEX >> 8) & 0xff;
+    const b = VAT_PALLOR_HEX & 0xff;
+    expect(Math.min(r, g, b)).toBeGreaterThan(0xd0);
+    expect(Math.max(r, g, b)).toBeLessThan(0xf5);
+    expect(Math.max(r, g, b) - Math.min(r, g, b)).toBeLessThan(0x10);
+    // Halfway sits between the two on every channel.
+    const mid = vatPallorHex(fur, 0.5);
+    for (const shift of [16, 8, 0]) {
+      const c = (mid >> shift) & 0xff;
+      const lo = Math.min((fur >> shift) & 0xff, (VAT_PALLOR_HEX >> shift) & 0xff);
+      const hi = Math.max((fur >> shift) & 0xff, (VAT_PALLOR_HEX >> shift) & 0xff);
+      expect(c).toBeGreaterThanOrEqual(lo);
+      expect(c).toBeLessThanOrEqual(hi);
+    }
   });
 });
 
