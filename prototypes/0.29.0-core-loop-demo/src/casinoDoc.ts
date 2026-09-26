@@ -56,6 +56,7 @@ import type {
 import { isAirHockeyFeeConfig, isAirHockeyPaidRecord } from './games/airHockey';
 import type { AirHockeyFeeConfig, AirHockeyPaidRecord } from './games/airHockey';
 import { readRoomOwner } from './games/gamesDoc';
+import { legacyOwnerMarker } from './roomOwner';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -883,20 +884,23 @@ function airHockeyPaidKey(tableId: string, playerId: string): string {
  * gamesDoc from the same room doc. A stale or hostile config naming anyone
  * else reads as "no fee" instead of routing chips to the wrong pocket;
  * offline (no room, no owner) every config is rejected, matching the UI
- * rule that an ownerless room has no fee knob.
+ * rule that an ownerless room has no fee knob. So is one in a room whose
+ * owner is the legacy 'Local-Clone' marker (legacyOwnerMarker): no player's
+ * sweep is addressed to it, so a fee charged there could never be collected.
  */
 export function readAirHockeyFeeConfig(tableId: string): AirHockeyFeeConfig | null {
   const value = ensureMap().get(`ah-fee:${tableId}`);
   if (!isAirHockeyFeeConfig(value)) return null;
   const owner = readRoomOwner();
-  return owner !== null && value.ownerId === owner ? value : null;
+  return owner !== null && !legacyOwnerMarker(owner) && value.ownerId === owner ? value : null;
 }
 
 /** Room owner only — callers gate via isHouse (the slot-odds precedent);
  *  the recipient check makes a mis-stamped config unwritable, not just
  *  unreadable. */
 export function writeAirHockeyFeeConfig(tableId: string, config: AirHockeyFeeConfig): void {
-  if (!isAirHockeyFeeConfig(config) || config.ownerId !== readRoomOwner()) return;
+  if (!isAirHockeyFeeConfig(config) || legacyOwnerMarker(config.ownerId)
+    || config.ownerId !== readRoomOwner()) return;
   const map = ensureMap();
   boundDoc!.transact(() => {
     map.set(`ah-fee:${tableId}`, config);

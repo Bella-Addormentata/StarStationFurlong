@@ -55,7 +55,7 @@ import {
   writeGame,
 } from './games/gamesDoc';
 import {
-  finalizeAirHockeyFee, payAirHockeyFee, readAirHockeyFeeConfig,
+  casinoDocEpoch, finalizeAirHockeyFee, payAirHockeyFee, readAirHockeyFeeConfig,
   readAirHockeyPaidRecord, readChips, refundAirHockeyFee,
   scanAirHockeyPaidRecords, subscribeCasino, sweepAirHockeyFees,
   writeAirHockeyFeeConfig,
@@ -65,6 +65,7 @@ import { chipDotsHtml } from './chipDisplay';
 // innerHTML (the seat-row display-name interpolation, previously an XSS).
 import { escapeHtml } from './htmlEscape';
 import { getPlayerId } from './identity';
+import { legacyOwnerMarker } from './roomOwner';
 import {
   packTick, tickKind, TICK_KIND_AH_MALLET, TICK_KIND_AH_PUCK,
 } from './network/protocol';
@@ -160,6 +161,9 @@ interface EngagedInput {
 interface TableSession {
   handle: AirHockeyVisualHandle;
   pose: TablePose;
+  /** The room doc this session began in (casinoDocEpoch). Everything below
+   *  is that room's: see sessionFor. */
+  docEpoch: number;
   remoteMallet: { a: RemoteMallet | null; b: RemoteMallet | null };
   remotePuck: RemotePuck | null;
   engaged: EngagedInput | null;
@@ -197,7 +201,7 @@ export function setAirHockeySender(fn: ((buf: Uint8Array) => void) | null): void
 /**
  * Register (or re-register after a furniture-doc rebuild) a built table's
  * visual handle + pose. Match-transient state survives a handle swap — the
- * table mesh was rebuilt, not the game.
+ * table mesh was rebuilt, not the game — within one room's doc only.
  */
 export function registerAirHockeyVisual(
   itemId: string,
@@ -205,14 +209,35 @@ export function registerAirHockeyVisual(
   pose: TablePose,
 ): void {
   const existing = sessions.get(itemId);
-  if (existing) {
+  if (existing && existing.docEpoch === casinoDocEpoch()) {
     existing.handle = handle;
     existing.pose = pose;
     return;
   }
-  sessions.set(itemId, {
+  sessions.set(itemId, freshSession(handle, pose));
+}
+
+/**
+ * The table's session in the room's current doc. The registry outlives a
+ * room change, and the next room can hold a table with the same id, whose
+ * built group the furniture reconcile keeps without registering it again.
+ * A session begun in another room's doc therefore starts afresh here, on
+ * the same handle: no remote samples, operator state, sequence counters or
+ * engaged input carry over to the new doc.
+ */
+function sessionFor(itemId: string): TableSession | null {
+  const st = sessions.get(itemId);
+  if (!st || st.docEpoch === casinoDocEpoch()) return st ?? null;
+  const fresh = freshSession(st.handle, st.pose);
+  sessions.set(itemId, fresh);
+  return fresh;
+}
+
+function freshSession(handle: AirHockeyVisualHandle, pose: TablePose): TableSession {
+  return {
     handle,
     pose,
+    docEpoch: casinoDocEpoch(),
     remoteMallet: { a: null, b: null },
     remotePuck: null,
     engaged: null,
@@ -227,7 +252,7 @@ export function registerAirHockeyVisual(
     malletSeq: 0,
     puckSendAccum: 0,
     puckSeq: 0,
-  });
+  };
 }
 
 /** Drop a removed table's runtime state (world.ts removeFurnitureVisuals).
@@ -276,7 +301,8 @@ function seqNewer(next: number, prev: number): boolean {
 function tableAtWorld(x: number, z: number): { id: string; st: TableSession } | null {
   let best: { id: string; st: TableSession } | null = null;
   let bestD = Infinity;
-  for (const [id, st] of sessions) {
+  for (const id of sessions.keys()) {
+    const st = sessionFor(id)!;
     const l = worldToLocal(st.pose, x, z);
     if (Math.abs(l.x) > AH_HALF_W + 0.6 || Math.abs(l.z) > AH_HALF_L + 0.6) continue;
     const d = l.x * l.x + l.z * l.z;
@@ -466,7 +492,8 @@ export function airHockeyFrame(dt: number): void {
   const now = frameNow;
   const myId = getPlayerId();
 
-  for (const [itemId, st] of sessions) {
+  for (const itemId of sessions.keys()) {
+    const st = sessionFor(itemId)!;
     // Follow furniture moves: edit mode re-poses the existing group WITHOUT a
     // remove/re-register (commitCarry locally, the E4 reconcile remotely), so
     // the wire-frame pose is re-read from the live registry each frame — a
@@ -761,7 +788,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   let lastTopHtml = '';
   let lastCardHtml = '';
 
-  const st = (): TableSession | null => sessions.get(deps.itemId) ?? null;
+  const st = (): TableSession | null => sessionFor(deps.itemId);
   const state = (): AirHockeyState | null => readAirHockey(deps.itemId);
 
   /** May I drive the mallet right now? Claimed my end, game not over. */
@@ -915,7 +942,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const writeFee = (enabled: boolean, amount: number): void => {
     const owner = readRoomOwner();
-    if (!owner || !deps.isHouse()) return;
+    if (!owner || legacyOwnerMarker(owner) || !deps.isHouse()) return;
     writeAirHockeyFeeConfig(deps.itemId, {
       enabled,
       feeAmount: Math.max(0, Math.min(AH_MAX_FEE, Math.round(amount))),
@@ -1097,9 +1124,11 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     }
 
     // Owner service row — the #115 fee knob ("set by owner"), stored beside
-    // the chip ledger. Needs a claimed room (someone must RECEIVE the fee).
+    // the chip ledger. Needs a claimed room (someone must RECEIVE the fee):
+    // a legacy 'Local-Clone' owner can't collect one either.
     let service = '';
-    if (deps.isHouse() && readRoomOwner() !== null) {
+    const roomOwner = readRoomOwner();
+    if (deps.isHouse() && roomOwner !== null && !legacyOwnerMarker(roomOwner)) {
       const enabled = cfg?.enabled === true && (cfg?.feeAmount ?? 0) > 0;
       const amount = cfg?.feeAmount ?? 0;
       service = `

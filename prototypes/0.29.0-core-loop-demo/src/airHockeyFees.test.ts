@@ -155,6 +155,23 @@ describe('fee config validation', () => {
     expect(readChips(P1)).toBe(200);
   });
 
+  it("charges nothing in a room whose owner is the legacy 'Local-Clone' marker", () => {
+    // Nobody's sweep is addressed to the marker, so a fee held for it could
+    // never be collected: a config naming it (written before the marker lost
+    // its authority, or by a peer) reads as no fee, and none can be written.
+    const LEGACY = 'Local-Clone';
+    const doc = makeRoom(LEGACY);
+    doc.transact(() => rawCasino(doc).set(`ah-fee:${TABLE}`, feeConfig(50, true, LEGACY)));
+    buyInChips(P1, 200);
+    expect(readAirHockeyFeeConfig(TABLE)).toBeNull();
+    expect(payAirHockeyFee(TABLE, P1)).toBe(0);
+    expect(readChips(P1)).toBe(200);
+    expect(readAirHockeyPaidRecord(TABLE, P1)).toBeNull();
+    rawCasino(doc).delete(`ah-fee:${TABLE}`);
+    writeAirHockeyFeeConfig(TABLE, feeConfig(50, true, LEGACY));
+    expect(rawCasino(doc).get(`ah-fee:${TABLE}`)).toBeUndefined();
+  });
+
   it('rejects malformed config shapes on read', () => {
     const doc = makeRoom();
     doc.transact(() =>
