@@ -111,6 +111,7 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'lavender-bouquet': '🪻 LAVENDER BOUQUET',
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
+  'coin-pusher': '🪙 COIN PUSHER',
   'cake-table': '🎂 CAKE TABLE',
   'gift-box': '🎁 GIFT BOX',
   'birthday-banner': '🎊 BIRTHDAY BANNER',

@@ -124,6 +124,7 @@ import {
   createSlotMachineUI,
   operateActiveSlotMachine,
   clearPendingSlotPlays,
+  createCoinPusherUI,
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
@@ -134,6 +135,11 @@ import {
   tickAutoSlotMachine,
   tickManualSlotMachine,
 } from "./slotCroupier";
+import {
+  closeCoinPusher,
+  tickCoinPusherRoom,
+  tickCoinPusherTeardowns,
+} from "./pusherCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
@@ -145,6 +151,7 @@ import type {
   SlotMachineVisualHandle,
   PropAnimHandle,
   SlotMachineCabinetControl,
+  CoinPusherVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
@@ -380,6 +387,11 @@ export class World {
   private cloneVats: Map<string, CloneVatHandle> = new Map();
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
+  /** 🪙 Coin-pusher cabinets (issue #135) — animated pusher bar + rebuilt chip
+   *  piles from shared state each frame. Same driven-every-frame idiom as the
+   *  slot-machine visuals; the userData key on the upper platform mesh carries
+   *  the handle so the traversal below picks it up. */
+  private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1607,6 +1619,7 @@ export class World {
       gameTableTops: this.gameTableTops,
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
+      coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
     };
   }
@@ -3028,6 +3041,10 @@ export class World {
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
     this.slotMachineVisuals.delete(itemId);
+    // 🪙 The cabinet frees its chip geometry and materials itself: they exist
+    // before any chip is drawn, so the traversal below can't reach them all.
+    this.coinPusherVisuals.get(itemId)?.dispose();
+    this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
@@ -3042,6 +3059,10 @@ export class World {
     } else if (removedKind === "slot-machine") {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
+    } else if (removedKind === "coin-pusher") {
+      // 🪙 Stop operating it here. The deed holder's session that operates it
+      // pays the chips still inside to the deed holder and wipes its keys.
+      closeCoinPusher(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -3727,6 +3748,10 @@ export class World {
 
     // 🎰 Keep physical cabinet reels synchronized for nearby spectators.
     for (const slot of this.slotMachineVisuals.values()) slot.update(deltaTime);
+    // 🪙 Coin-pusher cabinets — animate the sweep bar + rebuild piles every
+    // frame from the shared state. update(dt) is idempotent per-frame so it
+    // is safe to drive from the same loop regardless of focus / DOM UI.
+    for (const pusher of this.coinPusherVisuals.values()) pusher.update(deltaTime);
 
     // 🧍 Tell the props whether the local player is IN the room, and where —
     // the party speaker strikes up on the fox walking in and fades with
@@ -5171,6 +5196,9 @@ export class World {
     const rouletteTables = FURNITURE.filter((i) => i.kind === "roulette-table");
     const crapsTables = FURNITURE.filter((i) => i.kind === "craps-table");
     const slotMachines = FURNITURE.filter((i) => i.kind === "slot-machine");
+    // 🪙 Coin pushers need no robot at the cabinet (the operator runs
+    // headless), only the room's elected operator session (below).
+    const coinPushers = FURNITURE.filter((i) => i.kind === "coin-pusher");
     const tables = [...rouletteTables, ...crapsTables];
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
@@ -5195,6 +5223,19 @@ export class World {
         tickManualSlotMachine(machine.id, authorized);
       }
     }
+
+    // 🪙 Coin pushers: ONE of the deed holder's sessions operates every
+    // cabinet in the room (one lease, pusherCroupier.ts), so a player's
+    // balance has a single pusher writer. Every client ticks the room: it
+    // watches the lease's renewals (how the panel tells a live operator), and
+    // a client that may not operate stops operating there.
+    // The operator also drains removed cabinets there, once past its settling
+    // wait (closeCoinPusher).
+    tickCoinPusherRoom(coinPushers.map((machine) => machine.id));
+    // …and carry on with removed cabinets: the sweep of their per-player
+    // keys, one batch a frame (after the room tick, which may have just
+    // drained one).
+    tickCoinPusherTeardowns();
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's
     // reserved operator slot (roulette wheel-head / craps stickman). The owner
@@ -5509,6 +5550,24 @@ export class World {
           itemId: deviceId,
           isHouse: () => canEditRoom().ok,
           onDenominationChange: (amount) => visual?.setDenomination(amount),
+          onMessage: (message) => visual?.showMessage(message),
+        }),
+      );
+      return;
+    }
+
+    // 🪙 Coin pusher (#135) — the DOM panel writes the player's drop request
+    // (and the owner's door request); the operator settles them. The cabinet
+    // mirrors the selected hole and the panel's messages, and lights every
+    // settled drop by itself.
+    if (device.kind === "coinPusher") {
+      const visual = this.coinPusherVisuals.get(deviceId);
+      deviceFocus.beginFocus(
+        this.player,
+        device,
+        createCoinPusherUI({
+          itemId: deviceId,
+          onSelectedHoleChange: (hole) => visual?.setSelectedHole(hole),
           onMessage: (message) => visual?.showMessage(message),
         }),
       );

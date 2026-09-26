@@ -82,7 +82,18 @@ import {
   writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
+  // 🪙 Coin pusher (#135) — the player's and owner's request keys; the
+  // operator (pusherCroupier.ts) moves the chips.
+  readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
+  cancelCoinPusherRequest, coinPusherRequestKey, coinPusherResultKey, readCoinPusherResult,
+  COIN_PUSHER_OPERATOR_KEY,
+  readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
+  isCoinPusherRecordUnreadable,
+  subscribeCasinoKey,
 } from './casinoDoc';
+// 🪙 Whether the room's coin pushers are operated, and ready for a drop,
+// judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
+import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
 import { crapsBackend } from './crapsBackend';
@@ -105,6 +116,14 @@ import {
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
 } from './games/slots';
 import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
+// 🪙 Coin pusher engine (#135) — pure physics, no doc / DOM access. The panel
+// reads the sweep clock and the machine's meter from it.
+import {
+  chipsInMachine, currentPusherPhase, pusherFaceX,
+  HOLE_COUNT, HOLE_XS, MACHINE_MAX_CHIPS, PLAT_UP_FRONT, PUSHER_ANTE,
+  PUSHER_REQUEST_TTL_MS,
+} from './games/coinPusher';
+import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/coinPusher';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -124,11 +143,11 @@ import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
-import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
+import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -281,6 +300,31 @@ export interface SlotMachineVisualHandle {
   showMessage(message: string): void;
   /** Animate the physical axle/arm through one pull-and-return cycle. */
   pullLever(): void;
+}
+
+/**
+ * 🪙 In-world coin-pusher cabinet visuals. The pusher bar swings on a cosine
+ * profile that matches the pure engine's `pusherFaceX(phase)`, and the piles
+ * of chips on both platforms rebuild from the shared `pusher:<mid>` state each
+ * frame so every peer watches the same layout. World.update calls update(dt)
+ * every frame (the SlotMachineVisualHandle precedent — no detached rAF loop).
+ */
+export interface CoinPusherVisualHandle {
+  /** Advance the pusher animation phase and repaint pile visuals from the
+   *  shared doc state. Called every frame from World.update. */
+  update(deltaTime: number): void;
+  /** Light the rim of the hole the player's next drop will use. */
+  setSelectedHole(hole: 0 | 1 | 2): void;
+  /** Show a short panel message on the marquee for a couple of seconds. */
+  showMessage(message: string): void;
+  /** A short light pulse at a hole that fades back out. The cabinet fires it
+   *  itself for every settled drop, so spectators see drops too. */
+  triggerDropFx(hole: 0 | 1 | 2): void;
+  /** Free the chip geometry and both chip materials. They exist before any
+   *  chip is drawn, and each chip mesh holds only one material, so a
+   *  traversal of the cabinet can't reach them all. World calls this once,
+   *  as it removes the cabinet. */
+  dispose(): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
@@ -4179,3 +4223,385 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     },
   };
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 🪙 Coin pusher (#135)
+// ══════════════════════════════════════════════════════════════════════════════
+// The player's panel. The machine is run by its operator (pusherCroupier.ts);
+// this panel writes only the player's own drop request (hole + the pusher
+// phase on screen when they pressed DROP) and the owner's door request, and
+// reads the operator's answers back (the player's own result record, the
+// door's answer). No chips move here.
+
+export interface CoinPusherUIDeps {
+  /** Furniture item id — keys the machine's records in the casino map. */
+  itemId: string;
+  /** Mirror the selected hole on the in-world cabinet. */
+  onSelectedHoleChange?(hole: PusherHole): void;
+  /** Show a short message on the cabinet's marquee. */
+  onMessage?(message: string): void;
+}
+
+/** Why a drop was turned down, in plain words. No chips were taken. */
+const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
+  'no-chips': 'NO CHIP TO DROP — VISIT THE CASHIER',
+  'machine-full': 'THE MACHINE IS FULL — THE OWNER HAS TO EMPTY IT',
+  expired: 'YOUR DROP WAITED TOO LONG — NOTHING WAS TAKEN',
+  'balance-full': 'YOUR RACK CAN\'T HOLD ANY MORE — CASH SOME CHIPS OUT FIRST',
+  jammed: 'THE MACHINE JAMMED — NOTHING WAS TAKEN',
+};
+
+/**
+ * The coin-pusher panel: a live pusher gauge (the same clock the cabinet
+ * draws from), three drop holes, INSERT, the player's chips as a physical
+ * rack and their last drop's payout as a tray, and the owner's door.
+ */
+export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  const unsubscribers: Array<() => void> = [];
+  let selectedHole: PusherHole = 1;
+  let flash = '';
+  let timingNote = '';
+  /** My request in flight (DROP is disabled while it is set). */
+  let pending: string | null = null;
+  /** My latest request whose answer is still to be shown — kept after a
+   *  withdrawal, in case an answer that raced it still arrives. */
+  let watching: string | null = null;
+  let expiryTimer = 0;
+  /** My latest settled drop's payout (drawn in the tray). */
+  let lastPaid: number | null = null;
+  /** My door request in flight (its requestId). */
+  let door: string | null = null;
+  /** The machine as last read — the per-frame gauge draws from this. */
+  let cached: CoinPusherState | null = null;
+  /** The operator state the last render showed. */
+  let shownOperator: CoinPusherOperatorState | null = null;
+  const myId = getPlayerId();
+
+  const stopExpiry = (): void => {
+    if (expiryTimer) window.clearTimeout(expiryTimer);
+    expiryTimer = 0;
+  };
+
+  /** Withdraw my unanswered request (it carries no chips; if the operator
+   *  settled it meanwhile, that answer still shows when it arrives). */
+  const withdraw = (message: string): void => {
+    if (!pending) return;
+    stopExpiry();
+    cancelCoinPusherRequest(deps.itemId, myId, pending);
+    pending = null;
+    flash = message;
+    render();
+  };
+
+  const setSelectedHole = (hole: PusherHole): void => {
+    selectedHole = hole;
+    deps.onSelectedHoleChange?.(hole);
+    render();
+  };
+
+  const insert = (): void => {
+    const state = readCoinPusherState(deps.itemId);
+    const operator = coinPusherOperatorState();
+    if (!state || operator !== 'ready') {
+      // A drop made while the operator is still starting up would reach it
+      // too late to keep its timing.
+      flash = operator === 'starting'
+        ? 'THE MACHINE IS STARTING UP — ONE MOMENT'
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT';
+    } else if (pending || readCoinPusherRequest(deps.itemId, myId)) {
+      flash = 'YOUR LAST CHIP IS STILL DROPPING';
+    } else if (readChips(myId) < PUSHER_ANTE) {
+      flash = 'NO CHIPS — VISIT THE CASHIER';
+      deps.onMessage?.('NO CHIPS');
+    } else if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) {
+      flash = PUSHER_REFUSAL_TEXT['machine-full'];
+    } else {
+      const requestedAt = Date.now();
+      const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
+      // The timing IS the pusher phase on screen right now — the clock the
+      // gauge and the cabinet draw from. The operator keeps it if the request
+      // reaches it inside the timing window.
+      const phase = currentPusherPhase(state, requestedAt);
+      if (writeCoinPusherRequest(deps.itemId, {
+        requestId, player: myId, hole: selectedHole, phase, requestedAt,
+      })) {
+        pending = requestId;
+        watching = requestId;
+        stopExpiry();
+        expiryTimer = window.setTimeout(
+          () => withdraw('NO ANSWER FROM THE MACHINE — YOUR DROP WAS WITHDRAWN'),
+          PUSHER_REQUEST_TTL_MS,
+        );
+        lastPaid = null;
+        timingNote = '';
+        flash = 'DROPPING…';
+        deps.onMessage?.('DROP');
+      } else {
+        flash = 'YOUR LAST CHIP IS STILL DROPPING';
+      }
+    }
+    render();
+  };
+
+  const openDoor = (): void => {
+    const state = readCoinPusherState(deps.itemId);
+    if (!state || state.ownerId !== myId) {
+      flash = 'ONLY THE OWNER HAS THE KEY';
+    } else if (coinPusherOperatorState() === 'offline') {
+      flash = 'MACHINE OFFLINE — TRY AGAIN IN A MOMENT';
+    } else if (door || readCoinPusherEmptyRequest(deps.itemId)) {
+      flash = 'THE DOOR IS ALREADY OPENING';
+    } else {
+      const requestedAt = Date.now();
+      const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
+      if (writeCoinPusherEmptyRequest(deps.itemId, { requestId, requester: myId, requestedAt })) {
+        door = requestId;
+        flash = 'OPENING THE DOOR…';
+      }
+    }
+    render();
+  };
+
+  /** Read my answers back: my own result record (durable — another player's
+   *  drop can't overwrite it), a withdrawn request, or the door's answer. */
+  const readResults = (): void => {
+    const result = watching ? readCoinPusherResult(deps.itemId, myId) : null;
+    if (watching && result?.requestId === watching) {
+      stopExpiry();
+      pending = null;
+      watching = null;
+      if (result.kind === 'drop') {
+        lastPaid = result.paid;
+        flash = result.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME';
+        timingNote = result.honored
+          ? 'YOUR TIMING WAS KEPT'
+          : 'TOO LATE, OR THIS DEVICE\'S CLOCK IS OFF — IT DROPPED WHERE THE PUSHER WAS';
+        deps.onMessage?.(result.paid > 0 ? 'WINNER' : 'DROP');
+      } else {
+        flash = PUSHER_REFUSAL_TEXT[result.reason];
+      }
+    } else if (pending && readCoinPusherRequest(deps.itemId, myId)?.requestId !== pending) {
+      // Gone without an answer: withdrawn here, in another tab, or by the
+      // operator. `watching` stays set, so an answer that raced the
+      // withdrawal still shows.
+      stopExpiry();
+      pending = null;
+      flash = 'YOUR DROP WAS WITHDRAWN';
+    }
+    if (door) {
+      // The operator answers in the transaction that clears the request, so
+      // a request gone without this answer tells us nothing about the door.
+      const answer = readCoinPusherDoorResult(deps.itemId);
+      if (answer?.requestId === door) {
+        flash = answer.kind === 'refused' ? 'THE DOOR STAYED SHUT — ONLY THE OWNER HAS THE KEY'
+          : answer.emptied > 0 ? 'DOOR OPENED — THE CHIPS ARE ON YOUR RACK'
+            : 'THE DOOR OPENED ON AN EMPTY MACHINE';
+        door = null;
+      } else if (readCoinPusherEmptyRequest(deps.itemId)?.requestId !== door) {
+        flash = 'NO ANSWER FROM THE DOOR — TRY AGAIN';
+        door = null;
+      }
+    }
+  };
+
+  const paintTray = (id: string, chips: number[], label: string, emptyText?: string): void => {
+    const cv = panel?.querySelector<HTMLCanvasElement>(`#${id}`);
+    const c2 = cv?.getContext('2d');
+    if (!cv || !c2) return;
+    const w = cv.width / 2;
+    const h = cv.height / 2;
+    c2.setTransform(2, 0, 0, 2, 0, 0);
+    c2.clearRect(0, 0, w, h);
+    drawChips(c2, chips, 0, 0, w, h, { emptyText });
+    // The same chips for a screen reader, counted per denomination like the
+    // drawing — never as a total (the physical-chip rule).
+    const groups = groupChips(chips).map((g) => `${g.count} of ${g.denom}`);
+    cv.setAttribute('aria-label', `${label}: ${groups.length ? groups.join(', ') : (emptyText || 'none')}`);
+  };
+
+  const drawGauge = (): void => {
+    const bar = panel?.querySelector<HTMLElement>('#cp-bar');
+    if (!bar) return;
+    if (!cached) {
+      bar.style.display = 'none';
+      return;
+    }
+    bar.style.display = '';
+    const face = pusherFaceX(currentPusherPhase(cached, Date.now()));
+    bar.style.width = `${(face / PLAT_UP_FRONT) * 100}%`;
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const state = readCoinPusherState(deps.itemId);
+    cached = state;
+    readResults();
+    // A new cabinet's machine appears with its operator's first poll, after
+    // the settling wait: until then it is starting up, not offline.
+    const operator = coinPusherOperatorState();
+    shownOperator = operator;
+    const online = state !== null && operator === 'ready';
+    const status = panel.querySelector<HTMLElement>('#cp-status')!;
+    status.textContent = flash || (online ? 'PICK A HOLE AND TIME YOUR DROP'
+      : operator === 'starting' ? 'THE MACHINE IS STARTING UP…'
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
+    panel.querySelector<HTMLElement>('#cp-timing-note')!.textContent = timingNote;
+    for (let i = 0; i < HOLE_COUNT; i++) {
+      const btn = panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`);
+      if (!btn) continue;
+      btn.setAttribute('aria-pressed', String(i === selectedHole));
+      btn.style.borderColor = i === selectedHole ? '#D4A84B' : '#3A424C';
+      btn.style.background = i === selectedHole
+        ? 'rgba(212,168,75,0.18)' : 'rgba(212,168,75,0.05)';
+      const mark = panel.querySelector<HTMLElement>(`#cp-mark-${i}`);
+      if (mark) mark.style.background = i === selectedHole ? '#D4A84B' : '#3A424C';
+    }
+    const insertBtn = panel.querySelector<HTMLButtonElement>('#cp-insert')!;
+    const chips = readChips(myId);
+    const full = state !== null && chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS;
+    insertBtn.disabled = !online || pending !== null || chips < PUSHER_ANTE || full;
+    insertBtn.textContent = operator === 'starting' ? 'STARTING UP…'
+      : !online ? 'MACHINE OFFLINE'
+        : pending ? 'DROPPING…'
+          : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
+            : full ? 'MACHINE FULL'
+              : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
+    paintTray('cp-rack', chipsFor(chips), 'Your chips', 'NO CHIPS — VISIT THE CASHIER');
+    paintTray('cp-won', chipsFor(lastPaid ?? 0), 'Your last drop paid',
+      lastPaid === 0 ? 'NOTHING FELL' : '');
+    const meter = panel.querySelector<HTMLElement>('#cp-meter')!;
+    // A machine that reads at all balances (the guard checks its ledger), so
+    // the warning is for a record that is there but won't read.
+    const unreadable = state === null && isCoinPusherRecordUnreadable(deps.itemId);
+    meter.textContent = state ? 'METER ✓ EVERY CHIP INSIDE, PAID OUT OR EMPTIED IS ACCOUNTED FOR'
+      : unreadable ? '!! THE METER CAN\'T BE READ — TELL THE OWNER'
+        : '';
+    meter.style.color = unreadable ? '#FF6060' : GT_DIM;
+    const owner = panel.querySelector<HTMLElement>('#cp-owner')!;
+    const isOwner = state?.ownerId === myId;
+    owner.style.display = isOwner ? 'flex' : 'none';
+    if (isOwner && state) {
+      // Chips, never a total, outside the cashier (the physical-chip rule).
+      paintTray('cp-inside', chipsFor(chipsInMachine(state)), 'In the machine', 'THE MACHINE IS EMPTY');
+      const emptyBtn = panel.querySelector<HTMLButtonElement>('#cp-empty')!;
+      // The door has no timing to lose: it may be asked for while the
+      // operator starts up, and is answered once it is at work.
+      emptyBtn.disabled = operator === 'offline' || door !== null;
+    }
+    drawGauge();
+  };
+
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.repeat) return;
+    const target = event.target;
+    if (target instanceof Element
+      && target.closest('button, input, textarea, select, a, [contenteditable="true"]')) return;
+    if (event.code === 'ArrowLeft') {
+      event.preventDefault();
+      setSelectedHole(Math.max(0, selectedHole - 1) as PusherHole);
+    } else if (event.code === 'ArrowRight') {
+      event.preventDefault();
+      setSelectedHole(Math.min(HOLE_COUNT - 1, selectedHole + 1) as PusherHole);
+    } else if (event.code === 'Space') {
+      event.preventDefault();
+      insert();
+    }
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-coin-pusher-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 420px; max-height: 92vh; overflow-y: auto; box-sizing: border-box;
+        padding: 18px; display: flex; flex-direction: column; gap: 10px;
+        background: rgba(4, 8, 22, 0.95); border: 1px solid rgba(212, 168, 75, 0.35);
+        border-radius: 12px; color: ${GT_GOLD};
+        font-family: 'SF Mono','Consolas',monospace; pointer-events: auto;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+      `;
+      panel.innerHTML = `
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🪙 COIN PUSHER</div>
+        <div id="cp-status" role="status" aria-live="polite" style="min-height:14px;text-align:center;font-size:9px;color:${GT_GOLD_BRIGHT};font-weight:800;"></div>
+        <div id="cp-timing-note" aria-live="polite" style="min-height:11px;text-align:center;font-size:8px;color:#E8ECF2;"></div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <div style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">THE PUSHER — DROP AS IT SWEEPS PAST YOUR HOLE</div>
+          <div style="position:relative;height:24px;background:#0A0E1F;border:1px solid #3A424C;border-radius:4px;overflow:hidden;">
+            <div id="cp-bar" style="position:absolute;top:0;bottom:0;left:0;width:0;background:linear-gradient(90deg,#4A5560,#8A93A0);border-right:3px solid #D4A84B;"></div>
+            ${HOLE_XS.map((x, i) => `<div id="cp-mark-${i}" style="position:absolute;top:3px;bottom:3px;left:${((x / PLAT_UP_FRONT) * 100).toFixed(2)}%;width:2px;margin-left:-1px;background:#3A424C;"></div>`).join('')}
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${HOLE_XS.map((_, i) => `
+            <button id="cp-hole-${i}" style="flex:1;padding:12px 6px;background:rgba(212,168,75,0.05);border:2px solid #3A424C;color:${GT_GOLD};font:800 10px inherit;cursor:pointer;">
+              HOLE ${i + 1}
+            </button>
+          `).join('')}
+        </div>
+        <button id="cp-insert" style="padding:12px;background:rgba(0,192,96,0.12);border:1px solid #00A060;color:#8FFFC0;font:800 11px inherit;cursor:pointer;letter-spacing:1px;">DROP ONE CHIP</button>
+        <div style="display:flex;gap:10px;justify-content:space-between;">
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">YOUR CHIPS</span>
+            <canvas id="cp-rack" role="img" width="380" height="112" style="width:190px;height:56px;"></canvas>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">YOUR LAST DROP PAID</span>
+            <canvas id="cp-won" role="img" width="380" height="112" style="width:190px;height:56px;"></canvas>
+          </div>
+        </div>
+        <div id="cp-meter" style="font-size:8px;text-align:center;"></div>
+        <div id="cp-owner" style="display:none;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid rgba(212,168,75,.20);">
+          <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
+          <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">IN THE MACHINE · OPENING THE DOOR PUTS THEM ON YOUR RACK</span>
+          <canvas id="cp-inside" role="img" width="760" height="112" style="width:380px;height:56px;"></canvas>
+          <button id="cp-empty" style="padding:8px;background:rgba(230,80,60,0.10);border:1px solid #A03020;color:#FF9070;font:800 10px inherit;cursor:pointer;">OPEN THE DOOR &amp; EMPTY THE MACHINE</button>
+        </div>
+        <div style="font-size:8px;color:${GT_DIM};text-align:center;line-height:1.6;">← / → PICK A HOLE · SPACE DROPS ONE CHIP · CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS · THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE</div>
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      for (let i = 0; i < HOLE_COUNT; i++) {
+        panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`)!
+          .addEventListener('click', () => setSelectedHole(i as PusherHole));
+      }
+      panel.querySelector<HTMLButtonElement>('#cp-insert')!.addEventListener('click', insert);
+      panel.querySelector<HTMLButtonElement>('#cp-empty')!.addEventListener('click', openDoor);
+      window.addEventListener('keydown', onKeyDown);
+      host.appendChild(panel);
+      deps.onSelectedHoleChange?.(selectedHole);
+      for (const key of [
+        `pusher:${deps.itemId}`,
+        coinPusherRequestKey(deps.itemId, myId),
+        coinPusherResultKey(deps.itemId, myId),
+        `pusher-empty:${deps.itemId}`,
+        `pusher-door:${deps.itemId}`,
+        COIN_PUSHER_OPERATOR_KEY,
+        `bal:${myId}`,
+      ]) {
+        unsubscribers.push(subscribeCasinoKey(key, render));
+      }
+      render();
+    },
+    unmount(): void {
+      // Walking away withdraws an unanswered drop (the slot-machine rule); a
+      // drop the operator already settled is unaffected.
+      if (pending) cancelCoinPusherRequest(deps.itemId, myId, pending);
+      stopExpiry();
+      pending = null;
+      watching = null;
+      for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
+      window.removeEventListener('keydown', onKeyDown);
+      panel?.remove();
+      panel = null;
+      cached = null;
+    },
+    update(_dt: number): void {
+      // A lease can lapse, or its operator finish starting up, with no key
+      // changing: show it as soon as this page can tell.
+      if (panel && coinPusherOperatorState() !== shownOperator) render();
+      drawGauge();
+    },
+  };
+}
+

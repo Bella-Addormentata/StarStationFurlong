@@ -49,6 +49,15 @@ import type {
   SlotMachineState, SlotOddsConfig, SlotPlayRequest, SlotReveal,
   SlotFundingConfig,
 } from './games/slots';
+import {
+  chipsInMachine, computeConservation, isCoinPusherState, isPusherDoorResult,
+  isPusherEmptyRequest, isPusherInsertRequest, isPusherResult, normalizeCoinPusherState,
+  PUSHER_ANTE,
+} from './games/coinPusher';
+import type {
+  CoinPusherState, PusherDoorResult, PusherEmptyRequest, PusherInsertRequest,
+  PusherRefusalReason, PusherResult,
+} from './games/coinPusher';
 
 /** One player's open bets on one table (round-stamped: stale rounds ignore). */
 export interface TableBets {
@@ -102,6 +111,9 @@ export function bindCasinoDoc(doc: Y.Doc): void {
   bindingEpoch += 1;
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
+  // 🪙 Index the coin pushers' requests now, outside any operator poll, and
+  // observe ahead of notify() so listeners never see a stale index.
+  pusherRequestIndex(casinoMap);
   casinoMap.observe((event) => notify(event.keysChanged));
   notify(); // repaint subscribers from the fresh doc
 }
@@ -807,6 +819,610 @@ export function clearSlotMachineKeys(machineId: string): void {
   });
 }
 
+// ── 🪙 Coin pusher (#135) ────────────────────────────────────────────────────
+// Each machine is one operator-written record plus small request keys — the
+// slot-croupier pattern (pusherCroupier.ts is the operator):
+//
+//   pusher:<mid>            → CoinPusherState   (operator-written only)
+//   pusher-req:<mid>:<pid>  → PusherInsertRequest (the player's own key: hole +
+//                             the pusher phase they saw; carries NO chips)
+//   pusher-result:<mid>:<pid> → PusherResult    (the operator's answer to that
+//                             player's latest request — durable, unlike the
+//                             machine-wide lastDrop the next drop overwrites)
+//   pusher-empty:<mid>      → PusherEmptyRequest (the owner's door request)
+//   pusher-door:<mid>       → PusherDoorResult  (the operator's answer to it)
+//   pusher-operator         → the room's operator lease (ONE browser session
+//                             operates every coin pusher in the room, so a
+//                             player's balance has a single pusher writer)
+//
+// In the per-player keys each id is escaped (`%` → `%25`, `:` → `%3A`; see
+// coinPusherRequestKey), so a key splits one way only whatever the ids hold:
+// `(a, b:p)` and `(a:b, p)` are different keys, and no machine's keys start
+// with another's prefix. Ids with neither character (the UUID player ids,
+// `<kind>-<n>` item ids) are written as they are.
+//
+// MONEY: a request is a wish, not a payment. The operator debits the player's
+// one chip, credits exactly what the drop paid out, publishes the new machine
+// and clears the request in ONE transaction (settleCoinPusherInsert). The
+// owner's empty is the same shape (commitCoinPusherEmpty). Nothing is escrowed
+// and nothing is claimed afterwards, so no peer-written record is ever taken
+// as proof that chips moved, and a cancelled or abandoned request costs
+// nothing. Every commit re-reads the stored machine and refuses when it is not
+// the state the operator computed from (a lost update never double-counts).
+//
+// TRUST: the same dev-phase honest-client model as the rest of this map — the
+// operator (the room's deed holder) is trusted to run the physics honestly;
+// every read shape-guards so junk in these keys reads as "no machine". Chips
+// only ever leave the machine to the player whose drop pushed them or to the
+// operator itself (the door, a removed cabinet) — never to a party named in a
+// peer-writable record, so forging the machine can't pay the forger. Nor are
+// the requests authenticated: like every key in this map, a peer can write a
+// request naming another player (a drop at that player's cost, paid to that
+// player) or a door request naming the owner (the owner's own chips, back to
+// the owner). That is no more than writing that player's `bal:` directly,
+// which any peer can already do; authenticated accounts come with the
+// Registry chips.
+//
+// PARTITIONS: the operator lease is a Y.Map record, not a mutex; see
+// pusherCroupier.ts for how a second session of the same deed holder is kept
+// from operating while the first may only be cut off.
+
+/** The room's coin-pusher operator lease: one for every cabinet in the room. */
+export const COIN_PUSHER_OPERATOR_KEY = 'pusher-operator';
+
+/** The slot operator's record, plus the holder's tenure: a fresh token each
+ *  time a session takes the lease, kept across its renewals. A peer that
+ *  never saw the lease go (a release and a retake between two of its frames)
+ *  still tells a new tenure, with its settling wait, from a renewal. */
+export interface CoinPusherOperatorLease extends SlotOperatorLease {
+  tenure?: string;
+}
+
+function isCoinPusherOperatorLease(value: unknown): value is CoinPusherOperatorLease {
+  if (!isSlotOperatorLease(value)) return false;
+  const tenure = (value as { tenure?: unknown }).tenure;
+  return tenure === undefined
+    || (typeof tenure === 'string' && tenure.length > 0 && tenure.length <= 64);
+}
+
+export function readCoinPusherState(machineId: string): CoinPusherState | null {
+  const value = ensureMap().get(`pusher:${machineId}`);
+  return isCoinPusherState(value) ? value : null;
+}
+
+/** True when something is stored under `pusher:<mid>` that isn't a machine
+ *  the guard accepts (junk, or a ledger that doesn't balance), which the
+ *  panel reports rather than taking it for no machine at all. */
+export function isCoinPusherRecordUnreadable(machineId: string): boolean {
+  const map = ensureMap();
+  const key = `pusher:${machineId}`;
+  return map.has(key) && !isCoinPusherState(map.get(key));
+}
+
+/** Operator only (pusherCroupier.ts): create or re-own a machine. Writes the
+ *  normalized state (unknown fields dropped); false when the shape guard
+ *  rejects it. Drops and empties go through the settle helpers below. */
+export function writeCoinPusherState(machineId: string, state: CoinPusherState): boolean {
+  const normalized = normalizeCoinPusherState(state);
+  if (!normalized) return false;
+  ensureMap().set(`pusher:${machineId}`, normalized);
+  return true;
+}
+
+/** How many of a machine's requests one read looks at. A player files one
+ *  request per machine, so honest play stays far below it and is read exactly
+ *  oldest first; a flood is worked through this many at a time, in arrival
+ *  order, so none is starved. */
+export const PUSHER_REQUEST_SCAN = 64;
+
+// The operator polls a machine's requests ten times a second, and removing a
+// cabinet deletes all of its per-player keys, so both go through an index
+// rather than walking the casino map, which any peer can grow. Each bound map
+// gets one index, built by a single pass when the map is bound (bindCasinoDoc
+// — a join, where the doc is usually still empty, or the offline fallback)
+// and from then on kept current by an observer that looks only at the keys
+// each transaction changed, local or remote. No poll, and no removal, ever
+// walks the map. The keys escape their ids, so each is filed under exactly
+// one machine: the one it names.
+interface PusherRequestIndex {
+  /** machineId → the keys holding its well-formed requests, in arrival order. */
+  byMachine: Map<string, Set<string>>;
+  /** machineId → every per-player key naming that machine, whatever it holds
+   *  (a removal sweeps them from here — see startCoinPusherKeySweep). */
+  playerKeys: Map<string, Set<string>>;
+}
+
+const pusherRequestIndexes = new WeakMap<Y.Map<unknown>, PusherRequestIndex>();
+const PUSHER_REQUEST_PREFIX = 'pusher-req:';
+const PUSHER_RESULT_PREFIX = 'pusher-result:';
+/** The per-player key families, each with how many ids follow it, the
+ *  machine's first (`pusher-esc:<mid>:<pid>:<requestId>` is an earlier
+ *  revision's escrow, still cleared with its machine). */
+const PUSHER_PLAYER_FAMILIES: readonly (readonly [family: string, ids: number])[] = [
+  [PUSHER_REQUEST_PREFIX, 2],
+  [PUSHER_RESULT_PREFIX, 2],
+  ['pusher-esc:', 3],
+];
+
+/** One id as a key component: `%` and `:` escaped, so the colons between
+ *  components are the only ones in a key. */
+function pusherKeyPart(id: string): string {
+  return id.replace(/[%:]/g, (c) => (c === '%' ? '%25' : '%3A'));
+}
+
+/** The id a key component stands for, or null unless pusherKeyPart writes it
+ *  exactly so (non-empty, every `%` starting `%25` or `%3A`). */
+function pusherIdOf(part: string): string | null {
+  const id = part.replace(/%(25|3A)/g, (_escape, code: string) => (code === '25' ? '%' : ':'));
+  return id !== '' && pusherKeyPart(id) === part ? id : null;
+}
+
+/** `pusher-req:<mid>:<pid>`, the ids escaped: a player's request key. */
+export function coinPusherRequestKey(machineId: string, playerId: string): string {
+  return `${PUSHER_REQUEST_PREFIX}${pusherKeyPart(machineId)}:${pusherKeyPart(playerId)}`;
+}
+
+/** `pusher-result:<mid>:<pid>`, the ids escaped: the operator's answer to
+ *  that player. */
+export function coinPusherResultKey(machineId: string, playerId: string): string {
+  return `${PUSHER_RESULT_PREFIX}${pusherKeyPart(machineId)}:${pusherKeyPart(playerId)}`;
+}
+
+/** A per-player key's family and ids (the machine's first). Null for any other
+ *  key, and for one that isn't its family and exactly that many escaped ids:
+ *  such a key names no machine, and nothing reads it. */
+function parsePusherPlayerKey(key: string): { family: string; ids: string[] } | null {
+  for (const [family, count] of PUSHER_PLAYER_FAMILIES) {
+    if (!key.startsWith(family)) continue;
+    // One part past the count is enough to reject a key, however long.
+    const parts = key.slice(family.length).split(':', count + 1);
+    if (parts.length !== count) return null;
+    const ids: string[] = [];
+    for (const part of parts) {
+      const id = pusherIdOf(part);
+      if (id === null) return null;
+      ids.push(id);
+    }
+    return { family, ids };
+  }
+  return null;
+}
+
+/** Keys a sweep deletes per batch (continueCoinPusherKeySweep). */
+export const PUSHER_SWEEP_BATCH = 64;
+
+/**
+ * A removed machine's per-player keys (requests, answers, and `pusher-esc:`
+ * escrows an earlier revision left), deleted a batch at a time after the
+ * drain, so a flood of them can't stall a frame. None of them carries chips.
+ * It walks the keys the index files under the machine, and no other
+ * machine's, with a live iterator: a key deleted meanwhile is skipped, and
+ * one written meanwhile is deleted too, by this pass or, if it lands after
+ * the pass went by, the next. The sweep ends when the index files no key
+ * under the machine.
+ */
+export interface CoinPusherKeySweep {
+  readonly machineId: string;
+  /** The map it was started on — a sweep never touches another room's. */
+  readonly map: Y.Map<unknown>;
+  /** This pass's iterator (null between passes). */
+  cursor: Iterator<string> | null;
+}
+
+export function startCoinPusherKeySweep(machineId: string): CoinPusherKeySweep {
+  return { machineId, map: ensureMap(), cursor: null };
+}
+
+/**
+ * Delete up to `max` more of the machine's keys, in one transaction. True
+ * once the index files none under it, or when the bound doc is no longer the
+ * one it started on (nothing is touched then).
+ */
+export function continueCoinPusherKeySweep(
+  sweep: CoinPusherKeySweep,
+  max: number = PUSHER_SWEEP_BATCH,
+): boolean {
+  if (!docAlive() || casinoMap !== sweep.map) return true;
+  const doomed: string[] = [];
+  let finished = false;
+  while (doomed.length < max) {
+    if (sweep.cursor === null) {
+      // A pass over what the index files under the machine now: none means
+      // none of its keys is left in the map.
+      const keys = pusherRequestIndex(sweep.map).playerKeys.get(sweep.machineId);
+      if (!keys || keys.size === 0) {
+        finished = true;
+        break;
+      }
+      sweep.cursor = keys.values();
+    }
+    const next = sweep.cursor.next();
+    if (next.done) {
+      // The pass is over; the next starts once this batch's deletions are in
+      // (until then the index still files them).
+      sweep.cursor = null;
+      if (doomed.length > 0) break;
+      continue;
+    }
+    doomed.push(next.value);
+  }
+  if (doomed.length > 0) {
+    boundDoc!.transact(() => {
+      for (const key of doomed) sweep.map.delete(key);
+    });
+  }
+  return finished;
+}
+
+/** File a request key afresh under its machine: any change is a new arrival,
+ *  so it goes to the back. One that no longer holds a well-formed request of
+ *  the player its key names (the cross-key guard) is unfiled. */
+function reindexPusherRequest(
+  index: PusherRequestIndex,
+  key: string,
+  machineId: string,
+  playerId: string,
+  value: unknown,
+): void {
+  let keys = index.byMachine.get(machineId);
+  keys?.delete(key);
+  if (isPusherInsertRequest(value) && value.player === playerId) {
+    if (!keys) {
+      keys = new Set();
+      index.byMachine.set(machineId, keys);
+    }
+    keys.add(key);
+  } else if (keys?.size === 0) {
+    index.byMachine.delete(machineId);
+  }
+}
+
+/** Re-file one changed key of the casino map (a no-op for other keys). */
+function reindexPusherKey(index: PusherRequestIndex, map: Y.Map<unknown>, key: string): void {
+  const parsed = parsePusherPlayerKey(key);
+  if (parsed === null) return;
+  const [machineId, playerId] = parsed.ids;
+  if (parsed.family === PUSHER_REQUEST_PREFIX) {
+    reindexPusherRequest(index, key, machineId, playerId, map.get(key));
+  }
+  let keys = index.playerKeys.get(machineId);
+  if (map.has(key)) {
+    if (!keys) {
+      keys = new Set();
+      index.playerKeys.set(machineId, keys);
+    }
+    keys.add(key);
+  } else if (keys) {
+    keys.delete(key);
+    if (keys.size === 0) index.playerKeys.delete(machineId);
+  }
+}
+
+/** The bound map's request index (built by bindCasinoDoc). */
+function pusherRequestIndex(map: Y.Map<unknown>): PusherRequestIndex {
+  const existing = pusherRequestIndexes.get(map);
+  if (existing) return existing;
+  const index: PusherRequestIndex = { byMachine: new Map(), playerKeys: new Map() };
+  for (const key of map.keys()) reindexPusherKey(index, map, key);
+  map.observe((event) => {
+    for (const key of event.keysChanged) reindexPusherKey(index, map, key);
+  });
+  pusherRequestIndexes.set(map, index);
+  return index;
+}
+
+/** Up to `limit` of this machine's insert requests, in arrival order: first
+ *  come, first served. A request that changes (refused and filed again, or
+ *  rewritten) goes to the back, and a `requestId` is the player's to choose,
+ *  so it never decides the order. It reads the machine's index, never the
+ *  whole map, and looks at no more than PUSHER_REQUEST_SCAN, so its cost grows
+ *  neither with what peers write elsewhere nor with a flood of requests.
+ *  Shape- and cross-key-guarded: a request whose `player` disagrees with the
+ *  `<pid>` in its key is ignored. */
+export function readCoinPusherRequests(
+  machineId: string,
+  limit = PUSHER_REQUEST_SCAN,
+): PusherInsertRequest[] {
+  const map = ensureMap();
+  const keys = pusherRequestIndex(map).byMachine.get(machineId);
+  const out: PusherInsertRequest[] = [];
+  let looked = 0;
+  for (const key of keys ?? []) {
+    if (looked++ === PUSHER_REQUEST_SCAN) break;
+    const value = map.get(key);
+    if (isPusherInsertRequest(value)) out.push(value);
+  }
+  return out.slice(0, Math.max(0, limit));
+}
+
+/** One player's pending request on this machine (null when none). */
+export function readCoinPusherRequest(
+  machineId: string,
+  playerId: string,
+): PusherInsertRequest | null {
+  const value = ensureMap().get(coinPusherRequestKey(machineId, playerId));
+  return isPusherInsertRequest(value) && value.player === playerId ? value : null;
+}
+
+/** Player side: ask the operator to drop a chip. No chips move here — the
+ *  operator debits the chip when it settles the drop. One pending request per
+ *  player per machine; false when one is already pending or the shape guard
+ *  rejects the request. */
+export function writeCoinPusherRequest(
+  machineId: string,
+  request: PusherInsertRequest,
+): boolean {
+  if (!isPusherInsertRequest(request)) return false;
+  // A guarded read, not map.has: junk under the key must not lock the player out.
+  if (readCoinPusherRequest(machineId, request.player)) return false;
+  ensureMap().set(coinPusherRequestKey(machineId, request.player), request);
+  return true;
+}
+
+/** Withdraw a request if it is still `requestId` (the player's cancel, or the
+ *  operator dropping one it cannot process). Safe to race the operator's
+ *  settle: the request carries no chips, so whichever lands first wins and
+ *  nothing is lost or paid twice. */
+export function cancelCoinPusherRequest(
+  machineId: string,
+  playerId: string,
+  requestId: string,
+): boolean {
+  if (readCoinPusherRequest(machineId, playerId)?.requestId !== requestId) return false;
+  ensureMap().delete(coinPusherRequestKey(machineId, playerId));
+  return true;
+}
+
+/** The operator's answer to `playerId`'s latest request (null before the first). */
+export function readCoinPusherResult(machineId: string, playerId: string): PusherResult | null {
+  const value = ensureMap().get(coinPusherResultKey(machineId, playerId));
+  return isPusherResult(value) ? value : null;
+}
+
+export function readCoinPusherEmptyRequest(machineId: string): PusherEmptyRequest | null {
+  const value = ensureMap().get(`pusher-empty:${machineId}`);
+  return isPusherEmptyRequest(value) ? value : null;
+}
+
+/** Owner side: ask the operator to open the door and empty the machine into
+ *  the owner's chips. The operator checks the requester is the owner. */
+export function writeCoinPusherEmptyRequest(
+  machineId: string,
+  request: PusherEmptyRequest,
+): boolean {
+  if (!isPusherEmptyRequest(request)) return false;
+  ensureMap().set(`pusher-empty:${machineId}`, request);
+  return true;
+}
+
+/** The operator's answer to the latest door request (null before the first). */
+export function readCoinPusherDoorResult(machineId: string): PusherDoorResult | null {
+  const value = ensureMap().get(`pusher-door:${machineId}`);
+  return isPusherDoorResult(value) ? value : null;
+}
+
+/**
+ * Operator: turn a door request down (its requester does not own the
+ * machine) — answer it and clear it in one transaction, moving nothing.
+ * False when the request is no longer pending.
+ */
+export function refuseCoinPusherEmpty(
+  machineId: string,
+  request: PusherEmptyRequest,
+  atMs: number,
+): boolean {
+  if (readCoinPusherEmptyRequest(machineId)?.requestId !== request.requestId) return false;
+  const answer: PusherDoorResult = { kind: 'refused', requestId: request.requestId, atMs };
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(`pusher-door:${machineId}`, answer);
+    map.delete(`pusher-empty:${machineId}`);
+  });
+  return true;
+}
+
+/** The room's coin-pusher operator lease (one for every cabinet). */
+export function readCoinPusherOperatorLease(): CoinPusherOperatorLease | null {
+  const value = ensureMap().get(COIN_PUSHER_OPERATOR_KEY);
+  return isCoinPusherOperatorLease(value) ? value : null;
+}
+
+export function writeCoinPusherOperatorLease(lease: CoinPusherOperatorLease): void {
+  if (!isCoinPusherOperatorLease(lease)) return;
+  ensureMap().set(COIN_PUSHER_OPERATOR_KEY, lease);
+}
+
+export function clearCoinPusherOperatorLease(): void {
+  ensureMap().delete(COIN_PUSHER_OPERATOR_KEY);
+}
+
+/** The fields that change on every operator write — two states that agree on
+ *  all of them are the same machine revision. */
+function sameCoinPusherRevision(a: CoinPusherState, b: CoinPusherState): boolean {
+  return a.tick === b.tick
+    && a.ownerId === b.ownerId
+    && a.nextChipId === b.nextChipId
+    && a.totalInserted === b.totalInserted
+    && a.totalPaid === b.totalPaid
+    && a.totalEmptied === b.totalEmptied;
+}
+
+export type CoinPusherSettleResult =
+  | 'ok'
+  /** The stored machine is not `base` (another write landed first). */
+  | 'stale-state'
+  /** The player's request is gone or was replaced. */
+  | 'stale-request'
+  /** The player no longer holds PUSHER_ANTE chips. */
+  | 'no-chips'
+  /** The player's balance can't take what the drop paid (it would leave the
+   *  safe-integer range). */
+  | 'balance-full'
+  /** `next` is not a legal one-chip drop from `base` for this request. */
+  | 'invalid';
+
+/**
+ * Operator: settle one drop in ONE transaction — debit the player's
+ * PUSHER_ANTE chip, credit what the drop paid, publish `next`, answer the
+ * player (their PusherResult), clear the request. `next` must be
+ * processInsert's result on `base` for this request, and the credit is read
+ * off that transition (next.totalPaid − base.totalPaid, which must equal
+ * next.lastDrop.paid), never passed in separately. Nothing is written unless
+ * every check passes.
+ */
+export function settleCoinPusherInsert(
+  machineId: string,
+  base: CoinPusherState,
+  next: CoinPusherState,
+  request: PusherInsertRequest,
+): CoinPusherSettleResult {
+  const stored = readCoinPusherState(machineId);
+  if (!stored || !sameCoinPusherRevision(stored, base)) return 'stale-state';
+  if (readCoinPusherRequest(machineId, request.player)?.requestId !== request.requestId) {
+    return 'stale-request';
+  }
+  const normalized = normalizeCoinPusherState(next);
+  if (!normalized) return 'invalid';
+  const paid = normalized.totalPaid - base.totalPaid;
+  const drop = normalized.lastDrop;
+  if (normalized.ownerId !== base.ownerId
+    || normalized.tick <= base.tick
+    || normalized.nextChipId !== base.nextChipId + 1
+    || normalized.totalInserted !== base.totalInserted + PUSHER_ANTE
+    || normalized.totalEmptied !== base.totalEmptied
+    || paid < 0
+    || !computeConservation(normalized).balanced
+    || drop?.requestId !== request.requestId
+    || drop.player !== request.player
+    || drop.hole !== request.hole
+    || drop.paid !== paid) {
+    return 'invalid';
+  }
+  const map = ensureMap();
+  const balanceKey = `bal:${request.player}`;
+  const balance = safeCount(map, balanceKey);
+  if (balance < PUSHER_ANTE) return 'no-chips';
+  const nextBalance = balance - PUSHER_ANTE + paid;
+  if (!Number.isSafeInteger(nextBalance)) return 'balance-full';
+  const result: PusherResult = {
+    kind: 'drop', requestId: request.requestId, paid, honored: drop.honored, atMs: drop.atMs,
+  };
+  boundDoc!.transact(() => {
+    map.set(`pusher:${machineId}`, normalized);
+    map.set(balanceKey, nextBalance);
+    map.set(coinPusherResultKey(machineId, request.player), result);
+    map.delete(coinPusherRequestKey(machineId, request.player));
+  });
+  return 'ok';
+}
+
+/**
+ * Operator: turn a request down without moving any chips — answer the player
+ * with why (their PusherResult) and clear the request, in one transaction.
+ * The machine itself is untouched. False when the request is no longer
+ * pending.
+ */
+export function refuseCoinPusherInsert(
+  machineId: string,
+  request: PusherInsertRequest,
+  reason: PusherRefusalReason,
+  atMs: number,
+): boolean {
+  if (readCoinPusherRequest(machineId, request.player)?.requestId !== request.requestId) {
+    return false;
+  }
+  const result: PusherResult = { kind: 'refused', requestId: request.requestId, reason, atMs };
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    map.set(coinPusherResultKey(machineId, request.player), result);
+    map.delete(coinPusherRequestKey(machineId, request.player));
+  });
+  return true;
+}
+
+/**
+ * Operator: carry out the owner's door request in ONE transaction — publish
+ * the emptied `next`, credit the owner exactly the chips that were inside
+ * `base`, answer the request (its PusherDoorResult) and clear it. The
+ * operator must be the machine's owner and the one who asked (the operator
+ * re-owns every machine it runs, so this is the deed holder emptying their
+ * own machine), and `next` must be emptyMachine's result on `base`. Returns
+ * the chips credited, or null when nothing was written.
+ */
+export function commitCoinPusherEmpty(
+  machineId: string,
+  base: CoinPusherState,
+  next: CoinPusherState,
+  request: PusherEmptyRequest,
+  operatorId: string,
+  atMs: number,
+): number | null {
+  const stored = readCoinPusherState(machineId);
+  if (!stored || !sameCoinPusherRevision(stored, base)) return null;
+  if (readCoinPusherEmptyRequest(machineId)?.requestId !== request.requestId) return null;
+  if (base.ownerId !== operatorId || request.requester !== operatorId) return null;
+  const normalized = normalizeCoinPusherState(next);
+  if (!normalized) return null;
+  const emptied = chipsInMachine(base);
+  if (normalized.ownerId !== base.ownerId
+    || normalized.tick <= base.tick
+    || chipsInMachine(normalized) !== 0
+    || normalized.totalEmptied !== base.totalEmptied + emptied
+    || normalized.totalInserted !== base.totalInserted
+    || normalized.totalPaid !== base.totalPaid
+    || !computeConservation(normalized).balanced) {
+    return null;
+  }
+  const map = ensureMap();
+  const ownerKey = `bal:${base.ownerId}`;
+  const ownerBalance = safeCount(map, ownerKey);
+  if (!Number.isSafeInteger(ownerBalance + emptied)) return null;
+  const answer: PusherDoorResult = { kind: 'opened', requestId: request.requestId, emptied, atMs };
+  boundDoc!.transact(() => {
+    map.set(`pusher:${machineId}`, normalized);
+    if (emptied > 0) map.set(ownerKey, ownerBalance + emptied);
+    map.set(`pusher-door:${machineId}`, answer);
+    map.delete(`pusher-empty:${machineId}`);
+  });
+  return emptied;
+}
+
+/**
+ * Teardown for a removed cabinet, run only by the room's operator past its
+ * settling wait (pusherCroupier.closeCoinPusher), so it never merges with a
+ * drop another session is still settling: credit the chips still inside to
+ * `recipientId`, the deed holder running it, and delete every key the machine
+ * used, in ONE transaction. The recipient is the caller's own identity, never
+ * the `ownerId` stored in the peer-writable machine, so a forged machine can
+ * only ever pay the deed holder (the operator re-owns every machine it runs,
+ * so in honest play they are the same). This transaction touches only the
+ * machine's own keys, a fixed few. Its per-player keys carry no chips and are
+ * deleted afterwards, a batch at a time (startCoinPusherKeySweep). Returns the
+ * chips credited, or null when nothing was written: chips inside that can't be
+ * credited (the recipient's balance would leave the safe-integer range) stay
+ * in the machine, as the door leaves them, and the caller tries again later.
+ */
+export function drainAndClearCoinPusher(machineId: string, recipientId: string): number | null {
+  const map = ensureMap();
+  const state = readCoinPusherState(machineId);
+  const inside = state ? chipsInMachine(state) : 0;
+  const ownerKey = `bal:${recipientId}`;
+  const ownerBalance = safeCount(map, ownerKey);
+  if (inside > 0 && (recipientId.length === 0 || recipientId.length > 128
+    || !Number.isSafeInteger(ownerBalance + inside))) return null;
+  const credit = inside;
+  boundDoc!.transact(() => {
+    if (credit > 0) map.set(ownerKey, ownerBalance + credit);
+    map.delete(`pusher:${machineId}`);
+    map.delete(`pusher-empty:${machineId}`);
+    map.delete(`pusher-door:${machineId}`);
+    // A per-machine lease an earlier revision wrote. The room's lease stays:
+    // it covers the room's other cabinets.
+    map.delete(`pusher-operator:${machineId}`);
+  });
+  return credit;
+}
+
 // Permanent debug handle (the __ssfGames precedent) — console verification of
 // balances, table state and settle math without UI plumbing. Guard for Node
 // tooling / tests: importing this module must stay pure, with browser-only
@@ -826,5 +1442,8 @@ if (typeof window !== 'undefined') {
     depositSlotFunding, withdrawSlotFunding,
     readSlotSharedBankrollLease, acquireSlotSharedBankrollLease,
     releaseSlotSharedBankrollLease,
+    readCoinPusherState, readCoinPusherRequests, readCoinPusherRequest,
+    readCoinPusherResult, readCoinPusherEmptyRequest, readCoinPusherDoorResult,
+    readCoinPusherOperatorLease, coinPusherRequestKey, coinPusherResultKey,
   };
 }
