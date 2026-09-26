@@ -5232,8 +5232,9 @@ export class World {
     // The operator also drains removed cabinets there, once past its settling
     // wait (closeCoinPusher).
     tickCoinPusherRoom(coinPushers.map((machine) => machine.id));
-    // …and carry on with removed cabinets: the batched sweep of their
-    // per-player keys.
+    // …and carry on with removed cabinets: the sweep of their per-player
+    // keys, one batch a frame (after the room tick, which may have just
+    // drained one).
     tickCoinPusherTeardowns();
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's

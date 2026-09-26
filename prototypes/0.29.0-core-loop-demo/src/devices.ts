@@ -4247,6 +4247,7 @@ const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
   'no-chips': 'NO CHIP TO DROP — VISIT THE CASHIER',
   'machine-full': 'THE MACHINE IS FULL — THE OWNER HAS TO EMPTY IT',
   expired: 'YOUR DROP WAITED TOO LONG — NOTHING WAS TAKEN',
+  'balance-full': 'YOUR RACK CAN\'T HOLD ANY MORE — CASH SOME CHIPS OUT FIRST',
 };
 
 /**

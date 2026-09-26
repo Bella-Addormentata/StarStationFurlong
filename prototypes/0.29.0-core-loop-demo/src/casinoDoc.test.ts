@@ -46,6 +46,7 @@ import {
   emptyMachine,
   initialCoinPusherState,
   processInsert,
+  PUSHER_ANTE,
   type CoinPusherState,
   type PusherHole,
   type PusherInsertRequest,
@@ -94,13 +95,14 @@ function machineWith(n: number, owner = OWNER): CoinPusherState {
   return s;
 }
 
-/** A published machine plus a pending request whose drop pays out. */
-function payingSetup(): { base: CoinPusherState; req: PusherInsertRequest; next: CoinPusherState } {
+/** A published machine plus a pending request whose drop pays out (at least
+ *  `minPaid` chips). */
+function payingSetup(minPaid = 1): { base: CoinPusherState; req: PusherInsertRequest; next: CoinPusherState } {
   const base = machineWith(60);
   for (let seed = 0; seed < 500; seed++) {
     const req = request(PLAYER, `req-${seed}`);
     const next = dropFor(base, req, seed);
-    if (next.lastDrop!.paid > 0) {
+    if (next.lastDrop!.paid >= minPaid) {
       writeCoinPusherState(MACHINE, base);
       writeCoinPusherRequest(MACHINE, req);
       return { base: readCoinPusherState(MACHINE)!, req, next };
@@ -379,6 +381,25 @@ describe('settleCoinPusherInsert', () => {
     expect(readCoinPusherState(MACHINE)!.lastDrop!.requestId).toBe('zz-other');
     // PLAYER's panel, catching up late, still finds its own answer.
     expect(readCoinPusherResult(MACHINE, PLAYER)?.requestId).toBe(req.requestId);
+  });
+
+  it("a payout the player's balance can't take is 'balance-full', and nothing is written", () => {
+    const { base, req, next } = payingSetup(2);
+    const paid = next.lastDrop!.paid;
+    const map = doc.getMap('casino');
+    // One chip more than the balance could hold once the drop is paid.
+    const tooMany = Number.MAX_SAFE_INTEGER + PUSHER_ANTE - paid + 1;
+    map.set(`bal:${PLAYER}`, tooMany);
+    const transactions = countTransactions(doc);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('balance-full');
+    expect(transactions()).toBe(0);
+    expect(readChips(PLAYER)).toBe(tooMany);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toEqual(req);
+    // Up to the limit exactly, it settles.
+    map.set(`bal:${PLAYER}`, tooMany - 1);
+    expect(settleCoinPusherInsert(MACHINE, base, next, req)).toBe('ok');
+    expect(readChips(PLAYER)).toBe(Number.MAX_SAFE_INTEGER);
   });
 
   it('a request from a player with no chip gets nothing — and nothing is written', () => {

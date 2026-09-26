@@ -321,6 +321,33 @@ describe('operateCoinPusher', () => {
     expect(readChips(PLAYER)).toBe(3);
   });
 
+  it("answers, before the drop, a player whose balance couldn't take the most it could pay", () => {
+    const base = machineWith(20);
+    writeCoinPusherState(MACHINE, base);
+    const map = doc.getMap('casino');
+    // A drop pays at most every chip inside, its own included. At this
+    // balance that would leave the safe-integer range, however the chip falls.
+    const tooMany = Number.MAX_SAFE_INTEGER - chipsInMachine(base) + 1;
+    map.set(`bal:${PLAYER}`, tooMany);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', 0.5));
+    let draws = 0;
+    operateCoinPusher(MACHINE, OPERATOR, NOW, () => { draws += 1; return 7; });
+    expect(readCoinPusherResult(MACHINE, PLAYER)).toEqual({
+      kind: 'refused', requestId: 'req-1', reason: 'balance-full', atMs: NOW,
+    });
+    expect(draws).toBe(0); // refused before any seed is drawn
+    expect(readChips(PLAYER)).toBe(tooMany);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
+    // One chip fewer and every outcome fits: the drop is played.
+    map.set(`bal:${PLAYER}`, tooMany - 1);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2', 0.5));
+    operateCoinPusher(MACHINE, OPERATOR, NOW + 200, () => 7);
+    const result = readCoinPusherResult(MACHINE, PLAYER);
+    expect(result).toMatchObject({ kind: 'drop', requestId: 'req-2' });
+    expect(readChips(PLAYER)).toBe(tooMany - 1 - PUSHER_ANTE + (result?.kind === 'drop' ? result.paid : NaN));
+  });
+
   it('works through a bounded batch per pass however many requests are queued', () => {
     writeCoinPusherState(MACHINE, machineWith(20));
     const queued = 3 * MAX_REQUESTS_PER_POLL + 1;
@@ -711,7 +738,7 @@ describe('tickCoinPusherRoom', () => {
     tickCoinPusherRoom([MACHINE], NOW + 16);
     expect(coinPusherWatchCount()).toBe(0);
     tickCoinPusherTeardowns();
-    expect([...map.keys()].filter((k) => k.startsWith('pusher-result:pusher-3:'))).toHaveLength(PUSHER_SWEEP_BATCH);
+    expect([...map.keys()].filter((k) => k.startsWith('pusher-result:pusher-3:'))).toHaveLength(2 * PUSHER_SWEEP_BATCH);
     expect(readCoinPusherState('pusher-4')).not.toBeNull();
   });
 
@@ -761,7 +788,10 @@ describe('closeCoinPusher', () => {
     closeCoinPusher(MACHINE, true, ready + 10);
     expect(readChips(OPERATOR)).toBe(chipsInMachine(base));
     expect(readCoinPusherState(MACHINE)).toBeNull();
-    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull(); // a first batch, at once
+    // Its per-player keys go in the teardown tick, a batch a frame.
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).not.toBeNull();
+    tickCoinPusherTeardowns();
+    expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
     // The room's lease is for every cabinet: it goes once none is left.
     expect(readCoinPusherOperatorLease()?.sessionId).toBe(coinPusherOperatorSession());
     tickCoinPusherRoom([], ready + 26);
@@ -850,11 +880,60 @@ describe('closeCoinPusher', () => {
     const ready = becomeReadyOperator([SPARE]);
     closeCoinPusher(MACHINE, true, ready);
     expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(left()).toBe(flood); // the drain deletes none: the teardown tick does
+    tickCoinPusherTeardowns();
     expect(left()).toBe(flood - PUSHER_SWEEP_BATCH);
     tickCoinPusherTeardowns();
     expect(left()).toBe(flood - 2 * PUSHER_SWEEP_BATCH);
     tickCoinPusherTeardowns();
     expect(left()).toBe(0);
+  });
+
+  it('a cabinet drained in the room tick has one batch of its keys swept that frame, not two', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    const map = doc.getMap('casino');
+    const flood = 3 * PUSHER_SWEEP_BATCH;
+    for (let i = 0; i < flood; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
+    const left = () => [...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`)).length;
+    // Removed with nobody holding the lease: the room tick takes it, and
+    // drains once past the settling wait.
+    closeCoinPusher(MACHINE, true, NOW);
+    tickCoinPusherRoom([], NOW + 16);
+    tickCoinPusherTeardowns();
+    expect(left()).toBe(flood);
+    // One frame as World runs it: the room tick drains, then the teardown tick.
+    tickCoinPusherRoom([], NOW + 16 + SETTLE_MS);
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    tickCoinPusherTeardowns();
+    expect(left()).toBe(flood - PUSHER_SWEEP_BATCH);
+  });
+
+  it('removed cabinets take turns: one batch a frame between them', () => {
+    const map = doc.getMap('casino');
+    const [a, b] = ['pusher-a', 'pusher-b'];
+    for (const m of [a, b]) {
+      writeCoinPusherState(m, machineWith(5));
+      for (let i = 0; i < PUSHER_SWEEP_BATCH + 10; i++) map.set(`pusher-result:${m}:p${i}`, 'junk');
+    }
+    const left = () => [a, b].map((m) => [...map.keys()].filter((k) => k.startsWith(`pusher-result:${m}:`)).length);
+    const ready = becomeReadyOperator([SPARE]);
+    const watching = coinPusherWatchCount();
+    closeCoinPusher(a, true, ready);
+    closeCoinPusher(b, true, ready);
+    expect(left()).toEqual([PUSHER_SWEEP_BATCH + 10, PUSHER_SWEEP_BATCH + 10]);
+    const frames: number[][] = [];
+    for (let frame = 0; frame < 5; frame++) {
+      tickCoinPusherTeardowns();
+      frames.push(left());
+    }
+    expect(frames).toEqual([
+      [10, PUSHER_SWEEP_BATCH + 10],
+      [10, 10],
+      [0, 10],
+      [0, 0],
+      [0, 0], // both find nothing left, and end
+    ]);
+    expect(coinPusherWatchCount()).toBe(watching);
   });
 
   it('stops sweeping when the cabinet is put back', () => {
@@ -863,6 +942,7 @@ describe('closeCoinPusher', () => {
     for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
     const ready = becomeReadyOperator([SPARE]);
     closeCoinPusher(MACHINE, true, ready);
+    tickCoinPusherTeardowns(); // one batch
     tickCoinPusherRoom([SPARE, MACHINE], ready + 16); // World ticks it again: it is back
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'fresh', 0.5));
     tickCoinPusherTeardowns();
@@ -877,6 +957,7 @@ describe('closeCoinPusher', () => {
     for (let i = 0; i < 2 * PUSHER_SWEEP_BATCH; i++) map.set(`pusher-result:${MACHINE}:p${i}`, 'junk');
     const ready = becomeReadyOperator([SPARE]);
     closeCoinPusher(MACHINE, true, ready);
+    tickCoinPusherTeardowns(); // one batch
     setSoleCroupierPredicate(() => false);
     tickCoinPusherTeardowns();
     expect([...map.keys()].filter((k) => k.startsWith(`pusher-result:${MACHINE}:`))).toHaveLength(PUSHER_SWEEP_BATCH);

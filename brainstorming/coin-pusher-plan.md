@@ -184,7 +184,10 @@ player ids, `<kind>-<n>` item ids) are written as they are.
 - **A drop.** The player's request is a wish, not a payment. The operator
   refuses it (answers the player, clears the request, moves nothing and leaves
   the machine alone) when it is more than 2 minutes old, the player has no
-  chip, or the machine is full. Otherwise `processInsert` runs, and
+  chip, the machine is full, or the player's balance couldn't take the most
+  the drop could pay (every chip inside, its own included, without leaving
+  the safe-integer range). That last check comes before the drop, so a
+  refusal never depends on how the chip falls. Otherwise `processInsert` runs, and
   `settleCoinPusherInsert` debits the one chip, credits exactly what the drop
   paid, publishes the machine, answers the player and clears the request in
   **one transaction**. Before writing, it re-reads the stored machine and
@@ -233,9 +236,11 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   transaction (`drainAndClearCoinPusher`) that session pays the
   chips still inside to the deed holder and deletes the machine's own keys, a
   fixed few. Its per-player keys (requests, answers, and any `pusher-esc:`
-  records an earlier revision left) carry no chips. They are then swept a
-  batch of 64 per frame through the index, so a flood of them can't stall a
-  frame. The sweep walks only the keys the index files under the machine, with
+  records an earlier revision left) carry no chips. They are then swept
+  through the index, 64 a frame however many cabinets were removed (their
+  sweeps take turns), so a flood of them can't stall a frame. The drain
+  leaves them to the frame's teardown tick, so the frame that drains deletes
+  no second batch. The sweep walks only the keys the index files under the machine, with
   a live iterator, so a key written meanwhile (a stale request, a late answer)
   goes too: in the same pass, or in the next if it lands after the pass went
   by. The sweep ends when the index files none under the machine. Another

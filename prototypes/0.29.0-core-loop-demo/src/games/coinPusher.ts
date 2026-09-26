@@ -243,8 +243,10 @@ export interface PusherDropMark {
  *  between two frames. */
 export const RECENT_DROPS_MAX = 8;
 
-/** Why the operator turned an insert down. No chip moves on a refusal. */
-export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired';
+/** Why the operator turned an insert down. No chip moves on a refusal.
+ *  `balance-full`: the player's balance couldn't take the most the drop could
+ *  pay (it would leave the safe-integer range). */
+export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired' | 'balance-full';
 
 /**
  * The operator's answer to one player's request, written in the same
@@ -409,7 +411,7 @@ function isRecentDrops(v: unknown, nextChipId: number): v is PusherDropMark[] {
   });
 }
 
-const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired'];
+const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired', 'balance-full'];
 
 export function isPusherResult(v: unknown): v is PusherResult {
   if (typeof v !== 'object' || v === null) return false;

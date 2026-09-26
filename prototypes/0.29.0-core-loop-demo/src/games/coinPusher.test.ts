@@ -252,6 +252,7 @@ describe('shape guards', () => {
     const refused = { kind: 'refused', requestId: 'r2', reason: 'no-chips', atMs: 5 };
     expect(isPusherResult(drop)).toBe(true);
     expect(isPusherResult(refused)).toBe(true);
+    expect(isPusherResult({ ...refused, reason: 'balance-full' })).toBe(true);
     expect(isPusherResult({ ...drop, paid: -1 })).toBe(false);
     expect(isPusherResult({ ...drop, paid: MACHINE_MAX_CHIPS + 1 })).toBe(false);
     expect(isPusherResult({ ...drop, honored: 'yes' })).toBe(false);

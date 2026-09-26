@@ -1255,6 +1255,9 @@ export type CoinPusherSettleResult =
   | 'stale-request'
   /** The player no longer holds PUSHER_ANTE chips. */
   | 'no-chips'
+  /** The player's balance can't take what the drop paid (it would leave the
+   *  safe-integer range). */
+  | 'balance-full'
   /** `next` is not a legal one-chip drop from `base` for this request. */
   | 'invalid';
 
@@ -1300,7 +1303,7 @@ export function settleCoinPusherInsert(
   const balance = safeCount(map, balanceKey);
   if (balance < PUSHER_ANTE) return 'no-chips';
   const nextBalance = balance - PUSHER_ANTE + paid;
-  if (!Number.isSafeInteger(nextBalance)) return 'invalid';
+  if (!Number.isSafeInteger(nextBalance)) return 'balance-full';
   const result: PusherResult = {
     kind: 'drop', requestId: request.requestId, paid, honored: drop.honored, atMs: drop.atMs,
   };

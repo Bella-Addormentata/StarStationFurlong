@@ -55,8 +55,9 @@
  * bring the machine back and pay its chips twice (see closeCoinPusher). A
  * session that must wait keeps the teardown pending, and the room tick keeps
  * the election going for it even with no cabinet left. The chips and the
- * machine's own keys go in one transaction; its per-player keys, which carry
- * no chips, are swept a batch per frame so a flood of them can't stall one.
+ * machine's own keys go in one transaction. Its per-player keys, which carry
+ * no chips, are swept afterwards, one batch a frame however many cabinets
+ * were removed, so a flood of them can't stall a frame.
  *
  * WORK (at most every REQUEST_POLL_MS): the owner's door request first
  * (carried out, or answered with a refusal when its requester doesn't own the
@@ -65,7 +66,8 @@
  * PUSHER_REQUEST_SCAN of them, so a poll costs the same however many keys
  * peers write (the slot operator likewise takes one head request per poll).
  * An insert is refused — no chips move — when it is stale, the player has no
- * chip, or the machine is full. Otherwise
+ * chip, the machine is full, or the player's balance couldn't take the most
+ * the drop could pay. Otherwise
  * resolveDropTiming keeps the phase the player saw (inside the timing
  * window), processInsert runs with a seed the operator draws itself, and
  * casinoDoc.settleCoinPusherInsert debits the chip, credits the payout,
@@ -133,8 +135,8 @@ const requestsSeen = new Map<string, { docEpoch: number; byPlayer: Map<string, {
  *  operating them (closeCoinPusher), with the doc epoch each was removed in:
  *  one never reads or writes a different room's doc. */
 const pendingTeardowns = new Map<string, number>();
-/** Drained machines whose per-player keys this session is still deleting, a
- *  batch a frame (tickCoinPusherTeardowns). */
+/** Drained machines whose per-player keys this session is still deleting, in
+ *  turn, one batch a frame between them (tickCoinPusherTeardowns). */
 const sweeps = new Map<string, CoinPusherKeySweep>();
 /** Short: a drop's timing window (MAX_DROP_LAG_MS) has to cover this wait. */
 const REQUEST_POLL_MS = 100;
@@ -480,6 +482,13 @@ function settleOneInsert(
   if (waitedMs > PUSHER_STALE_REQUEST_MS) return refuse('expired');
   if (readChips(request.player) < PUSHER_ANTE) return refuse('no-chips');
   if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) return refuse('machine-full');
+  // A drop pays at most every chip in the machine, its own included, so it
+  // leaves the player at most the chips inside richer. A balance that couldn't
+  // take that is refused before the drop: a refusal never depends on how the
+  // chip falls.
+  if (!Number.isSafeInteger(readChips(request.player) + chipsInMachine(state))) {
+    return refuse('balance-full');
+  }
 
   const timing = resolveDropTiming(state, request.phase, request.requestedAt, now);
   let drop: ReturnType<typeof processInsert>;
@@ -512,7 +521,7 @@ function settleOneInsert(
     ].slice(-RECENT_DROPS_MAX),
   };
   const result = settleCoinPusherInsert(machineId, state, next, request);
-  if (result === 'no-chips') return refuse('no-chips');
+  if (result === 'no-chips' || result === 'balance-full') return refuse(result);
   if (result === 'invalid') {
     console.error('[coin-pusher] settle rejected the drop; request withdrawn, no chips moved');
     cancelCoinPusherRequest(machineId, request.player, request.requestId);
@@ -571,21 +580,23 @@ function hasTeardownsHere(): boolean {
 }
 
 /** Drain a removed cabinet, as the room's operator past its settling wait.
- *  The chips and the machine's own keys go in one transaction; its per-player
- *  keys (no chips in any) follow a batch per frame. When the chips inside
- *  can't be credited yet, nothing is written and the teardown stays pending:
- *  the operator tries again on its next pass. */
+ *  The chips and the machine's own keys go in one transaction. Its per-player
+ *  keys (no chips in any) are left to the teardown tick, which World runs
+ *  after the room tick: it deletes them a batch a frame, never a second batch
+ *  in the frame that drained. When the chips inside can't be credited yet,
+ *  nothing is written and the teardown stays pending: the operator tries
+ *  again on its next pass. */
 function tearDown(machineId: string, recipient: string): void {
   if (drainAndClearCoinPusher(machineId, recipient) === null) return;
   pendingTeardowns.delete(machineId);
-  const sweep = startCoinPusherKeySweep(machineId);
-  if (!continueCoinPusherKeySweep(sweep)) sweeps.set(machineId, sweep);
+  sweeps.set(machineId, startCoinPusherKeySweep(machineId));
 }
 
-/** World calls this every frame. It carries each removed cabinet's key sweep
- *  on by one batch, and forgets teardowns left over from another room's doc
- *  (a room switch since). The drains themselves are the operator's
- *  (tickCoinPusherRoom). */
+/** World calls this every frame, after the room tick. It deletes one batch of
+ *  removed cabinets' per-player keys, whichever cabinets and however many
+ *  were removed: the sweeps take turns, so a frame's work stays one batch.
+ *  It also forgets teardowns left over from another room's doc (a room switch
+ *  since). The drains themselves are the operator's (tickCoinPusherRoom). */
 export function tickCoinPusherTeardowns(): void {
   if (pendingTeardowns.size === 0 && sweeps.size === 0) return;
   if (!canRunCroupier()) {
@@ -598,7 +609,13 @@ export function tickCoinPusherTeardowns(): void {
     if (removedIn !== docEpoch) pendingTeardowns.delete(machineId);
   }
   for (const [machineId, sweep] of [...sweeps]) {
-    if (continueCoinPusherKeySweep(sweep)) sweeps.delete(machineId);
+    sweeps.delete(machineId);
+    // A sweep that finds nothing left ends without deleting anything, and the
+    // next takes this frame's batch. One that deleted goes to the back.
+    if (!continueCoinPusherKeySweep(sweep)) {
+      sweeps.set(machineId, sweep);
+      return;
+    }
   }
 }
 
