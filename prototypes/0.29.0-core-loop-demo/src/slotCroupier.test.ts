@@ -743,6 +743,28 @@ describe("earlier builds' per-machine leases", () => {
     const keys = [...doc.getMap('casino').keys()].filter((k) => k.startsWith('slot-operator'));
     expect(keys).toEqual([SLOT_OPERATOR_KEY]);
   });
+
+  it('refuse RUN when one is renewed after the last room tick, before the click', () => {
+    setSoleCroupierPredicate(() => false);
+    fund(M1);
+    fund(M2);
+    tickSlotMachineRoom([M1, M2], true, at(T0)); // no earlier build here yet
+    // An earlier build takes machine 1 up between that frame and a click on machine 2.
+    doc.getMap('casino').set(legacyKey, legacy(T0 + LEASE_MS));
+    expect(setManualSlotMachineRunning(M2, OPERATOR, true, at(T0 + 10))).toBe(false);
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(isManualSlotMachineRunning(M2, OPERATOR)).toBe(false);
+    // Not renewed again: RUN works once it has lapsed.
+    expect(setManualSlotMachineRunning(M2, OPERATOR, true, at(T0 + 10 + LEASE_MS))).toBe(true);
+  });
+
+  it("refuse RUN on a machine no room tick has seen yet, while that machine's is renewed", () => {
+    setSoleCroupierPredicate(() => false);
+    fund(M1);
+    doc.getMap('casino').set(legacyKey, legacy(T0 + LEASE_MS));
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(false);
+    expect(readSlotOperatorLease()).toBeNull();
+  });
 });
 
 // ── Leaving ──────────────────────────────────────────────────────────────────

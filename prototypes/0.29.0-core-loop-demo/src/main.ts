@@ -2102,7 +2102,7 @@ async function leaveRoom(): Promise<void> {
 
 async function leaveRoomNow(): Promise<void> {
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
-  sessionEpoch++;
+  const epoch = ++sessionEpoch;
   // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,
   // wide framing) must not follow the player into the next room: the docking
   // system is a boot-time singleton, so nothing else tears these down on a
@@ -2127,6 +2127,12 @@ async function leaveRoomNow(): Promise<void> {
   const sync = yjsSync;
   yjsSync = null;
   if (sync) {
+    // Claim the room's snapshot writer with it. A leave that overlaps this one
+    // finds no sync and returns at once, and its caller may join the next room
+    // while this one waits below: that join attaches its own writer, which
+    // this leave must leave alone.
+    const cache = roomCacheHandle;
+    roomCacheHandle = null;
     // 🎰 Hand back this session's slot operator lease while the room's doc
     // is still the bound casino doc, and send the release before the doc
     // goes: another of the operator's devices then takes over at once instead
@@ -2143,12 +2149,11 @@ async function leaveRoomNow(): Promise<void> {
     // 💾 Tier A: final snapshot BEFORE stop() destroys the doc (encode is
     // synchronous; the IndexedDB put is fire-and-forget and survives us).
     try {
-      roomCacheHandle?.flushNow();
+      cache?.flushNow();
     } catch {
       /* cache is never fatal */
     }
-    roomCacheHandle?.detach();
-    roomCacheHandle = null;
+    cache?.detach();
     const oldDoc = sync.doc;
     try {
       await sync.stop(); // closes the ysync writer + doc.destroy()
@@ -2161,6 +2166,11 @@ async function leaveRoomNow(): Promise<void> {
       console.warn("leaveRoom: previous Y.Doc was not destroyed by stop()");
     }
   }
+  // A leave or join begun while this one waited has claimed the session
+  // (sessionEpoch), and the shared link with it: a newer leave drops the link
+  // itself, and a newer join is using it. Dropping it here would cut that
+  // session off.
+  if (epoch !== sessionEpoch) return;
   try {
     await networkProvider.disconnect();
   } catch (err) {
