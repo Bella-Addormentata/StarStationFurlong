@@ -103,6 +103,7 @@ export function bindCasinoDoc(doc: Y.Doc): void {
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
   casinoMap.observe((event) => notify(event.keysChanged));
+  indexLegacySlotLeases(casinoMap);
   notify(); // repaint subscribers from the fresh doc
 }
 
@@ -425,6 +426,20 @@ export function writeSlotMachineState(machineId: string, state: SlotMachineState
   });
 }
 
+/**
+ * Run several casino writes as one transaction, so a peer sees all of them or
+ * none (the writes' own transactions nest inside it). Returns what `writes`
+ * returns.
+ */
+export function transactCasino<T>(writes: () => T): T {
+  ensureMap();
+  let result!: T;
+  boundDoc!.transact(() => {
+    result = writes();
+  });
+  return result;
+}
+
 export function readSlotPlayRequests(machineId: string): SlotPlayRequest[] {
   const prefix = `slot-request:${machineId}:`;
   const requests: SlotPlayRequest[] = [];
@@ -492,6 +507,10 @@ export interface SlotOperatorLease {
   playerId: string;
   sessionId: string;
   expiresAt: number;
+  /** The room's lease only: a fresh token each time a session takes it, kept
+   *  across its renewals, so a peer tells a new take from a renewal even when
+   *  it never saw the lease go. Earlier builds' per-machine leases have none. */
+  tenure?: string;
 }
 
 function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
@@ -501,24 +520,78 @@ function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
     && lease.playerId.length <= 128
     && typeof lease.sessionId === 'string' && lease.sessionId.length > 0
     && lease.sessionId.length <= 128
-    && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt);
+    && typeof lease.expiresAt === 'number' && Number.isFinite(lease.expiresAt)
+    && (lease.tenure === undefined
+      || (typeof lease.tenure === 'string' && lease.tenure.length > 0 && lease.tenure.length <= 64));
 }
 
-export function readSlotOperatorLease(machineId: string): SlotOperatorLease | null {
+/** 🎰 The room's slot operator lease: ONE session operates every slot machine
+ *  in the room (slotCroupier.ts), so a player's `bal:` has one slot writer. */
+export const SLOT_OPERATOR_KEY = 'slot-operator';
+
+export function readSlotOperatorLease(): SlotOperatorLease | null {
+  const value = ensureMap().get(SLOT_OPERATOR_KEY);
+  return isSlotOperatorLease(value) ? value : null;
+}
+
+export function writeSlotOperatorLease(lease: SlotOperatorLease): void {
+  if (!isSlotOperatorLease(lease)) return;
+  ensureMap().set(SLOT_OPERATOR_KEY, lease);
+}
+
+export function clearSlotOperatorLease(): void {
+  ensureMap().delete(SLOT_OPERATOR_KEY);
+}
+
+/** The per-machine lease (`slot-operator:<mid>`) that builds before the
+ *  room's lease took. This build never writes one: while one is being
+ *  renewed, an earlier build is operating that machine (slotCroupier.ts,
+ *  EARLIER BUILDS). */
+export function readLegacySlotOperatorLease(machineId: string): SlotOperatorLease | null {
   const value = ensureMap().get(`slot-operator:${machineId}`);
   return isSlotOperatorLease(value) ? value : null;
 }
 
-export function writeSlotOperatorLease(
-  machineId: string,
-  lease: SlotOperatorLease,
-): void {
-  if (!isSlotOperatorLease(lease)) return;
-  ensureMap().set(`slot-operator:${machineId}`, lease);
+export function clearLegacySlotOperatorLease(machineId: string): void {
+  ensureMap().delete(`slot-operator:${machineId}`);
 }
 
-export function clearSlotOperatorLease(machineId: string): void {
-  ensureMap().delete(`slot-operator:${machineId}`);
+/** The machines each bound map holds an earlier build's per-machine lease
+ *  for, kept current from the keys each transaction changed. The slot
+ *  operator asks before every write whether an earlier build is operating in
+ *  the room, whatever machines the room's layout listed at the last frame,
+ *  and never walks the map to find out. */
+const legacySlotLeaseMachines = new WeakMap<Y.Map<unknown>, Set<string>>();
+
+/** Build a map's index in one pass (when it is bound, while a joined doc is
+ *  usually still empty), then keep it by an observer. */
+function indexLegacySlotLeases(map: Y.Map<unknown>): void {
+  if (legacySlotLeaseMachines.has(map)) return;
+  const prefix = `${SLOT_OPERATOR_KEY}:`;
+  const machines = new Set<string>();
+  for (const key of map.keys()) {
+    if (key.startsWith(prefix)) machines.add(key.slice(prefix.length));
+  }
+  legacySlotLeaseMachines.set(map, machines);
+  map.observe((event) => {
+    for (const key of event.keysChanged) {
+      if (!key.startsWith(prefix)) continue;
+      const machineId = key.slice(prefix.length);
+      if (map.has(key)) machines.add(machineId);
+      else machines.delete(machineId);
+    }
+  });
+}
+
+/** Every machine an earlier build's lease (`slot-operator:<mid>`) is held
+ *  for in the bound map, read from the index built when it was bound. */
+export function readLegacySlotOperatorMachineIds(): string[] {
+  return [...(legacySlotLeaseMachines.get(ensureMap()) ?? [])];
+}
+
+/** Whether a round's reserve is locked on this machine (`slot-escrow:<mid>`). */
+export function hasSlotEscrow(machineId: string): boolean {
+  return ensureMap().has(`slot-escrow:${machineId}`);
 }
 
 export interface SlotSharedBankrollLease {
