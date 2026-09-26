@@ -452,6 +452,89 @@ describe('a round once this session no longer holds the lease', () => {
     expect(readChips(PLAYER)).toBe(100 - BET);
   });
 
+  it('writes nothing from a settle paused under one take once this page has taken the lease again, then settles it under the new take', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const t = ready + SLOT_SPIN_MS + 10;
+    tickSlotMachineRoom([M1], false, at(t)); // the settle starts under the first take, then awaits
+    releaseSlotOperatorLease(); // released (pagehide)…
+    tickSlotMachineRoom([M1], false, at(t + 1)); // …and taken again at once (a page restored from the cache)
+    const second = readSlotOperatorLease()?.tenure;
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true); // the first take's settle wrote nothing
+    expect(readChips(PLAYER)).toBe(100 - BET);
+    // Past the new take's settling wait, the round is settled under it.
+    tickSlotMachineRoom([M1], false, at(t + 1 + SETTLE_MS));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)?.phase).toBe('settled');
+    expect(readSlotOperatorLease()?.tenure).toBe(second);
+  });
+
+  it('writes nothing from a settle whose take a peer has overwritten, even naming this page', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const t = ready + SLOT_SPIN_MS + 10;
+    tickSlotMachineRoom([M1], false, at(t)); // the settle starts, then awaits
+    const mine = readSlotOperatorLease()!;
+    writeSlotOperatorLease({ ...mine, tenure: 'forged' }); // this page's session, another take
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  it('writes nothing from a settle begun under a take this page has since replaced, even if that take is written back', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const t = ready + SLOT_SPIN_MS + 10;
+    tickSlotMachineRoom([M1], false, at(t)); // the settle starts under the first take, then awaits
+    const first = readSlotOperatorLease()!;
+    releaseSlotOperatorLease();
+    tickSlotMachineRoom([M1], false, at(t + 1)); // a new take…
+    writeSlotOperatorLease({ ...first, expiresAt: t + 1 + LEASE_MS }); // …and a peer writes the old one back
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  it('writes nothing from a settle that resumes after its own lease has lapsed', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    tickSlotMachineRoom([M1], false, at(ready + SLOT_SPIN_MS + 10)); // the settle starts, then awaits
+    at(ready + SLOT_SPIN_MS + 10 + 20_000); // the page is frozen past its lease's term
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  it('accepts nothing from an accept paused under one take once this page has taken the lease again', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]); // the accept starts under the first take, then awaits
+    releaseSlotOperatorLease();
+    tickSlotMachineRoom([M1], false, at(ready + 1)); // taken again at once
+    await acceptsDone();
+    expect(spinning(M1)).toBe(false);
+    expect(readSlotPlayRequests(M1)).toHaveLength(1);
+    expect(readChips(PLAYER)).toBe(100);
+    // Accepted once, under the new take, when its settling wait is over.
+    tickSlotMachineRoom([M1], false, at(ready + 1 + SETTLE_MS));
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
   it('writes nothing from a refund paused at an await', async () => {
     fund(M1);
     await requestSpin(M1);
@@ -547,6 +630,30 @@ describe('running machines by hand', () => {
     await acceptsDone();
     expect(spinning(M1)).toBe(true);
     expect(spinning(M2)).toBe(false);
+  });
+
+  it('keeps running a machine by hand across a lapse of its own lease, and takes the lease again', () => {
+    fund(M1);
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(true);
+    tickSlotMachineRoom([M1], true, at(T0 + SETTLE_MS));
+    // No frames for a while (a background tab): its own lease lapses.
+    tickSlotMachineRoom([M1], true, at(T0 + 20_000));
+    expect(readSlotOperatorLease()).toBeNull();
+    tickSlotMachineRoom([M1], true, at(T0 + 20_001));
+    expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+    expect(isManualSlotMachineRunning(M1, OPERATOR)).toBe(true);
+  });
+
+  it('stops running a machine by hand once another session takes the lease, and leaves it stopped', () => {
+    fund(M1);
+    setManualSlotMachineRunning(M1, OPERATOR, true, at(T0));
+    writeSlotOperatorLease(lease(T0 + LEASE_MS)); // another session took the room over
+    tickSlotMachineRoom([M1], true, at(T0 + 100));
+    expect(isManualSlotMachineRunning(M1, OPERATOR)).toBe(false);
+    // Not taken back up when that session lets go: RUN is pressed again.
+    doc.getMap('casino').delete(SLOT_OPERATOR_KEY);
+    tickSlotMachineRoom([M1], true, at(T0 + 200));
+    expect(readSlotOperatorLease()).toBeNull();
   });
 
   it('STOP lets the lease go on the next frame once no machine is run here', () => {

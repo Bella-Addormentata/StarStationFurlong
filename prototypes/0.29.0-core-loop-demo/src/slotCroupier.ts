@@ -293,17 +293,21 @@ export function isSlotOperator(now = Date.now()): boolean {
 }
 
 /**
- * Whether this session still operates the room, in the doc of `docEpoch`.
- * A round's settle and refunds check it after their last await, just before
+ * Whether this session still operates the room in the same take of the lease
+ * (`tenure`) as when a piece of work began, in the doc of `docEpoch`. A
+ * round's accept, settle and refunds check it after their awaits, just before
  * they write: a session that has let the lease go (a room it is leaving, a
  * page put away in the back/forward cache, a lease lost or lapsed) never
- * writes behind whoever took over. The round stays on its machine, and that
- * machine's next operator finishes it.
+ * writes behind whoever took over, and work begun under one take never writes
+ * under a later one, which may still be in its settling wait. The round stays
+ * on its machine, and that machine's next operator finishes it.
  */
-function stillOperates(docEpoch: number): boolean {
+function stillOperates(docEpoch: number, tenure: string): boolean {
   return operator !== null
     && operator.docEpoch === docEpoch
     && docEpoch === casinoDocEpoch()
+    && operator.tenure === tenure
+    && readSlotOperatorLease()?.tenure === tenure
     && ownsOperatorLease(operator.playerId);
 }
 
@@ -324,12 +328,12 @@ function takeOperatorLease(playerId: string, now: number): void {
   };
 }
 
-/** Stop operating the room's slot machines here, and forget the machines
- *  this page ran by hand. The lease record goes too, so a successor needn't
- *  wait it out: a round still settling here writes nothing once this session
- *  no longer operates (stillOperates). */
-function stopSlotOperator(): void {
-  manualMachines.clear();
+/** Stop operating the room's slot machines here and, unless told to keep
+ *  them, forget the machines this page runs by hand. The lease record goes
+ *  too, so a successor needn't wait it out: a round still settling here
+ *  writes nothing once this session no longer operates (stillOperates). */
+function stopSlotOperator(forgetManualMachines = true): void {
+  if (forgetManualMachines) manualMachines.clear();
   if (!operator) return;
   operator = null;
   requestPolls.clear();
@@ -354,9 +358,10 @@ function electSlotOperator(lease: SlotOperatorLease | null, playerId: string, no
     || lease.sessionId !== operatorSessionId
     || lease.expiresAt <= now) {
     // Lost, or lapsed (a tab that got no frames for a while). A lapsed record
-    // of this session's own goes now unless a round is still settling; the
-    // next frame takes the lease afresh if nobody else has.
-    stopSlotOperator();
+    // of this session's own goes now, and the next frame takes the lease
+    // afresh if nobody else has: machines run by hand are forgotten only once
+    // another session holds the lease.
+    stopSlotOperator(lease !== null && lease.sessionId !== operatorSessionId);
     return null;
   }
   if (now - operator.renewedAt >= OPERATOR_LEASE_RENEW_MS) {
@@ -449,12 +454,14 @@ export function tickSlotMachineRoom(
     return;
   }
   const operatorId = electSlotOperator(lease, playerId, now);
-  if (operatorId === null) return;
-  for (const machineId of operated) tickSlotMachine(machineId, operatorId);
+  if (operatorId === null || !operator) return;
+  // Work started now belongs to this take of the lease (stillOperates).
+  const { tenure } = operator;
+  for (const machineId of operated) tickSlotMachine(machineId, operatorId, tenure);
   for (const machineId of windingDown) {
     const accepted = currentAcceptedRound(machineId);
     if (!accepted || accepting.has(machineId)) continue;
-    runTerminal(machineId, 'operator-change refund', () => windDownRound(machineId, accepted));
+    runTerminal(machineId, 'operator-change refund', () => windDownRound(machineId, accepted, tenure));
   }
 }
 
@@ -462,9 +469,13 @@ export function tickSlotMachineRoom(
  *  (WIND-DOWN above). One attempt: a round whose refund can't be made (its
  *  escrow is already gone) isn't held here, and the machine's next operator
  *  finds its spin like any other it didn't accept. */
-async function windDownRound(machineId: string, accepted: AcceptedSlotRound): Promise<void> {
+async function windDownRound(
+  machineId: string,
+  accepted: AcceptedSlotRound,
+  tenure: string,
+): Promise<void> {
   try {
-    await cancelForHouseCommit(machineId, readSlotMachineState(machineId));
+    await cancelForHouseCommit(machineId, readSlotMachineState(machineId), tenure);
   } finally {
     if (acceptedRounds.get(machineId) === accepted) acceptedRounds.delete(machineId);
   }
@@ -562,7 +573,7 @@ function runTerminal(
     .finally(() => settling.delete(machineId));
 }
 
-function tickSlotMachine(machineId: string, operatorId?: string): void {
+function tickSlotMachine(machineId: string, operatorId: string, tenure: string): void {
   if (settling.has(machineId) || accepting.has(machineId)) return;
   const state = readSlotMachineState(machineId);
   let activeAccepted = currentAcceptedRound(machineId);
@@ -578,18 +589,15 @@ function tickSlotMachine(machineId: string, operatorId?: string): void {
       activeAccepted = undefined;
     } else {
       runTerminal(machineId, 'state-change refund', () =>
-        cancelForHouseCommit(machineId, state));
+        cancelForHouseCommit(machineId, state, tenure));
       return;
     }
   }
-  if (operatorId) {
-    const configuredFunding = readSlotFundingConfig(machineId);
-    if (configuredFunding?.ownerId !== operatorId) return;
-    if (state?.phase === 'spinning' && state.funding?.ownerId !== operatorId) {
-      runTerminal(machineId, 'funding-owner transfer refund', () =>
-        cancelForHouseCommit(machineId, state));
-      return;
-    }
+  if (readSlotFundingConfig(machineId)?.ownerId !== operatorId) return;
+  if (state?.phase === 'spinning' && state.funding?.ownerId !== operatorId) {
+    runTerminal(machineId, 'funding-owner transfer refund', () =>
+      cancelForHouseCommit(machineId, state, tenure));
+    return;
   }
   if (state?.phase === 'spinning') {
     const player = state.player;
@@ -601,7 +609,7 @@ function tickSlotMachine(machineId: string, operatorId?: string): void {
       || accepted.player !== player
       || accepted.houseCommit !== houseCommit) {
       runTerminal(machineId, 'house-commit refund', () =>
-        cancelForHouseCommit(machineId, state));
+        cancelForHouseCommit(machineId, state, tenure));
       return;
     }
     let reveal = readSlotReveal(machineId, player);
@@ -612,13 +620,13 @@ function tickSlotMachine(machineId: string, operatorId?: string): void {
     if (!reveal || reveal.requestId !== state.requestId) {
       if (Date.now() - accepted.acceptedAt >= REVEAL_TIMEOUT_MS) {
         runTerminal(machineId, 'reveal timeout', () =>
-          settleRevealTimeout(machineId, state, accepted));
+          settleRevealTimeout(machineId, state, accepted, tenure));
       }
       return;
     }
     if (Date.now() - accepted.acceptedAt < SLOT_SPIN_MS) return;
     runTerminal(machineId, 'settle', () =>
-      settle(machineId, state, reveal.seed, accepted));
+      settle(machineId, state, reveal.seed, accepted, tenure));
     return;
   }
 
@@ -654,7 +662,7 @@ function tickSlotMachine(machineId: string, operatorId?: string): void {
     return;
   }
   accepting.add(machineId);
-  accept(machineId, state, request, operatorId)
+  accept(machineId, state, request, operatorId, tenure)
     .catch((err) => console.error('[slots] accept failed:', err))
     .finally(() => accepting.delete(machineId));
 }
@@ -663,10 +671,11 @@ async function settleRevealTimeout(
   machineId: string,
   state: SlotMachineState,
   accepted: AcceptedSlotRound,
+  tenure: string,
 ): Promise<void> {
   const token = accepted.sharedLeaseToken ?? undefined;
   if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
-  if (!stillOperates(accepted.docEpoch)) return;
+  if (!stillOperates(accepted.docEpoch, tenure)) return;
   if (!refundSlotWager(
     machineId,
     accepted.player,
@@ -693,6 +702,7 @@ async function settleRevealTimeout(
 async function cancelForHouseCommit(
   machineId: string,
   state: SlotMachineState | null,
+  tenure: string,
 ): Promise<void> {
   const docEpoch = casinoDocEpoch();
   const accepted = currentAcceptedRound(machineId);
@@ -709,7 +719,7 @@ async function cancelForHouseCommit(
   const fundingReady = !refund
     || await ensureTerminalFundingLease(machineId, refund.funding, sharedLeaseToken);
   // Nothing is written once this session no longer operates the room.
-  if (!stillOperates(docEpoch)) return;
+  if (!stillOperates(docEpoch, tenure)) return;
   if (state?.player) clearSlotReveal(machineId, state.player);
   if (!fundingReady) return;
   if (refund && !refundSlotWager(
@@ -744,7 +754,8 @@ async function accept(
   machineId: string,
   state: SlotMachineState | null,
   request: ReturnType<typeof readSlotPlayRequests>[number],
-  operatorId?: string,
+  operatorId: string,
+  tenure: string,
 ): Promise<void> {
   const docEpoch = casinoDocEpoch();
   const houseSeed = randomSlotSeed();
@@ -755,8 +766,8 @@ async function accept(
   const current = readSlotMachineState(machineId);
   if (queued?.requestId !== request.requestId
     || current?.phase === 'spinning'
-    || (operatorId && (!ownsOperatorLease(operatorId)
-      || readSlotFundingConfig(machineId)?.ownerId !== operatorId))) return;
+    || !stillOperates(docEpoch, tenure)
+    || readSlotFundingConfig(machineId)?.ownerId !== operatorId) return;
   const funding = readSlotFundingConfig(machineId);
   if (!funding) return;
   if (funding.mode === 'shared') {
@@ -785,8 +796,8 @@ async function accept(
     || leaseCurrent?.phase === 'spinning'
     || leaseFunding?.mode !== funding.mode
     || leaseFunding.ownerId !== funding.ownerId
-    || (operatorId && (!ownsOperatorLease(operatorId)
-      || leaseFunding.ownerId !== operatorId))) {
+    || !stillOperates(docEpoch, tenure)
+    || leaseFunding.ownerId !== operatorId) {
     return;
   }
   const paytable = (readSlotOddsConfig(machineId)?.paytable ?? DEFAULT_PAYTABLE)
@@ -803,8 +814,8 @@ async function accept(
     || postHashState?.phase === 'spinning'
     || postHashFunding?.mode !== funding.mode
     || postHashFunding.ownerId !== funding.ownerId
-    || (operatorId && (!ownsOperatorLease(operatorId)
-      || postHashFunding.ownerId !== operatorId))) {
+    || !stillOperates(docEpoch, tenure)
+    || postHashFunding.ownerId !== operatorId) {
     return;
   }
   const round = (postHashState?.round ?? state?.round ?? 0) + 1;
@@ -891,6 +902,7 @@ async function settle(
   state: SlotMachineState,
   playerSeed: string,
   accepted: AcceptedSlotRound,
+  tenure: string,
 ): Promise<void> {
   const actualPlayerCommit = await commitSlotSeed(playerSeed);
   if (accepted.docEpoch !== casinoDocEpoch()) {
@@ -901,7 +913,7 @@ async function settle(
   if (current?.phase !== 'spinning' || current.requestId !== state.requestId) return;
   if (acceptedRounds.get(machineId) !== accepted
     || current.fairness?.commits?.[1] !== accepted.houseCommit) {
-    await cancelForHouseCommit(machineId, state);
+    await cancelForHouseCommit(machineId, state, tenure);
     return;
   }
   if (actualPlayerCommit !== accepted.playerCommit) {
@@ -929,12 +941,12 @@ async function settle(
   if (latest?.phase !== 'spinning' || latest.requestId !== state.requestId) return;
   if (acceptedRounds.get(machineId) !== accepted
     || latest.fairness?.commits?.[1] !== accepted.houseCommit) {
-    await cancelForHouseCommit(machineId, state);
+    await cancelForHouseCommit(machineId, state, tenure);
     return;
   }
   const token = accepted.sharedLeaseToken ?? undefined;
   if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
-  if (!stillOperates(accepted.docEpoch)) return;
+  if (!stillOperates(accepted.docEpoch, tenure)) return;
   const terminalState = readSlotMachineState(machineId);
   if (terminalState?.phase !== 'spinning'
     || terminalState.requestId !== state.requestId
