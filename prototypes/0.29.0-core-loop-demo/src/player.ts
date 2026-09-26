@@ -2526,7 +2526,9 @@ export class Player {
     this.doorTimer = 0;
     // 🧬 Vat teardown: a beam ends any spawn choreography — its vat seals
     // behind us — and drops the clearance squeeze (beginVatSpawn beams first,
-    // then re-arms its own).
+    // then re-arms its own). A clone beamed out mid-ceremony is out of the
+    // vat all the same: its colour starts coming back.
+    if (this.vatPhase !== "NONE") this.pallorT = 0;
     this.vatPhase = "NONE";
     this._sealVat();
     this.mesh.scale.set(1, 1, 1);
@@ -2703,7 +2705,8 @@ export class Player {
     if (this.vatPhase === "NONE") return; // released: the seal check re-aims
     this.logicalAngle = faceAngle;
     if (this.vatPhase === "RELAX") {
-      // Mid-ease: keep the size it has reached, just move with the vat.
+      // Mid-ease: keep the size it has reached, just move with the vat (the
+      // next RELAX frame re-checks the spot before easing on).
       pos.x = centre.x + Math.sin(faceAngle) * along;
       pos.z = centre.z + Math.cos(faceAngle) * along;
     } else if (this.vatPhase === "WALK_OUT") {
@@ -2810,6 +2813,27 @@ export class Player {
       return;
     }
     if (this.vatPhase === "RELAX") {
+      // The spot must stay a valid release all the way through the ease: a
+      // vat moved under the clone (rebindVat carries it along) or furniture
+      // moved onto it re-plans like the walk-out — walk on, step out
+      // elsewhere, or hold.
+      const pos = this.mesh.position;
+      const at =
+        (pos.x - this.vatCentre.x) * Math.sin(this.vatFacing) +
+        (pos.z - this.vatCentre.z) * Math.cos(this.vatFacing);
+      if (
+        vatFreeExitAlong(
+          this.vatCentre,
+          this.vatFacing,
+          OBSTACLES,
+          this.roomBounds(),
+          PLAYER_R,
+          at,
+        ) === null
+      ) {
+        this._leaveVat(at);
+        return;
+      }
       // Short exit: ease back to full size and down onto the floor in place.
       this.vatRelaxT += Math.max(0, deltaTime);
       const k = Math.min(1, this.vatRelaxT / this.VAT_RELAX_TIME);
