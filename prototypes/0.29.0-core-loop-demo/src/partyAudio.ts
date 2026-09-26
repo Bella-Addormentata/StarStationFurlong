@@ -77,6 +77,8 @@ export function nextTrackId(id: string): string {
   return TRACKS[(i + 1) % TRACKS.length].id;
 }
 
+import { partyDocEpoch } from './partyDoc';
+
 export interface Note {
   /** MIDI note number, or null for a rest. */
   midi: number | null;
@@ -290,6 +292,11 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
   let live: OscillatorNode[] = []; // everything scheduled and not yet stopped
   let roundEnd = -1; // ctx time the current/last round ends; <0 = none
   let wasInRoom = false;
+  /** The party doc this voice's presence / loop / hold belong to: a room
+   *  swap keeps the World and may reuse a same-id speaker's group, so the
+   *  state is reset when the doc's epoch changes — the next room gets its
+   *  entry round, and a hold does not follow you (Copilot review, PR #169). */
+  let epoch = partyDocEpoch();
   /** Seconds the player has been continuously OUT of the room. Presence
    *  blinks for a frame or two as a room builds (the walk-in flipped
    *  true → false → true a second apart), and that blink paused the entry
@@ -419,6 +426,15 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
 
   const voice: SpeakerVoice = {
     update(_dt, { on, inRoom, distance, track }) {
+      const now_epoch = partyDocEpoch();
+      if (now_epoch !== epoch) {
+        epoch = now_epoch;
+        silence(0.2, 'room-swap');
+        wasInRoom = false;
+        away = 0;
+        looping = false;
+        held = false;
+      }
       if (track && track !== trackId) {
         // A new track mid-round: cut over and, if music was wanted, restart on it.
         const wanted = looping || (ctx !== null && roundEnd > 0 && ctx.currentTime < roundEnd);

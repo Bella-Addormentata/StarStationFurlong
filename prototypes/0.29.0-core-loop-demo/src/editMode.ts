@@ -246,6 +246,15 @@ export function validatePlacement(
       ? generated({ ...item, pos, rot }, FURNITURE.filter((o) => o.id !== item.id).concat([{ ...item, pos, rot }]))
       : [];
   const blocking: Box[] = box ? [box] : featureBoxes;
+  // …and an EXISTING feature's blocked area is generated the same way:
+  // itemAabb is null for the sea / river / infinity pool, so their water was
+  // invisible to the overlap and connectivity checks below.
+  const blockedBy = (other: FurnitureItem): Box[] => {
+    const ob = itemAabb(other);
+    if (ob) return [ob];
+    const gen = FURNITURE_DEFS[other.kind].obstacleBoxes;
+    return gen ? gen(other, FURNITURE) : [];
+  };
 
   // Placement box: 1 m inside each wall (floorPlanDoc.roomPlaceBounds —
   // deliberately tighter than the WALKABLE box; that function explains why).
@@ -271,13 +280,13 @@ export function validatePlacement(
   if (!wallVerdict.ok) return wallVerdict;
 
   for (const b of blocking) {
-    // 2. Overlap with every other item's CURRENT footprint.
+    // 2. Overlap with every other item's CURRENT blocked area.
     for (const other of FURNITURE) {
       if (other.id === item.id) continue;
-      const ob = itemAabb(other);
-      if (!ob) continue;
-      if (b.x0 < ob.x1 && b.x1 > ob.x0 && b.z0 < ob.z1 && b.z1 > ob.z0) {
-        return { ok: false, reason: `overlaps ${other.id}` };
+      for (const ob of blockedBy(other)) {
+        if (b.x0 < ob.x1 && b.x1 > ob.x0 && b.z0 < ob.z1 && b.z1 > ob.z0) {
+          return { ok: false, reason: `overlaps ${other.id}` };
+        }
       }
     }
 
@@ -326,8 +335,7 @@ export function validatePlacement(
   const scratch: Box[] = [...blocking];
   for (const other of FURNITURE) {
     if (other.id === item.id) continue;
-    const ob = itemAabb(other);
-    if (ob) scratch.push(ob);
+    scratch.push(...blockedBy(other));
   }
   const reachable = computeReachable(scratch, ctx.floodFrom.x, ctx.floodFrom.z);
   const isReachable = (x: number, z: number): boolean => {

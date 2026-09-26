@@ -128,6 +128,24 @@ function pointInAny(x: number, z: number, boxes: Box[]): boolean {
  * centre — because in a small room a target derived from fractions can land a
  * little inside a wall while a metre in would have been fine.
  */
+/** 🚪 Every door's opening plus a lane into the room — reserved before a
+ *  fitted set lands, so no piece stands in a doorway or its approach in a
+ *  room whose doors were moved (Copilot review, PR #169). The doors come
+ *  from the room's layout, not from a wall's centre. */
+function doorLanes(halfX: number, halfZ: number): Box[] {
+  const HALF_W = 1.3; // the opening + a post each side
+  const LANE = 2.0; // metres into the room kept clear
+  return roomDoorPoints().map((d) => {
+    const onZ = Math.abs(Math.abs(d.z) - halfZ) < Math.abs(Math.abs(d.x) - halfX); // a north/south wall
+    if (onZ) {
+      const inward = d.z > 0 ? -1 : 1;
+      return { x0: d.x - HALF_W, x1: d.x + HALF_W, z0: Math.min(d.z, d.z + inward * LANE), z1: Math.max(d.z, d.z + inward * LANE) };
+    }
+    const inward = d.x > 0 ? -1 : 1;
+    return { z0: d.z - HALF_W, z1: d.z + HALF_W, x0: Math.min(d.x, d.x + inward * LANE), x1: Math.max(d.x, d.x + inward * LANE) };
+  });
+}
+
 function placeFitting(
   specs: PlacementSpec[],
   halfX: number,
@@ -138,7 +156,7 @@ function placeFitting(
   seed: readonly Box[] = [],
 ): FurnitureItem[] {
   const out: FurnitureItem[] = [];
-  const occupied: Box[] = [...seed];
+  const occupied: Box[] = [...seed, ...doorLanes(halfX, halfZ)];
   const MARGIN = 0.6; // keep furniture off the walls
   let n = 0;
 
