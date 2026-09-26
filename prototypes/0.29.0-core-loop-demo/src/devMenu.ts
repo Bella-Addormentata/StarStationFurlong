@@ -47,7 +47,8 @@ import {
   FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos,
   footprintAabb, itemAabb,
 } from './furniture';
-import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
+import type { Box, FurnitureItem, FurnitureKind, Rot } from './furniture';
+import { PLAYER_R } from './player';
 // 🛰️ Hull space (exterior anchors + stacking) — moved out of furniture.ts.
 import { findFreeExteriorSpot } from './hull';
 import { validatePlacement, roomEdit } from './editMode';
@@ -966,7 +967,16 @@ function buildPanel(): HTMLDivElement {
       case 'add-template': {
         const w = getWorld();
         if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
-        const r = addRoomTemplateItems(btn.dataset.template ?? '');
+        // Players (inflated by the collision radius) and every reachable
+        // stand-point (plus the FINE-arrival epsilon) are ground the set
+        // must leave alone — the same clearances validatePlacement demands.
+        const me = w.getPlayer().getPosition();
+        const around = (p: { x: number; z: number }, r: number): Box => ({ x0: p.x - r, z0: p.z - r, x1: p.x + r, z1: p.z + r });
+        const keepClear: Box[] = [
+          ...[{ x: me.x, z: me.z }, ...w.getRemotePlayerPositions()].map((p) => around(p, PLAYER_R + 0.1)),
+          ...collectRequiredReachable(floodOrigin(w.getPlayer())).map((p) => around(p, PLAYER_R + 0.06)),
+        ];
+        const r = addRoomTemplateItems(btn.dataset.template ?? '', keepClear);
         if (!r) break;
         w.reconcileDoorPlacements();
         w.updateSideWallCoverage();

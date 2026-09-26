@@ -83,7 +83,7 @@ export interface RoomTemplate {
 
 /** One thing to try to place, at a position given as a FRACTION of the room's
  *  half-extents so the same recipe works in a 12 m room and a 30 m one. */
-interface PlacementSpec {
+export interface PlacementSpec {
   kind: FurnitureKind;
   /** Target, in room-fractions: [-1, 1] on each axis. */
   at: [number, number];
@@ -115,7 +115,7 @@ function boxesOverlap(a: Box, b: Box): boolean {
   return a.x0 < b.x1 && a.x1 > b.x0 && a.z0 < b.z1 && a.z1 > b.z0;
 }
 
-function pointInAny(x: number, z: number, boxes: Box[]): boolean {
+function pointInAny(x: number, z: number, boxes: readonly Box[]): boolean {
   return boxes.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
 }
 
@@ -133,8 +133,11 @@ function pointInAny(x: number, z: number, boxes: Box[]): boolean {
  *  room whose doors were moved (Copilot review, PR #169). The doors come
  *  from the room's layout, not from a wall's centre. */
 function doorLanes(halfX: number, halfZ: number): Box[] {
-  const HALF_W = 1.3; // the opening + a post each side
-  const LANE = 2.0; // metres into the room kept clear
+  const HALF_W = 1.12; // the 2 m opening + a post each side
+  const LANE = 0.8; // metres into the room kept clear — the doorway and its
+  // threshold. Deeper lanes evicted the pergola's near post and, in a 2×2
+  // room, the sea; the door FRONTS themselves are protected as stand-points
+  // (+ ADD boxes them, PLACE keeps the lane), which is what reachability needs.
   return roomDoorPoints().map((d) => {
     const onZ = Math.abs(Math.abs(d.z) - halfZ) < Math.abs(Math.abs(d.x) - halfX); // a north/south wall
     if (onZ) {
@@ -146,7 +149,7 @@ function doorLanes(halfX: number, halfZ: number): Box[] {
   });
 }
 
-function placeFitting(
+export function placeFitting(
   specs: PlacementSpec[],
   halfX: number,
   halfZ: number,
@@ -156,7 +159,12 @@ function placeFitting(
   seed: readonly Box[] = [],
 ): FurnitureItem[] {
   const out: FurnitureItem[] = [];
-  const occupied: Box[] = [...seed, ...doorLanes(halfX, halfZ)];
+  const occupied: Box[] = [...seed];
+  // Doorways are reserved for everything that STANDS; a spanning water
+  // feature keeps its own door rule (the sea's dry lanes, the pool's
+  // landings) and is not refused for touching a lane's box.
+  const lanes = doorLanes(halfX, halfZ);
+  const blockedFor = (spanning: boolean): readonly Box[] => (spanning ? occupied : [...occupied, ...lanes]);
   const MARGIN = 0.6; // keep furniture off the walls
   let n = 0;
 
@@ -199,7 +207,7 @@ function placeFitting(
         // not the collision one: the sea must not be laid through furniture
         // already standing in its corner (Copilot review, PR #169). Its own
         // set's later pieces then keep clear of it as before.
-        if (boxes.some((b) => occupied.some((o) => boxesOverlap(b, o)))) continue;
+        if (boxes.some((b) => blockedFor(true).some((o) => boxesOverlap(b, o)))) continue;
         occupied.push(...boxes);
         if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
         placed = item;
@@ -215,7 +223,7 @@ function placeFitting(
               b.z0 < -halfZ + margin || b.z1 > halfZ - margin,
           );
         if (outside) continue;
-        if (boxes.some((b) => occupied.some((o) => boxesOverlap(b, o)))) continue;
+        if (boxes.some((b) => blockedFor(false).some((o) => boxesOverlap(b, o)))) continue;
         occupied.push(...boxes);
         if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
       } else {
@@ -223,7 +231,7 @@ function placeFitting(
         // dance floor, the pergola roof). It cannot COLLIDE, but it must not
         // be standing in the river either, and it still has to be in the room.
         if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
-        if (!spec.overhead && pointInAny(x, z, occupied)) continue;
+        if (!spec.overhead && pointInAny(x, z, blockedFor(false))) continue;
       }
       placed = item;
       break;
@@ -272,10 +280,12 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     // 🌊 THE SEA first: flat water in the west-south corner of the sand, with
     // a staircase shoreline (furniture.ts seaWaterTiles). Everything after
     // avoids it. (The river was tried and never looked right inside a room.)
-    { kind: "beach-sea", at: [0, 0], spanning: true },
+    { kind: "beach-sea", at: [0, 0], spanning: true, group: "sea" },
     // 🛶 A raft ON the water — spanning so the occupancy check lets it float —
-    // in whichever front corner the sea chose (furniture.ts seaCorner).
-    { kind: "beach-raft", at: [seaCorner() === "SE" ? 0.72 : -0.72, 0.72], spanning: true },
+    // in whichever front corner the sea chose (furniture.ts seaCorner). In the
+    // sea's rigid group: no sea (furniture already in its corner), no raft
+    // beached on the floor (Copilot review, PR #169).
+    { kind: "beach-raft", at: [seaCorner() === "SE" ? 0.72 : -0.72, 0.72], spanning: true, group: "sea" },
 
     // 🎂 The anchor and its cluster, along the back.
     // Right of centre along the back, clear of the bar's shelf in the corner.
@@ -665,6 +675,11 @@ export function applyRoomTemplate(id: string): RoomTemplate | null {
  */
 export function addRoomTemplateItems(
   id: string,
+  /** Ground the set must also keep clear of — every player standing in the
+   *  room and every seat / door / device stand-point, boxed by the caller
+   *  (Copilot review, PR #169: a set landed on the fox and across the
+   *  terminal's front). */
+  keepClear: readonly Box[] = [],
 ): { name: string; placed: number; skipped: number } | null {
   const t = findTemplate(id);
   // Only a FITTED set can be added: a fixed manifest knows nothing about the
@@ -672,7 +687,7 @@ export function addRoomTemplateItems(
   // their authored coordinates straight through the furniture (Copilot
   // review, PR #169). Those templates PLACE (replace everything) only.
   if (!t || !t.layout) return null;
-  const wanted = t.layout(roomHalfExtents(), buildObstacleList(FURNITURE));
+  const wanted = t.layout(roomHalfExtents(), [...buildObstacleList(FURNITURE), ...keepClear]);
   const written = addFurniture(wanted);
   const total = t.layout({ halfX: 15, halfZ: 15 }).length;
   return { name: t.name, placed: written.length, skipped: Math.max(0, total - written.length) };

@@ -59,7 +59,7 @@ import { createSpeakerVoice } from "./partyAudio";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
-import { readAllDoorLayout, defaultDoorLayoutRecords } from "./doorLayoutDoc";
+import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } from "./doorLayoutDoc";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 
@@ -6696,11 +6696,14 @@ function buildPlankBridge({ m, place }: BuildCtx) {
  */
 const SEA_DOOR_KEEP = 1.6; // metres round a door kept dry
 
-/** World positions of the room's doors — the stored layout, or the four
- *  defaults an unseeded room renders (the doorDisplayName rule). */
+/** World positions of the room's doors — the stored layout; the four
+ *  defaults an UNSEEDED room renders (the doorDisplayName rule); and NONE
+ *  for a room whose owner deliberately removed every door (the
+ *  authoritative-empty marker — Copilot review, PR #169: those defaults
+ *  were reserving phantom doorways). */
 export function roomDoorPoints(): Array<{ x: number; z: number }> {
   const stored = readAllDoorLayout();
-  const recs = stored.size > 0 ? stored : defaultDoorLayoutRecords();
+  const recs = stored.size > 0 ? stored : doorSetIsMarkedEmpty() ? new Map() : defaultDoorLayoutRecords();
   const out: Array<{ x: number; z: number }> = [];
   for (const r of recs.values()) {
     const pose = poseFromWall(r.wall, r.lateral);
