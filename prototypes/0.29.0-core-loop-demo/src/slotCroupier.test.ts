@@ -16,6 +16,7 @@ import {
   buyInChips,
   hasSlotEscrow,
   readChips,
+  readLegacySlotOperatorMachineIds,
   readSlotMachineState,
   readSlotOperatorLease,
   readSlotPlayRequests,
@@ -631,6 +632,23 @@ describe('a round once this session no longer holds the lease', () => {
     expect(readChips(PLAYER)).toBe(100 - BET);
   });
 
+  it('writes nothing from a settle paused at an await once an earlier build starts on a machine placed since the last frame', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const t = ready + SLOT_SPIN_MS + 10;
+    tickSlotMachineRoom([M1], false, at(t)); // the settle starts, then awaits
+    // A machine placed after that frame, which an earlier build takes up.
+    doc.getMap('casino').set('slot-operator:slot-machine-new', {
+      playerId: OPERATOR, sessionId: 'a'.repeat(64), expiresAt: t + LEASE_MS,
+    });
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
   it('leaves a mismatched reveal alone once the take is over while the settle checks it', async () => {
     fund(M1);
     await requestSpin(M1);
@@ -860,6 +878,40 @@ describe("earlier builds' per-machine leases", () => {
     tickSlotMachineRoom([M1], false, at(T0 + LEASE_MS));
     expect(doc.getMap('casino').has(legacyKey)).toBe(false);
     expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+  });
+
+  it("count for a machine the room doesn't list, and one nobody renews is tidied after a term", () => {
+    fund(M1);
+    const leftover = 'slot-operator:slot-machine-gone';
+    doc.getMap('casino').set(leftover, legacy(T0 + LEASE_MS));
+    tickSlotMachineRoom([M1], false, at(T0));
+    expect(readSlotOperatorLease()).toBeNull(); // held off while it may be live
+    tickSlotMachineRoom([M1], false, at(T0 + LEASE_MS));
+    expect(doc.getMap('casino').has(leftover)).toBe(false);
+    expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+  });
+
+  it("are found through an index that follows the doc's writes, local and remote, without walking the map", () => {
+    const map = doc.getMap('casino');
+    map.set(`slot-operator:${M1}`, legacy(T0 + LEASE_MS));
+    // Another client's write, merged in.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    peer.getMap('casino').set(`slot-operator:${M2}`, legacy(T0 + LEASE_MS));
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, Y.encodeStateVector(doc)));
+    const walks = (['keys', 'entries', 'values', 'forEach'] as const)
+      .map((method) => vi.spyOn(Y.Map.prototype, method));
+    expect(readLegacySlotOperatorMachineIds().sort()).toEqual([M1, M2].sort());
+    map.delete(`slot-operator:${M1}`);
+    expect(readLegacySlotOperatorMachineIds()).toEqual([M2]);
+    // The room's own lease is not an earlier build's.
+    writeSlotOperatorLease(lease(T0 + LEASE_MS));
+    expect(readLegacySlotOperatorMachineIds()).toEqual([M2]);
+    for (const walk of walks) expect(walk).not.toHaveBeenCalled();
+    for (const walk of walks) walk.mockRestore();
+    // A doc bound with records already in it is indexed when it is bound.
+    bindCasinoDoc(peer);
+    expect(readLegacySlotOperatorMachineIds().sort()).toEqual([M1, M2].sort());
   });
 
   it('are never deleted by a visitor', () => {

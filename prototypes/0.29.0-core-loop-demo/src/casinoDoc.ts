@@ -103,6 +103,7 @@ export function bindCasinoDoc(doc: Y.Doc): void {
   boundDoc = doc;
   casinoMap = doc.getMap('casino');
   casinoMap.observe((event) => notify(event.keysChanged));
+  indexLegacySlotLeases(casinoMap);
   notify(); // repaint subscribers from the fresh doc
 }
 
@@ -553,6 +554,39 @@ export function readLegacySlotOperatorLease(machineId: string): SlotOperatorLeas
 
 export function clearLegacySlotOperatorLease(machineId: string): void {
   ensureMap().delete(`slot-operator:${machineId}`);
+}
+
+/** The machines each bound map holds an earlier build's per-machine lease
+ *  for, kept current from the keys each transaction changed. The slot
+ *  operator asks before every write whether an earlier build is operating in
+ *  the room, whatever machines the room's layout listed at the last frame,
+ *  and never walks the map to find out. */
+const legacySlotLeaseMachines = new WeakMap<Y.Map<unknown>, Set<string>>();
+
+/** Build a map's index in one pass (when it is bound, while a joined doc is
+ *  usually still empty), then keep it by an observer. */
+function indexLegacySlotLeases(map: Y.Map<unknown>): void {
+  if (legacySlotLeaseMachines.has(map)) return;
+  const prefix = `${SLOT_OPERATOR_KEY}:`;
+  const machines = new Set<string>();
+  for (const key of map.keys()) {
+    if (key.startsWith(prefix)) machines.add(key.slice(prefix.length));
+  }
+  legacySlotLeaseMachines.set(map, machines);
+  map.observe((event) => {
+    for (const key of event.keysChanged) {
+      if (!key.startsWith(prefix)) continue;
+      const machineId = key.slice(prefix.length);
+      if (map.has(key)) machines.add(machineId);
+      else machines.delete(machineId);
+    }
+  });
+}
+
+/** Every machine an earlier build's lease (`slot-operator:<mid>`) is held
+ *  for in the bound map, read from the index built when it was bound. */
+export function readLegacySlotOperatorMachineIds(): string[] {
+  return [...(legacySlotLeaseMachines.get(ensureMap()) ?? [])];
 }
 
 /** Whether a round's reserve is locked on this machine (`slot-escrow:<mid>`). */
