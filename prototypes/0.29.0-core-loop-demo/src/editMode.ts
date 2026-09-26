@@ -59,8 +59,8 @@ import * as THREE from 'three';
 import {
   FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos,
   // 🖥️ Interior wall mounts (the room terminal).
-  isWallMounted, snapInteriorWall, wallMountBox, wallMountHalfWidth,
-  wallOfMountRot, isRoomTerminalKind, deviceFrontFor,
+  isWallMounted, snapInteriorWall, wallMountBox, wallMountHalfWidth, wallMountHungOver,
+  wallOfMountRot, isRoomTerminalKind, isRoomAnchoredKind, deviceFrontFor,
 } from './furniture';
 // 🛰️ Hull space (exterior mounts + stacking) — moved out of furniture.ts.
 import {
@@ -224,7 +224,50 @@ export function validatePlacement(
     return validateExteriorPlacement(item, pos, rot);
   }
 
+  // 🏝️ A room-anchored feature (the sea, the infinity pool) is derived from
+  // the ROOM: dragging it would shift the mesh's offset and nothing else, so
+  // it may only stay where it is (add it again to change it).
+  if (
+    isRoomAnchoredKind(item.kind) &&
+    (Math.abs(pos.x - item.pos.x) > 1e-6 || Math.abs(pos.z - item.pos.z) > 1e-6 || rot !== item.rot)
+  ) {
+    return { ok: false, reason: 'a room feature — it goes where the room puts it' };
+  }
+
   const box = footprintAabb(item.kind, pos, rot);
+  // 🏝️ A kind with no footprint but a GENERATED blocked area (the sea, the
+  // infinity pool, the river): its obstacle boxes at this pose are what the
+  // overlap / clearance / connectivity checks below must see — without this
+  // an anchored feature was added under players and through furniture
+  // unchecked (Copilot review, PR #169).
+  const generated = FURNITURE_DEFS[item.kind].obstacleBoxes;
+  const featureBoxes: Box[] =
+    !box && generated
+      ? generated({ ...item, pos, rot }, FURNITURE.filter((o) => o.id !== item.id).concat([{ ...item, pos, rot }]))
+      : [];
+  const blocking: Box[] = box ? [box] : featureBoxes;
+  // A room-sized feature's generated area must stay INSIDE the room: the
+  // river's strips and floor cut follow its pose, and a pose dragged toward
+  // a wall pushes them past the floor's edge (where the hole is no hole to
+  // the triangulator and the strips block nothing real) — Copilot review,
+  // PR #169. The sea and the pool touch the walls by construction (their
+  // boxes carry a 1 cm seam), hence the tolerance.
+  if (featureBoxes.length) {
+    const { halfX: hx, halfZ: hz } = roomHalfExtents();
+    const TOL = 0.05;
+    if (featureBoxes.some((b) => b.x0 < -hx - TOL || b.x1 > hx + TOL || b.z0 < -hz - TOL || b.z1 > hz + TOL)) {
+      return { ok: false, reason: 'it would run out of the room' };
+    }
+  }
+  // …and an EXISTING feature's blocked area is generated the same way:
+  // itemAabb is null for the sea / river / infinity pool, so their water was
+  // invisible to the overlap and connectivity checks below.
+  const blockedBy = (other: FurnitureItem): Box[] => {
+    const ob = itemAabb(other);
+    if (ob) return [ob];
+    const gen = FURNITURE_DEFS[other.kind].obstacleBoxes;
+    return gen ? gen(other, FURNITURE) : [];
+  };
 
   // Placement box: 1 m inside each wall (floorPlanDoc.roomPlaceBounds —
   // deliberately tighter than the WALKABLE box; that function explains why).
@@ -249,22 +292,22 @@ export function validatePlacement(
   const wallVerdict = wallMountVerdict(item, pos, rot);
   if (!wallVerdict.ok) return wallVerdict;
 
-  if (box) {
-    // 2. Overlap with every other item's CURRENT footprint.
+  for (const b of blocking) {
+    // 2. Overlap with every other item's CURRENT blocked area.
     for (const other of FURNITURE) {
       if (other.id === item.id) continue;
-      const ob = itemAabb(other);
-      if (!ob) continue;
-      if (box.x0 < ob.x1 && box.x1 > ob.x0 && box.z0 < ob.z1 && box.z1 > ob.z0) {
-        return { ok: false, reason: `overlaps ${other.id}` };
+      for (const ob of blockedBy(other)) {
+        if (b.x0 < ob.x1 && b.x1 > ob.x0 && b.z0 < ob.z1 && b.z1 > ob.z0) {
+          return { ok: false, reason: `overlaps ${other.id}` };
+        }
       }
     }
 
     // 3. Player clearance (footprint inflated by the collision radius).
     for (const p of ctx.playerPositions) {
       if (
-        p.x > box.x0 - PLAYER_R && p.x < box.x1 + PLAYER_R &&
-        p.z > box.z0 - PLAYER_R && p.z < box.z1 + PLAYER_R
+        p.x > b.x0 - PLAYER_R && p.x < b.x1 + PLAYER_R &&
+        p.z > b.z0 - PLAYER_R && p.z < b.z1 + PLAYER_R
       ) {
         return { ok: false, reason: 'a player is in the way' };
       }
@@ -281,8 +324,8 @@ export function validatePlacement(
     const STAND_R = PLAYER_R + 0.06;
     for (const pt of ctx.requiredReachable) {
       if (
-        pt.x > box.x0 - STAND_R && pt.x < box.x1 + STAND_R &&
-        pt.z > box.z0 - STAND_R && pt.z < box.z1 + STAND_R
+        pt.x > b.x0 - STAND_R && pt.x < b.x1 + STAND_R &&
+        pt.z > b.z0 - STAND_R && pt.z < b.z1 + STAND_R
       ) {
         return { ok: false, reason: 'would block a stand-point' };
       }
@@ -298,15 +341,14 @@ export function validatePlacement(
   // (revalidateCarry runs from update()), and devMenu's spawn search would do
   // it for each of ~500 candidates × 3 margin passes — all to compute a grid
   // that, with no candidate box in it, is identical to the pre-move one.
-  if (!box && !isWallMounted(item.kind)) return { ok: true };
+  if (blocking.length === 0 && !isWallMounted(item.kind)) return { ok: true };
 
-  // 5. Connectivity on a scratch grid: candidate box + every OTHER item's
+  // 5. Connectivity on a scratch grid: candidate box(es) + every OTHER item's
   //    current box (the original spot is vacated, the candidate is applied).
-  const scratch: Box[] = box ? [box] : [];
+  const scratch: Box[] = [...blocking];
   for (const other of FURNITURE) {
     if (other.id === item.id) continue;
-    const ob = itemAabb(other);
-    if (ob) scratch.push(ob);
+    scratch.push(...blockedBy(other));
   }
   const reachable = computeReachable(scratch, ctx.floodFrom.x, ctx.floodFrom.z);
   const isReachable = (x: number, z: number): boolean => {
@@ -497,6 +539,22 @@ function wallMountVerdict(
       }
     }
   }
+
+  // 2b. Another wall mount on that stretch of wall. Wall mounts have no floor
+  //     box, so rule 3 below never sees them: without this a rose could be
+  //     hung over the terminal — ROSE WALLS or by hand — and hide the room's
+  //     only way back into EDIT ROOM, and the terminal could be re-hung
+  //     inside a rose curtain (Copilot review, PR #169). Decorative mounts
+  //     are held to it too; it comes before their exemption.
+  const hung = wallMountHungOver(item.kind, pos, rot, FURNITURE, item.id);
+  if (hung) return { ok: false, reason: `${hung.id} hangs there already` };
+
+  // 🌹 A DECORATIVE wall mount (no device — the climbing rose) hangs above
+  //    and behind whatever stands on the floor: a palm in front of it is the
+  //    garden, not a conflict, and nobody needs to walk up to it. Rules 3 and
+  //    4 exist so the terminal stays operable; they made the rose unplaceable
+  //    on any wall lined with the beach set's hedge (owner report 2026-09-25).
+  if (!FURNITURE_DEFS[item.kind].device) return { ok: true };
 
   // 3 + 4. Furniture occupying that stretch of wall, and furniture pinching
   //        the stand-point the panel would be used from. `() => true` as the
@@ -1603,7 +1661,44 @@ class RoomEditController {
     this.raycaster.setFromCamera(this.pointerNdc, camera);
     const hits = this.raycaster.intersectObjects(this.raycastTargets, false);
     if (hits.length === 0) return null;
-    return this.meshToItem.get(hits[0].object) ?? null;
+    // 🌹 Prefer the first VISIBLE thing under the cursor. A door's click box
+    // is invisible and fat (the opening + 0.6 m wide, 3.4 m tall, 0.5 m into
+    // the room — docking.ts), so a wall climber hung beside a doorway sat
+    // inside it and every click on the plant selected the door (owner report
+    // 2026-09-25). The box still wins where nothing visible is under the
+    // cursor — the doorway itself.
+    // The box protrudes 0.25 m into the room, so from a side-on view it
+    // intercepts rays on their way to a plant hanging next to the door — rays
+    // whose PIXEL shows the plant. Hence: any visible hit anywhere along the
+    // ray beats every invisible one; only when nothing visible is under the
+    // cursor may the box claim the click, and then only over the doorway
+    // proper (leaves + posts), never its 0.3 m side margins.
+    // Likewise the door frame's glass (opacity 0.16–0.35): the plant shows
+    // straight through it on screen, so an OPAQUE hit behind it is what the
+    // cursor is on. Priority: opaque > translucent > the invisible box.
+    const firstMat = (mesh: THREE.Mesh): THREE.Material | undefined => {
+      const mat = mesh.material;
+      return Array.isArray(mat) ? mat[0] : mat;
+    };
+    const isInvisible = (mesh: THREE.Mesh): boolean => firstMat(mesh)?.visible === false;
+    const isTranslucent = (mesh: THREE.Mesh): boolean => {
+      const m = firstMat(mesh);
+      return !!m && m.transparent && m.opacity < 0.6;
+    };
+    const shown = hits.filter((h) => h.object.visible && !isInvisible(h.object as THREE.Mesh));
+    const opaque = shown.find((h) => !isTranslucent(h.object as THREE.Mesh));
+    if (opaque) return this.meshToItem.get(opaque.object) ?? null;
+    if (shown.length) return this.meshToItem.get(shown[0].object) ?? null;
+    for (const h of hits) {
+      const mesh = h.object as THREE.Mesh;
+      if (!mesh.visible) continue;
+      const width = (mesh.geometry as THREE.BoxGeometry).parameters?.width;
+      if (typeof width !== 'number' || !mesh.parent) return this.meshToItem.get(mesh) ?? null;
+      const local = mesh.parent.worldToLocal(h.point.clone());
+      const core = (width - 0.6) / 2 + DOOR_POST_WIDTH; // the opening plus a post each side
+      if (Math.abs(local.x) <= core) return this.meshToItem.get(mesh) ?? null;
+    }
+    return null;
   }
 
   /** 🖱️ Ad-hoc raycast for the context menu OUTSIDE edit mode — the persistent

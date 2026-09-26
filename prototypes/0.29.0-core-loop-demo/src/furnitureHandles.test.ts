@@ -25,6 +25,7 @@ function freshSinks(): FurnitureHandleSinks {
     cloneVats: new Map(),
     slotMachineVisuals: new Map(),
     coinPusherVisuals: new Map(),
+    propAnims: new Map(),
   };
 }
 
@@ -52,6 +53,7 @@ describe('registerFurnitureHandles — filing', () => {
     const vat = handle('vat');
     const slot = handle('slot');
     const pusher = handle('pusher');
+    const pulse = handle('pulse');
     const ring = carrier({ holoSpin: 1.5 });
 
     registerFurnitureHandles(sinks, ITEM, carrier({ wallScreen: screen }));
@@ -61,6 +63,7 @@ describe('registerFurnitureHandles — filing', () => {
     registerFurnitureHandles(sinks, ITEM, carrier({ cloneVat: vat }));
     registerFurnitureHandles(sinks, ITEM, carrier({ slotMachineVisual: slot }));
     registerFurnitureHandles(sinks, ITEM, carrier({ coinPusherVisual: pusher }));
+    registerFurnitureHandles(sinks, ITEM, carrier({ propAnim: pulse }));
 
     expect(sinks.wallScreens.get(ITEM)).toBe(screen);
     expect(sinks.holoSpinners).toHaveLength(1);
@@ -71,6 +74,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.cloneVats.get(ITEM)).toBe(vat);
     expect(sinks.slotMachineVisuals.get(ITEM)).toBe(slot);
     expect(sinks.coinPusherVisuals.get(ITEM)).toBe(pusher);
+    expect(sinks.propAnims.get(ITEM)).toBe(pulse);
     // Exactly one entry per sink — nothing filed twice or into a neighbour.
     expect([
       sinks.wallScreens.size,
@@ -80,7 +84,8 @@ describe('registerFurnitureHandles — filing', () => {
       sinks.cloneVats.size,
       sinks.slotMachineVisuals.size,
       sinks.coinPusherVisuals.size,
-    ]).toEqual([1, 1, 1, 1, 1, 1, 1]);
+      sinks.propAnims.size,
+    ]).toEqual([1, 1, 1, 1, 1, 1, 1, 1]);
   });
 
   it('files every kind one carrier mesh carries', () => {
@@ -93,6 +98,7 @@ describe('registerFurnitureHandles — filing', () => {
       cloneVat: handle('v'),
       slotMachineVisual: handle('m'),
       coinPusherVisual: handle('p'),
+      propAnim: handle('p'),
     });
     registerFurnitureHandles(sinks, ITEM, all);
     expect(sinks.wallScreens.get(ITEM)).toBe(all.userData.wallScreen);
@@ -103,6 +109,7 @@ describe('registerFurnitureHandles — filing', () => {
     expect(sinks.cloneVats.get(ITEM)).toBe(all.userData.cloneVat);
     expect(sinks.slotMachineVisuals.get(ITEM)).toBe(all.userData.slotMachineVisual);
     expect(sinks.coinPusherVisuals.get(ITEM)).toBe(all.userData.coinPusherVisual);
+    expect(sinks.propAnims.get(ITEM)).toBe(all.userData.propAnim);
   });
 
   it('files nothing for a mesh without handles (unrelated userData included)', () => {
