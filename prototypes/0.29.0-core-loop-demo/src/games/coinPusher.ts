@@ -182,9 +182,11 @@ export const MAX_DROP_LEAD_MS = 250;
  *  own request. A request carries no chips, so a withdrawn one needs no
  *  refund. */
 export const PUSHER_REQUEST_TTL_MS = 15_000;
-/** The operator refuses (moving nothing) a request older than this by its own
- *  clock — one left behind by a closed tab while no operator was online.
- *  Generous, so clock skew between browsers never trips it. */
+/** The operator refuses (moving nothing) a request that has waited longer
+ *  than this since it first saw it, measured on its own clock: the tail of a
+ *  flood it is still working through. A request's own time (`requestedAt`) is
+ *  the player's clock, so it decides only whether the drop's timing is kept;
+ *  a device whose clock is off still plays. */
 export const PUSHER_STALE_REQUEST_MS = 120_000;
 
 /** Most chips the cabinet can physically hold. The platforms fit ~11 piles

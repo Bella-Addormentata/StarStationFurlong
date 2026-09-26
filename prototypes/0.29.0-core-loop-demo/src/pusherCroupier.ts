@@ -36,7 +36,9 @@
  * a tab on this device, which shares the clock, is also held to its own
  * expiry. Every client watches the renewals (World ticks the room on every
  * client), and the panel asks the same question: its DROP waits until the
- * operator is past its settling wait (coinPusherOperatorState).
+ * operator is past its settling wait (coinPusherOperatorState). A request is
+ * aged the same way, from when the operator first saw it; its `requestedAt`,
+ * the player's clock, decides only whether the drop's timing is kept.
  *
  * OWNERSHIP: the operator creates a missing machine with itself as owner and
  * re-owns one whose owner is anyone else (a deed transfer, a peer-written
@@ -120,6 +122,11 @@ interface PusherOperatorSession {
 /** This session's turn as the room's operator, if it has one. */
 let operator: PusherOperatorSession | null = null;
 const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
+/** When this session first saw each machine's pending requests (player →
+ *  request id and time), in the room of `docEpoch`. A request's age is
+ *  measured on this page's clock from that sighting, never from its
+ *  `requestedAt`, which is the player's clock (CLOCKS). */
+const requestsSeen = new Map<string, { docEpoch: number; byPlayer: Map<string, { requestId: string; at: number }> }>();
 /** Removed cabinets this session is to clear once no other session may be
  *  operating them (closeCoinPusher), with the doc epoch each was removed in:
  *  one never reads or writes a different room's doc. */
@@ -269,6 +276,7 @@ export function stopCoinPusherOperator(): void {
   if (!operator) return;
   operator = null;
   lastPolls.clear();
+  requestsSeen.clear();
   if (readCoinPusherOperatorLease()?.sessionId === operatorSessionId) {
     clearCoinPusherOperatorLease();
   }
@@ -409,17 +417,49 @@ export function operateCoinPusher(
     if (!state) return;
   }
 
-  for (const request of readCoinPusherRequests(machineId, MAX_REQUESTS_PER_POLL)) {
-    state = settleOneInsert(machineId, state, request, now, drawSeed);
+  // Every pending request the read returns counts as seen now (the first
+  // time it is); a batch of the oldest is then settled or refused.
+  const pending = readCoinPusherRequests(machineId);
+  const seen = seeRequests(machineId, pending, now);
+  for (const request of pending.slice(0, MAX_REQUESTS_PER_POLL)) {
+    const waited = now - (seen.get(request.player)?.at ?? now);
+    state = settleOneInsert(machineId, state, request, waited, now, drawSeed);
     if (!state) return;
   }
 }
 
-/** Settle or refuse one request; returns the machine as stored afterwards. */
+/** Note the machine's pending requests as seen: a request keeps the time this
+ *  session first saw it until its player files another. */
+function seeRequests(
+  machineId: string,
+  pending: readonly PusherInsertRequest[],
+  now: number,
+): Map<string, { requestId: string; at: number }> {
+  const docEpoch = casinoDocEpoch();
+  let seen = requestsSeen.get(machineId);
+  if (seen?.docEpoch !== docEpoch) {
+    seen = { docEpoch, byPlayer: new Map() };
+    requestsSeen.set(machineId, seen);
+  }
+  const current = new Map<string, { requestId: string; at: number }>();
+  for (const request of pending) {
+    const before = seen.byPlayer.get(request.player);
+    current.set(request.player, before?.requestId === request.requestId
+      ? before
+      : { requestId: request.requestId, at: now });
+  }
+  // Only what is still pending is kept: an answered or withdrawn request goes.
+  seen.byPlayer = current;
+  return current;
+}
+
+/** Settle or refuse one request, which has waited `waitedMs` since this
+ *  session first saw it; returns the machine as stored afterwards. */
 function settleOneInsert(
   machineId: string,
   state: CoinPusherState,
   request: PusherInsertRequest,
+  waitedMs: number,
   now: number,
   drawSeed: () => number,
 ): CoinPusherState | null {
@@ -427,7 +467,9 @@ function settleOneInsert(
     refuseCoinPusherInsert(machineId, request, reason, now);
     return readCoinPusherState(machineId);
   };
-  if (now - request.requestedAt > PUSHER_STALE_REQUEST_MS) return refuse('expired');
+  // Aged on this page's clock: `requestedAt` is the player's, and decides
+  // only whether the drop's timing is kept (resolveDropTiming).
+  if (waitedMs > PUSHER_STALE_REQUEST_MS) return refuse('expired');
   if (readChips(request.player) < PUSHER_ANTE) return refuse('no-chips');
   if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) return refuse('machine-full');
 
@@ -489,6 +531,7 @@ export function closeCoinPusher(
   now = Date.now(),
 ): void {
   lastPolls.delete(machineId);
+  requestsSeen.delete(machineId);
   // A room this session is leaving is left to the sessions still in it.
   if (!canManage || isLeavingRoom()) {
     pendingTeardowns.delete(machineId);
@@ -545,21 +588,24 @@ export function releaseCoinPusherLease(): void {
  * Leaving the room (main.ts leaveRoom, while the room's doc is still bound):
  * release the lease if this session holds it, and operate or watch nothing
  * more in this room, so no frame takes the lease back while the release is
- * being sent. The room's lease observation, pending teardowns and key sweeps
- * go with it. The next room's doc lifts this by its own epoch.
+ * being sent. The room's lease observation, request sightings, pending
+ * teardowns and key sweeps go with it. The next room's doc lifts this by its
+ * own epoch.
  */
 export function leaveCoinPusherRoom(): void {
   leavingDocEpoch = casinoDocEpoch();
   releaseCoinPusherLease();
   leaseSeen = null;
+  requestsSeen.clear();
   pendingTeardowns.clear();
   sweeps.clear();
 }
 
 /** How much this session is watching or tidying up (the room's lease
- *  observation, pending teardowns, key sweeps): tests and debugging. */
+ *  observation, request sightings, pending teardowns, key sweeps): tests and
+ *  debugging. */
 export function coinPusherWatchCount(): number {
-  return (leaseSeen ? 1 : 0) + pendingTeardowns.size + sweeps.size;
+  return (leaseSeen ? 1 : 0) + requestsSeen.size + pendingTeardowns.size + sweeps.size;
 }
 
 // Best effort on page close: the write may not flush. (A page restored from

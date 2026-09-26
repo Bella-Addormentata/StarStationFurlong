@@ -102,7 +102,9 @@ claim outside the window gains nothing. The result says which happened
 (`lastDrop.honored`), and the panel tells the player. Every timestamp a
 record carries must lie in the Date range (±8.64e15 ms, `MAX_TIMESTAMP_MS`):
 the guards refuse a peer-written one outside it, so the phase arithmetic
-between any two stays finite. Browser clocks aren't
+between any two stays finite. The operator ages a request on its own clock,
+from when it first saw it (`PUSHER_STALE_REQUEST_MS`, the tail of a flood),
+never by `requestedAt`. Browser clocks aren't
 synchronised: a device whose clock is off by more than the window never has
 its timing kept (it still plays, dropping where the pusher is), and the panel
 says the drop was late or the device's clock is off.
@@ -211,9 +213,11 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   panel that withdraws an unanswered request keeps watching for an answer
   that raced the withdrawal.
 - **Nothing to claim, nothing to refund.** There is no escrow and no pending
-  credit. A cancelled, abandoned or withdrawn request costs nothing (the panel
-  withdraws its own after 15 s without an answer, and when the player walks
-  away), so no peer-written record is ever taken as proof that chips moved.
+  credit. A cancelled or withdrawn request costs nothing (the panel withdraws
+  its own after 15 s without an answer, and when the player walks away), so no
+  peer-written record is ever taken as proof that chips moved. A request left
+  behind by a tab that closed before any operator answered it is still a
+  request: an operator that sees it later plays it like any other.
 - **The door.** Only the owner may empty the machine, and that too goes
   through the operator (`pusher-empty:<mid>` → `commitCoinPusherEmpty`: the
   emptied machine, the owner's credit for exactly the chips that were inside,
