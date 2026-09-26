@@ -7,16 +7,53 @@ on:
     # Uses standard GitHub Action glob filter syntax: [0-9]* matches any number of digits starting with a digit.
     tags:
       - 'v[0-9]*.[0-9]*.[0-9]*'
+  # Manual path — the SAME pipeline, started from the Actions tab or with
+  #   gh workflow run release.yml -f tag=vX.Y.Z -f target=<commit sha>
+  # for when a tag push is not possible from where the release was prepared
+  # (v0.35.0: branch pushes worked from that environment, refs/tags pushes
+  # 403'd four times, and the tag had to be pushed from another machine).
+  # The tag is resolved ONCE in create-release — reused untouched if it exists,
+  # otherwise created there, but only after the release guard has passed on
+  # the tree it will name — and every later job checks out that tag's COMMIT,
+  # never the ref this run was dispatched from. So dispatch from `main` (the
+  # trigger has to live on the default branch to be offered): the workflow
+  # definition comes from main, the release tree from the tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, vX.Y.Z. Created at `target` if it does not exist yet; reused as it stands if it does.'
+        required: true
+        type: string
+      target:
+        description: 'Commit to tag — SHA, branch or tag name. Blank = the head of the ref selected above. Ignored when the tag already exists: a tag is never moved.'
+        required: false
+        type: string
+        default: ''
+
+# One release run at a time. The draft lifecycle is single-writer: create-release
+# sweeps stale drafts for the tag, so a second run for the same tag starting while
+# the first is still uploading would delete the live draft from under it, and two
+# runs could race to create duplicate drafts. The running run is never cancelled
+# (cancel-in-progress keeps its default, false — a half-uploaded run is the worse
+# thing to lose), and further starts WAIT in FIFO order: `queue: max` holds up to
+# 100 pending runs, where the default `single` keeps one and silently cancels the
+# older pending run when another arrives. Releases are rare enough that a single
+# global lane costs nothing.
+concurrency:
+  group: release
+  queue: max
 
 env:
   # 🎯 WHICH PROTOTYPE THE RELEASE SHIPS AS THE APP FRONTEND.
-  # The Tauri shell (window, Rust node, icons, app version) always comes from
-  # prototypes/0.22.0-core-loop-demo/src-tauri — only the rendered frontend swaps.
+  # The Tauri PROJECT is built from this same folder — `projectPath` below is
+  # RELEASE_FRONTEND — so the shell (window, Rust node, icons, app version)
+  # comes from <this folder>/src-tauri, not from a fixed path.
   # To release a different demo:
   #   1. Point this at the demo folder (e.g. prototypes/0.0.4-navigation-demo).
   #   2. Make sure that folder has a committed package-lock.json and a
   #      `npm run build` script that outputs to its local dist/.
-  #   3. Commit, then push a vX.Y.Z tag as usual.
+  #   3. Commit, then push a vX.Y.Z tag as usual (or dispatch this workflow
+  #      with `tag` + `target` — see workflow_dispatch above).
   RELEASE_FRONTEND: prototypes/0.29.0-core-loop-demo
 
 jobs:
@@ -32,28 +69,201 @@ jobs:
       contents: write
     outputs:
       release_id: ${{ steps.create.outputs.result }}
+      # The tag this run releases and the COMMIT it names — resolved once, here,
+      # so every build job checks out the same tree however the run was started.
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.tag.outputs.sha }}
     steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
+      # Resolve WHICH tag this run releases and WHICH commit that is, before
+      # anything is checked out — and write NOTHING yet. Tag push: both come
+      # from the event. Manual dispatch: the tag is an input — an existing tag
+      # is reused as it stands (never moved; `target` is ignored with a
+      # warning); a missing one is resolved to the commit it will name, and the
+      # create-tag step below writes it only after the release guard has passed
+      # on that commit's tree. Both paths are held to the vX.Y.Z format: the
+      # push trigger's glob is looser than that (its `*` admits `v1.2.3-rc1`).
+      # Either way a tag whose release is already PUBLISHED fails here with the
+      # reason rather than at createRelease: releases in this repo are immutable.
+      - name: 🏷️ Resolve release tag and commit
+        id: tag
+        uses: actions/github-script@v8
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_TARGET: ${{ inputs.target }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const TAG_RE = /^v\d+\.\d+\.\d+$/;
+            const isPush = context.eventName === 'push';
+
+            // Follow refs/tags/<tag> down to the COMMIT it names: an annotated
+            // tag's ref points at a tag object, a lightweight tag's at the commit.
+            async function peel(ref) {
+              let { type, sha } = ref.object;
+              while (type === 'tag') {
+                const { data: t } = await github.rest.git.getTag({ owner, repo, tag_sha: sha });
+                ({ type, sha } = t.object);
+              }
+              return sha;
+            }
+            // "Not there" → null; anything else is a real error and must surface.
+            async function maybe(call, absent = [404]) {
+              try { return (await call()).data; }
+              catch (e) { if (absent.includes(e.status)) return null; throw e; }
+            }
+
+            const tag = isPush ? context.ref.replace('refs/tags/', '') : (process.env.INPUT_TAG || '').trim();
+            if (!TAG_RE.test(tag)) {
+              core.setFailed(`tag must look like vX.Y.Z, got '${tag}'`
+                + (isPush ? ' — the trigger glob is looser than the release format; delete this tag and push a vX.Y.Z one' : ''));
+              return;
+            }
+
+            let sha, create = false;
+            if (isPush) {
+              sha = context.sha;
+            } else {
+              const target = (process.env.INPUT_TARGET || '').trim();
+              const existing = await maybe(() => github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` }));
+              if (existing) {
+                sha = await peel(existing);
+                if (target) core.warning(`Tag ${tag} already exists at ${sha}; ignoring target '${target}' — this workflow never moves a tag.`);
+                core.info(`Reusing existing tag ${tag} -> ${sha}`);
+              } else {
+                // Resolve `target` (SHA, branch or tag name) to a full commit SHA
+                // first, so a typo fails here instead of tagging the wrong thing.
+                // The commits endpoint answers 422 for an unknown SHA, 404 otherwise.
+                const want = target || context.sha;
+                const commit = await maybe(() => github.rest.repos.getCommit({ owner, repo, ref: want }), [404, 422]);
+                if (!commit) {
+                  core.setFailed(`target '${want}' does not resolve to a commit in ${owner}/${repo}`);
+                  return;
+                }
+                sha = commit.sha;
+                create = true; // written by the create-tag step, after the guard
+                core.info(`Tag ${tag} does not exist yet; it will be created at ${sha} once the release guard passes`);
+              }
+            }
+
+            // get-release-by-tag only ever returns PUBLISHED releases (drafts are
+            // not addressable by tag), so any hit means this version is frozen.
+            const published = await maybe(() => github.rest.repos.getReleaseByTag({ owner, repo, tag }));
+            if (published) {
+              core.setFailed(`Release ${tag} is already published and immutable: ${published.html_url}. Bump the version and cut a new tag.`);
+              return;
+            }
+
+            core.info(`Releasing ${tag} at ${sha}`);
+            core.setOutput('tag', tag);
+            core.setOutput('sha', sha);
+            core.setOutput('create', String(create));
+
+      - name: 📥 Checkout repository (the release commit)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.tag.outputs.sha }}
+
+      # The two things README § "Cutting a release" says this workflow used to
+      # get SILENTLY wrong, checked on the tagged tree before anything is
+      # written — no tag on the dispatch path, no draft on either:
+      #   1. CHANGELOG.md's first `## v...` heading is this tag's; otherwise the
+      #      notes step below would ship the PREVIOUS version's section.
+      #   2. All NINE version locations agree with the tag — the list kept in
+      #      src/version.ts; the two Cargo.lock entries are what a grep misses.
+      # Inline rather than a script file on purpose: the workflow definition is
+      # what runs (from main on a dispatch) while the checked-out tree is the
+      # tag's, and a tag older than a script file would have nothing to run.
+      - name: 🔎 Release guard — CHANGELOG section + nine version locations
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -u
+          ver="${RELEASE_TAG#v}"
+          fail=0
+          bad() { echo "::error::$*"; fail=1; }
+          ok()  { echo "ok   $*"; }
+
+          # 1. CHANGELOG — the same key the notes extraction uses: the first line starting `## v`.
+          first="$(grep -m1 '^## v' CHANGELOG.md || true)"
+          if printf '%s\n' "$first" | grep -qE "^## ${RELEASE_TAG//./\\.}( |$)"; then
+            ok "CHANGELOG.md first version section: $first"
+          else
+            bad "CHANGELOG.md: first version section is '${first:-<none>}', expected '## $RELEASE_TAG — <date>'. Rename '## Unreleased' before tagging (README § Cutting a release) — as it stands the release would ship the previous version's notes."
+          fi
+
+          # 2. The nine version locations, all under RELEASE_FRONTEND.
+          cd "$RELEASE_FRONTEND"
+          json_version() { node -p "require('./$1').version ?? ''" 2>/dev/null || true; }
+          # First `key = "..."` inside the [package] table of a Cargo.toml.
+          toml_pkg() { awk -F'"' -v key="$2" '/^\[package\]/{p=1;next} /^\[/{p=0} p && $0 ~ "^" key " *=" {print $2; exit}' "$1" 2>/dev/null || true; }
+          # `version` of the [[package]] block named $2 in a Cargo.lock.
+          lock_pkg() { awk -F'"' -v name="$2" '$0 == "name = \"" name "\"" {f=1; next} f && /^version = / {print $2; exit}' "$1" 2>/dev/null || true; }
+          check() {
+            local what="$1" got="$2"
+            if [ "$got" = "$ver" ]; then ok "$what = $got"; else bad "$what reads '${got:-<missing>}', tag says '$ver'"; fi
+          }
+          check "package.json .version"                     "$(json_version package.json)"
+          check "package-lock.json .version"                "$(json_version package-lock.json)"
+          check "package-lock.json .packages[\"\"].version" "$(node -p "require('./package-lock.json').packages['']?.version ?? ''" 2>/dev/null || true)"
+          check "src-tauri/tauri.conf.json .version"        "$(json_version src-tauri/tauri.conf.json)"
+          check "src/version.ts APP_VERSION"                "$(sed -nE "s/^export const APP_VERSION = '([^']*)';.*/\1/p" src/version.ts 2>/dev/null || true)"
+          for crate in src-tauri ssf-p2p-node; do
+            name="$(toml_pkg "$crate/Cargo.toml" name)"
+            check "$crate/Cargo.toml [package] version"            "$(toml_pkg "$crate/Cargo.toml" version)"
+            check "$crate/Cargo.lock entry for ${name:-<no name>}" "$(lock_pkg "$crate/Cargo.lock" "$name")"
+          done
+
+          if [ "$fail" != 0 ]; then
+            echo "::error::$RELEASE_TAG is not release-ready. Nothing was created — fix the tree, then tag (or dispatch) again."
+            exit 1
+          fi
+          echo "✅ $RELEASE_TAG is release-ready: CHANGELOG section present, nine version locations agree."
+
+      # Only now — the tree checked — does a dispatch write anything: the
+      # annotated tag at the resolved commit, the same shape as a hand-made one.
+      # A tag created with GITHUB_TOKEN does NOT fire the `push` trigger above
+      # (GitHub never starts a workflow off an event made with GITHUB_TOKEN),
+      # so there is no second run. A tag push already has its tag: skipped.
+      - name: 🏷️ Create the tag (manual dispatch of a new tag only)
+        if: steps.tag.outputs.create == 'true'
+        uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+          RELEASE_SHA: ${{ steps.tag.outputs.sha }}
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const tag = process.env.RELEASE_TAG, sha = process.env.RELEASE_SHA;
+            const { data: tagObj } = await github.rest.git.createTag({
+              owner, repo, tag, object: sha, type: 'commit',
+              message: `StarStation Furlong ${tag}`,
+            });
+            await github.rest.git.createRef({ owner, repo, ref: `refs/tags/${tag}`, sha: tagObj.sha });
+            core.info(`Created annotated tag ${tag} -> ${sha}`);
 
       # Extract this release's notes (top version section of CHANGELOG.md) for the release body.
       # Matches the first `## v...` heading so the `## Unreleased` stub is skipped
       # (pre-v0.16.0 releases shipped the Unreleased stub as their body by mistake).
       - name: 📝 Extract release notes from CHANGELOG.md
         shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         run: |
           awk '/^## v/{n++; next} n==1{print}' CHANGELOG.md > RELEASE_NOTES.md
           if [ ! -s RELEASE_NOTES.md ]; then
-            echo "Sovereign P2P Space MMO - Production build stable release ${GITHUB_REF_NAME}. See CHANGELOG.md." > RELEASE_NOTES.md
+            echo "Sovereign P2P Space MMO - Production build stable release ${RELEASE_TAG}. See CHANGELOG.md." > RELEASE_NOTES.md
           fi
 
       - name: 🎫 Create shared draft release
         id: create
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
         with:
           script: |
             const fs = require('fs');
-            const tag = context.ref.replace('refs/tags/', '');
+            const tag = process.env.RELEASE_TAG;
             const body = fs.readFileSync('RELEASE_NOTES.md', 'utf8');
 
             // Clean up stale DRAFT releases for this tag left by earlier
@@ -102,12 +312,14 @@ jobs:
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
+      - name: 📥 Checkout repository (the release commit)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.create-release.outputs.sha }}
 
       # 1. Setup Node.js runtimes for Vite/Three.js frontend compilations
       - name: 🟢 Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: 'npm'
@@ -211,8 +423,10 @@ jobs:
       contents: write
     runs-on: windows-latest # MSVC — the GNU dev-profile linker wall does not apply
     steps:
-      - name: 📥 Checkout repository
-        uses: actions/checkout@v4
+      - name: 📥 Checkout repository (the release commit)
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.create-release.outputs.sha }}
 
       - name: 🦀 Setup Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -239,7 +453,7 @@ jobs:
           ls -la ssf-p2p-node*.exe
 
       - name: ⬆️ Upload node binaries to the shared draft release
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const fs = require('fs');
@@ -272,7 +486,9 @@ jobs:
   # exactly this way — published while builds were still uploading, leaving an
   # empty, undeletable release). Never publish the draft manually; this job
   # flips it once all installer jobs and the node asset are in. If anything
-  # fails upstream, the draft stays a draft and the tag can be re-run safely.
+  # fails upstream, the draft stays a draft and the tag can be re-run safely —
+  # re-run the failed run, or dispatch the workflow with the same `tag` (an
+  # existing tag is reused, never moved; the stale draft is swept above).
   finalize-release:
     needs: [create-release, publish-tauri-binaries, publish-p2p-node]
     permissions:
@@ -280,7 +496,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: 🚀 Publish release (all artifacts green)
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const release_id = Number('${{ needs.create-release.outputs.release_id }}');

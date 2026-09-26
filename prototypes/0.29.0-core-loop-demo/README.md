@@ -57,7 +57,7 @@ npm --version
 3. Enter the demo folder:
 
 ```bash
-cd /path/to/StarStationFurlong/prototypes/0.22.0-core-loop-demo
+cd /path/to/StarStationFurlong/prototypes/0.29.0-core-loop-demo
 ```
 
 Replace `/path/to/StarStationFurlong` with the folder where you cloned or copied the repository.
@@ -142,7 +142,7 @@ When you are done testing the demo:
 Key files and folders:
 
 ```text
-0.22.0-core-loop-demo/
+0.29.0-core-loop-demo/
 â”œâ”€â”€ public/              # Static assets such as textures
 â”œâ”€â”€ src/                 # Game source files
 â”‚   â”œâ”€â”€ main.ts          # Entry point, one-click entry flow, networking bootstrap
@@ -168,7 +168,7 @@ Key files and folders:
 ### `npm run dev` fails
 
 Check the following:
-1. Make sure you are inside the `0.22.0-core-loop-demo` folder.
+1. Make sure you are inside the `0.29.0-core-loop-demo` folder.
 2. Make sure `node --version` shows Node.js 20 or newer.
 3. Run `npm install` again if `node_modules/` is missing.
 4. Make sure you are running the command inside the demo folder, not the repository root.

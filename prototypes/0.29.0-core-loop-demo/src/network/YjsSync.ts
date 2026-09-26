@@ -78,6 +78,18 @@ function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
   return true;
 }
 
+/** Does `p` settle (either way) within `ms`? Never rejects; clears its timer. */
+function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    const done = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    p.then(done, done);
+  });
+}
+
 export class YjsSync {
   readonly doc: Y.Doc;
   /**
@@ -136,6 +148,10 @@ export class YjsSync {
   }
   #writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   #seq = 1;
+  /** Local-update sends in flight (signed + written) — see flush(). */
+  #pending = new Set<Promise<void>>();
+  /** ⚓ #163 confirmOwnWrites waiters, fed every inbound SyncStep2. */
+  #ackWaiters: Array<(update: Uint8Array) => void> = [];
 
   constructor(private readonly opts: YjsSyncOptions) {
     this.doc = new Y.Doc();
@@ -161,7 +177,17 @@ export class YjsSync {
     // 2. Start reactive ydoc mutation update pipeline (Task 3.3)
     this.doc.on('update', (update, origin) => {
       if (origin === 'server-origin') return; // avoid infinite loop
-      this.#sendUpdateMessage(update);
+      // Tracked so flush() can wait for it; behaviour is otherwise unchanged
+      // (a failed send is reported, never thrown into the doc observer).
+      const sent = this.#sendUpdateMessage(update);
+      this.#pending.add(sent);
+      sent.then(
+        () => this.#pending.delete(sent),
+        (e) => {
+          this.#pending.delete(sent);
+          console.warn('YjsSync failed to send an update:', e);
+        },
+      );
     });
 
     // 3. Start reader loop in background
@@ -191,6 +217,59 @@ export class YjsSync {
       } catch {}
     }
     this.doc.destroy();
+  }
+
+  /** Resolves once every local update emitted so far has been signed and
+   *  handed to the transport. stop() does not wait for them, so a caller that
+   *  writes and then tears its session down must await this first. */
+  async flush(): Promise<void> {
+    while (this.#pending.size > 0) {
+      await Promise.allSettled([...this.#pending]);
+    }
+  }
+
+  /**
+   * ⚓ #163: prove the node APPLIED this doc's own writes — the acknowledgment
+   * a short-lived far-room session (farDoorWrite.ts) needs before it may say
+   * "done" and hang up. Sends a SyncStep1 carrying `since`, a state vector
+   * captured BEFORE the writes, and resolves true as soon as a SyncStep2
+   * arrives holding any struct authored by this doc's client. The node answers
+   * a SyncStep1 from its replica, and the writes went out first on the same
+   * ordered stream (flush() runs before the probe is emitted, so signing
+   * cannot reorder them) — they are in that reply iff the node applied them.
+   * False on timeout — and the deadline covers the flush as well: a transport
+   * whose write never completes must not hold the caller (a far session, and
+   * with it that room's queue) past `timeoutMs`. Additive: no other path
+   * changes behaviour.
+   */
+  async confirmOwnWrites(since: Uint8Array, timeoutMs = 5000): Promise<boolean> {
+    if (!this.#active || !this.#writer) return false;
+    const deadline = Date.now() + timeoutMs;
+    if (!(await settlesWithin(this.flush(), timeoutMs))) return false;
+    const me = this.doc.clientID;
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (timer !== null) clearTimeout(timer);
+        this.#ackWaiters = this.#ackWaiters.filter((w) => w !== waiter);
+        resolve(ok);
+      };
+      const waiter = (update: Uint8Array) => {
+        let mine = false;
+        try {
+          mine = Y.decodeUpdate(update).structs.some((s) => s.id.client === me);
+        } catch {
+          /* undecodable — not an ack */
+        }
+        if (mine) finish(true);
+      };
+      this.#ackWaiters.push(waiter);
+      timer = setTimeout(() => finish(false), Math.max(0, deadline - Date.now()));
+      void this.#emitEnvelope('ysync', this.#packYSyncPayload(0, 0, since));
+    });
   }
 
   /** Feed an envelope that arrived on a NODE-INITIATED stream (remote peers'
@@ -485,6 +564,10 @@ export class YjsSync {
       if (subtype === 1 && !this.#serverSynced) {
         this.#serverSynced = true;
         this.#resolveServerSynced();
+      }
+      // ⚓ #163: a SyncStep2 may be the reply confirmOwnWrites is waiting for.
+      if (subtype === 1 && this.#ackWaiters.length > 0) {
+        for (const waiter of [...this.#ackWaiters]) waiter(data);
       }
       // 🛰️ The readiness gate opens only on a frame from the LINKED HOST —
       // correlated by a VERIFIED signature, not timing, not a bare author field.

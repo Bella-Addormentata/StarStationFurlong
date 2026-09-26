@@ -84,22 +84,29 @@ export function refundPart(kind: PartKind): void {
   addParts(kind, 1);
 }
 
+/** The part one chain segment is built from. ⚓ #163: a docking-adapter half
+ *  is an ADAPTER part — the same stock the port on a door is fitted from. */
+export function partForSegment(s: ConnectorSegment): PartKind {
+  return s.kind === 'flex' ? 'flex' : s.kind === 'dock' ? 'adapter' : 'ext';
+}
+
 /** Consume every part a segment list needs, atomically — false when short
  *  (nothing consumed). Used by the preset prefill. */
 export function consumeForSegments(segments: ConnectorSegment[]): boolean {
-  const need = { flex: 0, ext: 0 };
-  for (const s of segments) need[s.kind === 'flex' ? 'flex' : 'ext']++;
+  const need = { flex: 0, ext: 0, adapter: 0 };
+  for (const s of segments) need[partForSegment(s)]++;
   const p = loadParts();
-  if (p.flex < need.flex || p.ext < need.ext) return false;
+  if (p.flex < need.flex || p.ext < need.ext || p.adapter < need.adapter) return false;
   p.flex -= need.flex;
   p.ext -= need.ext;
+  p.adapter -= need.adapter;
   saveParts(p);
   return true;
 }
 
 export function refundForSegments(segments: ConnectorSegment[]): void {
   const p = loadParts();
-  for (const s of segments) p[s.kind === 'flex' ? 'flex' : 'ext']++;
+  for (const s of segments) p[partForSegment(s)]++;
   saveParts(p);
 }
 
@@ -180,12 +187,15 @@ export function setNorthDoorUnlocked(on: boolean): void {
  * The same physical connector described from the FAR room's door: segments in
  * reverse order with flex bends NEGATED (traversing a circular arc backwards
  * reverses the heading change: Δheading(B→A) = −Δheading(A→B)); extensions
- * unchanged.
+ * unchanged. ⚓ A dock's two halves swap ends and stay halves — a dock read
+ * from the far door is still a dock.
  */
 export function mirrorSegments(segments: ConnectorSegment[]): ConnectorSegment[] {
   return [...segments].reverse().map((s) =>
     s.kind === 'flex'
       ? { kind: 'flex' as const, bendDeg: -(s.bendDeg ?? 0), stretch: s.stretch ?? 0 }
-      : { kind: 'ext' as const, bays: s.bays, skin: s.skin },
+      : s.kind === 'dock'
+        ? { kind: 'dock' as const }
+        : { kind: 'ext' as const, bays: s.bays, skin: s.skin },
   );
 }

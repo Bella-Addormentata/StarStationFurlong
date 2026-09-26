@@ -54,8 +54,26 @@
 
 import * as THREE from 'three';
 import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
+import { vatPallorHex } from './vatGauge';
 
 export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep' | 'swim' | 'dive';
+
+/** 🏋️ One frame of follow-the-coach pose (#77 coach routine) — produced by
+ *  the coach bot (PoolWaiter.getFollowerPose), scaled to the chibi fox. */
+export interface WorkoutPose {
+  /** Torso Y offset — the squat sink / jack hop (applied after the root lerp). */
+  dip: number;
+  /** Per-arm forward raise (rad, absolute — the lunge drives them apart). */
+  armLX: number;
+  armRX: number;
+  /** Sideways arm sweep magnitude (rad, mirrored per side). */
+  armZ: number;
+  /** Leg splay magnitude (rad, mirrored per side). */
+  legZ: number;
+  /** Per-leg X overrides — the lunge split; omit to keep the state pose. */
+  legLX?: number;
+  legRX?: number;
+}
 
 interface PoseState {
   /** World-space Y for the torso root (lower values = seated) */
@@ -442,6 +460,19 @@ export class VoxelCharacter {
   >();
   /** Currently attached head accessory (one slot), or null. */
   private accessoryGroup: THREE.Group | null = null;
+
+  // ── 🧬 Fresh-clone pallor (#165) ───────────────────────────────────────────
+  /** 0 = its own colours, 1 = the clone grey (vatGauge.VAT_PALLOR_HEX). */
+  private pallor = 0;
+  /**
+   * The TRUE colour/emissive of every material the pallor recolours, captured
+   * the moment it first touches one — the source every pallored colour is
+   * lerped from, and what setPallor(0) writes back (exact, no drift).
+   */
+  private pallorBase = new Map<
+    THREE.MeshToonMaterial,
+    { color: number; emissive: number; emissiveSeeded: boolean }
+  >();
 
   constructor(scene: THREE.Scene) {
     // ── 1. Master / visual group hierarchy ───────────────────────────────────
@@ -1632,6 +1663,15 @@ export class VoxelCharacter {
    * the same outfit twice is exactly idempotent.
    */
   setOutfit(outfit: OutfitDef): void {
+    // 🧬 Dye the TRUE colours: lift any clone pallor first (so the pristine
+    // capture below never records a pallored hex), re-apply it after.
+    const pallor = this.pallor;
+    if (pallor > 0) this.setPallor(0);
+    this._applyOutfit(outfit);
+    if (pallor > 0) this.setPallor(pallor);
+  }
+
+  private _applyOutfit(outfit: OutfitDef): void {
     const seen = new Set<THREE.Material>();
     this.visualGroup.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
@@ -1668,11 +1708,60 @@ export class VoxelCharacter {
   /** Restore every outfit-touched material to its pristine color/emissive and
    *  detach any accessory. Exact inverse of setOutfit (no drift). */
   clearOutfit(): void {
+    const pallor = this.pallor;
+    if (pallor > 0) this.setPallor(0);
     for (const [mat, orig] of this.outfitOriginals) {
       mat.color.setHex(orig.color);
       if (mat.emissive) mat.emissive.setHex(orig.emissive);
     }
     this.removeAccessory();
+    if (pallor > 0) this.setPallor(pallor);
+  }
+
+  /**
+   * 🧬 Fresh-clone pallor (#165): blend the rig's body colours — every
+   * palette-role material (fur, cream, paws…) and the head accessory — from
+   * their true colours (k = 0) to an almost-white grey (k = 1). The dark
+   * face marks and the shared outline are left alone. Cheap enough to call
+   * every frame of a fade; setPallor(0) restores the true colours exactly.
+   */
+  setPallor(k: number): void {
+    const next = Math.min(1, Math.max(0, k));
+    if (next === this.pallor) return;
+    this.pallor = next;
+    const seen = new Set<THREE.Material>();
+    const visit = (obj: THREE.Object3D, all: boolean) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      if (!all && !mesh.userData.paletteRole) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        if (!m || m === OUTLINE_MAT || seen.has(m)) continue;
+        seen.add(m);
+        const mat = m as THREE.MeshToonMaterial;
+        if (!mat.color) continue;
+        let base = this.pallorBase.get(mat);
+        if (!base) {
+          base = {
+            color: mat.color.getHex(),
+            emissive: mat.emissive ? mat.emissive.getHex() : 0,
+            emissiveSeeded:
+              !!mat.emissive && mat.emissive.getHex() === mat.color.getHex(),
+          };
+          this.pallorBase.set(mat, base);
+        }
+        const hex = vatPallorHex(base.color, next);
+        mat.color.setHex(hex);
+        if (mat.emissive) {
+          mat.emissive.setHex(base.emissiveSeeded ? hex : base.emissive);
+        }
+      }
+    };
+    this.visualGroup.traverse((obj) => visit(obj, false));
+    this.accessoryGroup?.traverse((obj) => visit(obj, true));
+    // Fully restored: forget the captures, so a later outfit change is the
+    // truth the next pallor starts from.
+    if (next === 0) this.pallorBase.clear();
   }
 
   /**
@@ -1723,9 +1812,32 @@ export class VoxelCharacter {
   /** 🍹 Drink-hold override (waiter-bot serve): 0 = paw reaching forward at
    *  waist height, 1 = raised to the muzzle; null = normal arm animation. */
   private drinkHold: number | null = null;
+  /** 🏋️ Live follow-the-coach pose, or null (see setWorkoutPose). */
+  private workoutPose: WorkoutPose | null = null;
 
   public setDrinkHold(raise: number | null): void {
     this.drinkHold = raise;
+  }
+
+  /** Current animation state (read-only — follow-the-coach gates on 'idle'). */
+  public getState(): CharacterState {
+    return this.currentState;
+  }
+
+  /** 🏋️ Follow-the-coach override (#77): while set AND the fox is simply
+   *  standing (state 'idle'), the workout pose wins over the state limb
+   *  targets — the same post-branch slot as the drink hold. Walking, sitting
+   *  or swimming naturally breaks the follow. Arm/leg Z rotations aren't
+   *  state-managed, so clearing the pose zeroes them explicitly (X targets
+   *  converge back through the per-frame state lerps on their own). */
+  public setWorkoutPose(pose: WorkoutPose | null): void {
+    if (pose === null && this.workoutPose !== null) {
+      this.leftArm.rotation.z = 0;
+      this.rightArm.rotation.z = 0;
+      this.leftLeg.rotation.z = 0;
+      this.rightLeg.rotation.z = 0;
+    }
+    this.workoutPose = pose;
   }
 
   /** World position of the right paw (the drink rides in it while sipping).
@@ -1850,6 +1962,25 @@ export class VoxelCharacter {
         : 0;
     this.head.rotation.x = THREE.MathUtils.lerp(this.head.rotation.x, headLifeX, lerpSpeed);
     this.head.rotation.z = THREE.MathUtils.lerp(this.head.rotation.z, headLifeZ, lerpSpeed);
+
+    // 🏋️ Follow-the-coach (#77) — mirrors the coach's demo while the fox is
+    // simply standing; any other state (walk/sit/swim) ignores the pose, so
+    // stepping away breaks the follow with no bookkeeping. Applied before the
+    // drink hold: a fox holding a drink does the one-armed version.
+    if (this.workoutPose && this.currentState === 'idle') {
+      const w = this.workoutPose;
+      // ABSOLUTE root + dip: section 1's lerp only partially restores the base
+      // each frame, so an additive dip would compound (~6× at 60 fps).
+      this.torso.position.y = (state.rootY - 0.15) + w.dip;
+      this.leftArm.rotation.x = w.armLX;
+      this.rightArm.rotation.x = w.armRX;
+      this.leftArm.rotation.z = -w.armZ;
+      this.rightArm.rotation.z = w.armZ;
+      this.leftLeg.rotation.z = -w.legZ;
+      this.rightLeg.rotation.z = w.legZ;
+      if (w.legLX !== undefined) this.leftLeg.rotation.x = w.legLX;
+      if (w.legRX !== undefined) this.rightLeg.rotation.x = w.legRX;
+    }
 
     // 🍹 Drink in the right paw (waiter-bot serve) — OVERRIDES the state arm
     // pose: reaches forward to take the glass, curls up to the muzzle on each

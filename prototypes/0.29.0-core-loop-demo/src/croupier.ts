@@ -12,9 +12,11 @@
  *
  * ELECTION = the room's DEED HOLDER (main.ts currentRoomDeedIsMine — the raw
  * at-most-one owner, NOT the shareholder-extended `isHouse`). A personal or solo
- * room has exactly one deed holder ⇒ one croupier ⇒ no double-settle. Venture /
- * legacy 'Local-Clone' rooms (every shareholder is house) are NOT auto-driven —
- * they keep the manual SPIN button. main.ts registers the predicate at boot.
+ * room has exactly one deed holder ⇒ one croupier ⇒ no double-settle. Venture
+ * rooms (every shareholder is house) are NOT auto-driven — they keep the
+ * manual SPIN button. Legacy 'Local-Clone' rooms are not auto-driven either,
+ * but 🔒 #141 changed WHY: they used to make everyone the deed holder; now
+ * they make no one. main.ts registers the predicate at boot.
  *
  * NO SHARED CLOCK: the operator's Date.now() is the reference. It stamps an
  * absolute `phaseDeadline` into the record and is the only client that advances
