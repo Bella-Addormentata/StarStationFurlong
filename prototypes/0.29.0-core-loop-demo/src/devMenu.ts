@@ -835,7 +835,7 @@ function buildPanel(): HTMLDivElement {
     <div style="${ROW_STYLE}">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${t.description}">${t.name.toUpperCase()}</span>
       <span style="display:flex; gap:4px; flex-shrink:0;">
-        <button type="button" data-dev-action="add-template" data-template="${t.id}" title="Add this set to the room — nothing is removed" style="${BTN_STYLE}">+ ADD</button>
+        ${t.layout ? `<button type="button" data-dev-action="add-template" data-template="${t.id}" title="Add this set to the room — nothing is removed" style="${BTN_STYLE}">+ ADD</button>` : ''}
         <button type="button" data-dev-action="place-template" data-template="${t.id}" title="REPLACE every piece in the room with this template" style="${BTN_STYLE}">PLACE</button>
       </span>
     </div>

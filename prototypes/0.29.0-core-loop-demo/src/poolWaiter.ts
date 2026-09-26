@@ -849,21 +849,34 @@ export class PoolWaiter {
     );
   }
 
-  /** 🎉 Where to dance: ON the dance floor, at the point of it nearest the
-   *  bot's OWN dock (owner rulings 2026-09-26: on the floor, but by its own
-   *  station — so two dancers take the sides nearest their docks instead of
-   *  both crossing to the middle). The 4×4 pad is entered by half a metre so
-   *  the bot stands fully on it. No dock → the middle; no floor → the coach's
-   *  stage. Snapped to a reachable cell. */
-  private findDanceSpot(): { x: number; z: number } {
+  /** 🎉 Where to dance: ON the dance floor, at the reachable point of it
+   *  nearest the bot's OWN dock (owner rulings 2026-09-26: on the floor, but
+   *  by its own station — two dancers take the sides nearest their docks).
+   *  Candidates are the clamped dock point and then the pad's inner cells,
+   *  and only a cell INSIDE the pad counts — a reachable cell beside it is
+   *  not the floor (Copilot review, PR #169); with none, the bot waits. No
+   *  floor → the coach's stage. */
+  private findDanceSpot(): { x: number; z: number } | null {
     const here = { x: this.group.position.x, z: this.group.position.z };
     const floor = FURNITURE.find((i) => i.kind === "dance-floor");
     if (!floor) return this.findCoachStage();
     const d = this.dockTarget;
     const INSET = 1.5; // the pad is ±2 m; stay half a metre inside its edge
-    const x = d ? Math.max(floor.pos.x - INSET, Math.min(floor.pos.x + INSET, d.x)) : floor.pos.x;
-    const z = d ? Math.max(floor.pos.z - INSET, Math.min(floor.pos.z + INSET, d.z)) : floor.pos.z;
-    return nearestReachableCell(x, z, 3, here) ?? { x, z };
+    const clamp = (v: number, c: number) => Math.max(c - INSET, Math.min(c + INSET, v));
+    const onPad = (p: { x: number; z: number }) =>
+      Math.abs(p.x - floor.pos.x) <= INSET + 0.26 && Math.abs(p.z - floor.pos.z) <= INSET + 0.26;
+    const candidates: Array<{ x: number; z: number }> = [
+      { x: d ? clamp(d.x, floor.pos.x) : floor.pos.x, z: d ? clamp(d.z, floor.pos.z) : floor.pos.z },
+      { x: floor.pos.x, z: floor.pos.z },
+    ];
+    for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+      candidates.push({ x: floor.pos.x + ox * 1.0, z: floor.pos.z + oz * 1.0 });
+    }
+    for (const c of candidates) {
+      const cell = nearestReachableCell(c.x, c.z, 1, here);
+      if (cell && onPad(cell)) return cell;
+    }
+    return null;
   }
 
   /**
@@ -883,9 +896,15 @@ export class PoolWaiter {
     const floor = FURNITURE.find((i) => i.kind === "dance-floor");
     const d = this.dockTarget;
     const key = `${floor ? `${floor.pos.x},${floor.pos.z}` : "-"}|${d ? `${d.x},${d.z}` : "-"}`;
-    if (!this.danceSpot || key !== this.danceSpotKey) {
+    if (key !== this.danceSpotKey) {
       this.danceSpot = this.findDanceSpot();
       this.danceSpotKey = key;
+    }
+    if (!this.danceSpot) {
+      // No reachable cell on the pad: wait where we are, off the music.
+      this.resetExercisePose();
+      this.idlePose();
+      return;
     }
     if (!this.walkTo(dt, this.danceSpot.x, this.danceSpot.z, 0.15)) {
       this.resetExercisePose();

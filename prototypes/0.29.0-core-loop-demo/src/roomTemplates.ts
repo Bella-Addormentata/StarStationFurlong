@@ -601,12 +601,14 @@ export function addRoomTemplateItems(
   id: string,
 ): { name: string; placed: number; skipped: number } | null {
   const t = findTemplate(id);
-  if (!t) return null;
-  const wanted = t.layout
-    ? t.layout(roomHalfExtents(), buildObstacleList(FURNITURE))
-    : cloneItems(t.items).filter((i) => i.kind !== "wall-computer");
+  // Only a FITTED set can be added: a fixed manifest knows nothing about the
+  // room it lands in or what is already there — it would write its items at
+  // their authored coordinates straight through the furniture (Copilot
+  // review, PR #169). Those templates PLACE (replace everything) only.
+  if (!t || !t.layout) return null;
+  const wanted = t.layout(roomHalfExtents(), buildObstacleList(FURNITURE));
   const written = addFurniture(wanted);
-  const total = t.layout ? t.layout({ halfX: 15, halfZ: 15 }).length : wanted.length;
+  const total = t.layout({ halfX: 15, halfZ: 15 }).length;
   return { name: t.name, placed: written.length, skipped: Math.max(0, total - written.length) };
 }
 

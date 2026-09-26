@@ -9803,8 +9803,50 @@ export function poolCutContains(items: FurnitureItem[], wx: number, wz: number):
   return false;
 }
 
+/** 🏝️ Kinds whose geometry, tiles and blocked area come from the ROOM, not
+ *  from the item's pose (the sea, the infinity pool): they can be added and
+ *  removed but not dragged — a drag would move the mesh's offset and nothing
+ *  else (Copilot review, PR #169). */
+export function isRoomAnchoredKind(kind: FurnitureKind): boolean {
+  return kind === "beach-sea" || kind === "infinity-pool";
+}
+
 export function isPoolKind(kind: FurnitureKind): boolean {
   return kind === "lazy-pool" || kind === "classic-pool" || kind === "beach-river";
+}
+
+/**
+ * 🌊 A swim route that stays IN a winding river: from `from` to `to` along
+ * the centre line, the swimmer's offset from the centre eased from where it
+ * started to where it is going, never past the bank. Null when the room's
+ * pool is not a river (rectangular water needs no routing) or either end is
+ * not in its water. Straight lines between two bends crossed the sand
+ * (Copilot review, PR #169).
+ */
+export function riverSwimWaypoints(
+  items: FurnitureItem[],
+  from: { x: number; z: number },
+  to: { x: number; z: number },
+): Array<{ x: number; z: number }> | null {
+  const river = items.find((i) => i.kind === "beach-river");
+  if (!river) return null;
+  const a = toLocal(river, from.x, from.z);
+  const b = toLocal(river, to.x, to.z);
+  if (!riverHasWaterAt(a.x, a.z) || !riverHasWaterAt(b.x, b.z)) return null;
+  const { wWater } = riverMetrics();
+  const lane = Math.max(0.1, wWater - 0.3); // stay this far inside the bank
+  const offA = Math.max(-lane, Math.min(lane, a.z - riverCentreZ(a.x)));
+  const offB = Math.max(-lane, Math.min(lane, b.z - riverCentreZ(b.x)));
+  const steps = Math.max(1, Math.ceil(Math.abs(b.x - a.x) / 0.75));
+  const out: Array<{ x: number; z: number }> = [];
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const lx = a.x + (b.x - a.x) * t;
+    const lz = riverCentreZ(lx) + offA + (offB - offA) * t;
+    const w = rotXZ(lx, lz, river.rot);
+    out.push({ x: river.pos.x + w.x, z: river.pos.z + w.z });
+  }
+  return out;
 }
 
 /** 🕳️ Kinds that sink BELOW the floor and so need a hole cut in it: every pool,

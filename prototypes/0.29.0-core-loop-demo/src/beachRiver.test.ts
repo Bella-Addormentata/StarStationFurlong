@@ -21,6 +21,7 @@ import {
   poolHoleOutline,
   poolHoleRect,
   poolWaterContains,
+  riverSwimWaypoints,
   type FurnitureItem,
 } from './furniture';
 
@@ -247,5 +248,37 @@ describe('it sizes itself to the room', () => {
       bindFloorPlan(new Y.Doc());
       writeRoomDims(5, 5);
     }
+  });
+});
+
+describe('swimming the bends', () => {
+  it('routes a swim along the water, never across the sand between two bends', () => {
+    // Two points in the water on different bends of the S: a straight line
+    // between them leaves the band; the routed waypoints must not.
+    const x0 = -6, x1 = 6;
+    const from = { x: x0, z: centreZ(x0) };
+    const to = { x: x1, z: centreZ(x1) };
+    expect(poolWaterContains([RIVER], from.x, from.z)).toBe(true);
+    expect(poolWaterContains([RIVER], to.x, to.z)).toBe(true);
+    const mid = { x: 0, z: (from.z + to.z) / 2 }; // the straight line's midpoint
+    const straightStaysWet = poolWaterContains([RIVER], mid.x, mid.z);
+    const path = riverSwimWaypoints([RIVER], from, to)!;
+    expect(path).not.toBeNull();
+    expect(path.length).toBeGreaterThan(8);
+    for (const p of path) expect(poolWaterContains([RIVER], p.x, p.z)).toBe(true);
+    // Sanity: the case is only interesting if the straight line would fail
+    // somewhere — check the densest sampling of it.
+    let straightDry = false;
+    for (let t = 0; t <= 1; t += 0.05) {
+      if (!poolWaterContains([RIVER], from.x + (to.x - from.x) * t, from.z + (to.z - from.z) * t)) straightDry = true;
+    }
+    expect(straightDry || !straightStaysWet).toBe(true);
+    const last = path[path.length - 1];
+    expect(Math.hypot(last.x - to.x, last.z - to.z)).toBeLessThan(0.05);
+  });
+
+  it('returns null when an end is not in the water, or there is no river', () => {
+    expect(riverSwimWaypoints([RIVER], { x: 0, z: -14 }, { x: 1, z: centreZ(1) })).toBeNull();
+    expect(riverSwimWaypoints([], { x: 0, z: 7 }, { x: 1, z: 7 })).toBeNull();
   });
 });

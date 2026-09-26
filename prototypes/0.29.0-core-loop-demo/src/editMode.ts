@@ -60,7 +60,7 @@ import {
   FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos,
   // 🖥️ Interior wall mounts (the room terminal).
   isWallMounted, snapInteriorWall, wallMountBox, wallMountHalfWidth,
-  wallOfMountRot, isRoomTerminalKind, deviceFrontFor,
+  wallOfMountRot, isRoomTerminalKind, isRoomAnchoredKind, deviceFrontFor,
 } from './furniture';
 // 🛰️ Hull space (exterior mounts + stacking) — moved out of furniture.ts.
 import {
@@ -222,6 +222,13 @@ export function validatePlacement(
   const mount = FURNITURE_DEFS[item.kind].mount;
   if (mount === 'exterior-wall' || (mount === 'both' && isExteriorPos(pos))) {
     return validateExteriorPlacement(item, pos, rot);
+  }
+
+  // 🏝️ A room-anchored feature (the sea, the infinity pool) is derived from
+  // the ROOM: dragging it would shift the mesh's offset and nothing else, so
+  // it may only stay where it is (add it again to change it).
+  if (isRoomAnchoredKind(item.kind) && (Math.abs(pos.x - item.pos.x) > 1e-6 || Math.abs(pos.z - item.pos.z) > 1e-6)) {
+    return { ok: false, reason: 'a room feature — it goes where the room puts it' };
   }
 
   const box = footprintAabb(item.kind, pos, rot);

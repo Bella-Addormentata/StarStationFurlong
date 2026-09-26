@@ -81,6 +81,7 @@ import {
   getPoolBasin,
   getPoolIsland,
   poolWaterContains,
+  riverSwimWaypoints,
 } from "./furniture";
 import type { Seat } from "./seats";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -1297,7 +1298,12 @@ export class Player {
           basin.z0,
           Math.min(basin.z1, pos.z + nz * this.SWIM_SPEED * deltaTime),
         );
-        const resolved = this._resolvePoolIsland(nextX, nextZ);
+        // 🌊 The basin is a RECTANGLE; the water may not be (the river bends).
+        // A step that would leave the water slides along it, or holds.
+        const inWater = (x: number, z: number) => poolWaterContains(FURNITURE, x, z);
+        const stepX = inWater(nextX, nextZ) ? nextX : inWater(nextX, pos.z) ? nextX : pos.x;
+        const stepZ = inWater(stepX, nextZ) ? nextZ : pos.z;
+        const resolved = this._resolvePoolIsland(stepX, stepZ);
         pos.x = resolved.x;
         pos.z = resolved.z;
       }
@@ -1658,10 +1664,12 @@ export class Player {
     const clampedZ = Math.max(basin.z0, Math.min(basin.z1, tz));
     const destination = this._resolvePoolIsland(clampedX, clampedZ);
     this._clearPath();
-    this.waypointPath = this._swimPathAroundIsland(
-      destination.x,
-      destination.z,
-    );
+    // 🌊 In a winding river the route follows the water (riverSwimWaypoints);
+    // rectangular water keeps the island-aware straight path.
+    const here = this.mesh.position;
+    this.waypointPath =
+      riverSwimWaypoints(FURNITURE, { x: here.x, z: here.z }, destination) ??
+      this._swimPathAroundIsland(destination.x, destination.z);
     this.navMode = "WAYPOINT";
     this.reticle = new WaypointReticle(
       this.scene,
