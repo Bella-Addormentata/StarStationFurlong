@@ -179,15 +179,21 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   can still put two operators in one room.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
-  owner). The chips inside stay put and go with the room, like its furniture.
+  owner). It creates one only where there is no record at all: a record that
+  is there but won't read is kept as it is, ledger and all, and nothing is
+  played on it until the cabinet is removed. The chips inside stay put and go with the room, like its furniture.
   Nothing is paid on a takeover, so a forged owner earns nothing.
 - **A drop.** The player's request is a wish, not a payment. The operator
   refuses it (answers the player, clears the request, moves nothing and leaves
   the machine alone) when it is more than 2 minutes old, the player has no
-  chip, the machine is full, or the player's balance couldn't take the most
-  the drop could pay (every chip inside, its own included, without leaving
-  the safe-integer range). That last check comes before the drop, so a
-  refusal never depends on how the chip falls. Otherwise `processInsert` runs, and
+  chip, the machine is full, its counters have no room for another drop
+  (`jammed`: only a record a peer wrote gets near the safe-integer limit), or
+  the player's balance couldn't take the most the drop could pay (every chip
+  inside, its own included, without leaving the safe-integer range). These
+  checks come before the drop, so a refusal never depends on how the chip
+  falls. A drop that fails anyway (the engine throws, or the settle rejects
+  it) is answered as jammed too: the operator never clears a request without
+  an answer. Otherwise `processInsert` runs, and
   `settleCoinPusherInsert` debits the one chip, credits exactly what the drop
   paid, publishes the machine, answers the player and clears the request in
   **one transaction**. Before writing, it re-reads the stored machine and
@@ -284,7 +290,8 @@ Every reducer keeps it; the settle and empty helpers refuse a transition that
 breaks it; the guard rejects a machine whose ledger doesn't balance. The
 panel's meter shows a check mark for a machine that reads (no totals —
 outside the cashier, chips are shown as chips, never as numbers), and a
-warning for a record that is there but won't read.
+warning for a record that is there but won't read. The operator leaves such a
+record alone, so the warning stays until the owner removes the cabinet.
 
 ## Data flow at a drop
 

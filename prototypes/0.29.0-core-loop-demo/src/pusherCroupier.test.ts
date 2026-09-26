@@ -12,6 +12,7 @@ import {
   buyInChips,
   clearCoinPusherOperatorLease,
   drainAndClearCoinPusher,
+  isCoinPusherRecordUnreadable,
   PUSHER_SWEEP_BATCH,
   readChips,
   readCoinPusherDoorResult,
@@ -38,6 +39,7 @@ import {
   PUSHER_PERIOD_MS,
   PUSHER_STALE_REQUEST_MS,
   RECENT_DROPS_MAX,
+  TICKS_PER_DROP,
   unseenDropHoles,
   type CoinPusherState,
   type Pile,
@@ -127,6 +129,23 @@ describe('operateCoinPusher', () => {
     const s = readCoinPusherState(MACHINE)!;
     expect(s.ownerId).toBe(OPERATOR);
     expect(chipsInMachine(s)).toBe(0);
+  });
+
+  it("keeps a record that is there but won't read as it is, ledger and all", () => {
+    // A ledger that doesn't balance: a record, but not a machine.
+    const base = machineWith(30);
+    const record = { ...base, totalPaid: base.totalPaid + 1 };
+    const map = doc.getMap('casino');
+    map.set(`pusher:${MACHINE}`, record);
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(true);
+    buyInChips(PLAYER, 3);
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', 0.5));
+    operateCoinPusher(MACHINE, OPERATOR, NOW);
+    expect(map.get(`pusher:${MACHINE}`)).toEqual(record);
+    expect(isCoinPusherRecordUnreadable(MACHINE)).toBe(true);
+    // Nothing is played on it.
+    expect(readChips(PLAYER)).toBe(3);
+    expect(readCoinPusherRequest(MACHINE, PLAYER)?.requestId).toBe('req-1');
   });
 
   it('re-owns a machine owned by anyone else: the chips stay inside and nobody is paid', () => {
@@ -320,6 +339,45 @@ describe('operateCoinPusher', () => {
     expect(readCoinPusherResult(MACHINE, PLAYER)).toMatchObject({ kind: 'refused', reason: 'machine-full' });
     expect(readChips(PLAYER)).toBe(3);
   });
+
+  it.each([
+    // One drop moves `tick` by TICKS_PER_DROP, the other two by one.
+    ['tick', Number.MAX_SAFE_INTEGER - TICKS_PER_DROP + 1],
+    ['nextChipId', Number.MAX_SAFE_INTEGER],
+    ['totalInserted', Number.MAX_SAFE_INTEGER],
+  ] as const)(
+    'answers as jammed, before the drop, a drop a machine with its %s at %i could not record',
+    (counter, limit) => {
+      const base = machineWith(20);
+      const atLimit: CoinPusherState = { ...base };
+      atLimit[counter] = limit;
+      // The ledger still balances: what went in, less what is inside, was paid out.
+      if (counter === 'totalInserted') {
+        atLimit.totalPaid = limit - chipsInMachine(base) - base.totalEmptied;
+      }
+      expect(writeCoinPusherState(MACHINE, atLimit)).toBe(true);
+      const stored = readCoinPusherState(MACHINE)!;
+      buyInChips(PLAYER, 3);
+      writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1', 0.5));
+      let draws = 0;
+      operateCoinPusher(MACHINE, OPERATOR, NOW, () => { draws += 1; return 7; });
+      expect(readCoinPusherResult(MACHINE, PLAYER)).toEqual({
+        kind: 'refused', requestId: 'req-1', reason: 'jammed', atMs: NOW,
+      });
+      expect(draws).toBe(0); // refused before any seed is drawn
+      expect(readChips(PLAYER)).toBe(3);
+      expect(readCoinPusherState(MACHINE)).toEqual(stored);
+      expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
+      // One below the limit, the drop is played.
+      const room: CoinPusherState = { ...stored };
+      room[counter] = limit - 1;
+      if (counter === 'totalInserted') room.totalPaid = stored.totalPaid - 1;
+      expect(writeCoinPusherState(MACHINE, room)).toBe(true);
+      writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2', 0.5));
+      operateCoinPusher(MACHINE, OPERATOR, NOW + 200, () => 7);
+      expect(readCoinPusherResult(MACHINE, PLAYER)).toMatchObject({ kind: 'drop', requestId: 'req-2' });
+    },
+  );
 
   it("answers, before the drop, a player whose balance couldn't take the most it could pay", () => {
     const base = machineWith(20);

@@ -32,6 +32,7 @@ import {
   DROP_PHASE_MATCH_MS,
   emptyMachine,
   hashInts,
+  hasRoomForDrop,
   HOLE_XS,
   initialCoinPusherState,
   insertOnPlatform,
@@ -63,6 +64,7 @@ import {
   settlePiles,
   simulatePeg,
   stepMachine,
+  TICKS_PER_DROP,
   unseenDropHoles,
   type CoinPusherState,
   type Pile,
@@ -253,6 +255,7 @@ describe('shape guards', () => {
     expect(isPusherResult(drop)).toBe(true);
     expect(isPusherResult(refused)).toBe(true);
     expect(isPusherResult({ ...refused, reason: 'balance-full' })).toBe(true);
+    expect(isPusherResult({ ...refused, reason: 'jammed' })).toBe(true);
     expect(isPusherResult({ ...drop, paid: -1 })).toBe(false);
     expect(isPusherResult({ ...drop, paid: MACHINE_MAX_CHIPS + 1 })).toBe(false);
     expect(isPusherResult({ ...drop, honored: 'yes' })).toBe(false);
@@ -937,6 +940,28 @@ describe('processInsert', () => {
     const full = fullMachine(8);
     expect(chipsInMachine(full)).toBe(MACHINE_MAX_CHIPS);
     expect(() => processInsert(full, PLAYER1, 1, 0.5, 42)).toThrow(/full/);
+  });
+
+  it('moves tick by TICKS_PER_DROP, and refuses a drop its counters have no room for', () => {
+    const s0 = fill(10);
+    const r = processInsert(s0, PLAYER1, 1, 0.5, 42);
+    expect(r.state.tick - s0.tick).toBe(TICKS_PER_DROP);
+    expect(r.state.nextChipId - s0.nextChipId).toBe(1);
+    expect(r.state.totalInserted - s0.totalInserted).toBe(PUSHER_ANTE);
+    // Right at the edge the drop still fits, and its state still reads.
+    const edge = { ...s0, tick: Number.MAX_SAFE_INTEGER - TICKS_PER_DROP };
+    expect(hasRoomForDrop(edge)).toBe(true);
+    expect(isCoinPusherState(processInsert(edge, PLAYER1, 1, 0.5, 42).state)).toBe(true);
+    // One further, for each counter a drop moves, it doesn't.
+    const full: CoinPusherState[] = [
+      { ...s0, tick: Number.MAX_SAFE_INTEGER - TICKS_PER_DROP + 1 },
+      { ...s0, nextChipId: Number.MAX_SAFE_INTEGER },
+      { ...s0, totalInserted: Number.MAX_SAFE_INTEGER },
+    ];
+    for (const s of full) {
+      expect(hasRoomForDrop(s)).toBe(false);
+      expect(() => processInsert(s, PLAYER1, 1, 0.5, 42)).toThrow(/no room/);
+    }
   });
 
   it('same seed + phase + hole produces the same result', () => {

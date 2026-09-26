@@ -40,13 +40,14 @@
  * aged the same way, from when the operator first saw it; its `requestedAt`,
  * the player's clock, decides only whether the drop's timing is kept.
  *
- * OWNERSHIP: the operator creates a missing machine with itself as owner and
+ * OWNERSHIP: the operator creates a missing machine with itself as owner, and
  * re-owns one whose owner is anyone else (a deed transfer, a peer-written
  * owner, or another install of the deed holder, which has a player id of its
- * own). The chips inside stay where they are and go with the room, like its
- * furniture — nothing is paid out on a takeover, so a forged owner earns
- * nothing. The owner is therefore the install operating the room, and only
- * its panel offers the door.
+ * own). It creates one only where there is no record at all: a record that is
+ * there but won't read is left as it is, ledger and all. The chips inside stay
+ * where they are and go with the room, like its furniture — nothing is paid
+ * out on a takeover, so a forged owner earns nothing. The owner is therefore
+ * the install operating the room, and only its panel offers the door.
  *
  * TEARDOWN: a removed cabinet is drained by the same rule. Only the room's
  * operator, past its settling wait, pays out the chips inside and deletes its
@@ -66,8 +67,10 @@
  * PUSHER_REQUEST_SCAN of them, so a poll costs the same however many keys
  * peers write (the slot operator likewise takes one head request per poll).
  * An insert is refused — no chips move — when it is stale, the player has no
- * chip, the machine is full, or the player's balance couldn't take the most
- * the drop could pay. Otherwise
+ * chip, the machine is full, its counters have no room for another drop, or
+ * the player's balance couldn't take the most the drop could pay; a drop that
+ * fails anyway is refused too (jammed), never cleared without an answer.
+ * Otherwise
  * resolveDropTiming keeps the phase the player saw (inside the timing
  * window), processInsert runs with a seed the operator draws itself, and
  * casinoDoc.settleCoinPusherInsert debits the chip, credits the payout,
@@ -75,12 +78,12 @@
  * transaction.
  */
 import {
-  cancelCoinPusherRequest,
   casinoDocEpoch,
   clearCoinPusherOperatorLease,
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
+  isCoinPusherRecordUnreadable,
   readChips,
   readCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
@@ -98,6 +101,7 @@ import { canRunCroupier } from './croupier';
 import {
   chipsInMachine,
   emptyMachine,
+  hasRoomForDrop,
   initialCoinPusherState,
   MACHINE_MAX_CHIPS,
   processInsert,
@@ -407,7 +411,12 @@ export function operateCoinPusher(
 ): void {
   let state = readCoinPusherState(machineId);
   if (!state) {
-    writeCoinPusherState(machineId, initialCoinPusherState(operatorId, now));
+    // Created only where there is no record at all. One that is there but
+    // won't read is kept as it is, ledger and all: the meter warns, and
+    // nothing is played on it until the cabinet is removed.
+    if (!isCoinPusherRecordUnreadable(machineId)) {
+      writeCoinPusherState(machineId, initialCoinPusherState(operatorId, now));
+    }
     return;
   }
   if (state.ownerId !== operatorId) {
@@ -482,6 +491,10 @@ function settleOneInsert(
   if (waitedMs > PUSHER_STALE_REQUEST_MS) return refuse('expired');
   if (readChips(request.player) < PUSHER_ANTE) return refuse('no-chips');
   if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) return refuse('machine-full');
+  // A machine whose counters have no room for another drop (only a record a
+  // peer wrote gets there) takes no more: refused before the drop, so the
+  // settle never meets a counter past the safe-integer range.
+  if (!hasRoomForDrop(state)) return refuse('jammed');
   // A drop pays at most every chip in the machine, its own included, so it
   // leaves the player at most the chips inside richer. A balance that couldn't
   // take that is refused before the drop: a refusal never depends on how the
@@ -495,10 +508,10 @@ function settleOneInsert(
   try {
     drop = processInsert(state, request.player, request.hole, timing.dropPhase, drawSeed());
   } catch (err) {
-    // Unreachable for a guarded request; never let one poison the queue.
-    console.error('[coin-pusher] drop failed; request withdrawn, no chips moved:', err);
-    cancelCoinPusherRequest(machineId, request.player, request.requestId);
-    return readCoinPusherState(machineId);
+    // Unreachable for a guarded request; never let one poison the queue, and
+    // never clear it without an answer.
+    console.error('[coin-pusher] drop failed; refused as jammed, no chips moved:', err);
+    return refuse('jammed');
   }
   const next: CoinPusherState = {
     ...drop.state,
@@ -523,8 +536,10 @@ function settleOneInsert(
   const result = settleCoinPusherInsert(machineId, state, next, request);
   if (result === 'no-chips' || result === 'balance-full') return refuse(result);
   if (result === 'invalid') {
-    console.error('[coin-pusher] settle rejected the drop; request withdrawn, no chips moved');
-    cancelCoinPusherRequest(machineId, request.player, request.requestId);
+    // Unreachable behind the checks above: the operator computed the drop
+    // itself. Still answered, never cleared silently.
+    console.error('[coin-pusher] settle rejected the drop; refused as jammed, no chips moved');
+    return refuse('jammed');
   }
   return readCoinPusherState(machineId);
 }

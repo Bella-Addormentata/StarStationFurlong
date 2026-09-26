@@ -144,6 +144,10 @@ export const PHYSICS_SUBSTEP_MS = 40;
  *  comes back to rest. */
 export const SETTLE_MS = PUSHER_PERIOD_MS + PHYSICS_SUBSTEP_MS;
 
+/** How far one drop moves the machine's `tick`: one for the insert, then one
+ *  for every substep of the settling cycle (advanceSim). */
+export const TICKS_PER_DROP = 1 + Math.max(1, Math.ceil(SETTLE_MS / PHYSICS_SUBSTEP_MS));
+
 /** Peg field: rows of pins the chip deflects off between the hole and the
  *  upper platform. Five rows gives ~32 possible landing lanes, wide enough
  *  for real skill+luck but still small enough to test exhaustively. */
@@ -245,8 +249,9 @@ export const RECENT_DROPS_MAX = 8;
 
 /** Why the operator turned an insert down. No chip moves on a refusal.
  *  `balance-full`: the player's balance couldn't take the most the drop could
- *  pay (it would leave the safe-integer range). */
-export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired' | 'balance-full';
+ *  pay (it would leave the safe-integer range). `jammed`: the machine can't
+ *  record the drop (its meter has run out). */
+export type PusherRefusalReason = 'no-chips' | 'machine-full' | 'expired' | 'balance-full' | 'jammed';
 
 /**
  * The operator's answer to one player's request, written in the same
@@ -411,7 +416,7 @@ function isRecentDrops(v: unknown, nextChipId: number): v is PusherDropMark[] {
   });
 }
 
-const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired', 'balance-full'];
+const REFUSAL_REASONS: readonly PusherRefusalReason[] = ['no-chips', 'machine-full', 'expired', 'balance-full', 'jammed'];
 
 export function isPusherResult(v: unknown): v is PusherResult {
   if (typeof v !== 'object' || v === null) return false;
@@ -882,6 +887,19 @@ export function resolveDropTiming(
 }
 
 /**
+ * Whether one more drop keeps every counter it moves a safe integer, as the
+ * shape guard requires: `tick` moves by TICKS_PER_DROP, `nextChipId` and
+ * `totalInserted` by one. The ledger keeps the paid-out total below the
+ * inserted one. Only a record a peer wrote can come near the limit: an honest
+ * machine would need some 10^14 drops.
+ */
+export function hasRoomForDrop(state: CoinPusherState): boolean {
+  return state.tick <= Number.MAX_SAFE_INTEGER - TICKS_PER_DROP
+    && state.nextChipId < Number.MAX_SAFE_INTEGER
+    && state.totalInserted < Number.MAX_SAFE_INTEGER;
+}
+
+/**
  * Drop one chip through `hole` at pusher phase `dropPhase` (see
  * resolveDropTiming), then run SETTLE_MS of pusher motion so the drop plays
  * out and the machine comes back to rest. Returns the new state and `paid`:
@@ -893,9 +911,10 @@ export function resolveDropTiming(
  * the physics runs from `dropPhase` internally, and the free-running pusher
  * every client draws never jumps.
  *
- * Throws RangeError on a bad player id / hole / phase, and when the machine
- * is already holding MACHINE_MAX_CHIPS (the operator refuses the request
- * without moving money).
+ * Throws RangeError on a bad player id / hole / phase, when the machine is
+ * already holding MACHINE_MAX_CHIPS, and when its counters have no room for
+ * another drop (hasRoomForDrop); the operator refuses the request without
+ * moving money.
  */
 export function processInsert(
   state: CoinPusherState,
@@ -917,6 +936,9 @@ export function processInsert(
   if (!isPhase(dropPhase)) throw new RangeError('processInsert: dropPhase must be in [0, 1)');
   if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) {
     throw new RangeError('processInsert: the machine is full');
+  }
+  if (!hasRoomForDrop(state)) {
+    throw new RangeError('processInsert: the machine\'s counters have no room for another drop');
   }
 
   // 1. The pusher stands at the player's phase when the chip lands. The
