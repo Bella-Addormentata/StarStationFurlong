@@ -79,6 +79,7 @@ import {
   vatFallbackRelease,
   vatFloorY,
   vatFreeExitAlong,
+  vatShutDoorReleaseAlong,
   vatSqueezeAt,
   vatStrandedRelease,
 } from "./vatGauge";
@@ -2764,12 +2765,14 @@ export class Player {
 
   /**
    * A collision-free spot outside the vat for a clone that must leave
-   * without walking (HOLD watchdog): on its door path when there is one
-   * (vatFreeExitAlong), else the nearest free spot (vatFallbackRelease);
-   * null when nowhere in the room is free.
+   * without walking (HOLD watchdog). The door never opened and seals at once,
+   * so the full-size clone must stand wholly past its sweep. That is on its
+   * door path when the path reaches that far (vatShutDoorReleaseAlong), else
+   * the nearest free spot (vatFallbackRelease). null when nowhere in the
+   * room is free.
    */
   private _spotClearOfVat(): { x: number; z: number } | null {
-    const along = vatFreeExitAlong(
+    const along = vatShutDoorReleaseAlong(
       this.vatCentre,
       this.vatFacing,
       OBSTACLES,

@@ -346,6 +346,25 @@ export function vatFreeExitAlong(
   return free !== null && free >= minEnd ? free : null;
 }
 
+/**
+ * Where on the door path a clone can be put down at full size with the door
+ * shut behind it at once (the HOLD watchdog: the vat never opened). It is
+ * the free end of the path (vatFreeExitAlong), but only if the clone, facing
+ * out, is wholly past the door's sweep there (vatDoorClear). A shorter end is
+ * fine for a walk-out through the open door, but would leave the tail inside
+ * the closed door. null when the path gives no such spot.
+ */
+export function vatShutDoorReleaseAlong(
+  centre: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): number | null {
+  const along = vatFreeExitAlong(centre, facing, obstacles, bounds, radius);
+  return along !== null && vatDoorClear(along, 1) ? along : null;
+}
+
 /** A fallback release is at full size at once and may face any way, so it
  *  must clear the vat by the clone's whole reach, not just its collision
  *  radius: the plinth's base ring plus AVATAR_REACH from the vat's axis. */

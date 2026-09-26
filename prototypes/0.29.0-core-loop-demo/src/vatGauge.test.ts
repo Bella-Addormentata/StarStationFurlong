@@ -40,6 +40,7 @@ import {
   vatGaugeAt,
   vatPallorAt,
   vatPallorHex,
+  vatShutDoorReleaseAlong,
   vatSqueezeAt,
   vatStrandedRelease,
 } from './vatGauge';
@@ -270,6 +271,21 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     const spot = vatFallbackRelease({ x: 0, z: 0 }, 0, [cover], ROOM, R)!;
     expect(spot.x).toBeGreaterThanOrEqual(cover.x1 + R);
     expect(spot.x).toBeLessThanOrEqual(ROOM.boundX);
+  });
+
+  it('puts a clone down past the shut door only where its tail clears the sweep', () => {
+    const own = box(0, 0, 1, 1);
+    // Open floor: the full exit, where the full-size clone is past the door.
+    const open = vatShutDoorReleaseAlong({ x: 0, z: 0 }, 0, [own], ROOM, R)!;
+    expect(open).toBe(VAT_EXIT_ALONG);
+    expect(vatDoorClear(open, 1)).toBe(true);
+    // A path cut short at ~1.65 m still ends a walk-out through the open door,
+    // but with the door shut the tail would be inside it: no spot here.
+    const short = { x0: -1, z0: 2.05, x1: 1, z1: 2.5 };
+    const walkEnd = vatFreeExitAlong({ x: 0, z: 0 }, 0, [own, short], ROOM, R)!;
+    expect(walkEnd).toBeGreaterThanOrEqual(VAT_MIN_RELEASE_ALONG);
+    expect(vatDoorClear(walkEnd, 1)).toBe(false);
+    expect(vatShutDoorReleaseAlong({ x: 0, z: 0 }, 0, [own, short], ROOM, R)).toBeNull();
   });
 
   it('releases a clone whose vat was removed where it stands, or the nearest free spot', () => {
