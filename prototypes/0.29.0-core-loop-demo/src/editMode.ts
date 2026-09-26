@@ -227,7 +227,10 @@ export function validatePlacement(
   // 🏝️ A room-anchored feature (the sea, the infinity pool) is derived from
   // the ROOM: dragging it would shift the mesh's offset and nothing else, so
   // it may only stay where it is (add it again to change it).
-  if (isRoomAnchoredKind(item.kind) && (Math.abs(pos.x - item.pos.x) > 1e-6 || Math.abs(pos.z - item.pos.z) > 1e-6)) {
+  if (
+    isRoomAnchoredKind(item.kind) &&
+    (Math.abs(pos.x - item.pos.x) > 1e-6 || Math.abs(pos.z - item.pos.z) > 1e-6 || rot !== item.rot)
+  ) {
     return { ok: false, reason: 'a room feature — it goes where the room puts it' };
   }
 

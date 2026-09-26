@@ -82,6 +82,7 @@ import {
   getPoolIsland,
   poolWaterContains,
   riverSwimWaypoints,
+  riverClimbOut,
 } from "./furniture";
 import type { Seat } from "./seats";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -1767,7 +1768,13 @@ export class Player {
     this._clearPath();
     let ex = pos.x,
       ez = pos.z;
-    if (basin) {
+    // 🌊 A river's exit is its near bank, straight across the flow — not a
+    // corner of the basin rectangle (which lies across the sand at a bend).
+    const bank = riverClimbOut(FURNITURE, { x: pos.x, z: pos.z }, { x: tx, z: tz });
+    if (bank) {
+      ex = bank.x;
+      ez = bank.z;
+    } else if (basin) {
       // Exit over the side with the LARGER overshoot toward the target;
       // fall back to the nearest edge when the target is inside the basin.
       const dxOut =

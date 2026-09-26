@@ -22,6 +22,7 @@ import {
   poolHoleRect,
   poolWaterContains,
   riverSwimWaypoints,
+  riverClimbOut,
   type FurnitureItem,
 } from './furniture';
 
@@ -280,5 +281,34 @@ describe('swimming the bends', () => {
   it('returns null when an end is not in the water, or there is no river', () => {
     expect(riverSwimWaypoints([RIVER], { x: 0, z: -14 }, { x: 1, z: centreZ(1) })).toBeNull();
     expect(riverSwimWaypoints([], { x: 0, z: 7 }, { x: 1, z: 7 })).toBeNull();
+  });
+});
+
+describe('climbing out', () => {
+  it('exits onto the near bank straight across the flow, on the target\'s side', () => {
+    const x = -3;
+    const inWater = { x, z: centreZ(x) + 0.5 }; // a little toward +z
+    const dryFar = { x: 4, z: centreZ(4) + 6 }; // dry sand on the +z side, far along the river
+    const exit = riverClimbOut([RIVER], inWater, dryFar)!;
+    expect(exit).not.toBeNull();
+    // Same station along the river (straight across the flow)…
+    expect(Math.abs(exit.x - x)).toBeLessThan(0.01);
+    // …just past the wet shelf on the +z bank, out of the cut.
+    expect(exit.z).toBeGreaterThan(centreZ(x) + W_WET);
+    expect(poolCutContains([RIVER], exit.x, exit.z)).toBe(false);
+    // The glide from the water to the bank is straight across the band: every
+    // point of it up to the shelf's edge is still inside the cut.
+    for (let f = 0; f < 0.8; f += 0.1) {
+      const px = inWater.x + (exit.x - inWater.x) * f, pz = inWater.z + (exit.z - inWater.z) * f;
+      expect(poolCutContains([RIVER], px, pz)).toBe(true);
+    }
+    // A target on the other bank takes the other side.
+    const other = riverClimbOut([RIVER], inWater, { x: 4, z: centreZ(4) - 6 })!;
+    expect(other.z).toBeLessThan(centreZ(x) - W_WET);
+  });
+
+  it('is null off the water or without a river', () => {
+    expect(riverClimbOut([RIVER], { x: 0, z: -14 }, { x: 0, z: 0 })).toBeNull();
+    expect(riverClimbOut([], { x: 0, z: 7 }, { x: 0, z: 0 })).toBeNull();
   });
 });

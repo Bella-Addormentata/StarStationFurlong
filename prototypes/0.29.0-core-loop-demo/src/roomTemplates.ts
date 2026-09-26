@@ -103,6 +103,11 @@ interface PlacementSpec {
    *  (the part beyond it is inside the wall, harmless), and it is never
    *  nudged toward the centre — off the wall it is not a hedge. */
   hugWall?: boolean;
+  /** Hangs ABOVE the furniture it is placed over (the banner strung over the
+   *  cake, the pergola roof over its posts and the bar): a footprintless
+   *  item is otherwise refused wherever its centre is inside an occupied
+   *  box, which nudged the banner off the cake (Copilot review, PR #169). */
+  overhead?: boolean;
 }
 
 function boxesOverlap(a: Box, b: Box): boolean {
@@ -194,7 +199,7 @@ function placeFitting(
         // dance floor, the pergola roof). It cannot COLLIDE, but it must not
         // be standing in the river either, and it still has to be in the room.
         if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
-        if (pointInAny(x, z, occupied)) continue;
+        if (!spec.overhead && pointInAny(x, z, occupied)) continue;
       }
       placed = item;
       break;
@@ -253,7 +258,7 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     { kind: "cake-table", at: [0.42, -0.78] },
     // Strung OVER the cake table (same spot; the poles stand just past its
     // ends and the cloth hangs well above the cake) — behind it is the hedge.
-    { kind: "birthday-banner", at: [0.42, -0.78] },
+    { kind: "birthday-banner", at: [0.42, -0.78], overhead: true },
     // Gifts in METRES from the cake — one each side — so they sit beside it
     // in any room instead of drifting into the bar in a small one.
     { kind: "gift-box", at: [0.42, -0.78], off: [-1.6, 0.3] },
@@ -303,7 +308,7 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     { kind: "pergola-post", at: [-1, -1], off: [7.9, 1.7], group: "pergola" },
     { kind: "pergola-post", at: [-1, -1], off: [1.3, 5.3], group: "pergola" },
     { kind: "pergola-post", at: [-1, -1], off: [7.9, 5.3], group: "pergola" },
-    { kind: "pergola-roof", at: [-1, -1], off: [4.6, 3.5], group: "pergola" },
+    { kind: "pergola-roof", at: [-1, -1], off: [4.6, 3.5], group: "pergola", overhead: true },
     { kind: "gift-box", at: [0.86, -0.72] },
     { kind: "surfboard", at: [-0.94, 0.62] },
     { kind: "beach-ball", at: [-0.42, 0.3] },

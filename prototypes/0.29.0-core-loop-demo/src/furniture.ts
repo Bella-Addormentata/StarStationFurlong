@@ -9823,6 +9823,34 @@ export function isPoolKind(kind: FurnitureKind): boolean {
  * not in its water. Straight lines between two bends crossed the sand
  * (Copilot review, PR #169).
  */
+/**
+ * 🌊 Where a swimmer in the river climbs out: the point on the NEAR bank —
+ * the bank on the target's side of the water when the target is out of it,
+ * else the closer one — just past the wet shelf, straight across the flow
+ * from where they are. A straight glide there never crosses sand; the
+ * basin rectangle's edges did (Copilot review, PR #169). Null when the
+ * room's pool is not a river or the swimmer is not in its water.
+ */
+export function riverClimbOut(
+  items: FurnitureItem[],
+  from: { x: number; z: number },
+  target: { x: number; z: number },
+): { x: number; z: number } | null {
+  const river = items.find((i) => i.kind === "beach-river");
+  if (!river) return null;
+  const a = toLocal(river, from.x, from.z);
+  if (!riverHasWaterAt(a.x, a.z)) return null;
+  const t = toLocal(river, target.x, target.z);
+  const { wWet, halfLen } = riverMetrics();
+  const offFrom = a.z - riverCentreZ(a.x);
+  const offTarget = t.z - riverCentreZ(t.x);
+  const side = riverHasWaterAt(t.x, t.z) ? Math.sign(offFrom) || 1 : Math.sign(offTarget) || 1;
+  const lx = Math.max(-halfLen + 0.3, Math.min(halfLen - 0.3, a.x));
+  const lz = riverCentreZ(lx) + side * (wWet + 0.35);
+  const w = rotXZ(lx, lz, river.rot);
+  return { x: river.pos.x + w.x, z: river.pos.z + w.z };
+}
+
 export function riverSwimWaypoints(
   items: FurnitureItem[],
   from: { x: number; z: number },
