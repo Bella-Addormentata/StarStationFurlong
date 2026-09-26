@@ -35,6 +35,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  PropAnimHandle,
 } from "./devices";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
@@ -42,10 +43,24 @@ import { WHEEL_ORDER, pocketColor } from "./games/roulette";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
 import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
+// 🎉 Party props read their own per-instance state (candles, lids, the music)
+// straight from the room doc, the same way the slot machine reads the casino
+// map — the doc is the phase, a local click is never the phase.
+import {
+  readCake, readGift, readSpeaker, subscribePartyKey, partyDocEpoch,
+  cakeKey, giftKey, speakerKey,
+} from "./partyDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
+import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
+// 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
+// doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
+// this module.
+import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } from "./doorLayoutDoc";
+import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
@@ -105,7 +120,40 @@ export type FurnitureKind =
   | "classic-hot-tub"
   | "bunk-bed"
   | "clone-vat"
-  | "slot-machine";
+  | "slot-machine"
+  // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
+  | "cake-table"
+  | "gift-box"
+  | "birthday-banner"
+  | "party-speaker"
+  | "dance-floor"
+  | "party-standing-table"
+  // 🏝️ Beach fixtures — the party skill's set, ported to voxel.
+  | "palm-tree"
+  | "parasol"
+  | "sun-lounger"
+  | "surfboard"
+  | "beach-towel"
+  | "beach-ball"
+  | "beach-crate"
+  | "cooler"
+  | "tiki-torch"
+  | "tiki-bar-counter"
+  | "tiki-back-bar"
+  | "tiki-bar-stool"
+  | "pergola-post"
+  | "pergola-roof"
+  | "beach-river"
+  | "plank-bridge"
+  // 🏖️ The Habbo beach: a flat sea in the front corner, thatched parasols, a raft.
+  | "beach-sea"
+  // 🏊 The reference's terraced water as a pool on the front edge (not a swim kind).
+  | "infinity-pool"
+  | "tiki-parasol"
+  | "beach-raft"
+  | "jungle-plant"
+  // 🌹 Tall yellow climbing rose on a trellis — hangs on an interior wall.
+  | "climbing-rose";
 
 export interface FurnitureItem {
   id: string;
@@ -291,6 +339,16 @@ export interface FurnitureDef {
    * further, is what would break this; mounting height has nothing to do with it.
    */
   wallMount?: { halfW: number };
+  /**
+   * 🌊 Obstacle override for kinds whose blocked area is NOT one rectangle.
+   * A winding river is the case that forced it: a single AABB around the band
+   * would also block the dry sand at every bend AND the far bank, and a bridge
+   * could never be walkable because its cells would sit inside the same box.
+   * Returning per-column strips (minus anything that bridges the water) keeps
+   * the banks walkable and the crossing real. Takes the whole layout because
+   * what cuts a hole in the river is another ITEM.
+   */
+  obstacleBoxes?: (item: FurnitureItem, all: FurnitureItem[]) => Box[];
 }
 
 // ── Warm frontier colour palette (moved from world.addLobbyFurniture) ─────────
@@ -2419,6 +2477,53 @@ const seatOn = (topY: number): number => +(topY + SIT_CONTACT_DROP).toFixed(3);
  *  built meshes in the running room, not just the source. */
 const SOFT_SEAT_TOP = 0.455;
 
+/** 🏊 River entry: two wading-in points, one per bank, at the places the
+ *  centre line runs closest to that bank. Water seats put the occupant in the
+ *  swim pose at the water plane — the pool idiom, reused. */
+const beachRiverSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -4.0, z0: -3.0, x1: -1.0, z1: 0.0 },
+    front: { x: -2.5, z: -4.4 },
+    sit: { x: -2.5, z: -1.6 },
+    faceAngle: 0,
+    sitY: -0.35, // keep == POOL_WATER_Y (declared below this block)
+    swim: true,
+  },
+  {
+    clickBox: { x0: 1.0, z0: 0.0, x1: 4.0, z1: 3.0 },
+    front: { x: 2.5, z: 4.4 },
+    sit: { x: 2.5, z: 1.6 },
+    faceAngle: Math.PI,
+    sitY: -0.35, // keep == POOL_WATER_Y (declared below this block)
+    swim: true,
+  },
+];
+
+/** 🛋️ Sun lounger: you LIE on it. faceAngle points at the FEET end (+z), so
+ *  the recline tips the head toward -z — the head end the backrest is at. */
+const sunLoungerSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -0.5, z0: -1.0, x1: 0.5, z1: 1.0 },
+    front: { x: 1.2, z: 0 },
+    sit: { x: 0, z: 0.1 },
+    faceAngle: 0,
+    sitY: 0.47,
+    lie: true,
+  },
+];
+
+/** 🪑 Bar stool: seat top 0.865 to match the 1.28 m counter, and the occupant
+ *  faces -z — the counter side, so guests sit looking INTO the room's bar. */
+const tikiBarStoolSeats: SeatTemplate[] = [
+  {
+    clickBox: { x0: -0.5, z0: -0.5, x1: 0.5, z1: 0.5 },
+    front: { x: 0, z: 1.0 },
+    sit: { x: 0, z: 0 },
+    faceAngle: Math.PI,
+    sitY: seatOn(0.865),
+  },
+];
+
 const armchairLeftSeats: SeatTemplate[] = [
   {
     clickBox: { x0: -0.5, z0: -0.5, x1: 0.5, z1: 0.5 },
@@ -3092,6 +3197,147 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     kind: "birthday-balloons-wall",
     build: buildBirthdayBalloonsWall,
     footprint: null,
+  },
+  // ── 🎉 Party fixtures ──────────────────────────────────────────────────────
+  // The three with a `device` are the room's VERBS; the three without are the
+  // dressing. Device fronts follow the map-table convention: the stand point
+  // sits just beyond the +z footprint edge and faceAngle π turns the avatar
+  // back TOWARD the prop.
+  //
+  // 🎂 Cake table: 2×1 and solid, with open floor wanted on at least two sides
+  // — it is the thing the whole room turns to face.
+  "cake-table": {
+    kind: "cake-table",
+    build: buildCakeTable,
+    footprint: { w: 2, d: 1 },
+    functions: ["partyCake"],
+    device: {
+      kind: "cakeTable",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.9, z: 1.1 },
+      anchor: { x: 0, y: 1.55, z: 0 },
+    },
+  },
+  // 🎁 Gift box: 1×1, solid, and deliberately CHEAP to place — guests pile
+  // them by the cake in edit mode, which is half the point of shipping the
+  // party cluster sparse.
+  "gift-box": {
+    kind: "gift-box",
+    build: buildGiftBox,
+    footprint: { w: 1, d: 1 },
+    functions: ["partyGift"],
+    device: {
+      kind: "giftBox",
+      front: { x: 0, z: 0.9 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.05, z: 0.8 },
+      anchor: { x: 0, y: 0.35, z: 0 },
+    },
+  },
+  // 🎊 Banner: footprint NULL — guests walk under it. See buildBirthdayBanner.
+  "birthday-banner": {
+    kind: "birthday-banner",
+    build: buildBirthdayBanner,
+    footprint: null,
+  },
+  // 🔊 Speaker: drives every dance floor in the room via `speaker:<itemId>`.
+  "party-speaker": {
+    kind: "party-speaker",
+    build: buildPartySpeaker,
+    footprint: { w: 1, d: 1 },
+    functions: ["partySpeaker"],
+    device: {
+      kind: "partySpeaker",
+      front: { x: 0, z: 0.9 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.35, z: 0.85 },
+      anchor: { x: 0, y: 0.7, z: 0 },
+    },
+  },
+  // 💃 Dance floor: footprint NULL because it IS floor — an obstacle here
+  // would make the one tile people are supposed to stand on unwalkable.
+  "dance-floor": {
+    kind: "dance-floor",
+    build: buildDanceFloor,
+    footprint: null,
+  },
+  "party-standing-table": {
+    kind: "party-standing-table",
+    build: buildPartyStandingTable,
+    footprint: { w: 1, d: 1 },
+  },
+  // ── 🏝️ Beach fixtures — footprints and heights are the reference set's ────
+  "palm-tree": { kind: "palm-tree", build: buildPalmTree, footprint: { w: 1, d: 1 } },
+  "parasol": { kind: "parasol", build: buildParasol, footprint: { w: 1, d: 1 } },
+  "sun-lounger": {
+    kind: "sun-lounger",
+    build: buildSunLounger,
+    footprint: { w: 1, d: 2 },
+    seats: sunLoungerSeats,
+  },
+  "surfboard": { kind: "surfboard", build: buildSurfboard, footprint: { w: 1, d: 1 } },
+  "beach-towel": { kind: "beach-towel", build: buildBeachTowel, footprint: null },
+  // A ball you walk past — solid:false in the reference, and an obstacle here
+  // would strand anyone who kicked it into a doorway.
+  "beach-ball": { kind: "beach-ball", build: buildBeachBall, footprint: null },
+  "beach-crate": { kind: "beach-crate", build: buildBeachCrate, footprint: { w: 1, d: 1 } },
+  "cooler": { kind: "cooler", build: buildCooler, footprint: { w: 1, d: 1 } },
+  "tiki-torch": { kind: "tiki-torch", build: buildTikiTorch, footprint: { w: 1, d: 1 } },
+  "tiki-bar-counter": {
+    kind: "tiki-bar-counter",
+    build: buildTikiBarCounter,
+    footprint: { w: 4, d: 1 },
+  },
+  "tiki-back-bar": { kind: "tiki-back-bar", build: buildTikiBackBar, footprint: { w: 3, d: 1 } },
+  "tiki-bar-stool": {
+    kind: "tiki-bar-stool",
+    build: buildTikiBarStool,
+    footprint: { w: 1, d: 1 },
+    seats: tikiBarStoolSeats,
+  },
+  "pergola-post": { kind: "pergola-post", build: buildPergolaPost, footprint: { w: 1, d: 1 } },
+  // Overhead and non-solid: it shades the bar, it does not wall it off.
+  "pergola-roof": { kind: "pergola-roof", build: buildPergolaRoof, footprint: null },
+  // 🌊 The river. footprint null because a single AABB is exactly the wrong
+  // shape for it — obstacleBoxes returns per-column strips instead, so the dry
+  // sand at the bends and the far bank stay walkable.
+  "beach-river": {
+    kind: "beach-river",
+    build: buildBeachRiver,
+    footprint: null,
+    obstacleBoxes: riverObstacleBoxes,
+    seats: beachRiverSeats,
+  },
+  // 🌉 The crossing. footprint null and NOT an obstacle: it exists precisely to
+  // make cells walkable that the river took away.
+  "plank-bridge": { kind: "plank-bridge", build: buildPlankBridge, footprint: null },
+  // 🌊 Flat sea at floor level. footprint null; blocked per tile run.
+  "beach-sea": {
+    kind: "beach-sea",
+    build: buildBeachSea,
+    footprint: null,
+    obstacleBoxes: () => seaObstacleBoxes(),
+  },
+  // 🏊 Terraced infinity pool. footprint null; blocked per column, minus bridges.
+  "infinity-pool": {
+    kind: "infinity-pool",
+    build: buildInfinityPool,
+    footprint: null,
+    obstacleBoxes: (_item, all) => infinityPoolObstacleBoxes(all),
+  },
+  "tiki-parasol": { kind: "tiki-parasol", build: buildTikiParasol, footprint: { w: 1, d: 1 } },
+  // Floats on the sea — a thing you look at, not a tile you stand on.
+  "beach-raft": { kind: "beach-raft", build: buildBeachRaft, footprint: null },
+  "jungle-plant": { kind: "jungle-plant", build: buildJunglePlant, footprint: { w: 1, d: 1 } },
+  // 🌹 Climbing rose: wall-mounted like the terminal (footprint null, never
+  // an obstacle, pose derived from the wall — see snapInteriorWall), 1 m of
+  // wall, 3.6 m tall.
+  "climbing-rose": {
+    kind: "climbing-rose",
+    build: buildClimbingRose,
+    footprint: null,
+    wallMount: { halfW: 0.5 },
   },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
@@ -6151,6 +6397,2258 @@ function buildSlotMachine({
 }
 
 
+// ── 🌊 The beach river ──────────────────────────────────────────────────────
+/**
+ * The party skill's river, built the way it says to build one: a WIDE, WINDING
+ * channel across the FRONT of the room, generated from a sine centre line
+ * rather than drawn by hand, terraced so every bend shows a side face, with a
+ * darker deep channel down the middle and foam where the water meets the bank.
+ *
+ * WHY NOT lazy-pool: that is a ring around an island — a lazy river in the
+ * water-park sense. This is a river in the landscape sense: it crosses the
+ * scene, it has two banks, and you need a bridge.
+ *
+ * ONE DEVIATION FROM THE REFERENCE, and it is forced: the reference terraces
+ * sand 0 → wet −0.35 → water −0.75 → deep −1.1. Here the WATER SURFACE must
+ * stay at POOL_WATER_Y (−0.35) because the swim rig, the splash spawn and the
+ * head-bob are all calibrated to that plane. So the same four-terrace read is
+ * built AROUND that fixed surface instead: the bank steps down to a wet-sand
+ * shelf at −0.12, the water sits at −0.35, and the bed below it drops twice —
+ * −0.75 under the shallows, −1.25 down the channel — which is where the depth
+ * actually comes from, since you see the bed THROUGH the water.
+ */
+const RIVER_K = 0.38; // how tightly the centre line wanders — re-tunable
+/** How far short of each wall the river stops (see riverMetrics). */
+const RIVER_END_LIP = 0.35;
+const RIVER_PHASE = 0.6;
+
+/**
+ * 📐 The river is a ROOM-SPANNING feature, so its length and width come from
+ * the room, not from a constant. A 30 m channel authored for a 5×5 module
+ * hangs out through the walls of a 2×2 one; the reference's own widths (water
+ * 2.6, wet shelf 3.4) would leave a 12 m room with almost no bank.
+ *
+ * So: it reaches wall to wall, and the bands are a FRACTION of the room's
+ * depth, clamped so it never stops looking like a river — five or six tiles
+ * across in a big room, a stream in a small one, a bank on both sides either
+ * way. All four consumers (the builder, the floor-hole cutter, the obstacle
+ * strips and the swim test) read this one function, so what you see, what is
+ * missing from the floor and what you cannot walk on stay one shape.
+ */
+function riverMetrics(): {
+  halfLen: number;
+  amp: number;
+  wWet: number;
+  wWater: number;
+  wDeep: number;
+} {
+  const { halfX, halfZ } = roomHalfExtents();
+  // Narrow: a stream you step over on a bridge, not a bay. ~1.6 m of water in
+  // a 12 m room, 4 m in a 30 m one.
+  const wWater = Math.min(2.0, Math.max(0.8, halfZ * 0.135));
+  return {
+    // Stops RIVER_END_LIP short of each wall — for EVERYTHING, not just the
+    // floor cut. The platform has no skirt below floor level, so any terrace
+    // that ran on to ±halfX poked out past the floor's edge, visible from
+    // outside as a stack of teal steps; and a cut reaching the boundary is not
+    // a hole to the triangulator (see poolHoleOutline). Both fixed by one
+    // number; the lip reads as the bank meeting the wall, inside WALL_CLEARANCE.
+    halfLen: halfX - RIVER_END_LIP,
+    // A narrow band needs a visible wander or it reads as a straight ditch.
+    amp: Math.min(1.8, Math.max(0.6, halfZ * 0.17)),
+    wWet: wWater * 1.35,
+    wWater,
+    wDeep: wWater * 0.4,
+  };
+}
+// SHALLOW on purpose (owner ruling 2026-09-21): the reference river is flat
+// bands of colour with the thinnest of side faces — a beach, not a canyon.
+// The water surface is pinned at POOL_WATER_Y (−0.35) for the swim rig, so
+// the bank is a 0.35 m drop whatever we do; everything else stays close under
+// it. Depth is read through the water as colour, not as walls.
+const RIVER_Y_WET = -0.12; // a lip, not a step
+const RIVER_Y_BED = -0.62; // bed under the shallows
+const RIVER_Y_DEEP = -0.85; // bed down the channel
+const RIVER_SEGS = 120;
+
+/** The centre line, in the river item's LOCAL frame. Shared by the builder,
+ *  the floor-hole cutter and the obstacle strips, so the water you see, the
+ *  floor that is missing and the tiles you cannot walk on are one shape. */
+function riverCentreZ(lx: number): number {
+  return riverMetrics().amp * Math.sin(RIVER_K * lx + RIVER_PHASE);
+}
+
+/** Is a LOCAL point inside the river's water? Analytic — no polygon sampling,
+ *  because the band has a constant half-width about a known centre line. */
+function riverHasWaterAt(lx: number, lz: number): boolean {
+  const { halfLen, wWater } = riverMetrics();
+  return Math.abs(lx) <= halfLen && Math.abs(lz - riverCentreZ(lx)) <= wWater;
+}
+
+/**
+ * Is a LOCAL point inside the EXCAVATION — the whole cut, wet shelf included?
+ *
+ * Wider than the water, and the distinction matters twice over: the floor hole
+ * and the obstacle strips follow THIS (you cannot stand on a shelf 30 cm below
+ * a floor the engine draws flat, and if the hole stopped at the waterline the
+ * shelf would be buried under solid floor and never seen), while SWIMMING
+ * follows the water — wading onto the bank is climbing out, not drowning.
+ */
+function riverHasCutAt(lx: number, lz: number): boolean {
+  const { halfLen, wWet } = riverMetrics();
+  return Math.abs(lx) <= halfLen && Math.abs(lz - riverCentreZ(lx)) <= wWet;
+}
+
+/**
+ * A flat ribbon BAND following the centre line, from hwInner out to hwOuter on
+ * BOTH sides — an annulus, not a plate.
+ *
+ * This distinction is the whole terracing. A full-width ribbon at the shelf
+ * height is a lid: it spans the channel it is supposed to border, and every
+ * deeper layer — the water, the bed, the channel — renders underneath it and
+ * is never seen. Ask for the strip you mean.
+ */
+function riverRibbonBand(hwInner: number, hwOuter: number, y: number): THREE.BufferGeometry {
+  const { halfLen } = riverMetrics();
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= RIVER_SEGS; i++) {
+    const lx = -halfLen + (i / RIVER_SEGS) * halfLen * 2;
+    const zc = riverCentreZ(lx);
+    // Four vertices per station: outer-near, inner-near, inner-far, outer-far.
+    pos.push(lx, y, zc - hwOuter, lx, y, zc - hwInner, lx, y, zc + hwInner, lx, y, zc + hwOuter);
+  }
+  for (let i = 0; i < RIVER_SEGS; i++) {
+    const a = i * 4;
+    const b = a + 4;
+    idx.push(a, b, a + 1, a + 1, b, b + 1); // near strip
+    idx.push(a + 2, b + 2, a + 3, a + 3, b + 2, b + 3); // far strip
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** A flat ribbon following the centre line — one mesh per terrace instead of
+ *  a hundred little slabs. */
+function riverRibbon(hw: number, y: number): THREE.BufferGeometry {
+  const { halfLen } = riverMetrics();
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= RIVER_SEGS; i++) {
+    const lx = -halfLen + (i / RIVER_SEGS) * halfLen * 2;
+    const zc = riverCentreZ(lx);
+    pos.push(lx, y, zc - hw, lx, y, zc + hw);
+  }
+  for (let i = 0; i < RIVER_SEGS; i++) {
+    const a = i * 2;
+    idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+/** The vertical face at one bank edge — THE depth cue. Without these the whole
+ *  thing reads as a painted floor, which the checklist calls the single most
+ *  common reason a beach room looks flat. */
+function riverBankFace(hw: number, side: 1 | -1, yTop: number, yBot: number): THREE.BufferGeometry {
+  const { halfLen } = riverMetrics();
+  const pos: number[] = [];
+  const idx: number[] = [];
+  for (let i = 0; i <= RIVER_SEGS; i++) {
+    const lx = -halfLen + (i / RIVER_SEGS) * halfLen * 2;
+    const z = riverCentreZ(lx) + side * hw;
+    pos.push(lx, yTop, z, lx, yBot, z);
+  }
+  for (let i = 0; i < RIVER_SEGS; i++) {
+    const a = i * 2;
+    idx.push(a, a + 2, a + 1, a + 1, a + 2, a + 3);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+function buildBeachRiver(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const { halfLen, amp, wWet, wWater, wDeep } = riverMetrics();
+  const SAND = 0xfbf7ee; // the reference's white beach sand
+  const WET = 0xe4dac4; // …a shade darker where it is damp
+  const BED = 0x7fd3df; // pale — the shallows read light through the water
+  const BED_DEEP = 0x2f97ab; // the channel, one band darker
+  const WATER = 0x5fc4d4;
+  const FOAM = 0xeafaf9;
+  const both = (mat: THREE.MeshStandardMaterial) => {
+    mat.side = THREE.DoubleSide;
+    return mat;
+  };
+
+  // ── 🏖️ The beach itself: a flat sand apron on the floor either side of the
+  //    cut, so the room's tiles give way to sand before the water starts. It
+  //    is what makes this a beach in a room rather than a trench in a floor.
+  place(riverRibbonBand(wWet, wWet + 1.1, 0.006), both(m(SAND, 0.98, 0.0)), 0, 0, 0);
+
+  // ── Terraces. Each is the STRIP between its own edge and the next one in,
+  //    so nothing is a lid over the layer below it. Every step down also draws
+  //    a vertical face, which is where the depth actually comes from.
+  //
+  //    0      ──┐ dry sand (the room's own floor)
+  //    -0.30    └──┐ wet shelf .............. band  2.6 → 3.4
+  //    -0.35       ~~ water surface ......... plate      ±2.6
+  //    -1.05       └──┐ shallow bed ......... band  1.0 → 2.6
+  //    -1.85          └── deep channel bed .. plate      ±1.0
+  place(riverRibbonBand(wWater, wWet, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverBankFace(wWet, 1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+  place(riverBankFace(wWet, -1, 0, RIVER_Y_WET), both(m(WET, 0.95, 0.0)), 0, 0, 0);
+
+  place(riverRibbonBand(wDeep, wWater, RIVER_Y_BED), both(m(BED, 0.9, 0.02)), 0, 0, 0);
+  // The face under the waterline is SAND-coloured: it is the bank continuing
+  // down, and a teal wall there is what made the old cut read as a canyon.
+  place(riverBankFace(wWater, 1, RIVER_Y_WET, RIVER_Y_BED), both(m(WET, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wWater, -1, RIVER_Y_WET, RIVER_Y_BED), both(m(WET, 0.9, 0.02)), 0, 0, 0);
+
+  // The deep channel: one more terrace, and the biggest depth cue a river has.
+  place(riverRibbon(wDeep, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wDeep, 1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+  place(riverBankFace(wDeep, -1, RIVER_Y_BED, RIVER_Y_DEEP), both(m(BED_DEEP, 0.9, 0.02)), 0, 0, 0);
+
+  // ── End caps. The cut stops short of the wall, so each end of the trench is
+  //    an open cross-section — and the platform has no skirt below floor
+  //    level, so from outside the room you looked straight into it: a stack
+  //    of teal steps under the floor's edge. A wall closes each end — in the
+  //    platform's own dark, so it reads as the underside of the room rather
+  //    than as a pale block hung off its edge (a sand-coloured cap did).
+  for (const side of [1, -1] as const) {
+    const lx = side * halfLen;
+    const zc = riverCentreZ(lx);
+    const depth = -RIVER_Y_DEEP;
+    place(
+      new THREE.BoxGeometry(0.06, depth, wWet * 2),
+      m(0x141a26, 0.95, 0.0),
+      lx - side * 0.03,
+      -depth / 2,
+      zc,
+    );
+  }
+
+  // ── The water surface itself, translucent over the bed ──
+  const waterMat = both(m(WATER, 0.25, 0.1));
+  translucent(waterMat, 0.62); // the bed's two bands must read through it
+  place(riverRibbon(wWater, POOL_WATER_Y), waterMat, 0, 0, 0);
+
+  // ── Foam where the water laps the bank, on BOTH banks ──
+  for (const side of [1, -1] as const) {
+    const foam = both(m(FOAM, 0.6, 0.0, FOAM, 0.35));
+    translucent(foam, 0.8);
+    const g = riverRibbon(wWater, POOL_WATER_Y + 0.008);
+    // Squeeze the ribbon to a thin strip hugging one edge by moving every
+    // inner vertex out to meet the outer one.
+    const arr = g.getAttribute("position") as THREE.BufferAttribute;
+    for (let i = 0; i <= RIVER_SEGS; i++) {
+      const inner = side === 1 ? i * 2 : i * 2 + 1;
+      const outer = side === 1 ? i * 2 + 1 : i * 2;
+      const zOuter = arr.getZ(outer);
+      arr.setZ(inner, zOuter - side * 0.22);
+    }
+    arr.needsUpdate = true;
+    g.computeVertexNormals();
+    place(g, foam, 0, 0, 0);
+  }
+
+  // ── 🌊 The current. The checklist is specific: animate it as a CURRENT —
+  //    phase travelling downstream — not as a shimmer. Streaks drift along the
+  //    channel, following the centre line, and recycle at the far bank.
+  const STREAKS = 26;
+  const streaks: THREE.Mesh[] = [];
+  const streakX: number[] = [];
+  const streakOff: number[] = [];
+  const streakMat = both(m(FOAM, 0.4, 0.0, FOAM, 0.5));
+  translucent(streakMat, 0.34);
+  // A streak is 1.1 m long and is positioned by its CENTRE, so it must turn
+  // round half a length before the river ends — recycled at halfLen, the last
+  // streak ran 0.55 m past the cut and out through the platform's edge.
+  const STREAK_LEN = 1.1;
+  const streakEnd = halfLen - STREAK_LEN / 2;
+  for (let i = 0; i < STREAKS; i++) {
+    const mesh = place(new THREE.BoxGeometry(STREAK_LEN, 0.01, 0.075), streakMat, 0, POOL_WATER_Y + 0.014, 0);
+    streaks.push(mesh);
+    streakX.push(-streakEnd + (i / STREAKS) * streakEnd * 2);
+    // Spread across the channel, denser toward the middle where a real current
+    // runs fastest.
+    streakOff.push((Math.random() * 2 - 1) ** 3 * wWater * 0.8);
+  }
+  const anim: PropAnimHandle = {
+    update(dt: number) {
+      for (let i = 0; i < STREAKS; i++) {
+        // Mid-channel water moves faster than the edges.
+        const speed = 1.15 - 0.5 * Math.abs(streakOff[i]) / wWater;
+        streakX[i] += speed * dt;
+        if (streakX[i] > streakEnd) streakX[i] -= streakEnd * 2;
+        const lx = streakX[i];
+        streaks[i].position.set(lx, POOL_WATER_Y + 0.014, riverCentreZ(lx) + streakOff[i]);
+        // Bank the streak along the flow so it follows the bend.
+        const slope = amp * RIVER_K * Math.cos(RIVER_K * lx + RIVER_PHASE);
+        streaks[i].rotation.y = -Math.atan(slope);
+      }
+    },
+  };
+  streaks[0].userData.propAnim = anim;
+}
+
+/**
+ * 🌉 Plank bridge — the way across, and the reason the far bank is worth
+ * having. AXIS-ALIGNED on purpose: the pathfinder forbids corner-cutting, so a
+ * diagonal bridge is a bridge nobody can walk. Its cells are cut OUT of the
+ * river's floor hole and out of its obstacle strips, which is what makes it
+ * walkable over water.
+ */
+const BRIDGE_W = 1.8;
+/** Bridge length follows the RIVER (which follows the room): the excavation's
+ *  full width at its widest bend, plus a 0.7 m landing on each bank. A fixed
+ *  9 m span authored for a 5×5 module ran through the wall of a 2×2 one. */
+function bridgeLen(): number {
+  return bridgeLenFor(FURNITURE);
+}
+/** 🏊 Over the infinity pool the span is the pool's widest possible width —
+ *  water plus its wet step plus one row of drift — with the same 0.7 m
+ *  landings: a pier out to the edge. (Per item list so the tests' explicit
+ *  lists work too.) */
+function bridgeLenFor(all: FurnitureItem[]): number {
+  if (all.some((i) => i.kind === "infinity-pool")) return infinityPoolMetrics().waterW + 2 + 1.4;
+  const rm = riverMetrics();
+  return 2 * (rm.wWet + rm.amp) + 1.4;
+}
+
+function buildPlankBridge({ m, place }: BuildCtx) {
+  const BRIDGE_LEN = bridgeLen();
+  const PLANKS = Math.max(8, Math.round(BRIDGE_LEN * 2));
+  for (let i = 0; i < PLANKS; i++) {
+    const z = -BRIDGE_LEN / 2 + (i + 0.5) * (BRIDGE_LEN / PLANKS);
+    place(
+      new THREE.BoxGeometry(BRIDGE_W, 0.09, BRIDGE_LEN / PLANKS - 0.04),
+      m(i % 3 === 1 ? 0xa86f43 : 0xd9a46c, 0.92, 0.02),
+      0,
+      0.045,
+      z,
+    );
+  }
+  // Stringers under the planks, and pilings dropping to the bed — the bridge
+  // has to LOOK like it is standing in water, not floating over a hole.
+  for (const sx of [-BRIDGE_W / 2 + 0.12, BRIDGE_W / 2 - 0.12]) {
+    place(new THREE.BoxGeometry(0.14, 0.14, BRIDGE_LEN), m(0x7f5230, 0.92, 0.02), sx, -0.04, 0);
+    for (let i = 0; i < 5; i++) {
+      const z = -BRIDGE_LEN / 2 + 0.6 + i * ((BRIDGE_LEN - 1.2) / 4);
+      place(new THREE.CylinderGeometry(0.09, 0.09, 1.3, 7), m(0x7f5230, 0.95, 0.02), sx, -0.7, z);
+    }
+    // Rope handrail on posts.
+    for (let i = 0; i < 5; i++) {
+      const z = -BRIDGE_LEN / 2 + 0.6 + i * ((BRIDGE_LEN - 1.2) / 4);
+      place(new THREE.BoxGeometry(0.09, 0.62, 0.09), m(0x8a5731, 0.92, 0.02), sx, 0.4, z);
+    }
+    place(new THREE.BoxGeometry(0.05, 0.05, BRIDGE_LEN - 1.0), m(0xd9a46c, 0.9, 0.02), sx, 0.68, 0);
+  }
+}
+
+// ── 🌊 The beach SEA ────────────────────────────────────────────────────────
+/**
+ * The Habbo beach (owner reference: "How To Make a Habbo Beach", Aaron66734):
+ * the room's floor IS sand, and the front corner of it is simply WATER — flat,
+ * at floor level, blue, with a jagged staircase shoreline made of whole tiles.
+ * No trench, no depth, no swimming: it is a floor pattern you cannot walk on,
+ * and that is exactly why it looks right in a room where the river did not.
+ *
+ * Sized from the room like the river was. The water fills the WEST-SOUTH
+ * corner: deepest along the west wall, running out to nothing about 40% of
+ * the way along the south wall. Both wall CENTRES stay dry so the default
+ * doors there keep a lane (the shoreline never comes within DOOR_KEEP of them).
+ * Tiles are decided once per room by one pure function, so the geometry you
+ * see and the tiles you cannot walk on are one shape.
+ */
+const SEA_DOOR_KEEP = 1.6; // metres round a door kept dry
+
+/** World positions of the room's doors — the stored layout; the four
+ *  defaults an UNSEEDED room renders (the doorDisplayName rule); and NONE
+ *  for a room whose owner deliberately removed every door (the
+ *  authoritative-empty marker — Copilot review, PR #169: those defaults
+ *  were reserving phantom doorways). */
+export function roomDoorPoints(): Array<{ x: number; z: number }> {
+  const stored = readAllDoorLayout();
+  const recs = stored.size > 0 ? stored : doorSetIsMarkedEmpty() ? new Map() : defaultDoorLayoutRecords();
+  const out: Array<{ x: number; z: number }> = [];
+  for (const r of recs.values()) {
+    const pose = poseFromWall(r.wall, r.lateral);
+    out.push({ x: pose.x, z: pose.z });
+  }
+  return out;
+}
+
+/**
+ * Which FRONT corner the sea fills: the one farther from the room's doors. A
+ * sea deepest against a wall that has a door in it would cut that door off
+ * (its dry lane ends up an island), so with the usual single door on the west
+ * wall the water goes south-EAST — the reference build mirrored, which reads
+ * exactly the same. Ties go west, like the reference.
+ */
+export function seaCorner(): "SW" | "SE" {
+  const { halfX, halfZ } = roomHalfExtents();
+  const doors = roomDoorPoints();
+  const clearance = (cx: number) =>
+    Math.min(...doors.map((d) => Math.hypot(d.x - cx, d.z - halfZ)), Infinity);
+  return clearance(halfX) > clearance(-halfX) + 0.01 ? "SE" : "SW";
+}
+
+/**
+ * World tile indices [i, j] (tile = [i, i+1) × [j, j+1)) that are water.
+ *
+ * The reference build's sea: a TRIANGLE in a front corner — deepest against
+ * the side wall, its straight diagonal shoreline running out along the front
+ * about 75% of the way across. One tile deeper per column: in isometric that
+ * pure diagonal IS the Habbo staircase (a random stagger was tried and only
+ * made islands and spikes). Any tile within SEA_DOOR_KEEP of a real door
+ * stays sand.
+ */
+export function seaWaterTiles(): Array<[number, number]> {
+  const { halfX, halfZ } = roomHalfExtents();
+  const cols = Math.round(halfX * 2);
+  const rows = Math.round(halfZ * 2);
+  const T = Math.min(rows - 1, Math.round(cols * 0.75)); // the diagonal's reach, in tiles
+  const east = seaCorner() === "SE";
+  const doors = roomDoorPoints();
+  const nearDoor = (cx: number, cz: number) =>
+    doors.some((d) => Math.hypot(d.x - cx, d.z - cz) < SEA_DOOR_KEEP);
+  const out: Array<[number, number]> = [];
+  for (let c = 0; c <= T; c++) {
+    // c counts columns in from the sea's own wall.
+    const i = east ? Math.round(halfX) - 1 - c : -Math.round(halfX) + c;
+    const depth = Math.max(0, Math.min(rows - 1, T - c));
+    for (let d = 0; d < depth; d++) {
+      const j = Math.round(halfZ) - 1 - d;
+      // A door's dry lane ends the COLUMN, not just the tile: skipping one
+      // tile and continuing left the tiles behind it stranded as islands of
+      // water with sand on every side.
+      if (nearDoor(i + 0.5, j + 0.5)) break;
+      out.push([i, j]);
+    }
+  }
+  // ONE body of water: keep only the tiles connected (edge to edge) to the
+  // corner tile. A door lane can cut the diagonal in two, and the tail beyond
+  // it was a puddle on the far side of a dry strip — not a sea.
+  const key = (i: number, j: number) => `${i},${j}`;
+  const all = new Map(out.map(([i, j]) => [key(i, j), [i, j] as [number, number]]));
+  const corner = key(east ? Math.round(halfX) - 1 : -Math.round(halfX), Math.round(halfZ) - 1);
+  if (!all.has(corner)) return [];
+  const seen = new Set<string>([corner]);
+  const queue = [corner];
+  while (queue.length) {
+    const [ci, cj] = all.get(queue.pop()!)!;
+    for (const [ni, nj] of [[ci + 1, cj], [ci - 1, cj], [ci, cj + 1], [ci, cj - 1]]) {
+      const k = key(ni, nj);
+      if (all.has(k) && !seen.has(k)) { seen.add(k); queue.push(k); }
+    }
+  }
+  return [...seen].map((k) => all.get(k)!);
+}
+
+/** The sea's blocked area: one box per horizontal RUN of water tiles. */
+function seaObstacleBoxes(): Box[] {
+  const rows = new Map<number, number[]>();
+  for (const [i, j] of seaWaterTiles()) rows.set(j, [...(rows.get(j) ?? []), i]);
+  const boxes: Box[] = [];
+  for (const [j, is] of rows) {
+    is.sort((a, b) => a - b);
+    let start = is[0];
+    let prev = is[0];
+    for (let k = 1; k <= is.length; k++) {
+      if (k < is.length && is[k] === prev + 1) { prev = is[k]; continue; }
+      boxes.push({ x0: start - 0.01, z0: j - 0.01, x1: prev + 1.01, z1: j + 1.01 });
+      if (k < is.length) { start = is[k]; prev = is[k]; }
+    }
+  }
+  return boxes;
+}
+
+function buildBeachSea(ctx: BuildCtx) {
+  const { m, place, itemId } = ctx;
+  const tiles = seaWaterTiles();
+  const set = new Set(tiles.map(([i, j]) => `${i},${j}`));
+  // The item sits wherever the layout put it; the sea is a ROOM feature, so
+  // subtract the item's own position to keep the tiles on the world grid.
+  const item = FURNITURE.find((f) => f.id === itemId);
+  const ox = item?.pos.x ?? 0;
+  const oz = item?.pos.z ?? 0;
+
+  // One flat mesh of tile quads, each its own shade — the pixel-noise the
+  // Habbo water tiles have, without a texture.
+  const pos: number[] = [];
+  const col: number[] = [];
+  const idx: number[] = [];
+  const SHADES = [[0.20, 0.55, 0.80], [0.24, 0.60, 0.85], [0.18, 0.52, 0.78], [0.27, 0.63, 0.88]];
+  let v = 0;
+  const quad = (x0: number, z0: number, x1: number, z1: number, y: number, c: number[]) => {
+    pos.push(x0 - ox, y, z0 - oz, x1 - ox, y, z0 - oz, x1 - ox, y, z1 - oz, x0 - ox, y, z1 - oz);
+    for (let k = 0; k < 4; k++) col.push(c[0], c[1], c[2]);
+    idx.push(v, v + 2, v + 1, v, v + 3, v + 2);
+    v += 4;
+  };
+  for (const [i, j] of tiles) {
+    const shade = SHADES[(((i * 7 + j * 13) % 4) + 4) % 4];
+    quad(i, j, i + 1, j + 1, 0.012, shade);
+    // Foam: a pale rim on every edge that meets sand.
+    const F = 0.16;
+    const foam = [0.87, 0.95, 0.98];
+    if (!set.has(`${i - 1},${j}`)) quad(i, j, i + F, j + 1, 0.016, foam);
+    if (!set.has(`${i + 1},${j}`)) quad(i + 1 - F, j, i + 1, j + 1, 0.016, foam);
+    if (!set.has(`${i},${j - 1}`)) quad(i, j, i + 1, j + F, 0.016, foam);
+    if (!set.has(`${i},${j + 1}`)) quad(i, j + 1 - F, i + 1, j + 1, 0.016, foam);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(col, 3));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const mat = m(0xffffff, 0.35, 0.05);
+  mat.vertexColors = true;
+  mat.side = THREE.DoubleSide;
+  place(g, mat, 0, 0, 0);
+}
+
+// ── 🏊 The infinity pool ─────────────────────────────────────────────────────
+/**
+ * A narrow pool along the FRONT EDGE of the room, built the way the party
+ * skill's reference builds its water: out of whole tiles, every tile a flat
+ * top at its own level with a vertical face wherever the neighbour is lower.
+ * That staircase of faces is where the solidity comes from — a smooth ribbon
+ * reads as a painted curve however it is terraced, a stepped one reads as a
+ * place cut into a block.
+ *
+ * INFINITY: the pool has no far bank. Its far edge IS the platform's front
+ * edge — the water runs past the floor's rim onto a spill shelf and a sheet
+ * of it drops away into space below. The near edge is a wet-sand step down
+ * (−0.16 m, the reference's wet level) to the water (−0.34 m), and that near
+ * shoreline wanders by a tile across the room so it is a shore, not a rule.
+ *
+ * Narrow and WINDING on purpose (owner rulings 2026-09-25): one tile of
+ * water widening to two at the bends in a 2×2 module, two-to-three in a 5×5,
+ * the near shore zigzagging every two or three tiles (2¼ waves). The steps
+ * are deeper than the reference's (wet −0.22, water −0.50) because with the
+ * pool this narrow the step faces ARE the solidity. No deep channel — the
+ * drop over the edge is the depth cue.
+ *
+ * Not a pool kind: you cannot swim in it (the reference's water is simply
+ * unwalkable), so nothing pins its surface to the swim plane. It does cut the
+ * floor — isFloorCutKind / floorCutOutlines — because the tiles are BELOW
+ * floor level.
+ *
+ * A ROOM feature like beach-sea: the tiles are decided by one pure function
+ * of the room (infinityPoolColumns), on the world grid, and the item's own
+ * position is subtracted out, so the geometry, the floor hole and the blocked
+ * tiles are one shape wherever the item is dropped. Doors keep a dry lane —
+ * a door on the front wall gets a landing tile cut out of the pool.
+ */
+const IP_LIP = 0.35; // the cut stops this short of a WALL (a hole touching the floor's edge is no hole — see poolHoleOutline)
+const IP_EDGE = 0.05; // …and this short of the open front edge: the same triangulator rule, but the water carries on over it
+const IP_SPILL = 0.45; // how far the water shelf reaches past the platform edge
+const IP_DROP = 1.0; // how far the spill sheet falls below it before it fades into the hull
+const IP_DOOR_KEEP = 1.5; // metres round a door kept dry (a hair under the sea's 1.6: a wet step one tile off a door lane is not in it)
+/** Tile top levels, metres below the floor — deeper than the reference's
+ *  0.16 / 0.34 so a one-tile pool still shows tall faces. */
+const IP_Y = { wet: -0.22, water: -0.5 } as const;
+export type InfinityPoolLevel = keyof typeof IP_Y;
+
+export interface InfinityPoolColumn {
+  i: number;
+  /** First and last row of the column that are pool (inclusive). */
+  top: number;
+  bot: number;
+  /** First water row; rows above it (down to `top`) are the wet step. */
+  w0: number;
+}
+
+/** Sizes, from the room. */
+export function infinityPoolMetrics(): {
+  cx: number;
+  cz: number;
+  cols: number;
+  rows: number;
+  waterW: number;
+  amp: number;
+  zBase: number;
+} {
+  const { halfX, halfZ } = roomHalfExtents();
+  const cx = Math.round(halfX);
+  const cz = Math.round(halfZ);
+  const cols = 2 * cx;
+  const rows = 2 * cz;
+  const waterW = rows >= 24 ? 2 : 1; // rows of water at the narrowest
+  const amp = 0.5; // the near shore steps in and out by one tile
+  // The near edge, continuous: at +amp the water is exactly waterW rows.
+  const zBase = cz - waterW - amp;
+  return { cx, cz, cols, rows, waterW, amp, zBase };
+}
+
+/** The continuous NEAR-EDGE line, world z for a world x. Nearest the edge
+ *  (narrowest) at the west wall, then in and out across the room — 2¼ waves,
+ *  so the rounded shore changes row every two or three tiles. */
+export function infinityPoolEdgeZ(x: number): number {
+  const mt = infinityPoolMetrics();
+  const t = (x + mt.cx) / mt.cols;
+  return mt.zBase + mt.amp * Math.cos(4.5 * Math.PI * t);
+}
+
+/**
+ * The pool, one column per tile of the room's width, every column running
+ * from its wet step to the front edge. Rows are the near-edge line rounded to
+ * the grid, so neighbouring columns step by whole tiles — the Habbo
+ * staircase. A door's dry lane trims a column from the end nearer the door
+ * (never out of its middle), and a column trimmed to nothing is simply
+ * absent, so a run of columns is always one connected body of water.
+ */
+export function infinityPoolColumns(): InfinityPoolColumn[] {
+  const mt = infinityPoolMetrics();
+  const doors = roomDoorPoints();
+  const out: InfinityPoolColumn[] = [];
+  for (let i = -mt.cx; i < mt.cx; i++) {
+    const w0 = Math.round(infinityPoolEdgeZ(i + 0.5));
+    let top = Math.max(-mt.cz, w0 - 1);
+    let bot = mt.cz - 1;
+    const nearDoor = (j: number) =>
+      doors.some((d) => Math.hypot(d.x - (i + 0.5), d.z - (j + 0.5)) < IP_DOOR_KEEP);
+    // Keep cutting from whichever end is nearer the offending tile until the
+    // column is clean — a door disc can only ever bite one contiguous chunk.
+    for (;;) {
+      let hit = -1;
+      for (let j = top; j <= bot; j++) if (nearDoor(j)) { hit = j; break; }
+      if (hit < 0) break;
+      if (hit - top <= bot - hit) top = hit + 1;
+      else bot = hit - 1;
+    }
+    // A door landing can eat a one-row column's only water; a wet step with
+    // nothing below it is not pool, so the column goes (the pool continues
+    // either side of the door).
+    if (top > bot || bot < w0) continue;
+    out.push({ i, top, bot, w0 });
+  }
+  return out;
+}
+
+export function infinityPoolLevel(c: InfinityPoolColumn, j: number): InfinityPoolLevel {
+  return j < c.w0 ? "wet" : "water";
+}
+
+/** A tile's world rectangle — a whole tile, except that tiles against a wall
+ *  stop IP_LIP short of it and tiles on the front edge stop IP_EDGE short. */
+function infinityPoolRect(i: number, j: number): Box {
+  const { cx, cz } = infinityPoolMetrics();
+  return {
+    x0: i === -cx ? i + IP_LIP : i,
+    x1: i === cx - 1 ? i + 1 - IP_LIP : i + 1,
+    z0: j === -cz ? j + IP_LIP : j,
+    z1: j === cz - 1 ? j + 1 - IP_EDGE : j + 1,
+  };
+}
+
+/** Every pool tile, keyed "i,j". */
+export function infinityPoolTiles(): Map<string, { i: number; j: number; level: InfinityPoolLevel }> {
+  const tiles = new Map<string, { i: number; j: number; level: InfinityPoolLevel }>();
+  for (const c of infinityPoolColumns()) {
+    for (let j = c.top; j <= c.bot; j++) tiles.set(`${c.i},${j}`, { i: c.i, j, level: infinityPoolLevel(c, j) });
+  }
+  return tiles;
+}
+
+/**
+ * The floor hole(s): one rectilinear polygon per run of consecutive columns,
+ * down the near bank and back along the far one. Strictly inside the floor's
+ * outer ring (infinityPoolRect's lip), which the triangulator requires.
+ */
+export function infinityPoolOutlines(): Array<Array<{ x: number; z: number }>> {
+  const polys: Array<Array<{ x: number; z: number }>> = [];
+  let run: InfinityPoolColumn[] = [];
+  const flush = () => {
+    if (run.length === 0) return;
+    const near: Array<{ x: number; z: number }> = [];
+    const far: Array<{ x: number; z: number }> = [];
+    for (const c of run) {
+      const rt = infinityPoolRect(c.i, c.top);
+      const rb = infinityPoolRect(c.i, c.bot);
+      near.push({ x: rt.x0, z: rt.z0 }, { x: rt.x1, z: rt.z0 });
+      far.push({ x: rb.x0, z: rb.z1 }, { x: rb.x1, z: rb.z1 });
+    }
+    const ring = [...near, ...far.reverse()];
+    // Drop consecutive duplicates (adjacent columns at the same row share a point).
+    const poly = ring.filter((p, k) => k === 0 || p.x !== ring[k - 1].x || p.z !== ring[k - 1].z);
+    polys.push(poly);
+    run = [];
+  };
+  for (const c of infinityPoolColumns()) {
+    if (run.length > 0 && c.i !== run[run.length - 1].i + 1) flush();
+    run.push(c);
+  }
+  flush();
+  return polys;
+}
+
+/** A plank bridge's world AABB (bridges are cardinal, so it is one). */
+function bridgeWorldBox(bridge: FurnitureItem, len: number): Box {
+  const c = rotXZ(BRIDGE_W / 2, len / 2, bridge.rot);
+  return {
+    x0: bridge.pos.x - Math.abs(c.x),
+    z0: bridge.pos.z - Math.abs(c.z),
+    x1: bridge.pos.x + Math.abs(c.x),
+    z1: bridge.pos.z + Math.abs(c.z),
+  };
+}
+
+/**
+ * The tile river's blocked area: one box per column (water AND wet shelf —
+ * the shelf is 16 cm below a floor the engine walks flat), cut by any plank
+ * bridge crossing it. Same split-then-subtract as riverObstacleBoxes, on
+ * world tiles instead of local strips.
+ */
+function infinityPoolObstacleBoxes(all: FurnitureItem[]): Box[] {
+  const boxes: Box[] = [];
+  const len = bridgeLenFor(all);
+  const bridges = all.filter((b) => b.kind === "plank-bridge").map((b) => bridgeWorldBox(b, len));
+  const SEAM = 0.01;
+  for (const c of infinityPoolColumns()) {
+    const rt = infinityPoolRect(c.i, c.top);
+    const rb = infinityPoolRect(c.i, c.bot);
+    const cx0 = rt.x0;
+    const cx1 = rt.x1;
+    const xEdges = new Set<number>([cx0, cx1]);
+    for (const b of bridges) {
+      if (b.x0 > cx0 && b.x0 < cx1) xEdges.add(b.x0);
+      if (b.x1 > cx0 && b.x1 < cx1) xEdges.add(b.x1);
+    }
+    const xs = [...xEdges].sort((a, b) => a - b);
+    for (let k = 0; k < xs.length - 1; k++) {
+      const sx0 = xs[k];
+      const sx1 = xs[k + 1];
+      if (sx1 - sx0 < 1e-6) continue;
+      const mid = (sx0 + sx1) / 2;
+      const spans = [{ z0: rt.z0, z1: rb.z1 }];
+      for (const b of bridges) {
+        if (mid <= b.x0 || mid >= b.x1) continue;
+        for (let s = spans.length - 1; s >= 0; s--) {
+          const sp = spans[s];
+          if (b.z1 <= sp.z0 || b.z0 >= sp.z1) continue;
+          spans.splice(s, 1);
+          if (b.z0 > sp.z0) spans.push({ z0: sp.z0, z1: b.z0 });
+          if (b.z1 < sp.z1) spans.push({ z0: b.z1, z1: sp.z1 });
+        }
+      }
+      for (const sp of spans) {
+        if (sp.z1 - sp.z0 < 0.05) continue;
+        boxes.push({ x0: sx0 - SEAM, z0: sp.z0 - SEAM, x1: sx1 + SEAM, z1: sp.z1 + SEAM });
+      }
+    }
+  }
+  return boxes;
+}
+
+function buildInfinityPool(ctx: BuildCtx) {
+  const { m, place, itemId } = ctx;
+  const item = FURNITURE.find((f) => f.id === itemId);
+  const ox = item?.pos.x ?? 0;
+  const oz = item?.pos.z ?? 0;
+  const mt = infinityPoolMetrics();
+  const tiles = infinityPoolTiles();
+
+  // The reference palette: its WATER, and its white-sand tones for the bank
+  // faces and the wet step (the room's beach floor is that same #fbf7ee —
+  // world.ts makeSandFloorTex). Wet sand is darker than dry, and a bank face
+  // is the floor in shadow. [top, ±x, ±z].
+  const SAND_FACE = [0xebe3d2, 0xd4c9b2];
+  const WET = [0xe4dac4, 0xd6cbb3, 0xbcae94];
+  const WATER_FACE = [0x2b8fa2, 0x21707f];
+  const SPILL = [0x2b8fa2, 0x141a26]; // the falling sheet: water at the lip, fading into the platform's own dark
+  const CAP = 0x141a26; // the platform's own dark, where the cut meets a wall
+
+  type Buf = { pos: number[]; col: number[]; idx: number[]; v: number };
+  const terrain: Buf = { pos: [], col: [], idx: [], v: 0 };
+  const water: Buf = { pos: [], col: [], idx: [], v: 0 };
+  const tmp = new THREE.Color();
+  const quad = (
+    b: Buf,
+    p: [number, number, number, number, number, number, number, number, number, number, number, number],
+    color: number,
+  ): number => {
+    const start = b.v;
+    for (let k = 0; k < 12; k += 3) b.pos.push(p[k] - ox, p[k + 1], p[k + 2] - oz);
+    tmp.setHex(color);
+    for (let k = 0; k < 4; k++) b.col.push(tmp.r, tmp.g, tmp.b);
+    b.idx.push(start, start + 2, start + 1, start, start + 3, start + 2);
+    b.v += 4;
+    return start;
+  };
+  const top = (b: Buf, r: Box, y: number, color: number) =>
+    quad(b, [r.x0, y, r.z0, r.x1, y, r.z0, r.x1, y, r.z1, r.x0, y, r.z1], color);
+  // A vertical face along one edge of a tile, from yTop down to yBot.
+  const face = (b: Buf, r: Box, side: "x0" | "x1" | "z0" | "z1", yTop: number, yBot: number, color: number) => {
+    if (side === "x0" || side === "x1") {
+      const x = r[side];
+      quad(b, [x, yTop, r.z0, x, yTop, r.z1, x, yBot, r.z1, x, yBot, r.z0], color);
+    } else {
+      const z = r[side];
+      quad(b, [r.x0, yTop, z, r.x1, yTop, z, r.x1, yBot, z, r.x0, yBot, z], color);
+    }
+  };
+
+  // Water tops are repainted every frame (the travelling light bands and the
+  // foam wash), so remember where each one's four vertices start.
+  const live: Array<{ start: number; i: number; j: number; foam: boolean }> = [];
+  const DIRS: Array<[number, number, "x0" | "x1" | "z0" | "z1"]> = [
+    [1, 0, "x1"],
+    [-1, 0, "x0"],
+    [0, 1, "z1"],
+    [0, -1, "z0"],
+  ];
+  for (const t of tiles.values()) {
+    const r = infinityPoolRect(t.i, t.j);
+    const y = IP_Y[t.level];
+    const isWater = t.level === "water";
+    const buf = isWater ? water : terrain;
+    // 🌊 On the front edge the water does not stop at the cut: its top runs
+    // on over the floor's rim and past the platform edge — the infinity lip.
+    const onEdge = isWater && t.j === mt.cz - 1;
+    const rTop = onEdge ? { ...r, z1: mt.cz + IP_SPILL } : r;
+    const start = top(buf, rTop, y, isWater ? 0x3fb3c6 : WET[0]);
+    let foam = false;
+    for (const [di, dj, side] of DIRS) {
+      const n = tiles.get(`${t.i + di},${t.j + dj}`);
+      const alongX = side === "x0" || side === "x1";
+      if (!n) {
+        const pastFront = t.j + dj >= mt.cz;
+        if (pastFront && isWater) {
+          // The sheet falling off the shelf's outer edge, into space.
+          const zs = mt.cz + IP_SPILL;
+          const mid = y - IP_DROP * 0.35;
+          quad(water, [r.x0, y, zs, r.x1, y, zs, r.x1, mid, zs, r.x0, mid, zs], SPILL[0]);
+          quad(water, [r.x0, mid, zs, r.x1, mid, zs, r.x1, y - IP_DROP, zs, r.x0, y - IP_DROP, zs], SPILL[1]);
+          foam = true;
+          continue;
+        }
+        const outside =
+          t.i + di < -mt.cx || t.i + di >= mt.cx || t.j + dj < -mt.cz || pastFront;
+        // Sand at floor level next door: the bank's own face, down to this
+        // tile. At a wall it is the cut's end, closed in the platform's dark.
+        face(terrain, r, side, 0, y, outside ? CAP : SAND_FACE[alongX ? 0 : 1]);
+        if (isWater) foam = true;
+        continue;
+      }
+      const ny = IP_Y[n.level];
+      if (ny < y) {
+        // The neighbour is a step down: this tile's face, in its own colour.
+        const cols = t.level === "wet" ? [WET[1], WET[2]] : WATER_FACE;
+        face(buf, r, side, y, ny, cols[alongX ? 0 : 1]);
+      } else if (n.level === "wet" && isWater) {
+        foam = true;
+      }
+    }
+    // The shelf's own end faces where the edge row stops (a door landing, a wall).
+    if (onEdge) {
+      for (const [di, side] of [[1, "x1"], [-1, "x0"]] as const) {
+        const n = tiles.get(`${t.i + di},${t.j}`);
+        if (!n || n.level !== "water") {
+          const x = r[side];
+          quad(water, [x, y, mt.cz - IP_EDGE, x, y, mt.cz + IP_SPILL, x, y - 0.12, mt.cz + IP_SPILL, x, y - 0.12, mt.cz - IP_EDGE], WATER_FACE[0]);
+        }
+      }
+    }
+    if (isWater) live.push({ start, i: t.i, j: t.j, foam });
+  }
+
+  const mesh = (b: Buf, mat: THREE.MeshStandardMaterial | THREE.MeshBasicMaterial): THREE.Mesh => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
+    g.setAttribute("color", new THREE.Float32BufferAttribute(b.col, 3));
+    g.setIndex(b.idx);
+    g.computeVertexNormals();
+    mat.vertexColors = true;
+    mat.side = THREE.DoubleSide;
+    return place(g, mat, 0, 0, 0);
+  };
+  // The sand is lit like the floor it belongs to. The WATER is unlit: the
+  // reference's tiles are flat fills whose faces are pre-shaded (a darker
+  // colour per face, not a light), and under the room's sun a lit teal
+  // washed out to sky-white.
+  mesh(terrain, m(0xffffff, 0.95, 0.0));
+  const waterFlat = ctx.flat(0xffffff);
+  waterFlat.toneMapped = false; // the reference's exact fills, not the scene's curve
+  const waterMesh = mesh(water, waterFlat);
+  const waterCol = waterMesh.geometry.getAttribute("color") as THREE.BufferAttribute;
+
+  // ── 🌊 The current: short pale streaks drifting downstream (east → west)
+  //    along the centre line, each riding the surface of the tile under it.
+  const STREAK_LEN = 0.7;
+  const streakMat = m(0xffffff, 0.4, 0.0, 0xffffff, 0.4);
+  streakMat.transparent = true;
+  streakMat.opacity = 0.34;
+  streakMat.userData.baseOpacity = 0.34;
+  const xMin = -mt.cx + IP_LIP + STREAK_LEN / 2;
+  const xMax = mt.cx - IP_LIP - STREAK_LEN / 2;
+  const count = mt.cols * 2;
+  const streaks: THREE.Mesh[] = [];
+  const sx: number[] = [];
+  const sOff: number[] = [];
+  const offMax = Math.max(0.1, mt.waterW / 2 - 0.55);
+  for (let k = 0; k < count; k++) {
+    streaks.push(place(new THREE.BoxGeometry(STREAK_LEN, 0.008, 0.06), streakMat, 0, IP_Y.water, 0));
+    sx.push(xMin + (k / count) * (xMax - xMin));
+    sOff.push((Math.random() * 2 - 1) * offMax);
+  }
+
+  let time = 0;
+  const anim: PropAnimHandle = {
+    update(dt: number) {
+      time += dt;
+      // Light bands travelling downstream: phase advances along x, the
+      // stream's axis (the reference's x−y), and every tile keeps its own
+      // pixel-noise offset. Bank tiles get the foam wash pulsing over them.
+      for (const w of live) {
+        const k = Math.sin(w.i * 0.8 + w.j * 0.3 + time / 0.52) * 0.5 + 0.5;
+        const noise = ((w.i * 7 + w.j * 13) % 4) * 0.008;
+        const l = 0.34 + (10 + k * 16) * 0.005;
+        // Foam: the reference lays a 34 % ± 20 % white wash over bank tiles.
+        // Done as sRGB LIGHTNESS, not a lerp of the stored linear colour —
+        // that lerp is perceptually huge and turned the whole river sky-white.
+        const foam = w.foam ? 0.07 + Math.sin(time / 0.62 + w.i * 0.5) * 0.04 : 0;
+        // The reference's hsl() is an sRGB colour; say so, or setHSL writes
+        // it as linear and the output conversion lifts the whole river to sky.
+        tmp.setHSL(188 / 360, 0.52, l + noise + foam, THREE.SRGBColorSpace);
+        for (let v = 0; v < 4; v++) waterCol.setXYZ(w.start + v, tmp.r, tmp.g, tmp.b);
+      }
+      waterCol.needsUpdate = true;
+
+      for (let k = 0; k < count; k++) {
+        // Mid-stream runs faster than the edges.
+        const speed = 0.75 - 0.3 * (Math.abs(sOff[k]) / Math.max(offMax, 0.1));
+        sx[k] -= speed * dt;
+        if (sx[k] < xMin) sx[k] += xMax - xMin;
+        const x = sx[k];
+        // Down the middle of the water: between the near edge and the front.
+        const z = (infinityPoolEdgeZ(x) + mt.cz) / 2 + sOff[k];
+        const under = tiles.get(`${Math.floor(x)},${Math.floor(z)}`);
+        const s = streaks[k];
+        if (!under || under.level === "wet") {
+          s.visible = false;
+          continue;
+        }
+        s.visible = true;
+        s.position.set(x - ox, IP_Y.water + 0.012, z - oz);
+        const slope = -mt.amp * ((2.5 * Math.PI) / mt.cols) * Math.sin((2.5 * Math.PI * (x + mt.cx)) / mt.cols);
+        s.rotation.y = -Math.atan(slope);
+      }
+    },
+  };
+  waterMesh.userData.propAnim = anim;
+}
+
+/**
+ * 🌹 Tall yellow climbing rose — a wall decoration (owner request 2026-09-25,
+ * reference: yellow jessamine cascading off a pergola).
+ *
+ * Wall-mounted in the terminal's frame: the item's origin sits on the wall's
+ * flush-mount plane and local +z faces into the room, so everything here is
+ * built in z ≥ 0 and the wall is at the back. A wooden beam runs along the
+ * wall near the top; canes climb it from the foot, and from it a curtain of
+ * trailing strands drapes down, each hung with small five-petal yellow
+ * blossoms and dense leaves — the mass the reference has, not a sparse
+ * trellis. 1 m wide, 4.7 m tall against a 4 m wall — its crest spills over the top. Leaves, petals and flower
+ * centres are one InstancedMesh (≈2 000 instances, one draw call); the
+ * layout is seeded from the item id, so a row of these differs plant to
+ * plant but agrees on every client.
+ */
+function buildClimbingRose(ctx: BuildCtx) {
+  const { m, place, attach, itemId } = ctx;
+  const H = 4.7; // taller than the 4 m wall (owner ruling 2026-09-25): the beam sits on the wall's top and the crest spills over it
+  const W = 1.0;
+  const WOOD = 0x8a6a45;
+  const CANE = 0x4a7a3e;
+  const CANE_D = 0x35602e;
+  const LEAF = [0x3e8e4c, 0x54b062, 0x2f7a3e, 0x6cc070] as const;
+  const PETAL = [0xffd400, 0xffe14a, 0xffc61a, 0xfff08a] as const;
+  const CENTRE = 0xc98a12;
+  let seed = idHash01(itemId) * 1000;
+  const rnd = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+  const Z0 = 0.05;
+
+  // ── The beam the climber has taken over, and a pair of brackets.
+  const BEAM_Y = 4.05; // resting on the wall top
+  place(new THREE.BoxGeometry(W + 0.1, 0.09, 0.14), m(WOOD, 0.9, 0.05), 0, BEAM_Y, Z0 + 0.07);
+  for (const x of [-W / 2 + 0.06, W / 2 - 0.06]) {
+    place(new THREE.BoxGeometry(0.05, 0.05, 0.16), m(WOOD, 0.9, 0.05), x, BEAM_Y - 0.07, Z0 + 0.08);
+  }
+
+  // ── Wood: polylines drawn as short cylinders; every node remembered so the
+  //    foliage sits on the stems. Canes climb from the foot to the beam;
+  //    strands hang from the beam and sway a little as they fall.
+  type Pt = { x: number; y: number; z: number };
+  const nodes: Array<Pt & { hang: boolean }> = [];
+  const stem = (pts: Pt[], r: number, hang: boolean) => {
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dy, dz);
+      const seg = place(
+        new THREE.CylinderGeometry(r * 0.9, r, len + 0.01, 5),
+        m(i % 3 === 2 ? CANE_D : CANE, 0.85, 0.0),
+        (a.x + b.x) / 2,
+        (a.y + b.y) / 2,
+        (a.z + b.z) / 2,
+      );
+      // Orient the cylinder's +y along the segment.
+      seg.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(dx, dy, dz).normalize());
+      nodes.push({ ...b, hang });
+    }
+  };
+  // Three climbing canes, wandering up to the beam.
+  for (const [x0, drift] of [[-0.32, 0.12], [0.02, -0.04], [0.3, -0.14]] as const) {
+    const pts: Pt[] = [{ x: x0, y: 0.02, z: Z0 + 0.05 }];
+    let x: number = x0;
+    let dir = Math.PI / 2 + drift;
+    for (let y = 0.02; y < BEAM_Y - 0.1; ) {
+      dir += (rnd() - 0.5) * 0.5 + (Math.abs(x) > W / 2 - 0.1 ? (x > 0 ? 0.3 : -0.3) : 0);
+      x = Math.max(-W / 2 + 0.05, Math.min(W / 2 - 0.05, x + Math.cos(dir) * 0.24));
+      y += Math.max(0.1, Math.sin(dir) * 0.24);
+      pts.push({ x, y, z: Z0 + 0.05 + (rnd() - 0.5) * 0.03 });
+    }
+    stem(pts, 0.022, false);
+  }
+  // The curtain: strands from along the beam, hanging to varying depths and
+  // swinging out from the wall a little — the longest in the middle.
+  const STRANDS = 16;
+  for (let k = 0; k < STRANDS; k++) {
+    const x0 = -W / 2 + 0.05 + (k + 0.5) * ((W - 0.1) / STRANDS) + (rnd() - 0.5) * 0.04;
+    const mid = 1 - Math.abs((k + 0.5) / STRANDS - 0.5) * 2; // 1 in the middle, 0 at the ends
+    const len = 0.7 + mid * 1.2 + rnd() * 0.7;
+    const pts: Pt[] = [{ x: x0, y: BEAM_Y - 0.03, z: Z0 + 0.1 }];
+    const sway = (rnd() - 0.5) * 0.35;
+    const out = 0.12 + rnd() * 0.2;
+    const n = Math.max(3, Math.round(len / 0.2));
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      pts.push({
+        x: x0 + Math.sin(t * Math.PI) * sway + (rnd() - 0.5) * 0.03,
+        y: BEAM_Y - 0.03 - t * len,
+        z: Z0 + 0.1 + Math.sin(t * Math.PI * 0.5) * out,
+      });
+    }
+    stem(pts, 0.012, true);
+  }
+
+  // ── Leaves and blossoms, as instances.
+  type Inst = { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3; c: number };
+  const inst: Inst[] = [];
+  const UP = new THREE.Vector3(0, 1, 0);
+  const put = (p: THREE.Vector3, q: THREE.Quaternion, s: THREE.Vector3, c: number) => inst.push({ p, q, s, c });
+  const leaf = (at: Pt, size: number, hang: boolean) => {
+    // Lance-shaped, pointing away from the stem; hanging strands' leaves droop.
+    const a = hang ? Math.PI + (rnd() - 0.5) * 1.6 : rnd() * Math.PI * 2;
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), a)
+      .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), (rnd() - 0.5) * 0.9));
+    const off = new THREE.Vector3(0, size * 0.7, 0).applyQuaternion(q);
+    put(new THREE.Vector3(at.x, at.y, at.z + 0.015).add(off), q, new THREE.Vector3(size * 0.3, size * 0.7, size * 0.07), LEAF[Math.floor(rnd() * LEAF.length)]);
+  };
+  const blossom = (at: Pt, r: number, colour: number) => {
+    // Small, flat, five-petalled, facing out into the room with a tilt.
+    const n = new THREE.Vector3((rnd() - 0.5) * 0.8, (rnd() - 0.5) * 0.8 - 0.1, 1).normalize();
+    const qN = new THREE.Quaternion().setFromUnitVectors(UP, n);
+    const centre = new THREE.Vector3(at.x, at.y, at.z + r * 0.3);
+    const phase = rnd() * Math.PI * 2;
+    for (let k = 0; k < 5; k++) {
+      const a = phase + (k / 5) * Math.PI * 2;
+      const q = qN.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, -a))
+        .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -0.3));
+      const off = new THREE.Vector3(Math.cos(a) * r * 0.5, r * 0.06, Math.sin(a) * r * 0.5).applyQuaternion(qN);
+      put(centre.clone().add(off), q, new THREE.Vector3(r * 0.58, r * 0.12, r * 0.4), colour);
+    }
+    put(centre.clone().add(n.clone().multiplyScalar(r * 0.1)), qN, new THREE.Vector3(r * 0.2, r * 0.14, r * 0.2), CENTRE);
+  };
+  for (const nd of nodes) {
+    const leaves = nd.hang ? 3 : 2;
+    for (let k = 0; k < leaves; k++) {
+      leaf({ x: nd.x + (rnd() - 0.5) * 0.06, y: nd.y + (rnd() - 0.5) * 0.12, z: nd.z }, 0.09 + rnd() * 0.04, nd.hang);
+    }
+    // Blossoms: thick along the hanging strands, a few on the climbing canes.
+    const count = nd.hang ? (rnd() < 0.75 ? 2 : 1) : (rnd() < 0.3 ? 1 : 0);
+    for (let k = 0; k < count; k++) {
+      blossom({ x: nd.x + (rnd() - 0.5) * 0.1, y: nd.y + (rnd() - 0.5) * 0.14, z: nd.z + rnd() * 0.03 }, 0.032 + rnd() * 0.018, PETAL[Math.floor(rnd() * PETAL.length)]);
+    }
+  }
+  // The crest: foliage and bloom heaped over the beam and the wall's top,
+  // up to H — the plant has grown over the wall, not stopped at it.
+  for (let k = 0; k < 110; k++) {
+    const t = rnd();
+    const at = { x: (rnd() - 0.5) * (W + 0.2), y: BEAM_Y + 0.05 + t * (H - BEAM_Y - 0.1), z: Z0 - 0.1 + rnd() * 0.32 };
+    leaf(at, 0.1 + rnd() * 0.05, false);
+    if (rnd() < 0.55) blossom(at, 0.035 + rnd() * 0.018, PETAL[k % PETAL.length]);
+  }
+
+  const geo = new THREE.SphereGeometry(1, 7, 5);
+  const mat = m(0xffffff, 0.8, 0.0);
+  const mesh = new THREE.InstancedMesh(geo, mat, inst.length);
+  const mtx = new THREE.Matrix4();
+  const col = new THREE.Color();
+  inst.forEach((it, i) => {
+    mtx.compose(it.p, it.q, it.s);
+    mesh.setMatrixAt(i, mtx);
+    mesh.setColorAt(i, col.setHex(it.c));
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.name = "roseFoliage";
+  attach(mesh);
+}
+
+/**
+ * 🏝️ Thatched tiki parasol with a string of party bulbs round the brim — the
+ * parasol the reference build uses at every corner. 1×1, 2.4 m.
+ */
+function buildTikiParasol({ m, place }: BuildCtx) {
+  const THATCH = 0xb9924a;
+  const THATCH_D = 0x8f6b30;
+  place(new THREE.CylinderGeometry(0.04, 0.05, 2.2, 8), m(0x6d4d31, 0.9, 0.05), 0, 1.1, 0);
+  place(new THREE.CylinderGeometry(0.16, 0.2, 0.08, 10), m(0x6d4d31, 0.9, 0.05), 0, 0.04, 0);
+  // Two stacked straw cones, the lower ragged at the hem.
+  place(new THREE.ConeGeometry(1.05, 0.55, 12), m(THATCH, 0.95, 0.0), 0, 2.02, 0);
+  place(new THREE.ConeGeometry(0.62, 0.42, 12), m(THATCH_D, 0.95, 0.0), 0, 2.36, 0);
+  for (let i = 0; i < 12; i++) {
+    const a = (i / 12) * Math.PI * 2;
+    place(new THREE.BoxGeometry(0.16, 0.14, 0.05), m(i % 2 ? THATCH : THATCH_D, 0.95, 0.0), Math.cos(a) * 1.0, 1.72, Math.sin(a) * 1.0).rotation.y = -a;
+  }
+  // The bulbs: alternating green / yellow / pink round the brim, each lit.
+  const BULB = [0x7cff5a, 0xffe14a, 0xff7ad9] as const;
+  for (let i = 0; i < 10; i++) {
+    const a = (i / 10) * Math.PI * 2 + 0.2;
+    const c = BULB[i % 3];
+    place(new THREE.SphereGeometry(0.045, 7, 7), m(c, 0.3, 0.0, c, 1.6), Math.cos(a) * 1.02, 1.64, Math.sin(a) * 1.02);
+  }
+}
+
+/**
+ * 🌿 Jungle plant — the reference build's hedge plant: a TALL, DENSE mass of
+ * dark tropical foliage. In the video it reads as one solid dark-green shape
+ * with a ragged, frond-tipped outline — never as stems and separate blades
+ * (a spiky, see-through version was tried and looked like agave). So this is
+ * built as VOLUME first: three tiers of overlapping leaf pads make a solid
+ * silhouette, and only then do fronds fan out of the crown for the ragged
+ * top. 1×1, 5.4 m (owner spec), a per-instance twist so a row is not clones.
+ */
+function buildJunglePlant({ m, place, itemId }: BuildCtx) {
+  const H = 5.4;
+  const DARK = 0x184a2b; // the mass
+  const MID = 0x1f5e33; // pads catching light
+  const LIGHT = 0x2a7040; // frond tips
+  const twist = idHash01(itemId) * Math.PI * 2;
+
+  // A short dark base so the mass sits on the ground rather than floating.
+  place(new THREE.CylinderGeometry(0.22, 0.3, 0.9, 8), m(0x2b3d1f, 0.95, 0.0), 0, 0.45, 0);
+
+  // ── The mass: tiers of squashed spheres, each tier a ring of pads round a
+  //    core, tiers wider toward the middle and narrower at the top — the
+  //    bushy pear silhouette the reference has.
+  const tiers: Array<[number, number, number]> = [
+    // [height, ring radius, pad radius]
+    [1.5, 0.42, 0.62],
+    [2.5, 0.5, 0.66],
+    [3.5, 0.46, 0.62],
+    [4.4, 0.34, 0.54],
+    [5.0, 0.18, 0.42],
+  ];
+  tiers.forEach(([y, ring, r], t) => {
+    const n = t === tiers.length - 1 ? 4 : 6;
+    const core = place(new THREE.SphereGeometry(r * 1.05, 9, 7), m(DARK, 0.95, 0.0), 0, y, 0);
+    core.scale.set(1, 0.7, 1);
+    for (let i = 0; i < n; i++) {
+      const a = twist + t * 0.5 + (i / n) * Math.PI * 2;
+      const pad = place(
+        new THREE.SphereGeometry(r, 8, 6),
+        m(i % 2 ? DARK : MID, 0.95, 0.0),
+        Math.cos(a) * ring,
+        y + (i % 2 ? -0.08 : 0.08),
+        Math.sin(a) * ring,
+      );
+      pad.scale.set(1, 0.62, 1);
+    }
+  });
+
+  // ── The ragged outline: wide fronds fanning out of every tier's rim, up and
+  //    outward, longest at the crown — this is what stops the mass reading as
+  //    a topiary ball.
+  const frond = (y: number, ring: number, len: number, tilt: number, count: number, phase: number) => {
+    for (let i = 0; i < count; i++) {
+      const a = twist + phase + (i / count) * Math.PI * 2;
+      const f = place(
+        new THREE.ConeGeometry(0.26, len, 4),
+        m(i % 3 === 0 ? LIGHT : MID, 0.9, 0.0),
+        Math.cos(a) * (ring + Math.sin(tilt) * len * 0.45),
+        y + Math.cos(tilt) * len * 0.45,
+        Math.sin(a) * (ring + Math.sin(tilt) * len * 0.45),
+      );
+      f.rotation.order = "YXZ";
+      f.rotation.y = -a;
+      f.rotation.z = -tilt;
+      f.scale.set(1, 1, 0.18); // a wide flat blade
+    }
+  };
+  frond(2.2, 0.9, 1.5, 1.25, 7, 0.2); // low skirt, hanging outward
+  frond(3.4, 0.9, 1.6, 0.95, 8, 0.6);
+  frond(4.4, 0.75, 1.7, 0.6, 8, 1.0);
+  frond(H - 0.4, 0.45, 1.6, 0.28, 7, 1.4); // crown, reaching up: the H tips
+}
+
+/** 🛶 Inflatable raft — yellow, non-solid, meant to sit ON the water. */
+function buildBeachRaft({ m, place }: BuildCtx) {
+  const RUB = 0xf2c94c;
+  const RUB_D = 0xd9a92e;
+  const ring = place(new THREE.TorusGeometry(0.62, 0.2, 8, 18), m(RUB, 0.6, 0.02), 0, 0.2, 0);
+  ring.scale.set(1, 1, 0.72);
+  ring.rotation.x = Math.PI / 2;
+  place(new THREE.BoxGeometry(0.95, 0.06, 0.62), m(RUB_D, 0.7, 0.02), 0, 0.1, 0);
+  for (const sx of [-0.55, 0.55]) {
+    const oar = place(new THREE.BoxGeometry(1.1, 0.04, 0.05), m(0x8a5731, 0.9, 0.02), sx, 0.42, 0.28);
+    oar.rotation.z = sx < 0 ? 0.35 : -0.35;
+    oar.rotation.y = 0.5;
+  }
+}
+
+// ── 🏝️ Beach fixtures ───────────────────────────────────────────────────────
+// A voxel port of the beach set the party skill ships as a canvas-2D reference
+// room. The DRAW CODE does not transfer — that file paints iso diamonds, this
+// engine has a depth buffer — but the inventory, the footprints, the heights
+// and the palette do, and they are what make the room read as that beach. Sizes
+// below are the reference's `size`/`height` verbatim, in tiles and metres.
+//
+// The one substitution: the reference's winding RIVER is terrain, and terrain
+// here is flat. The station's own `lazy-pool` is already a sunken bezier river
+// with a central island, real swimming and infinity edges, so it plays the
+// river's part and these props dress the banks around it.
+
+const BCH_SAND = 0xfbf7ee; // white beach sand
+const BCH_CREAM = 0xfdf3e0;
+const BCH_SKY = 0x8fd3f4; // the bar counter's own colour
+const BCH_CORAL = 0xe8604c;
+const BCH_TEAK = 0xa8683f;
+const BCH_TRUNK = 0xa37a55;
+const BCH_TRUNK_D = 0x6d4d31;
+const BCH_FROND = 0x4fae76;
+const BCH_FROND_D = 0x37905d;
+const BCH_METAL = 0xdfe6e6;
+const BCH_TEAL = 0x4fb8c9;
+const BCH_MINT = 0x7fd1c4;
+
+/** Slats and canopies that should read as airy rather than solid. The reveal
+ *  machinery restores `baseOpacity`, so a translucent part must record it or
+ *  the morph-in snaps it back to fully opaque. */
+function translucent(mat: THREE.MeshStandardMaterial, opacity: number): THREE.MeshStandardMaterial {
+  mat.transparent = true;
+  mat.opacity = opacity;
+  mat.userData.baseOpacity = opacity;
+  return mat;
+}
+
+/**
+ * 🌴 Palm tree — 1×1, 3.2 m. The reference leans its trunk on a quadratic and
+ * fans SEVEN fronds of alternating green at the top; both are what stop a palm
+ * reading as a lamp post, so both are here as a stack of tapered segments and
+ * seven drooping blades.
+ */
+function buildPalmTree({ m, place }: BuildCtx) {
+  const H = 3.0;
+  const SEGS = 7;
+  const LEAN = 0.42; // total horizontal drift of the crown, on a quadratic
+  let prev = new THREE.Vector3(0, 0, 0);
+  for (let i = 1; i <= SEGS; i++) {
+    const t = i / SEGS;
+    const next = new THREE.Vector3(-LEAN * t * t, H * t, 0);
+    const mid = prev.clone().add(next).multiplyScalar(0.5);
+    const len = prev.distanceTo(next);
+    const seg = place(
+      new THREE.CylinderGeometry(0.085 - 0.04 * t, 0.10 - 0.04 * (t - 1 / SEGS), len, 9),
+      m(i % 2 ? BCH_TRUNK : BCH_TRUNK_D, 0.9, 0.02),
+      mid.x,
+      mid.y,
+      mid.z,
+    );
+    seg.rotation.z = Math.atan2(next.x - prev.x, next.y - prev.y) * -1;
+    prev = next;
+  }
+  const cx = -LEAN;
+  const cy = H;
+  for (let i = 0; i < 7; i++) {
+    const a = (i / 7) * Math.PI * 2 + 0.3;
+    const len = 0.78 + (i % 3) * 0.16;
+    // Each frond is a flattened, tapered blade tilted down from the crown.
+    const blade = place(
+      new THREE.ConeGeometry(0.17, len, 5),
+      m(i % 2 ? BCH_FROND : BCH_FROND_D, 0.88, 0.02),
+      cx + Math.cos(a) * len * 0.42,
+      cy + 0.06 - len * 0.16,
+      Math.sin(a) * len * 0.42,
+    );
+    blade.rotation.order = "YXZ";
+    blade.rotation.y = -a;
+    blade.rotation.z = Math.PI / 2 - 0.42; // droop
+    blade.scale.set(1, 1, 0.28); // flatten into a leaf
+  }
+  for (const [dx, dz, r] of [[0.07, 0.05, 0.055], [-0.05, 0.08, 0.047]] as const) {
+    place(new THREE.SphereGeometry(r, 8, 8), m(BCH_TRUNK_D, 0.9, 0.03), cx + dx, cy - 0.1, dz);
+  }
+}
+
+/**
+ * ⛱️ Parasol — 1×1, 2.4 m. Eight alternating canopy segments; the alternation
+ * is the whole silhouette, so the wedges are real geometry (ConeGeometry takes
+ * a thetaStart/thetaLength) rather than one cone in an averaged colour.
+ */
+function buildParasol({ m, place }: BuildCtx) {
+  place(new THREE.CylinderGeometry(0.035, 0.045, 2.3, 8), m(0x9a7350, 0.8, 0.05), 0, 1.15, 0);
+  const SEGS = 8;
+  for (let i = 0; i < SEGS; i++) {
+    const wedge = place(
+      new THREE.ConeGeometry(1.02, 0.44, 6, 1, false, (i / SEGS) * Math.PI * 2, (Math.PI * 2) / SEGS),
+      m(i % 2 ? BCH_CREAM : BCH_CORAL, 0.85, 0.02),
+      0,
+      2.16,
+      0,
+    );
+    wedge.castShadow = false;
+  }
+  // Ribs peeking past the hem, and the finial.
+  for (let i = 0; i < SEGS; i++) {
+    const a = ((i + 0.5) / SEGS) * Math.PI * 2;
+    place(
+      new THREE.BoxGeometry(0.02, 0.02, 0.1),
+      m(0x9a7350, 0.8, 0.05),
+      Math.cos(a) * 1.0,
+      1.96,
+      Math.sin(a) * 1.0,
+    );
+  }
+  place(new THREE.SphereGeometry(0.055, 8, 8), m(BCH_CORAL, 0.7, 0.05), 0, 2.42, 0);
+}
+
+/**
+ * 🛋️ Sun lounger — 1×2, 0.5 m, and you LIE on it. Striped mattress (five bands,
+ * cream against mint) and a raked backrest, both from the reference.
+ */
+function buildSunLounger({ m, place }: BuildCtx) {
+  place(new THREE.BoxGeometry(0.76, 0.3, 1.76), m(0xcfc0a6, 0.85, 0.04), 0, 0.15, 0);
+  place(new THREE.BoxGeometry(0.84, 0.1, 1.84), m(BCH_CREAM, 0.8, 0.03), 0, 0.35, 0);
+  const N = 5;
+  for (let i = 0; i < N; i++) {
+    const z = -0.78 + (i + 0.5) * (1.56 / N);
+    place(
+      new THREE.BoxGeometry(0.72, 0.07, 1.56 / N - 0.03),
+      m(i % 2 ? BCH_CREAM : BCH_MINT, 0.9, 0.02),
+      0,
+      0.435,
+      z,
+    );
+  }
+  // Raked backrest at the -z (head) end.
+  const back = place(new THREE.BoxGeometry(0.72, 0.62, 0.08), m(0xefe3d0, 0.85, 0.03), 0, 0.66, -0.82);
+  back.rotation.x = -0.42;
+  // Chrome feet.
+  for (const fx of [-0.3, 0.3]) {
+    for (const fz of [-0.7, 0.7]) {
+      place(new THREE.CylinderGeometry(0.03, 0.03, 0.14, 6), m(BCH_METAL, 0.4, 0.6), fx, 0.07, fz);
+    }
+  }
+}
+
+/** 🏖️ Beach towel — 1×1 and NOT solid: it lies ON the sand and people walk
+ *  over it. Striped, with one corner turned up so it reads as cloth. */
+function buildBeachTowel({ m, place }: BuildCtx) {
+  const W = 0.86;
+  const D = 1.3;
+  const N = 6;
+  for (let i = 0; i < N; i++) {
+    place(
+      new THREE.BoxGeometry(W, 0.022, D / N - 0.01),
+      m(i % 2 ? BCH_CORAL : BCH_SAND, 0.95, 0.0),
+      0,
+      0.012,
+      -D / 2 + (i + 0.5) * (D / N),
+    );
+  }
+  const corner = place(new THREE.BoxGeometry(0.3, 0.02, 0.3), m(BCH_SAND, 0.95, 0.0), W / 2 - 0.15, 0.05, D / 2 - 0.15);
+  corner.rotation.x = -0.5;
+  corner.rotation.z = 0.3;
+}
+
+/** 🏄 Surfboard — 1×1, 2.1 m, stood on its tail against the sand. */
+function buildSurfboard({ m, place }: BuildCtx) {
+  const body = place(new THREE.CylinderGeometry(0.26, 0.20, 1.7, 12), m(BCH_CREAM, 0.6, 0.08), 0, 1.0, 0);
+  body.scale.set(1, 1, 0.26);
+  const nose = place(new THREE.ConeGeometry(0.26, 0.42, 12), m(BCH_CREAM, 0.6, 0.08), 0, 2.06, 0);
+  nose.scale.set(1, 1, 0.26);
+  const tail = place(new THREE.ConeGeometry(0.20, 0.22, 12), m(BCH_CREAM, 0.6, 0.08), 0, 0.04, 0);
+  tail.scale.set(1, 1, 0.26);
+  tail.rotation.x = Math.PI;
+  // The stripe down the deck — one band of colour is what makes it a surfboard.
+  const stripe = place(new THREE.BoxGeometry(0.1, 1.9, 0.015), m(BCH_CORAL, 0.55, 0.1), 0, 1.05, 0.035);
+  stripe.rotation.x = 0;
+  // A slight lean, as if propped.
+  for (const mesh of [body, nose, tail, stripe]) mesh.rotation.z += 0.09;
+}
+
+/** 🏐 Beach ball — 1×1, 0.4 m, NOT solid: it is a thing you walk past, and a
+ *  ball that blocks a tile is a bug report. Six alternating panels. */
+function buildBeachBall({ m, place }: BuildCtx) {
+  const R = 0.2;
+  const PANELS = 6;
+  const cols = [BCH_CORAL, BCH_CREAM, BCH_SKY, BCH_CREAM, 0xf2c14e, BCH_CREAM] as const;
+  for (let i = 0; i < PANELS; i++) {
+    place(
+      new THREE.SphereGeometry(R, 8, 10, (i / PANELS) * Math.PI * 2, (Math.PI * 2) / PANELS),
+      m(cols[i], 0.5, 0.06),
+      0,
+      R,
+      0,
+    );
+  }
+}
+
+/** 📦 Crate — 1×1, 0.7 m, stackable. Four posts and slats, not a solid cube. */
+function buildBeachCrate({ m, place }: BuildCtx) {
+  const W = 0.74;
+  const H = 0.66;
+  for (const px of [-W / 2 + 0.05, W / 2 - 0.05]) {
+    for (const pz of [-W / 2 + 0.05, W / 2 - 0.05]) {
+      place(new THREE.BoxGeometry(0.1, H, 0.1), m(BCH_TEAK, 0.9, 0.03), px, H / 2, pz);
+    }
+  }
+  for (const y of [0.1, 0.33, 0.58]) {
+    place(new THREE.BoxGeometry(W, 0.1, W - 0.12), m(0x8a4f2d, 0.9, 0.03), 0, y, 0);
+    place(new THREE.BoxGeometry(W - 0.12, 0.1, W), m(0x8a4f2d, 0.9, 0.03), 0, y, 0);
+  }
+  place(new THREE.BoxGeometry(W, 0.05, W), m(BCH_TEAK, 0.9, 0.03), 0, H, 0);
+}
+
+/** 🧊 Cooler — 1×1, 0.55 m. White body, teal lid, a wire handle. */
+function buildCooler({ m, place }: BuildCtx) {
+  place(new THREE.BoxGeometry(0.72, 0.42, 0.72), m(0xf2f6f6, 0.6, 0.06), 0, 0.21, 0);
+  place(new THREE.BoxGeometry(0.8, 0.12, 0.8), m(BCH_TEAL, 0.55, 0.1), 0, 0.48, 0);
+  const handle = place(new THREE.TorusGeometry(0.11, 0.016, 6, 14, Math.PI), m(0x2c8496, 0.5, 0.3), 0, 0.54, 0);
+  handle.rotation.y = Math.PI / 2;
+}
+
+/**
+ * 🔥 Tiki torch — 1×1, 1.9 m. The checklist calls torch flicker the LAST
+ * ambience to add, so the flame here is steady-lit geometry plus one small warm
+ * light: the read without the frame cost.
+ */
+function buildTikiTorch({ m, place, addLight }: BuildCtx) {
+  place(new THREE.CylinderGeometry(0.045, 0.06, 1.6, 8), m(BCH_TRUNK_D, 0.92, 0.02), 0, 0.8, 0);
+  // Bamboo nodes.
+  for (const y of [0.42, 0.86, 1.3]) {
+    place(new THREE.CylinderGeometry(0.055, 0.055, 0.045, 8), m(0x4b3a24, 0.9, 0.03), 0, y, 0);
+  }
+  place(new THREE.CylinderGeometry(0.13, 0.09, 0.14, 10), m(0x4b3a24, 0.85, 0.05), 0, 1.66, 0);
+  place(new THREE.ConeGeometry(0.075, 0.24, 8), m(0xff8a3d, 0.3, 0.0, 0xff8a3d, 2.0), 0, 1.85, 0);
+  place(new THREE.ConeGeometry(0.042, 0.15, 8), m(0xffd166, 0.3, 0.0, 0xffd166, 2.6), 0, 1.83, 0);
+  addLight(new THREE.PointLight(0xffbe5a, 0, 2.4), 0, 1.9, 0, 0.55);
+}
+
+/**
+ * 🍹 Tiki bar counter — 4×1, 1.28 m. Deliberately TALL: chest height on an
+ * avatar reads as a real bar, waist height reads as a desk. Its own sky-blue
+ * body, a cream top that overhangs by 0.1, and the LED strip under the lip on
+ * the customer side (local +z) that sells the whole prop.
+ */
+function buildTikiBarCounter({ m, place }: BuildCtx) {
+  const L = 3.8;
+  const H = 1.18;
+  place(new THREE.BoxGeometry(L, H, 0.8), m(BCH_SKY, 0.7, 0.08), 0, H / 2, 0);
+  place(new THREE.BoxGeometry(L + 0.2, 0.1, 1.0), m(BCH_CREAM, 0.5, 0.12), 0, H + 0.05, 0);
+  // LED strip under the overhang, customer side.
+  place(
+    new THREE.BoxGeometry(L - 0.1, 0.022, 0.02),
+    m(0xe6faff, 0.2, 0.0, 0xe6faff, 2.4),
+    0,
+    H - 0.035,
+    0.42,
+  );
+  // A bamboo skirt, so the sky-blue slab reads as a beach bar.
+  for (let i = 0; i < 14; i++) {
+    place(
+      new THREE.CylinderGeometry(0.038, 0.038, H - 0.06, 6),
+      m(i % 3 ? BCH_TRUNK : BCH_TRUNK_D, 0.9, 0.02),
+      -L / 2 + 0.16 + i * ((L - 0.32) / 13),
+      (H - 0.06) / 2,
+      0.41,
+    );
+  }
+}
+
+/**
+ * 🍾 Back bar — 3×1, 2.3 m: the tallest thing in the bar and its focal point.
+ * Low white cabinet, a backlit panel standing on it, two glass shelves of
+ * bottles, and a neon sign on top. It goes against the BACK edge, behind the
+ * bartender row — never mirrored in front of the counter.
+ */
+function buildTikiBackBar({ m, place, addLight }: BuildCtx) {
+  const L = 2.8;
+  place(new THREE.BoxGeometry(L, 0.9, 0.5), m(BCH_CREAM, 0.6, 0.08), 0, 0.45, 0);
+  // Backlit panel.
+  place(
+    new THREE.BoxGeometry(L - 0.24, 1.3, 0.08),
+    m(0xa0e1fa, 0.35, 0.05, 0x79c4e6, 1.1),
+    0,
+    1.55,
+    -0.18,
+  );
+  // Two glass shelves with bottles.
+  const BOTTLE = [0x7fd1c4, 0xe8604c, 0xf2c14e, 0x9a7bd0, 0x6fbf6b, 0xe88fb0, 0x4fb8c9] as const;
+  for (const [y, n] of [[1.22, 6], [1.72, 5]] as const) {
+    place(
+      new THREE.BoxGeometry(L - 0.3, 0.03, 0.28),
+      translucent(m(0xdcf0f7, 0.25, 0.3), 0.55),
+      0,
+      y,
+      -0.02,
+    );
+    for (let i = 0; i < n; i++) {
+      const bx = -(L - 0.5) / 2 + i * ((L - 0.5) / (n - 1));
+      const h = 0.2 + (i % 3) * 0.06;
+      place(new THREE.CylinderGeometry(0.04, 0.045, h, 8), m(BOTTLE[i % BOTTLE.length], 0.4, 0.15), bx, y + 0.02 + h / 2, -0.02);
+      place(new THREE.CylinderGeometry(0.014, 0.014, 0.07, 6), m(BOTTLE[i % BOTTLE.length], 0.4, 0.15), bx, y + 0.02 + h + 0.035, -0.02);
+    }
+  }
+  // Neon "BAR" — a CanvasTexture plate, the wall-computer screen idiom.
+  const canvas = document.createElement("canvas");
+  canvas.width = 256;
+  canvas.height = 96;
+  const c2d = canvas.getContext("2d");
+  if (c2d) {
+    c2d.clearRect(0, 0, 256, 96);
+    c2d.font = "bold 58px ui-monospace, Menlo, monospace";
+    c2d.textAlign = "center";
+    c2d.textBaseline = "middle";
+    c2d.shadowColor = "#ff5fa2";
+    c2d.shadowBlur = 22;
+    c2d.fillStyle = "#ff8fc4";
+    c2d.fillText("B A R", 128, 52);
+    c2d.fillText("B A R", 128, 52);
+  }
+  const tex = new THREE.CanvasTexture(canvas);
+  const sign = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.1, 0.41),
+    new THREE.MeshBasicMaterial({ map: tex, transparent: true }),
+  );
+  sign.position.set(0, 2.32, -0.13);
+  sign.userData.baseOpacity = 1;
+  place(new THREE.BoxGeometry(1.2, 0.05, 0.06), m(0x23252e, 0.8, 0.2), 0, 2.08, -0.13);
+  (place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(BCH_CREAM, 1, 0), 0, 0, 0)).add(sign);
+  addLight(new THREE.PointLight(0xff8fc4, 0, 2.2), 0, 2.3, 0.1, 0.35);
+}
+
+/** 🪑 Bar stool — 1×1, 0.82 m. Seat height matches the TALLER counter; a
+ *  chair-height stool at a 1.28 m bar looks like a mistake. */
+function buildTikiBarStool({ m, place }: BuildCtx) {
+  place(new THREE.CylinderGeometry(0.22, 0.24, 0.03, 14), m(0xb9c4c4, 0.4, 0.6), 0, 0.015, 0);
+  place(new THREE.CylinderGeometry(0.05, 0.05, 0.78, 10), m(BCH_METAL, 0.35, 0.65), 0, 0.39, 0);
+  place(new THREE.TorusGeometry(0.16, 0.014, 6, 16), m(BCH_METAL, 0.35, 0.65), 0, 0.2, 0).rotation.x = Math.PI / 2;
+  place(new THREE.CylinderGeometry(0.21, 0.19, 0.04, 16), m(0xb64b3a, 0.7, 0.05), 0, 0.80, 0);
+  place(new THREE.CylinderGeometry(0.22, 0.22, 0.06, 16), m(BCH_CORAL, 0.75, 0.04), 0, 0.835, 0);
+}
+
+/** 🏛 Pergola post — 1×1, 3.0 m. Four of these at the deck corners carry the
+ *  roof; the tiles BETWEEN them stay free. */
+function buildPergolaPost({ m, place }: BuildCtx) {
+  place(new THREE.BoxGeometry(0.14, 3.0, 0.14), m(BCH_TEAK, 0.88, 0.03), 0, 1.5, 0);
+  place(new THREE.BoxGeometry(0.24, 0.08, 0.24), m(0x6d3c21, 0.9, 0.03), 0, 0.04, 0);
+  place(new THREE.BoxGeometry(0.22, 0.08, 0.22), m(0x6d3c21, 0.9, 0.03), 0, 2.96, 0);
+}
+
+/**
+ * ✨ Pergola roof — 7×4, 3.2 m, OVERHEAD and non-solid. Airy slats (40% alpha,
+ * so the back bar and anyone under it stay readable), five strands of fairy
+ * lights, and five paper lanterns at different heights. The checklist is blunt
+ * about this one: the lights are what make the bar feel like an evening party
+ * rather than a kiosk, so they are not optional dressing.
+ */
+function buildPergolaRoof({ m, place, addLight }: BuildCtx) {
+  const W = 6.6;
+  const D = 3.6;
+  const Y = 3.06;
+  // Beams along the long axis, then slats across.
+  for (const z of [-D / 2 + 0.1, 0, D / 2 - 0.1]) {
+    place(new THREE.BoxGeometry(W, 0.14, 0.16), m(BCH_TEAK, 0.88, 0.03), 0, Y + 0.09, z);
+  }
+  const SLATS = 17;
+  for (let i = 0; i < SLATS; i++) {
+    place(
+      new THREE.BoxGeometry(0.1, 0.07, D),
+      translucent(m(0x8a4f2d, 0.9, 0.03), 0.4),
+      -W / 2 + 0.2 + i * ((W - 0.4) / (SLATS - 1)),
+      Y,
+      0,
+    );
+  }
+  // Fairy lights: two strands along the beams, two diagonals, one across the
+  // middle. Bulbs alternate warm white / blush / gold and hang slightly.
+  const BULB = [0xfff2d6, 0xffc9de, 0xffd98a] as const;
+  const strand = (x0: number, z0: number, x1: number, z1: number, n: number, seed: number) => {
+    for (let i = 0; i < n; i++) {
+      const t = i / (n - 1);
+      const sag = 0.1 * Math.sin(t * Math.PI);
+      const col = BULB[(i + seed) % BULB.length];
+      place(
+        new THREE.SphereGeometry(0.032, 7, 7),
+        m(col, 0.25, 0.0, col, 1.9),
+        x0 + (x1 - x0) * t,
+        Y - 0.12 - sag,
+        z0 + (z1 - z0) * t,
+      );
+    }
+  };
+  strand(-W / 2 + 0.3, -D / 2 + 0.3, W / 2 - 0.3, -D / 2 + 0.3, 11, 0);
+  strand(-W / 2 + 0.3, D / 2 - 0.3, W / 2 - 0.3, D / 2 - 0.3, 11, 1);
+  strand(-W / 2 + 0.3, -D / 2 + 0.3, W / 2 - 0.3, D / 2 - 0.3, 13, 2);
+  strand(-W / 2 + 0.3, D / 2 - 0.3, W / 2 - 0.3, -D / 2 + 0.3, 13, 1);
+  strand(-W / 2 + 0.3, 0, W / 2 - 0.3, 0, 11, 0);
+  // Paper lanterns — pastel, at different heights, each with its own glow.
+  const LANTERN = [0xffc2d8, 0xd7bdf2, 0xffe08a, 0xa8ebd8, 0xffcfa8] as const;
+  const at = [-2.4, -1.1, 0.3, 1.6, 2.7];
+  at.forEach((lx, i) => {
+    const drop = 0.26 + (i % 3) * 0.14;
+    place(new THREE.CylinderGeometry(0.004, 0.004, drop, 4), m(0x8a4f2d, 0.9, 0.0), lx, Y - drop / 2, (i % 2 ? 0.7 : -0.7));
+    const ball = place(
+      new THREE.SphereGeometry(0.19, 12, 10),
+      m(LANTERN[i], 0.55, 0.0, LANTERN[i], 0.9),
+      lx,
+      Y - drop - 0.17,
+      i % 2 ? 0.7 : -0.7,
+    );
+    ball.scale.set(1, 0.84, 1);
+  });
+  addLight(new THREE.PointLight(0xffd9a8, 0, 7.0), 0, Y - 0.6, 0, 0.55);
+}
+
+// ── 🎉 Party fixtures ────────────────────────────────────────────────────────
+// The cake, the gifts, the banner, the speaker and the dance floor. Everything
+// here is ordinary registry furniture — what makes it a PARTY is that four of
+// the five carry per-instance state in the room doc (partyDoc.ts) instead of
+// being pure decoration, and that one of them is gated to a named person.
+//
+// Placement note (the element-checklist zoning rule): these want to live down
+// ONE SIDE of the room facing an empty middle, with the tallest (banner) at the
+// back. Nothing here should end up between the camera and the cake.
+
+const CANDLE_WAX = 0xfff0f4;
+const FLAME = 0xffb300;
+const CLOTH = 0xfdf6ec;
+
+/** Deterministic 0..1 from an item id — so a PILE of gifts isn't uniform.
+ *  (FNV-1a; the same id must give the same colour on every client.) */
+function idHash01(id: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return ((h >>> 0) % 1000) / 1000;
+}
+
+/**
+ * 🎂 THE ANCHOR OF THE ROOM. A tall clothed 2×1 table carrying a four-tier
+ * floral cake.
+ *
+ * Two phases, driven by `cake:<itemId>` in the room doc: candles LIT (only the
+ * guest of honour may blow them out) and candles OUT (the cake becomes a slice
+ * dispenser for everyone). The flames and their light are one group whose
+ * visibility follows the doc, so the moment lands on every screen at once.
+ *
+ * The table is display height (top at 0.92 m — owner ruling 2026-09-25: the
+ * old 0.67 m sat at the fox's knees). The cake follows the owner's reference
+ * (2026-09-25): FOUR tiers of pale mint buttercream with a rough, ridged
+ * finish — the frosting shows — dressed with big open blossoms in coral,
+ * pink, peach and yellow with green leaves: a cluster on top, a cascade down
+ * the front-left across every tier, and tiny blossoms along each tier's foot.
+ *
+ * Every petal, leaf and flower centre is ONE InstancedMesh (≈1 000 instances,
+ * one draw call): built as meshes they would cost more than the rest of the
+ * room. Flower layout is seeded from the item id, so two cakes differ but
+ * every client agrees on each.
+ */
+const CAKE_TOP = 0.92; // the cloth surface — every cake height is from here
+function buildCakeTable(ctx: BuildCtx) {
+  const { m, place, addLight, attach, itemId } = ctx;
+
+  // Table + cloth. Deep enough for the four-tier cake's stand; the cloth
+  // overhangs the top on all four sides and falls in a long skirt.
+  place(new THREE.BoxGeometry(1.62, 0.85, 0.92), m(WOOD, 0.8, 0.05), 0, 0.425, 0);
+  place(new THREE.BoxGeometry(1.86, 0.07, 1.14), m(CLOTH, 0.9, 0.02), 0, CAKE_TOP - 0.035, 0);
+  place(new THREE.BoxGeometry(1.84, 0.30, 1.12), m(CLOTH, 0.95, 0.0), 0, CAKE_TOP - 0.22, 0);
+
+  // ── Four tiers on a stand ──
+  const TOP = CAKE_TOP;
+  const MINT = [0xc3e4e0, 0xb4dcd8, 0xd0ebe7] as const; // the reference's pale blue buttercream, three ridge tones
+  const RIM = 0xa9d1cc; // the shadow line under each tier
+  place(new THREE.CylinderGeometry(0.46, 0.46, 0.02, 28), m(0xf4efe6, 0.6, 0.1), 0, TOP + 0.01, 0);
+  place(new THREE.CylinderGeometry(0.44, 0.46, 0.015, 28), m(0xe6dfd2, 0.6, 0.05), 0, TOP + 0.0275, 0);
+  const tiers: Array<[number, number]> = [
+    [0.40, 0.24],
+    [0.33, 0.22],
+    [0.26, 0.2],
+    [0.19, 0.18],
+  ];
+  let seed = idHash01(itemId) * 1000;
+  const rnd = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+  const tierBase: number[] = [];
+  const tierTop: number[] = [];
+  let y = TOP + 0.035;
+  for (const [r, h] of tiers) {
+    tierBase.push(y);
+    // The ridged finish: the tier is a stack of thin bands whose radius
+    // wanders a few millimetres, in three tones — buttercream pulled round
+    // with a palette knife, not a smooth drum.
+    const bands = Math.round(h / 0.035);
+    for (let b = 0; b < bands; b++) {
+      const rr = r + (rnd() - 0.35) * 0.012;
+      const bh = h / bands + 0.004;
+      place(new THREE.CylinderGeometry(rr, rr + 0.003, bh, 26), m(MINT[b % 3], 0.9, 0.0), 0, y + (b + 0.5) * (h / bands), 0);
+    }
+    place(new THREE.CylinderGeometry(r, r, 0.03, 26), m(MINT[2], 0.85, 0.0), 0, y + h + 0.015, 0);
+    place(new THREE.CylinderGeometry(r + 0.004, r + 0.004, 0.01, 26), m(RIM, 0.85, 0.0), 0, y + h - 0.005, 0);
+    y += h + 0.03;
+    tierTop.push(y);
+  }
+  const CAKE_TOP_Y = y;
+
+  // ── Flowers, as instances. Every blossom is a dark centre, five cupped
+  //    petals round it in the plane tangent to the cake, and a leaf or two.
+  const PETAL = [0xff6f52, 0xff8fab, 0xffb07a, 0xffd84a, 0xfff0d6, 0xf26b8a] as const;
+  const LEAF = [0x4fae76, 0x7cc47a, 0x3a8f5c] as const;
+  const CENTRE = 0x3b2a2a;
+  type Inst = { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3; c: number };
+  const inst: Inst[] = [];
+  const UP = new THREE.Vector3(0, 1, 0);
+  const put = (p: THREE.Vector3, q: THREE.Quaternion, s: THREE.Vector3, c: number) => inst.push({ p, q, s, c });
+  /** A blossom at `at`, facing `n` (unit), radius r. */
+  const blossom = (at: THREE.Vector3, n: THREE.Vector3, r: number, colour: number) => {
+    const qN = new THREE.Quaternion().setFromUnitVectors(UP, n);
+    const petals = 5;
+    const phase = rnd() * Math.PI * 2;
+    for (let k = 0; k < petals; k++) {
+      const a = phase + (k / petals) * Math.PI * 2;
+      // Petal: a flattened ellipsoid, long axis radial, tipped up 25° so the
+      // flower cups toward its centre.
+      const q = qN.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, -a))
+        .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -0.44));
+      const off = new THREE.Vector3(Math.cos(a) * r * 0.55, r * 0.12, Math.sin(a) * r * 0.55).applyQuaternion(qN);
+      put(at.clone().add(off), q, new THREE.Vector3(r * 0.62, r * 0.16, r * 0.42), colour);
+    }
+    put(at.clone().add(n.clone().multiplyScalar(r * 0.14)), qN, new THREE.Vector3(r * 0.26, r * 0.2, r * 0.26), CENTRE);
+    // A leaf or two poking out from under the petals.
+    const leaves = rnd() < 0.6 ? 2 : 1;
+    for (let k = 0; k < leaves; k++) {
+      const a = phase + rnd() * Math.PI * 2;
+      const q = qN.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, -a));
+      const off = new THREE.Vector3(Math.cos(a) * r * 0.95, -r * 0.05, Math.sin(a) * r * 0.95).applyQuaternion(qN);
+      put(at.clone().add(off), q, new THREE.Vector3(r * 0.5, r * 0.08, r * 0.24), LEAF[Math.floor(rnd() * LEAF.length)]);
+    }
+  };
+  const hue = () => PETAL[Math.floor(rnd() * PETAL.length)];
+  /** On a tier's SIDE at angle a (local, +z front), fraction f up its height. */
+  const onSide = (t: number, a: number, f: number, r: number) => {
+    const [R, h] = tiers[t];
+    const n = new THREE.Vector3(Math.cos(a), 0, Math.sin(a));
+    blossom(new THREE.Vector3(Math.cos(a) * (R + r * 0.1), tierBase[t] + h * f, Math.sin(a) * (R + r * 0.1)), n, r, hue());
+  };
+  /** On the exposed TOP of tier t (the annulus outside the tier above). */
+  const onTop = (t: number, a: number, radius: number, r: number) => {
+    blossom(new THREE.Vector3(Math.cos(a) * radius, tierTop[t] + r * 0.12, Math.sin(a) * radius), UP, r, hue());
+  };
+
+  // The crown: a cluster on the top tier's back-left, leaving the candles
+  // their ring at the centre-front.
+  for (let k = 0; k < 8; k++) {
+    const a = 1.9 + (k / 8) * 2.8 + rnd() * 0.3;
+    onTop(3, a, 0.1 + rnd() * 0.06, 0.06 + rnd() * 0.025);
+  }
+  // The cascade: down the front-left, every tier — on the side and spilling
+  // onto the top of the tier below, biggest in the middle.
+  for (let t = 3; t >= 0; t--) {
+    const n = 3 + (3 - t);
+    for (let k = 0; k < n; k++) {
+      const a = 2.0 + rnd() * 0.9 + (k / n) * 0.6;
+      onSide(t, a, 0.25 + rnd() * 0.55, 0.06 + rnd() * 0.03);
+    }
+    if (t > 0) {
+      const [rBelow] = tiers[t - 1];
+      const [rThis] = tiers[t];
+      for (let k = 0; k < 2; k++) {
+        const a = 2.15 + rnd() * 1.0;
+        onTop(t - 1, a, rThis + (rBelow - rThis) * 0.5, 0.05 + rnd() * 0.02);
+      }
+    }
+  }
+  // Tiny blossoms along each tier's foot, all the way round, like the
+  // reference's sprinkled base.
+  for (let t = 0; t < tiers.length; t++) {
+    const [R] = tiers[t];
+    const n = Math.round((2 * Math.PI * R) / 0.32);
+    for (let k = 0; k < n; k++) {
+      const a = (k / n) * Math.PI * 2 + rnd() * 0.3;
+      onSide(t, a, 0.06, 0.024 + rnd() * 0.01);
+    }
+  }
+
+  // One InstancedMesh for the lot.
+  const petalGeo = new THREE.SphereGeometry(1, 8, 6);
+  const petalMat = m(0xffffff, 0.75, 0.0);
+  const flowers = new THREE.InstancedMesh(petalGeo, petalMat, inst.length);
+  const mtx = new THREE.Matrix4();
+  const col = new THREE.Color();
+  inst.forEach((it, i) => {
+    mtx.compose(it.p, it.q, it.s);
+    flowers.setMatrixAt(i, mtx);
+    flowers.setColorAt(i, col.setHex(it.c));
+  });
+  flowers.instanceMatrix.needsUpdate = true;
+  if (flowers.instanceColor) flowers.instanceColor.needsUpdate = true;
+  flowers.name = "cakeFlowers";
+  attach(flowers);
+
+  // ── Candles. A ring on the top tier; the flames live in their own group. ──
+  const flames = new THREE.Group();
+  flames.name = "cakeFlames";
+  const { candles } = readCake(itemId);
+  const CANDLE_BASE = CAKE_TOP_Y;
+  for (let i = 0; i < candles; i++) {
+    const a = (i / Math.max(1, candles)) * Math.PI * 2;
+    const cx = Math.cos(a) * 0.075;
+    const cz = Math.sin(a) * 0.075 + 0.02; // a touch forward, clear of the crown
+    place(new THREE.CylinderGeometry(0.012, 0.012, 0.13, 6), m(CANDLE_WAX, 0.7, 0.02), cx, CANDLE_BASE + 0.065, cz);
+    // Flame: a small emissive teardrop. Parented to `flames`, not the item, so
+    // one visibility flip blows out every candle together.
+    const flame = new THREE.Mesh(
+      new THREE.ConeGeometry(0.018, 0.055, 7),
+      m(FLAME, 0.3, 0.0, FLAME, 2.2),
+    );
+    flame.position.set(cx, CANDLE_BASE + 0.16, cz);
+    flames.add(flame);
+  }
+  attach(flames);
+
+  // One warm light for the whole ring — 5 point lights would be a frame cost
+  // for no visible gain at this scale.
+  const glow = new THREE.PointLight(FLAME, 0, 1.6);
+  addLight(glow, 0, CANDLE_BASE + 0.22, 0, 0.9);
+
+  // ── 🎊 Confetti. The payoff of the moment, and the reason it reads as an
+  //    EVENT rather than a state flag. Pre-built and parked: a burst must not
+  //    allocate geometry at the instant everyone is looking.
+  const CONFETTI = [0xff8fab, 0xf2c14e, 0x7fd1c4, 0x9a7bd0, 0xffffff, 0x79c4e6] as const;
+  const COUNT = 48;
+  const bits: THREE.Mesh[] = [];
+  const vel: THREE.Vector3[] = [];
+  const spin: THREE.Vector3[] = [];
+  const confetti = new THREE.Group();
+  confetti.name = "cakeConfetti";
+  confetti.visible = false;
+  for (let i = 0; i < COUNT; i++) {
+    const bit = new THREE.Mesh(
+      new THREE.BoxGeometry(0.045, 0.006, 0.028),
+      m(CONFETTI[i % CONFETTI.length], 0.6, 0.05),
+    );
+    confetti.add(bit);
+    bits.push(bit);
+    vel.push(new THREE.Vector3());
+    spin.push(new THREE.Vector3());
+  }
+  attach(confetti);
+
+  let burstT = -1; // <0 ⇒ idle
+  const BURST_SECS = 2.6;
+  const fire = () => {
+    burstT = 0;
+    confetti.visible = true;
+    for (let i = 0; i < COUNT; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const speed = 0.7 + Math.random() * 1.1;
+      bits[i].position.set(0, CANDLE_BASE + 0.2, 0);
+      vel[i].set(Math.cos(a) * speed * 0.55, 1.5 + Math.random() * 1.2, Math.sin(a) * speed * 0.55);
+      spin[i].set(Math.random() * 8 - 4, Math.random() * 8 - 4, Math.random() * 8 - 4);
+    }
+  };
+  // Reuse the per-item pulse slot World already drives — a cake is never also
+  // a dance floor, so one handle per item is enough.
+  const pulse: PropAnimHandle = {
+    update(dt: number) {
+      if (burstT < 0) return;
+      burstT += dt;
+      if (burstT > BURST_SECS) {
+        burstT = -1;
+        confetti.visible = false;
+        return;
+      }
+      for (let i = 0; i < COUNT; i++) {
+        vel[i].y -= 3.4 * dt; // gravity — paper falls slowly
+        vel[i].x *= 1 - 1.6 * dt; // and air-brakes sideways
+        vel[i].z *= 1 - 1.6 * dt;
+        bits[i].position.addScaledVector(vel[i], dt);
+        bits[i].rotation.x += spin[i].x * dt;
+        bits[i].rotation.y += spin[i].y * dt;
+        bits[i].rotation.z += spin[i].z * dt;
+      }
+    },
+  };
+
+  // ── Live state: the flames follow the doc, not the local click ──
+  // First paint must NOT fire confetti: a joiner walking into a party that
+  // already happened should find the candles quietly out, not re-run the
+  // moment. Only a lit → unlit TRANSITION is the event.
+  // The baseline is per PARTY DOC: reconcileFurniture reuses this group when
+  // the next room holds a same-id cake in the same pose, and the rebind then
+  // notifies this very listener — an unlit cake there must not read as "the
+  // one I knew was lit just went out" (Copilot review, PR #169).
+  let known: boolean | null = null;
+  let knownEpoch = partyDocEpoch();
+  const applyPhase = () => {
+    const epoch = partyDocEpoch();
+    if (epoch !== knownEpoch) {
+      knownEpoch = epoch;
+      known = null;
+    }
+    const lit = readCake(itemId).lit;
+    flames.visible = lit;
+    glow.intensity = lit ? 0.9 : 0;
+    if (known === true && !lit) fire();
+    known = lit;
+  };
+  applyPhase();
+  // Both hooks ride the trim-style carrier rules: the subscription can live on
+  // a Group (the dispose scan traverses everything), the drive handle cannot
+  // (registerFurnitureHandles only visits meshes) — so it goes on a mesh.
+  flames.userData.disposePartySub = subscribePartyKey(cakeKey(itemId), applyPhase);
+  const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(CLOTH, 1, 0), 0, 0.01, 0);
+  carrier.visible = false;
+  carrier.userData.propAnim = pulse;
+}
+
+/**
+ * 🎁 A stackable, openable gift box. Colour is derived from the item id so a
+ * pile reads as several presents rather than a repeated asset. Opening is the
+ * small, ungated echo of the cake moment: one doc write, and the lid tilts off
+ * on every client.
+ */
+function buildGiftBox(ctx: BuildCtx) {
+  const { m, place, attach, itemId } = ctx;
+  const WRAPS = [0xff8fab, 0x7fd1c4, 0xf2c14e, 0x9a7bd0, 0x6fbf6b, 0x79c4e6] as const;
+  const wrap = WRAPS[Math.floor(idHash01(itemId) * WRAPS.length) % WRAPS.length];
+  const RIBBON = 0xfff4e8;
+
+  const W = 0.62;
+  place(new THREE.BoxGeometry(W, 0.46, W), m(wrap, 0.78, 0.04), 0, 0.23, 0);
+  // Ribbon cross on the four sides, slightly proud of the wrapping.
+  place(new THREE.BoxGeometry(0.1, 0.47, W + 0.012), m(RIBBON, 0.6, 0.06), 0, 0.23, 0);
+  place(new THREE.BoxGeometry(W + 0.012, 0.47, 0.1), m(RIBBON, 0.6, 0.06), 0, 0.23, 0);
+
+  // Lid + bow ride in one group so opening tilts them together.
+  const lid = new THREE.Group();
+  lid.name = "giftLid";
+  const lidMesh = new THREE.Mesh(new THREE.BoxGeometry(W + 0.06, 0.1, W + 0.06), m(wrap, 0.75, 0.05));
+  lidMesh.position.y = 0.05;
+  lid.add(lidMesh);
+  for (const ry of [0, Math.PI / 2]) {
+    const band = new THREE.Mesh(new THREE.BoxGeometry(0.1, 0.11, W + 0.07), m(RIBBON, 0.6, 0.06));
+    band.position.y = 0.05;
+    band.rotation.y = ry;
+    lid.add(band);
+  }
+  // Bow: two squashed spheres either side of a knot.
+  for (const bx of [-0.07, 0.07]) {
+    const loop = new THREE.Mesh(new THREE.SphereGeometry(0.06, 8, 8), m(RIBBON, 0.55, 0.08));
+    loop.position.set(bx, 0.13, 0);
+    loop.scale.set(1, 0.7, 0.55);
+    lid.add(loop);
+  }
+  lid.position.set(0, 0.46, 0);
+  attach(lid);
+
+  const applyPhase = () => {
+    const { opened } = readGift(itemId);
+    // Opened: the lid slides off one corner and tips, the way a lid actually
+    // lands. Closed: square on the box.
+    lid.position.set(opened ? 0.30 : 0, opened ? 0.50 : 0.46, opened ? 0.22 : 0);
+    lid.rotation.set(opened ? 0.42 : 0, opened ? 0.55 : 0, opened ? -0.30 : 0);
+  };
+  applyPhase();
+  lid.userData.disposePartySub = subscribePartyKey(giftKey(itemId), applyPhase);
+}
+
+/**
+ * 🎊 Birthday banner — 3×1 of bunting on two poles, with a lettered cloth
+ * hung beneath the string. footprint NULL on purpose: guests walk UNDER it,
+ * and a banner that blocks a corridor is the fastest way to make a party
+ * room unwalkable (the checklist's two-tile corridor rule).
+ *
+ * Poles stand 3.8 m (owner rulings 2026-09-25: 2.35 m hung at the jungle
+ * plants' waist, 3.0 m still sat on the cake's crown). The cloth reads "Happy Birthday Dorkmo" from
+ * both sides — two panels back to back, each with the text the right way
+ * round, since a single double-sided plane mirrors it from behind.
+ */
+const BANNER_TEXT = "Happy Birthday Dorkmo";
+
+/** The lettering, painted once per build into a canvas: coral script on a
+ *  cream cloth with a pink border, the party palette. */
+function makeBannerTexture(text: string): THREE.CanvasTexture {
+  const W = 1024;
+  const H = 192;
+  const cv = document.createElement("canvas");
+  cv.width = W;
+  cv.height = H;
+  const c = cv.getContext("2d")!;
+  c.fillStyle = "#fdf3e0"; // cream
+  c.fillRect(0, 0, W, H);
+  c.strokeStyle = "#ff8fab"; // pink border
+  c.lineWidth = 10;
+  c.strokeRect(9, 9, W - 18, H - 18);
+  // Scalloped dots along the border, the way a party banner is printed.
+  c.fillStyle = "#f2c14e";
+  for (let x = 40; x < W - 20; x += 48) {
+    c.beginPath(); c.arc(x, 24, 6, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(x, H - 24, 6, 0, Math.PI * 2); c.fill();
+  }
+  c.fillStyle = "#e8604c"; // coral letters
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  let size = 96;
+  c.font = `bold ${size}px "Trebuchet MS", "Gill Sans", "Helvetica Neue", sans-serif`;
+  while (c.measureText(text).width > W - 120 && size > 40) {
+    size -= 4;
+    c.font = `bold ${size}px "Trebuchet MS", "Gill Sans", "Helvetica Neue", sans-serif`;
+  }
+  c.fillText(text, W / 2, H / 2 + 4);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
+function buildBirthdayBanner(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const POLE = 0xd8d2c4;
+  const BUNTING = [0xff8fab, 0xf2c14e, 0x7fd1c4, 0x9a7bd0, 0xffffff] as const;
+  const SPAN = 2.6;
+  const POLE_H = 3.8;
+
+  for (const px of [-SPAN / 2, SPAN / 2]) {
+    place(new THREE.CylinderGeometry(0.035, 0.045, POLE_H, 8), m(POLE, 0.6, 0.35), px, POLE_H / 2, 0);
+    place(new THREE.CylinderGeometry(0.11, 0.13, 0.06, 10), m(POLE, 0.7, 0.3), px, 0.03, 0);
+  }
+
+  // The string sags: a catenary approximated by a cosine, drawn as short
+  // segments so it reads as a curve rather than a taut wire.
+  const SAG = 0.34;
+  const TOP = POLE_H - 0.1;
+  const yAt = (t: number) => TOP - SAG * Math.sin(t * Math.PI); // 0 at both poles
+  const STEPS = 14;
+  for (let i = 0; i < STEPS; i++) {
+    const t0 = i / STEPS;
+    const t1 = (i + 1) / STEPS;
+    const x0 = -SPAN / 2 + t0 * SPAN;
+    const x1 = -SPAN / 2 + t1 * SPAN;
+    const y0 = yAt(t0);
+    const y1 = yAt(t1);
+    const len = Math.hypot(x1 - x0, y1 - y0);
+    const seg = place(
+      new THREE.CylinderGeometry(0.012, 0.012, len, 5),
+      m(POLE, 0.8, 0.1),
+      (x0 + x1) / 2,
+      (y0 + y1) / 2,
+      0,
+    );
+    seg.rotation.z = Math.PI / 2 - Math.atan2(y1 - y0, x1 - x0);
+
+    // A bunting triangle hanging from the midpoint of every segment.
+    const flag = place(
+      new THREE.ConeGeometry(0.085, 0.2, 3),
+      m(BUNTING[i % BUNTING.length], 0.85, 0.02),
+      (x0 + x1) / 2,
+      (y0 + y1) / 2 - 0.115,
+      0,
+    );
+    flag.rotation.x = Math.PI; // point down
+    flag.rotation.y = Math.PI / 2;
+  }
+
+  // ── The lettered cloth, hung below the bunting on two cords ──
+  const CLOTH_W = 2.2;
+  const CLOTH_H = CLOTH_W * (192 / 1024);
+  const clothTop = yAt(0.5) - 0.3; // under the flag tips at the sag
+  const clothY = clothTop - CLOTH_H / 2;
+  for (const t of [0.2, 0.8]) {
+    const x = -SPAN / 2 + t * SPAN;
+    const cordLen = yAt(t) - clothTop;
+    place(new THREE.CylinderGeometry(0.008, 0.008, cordLen, 4), m(POLE, 0.8, 0.1), x, clothTop + cordLen / 2, 0);
+  }
+  const tex = makeBannerTexture(BANNER_TEXT);
+  for (const side of [1, -1] as const) {
+    const mat = m(0xffffff, 0.9, 0.0);
+    mat.map = tex;
+    const panel = place(new THREE.PlaneGeometry(CLOTH_W, CLOTH_H), mat, 0, clothY, side * 0.006);
+    if (side === -1) panel.rotation.y = Math.PI; // the back reads the right way round too
+  }
+  // A thin batten along the top edge so the cloth hangs straight.
+  place(new THREE.BoxGeometry(CLOTH_W + 0.04, 0.02, 0.025), m(0xa86f43, 0.8, 0.1), 0, clothTop, 0);
+}
+
+/**
+ * 🔊 Party speaker — the dance floor's power switch, and the room's music.
+ * Toggling it is ungated (anyone may kill the music) and the state rides
+ * `speaker:<itemId>`, which the dance floor subscribes to as well.
+ *
+ * 🎶 It PLAYS (partyAudio.ts): "Happy Birthday" on a celesta the moment the
+ * local player walks into the room — once, whatever the switch says — and on
+ * a loop while the switch is on, fading with the player's distance from the
+ * cabinet. Driven per frame by a PropAnimHandle, so it stops dead when the
+ * item is removed or the room is left.
+ */
+function buildPartySpeaker(ctx: BuildCtx) {
+  const { m, place, attach, itemId } = ctx;
+  const CAB = 0x23252e;
+  const CONE = 0x3d4a5e;
+  const LIT = 0x7fd1c4;
+
+  place(new THREE.BoxGeometry(0.52, 0.86, 0.42), m(CAB, 0.72, 0.18), 0, 0.43, 0);
+  place(new THREE.BoxGeometry(0.56, 0.05, 0.46), m(CAB, 0.55, 0.3), 0, 0.88, 0);
+  // Two drivers facing +z (the local "front" convention the devices use).
+  for (const [dy, r] of [[0.30, 0.17], [0.64, 0.10]] as const) {
+    place(new THREE.CylinderGeometry(r, r, 0.03, 16), m(CONE, 0.9, 0.05), 0, dy, 0.215).rotation.x = Math.PI / 2;
+    place(new THREE.CylinderGeometry(r * 0.35, r * 0.35, 0.05, 12), m(0x14181e, 0.6, 0.4), 0, dy, 0.228).rotation.x = Math.PI / 2;
+  }
+
+  // Status ring — the only part that changes with state.
+  const ring = new THREE.Group();
+  const ringMat = m(LIT, 0.3, 0.1, LIT, 1.8);
+  const ringMesh = new THREE.Mesh(new THREE.TorusGeometry(0.055, 0.012, 8, 20), ringMat);
+  ringMesh.position.set(0, 0.86, 0.14);
+  ringMesh.rotation.x = Math.PI / 2;
+  ring.add(ringMesh);
+  attach(ring);
+
+  const applyPhase = () => {
+    const { on } = readSpeaker(itemId);
+    ringMat.emissiveIntensity = on ? 1.8 : 0.05;
+    ringMat.needsUpdate = true;
+  };
+  applyPhase();
+  ring.userData.disposePartySub = subscribePartyKey(speakerKey(itemId), applyPhase);
+
+  // ── 🎶 The music. A carrier mesh holds the per-frame handle (World only
+  //    collects handles from meshes) and the dispose hook that silences it.
+  const voice = createSpeakerVoice(itemId);
+  const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(CAB, 1, 0), 0, 0.01, 0);
+  carrier.visible = false;
+  const anim: PropAnimHandle = {
+    update(dt: number) {
+      const me = FURNITURE.find((f) => f.id === itemId);
+      const p = localPlayerXZ();
+      const distance = me ? Math.hypot(me.pos.x - p.x, me.pos.z - p.z) : 0;
+      const sp = readSpeaker(itemId);
+      voice.update(dt, { on: sp.on, inRoom: isLocalPlayerInRoom(), distance, track: sp.track });
+    },
+  };
+  carrier.userData.propAnim = anim;
+  carrier.userData.disposeAudio = () => voice.dispose();
+}
+
+/**
+ * 💃 Dance floor — a 4×4 checkered pad. footprint NULL: it is FLOOR, people
+ * must be able to stand on it, and a dance emote on plain deck is a gesture
+ * while the same emote on a lit floor is a place.
+ *
+ * It pulses only while a speaker in the room is on. The pulse is driven by a
+ * PropAnimHandle that World ticks (the trunk-lid idiom) rather than a timer
+ * of its own, so it stops dead when the item is removed.
+ */
+function buildDanceFloor(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const A = 0xf7d9e6; // pastel pink
+  const B = 0xd6f0ee; // pastel mint
+  const N = 4;
+  const CELL = 1.0;
+  const pads: THREE.MeshStandardMaterial[] = [];
+
+  for (let i = 0; i < N; i++) {
+    for (let j = 0; j < N; j++) {
+      const col = (i + j) % 2 === 0 ? A : B;
+      const mat = m(col, 0.55, 0.06, col, 0.25);
+      const x = (i - (N - 1) / 2) * CELL;
+      const z = (j - (N - 1) / 2) * CELL;
+      place(new THREE.BoxGeometry(CELL * 0.97, 0.035, CELL * 0.97), mat, x, 0.018, z);
+      pads.push(mat);
+    }
+  }
+  // A dark trim so the floor reads as an inset panel, not a rug. It also
+  // CARRIES the handles: registerFurnitureHandles only visits meshes, so a
+  // Group would be collected by nothing and the floor would never pulse.
+  const trim = place(
+    new THREE.BoxGeometry(N * CELL + 0.1, 0.02, N * CELL + 0.1),
+    m(0x23252e, 0.8, 0.1),
+    0,
+    0.008,
+    0,
+  );
+
+  let t = 0;
+  // 💡 The floor lights up when the ROOM has music: any party speaker whose
+  // switch is on, or that is sounding its entry round on this client. It
+  // used to read `speaker:<its own id>` — a key no speaker ever writes — so
+  // it never lit (Copilot review, PR #169). Polled per frame: a handful of
+  // speakers at most, and the entry round is local state, not a doc key.
+  const musicOn = (): boolean =>
+    FURNITURE.some((i) => i.kind === "party-speaker" && (readSpeaker(i.id).on || isSpeakerPlaying(i.id)));
+  // Per-frame handle — World drives update(dt) and drops it on removal.
+  const pulse: PropAnimHandle = {
+    update(dt: number) {
+      if (!musicOn()) {
+        for (const mat of pads) mat.emissiveIntensity = 0.06;
+        return;
+      }
+      t += dt;
+      // Travelling wave across the grid, not a uniform blink: each pad's phase
+      // is offset by its index so the floor reads as moving light.
+      for (let k = 0; k < pads.length; k++) {
+        const phase = t * 3.2 - k * 0.35;
+        pads[k].emissiveIntensity = 0.18 + 0.30 * (0.5 + 0.5 * Math.sin(phase));
+      }
+    },
+  };
+  trim.userData.propAnim = pulse;
+}
+
+/**
+ * 🍸 Standing table — somewhere to put a drink down that isn't the cake table.
+ * The checklist is right that a party needs a second and third place to BE;
+ * this is the cheapest of them.
+ */
+function buildPartyStandingTable(ctx: BuildCtx) {
+  const { m, place } = ctx;
+  const H = 1.02;
+  place(new THREE.CylinderGeometry(0.30, 0.30, 0.05, 20), m(CLOTH, 0.7, 0.05), 0, H, 0);
+  place(new THREE.CylinderGeometry(0.055, 0.055, H, 10), m(0xd8d2c4, 0.5, 0.45), 0, H / 2, 0);
+  place(new THREE.CylinderGeometry(0.26, 0.30, 0.04, 16), m(0xd8d2c4, 0.6, 0.4), 0, 0.02, 0);
+  // A cloth sleeve down the post — bistro tables always have one.
+  place(new THREE.CylinderGeometry(0.085, 0.11, H - 0.1, 12), m(CLOTH, 0.95, 0.0), 0, (H - 0.1) / 2, 0);
+}
+
 // Obstacle-bearing items appear first, in the same order as the original
 // hand-authored OBSTACLES list, so collision-resolution iteration order (and
 // therefore sliding behaviour in multi-box corners) is unchanged.
@@ -6483,6 +8981,26 @@ export const FURNITURE: FurnitureItem[] = [
     movable: true,
   },
 ];
+/**
+ * 🪑 The Grand Lobby manifest, FROZEN at module load.
+ *
+ * `FURNITURE` above is not a constant in practice: World.reconcileFurniture
+ * splices and pushes it so it always mirrors the room you are standing in.
+ * Two things that meant to read "the default lobby" were reading "the current
+ * room" instead — the Grand Lobby template (placing it in an empty room placed
+ * nothing; in a furnished one, a copy of that room) and the seeding of a brand
+ * new module (which could inherit whatever room you had just walked out of).
+ * Both read this snapshot now. Deep-copied so a later edit-mode drag on a live
+ * item can never reach into it.
+ */
+export const DEFAULT_LOBBY_FURNITURE: readonly FurnitureItem[] = Object.freeze(
+  FURNITURE.map((i) => ({
+    ...i,
+    pos: { ...i.pos },
+    ...(i.footprintOverride ? { footprintOverride: { ...i.footprintOverride } } : {}),
+  })),
+);
+
 
 /**
  * Module-load snapshot of the hand-authored footprintOverrides above, keyed
@@ -6586,6 +9104,15 @@ export function footprintAabb(
 export function itemAabb(item: FurnitureItem): Box | null {
   if (item.footprintOverride !== undefined) return item.footprintOverride;
   return footprintAabb(item.kind, item.pos, item.rot);
+}
+
+/** What an item takes up for "is something already here?": its obstacle box
+ *  on the floor, or — for a wall-hung piece, which has none — the slab it
+ *  occupies on its wall (wallMountBox). ROSE WALLS tested only the floor box
+ *  and could hang a rose over the terminal, hiding the room's one way back
+ *  into EDIT ROOM (Copilot review, PR #169). */
+export function itemOccupancyBox(item: FurnitureItem): Box | null {
+  return itemAabb(item) ?? wallMountBox(item.kind, item.pos, item.rot);
 }
 
 /**
@@ -6745,7 +9272,7 @@ for (const item of OUTDOOR_FURNITURE) {
  * warm bright light) or a 'casino' — there is no room whose id means either
  * (owner ruling 2026-08-13: no room types).
  */
-export type RoomTheme = "interior" | "casino" | "outdoor-deck";
+export type RoomTheme = "interior" | "casino" | "outdoor-deck" | "beach";
 
 /**
  * Default casino floor. The four door approach lanes stay open, and every
@@ -7211,20 +9738,323 @@ function buildClassicHotTub({ m, flat, place, addLight }: BuildCtx) {
   addLight(new THREE.PointLight(0xcfe8f4, 0, 1.8), 1.1, 0.65, -0.55, 0.7);
 }
 
-export function getPoolBasin(items: FurnitureItem[]): {
+/**
+ * 🏊 Which kinds ARE water — the one list every pool-shaped question asks.
+ *
+ * The floor hole, the hole outline, the water bbox, the swim basin and World's
+ * "hide the platform floor" test all used to spell this pair out inline, and a
+ * new water kind had to find all five. It is a predicate now, so adding one is
+ * adding it here.
+ */
+/** World point → a cardinally-posed item's LOCAL frame. */
+function toLocal(item: FurnitureItem, wx: number, wz: number): { x: number; z: number } {
+  const inv = ((4 - item.rot) % 4) as Rot;
+  return rotXZ(wx - item.pos.x, wz - item.pos.z, inv);
+}
+
+/** A local AABB → the world AABB it becomes under a CARDINAL rotation. */
+function localBoxToWorld(item: FurnitureItem, x0: number, z0: number, x1: number, z1: number): Box {
+  const a = rotXZ(x0, z0, item.rot);
+  const b = rotXZ(x1, z1, item.rot);
+  return {
+    x0: item.pos.x + Math.min(a.x, b.x),
+    z0: item.pos.z + Math.min(a.z, b.z),
+    x1: item.pos.x + Math.max(a.x, b.x),
+    z1: item.pos.z + Math.max(a.z, b.z),
+  };
+}
+
+/** A bridge's footprint in the RIVER's local frame (both are cardinal, so the
+ *  rotated box is still an AABB). */
+function bridgeLocalBox(river: FurnitureItem, bridge: FurnitureItem): Box {
+  const half = ((4 - river.rot) % 4) as Rot;
+  const c = rotXZ(BRIDGE_W / 2, bridgeLen() / 2, bridge.rot);
+  const w0 = { x: bridge.pos.x - Math.abs(c.x), z: bridge.pos.z - Math.abs(c.z) };
+  const w1 = { x: bridge.pos.x + Math.abs(c.x), z: bridge.pos.z + Math.abs(c.z) };
+  const a = rotXZ(w0.x - river.pos.x, w0.z - river.pos.z, half);
+  const b = rotXZ(w1.x - river.pos.x, w1.z - river.pos.z, half);
+  return {
+    x0: Math.min(a.x, b.x),
+    z0: Math.min(a.z, b.z),
+    x1: Math.max(a.x, b.x),
+    z1: Math.max(a.z, b.z),
+  };
+}
+
+/**
+ * 🌊 The river's blocked area, as one strip per metre of its length rather
+ * than one box round the lot — see FurnitureDef.obstacleBoxes for why. Each
+ * strip spans the water at that column (widened to the drift WITHIN the
+ * column, so no water leaks out between strips) and is then cut by any bridge
+ * crossing it, which is what makes the crossing walkable.
+ */
+function riverObstacleBoxes(item: FurnitureItem, all: FurnitureItem[]): Box[] {
+  const boxes: Box[] = [];
+  const bridges = all
+    .filter((i) => i.kind === "plank-bridge")
+    .map((b) => bridgeLocalBox(item, b));
+  const STRIP = 1.0;
+  // Blocked-ness is a strict inequality (pathfinding.ts, the collision
+  // resolver), so strips overlap slightly: a point landing exactly on a shared
+  // edge would otherwise belong to neither.
+  const SEAM = 0.01;
+
+  const { halfLen, wWet } = riverMetrics();
+  for (let lx0 = -halfLen; lx0 < halfLen; lx0 += STRIP) {
+    const lx1 = Math.min(lx0 + STRIP, halfLen);
+
+    // Split the column in X at every bridge edge inside it FIRST. Cutting the
+    // whole column whenever a bridge merely clipped its edge used to delete a
+    // full metre of river for a few centimetres of bridge, leaving walkable
+    // water alongside the crossing.
+    const xEdges = new Set<number>([lx0, lx1]);
+    for (const b of bridges) {
+      if (b.x0 > lx0 && b.x0 < lx1) xEdges.add(b.x0);
+      if (b.x1 > lx0 && b.x1 < lx1) xEdges.add(b.x1);
+    }
+    const xs = [...xEdges].sort((a, b) => a - b);
+
+    for (let k = 0; k < xs.length - 1; k++) {
+      const sx0 = xs[k];
+      const sx1 = xs[k + 1];
+      if (sx1 - sx0 < 1e-6) continue;
+      const mid = (sx0 + sx1) / 2;
+      // The cut spans the whole EXCAVATION here, widened to the centre line's
+      // drift within this piece so no water leaks out between pieces.
+      const zc = [riverCentreZ(sx0), riverCentreZ(mid), riverCentreZ(sx1)];
+      const spans = [{ z0: Math.min(...zc) - wWet, z1: Math.max(...zc) + wWet }];
+      // Only a bridge that actually covers THIS piece in x may cut it.
+      for (const b of bridges) {
+        if (mid <= b.x0 || mid >= b.x1) continue;
+        for (let i = spans.length - 1; i >= 0; i--) {
+          const sp = spans[i];
+          if (b.z1 <= sp.z0 || b.z0 >= sp.z1) continue;
+          spans.splice(i, 1);
+          if (b.z0 > sp.z0) spans.push({ z0: sp.z0, z1: b.z0 });
+          if (b.z1 < sp.z1) spans.push({ z0: b.z1, z1: sp.z1 });
+        }
+      }
+      for (const sp of spans) {
+        if (sp.z1 - sp.z0 < 0.05) continue;
+        boxes.push(localBoxToWorld(item, sx0 - SEAM, sp.z0, sx1 + SEAM, sp.z1));
+      }
+    }
+  }
+  return boxes;
+}
+
+/**
+ * 🏊 Is this WORLD point actually in a pool's water? Kind-aware, unlike the
+ * basin rectangle: the river's band bends away from its own bounding box, and
+ * auto-swimming someone standing on the dry sand at a bend is exactly the bug
+ * the rect test would cause.
+ */
+export function poolWaterContains(items: FurnitureItem[], wx: number, wz: number): boolean {
+  for (const item of items) {
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      const l = toLocal(item, wx, wz);
+      if (!riverHasWaterAt(l.x, l.z)) continue;
+      // Standing ON the bridge is standing over water, not in it.
+      const onBridge = items.some((b) => {
+        if (b.kind !== "plank-bridge") return false;
+        const bb = bridgeLocalBox(item, b);
+        return l.x > bb.x0 && l.x < bb.x1 && l.z > bb.z0 && l.z < bb.z1;
+      });
+      return !onBridge;
+    }
+    // Each rectangular pool by ITS OWN basin — the first pool's rectangle
+    // reported the second pool dry (Copilot review, PR #169).
+    const basin = poolBasinOf(item);
+    if (wx > basin.x0 && wx < basin.x1 && wz > basin.z0 && wz < basin.z1) return true;
+  }
+  return false;
+}
+
+/**
+ * 🕳️ Is this WORLD point inside a pool's EXCAVATION — what the floor hole and
+ * the obstacle strips follow? For every pool but the river this is the same as
+ * the water; the river also cuts its wet shelf, which is dry but 30 cm down.
+ */
+export function poolCutContains(items: FurnitureItem[], wx: number, wz: number): boolean {
+  for (const item of items) {
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      const l = toLocal(item, wx, wz);
+      if (!riverHasCutAt(l.x, l.z)) continue;
+      const onBridge = items.some((b) => {
+        if (b.kind !== "plank-bridge") return false;
+        const bb = bridgeLocalBox(item, b);
+        return l.x > bb.x0 && l.x < bb.x1 && l.z > bb.z0 && l.z < bb.z1;
+      });
+      return !onBridge;
+    }
+    return poolWaterContains(items, wx, wz);
+  }
+  return false;
+}
+
+/** 🏝️ Kinds whose geometry, tiles and blocked area come from the ROOM, not
+ *  from the item's pose (the sea, the infinity pool): they can be added and
+ *  removed but not dragged — a drag would move the mesh's offset and nothing
+ *  else (Copilot review, PR #169). */
+export function isRoomAnchoredKind(kind: FurnitureKind): boolean {
+  return kind === "beach-sea" || kind === "infinity-pool";
+}
+
+export function isPoolKind(kind: FurnitureKind): boolean {
+  return kind === "lazy-pool" || kind === "classic-pool" || kind === "beach-river";
+}
+
+/**
+ * 🌊 A swim route that stays IN a winding river: from `from` to `to` along
+ * the centre line, the swimmer's offset from the centre eased from where it
+ * started to where it is going, never past the bank. Null when the room's
+ * pool is not a river (rectangular water needs no routing) or either end is
+ * not in its water. Straight lines between two bends crossed the sand
+ * (Copilot review, PR #169).
+ */
+/**
+ * 🌊 Where a swimmer in the river climbs out: the point on the NEAR bank —
+ * the bank on the target's side of the water when the target is out of it,
+ * else the closer one — just past the wet shelf, straight across the flow
+ * from where they are. A straight glide there never crosses sand; the
+ * basin rectangle's edges did (Copilot review, PR #169). Null when the
+ * room's pool is not a river or the swimmer is not in its water.
+ */
+export function riverClimbOut(
+  items: FurnitureItem[],
+  from: { x: number; z: number },
+  target: { x: number; z: number },
+): { x: number; z: number } | null {
+  const river = items.find((i) => i.kind === "beach-river");
+  if (!river) return null;
+  const a = toLocal(river, from.x, from.z);
+  if (!riverHasWaterAt(a.x, a.z)) return null;
+  const t = toLocal(river, target.x, target.z);
+  const { wWet, halfLen } = riverMetrics();
+  const offFrom = a.z - riverCentreZ(a.x);
+  const offTarget = t.z - riverCentreZ(t.x);
+  const side = riverHasWaterAt(t.x, t.z) ? Math.sign(offFrom) || 1 : Math.sign(offTarget) || 1;
+  const lx = Math.max(-halfLen + 0.3, Math.min(halfLen - 0.3, a.x));
+  const lz = riverCentreZ(lx) + side * (wWet + 0.35);
+  const w = rotXZ(lx, lz, river.rot);
+  return { x: river.pos.x + w.x, z: river.pos.z + w.z };
+}
+
+export function riverSwimWaypoints(
+  items: FurnitureItem[],
+  from: { x: number; z: number },
+  to: { x: number; z: number },
+): Array<{ x: number; z: number }> | null {
+  const river = items.find((i) => i.kind === "beach-river");
+  if (!river) return null;
+  const a = toLocal(river, from.x, from.z);
+  const b = toLocal(river, to.x, to.z);
+  if (!riverHasWaterAt(a.x, a.z) || !riverHasWaterAt(b.x, b.z)) return null;
+  const { wWater } = riverMetrics();
+  const lane = Math.max(0.1, wWater - 0.3); // stay this far inside the bank
+  const offA = Math.max(-lane, Math.min(lane, a.z - riverCentreZ(a.x)));
+  const offB = Math.max(-lane, Math.min(lane, b.z - riverCentreZ(b.x)));
+  const steps = Math.max(1, Math.ceil(Math.abs(b.x - a.x) / 0.75));
+  const out: Array<{ x: number; z: number }> = [];
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const lx = a.x + (b.x - a.x) * t;
+    const lz = riverCentreZ(lx) + offA + (offB - offA) * t;
+    const w = rotXZ(lx, lz, river.rot);
+    out.push({ x: river.pos.x + w.x, z: river.pos.z + w.z });
+  }
+  return out;
+}
+
+/** 🕳️ Kinds that sink BELOW the floor and so need a hole cut in it: every pool,
+ *  plus the infinity pool (unswimmable, but its terraces are under floor level). */
+export function isFloorCutKind(kind: FurnitureKind): boolean {
+  return isPoolKind(kind) || kind === "infinity-pool";
+}
+
+/** 🕳️ The floor's hole outlines for these items — the infinity pool's
+ *  staircase polygons, else the swim pool's outline. World XZ. Empty when nothing is sunk. */
+export function floorCutOutlines(items: FurnitureItem[]): Array<Array<{ x: number; z: number }>> {
+  // The UNION: a room can hold a swim pool and an infinity pool at once
+  // (edit mode, additive sets), and each needs its hole (Copilot review, PR #169).
+  const out: Array<Array<{ x: number; z: number }>> = [];
+  if (items.some((i) => i.kind === "infinity-pool")) out.push(...infinityPoolOutlines());
+  const outline = poolHoleOutline(items);
+  if (outline) out.push(outline);
+  return out;
+}
+
+export interface PoolBasin {
   x0: number;
   z0: number;
   x1: number;
   z1: number;
   exit: { x0: number; z0: number; x1: number; z1: number };
-} | null {
+}
+
+/** The FIRST pool's basin — kept for callers that only ask "is there water";
+ *  anything about a point or a swimmer wants poolBasinAt, which resolves the
+ *  pool the point is actually in (Copilot review, PR #169: with two pools
+ *  the second was judged by the first's rectangle). */
+export function getPoolBasin(items: FurnitureItem[]): PoolBasin | null {
   for (const item of items) {
-    if (item.kind !== "lazy-pool" && item.kind !== "classic-pool") continue;
+    if (!isPoolKind(item.kind)) continue;
+    return poolBasinOf(item);
+  }
+  return null;
+}
+
+/** 🏊 The basin of the pool whose water holds (wx, wz) — the swimmer's OWN
+ *  pool, kept through the swim and the climb-out — else, out of the water,
+ *  the nearest pool's; null with no pool in the room. */
+export function poolBasinAt(items: FurnitureItem[], wx: number, wz: number): PoolBasin | null {
+  let nearest: PoolBasin | null = null;
+  let nearestD = Infinity;
+  for (const item of items) {
+    if (!isPoolKind(item.kind)) continue;
+    const basin = poolBasinOf(item);
+    if (poolWaterContains([item, ...items.filter((b) => b.kind === "plank-bridge")], wx, wz)) return basin;
+    const d = Math.hypot(item.pos.x - wx, item.pos.z - wz);
+    if (d < nearestD) { nearestD = d; nearest = basin; }
+  }
+  return nearest;
+}
+
+/** One pool's basin rectangle (world space) and its exit corridor. */
+export function poolBasinOf(item: FurnitureItem): PoolBasin {
+  {
+    if (item.kind === "beach-river") {
+      // The band's bounding box. Swim CLAMPING and climb-out both want a
+      // rectangle, and over-covering is safe here because ENTRY is gated by
+      // poolWaterContains — you cannot start swimming on the dry sand at a
+      // bend, you can only drift over it once already in the water.
+      const rm = riverMetrics();
+      const half = rm.amp + rm.wWater - 0.2;
+      const a = rotXZ(-rm.halfLen + 0.4, -half, item.rot);
+      const b = rotXZ(rm.halfLen - 0.4, half, item.rot);
+      const e1 = rotXZ(-rm.halfLen + 0.4, -(half + 0.9), item.rot);
+      const e2 = rotXZ(rm.halfLen - 0.4, half + 0.9, item.rot);
+      return {
+        x0: item.pos.x + Math.min(a.x, b.x),
+        z0: item.pos.z + Math.min(a.z, b.z),
+        x1: item.pos.x + Math.max(a.x, b.x),
+        z1: item.pos.z + Math.max(a.z, b.z),
+        exit: {
+          x0: item.pos.x + Math.min(e1.x, e2.x),
+          z0: item.pos.z + Math.min(e1.z, e2.z),
+          x1: item.pos.x + Math.max(e1.x, e2.x),
+          z1: item.pos.z + Math.max(e1.z, e2.z),
+        },
+      };
+    }
     // ASYMMETRIC water: local -x reaches the west infinity edge (the west
     // deck IS water — see buildLazyPool WX). Corners rotate with the item.
     // Margin keeps the avatar's bulk off walls/edges; a "west" climb-out
     // lands back inside the basin and the auto-swim converts it — by design
     // (there is no deck out there, only horizon).
+    // (Rect pools: lazy-pool and classic-pool share this basin.)
     const a = rotXZ(-4.8, -2.55, item.rot); // west/deep corner (WX - margin)
     const b = rotXZ(3.05, 2.55, item.rot); // east corner (HX - margin)
     const e1 = rotXZ(-4.6, -3.25, item.rot); // exits: corridor cell centres
@@ -7242,7 +10072,6 @@ export function getPoolBasin(items: FurnitureItem[]): {
       },
     };
   }
-  return null;
 }
 
 /** 🌊 The lazy-river water outline (irregular bank + central island hole) in
@@ -7293,9 +10122,21 @@ function pointInPoly(px: number, py: number, poly: Array<{ x: number; y: number 
  */
 export function poolHoleCells(items: FurnitureItem[]): Set<string> {
   const cells = new Set<string>();
-  const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+  const pool = items.find((i) => isPoolKind(i.kind));
   if (!pool) return cells;
   const rect = poolHoleRect(items)!; // world bbox of the water footprint
+
+  if (pool.kind === "beach-river") {
+    // Analytic band — no polygon sampling needed, the half-width is constant
+    // about a known centre line. Bridge cells keep their floor, which is what
+    // a bridge IS.
+    for (let i = Math.floor(rect.x0); i < Math.ceil(rect.x1); i++) {
+      for (let j = Math.floor(rect.z0); j < Math.ceil(rect.z1); j++) {
+        if (poolCutContains(items, i + 0.5, j + 0.5)) cells.add(`${i},${j}`);
+      }
+    }
+    return cells;
+  }
 
   if (pool.kind === "classic-pool") {
     // Rectangular water ⇒ rectangular hole: cut cells whose CENTRE lies inside
@@ -7370,10 +10211,29 @@ export function mergeCellsToRects(cells: Set<string>): Box[] {
  * so an organic hole is safe for pathfinding. Null when there's no pool.
  */
 export function poolHoleOutline(items: FurnitureItem[]): Array<{ x: number; z: number }> | null {
-  const pool = items.find((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+  const pool = items.find((i) => isPoolKind(i.kind));
   if (!pool) return null;
   let local: Array<{ x: number; z: number }>;
-  if (pool.kind === "classic-pool") {
+  if (pool.kind === "beach-river") {
+    // Down one bank and back along the other — the same centre line the water
+    // ribbon is built from, so the cut edge and the water edge coincide.
+    // ⚠️ The hole must stay STRICTLY INSIDE the floor's outer ring: a hole
+    // touching the outer edge is not a hole to the triangulator
+    // (ShapeGeometry/earcut) — the floor comes back as bridging triangles that
+    // tilt down into the basin, a steep slope where there should be flat sand.
+    // riverMetrics().halfLen already stops RIVER_END_LIP short of the walls.
+    const rm = riverMetrics();
+    const ring: Array<{ x: number; z: number }> = [];
+    for (let i = 0; i <= RIVER_SEGS; i++) {
+      const lx = -rm.halfLen + (i / RIVER_SEGS) * rm.halfLen * 2;
+      ring.push({ x: lx, z: riverCentreZ(lx) - rm.wWet });
+    }
+    for (let i = RIVER_SEGS; i >= 0; i--) {
+      const lx = -rm.halfLen + (i / RIVER_SEGS) * rm.halfLen * 2;
+      ring.push({ x: lx, z: riverCentreZ(lx) + rm.wWet });
+    }
+    local = ring;
+  } else if (pool.kind === "classic-pool") {
     // Rectangular water footprint.
     local = [
       { x: -POOL_WATER_WEST, z: -POOL_WATER_HALFZ },
@@ -7407,7 +10267,12 @@ export function poolHoleRect(
   items: FurnitureItem[],
 ): { x0: number; z0: number; x1: number; z1: number } | null {
   for (const item of items) {
-    if (item.kind !== "lazy-pool" && item.kind !== "classic-pool") continue;
+    if (!isPoolKind(item.kind)) continue;
+    if (item.kind === "beach-river") {
+      const rm = riverMetrics();
+      const half = rm.amp + rm.wWet;
+      return localBoxToWorld(item, -rm.halfLen, -half, rm.halfLen, half);
+    }
     const a = rotXZ(-POOL_WATER_WEST, -POOL_WATER_HALFZ, item.rot);
     const b = rotXZ(POOL_WATER_EAST, POOL_WATER_HALFZ, item.rot);
     return {
@@ -7545,6 +10410,30 @@ export function wallMountBox(
   return { x0: pos.x - hw, z0: pos.z - hd, x1: pos.x + hw, z1: pos.z + hd };
 }
 
+/** The wall-mounted piece already hanging where (kind, pos, rot) would hang
+ *  on the SAME wall — their slabs overlapping — or null. Wall mounts have no
+ *  floor box, so the placement gate's furniture rule never saw one: a rose
+ *  could be hung over the terminal, hiding the room's way back into EDIT
+ *  ROOM, and the terminal re-hung inside a rose curtain (Copilot review,
+ *  PR #169). The same wall only: at a corner the slabs of two walls' pieces
+ *  cross for 0.15 m without either covering the other. */
+export function wallMountHungOver(
+  kind: FurnitureKind,
+  pos: { x: number; z: number },
+  rot: Rot,
+  others: readonly FurnitureItem[],
+  selfId?: string,
+): FurnitureItem | null {
+  const slab = wallMountBox(kind, pos, rot);
+  if (!slab) return null;
+  for (const o of others) {
+    if (o.id === selfId || o.rot !== rot) continue;
+    const ob = wallMountBox(o.kind, o.pos, o.rot);
+    if (ob && slab.x0 < ob.x1 && slab.x1 > ob.x0 && slab.z0 < ob.z1 && slab.z1 > ob.z0) return o;
+  }
+  return null;
+}
+
 /** A wall-mounted panel's half-width along its wall (0 for other kinds) — the
  *  span the doorway/window clearance checks measure against. */
 export function wallMountHalfWidth(kind: FurnitureKind): number {
@@ -7582,6 +10471,11 @@ export function deviceFrontFor(
 export function buildObstacleList(items: FurnitureItem[]): Box[] {
   const boxes: Box[] = [];
   for (const item of items) {
+    const multi = FURNITURE_DEFS[item.kind].obstacleBoxes;
+    if (multi) {
+      boxes.push(...multi(item, items));
+      continue;
+    }
     const box = itemAabb(item);
     if (box) boxes.push(box);
   }

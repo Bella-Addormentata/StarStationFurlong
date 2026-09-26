@@ -45,17 +45,20 @@
 import * as THREE from 'three';
 import {
   FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos,
-  footprintAabb, itemAabb,
+  footprintAabb, itemAabb, itemOccupancyBox,
 } from './furniture';
-import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
+import type { Box, FurnitureItem, FurnitureKind, Rot } from './furniture';
+import { PLAYER_R } from './player';
 // 🛰️ Hull space (exterior anchors + stacking) — moved out of furniture.ts.
 import { findFreeExteriorSpot } from './hull';
 import { validatePlacement, roomEdit } from './editMode';
 import type { PlacementContext } from './editMode';
-import { writeFurnitureItem } from './furnitureDoc';
+import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 // #45 board mirror: spawned game tables paint the doc's current game at once.
 import { readGame } from './games/gamesDoc';
-import { ROOM_TEMPLATES, applyRoomTemplate, exportCurrentRoomAsTemplate } from './roomTemplates';
+import {
+  ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
+} from './roomTemplates';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
@@ -108,6 +111,34 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'lavender-bouquet': '🪻 LAVENDER BOUQUET',
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
+  'cake-table': '🎂 CAKE TABLE',
+  'gift-box': '🎁 GIFT BOX',
+  'birthday-banner': '🎊 BIRTHDAY BANNER',
+  'party-speaker': '🔊 PARTY SPEAKER',
+  'dance-floor': '💃 DANCE FLOOR',
+  'party-standing-table': '🍸 STANDING TABLE',
+  'palm-tree': '🌴 PALM TREE',
+  'parasol': '⛱️ PARASOL',
+  'sun-lounger': '🛋️ SUN LOUNGER',
+  'surfboard': '🏄 SURFBOARD',
+  'beach-towel': '🏖️ BEACH TOWEL',
+  'beach-ball': '🏐 BEACH BALL',
+  'beach-crate': '📦 CRATE',
+  'cooler': '🧊 COOLER',
+  'tiki-torch': '🔥 TIKI TORCH',
+  'tiki-bar-counter': '🍹 TIKI BAR COUNTER',
+  'tiki-back-bar': '🍾 BACK BAR',
+  'tiki-bar-stool': '🪑 BAR STOOL',
+  'pergola-post': '🏛 PERGOLA POST',
+  'pergola-roof': '✨ PERGOLA ROOF (LANTERNS)',
+  'beach-river': '🌊 BEACH RIVER',
+  'plank-bridge': '🌉 PLANK BRIDGE',
+  'beach-sea': '🌊 BEACH SEA (corner)',
+  'infinity-pool': '🏊 INFINITY POOL (front edge)',
+  'tiki-parasol': '🏝️ TIKI PARASOL',
+  'beach-raft': '🛶 RAFT',
+  'jungle-plant': '🌿 JUNGLE PLANT',
+  'climbing-rose': '🌹 CLIMBING ROSE (wall)',
 };
 
 type GetWorld = () => World | null;
@@ -363,6 +394,30 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
  * walkable grid), then replan — shared by the free-spawn (FURNITURE section)
  * and inventory re-place (#53 INVENTORY section) paths.
  */
+/** Commit a BATCH the way commitSpawn commits one: every item pushed and
+ *  built, then the obstacle / grid / seat / device rebuild ONCE and one doc
+ *  transaction — ROSE WALLS hangs dozens at a time, and a full pipeline per
+ *  rose stalled the frame and burst the network (Copilot review, PR #169). */
+function commitSpawnMany(world: World, items: FurnitureItem[]): void {
+  if (items.length === 0) return;
+  for (const item of items) {
+    FURNITURE.push(item);
+    registerSpawnedGroup(world, item);
+  }
+  rebuildObstacles();
+  rebakeWalkableGrid();
+  rebuildSeats();
+  rebuildDevices();
+  world.getPlayer().onObstaclesChanged();
+  world.refreshOutdoorFloor();
+  if (items.some((i) => i.kind === 'charging-dock')) world.refreshRobots();
+  addFurniture(items); // ids are already unique (uniqueSpawnId), so none are renamed
+  if (roomEdit.isEditModeActive()) {
+    roomEdit.forceExit();
+    roomEdit.enter(world);
+  }
+}
+
 function commitSpawn(world: World, item: FurnitureItem): void {
   FURNITURE.push(item);
   registerSpawnedGroup(world, item);
@@ -428,6 +483,78 @@ function spawnFurniture(kind: FurnitureKind): void {
  * every load (the retired south-wall terminal), so restoring under that id
  * would vanish on the next reload.
  */
+/**
+ * 🌹 ROSE WALLS (owner request 2026-09-25): hang climbing roses shoulder to
+ * shoulder along the room's two most open walls — one per metre, so the
+ * curtains join into one. A wall's open length is what is left after its
+ * doorways, windows and anything standing against it (validatePlacement
+ * covers doors and windows; a hedge in front would only hide the roses, so
+ * furniture within a metre of the wall blocks the slot too). Additive: slots
+ * already holding a rose are skipped, so a second press fills gaps, not more.
+ */
+function fillRoseWalls(): void {
+  const world = getWorld();
+  if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
+    showHint('DEV: enter the room first.');
+    return;
+  }
+  const { halfX, halfZ } = roomHalfExtents();
+  const INSET = 0.03; // the flush-mount plane (furniture.ts snapInteriorWall)
+  const player = world.getPlayer().getPosition();
+  const ctx: PlacementContext = {
+    playerPositions: [{ x: player.x, z: player.z }, ...world.getRemotePlayerPositions()],
+    floodFrom: floodOrigin(world.getPlayer()),
+    requiredReachable: collectRequiredReachable(floodOrigin(world.getPlayer())),
+  };
+  // Every wall: its rot (furniture.ts WALL_MOUNT_ROT) and the pose of a slot
+  // at `along` metres from the room centre.
+  const walls: Array<{ name: string; rot: Rot; half: number; pose: (along: number) => { x: number; z: number } }> = [
+    { name: 'north', rot: 0, half: halfX, pose: (a) => ({ x: a, z: -halfZ + INSET }) },
+    { name: 'east', rot: 3, half: halfZ, pose: (a) => ({ x: halfX - INSET, z: a }) },
+    { name: 'south', rot: 2, half: halfX, pose: (a) => ({ x: a, z: halfZ - INSET }) },
+    { name: 'west', rot: 1, half: halfZ, pose: (a) => ({ x: -halfX + INSET, z: a }) },
+  ];
+  const blockedByFurniture = (pos: { x: number; z: number }, rot: Rot): boolean => {
+    // A 1 m stretch of wall and the metre of floor in front of it.
+    const alongX = rot % 2 === 0;
+    const band = alongX
+      ? { x0: pos.x - 0.5, x1: pos.x + 0.5, z0: Math.min(pos.z, pos.z - Math.sign(pos.z) * 1.0), z1: Math.max(pos.z, pos.z - Math.sign(pos.z) * 1.0) }
+      : { z0: pos.z - 0.5, z1: pos.z + 0.5, x0: Math.min(pos.x, pos.x - Math.sign(pos.x) * 1.0), x1: Math.max(pos.x, pos.x - Math.sign(pos.x) * 1.0) };
+    // Floor boxes AND wall slabs: the terminal has no footprint, but a rose
+    // hung over it would hide the way back into EDIT ROOM.
+    return FURNITURE.some((o) => {
+      if (o.kind === 'climbing-rose') return false;
+      const ob = itemOccupancyBox(o);
+      return !!ob && band.x0 < ob.x1 && band.x1 > ob.x0 && band.z0 < ob.z1 && band.z1 > ob.z0;
+    });
+  };
+  const probe: FurnitureItem = { id: 'rose-walls-probe', kind: 'climbing-rose', pos: { x: 0, z: 0 }, rot: 0, movable: true };
+  const plans = walls.map((w) => {
+    const slots: Array<{ x: number; z: number }> = [];
+    for (let a = -w.half + 0.5; a <= w.half - 0.5 + 1e-6; a += 1.0) {
+      const pos = w.pose(a);
+      const taken = FURNITURE.some((o) => o.kind === 'climbing-rose' && o.rot === w.rot && Math.hypot(o.pos.x - pos.x, o.pos.z - pos.z) < 0.9);
+      if (taken || blockedByFurniture(pos, w.rot)) continue;
+      if (!validatePlacement(probe, pos, w.rot, ctx).ok) continue;
+      slots.push(pos);
+    }
+    return { ...w, slots };
+  });
+  plans.sort((a, b) => b.slots.length - a.slots.length);
+  const chosen = plans.slice(0, 2).filter((p) => p.slots.length > 0);
+  const batch: FurnitureItem[] = [];
+  for (const w of chosen) {
+    for (const pos of w.slots) {
+      batch.push({ id: uniqueSpawnId('climbing-rose'), kind: 'climbing-rose', pos, rot: w.rot, movable: true });
+    }
+  }
+  commitSpawnMany(world, batch);
+  const placed = batch.length;
+  showHint(placed
+    ? `DEV: 🌹 hung ${placed} climbing roses along the ${chosen.map((w) => w.name).join(' and ')} wall${chosen.length > 1 ? 's' : ''} — synced to the room (E4).`
+    : 'DEV: 🌹 no open wall for roses (doorways, windows and the hedge take every slot).', 5000);
+}
+
 function spawnWallComputer(): void {
   const world = getWorld();
   if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
@@ -688,6 +815,12 @@ function buildPanel(): HTMLDivElement {
   // room that lost it needs a way back into EDIT ROOM.
   furnitureRows.unshift(`
     <div style="${ROW_STYLE}">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🌹 ROSE WALLS <span style="color:rgba(255,179,0,0.4);">· two open walls, one rose per metre</span></span>
+      <button type="button" data-dev-action="rose-walls" title="Hang climbing roses shoulder to shoulder along the two most open walls" style="${BTN_STYLE}">+ ADD</button>
+    </div>
+  `);
+  furnitureRows.unshift(`
+    <div style="${ROW_STYLE}">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ WALL COMPUTER <span style="color:rgba(255,179,0,0.4);">· restore</span></span>
       <button type="button" data-dev-action="spawn-wall-computer" style="${BTN_STYLE}">+</button>
     </div>
@@ -728,7 +861,10 @@ function buildPanel(): HTMLDivElement {
   const templateRows = ROOM_TEMPLATES.map((t) => `
     <div style="${ROW_STYLE}">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${t.description}">${t.name.toUpperCase()}</span>
-      <button type="button" data-dev-action="place-template" data-template="${t.id}" style="${BTN_STYLE}">PLACE</button>
+      <span style="display:flex; gap:4px; flex-shrink:0;">
+        ${t.layout ? `<button type="button" data-dev-action="add-template" data-template="${t.id}" title="Add this set to the room — nothing is removed" style="${BTN_STYLE}">+ ADD</button>` : ''}
+        <button type="button" data-dev-action="place-template" data-template="${t.id}" title="REPLACE every piece in the room with this template" style="${BTN_STYLE}">PLACE</button>
+      </span>
     </div>
   `);
   templateRows.push(`
@@ -789,6 +925,7 @@ function buildPanel(): HTMLDivElement {
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
+      case 'rose-walls': fillRoseWalls(); break;
       case 'spawn-wall-computer': spawnWallComputer(); break;
       case 'place-template': {
         const w = getWorld();
@@ -824,6 +961,33 @@ function buildPanel(): HTMLDivElement {
         w.reconcileDoorPlacements();
         w.updateSideWallCoverage();
         showHint(`DEV: 🏗️ placed "${t.name}" — ${t.items.length} pieces.`);
+        break;
+      }
+      // ➕ Additive: the room keeps everything it has, and a template with a
+      // layout generator fits itself to the room's real size. Not destructive,
+      // so no arm/confirm — that gate is there for PLACE, which wipes the room.
+      case 'add-template': {
+        const w = getWorld();
+        if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        // Players (inflated by the collision radius) and every reachable
+        // stand-point (plus the FINE-arrival epsilon) are ground the set
+        // must leave alone — the same clearances validatePlacement demands.
+        const me = w.getPlayer().getPosition();
+        const around = (p: { x: number; z: number }, r: number): Box => ({ x0: p.x - r, z0: p.z - r, x1: p.x + r, z1: p.z + r });
+        const keepClear: Box[] = [
+          ...[{ x: me.x, z: me.z }, ...w.getRemotePlayerPositions()].map((p) => around(p, PLAYER_R + 0.1)),
+          ...collectRequiredReachable(floodOrigin(w.getPlayer())).map((p) => around(p, PLAYER_R + 0.06)),
+        ];
+        const r = addRoomTemplateItems(btn.dataset.template ?? '', keepClear);
+        if (!r) break;
+        w.reconcileDoorPlacements();
+        w.updateSideWallCoverage();
+        showHint(
+          r.skipped > 0
+            ? `DEV: ➕ added ${r.placed} of "${r.name}" — ${r.skipped} didn't fit this room.`
+            : `DEV: ➕ added ${r.placed} pieces of "${r.name}".`,
+          5000,
+        );
         break;
       }
       case 'export-template': {
