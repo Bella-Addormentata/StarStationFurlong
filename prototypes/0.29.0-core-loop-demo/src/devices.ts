@@ -128,7 +128,19 @@ import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+
+/**
+ * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
+ * wave, the cake's confetti burst, the river's current. The builder
+ * (furniture.ts) stows it on a MESH's userData.propAnim (registerFurnitureHandles
+ * only visits meshes); World collects it and drives update(dt) every frame —
+ * the trunk-lid idiom, so the animation dies with the item instead of
+ * outliving it on a timer.
+ */
+export interface PropAnimHandle {
+  update(dt: number): void;
+}
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus

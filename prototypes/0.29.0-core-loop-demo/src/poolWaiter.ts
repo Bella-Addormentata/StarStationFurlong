@@ -17,10 +17,13 @@
 import * as THREE from "three";
 import type { Player } from "./player";
 import {
-  CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell,
+  CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell, walkableGridRevision,
 } from "./pathfinding";
 import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
+import { FURNITURE, type FurnitureItem } from "./furniture";
+import { readSpeaker } from "./partyDoc";
+import { isSpeakerPlaying, speakerBeat } from "./partyAudio";
 
 const WALK_SPEED = 1.15; // leisurely service pace (fox walks 2.8)
 const TURN_RATE = 9; // exponential turn smoothing factor
@@ -148,6 +151,39 @@ const COACH_REST_LINES: readonly string[] = [
   'Great set! Breathe…',
   'Nice form! Quick breather.',
 ];
+/** 🎉 Party dancer routine (owner request 2026-09-25): a birthday
+ *  celebration dance on the dance floor, run while the party speaker plays.
+ *  Four moves loop in time with the music — step-touch, hands-up wave, a full
+ *  spin, and a punch-the-air cheer with a shouted line. Every move's pose is
+ *  a half-sine per beat, so it starts and ends at neutral and the joins are
+ *  clean. Off the music the dancer waits on the floor and asks for a song. */
+/** Fallback tempo when no speaker reports a beat (the doc switch is on but
+ *  this client's voice is between rounds) — otherwise the dancer keeps time
+ *  to the speaker's playback (partyAudio speakerBeat). */
+const DANCE_BPM = 100;
+/** 👙 Bikini colours: the service red, and the dancer's black (owner request 2026-09-26). */
+const BIKINI_RED = 0xe0243a;
+const BIKINI_BLACK = 0x15151a;
+const DANCE_STEPS: ReadonlyArray<{ move: 'groove' | 'hands' | 'turn' | 'cheer'; beats: number }> = [
+  { move: 'groove', beats: 8 },
+  { move: 'hands', beats: 8 },
+  { move: 'groove', beats: 4 },
+  { move: 'turn', beats: 4 },
+  { move: 'cheer', beats: 8 },
+];
+const DANCE_CHEERS: readonly string[] = [
+  'Happy birthday, Dorkmo!',
+  'Make a wish!',
+  'Everybody on the dance floor!',
+  'Three cheers for the birthday fox!',
+  'Cake soon — keep dancing!',
+];
+const DANCE_WAIT_LINES: readonly string[] = [
+  "Start the music and I'll dance!",
+  'The floor is ready — hit play on the speaker!',
+];
+const DANCE_WAIT_EVERY = 25; // seconds between asks while the music is off
+
 /** Proximity invite (the coach's flavour of small talk). */
 const COACH_INVITES: readonly string[] = [
   'Join me for a set?',
@@ -227,6 +263,8 @@ export class PoolWaiter {
    *  behaviour). When idle past DOCK_AFTER_SECS with no fox near, the bot walks
    *  here and plays a charge pose until a fox approaches. */
   private dockTarget: { x: number; z: number; faceAngle: number } | null = null;
+  /** 👙 The bikini's one shared material: red on duty, black for the dancer. */
+  private bikiniMat!: THREE.MeshStandardMaterial;
   /** 🎰🤖 #77 Phase B: the roulette wheel-head post (world pos + facing). When
    *  set (the room has a roulette table), the bot leaves patrol/dock, walks to
    *  the head of the wheel, and stands the table as the croupier. Overrides dock
@@ -268,6 +306,18 @@ export class PoolWaiter {
   private stageYaw: number | null = null;
   /** 🏋️ The class stage — open floor nearest room centre (lazy, per class). */
   private coachStage: { x: number; z: number } | null = null;
+  /** 🎉 dance-routine state: the spot on the floor, beats into the current
+   *  move, which move, whether its cheer went out, and the wait-line clock. */
+  private danceSpot: { x: number; z: number } | null = null;
+  /** What the cached spot was derived from (floor pose | dock pose). */
+  private danceSpotKey = "";
+  private danceStepIdx = 0;
+  private danceStepBeat = 0;
+  private danceCheerSaid = false;
+  private danceWaitTimer = DANCE_WAIT_EVERY;
+  /** Heading at the start of the turn phrase — the turn is a function of
+   *  the phrase's progress, not of frame time. */
+  private danceTurnFrom = 0;
   /** 🧭 #77C in-room nav: the A*-routed world-space waypoints toward the current
    *  walk goal (routes around furniture / through door openings instead of
    *  clipping straight through), and the goal they were computed for. */
@@ -400,7 +450,8 @@ export class PoolWaiter {
     const SKIN = this.mat(0xf0c2a2, 0.55, 0.05); // synthetic skin
     const PLATE = this.mat(0xf9fafc, 0.32, 0.2); // white limb plating (low metalness: no env map here)
     const MECH = this.mat(0x22262b, 0.55, 0.35); // dark joint mechanics
-    const RED = this.mat(0xe0243a, 0.45, 0.1); // red bikini
+    const RED = this.mat(BIKINI_RED, 0.45, 0.1); // red bikini (black on a dancer — see setRoutine)
+    this.bikiniMat = RED;
     const GLOW = this.mat(0x35e6ff, 0.4, 0.1, 0x35e6ff, 1.6); // cyan light strips
     const HAIR = this.mat(0x8a5a33, 0.6, 0.1); // long medium-brown hair
     const BROW = this.mat(0x5a381e, 0.7, 0.05); // brows a shade darker than the hair
@@ -609,6 +660,13 @@ export class PoolWaiter {
       return;
     }
 
+    // 🎉 A 'dance' robot lives on the dance floor — never serves or croupiers.
+    if (this.routine === "dance") {
+      this.tray.visible = false;
+      this.updateDance(dt);
+      return;
+    }
+
     // 🤖 #77C s4: a 'custom' robot runs its owner-authored step loop (walk / say /
     // wait) — never serves or croupiers.
     if (this.routine === "custom") {
@@ -783,6 +841,217 @@ export class PoolWaiter {
     }
   }
 
+  /** 🎉 Is the party speaker playing — the shared switch on any speaker in the
+   *  room, or this client's own entry round? */
+  private musicOn(): boolean {
+    return FURNITURE.some(
+      (i) => i.kind === "party-speaker" && (readSpeaker(i.id).on || isSpeakerPlaying(i.id)),
+    );
+  }
+
+  /** 🎉 Where to dance: ON the dance floor, at the reachable point of it
+   *  nearest the bot's OWN dock (owner rulings 2026-09-26: on the floor, but
+   *  by its own station — two dancers take the sides nearest their docks).
+   *  Candidates are the clamped dock point and then the pad's inner cells,
+   *  and only a cell INSIDE the pad counts — a reachable cell beside it is
+   *  not the floor (Copilot review, PR #169); with none, the bot waits. No
+   *  floor → the coach's stage. */
+  /** The room's dance floors, nearest this bot's dock first (or the bot
+   *  itself, dockless): with several sets in one room each dancer takes its
+   *  own set's floor, not the first one in the list, and a floor it cannot
+   *  reach is passed over for the next (Copilot review, PR #169). */
+  private danceFloorsByDistance(): FurnitureItem[] {
+    const from = this.dockTarget ?? { x: this.group.position.x, z: this.group.position.z };
+    return FURNITURE.filter((i) => i.kind === "dance-floor")
+      .map((i) => ({ i, d: Math.hypot(i.pos.x - from.x, i.pos.z - from.z) }))
+      .sort((a, b) => a.d - b.d)
+      .map((e) => e.i);
+  }
+
+  private findDanceSpot(): { x: number; z: number } | null {
+    const here = { x: this.group.position.x, z: this.group.position.z };
+    const floors = this.danceFloorsByDistance();
+    if (floors.length === 0) return this.findCoachStage();
+    const d = this.dockTarget;
+    const INSET = 1.5; // the pad is ±2 m; stay half a metre inside its edge
+    const clamp = (v: number, c: number) => Math.max(c - INSET, Math.min(c + INSET, v));
+    for (const floor of floors) {
+      const onPad = (p: { x: number; z: number }) =>
+        Math.abs(p.x - floor.pos.x) <= INSET + 0.26 && Math.abs(p.z - floor.pos.z) <= INSET + 0.26;
+      const candidates: Array<{ x: number; z: number }> = [
+        { x: d ? clamp(d.x, floor.pos.x) : floor.pos.x, z: d ? clamp(d.z, floor.pos.z) : floor.pos.z },
+        { x: floor.pos.x, z: floor.pos.z },
+      ];
+      for (const [ox, oz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+        candidates.push({ x: floor.pos.x + ox * 1.0, z: floor.pos.z + oz * 1.0 });
+      }
+      for (const c of candidates) {
+        const cell = nearestReachableCell(c.x, c.z, 1, here);
+        if (cell && onPad(cell)) return cell;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * 🎉 Walk onto the floor (the side nearest the dock), then dance while the music plays. The dance is one
+   * continuous GROOVE — knees flexing on every beat so the whole body rides
+   * up and down, weight swaying side to side every two beats, arms swinging
+   * loosely against the sway — with the phrase's feature (hands up, a slow
+   * full turn, punching the air with a shouted line) blended in over its
+   * first beat and out over its last. Nothing snaps to neutral between
+   * beats (owner feedback 2026-09-26: the first cut looked like calisthenics).
+   * Off the music, wait on the spot and ask for a song now and then.
+   */
+  private updateDance(dt: number): void {
+    // The spot is cached, but re-derived whenever the floor or the dock it was
+    // derived FROM moves or goes, or the walkable grid is rebaked (something
+    // may now stand on the cell) — a furniture edit re-applies the same
+    // routine without touching it (Copilot review, PR #169).
+    // Every floor, in the order they are tried: a move of any of them, or of
+    // the dock the order comes from, re-derives the spot.
+    const floors = this.danceFloorsByDistance().map((f) => `${f.pos.x},${f.pos.z}`).join(";") || "-";
+    const d = this.dockTarget;
+    const key = `${floors}|${d ? `${d.x},${d.z}` : "-"}|${walkableGridRevision()}`;
+    if (key !== this.danceSpotKey) {
+      this.danceSpot = this.findDanceSpot();
+      this.danceSpotKey = key;
+    }
+    if (!this.danceSpot) {
+      // No reachable cell on the pad: wait where we are, off the music.
+      this.resetExercisePose();
+      this.idlePose();
+      return;
+    }
+    if (!this.walkTo(dt, this.danceSpot.x, this.danceSpot.z, 0.15)) {
+      this.resetExercisePose();
+      return;
+    }
+    const face = this.stageYaw ?? this.dockTarget?.faceAngle ?? 0;
+    if (!this.musicOn()) {
+      this.resetExercisePose();
+      this.idlePose();
+      this.turnToward(face, dt);
+      this.danceStepIdx = 0;
+      this.danceStepBeat = 0;
+      this.danceCheerSaid = false;
+      this.danceWaitTimer += dt;
+      if (this.danceWaitTimer >= DANCE_WAIT_EVERY && this.sayRandom(DANCE_WAIT_LINES)) this.danceWaitTimer = 0;
+      return;
+    }
+    this.danceWaitTimer = DANCE_WAIT_EVERY; // ask again the moment it stops
+    // 🕺 Keep time to the MUSIC: the first speaker with a live beat sets the
+    // phrase and the position in it, so the knees land on the recording's
+    // beats and every client dancing to the same file is in step. With no
+    // beat to read (between rounds), free-run at the fallback tempo.
+    const live = FURNITURE.map((i) => (i.kind === "party-speaker" ? speakerBeat(i.id) : null)).find((b) => b !== null) ?? null;
+    const total = DANCE_STEPS.reduce((n, st) => n + st.beats, 0);
+    const prevIdx = this.danceStepIdx;
+    if (live) {
+      let rem = live.beat % total;
+      let idx = 0;
+      while (rem >= DANCE_STEPS[idx].beats) {
+        rem -= DANCE_STEPS[idx].beats;
+        idx = (idx + 1) % DANCE_STEPS.length;
+      }
+      this.danceStepIdx = idx;
+      this.danceStepBeat = rem;
+    } else {
+      this.danceStepBeat += dt / (60 / DANCE_BPM);
+      if (this.danceStepBeat >= DANCE_STEPS[this.danceStepIdx].beats) {
+        this.danceStepBeat -= DANCE_STEPS[this.danceStepIdx].beats;
+        this.danceStepIdx = (this.danceStepIdx + 1) % DANCE_STEPS.length;
+      }
+    }
+    if (this.danceStepIdx !== prevIdx) {
+      this.danceCheerSaid = false;
+      this.danceTurnFrom = this.heading;
+    }
+    const step = DANCE_STEPS[this.danceStepIdx];
+    const b = this.danceStepBeat;
+    const TAU = Math.PI * 2;
+    // The phrase's feature fades in over its first beat and out over its last.
+    const edge = Math.max(0, Math.min(1, Math.min(b, step.beats - b)));
+    const e = edge * edge * (3 - 2 * edge);
+
+    // ── The groove, always on ──
+    const bounce = 0.5 - 0.5 * Math.cos(TAU * b); // 0 on the beat, 1 between beats
+    const sway = Math.sin(Math.PI * b); // ±1 across two beats: weight left, weight right
+    const bend = 0.16 + 0.26 * bounce; // knees never lock
+    const drop = 0.48 * (1 - Math.cos(bend));
+    this.legL.rotation.x = -bend - 0.22 * Math.max(0, sway); // the unweighted foot lifts a little
+    this.legR.rotation.x = -bend - 0.22 * Math.max(0, -sway);
+    this.shinL.rotation.x = bend;
+    this.shinR.rotation.x = bend;
+    this.legL.position.y = HIP_Y - drop;
+    this.legR.position.y = HIP_Y - drop;
+    this.legL.rotation.z = -0.05;
+    this.legR.rotation.z = 0.05;
+    this.body.position.y = -drop;
+    this.body.position.x = 0.035 * sway;
+    this.body.rotation.z = 0.06 * sway;
+    this.body.rotation.x = -0.03 * bounce;
+    // Arms hang loose and swing against the sway, elbows a touch out.
+    let armLX = 0.4 * sway - 0.15;
+    let armRX = -0.4 * sway - 0.15;
+    let armLZ = -0.18 - 0.08 * bounce;
+    let armRZ = 0.18 + 0.08 * bounce;
+    let yaw = face + 0.08 * sway; // the hips turn a touch with the weight
+
+    switch (step.move) {
+      case "hands": {
+        // Hands up over the head, waving side to side with the sway.
+        const wave = 0.35 * sway;
+        armLZ += e * (-2.25 + wave - armLZ);
+        armRZ += e * (2.25 + wave - armRZ);
+        armLX += e * (0.1 - armLX);
+        armRX += e * (0.1 - armRX);
+        break;
+      }
+      case "turn": {
+        // One smooth full turn across the phrase, as a function of where the
+        // phrase IS (smoothstep: from rest, fastest mid-turn, back to rest) —
+        // so it stays in step with the music however the frames fall.
+        const pr = Math.min(1, b / step.beats);
+        this.heading = this.danceTurnFrom + TAU * pr * pr * (3 - 2 * pr);
+        yaw = this.heading;
+        armLZ += e * (-0.7 - armLZ);
+        armRZ += e * (0.7 - armRZ);
+        break;
+      }
+      case "cheer": {
+        // A fist in the air on the first and fifth beats, shouting the line
+        // on the first; the other arm stays in the groove.
+        if (!this.danceCheerSaid) this.danceCheerSaid = this.sayRandom(DANCE_CHEERS);
+        const pulse = (at: number) => {
+          const t = b - at;
+          return t > 0 && t < 1.6 ? Math.sin((Math.PI * t) / 1.6) : 0;
+        };
+        const up = pulse(0) + pulse(4);
+        const left = b < 4;
+        if (left) armLX += up * (-2.6 - armLX);
+        else armRX += up * (-2.6 - armRX);
+        this.body.position.y += 0.05 * up;
+        break;
+      }
+      case "groove":
+      default:
+        break;
+    }
+    this.armL.rotation.x = armLX;
+    this.armR.rotation.x = armRX;
+    this.armL.rotation.z = armLZ;
+    this.armR.rotation.z = armRZ;
+    if (step.move === "turn") this.group.rotation.y = this.heading;
+    else this.turnToward(yaw, dt);
+  }
+
+  /** 🎉 Whether this bot is on stage for the camera — coaching or dancing —
+   *  so the world feeds it the stage yaw. */
+  public isPerforming(): boolean {
+    return (this.routine === "coach" || this.routine === "dance") && !this.parked;
+  }
+
   /** 🎥 Camera-facing yaw for the coach's class (set per frame by the world;
    *  null = face the dock's room direction). */
   public setStageYaw(yaw: number | null): void {
@@ -900,7 +1169,9 @@ export class PoolWaiter {
     this.legL.position.y = HIP_Y;
     this.legR.position.y = HIP_Y;
     this.body.position.y = 0;
+    this.body.position.x = 0;
     this.body.rotation.x = 0;
+    this.body.rotation.z = 0;
   }
 
   /** 🔌 Point the bot at a charging dock (world pos + facing). The world calls
@@ -916,6 +1187,9 @@ export class PoolWaiter {
 
   /** 🤖 #77C s3: set the owner-programmed routine (from the dock's console). */
   public setRoutine(routine: RobotRoutine): void {
+    // 👙 The dancer wears black; every other routine keeps the red.
+    this.bikiniMat.color.setHex(routine === "dance" ? BIKINI_BLACK : BIKINI_RED);
+    this.bikiniMat.roughness = routine === "dance" ? 0.35 : 0.45;
     if (routine !== this.routine) {
       // 🏋️ Leaving coach mid-rep must not strand raised arms / splayed legs;
       // entering restarts the class from the first move's announce, with the
@@ -924,6 +1198,11 @@ export class PoolWaiter {
       this.setCoachPhase("announce");
       this.coachMove = 0;
       this.coachStage = null;
+      this.danceSpot = null;
+      this.danceSpotKey = ""; // with the spot — or coming back to 'dance' waits forever on a stale key
+      this.danceStepIdx = 0;
+      this.danceStepBeat = 0;
+      this.danceCheerSaid = false;
     }
     this.routine = routine;
   }
@@ -1045,7 +1324,9 @@ export class PoolWaiter {
       this.path = [];
       return true;
     }
-    const key = `${tx.toFixed(1)},${tz.toFixed(1)}`;
+    // The goal AND the grid it was planned on: a rebake (furniture added,
+    // moved, removed) invalidates the route.
+    const key = `${tx.toFixed(1)},${tz.toFixed(1)}@${walkableGridRevision()}`;
     if (key !== this.pathGoalKey) {
       this.pathGoalKey = key;
       this.path = findPath(
