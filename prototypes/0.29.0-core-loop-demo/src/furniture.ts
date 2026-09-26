@@ -9028,6 +9028,15 @@ export function itemAabb(item: FurnitureItem): Box | null {
   return footprintAabb(item.kind, item.pos, item.rot);
 }
 
+/** What an item takes up for "is something already here?": its obstacle box
+ *  on the floor, or — for a wall-hung piece, which has none — the slab it
+ *  occupies on its wall (wallMountBox). ROSE WALLS tested only the floor box
+ *  and could hang a rose over the terminal, hiding the room's one way back
+ *  into EDIT ROOM (Copilot review, PR #169). */
+export function itemOccupancyBox(item: FurnitureItem): Box | null {
+  return itemAabb(item) ?? wallMountBox(item.kind, item.pos, item.rot);
+}
+
 /**
  * Snap a candidate centre to the placement lattice (plan §2.6 parity rule):
  * footprint tile-extents are integers, so per axis an ODD tile-extent puts

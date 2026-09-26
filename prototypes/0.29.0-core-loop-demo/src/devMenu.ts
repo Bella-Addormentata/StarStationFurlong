@@ -45,7 +45,7 @@
 import * as THREE from 'three';
 import {
   FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos,
-  footprintAabb, itemAabb,
+  footprintAabb, itemAabb, itemOccupancyBox,
 } from './furniture';
 import type { Box, FurnitureItem, FurnitureKind, Rot } from './furniture';
 import { PLAYER_R } from './player';
@@ -520,9 +520,11 @@ function fillRoseWalls(): void {
     const band = alongX
       ? { x0: pos.x - 0.5, x1: pos.x + 0.5, z0: Math.min(pos.z, pos.z - Math.sign(pos.z) * 1.0), z1: Math.max(pos.z, pos.z - Math.sign(pos.z) * 1.0) }
       : { z0: pos.z - 0.5, z1: pos.z + 0.5, x0: Math.min(pos.x, pos.x - Math.sign(pos.x) * 1.0), x1: Math.max(pos.x, pos.x - Math.sign(pos.x) * 1.0) };
+    // Floor boxes AND wall slabs: the terminal has no footprint, but a rose
+    // hung over it would hide the way back into EDIT ROOM.
     return FURNITURE.some((o) => {
       if (o.kind === 'climbing-rose') return false;
-      const ob = itemAabb(o);
+      const ob = itemOccupancyBox(o);
       return !!ob && band.x0 < ob.x1 && band.x1 > ob.x0 && band.z0 < ob.z1 && band.z1 > ob.z0;
     });
   };

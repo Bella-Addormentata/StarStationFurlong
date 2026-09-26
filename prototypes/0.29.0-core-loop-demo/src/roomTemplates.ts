@@ -124,6 +124,19 @@ const OVERLAY_ENVELOPE: Partial<Record<FurnitureKind, { w: number; d: number }>>
 };
 const OVERLAY_MARGIN = 0.3; // a pad may lie closer to a wall than a chair, but not in it
 
+/** The pads of walkable overlays ALREADY in the room, boxed the way
+ *  placeFitting boxes a candidate one. buildObstacleList leaves footprintless
+ *  items out, so without these + ADD would lay a set straight across an
+ *  existing dance floor (Copilot review, PR #169). */
+export function overlayEnvelopeBoxes(items: readonly FurnitureItem[]): Box[] {
+  const out: Box[] = [];
+  for (const it of items) {
+    const env = OVERLAY_ENVELOPE[it.kind];
+    if (env) out.push({ x0: it.pos.x - env.w / 2, z0: it.pos.z - env.d / 2, x1: it.pos.x + env.w / 2, z1: it.pos.z + env.d / 2 });
+  }
+  return out;
+}
+
 function pointInAny(x: number, z: number, boxes: readonly Box[]): boolean {
   return boxes.some((b) => x > b.x0 && x < b.x1 && z > b.z0 && z < b.z1);
 }
@@ -747,7 +760,9 @@ export function addRoomTemplateItems(
   // their authored coordinates straight through the furniture (Copilot
   // review, PR #169). Those templates PLACE (replace everything) only.
   if (!t || !t.layout) return null;
-  const wanted = t.layout(roomHalfExtents(), [...buildObstacleList(FURNITURE), ...keepClear]);
+  // Occupied: every obstacle box, every overlay pad already down, and the
+  // ground the caller asked to keep clear.
+  const wanted = t.layout(roomHalfExtents(), [...buildObstacleList(FURNITURE), ...overlayEnvelopeBoxes(FURNITURE), ...keepClear]);
   const written = addFurniture(wanted);
   const total = t.layout({ halfX: 15, halfZ: 15 }).length;
   return { name: t.name, placed: written.length, skipped: Math.max(0, total - written.length) };

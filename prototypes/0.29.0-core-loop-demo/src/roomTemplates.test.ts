@@ -13,8 +13,8 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { bindFloorPlan } from './floorPlanDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
-import { ROOM_TEMPLATES, placeFitting, templateItemsFor, type PlacementSpec } from './roomTemplates';
-import { buildObstacleList, roomDoorPoints, type Box, type FurnitureItem } from './furniture';
+import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, type PlacementSpec } from './roomTemplates';
+import { buildObstacleList, roomDoorPoints, itemOccupancyBox, type Box, type FurnitureItem } from './furniture';
 
 const HALF = { halfX: 6, halfZ: 6 }; // the default 2×2 module
 const party = ROOM_TEMPLATES.find((t) => t.id === 'party-2')!;
@@ -166,5 +166,36 @@ describe('the default room', () => {
     const pad: Box = { x0: floor.pos.x - 2.05, z0: floor.pos.z - 2.05, x1: floor.pos.x + 2.05, z1: floor.pos.z + 2.05 };
     expect(overlaps(boxesOf([speaker])[0], pad)).toBe(false);
     expect(Math.hypot(speaker.pos.x - floor.pos.x, speaker.pos.z - floor.pos.z)).toBeLessThan(4);
+  });
+});
+
+describe('what + ADD counts as occupied', () => {
+  it('boxes a dance floor already in the room by its pad, and the set keeps off it', () => {
+    const floor: FurnitureItem = { id: 'old-floor', kind: 'dance-floor', pos: { x: -2, z: 2 }, rot: 0, movable: true };
+    expect(buildObstacleList([floor])).toHaveLength(0); // no footprint of its own…
+    const pads = overlayEnvelopeBoxes([floor, { id: 'b', kind: 'beach-ball', pos: { x: 0, z: 0 }, rot: 0, movable: true }]);
+    expect(pads).toHaveLength(1); // …but a 4.1 m pad for fitting
+    expect(pads[0].x0).toBeCloseTo(-4.05, 6); expect(pads[0].x1).toBeCloseTo(0.05, 6);
+    expect(pads[0].z0).toBeCloseTo(-0.05, 6); expect(pads[0].z1).toBeCloseTo(4.05, 6);
+    const fitted = layout(pads);
+    for (const b of boxesOf(fitted)) expect(overlaps(b, pads[0])).toBe(false);
+    // A second floor, if it lands, lands off the first.
+    const second = fitted.find((i) => i.kind === 'dance-floor');
+    if (second) expect(overlaps(overlayEnvelopeBoxes([second])[0], pads[0])).toBe(false);
+  });
+
+  it('counts a wall-hung terminal by its slab, so a rose slot over it is taken', () => {
+    const terminal: FurnitureItem = { id: 't', kind: 'wall-computer', pos: { x: 1, z: -5.97 }, rot: 0, movable: true };
+    expect(buildObstacleList([terminal])).toHaveLength(0);
+    const slab = itemOccupancyBox(terminal)!;
+    expect(slab).toBeDefined();
+    expect(slab.x0).toBeLessThan(1);
+    expect(slab.x1).toBeGreaterThan(1);
+    // The rose slot's band: 1 m of wall and the metre of floor before it.
+    const band: Box = { x0: 0.5, x1: 1.5, z0: -6, z1: -5 };
+    expect(overlaps(band, slab)).toBe(true);
+    // Standing furniture still counts by its floor box; decoration by nothing.
+    expect(itemOccupancyBox({ id: 'c', kind: 'beach-crate', pos: { x: 0, z: 0 }, rot: 0, movable: true })).toEqual(buildObstacleList([{ id: 'c', kind: 'beach-crate', pos: { x: 0, z: 0 }, rot: 0, movable: true }])[0]);
+    expect(itemOccupancyBox({ id: 'b', kind: 'birthday-balloons', pos: { x: 0, z: 0 }, rot: 0, movable: true })).toBeNull();
   });
 });
