@@ -1778,14 +1778,6 @@ async function joinRoomAtEpoch(
         migrateDefaultLayout();
         roomMap.set("lobbyDoorClearV5", true);
       }
-      // 🧬 #165 one-time: the clone vat grew to a 2×2 tank centred on the NW
-      // corner square — an unmoved default vat (and the corner cherry tree it
-      // would swallow) moves to the new default pose. Its own marker, after
-      // V5 (which already writes the new pose into rooms it upgrades).
-      if (!roomMap.get("cloneVat2x2V1")) {
-        relocateLegacyDefaultVat();
-        roomMap.set("cloneVat2x2V1", true);
-      }
       // 🕯️ Additive one-time: give already-migrated lobbies the new ceiling
       // chandelier WITHOUT re-snapping the rest of the layout (a full
       // re-migrate would undo players' furniture moves). Its own marker, so a
@@ -1810,6 +1802,25 @@ async function joinRoomAtEpoch(
       // exactly like every other connection in the station.
     });
   }
+
+  // 🧬 #165 one-time: the clone vat grew to a 2×2 tank centred on the NW
+  // corner square. An unmoved default vat (and the corner cherry tree it
+  // would swallow) moves to the new default pose. Unlike the migrations
+  // above, this runs on every join, not only the first-claim path: a normal
+  // restart resumes the last room as a join, and an un-migrated room would
+  // draw the 2×2 tank at the old 1×1 pose, across the tree. It runs on a
+  // first claim, as before, or for anyone who may edit the room. It only moves
+  // items still at their old defaults, and the marker makes it one-time.
+  // Registered after the claim block, so on a first claim it runs after V5,
+  // which already writes the new pose into rooms it upgrades.
+  const vatMigrationEpoch = epoch;
+  void sync.whenServerSynced.then(() => {
+    if (vatMigrationEpoch !== sessionEpoch) return; // superseded by a newer session
+    if (roomMap.get("cloneVat2x2V1")) return;
+    if (!claimRoomDefaults && !canEditRoom().ok) return;
+    relocateLegacyDefaultVat();
+    roomMap.set("cloneVat2x2V1", true);
+  });
 
   // 🌌 Resolve this room's VISUAL theme: an explicit roomInfo['theme'] (stamped
   // by a template on provision, synced from the host) wins; otherwise fall back
