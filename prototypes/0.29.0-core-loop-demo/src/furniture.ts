@@ -47,7 +47,7 @@ import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./
 // straight from the room doc, the same way the slot machine reads the casino
 // map — the doc is the phase, a local click is never the phase.
 import {
-  readCake, readGift, readSpeaker, subscribePartyKey,
+  readCake, readGift, readSpeaker, subscribePartyKey, partyDocEpoch,
   cakeKey, giftKey, speakerKey,
 } from "./partyDoc";
 // 🖥️ Interior wall mounts need the live room size to find the wall planes.
@@ -8233,8 +8233,18 @@ function buildCakeTable(ctx: BuildCtx) {
   // First paint must NOT fire confetti: a joiner walking into a party that
   // already happened should find the candles quietly out, not re-run the
   // moment. Only a lit → unlit TRANSITION is the event.
+  // The baseline is per PARTY DOC: reconcileFurniture reuses this group when
+  // the next room holds a same-id cake in the same pose, and the rebind then
+  // notifies this very listener — an unlit cake there must not read as "the
+  // one I knew was lit just went out" (Copilot review, PR #169).
   let known: boolean | null = null;
+  let knownEpoch = partyDocEpoch();
   const applyPhase = () => {
+    const epoch = partyDocEpoch();
+    if (epoch !== knownEpoch) {
+      knownEpoch = epoch;
+      known = null;
+    }
     const lit = readCake(itemId).lit;
     flames.visible = lit;
     glow.intensity = lit ? 0.9 : 0;

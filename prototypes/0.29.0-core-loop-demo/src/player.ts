@@ -1443,21 +1443,24 @@ export class Player {
       pos.x = r2.x;
       pos.z = r2.z;
 
-      // 🧱 Wedged on the LAST leg of a device approach (owner report
-      // 2026-09-25): the A* grid bakes raw boxes but the body collides
-      // against boxes inflated by PLAYER_R, so the front CELL can be
-      // grid-walkable while its centre is physically out of reach — the
-      // palm beside the party speaker pinned the fox 0.2 m short of it and
-      // the panel never opened. No headway for a beat, one waypoint left and
-      // the device within arm's reach: hand off to the fine step (which has
-      // the same tolerance) instead of pushing at the palm forever.
+      // 🧱 Wedged on a device approach (owner report 2025-09-25): the A*
+      // grid bakes raw boxes but the body collides against boxes inflated by
+      // PLAYER_R, so a cell can be grid-walkable while its centre is
+      // physically out of reach — the palm beside the party speaker pinned
+      // the fox 0.2 m short of the front and the panel never opened. Two
+      // tiers, both only within arm's reach (1.6 m — a table is reachable
+      // across a stool; the doc gate is what guards the action itself):
+      //  · on the LAST leg, no headway for half a second hands off to the
+      //    fine step, which has the same tolerance;
+      //  · with route still ahead, the same only after a long stall (1.5 s)
+      //    — the route is given every chance to lead round the obstacle
+      //    first (Copilot review, PR #169).
       if (this.devicePhase === "APPROACH" && this.deviceTarget) {
         const headway = Math.hypot(pos.x - fromX, pos.z - fromZ);
         this.deviceStuck = headway < step * 0.25 ? this.deviceStuck + deltaTime : 0;
         const toFront = Math.hypot(this.deviceTarget.front.x - pos.x, this.deviceTarget.front.z - pos.z);
-        // Within 1.6 m: the fox can reach a table across a stool; the doc
-        // gate (cake owner, gift opener) is what actually guards the action.
-        if (this.deviceStuck > 0.5 && toFront < 1.6) {
+        const stall = this.waypointPath.length <= 1 ? 0.5 : 1.5;
+        if (this.deviceStuck > stall && toFront < 1.6) {
           this.waypointPath = [];
           this._removeReticle();
           this.devicePhase = "FINE";

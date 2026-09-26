@@ -306,6 +306,8 @@ export class PoolWaiter {
   /** 🎉 dance-routine state: the spot on the floor, beats into the current
    *  move, which move, whether its cheer went out, and the wait-line clock. */
   private danceSpot: { x: number; z: number } | null = null;
+  /** What the cached spot was derived from (floor pose | dock pose). */
+  private danceSpotKey = "";
   private danceStepIdx = 0;
   private danceStepBeat = 0;
   private danceCheerSaid = false;
@@ -869,7 +871,16 @@ export class PoolWaiter {
    * Off the music, wait on the spot and ask for a song now and then.
    */
   private updateDance(dt: number): void {
-    if (!this.danceSpot) this.danceSpot = this.findDanceSpot();
+    // The spot is cached, but re-derived whenever the floor or the dock it was
+    // derived FROM moves or goes — a furniture edit re-applies the same
+    // routine without touching it (Copilot review, PR #169).
+    const floor = FURNITURE.find((i) => i.kind === "dance-floor");
+    const d = this.dockTarget;
+    const key = `${floor ? `${floor.pos.x},${floor.pos.z}` : "-"}|${d ? `${d.x},${d.z}` : "-"}`;
+    if (!this.danceSpot || key !== this.danceSpotKey) {
+      this.danceSpot = this.findDanceSpot();
+      this.danceSpotKey = key;
+    }
     if (!this.walkTo(dt, this.danceSpot.x, this.danceSpot.z, 0.15)) {
       this.resetExercisePose();
       return;

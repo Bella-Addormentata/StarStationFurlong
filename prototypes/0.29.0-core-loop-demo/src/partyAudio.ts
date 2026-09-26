@@ -1,8 +1,13 @@
 /**
- * 🎶 Party audio — the speaker's "Happy Birthday", synthesised in WebAudio.
+ * 🎶 Party audio — the speaker's "Happy Birthday".
  *
- * No sample files: the tune is a score (HAPPY_BIRTHDAY, in F, 3/4) played on
- * a celesta-like voice — a sine with a touch of 2nd and 3rd harmonic, a fast
+ * Two sources, one graph. The speaker prefers a bundled RECORDING (TRACKS:
+ * three free-licensed renditions in public/audio — sung, choir, jazz trio —
+ * licences in public/audio/LICENSES.md), played through an <audio> element
+ * routed into the same WebAudio master as everything else, so distance and
+ * the hall apply to it. The fourth track, and the fallback whenever a file
+ * fails to load, is SYNTHESISED: a score (HAPPY_BIRTHDAY, in F, 3/4) on a
+ * celesta-like voice — a sine with a touch of 2nd and 3rd harmonic, a fast
  * attack and a long exponential decay — over a soft broken-chord
  * accompaniment and a little hall echo. Elegant rather than loud (owner
  * ruling 2026-09-25): a music box at a garden party, not a PA system.

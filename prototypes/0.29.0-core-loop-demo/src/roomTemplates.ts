@@ -135,7 +135,11 @@ function placeFitting(
 
   const groupMembers = new Map<string, FurnitureItem[]>();
   const groupFailed = new Set<string>();
+  /** Obstacle boxes each rigid group has claimed so far — handed back if it fails. */
+  const groupBoxes = new Map<string, Box[]>();
   for (const spec of specs) {
+    // A rigid group that already lost a member places nothing more.
+    if (spec.group && groupFailed.has(spec.group)) continue;
     const tx = spec.at[0] * halfX + (spec.off?.[0] ?? 0);
     const tz = spec.at[1] * halfZ + (spec.off?.[1] ?? 0);
     // Nudges pull toward the centre, which is where the room is. A rigid
@@ -165,6 +169,7 @@ function placeFitting(
       const boxes = buildObstacleList([item]);
       if (spec.spanning) {
         occupied.push(...boxes);
+        if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
         placed = item;
         break;
       }
@@ -180,6 +185,7 @@ function placeFitting(
         if (outside) continue;
         if (boxes.some((b) => occupied.some((o) => boxesOverlap(b, o)))) continue;
         occupied.push(...boxes);
+        if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
       } else {
         // Decoration with no footprint (banner, balloons, towel, ball, the
         // dance floor, the pergola roof). It cannot COLLIDE, but it must not
@@ -191,8 +197,19 @@ function placeFitting(
       break;
     }
     if (spec.group) {
-      if (!placed) groupFailed.add(spec.group);
-      else groupMembers.set(spec.group, [...(groupMembers.get(spec.group) ?? []), placed]);
+      if (!placed) {
+        // The group is out — and so are the boxes its earlier members
+        // claimed, or invisible furniture would keep blocking every later
+        // expansion item (Copilot review, PR #169).
+        groupFailed.add(spec.group);
+        const mine = new Set(groupBoxes.get(spec.group) ?? []);
+        if (mine.size) {
+          for (let i = occupied.length - 1; i >= 0; i--) if (mine.has(occupied[i])) occupied.splice(i, 1);
+          groupBoxes.delete(spec.group);
+        }
+      } else {
+        groupMembers.set(spec.group, [...(groupMembers.get(spec.group) ?? []), placed]);
+      }
       continue;
     }
     if (placed) out.push(placed);
