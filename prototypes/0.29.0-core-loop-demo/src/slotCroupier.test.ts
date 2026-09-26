@@ -15,6 +15,7 @@ import {
   bindCasinoDoc,
   buyInChips,
   hasSlotEscrow,
+  LEGACY_SLOT_LEASE_READ_CAP,
   readChips,
   readLegacySlotOperatorMachineIds,
   readSlotMachineState,
@@ -901,17 +902,74 @@ describe("earlier builds' per-machine leases", () => {
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, Y.encodeStateVector(doc)));
     const walks = (['keys', 'entries', 'values', 'forEach'] as const)
       .map((method) => vi.spyOn(Y.Map.prototype, method));
-    expect(readLegacySlotOperatorMachineIds().sort()).toEqual([M1, M2].sort());
+    expect(readLegacySlotOperatorMachineIds().machineIds.sort()).toEqual([M1, M2].sort());
     map.delete(`slot-operator:${M1}`);
-    expect(readLegacySlotOperatorMachineIds()).toEqual([M2]);
+    expect(readLegacySlotOperatorMachineIds()).toEqual({ machineIds: [M2], more: false });
     // The room's own lease is not an earlier build's.
     writeSlotOperatorLease(lease(T0 + LEASE_MS));
-    expect(readLegacySlotOperatorMachineIds()).toEqual([M2]);
+    expect(readLegacySlotOperatorMachineIds()).toEqual({ machineIds: [M2], more: false });
     for (const walk of walks) expect(walk).not.toHaveBeenCalled();
     for (const walk of walks) walk.mockRestore();
     // A doc bound with records already in it is indexed when it is bound.
     bindCasinoDoc(peer);
-    expect(readLegacySlotOperatorMachineIds().sort()).toEqual([M1, M2].sort());
+    expect(readLegacySlotOperatorMachineIds().machineIds.sort()).toEqual([M1, M2].sort());
+  });
+
+  it('past the read cap, hold the room off, and are tidied a batch a term until the rest fit', () => {
+    fund(M1);
+    const map = doc.getMap('casino');
+    const key = (i: number): string => `slot-operator:flood-${i}`;
+    const past = 10;
+    for (let i = 0; i < LEGACY_SLOT_LEASE_READ_CAP; i++) map.set(key(i), legacy(T0 + LEASE_MS));
+    expect(readLegacySlotOperatorMachineIds().more).toBe(false); // exactly the cap: all read
+    for (let i = LEGACY_SLOT_LEASE_READ_CAP; i < LEGACY_SLOT_LEASE_READ_CAP + past; i++) {
+      map.set(key(i), legacy(T0 + LEASE_MS));
+    }
+    const first = readLegacySlotOperatorMachineIds();
+    expect(first.machineIds).toHaveLength(LEGACY_SLOT_LEASE_READ_CAP);
+    expect(first.more).toBe(true);
+    // The unread ones may be live: nothing is taken, even once the read batch lapses.
+    tickSlotMachineRoom([M1], false, at(T0));
+    expect(readSlotOperatorLease()).toBeNull();
+    tickSlotMachineRoom([M1], false, at(T0 + LEASE_MS));
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(map.has(key(0))).toBe(false); // the batch it read, lapsed, is deleted
+    // The rest now fit, and are first seen on the next frame: a term of their own.
+    const rest = readLegacySlotOperatorMachineIds();
+    expect(rest.more).toBe(false);
+    expect(rest.machineIds).toHaveLength(past);
+    tickSlotMachineRoom([M1], false, at(T0 + LEASE_MS + 1));
+    expect(readSlotOperatorLease()).toBeNull();
+    tickSlotMachineRoom([M1], false, at(T0 + 2 * LEASE_MS + 1));
+    expect(readLegacySlotOperatorMachineIds()).toEqual({ machineIds: [], more: false });
+    expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+  });
+
+  it("read no more than the cap's worth of records a frame, however many a peer writes", () => {
+    fund(M1);
+    const map = doc.getMap('casino');
+    doc.transact(() => {
+      for (let i = 0; i < 5_000; i++) map.set(`slot-operator:flood-${i}`, legacy(T0 + LEASE_MS));
+    });
+    const get = vi.spyOn(Y.Map.prototype, 'get');
+    tickSlotMachineRoom([M1], false, at(T0));
+    const leaseReads = get.mock.calls.filter(([k]) => String(k).startsWith(`${SLOT_OPERATOR_KEY}:`));
+    get.mockRestore();
+    expect(leaseReads.length).toBeGreaterThan(0);
+    expect(leaseReads.length).toBeLessThanOrEqual(LEGACY_SLOT_LEASE_READ_CAP);
+    expect(readSlotOperatorLease()).toBeNull();
+  });
+
+  it('are forgotten once their record is gone, whoever deleted it', () => {
+    fund(M1);
+    const map = doc.getMap('casino');
+    map.set(`slot-operator:${M1}`, legacy(T0 + LEASE_MS));
+    map.set(`slot-operator:${M2}`, legacy(T0 + LEASE_MS));
+    tickSlotMachineRoom([M1], false, at(T0));
+    expect(slotOperatorWatchCount()).toBe(2);
+    map.delete(`slot-operator:${M1}`); // an earlier build letting it go
+    tickSlotMachineRoom([M1], false, at(T0 + 100));
+    expect(slotOperatorWatchCount()).toBe(1);
   });
 
   it('are never deleted by a visitor', () => {

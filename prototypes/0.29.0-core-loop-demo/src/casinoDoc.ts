@@ -583,10 +583,23 @@ function indexLegacySlotLeases(map: Y.Map<unknown>): void {
   });
 }
 
-/** Every machine an earlier build's lease (`slot-operator:<mid>`) is held
- *  for in the bound map, read from the index built when it was bound. */
-export function readLegacySlotOperatorMachineIds(): string[] {
-  return [...(legacySlotLeaseMachines.get(ensureMap()) ?? [])];
+/** How many of the earlier builds' leases one read returns. Any peer can
+ *  write `slot-operator:` keys, so this bounds the work they can make each
+ *  frame do. A room holding more is kept off anyway (slotCroupier.ts, EARLIER
+ *  BUILDS): one of those left unread may be live. */
+export const LEGACY_SLOT_LEASE_READ_CAP = 64;
+
+/** The machines an earlier build's lease (`slot-operator:<mid>`) is held for
+ *  in the bound map, read from the index built when it was bound: at most
+ *  LEGACY_SLOT_LEASE_READ_CAP of them, in the order their records appeared,
+ *  and whether the map holds more. */
+export function readLegacySlotOperatorMachineIds(): { machineIds: string[]; more: boolean } {
+  const machineIds: string[] = [];
+  for (const machineId of legacySlotLeaseMachines.get(ensureMap()) ?? []) {
+    if (machineIds.length === LEGACY_SLOT_LEASE_READ_CAP) return { machineIds, more: true };
+    machineIds.push(machineId);
+  }
+  return { machineIds, more: false };
 }
 
 /** Whether a round's reserve is locked on this machine (`slot-escrow:<mid>`). */

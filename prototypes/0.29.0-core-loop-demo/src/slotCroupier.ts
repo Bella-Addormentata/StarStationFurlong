@@ -55,7 +55,11 @@
  * counts, found through an index casinoDoc keeps, whatever machines the
  * room's layout listed at the last frame. RUN and the check before every
  * write (stillOperates) read those records afresh, so one that arrives
- * between two frames counts at once, even for a machine placed since.
+ * between two frames counts at once, even for a machine placed since. A read
+ * returns at most LEGACY_SLOT_LEASE_READ_CAP of them, since any peer can
+ * write such keys. While the doc holds more, one left unread may be live, so
+ * this build operates nothing; a session that could operate deletes the
+ * lapsed ones it read, a batch a term, until the rest fit.
  */
 import {
   casinoDocEpoch,
@@ -253,13 +257,16 @@ function heldElsewhere(lease: SlotOperatorLease | null, now: number): boolean {
  * or renewed within the last OPERATOR_LEASE_MS. A session that could operate
  * (`tidy`) deletes a lapsed one. Every lease the doc holds counts, found
  * through casinoDoc's index, whatever machines the room's layout listed at
- * the last frame: one for a machine placed since counts too.
+ * the last frame: one for a machine placed since counts too. At most
+ * LEGACY_SLOT_LEASE_READ_CAP are read; while the doc holds more, one of the
+ * rest may be live, so this says one is operating.
  */
 function watchEarlierBuilds(tidy: boolean, now: number): boolean {
   const docEpoch = casinoDocEpoch();
-  const machineIds = readLegacySlotOperatorMachineIds();
+  const { machineIds, more } = readLegacySlotOperatorMachineIds();
+  const read = new Set(machineIds);
   for (const machineId of [...earlierBuildLeasesSeen.keys()]) {
-    if (!machineIds.includes(machineId)) earlierBuildLeasesSeen.delete(machineId);
+    if (!read.has(machineId)) earlierBuildLeasesSeen.delete(machineId);
   }
   let until = 0;
   for (const machineId of machineIds) {
@@ -282,7 +289,7 @@ function watchEarlierBuilds(tidy: boolean, now: number): boolean {
       earlierBuildLeasesSeen.delete(machineId);
     }
   }
-  return now < until;
+  return more || now < until;
 }
 
 /** Whether an earlier build is operating a machine in this room now, read
