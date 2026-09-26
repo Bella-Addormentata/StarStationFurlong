@@ -80,6 +80,7 @@ import {
   vatFloorY,
   vatFreeExitAlong,
   vatSqueezeAt,
+  vatStrandedRelease,
 } from "./vatGauge";
 import {
   POOL_WATER_Y,
@@ -301,9 +302,15 @@ export class Player {
   /** HOLD = frozen inside the tube; WAIT_CLEAR = door open but nowhere in
    *  the room to stand, so still held (retrying); WALK_OUT = scripted
    *  straight exit walk; RELAX = back to full size in place when the exit
-   *  path was cut short. */
-  private vatPhase: "NONE" | "HOLD" | "WAIT_CLEAR" | "WALK_OUT" | "RELAX" =
-    "NONE";
+   *  path was cut short; ORPHANED = the vat was removed mid-ceremony, so the
+   *  clone is held where it stood until there is a free spot to release it. */
+  private vatPhase:
+    | "NONE"
+    | "HOLD"
+    | "WAIT_CLEAR"
+    | "WALK_OUT"
+    | "RELAX"
+    | "ORPHANED" = "NONE";
   /** The vat's axis on the floor. The clone stands on the line from here
    *  through the door, and the clearance gauge (vatGauge.ts) that squeezes
    *  it is measured along that line. */
@@ -322,10 +329,12 @@ export class Player {
   private vatRelaxT = 0;
   private vatRelaxFrom = { horizontal: 1, vertical: 1, y: 0 };
   private readonly VAT_RELAX_TIME = 0.4;
-  /** 🧬 Seconds since release while the clone's colours come back; -1 when
-   *  no fade is running (in the vat it is held fully pale). */
-  private pallorT = -1;
-  /** WAIT_CLEAR: seconds between tries for somewhere to step out to. */
+  /** 🧬 performance.now() when the clone left the vat and its colours began
+   *  coming back; -1 when no fade is running (in the vat it is held fully
+   *  pale). Wall-clock, not accumulated frame time: the fade runs its 30 s
+   *  even while update() is gated off (station view, a hidden tab). */
+  private pallorFrom = -1;
+  /** WAIT_CLEAR / ORPHANED: seconds between tries for somewhere to step out to. */
   private readonly VAT_WAIT_RETRY = 0.5;
   /** WAIT_CLEAR: where on the door path the clone is held (to look from). */
   private vatWaitFrom = 0;
@@ -836,7 +845,7 @@ export class Player {
     // it has walked clear (normally the walk-out itself does this), and a
     // fresh clone's colours ease back from the pallor grey.
     this._sealVatWhenClear();
-    this._updatePallor(deltaTime);
+    this._updatePallor();
 
     // ── 🧬 Clone-vat spawn choreography: fully scripted (HOLD inside the
     //    tube while it drains/opens, then the straight walk-out). Input is
@@ -2528,7 +2537,7 @@ export class Player {
     // behind us — and drops the clearance squeeze (beginVatSpawn beams first,
     // then re-arms its own). A clone beamed out mid-ceremony is out of the
     // vat all the same: its colour starts coming back.
-    if (this.vatPhase !== "NONE") this.pallorT = 0;
+    if (this.vatPhase !== "NONE") this.pallorFrom = performance.now();
     this.vatPhase = "NONE";
     this._sealVat();
     this.mesh.scale.set(1, 1, 1);
@@ -2575,7 +2584,7 @@ export class Player {
     this.character.setState("idle", faceAngle);
     // 🧬 A fresh clone decants almost-white grey; its own colours come back
     // over VAT_PALLOR_FADE_S once it is out (_releaseVat starts the fade).
-    this.pallorT = -1;
+    this.pallorFrom = -1;
     this.character.setPallor(1);
   }
 
@@ -2649,15 +2658,19 @@ export class Player {
   }
 
   /**
-   * Instantly release the choreography at the current spot (vat removed
-   * mid-cycle, room teardown): back to full size on the floor, MANUAL
-   * control. A pending seal fires now — the cycle is over, so its vat
-   * closes and refills rather than standing open and dry.
+   * The vat running this ceremony is being removed (edit mode, a synced
+   * removal): end the ceremony. A pending seal fires now. The clone is not
+   * released on the spot, because World calls this before the vat leaves
+   * the obstacle list, and that spot may be inside other furniture. It is
+   * held where it stands (ORPHANED), and the next update releases it there
+   * or at the nearest free spot once the obstacles are rebuilt. If nowhere
+   * is free it stays held and retries.
    */
   public abortVatSpawn(): void {
     if (this.vatPhase === "NONE") return;
-    this._releaseVat();
     this._sealVat();
+    this.vatPhase = "ORPHANED";
+    this.vatHoldTimer = this.VAT_WAIT_RETRY; // try on the very next update
   }
 
   /** Hand control back: full size, on the floor, MANUAL. Leaves a pending
@@ -2667,16 +2680,15 @@ export class Player {
     this.mesh.scale.set(1, 1, 1);
     this.mesh.position.y = 0;
     this.navMode = "MANUAL";
-    this.pallorT = 0; // out of the vat: colour starts coming back
+    this.pallorFrom = performance.now(); // out of the vat: colour starts coming back
   }
 
   /** 🧬 Ease a released clone's colours back from the pallor grey. */
-  private _updatePallor(deltaTime: number): void {
-    if (this.pallorT < 0) return;
-    this.pallorT += Math.max(0, deltaTime);
-    const k = vatPallorAt(this.pallorT);
+  private _updatePallor(): void {
+    if (this.pallorFrom < 0) return;
+    const k = vatPallorAt((performance.now() - this.pallorFrom) / 1000);
     this.character.setPallor(k);
-    if (k <= 0) this.pallorT = -1;
+    if (k <= 0) this.pallorFrom = -1;
   }
 
   /**
@@ -2688,7 +2700,9 @@ export class Player {
    * while the pose is unchanged (World calls it every frame).
    */
   public rebindVat(centre: { x: number; z: number }, faceAngle: number): void {
-    if (!this.isVatBound()) return;
+    // ORPHANED: that vat is gone. The clone is no longer tied to it, even if
+    // an item with the same id comes back.
+    if (!this.isVatBound() || this.vatPhase === "ORPHANED") return;
     if (
       centre.x === this.vatCentre.x &&
       centre.z === this.vatCentre.z &&
@@ -2795,7 +2809,8 @@ export class Player {
         if (spot) {
           this.mesh.position.x = spot.x;
           this.mesh.position.z = spot.z;
-          this.abortVatSpawn();
+          this._releaseVat();
+          this._sealVat();
         } else {
           this.vatHoldTimer = 0;
         }
@@ -2809,6 +2824,29 @@ export class Player {
       if (this.vatHoldTimer >= this.VAT_WAIT_RETRY) {
         this.vatHoldTimer = 0;
         this._leaveVat(this.vatWaitFrom);
+      }
+      return;
+    }
+    if (this.vatPhase === "ORPHANED") {
+      // The vat was removed around the clone: no tank is left to clip, so
+      // release it where it stands if that is free, else at the nearest free
+      // spot. With nowhere free it stays held, retrying.
+      this.character.setState("idle", this.logicalAngle);
+      this.vatHoldTimer += deltaTime;
+      if (this.vatHoldTimer >= this.VAT_WAIT_RETRY) {
+        this.vatHoldTimer = 0;
+        const spot = vatStrandedRelease(
+          this.mesh.position,
+          this.logicalAngle,
+          OBSTACLES,
+          this.roomBounds(),
+          PLAYER_R,
+        );
+        if (spot) {
+          this.mesh.position.x = spot.x;
+          this.mesh.position.z = spot.z;
+          this._releaseVat();
+        }
       }
       return;
     }

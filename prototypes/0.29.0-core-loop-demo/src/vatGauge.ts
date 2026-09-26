@@ -367,7 +367,39 @@ export function vatFallbackRelease(
   radius: number,
 ): { x: number; z: number } | null {
   const minR = Math.max(VAT_FOOTPRINT_HALF + radius, VAT_FALLBACK_MIN_R);
-  for (let r = minR + 0.05; r <= 4.5; r += 0.25) {
+  return nearestFreeSpot(centre, facing, minR, minR + 0.05, obstacles, bounds, radius);
+}
+
+/**
+ * Where a clone whose vat was removed mid-ceremony is released: no tank is
+ * left around it, so on the spot `at` where it was held when that is free,
+ * else the nearest free spot (rings out to 4.5 m, then the whole walkable
+ * box). null when nowhere in the room is free; the caller keeps it held.
+ */
+export function vatStrandedRelease(
+  at: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): { x: number; z: number } | null {
+  if (!spotBlocked(at.x, at.z, obstacles, bounds, radius)) return { x: at.x, z: at.z };
+  return nearestFreeSpot(at, facing, 0, 0.25, obstacles, bounds, radius);
+}
+
+/** The nearest spot at least `minR` from `centre` that a player of `radius`
+ *  may stand on: rings from `firstR` out to 4.5 m (16 bearings, the `facing`
+ *  side first), else the nearest on a 0.25 m grid over the walkable box. */
+function nearestFreeSpot(
+  centre: { x: number; z: number },
+  facing: number,
+  minR: number,
+  firstR: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): { x: number; z: number } | null {
+  for (let r = firstR; r <= 4.5; r += 0.25) {
     for (let k = 0; k < 16; k++) {
       const turn = (k % 2 === 1 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
       const x = centre.x + Math.sin(facing + turn) * r;

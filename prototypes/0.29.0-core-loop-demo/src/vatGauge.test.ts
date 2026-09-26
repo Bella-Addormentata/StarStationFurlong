@@ -41,6 +41,7 @@ import {
   vatPallorAt,
   vatPallorHex,
   vatSqueezeAt,
+  vatStrandedRelease,
 } from './vatGauge';
 import { FURNITURE, FURNITURE_DEFS, itemAabb, snapItemPos } from './furniture';
 import {
@@ -269,6 +270,29 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     const spot = vatFallbackRelease({ x: 0, z: 0 }, 0, [cover], ROOM, R)!;
     expect(spot.x).toBeGreaterThanOrEqual(cover.x1 + R);
     expect(spot.x).toBeLessThanOrEqual(ROOM.boundX);
+  });
+
+  it('releases a clone whose vat was removed where it stands, or the nearest free spot', () => {
+    // The vat is gone from the obstacles: the spot it was held on is free.
+    expect(vatStrandedRelease({ x: 0.2, z: 0.1 }, 0, [], ROOM, R)).toEqual({ x: 0.2, z: 0.1 });
+    // A peer-written box that overlapped the vat is still there: step out of
+    // it to the nearest free spot, never inside it.
+    const overlap = box(0, 0, 0.6, 0.6);
+    const spot = vatStrandedRelease({ x: 0.2, z: 0.1 }, 0, [overlap], ROOM, R)!;
+    const inside =
+      spot.x > overlap.x0 - R &&
+      spot.x < overlap.x1 + R &&
+      spot.z > overlap.z0 - R &&
+      spot.z < overlap.z1 + R;
+    expect(inside).toBe(false);
+    expect(Math.hypot(spot.x - 0.2, spot.z - 0.1)).toBeLessThan(1.5); // nearby
+    // Covered but for a strip by the east wall: the whole-room search finds it.
+    const cover = { x0: -6, z0: -6, x1: 4.5, z1: 6 };
+    const far = vatStrandedRelease({ x: 0, z: 0 }, 0, [cover], ROOM, R)!;
+    expect(far.x).toBeGreaterThanOrEqual(cover.x1 + R);
+    expect(far.x).toBeLessThanOrEqual(ROOM.boundX);
+    // Nowhere free: no spot, so the clone stays held.
+    expect(vatStrandedRelease({ x: 0, z: 0 }, 0, [box(0, 0, 6, 6)], ROOM, R)).toBeNull();
   });
 
   it('only ends a walk-out where the full-size clone clears the vat', () => {

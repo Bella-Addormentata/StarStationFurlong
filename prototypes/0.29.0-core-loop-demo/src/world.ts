@@ -3045,9 +3045,16 @@ export class World {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
     }
-    // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
+    // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
-    if (this.cloneVats.delete(itemId) && this.player.isVatSpawning()) {
+    // The clone is released on its next update, once the vat has left the
+    // obstacles, where it stands or at the nearest free spot. Removing some
+    // other vat leaves the ceremony alone.
+    if (
+      this.cloneVats.delete(itemId) &&
+      itemId === this.activeVatId &&
+      this.player.isVatSpawning()
+    ) {
       this.player.abortVatSpawn();
     }
 
