@@ -265,6 +265,15 @@ describe('one operator for the room', () => {
     expect(readSlotOperatorLease()).toBeNull();
   });
 
+  it("stops once another session has taken the lease, and leaves that session's record alone", () => {
+    fund(M1);
+    const ready = becomeOperator([M1]);
+    writeSlotOperatorLease(lease(ready + LEASE_MS)); // another session took the room over
+    tickSlotMachineRoom([M1], false, at(ready + 100));
+    expect(isSlotOperator()).toBe(false);
+    expect(readSlotOperatorLease()?.sessionId).toBe('other-device:tab');
+  });
+
   it('forgets a round of a machine that has left the room, and lets the lease go at once', async () => {
     fund(M1);
     await requestSpin(M1);
