@@ -280,6 +280,10 @@ export class Player {
   private deviceHooks: DeviceFocusHooks | null = null;
   /** Phase timer (TURN dwell — reuses TURN_TIME). */
   private deviceTimer = 0;
+  /** 🧱 Seconds the FINE step has made no headway toward the device front —
+   *  the "wedge": a neighbour's box plus PLAYER_R can put the exact front
+   *  point out of reach (a palm beside the speaker, a table by the cake). */
+  private deviceStuck = 0;
 
   // ── 🧬 Clone-vat spawn state (owner request — diegetic spawn point) ────────
   /** HOLD = frozen inside the tube; WALK_OUT = scripted straight exit walk. */
@@ -1355,6 +1359,7 @@ export class Player {
         // Arrived at (or started on) the device's front cell — fine-step next.
         this._removeReticle();
         this.devicePhase = "FINE";
+        this.deviceStuck = 0;
         return;
       }
       this.character.setState(
@@ -1392,6 +1397,7 @@ export class Player {
         if (this.devicePhase === "APPROACH") {
           this._removeReticle();
           this.devicePhase = "FINE";
+          this.deviceStuck = 0;
           return;
         }
         this.character.setState("idle", this.logicalAngle);
@@ -1424,6 +1430,8 @@ export class Player {
       const candX = pos.x + nx * step;
       const candZ = pos.z + nz * step;
       const { boundX, boundZ } = this.roomBounds();
+      const fromX = pos.x;
+      const fromZ = pos.z;
       const r1 = resolveObstacles(
         Math.max(-boundX, Math.min(boundX, candX)),
         pos.z,
@@ -1434,6 +1442,29 @@ export class Player {
       );
       pos.x = r2.x;
       pos.z = r2.z;
+
+      // 🧱 Wedged on the LAST leg of a device approach (owner report
+      // 2026-09-25): the A* grid bakes raw boxes but the body collides
+      // against boxes inflated by PLAYER_R, so the front CELL can be
+      // grid-walkable while its centre is physically out of reach — the
+      // palm beside the party speaker pinned the fox 0.2 m short of it and
+      // the panel never opened. No headway for a beat, one waypoint left and
+      // the device within arm's reach: hand off to the fine step (which has
+      // the same tolerance) instead of pushing at the palm forever.
+      if (this.devicePhase === "APPROACH" && this.deviceTarget) {
+        const headway = Math.hypot(pos.x - fromX, pos.z - fromZ);
+        this.deviceStuck = headway < step * 0.25 ? this.deviceStuck + deltaTime : 0;
+        const toFront = Math.hypot(this.deviceTarget.front.x - pos.x, this.deviceTarget.front.z - pos.z);
+        // Within 1.6 m: the fox can reach a table across a stool; the doc
+        // gate (cake owner, gift opener) is what actually guards the action.
+        if (this.deviceStuck > 0.5 && toFront < 1.6) {
+          this.waypointPath = [];
+          this._removeReticle();
+          this.devicePhase = "FINE";
+          this.deviceStuck = 0;
+          return;
+        }
+      }
 
       this.character.setState("walk", this.logicalAngle);
     }
@@ -2591,9 +2622,26 @@ export class Player {
         const nz = dz / dist;
         this.logicalAngle = snapTo8Ways(Math.atan2(nx, nz));
         const step = Math.min(this.SPEED * deltaTime, dist);
+        const fromX = pos.x;
+        const fromZ = pos.z;
         const r = resolveObstacles(pos.x + nx * step, pos.z + nz * step);
         pos.x = r.x;
         pos.z = r.z;
+        // 🧱 Wedged short of the front point (owner report 2026-09-25: the
+        // party speaker's front lay inside the palm beside it once the box
+        // was inflated by PLAYER_R, so the fox stood 0.2 m off and the panel
+        // never opened). No headway for a beat while already within arm's
+        // reach counts as arrived; from further away we keep pushing.
+        const headway = Math.hypot(pos.x - fromX, pos.z - fromZ);
+        this.deviceStuck = headway < step * 0.25 ? this.deviceStuck + deltaTime : 0;
+        if (this.deviceStuck > 0.4 && dist < 1.6) {
+          this.deviceStuck = 0;
+          this.logicalAngle = device.faceAngle;
+          this.character.setState("idle", this.logicalAngle);
+          this.deviceTimer = 0;
+          this.devicePhase = "TURN";
+          return;
+        }
         this.character.setState("walk", this.logicalAngle);
         return;
       }

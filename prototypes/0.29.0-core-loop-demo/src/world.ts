@@ -7,6 +7,7 @@
 import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
 import { readDoorPolicy } from "./doorPolicy";
+import { setLocalPresence } from "./localPresence";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
   DOOR_OPENING_WIDTH, DOOR_OPENING_HEIGHT, DOOR_POST_WIDTH,
@@ -60,7 +61,8 @@ import {
   DIVE_TIME,
   DIVE_ARC_LIFT,
   bridgeDeckY,
-  poolHoleOutline,
+  floorCutOutlines,
+  isFloorCutKind,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
 import { northDoorUnlocked } from "./stationParts";
@@ -2627,29 +2629,29 @@ export class World {
    * covers remote changes; editMode's local splice/spawn does not).
    */
   public refreshOutdoorFloor(): void {
-    // A pool (either style) sinks its water below the floor.
-    const hasPool = FURNITURE.some(
-      (i) => isPoolKind(i.kind),
+    // A pool (either style) sinks its water below the floor; so does the
+    // 🏊 infinity pool, whose terraces are cut into it (isFloorCutKind).
+    const hasCut = FURNITURE.some(
+      (i) => isFloorCutKind(i.kind),
     );
     if (OCTAGON_HULL) {
-      // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the pool water
-      // is — the deck keeps its floor. The hole is the water's EXACT outline
-      // (poolHoleOutline), so no solid floor peeks over the organic water (the
-      // old 1 m cell holes couldn't match the curve). The pool's basin (with its
-      // drawn-in bottom) sinks into the basement through the hole. No pool ⇒ no
-      // holes, plus any demo rect hole.
+      // 🛑📐 #80: keep the floor SOLID and cut a hole ONLY where the water is
+      // — the deck keeps its floor. The hole is the water's EXACT outline
+      // (floorCutOutlines: the swim pool's curve, or the infinity pool's staircase),
+      // so no solid floor peeks over the water (the old 1 m cell holes couldn't
+      // match the curve). The basin (with its drawn-in bottom) sinks into the
+      // basement through the hole. Nothing sunk ⇒ no holes, plus any demo rect.
       const rects: Array<{ x0: number; z0: number; x1: number; z1: number }> = [];
       if (this.demoFloorHole) rects.push(this.demoFloorHole);
-      const outline = hasPool ? poolHoleOutline(FURNITURE) : null;
-      this.setFloorHoles(rects, outline ? [outline] : []);
+      this.setFloorHoles(rects, hasCut ? floorCutOutlines(FURNITURE) : []);
       if (this.platformFloor) this.platformFloor.visible = true;
-      if (this.platformGrid) this.platformGrid.visible = !hasPool;
+      if (this.platformGrid) this.platformGrid.visible = !hasCut;
       return;
     }
     // Legacy (no octagon): hide the whole floor/grid wherever a pool is present
     // — the pool's deck slabs provide the visible flooring instead.
-    if (this.platformFloor) this.platformFloor.visible = !hasPool;
-    if (this.platformGrid) this.platformGrid.visible = !hasPool;
+    if (this.platformFloor) this.platformFloor.visible = !hasCut;
+    if (this.platformGrid) this.platformGrid.visible = !hasCut;
   }
 
   /**
@@ -2725,7 +2727,11 @@ export class World {
     cv.width = W;
     cv.height = H;
     const c = cv.getContext("2d")!;
-    c.fillStyle = "#E7C265";
+    // 🏖️ WHITE beach sand (owner ruling 2026-09-25): the party skill's
+    // reference palette (#fbf7ee), not the golden sand tried first — the
+    // grain is the same pixel noise in four near-white tones, so it still
+    // reads as sand rather than as a blank floor.
+    c.fillStyle = "#FBF7EE";
     c.fillRect(0, 0, W, H);
     let seed = 0x9e3779b9;
     const rnd = () => {
@@ -2733,7 +2739,7 @@ export class World {
       seed = (Math.imul(seed ^ (seed >>> 12), 0x297a2d39) >>> 0);
       return ((seed ^ (seed >>> 15)) >>> 0) / 4294967296;
     };
-    const TONES = ["#D9AF4E", "#F2D27C", "#C99E3F", "#FBE39A"];
+    const TONES = ["#EBE3D2", "#FFFDF7", "#D4C9B2", "#F3ECDC"];
     for (let n = 0; n < 26000; n++) {
       c.fillStyle = TONES[n % 4];
       c.globalAlpha = 0.35 + rnd() * 0.4;
@@ -3713,6 +3719,13 @@ export class World {
     // 🎰 Keep physical cabinet reels synchronized for nearby spectators.
     for (const slot of this.slotMachineVisuals.values()) slot.update(deltaTime);
 
+    // 🧍 Tell the props whether the local player is IN the room, and where —
+    // the party speaker strikes up on the fox walking in and fades with
+    // distance (localPresence.ts). Change-detected inside, so this is cheap.
+    {
+      const p = this.player.getPosition();
+      setLocalPresence(this.isPlayerActive(), p.x, p.z);
+    }
     // 💃 Dance floors run their travelling light wave (no-op while the room's
     // speaker is off — the handle reads that itself).
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
@@ -5056,7 +5069,7 @@ export class World {
       const stageYaw = firstPerson
         ? Math.atan2(pp.x - bp.x, pp.z - bp.z)
         : rigYaw;
-      bot.setStageYaw(bot.isCoaching() ? stageYaw : null);
+      bot.setStageYaw(bot.isPerforming() ? stageYaw : null);
       if (!activePlayer || !bot.isCoaching()) continue;
       if (Math.hypot(bp.x - pp.x, bp.z - pp.z) > 6) continue; // the 6 m circle
       // 🚪 Door-zone exemption: a fox walking out pauses BESIDE the door
@@ -5165,6 +5178,7 @@ export class World {
       routineOf(k) !== "idle" &&
       routineOf(k) !== "custom" &&
       routineOf(k) !== "coach" && // a coach runs its class, never a table
+      routineOf(k) !== "dance" && // 🎉 a dancer is on the floor, never at a table
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,

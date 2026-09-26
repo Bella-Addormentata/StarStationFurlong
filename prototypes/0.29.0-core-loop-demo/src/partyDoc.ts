@@ -39,23 +39,33 @@ export interface CakeState {
   candles: number;
 }
 
-/** 🎁 One gift box. `byName` is a display copy for the "opened by" line. */
+/** 🎁 One gift box. `byName` is a display copy for the "opened by" line.
+ *  `wish` is the line written on the tag (owner request 2026-09-26): anyone
+ *  may leave one on a box that has none; the writer (by pub) or the room
+ *  owner may change it; it is read when the box is opened. */
 export interface GiftState {
   opened: boolean;
   byName: string;
+  wish: string;
+  wishBy: string;
+  wishByName: string;
 }
+export const MAX_WISH = 120;
 
-/** 🔊 The speaker drives the dance floor's pulse. */
+/** 🔊 The speaker drives the dance floor's pulse, and plays one of the
+ *  bundled recordings (partyAudio.ts TRACKS) — `track` is that track's id. */
 export interface SpeakerState {
   on: boolean;
+  track: string;
 }
 
 export const DEFAULT_CANDLES = 5;
 const MAX_CANDLES = 12;
 
 const CAKE_DEFAULT: CakeState = { lit: true, candles: DEFAULT_CANDLES };
-const GIFT_DEFAULT: GiftState = { opened: false, byName: '' };
-const SPEAKER_DEFAULT: SpeakerState = { on: true };
+const GIFT_DEFAULT: GiftState = { opened: false, byName: '', wish: '', wishBy: '', wishByName: '' };
+export const DEFAULT_TRACK = 'sung';
+const SPEAKER_DEFAULT: SpeakerState = { on: true, track: DEFAULT_TRACK };
 
 let boundDoc: Y.Doc | null = null;
 let partyMap: Y.Map<unknown> | null = null;
@@ -218,24 +228,62 @@ export function giftKey(itemId: string): string {
 export function readGift(itemId: string): GiftState {
   const raw = ensureMap().get(giftKey(itemId)) as Partial<GiftState> | undefined;
   if (!raw || typeof raw !== 'object') return { ...GIFT_DEFAULT };
+  const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
   return {
     opened: raw.opened === true,
-    byName: typeof raw.byName === 'string' ? raw.byName.slice(0, 32) : '',
+    byName: str(raw.byName, 32),
+    wish: str(raw.wish, MAX_WISH),
+    wishBy: str(raw.wishBy, 128),
+    wishByName: str(raw.wishByName, 32),
   };
 }
 
-/** Anyone may open a gift — it is the small, ungated echo of the cake moment. */
+/** Anyone may open a gift — it is the small, ungated echo of the cake moment.
+ *  The wish on the tag survives the opening: that is when it gets read. */
 export function openGift(itemId: string, myName: string): PartyAction {
-  if (readGift(itemId).opened) return { ok: false, error: 'Already opened.' };
+  const cur = readGift(itemId);
+  if (cur.opened) return { ok: false, error: 'Already opened.' };
   write(giftKey(itemId), {
+    ...cur,
     opened: true,
     byName: (myName || 'A clone').slice(0, 32),
   } satisfies GiftState);
   return { ok: true };
 }
 
+/** Wrap it again (owner): closed, nobody's — the wish stays on the tag. */
 export function closeGift(itemId: string): void {
-  write(giftKey(itemId), { ...GIFT_DEFAULT });
+  const cur = readGift(itemId);
+  write(giftKey(itemId), { ...GIFT_DEFAULT, wish: cur.wish, wishBy: cur.wishBy, wishByName: cur.wishByName });
+}
+
+/**
+ * 💌 Write the wish on a gift's tag. A box with no wish takes anyone's; a
+ * box that has one is changed only by its writer or the room owner (the
+ * host may tidy a tag, a guest may not overwrite another guest's). An empty
+ * text, by someone allowed, takes the wish off. Gated HERE, not only in the
+ * panel, so an edited client cannot scribble over the others' tags.
+ */
+export function writeGiftWish(
+  itemId: string,
+  text: string,
+  myPub: string,
+  myName: string,
+  isOwner: boolean,
+): PartyAction {
+  const cur = readGift(itemId);
+  const wish = text.replace(/\s+/g, ' ').trim().slice(0, MAX_WISH);
+  if (cur.wish && cur.wishBy !== myPub && !isOwner) {
+    return { ok: false, error: `${cur.wishByName || 'Someone'} already wrote on this one.` };
+  }
+  if (!wish && !cur.wish) return { ok: false, error: 'Write a few words first.' };
+  write(giftKey(itemId), {
+    ...cur,
+    wish,
+    wishBy: wish ? myPub : '',
+    wishByName: wish ? (myName || 'A clone').slice(0, 32) : '',
+  } satisfies GiftState);
+  return { ok: true };
 }
 
 // ── 🔊 The speaker ───────────────────────────────────────────────────────────
@@ -247,12 +295,18 @@ export function speakerKey(itemId: string): string {
 export function readSpeaker(itemId: string): SpeakerState {
   const raw = ensureMap().get(speakerKey(itemId)) as Partial<SpeakerState> | undefined;
   if (!raw || typeof raw !== 'object') return { ...SPEAKER_DEFAULT };
-  return { on: raw.on !== false };
+  return { on: raw.on !== false, track: typeof raw.track === 'string' && raw.track ? raw.track : DEFAULT_TRACK };
 }
 
 /** Anyone may kill the music. Parties are like that. */
 export function toggleSpeaker(itemId: string): boolean {
-  const next = !readSpeaker(itemId).on;
-  write(speakerKey(itemId), { on: next } satisfies SpeakerState);
-  return next;
+  const cur = readSpeaker(itemId);
+  write(speakerKey(itemId), { on: !cur.on, track: cur.track } satisfies SpeakerState);
+  return !cur.on;
+}
+
+/** 🎵 Pick the recording the speaker plays — shared, like the switch. */
+export function setSpeakerTrack(itemId: string, track: string): void {
+  const cur = readSpeaker(itemId);
+  write(speakerKey(itemId), { on: cur.on, track } satisfies SpeakerState);
 }

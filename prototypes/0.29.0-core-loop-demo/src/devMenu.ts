@@ -133,9 +133,11 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'beach-river': '🌊 BEACH RIVER',
   'plank-bridge': '🌉 PLANK BRIDGE',
   'beach-sea': '🌊 BEACH SEA (corner)',
+  'infinity-pool': '🏊 INFINITY POOL (front edge)',
   'tiki-parasol': '🏝️ TIKI PARASOL',
   'beach-raft': '🛶 RAFT',
   'jungle-plant': '🌿 JUNGLE PLANT',
+  'climbing-rose': '🌹 CLIMBING ROSE (wall)',
 };
 
 type GetWorld = () => World | null;
@@ -456,6 +458,76 @@ function spawnFurniture(kind: FurnitureKind): void {
  * every load (the retired south-wall terminal), so restoring under that id
  * would vanish on the next reload.
  */
+/**
+ * 🌹 ROSE WALLS (owner request 2026-09-25): hang climbing roses shoulder to
+ * shoulder along the room's two most open walls — one per metre, so the
+ * curtains join into one. A wall's open length is what is left after its
+ * doorways, windows and anything standing against it (validatePlacement
+ * covers doors and windows; a hedge in front would only hide the roses, so
+ * furniture within a metre of the wall blocks the slot too). Additive: slots
+ * already holding a rose are skipped, so a second press fills gaps, not more.
+ */
+function fillRoseWalls(): void {
+  const world = getWorld();
+  if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
+    showHint('DEV: enter the room first.');
+    return;
+  }
+  const { halfX, halfZ } = roomHalfExtents();
+  const INSET = 0.03; // the flush-mount plane (furniture.ts snapInteriorWall)
+  const player = world.getPlayer().getPosition();
+  const ctx: PlacementContext = {
+    playerPositions: [{ x: player.x, z: player.z }, ...world.getRemotePlayerPositions()],
+    floodFrom: floodOrigin(world.getPlayer()),
+    requiredReachable: collectRequiredReachable(floodOrigin(world.getPlayer())),
+  };
+  // Every wall: its rot (furniture.ts WALL_MOUNT_ROT) and the pose of a slot
+  // at `along` metres from the room centre.
+  const walls: Array<{ name: string; rot: Rot; half: number; pose: (along: number) => { x: number; z: number } }> = [
+    { name: 'north', rot: 0, half: halfX, pose: (a) => ({ x: a, z: -halfZ + INSET }) },
+    { name: 'east', rot: 3, half: halfZ, pose: (a) => ({ x: halfX - INSET, z: a }) },
+    { name: 'south', rot: 2, half: halfX, pose: (a) => ({ x: a, z: halfZ - INSET }) },
+    { name: 'west', rot: 1, half: halfZ, pose: (a) => ({ x: -halfX + INSET, z: a }) },
+  ];
+  const blockedByFurniture = (pos: { x: number; z: number }, rot: Rot): boolean => {
+    // A 1 m stretch of wall and the metre of floor in front of it.
+    const alongX = rot % 2 === 0;
+    const band = alongX
+      ? { x0: pos.x - 0.5, x1: pos.x + 0.5, z0: Math.min(pos.z, pos.z - Math.sign(pos.z) * 1.0), z1: Math.max(pos.z, pos.z - Math.sign(pos.z) * 1.0) }
+      : { z0: pos.z - 0.5, z1: pos.z + 0.5, x0: Math.min(pos.x, pos.x - Math.sign(pos.x) * 1.0), x1: Math.max(pos.x, pos.x - Math.sign(pos.x) * 1.0) };
+    return FURNITURE.some((o) => {
+      if (o.kind === 'climbing-rose') return false;
+      const ob = itemAabb(o);
+      return !!ob && band.x0 < ob.x1 && band.x1 > ob.x0 && band.z0 < ob.z1 && band.z1 > ob.z0;
+    });
+  };
+  const probe: FurnitureItem = { id: 'rose-walls-probe', kind: 'climbing-rose', pos: { x: 0, z: 0 }, rot: 0, movable: true };
+  const plans = walls.map((w) => {
+    const slots: Array<{ x: number; z: number }> = [];
+    for (let a = -w.half + 0.5; a <= w.half - 0.5 + 1e-6; a += 1.0) {
+      const pos = w.pose(a);
+      const taken = FURNITURE.some((o) => o.kind === 'climbing-rose' && o.rot === w.rot && Math.hypot(o.pos.x - pos.x, o.pos.z - pos.z) < 0.9);
+      if (taken || blockedByFurniture(pos, w.rot)) continue;
+      if (!validatePlacement(probe, pos, w.rot, ctx).ok) continue;
+      slots.push(pos);
+    }
+    return { ...w, slots };
+  });
+  plans.sort((a, b) => b.slots.length - a.slots.length);
+  const chosen = plans.slice(0, 2).filter((p) => p.slots.length > 0);
+  let placed = 0;
+  for (const w of chosen) {
+    for (const pos of w.slots) {
+      const item: FurnitureItem = { id: uniqueSpawnId('climbing-rose'), kind: 'climbing-rose', pos, rot: w.rot, movable: true };
+      commitSpawn(world, item);
+      placed++;
+    }
+  }
+  showHint(placed
+    ? `DEV: 🌹 hung ${placed} climbing roses along the ${chosen.map((w) => w.name).join(' and ')} wall${chosen.length > 1 ? 's' : ''} — synced to the room (E4).`
+    : 'DEV: 🌹 no open wall for roses (doorways, windows and the hedge take every slot).', 5000);
+}
+
 function spawnWallComputer(): void {
   const world = getWorld();
   if (!world || !world.getClickPlane() || !world.isPlayerActive()) {
@@ -716,6 +788,12 @@ function buildPanel(): HTMLDivElement {
   // room that lost it needs a way back into EDIT ROOM.
   furnitureRows.unshift(`
     <div style="${ROW_STYLE}">
+      <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🌹 ROSE WALLS <span style="color:rgba(255,179,0,0.4);">· two open walls, one rose per metre</span></span>
+      <button type="button" data-dev-action="rose-walls" title="Hang climbing roses shoulder to shoulder along the two most open walls" style="${BTN_STYLE}">+ ADD</button>
+    </div>
+  `);
+  furnitureRows.unshift(`
+    <div style="${ROW_STYLE}">
       <span style="min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">🖥️ WALL COMPUTER <span style="color:rgba(255,179,0,0.4);">· restore</span></span>
       <button type="button" data-dev-action="spawn-wall-computer" style="${BTN_STYLE}">+</button>
     </div>
@@ -820,6 +898,7 @@ function buildPanel(): HTMLDivElement {
       case 'add-item': addItemToTrunk(btn.dataset.id ?? ''); break;
       case 'equip-outfit': equipOutfit(btn.dataset.id ?? ''); break;
       case 'spawn-furniture': spawnFurniture(btn.dataset.kind as FurnitureKind); break;
+      case 'rose-walls': fillRoseWalls(); break;
       case 'spawn-wall-computer': spawnWallComputer(); break;
       case 'place-template': {
         const w = getWorld();

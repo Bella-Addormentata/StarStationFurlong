@@ -54,6 +54,8 @@ import {
 // (floorPlanDoc imports neither this module nor anything that leads back to
 // it, and DoorWall is type-only — no cycle either way.)
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
+import { createSpeakerVoice } from "./partyAudio";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
@@ -145,9 +147,13 @@ export type FurnitureKind =
   | "plank-bridge"
   // 🏖️ The Habbo beach: a flat sea in the front corner, thatched parasols, a raft.
   | "beach-sea"
+  // 🏊 The reference's terraced water as a pool on the front edge (not a swim kind).
+  | "infinity-pool"
   | "tiki-parasol"
   | "beach-raft"
-  | "jungle-plant";
+  | "jungle-plant"
+  // 🌹 Tall yellow climbing rose on a trellis — hangs on an interior wall.
+  | "climbing-rose";
 
 export interface FurnitureItem {
   id: string;
@@ -3209,8 +3215,8 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       kind: "cakeTable",
       front: { x: 0, z: 1.0 },
       faceAngle: Math.PI,
-      eye: { x: 0, y: 1.5, z: 1.0 },
-      anchor: { x: 0, y: 1.15, z: 0 },
+      eye: { x: 0, y: 1.9, z: 1.1 },
+      anchor: { x: 0, y: 1.55, z: 0 },
     },
   },
   // 🎁 Gift box: 1×1, solid, and deliberately CHEAP to place — guests pile
@@ -3313,10 +3319,26 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
     footprint: null,
     obstacleBoxes: () => seaObstacleBoxes(),
   },
+  // 🏊 Terraced infinity pool. footprint null; blocked per column, minus bridges.
+  "infinity-pool": {
+    kind: "infinity-pool",
+    build: buildInfinityPool,
+    footprint: null,
+    obstacleBoxes: (_item, all) => infinityPoolObstacleBoxes(all),
+  },
   "tiki-parasol": { kind: "tiki-parasol", build: buildTikiParasol, footprint: { w: 1, d: 1 } },
   // Floats on the sea — a thing you look at, not a tile you stand on.
   "beach-raft": { kind: "beach-raft", build: buildBeachRaft, footprint: null },
   "jungle-plant": { kind: "jungle-plant", build: buildJunglePlant, footprint: { w: 1, d: 1 } },
+  // 🌹 Climbing rose: wall-mounted like the terminal (footprint null, never
+  // an obstacle, pose derived from the wall — see snapInteriorWall), 1 m of
+  // wall, 3.6 m tall.
+  "climbing-rose": {
+    kind: "climbing-rose",
+    build: buildClimbingRose,
+    footprint: null,
+    wallMount: { halfW: 0.5 },
+  },
   // Wall-mounted room terminal (M1 of #33): footprint null — it hangs on the
   // wall plane and must never become an obstacle. Device template in the
   // local rot-0 frame (screen faces +z):
@@ -6615,6 +6637,14 @@ const BRIDGE_W = 1.8;
  *  full width at its widest bend, plus a 0.7 m landing on each bank. A fixed
  *  9 m span authored for a 5×5 module ran through the wall of a 2×2 one. */
 function bridgeLen(): number {
+  return bridgeLenFor(FURNITURE);
+}
+/** 🏊 Over the infinity pool the span is the pool's widest possible width —
+ *  water plus its wet step plus one row of drift — with the same 0.7 m
+ *  landings: a pier out to the edge. (Per item list so the tests' explicit
+ *  lists work too.) */
+function bridgeLenFor(all: FurnitureItem[]): number {
+  if (all.some((i) => i.kind === "infinity-pool")) return infinityPoolMetrics().waterW + 2 + 1.4;
   const rm = riverMetrics();
   return 2 * (rm.wWet + rm.amp) + 1.4;
 }
@@ -6807,6 +6837,598 @@ function buildBeachSea(ctx: BuildCtx) {
   mat.vertexColors = true;
   mat.side = THREE.DoubleSide;
   place(g, mat, 0, 0, 0);
+}
+
+// ── 🏊 The infinity pool ─────────────────────────────────────────────────────
+/**
+ * A narrow pool along the FRONT EDGE of the room, built the way the party
+ * skill's reference builds its water: out of whole tiles, every tile a flat
+ * top at its own level with a vertical face wherever the neighbour is lower.
+ * That staircase of faces is where the solidity comes from — a smooth ribbon
+ * reads as a painted curve however it is terraced, a stepped one reads as a
+ * place cut into a block.
+ *
+ * INFINITY: the pool has no far bank. Its far edge IS the platform's front
+ * edge — the water runs past the floor's rim onto a spill shelf and a sheet
+ * of it drops away into space below. The near edge is a wet-sand step down
+ * (−0.16 m, the reference's wet level) to the water (−0.34 m), and that near
+ * shoreline wanders by a tile across the room so it is a shore, not a rule.
+ *
+ * Narrow and WINDING on purpose (owner rulings 2026-09-25): one tile of
+ * water widening to two at the bends in a 2×2 module, two-to-three in a 5×5,
+ * the near shore zigzagging every two or three tiles (2¼ waves). The steps
+ * are deeper than the reference's (wet −0.22, water −0.50) because with the
+ * pool this narrow the step faces ARE the solidity. No deep channel — the
+ * drop over the edge is the depth cue.
+ *
+ * Not a pool kind: you cannot swim in it (the reference's water is simply
+ * unwalkable), so nothing pins its surface to the swim plane. It does cut the
+ * floor — isFloorCutKind / floorCutOutlines — because the tiles are BELOW
+ * floor level.
+ *
+ * A ROOM feature like beach-sea: the tiles are decided by one pure function
+ * of the room (infinityPoolColumns), on the world grid, and the item's own
+ * position is subtracted out, so the geometry, the floor hole and the blocked
+ * tiles are one shape wherever the item is dropped. Doors keep a dry lane —
+ * a door on the front wall gets a landing tile cut out of the pool.
+ */
+const IP_LIP = 0.35; // the cut stops this short of a WALL (a hole touching the floor's edge is no hole — see poolHoleOutline)
+const IP_EDGE = 0.05; // …and this short of the open front edge: the same triangulator rule, but the water carries on over it
+const IP_SPILL = 0.45; // how far the water shelf reaches past the platform edge
+const IP_DROP = 1.0; // how far the spill sheet falls below it before it fades into the hull
+const IP_DOOR_KEEP = 1.5; // metres round a door kept dry (a hair under the sea's 1.6: a wet step one tile off a door lane is not in it)
+/** Tile top levels, metres below the floor — deeper than the reference's
+ *  0.16 / 0.34 so a one-tile pool still shows tall faces. */
+const IP_Y = { wet: -0.22, water: -0.5 } as const;
+export type InfinityPoolLevel = keyof typeof IP_Y;
+
+export interface InfinityPoolColumn {
+  i: number;
+  /** First and last row of the column that are pool (inclusive). */
+  top: number;
+  bot: number;
+  /** First water row; rows above it (down to `top`) are the wet step. */
+  w0: number;
+}
+
+/** Sizes, from the room. */
+export function infinityPoolMetrics(): {
+  cx: number;
+  cz: number;
+  cols: number;
+  rows: number;
+  waterW: number;
+  amp: number;
+  zBase: number;
+} {
+  const { halfX, halfZ } = roomHalfExtents();
+  const cx = Math.round(halfX);
+  const cz = Math.round(halfZ);
+  const cols = 2 * cx;
+  const rows = 2 * cz;
+  const waterW = rows >= 24 ? 2 : 1; // rows of water at the narrowest
+  const amp = 0.5; // the near shore steps in and out by one tile
+  // The near edge, continuous: at +amp the water is exactly waterW rows.
+  const zBase = cz - waterW - amp;
+  return { cx, cz, cols, rows, waterW, amp, zBase };
+}
+
+/** The continuous NEAR-EDGE line, world z for a world x. Nearest the edge
+ *  (narrowest) at the west wall, then in and out across the room — 2¼ waves,
+ *  so the rounded shore changes row every two or three tiles. */
+export function infinityPoolEdgeZ(x: number): number {
+  const mt = infinityPoolMetrics();
+  const t = (x + mt.cx) / mt.cols;
+  return mt.zBase + mt.amp * Math.cos(4.5 * Math.PI * t);
+}
+
+/**
+ * The pool, one column per tile of the room's width, every column running
+ * from its wet step to the front edge. Rows are the near-edge line rounded to
+ * the grid, so neighbouring columns step by whole tiles — the Habbo
+ * staircase. A door's dry lane trims a column from the end nearer the door
+ * (never out of its middle), and a column trimmed to nothing is simply
+ * absent, so a run of columns is always one connected body of water.
+ */
+export function infinityPoolColumns(): InfinityPoolColumn[] {
+  const mt = infinityPoolMetrics();
+  const doors = roomDoorPoints();
+  const out: InfinityPoolColumn[] = [];
+  for (let i = -mt.cx; i < mt.cx; i++) {
+    const w0 = Math.round(infinityPoolEdgeZ(i + 0.5));
+    let top = Math.max(-mt.cz, w0 - 1);
+    let bot = mt.cz - 1;
+    const nearDoor = (j: number) =>
+      doors.some((d) => Math.hypot(d.x - (i + 0.5), d.z - (j + 0.5)) < IP_DOOR_KEEP);
+    // Keep cutting from whichever end is nearer the offending tile until the
+    // column is clean — a door disc can only ever bite one contiguous chunk.
+    for (;;) {
+      let hit = -1;
+      for (let j = top; j <= bot; j++) if (nearDoor(j)) { hit = j; break; }
+      if (hit < 0) break;
+      if (hit - top <= bot - hit) top = hit + 1;
+      else bot = hit - 1;
+    }
+    // A door landing can eat a one-row column's only water; a wet step with
+    // nothing below it is not pool, so the column goes (the pool continues
+    // either side of the door).
+    if (top > bot || bot < w0) continue;
+    out.push({ i, top, bot, w0 });
+  }
+  return out;
+}
+
+export function infinityPoolLevel(c: InfinityPoolColumn, j: number): InfinityPoolLevel {
+  return j < c.w0 ? "wet" : "water";
+}
+
+/** A tile's world rectangle — a whole tile, except that tiles against a wall
+ *  stop IP_LIP short of it and tiles on the front edge stop IP_EDGE short. */
+function infinityPoolRect(i: number, j: number): Box {
+  const { cx, cz } = infinityPoolMetrics();
+  return {
+    x0: i === -cx ? i + IP_LIP : i,
+    x1: i === cx - 1 ? i + 1 - IP_LIP : i + 1,
+    z0: j === -cz ? j + IP_LIP : j,
+    z1: j === cz - 1 ? j + 1 - IP_EDGE : j + 1,
+  };
+}
+
+/** Every pool tile, keyed "i,j". */
+export function infinityPoolTiles(): Map<string, { i: number; j: number; level: InfinityPoolLevel }> {
+  const tiles = new Map<string, { i: number; j: number; level: InfinityPoolLevel }>();
+  for (const c of infinityPoolColumns()) {
+    for (let j = c.top; j <= c.bot; j++) tiles.set(`${c.i},${j}`, { i: c.i, j, level: infinityPoolLevel(c, j) });
+  }
+  return tiles;
+}
+
+/**
+ * The floor hole(s): one rectilinear polygon per run of consecutive columns,
+ * down the near bank and back along the far one. Strictly inside the floor's
+ * outer ring (infinityPoolRect's lip), which the triangulator requires.
+ */
+export function infinityPoolOutlines(): Array<Array<{ x: number; z: number }>> {
+  const polys: Array<Array<{ x: number; z: number }>> = [];
+  let run: InfinityPoolColumn[] = [];
+  const flush = () => {
+    if (run.length === 0) return;
+    const near: Array<{ x: number; z: number }> = [];
+    const far: Array<{ x: number; z: number }> = [];
+    for (const c of run) {
+      const rt = infinityPoolRect(c.i, c.top);
+      const rb = infinityPoolRect(c.i, c.bot);
+      near.push({ x: rt.x0, z: rt.z0 }, { x: rt.x1, z: rt.z0 });
+      far.push({ x: rb.x0, z: rb.z1 }, { x: rb.x1, z: rb.z1 });
+    }
+    const ring = [...near, ...far.reverse()];
+    // Drop consecutive duplicates (adjacent columns at the same row share a point).
+    const poly = ring.filter((p, k) => k === 0 || p.x !== ring[k - 1].x || p.z !== ring[k - 1].z);
+    polys.push(poly);
+    run = [];
+  };
+  for (const c of infinityPoolColumns()) {
+    if (run.length > 0 && c.i !== run[run.length - 1].i + 1) flush();
+    run.push(c);
+  }
+  flush();
+  return polys;
+}
+
+/** A plank bridge's world AABB (bridges are cardinal, so it is one). */
+function bridgeWorldBox(bridge: FurnitureItem, len: number): Box {
+  const c = rotXZ(BRIDGE_W / 2, len / 2, bridge.rot);
+  return {
+    x0: bridge.pos.x - Math.abs(c.x),
+    z0: bridge.pos.z - Math.abs(c.z),
+    x1: bridge.pos.x + Math.abs(c.x),
+    z1: bridge.pos.z + Math.abs(c.z),
+  };
+}
+
+/**
+ * The tile river's blocked area: one box per column (water AND wet shelf —
+ * the shelf is 16 cm below a floor the engine walks flat), cut by any plank
+ * bridge crossing it. Same split-then-subtract as riverObstacleBoxes, on
+ * world tiles instead of local strips.
+ */
+function infinityPoolObstacleBoxes(all: FurnitureItem[]): Box[] {
+  const boxes: Box[] = [];
+  const len = bridgeLenFor(all);
+  const bridges = all.filter((b) => b.kind === "plank-bridge").map((b) => bridgeWorldBox(b, len));
+  const SEAM = 0.01;
+  for (const c of infinityPoolColumns()) {
+    const rt = infinityPoolRect(c.i, c.top);
+    const rb = infinityPoolRect(c.i, c.bot);
+    const cx0 = rt.x0;
+    const cx1 = rt.x1;
+    const xEdges = new Set<number>([cx0, cx1]);
+    for (const b of bridges) {
+      if (b.x0 > cx0 && b.x0 < cx1) xEdges.add(b.x0);
+      if (b.x1 > cx0 && b.x1 < cx1) xEdges.add(b.x1);
+    }
+    const xs = [...xEdges].sort((a, b) => a - b);
+    for (let k = 0; k < xs.length - 1; k++) {
+      const sx0 = xs[k];
+      const sx1 = xs[k + 1];
+      if (sx1 - sx0 < 1e-6) continue;
+      const mid = (sx0 + sx1) / 2;
+      const spans = [{ z0: rt.z0, z1: rb.z1 }];
+      for (const b of bridges) {
+        if (mid <= b.x0 || mid >= b.x1) continue;
+        for (let s = spans.length - 1; s >= 0; s--) {
+          const sp = spans[s];
+          if (b.z1 <= sp.z0 || b.z0 >= sp.z1) continue;
+          spans.splice(s, 1);
+          if (b.z0 > sp.z0) spans.push({ z0: sp.z0, z1: b.z0 });
+          if (b.z1 < sp.z1) spans.push({ z0: b.z1, z1: sp.z1 });
+        }
+      }
+      for (const sp of spans) {
+        if (sp.z1 - sp.z0 < 0.05) continue;
+        boxes.push({ x0: sx0 - SEAM, z0: sp.z0 - SEAM, x1: sx1 + SEAM, z1: sp.z1 + SEAM });
+      }
+    }
+  }
+  return boxes;
+}
+
+function buildInfinityPool(ctx: BuildCtx) {
+  const { m, place, itemId } = ctx;
+  const item = FURNITURE.find((f) => f.id === itemId);
+  const ox = item?.pos.x ?? 0;
+  const oz = item?.pos.z ?? 0;
+  const mt = infinityPoolMetrics();
+  const tiles = infinityPoolTiles();
+
+  // The reference palette: its WATER, and its white-sand tones for the bank
+  // faces and the wet step (the room's beach floor is that same #fbf7ee —
+  // world.ts makeSandFloorTex). Wet sand is darker than dry, and a bank face
+  // is the floor in shadow. [top, ±x, ±z].
+  const SAND_FACE = [0xebe3d2, 0xd4c9b2];
+  const WET = [0xe4dac4, 0xd6cbb3, 0xbcae94];
+  const WATER_FACE = [0x2b8fa2, 0x21707f];
+  const SPILL = [0x2b8fa2, 0x141a26]; // the falling sheet: water at the lip, fading into the platform's own dark
+  const CAP = 0x141a26; // the platform's own dark, where the cut meets a wall
+
+  type Buf = { pos: number[]; col: number[]; idx: number[]; v: number };
+  const terrain: Buf = { pos: [], col: [], idx: [], v: 0 };
+  const water: Buf = { pos: [], col: [], idx: [], v: 0 };
+  const tmp = new THREE.Color();
+  const quad = (
+    b: Buf,
+    p: [number, number, number, number, number, number, number, number, number, number, number, number],
+    color: number,
+  ): number => {
+    const start = b.v;
+    for (let k = 0; k < 12; k += 3) b.pos.push(p[k] - ox, p[k + 1], p[k + 2] - oz);
+    tmp.setHex(color);
+    for (let k = 0; k < 4; k++) b.col.push(tmp.r, tmp.g, tmp.b);
+    b.idx.push(start, start + 2, start + 1, start, start + 3, start + 2);
+    b.v += 4;
+    return start;
+  };
+  const top = (b: Buf, r: Box, y: number, color: number) =>
+    quad(b, [r.x0, y, r.z0, r.x1, y, r.z0, r.x1, y, r.z1, r.x0, y, r.z1], color);
+  // A vertical face along one edge of a tile, from yTop down to yBot.
+  const face = (b: Buf, r: Box, side: "x0" | "x1" | "z0" | "z1", yTop: number, yBot: number, color: number) => {
+    if (side === "x0" || side === "x1") {
+      const x = r[side];
+      quad(b, [x, yTop, r.z0, x, yTop, r.z1, x, yBot, r.z1, x, yBot, r.z0], color);
+    } else {
+      const z = r[side];
+      quad(b, [r.x0, yTop, z, r.x1, yTop, z, r.x1, yBot, z, r.x0, yBot, z], color);
+    }
+  };
+
+  // Water tops are repainted every frame (the travelling light bands and the
+  // foam wash), so remember where each one's four vertices start.
+  const live: Array<{ start: number; i: number; j: number; foam: boolean }> = [];
+  const DIRS: Array<[number, number, "x0" | "x1" | "z0" | "z1"]> = [
+    [1, 0, "x1"],
+    [-1, 0, "x0"],
+    [0, 1, "z1"],
+    [0, -1, "z0"],
+  ];
+  for (const t of tiles.values()) {
+    const r = infinityPoolRect(t.i, t.j);
+    const y = IP_Y[t.level];
+    const isWater = t.level === "water";
+    const buf = isWater ? water : terrain;
+    // 🌊 On the front edge the water does not stop at the cut: its top runs
+    // on over the floor's rim and past the platform edge — the infinity lip.
+    const onEdge = isWater && t.j === mt.cz - 1;
+    const rTop = onEdge ? { ...r, z1: mt.cz + IP_SPILL } : r;
+    const start = top(buf, rTop, y, isWater ? 0x3fb3c6 : WET[0]);
+    let foam = false;
+    for (const [di, dj, side] of DIRS) {
+      const n = tiles.get(`${t.i + di},${t.j + dj}`);
+      const alongX = side === "x0" || side === "x1";
+      if (!n) {
+        const pastFront = t.j + dj >= mt.cz;
+        if (pastFront && isWater) {
+          // The sheet falling off the shelf's outer edge, into space.
+          const zs = mt.cz + IP_SPILL;
+          const mid = y - IP_DROP * 0.35;
+          quad(water, [r.x0, y, zs, r.x1, y, zs, r.x1, mid, zs, r.x0, mid, zs], SPILL[0]);
+          quad(water, [r.x0, mid, zs, r.x1, mid, zs, r.x1, y - IP_DROP, zs, r.x0, y - IP_DROP, zs], SPILL[1]);
+          foam = true;
+          continue;
+        }
+        const outside =
+          t.i + di < -mt.cx || t.i + di >= mt.cx || t.j + dj < -mt.cz || pastFront;
+        // Sand at floor level next door: the bank's own face, down to this
+        // tile. At a wall it is the cut's end, closed in the platform's dark.
+        face(terrain, r, side, 0, y, outside ? CAP : SAND_FACE[alongX ? 0 : 1]);
+        if (isWater) foam = true;
+        continue;
+      }
+      const ny = IP_Y[n.level];
+      if (ny < y) {
+        // The neighbour is a step down: this tile's face, in its own colour.
+        const cols = t.level === "wet" ? [WET[1], WET[2]] : WATER_FACE;
+        face(buf, r, side, y, ny, cols[alongX ? 0 : 1]);
+      } else if (n.level === "wet" && isWater) {
+        foam = true;
+      }
+    }
+    // The shelf's own end faces where the edge row stops (a door landing, a wall).
+    if (onEdge) {
+      for (const [di, side] of [[1, "x1"], [-1, "x0"]] as const) {
+        const n = tiles.get(`${t.i + di},${t.j}`);
+        if (!n || n.level !== "water") {
+          const x = r[side];
+          quad(water, [x, y, mt.cz - IP_EDGE, x, y, mt.cz + IP_SPILL, x, y - 0.12, mt.cz + IP_SPILL, x, y - 0.12, mt.cz - IP_EDGE], WATER_FACE[0]);
+        }
+      }
+    }
+    if (isWater) live.push({ start, i: t.i, j: t.j, foam });
+  }
+
+  const mesh = (b: Buf, mat: THREE.MeshStandardMaterial | THREE.MeshBasicMaterial): THREE.Mesh => {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
+    g.setAttribute("color", new THREE.Float32BufferAttribute(b.col, 3));
+    g.setIndex(b.idx);
+    g.computeVertexNormals();
+    mat.vertexColors = true;
+    mat.side = THREE.DoubleSide;
+    return place(g, mat, 0, 0, 0);
+  };
+  // The sand is lit like the floor it belongs to. The WATER is unlit: the
+  // reference's tiles are flat fills whose faces are pre-shaded (a darker
+  // colour per face, not a light), and under the room's sun a lit teal
+  // washed out to sky-white.
+  mesh(terrain, m(0xffffff, 0.95, 0.0));
+  const waterFlat = ctx.flat(0xffffff);
+  waterFlat.toneMapped = false; // the reference's exact fills, not the scene's curve
+  const waterMesh = mesh(water, waterFlat);
+  const waterCol = waterMesh.geometry.getAttribute("color") as THREE.BufferAttribute;
+
+  // ── 🌊 The current: short pale streaks drifting downstream (east → west)
+  //    along the centre line, each riding the surface of the tile under it.
+  const STREAK_LEN = 0.7;
+  const streakMat = m(0xffffff, 0.4, 0.0, 0xffffff, 0.4);
+  streakMat.transparent = true;
+  streakMat.opacity = 0.34;
+  streakMat.userData.baseOpacity = 0.34;
+  const xMin = -mt.cx + IP_LIP + STREAK_LEN / 2;
+  const xMax = mt.cx - IP_LIP - STREAK_LEN / 2;
+  const count = mt.cols * 2;
+  const streaks: THREE.Mesh[] = [];
+  const sx: number[] = [];
+  const sOff: number[] = [];
+  const offMax = Math.max(0.1, mt.waterW / 2 - 0.55);
+  for (let k = 0; k < count; k++) {
+    streaks.push(place(new THREE.BoxGeometry(STREAK_LEN, 0.008, 0.06), streakMat, 0, IP_Y.water, 0));
+    sx.push(xMin + (k / count) * (xMax - xMin));
+    sOff.push((Math.random() * 2 - 1) * offMax);
+  }
+
+  let time = 0;
+  const anim: PropAnimHandle = {
+    update(dt: number) {
+      time += dt;
+      // Light bands travelling downstream: phase advances along x, the
+      // stream's axis (the reference's x−y), and every tile keeps its own
+      // pixel-noise offset. Bank tiles get the foam wash pulsing over them.
+      for (const w of live) {
+        const k = Math.sin(w.i * 0.8 + w.j * 0.3 + time / 0.52) * 0.5 + 0.5;
+        const noise = ((w.i * 7 + w.j * 13) % 4) * 0.008;
+        const l = 0.34 + (10 + k * 16) * 0.005;
+        // Foam: the reference lays a 34 % ± 20 % white wash over bank tiles.
+        // Done as sRGB LIGHTNESS, not a lerp of the stored linear colour —
+        // that lerp is perceptually huge and turned the whole river sky-white.
+        const foam = w.foam ? 0.07 + Math.sin(time / 0.62 + w.i * 0.5) * 0.04 : 0;
+        // The reference's hsl() is an sRGB colour; say so, or setHSL writes
+        // it as linear and the output conversion lifts the whole river to sky.
+        tmp.setHSL(188 / 360, 0.52, l + noise + foam, THREE.SRGBColorSpace);
+        for (let v = 0; v < 4; v++) waterCol.setXYZ(w.start + v, tmp.r, tmp.g, tmp.b);
+      }
+      waterCol.needsUpdate = true;
+
+      for (let k = 0; k < count; k++) {
+        // Mid-stream runs faster than the edges.
+        const speed = 0.75 - 0.3 * (Math.abs(sOff[k]) / Math.max(offMax, 0.1));
+        sx[k] -= speed * dt;
+        if (sx[k] < xMin) sx[k] += xMax - xMin;
+        const x = sx[k];
+        // Down the middle of the water: between the near edge and the front.
+        const z = (infinityPoolEdgeZ(x) + mt.cz) / 2 + sOff[k];
+        const under = tiles.get(`${Math.floor(x)},${Math.floor(z)}`);
+        const s = streaks[k];
+        if (!under || under.level === "wet") {
+          s.visible = false;
+          continue;
+        }
+        s.visible = true;
+        s.position.set(x - ox, IP_Y.water + 0.012, z - oz);
+        const slope = -mt.amp * ((2.5 * Math.PI) / mt.cols) * Math.sin((2.5 * Math.PI * (x + mt.cx)) / mt.cols);
+        s.rotation.y = -Math.atan(slope);
+      }
+    },
+  };
+  waterMesh.userData.propAnim = anim;
+}
+
+/**
+ * 🌹 Tall yellow climbing rose — a wall decoration (owner request 2026-09-25,
+ * reference: yellow jessamine cascading off a pergola).
+ *
+ * Wall-mounted in the terminal's frame: the item's origin sits on the wall's
+ * flush-mount plane and local +z faces into the room, so everything here is
+ * built in z ≥ 0 and the wall is at the back. A wooden beam runs along the
+ * wall near the top; canes climb it from the foot, and from it a curtain of
+ * trailing strands drapes down, each hung with small five-petal yellow
+ * blossoms and dense leaves — the mass the reference has, not a sparse
+ * trellis. 1 m wide, 4.7 m tall against a 4 m wall — its crest spills over the top. Leaves, petals and flower
+ * centres are one InstancedMesh (≈2 000 instances, one draw call); the
+ * layout is seeded from the item id, so a row of these differs plant to
+ * plant but agrees on every client.
+ */
+function buildClimbingRose(ctx: BuildCtx) {
+  const { m, place, attach, itemId } = ctx;
+  const H = 4.7; // taller than the 4 m wall (owner ruling 2026-09-25): the beam sits on the wall's top and the crest spills over it
+  const W = 1.0;
+  const WOOD = 0x8a6a45;
+  const CANE = 0x4a7a3e;
+  const CANE_D = 0x35602e;
+  const LEAF = [0x3e8e4c, 0x54b062, 0x2f7a3e, 0x6cc070] as const;
+  const PETAL = [0xffd400, 0xffe14a, 0xffc61a, 0xfff08a] as const;
+  const CENTRE = 0xc98a12;
+  let seed = idHash01(itemId) * 1000;
+  const rnd = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+  const Z0 = 0.05;
+
+  // ── The beam the climber has taken over, and a pair of brackets.
+  const BEAM_Y = 4.05; // resting on the wall top
+  place(new THREE.BoxGeometry(W + 0.1, 0.09, 0.14), m(WOOD, 0.9, 0.05), 0, BEAM_Y, Z0 + 0.07);
+  for (const x of [-W / 2 + 0.06, W / 2 - 0.06]) {
+    place(new THREE.BoxGeometry(0.05, 0.05, 0.16), m(WOOD, 0.9, 0.05), x, BEAM_Y - 0.07, Z0 + 0.08);
+  }
+
+  // ── Wood: polylines drawn as short cylinders; every node remembered so the
+  //    foliage sits on the stems. Canes climb from the foot to the beam;
+  //    strands hang from the beam and sway a little as they fall.
+  type Pt = { x: number; y: number; z: number };
+  const nodes: Array<Pt & { hang: boolean }> = [];
+  const stem = (pts: Pt[], r: number, hang: boolean) => {
+    for (let i = 1; i < pts.length; i++) {
+      const a = pts[i - 1];
+      const b = pts[i];
+      const dx = b.x - a.x;
+      const dy = b.y - a.y;
+      const dz = b.z - a.z;
+      const len = Math.hypot(dx, dy, dz);
+      const seg = place(
+        new THREE.CylinderGeometry(r * 0.9, r, len + 0.01, 5),
+        m(i % 3 === 2 ? CANE_D : CANE, 0.85, 0.0),
+        (a.x + b.x) / 2,
+        (a.y + b.y) / 2,
+        (a.z + b.z) / 2,
+      );
+      // Orient the cylinder's +y along the segment.
+      seg.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(dx, dy, dz).normalize());
+      nodes.push({ ...b, hang });
+    }
+  };
+  // Three climbing canes, wandering up to the beam.
+  for (const [x0, drift] of [[-0.32, 0.12], [0.02, -0.04], [0.3, -0.14]] as const) {
+    const pts: Pt[] = [{ x: x0, y: 0.02, z: Z0 + 0.05 }];
+    let x: number = x0;
+    let dir = Math.PI / 2 + drift;
+    for (let y = 0.02; y < BEAM_Y - 0.1; ) {
+      dir += (rnd() - 0.5) * 0.5 + (Math.abs(x) > W / 2 - 0.1 ? (x > 0 ? 0.3 : -0.3) : 0);
+      x = Math.max(-W / 2 + 0.05, Math.min(W / 2 - 0.05, x + Math.cos(dir) * 0.24));
+      y += Math.max(0.1, Math.sin(dir) * 0.24);
+      pts.push({ x, y, z: Z0 + 0.05 + (rnd() - 0.5) * 0.03 });
+    }
+    stem(pts, 0.022, false);
+  }
+  // The curtain: strands from along the beam, hanging to varying depths and
+  // swinging out from the wall a little — the longest in the middle.
+  const STRANDS = 16;
+  for (let k = 0; k < STRANDS; k++) {
+    const x0 = -W / 2 + 0.05 + (k + 0.5) * ((W - 0.1) / STRANDS) + (rnd() - 0.5) * 0.04;
+    const mid = 1 - Math.abs((k + 0.5) / STRANDS - 0.5) * 2; // 1 in the middle, 0 at the ends
+    const len = 0.7 + mid * 1.2 + rnd() * 0.7;
+    const pts: Pt[] = [{ x: x0, y: BEAM_Y - 0.03, z: Z0 + 0.1 }];
+    const sway = (rnd() - 0.5) * 0.35;
+    const out = 0.12 + rnd() * 0.2;
+    const n = Math.max(3, Math.round(len / 0.2));
+    for (let i = 1; i <= n; i++) {
+      const t = i / n;
+      pts.push({
+        x: x0 + Math.sin(t * Math.PI) * sway + (rnd() - 0.5) * 0.03,
+        y: BEAM_Y - 0.03 - t * len,
+        z: Z0 + 0.1 + Math.sin(t * Math.PI * 0.5) * out,
+      });
+    }
+    stem(pts, 0.012, true);
+  }
+
+  // ── Leaves and blossoms, as instances.
+  type Inst = { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3; c: number };
+  const inst: Inst[] = [];
+  const UP = new THREE.Vector3(0, 1, 0);
+  const put = (p: THREE.Vector3, q: THREE.Quaternion, s: THREE.Vector3, c: number) => inst.push({ p, q, s, c });
+  const leaf = (at: Pt, size: number, hang: boolean) => {
+    // Lance-shaped, pointing away from the stem; hanging strands' leaves droop.
+    const a = hang ? Math.PI + (rnd() - 0.5) * 1.6 : rnd() * Math.PI * 2;
+    const q = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), a)
+      .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), (rnd() - 0.5) * 0.9));
+    const off = new THREE.Vector3(0, size * 0.7, 0).applyQuaternion(q);
+    put(new THREE.Vector3(at.x, at.y, at.z + 0.015).add(off), q, new THREE.Vector3(size * 0.3, size * 0.7, size * 0.07), LEAF[Math.floor(rnd() * LEAF.length)]);
+  };
+  const blossom = (at: Pt, r: number, colour: number) => {
+    // Small, flat, five-petalled, facing out into the room with a tilt.
+    const n = new THREE.Vector3((rnd() - 0.5) * 0.8, (rnd() - 0.5) * 0.8 - 0.1, 1).normalize();
+    const qN = new THREE.Quaternion().setFromUnitVectors(UP, n);
+    const centre = new THREE.Vector3(at.x, at.y, at.z + r * 0.3);
+    const phase = rnd() * Math.PI * 2;
+    for (let k = 0; k < 5; k++) {
+      const a = phase + (k / 5) * Math.PI * 2;
+      const q = qN.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, -a))
+        .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -0.3));
+      const off = new THREE.Vector3(Math.cos(a) * r * 0.5, r * 0.06, Math.sin(a) * r * 0.5).applyQuaternion(qN);
+      put(centre.clone().add(off), q, new THREE.Vector3(r * 0.58, r * 0.12, r * 0.4), colour);
+    }
+    put(centre.clone().add(n.clone().multiplyScalar(r * 0.1)), qN, new THREE.Vector3(r * 0.2, r * 0.14, r * 0.2), CENTRE);
+  };
+  for (const nd of nodes) {
+    const leaves = nd.hang ? 3 : 2;
+    for (let k = 0; k < leaves; k++) {
+      leaf({ x: nd.x + (rnd() - 0.5) * 0.06, y: nd.y + (rnd() - 0.5) * 0.12, z: nd.z }, 0.09 + rnd() * 0.04, nd.hang);
+    }
+    // Blossoms: thick along the hanging strands, a few on the climbing canes.
+    const count = nd.hang ? (rnd() < 0.75 ? 2 : 1) : (rnd() < 0.3 ? 1 : 0);
+    for (let k = 0; k < count; k++) {
+      blossom({ x: nd.x + (rnd() - 0.5) * 0.1, y: nd.y + (rnd() - 0.5) * 0.14, z: nd.z + rnd() * 0.03 }, 0.032 + rnd() * 0.018, PETAL[Math.floor(rnd() * PETAL.length)]);
+    }
+  }
+  // The crest: foliage and bloom heaped over the beam and the wall's top,
+  // up to H — the plant has grown over the wall, not stopped at it.
+  for (let k = 0; k < 110; k++) {
+    const t = rnd();
+    const at = { x: (rnd() - 0.5) * (W + 0.2), y: BEAM_Y + 0.05 + t * (H - BEAM_Y - 0.1), z: Z0 - 0.1 + rnd() * 0.32 };
+    leaf(at, 0.1 + rnd() * 0.05, false);
+    if (rnd() < 0.55) blossom(at, 0.035 + rnd() * 0.018, PETAL[k % PETAL.length]);
+  }
+
+  const geo = new THREE.SphereGeometry(1, 7, 5);
+  const mat = m(0xffffff, 0.8, 0.0);
+  const mesh = new THREE.InstancedMesh(geo, mat, inst.length);
+  const mtx = new THREE.Matrix4();
+  const col = new THREE.Color();
+  inst.forEach((it, i) => {
+    mtx.compose(it.p, it.q, it.s);
+    mesh.setMatrixAt(i, mtx);
+    mesh.setColorAt(i, col.setHex(it.c));
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  mesh.name = "roseFoliage";
+  attach(mesh);
 }
 
 /**
@@ -7346,9 +7968,6 @@ function buildPergolaRoof({ m, place, addLight }: BuildCtx) {
 // ONE SIDE of the room facing an empty middle, with the tallest (banner) at the
 // back. Nothing here should end up between the camera and the cake.
 
-const CAKE_SPONGE = 0xf2d9a8; // warm sponge
-const CAKE_FROST = 0xfff4e8; // buttercream
-const CAKE_BERRY = 0xff8fab; // the pink drip (PK2's sibling)
 const CANDLE_WAX = 0xfff0f4;
 const FLAME = 0xffb300;
 const CLOTH = 0xfdf6ec;
@@ -7365,43 +7984,175 @@ function idHash01(id: string): number {
 }
 
 /**
- * 🎂 THE ANCHOR OF THE ROOM. A clothed 2×1 table carrying a two-tier cake.
+ * 🎂 THE ANCHOR OF THE ROOM. A tall clothed 2×1 table carrying a four-tier
+ * floral cake.
  *
  * Two phases, driven by `cake:<itemId>` in the room doc: candles LIT (only the
  * guest of honour may blow them out) and candles OUT (the cake becomes a slice
  * dispenser for everyone). The flames and their light are one group whose
  * visibility follows the doc, so the moment lands on every screen at once.
  *
- * Tier proportions follow the reference set: a short wide tier under a taller
- * narrow one, each finished with a frosting disc that overhangs very slightly.
+ * The table is display height (top at 0.92 m — owner ruling 2026-09-25: the
+ * old 0.67 m sat at the fox's knees). The cake follows the owner's reference
+ * (2026-09-25): FOUR tiers of pale mint buttercream with a rough, ridged
+ * finish — the frosting shows — dressed with big open blossoms in coral,
+ * pink, peach and yellow with green leaves: a cluster on top, a cascade down
+ * the front-left across every tier, and tiny blossoms along each tier's foot.
+ *
+ * Every petal, leaf and flower centre is ONE InstancedMesh (≈1 000 instances,
+ * one draw call): built as meshes they would cost more than the rest of the
+ * room. Flower layout is seeded from the item id, so two cakes differ but
+ * every client agrees on each.
  */
+const CAKE_TOP = 0.92; // the cloth surface — every cake height is from here
 function buildCakeTable(ctx: BuildCtx) {
   const { m, place, addLight, attach, itemId } = ctx;
 
-  // Table + cloth. The cloth overhangs the top on all four sides.
-  place(new THREE.BoxGeometry(1.62, 0.60, 0.74), m(WOOD, 0.8, 0.05), 0, 0.30, 0);
-  place(new THREE.BoxGeometry(1.86, 0.07, 0.96), m(CLOTH, 0.9, 0.02), 0, 0.635, 0);
-  // Skirt: a thin band under the cloth edge, so the table doesn't read as a slab.
-  place(new THREE.BoxGeometry(1.84, 0.16, 0.94), m(CLOTH, 0.95, 0.0), 0, 0.55, 0);
+  // Table + cloth. Deep enough for the four-tier cake's stand; the cloth
+  // overhangs the top on all four sides and falls in a long skirt.
+  place(new THREE.BoxGeometry(1.62, 0.85, 0.92), m(WOOD, 0.8, 0.05), 0, 0.425, 0);
+  place(new THREE.BoxGeometry(1.86, 0.07, 1.14), m(CLOTH, 0.9, 0.02), 0, CAKE_TOP - 0.035, 0);
+  place(new THREE.BoxGeometry(1.84, 0.30, 1.12), m(CLOTH, 0.95, 0.0), 0, CAKE_TOP - 0.22, 0);
 
-  // ── Two-tier cake, centred on the table top (y 0.67 = cloth surface) ──
-  const TOP = 0.67;
-  place(new THREE.CylinderGeometry(0.30, 0.30, 0.22, 20), m(CAKE_SPONGE, 0.85, 0.02), 0, TOP + 0.11, 0);
-  place(new THREE.CylinderGeometry(0.315, 0.315, 0.06, 20), m(CAKE_FROST, 0.7, 0.03), 0, TOP + 0.25, 0);
-  place(new THREE.CylinderGeometry(0.19, 0.19, 0.18, 18), m(CAKE_SPONGE, 0.85, 0.02), 0, TOP + 0.37, 0);
-  place(new THREE.CylinderGeometry(0.20, 0.20, 0.05, 18), m(CAKE_FROST, 0.7, 0.03), 0, TOP + 0.485, 0);
-  // A pink drip band around the lower tier's frosting.
-  place(new THREE.CylinderGeometry(0.318, 0.318, 0.025, 20), m(CAKE_BERRY, 0.75, 0.04), 0, TOP + 0.225, 0);
+  // ── Four tiers on a stand ──
+  const TOP = CAKE_TOP;
+  const MINT = [0xc3e4e0, 0xb4dcd8, 0xd0ebe7] as const; // the reference's pale blue buttercream, three ridge tones
+  const RIM = 0xa9d1cc; // the shadow line under each tier
+  place(new THREE.CylinderGeometry(0.46, 0.46, 0.02, 28), m(0xf4efe6, 0.6, 0.1), 0, TOP + 0.01, 0);
+  place(new THREE.CylinderGeometry(0.44, 0.46, 0.015, 28), m(0xe6dfd2, 0.6, 0.05), 0, TOP + 0.0275, 0);
+  const tiers: Array<[number, number]> = [
+    [0.40, 0.24],
+    [0.33, 0.22],
+    [0.26, 0.2],
+    [0.19, 0.18],
+  ];
+  let seed = idHash01(itemId) * 1000;
+  const rnd = () => { seed = (seed * 9301 + 49297) % 233280; return seed / 233280; };
+  const tierBase: number[] = [];
+  const tierTop: number[] = [];
+  let y = TOP + 0.035;
+  for (const [r, h] of tiers) {
+    tierBase.push(y);
+    // The ridged finish: the tier is a stack of thin bands whose radius
+    // wanders a few millimetres, in three tones — buttercream pulled round
+    // with a palette knife, not a smooth drum.
+    const bands = Math.round(h / 0.035);
+    for (let b = 0; b < bands; b++) {
+      const rr = r + (rnd() - 0.35) * 0.012;
+      const bh = h / bands + 0.004;
+      place(new THREE.CylinderGeometry(rr, rr + 0.003, bh, 26), m(MINT[b % 3], 0.9, 0.0), 0, y + (b + 0.5) * (h / bands), 0);
+    }
+    place(new THREE.CylinderGeometry(r, r, 0.03, 26), m(MINT[2], 0.85, 0.0), 0, y + h + 0.015, 0);
+    place(new THREE.CylinderGeometry(r + 0.004, r + 0.004, 0.01, 26), m(RIM, 0.85, 0.0), 0, y + h - 0.005, 0);
+    y += h + 0.03;
+    tierTop.push(y);
+  }
+  const CAKE_TOP_Y = y;
+
+  // ── Flowers, as instances. Every blossom is a dark centre, five cupped
+  //    petals round it in the plane tangent to the cake, and a leaf or two.
+  const PETAL = [0xff6f52, 0xff8fab, 0xffb07a, 0xffd84a, 0xfff0d6, 0xf26b8a] as const;
+  const LEAF = [0x4fae76, 0x7cc47a, 0x3a8f5c] as const;
+  const CENTRE = 0x3b2a2a;
+  type Inst = { p: THREE.Vector3; q: THREE.Quaternion; s: THREE.Vector3; c: number };
+  const inst: Inst[] = [];
+  const UP = new THREE.Vector3(0, 1, 0);
+  const put = (p: THREE.Vector3, q: THREE.Quaternion, s: THREE.Vector3, c: number) => inst.push({ p, q, s, c });
+  /** A blossom at `at`, facing `n` (unit), radius r. */
+  const blossom = (at: THREE.Vector3, n: THREE.Vector3, r: number, colour: number) => {
+    const qN = new THREE.Quaternion().setFromUnitVectors(UP, n);
+    const petals = 5;
+    const phase = rnd() * Math.PI * 2;
+    for (let k = 0; k < petals; k++) {
+      const a = phase + (k / petals) * Math.PI * 2;
+      // Petal: a flattened ellipsoid, long axis radial, tipped up 25° so the
+      // flower cups toward its centre.
+      const q = qN.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, -a))
+        .multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -0.44));
+      const off = new THREE.Vector3(Math.cos(a) * r * 0.55, r * 0.12, Math.sin(a) * r * 0.55).applyQuaternion(qN);
+      put(at.clone().add(off), q, new THREE.Vector3(r * 0.62, r * 0.16, r * 0.42), colour);
+    }
+    put(at.clone().add(n.clone().multiplyScalar(r * 0.14)), qN, new THREE.Vector3(r * 0.26, r * 0.2, r * 0.26), CENTRE);
+    // A leaf or two poking out from under the petals.
+    const leaves = rnd() < 0.6 ? 2 : 1;
+    for (let k = 0; k < leaves; k++) {
+      const a = phase + rnd() * Math.PI * 2;
+      const q = qN.clone().multiply(new THREE.Quaternion().setFromAxisAngle(UP, -a));
+      const off = new THREE.Vector3(Math.cos(a) * r * 0.95, -r * 0.05, Math.sin(a) * r * 0.95).applyQuaternion(qN);
+      put(at.clone().add(off), q, new THREE.Vector3(r * 0.5, r * 0.08, r * 0.24), LEAF[Math.floor(rnd() * LEAF.length)]);
+    }
+  };
+  const hue = () => PETAL[Math.floor(rnd() * PETAL.length)];
+  /** On a tier's SIDE at angle a (local, +z front), fraction f up its height. */
+  const onSide = (t: number, a: number, f: number, r: number) => {
+    const [R, h] = tiers[t];
+    const n = new THREE.Vector3(Math.cos(a), 0, Math.sin(a));
+    blossom(new THREE.Vector3(Math.cos(a) * (R + r * 0.1), tierBase[t] + h * f, Math.sin(a) * (R + r * 0.1)), n, r, hue());
+  };
+  /** On the exposed TOP of tier t (the annulus outside the tier above). */
+  const onTop = (t: number, a: number, radius: number, r: number) => {
+    blossom(new THREE.Vector3(Math.cos(a) * radius, tierTop[t] + r * 0.12, Math.sin(a) * radius), UP, r, hue());
+  };
+
+  // The crown: a cluster on the top tier's back-left, leaving the candles
+  // their ring at the centre-front.
+  for (let k = 0; k < 8; k++) {
+    const a = 1.9 + (k / 8) * 2.8 + rnd() * 0.3;
+    onTop(3, a, 0.1 + rnd() * 0.06, 0.06 + rnd() * 0.025);
+  }
+  // The cascade: down the front-left, every tier — on the side and spilling
+  // onto the top of the tier below, biggest in the middle.
+  for (let t = 3; t >= 0; t--) {
+    const n = 3 + (3 - t);
+    for (let k = 0; k < n; k++) {
+      const a = 2.0 + rnd() * 0.9 + (k / n) * 0.6;
+      onSide(t, a, 0.25 + rnd() * 0.55, 0.06 + rnd() * 0.03);
+    }
+    if (t > 0) {
+      const [rBelow] = tiers[t - 1];
+      const [rThis] = tiers[t];
+      for (let k = 0; k < 2; k++) {
+        const a = 2.15 + rnd() * 1.0;
+        onTop(t - 1, a, rThis + (rBelow - rThis) * 0.5, 0.05 + rnd() * 0.02);
+      }
+    }
+  }
+  // Tiny blossoms along each tier's foot, all the way round, like the
+  // reference's sprinkled base.
+  for (let t = 0; t < tiers.length; t++) {
+    const [R] = tiers[t];
+    const n = Math.round((2 * Math.PI * R) / 0.32);
+    for (let k = 0; k < n; k++) {
+      const a = (k / n) * Math.PI * 2 + rnd() * 0.3;
+      onSide(t, a, 0.06, 0.024 + rnd() * 0.01);
+    }
+  }
+
+  // One InstancedMesh for the lot.
+  const petalGeo = new THREE.SphereGeometry(1, 8, 6);
+  const petalMat = m(0xffffff, 0.75, 0.0);
+  const flowers = new THREE.InstancedMesh(petalGeo, petalMat, inst.length);
+  const mtx = new THREE.Matrix4();
+  const col = new THREE.Color();
+  inst.forEach((it, i) => {
+    mtx.compose(it.p, it.q, it.s);
+    flowers.setMatrixAt(i, mtx);
+    flowers.setColorAt(i, col.setHex(it.c));
+  });
+  flowers.instanceMatrix.needsUpdate = true;
+  if (flowers.instanceColor) flowers.instanceColor.needsUpdate = true;
+  flowers.name = "cakeFlowers";
+  attach(flowers);
 
   // ── Candles. A ring on the top tier; the flames live in their own group. ──
   const flames = new THREE.Group();
   flames.name = "cakeFlames";
   const { candles } = readCake(itemId);
-  const CANDLE_BASE = TOP + 0.51;
+  const CANDLE_BASE = CAKE_TOP_Y;
   for (let i = 0; i < candles; i++) {
     const a = (i / Math.max(1, candles)) * Math.PI * 2;
-    const cx = Math.cos(a) * 0.115;
-    const cz = Math.sin(a) * 0.115;
+    const cx = Math.cos(a) * 0.075;
+    const cz = Math.sin(a) * 0.075 + 0.02; // a touch forward, clear of the crown
     place(new THREE.CylinderGeometry(0.012, 0.012, 0.13, 6), m(CANDLE_WAX, 0.7, 0.02), cx, CANDLE_BASE + 0.065, cz);
     // Flame: a small emissive teardrop. Parented to `flames`, not the item, so
     // one visibility flip blows out every candle together.
@@ -7552,16 +8303,60 @@ function buildGiftBox(ctx: BuildCtx) {
 }
 
 /**
- * 🎊 Birthday banner — 3×1 of bunting on two poles. footprint NULL on purpose:
- * guests walk UNDER it, and a banner that blocks a corridor is the fastest way
- * to make a party room unwalkable (the checklist's two-tile corridor rule).
+ * 🎊 Birthday banner — 3×1 of bunting on two poles, with a lettered cloth
+ * hung beneath the string. footprint NULL on purpose: guests walk UNDER it,
+ * and a banner that blocks a corridor is the fastest way to make a party
+ * room unwalkable (the checklist's two-tile corridor rule).
+ *
+ * Poles stand 3.8 m (owner rulings 2026-09-25: 2.35 m hung at the jungle
+ * plants' waist, 3.0 m still sat on the cake's crown). The cloth reads "Happy Birthday Dorkmo" from
+ * both sides — two panels back to back, each with the text the right way
+ * round, since a single double-sided plane mirrors it from behind.
  */
+const BANNER_TEXT = "Happy Birthday Dorkmo";
+
+/** The lettering, painted once per build into a canvas: coral script on a
+ *  cream cloth with a pink border, the party palette. */
+function makeBannerTexture(text: string): THREE.CanvasTexture {
+  const W = 1024;
+  const H = 192;
+  const cv = document.createElement("canvas");
+  cv.width = W;
+  cv.height = H;
+  const c = cv.getContext("2d")!;
+  c.fillStyle = "#fdf3e0"; // cream
+  c.fillRect(0, 0, W, H);
+  c.strokeStyle = "#ff8fab"; // pink border
+  c.lineWidth = 10;
+  c.strokeRect(9, 9, W - 18, H - 18);
+  // Scalloped dots along the border, the way a party banner is printed.
+  c.fillStyle = "#f2c14e";
+  for (let x = 40; x < W - 20; x += 48) {
+    c.beginPath(); c.arc(x, 24, 6, 0, Math.PI * 2); c.fill();
+    c.beginPath(); c.arc(x, H - 24, 6, 0, Math.PI * 2); c.fill();
+  }
+  c.fillStyle = "#e8604c"; // coral letters
+  c.textAlign = "center";
+  c.textBaseline = "middle";
+  let size = 96;
+  c.font = `bold ${size}px "Trebuchet MS", "Gill Sans", "Helvetica Neue", sans-serif`;
+  while (c.measureText(text).width > W - 120 && size > 40) {
+    size -= 4;
+    c.font = `bold ${size}px "Trebuchet MS", "Gill Sans", "Helvetica Neue", sans-serif`;
+  }
+  c.fillText(text, W / 2, H / 2 + 4);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
+  return tex;
+}
+
 function buildBirthdayBanner(ctx: BuildCtx) {
   const { m, place } = ctx;
   const POLE = 0xd8d2c4;
   const BUNTING = [0xff8fab, 0xf2c14e, 0x7fd1c4, 0x9a7bd0, 0xffffff] as const;
   const SPAN = 2.6;
-  const POLE_H = 2.35;
+  const POLE_H = 3.8;
 
   for (const px of [-SPAN / 2, SPAN / 2]) {
     place(new THREE.CylinderGeometry(0.035, 0.045, POLE_H, 8), m(POLE, 0.6, 0.35), px, POLE_H / 2, 0);
@@ -7602,12 +8397,38 @@ function buildBirthdayBanner(ctx: BuildCtx) {
     flag.rotation.x = Math.PI; // point down
     flag.rotation.y = Math.PI / 2;
   }
+
+  // ── The lettered cloth, hung below the bunting on two cords ──
+  const CLOTH_W = 2.2;
+  const CLOTH_H = CLOTH_W * (192 / 1024);
+  const clothTop = yAt(0.5) - 0.3; // under the flag tips at the sag
+  const clothY = clothTop - CLOTH_H / 2;
+  for (const t of [0.2, 0.8]) {
+    const x = -SPAN / 2 + t * SPAN;
+    const cordLen = yAt(t) - clothTop;
+    place(new THREE.CylinderGeometry(0.008, 0.008, cordLen, 4), m(POLE, 0.8, 0.1), x, clothTop + cordLen / 2, 0);
+  }
+  const tex = makeBannerTexture(BANNER_TEXT);
+  for (const side of [1, -1] as const) {
+    const mat = m(0xffffff, 0.9, 0.0);
+    mat.map = tex;
+    const panel = place(new THREE.PlaneGeometry(CLOTH_W, CLOTH_H), mat, 0, clothY, side * 0.006);
+    if (side === -1) panel.rotation.y = Math.PI; // the back reads the right way round too
+  }
+  // A thin batten along the top edge so the cloth hangs straight.
+  place(new THREE.BoxGeometry(CLOTH_W + 0.04, 0.02, 0.025), m(0xa86f43, 0.8, 0.1), 0, clothTop, 0);
 }
 
 /**
- * 🔊 Party speaker — the dance floor's power switch. Toggling it is ungated
- * (anyone may kill the music) and the state rides `speaker:<itemId>`, which the
- * dance floor subscribes to as well.
+ * 🔊 Party speaker — the dance floor's power switch, and the room's music.
+ * Toggling it is ungated (anyone may kill the music) and the state rides
+ * `speaker:<itemId>`, which the dance floor subscribes to as well.
+ *
+ * 🎶 It PLAYS (partyAudio.ts): "Happy Birthday" on a celesta the moment the
+ * local player walks into the room — once, whatever the switch says — and on
+ * a loop while the switch is on, fading with the player's distance from the
+ * cabinet. Driven per frame by a PropAnimHandle, so it stops dead when the
+ * item is removed or the room is left.
  */
 function buildPartySpeaker(ctx: BuildCtx) {
   const { m, place, attach, itemId } = ctx;
@@ -7639,6 +8460,23 @@ function buildPartySpeaker(ctx: BuildCtx) {
   };
   applyPhase();
   ring.userData.disposePartySub = subscribePartyKey(speakerKey(itemId), applyPhase);
+
+  // ── 🎶 The music. A carrier mesh holds the per-frame handle (World only
+  //    collects handles from meshes) and the dispose hook that silences it.
+  const voice = createSpeakerVoice(itemId);
+  const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(CAB, 1, 0), 0, 0.01, 0);
+  carrier.visible = false;
+  const anim: PropAnimHandle = {
+    update(dt: number) {
+      const me = FURNITURE.find((f) => f.id === itemId);
+      const p = localPlayerXZ();
+      const distance = me ? Math.hypot(me.pos.x - p.x, me.pos.z - p.z) : 0;
+      const sp = readSpeaker(itemId);
+      voice.update(dt, { on: sp.on, inRoom: isLocalPlayerInRoom(), distance, track: sp.track });
+    },
+  };
+  carrier.userData.propAnim = anim;
+  carrier.userData.disposeAudio = () => voice.dispose();
 }
 
 /**
@@ -8957,6 +9795,20 @@ export function poolCutContains(items: FurnitureItem[], wx: number, wz: number):
 
 export function isPoolKind(kind: FurnitureKind): boolean {
   return kind === "lazy-pool" || kind === "classic-pool" || kind === "beach-river";
+}
+
+/** 🕳️ Kinds that sink BELOW the floor and so need a hole cut in it: every pool,
+ *  plus the infinity pool (unswimmable, but its terraces are under floor level). */
+export function isFloorCutKind(kind: FurnitureKind): boolean {
+  return isPoolKind(kind) || kind === "infinity-pool";
+}
+
+/** 🕳️ The floor's hole outlines for these items — the infinity pool's
+ *  staircase polygons, else the swim pool's outline. World XZ. Empty when nothing is sunk. */
+export function floorCutOutlines(items: FurnitureItem[]): Array<Array<{ x: number; z: number }>> {
+  if (items.some((i) => i.kind === "infinity-pool")) return infinityPoolOutlines();
+  const outline = poolHoleOutline(items);
+  return outline ? [outline] : [];
 }
 
 export function getPoolBasin(items: FurnitureItem[]): {

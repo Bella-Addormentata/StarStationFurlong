@@ -15,10 +15,11 @@
  */
 
 import type { DeviceUI } from './devices';
+import { isSpeakerPlaying, stopSpeakerLocally, trackById, nextTrackId } from './partyAudio';
 import {
   readCake, blowCandles, relightCandles,
-  readGift, openGift, closeGift,
-  readSpeaker, toggleSpeaker,
+  readGift, openGift, closeGift, writeGiftWish, MAX_WISH,
+  readSpeaker, toggleSpeaker, setSpeakerTrack,
   readBirthdayPub, setBirthdayPub,
   subscribeParty,
   cakeKey, giftKey, speakerKey,
@@ -31,6 +32,10 @@ const GREEN = '#2fe6a0';
 const WARN = '#ff8a50';
 
 /** Text escape for names that came off the wire (a peer picks their own). */
+function escAttr(s: string): string {
+  return esc(s).replace(/"/g, '&quot;');
+}
+
 function esc(s: string): string {
   return s
     .replace(/&/g, '&amp;')
@@ -211,6 +216,31 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
   return panelUI(`device-gift-${deps.itemId}`, (panel) => {
     const gift = readGift(deps.itemId);
     const owner = deps.canEdit();
+    const me = deps.myPub();
+    const mayWrite = !gift.wish || gift.wishBy === me || owner;
+    // 💌 The tag. Closed: a blank tag invites a wish; a written one is
+    // sealed until the box is opened (its writer / the host may still edit).
+    // Opened: the wish is read out in full.
+    const tag = gift.opened
+      ? gift.wish
+        ? `<div style="margin-top:8px; padding:8px 10px; border:1px solid rgba(212,168,75,0.35); border-radius:7px; background:rgba(212,168,75,0.08);">
+             <div style="font-size:12px; color:${GOLD_BRIGHT}; line-height:1.5;">💌 “${esc(gift.wish)}”</div>
+             <div style="font-size:10px; color:${DIM}; margin-top:3px;">— ${esc(gift.wishByName || 'a friend')}</div>
+           </div>`
+        : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">No wish on the tag.</div>`
+      : `${gift.wish && !mayWrite
+          ? `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 ${esc(gift.wishByName || 'Someone')} left a wish — open it to read.</div>`
+          : gift.wish
+            ? `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 Your wish is on the tag${owner && gift.wishBy !== me ? ` (by ${esc(gift.wishByName || 'a guest')})` : ''}.</div>`
+            : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 Leave a wish on the tag — it is read when the box is opened.</div>`}
+         ${mayWrite
+           ? `<div style="display:flex; gap:6px; margin-top:6px;">
+                <input data-wish="1" type="text" maxlength="${MAX_WISH}" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
+                  flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
+                  border-radius:4px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:11px; padding:5px 7px;">
+                <button data-wish-save="1" style="background:rgba(212,168,75,0.12); border:1px solid rgba(212,168,75,0.4); border-radius:6px; color:${GOLD}; font-family:inherit; font-size:10px; font-weight:800; padding:0 9px; cursor:pointer;">${gift.wish ? 'SAVE' : 'WRITE'}</button>
+              </div>`
+           : ''}`;
     panel.innerHTML = `
       ${title('🎁 A PRESENT', gift.opened ? 'opened' : 'still wrapped')}
       ${
@@ -218,8 +248,9 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
           ? `<div style="font-size:11px; color:${GREEN}; line-height:1.5;">
                Opened by <b>${esc(gift.byName || 'someone')}</b>.
              </div>
+             ${tag}
              ${owner ? bigButton('data-rewrap="1"', '🎀 WRAP IT AGAIN', '212,168,75') : ''}`
-          : bigButton('data-open="1"', '🎁 OPEN IT', '255,143,171')
+          : `${bigButton('data-open="1"', '🎁 OPEN IT', '255,143,171')}${tag}`
       }
     `;
     panel.querySelector<HTMLButtonElement>('[data-open]')?.addEventListener('click', () => {
@@ -229,25 +260,66 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('[data-rewrap]')?.addEventListener('click', () => {
       if (deps.canEdit()) closeGift(deps.itemId);
     });
+    const input = panel.querySelector<HTMLInputElement>('[data-wish]');
+    const save = () => {
+      if (!input) return;
+      const result = writeGiftWish(deps.itemId, input.value, me, deps.myName(), deps.canEdit());
+      if (!result.ok) showPanelNote(panel, result.error);
+    };
+    panel.querySelector<HTMLButtonElement>('[data-wish-save]')?.addEventListener('click', save);
+    input?.addEventListener('keydown', (e) => {
+      e.stopPropagation(); // typing must not walk the fox or rotate the view
+      if (e.key === 'Enter') save();
+    });
+    input?.addEventListener('keyup', (e) => e.stopPropagation());
   });
 }
 
 // ── 🔊 The speaker ───────────────────────────────────────────────────────────
 
+/**
+ * 🔇 Clicking the speaker IS the stop (owner ruling 2026-09-25): walking up
+ * to it silences whatever it is playing on this client — the entry round or
+ * the loop — and, if the shared switch was on, turns it off for everyone.
+ * The panel then offers ▶ START THE MUSIC to bring the loop back.
+ */
 export function createPartySpeakerUI(deps: PartyDeviceDeps): DeviceUI {
-  return panelUI(`device-speaker-${deps.itemId}`, (panel) => {
-    const { on } = readSpeaker(deps.itemId);
+  const ui = panelUI(`device-speaker-${deps.itemId}`, (panel) => {
+    const { on, track } = readSpeaker(deps.itemId);
+    const sounding = on || isSpeakerPlaying(deps.itemId);
+    const t = trackById(track);
     panel.innerHTML = `
-      ${title('🔊 PARTY SPEAKER', on ? 'playing — the floor is lit' : 'silent')}
-      ${bigButton('data-toggle="1"', on ? '⏸ STOP THE MUSIC' : '▶ START THE MUSIC', on ? '255,138,80' : '47,230,160')}
+      ${title('🔊 PARTY SPEAKER', on ? 'playing — the floor is lit' : sounding ? 'playing' : 'silent')}
+      ${bigButton('data-toggle="1"', sounding ? '⏸ STOP THE MUSIC' : '▶ START THE MUSIC', sounding ? '255,138,80' : '47,230,160')}
+      <div style="font-size:11px; color:${GOLD_BRIGHT}; line-height:1.4; margin-top:6px;">♪ ${esc(t.title)}</div>
+      <div style="font-size:9px; color:${DIM}; line-height:1.4;">${esc(t.credit)}</div>
+      ${bigButton('data-next-track="1"', '⏭ NEXT TRACK', '212,168,75')}
       <div style="font-size:10px; color:${DIM}; line-height:1.4;">
-        Drives every dance floor in this room.
+        Drives every dance floor in this room. Free-licensed recordings — see public/audio/LICENSES.md.
       </div>
     `;
+    panel.querySelector<HTMLButtonElement>('[data-next-track]')?.addEventListener('click', () => {
+      setSpeakerTrack(deps.itemId, nextTrackId(readSpeaker(deps.itemId).track));
+    });
     panel.querySelector<HTMLButtonElement>('[data-toggle]')?.addEventListener('click', () => {
-      toggleSpeaker(deps.itemId);
+      if (sounding) {
+        stopSpeakerLocally(deps.itemId);
+        if (readSpeaker(deps.itemId).on) toggleSpeaker(deps.itemId);
+      } else {
+        toggleSpeaker(deps.itemId);
+      }
     });
   });
+  return {
+    ...ui,
+    mount(host: HTMLElement): void {
+      if (isSpeakerPlaying(deps.itemId) || readSpeaker(deps.itemId).on) {
+        stopSpeakerLocally(deps.itemId);
+        if (readSpeaker(deps.itemId).on) toggleSpeaker(deps.itemId);
+      }
+      ui.mount(host);
+    },
+  };
 }
 
 // Re-exported so world.ts can subscribe to a single prop's key if it ever needs

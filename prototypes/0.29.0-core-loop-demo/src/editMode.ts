@@ -498,6 +498,13 @@ function wallMountVerdict(
     }
   }
 
+  // 🌹 A DECORATIVE wall mount (no device — the climbing rose) hangs above
+  //    and behind whatever stands on the floor: a palm in front of it is the
+  //    garden, not a conflict, and nobody needs to walk up to it. Rules 3 and
+  //    4 exist so the terminal stays operable; they made the rose unplaceable
+  //    on any wall lined with the beach set's hedge (owner report 2026-09-25).
+  if (!FURNITURE_DEFS[item.kind].device) return { ok: true };
+
   // 3 + 4. Furniture occupying that stretch of wall, and furniture pinching
   //        the stand-point the panel would be used from. `() => true` as the
   //        walkable predicate makes deviceFrontFor return the PREFERRED front
@@ -1603,7 +1610,44 @@ class RoomEditController {
     this.raycaster.setFromCamera(this.pointerNdc, camera);
     const hits = this.raycaster.intersectObjects(this.raycastTargets, false);
     if (hits.length === 0) return null;
-    return this.meshToItem.get(hits[0].object) ?? null;
+    // 🌹 Prefer the first VISIBLE thing under the cursor. A door's click box
+    // is invisible and fat (the opening + 0.6 m wide, 3.4 m tall, 0.5 m into
+    // the room — docking.ts), so a wall climber hung beside a doorway sat
+    // inside it and every click on the plant selected the door (owner report
+    // 2026-09-25). The box still wins where nothing visible is under the
+    // cursor — the doorway itself.
+    // The box protrudes 0.25 m into the room, so from a side-on view it
+    // intercepts rays on their way to a plant hanging next to the door — rays
+    // whose PIXEL shows the plant. Hence: any visible hit anywhere along the
+    // ray beats every invisible one; only when nothing visible is under the
+    // cursor may the box claim the click, and then only over the doorway
+    // proper (leaves + posts), never its 0.3 m side margins.
+    // Likewise the door frame's glass (opacity 0.16–0.35): the plant shows
+    // straight through it on screen, so an OPAQUE hit behind it is what the
+    // cursor is on. Priority: opaque > translucent > the invisible box.
+    const firstMat = (mesh: THREE.Mesh): THREE.Material | undefined => {
+      const mat = mesh.material;
+      return Array.isArray(mat) ? mat[0] : mat;
+    };
+    const isInvisible = (mesh: THREE.Mesh): boolean => firstMat(mesh)?.visible === false;
+    const isTranslucent = (mesh: THREE.Mesh): boolean => {
+      const m = firstMat(mesh);
+      return !!m && m.transparent && m.opacity < 0.6;
+    };
+    const shown = hits.filter((h) => h.object.visible && !isInvisible(h.object as THREE.Mesh));
+    const opaque = shown.find((h) => !isTranslucent(h.object as THREE.Mesh));
+    if (opaque) return this.meshToItem.get(opaque.object) ?? null;
+    if (shown.length) return this.meshToItem.get(shown[0].object) ?? null;
+    for (const h of hits) {
+      const mesh = h.object as THREE.Mesh;
+      if (!mesh.visible) continue;
+      const width = (mesh.geometry as THREE.BoxGeometry).parameters?.width;
+      if (typeof width !== 'number' || !mesh.parent) return this.meshToItem.get(mesh) ?? null;
+      const local = mesh.parent.worldToLocal(h.point.clone());
+      const core = (width - 0.6) / 2 + DOOR_POST_WIDTH; // the opening plus a post each side
+      if (Math.abs(local.x) <= core) return this.meshToItem.get(mesh) ?? null;
+    }
+    return null;
   }
 
   /** 🖱️ Ad-hoc raycast for the context menu OUTSIDE edit mode — the persistent

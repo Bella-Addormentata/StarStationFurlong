@@ -231,7 +231,9 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     // 🎂 The anchor and its cluster, along the back.
     // Right of centre along the back, clear of the bar's shelf in the corner.
     { kind: "cake-table", at: [0.42, -0.78] },
-    { kind: "birthday-banner", at: [0.42, -0.9] },
+    // Strung OVER the cake table (same spot; the poles stand just past its
+    // ends and the cloth hangs well above the cake) — behind it is the hedge.
+    { kind: "birthday-banner", at: [0.42, -0.78] },
     // Gifts in METRES from the cake — one each side — so they sit beside it
     // in any room instead of drifting into the bar in a small one.
     { kind: "gift-box", at: [0.42, -0.78], off: [-1.6, 0.3] },
@@ -261,7 +263,8 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
     { kind: "sun-lounger", at: [0.48, 0.64] },
     { kind: "tiki-parasol", at: [0.66, 0.5] },
     { kind: "palm-tree", at: [-0.86, 0.3] },
-    { kind: "palm-tree", at: [0.86, 0.26] },
+    // Clear of the speaker's front (a palm at 0.26 wedged it shut).
+    { kind: "palm-tree", at: [0.86, 0.5] },
     { kind: "palm-tree", at: [-0.88, -0.44] },
     { kind: "tiki-torch", at: [-0.2, -0.66] },
     { kind: "tiki-torch", at: [-0.9, -0.66] },
@@ -270,7 +273,8 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
 
     // Everything past here is expansion — it lands only if there is room.
     { kind: "party-standing-table", at: [-0.34, -0.3] },
-    { kind: "party-standing-table", at: [0.42, -0.62] },
+    // Beside the cake, not on its front point.
+    { kind: "party-standing-table", at: [0.16, -0.55] },
     { kind: "cooler", at: [-1, -1], off: [1.3, 3.4] },
     { kind: "beach-crate", at: [-1, -1], off: [2.3, 0.9] },
     // The pergola is a RIGID GROUP: four posts 6.6 × 3.6 apart (the roof's
@@ -442,7 +446,7 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
 
       // 🎂 The anchor, and the cluster around it.
       { id: "party-cake", kind: "cake-table", pos: { x: -1.0, z: -4.2 }, rot: 0, movable: true },
-      { id: "party-banner", kind: "birthday-banner", pos: { x: -1.0, z: -5.3 }, rot: 0, movable: true },
+      { id: "party-banner", kind: "birthday-banner", pos: { x: -1.0, z: -4.2 }, rot: 0, movable: true },
       { id: "party-gift-1", kind: "gift-box", pos: { x: -2.7, z: -4.0 }, rot: 0, movable: true },
       { id: "party-gift-2", kind: "gift-box", pos: { x: -3.5, z: -4.7 }, rot: 0, movable: true },
       { id: "party-gift-3", kind: "gift-box", pos: { x: 0.7, z: -4.3 }, rot: 0, movable: true },
