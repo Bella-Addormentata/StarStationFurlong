@@ -9816,9 +9816,13 @@ export function isFloorCutKind(kind: FurnitureKind): boolean {
 /** 🕳️ The floor's hole outlines for these items — the infinity pool's
  *  staircase polygons, else the swim pool's outline. World XZ. Empty when nothing is sunk. */
 export function floorCutOutlines(items: FurnitureItem[]): Array<Array<{ x: number; z: number }>> {
-  if (items.some((i) => i.kind === "infinity-pool")) return infinityPoolOutlines();
+  // The UNION: a room can hold a swim pool and an infinity pool at once
+  // (edit mode, additive sets), and each needs its hole (Copilot review, PR #169).
+  const out: Array<Array<{ x: number; z: number }>> = [];
+  if (items.some((i) => i.kind === "infinity-pool")) out.push(...infinityPoolOutlines());
   const outline = poolHoleOutline(items);
-  return outline ? [outline] : [];
+  if (outline) out.push(outline);
+  return out;
 }
 
 export function getPoolBasin(items: FurnitureItem[]): {

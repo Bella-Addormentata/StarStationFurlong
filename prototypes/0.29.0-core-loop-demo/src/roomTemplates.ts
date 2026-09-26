@@ -27,7 +27,7 @@
 
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
-  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, buildObstacleList,
+  DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList,
   seaCorner, roomDoorPoints,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
@@ -76,7 +76,7 @@ export interface RoomTemplate {
    * generator is handed the real half-extents and places what fits, in
    * priority order, skipping what does not. See layoutBeachParty.
    */
-  layout?: (half: { halfX: number; halfZ: number }) => FurnitureItem[];
+  layout?: (half: { halfX: number; halfZ: number }, seed?: readonly Box[]) => FurnitureItem[];
 }
 
 // ── 🧩 Fitted layouts ────────────────────────────────────────────────────────
@@ -127,9 +127,12 @@ function placeFitting(
   halfX: number,
   halfZ: number,
   idPrefix: string,
+  /** What already stands in the room — a set ADDED to a furnished room fits
+   *  around it instead of through it (Copilot review, PR #169). */
+  seed: readonly Box[] = [],
 ): FurnitureItem[] {
   const out: FurnitureItem[] = [];
-  const occupied: Box[] = [];
+  const occupied: Box[] = [...seed];
   const MARGIN = 0.6; // keep furniture off the walls
   let n = 0;
 
@@ -234,7 +237,7 @@ function placeFitting(
  * Nothing is scaled — a bar counter is 4 m wide wherever it is — so the set
  * thins out rather than shrinking.
  */
-function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem[] {
+function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly Box[] = []): FurnitureItem[] {
   const { halfX, halfZ } = half;
   const specs: PlacementSpec[] = [
     // 🌊 THE SEA first: flat water in the west-south corner of the sand, with
@@ -328,7 +331,7 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }): FurnitureItem
   // BEFORE the beach dressing, which has the whole front to itself anyway.
   const expansionAt = specs.findIndex((sp) => sp.kind === "party-standing-table");
   const ordered = [...specs.slice(0, expansionAt), ...hedge, ...specs.slice(expansionAt)];
-  return placeFitting(ordered, halfX, halfZ, "beach");
+  return placeFitting(ordered, halfX, halfZ, "beach", seed);
 }
 
 /** Clone so applying a template never aliases the shared manifest arrays. */
@@ -600,7 +603,7 @@ export function addRoomTemplateItems(
   const t = findTemplate(id);
   if (!t) return null;
   const wanted = t.layout
-    ? t.layout(roomHalfExtents())
+    ? t.layout(roomHalfExtents(), buildObstacleList(FURNITURE))
     : cloneItems(t.items).filter((i) => i.kind !== "wall-computer");
   const written = addFurniture(wanted);
   const total = t.layout ? t.layout({ halfX: 15, halfZ: 15 }).length : wanted.length;

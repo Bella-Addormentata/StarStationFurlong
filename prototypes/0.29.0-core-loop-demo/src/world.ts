@@ -3722,9 +3722,13 @@ export class World {
     // 🧍 Tell the props whether the local player is IN the room, and where —
     // the party speaker strikes up on the fox walking in and fades with
     // distance (localPresence.ts). Change-detected inside, so this is cheap.
+    // "In the room" is the robots' predicate below (active AND the iso room
+    // view): isPlayerActive() alone is already true behind the ENTER ROOM
+    // prompt, which would mark presence before the walk-in and lose the
+    // entry transition the speaker fires on (Copilot review, PR #169).
     {
       const p = this.player.getPosition();
-      setLocalPresence(this.isPlayerActive(), p.x, p.z);
+      setLocalPresence(this.isPlayerActive() && zoomLevel <= 2, p.x, p.z);
     }
     // 💃 Dance floors run their travelling light wave (no-op while the room's
     // speaker is off — the handle reads that itself).
