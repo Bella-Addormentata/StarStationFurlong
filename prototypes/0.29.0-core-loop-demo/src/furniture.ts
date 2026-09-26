@@ -10301,6 +10301,30 @@ export function wallMountBox(
   return { x0: pos.x - hw, z0: pos.z - hd, x1: pos.x + hw, z1: pos.z + hd };
 }
 
+/** The wall-mounted piece already hanging where (kind, pos, rot) would hang
+ *  on the SAME wall — their slabs overlapping — or null. Wall mounts have no
+ *  floor box, so the placement gate's furniture rule never saw one: a rose
+ *  could be hung over the terminal, hiding the room's way back into EDIT
+ *  ROOM, and the terminal re-hung inside a rose curtain (Copilot review,
+ *  PR #169). The same wall only: at a corner the slabs of two walls' pieces
+ *  cross for 0.15 m without either covering the other. */
+export function wallMountHungOver(
+  kind: FurnitureKind,
+  pos: { x: number; z: number },
+  rot: Rot,
+  others: readonly FurnitureItem[],
+  selfId?: string,
+): FurnitureItem | null {
+  const slab = wallMountBox(kind, pos, rot);
+  if (!slab) return null;
+  for (const o of others) {
+    if (o.id === selfId || o.rot !== rot) continue;
+    const ob = wallMountBox(o.kind, o.pos, o.rot);
+    if (ob && slab.x0 < ob.x1 && slab.x1 > ob.x0 && slab.z0 < ob.z1 && slab.z1 > ob.z0) return o;
+  }
+  return null;
+}
+
 /** A wall-mounted panel's half-width along its wall (0 for other kinds) — the
  *  span the doorway/window clearance checks measure against. */
 export function wallMountHalfWidth(kind: FurnitureKind): number {

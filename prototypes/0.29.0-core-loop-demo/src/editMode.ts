@@ -59,7 +59,7 @@ import * as THREE from 'three';
 import {
   FURNITURE, FURNITURE_DEFS, footprintAabb, itemAabb, snapItemPos,
   // 🖥️ Interior wall mounts (the room terminal).
-  isWallMounted, snapInteriorWall, wallMountBox, wallMountHalfWidth,
+  isWallMounted, snapInteriorWall, wallMountBox, wallMountHalfWidth, wallMountHungOver,
   wallOfMountRot, isRoomTerminalKind, isRoomAnchoredKind, deviceFrontFor,
 } from './furniture';
 // 🛰️ Hull space (exterior mounts + stacking) — moved out of furniture.ts.
@@ -539,6 +539,15 @@ function wallMountVerdict(
       }
     }
   }
+
+  // 2b. Another wall mount on that stretch of wall. Wall mounts have no floor
+  //     box, so rule 3 below never sees them: without this a rose could be
+  //     hung over the terminal — ROSE WALLS or by hand — and hide the room's
+  //     only way back into EDIT ROOM, and the terminal could be re-hung
+  //     inside a rose curtain (Copilot review, PR #169). Decorative mounts
+  //     are held to it too; it comes before their exemption.
+  const hung = wallMountHungOver(item.kind, pos, rot, FURNITURE, item.id);
+  if (hung) return { ok: false, reason: `${hung.id} hangs there already` };
 
   // 🌹 A DECORATIVE wall mount (no device — the climbing rose) hangs above
   //    and behind whatever stands on the floor: a palm in front of it is the

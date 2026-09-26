@@ -13,8 +13,9 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { bindFloorPlan } from './floorPlanDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
-import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, type PlacementSpec } from './roomTemplates';
-import { buildObstacleList, roomDoorPoints, itemOccupancyBox, type Box, type FurnitureItem } from './furniture';
+import { bindFurnitureDoc, subscribeFurniture, readAllFurniture } from './furnitureDoc';
+import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, addRoomTemplateItems, type PlacementSpec } from './roomTemplates';
+import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, type Box, type FurnitureItem } from './furniture';
 
 const HALF = { halfX: 6, halfZ: 6 }; // the default 2×2 module
 const party = ROOM_TEMPLATES.find((t) => t.id === 'party-2')!;
@@ -197,5 +198,61 @@ describe('what + ADD counts as occupied', () => {
     // Standing furniture still counts by its floor box; decoration by nothing.
     expect(itemOccupancyBox({ id: 'c', kind: 'beach-crate', pos: { x: 0, z: 0 }, rot: 0, movable: true })).toEqual(buildObstacleList([{ id: 'c', kind: 'beach-crate', pos: { x: 0, z: 0 }, rot: 0, movable: true }])[0]);
     expect(itemOccupancyBox({ id: 'b', kind: 'birthday-balloons', pos: { x: 0, z: 0 }, rot: 0, movable: true })).toBeNull();
+  });
+});
+
+describe('+ ADD', () => {
+  it('reports skipped pieces against what THIS room holds, and a second press lands fewer', () => {
+    // An unseeded doc shows the default lobby (34 pieces) in a 2×2 room. The
+    // World mirrors the doc's records into FURNITURE once it has any
+    // (world.ts reconcileFurniture); here a bare mirror stands in for it.
+    const before = [...FURNITURE];
+    const unsubscribe = subscribeFurniture(() => {
+      const recs = readAllFurniture();
+      if (recs.size === 0) return;
+      FURNITURE.splice(0, FURNITURE.length, ...[...recs].map(([id, r]) => ({ id, kind: r.kind, pos: { x: r.x, z: r.z }, rot: r.rot, movable: r.movable })));
+    });
+    bindFurnitureDoc(new Y.Doc());
+    expect(FURNITURE.length).toBeGreaterThan(0);
+    const occupied = [...buildObstacleList(FURNITURE), ...overlayEnvelopeBoxes(FURNITURE)];
+    const first = addRoomTemplateItems('party-2')!;
+    expect(first).not.toBeNull();
+    // What landed is the set fitted around the lobby; what was skipped is
+    // measured against the set fitted to THIS room when empty — never
+    // against a 30 m room's fuller inventory.
+    expect(first.placed).toBe(layout(occupied).length);
+    expect(first.skipped).toBe(layout().length - first.placed);
+    expect(first.skipped).toBeLessThan(party.layout!({ halfX: 15, halfZ: 15 }).length - first.placed);
+    expect(FURNITURE.length).toBe(first.placed); // the doc's records now
+    const second = addRoomTemplateItems('party-2')!;
+    expect(second.placed).toBeLessThan(first.placed);
+    expect(second.skipped).toBe(layout().length - second.placed);
+    unsubscribe();
+    FURNITURE.splice(0, FURNITURE.length, ...before);
+  });
+});
+
+describe('one wall mount over another', () => {
+  const item = (id: string, kind: FurnitureItem['kind'], x: number, z: number, rot: 0 | 1 | 2 | 3): FurnitureItem =>
+    ({ id, kind, pos: { x, z }, rot, movable: true });
+  const terminal = item('term', 'wall-computer', 1, -5.97, 0); // north wall
+
+  it('finds the terminal under a rose hung on the same stretch of wall, and nothing a metre along', () => {
+    expect(wallMountHungOver('climbing-rose', { x: 1.2, z: -5.97 }, 0, [terminal])?.id).toBe('term');
+    expect(wallMountHungOver('climbing-rose', { x: 3, z: -5.97 }, 0, [terminal])).toBeNull();
+    // …and the terminal cannot be re-hung inside a rose either.
+    const rose = item('rose', 'climbing-rose', 1, -5.97, 0);
+    expect(wallMountHungOver('wall-computer', { x: 1.3, z: -5.97 }, 0, [rose])?.id).toBe('rose');
+    // Itself is not in its own way.
+    expect(wallMountHungOver('wall-computer', { x: 1.3, z: -5.97 }, 0, [terminal], 'term')).toBeNull();
+  });
+
+  it('lets the two walls\' corner pieces meet, and shoulder-to-shoulder roses touch', () => {
+    const northCorner = item('n', 'climbing-rose', -5.5, -5.97, 0);
+    expect(wallMountHungOver('climbing-rose', { x: -5.97, z: -5.5 }, 1, [northCorner])).toBeNull();
+    // ROSE WALLS hangs one per metre: slabs touching, not overlapping.
+    expect(wallMountHungOver('climbing-rose', { x: -4.5, z: -5.97 }, 0, [northCorner])).toBeNull();
+    // Floor furniture is not a wall mount: no slab, no verdict here.
+    expect(wallMountHungOver('beach-crate', { x: 1, z: -5.5 }, 0, [terminal])).toBeNull();
   });
 });

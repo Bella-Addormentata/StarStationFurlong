@@ -764,7 +764,11 @@ export function addRoomTemplateItems(
   // ground the caller asked to keep clear.
   const wanted = t.layout(roomHalfExtents(), [...buildObstacleList(FURNITURE), ...overlayEnvelopeBoxes(FURNITURE), ...keepClear]);
   const written = addFurniture(wanted);
-  const total = t.layout({ halfX: 15, halfZ: 15 }).length;
+  // "Skipped" against what THIS room holds when empty — the set fitted to
+  // these extents with nothing in the way — not against a 30 m room's longer
+  // hedge and fuller inventory, which reported pieces skipped in a default
+  // room where every generated piece had landed (Copilot review, PR #169).
+  const total = t.layout(roomHalfExtents()).length;
   return { name: t.name, placed: written.length, skipped: Math.max(0, total - written.length) };
 }
 
