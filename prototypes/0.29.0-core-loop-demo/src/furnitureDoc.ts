@@ -271,8 +271,8 @@ const LEGACY_CORNER_TREE_POSE = { x: -5.3, z: -5.3, rot: 0 };
  */
 export function relocateLegacyDefaultVat(): void {
   if (!docAlive()) return;
-  const vat = DEFAULT_LAYOUT.find((item) => item.id === 'clone-vat');
-  const tree = DEFAULT_LAYOUT.find((item) => item.id === 'cherry-tree-back-left');
+  const vat = DEFAULT_LOBBY_FURNITURE.find((item) => item.id === 'clone-vat');
+  const tree = DEFAULT_LOBBY_FURNITURE.find((item) => item.id === 'cherry-tree-back-left');
   if (!vat || !tree) return;
   const isAt = (id: string, pose: { x: number; z: number; rot: number }) => {
     const rec = furnitureMap!.get(id);
