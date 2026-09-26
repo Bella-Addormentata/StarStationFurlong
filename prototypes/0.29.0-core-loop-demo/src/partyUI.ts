@@ -246,26 +246,31 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
     // 💌 The tag. Closed: a blank tag invites a wish; a written one is
     // sealed until the box is opened (its writer / the host may still edit).
     // Opened: the wish is read out in full.
+    // The editor, for whoever may write — shown wrapped OR opened, since
+    // writeGiftWish allows the writer / the host to change a tag after the
+    // box is open and a guest cannot re-wrap to get at it (Copilot review,
+    // PR #169).
+    const editor = mayWrite
+      ? `<div style="display:flex; gap:6px; margin-top:6px;">
+           <input data-wish="1" data-draft="wish" type="text" maxlength="${MAX_WISH}" aria-label="Wish on the gift tag" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
+             flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
+             border-radius:4px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:11px; padding:5px 7px;">
+           <button data-wish-save="1" style="background:rgba(212,168,75,0.12); border:1px solid rgba(212,168,75,0.4); border-radius:6px; color:${GOLD}; font-family:inherit; font-size:10px; font-weight:800; padding:0 9px; cursor:pointer;">${gift.wish ? 'SAVE' : 'WRITE'}</button>
+         </div>`
+      : '';
     const tag = gift.opened
-      ? gift.wish
+      ? (gift.wish
         ? `<div style="margin-top:8px; padding:8px 10px; border:1px solid rgba(212,168,75,0.35); border-radius:7px; background:rgba(212,168,75,0.08);">
              <div style="font-size:12px; color:${GOLD_BRIGHT}; line-height:1.5;">💌 “${esc(gift.wish)}”</div>
              <div style="font-size:10px; color:${DIM}; margin-top:3px;">— ${esc(gift.wishByName || 'a friend')}</div>
            </div>`
-        : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">No wish on the tag.</div>`
+        : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">No wish on the tag.</div>`) + editor
       : `${gift.wish && !mayWrite
           ? `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 ${esc(gift.wishByName || 'Someone')} left a wish — open it to read.</div>`
           : gift.wish
             ? `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 Your wish is on the tag${owner && gift.wishBy !== me ? ` (by ${esc(gift.wishByName || 'a guest')})` : ''}.</div>`
             : `<div style="font-size:10px; color:${DIM}; line-height:1.4; margin-top:6px;">💌 Leave a wish on the tag — it is read when the box is opened.</div>`}
-         ${mayWrite
-           ? `<div style="display:flex; gap:6px; margin-top:6px;">
-                <input data-wish="1" data-draft="wish" type="text" maxlength="${MAX_WISH}" aria-label="Wish on the gift tag" placeholder="Happy birthday…" value="${escAttr(gift.wish)}" style="
-                  flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
-                  border-radius:4px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:11px; padding:5px 7px;">
-                <button data-wish-save="1" style="background:rgba(212,168,75,0.12); border:1px solid rgba(212,168,75,0.4); border-radius:6px; color:${GOLD}; font-family:inherit; font-size:10px; font-weight:800; padding:0 9px; cursor:pointer;">${gift.wish ? 'SAVE' : 'WRITE'}</button>
-              </div>`
-           : ''}`;
+         ${editor}`;
     panel.innerHTML = `
       ${title('🎁 A PRESENT', gift.opened ? 'opened' : 'still wrapped')}
       ${

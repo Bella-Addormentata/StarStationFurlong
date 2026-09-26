@@ -32,6 +32,7 @@ import {
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
+import { PLAYER_R } from "./player";
 
 /** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
  *  room's theme into its own roomInfo doc, so "this module is a casino now"
@@ -644,7 +645,7 @@ export function findTemplate(id: string): RoomTemplate | null {
  * reused that frozen 12×12 result in any room (Copilot review, PR #169).
  * The fitted set's own terminal rides along at the real south wall.
  */
-function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
+export function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
   if (!t.layout) return cloneItems(t.items);
   const half = roomHalfExtents();
   // The terminal hangs on the south wall at the first half-metre station,
@@ -654,24 +655,50 @@ function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
   // (Copilot review, PR #169).
   const doorHalf = 1.3;
   const panelHalf = wallMountHalfWidth("wall-computer");
-  const doors = roomDoorPoints().filter((d) => Math.abs(d.z - half.halfZ) < 0.6);
-  const clear = (x: number) => doors.every((d) => Math.abs(d.x - x) >= doorHalf + panelHalf);
-  const stations: number[] = [];
-  const base = Math.min(1.8, Math.max(0, half.halfX - 1.0));
-  for (let k = 0; k * 0.5 <= half.halfX; k++) {
-    for (const x of [base + k * 0.5, base - k * 0.5]) {
-      if (Math.abs(x) <= half.halfX - 1.0 - panelHalf) stations.push(x);
+  // The set first; the terminal's station is then chosen with the set's
+  // blocked area in hand, so its stand-point (1 m in front of the panel) is
+  // never in the sea — in a doorless room the sea reaches the south wall's
+  // middle, where the terminal used to go (Copilot review, PR #169). The
+  // south wall is tried first (where it has always hung), then the others:
+  // a doorless 2×2 room's south wall can be sea and loungers end to end.
+  const items = t.layout(half);
+  const blocked = buildObstacleList(items);
+  const REACH = PLAYER_R + 0.06; // the FINE-arrival clearance validatePlacement demands
+  const doors = roomDoorPoints();
+  const dry = (fx: number, fz: number) =>
+    !blocked.some((b) => fx > b.x0 - REACH && fx < b.x1 + REACH && fz > b.z0 - REACH && fz < b.z1 + REACH);
+  type Wall = { rot: Rot; along: number; pose: (a: number) => { x: number; z: number }; front: (a: number) => { x: number; z: number }; door: (d: { x: number; z: number }) => number | null };
+  const walls: Wall[] = [
+    { rot: 2, along: half.halfX, pose: (a) => ({ x: a, z: half.halfZ - 0.03 }), front: (a) => ({ x: a, z: half.halfZ - 1.0 }), door: (d) => (Math.abs(d.z - half.halfZ) < 0.6 ? d.x : null) },
+    { rot: 3, along: half.halfZ, pose: (a) => ({ x: half.halfX - 0.03, z: a }), front: (a) => ({ x: half.halfX - 1.0, z: a }), door: (d) => (Math.abs(d.x - half.halfX) < 0.6 ? d.z : null) },
+    { rot: 1, along: half.halfZ, pose: (a) => ({ x: -half.halfX + 0.03, z: a }), front: (a) => ({ x: -half.halfX + 1.0, z: a }), door: (d) => (Math.abs(d.x + half.halfX) < 0.6 ? d.z : null) },
+    { rot: 0, along: half.halfX, pose: (a) => ({ x: a, z: -half.halfZ + 0.03 }), front: (a) => ({ x: a, z: -half.halfZ + 1.0 }), door: (d) => (Math.abs(d.z + half.halfZ) < 0.6 ? d.x : null) },
+  ];
+  let chosen: { pos: { x: number; z: number }; rot: Rot } | null = null;
+  for (const w of walls) {
+    const laterals = doors.map(w.door).filter((v): v is number => v !== null);
+    const base = w.rot === 2 ? Math.min(1.8, Math.max(0, w.along - 1.0)) : 0;
+    const stations: number[] = [];
+    for (let k = 0; k * 0.5 <= w.along; k++) {
+      for (const a of [base + k * 0.5, base - k * 0.5]) {
+        if (Math.abs(a) <= w.along - 1.0 - panelHalf) stations.push(a);
+      }
+    }
+    const a = stations.find((s) => laterals.every((l) => Math.abs(l - s) >= doorHalf + panelHalf) && dry(w.front(s).x, w.front(s).z));
+    if (a !== undefined) {
+      const p = w.pose(a);
+      chosen = { pos: { x: +p.x.toFixed(2), z: +p.z.toFixed(2) }, rot: w.rot };
+      break;
     }
   }
-  const x = stations.find(clear) ?? base;
   const terminal: FurnitureItem = {
     id: `${t.id}-computer`,
     kind: "wall-computer",
-    pos: { x: +x.toFixed(2), z: half.halfZ - 0.03 },
-    rot: 2,
+    pos: chosen?.pos ?? { x: Math.min(1.8, Math.max(0, half.halfX - 1.0)), z: half.halfZ - 0.03 },
+    rot: chosen?.rot ?? 2,
     movable: true,
   };
-  return [terminal, ...t.layout(half)];
+  return [terminal, ...items];
 }
 
 export function applyRoomTemplate(id: string): RoomTemplate | null {

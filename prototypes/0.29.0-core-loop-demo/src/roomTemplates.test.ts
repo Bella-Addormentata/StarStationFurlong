@@ -13,7 +13,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { bindFloorPlan } from './floorPlanDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
-import { ROOM_TEMPLATES, placeFitting, type PlacementSpec } from './roomTemplates';
+import { ROOM_TEMPLATES, placeFitting, templateItemsFor, type PlacementSpec } from './roomTemplates';
 import { buildObstacleList, roomDoorPoints, type Box, type FurnitureItem } from './furniture';
 
 const HALF = { halfX: 6, halfZ: 6 }; // the default 2×2 module
@@ -131,5 +131,25 @@ describe('keep-clear ground (+ ADD)', () => {
     ];
     const fitted = layout(keep);
     for (const b of boxesOf(fitted)) for (const k of keep) expect(overlaps(b, k)).toBe(false);
+  });
+});
+
+describe('the fitted set\'s terminal', () => {
+  it('stands where its front is dry, even in a doorless room where the sea reaches the middle of the south wall', () => {
+    bindDoorLayoutDoc(new Y.Doc());
+    seedDoorLayoutEmpty();
+    const items = templateItemsFor(party);
+    const terminal = items.find((i) => i.kind === 'wall-computer')!;
+    expect(terminal).toBeDefined();
+    // On some wall's mount plane, its front 1 m into the room from there.
+    const onWall = Math.abs(Math.abs(terminal.pos.x) - 5.97) < 0.01 || Math.abs(Math.abs(terminal.pos.z) - 5.97) < 0.01;
+    expect(onWall).toBe(true);
+    const front = { x: terminal.pos.x, z: terminal.pos.z };
+    if (terminal.rot === 2) front.z -= 1.0; else if (terminal.rot === 0) front.z += 1.0; else if (terminal.rot === 3) front.x -= 1.0; else front.x += 1.0;
+    const reach = 0.44;
+    for (const b of buildObstacleList(items.filter((i) => i.kind !== 'wall-computer'))) {
+      const inside = front.x > b.x0 - reach && front.x < b.x1 + reach && front.z > b.z0 - reach && front.z < b.z1 + reach;
+      expect(inside).toBe(false);
+    }
   });
 });
