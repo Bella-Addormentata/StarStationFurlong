@@ -2716,12 +2716,6 @@ export class World {
   }
 
   /**
-   * 🏝️ Canvas stone-tile floor texture for the outdoor casino pool room.
-   * Large square tiles in warm beige/sandstone, with grout lines and subtle
-   * surface variation to distinguish from the lobby's herringbone wood.
-   * Created lazily on first outdoor entry and cached for the session.
-   */
-  /**
    * 🏖️ Beach sand: a warm yellow ground with thousands of grains in four
    * tones — the noisy Habbo sand tile, not a smooth colour. Deterministic
    * PRNG so every client draws the same grain.
@@ -2764,6 +2758,12 @@ export class World {
     return tex;
   }
 
+  /**
+   * 🏝️ Canvas stone-tile floor texture for the outdoor casino pool room.
+   * Large square tiles in warm beige/sandstone, with grout lines and subtle
+   * surface variation to distinguish from the lobby's herringbone wood.
+   * Created lazily on first outdoor entry and cached for the session.
+   */
   private makeOutdoorFloorTex(): THREE.Texture {
     const W = 512,
       H = 512;

@@ -1450,7 +1450,7 @@ export class Player {
       pos.x = r2.x;
       pos.z = r2.z;
 
-      // 🧱 Wedged on a device approach (owner report 2025-09-25): the A*
+      // 🧱 Wedged on a device approach (owner report 2026-09-25): the A*
       // grid bakes raw boxes but the body collides against boxes inflated by
       // PLAYER_R, so a cell can be grid-walkable while its centre is
       // physically out of reach — the palm beside the party speaker pinned

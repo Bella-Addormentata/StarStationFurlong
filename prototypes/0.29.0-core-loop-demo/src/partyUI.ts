@@ -207,7 +207,7 @@ export function createCakeTableUI(deps: PartyDeviceDeps): DeviceUI {
     `;
 
     panel.querySelector<HTMLButtonElement>('[data-blow]')?.addEventListener('click', () => {
-      const result = blowCandles(deps.itemId, me, honoureeName);
+      const result = blowCandles(deps.itemId, honoureeName); // who: the registered identity
       // A refused blow still has to say why — the same sentence a guest sees.
       if (!result.ok) showPanelNote(panel, result.error);
     });

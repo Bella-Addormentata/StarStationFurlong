@@ -36,10 +36,14 @@ const GUEST = 'BBBBguestpub';
 const CAKE = 'cake-1';
 
 let doc: Y.Doc;
+/** Who the module believes is acting — the registered identity, never an
+ *  argument (a caller naming the honouree's key must not pass the gate). */
+const iAm = (pub: string, name = '') => setPartyIdentity(() => ({ pub, name }));
 
 beforeEach(() => {
   doc = new Y.Doc();
   bindPartyDoc(doc);
+  iAm('', '');
 });
 
 describe('the birthday role', () => {
@@ -68,7 +72,8 @@ describe('the cake — two phases', () => {
 
   it('refuses a guest, naming whose candles they are', () => {
     setBirthdayPub(HONOUREE);
-    const result = blowCandles(CAKE, GUEST, 'Mia');
+    iAm(GUEST);
+    const result = blowCandles(CAKE, 'Mia');
     expect(result).toEqual({ ok: false, error: 'Waiting for Mia to blow out the candles!' });
     // …and the refusal changed nothing.
     expect(readCake(CAKE).lit).toBe(true);
@@ -76,25 +81,40 @@ describe('the cake — two phases', () => {
 
   it('still answers a guest when the honouree has no known name', () => {
     setBirthdayPub(HONOUREE);
-    const result = blowCandles(CAKE, GUEST, '   ');
+    iAm(GUEST);
+    const result = blowCandles(CAKE, '   ');
     expect(result.ok).toBe(false);
     expect(result.ok === false && result.error).toContain('the guest of honour');
   });
 
   it('refuses everyone while no honouree is named', () => {
-    expect(blowCandles(CAKE, GUEST, '').ok).toBe(false);
+    iAm(GUEST);
+    expect(blowCandles(CAKE, '').ok).toBe(false);
     // Including the room owner — an unnamed role is not "anyone", it is nobody.
-    expect(blowCandles(CAKE, HONOUREE, '').ok).toBe(false);
+    iAm(HONOUREE);
+    expect(blowCandles(CAKE, '').ok).toBe(false);
     expect(readCake(CAKE).lit).toBe(true);
+  });
+
+  it('cannot be defeated by a caller naming the honouree: the gate reads the registered identity', () => {
+    setBirthdayPub(HONOUREE);
+    iAm(GUEST, 'Guest');
+    // There is no argument to pass the honouree's key through any more;
+    // the only way in is to BE the registered identity.
+    expect(blowCandles(CAKE, 'Mia').ok).toBe(false);
+    expect(readCake(CAKE).lit).toBe(true);
+    iAm(HONOUREE, 'Mia');
+    expect(blowCandles(CAKE, 'Mia')).toEqual({ ok: true });
   });
 
   it('lets the honouree blow them out, once', () => {
     setBirthdayPub(HONOUREE);
-    expect(blowCandles(CAKE, HONOUREE, 'Mia')).toEqual({ ok: true });
+    iAm(HONOUREE);
+    expect(blowCandles(CAKE, 'Mia')).toEqual({ ok: true });
     expect(readCake(CAKE).lit).toBe(false);
     // The candle COUNT survives the blow — it is the cake's size, not its phase.
     expect(readCake(CAKE).candles).toBe(DEFAULT_CANDLES);
-    expect(blowCandles(CAKE, HONOUREE, 'Mia')).toEqual({
+    expect(blowCandles(CAKE, 'Mia')).toEqual({
       ok: false,
       error: 'The candles are already out.',
     });
@@ -102,13 +122,15 @@ describe('the cake — two phases', () => {
 
   it('keeps each cake instance separate', () => {
     setBirthdayPub(HONOUREE);
-    blowCandles(CAKE, HONOUREE, 'Mia');
+    iAm(HONOUREE);
+    blowCandles(CAKE, 'Mia');
     expect(readCake('cake-2').lit).toBe(true);
   });
 
   it('re-lights for the next party, clamping a silly candle count', () => {
     setBirthdayPub(HONOUREE);
-    blowCandles(CAKE, HONOUREE, 'Mia');
+    iAm(HONOUREE);
+    blowCandles(CAKE, 'Mia');
     relightCandles(CAKE, 7);
     expect(readCake(CAKE)).toEqual({ lit: true, candles: 7 });
     relightCandles(CAKE, 9999);
@@ -192,7 +214,8 @@ describe('subscriptions', () => {
     toggleSpeaker('s1');
     expect(cakeHits).toBe(baseline); // a speaker write is not a cake write
     setBirthdayPub(HONOUREE);
-    blowCandles(CAKE, HONOUREE, 'Mia');
+    iAm(HONOUREE);
+    blowCandles(CAKE, 'Mia');
     expect(cakeHits).toBeGreaterThan(baseline);
   });
 
@@ -212,7 +235,8 @@ describe('subscriptions', () => {
 describe('rebinding (the T0 seam)', () => {
   it('reads the NEW room after a rebind, not the old one', () => {
     setBirthdayPub(HONOUREE);
-    blowCandles(CAKE, HONOUREE, 'Mia');
+    iAm(HONOUREE);
+    blowCandles(CAKE, 'Mia');
     expect(readCake(CAKE).lit).toBe(false);
 
     bindPartyDoc(new Y.Doc()); // walked into a different room

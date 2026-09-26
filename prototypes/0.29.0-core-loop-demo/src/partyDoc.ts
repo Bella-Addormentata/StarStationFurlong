@@ -190,13 +190,13 @@ export type PartyAction = { ok: true } | { ok: false; error: string };
  * else gets a sentence naming whose job it is, because a click that does
  * nothing reads as broken while a click that answers reads as a rule.
  *
- * `honoureeName` is only for that refusal line — the gate itself is the key.
+ * WHO is blowing comes from the registered identity (setPartyIdentity), never
+ * from the caller — a caller that could name the honouree's key would defeat
+ * the gate through the public API (Copilot review, PR #169). `honoureeName`
+ * is only for the refusal line.
  */
-export function blowCandles(
-  itemId: string,
-  myPub: string,
-  honoureeName: string,
-): PartyAction {
+export function blowCandles(itemId: string, honoureeName: string): PartyAction {
+  const myPub = identityProvider().pub;
   const birthday = readBirthdayPub();
   if (birthday === '') {
     return { ok: false, error: 'No guest of honour yet — the host names one from CONTACTS.' };
