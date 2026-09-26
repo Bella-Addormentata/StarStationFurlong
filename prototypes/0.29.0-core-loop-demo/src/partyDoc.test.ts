@@ -18,6 +18,7 @@ import {
   openGift,
   writeGiftWish,
   setPartyHostPredicate,
+  setPartyIdentity,
   readBirthdayPub,
   readCake,
   readGift,
@@ -221,8 +222,11 @@ describe('rebinding (the T0 seam)', () => {
 });
 
 describe('💌 the wish on the tag', () => {
+  // The writer is whoever the registered identity says — never a caller's claim.
+  const as = (pub: string, name: string) => setPartyIdentity(() => ({ pub, name }));
   it('takes anyone\'s wish on a blank tag, and survives opening and re-wrapping', () => {
-    expect(writeGiftWish('w1', '  Happy birthday,   Dorkmo!  ', 'pub-a', 'Ana')).toEqual({ ok: true });
+    as('pub-a', 'Ana');
+    expect(writeGiftWish('w1', '  Happy birthday,   Dorkmo!  ')).toEqual({ ok: true });
     expect(readGift('w1')).toMatchObject({ wish: 'Happy birthday, Dorkmo!', wishBy: 'pub-a', wishByName: 'Ana', opened: false });
     openGift('w1', 'Bo');
     expect(readGift('w1')).toMatchObject({ opened: true, byName: 'Bo', wish: 'Happy birthday, Dorkmo!' });
@@ -232,23 +236,27 @@ describe('💌 the wish on the tag', () => {
 
   it('lets only the writer or the owner change a written tag', () => {
     setPartyHostPredicate(() => false); // a guest's client
-    writeGiftWish('w2', 'From Ana', 'pub-a', 'Ana');
-    expect(writeGiftWish('w2', 'From Bo', 'pub-b', 'Bo')).toEqual({ ok: false, error: 'Ana already wrote on this one.' });
+    as('pub-a', 'Ana'); writeGiftWish('w2', 'From Ana');
+    as('pub-b', 'Bo');
+    expect(writeGiftWish('w2', 'From Bo')).toEqual({ ok: false, error: 'Ana already wrote on this one.' });
     expect(readGift('w2').wish).toBe('From Ana');
-    expect(writeGiftWish('w2', 'From Ana, with love', 'pub-a', 'Ana')).toEqual({ ok: true });
+    as('pub-a', 'Ana');
+    expect(writeGiftWish('w2', 'From Ana, with love')).toEqual({ ok: true });
     // Host authority is the registered room-owner check, not a caller's word.
     setPartyHostPredicate(() => true);
-    expect(writeGiftWish('w2', 'Tidied by the host', 'pub-host', 'Host')).toEqual({ ok: true });
+    as('pub-host', 'Host');
+    expect(writeGiftWish('w2', 'Tidied by the host')).toEqual({ ok: true });
     expect(readGift('w2')).toMatchObject({ wish: 'Tidied by the host', wishByName: 'Host' });
     // The host can also take it off; a blank on a blank tag is refused.
-    expect(writeGiftWish('w2', '', 'pub-host', 'Host')).toEqual({ ok: true });
+    expect(writeGiftWish('w2', '')).toEqual({ ok: true });
     expect(readGift('w2').wish).toBe('');
     setPartyHostPredicate(() => false);
-    expect(writeGiftWish('w2', '   ', 'pub-a', 'Ana').ok).toBe(false);
+    as('pub-a', 'Ana');
+    expect(writeGiftWish('w2', '   ').ok).toBe(false);
   });
 
   it('caps the wish at 120 characters and shape-checks a hostile record', () => {
-    writeGiftWish('w3', 'x'.repeat(500), 'pub-a', 'Ana');
+    as('pub-a', 'Ana'); writeGiftWish('w3', 'x'.repeat(500));
     expect(readGift('w3').wish).toHaveLength(120);
     doc.getMap('party').set('gift:w4', { opened: 'yes', wish: 42, wishBy: null });
     expect(readGift('w4')).toEqual({ opened: false, byName: '', wish: '', wishBy: '', wishByName: '' });

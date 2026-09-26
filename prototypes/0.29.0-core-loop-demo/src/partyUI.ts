@@ -288,7 +288,7 @@ export function createGiftBoxUI(deps: PartyDeviceDeps): DeviceUI {
     const input = panel.querySelector<HTMLInputElement>('[data-wish]');
     const save = () => {
       if (!input) return;
-      const result = writeGiftWish(deps.itemId, input.value, me, deps.myName());
+      const result = writeGiftWish(deps.itemId, input.value);
       if (!result.ok) showPanelNote(panel, result.error);
     };
     panel.querySelector<HTMLButtonElement>('[data-wish-save]')?.addEventListener('click', save);

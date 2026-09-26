@@ -103,7 +103,7 @@ import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
-import { bindPartyDoc, setPartyHostPredicate } from "./partyDoc";
+import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -8442,6 +8442,7 @@ async function init() {
   // 🔒 The party's host-gated writes (a guest's wish may be tidied by the
   // host) ask the same owner seam edit mode does.
   setPartyHostPredicate(() => canEditRoom().ok);
+  setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   setRoomEditPermission(() => {
     if (!yjsSync) return { ok: true }; // offline: your room
     // 🔒 #141: an absent owner is NOT the legacy marker and grants nothing.

@@ -1183,6 +1183,7 @@ export class PoolWaiter {
       this.coachMove = 0;
       this.coachStage = null;
       this.danceSpot = null;
+      this.danceSpotKey = ""; // with the spot — or coming back to 'dance' waits forever on a stale key
       this.danceStepIdx = 0;
       this.danceStepBeat = 0;
       this.danceCheerSaid = false;

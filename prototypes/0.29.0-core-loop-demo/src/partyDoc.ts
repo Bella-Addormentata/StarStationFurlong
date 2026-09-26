@@ -270,6 +270,13 @@ let hostPredicate: () => boolean = () => false;
 export function setPartyHostPredicate(predicate: () => boolean): void {
   hostPredicate = predicate;
 }
+/** 🔒 WHO is writing, for the writes that record an author: the local
+ *  identity, registered by main.ts — a caller may not name someone else
+ *  (Copilot review, PR #169). Default: an anonymous clone. */
+let identityProvider: () => { pub: string; name: string } = () => ({ pub: '', name: '' });
+export function setPartyIdentity(provider: () => { pub: string; name: string }): void {
+  identityProvider = provider;
+}
 
 /**
  * 💌 Write the wish on a gift's tag. A box with no wish takes anyone's; a
@@ -280,12 +287,8 @@ export function setPartyHostPredicate(predicate: () => boolean): void {
  * not only in the panel, so an edited client cannot scribble over the
  * others' tags.
  */
-export function writeGiftWish(
-  itemId: string,
-  text: string,
-  myPub: string,
-  myName: string,
-): PartyAction {
+export function writeGiftWish(itemId: string, text: string): PartyAction {
+  const { pub: myPub, name: myName } = identityProvider();
   const cur = readGiftWish(itemId);
   const wish = text.replace(/\s+/g, ' ').trim().slice(0, MAX_WISH);
   if (cur.wish && cur.wishBy !== myPub && !hostPredicate()) {
