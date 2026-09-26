@@ -250,6 +250,10 @@ export function updateCameraRig(deltaTime: number): void {
     // the home detent instead; the tween below still carries the camera there
     // smoothly, and the readout follows.
     stepIndex = 0;
+    // A long drift leaves whole turns on currentYaw; fold them away first so
+    // the tween takes the short way to the same 0°, not every turn back
+    // (Copilot review, PR #169).
+    currentYaw = ((currentYaw + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
     targetYaw = 0;
     refreshAngleChip();
   }

@@ -246,6 +246,19 @@ export function validatePlacement(
       ? generated({ ...item, pos, rot }, FURNITURE.filter((o) => o.id !== item.id).concat([{ ...item, pos, rot }]))
       : [];
   const blocking: Box[] = box ? [box] : featureBoxes;
+  // A room-sized feature's generated area must stay INSIDE the room: the
+  // river's strips and floor cut follow its pose, and a pose dragged toward
+  // a wall pushes them past the floor's edge (where the hole is no hole to
+  // the triangulator and the strips block nothing real) — Copilot review,
+  // PR #169. The sea and the pool touch the walls by construction (their
+  // boxes carry a 1 cm seam), hence the tolerance.
+  if (featureBoxes.length) {
+    const { halfX: hx, halfZ: hz } = roomHalfExtents();
+    const TOL = 0.05;
+    if (featureBoxes.some((b) => b.x0 < -hx - TOL || b.x1 > hx + TOL || b.z0 < -hz - TOL || b.z1 > hz + TOL)) {
+      return { ok: false, reason: 'it would run out of the room' };
+    }
+  }
   // …and an EXISTING feature's blocked area is generated the same way:
   // itemAabb is null for the sea / river / infinity pool, so their water was
   // invisible to the overlap and connectivity checks below.
