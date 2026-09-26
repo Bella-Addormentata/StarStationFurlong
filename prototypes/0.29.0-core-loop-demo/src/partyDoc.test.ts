@@ -279,6 +279,29 @@ describe('💌 the wish on the tag', () => {
     expect(writeGiftWish('w2', '   ').ok).toBe(false);
   });
 
+  it('still reads a wish written before the tag had its own record, and never loses it', () => {
+    // The pre-split shape: the wish inside the box's record (owner's room, 2026-09-26).
+    doc.getMap('party').set('gift:old', { opened: false, byName: '', wish: 'More years. More stories. More magic.', wishBy: 'pub-owner', wishByName: 'Alluxia' });
+    expect(readGift('old')).toMatchObject({ opened: false, wish: 'More years. More stories. More magic.', wishBy: 'pub-owner', wishByName: 'Alluxia' });
+    // Opening the box replaces its record — the wish is carried to the tag first.
+    as('pub-b', 'Ben');
+    expect(openGift('old', 'Ben')).toEqual({ ok: true });
+    expect(readGift('old')).toMatchObject({ opened: true, byName: 'Ben', wish: 'More years. More stories. More magic.', wishByName: 'Alluxia' });
+    expect(doc.getMap('party').get('giftwish:old')).toMatchObject({ wish: 'More years. More stories. More magic.' });
+    // …and rewrapping keeps it too.
+    closeGift('old');
+    expect(readGift('old')).toMatchObject({ opened: false, wish: 'More years. More stories. More magic.' });
+    // A legacy wish is still ITS WRITER's: another guest may not overwrite it, the writer may.
+    expect(writeGiftWish('old', 'mine now').ok).toBe(false);
+    as('pub-owner', 'Alluxia');
+    expect(writeGiftWish('old', 'Rewritten.')).toEqual({ ok: true });
+    expect(readGift('old').wish).toBe('Rewritten.');
+    // A tag with its own wish beats the box's legacy one.
+    doc.getMap('party').set('gift:both', { opened: false, byName: '', wish: 'the old one', wishBy: 'pub-owner', wishByName: 'Alluxia' });
+    doc.getMap('party').set('giftwish:both', { wish: 'the new one', wishBy: 'pub-owner', wishByName: 'Alluxia' });
+    expect(readGift('both').wish).toBe('the new one');
+  });
+
   it('caps the wish at 120 characters and shape-checks a hostile record', () => {
     as('pub-a', 'Ana'); writeGiftWish('w3', 'x'.repeat(500));
     expect(readGift('w3').wish).toHaveLength(120);

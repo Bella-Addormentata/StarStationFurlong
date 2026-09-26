@@ -241,8 +241,31 @@ function readGiftBox(itemId: string): GiftBox {
 }
 function readGiftWish(itemId: string): GiftWish {
   const raw = ensureMap().get(giftWishKey(itemId)) as Partial<GiftWish> | undefined;
+  if (raw && typeof raw === 'object' && str(raw.wish, MAX_WISH)) {
+    return { wish: str(raw.wish, MAX_WISH), wishBy: str(raw.wishBy, 128), wishByName: str(raw.wishByName, 32) };
+  }
+  // 🏷️ LEGACY: before the tag became its own record (1e7db7a) the wish lived
+  // in the box's record. Tags written then are still there and still read —
+  // the owner's eight wishes went dark when the split shipped (owner report
+  // 2026-09-26). A tag record with a wish wins; an emptied one falls back.
+  return legacyGiftWish(itemId);
+}
+
+/** The wish fields a pre-split box record may still carry. */
+function legacyGiftWish(itemId: string): GiftWish {
+  const raw = ensureMap().get(giftKey(itemId)) as Partial<GiftWish> | undefined;
   if (!raw || typeof raw !== 'object') return { wish: '', wishBy: '', wishByName: '' };
   return { wish: str(raw.wish, MAX_WISH), wishBy: str(raw.wishBy, 128), wishByName: str(raw.wishByName, 32) };
+}
+
+/** Before the box's record is REPLACED (open, rewrap), carry a legacy wish
+ *  it still holds over to the tag's own record — or the replace would be
+ *  the write that finally loses it. */
+function preserveLegacyWish(itemId: string): void {
+  const tag = ensureMap().get(giftWishKey(itemId)) as Partial<GiftWish> | undefined;
+  if (tag && typeof tag === 'object' && str(tag.wish, MAX_WISH)) return; // the tag already has its own
+  const legacy = legacyGiftWish(itemId);
+  if (legacy.wish) write(giftWishKey(itemId), legacy satisfies GiftWish);
 }
 export function readGift(itemId: string): GiftState {
   return { ...readGiftBox(itemId), ...readGiftWish(itemId) };
@@ -252,6 +275,7 @@ export function readGift(itemId: string): GiftState {
  *  The wish on the tag survives the opening: that is when it gets read. */
 export function openGift(itemId: string, myName: string): PartyAction {
   if (readGiftBox(itemId).opened) return { ok: false, error: 'Already opened.' };
+  preserveLegacyWish(itemId);
   write(giftKey(itemId), { opened: true, byName: (myName || 'A clone').slice(0, 32) } satisfies GiftBox);
   return { ok: true };
 }
@@ -259,6 +283,7 @@ export function openGift(itemId: string, myName: string): PartyAction {
 /** Wrap it again (owner): closed, nobody's — the wish stays on the tag
  *  (its own key, untouched here). */
 export function closeGift(itemId: string): void {
+  preserveLegacyWish(itemId);
   write(giftKey(itemId), { opened: false, byName: '' } satisfies GiftBox);
 }
 
