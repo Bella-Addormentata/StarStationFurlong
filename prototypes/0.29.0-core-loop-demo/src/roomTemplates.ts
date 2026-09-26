@@ -93,8 +93,9 @@ interface PlacementSpec {
    *  one. Anchor the cluster with `at`, lay it out with `off`. */
   off?: [number, number];
   rot?: Rot;
-  /** Spans the room on purpose (the river, the bridge over it) — skip the
-   *  bounds check AND the occupancy check: crossing what is there is the point. */
+  /** Spans the room on purpose (the sea, a bridge) — skip the bounds check;
+   *  crossing the room is the point. It still yields to furniture already
+   *  standing where it would go. */
   spanning?: boolean;
   /** Rigid group: if any member fails to place, the whole group is dropped.
    *  A pergola roof with two of its four posts is not a pergola. */
@@ -176,6 +177,11 @@ function placeFitting(
       };
       const boxes = buildObstacleList([item]);
       if (spec.spanning) {
+        // Spanning skips the BOUNDS check (crossing the room is the point),
+        // not the collision one: the sea must not be laid through furniture
+        // already standing in its corner (Copilot review, PR #169). Its own
+        // set's later pieces then keep clear of it as before.
+        if (boxes.some((b) => occupied.some((o) => boxesOverlap(b, o)))) continue;
         occupied.push(...boxes);
         if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), ...boxes]);
         placed = item;

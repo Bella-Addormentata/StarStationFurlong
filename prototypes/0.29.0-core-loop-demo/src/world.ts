@@ -2652,9 +2652,12 @@ export class World {
     // present — its deck slabs provide the visible flooring instead. The
     // infinity pool has no deck, so it must not trigger this (Copilot review,
     // PR #169); without the octagon hull it simply sits in the floor.
-    const hasPool = FURNITURE.some((i) => isPoolKind(i.kind));
-    if (this.platformFloor) this.platformFloor.visible = !hasPool;
-    if (this.platformGrid) this.platformGrid.visible = !hasPool;
+    // …and only the pools that HAVE deck slabs: the beach river is a cut in
+    // the floor with a sand apron, not a deck — hiding the floor for it left
+    // the room a void (Copilot review, PR #169).
+    const hasDeck = FURNITURE.some((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+    if (this.platformFloor) this.platformFloor.visible = !hasDeck;
+    if (this.platformGrid) this.platformGrid.visible = !hasDeck;
   }
 
   /**

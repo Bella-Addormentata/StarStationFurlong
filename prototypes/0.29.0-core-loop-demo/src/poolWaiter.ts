@@ -17,7 +17,7 @@
 import * as THREE from "three";
 import type { Player } from "./player";
 import {
-  CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell,
+  CELL_SIZE, findPath, worldToCol, worldToRow, nearestReachableCell, walkableGridRevision,
 } from "./pathfinding";
 import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
@@ -891,11 +891,12 @@ export class PoolWaiter {
    */
   private updateDance(dt: number): void {
     // The spot is cached, but re-derived whenever the floor or the dock it was
-    // derived FROM moves or goes — a furniture edit re-applies the same
+    // derived FROM moves or goes, or the walkable grid is rebaked (something
+    // may now stand on the cell) — a furniture edit re-applies the same
     // routine without touching it (Copilot review, PR #169).
     const floor = FURNITURE.find((i) => i.kind === "dance-floor");
     const d = this.dockTarget;
-    const key = `${floor ? `${floor.pos.x},${floor.pos.z}` : "-"}|${d ? `${d.x},${d.z}` : "-"}`;
+    const key = `${floor ? `${floor.pos.x},${floor.pos.z}` : "-"}|${d ? `${d.x},${d.z}` : "-"}|${walkableGridRevision()}`;
     if (key !== this.danceSpotKey) {
       this.danceSpot = this.findDanceSpot();
       this.danceSpotKey = key;
@@ -1306,7 +1307,9 @@ export class PoolWaiter {
       this.path = [];
       return true;
     }
-    const key = `${tx.toFixed(1)},${tz.toFixed(1)}`;
+    // The goal AND the grid it was planned on: a rebake (furniture added,
+    // moved, removed) invalidates the route.
+    const key = `${tx.toFixed(1)},${tz.toFixed(1)}@${walkableGridRevision()}`;
     if (key !== this.pathGoalKey) {
       this.pathGoalKey = key;
       this.path = findPath(

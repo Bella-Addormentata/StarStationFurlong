@@ -46,7 +46,16 @@ export const GRID_HALF = GRID_SIZE / 2;
 export const walkable: boolean[][] = [];
 
 /** Re-bake the walkable grid from the current OBSTACLES list, in place. */
+/** Bumped on every rebake — anything holding a planned path (a robot on
+ *  its way somewhere) re-plans when this changes, so furniture dropped onto
+ *  the route is walked round, not through (Copilot review, PR #169). */
+let gridRevision = 0;
+export function walkableGridRevision(): number {
+  return gridRevision;
+}
+
 export function rebakeWalkableGrid(): void {
+  gridRevision++;
   // Walkable box = WALL_CLEARANCE inside each wall, per axis (floorPlanDoc —
   // the shared source the player/npc clamps and the placement gate also read).
   // Default 2×2 room: half=6 ⇒ ±5.5, so the outermost cell centres (±5.25)
