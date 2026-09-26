@@ -36,12 +36,13 @@ class FakeOsc extends FakeNode {
   start() { oscStarts++; }
   stop() {}
 }
+const gains: FakeNode[] = []; // every gain node made, in order: a voice's master is its first
 class FakeAudioContext {
   currentTime = 0;
   state = 'running';
   destination = new FakeNode();
   resume() { return Promise.resolve(); }
-  createGain() { return new FakeNode(); }
+  createGain() { const g = new FakeNode(); gains.push(g); return g; }
   createDelay() { return new FakeNode(); }
   createBiquadFilter() { return new FakeNode(); }
   createOscillator() { return new FakeOsc(); }
@@ -135,6 +136,34 @@ describe('createSpeakerVoice', () => {
     inRoom(voice, false);
     await new Promise((r) => setTimeout(r, 900));
     expect(audios[0].paused).toBe(true);
+    voice.dispose();
+  });
+
+  it('keeps the switch-off fade: the gain is not re-aimed while no round is on', async () => {
+    const before = gains.length;
+    const voice = createSpeakerVoice('sp');
+    inRoom(voice, true);
+    await flush();
+    const master = gains[before];
+    expect(master.gain.value).toBeGreaterThan(0); // aimed at the distance level
+    inRoom(voice, false); // silence(0.8): ramped to 0…
+    expect(master.gain.value).toBe(0);
+    for (let i = 0; i < 30; i++) { ctx.currentTime += 0.016; inRoom(voice, false); }
+    expect(master.gain.value).toBe(0); // …and left there
+    voice.dispose();
+  });
+
+  it('ignores recording metadata that arrives after the fallback to the music box', async () => {
+    refusePlay = true;
+    const voice = createSpeakerVoice('sp');
+    inRoom(voice);
+    await flush();
+    inRoom(voice); // the synth round, about sixteen seconds
+    ctx.currentTime = 1;
+    expect(voice.beat()?.bpm).toBe(92);
+    for (const fn of audios[0].listeners.get('loadedmetadata') ?? []) fn(); // the 30 s file, late
+    ctx.currentTime = 25; // past the synth round, inside the recording's length
+    expect(voice.playing()).toBe(false);
     voice.dispose();
   });
 

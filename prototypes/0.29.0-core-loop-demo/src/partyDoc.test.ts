@@ -282,7 +282,14 @@ describe('💌 the wish on the tag', () => {
   it('caps the wish at 120 characters and shape-checks a hostile record', () => {
     as('pub-a', 'Ana'); writeGiftWish('w3', 'x'.repeat(500));
     expect(readGift('w3').wish).toHaveLength(120);
-    doc.getMap('party').set('gift:w4', { opened: 'yes', wish: 42, wishBy: null });
+    // Hostile records under BOTH keys the reader merges: the box's and the
+    // tag's (giftwish:) — the tag is where a peer would plant a bad wish.
+    doc.getMap('party').set('gift:w4', { opened: 'yes', byName: ['x'] });
+    doc.getMap('party').set('giftwish:w4', { wish: 42, wishBy: null, wishByName: { name: 'Eve' } });
     expect(readGift('w4')).toEqual({ opened: false, byName: '', wish: '', wishBy: '', wishByName: '' });
+    // A tag with an over-long wish is clipped on the way out too.
+    doc.getMap('party').set('giftwish:w5', { wish: 'y'.repeat(999), wishBy: 'pub-e', wishByName: 'Eve' });
+    expect(readGift('w5').wish).toHaveLength(120);
+    expect(readGift('w5').wishByName).toBe('Eve');
   });
 });

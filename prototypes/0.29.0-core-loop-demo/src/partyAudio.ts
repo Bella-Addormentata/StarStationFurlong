@@ -348,8 +348,11 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
       audio.crossOrigin = 'anonymous';
       audio.addEventListener('error', () => { fileBroken = true; });
       audio.addEventListener('loadedmetadata', () => {
-        // A round is as long as the file, once we know it.
-        if (audio && ctx && roundEnd > 0 && Number.isFinite(audio.duration)) roundEnd = roundStart + audio.duration;
+        // A round is as long as the file, once we know it — while the round
+        // IS the file: metadata that arrives after the voice fell back to
+        // the music box would stretch the synth's round to the recording's
+        // length (Copilot review, PR #169).
+        if (audio && ctx && fileRound && roundEnd > 0 && Number.isFinite(audio.duration)) roundEnd = roundStart + audio.duration;
       });
       audioSrc = ctx.createMediaElementSource(audio);
       audioSrc.connect(master);
@@ -482,10 +485,16 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
       if (looping && roundEnd > 0 && now > roundEnd + REST_BEATS * beatSeconds() - 0.3) {
         startRound(roundEnd + REST_BEATS * beatSeconds());
       }
-      // Distance: full near the speaker, a murmur across the room.
-      const f = Math.min(1, Math.max(0, (distance - NEAR_M) / (FAR_M - NEAR_M)));
-      const g = MASTER * (1 - f * (1 - FAR_GAIN));
-      master.gain.setTargetAtTime(g, now, 0.15);
+      // Distance: full near the speaker, a murmur across the room — while a
+      // round is on. silence() has just ramped the gain to 0; re-aiming it
+      // at an audible level here undid that fade every frame, and a stopped
+      // recording stayed audible until its delayed pause (Copilot review,
+      // PR #169).
+      if (roundEnd > 0) {
+        const f = Math.min(1, Math.max(0, (distance - NEAR_M) / (FAR_M - NEAR_M)));
+        const g = MASTER * (1 - f * (1 - FAR_GAIN));
+        master.gain.setTargetAtTime(g, now, 0.15);
+      }
     },
     playing() {
       return !!ctx && roundEnd > 0 && ctx.currentTime < roundEnd + 1.5;
