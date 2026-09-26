@@ -203,21 +203,35 @@ describe('coin-pusher requests', () => {
     expect(readCoinPusherRequest(MACHINE, PLAYER)).toBeNull();
   });
 
-  it('lists requests oldest first and ignores one filed under another player\'s key', () => {
+  it('lists requests in arrival order and ignores one filed under another player\'s key', () => {
     writeCoinPusherRequest(MACHINE, request(OTHER, 'b-2'));
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
     doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, request(PLAYER, 'a-0'));
-    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['a-1', 'b-2']);
+    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['b-2', 'a-1']);
   });
 
-  it('a bounded read keeps only the oldest, whatever order they were written in', () => {
+  it('a bounded read keeps the first to arrive, whatever ids they carry', () => {
     const ids = ['m-5', 'm-2', 'm-9', 'm-1', 'm-7', 'm-3'];
     ids.forEach((id, i) => writeCoinPusherRequest(MACHINE, request(`p${i}`, id)));
-    expect(readCoinPusherRequests(MACHINE, 3).map((r) => r.requestId)).toEqual(['m-1', 'm-2', 'm-3']);
-    expect(readCoinPusherRequests(MACHINE, 1).map((r) => r.requestId)).toEqual(['m-1']);
-    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(
-      ['m-1', 'm-2', 'm-3', 'm-5', 'm-7', 'm-9'],
-    );
+    expect(readCoinPusherRequests(MACHINE, 3).map((r) => r.requestId)).toEqual(['m-5', 'm-2', 'm-9']);
+    expect(readCoinPusherRequests(MACHINE, 1).map((r) => r.requestId)).toEqual(['m-5']);
+    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(ids);
+  });
+
+  it('first come, first served: low ids written later never jump the queue, and a request filed again goes to the back', () => {
+    const map = doc.getMap('casino');
+    writeCoinPusherRequest(MACHINE, request(PLAYER, 'zz-honest'));
+    for (let i = 0; i < 4; i++) map.set(`pusher-req:${MACHINE}:peer${i}`, request(`peer${i}`, `00-${i}`));
+    const firstBatch = () => readCoinPusherRequests(MACHINE, 4).map((r) => r.requestId);
+    expect(firstBatch()[0]).toBe('zz-honest');
+    // Refused, then filed again with a lower id: behind everyone already waiting.
+    map.delete(`pusher-req:${MACHINE}:peer0`);
+    map.set(`pusher-req:${MACHINE}:peer0`, request('peer0', '00-again'));
+    expect(firstBatch()).toEqual(['zz-honest', '00-1', '00-2', '00-3']);
+    // Rewritten in place, the same.
+    map.set(`pusher-req:${MACHINE}:peer1`, request('peer1', '000-rewritten'));
+    expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId))
+      .toEqual(['zz-honest', '00-2', '00-3', '00-again', '000-rewritten']);
   });
 
   it('reads a machine\'s requests from its index, never by walking the casino map — not even the first time', () => {
@@ -304,7 +318,7 @@ describe('coin-pusher requests', () => {
   it('works through a flood PUSHER_REQUEST_SCAN at a time, in arrival order, reaching every request once', () => {
     const id = (i: number) => `r-${String(i).padStart(4, '0')}`;
     const total = 3 * PUSHER_REQUEST_SCAN + 5;
-    // Written newest first, so arrival order and age disagree.
+    // Written with falling ids, so arrival order and id order disagree.
     for (let i = total - 1; i >= 0; i--) writeCoinPusherRequest(MACHINE, request(`p${i}`, id(i)));
     const gets = vi.spyOn(Y.Map.prototype, 'get');
     let first: string[];
@@ -314,8 +328,8 @@ describe('coin-pusher requests', () => {
     } finally {
       gets.mockRestore();
     }
-    // The oldest of the first PUSHER_REQUEST_SCAN to arrive.
-    expect(first).toEqual([0, 1, 2, 3].map((k) => id(total - PUSHER_REQUEST_SCAN + k)));
+    // The first four to arrive, whatever their ids.
+    expect(first).toEqual([1, 2, 3, 4].map((k) => id(total - k)));
     // Answering four a pass (the operator's batch) reaches each exactly once.
     const answered = new Set<string>();
     let passes = 0;
@@ -597,6 +611,30 @@ describe('drainAndClearCoinPusher', () => {
     expect(readCoinPusherResult(MACHINE, PLAYER)).toBeNull();
     expect(readCoinPusherRequests(MACHINE)).toEqual([]);
     expect(readChips(OWNER)).toBe(chipsInMachine(base));
+  });
+
+  it('writes nothing when the chips inside cannot be credited: the machine stays, whole', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    doc.getMap('casino').set(`bal:${OWNER}`, Number.MAX_SAFE_INTEGER); // at the limit
+    const transactions = countTransactions(doc);
+    expect(drainAndClearCoinPusher(MACHINE, OWNER)).toBeNull();
+    expect(transactions()).toBe(0);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    expect(readChips(OWNER)).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('clears an empty machine whatever the recipient: there is nothing to credit', () => {
+    const empty = emptyMachine(machineWith(30), OWNER).state;
+    expect(chipsInMachine(empty)).toBe(0);
+    writeCoinPusherState(MACHINE, empty);
+    expect(drainAndClearCoinPusher(MACHINE, '')).toBe(0);
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    // With chips inside, a recipient that can't take them clears nothing.
+    const full = machineWith(30);
+    writeCoinPusherState(MACHINE, full);
+    expect(drainAndClearCoinPusher(MACHINE, '')).toBeNull();
+    expect(readCoinPusherState(MACHINE)).toEqual(full);
   });
 
   it('sweeps a flood of per-player keys a batch at a time', () => {

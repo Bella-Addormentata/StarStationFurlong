@@ -60,7 +60,7 @@
  *
  * WORK (at most every REQUEST_POLL_MS): the owner's door request first
  * (carried out, or answered with a refusal when its requester doesn't own the
- * machine), then the MAX_REQUESTS_PER_POLL oldest inserts. The requests come
+ * machine), then the first MAX_REQUESTS_PER_POLL inserts to arrive. The requests come
  * from casinoDoc's per-machine index, which looks at no more than
  * PUSHER_REQUEST_SCAN of them, so a poll costs the same however many keys
  * peers write (the slot operator likewise takes one head request per poll).
@@ -426,7 +426,7 @@ export function operateCoinPusher(
   }
 
   // Every pending request the read returns counts as seen now (the first
-  // time it is); a batch of the oldest is then settled or refused.
+  // time it is); a batch of the first to arrive is then settled or refused.
   const pending = readCoinPusherRequests(machineId);
   const seen = seeRequests(machineId, pending, now);
   for (const request of pending.slice(0, MAX_REQUESTS_PER_POLL)) {
@@ -572,10 +572,12 @@ function hasTeardownsHere(): boolean {
 
 /** Drain a removed cabinet, as the room's operator past its settling wait.
  *  The chips and the machine's own keys go in one transaction; its per-player
- *  keys (no chips in any) follow a batch per frame. */
+ *  keys (no chips in any) follow a batch per frame. When the chips inside
+ *  can't be credited yet, nothing is written and the teardown stays pending:
+ *  the operator tries again on its next pass. */
 function tearDown(machineId: string, recipient: string): void {
+  if (drainAndClearCoinPusher(machineId, recipient) === null) return;
   pendingTeardowns.delete(machineId);
-  drainAndClearCoinPusher(machineId, recipient);
   const sweep = startCoinPusherKeySweep(machineId);
   if (!continueCoinPusherKeySweep(sweep)) sweeps.set(machineId, sweep);
 }

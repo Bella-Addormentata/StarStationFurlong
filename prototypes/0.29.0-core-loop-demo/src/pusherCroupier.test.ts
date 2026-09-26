@@ -200,7 +200,7 @@ describe('operateCoinPusher', () => {
     let draws = 0;
     operateCoinPusher(MACHINE, OPERATOR, NOW, () => { draws += 1; return draws; });
     expect(draws).toBe(2);
-    // Both settled in one pass, oldest first: the later one is the last drop.
+    // Both settled in one pass, in arrival order: the later one is the last drop.
     expect(readCoinPusherState(MACHINE)!.lastDrop!.requestId).toBe('b-2');
     expect(readChips(PLAYER) + readChips(OTHER)).toBe(
       6 - 2 + (readCoinPusherState(MACHINE)!.totalPaid - machineWith(10).totalPaid),
@@ -824,6 +824,21 @@ describe('closeCoinPusher', () => {
       expect(readChips(PLAYER)).toBe(3 - 1 + settled.lastDrop!.paid);
       expect(readChips(PLAYER) + readChips(OPERATOR)).toBe(3 + chipsInMachine(base));
     }
+  });
+
+  it('keeps a teardown pending while the chips inside cannot be credited, and drains once they can', () => {
+    const base = machineWith(30);
+    writeCoinPusherState(MACHINE, base);
+    const ready = becomeReadyOperator([SPARE]);
+    doc.getMap('casino').set(`bal:${OPERATOR}`, Number.MAX_SAFE_INTEGER); // at the limit
+    closeCoinPusher(MACHINE, true, ready + 10);
+    expect(readCoinPusherState(MACHINE)).toEqual(base);
+    tickCoinPusherRoom([SPARE], ready + 100);
+    expect(readCoinPusherState(MACHINE)).toEqual(base); // tried again, still whole
+    doc.getMap('casino').set(`bal:${OPERATOR}`, 100);
+    tickCoinPusherRoom([SPARE], ready + 200);
+    expect(readCoinPusherState(MACHINE)).toBeNull();
+    expect(readChips(OPERATOR)).toBe(100 + chipsInMachine(base));
   });
 
   it('sweeps a removed cabinet\'s per-player keys a batch per frame', () => {

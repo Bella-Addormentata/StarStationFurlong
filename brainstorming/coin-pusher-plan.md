@@ -192,7 +192,7 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   is gone or replaced, or if the transition is not a one-chip drop whose
   payout (`totalPaid` delta) matches `lastDrop.paid`. The credit is read off
   that transition; it is never a separate argument. Each poll works through
-  at most 4 requests (oldest first), so a flood of requests can't stall the
+  at most 4 requests (first come, first served), so a flood of requests can't stall the
   operator's frame. It reads them from an index of the requests by machine.
   The index is built by one pass when the casino map is bound (a join, where
   the doc is usually still empty) and then kept current by an observer, from
@@ -246,7 +246,11 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   the teardown pending, and its room tick keeps the election going for it,
   even with no cabinet left. It takes the lease once it may: at once if nobody
   holds it, or after the same wait as a takeover if the operator goes away
-  still holding it. It drains once past its own settling wait. A cabinet put back
+  still holding it. It drains once past its own settling wait. If the
+  recipient's balance can't take the chips inside (it would leave the
+  safe-integer range), the drain writes nothing, as the door does in the same
+  case: the machine stays whole, and the teardown stays pending until the
+  credit fits. A cabinet put back
   first is left alone (its sweep stops too), and a pending teardown or sweep
   is dropped if the session moves to another room's doc, so it never touches
   either room's doc again. The recipient is the caller's own identity, never
@@ -282,8 +286,9 @@ warning for a record that is there but won't read.
 1. The player presses DROP ONE CHIP. The panel writes
    `pusher-req:<mid>:<me>` = `{ requestId, player, hole, phase, requestedAt }`
    (the phase on screen, and when). No chips move.
-2. The operator's next pass (at most 100 ms later) reads the requests oldest
-   first from the machine's index, refuses or resolves each one's timing,
+2. The operator's next pass (at most 100 ms later) reads the requests in
+   arrival order from the machine's index (a request filed again goes to the
+   back, and its id never decides the order), refuses or resolves each one's timing,
    runs `processInsert` with its own seed, and settles it (step *A drop*
    above).
 3. Every client sees `pusher:<mid>` change: the cabinet redraws the piles and

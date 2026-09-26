@@ -1111,13 +1111,14 @@ function pusherRequestIndex(map: Y.Map<unknown>): PusherRequestIndex {
   return index;
 }
 
-/** Up to `limit` of this machine's insert requests, oldest first (the
- *  requestId leads with the base-36 request time — the slot-request
- *  precedent), from the first PUSHER_REQUEST_SCAN in arrival order. It reads
- *  the machine's index, never the whole map, so its cost grows neither with
- *  what peers write elsewhere nor with a flood of requests. Shape- and
- *  cross-key-guarded: a request whose `player` disagrees with the `<pid>` in
- *  its key is ignored. */
+/** Up to `limit` of this machine's insert requests, in arrival order: first
+ *  come, first served. A request that changes (refused and filed again, or
+ *  rewritten) goes to the back, and a `requestId` is the player's to choose,
+ *  so it never decides the order. It reads the machine's index, never the
+ *  whole map, and looks at no more than PUSHER_REQUEST_SCAN, so its cost grows
+ *  neither with what peers write elsewhere nor with a flood of requests.
+ *  Shape- and cross-key-guarded: a request whose `player` disagrees with the
+ *  `<pid>` in its key is ignored. */
 export function readCoinPusherRequests(
   machineId: string,
   limit = PUSHER_REQUEST_SCAN,
@@ -1131,7 +1132,6 @@ export function readCoinPusherRequests(
     const value = map.get(key);
     if (isPusherInsertRequest(value)) out.push(value);
   }
-  out.sort((a, b) => a.requestId.localeCompare(b.requestId));
   return out.slice(0, Math.max(0, limit));
 }
 
@@ -1385,27 +1385,29 @@ export function commitCoinPusherEmpty(
 }
 
 /**
- * Teardown for a removed cabinet, run only by the deed holder's session that
- * operates the machine, or could take it over by the election's rule
- * (pusherCroupier.closeCoinPusher), so it never merges with a drop another
- * session is still settling: credit the chips still inside to `recipientId`,
- * the deed holder running it, and delete every key the machine used, in ONE
- * transaction. The recipient is the caller's own identity, never
+ * Teardown for a removed cabinet, run only by the room's operator past its
+ * settling wait (pusherCroupier.closeCoinPusher), so it never merges with a
+ * drop another session is still settling: credit the chips still inside to
+ * `recipientId`, the deed holder running it, and delete every key the machine
+ * used, in ONE transaction. The recipient is the caller's own identity, never
  * the `ownerId` stored in the peer-writable machine, so a forged machine can
  * only ever pay the deed holder (the operator re-owns every machine it runs,
  * so in honest play they are the same). This transaction touches only the
  * machine's own keys, a fixed few. Its per-player keys carry no chips and are
  * deleted afterwards, a batch at a time (startCoinPusherKeySweep). Returns the
- * chips credited.
+ * chips credited, or null when nothing was written: chips inside that can't be
+ * credited (the recipient's balance would leave the safe-integer range) stay
+ * in the machine, as the door leaves them, and the caller tries again later.
  */
-export function drainAndClearCoinPusher(machineId: string, recipientId: string): number {
+export function drainAndClearCoinPusher(machineId: string, recipientId: string): number | null {
   const map = ensureMap();
   const state = readCoinPusherState(machineId);
   const inside = state ? chipsInMachine(state) : 0;
   const ownerKey = `bal:${recipientId}`;
   const ownerBalance = safeCount(map, ownerKey);
-  const credit = inside > 0 && recipientId.length > 0 && recipientId.length <= 128
-    && Number.isSafeInteger(ownerBalance + inside) ? inside : 0;
+  if (inside > 0 && (recipientId.length === 0 || recipientId.length > 128
+    || !Number.isSafeInteger(ownerBalance + inside))) return null;
+  const credit = inside;
   boundDoc!.transact(() => {
     if (credit > 0) map.set(ownerKey, ownerBalance + credit);
     map.delete(`pusher:${machineId}`);
