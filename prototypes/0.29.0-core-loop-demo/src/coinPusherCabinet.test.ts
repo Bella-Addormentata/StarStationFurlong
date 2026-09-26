@@ -1,6 +1,7 @@
 /**
  * 🪙 Coin-pusher cabinet tests (issue #135): removing a cabinet frees every
- * geometry, material and texture it made, each once. The cabinet is built
+ * geometry, material and texture it made, each once, and its chips hide with
+ * it at the distant zoom levels. The cabinet is built
  * for real (buildItemGroup, with a stand-in canvas for its marquee), its
  * handle filed the way World files it, and it is taken apart the way
  * World.removeFurnitureVisuals does: the handle's dispose(), then a deduped
@@ -135,6 +136,39 @@ describe('coin pusher cabinet removal', () => {
     expect(ids(geometryDispose)).toEqual(between(before.geometry, after.geometry));
     expect(ids(materialDispose)).toEqual(between(before.material, after.material));
     expect(ids(textureDispose)).toEqual(between(before.texture, after.texture));
+  });
+
+  it('hides its chips at the distant zoom levels along with the meshes World registered', () => {
+    const { group, handle } = buildCabinet();
+    // What World registers, and hides at zoom 3+: the meshes there when the
+    // cabinet is filed. The chips come later, from the pool.
+    const registered: THREE.Mesh[] = [];
+    group.traverse((obj) => {
+      if (obj instanceof THREE.Mesh) registered.push(obj);
+    });
+    const state = machineWith(7);
+    writeCoinPusherState(MACHINE, state);
+    /** Chips that render: the chip itself and every parent visible. */
+    const chipsShown = (): number => {
+      let n = 0;
+      group.traverse((obj) => {
+        if (!(obj instanceof THREE.Mesh) || !(obj.geometry instanceof THREE.CylinderGeometry)) return;
+        let shown = true;
+        for (let o: THREE.Object3D | null = obj; o; o = o.parent) shown &&= o.visible;
+        if (shown) n += 1;
+      });
+      return n;
+    };
+    handle.update(0.016);
+    expect(chipsShown()).toBe(chipsInMachine(state));
+
+    for (const mesh of registered) mesh.visible = false; // zoom 3+, as World does it
+    handle.update(0.016);
+    expect(chipsShown()).toBe(0);
+
+    for (const mesh of registered) mesh.visible = true; // back inside
+    handle.update(0.016);
+    expect(chipsShown()).toBe(chipsInMachine(state));
   });
 
   it("World's removal has the handle free them before its own traversal", () => {

@@ -6648,6 +6648,9 @@ function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, 
       }
 
       for (const mat of chipMaterials) mat.opacity = barMat.opacity;
+      // World's zoom-level hiding doesn't reach the chips either (it hides only
+      // the meshes it registered): they show and hide with their platform.
+      pileGroup.visible = upperPlatform.visible;
       let idx = 0;
       if (state) {
         for (const [piles, toZ, baseY] of [
