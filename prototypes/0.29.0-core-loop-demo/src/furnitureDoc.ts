@@ -189,6 +189,15 @@ export function seedFurnitureDefaults(): void {
  * adding the same set twice gives two of everything rather than silently
  * overwriting the first. Returns the ids written.
  */
+/** 🏷️ A tag no OTHER peer mints: the bound doc's Yjs client id (random per
+ *  doc instance), for ids written by several peers into one map. addFurniture
+ *  de-duplicates only against the local map — two peers adding the same set
+ *  at once otherwise pick identical ids and the map's per-key LWW keeps one
+ *  of each pair (Copilot review, PR #169). '' with no doc bound. */
+export function peerIdTag(): string {
+  return boundDoc ? boundDoc.clientID.toString(36) : '';
+}
+
 export function addFurniture(items: FurnitureItem[]): string[] {
   if (!docAlive()) return [];
   const taken = new Set(furnitureMap!.keys());

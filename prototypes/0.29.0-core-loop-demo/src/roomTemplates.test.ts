@@ -13,7 +13,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { bindFloorPlan } from './floorPlanDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
-import { bindFurnitureDoc, subscribeFurniture, readAllFurniture } from './furnitureDoc';
+import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag } from './furnitureDoc';
 import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, addRoomTemplateItems, type PlacementSpec } from './roomTemplates';
 import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, type Box, type FurnitureItem } from './furniture';
 
@@ -254,5 +254,51 @@ describe('one wall mount over another', () => {
     expect(wallMountHungOver('climbing-rose', { x: -4.5, z: -5.97 }, 0, [northCorner])).toBeNull();
     // Floor furniture is not a wall mount: no slab, no verdict here.
     expect(wallMountHungOver('beach-crate', { x: 1, z: -5.5 }, 0, [terminal])).toBeNull();
+  });
+});
+
+describe('the banner', () => {
+  it('hangs over the cake WHERE THE CAKE LANDED, and not at all without a cake', () => {
+    const fresh = layout();
+    const cake = fresh.find((i) => i.kind === 'cake-table')!;
+    expect(fresh.find((i) => i.kind === 'birthday-banner')!.pos).toEqual(cake.pos);
+    // A crate on the cake's far corner: the cake takes its first nudge, and
+    // the banner goes with it.
+    const corner: Box[] = [{ x0: cake.pos.x + 0.78, z0: cake.pos.z - 0.52, x1: cake.pos.x + 1.1, z1: cake.pos.z - 0.02 }];
+    const fitted = layout(corner);
+    const moved = fitted.find((i) => i.kind === 'cake-table')!;
+    expect(moved).toBeDefined();
+    expect(moved.pos).not.toEqual(cake.pos);
+    expect(fitted.find((i) => i.kind === 'birthday-banner')!.pos).toEqual(moved.pos);
+    // The whole cake spot taken, nudges included: no cake, so no banner
+    // hanging over whatever stands there.
+    const taken: Box[] = [{ x0: cake.pos.x - 1.2, z0: cake.pos.z - 0.8, x1: cake.pos.x + 1.2, z1: cake.pos.z + 0.8 }];
+    const without = layout(taken);
+    expect(kinds(without)).not.toContain('cake-table');
+    expect(kinds(without)).not.toContain('birthday-banner');
+    // Likewise from the specs alone (every nudge of the centre is the centre).
+    const specs: PlacementSpec[] = [{ kind: 'cake-table', at: [0, 0] }, { kind: 'birthday-banner', over: 'cake-table' }];
+    expect(placeFitting(specs, 6, 6, 't', [{ x0: -2, z0: -2, x1: 2, z1: 2 }])).toHaveLength(0);
+  });
+});
+
+describe('+ ADD from two peers', () => {
+  it('mints ids the other peer cannot, so both sets survive the merge', () => {
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    bindFurnitureDoc(a);
+    const tagA = peerIdTag();
+    expect(tagA).toBe(a.clientID.toString(36));
+    addRoomTemplateItems('party-2');
+    const idsA = [...readAllFurniture().keys()];
+    expect(idsA.length).toBeGreaterThan(0);
+    for (const id of idsA) expect(id.endsWith(`-${tagA}`)).toBe(true);
+    bindFurnitureDoc(b); // the other peer, same room, same press
+    addRoomTemplateItems('party-2');
+    const idsB = [...readAllFurniture().keys()];
+    expect(idsB.length).toBe(idsA.length);
+    expect(idsA.filter((id) => idsB.includes(id))).toEqual([]); // no id in common…
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b)); // …so the merge keeps both sets whole
+    expect(a.getMap('furniture').size).toBe(idsA.length + idsB.length);
   });
 });

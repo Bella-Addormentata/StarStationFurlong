@@ -30,7 +30,7 @@ import {
   DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList, wallMountHalfWidth,
   seaCorner, roomDoorPoints,
 } from "./furniture";
-import { replaceAllFurniture, readAllFurniture, addFurniture } from "./furnitureDoc";
+import { replaceAllFurniture, readAllFurniture, addFurniture, peerIdTag } from "./furnitureDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { PLAYER_R } from "./player";
 
@@ -86,8 +86,15 @@ export interface RoomTemplate {
  *  half-extents so the same recipe works in a 12 m room and a 30 m one. */
 export interface PlacementSpec {
   kind: FurnitureKind;
-  /** Target, in room-fractions: [-1, 1] on each axis. */
-  at: [number, number];
+  /** Target, in room-fractions: [-1, 1] on each axis. Ignored with `over`. */
+  at?: [number, number];
+  /** Hangs over the most recently placed piece of THAT kind in this set: its
+   *  target is where that piece LANDED (plus `off`), never nudged, and it is
+   *  left out when that piece did not land. The banner is strung over the
+   *  cake — the cake as fitted, not the cake's first choice: with the target
+   *  taken, the cake was nudged and the banner still hung at the old spot,
+   *  through whatever stood there (Copilot review, PR #169). */
+  over?: FurnitureKind;
   /** Metres added AFTER the fraction — for rigid clusters. A bar counter and
    *  the shelf behind it are a fixed distance apart in any room; fractions
    *  would squeeze them together in a small one and tear them apart in a big
@@ -182,6 +189,7 @@ export function placeFitting(
 ): FurnitureItem[] {
   const out: FurnitureItem[] = [];
   const occupied: Box[] = [...seed];
+  const lastPlaced = new Map<FurnitureKind, FurnitureItem>(); // anchors for `over`
   // Doorways are reserved for everything that STANDS; a spanning water
   // feature keeps its own door rule (the sea's dry lanes, the pool's
   // landings) and is not refused for touching a lane's box.
@@ -197,12 +205,15 @@ export function placeFitting(
   for (const spec of specs) {
     // A rigid group that already lost a member places nothing more.
     if (spec.group && groupFailed.has(spec.group)) continue;
-    const tx = spec.at[0] * halfX + (spec.off?.[0] ?? 0);
-    const tz = spec.at[1] * halfZ + (spec.off?.[1] ?? 0);
+    const anchor = spec.over ? lastPlaced.get(spec.over) : undefined;
+    if (spec.over && !anchor) continue; // nothing to hang over
+    const tx = (anchor ? anchor.pos.x : (spec.at?.[0] ?? 0) * halfX) + (spec.off?.[0] ?? 0);
+    const tz = (anchor ? anchor.pos.z : (spec.at?.[1] ?? 0) * halfZ) + (spec.off?.[1] ?? 0);
     // Nudges pull toward the centre, which is where the room is. A rigid
     // group gets no nudge — moving one member relative to the others is
-    // exactly what `off` exists to prevent.
-    const tries: Array<[number, number]> = spec.group || spec.hugWall
+    // exactly what `off` exists to prevent — and neither does a piece hung
+    // OVER another: it goes where its anchor went.
+    const tries: Array<[number, number]> = spec.group || spec.hugWall || anchor
       ? [[tx, tz]]
       : [
           [tx, tz],
@@ -268,12 +279,13 @@ export function placeFitting(
           if (spec.group) groupBoxes.set(spec.group, [...(groupBoxes.get(spec.group) ?? []), eb]);
         } else {
           if (Math.abs(x) > halfX - MARGIN || Math.abs(z) > halfZ - MARGIN) continue;
-          if (!spec.overhead && pointInAny(x, z, blockedFor(false))) continue;
+          if (!spec.overhead && !anchor && pointInAny(x, z, blockedFor(false))) continue;
         }
       }
       placed = item;
       break;
     }
+    if (placed) lastPlaced.set(spec.kind, placed);
     if (spec.group) {
       if (!placed) {
         // The group is out — and so are the boxes its earlier members
@@ -328,9 +340,10 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     // 🎂 The anchor and its cluster, along the back.
     // Right of centre along the back, clear of the bar's shelf in the corner.
     { kind: "cake-table", at: [0.42, -0.78] },
-    // Strung OVER the cake table (same spot; the poles stand just past its
-    // ends and the cloth hangs well above the cake) — behind it is the hedge.
-    { kind: "birthday-banner", at: [0.42, -0.78], overhead: true },
+    // Strung OVER the cake table — where the cake LANDED (the poles stand
+    // just past its ends and the cloth hangs well above the cake); behind it
+    // is the hedge. No cake, no banner.
+    { kind: "birthday-banner", over: "cake-table" },
     // Gifts in METRES from the cake — one each side — so they sit beside it
     // in any room instead of drifting into the bar in a small one.
     { kind: "gift-box", at: [0.42, -0.78], off: [-1.6, 0.3] },
@@ -763,7 +776,12 @@ export function addRoomTemplateItems(
   // Occupied: every obstacle box, every overlay pad already down, and the
   // ground the caller asked to keep clear.
   const wanted = t.layout(roomHalfExtents(), [...buildObstacleList(FURNITURE), ...overlayEnvelopeBoxes(FURNITURE), ...keepClear]);
-  const written = addFurniture(wanted);
+  // Ids carry this peer's tag: addFurniture only de-duplicates against the
+  // LOCAL map, so two peers pressing + ADD together minted the same ids and
+  // the map's per-key LWW collapsed each pair to one item while both
+  // reported everything written (Copilot review, PR #169).
+  const tag = peerIdTag();
+  const written = addFurniture(wanted.map((i) => ({ ...i, id: `${i.id}-${tag}` })));
   // "Skipped" against what THIS room holds when empty — the set fitted to
   // these extents with nothing in the way — not against a 30 m room's longer
   // hedge and fuller inventory, which reported pieces skipped in a default
