@@ -137,9 +137,13 @@ export function clearRobotConfig(dockId: string): void {
   });
 }
 
-// Console verification handle (the __ssfCasino precedent).
-(window as unknown as { __ssfRobot: unknown }).__ssfRobot = {
-  readRobotConfig,
-  writeRobotConfig,
-  clearRobotConfig,
-};
+// Console verification handle (the __ssfCasino precedent). Guarded: the
+// module is also imported where there is no window (roomTemplates under
+// vitest configures a template's docks through it).
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfRobot: unknown }).__ssfRobot = {
+    readRobotConfig,
+    writeRobotConfig,
+    clearRobotConfig,
+  };
+}

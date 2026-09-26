@@ -28,9 +28,10 @@
 import type { Box, FurnitureItem, FurnitureKind, RoomTheme, Rot } from "./furniture";
 import {
   DEFAULT_LOBBY_FURNITURE, OUTDOOR_FURNITURE, CASINO_FURNITURE, FURNITURE, buildObstacleList, wallMountHalfWidth,
-  seaCorner, roomDoorPoints,
+  seaCorner, roomDoorPoints, itemOccupancyBox,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture, peerIdTag } from "./furnitureDoc";
+import { writeRobotConfig, type RobotRoutine } from "./robotDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { PLAYER_R } from "./player";
 
@@ -69,6 +70,12 @@ export interface RoomTemplate {
    *  'outdoor-deck' opens the room to the real space backdrop + warm bright
    *  light. Absent handling defaults to 'interior' at the call site. */
   theme: RoomTheme;
+  /** 🤖 The routine every charging-dock this template places is configured
+   *  with when it lands (PLACE, provisioning and + ADD alike). Robots come
+   *  only from placed docks, and an unconfigured dock serves drinks: a party
+   *  set that advertises a dancer has to bring the dock AND set it dancing
+   *  (Copilot review, PR #169). */
+  dockRoutine?: RobotRoutine;
   /**
    * 🧩 A layout GENERATED for the room it is going into, instead of the fixed
    * `items` list. A room's structure is fixed once it is built — you cannot
@@ -344,10 +351,12 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     // just past its ends and the cloth hangs well above the cake); behind it
     // is the hedge. No cake, no banner.
     { kind: "birthday-banner", over: "cake-table" },
-    // Gifts in METRES from the cake — one each side — so they sit beside it
-    // in any room instead of drifting into the bar in a small one.
-    { kind: "gift-box", at: [0.42, -0.78], off: [-1.6, 0.3] },
-    { kind: "gift-box", at: [0.42, -0.78], off: [1.6, 0.3] },
+    // Gifts in METRES from the cake AS FITTED — one each side — so they sit
+    // beside it wherever it landed, never nudged away on their own, and stay
+    // out with it (Copilot review, PR #169: the cluster came apart when the
+    // cake was nudged around existing furniture).
+    { kind: "gift-box", over: "cake-table", off: [-1.6, 0.3] },
+    { kind: "gift-box", over: "cake-table", off: [1.6, 0.3] },
     { kind: "birthday-balloons", at: [0.72, -0.82] },
     { kind: "birthday-balloons", at: [0.06, -0.86] },
 
@@ -364,6 +373,12 @@ function layoutBeachParty(half: { halfX: number; halfZ: number }, seed: readonly
     // the speaker stands at the floor's end, not on it — its box starts at
     // z 0.82, the pad ends at 0.43 in a 2×2 module.
     { kind: "party-speaker", at: [0.48, 0.22] },
+    // 🤖 The dancer's dock, in the strip between the floor and the east wall,
+    // below the east door's lane and inside the walk bounds (±5 in a 2×2:
+    // the robot starts ON its dock), facing the floor (rot 3: front toward
+    // -x). Its robot is configured `dance` when the set lands
+    // (RoomTemplate.dockRoutine).
+    { kind: "charging-dock", at: [0.8, 0.3], rot: 3 },
 
     // 🍹 The bar, anchored in the FAR CORNER and laid out in metres from it so
     // the shelf, counter and stools keep their spacing in any room: shelf at
@@ -614,6 +629,8 @@ export const ROOM_TEMPLATES: RoomTemplate[] = [
     // 🧩 …and the version that FITS: ADD SET runs this against the room's real
     // extents instead of the fixed list above, which was drawn for a 5×5.
     layout: layoutBeachParty,
+    // 🎉 The dock the set places is the party dancer's.
+    dockRoutine: "dance",
 
     // 🏖️ The beach theme: the deck's open sky and sunward light over a SAND
     // floor (world.ts applyRoomVisuals) — the reference build's whole look is
@@ -679,15 +696,21 @@ export function findTemplate(id: string): RoomTemplate | null {
  * The fitted set's own terminal rides along at the real south wall.
  */
 export function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
-  if (!t.layout) return cloneItems(t.items);
   const half = roomHalfExtents();
+  if (!t.layout) {
+    // A fixed manifest was drawn for the default 2×2 envelope; a 1×1 room
+    // has 3 m half-extents, and PLACE wrote its far pieces outside the
+    // walls (Copilot review, PR #169). Keep what the room can hold — and
+    // if that lost the terminal, hang one on this room's own wall.
+    const kept = cloneItems(t.items).filter((i) => fitsRoom(i, half));
+    if (kept.some((i) => i.kind === "wall-computer")) return kept;
+    return [terminalFor(t, half, buildObstacleList(kept)), ...kept];
+  }
   // The terminal hangs on the south wall at the first half-metre station,
   // outward from the usual 1.8, that no door claims (its opening + a post
   // each side, plus the panel's half-width) — doors move, and a PLACE that
   // hung the room's only edit entry across a doorway left it unusable
   // (Copilot review, PR #169).
-  const doorHalf = 1.3;
-  const panelHalf = wallMountHalfWidth("wall-computer");
   // The set first; the terminal's station is then chosen with the set's
   // blocked area in hand, so its stand-point (1 m in front of the panel) is
   // never in the sea — in a doorless room the sea reaches the south wall's
@@ -695,7 +718,27 @@ export function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
   // south wall is tried first (where it has always hung), then the others:
   // a doorless 2×2 room's south wall can be sea and loungers end to end.
   const items = t.layout(half);
-  const blocked = buildObstacleList(items);
+  return [terminalFor(t, half, buildObstacleList(items)), ...items];
+}
+
+/** Is this item inside the walls of a room with these half-extents? Its
+ *  centre must be; its box (floor, wall slab, or overlay pad) may run past
+ *  the wall line by the wall-flush allowance — the bar's cabinet, the map
+ *  table against the north wall and a hung panel's slab all do, on purpose
+ *  (the same 0.6 m placeFitting grants a hedge). */
+function fitsRoom(item: FurnitureItem, half: { halfX: number; halfZ: number }): boolean {
+  if (Math.abs(item.pos.x) > half.halfX || Math.abs(item.pos.z) > half.halfZ) return false;
+  const box = itemOccupancyBox(item) ?? overlayEnvelopeBoxes([item])[0];
+  if (!box) return true;
+  const FLUSH = 0.6;
+  return box.x0 >= -half.halfX - FLUSH && box.x1 <= half.halfX + FLUSH && box.z0 >= -half.halfZ - FLUSH && box.z1 <= half.halfZ + FLUSH;
+}
+
+/** The room terminal for a template's set: on the first dry, door-free
+ *  station of the south wall, else the other walls (see templateItemsFor). */
+function terminalFor(t: RoomTemplate, half: { halfX: number; halfZ: number }, blocked: readonly Box[]): FurnitureItem {
+  const doorHalf = 1.3;
+  const panelHalf = wallMountHalfWidth("wall-computer");
   const REACH = PLAYER_R + 0.06; // the FINE-arrival clearance validatePlacement demands
   const doors = roomDoorPoints();
   const dry = (fx: number, fz: number) =>
@@ -724,20 +767,31 @@ export function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
       break;
     }
   }
-  const terminal: FurnitureItem = {
+  return {
     id: `${t.id}-computer`,
     kind: "wall-computer",
     pos: chosen?.pos ?? { x: Math.min(1.8, Math.max(0, half.halfX - 1.0)), z: half.halfZ - 0.03 },
     rot: chosen?.rot ?? 2,
     movable: true,
   };
-  return [terminal, ...items];
+}
+
+/** 🤖 Configure every charging-dock a template just placed with the routine
+ *  it asks for (RoomTemplate.dockRoutine); `ids` are the ids as WRITTEN,
+ *  aligned with `items`. */
+function configureTemplateDocks(t: RoomTemplate, items: readonly FurnitureItem[], ids: readonly string[]): void {
+  if (!t.dockRoutine) return;
+  items.forEach((item, i) => {
+    if (item.kind === "charging-dock" && ids[i]) writeRobotConfig(ids[i], { routine: t.dockRoutine! });
+  });
 }
 
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
-  replaceAllFurniture(templateItemsFor(t));
+  const items = templateItemsFor(t);
+  replaceAllFurniture(items);
+  configureTemplateDocks(t, items, items.map((i) => i.id));
   // 🌌 …and the room IS this now: stamping the theme makes the change
   // persistent and shared, instead of a look that lasted until the next
   // reload re-resolved it from nothing.
@@ -782,6 +836,7 @@ export function addRoomTemplateItems(
   // reported everything written (Copilot review, PR #169).
   const tag = peerIdTag();
   const written = addFurniture(wanted.map((i) => ({ ...i, id: `${i.id}-${tag}` })));
+  configureTemplateDocks(t, wanted, written);
   // "Skipped" against what THIS room holds when empty — the set fitted to
   // these extents with nothing in the way — not against a 30 m room's longer
   // hedge and fuller inventory, which reported pieces skipped in a default
@@ -799,7 +854,9 @@ export function addRoomTemplateItems(
 export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
-  replaceAllFurniture(templateItemsFor(t));
+  const items = templateItemsFor(t);
+  replaceAllFurniture(items);
+  configureTemplateDocks(t, items, items.map((i) => i.id));
   return true;
 }
 

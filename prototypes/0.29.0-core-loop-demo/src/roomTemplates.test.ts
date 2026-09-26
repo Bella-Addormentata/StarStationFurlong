@@ -11,10 +11,11 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { bindFloorPlan } from './floorPlanDoc';
+import { bindFloorPlan, writeRoomDims } from './floorPlanDoc';
+import { bindRobotDoc, readRobotConfig } from './robotDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
 import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag } from './furnitureDoc';
-import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, addRoomTemplateItems, type PlacementSpec } from './roomTemplates';
+import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, addRoomTemplateItems, applyRoomTemplate, type PlacementSpec } from './roomTemplates';
 import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, type Box, type FurnitureItem } from './furniture';
 
 const HALF = { halfX: 6, halfZ: 6 }; // the default 2×2 module
@@ -270,12 +271,16 @@ describe('the banner', () => {
     expect(moved).toBeDefined();
     expect(moved.pos).not.toEqual(cake.pos);
     expect(fitted.find((i) => i.kind === 'birthday-banner')!.pos).toEqual(moved.pos);
+    // …and so do the gifts, one each side of the cake as fitted.
+    const gifts = fitted.filter((i) => i.kind === 'gift-box').map((g) => [+(g.pos.x - moved.pos.x).toFixed(2), +(g.pos.z - moved.pos.z).toFixed(2)]);
+    expect(gifts).toEqual([[-1.6, 0.3], [1.6, 0.3]]);
     // The whole cake spot taken, nudges included: no cake, so no banner
-    // hanging over whatever stands there.
+    // hanging over whatever stands there, and no gifts beside nothing.
     const taken: Box[] = [{ x0: cake.pos.x - 1.2, z0: cake.pos.z - 0.8, x1: cake.pos.x + 1.2, z1: cake.pos.z + 0.8 }];
     const without = layout(taken);
     expect(kinds(without)).not.toContain('cake-table');
     expect(kinds(without)).not.toContain('birthday-banner');
+    expect(kinds(without)).not.toContain('gift-box');
     // Likewise from the specs alone (every nudge of the centre is the centre).
     const specs: PlacementSpec[] = [{ kind: 'cake-table', at: [0, 0] }, { kind: 'birthday-banner', over: 'cake-table' }];
     expect(placeFitting(specs, 6, 6, 't', [{ x0: -2, z0: -2, x1: 2, z1: 2 }])).toHaveLength(0);
@@ -300,5 +305,53 @@ describe('+ ADD from two peers', () => {
     expect(idsA.filter((id) => idsB.includes(id))).toEqual([]); // no id in common…
     Y.applyUpdate(a, Y.encodeStateAsUpdate(b)); // …so the merge keeps both sets whole
     expect(a.getMap('furniture').size).toBe(idsA.length + idsB.length);
+  });
+});
+
+describe('a fixed manifest in a small room', () => {
+  it('keeps only what a 1×1 room can hold, and still hangs a terminal on its own wall', () => {
+    writeRoomDims(1, 1); // 6 m square: 3 m half-extents
+    const party1 = ROOM_TEMPLATES.find((t) => t.id === 'party-1')!;
+    expect(party1.layout).toBeUndefined();
+    const items = templateItemsFor(party1);
+    expect(items.length).toBeGreaterThan(0);
+    expect(items.length).toBeLessThan(party1.items.length);
+    // Every centre inside the walls; every box at most the wall-flush
+    // allowance past them (a cabinet against the wall is allowed that).
+    for (const i of items) { expect(Math.abs(i.pos.x)).toBeLessThanOrEqual(3); expect(Math.abs(i.pos.z)).toBeLessThanOrEqual(3); }
+    for (const b of boxesOf(items)) {
+      expect(b.x0).toBeGreaterThanOrEqual(-3.6); expect(b.x1).toBeLessThanOrEqual(3.6);
+      expect(b.z0).toBeGreaterThanOrEqual(-3.6); expect(b.z1).toBeLessThanOrEqual(3.6);
+    }
+    expect(kinds(items)).not.toContain('bar-corner'); // authored at x 5.24
+    expect(kinds(items)).not.toContain('cake-table'); // authored at z −4.2
+    expect(kinds(items)).not.toContain('dance-floor'); // a 4 m pad, judged whole: past the walls
+    expect(kinds(items)).toContain('chandelier'); // the middle stays
+    const terminal = items.find((i) => i.kind === 'wall-computer')!;
+    expect(terminal).toBeDefined();
+    expect(Math.abs(terminal.pos.z)).toBeCloseTo(2.97, 2); // this room's wall, not the 2×2's
+    // In the 2×2 room the manifest is untouched.
+    writeRoomDims(2, 2);
+    expect(templateItemsFor(party1)).toHaveLength(party1.items.length);
+  });
+});
+
+describe('the dancer', () => {
+  it('comes with the set: PLACE and + ADD each land a dock configured to dance', () => {
+    expect(kinds(layout())).toContain('charging-dock');
+    bindRobotDoc(new Y.Doc());
+    bindFurnitureDoc(new Y.Doc());
+    applyRoomTemplate('party-2');
+    const placedDocks = [...readAllFurniture()].filter(([, r]) => r.kind === 'charging-dock').map(([id]) => id);
+    expect(placedDocks).toHaveLength(1);
+    expect(readRobotConfig(placedDocks[0])?.routine).toBe('dance');
+    // + ADD writes ids of its own (the peer tag); its dock is configured too.
+    bindRobotDoc(new Y.Doc());
+    bindFurnitureDoc(new Y.Doc());
+    addRoomTemplateItems('party-2');
+    const addedDocks = [...readAllFurniture()].filter(([, r]) => r.kind === 'charging-dock').map(([id]) => id);
+    expect(addedDocks).toHaveLength(1);
+    expect(addedDocks[0]).not.toBe(placedDocks[0]);
+    expect(readRobotConfig(addedDocks[0])?.routine).toBe('dance');
   });
 });
