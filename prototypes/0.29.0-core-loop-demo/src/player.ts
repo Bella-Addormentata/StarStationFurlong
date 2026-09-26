@@ -2659,17 +2659,20 @@ export class Player {
   }
 
   /**
-   * The vat running this ceremony is being removed (edit mode, a synced
-   * removal): end the ceremony. A pending seal fires now. The clone is not
-   * released on the spot, because World calls this before the vat leaves
-   * the obstacle list, and that spot may be inside other furniture. It is
-   * held where it stands (ORPHANED), and the next update releases it there
-   * or at the nearest free spot once the obstacles are rebuilt. If nowhere
-   * is free it stays held and retries.
+   * The vat this clone is bound to is being removed (edit mode, a synced
+   * removal). A pending seal fires now, so nothing stays tied to the removed
+   * vat, including after a short exit that released the clone before the door
+   * sealed. A running ceremony ends too. The clone is not released on the
+   * spot, because World calls this before the vat leaves the obstacle list,
+   * and that spot may be inside other furniture. It is held where it stands
+   * (ORPHANED), and the next update releases it there or at the nearest free
+   * spot once the obstacles are rebuilt. If nowhere is free it stays held and
+   * retries.
    */
   public abortVatSpawn(): void {
-    if (this.vatPhase === "NONE") return;
+    if (!this.isVatBound()) return;
     this._sealVat();
+    if (this.vatPhase === "NONE") return; // already released: nothing to hold
     this.vatPhase = "ORPHANED";
     this.vatHoldTimer = this.VAT_WAIT_RETRY; // try on the very next update
   }

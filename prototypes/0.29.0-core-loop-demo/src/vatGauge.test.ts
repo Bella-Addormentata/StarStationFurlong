@@ -273,6 +273,17 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     expect(spot.x).toBeLessThanOrEqual(ROOM.boundX);
   });
 
+  it('finds a free pocket narrower than any sampling step', () => {
+    // Free floor only for 3.10 <= x <= 3.14: between lattice points and off
+    // every ring bearing, so only the obstacle-edge candidates reach it.
+    const left = { x0: -6, z0: -6, x1: 2.72, z1: 6 };
+    const right = { x0: 3.52, z0: -6, x1: 6, z1: 6 };
+    const inPocket = (s: { x: number; z: number } | null) =>
+      s !== null && s.x >= 3.1 - 1e-9 && s.x <= 3.14 + 1e-9;
+    expect(inPocket(vatFallbackRelease({ x: 0, z: 0 }, 0, [left, right], ROOM, R))).toBe(true);
+    expect(inPocket(vatStrandedRelease({ x: 0, z: 0 }, 0, [left, right], ROOM, R))).toBe(true);
+  });
+
   it('puts a clone down past the shut door only where its tail clears the sweep', () => {
     const own = box(0, 0, 1, 1);
     // Open floor: the full exit, where the full-size clone is past the door.

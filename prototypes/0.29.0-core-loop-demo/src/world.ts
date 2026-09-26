@@ -3048,14 +3048,13 @@ export class World {
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
     // The clone is released on its next update, once the vat has left the
-    // obstacles, where it stands or at the nearest free spot. Removing some
-    // other vat leaves the ceremony alone.
-    if (
-      this.cloneVats.delete(itemId) &&
-      itemId === this.activeVatId &&
-      this.player.isVatSpawning()
-    ) {
+    // obstacles, where it stands or at the nearest free spot. A clone already
+    // released but with the seal still pending is unbound too, so nothing
+    // keeps pointing at the removed vat (or rebinds to a new item with the
+    // same id). Removing some other vat leaves the ceremony alone.
+    if (this.cloneVats.delete(itemId) && itemId === this.activeVatId) {
       this.player.abortVatSpawn();
+      this.activeVatId = null;
     }
 
     const groupMeshes = new Set<THREE.Object3D>();

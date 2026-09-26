@@ -406,9 +406,20 @@ export function vatStrandedRelease(
   return nearestFreeSpot(at, facing, 0, 0.25, obstacles, bounds, radius);
 }
 
-/** The nearest spot at least `minR` from `centre` that a player of `radius`
- *  may stand on: rings from `firstR` out to 4.5 m (16 bearings, the `facing`
- *  side first), else the nearest on a 0.25 m grid over the walkable box. */
+/**
+ * The nearest spot at least `minR` from `centre` that a player of `radius`
+ * may stand on: rings from `firstR` out to 4.5 m (16 bearings, the `facing`
+ * side first), else the nearest anywhere in the walkable box.
+ *
+ * The whole-box pass cannot miss a free pocket, however narrow. The free
+ * floor is the walkable box minus the obstacles inflated by `radius`, so it
+ * is made of rectangles whose edges lie on the bounds or on inflated
+ * obstacle edges. Every corner of such a rectangle is free, and in a
+ * rectangle that reaches `minR` from `centre` at least one corner does too
+ * (a disc is convex). So trying every pairing of those coordinates finds a
+ * spot whenever one exists. The centre's own coordinates and a 0.25 m
+ * lattice join them, so the spot found is the nearest, or close to it.
+ */
 function nearestFreeSpot(
   centre: { x: number; z: number },
   facing: number,
@@ -426,14 +437,20 @@ function nearestFreeSpot(
       if (!spotBlocked(x, z, obstacles, bounds, radius)) return { x, z };
     }
   }
+  const xs = candidateCoords(
+    bounds.boundX,
+    centre.x,
+    obstacles.flatMap((b) => [b.x0 - radius, b.x1 + radius]),
+  );
+  const zs = candidateCoords(
+    bounds.boundZ,
+    centre.z,
+    obstacles.flatMap((b) => [b.z0 - radius, b.z1 + radius]),
+  );
   let best: { x: number; z: number } | null = null;
   let bestD = Infinity;
-  const nx = Math.floor(bounds.boundX / 0.25);
-  const nz = Math.floor(bounds.boundZ / 0.25);
-  for (let i = -nx; i <= nx; i++) {
-    for (let j = -nz; j <= nz; j++) {
-      const x = i * 0.25;
-      const z = j * 0.25;
+  for (const x of xs) {
+    for (const z of zs) {
       const d = Math.hypot(x - centre.x, z - centre.z);
       if (d >= minR && d < bestD && !spotBlocked(x, z, obstacles, bounds, radius)) {
         best = { x, z };
@@ -442,6 +459,16 @@ function nearestFreeSpot(
     }
   }
   return best;
+}
+
+/** One axis of nearestFreeSpot's search: the bounds, the centre's own
+ *  coordinate, the inflated obstacle edges and a 0.25 m lattice, kept inside
+ *  the walkable box, without duplicates. */
+function candidateCoords(bound: number, own: number, edges: number[]): number[] {
+  const out = new Set<number>([-bound, bound, own, ...edges]);
+  const n = Math.floor(bound / 0.25);
+  for (let i = -n; i <= n; i++) out.add(i * 0.25);
+  return [...out].filter((v) => Math.abs(v) <= bound + 1e-9);
 }
 
 /** Root height while walking out: on the pad inside, easing down off the
