@@ -331,12 +331,16 @@ describe('isDeedHolder — the deed, not owner-equivalence', () => {
  * back to "offline: this client is alone" when there is no sync. Without the
  * leaving check first, a departing client — a visitor included — ran the old
  * room's croupiers and its owner-gated paths (the manual slot operator among
- * them) while its writes still went out (PR #137 review).
+ * them) while its writes still went out (PR #137 review). A second leave in
+ * that wait finds no sync and returns, and its caller may join the next room;
+ * the first leave then tears down only what was its own room's (PR #167
+ * review).
  *
  * ⚠️ Like the #142 block above, this SCANS the source: main.ts can't be loaded
  * by vitest. It pins the wiring (both gates check the flag before the offline
- * fallback, and leaveRoom holds the flag across the whole leave), not that a
- * frame lands inside the window.
+ * fallback, leaveRoom holds the flag across the whole leave, and a leave claims
+ * its room's resources before the wait), not that a frame lands inside the
+ * window.
  */
 describe('leaving a room hands this client none of it (source scan)', () => {
   const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
@@ -375,5 +379,26 @@ describe('leaving a room hands this client none of it (source scan)', () => {
     expect(now).toContain('await sync.stop()');
     // Nothing else lowers it: the leave's own finally is the only place.
     expect(main.match(/roomLeavesUnderWay--/g)).toHaveLength(1);
+  });
+
+  it('a leave that a newer leave or join overlaps tears down only its own room', () => {
+    const now = bodyOf('leaveRoomNow');
+    const wait = now.indexOf('sync.flush()');
+    // The room's snapshot writer is claimed with the sync, before the wait…
+    const claim = now.indexOf('const cache = roomCacheHandle;');
+    expect(claim, 'claim the snapshot writer').toBeGreaterThan(-1);
+    expect(claim).toBeLessThan(wait);
+    expect(now.indexOf('roomCacheHandle = null;')).toBeGreaterThan(claim);
+    expect(now.indexOf('roomCacheHandle = null;')).toBeLessThan(wait);
+    // …and only that writer is flushed and detached after it, never whichever
+    // one a newer join has attached meanwhile.
+    expect(now).toContain('cache?.flushNow()');
+    expect(now).toContain('cache?.detach()');
+    expect(now).not.toMatch(/roomCacheHandle\?\.(flushNow|detach)\(/);
+    // The shared link is dropped only while this leave still owns the session.
+    expect(now).toMatch(/const epoch = \+\+sessionEpoch;/);
+    const owns = now.indexOf('if (epoch !== sessionEpoch) return;');
+    expect(owns, 'drop the link only while this leave owns the session').toBeGreaterThan(wait);
+    expect(owns).toBeLessThan(now.indexOf('networkProvider.disconnect()'));
   });
 });
