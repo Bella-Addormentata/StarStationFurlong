@@ -425,15 +425,16 @@ export class World {
   private sandFloorTex: THREE.Texture | null = null;
   /** Lazy-created casino carpet texture (created on first casino entry). */
   private casinoFloorTex: THREE.Texture | null = null;
-  /** 🌌 Legacy mirror of isOutdoorDeck — kept in sync with the room's THEME so
-   *  the platform-floor visibility read in the render loop (world.ts:3427)
-   *  still hides the floor for an outdoor-deck room on a non-octagon hull.
-   *  Was once the id-keyed "outdoor casino pool room" flag; now theme-driven. */
-  private isOutdoorRoom = false;
+  /** 🏊 Legacy hull (no octagon) only: the floor is hidden because a SWIM
+   *  pool's deck slabs are the flooring. Decided by what the room CONTAINS
+   *  (refreshOutdoorFloor), never by its theme — deriving it from the theme
+   *  hid the beach's sand floor under the party set every frame (Copilot
+   *  review, PR #169). The render loop reads it when restoring the interior. */
+  private legacyDeckHidesFloor = false;
   /** 🌌 True while the active room's THEME is 'outdoor-deck' (space seen through
    *  the glass ceiling + warm bright light). Drives the space backdrop
-   *  visibility toggle in applyRoomVisuals; isOutdoorRoom mirrors it for the
-   *  legacy floor-visibility read. */
+   *  visibility toggle in applyRoomVisuals. (The legacy floor visibility is
+   *  legacyDeckHidesFloor's, from the furniture, not this flag's.) */
   private isOutdoorDeck = false;
   /** 🪐 Overhead ocean-planet for the outdoor-deck backdrop — the "beach" world
    *  the station orbits, seen up through the skylights. Built once, spun slowly,
@@ -2353,10 +2354,8 @@ export class World {
     const deck = resolvedTheme === "outdoor-deck" || beach;
     const casinoTheme = resolvedTheme === "casino";
     this.isOutdoorDeck = deck;
-    // Keep the legacy floor-visibility flag in lockstep with the theme: the
-    // render loop still reads isOutdoorRoom (world.ts:3427) to hide the
-    // platform floor under an outdoor deck on non-octagon hulls.
-    this.isOutdoorRoom = deck;
+    // (The legacy floor-visibility decision is NOT the theme's: see
+    // legacyDeckHidesFloor / refreshOutdoorFloor.)
     // 🚪 The room's RETIRED door-layout kind — compat only. A door's physical
     // slot now comes from its own layout record (wall + lateral), which is what
     // lets a wall carry zero or many doors; this line only tells the doc layer
@@ -2656,6 +2655,7 @@ export class World {
     // the floor with a sand apron, not a deck — hiding the floor for it left
     // the room a void (Copilot review, PR #169).
     const hasDeck = FURNITURE.some((i) => i.kind === "lazy-pool" || i.kind === "classic-pool");
+    this.legacyDeckHidesFloor = hasDeck;
     if (this.platformFloor) this.platformFloor.visible = !hasDeck;
     if (this.platformGrid) this.platformGrid.visible = !hasDeck;
   }
@@ -3614,11 +3614,12 @@ export class World {
       this.furnitureMeshes.forEach((mesh) => {
         mesh.visible = true;
       });
-      // 🏊 Outdoor pool room: legacy hides the floor (deck slabs are the floor;
-      // sunken water shows through). Under the octagon flag the floor stays
-      // SOLID with a pool hole cut (refreshOutdoorFloor), so keep it visible.
+      // 🏊 Legacy hull: the floor stays hidden only where a SWIM pool's deck
+      // slabs are the flooring (refreshOutdoorFloor's ruling, from the
+      // furniture — not the theme). Under the octagon flag the floor stays
+      // SOLID with a pool hole cut, so keep it visible.
       if (this.platformFloor)
-        this.platformFloor.visible = OCTAGON_HULL || !this.isOutdoorRoom;
+        this.platformFloor.visible = OCTAGON_HULL || !this.legacyDeckHidesFloor;
       // 🛑📐 #80: the octagon floor is SOLID by default now (basement hidden
       // beneath it); a hole is cut only where a pool sinks into the basement
       // (setFloorHoles → makeFloorGeometry). No blanket hide.

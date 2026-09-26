@@ -55,7 +55,7 @@ import {
 // it, and DoorWall is type-only — no cycle either way.)
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
-import { createSpeakerVoice } from "./partyAudio";
+import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
@@ -8502,7 +8502,7 @@ function buildPartySpeaker(ctx: BuildCtx) {
  * of its own, so it stops dead when the item is removed.
  */
 function buildDanceFloor(ctx: BuildCtx) {
-  const { m, place, itemId } = ctx;
+  const { m, place } = ctx;
   const A = 0xf7d9e6; // pastel pink
   const B = 0xd6f0ee; // pastel mint
   const N = 4;
@@ -8531,11 +8531,17 @@ function buildDanceFloor(ctx: BuildCtx) {
   );
 
   let t = 0;
-  let on = readSpeaker(itemId).on;
+  // 💡 The floor lights up when the ROOM has music: any party speaker whose
+  // switch is on, or that is sounding its entry round on this client. It
+  // used to read `speaker:<its own id>` — a key no speaker ever writes — so
+  // it never lit (Copilot review, PR #169). Polled per frame: a handful of
+  // speakers at most, and the entry round is local state, not a doc key.
+  const musicOn = (): boolean =>
+    FURNITURE.some((i) => i.kind === "party-speaker" && (readSpeaker(i.id).on || isSpeakerPlaying(i.id)));
   // Per-frame handle — World drives update(dt) and drops it on removal.
   const pulse: PropAnimHandle = {
     update(dt: number) {
-      if (!on) {
+      if (!musicOn()) {
         for (const mat of pads) mat.emissiveIntensity = 0.06;
         return;
       }
@@ -8549,11 +8555,6 @@ function buildDanceFloor(ctx: BuildCtx) {
     },
   };
   trim.userData.propAnim = pulse;
-
-  const applySpeaker = () => {
-    on = readSpeaker(itemId).on;
-  };
-  trim.userData.disposePartySub = subscribePartyKey(speakerKey(itemId), applySpeaker);
 }
 
 /**
