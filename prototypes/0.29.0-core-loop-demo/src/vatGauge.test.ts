@@ -23,6 +23,7 @@ import {
   VAT_MIN_SCALE,
   VAT_NECK_H,
   VAT_NECK_HALF_W,
+  VAT_OUTER_R,
   VAT_PAD_Y,
   VAT_PALLOR_FADE_S,
   VAT_PALLOR_HEX,
@@ -44,7 +45,8 @@ import {
   vatSqueezeAt,
   vatStrandedRelease,
 } from './vatGauge';
-import { FURNITURE, FURNITURE_DEFS, itemAabb, snapItemPos } from './furniture';
+import * as THREE from 'three';
+import { FURNITURE, FURNITURE_DEFS, buildItemGroup, itemAabb, snapItemPos } from './furniture';
 import {
   bindFurnitureDoc,
   readAllFurniture,
@@ -199,6 +201,42 @@ describe('door, floor and exit along the walk-out', () => {
     expect(VAT_PLINTH_R + 0.05).toBeLessThanOrEqual(1); // base ring, 2×2 ⇒ ±1 m
     expect(VAT_DOOR_ARC).toBeLessThanOrEqual(Math.PI);
   });
+
+  it('keeps every vertex of the built vat within VAT_OUTER_R of its axis', () => {
+    // The status plate draws on a canvas: give the builder a no-op one.
+    const noop = (): any =>
+      new Proxy(function () {}, {
+        get: (t: any, k) =>
+          k === 'width' || k === 'height' ? 0 : typeof k === 'symbol' ? undefined : k in t ? t[k] : noop(),
+        apply: () => noop(),
+        set: () => true,
+      });
+    const g = globalThis as { document?: unknown };
+    const hadDocument = 'document' in g;
+    const saved = g.document;
+    g.document ??= { createElement: () => ({ width: 0, height: 0, getContext: () => noop(), style: {} }) };
+    try {
+      const vat = buildItemGroup({ id: 'v', kind: 'clone-vat', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+      vat.updateMatrixWorld(true);
+      let reach = 0;
+      const v = new THREE.Vector3();
+      vat.traverse((o) => {
+        const pos = (o as THREE.Mesh).isMesh ? (o as THREE.Mesh).geometry.attributes.position : null;
+        if (!pos) return;
+        for (let i = 0; i < pos.count; i++) {
+          v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+          reach = Math.max(reach, Math.hypot(v.x, v.z));
+        }
+      });
+      expect(reach).toBeGreaterThan(VAT_PLINTH_R); // the rear pipes stand proud of the plinth
+      expect(reach).toBeLessThanOrEqual(VAT_OUTER_R);
+      // A fallback release clears all of it by the clone's whole reach.
+      expect(VAT_FALLBACK_MIN_R - AVATAR_REACH).toBeGreaterThan(reach);
+    } finally {
+      if (hadDocument) g.document = saved;
+      else delete g.document;
+    }
+  });
 });
 
 describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
@@ -258,7 +296,7 @@ describe('vatFreeExitAlong — where a movable vat\'s walk-out can end', () => {
     // the door can seal straight away.
     const d = Math.hypot(spot.x, spot.z);
     expect(d).toBeGreaterThanOrEqual(VAT_FALLBACK_MIN_R);
-    expect(d - AVATAR_REACH).toBeGreaterThan(VAT_PLINTH_R);
+    expect(d - AVATAR_REACH).toBeGreaterThan(VAT_OUTER_R);
     expect(vatClearOfDoorAt(d, 1)).toBe(true);
     // A room with nowhere free gives no spot rather than an overlapping one.
     const full = box(0, 0, 6, 6);

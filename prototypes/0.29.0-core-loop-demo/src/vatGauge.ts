@@ -365,10 +365,16 @@ export function vatShutDoorReleaseAlong(
   return along !== null && vatDoorClear(along, 1) ? along : null;
 }
 
+/** The vat's outermost reach from its axis, at any height: the tilted rear
+ *  feed pipes and their clamps (about 1.05 m). A test builds the vat mesh and
+ *  checks every vertex stays inside it. */
+export const VAT_OUTER_R = 1.06;
+
 /** A fallback release is at full size at once and may face any way, so it
  *  must clear the vat by the clone's whole reach, not just its collision
- *  radius: the plinth's base ring plus AVATAR_REACH from the vat's axis. */
-export const VAT_FALLBACK_MIN_R = VAT_PLINTH_R + 0.05 + AVATAR_REACH;
+ *  radius: the vat's outer reach plus a margin plus AVATAR_REACH from the
+ *  vat's axis. */
+export const VAT_FALLBACK_MIN_R = VAT_OUTER_R + 0.05 + AVATAR_REACH;
 
 /**
  * Where a clone steps out when its door path is blocked (vatFreeExitAlong
