@@ -21,7 +21,7 @@ import {
 } from "./pathfinding";
 import type { WorkoutPose } from "./voxelCharacter";
 import type { RobotRoutine, RobotStep } from "./robotDoc";
-import { FURNITURE } from "./furniture";
+import { FURNITURE, type FurnitureItem } from "./furniture";
 import { readSpeaker } from "./partyDoc";
 import { isSpeakerPlaying, speakerBeat } from "./partyAudio";
 
@@ -856,9 +856,24 @@ export class PoolWaiter {
    *  and only a cell INSIDE the pad counts — a reachable cell beside it is
    *  not the floor (Copilot review, PR #169); with none, the bot waits. No
    *  floor → the coach's stage. */
+  /** The dance floor nearest this bot's dock (or the bot itself, dockless):
+   *  with several sets in one room each dancer takes its own set's floor,
+   *  not the first one in the list (Copilot review, PR #169). */
+  private nearestDanceFloor(): FurnitureItem | undefined {
+    const from = this.dockTarget ?? { x: this.group.position.x, z: this.group.position.z };
+    let best: FurnitureItem | undefined;
+    let bestD = Infinity;
+    for (const i of FURNITURE) {
+      if (i.kind !== "dance-floor") continue;
+      const d = Math.hypot(i.pos.x - from.x, i.pos.z - from.z);
+      if (d < bestD) { bestD = d; best = i; }
+    }
+    return best;
+  }
+
   private findDanceSpot(): { x: number; z: number } | null {
     const here = { x: this.group.position.x, z: this.group.position.z };
-    const floor = FURNITURE.find((i) => i.kind === "dance-floor");
+    const floor = this.nearestDanceFloor();
     if (!floor) return this.findCoachStage();
     const d = this.dockTarget;
     const INSET = 1.5; // the pad is ±2 m; stay half a metre inside its edge
@@ -894,7 +909,7 @@ export class PoolWaiter {
     // derived FROM moves or goes, or the walkable grid is rebaked (something
     // may now stand on the cell) — a furniture edit re-applies the same
     // routine without touching it (Copilot review, PR #169).
-    const floor = FURNITURE.find((i) => i.kind === "dance-floor");
+    const floor = this.nearestDanceFloor();
     const d = this.dockTarget;
     const key = `${floor ? `${floor.pos.x},${floor.pos.z}` : "-"}|${d ? `${d.x},${d.z}` : "-"}|${walkableGridRevision()}`;
     if (key !== this.danceSpotKey) {

@@ -33,6 +33,7 @@ import {
 import { replaceAllFurniture, readAllFurniture, addFurniture, peerIdTag } from "./furnitureDoc";
 import { writeRobotConfig, type RobotRoutine } from "./robotDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
+import { doorSetIsAuthoritative } from "./doorLayoutDoc";
 import { PLAYER_R } from "./player";
 
 /** 🌌 Injected by main.ts (same idiom as the exterior-view hooks): writes the
@@ -702,7 +703,16 @@ export function templateItemsFor(t: RoomTemplate): FurnitureItem[] {
     // has 3 m half-extents, and PLACE wrote its far pieces outside the
     // walls (Copilot review, PR #169). Keep what the room can hold — and
     // if that lost the terminal, hang one on this room's own wall.
-    const kept = cloneItems(t.items).filter((i) => fitsRoom(i, half));
+    // …and off the room's doorways: the manifest knows nothing of where
+    // THIS room's doors are, and a tree or the terminal across a moved door
+    // is a door nobody can use (Copilot review, PR #169). A rejected
+    // terminal is re-hung by terminalFor below. Only a door set the room
+    // has STATED counts: the legacy four-cardinal fallback is what the
+    // Grand Lobby was drawn against — its armchairs flank the south door
+    // and its map table stands at the north one — and an un-migrated room
+    // must not lose them to a fallback.
+    const lanes = doorSetIsAuthoritative() ? doorLanes(half.halfX, half.halfZ) : [];
+    const kept = cloneItems(t.items).filter((i) => fitsRoom(i, half) && !inDoorLane(i, lanes));
     if (kept.some((i) => i.kind === "wall-computer")) return kept;
     return [terminalFor(t, half, buildObstacleList(kept)), ...kept];
   }
@@ -732,6 +742,14 @@ function fitsRoom(item: FurnitureItem, half: { halfX: number; halfZ: number }): 
   if (!box) return true;
   const FLUSH = 0.6;
   return box.x0 >= -half.halfX - FLUSH && box.x1 <= half.halfX + FLUSH && box.z0 >= -half.halfZ - FLUSH && box.z1 <= half.halfZ + FLUSH;
+}
+
+/** Does this item — by its box (floor, wall slab, or overlay pad) or else
+ *  its centre — stand in any of the room's door lanes? */
+function inDoorLane(item: FurnitureItem, lanes: readonly Box[]): boolean {
+  const box = itemOccupancyBox(item) ?? overlayEnvelopeBoxes([item])[0];
+  if (box) return lanes.some((l) => boxesOverlap(box, l));
+  return pointInAny(item.pos.x, item.pos.z, lanes);
 }
 
 /** The room terminal for a template's set: on the first dry, door-free

@@ -477,7 +477,10 @@ export function createSpeakerVoice(itemId: string): SpeakerVoice {
       // round clears it, so this cannot re-arm every frame (it did, and
       // scheduled a fresh round of oscillators per frame — caught while
       // verifying PR #169's beat sync).
-      if (fileBroken && fileRound && audio && audio.paused && roundEnd > 0 && now < roundEnd) {
+      // Any broken FILE round, playing or not: a decode error can land after
+      // play() has started the element (Copilot review, PR #169) — startRound
+      // pauses it before the synth.
+      if (fileBroken && fileRound && roundEnd > 0 && now < roundEnd) {
         roundEnd = -1;
         startRound(0);
       }

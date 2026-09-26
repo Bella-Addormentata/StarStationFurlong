@@ -201,6 +201,20 @@ describe('createSpeakerVoice', () => {
     voice.dispose();
   });
 
+  it('falls back to the music box when the file breaks AFTER it started playing', async () => {
+    const voice = createSpeakerVoice('sp');
+    inRoom(voice);
+    await flush();
+    expect(audios[0].paused).toBe(false);
+    expect(oscStarts).toBe(0);
+    for (const fn of audios[0].listeners.get('error') ?? []) fn(); // a decode error mid-file
+    ctx.currentTime = 2;
+    inRoom(voice);
+    expect(oscStarts).toBeGreaterThan(0); // the music box took over…
+    expect(audios[0].paused).toBe(true); // …and the recording was stopped first
+    voice.dispose();
+  });
+
   it('plays the music box outright for the music-box track, in time', () => {
     const voice = createSpeakerVoice('sp');
     inRoom(voice, false, 'music-box');

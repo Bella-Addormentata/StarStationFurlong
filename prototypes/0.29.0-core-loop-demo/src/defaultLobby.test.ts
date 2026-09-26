@@ -8,6 +8,7 @@ import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { DEFAULT_LOBBY_FURNITURE, FURNITURE } from './furniture';
 import { bindFurnitureDoc, readAllFurniture, seedFurnitureDefaults } from './furnitureDoc';
+import { bindDoorLayoutDoc, seedDoorLayoutSingle } from './doorLayoutDoc';
 import { ROOM_TEMPLATES, applyRoomTemplate } from './roomTemplates';
 
 describe('the frozen lobby manifest', () => {
@@ -19,11 +20,26 @@ describe('the frozen lobby manifest', () => {
     try {
       expect(FURNITURE).toHaveLength(0);
       expect(DEFAULT_LOBBY_FURNITURE).toHaveLength(before);
-      // …and the Grand Lobby still places the whole lobby.
+      // …and the Grand Lobby still places the whole lobby — an un-migrated
+      // room (no door set of its own) keeps every piece, the lobby having
+      // been drawn against the legacy four doors.
+      bindDoorLayoutDoc(new Y.Doc());
       bindFurnitureDoc(new Y.Doc());
       expect(applyRoomTemplate('lobby-1')?.name).toBe('Grand Lobby');
       expect(readAllFurniture().size).toBe(34);
+      // A room that has STATED its doors — one, mid south wall — loses the
+      // two armchairs that flank that doorway to its lane; nothing else.
+      bindDoorLayoutDoc(new Y.Doc());
+      seedDoorLayoutSingle('y+', 0);
+      bindFurnitureDoc(new Y.Doc());
+      applyRoomTemplate('lobby-1');
+      expect(readAllFurniture().size).toBe(32);
+      const ids = [...readAllFurniture().keys()];
+      expect(ids).not.toContain('armchair-left-3');
+      expect(ids).not.toContain('armchair-right-0');
+      expect(ids).toContain('map-table'); // the north wall has no door now
       // …and a new room is seeded with the lobby, not with "nothing".
+      bindDoorLayoutDoc(new Y.Doc());
       bindFurnitureDoc(new Y.Doc());
       seedFurnitureDefaults();
       expect(readAllFurniture().size).toBe(34);
