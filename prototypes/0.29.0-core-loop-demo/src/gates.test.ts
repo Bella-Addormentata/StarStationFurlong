@@ -383,6 +383,13 @@ describe('the station record', () => {
     ]).map((b) => b.gate)).toEqual([1, 2, 3, undefined]);
   });
 
+  it("keeps a record's extra fields beside a long gate list", () => {
+    const berths = Array.from({ length: 40 }, (_, i) => ({ roomId: 'room-far', doorId: `d:${String(i + 1).padStart(8, '0')}`, gate: i + 1 }));
+    registerStation({ id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berths, tow: { by: 'tug' } } as Parameters<typeof registerStation>[0]);
+    const saved = JSON.parse(store.get('ssf-stations') ?? '[]') as Array<Record<string, unknown>>;
+    expect(saved.find((r) => r.id === 'far')?.tow).toEqual({ by: 'tug' });
+  });
+
   it('lists every gate up to the highest number', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 20; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;

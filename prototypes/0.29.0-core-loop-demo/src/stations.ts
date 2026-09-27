@@ -335,7 +335,7 @@ export function readStationRecords(): StationRecord[] {
 /** Most JSON a record's extra fields may take (a newer build's, or a peer's
  *  carried by the shared planet summary); past it they are dropped. */
 const MAX_EXTRA_JSON = 1024;
-const CORE_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'derived']);
+const CORE_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived']);
 
 /** The record's fields this build does not know, kept as they are while
  *  they are plain JSON within MAX_EXTRA_JSON, so a newer build's (or a
