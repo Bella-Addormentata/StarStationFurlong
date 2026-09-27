@@ -24,6 +24,7 @@ import {
   harvestIntoAtlas,
   readAtlas,
   stationGates,
+  withSharedAtlasOf,
 } from './stationAtlas';
 import { listStations, registerStation } from './stations';
 import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
@@ -128,6 +129,16 @@ describe('the gate on a dock port', () => {
     expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
   });
 
+  it('finds a live gate however many malformed layout keys come first', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    for (let i = 0; i < 1100; i++) doc.getMap('doorLayout').set(`d:junk${String(i).padStart(4, '0')}`, { nope: true });
+    doc.getMap('doorLayout').set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
+    expect(readDockGates()).toEqual({ 'd:live': 5 });
+    expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
+  });
+
   it('takes the lowest number free in the station', () => {
     expect(nextFreeGate([])).toBe(1);
     expect(nextFreeGate([1, 2, 4])).toBe(3);
@@ -205,6 +216,34 @@ describe('gate gossip that doors alone would skip', () => {
   });
 });
 
+describe("a far room doc's shared atlas", () => {
+  const entry = (roomId: string, updatedAt: number, doors: Record<string, unknown>, gates?: Record<string, number>) => ({
+    roomId, name: roomId, updatedAt, doors, ...(gates ? { gates } : {}),
+  });
+
+  it("walks the far room's station however many other entries the doc holds", () => {
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    for (let i = 0; i < 300; i++) shared.set(`other-${String(i).padStart(3, '0')}`, entry(`other-${String(i).padStart(3, '0')}`, 1, {}));
+    shared.set('far-dock', entry('far-dock', 5, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
+    shared.set('far-hub', entry('far-hub', 5, { 'd:in': { targetRoomId: 'far-dock', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1, 'd:p2': 2 }));
+    const atlas = withSharedAtlasOf(doc, readAtlas(), 'far-dock');
+    expect(freeGateNumber(atlas, 'far-dock', {})).toBe(3);
+    // Only that station is read.
+    expect(atlas['other-000']).toBeUndefined();
+  });
+
+  it("takes the doc's gates for a known room when the doc's copy is newer", () => {
+    harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: { 'd:p1': 1 } });
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-hub', entry('room-hub', Date.now() + 60_000, {}, { 'd:p1': 1, 'd:p2': 2 }));
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'].gates).toEqual({ 'd:p1': 1, 'd:p2': 2 });
+    // An older copy leaves what this client saw alone.
+    doc.getMap('atlas').set('room-hub', entry('room-hub', 1, {}, { 'd:p9': 9 }));
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'].gates).toEqual({ 'd:p1': 1 });
+  });
+});
+
 describe('the station record', () => {
   it('lists the station\'s gates as its berths, and names the lowest welcome-room gate as berthDoor', () => {
     twoRoomStation();
@@ -216,6 +255,14 @@ describe('the station record', () => {
       { roomId: 'room-b', doorId: 'east', gate: 3 },
     ]);
     expect(hub.berthDoor).toBe('south');
+  });
+
+  it('replaces a berthDoor that is no longer a welcome-room gate, and drops it when there are none', () => {
+    registerStation({ id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'north' });
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: { east: 6, south: 4 } });
+    expect(listStations().find((s) => s.id === 'far')?.berthDoor).toBe('south');
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: {} });
+    expect(listStations().find((s) => s.id === 'far')?.berthDoor).toBeUndefined();
   });
 
   it('keeps a learned berth list for a station this install has not mapped, and reads berthDoor as one berth', () => {
@@ -284,6 +331,17 @@ describe('the station record', () => {
     expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([]);
   });
 
+  it('keeps all 99 gates of one room through the atlas and its gossip', () => {
+    const gates: Record<string, number> = {};
+    for (let i = 1; i <= 99; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
+    harvestIntoAtlas({ roomId: 'room-full', name: 'FULL', doors: [], gates });
+    registerStation({ id: 'full', name: 'FULL', planetId: 'planet-sovereign', orbitSlot: 7, welcomeRoomId: 'room-full' });
+    expect(listStations().find((s) => s.id === 'full')?.berths).toHaveLength(99);
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 5, doors: {}, gates });
+    expect(Object.keys(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates ?? {})).toHaveLength(99);
+  });
+
   it('lists every gate up to the highest number', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 20; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
@@ -314,6 +372,12 @@ describe('the per-planet summary', () => {
     const merged = mergeStation(older, newer)!;
     expect(merged.name).toBe('NEW');
     expect(merged.berths).toEqual([{ roomId: 'room-b', doorId: 'east', gate: 3 }]);
+  });
+
+  it('settles gate lists read the same moment alike, in either merge order', () => {
+    const one = base({ ownerId: 'hub', berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0 });
+    const two = base({ ownerId: 'hub', berths: [{ roomId: 'room-b', doorId: 'east', gate: 3 }], berthsAt: T0 });
+    expect(mergeStation(one, two)?.berths ?? one.berths).toEqual(mergeStation(two, one)?.berths ?? two.berths);
   });
 
   it('lets any visitor update a derived station\'s gates, though not its slot', () => {

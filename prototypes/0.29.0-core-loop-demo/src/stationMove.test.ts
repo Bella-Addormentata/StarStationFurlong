@@ -4,7 +4,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { ORBIT_EPOCH_MS } from './orbits';
+import { ORBIT_EPOCH_MS, setStationTrimResolver } from './orbits';
+import { stationBodies } from './map';
 import {
   bindPlanetSummaryDoc,
   cleanStationSummary,
@@ -13,7 +14,7 @@ import {
   summaryForStation,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
-import { planPlanetTransfer, planetSunPointAt } from './solarOrbits';
+import { AU_KM, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
 import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
 import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeTrimBurn } from './stationKeeping';
@@ -24,6 +25,7 @@ import {
   bindStationMoveDoc,
   cancelTowLeftBehind,
   concurrentMoves,
+  isCancelPin,
   isPinMove,
   pinSettledArrival,
   isPlausibleMove,
@@ -546,6 +548,7 @@ describe('tugs: a torch tow', () => {
     expect(end.radiusKm / to.radiusKm).toBeCloseTo(1, 6);
     expect(angleGap(end.angle, to.angle)).toBeLessThan(1e-6);
     expect(moveTransitPointAt(move, move.arriveAt)).toBeNull();
+    expect(moveTransitPointAt({ ...move, toPlanetId: SOV }, move.departAt + 1)).toBeNull();
     // The station list follows the tow like any move.
     setStationMoveResolver(() => move);
     expect(stationInTransit(listStations({}, [], NOW + 1).find((s) => s.id === DEFAULT_STATION_ID)!, NOW + 1)).toBe(true);
@@ -632,10 +635,10 @@ describe('tugs: a torch tow', () => {
     bindStationMoveDoc(new Y.Doc());
     writeStationMove(plan.move);
     // Still docked: the tow stands.
-    expect(cancelTowLeftBehind('tug-room', 'docked', NOW + 1)).toBe(false);
+    expect(cancelTowLeftBehind('tug-room', { status: 'docked' }, NOW + 1)).toBe(false);
     expect(isTowing('tug-room', NOW + 1)).toBe(true);
     // The tug is flying: the tow is cancelled, not flown, held or paid for.
-    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 1)).toBe(true);
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 1)).toBe(true);
     expect(isTowing('tug-room', NOW + 2)).toBe(false);
     expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
     expect(readMoveFuelDrawn()).toBe(0);
@@ -646,7 +649,7 @@ describe('tugs: a torch tow', () => {
     expect(listStations({}, [], NOW + 10).find((s) => s.id === DEFAULT_STATION_ID))
       .toMatchObject({ planetId: SOV, orbitSlot: plan.move.fromSlot });
     // Once is enough.
-    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 3)).toBe(false);
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 3)).toBe(false);
   });
 
   it('lets a move booked at the same time beat a tow that would have flown first', () => {
@@ -719,6 +722,97 @@ describe('tugs: a torch tow', () => {
     store.clear();
     rememberMove(won, lost.arriveAt + 10);
     expect(rememberMove(pin, lost.arriveAt + 10)).toBe(false);
+  });
+
+  it('lets a cancel lose with its tow, and refuses a pin of an implausible move', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(tow);
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 1)).toBe(true);
+    const cancel = readStationMove()!;
+    expect(cancel.settles).toEqual(cleanMove(tow));
+    // A concurrent move leaving the same millisecond that beats the tow beats its cancel.
+    const rival = [{ ...tow, toSlot: tow.toSlot + 1 }, { ...tow, toSlot: tow.toSlot + 2 }]
+      .find((m) => compareMoves(m, tow) > 0)!;
+    expect(compareMoves(rival, cancel)).toBeGreaterThan(0);
+    // A pin wrapping a move decades away is refused like that move.
+    const far = { ...tow, departAt: NOW + 20 * 365 * 86_400_000, arriveAt: NOW + 20 * 365 * 86_400_000 + 1000 };
+    expect(isPlausibleMove({ ...cancel, settles: far }, NOW)).toBe(false);
+    expect(isPlausibleMove(cancel, NOW)).toBe(true);
+  });
+
+  it('cancels a tow whose tug left mid-tow even when that shows up after the ETA, over any arrival pin', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    const after = tow.arriveAt + 60_000;
+    // A partitioned replica saw the tow arrive and pinned it at Aris.
+    const pin: StationMove = {
+      ...tow, fromPlanetId: ARIS, fromSlot: tow.toSlot, toPlanetId: ARIS, mode: 'thrusters', tugRoomId: undefined,
+      departAt: tow.arriveAt, arriveAt: tow.arriveAt + 1, bookedAt: tow.arriveAt + 10, fuel: 0, fuelDrawn: 0, settles: tow,
+    };
+    const d1 = new Y.Doc();
+    d1.clientID = 1;
+    bindStationMoveDoc(d1);
+    writeStationMove(tow);
+    writeStationMove(pin);
+    expect(readStationMove()).toEqual(cleanMove(pin));
+    // A tug that left after the tow ended is its own business.
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight', castOffAt: tow.arriveAt + 5 }, after)).toBe(false);
+    // Its DEPART cast off an hour into the tow, learned only now.
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight', castOffAt: tow.departAt + 3_600_000 }, after)).toBe(true);
+    const cancel = readStationMove()!;
+    expect(isCancelPin(cancel)).toBe(true);
+    expect(compareMoves(cancel, pin)).toBeGreaterThan(0);
+    expect(readMoveFuelDrawn()).toBe(0);
+    // Merged either way round with a replica holding only the pin, the cancel stands.
+    const d2 = new Y.Doc();
+    d2.clientID = 2;
+    store.clear();
+    bindStationMoveDoc(d2);
+    writeStationMove(tow);
+    writeStationMove(pin);
+    Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+    expect(readStationMove()).toEqual(cancel);
+    setStationMoveResolver(() => readStationMove());
+    expect(listStations({}, [], after).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV, orbitSlot: tow.fromSlot });
+    // Once cancelled, nothing more is written.
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight', castOffAt: tow.departAt + 3_600_000 }, after)).toBe(false);
+  });
+
+  it('draws a moving station on the holotable around its old planet, in flight, then around its new one', () => {
+    setStationTrimResolver((st, slot) => (st.id === DEFAULT_STATION_ID
+      ? { radiusKm: slot.radiusKm * 1.01, phase0: slot.phase0 + 0.3 } : null));
+    try {
+      const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+      if (!plan.ok) throw new Error(plan.refusal);
+      for (const move of [moveTo(), plan.move]) {
+        const home = stationBodies([DEFAULT_STATION_RECORD], NOW)[0];
+        const moving = stationBodies([{ ...DEFAULT_STATION_RECORD, move }], NOW)[0];
+        const place = moving.placeAt!;
+        // Before the burn: where it always was, its trim included.
+        const before = move.departAt - 1000;
+        const p0 = place(before);
+        expect(p0).toMatchObject({ parentId: SOV, radius: home.orbitRadius });
+        expect(p0.angle).toBeCloseTo(home.angleAt!(before), 9);
+        // Under way: on its course around the sun, a planet's distance out.
+        const mid = (move.departAt + move.arriveAt) / 2;
+        const p1 = place(mid);
+        const course = moveTransitPointAt(move, mid)!;
+        expect(p1.parentId).toBeUndefined();
+        expect(p1.angle).toBeCloseTo(course.angle, 12);
+        expect(p1.radius).toBeCloseTo((course.radiusKm / AU_KM) * 180, 9);
+        // Arrived: around the new planet, in the slot it asked for.
+        const there = stationBodies([{ ...DEFAULT_STATION_RECORD, planetId: ARIS, orbitSlot: move.toSlot }], NOW)[0];
+        const p2 = place(move.arriveAt + 1000);
+        expect(p2).toMatchObject({ parentId: ARIS, radius: there.orbitRadius });
+      }
+    } finally {
+      setStationTrimResolver(null);
+    }
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {

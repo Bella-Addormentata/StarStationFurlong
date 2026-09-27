@@ -475,12 +475,12 @@ function isPlainGates(v: unknown): v is Record<string, unknown> {
     && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
 }
 
-/** Only door id → integer gate pairs, at most MAX_DOORS_PER_ENTRY of them. */
+/** Only door id → integer gate pairs, at most one per gate number. */
 function cleanGates(v: Record<string, unknown>): Record<string, number> {
   const out: Record<string, number> = {};
   let kept = 0;
   for (const [doorId, gate] of Object.entries(v)) {
-    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    if (kept >= MAX_GATE_NUMBER) break;
     if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
     if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
     out[doorId] = gate;
@@ -497,12 +497,12 @@ export interface AtlasGateAccess {
   reservedFor?: string;
 }
 
-/** Door id → access pairs a peer may send, cleaned and capped. */
+/** Door id → access pairs a peer may send, cleaned and capped (one per gate number). */
 function cleanGateAccess(v: Record<string, unknown>): Record<string, AtlasGateAccess> {
   const out: Record<string, AtlasGateAccess> = {};
   let kept = 0;
   for (const [doorId, raw] of Object.entries(v)) {
-    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    if (kept >= MAX_GATE_NUMBER) break;
     if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
     if (typeof raw !== 'object' || raw === null) continue;
     const r = raw as { access?: unknown; reservedFor?: unknown };
@@ -571,51 +571,65 @@ export function freeGateNumber(
 
 /**
  * ⚓🚦 `atlas` with a room doc's shared atlas folded in, for gate numbering in
- * a room this client may never have visited (a far DOCK's port). A room the
- * local atlas lacks comes from the doc; a known room gains the doc's gates when
- * it has none, and any door pairing it lacks, so the station walk and the
- * numbers taken both see what the far station has already published. Local
- * knowledge wins wherever it exists. Peer entries are shape-checked and
- * capped as pullSharedAtlas does. Pure: nothing is written.
+ * a room this client may never have visited (a far DOCK's port). Only the
+ * station around `roomId` is read: a walk from that room along its door
+ * pairings (berths aside), looking each room up in the doc directly, so a
+ * doc crowded with other stations' entries cannot push this one's out of
+ * reach. A room the local atlas lacks comes from the doc; a known room gains
+ * any door pairing it lacks, and the doc's gates when it has none or the
+ * doc's copy is newer (as pullSharedAtlas arbitrates), so the station walk
+ * and the numbers taken both see what the far station has published. Peer
+ * entries are shape-checked and capped as pullSharedAtlas does. Pure:
+ * nothing is written.
  */
 export function withSharedAtlasOf(
   doc: Y.Doc,
   atlas: Record<string, AtlasEntry>,
+  roomId: string,
 ): Record<string, AtlasEntry> {
   const out: Record<string, AtlasEntry> = { ...atlas };
-  let seen = 0;
-  for (const [rid, value] of doc.getMap('atlas').entries()) {
-    if (++seen > MAX_SHARED_SCAN) break;
-    if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
-    const doors: Record<string, AtlasDoor> = {};
-    let kept = 0;
-    for (const [d, door] of Object.entries(value.doors)) {
-      if (kept >= MAX_DOORS_PER_ENTRY) break;
-      if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
-      doors[d] = {
-        targetSeed: '',
-        targetRoomId: door.targetRoomId,
-        segments: door.segments,
-        farDoor: door.farDoor,
-        ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
-      };
-      kept++;
+  const shared = doc.getMap('atlas');
+  const queued = new Set<string>([roomId]);
+  const queue: string[] = [roomId];
+  for (let i = 0; i < queue.length && i < MAX_SHARED_SCAN; i++) {
+    const rid = queue[i];
+    const value = shared.get(rid);
+    if (isSharedAtlasEntry(value) && value.roomId === rid) {
+      const doors: Record<string, AtlasDoor> = {};
+      let kept = 0;
+      for (const [d, door] of Object.entries(value.doors)) {
+        if (kept >= MAX_DOORS_PER_ENTRY) break;
+        if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
+        doors[d] = {
+          targetSeed: '',
+          targetRoomId: door.targetRoomId,
+          segments: door.segments,
+          farDoor: door.farDoor,
+          ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
+        };
+        kept++;
+      }
+      const gates = value.gates !== undefined ? cleanGates(value.gates) : undefined;
+      const prior = out[rid];
+      if (!prior) {
+        out[rid] = {
+          roomId: rid,
+          name: value.name || 'Module',
+          doors,
+          ...(gates ? { gates } : {}),
+          lastSeen: value.updatedAt,
+        };
+      } else {
+        const merged: AtlasEntry = { ...prior, doors: { ...doors, ...prior.doors } };
+        if (gates && (prior.gates === undefined || value.updatedAt > prior.lastSeen)) merged.gates = gates;
+        out[rid] = merged;
+      }
     }
-    const gates = value.gates !== undefined ? cleanGates(value.gates) : undefined;
-    const prior = out[rid];
-    if (!prior) {
-      out[rid] = {
-        roomId: rid,
-        name: value.name || 'Module',
-        doors,
-        ...(gates ? { gates } : {}),
-        lastSeen: value.updatedAt,
-      };
-      continue;
+    for (const door of Object.values(out[rid]?.doors ?? {})) {
+      if (!door || isBerthDoor(door) || queued.has(door.targetRoomId)) continue;
+      queued.add(door.targetRoomId);
+      queue.push(door.targetRoomId);
     }
-    const merged: AtlasEntry = { ...prior, doors: { ...doors, ...prior.doors } };
-    if (prior.gates === undefined && gates) merged.gates = gates;
-    out[rid] = merged;
   }
   return out;
 }
