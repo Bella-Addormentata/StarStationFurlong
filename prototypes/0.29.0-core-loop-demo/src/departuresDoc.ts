@@ -388,7 +388,8 @@ export function cleanDeparturesPublish(pub: DeparturesPublish, now: number): Dep
  * merged key by key, a rewritten key keeping the newer observation; the
  * ferry's keys from any other run go, and so do the entries the timetable's
  * own pruning drops (pilotRoute.checkpointsToPrune). A new ferry in a full
- * map evicts the one published longest ago. Returns whether it wrote.
+ * map evicts the one published longest ago, unless that is itself (then it
+ * writes nothing but clears its own stray keys). Returns whether it wrote.
  */
 export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now = Date.now()): { wrote: boolean } {
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return { wrote: false };
@@ -443,6 +444,14 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
     keys: o.keys,
     at: newestRouteEntry(o.entries)?.entry.at ?? Number.NEGATIVE_INFINITY,
   }));
+  // A full room ranks a ferry it does not hold yet with the ones it does
+  // (byPublished, as readers keep the newest): the ferries published longest
+  // ago go, and when that includes this publish, none of it is written.
+  const gone = !existing && others.length >= MAX_DEPARTURE_FERRIES
+    ? [...others, { ship, keys: mineRouteKeys, at: pub.at }].sort(byPublished)
+      .slice(0, others.length + 1 - MAX_DEPARTURE_FERRIES)
+    : [];
+  const admitted = !gone.some((g) => g.ship === ship);
 
   let wrote = false;
   const set = (key: string, value: unknown) => {
@@ -457,6 +466,11 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   };
 
   doc.transact(() => {
+    for (const g of gone) {
+      for (const key of g.keys) del(key);
+      for (const key of (g.ship === ship ? mineKeys.map((m) => m.key) : otherCkpts.get(g.ship)) ?? []) del(key);
+    }
+    if (!admitted) return;
     if (takes) set(keepKey, departureRouteToWire(pub));
     // Only the keys this writer saw: a snapshot another rider is writing
     // right now lands beside the kept one, and readers pick between them.
@@ -491,14 +505,6 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
       if (left.length > MAX_CHECKPOINT_KEYS_SCANNED) {
         const keep = new Set(capCheckpoints(left.map(([, e]) => e), MAX_CHECKPOINT_KEYS_SCANNED));
         for (const [key, e] of left) if (!keep.has(e)) del(key);
-      }
-    }
-    // A full room lets the ferry published longest ago go.
-    if (!existing && takes && others.length >= MAX_DEPARTURE_FERRIES) {
-      others.sort(byPublished);
-      for (const gone of others.slice(0, others.length - MAX_DEPARTURE_FERRIES + 1)) {
-        for (const key of gone.keys) del(key);
-        for (const key of otherCkpts.get(gone.ship) ?? []) del(key);
       }
     }
   });

@@ -385,6 +385,32 @@ describe('a publish applied to a stop room', () => {
     expect(keys(doc).some((k) => k.startsWith('ship-00:'))).toBe(false);
   });
 
+  it('a full room keeps its ferries over a new one published longer ago than any of them', () => {
+    const doc = new Y.Doc();
+    const route = running();
+    const s = start(route);
+    for (let i = 0; i < MAX_DEPARTURE_FERRIES; i++) {
+      applyDeparturesPublish(doc, pub(route, [s], T0 + (i + 1) * SEC, { shipRoomId: `ship-${String(i).padStart(2, '0')}` }), T0 + MIN);
+    }
+    const before = keys(doc);
+    // A delayed snapshot of a ferry the room has never held: older than all 16.
+    expect(applyDeparturesPublish(doc, pub(route, [s], T0, { shipRoomId: 'ship-late' }), T0 + MIN).wrote).toBe(false);
+    expect(keys(doc)).toEqual(before);
+    const ships = departureFerriesIn(doc.getMap(DEPARTURES_MAP)).map((f) => f.shipRoomId);
+    expect(ships).toHaveLength(MAX_DEPARTURE_FERRIES);
+    expect(ships).toContain('ship-00');
+    expect(ships).not.toContain('ship-late');
+    // Its stray keys from an earlier stay go with it; a newer one still gets in.
+    const { kind: _k, legSeq: _l, ...startWire } = s;
+    doc.getMap(DEPARTURES_MAP).set(departureCheckpointKey('ship-late', T0, 0, 'start'), startWire);
+    expect(applyDeparturesPublish(doc, pub(route, [s], T0, { shipRoomId: 'ship-late' }), T0 + MIN).wrote).toBe(true);
+    expect(keys(doc)).toEqual(before);
+    expect(applyDeparturesPublish(doc, pub(route, [s], T0 + MIN, { shipRoomId: 'ship-late' }), T0 + MIN).wrote).toBe(true);
+    const after = departureFerriesIn(doc.getMap(DEPARTURES_MAP)).map((f) => f.shipRoomId);
+    expect(after).toContain('ship-late');
+    expect(after).not.toContain('ship-00');
+  });
+
   it('an overfilled room is trimmed in one scan: every evicted ferry’s keys go, the map walked once', () => {
     const doc = new Y.Doc();
     const map = doc.getMap(DEPARTURES_MAP);
