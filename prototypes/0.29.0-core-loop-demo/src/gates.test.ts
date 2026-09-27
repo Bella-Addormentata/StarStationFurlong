@@ -116,6 +116,18 @@ describe('the gate on a dock port', () => {
     expect(readUnnumberedPorts()).toEqual([]);
   });
 
+  it('finds a live gate however many stale policy keys come first', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    for (let i = 0; i < 300; i++) {
+      doc.getMap('doorPolicy').set(`d:stale${String(i).padStart(4, '0')}`, { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    }
+    doc.getMap('doorLayout').set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
+    expect(readDockGates()).toEqual({ 'd:live': 5 });
+    expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
+  });
+
   it('takes the lowest number free in the station', () => {
     expect(nextFreeGate([])).toBe(1);
     expect(nextFreeGate([1, 2, 4])).toBe(3);
@@ -159,19 +171,30 @@ describe('the station atlas', () => {
 });
 
 describe('gate gossip that doors alone would skip', () => {
-  it("adds our gates to a newer doc copy that has none, keeping its doors", () => {
+  it("adds our gates to an equally new doc copy that has none, keeping its doors and size", () => {
     twoRoomStation();
+    // Our own (older) record of room-b also knows an older size.
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS', dims: { cols: 5, rows: 5 },
+      doors: [
+        { doorId: 'west', targetSeed: seed('room-a'), transient: false },
+        { doorId: 'south', targetSeed: seed('ship-1'), transient: true },
+      ],
+      gates: { south: 2, east: 3 },
+    });
     const doc = new Y.Doc();
-    // An older client's copy of room-b: newer than ours, as many doors, no gates.
+    // An older client's copy of room-b: as new as ours, as many doors, no gates.
     const door = { targetRoomId: 'room-a', farDoor: 'east', transient: false };
     doc.getMap('atlas').set('room-b', {
-      roomId: 'room-b', name: 'DOCKS', updatedAt: Date.now() + 1000,
+      roomId: 'room-b', name: 'DOCKS', updatedAt: readAtlas()['room-b']!.lastSeen, dims: { cols: 4, rows: 3 },
       doors: { west: door, south: { targetRoomId: 'ship-1', transient: true } },
     });
     bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
     const b = doc.getMap('atlas').get('room-b') as { gates?: unknown; doors: Record<string, unknown> };
     expect(b.gates).toEqual({ south: 2, east: 3 });
     expect(b.doors.west).toEqual(door);
+    // Its newer size stands too.
+    expect((b as { dims?: unknown }).dims).toEqual({ cols: 4, rows: 3 });
   });
 
   it('carries the gates of a room known without door pairings', () => {

@@ -1306,7 +1306,7 @@ export function pushAtlasToDoc(): void {
         // renders every module it has not personally visited at the fallback
         // size, so the station's shape was only ever right for rooms you had
         // walked through yourself.
-        ...(entry.dims ? { dims: entry.dims } : {}),
+        ...(!onlyGates && entry.dims ? { dims: entry.dims } : {}),
         // ⚓🚦 Gates travel with the layout, so a board or an arriving ship in
         // any room of the station knows every gate.
         ...(entry.gates ? { gates: entry.gates } : {}),

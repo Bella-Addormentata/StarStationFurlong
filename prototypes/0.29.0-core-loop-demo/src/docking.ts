@@ -230,7 +230,8 @@ export type FarDockResult =
         | "occupied"
         | "closed"
         | "gone"
-        /** ⚓🚦 The gate is closed or reserved to this ship (doorPolicy). */
+        /** ⚓🚦 The gate does not admit this ship (doorPolicy): closed,
+         *  reserved for another ship, or open only to granted captains. */
         | "not-allowed"
         /** ⚓🚦 The far door wears no port and every gate number of its
          *  station is taken, so none is fitted. */
