@@ -2309,7 +2309,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'berths-taken'
-      ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, or out of reach). Dock from a door panel when one frees up.`
+      ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, out of reach, or not open to this ship). Dock from a door panel when one frees up, or ask the station's owner for a grant at a gate that admits only granted captains.`
       : outcome.reason === 'occupied'
       ? `Arrived at ${outcome.stationName} — every berth the ship tried is occupied (or not open to this ship). Dock from a door panel when one frees up.`
       : outcome.reason === 'unreachable'

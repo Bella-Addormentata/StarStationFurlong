@@ -356,7 +356,7 @@ export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['re
   occupied: 'That berth is occupied by another module now.',
   closed: 'That berth was closed — its dock port was removed.',
   superseded: 'A newer DOCK of this port already holds that berth.',
-  'not-allowed': 'That gate is not open to this ship — the station has closed or reserved it.',
+  'not-allowed': 'That gate does not admit this ship — the station has closed it, reserved it for another ship, or opened it only to captains granted at its door.',
 };
 
 /** ⚓🚦 Who the far gate admits (doorPolicy gateAccessIn): absent = open. */

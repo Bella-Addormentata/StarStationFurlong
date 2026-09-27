@@ -150,23 +150,25 @@ export function arrivalBerths(input: {
   shipRoomId?: string;
 }): StationBerth[] {
   const { station } = input;
-  const remembered = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
   // ⚓🚦 The station decides who may dock where: a closed gate, or one
   // reserved for another ship, is never asked (its far end would refuse).
   // Gates open to the owner's granted captains cannot be checked from here,
-  // so they are tried after the open ones.
+  // so they are tried after every open one, taken-looking ones included.
   const ours = (b: StationBerth) => b.access === 'reserved' && !!input.shipRoomId && b.reservedFor === input.shipRoomId;
-  const gates = (station.berths ?? []).filter((b) => isRoomSeed(b.address)
-    && b.access !== 'closed' && (b.access !== 'reserved' || ours(b)));
+  const barred = (b: StationBerth) => b.access === 'closed' || (b.access === 'reserved' && !ours(b));
+  const gates = (station.berths ?? []).filter((b) => isRoomSeed(b.address) && !barred(b));
   const asked = (b: StationBerth) => input.gate !== undefined && b.gate === input.gate;
   const rank = (b: StationBerth): number =>
-    asked(b) ? 0 : ours(b) ? 1 : b.access === 'pass' ? (b.occupied ? 5 : 3) : b.occupied ? 4 : 2;
+    asked(b) ? 0 : ours(b) ? 1 : (b.access === 'pass' ? 4 : 2) + (b.occupied ? 1 : 0);
+  const same = (a: StationBerth, b: StationBerth) =>
+    sameRoom(a.address, b.address) && (a.farDoor ?? '') === (b.farDoor ?? '');
+  // The ship's memory of a gate the station now bars is not asked either.
+  const recalled = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
+  const remembered = recalled && !(station.berths ?? []).some((b) => barred(b) && same(b, recalled)) ? recalled : null;
   const listed: StationBerth[] = (station.berths ?? []).length > 0
     ? gates.map((b, i) => ({ b, i })).sort((x, y) => rank(x.b) - rank(y.b) || x.i - y.i).map((x) => x.b)
     : station.berth && isRoomSeed(station.berth.address) ? [station.berth] : [];
   const out: StationBerth[] = [];
-  const same = (a: StationBerth, b: StationBerth) =>
-    sameRoom(a.address, b.address) && (a.farDoor ?? '') === (b.farDoor ?? '');
   const add = (b: StationBerth) => { if (!out.some((o) => same(o, b))) out.push(b); };
   const memoryFirst = remembered && (listed.length === 0
     || (listed.length === 1 && !listed[0].farDoor && sameRoom(listed[0].address, remembered.address)));

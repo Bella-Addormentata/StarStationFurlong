@@ -2038,8 +2038,9 @@ export class DoorDockingPortSystem {
       else if (el.dataset.dockAction === "dock") void this.redockPort(doorId);
       else if (el.dataset.dockAction === "gate-down" || el.dataset.dockAction === "gate-up") {
         // ⚓🚦 The owner renumbers a gate by hand (a duplicate is flagged in
-        // the row, never fixed behind their back).
-        if (!this.canConstruct(doorId)) return;
+        // the row, never fixed behind their back). Owner only: a public
+        // build door or a granted builder may fit ports, not renumber gates.
+        if (!this.isRoomOwner()) return;
         const policy = readDoorPolicy(doorId);
         if (!policy.adapter) return;
         // A port fitted before gates existed gets the lowest free number first.
@@ -2051,8 +2052,8 @@ export class DoorDockingPortSystem {
       } else if (el.dataset.dockAction === "gate-access") {
         // ⚓🚦 The owner decides who may dock here: OPEN → PASS (captains
         // granted at this door) → RESERVED (the ship docked here now, when
-        // there is one) → CLOSED → OPEN.
-        if (!this.canConstruct(doorId)) return;
+        // there is one) → CLOSED → OPEN. Owner only, like renumbering.
+        if (!this.isRoomOwner()) return;
         const policy = readDoorPolicy(doorId);
         if (!policy.adapter) return;
         const port = classifyDockPort(readDoor(doorId));
@@ -3214,13 +3215,14 @@ export class DoorDockingPortSystem {
         : policyNow.gateAccess === "pass" ? "GRANTED CAPTAINS"
           : policyNow.gateAccess === "reserved" ? `RESERVED · ${esc(this.partnerLabel(policyNow.reservedFor ?? ""))}`
             : "OPEN";
-    const accessBtn = may
+    const owner = this.isRoomOwner();
+    const accessBtn = owner
       ? `<button type="button" data-dock-action="gate-access" title="Who may dock at this gate: open to all, captains you granted at this door, reserved for the ship docked here now, or closed" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${accessLabel}</button>`
       : `<span>${accessLabel}</span>`;
     const gateLine = readDoorPolicy(doorId).adapter
       ? `<div style="display:flex; align-items:center; gap:6px; font-size:9.5px; color:#f2efe6; flex-wrap:wrap;">
           <span>🚦 GATE <b>${gate ?? "—"}</b></span>
-          ${may ? gateBtn("down", "−") + gateBtn("up", "+") : ""}
+          ${owner ? gateBtn("down", "−") + gateBtn("up", "+") : ""}
           <span style="color:rgba(242,239,230,0.6);">DOCKING:</span> ${accessBtn}
           ${clash ? `<span style="color:#ffb300;">⚠ another port in this station is also gate ${gate}</span>` : ""}
         </div>`

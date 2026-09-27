@@ -160,6 +160,34 @@ describe('the station record', () => {
     expect(list.find((s) => s.id === 'far')?.berths).toEqual([{ roomId: 'room-far', doorId: 'east', gate: 5 }]);
     expect(list.find((s) => s.id === 'old')?.berths).toEqual([{ roomId: 'room-old', doorId: 'north' }]);
   });
+
+  it('drops learned gates once this atlas knows the room has none, and keeps "none" as news', () => {
+    registerStation({
+      id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'east',
+      berths: [{ roomId: 'room-far', doorId: 'east', gate: 5 }],
+    });
+    // The last port was removed: this client's harvest shows no gates.
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: {} });
+    const far = listStations().find((s) => s.id === 'far')!;
+    expect(far.berths).toEqual([]);
+    // The empty list is published, stamped, and wins over the older one.
+    const out = summaryForStation(far, null, 5_000);
+    expect(out.berths).toEqual([]);
+    expect(out.berthsAt).toBe(5_000);
+    const known: StationSummary = {
+      welcomeRoomId: 'room-far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, updatedAt: 1_000,
+      berths: [{ roomId: 'room-far', doorId: 'east', gate: 5 }], berthsAt: 1_000,
+    };
+    expect(mergeStation(known, out)?.berths).toEqual([]);
+  });
+
+  it('lists every gate up to the highest number', () => {
+    const gates: Record<string, number> = {};
+    for (let i = 1; i <= 20; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
+    harvestIntoAtlas({ roomId: 'room-big', name: 'BIG', doors: [], gates });
+    registerStation({ id: 'big', name: 'BIG', planetId: 'planet-sovereign', orbitSlot: 6, welcomeRoomId: 'room-big' });
+    expect(listStations().find((s) => s.id === 'big')?.berths).toHaveLength(20);
+  });
 });
 
 describe('the per-planet summary', () => {
@@ -292,5 +320,25 @@ describe('who may dock at a gate', () => {
     // never a closed gate or another ship's.
     expect(order('ship-1')).toEqual([4, 3, 2]);
     expect(order('ship-3')).toEqual([3, 2]);
+  });
+
+  it('asks granted-captain gates after every open one, taken-looking ones too', () => {
+    const g = (n: number, extra: object = {}) => ({ address: seed('room-a'), farDoor: `d:0000000${n}`, gate: n, ...extra });
+    const order = arrivalBerths({
+      station: { berths: [g(1, { access: 'pass' }), g(2, { occupied: true }), g(3, { access: 'pass', occupied: true }), g(4)] },
+      remembered: null,
+    }).map((b) => b.gate);
+    expect(order).toEqual([4, 2, 1, 3]);
+  });
+
+  it('does not ask a remembered berth the station now closes or reserves for another ship', () => {
+    const g = (n: number, extra: object = {}) => ({ address: seed('room-a'), farDoor: `d:0000000${n}`, gate: n, ...extra });
+    const remembered = { address: seed('room-a'), farDoor: 'd:00000001' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    const ask = (access: object) => arrivalBerths({
+      station: { berths: [g(1, access), g(2)] }, remembered, shipRoomId: 'ship-1',
+    }).map((b) => b.farDoor);
+    expect(ask({ access: 'closed' })).toEqual(['d:00000002']);
+    expect(ask({ access: 'reserved', reservedFor: 'ship-2' })).toEqual(['d:00000002']);
+    expect(ask({ access: 'reserved', reservedFor: 'ship-1' })).toEqual(['d:00000001', 'd:00000002']);
   });
 });

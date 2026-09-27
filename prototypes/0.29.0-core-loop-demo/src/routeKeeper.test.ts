@@ -497,7 +497,7 @@ describe('the gate list', () => {
 
   it('tries the stop\'s own berth first, then the station\'s gates in arrival order', () => {
     const list = keeperBerths({ stop: anyStop, own, station, shipRoomId: 'ship-1' });
-    expect(list.map((b) => b.gate)).toEqual([1, 5, 3, 2]);
+    expect(list.map((b) => b.gate)).toEqual([1, 5, 2, 3]);
   });
 
   it('tries only the stop\'s own gate when the stop pins it', () => {
@@ -506,7 +506,7 @@ describe('the gate list', () => {
   });
 
   it('asks the station\'s gates alone when this game holds no pass for the stop\'s room', () => {
-    expect(keeperBerths({ stop: anyStop, own: null, station, shipRoomId: 'ship-1' }).map((b) => b.gate)).toEqual([1, 5, 3, 2]);
+    expect(keeperBerths({ stop: anyStop, own: null, station, shipRoomId: 'ship-1' }).map((b) => b.gate)).toEqual([1, 5, 2, 3]);
     expect(keeperBerths({ stop: pinnedStop, own: null, station, shipRoomId: 'ship-1' })).toEqual([]);
   });
 
