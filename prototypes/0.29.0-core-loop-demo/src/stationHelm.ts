@@ -31,7 +31,7 @@ import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
 import { realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
-import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawFloor, readFuelLevel, subscribeShip } from './shipDoc';
+import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFuelLevel, subscribeShip } from './shipDoc';
 import type { StationRecord } from './stations';
 import {
   MAX_TRIM_KM,
@@ -295,7 +295,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
-      meter: fuelDrawFloor(),
+      deficit: fuelDrawDeficit(),
       now: Date.now(),
       tanks,
       capacity,
