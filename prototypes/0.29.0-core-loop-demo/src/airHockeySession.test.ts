@@ -290,3 +290,49 @@ describe('a page whose frames stalled mid-match (#116 review)', () => {
     expect(input.vz).toBe(0);
   });
 });
+
+describe('a goal and a forfeit falling due in the same frame (#116 review)', () => {
+  const T = 1_800_000_000_000;
+  const served = T + AH_SERVE_DELAY_MS;
+
+  /** Side a operates a versus match at `scoreA`–0; side b has been silent past
+   *  the forfeit timeout, and the puck is about to cross b's goal line. */
+  function goalAndForfeitDue(scoreA: number): void {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T);
+    joinRoom();
+    registerAirHockeyVisual(TABLE, handle(), POSE);
+    const me = getPlayerId();
+    let s = claimSide(initialAirHockeyState(), 'a', me, airHockeySeat())!;
+    s = claimSide(s, 'b', 'peer-b', 'seat-b')!;
+    s = setReady(setReady(s, 'a', me)!, 'b', 'peer-b')!;
+    writeGame(TABLE, { ...startIfReady(s, T)!, score: { a: scoreA, b: 0 } });
+    const st = sessions.get(TABLE)!;
+    st.engaged = { side: 'a', x: 0, z: -0.9, vx: 0, vz: 0, prevX: 0, prevZ: -0.9, down: false, locked: false };
+    airHockeyFrame(0.016);
+    vi.setSystemTime(served);
+    airHockeyFrame(0.016);
+    (st as unknown as { lastMalletAt: { a: number; b: number } }).lastMalletAt.b = served - 10_500;
+    st.puck = { x: 0, z: 1.3, vx: 0, vz: 3 };
+    st.puckActive = true;
+    vi.setSystemTime(served + 16);
+  }
+
+  it('keep the goal: the walkover is written on top of it', () => {
+    goalAndForfeitDue(2);
+    airHockeyFrame(0.05);
+    const s = readAirHockey(TABLE)!;
+    expect(s.status).toBe('ended');
+    expect(s.winner).toBe('a');
+    expect(s.score).toEqual({ a: 3, b: 0 });
+  });
+
+  it('leave a match the goal won as the goal left it', () => {
+    goalAndForfeitDue(6);
+    airHockeyFrame(0.05);
+    const s = readAirHockey(TABLE)!;
+    expect(s.status).toBe('ended');
+    expect(s.winner).toBe('a');
+    expect(s.score).toEqual({ a: 7, b: 0 });
+  });
+});

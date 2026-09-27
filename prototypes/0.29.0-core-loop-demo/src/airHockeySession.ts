@@ -673,7 +673,11 @@ export function airHockeyFrame(dt: number): void {
     if (iAmClaimant && input && s && s.status === 'playing' && isVersus(s)) {
       const opp = otherSide(input.side);
       if (now - st.lastMalletAt[opp] > FORFEIT_MS) {
-        const ns = withForfeit(s, input.side);
+        // The simulation above may have written a goal this frame, even the
+        // match's last: walk over from the table as it stands now, never
+        // from the state this frame began with.
+        const current = readAirHockey(itemId);
+        const ns = current ? withForfeit(current, input.side) : null;
         if (ns) writeGame(itemId, ns);
       }
     }
