@@ -14,9 +14,12 @@ import * as Y from 'yjs';
 vi.stubGlobal('window', { location: { search: '' } });
 
 const { bindCasinoDoc } = await import('./casinoDoc');
-const { bindGamesDoc } = await import('./games/gamesDoc');
+const { bindGamesDoc, writeGame } = await import('./games/gamesDoc');
+const { getPlayerId } = await import('./identity');
 const { airHockeyFrame, closeAirHockeyTable, registerAirHockeyVisual, routeAirHockeyTick } = await import('./airHockeySession');
-const { malletToTick } = await import('./games/airHockey');
+const {
+  AH_GOAL_PAUSE_MS, AH_SERVE_DELAY_MS, claimSide, initialAirHockeyState, malletToTick, startPractice,
+} = await import('./games/airHockey');
 
 type Session = {
   handle: unknown;
@@ -26,6 +29,8 @@ type Session = {
   wasOperator: boolean;
   malletSeq: number;
   puckSeq: number;
+  puckActive: boolean;
+  engaged: unknown;
 };
 const sessions = (window as unknown as { __ssfAirHockey: { sessions: Map<string, Session> } })
   .__ssfAirHockey.sessions;
@@ -63,7 +68,10 @@ function expectFresh(st: Session | undefined, h: unknown): void {
   expect(st!.puckSeq).toBe(0);
 }
 
-afterEach(() => closeAirHockeyTable(TABLE));
+afterEach(() => {
+  closeAirHockeyTable(TABLE);
+  vi.useRealTimers();
+});
 
 describe('air-hockey sessions across a room change', () => {
   it('keep their match state when the table is rebuilt in the same room', () => {
@@ -109,5 +117,48 @@ describe('air-hockey sessions across a room change', () => {
     routeAirHockeyTick('peer', malletToTick({ x: 0.1, z: -0.4, down: true, seq: 3 }));
     airHockeyFrame(0.016);
     expect(sessions.get(TABLE)!.remoteMallet.a?.seq).toBe(3);
+  });
+});
+
+describe('air-hockey serves', () => {
+  const T = 1_800_000_000_000;
+  const longestWait = Math.max(AH_SERVE_DELAY_MS, AH_GOAL_PAUSE_MS);
+
+  /** This page plays side a of a solo practice whose serve deadline a peer's
+   *  clock wrote, `aheadMs` ahead of this page's. */
+  function practiceScheduledAhead(aheadMs: number): Session {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T);
+    joinRoom();
+    registerAirHockeyVisual(TABLE, handle(), POSE);
+    const me = getPlayerId();
+    const claimed = claimSide(initialAirHockeyState(), 'a', me)!;
+    writeGame(TABLE, startPractice(claimed, 'a', me, T + aheadMs)!);
+    const st = sessions.get(TABLE)!;
+    st.engaged = { side: 'a', x: 0, z: -0.9, vx: 0, vz: 0, prevX: 0, prevZ: -0.9, down: false, locked: false };
+    return st;
+  }
+
+  it("fall due on this page's clock, at most the longest serve wait after it first sees them scheduled", () => {
+    const st = practiceScheduledAhead(5 * 60_000); // a peer clock five minutes ahead
+    airHockeyFrame(0.016); // first sight of the schedule
+    expect(st.puckActive).toBe(false);
+    vi.setSystemTime(T + longestWait - 1);
+    airHockeyFrame(0.016);
+    expect(st.puckActive).toBe(false);
+    vi.setSystemTime(T + longestWait);
+    airHockeyFrame(0.016);
+    expect(st.puckActive).toBe(true);
+  });
+
+  it('keep a deadline that falls due sooner', () => {
+    const st = practiceScheduledAhead(0); // written on this page's clock
+    airHockeyFrame(0.016);
+    vi.setSystemTime(T + AH_SERVE_DELAY_MS - 1);
+    airHockeyFrame(0.016);
+    expect(st.puckActive).toBe(false);
+    vi.setSystemTime(T + AH_SERVE_DELAY_MS);
+    airHockeyFrame(0.016);
+    expect(st.puckActive).toBe(true);
   });
 });

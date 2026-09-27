@@ -36,7 +36,7 @@
  */
 
 import {
-  AH_GOALS_TO_WIN, AH_HALF_L, AH_HALF_W, AH_PUCK_R,
+  AH_GOAL_PAUSE_MS, AH_GOALS_TO_WIN, AH_HALF_L, AH_HALF_W, AH_PUCK_R,
   AH_SERVE_DELAY_MS, AH_STUCK_SPEED, AH_STUCK_TIMEOUT_MS,
   claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
   malletFromTick, malletToTick, puckFromTick, puckToTick,
@@ -85,6 +85,10 @@ const PUCK_DISPLAY_RATE = 18;
 const MALLET_DISPLAY_RATE = 22;
 /** Furthest ahead a remote puck is dead-reckoned (covers one dropped tick). */
 const PUCK_EXTRAPOLATE_MAX_S = 0.25;
+/** The furthest ahead any write schedules a serve (a start's delay or a goal's
+ *  pause): a serve falls due no later than this after this page first sees it
+ *  scheduled, whatever clock wrote its deadline (servesAt). */
+const MAX_SERVE_WAIT_MS = Math.max(AH_SERVE_DELAY_MS, AH_GOAL_PAUSE_MS);
 
 // ── Per-table runtime state ──────────────────────────────────────────────────
 
@@ -170,6 +174,9 @@ interface TableSession {
   prevScore: { a: number; b: number; startedAt: number } | null;
   /** startedAt last seen — a change is a fresh match: reset grace clocks. */
   seenStartedAt: number | null;
+  /** The doc's scheduled serve (`serveAt`) as this page last saw it, and when
+   *  it first did (servesAt). */
+  serveSeen: { serveAt: number; at: number } | null;
   malletSendAccum: number;
   malletSeq: number;
   puckSendAccum: number;
@@ -235,6 +242,7 @@ function freshSession(handle: AirHockeyVisualHandle, pose: TablePose): TableSess
     slowSince: null,
     prevScore: null,
     seenStartedAt: null,
+    serveSeen: null,
     malletSendAccum: 0,
     malletSeq: 0,
     puckSendAccum: 0,
@@ -413,6 +421,24 @@ function sendPuckTick(st: TableSession, x: number, z: number, vx: number, vz: nu
   })));
 }
 
+/**
+ * When the doc's scheduled serve falls due on THIS page's clock (0 = none).
+ * `serveAt` is a deadline on its writer's wall clock, and devices' clocks
+ * aren't synchronised: one written by a clock minutes ahead would hold the
+ * puck for minutes, on the operator and on every scoreboard. So a serve falls
+ * due no later than MAX_SERVE_WAIT_MS after this page first saw it scheduled,
+ * whatever deadline it names. (One written by a clock running behind falls
+ * due early, down to at once: a shorter countdown, never a stall.)
+ */
+function servesAt(st: TableSession, s: AirHockeyState, now: number): number {
+  if (s.serveAt <= 0) {
+    st.serveSeen = null;
+    return 0;
+  }
+  if (st.serveSeen?.serveAt !== s.serveAt) st.serveSeen = { serveAt: s.serveAt, at: now };
+  return Math.min(s.serveAt, st.serveSeen.at + MAX_SERVE_WAIT_MS);
+}
+
 // ── Operator election ────────────────────────────────────────────────────────
 
 /** One sim at a time: side a's engaged claimant by default; side b's covers
@@ -453,6 +479,7 @@ export function airHockeyFrame(dt: number): void {
     }
 
     const s = readAirHockey(itemId);
+    const serveDue = s ? servesAt(st, s, now) : 0;
 
     // Fresh match (or table cleared): reset grace clocks + transient physics
     // so takeover/forfeit never fire off pre-match silence, and a stale
@@ -517,10 +544,10 @@ export function airHockeyFrame(dt: number): void {
         st.slowSince = null;
       }
 
-      // Serve: place the puck once the doc's serve time arrives. serveAt is
-      // stamped by startIfReady/startPractice/withGoal (and the stuck
-      // re-serve), so during play it is always > 0.
-      if (!st.puckActive && s.serveAt > 0 && now >= s.serveAt) {
+      // Serve: place the puck once the doc's serve falls due on this page's
+      // clock (servesAt). serveAt is stamped by startIfReady/startPractice/
+      // withGoal (and the stuck re-serve), so during play it is always > 0.
+      if (!st.puckActive && serveDue > 0 && now >= serveDue) {
         const sp = servePosition(s);
         st.puck = { x: sp.x, z: sp.z, vx: 0, vz: 0 };
         st.puckActive = true;
@@ -657,7 +684,7 @@ export function airHockeyFrame(dt: number): void {
 
     // ── Visuals: scoreboard + goal lamps (doc-driven — identical on every
     // client, operator or spectator; setScore dedupes internally). ──
-    st.handle.setScore(s?.score.a ?? 0, s?.score.b ?? 0, scoreboardLine(s, now));
+    st.handle.setScore(s?.score.a ?? 0, s?.score.b ?? 0, scoreboardLine(s, now, serveDue));
     if (s && st.prevScore && s.startedAt === st.prevScore.startedAt) {
       // withGoal increments the SCORER; the lamp lights at the scored-on end.
       if (s.score.a > st.prevScore.a) st.handle.flashGoal('b');
@@ -670,7 +697,7 @@ export function airHockeyFrame(dt: number): void {
 }
 
 /** Pole-scoreboard status line (≤26 chars — the painter slices anyway). */
-function scoreboardLine(s: AirHockeyState | null, now: number): string {
+function scoreboardLine(s: AirHockeyState | null, now: number, serveDue: number): string {
   if (!s || (s.status === 'waiting' && !s.players.a && !s.players.b)) {
     return 'STAND AT AN END TO PLAY';
   }
@@ -682,7 +709,7 @@ function scoreboardLine(s: AirHockeyState | null, now: number): string {
     const byForfeit = Math.max(s.score.a, s.score.b) < AH_GOALS_TO_WIN;
     return byForfeit ? `${w} WINS BY FORFEIT` : `${w} WINS`;
   }
-  if (s.serveAt > now) return `SERVE IN ${Math.ceil((s.serveAt - now) / 1000)}`;
+  if (serveDue > now) return `SERVE IN ${Math.ceil((serveDue - now) / 1000)}`;
   return isVersus(s) ? `FIRST TO ${AH_GOALS_TO_WIN}` : 'PRACTICE';
 }
 
@@ -719,8 +746,18 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   let lastTopHtml = '';
   let lastCardHtml = '';
 
-  const st = (): TableSession | null => sessionFor(deps.itemId);
-  const state = (): AirHockeyState | null => readAirHockey(deps.itemId);
+  /** The room doc this panel opened in (casinoDocEpoch at mount). Device focus
+   *  can outlive a room change, and the next room may hold a table with this
+   *  id: once the bound doc changes, the panel reads and writes nothing. */
+  let mountEpoch = -1;
+  const live = (): boolean => mountEpoch === casinoDocEpoch();
+  const st = (): TableSession | null => (live() ? sessionFor(deps.itemId) : null);
+  const state = (): AirHockeyState | null => (live() ? readAirHockey(deps.itemId) : null);
+  /** When this panel's table serves next, on this page's clock (servesAt). */
+  const serveDue = (s: AirHockeyState, now: number): number => {
+    const session = st();
+    return session ? servesAt(session, s, now) : s.serveAt;
+  };
 
   /** May I drive the mallet right now? Claimed my end, game not over. */
   const canDrive = (): boolean => {
@@ -734,6 +771,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   // ── Doc transitions (read → pure engine → transacted write) ────────────────
 
   const doClaim = (): void => {
+    if (!live()) return;
     // First claim may land on an untouched table — seed the initial state.
     const ns = claimSide(state() ?? initialAirHockeyState(), side, myId);
     if (ns) writeGame(deps.itemId, ns);
@@ -891,7 +929,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     else if (s.status === 'ended') {
       const w = s.winner === 'a' ? 'CYAN' : 'ORANGE';
       status = `${w} WINS${Math.max(s.score.a, s.score.b) < AH_GOALS_TO_WIN ? ' BY FORFEIT' : ''}`;
-    } else if (s.serveAt > now) status = `SERVE IN ${Math.ceil((s.serveAt - now) / 1000)}…`;
+    } else if (serveDue(s, now) > now) status = `SERVE IN ${Math.ceil((serveDue(s, now) - now) / 1000)}…`;
     else status = isVersus(s) ? `FIRST TO ${AH_GOALS_TO_WIN}` : 'PRACTICE — SHOOT AT EITHER GOAL';
     const down = st()?.engaged?.down === true;
     const html = `
@@ -910,6 +948,16 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const renderCard = (): void => {
     if (!card || !prompt) return;
+    if (!live()) {
+      prompt.style.display = 'none';
+      card.style.display = 'flex';
+      const html = `<div style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">THIS TABLE WAS IN THE ROOM YOU LEFT — STEP BACK</div>`;
+      if (html !== lastCardHtml) {
+        lastCardHtml = html;
+        card.innerHTML = html;
+      }
+      return;
+    }
     const s = state();
 
     // Centre prompt: visible whenever I could be driving but the mouse is free.
@@ -980,7 +1028,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   const onCardClick = (e: MouseEvent): void => {
     e.stopPropagation();
     const target = (e.target as HTMLElement).closest('button');
-    if (!target || target.disabled) return;
+    if (!target || target.disabled || !live()) return;
     switch (target.id) {
       case 'ah-claim': doClaim(); break;
       case 'ah-ready': doReady(); break;
@@ -1003,6 +1051,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   return {
     mount(host: HTMLElement): void {
+      mountEpoch = casinoDocEpoch();
       panel = document.createElement('div');
       panel.id = 'device-airhockey-pane';
       // Full-viewport transparent shell — the 3D table IS the game surface;
