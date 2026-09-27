@@ -160,6 +160,13 @@ describe('guards', () => {
     expect(registerLearnedStations(SOV, [s])).toBe(0);
   });
 
+  it("drops a learned station's extra field once the summary no longer carries it", () => {
+    const move = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    registerLearnedStations(SOV, [summary({ ext: { move } })]);
+    expect(registerLearnedStations(SOV, [summary()])).toBe(1);
+    expect(readStationRecords().find((r) => r.welcomeRoomId === 'room-hab')).not.toHaveProperty('move');
+  });
+
   it('checks ship summaries', () => {
     const ship = { roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'in-flight', fromRoom: 'a', toRoom: 'b', departedAt: T0, etaAt: T0 + 60_000, updatedAt: T0 };
     expect(cleanShipSummary(ship, T0)).toEqual(ship);
@@ -318,6 +325,21 @@ describe('sharing through the room doc', () => {
     sync(peer, doc);
     const hab = listStations().find((s) => s.id === 'hab')!;
     expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm - 6, 6);
+  });
+
+  it('writes the winner back when a peer\'s value loses the merge', () => {
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null));
+    // The first published (unowned) record stands here…
+    const peer1 = new Y.Doc();
+    peer1.getMap('stationSummaries').set('room-hab', summary({ orbitSlot: 2, updatedAt: T0 }));
+    sync(peer1, doc);
+    // …and a later first publish from an install that was offline reaches the map.
+    const peer2 = new Y.Doc();
+    peer2.getMap('stationSummaries').set('room-hab', summary({ orbitSlot: 1, updatedAt: T0 + 50 }));
+    sync(peer2, doc);
+    expect(readStore().stations['room-hab']?.orbitSlot).toBe(2);
+    expect((doc.getMap('stationSummaries').get('room-hab') as StationSummary).orbitSlot).toBe(2);
   });
 
   it('ignores junk a peer writes into the maps', () => {

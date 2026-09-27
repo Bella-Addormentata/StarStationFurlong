@@ -444,7 +444,10 @@ export function registerLearnedStations(
     const had = saved.get(rec.id) as (StationRecord & Record<string, unknown>) | undefined;
     // The install's own record under a learned-looking id is never replaced.
     if (had && !isLearnedRecord(had)) continue;
-    const sameExt = Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
+    // Both ways: a field the summary no longer carries must go too.
+    const hadExt = Object.keys(had ?? {}).filter((k) => !KNOWN_FIELDS.has(k));
+    const sameExt = hadExt.length === Object.keys(s.ext ?? {}).length
+      && Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
     if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
       && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor) continue;
@@ -510,12 +513,17 @@ export function pullPlanetSummary(now = Date.now()): void {
   const store = readStore(now);
   let changed = false;
   let scanned = 0;
+  // Entries whose visible value lost to what this install holds: written
+  // back below, so the map shows the same winner every install keeps.
+  const staleStations = new Map<string, StationSummary>();
+  const staleShips = new Map<string, ShipSummary>();
   for (const [k, v] of stationMap!.entries()) {
     if (++scanned > MAX_STATIONS * 4) break;
     const s = cleanStationSummary(v, now);
     if (!s || s.welcomeRoomId !== k) continue;
     const next = mergeStation(store.stations[k], s);
     if (next) { store.stations[k] = next; changed = true; }
+    if (JSON.stringify(store.stations[k]) !== JSON.stringify(s)) staleStations.set(k, s);
   }
   scanned = 0;
   for (const [k, v] of shipMap!.entries()) {
@@ -524,12 +532,30 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (!s || s.roomId !== k || now - s.updatedAt > SHIP_STALE_MS) continue;
     const next = mergeShip(store.ships[k], s);
     if (next) { store.ships[k] = next; changed = true; }
+    if (JSON.stringify(store.ships[k]) !== JSON.stringify(s)) staleShips.set(k, s);
+  }
+  const pins = firstHandKeys();
+  if (changed) {
+    store.stations = capped(store.stations, MAX_STATIONS, pins.stations);
+    store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
+    writeStore(store);
+  }
+  if (staleStations.size > 0 || staleShips.size > 0) {
+    // A local write: the observer skips it, so this never loops.
+    doc!.transact(() => {
+      for (const [k, s] of staleStations) {
+        const won = store.stations[k];
+        const next = won && mergeStation(s, won);
+        if (next) stationMap!.set(k, next);
+      }
+      for (const [k, s] of staleShips) {
+        const won = store.ships[k];
+        const next = won && mergeShip(s, won);
+        if (next) shipMap!.set(k, next);
+      }
+    });
   }
   if (!changed) return;
-  const pins = firstHandKeys();
-  store.stations = capped(store.stations, MAX_STATIONS, pins.stations);
-  store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
-  writeStore(store);
   applyLearned(store);
   notify();
 }
