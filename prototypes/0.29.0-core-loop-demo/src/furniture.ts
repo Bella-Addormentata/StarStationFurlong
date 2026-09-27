@@ -70,7 +70,8 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { isBoltedIntoStation, isBurning, readOrbitTrim, subscribeStationKeeping } from "./stationKeeping";
+import { isBoltedIntoStation, isBurning, readOrbitTrim, subscribeStationKeeping, trimFor } from "./stationKeeping";
+import { currentStation } from "./stations";
 import type { OrbitTrim } from "./stationKeeping";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
@@ -3982,8 +3983,10 @@ function buildHelmSticks(
     fighter.visible = !bolted;
     trimStick.visible = bolted;
   };
+  // Only a trim that applies to the station this install places the room in
+  // (stationKeeping.trimFor) — the one the dashboard shows and burns from.
   const readTrim = () => {
-    trim = readOrbitTrim();
+    trim = trimFor(currentStation(), readOrbitTrim());
   };
   applyFace();
   readTrim();
@@ -4013,7 +4016,10 @@ function buildHelmSticks(
   const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(0x1c262e, 1, 0), 0, 0.01, 0);
   carrier.visible = false;
   carrier.userData.propAnim = anim;
-  carrier.userData.disposeHelmFace = subscribeDoors(applyFace);
+  carrier.userData.disposeHelmFace = subscribeDoors(() => {
+    applyFace();
+    readTrim(); // the doors can move the room to another station
+  });
   carrier.userData.disposeHelmTrim = subscribeStationKeeping(readTrim);
 }
 

@@ -118,7 +118,7 @@ import { completeArrival } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
-import { bindStationKeepingDoc } from "./stationKeeping";
+import { bindStationKeepingDoc, isBoltedIntoStation } from "./stationKeeping";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1730,9 +1730,15 @@ async function joinRoomAtEpoch(
     // A ship is its own atlas station (docks are not station structure), so
     // the room it stands in resolves through its live dock: the backdrop
     // planet, the holotable and every stationForRoom caller then see the
-    // station it is docked at. Station rooms keep the atlas answer.
+    // station it is docked at. Station rooms keep the atlas answer — and a
+    // module bolted into a station by a gangway is a station room even when
+    // it carries engines, tanks and a helm (station keeping): its first
+    // paired door may be a visiting ship's dock, which would name the
+    // visitor's station.
     setRoomStationResolver((roomId) =>
-      roomId === activeBootstrap?.roomId && isShipReady()
+      roomId === activeBootstrap?.roomId &&
+      isShipReady() &&
+      !isBoltedIntoStation(readAllDoors().values())
         ? shipStationHere(roomId)
         : null,
     );

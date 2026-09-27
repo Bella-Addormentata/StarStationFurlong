@@ -474,6 +474,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       const dir = ARROW_KEYS[e.key];
       if (!dir) return;
       e.preventDefault();
+      // One press, one burn: a held key's auto-repeat is not a new press
+      // (it would fire again the moment the last burn ends).
+      if (e.repeat) return;
       fire(dir);
     });
     well.addEventListener('pointerdown', (e) => {
