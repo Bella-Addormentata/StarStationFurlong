@@ -178,4 +178,21 @@ describe('atlasForBundle', () => {
     expect(Object.keys(atlasForBundle(atlas, 'elsewhere')).sort()).toEqual(['elsewhere', 'elsewhere-2']);
     expect(atlasForBundle(atlas, 'nowhere')).toEqual({});
   });
+
+  it('leaves out a visiting ship and the berth it docked at', () => {
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: {
+        roomId: 'welcome', name: 'W', lastSeen: now,
+        doors: {
+          'd:1': door('hub', 'd:2'),
+          'd:dock': { targetSeed: '', targetRoomId: 'ship', transient: true },
+        },
+      },
+      hub: { roomId: 'hub', name: 'H', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+      ship: { roomId: 'ship', name: 'SHIP', doors: { 'd:dock': { targetSeed: '', targetRoomId: 'welcome', transient: true } }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['hub', 'welcome']);
+    expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
+  });
 });

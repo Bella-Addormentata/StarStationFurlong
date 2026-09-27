@@ -57,6 +57,12 @@ export interface AtlasDoor {
    *  room's snapshot, which was only ever right by coincidence. */
   wall?: DoorWall;
   lateral?: number;
+  /** ⚓ A TRANSIENT berth (doorsDoc `transient`, #67 D2): a visiting ship's
+   *  DOCK, not station structure. The exterior still draws the docked ship,
+   *  but station grouping (atlasComponents) skips the edge — the station-side
+   *  record can outlive the ship's departure (the dock never sees it leave),
+   *  and a ship must not join, or bridge, the stations it calls at. */
+  transient?: true;
 }
 
 export interface AtlasEntry {
@@ -240,7 +246,7 @@ export function harvestIntoAtlas(entry: {
   doors: Array<{
     doorId: string; targetSeed: string; segments?: ConnectorSegment[];
     farDoor?: string; farWall?: DoorWall; farLateral?: number; farYawDeg?: 0 | 45;
-    wall?: DoorWall; lateral?: number;
+    wall?: DoorWall; lateral?: number; transient?: boolean;
   }>;
 }): void {
   if (!entry.roomId) return;
@@ -258,6 +264,7 @@ export function harvestIntoAtlas(entry: {
       farYawDeg: d.farYawDeg,
       wall: d.wall,
       lateral: d.lateral,
+      ...(d.transient === true ? { transient: true as const } : {}),
     };
   }
   atlas[entry.roomId] = {
@@ -404,12 +411,16 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
 
 // ── 🪐 Connected components — what a STATION is ──────────────────────────────
 //
-// No station record is stored anywhere: a station is the set of rooms joined
-// by door pairings. These walks are the one definition of that set, shared by
-// the default-station export (defaultStation.atlasForBundle) and the station
-// registry (stations.ts). Edges are walked both ways — a pairing recorded on
+// Which rooms make up a station is never stored: a station is the set of
+// rooms joined by door pairings. These walks are the one definition of that
+// set, shared by the default-station export (defaultStation.atlasForBundle)
+// and the station registry (stations.ts), whose records — name, planet,
+// orbit — sit on top of these components. Edges are walked both ways — a pairing recorded on
 // either side joins the two rooms — and a door may name a room the atlas holds
 // no entry for (a neighbour we only heard about); that room still belongs.
+// TRANSIENT berths are not structure and join nothing: a visiting ship is not
+// part of the station it docks at, and a stale berth left on the station side
+// after the ship casts off can never bridge two stations through the ship.
 
 function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
   const adjacent = new Map<string, Set<string>>();
@@ -420,7 +431,7 @@ function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<stri
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || !e.doors) continue;
     for (const d of Object.values(e.doors)) {
-      if (!d?.targetRoomId) continue;
+      if (!d?.targetRoomId || d.transient) continue;
       link(e.roomId, d.targetRoomId);
       link(d.targetRoomId, e.roomId);
     }
@@ -665,6 +676,8 @@ interface SharedAtlasEntry {
     /** 🧭 This door's own physical pose — see AtlasDoor. */
     wall?: DoorWall;
     lateral?: number;
+    /** ⚓ A transient berth — see AtlasDoor. */
+    transient?: true;
   }>;
   /** 🛑📐 The module's true tile size. PUBLIC by owner ruling — anyone may see
    *  a module's outside: its size, its position and its connections. Only the
@@ -832,6 +845,8 @@ function pullSharedAtlas(): void {
         lateral: Number.isFinite(door.lateral) && Math.abs(door.lateral as number) <= 32
           ? (door.lateral as number)
           : prior?.doors[d]?.lateral,
+        // Exactly `true` or absent — a berth flag, never peer-shaped junk.
+        ...(door.transient === true ? { transient: true as const } : {}),
       };
       kept++;
     }
@@ -899,6 +914,7 @@ export function pushAtlasToDoc(): void {
           farYawDeg: door.farYawDeg,
           wall: door.wall,
           lateral: door.lateral,
+          ...(door.transient ? { transient: true as const } : {}),
           ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
         };
       }

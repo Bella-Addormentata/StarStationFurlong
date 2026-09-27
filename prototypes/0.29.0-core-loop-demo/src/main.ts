@@ -3458,6 +3458,8 @@ function harvestStationAtlas(): void {
         farWall: r.farWall,
         farLateral: r.farLateral,
         farYawDeg: r.farYawDeg,
+        // ⚓ A visiting ship's berth: drawn from space, never station structure.
+        transient: r.transient === true,
         ...(pose
           ? {
               wall: pose.wall,
