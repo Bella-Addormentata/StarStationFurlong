@@ -391,8 +391,8 @@ export interface TrimContext {
    *  replay holds it to the fuel it could draw on. Left out, none. */
   capacity?: number;
   now: number;
-  /** The room's burn firing now (readBurnFiring), which holds the next push
-   *  while it is on the orbit the stick flies (trimFor is applied here).
+  /** The burn firing now on the station's orbit (readBurnFiring(now,
+   *  station)), which holds the next push (trimFor is applied here too).
    *  Left out, the trim's last burn stands in for it: right only while no
    *  burn stamped ahead of our clock sorts after the latest one. */
   firing?: FiredBurn | null;
@@ -570,8 +570,9 @@ function lastBurnOf(trim: OrbitTrim): FiredBurn {
 }
 
 /** The dashboard's status line when nothing refuses: the burn firing, on
- *  station, or what to do to get back there. `firing` is the room's burn
- *  firing now (readBurnFiring); left out, the trim's last burn stands in. */
+ *  station, or what to do to get back there. `firing` is the burn firing now
+ *  on the station's orbit (readBurnFiring); left out, the trim's last burn
+ *  stands in. */
 export function describeTrimStatus(
   base: CircularOrbit,
   trim: OrbitTrim | null,
@@ -849,15 +850,26 @@ export function readFuelDrawn(): number {
   return docAlive() ? replayRoom().fuelDrawn : 0;
 }
 
-/** The room's burn firing at `realMs`, or null: the latest burn to have
- *  fired by then, while it is less than BURN_MS old. Whatever order the
- *  replay puts the burns in: a burn stamped ahead of our clock (a peer
- *  running fast) has not fired here yet, and never hides one that has, so
- *  it cannot let the next push skip the lockout. A dropped burn never fired. */
-export function readBurnFiring(realMs: number): FiredBurn | null {
-  if (!docAlive()) return null;
+/** The burn firing at `realMs` on `station`'s orbit, or null: the latest
+ *  burn there to have fired by then, while it is less than BURN_MS old.
+ *  Whatever order the replay puts the burns in: a burn stamped ahead of our
+ *  clock (a peer running fast) has not fired here yet, and never hides one
+ *  that has, so it cannot let the next push skip the lockout. Only burns on
+ *  the planet and slot `station` flies count (trimFor), and they are picked
+ *  before the latest, so a newer burn on an orbit another install puts the
+ *  room in never hides one on ours either. No station, no burn; left out,
+ *  any orbit's. A dropped burn never fired. */
+export function readBurnFiring(
+  realMs: number,
+  station?: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null,
+): FiredBurn | null {
+  if (!docAlive() || station === null) return null;
   let latest: FiredBurn | null = null;
-  for (const b of replayRoom().fired) if (b.at <= realMs && (!latest || b.at > latest.at)) latest = b;
+  for (const b of replayRoom().fired) {
+    if (b.at > realMs || (latest && b.at <= latest.at)) continue;
+    if (station && !trimFor(station, b)) continue;
+    latest = b;
+  }
   return latest && isFiring(latest, realMs)
     ? { planetId: latest.planetId, slot: latest.slot, dir: latest.dir, at: latest.at }
     : null;

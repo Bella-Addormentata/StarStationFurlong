@@ -312,15 +312,16 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     const tanks = countFunction('fuelTank');
     const capacity = tanks * TANK_CAPACITY;
     const now = Date.now();
+    const station = deps.station();
     return {
       bolted: deps.bolted(),
-      station: deps.station(),
+      station,
       trim: readOrbitTrim(),
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
       now,
-      firing: readBurnFiring(now),
+      firing: readBurnFiring(now, station),
       logFull: isBurnLogFull(),
       tanks,
       capacity,
@@ -396,7 +397,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   };
 
   /** The room's burn firing now, on the orbit the dashboard shows. */
-  const firingNow = (now: number): FiredBurn | null => (view ? trimFor(view.station, readBurnFiring(now)) : null);
+  const firingNow = (now: number): FiredBurn | null => (view ? readBurnFiring(now, view.station) : null);
 
   const refresh = (): void => {
     if (!panel) return;
