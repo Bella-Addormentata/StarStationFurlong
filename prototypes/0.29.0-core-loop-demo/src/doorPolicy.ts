@@ -25,7 +25,7 @@
  */
 
 import * as Y from 'yjs';
-import { hasDoorLayout } from './doorLayoutDoc';
+import { LEGACY_ID_WALL, doorExistsIn, hasDoorLayout } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -205,13 +205,31 @@ function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
   return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
 }
 
+/** ⚓🚦 The doors a room's layout has (bounded), whose policies the gate
+ *  readers look up directly. Walking the layout rather than the policy map
+ *  means stale or junk policy keys (a removed door's, a peer's) can never
+ *  crowd a live port out of a capped scan. */
+function layoutDoorsIn(doc: Y.Doc): string[] {
+  const out: string[] = [];
+  let n = 0;
+  for (const id of doc.getMap('doorLayout').keys()) {
+    if (++n > 1024) break;
+    if (doorExistsIn(doc, id)) {
+      out.push(id);
+      if (out.length >= 256) break;
+    }
+  }
+  // A legacy room keeps no layout records: its doors are the cardinal ones.
+  if (out.length === 0) for (const id of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, id)) out.push(id);
+  return out;
+}
+
 /** ⚓🚦 Every non-open gate access of this room's ports, by door id. */
 export function readGateAccess(): Record<string, GateAccessRecord> {
   const out: Record<string, GateAccessRecord> = {};
   if (!docAlive()) return out;
-  for (const [doorId, value] of policyMap!.entries()) {
-    if (!isKnownDoorId(doorId)) continue;
-    const a = accessRecord(sanitizePolicy(value));
+  for (const doorId of layoutDoorsIn(boundDoc!)) {
+    const a = accessRecord(sanitizePolicy(policyMap!.get(doorId)));
     if (a) out[doorId] = a;
   }
   return out;
@@ -258,22 +276,34 @@ export function fitDockPortIn(doc: Y.Doc, doorId: string, gate?: number | null):
 export function readDockGates(): Record<string, number> {
   const out: Record<string, number> = {};
   if (!docAlive()) return out;
-  for (const [doorId, value] of policyMap!.entries()) {
-    if (!isKnownDoorId(doorId)) continue;
-    const p = sanitizePolicy(value);
+  for (const doorId of layoutDoorsIn(boundDoc!)) {
+    const p = sanitizePolicy(policyMap!.get(doorId));
     if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;
+}
+
+/** ⚓🚦 This room's ports that carry no gate number yet (fitted before gates
+ *  existed), by door id, in id order. */
+export function readUnnumberedPorts(): string[] {
+  const out: string[] = [];
+  if (!docAlive()) return out;
+  for (const doorId of layoutDoorsIn(boundDoc!)) {
+    const p = sanitizePolicy(policyMap!.get(doorId));
+    if (p.adapter && p.gate === undefined) out.push(doorId);
+  }
+  return out.sort();
 }
 
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
 export function dockGatesIn(doc: Y.Doc): Record<string, number> {
   const out: Record<string, number> = {};
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return out;
-  let n = 0;
-  for (const [doorId, value] of doc.getMap('doorPolicy').entries()) {
-    if (++n > 256) break;
-    const p = sanitizePolicy(value);
+  // Only doors the room's layout has: a peer's policy for a door that does
+  // not exist must not use up gate numbers.
+  const policies = doc.getMap('doorPolicy');
+  for (const doorId of layoutDoorsIn(doc)) {
+    const p = sanitizePolicy(policies.get(doorId));
     if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;

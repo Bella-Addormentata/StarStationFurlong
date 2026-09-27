@@ -95,7 +95,8 @@ const MAP_PER_AU = 180;
  *  on its course around the sun (the transfer ellipse, or a tug's straight
  *  torch run), then around its new planet. */
 function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['placeAt']> {
-  const from = stationOrbit({ planetId: move.fromPlanetId, orbitSlot: move.fromSlot });
+  // Until the burn it is the station it always was: its id keeps its trim.
+  const from = stationOrbit({ id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot });
   const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });
   const slotRadius = (slot: number) => STATION_ORBIT_BASE + slot * STATION_ORBIT_STEP;
   return (nowMs: number) => {

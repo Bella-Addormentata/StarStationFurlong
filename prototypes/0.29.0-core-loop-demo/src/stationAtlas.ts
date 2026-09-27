@@ -116,6 +116,8 @@ export const MAX_ENTRIES = 64;
  *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
  *  scan), so without this one entry could carry an arbitrarily large set. */
 export const MAX_DOORS_PER_ENTRY = 64;
+/** ⚓🚦 Most shared-atlas entries withSharedAtlasOf reads from one room doc. */
+const MAX_SHARED_SCAN = 256;
 /** Raw `doors` keys a shared entry may carry before the whole entry is refused
  *  at ingest. An honest publisher never exceeds MAX_DOORS_PER_ENTRY (it pushes
  *  what readAllDoors read); the slack tolerates junk keys among real ones
@@ -225,8 +227,32 @@ export function compareAtlasRecency(a: AtlasEntry, b: AtlasEntry): number {
   return bt !== at ? bt - at : br - ar;
 }
 
+/**
+ * ⚓ Write down every berth the atlas only INFERS. berthDoorIds counts both
+ * records of a connection as the berth when either end is one, but that
+ * inference lives only while both records do: once the flagged end is
+ * re-harvested without its dock (the ship cast off), the unflagged end left
+ * behind would read as structure again and pull the ship back into the
+ * station it left. So an unknown flag on an inferred berth is set to true
+ * while the pair is still there to show it. A known flag, true or false, is
+ * the room's own word and is left alone; a newer harvest of that room
+ * replaces the guess.
+ */
+function markInferredBerths(atlas: Record<string, AtlasEntry>): void {
+  for (const [roomId, doorIds] of berthDoorIds(atlas)) {
+    const doors = atlas[roomId]?.doors;
+    if (!doors) continue;
+    for (const id of doorIds) {
+      const door = doors[id];
+      if (door && typeof door.transient !== 'boolean') door.transient = true;
+    }
+  }
+}
+
 function writeAtlas(atlas: Record<string, AtlasEntry>): void {
   try {
+    // Before eviction, which can drop the flagged end of a berth too.
+    markInferredBerths(atlas);
     // 🗄️ Evict in two tiers, and never on the gossip stamp. `lastSeen` is
     // derived from a peer's `updatedAt`, so ordering retention by it let a peer
     // float its own entries to the top of a 64-deep list and push out rooms the
@@ -268,6 +294,9 @@ export function harvestIntoAtlas(entry: {
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
+  // Before this entry is replaced: an atlas saved before berths were written
+  // down may hold a berth only this entry's old doors imply.
+  markInferredBerths(atlas);
   const prior = atlas[entry.roomId];
   const doors: Record<string, AtlasDoor> = {};
   for (const d of entry.doors) {
@@ -540,6 +569,57 @@ export function freeGateNumber(
   return null;
 }
 
+/**
+ * ⚓🚦 `atlas` with a room doc's shared atlas folded in, for gate numbering in
+ * a room this client may never have visited (a far DOCK's port). A room the
+ * local atlas lacks comes from the doc; a known room gains the doc's gates when
+ * it has none, and any door pairing it lacks, so the station walk and the
+ * numbers taken both see what the far station has already published. Local
+ * knowledge wins wherever it exists. Peer entries are shape-checked and
+ * capped as pullSharedAtlas does. Pure: nothing is written.
+ */
+export function withSharedAtlasOf(
+  doc: Y.Doc,
+  atlas: Record<string, AtlasEntry>,
+): Record<string, AtlasEntry> {
+  const out: Record<string, AtlasEntry> = { ...atlas };
+  let seen = 0;
+  for (const [rid, value] of doc.getMap('atlas').entries()) {
+    if (++seen > MAX_SHARED_SCAN) break;
+    if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
+    const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
+    for (const [d, door] of Object.entries(value.doors)) {
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
+      if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
+      doors[d] = {
+        targetSeed: '',
+        targetRoomId: door.targetRoomId,
+        segments: door.segments,
+        farDoor: door.farDoor,
+        ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
+      };
+      kept++;
+    }
+    const gates = value.gates !== undefined ? cleanGates(value.gates) : undefined;
+    const prior = out[rid];
+    if (!prior) {
+      out[rid] = {
+        roomId: rid,
+        name: value.name || 'Module',
+        doors,
+        ...(gates ? { gates } : {}),
+        lastSeen: value.updatedAt,
+      };
+      continue;
+    }
+    const merged: AtlasEntry = { ...prior, doors: { ...doors, ...prior.doors } };
+    if (prior.gates === undefined && gates) merged.gates = gates;
+    out[rid] = merged;
+  }
+  return out;
+}
+
 // ── 🪐 Connected components — what a STATION is ──────────────────────────────
 //
 // Which rooms make up a station is never stored: a station is the set of
@@ -553,7 +633,8 @@ export function freeGateNumber(
 // part of the station it docks at, and a stale berth left on the station side
 // after the ship casts off can never bridge two stations through the ship.
 // Both records of a berth count as the berth (berthDoorIds), however the
-// other side happens to be flagged.
+// other side happens to be flagged, and the atlas writes that down
+// (markInferredBerths) so it outlives the flagged record.
 
 /** ⚓ Is this door a visiting ship's berth rather than station structure?
  *  Flagged transient, or a DOCK — exactly two `dock` segments, which dockRules
@@ -575,10 +656,11 @@ export function isBerthDoor(door: Pick<AtlasDoor, 'transient' | 'segments'>): bo
  * Records are matched per pair of rooms the way dockRules.findFarDoor finds
  * a connection's far end: a record's `farDoor` is the far room's own key for
  * its door, so a record naming one, or named by one, pairs with exactly that
- * record. Records naming no far door then pair across, each berth taking one
- * unflagged record opposite. Whatever is left over is a SEPARATE connection
- * and keeps its own flag — a permanent gangway between the same two rooms
- * still joins them.
+ * record. Records naming no far door then pair across: a berth with a berth
+ * opposite first (one connection flagged at both ends), and only a berth left
+ * over with one unflagged record opposite. Whatever is left over is a
+ * SEPARATE connection and keeps its own flag — a permanent gangway between
+ * the same two rooms still joins them.
  */
 export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
   type Side = Array<{ doorId: string; door: AtlasDoor }>;
@@ -623,12 +705,16 @@ export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set
         if (t) partner(i, r, t);
       }
     }
-    // Unnamed: a berth takes one unflagged, unnamed record opposite.
-    const loose = sides.map((side) => side.filter((r) => r.door.farDoor === undefined && !partnered.has(r)));
+    // Unnamed: a berth flagged at both ends is one connection, so berths pair
+    // with berths first; only a berth left over (flagged on one side alone)
+    // takes one unflagged, unnamed record opposite.
+    const loose = (i: number, berth: boolean) =>
+      sides[i].filter((r) => r.door.farDoor === undefined && !partnered.has(r) && isBerthDoor(r.door) === berth);
+    const [flagged0, flagged1] = [loose(0, true), loose(1, true)];
+    for (let k = 0; k < Math.min(flagged0.length, flagged1.length); k++) partner(0, flagged0[k], flagged1[k]);
     for (const i of [0, 1] as const) {
-      const unflagged = loose[1 - i].filter((r) => !isBerthDoor(r.door));
-      for (const r of loose[i]) {
-        if (!isBerthDoor(r.door)) continue;
+      const unflagged = loose(1 - i, false);
+      for (const r of loose(i, true)) {
         const t = unflagged.shift();
         if (!t) break;
         partner(i, r, t);
@@ -958,7 +1044,11 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     // room editor enforces, so a hostile or buggy entry degrades to "we don't
     // know this module's size" (the renderer's existing fallback) instead of
     // asking Three.js for a 10-billion-tile hull.
-    && (e.dims === undefined || isSaneDims(e.dims));
+    && (e.dims === undefined || isSaneDims(e.dims))
+    // ⚓🚦 Gates ride as plain door-keyed maps, bounded like `doors`, so an
+    // oversized peer value never becomes `known` (and never gets stringified).
+    && (e.gates === undefined || isPlainGates(e.gates))
+    && (e.gateAccess === undefined || isPlainGates(e.gateAccess));
 }
 
 /** True once `obj` has more than `limit` own keys — stops counting there, so
@@ -1018,6 +1108,7 @@ export function subscribeSharedAtlas(listener: () => void): () => void {
 function pullSharedAtlas(): void {
   if (!sharedAlive()) return;
   const atlas = readAtlas();
+  markInferredBerths(atlas); // before any entry is replaced, as in harvestIntoAtlas
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
@@ -1123,6 +1214,21 @@ function pullSharedAtlas(): void {
   if (changed) writeAtlas(atlas);
 }
 
+/** ⚓ A doc entry with a berth flag added wherever it has none and our entry
+ *  holds `transient: true` for the same door to the same room, or null when
+ *  there is nothing to add. Nothing else in the doc's copy changes. */
+function withBerthFlags(known: SharedAtlasEntry, entry: AtlasEntry): SharedAtlasEntry | null {
+  let doors: SharedAtlasEntry['doors'] | null = null;
+  for (const [id, door] of Object.entries(known.doors)) {
+    const mine = entry.doors[id];
+    if (!door || typeof door.transient === 'boolean' || mine?.transient !== true) continue;
+    if (typeof door.targetRoomId !== 'string' || door.targetRoomId !== mine.targetRoomId) continue;
+    doors ??= { ...known.doors };
+    doors[id] = { ...door, transient: true };
+  }
+  return doors ? { ...known, doors } : null;
+}
+
 /**
  * localStorage → doc (called after every harvest). Gossip carries geometry +
  * names; SEEDS DO NOT TRAVEL — except the doc's own-room entry (see header).
@@ -1136,7 +1242,9 @@ export function pushAtlasToDoc(): void {
     for (const entry of Object.values(atlas)) {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
-      if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
+      // Stubs add no geometry; ⚓🚦 one that knows a room's gates still has
+      // something to carry.
+      if (!isOwn && doorIds.length === 0 && entry.gates === undefined) continue;
       // 🛰️ Never publish what this install never observed: an entry the
       // build's bundled default station wrote (seedAtlasDefaults) would reach
       // every room we join as if we had seen it. The room we are standing in
@@ -1147,9 +1255,29 @@ export function pushAtlasToDoc(): void {
       if (entry.bundled) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
-      if (known && !isOwn
+      // ⚓🚦 A doc copy with no gates (an older client's, or a stub) gains the
+      // gates we know even when it is otherwise as new as ours: its own doors
+      // are kept, and only the gates are added.
+      const onlyGates = !!known && !isOwn && entry.gates !== undefined && known.gates === undefined
         && known.updatedAt >= entry.lastSeen
-        && Object.keys(known.doors).length >= doorIds.length) continue;
+        && Object.keys(known.doors).length >= doorIds.length;
+      if (known && !isOwn && !onlyGates
+        && known.updatedAt >= entry.lastSeen
+        && Object.keys(known.doors).length >= doorIds.length) {
+        // The doc's copy is at least as new as ours, so ours stays unsent,
+        // except for a berth we know and that copy has no flag for (an
+        // inferred berth is written down, markInferredBerths). That flag goes
+        // onto the DOC's copy, its geometry untouched, so a client joining
+        // after the ship casts off still reads the stale end as a berth.
+        const flagged = withBerthFlags(known, entry);
+        if (flagged) {
+          sharedMap!.set(entry.roomId, {
+            ...flagged,
+            updatedAt: Math.min(known.updatedAt + 1, Date.now() + MAX_GOSSIP_SKEW_MS),
+          });
+        }
+        continue;
+      }
       const doors: SharedAtlasEntry['doors'] = {};
       for (const d of doorIds) {
         const door = entry.doors[d];
@@ -1170,13 +1298,15 @@ export function pushAtlasToDoc(): void {
       }
       const rec: SharedAtlasEntry = {
         roomId: entry.roomId,
-        name: entry.name,
-        doors,
+        name: onlyGates ? known!.name : entry.name,
+        // (With 171's inferred berth flags applied, as the skip path does.)
+        doors: onlyGates ? (withBerthFlags(known!, entry)?.doors ?? known!.doors) : doors,
+        ...(onlyGates && known!.dims ? { dims: known!.dims } : {}),
         // 🛑📐 Size travels with the connection graph. Without this a peer
         // renders every module it has not personally visited at the fallback
         // size, so the station's shape was only ever right for rooms you had
         // walked through yourself.
-        ...(entry.dims ? { dims: entry.dims } : {}),
+        ...(!onlyGates && entry.dims ? { dims: entry.dims } : {}),
         // ⚓🚦 Gates travel with the layout, so a board or an arriving ship in
         // any room of the station knows every gate.
         ...(entry.gates ? { gates: entry.gates } : {}),

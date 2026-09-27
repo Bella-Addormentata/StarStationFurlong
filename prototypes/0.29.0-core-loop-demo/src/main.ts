@@ -115,7 +115,7 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { arrivalNoteHere, clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
 import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
@@ -132,11 +132,13 @@ import {
 import {
   bindPlanetSummaryDoc,
   installTrimResolver,
+  LEARNED_PREFIX,
   publishPlanetSummary,
+  portableStationId,
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
-import { bindStationMoveDoc, installStationMoveResolver } from "./stationMove";
+import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, pinSettledArrival, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -171,7 +173,7 @@ import {
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
 // and the far room's end of every DOCK / UNDOCK.
 import { isDockChain } from "./adapter";
-import { mirrorMayWrite } from "./dockRules";
+import { gateAdmits, mirrorMayWrite } from "./dockRules";
 import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
@@ -199,7 +201,9 @@ import {
 import {
   bindDoorPolicy,
   subscribeDoorPolicy,
+  gateAccessIn,
   readDockGates,
+  readUnnumberedPorts,
   readGateAccess,
   readDoorPolicy,
   writeDoorPolicy,
@@ -268,7 +272,9 @@ import {
 } from "./exteriorView";
 import {
   harvestIntoAtlas,
+  freeGateNumber,
   readAtlas,
+  atlasComponent,
   bindStationAtlasDoc,
   pushAtlasToDoc,
   subscribeSharedAtlas,
@@ -472,7 +478,10 @@ const networkProvider = new NetworkProvider();
   //   __ssfMesh.registerStation({ id: 'l4-yard', name: 'L4 YARD',
   //     planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'home-…' })
   listStations: () => listStations(),
-  registerStation,
+  // 'shared:' ids are reserved for stations learned from other installs
+  // (planetSummary.ts), so a hand-made record never collides with one.
+  registerStation: (rec: Parameters<typeof registerStation>[0]) =>
+    typeof rec?.id === "string" && rec.id.startsWith(LEARNED_PREFIX) ? false : registerStation(rec),
   removeStation,
   // 🛰️ The default-station bundle: the connected component of the room you
   // are standing in (or of `roomId`), stripped of everything personal — see
@@ -1204,6 +1213,9 @@ function shipStationHere(roomId: string): string | null {
       continue;
     }
     const st = partner ? stationForRoom(partner) : null;
+    // Another lone module's one-room station is no host: two lone modules
+    // docked together each stay where they are (stations.dockedStationFor).
+    if (st && st.derived && atlasComponent(readAtlas(), st.welcomeRoomId).size <= 1) continue;
     if (st) return st.id;
   }
   // No host station: not the ship's own one-room station (the directory
@@ -1231,7 +1243,8 @@ function planetShipStatus(): ShipStatusInput | null {
   const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
   if (!planetId) return null;
   const name =
-    (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) || "SHIP";
+    // Peer-written: only a string is a name.
+    (() => { const n = yjsSync?.doc.getMap("roomInfo").get("name"); return typeof n === "string" ? n : ""; })() || "SHIP";
   const out: ShipStatusInput = { roomId, name: name.slice(0, 64), planetId, status: rec.status };
   if (from?.welcomeRoomId) out.fromRoom = from.welcomeRoomId;
   if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
@@ -1249,6 +1262,7 @@ function isLocalHelmCommander(): boolean {
 
 /** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
 let shipFlightWatch: number | null = null;
+let planetSummaryBeat = 0;
 
 async function joinRoomAtEpoch(
   boot: RoomBootstrap,
@@ -1776,11 +1790,18 @@ async function joinRoomAtEpoch(
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
-    const localSeedFor = (roomId: string): string | undefined =>
-      readAtlas()[roomId]?.seed ??
-      (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
-        ? DEFAULT_STATION.welcomeRoomLink
-        : undefined);
+    // A seed is only this room's when it names this room (atlas entries can
+    // come from peers): one naming another room would dock elsewhere.
+    const seedNames = (seed: string | undefined, roomId: string): seed is string => {
+      if (!seed) return false;
+      try { return roomIdFromSeed(seed) === roomId; } catch { return false; }
+    };
+    const localSeedFor = (roomId: string): string | undefined => {
+      const atlasSeed = readAtlas()[roomId]?.seed;
+      if (seedNames(atlasSeed, roomId)) return atlasSeed;
+      // The build's own pass for the default station is trusted as shipped.
+      return roomId === DEFAULT_STATION.welcomeRoomId ? DEFAULT_STATION.welcomeRoomLink || undefined : undefined;
+    };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
     setStationDirectory(
@@ -1790,6 +1811,7 @@ async function joinRoomAtEpoch(
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
         (id) => resolveStationAlias(id),
+        (id) => portableStationId(id),
       ),
     );
     // 🪐 Stations fly their shared trims, and what changes here goes out:
@@ -1797,6 +1819,8 @@ async function joinRoomAtEpoch(
     installTrimResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
+    // 🚚 A move this room remembers goes out on the planet summary at once.
+    subscribeStationMove(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).
@@ -1807,6 +1831,9 @@ async function joinRoomAtEpoch(
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
       if (docked) return docked;
+      // A saved or built-in station whose welcome room this is stays put,
+      // whatever it wears: only a free-flying ship follows its flight.
+      if (listStations().some((st) => !st.derived && st.welcomeRoomId === roomId)) return null;
       // A module bolted into a station by structure (a station-keeping helm
       // room wears engine, tank and helm too) belongs to that station, never
       // to its own flight record: only a free-flying ship follows the flight.
@@ -1849,6 +1876,10 @@ async function joinRoomAtEpoch(
     setHelmOwnerCheck(isLocalHelmCommander);
     setStationHelmCommanderCheck(isLocalHelmCommander);
   }
+  // 🪐 Publish again now the room's station, doors and directory are all in
+  // place (the bind-time publish ran before them, and on a first join the
+  // one-time seams above did not exist yet).
+  publishPlanetSummary();
   // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
   // ticks the countdown while open, but a flight must complete even if no
   // one has the panel up — otherwise a `in-flight` record with a past
@@ -1862,16 +1893,26 @@ async function joinRoomAtEpoch(
   // join replaces the last room's watch and leaveRoomNow clears it, so room
   // hops neither stack callbacks nor leave a flight without its watch.
   if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
+  planetSummaryBeat = 0;
   shipFlightWatch = window.setInterval(() => {
+    // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
+    // publishPlanetSummary refreshes its stamp once an hour).
+    if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
     if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
+    // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
+    cancelTowLeftBehind(boot.roomId, rec.status, Date.now());
+    // 🪐 Where this station's last move settled it, shared once for everyone.
+    if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).
       writeFlightRecord({
         status: "redocking",
         locationId: rec.destinationId ?? rec.locationId,
+        departedAt: rec.departedAt,
         etaAt: rec.etaAt,
+        castOffAt: rec.castOffAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
@@ -1886,7 +1927,7 @@ async function joinRoomAtEpoch(
               dock: (doorId) => ds.redockPort(doorId),
             }
           : null,
-        { onSettled: noteShipArrival },
+        { onSettled: arrivalNoteHere() },
       ),
     );
   }, 1_000);
@@ -1944,7 +1985,10 @@ async function joinRoomAtEpoch(
       // defaults to the wall label exactly as seedDoorLayoutSingle's does.)
       if (mintedHere.birthPort) {
         const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
-        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true });
+        // ⚓🚦 …numbered like every port (the new room's own gate list; the
+        // atlas groups it with its station once harvested).
+        const gate = freeGateNumber(readAtlas(), boot.roomId, readDockGates());
+        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
       // so the door sits centred on `birthWall` whatever the room is called.
@@ -3070,11 +3114,22 @@ async function transitTo(
     // re-dock the mirror completes, while an older one is a stale berth. A
     // DOCK never lands on a tombstoned door whose port was removed: it would
     // re-fit the port below.
+    // ⚓🚦 A dock that fits a new port here needs a free gate number; with
+    // every number taken, the dock is not completed (as the far DOCK refuses).
+    const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
+    const newGate = needsPort ? freeGateNumber(readAtlas(), activeBootstrap?.roomId ?? "", readDockGates()) : null;
     if (
       depRoomId &&
+      !(needsPort && newGate === null) &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
-      })
+      }) &&
+      // ⚓🚦 A dock this gate does not admit is not completed here either
+      // (one the door already holds for that ship stands).
+      (!depDock.isDock ||
+        (existing?.paired === true && roomIdFromSeed(existing.connectedRoomAddress) === depRoomId) ||
+        !yjsSync ||
+        gateAdmits(gateAccessIn(yjsSync.doc, arrivalDoorId, getIdentityPub() ?? undefined), depRoomId))
     ) {
       // ⚓ ONE transaction for the pairing and, for a dock, its port: were the
       // pairing to land alone (a session cut between two updates), the port
@@ -3103,10 +3158,12 @@ async function transitTo(
         // ⚓ A dock has a half on BOTH doors: the arrival door wears the
         // mating half the connection brought (staged on the far side, or the
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
-        if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+        if (needsPort && newGate !== null) {
+          // ⚓🚦 …numbered, like every new port of the station.
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
+            gate: newGate,
           });
         }
       });
@@ -3581,9 +3638,28 @@ function harvestStationAtlas(): void {
           : {}),
       }];
     });
+  // ⚓🚦 A port fitted before gates existed has no number: the owner numbers
+  // it here, once. Until then (anyone else here) the room's gates are not
+  // known, so the harvest leaves them as they were rather than listing none
+  // and hiding a legacy berth.
+  const unnumbered = readUnnumberedPorts();
+  if (unnumbered.length > 0 && isLocalHelmCommander() && yjsSync) {
+    // One transaction: the policy observer (which harvests again) runs only
+    // once every port has its number, so none is numbered twice.
+    yjsSync.doc.transact(() => {
+      for (const doorId of unnumbered) {
+        if (readDoorPolicy(doorId).gate !== undefined) continue;
+        const gate = freeGateNumber(readAtlas(), roomId, readDockGates());
+        if (gate === null) break;
+        writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
+      }
+    });
+  }
+  const gatesKnown = readUnnumberedPorts().length === 0;
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
   harvestIntoAtlas({
-    roomId, name, seed, dims: readRoomDims(), doors, gates: readDockGates(), gateAccess: readGateAccess(),
+    roomId, name, seed, dims: readRoomDims(), doors,
+    ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).

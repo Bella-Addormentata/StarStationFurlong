@@ -88,6 +88,16 @@ describe('Hohmann transfers between planets', () => {
     expect(atWindow.waitMs).toBeLessThan(1000);
   });
 
+  it('leaves at once when asked at any window\'s exact time, never a synodic period later', () => {
+    for (let i = 0; i < 400; i++) {
+      const [a, b] = i % 2 ? [ARIS, SOV] : [SOV, ARIS];
+      const plan = planPlanetTransfer(station(a), station(b), now + i * 7_777_777)!;
+      const again = planPlanetTransfer(station(a), station(b), plan.departAt)!;
+      expect(again.waitMs).toBe(0);
+      expect(again.departAt).toBe(plan.departAt);
+    }
+  });
+
   it('prices the burns from each station\'s own orbit (patched conics)', () => {
     const low = planPlanetTransfer(station(SOV, 0), station(ARIS, 0), now)!;
     const high = planPlanetTransfer(station(SOV, 8), station(ARIS, 0), now)!;
