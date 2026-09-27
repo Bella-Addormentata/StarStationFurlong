@@ -31,7 +31,7 @@ import {
   type BerthMemoryRecord,
   type FlightRecord,
 } from './shipDoc';
-import { stationHere, type StationBerth, type StationDestination } from './stationDirectory';
+import { isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
 
 /** The slice of a dock port the planner reads (docking.ts DockPortView). */
 export interface ArrivalPort {
@@ -154,7 +154,11 @@ export function castOffForDeparture(stationId: string, docking: ShipDockingApi):
 /** What the last arrival did — the helm shows it. */
 export type ArrivalOutcome =
   | { kind: 'docking'; stationName: string }
-  | { kind: 'none'; stationName: string; reason: 'no-berth' | 'no-port' | 'already-docked' };
+  | {
+      kind: 'none';
+      stationName: string;
+      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station';
+    };
 
 /**
  * Finish a flight: `redocking → docked` at the destination, then DOCK at its
@@ -166,6 +170,11 @@ export function completeArrival(docking: ShipDockingApi | null): ArrivalOutcome 
   const rec = readFlightRecord();
   if (rec.status !== 'redocking') return null;
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
+  // A destination that left the directory mid-flight is NOT home: arrive
+  // there undocked rather than docking at findDestination's fallback.
+  if (!isKnownStation(rec.locationId)) {
+    return { kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' };
+  }
   const station = findDestination(rec.locationId);
   if (!docking) return { kind: 'none', stationName: station.name, reason: 'no-port' };
   const plan = planArrivalDock({

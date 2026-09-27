@@ -214,6 +214,23 @@ describe('a round trip', () => {
     expect(completeArrival(docking)).toBeNull();
   });
 
+  it('never sends the ship home when its destination drops off the list mid-flight', () => {
+    let stations: readonly StationDestination[] = [
+      DEFAULT_STATIONS[0],
+      { ...DEFAULT_STATIONS[1], id: 'gone-soon', name: 'Gone Soon' },
+    ];
+    setStationDirectory({ stations: () => stations });
+    const docking = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', docking);
+    fly('furlong-station', 'gone-soon');
+    stations = [DEFAULT_STATIONS[0]]; // the record vanished while in flight
+    expect(completeArrival(docking)).toEqual({ kind: 'none', stationName: 'gone-soon', reason: 'unlisted-station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'gone-soon' });
+    // Not re-docked at Furlong's remembered berth.
+    expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+    expect(docking.docks).toEqual([]);
+  });
+
   it('arrives without a docking system and says there is no port', () => {
     castOffForDeparture('furlong-station', fakeDocking(['north']));
     fly('furlong-station', 'high-orbit');

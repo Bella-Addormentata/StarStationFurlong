@@ -45,7 +45,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom } from './stationDirectory';
+import { destinationsFrom, isKnownStation } from './stationDirectory';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
   castOffForDeparture,
@@ -2069,7 +2069,9 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     tone: 'warn',
     text: outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
-      : outcome.reason === 'no-port'
+      : outcome.reason === 'unlisted-station'
+        ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
+        : outcome.reason === 'no-port'
         ? `Arrived at ${outcome.stationName} — no free dock port to dock with. Fit one at a door (door panel › +DOCK).`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
   };
@@ -2133,8 +2135,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const now = Date.now();
     const arrived = flightArrived(flight, now);
     const progress = flightProgress(flight, now);
-    const location = findDestination(shipLocationId(flight, hasLiveDock()));
-    const destination = flight.destinationId ? findDestination(flight.destinationId) : null;
+    // A station that dropped out of the directory is named as unlisted, never
+    // passed off as home (findDestination's fallback).
+    const named = (id: string) => isKnownStation(id)
+      ? findDestination(id)
+      : { ...findDestination(id), id, name: 'an unlisted station' };
+    const location = named(shipLocationId(flight, hasLiveDock()));
+    const destination = flight.destinationId ? named(flight.destinationId) : null;
     const choices = destinationsFrom(location.id);
     if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
     const pickerDest = pickerDestId ? findDestination(pickerDestId) : null;
@@ -2573,7 +2580,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     if (!panel || !helmIsCommander()) return;
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
-      writeFlightRecord({ status: 'redocking', locationId: findDestination(rec.destinationId ?? rec.locationId).id });
+      // Arrive where the ship flew, even if the directory no longer lists it.
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId });
     }
     if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking));
   };

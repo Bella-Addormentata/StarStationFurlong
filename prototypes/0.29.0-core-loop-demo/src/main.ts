@@ -106,7 +106,6 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } fr
 // once/sec so a flight completes even if no one has the helm panel open.
 import {
   bindShipDoc,
-  findDestination,
   flightArrived,
   readFlightRecord,
   writeFlightRecord,
@@ -1728,10 +1727,12 @@ async function joinRoomAtEpoch(
       if (!isHelmCommander()) return;
       const rec = readFlightRecord();
       if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
-        const dest = rec.destinationId
-          ? findDestination(rec.destinationId)
-          : findDestination(rec.locationId);
-        writeFlightRecord({ status: "redocking", locationId: dest.id });
+        // Arrive where the ship flew — even if that station has since dropped
+        // out of the directory (never silently home).
+        writeFlightRecord({
+          status: "redocking",
+          locationId: rec.destinationId ?? rec.locationId,
+        });
       }
       // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
       if (readFlightRecord().status !== "redocking") return;
