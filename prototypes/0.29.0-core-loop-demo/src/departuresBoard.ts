@@ -523,11 +523,16 @@ export interface RouteSummaryFields {
   routeIdle?: true;
 }
 
-/** The newest checkpoint's event time (a hold's first sighting, not its
- *  renewals), or 0: what a summary's `routeNews` compares against. */
+/** The newest observation among the checkpoints (a hold's newest sighting,
+ *  as departuresDoc keeps it; any other entry's time), or 0: what a
+ *  summary's `routeNews` compares against. A renewal a room missed then
+ *  reads as news its copy lacks, before its hold goes unwatched there. */
 export function newestRouteNews(checkpoints: readonly RouteCheckpoint[]): number {
   let t = 0;
-  for (const e of checkpoints) if (Number.isFinite(e.at) && e.at > t) t = e.at;
+  for (const e of checkpoints) {
+    const seen = e.kind === 'hold' ? Math.max(e.at, e.seenAt) : e.at;
+    if (Number.isFinite(seen) && seen > t) t = seen;
+  }
   return t;
 }
 

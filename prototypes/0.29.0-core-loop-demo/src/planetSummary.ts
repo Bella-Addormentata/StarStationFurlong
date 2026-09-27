@@ -110,9 +110,9 @@ export interface ShipSummary {
   /** 🚏 The run it flies (the route's startedAt), so a board can tell a
    *  replacement route from a later stop of the one it holds. */
   routeRun?: number;
-  /** 🚏 The newest checkpoint of that run (its event time: a hold, a skip,
-   *  a pause, a person's departure…), so a board can tell that its own copy
-   *  of the timetable missed one. */
+  /** 🚏 The newest checkpoint of that run (its event time: a hold's newest
+   *  sighting, a skip, a pause, a person's departure…), so a board can tell
+   *  that its own copy of the timetable missed one. */
   routeNews?: number;
   /** 🏁 No route run flies (none set, not started, or ended). Said outright
    *  because an older client's relay drops every route field: a summary

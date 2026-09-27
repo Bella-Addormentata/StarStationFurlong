@@ -144,6 +144,23 @@ describe('the route entry', () => {
     }
   });
 
+  it('refuses a publish stamp or run stamp far past the reader’s clock; a far finish drops alone', () => {
+    const SKEW = 6 * 3600 * SEC;
+    const far = T0 + SKEW + 1;
+    const entry = (route: ShipRoute, at = T0, endedRun?: number) =>
+      departureRouteToWire({ shipRoomId: SHIP, name: 'F', capacity: 100, route, at, ...(endedRun ? { endedRun } : {}) });
+    expect(departureRouteFromWire(entry(running(), T0 + SKEW), SHIP, T0)).not.toBeNull();
+    expect(departureRouteFromWire(entry(running(), far), SHIP, T0)).toBeNull();
+    expect(departureRouteFromWire(entry(running(), Number.MAX_SAFE_INTEGER), SHIP, T0)).toBeNull();
+    expect(departureRouteFromWire(entry(running([0, 1], far)), SHIP, T0)).toBeNull();
+    expect(departureRouteFromWire(entry(running([0, 1], T0, { stoppedAt: far })), SHIP, T0)).toBeNull();
+    const { startedAt: _s, startStop: _p, ...idle } = running();
+    expect(departureRouteFromWire(entry(idle, T0, T0), SHIP, T0)?.endedRun).toBe(T0);
+    const farFinish = departureRouteFromWire(entry(idle, T0, far), SHIP, T0);
+    expect(farFinish).not.toBeNull();
+    expect(farFinish).not.toHaveProperty('endedRun');
+  });
+
   it('newest wins: a newer START always, STOP within a run, else the later publish', () => {
     const a = { route: running([0, 1], T0), at: T0 + 10 * MIN };
     const b = { route: running([0, 1], T0 + MIN), at: T0 };
@@ -427,6 +444,39 @@ describe('reading a room’s departures', () => {
     const extra = holdCheckpoint(route, MAX_CHECKPOINT_KEYS_SCANNED, { at: s.arriveAt + MAX_CHECKPOINT_KEYS_SCANNED * SEC });
     applyDeparturesPublish(doc, pub(route, [s, extra], T0 + MIN, { shipRoomId: 'ship-00' }), T0 + MIN);
     expect(keys(doc).filter((k) => k.startsWith('ship-00:ckpt:'))).toHaveLength(MAX_CHECKPOINT_KEYS_SCANNED);
+  });
+
+  it('a peer’s far-future entries never hide the ferry, and the next publish clears them', () => {
+    const doc = new Y.Doc();
+    const map = doc.getMap(DEPARTURES_MAP);
+    const route = running();
+    const s = start(route);
+    const hold = holdCheckpoint(route, 1, { at: s.arriveAt + SEC });
+    const now = s.arriveAt + 2 * SEC;
+    applyDeparturesPublish(doc, pub(route, [s, hold], T0), now);
+    // Written straight into the map, past cleanDeparturesPublish: a snapshot
+    // stamped near the end of time, a START hours ahead, a hold renewed far
+    // ahead (it would keep every real renewal off its key).
+    const ghostAt = { shipRoomId: SHIP, name: 'Ghost', capacity: 100, route, at: Number.MAX_SAFE_INTEGER - 1 };
+    const ghostRun = { shipRoomId: SHIP, name: 'Ghost', capacity: 100, route: running([0, 1], now + 7 * 3600 * SEC), at: T0 };
+    const { kind: _k, legSeq: _l, ...farHold } = renewedHold(hold, now + 7 * 3600 * SEC);
+    doc.transact(() => {
+      map.set(departureRouteKey(ghostAt), departureRouteToWire(ghostAt));
+      map.set(departureRouteKey(ghostRun), departureRouteToWire(ghostRun));
+      map.set(departureCheckpointKey(SHIP, T0, 1, 'hold'), farHold);
+    });
+    const [f] = departureFerriesIn(map, now);
+    expect(f).toMatchObject({ name: 'Ferry One', route, at: T0 });
+    expect(f.checkpoints.map((e) => e.kind)).toEqual(['start']);
+    // The next real publish takes the ferry's keys back.
+    const renewed = renewedHold(hold, now + MIN);
+    expect(applyDeparturesPublish(doc, pub(route, [s, renewed], T0 + MIN), now + MIN).wrote).toBe(true);
+    expect(keys(doc)).toEqual([
+      departureCheckpointKey(SHIP, T0, 0, 'start'), departureCheckpointKey(SHIP, T0, 1, 'hold'), departureRouteKey(pub(route, [], T0 + MIN)),
+    ].sort());
+    const [g] = departureFerriesIn(map, now + MIN);
+    expect(g.at).toBe(T0 + MIN);
+    expect(g.checkpoints.find((e) => e.kind === 'hold')).toMatchObject({ seenAt: now + MIN });
   });
 
   it('two writers overfilling a room: readers and the next writer keep the same newest ferries', () => {

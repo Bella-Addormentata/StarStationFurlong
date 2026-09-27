@@ -33,6 +33,7 @@ import {
   legWindowAfter,
   liveDockFrom,
   pauseCheckpoint,
+  renewedHold,
   routeFlightAt,
   routeLegFuel,
   skipCheckpoint,
@@ -336,6 +337,31 @@ describe('the board', () => {
     // …and the in-world screen draws every one of them.
     expect(DB_SCREEN_ROWS).toBe(MAX_BOARD_ROWS);
     expect(many.rows.map((r) => r.at)).toEqual([...many.rows.map((r) => r.at)].sort((a, b) => a! - b!));
+  });
+
+  it('a hold renewal this room missed: the summary’s news is the hold’s newest sighting', () => {
+    const hold = holdCheckpoint(route, 1, { at: s.arriveAt + 5 * SEC });
+    // The keeper renews the hold each minute; this room's copy kept only the
+    // first sighting, which has gone unwatched by now.
+    const renewed = renewedHold(hold, hold.at + 3 * MIN);
+    const now = renewed.seenAt + 30 * SEC;
+    const f = routeFlightAt(route, [s, renewed], null, now, 100)!;
+    const fields = routeSummaryFields(route, f, [s, renewed], null, now);
+    expect(fields).toMatchObject({ routeStatus: 'holding', routeRun: T0, routeNews: renewed.seenAt });
+    const summary: ShipSummary = {
+      roomId: SHIP, name: 'Ferry One', planetId: SOV, status: 'in-flight', fromRoom: 'room-0', toRoom: 'room-1',
+      ...fields, updatedAt: renewed.seenAt,
+    };
+    const view = (mirror: RouteCheckpoint[]) => boardView({
+      ferries: [ferry(route, mirror)], here: boardAt(1), gate: null, summaries: [summary],
+      isHereRoom: (room) => room === 'room-1', placeOf: () => 'Stop 0', now,
+    }).rows;
+    // The lapsed copy gives way to the ship's word…
+    expect(view([s, hold])).toEqual([expect.objectContaining({ status: 'HOLDING FOR BERTH', asOf: renewed.seenAt })]);
+    // …and a copy that has the renewal keeps its own row.
+    const own = view([s, renewed]);
+    expect(own).toEqual([expect.objectContaining({ status: 'HOLDING FOR BERTH' })]);
+    expect(own[0].asOf).toBeUndefined();
   });
 
   it('a summary the ferry wrote after its last publish here wins where they disagree', () => {

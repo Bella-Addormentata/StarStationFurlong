@@ -136,6 +136,24 @@ const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 
 /** A run id (route.startedAt): the ship map's own rule. */
 const isRunId = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
 
+/** A peer's ordering stamp sits at most MAX_PUBLISH_SKEW_MS ahead of this
+ *  reader's clock: a map is peer-writable past cleanDeparturesPublish, and
+ *  one stamp far in the future would outrank every real one for good. */
+const inSkew = (t: number, now: number): boolean => t <= now + MAX_PUBLISH_SKEW_MS;
+
+/** A route's run stamps (its START and STOP) within the skew. */
+function routeInSkew(route: ShipRoute, now: number): boolean {
+  return (route.startedAt === undefined || inSkew(route.startedAt, now))
+    && (route.stoppedAt === undefined || inSkew(route.stoppedAt, now));
+}
+
+/** A checkpoint off the wire whose observation (observedAt) is within the
+ *  skew, or null. */
+function checkpointInSkew(kind: RouteCheckpoint['kind'], legSeq: number, v: unknown, now: number): RouteCheckpoint | null {
+  const e = checkpointFromWire(kind, legSeq, v);
+  return e && inSkew(observedAt(e), now) ? e : null;
+}
+
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
     && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
@@ -216,16 +234,17 @@ export function departureRouteToWire(f: Pick<DepartureFerry, 'shipRoomId' | 'nam
 
 /** A route entry off the wire under `ship`'s key, cleaned, or null. The route
  *  is rebuilt by shipRoute's own guard (a pass, or any field it does not
- *  know, never survives). */
-export function departureRouteFromWire(v: unknown, ship: string): Omit<DepartureFerry, 'checkpoints'> | null {
+ *  know, never survives). Its publish stamp and run stamps must sit within
+ *  the skew of `now` (the reader's clock). */
+export function departureRouteFromWire(v: unknown, ship: string, now = Date.now()): Omit<DepartureFerry, 'checkpoints'> | null {
   if (!isPlainObject(v) || !isDepartureShipId(ship) || v.shipRoomId !== ship) return null;
   if (typeof v.name !== 'string' || v.name.length === 0 || v.name.length > MAX_NAME_LEN) return null;
   if (!(typeof v.capacity === 'number' && Number.isFinite(v.capacity) && v.capacity >= 0 && v.capacity <= MAX_CAPACITY)) return null;
-  if (!(typeof v.at === 'number' && Number.isFinite(v.at) && v.at >= 0)) return null;
+  if (!(typeof v.at === 'number' && Number.isFinite(v.at) && v.at >= 0 && inSkew(v.at, now))) return null;
   const route = shipRouteFromWire(v.route);
-  if (!route) return null;
+  if (!route || !routeInSkew(route, now)) return null;
   // 🏁 A bad or misplaced endedRun is dropped, never the entry.
-  const endedRun = route.startedAt === undefined && isRunId(v.endedRun) ? v.endedRun : undefined;
+  const endedRun = route.startedAt === undefined && isRunId(v.endedRun) && inSkew(v.endedRun, now) ? v.endedRun : undefined;
   return { shipRoomId: ship, name: v.name, capacity: v.capacity, at: v.at, route, ...(endedRun !== undefined ? { endedRun } : {}) };
 }
 
@@ -288,7 +307,7 @@ function observedAt(e: RouteCheckpoint): number {
  * room id (replicas iterate in their own order). A ferry's checkpoints are
  * its route's current run only.
  */
-export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
+export function departureFerriesIn(map: Y.Map<unknown>, now = Date.now()): DepartureFerry[] {
   const candidates = new Map<string, Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }>>();
   const ckpts = new Map<string, Array<{ run: number; e: RouteCheckpoint }>>();
   let visited = 0;
@@ -297,12 +316,12 @@ export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
     const k = parseDepartureKey(key);
     if (!k) continue;
     if (k.kind === 'route') {
-      const entry = departureRouteFromWire(value, k.ship);
+      const entry = departureRouteFromWire(value, k.ship, now);
       if (entry) candidates.set(k.ship, [...(candidates.get(k.ship) ?? []), { key, entry }]);
       continue;
     }
     const list = ckpts.get(k.ship) ?? [];
-    const e = checkpointFromWire(k.ckpt, k.legSeq, value);
+    const e = checkpointInSkew(k.ckpt, k.legSeq, value, now);
     if (!e) continue;
     list.push({ run: k.run, e });
     ckpts.set(k.ship, list);
@@ -339,19 +358,19 @@ export function cleanDeparturesPublish(pub: DeparturesPublish, now: number): Dep
   if (!isDepartureShipId(pub.shipRoomId)) return null;
   const name = typeof pub.name === 'string' ? pub.name.trim().slice(0, MAX_NAME_LEN) : '';
   const route = shipRouteFromWire(routeToWire(pub.route));
-  if (!route) return null;
+  if (!route || !routeInSkew(route, now)) return null;
   if (!(Number.isFinite(pub.capacity) && pub.capacity >= 0 && pub.capacity <= MAX_CAPACITY)) return null;
   if (!(Number.isFinite(pub.at) && pub.at >= 0 && pub.at <= now + MAX_PUBLISH_SKEW_MS)) return null;
   const run = route.startedAt;
   const checkpoints: RouteCheckpoint[] = [];
   if (run !== undefined) {
     for (const e of pub.checkpoints) {
-      const clean = checkpointFromWire(e.kind, e.legSeq, checkpointToWire(e));
+      const clean = checkpointInSkew(e.kind, e.legSeq, checkpointToWire(e), now);
       if (!clean || clean.stationId !== route.stops[stopAt(route, clean.legSeq)]?.stationId) continue;
       checkpoints.push(clean);
     }
   }
-  const endedRun = run === undefined && isRunId(pub.endedRun) ? pub.endedRun : undefined;
+  const endedRun = run === undefined && isRunId(pub.endedRun) && inSkew(pub.endedRun, now) ? pub.endedRun : undefined;
   return {
     shipRoomId: pub.shipRoomId, name: name || 'FERRY', capacity: pub.capacity, route, checkpoints, at: pub.at,
     ...(endedRun !== undefined ? { endedRun } : {}),
@@ -398,7 +417,7 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
       continue;
     }
     if (k.kind !== 'route') continue;
-    const e = departureRouteFromWire(map.get(key), k.ship);
+    const e = departureRouteFromWire(map.get(key), k.ship, now);
     if (k.ship === ship) {
       mineRouteKeys.push(key);
       if (e) mineRoutes.push({ key, entry: e });
@@ -442,7 +461,7 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
     const current = new Map<string, RouteCheckpoint>();
     for (const { key, k } of mineKeys) {
       if (run === undefined || k.run !== run) { del(key); continue; }
-      const e = checkpointFromWire(k.ckpt, k.legSeq, map.get(key));
+      const e = checkpointInSkew(k.ckpt, k.legSeq, map.get(key), now);
       if (e) current.set(key, e); else del(key);
     }
     // This run's entries, one key per event, the newer observation kept.
