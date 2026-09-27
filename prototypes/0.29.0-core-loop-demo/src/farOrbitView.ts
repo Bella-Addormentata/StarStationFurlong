@@ -201,7 +201,7 @@ function gather(now: number): Source {
   const me = aboard || adrift
     ? null
     : currentStation() ??
-      all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0) ??
+      all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0 && !reallyMoving(s, now)) ??
       null;
   // The sun view only while the move really has a course right now (a
   // malformed record, say both ends on one planet, has none): otherwise the
