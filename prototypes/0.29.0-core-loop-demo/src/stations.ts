@@ -223,9 +223,11 @@ function isRecord(v: unknown): v is StationRecord {
 
 /** How each arrival this install has settled went: 'bounced' (its new
  *  planet was full the moment it got there, so it stayed where it left from)
- *  or 'arrived', keyed `<welcomeRoomId>|<departAt>`. Worked out again from
- *  the stations known now, a bounce could flip once the station that filled
- *  the planet moves on, pulling a station across without a transfer. */
+ *  or 'arrived', keyed by the move itself (welcome room, times, ends, mode),
+ *  so two moves leaving the same millisecond never share an outcome. Worked
+ *  out again from the stations known now, a bounce could flip once the
+ *  station that filled the planet moves on, pulling a station across
+ *  without a transfer. */
 const OUTCOME_KEY = 'ssf-station-arrivals';
 const MAX_OUTCOMES = 128;
 type ArrivalOutcome = 'bounced' | 'arrived';
@@ -467,7 +469,8 @@ export function listStations(
     // and move say for T.
     // Once decided here it stays decided: the others' later moves change
     // what "then" looks like from now, never where this one went.
-    const outcomeKey = `${candidates[i].welcomeRoomId}|${m.departAt}`;
+    const outcomeKey = [candidates[i].welcomeRoomId, m.departAt, m.bookedAt ?? m.departAt, m.fromPlanetId, m.fromSlot,
+      m.toPlanetId, m.toSlot, m.mode].join('|');
     let outcome = readArrivalOutcome(outcomeKey);
     if (!outcome) {
       const dest = planetById(m.toPlanetId).id;

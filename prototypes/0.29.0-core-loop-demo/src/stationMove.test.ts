@@ -721,6 +721,25 @@ describe('tugs: a torch tow', () => {
     expect(rememberMove(pin, lost.arriveAt + 10)).toBe(false);
   });
 
+  it('lets a cancel lose with its tow, and refuses a pin of an implausible move', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(tow);
+    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 1)).toBe(true);
+    const cancel = readStationMove()!;
+    expect(cancel.settles).toEqual(cleanMove(tow));
+    // A concurrent move leaving the same millisecond that beats the tow beats its cancel.
+    const rival = [{ ...tow, toSlot: tow.toSlot + 1 }, { ...tow, toSlot: tow.toSlot + 2 }]
+      .find((m) => compareMoves(m, tow) > 0)!;
+    expect(compareMoves(rival, cancel)).toBeGreaterThan(0);
+    // A pin wrapping a move decades away is refused like that move.
+    const far = { ...tow, departAt: NOW + 20 * 365 * 86_400_000, arriveAt: NOW + 20 * 365 * 86_400_000 + 1000 };
+    expect(isPlausibleMove({ ...cancel, settles: far }, NOW)).toBe(false);
+    expect(isPlausibleMove(cancel, NOW)).toBe(true);
+  });
+
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
     const plan = planStationTow(towCtx(), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);

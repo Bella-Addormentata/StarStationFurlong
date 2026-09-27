@@ -102,8 +102,10 @@ export const MOVE_HORIZON_MS = 7 * 24 * 3_600_000;
  * arrives from outside (room doc, remembered list, planet summary).
  */
 export function isPlausibleMove(m: StationMove, nowMs: number = Date.now()): boolean {
+  // A pin ranks as the move it settles, so that move must pass too.
   return m.departAt <= nowMs + MOVE_HORIZON_MS && m.arriveAt - m.departAt <= MOVE_HORIZON_MS
-    && bookedOf(m) <= nowMs + MOVE_HORIZON_MS;
+    && bookedOf(m) <= nowMs + MOVE_HORIZON_MS
+    && (!m.settles || isPlausibleMove(m.settles, nowMs));
 }
 
 /** When the move was booked: its own stamp, or (older records) its departure. */
@@ -522,9 +524,10 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
  * A tug that left its station behind: a DEPART written at the same moment
  * as a TOW (another tab, or one offline) flies the tug away while the tow
  * still says it is the station's engine. Whichever tab sees the two together
- * cancels the tow with a move that leaves the station where it was, one
- * millisecond after the tow: it wins the one order everywhere, so the tow is
- * never flown, held or paid for. Returns whether it wrote a cancel.
+ * cancels the tow with a move that leaves the station where it was, settling
+ * that tow: it ranks just after it everywhere, so the tow is never flown,
+ * held or paid for, and a move that beats the tow beats the cancel too.
+ * Returns whether it wrote a cancel.
  */
 export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs: number): boolean {
   if (flightStatus === 'docked') return false;
@@ -542,6 +545,7 @@ export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs
     arriveAt: departAt + 1,
     mode: 'thrusters',
     bookedAt: Math.floor(realMs),
+    settles: tow,
     fuel: 0,
     fuelDrawn: 0,
   });
