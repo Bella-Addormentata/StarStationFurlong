@@ -100,6 +100,19 @@ describe('Hohmann transfers', () => {
       .toBeCloseTo(plan.departAt + plan.synodicMs, 0);
   });
 
+  it('keeps a launch window when asked at its exact time', () => {
+    // Rounding can put an exact window a hair either side of the time asked
+    // about; a hair behind must not push the departure a whole synodic period out.
+    for (const [fromSlot, toSlot] of [[0, 1], [1, 0], [0, 15], [15, 14]]) {
+      for (let k = 0; k < 50; k++) {
+        const plan = planTransfer(station(fromSlot), station(toSlot), NOW + k * 78_919_113)!;
+        const again = planTransfer(station(fromSlot), station(toSlot), plan.departAt)!;
+        expect(again.departAt).toBe(plan.departAt);
+        expect(again.waitMs).toBe(0);
+      }
+    }
+  });
+
   it.each([
     ['outbound', 0, 3],
     ['inbound', 3, 1],
