@@ -113,7 +113,7 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { clearShipArrivalNote, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
 import { completeArrival } from "./shipArrival";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -157,6 +157,7 @@ import {
   listStations,
   registerStation,
   removeStation,
+  setRoomStationResolver,
   setStationRoomSource,
   stationForRoom,
 } from "./stations";
@@ -1175,8 +1176,14 @@ function shipStationHere(roomId: string): string | null {
     const st = partner ? stationForRoom(partner) : null;
     if (st) return st.id;
   }
-  const own = stationForRoom(roomId);
-  return own && own.welcomeRoomId === roomId ? own.id : null;
+  return ownStationOf(roomId);
+}
+
+/** The one-module station whose welcome room IS this room, straight from
+ *  the list (not stationForRoom, which a ship room resolves through its dock). */
+function ownStationOf(roomId: string): string | null {
+  if (!roomId) return null;
+  return listStations().find((st) => st.welcomeRoomId === roomId)?.id ?? null;
 }
 
 /** 🚀 #30 SH3: does this player command the current room's ship? */
@@ -1711,12 +1718,17 @@ async function joinRoomAtEpoch(
             ? DEFAULT_STATION.welcomeRoomLink
             : undefined),
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
-        () => {
-          const room = activeBootstrap?.roomId ?? "";
-          const own = room ? stationForRoom(room) : null;
-          return own && own.welcomeRoomId === room ? own.id : null;
-        },
+        () => ownStationOf(activeBootstrap?.roomId ?? ""),
       ),
+    );
+    // A ship is its own atlas station (docks are not station structure), so
+    // the room it stands in resolves through its live dock: the backdrop
+    // planet, the holotable and every stationForRoom caller then see the
+    // station it is docked at. Station rooms keep the atlas answer.
+    setRoomStationResolver((roomId) =>
+      roomId === activeBootstrap?.roomId && isShipReady()
+        ? shipStationHere(roomId)
+        : null,
     );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
