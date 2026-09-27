@@ -31,14 +31,20 @@
  * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
  * could each take it and settle spins; when the docs merge, only one of each
  * balance write survives. Settling can't be made split-safe without an
- * authoritative ledger (the Registry-anchored chips), so a second operator
- * never starts while the first may only be cut off: a session on ANOTHER
- * device takes over a lapsed lease only OPERATOR_UNCLEAN_TAKEOVER_MS later.
+ * authoritative ledger (the Registry-anchored chips), so a session on ANOTHER
+ * device takes over a lease it has seen lapse only
+ * OPERATOR_UNCLEAN_TAKEOVER_MS later, in case its holder is only cut off.
  * Tabs on one device share its local node, so they take over as soon as the
  * lease lapses (a reload, a closed tab). A session that stops operating
  * releases its lease, so a successor needn't wait; so does one leaving the
- * room, or the page (best effort on close). Only a split outlasting that
- * window can still put two operators in one room.
+ * room, or the page (best effort on close). That window guards only a lease
+ * this page has seen. One that sees no lease at all (cut off from the
+ * operator, or joining from a cached copy of the room before its live state
+ * arrives) takes it at once and operates after the settling wait, which is
+ * enough only where the two are connected: each sees the other's take, and
+ * the merge keeps one. So a split of any length that begins before a device
+ * has seen the other's lease can put two operators in one room; once it has,
+ * only a split outlasting the window can.
  *
  * CLOCKS: devices' clocks aren't synchronised, so a lease written on another
  * device is never judged by the expiry it claims: it lapses one
