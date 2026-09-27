@@ -1594,6 +1594,7 @@ async function joinRoomAtEpoch(
       world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
       roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
       world?.dockingSystem?.refreshPolicyUI();
+      world?.dockingSystem?.refreshProvisionGhost(); // its room shell shows the cupola
       refreshExteriorView();
     });
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle

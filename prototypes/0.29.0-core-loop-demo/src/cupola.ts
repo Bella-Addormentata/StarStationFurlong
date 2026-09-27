@@ -6,8 +6,8 @@
  * of its two octagon END CAPS a cupola (floorPlan `cupola` key, floorPlanDoc).
  * The room keeps its size, its floor plan and every other wall; only the last
  * `depth` metres at that end change. There the octagon barrel tapers into a
- * frustum: each of the octagon's 8 edges runs inward at 45° to a smaller,
- * ALIGNED octagon — the flat tip window standing in the end plane:
+ * frustum: each of the octagon's 8 edges runs inward to a smaller, ALIGNED
+ * octagon — the flat tip window standing in the end plane:
  *
  *        plan view (square room, cupola on y+)           end-on (tip window)
  *
@@ -18,11 +18,13 @@
  *      └┐                    ┌┘ ← corners cut at 45°               \    /
  *        └──────────────────┘   ← tip window (y+)                  └──┘
  *
- * The tapering is an OFFSET, not a scale, so every frustum face leans at the
- * same 45°: the two vertical walls step in by `depth` (the floor corners are
- * cut at exactly 45°, both walls keep their full height), the ridge drops by
- * `depth` and the basement floor rises by it. Ridge and basement keep their
- * widths, which keeps every face a PLANAR trapezoid (checked in cupola.test).
+ * The tapering is an OFFSET, not a scale: the two vertical walls step in by
+ * `depth` (the floor corners are cut at exactly 45°, both walls keep their
+ * full height), the ridge drops by `depth` and the basement floor rises by it,
+ * so those four faces lean 45°. The four diagonal faces (eaves and basement
+ * chamfers) lean less, about 35°, because their edges must meet the walls at
+ * full wall height. Ridge and basement keep their widths, which keeps every
+ * face a PLANAR trapezoid (checked in cupola.test).
  *
  * The cupola sits INSIDE the room's footprint, so the module's envelope — its
  * docking, its place in the station, its exterior layout — is unchanged. The
@@ -81,8 +83,9 @@ export function cupolaDepth(profile: OctagonProfile): number {
 }
 
 /**
- * The tip window's outline: the base octagon offset inward by `depth` (see the
- * module header). Same vertex order as OctagonProfile.outline, so edge i of the
+ * The tip window's outline: the base octagon's walls, ridge and basement floor
+ * each moved inward by `depth` (see the module header for the face angles).
+ * Same vertex order as OctagonProfile.outline, so edge i of the
  * base and edge i of the tip bound frustum face i.
  */
 export function cupolaTipOutline(profile: OctagonProfile, depth: number): SectionPoint[] {
