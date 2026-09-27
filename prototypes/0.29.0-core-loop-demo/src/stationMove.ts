@@ -51,7 +51,7 @@ import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { interplanetaryPointAt, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
-import { MAX_ORBIT_SLOTS, PLANETS, moveBelongsTo, planetById, setStationMoveResolver } from './stations';
+import { MAX_ORBIT_SLOTS, PLANETS, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit } from './stations';
 import type { MovingStation, StationMove, StationRecord } from './stations';
 
 export type { StationMove } from './stations';
@@ -98,6 +98,16 @@ export const MOVE_HORIZON_MS = 7 * 24 * 3_600_000;
  */
 export function isPlausibleMove(m: StationMove, nowMs: number = Date.now()): boolean {
   return m.departAt <= nowMs + MOVE_HORIZON_MS && m.arriveAt - m.departAt <= MOVE_HORIZON_MS;
+}
+
+/** One total order on a station's moves, the same on every client: the
+ *  later departure wins, and two leaving the same millisecond are told apart
+ *  by their serialized records. Positive when `a` wins. */
+export function compareMoves(a: StationMove, b: StationMove): number {
+  if (a.departAt !== b.departAt) return a.departAt - b.departAt;
+  const sa = JSON.stringify(cleanMove(a));
+  const sb = JSON.stringify(cleanMove(b));
+  return sa === sb ? 0 : sa > sb ? 1 : -1;
 }
 
 /** Only the fields a move has — what a write publishes. */
@@ -445,6 +455,20 @@ export function isTowing(roomId: string, realMs: number): boolean {
   return !!move && move.mode === 'tug' && move.tugRoomId === roomId && isMoveActive(move, realMs);
 }
 
+/** Does a move hold this dock still? A tug's tow under way (either end), or
+ *  either end belonging to a station between planets: every ship docked to
+ *  it rides along, and none may leave or join it until it arrives. Before a
+ *  thruster move leaves, and after any move arrives, docks work as usual. */
+export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
+  if (towHoldsDock(roomIds, realMs)) return true;
+  return roomIds.some((id) => {
+    if (!id) return false;
+    const station = stationForRoom(id);
+    const move = station ? latestMoveOf(station) : null;
+    return !!move && stationInTransit({ move }, realMs);
+  });
+}
+
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
  *  by the bound room's record or any move this install remembers? Its dock
  *  holds the station, so neither end may UNDOCK it — from the tug's docking
@@ -531,8 +555,7 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
   const at = list.findIndex((m) => sameStation(m, move));
   if (at >= 0) {
     const old = list[at];
-    if (old.departAt > move.departAt) return false;
-    if (JSON.stringify(old) === JSON.stringify(cleanMove(move))) return false;
+    if (compareMoves(move, old) <= 0) return false;
     list[at] = cleanMove(move);
   } else {
     list.push(cleanMove(move));

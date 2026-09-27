@@ -366,8 +366,15 @@ export function listStations(
     const m = c.move;
     if (m && nowMs >= m.arriveAt) {
       const T = m.arriveAt;
-      const there = candidates.filter((o, j) => j !== i
-        && planetById(placeWithMove(o.base, o.move, T).planetId).id === planetById(m.toPlanetId).id).length;
+      // Where each other station was at T: its settled place when it had
+      // already arrived (after any bounce of its own), else what its record
+      // and move say for T.
+      const dest = planetById(m.toPlanetId).id;
+      const there = candidates.filter((o, j) => {
+        if (j === i) return false;
+        if (settledAt(o) <= T) return spots[j]?.planetId === dest;
+        return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
+      }).length;
       if (there >= MAX_ORBIT_SLOTS) at = { planetId: m.fromPlanetId, orbitSlot: m.fromSlot };
     }
     let slot = claim(at.planetId, at.orbitSlot);

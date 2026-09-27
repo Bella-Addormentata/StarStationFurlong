@@ -40,7 +40,7 @@ import * as Y from 'yjs';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, isPlausibleMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
+import { cleanMove, compareMoves, isPlausibleMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
 import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -239,7 +239,7 @@ function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): Shared
 function newerMove(a: StationMove | undefined, b: StationMove | undefined): StationMove | undefined {
   if (!a) return b;
   if (!b) return a;
-  return b.departAt > a.departAt ? b : a;
+  return compareMoves(b, a) > 0 ? b : a;
 }
 
 /** Merge an incoming station summary into a known one: the newer record,

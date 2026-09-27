@@ -1877,7 +1877,9 @@ async function joinRoomAtEpoch(
       writeFlightRecord({
         status: "redocking",
         locationId: rec.destinationId ?? rec.locationId,
+        departedAt: rec.departedAt,
         etaAt: rec.etaAt,
+        castOffAt: rec.castOffAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.

@@ -320,7 +320,9 @@ export function completeArrival(
   // Since the ship cast off — the booking, not the launch window it waited
   // for (older records carry only the window).
   const leftAt = rec.castOffAt ?? rec.departedAt;
-  const movedMidFlight = !!moved && leftAt !== undefined && moved.departAt > leftAt && moved.departAt <= now;
+  // Any move that was still under way (or not yet begun) when the ship left
+  // and has begun by now overlaps its time away.
+  const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
   if (stationInTransit(station, now) || movedMidFlight) {
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
   }

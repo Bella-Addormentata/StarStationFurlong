@@ -23,6 +23,8 @@ import {
   MOVE_HORIZON_MS,
   bindStationMoveDoc,
   isPlausibleMove,
+  compareMoves,
+  dockLockedByMove,
   cleanMove,
   freeSlotAround,
   isTowing,
@@ -216,6 +218,29 @@ describe('the station list follows a move', () => {
     const later = listStations({}, full, leaves.arriveAt + 1);
     expect(later.filter((s) => s.planetId === ARIS)).toHaveLength(15);
     expect(later.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+
+    // A second arrival after the vacancy finds room: the bounced station
+    // counts where it settled (home), not where it was headed.
+    const second: StationMove = {
+      ...move, stationId: 'late', welcomeRoomId: 'late', fromSlot: 9, departAt: leaves.arriveAt + 10, arriveAt: leaves.arriveAt + 20,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move
+      : st.welcomeRoomId === 'a15' ? leaves : st.welcomeRoomId === 'late' ? second : null));
+    const lateRec: StationRecord = { id: 'late', name: 'LATE', planetId: SOV, orbitSlot: 9, welcomeRoomId: 'late' };
+    const withSecond = listStations({}, [...full, lateRec], second.arriveAt + 1);
+    expect(withSecond.find((s) => s.id === 'late')).toMatchObject({ planetId: ARIS });
+    expect(withSecond.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
+  });
+
+  it('holds every dock of a station between planets, and only then', () => {
+    const move = moveTo();
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    const room = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const mid = (move.departAt + move.arriveAt) / 2;
+    expect(dockLockedByMove([room], move.departAt - 1)).toBe(false);
+    expect(dockLockedByMove(['ship-room', room], mid)).toBe(true);
+    expect(dockLockedByMove(['ship-room'], mid)).toBe(false);
+    expect(dockLockedByMove([room], move.arriveAt)).toBe(false);
   });
 });
 
@@ -356,6 +381,11 @@ describe('moves between installs', () => {
     const later = { ...move, departAt: move.departAt + 1000, arriveAt: move.arriveAt + 1000 };
     expect(mergeStation(summary, { ...summary, move: later })?.move).toEqual(later);
     expect(mergeStation({ ...summary, move: later }, summary)).toBeNull();
+    // Two moves leaving the same millisecond: one winner, whatever the order.
+    const twin = { ...move, toSlot: move.toSlot + 1 };
+    const winner = compareMoves(twin, move) > 0 ? twin : move;
+    expect(mergeStation({ ...summary, move }, { ...summary, move: twin })?.move ?? move).toEqual(winner);
+    expect(mergeStation({ ...summary, move: twin }, { ...summary, move })?.move ?? twin).toEqual(winner);
 
     // A second install pulls the summary from a room doc and learns the move.
     store.clear();
