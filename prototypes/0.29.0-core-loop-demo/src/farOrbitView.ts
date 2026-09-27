@@ -59,8 +59,10 @@ const MODULE_PX = 7;
 const SHIP_PX = 9;
 const PLANET_PX = 16;
 const SUN_PX = 30;
-/** Most boxes drawn for one station. */
-const MAX_MODULE_BOXES = 8;
+/** Boxes per row of a station impostor; bigger stations wrap to more rows.
+ *  Every module gets a box (a station's count is bounded by the atlas cap,
+ *  stationAtlas.MAX_ENTRIES, and every box shares one geometry and material). */
+const MODULES_PER_ROW = 8;
 /** How often the list of what is out there is re-read, real ms. */
 const REFRESH_MS = 1000;
 
@@ -132,7 +134,9 @@ function gather(now: number): Source {
       null;
   if (me?.move && stationInTransit(me, now)) {
     const m = me.move;
-    return { mode: 'sun', move: m, key: `sun|${m.welcomeRoomId}|${m.departAt}|${m.arriveAt}` };
+    return { mode: 'sun', move: m, key: [
+        'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
+      ].join('|') };
   }
 
   const planetId = aboard
@@ -165,7 +169,12 @@ function gather(now: number): Source {
     if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
     if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
     const plan = flightPlan(byRoom(ship.fromRoom), byRoom(ship.toRoom), ship.departedAt, ship.etaAt);
-    if (plan) ships.push({ id: `ship:${ship.roomId}`, name: ship.name, plan });
+    // Only ships on their transfer right now: the gather re-runs every
+    // REFRESH_MS, so a ship joins the key at departure and leaves it at
+    // arrival, and the static frame is rebuilt at both.
+    if (plan && transferPointAt(plan, now).leg === 'transfer') {
+      ships.push({ id: `ship:${ship.roomId}`, name: ship.name, plan });
+    }
   }
 
   const key = [
@@ -294,13 +303,17 @@ function circle(radius: number, color: number, opacity: number): THREE.LineLoop 
 
 function stationImpostor(body: FarBody): THREE.Object3D {
   const g = new THREE.Group();
-  const n = Math.min(MAX_MODULE_BOXES, body.modules);
+  const n = body.modules;
+  const perRow = Math.min(MODULES_PER_ROW, n);
+  const rows = Math.ceil(n / perRow);
   const geo = new THREE.BoxGeometry(1, 0.8, 1);
   const mat = new THREE.MeshStandardMaterial({ color: STATION_COLOR, roughness: 0.6, metalness: 0.3, emissive: 0x223344 });
-  // A row of modules along the direction of travel (local −Z), centred.
+  // Rows of modules along the direction of travel (local −Z), stacked
+  // outward (+X), centred.
   for (let i = 0; i < n; i++) {
     const box = new THREE.Mesh(geo, mat);
-    box.position.z = -(i - (n - 1) / 2) * 1.25;
+    box.position.z = -((i % perRow) - (perRow - 1) / 2) * 1.25;
+    box.position.x = (Math.floor(i / perRow) - (rows - 1) / 2) * 1.25;
     g.add(box);
   }
   return g;
