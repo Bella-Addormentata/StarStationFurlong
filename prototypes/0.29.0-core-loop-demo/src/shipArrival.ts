@@ -214,7 +214,7 @@ export function berthToRemember(ports: readonly ArrivalPort[]): BerthMemoryRecor
     if (p.state.kind !== 'docked') continue;
     const rec = p.state.record;
     const roomId = roomOf(p.state.address);
-    if (!roomId) return null;
+    if (!roomId) continue; // a malformed dock: keep looking for a good one
     const out: BerthMemoryRecord = { doorId: p.doorId, roomId };
     if (rec.farDoor) out.farDoor = rec.farDoor;
     if (rec.farWall) out.farWall = rec.farWall;

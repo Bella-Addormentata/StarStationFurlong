@@ -181,6 +181,12 @@ describe('berthToRemember', () => {
       { doorId: 'north', state: dockedTo(SEED_FURLONG) },
     ])).toEqual({ doorId: 'north', roomId: FURLONG_ROOM, farDoor: 'south', farWall: 'y+' });
     expect(berthToRemember([{ doorId: 'east', state: FREE }])).toBeNull();
+    // A dock whose address names no room is skipped, not the end of the scan.
+    const junk = { ...dockedTo(SEED_FURLONG), address: 'ssf://room#nothing' } as ArrivalPort['state'];
+    expect(berthToRemember([
+      { doorId: 'east', state: junk },
+      { doorId: 'north', state: dockedTo(SEED_HIGH) },
+    ])?.roomId).toBe(HIGH_ROOM);
   });
 });
 
