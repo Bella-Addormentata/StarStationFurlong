@@ -9,7 +9,8 @@
 
 import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
-import { angleAt, stationOrbit } from './orbits';
+import { angleAt, realMsFor, stationOrbit } from './orbits';
+import { planetSunOrbit, sunAngleAt } from './solarOrbits';
 
 export interface MapBody {
   id: string;
@@ -78,6 +79,20 @@ export function stationBodies(stations: StationRecord[]): MapBody[] {
   });
 }
 
+/** ☀️ A planet's true angle around the sun on the shared clock
+ *  (solarOrbits.ts). The holotable keeps its schematic distances. */
+function planetAngleAt(planetId: string): (nowMs: number) => number {
+  const orbit = planetSunOrbit(planetId);
+  return (nowMs: number) => sunAngleAt(orbit, nowMs);
+}
+
+/** "One year every 6d 02h" — a planet's real-time year for the readout. */
+function yearReadout(planetId: string): string {
+  const ms = realMsFor(planetSunOrbit(planetId).periodS);
+  const h = Math.round(ms / 3_600_000);
+  return `One year every ${Math.floor(h / 24)}d ${String(h % 24).padStart(2, '0')}h.`;
+}
+
 export class SolarSystemMap {
   private container: HTMLDivElement | null = null;
   private mapArea: HTMLDivElement | null = null;
@@ -113,6 +128,7 @@ export class SolarSystemMap {
   }
 
   private initializeBodies() {
+    const sovereignAngle = planetAngleAt('planet-sovereign');
     this.bodies = [
       {
         id: 'star-sol',
@@ -128,9 +144,10 @@ export class SolarSystemMap {
         name: 'ARIS PRIME',
         type: 'planet',
         orbitRadius: 100,
-        orbitSpeed: 0.002,
+        orbitSpeed: 0,
         angle: 0.5,
-        description: 'Lava-rich dense inner planet. Rich in heavy iron ore pockets.',
+        angleAt: planetAngleAt('planet-aris'),
+        description: `Lava-rich dense inner planet. Rich in heavy iron ore pockets. ${yearReadout('planet-aris')}`,
         resources: [{ type: 'Iron Ore', yield: 800 }],
       },
       {
@@ -138,11 +155,10 @@ export class SolarSystemMap {
         name: 'SOVEREIGN II',
         type: 'planet',
         orbitRadius: 180,
-        orbitSpeed: 0.0012,
-        semiMajorAxis: 180,
-        eccentricity: 0.15, // Elliptical Orbit
+        orbitSpeed: 0,
         angle: 1.2,
-        description: 'Carbon-silica rich terra planet holding Furlong System main station.',
+        angleAt: sovereignAngle,
+        description: `Carbon-silica rich terra planet holding Furlong System main station. ${yearReadout('planet-sovereign')}`,
         resources: [{ type: 'Silica', yield: 1200 }],
       },
       ...stationBodies(listStations()),
@@ -150,10 +166,10 @@ export class SolarSystemMap {
         id: 'lagrange-l4',
         name: 'SOVEREIGN L4 APEX',
         type: 'lagrange',
-        parentId: 'planet-sovereign',
-        orbitRadius: 180,
-        orbitSpeed: 0.0012, // Co-orbital with parent
+        orbitRadius: 180, // On Sovereign's orbit around the sun
+        orbitSpeed: 0,
         angle: 1.2 + (Math.PI / 3.0), // 60 degrees ahead (stable Lagrange L4)
+        angleAt: (nowMs: number) => sovereignAngle(nowMs) + Math.PI / 3,
         lagrangePoint: 'L4',
         description: 'Gravitationally stable Lagrange co-orbital pocket. Ideal for modular outposts.',
       },
@@ -161,10 +177,10 @@ export class SolarSystemMap {
         id: 'lagrange-l5',
         name: 'SOVEREIGN L5 REFUGE',
         type: 'lagrange',
-        parentId: 'planet-sovereign',
-        orbitRadius: 180,
-        orbitSpeed: 0.0012, // Co-orbital
+        orbitRadius: 180, // On Sovereign's orbit around the sun
+        orbitSpeed: 0,
         angle: 1.2 - (Math.PI / 3.0), // 60 degrees behind (stable Lagrange L5)
+        angleAt: (nowMs: number) => sovereignAngle(nowMs) - Math.PI / 3,
         lagrangePoint: 'L5',
         description: 'Stable Lagrange refuge pocket. Uncharted asteroid debris.',
         resources: [{ type: 'Rare Mineral', yield: 250 }],
@@ -417,7 +433,8 @@ export class SolarSystemMap {
     let angle = body.angle;
 
     // Simulate orbital movement as a function of the simulation clock tick —
-    // or, for stations, the true angle on the shared orbital clock.
+    // or, for planets, stations and Lagrange points, the true angle on the
+    // shared orbital clock.
     angle = body.angleAt ? body.angleAt(this.clock()) : angle + body.orbitSpeed * this.simTick;
 
     if (body.parentId) {
@@ -601,7 +618,8 @@ export class SolarSystemMap {
 
     // 1. Draw Kepler orbits
     for (const body of this.bodies) {
-      if (body.type === 'star' || body.parentId) continue;
+      // Lagrange points ride Sovereign's own orbit: no ring of their own.
+      if (body.type === 'star' || body.type === 'lagrange' || body.parentId) continue;
 
       ctx.beginPath();
       ctx.strokeStyle = body.id === 'belt-ring' ? 'rgba(212, 168, 75, 0.1)' : 'rgba(212, 168, 75, 0.08)';
