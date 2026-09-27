@@ -122,8 +122,7 @@ export interface CupolaPlan {
 
 /** Resolve a stored cupola wall against a room size. Null when there is no
  *  cupola, or the wall is not an end wall at this size (a resize turned it
- *  into a side wall) — the room then renders plain, and the setting comes back
- *  if the room is resized back. */
+ *  into a side wall; writeRoomDims clears it then) — the room renders plain. */
 export function cupolaPlan(
   opts: HullSectionOpts,
   wall: CupolaWall | null | undefined,

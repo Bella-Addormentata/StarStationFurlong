@@ -1447,6 +1447,7 @@ export class World {
     if (sig === this.cupolaSig) return;
     this.cupolaSig = sig;
     rebakeWalkableGrid();
+    this.player.onWalkShapeChanged(); // out of a glass corner; replan the walk
     if (this.platformFloor) {
       const old = this.platformFloor.geometry;
       this.platformFloor.geometry = this.makeFloorGeometry();

@@ -307,9 +307,9 @@ function recomputeRoomHalf(): void {
 
 // ── 🔭 Cupola end wall (cupola.ts) ───────────────────────────────────────────
 // `floorPlan.cupola → { wall }`: which END wall is an eight-sided observation
-// cupola. Absent / malformed ⇒ none (every existing room, unchanged). Stored as
-// the wall label, so a resize that turns that wall into a side wall simply
-// renders it plain (cupolaPlan → null) until the room is resized back.
+// cupola. Absent / malformed ⇒ none (every existing room, unchanged). A resize
+// that turns that wall into a side wall clears it (writeRoomDims); a record
+// that is a side wall anyway (a peer's write) just renders plain.
 
 /** The cupola is part of the octagon hull; the legacy flat-box room
  *  (`?octagon=0`) draws none, so it must not walk or place round one either.
@@ -439,6 +439,13 @@ export function writeRoomDims(cols: number, rows: number): void {
   if (c === null || r === null) return;
   boundDoc!.transact(() => {
     planMap!.set('dims', { cols: c, rows: r });
+    // 🔭 A resize that makes the cupola wall a SIDE wall ends the cupola —
+    // kept dormant, it could come back over doors or windows placed on that
+    // wall meanwhile, none of which validateCupolaWall ever saw.
+    const cupolaWall = readCupolaWall();
+    if (cupolaWall && !cupolaPlan({ halfX: c * TILE_SIZE / 2, halfZ: r * TILE_SIZE / 2 }, cupolaWall)) {
+      planMap!.delete('cupola');
+    }
     const nonDefault = c !== DEFAULT_DIMS.cols || r !== DEFAULT_DIMS.rows;
     if (nonDefault) {
       planMap!.set('meta', { v: 2 });

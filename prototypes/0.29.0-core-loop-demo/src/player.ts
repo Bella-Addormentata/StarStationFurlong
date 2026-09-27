@@ -986,6 +986,22 @@ export class Player {
     );
   }
 
+  /**
+   * 🔭 The room's walkable SHAPE changed (a cupola set or cleared): step out
+   * of a corner that is glass now, then replan any walk across the new grid.
+   * Left alone mid door walk-through or seated — both are already off the
+   * open floor on purpose.
+   */
+  public onWalkShapeChanged(): void {
+    if (this.getActiveDoorId() === null && this.getSeatedSeatId() === null) {
+      const p = this.mesh.position;
+      const onFloor = clampToRoomWalk(p.x, p.z);
+      p.x = onFloor.x;
+      p.z = onFloor.z;
+    }
+    this.onObstaclesChanged();
+  }
+
   /** Returns the player's current world-space position. */
   getPosition(): THREE.Vector3 {
     return this.mesh.position.clone();

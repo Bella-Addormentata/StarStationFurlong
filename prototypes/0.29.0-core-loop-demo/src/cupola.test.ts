@@ -139,13 +139,15 @@ describe('floorPlan cupola setting', () => {
     expect(roomCupola()).toBeNull();
   });
 
-  it('renders plain while a resize makes the stored wall a side wall', () => {
+  it('ends the cupola when a resize makes its wall a side wall', () => {
     writeCupolaWall('y-');
+    writeRoomDims(2, 3); // 12 × 18: still extrudes along z, y− still an end
+    expect(roomCupola()?.wall).toBe('y-');
     writeRoomDims(3, 2); // 18 × 12: now extrudes along x, y± are side walls
-    expect(readCupolaWall()).toBe('y-');
+    expect(readCupolaWall()).toBeNull();
     expect(roomCupola()).toBeNull();
     writeRoomDims(2, 2);
-    expect(roomCupola()?.wall).toBe('y-');
+    expect(roomCupola()).toBeNull(); // not revived over whatever went there meanwhile
   });
 });
 
