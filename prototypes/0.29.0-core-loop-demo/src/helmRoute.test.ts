@@ -24,6 +24,8 @@ import {
   readShipRoute,
 } from './shipRoute';
 import type { RouteStop, ShipRoute } from './shipRoute';
+import { adriftAt } from './stationDirectory';
+import { listStations, planetById } from './stations';
 import type { StationBerthRecord } from './stations';
 import {
   DEFAULT_WAIT_SECS,
@@ -690,6 +692,19 @@ describe('the helm writers', () => {
     expect(readRouteFlight(departAt + SEC)).toMatchObject({ status: 'in-flight', legSeq: 0 });
     // Not twice: the leg has gone.
     expect(departRouteFromHelm({ now: departAt + SEC })).toBeNull();
+  });
+
+  it("a person's route DEPART records where its next stop orbits as it casts off (PR 174's destinationAt)", () => {
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const r = saved([0, 1], { robotDockId: undefined });
+    r.stops[1] = { ...r.stops[1], stationId: 'furlong-station' };
+    const { departAt } = start(r);
+    expect(departRouteFromHelm({ now: departAt - 10 * SEC })).not.toBeNull();
+    expect(readFlightRecord()).toMatchObject({
+      status: 'in-flight',
+      destinationId: 'furlong-station',
+      destinationAt: adriftAt(planetById(home.planetId).id, home.orbitSlot),
+    });
   });
 
   it('a route DEPART pressed late takes the next window', () => {
