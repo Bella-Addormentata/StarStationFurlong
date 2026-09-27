@@ -416,9 +416,12 @@ function scheduleMoved(mirror: DepartureRow, newer: DepartureRow): boolean {
  * The map's entry for a ferry is its last publish that reached this room
  * (DepartureFerry.at). A summary the ferry wrote AFTER it wins where they
  * disagree, since a publish can give up or a finished route's entry stays
- * behind: said since that no route runs, or that a later run flies, the
- * held row goes; a row where the map has none, from a later run, or with
- * another gate or time, replaces the map's.
+ * behind: said since that no run flies (🏁 `routeIdle`), or that a later
+ * run flies, the held row goes; a row where the map has none, from a later
+ * run, with another gate or time, or knowing of a checkpoint the map lacks
+ * (a hold, a pause…: `routeNews`), replaces the map's, and with no row of
+ * its own that last reads DELAYED, time unknown. A summary with no route
+ * fields at all (an older client's relay drops them) changes nothing.
  */
 export function boardView(i: BoardInput): BoardView {
   const rows: DepartureRow[] = [];
@@ -435,16 +438,26 @@ export function boardView(i: BoardInput): BoardView {
     const r = ferryRow(ferry, i.here, i.now, cache);
     const s = summaryOf.get(ferry.shipRoomId);
     if (s && i.isHereRoom && s.updatedAt > ferry.at) {
-      if (!s.routeStatus) continue;
-      // A later run than the one this room holds (a replacement route): the
-      // held one is over, whether or not the new one calls here now.
-      const laterRun = s.routeRun !== undefined && s.routeRun > (ferry.route.startedAt ?? ferry.endedRun ?? 0);
-      const sr = summaryRow(s, i.isHereRoom, placeOf, i.now);
-      if (sr && (!r || laterRun || scheduleMoved(r, sr))) {
-        rows.push(sr);
-        continue;
+      if (s.routeIdle) continue;
+      if (s.routeStatus) {
+        // A later run than the one this room holds (a replacement route): the
+        // held one is over, whether or not the new one calls here now.
+        const laterRun = s.routeRun !== undefined && s.routeRun > (ferry.route.startedAt ?? ferry.endedRun ?? 0);
+        // The same run, and the ship knows of a checkpoint this room's copy
+        // lacks (its publish gave up): the held timetable is out of date.
+        const missed = !laterRun && s.routeRun !== undefined && s.routeRun === ferry.route.startedAt
+          && s.routeNews !== undefined && s.routeNews > newestRouteNews(ferry.checkpoints);
+        const sr = summaryRow(s, i.isHereRoom, placeOf, i.now);
+        if (sr && (!r || laterRun || missed || scheduleMoved(r, sr))) {
+          rows.push(sr);
+          continue;
+        }
+        if (laterRun) continue;
+        if (missed && r) {
+          rows.push({ ...r, status: 'DELAYED', at: null, note: 'time unknown', asOf: s.updatedAt });
+          continue;
+        }
       }
-      if (laterRun) continue;
     }
     if (r) rows.push(r);
   }
@@ -486,6 +499,16 @@ export interface RouteSummaryFields {
   departAt?: number;
   routeStatus?: RouteStatus;
   routeRun?: number;
+  routeNews?: number;
+  routeIdle?: true;
+}
+
+/** The newest checkpoint's event time (a hold's first sighting, not its
+ *  renewals), or 0: what a summary's `routeNews` compares against. */
+export function newestRouteNews(checkpoints: readonly RouteCheckpoint[]): number {
+  let t = 0;
+  for (const e of checkpoints) if (Number.isFinite(e.at) && e.at > t) t = e.at;
+  return t;
 }
 
 /**
@@ -508,7 +531,8 @@ export function routePortGate(
 /**
  * The route fields of the ship's own summary (A9 item 7), from its
  * timetable and its own live dock at the stop (`dock`: docked there, and at
- * which gate when known). Empty when no route runs or it has ended. Pure.
+ * which gate when known), with the run's newest checkpoint. 🏁 `routeIdle`
+ * alone when no route runs or it has ended. Pure.
  */
 export function routeSummaryFields(
   route: ShipRoute | null,
@@ -517,10 +541,12 @@ export function routeSummaryFields(
   dock: { gate?: number } | null,
   now: number,
 ): RouteSummaryFields {
-  if (!isRouteRunning(route) || !f || f.ended === 'stop') return {};
+  if (!isRouteRunning(route) || !f || f.ended === 'stop') return { routeIdle: true };
   const next = route.stops[f.nextStopIndex];
   const out: RouteSummaryFields = {};
   if (route.startedAt !== undefined) out.routeRun = route.startedAt;
+  const news = newestRouteNews(checkpoints);
+  if (news > 0) out.routeNews = news;
   if (next) out.nextStopRoom = next.berth.roomId;
   if (f.paused) {
     out.routeStatus = 'paused';

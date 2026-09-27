@@ -1413,7 +1413,8 @@ function planetShipStatus(): ShipStatusInput | null {
   if (rec.etaAt !== undefined) out.etaAt = rec.etaAt;
   // 🚏📋 A9 item 7: a route ferry's gate, next stop, departure and status,
   // for the all-gates boards of other rooms ("as of" this summary's time).
-  // Empty for a ship with no running route. Old clients drop the fields.
+  // 🏁 Just routeIdle for a ship with no running route. Old clients drop
+  // the fields.
   Object.assign(
     out,
     routeSummaryFields(readShipRoute(), readRouteFlight(now), readRouteCheckpoints(), shipRoutePortDock(now), now),

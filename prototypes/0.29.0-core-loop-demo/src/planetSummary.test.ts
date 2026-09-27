@@ -128,16 +128,24 @@ describe('guards', () => {
   it('keeps a route ferry\'s gate, next stop, departure and status; a bad one drops alone', () => {
     const ship = {
       roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a',
-      gate: 2, nextStopRoom: 'room-b', departAt: T0 + 60_000, routeStatus: 'boarding', routeRun: T0 - 60_000, updatedAt: T0,
+      gate: 2, nextStopRoom: 'room-b', departAt: T0 + 60_000, routeStatus: 'boarding', routeRun: T0 - 60_000, routeNews: T0 - 30_000, updatedAt: T0,
     };
     expect(cleanShipSummary(ship, T0)).toEqual(ship);
     for (const [field, bad] of [['gate', 0], ['gate', 100], ['gate', 1.5], ['nextStopRoom', ''], ['nextStopRoom', 'r'.repeat(129)],
-      ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3], ['routeRun', 0], ['routeRun', 1.5], ['routeRun', 'x']] as const) {
+      ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3], ['routeRun', 0], ['routeRun', 1.5], ['routeRun', 'x'],
+      ['routeNews', 0], ['routeNews', 1.5], ['routeNews', 'x']] as const) {
       const clean = cleanShipSummary({ ...ship, [field]: bad }, T0);
       expect(clean).not.toBeNull();
       expect(clean).not.toHaveProperty(field);
       expect(clean?.status).toBe('docked');
     }
+  });
+
+  it('🏁 keeps "no run flies" only as said, and never beside a route status', () => {
+    const idle = { roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a', routeIdle: true, updatedAt: T0 };
+    expect(cleanShipSummary(idle, T0)).toEqual(idle);
+    expect(cleanShipSummary({ ...idle, routeIdle: 'yes' }, T0)).not.toHaveProperty('routeIdle');
+    expect(cleanShipSummary({ ...idle, routeStatus: 'boarding' }, T0)).not.toHaveProperty('routeIdle');
   });
 });
 

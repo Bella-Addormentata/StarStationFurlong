@@ -110,6 +110,14 @@ export interface ShipSummary {
   /** 🚏 The run it flies (the route's startedAt), so a board can tell a
    *  replacement route from a later stop of the one it holds. */
   routeRun?: number;
+  /** 🚏 The newest checkpoint of that run (its event time: a hold, a skip,
+   *  a pause, a person's departure…), so a board can tell that its own copy
+   *  of the timetable missed one. */
+  routeNews?: number;
+  /** 🏁 No route run flies (none set, not started, or ended). Said outright
+   *  because an older client's relay drops every route field: a summary
+   *  with none of them says nothing about a route. */
+  routeIdle?: true;
   updatedAt: number;
 }
 
@@ -225,6 +233,8 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
     out.routeStatus = v.routeStatus as ShipRouteStatus;
   }
   if (Number.isSafeInteger(v.routeRun) && (v.routeRun as number) > 0) out.routeRun = v.routeRun as number;
+  if (Number.isSafeInteger(v.routeNews) && (v.routeNews as number) > 0) out.routeNews = v.routeNews as number;
+  if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   return out;
 }
 

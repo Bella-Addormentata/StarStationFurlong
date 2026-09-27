@@ -315,9 +315,13 @@ describe('the board', () => {
     // Another gate, or the same status at another time: the newer word.
     expect(view(mine({ gate: 3 }))).toEqual([expect.objectContaining({ gate: 3, asOf: T0 + 5 * SEC })]);
     expect(view(mine({ departAt: s.departAt + 5 * MIN }))).toEqual([expect.objectContaining({ at: s.departAt + 5 * MIN, asOf: T0 + 5 * SEC })]);
-    // Said since that no route runs: off the board. Said before: no say.
-    expect(view(mine({ routeStatus: undefined }))).toEqual([]);
-    expect(view(mine({ routeStatus: undefined, updatedAt: T0 - SEC }))).toHaveLength(1);
+    // 🏁 Said since that no run flies: off the board. Said before: no say.
+    const idle: ShipSummary = { roomId: SHIP, name: 'Ferry One', planetId: SOV, status: 'docked', fromRoom: 'room-0', routeIdle: true, updatedAt: T0 + 5 * SEC };
+    expect(view(idle)).toEqual([]);
+    expect(view({ ...idle, updatedAt: T0 - SEC })).toHaveLength(1);
+    // No route fields at all (an older client's relay drops them): no say either.
+    const { routeIdle: _i, ...stripped } = idle;
+    expect(view(stripped)).toEqual([expect.objectContaining({ status: 'BOARDING', at: s.departAt })]);
     // A finished route's entry left behind makes no row: a newer summary fills it.
     const finished = ferry(running({ stoppedAt: T0 + SEC }), [s]);
     expect(view(mine(), finished)).toEqual([expect.objectContaining({ status: 'BOARDING', asOf: T0 + 5 * SEC })]);
@@ -329,6 +333,17 @@ describe('the board', () => {
     // The same run, calling elsewhere now: the held timetable still says
     // when it calls here.
     expect(view(mine({ routeRun: T0, fromRoom: 'room-7' }))).toEqual([expect.objectContaining({ status: 'BOARDING', at: s.departAt })]);
+    // The ship knows of a checkpoint this room's copy lacks (a pause here
+    // whose publish gave up): its word wins even where only the status
+    // differs, and with no row of its own the held one reads time unknown.
+    const paused = mine({ routeRun: T0, routeStatus: 'paused' });
+    expect(view(paused)).toEqual([expect.objectContaining({ status: 'BOARDING', at: s.departAt })]);
+    expect(view({ ...paused, routeNews: T0 })).toEqual([expect.objectContaining({ status: 'BOARDING', at: s.departAt })]);
+    expect(view({ ...paused, routeNews: T0 + 3 * SEC })).toEqual([expect.objectContaining({ status: 'PAUSED', at: null, asOf: T0 + 5 * SEC })]);
+    const holdingElsewhere = mine({
+      routeRun: T0, routeNews: T0 + 3 * SEC, routeStatus: 'holding', status: 'in-flight', fromRoom: 'room-7', toRoom: 'room-9', nextStopRoom: 'room-9',
+    });
+    expect(view(holdingElsewhere)).toEqual([expect.objectContaining({ dir: 'to', status: 'DELAYED', at: null, note: 'time unknown', asOf: T0 + 5 * SEC })]);
   });
 
   it('a summary row: docked here, or flying here; nothing stale, off route or elsewhere', () => {
@@ -361,7 +376,7 @@ describe('the route fields of the ferry’s own summary', () => {
   it('docked at a stop: its gate, next stop, departure and status', () => {
     const f = routeFlightAt(route, [s], () => T0 + SEC, T0 + 10 * SEC, 100)!;
     expect(routeSummaryFields(route, f, [s], { gate: 4 }, T0 + 10 * SEC)).toEqual({
-      nextStopRoom: 'room-1', gate: 4, departAt: s.departAt, routeStatus: 'boarding', routeRun: T0,
+      nextStopRoom: 'room-1', gate: 4, departAt: s.departAt, routeStatus: 'boarding', routeRun: T0, routeNews: T0,
     });
     expect(routeSummaryFields(route, f, [s], null, T0 + BOARD_ARRIVING_MS + SEC)).toMatchObject({ routeStatus: 'not-docked', gate: 1 });
   });
@@ -380,14 +395,17 @@ describe('the route fields of the ferry’s own summary', () => {
 
   it('in flight: on time to the next stop’s gate; paused; nothing once over', () => {
     const f = routeFlightAt(route, [s], null, s.departAt + SEC, 100)!;
-    expect(routeSummaryFields(route, f, [s], null, s.departAt + SEC)).toEqual({ nextStopRoom: 'room-1', gate: 2, routeStatus: 'on-time', routeRun: T0 });
+    expect(routeSummaryFields(route, f, [s], null, s.departAt + SEC)).toEqual({ nextStopRoom: 'room-1', gate: 2, routeStatus: 'on-time', routeRun: T0, routeNews: T0 });
     const pause = pauseCheckpoint(route, 0, { at: T0 + 20 * SEC });
     const p = routeFlightAt(route, [s, pause], null, T0 + 30 * SEC, 100)!;
-    expect(routeSummaryFields(route, p, [s, pause], null, T0 + 30 * SEC)).toEqual({ nextStopRoom: 'room-1', routeStatus: 'paused', routeRun: T0 });
-    expect(routeSummaryFields(null, null, [], null, T0)).toEqual({});
+    expect(routeSummaryFields(route, p, [s, pause], null, T0 + 30 * SEC)).toEqual({
+      nextStopRoom: 'room-1', routeStatus: 'paused', routeRun: T0, routeNews: T0 + 20 * SEC,
+    });
+    // 🏁 No run flies: said outright.
+    expect(routeSummaryFields(null, null, [], null, T0)).toEqual({ routeIdle: true });
     const stopped = running({ stoppedAt: T0 + SEC });
     const e = routeFlightAt(stopped, [s], null, T0 + 10 * SEC, 100)!;
     expect(e.ended).toBe('stop');
-    expect(routeSummaryFields(stopped, e, [s], null, T0 + 10 * SEC)).toEqual({});
+    expect(routeSummaryFields(stopped, e, [s], null, T0 + 10 * SEC)).toEqual({ routeIdle: true });
   });
 });
