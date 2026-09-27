@@ -22,6 +22,7 @@ import {
   TUG_MIN_ENGINES,
   MOVE_HORIZON_MS,
   bindStationMoveDoc,
+  cancelTowLeftBehind,
   isPlausibleMove,
   compareMoves,
   dockLockedByMove,
@@ -246,6 +247,24 @@ describe('the station list follows a move', () => {
     const withSecond = listStations({}, [...full, lateRec], second.arriveAt + 1);
     expect(withSecond.find((s) => s.id === 'late')).toMatchObject({ planetId: ARIS });
     expect(withSecond.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
+  });
+
+  it('keeps a bounced arrival bounced when a station it counted turns out to have left', () => {
+    const move = moveTo();
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    expect(listStations({}, full, move.arriveAt + 1).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV });
+    // Later this install learns one of the sixteen had left before the
+    // default station arrived: the bounce this install saw still stands.
+    const left: StationMove = {
+      ...move, stationId: 'aris-15', welcomeRoomId: 'a15', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 6,
+      departAt: move.departAt, arriveAt: move.arriveAt - 1000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? left : null));
+    expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV });
   });
 
   it('never lets an unknown planet id share a slot with the planet it reads as', () => {
@@ -562,6 +581,44 @@ describe('tugs: a torch tow', () => {
     writeStationMove(loser);
     expect(readStationMove()).toBeNull();
     expect(readMoveFuelDrawn()).toBe(0);
+  });
+
+  it('charges one move written twice (two tabs, one millisecond) once', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const d1 = new Y.Doc();
+    const d2 = new Y.Doc();
+    d1.clientID = 1; d2.clientID = 2;
+    bindStationMoveDoc(d1);
+    writeStationMove(plan.move);
+    bindStationMoveDoc(d2);
+    writeStationMove(plan.move);
+    Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+    bindStationMoveDoc(d1);
+    expect(readMoveFuelDrawn()).toBe(plan.move.fuel);
+  });
+
+  it('cancels a tow whose tug flew off on a DEPART written at the same time', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    // Still docked: the tow stands.
+    expect(cancelTowLeftBehind('tug-room', 'docked', NOW + 1)).toBe(false);
+    expect(isTowing('tug-room', NOW + 1)).toBe(true);
+    // The tug is flying: the tow is cancelled, not flown, held or paid for.
+    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 1)).toBe(true);
+    expect(isTowing('tug-room', NOW + 2)).toBe(false);
+    expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
+    expect(readMoveFuelDrawn()).toBe(0);
+    const cancel = readStationMove()!;
+    expect(cancel).toMatchObject({ mode: 'thrusters', toPlanetId: SOV, toSlot: plan.move.fromSlot, fuel: 0 });
+    expect(isStationMove(cancel)).toBe(true);
+    setStationMoveResolver(() => cancel);
+    expect(listStations({}, [], NOW + 10).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV, orbitSlot: plan.move.fromSlot });
+    // Once is enough.
+    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 3)).toBe(false);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {

@@ -213,6 +213,35 @@ function isRecord(v: unknown): v is StationRecord {
     && (r.berthDoor === undefined || (typeof r.berthDoor === 'string' && isAcceptableDoorKey(r.berthDoor)));
 }
 
+/** How each arrival this install has settled went: 'bounced' (its new
+ *  planet was full the moment it got there, so it stayed where it left from)
+ *  or 'arrived', keyed `<welcomeRoomId>|<departAt>`. Worked out again from
+ *  the stations known now, a bounce could flip once the station that filled
+ *  the planet moves on, pulling a station across without a transfer. */
+const OUTCOME_KEY = 'ssf-station-arrivals';
+const MAX_OUTCOMES = 128;
+type ArrivalOutcome = 'bounced' | 'arrived';
+
+function readArrivalOutcomes(): Array<[string, ArrivalOutcome]> {
+  try {
+    const raw = localStorage.getItem(OUTCOME_KEY);
+    const arr = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(arr)) return [];
+    return arr.filter((e): e is [string, ArrivalOutcome] => Array.isArray(e) && typeof e[0] === 'string'
+      && (e[1] === 'bounced' || e[1] === 'arrived')).slice(-MAX_OUTCOMES);
+  } catch { return []; }
+}
+
+function readArrivalOutcome(key: string): ArrivalOutcome | null {
+  return readArrivalOutcomes().find((e) => e[0] === key)?.[1] ?? null;
+}
+
+function writeArrivalOutcome(key: string, outcome: ArrivalOutcome): void {
+  const list = readArrivalOutcomes().filter((e) => e[0] !== key);
+  list.push([key, outcome]);
+  try { localStorage.setItem(OUTCOME_KEY, JSON.stringify(list.slice(-MAX_OUTCOMES))); } catch { /* quota */ }
+}
+
 export function readStationRecords(): StationRecord[] {
   try {
     const raw = localStorage.getItem(KEY);
@@ -428,13 +457,21 @@ export function listStations(
     // Where each other station was at T: its settled place when it had
     // already arrived (after any bounce of its own), else what its record
     // and move say for T.
-    const dest = planetById(m.toPlanetId).id;
-    const there = candidates.filter((o, j) => {
-      if (j === i) return false;
-      if (settledAt(o) <= T) return spots[j]?.planetId === dest;
-      return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
-    }).length;
-    if (there >= MAX_ORBIT_SLOTS) at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
+    // Once decided here it stays decided: the others' later moves change
+    // what "then" looks like from now, never where this one went.
+    const outcomeKey = `${candidates[i].welcomeRoomId}|${m.departAt}`;
+    let outcome = readArrivalOutcome(outcomeKey);
+    if (!outcome) {
+      const dest = planetById(m.toPlanetId).id;
+      const there = candidates.filter((o, j) => {
+        if (j === i) return false;
+        if (settledAt(o) <= T) return spots[j]?.planetId === dest;
+        return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
+      }).length;
+      outcome = there >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';
+      writeArrivalOutcome(outcomeKey, outcome);
+    }
+    if (outcome === 'bounced') at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
     let planetId = at.planetId;
     let slot = claim(planetId, at.orbitSlot);
     // Still no room (every planet it could be at is full): the first planet

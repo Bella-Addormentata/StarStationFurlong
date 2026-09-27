@@ -483,6 +483,34 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
     m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
 }
 
+/**
+ * A tug that left its station behind: a DEPART written at the same moment
+ * as a TOW (another tab, or one offline) flies the tug away while the tow
+ * still says it is the station's engine. Whichever tab sees the two together
+ * cancels the tow with a move that leaves the station where it was, one
+ * millisecond after the tow: it wins the one order everywhere, so the tow is
+ * never flown, held or paid for. Returns whether it wrote a cancel.
+ */
+export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs: number): boolean {
+  if (flightStatus === 'docked') return false;
+  const tow = readStationMove();
+  if (!tow || tow.mode !== 'tug' || tow.tugRoomId !== roomId || !isMoveActive(tow, realMs)) return false;
+  const departAt = tow.departAt + 1;
+  return writeStationMove({
+    stationId: tow.stationId,
+    welcomeRoomId: tow.welcomeRoomId,
+    fromPlanetId: tow.fromPlanetId,
+    fromSlot: tow.fromSlot,
+    toPlanetId: tow.fromPlanetId,
+    toSlot: tow.fromSlot,
+    departAt,
+    arriveAt: departAt + 1,
+    mode: 'thrusters',
+    fuel: 0,
+    fuelDrawn: 0,
+  });
+}
+
 // ── What the dashboard says ──────────────────────────────────────────────────
 
 /** "2d 03h" / "5h 12m" / "4m" — a real-time span. */
@@ -663,7 +691,14 @@ export function readMoveFuelDrawn(): number {
   const { entries, legacy } = roomMoves();
   const known = knownMoves(legacy ? [legacy, ...entries] : entries);
   let drawn = legacy?.fuelDrawn ?? 0;
-  for (const m of entries) if (!superseded(m, known)) drawn += m.fuel;
+  // The same move written twice (two tabs, one millisecond) is one move.
+  const seen = new Set<string>();
+  for (const m of entries) {
+    const key = JSON.stringify(m);
+    if (seen.has(key) || superseded(m, known)) continue;
+    seen.add(key);
+    drawn += m.fuel;
+  }
   return drawn;
 }
 
