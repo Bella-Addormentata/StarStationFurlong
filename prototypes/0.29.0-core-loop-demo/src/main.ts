@@ -114,7 +114,7 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { arrivalNoteHere, clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
 import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
@@ -1245,6 +1245,7 @@ function isLocalHelmCommander(): boolean {
 
 /** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
 let shipFlightWatch: number | null = null;
+let planetSummaryBeat = 0;
 
 async function joinRoomAtEpoch(
   boot: RoomBootstrap,
@@ -1839,6 +1840,10 @@ async function joinRoomAtEpoch(
     setHelmOwnerCheck(isLocalHelmCommander);
     setStationHelmCommanderCheck(isLocalHelmCommander);
   }
+  // 🪐 Publish again now the room's station, doors and directory are all in
+  // place (the bind-time publish ran before them, and on a first join the
+  // one-time seams above did not exist yet).
+  publishPlanetSummary();
   // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
   // ticks the countdown while open, but a flight must complete even if no
   // one has the panel up — otherwise a `in-flight` record with a past
@@ -1852,7 +1857,11 @@ async function joinRoomAtEpoch(
   // join replaces the last room's watch and leaveRoomNow clears it, so room
   // hops neither stack callbacks nor leave a flight without its watch.
   if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
+  planetSummaryBeat = 0;
   shipFlightWatch = window.setInterval(() => {
+    // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
+    // publishPlanetSummary refreshes its stamp once an hour).
+    if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
     if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
@@ -1876,7 +1885,7 @@ async function joinRoomAtEpoch(
               dock: (doorId) => ds.redockPort(doorId),
             }
           : null,
-        { onSettled: noteShipArrival },
+        { onSettled: arrivalNoteHere() },
       ),
     );
   }, 1_000);
