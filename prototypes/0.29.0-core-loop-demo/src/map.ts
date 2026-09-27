@@ -10,7 +10,9 @@
 import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
 import { angleAt, realMsFor, stationOrbit } from './orbits';
-import { planetSunOrbit, sunAngleAt } from './solarOrbits';
+import { AU_KM, interplanetaryPointAt, planetSunOrbit, sunAngleAt } from './solarOrbits';
+import { describeMove, movePlan } from './stationMove';
+import type { StationMove } from './stations';
 
 export interface MapBody {
   id: string;
@@ -25,6 +27,10 @@ export interface MapBody {
   /** 🪐 When set, the body's true angle at a real time (orbits.ts) — replaces
    *  angle + orbitSpeed·tick, so every client draws it in the same place. */
   angleAt?: (nowMs: number) => number;
+  /** 🚚 When set, the body's whole place at a real time — which body it goes
+   *  round (none: the sun) and where. A station moving between planets
+   *  (stationMove.ts) leaves its planet for the sun and joins another. */
+  placeAt?: (nowMs: number) => { parentId?: string; angle: number; radius: number };
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
@@ -58,11 +64,12 @@ function formatSpan(ms: number): string {
  * from the shared orbital clock; slot 0 starts where the single hard-coded
  * Furlong body always stood.
  */
-export function stationBodies(stations: StationRecord[]): MapBody[] {
+export function stationBodies(stations: StationRecord[], nowMs: number = Date.now()): MapBody[] {
   return stations.map((s) => {
     const orbit = stationOrbit(s);
     const readout = `${Math.round(orbit.altitudeKm).toLocaleString('en-US')} km up · ${orbit.speedKmS.toFixed(2)} km/s · `
       + `one orbit every ${formatSpan((orbit.periodS / 60) * 1000)}.`;
+    const moving = s.move ? ` ${describeMove(s.move, nowMs)}` : '';
     return {
       id: s.id,
       name: s.name,
@@ -72,11 +79,33 @@ export function stationBodies(stations: StationRecord[]): MapBody[] {
       orbitSpeed: 0,
       angle: orbit.phase0,
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
-      description: s.id === DEFAULT_STATION_ID
+      ...(s.move ? { placeAt: movingPlace(s, s.move) } : {}),
+      description: (s.id === DEFAULT_STATION_ID
         ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
-        : `Station around ${orbit.planet.name}: ${readout}`,
+        : `Station around ${orbit.planet.name}: ${readout}`) + moving,
     };
   });
+}
+
+/** Holotable radius of a sun-centred distance: the planets' schematic scale
+ *  (Sovereign II, at 1 AU, is drawn at 180). */
+const MAP_PER_AU = 180;
+
+/** Where a moving station is drawn: around its old planet until the burn,
+ *  on the transfer ellipse around the sun, then around its new planet. */
+function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['placeAt']> {
+  const plan = movePlan(move);
+  const from = stationOrbit({ planetId: move.fromPlanetId, orbitSlot: move.fromSlot });
+  const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });
+  const slotRadius = (slot: number) => STATION_ORBIT_BASE + slot * STATION_ORBIT_STEP;
+  return (nowMs: number) => {
+    if (plan && nowMs >= move.departAt && nowMs < move.arriveAt) {
+      const p = interplanetaryPointAt(plan, nowMs);
+      return { angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU };
+    }
+    if (nowMs >= move.arriveAt) return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
+    return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: slotRadius(s.orbitSlot) };
+  };
 }
 
 /** ☀️ A planet's true angle around the sun on the shared clock
@@ -426,6 +455,14 @@ export class SolarSystemMap {
   private getBodyCoordinates(body: MapBody, centerX: number, centerY: number): { x: number; y: number } {
     if (body.type === 'star') {
       return { x: centerX, y: centerY };
+    }
+
+    if (body.placeAt) {
+      const place = body.placeAt(this.clock());
+      const parent = place.parentId ? this.bodies.find((b) => b.id === place.parentId) : undefined;
+      const origin = parent ? this.getBodyCoordinates(parent, centerX, centerY) : { x: centerX, y: centerY };
+      const { dx, dy } = screenOffset(place.angle, place.radius * this.scale);
+      return { x: origin.x + dx, y: origin.y + dy };
     }
 
     // Base orbit positions (derive-don't-tick, v006 §8.2 / Kepler orbits)

@@ -119,6 +119,7 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
 import { bindStationKeepingDoc } from "./stationKeeping";
+import { bindStationMoveDoc, installStationMoveResolver } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1516,6 +1517,7 @@ async function joinRoomAtEpoch(
   bindShipDoc(sync.doc);
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
+  bindStationMoveDoc(sync.doc);
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1718,6 +1720,9 @@ async function joinRoomAtEpoch(
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🪐 …and the station registry's "which station am I in" (holotable).
     setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // 🚚 …and every station move this install has seen (stationMove.ts), so a
+    // moved station stays moved in every room.
+    installStationMoveResolver();
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.

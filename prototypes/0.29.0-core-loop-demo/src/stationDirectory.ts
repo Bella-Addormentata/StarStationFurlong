@@ -19,6 +19,8 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
+import { stationInTransit } from './stations';
+import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -41,6 +43,9 @@ export interface StationDestination {
   /** Writer-clock travel time of a hop to this station, ms. */
   travelMs: number;
   berth?: StationBerth;
+  /** A move to another planet, scheduled or under way (stations.ts): while
+   *  it is in transit the station is no ship's destination. */
+  move?: StationMove;
 }
 
 /** The seam: whatever knows the stations. */
@@ -134,8 +139,11 @@ export function destinationsFrom(fromId: string): StationDestination[] {
   const from = findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
+  // A station between planets (stationMove.ts) is in no planet's orbits.
+  const now = Date.now();
   return listStations().filter(
-    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own,
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own
+      && !stationInTransit(s, now),
   );
 }
 
@@ -149,6 +157,8 @@ export interface StationRecordLike {
   orbitSlot: number;
   welcomeRoomId: string;
   berthDoor?: string;
+  /** A move to another planet, scheduled or under way (stations.ts). */
+  move?: StationMove;
 }
 
 /** Rough per-destination figures for a station record (what a hop from the
@@ -171,6 +181,8 @@ export function planRecordHop(
   nowMs: number,
 ): HopPlan | null {
   if (!from || !to) return null;
+  // No hop to or from a station between planets (stationMove.ts).
+  if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
   return {
@@ -199,6 +211,7 @@ export function destinationsFromRecords(
       planetId: r.planetId,
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
+      ...(r.move ? { move: r.move } : {}),
     };
     // A public berth needs its door: DOCK only asks the far room (and so
     // only proves a port is there) when it knows the far door. Without one

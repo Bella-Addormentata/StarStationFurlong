@@ -56,6 +56,7 @@ import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, circularOrbit, orbitForSlot, orbitalS
 import type { CircularOrbit } from './orbits';
 import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { isBerthDoor } from './stationAtlas';
+import { isStationMove } from './stationMove';
 import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationRecord } from './stations';
 
@@ -420,9 +421,14 @@ export function readOrbitTrim(): OrbitTrim | null {
   return isOrbitTrim(raw) ? cleanTrim(raw) : null;
 }
 
-/** Fuel station keeping has drawn in this room: the tank's draw meter. */
+/** Fuel station keeping has drawn in this room: the tank's draw meter. A
+ *  station move (stationMove.ts) draws through the same meter from its own
+ *  record; each write starts from the meter's reading, so the higher of the
+ *  two totals is the meter. */
 export function readFuelDrawn(): number {
-  return readOrbitTrim()?.fuelDrawn ?? 0;
+  const raw = docAlive() ? keepMap!.get('move') : undefined;
+  const moved = isStationMove(raw) ? raw.fuelDrawn : 0;
+  return Math.max(readOrbitTrim()?.fuelDrawn ?? 0, moved);
 }
 
 /**

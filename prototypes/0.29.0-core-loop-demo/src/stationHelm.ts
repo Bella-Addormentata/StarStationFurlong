@@ -23,6 +23,11 @@
  * gauge). The FUEL & DOCKING tab is the ship helm face itself (devices.ts
  * createHelmUI), whose REFUEL and DOCKING COMPUTER serve a station module as
  * well — nothing the helm did before is lost.
+ *
+ * MOVE TO ANOTHER PLANET (stationMove.ts) sits under the stick: for each other
+ * planet, the next launch window, the flight time and the propellant both
+ * burns take; MOVE schedules the whole transfer in one write. While a move is
+ * scheduled or under way the stick holds still.
  */
 
 import type { DeviceUI } from './devices';
@@ -55,6 +60,20 @@ import {
   writeOrbitTrim,
 } from './stationKeeping';
 import type { OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
+import { atlasComponent, readAtlas } from './stationAtlas';
+import {
+  describeMove,
+  describeMoveRefusal,
+  formatLongSpan,
+  isMoveActive,
+  otherPlanets,
+  planStationMove,
+  quoteMove,
+  subscribeStationMove,
+  writeStationMove,
+} from './stationMove';
+import type { MoveContext } from './stationMove';
+import { listStations, planetById } from './stations';
 
 const DEG = Math.PI / 180;
 
@@ -274,6 +293,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   // What the dashboard last read (refresh), and what the box draws each frame.
   let view: { station: StationRecord; base: CircularOrbit; trim: OrbitTrim | null; planet: string } | null = null;
   let flash: { text: string; until: number } | null = null;
+  let moveFlash: { text: string; until: number } | null = null;
   let sinceText = 0;
   let drag: { id: number; cx: number; cy: number; dx: number; dy: number } | null = null;
 
@@ -300,6 +320,73 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       tanks,
       capacity,
     };
+  };
+
+  /** Everything a move decision reads, fresh, on top of the burn's. */
+  const readMoveContext = (c: ReturnType<typeof readContext>): MoveContext => ({
+    bolted: c.bolted,
+    station: c.station,
+    stations: listStations(),
+    commander: c.commander,
+    engines: c.engines,
+    fuel: c.fuel,
+    meter: c.meter,
+    modules: c.station?.welcomeRoomId ? Math.max(1, atlasComponent(readAtlas(), c.station.welcomeRoomId).size) : 1,
+    now: c.now,
+  });
+
+  /** The MOVE TO ANOTHER PLANET block: the move under way, or a quote per
+   *  planet with its MOVE button. */
+  const refreshMove = (c: ReturnType<typeof readContext>): void => {
+    const mc = readMoveContext(c);
+    const station = mc.station;
+    const move = station?.move;
+    let rows = '';
+    let note = '';
+    if (!station) {
+      note = describeMoveRefusal('no-station', null, mc.fuel);
+    } else if (move && isMoveActive(move, mc.now)) {
+      note = describeMove(move, mc.now);
+    } else {
+      for (const planetId of otherPlanets(station)) {
+        const quote = quoteMove(station, mc.stations, planetId, mc.modules, mc.now);
+        const name = esc(planetById(planetId).name);
+        if (!quote) {
+          rows += `<div style="padding:5px 0; font-size:10px; color:${GOLD_DIM};">${name} · no free orbit</div>`;
+          continue;
+        }
+        const plan = planStationMove(mc, planetId);
+        const ready = plan.ok;
+        rows += `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid rgba(212,168,75,0.10); font-size:10px; line-height:1.45;">
+            <span><b style="color:#F0C060;">${name}</b> · slot ${quote.toSlot}<br>
+              <span style="color:${GOLD_DIM};">window in ${formatLongSpan(quote.plan.waitMs)} · ${formatLongSpan(quote.plan.transferMs)} flight · ${quote.plan.deltaVKmS.toFixed(2)} km/s</span><br>
+              ${check(mc.fuel >= quote.fuel)} ${quote.fuel} fuel <span style="color:${GOLD_DIM};">(${mc.modules} module${mc.modules === 1 ? '' : 's'})</span></span>
+            <button type="button" data-sk-move="${esc(planetId)}" title="${esc(ready ? `Leave for ${planetById(planetId).name} at the next launch window` : describeMoveRefusal(plan.refusal, plan.quote, mc.fuel))}" style="padding:5px 10px; border-radius:6px; border:1px solid rgba(255,179,0,0.45); background:rgba(255,179,0,0.10); color:${AMBER}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:0.5px; opacity:${ready ? '1' : '0.45'}; cursor:pointer;">MOVE</button>
+          </div>`;
+      }
+    }
+    setText('#sk-move', rows);
+    const msg = q<HTMLElement>('#sk-move-msg');
+    if (msg) {
+      const text = moveFlash && mc.now < moveFlash.until ? moveFlash.text : note;
+      if (msg.textContent !== text) msg.textContent = text;
+      msg.style.display = text ? 'block' : 'none';
+      msg.style.color = moveFlash && mc.now < moveFlash.until ? WARN : GOLD;
+    }
+  };
+
+  /** Schedule the move to `planetId` — the block's only write. */
+  const startMove = (planetId: string): void => {
+    const c = readContext();
+    const plan = planStationMove(readMoveContext(c), planetId);
+    if (!plan.ok) {
+      moveFlash = { text: describeMoveRefusal(plan.refusal, plan.quote, c.fuel), until: c.now + FLASH_MS * 2 };
+    } else {
+      moveFlash = null;
+      writeStationMove(plan.move);
+    }
+    refresh();
   };
 
   const refresh = (): void => {
@@ -369,11 +456,17 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       if (msg.textContent !== text) msg.textContent = text;
       msg.style.color = tone;
     }
+    refreshMove(c);
   };
 
   /** One burn — the stick's only write. */
   const fire = (dir: TrimDirection): void => {
     const c = readContext();
+    if (isMoveActive(c.station?.move, c.now)) {
+      flash = { text: 'The station is moving to another planet: the stick holds until it arrives.', until: c.now + FLASH_MS };
+      refresh();
+      return;
+    }
     const plan = planTrim(c, dir);
     if (!plan.ok) {
       flash = { text: describeRefusal(plan.refusal, c.tanks, trimFor(c.station, c.trim)?.dRadiusKm ?? 0), until: c.now + FLASH_MS };
@@ -451,6 +544,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         </div>
       </div>
       <div id="sk-msg" role="status" style="margin-top:10px; padding:9px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.55;"></div>
+      <div style="margin-top:12px; font-size:10px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚚 MOVE TO ANOTHER PLANET</div>
+      <div id="sk-move"></div>
+      <div id="sk-move-msg" role="status" style="margin-top:6px; font-size:10px; line-height:1.55;"></div>
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px; line-height:1.5;">
         SSF STATION KEEPING v0 · circular orbit · a lower orbit runs faster · one flick = one burn = ${TRIM_FUEL} fuel
       </div>
@@ -464,6 +560,11 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       const dirBtn = target.closest<HTMLButtonElement>('[data-sk-dir]');
       if (dirBtn && !dirBtn.disabled) {
         fire(dirBtn.dataset.skDir as TrimDirection);
+        return;
+      }
+      const moveBtn = target.closest<HTMLButtonElement>('[data-sk-move]');
+      if (moveBtn?.dataset.skMove) {
+        startMove(moveBtn.dataset.skMove);
         return;
       }
       const tab = target.closest<HTMLElement>('[data-sk-tab]');
@@ -518,6 +619,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
 
     h.appendChild(panel);
     unsubs.push(subscribeStationKeeping(refresh));
+    unsubs.push(subscribeStationMove(refresh));
     unsubs.push(subscribeShip(refresh));
     unsubs.push(subscribeFurniture(refresh));
     unsubs.push(subscribeDoors(refresh));
@@ -578,6 +680,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       host = null;
       view = null;
       flash = null;
+      moveFlash = null;
     },
     update(dt: number): void {
       if (face === 'ship') {
@@ -588,6 +691,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       sinceText += dt;
       if (sinceText >= TEXT_REFRESH_S || (flash && Date.now() >= flash.until)) {
         if (flash && Date.now() >= flash.until) flash = null;
+        if (moveFlash && Date.now() >= moveFlash.until) moveFlash = null;
         refresh();
       }
       const now = Date.now();

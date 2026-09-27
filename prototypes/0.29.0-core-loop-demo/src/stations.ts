@@ -76,6 +76,72 @@ export interface StationRecord {
   berthDoor?: string;
   /** Set on stations derived from an atlas component with no record. */
   derived?: true;
+  /** A move to another planet that is scheduled or under way (stationMove.ts).
+   *  listStations fills it from the move resolver; once the move arrives the
+   *  station is listed at its new planet and slot, and this is gone. */
+  move?: StationMove;
+}
+
+/**
+ * 🚚 A station's move to another planet (stationMove.ts): the station, where
+ * it leaves from and goes to, and the two burns' real times. Plain JSON, so
+ * whatever shares station records can carry it as it is.
+ */
+export interface StationMove {
+  stationId: string;
+  fromPlanetId: string;
+  fromSlot: number;
+  toPlanetId: string;
+  /** The slot it asked for there; listStations still resolves a clash. */
+  toSlot: number;
+  /** Real ms of the departure burn — a launch window. */
+  departAt: number;
+  /** Real ms of the capture burn at the new planet. */
+  arriveAt: number;
+  /** Under its own thrusters. ('tug' comes with tugs.) */
+  mode: 'thrusters';
+  /** Propellant the move burns. */
+  fuel: number;
+  /** The tank's draw meter after paying for it (shipDoc.setFuelDrawMeter). */
+  fuelDrawn: number;
+}
+
+let moveResolver: ((stationId: string) => StationMove | null) | null = null;
+
+/** Install (or remove, with null) where listStations finds each station's
+ *  latest move (stationMove.installStationMoveResolver). */
+export function setStationMoveResolver(resolver: ((stationId: string) => StationMove | null) | null): void {
+  moveResolver = resolver;
+}
+
+function moveOf(stationId: string): StationMove | null {
+  if (!moveResolver) return null;
+  try {
+    const m = moveResolver(stationId);
+    return m && m.stationId === stationId ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Where a station is listed at `nowMs` given its latest move: the move's
+ *  destination once it has arrived, else where it left from (a move names
+ *  where it leaves, so it supersedes any earlier one). */
+function placeWithMove(
+  r: { id: string; planetId: string; orbitSlot: number },
+  nowMs: number,
+): { planetId: string; orbitSlot: number; move?: StationMove } {
+  const move = moveOf(r.id);
+  if (!move) return { planetId: r.planetId, orbitSlot: r.orbitSlot };
+  if (nowMs >= move.arriveAt) return { planetId: move.toPlanetId, orbitSlot: move.toSlot };
+  return { planetId: move.fromPlanetId, orbitSlot: move.fromSlot, move };
+}
+
+/** Is the station between its departure and capture burns — gone from every
+ *  planet's orbits, so no ship can reach it? */
+export function stationInTransit(station: Pick<StationRecord, 'move'>, nowMs: number = Date.now()): boolean {
+  const m = station.move;
+  return !!m && nowMs >= m.departAt && nowMs < m.arriveAt;
 }
 
 /** Slots per planet. orbits.ts spaces slots geometrically, so this also
@@ -182,6 +248,7 @@ export function removeStation(id: string): void {
 export function listStations(
   atlas: Record<string, AtlasEntry> = readAtlas(),
   records: StationRecord[] = readStationRecords(),
+  nowMs: number = Date.now(),
 ): StationRecord[] {
   // Which PLACE a welcome room is: its atlas component, or the bare room when
   // the atlas does not know it. One place is one station — a second record
@@ -212,10 +279,12 @@ export function listStations(
     if (out.some((e) => e.id === r.id)) continue;
     const place = placeOf(r.welcomeRoomId);
     if (place && places.has(place)) continue;
-    const slot = claim(r.planetId, r.orbitSlot);
+    const at = placeWithMove(r, nowMs);
+    const slot = claim(at.planetId, at.orbitSlot);
     if (slot === null) continue;
     if (place) places.add(place);
-    out.push({ ...r, orbitSlot: slot });
+    const { move: _stale, ...rest } = r;
+    out.push({ ...rest, planetId: planetById(at.planetId).id, orbitSlot: slot, ...(at.move ? { move: at.move } : {}) });
   }
 
   // Atlas ids and names can arrive from peers unbounded, so derived records
@@ -235,15 +304,20 @@ export function listStations(
   });
   derived.sort((a, b) => (a.anchor < b.anchor ? -1 : a.anchor > b.anchor ? 1 : 0));
   for (const d of derived) {
-    const slot = claim(DEFAULT_PLANET_ID, 0);
-    if (slot === null) break;
+    const id = `${DERIVED_PREFIX}${d.anchor}`;
+    // A derived station that has moved is listed where its move put it; one
+    // that has not takes the lowest free slot around the default planet.
+    const at = placeWithMove({ id, planetId: DEFAULT_PLANET_ID, orbitSlot: 0 }, nowMs);
+    const slot = claim(at.planetId, at.orbitSlot);
+    if (slot === null) continue;
     out.push({
-      id: `${DERIVED_PREFIX}${d.anchor}`,
+      id,
       name: d.name,
-      planetId: DEFAULT_PLANET_ID,
+      planetId: planetById(at.planetId).id,
       orbitSlot: slot,
       welcomeRoomId: d.anchor,
       derived: true,
+      ...(at.move ? { move: at.move } : {}),
     });
   }
   return out;
