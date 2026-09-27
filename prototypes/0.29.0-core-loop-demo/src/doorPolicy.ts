@@ -205,15 +205,16 @@ function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
   return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
 }
 
-/** ⚓🚦 The doors a room's layout has (bounded), whose policies the gate
- *  readers look up directly. Walking the layout rather than the policy map
- *  means stale or junk policy keys (a removed door's, a peer's) can never
- *  crowd a live port out of a capped scan. */
+/** ⚓🚦 The doors a room's layout has, whose policies the gate readers look
+ *  up directly. Walking the layout rather than the policy map means stale or
+ *  junk policy keys (a removed door's, a peer's) can never crowd a live port
+ *  out of a capped scan. The walk covers the whole layout map, as the room's
+ *  own door list (doorLayoutDoc.readAllDoorLayout) does, so malformed layout
+ *  keys cannot hide a real door either; only valid doors count toward the
+ *  cap. */
 function layoutDoorsIn(doc: Y.Doc): string[] {
   const out: string[] = [];
-  let n = 0;
   for (const id of doc.getMap('doorLayout').keys()) {
-    if (++n > 1024) break;
     if (doorExistsIn(doc, id)) {
       out.push(id);
       if (out.length >= 256) break;

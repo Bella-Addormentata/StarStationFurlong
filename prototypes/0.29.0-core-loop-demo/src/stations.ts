@@ -284,9 +284,11 @@ function isRecord(v: unknown): v is StationRecord {
 
 /** How each arrival this install has settled went: 'bounced' (its new
  *  planet was full the moment it got there, so it stayed where it left from)
- *  or 'arrived', keyed `<welcomeRoomId>|<departAt>`. Worked out again from
- *  the stations known now, a bounce could flip once the station that filled
- *  the planet moves on, pulling a station across without a transfer. */
+ *  or 'arrived', keyed by the move itself (welcome room, times, ends, mode),
+ *  so two moves leaving the same millisecond never share an outcome. Worked
+ *  out again from the stations known now, a bounce could flip once the
+ *  station that filled the planet moves on, pulling a station across
+ *  without a transfer. */
 const OUTCOME_KEY = 'ssf-station-arrivals';
 const MAX_OUTCOMES = 128;
 type ArrivalOutcome = 'bounced' | 'arrived';
@@ -531,7 +533,8 @@ export function listStations(
     // and move say for T.
     // Once decided here it stays decided: the others' later moves change
     // what "then" looks like from now, never where this one went.
-    const outcomeKey = `${candidates[i].welcomeRoomId}|${m.departAt}`;
+    const outcomeKey = [candidates[i].welcomeRoomId, m.departAt, m.bookedAt ?? m.departAt, m.fromPlanetId, m.fromSlot,
+      m.toPlanetId, m.toSlot, m.mode].join('|');
     let outcome = readArrivalOutcome(outcomeKey);
     if (!outcome) {
       const dest = planetById(m.toPlanetId).id;
@@ -571,7 +574,8 @@ export function listStations(
  * station, free or docked) together with the gates the record learned in
  * rooms the atlas has not harvested, else its plain berthDoor. A record
  * naming no berthDoor gets the lowest gate in its welcome room as one, for
- * builds that read only that.
+ * builds that read only that; once the welcome room's gates are known, a
+ * berthDoor that is not one of them is replaced the same way, or dropped.
  */
 function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): StationRecord {
   const gates = stationGates(atlas, st.welcomeRoomId);
@@ -603,9 +607,15 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
   }
   const out: StationRecord = { ...st };
   if (berths.length > 0 || knownNone) out.berths = berths; else delete out.berths;
-  if (!out.berthDoor) {
-    const inWelcome = berths.find((b) => b.roomId === st.welcomeRoomId);
-    if (inWelcome) out.berthDoor = inWelcome.doorId;
+  const inWelcome = berths.filter((b) => b.roomId === st.welcomeRoomId);
+  if (st.welcomeRoomId && !unknown(st.welcomeRoomId)) {
+    // The welcome room's gates are known: a berthDoor that is no longer one of
+    // them is stale, so it gives way to the lowest gate there, or to none.
+    if (!inWelcome.some((b) => b.doorId === out.berthDoor)) {
+      if (inWelcome.length > 0) out.berthDoor = inWelcome[0].doorId; else delete out.berthDoor;
+    }
+  } else if (!out.berthDoor && inWelcome.length > 0) {
+    out.berthDoor = inWelcome[0].doorId;
   }
   return out;
 }

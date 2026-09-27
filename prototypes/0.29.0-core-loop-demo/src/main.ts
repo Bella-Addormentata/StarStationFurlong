@@ -2227,7 +2227,7 @@ async function joinRoomAtEpoch(
     if (!isLocalHelmCommander()) return;
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     // (🚏 A ferry on its route is where its timetable says.)
-    cancelTowLeftBehind(boot.roomId, readResolvedFlight().status, Date.now());
+    cancelTowLeftBehind(boot.roomId, readResolvedFlight(), Date.now());
     // 🪐 Where this station's last move settled it, shared once for everyone.
     if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
     // 🚏 A4: while a ferry route runs unpaused its timetable moves the ship

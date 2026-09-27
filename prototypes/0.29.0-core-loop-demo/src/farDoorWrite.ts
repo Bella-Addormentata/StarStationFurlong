@@ -95,7 +95,9 @@ export function applyFarDockRequest(
   // station's other rooms or the gates they already use.
   const newPort = !dockPortFlagIn(doc, req.farDoor);
   const gate = newPort
-    ? freeGateNumber(withSharedAtlasOf(doc, readAtlas()), farRoomOf(req.farAddress), dockGatesIn(doc))
+    ? freeGateNumber(
+      withSharedAtlasOf(doc, readAtlas(), farRoomOf(req.farAddress)), farRoomOf(req.farAddress), dockGatesIn(doc),
+    )
     : null;
   if (newPort && gate === null) {
     return { result: { ok: false, reason: 'no-gate' }, wrote: false };
