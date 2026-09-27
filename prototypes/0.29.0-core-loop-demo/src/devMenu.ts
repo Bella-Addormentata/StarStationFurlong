@@ -44,7 +44,7 @@
 
 import * as THREE from 'three';
 import {
-  FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos,
+  FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos, snapInteriorWall,
   footprintAabb, itemAabb, itemOccupancyBox,
 } from './furniture';
 import type { Box, FurnitureItem, FurnitureKind, Rot } from './furniture';
@@ -309,8 +309,14 @@ function clearanceOk(item: FurnitureItem, pos: { x: number; z: number }, margin:
  * see clearanceOk — then 0.5 m, then flush) so the common spawn lands in open
  * space but a crowded room still fills up before rejecting. Returns null when
  * the room is genuinely full.
+ *
+ * 🚏 A WALL-MOUNTED kind (the departures board, a climbing rose) is hung on
+ * the wall nearest each probe point instead — on its flush plane, facing
+ * into the room, exactly as edit mode's drag snaps it (snapInteriorWall) —
+ * and the spot carries that wall's rot. The floor lattice alone could only
+ * put such a piece about half a metre out from the north wall, in mid-air.
  */
-function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: number } | null {
+function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: number; rot?: Rot } | null {
   const player = world.getPlayer();
   const p = player.getPosition();
   const ctx: PlacementContext = {
@@ -327,9 +333,19 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
   const probeX = Math.ceil(2 * halfX), probeZ = Math.ceil(2 * halfZ);
   const bX = halfX - 0.5, bZ = halfZ - 0.5;
   const seen = new Set<string>();
-  const candidates: Array<{ x: number; z: number; d: number }> = [];
+  const candidates: Array<{ x: number; z: number; rot?: Rot; d: number }> = [];
+  const wallMounted = !!FURNITURE_DEFS[item.kind].wallMount;
   for (let dx = -probeX; dx <= probeX; dx += 0.5) {
     for (let dz = -probeZ; dz <= probeZ; dz += 0.5) {
+      if (wallMounted) {
+        const w = snapInteriorWall(item.kind, p.x + dx, p.z + dz);
+        if (!w) continue;
+        const key = `${w.x},${w.z},${w.rot}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        candidates.push({ x: w.x, z: w.z, rot: w.rot, d: (w.x - p.x) ** 2 + (w.z - p.z) ** 2 });
+        continue;
+      }
       const s = snapItemPos(item.kind, item.rot, p.x + dx, p.z + dz);
       if (s.x < -bX || s.x > bX || s.z < -bZ || s.z > bZ) continue;
       const key = `${s.x},${s.z}`;
@@ -341,9 +357,10 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
   candidates.sort((a, b) => a.d - b.d);
   for (const margin of [1.0, 0.5, 0]) {
     for (const c of candidates) {
-      if (!clearanceOk(item, { x: c.x, z: c.z }, margin)) continue;
-      if (validatePlacement(item, { x: c.x, z: c.z }, item.rot, ctx).ok) {
-        return { x: c.x, z: c.z };
+      const probe = c.rot === undefined ? item : { ...item, rot: c.rot };
+      if (!clearanceOk(probe, { x: c.x, z: c.z }, margin)) continue;
+      if (validatePlacement(probe, { x: c.x, z: c.z }, probe.rot, ctx).ok) {
+        return c.rot === undefined ? { x: c.x, z: c.z } : { x: c.x, z: c.z, rot: c.rot };
       }
     }
   }

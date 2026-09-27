@@ -39,7 +39,10 @@ import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { shipsAroundPlanet } from './planetSummary';
-import { readFlightRecord, shipDocBound } from './shipDoc';
+import { shipDocBound } from './shipDoc';
+// 🚏 A ferry route's leg is flown by its timetable, never written to the
+// stored flight (robot pilot routes, build notes A4): the resolved flight.
+import { readResolvedFlight } from './shipRoute';
 import { atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -110,7 +113,9 @@ function gather(now: number): Source {
   // Aboard a ship in flight: see the planet from the transfer.
   let aboard: TransferPlan | null = null;
   if (shipDocBound()) {
-    const rec = readFlightRecord();
+    // 🚏 A running ferry route's timetable while it rules the flight (its
+    // legs write no stored `flight`), else the stored record.
+    const rec = readResolvedFlight(now);
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt && rec.etaAt) {
       aboard = flightPlan(
         all.find((s) => s.id === rec.locationId),

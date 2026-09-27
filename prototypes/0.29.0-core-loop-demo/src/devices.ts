@@ -222,7 +222,16 @@ import {
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
-import { consoleRoutineRefusal, pilotRoutineOffered, routeCaptainDockId, shipPilotEligible } from './shipPilot';
+import {
+  consoleRoutineRefusal,
+  freshHelmAnnouncer,
+  helmAnnouncerStep,
+  pilotRoutineOffered,
+  readPilotView,
+  routeCaptainDockId,
+  shipPilotEligible,
+  type HelmAnnouncer,
+} from './shipPilot';
 import { rowText } from './departuresBoard';
 import type { BoardView } from './departuresBoard';
 import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './departuresDoc';
@@ -2351,6 +2360,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const ROUTE_NEXT = 'route:next';
   /** The run and stay the picker was last put on the next stop for. */
   let pickerRouteKey = '';
+  /** 🚏📢 Design §5: the captain's lines, shown at the helm too (a person
+   *  flying with no robot captain hears no robot). Its own memory, local to
+   *  this open helm (shipPilot.helmAnnouncerStep); stepped once a second. */
+  let announcer: HelmAnnouncer = freshHelmAnnouncer();
+  let announcedAt = 0;
 
   const flashRoute = (text: string, tone: 'ok' | 'warn' = 'warn'): void => {
     routeFlash = { text, tone, until: Date.now() + 8_000 };
@@ -3212,6 +3226,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         title(`🚏 ROUTE · ${path}`, badge('RUNNING', '#00E676'))
         + line(esc(st.text), st.tone === 'ok' ? '#00E676' : st.tone === 'warn' ? AMBER : 'rgba(212,168,75,0.55)')
         + line(esc(pilotLine))
+        + (announcer.shown && announcer.shown.run === route.startedAt
+          ? line(`📢 ${esc(announcer.shown.text)}`, '#F0C060')
+          : '')
         + takeover
         + buttons(helmButtons)
         + buttons(routeButtons)
@@ -3685,9 +3702,22 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         const f = readResolvedFlight(now);
         const key = flightKey(f);
         const rk = routeKey(now);
-        const changed = key !== lastFlight || rk !== lastRoute;
+        let changed = key !== lastFlight || rk !== lastRoute;
         lastFlight = key;
         lastRoute = rk;
+        // 🚏📢 The captain's next line, or the shown one going stale.
+        if (now - announcedAt >= 1000) {
+          announcedAt = now;
+          let view: ReturnType<typeof readPilotView> = null;
+          try {
+            view = readPilotView(now);
+          } catch {
+            view = null;
+          }
+          const next = helmAnnouncerStep(announcer, view);
+          if (next.shown !== announcer.shown) changed = true;
+          announcer = next;
+        }
         if (f.status === 'in-flight' || changed) render();
       }, HELM_TICK_MS);
       render();

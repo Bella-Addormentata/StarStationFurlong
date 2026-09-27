@@ -2666,6 +2666,14 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     window.clearInterval(shipFlightWatch);
     shipFlightWatch = null;
   }
+  // 🚏🛟 The ferry's keeper ticks inside that watch, so it stops with it; a
+  // docking pass still awaiting a station's answer is disowned here too
+  // (reset bumps its generation), so it writes nothing about a ship this
+  // game is leaving while the old doc flushes. The boards' walk caches and
+  // the route summary's last word belong to the room we leave.
+  routeKeeper.reset();
+  lastRouteShipStatus = "";
+  boardWalkCaches.clear();
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   const epoch = ++sessionEpoch;
   // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,

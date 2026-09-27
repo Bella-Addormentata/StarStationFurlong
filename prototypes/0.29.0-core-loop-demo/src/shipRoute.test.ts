@@ -41,6 +41,7 @@ import {
   CHECKPOINT_KINDS,
   MAX_CHECKPOINT_KEYS_SCANNED,
   ROUTE_FUEL_METER,
+  ROUTE_MIN_CLIENT,
   checkpointFromWire,
   checkpointKey,
   checkpointToWire,
@@ -49,6 +50,7 @@ import {
   installRouteFuelMeter,
   parseCheckpointKey,
   pruneRouteCheckpoints,
+  raisedMinClient,
   readResolvedFlight,
   readRouteCheckpoints,
   readRouteFlight,
@@ -420,6 +422,45 @@ describe('startShipRoute', () => {
   it('with no route saved, START does nothing', () => {
     expect(startShipRoute({ now: T0, startStop: 0, pilot: 'person', fuel: 50, capacity: CAP })).toBeNull();
     expect([...map().keys()]).toEqual([]);
+    expect(doc.getMap('roomInfo').get('minClient')).toBeUndefined();
+  });
+
+  it("raises the room's minClient advisory in START's own transaction, and never lowers it", () => {
+    const info = doc.getMap('roomInfo');
+    writeShipRoute(saved());
+    expect(info.get('minClient')).toBeUndefined(); // a saved route alone asks nothing
+    const updates = countUpdates(doc);
+    startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 50, capacity: CAP });
+    expect(updates.n).toBe(1);
+    expect(info.get('minClient')).toBe(ROUTE_MIN_CLIENT);
+
+    bindShipDoc(new Y.Doc());
+    const later = shipDocHandle()!.doc.getMap('roomInfo');
+    later.set('minClient', '0.40.2');
+    writeShipRoute(saved());
+    startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 50, capacity: CAP });
+    expect(later.get('minClient')).toBe('0.40.2');
+  });
+});
+
+describe('raisedMinClient (the roomInfo advisory)', () => {
+  it('asks for the newer of the two versions, numerically', () => {
+    expect(raisedMinClient(undefined, '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient('0.32.36', '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient('0.37.9', '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient('0.38.0', '0.38.0')).toBeNull();
+    expect(raisedMinClient('0.38.1', '0.38.0')).toBeNull();
+    expect(raisedMinClient('0.100.0', '0.38.0')).toBeNull(); // not a string compare
+    expect(raisedMinClient('1.0.0', '0.38.0')).toBeNull();
+    expect(raisedMinClient('0.39.0-beta.1', '0.38.0')).toBeNull();
+  });
+
+  it("replaces a peer's junk, and asks nothing for a malformed need", () => {
+    expect(raisedMinClient(42, '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient('latest', '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient({ v: 1 }, '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient('9'.repeat(40), '0.38.0')).toBe('0.38.0');
+    expect(raisedMinClient('0.1.0', 'soon')).toBeNull();
   });
 
   it('stores the current level clamped to the tanks, or the full-tank ceiling with the home refill', () => {

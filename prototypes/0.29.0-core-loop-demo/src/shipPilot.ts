@@ -65,7 +65,9 @@
  * Each line is said once per stay (the memory is local, like the robot), a
  * line that went stale unsaid (the player was not in the room yet) is
  * dropped, and lines are spaced so one bubble does not replace another.
- * Lines go through world.ts robotSay, the one bubble-plus-voice seam.
+ * Lines go through world.ts robotSay, the one bubble-plus-voice seam. An
+ * open helm shows the same lines as text (helmAnnouncerStep), so a route a
+ * person flies with no robot captain still announces its stops aboard.
  *
  * Pure functions (eligibility, the lock, posts, lines, words) plus thin
  * readers over the ship doc at the end. Pinned by shipPilot.test.ts.
@@ -401,6 +403,53 @@ export function pilotSpeechAfter(v: PilotLineView, mem: PilotSpeech | null, line
     departsAt: line.departsAt ?? m.departsAt,
     lastAt: v.now,
   };
+}
+
+// ── The same lines at the helm (design §5) ──────────────────────────────────
+//
+// "A route with no robot captain shows the same lines at the helm": a person
+// flying the ferry is the one aboard who needs them. An open helm runs its
+// own announcer over the same pilotLine, with a memory of its own (never a
+// robot's: each speaks once per stay for itself), and shows the newest line
+// under the route's status while it is fresh. Shown for a route with a
+// robot captain too: the robot says it, the helm echoes it. Local, like the
+// robot's speech; nothing is written.
+
+/** How long the helm shows the newest line: its words go stale ("departing
+ *  in 3 minutes"), and the status line above it carries the exact second. */
+export const HELM_LINE_SHOW_MS = 45_000;
+
+/** One open helm's announcer: what it has "said" and the line it shows. */
+export interface HelmAnnouncer {
+  speech: PilotSpeech | null;
+  shown: { text: string; run: number; at: number } | null;
+}
+
+/** A helm that has said nothing yet. */
+export function freshHelmAnnouncer(): HelmAnnouncer {
+  return { speech: null, shown: null };
+}
+
+/**
+ * One step of the helm's announcer over the captain's view now (null: no
+ * route runs). The next line is shown as soon as it is due; the shown line
+ * goes after HELM_LINE_SHOW_MS, at another run, while paused, or with no
+ * route. Returns `a` itself when nothing changed, so the caller repaints only
+ * on a new object's `shown`. Pure.
+ */
+export function helmAnnouncerStep(a: HelmAnnouncer, v: PilotLineView | null): HelmAnnouncer {
+  if (!v) return a.speech === null && a.shown === null ? a : freshHelmAnnouncer();
+  const line = pilotLine(v, a.speech);
+  if (line) {
+    return {
+      speech: pilotSpeechAfter(v, a.speech, line),
+      shown: { text: line.text, run: v.route.startedAt, at: v.now },
+    };
+  }
+  if (a.shown && (a.shown.run !== v.route.startedAt || v.f.paused || v.now - a.shown.at >= HELM_LINE_SHOW_MS)) {
+    return { ...a, shown: null };
+  }
+  return a;
 }
 
 // ── Readers (thin, effectful) ────────────────────────────────────────────────

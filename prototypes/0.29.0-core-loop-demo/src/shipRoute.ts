@@ -675,6 +675,39 @@ export function writeShipRoute(route: ShipRoute | null): boolean {
   return true;
 }
 
+// 🚏🏷️ The roomInfo.minClient advisory (floorplan plan §3.5; floorPlanDoc
+// stamps it for a resized room). An older client ignores `route` and the
+// `ckpt:` keys and obeys the stored flight (A4): its helm shows the ferry
+// where START left it, and a commander on one could DEPART mid-route. So
+// START raises the ship room's advisory to the first release that flies
+// routes, in its own transaction. Advisory only: no client refuses on it
+// yet, it is never lowered, and a room with no route never gets it.
+
+/** The first release that reads ferry routes (the one after v0.37.0). */
+export const ROUTE_MIN_CLIENT = '0.38.0';
+
+function versionParts(v: unknown): [number, number, number] | null {
+  if (typeof v !== 'string' || v.length > 32) return null;
+  const m = /^(\d{1,6})\.(\d{1,6})\.(\d{1,6})/.exec(v);
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
+}
+
+/**
+ * The minClient to write so a room asks for at least `need`, or null when
+ * `current` already asks for as much or more. A value that is not a version
+ * (absent, or a peer's junk) is replaced. Pure.
+ */
+export function raisedMinClient(current: unknown, need: string): string | null {
+  const want = versionParts(need);
+  if (!want) return null;
+  const have = versionParts(current);
+  if (!have) return need;
+  for (let i = 0; i < 3; i++) {
+    if (have[i] !== want[i]) return have[i] < want[i] ? need : null;
+  }
+  return null;
+}
+
 /** What START needs from the helm. */
 export interface RouteStartInput {
   now: number;
@@ -690,7 +723,8 @@ export interface RouteStartInput {
 /**
  * START (helm gate): in one transaction, the fuel ceiling (while the route
  * meter still reads 0; see the header), the run fields, the `start` entry,
- * and every other run's checkpoints deleted. The run id is `now`, moved
+ * every other run's checkpoints deleted, and the room's minClient advisory
+ * raised to ROUTE_MIN_CLIENT (never lowered). The run id is `now`, moved
  * past any run id still in the map. Refused when no route is saved, one is
  * running, the stop is not on it, or a robot pilot is asked for a route
  * without a robot captain. Returns the run id, or null.
@@ -720,6 +754,10 @@ export function startShipRoute(o: RouteStartInput): number | null {
     h.map.set(checkpointKey(startedAt, 0, 'start'), checkpointToWire(entry));
     for (const key of old) h.map.delete(key);
     touched();
+    // 3. The advisory: an older client flies this ship by its stored flight.
+    const info = h.doc.getMap('roomInfo');
+    const minClient = raisedMinClient(info.get('minClient'), ROUTE_MIN_CLIENT);
+    if (minClient !== null) info.set('minClient', minClient);
   });
   announce({ kind: 'start', legSeq: 0 });
   return startedAt;

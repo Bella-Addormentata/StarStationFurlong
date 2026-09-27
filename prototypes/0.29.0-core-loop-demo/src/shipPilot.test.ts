@@ -4,7 +4,8 @@
  * can fly), the captain's lock on its console and dock while a route runs,
  * where the captain stands at each moment of the timetable, how it reads
  * its dock's gate and a skip's reason, the words (the clock rounded down,
- * how long is left), every line it says and when, and the readers over a
+ * how long is left), every line it says and when, the helm's own echo of
+ * those lines (a person flying with no robot captain), and the readers over a
  * real ship + doors doc (a docked stay's welcome, SKIP STOP's reason, the
  * lock lifting when the route finishes).
  */
@@ -33,11 +34,14 @@ import type { RouteCheckpoint, RouteStop, ShipRoute } from './shipRoute';
 import type { StationBerth } from './stationDirectory';
 import {
   CAPTAIN_LOCK_REFUSAL,
+  HELM_LINE_SHOW_MS,
   PILOT_DEPART_LINE_MS,
   PILOT_HELM_BEFORE_MS,
   PILOT_LINE_GAP_MS,
   captainLockRefusal,
   consoleRoutineRefusal,
+  freshHelmAnnouncer,
+  helmAnnouncerStep,
   pilotDockAt,
   pilotLine,
   pilotPost,
@@ -441,6 +445,66 @@ describe('what the captain says (pilotLine)', () => {
     expect(pilotSpeechAt(m, 1, 5)).toEqual({ run: 1, legSeq: 5, said: [], departsAt: null, lastAt: D - MIN });
     expect(pilotSpeechAt(m, 2, 4).said).toEqual([]);
     expect(pilotSpeechAt(null, 1, 0).lastAt).toBe(-Infinity);
+  });
+});
+
+// ── The same lines at the helm (design §5) ──────────────────────────────────
+
+describe("the helm's announcer (the same lines at the helm)", () => {
+  it('shows each line as it falls due, once, from a memory of its own', () => {
+    const t = D - 4 * MIN;
+    const a0 = freshHelmAnnouncer();
+    const a1 = helmAnnouncerStep(a0, lineView(docked(), t));
+    expect(a1.shown).toEqual({
+      text: 'Welcome to Stop 0, gate 2. Next stop Stop 1, departing in 4 minutes, at 14:05.',
+      run: D - 10 * MIN,
+      at: t,
+    });
+    // Nothing new a second later: the same object comes back (no repaint).
+    expect(helmAnnouncerStep(a1, lineView(docked(), t + SEC))).toBe(a1);
+    // The one-minute line replaces it when due.
+    const a2 = helmAnnouncerStep(a1, lineView(docked(), D - 55 * SEC));
+    expect(a2.shown?.text).toBe('Departing for Stop 1 in one minute.');
+    // A robot's memory is not the helm's: a robot that said the welcome
+    // leaves the helm's own welcome due.
+    const [, robotMem] = say(lineView(docked(), t), null);
+    expect(robotMem?.said).toContain('welcome');
+    expect(helmAnnouncerStep(a0, lineView(docked(), t)).shown?.text).toMatch(/^Welcome to Stop 0/);
+  });
+
+  it('lets a line go once it is stale, at another run, while paused, and with no route', () => {
+    const t = D - 4 * MIN;
+    const a1 = helmAnnouncerStep(freshHelmAnnouncer(), lineView(docked(), t));
+    expect(a1.shown).not.toBeNull();
+    const kept = helmAnnouncerStep(a1, lineView(docked(), t + HELM_LINE_SHOW_MS - 1));
+    expect(kept).toBe(a1);
+    const stale = helmAnnouncerStep(a1, lineView(docked(), t + HELM_LINE_SHOW_MS));
+    expect(stale.shown).toBeNull();
+    expect(stale.speech).toBe(a1.speech); // the welcome stays said
+    expect(helmAnnouncerStep(stale, lineView(docked(), t + HELM_LINE_SHOW_MS + SEC))).toBe(stale);
+
+    // Another run: the old run's line goes at once, and the new run's own
+    // welcome follows once the gap between lines has passed.
+    const newRun = { route: running({ startedAt: D - 9 * MIN }) };
+    const dropped = helmAnnouncerStep(a1, lineView(docked(), t + SEC, newRun));
+    expect(dropped.shown).toBeNull();
+    expect(helmAnnouncerStep(dropped, lineView(docked(), t + PILOT_LINE_GAP_MS, newRun)).shown?.run).toBe(D - 9 * MIN);
+    expect(helmAnnouncerStep(a1, lineView(docked({ paused: true }), t + SEC)).shown).toBeNull();
+    const none = helmAnnouncerStep(a1, null);
+    expect(none).toEqual(freshHelmAnnouncer());
+    expect(helmAnnouncerStep(none, null)).toBe(none);
+  });
+
+  it('shows the §4 lines a person flying with no robot captain needs', () => {
+    const route = running({ robotDockId: undefined });
+    const hold = helmAnnouncerStep(freshHelmAnnouncer(), lineView(
+      docked({ holding: true, holdSince: D - 6 * MIN, departsAt: null, pilot: 'person' }), D - 5 * MIN, { route, dock: null },
+    ));
+    expect(hold.shown?.text).toBe('Berth at Stop 0 is occupied. Holding until it is free.');
+    const skip = helmAnnouncerStep(freshHelmAnnouncer(), lineView(
+      docked({ skipped: true, pilot: 'person' }), D - 2 * MIN, { route, dock: null, skipWhy: 'gone' },
+    ));
+    expect(skip.shown?.text).toBe('The berth at Stop 0 has been removed. Continuing to Stop 1.');
   });
 });
 
