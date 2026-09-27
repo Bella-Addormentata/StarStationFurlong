@@ -1715,11 +1715,18 @@ async function joinRoomAtEpoch(
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
-    const localSeedFor = (roomId: string): string | undefined =>
-      readAtlas()[roomId]?.seed ??
-      (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
-        ? DEFAULT_STATION.welcomeRoomLink
-        : undefined);
+    // A seed is only this room's when it names this room (atlas entries can
+    // come from peers): one naming another room would dock elsewhere.
+    const seedNames = (seed: string | undefined, roomId: string): seed is string => {
+      if (!seed) return false;
+      try { return roomIdFromSeed(seed) === roomId; } catch { return false; }
+    };
+    const localSeedFor = (roomId: string): string | undefined => {
+      const atlasSeed = readAtlas()[roomId]?.seed;
+      if (seedNames(atlasSeed, roomId)) return atlasSeed;
+      // The build's own pass for the default station is trusted as shipped.
+      return roomId === DEFAULT_STATION.welcomeRoomId ? DEFAULT_STATION.welcomeRoomLink || undefined : undefined;
+    };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
     setStationDirectory(
