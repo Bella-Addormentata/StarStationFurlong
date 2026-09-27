@@ -454,6 +454,15 @@ describe('a round trip', () => {
     expect(docking.docks).toEqual([]);
   });
 
+  it('waits in open orbit where an unlisted destination was at cast-off, when the flight kept it', () => {
+    const now = Date.now();
+    const then = 'adrift:planet-aris:4';
+    writeFlightRecord({ status: 'redocking', locationId: 'gone-soon', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    expect(completeArrival(fakeDocking(['north']), { force: true }))
+      .toEqual({ kind: 'none', stationName: 'gone-soon', reason: 'unlisted-station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: then });
+  });
+
   it('waits out the grace for a commander who can dock, then settles berthless', () => {
     castOffForDeparture('furlong-station', fakeDocking(['north']));
     const eta = 50_000;

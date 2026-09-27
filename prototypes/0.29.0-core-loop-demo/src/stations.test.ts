@@ -14,6 +14,7 @@ import {
   dockedStationFor,
   listStations,
   planetForRoom,
+  roomAdriftPlace,
   readStationRecords,
   registerStation,
   removeStation,
@@ -303,6 +304,11 @@ describe('stationForRoom / planetForRoom', () => {
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
       setRoomStationResolver(() => { throw new Error('no dock'); });
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      // A ship adrift is at its open orbit's planet, not its stand-in's.
+      setRoomStationResolver(() => 'adrift:planet-aris:3');
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
+      expect(roomAdriftPlace('ship')).toEqual({ planetId: 'planet-aris', orbitSlot: 3 });
     } finally {
       setRoomStationResolver(null);
       setStationRoomSource(() => '');

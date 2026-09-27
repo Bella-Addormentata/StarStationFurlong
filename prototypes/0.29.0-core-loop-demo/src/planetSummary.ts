@@ -43,7 +43,7 @@ import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
-import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation } from './stations';
+import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace } from './stations';
 import type { StationBerthRecord, StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
@@ -64,8 +64,14 @@ export interface TrimGone {
   readAt: number;
 }
 
-/** Rooms whose trim-gone readings a summary keeps (the newest, one each). */
-export const MAX_TRIM_GONE = 16;
+/** Rooms whose trim-gone readings a summary keeps (the newest, one each),
+ *  besides the floor: as many as the atlas holds rooms (MAX_ENTRIES). */
+export const MAX_TRIM_GONE = 64;
+/** The `from` of the floor entry: a room reading dropped past the cap
+ *  raises it, and it holds for every room without an entry of its own, so
+ *  no trim read before a forgotten take-back can come back. Never a room id
+ *  (those are seed-derived). */
+export const TRIM_GONE_FLOOR = '*';
 
 export interface StationSummary {
   welcomeRoomId: string;
@@ -547,8 +553,10 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
 }
 
 /** Two lists of "trim gone" readings, room by room: the later reading of
- *  each room; past the cap the newest rooms stay (ties by room), sorted by
- *  room so every client settles on the same list. */
+ *  each room; past the cap the newest rooms stay (ties by room) and the
+ *  rest raise the floor entry (TRIM_GONE_FLOOR), which also stands in for
+ *  every reading at or below it. Sorted by room so every client settles on
+ *  the same list. */
 function mergeGone(a: TrimGone[] | undefined, b: TrimGone[] | undefined): TrimGone[] | undefined {
   if (!a?.length) return b?.length ? b : undefined;
   if (!b?.length) return a;
@@ -557,16 +565,22 @@ function mergeGone(a: TrimGone[] | undefined, b: TrimGone[] | undefined): TrimGo
     const had = byRoom.get(g.from);
     if (!had || g.readAt > had.readAt) byRoom.set(g.from, g);
   }
+  let floor = byRoom.get(TRIM_GONE_FLOOR)?.readAt ?? 0;
+  byRoom.delete(TRIM_GONE_FLOOR);
   const byName = (x: TrimGone, y: TrimGone) => (x.from < y.from ? -1 : x.from > y.from ? 1 : 0);
-  return [...byRoom.values()]
-    .sort((x, y) => y.readAt - x.readAt || byName(x, y))
-    .slice(0, MAX_TRIM_GONE)
-    .sort(byName);
+  const rooms = [...byRoom.values()].sort((x, y) => y.readAt - x.readAt || byName(x, y));
+  for (const g of rooms.slice(MAX_TRIM_GONE)) floor = Math.max(floor, g.readAt);
+  const kept = rooms.slice(0, MAX_TRIM_GONE).filter((g) => g.readAt > floor);
+  if (floor > 0) kept.push({ from: TRIM_GONE_FLOOR, readAt: floor });
+  return kept.length > 0 ? kept.sort(byName) : undefined;
 }
 
-/** When `room` last read no trim (0: never, as far as known). */
+/** When `room` last read no trim, or the floor if later (0: never, as far
+ *  as known). */
 function goneAt(gone: TrimGone[] | undefined, room: string): number {
-  return gone?.find((g) => g.from === room)?.readAt ?? 0;
+  let at = 0;
+  for (const g of gone ?? []) if (g.from === room || g.from === TRIM_GONE_FLOOR) at = Math.max(at, g.readAt);
+  return at;
 }
 
 function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipSummary | null {
@@ -626,7 +640,7 @@ function onPlanet(v: { planetId: string }, planet: string | null): boolean {
 /** The keys this client knows first-hand: the station it stands in and the
  *  ship it is aboard. Retention keeps them whatever peers stamp. And the
  *  planet it is at (null when it cannot place itself). */
-function firstHandKeys(): { stations: Set<string>; ships: Set<string>; planet: string | null } {
+function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<string>; planet: string | null } {
   const stations = new Set<string>();
   const ships = new Set<string>();
   const current = ctx?.currentStation() ?? null;
@@ -634,7 +648,32 @@ function firstHandKeys(): { stations: Set<string>; ships: Set<string>; planet: s
   if (here) stations.add(here);
   const ship = ctx?.ship()?.roomId;
   if (ship) ships.add(ship);
-  return { stations, ships, planet: current ? planetById(current.planetId).id : null };
+  // A room that may be a ship keeps its own entry too: while its stations
+  // are not placed, that entry is what says which planet it is at.
+  const shipRoom = mayBeShipRoom();
+  if (shipRoom) ships.add(shipRoom);
+  const standIn = isShipStandIn(current, shipRoom);
+  const shipEntry = shipRoom ? store?.ships[shipRoom] : undefined;
+  // A ship adrift is at its open orbit's planet, not its stand-in's.
+  const adrift = roomAdriftPlace(ctx?.currentRoom?.() || '');
+  const planet = adrift ? planetById(adrift.planetId).id
+    : current && !standIn ? planetById(current.planetId).id
+      : shipEntry && !shipEntry.retired ? planetById(shipEntry.planetId).id
+        : null;
+  return { stations, ships, planet };
+}
+
+/** The room this client stands in, unless it is known to be no ship. */
+function mayBeShipRoom(): string | null {
+  const room = ctx?.currentRoom?.() || null;
+  return room && ctx?.notShipRoom?.() !== room ? room : null;
+}
+
+/** A ship's own one-room stand-in (derived, its welcome room the ship's
+ *  room): it sits on the default planet until stations are known, so it
+ *  places nothing. A one-room station known to be no ship is a place. */
+function isShipStandIn(found: StationRecord | null, shipRoom: string | null): boolean {
+  return !!found && !!found.derived && shipRoom !== null && found.welcomeRoomId === shipRoom;
 }
 
 // ── From this client: its station and its ship ──────────────────────────────
@@ -692,6 +731,7 @@ export function foldOwnStation(
   trim: OrbitTrim | null,
   now: number,
   firstHandRoom?: string,
+  readChanged = false,
 ): StationSummary | null {
   const past = (at: number) => Math.min(Math.max(now, at + 1), now + MAX_SKEW_MS);
   // The trim read first-hand from the room this client stands in: stamped
@@ -741,9 +781,14 @@ export function foldOwnStation(
   const applies = cleanTrim(trimFor(base, readTrim(known)));
   // This room now reads no trim where the known one was read here: that
   // trim was taken back, and the reading says so.
+  // This room's reading changed while another room's trim stands over it:
+  // its own earlier readings are superseded all the same (a reading it
+  // takes now is stamped at or past this), so none can come back later.
   const gone: TrimGone[] | undefined = !trim && firstHandRoom !== undefined && known.trim?.from === firstHandRoom
     ? [{ from: firstHandRoom, readAt: past(known.trim.readAt ?? 0) }]
-    : undefined;
+    : readChanged && firstHandRoom !== undefined && known.trim !== undefined && known.trim.from !== firstHandRoom
+      ? [{ from: firstHandRoom, readAt: past(goneAt(known.trimGone, firstHandRoom)) }]
+      : undefined;
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);
   // Gates: only the room this client stands in is first-hand; its other rooms
@@ -973,7 +1018,7 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (next) { store.ships[k] = next; changed = true; }
     if (JSON.stringify(store.ships[k]) !== JSON.stringify(s)) staleShips.set(k, s);
   }
-  const pins = firstHandKeys();
+  const pins = firstHandKeys(store);
   if (changed) {
     store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
     store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
@@ -1035,7 +1080,9 @@ export function publishPlanetSummary(now = Date.now()): void {
   const store = readStore(now);
   const here = ctx.currentStation();
   if (here && here.welcomeRoomId && here.welcomeRoomId.length <= MAX_ID_LEN) {
-    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, ctx.localTrim(), now, ctx.currentRoom?.() || currentRoomId() || undefined);
+    const room = ctx.currentRoom?.() || currentRoomId() || undefined;
+    const local = ctx.localTrim();
+    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, local, now, room, room !== undefined && readingChanged(room, local));
     if (next) store.stations[here.welcomeRoomId] = next;
   }
   const ship = ctx.ship();
@@ -1064,7 +1111,7 @@ export function publishPlanetSummary(now = Date.now()): void {
       store.ships[room] = { ...prior, retired: true, updatedAt: stampPast(room) };
     }
   }
-  const pins = firstHandKeys();
+  const pins = firstHandKeys(store);
   store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
   store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
   writeStore(store);
@@ -1102,6 +1149,19 @@ export function publishPlanetSummary(now = Date.now()): void {
   notify();
 }
 
+/** What each room last read first-hand (its trim's core, or none), so a
+ *  change of reading is news even while another room's trim stands. */
+const lastReadings = new Map<string, string>();
+
+function readingChanged(room: string, trim: OrbitTrim | null): boolean {
+  const core = trim ? JSON.stringify({ ...cleanTrim(trim, Infinity), from: undefined, readAt: undefined }) : '';
+  const had = lastReadings.get(room);
+  if (had === undefined && lastReadings.size >= 256) lastReadings.clear();
+  lastReadings.set(room, core);
+  // A first reading of none says nothing (most rooms have no helm).
+  return had === undefined ? core !== '' : had !== core;
+}
+
 // ── Reading what is known ────────────────────────────────────────────────────
 
 let trimsByStationId = new Map<string, SharedTrim>();
@@ -1111,11 +1171,9 @@ let trimsByStationId = new Map<string, SharedTrim>();
 function applyLearned(store: Store): void {
   // Moves first: they decide which planet each station is listed at.
   for (const s of Object.values(store.stations)) if (s.move) rememberMove(s.move);
-  const room = ctx?.currentRoom?.() || null;
+  const room = mayBeShipRoom();
   const found = ctx?.currentStation() ?? null;
-  // A ship's own one-room stand-in (derived, its welcome room this room)
-  // places nothing: it sits on the default planet until stations are known.
-  const here = found && !(found.derived && found.welcomeRoomId === room) ? found : null;
+  const here = found && !isShipStandIn(found, room) ? found : null;
   // Where this client is: the shared summary of the station it stands in,
   // unless this install's own saved record is the one that stands there (a
   // derived record sits on the default planet until its learned one
@@ -1208,6 +1266,7 @@ export function systemStationNames(planetId: string, now = Date.now()): Array<{ 
 
 /** Test seam: forget the binding. */
 export function unbindPlanetSummaryForTest(): void {
+  lastReadings.clear();
   doc = null;
   stationMap = null;
   shipMap = null;

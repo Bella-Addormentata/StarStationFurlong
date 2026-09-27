@@ -403,8 +403,12 @@ export function completeArrival(
   };
   // A destination that left the directory mid-flight is NOT home: arrive
   // there undocked rather than docking at findDestination's fallback.
+  // It waits in open orbit where the station was at cast-off, when the
+  // flight kept that (a station pruned from this install's list after it
+  // moved): a place every planet reader resolves, unlike a lost station id.
   if (!isKnownStation(rec.locationId)) {
-    return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' });
+    const at = rec.destinationAt && adriftPlace(rec.destinationAt) ? rec.destinationAt : rec.locationId;
+    return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' }, at);
   }
   const station = findDestination(rec.locationId);
   // 🚚 A station that left its planet while the ship was on the way (still
