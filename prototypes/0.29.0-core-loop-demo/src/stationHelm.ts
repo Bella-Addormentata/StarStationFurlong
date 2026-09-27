@@ -37,6 +37,7 @@ import { subscribeFurniture } from './furnitureDoc';
 import { realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFuelLevel, subscribeShip } from './shipDoc';
+import { subscribePlanetSummary } from './planetSummary';
 import type { StationRecord } from './stations';
 import {
   MAX_TRIM_KM,
@@ -635,6 +636,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     unsubs.push(subscribeShip(refresh));
     unsubs.push(subscribeFurniture(refresh));
     unsubs.push(subscribeDoors(refresh));
+    // 🪐 A peer's trim of this station, or a newly learned neighbour.
+    unsubs.push(subscribePlanetSummary(refresh));
     refresh();
     placeKnob(Date.now());
   };

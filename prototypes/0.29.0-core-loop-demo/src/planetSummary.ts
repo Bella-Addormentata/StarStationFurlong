@@ -204,15 +204,19 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // An empty list is news too (the station's last gate was removed); a list
   // whose every entry was malformed is not.
   const berths = cleanBerths(v.berths);
-  if (Array.isArray(v.berths) && (berths.length > 0 || v.berths.length === 0) && isStamp(v.berthsAt, now)) {
+  // Peer-written room stamps: a map larger than any list carries is junk
+  // (counting stops early), and so is the gate list it came with, since
+  // without its stamps each room would pass for as fresh as the whole list.
+  let roomCount = 0;
+  if (isPlainObject(v.berthRoomsAt)) for (const _k in v.berthRoomsAt) if (++roomCount > MAX_BERTHS) break;
+  const roomsOk = v.berthRoomsAt === undefined || (isPlainObject(v.berthRoomsAt) && roomCount <= MAX_BERTHS);
+  if (Array.isArray(v.berths) && (berths.length > 0 || v.berths.length === 0) && isStamp(v.berthsAt, now) && roomsOk) {
     out.berths = berths;
     out.berthsAt = v.berthsAt;
     if (isPlainObject(v.berthRoomsAt)) {
       const rooms: Record<string, number> = {};
-      let n = 0;
       for (const [room, at] of Object.entries(v.berthRoomsAt)) {
-        if (n >= MAX_BERTHS) break;
-        if (isId(room) && isStamp(at, now)) { rooms[room] = at; n++; }
+        if (isId(room) && isStamp(at, now)) rooms[room] = at;
       }
       const canon = canonRoomStamps(out.berths, out.berthsAt, rooms);
       if (canon) out.berthRoomsAt = canon;
@@ -676,7 +680,18 @@ export function registerLearnedStations(
     if (!rec) continue;
     const owner = listed.find((st) => st.welcomeRoomId === s.welcomeRoomId);
     // Someone else's record, or its own saved one: this install decides.
-    if (owner && !owner.derived && owner.id !== rec.id) continue;
+    if (owner && !owner.derived && owner.id !== rec.id) {
+      // …except where it stands: when another install's record of the same
+      // place stood (rival owners settle on one, mergeStation), this one
+      // flies that planet and slot too, under its own id, so both installs
+      // agree and the standing trim fits.
+      const own = saved.get(owner.id);
+      if (own && !isLearnedRecord(own) && s.ownerId !== undefined && s.ownerId !== owner.id
+        && (own.orbitSlot !== s.orbitSlot || planetById(own.planetId).id !== planetById(s.planetId).id)) {
+        if (registerStation({ ...own, planetId: s.planetId, orbitSlot: s.orbitSlot })) changed++;
+      }
+      continue;
+    }
     // Unchanged since it was saved: compare with the SAVED record, not the
     // listed one (the list may have moved it to a free slot), extra fields
     // included (a newer build's, such as a station's move).

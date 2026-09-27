@@ -313,6 +313,29 @@ function sync(from: Y.Doc, to: Y.Doc): void {
 }
 
 describe('sharing through the room doc', () => {
+  it('two installs that each saved one place fly the standing record\'s slot', () => {
+    // Install A saved HAB RING as 'a-hab' in slot 2 and published it.
+    store = new Map();
+    registerStation(record({ id: 'a-hab', orbitSlot: 2 }));
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install('a-hab'));
+    // Install B saved the same place as 'b-hab' in slot 5, then joins.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    registerStation(record({ id: 'b-hab', orbitSlot: 5 }));
+    const docB = new Y.Doc();
+    sync(docA, docB);
+    bindPlanetSummaryDoc(docB, install('b-hab'));
+    // The smaller owner id stands; B keeps its id and flies A's slot.
+    expect(readStore().stations['room-hab']?.ownerId).toBe('a-hab');
+    const b = listStations().find((s) => s.id === 'b-hab');
+    expect(b?.orbitSlot).toBe(2);
+    // Nothing left to republish over.
+    const before = JSON.stringify(docB.getMap('stationSummaries').toJSON());
+    publishPlanetSummary(Date.now() + 1000);
+    expect(JSON.stringify(docB.getMap('stationSummaries').toJSON())).toBe(before);
+  });
+
   it('places a fresh install standing in an off-home station by the room\'s shared summary', () => {
     const doc = new Y.Doc();
     doc.getMap('stationSummaries').set('room-x', {

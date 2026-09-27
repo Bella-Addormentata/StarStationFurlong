@@ -9,8 +9,8 @@
  * which is structure: a dock can be released, a gangway cannot) steers the
  * STATION, so its helm opens the station keeping face (stationHelm.ts). Any
  * other module flies ITSELF: the ship helm (devices.ts createHelmUI). It is
- * the same line the ship helm already draws when it says a bolted module
- * cannot fly.
+ * the line the ship helm already draws when it says a bolted module cannot
+ * fly, except that a pairing naming no room joins nothing, as in the atlas.
  *
  * THE ORBIT. Stations fly perfect circles (orbits.ts, owner pick 2026-09-27):
  * a station's slot fixes its radius and its phase. Station keeping adds a
@@ -99,13 +99,14 @@ const DEG = Math.PI / 180;
 
 /**
  * Is this module part of a station's structure? True when any of its doors is
- * paired and is not a berth — the same line station grouping draws
- * (stationAtlas.isBerthDoor: a transient guest berth or a docking-adapter
- * chain is a ship calling, not structure).
+ * paired to a room and is not a berth — the same line station grouping draws
+ * (the atlas harvest skips a pairing that names no room, and
+ * stationAtlas.isBerthDoor calls a transient guest berth or a docking-adapter
+ * chain a ship calling, not structure).
  */
 export function isBoltedIntoStation(doors: Iterable<DoorRecord>): boolean {
   for (const rec of doors) {
-    if (rec.paired !== true) continue;
+    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (isBerthDoor(rec)) continue;
     return true;
   }
