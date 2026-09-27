@@ -960,6 +960,39 @@ describe("earlier builds' per-machine leases", () => {
     expect(readSlotOperatorLease()).toBeNull();
   });
 
+  it('count only records that are leases: junk under the prefix neither fills the cap nor holds the room off', () => {
+    fund(M1);
+    const map = doc.getMap('casino');
+    doc.transact(() => {
+      for (let i = 0; i < LEGACY_SLOT_LEASE_READ_CAP * 2; i++) {
+        map.set(`slot-operator:junk-${i}`, i % 2 ? 'not a lease' : { expiresAt: T0 + LEASE_MS });
+      }
+    });
+    expect(readLegacySlotOperatorMachineIds()).toEqual({ machineIds: [], more: false });
+    // A real one among the junk is still found, and held for its term.
+    map.set(legacyKey, legacy(T0 + LEASE_MS));
+    expect(readLegacySlotOperatorMachineIds()).toEqual({ machineIds: [M1], more: false });
+    tickSlotMachineRoom([M1], false, at(T0));
+    expect(readSlotOperatorLease()).toBeNull();
+    tickSlotMachineRoom([M1], false, at(T0 + LEASE_MS));
+    expect(readSlotOperatorLease()?.sessionId).toBe(slotOperatorSession());
+  });
+
+  it('follow a record rewritten to junk and back, and ignore junk a doc is bound with', () => {
+    const map = doc.getMap('casino');
+    map.set(legacyKey, legacy(T0 + LEASE_MS));
+    expect(readLegacySlotOperatorMachineIds().machineIds).toEqual([M1]);
+    map.set(legacyKey, { playerId: OPERATOR }); // no longer a lease
+    expect(readLegacySlotOperatorMachineIds().machineIds).toEqual([]);
+    map.set(legacyKey, legacy(T0 + LEASE_MS));
+    expect(readLegacySlotOperatorMachineIds().machineIds).toEqual([M1]);
+    const other = new Y.Doc();
+    other.getMap('casino').set(`slot-operator:${M2}`, 42);
+    other.getMap('casino').set(`slot-operator:${M1}`, legacy(T0 + LEASE_MS));
+    bindCasinoDoc(other);
+    expect(readLegacySlotOperatorMachineIds().machineIds).toEqual([M1]);
+  });
+
   it('are forgotten once their record is gone, whoever deleted it', () => {
     fund(M1);
     const map = doc.getMap('casino');

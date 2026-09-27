@@ -560,7 +560,10 @@ export function clearLegacySlotOperatorLease(machineId: string): void {
  *  for, kept current from the keys each transaction changed. The slot
  *  operator asks before every write whether an earlier build is operating in
  *  the room, whatever machines the room's layout listed at the last frame,
- *  and never walks the map to find out. */
+ *  and never walks the map to find out. Only a key holding a lease record
+ *  counts: anything else under the prefix is no lease (as
+ *  readLegacySlotOperatorLease reads it), so it neither holds the room off
+ *  nor takes a place under the read cap. */
 const legacySlotLeaseMachines = new WeakMap<Y.Map<unknown>, Set<string>>();
 
 /** Build a map's index in one pass (when it is bound, while a joined doc is
@@ -569,16 +572,18 @@ function indexLegacySlotLeases(map: Y.Map<unknown>): void {
   if (legacySlotLeaseMachines.has(map)) return;
   const prefix = `${SLOT_OPERATOR_KEY}:`;
   const machines = new Set<string>();
+  const file = (key: string): void => {
+    const machineId = key.slice(prefix.length);
+    if (isSlotOperatorLease(map.get(key))) machines.add(machineId);
+    else machines.delete(machineId);
+  };
   for (const key of map.keys()) {
-    if (key.startsWith(prefix)) machines.add(key.slice(prefix.length));
+    if (key.startsWith(prefix)) file(key);
   }
   legacySlotLeaseMachines.set(map, machines);
   map.observe((event) => {
     for (const key of event.keysChanged) {
-      if (!key.startsWith(prefix)) continue;
-      const machineId = key.slice(prefix.length);
-      if (map.has(key)) machines.add(machineId);
-      else machines.delete(machineId);
+      if (key.startsWith(prefix)) file(key);
     }
   });
 }
