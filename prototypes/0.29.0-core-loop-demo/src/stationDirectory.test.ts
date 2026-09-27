@@ -108,9 +108,9 @@ describe('the station record as destinations', () => {
     expect(out[2].travelMs).toBe(TRAVEL_MS_MAX);
   });
 
-  it('gives a berth only where this client holds a seed for the welcome room', () => {
+  it('gives a berth only where the berth door is named and this client holds a seed', () => {
     const out = destinationsFromRecords(records, (rid) => seeds[rid]);
-    expect(out[0].berth).toEqual({ address: 'seed-home' });
+    expect(out[0].berth).toBeUndefined();
     expect(out[1].berth).toEqual({ address: 'seed-mod', farDoor: 'north' });
     expect(out[2].berth).toBeUndefined();
   });

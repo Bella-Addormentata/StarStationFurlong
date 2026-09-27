@@ -195,6 +195,14 @@ describe('a round trip', () => {
     expect(north.kind === 'docked' && north.record.farDoor).toBe('south');
   });
 
+  it('forgets the oldest other station to remember this berth when memory is full', () => {
+    for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', address: SEED_HIGH });
+    expect(castOffForDeparture('furlong-station', fakeDocking(['north']))).toBe(true);
+    expect(readStationBerth('furlong-station')?.address).toBe(SEED_FURLONG);
+    expect(readStationBerth('s0')).toBeNull();
+    expect(readStationBerth('s31')).not.toBeNull();
+  });
+
   it("docks at the destination station's own berth, and remembers where it left", () => {
     const stations: StationDestination[] = [
       ...DEFAULT_STATIONS.slice(0, 1),
@@ -298,11 +306,23 @@ describe('berth memory in the ship doc', () => {
       good: { doorId: 'north', address: SEED_FURLONG },
       badWall: { doorId: 'north', address: SEED_FURLONG, farWall: 'up' },
       badLat: { doorId: 'north', address: SEED_FURLONG, farLateral: Infinity },
+      wideLat: { doorId: 'north', address: SEED_FURLONG, farLateral: 33 },
       notObj: 7,
     });
     expect(readStationBerth('good')).toEqual({ doorId: 'north', address: SEED_FURLONG });
     expect(readStationBerth('badWall')).toBeNull();
     expect(readStationBerth('badLat')).toBeNull();
+    expect(readStationBerth('wideLat')).toBeNull();
     expect(readStationBerth('notObj')).toBeNull();
+  });
+
+  it('stops inspecting a map flooded with junk keys', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    const berths: Record<string, unknown> = {};
+    for (let i = 0; i < 500; i++) berths[`junk${i}`] = 7;
+    berths.late = { doorId: 'north', address: SEED_FURLONG };
+    doc.getMap('ship').set('berths', berths);
+    expect(readStationBerth('late')).toBeNull();
   });
 });

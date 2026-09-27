@@ -2057,21 +2057,34 @@ function portStatusText(p: DockPortView): string {
  *  finished the flight (the open helm's tick, or main.ts's 1 Hz watch), shown
  *  on the next docked render. Cleared at DEPART. */
 let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
+/** Open helms re-render when the note changes — an arrival finished by
+ *  main.ts's watch writes no doc value the helm observes. */
+const arrivalNoteListeners = new Set<() => void>();
+
+function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
+  lastArrivalNote = note;
+  for (const fn of arrivalNoteListeners) fn();
+}
+
+function subscribeArrivalNote(fn: () => void): () => void {
+  arrivalNoteListeners.add(fn);
+  return () => { arrivalNoteListeners.delete(fn); };
+}
 
 /** Forget the last arrival — main.ts calls it on every room join, so one
  *  ship's arrival never shows on another ship's helm. */
 export function clearShipArrivalNote(): void {
-  lastArrivalNote = null;
+  setArrivalNote(null);
 }
 
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
 export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   if (!outcome) return;
   if (outcome.kind === 'docking') {
-    lastArrivalNote = { text: `Arrived at ${outcome.stationName} — docking at the berth.`, tone: 'ok' };
+    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at the berth.`, tone: 'ok' });
     return;
   }
-  lastArrivalNote = {
+  setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
@@ -2080,7 +2093,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
         : outcome.reason === 'no-port'
         ? `Arrived at ${outcome.stationName} — no free dock port to dock with. Fit one at a door (door panel › +DOCK).`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
-  };
+  });
 }
 
 /**
@@ -2372,6 +2385,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const nowFlight = readFlightRecord();
       const fromId = shipLocationId(nowFlight, hasLiveDock());
       const destId = pickerDestId ?? '';
+      const nowHop = destId ? planHop(fromId, destId, Date.now()) : null;
       const nowRefusal = canDepart({
         flightCapable: isShipReady(),
         currentStatus: nowFlight.status,
@@ -2380,10 +2394,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         chainedDoors: enumerateChainedDoors(),
         ownerAuthorized: helmIsCommander(),
         locationId: fromId,
+        ...(destId ? { hop: nowHop } : {}),
       });
       if (!nowRefusal.ok) { render(); return; }
       const dest = findDestination(destId);
-      const nowHop = planHop(fromId, destId, Date.now());
       if (!nowHop) { render(); return; }
       if (nowFuel < nowHop.fuelCost) { render(); return; }
       // 1) Publish the flight record FIRST — the FAST path docked → in-flight.
@@ -2402,11 +2416,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
       //    UNDOCK — tombstone + far-room write), then detach any other
       //    transient guest berth (#67 D2, either-side legal).
-      if (shipDocking) castOffForDeparture(fromId, shipDocking);
+      const berthKept = shipDocking ? castOffForDeparture(fromId, shipDocking) : true;
       for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
       // 3) Debit the fuel cost.
       writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
-      lastArrivalNote = null;
+      setArrivalNote(berthKept ? null : {
+        tone: 'warn',
+        text: `The ship could not remember its berth at ${findDestination(fromId).name}; a return trip will need a dock from a door panel.`,
+      });
       render();
     });
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
@@ -2651,6 +2668,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeShip(() => { refuelArmed = false; render(); }));
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
+      unsubs.push(subscribeArrivalNote(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();

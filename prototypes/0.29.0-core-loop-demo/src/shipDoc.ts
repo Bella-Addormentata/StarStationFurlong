@@ -514,6 +514,11 @@ const MAX_BERTH_STATIONS = 32;
 /** A pass seed carries hints and a key — generous, but bounded. */
 const MAX_ADDRESS_LEN = 4096;
 const DOOR_WALLS: readonly string[] = ['x+', 'x-', 'y+', 'y-'];
+/** Same bound the door and atlas records put on a lateral offset. */
+const MAX_FAR_LATERAL = 32;
+/** How many raw keys a read inspects before giving up: junk keys a peer
+ *  wrote must not make every helm render walk an unbounded map. */
+const MAX_BERTH_KEYS_SCANNED = MAX_BERTH_STATIONS * 4;
 
 export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
@@ -522,7 +527,8 @@ export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
   if (typeof r.address !== 'string' || r.address.length === 0 || r.address.length > MAX_ADDRESS_LEN) return false;
   if (r.farDoor !== undefined && !isBoundedString(r.farDoor)) return false;
   if (r.farWall !== undefined && !DOOR_WALLS.includes(r.farWall as string)) return false;
-  if (r.farLateral !== undefined && !(typeof r.farLateral === 'number' && Number.isFinite(r.farLateral))) return false;
+  if (r.farLateral !== undefined && !(typeof r.farLateral === 'number' && Number.isFinite(r.farLateral)
+    && Math.abs(r.farLateral) <= MAX_FAR_LATERAL)) return false;
   return true;
 }
 
@@ -542,9 +548,14 @@ export function readBerthMemory(): Record<string, BerthMemoryRecord> {
   if (!docAlive()) return out;
   const raw = shipMap!.get('berths');
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return out;
+  const map = raw as Record<string, unknown>;
   let n = 0;
-  for (const [stationId, rec] of Object.entries(raw as Record<string, unknown>)) {
-    if (n >= MAX_BERTH_STATIONS) break;
+  let scanned = 0;
+  for (const stationId in map) {
+    if (n >= MAX_BERTH_STATIONS || scanned >= MAX_BERTH_KEYS_SCANNED) break;
+    scanned++;
+    if (!Object.prototype.hasOwnProperty.call(map, stationId)) continue;
+    const rec = map[stationId];
     if (!isBoundedString(stationId) || !isBerthMemoryRecord(rec)) continue;
     out[stationId] = cleanBerth(rec);
     n++;

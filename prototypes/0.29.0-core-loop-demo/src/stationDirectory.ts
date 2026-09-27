@@ -183,8 +183,8 @@ export function planRecordHop(
 /**
  * Turn station records into destinations. A station's berth is its welcome
  * room — dockable only when this client holds a seed for it (`seedFor`: the
- * atlas seed, or the build's own pass for the default station) — at its
- * berth door when one is named.
+ * atlas seed, or the build's own pass for the default station) — and only
+ * when the record names its berth door.
  */
 export function destinationsFromRecords(
   records: readonly StationRecordLike[],
@@ -199,11 +199,11 @@ export function destinationsFromRecords(
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
     };
-    const address = r.welcomeRoomId ? seedFor(r.welcomeRoomId) : undefined;
-    if (address) {
-      out.berth = { address };
-      if (r.berthDoor) out.berth.farDoor = r.berthDoor;
-    }
+    // A public berth needs its door: DOCK only asks the far room (and so
+    // only proves a port is there) when it knows the far door. Without one
+    // the ship's own berth memory decides, or arrival reports no berth.
+    const address = r.welcomeRoomId && r.berthDoor ? seedFor(r.welcomeRoomId) : undefined;
+    if (address && r.berthDoor) out.berth = { address, farDoor: r.berthDoor };
     return out;
   });
 }
