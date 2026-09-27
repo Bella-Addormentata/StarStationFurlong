@@ -25,6 +25,7 @@ import {
   type StationDestination,
 } from './stationDirectory';
 import { planTransfer } from './orbits';
+import { isFlightRecord } from './shipDoc';
 
 afterEach(() => setStationDirectory(null));
 
@@ -132,6 +133,7 @@ describe('planning a hop', () => {
     expect(planHop('furlong-station', 'high-orbit', 1000)).toEqual({ departAt: 1000, arriveAt: 1000 + TRAVEL_MS_MIN, fuelCost: 25 });
     expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
     expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
+    expect(planHop('nowhere', 'high-orbit', 1000)).toBeNull();
   });
 
   it('follows the circular-orbit model over station records', () => {
@@ -144,13 +146,30 @@ describe('planning a hop', () => {
     const now = Date.UTC(2026, 8, 27);
     const hop = planHop('low', 'high', now)!;
     const t = planTransfer(records[0], records[1], now)!;
-    expect(hop.departAt).toBe(t.departAt);
-    expect(hop.arriveAt).toBe(t.arriveAt);
+    // Whole milliseconds, rounded up (a flight record stores only those).
+    expect(hop.departAt).toBe(Math.ceil(t.departAt));
+    expect(hop.arriveAt).toBe(Math.ceil(t.arriveAt));
     expect(hop.departAt).toBeGreaterThanOrEqual(now);
     expect(hop.fuelCost).toBe(Math.ceil(t.deltaVKmS * FUEL_PER_KMS));
     expect(hop.windowEveryMs).toBe(t.synodicMs);
     // Two stations sharing one orbit have no transfer between them.
     expect(planHop('low', 'twin', now)).toBeNull();
+  });
+
+  it('plans hops a flight record accepts as they are', () => {
+    const records = [
+      { id: 'low', name: 'LOW', planetId: 'planet-sovereign', orbitSlot: 0, welcomeRoomId: 'r0' },
+      { id: 'high', name: 'HIGH', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'r1' },
+    ];
+    setStationDirectory(directoryFromStationRecords(() => records, () => undefined, () => null));
+    const now = Date.now();
+    for (const at of [now, now + 0.25, now + 1234.5]) {
+      const hop = planHop('low', 'high', at)!;
+      expect(Number.isSafeInteger(hop.departAt) && Number.isSafeInteger(hop.arriveAt)).toBe(true);
+      expect(isFlightRecord({
+        status: 'in-flight', locationId: 'low', destinationId: 'high', departedAt: hop.departAt, etaAt: hop.arriveAt,
+      })).toBe(true);
+    }
   });
 
   it('prices a low hop so one tank flies more than one', () => {
@@ -178,6 +197,14 @@ describe('station ids written on another install', () => {
     // An alias to nothing listed, or no alias at all: left as written.
     expect(localStationId('ghost')).toBe('ghost');
     expect(localStationId('unknown')).toBe('unknown');
+  });
+
+  it('ask the resolver before taking a listed id as written', () => {
+    // A local record whose id collides with a portable id for another room.
+    const clash = [...records, { id: 'shared:room-odd', name: 'ODD', planetId: HOME_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'room-x' }];
+    const byRoom: Record<string, string> = { 'shared:room-odd': 'shared:room-hab' };
+    setStationDirectory(directoryFromStationRecords(() => clash, () => undefined, () => null, () => null, (id) => byRoom[id] ?? null));
+    expect(localStationId('shared:room-odd')).toBe('shared:room-hab');
   });
 
   it('are taken as written without a resolver', () => {

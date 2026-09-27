@@ -117,7 +117,7 @@ import {
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
 import { pairingAllowedByFlight } from "./shipDoc";
-import { towHoldsDock } from "./stationMove";
+import { dockLockedByMove } from "./stationMove";
 // 🚏 A4: every flight gate here reads the flight the ship is really on — a
 // running ferry route's timetable (never written) while it rules, else the
 // stored record — or a far write lands while the ferry is between stops.
@@ -236,7 +236,8 @@ export type FarDockResult =
         | "occupied"
         | "closed"
         | "gone"
-        /** ⚓🚦 The gate is closed or reserved to this ship (doorPolicy). */
+        /** ⚓🚦 The gate does not admit this ship (doorPolicy): closed,
+         *  reserved for another ship, or open only to granted captains. */
         | "not-allowed"
         /** ⚓🚦 The far door wears no port and every gate number of its
          *  station is taken, so none is fitted. */
@@ -2049,17 +2050,30 @@ export class DoorDockingPortSystem {
       if (el.dataset.dockAction === "undock") void this.undockPort(doorId);
       else if (el.dataset.dockAction === "dock") void this.redockPort(doorId);
       else if (el.dataset.dockAction === "gate-down" || el.dataset.dockAction === "gate-up") {
-        // ⚓🚦 The owner renumbers a gate by hand (a duplicate is flagged in
-        // the row, never fixed behind their back). Owner only: a public
-        // build door or a granted builder may fit ports, not renumber gates.
+        // ⚓🚦 The owner renumbers a gate by hand, stepping over numbers other
+        // ports of the station use, so numbers stay unique and a station has
+        // at most MAX_GATE ports listed. (A duplicate that arrives some other
+        // way, such as two stations joined, is flagged in the row.) Owner
+        // only: a public build door or a granted builder may fit ports, not
+        // renumber gates.
         if (!this.isRoomOwner()) return;
         const policy = readDoorPolicy(doorId);
         if (!policy.adapter) return;
+        const roomId = this.roomNow();
+        const own = readDockGates();
         // A port fitted before gates existed gets the lowest free number first.
+        if (policy.gate === undefined) {
+          const first = freeGateNumber(readAtlas(), roomId, own);
+          if (first !== null) writeDoorPolicy(doorId, { ...policy, gate: first });
+          return;
+        }
+        const taken = new Set<number>();
+        for (const g of stationGates(readAtlas(), roomId)) if (g.roomId !== roomId) taken.add(g.gate);
+        for (const [d, g] of Object.entries(own)) if (d !== doorId) taken.add(g);
         const step = el.dataset.dockAction === "gate-up" ? 1 : -1;
-        const gate = policy.gate === undefined
-          ? freeGateNumber(readAtlas(), this.roomNow(), readDockGates()) ?? 1
-          : Math.min(MAX_GATE, Math.max(1, policy.gate + step));
+        let gate = policy.gate + step;
+        while (gate >= 1 && gate <= MAX_GATE && taken.has(gate)) gate += step;
+        if (gate < 1 || gate > MAX_GATE) return; // nothing free that way
         writeDoorPolicy(doorId, { ...policy, gate });
       } else if (el.dataset.dockAction === "gate-access") {
         // ⚓🚦 The owner decides who may dock here: OPEN → PASS (captains
@@ -2827,11 +2841,12 @@ export class DoorDockingPortSystem {
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
-    // 🚚 A tug under way holds its station by this dock: neither end lets go
-    // until the tow arrives.
-    if (towHoldsDock([roomId, port.roomId], Date.now())) {
+    // 🚚 A tug under way holds its station by this dock, and a station
+    // between planets carries every ship docked to it: neither end lets go
+    // until it arrives.
+    if (dockLockedByMove([roomId, port.roomId], Date.now())) {
       this.setDockOp(doorId, {
-        note: "A tow is under way on this dock — it can't undock until the station arrives.",
+        note: "This station is moving between planets — the dock holds until it arrives.",
         tone: "bad",
       });
       return false;
@@ -2937,6 +2952,14 @@ export class DoorDockingPortSystem {
         tone: "bad",
       });
       return { ok: false, reason: "in-flight" };
+    }
+    // 🚚 No ship joins (or rejoins) a station between planets.
+    if (dockLockedByMove([roomId, port.roomId], Date.now())) {
+      this.setDockOp(doorId, {
+        note: "That station is moving between planets — dock when it arrives.",
+        tone: "bad",
+      });
+      return { ok: false, reason: "moving" };
     }
     if (!this.mayDockHere(doorId, "dock", port.roomId, opts)) {
       this.setDockOp(doorId, {
@@ -3842,6 +3865,11 @@ export class DoorDockingPortSystem {
           `[docking] refused ACCEPTED pairing on ${doorId} — ship is ${flightGate.status} (SH3 gate)`,
         );
         return; // leave pairingPending alone; the request is not consumed
+      }
+      // 🚚 Nor while this room's station is between planets (stationMove.ts).
+      if (dockLockedByMove([this.roomNow()], Date.now())) {
+        console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — station in transit`);
+        return;
       }
     }
 

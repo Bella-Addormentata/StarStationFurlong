@@ -460,6 +460,8 @@ export function farDockPatch(
  *                cannot be asked (a plain DOCK docks this side alone)
  *   changed      this port changed while the berth was asked
  *   refused      a bare `false` from an older docking API (no reason given)
+ *   moving       this station or the berth's is moving between planets
+ *                (stationMove.dockLockedByMove, PR 174)
  * `occupied` is also this side's own answer when the local atlas shows the
  * berth taken (a plain DOCK only; keeper mode asks the station instead).
  */
@@ -472,6 +474,7 @@ export type DockRefusal =
   | 'no-writer'
   | 'changed'
   | 'refused'
+  | 'moving'
   | 'unreachable'
   | 'no-address'
   | 'no-far-door'

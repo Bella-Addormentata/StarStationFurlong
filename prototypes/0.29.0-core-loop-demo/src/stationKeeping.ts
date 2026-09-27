@@ -26,27 +26,32 @@
  * phase home.
  *
  * Derive, don't tick (STUDY-Architecture v006 §8.2; the Phase 2 plan's
- * "station-keeping burns are discrete events"): each nudge is ONE burn that
- * rewrites the trim record — the radius offset, the phase offset AT the burn,
- * and the burn's time. Where the station is at any other moment is computed
- * from those three numbers, never stored or ticked. The burn's fuel rides the
- * same write: the record carries the fuel trim burns have drawn so far, which
- * the tank reads as station keeping's draw meter (shipDoc.setFuelDrawMeter),
- * so a burn and a REFUEL or DEPART from another tab both keep their cost when
- * they sync.
+ * "station-keeping burns are discrete events"): each nudge is ONE burn, kept
+ * as its own entry: which way it pushed, the orbit it trimmed, when, and the
+ * fuel it took. The trim is the burns replayed in time order: the radius
+ * offset, the phase offset AT the last burn, and that burn's time. Where the
+ * station is at any other moment is computed from those three numbers, never
+ * stored or ticked. The burns' fuel, added up, is station keeping's draw
+ * meter on the tank (shipDoc.setFuelDrawMeter), so a burn and a REFUEL or
+ * DEPART from another tab both keep their cost when they sync.
  *
- * Storage: the `stationKeeping` map in the HELM ROOM's doc (key 'trim') —
- * shared by everyone in the room, like the ship doc. The record names the
- * orbit it trims by its BASIS — planet and slot, the two numbers the slot's
- * orbit is derived from — not by a station id: station records are still
- * kept per install, so two people in the room may know the station by
- * different ids, but everyone who puts it in the same slot derives the same
- * trimmed orbit, and anyone who puts it elsewhere ignores the trim rather
- * than misapplying it. Trust: owner-writes at the UI, honest-client reads
- * with shape guards and clamps (the shipDoc posture). Other rooms of the
- * station do not see a trim until station records are shared (the
- * per-planet summary); until then the holotable and ship transfers keep
- * using the slot's orbit.
+ * Storage: the `stationKeeping` map in the HELM ROOM's doc, shared by
+ * everyone in the room like the ship doc. Each burn is written once under a
+ * key of its own (writeTrimBurn) and never replaced, so two burns fired at
+ * once from two tabs, or one from a tab that was offline, both land: every
+ * client replays the same burns to the same trim, and the meter only grows
+ * (a merge never refunds a burn). The log grows by one small entry per burn.
+ * A room trimmed before the log keeps its one 'trim' record, and the replay
+ * starts from it. A burn names the orbit it trims by its BASIS — planet and
+ * slot, the two numbers the slot's orbit is derived from — not by a station
+ * id: station records are still kept per install, so two people in the room
+ * may know the station by different ids, but everyone who puts it in the
+ * same slot derives the same trimmed orbit, and anyone who puts it elsewhere
+ * ignores the trim rather than misapplying it. Trust: owner-writes at the
+ * UI, honest-client reads with shape guards and clamps (the shipDoc
+ * posture). Other rooms of the station do not see a trim until station
+ * records are shared (the per-planet summary); until then the holotable and
+ * ship transfers keep using the slot's orbit.
  *
  * Pure except for the doc binding. Pinned by stationKeeping.test.ts.
  */
@@ -109,9 +114,9 @@ export const TRIM_DIRECTIONS: readonly TrimDirection[] = ['raise', 'lower', 'ahe
 
 // ── The trim record ──────────────────────────────────────────────────────────
 
-/** One station's trim — written whole by each burn. Plain JSON. The orbit
- *  it trims is named by its basis (planet and slot), never by a station id:
- *  see the header. */
+/** One station's trim: where its burns have left it (replayBurns). Plain
+ *  JSON. The orbit it trims is named by its basis (planet and slot), never
+ *  by a station id: see the header. */
 export interface OrbitTrim {
   /** The planet the orbit goes round (a PLANETS id, as orbits.ts resolves
    *  it). */
@@ -124,14 +129,26 @@ export interface OrbitTrim {
   /** Angle from the slot's nominal position at `at`, radians in (−π, π];
    *  positive is ahead (the direction of travel). */
   dPhase: number;
-  /** Real ms of the burn that wrote this record. */
+  /** Real ms of the last burn. */
   at: number;
   /** Which way that burn pushed. */
   last: TrimDirection;
-  /** Fuel trim burns have drawn from this module's tanks, every burn so far:
-   *  station keeping's draw meter. Each burn raises it by TRIM_FUEL in the
-   *  same write as the burn. Absent on a record from before the meter: 0. */
+  /** Only on the 'trim' record kept before the burn log: the fuel its burns
+   *  had drawn. The log's burns add theirs on top. */
   fuelDrawn?: number;
+}
+
+/** One burn of the stick, as the log keeps it. Plain JSON. */
+export interface TrimBurn {
+  /** The basis of the orbit it trimmed: a PLANETS id and a slot. */
+  planetId: string;
+  slot: number;
+  /** Which way it pushed. */
+  dir: TrimDirection;
+  /** Real ms it fired. */
+  at: number;
+  /** Fuel it took from this module's tanks. */
+  fuel: number;
 }
 
 /** An angle folded into (−π, π]. */
@@ -147,32 +164,55 @@ const MAX_PLANET_ID_LEN = 128;
  *  continuous either side of `at`). */
 const MAX_AT_MS = ORBIT_EPOCH_MS + 100 * 365.25 * 24 * 3600 * 1000;
 
+/** A burn takes at most this much fuel: a bound on a peer-written entry, far
+ *  above TRIM_FUEL. */
+const MAX_BURN_FUEL = 1_000;
+
+function isBasis(planetId: unknown, slot: unknown): boolean {
+  return typeof planetId === 'string' && planetId.length > 0 && planetId.length <= MAX_PLANET_ID_LEN
+    && Number.isInteger(slot) && (slot as number) >= 0 && (slot as number) < MAX_ORBIT_SLOTS;
+}
+
+function isBurnTime(at: unknown): boolean {
+  return typeof at === 'number' && Number.isFinite(at) && at >= ORBIT_EPOCH_MS && at <= MAX_AT_MS;
+}
+
+function isDirection(v: unknown): v is TrimDirection {
+  return typeof v === 'string' && (TRIM_DIRECTIONS as readonly string[]).includes(v);
+}
+
 /** Shape guard — a hostile peer can write anything into the map. */
 export function isOrbitTrim(v: unknown): v is OrbitTrim {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof OrbitTrim, unknown>>;
-  return typeof r.planetId === 'string' && r.planetId.length > 0 && r.planetId.length <= MAX_PLANET_ID_LEN
-    && Number.isInteger(r.slot) && (r.slot as number) >= 0 && (r.slot as number) < MAX_ORBIT_SLOTS
+  return isBasis(r.planetId, r.slot)
     && typeof r.dRadiusKm === 'number' && Number.isFinite(r.dRadiusKm) && Math.abs(r.dRadiusKm) <= MAX_TRIM_KM
     && typeof r.dPhase === 'number' && Number.isFinite(r.dPhase) && Math.abs(r.dPhase) <= Math.PI
-    && typeof r.at === 'number' && Number.isFinite(r.at) && r.at >= ORBIT_EPOCH_MS && r.at <= MAX_AT_MS
-    && typeof r.last === 'string' && (TRIM_DIRECTIONS as readonly string[]).includes(r.last)
+    && isBurnTime(r.at)
+    && isDirection(r.last)
     && (r.fuelDrawn === undefined
       || (typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX));
 }
 
-/** Only the fields a trim has — what a write publishes. */
+/** Shape guard for a burn off the wire. */
+export function isTrimBurn(v: unknown): v is TrimBurn {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<Record<keyof TrimBurn, unknown>>;
+  return isBasis(r.planetId, r.slot)
+    && isDirection(r.dir)
+    && isBurnTime(r.at)
+    && typeof r.fuel === 'number' && r.fuel > 0 && r.fuel <= MAX_BURN_FUEL;
+}
+
+/** A trim's orbit fields only (a record from before the log also carries
+ *  its fuel, which the meter reads apart). */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
-  const clean: OrbitTrim = {
-    planetId: t.planetId,
-    slot: t.slot,
-    dRadiusKm: t.dRadiusKm,
-    dPhase: t.dPhase,
-    at: t.at,
-    last: t.last,
-  };
-  if (t.fuelDrawn !== undefined) clean.fuelDrawn = t.fuelDrawn;
-  return clean;
+  return { planetId: t.planetId, slot: t.slot, dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
+}
+
+/** Only the fields a burn has — what a write publishes. */
+function cleanBurn(b: TrimBurn): TrimBurn {
+  return { planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at, fuel: b.fuel };
 }
 
 /** The trim that applies to `station`: the record, while it names the
@@ -259,26 +299,81 @@ export interface TrimContext {
    *  gangway down while it is open)? */
   bolted: boolean;
   station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null;
-  /** The doc's record, as read — trimFor is applied here, not by the caller. */
+  /** The room's trim, as read — trimFor is applied here, not by the caller. */
   trim: OrbitTrim | null;
   commander: boolean;
   /** Engine blocks mounted on this module (its thrusters). */
   engines: number;
   /** Fuel aboard, already clamped to the tanks' capacity. */
   fuel: number;
-  /** What the tank's meter owes its level (shipDoc.fuelDrawDeficit), added
-   *  to this burn's draw. */
-  deficit: number;
   now: number;
 }
 
-export type TrimPlan = { ok: true; trim: OrbitTrim } | { ok: false; refusal: TrimRefusal };
+/** A burn the stick may fire — the entry to write and the trim it leaves —
+ *  or why it cannot fire. */
+export type TrimPlan = { ok: true; burn: TrimBurn; trim: OrbitTrim } | { ok: false; refusal: TrimRefusal };
 
 /**
- * One burn of the stick: the trim record it writes, or why it cannot fire.
- * RAISE / LOWER move the radius a step and keep the station where it is right
- * now (its offset from the slot carries across the burn, so nothing jumps);
- * AHEAD / BACK slide it a step along the orbit and keep the radius.
+ * One burn applied to the trim it finds: the trim after it, or null when it
+ * would take the radius past ±MAX_TRIM_KM. A trim on another basis does not
+ * carry over: the burn starts from its slot's own orbit. RAISE / LOWER move
+ * the radius a step and keep the station where it is at the burn (its offset
+ * from the slot carries across, so nothing jumps); AHEAD / BACK slide it a
+ * step along the orbit and keep the radius.
+ */
+export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planetId' | 'slot' | 'dir' | 'at'>): OrbitTrim | null {
+  const current = before && before.planetId === burn.planetId && before.slot === burn.slot ? before : null;
+  const base = orbitForSlot(burn.planetId, burn.slot);
+  const radius = current?.dRadiusKm ?? 0;
+  const offset = slotOffsetAt(base, current, burn.at);
+  let dRadiusKm = radius;
+  let dPhase = offset;
+  if (burn.dir === 'raise') dRadiusKm = radius + TRIM_STEP_KM;
+  else if (burn.dir === 'lower') dRadiusKm = radius - TRIM_STEP_KM;
+  else if (burn.dir === 'ahead') dPhase = offset + PHASE_STEP_RAD;
+  else dPhase = offset - PHASE_STEP_RAD;
+  // Whole steps from zero stay exact in binary; the rounding only mops up a
+  // peer-written radius that was not a whole step.
+  dRadiusKm = Math.round(dRadiusKm * 1000) / 1000;
+  if (Math.abs(dRadiusKm) > MAX_TRIM_KM) return null;
+  return { planetId: burn.planetId, slot: burn.slot, dRadiusKm, dPhase: signedAngle(dPhase), at: burn.at, last: burn.dir };
+}
+
+/** Burn order: by time, then by every other field, so all clients replay
+ *  the same burns in the same order (plain code-unit order: never the
+ *  locale's). */
+function burnOrder(a: TrimBurn, b: TrimBurn): number {
+  if (a.at !== b.at) return a.at - b.at;
+  if (a.dir !== b.dir) return a.dir < b.dir ? -1 : 1;
+  if (a.planetId !== b.planetId) return a.planetId < b.planetId ? -1 : 1;
+  if (a.slot !== b.slot) return a.slot - b.slot;
+  return a.fuel - b.fuel;
+}
+
+/**
+ * Where a run of burns leaves the trim, and the fuel they drew: each burn in
+ * time order, from the trim and fuel before them. A burn that would leave
+ * the band changes nothing but still pays — its fuel burned wherever it
+ * fired, and a burn that arrives late (from a tab that was offline) must
+ * never make an earlier one free.
+ */
+export function replayBurns(
+  burns: readonly TrimBurn[],
+  start: OrbitTrim | null = null,
+  startFuel = 0,
+): { trim: OrbitTrim | null; fuelDrawn: number } {
+  let trim = start;
+  let fuelDrawn = startFuel;
+  for (const burn of [...burns].sort(burnOrder)) {
+    fuelDrawn += burn.fuel;
+    trim = applyBurn(trim, burn) ?? trim;
+  }
+  return { trim, fuelDrawn };
+}
+
+/**
+ * One burn of the stick: the burn to write and the trim it leaves, or why it
+ * cannot fire (see applyBurn for what each direction does).
  */
 export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
   const { station, now } = ctx;
@@ -289,33 +384,9 @@ export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
   if (!(ctx.fuel >= TRIM_FUEL)) return { ok: false, refusal: 'no-fuel' };
   const current = trimFor(station, ctx.trim);
   if (isBurning(current, now)) return { ok: false, refusal: 'burning' };
-
-  const base = slotOrbit(station);
-  const radius = current?.dRadiusKm ?? 0;
-  const offset = slotOffsetAt(base, current, now);
-  let dRadiusKm = radius;
-  let dPhase = offset;
-  if (dir === 'raise') dRadiusKm = radius + TRIM_STEP_KM;
-  else if (dir === 'lower') dRadiusKm = radius - TRIM_STEP_KM;
-  else if (dir === 'ahead') dPhase = offset + PHASE_STEP_RAD;
-  else dPhase = offset - PHASE_STEP_RAD;
-  // Whole steps from zero stay exact in binary; the rounding only mops up a
-  // peer-written radius that was not a whole step.
-  dRadiusKm = Math.round(dRadiusKm * 1000) / 1000;
-  if (Math.abs(dRadiusKm) > MAX_TRIM_KM) return { ok: false, refusal: 'at-limit' };
-  return {
-    ok: true,
-    trim: {
-      planetId: base.planet.id,
-      slot: station.orbitSlot,
-      dRadiusKm,
-      dPhase: signedAngle(dPhase),
-      at: now,
-      last: dir,
-      // The record's own running total, whatever basis it trimmed.
-      fuelDrawn: (ctx.trim?.fuelDrawn ?? 0) + ctx.deficit + TRIM_FUEL,
-    },
-  };
+  const burn: TrimBurn = { planetId: planetById(station.planetId).id, slot: station.orbitSlot, dir, at: now, fuel: TRIM_FUEL };
+  const trim = applyBurn(current, burn);
+  return trim ? { ok: true, burn, trim } : { ok: false, refusal: 'at-limit' };
 }
 
 // ── What the dashboard says ──────────────────────────────────────────────────
@@ -381,9 +452,16 @@ export function describeTrimStatus(base: CircularOrbit, trim: OrbitTrim | null, 
 
 // ── Doc binding (mirror of bindShipDoc) ──────────────────────────────────────
 
+/** The record a room trimmed before the burn log kept: where replay starts. */
+const TRIM_KEY = 'trim';
+/** Every burn's key starts so; the rest names the client and the time. */
+const BURN_KEY_PREFIX = 'burn:';
+
 let boundDoc: Y.Doc | null = null;
 let keepMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+/** The bound map's burns replayed: dropped whenever the map changes. */
+let replayed: { trim: OrbitTrim | null; fuelDrawn: number } | null = null;
 
 function notify(): void {
   // Copy: a listener may unsubscribe mid-notify. Isolate: one throwing
@@ -397,12 +475,17 @@ function notify(): void {
   }
 }
 
-/** Bind the room doc — at the T0 seam beside bindShipDoc. The trim record's
- *  running fuel total becomes one of the tank's draw meters. */
+/** Bind the room doc — at the T0 seam beside bindShipDoc. The burns' fuel,
+ *  added up, becomes one of the tank's draw meters. */
 export function bindStationKeepingDoc(doc: Y.Doc): void {
   boundDoc = doc;
-  keepMap = doc.getMap('stationKeeping');
-  keepMap.observe(() => notify());
+  const map = doc.getMap('stationKeeping');
+  keepMap = map;
+  replayed = null;
+  map.observe(() => {
+    if (keepMap === map) replayed = null;
+    notify();
+  });
   setFuelDrawMeter('stationKeeping', { read: readFuelDrawn, subscribe: subscribeStationKeeping });
   notify();
 }
@@ -416,40 +499,56 @@ function docAlive(): boolean {
   return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && keepMap !== null;
 }
 
-/** The room's trim record, or null (none, unbound, or malformed). */
-export function readOrbitTrim(): OrbitTrim | null {
-  if (!docAlive()) return null;
-  const raw = keepMap!.get('trim');
-  return isOrbitTrim(raw) ? cleanTrim(raw) : null;
+/** The bound room's burns, replayed from its record from before the log.
+ *  Malformed entries are skipped, the same on every client. */
+function replayRoom(): { trim: OrbitTrim | null; fuelDrawn: number } {
+  if (replayed) return replayed;
+  const record = keepMap!.get(TRIM_KEY);
+  const start = isOrbitTrim(record) ? record : null;
+  const burns: TrimBurn[] = [];
+  keepMap!.forEach((v, key) => {
+    if (key.startsWith(BURN_KEY_PREFIX) && isTrimBurn(v)) burns.push(cleanBurn(v));
+  });
+  replayed = replayBurns(burns, start && cleanTrim(start), start?.fuelDrawn ?? 0);
+  return replayed;
 }
 
-/** Fuel trim burns have drawn in this room: station keeping's draw meter. */
+/** The room's trim (its burns replayed), or null: none, unbound, or nothing
+ *  well-formed. */
+export function readOrbitTrim(): OrbitTrim | null {
+  if (!docAlive()) return null;
+  const { trim } = replayRoom();
+  return trim && { ...trim };
+}
+
+/** Fuel trim burns have drawn in this room — every burn's, added up:
+ *  station keeping's draw meter. It only grows. */
 export function readFuelDrawn(): number {
-  return readOrbitTrim()?.fuelDrawn ?? 0;
+  return docAlive() ? replayRoom().fuelDrawn : 0;
 }
 
 /**
- * Publish a burn's trim record: the burn and its fuel (fuelDrawn) in one
- * write, so peers never see one without the other. Owner-gated at the caller.
- * Returns whether it wrote.
- *
- * The burn never writes the fuel level itself, so a REFUEL or DEPART fired at
- * the same moment from another tab (or an offline one) cannot wipe out its
- * cost, nor it theirs: after the sync the tank reads both debits (see
- * shipDoc.setFuelDrawMeter). Two burns fired at once both write this one key,
- * and Yjs keeps one of them whole: the room converges on one burn and that
- * burn's fuel. The other press drops whole, and its dashboard redraws from
- * the doc on the next sync.
+ * Publish a burn: its own entry, under a key that names this client and the
+ * burn's time, so no other write replaces it — two burns fired at once from
+ * two tabs (or an offline one) both land, and every client replays the same
+ * burns to the same trim. The burn's fuel rides the same entry, so peers
+ * never see one without the other, and the meter it adds to only grows. The
+ * burn never writes the fuel level itself, so a REFUEL or DEPART fired at
+ * the same moment keeps its cost too (see shipDoc.setFuelDrawMeter).
+ * Owner-gated at the caller. Returns whether it wrote: a malformed burn, or
+ * a second one from this client in the same millisecond, is refused.
  */
-export function writeOrbitTrim(trim: OrbitTrim): boolean {
+export function writeTrimBurn(burn: TrimBurn): boolean {
   if (!docAlive()) return false;
-  const clean = cleanTrim(trim);
-  if (!isOrbitTrim(clean)) {
-    console.warn('[station keeping] refused to write a malformed trim', trim);
+  const clean = cleanBurn(burn);
+  if (!isTrimBurn(clean)) {
+    console.warn('[station keeping] refused to write a malformed burn', burn);
     return false;
   }
+  const key = `${BURN_KEY_PREFIX}${boundDoc!.clientID}:${clean.at}`;
+  if (keepMap!.has(key)) return false;
   boundDoc!.transact(() => {
-    keepMap!.set('trim', clean);
+    keepMap!.set(key, clean);
   });
   return true;
 }

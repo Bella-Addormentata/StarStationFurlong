@@ -344,7 +344,9 @@ export type ArrivalOutcome =
       stationName: string;
       /**
        * `berths-taken`: every berth tried refused, and at least one without
-       * saying why (an older docking API's bare false).
+       * saying why (an older docking API's bare false). Usually taken, closed
+       * or unreachable, but redockPort also refuses for its own reasons (no
+       * rights, no room to fit, a busy port); the port's panel says which.
        * `in-transit`: the destination is between planets.
        * 🚏 A5, when every berth said why:
        *   `occupied`     one or more was taken (or the module would overlap
@@ -419,9 +421,17 @@ export function completeArrival(
     return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' });
   }
   const station = findDestination(rec.locationId);
-  // 🚚 A station that left its planet while the ship was on the way has no
-  // berth in reach: the ship arrives where it was and stays undocked.
-  if (stationInTransit(station, now)) {
+  // 🚚 A station that left its planet while the ship was on the way (still
+  // between planets, or already at the new one) has no berth in reach: the
+  // ship arrives where it was headed and stays undocked.
+  const moved = station.lastMove ?? station.move;
+  // Since the ship cast off — the booking, not the launch window it waited
+  // for (older records carry only the window).
+  const leftAt = rec.castOffAt ?? rec.departedAt;
+  // Any move that was still under way (or not yet begun) when the ship left
+  // and has begun by now overlaps its time away.
+  const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
+  if (stationInTransit(station, now) || movedMidFlight) {
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
   }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });

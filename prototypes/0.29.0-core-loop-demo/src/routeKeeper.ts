@@ -532,7 +532,8 @@ export function keeperBerths(o: {
  *   taken  the berth is in use (or the module would overlap there)
  *   shut   the gate is closed, or reserved for another ship
  *   gone   the berth's door, or its port, was removed (and no port can be
- *          fitted there again while every gate number is taken)
+ *          fitted there again while every gate number is taken), or its
+ *          station is moving between planets
  *   rider  a verdict on this game alone: its key (a granted-captains gate),
  *          its pass, or its reach
  *   port   the ship's port itself cannot dock now: the pass stops
@@ -550,6 +551,8 @@ export function classifyKeeperRefusal(
     case 'gone':
     case 'closed':
     case 'no-gate':
+    // The stop's station left for another planet: out of reach for hours.
+    case 'moving':
       return 'gone';
     case 'not-allowed': {
       // A granted-captains gate checks the docking game's key (A9.5): a

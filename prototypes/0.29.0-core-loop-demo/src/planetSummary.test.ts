@@ -103,6 +103,19 @@ describe('guards', () => {
     expect(cleanStationSummary(summary({ updatedAt: T0 + 7 * 3600 * 1000 }), T0)).toBeNull();
   });
 
+  it('strips credential-named fields from ext at any depth', () => {
+    const s = cleanStationSummary({ ...summary(), ext: { seed: 'x', welcomeLink: 'y', note: { pass: 'z', ok: 1 }, passage: 'public' } }, T0);
+    expect(s?.ext).toEqual({ note: { ok: 1 }, passage: 'public' });
+  });
+
+  it('breaks a same-moment tie the same way on every client', () => {
+    const a = summary({ orbitSlot: 3, trim: trim({ dRadiusKm: 1 }) });
+    const b = summary({ orbitSlot: 5, trim: trim({ dRadiusKm: 2 }) });
+    const ab = mergeStation(a, b) ?? a;
+    const ba = mergeStation(b, a) ?? b;
+    expect(ab).toEqual(ba);
+  });
+
   it('drops a malformed trim but keeps the record', () => {
     const s = cleanStationSummary({ ...summary(), trim: { ...trim(), dRadiusKm: 999 } }, T0);
     expect(s).toEqual(summary());
@@ -158,17 +171,30 @@ describe('guards', () => {
 });
 
 describe('merge', () => {
-  it('takes the newer record and, separately, the newer trim', () => {
-    const older = summary({ name: 'OLD', updatedAt: T0, trim: trim({ at: T0 + 5000 }) });
-    const newer = summary({ name: 'NEW', updatedAt: T0 + 1, trim: trim({ at: T0, dRadiusKm: -2 }) });
+  it('takes the owner\'s newer record and, separately, the newer trim', () => {
+    const older = summary({ name: 'OLD', ownerId: 'hab', updatedAt: T0, trim: trim({ at: T0 + 5000 }) });
+    const newer = summary({ name: 'NEW', ownerId: 'hab', updatedAt: T0 + 1, trim: trim({ at: T0, dRadiusKm: -2 }) });
     const merged = mergeStation(older, newer);
     expect(merged?.name).toBe('NEW');
     expect(merged?.trim?.at).toBe(T0 + 5000);
   });
 
+  it('keeps the first record nobody owns, and lets an owned one replace it', () => {
+    const first = summary({ orbitSlot: 2, updatedAt: T0 });
+    const late = summary({ orbitSlot: 4, updatedAt: T0 + 60_000 });
+    // A late install's first publish does not move a derived station…
+    expect(mergeStation(first, late)).toBeNull();
+    expect(mergeStation(late, first)?.orbitSlot).toBe(2);
+    // …but its owner's record does, whenever it was stamped.
+    const owners = summary({ orbitSlot: 5, ownerId: 'hab', updatedAt: T0 - 1 });
+    expect(mergeStation(first, owners)?.orbitSlot).toBe(5);
+    expect(mergeStation(owners, late)).toBeNull();
+  });
+
   it('reports no change for the same summary', () => {
     expect(mergeStation(summary(), summary())).toBeNull();
-    expect(mergeStation(summary({ updatedAt: T0 + 1 }), summary())).toBeNull();
+    expect(mergeStation(summary({ ownerId: 'hab', updatedAt: T0 + 1 }), summary({ ownerId: 'hab' }))).toBeNull();
+    expect(mergeStation(summary(), summary({ updatedAt: T0 + 1 }))).toBeNull();
   });
 });
 
@@ -316,14 +342,43 @@ describe('sharing through the room doc', () => {
       const id = `room-${String(i).padStart(3, '0')}`;
       map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, updatedAt: now - (70 - i) * 1000 }));
     }
+    // One prune pass visits a bounded number of keys (64 * 4), so no single
+    // transaction deletes more than that; later passes finish the job.
+    let mostDeleted = 0;
+    map.observe((e) => {
+      let n = 0;
+      e.changes.keys.forEach((c) => { if (c.action === 'delete') n++; });
+      mostDeleted = Math.max(mostDeleted, n);
+    });
     bindPlanetSummaryDoc(doc, install(null));
     publishPlanetSummary(now);
+    publishPlanetSummary(now);
+    expect(mostDeleted).toBeLessThanOrEqual(256);
     const keys = [...map.keys()];
     expect(keys.some((k) => k.startsWith('junk-'))).toBe(false);
     expect(keys).toHaveLength(64);
     // The oldest six went; the newest stayed.
     expect(keys).not.toContain('room-000');
     expect(keys).toContain('room-069');
+    // …and entries the first bounded pull never reached are read right after.
+    expect(readStore(now).stations['room-069']?.name).toBe('S69');
+  });
+
+  it('keeps its own station through a flood of newer peer summaries', () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const map = doc.getMap('stationSummaries');
+    map.set('room-hab', summary({ updatedAt: now - 60 * 60 * 1000 }));
+    for (let i = 0; i < 70; i++) {
+      const id = `room-${String(i).padStart(3, '0')}`;
+      // Stamped an hour ahead: inside the allowed skew, newer than ours.
+      map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, orbitSlot: 3, updatedAt: now + 60 * 60 * 1000 }));
+    }
+    bindPlanetSummaryDoc(doc, install('hab'));
+    publishPlanetSummary(now);
+    expect(map.has('room-hab')).toBe(true);
+    expect(readStore(now).stations['room-hab']).toBeDefined();
   });
 
   it('never publishes a seed', () => {
@@ -380,6 +435,20 @@ describe('ships and the solar system', () => {
     expect(stamp()).toBe(plain + SHIP_HEARTBEAT_MS);
   });
 
+  it('settles a same-moment pair of ship values the same way in the doc', () => {
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const a = { ...ship, status: 'docked' as const, updatedAt: now };
+    const b = { ...ship, status: 'in-flight' as const, toRoom: 'room-b', departedAt: now, etaAt: now + 60_000, updatedAt: now };
+    const winner = JSON.stringify(b) > JSON.stringify(a) ? b : a;
+    const loser = winner === a ? b : a;
+    doc.getMap('shipSummaries').set('room-ship', loser);
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => null }));
+    store.set('ssf-planet-summary', JSON.stringify({ stations: {}, ships: { 'room-ship': winner } }));
+    publishPlanetSummary(now);
+    expect(doc.getMap('shipSummaries').get('room-ship')).toEqual(winner);
+  });
+
   it('forgets a ship not heard from in a day', () => {
     const doc = new Y.Doc();
     bindPlanetSummaryDoc(doc, install(null, { ship: () => ship }));
@@ -415,6 +484,16 @@ describe('station id aliases (flight records cross installs)', () => {
     expect(resolveStationAlias('station:room-hab')).toBe('mine');
     expect(resolveStationAlias('shared:room-hab')).toBe('mine');
     expect(resolveStationAlias('station:room-nowhere')).toBeNull();
+  });
+
+  it("resolves a learned id by its room even when a local record has that id", () => {
+    // A hand-made record whose id only looks learned (another room).
+    registerStation(record({ id: 'shared:room-hab', welcomeRoomId: 'room-odd', orbitSlot: 4 }));
+    registerStation(record({ id: 'mine' }));
+    expect(resolveStationAlias('shared:room-hab')).toBe('mine');
+    // …and it is the install's own: no prune takes it.
+    expect(registerLearnedStations(ARIS, [], { prune: true })).toBe(0);
+    expect(readStationRecords().some((r) => r.id === 'shared:room-hab')).toBe(true);
   });
 
   it('maps another install\'s saved id through the summary that carries it', () => {

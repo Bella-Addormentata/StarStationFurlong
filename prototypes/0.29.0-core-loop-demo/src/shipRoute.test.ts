@@ -719,7 +719,7 @@ describe('STOP and finish', () => {
     expect(readShipRoute()).toEqual(routeWithoutRun(route));
     expect(ckptKeys()).toEqual([]);
     expect(readFuelLevel(CAP)).toBe(level);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
     expect(finishShipRoute()).toBe(false);
   });
 });
@@ -753,7 +753,7 @@ describe('the route fuel meter', () => {
     clock = on[2].depart + SEC;
     expect(readFuelLevel(CAP)).toBe(CAP - cost);
     expect(updates.n).toBe(0);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
   });
 
   it('REFUEL writes its checkpoint first, then the level, and later burns still come off', () => {
@@ -766,7 +766,7 @@ describe('the route fuel meter', () => {
     expect(writeRouteCheckpoint(run, fuelCheckpoint(route, 1, { at: clock, fuel: CAP }), clock)).toBe(true);
     writeFuelLevel(CAP, CAP);
     expect(readFuelLevel(CAP)).toBe(CAP);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
     clock = on[1].depart + SEC;
     expect(readFuelLevel(CAP)).toBe(CAP - cost);
     clock = on[2].depart + SEC;
@@ -805,7 +805,7 @@ describe('the route fuel meter', () => {
     expect(readFuelLevel(CAP)).toBe(CAP);
     writeFuelLevel(level, CAP);
     expect(readFuelLevel(CAP)).toBe(level);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
     // Hours later the paused route still draws nothing.
     clock = on[2].arrive + 5 * HOUR;
     expect(readFuelLevel(CAP)).toBe(level);
@@ -844,7 +844,7 @@ describe("PR 173's meter rules (the route's meter is owed)", () => {
   // keeping's trim burns do (stationKeeping.test.ts pins those on their own).
   const OTHER = 'test-trim';
   let drawn = 0;
-  const otherDraws = (amount: number) => { drawn = drawn + fuelDrawDeficit() + amount; };
+  const otherDraws = (amount: number) => { drawn = drawn + fuelDrawDeficit(OTHER) + amount; };
   const storedMeter = () => (map().get('fuel') as { meter?: number } | undefined)?.meter ?? 0;
   beforeEach(() => {
     drawn = 0;
@@ -871,7 +871,7 @@ describe("PR 173's meter rules (the route's meter is owed)", () => {
     const cost = routeLegFuel(route, 0, 1)!;
     const on = onTime(route, start, 3);
     clock = on[0].depart + SEC;
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(OTHER)).toBe(0);
     otherDraws(5);
     expect(drawn).toBe(5);
     expect(readFuelLevel(CAP)).toBe(CAP - cost - 5);
@@ -881,7 +881,7 @@ describe("PR 173's meter rules (the route's meter is owed)", () => {
     // other draw stays drawn until a level write folds it (REFUEL, finish).
     clock = on[1].arrive + SEC;
     expect(readFuelLevel(CAP)).toBe(CAP - 5);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(OTHER)).toBe(0);
   });
 
   it('a total that went back neither refunds fuel nor frees the next draw while the route owes fuel', () => {
@@ -891,9 +891,9 @@ describe("PR 173's meter rules (the route's meter is owed)", () => {
     clock = onTime(route, start, 1)[0].depart + SEC;
     // The level was written after 10 fuel of other draws; then an older
     // record (4 drawn) won a merge. The route owes `cost` on top.
-    map().set('fuel', { level: 70, meter: 10 });
+    map().set('fuel', { level: 70, meters: { [OTHER]: 10 } });
     drawn = 4;
-    expect(fuelDrawDeficit()).toBe(6);
+    expect(fuelDrawDeficit(OTHER)).toBe(6);
     expect(readFuelLevel(CAP)).toBe(70 - cost);
     otherDraws(3);
     expect(drawn).toBe(13);
@@ -914,7 +914,7 @@ describe("PR 173's meter rules (the route's meter is owed)", () => {
     writeFuelLevel(level, CAP);
     expect(storedMeter()).toBe(4);
     expect(readFuelLevel(CAP)).toBe(level);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(OTHER)).toBe(0);
     // The next leg's burn still comes off in full.
     clock = on[1].depart + SEC;
     expect(readFuelLevel(CAP)).toBe(level - cost);
@@ -941,7 +941,7 @@ describe("PR 173's meter rules (the route's meter is owed)", () => {
       expect(readShipRoute()!.startedAt).toBeUndefined();
       expect(storedMeter()).toBe(3);
       expect(readFuelLevel(CAP)).toBe(CAP - 1);
-      expect(fuelDrawDeficit()).toBe(0);
+      expect(fuelDrawDeficit(OTHER)).toBe(0);
     } finally {
       off?.();
     }
@@ -1083,7 +1083,7 @@ describe('the copy-back after STOP (A4)', () => {
     expect(readResolvedFlight()).toEqual({ status: 'docked', locationId: 'st-1' });
     expect(readStoredFuelLevel()).toBe(70 - cost);
     expect(readFuelLevel(CAP)).toBe(70 - cost);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
     // Hours later nothing more burns, and there is nothing left to settle.
     clock += 5 * HOUR;
     expect(readFuelLevel(CAP)).toBe(70 - cost);
@@ -1168,7 +1168,7 @@ describe('REFUEL on a running route (A2 fuel, through the route)', () => {
     expect(updates.n).toBe(1);
     expect(readRouteCheckpoints().some((e) => e.kind === 'fuel' && e.legSeq === 1 && e.fuel === CAP)).toBe(true);
     expect(readFuelLevel(CAP)).toBe(CAP);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
     clock = on[1].depart + SEC;
     expect(readFuelLevel(CAP)).toBe(CAP - cost);
   });

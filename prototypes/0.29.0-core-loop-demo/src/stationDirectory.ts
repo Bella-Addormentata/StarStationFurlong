@@ -19,7 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
-import { stationInTransit } from './stations';
+import { latestMoveOf, stationInTransit } from './stations';
 import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -56,6 +56,9 @@ export interface StationDestination {
   /** A move to another planet, scheduled or under way (stations.ts): while
    *  it is in transit the station is no ship's destination. */
   move?: StationMove;
+  /** Its latest move even once finished: arrival checks it against the
+   *  flight, so a ship never docks at a station that moved away meanwhile. */
+  lastMove?: StationMove;
 }
 
 /** The seam: whatever knows the stations. */
@@ -78,6 +81,10 @@ export interface StationDirectory {
    *  are per install, and a flight record travels in the ship's room doc),
    *  or null when none matches. Absent ⇒ ids are taken as written. */
   resolve?(id: string): string | null;
+  /** The id to write into a shared record for this install's station `id`,
+   *  one every install resolves to the same station (its welcome room), or
+   *  null to write `id` as it is. */
+  portable?(id: string): string | null;
 }
 
 /** One planned hop. Times are real epoch ms; `departAt` may be in the future
@@ -117,14 +124,22 @@ export function listStations(): readonly StationDestination[] {
   return list.length > 0 ? list : DEFAULT_STATIONS;
 }
 
-/** This install's id for `id`: itself when listed, else the directory's
- *  alias for it when that is listed, else `id` unchanged (unknown). */
+/** This install's id for `id`: the directory's alias for it when that is
+ *  listed (asked FIRST, so a portable id resolves by its welcome room even
+ *  when a local record happens to share the id), else itself, which is
+ *  unknown when unlisted. */
 export function localStationId(id: string): string {
   const list = listStations();
-  if (list.some((s) => s.id === id)) return id;
   let alias: string | null = null;
   try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }
   return alias && list.some((s) => s.id === alias) ? alias : id;
+}
+
+/** The id a shared record carries for this install's station `id`. */
+export function portableStationId(id: string): string {
+  let out: string | null = null;
+  try { out = directory.portable?.(id) ?? null; } catch { out = null; }
+  return out ?? id;
 }
 
 /** Look a station up; unknown ids resolve to home (plan §2, item 4). */
@@ -141,14 +156,26 @@ export function isKnownStation(id: string): boolean {
 /** Plan the hop from → to at `nowMs`: the directory's own planner (orbits),
  *  else a flat hop that leaves now. Null for an unknown or unreachable pair. */
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
-  if (fromId === toId || !isKnownStation(toId)) return null;
+  // Both ends must be listed: findStation would quietly read an unknown
+  // origin as home.
+  if (fromId === toId || !isKnownStation(fromId) || !isKnownStation(toId)) return null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
-    return plan;
+    return wholeMs(plan);
   }
   const dest = findStation(toId);
-  return { departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost };
+  return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
+}
+
+/** A hop's times as whole milliseconds, which is all a flight record stores
+ *  (shipDoc isFlightRecord): orbital math gives fractions. Rounded up, so a
+ *  ship never burns before its window; null when a time is no safe integer. */
+function wholeMs(plan: HopPlan): HopPlan | null {
+  const departAt = Math.ceil(plan.departAt);
+  const arriveAt = Math.max(departAt + 1, Math.ceil(plan.arriveAt));
+  if (!Number.isSafeInteger(departAt) || !Number.isSafeInteger(arriveAt)) return null;
+  return { ...plan, departAt, arriveAt };
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */
@@ -214,10 +241,12 @@ export function planRecordHop(
   if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
-  // Nor one whose window overlaps a scheduled move at either end: the
-  // station would be gone by the time the ship arrives (or leaves).
-  const clashes = (m: StationMove | undefined) => !!m && m.departAt <= t.arriveAt && m.arriveAt > t.departAt;
-  if (clashes(from.move) || clashes(to.move)) return null;
+  // Nor one with a move under way (or coming) while either end must hold
+  // still: the source until the ship leaves, the destination until it
+  // arrives. A move that starts at the source after the burn is no concern of
+  // this hop; one that lands before it would leave the plan on the old orbit.
+  const movesWithin = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs;
+  if (movesWithin(from.move, t.departAt) || movesWithin(to.move, t.arriveAt)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,
@@ -246,6 +275,8 @@ export function destinationsFromRecords(
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
       ...(r.move ? { move: r.move } : {}),
     };
+    const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
+    if (last) out.lastMove = last;
     // A public berth needs its door: DOCK only asks the far room (and so
     // only proves a port is there) when it knows the far door. Without one
     // the ship's own berth memory decides, or arrival reports no berth. A
@@ -289,12 +320,14 @@ export function directoryFromStationRecords(
   hereId: () => string | null,
   ownId: () => string | null = () => null,
   resolve?: (id: string) => string | null,
+  portable?: (id: string) => string | null,
 ): StationDirectory {
   return {
     stations: () => destinationsFromRecords(list(), seedFor),
     here: hereId,
     own: ownId,
     ...(resolve ? { resolve } : {}),
+    ...(portable ? { portable } : {}),
     plan: (fromId, toId, nowMs) => {
       const records = list();
       return planRecordHop(

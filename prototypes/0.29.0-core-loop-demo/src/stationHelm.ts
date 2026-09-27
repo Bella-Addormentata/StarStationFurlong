@@ -11,7 +11,7 @@
  * Flick the stick (drag the knob past its ring and let go), press a button,
  * or focus the stick and use the arrow keys. Each is ONE discrete burn
  * (stationKeeping.planTrim); everything else on the dashboard is derived
- * from the trim record and the clock.
+ * from the room's burns and the clock.
  *
  * The STATION KEEPING BOX draws the station against its slot: the crosshair
  * is where the slot's orbit puts it, across is along the orbit (behind /
@@ -57,7 +57,7 @@ import {
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
-  writeOrbitTrim,
+  writeTrimBurn,
 } from './stationKeeping';
 import type { OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
 import { atlasComponent, readAtlas } from './stationAtlas';
@@ -316,7 +316,6 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
-      deficit: fuelDrawDeficit(),
       now: Date.now(),
       tanks,
       capacity,
@@ -332,7 +331,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     engines: c.engines,
     fuel: c.fuel,
     drawn: readMoveFuelDrawn(),
-    deficit: c.deficit,
+    deficit: fuelDrawDeficit('stationMove'),
     modules: c.station?.welcomeRoomId ? Math.max(1, atlasComponent(readAtlas(), c.station.welcomeRoomId).size) : 1,
     now: c.now,
   });
@@ -476,7 +475,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       return;
     }
     flash = null;
-    writeOrbitTrim(plan.trim);
+    writeTrimBurn(plan.burn);
     refresh();
   };
 

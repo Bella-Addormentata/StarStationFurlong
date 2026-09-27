@@ -81,6 +81,13 @@ const PHASE_STEP = Math.PI * (3 - Math.sqrt(5));
 
 const TAU = 2 * Math.PI;
 
+/** Real ms either side of the time asked about within which a launch window
+ *  counts as that time: floating-point rounding alone can move an exact
+ *  window a hair off it. Rounding stays under a thousandth of a ms for a
+ *  decade past the epoch, and asking 1 ms after a window still finds the
+ *  next one. */
+const WINDOW_ROUNDING_MS = 0.1;
+
 /** An angle folded into [0, 2π). */
 export function wrapAngle(a: number): number {
   const r = a % TAU;
@@ -299,7 +306,12 @@ export function planTransfer(
   const leadNow = wrapAngle(angleAt(o2, nowMs) - angleAt(o1, nowMs));
   const drift = o2.meanMotion - o1.meanMotion; // rad/s the lead changes by
   const turn = drift > 0 ? wrapAngle(neededLead - leadNow) : wrapAngle(leadNow - neededLead);
-  const waitMs = realMsFor(turn / Math.abs(drift));
+  const synodicMs = realMsFor(TAU / Math.abs(drift));
+  let waitMs = realMsFor(turn / Math.abs(drift));
+  // Asked at a window's exact time, rounding can leave that window a hair
+  // ahead, or a hair behind, where wrapping would wait a whole synodic period
+  // for the next one. Either way it is the window being asked about.
+  if (waitMs <= WINDOW_ROUNDING_MS || synodicMs - waitMs <= WINDOW_ROUNDING_MS) waitMs = 0;
   const transferMs = realMsFor(tH);
   const departAt = nowMs + waitMs;
   return {
@@ -312,7 +324,7 @@ export function planTransfer(
     waitMs,
     transferMs,
     deltaVKmS: dv1 + dv2,
-    synodicMs: realMsFor(TAU / Math.abs(drift)),
+    synodicMs,
   };
 }
 

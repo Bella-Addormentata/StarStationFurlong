@@ -8,7 +8,9 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas, seedAtlasDefaults } from './stationAtlas';
+import {
+  atlasComponent, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas, seedAtlasDefaults,
+} from './stationAtlas';
 import type { BundledAtlasEntry } from './stationAtlas';
 
 /** vitest runs in node here, so the atlas's localStorage needs a shim. */
@@ -514,6 +516,65 @@ describe('transient berths (a visiting ship\'s dock)', () => {
     });
     peer = readAtlas()['module-peer'];
     expect(peer.doors['d:dock'].transient).toBe(false);
+  });
+
+  it('stay berths after the ship casts off, when only the ship\'s end was flagged', () => {
+    // An older client gossiped the station side: its end of the berth has no flag.
+    doc.getMap('atlas').set('module-hall', {
+      roomId: 'module-hall',
+      name: 'HALL',
+      doors: { 'd:port': { targetRoomId: 'module-ship', targetSeed: '' } },
+      updatedAt: Date.now() - 60_000,
+    });
+    bind('module-ship');
+    // The ship's own end is flagged, so the pair is one berth.
+    const hall = 'ssf://x#room=module-hall';
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [{ doorId: 'd:dock', targetSeed: hall, transient: true }] });
+    expect(atlasComponent(readAtlas(), 'module-ship')).toEqual(new Set(['module-ship']));
+    expect(readAtlas()['module-hall'].doors['d:port'].transient).toBe(true); // written down at once
+    // It casts off and re-harvests; the hall's stale end is all that is left.
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [] });
+    expect(readAtlas()['module-hall'].doors['d:port'].transient).toBe(true);
+    expect(atlasComponent(readAtlas(), 'module-ship')).toEqual(new Set(['module-ship']));
+  });
+
+  it('reach a client that joins after the ship casts off', () => {
+    // An older client published the station side with no flag.
+    const stamp = Date.now() - 60_000;
+    doc.getMap('atlas').set('module-hall', {
+      roomId: 'module-hall',
+      name: 'HALL',
+      doors: { 'd:port': { targetRoomId: 'module-ship', targetSeed: '', wall: 'x+', lateral: 1 } },
+      updatedAt: stamp,
+    });
+    bind('module-ship');
+    const hall = 'ssf://x#room=module-hall';
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [{ doorId: 'd:dock', targetSeed: hall, transient: true }] });
+    pushAtlasToDoc();
+    // The flag lands on the doc's own copy of the hall, which is otherwise untouched.
+    const published = doc.getMap('atlas').get('module-hall') as { doors: Record<string, object>; updatedAt: number };
+    expect(published.doors['d:port']).toEqual({ targetRoomId: 'module-ship', targetSeed: '', wall: 'x+', lateral: 1, transient: true });
+    expect(published.updatedAt).toBe(stamp + 1);
+    // The ship casts off; then a fresh client with nothing stored joins.
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [] });
+    pushAtlasToDoc();
+    store.clear();
+    bind('module-lounge');
+    expect(atlasComponent(readAtlas(), 'module-ship')).toEqual(new Set(['module-ship']));
+  });
+
+  it('mark a berth an atlas saved before implied, before the ship\'s entry is replaced', () => {
+    const lastSeen = Date.now() - 120_000;
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-hall': { roomId: 'module-hall', name: 'HALL', lastSeen, doors: {
+        'd:port': { targetSeed: '', targetRoomId: 'module-ship' },
+      } },
+      'module-ship': { roomId: 'module-ship', name: 'SHIP', lastSeen, doors: {
+        'd:dock': { targetSeed: '', targetRoomId: 'module-hall', transient: true },
+      } },
+    }));
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [] });
+    expect(atlasComponent(readAtlas(), 'module-ship')).toEqual(new Set(['module-ship']));
   });
 
   it('are read from a peer only as exactly true', () => {
