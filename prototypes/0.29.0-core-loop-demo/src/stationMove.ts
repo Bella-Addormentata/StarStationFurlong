@@ -719,7 +719,12 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
  *  room (stations.moveBelongsTo), so a move another install wrote under its
  *  own id for the station still applies here. */
 export function rememberedMoveFor(station: MovingStation): StationMove | null {
-  return readRememberedMoves().find((m) => moveBelongsTo(m, station)) ?? null;
+  const remembered = readRememberedMoves().find((m) => moveBelongsTo(m, station)) ?? null;
+  // The bound room's own standing move too, so a move written here applies
+  // even when this install cannot store it (localStorage full or blocked).
+  const here = roomStanding().find((m) => moveBelongsTo(m, station)) ?? null;
+  if (!here) return remembered;
+  return !remembered || compareMoves(here, remembered) > 0 ? here : remembered;
 }
 
 /** Point stations.listStations at the remembered moves. */
@@ -754,57 +759,82 @@ const ENTRY_PREFIX = 'move:';
  *  whose fuelDrawn was the room's running total. Still read, never written. */
 const LEGACY_KEY = 'move';
 
-/** Prefix of the settled part of the move log: `moveSettled:<clientID>:<at>`
- *  holding { through, drawn }: the 'stationMove' meter's total for every
- *  entry pruned from the log so far (the legacy record's too). Readers take
- *  the one with the latest `through`; each pruning writes a new one and
- *  drops the old ones it saw. */
+/** Prefix of the settled part of the move log: `moveSettled:<writer>:<n>`
+ *  holding { n, drawn, floor } for the first `n` entries one writer (the
+ *  clientID in an entry's key) wrote that have left the log: their unbeaten
+ *  fuel, and their largest unbeaten running total. A writer's entries leave
+ *  in the order it wrote them, and Yjs hands every replica a writer's
+ *  entries in that order, so two replicas pruning at once cut prefixes of
+ *  one sequence: the record with the larger `n` covers the other's, and
+ *  readers take each writer's largest. Nothing is summed twice or lost when
+ *  both records survive a merge. */
 const SETTLED_PREFIX = 'moveSettled:';
 
 /** Entries that arrived longer ago than this can leave the log, unless they
  *  still stand as a station's move or next to a move that stays. */
 export const MOVE_LOG_KEEP_MS = 24 * 60 * 60 * 1000;
 
-interface SettledMoves { through: number; drawn: number }
+/** At most this many move and settled keys are read from the peer-writable
+ *  map per pass, so a flood cannot stall a room: moves and pins come a few
+ *  a day, and pruning keeps an honest log far below it. */
+export const MOVE_SCAN_MAX = 256;
 
-/** A settled total off the wire: `through` no later than the move horizon
- *  past `nowMs` (a far-future one would stand over every later pruning) and
- *  `drawn` within the fuel meter's range. */
-function isSettledMoves(v: unknown, nowMs: number = Date.now()): v is SettledMoves {
+interface SettledMoves { n: number; drawn: number; floor: number }
+
+/** A settled record off the wire: a positive whole count, and totals within
+ *  the fuel meter's range. */
+function isSettledMoves(v: unknown): v is SettledMoves {
   const r = v as SettledMoves;
-  return !!r && typeof r === 'object' && Number.isFinite(r.through) && r.through <= nowMs + MOVE_HORIZON_MS
-    && Number.isFinite(r.drawn) && r.drawn >= 0 && r.drawn <= FUEL_METER_MAX;
+  const meter = (x: unknown) => typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= FUEL_METER_MAX;
+  return !!r && typeof r === 'object' && Number.isSafeInteger(r.n) && r.n > 0 && meter(r.drawn) && meter(r.floor);
 }
 
 function validMove(raw: unknown): StationMove | null {
   return isStationMove(raw) && isPlausibleMove(raw) ? cleanMove(raw) : null;
 }
 
-/** Every move this room's doc holds: its entries (with their keys), a legacy
- *  record, and the settled total of the entries already pruned. */
+/** The writer (Yjs clientID) in an entry key `move:<clientID>:<departAt>`,
+ *  or a settled key `moveSettled:<clientID>:<n>`. */
+function writerOf(key: string, prefix: string): string {
+  const rest = key.slice(prefix.length);
+  const cut = rest.indexOf(':');
+  return cut > 0 ? rest.slice(0, cut) : rest;
+}
+
+/** Every move this room's doc holds (a bounded scan): its entries (with
+ *  their keys), a legacy record, each writer's best settled record, and the
+ *  keys that hold junk or a settled record another covers. */
 function roomMoves(): {
   entries: StationMove[];
   keyed: Array<{ key: string; move: StationMove }>;
   legacy: StationMove | null;
-  settled: SettledMoves | null;
-  settledKeys: string[];
+  settled: Map<string, SettledMoves & { key: string }>;
+  stale: string[];
 } {
-  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled: null, settledKeys: [] };
+  const settled = new Map<string, SettledMoves & { key: string }>();
+  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled, stale: [] };
   const keyed: Array<{ key: string; move: StationMove }> = [];
-  let settled: SettledMoves | null = null;
-  const settledKeys: string[] = [];
-  keepMap!.forEach((v, k) => {
-    if (k.startsWith(SETTLED_PREFIX)) {
-      settledKeys.push(k);
-      if (isSettledMoves(v) && (!settled || v.through > settled.through
-        || (v.through === settled.through && v.drawn > settled.drawn))) settled = { through: v.through, drawn: v.drawn };
-      return;
+  const stale: string[] = [];
+  let scanned = 0;
+  for (const [k, v] of keepMap!.entries()) {
+    const isSettled = k.startsWith(SETTLED_PREFIX);
+    if (!isSettled && !k.startsWith(ENTRY_PREFIX)) continue;
+    if (++scanned > MOVE_SCAN_MAX) break;
+    if (isSettled) {
+      if (!isSettledMoves(v)) { stale.push(k); continue; }
+      const w = writerOf(k, SETTLED_PREFIX);
+      const had = settled.get(w);
+      if (!had || v.n > had.n || (v.n === had.n && v.drawn > had.drawn)) {
+        if (had) stale.push(had.key);
+        settled.set(w, { n: v.n, drawn: v.drawn, floor: v.floor, key: k });
+      } else stale.push(k);
+      continue;
     }
-    if (!k.startsWith(ENTRY_PREFIX)) return;
     const m = validMove(v);
     if (m) keyed.push({ key: k, move: m });
-  });
-  return { entries: keyed.map((e) => e.move), keyed, legacy: validMove(keepMap!.get(LEGACY_KEY)), settled, settledKeys };
+    else stale.push(k);
+  }
+  return { entries: keyed.map((e) => e.move), keyed, legacy: validMove(keepMap!.get(LEGACY_KEY)), settled, stale };
 }
 
 /** The move a record stands for: a pin's settled move, else itself. */
@@ -856,6 +886,25 @@ function standingMoves(own: StationMove[], known: StationMove[]): StationMove[] 
   return best;
 }
 
+/** Each station's standing move in the bound room, cached until the room
+ *  or this install's remembered moves change (the station list asks for
+ *  every station, often). */
+let standingCache: { version: string; moves: StationMove[] } | null = null;
+let roomVersion = 0;
+
+function roomStanding(): StationMove[] {
+  if (!docAlive()) return [];
+  let stored: string | null = null;
+  try { stored = localStorage.getItem(KEY); } catch { /* none stored */ }
+  const version = `${roomVersion}|${stored ?? ''}`;
+  if (standingCache?.version === version) return standingCache.moves;
+  const { entries, legacy } = roomMoves();
+  const own = legacy ? [legacy, ...entries] : entries;
+  const moves = standingMoves(own, knownMoves(own));
+  standingCache = { version, moves };
+  return moves;
+}
+
 /** The room's latest move that is not beaten by a concurrent one, or null
  *  (none, unbound, or malformed). */
 export function readStationMove(): StationMove | null {
@@ -887,48 +936,81 @@ function meterParts(entries: StationMove[], known: StationMove[], base: number):
 }
 
 /** Fuel moves have drawn in this room: the 'stationMove' draw meter — the
- *  settled total of pruned entries (else the legacy record's running total),
- *  plus each entry's own fuel unless a concurrent move beat it; never below
- *  an unbeaten entry's own running total (fuelDrawn), which carries the
- *  meter's deficit at booking, so a move booked after a loser dropped out of
- *  the sum still pays. */
+ *  legacy record's running total and every writer's settled total, plus
+ *  each live entry's own fuel unless a concurrent move beat it; never below
+ *  an unbeaten entry's own running total (fuelDrawn, kept for pruned entries
+ *  as each settled record's floor), which carries the meter's deficit at
+ *  booking, so a move booked after a loser dropped out of the sum still
+ *  pays. */
 export function readMoveFuelDrawn(): number {
   const { entries, legacy, settled } = roomMoves();
   const known = knownMoves(legacy ? [legacy, ...entries] : entries);
-  const { sum, floor } = meterParts(entries, known, settled ? settled.drawn : legacy?.fuelDrawn ?? 0);
-  return Math.max(sum, floor);
+  let base = legacy?.fuelDrawn ?? 0;
+  let settledFloor = 0;
+  for (const r of settled.values()) { base += r.drawn; settledFloor = Math.max(settledFloor, r.floor); }
+  const { sum, floor } = meterParts(entries, known, base);
+  return Math.max(sum, floor, settledFloor);
 }
 
-/** Prune the move log inside a write's transaction: entries that arrived
- *  before `now - MOVE_LOG_KEEP_MS` leave it, except each station's standing
- *  move and anything that could still decide whether a kept entry is beaten
- *  (related, closed over). The meter's reading is unchanged: what left is
- *  folded into a new settled total. Keeps the log, and every read's
- *  superseded checks, bounded by the moves of about a day. */
+/** Prune the move log inside a write's transaction. An entry can leave once
+ *  it arrived before `now - MOVE_LOG_KEEP_MS`, unless it is a station's
+ *  standing move or could still decide whether a kept entry is beaten
+ *  (related, closed over); and only as part of its writer's oldest run of
+ *  entries (see SETTLED_PREFIX). What leaves is added to its writer's settled
+ *  record, so the meter reads the same. Junk keys and covered settled
+ *  records go too. Keeps the log, and every read's superseded checks,
+ *  bounded by the moves of about a day. */
 function pruneMoveLog(now: number): void {
-  const { entries, keyed, legacy, settled, settledKeys } = roomMoves();
+  const { entries, keyed, legacy, settled, stale } = roomMoves();
+  for (const k of stale) keepMap!.delete(k);
   const own = legacy ? [legacy, ...entries] : entries;
   const known = knownMoves(own);
   const through = now - MOVE_LOG_KEEP_MS;
   const standing = new Set(standingMoves(entries, known));
-  const kept = new Set(keyed.filter((e) => e.move.arriveAt >= through || standing.has(e.move)));
+  type Entry = { key: string; move: StationMove };
+  const kept = new Set<Entry>(keyed.filter((e) => e.move.arriveAt >= through || standing.has(e.move)));
+  const byWriter = new Map<string, Entry[]>();
+  for (const e of keyed) {
+    const w = writerOf(e.key, ENTRY_PREFIX);
+    byWriter.set(w, [...(byWriter.get(w) ?? []), e]);
+  }
+  for (const list of byWriter.values()) list.sort((x, y) => bookedOf(x.move) - bookedOf(y.move) || x.move.departAt - y.move.departAt);
+  // Grow `kept` until it is closed: everything related to a kept entry, and
+  // every entry after a kept one in its writer's order.
   for (let grew = true; grew;) {
     grew = false;
     for (const e of keyed) {
       if (kept.has(e)) continue;
       if ([...kept].some((k) => related(k.move, e.move))) { kept.add(e); grew = true; }
     }
+    for (const list of byWriter.values()) {
+      const at = list.findIndex((e) => kept.has(e));
+      if (at < 0) continue;
+      for (const e of list.slice(at)) if (!kept.has(e)) { kept.add(e); grew = true; }
+    }
   }
   if (kept.size === keyed.length) return;
-  const drawn = Math.max(readMoveFuelDrawn(), 0);
   const keptMoves = keyed.filter((e) => kept.has(e)).map((e) => e.move);
-  // The new base is what the kept entries' own fuel does not already cover,
-  // so base + kept fuel reads what the whole log read.
-  const { sum } = meterParts(keptMoves, known, 0);
-  const next: SettledMoves = { through: Math.max(through, settled?.through ?? -Infinity), drawn: Math.min(FUEL_METER_MAX, Math.max(0, drawn - sum)) };
-  for (const e of keyed) if (!kept.has(e)) keepMap!.delete(e.key);
-  for (const k of settledKeys) keepMap!.delete(k);
-  keepMap!.set(`${SETTLED_PREFIX}${boundDoc!.clientID}:${now}`, next);
+  // A move written twice (two tabs) is one move: a copy that stays pays.
+  const counted = new Set(keptMoves.map((m) => JSON.stringify(m)));
+  for (const [w, list] of byWriter) {
+    const gone = list.filter((e) => !kept.has(e));
+    if (gone.length === 0) continue;
+    const had = settled.get(w);
+    let drawn = had?.drawn ?? 0;
+    let floor = had?.floor ?? 0;
+    for (const e of gone) {
+      keepMap!.delete(e.key);
+      const id = JSON.stringify(e.move);
+      if (counted.has(id) || superseded(e.move, known)) continue;
+      counted.add(id);
+      drawn += e.move.fuel;
+      floor = Math.max(floor, e.move.fuelDrawn);
+    }
+    const n = (had?.n ?? 0) + gone.length;
+    if (had) keepMap!.delete(had.key);
+    keepMap!.set(`${SETTLED_PREFIX}${w}:${n}`, { n, drawn: Math.min(FUEL_METER_MAX, drawn), floor: Math.min(FUEL_METER_MAX, floor) });
+  }
 }
 
 /** Bind the room doc — beside bindStationKeepingDoc. Each station's standing
@@ -939,7 +1021,9 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
   boundDoc = doc;
   const map = doc.getMap('stationKeeping');
   keepMap = map;
+  roomVersion++;
   const onChange = () => {
+    roomVersion++;
     const { entries, legacy } = roomMoves();
     const own = legacy ? [legacy, ...entries] : entries;
     for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);

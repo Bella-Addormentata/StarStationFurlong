@@ -943,19 +943,74 @@ describe('the move log stays bounded', () => {
     expect(readMoveFuelDrawn()).toBe(drawn);
   });
 
-  it('ignores a settled total from the far future or past the meter\'s range', () => {
+  it('ignores a settled record that is malformed or past the meter\'s range, and clears it', () => {
     const doc = new Y.Doc();
     bindStationMoveDoc(doc);
     writeStationMove(hop(0, 10, 10));
     const map = doc.getMap('stationKeeping');
-    map.set('moveSettled:9:1', { through: Date.now() + 365 * 86_400_000, drawn: 0 });
-    map.set('moveSettled:9:2', { through: Date.now(), drawn: 1e15 });
+    map.set('moveSettled:9:1', { through: Date.now(), drawn: 0 });
+    map.set('moveSettled:9:2', { n: 2, drawn: 1e15, floor: 0 });
+    map.set('moveSettled:9:3', { n: 1.5, drawn: 3, floor: 0 });
     expect(readMoveFuelDrawn()).toBe(10);
-    // A later pruning is not steered by them either.
+    writeStationMove(hop(1, 5, 15));
+    expect(readMoveFuelDrawn()).toBe(15);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:9:'))).toEqual([]);
+  });
+
+  it('keeps every writer\'s settled fuel when two replicas prune at once', () => {
+    // Writer 11 wrote three yard moves; replica B has only seen the first two.
+    const x = new Y.Doc();
+    x.clientID = 11;
+    const xs = x.getMap('stationKeeping');
+    xs.set(`move:11:${hop(0, 0, 0).departAt}`, hop(0, 10, 10));
+    xs.set(`move:11:${hop(1, 0, 0).departAt}`, hop(1, 20, 30));
+    const early = Y.encodeStateAsUpdate(x);
+    xs.set(`move:11:${hop(2, 0, 0).departAt}`, hop(2, 5, 35));
+    const a = new Y.Doc(); a.clientID = 21; Y.applyUpdate(a, Y.encodeStateAsUpdate(x));
+    const b = new Y.Doc(); b.clientID = 22; Y.applyUpdate(b, early);
+    // Each books another station's move offline, pruning what it can.
+    bindStationMoveDoc(a);
+    writeStationMove({ ...hop(3, 7, 42), stationId: 'dock-a', welcomeRoomId: 'dock-a-room' });
+    bindStationMoveDoc(b);
+    writeStationMove({ ...hop(3, 7, 37), stationId: 'dock-b', welcomeRoomId: 'dock-b-room' });
+    expect([...a.getMap('stationKeeping').keys()]).toContain('moveSettled:11:2');
+    expect([...b.getMap('stationKeeping').keys()]).toContain('moveSettled:11:1');
+    // They meet: the larger record covers the smaller, and nothing is lost.
+    for (const [from, to] of [[a, b], [b, a], [x, a], [a, x]]) Y.applyUpdate(to, Y.encodeStateAsUpdate(from));
+    for (const d of [a, b, x]) Y.applyUpdate(d, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      store.clear();
+      bindStationMoveDoc(d);
+      expect(readMoveFuelDrawn()).toBe(10 + 20 + 5 + 7 + 7);
+    }
+    expect([...a.getMap('stationKeeping').keys()].filter((k) => k.startsWith('move:11:'))).toEqual([`move:11:${hop(2, 0, 0).departAt}`]);
+  });
+
+  it('reads a bounded number of keys and clears junk a peer wrote', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationKeeping');
+    for (let i = 0; i < 1000; i++) map.set(`move:666:${i}`, { junk: i });
+    expect(readMoveFuelDrawn()).toBe(0);
+    writeStationMove(hop(0, 10, 10));
     writeStationMove(hop(1, 5, 15));
     writeStationMove(hop(2, 5, 20));
-    expect(readMoveFuelDrawn()).toBe(20);
-    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:'))).toHaveLength(1);
+    expect([...map.keys()].filter((k) => k.startsWith('move:666:')).length).toBeLessThanOrEqual(1000 - 3 * 250);
+  });
+
+  it('follows a move written here even when this install cannot store it', () => {
+    const setItem = (globalThis as { localStorage: { setItem: unknown } }).localStorage.setItem;
+    (globalThis as { localStorage: { setItem: unknown } }).localStorage.setItem = () => { throw new Error('full'); };
+    try {
+      installStationMoveResolver();
+      bindStationMoveDoc(new Y.Doc());
+      const move = moveTo();
+      expect(writeStationMove(move)).toBe(true);
+      expect(readRememberedMoves()).toEqual([]);
+      expect(listStations({}, [], move.arriveAt + 1).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS });
+    } finally {
+      (globalThis as { localStorage: { setItem: unknown } }).localStorage.setItem = setItem;
+    }
   });
 
   it('keeps a loser next to the move that beat it, so it stays unpaid', () => {
