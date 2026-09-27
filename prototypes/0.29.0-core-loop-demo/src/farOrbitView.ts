@@ -246,11 +246,11 @@ function gather(now: number): Source {
   // hidden in every view, not only its own planet's.
   const flying = new Set<string>();
   for (const ship of Object.values(readStore(now).ships)) {
-    if (ship.status === 'in-flight' && !(ship as { retired?: boolean }).retired) flying.add(ship.roomId);
+    if (ship.status === 'in-flight' && !ship.retired) flying.add(ship.roomId);
   }
   for (const ship of shipsAroundPlanet(planetId, now)) {
     if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
-    if ((ship as { retired?: boolean }).retired) continue;
+    if (ship.retired) continue;
     if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
     const plan = flightPlan(byRoom(ship.fromRoom, ship.departedAt), byRoom(ship.toRoom, ship.departedAt), ship.departedAt, ship.etaAt);
     // Only ships on their transfer right now: the gather re-runs every
