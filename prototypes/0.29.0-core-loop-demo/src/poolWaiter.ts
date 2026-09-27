@@ -21,6 +21,7 @@ import type { RobotRoutine, RobotStep } from "./robotDoc";
 import {
   ARRIVE_DIST as SCRIPT_ARRIVE_DIST,
   RobotScriptScheduler,
+  ferryStops,
 } from "./robotScript";
 // 🔋 #77 charge slice: engine-pure per-robot charge accumulator + the reading
 // shape the dock console reads. All timing is dt-driven so every client's
@@ -215,6 +216,11 @@ export class PoolWaiter {
    *  Kept here (not created per-tick) so timers survive across frames. */
   private scriptScheduler = new RobotScriptScheduler();
   private sayHandler: ((text: string, x: number, z: number) => void) | null = null;
+  /** 🛳️ Ferry-route slice: the berth this bot is currently tied to (the world
+   *  sets it from its dock binding — a dock robot STARTS at its berth). Fed
+   *  back into the scheduler each frame so a `ferry` step targets the NEXT
+   *  stop of the loop; a bot mid-route carries the last completed hop. */
+  private ferryStop = -1;
   /** 🗨️ #77 small talk: greet once when a fox newly enters range, then hold off. */
   private smalltalkCooldown = 0;
   private foxWasNear = false;
@@ -607,10 +613,32 @@ export class PoolWaiter {
    *  pure patrol. Passing null clears the dock and returns the bot to patrol. */
   public setDock(dock: { x: number; z: number; faceAngle: number } | null): void {
     this.dockTarget = dock;
+    // 🛳️ A dock robot STARTS tied to its berth: if the bound dock is a ferry
+    //  stop, that is the leg the first `ferry` step departs FROM. -1 when the
+    //  dock isn't on the loop (a room with fewer than two docks binds no route).
+    this.ferryStop = dock ? this.ferryStopIndexOf(dock.x, dock.z) : -1;
     if (!dock && this.activity === "DOCK") {
       this.activity = "PATROL";
       this.idleTimer = 0;
     }
+  }
+
+  /** 🛳️ The index of the bound dock inside the ferry loop, or -1 when the
+   *  dock isn't a berth (single-dock rooms bind no route at all — the ferry
+   *  step then no-ops). Stop coords ARE the world's dock coords, so the match
+   *  is exact in the common case; the small tolerance covers render drift and
+   *  first-min-wins keeps the pick deterministic on every client. */
+  private ferryStopIndexOf(x: number, z: number): number {
+    let best = -1;
+    let bestDist = 0.5;
+    ferryStops().forEach((s, i) => {
+      const d = Math.hypot(x - s.x, z - s.z);
+      if (d < bestDist) {
+        bestDist = d;
+        best = i;
+      }
+    });
+    return best;
   }
 
   /** 🤖 #77C s3: set the owner-programmed routine (from the dock's console). */
@@ -671,6 +699,9 @@ export class PoolWaiter {
       // scheduler stall for DOCK_STEP_NO_DOCK_SECS and move on — the loop
       // never freezes on a dock step in a dockless room.
       this.dockTarget ? { x: this.dockTarget.x, z: this.dockTarget.z } : null,
+      // 🛳️ The berth this bot is tied to — the scheduler targets the NEXT
+      // stop of the ferry loop from it and latches the hop on arrival.
+      this.ferryStop,
     );
     if (action.kind === "none") {
       this.idlePose();
@@ -680,6 +711,17 @@ export class PoolWaiter {
       // walkTo uses the same ARRIVE_DIST as the scheduler so both agree on
       // "arrived". Return value is ignored — the scheduler owns advancement.
       this.walkTo(dt, action.x, action.z, SCRIPT_ARRIVE_DIST);
+      return;
+    }
+    if (action.kind === "gotoFerryStop") {
+      // 🛳️ A scripted FERRY leg: walk to the target berth and, on arrival,
+      //  latch the hop (the scheduler's NEXT ferry step departs from here) and
+      //  face the pad the way the dock-arrival path does. The scheduler owns
+      //  the timeout/advance verdict; the chassis only walks.
+      if (this.walkTo(dt, action.x, action.z, SCRIPT_ARRIVE_DIST)) {
+        this.ferryStop = action.stop;
+        if (this.dockTarget) this.turnToward(this.dockTarget.faceAngle, dt);
+      }
       return;
     }
     if (action.kind === "gotoDock") {

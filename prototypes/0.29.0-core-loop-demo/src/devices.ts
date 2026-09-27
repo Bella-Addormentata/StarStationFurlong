@@ -2066,10 +2066,15 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         body = `💬 SAY ${inp(idx, 'text', escAttr(step.text), '150px', 'text', `maxlength="${MAX_SAY_LEN}"`)}`;
       } else if (step.kind === 'wait') {
         body = `⏱ WAIT ${inp(idx, 'secs', String(step.secs), '46px', 'number', `min="0" max="${MAX_WAIT_SECS}" step="any"`)} s`;
-      } else {
+      } else if (step.kind === 'dock') {
         // 🔋 #77 charge slice: DOCK step carries no payload — the render binding
         // resolves the dock target. No editable fields; just a labelled row.
         body = `🔋 DOCK · walk to the charging dock`;
+      } else {
+        // 🛳️ Ferry-route slice: FERRY is also payload-free — the binding walks
+        // the NEXT stop of the room's ferry loop (the dock positions). No
+        // editable fields; consecutive FERRY steps hop berth to berth.
+        body = `🛳️ FERRY · next stop on the route`;
       }
       return `<div style="display:flex; align-items:center; gap:6px; font-size:10px; color:${CH_GOLD};">${body}${del}</div>`;
     };
@@ -2158,7 +2163,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       </div>
       ${owner
           ? script.length < MAX_SCRIPT_STEPS
-            ? `<div style="display:flex; gap:6px;">${addBtn('goto', '+ Go to')}${addBtn('say', '+ Say')}${addBtn('wait', '+ Wait')}${addBtn('dock', '+ Dock')}</div>`
+            ? `<div style="display:flex; gap:6px;">${addBtn('goto', '+ Go to')}${addBtn('say', '+ Say')}${addBtn('wait', '+ Wait')}${addBtn('dock', '+ Dock')}${addBtn('ferry', '+ Ferry')}</div>`
             : `<span style="font-size:9px; color:#4A5560;">Max ${MAX_SCRIPT_STEPS} steps.</span>`
           : ''}`
         : timingEditor;
@@ -2237,6 +2242,8 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         const kind = b.dataset.add;
         // 🔋 #77 charge slice: 'dock' composes with the rest of the loop —
         // walk home to the robot's own dock, then run the next step.
+        // 🛳️ 'ferry' composes the same way — walk the NEXT stop of the
+        // room's ferry loop (two stops ⇒ the A↔B shuttle the PR asks about).
         const step: RobotStep =
           kind === 'goto'
             ? { kind: 'goto', x: 0, z: 0 }
@@ -2244,7 +2251,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
               ? { kind: 'say', text: 'Hello!' }
               : kind === 'dock'
                 ? { kind: 'dock' }
-                : { kind: 'wait', secs: 2 };
+                : kind === 'ferry'
+                  ? { kind: 'ferry' }
+                  : { kind: 'wait', secs: 2 };
         writeScript('custom', [...curScript(), step].slice(0, MAX_SCRIPT_STEPS));
       });
     });

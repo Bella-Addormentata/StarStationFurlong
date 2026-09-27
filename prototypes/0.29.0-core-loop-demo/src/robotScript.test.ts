@@ -6,7 +6,7 @@
  * and the deterministic goto/say/wait loop the render layer drives.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, afterEach } from 'vitest';
 import {
   ARRIVE_DIST,
   BET_SECS_MAX,
@@ -23,12 +23,21 @@ import {
   SAY_HOLD_SECS,
   SHOW_SECS_MAX,
   SHOW_SECS_MIN,
+  bindFerryStops,
+  ferryStops,
   isRobotStep,
   isWheelTiming,
+  nextFerryStop,
   parseRobotScript,
   patchScriptStep,
 } from './robotScript';
 import type { RobotStep } from './robotScript';
+
+// 🛳️ The ferry-stop registry is module-scope render-provided state — reset it
+// after every test so one suite's bound route can't leak into the next.
+afterEach(() => {
+  bindFerryStops([]);
+});
 
 // ── isRobotStep — the doc-boundary guard ───────────────────────────────────
 
@@ -89,10 +98,18 @@ describe('isRobotStep', () => {
     // binding resolves the target from ITS own dockTarget, not from the doc.
     expect(isRobotStep({ kind: 'dock' })).toBe(true);
   });
+  it('accepts a valid ferry step (payload-free)', () => {
+    // 🛳️ Ferry-route slice: like 'dock', the 'ferry' step carries no coords —
+    // the render binding resolves the NEXT stop of the room's ferry loop.
+    expect(isRobotStep({ kind: 'ferry' })).toBe(true);
+  });
   it('ignores extraneous fields on a dock step (still valid on kind alone)', () => {
     // The guard only checks `kind`. Extra fields don't invalidate the step —
     // but they are silently dropped by whole-value replace on the next write.
     expect(isRobotStep({ kind: 'dock', x: 999, z: 'nope' })).toBe(true);
+  });
+  it('ignores extraneous fields on a ferry step (still valid on kind alone)', () => {
+    expect(isRobotStep({ kind: 'ferry', x: 999, payload: 'nope' })).toBe(true);
   });
 });
 
@@ -361,6 +378,151 @@ describe('RobotScriptScheduler — DOCK step (goto-dock capability)', () => {
   });
 });
 
+// 🛳️ Ferry-route slice (the PR's "drive a ship on a repeated route between
+// two stations" ask): the payload-free `ferry` step hops berth to berth along
+// the room's ferry loop — the placed charging-docks, id-sorted and bound by
+// the world at render time. Stops are MODULE state (bindFerryStops), never
+// doc-borne step coords, so the trust-boundary story matches `dock` exactly.
+describe('RobotScriptScheduler — FERRY step (route between stops)', () => {
+  /** Two berths: the demo Aft Dock (A) and Forward Dock (B). */
+  const bindTwoStops = (): void =>
+    bindFerryStops([
+      { x: -4.5, z: -10.5 }, // stop 0 — Aft Dock
+      { x: 4.5, z: 10.5 }, // stop 1 — Forward Dock
+    ]);
+
+  it('emits gotoFerryStop targeting stop 0 when the bot has no berth yet', () => {
+    bindTwoStops();
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    const a = s.advance(0.1, { x: 0, z: 0 }, null, -1) as {
+      kind: 'gotoFerryStop'; x: number; z: number; stop: number;
+    };
+    expect(a.kind).toBe('gotoFerryStop');
+    expect(a.stop).toBe(0);
+    expect(a.x).toBe(-4.5);
+    expect(a.z).toBe(-10.5);
+    expect(s.cursor()).toBe(0);
+    expect(s.ferryStop()).toBe(-1); // hop not latched until arrival
+  });
+
+  it('advances the cursor and latches the hop on arrival at the berth', () => {
+    bindTwoStops();
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    // Standing ON stop 0 — arrived; the hop latches and the loop advances.
+    s.advance(0.1, { x: -4.5, z: -10.5 }, null, -1);
+    expect(s.cursor()).toBe(1);
+    expect(s.ferryStop()).toBe(0);
+  });
+
+  it('runs the two-station shuttle A→B→A (the PR demo route)', () => {
+    bindTwoStops();
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    // Bot STARTS at its berth A (the world latches its dock as stop 0).
+    let a = s.advance(0.1, { x: -4.5, z: -10.5 }, null, 0) as { kind: string; stop: number };
+    expect(a.stop).toBe(1); // departs Aft → Forward
+    // Walk frame-by-frame at B's position until the leg completes.
+    s.advance(0.1, { x: 4.5, z: 10.5 }, null, 0);
+    expect(s.ferryStop()).toBe(1);
+    expect(s.cursor()).toBe(1); // now on the wait step
+    // Burn the wait; the loop wraps to the next ferry leg.
+    s.advance(31, { x: 4.5, z: 10.5 }, null, 1); // dt clamps to 5 — timer 5 ≥ 30? no
+    for (let i = 0; i < 6; i++) s.advance(5, { x: 4.5, z: 10.5 }, null, 1); // 35 s total
+    expect(s.cursor()).toBe(0); // back on the ferry step
+    a = s.advance(0.1, { x: 4.5, z: 10.5 }, null, 1) as { kind: string; stop: number };
+    expect(a.stop).toBe(0); // departs Forward → Aft — the return leg
+  });
+
+  it('composes the PR shape: ferry, announce, wait, ferry, announce, wait', () => {
+    bindTwoStops();
+    const s = new RobotScriptScheduler([
+      { kind: 'ferry' },
+      { kind: 'say', text: 'Now arriving at Forward Dock' },
+      { kind: 'wait', secs: 5 },
+      { kind: 'ferry' },
+      { kind: 'say', text: 'Now arriving at Aft Dock' },
+      { kind: 'wait', secs: 5 },
+    ]);
+    expect(s.size()).toBe(6);
+    // Leg 1: berth unknown → walks to stop 0 (Aft).
+    const leg1 = s.advance(0.1, { x: 0, z: 0 }, null, -1) as { kind: string; stop: number };
+    expect(leg1).toMatchObject({ kind: 'gotoFerryStop', stop: 0 });
+    // Arrive → announce (say edge fires once) → wait → leg 2 targets stop 1.
+    s.advance(0.1, { x: -4.5, z: -10.5 }, null, -1);
+    expect(s.cursor()).toBe(1);
+    const say = s.advance(0.1, { x: -4.5, z: -10.5 }, null, 0) as { kind: string; text: string; started: boolean };
+    expect(say).toMatchObject({ kind: 'say', text: 'Now arriving at Forward Dock', started: true });
+  });
+
+  it('is a no-op when no ferry stops are bound (dockless room keeps moving)', () => {
+    // No bindFerryStops call — the route is empty.
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    expect(s.advance(0.1, { x: 0, z: 0 }, null, -1)).toEqual({ kind: 'none' });
+    expect(s.cursor()).toBe(1); // completed instantly — no stall, no freeze
+  });
+
+  it('a one-stop route targets that same berth every leg', () => {
+    bindFerryStops([{ x: -4.5, z: -10.5 }]);
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    const a = s.advance(0.1, { x: 0, z: 0 }, null, 0) as { kind: string; stop: number };
+    expect(a.stop).toBe(0); // (0 + 1) mod 1 === 0 — the ferry idles at its only berth
+  });
+
+  it('times out an unreachable berth on GOTO_TIMEOUT_SECS and latches the hop anyway', () => {
+    bindTwoStops();
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    // Bot never moves; the fail-safe fires so the loop can't freeze on a leg.
+    for (let t = 0; t < Math.ceil(GOTO_TIMEOUT_SECS); t++) {
+      s.advance(1, { x: 99, z: 99 }, null, -1);
+    }
+    expect(s.cursor()).toBe(1);
+    expect(s.ferryStop()).toBe(0); // the hop latched — next leg departs from stop 0
+  });
+
+  it('rebinding the same stops does not restart the route', () => {
+    bindTwoStops();
+    const s = new RobotScriptScheduler([{ kind: 'ferry' }, { kind: 'wait', secs: 30 }]);
+    s.advance(0.1, { x: -4.5, z: -10.5 }, null, -1); // latch stop 0
+    expect(s.ferryStop()).toBe(0);
+    bindTwoStops(); // a furniture re-reconcile re-publishes the same loop
+    expect(s.ferryStop()).toBe(0); // mid-route state survives
+  });
+});
+
+describe('ferry-stop registry (bindFerryStops / ferryStops / nextFerryStop)', () => {
+  it('starts empty; nextFerryStop returns null', () => {
+    expect(ferryStops()).toEqual([]);
+    expect(nextFerryStop(-1)).toBeNull();
+  });
+  it('binds an ordered loop and cycles with wraparound', () => {
+    bindFerryStops([
+      { x: -4.5, z: -10.5 },
+      { x: 4.5, z: 10.5 },
+    ]);
+    expect(nextFerryStop(-1)).toMatchObject({ stop: 0, x: -4.5, z: -10.5 });
+    expect(nextFerryStop(0)).toMatchObject({ stop: 1, x: 4.5, z: 10.5 });
+    expect(nextFerryStop(1)).toMatchObject({ stop: 0, x: -4.5, z: -10.5 }); // wrap
+  });
+  it('returns copies — callers cannot mutate the bound route', () => {
+    bindFerryStops([{ x: 1, z: 2 }]);
+    ferryStops()[0].x = 999;
+    expect(ferryStops()[0].x).toBe(1);
+    const t = nextFerryStop(-1);
+    expect(t).toMatchObject({ stop: 0, x: 1, z: 2 });
+  });
+  it('rebinding to [] empties the loop (docks removed)', () => {
+    bindFerryStops([{ x: 1, z: 2 }]);
+    bindFerryStops([]);
+    expect(nextFerryStop(0)).toBeNull();
+  });
+  it('clamps a stale out-of-range fromStop (a berth was removed mid-route)', () => {
+    bindFerryStops([{ x: 0, z: 0 }, { x: 1, z: 1 }]);
+    // fromStop 5 belonged to a longer route — the hop must still land on a
+    // real berth, not index past the end.
+    expect(nextFerryStop(5)).toMatchObject({ stop: 0 });
+    expect(nextFerryStop(-7)).toMatchObject({ stop: 0 });
+  });
+});
+
 describe('RobotScriptScheduler — looping and setSteps', () => {
   it('loops back to the first step after the last completes', () => {
     const s = new RobotScriptScheduler([
@@ -469,7 +631,6 @@ describe('patchScriptStep', () => {
     { kind: 'wait', secs: 2 },
     { kind: 'dock' },
   ];
-
   it('applies an in-envelope goto coordinate edit', () => {
     const steps = base();
     const next = patchScriptStep(steps, 0, 'x', '7');
@@ -525,6 +686,13 @@ describe('patchScriptStep', () => {
   it('refuses any edit on a DOCK step (payload-free by design)', () => {
     expect(patchScriptStep(base(), 3, 'x', '1')).toBeNull();
     expect(patchScriptStep(base(), 3, 'text', 'hi')).toBeNull();
+  });
+  it('refuses any edit on a FERRY step (payload-free by design)', () => {
+    // 🛳️ The route lives in the room, not the step — nothing to patch.
+    const steps: RobotStep[] = [{ kind: 'ferry' }];
+    expect(patchScriptStep(steps, 0, 'x', '1')).toBeNull();
+    expect(patchScriptStep(steps, 0, 'text', 'hi')).toBeNull();
+    expect(patchScriptStep(steps, 0, 'secs', '5')).toBeNull();
   });
   it('refuses an out-of-range or non-integer index', () => {
     expect(patchScriptStep(base(), -1, 'x', '1')).toBeNull();
