@@ -697,6 +697,20 @@ export class SolarSystemMap {
     current: StationRecord | null = currentStation(),
   ) {
     this.bodies = [...this.bodies.filter((b) => b.type !== 'station'), ...stationBodies(stations)];
+    // A transit under way follows its destination's refreshed body, or is
+    // called off when that station is gone (it could never land).
+    if (this.travelDestination) {
+      const dest = this.bodies.find((b) => b.id === this.travelDestination!.id);
+      if (dest) {
+        this.travelDestination = dest;
+      } else {
+        this.travelDestination = null;
+        if (this.container) {
+          const travelPanel = document.getElementById('map-traveling-panel');
+          if (travelPanel) travelPanel.style.display = 'none';
+        }
+      }
+    }
     // Location FIRST: the selection repaint below reads it for the travel
     // button ("YOU ARE HERE" belongs to the station we are in now).
     if (!this.travelDestination && current) {

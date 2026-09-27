@@ -61,8 +61,11 @@ export interface AtlasDoor {
    *  DOCK, not station structure. The exterior still draws the docked ship,
    *  but station grouping (atlasComponents) skips the edge — the station-side
    *  record can outlive the ship's departure (the dock never sees it leave),
-   *  and a ship must not join, or bridge, the stations it calls at. */
-  transient?: true;
+   *  and a ship must not join, or bridge, the stations it calls at.
+   *  Three states: true / false are KNOWN (a harvest, or gossip from a client
+   *  that knows the flag); absent is UNKNOWN — gossip from an older client,
+   *  which never sends it. Unknown groups like structure, as before. */
+  transient?: boolean;
 }
 
 export interface AtlasEntry {
@@ -264,7 +267,7 @@ export function harvestIntoAtlas(entry: {
       farYawDeg: d.farYawDeg,
       wall: d.wall,
       lateral: d.lateral,
-      ...(d.transient === true ? { transient: true as const } : {}),
+      ...(typeof d.transient === 'boolean' ? { transient: d.transient } : {}),
     };
   }
   atlas[entry.roomId] = {
@@ -431,7 +434,7 @@ function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<stri
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || !e.doors) continue;
     for (const d of Object.values(e.doors)) {
-      if (!d?.targetRoomId || d.transient) continue;
+      if (!d?.targetRoomId || d.transient === true) continue;
       link(e.roomId, d.targetRoomId);
       link(d.targetRoomId, e.roomId);
     }
@@ -676,8 +679,10 @@ interface SharedAtlasEntry {
     /** 🧭 This door's own physical pose — see AtlasDoor. */
     wall?: DoorWall;
     lateral?: number;
-    /** ⚓ A transient berth — see AtlasDoor. */
-    transient?: true;
+    /** ⚓ A transient berth — see AtlasDoor. Sent whenever KNOWN, false
+     *  included, so a reader can tell "not a berth" from an older client's
+     *  silence. */
+    transient?: boolean;
   }>;
   /** 🛑📐 The module's true tile size. PUBLIC by owner ruling — anyone may see
    *  a module's outside: its size, its position and its connections. Only the
@@ -845,8 +850,16 @@ function pullSharedAtlas(): void {
         lateral: Number.isFinite(door.lateral) && Math.abs(door.lateral as number) <= 32
           ? (door.lateral as number)
           : prior?.doors[d]?.lateral,
-        // Exactly `true` or absent — a berth flag, never peer-shaped junk.
-        ...(door.transient === true ? { transient: true as const } : {}),
+        // A berth flag is exactly true or false. Anything else is an older
+        // client's silence, and silence must not erase what we knew: keep the
+        // prior value while the door still leads to the same room (review of
+        // #171 — legacy gossip was clearing markers and re-merging stations).
+        ...(typeof door.transient === 'boolean'
+          ? { transient: door.transient }
+          : prior?.doors[d]?.targetRoomId === door.targetRoomId
+            && typeof prior?.doors[d]?.transient === 'boolean'
+            ? { transient: prior.doors[d].transient }
+            : {}),
       };
       kept++;
     }
@@ -914,7 +927,8 @@ export function pushAtlasToDoc(): void {
           farYawDeg: door.farYawDeg,
           wall: door.wall,
           lateral: door.lateral,
-          ...(door.transient ? { transient: true as const } : {}),
+          // Known either way ⇒ published either way; unknown stays unsent.
+          ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
           ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
         };
       }
