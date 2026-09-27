@@ -212,10 +212,12 @@ export function listStations(
     if (out.some((e) => e.id === r.id)) continue;
     const place = placeOf(r.welcomeRoomId);
     if (place && places.has(place)) continue;
-    const slot = claim(r.planetId, r.orbitSlot);
+    // An unknown planet reads as the default one, so it claims that planet's slots.
+    const planetId = planetById(r.planetId).id;
+    const slot = claim(planetId, r.orbitSlot);
     if (slot === null) continue;
     if (place) places.add(place);
-    out.push({ ...r, orbitSlot: slot });
+    out.push({ ...r, planetId, orbitSlot: slot });
   }
 
   // Atlas ids and names can arrive from peers unbounded, so derived records

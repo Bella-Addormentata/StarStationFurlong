@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { AtlasEntry } from './stationAtlas';
-import { atlasComponent, atlasComponents } from './stationAtlas';
+import { atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
 import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
@@ -153,6 +153,19 @@ describe('atlas components', () => {
     expect(atlasComponents(atlas)).toHaveLength(1);
   });
 
+  it('pairs an unnamed berth flagged at both ends with itself, not with a gangway beside it', () => {
+    const atlas = atlasOf(room('a1'), room('ship'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', transient: true };
+    atlas.ship.doors['d:dock'] = { targetSeed: '', targetRoomId: 'a1', transient: true };
+    // A permanent gangway between the same rooms; no record names its far door.
+    atlas.a1.doors['d:tube'] = { targetSeed: '', targetRoomId: 'ship' };
+    atlas.ship.doors['d:hatch'] = { targetSeed: '', targetRoomId: 'a1' };
+    const berths = berthDoorIds(atlas);
+    expect([...(berths.get('a1') ?? [])]).toEqual(['d:berth']);
+    expect([...(berths.get('ship') ?? [])]).toEqual(['d:dock']);
+    expect(atlasComponents(atlas)).toHaveLength(1);
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });
@@ -187,6 +200,15 @@ describe('listStations', () => {
     expect(stations.map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'aris-forge']);
     expect(stationsAroundPlanet('planet-aris', stations).map((s) => s.id)).toEqual(['aris-forge']);
     expect(stationForRoom('yard-a', twoStations(), stations)?.id).toBe('aris-forge');
+  });
+
+  it('lists a record naming an unknown planet at the default planet, in a slot free there', () => {
+    const lost: StationRecord = {
+      id: 'lost', name: 'LOST', planetId: 'planet-nope', orbitSlot: 0, welcomeRoomId: 'far-room',
+    };
+    const stations = listStations({}, [lost]);
+    expect(stations.find((s) => s.id === 'lost')).toMatchObject({ planetId: DEFAULT_PLANET_ID, orbitSlot: 1 });
+    expect(stationsAroundPlanet(DEFAULT_PLANET_ID, stations).map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'lost']);
   });
 
   it('lists one station per place: a record inside a listed station is dropped', () => {
