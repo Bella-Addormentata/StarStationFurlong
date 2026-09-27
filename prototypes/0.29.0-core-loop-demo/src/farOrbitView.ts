@@ -38,7 +38,7 @@ import {
 import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
-import { shipsAroundPlanet } from './planetSummary';
+import { readStore, shipsAroundPlanet } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
@@ -100,10 +100,24 @@ type Source =
  *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
 type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
 
-function placeOf(id: string | undefined, all: readonly StationRecord[]): Place | undefined {
+/** A flight's end as it was when the ship left (`leftAt`): a station that
+ *  has moved to another planet since then is still at its old slot for the
+ *  flight, as shipArrival.ts reads it (the ship arrives in open orbit there).
+ *  A pin stands for the move it settles; a cancel pin is no move at all. */
+function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?: number, now = Date.now()): Place | undefined {
   if (!id) return undefined;
   const station = all.find((s) => s.id === id);
-  if (station) return station;
+  if (station) {
+    const latest = station.move;
+    const moved = !latest ? undefined
+      : !latest.settles ? latest
+      : latest.departAt < latest.settles.arriveAt ? undefined
+      : latest.settles;
+    if (moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now && betweenPlanets(moved)) {
+      return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot };
+    }
+    return station;
+  }
   const adrift = adriftPlace(id);
   return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
 }
@@ -165,7 +179,13 @@ function gather(now: number): Source {
   if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
-      aboard = flightPlan(placeOf(rec.locationId, all), placeOf(rec.destinationId, all), rec.departedAt, rec.etaAt);
+      const leftAt = rec.castOffAt ?? rec.departedAt;
+      aboard = flightPlan(
+        placeOf(rec.locationId, all, leftAt, now),
+        placeOf(rec.destinationId, all, leftAt, now),
+        rec.departedAt,
+        rec.etaAt,
+      );
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
@@ -218,14 +238,21 @@ function gather(now: number): Source {
     viewerRingRadiusKm = orbit.radiusKm;
   }
 
-  const byRoom = (room: string | undefined) => (room ? all.find((s) => s.welcomeRoomId === room) : undefined);
+  const byRoom = (room: string | undefined, leftAt: number) =>
+    placeOf(room ? all.find((s) => s.welcomeRoomId === room)?.id : undefined, all, leftAt, now);
   const ships: FarShipInput[] = [];
+  // Every ship in flight anywhere: its room is also listed as a one-module
+  // station, which may sit around another planet than its summary, so it is
+  // hidden in every view, not only its own planet's.
   const flying = new Set<string>();
+  for (const ship of Object.values(readStore(now).ships)) {
+    if (ship.status === 'in-flight' && !(ship as { retired?: boolean }).retired) flying.add(ship.roomId);
+  }
   for (const ship of shipsAroundPlanet(planetId, now)) {
-    if (ship.status === 'in-flight') flying.add(ship.roomId);
     if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
+    if ((ship as { retired?: boolean }).retired) continue;
     if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
-    const plan = flightPlan(byRoom(ship.fromRoom), byRoom(ship.toRoom), ship.departedAt, ship.etaAt);
+    const plan = flightPlan(byRoom(ship.fromRoom, ship.departedAt), byRoom(ship.toRoom, ship.departedAt), ship.departedAt, ship.etaAt);
     // Only ships on their transfer right now: the gather re-runs every
     // REFRESH_MS, so a ship joins the key at departure and leaves it at
     // arrival, and the static frame is rebuilt at both.
