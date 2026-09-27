@@ -297,7 +297,7 @@ export function validatePlacement(
   //     A wall panel may not hang anywhere past where the taper starts (on
   //     the glass, or on side wall the taper removed).
   const cupola = roomCupola();
-  if (cupola && !cupolaClearsItem(cupola, item.kind, pos, rot, box)) {
+  if (cupola && !cupolaClearsItem(cupola, item.kind, pos, rot, box, featureBoxes)) {
     return { ok: false, reason: 'in the cupola glass' };
   }
 
@@ -794,27 +794,41 @@ export function validateDoorPlacement(
  *  placement box keeps from the walls (floorPlanDoc.roomPlaceBounds). */
 const CUPOLA_PLACE_CLEARANCE = 1.0;
 
+/** Window end inset — octagonHull.WINDOW_INSET / windowLayout.WALL_INSET. */
+const WINDOW_END_INSET = 0.05;
+
 /** Doorway (opening + posts) kept this far short of where a side wall ends at
  *  the cupola — the same margin the door keeps from a window. */
 const CUPOLA_DOOR_MARGIN = 0.4;
 
-/** True when a piece (at `pos`/`rot`, floor footprint `box`) stays out of
- *  the cupola: floor pieces clear of the cut corners, wall panels short of
- *  the taper. */
+/** True when a piece stays out of the cupola. Wall panels must hang short
+ *  of the taper. A footprint (`box`) keeps the placement box's 1 m inside
+ *  the cut corners; a generated feature's blocked area (`featureBoxes`: sea,
+ *  river, pool — they meet the walls by design) only has to stay out of the
+ *  cut-off corners; a piece with neither is tested at its origin. */
 function cupolaClearsItem(
   plan: CupolaPlan,
   kind: FurnitureItem['kind'],
   pos: { x: number; z: number },
   rot: Rot,
   box: Box | null,
+  featureBoxes: readonly Box[] = [],
 ): boolean {
   if (isWallMounted(kind)) {
     const mount = wallMountBox(kind, pos, rot);
     return !mount || !boxInCupolaTaper(plan, mount);
   }
-  return box
-    ? boxClearOfCupolaCorners(plan, box, CUPOLA_PLACE_CLEARANCE)
-    : cupolaCornerClearance(plan, pos.x, pos.z) >= CUPOLA_PLACE_CLEARANCE;
+  if (box) return boxClearOfCupolaCorners(plan, box, CUPOLA_PLACE_CLEARANCE);
+  if (featureBoxes.length) return featureBoxes.every((b) => boxClearOfCupolaCorners(plan, b, 0));
+  return cupolaCornerClearance(plan, pos.x, pos.z) >= CUPOLA_PLACE_CLEARANCE;
+}
+
+/** cupolaClearsItem for a piece already in the room. */
+function cupolaClearsItemRecord(plan: CupolaPlan, item: FurnitureItem): boolean {
+  const box = itemAabb(item);
+  const gen = FURNITURE_DEFS[item.kind].obstacleBoxes;
+  const featureBoxes = !box && gen ? gen(item, FURNITURE) : [];
+  return cupolaClearsItem(plan, item.kind, item.pos, item.rot, box, featureBoxes);
 }
 
 /** True when a door on `wall` at `lateral` leaves the cupola alone: always on
@@ -853,14 +867,16 @@ export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
     return { ok: false, reason: `move ${doorDisplayName(intruder.id)} away from the ${wall} end first` };
   }
   for (const item of FURNITURE) {
-    if (!cupolaClearsItem(plan, item.kind, item.pos, item.rot, itemAabb(item))) {
+    if (!cupolaClearsItemRecord(plan, item)) {
       return { ok: false, reason: `move ${item.id} away from the ${wall} end first` };
     }
   }
   // 5. …nor a hull window reaching into the taper (the strips end there).
   const [lo, hi] = cupolaStripRun(plan, plan.profile.longHalf);
   for (const rec of readAllWindowLayout().values()) {
-    if (rec.along - rec.w / 2 < lo - 1e-6 || rec.along + rec.w / 2 > hi + 1e-6) {
+    // The same 0.05 m end inset the hull and the editor keep (clampOpening,
+    // clampWindowAlong), so a window that passes renders where it is stored.
+    if (rec.along - rec.w / 2 < lo + WINDOW_END_INSET - 1e-6 || rec.along + rec.w / 2 > hi - WINDOW_END_INSET + 1e-6) {
       return { ok: false, reason: `move the window near the ${wall} end first` };
     }
   }
