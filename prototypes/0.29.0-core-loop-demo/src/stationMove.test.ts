@@ -9,17 +9,23 @@ import {
   bindPlanetSummaryDoc,
   cleanStationSummary,
   mergeStation,
+  foldOwnStation,
   summaryForStation,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import { planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
 import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
-import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeOrbitTrim } from './stationKeeping';
+import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeTrimBurn } from './stationKeeping';
 import {
   TUG_ACCEL_KMS2,
   TUG_MIN_ENGINES,
+  MOVE_HORIZON_MS,
   bindStationMoveDoc,
+  cancelTowLeftBehind,
+  isPlausibleMove,
+  compareMoves,
+  dockLockedByMove,
   cleanMove,
   freeSlotAround,
   isTowing,
@@ -179,6 +185,22 @@ describe('the station list follows a move', () => {
     expect(planRecordHop(home, other, justBefore)).toBeNull();
   });
 
+  it('lets a ship leave a station that only moves after the ship has left', () => {
+    const other: StationRecord = { id: 'yard', name: 'YARD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'y' };
+    const early = moveTo().departAt - 10 * 3_600_000;
+    const hop = planRecordHop({ ...DEFAULT_STATION_RECORD }, other, early)!;
+    expect(hop).not.toBeNull();
+    // The source leaves after the burn (still inside the flight): fine.
+    const later: StationMove = { ...moveTo(), departAt: hop.departAt + 1, arriveAt: hop.departAt + 3_600_000 };
+    expect(planRecordHop({ ...DEFAULT_STATION_RECORD, move: later }, other, early)).not.toBeNull();
+    // The source is still on its way to its new orbit at the burn: refused.
+    const landing: StationMove = { ...later, departAt: early - 1000, arriveAt: hop.departAt - 1 };
+    expect(planRecordHop({ ...DEFAULT_STATION_RECORD, move: landing }, other, early)).toBeNull();
+    // The destination leaves before the ship arrives: refused.
+    expect(planRecordHop({ ...DEFAULT_STATION_RECORD }, { ...other, move: { ...later, stationId: 'yard', welcomeRoomId: 'y' } }, early))
+      .toBeNull();
+  });
+
   it('keeps a station listed when its move lands on a full planet', () => {
     const move = moveTo();
     setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
@@ -192,6 +214,78 @@ describe('the station list follows a move', () => {
     const list = listStations({}, [...full, moved], move.arriveAt + 1);
     expect(list.filter((s) => s.planetId === ARIS)).toHaveLength(16);
     expect(list.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
+  });
+
+  it('keeps every incumbent when the first-listed station arrives at a full planet, for good', () => {
+    const move = moveTo();
+    // Sixteen stations at Aris; the last one leaves for Sovereign after the
+    // default station has arrived (and is back before now).
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    const leaves: StationMove = {
+      ...move, stationId: 'aris-15', welcomeRoomId: 'a15', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 6,
+      departAt: move.arriveAt + 1000, arriveAt: move.arriveAt + 2000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? leaves : null));
+    const atArrival = listStations({}, full, move.arriveAt + 1);
+    expect(atArrival.filter((s) => s.planetId === ARIS).map((s) => s.id)).toEqual(full.map((r) => r.id));
+    expect(atArrival.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    // Aris now has a free slot, and the default station still stays home: it
+    // bounced when it arrived, and a vacancy later never pulls it across.
+    const later = listStations({}, full, leaves.arriveAt + 1);
+    expect(later.filter((s) => s.planetId === ARIS)).toHaveLength(15);
+    expect(later.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+
+    // A second arrival after the vacancy finds room: the bounced station
+    // counts where it settled (home), not where it was headed.
+    const second: StationMove = {
+      ...move, stationId: 'late', welcomeRoomId: 'late', fromSlot: 9, departAt: leaves.arriveAt + 10, arriveAt: leaves.arriveAt + 20,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move
+      : st.welcomeRoomId === 'a15' ? leaves : st.welcomeRoomId === 'late' ? second : null));
+    const lateRec: StationRecord = { id: 'late', name: 'LATE', planetId: SOV, orbitSlot: 9, welcomeRoomId: 'late' };
+    const withSecond = listStations({}, [...full, lateRec], second.arriveAt + 1);
+    expect(withSecond.find((s) => s.id === 'late')).toMatchObject({ planetId: ARIS });
+    expect(withSecond.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
+  });
+
+  it('keeps a bounced arrival bounced when a station it counted turns out to have left', () => {
+    const move = moveTo();
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    expect(listStations({}, full, move.arriveAt + 1).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV });
+    // Later this install learns one of the sixteen had left before the
+    // default station arrived: the bounce this install saw still stands.
+    const left: StationMove = {
+      ...move, stationId: 'aris-15', welcomeRoomId: 'a15', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 6,
+      departAt: move.departAt, arriveAt: move.arriveAt - 1000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? left : null));
+    expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV });
+  });
+
+  it('never lets an unknown planet id share a slot with the planet it reads as', () => {
+    const odd: StationMove = { ...moveTo(), stationId: 'odd', welcomeRoomId: 'o', toPlanetId: 'planet-unknown', toSlot: 0 };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'o' ? odd : null));
+    const rec: StationRecord = { id: 'odd', name: 'ODD', planetId: ARIS, orbitSlot: 3, welcomeRoomId: 'o' };
+    const list = listStations({}, [rec], odd.arriveAt + 1);
+    const taken = list.filter((s) => s.planetId === SOV).map((s) => s.orbitSlot);
+    expect(new Set(taken).size).toBe(taken.length);
+    expect(list.find((s) => s.id === 'odd')).toMatchObject({ planetId: SOV });
+  });
+
+  it('holds every dock of a station between planets, and only then', () => {
+    const move = moveTo();
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    const room = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const mid = (move.departAt + move.arriveAt) / 2;
+    expect(dockLockedByMove([room], move.departAt - 1)).toBe(false);
+    expect(dockLockedByMove(['ship-room', room], mid)).toBe(true);
+    expect(dockLockedByMove(['ship-room'], mid)).toBe(false);
+    expect(dockLockedByMove([room], move.arriveAt)).toBe(false);
   });
 });
 
@@ -214,6 +308,18 @@ describe('the record in the room doc and on this install', () => {
     const move = moveTo();
     for (let i = 0; i < 64; i++) rememberMove({ ...move, stationId: `s${i}`, welcomeRoomId: `w${i}` });
     expect(readRememberedMoves()).toHaveLength(64);
+  });
+
+  it('refuses a move leaving or lasting past the horizon, wherever it comes from', () => {
+    const move = moveTo();
+    const far = { ...move, departAt: NOW + MOVE_HORIZON_MS + 1, arriveAt: NOW + MOVE_HORIZON_MS + 2 };
+    expect(isPlausibleMove(move, NOW)).toBe(true);
+    expect(isPlausibleMove(far, NOW)).toBe(false);
+    expect(isPlausibleMove({ ...move, arriveAt: move.departAt + MOVE_HORIZON_MS + 1 }, NOW)).toBe(false);
+    expect(rememberMove(far, NOW)).toBe(false);
+    expect(readRememberedMoves()).toEqual([]);
+    const summary = cleanStationSummary({ ...summaryForStation(ctx().station!, null, NOW), move: far }, NOW);
+    expect(summary?.move).toBeUndefined();
   });
 
   it('remembers a move a peer wrote into the room', () => {
@@ -243,8 +349,8 @@ describe('the record in the room doc and on this install', () => {
     writeFuelLevel(9_000, 10_000);
     const move = moveTo();
     writeStationMove(move);
-    expect(readMoveFuelDrawn()).toBe(move.fuelDrawn);
-    expect(readFuelLevel()).toBe(9_000 - move.fuelDrawn);
+    expect(readMoveFuelDrawn()).toBe(move.fuel);
+    expect(readFuelLevel()).toBe(9_000 - move.fuel);
   });
 
   it('a trim burn and a move started at once from two tabs both pay, whichever tab Yjs favours', () => {
@@ -265,12 +371,12 @@ describe('the record in the room doc and on this install', () => {
       const c = ctx();
       const trim = planTrim({
         bolted: true, station: c.station, trim: readOrbitTrim(), commander: true, engines: 1,
-        fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: NOW,
+        fuel: readFuelLevel(), now: NOW,
       }, 'raise');
       if (!trim.ok) throw new Error(trim.refusal);
-      writeOrbitTrim(trim.trim);
+      writeTrimBurn(trim.burn);
       bind(b);
-      const plan = planStationMove(ctx({ fuel: readFuelLevel(), drawn: readMoveFuelDrawn(), deficit: fuelDrawDeficit() }), ARIS);
+      const plan = planStationMove(ctx({ fuel: readFuelLevel(), drawn: readMoveFuelDrawn(), deficit: fuelDrawDeficit('stationMove') }), ARIS);
       if (!plan.ok) throw new Error(plan.refusal);
       writeStationMove(plan.move);
 
@@ -320,6 +426,11 @@ describe('moves between installs', () => {
     const later = { ...move, departAt: move.departAt + 1000, arriveAt: move.arriveAt + 1000 };
     expect(mergeStation(summary, { ...summary, move: later })?.move).toEqual(later);
     expect(mergeStation({ ...summary, move: later }, summary)).toBeNull();
+    // Two moves leaving the same millisecond: one winner, whatever the order.
+    const twin = { ...move, toSlot: move.toSlot + 1 };
+    const winner = compareMoves(twin, move) > 0 ? twin : move;
+    expect(mergeStation({ ...summary, move }, { ...summary, move: twin })?.move ?? move).toEqual(winner);
+    expect(mergeStation({ ...summary, move: twin }, { ...summary, move })?.move ?? twin).toEqual(winner);
 
     // A second install pulls the summary from a room doc and learns the move.
     store.clear();
@@ -327,6 +438,28 @@ describe('moves between installs', () => {
     doc.getMap('stationSummaries').set('yard-lobby', summary);
     bindPlanetSummaryDoc(doc, { currentStation: () => null, localTrim: () => null, ship: () => null });
     expect(readRememberedMoves()).toEqual([move]);
+  });
+
+  it('carries a derived station\'s move although its first record stands', () => {
+    const move = yardMove();
+    const known = { ...summaryForStation(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!, null, NOW - 60_000) };
+    delete (known as { ownerId?: string }).ownerId;
+    const later = { ...known, updatedAt: NOW, orbitSlot: known.orbitSlot + 1, move };
+    const next = mergeStation(known, later)!;
+    expect(next.orbitSlot).toBe(known.orbitSlot);
+    expect(next.updatedAt).toBe(known.updatedAt);
+    expect(next.move).toEqual(move);
+  });
+
+  it('freshens the summary\'s stamp when a move goes out, so the caps keep it', () => {
+    const station = listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!;
+    const known = summaryForStation(station, null, NOW - 60_000);
+    const move = yardMove();
+    rememberMove(move);
+    const moving = listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!;
+    const next = foldOwnStation(known, moving, null, NOW);
+    expect(next?.move).toEqual(move);
+    expect(next!.updatedAt).toBeGreaterThan(known.updatedAt);
   });
 });
 
@@ -412,6 +545,80 @@ describe('tugs: a torch tow', () => {
     expect(isTowing('tug-room', NOW + 1)).toBe(true);
     expect(isTowing('other-room', NOW + 1)).toBe(false);
     expect(isTowing('tug-room', plan.move.arriveAt)).toBe(false);
+  });
+
+  it('two moves written at once both land, and only the one that flies is paid for, everywhere', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b = { ...a, toSlot: a.toSlot + 1, fuel: a.fuel + 5 };
+    const winner = compareMoves(a, b) > 0 ? a : b;
+    const loser = winner === a ? b : a;
+    const d1 = new Y.Doc();
+    const d2 = new Y.Doc();
+    d1.clientID = 1; d2.clientID = 2;
+    bindStationMoveDoc(d1);
+    writeStationMove(a);
+    bindStationMoveDoc(d2);
+    writeStationMove(b);
+    // Offline tabs meet.
+    Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+    Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+    for (const d of [d1, d2]) {
+      store.clear();
+      bindStationMoveDoc(d);
+      expect(readStationMove()).toEqual(winner);
+      expect(readMoveFuelDrawn()).toBe(winner.fuel);
+      expect(isTowing('tug-room', NOW + 1)).toBe(true);
+      expect(readRememberedMoves()).toEqual([winner]);
+    }
+    // A room holding only the loser (another room's doc wrote the winner)
+    // neither tows nor pays once the winner is known here.
+    store.clear();
+    rememberMove(winner);
+    const d3 = new Y.Doc();
+    bindStationMoveDoc(d3);
+    writeStationMove(loser);
+    expect(readStationMove()).toBeNull();
+    expect(readMoveFuelDrawn()).toBe(0);
+  });
+
+  it('charges one move written twice (two tabs, one millisecond) once', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const d1 = new Y.Doc();
+    const d2 = new Y.Doc();
+    d1.clientID = 1; d2.clientID = 2;
+    bindStationMoveDoc(d1);
+    writeStationMove(plan.move);
+    bindStationMoveDoc(d2);
+    writeStationMove(plan.move);
+    Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+    bindStationMoveDoc(d1);
+    expect(readMoveFuelDrawn()).toBe(plan.move.fuel);
+  });
+
+  it('cancels a tow whose tug flew off on a DEPART written at the same time', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    // Still docked: the tow stands.
+    expect(cancelTowLeftBehind('tug-room', 'docked', NOW + 1)).toBe(false);
+    expect(isTowing('tug-room', NOW + 1)).toBe(true);
+    // The tug is flying: the tow is cancelled, not flown, held or paid for.
+    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 1)).toBe(true);
+    expect(isTowing('tug-room', NOW + 2)).toBe(false);
+    expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
+    expect(readMoveFuelDrawn()).toBe(0);
+    const cancel = readStationMove()!;
+    expect(cancel).toMatchObject({ mode: 'thrusters', toPlanetId: SOV, toSlot: plan.move.fromSlot, fuel: 0 });
+    expect(isStationMove(cancel)).toBe(true);
+    setStationMoveResolver(() => cancel);
+    expect(listStations({}, [], NOW + 10).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: SOV, orbitSlot: plan.move.fromSlot });
+    // Once is enough.
+    expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 3)).toBe(false);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {

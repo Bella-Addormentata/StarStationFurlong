@@ -27,16 +27,18 @@
  * `from` is where the last one arrived). Only the latest move per station is
  * kept.
  *
- * Storage: the `stationKeeping` map in the HELM ROOM's doc (key 'move'),
- * beside the trim record — shared by everyone in the room. Station records are
+ * Storage: the `stationKeeping` map in the HELM ROOM's doc, one entry per
+ * move (`move:<clientID>:<departAt>`, beside the trim burns) — shared by
+ * everyone in the room. Two moves written at once both land; compareMoves
+ * picks the one that flies, the same everywhere, and only its fuel is drawn. Station records are
  * still kept per install, so each install also REMEMBERS every move it has
  * seen (localStorage), keyed by station id: the station stays moved when you
  * walk to another room — and the per-planet summary (planetSummary.ts)
  * carries each station's latest move to every install around the planet.
  *
- * Fuel rides the tank's draw meters, like a trim burn: the record carries the
- * running total moves have drawn in this room, and binding the doc registers
- * it as the 'stationMove' meter (shipDoc.setFuelDrawMeter). The tank adds it
+ * Fuel rides the tank's draw meters, like a trim burn: each entry carries its
+ * own fuel, and binding the doc registers their sum (the moves that fly) as
+ * the 'stationMove' meter (shipDoc.setFuelDrawMeter). The tank adds it
  * to the trim's, so a trim burn and a move started at once from two tabs
  * both pay.
  *
@@ -51,7 +53,7 @@ import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { interplanetaryPointAt, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
-import { MAX_ORBIT_SLOTS, PLANETS, moveBelongsTo, planetById, setStationMoveResolver } from './stations';
+import { MAX_ORBIT_SLOTS, PLANETS, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit } from './stations';
 import type { MovingStation, StationMove, StationRecord } from './stations';
 
 export type { StationMove } from './stations';
@@ -82,6 +84,32 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
+}
+
+/** How far ahead a real move can be: the longest wait for a launch window
+ *  (4.3 real days between Sovereign and Aris) and the longest trip (about
+ *  two real days) each fit well inside it. */
+export const MOVE_HORIZON_MS = 7 * 24 * 3_600_000;
+
+/**
+ * Could this move have been planned by a helm at or before `nowMs`? The
+ * latest departure wins every merge, so a peer's move leaving decades from
+ * now would otherwise hold its station "moving" forever. Anything leaving
+ * past the horizon, or taking longer than it, is refused wherever a move
+ * arrives from outside (room doc, remembered list, planet summary).
+ */
+export function isPlausibleMove(m: StationMove, nowMs: number = Date.now()): boolean {
+  return m.departAt <= nowMs + MOVE_HORIZON_MS && m.arriveAt - m.departAt <= MOVE_HORIZON_MS;
+}
+
+/** One total order on a station's moves, the same on every client: the
+ *  later departure wins, and two leaving the same millisecond are told apart
+ *  by their serialized records. Positive when `a` wins. */
+export function compareMoves(a: StationMove, b: StationMove): number {
+  if (a.departAt !== b.departAt) return a.departAt - b.departAt;
+  const sa = JSON.stringify(cleanMove(a));
+  const sb = JSON.stringify(cleanMove(b));
+  return sa === sb ? 0 : sa > sb ? 1 : -1;
 }
 
 /** Only the fields a move has — what a write publishes. */
@@ -429,6 +457,20 @@ export function isTowing(roomId: string, realMs: number): boolean {
   return !!move && move.mode === 'tug' && move.tugRoomId === roomId && isMoveActive(move, realMs);
 }
 
+/** Does a move hold this dock still? A tug's tow under way (either end), or
+ *  either end belonging to a station between planets: every ship docked to
+ *  it rides along, and none may leave or join it until it arrives. Before a
+ *  thruster move leaves, and after any move arrives, docks work as usual. */
+export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
+  if (towHoldsDock(roomIds, realMs)) return true;
+  return roomIds.some((id) => {
+    if (!id) return false;
+    const station = stationForRoom(id);
+    const move = station ? latestMoveOf(station) : null;
+    return !!move && stationInTransit({ move }, realMs);
+  });
+}
+
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
  *  by the bound room's record or any move this install remembers? Its dock
  *  holds the station, so neither end may UNDOCK it — from the tug's docking
@@ -439,6 +481,34 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
   const bound = readStationMove();
   return [...(bound ? [bound] : []), ...readRememberedMoves()].some((m) =>
     m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
+}
+
+/**
+ * A tug that left its station behind: a DEPART written at the same moment
+ * as a TOW (another tab, or one offline) flies the tug away while the tow
+ * still says it is the station's engine. Whichever tab sees the two together
+ * cancels the tow with a move that leaves the station where it was, one
+ * millisecond after the tow: it wins the one order everywhere, so the tow is
+ * never flown, held or paid for. Returns whether it wrote a cancel.
+ */
+export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs: number): boolean {
+  if (flightStatus === 'docked') return false;
+  const tow = readStationMove();
+  if (!tow || tow.mode !== 'tug' || tow.tugRoomId !== roomId || !isMoveActive(tow, realMs)) return false;
+  const departAt = tow.departAt + 1;
+  return writeStationMove({
+    stationId: tow.stationId,
+    welcomeRoomId: tow.welcomeRoomId,
+    fromPlanetId: tow.fromPlanetId,
+    fromSlot: tow.fromSlot,
+    toPlanetId: tow.fromPlanetId,
+    toSlot: tow.fromSlot,
+    departAt,
+    arriveAt: departAt + 1,
+    mode: 'thrusters',
+    fuel: 0,
+    fuelDrawn: 0,
+  });
 }
 
 // ── What the dashboard says ──────────────────────────────────────────────────
@@ -496,7 +566,8 @@ export function readRememberedMoves(): StationMove[] {
     if (!raw) return [];
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    return arr.filter(isStationMove).slice(0, MAX_REMEMBERED).map(cleanMove);
+    const now = Date.now();
+    return arr.filter((m): m is StationMove => isStationMove(m) && isPlausibleMove(m, now)).slice(0, MAX_REMEMBERED).map(cleanMove);
   } catch { return []; }
 }
 
@@ -508,14 +579,13 @@ function sameStation(a: StationMove, b: StationMove): boolean {
 /** Remember a move this install has seen — from the helm room, or from the
  *  per-planet summary. A later departure for the same station replaces an
  *  earlier one; an older one is ignored. Returns whether the list changed. */
-export function rememberMove(move: StationMove): boolean {
-  if (!isStationMove(move)) return false;
+export function rememberMove(move: StationMove, nowMs: number = Date.now()): boolean {
+  if (!isStationMove(move) || !isPlausibleMove(move, nowMs)) return false;
   const list = readRememberedMoves();
   const at = list.findIndex((m) => sameStation(m, move));
   if (at >= 0) {
     const old = list[at];
-    if (old.departAt > move.departAt) return false;
-    if (JSON.stringify(old) === JSON.stringify(cleanMove(move))) return false;
+    if (compareMoves(move, old) <= 0) return false;
     list[at] = cleanMove(move);
   } else {
     list.push(cleanMove(move));
@@ -559,17 +629,77 @@ function docAlive(): boolean {
   return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && keepMap !== null;
 }
 
-/** The room's move record, or null (none, unbound, or malformed). */
-export function readStationMove(): StationMove | null {
-  if (!docAlive()) return null;
-  const raw = keepMap!.get('move');
-  return isStationMove(raw) ? cleanMove(raw) : null;
+/** Prefix of a move's own entry in the room's 'stationKeeping' map: one
+ *  entry per move written (`move:<clientID>:<departAt>`), never rewritten,
+ *  so two moves written at once from two tabs (or an offline one) both land
+ *  and one order decides between them everywhere. */
+const ENTRY_PREFIX = 'move:';
+
+/** The key moves were kept under before entries: one Yjs-arbitrated record
+ *  whose fuelDrawn was the room's running total. Still read, never written. */
+const LEGACY_KEY = 'move';
+
+function validMove(raw: unknown): StationMove | null {
+  return isStationMove(raw) && isPlausibleMove(raw) ? cleanMove(raw) : null;
 }
 
-/** Fuel moves have drawn in this room, whichever station the latest one
- *  moved: the 'stationMove' draw meter. */
+/** Every move this room's doc holds: its entries, and a legacy record. */
+function roomMoves(): { entries: StationMove[]; legacy: StationMove | null } {
+  if (!docAlive()) return { entries: [], legacy: null };
+  const entries: StationMove[] = [];
+  keepMap!.forEach((v, k) => {
+    if (!k.startsWith(ENTRY_PREFIX)) return;
+    const m = validMove(v);
+    if (m) entries.push(m);
+  });
+  return { entries, legacy: validMove(keepMap!.get(LEGACY_KEY)) };
+}
+
+/** Did a concurrent move of the same station win over this one? Another
+ *  move that wins the one order (compareMoves) and left before this one
+ *  arrived — a move is only planned once the last has arrived, so an
+ *  overlap means the two were written at once. The loser never flies: it
+ *  holds no tug, and its fuel is not drawn. */
+function superseded(m: StationMove, known: StationMove[]): boolean {
+  return known.some((o) => sameStation(o, m) && compareMoves(o, m) > 0 && o.departAt <= m.arriveAt);
+}
+
+/** Every move known here, for deciding winners: the room's own, and every
+ *  move this install remembers (another room's doc may hold the winner). */
+function knownMoves(own: StationMove[]): StationMove[] {
+  return [...own, ...readRememberedMoves()];
+}
+
+/** The room's latest move that is not beaten by a concurrent one, or null
+ *  (none, unbound, or malformed). */
+export function readStationMove(): StationMove | null {
+  const { entries, legacy } = roomMoves();
+  const own = legacy ? [legacy, ...entries] : entries;
+  const known = knownMoves(own);
+  let best: StationMove | null = null;
+  for (const m of own) {
+    if (superseded(m, known)) continue;
+    if (!best || compareMoves(m, best) > 0) best = m;
+  }
+  return best;
+}
+
+/** Fuel moves have drawn in this room: the 'stationMove' draw meter — the
+ *  legacy record's running total, plus each entry's own fuel unless a
+ *  concurrent move beat it. */
 export function readMoveFuelDrawn(): number {
-  return readStationMove()?.fuelDrawn ?? 0;
+  const { entries, legacy } = roomMoves();
+  const known = knownMoves(legacy ? [legacy, ...entries] : entries);
+  let drawn = legacy?.fuelDrawn ?? 0;
+  // The same move written twice (two tabs, one millisecond) is one move.
+  const seen = new Set<string>();
+  for (const m of entries) {
+    const key = JSON.stringify(m);
+    if (seen.has(key) || superseded(m, known)) continue;
+    seen.add(key);
+    drawn += m.fuel;
+  }
+  return drawn;
 }
 
 /** Bind the room doc — beside bindStationKeepingDoc. Every move the room
@@ -581,8 +711,10 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
   const map = doc.getMap('stationKeeping');
   keepMap = map;
   const onChange = () => {
-    const move = readStationMove();
-    if (move) rememberMove(move);
+    // Remember every move the room holds; the remembered list keeps each
+    // station's winner.
+    const { entries, legacy } = roomMoves();
+    for (const m of legacy ? [legacy, ...entries] : entries) rememberMove(m);
     notify();
   };
   map.observe(onChange);
@@ -605,7 +737,7 @@ export function writeStationMove(move: StationMove): boolean {
     return false;
   }
   boundDoc!.transact(() => {
-    keepMap!.set('move', clean);
+    keepMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}`, clean);
   });
   rememberMove(clean);
   return true;

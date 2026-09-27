@@ -286,8 +286,8 @@ describe('the per-planet summary', () => {
   });
 
   it('takes the newer gate list apart from the record', () => {
-    const older = base({ name: 'NEW', updatedAt: T0 + 5, berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0 });
-    const newer = base({ berths: [{ roomId: 'room-b', doorId: 'east', gate: 3 }], berthsAt: T0 + 9 });
+    const older = base({ name: 'NEW', ownerId: 'hub', updatedAt: T0 + 5, berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0 });
+    const newer = base({ ownerId: 'hub', berths: [{ roomId: 'room-b', doorId: 'east', gate: 3 }], berthsAt: T0 + 9 });
     const merged = mergeStation(older, newer)!;
     expect(merged.name).toBe('NEW');
     expect(merged.berths).toEqual([{ roomId: 'room-b', doorId: 'east', gate: 3 }]);

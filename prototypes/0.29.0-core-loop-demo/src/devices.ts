@@ -199,6 +199,7 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1025,6 +1026,10 @@ let mapTableMap: SolarSystemMap | null = null;
  */
 export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
   let panel: HTMLDivElement | null = null;
+  // 🚚 While the table is open, stations follow what is learned meanwhile (a
+  // move from another player, a summary pull), and a move's "departs in …"
+  // text is re-read each minute.
+  let stopLive: (() => void) | null = null;
 
   return {
     mount(host: HTMLElement): void {
@@ -1086,9 +1091,16 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
       mapTableMap.show();
+      stopLive?.();
+      const refresh = () => mapTableMap?.refreshStations(undefined, holotableStation());
+      const offSummary = subscribePlanetSummary(refresh);
+      const offMove = subscribeStationMove(refresh);
+      const tick = window.setInterval(refresh, 60_000);
+      stopLive = () => { offSummary(); offMove(); window.clearInterval(tick); stopLive = null; };
     },
 
     unmount(): void {
+      stopLive?.();
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -2153,7 +2165,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'berths-taken'
-      ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, out of reach, or not open to this ship). Dock from a door panel when one frees up, or ask the station's owner for a grant at a gate that admits only granted captains.`
+      ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, closed, out of reach, not open to this ship, or no rights or room at the port). Check the dock port's panel, dock from it when that clears, or ask the station's owner for a grant at a gate that admits only granted captains.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
       : outcome.reason === 'in-transit'
@@ -2193,6 +2205,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let markers: Array<{ doorId: string; x: number; y: number }> = [];
   let pickerDestId: string | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let wasTowing = false;
   // Refuel confirm-arm — one click primes, second confirms. Cleared by any
   // record change (a peer refuel resets everyone's arm).
   let refuelArmed = false;
@@ -2511,6 +2524,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         destinationId: dest.id,
         departedAt: nowHop.departAt,
         etaAt: nowHop.arriveAt,
+        // A whole ms, no later than the burn (flight times are whole ms).
+        castOffAt: Math.floor(Math.min(Date.now(), nowHop.departAt)),
       });
       if (!departed) { render(); return; }
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
@@ -2701,7 +2716,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const towContext = (engines: number, fuel: number, commander: boolean, now: number): TowContext => {
     const stations = listStationRecordsNow();
     const hereId = stationHere();
-    const station = hereId ? stations.find((st) => st.id === hereId) ?? null : null;
+    // Only a free ship tows: a module bolted on by a gangway is part of a
+    // station (whose helm shows this face on its FUEL & DOCKING tab), and a
+    // station never tows another.
+    const bolted = (docking?.connected() ?? []).some((m) => !m.dock);
+    const station = hereId && !bolted ? stations.find((st) => st.id === hereId) ?? null : null;
     return {
       station,
       stations,
@@ -2710,7 +2729,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       engines,
       fuel,
       drawn: readMoveFuelDrawn(),
-      deficit: fuelDrawDeficit(),
+      deficit: fuelDrawDeficit('stationMove'),
       modules: station?.welcomeRoomId ? Math.max(1, atlasComponent(readStationAtlas(), station.welcomeRoomId).size) : 1,
       now,
     };
@@ -2766,7 +2785,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const now = Date.now();
     const plan = planStationTow(towContext(countFunction('engine'), fuel, helmIsCommander(), now), planetId);
     if (!plan.ok) {
-      towFlash = { text: describeTowRefusal(plan.refusal, plan.quote, fuel), until: now + 5_000 };
+      const flash = { text: describeTowRefusal(plan.refusal, plan.quote, fuel), until: now + 5_000 };
+      towFlash = flash;
+      // Nothing else re-renders a docked ship, so the note clears itself.
+      setTimeout(() => {
+        if (towFlash !== flash) return;
+        towFlash = null;
+        if (panel) render();
+      }, 5_050);
     } else if (readFlightRecord().status === 'docked') {
       towFlash = null;
       writeStationMove(plan.move);
@@ -2821,7 +2847,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
-      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt });
     }
     if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };
@@ -2856,7 +2882,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();
-        if (readFlightRecord().status === 'in-flight') render();
+        // A tow ends on the clock, not on a write: keep ticking while this
+        // tug tows, and once more as it arrives (DEPART and UNDOCK return).
+        const towing = isTowing(currentRoomId(), Date.now());
+        if (readFlightRecord().status === 'in-flight' || towing || wasTowing) render();
+        wasTowing = towing;
       }, HELM_TICK_MS);
       render();
     },

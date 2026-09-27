@@ -115,7 +115,7 @@ import {
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
-import { towHoldsDock } from "./stationMove";
+import { dockLockedByMove } from "./stationMove";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2802,11 +2802,12 @@ export class DoorDockingPortSystem {
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
-    // 🚚 A tug under way holds its station by this dock: neither end lets go
-    // until the tow arrives.
-    if (towHoldsDock([roomId, port.roomId], Date.now())) {
+    // 🚚 A tug under way holds its station by this dock, and a station
+    // between planets carries every ship docked to it: neither end lets go
+    // until it arrives.
+    if (dockLockedByMove([roomId, port.roomId], Date.now())) {
       this.setDockOp(doorId, {
-        note: "A tow is under way on this dock — it can't undock until the station arrives.",
+        note: "This station is moving between planets — the dock holds until it arrives.",
         tone: "bad",
       });
       return false;
@@ -2885,6 +2886,14 @@ export class DoorDockingPortSystem {
     if (!flightGate.ok) {
       this.setDockOp(doorId, {
         note: `This module is ${flightGate.status.toUpperCase()} — it docks when it arrives.`,
+        tone: "bad",
+      });
+      return false;
+    }
+    // 🚚 No ship joins (or rejoins) a station between planets.
+    if (dockLockedByMove([roomId, port.roomId], Date.now())) {
+      this.setDockOp(doorId, {
+        note: "That station is moving between planets — dock when it arrives.",
         tone: "bad",
       });
       return false;
@@ -3759,6 +3768,11 @@ export class DoorDockingPortSystem {
           `[docking] refused ACCEPTED pairing on ${doorId} — ship is ${flightGate.status} (SH3 gate)`,
         );
         return; // leave pairingPending alone; the request is not consumed
+      }
+      // 🚚 Nor while this room's station is between planets (stationMove.ts).
+      if (dockLockedByMove([this.roomNow()], Date.now())) {
+        console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — station in transit`);
+        return;
       }
     }
 

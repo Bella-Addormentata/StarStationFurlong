@@ -152,7 +152,12 @@ export function planPlanetTransfer(
   const leadNow = wrapAngle(sunAngleAt(o2, nowMs) - sunAngleAt(o1, nowMs));
   const drift = o2.meanMotion - o1.meanMotion;
   const turn = drift > 0 ? wrapAngle(neededLead - leadNow) : wrapAngle(leadNow - neededLead);
-  const waitMs = realMsFor(turn / Math.abs(drift));
+  const synodicMs = realMsFor(TAU / Math.abs(drift));
+  let waitMs = realMsFor(turn / Math.abs(drift));
+  // Asked at a window's own instant, rounding can put the window a hair
+  // behind `nowMs`, and the wrapped turn becomes a full synodic period:
+  // snap that (and a hair ahead) to "leave now".
+  if (waitMs <= 0.1 || synodicMs - waitMs <= 0.1) waitMs = 0;
   const transferMs = realMsFor(tH);
   const departAt = nowMs + waitMs;
   return {
@@ -164,7 +169,7 @@ export function planPlanetTransfer(
     arriveAt: departAt + transferMs,
     waitMs,
     transferMs,
-    synodicMs: realMsFor(TAU / Math.abs(drift)),
+    synodicMs,
     vInfDepartKmS: vInfDepart,
     vInfArriveKmS: vInfArrive,
     deltaVKmS: dv,

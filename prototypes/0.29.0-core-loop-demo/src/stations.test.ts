@@ -4,7 +4,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { AtlasEntry } from './stationAtlas';
-import { atlasComponent, atlasComponents } from './stationAtlas';
+import { atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
 import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
@@ -153,6 +153,19 @@ describe('atlas components', () => {
     expect(atlasComponents(atlas)).toHaveLength(1);
   });
 
+  it('pairs an unnamed berth flagged at both ends with itself, not with a gangway beside it', () => {
+    const atlas = atlasOf(room('a1'), room('ship'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', transient: true };
+    atlas.ship.doors['d:dock'] = { targetSeed: '', targetRoomId: 'a1', transient: true };
+    // A permanent gangway between the same rooms; no record names its far door.
+    atlas.a1.doors['d:tube'] = { targetSeed: '', targetRoomId: 'ship' };
+    atlas.ship.doors['d:hatch'] = { targetSeed: '', targetRoomId: 'a1' };
+    const berths = berthDoorIds(atlas);
+    expect([...(berths.get('a1') ?? [])]).toEqual(['d:berth']);
+    expect([...(berths.get('ship') ?? [])]).toEqual(['d:dock']);
+    expect(atlasComponents(atlas)).toHaveLength(1);
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });
@@ -187,6 +200,41 @@ describe('listStations', () => {
     expect(stations.map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'aris-forge']);
     expect(stationsAroundPlanet('planet-aris', stations).map((s) => s.id)).toEqual(['aris-forge']);
     expect(stationForRoom('yard-a', twoStations(), stations)?.id).toBe('aris-forge');
+  });
+
+  it('settles a slot clash the same way on every install, whatever order it saved its records in', () => {
+    // Two installs, each with its own station first and the other's learned
+    // record second, both wanting slot 1.
+    const want1 = (id: string, welcomeRoomId: string): StationRecord =>
+      ({ id, name: id.toUpperCase(), planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId });
+    const slots = (records: StationRecord[]) =>
+      Object.fromEntries(listStations({}, records).map((st) => [st.welcomeRoomId, st.orbitSlot]));
+    const onA = slots([want1('home', 'room-a'), want1('shared:room-b', 'room-b')]);
+    const onB = slots([want1('home', 'room-b'), want1('shared:room-a', 'room-a')]);
+    expect(onA).toEqual({ [WELCOME]: 0, 'room-a': 1, 'room-b': 2 });
+    expect(onB).toEqual(onA);
+    // The list itself keeps record order.
+    expect(listStations({}, [want1('b', 'room-b'), want1('a', 'room-a')]).map((st) => st.id))
+      .toEqual([DEFAULT_STATION_ID, 'b', 'a']);
+  });
+
+  it('moves only the station that lost a slot clash', () => {
+    const at = (room: string, orbitSlot: number): StationRecord =>
+      ({ id: room, name: room.toUpperCase(), planetId: DEFAULT_PLANET_ID, orbitSlot, welcomeRoomId: room });
+    // room-b and room-c hold the slots they want; room-a then wants room-b's
+    // and wins it. room-b moves on past room-c, which stays put.
+    const stations = listStations({}, [at('room-b', 1), at('room-c', 2), at('room-a', 1)]);
+    expect(stations.map((st) => [st.id, st.orbitSlot]))
+      .toEqual([[DEFAULT_STATION_ID, 0], ['room-b', 3], ['room-c', 2], ['room-a', 1]]);
+  });
+
+  it('lists a record naming an unknown planet at the default planet, in a slot free there', () => {
+    const lost: StationRecord = {
+      id: 'lost', name: 'LOST', planetId: 'planet-nope', orbitSlot: 0, welcomeRoomId: 'far-room',
+    };
+    const stations = listStations({}, [lost]);
+    expect(stations.find((s) => s.id === 'lost')).toMatchObject({ planetId: DEFAULT_PLANET_ID, orbitSlot: 1 });
+    expect(stationsAroundPlanet(DEFAULT_PLANET_ID, stations).map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'lost']);
   });
 
   it('lists one station per place: a record inside a listed station is dropped', () => {
@@ -321,6 +369,15 @@ describe('saved records', () => {
     expect(readStationRecords().map((r) => r.name)).toEqual(['A PRIME', 'B']);
   });
 
+  it('refuses to move a saved record into a station a later record holds', () => {
+    const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2 };
+    expect(registerStation({ ...base, id: 'x', welcomeRoomId: 'far-1' })).toBe(true);
+    expect(registerStation({ ...base, id: 'y', welcomeRoomId: 'far-2' })).toBe(true);
+    expect(registerStation({ ...base, id: 'x', welcomeRoomId: 'far-2' })).toBe(false);
+    expect(listStations({}).map((st) => [st.id, st.welcomeRoomId]))
+      .toEqual([[DEFAULT_STATION_ID, WELCOME], ['x', 'far-1'], ['y', 'far-2']]);
+  });
+
   it('refuses invalid records and shadowing the default station', () => {
     const base = { id: 'x', name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'r' };
     expect(registerStation({ ...base, id: DEFAULT_STATION_ID })).toBe(false);
@@ -343,6 +400,8 @@ describe('saved records', () => {
       expect(registerStation({ id: `s${i}`, name: `S${i}`, planetId: DEFAULT_PLANET_ID, orbitSlot: i, welcomeRoomId: `r${i}` })).toBe(true);
     }
     expect(registerStation({ id: 'full', name: 'FULL', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'rx' })).toBe(false);
+    // Nor may a record win a saved station's slot and leave it nowhere to go.
+    expect(registerStation({ id: 'rival', name: 'RIVAL', planetId: DEFAULT_PLANET_ID, orbitSlot: 5, welcomeRoomId: 'a-room' })).toBe(false);
     expect(stationsAroundPlanet(DEFAULT_PLANET_ID, listStations({}))).toHaveLength(MAX_ORBIT_SLOTS);
     // Another planet still has room.
     expect(registerStation({ id: 'aris', name: 'ARIS', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'ry' })).toBe(true);
