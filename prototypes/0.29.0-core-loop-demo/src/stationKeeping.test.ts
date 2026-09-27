@@ -121,6 +121,9 @@ function bindRoom(doc: Y.Doc): void {
 /** The bound room's log key for a burn this tab wrote. */
 const keyOf = (doc: Y.Doc, b: TrimBurn) => `burn:${doc.clientID}:${b.at}`;
 
+/** A burn as a settlement keeps it among the last that fired. */
+const firedOf = (b: TrimBurn) => ({ planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at });
+
 /** Two tabs trade everything they have. */
 function sync(a: Y.Doc, b: Y.Doc): void {
   Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
@@ -907,7 +910,12 @@ describe('level writes settle the log', () => {
     writeFuelLevel(gauge, 100);
     const settled = readFuelSettlement(SK);
     expect(isKeepingSettlement(settled)).toBe(true);
-    expect(settled).toEqual({ trim: t, fuelDrawn: 3 * TRIM_FUEL, burns: burns.map((b) => keyOf(doc, b)) });
+    expect(settled).toEqual({
+      trim: t,
+      fuelDrawn: 3 * TRIM_FUEL,
+      burns: burns.map((b) => keyOf(doc, b)),
+      fired: burns.map(firedOf),
+    });
     expect(readOrbitTrim()).toEqual(t);
     expect(readFuelLevel()).toBe(gauge);
     expect(log(doc).size).toBe(3);
@@ -1033,6 +1041,45 @@ describe('level writes settle the log', () => {
     expect(planTrim(c, 'ahead')).toEqual({ ok: false, refusal: 'burning' });
   });
 
+  it('a level write keeps the last burns on every orbit firing, not only the last one', () => {
+    const OTHER = { ...STATION, orbitSlot: 1 };
+    const a = new Y.Doc();
+    const x = new Y.Doc();
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    Y.applyUpdate(x, Y.encodeStateAsUpdate(a));
+    // This tab burns on slot 0, and a tab that places the room in slot 1
+    // burns there 100 ms later...
+    const mine = press('raise', T0);
+    bindRoom(x);
+    const plan = planTrim(ctx({ station: OTHER, trim: readOrbitTrim(), fuel: readFuelLevel(), now: T0 + 100 }), 'ahead');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(writeTrimBurn(plan.burn)).toBe(true);
+    sync(a, x);
+    // ...and a REFUEL settles both while both still fire.
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    const now = T0 + 1_000;
+    const firing = [
+      { planetId: SOV, slot: 0, dir: 'raise', at: mine.at },
+      { planetId: SOV, slot: 1, dir: 'ahead', at: plan.burn.at },
+    ];
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(a));
+    for (const doc of [a, reload]) {
+      bindRoom(doc);
+      expect(readBurnFiring(now, STATION)).toEqual(firing[0]);
+      expect(readBurnFiring(now, OTHER)).toEqual(firing[1]);
+      const c = ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), now, firing: readBurnFiring(now, STATION) });
+      expect(planTrim(c, 'raise')).toEqual({ ok: false, refusal: 'burning' });
+    }
+    // The next burn clears the settled entries; the settlement still has them.
+    bindRoom(a);
+    press('lower', mine.at + BURN_MS);
+    expect(log(a).has(keyOf(a, mine))).toBe(false);
+    expect(readBurnFiring(now, OTHER)).toEqual(firing[1]);
+  });
+
   it('ignores a hostile settlement: every burn in the log still counts', () => {
     const doc = new Y.Doc();
     bindRoom(doc);
@@ -1055,6 +1102,10 @@ describe('level writes settle the log', () => {
       { trim: null, fuelDrawn: 0, burns: [...keys, 'trim'] },
       { trim: null, fuelDrawn: 0, burns: [...keys, `burn:${'x'.repeat(100)}`] },
       { trim: null, fuelDrawn: 0, burns: [...keys, ...Array.from({ length: 2 * MAX_LOG }, (_, i) => `burn:x:${i}`)] },
+      { trim: null, fuelDrawn: 0, burns: keys, fired: 'fired' },
+      { trim: null, fuelDrawn: 0, burns: keys, fired: [{ planetId: SOV, slot: 0, dir: 'up', at: T0 }] },
+      { trim: null, fuelDrawn: 0, burns: keys, fired: [{ planetId: SOV, slot: -1, dir: 'raise', at: T0 }] },
+      { trim: null, fuelDrawn: 0, burns: keys, fired: Array.from({ length: 17 }, () => ({ planetId: SOV, slot: 0, dir: 'raise', at: T0 })) },
     ];
     for (const value of hostile) {
       expect(isKeepingSettlement(value)).toBe(false);
@@ -1268,7 +1319,14 @@ describe('the fuel record: one reading per meter', () => {
       level: 30 - 2 * TRIM_FUEL,
       meters: { [SK]: 2 * TRIM_FUEL },
       meter: 2 * TRIM_FUEL,
-      settled: { [SK]: { trim: readOrbitTrim(), fuelDrawn: 2 * TRIM_FUEL, burns: [keyOf(doc, b1), keyOf(doc, b2)] } },
+      settled: {
+        [SK]: {
+          trim: readOrbitTrim(),
+          fuelDrawn: 2 * TRIM_FUEL,
+          burns: [keyOf(doc, b1), keyOf(doc, b2)],
+          fired: [firedOf(b1), firedOf(b2)],
+        },
+      },
     });
     expect(readFuelLevel()).toBe(30 - 2 * TRIM_FUEL);
   });
@@ -1375,6 +1433,40 @@ describe('the fuel record: one reading per meter', () => {
   it('refuses a meter name the record could not keep', () => {
     expect(() => setFuelDrawMeter('not a name', null)).toThrow();
     expect(() => setFuelDrawMeter('__proto__', null)).toThrow();
+  });
+
+  it('installs no more meters than the record keeps readings for, so none is charged twice', () => {
+    // Copilot's review of #173: a 17th meter's reading was never recorded,
+    // so every level write charged it again.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(100, 100);
+    press('raise', T0);
+    const one = { read: () => 1, subscribe: () => () => {} };
+    const names: string[] = [];
+    try {
+      // Station keeping's meter is one of the 16...
+      for (let i = 0; i < 16; i++) {
+        try {
+          setFuelDrawMeter(`cap-${i}`, one);
+        } catch {
+          break;
+        }
+        names.push(`cap-${i}`);
+      }
+      expect(names).toHaveLength(15);
+      // ...so the next is refused, while replacing one is not.
+      expect(() => setFuelDrawMeter('cap-extra', one)).toThrow();
+      expect(() => setFuelDrawMeter(names[0], one)).not.toThrow();
+      // Every meter keeps a reading, so level writes charge each draw once.
+      const gauge = readFuelLevel();
+      expect(gauge).toBe(100 - 16);
+      writeFuelLevel(gauge, 100);
+      writeFuelLevel(readFuelLevel(), 100);
+      expect(readFuelLevel()).toBe(gauge);
+    } finally {
+      for (const name of names) setFuelDrawMeter(name, null);
+    }
   });
 });
 
