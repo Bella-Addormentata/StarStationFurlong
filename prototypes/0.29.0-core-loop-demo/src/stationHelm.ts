@@ -43,8 +43,9 @@ import {
   describeOffset,
   describeRefusal,
   describeTrimStatus,
-  isBurning,
+  isBurnLogFull,
   planTrim,
+  readBurnFiring,
   readOrbitTrim,
   slotDriftPerHour,
   slotOffsetAt,
@@ -54,7 +55,7 @@ import {
   trimmedOrbit,
   writeTrimBurn,
 } from './stationKeeping';
-import type { OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
+import type { FiredBurn, OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
 
 const DEG = Math.PI / 180;
 
@@ -86,7 +87,7 @@ const GREEN = '#00E676';
 const WARN = '#FFB74D';
 
 /** The refusals that disable the whole stick (as opposed to one direction). */
-const STICK_REFUSALS: readonly TrimRefusal[] = ['not-bolted', 'no-station', 'not-commander', 'no-thrusters', 'no-fuel'];
+const STICK_REFUSALS: readonly TrimRefusal[] = ['not-bolted', 'no-station', 'not-commander', 'no-thrusters', 'no-fuel', 'log-full'];
 
 /** "1m 32s" / "3h 54m" — a real-time span. */
 function formatSpan(ms: number): string {
@@ -119,6 +120,7 @@ function drawKeepingBox(
   canvas: HTMLCanvasElement,
   view: { base: CircularOrbit; trim: OrbitTrim | null; planet: string } | null,
   now: number,
+  firing: FiredBurn | null,
 ): void {
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
@@ -199,8 +201,8 @@ function drawKeepingBox(
   }
 
   // A burn's exhaust, opposite the push.
-  if (view.trim && isBurning(view.trim, now)) {
-    const push = PUSH[view.trim.last];
+  if (firing) {
+    const push = PUSH[firing.dir];
     const flicker = 0.7 + 0.3 * Math.sin(now / 45);
     ctx.fillStyle = `rgba(255,138,64,${0.75 * flicker})`;
     ctx.beginPath();
@@ -288,6 +290,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   const readContext = (): TrimContext & { station: StationRecord | null; tanks: number; capacity: number } => {
     const tanks = countFunction('fuelTank');
     const capacity = tanks * TANK_CAPACITY;
+    const now = Date.now();
     return {
       bolted: deps.bolted(),
       station: deps.station(),
@@ -295,11 +298,16 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
-      now: Date.now(),
+      now,
+      firing: readBurnFiring(now),
+      logFull: isBurnLogFull(),
       tanks,
       capacity,
     };
   };
+
+  /** The room's burn firing now, on the orbit the dashboard shows. */
+  const firingNow = (now: number): FiredBurn | null => (view ? trimFor(view.station, readBurnFiring(now)) : null);
 
   const refresh = (): void => {
     if (!panel) return;
@@ -359,7 +367,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         text = flash.text;
         tone = WARN;
       } else if (view) {
-        text = describeTrimStatus(view.base, trim, c.now);
+        text = describeTrimStatus(view.base, trim, c.now, trimFor(station, c.firing ?? null));
         tone = text.startsWith('ON STATION') ? GREEN : text.startsWith('BURNING') ? AMBER : GOLD;
       } else {
         text = describeRefusal('no-station', c.tanks);
@@ -379,8 +387,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       refresh();
       return;
     }
-    flash = null;
-    writeTrimBurn(plan.burn);
+    flash = writeTrimBurn(plan.burn) ? null : { text: 'The burn did not go through. Try the stick again.', until: c.now + FLASH_MS };
     refresh();
   };
 
@@ -392,8 +399,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       knob.style.transform = `translate(${drag.dx}px, ${drag.dy}px)`;
       return;
     }
-    const trim = view?.trim ?? null;
-    const push = trim && isBurning(trim, now) ? PUSH[trim.last] : { x: 0, y: 0 };
+    const firing = firingNow(now);
+    const push = firing ? PUSH[firing.dir] : { x: 0, y: 0 };
     const t = `translate(${push.x * KNOB_TRAVEL * 0.7}px, ${push.y * KNOB_TRAVEL * 0.7}px)`;
     if (knob.style.transform !== t) knob.style.transform = t;
   };
@@ -592,7 +599,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       const now = Date.now();
       placeKnob(now);
       const canvas = q<HTMLCanvasElement>('#sk-box');
-      if (canvas) drawKeepingBox(canvas, view, now);
+      if (canvas) drawKeepingBox(canvas, view, now, firingNow(now));
     },
   };
 }
