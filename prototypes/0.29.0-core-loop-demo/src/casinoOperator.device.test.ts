@@ -134,6 +134,9 @@ describe('the pagehide listener', () => {
     const listeners: { type: string; handler: () => void }[] = [];
     const win = { addEventListener: (type: string, handler: () => void) => { listeners.push({ type, handler }); } };
     const { casinoDoc, casinoOperator } = await load({}, win);
+    // The games register none of their own: one listener for the three modules.
+    await import('./slotCroupier');
+    await import('./pusherCroupier');
     const pagehide = listeners.filter((l) => l.type === 'pagehide');
     expect(pagehide).toHaveLength(1);
     expect(pagehide[0].handler).toBe(casinoOperator.releaseCasinoOperatorLease);
