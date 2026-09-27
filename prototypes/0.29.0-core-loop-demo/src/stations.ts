@@ -539,11 +539,17 @@ export function listStations(
   };
   const stayers = candidates.map((_, i) => i).filter((i) => settledAt(candidates[i]) === -Infinity);
   const [builtIn, ...rest] = stayers[0] === 0 ? stayers : [-1, ...stayers];
-  if (builtIn === 0) {
+  // A station between planets is listed where it left from (for the helm
+  // and the holotable) but holds no slot there until it is back: its old
+  // slot is free for others, and a bounce home claims one again.
+  const inTransit = (i: number) => stationInTransit({ move: candidates[i].move ?? undefined }, nowMs);
+  if (builtIn === 0 && inTransit(0)) settle(0, wantOf[0].planetId, wantOf[0].orbitSlot);
+  else if (builtIn === 0) {
     const slot = claim(wantOf[0].planetId, wantOf[0].orbitSlot);
     if (slot !== null) settle(0, wantOf[0].planetId, slot);
   }
-  for (const group of [rest.filter((i) => i < firstDerived), rest.filter((i) => i >= firstDerived)]) {
+  for (const i of rest.filter(inTransit)) settle(i, wantOf[i].planetId, wantOf[i].orbitSlot);
+  for (const group of [rest.filter((i) => i < firstDerived && !inTransit(i)), rest.filter((i) => i >= firstDerived && !inTransit(i))]) {
     const lost: number[] = [];
     for (const i of [...group].sort(globalOrder)) {
       const { planetId, orbitSlot } = wantOf[i];
@@ -580,6 +586,8 @@ export function listStations(
       const there = candidates.filter((o, j) => {
         if (j === i) return false;
         if (settledAt(o) <= T) return spots[j]?.planetId === dest;
+        // One between planets at T held no slot anywhere.
+        if (stationInTransit({ move: o.move ?? undefined }, T)) return false;
         return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
       }).length;
       outcome = there >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';

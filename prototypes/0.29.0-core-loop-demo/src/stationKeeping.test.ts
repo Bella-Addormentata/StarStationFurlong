@@ -150,6 +150,13 @@ describe('which face the helm shows', () => {
     expect(isBoltedIntoStation([dock])).toBe(false);
     expect(isBoltedIntoStation([guestBerth, retired, dock])).toBe(false);
   });
+
+  it('a pairing that names no room joins nothing, as in the atlas', () => {
+    const unaddressed: DoorRecord = { paired: true, connectedRoomAddress: '' };
+    expect(isBoltedIntoStation([unaddressed])).toBe(false);
+    expect(isBoltedIntoStation([unaddressed, dock])).toBe(false);
+    expect(isBoltedIntoStation([unaddressed, gangway])).toBe(true);
+  });
 });
 
 describe('the trimmed orbit', () => {

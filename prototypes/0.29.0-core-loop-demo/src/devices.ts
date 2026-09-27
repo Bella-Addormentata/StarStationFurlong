@@ -2898,6 +2898,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
       unsubs.push(subscribeStationMove(() => render()));
+      // 🪐 Destinations and their orbits learned from peers.
+      unsubs.push(subscribePlanetSummary(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();

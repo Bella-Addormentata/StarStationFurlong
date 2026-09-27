@@ -680,7 +680,18 @@ export function registerLearnedStations(
     if (!rec) continue;
     const owner = listed.find((st) => st.welcomeRoomId === s.welcomeRoomId);
     // Someone else's record, or its own saved one: this install decides.
-    if (owner && !owner.derived && owner.id !== rec.id) continue;
+    if (owner && !owner.derived && owner.id !== rec.id) {
+      // …except where it stands: when another install's record of the same
+      // place stood (rival owners settle on one, mergeStation), this one
+      // flies that planet and slot too, under its own id, so both installs
+      // agree and the standing trim fits.
+      const own = saved.get(owner.id);
+      if (own && !isLearnedRecord(own) && s.ownerId !== undefined && s.ownerId !== owner.id
+        && (own.orbitSlot !== s.orbitSlot || planetById(own.planetId).id !== planetById(s.planetId).id)) {
+        if (registerStation({ ...own, planetId: s.planetId, orbitSlot: s.orbitSlot })) changed++;
+      }
+      continue;
+    }
     // Unchanged since it was saved: compare with the SAVED record, not the
     // listed one (the list may have moved it to a free slot), extra fields
     // included (a newer build's, such as a station's move).
