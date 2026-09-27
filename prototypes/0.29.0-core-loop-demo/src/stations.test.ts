@@ -9,6 +9,7 @@ import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
+  MAX_ORBIT_SLOTS,
   listStations,
   planetForRoom,
   readStationRecords,
@@ -20,6 +21,7 @@ import {
 import type { StationRecord } from './stations';
 import { SolarSystemMap, stationBodies } from './map';
 import { DEFAULT_STATION } from './defaultStation';
+import { ORBIT_EPOCH_MS } from './orbits';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -65,6 +67,14 @@ describe('atlas components', () => {
     ]);
   });
 
+  it('does not let unknown door targets crowd a real neighbour out of its component', () => {
+    const unknown = Array.from({ length: 63 }, (_, i) => `ghost-${i}`);
+    const atlas = atlasOf(room('hub', [...unknown, 'real']), room('real', []));
+    expect(atlasComponent(atlas, 'hub').has('real')).toBe(true);
+    expect(atlasComponents(atlas)).toHaveLength(1);
+    expect(listStations(atlas, []).filter((s) => s.derived)).toHaveLength(1);
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });
@@ -99,6 +109,31 @@ describe('listStations', () => {
     expect(stations.map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'aris-forge']);
     expect(stationsAroundPlanet('planet-aris', stations).map((s) => s.id)).toEqual(['aris-forge']);
     expect(stationForRoom('yard-a', twoStations(), stations)?.id).toBe('aris-forge');
+  });
+
+  it('lists one station per place: a record inside a listed station is dropped', () => {
+    const insideFurlong: StationRecord = {
+      id: 'lounge-2', name: 'LOUNGE', planetId: DEFAULT_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'lounge',
+    };
+    const yard: StationRecord = {
+      id: 'yard', name: 'YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 4, welcomeRoomId: 'yard-a',
+    };
+    const yardAgain: StationRecord = { ...yard, id: 'yard-2', welcomeRoomId: 'yard-b' };
+    const offAtlas: StationRecord = { ...yard, id: 'far', welcomeRoomId: 'far-room', orbitSlot: 5 };
+    const offAtlasAgain: StationRecord = { ...offAtlas, id: 'far-2', orbitSlot: 6 };
+    const stations = listStations(twoStations(), [insideFurlong, yard, yardAgain, offAtlas, offAtlasAgain]);
+    expect(stations.map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'yard', 'far']);
+  });
+
+  it('refuses to register a record for a room of a station already listed', () => {
+    for (const e of Object.values(twoStations())) {
+      const atlas = JSON.parse(store.get('ssf-station-atlas') ?? '{}');
+      atlas[e.roomId] = e;
+      store.set('ssf-station-atlas', JSON.stringify(atlas));
+    }
+    const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2 };
+    expect(registerStation({ ...base, id: 'dup', welcomeRoomId: 'lounge' })).toBe(false);
+    expect(registerStation({ ...base, id: 'yard', welcomeRoomId: 'yard-b' })).toBe(true);
   });
 
   it('bumps a record whose orbit slot is already taken to the next free one', () => {
@@ -143,7 +178,21 @@ describe('saved records', () => {
     expect(registerStation({ ...base, orbitSlot: -1 })).toBe(false);
     expect(registerStation({ ...base, orbitSlot: 1.5 })).toBe(false);
     expect(registerStation({ ...base, welcomeRoomId: '' })).toBe(false);
+    expect(registerStation({ ...base, id: 'planet-sovereign' })).toBe(false);
+    expect(registerStation({ ...base, id: 'belt-ring' })).toBe(false);
+    expect(registerStation({ ...base, id: 'station:yard-a' })).toBe(false);
     expect(readStationRecords()).toEqual([]);
+  });
+
+  it('refuses a record once its planet has no free orbit slot', () => {
+    // The built-in station holds one of Sovereign's slots.
+    for (let i = 1; i < MAX_ORBIT_SLOTS; i++) {
+      expect(registerStation({ id: `s${i}`, name: `S${i}`, planetId: DEFAULT_PLANET_ID, orbitSlot: i, welcomeRoomId: `r${i}` })).toBe(true);
+    }
+    expect(registerStation({ id: 'full', name: 'FULL', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'rx' })).toBe(false);
+    expect(stationsAroundPlanet(DEFAULT_PLANET_ID, listStations({}))).toHaveLength(MAX_ORBIT_SLOTS);
+    // Another planet still has room.
+    expect(registerStation({ id: 'aris', name: 'ARIS', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'ry' })).toBe(true);
   });
 
   it('survives a corrupt store and maps unknown planets to the default', () => {
@@ -160,11 +209,11 @@ describe('saved records', () => {
 });
 
 describe('solar map station bodies', () => {
-  it('keeps the Furlong body where it always was', () => {
+  it('keeps the Furlong body where it always was, now moving on its true orbit', () => {
     const [furlong] = stationBodies([DEFAULT_STATION_RECORD]);
-    expect(furlong).toMatchObject({
-      id: 'furlong-station', parentId: 'planet-sovereign', orbitRadius: 35, orbitSpeed: 0.015, angle: 2.1,
-    });
+    expect(furlong).toMatchObject({ id: 'furlong-station', parentId: 'planet-sovereign', orbitRadius: 35 });
+    expect(furlong.angleAt!(ORBIT_EPOCH_MS)).toBeCloseTo(2.1, 12);
+    expect(furlong.description).toContain('400 km up · 7.67 km/s · one orbit every 1m 32s.');
   });
 
   it('shows both stations around Sovereign on the holotable and marks the current one', () => {
@@ -177,6 +226,15 @@ describe('solar map station bodies', () => {
     const bodies = stationBodies(stations);
     expect(bodies.every((b) => b.parentId === 'planet-sovereign')).toBe(true);
     expect(bodies[1].orbitRadius).toBeGreaterThan(bodies[0].orbitRadius);
+  });
+
+  it('rebinds the selection when a station is renamed', () => {
+    const map = new SolarSystemMap();
+    const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+    map.refreshStations(listStations({}, [rec]), null);
+    (map as unknown as { selectedBody: unknown }).selectedBody = stationBodies([rec])[0];
+    map.refreshStations(listStations({}, [{ ...rec, name: 'L4 DEPOT' }]), null);
+    expect((map as unknown as { selectedBody: { name: string } }).selectedBody.name).toBe('L4 DEPOT');
   });
 
   it('defaults to Furlong as the player location, as before', () => {

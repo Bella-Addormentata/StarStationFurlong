@@ -428,13 +428,26 @@ function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<stri
   return adjacent;
 }
 
-function walkComponent(adjacent: Map<string, Set<string>>, start: string): Set<string> {
+/** The cap counts rooms the atlas holds an entry for; unknown door targets
+ *  are still walked (they are bounded by the per-entry door cap), so a room
+ *  listing many unknown neighbours cannot crowd a real one out of its
+ *  component and split one station into two. */
+function walkComponent(
+  atlas: Record<string, AtlasEntry>,
+  adjacent: Map<string, Set<string>>,
+  start: string,
+): Set<string> {
   const component = new Set<string>([start]);
+  let known = atlas[start] ? 1 : 0;
   const queue = [start];
   while (queue.length > 0) {
     const rid = queue.shift()!;
     for (const next of adjacent.get(rid) ?? []) {
-      if (component.has(next) || component.size >= MAX_ENTRIES) continue;
+      if (component.has(next)) continue;
+      if (atlas[next]) {
+        if (known >= MAX_ENTRIES) continue;
+        known++;
+      }
       component.add(next);
       queue.push(next);
     }
@@ -442,11 +455,12 @@ function walkComponent(adjacent: Map<string, Set<string>>, start: string): Set<s
   return component;
 }
 
-/** The connected component of `roomId`, capped at the atlas's own size.
+/** The connected component of `roomId`, capped at the atlas's own size in
+ *  known rooms.
  *  Empty when the atlas holds no entry for the room. */
 export function atlasComponent(atlas: Record<string, AtlasEntry>, roomId: string): Set<string> {
   if (!roomId || !atlas[roomId]) return new Set();
-  return walkComponent(atlasAdjacency(atlas), roomId);
+  return walkComponent(atlas, atlasAdjacency(atlas), roomId);
 }
 
 /** Every connected component of the atlas — one per station this install
@@ -459,7 +473,7 @@ export function atlasComponents(atlas: Record<string, AtlasEntry>): Set<string>[
   const out: Set<string>[] = [];
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || seen.has(e.roomId)) continue;
-    const component = walkComponent(adjacent, e.roomId);
+    const component = walkComponent(atlas, adjacent, e.roomId);
     for (const rid of component) seen.add(rid);
     out.push(component);
   }
