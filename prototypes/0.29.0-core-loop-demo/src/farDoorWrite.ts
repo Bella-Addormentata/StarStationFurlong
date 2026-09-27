@@ -64,6 +64,8 @@ export function applyFarDockRequest(
     writeDoorRecordTo(doc, farDoor, patch.record);
     return { result: { ok: true, detail: 'written' }, wrote: true };
   }
+  // The requester's key is its own claim, as every door write is in the
+  // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
   const gate = gateAccessIn(doc, req.farDoor, req.requesterPub);
   const patch = farDockPatch(
     readDoorFrom(doc, req.farDoor),

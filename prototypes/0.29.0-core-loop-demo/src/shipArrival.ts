@@ -150,6 +150,9 @@ export function arrivalBerths(input: {
   shipRoomId?: string;
 }): StationBerth[] {
   const { station } = input;
+  // A station known to have no gates (an empty list, not a missing one) has
+  // no berth to ask, remembered or not.
+  if (Array.isArray(station.berths) && station.berths.length === 0) return [];
   // ⚓🚦 The station decides who may dock where: a closed gate, or one
   // reserved for another ship, is never asked (its far end would refuse).
   // Gates open to the owner's granted captains cannot be checked from here,

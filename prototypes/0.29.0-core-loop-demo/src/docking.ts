@@ -1910,6 +1910,15 @@ export class DoorDockingPortSystem {
           this.showAssemblyNotice(doorId, step.reason);
           return;
         }
+        // ⚓🚦 A new port takes the lowest gate number free in the station;
+        // with every number taken it is not fitted (and no part is spent).
+        const gate = step.kind === "fit-port"
+          ? freeGateNumber(readAtlas(), this.roomNow(), readDockGates())
+          : null;
+        if (step.kind === "fit-port" && gate === null) {
+          this.showAssemblyNotice(doorId, `Every gate number (1–${MAX_GATE}) is taken in this station — remove a port first.`);
+          return;
+        }
         if (!consumePart("adapter")) {
           this.renderAssemblyStrip(doorId, "no ADAPTER parts — DEV menu › PARTS");
           return;
@@ -1918,8 +1927,6 @@ export class DoorDockingPortSystem {
         if (step.kind === "fit-port") {
           // SEED-FIRST is not needed here: writeDoorPolicy refuses a door the
           // layout does not know, and every door with a pane is known.
-          // ⚓🚦 A new port takes the lowest gate number free in the station.
-          const gate = freeGateNumber(readAtlas(), this.roomNow(), readDockGates());
           writeDoorPolicy(doorId, {
             ...readDoorPolicy(doorId),
             adapter: true,

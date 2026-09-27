@@ -2280,7 +2280,9 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     setArrivalNote({
       text: outcome.gateChange && outcome.gate !== undefined
         ? `Gate change: docked at ${outcome.stationName}, gate ${outcome.gate}.`
-        : `Docked at ${outcome.stationName}, ${gate(outcome.gate)}.`,
+        : outcome.gate !== undefined
+          ? `Docked at ${outcome.stationName}, gate ${outcome.gate}.`
+          : `Docked at ${outcome.stationName}.`,
       tone: 'ok',
       ...(outcome.routeStay ? { tie: { ...outcome.routeStay } } : {}),
     });
