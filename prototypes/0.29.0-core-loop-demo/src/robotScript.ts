@@ -34,14 +34,7 @@ export type RobotStep =
   // scheduler emits a `gotoDock` action and the render binding walks to WHATEVER
   // dock the robot is bound to — a hostile owner can't teleport the bot outside
   // the bounded goto envelope by writing a synthetic goto to a dock's world pos.
-  | { kind: 'dock' }
-  // 🛳️ Ferry-route slice (the "drive a ship between two stations" ask on the
-  // PR): the scheduled ferry leg. ALSO payload-free — the render binding swaps
-  // in the NEXT stop of the room's ferry loop (dock positions by id order),
-  // so the two-station route composes as [ferry, say, wait, ferry, say, wait]
-  // with the departure lines/waits the owner writes between the legs. Like
-  // `dock`, no coordinates cross the doc trust boundary in the step.
-  | { kind: 'ferry' };
+  | { kind: 'dock' };
 
 /** Hard cap on a custom script — keeps the synced record small, the render
  *  loop cheap, and a malicious peer's payload bounded. 16 chips is enough for a
@@ -134,11 +127,6 @@ export function isRobotStep(value: unknown): value is RobotStep {
   if (s.kind === 'dock') {
     return true;
   }
-  // 🛳️ 'ferry' is payload-free for the same reason — the route lives in the
-  // room (dock positions), never in the step.
-  if (s.kind === 'ferry') {
-    return true;
-  }
   return false;
 }
 
@@ -198,7 +186,6 @@ const EDITABLE_STEP_FIELDS: Record<RobotStep['kind'], readonly string[]> = {
   say: ['text'],
   wait: ['secs'],
   dock: [],
-  ferry: [],
 };
 
 /** patchScriptStep — pure, VALIDATED single-field edit of one script step.
@@ -240,74 +227,6 @@ export function patchScriptStep(
   return steps.map((s, n) => (n === index ? candidate : s));
 }
 
-// ── Ferry stops (the "drive a ship between two stations" slice) ──────────────
-
-/** One berth on the room's ferry loop. The world derives these from the placed
- *  charging-docks (sorted by id so every client resolves the same order), so a
- *  stop's COORDS never live in the doc-borne script — the `ferry` step stays
- *  payload-free exactly like `dock`. `faceAngle` is optional because the
- *  furniture-derived candidates don't carry one (the chassis falls back to
- *  facing the room centre, matching the dock binding). */
-export interface FerryStop {
-  x: number;
-  z: number;
-  faceAngle?: number;
-}
-
-/** The bound ferry loop — an ordered list of berths the `ferry` step cycles
- *  through. Written by the render layer (world.reconcileRobots →
- *  bindFerryStops), read by the scheduler one hop at a time via
- *  nextFerryStop. Module-scope like the doc bindings (doorsDoc's notify
- *  pattern): the engine module stays free of THREE/Y.js/DOM imports while the
- *  route itself remains render-provided data. */
-let ferryStopList: FerryStop[] = [];
-const ferryListeners = new Set<() => void>();
-
-function notifyFerryStops(): void {
-  for (const listener of [...ferryListeners]) {
-    try {
-      listener();
-    } catch (err) {
-      console.error('[robot] ferry-stops listener threw:', err);
-    }
-  }
-}
-
-/** Install the room's ferry loop (id-sorted dock positions). Rebinding to the
- *  same coordinates is a content no-op for the scheduler — the per-robot leg
- *  counter is NOT reset here, so a furniture re-reconcile doesn't strand a
- *  bot mid-route back at stop 0. */
-export function bindFerryStops(stops: readonly FerryStop[]): void {
-  ferryStopList = stops.map((s) => ({ ...s }));
-  notifyFerryStops();
-}
-
-/** Read the bound ferry loop (a copy — callers can't mutate the route). */
-export function ferryStops(): FerryStop[] {
-  return ferryStopList.map((s) => ({ ...s }));
-}
-
-/** Subscribe to route changes (dock added/removed/moved). Unsubscribe fn. */
-export function observeFerryStops(listener: () => void): () => void {
-  ferryListeners.add(listener);
-  return () => ferryListeners.delete(listener);
-}
-
-/** The stop a `ferry` step should walk to AFTER `fromStop` — the next berth
- *  in the loop, wrapping to 0. A one-stop route returns stop 0 every time (the
- *  ferry idles at its only berth); an empty route returns null so the caller
- *  can no-op. Pure: same list + same fromStop ⇒ same answer on every client.
- *  A stale out-of-range fromStop (a berth was removed mid-route) is clamped
- *  into range first so the hop always lands on a real berth. */
-export function nextFerryStop(fromStop: number): { stop: number; x: number; z: number; faceAngle?: number } | null {
-  if (ferryStopList.length === 0) return null;
-  const n = ferryStopList.length;
-  const from = ((fromStop % n) + n) % n; // -1 → n-1 → 0; any stale index clamps in
-  const stop = (from + 1) % n;
-  const s = ferryStopList[stop];
-  return { stop, x: s.x, z: s.z, ...(s.faceAngle !== undefined ? { faceAngle: s.faceAngle } : {}) };
-}
-
 // ── Scheduler ─────────────────────────────────────────────────────────────────
 
 /** What the scheduler asks the render layer to do this frame. The scheduler
@@ -325,12 +244,6 @@ export type SchedulerAction =
    *  had no dock passes null, and `hasDock=false` means "there is nowhere to
    *  go; hold pose while the step's stall timer runs out". */
   | { kind: 'gotoDock'; x: number; z: number; hasDock: boolean }
-  /** 🛳️ Walk the FERRY ROUTE: the target is the NEXT stop of the bound ferry
-   *  loop (world-derived dock positions — never doc coords), so consecutive
-   *  `ferry` steps hop berth to berth around the room. `stop` is the index the
-   *  chassis should remember; it hands it back as `ferryStop` on the next
-   *  advance() so the loop resumes mid-route instead of restarting. */
-  | { kind: 'gotoFerryStop'; x: number; z: number; stop: number }
   /** No script → no request; the caller idles freely. */
   | { kind: 'none' };
 
@@ -364,12 +277,6 @@ export class RobotScriptScheduler {
    *  The caller pops one bubble on `started`, then leaves the bubble alone
    *  while the SAY holds. Reset when the step advances. */
   private sayStarted = false;
-  /** 🛳️ Last ferry berth this robot COMPLETED a hop to (-1 = never). The
-   *  caller feeds it back in as `ferryStop` each frame (it owns the render-
-   *  time truth: a bot standing at a dock knows which berth that is). A
-   *  `ferry` step targets (lastFerryStop + 1) mod route-length, so two stops
-   *  give the classic A→B→A shuttle and N stops give a round-robin circuit. */
-  private lastFerryStop = -1;
   /** JSON-serialised current steps — cheap fingerprint for setSteps() dedup. */
   private stepsKey = '[]';
 
@@ -410,13 +317,6 @@ export class RobotScriptScheduler {
     return this.steps.length === 0 ? 0 : this.index % this.steps.length;
   }
 
-  /** 🛳️ Introspection — the last ferry berth this robot completed (-1 =
-   *  none yet). The render layer feeds this back via advance()'s `ferryStop`
-   *  arg; tests read it to pin the route-progression state machine. */
-  ferryStop(): number {
-    return this.lastFerryStop;
-  }
-
   /** One step of the state machine. Returns the SchedulerAction the render
    *  layer should honour THIS frame. The caller passes the bot's current world
    *  (x, z) so goto-arrival can be judged here (the arrival predicate lives
@@ -430,23 +330,12 @@ export class RobotScriptScheduler {
    *  binding hands it in every frame from its own dockTarget (or null when
    *  the robot has no dock). Passing it here keeps the doc's `dock` step
    *  payload-free (no coords for a hostile peer to abuse) while still giving
-   *  the scheduler an arrival predicate that matches the walker's own.
-   *
-   *  🛳️ `ferryStop` is the caller's record of which berth the bot is at (the
-   *  render layer knows — it resolved the docks); -1/absent means "not at a
-   *  stop yet", so the first `ferry` step walks to stop 0. The returned
-   *  gotoFerryStop carries the target index back so the caller can latch it
-   *  on arrival. No bound stops ⇒ the step completes instantly (no-op) so a
-   *  dockless room's loop keeps moving. */
+   *  the scheduler an arrival predicate that matches the walker's own. */
   advance(
     dt: number,
     pos?: { x: number; z: number },
     dock?: { x: number; z: number } | null,
-    ferryStop?: number,
   ): SchedulerAction {
-    if (typeof ferryStop === 'number' && Number.isInteger(ferryStop)) {
-      this.lastFerryStop = ferryStop;
-    }
     if (this.steps.length === 0) return { kind: 'none' };
     // Clamp dt into a sane band. Negative dt is a caller bug — treat as zero.
     const stepDt = Math.max(0, Math.min(dt, RobotScriptScheduler.DT_CEILING));
@@ -489,28 +378,6 @@ export class RobotScriptScheduler {
       const timedOut = this.timer >= GOTO_TIMEOUT_SECS;
       if (arrived || timedOut) this.advanceCursor();
       return { kind: 'gotoDock', x: dock.x, z: dock.z, hasDock: true };
-    }
-
-    // 🛳️ ferry: walk to the NEXT berth of the bound ferry loop (render-
-    // derived dock positions — never doc coords). Same arrival predicate and
-    // GOTO_TIMEOUT fail-safe as a goto; the completed hop's index latches so
-    // the NEXT ferry step continues the route instead of re-walking it.
-    if (step.kind === 'ferry') {
-      const target = nextFerryStop(this.lastFerryStop);
-      if (!target) {
-        // No berths bound (a dockless room) — the leg is a no-op; complete
-        // immediately so a route-less loop doesn't stall even a beat.
-        this.advanceCursor();
-        return { kind: 'none' };
-      }
-      const arrived =
-        pos != null && Math.hypot(pos.x - target.x, pos.z - target.z) <= ARRIVE_DIST;
-      const timedOut = this.timer >= GOTO_TIMEOUT_SECS;
-      if (arrived || timedOut) {
-        this.lastFerryStop = target.stop;
-        this.advanceCursor();
-      }
-      return { kind: 'gotoFerryStop', x: target.x, z: target.z, stop: target.stop };
     }
 
     // wait

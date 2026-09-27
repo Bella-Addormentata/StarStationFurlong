@@ -46,10 +46,6 @@ import { readRobotConfig, subscribeRobot } from "./robotDoc";
 // tie-break) — the same helper the tests exercise. Used inside reconcileRobots
 // so every client picks the same dock for each robot when multiple exist.
 import { pickDockForRobot, type DockCandidate, type ChargeReading } from "./robotCharge";
-// 🛳️ Ferry-route slice: the world publishes the room's ferry loop (the placed
-// charging-docks, id-sorted) into the engine-pure scheduler's registry so a
-// scripted `ferry` step resolves its NEXT stop without coords in the doc.
-import { bindFerryStops } from "./robotScript";
 import type { RobotRoutine } from "./robotDoc";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
@@ -240,19 +236,6 @@ function oppositeWall(wall: DoorWall): DoorWall {
         ? "x-"
         : "x+";
 }
-
-/** 🛳️ Ferry-route demo berths (the PR's "two stations orbiting the same
- *  planet" ask, seeded in-room): two charging-docks at opposite ends of the
- *  floor, Aft Dock and Forward Dock. Docks = robots = ferrymen, so the pair
- *  comes with two robots the owner can program with a `ferry` script — the
- *  classic two-stop shuttle. Ids sort ahead of legacy dock ids so the route
- *  order (Aft → Forward → …) is stable on every client; the pads are movable
- *  like any placed dock, and reconcileRobots seeds them idempotently (a
- *  doc-driven layout replaces the set wholesale). */
-const DEMO_FERRY_DOCKS: ReadonlyArray<FurnitureItem> = [
-  { id: "ferry-pad-a", kind: "charging-dock", pos: { x: -4.5, z: -10.5 }, rot: 0, movable: true },
-  { id: "ferry-pad-b", kind: "charging-dock", pos: { x: 4.5, z: 10.5 }, rot: 2, movable: true },
-];
 
 export class World {
   private scene: THREE.Scene;
@@ -4802,15 +4785,6 @@ export class World {
   }
 
   private reconcileRobots(waiterPatrol: Array<[number, number]> | null): void {
-    // 🛳️ Ferry-route demo seed: the PR asks for a route "between two stations",
-    // so the room ships with two extra berths — Aft Dock and Forward Dock,
-    // charging-docks at opposite ends of the floor. Docks = robots = ferrymen,
-    // so these two pads come with two robots the owner can program with a
-    // ferry script; re-runs (idempotent) and doc-seeded rooms (reconcile
-    // replaces the set wholesale) are both safe.
-    for (const pad of DEMO_FERRY_DOCKS) {
-      if (!FURNITURE.some((i) => i.id === pad.id)) FURNITURE.push({ ...pad, pos: { ...pad.pos } });
-    }
     if (this.robotsPatrol !== waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
@@ -4858,15 +4832,6 @@ export class World {
       x: d.pos.x,
       z: d.pos.z,
     }));
-    // 🛳️ Publish the ferry loop to the engine-pure scheduler's registry: the
-    // same dock candidates, id-sorted so every client resolves the same berth
-    // order. Two or more docks ⇒ a real route; one dock ⇒ a one-berth loop
-    // (the ferry step still walks "home"); none ⇒ an empty route (no-op).
-    bindFerryStops(
-      [...dockCandidates]
-        .sort((a, b) => a.id.localeCompare(b.id))
-        .map((d) => ({ x: d.x, z: d.z })),
-    );
     for (const [key, bot] of this.robots) {
       const bp = bot.getPosition();
       const chosen = pickDockForRobot(bp.x, bp.z, dockCandidates, key);

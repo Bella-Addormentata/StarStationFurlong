@@ -120,28 +120,10 @@ describe('isRobotConfig — script/parked/wheelTiming coexistence with chargePar
           { kind: 'say', text: 'hi' },
           { kind: 'wait', secs: 3 },
           { kind: 'dock' }, // 🔋 charge-slice step composes with the loop
-          { kind: 'ferry' }, // 🛳️ ferry-route step composes the same way
         ],
         parked: false,
         wheelTiming: { betSecs: 18, closingSecs: 3, showSecs: 9 },
         chargeParams: { dischargeSecs: 300, chargeSecs: 60, lowPercent: 20 },
-      }),
-    ).toBe(true);
-  });
-
-  it('accepts a custom script whose only steps are ferry + announce + wait (the PR route)', () => {
-    // 🛳️ The exact two-station demo loop: shuttle, announce, dwell, shuttle.
-    expect(
-      isRobotConfig({
-        routine: 'custom',
-        script: [
-          { kind: 'ferry' },
-          { kind: 'say', text: 'Now arriving at Forward Dock' },
-          { kind: 'wait', secs: 20 },
-          { kind: 'ferry' },
-          { kind: 'say', text: 'Now arriving at Aft Dock' },
-          { kind: 'wait', secs: 20 },
-        ],
       }),
     ).toBe(true);
   });
