@@ -34,6 +34,7 @@ import {
   startCheckpoint,
 } from './pilotRoute';
 import type { ShipSummary } from './planetSummary';
+import { DB_SCREEN_ROWS } from './furniture';
 import type { RouteCheckpoint, RouteStop, ShipRoute, StartCheckpoint } from './shipRoute';
 
 const SOV = 'planet-sovereign';
@@ -261,7 +262,37 @@ describe('the board', () => {
       ferries: [], here, gate: 2, summaries: Array.from({ length: 10 }, (_, i) => summary(i)), isHereRoom, placeOf, now: T0,
     });
     expect(many.rows).toHaveLength(MAX_BOARD_ROWS);
+    // …and the in-world screen draws every one of them.
+    expect(DB_SCREEN_ROWS).toBe(MAX_BOARD_ROWS);
     expect(many.rows.map((r) => r.at)).toEqual([...many.rows.map((r) => r.at)].sort((a, b) => a! - b!));
+  });
+
+  it('a summary the ferry wrote after its last publish here wins where they disagree', () => {
+    const here = boardAt(0, { dockedAt: T0 + 2 * SEC });
+    const isHereRoom = (room: string) => room === 'room-0';
+    const placeOf = (room: string | undefined) => (room === 'room-1' ? 'Stop 1' : '?');
+    const now = T0 + 10 * SEC;
+    const mine = (over: Partial<ShipSummary> = {}): ShipSummary => ({
+      roomId: SHIP, name: 'Ferry One', planetId: SOV, status: 'docked', fromRoom: 'room-0', nextStopRoom: 'room-1',
+      departAt: s.departAt, gate: 1, routeStatus: 'boarding', updatedAt: T0 + 5 * SEC, ...over,
+    });
+    const view = (summary: ShipSummary, f = ferry(route, [s])) =>
+      boardView({ ferries: [f], here, gate: null, summaries: [summary], isHereRoom, placeOf, now }).rows;
+    // Agreeing: the map's own row, read from the clock now.
+    const same = view(mine());
+    expect(same).toHaveLength(1);
+    expect(same[0]).toMatchObject({ status: 'BOARDING', gate: 1, at: s.departAt });
+    expect(same[0].asOf).toBeUndefined();
+    // Another gate, or the same status at another time: the newer word.
+    expect(view(mine({ gate: 3 }))).toEqual([expect.objectContaining({ gate: 3, asOf: T0 + 5 * SEC })]);
+    expect(view(mine({ departAt: s.departAt + 5 * MIN }))).toEqual([expect.objectContaining({ at: s.departAt + 5 * MIN, asOf: T0 + 5 * SEC })]);
+    // Said since that no route runs: off the board. Said before: no say.
+    expect(view(mine({ routeStatus: undefined }))).toEqual([]);
+    expect(view(mine({ routeStatus: undefined, updatedAt: T0 - SEC }))).toHaveLength(1);
+    // A finished route's entry left behind makes no row: a newer summary fills it.
+    const finished = ferry(running({ stoppedAt: T0 + SEC }), [s]);
+    expect(view(mine(), finished)).toEqual([expect.objectContaining({ status: 'BOARDING', asOf: T0 + 5 * SEC })]);
+    expect(view(mine({ updatedAt: T0 - SEC }), finished)).toEqual([]);
   });
 
   it('a summary row: docked here, or flying here; nothing stale, off route or elsewhere', () => {

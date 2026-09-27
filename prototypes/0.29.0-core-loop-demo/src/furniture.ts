@@ -1867,6 +1867,13 @@ const DB_D = 0.12;
 const DB_Y = 1.6; // mount height (the wall computer's)
 const DB_CW = 512; // canvas px
 const DB_CH = 160;
+/** Row pitch and first baseline on the board canvas: six rows sit between
+ *  the column heads and the notes footer. */
+const DB_ROW_PITCH = 15;
+const DB_ROW_TOP = 56;
+/** Rows the screen draws: every row a board can hold (departuresBoard
+ *  MAX_BOARD_ROWS, pinned by departuresBoard.test.ts). */
+export const DB_SCREEN_ROWS = 6;
 
 const buildDeparturesBoard = (ctx: BuildCtx) => {
   const { m, place } = ctx;
@@ -1935,9 +1942,9 @@ const buildDeparturesBoard = (ctx: BuildCtx) => {
       c2d.fillStyle = "#4A5560";
       c2d.fillText(board?.empty ?? "NO DEPARTURES NEWS", 12, 72);
     }
-    const shown = rows.slice(0, 5);
+    const shown = rows.slice(0, DB_SCREEN_ROWS);
     shown.forEach((r, i) => {
-      const y = 59 + i * 18;
+      const y = DB_ROW_TOP + i * DB_ROW_PITCH;
       c2d.font = "bold 11px monospace";
       c2d.fillStyle = "#F0C060";
       c2d.fillText(clip(r.ferry, 16), COL.ferry, y);

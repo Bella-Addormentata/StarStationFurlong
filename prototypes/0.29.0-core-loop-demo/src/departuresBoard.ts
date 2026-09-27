@@ -357,14 +357,32 @@ function rowOrder(a: DepartureRow, b: DepartureRow): number {
   return a.ferry < b.ferry ? -1 : a.ferry > b.ferry ? 1 : 0;
 }
 
+/** Does a newer summary row show a schedule the departures map's row no
+ *  longer matches (a gate, or the same status at another time)? Status alone
+ *  is not enough: the map's row reads the clock now, the summary as of its
+ *  time. */
+function scheduleMoved(mirror: DepartureRow, newer: DepartureRow): boolean {
+  if (newer.gate !== undefined && newer.gate !== mirror.gate) return true;
+  return newer.status === mirror.status && newer.at !== null && mirror.at !== null
+    && Math.abs(newer.at - mirror.at) > 1000;
+}
+
 /**
  * The board: a row per ferry from the departures map, then a row per ship
  * summary for ferries the map does not hold, filtered to the board's gate,
  * soonest first, capped at MAX_BOARD_ROWS. Pure.
+ *
+ * The map's entry for a ferry is its last publish that reached this room
+ * (DepartureFerry.at). A summary the ferry wrote AFTER it wins where they
+ * disagree, since a publish can give up or a finished route's entry stays
+ * behind: said since that no route runs, the ferry leaves the board; a row
+ * where the map has none, or with another gate or time, replaces the map's.
  */
 export function boardView(i: BoardInput): BoardView {
   const rows: DepartureRow[] = [];
   const known = new Set<string>();
+  const placeOf = i.placeOf ?? (() => '?');
+  const summaryOf = new Map((i.summaries ?? []).map((s) => [s.roomId, s] as const));
   for (const ferry of i.ferries) {
     known.add(ferry.shipRoomId);
     let cache = i.caches?.get(ferry.shipRoomId);
@@ -373,10 +391,18 @@ export function boardView(i: BoardInput): BoardView {
       i.caches.set(ferry.shipRoomId, cache);
     }
     const r = ferryRow(ferry, i.here, i.now, cache);
+    const s = summaryOf.get(ferry.shipRoomId);
+    if (s && i.isHereRoom && s.updatedAt > ferry.at) {
+      if (!s.routeStatus) continue;
+      const sr = summaryRow(s, i.isHereRoom, placeOf, i.now);
+      if (sr && (!r || scheduleMoved(r, sr))) {
+        rows.push(sr);
+        continue;
+      }
+    }
     if (r) rows.push(r);
   }
   if (i.summaries && i.isHereRoom) {
-    const placeOf = i.placeOf ?? (() => '?');
     for (const s of i.summaries) {
       if (known.has(s.roomId)) continue;
       const r = summaryRow(s, i.isHereRoom, placeOf, i.now);
