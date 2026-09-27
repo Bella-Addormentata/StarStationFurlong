@@ -475,12 +475,12 @@ function isPlainGates(v: unknown): v is Record<string, unknown> {
     && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
 }
 
-/** Only door id → integer gate pairs, at most MAX_DOORS_PER_ENTRY of them. */
+/** Only door id → integer gate pairs, at most one per gate number. */
 function cleanGates(v: Record<string, unknown>): Record<string, number> {
   const out: Record<string, number> = {};
   let kept = 0;
   for (const [doorId, gate] of Object.entries(v)) {
-    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    if (kept >= MAX_GATE_NUMBER) break;
     if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
     if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
     out[doorId] = gate;
@@ -497,12 +497,12 @@ export interface AtlasGateAccess {
   reservedFor?: string;
 }
 
-/** Door id → access pairs a peer may send, cleaned and capped. */
+/** Door id → access pairs a peer may send, cleaned and capped (one per gate number). */
 function cleanGateAccess(v: Record<string, unknown>): Record<string, AtlasGateAccess> {
   const out: Record<string, AtlasGateAccess> = {};
   let kept = 0;
   for (const [doorId, raw] of Object.entries(v)) {
-    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    if (kept >= MAX_GATE_NUMBER) break;
     if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
     if (typeof raw !== 'object' || raw === null) continue;
     const r = raw as { access?: unknown; reservedFor?: unknown };

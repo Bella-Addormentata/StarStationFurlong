@@ -285,10 +285,15 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
   return compareMoves(b, a) > 0 ? b : a;
 }
 
-/** The newer of two gate lists, by when each was read. */
+/** The newer of two gate lists, by when each was read; lists read the same
+ *  moment settle on tieBreak, so merge order cannot matter. */
 function newerBerths(a: StationSummary, b: StationSummary): Pick<StationSummary, 'berths' | 'berthsAt'> {
-  const pick = !a.berths ? b : !b.berths ? a : (b.berthsAt ?? 0) > (a.berthsAt ?? 0) ? b : a;
-  return pick.berths ? { berths: pick.berths, berthsAt: pick.berthsAt } : {};
+  const of = (x: StationSummary) => (x.berths ? { berths: x.berths, berthsAt: x.berthsAt } : {});
+  if (!a.berths) return of(b);
+  if (!b.berths) return of(a);
+  const at = (x: StationSummary) => x.berthsAt ?? 0;
+  if (at(a) !== at(b)) return at(b) > at(a) ? of(b) : of(a);
+  return tieBreak(of(a), of(b));
 }
 
 /** Merge an incoming station summary into a known one, and the newer trim.

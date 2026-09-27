@@ -129,6 +129,16 @@ describe('the gate on a dock port', () => {
     expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
   });
 
+  it('finds a live gate however many malformed layout keys come first', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    for (let i = 0; i < 1100; i++) doc.getMap('doorLayout').set(`d:junk${String(i).padStart(4, '0')}`, { nope: true });
+    doc.getMap('doorLayout').set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
+    expect(readDockGates()).toEqual({ 'd:live': 5 });
+    expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
+  });
+
   it('takes the lowest number free in the station', () => {
     expect(nextFreeGate([])).toBe(1);
     expect(nextFreeGate([1, 2, 4])).toBe(3);
@@ -321,6 +331,17 @@ describe('the station record', () => {
     expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([]);
   });
 
+  it('keeps all 99 gates of one room through the atlas and its gossip', () => {
+    const gates: Record<string, number> = {};
+    for (let i = 1; i <= 99; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
+    harvestIntoAtlas({ roomId: 'room-full', name: 'FULL', doors: [], gates });
+    registerStation({ id: 'full', name: 'FULL', planetId: 'planet-sovereign', orbitSlot: 7, welcomeRoomId: 'room-full' });
+    expect(listStations().find((s) => s.id === 'full')?.berths).toHaveLength(99);
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 5, doors: {}, gates });
+    expect(Object.keys(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates ?? {})).toHaveLength(99);
+  });
+
   it('lists every gate up to the highest number', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 20; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
@@ -351,6 +372,12 @@ describe('the per-planet summary', () => {
     const merged = mergeStation(older, newer)!;
     expect(merged.name).toBe('NEW');
     expect(merged.berths).toEqual([{ roomId: 'room-b', doorId: 'east', gate: 3 }]);
+  });
+
+  it('settles gate lists read the same moment alike, in either merge order', () => {
+    const one = base({ ownerId: 'hub', berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0 });
+    const two = base({ ownerId: 'hub', berths: [{ roomId: 'room-b', doorId: 'east', gate: 3 }], berthsAt: T0 });
+    expect(mergeStation(one, two)?.berths ?? one.berths).toEqual(mergeStation(two, one)?.berths ?? two.berths);
   });
 
   it('lets any visitor update a derived station\'s gates, though not its slot', () => {
