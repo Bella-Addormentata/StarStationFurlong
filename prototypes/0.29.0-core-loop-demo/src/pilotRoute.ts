@@ -165,6 +165,15 @@ export const MAX_LEG_SEQ = 99_999_999;
 /** The most stays one walk lays end to end before giving up. A month with no
  *  checkpoint is about 40,000 short legs; a game walks it once, then caches. */
 export const MAX_WALK_STAYS = 500_000;
+/** ⏱️ Robot legs write nothing, so the keeper writes a `dock` anchor at an
+ *  on-time robot stay this many stays past the newest timed entry
+ *  (routeKeeper.ts): a reader that joins a ferry running for months walks
+ *  from it, never from START. It says what the timetable already says. */
+export const ROUTE_ANCHOR_EVERY_STAYS = 1_000;
+/** ⏱️ How many stays past an entry the reader checks (validateCheckpoints)
+ *  lays end to end; further on it bounds the chain by the shortest transfer
+ *  instead, so an anchor far from START costs the same to check. */
+const CHAIN_EXACT_STAYS = 2 * ROUTE_ANCHOR_EVERY_STAYS;
 
 // ── Stops along the shape ────────────────────────────────────────────────────
 
@@ -292,6 +301,21 @@ class Legs {
 
   leg(legSeq: number): LegWindow | null {
     return this.pair(this.stopAt(legSeq), this.stopAt(legSeq + 1));
+  }
+
+  private shortest: number | undefined;
+
+  /** ⏱️ The shortest transfer of any leg of the shape (0 when one can't be
+   *  planned): every leg takes at least this long. */
+  minTransferMs(): number {
+    if (this.shortest === undefined) {
+      let min = Number.POSITIVE_INFINITY;
+      for (const [a, b] of routeLegPairs(this.route.stops.length, this.route.shape)) {
+        min = Math.min(min, this.pair(a, b)?.transferMs ?? 0);
+      }
+      this.shortest = Number.isFinite(min) ? min : 0;
+    }
+    return this.shortest;
   }
 
   /** Leg `legSeq`'s first window at or after `base`. */
@@ -556,8 +580,23 @@ export function validateCheckpoints(
     let reachable = true;
     let walked = 0;
     while (!pausedHere && chainStay < legSeq) {
+      if (walked >= CHAIN_EXACT_STAYS) {
+        // ⏱️ Far past the last entry: every leg takes at least the shortest
+        // transfer, which still bounds the stay from below (never above).
+        const skipped = legSeq - chainStay;
+        const into = legs.leg(legSeq - 1)?.transferMs ?? 0;
+        chainArrival += skipped * legs.minTransferMs();
+        chainDepart = chainArrival - into;
+        chainStay = legSeq;
+        // Not reached yet: even the leg into the stay before it can't have
+        // left by now (it arrives no sooner than one shortest transfer back).
+        const before = chainArrival - legs.minTransferMs() - (legs.leg(legSeq - 2)?.transferMs ?? 0);
+        if (skipped > 1 && before - GUARD_BAND_MS > limit) reachable = false;
+        break;
+      }
       const w = legs.windowAfter(chainStay, chainArrival);
-      if (!w || ++walked > MAX_WALK_STAYS) { reachable = false; break; }
+      if (!w) { reachable = false; break; }
+      walked++;
       chainDepart = w.departAt;
       chainArrival = w.arriveAt;
       chainStay++;
@@ -1085,10 +1124,25 @@ function anchorCursor(route: ShipRoute, p: Prepared, capacity: number): StayCurs
     fuel = clampFuelToCapacity(capacity, capacity);
   } else {
     fuel = clampFuelToCapacity(src.fuel, capacity);
-    for (let j = src.legSeq; j < a; j++) {
+    let j = src.legSeq;
+    // ⏱️ The last arrival home before the anchor fills the tanks whatever
+    // they held: fly on from there (at most one cycle back).
+    if (route.homeRefuel) {
+      const floor = Math.max(src.legSeq, a - routeCycleLength(route.stops.length, route.shape));
+      for (let h = a - 1; h >= floor; h--) {
+        if (p.legs.stopAt(h + 1) === 0 && p.legs.leg(h)) {
+          fuel = clampFuelToCapacity(capacity, capacity);
+          j = h + 1;
+          break;
+        }
+      }
+    }
+    for (; j < a; j++) {
       const leg = p.legs.leg(j);
       if (!leg) break;
       fuel = arriveWith(route, fuel, leg.fuelCost, leg.to, capacity);
+      // Empty with no refill ahead: it stays empty.
+      if (fuel <= 0 && !route.homeRefuel) break;
     }
   }
   return { legSeq: a, arrival: null, fuel, pilot: allowedPilot(route, pilot) };

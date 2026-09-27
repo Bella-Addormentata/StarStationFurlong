@@ -26,12 +26,14 @@ import {
 import {
   GUARD_BAND_MS,
   HOLD_UNWATCHED_MS,
+  ROUTE_ANCHOR_EVERY_STAYS,
   dockCheckpoint,
   holdCheckpoint,
   legWindowAfter,
   liveDockFrom,
   pauseCheckpoint,
   routeFlightAt,
+  routeCycleLength,
   skipCheckpoint,
   startCheckpoint,
 } from './pilotRoute';
@@ -188,6 +190,36 @@ describe('one tick of the keeper', () => {
     const f = flightAt(R, [S], now, dockedAtStop(0, T0 - SEC));
     expect(keeperStep(view(R, f, now, { port: DOCKED_HERE, docks: { atStop: T0 - SEC, atNext: null, elsewhere: 0 } })))
       .toEqual({ kind: 'idle', why: 'docked' });
+  });
+
+  it('⏱️ writes an anchor at an on-time robot stay far past the newest timed entry, and only there', () => {
+    const now = S.departAt - 30 * SEC;
+    const here = flightAt(R, [S], now, dockedAtStop(0, T0 - SEC));
+    // The same stop a thousand cycles on: the same stay figures.
+    const k = routeCycleLength(R.stops.length, R.shape) * ROUTE_ANCHOR_EVERY_STAYS;
+    const f = { ...here, legSeq: k };
+    const at = (over: Partial<KeeperView> = {}, ff: RouteFlight = f, t = now) =>
+      keeperStep(view(R, ff, t, { port: DOCKED_HERE, docks: { atStop: T0 - SEC, atNext: null, elsewhere: 0 }, anchorSeq: 0, ...over }));
+    const step = at();
+    expect(step).toMatchObject({ kind: 'write', why: 'anchor' });
+    if (step.kind !== 'write') return;
+    // It says what the timetable says: the stay's arrival and departure.
+    expect(step.entry).toEqual(dockCheckpoint(R, k, { at: now, stayStart: here.stayStart!, pilot: 'robot' }));
+    expect(step.entry).toMatchObject({ kind: 'dock', legSeq: k, stayStart: here.stayStart, departAt: here.departsAt, arriveAt: here.arrivesAt });
+    // Not yet that far, nothing known, a dock entry already here, just written.
+    const idleDocked = { kind: 'idle', why: 'docked' };
+    expect(at({ anchorSeq: k - ROUTE_ANCHOR_EVERY_STAYS + 1 })).toEqual(idleDocked);
+    expect(at({ anchorSeq: undefined })).toEqual(idleDocked);
+    expect(at({ stayDock: true })).toEqual(idleDocked);
+    const memory = freshKeeperMemory(T0, k);
+    memory.wroteAt.anchor = now - SEC;
+    expect(at({ memory })).toEqual(idleDocked);
+    // Not in the guard band, not while holding a stay open for a person, not
+    // with no known arrival, and not once STOP was pressed.
+    expect(at({}, f, S.departAt - GUARD_BAND_MS)).toEqual(idleDocked);
+    expect(at({}, { ...f, takeoverAt: S.departAt + 5 * 60 * SEC })).toEqual(idleDocked);
+    expect(at({}, { ...f, stayStart: null })).toEqual(idleDocked);
+    expect(at({}, { ...f, stopping: true })).toEqual(idleDocked);
   });
 
   it('casts off on time, up to 10 s after the departure, and the leg stands', () => {

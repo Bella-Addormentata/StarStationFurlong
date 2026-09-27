@@ -100,6 +100,10 @@
  * its RESUME mark through the keeper's own rewrites of that stay's `dock`
  * (end-hold, restart), or every entry after it would read as too early.
  * 🚚 A tug towing a station is left alone (its tow holds the ship).
+ * ⏱️ Robot legs write nothing, so a robot stay docked on time once
+ * ROUTE_ANCHOR_EVERY_STAYS stays past the newest timed entry writes a `dock`
+ * anchor with its own arrival (anchorStep): the departure it names is the
+ * one the timetable has already, and readers walk on from it, not from START.
  *
  * Pure decision functions (keeperStep, keeperAfterPass, passVerdict,
  * keeperBerths, keeperMayOperate …) plus a thin effectful loop
@@ -112,9 +116,11 @@ import { readAllDoors, writeDoorTombstone } from './doorsDoc';
 import {
   CLOCK_AHEAD_MS,
   GUARD_BAND_MS,
+  ROUTE_ANCHOR_EVERY_STAYS,
   dockCheckpoint,
   holdCheckpoint,
   isRouteRunning,
+  isTimedCheckpoint,
   renewedHold,
   routeRulesFlight,
   skipCheckpoint,
@@ -223,7 +229,7 @@ export interface KeeperMemory {
   castOff: boolean;
 }
 
-export type KeeperWrite = 'end-hold' | 'restart' | 'renew-hold' | 'hold' | 'skip';
+export type KeeperWrite = 'end-hold' | 'restart' | 'renew-hold' | 'hold' | 'skip' | 'anchor';
 
 export function freshKeeperMemory(run: number, legSeq: number): KeeperMemory {
   return {
@@ -263,6 +269,9 @@ export interface KeeperView {
   /** 🚚 This ship is towing a station (stationMove.isTowing): the keeper
    *  leaves it docked. Absent: false. */
   towing?: boolean;
+  /** ⏱️ The stay of the newest timed entry at or before this one
+   *  (newestTimedStay); absent when none is known. */
+  anchorSeq?: number;
   memory: KeeperMemory;
 }
 
@@ -283,6 +292,16 @@ export function standingHold(checkpoints: readonly RouteCheckpoint[], legSeq: nu
     if ((e.kind === 'dock' || e.kind === 'go' || e.kind === 'skip' || e.kind === 'pause') && e.at >= hold.at) return null;
   }
   return hold;
+}
+
+/** ⏱️ The stay of the newest timed entry (START, dock, skip, go) at or
+ *  before stay `legSeq`, or undefined. */
+export function newestTimedStay(checkpoints: readonly RouteCheckpoint[], legSeq: number): number | undefined {
+  let best: number | undefined;
+  for (const e of checkpoints) {
+    if (isTimedCheckpoint(e) && e.legSeq <= legSeq && (best === undefined || e.legSeq > best)) best = e.legSeq;
+  }
+  return best;
 }
 
 /** Does stay `legSeq` carry a `dock` entry? */
@@ -370,7 +389,7 @@ export type KeeperStep =
   /** Cast off: every dock the ferry has (`departure`, `in-flight`), or only
    *  the route's port, docked at the wrong stop (`wrong-stop`). */
   | { kind: 'cast-off'; why: 'departure' | 'in-flight' | 'wrong-stop' }
-  | { kind: 'write'; why: 'end-hold' | 'restart' | 'renew-hold'; entry: RouteCheckpoint }
+  | { kind: 'write'; why: 'end-hold' | 'restart' | 'renew-hold' | 'anchor'; entry: RouteCheckpoint }
   /** Start a dock pass through the gate list. */
   | { kind: 'dock' };
 
@@ -380,6 +399,24 @@ const idle = (why: KeeperIdle): KeeperStep => ({ kind: 'idle', why });
 function mayWrite(mem: KeeperMemory, why: KeeperWrite, now: number): boolean {
   const last = mem.wroteAt[why];
   return last === undefined || now - last >= KEEPER_WRITE_GAP_MS || now < last;
+}
+
+/**
+ * ⏱️ The anchor a robot stay docked on time writes once it is
+ * ROUTE_ANCHOR_EVERY_STAYS stays past the newest timed entry: a `dock` entry
+ * with the stay's own arrival, so its departure is the one the timetable
+ * already has. Readers then walk from it, never from START. Null when not due.
+ */
+function anchorStep(v: KeeperView): KeeperStep | null {
+  const { flight: f, now, route, memory: mem } = v;
+  if (v.anchorSeq === undefined || f.legSeq - v.anchorSeq < ROUTE_ANCHOR_EVERY_STAYS) return null;
+  if (v.stayDock || f.pilot !== 'robot' || f.takeoverAt !== null || f.stopping || f.skipped) return null;
+  if (f.stayStart === null || f.departsAt === null || inGuardBand(f, now)) return null;
+  if (!mayWrite(mem, 'anchor', now)) return null;
+  const entry = dockCheckpoint(route, f.legSeq, { at: now, stayStart: f.stayStart, pilot: 'robot' });
+  // Only one that changes nothing.
+  if (!entry || entry.departAt !== f.departsAt) return null;
+  return { kind: 'write', why: 'anchor', entry };
 }
 
 /**
@@ -430,7 +467,7 @@ export function keeperStep(v: KeeperView): KeeperStep {
     }
     if (f.ended !== null) return idle('ended');
     if (personDeparts(f)) return idle('person-departs');
-    if (!dueToLeave(f, now)) return idle('docked');
+    if (!dueToLeave(f, now)) return anchorStep(v) ?? idle('docked');
     // 🛟 Another pairing this game may not release holds the ferry: no
     // cast-off (it would leave half-docked) and no restart (it would restart
     // every window) until someone with rights lets it go.
@@ -1015,6 +1052,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       stayDock: stayHasDock(ckpts, f.legSeq),
       stayResume: stayResumed(ckpts, f.legSeq),
       towing: towingNow(),
+      anchorSeq: newestTimedStay(ckpts, f.legSeq),
       memory,
     };
   };
