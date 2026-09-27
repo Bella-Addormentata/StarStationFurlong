@@ -85,10 +85,20 @@ export const DEFAULT_STATION_RECORD: StationRecord = {
 const KEY = 'ssf-stations';
 const MAX_RECORDS = 32;
 
+/** Prefix of derived station ids — never accepted on a saved record. */
+const DERIVED_PREFIX = 'station:';
+
+/** Solar-map body ids a station may not take (map.ts initializeBodies): a
+ *  station sharing an id with a planet would confuse selection and travel. */
+const RESERVED_BODY_IDS = new Set([
+  'star-sol', 'lagrange-l4', 'lagrange-l5', 'belt-ring', ...PLANETS.map((p) => p.id),
+]);
+
 function isRecord(v: unknown): v is StationRecord {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Record<string, unknown>;
   return typeof r.id === 'string' && r.id.length > 0 && r.id.length <= 128
+    && !r.id.startsWith(DERIVED_PREFIX) && !RESERVED_BODY_IDS.has(r.id)
     && typeof r.name === 'string' && r.name.length > 0 && r.name.length <= 64
     && typeof r.planetId === 'string'
     && Number.isInteger(r.orbitSlot) && (r.orbitSlot as number) >= 0 && (r.orbitSlot as number) < MAX_ORBIT_SLOTS
@@ -118,8 +128,9 @@ function clean(r: StationRecord): StationRecord {
 }
 
 /** Save (or replace, by id) a station record on this install. Returns false
- *  for an invalid record, one that would shadow the built-in default, or one
- *  whose planet has no free orbit slot left. */
+ *  for an invalid record, one that would shadow the built-in default, a solar
+ *  map body or a derived station id, or one whose planet has no free orbit
+ *  slot left. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
   const records = readStationRecords().filter((r) => r.id !== record.id);
@@ -185,7 +196,7 @@ export function listStations(
     const slot = claim(DEFAULT_PLANET_ID, 0);
     if (slot === null) break;
     out.push({
-      id: `station:${d.anchor}`,
+      id: `${DERIVED_PREFIX}${d.anchor}`,
       name: d.name,
       planetId: DEFAULT_PLANET_ID,
       orbitSlot: slot,

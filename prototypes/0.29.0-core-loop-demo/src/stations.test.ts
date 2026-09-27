@@ -152,6 +152,9 @@ describe('saved records', () => {
     expect(registerStation({ ...base, orbitSlot: -1 })).toBe(false);
     expect(registerStation({ ...base, orbitSlot: 1.5 })).toBe(false);
     expect(registerStation({ ...base, welcomeRoomId: '' })).toBe(false);
+    expect(registerStation({ ...base, id: 'planet-sovereign' })).toBe(false);
+    expect(registerStation({ ...base, id: 'belt-ring' })).toBe(false);
+    expect(registerStation({ ...base, id: 'station:yard-a' })).toBe(false);
     expect(readStationRecords()).toEqual([]);
   });
 
