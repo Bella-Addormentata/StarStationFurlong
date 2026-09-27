@@ -248,6 +248,16 @@ describe('the station list follows a move', () => {
     expect(withSecond.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
   });
 
+  it('never lets an unknown planet id share a slot with the planet it reads as', () => {
+    const odd: StationMove = { ...moveTo(), stationId: 'odd', welcomeRoomId: 'o', toPlanetId: 'planet-unknown', toSlot: 0 };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'o' ? odd : null));
+    const rec: StationRecord = { id: 'odd', name: 'ODD', planetId: ARIS, orbitSlot: 3, welcomeRoomId: 'o' };
+    const list = listStations({}, [rec], odd.arriveAt + 1);
+    const taken = list.filter((s) => s.planetId === SOV).map((s) => s.orbitSlot);
+    expect(new Set(taken).size).toBe(taken.length);
+    expect(list.find((s) => s.id === 'odd')).toMatchObject({ planetId: SOV });
+  });
+
   it('holds every dock of a station between planets, and only then', () => {
     const move = moveTo();
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));

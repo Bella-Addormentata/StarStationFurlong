@@ -377,8 +377,10 @@ export function listStations(
       }).length;
       if (there >= MAX_ORBIT_SLOTS) at = { planetId: m.fromPlanetId, orbitSlot: m.fromSlot };
     }
-    let slot = claim(at.planetId, at.orbitSlot);
-    let planetId = at.planetId;
+    // Claim under the planet the station is listed at (an unknown id reads as
+    // the default planet), so two ids for one planet never share a slot.
+    let planetId = planetById(at.planetId).id;
+    let slot = claim(planetId, at.orbitSlot);
     // A station that moved and still finds no room (every planet it could
     // be at is full) takes the first planet with a free slot, so an accepted
     // move never loses a station. One that never moved is refused as always.

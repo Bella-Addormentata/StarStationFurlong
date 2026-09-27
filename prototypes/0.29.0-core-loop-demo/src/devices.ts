@@ -2709,7 +2709,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const towContext = (engines: number, fuel: number, commander: boolean, now: number): TowContext => {
     const stations = listStationRecordsNow();
     const hereId = stationHere();
-    const station = hereId ? stations.find((st) => st.id === hereId) ?? null : null;
+    // Only a free ship tows: a module bolted on by a gangway is part of a
+    // station (whose helm shows this face on its FUEL & DOCKING tab), and a
+    // station never tows another.
+    const bolted = (docking?.connected() ?? []).some((m) => !m.dock);
+    const station = hereId && !bolted ? stations.find((st) => st.id === hereId) ?? null : null;
     return {
       station,
       stations,
@@ -2774,7 +2778,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const now = Date.now();
     const plan = planStationTow(towContext(countFunction('engine'), fuel, helmIsCommander(), now), planetId);
     if (!plan.ok) {
-      towFlash = { text: describeTowRefusal(plan.refusal, plan.quote, fuel), until: now + 5_000 };
+      const flash = { text: describeTowRefusal(plan.refusal, plan.quote, fuel), until: now + 5_000 };
+      towFlash = flash;
+      // Nothing else re-renders a docked ship, so the note clears itself.
+      setTimeout(() => {
+        if (towFlash !== flash) return;
+        towFlash = null;
+        if (panel) render();
+      }, 5_050);
     } else if (readFlightRecord().status === 'docked') {
       towFlash = null;
       writeStationMove(plan.move);
