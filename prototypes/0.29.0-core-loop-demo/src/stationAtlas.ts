@@ -475,14 +475,29 @@ function isPlainGates(v: unknown): v is Record<string, unknown> {
     && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
 }
 
-/** Only door id → integer gate pairs, at most one per gate number. */
+/** Only door id → integer gate pairs, at most MAX_GATE_NUMBER of them. Every
+ *  distinct number is taken first, so ports sharing a number (two stations
+ *  joined, a peer's junk) can never push another gate out; a duplicate
+ *  fills only room that is left. */
 function cleanGates(v: Record<string, unknown>): Record<string, number> {
   const out: Record<string, number> = {};
+  const numbers = new Set<number>();
+  const repeats: Array<[string, number]> = [];
   let kept = 0;
   for (const [doorId, gate] of Object.entries(v)) {
     if (kept >= MAX_GATE_NUMBER) break;
     if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
     if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
+    if (numbers.has(gate)) {
+      if (repeats.length < MAX_GATE_NUMBER) repeats.push([doorId, gate]);
+      continue;
+    }
+    numbers.add(gate);
+    out[doorId] = gate;
+    kept++;
+  }
+  for (const [doorId, gate] of repeats) {
+    if (kept >= MAX_GATE_NUMBER) break;
     out[doorId] = gate;
     kept++;
   }

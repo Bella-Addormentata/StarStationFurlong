@@ -363,6 +363,15 @@ describe('the station record', () => {
     expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([]);
   });
 
+  it('never lets ports sharing a number push another gate out', () => {
+    const gates: Record<string, number> = {};
+    for (let i = 0; i < 120; i++) gates[`d:dup${String(i).padStart(4, '0')}`] = 1;
+    gates['d:real'] = 2;
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 5, doors: {}, gates });
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates?.['d:real']).toBe(2);
+  });
+
   it('keeps all 99 gates of one room through the atlas and its gossip', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 99; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
