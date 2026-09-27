@@ -88,11 +88,14 @@ export function planArrivalDock(input: {
   ports: readonly ArrivalPort[];
   now?: number;
 }): ArrivalPlan {
-  const { station, remembered, ports } = input;
+  const { station, ports } = input;
   // The station's berth wins; the ship's own memory fills in when the station
   // names none, or names the same room without saying which door (the memory
   // knows the door and its geometry — a dock that can ask the far side).
-  const stationBerth = station.berth ?? null;
+  // Peer-written addresses: one that names no room is no berth at all (it
+  // would reach the door record as a tombstone DOCK cannot parse).
+  const stationBerth = station.berth && isRoomSeed(station.berth.address) ? station.berth : null;
+  const remembered = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
   const berth: StationBerth | null =
     remembered &&
     (!stationBerth ||
@@ -103,7 +106,10 @@ export function planArrivalDock(input: {
   if (ports.some((p) => p.state.kind === 'docked' && sameRoom(p.state.address, berth.address))) {
     return { kind: 'none', reason: 'already-docked' };
   }
-  const open = (p: ArrivalPort) => p.state.kind === 'undocked' || p.state.kind === 'free';
+  // Open = free to dock AND ours to use right now: a busy or locked port
+  // would refuse DOCK after its door record was already re-pointed.
+  const open = (p: ArrivalPort) =>
+    (p.state.kind === 'undocked' || p.state.kind === 'free') && !p.busy && p.canOperate !== false;
   const preferred = remembered ? ports.find((p) => p.doorId === remembered.doorId && open(p)) : undefined;
   const port = preferred ?? ports.find(open);
   if (!port) return { kind: 'none', reason: 'no-port' };
@@ -139,6 +145,15 @@ export function shipLocationId(rec: FlightRecord, hasLiveDock: boolean): string 
 }
 
 /** Two pass seeds reach the same room (a seed's hints may differ). */
+/** Does this seed name a room? Malformed peer-written seeds throw; fail closed. */
+function isRoomSeed(seed: string): boolean {
+  try {
+    return roomIdFromSeed(seed) !== '';
+  } catch {
+    return false;
+  }
+}
+
 function sameRoom(a: string, b: string): boolean {
   if (a === b) return true;
   // Peer-written seeds: a malformed one (e.g. `#room=%`) makes the parser

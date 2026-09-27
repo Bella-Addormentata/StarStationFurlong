@@ -103,6 +103,38 @@ describe('planArrivalDock', () => {
     })).not.toThrow();
   });
 
+  it('never plans a dock to a berth whose address names no room', () => {
+    const bad = 'ssf://room#room=%';
+    expect(planArrivalDock({
+      station: { berth: { address: bad } },
+      remembered: null,
+      ports: [{ doorId: 'east', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'no-berth' });
+    expect(planArrivalDock({
+      station: {},
+      remembered: { doorId: 'north', address: bad },
+      ports: [{ doorId: 'north', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'no-berth' });
+  });
+
+  it('passes over a port that is mid-operation or not ours to operate', () => {
+    const plan = planArrivalDock({
+      station: { berth: { address: SEED_HIGH, farDoor: 'd:a3313fdd' } },
+      remembered: { doorId: 'north', address: SEED_FURLONG },
+      ports: [
+        { doorId: 'north', state: FREE, busy: true },
+        { doorId: 'east', state: FREE, canOperate: false },
+        { doorId: 'west', state: FREE, busy: false, canOperate: true },
+      ],
+    });
+    expect(plan.kind === 'dock' && plan.doorId).toBe('west');
+    expect(planArrivalDock({
+      station: { berth: { address: SEED_HIGH, farDoor: 'd:a3313fdd' } },
+      remembered: null,
+      ports: [{ doorId: 'north', state: FREE, busy: true }],
+    })).toEqual({ kind: 'none', reason: 'no-port' });
+  });
+
   it('skips a remembered port that is busy and takes the next open one', () => {
     const plan = planArrivalDock({
       station: {},
