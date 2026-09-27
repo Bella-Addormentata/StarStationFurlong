@@ -115,6 +115,11 @@ import {
 // funnels the current-room owner predicate into the device UI.
 import { noteShipArrival, setHelmOwnerCheck } from "./devices";
 import { completeArrival } from "./shipArrival";
+// 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
+// Its trim record rides the room doc (bound beside the ship doc) and its
+// burns are owner-gated with the helm's own commander predicate.
+import { bindStationKeepingDoc } from "./stationKeeping";
+import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
@@ -1464,6 +1469,7 @@ async function joinRoomAtEpoch(
   // branch will read this same doc — plan §7 SH4 — but no exterior code
   // consumes shipDoc in the shipped SH3 slice.)
   bindShipDoc(sync.doc);
+  bindStationKeepingDoc(sync.doc);
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1717,6 +1723,7 @@ async function joinRoomAtEpoch(
       return isLocalPlayerRoomOwner(ownerVal);
     };
     setHelmOwnerCheck(isHelmCommander);
+    setStationHelmCommanderCheck(isHelmCommander);
     // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
     // ticks the countdown while open, but a flight must complete even if no
     // one has the panel up — otherwise a `in-flight` record with a past
