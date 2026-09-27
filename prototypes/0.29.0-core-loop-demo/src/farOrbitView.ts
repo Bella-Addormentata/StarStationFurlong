@@ -39,7 +39,7 @@ import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { shipsAroundPlanet } from './planetSummary';
-import { moveTransitPointAt } from './stationMove';
+import { isPinMove, moveTransitPointAt } from './stationMove';
 import { readFlightRecord, shipDocBound } from './shipDoc';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -106,6 +106,13 @@ function flightPlan(
 /** Modules to draw for a station: the rooms of its atlas component that
  *  the (capped) atlas actually holds. A component also names door targets
  *  with no entry, which peers control, so those never count. */
+/** Between planets right now. A stay-put pin move (stationMove.isPinMove,
+ *  written after an arrival) is a station settled at its slot, never a
+ *  transfer. */
+function reallyMoving(s: StationRecord, now: number): boolean {
+  return !!s.move && !isPinMove(s.move) && stationInTransit(s, now);
+}
+
 function modulesOf(station: StationRecord, components: Set<string>[], atlas: Record<string, unknown>): number {
   if (!station.welcomeRoomId) return 1;
   const component = components.find((c) => c.has(station.welcomeRoomId));
@@ -147,7 +154,7 @@ function gather(now: number): Source {
   // The sun view only while the move really has a course right now (a
   // malformed record, say both ends on one planet, has none): otherwise the
   // planet view below, never an empty backdrop.
-  if (me?.move && stationInTransit(me, now) && moveTransitPointAt(me.move, now)) {
+  if (me && reallyMoving(me, now) && me.move && moveTransitPointAt(me.move, now)) {
     const m = me.move;
     return { mode: 'sun', move: m, key: [
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
@@ -197,7 +204,7 @@ function gather(now: number): Source {
     // A ship in flight is listed as its own one-module station too; it is
     // drawn on its transfer instead, never also on a circular orbit.
     .filter((s) => !flying.has(s.welcomeRoomId))
-    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
+    .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 
   const key = [
