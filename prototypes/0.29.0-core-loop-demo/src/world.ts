@@ -146,10 +146,19 @@ import type {
   PropAnimHandle,
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
+  AirHockeyVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
-import { subscribeGames, readGame } from "./games/gamesDoc";
+import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+// 🏒 #115: the air-hockey live layer — World feeds it built table handles +
+// frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
+import {
+  airHockeyFrame,
+  closeAirHockeyTable,
+  createAirHockeyUI,
+  registerAirHockeyVisual,
+} from "./airHockeySession";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom } from "./editMode";
 import { showHint } from "./hud";
@@ -407,6 +416,9 @@ export class World {
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   private propAnims: Map<string, PropAnimHandle> = new Map();
+  /** 🏒 Air-hockey table visuals, keyed by item id — filed here, then handed
+   *  to the session layer, which drives them (airHockeyFrame). */
+  private airHockeyVisuals: Map<string, AirHockeyVisualHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -1575,6 +1587,18 @@ export class World {
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
         if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+        // 🏒 #115: hand the filed air-hockey handle to the session layer,
+        // which drives it every frame (airHockeyFrame) and converts its LOCAL
+        // coords to the world-space tick wire — read back from the sink for
+        // the same reason as the table top above.
+        const hockey = sinks.airHockeyVisuals.get(item.id);
+        if (hockey) {
+          registerAirHockeyVisual(item.id, hockey, {
+            x: item.pos.x,
+            z: item.pos.z,
+            rot: item.rot,
+          });
+        }
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1618,6 +1642,7 @@ export class World {
       slotMachineVisuals: this.slotMachineVisuals,
       coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
+      airHockeyVisuals: this.airHockeyVisuals,
     };
   }
 
@@ -3043,6 +3068,7 @@ export class World {
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
+    this.airHockeyVisuals.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3060,6 +3086,14 @@ export class World {
       // 🪙 Stop operating it here. The deed holder's session that operates it
       // pays the chips still inside to the deed holder and wipes its keys.
       closeCoinPusher(itemId);
+    } else if (removedKind === "air-hockey-table") {
+      // 🏒 #115: drop the runtime session (stops the frame drive + tick
+      // routing to the freed handle) and wipe the table's doc state. Moves
+      // never pass here (the reconcile re-poses the existing group), so this
+      // only fires on true removals; the delete is idempotent, safe for every
+      // observing client to run.
+      closeAirHockeyTable(itemId);
+      clearTable(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -3790,6 +3824,11 @@ export class World {
     // speaker is off — the handle reads that itself).
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
     this.updateSeatedSlotSession();
+
+    // 🏒 #115: advance every air-hockey table — operator puck sim + doc
+    // writes, 30/20 Hz tick sends, remote smoothing, scoreboard/goal lamps.
+    // The session module owns the registry; this is its only clock.
+    airHockeyFrame(deltaTime);
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -5650,6 +5689,36 @@ export class World {
         canEdit: () => canEditRoom().ok,
       });
       deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "airHockey") {
+      // 🏒 #115: walk to a FREE end and play first-person from it. Stand slot
+      // s0 is the cyan/a end (local −z), s1 the orange/b end (local +z) — the
+      // template INDEX is the side, read from the `${itemId}:s${n}` slot id.
+      // Every slot taken (or unreachable) falls back to the a end, matching
+      // standTarget's fallback-to-device-front behavior.
+      const stand = this.pickFreeStand(deviceId);
+      const standIdx = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
+        : 0;
+      const side = standIdx === 1 ? ("b" as const) : ("a" as const);
+      // The def bakes side a's eye; side b's is its point reflection through
+      // the table centre (anchor) — one def entry serves both ends, and the
+      // focus camera still eases eye → look-at-anchor exactly as baked.
+      const eye =
+        side === "a"
+          ? device.eye
+          : new THREE.Vector3(
+              2 * device.anchor.x - device.eye.x,
+              device.eye.y,
+              2 * device.anchor.z - device.eye.z,
+            );
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : { ...device, eye };
+      const ui = createAirHockeyUI({ itemId: deviceId, side });
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 

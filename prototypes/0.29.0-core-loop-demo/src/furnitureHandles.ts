@@ -33,6 +33,7 @@ import type {
   SlotMachineVisualHandle,
   CoinPusherVisualHandle,
   PropAnimHandle,
+  AirHockeyVisualHandle,
 } from './devices';
 
 /**
@@ -60,6 +61,10 @@ export interface FurnitureHandleSinks {
   coinPusherVisuals: Map<string, CoinPusherVisualHandle>;
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   propAnims: Map<string, PropAnimHandle>;
+  /** 🏒 Air-hockey table visuals (mallets/puck/scoreboard), keyed by item id.
+   *  Both registration paths read the filed handle back and hand it, with the
+   *  item's pose, to the session layer (airHockeySession.ts), which drives it. */
+  airHockeyVisuals: Map<string, AirHockeyVisualHandle>;
 }
 
 /**
@@ -91,4 +96,5 @@ export function registerFurnitureHandles(
     sinks.coinPusherVisuals.set(itemId, d.coinPusherVisual as CoinPusherVisualHandle);
   }
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
+  if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
 }
