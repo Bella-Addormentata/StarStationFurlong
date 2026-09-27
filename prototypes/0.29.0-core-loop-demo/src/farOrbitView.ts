@@ -151,7 +151,9 @@ function gather(now: number): Source {
         rec.departedAt,
         rec.etaAt,
       );
-      if (aboard && transferPointAt(aboard, now).leg !== 'transfer') aboard = null;
+      // Kept through every leg: a ship casts off before its launch window,
+      // and transferPointAt holds it on the source orbit while it waits (and
+      // on the target orbit once it is there) until it docks.
     }
   }
 
@@ -566,7 +568,9 @@ export function renderWithFarPass(
   const cameraLayers = camera.layers.mask;
   try {
     update(renderer, camera);
-    // 1. The sky alone (clears with the scene background as usual).
+    // 1. The sky alone (clears with the scene background as usual). A room
+    //    shows its nebula only on a deck, so the sky is shown for this pass.
+    for (const o of sky) o.visible = true;
     camera.layers.set(SKY_LAYER);
     renderer.render(scene, camera);
     camera.layers.mask = cameraLayers;
