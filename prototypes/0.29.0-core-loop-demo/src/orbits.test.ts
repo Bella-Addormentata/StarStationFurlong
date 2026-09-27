@@ -2,18 +2,21 @@
  * 🪐 orbits — circular station orbits on the shared clock, and Hohmann
  * transfers between them.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import * as THREE from 'three';
 import {
   ORBIT_EPOCH_MS,
   ORBIT_TIME_SCALE,
   SLOT0_ALTITUDE_KM,
   angleAt,
+  circularOrbit,
   inStationFrame,
   orbitForSlot,
   planTransfer,
   realMsFor,
+  setStationTrimResolver,
   stationHeadingAt,
+  stationOrbit,
   stationPointAt,
   toPlanetFrame,
   transferPointAt,
@@ -202,5 +205,51 @@ describe('the planet frame', () => {
     const late = transferPointAt(plan, plan.arriveAt - 1);
     expect(early.speedKmS).toBeGreaterThan(plan.from.speedKmS); // after the prograde burn
     expect(late.speedKmS).toBeLessThan(plan.to.speedKmS); // before the circularising burn
+  });
+});
+
+describe('station keeping: the trim seam', () => {
+  const NOW = ORBIT_EPOCH_MS + 44_444_444;
+  afterEach(() => setStationTrimResolver(null));
+
+  it('builds any circular orbit the way the slots are built', () => {
+    const slot = orbitForSlot(SOV, 3);
+    expect(circularOrbit(planetById(SOV), slot.radiusKm, slot.phase0)).toEqual(slot);
+    const o = circularOrbit(planetById(SOV), 7000, -0.5);
+    expect(o.meanMotion).toBeCloseTo(Math.sqrt(MU / 7000 ** 3), 15);
+    expect(o.periodS).toBeCloseTo((2 * Math.PI) / o.meanMotion, 9);
+    expect(o.speedKmS).toBeCloseTo(Math.sqrt(MU / 7000), 12);
+    expect(o.phase0).toBeCloseTo(2 * Math.PI - 0.5, 12);
+  });
+
+  it('flies every station on its slot orbit while no resolver is installed', () => {
+    expect(stationOrbit(station(2))).toEqual(orbitForSlot(SOV, 2));
+  });
+
+  it('flies a trimmed station on its trimmed orbit everywhere: position, heading and transfers', () => {
+    const trimmed = station(1);
+    const slot = orbitForSlot(SOV, 1);
+    setStationTrimResolver((s, slotOrbit) => (s.id === trimmed.id
+      ? { radiusKm: slotOrbit.radiusKm + 10, phase0: slotOrbit.phase0 + 0.01 }
+      : null));
+    const o = stationOrbit(trimmed);
+    expect(o.radiusKm).toBeCloseTo(slot.radiusKm + 10, 9);
+    expect(o.meanMotion).toBeCloseTo(Math.sqrt(MU / o.radiusKm ** 3), 15); // its own Kepler rate
+    expect(stationPointAt(trimmed, NOW)).toEqual({ radiusKm: o.radiusKm, angle: angleAt(o, NOW) });
+    expect(stationHeadingAt(trimmed, NOW)).toBeCloseTo(angleAt(o, NOW), 12);
+    expect(planTransfer(trimmed, station(3), NOW)!.from).toEqual(o);
+    // Other stations, and a station given without its id, keep their slots.
+    expect(stationOrbit(station(3))).toEqual(orbitForSlot(SOV, 3));
+    expect(stationOrbit({ planetId: SOV, orbitSlot: 1 })).toEqual(slot);
+  });
+
+  it('ignores a resolver answer that throws, is not finite, or strays toward another slot', () => {
+    const slot = orbitForSlot(SOV, 1);
+    for (const radiusKm of [NaN, Infinity, slot.radiusKm * 1.2, slot.radiusKm * 0.8]) {
+      setStationTrimResolver(() => ({ radiusKm, phase0: 0 }));
+      expect(stationOrbit(station(1))).toEqual(slot);
+    }
+    setStationTrimResolver(() => { throw new Error('bad trim'); });
+    expect(stationOrbit(station(1))).toEqual(slot);
   });
 });

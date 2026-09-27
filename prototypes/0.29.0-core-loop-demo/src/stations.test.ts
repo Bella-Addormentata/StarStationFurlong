@@ -10,11 +10,14 @@ import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
   MAX_ORBIT_SLOTS,
+  currentStation,
   listStations,
   planetForRoom,
   readStationRecords,
   registerStation,
   removeStation,
+  setRoomStationResolver,
+  setStationRoomSource,
   stationForRoom,
   stationsAroundPlanet,
 } from './stations';
@@ -100,6 +103,12 @@ describe('atlas components', () => {
     const derived = listStations(atlas, []).filter((st) => st.derived);
     expect(derived.map((st) => st.id)).toEqual(['station:ok']);
     expect(derived[0].name).toHaveLength(64);
+  });
+
+  it('names a derived station STATION when its anchor room\'s name is not a string', () => {
+    const atlas = atlasOf(room('odd'));
+    (atlas.odd as unknown as { name: unknown }).name = 42;
+    expect(listStations(atlas, []).find((st) => st.derived)?.name).toBe('STATION');
   });
 
   it('treats a dock recorded before the berth flag existed as a berth too', () => {
@@ -221,6 +230,36 @@ describe('stationForRoom / planetForRoom', () => {
     expect(stationForRoom('nowhere', atlas)).toBeNull();
   });
 
+  it('places a docked ship at the station a resolver names, and falls back to the atlas', () => {
+    const atlas = atlasOf(room('b1'), room('ship'));
+    atlas.b1.doors['d:port'] = { targetSeed: '', targetRoomId: 'ship', transient: true };
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    // The berth is not structure: by the atlas alone the ship is a place of its own.
+    expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+    expect(planetForRoom('ship', atlas).id).toBe(DEFAULT_PLANET_ID);
+    try {
+      // Ship travel knows the room the dock leads into, and asks the atlas about it.
+      let calls = 0;
+      setRoomStationResolver((roomId) => {
+        calls++;
+        return roomId === 'ship' ? stationForRoom('b1', atlas)?.id ?? null : null;
+      });
+      expect(stationForRoom('ship', atlas)?.id).toBe('aris-yard');
+      expect(calls).toBe(1); // its own lookup went straight to the atlas
+      expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
+      setStationRoomSource(() => 'ship');
+      expect(currentStation()?.id).toBe('aris-yard');
+      // A station that is not listed, or a resolver that throws, falls back to the atlas.
+      setRoomStationResolver(() => 'nowhere');
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      setRoomStationResolver(() => { throw new Error('no dock'); });
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+    } finally {
+      setRoomStationResolver(null);
+      setStationRoomSource(() => '');
+    }
+  });
+
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
     const atlas = twoStations();
     expect(planetForRoom('nowhere', atlas).id).toBe(DEFAULT_PLANET_ID);
@@ -290,7 +329,7 @@ describe('saved records', () => {
 
 /** Runs `fn` against a stand-in document whose elements appear on first
  *  lookup, for the holotable's DOM paths. */
-function withFakeDocument(fn: (els: Map<string, { textContent: string }>) => void): void {
+function withFakeDocument(fn: (els: Map<string, { style: Record<string, string>; textContent: string }>) => void): void {
   const els = new Map<string, { style: Record<string, string>; textContent: string; innerHTML: string; disabled?: boolean }>();
   (globalThis as { document?: unknown }).document = {
     getElementById: (id: string) => {
@@ -352,6 +391,21 @@ describe('solar map station bodies', () => {
       map.refreshStations(stations, stationForRoom('yard-b', atlas, stations));
       expect(els.get('map-player-loc')?.textContent).toBe('YARD-A');
       expect(els.get('map-travel-btn')?.textContent).toBe('TRAVEL TO FURLONG LOBBY STATION');
+    });
+  });
+
+  it('hides the details of a selected station that is gone', () => {
+    withFakeDocument((els) => {
+      const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+      const map = new SolarSystemMap();
+      (map as unknown as { container: unknown }).container = {};
+      const internals = map as unknown as { selectedBody: unknown };
+      internals.selectedBody = stationBodies([rec])[0];
+      map.refreshStations(listStations({}, [rec]), DEFAULT_STATION_RECORD);
+      expect(els.get('map-selection-details')?.style.display).toBe('flex');
+      map.refreshStations(listStations({}, []), DEFAULT_STATION_RECORD);
+      expect(internals.selectedBody).toBeNull();
+      expect(els.get('map-selection-details')?.style.display).toBe('none');
     });
   });
 

@@ -21,6 +21,13 @@
  * client puts every station — and every ship on a known transfer — in the same
  * place at the same moment, within clock skew (the plan's accepted posture).
  *
+ * STATION KEEPING: a station may fly a little off its slot's orbit — a TRIM
+ * (a few km of radius, a nudge of phase) left by its station-keeping burns.
+ * Whoever knows the trims installs a resolver (setStationTrimResolver), and
+ * stationOrbit — with everything built on it: positions, headings, the frame,
+ * transfers, the holotable — flies the trimmed orbit. orbitForSlot stays the
+ * untrimmed slot orbit, the reference a trim is measured from.
+ *
  * THE PLANET FRAME (owner question, 2026-09-27: keep each station's "down"
  * parallel to the planet's axis so ships stay on one flat plane around the
  * equator). One frame per planet, shared by every view:
@@ -109,11 +116,10 @@ export interface CircularOrbit {
   phase0: number;
 }
 
-/** The circular orbit of a slot around a planet (unknown planet ⇒ default). */
-export function orbitForSlot(planetId: string, slot: number): CircularOrbit {
-  const planet = planetById(planetId);
-  const s = Number.isFinite(slot) ? Math.max(0, Math.floor(slot)) : 0;
-  const radiusKm = (planet.radiusKm + SLOT0_ALTITUDE_KM) * Math.pow(SLOT_RADIUS_RATIO, s);
+/** A circular orbit of `radiusKm` (positive, from the planet's centre) at
+ *  `phase0` radians at the epoch: period, speed and mean motion follow from
+ *  the radius by Kepler. Every orbit here is built with it. */
+export function circularOrbit(planet: PlanetRecord, radiusKm: number, phase0: number): CircularOrbit {
   const meanMotion = Math.sqrt(planet.mu / radiusKm ** 3);
   return {
     planet,
@@ -122,12 +128,64 @@ export function orbitForSlot(planetId: string, slot: number): CircularOrbit {
     periodS: TAU / meanMotion,
     speedKmS: Math.sqrt(planet.mu / radiusKm),
     meanMotion,
-    phase0: wrapAngle(PHASE_SLOT0 + s * PHASE_STEP),
+    phase0: wrapAngle(phase0),
   };
 }
 
-export function stationOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>): CircularOrbit {
-  return orbitForSlot(station.planetId, station.orbitSlot);
+/** The circular orbit of a slot around a planet (unknown planet ⇒ default) —
+ *  untrimmed, whatever station keeping says. */
+export function orbitForSlot(planetId: string, slot: number): CircularOrbit {
+  const planet = planetById(planetId);
+  const s = Number.isFinite(slot) ? Math.max(0, Math.floor(slot)) : 0;
+  const radiusKm = (planet.radiusKm + SLOT0_ALTITUDE_KM) * Math.pow(SLOT_RADIUS_RATIO, s);
+  return circularOrbit(planet, radiusKm, PHASE_SLOT0 + s * PHASE_STEP);
+}
+
+// ── Station keeping: the trim seam ───────────────────────────────────────────
+
+/** What the orbit helpers need to know about a station. A trim resolver finds
+ *  the station by `id`; without one, the station flies its slot's orbit. */
+export type OrbitingStation = Pick<StationRecord, 'planetId' | 'orbitSlot'> & { id?: string };
+
+/** The orbit a station flies when station keeping has trimmed it off its
+ *  slot's, or null for none. Only the radius and phase are read: stationOrbit
+ *  rebuilds the rest around the slot's planet. */
+export type StationTrimResolver = (
+  station: OrbitingStation & { id: string },
+  slotOrbit: CircularOrbit,
+) => Pick<CircularOrbit, 'radiusKm' | 'phase0'> | null;
+
+let trimResolver: StationTrimResolver | null = null;
+
+/** Install the trim resolver, or remove it with null. Whoever shares station
+ *  records (and so their trims) installs one; until then every station flies
+ *  its slot's orbit. */
+export function setStationTrimResolver(resolver: StationTrimResolver | null): void {
+  trimResolver = resolver;
+}
+
+/** How far a trim may move a station from its slot's radius, as a fraction of
+ *  that radius: a sanity bound well inside half the gap to either neighbouring
+ *  slot (a tenth of the radius below, an eighth above), so a trimmed station
+ *  always stays nearest its own slot. Station keeping holds a far tighter
+ *  limit of its own. */
+const MAX_TRIM_FRACTION = 0.05;
+
+/** The orbit a station flies: its slot's, or the trimmed one the resolver
+ *  gives. A resolver answer that throws, is not finite, or strays out of
+ *  bounds is ignored. */
+export function stationOrbit(station: OrbitingStation): CircularOrbit {
+  const slot = orbitForSlot(station.planetId, station.orbitSlot);
+  if (!trimResolver || typeof station.id !== 'string' || !station.id) return slot;
+  let trim: Pick<CircularOrbit, 'radiusKm' | 'phase0'> | null;
+  try {
+    trim = trimResolver(station as OrbitingStation & { id: string }, slot);
+  } catch {
+    return slot;
+  }
+  if (!trim || !Number.isFinite(trim.radiusKm) || !Number.isFinite(trim.phase0)
+    || Math.abs(trim.radiusKm - slot.radiusKm) > slot.radiusKm * MAX_TRIM_FRACTION) return slot;
+  return circularOrbit(slot.planet, trim.radiusKm, trim.phase0);
 }
 
 /** Where on its orbit a body is at a real time (radians, [0, 2π)). */
@@ -141,7 +199,7 @@ export interface OrbitPoint {
   angle: number;
 }
 
-export function stationPointAt(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>, realMs: number): OrbitPoint {
+export function stationPointAt(station: OrbitingStation, realMs: number): OrbitPoint {
   const orbit = stationOrbit(station);
   return { radiusKm: orbit.radiusKm, angle: angleAt(orbit, realMs) };
 }
@@ -163,7 +221,7 @@ export function toPlanetFrame(p: OrbitPoint): FramePoint {
 /** A planet-locked station's yaw in the planet frame — its rotation.y. It
  *  equals the station's orbit angle: at angle 0 its local axes line up with
  *  the planet frame's. */
-export function stationHeadingAt(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>, realMs: number): number {
+export function stationHeadingAt(station: OrbitingStation, realMs: number): number {
   return stationPointAt(station, realMs).angle;
 }
 
@@ -174,7 +232,7 @@ export function stationHeadingAt(station: Pick<StationRecord, 'planetId' | 'orbi
  * a view from the station draws the planet and passing traffic with.
  */
 export function inStationFrame(
-  station: Pick<StationRecord, 'planetId' | 'orbitSlot'>,
+  station: OrbitingStation,
   realMs: number,
   target: OrbitPoint | FramePoint,
 ): FramePoint {

@@ -723,10 +723,19 @@ export class SolarSystemMap {
       }
     }
     // Rebind the selection to the refreshed body (a station may have been
-    // renamed or moved since); drop it when the station is gone.
-    const fresh = this.selectedBody && this.bodies.find((b) => b.id === this.selectedBody!.id);
+    // renamed or moved since); drop it, and hide its details, when the
+    // station is gone.
+    const had = this.selectedBody;
+    const fresh = had && this.bodies.find((b) => b.id === had.id);
     this.selectedBody = fresh || null;
-    if (fresh && this.container) this.selectBody(fresh);
+    if (this.container) {
+      if (fresh) {
+        this.selectBody(fresh);
+      } else if (had) {
+        const panel = document.getElementById('map-selection-details');
+        if (panel) panel.style.display = 'none';
+      }
+    }
   }
 
   /** The station bodies now on the map, planet by planet (test/debug view). */
