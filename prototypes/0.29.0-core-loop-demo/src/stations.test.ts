@@ -19,7 +19,7 @@ import {
   stationsAroundPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
-import { SolarSystemMap, stationBodies } from './map';
+import { SolarSystemMap, screenOffset, stationBodies } from './map';
 import { DEFAULT_STATION } from './defaultStation';
 import { ORBIT_EPOCH_MS } from './orbits';
 
@@ -73,6 +73,43 @@ describe('atlas components', () => {
     expect(atlasComponent(atlas, 'hub').has('real')).toBe(true);
     expect(atlasComponents(atlas)).toHaveLength(1);
     expect(listStations(atlas, []).filter((s) => s.derived)).toHaveLength(1);
+  });
+
+  it('never lets a ship\'s berth join or bridge stations', () => {
+    const berth = (target: string) => ({ targetSeed: '', targetRoomId: target, transient: true as const });
+    const atlas = atlasOf(
+      room('a1', ['a2']),
+      room('a2', ['a1']),
+      room('b1'),
+      room('ship'),
+    );
+    // Station A still records the ship it hosted (a stale berth — the dock
+    // never saw it leave), and the ship is now docked at station B.
+    atlas.a1.doors['d:berth'] = berth('ship');
+    atlas.ship.doors['d:dock'] = berth('b1');
+    atlas.b1.doors['d:port'] = berth('ship');
+    expect(atlasComponents(atlas).map((c) => [...c].sort())).toEqual([['a1', 'a2'], ['b1'], ['ship']]);
+    expect(listStations(atlas, []).filter((st) => st.derived).map((st) => st.id))
+      .toEqual(['station:a1', 'station:b1', 'station:ship']);
+    expect(stationForRoom('a2', atlas)?.id).toBe('station:a1');
+  });
+
+  it('holds derived stations to the saved-record limits on ids and names', () => {
+    const longId = `r${'x'.repeat(200)}`;
+    const atlas = atlasOf(room(longId), room('ok', [], 'N'.repeat(500)));
+    const derived = listStations(atlas, []).filter((st) => st.derived);
+    expect(derived.map((st) => st.id)).toEqual(['station:ok']);
+    expect(derived[0].name).toHaveLength(64);
+  });
+
+  it('treats a dock recorded before the berth flag existed as a berth too', () => {
+    // An upgrade: persisted (or older-client) entries carry the dock chain but
+    // no flag — and a dock is always transient.
+    const dock = [{ kind: 'dock' as const }, { kind: 'dock' as const }];
+    const atlas = atlasOf(room('a1'), room('ship'), room('b1'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', segments: dock };
+    atlas.ship.doors['d:dock'] = { targetSeed: '', targetRoomId: 'b1', segments: dock, transient: false };
+    expect(atlasComponents(atlas).map((c) => [...c].sort())).toEqual([['a1'], ['ship'], ['b1']]);
   });
 
   it('returns nothing for a room the atlas does not hold', () => {
@@ -235,6 +272,49 @@ describe('solar map station bodies', () => {
     (map as unknown as { selectedBody: unknown }).selectedBody = stationBodies([rec])[0];
     map.refreshStations(listStations({}, [{ ...rec, name: 'L4 DEPOT' }]), null);
     expect((map as unknown as { selectedBody: { name: string } }).selectedBody.name).toBe('L4 DEPOT');
+  });
+
+  it('looks down from the north: a growing angle turns counter-clockwise on screen', () => {
+    const a = screenOffset(0, 10);
+    const b = screenOffset(Math.PI / 2, 10);
+    expect(a.dx).toBeCloseTo(10, 12);
+    expect(b.dy).toBeCloseTo(-10, 12); // up the screen (canvas y grows downward)
+  });
+
+  it('updates "you are here" before repainting a kept selection', () => {
+    const els = new Map<string, { style: Record<string, string>; textContent: string; innerHTML: string; disabled?: boolean }>();
+    (globalThis as { document?: unknown }).document = {
+      getElementById: (id: string) => {
+        if (!els.has(id)) els.set(id, { style: {}, textContent: '', innerHTML: '' });
+        return els.get(id);
+      },
+    };
+    try {
+      const atlas = twoStations();
+      const stations = listStations(atlas, []);
+      const map = new SolarSystemMap();
+      (map as unknown as { container: unknown }).container = {}; // mounted, for the repaint path
+      map.refreshStations(stations, stationForRoom('lounge', atlas, stations));
+      (map as unknown as { selectedBody: unknown }).selectedBody = stationBodies(stations)[0]; // Furlong
+      map.refreshStations(stations, stationForRoom('yard-b', atlas, stations));
+      expect(els.get('map-player-loc')?.textContent).toBe('YARD-A');
+      expect(els.get('map-travel-btn')?.textContent).toBe('TRAVEL TO FURLONG LOBBY STATION');
+    } finally {
+      delete (globalThis as { document?: unknown }).document;
+    }
+  });
+
+  it('keeps a holotable trip on its destination\'s refreshed body, and calls it off when the station is gone', () => {
+    const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+    const map = new SolarSystemMap();
+    map.refreshStations(listStations({}, [rec]), null);
+    const internals = map as unknown as { travelDestination: { id: string; name: string } | null };
+    internals.travelDestination = stationBodies([rec])[0];
+    map.refreshStations(listStations({}, [{ ...rec, name: 'L4 DEPOT' }]), null);
+    expect(internals.travelDestination?.name).toBe('L4 DEPOT');
+    map.refreshStations(listStations({}, []), DEFAULT_STATION_RECORD);
+    expect(internals.travelDestination).toBeNull();
+    expect(map.getPlayerLocationId()).toBe(DEFAULT_STATION_ID);
   });
 
   it('defaults to Furlong as the player location, as before', () => {

@@ -113,7 +113,7 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { clearShipArrivalNote, noteShipArrival, setHelmOwnerCheck } from "./devices";
 import { completeArrival } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
@@ -1159,6 +1159,31 @@ async function joinRoom(
  *  re-checks the epoch and unwinds whatever it created if superseded.
  *  `claimRoomDefaults`: true only on the own-room default-bootstrap path —
  *  gates the roomInfo owner/name default writes (see below). */
+/**
+ * 🛰️ #30 SH3: the station a ship's room belongs to right now, from its LIVE
+ * docks — the room a dock leads into — never from the atlas alone: atlas
+ * edges outlive a cast-off, so the component around the ship's own room can
+ * still hold the station it left. Floating free, the ship counts only as its
+ * own one-module station (what the directory must never offer as a
+ * destination); anything else the atlas says about it is stale.
+ */
+function shipStationHere(roomId: string): string | null {
+  if (!roomId) return null;
+  for (const [, rec] of readAllDoors()) {
+    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    let partner = "";
+    try {
+      partner = roomIdFromSeed(rec.connectedRoomAddress);
+    } catch {
+      continue;
+    }
+    const st = partner ? stationForRoom(partner) : null;
+    if (st) return st.id;
+  }
+  const own = stationForRoom(roomId);
+  return own && own.welcomeRoomId === roomId ? own.id : null;
+}
+
 /** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
 let shipFlightWatch: number | null = null;
 
@@ -1469,6 +1494,7 @@ async function joinRoomAtEpoch(
   // branch will read this same doc — plan §7 SH4 — but no exterior code
   // consumes shipDoc in the shipped SH3 slice.)
   bindShipDoc(sync.doc);
+  clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
@@ -1683,7 +1709,12 @@ async function joinRoomAtEpoch(
           (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
             ? DEFAULT_STATION.welcomeRoomLink
             : undefined),
-        () => stationForRoom(activeBootstrap?.roomId ?? "")?.id ?? null,
+        () => shipStationHere(activeBootstrap?.roomId ?? ""),
+        () => {
+          const room = activeBootstrap?.roomId ?? "";
+          const own = room ? stationForRoom(room) : null;
+          return own && own.welcomeRoomId === room ? own.id : null;
+        },
       ),
     );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
@@ -3439,6 +3470,8 @@ function harvestStationAtlas(): void {
         farWall: r.farWall,
         farLateral: r.farLateral,
         farYawDeg: r.farYawDeg,
+        // ⚓ A visiting ship's berth: drawn from space, never station structure.
+        transient: r.transient === true,
         ...(pose
           ? {
               wall: pose.wall,

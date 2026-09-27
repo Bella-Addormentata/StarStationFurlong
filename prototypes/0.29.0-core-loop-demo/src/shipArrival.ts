@@ -24,6 +24,7 @@ import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
 import {
   findDestination,
+  readBerthMemory,
   readFlightRecord,
   readStationBerth,
   writeFlightRecord,
@@ -123,8 +124,14 @@ export function shipLocationId(rec: FlightRecord, hasLiveDock: boolean): string 
 /** Two pass seeds reach the same room (a seed's hints may differ). */
 function sameRoom(a: string, b: string): boolean {
   if (a === b) return true;
-  const ra = roomIdFromSeed(a);
-  return ra !== '' && ra === roomIdFromSeed(b);
+  // Peer-written seeds: a malformed one (e.g. `#room=%`) makes the parser
+  // throw — fail closed, as two different rooms.
+  try {
+    const ra = roomIdFromSeed(a);
+    return ra !== '' && ra === roomIdFromSeed(b);
+  } catch {
+    return false;
+  }
 }
 
 /** The berth to remember at the station being left: the first docked port. */
@@ -141,14 +148,29 @@ export function berthToRemember(ports: readonly ArrivalPort[]): BerthMemoryRecor
   return null;
 }
 
-/** DEPART's cast-off: remember the berth here, then UNDOCK every docked port. */
-export function castOffForDeparture(stationId: string, docking: ShipDockingApi): void {
+/** DEPART's cast-off: remember the berth here (evicting the oldest other
+ *  station when memory is full), then UNDOCK every docked port. Returns
+ *  whether the berth here is remembered (true when there was none to keep). */
+export function castOffForDeparture(stationId: string, docking: ShipDockingApi): boolean {
   const ports = docking.ports();
   const berth = berthToRemember(ports);
-  if (berth) writeStationBerth(stationId, berth);
+  let remembered = berth === null;
+  if (berth) {
+    remembered = writeStationBerth(stationId, berth);
+    if (!remembered) {
+      // Memory full: forget the oldest other station so the berth we are
+      // leaving (the one a return trip needs) is never the one dropped.
+      const oldest = Object.keys(readBerthMemory()).find((id) => id !== stationId);
+      if (oldest !== undefined && writeStationBerth(oldest, null)) {
+        remembered = writeStationBerth(stationId, berth);
+      }
+    }
+    if (!remembered) console.warn(`[ship] could not remember the berth at ${stationId}`);
+  }
   for (const p of ports) {
     if (p.state.kind === 'docked') docking.undock(p.doorId);
   }
+  return remembered;
 }
 
 /** What the last arrival did — the helm shows it. */

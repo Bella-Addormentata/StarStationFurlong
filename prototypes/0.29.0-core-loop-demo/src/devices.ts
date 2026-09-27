@@ -45,7 +45,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, isKnownStation } from './stationDirectory';
+import { destinationsFrom, isKnownStation, planHop } from './stationDirectory';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
   castOffForDeparture,
@@ -2057,15 +2057,34 @@ function portStatusText(p: DockPortView): string {
  *  finished the flight (the open helm's tick, or main.ts's 1 Hz watch), shown
  *  on the next docked render. Cleared at DEPART. */
 let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
+/** Open helms re-render when the note changes — an arrival finished by
+ *  main.ts's watch writes no doc value the helm observes. */
+const arrivalNoteListeners = new Set<() => void>();
+
+function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
+  lastArrivalNote = note;
+  for (const fn of arrivalNoteListeners) fn();
+}
+
+function subscribeArrivalNote(fn: () => void): () => void {
+  arrivalNoteListeners.add(fn);
+  return () => { arrivalNoteListeners.delete(fn); };
+}
+
+/** Forget the last arrival — main.ts calls it on every room join, so one
+ *  ship's arrival never shows on another ship's helm. */
+export function clearShipArrivalNote(): void {
+  setArrivalNote(null);
+}
 
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
 export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   if (!outcome) return;
   if (outcome.kind === 'docking') {
-    lastArrivalNote = { text: `Arrived at ${outcome.stationName} — docking at the berth.`, tone: 'ok' };
+    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at the berth.`, tone: 'ok' });
     return;
   }
-  lastArrivalNote = {
+  setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
@@ -2074,7 +2093,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
         : outcome.reason === 'no-port'
         ? `Arrived at ${outcome.stationName} — no free dock port to dock with. Fit one at a door (door panel › +DOCK).`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
-  };
+  });
 }
 
 /**
@@ -2145,6 +2164,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const choices = destinationsFrom(location.id);
     if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
     const pickerDest = pickerDestId ? findDestination(pickerDestId) : null;
+    // The next hop to the picked station: when it leaves (a launch window may
+    // still be to come), when it lands, and what it burns.
+    const hop = pickerDestId ? planHop(location.id, pickerDestId, now) : null;
     const refusal = canDepart({
       flightCapable: isShipReady(),
       currentStatus: flight.status,
@@ -2153,6 +2175,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       chainedDoors: chained,
       ownerAuthorized: commander,
       locationId: location.id,
+      ...(pickerDestId ? { hop } : {}),
     });
 
     const check = (ok: boolean) => ok
@@ -2200,10 +2223,24 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // ── Flight panel (status-driven) ────────────────────────────────────────
     let flightPanel = '';
     if (flight.status === 'docked') {
-      const options = choices.map((d) => `
+      const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
+      const options = choices.map((d) => {
+        const h = planHop(location.id, d.id, now);
+        const label = h
+          ? `${h.fuelCost} fuel · ${secs(h.arriveAt - h.departAt)} flight`
+          : 'no transfer from here';
+        return `
         <option value="${esc(d.id)}"${d.id === pickerDestId ? ' selected' : ''}>
-          ${esc(d.name)} — ${d.fuelCost} fuel · ${Math.round(d.travelMs / 1000)}s
-        </option>`).join('');
+          ${esc(d.name)} — ${label}
+        </option>`;
+      }).join('');
+      const windowNote = hop && refusal.ok
+        ? `<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px; line-height:1.4;">${
+            hop.departAt - now > 1000
+              ? `Next launch window in ${secs(hop.departAt - now)} — DEPART casts off now and burns at the window.`
+              : 'Launch window open now.'
+          }${hop.windowEveryMs ? ` Windows every ${secs(hop.windowEveryMs)}.` : ''}</div>`
+        : '';
       // Refusal copy — the button is the caller's ANSWER, so name the reason.
       const refuseCopy = refusal.ok ? '' : (() => {
         switch (refusal.reason) {
@@ -2215,6 +2252,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           case 'insufficient-fuel': return `Insufficient fuel — this hop needs ${refusal.needed}, tanks hold ${refusal.have}.`;
           case 'already-here': return 'The ship is already here.';
           case 'other-planet': return 'That station orbits another planet — out of range.';
+          case 'no-transfer': return 'No transfer orbit from here to there (the two stations share an orbit).';
           case 'unknown-destination': return choices.length === 0
             ? 'No other station orbits this planet yet.'
             : 'Unknown destination.';
@@ -2237,6 +2275,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             ${options}
           </select>` : ''}
           <button id="helm-depart-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? 'rgba(0,230,118,0.18)' : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnLabel}</button>
+          ${windowNote}
           ${refuseCopy ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${refuseCopy}</div>` : ''}
           ${castOffNote}
         </div>`;
@@ -2251,7 +2290,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     } else if (flight.status === 'in-flight') {
       const remaining = Math.ceil((flight.etaAt !== undefined ? Math.max(0, flight.etaAt - now) : 0) / 1000);
       const destName = esc((destination?.name ?? 'UNKNOWN').toUpperCase());
-      if (arrived) {
+      if (flight.departedAt !== undefined && now < flight.departedAt) {
+        const wait = Math.ceil((flight.departedAt - now) / 1000);
+        flightPanel = `
+          <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,235,59,0.3); border-radius:8px; background:rgba(255,235,59,0.05);">
+            <div style="font-size:11px; color:#FFEB3B; letter-spacing:0.5px;">⏳ HOLDING FOR LAUNCH WINDOW → ${destName}</div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Transfer burn in ${wait}s · arrival ETA ${remaining}s</div>
+          </div>`;
+      } else if (arrived) {
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid #00E676; border-radius:8px; background:rgba(0,230,118,0.10);">
             <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">✅ ARRIVED AT ${destName}</div>
@@ -2339,6 +2385,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const nowFlight = readFlightRecord();
       const fromId = shipLocationId(nowFlight, hasLiveDock());
       const destId = pickerDestId ?? '';
+      const nowHop = destId ? planHop(fromId, destId, Date.now()) : null;
       const nowRefusal = canDepart({
         flightCapable: isShipReady(),
         currentStatus: nowFlight.status,
@@ -2347,29 +2394,36 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         chainedDoors: enumerateChainedDoors(),
         ownerAuthorized: helmIsCommander(),
         locationId: fromId,
+        ...(destId ? { hop: nowHop } : {}),
       });
       if (!nowRefusal.ok) { render(); return; }
       const dest = findDestination(destId);
+      if (!nowHop) { render(); return; }
+      if (nowFuel < nowHop.fuelCost) { render(); return; }
       // 1) Publish the flight record FIRST — the FAST path docked → in-flight.
       //    A record the writer refuses (shape or transition) must not leave
       //    the ship cast off and charged without having departed.
-      const start = Date.now();
+      //    departedAt is the transfer burn — the next launch window, which
+      //    may still be ahead (every viewer shows the hold until then).
       const departed = writeFlightRecord({
         status: 'in-flight',
         locationId: fromId,
         destinationId: dest.id,
-        departedAt: start,
-        etaAt: start + Math.max(1, dest.travelMs),
+        departedAt: nowHop.departAt,
+        etaAt: nowHop.arriveAt,
       });
       if (!departed) { render(); return; }
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
       //    UNDOCK — tombstone + far-room write), then detach any other
       //    transient guest berth (#67 D2, either-side legal).
-      if (shipDocking) castOffForDeparture(fromId, shipDocking);
+      const berthKept = shipDocking ? castOffForDeparture(fromId, shipDocking) : true;
       for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
       // 3) Debit the fuel cost.
-      writeFuelLevel(nowFuel - dest.fuelCost, nowCapacity);
-      lastArrivalNote = null;
+      writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
+      setArrivalNote(berthKept ? null : {
+        tone: 'warn',
+        text: `The ship could not remember its berth at ${findDestination(fromId).name}; a return trip will need a dock from a door panel.`,
+      });
       render();
     });
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
@@ -2614,6 +2668,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeShip(() => { refuelArmed = false; render(); }));
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
+      unsubs.push(subscribeArrivalNote(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();

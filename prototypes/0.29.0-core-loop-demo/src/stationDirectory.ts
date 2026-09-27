@@ -17,6 +17,7 @@
  */
 
 import type { DoorWall } from './doorLayoutDoc';
+import { planTransfer } from './orbits';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -49,6 +50,24 @@ export interface StationDirectory {
    *  lead into, or (floating free) the ship's own one-module "station" — or
    *  null when that is not known. Never a destination. */
   here?(): string | null;
+  /** The ship's OWN one-module station, when its room is listed as one (a
+   *  module docked only by transient docks is its own atlas group) — never a
+   *  destination. */
+  own?(): string | null;
+  /** When the hop from → to leaves and lands, and what it burns, asked at
+   *  `nowMs`; null when there is no such hop. Absent ⇒ every hop leaves now
+   *  and takes the destination's flat travelMs / fuelCost. */
+  plan?(fromId: string, toId: string, nowMs: number): HopPlan | null;
+}
+
+/** One planned hop. Times are real epoch ms; `departAt` may be in the future
+ *  (a launch window still to come). */
+export interface HopPlan {
+  departAt: number;
+  arriveAt: number;
+  fuelCost: number;
+  /** Real ms between launch windows for this pair, when windows repeat. */
+  windowEveryMs?: number;
 }
 
 /** Travel time floor (plan §5.1 targets 60–120 s). */
@@ -89,6 +108,19 @@ export function isKnownStation(id: string): boolean {
   return listStations().some((s) => s.id === id);
 }
 
+/** Plan the hop from → to at `nowMs`: the directory's own planner (orbits),
+ *  else a flat hop that leaves now. Null for an unknown or unreachable pair. */
+export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
+  if (fromId === toId || !isKnownStation(toId)) return null;
+  if (directory.plan) {
+    const plan = directory.plan(fromId, toId, nowMs);
+    if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
+    return plan;
+  }
+  const dest = findStation(toId);
+  return { departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost };
+}
+
 /** The station the ship's room belongs to right now, when the source knows. */
 export function stationHere(): string | null {
   const id = directory.here?.() ?? null;
@@ -100,7 +132,10 @@ export function stationHere(): string | null {
 export function destinationsFrom(fromId: string): StationDestination[] {
   const from = findStation(fromId);
   const here = stationHere();
-  return listStations().filter((s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here);
+  const own = directory.own?.() ?? null;
+  return listStations().filter(
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own,
+  );
 }
 
 // ── The station record as a directory (stations.ts) ──────────────────────────
@@ -115,18 +150,41 @@ export interface StationRecordLike {
   berthDoor?: string;
 }
 
-/** Fuel and time per orbit slot out from the planet — placeholder pricing
- *  until orbits carry real altitudes (the plan's "flat cost per hop"). */
+/** Rough per-destination figures for a station record (what a hop from the
+ *  planet's lowest orbit would cost) — shown only where no hop is planned.
+ *  Real hops are priced by planTransfer below. */
 export const FUEL_BASE = 20;
 export const FUEL_PER_SLOT = 10;
 export const TRAVEL_MS_PER_SLOT = 10_000;
 export const TRAVEL_MS_MAX = 120_000;
 
+/** Fuel units per km/s of Hohmann delta-v (both burns). A low hop is well
+ *  under 1 km/s, so one 100-unit tank flies several. */
+export const FUEL_PER_KMS = 40;
+
+/** A hop between two station records: the next Hohmann launch window
+ *  (orbits.planTransfer), priced on its delta-v. */
+export function planRecordHop(
+  from: StationRecordLike | undefined,
+  to: StationRecordLike | undefined,
+  nowMs: number,
+): HopPlan | null {
+  if (!from || !to) return null;
+  const t = planTransfer(from, to, nowMs);
+  if (!t) return null;
+  return {
+    departAt: t.departAt,
+    arriveAt: t.arriveAt,
+    fuelCost: Math.max(1, Math.ceil(t.deltaVKmS * FUEL_PER_KMS)),
+    windowEveryMs: t.synodicMs,
+  };
+}
+
 /**
  * Turn station records into destinations. A station's berth is its welcome
  * room — dockable only when this client holds a seed for it (`seedFor`: the
- * atlas seed, or the build's own pass for the default station) — at its
- * berth door when one is named.
+ * atlas seed, or the build's own pass for the default station) — and only
+ * when the record names its berth door.
  */
 export function destinationsFromRecords(
   records: readonly StationRecordLike[],
@@ -141,24 +199,35 @@ export function destinationsFromRecords(
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
     };
-    const address = r.welcomeRoomId ? seedFor(r.welcomeRoomId) : undefined;
-    if (address) {
-      out.berth = { address };
-      if (r.berthDoor) out.berth.farDoor = r.berthDoor;
-    }
+    // A public berth needs its door: DOCK only asks the far room (and so
+    // only proves a port is there) when it knows the far door. Without one
+    // the ship's own berth memory decides, or arrival reports no berth.
+    const address = r.welcomeRoomId && r.berthDoor ? seedFor(r.welcomeRoomId) : undefined;
+    if (address && r.berthDoor) out.berth = { address, farDoor: r.berthDoor };
     return out;
   });
 }
 
 /** A directory over the station record: `list` is stations.listStations,
- *  `hereId` the ship room's station (null when floating free). */
+ *  `hereId` the ship room's station (null when floating free); hops follow
+ *  the circular-orbit model (orbits.ts). */
 export function directoryFromStationRecords(
   list: () => readonly StationRecordLike[],
   seedFor: (roomId: string) => string | undefined,
   hereId: () => string | null,
+  ownId: () => string | null = () => null,
 ): StationDirectory {
   return {
     stations: () => destinationsFromRecords(list(), seedFor),
     here: hereId,
+    own: ownId,
+    plan: (fromId, toId, nowMs) => {
+      const records = list();
+      return planRecordHop(
+        records.find((r) => r.id === fromId),
+        records.find((r) => r.id === toId),
+        nowMs,
+      );
+    },
   };
 }

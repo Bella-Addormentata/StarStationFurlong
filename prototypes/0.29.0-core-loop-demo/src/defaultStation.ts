@@ -44,7 +44,7 @@
 
 import { normalizeWall } from './doorLayoutDoc';
 import type { ConnectorSegment } from './adapter';
-import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, atlasComponent, isSaneDims, roomIdFromSeed } from './stationAtlas';
+import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, atlasComponent, isBerthDoor, isSaneDims, roomIdFromSeed } from './stationAtlas';
 import type { AtlasEntry, BundledAtlasEntry } from './stationAtlas';
 import bundledAtlasJson from './defaultStation.atlas.json';
 
@@ -187,7 +187,8 @@ export function defaultStationAtlas(): BundledAtlasEntry[] {
  * What a client exports for the bundle (the devtools helper in the header):
  * the CONNECTED COMPONENT of `welcomeRoomId` in its local atlas — the station,
  * not every module this install ever visited (review of #156) — minus
- * everything personal: seeds, door seeds and both recency stamps. Edges are
+ * everything personal: seeds, door seeds and both recency stamps — and every
+ * transient berth (a visiting ship is not the station). Edges are
  * walked both ways (a pairing recorded on either side joins the two rooms),
  * the component is capped at the atlas's own size, and doorless stubs add no
  * geometry so they are left out. Empty when the room is unknown.
@@ -204,7 +205,8 @@ export function atlasForBundle(
     if (!e?.doors) continue;
     const doors: BundledAtlasEntry['doors'] = {};
     for (const [id, d] of Object.entries(e.doors)) {
-      if (!d?.targetRoomId) continue;
+      // ⚓ A visiting ship's berth is not the station's layout.
+      if (!d?.targetRoomId || isBerthDoor(d)) continue;
       doors[id] = {
         targetRoomId: d.targetRoomId,
         ...(d.wall !== undefined ? { wall: d.wall } : {}),
