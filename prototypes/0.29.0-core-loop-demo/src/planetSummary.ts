@@ -62,8 +62,14 @@ export interface TrimGone {
   readAt: number;
 }
 
-/** Rooms whose trim-gone readings a summary keeps (the newest, one each). */
-export const MAX_TRIM_GONE = 16;
+/** Rooms whose trim-gone readings a summary keeps (the newest, one each),
+ *  besides the floor: as many as the atlas holds rooms (MAX_ENTRIES). */
+export const MAX_TRIM_GONE = 64;
+/** The `from` of the floor entry: a room reading dropped past the cap
+ *  raises it, and it holds for every room without an entry of its own, so
+ *  no trim read before a forgotten take-back can come back. Never a room id
+ *  (those are seed-derived). */
+export const TRIM_GONE_FLOOR = '*';
 
 export interface StationSummary {
   welcomeRoomId: string;
@@ -408,8 +414,10 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
 }
 
 /** Two lists of "trim gone" readings, room by room: the later reading of
- *  each room; past the cap the newest rooms stay (ties by room), sorted by
- *  room so every client settles on the same list. */
+ *  each room; past the cap the newest rooms stay (ties by room) and the
+ *  rest raise the floor entry (TRIM_GONE_FLOOR), which also stands in for
+ *  every reading at or below it. Sorted by room so every client settles on
+ *  the same list. */
 function mergeGone(a: TrimGone[] | undefined, b: TrimGone[] | undefined): TrimGone[] | undefined {
   if (!a?.length) return b?.length ? b : undefined;
   if (!b?.length) return a;
@@ -418,16 +426,22 @@ function mergeGone(a: TrimGone[] | undefined, b: TrimGone[] | undefined): TrimGo
     const had = byRoom.get(g.from);
     if (!had || g.readAt > had.readAt) byRoom.set(g.from, g);
   }
+  let floor = byRoom.get(TRIM_GONE_FLOOR)?.readAt ?? 0;
+  byRoom.delete(TRIM_GONE_FLOOR);
   const byName = (x: TrimGone, y: TrimGone) => (x.from < y.from ? -1 : x.from > y.from ? 1 : 0);
-  return [...byRoom.values()]
-    .sort((x, y) => y.readAt - x.readAt || byName(x, y))
-    .slice(0, MAX_TRIM_GONE)
-    .sort(byName);
+  const rooms = [...byRoom.values()].sort((x, y) => y.readAt - x.readAt || byName(x, y));
+  for (const g of rooms.slice(MAX_TRIM_GONE)) floor = Math.max(floor, g.readAt);
+  const kept = rooms.slice(0, MAX_TRIM_GONE).filter((g) => g.readAt > floor);
+  if (floor > 0) kept.push({ from: TRIM_GONE_FLOOR, readAt: floor });
+  return kept.length > 0 ? kept.sort(byName) : undefined;
 }
 
-/** When `room` last read no trim (0: never, as far as known). */
+/** When `room` last read no trim, or the floor if later (0: never, as far
+ *  as known). */
 function goneAt(gone: TrimGone[] | undefined, room: string): number {
-  return gone?.find((g) => g.from === room)?.readAt ?? 0;
+  let at = 0;
+  for (const g of gone ?? []) if (g.from === room || g.from === TRIM_GONE_FLOOR) at = Math.max(at, g.readAt);
+  return at;
 }
 
 function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipSummary | null {

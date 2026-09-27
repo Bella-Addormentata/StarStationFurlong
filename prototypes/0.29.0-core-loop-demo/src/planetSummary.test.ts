@@ -10,6 +10,7 @@ import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS, orbitForSlot, setStationTrimResolver, stationOrbit } from './orbits';
 import {
   LEARNED_PREFIX,
+  MAX_TRIM_GONE,
   SHIP_STALE_MS,
   bindPlanetSummaryDoc,
   cleanShipSummary,
@@ -242,6 +243,19 @@ describe('merge', () => {
     // Room B's own later reading still counts.
     const fromB = summary({ trim: { ...trim({ dRadiusKm: 6 }), from: 'room-b', readAt: T0 + 4 } });
     expect(mergeStation(s, fromB)?.trim?.dRadiusKm).toBe(6);
+  });
+
+  it('keeps a forgotten room\'s take-back as a floor past the cap', () => {
+    const fromA = summary({ trim: { ...trim(), from: 'room-a', readAt: T0 + 1 } });
+    let s = mergeStation(fromA, summary({ trimGone: [{ from: 'room-a', readAt: T0 + 2 }] }))!;
+    // More rooms than the list keeps take back their trims later.
+    for (let i = 0; i < MAX_TRIM_GONE + 5; i++) {
+      s = mergeStation(s, summary({ trimGone: [{ from: `room-${1000 + i}`, readAt: T0 + 10 + i }] }))!;
+    }
+    expect(s.trimGone!.length).toBeLessThanOrEqual(MAX_TRIM_GONE + 1);
+    expect(s.trimGone!.some((g) => g.from === 'room-a')).toBe(false);
+    // Room A's pre-rollback reading is replayed: still gone.
+    expect(mergeStation(s, fromA)?.trim ?? s.trim).toBeUndefined();
   });
 
   it('reads a single take-back as the first builds sent it', () => {
