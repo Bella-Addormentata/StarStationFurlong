@@ -41,6 +41,15 @@ export interface StationBerth {
 }
 
 /** One station a ship can fly to. */
+/** ⚓🚦 A gate this client cannot address: its room, door and policy. */
+export interface UnaddressedGate {
+  roomId: string;
+  farDoor: string;
+  gate?: number;
+  access?: StationBerth['access'];
+  reservedFor?: string;
+}
+
 export interface StationDestination {
   id: string;
   name: string;
@@ -57,6 +66,10 @@ export interface StationDestination {
    *  whether or not this client can dock there: a dock another commander
    *  made at a gate this client holds no pass for is still at this station. */
   berthRooms?: string[];
+  /** ⚓🚦 The station's gates this client holds no pass for (room ids, no
+   *  address): not askable as they are, but a ship's own memory of one of
+   *  them can supply the address (shipArrival.arrivalBerths). */
+  unaddressed?: UnaddressedGate[];
   /** A move to another planet, scheduled or under way (stations.ts): while
    *  it is in transit the station is no ship's destination. */
   move?: StationMove;
@@ -322,10 +335,19 @@ export function destinationsFromRecords(
     // ⚓🚦 Every gate this client can dock at: a port whose room it holds a
     // pass for. Gate order, as the station lists them.
     const gates: StationBerth[] = [];
+    const unaddressed: UnaddressedGate[] = [];
     for (const b of r.berths ?? []) {
       if (!b.roomId || !isAcceptableDoorKey(b.doorId)) continue;
       const seed = seedFor(b.roomId);
-      if (!seed) continue;
+      if (!seed) {
+        unaddressed.push({
+          roomId: b.roomId,
+          farDoor: b.doorId,
+          ...(b.gate !== undefined ? { gate: b.gate } : {}),
+          ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
+        });
+        continue;
+      }
       gates.push({
         address: seed,
         farDoor: b.doorId,
@@ -338,6 +360,7 @@ export function destinationsFromRecords(
     if (r.welcomeRoomId) rooms.add(r.welcomeRoomId);
     for (const b of r.berths ?? []) if (b.roomId) rooms.add(b.roomId);
     if (rooms.size > 0) out.berthRooms = [...rooms];
+    if (unaddressed.length > 0) out.unaddressed = unaddressed;
     if (Array.isArray(r.berths)) {
       // ⚓🚦 The record knows its gates: these are the berths (none, when its
       // last port was removed or this client holds no pass for any), and the

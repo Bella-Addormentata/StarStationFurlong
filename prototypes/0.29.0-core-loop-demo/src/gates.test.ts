@@ -642,6 +642,23 @@ describe('an arriving ship\'s memory', () => {
     const west = { address: seed('room-far'), farDoor: 'west' } as Parameters<typeof arrivalBerths>[0]['remembered'];
     expect(arrivalBerths({ station: open, remembered: west }).map((b) => b.farDoor)).toEqual(['west']);
   });
+
+  it('reaches a gate this client holds no pass for through the ship\'s memory of it', () => {
+    const [dest] = destinationsFromRecords([{
+      id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b',
+      berths: [
+        { roomId: 'room-c', doorId: 'east', gate: 3, access: 'reserved', reservedFor: 'ship-1' },
+        { roomId: 'room-c', doorId: 'west', gate: 4, access: 'closed' },
+      ],
+    }], () => undefined);
+    expect(dest.berths).toEqual([]);
+    const east = { address: seed('room-c'), farDoor: 'east' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station: dest, remembered: east, shipRoomId: 'ship-1' }).map((b) => b.gate)).toEqual([3]);
+    // Reserved for another ship, or closed: still not asked.
+    expect(arrivalBerths({ station: dest, remembered: east, shipRoomId: 'ship-2' })).toEqual([]);
+    const west = { address: seed('room-c'), farDoor: 'west' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station: dest, remembered: west, shipRoomId: 'ship-1' }).map((b) => b.gate)).toEqual([3]);
+  });
 });
 
 describe('who may dock at a gate', () => {
