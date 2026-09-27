@@ -9,6 +9,25 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🏒 A two-player air hockey table, free to play ([#116](https://github.com/Bella-Addormentata/StarStationFurlong/pull/116), part of [#115](https://github.com/Bella-Addormentata/StarStationFurlong/issues/115)).** A new 2×3 game table with a stand at each end, spawnable from the DEV menu's FURNITURE list (🏒 AIR HOCKEY TABLE). Walk up to an end and the camera locks into a first-person view over your goal. Pointer lock steers your mallet: hold the mouse button to press it onto the table, and let go to lift it (a lifted mallet passes over the puck). First to 7 wins. A pole-mounted scoreboard, readable from both ends, and goal lamps follow the match. Serves run on a countdown, **PRACTICE** plays solo against both goals, and an opponent silent for 10 s forfeits. Esc or WASD steps back.
+  - **Over the network.** Mallet and puck positions ride the 13-byte tick datagram as two new lane kinds (mallet at 30 Hz, puck at 20 Hz), with u16 serials and echo drops; movement ticks are unchanged. Score and match state sync through the shared `games` map with the same shape-guarded writes as chess and checkers. One client runs the puck's physics, and everyone else smooths.
+  - **One page plays each end.** A player id is shared by every tab and device of that player, so the table records which page plays each claimed end. Another page of the same player shows **PLAY HERE**, which moves the end to it.
+  - **Stalls and clocks.** When the page running the puck stalls (a hidden tab gets no frames), the other end's page takes the puck over. When the stalled page's frames resume, it adopts that puck, with its mallet at rest, rather than carry on from before the stall. Serves fall due on each page's own clock, at most 1.6 s after it first sees one scheduled, so a peer's clock can't hold a serve.
+  - **Recovery.** **RESET TABLE** lets the players and the room owner clear the table before a match ends, freeing an end whose player left. The focused panel reads and writes only the room it opened in. Opponent names are cut to 24 characters and escaped in the HUD. An air-hockey record under a classic game table's key shows an **UNRECOGNISED TABLE STATE** strip anyone may reset, rather than wedging that table.
+  - **Free to play.** The owner-set entry fee was taken out before merge. Its escrow rewrote whole-value balances from several clients at once: the race the slot machines and the coin pusher closed with one operator per room. It returns, optional for the owner, on a shared casino operator.
+
+  **Testing, stated honestly:**
+  - `tsc` clean, build clean, and 951 tests on main after the merge, 62 of them air hockey's: 34 engine, 15 session, 11 XSS and 2 table tests.
+  - Driven headlessly in Chromium against the real build: spawn, focus, claim, serve, goal, forfeit, reset, leave and removal.
+  - Not tested: pointer-lock feel with a real mouse, and a live match between two browsers over the node. Both are on TODO as the hands-on acceptance pass.
+  - The last fix (`d9a6602`: a goal and a walkover in the same frame) merged before Copilot re-reviewed it.
+
+  **Deferred, documented:**
+  - The physics runs as floats on wall-clock time, on one client, so a result can't be replayed. Before anything rides on a match, the sim must be made deterministic, or both players must co-sign the score.
+  - Mallet and puck ticks are unauthenticated, so any peer can strike the puck from either half. Per-tick authorship (M5.5) closes this.
+  - PLAY HERE rewrites the table's state, so it can race a goal written at the same moment.
+  - An end left by a room swap stays claimed until RESET TABLE or the opponent's forfeit clock clears it.
+
 - **🎰 One slot operator per room, so a player's balance has one slot writer ([#167](https://github.com/Bella-Addormentata/StarStationFurlong/pull/167)).** Slot machines took an operator lease per machine, so two sessions of the room's deed holder (two tabs, or two devices) could each operate a different machine. Every settle rewrites the player's whole `bal:`, so one player spinning both machines at once could lose a debit or a payout in the merge. The room now has one slot operator (`slot-operator`, `slotCroupier.ts`), as the coin pusher does. The deed holder's session operates every machine whose bankroll its player owns. In a venture room, a room owner still starts machines by hand (**RUN MANUAL CROUPIER**), which is refused while another session operates the room's slots.
   - **The lease** keeps the coin pusher's rules: a 2 s settling wait after each take, and a renewal every 3 s. Another device's lease is judged by the renewals seen: it lapses 8 s after the last one, and is taken over only after a further 60 s split window. Tabs on one device take over as soon as it lapses.
   - **Each take is its own term.** An accept, settle or refund paused at an `await` writes nothing once its take has ended, even when the same page has taken the lease again. The round stays on its machine for the next operator.
