@@ -2,8 +2,9 @@
  * 🚚 Station moves — a station leaves its planet for another one under its
  * own thrusters (owner ask, 2026-09-27: "stations … should be able to be
  * moved to other planets, perhaps slowly with its own thrusters, or fast with
- * the help of a powerful tug like ship"). This is the thruster half; tugs come
- * next and reuse the same record with `mode: 'tug'`.
+ * the help of a powerful tug like ship"). Both ways write the same record:
+ * `mode: 'thrusters'` from the station's helm, `mode: 'tug'` from a docked
+ * tug's helm (see "Tugs" below).
  *
  * TRUE PHYSICS (owner pick, 2026-09-27) on the shared 60× clock: a move is the
  * Hohmann transfer solarOrbits.planPlanetTransfer plans — it leaves only at a
@@ -44,9 +45,10 @@
  */
 
 import * as Y from 'yjs';
-import { ORBIT_EPOCH_MS } from './orbits';
+import { ORBIT_EPOCH_MS, orbitalSeconds, realMsFor, wrapAngle } from './orbits';
+import type { OrbitPoint } from './orbits';
 import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
-import { planPlanetTransfer } from './solarOrbits';
+import { interplanetaryPointAt, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
 import { MAX_ORBIT_SLOTS, PLANETS, moveBelongsTo, planetById, setStationMoveResolver } from './stations';
@@ -76,7 +78,8 @@ export function isStationMove(v: unknown): v is StationMove {
     && isId(r.fromPlanetId) && isSlot(r.fromSlot)
     && isId(r.toPlanetId) && isSlot(r.toSlot)
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
-    && r.mode === 'thrusters'
+    && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
+    && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
 }
@@ -95,6 +98,7 @@ export function cleanMove(m: StationMove): StationMove {
     mode: m.mode,
     fuel: m.fuel,
     fuelDrawn: m.fuelDrawn,
+    ...(m.mode === 'tug' && m.tugRoomId ? { tugRoomId: m.tugRoomId } : {}),
   };
 }
 
@@ -105,9 +109,11 @@ export function movePhase(move: StationMove, realMs: number): MovePhase {
   return realMs < move.arriveAt ? 'transit' : 'arrived';
 }
 
-/** The interplanetary plan a move follows, rebuilt from its record: the same
- *  sun orbits, pinned to the record's own departure. */
+/** The interplanetary plan a thruster move follows, rebuilt from its record:
+ *  the same sun orbits, pinned to the record's own departure. (A tow flies a
+ *  straight torch course instead: towPointAt.) */
 export function movePlan(move: StationMove): InterplanetaryPlan | null {
+  if (move.mode !== 'thrusters') return null;
   const plan = planPlanetTransfer(
     { id: move.stationId, planetId: move.fromPlanetId, orbitSlot: move.fromSlot },
     { id: `${move.stationId}@${move.toPlanetId}`, planetId: move.toPlanetId, orbitSlot: move.toSlot },
@@ -231,6 +237,198 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
   };
 }
 
+// ── Tugs: a torch flight ─────────────────────────────────────────────────────
+//
+// A tug is any ship module with TUG_MIN_ENGINES engine blocks or more, docked
+// at a station. Its helm tows the station to another planet: the stack leaves
+// AT ONCE and thrusts the whole way — speeding up to the halfway point, then
+// braking — on a straight course from where the old planet is at departure to
+// where the new planet will be at arrival (owner pick pending, 2026-09-27:
+// "fast with the help of a powerful tug like ship"). Still true physics on
+// the 60× clock: t = 2·√(d / a), Δv = a·t. The sun's pull is small beside the
+// torch and is left out. The tug's tanks pay, through its own room's
+// 'stationMove' meter; the drive is far more efficient than engine blocks.
+
+/** Engine blocks a ship needs to tow a station. */
+export const TUG_MIN_ENGINES = 4;
+
+/** The torch's steady acceleration, km/s² (0.1 m/s², about a hundredth of a
+ *  g). Sovereign II → Aris Prime takes 7½ to 14 real hours by where the
+ *  planets are. */
+export const TUG_ACCEL_KMS2 = 1e-4;
+
+/** Fuel per km/s of torch Δv per module pushed (the station's modules and the
+ *  tug) — an eightieth of what engine blocks burn. */
+export const TUG_FUEL_PER_KMS = 0.5;
+
+function sunXZ(p: OrbitPoint): { x: number; z: number } {
+  return { x: p.radiusKm * Math.cos(p.angle), z: -p.radiusKm * Math.sin(p.angle) };
+}
+
+function fromXZ(x: number, z: number): OrbitPoint {
+  return { radiusKm: Math.hypot(x, z), angle: wrapAngle(Math.atan2(-z, x)) };
+}
+
+export interface TowPlan {
+  departAt: number;
+  arriveAt: number;
+  transferMs: number;
+  /** Straight-line distance flown, km. */
+  distanceKm: number;
+  deltaVKmS: number;
+}
+
+/** A torch flight between two planets leaving at `departAt`: its length
+ *  meets the target planet where it will be on arrival (a fixed point that
+ *  settles in a few steps, the planets being slow beside the torch). */
+export function planTow(fromPlanetId: string, toPlanetId: string, departAt: number): TowPlan | null {
+  const from = planetById(fromPlanetId).id;
+  const to = planetById(toPlanetId).id;
+  if (from === to) return null;
+  const start = sunXZ(planetSunPointAt(from, departAt));
+  let t = 0;
+  let d = 0;
+  for (let i = 0; i < 30; i++) {
+    const end = sunXZ(planetSunPointAt(to, departAt + realMsFor(t)));
+    d = Math.hypot(end.x - start.x, end.z - start.z);
+    const next = 2 * Math.sqrt(d / TUG_ACCEL_KMS2);
+    if (Math.abs(next - t) < 1) { t = next; break; }
+    t = next;
+  }
+  const transferMs = Math.round(realMsFor(t));
+  return { departAt, arriveAt: departAt + transferMs, transferMs, distanceKm: d, deltaVKmS: TUG_ACCEL_KMS2 * t };
+}
+
+/** Where a towed station is on its torch course, sun-centred. */
+export function towPointAt(move: StationMove, realMs: number): OrbitPoint {
+  const start = sunXZ(planetSunPointAt(move.fromPlanetId, move.departAt));
+  const end = sunXZ(planetSunPointAt(move.toPlanetId, move.arriveAt));
+  const span = orbitalSeconds(move.arriveAt) - orbitalSeconds(move.departAt);
+  const f = span > 0 ? Math.min(1, Math.max(0, (orbitalSeconds(realMs) - orbitalSeconds(move.departAt)) / span)) : 1;
+  // Constant thrust: speeding up for the first half, braking for the second.
+  const s = f < 0.5 ? 2 * f * f : 1 - 2 * (1 - f) * (1 - f);
+  return fromXZ(start.x + (end.x - start.x) * s, start.z + (end.z - start.z) * s);
+}
+
+/** Where a moving station is between its burns, sun-centred, whichever way
+ *  it travels; null outside the transit. */
+export function moveTransitPointAt(move: StationMove, realMs: number): OrbitPoint | null {
+  if (movePhase(move, realMs) !== 'transit') return null;
+  if (move.mode === 'tug') return towPointAt(move, realMs);
+  const plan = movePlan(move);
+  return plan ? interplanetaryPointAt(plan, realMs) : null;
+}
+
+/** Propellant a tow takes from the tug's tanks. */
+export function towFuelCost(deltaVKmS: number, stationModules: number): number {
+  return Math.max(1, Math.ceil(deltaVKmS * TUG_FUEL_PER_KMS * (Math.max(1, Math.floor(stationModules)) + 1)));
+}
+
+/** Why a tug will not tow, in the order its helm checks. */
+export type TowRefusal =
+  | 'not-docked' // the ship is not docked at a known station
+  | 'not-commander'
+  | 'moving' // the station is already scheduled to move, or moving
+  | 'same-planet'
+  | 'no-slot'
+  | 'too-weak' // fewer than TUG_MIN_ENGINES engine blocks
+  | 'no-fuel';
+
+export interface TowContext {
+  /** The station the ship is docked at, as listed, or null. */
+  station: StationRecord | null;
+  stations: StationRecord[];
+  /** The tug's own room. */
+  tugRoomId: string;
+  commander: boolean;
+  engines: number;
+  fuel: number;
+  /** Fuel tows and moves have drawn in the tug's room (readMoveFuelDrawn). */
+  drawn: number;
+  deficit: number;
+  /** Modules in the station being towed. */
+  modules: number;
+  now: number;
+}
+
+export interface TowQuote {
+  toPlanetId: string;
+  toSlot: number;
+  plan: TowPlan;
+  fuel: number;
+}
+
+export type TowPlanResult =
+  | { ok: true; move: StationMove; quote: TowQuote }
+  | { ok: false; refusal: TowRefusal; quote: TowQuote | null };
+
+export function quoteTow(
+  station: StationRecord | null,
+  stations: StationRecord[],
+  toPlanetId: string,
+  modules: number,
+  now: number,
+): TowQuote | null {
+  if (!station) return null;
+  const to = planetById(toPlanetId).id;
+  if (to === planetById(station.planetId).id) return null;
+  const toSlot = freeSlotAround(to, stations, station.id);
+  if (toSlot === null) return null;
+  const plan = planTow(station.planetId, to, now);
+  if (!plan) return null;
+  return { toPlanetId: to, toSlot, plan, fuel: towFuelCost(plan.deltaVKmS, modules) };
+}
+
+/** Tow the station the ship is docked at to `toPlanetId`: the move record to
+ *  write in the tug's room, or why not. */
+export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResult {
+  const { station, now } = ctx;
+  if (!station) return { ok: false, refusal: 'not-docked', quote: null };
+  if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
+  if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
+  const quote = quoteTow(station, ctx.stations, toPlanetId, ctx.modules, now);
+  if (!quote) return { ok: false, refusal: 'no-slot', quote: null };
+  if (ctx.engines < TUG_MIN_ENGINES) return { ok: false, refusal: 'too-weak', quote };
+  if (!(ctx.fuel >= quote.fuel)) return { ok: false, refusal: 'no-fuel', quote };
+  return {
+    ok: true,
+    quote,
+    move: {
+      stationId: station.id,
+      welcomeRoomId: station.welcomeRoomId,
+      fromPlanetId: planetById(station.planetId).id,
+      fromSlot: station.orbitSlot,
+      toPlanetId: quote.toPlanetId,
+      toSlot: quote.toSlot,
+      departAt: quote.plan.departAt,
+      arriveAt: quote.plan.arriveAt,
+      mode: 'tug',
+      tugRoomId: ctx.tugRoomId,
+      fuel: quote.fuel,
+      fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
+    },
+  };
+}
+
+export function describeTowRefusal(refusal: TowRefusal, quote: TowQuote | null, fuel: number): string {
+  switch (refusal) {
+    case 'not-docked': return 'Dock at a station to tow it.';
+    case 'not-commander': return 'Only the ship\'s owner can tow.';
+    case 'moving': return 'That station is already scheduled to move, or moving.';
+    case 'same-planet': return 'The station already orbits that planet.';
+    case 'no-slot': return 'Every orbit around that planet is taken.';
+    case 'too-weak': return `A tug needs at least ${TUG_MIN_ENGINES} ENGINE BLOCKs.`;
+    case 'no-fuel': return `Needs ${quote?.fuel ?? '?'} fuel; ${Math.floor(fuel)} aboard. Fit more FUEL TANKs and refuel.`;
+  }
+}
+
+/** Is this room's own tow under way (or about to leave)? Its ship holds. */
+export function isTowing(roomId: string, realMs: number): boolean {
+  const move = readStationMove();
+  return !!move && move.mode === 'tug' && move.tugRoomId === roomId && isMoveActive(move, realMs);
+}
+
 // ── What the dashboard says ──────────────────────────────────────────────────
 
 /** "2d 03h" / "5h 12m" / "4m" — a real-time span. */
@@ -260,7 +458,9 @@ export function describeMove(move: StationMove, realMs: number): string {
   const to = planetById(move.toPlanetId).name;
   switch (movePhase(move, realMs)) {
     case 'scheduled': return `Leaving for ${to} at the launch window in ${formatLongSpan(move.departAt - realMs)}.`;
-    case 'transit': return `In transit to ${to}: arriving in ${formatLongSpan(move.arriveAt - realMs)}.`;
+    case 'transit': return move.mode === 'tug'
+      ? `Under tow to ${to}: arriving in ${formatLongSpan(move.arriveAt - realMs)}.`
+      : `In transit to ${to}: arriving in ${formatLongSpan(move.arriveAt - realMs)}.`;
     case 'arrived': return `Arrived at ${to}, orbit slot ${move.toSlot}.`;
   }
 }
