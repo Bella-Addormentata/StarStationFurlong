@@ -102,6 +102,7 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } fr
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
@@ -2164,14 +2165,16 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // this leave must leave alone.
     const cache = roomCacheHandle;
     roomCacheHandle = null;
-    // 🪙 Hand back this session's coin-pusher leases while the room's doc is
-    // still the bound casino doc, and send the release before the doc goes:
-    // another of the deed holder's devices then takes over at once instead
+    // 🎰🪙 Hand back this session's slot and coin-pusher operator leases
+    // while the room's doc is still the bound casino doc, and send the
+    // releases before the doc goes: another of the operator's devices then
+    // takes over at once instead
     // of waiting out the lapse and the split window. Frames keep running
     // meanwhile, but nothing is operated or edited in this room while it can
     // still send: the gates refuse until its sync is closed to new writes
     // (roomLeavesUnderWay). stop() doesn't wait for sends in flight, so flush
     // first (bounded: a stalled transport must not hold the swap).
+    leaveSlotMachineRoom();
     leaveCoinPusherRoom();
     await Promise.race([
       sync.flush(),

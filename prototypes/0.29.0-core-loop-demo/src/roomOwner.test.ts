@@ -399,6 +399,20 @@ describe('leaving a room hands this client none of it (source scan)', () => {
     expect(noSync).toBeLessThan(now.indexOf('networkProvider.disconnect()'));
   });
 
+  it('a leave hands back every casino operator lease before the flush wait', () => {
+    // Each operator (slots, coin pusher) releases its room lease while the
+    // room's doc is still bound, so the flush sends the releases and another
+    // device takes over at once. A merge that drops either call leaves that
+    // game's lease to lapse (and the split window) instead.
+    const now = bodyOf('leaveRoomNow');
+    const wait = now.indexOf('sync.flush()');
+    for (const release of ['leaveSlotMachineRoom();', 'leaveCoinPusherRoom();']) {
+      const at = now.indexOf(release);
+      expect(at, `the leave calls ${release}`).toBeGreaterThan(-1);
+      expect(at, `${release} before the flush wait`).toBeLessThan(wait);
+    }
+  });
+
   it('a leave that a newer leave or join overlaps tears down only its own room', () => {
     const now = bodyOf('leaveRoomNow');
     const wait = now.indexOf('sync.flush()');
