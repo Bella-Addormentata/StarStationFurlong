@@ -40,7 +40,10 @@ import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { shipsAroundPlanet } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
+import { isShipReady } from './devices';
+import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
+import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -113,6 +116,12 @@ function reallyMoving(s: StationRecord, now: number): boolean {
   return !!s.move && !isPinMove(s.move) && stationInTransit(s, now);
 }
 
+/** A move whose ends are two different planets, once unknown ids read as
+ *  the default planet: a record naming one planet twice has no course. */
+function betweenPlanets(m: StationMove): boolean {
+  return planetById(m.fromPlanetId).id !== planetById(m.toPlanetId).id;
+}
+
 function modulesOf(station: StationRecord, components: Set<string>[], atlas: Record<string, unknown>): number {
   if (!station.welcomeRoomId) return 1;
   const component = components.find((c) => c.has(station.welcomeRoomId));
@@ -129,8 +138,11 @@ function gather(now: number): Source {
   const components = atlasComponents(atlas);
 
   // Aboard a ship in flight: see the planet from the transfer.
+  // Every room binds a ship doc, so a flight record alone proves nothing: only
+  // a ready ship that is not bolted into a station follows its flight (the
+  // same test main.ts's planet publisher and station resolver use).
   let aboard: TransferPlan | null = null;
-  if (shipDocBound()) {
+  if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       aboard = flightPlan(
@@ -154,7 +166,7 @@ function gather(now: number): Source {
   // The sun view only while the move really has a course right now (a
   // malformed record, say both ends on one planet, has none): otherwise the
   // planet view below, never an empty backdrop.
-  if (me && reallyMoving(me, now) && me.move && moveTransitPointAt(me.move, now)) {
+  if (me && reallyMoving(me, now) && me.move && betweenPlanets(me.move) && moveTransitPointAt(me.move, now)) {
     const m = me.move;
     return { mode: 'sun', move: m, key: [
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,

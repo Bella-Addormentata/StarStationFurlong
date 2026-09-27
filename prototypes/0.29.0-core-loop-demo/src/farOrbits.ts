@@ -253,6 +253,9 @@ export function planetLayout(input: {
  * the station's course from departure to capture. null outside the transit.
  */
 export function transitLayout(move: StationMove, nowMs: number, withPaths = true): FarLayout | null {
+  // Moves come from peers: one whose ends normalize to the same planet (a
+  // tug's course would be a chord between two places of that planet) has none.
+  if (planetById(move.fromPlanetId).id === planetById(move.toPlanetId).id) return null;
   const here = moveTransitPointAt(move, nowMs);
   if (!here) return null;
   const squash = (p: OrbitPoint) => toPlanetFrame(compressSunPoint(p));
