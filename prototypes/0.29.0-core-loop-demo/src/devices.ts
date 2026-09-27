@@ -50,6 +50,7 @@ import { currentStation, listStations as listStationRecords, type StationRecord 
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
   castOffForDeparture,
+  castOffRefusal,
   rememberBerthHere,
   completeArrival,
   shipLocationId,
@@ -2424,7 +2425,19 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const dest = findDestination(destId);
       if (!nowHop) { render(); return; }
       if (nowFuel < nowHop.fuelCost) { render(); return; }
-      // 0) Keep the berth here first: a ship that cannot remember where it
+      // 0) Every dock must be releasable, or the flight would leave one live.
+      const castOffBlock = shipDocking ? castOffRefusal(shipDocking.ports()) : null;
+      if (castOffBlock) {
+        setArrivalNote({
+          tone: 'warn',
+          text: castOffBlock === 'dock-busy'
+            ? 'Cannot depart yet: a dock port is still busy. Try again in a moment.'
+            : 'Cannot depart: a dock port here is one you may not undock.',
+        });
+        render();
+        return;
+      }
+      //    Keep the berth here first: a ship that cannot remember where it
       //    docked must not leave (the return trip would have nowhere to go).
       if (shipDocking && !rememberBerthHere(fromId, shipDocking.ports())) {
         setArrivalNote({

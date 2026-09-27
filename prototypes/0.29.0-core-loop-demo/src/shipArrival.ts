@@ -38,6 +38,23 @@ import { isKnownStation, stationHere, type StationBerth, type StationDestination
 export interface ArrivalPort {
   doorId: string;
   state: DockPortState;
+  /** A dock/undock is running on this port (docking.ts DockPortView). */
+  busy?: boolean;
+  /** May the local player dock/undock here. */
+  canOperate?: boolean;
+}
+
+/** Why a cast-off cannot release every dock right now, or null when it can.
+ *  DEPART checks this BEFORE it commits the flight: UNDOCK refuses a busy
+ *  port or one the player may not operate, and a flight must never leave
+ *  with a live dock behind it. */
+export function castOffRefusal(ports: readonly ArrivalPort[]): 'dock-busy' | 'dock-locked' | null {
+  for (const p of ports) {
+    if (p.state.kind !== 'docked') continue;
+    if (p.busy) return 'dock-busy';
+    if (p.canOperate === false) return 'dock-locked';
+  }
+  return null;
 }
 
 /** The docking system as departure/arrival drive it (world.ts wires it). */
