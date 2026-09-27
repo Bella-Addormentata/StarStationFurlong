@@ -137,6 +137,7 @@ import type {
   RouteStop,
   ShipRoute,
   SkipCheckpoint,
+  SkipWhy,
   StartCheckpoint,
 } from './shipRoute';
 
@@ -688,12 +689,16 @@ export function dockCheckpoint(
 export function skipCheckpoint(
   route: ShipRoute,
   legSeq: number,
-  o: { at: number; pilot: RoutePilot },
+  o: { at: number; pilot: RoutePilot; why?: SkipWhy },
 ): SkipCheckpoint | null {
   const legs = new Legs(route);
   const w = legs.windowAfter(legSeq, o.at);
   if (!w) return null;
-  return { kind: 'skip', ...common(legs, legSeq, o.at), departAt: w.departAt, arriveAt: w.arriveAt, pilot: o.pilot };
+  return {
+    kind: 'skip', ...common(legs, legSeq, o.at), departAt: w.departAt, arriveAt: w.arriveAt, pilot: o.pilot,
+    // 🚀 Why, for the robot captain's line (additive; absent reads as unknown).
+    ...(o.why !== undefined ? { why: o.why } : {}),
+  };
 }
 
 /** A person's route DEPART: the first window after max(at, stayStart + wait),

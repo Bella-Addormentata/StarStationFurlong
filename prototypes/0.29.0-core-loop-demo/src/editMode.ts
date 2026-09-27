@@ -112,6 +112,8 @@ import { showHint } from './hud';
 import { isDeviceFocusActive } from './deviceFocus';
 import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
+// 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
+import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2199,6 +2201,14 @@ class RoomEditController {
     // spawner could recover the room).
     if (isRoomTerminalKind(item.kind)) {
       showHint("CAN'T REMOVE — the room terminal is the way back into edit mode.", 2600);
+      return;
+    }
+    // 🚀 The robot captain's charging dock (itself, or mounted under the item)
+    // can't go while the ship's route runs: the route names it, and its robot
+    // walks the helm and the berth door. Stop the route at the helm first.
+    const captainDock = readRouteCaptainDockId();
+    if (captainDock && (itemId === captainDock || mountDescendantsOf(itemId).some((c) => c.id === captainDock))) {
+      showHint(`CAN'T REMOVE — ${CAPTAIN_LOCK_REFUSAL}.`, 2800);
       return;
     }
     if (import.meta.env.DEV && isDeviceFocusActive()) {

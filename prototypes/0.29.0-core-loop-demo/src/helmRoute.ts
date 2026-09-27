@@ -156,8 +156,8 @@ export const DEFAULT_WAIT_SECS = 60;
 export const ROUTE_WAIT_CHOICES: readonly number[] = [30, 45, 60, 90, 120, 180, 240, 300, 420, 600];
 
 /** 🤖 The robot routine that makes a charging dock's robot eligible to be
- *  the ship's robot captain ("🚀 Ship pilot", robotDoc.ts: slice 5 adds it).
- *  Until then no dock runs it, and routes are flown by people only. */
+ *  the ship's robot captain ("🚀 Ship pilot", robotDoc.ts `pilot`; who may be
+ *  named, and what the captain does, is shipPilot.ts). */
 export const SHIP_PILOT_ROUTINE = 'pilot';
 
 /** Is `routine` the Ship pilot routine? (devices.ts robotCaptainEligible
@@ -1036,7 +1036,8 @@ export function skipRouteStop(o: { now: number }): boolean {
   const f = readRouteFlight(o.now);
   if (!routeRulesFlight(f) || f.status !== 'docked' || f.ended !== null || f.skipped) return false;
   if (helmEntryStay(f, o.now) !== f.legSeq) return false;
-  const entry = skipCheckpoint(route, f.legSeq, { at: o.now, pilot: f.pilot });
+  // 🚀 why 'helm': the robot captain says the stop is skipped, not removed.
+  const entry = skipCheckpoint(route, f.legSeq, { at: o.now, pilot: f.pilot, why: 'helm' });
   if (!entry || !writable(route, entry)) return false;
   return writeRouteCheckpoint(route.startedAt, entry, o.now);
 }

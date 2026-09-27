@@ -561,6 +561,14 @@ export function passVerdict(results: readonly KeeperGateResult[], own: StationBe
   return { kind: 'none', reason: keyOnly ? 'not-allowed' : 'unreachable' };
 }
 
+/** 🚀 Why a pass that decided `skip` skips (the robot captain's line, design
+ *  §4): `gone` when every gate asked was gone (its door or port removed),
+ *  else `shut` (closed, or reserved for another ship). Pure. */
+export function skipWhyOf(results: readonly KeeperGateResult[]): 'gone' | 'shut' {
+  const refused = results.filter((r) => r.kind === 'refused');
+  return refused.length > 0 && refused.every((r) => r.kind === 'refused' && r.cls === 'gone') ? 'gone' : 'shut';
+}
+
 /** What a finished pass changes: the keeper's memory, and a checkpoint to
  *  write (hold, renewal, skip), or null. */
 export interface AfterPass {
@@ -577,7 +585,7 @@ export interface AfterPass {
  * so write `hold`, or renew one older than a minute. Skip: only when the
  * stay has no `dock` entry and nothing is docked. Refused: back off. Pure.
  */
-export function keeperAfterPass(v: KeeperView, pass: { legSeq: number; verdict: PassVerdict }): AfterPass {
+export function keeperAfterPass(v: KeeperView, pass: { legSeq: number; verdict: PassVerdict; skipWhy?: 'gone' | 'shut' }): AfterPass {
   const { now, flight: f, route } = v;
   const same = v.memory.run === route.startedAt && v.memory.legSeq === pass.legSeq;
   const base = same ? v.memory : keeperMemoryAt(v.memory, route.startedAt, pass.legSeq);
@@ -605,7 +613,9 @@ export function keeperAfterPass(v: KeeperView, pass: { legSeq: number; verdict: 
     return { memory, write: null };
   }
   if (pass.verdict.kind === 'skip' && !v.stayDock) {
-    const entry = skipCheckpoint(route, pass.legSeq, { at: now, pilot: f.pilot });
+    const entry = skipCheckpoint(route, pass.legSeq, {
+      at: now, pilot: f.pilot, ...(pass.skipWhy !== undefined ? { why: pass.skipWhy } : {}),
+    });
     if (entry) {
       memory.wroteAt.skip = now;
       return { memory, write: { why: 'skip', entry } };
@@ -956,7 +966,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       }),
       stillWanted,
       now: clock,
-    }).then(({ verdict }) => {
+    }).then(({ verdict, results }) => {
       if (gen !== generation) return;
       const d = deps.docking();
       const fresh = d ? viewNow(clock(), d) : null;
@@ -964,7 +974,9 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
         if (memory && memory.run === run && memory.legSeq === legSeq) memory.passing = false;
         return;
       }
-      const after = keeperAfterPass(fresh, { legSeq, verdict });
+      const after = keeperAfterPass(fresh, {
+        legSeq, verdict, ...(verdict.kind === 'skip' ? { skipWhy: skipWhyOf(results) } : {}),
+      });
       memory = after.memory;
       if (after.write) writeRouteCheckpoint(run, after.write.entry, fresh.now);
       // Say it once per change (not on every retry of the same answer).

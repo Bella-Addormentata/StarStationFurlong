@@ -212,6 +212,14 @@ export interface DockCheckpoint extends CheckpointCommon {
   /** 🧭 RESUME: the ship came back to the route here. */
   resume?: true;
 }
+/** 🚀 Why a stay is skipped, for the robot captain's line (design §4):
+ *  every gate `gone` (the berth door or its port was removed), every gate
+ *  gone or `shut` to this ship (closed, or reserved for another), or SKIP
+ *  STOP at the `helm`. Additive: an older writer leaves it out, and a value
+ *  this reader does not know is dropped (the entry itself still counts). */
+export type SkipWhy = 'gone' | 'shut' | 'helm';
+export const SKIP_WHYS: readonly SkipWhy[] = ['gone', 'shut', 'helm'];
+
 /** The berth is gone or closed, or SKIP STOP. */
 export interface SkipCheckpoint extends CheckpointCommon {
   kind: 'skip';
@@ -219,6 +227,8 @@ export interface SkipCheckpoint extends CheckpointCommon {
   arriveAt: number;
   /** 🧭 The pilot the writer derived for the leg leaving this stay. */
   pilot?: RoutePilot;
+  /** 🚀 Why (absent: an older writer, or a reason this reader lacks). */
+  why?: SkipWhy;
 }
 /** A person's route DEPART. */
 export interface GoCheckpoint extends CheckpointCommon {
@@ -461,9 +471,12 @@ export function checkpointFromWire(kind: CheckpointKind, legSeq: number, v: unkn
     case 'skip': {
       if (!times()) return null;
       if (v.pilot !== undefined && !isPilot(v.pilot)) return null;
+      // 🚀 An unknown reason (a newer writer's) is dropped, not the skip.
+      const why = (SKIP_WHYS as readonly unknown[]).includes(v.why) ? (v.why as SkipWhy) : undefined;
       return {
         kind, ...common, departAt: v.departAt as number, arriveAt: v.arriveAt as number,
         ...(v.pilot !== undefined ? { pilot: v.pilot as RoutePilot } : {}),
+        ...(why !== undefined ? { why } : {}),
       };
     }
     case 'go': {

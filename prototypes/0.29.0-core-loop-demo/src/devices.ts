@@ -60,7 +60,7 @@ import {
   ROUTE_WAIT_CHOICES,
   addDraftStop, checkRouteDraft, choiceIndexFor, departRouteFromHelm, describeGateChoice, describeRouteProblem,
   describeRouteStartRefusal, draftFromRoute, draftLegAfter, formatClock, formatRouteSpan, formatWait,
-  handOverRoute, isShipPilotRoutine, moveDraftStop, pauseRouteFromHelm, readHelmCheckpoints, refreshDraftStops,
+  handOverRoute, moveDraftStop, pauseRouteFromHelm, readHelmCheckpoints, refreshDraftStops,
   removeDraftStop, resumeRouteFromHelm, resumeStopIndex, routeDepartLine, routeDepartState, routeFromDraft, routeHelmView,
   routePathLabel, routeRenderKey, routeStartRefusal, routeStatusLine, routeStopCandidates, routeStopIndexAt,
   setDraftAnyGate, setDraftBerth, setDraftWait, skipRouteStop, startRouteFromHelm, stopRouteFromHelm,
@@ -221,6 +221,8 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+// 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
+import { consoleRoutineRefusal, pilotRoutineOffered, routeCaptainDockId, shipPilotEligible } from './shipPilot';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -2093,14 +2095,12 @@ export function shipFuelCapacity(): number {
   return countFunction('fuelTank') * TANK_CAPACITY;
 }
 
-// ── 🚏🤖 The robot captain (design §2a; the pilot routine is slice 5's) ─────
+// ── 🚏🤖 The robot captain (design §2a) ───────────────────────────────────────
 //
-// A charging dock aboard whose robot runs the 🚀 Ship pilot routine may be
-// named the route's robot captain at the helm. The routine is added by the
-// next slice; until then no dock runs it, the helm offers "people only", and
-// the check below is the one seam that slice fills: either by adding the
-// `pilot` routine (the default check reads it through isShipPilotRoutine),
-// or by installing its own check. Whether a RUNNING route has a robot captain
+// A charging dock aboard whose robot runs the 🚀 Ship pilot routine
+// (robotDoc.ts `pilot`) may be named the route's robot captain at the helm,
+// while the module can fly (shipPilot.shipPilotEligible). A test or a later
+// rule may install its own check. Whether a RUNNING route has a robot captain
 // is never read from here: the timetable reads route.robotDockId alone.
 
 let robotCaptainCheck: ((dockItemId: string) => boolean) | null = null;
@@ -2118,7 +2118,7 @@ export function robotCaptainEligible(dockItemId: string): boolean {
   try {
     return robotCaptainCheck
       ? robotCaptainCheck(dockItemId) === true
-      : isShipPilotRoutine(readRobotConfig(dockItemId)?.routine);
+      : shipPilotEligible({ dockAboard: true, routine: readRobotConfig(dockItemId)?.routine, flightCapable: isShipReady() });
   } catch {
     return false;
   }
@@ -3897,6 +3897,12 @@ function escAttr(s: string): string {
 export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
+  /** 🚀 A refused routine switch says why here, until the next change. */
+  let flash: string | null = null;
+  /** 🚀 Whether the last render drew this dock as a running route's captain
+   *  (the ship map re-renders the console only when that flips, so a script
+   *  edit in progress is not redrawn under the owner's cursor). */
+  let drawnCaptain = false;
 
   const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
     writeRobotConfig(deps.itemId, { routine, script });
@@ -3908,18 +3914,39 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const cfg = readRobotConfig(deps.itemId);
     const current = cfg?.routine ?? 'serve';
     const owner = deps.canEdit();
+    // 🚀 The captain's lock (design §2a): while a running route names this
+    // dock as its robot captain, its routine can't change (and edit mode
+    // won't remove the dock). Ship pilot itself is offered only aboard a
+    // module that can fly.
+    const captain = routeCaptainDockId(readShipRoute()) === deps.itemId;
+    drawnCaptain = captain;
+    const flightCapable = isShipReady();
     const routineBtn = (r: RobotRoutine): string => {
       const on = r === current;
-      return `<button data-routine="${r}" ${owner ? '' : 'disabled'} style="
+      const usable = owner && (on || !captain);
+      return `<button data-routine="${r}" ${usable ? '' : 'disabled'} style="
         display:flex; justify-content:space-between; align-items:center; gap:8px;
         padding:9px 12px; text-align:left;
         background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
         border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
         border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
         font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
-        cursor:${owner ? 'pointer' : 'default'};
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !owner ? 1 : 0.45};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
+    const routines = ROBOT_ROUTINES.filter((r) => r !== 'pilot' || pilotRoutineOffered({ flightCapable, current }));
+    const pilotNote = captain
+      ? `🚀 Captain of this ship&apos;s route: it walks to the helm and the berth door and announces each stop. Stop the route at the helm to change its routine or remove its dock. ⏸ STOP here only parks it on its dock: the ferry keeps its timetable.`
+      : current === 'pilot'
+        ? flightCapable
+          ? '🚀 Ready to fly: name this robot the robot captain in the helm&apos;s ROUTE panel.'
+          : '🚀 This module can&apos;t fly yet: mount a FUEL TANK, ENGINE BLOCK and HELM CONSOLE, then name this robot captain at the helm.'
+        : '';
+    const pilotBlock = pilotNote || flash
+      ? `<div style="font-size:9.5px; line-height:1.45; color:${flash ? CH_PINK : '#2fe6a0'}; letter-spacing:0.3px;">
+          ${flash ? `⚠ ${escAttr(flash)}.` : ''}${flash && pilotNote ? '<br>' : ''}${pilotNote}
+        </div>`
+      : '';
     const inp = (idx: number, field: string, val: string, w: string, type = 'text'): string =>
       `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${owner ? '' : 'disabled'} style="
         width:${w}; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
@@ -3986,8 +4013,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       ${parkBtn}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">ROUTINE</div>
       <div style="display:flex; flex-direction:column; gap:8px;">
-        ${ROBOT_ROUTINES.map(routineBtn).join('')}
+        ${routines.map(routineBtn).join('')}
       </div>
+      ${pilotBlock}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
       ${voiceBtn}
       ${editor}
@@ -4021,8 +4049,20 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       b.addEventListener('click', () => {
         // Keep any authored script AND the parked state when switching routines.
         const c = readRobotConfig(deps.itemId);
+        const to = b.dataset.routine as RobotRoutine;
+        // 🚀 Re-checked at the click: the route may have started since the
+        // render ("Captain of this ship's route: stop the route first").
+        const refused = consoleRoutineRefusal({
+          route: readShipRoute(), dockId: deps.itemId, from: c?.routine ?? 'serve', to,
+        });
+        if (refused) {
+          flash = refused;
+          render();
+          return;
+        }
+        flash = null;
         writeRobotConfig(deps.itemId, {
-          routine: b.dataset.routine as RobotRoutine,
+          routine: to,
           ...(script.length ? { script } : {}),
           ...(c?.parked ? { parked: true } : {}),
         });
@@ -4075,12 +4115,19 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       `;
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
-      unsubscribe = subscribeRobot(() => render());
+      // 🚀 The ship map too: a route starting or finishing locks or frees
+      // a captain's console.
+      const offRobot = subscribeRobot(() => render());
+      const offShip = subscribeShip(() => {
+        if ((routeCaptainDockId(readShipRoute()) === deps.itemId) !== drawnCaptain) render();
+      });
+      unsubscribe = () => { offRobot(); offShip(); };
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      flash = null;
       panel?.remove();
       panel = null;
     },

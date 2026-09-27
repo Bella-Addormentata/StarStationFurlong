@@ -45,6 +45,9 @@ import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
 import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
+// 🚀 The robot captain (robot pilot routes §2a): where a Ship pilot robot
+// stands and what it announces, from the ship's shared timetable.
+import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech } from "./shipPilot";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
@@ -289,6 +292,11 @@ export class World {
   private robotQuietUntil = 0;
   /** Edge detector for the player-entered-the-room moment (see above). */
   private hadActivePlayer = false;
+  /** 🚀 The robot captain's lines said, per charging-dock robot (local,
+   *  like the robot: each rider's copy speaks for itself), and the
+   *  countdown (s) to the next reading of the timetable. */
+  private pilotSpeech = new Map<string, PilotSpeech>();
+  private pilotTimer = 0;
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -3816,6 +3824,13 @@ export class World {
       this.robotQuietUntil = performance.now() + 1000;
     }
     this.hadActivePlayer = !!activePlayer;
+    // 🚀 Ship pilot robots: re-read the ship's timetable twice a second
+    // (where the captain stands, what it says) — never per frame.
+    this.pilotTimer -= deltaTime;
+    if (this.pilotTimer <= 0) {
+      this.pilotTimer = World.PILOT_TICK_SECS;
+      this.updateShipPilots();
+    }
     for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
 
     this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
@@ -5043,6 +5058,7 @@ export class World {
     if (this.robotsPatrol !== waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
+      this.pilotSpeech.clear(); // 🚀 fresh robots, fresh announcements
       this.robotsPatrol = waiterPatrol;
       // 🔇 Fresh room: hold every robot line for the first second (owner
       // request — no greeting barked mid-load/entry; the class opens its
@@ -5107,6 +5123,96 @@ export class World {
     spawnFixedBubble(anchorId, text, x, z, ROBOT_BUBBLE_Y);
     speakRobotLine(text, x, z);
     return true;
+  }
+
+  /** 🚀 How often (s) the Ship pilot robots re-read the timetable. */
+  private static readonly PILOT_TICK_SECS = 0.5;
+  /** 🚀 How far inside the berth door the captain stands to announce. */
+  private static readonly PILOT_DOOR_STANDOFF = 1.8;
+  /** 🚀 How far to the side of the helm's stand the captain stands. */
+  private static readonly PILOT_HELM_SIDESTEP = 0.8;
+
+  /**
+   * 🚀 The robot captain (robot pilot routes, design §2a; shipPilot.ts).
+   * Every 'pilot' robot is pointed at its post: the running route's captain
+   * (route.robotDockId) goes to the helm or the berth door as the ship's
+   * timetable says (shipPilot.pilotPost); any other pilot robot waits on its
+   * dock. The captain's announcements (shipPilot.pilotLine) go through
+   * robotSay like every robot line, and are marked said only once
+   * delivered. A parked captain stays on its dock and says nothing (the
+   * ferry keeps its timetable). Local to this game, never synced.
+   */
+  private updateShipPilots(): void {
+    let any = false;
+    for (const key of this.robots.keys()) {
+      if (readRobotConfig(key)?.routine === "pilot") {
+        any = true;
+        break;
+      }
+    }
+    if (!any) {
+      this.pilotSpeech.clear();
+      return;
+    }
+    const now = Date.now();
+    let view: ReturnType<typeof readPilotView> = null;
+    try {
+      view = readPilotView(now);
+    } catch (err) {
+      console.warn("[pilot] timetable read failed:", err);
+    }
+    for (const [key, bot] of this.robots) {
+      const cfg = readRobotConfig(key);
+      if (cfg?.routine !== "pilot") {
+        bot.setPilotPost(null);
+        this.pilotSpeech.delete(key);
+        continue;
+      }
+      const captain = view && view.route.robotDockId === key ? view : null;
+      const post = pilotPost(captain?.f ?? null, now);
+      const door = captain ? this.pilotDoorPost(captain.route.shipPort) : null;
+      bot.setPilotPost(
+        post === "helm" ? (this.pilotHelmPost() ?? door) : post === "door" ? door : null,
+      );
+      if (!captain || cfg.parked === true) continue;
+      const mem = this.pilotSpeech.get(key) ?? null;
+      const line = pilotLine(captain, mem);
+      if (!line) continue;
+      const p = bot.getPosition();
+      if (this.robotSay(`robotsay:${key}`, line.text, p.x, p.z)) {
+        this.pilotSpeech.set(key, pilotSpeechAfter(captain, mem, line));
+      }
+    }
+  }
+
+  /** 🚀 The captain's helm post: beside the first helm console's device
+   *  stand (a step to its side, so a player can still walk up and use the
+   *  helm), facing the console. */
+  private pilotHelmPost(): { x: number; z: number; faceAngle: number } | null {
+    const helm = FURNITURE.find((i) => FURNITURE_DEFS[i.kind]?.functions?.includes("helm"));
+    const d = helm ? findDevice(helm.id) : null;
+    if (!d) return null;
+    const side = World.PILOT_HELM_SIDESTEP;
+    const want = {
+      x: d.front.x + Math.cos(d.faceAngle) * side,
+      z: d.front.z - Math.sin(d.faceAngle) * side,
+    };
+    const cell = nearestWalkableCell(want.x, want.z, 2) ?? d.front;
+    return { x: cell.x, z: cell.z, faceAngle: d.faceAngle };
+  }
+
+  /** 🚀 The captain's berth-door post: just inside the route's dock-port
+   *  door (toward the room's middle, on walkable floor), facing the door. */
+  private pilotDoorPost(doorId: string): { x: number; z: number; faceAngle: number } | null {
+    const g = this.dockingSystem?.getDoorGroups().get(doorId);
+    if (!g) return null;
+    const dx = g.position.x;
+    const dz = g.position.z;
+    const len = Math.hypot(dx, dz);
+    const k = len > 0.01 ? Math.max(0, len - World.PILOT_DOOR_STANDOFF) / len : 0;
+    const want = { x: dx * k, z: dz * k };
+    const cell = nearestWalkableCell(want.x, want.z, 3) ?? want;
+    return { x: cell.x, z: cell.z, faceAngle: Math.atan2(dx - cell.x, dz - cell.z) };
   }
 
   /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
@@ -5289,6 +5395,7 @@ export class World {
       routineOf(k) !== "custom" &&
       routineOf(k) !== "coach" && // a coach runs its class, never a table
       routineOf(k) !== "dance" && // 🎉 a dancer is on the floor, never at a table
+      routineOf(k) !== "pilot" && // 🚀 a ship pilot keeps to the helm and the berth door
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,
