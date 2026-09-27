@@ -380,12 +380,23 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   const mineRoutes: Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }> = [];
   const mineRouteKeys: string[] = [];
   const otherRoutes = new Map<string, { keys: string[]; entries: Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }> }>();
+  /** Other ferries' checkpoint keys, by ship: an evicted ferry's go with it,
+   *  from this one scan (never a rescan per evicted ferry). */
+  const otherCkpts = new Map<string, string[]>();
   let visited = 0;
   for (const key of map.keys()) {
     if (++visited > MAX_WRITE_KEYS_VISITED) break;
     const k = parseDepartureKey(key);
     if (!k) continue;
-    if (k.kind === 'ckpt' && k.ship === ship) mineKeys.push({ key, k });
+    if (k.kind === 'ckpt') {
+      if (k.ship === ship) mineKeys.push({ key, k });
+      else {
+        const list = otherCkpts.get(k.ship);
+        if (list) list.push(key);
+        else otherCkpts.set(k.ship, [key]);
+      }
+      continue;
+    }
     if (k.kind !== 'route') continue;
     const e = departureRouteFromWire(map.get(key), k.ship);
     if (k.ship === ship) {
@@ -464,12 +475,7 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
       others.sort(byPublished);
       for (const gone of others.slice(0, others.length - MAX_DEPARTURE_FERRIES + 1)) {
         for (const key of gone.keys) del(key);
-        let n = 0;
-        for (const key of [...map.keys()]) {
-          if (++n > MAX_WRITE_KEYS_VISITED) break;
-          const k = parseDepartureKey(key);
-          if (k && k.kind === 'ckpt' && k.ship === gone.ship) del(key);
-        }
+        for (const key of otherCkpts.get(gone.ship) ?? []) del(key);
       }
     }
   });

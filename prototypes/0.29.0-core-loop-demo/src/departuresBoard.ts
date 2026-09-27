@@ -552,7 +552,9 @@ export function routePortGate(
  * The route fields of the ship's own summary (A9 item 7), from its
  * timetable and its own live dock at the stop (`dock`: docked there, and at
  * which gate when known), with the run's newest checkpoint. 🏁 `routeIdle`
- * alone when no route runs or it has ended. Pure.
+ * alone when no route runs or it has ended; nothing at all while a running
+ * route's timetable can't be worked out yet (its anchor checkpoint has not
+ * arrived), so a board keeps what it holds. Pure.
  */
 export function routeSummaryFields(
   route: ShipRoute | null,
@@ -561,7 +563,8 @@ export function routeSummaryFields(
   dock: { gate?: number } | null,
   now: number,
 ): RouteSummaryFields {
-  if (!isRouteRunning(route) || !f || f.ended === 'stop') return { routeIdle: true };
+  if (!isRouteRunning(route) || f?.ended === 'stop') return { routeIdle: true };
+  if (!f) return {};
   const next = route.stops[f.nextStopIndex];
   const out: RouteSummaryFields = {};
   if (route.startedAt !== undefined) out.routeRun = route.startedAt;

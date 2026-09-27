@@ -461,6 +461,10 @@ describe('the route fields of the ferry’s own summary', () => {
     });
     // 🏁 No run flies: said outright.
     expect(routeSummaryFields(null, null, [], null, T0)).toEqual({ routeIdle: true });
+    // A run that flies but can't be worked out yet (no anchor checkpoint
+    // here): no word either way, so boards keep what they hold.
+    expect(routeFlightAt(route, [], null, T0 + 10 * SEC, 100)).toBeNull();
+    expect(routeSummaryFields(route, null, [], null, T0 + 10 * SEC)).toEqual({});
     const stopped = running({ stoppedAt: T0 + SEC });
     const e = routeFlightAt(stopped, [s], null, T0 + 10 * SEC, 100)!;
     expect(e.ended).toBe('stop');

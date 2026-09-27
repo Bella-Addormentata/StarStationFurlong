@@ -367,6 +367,35 @@ describe('a publish applied to a stop room', () => {
     expect(ships).not.toContain('ship-00');
     expect(keys(doc).some((k) => k.startsWith('ship-00:'))).toBe(false);
   });
+
+  it('an overfilled room is trimmed in one scan: every evicted ferry’s keys go, the map walked once', () => {
+    const doc = new Y.Doc();
+    const map = doc.getMap(DEPARTURES_MAP);
+    const route = running();
+    const s = start(route);
+    const { kind: _k, legSeq: _l, ...startWire } = s;
+    const n = 200;
+    doc.transact(() => {
+      for (let i = 0; i < n; i++) {
+        const ship = `ship-${String(i).padStart(3, '0')}`;
+        map.set(departureCheckpointKey(ship, T0, 0, 'start'), startWire);
+        const entry = { shipRoomId: ship, name: 'F', capacity: 100, route, at: T0 + i * SEC };
+        map.set(departureRouteKey(entry), departureRouteToWire(entry));
+      }
+    });
+    const walks = vi.spyOn(map, 'keys');
+    applyDeparturesPublish(doc, pub(route, [s], T0 + 10 * MIN, { shipRoomId: 'ship-new' }), T0 + 10 * MIN);
+    expect(walks).toHaveBeenCalledTimes(1);
+    walks.mockRestore();
+    const ships = departureFerriesIn(map).map((f) => f.shipRoomId);
+    expect(ships).toHaveLength(MAX_DEPARTURE_FERRIES);
+    expect(ships).toContain('ship-new');
+    // The newest published stay; every other ferry's route and checkpoints go.
+    const kept = new Set(ships);
+    expect(kept.has(`ship-${n - 1}`)).toBe(true);
+    for (const k of keys(doc)) expect(kept.has(k.split(':')[0])).toBe(true);
+    expect(keys(doc).filter((k) => k.includes(':ckpt:'))).toHaveLength(MAX_DEPARTURE_FERRIES);
+  });
 });
 
 describe('reading a room’s departures', () => {
