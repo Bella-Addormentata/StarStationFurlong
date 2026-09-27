@@ -128,10 +128,12 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
 
 /** A list of berths, cleaned, deduplicated by port and capped. */
 export function cleanBerths(v: unknown): StationBerthRecord[] {
-  if (!Array.isArray(v)) return [];
+  // A longer list than any station lists is junk, not a prefix to trust:
+  // duplicates could otherwise push a real gate past the cut.
+  if (!Array.isArray(v) || v.length > MAX_BERTHS * 4) return [];
   const valid: StationBerthRecord[] = [];
   const seen = new Set<string>();
-  for (const item of v.slice(0, MAX_BERTHS * 4)) {
+  for (const item of v) {
     const b = cleanBerth(item);
     if (!b) continue;
     const key = `${b.roomId}\u0000${b.doorId}`;
