@@ -3,10 +3,10 @@
  * (Kepler stays honest: lower is faster), the burn planner's refusal ladder,
  * the doc record's guards, and two owners burning at once.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
-import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, wrapAngle } from './orbits';
+import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, setStationTrimResolver, stationOrbit, wrapAngle } from './orbits';
 import { bindShipDoc, readFuelLevel, writeFuelLevel } from './shipDoc';
 import { DEFAULT_PLANET_ID } from './stations';
 import {
@@ -391,5 +391,20 @@ describe('two owners burning at once', () => {
     expect(sa).toEqual(sb);
     expect([ta, tb]).toContainEqual(sa.trim);
     expect(sa.fuel).toBe(5 - TRIM_FUEL);
+  });
+});
+
+describe('with a trim resolver installed (orbits.setStationTrimResolver)', () => {
+  afterEach(() => setStationTrimResolver(null));
+
+  it('stationOrbit flies the trim, and burns are still measured from the slot — never twice', () => {
+    const t = trim({ dRadiusKm: -4, dPhase: 0.2 });
+    const plan = () => planTrim(ctx({ trim: t, now: T0 + HOUR }), 'raise');
+    const without = plan();
+    setStationTrimResolver((station, slot) => (trimFor(station, t) ? trimmedOrbit(slot, t) : null));
+    const want = trimmedOrbit(slotOrbit(STATION), t);
+    expect(stationOrbit(STATION).radiusKm).toBeCloseTo(want.radiusKm, 9);
+    expect(stationOrbit(STATION).phase0).toBeCloseTo(want.phase0, 9);
+    expect(plan()).toEqual(without);
   });
 });

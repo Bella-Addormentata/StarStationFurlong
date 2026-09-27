@@ -49,7 +49,7 @@
 
 import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
-import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
+import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, circularOrbit, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { isBerthDoor } from './stationAtlas';
 import { MAX_ORBIT_SLOTS, planetById } from './stations';
@@ -191,18 +191,13 @@ export function slotOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>
  */
 export function trimmedOrbit(base: CircularOrbit, trim: OrbitTrim | null): CircularOrbit {
   if (!trim) return base;
-  const mu = base.planet.mu;
   const radiusKm = base.radiusKm + trim.dRadiusKm;
-  const meanMotion = Math.sqrt(mu / radiusKm ** 3);
-  return {
-    planet: base.planet,
+  const meanMotion = Math.sqrt(base.planet.mu / radiusKm ** 3);
+  return circularOrbit(
+    base.planet,
     radiusKm,
-    altitudeKm: radiusKm - base.planet.radiusKm,
-    periodS: TAU / meanMotion,
-    speedKmS: Math.sqrt(mu / radiusKm),
-    meanMotion,
-    phase0: wrapAngle(base.phase0 + trim.dPhase - (meanMotion - base.meanMotion) * orbitalSeconds(trim.at)),
-  };
+    base.phase0 + trim.dPhase - (meanMotion - base.meanMotion) * orbitalSeconds(trim.at),
+  );
 }
 
 /** How far along its orbit the station sits from its slot's nominal position
