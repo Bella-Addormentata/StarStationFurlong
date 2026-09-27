@@ -613,8 +613,9 @@ export function withSharedAtlasOf(
     if (isSharedAtlasEntry(value) && value.roomId === rid) {
       const doors: Record<string, AtlasDoor> = {};
       let kept = 0;
+      let whole = true;
       for (const [d, door] of Object.entries(value.doors)) {
-        if (kept >= MAX_DOORS_PER_ENTRY) break;
+        if (kept >= MAX_DOORS_PER_ENTRY) { whole = false; break; }
         if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
         doors[d] = {
           targetSeed: '',
@@ -636,12 +637,20 @@ export function withSharedAtlasOf(
           lastSeen: value.updatedAt,
         };
       } else {
-        // A newer doc copy's pairings win door by door (a door re-paired since
-        // we saw the room); an older one only adds pairings we lack.
+        // A newer doc copy is the room's doors now, as pullSharedAtlas takes
+        // it: a door it lacks was removed (keeping it would walk a module no
+        // longer in the station). Our seed for a door still paired the same
+        // way stays. An older copy only adds pairings we lack; so does a
+        // newer one cut short at the door cap.
         const newer = value.updatedAt > prior.lastSeen;
+        const withSeeds: Record<string, AtlasDoor> = {};
+        for (const [d, door] of Object.entries(doors)) {
+          const had = prior.doors[d];
+          withSeeds[d] = had && had.targetRoomId === door.targetRoomId ? { ...door, targetSeed: had.targetSeed } : door;
+        }
         const merged: AtlasEntry = {
           ...prior,
-          doors: newer ? { ...prior.doors, ...doors } : { ...doors, ...prior.doors },
+          doors: newer ? (whole ? withSeeds : { ...prior.doors, ...withSeeds }) : { ...doors, ...prior.doors },
         };
         if (gates && (prior.gates === undefined || newer)) merged.gates = gates;
         out[rid] = merged;

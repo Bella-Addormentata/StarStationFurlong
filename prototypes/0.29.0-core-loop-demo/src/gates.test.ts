@@ -266,6 +266,28 @@ describe("a far room doc's shared atlas", () => {
     expect(freeGateNumber(withSharedAtlasOf(doc, readAtlas(), 'far-dock'), 'far-dock', {})).toBe(2);
   });
 
+  it("drops a door a newer doc copy no longer lists, so a removed module's gates don't count", () => {
+    // We once saw far-dock joined to far-old, which used every gate number.
+    harvestIntoAtlas({ roomId: 'far-dock', name: 'DOCK', doors: [{ doorId: 'd:aft', targetSeed: seed('far-old'), transient: false }] });
+    const all: Record<string, number> = {};
+    for (let g = 1; g <= 99; g++) all[`d:g${String(g).padStart(6, '0')}`] = g;
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('far-old', entry('far-old', 5, {}, all));
+    // The newer copy: that module has been unbolted.
+    shared.set('far-dock', entry('far-dock', Date.now() + 60_000, {}));
+    const atlas = withSharedAtlasOf(doc, readAtlas(), 'far-dock');
+    expect(atlas['far-dock'].doors['d:aft']).toBeUndefined();
+    expect(freeGateNumber(atlas, 'far-dock', {})).toBe(1);
+  });
+
+  it("keeps our seed for a door a newer doc copy still pairs the same way", () => {
+    harvestIntoAtlas({ roomId: 'far-dock', name: 'DOCK', doors: [{ doorId: 'd:hall', targetSeed: seed('far-hub'), transient: false }] });
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('far-dock', entry('far-dock', Date.now() + 60_000, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
+    expect(withSharedAtlasOf(doc, readAtlas(), 'far-dock')['far-dock'].doors['d:hall'].targetSeed).toBe(seed('far-hub'));
+  });
+
   it("takes the doc's gates for a known room when the doc's copy is newer", () => {
     harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: { 'd:p1': 1 } });
     const doc = new Y.Doc();
@@ -398,6 +420,11 @@ describe('the station record', () => {
     const out = cleanBerths([...flood, { roomId: 'room-a', doorId: 'north', gate: 2 }]);
     expect(out).toHaveLength(99);
     expect(out.some((b) => b.gate === 2)).toBe(true);
+  });
+
+  it('rejects a peer gate list longer than any station lists, rather than trusting a prefix', () => {
+    const flood = Array.from({ length: 396 }, (_, i) => ({ roomId: 'room-x', doorId: `d:${String(i).padStart(8, '0')}`, gate: 1 }));
+    expect(cleanBerths([...flood, { roomId: 'room-a', doorId: 'north', gate: 2 }])).toEqual([]);
   });
 
   it("keeps a record's extra fields beside a long gate list", () => {
