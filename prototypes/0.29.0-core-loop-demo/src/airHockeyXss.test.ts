@@ -10,14 +10,21 @@
  * table. The remediation escapes every peer-authored string before it
  * reaches the DOM by routing it through this module's `escapeHtml`.
  *
- * The DOM interpolation itself isn't exercised from the pure-Node vitest
- * environment (no JSDOM configured), so we pin the pure escaper directly
- * and assert the specific characters that make markup / event-handler
- * injection possible are all rewritten to entities.
+ * The pure-Node vitest environment has no DOM, so the escaper is pinned
+ * directly (the characters that make markup / event-handler injection
+ * possible are all rewritten to entities), and so is the seat row the HUD
+ * renders (airHockeySeatRowHtml, the markup card.innerHTML takes): a hostile
+ * name comes out as text, whichever end and player the row is for.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { escapeHtml } from './htmlEscape';
+
+// airHockeySession publishes a debug handle on `window` when it loads (and
+// furniture.ts reads the page's query string).
+vi.stubGlobal('window', { location: { search: '' } });
+const { airHockeySeatRowHtml } = await import('./airHockeySession');
+const { claimSide, initialAirHockeyState } = await import('./games/airHockey');
 
 describe('#116 XSS fix — escapeHtml on peer display names', () => {
   it('escapes the five markup-sensitive characters', () => {
@@ -78,5 +85,34 @@ describe('#116 XSS fix — escapeHtml on peer display names', () => {
     // an entity through. This regex-with-lookup construction is single-pass.
     expect(escapeHtml('&lt;')).toBe('&amp;lt;'); // literal `&lt;` becomes `&amp;lt;`
     expect(escapeHtml('a & b < c')).toBe('a &amp; b &lt; c');
+  });
+});
+
+describe('#116 XSS fix — the seat row the HUD renders', () => {
+  const attack = '<img src=x onerror="alert(1)">';
+  const opponent = claimSide(initialAirHockeyState(), 'b', 'peer-1', 'seat-1')!;
+
+  it("carries a hostile display name as text, never as markup", () => {
+    const html = airHockeySeatRowHtml(opponent, 'b', 'a', 'me', () => attack);
+    // Every tag in the row is the template's own: the name adds none.
+    const tags = [...html.matchAll(/<\s*\/?\s*([a-z0-9]+)/gi)].map((m) => m[1].toLowerCase());
+    expect(new Set(tags)).toEqual(new Set(['div', 'span']));
+    for (const tag of html.match(/<[^>]*>/g) ?? []) expect(tag).not.toMatch(/\bon\w+\s*=/i);
+    // The name is there, escaped (the row upper-cases it).
+    expect(html).toContain('&lt;IMG SRC=X ONERROR=&quot;ALERT(1)&quot;&gt;');
+  });
+
+  it('escapes the name wherever it sits: this end or the other, yours or theirs', () => {
+    for (const [thisEnd, me] of [['a', 'me'], ['b', 'me'], ['b', 'peer-1']] as const) {
+      const html = airHockeySeatRowHtml(opponent, 'b', thisEnd, me, () => attack);
+      expect(html).not.toMatch(/<img/i);
+      expect(html).toContain('&lt;IMG');
+    }
+  });
+
+  it('shows an open seat with no name at all', () => {
+    const html = airHockeySeatRowHtml(opponent, 'a', 'a', 'me', () => attack);
+    expect(html).toContain('OPEN');
+    expect(html).not.toContain('IMG');
   });
 });

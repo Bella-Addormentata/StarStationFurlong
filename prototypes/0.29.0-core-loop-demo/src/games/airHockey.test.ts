@@ -27,12 +27,14 @@ import {
   puckFromTick,
   puckToTick,
   releaseSide,
+  seatOf,
   servePosition,
   setReady,
   setUnready,
   startIfReady,
   startPractice,
   stepPuck,
+  takeSeat,
   withForfeit,
   withGoal,
   type AirHockeyState,
@@ -105,17 +107,17 @@ describe('isAirHockeyState guard', () => {
 describe('claim / ready lifecycle', () => {
   it('claims an open side, refuses a taken side and double-siding', () => {
     const s0 = initialAirHockeyState();
-    const s1 = claimSide(s0, 'a', 'p1');
+    const s1 = claimSide(s0, 'a', 'p1', 'seat-p1');
     expect(s1?.players.a).toBe('p1');
-    expect(claimSide(s1!, 'a', 'p2')).toBeNull();       // taken
-    expect(claimSide(s1!, 'b', 'p1')).toBeNull();       // one side per player
-    expect(claimSide(s1!, 'a', 'p1')).toBeNull();       // already mine — no-op
-    const s2 = claimSide(s1!, 'b', 'p2');
+    expect(claimSide(s1!, 'a', 'p2', 'seat-p2')).toBeNull();       // taken
+    expect(claimSide(s1!, 'b', 'p1', 'seat-p1')).toBeNull();       // one side per player
+    expect(claimSide(s1!, 'a', 'p1', 'seat-p1')).toBeNull();       // already mine — no-op
+    const s2 = claimSide(s1!, 'b', 'p2', 'seat-p2');
     expect(s2?.players).toEqual({ a: 'p1', b: 'p2' });
   });
 
   it('release clears the claim plus ready, only pre-game and only by owner', () => {
-    let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
+    let s = claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!;
     s = setReady(s, 'a', 'p1')!;
     expect(releaseSide(s, 'a', 'p2')).toBeNull();
     const released = releaseSide(s, 'a', 'p1')!;
@@ -124,7 +126,7 @@ describe('claim / ready lifecycle', () => {
   });
 
   it('ready and unready gate on claimant + status', () => {
-    let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
+    let s = claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!;
     expect(setReady(s, 'a', 'p2')).toBeNull();          // not the claimant
     s = setReady(s, 'a', 'p1')!;
     expect(s.ready.a).toBe(true);
@@ -136,10 +138,10 @@ describe('claim / ready lifecycle', () => {
   });
 
   it('startIfReady fires only with both sides claimed AND ready, and resets score', () => {
-    let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
+    let s = claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!;
     s = setReady(s, 'a', 'p1')!;
     expect(startIfReady(s, 1000)).toBeNull();           // b missing
-    s = claimSide(s, 'b', 'p2')!;
+    s = claimSide(s, 'b', 'p2', 'seat-p2')!;
     expect(startIfReady(s, 1000)).toBeNull();           // b not ready
     s = setReady(s, 'b', 'p2')!;
     const playing = startIfReady({ ...s, score: { a: 3, b: 1 } }, 1000)!;
@@ -151,19 +153,72 @@ describe('claim / ready lifecycle', () => {
   });
 
   it('practice starts solo only, and versus takes priority once b is claimed', () => {
-    let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
+    let s = claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!;
     const practice = startPractice(s, 'a', 'p1', 500)!;
     expect(practice.status).toBe('playing');
     expect(isVersus(practice)).toBe(false);
-    s = claimSide(s, 'b', 'p2')!;
+    s = claimSide(s, 'b', 'p2', 'seat-p2')!;
     expect(startPractice(s, 'a', 'p1', 500)).toBeNull();
+  });
+});
+
+describe('seats: which page plays a claimed end', () => {
+  it('a claim records the claiming page, and a release clears it', () => {
+    const s1 = claimSide(initialAirHockeyState(), 'a', 'p1', 'tab-1')!;
+    expect(seatOf(s1, 'a')).toBe('tab-1');
+    expect(seatOf(s1, 'b')).toBeNull();
+    const s2 = claimSide(s1, 'b', 'p2', 'tab-2')!;
+    expect(s2.seats).toEqual({ a: 'tab-1', b: 'tab-2' });
+    expect(releaseSide(s2, 'a', 'p1')!.seats).toEqual({ a: null, b: 'tab-2' });
+  });
+
+  it("takeSeat moves an end to another of its player's pages, mid-match too", () => {
+    const s = claimSide(initialAirHockeyState(), 'a', 'p1', 'tab-1')!;
+    expect(takeSeat(s, 'a', 'p2', 'tab-9')).toBeNull();  // not the claimant
+    expect(takeSeat(s, 'b', 'p1', 'tab-2')).toBeNull();  // an end p1 doesn't hold
+    expect(takeSeat(s, 'a', 'p1', 'tab-1')).toBeNull();  // already this page's
+    const moved = takeSeat(s, 'a', 'p1', 'tab-2')!;
+    expect(seatOf(moved, 'a')).toBe('tab-2');
+    expect(moved.players).toEqual(s.players);
+    const practice = startPractice(moved, 'a', 'p1', 500)!;
+    expect(seatOf(takeSeat(practice, 'a', 'p1', 'tab-1')!, 'a')).toBe('tab-1');
+    expect(takeSeat({ ...practice, status: 'ended' }, 'a', 'p1', 'tab-1')).toBeNull();
+  });
+
+  it('every transition keeps the seats', () => {
+    let s = claimSide(initialAirHockeyState(), 'a', 'p1', 'tab-1')!;
+    s = claimSide(s, 'b', 'p2', 'tab-2')!;
+    const seats = { a: 'tab-1', b: 'tab-2' };
+    s = setReady(s, 'a', 'p1')!;
+    expect(s.seats).toEqual(seats);
+    expect(setUnready(s, 'a', 'p1')!.seats).toEqual(seats);
+    s = setReady(s, 'b', 'p2')!;
+    s = startIfReady(s, 1000)!;
+    expect(s.seats).toEqual(seats);
+    s = withGoal(s, 'a', 2000)!;
+    expect(s.seats).toEqual(seats);
+    expect(withForfeit(s, 'b')!.seats).toEqual(seats);
+    const solo = claimSide(initialAirHockeyState(), 'a', 'p1', 'tab-1')!;
+    expect(seatOf(startPractice(solo, 'a', 'p1', 500)!, 'a')).toBe('tab-1');
+  });
+
+  it('the guard takes a record from before seats, and refuses malformed seats', () => {
+    const { seats: _seats, ...before } = claimSide(initialAirHockeyState(), 'a', 'p1', 'tab-1')!;
+    expect(isAirHockeyState(before)).toBe(true);
+    expect(seatOf(before as AirHockeyState, 'a')).toBeNull(); // no page plays it yet
+    expect(seatOf(takeSeat(before as AirHockeyState, 'a', 'p1', 'tab-1')!, 'a')).toBe('tab-1');
+    const base = initialAirHockeyState();
+    expect(isAirHockeyState({ ...base, seats: null })).toBe(false);
+    expect(isAirHockeyState({ ...base, seats: { a: 5, b: null } })).toBe(false);
+    expect(isAirHockeyState({ ...base, seats: { a: '', b: null } })).toBe(false);
+    expect(isAirHockeyState({ ...base, seats: { a: 'x'.repeat(129), b: null } })).toBe(false);
   });
 });
 
 describe('goals, wins, forfeits', () => {
   function playingVersus(): AirHockeyState {
-    let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
-    s = claimSide(s, 'b', 'p2')!;
+    let s = claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!;
+    s = claimSide(s, 'b', 'p2', 'seat-p2')!;
     s = setReady(s, 'a', 'p1')!;
     s = setReady(s, 'b', 'p2')!;
     return startIfReady(s, 1000)!;
@@ -191,7 +246,7 @@ describe('goals, wins, forfeits', () => {
   });
 
   it('practice never ends on score', () => {
-    const solo = claimSide(initialAirHockeyState(), 'a', 'p1')!;
+    const solo = claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!;
     let s = startPractice(solo, 'a', 'p1', 500)!;
     for (let i = 0; i < AH_GOALS_TO_WIN + 3; i++) s = withGoal(s, 'b', 1000 + i)!;
     expect(s.status).toBe('playing');
@@ -203,7 +258,7 @@ describe('goals, wins, forfeits', () => {
     const s = withForfeit(playingVersus(), 'a')!;
     expect(s.status).toBe('ended');
     expect(s.winner).toBe('a');
-    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1')!, 'a', 'p1', 1)!;
+    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!, 'a', 'p1', 1)!;
     expect(withForfeit(solo, 'a')).toBeNull();
   });
 
@@ -211,7 +266,7 @@ describe('goals, wins, forfeits', () => {
     const versus = playingVersus();
     expect(servePosition({ ...versus, servingSide: 'a' }).z).toBeLessThan(0);
     expect(servePosition({ ...versus, servingSide: 'b' }).z).toBeGreaterThan(0);
-    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1')!, 'a', 'p1', 1)!;
+    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1', 'seat-p1')!, 'a', 'p1', 1)!;
     expect(servePosition(solo)).toEqual({ x: 0, z: 0 });
   });
 });
@@ -273,6 +328,28 @@ describe('puck physics', () => {
     goal = null;
     for (let i = 0; i < 60 && goal === null; i++) goal = stepPuck(other, [], 1 / 60);
     expect(goal).toBe('a');
+  });
+
+  it('a puck overlapping a rail at the edge of the mouth bounces off it', () => {
+    // The end rails begin at ±AH_GOAL_HALF_W, so a centre within a radius of
+    // that overlaps the rail: it must not pass through and score.
+    const edge = AH_GOAL_HALF_W - AH_PUCK_R / 2;
+    for (const dir of [1, -1] as const) {
+      const sim: PuckSim = { x: edge * dir, z: dir * 1.0, vx: 0, vz: dir * 3 };
+      let goal: ReturnType<typeof stepPuck> = null;
+      for (let i = 0; i < 12 && goal === null; i++) goal = stepPuck(sim, [], 1 / 60);
+      expect(goal).toBeNull();
+      expect(Math.sign(sim.vz)).toBe(-dir);                 // reflected by the rail
+      expect(Math.abs(sim.z)).toBeLessThanOrEqual(AH_HALF_L - AH_PUCK_R + 1e-9);
+    }
+  });
+
+  it('a puck that just fits the mouth still scores', () => {
+    const fits = AH_GOAL_HALF_W - AH_PUCK_R - 0.001;
+    const sim: PuckSim = { x: -fits, z: 1.0, vx: 0, vz: 3 };
+    let goal: ReturnType<typeof stepPuck> = null;
+    for (let i = 0; i < 12 && goal === null; i++) goal = stepPuck(sim, [], 1 / 60);
+    expect(goal).toBe('b');
   });
 
   it('friction decays speed exponentially between contacts', () => {

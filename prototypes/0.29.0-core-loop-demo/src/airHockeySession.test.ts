@@ -14,11 +14,15 @@ import * as Y from 'yjs';
 vi.stubGlobal('window', { location: { search: '' } });
 
 const { bindCasinoDoc } = await import('./casinoDoc');
-const { bindGamesDoc, writeGame } = await import('./games/gamesDoc');
+const { bindGamesDoc, readAirHockey, writeGame } = await import('./games/gamesDoc');
 const { getPlayerId } = await import('./identity');
-const { airHockeyFrame, closeAirHockeyTable, registerAirHockeyVisual, routeAirHockeyTick } = await import('./airHockeySession');
+const {
+  airHockeyFrame, airHockeySeat, closeAirHockeyTable, registerAirHockeyVisual, routeAirHockeyTick,
+  setAirHockeySender,
+} = await import('./airHockeySession');
 const {
   AH_GOAL_PAUSE_MS, AH_SERVE_DELAY_MS, claimSide, initialAirHockeyState, malletToTick, startPractice,
+  takeSeat,
 } = await import('./games/airHockey');
 
 type Session = {
@@ -70,6 +74,7 @@ function expectFresh(st: Session | undefined, h: unknown): void {
 
 afterEach(() => {
   closeAirHockeyTable(TABLE);
+  setAirHockeySender(null);
   vi.useRealTimers();
 });
 
@@ -132,7 +137,7 @@ describe('air-hockey serves', () => {
     joinRoom();
     registerAirHockeyVisual(TABLE, handle(), POSE);
     const me = getPlayerId();
-    const claimed = claimSide(initialAirHockeyState(), 'a', me)!;
+    const claimed = claimSide(initialAirHockeyState(), 'a', me, airHockeySeat())!;
     writeGame(TABLE, startPractice(claimed, 'a', me, T + aheadMs)!);
     const st = sessions.get(TABLE)!;
     st.engaged = { side: 'a', x: 0, z: -0.9, vx: 0, vz: 0, prevX: 0, prevZ: -0.9, down: false, locked: false };
@@ -160,5 +165,66 @@ describe('air-hockey serves', () => {
     vi.setSystemTime(T + AH_SERVE_DELAY_MS);
     airHockeyFrame(0.016);
     expect(st.puckActive).toBe(true);
+  });
+});
+
+describe("a player's other pages at one end (#116 review)", () => {
+  const T = 1_800_000_000_000;
+
+  /** This player's practice at end a, played from `seat`, with this page
+   *  engaged on that end too. */
+  function practiceFrom(seat: string): Session {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T);
+    joinRoom();
+    registerAirHockeyVisual(TABLE, handle(), POSE);
+    const me = getPlayerId();
+    writeGame(TABLE, startPractice(claimSide(initialAirHockeyState(), 'a', me, seat)!, 'a', me, T)!);
+    const st = sessions.get(TABLE)!;
+    st.engaged = { side: 'a', x: 0, z: -0.9, vx: 0, vz: 0, prevX: 0, prevZ: -0.9, down: false, locked: false };
+    return st;
+  }
+
+  function sent(): Uint8Array[] {
+    const out: Uint8Array[] = [];
+    setAirHockeySender((buf) => out.push(buf));
+    return out;
+  }
+
+  it('leave the end to the page that plays it: no puck, no ticks, no writes', () => {
+    const st = practiceFrom('another-tab');
+    const ticks = sent();
+    const before = JSON.stringify(readAirHockey(TABLE));
+    for (let i = 0; i < 5; i++) {
+      vi.setSystemTime(T + AH_SERVE_DELAY_MS + i * 100);
+      airHockeyFrame(0.1);
+    }
+    expect(st.wasOperator).toBe(false);
+    expect(st.puckActive).toBe(false);
+    expect(ticks).toHaveLength(0);
+    expect(JSON.stringify(readAirHockey(TABLE))).toBe(before);
+  });
+
+  it('play it once this page takes the seat', () => {
+    const st = practiceFrom('another-tab');
+    const ticks = sent();
+    writeGame(TABLE, takeSeat(readAirHockey(TABLE)!, 'a', getPlayerId(), airHockeySeat())!);
+    vi.setSystemTime(T + AH_SERVE_DELAY_MS);
+    airHockeyFrame(0.1);
+    expect(st.wasOperator).toBe(true);
+    expect(st.puckActive).toBe(true);
+    expect(ticks.length).toBeGreaterThan(0);
+  });
+
+  it("show the mallet of the page that plays this page's end", () => {
+    practiceFrom('another-tab');
+    routeAirHockeyTick('other-tab', malletToTick({ x: 0.1, z: -0.4, down: true, seq: 3 }));
+    expect(sessions.get(TABLE)!.remoteMallet.a?.seq).toBe(3);
+  });
+
+  it('ignore an echo of the end this page plays', () => {
+    practiceFrom(airHockeySeat());
+    routeAirHockeyTick('echo', malletToTick({ x: 0.1, z: -0.4, down: true, seq: 3 }));
+    expect(sessions.get(TABLE)!.remoteMallet.a).toBeNull();
   });
 });

@@ -39,9 +39,9 @@ import {
   AH_GOAL_PAUSE_MS, AH_GOALS_TO_WIN, AH_HALF_L, AH_HALF_W, AH_PUCK_R,
   AH_SERVE_DELAY_MS, AH_STUCK_SPEED, AH_STUCK_TIMEOUT_MS,
   claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
-  malletFromTick, malletToTick, puckFromTick, puckToTick,
+  malletFromTick, malletToTick, puckFromTick, puckToTick, seatOf,
   servePosition, setReady, setUnready, startIfReady, startPractice, stepPuck,
-  withForfeit, withGoal,
+  takeSeat, withForfeit, withGoal,
 } from './games/airHockey';
 import type {
   AirHockeySide, AirHockeyState, MalletInput, PuckSim,
@@ -186,6 +186,31 @@ interface TableSession {
 
 const sessions = new Map<string, TableSession>();
 
+/** This page's seat (AirHockeyState.seats). A player id is shared by every
+ *  tab and device of that player, so two of their pages at one end would both
+ *  run the puck and race each other's score writes. Only the page holding an
+ *  end's seat plays it. Fresh on every page load. */
+const PAGE_SEAT = mintSeat();
+
+function mintSeat(): string {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+      return crypto.randomUUID();
+    }
+  } catch { /* fall through to the non-crypto shape */ }
+  return `seat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+/** This page's seat: the one it claims ends with (tests and debugging). */
+export function airHockeySeat(): string {
+  return PAGE_SEAT;
+}
+
+/** Does this page play `side`? Its player holds the end, from this page. */
+function playsSide(s: AirHockeyState, side: AirHockeySide, myId: string): boolean {
+  return s.players[side] === myId && seatOf(s, side) === PAGE_SEAT;
+}
+
 /** Outbound datagram seam — main.ts wires NetworkProvider.sendTick here. */
 let sendTickBuf: ((buf: Uint8Array) => void) | null = null;
 
@@ -321,7 +346,7 @@ export function routeAirHockeyTick(senderId: string, tick: MovementTick): void {
   const kind = tickKind(tick.flags);
   const found = tableAtWorld(tick.x, tick.z);
   if (!found) return; // no table under that point (removed, or garbage)
-  const { st } = found;
+  const { id, st } = found;
   const now = Date.now();
 
   if (kind === TICK_KIND_AH_MALLET) {
@@ -330,9 +355,13 @@ export function routeAirHockeyTick(senderId: string, tick: MovementTick): void {
     // The side IS the half the mallet is in (clampMallet keeps senders ≥ one
     // mallet-radius from the centre line, so the sign never wavers).
     const side: AirHockeySide = l.z < 0 ? 'a' : 'b';
-    // Self-echo guard: while I'm engaged on a side, its mallet is MINE —
-    // a loopback or impersonating tick must not fight my local input.
-    if (st.engaged?.side === side) return;
+    // Self-echo guard: while I play a side, its mallet is MINE — a loopback
+    // or impersonating tick must not fight my local input. Engaged on an end
+    // another page of mine plays, this page shows that page's mallet instead.
+    if (st.engaged?.side === side) {
+      const s = readAirHockey(id);
+      if (s && playsSide(s, side, getPlayerId())) return;
+    }
     const c = clampMallet(side, l.x, l.z);
     const prev = st.remoteMallet[side];
     const fresh = !prev || prev.sender !== senderId || now - prev.lastAt > REMOTE_STALE_MS;
@@ -443,12 +472,13 @@ function servesAt(st: TableSession, s: AirHockeyState, now: number): number {
 // ── Operator election ────────────────────────────────────────────────────────
 
 /** One sim at a time: side a's engaged claimant by default; side b's covers
- *  a silent side a; a solo practice claimant always operates. Spectators and
- *  the unengaged NEVER simulate. */
+ *  a silent side a; a solo practice claimant always operates. Only the page
+ *  holding the end's seat counts as its claimant. Spectators, the unengaged
+ *  and a player's other pages NEVER simulate. */
 function amIOperator(st: TableSession, s: AirHockeyState, myId: string, now: number): boolean {
   const input = st.engaged;
   if (!input || s.status !== 'playing') return false;
-  if (s.players[input.side] !== myId) return false;
+  if (!playsSide(s, input.side, myId)) return false;
   if (!isVersus(s)) return true;
   if (input.side === 'a') return true;
   return now - st.lastMalletAt.a > OPERATOR_TAKEOVER_MS;
@@ -496,7 +526,7 @@ export function airHockeyFrame(dt: number): void {
     }
 
     const input = st.engaged;
-    const iAmClaimant = input !== null && s !== null && s.players[input.side] === myId;
+    const iAmClaimant = input !== null && s !== null && playsSide(s, input.side, myId);
 
     // ── Local input upkeep (velocity estimate + presence heartbeat) ──
     if (input) {
@@ -728,6 +758,32 @@ const AH_UI_ORANGE = '#e8933a';
 const AH_UI_GOLD = '#d4a84b';
 const AH_UI_GOLD_BRIGHT = '#F0C060';
 
+const sideName = (sd: AirHockeySide): string => (sd === 'a' ? 'CYAN' : 'ORANGE');
+const sideColor = (sd: AirHockeySide): string => (sd === 'a' ? AH_UI_CYAN : AH_UI_ORANGE);
+
+/**
+ * One seat row of the focused HUD: the markup the card's innerHTML takes.
+ * #116 review fix: the player's display name is peer-writable, so it is
+ * escaped here, before it reaches the DOM. The rest is fixed strings.
+ */
+export function airHockeySeatRowHtml(
+  s: AirHockeyState | null,
+  sd: AirHockeySide,
+  thisEnd: AirHockeySide,
+  myId: string,
+  displayName: (playerId: string) => string,
+): string {
+  const pid = s?.players[sd] ?? null;
+  const label = pid
+    ? `${escapeHtml(displayName(pid).toUpperCase())}${pid === myId ? ' (YOU)' : ''}${s?.ready[sd] ? ' · READY' : ''}`
+    : 'OPEN';
+  return `
+      <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:6px 10px;">
+        <span style="width:10px; height:10px; border-radius:50%; background:${sideColor(sd)}; flex:none;"></span>
+        <span style="flex:1; font-size:10px; letter-spacing:1px; color:${AH_UI_GOLD};">${sideName(sd)}${sd === thisEnd ? ' (THIS END)' : ''} — ${label}</span>
+      </div>`;
+}
+
 /**
  * The focused first-person HUD for one table end: claim/ready/practice
  * card at the bottom, score strip on top, and the pointer-lock capture layer
@@ -771,10 +827,14 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     return session ? servesAt(session, s, now) : s.serveAt;
   };
 
+  /** Does this page play this end? (playsSide: the claim, from this page.) */
+  const plays = (s: AirHockeyState | null): s is AirHockeyState =>
+    s !== null && playsSide(s, side, myId);
+
   /** May I drive the mallet right now? Claimed my end, game not over. */
   const canDrive = (): boolean => {
     const s = state();
-    return s !== null && s.players[side] === myId && s.status !== 'ended';
+    return plays(s) && s.status !== 'ended';
   };
 
   const locked = (): boolean =>
@@ -804,13 +864,23 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   const doClaim = (): void => {
     if (!live()) return;
     // First claim may land on an untouched table — seed the initial state.
-    const ns = claimSide(state() ?? initialAirHockeyState(), side, myId);
+    const ns = claimSide(state() ?? initialAirHockeyState(), side, myId, PAGE_SEAT);
+    if (ns) writeGame(deps.itemId, ns);
+  };
+
+  /** Play this end, which my player holds, from this page rather than the
+   *  one it is played from (another tab or device, or this tab before a
+   *  reload). That page stops playing it. */
+  const doPlayHere = (): void => {
+    const s = state();
+    if (!s) return;
+    const ns = takeSeat(s, side, myId, PAGE_SEAT);
     if (ns) writeGame(deps.itemId, ns);
   };
 
   const doReady = (): void => {
     const s = state();
-    if (!s || s.status !== 'waiting' || s.players[side] !== myId || s.ready[side]) return;
+    if (!plays(s) || s.status !== 'waiting' || s.ready[side]) return;
     const ns = setReady(s, side, myId);
     if (!ns) return;
     writeGame(deps.itemId, ns);
@@ -824,14 +894,14 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const doUnready = (): void => {
     const s = state();
-    if (!s || s.status !== 'waiting' || s.players[side] !== myId || !s.ready[side]) return;
+    if (!plays(s) || s.status !== 'waiting' || !s.ready[side]) return;
     const ns = setUnready(s, side, myId);
     if (ns) writeGame(deps.itemId, ns);
   };
 
   const doPractice = (): void => {
     const s = state();
-    if (!s || s.status !== 'waiting' || s.players[side] !== myId) return;
+    if (!plays(s) || s.status !== 'waiting') return;
     if (s.players[otherSide(side)] !== null) return;
     const ns = startPractice(s, side, myId, Date.now());
     if (ns) writeGame(deps.itemId, ns);
@@ -839,7 +909,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const doForfeit = (): void => {
     const s = state();
-    if (!s || s.status !== 'playing' || s.players[side] !== myId) return;
+    if (!plays(s) || s.status !== 'playing') return;
     if (!isVersus(s)) {
       writeGame(deps.itemId, initialAirHockeyState()); // end practice → open table
       return;
@@ -917,9 +987,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   // ── Rendering ──────────────────────────────────────────────────────────────
 
-  const sideName = (sd: AirHockeySide): string => (sd === 'a' ? 'CYAN' : 'ORANGE');
-  const sideColor = (sd: AirHockeySide): string => (sd === 'a' ? AH_UI_CYAN : AH_UI_ORANGE);
-
   const btn = (id: string, label: string, disabled: boolean, title = ''): string => `
     <button id="${id}" ${disabled ? 'disabled' : ''} title="${title}" style="
       padding: 7px 12px;
@@ -935,20 +1002,8 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       opacity: ${disabled ? '0.5' : '1'};
     ">${label}</button>`;
 
-  const seatRow = (s: AirHockeyState | null, sd: AirHockeySide): string => {
-    const pid = s?.players[sd] ?? null;
-    // #116 review fix: display name is peer-writable and this string is
-    // interpolated into card.innerHTML — escape before it reaches the DOM.
-    // (The rest of the label is fixed strings under our control.)
-    const label = pid
-      ? `${escapeHtml(readPlayerDisplayName(pid).toUpperCase())}${pid === myId ? ' (YOU)' : ''}${s?.ready[sd] ? ' · READY' : ''}`
-      : 'OPEN';
-    return `
-      <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:6px 10px;">
-        <span style="width:10px; height:10px; border-radius:50%; background:${sideColor(sd)}; flex:none;"></span>
-        <span style="flex:1; font-size:10px; letter-spacing:1px; color:${AH_UI_GOLD};">${sideName(sd)}${sd === side ? ' (THIS END)' : ''} — ${label}</span>
-      </div>`;
-  };
+  const seatRow = (s: AirHockeyState | null, sd: AirHockeySide): string =>
+    airHockeySeatRowHtml(s, sd, side, myId, readPlayerDisplayName);
 
   const renderTop = (): void => {
     if (!topBar) return;
@@ -1000,7 +1055,10 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     card.style.display = locked() ? 'none' : 'flex';
     if (locked()) return;
 
-    const mine = s?.players[side] === myId;
+    const mine = plays(s);
+    // My player holds this end, but another page plays it: another tab or
+    // device, or this tab before a reload. PLAY HERE moves it to this page.
+    const mineElsewhere = s !== null && s.players[side] === myId && !mine;
     const otherPid = s?.players[otherSide(side)] ?? null;
 
     // A claim or a practice whose player walked off (a closed tab, a room
@@ -1009,16 +1067,22 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     const resetTable = (table: AirHockeyState): string => (canReset(table)
       ? btn('ah-reset', 'RESET TABLE', false, 'Clear the table, freeing an end its player left')
       : '');
+    const playHere = `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <span style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">YOU HOLD THIS END FROM ANOTHER TAB OR DEVICE</span>
+          ${btn('ah-here', 'PLAY HERE', false, 'Play this end from this tab instead')}
+        </div>`;
 
     let actions = '';
     if (!s || s.status === 'waiting') {
-      const takenByOther = s !== null && s.players[side] !== null && !mine;
+      const takenByOther = s !== null && s.players[side] !== null && s.players[side] !== myId;
       const iHoldOther = s !== null && s.players[otherSide(side)] === myId;
       if (takenByOther) {
         actions = `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <span style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">THIS END IS TAKEN — WALK AROUND TO THE OTHER END</span>
           ${resetTable(s)}
         </div>`;
+      } else if (mineElsewhere) {
+        actions = playHere;
       } else if (iHoldOther) {
         actions = `<div style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">YOU HOLD THE OTHER END — WALK BACK AROUND</div>`;
       } else if (!mine) {
@@ -1040,7 +1104,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     } else if (s.status === 'playing') {
       actions = mine
         ? `<div style="display:flex; gap:8px;">${btn('ah-forfeit', isVersus(s) ? 'FORFEIT MATCH' : 'END PRACTICE', false, isVersus(s) ? 'Concede — your opponent takes the win' : 'Stop practising and open the table')}</div>`
-        : `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        : mineElsewhere ? playHere : `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           <span style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">MATCH IN PROGRESS — SPECTATING</span>
           ${resetTable(s)}
         </div>`;
@@ -1080,6 +1144,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       case 'ah-practice': doPractice(); break;
       case 'ah-forfeit': doForfeit(); break;
       case 'ah-reset': doReset(); break;
+      case 'ah-here': doPlayHere(); break;
       case 'ah-leave': leaveSide(); render(); break;
     }
   };
@@ -1088,7 +1153,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
    *  this. */
   const leaveSide = (): void => {
     const s = state();
-    if (!s || s.status !== 'waiting' || s.players[side] !== myId) return;
+    if (!plays(s) || s.status !== 'waiting') return;
     const ns = releaseSide(s, side, myId);
     if (ns) writeGame(deps.itemId, ns);
   };
@@ -1199,9 +1264,11 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       //  versus   → KEEP the claim: my ticks stop, the opponent's forfeit
       //             clock takes the match from here (#115 walkover);
       //  ended    → leave the result standing for NEW MATCH.
+      // Only the page that plays the end walks away with it: stepping back
+      // from a page that doesn't leaves the end to the page that does.
       const s = state();
       const session = st();
-      if (s && s.players[side] === myId) {
+      if (plays(s)) {
         if (s.status === 'waiting') {
           leaveSide();
         } else if (s.status === 'playing' && !isVersus(s)) {
@@ -1212,7 +1279,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
         // One last "lifted" tick so remote mallets rise instead of freezing
         // planted for the 2 s stale window.
         session.engaged.down = false;
-        if (s && s.players[side] === myId && s.status !== 'ended') {
+        if (plays(s) && s.status !== 'ended') {
           sendMalletTick(session, session.engaged);
         }
         session.engaged = null;

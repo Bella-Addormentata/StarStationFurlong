@@ -95,6 +95,13 @@ export interface AirHockeyState {
   kind: 'airhockey';
   /** Side claims — S2 player ids, claimed on walk-up. */
   players: { a: string | null; b: string | null };
+  /** The page that plays each claimed end. A player id is shared by every tab
+   *  and device of that player, so it can't say which one plays: each page
+   *  mints its own seat, and only the page holding an end's seat drives its
+   *  mallet, runs the puck and writes outcomes. Absent from records written
+   *  before seats existed; then no page plays the end until its player takes
+   *  the seat (takeSeat). */
+  seats?: { a: string | null; b: string | null };
   /** Ready flags — both true flips status to 'playing'. */
   ready: { a: boolean; b: boolean };
   score: { a: number; b: number };
@@ -112,6 +119,7 @@ export function initialAirHockeyState(): AirHockeyState {
   return {
     kind: 'airhockey',
     players: { a: null, b: null },
+    seats: { a: null, b: null },
     ready: { a: false, b: false },
     score: { a: 0, b: 0 },
     status: 'waiting',
@@ -144,6 +152,7 @@ export function isAirHockeyState(value: unknown): value is AirHockeyState {
     Number.isSafeInteger(v) && (v as number) >= 0;
   return s.kind === 'airhockey'
     && sideRecord(s.players, playerOk)
+    && (s.seats === undefined || sideRecord(s.seats, playerOk))
     && sideRecord(s.ready, boolOk)
     && sideRecord(s.score, countOk)
     && (s.status === 'waiting' || s.status === 'playing' || s.status === 'ended')
@@ -155,17 +164,42 @@ export function isAirHockeyState(value: unknown): value is AirHockeyState {
 
 // ── Doc-state transitions (pure — callers wrap in read → here → write) ───────
 
-/** Claim an open side pre-game. Returns the new state, or null (no-op). */
+/** The seat that plays `side`, or null (none, or a record from before seats). */
+export function seatOf(s: AirHockeyState, side: AirHockeySide): string | null {
+  return s.seats?.[side] ?? null;
+}
+
+function withSeat(s: AirHockeyState, side: AirHockeySide, seat: string | null): AirHockeyState {
+  return { ...s, seats: { a: seatOf(s, 'a'), b: seatOf(s, 'b'), [side]: seat } };
+}
+
+/** Claim an open side pre-game, played from `seat` (the claiming page).
+ *  Returns the new state, or null (no-op). */
 export function claimSide(
   s: AirHockeyState,
   side: AirHockeySide,
   playerId: string,
+  seat: string,
 ): AirHockeyState | null {
   if (s.status !== 'waiting') return null;
   if (s.players[side] !== null && s.players[side] !== playerId) return null;
   if (s.players[otherSide(side)] === playerId) return null; // one side each
   if (s.players[side] === playerId) return null;            // already mine
-  return { ...s, players: { ...s.players, [side]: playerId } };
+  return withSeat({ ...s, players: { ...s.players, [side]: playerId } }, side, seat);
+}
+
+/** Play a side its player already holds from `seat` instead: the page that
+ *  held the seat (another tab or device of that player, or this tab before a
+ *  reload) stops playing it. Mid-match too; not once the match has ended. */
+export function takeSeat(
+  s: AirHockeyState,
+  side: AirHockeySide,
+  playerId: string,
+  seat: string,
+): AirHockeyState | null {
+  if (s.status === 'ended' || s.players[side] !== playerId) return null;
+  if (seatOf(s, side) === seat) return null;
+  return withSeat(s, side, seat);
 }
 
 /** Release a side pre-game (walk-away/un-claim); ready resets with it. */
@@ -175,11 +209,11 @@ export function releaseSide(
   playerId: string,
 ): AirHockeyState | null {
   if (s.status !== 'waiting' || s.players[side] !== playerId) return null;
-  return {
+  return withSeat({
     ...s,
     players: { ...s.players, [side]: null },
     ready: { ...s.ready, [side]: false },
-  };
+  }, side, null);
 }
 
 /** Mark a claimed side ready. */
@@ -319,9 +353,11 @@ export function servePosition(s: AirHockeyState): { x: number; z: number } {
   return { x: 0, z: s.servingSide === 'a' ? -AH_HALF_L / 2 : AH_HALF_L / 2 };
 }
 
-/** True when the puck centre is inside a goal-mouth band (no end rail there). */
+/** True when the whole puck fits the goal mouth: the end rails begin at
+ *  ±AH_GOAL_HALF_W, so its centre must be a puck radius inside that, or it
+ *  would pass through (and score through) a rail it visibly overlaps. */
 function inGoalMouth(x: number): boolean {
-  return Math.abs(x) < AH_GOAL_HALF_W;
+  return Math.abs(x) < AH_GOAL_HALF_W - AH_PUCK_R;
 }
 
 /**
