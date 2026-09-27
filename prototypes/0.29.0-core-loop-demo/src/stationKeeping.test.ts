@@ -1198,6 +1198,59 @@ describe('the fuel record: one reading per meter', () => {
     expect(readFuelLevel()).toBe(22);
   });
 
+  it('reads a peer\'s long meters and settlements once per record, and only their first 16 keys', () => {
+    // Copilot's review of #173: every gauge or ceiling read walked the whole
+    // peer-written object.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    let gets = 0;
+    const counted = <T extends object>(o: T): T => new Proxy(o, {
+      get: (t, k, r) => {
+        gets += 1;
+        return Reflect.get(t, k, r);
+      },
+    });
+    const long = (value: unknown) => Object.fromEntries(Array.from({ length: 5_000 }, (_, i) => [`peer${i}`, value]));
+    doc.getMap('ship').set('fuel', { level: 40, meters: counted({ ...long(1), [SK]: 9 }), settled: counted(long('x')) });
+    for (let i = 0; i < 3; i++) {
+      expect(readFuelLevel()).toBe(40);
+      expect(fuelCeiling(SK)).toBe(40);
+      expect(readFuelSettlement('peer0')).toBe('x');
+      // Past the first 16 keys, nothing is read: not even this meter's own.
+      expect(readFuelSettlement('peer16')).toBeUndefined();
+    }
+    expect(gets).toBeLessThanOrEqual(2 * 16);
+  });
+
+  it('tells ship subscribers when a meter is installed, replaced or removed', () => {
+    // Copilot's review of #173: a gauge kept showing the fuel a removed
+    // meter had drawn until something else changed.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    let heard = 0;
+    const unsubscribe = subscribeShip(() => {
+      heard += 1;
+    });
+    const meter = (reading: number) => ({ read: () => reading, subscribe: () => () => {} });
+    try {
+      setFuelDrawMeter('test-other', meter(4));
+      expect(heard).toBeGreaterThan(0);
+      expect(readFuelLevel()).toBe(46);
+      heard = 0;
+      setFuelDrawMeter('test-other', meter(6));
+      expect(heard).toBeGreaterThan(0);
+      expect(readFuelLevel()).toBe(44);
+      heard = 0;
+      setFuelDrawMeter('test-other', null);
+      expect(heard).toBeGreaterThan(0);
+      expect(readFuelLevel()).toBe(50);
+    } finally {
+      unsubscribe();
+      setFuelDrawMeter('test-other', null);
+    }
+  });
+
   it('refuses a meter name the record could not keep', () => {
     expect(() => setFuelDrawMeter('not a name', null)).toThrow();
     expect(() => setFuelDrawMeter('__proto__', null)).toThrow();
