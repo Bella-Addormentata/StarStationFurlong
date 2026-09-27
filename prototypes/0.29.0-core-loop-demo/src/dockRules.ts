@@ -345,7 +345,7 @@ export type FarDock =
   | { action: 'write'; record: DoorPairing }
   | {
       action: 'refuse';
-      reason: 'gone' | 'occupied' | 'closed' | 'superseded';
+      reason: 'gone' | 'occupied' | 'closed' | 'superseded' | 'not-allowed';
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
     };
@@ -356,7 +356,24 @@ export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['re
   occupied: 'That berth is occupied by another module now.',
   closed: 'That berth was closed — its dock port was removed.',
   superseded: 'A newer DOCK of this port already holds that berth.',
+  'not-allowed': 'That gate is not open to this ship — the station has closed or reserved it.',
 };
+
+/** ⚓🚦 Who the far gate admits (doorPolicy gateAccessIn): absent = open. */
+export interface FarGateAccess {
+  access: 'open' | 'pass' | 'reserved' | 'closed';
+  reservedFor?: string;
+  /** The docking captain holds the owner's grant at that door. */
+  granted?: boolean;
+}
+
+/** Does the gate admit the ship whose room is `shipRoomId`? */
+export function gateAdmits(gate: FarGateAccess | undefined, shipRoomId: string, granted = gate?.granted === true): boolean {
+  if (!gate || gate.access === 'open') return true;
+  if (gate.access === 'closed') return false;
+  if (gate.access === 'reserved') return !!gate.reservedFor && gate.reservedFor === shipRoomId;
+  return granted;
+}
 
 /**
  * DOCK's far end: the berth must still exist and be free.
@@ -385,8 +402,13 @@ export function farDockPatch(
   near: NearEnd,
   dockedAt: number,
   replacesUndockedAt?: number,
+  gate?: FarGateAccess,
 ): FarDock {
   if (!far.exists) return { action: 'refuse', reason: 'gone' };
+  // ⚓🚦 The station decides who docks here. A dock this ship already holds
+  // stands (re-affirming it is not a new arrival).
+  const heldByUs = !!farRecord?.paired && roomIdFromSeed(farRecord.connectedRoomAddress) === near.roomId;
+  if (!heldByUs && !gateAdmits(gate, near.roomId)) return { action: 'refuse', reason: 'not-allowed' };
   if (farRecord?.paired) {
     if (
       roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId ||

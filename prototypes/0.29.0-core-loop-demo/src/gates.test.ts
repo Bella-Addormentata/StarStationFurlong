@@ -10,7 +10,9 @@ import {
   bindDoorPolicy,
   dockGatesIn,
   fitDockPortIn,
+  gateAccessIn,
   nextFreeGate,
+  readGateAccess,
   readDockGates,
   readDoorPolicy,
   writeDoorPolicy,
@@ -26,6 +28,8 @@ import { listStations, registerStation } from './stations';
 import { foldOwnStation, mergeStation, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
+import { farDockPatch } from './dockRules';
+import { arrivalBerths } from './shipArrival';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -212,5 +216,81 @@ describe('ship destinations', () => {
     ]);
     // The public berth names its gate.
     expect(dest.berth).toEqual({ address: seed('room-b'), farDoor: 'south', gate: 2, occupied: true });
+  });
+});
+
+describe('who may dock at a gate', () => {
+  const near = { roomId: 'ship-1', address: seed('ship-1'), doorId: 'north' };
+
+  it('is stored on the port, cleaned, and cleared with it', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    writeDoorPolicy('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1, gateAccess: 'reserved', reservedFor: 'ship-1' });
+    writeDoorPolicy('east', { passage: 'public', construction: 'owner', adapter: true, gate: 2, gateAccess: 'closed' });
+    doc.getMap('doorPolicy').set('west', { adapter: true, gate: 3, gateAccess: 'reserved' }); // no ship named
+    doc.getMap('doorPolicy').set('south', { adapter: true, gate: 4, gateAccess: 'vip' });
+    expect(readGateAccess()).toEqual({
+      north: { access: 'reserved', reservedFor: 'ship-1' },
+      east: { access: 'closed' },
+    });
+    writeDoorPolicy('east', { ...readDoorPolicy('east'), adapter: false });
+    expect(readDoorPolicy('east').gateAccess).toBeUndefined();
+  });
+
+  it('is enforced at the far end of a DOCK', () => {
+    const berth = { exists: true, portFlag: true };
+    const dock = (gate: Parameters<typeof farDockPatch>[5]) => farDockPatch(undefined, berth, near, 5000, undefined, gate);
+    expect(dock(undefined).action).toBe('write');
+    expect(dock({ access: 'open' }).action).toBe('write');
+    expect(dock({ access: 'closed' })).toEqual({ action: 'refuse', reason: 'not-allowed' });
+    expect(dock({ access: 'reserved', reservedFor: 'ship-2' })).toEqual({ action: 'refuse', reason: 'not-allowed' });
+    expect(dock({ access: 'reserved', reservedFor: 'ship-1' }).action).toBe('write');
+    expect(dock({ access: 'pass', granted: false })).toEqual({ action: 'refuse', reason: 'not-allowed' });
+    expect(dock({ access: 'pass', granted: true }).action).toBe('write');
+  });
+
+  it('reads the owner\'s grant at the door for a gate open to granted captains', () => {
+    const far = new Y.Doc();
+    far.getMap('doorPolicy').set('south', { adapter: true, gate: 2, gateAccess: 'pass' });
+    far.getMap('doorGrants').set('south|pub-a', { doorId: 'south', pub: 'pub-a', name: 'A', grantedAt: 1 });
+    expect(gateAccessIn(far, 'south', 'pub-a')).toEqual({ access: 'pass', granted: true });
+    expect(gateAccessIn(far, 'south', 'pub-b')).toEqual({ access: 'pass', granted: false });
+    expect(gateAccessIn(far, 'north')).toEqual({ access: 'open', granted: false });
+  });
+
+  it('travels with the gates to the station record', () => {
+    harvestIntoAtlas({
+      roomId: 'room-a', name: 'HUB', doors: [],
+      gates: { north: 1, east: 2 },
+      gateAccess: { east: { access: 'reserved', reservedFor: 'ship-9' } },
+    });
+    expect(stationGates(readAtlas(), 'room-a')).toEqual([
+      { roomId: 'room-a', doorId: 'north', gate: 1, occupied: false },
+      { roomId: 'room-a', doorId: 'east', gate: 2, occupied: false, access: 'reserved', reservedFor: 'ship-9' },
+    ]);
+    registerStation({ id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-a' });
+    const hub = listStations().find((st) => st.id === 'hub')!;
+    expect(hub.berths?.[1]).toEqual({ roomId: 'room-a', doorId: 'east', gate: 2, access: 'reserved', reservedFor: 'ship-9' });
+    // The summary keeps it (cleanBerths).
+    expect(summaryForStation(hub, null, 1).berths?.[1]).toMatchObject({ access: 'reserved', reservedFor: 'ship-9' });
+  });
+
+  it('decides which gates an arriving ship asks, and in what order', () => {
+    const g = (n: number, extra: object = {}) => ({ address: seed('room-a'), farDoor: `d:0000000${n}`, gate: n, ...extra });
+    const order = (shipRoomId: string) => arrivalBerths({
+      station: { berths: [
+        g(1, { access: 'closed' }),
+        g(2, { access: 'pass' }),
+        g(3),
+        g(4, { access: 'reserved', reservedFor: 'ship-1' }),
+        g(5, { access: 'reserved', reservedFor: 'ship-2' }),
+      ] },
+      remembered: null,
+      shipRoomId,
+    }).map((b) => b.gate);
+    // Its own reserved gate first, then open ones, then granted-captain gates;
+    // never a closed gate or another ship's.
+    expect(order('ship-1')).toEqual([4, 3, 2]);
+    expect(order('ship-3')).toEqual([3, 2]);
   });
 });

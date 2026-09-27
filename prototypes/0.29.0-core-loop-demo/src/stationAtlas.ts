@@ -86,6 +86,9 @@ export interface AtlasEntry {
    *  not admission: public like the rest (credential rule above). Absent when
    *  unknown (an older client's gossip, or a room never harvested). */
   gates?: Record<string, number>;
+  /** ⚓🚦 Who may dock at each gate, by door id — only gates not open to all
+   *  (closed, pass holders, or reserved for one ship's room). */
+  gateAccess?: Record<string, AtlasGateAccess>;
   /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
    *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
    *  ranking that decides what the player KEEPS or SEES must not read it:
@@ -260,6 +263,8 @@ export function harvestIntoAtlas(entry: {
   }>;
   /** ⚓🚦 The room's dock ports by door id → gate number (doorPolicy). */
   gates?: Record<string, number>;
+  /** ⚓🚦 Non-open gate access by door id (doorPolicy readGateAccess). */
+  gateAccess?: Record<string, AtlasGateAccess>;
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
@@ -289,6 +294,9 @@ export function harvestIntoAtlas(entry: {
     dims: entry.dims ?? prior?.dims,
     doors,
     ...(entry.gates ? { gates: cleanGates(entry.gates) } : prior?.gates ? { gates: prior.gates } : {}),
+    ...(entry.gates
+      ? (entry.gateAccess ? { gateAccess: cleanGateAccess(entry.gateAccess) } : {})
+      : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
     lastSeen: Date.now(),
     // We are standing in it — the strongest possible local recency signal.
     localSeenAt: Date.now(),
@@ -452,6 +460,33 @@ function cleanGates(v: Record<string, unknown>): Record<string, number> {
   return out;
 }
 
+/** ⚓🚦 A gate's access as the atlas carries it (doorPolicy GateAccess,
+ *  minus 'open', which is the absence of a record). */
+export interface AtlasGateAccess {
+  access: 'pass' | 'reserved' | 'closed';
+  /** With 'reserved': the one ship's room id. */
+  reservedFor?: string;
+}
+
+/** Door id → access pairs a peer may send, cleaned and capped. */
+function cleanGateAccess(v: Record<string, unknown>): Record<string, AtlasGateAccess> {
+  const out: Record<string, AtlasGateAccess> = {};
+  let kept = 0;
+  for (const [doorId, raw] of Object.entries(v)) {
+    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
+    if (typeof raw !== 'object' || raw === null) continue;
+    const r = raw as { access?: unknown; reservedFor?: unknown };
+    if (r.access === 'pass' || r.access === 'closed') out[doorId] = { access: r.access };
+    else if (r.access === 'reserved' && typeof r.reservedFor === 'string'
+      && r.reservedFor.length > 0 && r.reservedFor.length <= 128) {
+      out[doorId] = { access: 'reserved', reservedFor: r.reservedFor };
+    } else continue;
+    kept++;
+  }
+  return out;
+}
+
 /** One gate of a station: a dock port, its room and its number. */
 export interface StationGate {
   roomId: string;
@@ -459,6 +494,9 @@ export interface StationGate {
   gate: number;
   /** The atlas shows a pairing on this port's door (a ship is docked). */
   occupied: boolean;
+  /** Who may dock there, when not every ship may. */
+  access?: AtlasGateAccess['access'];
+  reservedFor?: string;
 }
 
 /**
@@ -473,7 +511,11 @@ export function stationGates(atlas: Record<string, AtlasEntry>, roomId: string):
     const entry = atlas[rid];
     if (!entry?.gates) continue;
     for (const [doorId, gate] of Object.entries(entry.gates)) {
-      out.push({ roomId: rid, doorId, gate, occupied: !!entry.doors[doorId]?.targetRoomId });
+      const a = entry.gateAccess?.[doorId];
+      out.push({
+        roomId: rid, doorId, gate, occupied: !!entry.doors[doorId]?.targetRoomId,
+        ...(a ? { access: a.access, ...(a.reservedFor ? { reservedFor: a.reservedFor } : {}) } : {}),
+      });
     }
   }
   return out.sort((a, b) => a.gate - b.gate
@@ -867,6 +909,9 @@ interface SharedAtlasEntry {
   dims?: { cols: number; rows: number };
   /** ⚓🚦 Dock ports → gate numbers (AtlasEntry.gates). Public layout. */
   gates?: Record<string, number>;
+  /** ⚓🚦 Non-open gate access (AtlasEntry.gateAccess). Public: a captain
+   *  must know which gates admit them. */
+  gateAccess?: Record<string, AtlasGateAccess>;
   /** The dial-in credential. Rides only while a door that ACTUALLY EXISTS is
    *  set to public passage — this is the access restriction, and it is
    *  deliberately NOT the same question as "may you see this module". */
@@ -1058,6 +1103,13 @@ function pullSharedAtlas(): void {
       ...(value.gates !== undefined && isPlainGates(value.gates)
         ? { gates: cleanGates(value.gates) }
         : prior?.gates ? { gates: prior.gates } : {}),
+      // Access rides with the gates it belongs to: a publisher that sent
+      // gates sent every non-open access, so absent here means all open.
+      ...(value.gates !== undefined && isPlainGates(value.gates)
+        ? (value.gateAccess !== undefined && isPlainGates(value.gateAccess)
+          ? { gateAccess: cleanGateAccess(value.gateAccess) }
+          : {})
+        : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
       // Gossip is SECOND-hand and must never mint local recency: stamping it
       // here would let one peer's station sweep outrank every room the player
@@ -1128,6 +1180,9 @@ export function pushAtlasToDoc(): void {
         // ⚓🚦 Gates travel with the layout, so a board or an arriving ship in
         // any room of the station knows every gate.
         ...(entry.gates ? { gates: entry.gates } : {}),
+        ...(entry.gates && entry.gateAccess && Object.keys(entry.gateAccess).length > 0
+          ? { gateAccess: entry.gateAccess }
+          : {}),
         // 🧭 F5 (redo review): MONOTONIC, not just lastSeen. A corrective
         // re-push with the same second's stamp would lose the LWW tie against
         // the poisoned entry it is correcting (pull skips on >=); bumping past

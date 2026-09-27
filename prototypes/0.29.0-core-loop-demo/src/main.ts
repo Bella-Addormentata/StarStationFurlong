@@ -199,6 +199,7 @@ import {
   bindDoorPolicy,
   subscribeDoorPolicy,
   readDockGates,
+  readGateAccess,
   readDoorPolicy,
   writeDoorPolicy,
 } from "./doorPolicy";
@@ -3580,7 +3581,9 @@ function harvestStationAtlas(): void {
       }];
     });
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
-  harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors, gates: readDockGates() });
+  harvestIntoAtlas({
+    roomId, name, seed, dims: readRoomDims(), doors, gates: readDockGates(), gateAccess: readGateAccess(),
+  });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
   pushAtlasToDoc();

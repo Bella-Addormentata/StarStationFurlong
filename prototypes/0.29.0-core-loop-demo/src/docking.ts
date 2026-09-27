@@ -95,6 +95,7 @@ import {
   hasDoorRequest,
   readDockGates,
   MAX_GATE,
+  type GateAccess,
   type ConstructionMode,
   type DoorPolicyRecord,
 } from "./doorPolicy";
@@ -211,6 +212,9 @@ export type FarDockRequest =
       nearWall?: DoorWall;
       nearLateral?: number;
       dockedAt: number;
+      /** ⚓🚦 The docking captain's identity key, for a gate open to the
+       *  owner's granted captains (doorPolicy gateAccess 'pass'). */
+      requesterPub?: string;
     };
 
 export type FarDockResult =
@@ -224,6 +228,8 @@ export type FarDockResult =
         | "occupied"
         | "closed"
         | "gone"
+        /** ⚓🚦 The gate is closed or reserved to this ship (doorPolicy). */
+        | "not-allowed"
         /** The berth holds a dock of this very port with another stamp — a
          *  claim made at the same moment that the CRDT kept, or one made
          *  from the far side: it stands, this one yields (and may join it). */
@@ -2004,6 +2010,24 @@ export class DoorDockingPortSystem {
           ? freeGateNumber(readAtlas(), this.roomNow(), readDockGates()) ?? 1
           : Math.min(MAX_GATE, Math.max(1, policy.gate + step));
         writeDoorPolicy(doorId, { ...policy, gate });
+      } else if (el.dataset.dockAction === "gate-access") {
+        // ⚓🚦 The owner decides who may dock here: OPEN → PASS (captains
+        // granted at this door) → RESERVED (the ship docked here now, when
+        // there is one) → CLOSED → OPEN.
+        if (!this.canConstruct(doorId)) return;
+        const policy = readDoorPolicy(doorId);
+        if (!policy.adapter) return;
+        const port = classifyDockPort(readDoor(doorId));
+        const dockedShip = port.kind === "docked" ? port.roomId : "";
+        const order: GateAccess[] = ["open", "pass", "reserved", "closed"];
+        let next = order[(order.indexOf(policy.gateAccess ?? "open") + 1) % order.length];
+        if (next === "reserved" && !dockedShip) next = "closed";
+        const { gateAccess: _a, reservedFor: _r, ...rest } = policy;
+        writeDoorPolicy(doorId, {
+          ...rest,
+          ...(next === "open" ? {} : { gateAccess: next }),
+          ...(next === "reserved" ? { reservedFor: dockedShip } : {}),
+        });
       }
     });
 
@@ -2898,6 +2922,7 @@ export class DoorDockingPortSystem {
           nearWall: near.wall,
           nearLateral: near.lateral,
           dockedAt,
+          requesterPub: getIdentityPub() ?? undefined,
         });
       } catch (err) {
         console.warn("[dock] far dock threw:", err);
@@ -2931,10 +2956,11 @@ export class DoorDockingPortSystem {
         );
         return false;
       }
-      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone")) {
+      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone" || far.reason === "not-allowed")) {
         // A closed or vanished berth is not coming back: drop the memory so
-        // this port stops offering it. An occupied one may free up.
-        if (far.reason !== "occupied" && unchanged()) writeDoorTombstone(doorId, port.address);
+        // this port stops offering it. An occupied one may free up, and a gate
+        // not open to us now may open later.
+        if (far.reason !== "occupied" && far.reason !== "not-allowed" && unchanged()) writeDoorTombstone(doorId, port.address);
         this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" }, roomId);
         return false;
       }
@@ -3086,10 +3112,20 @@ export class DoorDockingPortSystem {
       .some((g) => g.gate === gate && !(g.roomId === roomId && g.doorId === doorId));
     const gateBtn = (dir: "down" | "up", label: string) =>
       `<button type="button" data-dock-action="gate-${dir}" title="${dir === "up" ? "Next" : "Previous"} gate number" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${label}</button>`;
+    const policyNow = readDoorPolicy(doorId);
+    const accessLabel =
+      policyNow.gateAccess === "closed" ? "CLOSED"
+        : policyNow.gateAccess === "pass" ? "GRANTED CAPTAINS"
+          : policyNow.gateAccess === "reserved" ? `RESERVED · ${esc(this.partnerLabel(policyNow.reservedFor ?? ""))}`
+            : "OPEN";
+    const accessBtn = may
+      ? `<button type="button" data-dock-action="gate-access" title="Who may dock at this gate: open to all, captains you granted at this door, reserved for the ship docked here now, or closed" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${accessLabel}</button>`
+      : `<span>${accessLabel}</span>`;
     const gateLine = readDoorPolicy(doorId).adapter
-      ? `<div style="display:flex; align-items:center; gap:6px; font-size:9.5px; color:#f2efe6;">
+      ? `<div style="display:flex; align-items:center; gap:6px; font-size:9.5px; color:#f2efe6; flex-wrap:wrap;">
           <span>🚦 GATE <b>${gate ?? "—"}</b></span>
           ${may ? gateBtn("down", "−") + gateBtn("up", "+") : ""}
+          <span style="color:rgba(242,239,230,0.6);">DOCKING:</span> ${accessBtn}
           ${clash ? `<span style="color:#ffb300;">⚠ another port in this station is also gate ${gate}</span>` : ""}
         </div>`
       : "";

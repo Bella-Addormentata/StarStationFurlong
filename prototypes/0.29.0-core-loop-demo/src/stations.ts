@@ -99,6 +99,10 @@ export interface StationBerthRecord {
   /** The atlas shows a ship docked there. Local knowledge: never stored or
    *  shared, only listed. */
   occupied?: boolean;
+  /** Who the station lets dock there, when not every ship (doorPolicy
+   *  gateAccess): pass holders, one reserved ship's room, or none. */
+  access?: 'pass' | 'reserved' | 'closed';
+  reservedFor?: string;
 }
 
 /** Gates a station lists at most. */
@@ -113,6 +117,12 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
   if (typeof b.doorId !== 'string' || !isAcceptableDoorKey(b.doorId)) return null;
   const out: StationBerthRecord = { roomId: b.roomId, doorId: b.doorId };
   if (typeof b.gate === 'number' && Number.isInteger(b.gate) && b.gate >= 1 && b.gate <= 99) out.gate = b.gate;
+  if (b.access === 'pass' || b.access === 'closed') out.access = b.access;
+  else if (b.access === 'reserved' && typeof b.reservedFor === 'string'
+    && b.reservedFor.length > 0 && b.reservedFor.length <= MAX_ID_LENGTH) {
+    out.access = 'reserved';
+    out.reservedFor = b.reservedFor;
+  }
   return out;
 }
 
@@ -406,6 +416,7 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
   if (gates.length > 0) {
     berths = gates.slice(0, MAX_BERTHS).map((g) => ({
       roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
+      ...(g.access ? { access: g.access, ...(g.reservedFor ? { reservedFor: g.reservedFor } : {}) } : {}),
     }));
   } else if (st.berths && st.berths.length > 0) {
     berths = st.berths;
