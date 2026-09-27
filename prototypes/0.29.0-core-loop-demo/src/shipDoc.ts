@@ -77,6 +77,7 @@ import {
   DEFAULT_STATIONS,
   findStation,
   isKnownStation,
+  localStationId,
   listStations,
   type StationDestination,
 } from './stationDirectory';
@@ -242,9 +243,10 @@ export function defaultFlight(): FlightRecord {
  *  in the read-side resolver — a docked record shouldn't carry a departedAt
  *  timestamp, and rendering code shouldn't have to defensively ignore it. */
 function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
-  const out: FlightRecord = { status: r.status, locationId: r.locationId };
+  // Station ids are per install: read another install's ids as ours.
+  const out: FlightRecord = { status: r.status, locationId: localStationId(r.locationId) };
   if (r.status === 'undocking' || r.status === 'in-flight') {
-    if (r.destinationId !== undefined) out.destinationId = r.destinationId;
+    if (r.destinationId !== undefined) out.destinationId = localStationId(r.destinationId);
     if (r.status === 'in-flight') {
       if (r.departedAt !== undefined) out.departedAt = r.departedAt;
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;

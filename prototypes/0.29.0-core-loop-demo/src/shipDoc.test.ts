@@ -18,6 +18,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
 import {
   DESTINATIONS,
   TANK_CAPACITY,
@@ -776,5 +777,19 @@ describe('canDepart — a planned hop', () => {
 
   it('refuses when no transfer exists', () => {
     expect(canDepart({ ...base, hop: null })).toEqual({ ok: false, reason: 'no-transfer' });
+  });
+});
+
+describe('flight records written on another install', () => {
+  it('read their station ids as this install\'s', () => {
+    const aliases: Record<string, string> = { 'station:room-high': 'high-orbit', 'their-l4': 'l4-anchorage' };
+    setStationDirectory({ stations: () => DEFAULT_STATIONS, resolve: (id) => aliases[id] ?? null });
+    try {
+      const doc = freshDoc();
+      hostileSetFlight(doc, { status: 'in-flight', locationId: 'station:room-high', destinationId: 'their-l4', departedAt: 1, etaAt: 2 });
+      expect(readFlightRecord()).toMatchObject({ locationId: 'high-orbit', destinationId: 'l4-anchorage' });
+    } finally {
+      setStationDirectory(null);
+    }
   });
 });

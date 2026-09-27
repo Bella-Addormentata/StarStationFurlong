@@ -64,6 +64,10 @@ export interface StationDirectory {
    *  `nowMs`; null when there is no such hop. Absent ⇒ every hop leaves now
    *  and takes the destination's flat travelMs / fuelCost. */
   plan?(fromId: string, toId: string, nowMs: number): HopPlan | null;
+  /** This install's id for a station id another install wrote (station ids
+   *  are per install, and a flight record travels in the ship's room doc),
+   *  or null when none matches. Absent ⇒ ids are taken as written. */
+  resolve?(id: string): string | null;
 }
 
 /** One planned hop. Times are real epoch ms; `departAt` may be in the future
@@ -101,6 +105,16 @@ export function setStationDirectory(next: StationDirectory | null): void {
 export function listStations(): readonly StationDestination[] {
   const list = directory.stations();
   return list.length > 0 ? list : DEFAULT_STATIONS;
+}
+
+/** This install's id for `id`: itself when listed, else the directory's
+ *  alias for it when that is listed, else `id` unchanged (unknown). */
+export function localStationId(id: string): string {
+  const list = listStations();
+  if (list.some((s) => s.id === id)) return id;
+  let alias: string | null = null;
+  try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }
+  return alias && list.some((s) => s.id === alias) ? alias : id;
 }
 
 /** Look a station up; unknown ids resolve to home (plan §2, item 4). */
@@ -232,11 +246,13 @@ export function directoryFromStationRecords(
   seedFor: (roomId: string) => string | undefined,
   hereId: () => string | null,
   ownId: () => string | null = () => null,
+  resolve?: (id: string) => string | null,
 ): StationDirectory {
   return {
     stations: () => destinationsFromRecords(list(), seedFor),
     here: hereId,
     own: ownId,
+    ...(resolve ? { resolve } : {}),
     plan: (fromId, toId, nowMs) => {
       const records = list();
       return planRecordHop(
