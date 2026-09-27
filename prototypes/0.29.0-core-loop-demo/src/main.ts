@@ -108,6 +108,7 @@ import {
   bindShipDoc,
   flightArrived,
   readFlightRecord,
+  subscribeShip,
   writeFlightRecord,
 } from "./shipDoc";
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
@@ -118,7 +119,22 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
-import { bindStationKeepingDoc } from "./stationKeeping";
+import {
+  bindStationKeepingDoc,
+  isBoltedIntoStation,
+  readOrbitTrim,
+  subscribeStationKeeping,
+} from "./stationKeeping";
+// 🪐 Per-planet summary: every room doc gossips a small record per station
+// (with its trim) and per ship, so all clients around a planet fly the same
+// orbits, and flight records written on another install still resolve here.
+import {
+  bindPlanetSummaryDoc,
+  installTrimResolver,
+  publishPlanetSummary,
+  resolveStationAlias,
+  type ShipStatusInput,
+} from "./planetSummary";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -159,6 +175,7 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
 import {
+  currentStation,
   dockedStationFor,
   listStations,
   registerStation,
@@ -1197,6 +1214,28 @@ function ownStationOf(roomId: string): string | null {
   return listStations().find((st) => st.welcomeRoomId === roomId)?.id ?? null;
 }
 
+/** 🪐 What this client tells the planet about the ship it stands in: null
+ *  when the room is no ready ship, or is a module bolted into a station. */
+function planetShipStatus(): ShipStatusInput | null {
+  const roomId = activeBootstrap?.roomId ?? "";
+  if (!roomId || !isShipReady() || isBoltedIntoStation(readAllDoors().values())) return null;
+  const rec = readFlightRecord();
+  const stations = listStations();
+  const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
+  const from = byId(rec.locationId);
+  const to = byId(rec.destinationId);
+  const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
+  if (!planetId) return null;
+  const name =
+    (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) || "SHIP";
+  const out: ShipStatusInput = { roomId, name: name.slice(0, 64), planetId, status: rec.status };
+  if (from?.welcomeRoomId) out.fromRoom = from.welcomeRoomId;
+  if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
+  if (rec.departedAt !== undefined) out.departedAt = rec.departedAt;
+  if (rec.etaAt !== undefined) out.etaAt = rec.etaAt;
+  return out;
+}
+
 /** 🚀 #30 SH3: does this player command the current room's ship? */
 function isLocalHelmCommander(): boolean {
   const ownerVal =
@@ -1516,6 +1555,12 @@ async function joinRoomAtEpoch(
   bindShipDoc(sync.doc);
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
+  // 🪐 After the ship and trim records: the summary publishes both.
+  bindPlanetSummaryDoc(sync.doc, {
+    currentStation,
+    localTrim: readOrbitTrim,
+    ship: planetShipStatus,
+  });
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1734,8 +1779,14 @@ async function joinRoomAtEpoch(
         localSeedFor,
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
+        (id) => resolveStationAlias(id),
       ),
     );
+    // 🪐 Stations fly their shared trims, and what changes here goes out:
+    // a burn, a flight step, a station the atlas now groups differently.
+    installTrimResolver();
+    subscribeStationKeeping(() => publishPlanetSummary());
+    subscribeShip(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).
@@ -1771,6 +1822,7 @@ async function joinRoomAtEpoch(
     // 🛰️ Shared-atlas arrivals do too — a visitor watches the station fill
     // in live as the doc syncs (usually within the first second of joining).
     subscribeSharedAtlas(() => {
+      publishPlanetSummary();
       refreshExteriorView();
       // 🛑🛰️ #80 S5: … and the station-through-the-window shells fill in with it.
       world?.refreshFpNeighbourShells();
