@@ -24,6 +24,8 @@ import {
   rememberBerthHere,
   completeArrival,
   planArrivalDock,
+  arrivalBerths,
+  type ArrivalOutcome,
   shipLocationId,
   type ArrivalPort,
   type ShipDockingApi,
@@ -439,5 +441,106 @@ describe('berth memory in the ship doc', () => {
     berths.late = { doorId: 'north', roomId: FURLONG_ROOM };
     doc.getMap('ship').set('berths', berths);
     expect(readStationBerth('late')).toBeNull();
+  });
+});
+
+// ── ⚓🚦 Gates ─────────────────────────────────────────────────────────────────
+
+describe('arrival gates', () => {
+  const SEED_GATE_ROOM = 'ssf://room#room=high-gates';
+  const gate = (n: number, door: string, occupied = false) =>
+    ({ address: SEED_GATE_ROOM, farDoor: door, gate: n, ...(occupied ? { occupied: true } : {}) });
+
+  it('orders the asked gate first, then free gates, then taken ones, then the memory', () => {
+    const remembered = { doorId: 'north', address: SEED_FURLONG, farDoor: 'south' };
+    const order = arrivalBerths({
+      station: { berths: [gate(1, 'east', true), gate(2, 'west'), gate(3, 'north')] },
+      remembered,
+      gate: 3,
+    }).map((b) => b.gate ?? b.farDoor);
+    expect(order).toEqual([3, 2, 1, 'south']);
+  });
+
+  it('keeps the old single-berth rules when a station lists no gates', () => {
+    const remembered = { doorId: 'north', address: SEED_HIGH, farDoor: 'east' };
+    expect(arrivalBerths({ station: { berth: { address: SEED_HIGH } }, remembered })).toEqual([remembered]);
+    expect(arrivalBerths({ station: {}, remembered: null })).toEqual([]);
+  });
+
+  describe('docking', () => {
+    beforeEach(() => {
+      const doc = new Y.Doc();
+      bindShipDoc(doc);
+      bindDoorsDoc(doc);
+    });
+    afterEach(() => setStationDirectory(null));
+
+    /** A docking system whose far berths refuse the doors in `taken`. */
+    const gatedDocking = (taken: string[]) => {
+      const base = fakeDocking(['north']);
+      const tried: string[] = [];
+      return {
+        ...base,
+        tried,
+        dock: async (doorId: string) => {
+          const st = classifyDockPort(readDoor(doorId));
+          const far = st.kind === 'undocked' ? st.memory.farDoor ?? '' : '';
+          tried.push(far);
+          if (taken.includes(far)) return false;
+          base.dock(doorId);
+          return true;
+        },
+      };
+    };
+
+    function arriveAtGates(berths: StationDestination['berths']): void {
+      setStationDirectory({ stations: () => [DEFAULT_STATIONS[0], { ...DEFAULT_STATIONS[1], berths }] });
+      writeDoorTombstone('north', SEED_FURLONG, { farDoor: 'south', undockedAt: 2000 });
+      fly('furlong-station', 'high-orbit');
+    }
+
+    const settled = () => {
+      let resolve!: (o: ArrivalOutcome) => void;
+      const promise = new Promise<ArrivalOutcome>((r) => { resolve = r; });
+      return { promise, onSettled: resolve };
+    };
+
+    it('docks at the first gate and says which', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
+      const docking = gatedDocking([]);
+      const s = settled();
+      expect(completeArrival(docking, { onSettled: s.onSettled })).toEqual({ kind: 'docking', stationName: 'High Orbit', gate: 1 });
+      expect(await s.promise).toEqual({ kind: 'docked', stationName: 'High Orbit', gate: 1 });
+      expect(docking.tried).toEqual(['east']);
+    });
+
+    it('moves on to the next gate when one is taken', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west'), gate(3, 'north')]);
+      const docking = gatedDocking(['east', 'west']);
+      const s = settled();
+      completeArrival(docking, { onSettled: s.onSettled });
+      expect(await s.promise).toEqual({ kind: 'docked', stationName: 'High Orbit', gate: 3 });
+      expect(docking.tried).toEqual(['east', 'west', 'north']);
+      const north = classifyDockPort(readDoor('north'));
+      expect(north.kind === 'docked' && north.record.farDoor).toBe('north');
+    });
+
+    it('tries the gate it was asked for first', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
+      const docking = gatedDocking([]);
+      const s = settled();
+      completeArrival(docking, { gate: 2, onSettled: s.onSettled });
+      expect(await s.promise).toMatchObject({ kind: 'docked', gate: 2 });
+    });
+
+    it('says so when every gate refuses, and leaves the ship arrived undocked', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
+      const docking = gatedDocking(['east', 'west']);
+      const s = settled();
+      completeArrival(docking, { onSettled: s.onSettled });
+      expect(await s.promise).toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'berths-taken' });
+      expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'high-orbit' });
+      expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+    });
   });
 });

@@ -30,6 +30,10 @@ export interface StationBerth {
   farDoor?: string;
   farWall?: DoorWall;
   farLateral?: number;
+  /** ⚓🚦 The berth's gate number, when its port has one. */
+  gate?: number;
+  /** The station's atlas shows a ship docked there already. */
+  occupied?: boolean;
 }
 
 /** One station a ship can fly to. */
@@ -43,6 +47,8 @@ export interface StationDestination {
   /** Writer-clock travel time of a hop to this station, ms. */
   travelMs: number;
   berth?: StationBerth;
+  /** ⚓🚦 Every gate an arriving ship may try, in gate order. */
+  berths?: StationBerth[];
   /** A move to another planet, scheduled or under way (stations.ts): while
    *  it is in transit the station is no ship's destination. */
   move?: StationMove;
@@ -171,6 +177,8 @@ export interface StationRecordLike {
   orbitSlot: number;
   welcomeRoomId: string;
   berthDoor?: string;
+  /** ⚓🚦 Every gate of the station, in gate order (stations.ts). */
+  berths?: ReadonlyArray<{ roomId: string; doorId: string; gate?: number; occupied?: boolean }>;
   /** A move to another planet, scheduled or under way (stations.ts). */
   move?: StationMove;
 }
@@ -234,6 +242,26 @@ export function destinationsFromRecords(
     const door = r.berthDoor && isAcceptableDoorKey(r.berthDoor) ? r.berthDoor : undefined;
     const address = r.welcomeRoomId && door ? seedFor(r.welcomeRoomId) : undefined;
     if (address && door) out.berth = { address, farDoor: door };
+    // ⚓🚦 Every gate this client can dock at: a port whose room it holds a
+    // pass for. Gate order, as the station lists them.
+    const gates: StationBerth[] = [];
+    for (const b of r.berths ?? []) {
+      if (!b.roomId || !isAcceptableDoorKey(b.doorId)) continue;
+      const seed = seedFor(b.roomId);
+      if (!seed) continue;
+      gates.push({
+        address: seed,
+        farDoor: b.doorId,
+        ...(b.gate !== undefined ? { gate: b.gate } : {}),
+        ...(b.occupied ? { occupied: true } : {}),
+      });
+    }
+    if (gates.length > 0) {
+      out.berths = gates;
+      // The public berth names its gate when it is one of them.
+      const same = out.berth && gates.find((g) => g.farDoor === out.berth!.farDoor && g.address === out.berth!.address);
+      if (same) out.berth = same;
+    }
     return out;
   });
 }

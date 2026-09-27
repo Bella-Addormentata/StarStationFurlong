@@ -198,6 +198,7 @@ import {
 import {
   bindDoorPolicy,
   subscribeDoorPolicy,
+  readDockGates,
   readDoorPolicy,
   writeDoorPolicy,
 } from "./doorPolicy";
@@ -1711,6 +1712,8 @@ async function joinRoomAtEpoch(
     // draws the port itself; the exterior's atlas links follow the doors doc).
     subscribeDoorPolicy(() => {
       world?.dockingSystem?.refreshPolicyUI();
+      // ⚓🚦 A port fitted, removed or renumbered changes the station's gates.
+      harvestStationAtlas();
       refreshExteriorView();
     });
     // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
@@ -1878,9 +1881,10 @@ async function joinRoomAtEpoch(
           ? {
               ports: () => ds.listDockPorts(),
               undock: (doorId) => void ds.undockPort(doorId),
-              dock: (doorId) => void ds.redockPort(doorId),
+              dock: (doorId) => ds.redockPort(doorId),
             }
           : null,
+        { onSettled: noteShipArrival },
       ),
     );
   }, 1_000);
@@ -3575,7 +3579,8 @@ function harvestStationAtlas(): void {
           : {}),
       }];
     });
-  harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors });
+  // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
+  harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors, gates: readDockGates() });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
   pushAtlasToDoc();

@@ -42,8 +42,8 @@ import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
-import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation } from './stations';
-import type { StationMove, StationRecord } from './stations';
+import { MAX_ORBIT_SLOTS, cleanBerths, listStations, planetById, readStationRecords, registerStation } from './stations';
+import type { StationBerthRecord, StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,12 @@ export interface StationSummary {
   planetId: string;
   orbitSlot: number;
   berthDoor?: string;
+  /** ⚓🚦 The station's gates (StationRecord.berths, without the local
+   *  `occupied` flag), and when a client standing in the station last read
+   *  them from its atlas. Newest `berthsAt` wins, apart from the record: any
+   *  visitor's live atlas knows the gates, not only the record's owner. */
+  berths?: StationBerthRecord[];
+  berthsAt?: number;
   /** Record fields this build does not know (a newer build's additions),
    *  carried as they came so they reach stations.ts on every client. */
   ext?: Record<string, unknown>;
@@ -103,7 +109,7 @@ const MAX_SKEW_MS = 6 * 3600 * 1000;
 /** A ship not heard from in this long has left the picture. */
 export const SHIP_STALE_MS = 24 * 3600 * 1000;
 const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
-const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'derived', 'move']);
+const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
 
 const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LEN;
 const isName = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_NAME_LEN;
@@ -149,6 +155,11 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   };
   if (v.berthDoor !== undefined) out.berthDoor = v.berthDoor as string;
   if (v.ownerId !== undefined) out.ownerId = v.ownerId as string;
+  const berths = cleanBerths(v.berths);
+  if (berths.length > 0 && isStamp(v.berthsAt, now)) {
+    out.berths = berths;
+    out.berthsAt = v.berthsAt;
+  }
   const ext = cleanExt(v.ext);
   if (ext) out.ext = ext;
   const trim = cleanTrim(v.trim);
@@ -237,16 +248,27 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
   return b.departAt > a.departAt ? b : a;
 }
 
+/** The newer of two gate lists, by when each was read. */
+function newerBerths(a: StationSummary, b: StationSummary): Pick<StationSummary, 'berths' | 'berthsAt'> {
+  const pick = !a.berths ? b : !b.berths ? a : (b.berthsAt ?? 0) > (a.berthsAt ?? 0) ? b : a;
+  return pick.berths ? { berths: pick.berths, berthsAt: pick.berthsAt } : {};
+}
+
 /** Merge an incoming station summary into a known one: the newer record,
- *  the newer trim, the later move. Returns null when nothing changes. */
+ *  the newer trim, the later move, the newer gate list. Returns null when
+ *  nothing changes. */
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary): StationSummary | null {
   if (!prior) return incoming;
   const base = incoming.updatedAt > prior.updatedAt ? incoming : prior;
   const trim = newerTrim(prior.trim, incoming.trim);
   const move = newerMove(prior.move, incoming.move);
+  const gates = newerBerths(prior, incoming);
   const next: StationSummary = { ...base };
   if (trim) next.trim = trim; else delete next.trim;
   if (move) next.move = move; else delete next.move;
+  delete next.berths;
+  delete next.berthsAt;
+  Object.assign(next, gates);
   return JSON.stringify(next) === JSON.stringify(prior) ? null : next;
 }
 
@@ -284,6 +306,11 @@ export function summaryForStation(station: StationRecord, trim: OrbitTrim | null
     updatedAt,
   };
   if (station.berthDoor) out.berthDoor = station.berthDoor;
+  const berths = cleanBerths(station.berths);
+  if (berths.length > 0) {
+    out.berths = berths;
+    out.berthsAt = updatedAt;
+  }
   if (isOwned(station) && isId(station.id)) out.ownerId = station.id;
   const ext = cleanExt(station);
   if (ext) out.ext = ext;
@@ -313,8 +340,9 @@ export function foldOwnStation(
   const mine = summaryForStation(station, trim, now);
   const owned = isOwned(station);
   if (!known) return mine;
-  const sameRecord = (a: StationSummary, b: StationSummary): boolean =>
-    JSON.stringify({ ...a, trim: undefined, move: undefined, updatedAt: 0 }) === JSON.stringify({ ...b, trim: undefined, move: undefined, updatedAt: 0 });
+  const recordOnly = (a: StationSummary) =>
+    JSON.stringify({ ...a, trim: undefined, move: undefined, berths: undefined, berthsAt: undefined, updatedAt: 0 });
+  const sameRecord = (a: StationSummary, b: StationSummary): boolean => recordOnly(a) === recordOnly(b);
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
     : known;
@@ -323,8 +351,15 @@ export function foldOwnStation(
   const applies = cleanTrim(trimFor(base, trim));
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);
-  const { trim: _unused, move: _unusedMove, ...rest } = base;
-  return mergeStation(known, { ...rest, ...(applies ? { trim: applies } : {}), ...(move ? { move } : {}) });
+  // Gates: what this client's atlas lists goes out whenever it differs from
+  // what is known, stamped past it — any visitor's live atlas is first-hand.
+  const gates = mine.berths && JSON.stringify(mine.berths) !== JSON.stringify(base.berths)
+    ? { berths: mine.berths, berthsAt: Math.min(Math.max(now, (base.berthsAt ?? 0) + 1), now + MAX_SKEW_MS) }
+    : base.berths ? { berths: base.berths, berthsAt: base.berthsAt } : {};
+  const { trim: _unused, move: _unusedMove, berths: _b, berthsAt: _ba, ...rest } = base;
+  return mergeStation(known, {
+    ...rest, ...(applies ? { trim: applies } : {}), ...(move ? { move } : {}), ...gates,
+  });
 }
 
 // ── Learned stations → station records ───────────────────────────────────────
@@ -342,6 +377,7 @@ export function learnedRecord(s: StationSummary): Omit<StationRecord, 'derived'>
     orbitSlot: s.orbitSlot,
     welcomeRoomId: s.welcomeRoomId,
     ...(s.berthDoor ? { berthDoor: s.berthDoor } : {}),
+    ...(s.berths ? { berths: s.berths } : {}),
   };
 }
 
@@ -371,7 +407,8 @@ export function registerLearnedStations(planetId: string, stations: Iterable<Sta
     const sameExt = Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
     if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
-      && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor) continue;
+      && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor
+      && JSON.stringify(had.berths ?? []) === JSON.stringify(rec.berths ?? [])) continue;
     if (registerStation(rec)) changed++;
   }
   return changed;

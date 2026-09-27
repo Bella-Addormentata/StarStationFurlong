@@ -32,7 +32,8 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
-import { dockPortFlagIn, fitDockPortIn } from './doorPolicy';
+import { dockGatesIn, dockPortFlagIn, fitDockPortIn } from './doorPolicy';
+import { freeGateNumber, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
   farDockPatch, farUndockPatch, findFarDoor, holdsDockTo, type NearEnd,
@@ -84,9 +85,15 @@ export function applyFarDockRequest(
   // peer ever sees a dock on a door without its half.
   doc.transact(() => {
     writeDoorRecordTo(doc, req.farDoor, patch.record);
-    fitDockPortIn(doc, req.farDoor);
+    // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate.
+    fitDockPortIn(doc, req.farDoor, freeGateNumber(readAtlas(), farRoomOf(req.farAddress), dockGatesIn(doc)));
   });
   return { result: { ok: true, detail: 'written' }, wrote: true };
+}
+
+/** The far room's id from its address ('' when it names none). */
+function farRoomOf(address: string): string {
+  try { return roomIdFromSeed(address); } catch { return ''; }
 }
 
 /** What farDockPatch needs to know about the far door besides its record. */

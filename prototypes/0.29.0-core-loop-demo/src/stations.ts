@@ -26,7 +26,7 @@
  * planet) is the natural next step once ship travel needs it.
  */
 
-import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed } from './stationAtlas';
+import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
 import { isAcceptableDoorKey } from './doorsDoc';
@@ -74,12 +74,63 @@ export interface StationRecord {
   /** Optional door id of the berth port in the welcome room — a door key
    *  doorsDoc accepts (a record naming any other could never be docked at). */
   berthDoor?: string;
+  /** ⚓🚦 Every gate an arriving ship may dock at, in gate order. listStations
+   *  fills it from the station atlas (every dock port of the station, with its
+   *  gate number); a record keeps a list it learned (a station whose rooms
+   *  this install has not mapped), and a plain `berthDoor` reads as one
+   *  berth. `berthDoor` stays for older builds: listStations sets it to the
+   *  lowest gate in the welcome room when the record names none. */
+  berths?: StationBerthRecord[];
   /** Set on stations derived from an atlas component with no record. */
   derived?: true;
   /** A move to another planet that is scheduled or under way (stationMove.ts).
    *  listStations fills it from the move resolver; once the move arrives the
    *  station is listed at its new planet and slot, and this is gone. */
   move?: StationMove;
+}
+
+/** ⚓🚦 One gate of a station: a dock port an arriving ship may berth at. */
+export interface StationBerthRecord {
+  roomId: string;
+  doorId: string;
+  /** The port's gate number (doorPolicy); absent for a berth that has none
+   *  (a record's plain berthDoor, a port fitted before gates existed). */
+  gate?: number;
+  /** The atlas shows a ship docked there. Local knowledge: never stored or
+   *  shared, only listed. */
+  occupied?: boolean;
+}
+
+/** Gates a station lists at most. */
+export const MAX_BERTHS = 16;
+
+/** One berth, shape-checked (peer-written when it came through a summary),
+ *  without the local `occupied` flag. Null when it is not one. */
+export function cleanBerth(v: unknown): StationBerthRecord | null {
+  if (typeof v !== 'object' || v === null) return null;
+  const b = v as Record<string, unknown>;
+  if (typeof b.roomId !== 'string' || !b.roomId || b.roomId.length > MAX_ID_LENGTH) return null;
+  if (typeof b.doorId !== 'string' || !isAcceptableDoorKey(b.doorId)) return null;
+  const out: StationBerthRecord = { roomId: b.roomId, doorId: b.doorId };
+  if (typeof b.gate === 'number' && Number.isInteger(b.gate) && b.gate >= 1 && b.gate <= 99) out.gate = b.gate;
+  return out;
+}
+
+/** A list of berths, cleaned, deduplicated by port and capped. */
+export function cleanBerths(v: unknown): StationBerthRecord[] {
+  if (!Array.isArray(v)) return [];
+  const out: StationBerthRecord[] = [];
+  const seen = new Set<string>();
+  for (const item of v.slice(0, MAX_BERTHS * 4)) {
+    if (out.length >= MAX_BERTHS) break;
+    const b = cleanBerth(item);
+    if (!b) continue;
+    const key = `${b.roomId}\u0000${b.doorId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(b);
+  }
+  return out;
 }
 
 /**
@@ -223,6 +274,7 @@ function clean(r: StationRecord): StationRecord {
     orbitSlot: r.orbitSlot,
     welcomeRoomId: r.welcomeRoomId,
     ...(r.berthDoor ? { berthDoor: r.berthDoor } : {}),
+    ...(cleanBerths(r.berths).length > 0 ? { berths: cleanBerths(r.berths) } : {}),
   };
 }
 
@@ -335,6 +387,35 @@ export function listStations(
       derived: true,
       ...(at.move ? { move: at.move } : {}),
     });
+  }
+  return out.map((st) => withBerths(st, atlas));
+}
+
+/**
+ * ⚓🚦 A listed station with its gates: the atlas's (every dock port of the
+ * station, free or docked) when it knows any, else the list the record
+ * carries, else its plain berthDoor. A record naming no berthDoor gets the
+ * lowest gate in its welcome room as one, for builds that read only that.
+ */
+function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): StationRecord {
+  const gates = stationGates(atlas, st.welcomeRoomId);
+  let berths: StationBerthRecord[];
+  if (gates.length > 0) {
+    berths = gates.slice(0, MAX_BERTHS).map((g) => ({
+      roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
+    }));
+  } else if (st.berths && st.berths.length > 0) {
+    berths = st.berths;
+  } else if (st.berthDoor && st.welcomeRoomId) {
+    berths = [{ roomId: st.welcomeRoomId, doorId: st.berthDoor }];
+  } else {
+    berths = [];
+  }
+  const out: StationRecord = { ...st };
+  if (berths.length > 0) out.berths = berths; else delete out.berths;
+  if (!out.berthDoor) {
+    const inWelcome = berths.find((b) => b.roomId === st.welcomeRoomId);
+    if (inWelcome) out.berthDoor = inWelcome.doorId;
   }
   return out;
 }

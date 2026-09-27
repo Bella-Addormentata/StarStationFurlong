@@ -81,6 +81,11 @@ export interface AtlasEntry {
   dims?: { cols: number; rows: number };
   /** Keyed by DOOR ID — cardinal or free `d:`. */
   doors: Record<string, AtlasDoor>;
+  /** ⚓🚦 The room's DOCK PORTS with their gate numbers, by door id — free
+   *  or docked (a free port has no door record, so `doors` cannot say). Layout,
+   *  not admission: public like the rest (credential rule above). Absent when
+   *  unknown (an older client's gossip, or a room never harvested). */
+  gates?: Record<string, number>;
   /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
    *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
    *  ranking that decides what the player KEEPS or SEES must not read it:
@@ -253,6 +258,8 @@ export function harvestIntoAtlas(entry: {
     farDoor?: string; farWall?: DoorWall; farLateral?: number; farYawDeg?: 0 | 45;
     wall?: DoorWall; lateral?: number; transient?: boolean;
   }>;
+  /** ⚓🚦 The room's dock ports by door id → gate number (doorPolicy). */
+  gates?: Record<string, number>;
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
@@ -281,6 +288,7 @@ export function harvestIntoAtlas(entry: {
     seed: entry.seed ?? prior?.seed,
     dims: entry.dims ?? prior?.dims,
     doors,
+    ...(entry.gates ? { gates: cleanGates(entry.gates) } : prior?.gates ? { gates: prior.gates } : {}),
     lastSeen: Date.now(),
     // We are standing in it — the strongest possible local recency signal.
     localSeenAt: Date.now(),
@@ -415,6 +423,79 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
   }
   if (written) writeAtlas(atlas);
   return written;
+}
+
+// ── ⚓🚦 Gates ─────────────────────────────────────────────────────────────────
+
+/** The same ceiling doorPolicy.MAX_GATE holds (not imported: doorPolicy
+ *  reads the layout doc, and this module stays free of doc bindings). */
+const MAX_GATE_NUMBER = 99;
+/** Door ids are short keys (doorsDoc.isAcceptableDoorKey allows 64). */
+const MAX_GATE_DOOR_ID = 64;
+
+function isPlainGates(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v)
+    && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
+}
+
+/** Only door id → integer gate pairs, at most MAX_DOORS_PER_ENTRY of them. */
+function cleanGates(v: Record<string, unknown>): Record<string, number> {
+  const out: Record<string, number> = {};
+  let kept = 0;
+  for (const [doorId, gate] of Object.entries(v)) {
+    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
+    if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
+    out[doorId] = gate;
+    kept++;
+  }
+  return out;
+}
+
+/** One gate of a station: a dock port, its room and its number. */
+export interface StationGate {
+  roomId: string;
+  doorId: string;
+  gate: number;
+  /** The atlas shows a pairing on this port's door (a ship is docked). */
+  occupied: boolean;
+}
+
+/**
+ * Every gate of the station `roomId` belongs to (its atlas component), in
+ * gate order (ties by room, then door — a duplicate number is flagged at the
+ * door panel, not fixed here).
+ */
+export function stationGates(atlas: Record<string, AtlasEntry>, roomId: string): StationGate[] {
+  const out: StationGate[] = [];
+  if (!roomId) return out;
+  for (const rid of atlasComponent(atlas, roomId)) {
+    const entry = atlas[rid];
+    if (!entry?.gates) continue;
+    for (const [doorId, gate] of Object.entries(entry.gates)) {
+      out.push({ roomId: rid, doorId, gate, occupied: !!entry.doors[doorId]?.targetRoomId });
+    }
+  }
+  return out.sort((a, b) => a.gate - b.gate
+    || (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0)
+    || (a.doorId < b.doorId ? -1 : a.doorId > b.doorId ? 1 : 0));
+}
+
+/**
+ * The gate number a port newly fitted in `roomId` takes: the lowest one no
+ * other gate of its station uses. The room's own live gates (`own`, from its
+ * doorPolicy) stand in for its atlas entry, which may be a harvest behind.
+ * Null when all MAX_GATE_NUMBER are taken.
+ */
+export function freeGateNumber(
+  atlas: Record<string, AtlasEntry>,
+  roomId: string,
+  own: Record<string, number>,
+): number | null {
+  const taken = new Set<number>(Object.values(own));
+  for (const g of stationGates(atlas, roomId)) if (g.roomId !== roomId) taken.add(g.gate);
+  for (let g = 1; g <= MAX_GATE_NUMBER; g++) if (!taken.has(g)) return g;
+  return null;
 }
 
 // ── 🪐 Connected components — what a STATION is ──────────────────────────────
@@ -784,6 +865,8 @@ interface SharedAtlasEntry {
    *  a module's outside: its size, its position and its connections. Only the
    *  SEED (the credential that dials you in) is access-controlled. */
   dims?: { cols: number; rows: number };
+  /** ⚓🚦 Dock ports → gate numbers (AtlasEntry.gates). Public layout. */
+  gates?: Record<string, number>;
   /** The dial-in credential. Rides only while a door that ACTUALLY EXISTS is
    *  set to public passage — this is the access restriction, and it is
    *  deliberately NOT the same question as "may you see this module". */
@@ -970,6 +1053,11 @@ function pullSharedAtlas(): void {
       seed: value.seed ?? prior?.seed,
       dims: value.dims ?? prior?.dims,
       doors,
+      // ⚓🚦 Peer-written: cleaned and capped. Silence (an older client) keeps
+      // what we knew, like dims.
+      ...(value.gates !== undefined && isPlainGates(value.gates)
+        ? { gates: cleanGates(value.gates) }
+        : prior?.gates ? { gates: prior.gates } : {}),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
       // Gossip is SECOND-hand and must never mint local recency: stamping it
       // here would let one peer's station sweep outrank every room the player
@@ -1037,6 +1125,9 @@ export function pushAtlasToDoc(): void {
         // size, so the station's shape was only ever right for rooms you had
         // walked through yourself.
         ...(entry.dims ? { dims: entry.dims } : {}),
+        // ⚓🚦 Gates travel with the layout, so a board or an arriving ship in
+        // any room of the station knows every gate.
+        ...(entry.gates ? { gates: entry.gates } : {}),
         // 🧭 F5 (redo review): MONOTONIC, not just lastSeen. A corrective
         // re-push with the same second's stamp would lose the LWW tie against
         // the poisoned entry it is correcting (pull skips on >=); bumping past

@@ -43,6 +43,29 @@ export interface DoorPolicyRecord {
    *  permanence, either side detaches). Owner installs/removes (consumes/
    *  refunds an ADAPTER part). */
   adapter?: boolean;
+  /** ⚓🚦 The port's GATE number (airport-style, 1..MAX_GATE), shown on
+   *  departure boards and tried in order by arriving ships. Stored, never
+   *  derived, so gates never renumber as other ports come and go: assigned
+   *  the lowest free number in the station when the port is fitted, editable
+   *  by the owner at the door panel, cleared when the port is removed. Only
+   *  meaningful while `adapter` is true. */
+  gate?: number;
+}
+
+/** Highest gate number a port may carry. */
+export const MAX_GATE = 99;
+
+/** Is `v` a gate number? */
+export function isGateNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= MAX_GATE;
+}
+
+/** The lowest gate number not in `taken` (1 when none are), or null when
+ *  every number is used. */
+export function nextFreeGate(taken: Iterable<number>): number | null {
+  const used = new Set(taken);
+  for (let g = 1; g <= MAX_GATE; g++) if (!used.has(g)) return g;
+  return null;
 }
 
 export interface DoorRightsRequest {
@@ -129,6 +152,7 @@ function sanitizePolicy(value: unknown): DoorPolicyRecord {
     ...(raw?.oneWay === 'in' || raw?.oneWay === 'out' ? { oneWay: raw.oneWay } : {}),
     construction: raw?.construction === 'request' || raw?.construction === 'public' ? raw.construction : 'owner',
     adapter: raw?.adapter === true,
+    ...(raw?.adapter === true && isGateNumber(raw?.gate) ? { gate: raw.gate } : {}),
   };
 }
 
@@ -139,6 +163,7 @@ function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
     ...(policy.oneWay === 'in' || policy.oneWay === 'out' ? { oneWay: policy.oneWay } : {}),
     construction: policy.construction,
     adapter: policy.adapter === true,
+    ...(policy.adapter === true && isGateNumber(policy.gate) ? { gate: policy.gate } : {}),
   };
 }
 
@@ -156,14 +181,40 @@ export function dockPortFlagIn(doc: Y.Doc, doorId: string): boolean {
  * bound one). Its other policy fields are kept exactly as stored; the caller
  * has already checked the door exists in that room's layout.
  */
-export function fitDockPortIn(doc: Y.Doc, doorId: string): void {
+export function fitDockPortIn(doc: Y.Doc, doorId: string, gate?: number | null): void {
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return;
   const map = doc.getMap('doorPolicy');
   const current = sanitizePolicy(map.get(doorId));
   if (current.adapter) return;
   doc.transact(() => {
-    map.set(doorId, policyShape({ ...current, adapter: true }));
+    map.set(doorId, policyShape({ ...current, adapter: true, ...(isGateNumber(gate) ? { gate } : {}) }));
   });
+}
+
+/** ⚓🚦 Every gate this room's ports carry, by door id — what the atlas
+ *  harvest publishes for the station's boards and arriving ships. */
+export function readDockGates(): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!docAlive()) return out;
+  for (const [doorId, value] of policyMap!.entries()) {
+    if (!isKnownDoorId(doorId)) continue;
+    const p = sanitizePolicy(value);
+    if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
+  }
+  return out;
+}
+
+/** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
+export function dockGatesIn(doc: Y.Doc): Record<string, number> {
+  const out: Record<string, number> = {};
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return out;
+  let n = 0;
+  for (const [doorId, value] of doc.getMap('doorPolicy').entries()) {
+    if (++n > 256) break;
+    const p = sanitizePolicy(value);
+    if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
+  }
+  return out;
 }
 
 /** Player-facing passage label (plain language, one string everywhere). */

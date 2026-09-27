@@ -2057,7 +2057,8 @@ export interface HelmDockingDeps {
   /** Subscribe to port changes; returns the unsubscribe. */
   subscribe: (cb: () => void) => () => void;
   undock: (doorId: string) => void;
-  dock: (doorId: string) => void;
+  /** The shipped DOCK; its answer (false: refused) lets an arrival try the next berth. */
+  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
 }
 
 /** Port marker colours on the ship atlas (and the status words beside them). */
@@ -2105,13 +2106,20 @@ export function clearShipArrivalNote(): void {
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
 export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   if (!outcome) return;
+  const gate = (g: number | undefined) => (g !== undefined ? `gate ${g}` : 'the berth');
   if (outcome.kind === 'docking') {
-    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at the berth.`, tone: 'ok' });
+    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at ${gate(outcome.gate)}…`, tone: 'ok' });
+    return;
+  }
+  if (outcome.kind === 'docked') {
+    setArrivalNote({ text: `Docked at ${outcome.stationName}, ${gate(outcome.gate)}.`, tone: 'ok' });
     return;
   }
   setArrivalNote({
     tone: 'warn',
-    text: outcome.reason === 'already-docked'
+    text: outcome.reason === 'berths-taken'
+      ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, or out of reach). Dock from a door panel when one frees up.`
+      : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
       : outcome.reason === 'unlisted-station'
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
@@ -2473,7 +2481,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;
       // DOCK NOW is the commander's call: settle the arrival here and now.
-      noteShipArrival(completeArrival(shipDocking, { force: true }));
+      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: noteShipArrival }));
     });
 
     if (refocus) {
@@ -2685,7 +2693,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Arrive where the ship flew, even if the directory no longer lists it.
       writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
     }
-    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking));
+    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: noteShipArrival }));
   };
 
   return {

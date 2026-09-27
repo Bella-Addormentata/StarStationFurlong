@@ -93,6 +93,8 @@ import {
   removeDoorGrant,
   hasDoorGrant,
   hasDoorRequest,
+  readDockGates,
+  MAX_GATE,
   type ConstructionMode,
   type DoorPolicyRecord,
 } from "./doorPolicy";
@@ -118,7 +120,7 @@ import {
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
-  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency,
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumber, stationGates,
 } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -1872,7 +1874,13 @@ export class DoorDockingPortSystem {
         if (step.kind === "fit-port") {
           // SEED-FIRST is not needed here: writeDoorPolicy refuses a door the
           // layout does not know, and every door with a pane is known.
-          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: true });
+          // ⚓🚦 A new port takes the lowest gate number free in the station.
+          const gate = freeGateNumber(readAtlas(), this.roomNow(), readDockGates());
+          writeDoorPolicy(doorId, {
+            ...readDoorPolicy(doorId),
+            adapter: true,
+            ...(gate !== null ? { gate } : {}),
+          });
         } else {
           state.segments = dockChain();
           state.dockMatePaid = true;
@@ -1984,6 +1992,19 @@ export class DoorDockingPortSystem {
       if (!doorId) return;
       if (el.dataset.dockAction === "undock") void this.undockPort(doorId);
       else if (el.dataset.dockAction === "dock") void this.redockPort(doorId);
+      else if (el.dataset.dockAction === "gate-down" || el.dataset.dockAction === "gate-up") {
+        // ⚓🚦 The owner renumbers a gate by hand (a duplicate is flagged in
+        // the row, never fixed behind their back).
+        if (!this.canConstruct(doorId)) return;
+        const policy = readDoorPolicy(doorId);
+        if (!policy.adapter) return;
+        // A port fitted before gates existed gets the lowest free number first.
+        const step = el.dataset.dockAction === "gate-up" ? 1 : -1;
+        const gate = policy.gate === undefined
+          ? freeGateNumber(readAtlas(), this.roomNow(), readDockGates()) ?? 1
+          : Math.min(MAX_GATE, Math.max(1, policy.gate + step));
+        writeDoorPolicy(doorId, { ...policy, gate });
+      }
     });
 
     (
@@ -3057,12 +3078,28 @@ export class DoorDockingPortSystem {
     }
     const toneColor =
       op?.tone === "ok" ? "#00e676" : op?.tone === "bad" ? "#ff8a80" : "#ffb300";
+    // ⚓🚦 The port's gate number, as departure boards show it. A number
+    // another port of the station also uses is flagged, not changed.
+    const gate = readDoorPolicy(doorId).gate;
+    const roomId = this.roomNow();
+    const clash = gate !== undefined && stationGates(readAtlas(), roomId)
+      .some((g) => g.gate === gate && !(g.roomId === roomId && g.doorId === doorId));
+    const gateBtn = (dir: "down" | "up", label: string) =>
+      `<button type="button" data-dock-action="gate-${dir}" title="${dir === "up" ? "Next" : "Previous"} gate number" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${label}</button>`;
+    const gateLine = readDoorPolicy(doorId).adapter
+      ? `<div style="display:flex; align-items:center; gap:6px; font-size:9.5px; color:#f2efe6;">
+          <span>🚦 GATE <b>${gate ?? "—"}</b></span>
+          ${may ? gateBtn("down", "−") + gateBtn("up", "+") : ""}
+          ${clash ? `<span style="color:#ffb300;">⚠ another port in this station is also gate ${gate}</span>` : ""}
+        </div>`
+      : "";
     rowEl.innerHTML = `
       <div style="border:1px solid rgba(242,239,230,0.35); border-radius:8px; padding:8px 10px; background:rgba(242,239,230,0.05); display:flex; flex-direction:column; gap:6px;">
         <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
           <span style="font-size:10.5px; color:#f2efe6; line-height:1.35;">${status}</span>
           ${action}
         </div>
+        ${gateLine}
         ${op?.note ? `<div style="font-size:9.5px; color:${op.busy ? "#ffb300" : toneColor}; line-height:1.3;">${op.busy ? "⏳ " : ""}${esc(op.note)}</div>` : ""}
         ${!may && (port.kind === "docked" || port.kind === "undocked") ? `<div style="font-size:9px; color:rgba(242,239,230,0.5);">Docking here is up to the owner — or undock from your ship's own door or helm.</div>` : ""}
       </div>`;

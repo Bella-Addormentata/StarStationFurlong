@@ -62,7 +62,10 @@ export function castOffRefusal(ports: readonly ArrivalPort[]): 'dock-busy' | 'do
 export interface ShipDockingApi {
   ports: () => ArrivalPort[];
   undock: (doorId: string) => void;
-  dock: (doorId: string) => void;
+  /** The shipped DOCK. Its answer (docking.ts redockPort: false when the far
+   *  berth refused, e.g. taken) lets an arrival try the station's next gate;
+   *  no answer counts as docked. */
+  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
 }
 
 /** A remembered berth with a pass this client holds for its room — what
@@ -115,37 +118,78 @@ export type ArrivalPlan =
       /** Re-point the port's tombstone here before DOCK; null when the port
        *  already remembers exactly this berth. */
       retarget: DockBerthMemory | null;
+      /** ⚓🚦 The gate being docked at, when the berth has one. */
+      gate?: number;
     }
   | { kind: 'none'; reason: 'no-berth' | 'no-port' | 'already-docked' };
 
 /**
- * Decide how an arriving ship docks. The station's own berth wins (the station
- * says where visitors dock); otherwise the ship's memory of its last berth
- * there. The port used is the remembered one when it is free, else the first
- * port that is not docked.
+ * ⚓🚦 Every berth an arriving ship may try, in order:
+ *   1. the gate asked for (a route stop's), when the station has it;
+ *   2. the station's other gates in gate order, those its atlas shows taken
+ *      last (the atlas may be a harvest behind, so they are still tried);
+ *   3. a station that lists no gates: its one public berth;
+ *   4. the ship's memory of its last berth there — first when the station
+ *      names none, or names the same room without saying which door (the
+ *      memory knows the door and its geometry), else last.
+ * Peer-written addresses: one that names no room is no berth at all (it
+ * would reach the door record as a tombstone DOCK cannot parse).
+ */
+export function arrivalBerths(input: {
+  station: Pick<StationDestination, 'berth' | 'berths'>;
+  remembered: RememberedBerth | null;
+  gate?: number;
+}): StationBerth[] {
+  const { station } = input;
+  const remembered = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
+  const gates = (station.berths ?? []).filter((b) => isRoomSeed(b.address));
+  const listed: StationBerth[] = gates.length > 0
+    ? [
+        ...gates.filter((b) => input.gate !== undefined && b.gate === input.gate),
+        ...gates.filter((b) => !(input.gate !== undefined && b.gate === input.gate) && !b.occupied),
+        ...gates.filter((b) => !(input.gate !== undefined && b.gate === input.gate) && b.occupied),
+      ]
+    : station.berth && isRoomSeed(station.berth.address) ? [station.berth] : [];
+  const out: StationBerth[] = [];
+  const same = (a: StationBerth, b: StationBerth) =>
+    sameRoom(a.address, b.address) && (a.farDoor ?? '') === (b.farDoor ?? '');
+  const add = (b: StationBerth) => { if (!out.some((o) => same(o, b))) out.push(b); };
+  const memoryFirst = remembered && (listed.length === 0
+    || (listed.length === 1 && !listed[0].farDoor && sameRoom(listed[0].address, remembered.address)));
+  if (memoryFirst) add(remembered);
+  for (const b of listed) {
+    // A doorless berth in the room the memory knows is the memory's.
+    if (memoryFirst && !b.farDoor && sameRoom(b.address, remembered.address)) continue;
+    add(b);
+  }
+  if (remembered) add(remembered);
+  return out;
+}
+
+/**
+ * Decide how an arriving ship docks: at `berth` when given (the next gate
+ * after a refusal), else the first of arrivalBerths. The port used is the
+ * remembered one when it is free, else the first port that is not docked.
  */
 export function planArrivalDock(input: {
-  station: Pick<StationDestination, 'berth'>;
+  station: Pick<StationDestination, 'berth' | 'berths'>;
   remembered: RememberedBerth | null;
   ports: readonly ArrivalPort[];
   now?: number;
+  /** ⚓🚦 The gate to try first (a route stop's). */
+  gate?: number;
+  /** Dock here instead of the first candidate. */
+  berth?: StationBerth;
 }): ArrivalPlan {
-  const { station, ports } = input;
-  // The station's berth wins; the ship's own memory fills in when the station
-  // names none, or names the same room without saying which door (the memory
-  // knows the door and its geometry — a dock that can ask the far side).
-  // Peer-written addresses: one that names no room is no berth at all (it
-  // would reach the door record as a tombstone DOCK cannot parse).
-  const stationBerth = station.berth && isRoomSeed(station.berth.address) ? station.berth : null;
+  const { ports } = input;
   const remembered = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
+  const candidates = arrivalBerths(input);
   const berth: StationBerth | null =
-    remembered &&
-    (!stationBerth ||
-      (!stationBerth.farDoor && sameRoom(stationBerth.address, remembered.address)))
-      ? remembered
-      : stationBerth;
+    input.berth && isRoomSeed(input.berth.address) ? input.berth : candidates[0] ?? null;
   if (!berth) return { kind: 'none', reason: 'no-berth' };
-  if (ports.some((p) => p.state.kind === 'docked' && sameRoom(p.state.address, berth.address))) {
+  // Docked at any of this station's berths: already there.
+  if (ports.some((p) => p.state.kind === 'docked'
+    && [berth, ...candidates].some((b) => sameRoom((p.state as { address: string }).address, b.address)))) {
     return { kind: 'none', reason: 'already-docked' };
   }
   // Open = free to dock AND ours to use right now: a busy or locked port
@@ -161,7 +205,7 @@ export function planArrivalDock(input: {
     sameRoom(st.address, berth.address) &&
     (berth.farDoor === undefined || st.memory.farDoor === berth.farDoor)
   ) {
-    return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: null };
+    return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: null, ...gateOf(berth) };
   }
   const memory: DockBerthMemory = {
     undockedAt: stampAfter(st.kind === 'undocked' ? st.memory.undockedAt : undefined, input.now),
@@ -169,7 +213,11 @@ export function planArrivalDock(input: {
   if (berth.farDoor !== undefined) memory.farDoor = berth.farDoor;
   if (berth.farWall !== undefined) memory.farWall = berth.farWall;
   if (berth.farLateral !== undefined) memory.farLateral = berth.farLateral;
-  return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: memory };
+  return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: memory, ...gateOf(berth) };
+}
+
+function gateOf(berth: StationBerth): { gate?: number } {
+  return berth.gate !== undefined ? { gate: berth.gate } : {};
 }
 
 /**
@@ -258,11 +306,14 @@ export function castOffForDeparture(stationId: string, docking: ShipDockingApi):
 
 /** What the last arrival did — the helm shows it. */
 export type ArrivalOutcome =
-  | { kind: 'docking'; stationName: string }
+  | { kind: 'docking'; stationName: string; gate?: number }
+  /** ⚓🚦 The DOCK went through (reported once the far berth answered). */
+  | { kind: 'docked'; stationName: string; gate?: number }
   | {
       kind: 'none';
       stationName: string;
-      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station';
+      /** `berths-taken`: every berth tried refused (taken, or unreachable). */
+      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken';
     };
 
 /** How long an arrival waits for a commander who can dock (station records
@@ -283,7 +334,15 @@ export const ARRIVAL_GRACE_MS = 15_000;
  */
 export function completeArrival(
   docking: ShipDockingApi | null,
-  opts: { now?: number; force?: boolean } = {},
+  opts: {
+    now?: number;
+    force?: boolean;
+    /** ⚓🚦 The gate to try first (a route stop's). */
+    gate?: number;
+    /** Called once the docking settles: docked (at which gate), or every
+     *  berth refused. Not called when this returns anything but `docking`. */
+    onSettled?: (outcome: ArrivalOutcome) => void;
+  } = {},
 ): ArrivalOutcome | null {
   const rec = readFlightRecord();
   if (rec.status !== 'redocking') return null;
@@ -302,11 +361,8 @@ export function completeArrival(
   const station = findDestination(rec.locationId);
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
   const ports = docking.ports();
-  const plan = planArrivalDock({
-    station,
-    remembered: resolveRememberedBerth(readStationBerth(station.id), ports),
-    ports,
-  });
+  const remembered = resolveRememberedBerth(readStationBerth(station.id), ports);
+  const plan = planArrivalDock({ station, remembered, ports, gate: opts.gate });
   if (plan.kind === 'none') {
     const outcome: ArrivalOutcome = { kind: 'none', stationName: station.name, reason: plan.reason };
     if (plan.reason === 'already-docked') {
@@ -316,7 +372,47 @@ export function completeArrival(
     return settle(outcome);
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
-  if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
-  docking.dock(plan.doorId);
-  return { kind: 'docking', stationName: station.name };
+  const candidates = arrivalBerths({ station, remembered, gate: opts.gate });
+  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled);
+  return { kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) };
+}
+
+/**
+ * ⚓🚦 DOCK at the planned berth; when the far berth refuses (taken, or its
+ * room out of reach), try the next berth in arrivalBerths order, re-planned
+ * against the ports as they are now. Settles docked at the first that takes
+ * the ship, or `berths-taken` when every one refused.
+ */
+async function dockThroughBerths(
+  docking: ShipDockingApi,
+  station: StationDestination,
+  remembered: RememberedBerth | null,
+  candidates: readonly StationBerth[],
+  first: Extract<ArrivalPlan, { kind: 'dock' }>,
+  onSettled: ((outcome: ArrivalOutcome) => void) | undefined,
+): Promise<void> {
+  // `first` was planned for candidates[0] (planArrivalDock's own pick).
+  for (let i = 0; i < candidates.length || i === 0; i++) {
+    const plan: ArrivalPlan = i === 0
+      ? first
+      : planArrivalDock({ station, remembered, ports: docking.ports(), berth: candidates[i] });
+    if (plan.kind === 'none') {
+      onSettled?.(plan.reason === 'already-docked'
+        ? { kind: 'docked', stationName: station.name }
+        : { kind: 'none', stationName: station.name, reason: plan.reason });
+      return;
+    }
+    if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
+    let ok: boolean | void = false;
+    try {
+      ok = await docking.dock(plan.doorId);
+    } catch (err) {
+      console.warn('[ship] arrival DOCK threw:', err);
+    }
+    if (ok !== false) {
+      onSettled?.({ kind: 'docked', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) });
+      return;
+    }
+  }
+  onSettled?.({ kind: 'none', stationName: station.name, reason: 'berths-taken' });
 }
