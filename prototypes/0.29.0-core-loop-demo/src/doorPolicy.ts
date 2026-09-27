@@ -209,7 +209,10 @@ function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
 export function readGateAccess(): Record<string, GateAccessRecord> {
   const out: Record<string, GateAccessRecord> = {};
   if (!docAlive()) return out;
+  // Peer-writable map: the scan is capped before any key is checked.
+  let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
+    if (++n > 256) break;
     if (!isKnownDoorId(doorId)) continue;
     const a = accessRecord(sanitizePolicy(value));
     if (a) out[doorId] = a;
@@ -258,7 +261,10 @@ export function fitDockPortIn(doc: Y.Doc, doorId: string, gate?: number | null):
 export function readDockGates(): Record<string, number> {
   const out: Record<string, number> = {};
   if (!docAlive()) return out;
+  // Peer-writable map: the scan is capped before any key is checked.
+  let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
+    if (++n > 256) break;
     if (!isKnownDoorId(doorId)) continue;
     const p = sanitizePolicy(value);
     if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;

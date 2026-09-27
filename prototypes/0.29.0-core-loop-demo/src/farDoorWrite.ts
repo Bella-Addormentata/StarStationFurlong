@@ -84,12 +84,18 @@ export function applyFarDockRequest(
       wrote: false,
     };
   }
+  // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate; with
+  // every number taken, neither record is written.
+  const newPort = !dockPortFlagIn(doc, req.farDoor);
+  const gate = newPort ? freeGateNumber(readAtlas(), farRoomOf(req.farAddress), dockGatesIn(doc)) : null;
+  if (newPort && gate === null) {
+    return { result: { ok: false, reason: 'no-gate' }, wrote: false };
+  }
   // One transaction: the berth's record and its port land together, so no
   // peer ever sees a dock on a door without its half.
   doc.transact(() => {
     writeDoorRecordTo(doc, req.farDoor, patch.record);
-    // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate.
-    fitDockPortIn(doc, req.farDoor, freeGateNumber(readAtlas(), farRoomOf(req.farAddress), dockGatesIn(doc)));
+    if (newPort) fitDockPortIn(doc, req.farDoor, gate);
   });
   return { result: { ok: true, detail: 'written' }, wrote: true };
 }

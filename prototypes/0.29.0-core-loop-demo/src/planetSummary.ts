@@ -410,7 +410,8 @@ export function registerLearnedStations(planetId: string, stations: Iterable<Sta
     if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
       && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor
-      && JSON.stringify(had.berths ?? []) === JSON.stringify(rec.berths ?? [])) continue;
+      // No list (unknown) and an empty one (known to have none) differ.
+      && JSON.stringify(had.berths) === JSON.stringify(rec.berths)) continue;
     if (registerStation(rec)) changed++;
   }
   return changed;
