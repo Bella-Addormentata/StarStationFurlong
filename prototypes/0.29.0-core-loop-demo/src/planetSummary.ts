@@ -343,11 +343,11 @@ export function registerLearnedStations(planetId: string, stations: Iterable<Sta
     // Someone else's record, or its own saved one: this install decides.
     if (owner && !owner.derived && owner.id !== rec.id) continue;
     // Unchanged since it was saved: compare with the SAVED record, not the
-    // listed one (the list may have moved it to a free slot). Fields this
-    // build's stations.ts does not keep cannot be compared, so they only
-    // travel on when the core fields change.
-    const had = saved.get(rec.id);
-    if (had && had.name === rec.name && had.orbitSlot === rec.orbitSlot
+    // listed one (the list may have moved it to a free slot), extra fields
+    // included (a newer build's, such as a station's move).
+    const had = saved.get(rec.id) as (StationRecord & Record<string, unknown>) | undefined;
+    const sameExt = Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
+    if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
       && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor) continue;
     if (registerStation(rec)) changed++;
