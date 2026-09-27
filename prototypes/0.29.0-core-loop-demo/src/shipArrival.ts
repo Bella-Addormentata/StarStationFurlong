@@ -433,7 +433,7 @@ export function completeArrival(
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
   const candidates = arrivalBerths({ station, remembered, gate: opts.gate, shipRoomId });
-  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled);
+  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled, shipRoomId);
   return { kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) };
 }
 
@@ -450,13 +450,16 @@ async function dockThroughBerths(
   candidates: readonly StationBerth[],
   first: Extract<ArrivalPlan, { kind: 'dock' }>,
   onSettled: ((outcome: ArrivalOutcome) => void) | undefined,
+  /** The arriving ship's room, captured at arrival: every retry plans for
+   *  the same ship (its reserved gates count, and a dock it gained counts). */
+  shipRoomId?: string,
 ): Promise<void> {
   // `first` was planned for candidates[0] (planArrivalDock's own pick).
   const reasons: DockRefusal[] = [];
   for (let i = 0; i < candidates.length || i === 0; i++) {
     const plan: ArrivalPlan = i === 0
       ? first
-      : planArrivalDock({ station, remembered, ports: docking.ports(), berth: candidates[i] });
+      : planArrivalDock({ station, remembered, ports: docking.ports(), berth: candidates[i], shipRoomId });
     if (plan.kind === 'none') {
       onSettled?.(plan.reason === 'already-docked'
         ? { kind: 'docked', stationName: station.name }

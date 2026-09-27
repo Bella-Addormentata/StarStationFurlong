@@ -345,7 +345,7 @@ export type FarDock =
   | { action: 'write'; record: DoorPairing }
   | {
       action: 'refuse';
-      reason: 'gone' | 'occupied' | 'closed' | 'superseded' | 'not-allowed';
+      reason: 'gone' | 'occupied' | 'closed' | 'superseded' | 'not-allowed' | 'no-gate';
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
     };
@@ -356,6 +356,7 @@ export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['re
   occupied: 'That berth is occupied by another module now.',
   closed: 'That berth was closed — its dock port was removed.',
   superseded: 'A newer DOCK of this port already holds that berth.',
+  'no-gate': 'That station has used every gate number — no new dock port can be fitted there.',
   'not-allowed': 'That gate does not admit this ship — the station has closed it, reserved it for another ship, or opened it only to captains granted at its door.',
 };
 

@@ -25,7 +25,7 @@ import {
   stationGates,
 } from './stationAtlas';
 import { listStations, registerStation } from './stations';
-import { foldOwnStation, mergeStation, summaryForStation } from './planetSummary';
+import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
 import { farDockPatch } from './dockRules';
@@ -202,6 +202,17 @@ describe('the station record', () => {
     expect(dest.berth).toBeUndefined();
     const remembered = { address: seed('room-far'), farDoor: 'east' } as Parameters<typeof arrivalBerths>[0]['remembered'];
     expect(arrivalBerths({ station: dest, remembered })).toEqual([]);
+  });
+
+  it('registers a learned station\'s last gate going away', () => {
+    const summary: StationSummary = {
+      welcomeRoomId: 'room-far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, updatedAt: 1_000,
+      berthDoor: 'east',
+    };
+    registerLearnedStations('planet-sovereign', [summary]);
+    expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([{ roomId: 'room-far', doorId: 'east' }]);
+    expect(registerLearnedStations('planet-sovereign', [{ ...summary, berths: [], berthsAt: 2_000 }])).toBe(1);
+    expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([]);
   });
 
   it('lists every gate up to the highest number', () => {

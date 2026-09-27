@@ -236,6 +236,9 @@ export type FarDockResult =
         | "gone"
         /** ⚓🚦 The gate is closed or reserved to this ship (doorPolicy). */
         | "not-allowed"
+        /** ⚓🚦 The far door wears no port and every gate number of its
+         *  station is taken, so none is fitted. */
+        | "no-gate"
         /** The berth holds a dock of this very port with another stamp — a
          *  claim made at the same moment that the CRDT kept, or one made
          *  from the far side: it stands, this one yields (and may join it). */
@@ -3038,11 +3041,11 @@ export class DoorDockingPortSystem {
         );
         return { ok: false, reason: "superseded" };
       }
-      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone" || far.reason === "not-allowed")) {
+      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone" || far.reason === "not-allowed" || far.reason === "no-gate")) {
         // A closed or vanished berth is not coming back: drop the memory so
         // this port stops offering it. An occupied one may free up, and a gate
         // not open to us now may open later.
-        if (far.reason !== "occupied" && far.reason !== "not-allowed" && unchanged()) writeDoorTombstone(doorId, port.address);
+        if (far.reason !== "occupied" && far.reason !== "not-allowed" && far.reason !== "no-gate" && unchanged()) writeDoorTombstone(doorId, port.address);
         this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" }, roomId);
         return {
           ok: false,

@@ -958,7 +958,11 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     // room editor enforces, so a hostile or buggy entry degrades to "we don't
     // know this module's size" (the renderer's existing fallback) instead of
     // asking Three.js for a 10-billion-tile hull.
-    && (e.dims === undefined || isSaneDims(e.dims));
+    && (e.dims === undefined || isSaneDims(e.dims))
+    // ⚓🚦 Gates ride as plain door-keyed maps, bounded like `doors`, so an
+    // oversized peer value never becomes `known` (and never gets stringified).
+    && (e.gates === undefined || isPlainGates(e.gates))
+    && (e.gateAccess === undefined || isPlainGates(e.gateAccess));
 }
 
 /** True once `obj` has more than `limit` own keys — stops counting there, so
