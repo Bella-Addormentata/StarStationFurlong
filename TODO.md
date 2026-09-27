@@ -44,6 +44,7 @@
 - [ ] **Key-loss / social recovery UX** — FROST recovery-council flow tested with non-technical users; mandatory-export-before-sole-custody onboarding (v006 §10.3)
 - [ ] **Topic-secret re-key procedure** — epochal rotation implementation notes (v006 §7.4, P‑18)
 - [ ] **Malicious-host / anti-cheat note** — deterministic-replay adjudication from signed intents (v006 §10.3; Phase 3+)
+- [ ] **Per-key write rules for the casino's player-scoped keys** — any room peer can write any casino key today: another player's `bal:`, a drop or spin request in their name, a door request in the owner's (the coin pusher's TRUST note in [casinoDoc.ts](prototypes/0.29.0-core-loop-demo/src/casinoDoc.ts)). YjsSync's verify-before-apply proves who sent an update, not which keys the sender may write. The off-chain ownership root (critical path, above) makes write authority grant-set membership, but that is room-level: a granted member can still write every key, and once it lands a player without a grant can't write even their own. Design who may write `bal:`, `bets:`, `slot-request:` and `pusher-req:` (the player; the elected operator for settles), or move balances to the Registry chips the casino header already points at. Surfaced in [#137](https://github.com/Bella-Addormentata/StarStationFurlong/pull/137)'s review
 
 ## 🏦 Company treasury and governance
 

@@ -25,6 +25,30 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
   **Testing, stated honestly:** `tsc` clean, 560 tests (the party suites: `infinityPool`, `partyAudio` + its voice state machine on a fake clock, `partyDoc`, `roomTemplates` fitting). Twenty-five Copilot review rounds; every finding fixed and pinned by a test. Driven headlessly in a private test module: canvas clicks open the speaker and cake panels, the recording plays on entry and switches tracks, the robot walks to the floor and dances, the gift flow (write → sealed for others → read on open) works with the app's own module instances. The room was then furnished and gifted live: eight wishes on eight boxes, the deed handed over by transfer offer.
 
+- **🪙 An arcade coin pusher: time a chip drop against the sweep, and win what falls off the front ([#137](https://github.com/Bella-Addormentata/StarStationFurlong/pull/137), fixes [#135](https://github.com/Bella-Addormentata/StarStationFurlong/issues/135)).** A new casino cabinet, spawnable from the DEV menu's FURNITURE list (🪙 COIN PUSHER).
+  - A player picks one of three drop holes and times the drop against the sweeping pusher. The chip falls through a peg field onto the upper platform, the pusher shoves the piles forward, and chips cascade onto the lower platform.
+  - Only chips that fall off the front of the last platform are paid, to that drop's player. Everything else stays in the machine until its owner opens the door and takes the chips inside back to their rack.
+  - The engine (`games/coinPusher.ts`) is pure: a peer with a drop's seed reproduces its path. The sweep is a free-running clock that every client draws from its own wall clock, and a drop keeps the phase the player saw.
+
+  **One operator for the room.** Every chip moves through one session of the room's deed holder (`pusher-operator`, `pusherCroupier.ts`). A player's `bal:` is a whole value, so two sessions settling at once would each rewrite it and the merge would keep only one write.
+  - **The lease.** The operator waits 2 s after taking the lease and renews it every 3 s. Another device's lease is judged by the renewals seen, never by the expiry it claims: it lapses 8 s after the last renewal and is taken over only after a further 60 s split window. Tabs on one device take over at once.
+  - **Drops.** DROP waits until the operator is past its settling wait. A settle moves the machine, the balance and the player's answer in one transaction. A request is refused, with nothing moved, when it is stale, the player has no chip, the machine is full, or the payout couldn't be credited.
+  - **Leaving a room** hands the lease back before the room's doc goes. The edit and croupier gates stay shut while the old room can still send (`roomLeavesUnderWay`, `main.ts`).
+  - **Removal.** Only the operator, past its settling wait, drains a removed cabinet, so a previous holder's last settle can never pay the same chips twice. Its per-player keys are swept a batch a frame.
+
+  **Testing, stated honestly:**
+  - `tsc` clean and 764 tests at merge: 80 engine, 47 `casinoDoc`, 67 `pusherCroupier`, 2 fallback and 5 cabinet tests. They include two-doc Yjs merges: a settle against the player's cancel, against a removal, and against a previous holder's last settle.
+  - Twenty-eight Copilot review rounds.
+  - In Chromium against a local node:
+    - 45 drops left the balance exact;
+    - late and forged requests fell where the pusher was or were refused;
+    - the door returned the chips inside;
+    - with the deed holder on two devices, one session operated both cabinets, and 6 of 6 same-instant trials kept both debits.
+
+  **Deferred, documented:**
+  - A split between two of the deed holder's devices, longer than the window or begun before either saw the other's lease, can still put two operators in one room. Closing that needs an authoritative ledger.
+  - Any room peer can write casino keys, so a request can be forged in another player's name. Per-key write rules are a new TODO.
+
 - **🧬 A 2×2 clone vat the clone squeezes out of: drained before the door opens, sealed before it refills, and a pale clone that regains its colour ([#166](https://github.com/Bella-Addormentata/StarStationFurlong/pull/166), fixes [#165](https://github.com/Bella-Addormentata/StarStationFurlong/issues/165)).** The vat is now a 2×2 tank centred on the NW corner's 2×2 square at (−5, −5): a 0.8 m glass radius, 2.7 m of glass, and a 140° door with a fixed transom above it. The corner cherry tree moves to the west wall. The fox is far bigger than any tank, so during the ceremony it is scaled every frame to an hourglass-shaped hard limit (`vatGauge.ts`), fitted to the rig's measured silhouette. The limit runs from the round tank, through the doorway between the door rails and under the transom, to a cone opening into the room. The tank drains and is held visibly empty before the door spins. The door shuts once the clone's tail is clear, and only then does the tank refill. A fresh clone decants almost-white grey and regains its own colours over 30 s.
 
   **Movable vats.** The clone is never released overlapping the vat or other furniture.
