@@ -44,7 +44,7 @@
 
 import { normalizeWall } from './doorLayoutDoc';
 import type { ConnectorSegment } from './adapter';
-import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, isSaneDims, roomIdFromSeed } from './stationAtlas';
+import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, atlasComponent, isSaneDims, roomIdFromSeed } from './stationAtlas';
 import type { AtlasEntry, BundledAtlasEntry } from './stationAtlas';
 import bundledAtlasJson from './defaultStation.atlas.json';
 
@@ -198,29 +198,7 @@ export function atlasForBundle(
 ): Record<string, BundledAtlasEntry> {
   const out: Record<string, BundledAtlasEntry> = {};
   if (!welcomeRoomId || !atlas[welcomeRoomId]) return out;
-  const adjacent = new Map<string, Set<string>>();
-  const link = (a: string, b: string) => {
-    if (!adjacent.has(a)) adjacent.set(a, new Set());
-    adjacent.get(a)!.add(b);
-  };
-  for (const e of Object.values(atlas)) {
-    if (!e?.roomId || !e.doors) continue;
-    for (const d of Object.values(e.doors)) {
-      if (!d?.targetRoomId) continue;
-      link(e.roomId, d.targetRoomId);
-      link(d.targetRoomId, e.roomId);
-    }
-  }
-  const component = new Set<string>([welcomeRoomId]);
-  const queue = [welcomeRoomId];
-  while (queue.length > 0) {
-    const rid = queue.shift()!;
-    for (const next of adjacent.get(rid) ?? []) {
-      if (component.has(next) || component.size >= MAX_ENTRIES) continue;
-      component.add(next);
-      queue.push(next);
-    }
-  }
+  const component = atlasComponent(atlas, welcomeRoomId);
   for (const rid of component) {
     const e = atlas[rid];
     if (!e?.doors) continue;

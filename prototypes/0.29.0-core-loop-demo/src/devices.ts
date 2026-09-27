@@ -1058,6 +1058,7 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       } else {
         mapTableMap.mount(body); // re-parents the existing container
       }
+      mapTableMap.refreshStations(); // every station around each planet, "you are here" on the current one
       mapTableMap.show();
     },
 

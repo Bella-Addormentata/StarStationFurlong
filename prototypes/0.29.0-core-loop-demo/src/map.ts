@@ -7,6 +7,9 @@
  * long-distance travel system (v006 §8.2 / Phase 2 Feature 1 & 2).
  */
 
+import { DEFAULT_STATION_ID, currentStation, listStations, planetById } from './stations';
+import type { StationRecord } from './stations';
+
 export interface MapBody {
   id: string;
   name: string;
@@ -20,6 +23,35 @@ export interface MapBody {
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
+}
+
+/** Map radius of orbit slot 0 around a planet, and the step per slot. */
+const STATION_ORBIT_BASE = 35;
+const STATION_ORBIT_STEP = 9;
+
+/**
+ * 🪐 One map body per station, orbiting its planet (stations.ts). Slot 0
+ * keeps the radius, speed and phase the single hard-coded Furlong body had;
+ * each further slot sits a step farther out, a little slower, and spread
+ * around the planet so neighbours don't stack.
+ */
+export function stationBodies(stations: StationRecord[]): MapBody[] {
+  return stations.map((s) => {
+    const orbitRadius = STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP;
+    const planet = planetById(s.planetId);
+    return {
+      id: s.id,
+      name: s.name,
+      type: 'station' as const,
+      parentId: planet.id,
+      orbitRadius,
+      orbitSpeed: 0.015 * Math.pow(STATION_ORBIT_BASE / orbitRadius, 1.5),
+      angle: 2.1 + s.orbitSlot * 2.4,
+      description: s.id === DEFAULT_STATION_ID
+        ? 'Sovereign-serverless terminal, lounge, and trade hub for all clones.'
+        : `Station in orbit slot ${s.orbitSlot + 1} around ${planet.name}.`,
+    };
+  });
 }
 
 export class SolarSystemMap {
@@ -42,7 +74,7 @@ export class SolarSystemMap {
   
   // Selection / Travel tracking
   private selectedBody: MapBody | null = null;
-  private playerLocationId = 'furlong-station';
+  private playerLocationId = DEFAULT_STATION_ID;
   private travelDestination: MapBody | null = null;
   private departureTick = 0;
   private travelDurationTicks = 0; // calculated distance / speed ratio
@@ -87,16 +119,7 @@ export class SolarSystemMap {
         description: 'Carbon-silica rich terra planet holding Furlong System main station.',
         resources: [{ type: 'Silica', yield: 1200 }],
       },
-      {
-        id: 'furlong-station',
-        name: 'FURLONG LOBBY STATION',
-        type: 'station',
-        parentId: 'planet-sovereign',
-        orbitRadius: 35, // Distance from parent Planet Sovereign
-        orbitSpeed: 0.015,
-        angle: 2.1,
-        description: 'Sovereign-serverless terminal, lounge, and trade hub for all clones.',
-      },
+      ...stationBodies(listStations()),
       {
         id: 'lagrange-l4',
         name: 'SOVEREIGN L4 APEX',
@@ -638,6 +661,30 @@ export class SolarSystemMap {
   public getIrohNodeId(): string | undefined {
     const boot = this.getBootRecord();
     return boot ? boot.irohNodeId : undefined;
+  }
+
+  /**
+   * Re-read the station list (stations.ts) and mark the station the player is
+   * standing in. Called each time the holotable opens, so stations learned
+   * since the last look appear. A mock transit in progress keeps its own
+   * location until it lands.
+   */
+  public refreshStations(
+    stations: StationRecord[] = listStations(),
+    current: StationRecord | null = currentStation(),
+  ) {
+    this.bodies = [...this.bodies.filter((b) => b.type !== 'station'), ...stationBodies(stations)];
+    if (this.selectedBody && !this.bodies.some((b) => b.id === this.selectedBody!.id)) this.selectedBody = null;
+    if (!this.travelDestination && current) this.playerLocationId = current.id;
+  }
+
+  /** The station bodies now on the map, planet by planet (test/debug view). */
+  public stationIds(): string[] {
+    return this.bodies.filter((b) => b.type === 'station').map((b) => b.id);
+  }
+
+  public getPlayerLocationId(): string {
+    return this.playerLocationId;
   }
 
   public show() {
