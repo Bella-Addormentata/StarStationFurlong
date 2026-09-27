@@ -133,6 +133,10 @@ describe('planetLayout', () => {
     expect(Math.hypot(first.x, first.z)).toBeCloseTo(compressRadiusKm(plan.from.radiusKm, planet), 3);
     expect(Math.hypot(last.x, last.z)).toBeCloseTo(compressRadiusKm(plan.to.radiusKm, planet), 3);
 
+    const posesOnly = planetLayout({ ...base, nowMs: mid, ships: [{ id: 'ship', name: 'SHIP', plan }], withPaths: false });
+    expect(posesOnly.paths).toHaveLength(0);
+    expect(posesOnly.bodies[0].position).toEqual(flying.bodies[0].position);
+
     const waiting = planetLayout({ ...base, nowMs: plan.departAt - 1000, ships: [{ id: 'ship', name: 'SHIP', plan }] });
     expect(waiting.bodies).toHaveLength(0);
   });
@@ -166,6 +170,7 @@ describe('transitLayout', () => {
     expect(layout.planet).toBeNull();
     expect(layout.bodies.map((b) => b.kind).sort()).toEqual(['planet', 'planet', 'sun']);
     expect(layout.paths[0].points.length).toBeGreaterThan(10);
+    expect(transitLayout(move, (move.departAt + move.arriveAt) / 2, false)!.paths).toHaveLength(0);
     // The sun sits off the viewer's −X.
     const sun = applyFrameTransform(layout.transform, { x: 0, y: 0, z: 0 });
     expect(sun.x).toBeLessThan(0);
