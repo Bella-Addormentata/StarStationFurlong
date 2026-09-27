@@ -1193,7 +1193,9 @@ export function pushAtlasToDoc(): void {
     for (const entry of Object.values(atlas)) {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
-      if (!isOwn && doorIds.length === 0) continue; // stubs add no geometry
+      // Stubs add no geometry; ⚓🚦 one that knows a room's gates still has
+      // something to carry.
+      if (!isOwn && doorIds.length === 0 && entry.gates === undefined) continue;
       // 🛰️ Never publish what this install never observed: an entry the
       // build's bundled default station wrote (seedAtlasDefaults) would reach
       // every room we join as if we had seen it. The room we are standing in
@@ -1204,7 +1206,13 @@ export function pushAtlasToDoc(): void {
       if (entry.bundled) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
-      if (known && !isOwn
+      // ⚓🚦 A doc copy with no gates (an older client's, or a stub) gains the
+      // gates we know even when it is otherwise as new as ours: its own doors
+      // are kept, and only the gates are added.
+      const onlyGates = !!known && !isOwn && entry.gates !== undefined && known.gates === undefined
+        && known.updatedAt >= entry.lastSeen
+        && Object.keys(known.doors).length >= doorIds.length;
+      if (known && !isOwn && !onlyGates
         && known.updatedAt >= entry.lastSeen
         && Object.keys(known.doors).length >= doorIds.length) continue;
       const doors: SharedAtlasEntry['doors'] = {};
@@ -1227,8 +1235,9 @@ export function pushAtlasToDoc(): void {
       }
       const rec: SharedAtlasEntry = {
         roomId: entry.roomId,
-        name: entry.name,
-        doors,
+        name: onlyGates ? known!.name : entry.name,
+        doors: onlyGates ? known!.doors : doors,
+        ...(onlyGates && known!.dims ? { dims: known!.dims } : {}),
         // 🛑📐 Size travels with the connection graph. Without this a peer
         // renders every module it has not personally visited at the fallback
         // size, so the station's shape was only ever right for rooms you had

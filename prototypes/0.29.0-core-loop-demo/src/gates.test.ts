@@ -158,6 +158,30 @@ describe('the station atlas', () => {
   });
 });
 
+describe('gate gossip that doors alone would skip', () => {
+  it("adds our gates to a newer doc copy that has none, keeping its doors", () => {
+    twoRoomStation();
+    const doc = new Y.Doc();
+    // An older client's copy of room-b: newer than ours, as many doors, no gates.
+    const door = { targetRoomId: 'room-a', farDoor: 'east', transient: false };
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: Date.now() + 1000,
+      doors: { west: door, south: { targetRoomId: 'ship-1', transient: true } },
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    const b = doc.getMap('atlas').get('room-b') as { gates?: unknown; doors: Record<string, unknown> };
+    expect(b.gates).toEqual({ south: 2, east: 3 });
+    expect(b.doors.west).toEqual(door);
+  });
+
+  it('carries the gates of a room known without door pairings', () => {
+    harvestIntoAtlas({ roomId: 'room-lone', name: 'LONE', doors: [], gates: { north: 7 } });
+    const doc = new Y.Doc();
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect((doc.getMap('atlas').get('room-lone') as { gates?: unknown } | undefined)?.gates).toEqual({ north: 7 });
+  });
+});
+
 describe('the station record', () => {
   it('lists the station\'s gates as its berths, and names the lowest welcome-room gate as berthDoor', () => {
     twoRoomStation();

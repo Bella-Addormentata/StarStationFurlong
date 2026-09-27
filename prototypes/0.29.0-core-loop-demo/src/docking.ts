@@ -2011,17 +2011,30 @@ export class DoorDockingPortSystem {
       if (el.dataset.dockAction === "undock") void this.undockPort(doorId);
       else if (el.dataset.dockAction === "dock") void this.redockPort(doorId);
       else if (el.dataset.dockAction === "gate-down" || el.dataset.dockAction === "gate-up") {
-        // ⚓🚦 The owner renumbers a gate by hand (a duplicate is flagged in
-        // the row, never fixed behind their back). Owner only: a public
-        // build door or a granted builder may fit ports, not renumber gates.
+        // ⚓🚦 The owner renumbers a gate by hand, stepping over numbers other
+        // ports of the station use, so numbers stay unique and a station has
+        // at most MAX_GATE ports listed. (A duplicate that arrives some other
+        // way, such as two stations joined, is flagged in the row.) Owner
+        // only: a public build door or a granted builder may fit ports, not
+        // renumber gates.
         if (!this.isRoomOwner()) return;
         const policy = readDoorPolicy(doorId);
         if (!policy.adapter) return;
+        const roomId = this.roomNow();
+        const own = readDockGates();
         // A port fitted before gates existed gets the lowest free number first.
+        if (policy.gate === undefined) {
+          const first = freeGateNumber(readAtlas(), roomId, own);
+          if (first !== null) writeDoorPolicy(doorId, { ...policy, gate: first });
+          return;
+        }
+        const taken = new Set<number>();
+        for (const g of stationGates(readAtlas(), roomId)) if (g.roomId !== roomId) taken.add(g.gate);
+        for (const [d, g] of Object.entries(own)) if (d !== doorId) taken.add(g);
         const step = el.dataset.dockAction === "gate-up" ? 1 : -1;
-        const gate = policy.gate === undefined
-          ? freeGateNumber(readAtlas(), this.roomNow(), readDockGates()) ?? 1
-          : Math.min(MAX_GATE, Math.max(1, policy.gate + step));
+        let gate = policy.gate + step;
+        while (gate >= 1 && gate <= MAX_GATE && taken.has(gate)) gate += step;
+        if (gate < 1 || gate > MAX_GATE) return; // nothing free that way
         writeDoorPolicy(doorId, { ...policy, gate });
       } else if (el.dataset.dockAction === "gate-access") {
         // ⚓🚦 The owner decides who may dock here: OPEN → PASS (captains
