@@ -40,7 +40,6 @@ export interface StationBerth {
   reservedFor?: string;
 }
 
-/** One station a ship can fly to. */
 /** ⚓🚦 A gate this client cannot address: its room, door and policy. */
 export interface UnaddressedGate {
   roomId: string;
@@ -50,6 +49,7 @@ export interface UnaddressedGate {
   reservedFor?: string;
 }
 
+/** One station a ship can fly to. */
 export interface StationDestination {
   id: string;
   name: string;

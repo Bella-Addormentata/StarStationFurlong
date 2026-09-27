@@ -64,6 +64,9 @@ export interface TrimGone {
   readAt: number;
 }
 
+/** Rooms whose trim-gone readings a summary keeps (the newest, one each). */
+export const MAX_TRIM_GONE = 16;
+
 export interface StationSummary {
   welcomeRoomId: string;
   name: string;
@@ -89,7 +92,9 @@ export interface StationSummary {
    *  after it arrives so a late install still learns where it went. Matched
    *  to the station by its welcome room, so the writer's id never matters. */
   move?: StationMove;
-  trimGone?: TrimGone;
+  /** One reading per room (sorted by room, at most MAX_TRIM_GONE), so one
+   *  helm room's take-back never forgets another's. */
+  trimGone?: TrimGone[];
   /** The owning install's own id for its saved record, so a flight record
    *  written there (station ids are per install) still resolves here. */
   ownerId?: string;
@@ -161,13 +166,59 @@ function cleanExt(v: unknown): Record<string, unknown> | undefined {
   if (!isPlainObject(v)) return undefined;
   // The cap is on the extras alone (as stations.ts keeps them), not on the
   // record they came with.
+  // Peer-written: copied under a budget, so an oversized value is dropped
+  // before it is walked or serialized in full.
+  const budget = { left: MAX_EXT_JSON };
   const extras: Record<string, unknown> = {};
-  for (const [k, x] of Object.entries(v)) if (!KNOWN_FIELDS.has(k)) extras[k] = x;
+  for (const k in v) {
+    if (!Object.prototype.hasOwnProperty.call(v, k) || KNOWN_FIELDS.has(k)) continue;
+    budget.left -= k.length + 4;
+    const x = boundedJson(v[k], budget, 0);
+    if (x === TOO_BIG || budget.left < 0) return undefined;
+    if (x !== undefined) extras[k] = x;
+  }
   let json: string;
   try { json = JSON.stringify(extras); } catch { return undefined; }
   if (json.length > MAX_EXT_JSON) return undefined;
   const out = stripCredentials(JSON.parse(json)) as Record<string, unknown>;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const TOO_BIG = Symbol('too big');
+const MAX_EXT_DEPTH = 16;
+
+/** A JSON-only copy of `v`, charging `budget` about what its JSON costs;
+ *  TOO_BIG as soon as the budget or depth runs out, undefined for what JSON
+ *  leaves out. */
+function boundedJson(v: unknown, budget: { left: number }, depth: number): unknown {
+  if (budget.left < 0 || depth > MAX_EXT_DEPTH) return TOO_BIG;
+  if (v === null || typeof v === 'boolean') { budget.left -= 5; return v; }
+  if (typeof v === 'number') { budget.left -= 8; return Number.isFinite(v) ? v : null; }
+  if (typeof v === 'string') { budget.left -= v.length + 2; return budget.left < 0 ? TOO_BIG : v; }
+  if (Array.isArray(v)) {
+    if (v.length > budget.left) return TOO_BIG;
+    const out: unknown[] = [];
+    budget.left -= 2;
+    for (const x of v) {
+      const c = boundedJson(x, budget, depth + 1);
+      if (c === TOO_BIG) return TOO_BIG;
+      out.push(c === undefined ? null : c);
+      budget.left -= 1;
+    }
+    return out;
+  }
+  if (!isPlainObject(v)) return undefined;
+  const out: Record<string, unknown> = {};
+  budget.left -= 2;
+  for (const k in v) {
+    if (!Object.prototype.hasOwnProperty.call(v, k) || k === '__proto__') continue;
+    budget.left -= k.length + 4;
+    if (budget.left < 0) return TOO_BIG;
+    const c = boundedJson(v[k], budget, depth + 1);
+    if (c === TOO_BIG) return TOO_BIG;
+    if (c !== undefined) out[k] = c;
+  }
+  return out;
 }
 
 /** Field names that may carry a room's dial-in credentials (a seed, a pass,
@@ -198,9 +249,25 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
   };
 }
 
-function cleanTrimGone(v: unknown, now: number): TrimGone | undefined {
+function cleanOneGone(v: unknown, now: number): TrimGone | undefined {
   if (!isPlainObject(v) || !isId(v.from) || !isStamp(v.readAt, now)) return undefined;
   return { from: v.from, readAt: v.readAt };
+}
+
+/** Peer-sent take-backs, bounded before they are walked (one reading, as
+ *  the first builds sent, or a list). */
+function cleanTrimGone(v: unknown, now: number): TrimGone[] | undefined {
+  if (!Array.isArray(v)) {
+    const one = cleanOneGone(v, now);
+    return one ? [one] : undefined;
+  }
+  if (v.length > MAX_TRIM_GONE * 4) return undefined;
+  let out: TrimGone[] | undefined;
+  for (const x of v) {
+    const one = cleanOneGone(x, now);
+    if (one) out = mergeGone(out, [one]);
+  }
+  return out;
 }
 
 /** Shape guard + copy: a summary crosses the peer trust boundary. */
@@ -446,10 +513,11 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   // Only a trim of the orbit the standing record flies: one published for
   // the slot that lost would be dropped by every reader anyway.
   const fits = (t: SharedTrim | undefined) => (t && trimFor(base, t) ? t : undefined);
-  const gone = newerGone(prior.trimGone, incoming.trimGone);
-  let trim = newerTrim(fits(prior.trim), fits(incoming.trim));
+  const gone = mergeGone(prior.trimGone, incoming.trimGone);
   // A room's trim read before that room read none is taken back.
-  if (trim && gone && trim.from === gone.from && (trim.readAt ?? 0) < gone.readAt) trim = undefined;
+  const alive = (t: SharedTrim | undefined) =>
+    (t && (t.from === undefined || (t.readAt ?? 0) >= goneAt(gone, t.from)) ? t : undefined);
+  const trim = newerTrim(alive(fits(prior.trim)), alive(fits(incoming.trim)));
   const move = newerMove(prior.move, incoming.move);
   const gates = newerBerths(prior, incoming);
   const next: StationSummary = { ...base };
@@ -460,15 +528,45 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   delete next.berthsAt;
   delete next.berthRoomsAt;
   Object.assign(next, gates);
+  // The legacy berth follows the merged gates wherever they know the
+  // welcome room (as listStations does): its lowest gate there, or none.
+  if (gates.berths && roomStamps(gates).has(next.welcomeRoomId)) {
+    const inWelcome = gates.berths.filter((b) => b.roomId === next.welcomeRoomId);
+    if (!inWelcome.some((b) => b.doorId === next.berthDoor)) {
+      const lowest = inWelcome.reduce<StationBerthRecord | undefined>(
+        (best, b) => (!best || (b.gate ?? Infinity) < (best.gate ?? Infinity) ? b : best), undefined);
+      // In the place a cleaned summary keeps it, so equal records compare equal.
+      const { welcomeRoomId, name, planetId, orbitSlot, berthDoor: _stale, ...others } = next;
+      const moved: StationSummary = {
+        welcomeRoomId, name, planetId, orbitSlot, ...(lowest ? { berthDoor: lowest.doorId } : {}), ...others,
+      };
+      return JSON.stringify(moved) === JSON.stringify(prior) ? null : moved;
+    }
+  }
   return JSON.stringify(next) === JSON.stringify(prior) ? null : next;
 }
 
-/** The later of two "trim gone" readings (by when; ties by tieBreak). */
-function newerGone(a: TrimGone | undefined, b: TrimGone | undefined): TrimGone | undefined {
-  if (!a) return b;
-  if (!b) return a;
-  if (a.readAt !== b.readAt) return b.readAt > a.readAt ? b : a;
-  return tieBreak(a, b);
+/** Two lists of "trim gone" readings, room by room: the later reading of
+ *  each room; past the cap the newest rooms stay (ties by room), sorted by
+ *  room so every client settles on the same list. */
+function mergeGone(a: TrimGone[] | undefined, b: TrimGone[] | undefined): TrimGone[] | undefined {
+  if (!a?.length) return b?.length ? b : undefined;
+  if (!b?.length) return a;
+  const byRoom = new Map<string, TrimGone>();
+  for (const g of [...a, ...b]) {
+    const had = byRoom.get(g.from);
+    if (!had || g.readAt > had.readAt) byRoom.set(g.from, g);
+  }
+  const byName = (x: TrimGone, y: TrimGone) => (x.from < y.from ? -1 : x.from > y.from ? 1 : 0);
+  return [...byRoom.values()]
+    .sort((x, y) => y.readAt - x.readAt || byName(x, y))
+    .slice(0, MAX_TRIM_GONE)
+    .sort(byName);
+}
+
+/** When `room` last read no trim (0: never, as far as known). */
+function goneAt(gone: TrimGone[] | undefined, room: string): number {
+  return gone?.find((g) => g.from === room)?.readAt ?? 0;
 }
 
 function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipSummary | null {
@@ -607,7 +705,7 @@ export function foldOwnStation(
     if (kt && kt.from === firstHandRoom && core(kt) === core(trim)) return kt;
     const before = Math.max(
       kt && kt.from === firstHandRoom ? kt.readAt ?? 0 : 0,
-      known?.trimGone?.from === firstHandRoom ? known.trimGone.readAt : 0,
+      goneAt(known?.trimGone, firstHandRoom),
     );
     return { ...trim, from: firstHandRoom, readAt: past(before) };
   };
@@ -643,8 +741,8 @@ export function foldOwnStation(
   const applies = cleanTrim(trimFor(base, readTrim(known)));
   // This room now reads no trim where the known one was read here: that
   // trim was taken back, and the reading says so.
-  const gone: TrimGone | undefined = !trim && firstHandRoom !== undefined && known.trim?.from === firstHandRoom
-    ? { from: firstHandRoom, readAt: past(known.trim.readAt ?? 0) }
+  const gone: TrimGone[] | undefined = !trim && firstHandRoom !== undefined && known.trim?.from === firstHandRoom
+    ? [{ from: firstHandRoom, readAt: past(known.trim.readAt ?? 0) }]
     : undefined;
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);

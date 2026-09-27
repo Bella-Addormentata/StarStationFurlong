@@ -498,6 +498,18 @@ describe('the per-planet summary', () => {
     }
   });
 
+  it('moves the legacy berth to the welcome room\'s lowest merged gate, or drops it', () => {
+    const known = base({ berthDoor: 'south', berths: [{ roomId: 'room-b', doorId: 'south', gate: 1 }], berthsAt: T0 });
+    // The welcome room renumbered: south is gone, east and west are its gates.
+    const moved = mergeStation(known, base({
+      berths: [{ roomId: 'room-b', doorId: 'west', gate: 3 }, { roomId: 'room-b', doorId: 'east', gate: 2 }], berthsAt: T0 + 5,
+    }))!;
+    expect(moved.berthDoor).toBe('east');
+    // Then it lists none at all.
+    const none = mergeStation(moved, base({ berths: [], berthsAt: T0 + 9, berthRoomsAt: { 'room-b': T0 + 9 } }))!;
+    expect(none.berthDoor).toBeUndefined();
+  });
+
   it('shares gates without the local occupied flag', () => {
     const s = summaryForStation({
       id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b', derived: true,
