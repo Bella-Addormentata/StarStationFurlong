@@ -10,11 +10,14 @@ import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
   MAX_ORBIT_SLOTS,
+  currentStation,
   listStations,
   planetForRoom,
   readStationRecords,
   registerStation,
   removeStation,
+  setRoomStationResolver,
+  setStationRoomSource,
   stationForRoom,
   stationsAroundPlanet,
 } from './stations';
@@ -225,6 +228,36 @@ describe('stationForRoom / planetForRoom', () => {
     expect(stationForRoom('lounge', atlas)?.id).toBe(DEFAULT_STATION_ID);
     expect(stationForRoom('yard-b', atlas)?.id).toBe('station:yard-a');
     expect(stationForRoom('nowhere', atlas)).toBeNull();
+  });
+
+  it('places a docked ship at the station a resolver names, and falls back to the atlas', () => {
+    const atlas = atlasOf(room('b1'), room('ship'));
+    atlas.b1.doors['d:port'] = { targetSeed: '', targetRoomId: 'ship', transient: true };
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    // The berth is not structure: by the atlas alone the ship is a place of its own.
+    expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+    expect(planetForRoom('ship', atlas).id).toBe(DEFAULT_PLANET_ID);
+    try {
+      // Ship travel knows the room the dock leads into, and asks the atlas about it.
+      let calls = 0;
+      setRoomStationResolver((roomId) => {
+        calls++;
+        return roomId === 'ship' ? stationForRoom('b1', atlas)?.id ?? null : null;
+      });
+      expect(stationForRoom('ship', atlas)?.id).toBe('aris-yard');
+      expect(calls).toBe(1); // its own lookup went straight to the atlas
+      expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
+      setStationRoomSource(() => 'ship');
+      expect(currentStation()?.id).toBe('aris-yard');
+      // A station that is not listed, or a resolver that throws, falls back to the atlas.
+      setRoomStationResolver(() => 'nowhere');
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      setRoomStationResolver(() => { throw new Error('no dock'); });
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+    } finally {
+      setRoomStationResolver(null);
+      setStationRoomSource(() => '');
+    }
   });
 
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {

@@ -251,14 +251,44 @@ export function stationsAroundPlanet(planetId: string, stations: StationRecord[]
   return stations.filter((s) => s.planetId === planetId).sort((a, b) => a.orbitSlot - b.orbitSlot);
 }
 
-/** The station a room belongs to: the one whose welcome room shares the
- *  room's atlas component, or null when the atlas does not know the room. */
+// ── Rooms the atlas cannot place ─────────────────────────────────────────────
+
+let roomStationResolver: ((roomId: string) => string | null) | null = null;
+let resolvingRoom = false;
+
+/** Install (or remove, with null) a resolver that names the station a room is
+ *  at when the atlas cannot say: a DOCKED SHIP. Its berth is not structure,
+ *  so the atlas keeps the ship apart from the station it is docked at; ship
+ *  travel knows the station its live dock leads into. stationForRoom — and so
+ *  planetForRoom and currentStation — asks it first. A null answer, a station
+ *  that is not listed, or a throw falls back to the atlas, and so does any
+ *  lookup the resolver makes itself. */
+export function setRoomStationResolver(resolver: ((roomId: string) => string | null) | null): void {
+  roomStationResolver = resolver;
+}
+
+/** The station a room belongs to: the one the room-station resolver names,
+ *  else the one whose welcome room shares the room's atlas component, or null
+ *  when neither knows the room. */
 export function stationForRoom(
   roomId: string,
   atlas: Record<string, AtlasEntry> = readAtlas(),
   stations: StationRecord[] = listStations(atlas),
 ): StationRecord | null {
   if (!roomId) return null;
+  if (roomStationResolver && !resolvingRoom) {
+    let id: string | null = null;
+    resolvingRoom = true;
+    try {
+      id = roomStationResolver(roomId);
+    } catch {
+      id = null;
+    } finally {
+      resolvingRoom = false;
+    }
+    const placed = id ? stations.find((s) => s.id === id) : undefined;
+    if (placed) return placed;
+  }
   const direct = stations.find((s) => s.welcomeRoomId === roomId);
   if (direct) return direct;
   const component = atlasComponents(atlas).find((c) => c.has(roomId));
