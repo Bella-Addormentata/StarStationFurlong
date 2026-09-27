@@ -182,6 +182,14 @@ export function shipDocBound(): boolean {
   return docAlive();
 }
 
+/** 🚏 The bound doc and its `ship` map, for the ship's other records kept in
+ *  this map under their own keys (shipRoute.ts: the route and its
+ *  checkpoints), or null while unbound. Old clients only ever `get` fuel,
+ *  flight and berths, so new keys here are invisible to them. */
+export function shipDocHandle(): { doc: Y.Doc; map: Y.Map<unknown> } | null {
+  return docAlive() ? { doc: boundDoc!, map: shipMap! } : null;
+}
+
 // ── Shape guards (values cross a trust boundary — see module header) ─────────
 
 const FLIGHT_STATUSES: readonly FlightStatus[] = ['docked', 'undocking', 'in-flight', 'redocking'];
@@ -346,6 +354,16 @@ export function readFuelLevel(capacity = Number.POSITIVE_INFINITY): number {
   // every reader would fail-open otherwise. Clamp to [0, +∞) at the boundary;
   // capacity clamp is a caller responsibility (see clampFuelToCapacity).
   return Math.max(0, held - drawnSince);
+}
+
+/** 🚏 The level the fuel record stores, before any draw meter comes off (0
+ *  when there is none or it is malformed). A meter whose consumer derives
+ *  its own level (shipRoute.ts's route meter) reads how far below this the
+ *  tank should stand; everything else reads readFuelLevel. */
+export function readStoredFuelLevel(): number {
+  if (!docAlive()) return 0;
+  const raw = shipMap!.get('fuel');
+  return isFuelRecord(raw) ? Math.max(0, raw.level) : 0;
 }
 
 /** Fuel level clamped against the CURRENT derived capacity (tanks removed
