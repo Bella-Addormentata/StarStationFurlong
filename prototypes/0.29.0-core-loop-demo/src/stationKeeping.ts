@@ -466,7 +466,10 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
   // before them, so it applies at the time of their last one.
   const frontier = start ? start.at : Number.NEGATIVE_INFINITY;
   for (const burn of sorted) {
-    if (fuelDrawn + burn.fuel > ceiling(burn.cap ?? Number.POSITIVE_INFINITY)) continue;
+    // Never past what a meter reading can hold: a reading past it counts as
+    // none, which would refund every burn before it.
+    const limit = Math.min(FUEL_METER_MAX, ceiling(burn.cap ?? Number.POSITIVE_INFINITY));
+    if (fuelDrawn + burn.fuel > limit) continue;
     fuelDrawn += burn.fuel;
     trim = applyBurn(trim, burn.at < frontier ? { ...burn, at: frontier } : burn) ?? trim;
     fired.push(burn);
@@ -480,11 +483,12 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
  * `start`'s last burn (one that reached us after a level write settled the
  * burns `start` sums up) applies at that burn's time. A burn the fuel cannot
  * cover, one that would take the fuel drawn past `ceiling`
- * (shipDoc.fuelCeiling, by the capacity the burn was made against), is
- * dropped: it neither moves the orbit nor takes fuel, and the burns after it
- * still get their turn. A burn that would leave the band changes nothing but
- * still pays — its fuel burned wherever it fired, and a burn that arrives
- * late (from a tab that was offline) must never make an earlier one free.
+ * (shipDoc.fuelCeiling, by the capacity the burn was made against) or past
+ * what a meter reading can hold (FUEL_METER_MAX), is dropped: it neither
+ * moves the orbit nor takes fuel, and the burns after it still get their
+ * turn. A burn that would leave the band changes nothing but still pays — its
+ * fuel burned wherever it fired, and a burn that arrives late (from a tab
+ * that was offline) must never make an earlier one free.
  */
 export function replayBurns(
   burns: readonly TrimBurn[],
@@ -745,8 +749,9 @@ function leastOf<T>(limit: number, order: (a: T, b: T) => number): { push(item: 
  *  log), then the burns the settlement does not cover, in burn order — at
  *  most MAX_LOG of them, the rest waiting for the next level write —
  *  dropping those the fuel cannot cover. Malformed entries are skipped,
- *  the same on every client. The scan keeps no more entries than it takes,
- *  however many a peer writes. */
+ *  the same on every client, and a key no settlement could name is left
+ *  out altogether. The scan keeps no more entries than it takes, however
+ *  many a peer writes. */
 function replayLog(ceiling: BurnCeiling): RoomReplay {
   const map = keepMap!;
   const raw = readFuelSettlement(METER);
@@ -767,7 +772,9 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   const junk = leastOf<string>(MAX_SETTLED_BURNS, keyOrder);
   let waiting = 0;
   map.forEach((v, key) => {
-    if (!key.startsWith(BURN_KEY_PREFIX)) return;
+    // Settling a key longer than a settlement may name would void the
+    // settlement (isKeepingSettlement), so such an entry never counts.
+    if (!key.startsWith(BURN_KEY_PREFIX) || key.length > MAX_BURN_KEY_LEN) return;
     if (covered.has(key)) settledKeys.push(key);
     else if (isTrimBurn(v)) {
       waiting += 1;

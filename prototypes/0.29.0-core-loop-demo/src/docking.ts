@@ -3868,7 +3868,15 @@ export class DoorDockingPortSystem {
       }
       // 🚚 Nor while either end's station is between planets (stationMove.ts):
       // this room, and the room the request comes from.
-      const farRoom = state.connectedRoomAddress ? roomIdFromSeed(state.connectedRoomAddress) : '';
+      // A peer's address that does not parse refuses the pairing (left
+      // pending, like the other refusals here), never throws out of ACCEPT.
+      let farRoom = '';
+      try {
+        farRoom = state.connectedRoomAddress ? roomIdFromSeed(state.connectedRoomAddress) : '';
+      } catch (err) {
+        console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — unreadable address`, err);
+        return;
+      }
       if (dockLockedByMove([this.roomNow(), farRoom], Date.now())) {
         console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — station in transit`);
         return;

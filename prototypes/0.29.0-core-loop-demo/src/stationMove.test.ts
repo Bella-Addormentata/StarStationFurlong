@@ -46,6 +46,7 @@ import {
   isStationMove,
   movePhase,
   moveFuelCost,
+  quoteMove,
   planStationMove,
   readMoveFuelDrawn,
   readRememberedMoves,
@@ -131,6 +132,8 @@ describe('planning a thruster move', () => {
   it('refuses in the helm\'s order', () => {
     expect(planStationMove(ctx({ bolted: false }), ARIS)).toMatchObject({ ok: false, refusal: 'not-bolted' });
     expect(planStationMove(ctx({ station: null }), ARIS)).toMatchObject({ ok: false, refusal: 'no-station' });
+    expect(planStationMove(ctx({ modules: 0 }), ARIS)).toMatchObject({ ok: false, refusal: 'unknown-layout', quote: null });
+    expect(quoteMove(ctx().station, ctx().stations, ARIS, 0, NOW)).toBeNull();
     expect(planStationMove(ctx({ commander: false }), ARIS)).toMatchObject({ ok: false, refusal: 'not-commander' });
     expect(planStationMove(ctx(), SOV)).toMatchObject({ ok: false, refusal: 'same-planet' });
     expect(planStationMove(ctx({ engines: 0 }), ARIS)).toMatchObject({ ok: false, refusal: 'no-thrusters' });
@@ -885,6 +888,11 @@ describe('tugs: a torch tow', () => {
     const docked = { status: 'docked' };
     expect(cancelTowLeftBehind('tug-room', docked, NOW + 1, (w) => w === a.welcomeRoomId)).toBe(true);
     expect(readMoveFuelDrawn()).toBe(a.fuel);
+    // The tow still under way holds the tug, whichever record sorts first,
+    // with nothing remembered on this install.
+    store.clear();
+    expect(isTowing('tug-room', NOW + 1)).toBe(true);
+    expect(towHoldsDock(['tug-room'], NOW + 1)).toBe(true);
     // The tug flies off: the first is cancelled too.
     expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 2)).toBe(true);
     expect(readMoveFuelDrawn()).toBe(0);
@@ -946,7 +954,7 @@ describe('tugs: a torch tow', () => {
 });
 
 describe('the move log stays bounded', () => {
-  const keys = (doc: Y.Doc) => [...doc.getMap('stationKeeping').keys()];
+  const keys = (doc: Y.Doc) => [...doc.getMap('stationMoves').keys()];
   const hop = (k: number, fuel: number, drawn: number): StationMove => {
     const at = NOW + k * 10 * 86_400_000;
     return {
@@ -980,7 +988,7 @@ describe('the move log stays bounded', () => {
     const doc = new Y.Doc();
     bindStationMoveDoc(doc);
     writeStationMove(hop(0, 10, 10));
-    const map = doc.getMap('stationKeeping');
+    const map = doc.getMap('stationMoves');
     map.set('moveSettled:9:1', { through: Date.now(), drawn: 0 });
     map.set('moveSettled:9:2', { n: 2, drawn: 1e15, floor: 0 });
     map.set('moveSettled:9:3', { n: 1.5, drawn: 3, floor: 0 });
@@ -994,7 +1002,7 @@ describe('the move log stays bounded', () => {
     // Writer 11 wrote three yard moves; replica B has only seen the first two.
     const x = new Y.Doc();
     x.clientID = 11;
-    const xs = x.getMap('stationKeeping');
+    const xs = x.getMap('stationMoves');
     xs.set(`move:11:${hop(0, 0, 0).departAt}`, hop(0, 10, 10));
     xs.set(`move:11:${hop(1, 0, 0).departAt}`, hop(1, 20, 30));
     const early = Y.encodeStateAsUpdate(x);
@@ -1006,8 +1014,8 @@ describe('the move log stays bounded', () => {
     writeStationMove({ ...hop(3, 7, 42), stationId: 'dock-a', welcomeRoomId: 'dock-a-room' });
     bindStationMoveDoc(b);
     writeStationMove({ ...hop(3, 7, 37), stationId: 'dock-b', welcomeRoomId: 'dock-b-room' });
-    expect([...a.getMap('stationKeeping').keys()]).toContain('moveSettled:11:2');
-    expect([...b.getMap('stationKeeping').keys()]).toContain('moveSettled:11:1');
+    expect([...a.getMap('stationMoves').keys()]).toContain('moveSettled:11:2');
+    expect([...b.getMap('stationMoves').keys()]).toContain('moveSettled:11:1');
     // They meet: the larger record covers the smaller, and nothing is lost.
     for (const [from, to] of [[a, b], [b, a], [x, a], [a, x]]) Y.applyUpdate(to, Y.encodeStateAsUpdate(from));
     for (const d of [a, b, x]) Y.applyUpdate(d, Y.encodeStateAsUpdate(a));
@@ -1016,13 +1024,13 @@ describe('the move log stays bounded', () => {
       bindStationMoveDoc(d);
       expect(readMoveFuelDrawn()).toBe(10 + 20 + 5 + 7 + 7);
     }
-    expect([...a.getMap('stationKeeping').keys()].filter((k) => k.startsWith('move:11:'))).toEqual([`move:11:${hop(2, 0, 0).departAt}`]);
+    expect([...a.getMap('stationMoves').keys()].filter((k) => k.startsWith('move:11:'))).toEqual([`move:11:${hop(2, 0, 0).departAt}`]);
   });
 
   it('reads a bounded number of keys and clears junk a peer wrote', () => {
     const doc = new Y.Doc();
     bindStationMoveDoc(doc);
-    const map = doc.getMap('stationKeeping');
+    const map = doc.getMap('stationMoves');
     for (let i = 0; i < 1000; i++) map.set(`move:666:${i}`, { junk: i });
     expect(readMoveFuelDrawn()).toBe(0);
     writeStationMove(hop(0, 10, 10));
@@ -1043,7 +1051,7 @@ describe('the move log stays bounded', () => {
     writeStationMove(m);
     writeStationMove(next);
     writeStationMove({ ...at(t0 + 4 * 3_600_000, 7, 7, t0 + 3 * 3_600_000), stationId: 'dock', welcomeRoomId: 'dock-room' });
-    const settled = [...doc.getMap('stationKeeping').entries()].filter(([k]) => k.startsWith('moveSettled:'));
+    const settled = [...doc.getMap('stationMoves').entries()].filter(([k]) => k.startsWith('moveSettled:'));
     expect(settled).toHaveLength(1);
     expect((settled[0][1] as { recent: StationMove[] }).recent).toEqual([m]);
     expect(readMoveFuelDrawn()).toBe(10 + 5 + 7);
@@ -1051,7 +1059,7 @@ describe('the move log stays bounded', () => {
     // wins; its entry reaches this room only now.
     const rival: StationMove = { ...m, departAt: m.departAt + 1, arriveAt: m.arriveAt + 1, toSlot: m.toSlot + 1, fuel: 3, fuelDrawn: 3 };
     expect(compareMoves(rival, m)).toBeGreaterThan(0);
-    doc.getMap('stationKeeping').set(`move:99:${rival.departAt}:yard-room`, rival);
+    doc.getMap('stationMoves').set(`move:99:${rival.departAt}:yard-room`, rival);
     expect(readMoveFuelDrawn()).toBe(3 + 5 + 7);
   });
 

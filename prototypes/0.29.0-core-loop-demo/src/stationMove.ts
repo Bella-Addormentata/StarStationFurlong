@@ -27,8 +27,9 @@
  * `from` is where the last one arrived). Only the latest move per station is
  * kept.
  *
- * Storage: the `stationKeeping` map in the HELM ROOM's doc, one entry per
- * move (`move:<clientID>:<departAt>:<station>`, beside the trim burns) — shared by
+ * Storage: the `stationMoves` map in the HELM ROOM's doc, one entry per
+ * move (`move:<clientID>:<departAt>:<station>`; older builds' single record
+ * sits under `stationKeeping`'s 'move' key) — shared by
  * everyone in the room. Two moves written at once both land; compareMoves
  * picks the one that flies, the same everywhere, and only its fuel is drawn. Station records are
  * still kept per install, so each install also REMEMBERS every move it has
@@ -210,6 +211,7 @@ export type MoveRefusal =
   | 'same-planet' // already there: use the trim stick
   | 'no-slot' // every orbit around the destination is taken
   | 'no-thrusters' // no engine block on this module
+  | 'unknown-layout' // this install does not know the station's modules yet
   | 'no-fuel'; // not enough propellant for both burns
 
 export interface MoveContext {
@@ -227,7 +229,8 @@ export interface MoveContext {
   /** What the tank's meter owes its level (shipDoc.fuelDrawDeficit), added
    *  to this draw. */
   deficit: number;
-  /** Modules in the station (its atlas component): the mass the burns push. */
+  /** Modules in the station (its atlas component): the mass the burns push;
+   *  0 when this install does not know its layout, and no move is priced. */
   modules: number;
   now: number;
 }
@@ -267,7 +270,9 @@ export function quoteMove(
   modules: number,
   now: number,
 ): MoveQuote | null {
-  if (!station) return null;
+  // No quote for a layout this install cannot see (0 modules): a price
+  // clamped to one module would undercharge the move.
+  if (!station || !(modules >= 1)) return null;
   const to = planetById(toPlanetId).id;
   if (to === planetById(station.planetId).id) return null;
   const toSlot = freeSlotAround(to, stations, station.id);
@@ -290,6 +295,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
+  if (!(ctx.modules >= 1)) return { ok: false, refusal: 'unknown-layout', quote: null };
   const quote = quoteMove(station, ctx.stations, toPlanetId, ctx.modules, now);
   if (!quote) return { ok: false, refusal: 'no-slot', quote: null };
   if (ctx.engines < 1) return { ok: false, refusal: 'no-thrusters', quote };
@@ -521,8 +527,9 @@ export function describeTowRefusal(refusal: TowRefusal, quote: TowQuote | null, 
 
 /** Is this room's own tow under way (or about to leave)? Its ship holds. */
 export function isTowing(roomId: string, realMs: number): boolean {
-  const move = readStationMove();
-  return !!move && move.mode === 'tug' && move.tugRoomId === roomId && isMoveActive(move, realMs);
+  // Every station's standing move: a tug room can hold several stations'
+  // tows, and another station's pin may sort above an active one.
+  return roomStanding().some((m) => m.mode === 'tug' && m.tugRoomId === roomId && isMoveActive(m, realMs));
 }
 
 /** Does a move hold this dock still? A tug's tow under way (either end), or
@@ -546,8 +553,7 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
 export function towHoldsDock(roomIds: string[], realMs: number): boolean {
   const ids = new Set(roomIds.filter(Boolean));
   if (ids.size === 0) return false;
-  const bound = readStationMove();
-  return [...(bound ? [bound] : []), ...readRememberedMoves()].some((m) =>
+  return [...roomStanding(), ...readRememberedMoves()].some((m) =>
     m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
 }
 
@@ -658,6 +664,7 @@ export function describeMoveRefusal(refusal: MoveRefusal, quote: MoveQuote | nul
     case 'moving': return 'A move is already scheduled or under way.';
     case 'same-planet': return 'The station already orbits that planet: use the trim stick.';
     case 'no-slot': return 'Every orbit around that planet is taken.';
+    case 'unknown-layout': return 'This helm does not know the station\'s layout yet, so the move cannot be priced.';
     case 'no-thrusters': return 'Fit an ENGINE BLOCK to this module to burn for another planet.';
     case 'no-fuel': return `Needs ${quote?.fuel ?? '?'} fuel for both burns; ${Math.floor(fuel)} aboard. Fit more FUEL TANKs and refuel, or wait for a tug.`;
   }
@@ -748,7 +755,13 @@ export function installStationMoveResolver(): void {
 // ── The room doc ─────────────────────────────────────────────────────────────
 
 let boundDoc: Y.Doc | null = null;
+/** The room's 'stationKeeping' map: only the legacy 'move' record is read
+ *  from it now. */
 let keepMap: Y.Map<unknown> | null = null;
+/** The room's 'stationMoves' map: the move log (entries and settled records)
+ *  on its own, so its bounded scan never walks the trim burn log or anything
+ *  else a peer writes beside it. */
+let moveMap: Y.Map<unknown> | null = null;
 let unobserve: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
@@ -759,10 +772,10 @@ function notify(): void {
 }
 
 function docAlive(): boolean {
-  return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && keepMap !== null;
+  return boundDoc !== null && !(boundDoc as { isDestroyed?: boolean }).isDestroyed && keepMap !== null && moveMap !== null;
 }
 
-/** Prefix of a move's own entry in the room's 'stationKeeping' map: one
+/** Prefix of a move's own entry in the room's 'stationMoves' map: one
  *  entry per move written (`move:<clientID>:<departAt>:<station>`), never rewritten,
  *  so two moves written at once from two tabs (or an offline one) both land
  *  and one order decides between them everywhere. */
@@ -841,10 +854,11 @@ function roomMoves(): {
   const keyed: Array<{ key: string; move: StationMove }> = [];
   const stale: string[] = [];
   let scanned = 0;
-  for (const [k, v] of keepMap!.entries()) {
-    const isSettled = k.startsWith(SETTLED_PREFIX);
-    if (!isSettled && !k.startsWith(ENTRY_PREFIX)) continue;
+  for (const [k, v] of moveMap!.entries()) {
+    // Every key visited counts, whatever it holds: the walk itself is bounded.
     if (++scanned > MOVE_SCAN_MAX) break;
+    const isSettled = k.startsWith(SETTLED_PREFIX);
+    if (!isSettled && !k.startsWith(ENTRY_PREFIX)) { stale.push(k); continue; }
     if (isSettled) {
       if (!isSettledMoves(v)) { stale.push(k); continue; }
       const w = writerOf(k, SETTLED_PREFIX);
@@ -994,7 +1008,7 @@ function recentMoves(settled: Map<string, SettledMoves>): StationMove[] {
  *  bounded by the moves of about a day. */
 function pruneMoveLog(now: number): void {
   const { entries, keyed, legacy, settled, stale } = roomMoves();
-  for (const k of stale) keepMap!.delete(k);
+  for (const k of stale) moveMap!.delete(k);
   const own = legacy ? [legacy, ...entries] : entries;
   const known = knownMoves([...own, ...recentMoves(settled)]);
   const through = now - MOVE_LOG_KEEP_MS;
@@ -1035,7 +1049,7 @@ function pruneMoveLog(now: number): void {
     // already beaten was never paid and is dropped.
     const recent = [...(had?.recent ?? [])];
     for (const e of gone) {
-      keepMap!.delete(e.key);
+      moveMap!.delete(e.key);
       const id = JSON.stringify(e.move);
       if (counted.has(id) || superseded(e.move, known)) continue;
       counted.add(id);
@@ -1051,8 +1065,8 @@ function pruneMoveLog(now: number): void {
       floor = Math.max(floor, m.fuelDrawn);
     }
     const n = (had?.n ?? 0) + gone.length;
-    if (had) keepMap!.delete(had.key);
-    keepMap!.set(`${SETTLED_PREFIX}${w}:${n}`, {
+    if (had) moveMap!.delete(had.key);
+    moveMap!.set(`${SETTLED_PREFIX}${w}:${n}`, {
       n,
       drawn: Math.min(FUEL_METER_MAX, drawn),
       floor: Math.min(FUEL_METER_MAX, floor),
@@ -1068,7 +1082,9 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
   unobserve?.();
   boundDoc = doc;
   const map = doc.getMap('stationKeeping');
+  const moves = doc.getMap('stationMoves');
   keepMap = map;
+  moveMap = moves;
   roomVersion++;
   const onChange = () => {
     roomVersion++;
@@ -1077,8 +1093,12 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
     for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
     notify();
   };
-  map.observe(onChange);
-  unobserve = () => map.unobserve(onChange);
+  // The legacy record rides 'stationKeeping'; every trim burn changes that
+  // map too, so only a change to the legacy key counts there.
+  const onKeep = (e: Y.YMapEvent<unknown>) => { if (e.keysChanged.has(LEGACY_KEY)) onChange(); };
+  map.observe(onKeep);
+  moves.observe(onChange);
+  unobserve = () => { map.unobserve(onKeep); moves.unobserve(onChange); };
   setFuelDrawMeter('stationMove', { read: readMoveFuelDrawn, subscribe: subscribeStationMove });
   onChange();
 }
@@ -1099,7 +1119,7 @@ export function writeStationMove(move: StationMove): boolean {
   boundDoc!.transact(() => {
     pruneMoveLog(Date.now());
     // One key per move: a writer's moves of two stations can leave at once.
-    keepMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}:${clean.welcomeRoomId || clean.stationId}`, clean);
+    moveMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}:${clean.welcomeRoomId || clean.stationId}`, clean);
   });
   rememberMove(clean);
   return true;

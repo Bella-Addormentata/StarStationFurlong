@@ -67,7 +67,7 @@ import {
   type RouteDraft, type RouteStopCandidate,
 } from './helmRoute';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { adriftPlace, destinationsFrom, isKnownStation, localStationId, planHop, stationHere } from './stationDirectory';
+import { adriftAt, adriftPlace, destinationsFrom, isKnownStation, localStationId, planHop, stationHere } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
 import {
   TUG_MIN_ENGINES,
@@ -241,6 +241,14 @@ import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
+
+/** 🚚 A flight's `destinationAt`: where the station orbits as the ship casts
+ *  off, as an open-orbit place; nothing for a station this install cannot
+ *  list. */
+function destinationAtOf(stationId: string): { destinationAt?: string } {
+  const st = listStationRecordsNow().find((r) => r.id === stationId);
+  return st ? { destinationAt: adriftAt(planetById(st.planetId).id, st.orbitSlot) } : {};
+}
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -2859,6 +2867,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         etaAt: nowHop.arriveAt,
         // A whole ms, no later than the burn (flight times are whole ms).
         castOffAt: Math.floor(Math.min(Date.now(), nowHop.departAt)),
+        // Where the destination orbits now: arrival compares against it.
+        ...destinationAtOf(dest.id),
       };
       let departed = false;
       if (nowResolved.route) {
@@ -3725,7 +3735,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
-      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt });
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt, destinationAt: rec.destinationAt });
     }
     if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };

@@ -590,7 +590,22 @@ export function foldOwnStation(
 ): StationSummary | null {
   const mine = summaryForStation(station, trim, now);
   const owned = isOwned(station);
-  if (!known) return mine;
+  const past = (at: number) => Math.min(Math.max(now, at + 1), now + MAX_SKEW_MS);
+  /** This client's whole gate list as news: only the room it stands in is
+   *  read first-hand (stamped `at`, a tombstone when it lists none); the
+   *  atlas's other rooms go out stamped 0, so any peer's reading beats them. */
+  const wholeList = (at: number): Gates => {
+    if (!mine.berths) return {};
+    const read = new Map<string, number>();
+    for (const room of roomStamps(mine).keys()) read.set(room, 0);
+    if (firstHandRoom !== undefined) read.set(firstHandRoom, at);
+    const rooms = canonRoomStamps(mine.berths, at, read);
+    return { berths: mine.berths, berthsAt: at, ...(rooms ? { berthRoomsAt: rooms } : {}) };
+  };
+  if (!known) {
+    const { berths: _b0, berthsAt: _ba0, berthRoomsAt: _bra0, ...first } = mine;
+    return { ...first, ...wholeList(now) };
+  }
   // The owner id is per install: another install's identical record is the
   // same record, not news to republish over.
   const recordOnly = (a: StationSummary) => JSON.stringify({
@@ -611,23 +626,25 @@ export function foldOwnStation(
   // part of it is replaced (and a new list goes out stamped past the known
   // one); a station with no known list takes this client's whole one.
   // That room is stamped past what is known of it; the others keep their
-  // own stamps, so the merge takes only this room's part as news.
-  const past = (at: number) => Math.min(Math.max(now, at + 1), now + MAX_SKEW_MS);
-  let gates: Gates = gatesOf(base);
-  if (mine.berths && base.berths && firstHandRoom !== undefined) {
-    const listed = firstHandBerths(base.berths, mine.berths, firstHandRoom);
-    const known = roomStamps(base);
+  // own stamps, so the merge takes only this room's part as news. The gate
+  // list merges on its own: it starts from what is known, whichever record
+  // stands (an owned record's edit is not news about the gates).
+  let gates: Gates = gatesOf(known);
+  if (mine.berths && known.berths && firstHandRoom !== undefined) {
+    const listed = firstHandBerths(known.berths, mine.berths, firstHandRoom);
+    const stamps = roomStamps(known);
     const mineHere = JSON.stringify(mine.berths.filter((b) => b.roomId === firstHandRoom));
-    const knownHere = JSON.stringify(base.berths.filter((b) => b.roomId === firstHandRoom));
+    const knownHere = JSON.stringify(known.berths.filter((b) => b.roomId === firstHandRoom));
     if (mineHere !== knownHere) {
-      const at = past(known.get(firstHandRoom) ?? base.berthsAt ?? 0);
-      known.set(firstHandRoom, at);
-      const berthsAt = Math.max(base.berthsAt ?? 0, at);
-      const rooms = canonRoomStamps(listed, berthsAt, known);
+      const at = past(stamps.get(firstHandRoom) ?? known.berthsAt ?? 0);
+      stamps.set(firstHandRoom, at);
+      const berthsAt = Math.max(known.berthsAt ?? 0, at);
+      const rooms = canonRoomStamps(listed, berthsAt, stamps);
       gates = { berths: listed, berthsAt, ...(rooms ? { berthRoomsAt: rooms } : {}) };
     }
-  } else if (mine.berths && JSON.stringify(mine.berths) !== JSON.stringify(base.berths)) {
-    gates = { berths: mine.berths, berthsAt: past(base.berthsAt ?? 0) };
+  } else if (mine.berths && !known.berths) {
+    // No list known yet: this client's, read as wholeList says.
+    gates = wholeList(past(0));
   }
   const { trim: _unused, move: _unusedMove, berths: _b, berthsAt: _ba, berthRoomsAt: _bra, ...rest } = base;
   // A new move freshens an owned summary's stamp too (an unowned record keeps

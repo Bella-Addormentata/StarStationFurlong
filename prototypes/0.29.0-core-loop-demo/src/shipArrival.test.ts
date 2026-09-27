@@ -4,6 +4,7 @@
 // near-side writes as docking.ts's UNDOCK / DOCK.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { listStations } from './stations';
 import * as Y from 'yjs';
 import { setStationRoomSource } from './stations';
 import { dockChain } from './adapter';
@@ -324,6 +325,19 @@ describe('a round trip', () => {
     expect(north.kind === 'docked' && north.record.farWall).toBe('x-');
     // The berth left behind is still remembered for the trip home.
     expect(readStationBerth('furlong-station')?.roomId).toBe(FURLONG_ROOM);
+  });
+
+  it('waits where the destination was at cast-off once it has moved on, however many moves', () => {
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    // At cast-off Furlong orbited another slot (it has since moved, and
+    // moved again: the directory keeps only its latest move, if any).
+    const then = adriftAt(home.planetId, (home.orbitSlot + 3) % 16);
+    writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    writeFlightRecord({ status: 'redocking', locationId: 'furlong-station', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    expect(readFlightRecord().destinationAt).toBe(then);
+    expect(completeArrival(fakeDocking(['north']), { now, force: true })).toMatchObject({ kind: 'none', reason: 'in-transit' });
+    expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: then });
   });
 
   it('stays undocked at a station that left for another planet mid-flight', () => {

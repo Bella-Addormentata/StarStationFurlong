@@ -11,6 +11,7 @@ import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, setStationTrimResolver, stationOrbit, wrapAngle } from './orbits';
 import {
+  FUEL_METER_MAX,
   bindShipDoc,
   clampFuelToCapacity,
   fuelCeiling,
@@ -1015,6 +1016,41 @@ describe('level writes settle the log', () => {
     expect(readFuelSettlement(SK)).toEqual(settled);
     bindRoom(doc);
     expect(readOrbitTrim()).toEqual((settled as KeepingSettlement).trim);
+  });
+
+  it('never takes the meter past what a reading can hold', () => {
+    // Copilot's review of #173: a reading past FUEL_METER_MAX counts as none,
+    // so one more burn refunded every burn before it and voided the
+    // settlement.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    doc.getMap('stationKeeping').set('trim', trim({ fuelDrawn: FUEL_METER_MAX }));
+    doc.getMap('ship').set('fuel', { level: 1e15 });
+    const gauge = readFuelLevel();
+    expect(gauge).toBe(1e15 - FUEL_METER_MAX);
+    doc.getMap('stationKeeping').set('burn:peer:1', burnAt(T0 + HOUR, 'raise'));
+    expect(readFuelDrawn()).toBe(FUEL_METER_MAX);
+    expect(readOrbitTrim()).toEqual(trim());
+    expect(readFuelLevel()).toBe(gauge);
+    writeFuelLevel(readFuelLevel(), 1e15);
+    expect(isKeepingSettlement(readFuelSettlement(SK))).toBe(true);
+  });
+
+  it('leaves out a burn whose key no settlement could name', () => {
+    // Copilot's review of #173: settling it voided the settlement, so the
+    // burns it dropped came back and the log never cleared.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    doc.getMap('stationKeeping').set(`burn:${'x'.repeat(100)}`, burnAt(T0, 'raise'));
+    expect(readOrbitTrim()).toBeNull();
+    expect(readFuelDrawn()).toBe(0);
+    const b = press('ahead', T0 + BURN_MS);
+    writeFuelLevel(readFuelLevel(), 100);
+    const settled = readFuelSettlement(SK);
+    expect(isKeepingSettlement(settled)).toBe(true);
+    expect((settled as KeepingSettlement).burns).toEqual([keyOf(doc, b)]);
+    expect(readFuelLevel()).toBe(50 - TRIM_FUEL);
   });
 
   it('takes the same burns out of a flood whatever order it was written in', () => {

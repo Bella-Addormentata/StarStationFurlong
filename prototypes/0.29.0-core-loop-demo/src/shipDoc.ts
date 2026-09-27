@@ -132,6 +132,10 @@ export interface FlightRecord {
    *  before `departedAt` (the launch window it waits for). Kept through
    *  `redocking`, so arrival can tell what changed while the ship was away. */
   castOffAt?: number;
+  /** Where the destination orbited when DEPART cast off, as an open-orbit
+   *  place (stationDirectory.adriftAt). Kept through `redocking`, so arrival
+   *  can tell the destination moved away however many moves it made since. */
+  destinationAt?: string;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -245,6 +249,7 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.departedAt !== undefined && !isFlightTime(r.departedAt)) return false;
   if (r.etaAt !== undefined && !isFlightTime(r.etaAt)) return false;
   if (r.castOffAt !== undefined && !isFlightTime(r.castOffAt)) return false;
+  if (r.destinationAt !== undefined && !isBoundedString(r.destinationAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -297,6 +302,7 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
       if (r.departedAt !== undefined) out.departedAt = r.departedAt;
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;
       if (r.castOffAt !== undefined && (r.departedAt === undefined || r.castOffAt <= r.departedAt)) out.castOffAt = r.castOffAt;
+      if (r.destinationAt !== undefined) out.destinationAt = r.destinationAt;
     }
   }
   // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
@@ -307,6 +313,7 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
   if (r.status === 'redocking' && r.departedAt !== undefined && r.etaAt !== undefined && r.etaAt > r.departedAt) {
     out.departedAt = r.departedAt;
     if (r.castOffAt !== undefined && r.castOffAt <= r.departedAt) out.castOffAt = r.castOffAt;
+    if (r.destinationAt !== undefined) out.destinationAt = r.destinationAt;
   }
   return out;
 }
