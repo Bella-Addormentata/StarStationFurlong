@@ -452,10 +452,11 @@ export function isBerthDoor(door: Pick<AtlasDoor, 'transient' | 'segments'>): bo
  * Records are matched per pair of rooms the way dockRules.findFarDoor finds
  * a connection's far end: a record's `farDoor` is the far room's own key for
  * its door, so a record naming one, or named by one, pairs with exactly that
- * record. Records naming no far door then pair across, each berth taking one
- * unflagged record opposite. Whatever is left over is a SEPARATE connection
- * and keeps its own flag — a permanent gangway between the same two rooms
- * still joins them.
+ * record. Records naming no far door then pair across: a berth with a berth
+ * opposite first (one connection flagged at both ends), and only a berth left
+ * over with one unflagged record opposite. Whatever is left over is a
+ * SEPARATE connection and keeps its own flag — a permanent gangway between
+ * the same two rooms still joins them.
  */
 export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
   type Side = Array<{ doorId: string; door: AtlasDoor }>;
@@ -500,12 +501,16 @@ export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set
         if (t) partner(i, r, t);
       }
     }
-    // Unnamed: a berth takes one unflagged, unnamed record opposite.
-    const loose = sides.map((side) => side.filter((r) => r.door.farDoor === undefined && !partnered.has(r)));
+    // Unnamed: a berth flagged at both ends is one connection, so berths pair
+    // with berths first; only a berth left over (flagged on one side alone)
+    // takes one unflagged, unnamed record opposite.
+    const loose = (i: number, berth: boolean) =>
+      sides[i].filter((r) => r.door.farDoor === undefined && !partnered.has(r) && isBerthDoor(r.door) === berth);
+    const [flagged0, flagged1] = [loose(0, true), loose(1, true)];
+    for (let k = 0; k < Math.min(flagged0.length, flagged1.length); k++) partner(0, flagged0[k], flagged1[k]);
     for (const i of [0, 1] as const) {
-      const unflagged = loose[1 - i].filter((r) => !isBerthDoor(r.door));
-      for (const r of loose[i]) {
-        if (!isBerthDoor(r.door)) continue;
+      const unflagged = loose(1 - i, false);
+      for (const r of loose(i, true)) {
         const t = unflagged.shift();
         if (!t) break;
         partner(i, r, t);
