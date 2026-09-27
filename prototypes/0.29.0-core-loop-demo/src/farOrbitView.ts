@@ -177,14 +177,19 @@ function gather(now: number): Source {
     'planet',
     planetId,
     viewerRingRadiusKm ?? 'x',
-    ...stations.map((s) => `${s.record.id}:${s.record.orbitSlot}:${s.modules}:${s.record.name}`),
-    ...ships.map((s) => `${s.id}:${s.plan.departAt}:${s.plan.arriveAt}`),
+    // Everything buildFrame draws once: ring radii (a trim moves a ring
+    // without changing its slot), names, module counts and each course.
+    ...stations.map((s) => `${s.record.id}:${stationOrbit(s.record).radiusKm.toFixed(3)}:${s.modules}:${s.record.name}`),
+    ...ships.map((s) =>
+      `${s.id}:${s.name}:${s.plan.departAt}:${s.plan.arriveAt}:${s.plan.from.radiusKm.toFixed(3)}:${s.plan.from.phase0}:${s.plan.to.radiusKm.toFixed(3)}`),
   ].join('|');
   return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key };
 }
 
-function layoutFor(source: Source, now: number): FarLayout | null {
-  if (source.mode === 'sun') return transitLayout(source.move, now);
+/** The layout now; `withPaths` samples the courses too, which only a
+ *  rebuild of the static geometry needs. */
+function layoutFor(source: Source, now: number, withPaths: boolean): FarLayout | null {
+  if (source.mode === 'sun') return transitLayout(source.move, now, withPaths);
   const stations: FarStationInput[] = source.stations.map(({ record, modules }) => ({
     id: record.id,
     name: record.name,
@@ -199,6 +204,7 @@ function layoutFor(source: Source, now: number): FarLayout | null {
     viewerRingRadiusKm: source.viewerRingRadiusKm,
     stations,
     ships: source.ships,
+    withPaths,
   });
 }
 
@@ -434,11 +440,12 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
     }
     lastRefresh = now;
   }
-  const layout = source ? layoutFor(source, now) : null;
+  const rebuild = !!source && source.key !== builtKey;
+  const layout = source ? layoutFor(source, now, rebuild) : null;
   if (!layout) {
     clearFrame();
   } else {
-    if (source && source.key !== builtKey) {
+    if (rebuild && source) {
       buildFrame(layout);
       builtKey = source.key;
     }

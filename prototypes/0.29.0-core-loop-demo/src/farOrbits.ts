@@ -183,6 +183,9 @@ export function planetLayout(input: {
   viewerRingRadiusKm?: number;
   stations: readonly FarStationInput[];
   ships: readonly FarShipInput[];
+  /** Sample each ship's course (default true). The courses only change when
+   *  a flight does, so a per-frame caller passes false and keeps its own. */
+  withPaths?: boolean;
 }): FarLayout {
   const planet = planetById(input.planetId);
   const squash = (p: OrbitPoint) => toPlanetFrame(compressPlanetPoint(p, planet));
@@ -220,6 +223,7 @@ export function planetLayout(input: {
     const p = transferPointAt(ship.plan, input.nowMs);
     if (p.leg !== 'transfer') continue;
     bodies.push({ id: ship.id, kind: 'ship', name: ship.name, position: squash(p), angle: p.angle, modules: 1 });
+    if (input.withPaths === false) continue;
     paths.push({
       id: ship.id,
       points: sampleCourse((ms) => squash(transferPointAt(ship.plan, ms)), ship.plan.departAt, ship.plan.arriveAt),
@@ -245,7 +249,7 @@ export function planetLayout(input: {
  * planet-locked), every planet on its compressed orbit and true angle, and
  * the station's course from departure to capture. null outside the transit.
  */
-export function transitLayout(move: StationMove, nowMs: number): FarLayout | null {
+export function transitLayout(move: StationMove, nowMs: number, withPaths = true): FarLayout | null {
   const here = moveTransitPointAt(move, nowMs);
   if (!here) return null;
   const squash = (p: OrbitPoint) => toPlanetFrame(compressSunPoint(p));
@@ -259,7 +263,7 @@ export function transitLayout(move: StationMove, nowMs: number): FarLayout | nul
     rings.push({ radius: compressSunPoint(p).radiusKm, own: false });
     bodies.push({ id: planet.id, kind: 'planet', name: planet.name, position: squash(p), angle: p.angle, modules: 1 });
   }
-  const course = sampleCourse((ms) => {
+  const course = !withPaths ? [] : sampleCourse((ms) => {
     const p = moveTransitPointAt(move, Math.min(Math.max(ms, move.departAt + 1), move.arriveAt - 1));
     return squash(p ?? here);
   }, move.departAt, move.arriveAt);
