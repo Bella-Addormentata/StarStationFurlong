@@ -70,7 +70,8 @@
  *   above the route's level shows only once the route's own checkpoint says
  *   so (REFUEL writes a `fuel` entry; START and RESUME write the CEILING,
  *   the capacity with the home refill, else the level aboard, so the
- *   derived level can climb back to it with no write). A PAUSED route's
+ *   derived level can climb back to it with no write; a tank fitted mid-run
+ *   raises it, raiseRouteFuelCeiling). A PAUSED route's
  *   meter reads 0: the stored level rules while paused, so PAUSE writes the
  *   derived level with its pause entry.
  *   An old client ignores the meter: it reads the ceiling, a stale level, and
@@ -109,6 +110,7 @@ import {
 import type { LiveDockAt, RouteFlight, RouteSettleAction } from './pilotRoute';
 import {
   clampFuelToCapacity,
+  raiseStoredFuelLevel,
   readFlightRecord,
   readFuelLevel,
   readStoredFuelLevel,
@@ -1150,6 +1152,27 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
     for (const rec of action.writes) writeFlightRecord(rec);
   });
   return 'follow';
+}
+
+/**
+ * ⛽ A tank fitted while a home-refill route runs. The timetable fills the
+ * tanks to the capacity they have NOW at each home arrival, but the gauge
+ * reads the lower of the route's level and the CEILING START (or RESUME)
+ * stored, the capacity then: past it, a refill could never show, and the
+ * copy-back after STOP would cut the level down to it. So the ceiling
+ * follows the tanks up: the stored level is raised to the capacity, every
+ * other meter's recorded reading kept (shipDoc.raiseStoredFuelLevel), and
+ * the route's own debt takes the raise, so the gauge does not move until
+ * the route's level does. Only while the route rules the flight: paused,
+ * the stored level is the tank's own, and RESUME writes the ceiling anew.
+ * Never lowers it (taking a tank off, the gauge clamps to the tanks). The
+ * helm-gated game calls it (main.ts's watch). Returns whether it wrote.
+ */
+export function raiseRouteFuelCeiling(capacity: number, now = Date.now()): boolean {
+  const route = readShipRoute(now);
+  if (!isRouteRunning(route) || !route.homeRefuel || !(capacity > 0)) return false;
+  if (!routeRulesFlight(routeFlightNow(null, capacity, now))) return false;
+  return raiseStoredFuelLevel(capacity, capacity);
 }
 
 /**

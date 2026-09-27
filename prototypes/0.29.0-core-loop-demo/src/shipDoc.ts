@@ -536,6 +536,25 @@ export function readStoredFuelLevel(): number {
   return isFuelRecord(raw) ? Math.max(0, raw.level) : 0;
 }
 
+/** 🚏 Raise the stored level to `level` (clamped to `capacity`), keeping
+ *  every meter's recorded reading and settlement as they are, so a draw
+ *  already made still comes off. Never lowers it; no record, no raise. On
+ *  its own this would add fuel: it is for the ferry route's CEILING
+ *  (shipRoute.raiseRouteFuelCeiling), where the route's owed meter, a debt
+ *  against this level, takes the raise back until the route's own level
+ *  climbs. Returns whether it wrote. */
+export function raiseStoredFuelLevel(level: number, capacity: number): boolean {
+  if (!docAlive()) return false;
+  const raw = shipMap!.get('fuel');
+  if (!isFuelRecord(raw)) return false;
+  const safe = clampFuelToCapacity(level, capacity);
+  if (!(safe > raw.level)) return false;
+  boundDoc!.transact(() => {
+    shipMap!.set('fuel', { ...raw, level: safe });
+  });
+  return true;
+}
+
 /** Fuel level clamped against the CURRENT derived capacity (tanks removed
  *  after a fill silently strand overflow — plan §2, item 2). */
 export function clampFuelToCapacity(level: number, capacity: number): number {

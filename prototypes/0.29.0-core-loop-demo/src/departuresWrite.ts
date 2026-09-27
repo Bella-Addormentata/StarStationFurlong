@@ -226,6 +226,9 @@ interface RoomState {
   busy: boolean;
   /** Retries spent on the snapshot now being sent. */
   retries: number;
+  /** The offers answered once this room answers the snapshot in `waiting`
+   *  (or a newer one that replaced it before it went). */
+  waiters: Array<() => void>;
 }
 
 /**
@@ -247,22 +250,31 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     const key = `${room}\n${ship}`;
     let st = rooms.get(key);
     if (!st) {
-      st = { room, waiting: null, latest: null, busy: false, retries: 0 };
+      st = { room, waiting: null, latest: null, busy: false, retries: 0, waiters: [] };
       rooms.set(key, st);
     }
     return st;
   };
 
-  /** Send what waits for this room from this ferry; resolves once the room
-   *  has answered it. */
+  /** Send what waits for this room from this ferry, and answer its offers
+   *  once the room has answered it. */
   const pump = async (st: RoomState): Promise<void> => {
     const room = st.room;
     if (st.busy || !st.waiting) return;
     const pub = st.waiting;
     st.waiting = null;
-    const seed = d.seedFor(room);
+    const answered = st.waiters;
+    st.waiters = [];
+    const done = () => { for (const w of answered) w(); };
+    let seed: string | undefined;
+    try {
+      seed = d.seedFor(room);
+    } catch {
+      seed = undefined;
+    }
     if (!seed) {
       st.retries = 0;
+      done();
       return;
     }
     st.busy = true;
@@ -273,6 +285,7 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
       result = 'unreachable';
     }
     st.busy = false;
+    done();
     if (result === 'unreachable' && !st.waiting && st.retries < DEPARTURES_RETRY_MS.length) {
       const wait = DEPARTURES_RETRY_MS[st.retries];
       st.retries++;
@@ -289,12 +302,17 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     if (st.waiting) void pump(st);
   };
 
+  /** Offer a snapshot to a room. Resolves once the room has answered it (or
+   *  a newer snapshot that replaced it while the room was busy), never
+   *  sooner: a busy room answers its current write first. */
   const offer = (room: string, pub: DeparturesPublish): Promise<void> => {
     const st = stateOf(room, pub.shipRoomId);
     st.waiting = pub;
     st.latest = pub;
     st.retries = 0;
-    return pump(st);
+    const answered = new Promise<void>((resolve) => { st.waiters.push(resolve); });
+    void pump(st);
+    return answered;
   };
 
   const flush = (): void => {

@@ -131,6 +131,26 @@ describe('the departures publisher', () => {
     expect(toRoom1[1].pub.checkpoints.find((e) => e.kind === 'hold')?.at).toBe(s.arriveAt + 2000);
   });
 
+  it('the stop concerned answers each snapshot first, even while it is busy with an older one', async () => {
+    const h = harness();
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick();
+    // A second gesture about the same stop while room-1 still works on the first.
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick();
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1']);
+    // room-1 answers the first: the others get it, and room-1 the second.
+    await h.answer(0, 'written');
+    expect(h.calls.map((c) => c.address).sort()).toEqual(['pass:room-0', 'pass:room-1', 'pass:room-1', 'pass:room-2']);
+    const second = h.calls.findIndex((c, i) => i > 0 && c.address === 'pass:room-1');
+    for (let i = 1; i < h.calls.length; i++) if (i !== second) await h.answer(i, 'written');
+    // Only once room-1 has answered the second do the others get it.
+    expect(h.calls).toHaveLength(4);
+    await h.answer(second, 'written');
+    expect(h.calls.slice(4).map((c) => c.address).sort()).toEqual(['pass:room-0', 'pass:room-2']);
+    expect(h.calls[4].pub).toBe(h.calls[second].pub);
+  });
+
   it('retries an unreachable room twice, 30 s then 60 s later, then gives up', async () => {
     const h = harness({ route: () => ({ ...running(), stops: [stop(0, 0), stop(1, 1)] }) });
     h.p.routeWritten({ kind: 'start', legSeq: 0 });

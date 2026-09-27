@@ -374,6 +374,11 @@ export function summaryRow(
     // somewhere else, so the time is unknown, as when docked.
     return { ...base, dir: 'from', place: placeOf(s.fromRoom), at: paused ? null : s.etaAt ?? null };
   }
+  // Paused and docked off its route once that flight has landed: the stop it
+  // resumes at next still lists it, time unknown.
+  if (paused && (s.status === 'docked' || s.status === 'undocking') && s.nextStopRoom && isHereRoom(s.nextStopRoom)) {
+    return { ...base, dir: 'from', place: placeOf(s.fromRoom), at: null };
+  }
   return null;
 }
 

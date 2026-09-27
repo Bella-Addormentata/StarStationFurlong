@@ -54,6 +54,7 @@ import {
   onRouteWritten,
   parseCheckpointKey,
   pruneRouteCheckpoints,
+  raiseRouteFuelCeiling,
   raisedMinClient,
   readResolvedFlight,
   readRouteCheckpoints,
@@ -841,6 +842,55 @@ describe('the route fuel meter', () => {
     expect(readFuelLevel(CAP)).toBe(CAP - cost);
     expect(updates.n).toBe(0);
     expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
+  });
+
+  it('⛽ a tank fitted mid-run: the home refill fills the new capacity, and the gauge shows it', () => {
+    let cap = CAP;
+    const { route, start } = started(saved([0, 1], { homeRefuel: true }), 70);
+    installRouteFuelMeter({ capacity: () => cap, clock: () => clock });
+    const cost = routeLegFuel(route, 0, 1)!;
+    const on = onTime(route, start, 4);
+    // Another consumer's draw before the tank goes in (station keeping, say).
+    const OTHER = 'test-other';
+    let drawn = 0;
+    setFuelDrawMeter(OTHER, { read: () => drawn, subscribe: () => () => {} });
+    try {
+      drawn = 3;
+      clock = on[0].depart + SEC;
+      expect(readFuelLevel(cap)).toBe(70 - cost - 3);
+      cap = 2 * CAP; // a second tank
+      expect(raiseRouteFuelCeiling(cap, clock)).toBe(true);
+      expect(readStoredFuelLevel()).toBe(2 * CAP);
+      // Nothing moves now: the route's debt takes the raise.
+      expect(readFuelLevel(cap)).toBe(70 - cost - 3);
+      expect(raiseRouteFuelCeiling(cap, clock)).toBe(false); // never twice
+      clock = on[1].arrive + SEC; // home again: the new tanks full, less that draw
+      expect(readFuelLevel(cap)).toBe(2 * CAP - 3);
+      clock = on[2].depart + SEC;
+      expect(readFuelLevel(cap)).toBe(2 * CAP - 3 - cost);
+      // A tank taken off again never lowers it (the gauge clamps to the tanks).
+      expect(raiseRouteFuelCeiling(CAP, clock)).toBe(false);
+      expect(readStoredFuelLevel()).toBe(2 * CAP);
+    } finally {
+      setFuelDrawMeter(OTHER, null);
+    }
+  });
+
+  it('⛽ the ceiling stays put with no home refill, while paused, and with no run', () => {
+    started(saved(), 70);
+    installRouteFuelMeter({ capacity: () => 2 * CAP, clock: () => clock });
+    expect(raiseRouteFuelCeiling(2 * CAP, clock)).toBe(false);
+    expect(readStoredFuelLevel()).toBe(70);
+    bindShipDoc(new Y.Doc());
+    const { run, route } = started(saved([0, 1], { homeRefuel: true }), 70);
+    expect(writeRouteCheckpoint(run, pauseCheckpoint(route, 0, { at: T0 + SEC }), T0 + SEC)).toBe(true);
+    expect(raiseRouteFuelCeiling(2 * CAP, T0 + 2 * SEC)).toBe(false);
+    expect(readStoredFuelLevel()).toBe(CAP);
+    bindShipDoc(new Y.Doc());
+    writeShipRoute(saved([0, 1], { homeRefuel: true }));
+    writeFuelLevel(50, CAP);
+    expect(raiseRouteFuelCeiling(2 * CAP, T0)).toBe(false);
+    expect(readStoredFuelLevel()).toBe(50);
   });
 
   it('REFUEL writes its checkpoint first, then the level, and later burns still come off', () => {

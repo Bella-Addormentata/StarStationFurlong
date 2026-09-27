@@ -443,6 +443,14 @@ describe('the board', () => {
     // Paused in flight, off its route: that flight's ETA is somewhere else's.
     expect(summaryRow({ ...base, toRoom: 'welcome-5', nextStopRoom: 'welcome-0', routeStatus: 'paused' }, isHereRoom, placeOf, T0))
       .toMatchObject({ dir: 'from', status: 'PAUSED', at: null });
+    // …and once that flight has landed off its route: docked elsewhere, it
+    // resumes here next, so this stop still lists it.
+    const offRoute: ShipSummary = { ...base, status: 'docked', fromRoom: 'welcome-7', toRoom: undefined, etaAt: undefined, nextStopRoom: 'welcome-0', routeStatus: 'paused' };
+    expect(summaryRow(offRoute, isHereRoom, placeOf, T0)).toMatchObject({ dir: 'from', place: 'welcome-7', status: 'PAUSED', at: null });
+    expect(summaryRow({ ...offRoute, status: 'undocking' }, isHereRoom, placeOf, T0)).toMatchObject({ dir: 'from', status: 'PAUSED', at: null });
+    // Not paused, it is at another stop of its route: that stop's news.
+    expect(summaryRow({ ...offRoute, routeStatus: 'boarding', departAt: T0 + MIN }, isHereRoom, placeOf, T0)).toBeNull();
+    expect(summaryRow({ ...offRoute, nextStopRoom: 'welcome-5' }, isHereRoom, placeOf, T0)).toBeNull();
   });
 
   it('prints a row: ferry, where, gate, HH:MM:SS, status and note', () => {

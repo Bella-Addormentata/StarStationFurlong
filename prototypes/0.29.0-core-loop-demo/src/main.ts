@@ -131,6 +131,7 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 import {
   installRouteFlight,
   onRouteWritten,
+  raiseRouteFuelCeiling,
   readResolvedFlight,
   readRouteCheckpoints,
   readRouteFlight,
@@ -2259,7 +2260,11 @@ async function joinRoomAtEpoch(
     // came during a hold), or when a person's `in-flight` has been landed.
     if (routeRulesFlightNow()) {
       // 🛰️ Never copy a stale replica's timetable back.
-      if (roomStateArrivedNow()) settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) });
+      if (roomStateArrivedNow()) {
+        // ⛽ A tank fitted mid-run: the home refill's ceiling follows it.
+        raiseRouteFuelCeiling(shipFuelCapacity());
+        settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) });
+      }
       return;
     }
     const rec = readFlightRecord();
