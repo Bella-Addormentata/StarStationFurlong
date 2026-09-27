@@ -408,6 +408,35 @@ describe('sharing through the room doc', () => {
     expect(b?.orbitSlot).toBe(2);
   });
 
+  it('places a one-room off-home station that is no ship by its shared summary', () => {
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('room-x', {
+      welcomeRoomId: 'room-x', name: 'ARIS DEPOT', planetId: ARIS, orbitSlot: 3, updatedAt: Date.now() - 1000,
+    });
+    const derived = { id: 'station:room-x', name: 'ROOM X', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-x', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, {
+      currentStation: () => derived, currentRoom: () => 'room-x', notShipRoom: () => 'room-x',
+    }));
+    expect(listStations().find((s) => s.id === 'shared:room-x')?.planetId).toBe(ARIS);
+  });
+
+  it('keeps an unplaced ship\'s own entry when newer ships fill the list', () => {
+    const doc = new Y.Doc();
+    const now = Date.now();
+    doc.getMap('shipSummaries').set('room-ship', {
+      roomId: 'room-ship', name: 'FERRY', planetId: ARIS, status: 'docked', updatedAt: now - 60_000,
+    });
+    for (let i = 0; i < 40; i++) {
+      doc.getMap('shipSummaries').set(`room-s${i}`, {
+        roomId: `room-s${i}`, name: `S${i}`, planetId: SOV, status: 'docked', updatedAt: now - 1000 + i,
+      });
+    }
+    const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship', notShipRoom: () => null }));
+    expect(readStore().ships['room-ship']?.planetId).toBe(ARIS);
+    expect(doc.getMap('shipSummaries').has('room-ship')).toBe(true);
+  });
+
   it('places a fresh install standing in a ship by the ship\'s shared summary', () => {
     const doc = new Y.Doc();
     doc.getMap('stationSummaries').set('room-x', {

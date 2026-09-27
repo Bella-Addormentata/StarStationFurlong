@@ -467,7 +467,7 @@ function onPlanet(v: { planetId: string }, planet: string | null): boolean {
 /** The keys this client knows first-hand: the station it stands in and the
  *  ship it is aboard. Retention keeps them whatever peers stamp. And the
  *  planet it is at (null when it cannot place itself). */
-function firstHandKeys(): { stations: Set<string>; ships: Set<string>; planet: string | null } {
+function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<string>; planet: string | null } {
   const stations = new Set<string>();
   const ships = new Set<string>();
   const current = ctx?.currentStation() ?? null;
@@ -475,7 +475,29 @@ function firstHandKeys(): { stations: Set<string>; ships: Set<string>; planet: s
   if (here) stations.add(here);
   const ship = ctx?.ship()?.roomId;
   if (ship) ships.add(ship);
-  return { stations, ships, planet: current ? planetById(current.planetId).id : null };
+  // A room that may be a ship keeps its own entry too: while its stations
+  // are not placed, that entry is what says which planet it is at.
+  const shipRoom = mayBeShipRoom();
+  if (shipRoom) ships.add(shipRoom);
+  const standIn = isShipStandIn(current, shipRoom);
+  const shipEntry = shipRoom ? store?.ships[shipRoom] : undefined;
+  const planet = current && !standIn ? planetById(current.planetId).id
+    : shipEntry && !shipEntry.retired ? planetById(shipEntry.planetId).id
+      : null;
+  return { stations, ships, planet };
+}
+
+/** The room this client stands in, unless it is known to be no ship. */
+function mayBeShipRoom(): string | null {
+  const room = ctx?.currentRoom?.() || null;
+  return room && ctx?.notShipRoom?.() !== room ? room : null;
+}
+
+/** A ship's own one-room stand-in (derived, its welcome room the ship's
+ *  room): it sits on the default planet until stations are known, so it
+ *  places nothing. A one-room station known to be no ship is a place. */
+function isShipStandIn(found: StationRecord | null, shipRoom: string | null): boolean {
+  return !!found && !!found.derived && shipRoom !== null && found.welcomeRoomId === shipRoom;
 }
 
 // ── From this client: its station and its ship ──────────────────────────────
@@ -731,7 +753,7 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (next) { store.ships[k] = next; changed = true; }
     if (JSON.stringify(store.ships[k]) !== JSON.stringify(s)) staleShips.set(k, s);
   }
-  const pins = firstHandKeys();
+  const pins = firstHandKeys(store);
   if (changed) {
     store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet);
     store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
@@ -822,7 +844,7 @@ export function publishPlanetSummary(now = Date.now()): void {
       store.ships[room] = { ...prior, retired: true, updatedAt: stampPast(room) };
     }
   }
-  const pins = firstHandKeys();
+  const pins = firstHandKeys(store);
   store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet);
   store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
   writeStore(store);
@@ -867,11 +889,9 @@ let trimsByStationId = new Map<string, SharedTrim>();
 /** Refresh records and trims from the store: register this planet's learned
  *  stations, then map every listed station to its newest known trim. */
 function applyLearned(store: Store): void {
-  const room = ctx?.currentRoom?.() || null;
+  const room = mayBeShipRoom();
   const found = ctx?.currentStation() ?? null;
-  // A ship's own one-room stand-in (derived, its welcome room this room)
-  // places nothing: it sits on the default planet until stations are known.
-  const here = found && !(found.derived && found.welcomeRoomId === room) ? found : null;
+  const here = found && !isShipStandIn(found, room) ? found : null;
   // Where this client is: the shared summary of the station it stands in,
   // unless this install's own saved record is the one that stands there (a
   // derived record sits on the default planet until its learned one
