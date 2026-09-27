@@ -182,7 +182,7 @@ const FLIGHT_STATUSES: readonly FlightStatus[] = ['docked', 'undocking', 'in-fli
 /** `locationId` and `destinationId` are compared against DESTINATIONS on read
  *  (unknown ⇒ home), so we only sanity-check bounded string shape here — a
  *  hostile 4 MB string would still eat memory before the resolver saved us. */
-const MAX_LOC_ID_LEN = 64;
+const MAX_LOC_ID_LEN = 128; // = stations.ts's station-id bound
 
 function isFlightStatus(v: unknown): v is FlightStatus {
   return typeof v === 'string' && (FLIGHT_STATUSES as readonly string[]).includes(v);
@@ -308,13 +308,13 @@ export function writeFuelLevel(level: number, capacity: number): void {
  *       stranding the ship.
  *
  *  Rejections are non-throwing (console.warn + no-op) so a bad caller cannot
- *  wedge a doc.transact half-write on the map. */
-export function writeFlightRecord(rec: FlightRecord): void {
-  if (!docAlive()) return;
+ *  wedge a doc.transact half-write on the map. Returns whether it wrote. */
+export function writeFlightRecord(rec: FlightRecord): boolean {
+  if (!docAlive()) return false;
   const clean = sanitizeFlightRecord(rec);
   if (!isFlightRecord(clean)) {
     console.warn('[ship] refused to write malformed flight record', rec);
-    return;
+    return false;
   }
   // Transition-legality gate — read the current record OUTSIDE the transact
   // (no lock; honest-client posture, SH5 signed enforcement is a later slice).
@@ -329,12 +329,13 @@ export function writeFlightRecord(rec: FlightRecord): void {
         `[ship] refused illegal flight transition ${current.status} -> ${clean.status}`,
         rec,
       );
-      return;
+      return false;
     }
   }
   boundDoc!.transact(() => {
     shipMap!.set('flight', clean);
   });
+  return true;
 }
 
 // ── State-machine legal transitions (pure — testable without a doc) ──────────

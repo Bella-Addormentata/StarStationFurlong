@@ -740,3 +740,19 @@ describe('canDepart — where the ship is', () => {
       .toEqual({ ok: false, reason: 'unknown-destination' });
   });
 });
+
+describe('writeFlightRecord — station ids and the result DEPART checks', () => {
+  beforeEach(() => { freshDoc(); });
+
+  it('accepts a station id as long as stations.ts allows (128)', () => {
+    const id = 's'.repeat(128);
+    const now = 1000;
+    expect(writeFlightRecord({ status: 'in-flight', locationId: HOME.id, destinationId: id, departedAt: now, etaAt: now + 1 })).toBe(true);
+    expect(readFlightRecord().destinationId).toBe(id);
+  });
+
+  it('reports a refused write so DEPART can stop before casting off', () => {
+    expect(writeFlightRecord({ status: 'in-flight', locationId: HOME.id, destinationId: 's'.repeat(129), departedAt: 1, etaAt: 2 })).toBe(false);
+    expect(readFlightRecord().status).toBe('docked');
+  });
+});

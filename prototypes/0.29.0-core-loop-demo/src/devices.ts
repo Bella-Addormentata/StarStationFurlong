@@ -2350,22 +2350,25 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       });
       if (!nowRefusal.ok) { render(); return; }
       const dest = findDestination(destId);
-      // 1) Cast off: remember this berth, UNDOCK every docked port (shipped
-      //    UNDOCK — tombstone + far-room write), then detach any other
-      //    transient guest berth (#67 D2, either-side legal).
-      if (shipDocking) castOffForDeparture(fromId, shipDocking);
-      for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
-      // 2) Debit the fuel cost.
-      writeFuelLevel(nowFuel - dest.fuelCost, nowCapacity);
-      // 3) Publish the flight record — the FAST path docked → in-flight.
+      // 1) Publish the flight record FIRST — the FAST path docked → in-flight.
+      //    A record the writer refuses (shape or transition) must not leave
+      //    the ship cast off and charged without having departed.
       const start = Date.now();
-      writeFlightRecord({
+      const departed = writeFlightRecord({
         status: 'in-flight',
         locationId: fromId,
         destinationId: dest.id,
         departedAt: start,
         etaAt: start + Math.max(1, dest.travelMs),
       });
+      if (!departed) { render(); return; }
+      // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
+      //    UNDOCK — tombstone + far-room write), then detach any other
+      //    transient guest berth (#67 D2, either-side legal).
+      if (shipDocking) castOffForDeparture(fromId, shipDocking);
+      for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
+      // 3) Debit the fuel cost.
+      writeFuelLevel(nowFuel - dest.fuelCost, nowCapacity);
       lastArrivalNote = null;
       render();
     });
