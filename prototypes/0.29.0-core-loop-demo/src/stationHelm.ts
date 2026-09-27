@@ -31,7 +31,7 @@ import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
 import { realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
-import { TANK_CAPACITY, clampFuelToCapacity, readFuelLevel, subscribeShip, writeFuelLevel } from './shipDoc';
+import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawFloor, readFuelLevel, subscribeShip } from './shipDoc';
 import type { StationRecord } from './stations';
 import {
   MAX_TRIM_KM,
@@ -294,7 +294,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       trim: readOrbitTrim(),
       commander: isCommander(),
       engines: countFunction('engine'),
-      fuel: clampFuelToCapacity(readFuelLevel(), capacity),
+      fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
+      meter: fuelDrawFloor(),
       now: Date.now(),
       tanks,
       capacity,
@@ -380,7 +381,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       return;
     }
     flash = null;
-    writeOrbitTrim(plan.trim, () => writeFuelLevel(c.fuel - TRIM_FUEL, c.capacity));
+    writeOrbitTrim(plan.trim);
     refresh();
   };
 

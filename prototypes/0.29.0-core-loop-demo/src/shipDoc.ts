@@ -9,7 +9,9 @@
  *   - `fuel.level` — how much fuel is aboard right now (units). Capacity is
  *      derived (tanks × TANK_CAPACITY, never stored); level is doc truth so a
  *      REFUEL on one client moves the gauge on every other, and a DEPART debit
- *      is seen by everyone before the starfield swap.
+ *      is seen by everyone before the starfield swap. Station keeping's trim
+ *      burns draw from the same tanks through a meter in their own record
+ *      (setFuelDrawMeter), so a burn never races a REFUEL or DEPART for it.
  *   - `flight`     — the state machine (docked / undocking / in-flight /
  *      redocking) that spaceship-conversion-plan.md §1.4 rules is "a record,
  *      not a simulation": passengers travel with the module for free because
@@ -125,9 +127,12 @@ export interface FlightRecord {
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
- *  stored — so removing a tank silently caps the effective level on read. */
+ *  stored — so removing a tank silently caps the effective level on read.
+ *  `meter` is the draw meter's reading (setFuelDrawMeter) when the level was
+ *  written; absent means 0. */
 export interface FuelRecord {
   level: number;
+  meter?: number;
 }
 
 // ── Wire-up (mirror bindFurnitureDoc / bindDoorsDoc / bindGamesDoc) ──────────
@@ -251,19 +256,83 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
   return out;
 }
 
+// ── Draws that ride another record (station keeping) ────────────────────────
+//
+// `fuel.level` is written whole, and Yjs keeps one of two concurrent writes to
+// a key. REFUEL and DEPART each write the level from the gauge they read. A
+// station-keeping burn fired at the same moment from another tab (or an
+// offline one) writes its own trim record too, and if it ALSO wrote the level,
+// one of the two debits would vanish when the tabs sync. So a consumer that
+// keeps its own record draws through a METER there instead: a running total
+// of the fuel it has drawn, raised in the same write as the thing it paid
+// for. The tank reads level − (meter − the reading the level was written
+// against), and every level write records the reading it saw, so draws the
+// writer had seen are folded into the level and draws it had not seen still
+// come off.
+
+/** A meter reads at most this: a running fuel total stays well inside exact
+ *  integers, and a hostile reading past it counts as none. */
+export const FUEL_METER_MAX = 1e12;
+
+/** A running total of fuel drawn, kept in the consumer's own record. */
+export interface FuelDrawMeter {
+  read(): number;
+  subscribe(listener: () => void): () => void;
+}
+
+let drawMeter: FuelDrawMeter | null = null;
+let unsubscribeDrawMeter: (() => void) | null = null;
+
+/** Install the tank's draw meter (null removes it). A meter change moves the
+ *  gauge, so ship subscribers hear about it too. */
+export function setFuelDrawMeter(meter: FuelDrawMeter | null): void {
+  unsubscribeDrawMeter?.();
+  drawMeter = meter;
+  unsubscribeDrawMeter = meter ? meter.subscribe(() => notify()) : null;
+}
+
+/** A meter value off the wire: anything but a number in (0, FUEL_METER_MAX] is 0. */
+function meterValue(v: unknown): number {
+  return typeof v === 'number' && v > 0 && v <= FUEL_METER_MAX ? v : 0;
+}
+
+/** The meter's reading. */
+function meterReading(): number {
+  return meterValue(drawMeter?.read());
+}
+
+/** The meter reading a fuel record was written against. */
+function meterBase(rec: FuelRecord): number {
+  return meterValue(rec.meter);
+}
+
+/** Where a new draw starts the meter: its reading, but never below the one the
+ *  level was written against, so a meter that went back (an older record won
+ *  a merge) neither refunds fuel nor lets the next draw go free. A draw of
+ *  `amount` writes `fuelDrawFloor() + amount` into its record. */
+export function fuelDrawFloor(): number {
+  const raw = docAlive() ? shipMap!.get('fuel') : undefined;
+  return Math.max(meterReading(), isFuelRecord(raw) ? meterBase(raw) : 0);
+}
+
 // ── Reads (untrusted; every path degrades to defaults, never throws) ─────────
 
-/** Raw fuel level from the doc — clamp to [0, capacity] happens in the
- *  resolveShipState() step or in the caller (owner-only REFUEL write already
- *  clamps to the CURRENT capacity — see writeFuelLevel). */
-export function readFuelLevel(): number {
+/** Fuel level from the doc, less any draws through the meter since it was
+ *  written. Pass the tanks' CURRENT capacity: a draw comes out of what the
+ *  fitted tanks hold, never out of fuel stranded by a removed tank (which
+ *  comes back if the tank does). The capacity clamp itself happens in the
+ *  caller (owner-only REFUEL write already clamps to the CURRENT capacity —
+ *  see writeFuelLevel). */
+export function readFuelLevel(capacity = Number.POSITIVE_INFINITY): number {
   if (!docAlive()) return 0;
   const raw = shipMap!.get('fuel');
   if (!isFuelRecord(raw)) return 0;
+  const held = capacity >= 0 ? Math.min(raw.level, capacity) : 0;
+  const drawnSince = Math.max(0, meterReading() - meterBase(raw));
   // Negative-fuel guard belongs here too — a peer could write -Infinity and
   // every reader would fail-open otherwise. Clamp to [0, +∞) at the boundary;
   // capacity clamp is a caller responsibility (see clampFuelToCapacity).
-  return Math.max(0, raw.level);
+  return Math.max(0, held - drawnSince);
 }
 
 /** Fuel level clamped against the CURRENT derived capacity (tanks removed
@@ -286,13 +355,17 @@ export function readFlightRecord(): FlightRecord {
 // ── Writes (owner-gated at the CALLER; single-writer per key/phase) ──────────
 
 /** Publish the fuel level after clamping to the current derived capacity.
- *  Owner-gated at the caller (helm UI). The write is idempotent — the same
- *  level twice makes one Yjs op (Y.Map dedups equal values). */
+ *  `level` is what the gauge should read now; the record keeps the draw
+ *  meter's floor beside it, so the draws this writer has seen stay counted
+ *  once (see setFuelDrawMeter). Owner-gated at the caller (helm UI). The
+ *  write is idempotent — the same level twice makes one Yjs op (Y.Map dedups
+ *  equal values). */
 export function writeFuelLevel(level: number, capacity: number): void {
   if (!docAlive()) return;
   const safe = clampFuelToCapacity(level, capacity);
+  const meter = fuelDrawFloor();
   boundDoc!.transact(() => {
-    shipMap!.set('fuel', { level: safe } as FuelRecord);
+    shipMap!.set('fuel', (meter > 0 ? { level: safe, meter } : { level: safe }) as FuelRecord);
   });
 }
 

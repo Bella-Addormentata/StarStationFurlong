@@ -29,7 +29,10 @@
  * "station-keeping burns are discrete events"): each nudge is ONE burn that
  * rewrites the trim record — the radius offset, the phase offset AT the burn,
  * and the burn's time. Where the station is at any other moment is computed
- * from those three numbers, never stored or ticked.
+ * from those three numbers, never stored or ticked. The burn's fuel rides the
+ * same write: the record carries the fuel station keeping has drawn so far,
+ * which the tank reads as a meter (shipDoc.setFuelDrawMeter), so a burn and a
+ * REFUEL or DEPART from another tab both keep their cost when they sync.
  *
  * Storage: the `stationKeeping` map in the HELM ROOM's doc (key 'trim') —
  * shared by everyone in the room, like the ship doc. The record names the
@@ -51,6 +54,7 @@ import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, circularOrbit, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
+import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { isBerthDoor } from './stationAtlas';
 import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationRecord } from './stations';
@@ -123,6 +127,10 @@ export interface OrbitTrim {
   at: number;
   /** Which way that burn pushed. */
   last: TrimDirection;
+  /** Fuel station keeping has drawn from this module's tanks, every burn so
+   *  far: the tank's draw meter. Each burn raises it by TRIM_FUEL in the
+   *  same write as the burn. Absent on a record from before the meter: 0. */
+  fuelDrawn?: number;
 }
 
 /** An angle folded into (−π, π]. */
@@ -147,12 +155,14 @@ export function isOrbitTrim(v: unknown): v is OrbitTrim {
     && typeof r.dRadiusKm === 'number' && Number.isFinite(r.dRadiusKm) && Math.abs(r.dRadiusKm) <= MAX_TRIM_KM
     && typeof r.dPhase === 'number' && Number.isFinite(r.dPhase) && Math.abs(r.dPhase) <= Math.PI
     && typeof r.at === 'number' && Number.isFinite(r.at) && r.at >= ORBIT_EPOCH_MS && r.at <= MAX_AT_MS
-    && typeof r.last === 'string' && (TRIM_DIRECTIONS as readonly string[]).includes(r.last);
+    && typeof r.last === 'string' && (TRIM_DIRECTIONS as readonly string[]).includes(r.last)
+    && (r.fuelDrawn === undefined
+      || (typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX));
 }
 
 /** Only the fields a trim has — what a write publishes. */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
-  return {
+  const clean: OrbitTrim = {
     planetId: t.planetId,
     slot: t.slot,
     dRadiusKm: t.dRadiusKm,
@@ -160,6 +170,8 @@ function cleanTrim(t: OrbitTrim): OrbitTrim {
     at: t.at,
     last: t.last,
   };
+  if (t.fuelDrawn !== undefined) clean.fuelDrawn = t.fuelDrawn;
+  return clean;
 }
 
 /** The trim that applies to `station`: the record, while it names the
@@ -253,6 +265,8 @@ export interface TrimContext {
   engines: number;
   /** Fuel aboard, already clamped to the tanks' capacity. */
   fuel: number;
+  /** Where this burn starts the tank's draw meter (shipDoc.fuelDrawFloor). */
+  meter: number;
   now: number;
 }
 
@@ -296,6 +310,7 @@ export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
       dPhase: signedAngle(dPhase),
       at: now,
       last: dir,
+      fuelDrawn: ctx.meter + TRIM_FUEL,
     },
   };
 }
@@ -379,11 +394,13 @@ function notify(): void {
   }
 }
 
-/** Bind the room doc — at the T0 seam beside bindShipDoc. */
+/** Bind the room doc — at the T0 seam beside bindShipDoc. The trim record's
+ *  running fuel total becomes the tank's draw meter. */
 export function bindStationKeepingDoc(doc: Y.Doc): void {
   boundDoc = doc;
   keepMap = doc.getMap('stationKeeping');
   keepMap.observe(() => notify());
+  setFuelDrawMeter({ read: readFuelDrawn, subscribe: subscribeStationKeeping });
   notify();
 }
 
@@ -403,19 +420,25 @@ export function readOrbitTrim(): OrbitTrim | null {
   return isOrbitTrim(raw) ? cleanTrim(raw) : null;
 }
 
+/** Fuel station keeping has drawn in this room: the tank's draw meter. */
+export function readFuelDrawn(): number {
+  return readOrbitTrim()?.fuelDrawn ?? 0;
+}
+
 /**
- * Publish a burn's trim record. `alongside` runs inside the same transaction
- * — the fuel debit — so peers never see the burn without its cost. Owner-gated
- * at the caller. Returns whether it wrote.
+ * Publish a burn's trim record: the burn and its fuel (fuelDrawn) in one
+ * write, so peers never see one without the other. Owner-gated at the caller.
+ * Returns whether it wrote.
  *
- * Two burns fired at once from two clients (the owner in two tabs) never both
- * land, and neither lands free. Each writes a whole trim and the fuel it saw
- * less one burn; Yjs settles concurrent writes to a key by client id, so when
- * both started from the same record the same writer wins BOTH keys, and the
- * room converges on one burn and that burn's debit. The other press drops
- * whole, and its dashboard redraws from the doc on the next sync.
+ * The burn never writes the fuel level itself, so a REFUEL or DEPART fired at
+ * the same moment from another tab (or an offline one) cannot wipe out its
+ * cost, nor it theirs: after the sync the tank reads both debits (see
+ * shipDoc.setFuelDrawMeter). Two burns fired at once both write this one key,
+ * and Yjs keeps one of them whole: the room converges on one burn and that
+ * burn's fuel. The other press drops whole, and its dashboard redraws from
+ * the doc on the next sync.
  */
-export function writeOrbitTrim(trim: OrbitTrim, alongside?: () => void): boolean {
+export function writeOrbitTrim(trim: OrbitTrim): boolean {
   if (!docAlive()) return false;
   const clean = cleanTrim(trim);
   if (!isOrbitTrim(clean)) {
@@ -424,7 +447,6 @@ export function writeOrbitTrim(trim: OrbitTrim, alongside?: () => void): boolean
   }
   boundDoc!.transact(() => {
     keepMap!.set('trim', clean);
-    alongside?.();
   });
   return true;
 }
