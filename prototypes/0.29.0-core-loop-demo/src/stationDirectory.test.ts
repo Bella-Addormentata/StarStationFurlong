@@ -67,6 +67,15 @@ describe('a swapped-in directory', () => {
     expect(destinationsFrom('a').map((s) => s.id)).toEqual(['b']);
   });
 
+  it("never offers the ship's own one-module station", () => {
+    setStationDirectory({
+      stations: () => [station('a', 'p1'), station('b', 'p1'), station('ship', 'p1')],
+      here: () => 'a',
+      own: () => 'ship',
+    });
+    expect(destinationsFrom('a').map((s) => s.id)).toEqual(['b']);
+  });
+
   it('ignores a `here` the directory does not list', () => {
     setStationDirectory({ stations: () => [station('a', 'p1')], here: () => 'ghost' });
     expect(stationHere()).toBeNull();

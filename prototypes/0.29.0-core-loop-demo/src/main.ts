@@ -1704,6 +1704,11 @@ async function joinRoomAtEpoch(
             ? DEFAULT_STATION.welcomeRoomLink
             : undefined),
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
+        () => {
+          const room = activeBootstrap?.roomId ?? "";
+          const own = room ? stationForRoom(room) : null;
+          return own && own.welcomeRoomId === room ? own.id : null;
+        },
       ),
     );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,

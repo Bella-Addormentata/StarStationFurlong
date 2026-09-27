@@ -50,6 +50,10 @@ export interface StationDirectory {
    *  lead into, or (floating free) the ship's own one-module "station" — or
    *  null when that is not known. Never a destination. */
   here?(): string | null;
+  /** The ship's OWN one-module station, when its room is listed as one (a
+   *  module docked only by transient docks is its own atlas group) — never a
+   *  destination. */
+  own?(): string | null;
   /** When the hop from → to leaves and lands, and what it burns, asked at
    *  `nowMs`; null when there is no such hop. Absent ⇒ every hop leaves now
    *  and takes the destination's flat travelMs / fuelCost. */
@@ -128,7 +132,10 @@ export function stationHere(): string | null {
 export function destinationsFrom(fromId: string): StationDestination[] {
   const from = findStation(fromId);
   const here = stationHere();
-  return listStations().filter((s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here);
+  const own = directory.own?.() ?? null;
+  return listStations().filter(
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own,
+  );
 }
 
 // ── The station record as a directory (stations.ts) ──────────────────────────
@@ -208,10 +215,12 @@ export function directoryFromStationRecords(
   list: () => readonly StationRecordLike[],
   seedFor: (roomId: string) => string | undefined,
   hereId: () => string | null,
+  ownId: () => string | null = () => null,
 ): StationDirectory {
   return {
     stations: () => destinationsFromRecords(list(), seedFor),
     here: hereId,
+    own: ownId,
     plan: (fromId, toId, nowMs) => {
       const records = list();
       return planRecordHop(
