@@ -281,6 +281,18 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
 // reading the level was written against), and every level write records the
 // reading it saw, so draws the writer had seen are folded into the level and
 // draws it had not seen still come off.
+//
+// 🚏⛽ One meter is not a running total: the ferry route's (shipRoute.ts,
+// 'route'). Its level is worked out from the clock, like its position, and
+// the home refill (choice 4 b) fills the tanks again on each arrival at the
+// route's first stop with no write, so what it reads is a DEBT against the
+// stored level: how far below it the route has taken the tank, back to 0 at
+// each refill. A debt that goes back is the refill, not a merge, so it must
+// neither count in the floor a level write records (the next refill would
+// read as a refund below it, and the route's next burns would be swallowed)
+// nor hide what the running totals owe (a trim burn would go free while the
+// route's debt stood in for a total that went back). So an `owed` meter
+// comes off the level like any draw, and is left out of both.
 
 /** A meter reads at most this: a running fuel total stays well inside exact
  *  integers, and a hostile reading past it counts as none. */
@@ -291,6 +303,11 @@ export const FUEL_METER_MAX = 1e12;
 export interface FuelDrawMeter {
   read(): number;
   subscribe(listener: () => void): () => void;
+  /** 🚏 A debt against the STORED level rather than a running total (the
+   *  ferry route's: it falls back to 0 at each home refill). It comes off
+   *  the level, but never enters the reading a level write records nor the
+   *  deficit a drawing consumer adds (see above). */
+  owed?: boolean;
 }
 
 const drawMeters = new Map<string, { meter: FuelDrawMeter; unsubscribe: () => void }>();
@@ -309,10 +326,18 @@ function meterValue(v: unknown): number {
   return typeof v === 'number' && v > 0 && v <= FUEL_METER_MAX ? v : 0;
 }
 
-/** The tank's meter: every consumer's total, added up. */
+/** The tank's meter: every consumer's running total, added up (owed
+ *  meters apart: owedReading). */
 function meterReading(): number {
   let total = 0;
-  for (const { meter } of drawMeters.values()) total += meterValue(meter.read());
+  for (const { meter } of drawMeters.values()) if (!meter.owed) total += meterValue(meter.read());
+  return total;
+}
+
+/** 🚏 What the owed meters take off the level now (the ferry route's debt). */
+function owedReading(): number {
+  let total = 0;
+  for (const { meter } of drawMeters.values()) if (meter.owed) total += meterValue(meter.read());
   return total;
 }
 
@@ -353,7 +378,9 @@ export function readFuelLevel(capacity = Number.POSITIVE_INFINITY): number {
   // Negative-fuel guard belongs here too — a peer could write -Infinity and
   // every reader would fail-open otherwise. Clamp to [0, +∞) at the boundary;
   // capacity clamp is a caller responsibility (see clampFuelToCapacity).
-  return Math.max(0, held - drawnSince);
+  // 🚏 An owed meter (the route's debt) comes off on top, never through the
+  // base the level was written against.
+  return Math.max(0, held - drawnSince - owedReading());
 }
 
 /** 🚏 The level the fuel record stores, before any draw meter comes off (0

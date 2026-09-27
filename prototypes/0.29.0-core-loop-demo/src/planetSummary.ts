@@ -12,7 +12,9 @@
  *   - per station: its record (name, planet, slot, berth door, and any fields
  *     a newer build adds, carried through untouched), its latest trim and its
  *     latest move to another planet;
- *   - per ship: its name, planet and flight (status, from, to, times).
+ *   - per ship: its name, planet and flight (status, from, to, times), and
+ *     for a ferry on a route its gate, next stop, departure and status word
+ *     (departures boards in rooms its riders never publish to read these).
  *
  * Three levels, not full-atlas gossip:
  *   - your own station: its full atlas, as before (stationAtlas);
@@ -76,6 +78,14 @@ export interface StationSummary {
   updatedAt: number;
 }
 
+/** 🚏📋 A route ferry's status, as departures boards show it
+ *  (departuresBoard.ts: BOARDING, ON TIME, HOLDING FOR BERTH, DELAYED,
+ *  NOT DOCKED, PAUSED, ROUTE BLOCKED). */
+export type ShipRouteStatus = 'boarding' | 'on-time' | 'holding' | 'delayed' | 'not-docked' | 'paused' | 'blocked';
+export const SHIP_ROUTE_STATUSES: readonly ShipRouteStatus[] = [
+  'boarding', 'on-time', 'holding', 'delayed', 'not-docked', 'paused', 'blocked',
+];
+
 export interface ShipSummary {
   /** The ship's room id. */
   roomId: string;
@@ -88,6 +98,15 @@ export interface ShipSummary {
   toRoom?: string;
   departedAt?: number;
   etaAt?: number;
+  /** 🚏📋 A ferry on a route (build notes A9 item 7), so an all-gates board
+   *  in a room its riders never publish to can still show it, "as of"
+   *  updatedAt: the gate it is docked at (or bound for), its next stop's
+   *  berth room, its departure from here, and its status word. Additive: an
+   *  older client's clean drops them, and its relay passes the rest. */
+  gate?: number;
+  nextStopRoom?: string;
+  departAt?: number;
+  routeStatus?: ShipRouteStatus;
   updatedAt: number;
 }
 
@@ -188,6 +207,14 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.toRoom !== undefined) out.toRoom = v.toRoom as string;
   if (v.departedAt !== undefined) out.departedAt = v.departedAt as number;
   if (v.etaAt !== undefined) out.etaAt = v.etaAt as number;
+  // 🚏📋 The route fields each stand or drop alone: a bad one never costs
+  // the ship its summary.
+  if (Number.isInteger(v.gate) && (v.gate as number) >= 1 && (v.gate as number) <= 99) out.gate = v.gate as number;
+  if (isId(v.nextStopRoom)) out.nextStopRoom = v.nextStopRoom;
+  if (isTime(v.departAt)) out.departAt = v.departAt;
+  if (typeof v.routeStatus === 'string' && (SHIP_ROUTE_STATUSES as readonly string[]).includes(v.routeStatus)) {
+    out.routeStatus = v.routeStatus as ShipRouteStatus;
+  }
   return out;
 }
 

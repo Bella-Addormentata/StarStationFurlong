@@ -1,0 +1,309 @@
+/**
+ * 🚏📋📡 Departures writes — a rider's game tells each stop's board about its
+ * ferry (robot pilot routes, build notes A6; owner decisions 2026-09-27:
+ * announcements aboard AND on boards, the schedule belongs to the ship).
+ *
+ * A ferry's route and checkpoints live in the SHIP's room doc. A stop's board
+ * lives in the STATION's berth room, which the rider's game does not have
+ * bound. So, modeled on farDoorWrite.ts (which carries door records the same
+ * way): a short-lived background session to the berth room's doc on the
+ * local node, which waits until the replica holds real state (for a room
+ * hosted elsewhere, a fresh answer from its live host), applies ONE publish
+ * (departuresDoc.applyDeparturesPublish: the ferry's route entry and its
+ * checkpoints, one key per event), waits for the node's acknowledgment, and
+ * hangs up. It needs a pass for the berth room, as the keeper's DOCK does,
+ * and never writes one: the publish carries room and door ids only.
+ *
+ * WHEN (createDeparturesPublisher). The game that WRITES a route change
+ * publishes it: START, each checkpoint (a hold, its renewal, the dock that
+ * ends it, a skip, a DEPART, a handover, REFUEL, PAUSE, RESUME), STOP, and
+ * the finish after STOP (which takes the ferry off the boards). It hears
+ * them from shipRoute.onRouteWritten, waits for the gesture to end (one
+ * helm press may write several entries), and sends one snapshot of the whole
+ * route and run: the stop the change concerns first, every other stop once
+ * that one has answered. On-time legs publish nothing: every board works the
+ * timetable out from the clock.
+ *
+ * Best effort, like the far dock write: per berth room one session at a
+ * time, and only the NEWEST snapshot waits behind it (a hold renewed every
+ * minute never queues up). An unreachable room is retried twice, 30 s and
+ * then 60 s later, unless newer news replaced it; a room this game holds no
+ * pass for is skipped (another rider may reach it, and the planet's ship
+ * summaries carry the ferry to all-gates boards anyway). Never throws.
+ *
+ * The session is this file; the decision is departuresDoc.ts (pure over the
+ * far doc, pinned by departuresDoc.test.ts); the publisher's scheduling is
+ * pinned by departuresWrite.test.ts with a fake writer and clock.
+ */
+
+import * as Y from 'yjs';
+import { NetworkProvider } from './network/NetworkProvider';
+import { YjsSync } from './network/YjsSync';
+import type { RoomBootstrap } from './network/protocol';
+import { ysyncSigner } from './keypair';
+import { roomStateArrived, underWriteDeadline, withTimeout } from './farDoorWrite';
+import { applyDeparturesPublish, publishRoomOrder } from './departuresDoc';
+import type { DeparturesPublish } from './departuresDoc';
+import { isRouteRunning } from './pilotRoute';
+import type { RouteCheckpoint, RouteWriteNotice, ShipRoute } from './shipRoute';
+
+// ── The session ──────────────────────────────────────────────────────────────
+
+/** What a publish to one room came to. */
+export type DeparturesWriteResult = 'written' | 'unchanged' | 'unreachable' | 'no-address';
+
+/** The same seams farDoorWrite.ts is given (main.ts wires both alike). */
+export interface DeparturesWriteDeps {
+  decode: (seed: string) => RoomBootstrap | null;
+  resolve: (boot: RoomBootstrap) => Promise<RoomBootstrap>;
+  hostedHere: (roomId: string) => boolean;
+  activeRoomDoc: (roomId: string) => Y.Doc | null;
+}
+
+let deps: DeparturesWriteDeps | null = null;
+
+export function initDeparturesWrite(d: DeparturesWriteDeps): void {
+  deps = d;
+}
+
+const READY_TIMEOUT_MS = 10_000;
+const HOST_READY_TIMEOUT_MS = 20_000;
+const ACK_TIMEOUT_MS = 5_000;
+const SESSION_DEADLINE_MS = 60_000;
+
+const queues = new Map<string, Promise<unknown>>();
+
+/**
+ * Publish one ferry snapshot to the room `address` names (a pass for it).
+ * Serialized per room. Never throws.
+ */
+export function writeDepartures(address: string, pub: DeparturesPublish): Promise<DeparturesWriteResult> {
+  const d = deps;
+  if (!d) return Promise.resolve('unreachable');
+  const imported = d.decode(address);
+  if (!imported) return Promise.resolve('no-address');
+  const key = imported.roomId;
+  const write = () => {
+    // The board's room is the one this game stands in: its bound doc.
+    const here = d.activeRoomDoc(imported.roomId);
+    if (here) return Promise.resolve(applyDeparturesPublish(here, pub).wrote ? 'written' as const : 'unchanged' as const);
+    return underWriteDeadline<DeparturesWriteResult>(
+      (mayWrite) => session(d, imported, pub, mayWrite),
+      SESSION_DEADLINE_MS,
+      () => 'unreachable',
+    );
+  };
+  const prior = queues.get(key) ?? Promise.resolve();
+  const run = prior.then(write, write);
+  const tail = run.catch(() => undefined);
+  queues.set(key, tail);
+  void tail.then(() => {
+    if (queues.get(key) === tail) queues.delete(key);
+  });
+  return run.catch(() => 'unreachable' as const);
+}
+
+async function session(
+  d: DeparturesWriteDeps,
+  imported: RoomBootstrap,
+  pub: DeparturesPublish,
+  mayWrite: () => boolean,
+): Promise<DeparturesWriteResult> {
+  let provider: NetworkProvider | null = null;
+  let sync: YjsSync | null = null;
+  try {
+    const boot = await d.resolve(imported);
+    provider = new NetworkProvider();
+    const p = provider;
+    await withTimeout(p.connect(boot), READY_TIMEOUT_MS, 'board room dial');
+    const channel = await withTimeout(p.openChannel('ysync'), READY_TIMEOUT_MS, 'board room channel');
+    sync = new YjsSync({
+      roomId: boot.roomId,
+      channel,
+      ...ysyncSigner(),
+      bootRecord: () => p.getBootRecord(),
+    });
+    const s = sync;
+    p.onEnvelope((env: { kind?: string; room?: string; payload?: string }) => {
+      if (env.kind === 'ysync') {
+        s.ingestEnvelope(env);
+        return;
+      }
+      if (env.kind === 'bridge' && typeof env.payload === 'string') {
+        try {
+          if (JSON.parse(atob(env.payload))?.status === 'connected') {
+            s.markPeerLinked();
+            s.resync();
+          }
+        } catch {
+          /* non-JSON bridge payload */
+        }
+      }
+    });
+    await s.start();
+    const hostedHere = d.hostedHere(boot.roomId);
+    if (!hostedHere) s.markPeerLinked();
+    const readyWithin = hostedHere ? READY_TIMEOUT_MS : HOST_READY_TIMEOUT_MS;
+    if (!(await roomStateArrived(s, readyWithin, hostedHere))) {
+      console.warn(`[departures] ${boot.roomId}: no room state within ${readyWithin} ms`);
+      return 'unreachable';
+    }
+    if (!mayWrite()) return 'unreachable';
+    // Read-before-write, as the far dock write: the merge sees the board
+    // room's real entries, so a newer one there is kept.
+    const since = Y.encodeStateVector(s.doc);
+    const { wrote } = applyDeparturesPublish(s.doc, pub);
+    if (!wrote) return 'unchanged';
+    if (!(await s.confirmOwnWrites(since, ACK_TIMEOUT_MS))) {
+      console.warn(`[departures] ${boot.roomId}: the node did not acknowledge the write`);
+      return 'unreachable';
+    }
+    console.log(`🚏 Departures → ${boot.roomId}: ${pub.name} (${pub.checkpoints.length} checkpoints)`);
+    return 'written';
+  } catch (err) {
+    console.warn('[departures] board room session failed:', err);
+    return 'unreachable';
+  } finally {
+    const closing = { sync, provider };
+    void closing.sync?.stop().catch(() => undefined);
+    void closing.provider?.disconnect().catch(() => undefined);
+  }
+}
+
+// ── The publisher (which rooms, when) ────────────────────────────────────────
+
+/** Retries of an unreachable room: 30 s, then 60 s. */
+export const DEPARTURES_RETRY_MS: readonly number[] = [30_000, 60_000];
+
+export interface DeparturesPublisherDeps {
+  /** The ship room this game stands in ('' when none). */
+  shipRoomId: () => string;
+  /** The ship's name, as its riders see it. */
+  shipName: () => string;
+  /** The tanks' derived capacity. */
+  capacity: () => number;
+  route: () => ShipRoute | null;
+  checkpoints: () => readonly RouteCheckpoint[];
+  /** A pass this game holds for a room, or undefined. */
+  seedFor: (roomId: string) => string | undefined;
+  write: (address: string, pub: DeparturesPublish) => Promise<DeparturesWriteResult>;
+  clock?: () => number;
+  /** setTimeout (tests pass their own). */
+  later?: (fn: () => void, ms: number) => void;
+}
+
+export interface DeparturesPublisher {
+  /** Hear one of this game's route writes (shipRoute.onRouteWritten). */
+  routeWritten: (n: RouteWriteNotice) => void;
+  /** Rooms with a publish in flight or waiting (tests). */
+  busyRooms: () => string[];
+}
+
+interface RoomState {
+  /** The newest snapshot waiting for this room. */
+  waiting: DeparturesPublish | null;
+  busy: boolean;
+  /** Retries spent on the snapshot now being sent. */
+  retries: number;
+}
+
+/**
+ * The publisher main.ts installs once. It snapshots the route after the
+ * gesture that wrote it, and sends it to every stop's berth room: the stop
+ * the write concerns first, the rest once that one has answered.
+ */
+export function createDeparturesPublisher(d: DeparturesPublisherDeps): DeparturesPublisher {
+  const clock = d.clock ?? Date.now;
+  const later = d.later ?? ((fn, ms) => { setTimeout(fn, ms); });
+  const rooms = new Map<string, RoomState>();
+  let pending: { ship: string; legSeq: number | null } | null = null;
+
+  const stateOf = (room: string): RoomState => {
+    let st = rooms.get(room);
+    if (!st) {
+      st = { waiting: null, busy: false, retries: 0 };
+      rooms.set(room, st);
+    }
+    return st;
+  };
+
+  /** Send what waits for `room`; resolves once this room has answered it. */
+  const pump = async (room: string): Promise<void> => {
+    const st = stateOf(room);
+    if (st.busy || !st.waiting) return;
+    const pub = st.waiting;
+    st.waiting = null;
+    const seed = d.seedFor(room);
+    if (!seed) {
+      st.retries = 0;
+      return;
+    }
+    st.busy = true;
+    let result: DeparturesWriteResult = 'unreachable';
+    try {
+      result = await d.write(seed, pub);
+    } catch {
+      result = 'unreachable';
+    }
+    st.busy = false;
+    if (result === 'unreachable' && !st.waiting && st.retries < DEPARTURES_RETRY_MS.length) {
+      const wait = DEPARTURES_RETRY_MS[st.retries];
+      st.retries++;
+      later(() => {
+        if (!st.waiting) st.waiting = pub;
+        void pump(room);
+      }, wait);
+      return;
+    }
+    st.retries = 0;
+    if (st.waiting) void pump(room);
+  };
+
+  const offer = (room: string, pub: DeparturesPublish): Promise<void> => {
+    const st = stateOf(room);
+    st.waiting = pub;
+    st.retries = 0;
+    return pump(room);
+  };
+
+  const flush = (): void => {
+    const p = pending;
+    pending = null;
+    if (!p) return;
+    const ship = d.shipRoomId();
+    // The player left the ship's room before the gesture ended: the doc now
+    // bound is another room's.
+    if (!ship || ship !== p.ship) return;
+    const route = d.route();
+    if (!route) return;
+    const pub: DeparturesPublish = {
+      shipRoomId: ship,
+      name: d.shipName(),
+      capacity: d.capacity(),
+      route,
+      checkpoints: isRouteRunning(route) ? [...d.checkpoints()] : [],
+      at: clock(),
+    };
+    const order = publishRoomOrder(route, p.legSeq);
+    if (order.length === 0) return;
+    const [first, ...rest] = order;
+    void offer(first, pub).finally(() => {
+      for (const room of rest) void offer(room, pub);
+    });
+  };
+
+  return {
+    routeWritten: (n) => {
+      const ship = d.shipRoomId();
+      if (!ship) return;
+      if (pending && pending.ship === ship) {
+        // Several writes in one gesture: the first names the stop.
+        if (pending.legSeq === null && n.legSeq !== undefined) pending.legSeq = n.legSeq;
+        return;
+      }
+      pending = { ship, legSeq: n.legSeq ?? null };
+      later(flush, 0);
+    },
+    busyRooms: () => [...rooms.entries()].filter(([, st]) => st.busy || st.waiting !== null).map(([room]) => room),
+  };
+}

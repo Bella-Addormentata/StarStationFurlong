@@ -105,6 +105,7 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
  *  (world.reconcileRobots), so label it so it's findable. */
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
+  'departures-board': '🚏 DEPARTURES BOARD',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
   'rose-bouquet': '🌹 ROSE BOUQUET',
   'purple-bouquet': '💜 PURPLE BOUQUET',

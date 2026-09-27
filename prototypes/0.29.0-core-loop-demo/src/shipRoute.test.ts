@@ -11,6 +11,9 @@
  * one transaction (through redocking), and REFUEL through the route.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync, readdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
 import {
   dockCheckpoint,
@@ -695,15 +698,22 @@ describe('the route fuel meter', () => {
     expect(readFuelLevel(CAP)).toBe(CAP - 2 * cost);
   });
 
-  it('(why the order matters) the level written first would swallow the next burn', () => {
+  it('either order: the level written before its checkpoint still leaves the next burn to come off', () => {
+    // ⛽ The route's meter is OWED (shipDoc): a level write never records its
+    // debt in the floor, so no writer has to order around it. (Before it was,
+    // this order swallowed the next leg's burn.)
     const { run, route, start } = started(saved(), 70);
     installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
+    const cost = routeLegFuel(route, 0, 1)!;
     const on = onTime(route, start, 3);
     clock = on[0].arrive + 30 * SEC;
     writeFuelLevel(CAP, CAP);
+    // Above the route's level, the write shows only once the route says so.
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
     writeRouteCheckpoint(run, fuelCheckpoint(route, 1, { at: clock, fuel: CAP }), clock);
-    clock = on[1].depart + SEC;
     expect(readFuelLevel(CAP)).toBe(CAP);
+    clock = on[1].depart + SEC;
+    expect(readFuelLevel(CAP)).toBe(CAP - cost);
   });
 
   it('a paused route reads the stored level: PAUSE writes the derived level after its checkpoint', () => {
@@ -749,6 +759,127 @@ describe('the route fuel meter', () => {
     expect(readFuelLevel(CAP)).toBeLessThan(70);
     off();
     expect(readFuelLevel(CAP)).toBe(70);
+  });
+});
+
+// ── PR 173's meter rules, with the route's meter among them ─────────────────
+
+describe("PR 173's meter rules (the route's meter is owed)", () => {
+  // Another consumer drawing through its own running total, the way station
+  // keeping's trim burns do (stationKeeping.test.ts pins those on their own).
+  const OTHER = 'test-trim';
+  let drawn = 0;
+  const otherDraws = (amount: number) => { drawn = drawn + fuelDrawDeficit() + amount; };
+  const storedMeter = () => (map().get('fuel') as { meter?: number } | undefined)?.meter ?? 0;
+  beforeEach(() => {
+    drawn = 0;
+    setFuelDrawMeter(OTHER, { read: () => drawn, subscribe: () => () => {} });
+  });
+  afterEach(() => setFuelDrawMeter(OTHER, null));
+
+  it('the route registers its own named meter, owed, beside the others', () => {
+    const { route, start } = started(saved(), 70);
+    const off = installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
+    clock = onTime(route, start, 1)[0].depart + SEC;
+    const cost = routeLegFuel(route, 0, 1)!;
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    // Replacing it under the same name replaces it (one route meter a game).
+    installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    off();
+    expect(readFuelLevel(CAP)).toBe(70);
+  });
+
+  it("another consumer's draw during a route comes off once, beside the legs", () => {
+    const { route, start } = started(saved([0, 1], { homeRefuel: true }), CAP);
+    installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
+    const cost = routeLegFuel(route, 0, 1)!;
+    const on = onTime(route, start, 3);
+    clock = on[0].depart + SEC;
+    expect(fuelDrawDeficit()).toBe(0);
+    otherDraws(5);
+    expect(drawn).toBe(5);
+    expect(readFuelLevel(CAP)).toBe(CAP - cost - 5);
+    clock = on[1].depart + SEC;
+    expect(readFuelLevel(CAP)).toBe(CAP - 2 * cost - 5);
+    // The home refill fills the route's own legs back, with no write; the
+    // other draw stays drawn until a level write folds it (REFUEL, finish).
+    clock = on[1].arrive + SEC;
+    expect(readFuelLevel(CAP)).toBe(CAP - 5);
+    expect(fuelDrawDeficit()).toBe(0);
+  });
+
+  it('a total that went back neither refunds fuel nor frees the next draw while the route owes fuel', () => {
+    const { route, start } = started(saved(), 70);
+    installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
+    const cost = routeLegFuel(route, 0, 1)!;
+    clock = onTime(route, start, 1)[0].depart + SEC;
+    // The level was written after 10 fuel of other draws; then an older
+    // record (4 drawn) won a merge. The route owes `cost` on top.
+    map().set('fuel', { level: 70, meter: 10 });
+    drawn = 4;
+    expect(fuelDrawDeficit()).toBe(6);
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    otherDraws(3);
+    expect(drawn).toBe(13);
+    expect(readFuelLevel(CAP)).toBe(70 - cost - 3);
+  });
+
+  it('a route writer’s level write records the running totals it saw, never the route’s debt', () => {
+    const { run, route, start } = started(saved(), 70);
+    installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
+    const cost = routeLegFuel(route, 0, 1)!;
+    const on = onTime(route, start, 2);
+    otherDraws(4);
+    clock = on[0].arrive + 20 * SEC;
+    const level = readFuelLevel(CAP);
+    expect(level).toBe(70 - cost - 4);
+    // A route writer's pair (RESUME, REFUEL): its `fuel` entry, and the level.
+    expect(writeRouteCheckpoint(run, fuelCheckpoint(route, 1, { at: clock, fuel: level }), clock)).toBe(true);
+    writeFuelLevel(level, CAP);
+    expect(storedMeter()).toBe(4);
+    expect(readFuelLevel(CAP)).toBe(level);
+    expect(fuelDrawDeficit()).toBe(0);
+    // The next leg's burn still comes off in full.
+    clock = on[1].depart + SEC;
+    expect(readFuelLevel(CAP)).toBe(level - cost);
+  });
+
+  it('START, REFUEL and the finish after STOP write the level through writeFuelLevel against the running totals', () => {
+    let off: (() => void) | null = null;
+    try {
+      const { route, start } = started(saved([0, 1], { homeRefuel: true }), 70);
+      expect(readStoredFuelLevel()).toBe(CAP); // START's ceiling
+      otherDraws(2);
+      off = installRouteFlight({ capacity: () => CAP, clock: () => clock });
+      const cost = routeLegFuel(route, 0, 1)!;
+      const on = onTime(route, start, 4);
+      clock = on[0].arrive + 20 * SEC;
+      expect(readFuelLevel(CAP)).toBe(70 - cost - 2);
+      expect(refuelShipRoute(CAP, clock)).toBe(true);
+      expect(storedMeter()).toBe(2);
+      expect(readFuelLevel(CAP)).toBe(CAP);
+      otherDraws(1);
+      expect(stopShipRoute(clock)).toBe(true);
+      clock = on[1].arrive + SEC; // pinned at stop 0 (home: full)
+      expect(settleRouteFlight({ now: clock })).toBe('finish');
+      expect(readShipRoute()!.startedAt).toBeUndefined();
+      expect(storedMeter()).toBe(3);
+      expect(readFuelLevel(CAP)).toBe(CAP - 1);
+      expect(fuelDrawDeficit()).toBe(0);
+    } finally {
+      off?.();
+    }
+  });
+
+  it('only shipDoc.writeFuelLevel writes the fuel record', () => {
+    // Every route fuel write (and every other) goes through writeFuelLevel,
+    // which records the floor; a direct write of the key would skip it.
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const direct = readdirSync(dir)
+      .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && f !== 'shipDoc.ts')
+      .filter((f) => /\.set\(\s*['"`]fuel['"`]/.test(readFileSync(join(dir, f), 'utf8')));
+    expect(direct).toEqual([]);
   });
 });
 

@@ -38,29 +38,36 @@
  *
  * FUEL. The ferry's fuel is derived like its position (A3 rule 5: the newest
  * level less every leg since, full again at each arrival at the first stop
- * with the home refill). The tank reads it through its own DRAW METER, named
- * 'route' (installRouteFuelMeter, the way stationKeeping.ts registers
+ * with the home refill). The tank reads it through the route's own named
+ * DRAW METER, 'route' (installRouteFuelMeter, registered through
+ * shipDoc.setFuelDrawMeter the way stationKeeping.ts registers
  * 'stationKeeping'): the meter reads how far below the STORED level the
  * route has taken the tank, max(0, stored − derived). So a leg on time
- * writes no fuel either, and every existing fuel reader (the helm's gauge,
+ * writes no fuel, the home refill writes none either (the meter falls back
+ * to 0 on arrival), and every existing fuel reader (the helm's gauge,
  * canDepart, tows) sees the route's level with no change of its own.
  *
- *   The one rule that keeps the meter honest: THE ROUTE METER READS 0
- *   WHENEVER THE `fuel` RECORD IS WRITTEN. writeFuelLevel records the meter
- *   reading it wrote against; if the route's share were in it, the next home
- *   refill (which lowers the route's reading) would count as a refund below
- *   that floor, and PR 173's meter would swallow the route's next burns. So:
- *    - START writes the level FIRST (the route not yet running, meter 0):
- *      up to the tanks' capacity with the home refill (a CEILING the derived
- *      level can climb back to without a write), else the level it read.
- *    - REFUEL on a running route writes its `fuel` checkpoint FIRST (the
- *      derived level jumps to full, meter 0), then the level.
- *    - finishing a route (after STOP) clears the run FIRST, then writes the
- *      derived flight and fuel (finishShipRoute runs the caller's writes
- *      after the clear, in one transaction).
- *    - a PAUSED route's meter reads 0: the stored level rules while paused,
- *      so PAUSE writes the derived level after its pause checkpoint, and
- *      RESUME writes a fresh ceiling before its dock and fuel checkpoints.
+ *   ⛽ PR 173's meter rules, and why this one is OWED. PR 173's meters are
+ *   running totals that only climb; a level write records the reading it
+ *   saw (the floor), and a total that goes back (an older record winning a
+ *   merge) neither refunds fuel nor lets the next draw go free. The route's
+ *   meter goes back by design at every home refill, so it is registered
+ *   `owed` (shipDoc): it comes off the level, but never enters the floor a
+ *   level write records, nor the deficit another consumer's draw adds. Two
+ *   consequences, pinned by shipRoute.test.ts ("PR 173's meter rules"):
+ *    - a station-keeping or station-move draw during a route still comes off
+ *      once, and a trim total that went back still frees no burn;
+ *    - no route writer has to order its `fuel` write around the meter. Every
+ *      route fuel write goes through writeFuelLevel (START's ceiling, REFUEL,
+ *      PAUSE, RESUME, the finish after STOP), each in one transaction with
+ *      its checkpoint, and either order reads the same.
+ *   While a route runs the tank reads min(stored, derived): a level write
+ *   above the route's level shows only once the route's own checkpoint says
+ *   so (REFUEL writes a `fuel` entry; START and RESUME write the CEILING,
+ *   the capacity with the home refill, else the level aboard, so the
+ *   derived level can climb back to it with no write). A PAUSED route's
+ *   meter reads 0: the stored level rules while paused, so PAUSE writes the
+ *   derived level with its pause entry.
  *   An old client ignores the meter: it reads the ceiling, a stale level, and
  *   its REFUEL or DEPART writes fold nothing of the route's (degrade, not
  *   corrupt). Routes should ship once clients have updated (A4).
@@ -98,6 +105,7 @@ import type { LiveDockAt, RouteFlight, RouteSettleAction } from './pilotRoute';
 import {
   clampFuelToCapacity,
   readFlightRecord,
+  readFuelLevel,
   readStoredFuelLevel,
   setFuelDrawMeter,
   shipDocHandle,
@@ -596,6 +604,38 @@ function touched(): void {
   docVersion++;
 }
 
+// 🚏📋 What THIS game just wrote, for the departures publisher (build notes
+// A6: a rider's game publishes the route at START and each checkpoint it
+// writes to every stop's board). Heard after the write, inside any outer
+// transaction the caller opened (a listener that reads the doc should wait
+// for the gesture to end: departuresWrite.ts defers to the next task).
+
+/** A route write this game made: START, a checkpoint (its stay), STOP, or
+ *  the finish after STOP. */
+export interface RouteWriteNotice {
+  kind: 'start' | 'checkpoint' | 'stop' | 'finish';
+  /** The stay the write concerns (START: 0). */
+  legSeq?: number;
+}
+
+const writeListeners = new Set<(n: RouteWriteNotice) => void>();
+
+/** Hear this game's own route writes. Returns the unsubscriber. */
+export function onRouteWritten(listener: (n: RouteWriteNotice) => void): () => void {
+  writeListeners.add(listener);
+  return () => writeListeners.delete(listener);
+}
+
+function announce(n: RouteWriteNotice): void {
+  for (const listener of [...writeListeners]) {
+    try {
+      listener(n);
+    } catch (err) {
+      console.error('[route] write listener threw:', err);
+    }
+  }
+}
+
 /** Delete this run's prunable entries and every other run's keys. Runs
  *  inside the caller's transaction. */
 function pruneIn(map: Y.Map<unknown>, route: ShipRoute & { startedAt: number }, now: number): number {
@@ -681,6 +721,7 @@ export function startShipRoute(o: RouteStartInput): number | null {
     for (const key of old) h.map.delete(key);
     touched();
   });
+  announce({ kind: 'start', legSeq: 0 });
   return startedAt;
 }
 
@@ -692,6 +733,7 @@ export function stopShipRoute(now: number): boolean {
   if (!h || !isRouteRunning(route) || route.stoppedAt !== undefined || !Number.isFinite(now)) return false;
   const stopped: ShipRoute = { ...route, stoppedAt: Math.max(route.startedAt, now) };
   h.doc.transact(() => { h.map.set('route', routeToWire(stopped)); touched(); });
+  announce({ kind: 'stop' });
   return true;
 }
 
@@ -716,6 +758,7 @@ export function writeRouteCheckpoint(run: number, entry: RouteCheckpoint, now = 
     touched();
     pruneIn(h.map, route, now);
   });
+  announce({ kind: 'checkpoint', legSeq: clean.legSeq });
   return true;
 }
 
@@ -747,6 +790,7 @@ export function finishShipRoute(apply?: () => void): boolean {
     touched();
     apply?.();
   });
+  announce({ kind: 'finish' });
   return true;
 }
 
@@ -782,6 +826,9 @@ export function installRouteFuelMeter(deps: RouteFuelMeterDeps): () => void {
   const cache = createRouteWalkCache();
   const clock = deps.clock ?? Date.now;
   setFuelDrawMeter(ROUTE_FUEL_METER, {
+    // A debt against the stored level that the home refill takes back to 0,
+    // not a running total: PR 173's floor and deficit leave it out.
+    owed: true,
     read: () => {
       try {
         const s = snapshot();
@@ -930,9 +977,13 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
   if (!action) return null;
   if (action.kind === 'finish') {
     const capacity = d.capacity();
+    // ⛽ What the tank reads now, with the route's meter still on: the
+    // route's level less any other consumer's draw since the level was
+    // written (a trim burn), which the route's own accounting never saw.
+    const level = Math.min(action.fuel, readFuelLevel(capacity));
     const finished = finishShipRoute(() => {
       for (const rec of action.writes) writeFlightRecord(rec);
-      writeFuelLevel(action.fuel, capacity);
+      writeFuelLevel(level, capacity);
     });
     return finished ? 'finish' : null;
   }

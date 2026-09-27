@@ -410,8 +410,9 @@ async function session(
 /** Wait for roomStateReady on a doc that is not the active one. Until it
  *  holds, the replica is EMPTY (or, for a room hosted elsewhere, possibly
  *  STALE), and neither is knowledge about the room — a decision made on it
- *  could overwrite a record it simply had not received yet. */
-function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean): Promise<boolean> {
+ *  could overwrite a record it simply had not received yet. (🚏📋 Exported
+ *  for departuresWrite.ts, whose sessions wait the same way.) */
+export function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean): Promise<boolean> {
   const roomMap = sync.doc.getMap('roomInfo');
   const ready = () =>
     roomStateReady({
@@ -454,7 +455,7 @@ function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean)
   });
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
     p.then(

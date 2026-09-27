@@ -123,6 +123,21 @@ describe('guards', () => {
     expect(cleanShipSummary({ ...ship, etaAt: Infinity }, T0)).toBeNull();
     expect(cleanShipSummary({ ...ship, seed: 'secret' }, T0)).not.toHaveProperty('seed');
   });
+
+  it('keeps a route ferry\'s gate, next stop, departure and status; a bad one drops alone', () => {
+    const ship = {
+      roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a',
+      gate: 2, nextStopRoom: 'room-b', departAt: T0 + 60_000, routeStatus: 'boarding', updatedAt: T0,
+    };
+    expect(cleanShipSummary(ship, T0)).toEqual(ship);
+    for (const [field, bad] of [['gate', 0], ['gate', 100], ['gate', 1.5], ['nextStopRoom', ''], ['nextStopRoom', 'r'.repeat(129)],
+      ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3]] as const) {
+      const clean = cleanShipSummary({ ...ship, [field]: bad }, T0);
+      expect(clean).not.toBeNull();
+      expect(clean).not.toHaveProperty(field);
+      expect(clean?.status).toBe('docked');
+    }
+  });
 });
 
 describe('merge', () => {

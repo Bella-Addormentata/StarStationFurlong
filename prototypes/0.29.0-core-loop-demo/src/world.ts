@@ -6,7 +6,7 @@
 
 import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
-import { readDoorPolicy } from "./doorPolicy";
+import { readDockGates, readDoorPolicy } from "./doorPolicy";
 import { setLocalPresence } from "./localPresence";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
@@ -133,8 +133,11 @@ import {
   createCoinPusherUI,
   createRobotDockUI,
   createCloneVatUI,
+  createDeparturesBoardUI,
+  readDepartureScreen,
   readLiveRoomStatus,
 } from "./devices";
+import { boardGate } from "./departuresDoc";
 import {
   closeSlotMachine,
   stopAutoSlotMachine,
@@ -3863,8 +3866,12 @@ export class World {
       if (this.screenStatusTimer >= 1.0) {
         this.screenStatusTimer = 0;
         const status = readLiveRoomStatus();
-        for (const screen of this.wallScreens.values()) {
-          screen.updateStatus(status);
+        for (const [itemId, screen] of this.wallScreens) {
+          // 🚏📋 A departures board adds its own rows (its gate setting is
+          // its own); the plain terminal's status carries none.
+          screen.updateStatus(
+            screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
+          );
         }
       }
     }
@@ -5766,6 +5773,26 @@ export class World {
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "departuresBoard") {
+      // 🚏📋 The board's console: what it shows (all gates, or one gate's
+      // ferries) and its rows now. Owner-gated like the robot console.
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const roomGates = () => Object.values(readDockGates());
+      const ui = createDeparturesBoardUI({
+        itemId: deviceId,
+        canEdit: () => canEditRoom().ok,
+        gateChoices: () => [
+          ...roomGates(),
+          ...(currentStation()?.berths ?? []).flatMap((b) => (b.gate !== undefined ? [b.gate] : [])),
+        ],
+        defaultGate: () => boardGate(null, roomGates()),
+        // Dim the in-world screen while focused, as the terminal does (D0.4).
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

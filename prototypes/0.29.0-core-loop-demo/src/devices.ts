@@ -223,13 +223,16 @@ import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
 import { consoleRoutineRefusal, pilotRoutineOffered, routeCaptainDockId, shipPilotEligible } from './shipPilot';
+import { rowText } from './departuresBoard';
+import type { BoardView } from './departuresBoard';
+import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './departuresDoc';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -317,6 +320,19 @@ export interface WallComputerStatus {
   roomName: string;
   peers: number;
   nodeOnline: boolean;
+  /** 🚏📋 A departures board's rows (build notes A6): World fills them per
+   *  screen, for the screens that ask (WallScreenHandle.departures); the
+   *  plain terminal ignores them. */
+  departures?: DepartureScreen;
+}
+
+/** 🚏📋 A board's rows as its screen prints them (departuresBoard.rowText). */
+export interface DepartureScreen {
+  /** "DEPARTURES · ALL GATES" / "DEPARTURES · GATE 2". */
+  title: string;
+  rows: Array<{ ferry: string; place: string; gate: string; time: string; status: string; note: string }>;
+  /** Nothing to show, and why ("NO FERRIES DUE", "NO DEPARTURES NEWS"). */
+  empty?: string;
 }
 
 /**
@@ -329,6 +345,42 @@ export interface WallScreenHandle {
   updateStatus(status: WallComputerStatus): void;
   /** Dim the in-world screen to "TERMINAL IN USE" while a player is focused. */
   setEngaged(engaged: boolean): void;
+  /** 🚏📋 A departures board (the wall computer's wide variant): World adds
+   *  its rows to the status it pushes. */
+  readonly departures?: boolean;
+}
+
+// ── 🚏📋 Departures boards (robot pilot routes, A6 + A9 item 7) ──────────────
+
+/** Where a board's rows come from (main.ts installs it: the room's
+ *  departures map, its berth doors, the planet's ship summaries). */
+let departureBoardSource: ((itemId: string) => BoardView | null) | null = null;
+
+export function setDepartureBoardSource(fn: ((itemId: string) => BoardView | null) | null): void {
+  departureBoardSource = fn;
+}
+
+/** A board's rows now, or null when nothing is installed or the read failed
+ *  (the screen then says so; it never throws into World's frame loop). */
+export function readDepartureBoard(itemId: string): BoardView | null {
+  if (!departureBoardSource) return null;
+  try {
+    return departureBoardSource(itemId);
+  } catch (err) {
+    console.warn('[departures] board read failed:', err);
+    return null;
+  }
+}
+
+/** A board's rows as its in-world screen prints them. */
+export function readDepartureScreen(itemId: string): DepartureScreen {
+  const view = readDepartureBoard(itemId);
+  if (!view) return { title: 'DEPARTURES', rows: [], empty: 'NO DEPARTURES NEWS' };
+  return {
+    title: view.title,
+    rows: view.rows.map(rowText),
+    ...(view.rows.length === 0 ? { empty: view.gate !== null ? `NO FERRIES DUE AT GATE ${view.gate}` : 'NO FERRIES DUE' } : {}),
+  };
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
@@ -4133,6 +4185,140 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     },
     update(): void {
       /* observer-driven; nothing per-frame */
+    },
+  };
+}
+
+// ── 🚏📋 DEPARTURES BOARD console (robot pilot routes, design §5a) ──────────
+
+export interface DeparturesBoardUIDeps {
+  /** The board's furniture item id — keys its setting (departuresDoc). */
+  itemId: string;
+  /** Owner gate — only the room owner changes what the board shows. */
+  canEdit: () => boolean;
+  /** Gate numbers the console offers: this room's gates and the station's. */
+  gateChoices: () => number[];
+  /** The gate an unset board shows (the room's one gate), or null (all). */
+  defaultGate: () => number | null;
+  /** Dims the in-world screen to "BOARD IN USE" while focused. */
+  onEngagedChange?: (engaged: boolean) => void;
+}
+
+/**
+ * The board's console (design §5a): what the board shows — ALL GATES (a
+ * departures hall) or GATE N (a gate-side board, that gate's ferries) — and
+ * the rows it shows now, live. An unset board shows the gate in its room when
+ * there is exactly one, else all gates. The rows are the in-world screen's
+ * (readDepartureBoard); ferries put them here from their riders' games.
+ */
+export function createDeparturesBoardUI(deps: DeparturesBoardUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let since = 0;
+
+  const rowsHtml = (): string => {
+    const view = readDepartureBoard(deps.itemId);
+    if (!view) return `<span style="font-size:10px; color:${CH_DIM};">No departures news in this room.</span>`;
+    if (view.rows.length === 0) {
+      return `<span style="font-size:10px; color:${CH_DIM};">No ferries due${view.gate !== null ? ` at gate ${view.gate}` : ''}.</span>`;
+    }
+    const tone = (st: string) =>
+      st === 'BOARDING' || st === 'ON TIME' ? '#2fe6a0' : st === 'ROUTE BLOCKED' ? '#FF1744' : '#FFB300';
+    return view.rows.map((r) => {
+      const t = rowText(r);
+      return `<div style="display:grid; grid-template-columns: 1.3fr 1.3fr 0.4fr 0.9fr; gap:4px; font-size:10px; align-items:baseline;">
+        <span style="color:${CH_GOLD_BRIGHT};">${escAttr(t.ferry)}</span>
+        <span style="color:${CH_GOLD};">${escAttr(t.place)}</span>
+        <span style="color:#00E5FF;">G${escAttr(t.gate)}</span>
+        <span style="color:${CH_GOLD};">${escAttr(t.time)}</span>
+        <span style="grid-column: 1 / span 4; color:${tone(t.status)}; font-weight:800; letter-spacing:0.5px;">${escAttr(t.status)}${t.note ? ` <span style="font-weight:400; color:${CH_DIM};">· ${escAttr(t.note)}</span>` : ''}</span>
+      </div>`;
+    }).join('');
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const owner = deps.canEdit();
+    const setting = readBoardSetting(deps.itemId);
+    const def = deps.defaultGate();
+    const showing = setting ? ('gate' in setting ? setting.gate : null) : def;
+    const choices = [...new Set([...deps.gateChoices(), ...(setting && 'gate' in setting ? [setting.gate] : [])])]
+      .filter((g) => Number.isInteger(g) && g >= 1 && g <= 99)
+      .sort((a, b) => a - b);
+    const btn = (id: string, label: string, on: boolean): string => `<button data-show="${id}" ${owner ? '' : 'disabled'} style="
+        padding:7px 10px; background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
+        border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'}; border-radius:7px;
+        color:${on ? '#2fe6a0' : CH_GOLD}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:0.5px;
+        cursor:${owner ? 'pointer' : 'default'};">${label}</button>`;
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🚏 DEPARTURES BOARD</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">SHOWS</div>
+      <div style="display:flex; flex-wrap:wrap; gap:6px;">
+        ${btn('all', 'ALL GATES', showing === null)}
+        ${choices.map((g) => btn(String(g), `GATE ${g}`, showing === g)).join('')}
+      </div>
+      <div style="font-size:9.5px; line-height:1.45; color:${CH_DIM};">
+        ${setting
+          ? `Set to ${showing === null ? 'all gates' : `gate ${showing}`}.${owner ? ' <button data-show="default" style="background:none; border:none; color:#00E5FF; font-family:inherit; font-size:9.5px; cursor:pointer; padding:0;">Back to the default</button>' : ''}`
+          : `Default: ${def !== null ? `gate ${def}, the one gate in this room` : 'all gates'}.`}
+      </div>
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">NOW</div>
+      <div data-rows style="display:flex; flex-direction:column; gap:8px;">${rowsHtml()}</div>
+      <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
+        ${owner ? 'Choose what this board shows: a departures hall, or one gate&apos;s ferries.' : 'Only the room owner can change what this board shows.'}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF DEPARTURES v1 · ferries post their timetables here from riders&apos; games · other ferries as of their last news
+      </div>
+    `;
+    if (!owner) return;
+    panel.querySelectorAll<HTMLButtonElement>('[data-show]').forEach((b) => {
+      b.addEventListener('click', () => {
+        if (!deps.canEdit()) return;
+        const v = b.dataset.show ?? '';
+        if (v === 'default') writeBoardSetting(deps.itemId, null);
+        else if (v === 'all') writeBoardSetting(deps.itemId, { all: true });
+        else writeBoardSetting(deps.itemId, { gate: Number(v) });
+      });
+    });
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-departures-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 380px; max-height: 90vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeDepartures(() => render());
+      deps.onEngagedChange?.(true);
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      deps.onEngagedChange?.(false);
+      panel?.remove();
+      panel = null;
+    },
+    update(dt: number): void {
+      // The rows move with the clock: redraw them (not the buttons) each second.
+      since += dt;
+      if (since < 1 || !panel) return;
+      since = 0;
+      const rows = panel.querySelector<HTMLElement>('[data-rows]');
+      if (rows) rows.innerHTML = rowsHtml();
     },
   };
 }
