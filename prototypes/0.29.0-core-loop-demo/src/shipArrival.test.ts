@@ -166,6 +166,16 @@ describe('planArrivalDock', () => {
       ports: [{ doorId: 'north', state: dockedTo(SEED_FURLONG_OTHER_HINTS) }],
     })).toEqual({ kind: 'none', reason: 'already-docked' });
   });
+
+  it('counts a dock at a station gate this client cannot address as already there', () => {
+    // Another commander docked the ship at HIGH's room, a gate of this
+    // station this client holds no pass for, so no candidate names it.
+    expect(planArrivalDock({
+      station: { berths: [{ address: SEED_FURLONG, farDoor: 'd:a3313fdd' }], berthRooms: [FURLONG_ROOM, HIGH_ROOM] },
+      remembered: null,
+      ports: [{ doorId: 'north', state: dockedTo(SEED_HIGH) }, { doorId: 'east', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'already-docked' });
+  });
 });
 
 describe('castOffRefusal', () => {

@@ -53,6 +53,10 @@ export interface StationDestination {
   berth?: StationBerth;
   /** ⚓🚦 Every gate an arriving ship may try, in gate order. */
   berths?: StationBerth[];
+  /** ⚓🚦 The rooms of all the station's berths (and its welcome room),
+   *  whether or not this client can dock there: a dock another commander
+   *  made at a gate this client holds no pass for is still at this station. */
+  berthRooms?: string[];
   /** A move to another planet, scheduled or under way (stations.ts): while
    *  it is in transit the station is no ship's destination. */
   move?: StationMove;
@@ -330,6 +334,10 @@ export function destinationsFromRecords(
         ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
       });
     }
+    const rooms = new Set<string>();
+    if (r.welcomeRoomId) rooms.add(r.welcomeRoomId);
+    for (const b of r.berths ?? []) if (b.roomId) rooms.add(b.roomId);
+    if (rooms.size > 0) out.berthRooms = [...rooms];
     if (Array.isArray(r.berths)) {
       // ⚓🚦 The record knows its gates: these are the berths (none, when its
       // last port was removed or this client holds no pass for any), and the

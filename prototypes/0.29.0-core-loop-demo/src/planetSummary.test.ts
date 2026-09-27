@@ -343,6 +343,26 @@ function sync(from: Y.Doc, to: Y.Doc): void {
 }
 
 describe('sharing through the room doc', () => {
+  it('places a fresh install standing in an off-home station by the room\'s shared summary', () => {
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('room-x', {
+      welcomeRoomId: 'room-x', name: 'ARIS DEPOT', planetId: ARIS, orbitSlot: 3, updatedAt: Date.now() - 1000,
+    });
+    // This install only knows the room from its atlas: a derived record on the
+    // default planet.
+    const derived = { id: 'station:room-x', name: 'ROOM X', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-x', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => derived }));
+    const learned = listStations().find((s) => s.id === 'shared:room-x');
+    expect(learned?.planetId).toBe(ARIS);
+    expect(learned?.orbitSlot).toBe(3);
+  });
+
+  it('keeps extras near the cap on a record whose core fields are long', () => {
+    const extra = { note: 'x'.repeat(900) };
+    const out = summaryForStation({ ...record(), name: 'N'.repeat(60), ...extra } as never, null, T0);
+    expect(out.ext).toEqual(extra);
+  });
+
   it('a station and its trim reach another install, which flies the same orbit', () => {
     // Install A owns HAB RING in slot 2 and has trimmed it.
     const a = new Map<string, string>();
@@ -536,6 +556,59 @@ describe('ships and the solar system', () => {
     store.set('ssf-planet-summary', JSON.stringify({ stations: {}, ships: { 'room-ship': winner } }));
     publishPlanetSummary(now);
     expect(doc.getMap('shipSummaries').get('room-ship')).toEqual(winner);
+  });
+
+  it('keeps the ship entry while a ship\'s planet is not placed yet', () => {
+    let status: ShipStatusInput | null = ship;
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status, notShipRoom: () => null }));
+    status = null; // still a ship, but its stations are not listed yet
+    publishPlanetSummary(Date.now() + 1);
+    expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
+  });
+
+  it('withdraws the ship entry when the room stops being a ship', () => {
+    let status: ShipStatusInput | null = ship;
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status, notShipRoom: () => (status ? null : 'room-ship') }));
+    expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
+    status = null; // bolted into a station
+    publishPlanetSummary(Date.now() + 1);
+    expect(shipsAroundPlanet(SOV)).toEqual([]);
+    expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ retired: true });
+    // Another install that still holds the old entry learns the withdrawal.
+    const other = new Y.Doc();
+    sync(doc, other);
+    unbindPlanetSummaryForTest();
+    store.set('ssf-planet-summary', JSON.stringify({ stations: {}, ships: { 'room-ship': { ...ship, updatedAt: Date.now() - 1000 } } }));
+    expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
+    bindPlanetSummaryDoc(other, install(null));
+    expect(shipsAroundPlanet(SOV)).toEqual([]);
+  });
+
+  it('stamps a local ship change past a peer stamp that runs ahead', () => {
+    let status = ship;
+    const doc = new Y.Doc();
+    const ahead = Date.now() + 3600 * 1000;
+    doc.getMap('shipSummaries').set('room-ship', { ...ship, updatedAt: ahead });
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status }));
+    status = { ...ship, status: 'in-flight', toRoom: 'room-b', departedAt: T0, etaAt: T0 + 60_000 };
+    publishPlanetSummary(Date.now());
+    expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ status: 'in-flight', updatedAt: ahead + 1 });
+  });
+
+  it('keeps the same ships when more than fit share one stamp, whatever the arrival order', () => {
+    const now = Date.now();
+    const keys = Array.from({ length: 40 }, (_, i) => `room-s${String(i).padStart(2, '0')}`);
+    const kept = (order: string[]) => {
+      unbindPlanetSummaryForTest();
+      store.clear();
+      const doc = new Y.Doc();
+      for (const k of order) doc.getMap('shipSummaries').set(k, { ...ship, roomId: k, updatedAt: now });
+      bindPlanetSummaryDoc(doc, install(null));
+      return Object.keys(readStore(now).ships).sort();
+    };
+    expect(kept(keys)).toEqual(kept([...keys].reverse()));
   });
 
   it('forgets a ship not heard from in a day', () => {

@@ -197,7 +197,7 @@ export function arrivalBerths(input: {
  * remembered one when it is free, else the first port that is not docked.
  */
 export function planArrivalDock(input: {
-  station: Pick<StationDestination, 'berth' | 'berths'>;
+  station: Pick<StationDestination, 'berth' | 'berths' | 'berthRooms'>;
   remembered: RememberedBerth | null;
   ports: readonly ArrivalPort[];
   now?: number;
@@ -214,9 +214,16 @@ export function planArrivalDock(input: {
   const berth: StationBerth | null =
     input.berth && isRoomSeed(input.berth.address) ? input.berth : candidates[0] ?? null;
   if (!berth) return { kind: 'none', reason: 'no-berth' };
-  // Docked at any of this station's berths: already there.
+  // Docked at any of this station's berths: already there. Its rooms count
+  // too, so a dock another commander made at a gate this client cannot
+  // address is never doubled.
+  const stationRooms = new Set(input.station.berthRooms ?? []);
+  const inStation = (address: string): boolean => {
+    try { return stationRooms.has(roomIdFromSeed(address)); } catch { return false; }
+  };
   if (ports.some((p) => p.state.kind === 'docked'
-    && [berth, ...candidates].some((b) => sameRoom((p.state as { address: string }).address, b.address)))) {
+    && (inStation((p.state as { address: string }).address)
+      || [berth, ...candidates].some((b) => sameRoom((p.state as { address: string }).address, b.address))))) {
     return { kind: 'none', reason: 'already-docked' };
   }
   // Open = free to dock AND ours to use right now: a busy or locked port
