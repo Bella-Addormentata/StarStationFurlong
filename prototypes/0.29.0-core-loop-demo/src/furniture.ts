@@ -3154,9 +3154,15 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   place(new THREE.BoxGeometry(0.16, 0.05, 0.06), lampMatB, 0, railTop + 0.02, endZ);
 
   // Scoreboard: pole off the +x LONG side (outside the 1.7 m cabinet, inside
-  // the 2 m footprint), dual-face panel high enough to read from both ends
-  // without ever hanging over the playfield.
-  place(new THREE.CylinderGeometry(0.03, 0.04, 1.5, 10), m(0x2a3644, 0.5, 0.4), 0.94, 0.75, 0);
+  // the 2 m footprint), dual-face panel reaching in from it over the rail.
+  // All of it stays inside the footprint (placement and collision know only
+  // that), and the panel sits above both players' sightlines to the far goal.
+  const SCORE_W = 0.56;
+  const SCORE_H = 0.28;
+  const SCORE_X = 0.98 - SCORE_W / 2; // outer edge 2 cm inside the footprint
+  const SCORE_Y = 1.58;
+  const poleH = SCORE_Y - SCORE_H / 2; // up to the panel's lower edge
+  place(new THREE.CylinderGeometry(0.03, 0.04, poleH, 10), m(0x2a3644, 0.5, 0.4), 0.94, poleH / 2, 0);
   const scoreCv = document.createElement("canvas");
   scoreCv.width = 512;
   scoreCv.height = 256;
@@ -3185,26 +3191,19 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
     s2d.fillText(statusLine.slice(0, 26).toUpperCase(), 256, 222);
   };
   drawScore(0, 0, "walk up to play");
-  const mkScoreTex = (mirror: boolean): THREE.CanvasTexture => {
-    const t = new THREE.CanvasTexture(scoreCv);
-    t.minFilter = THREE.NearestFilter;
-    t.magFilter = THREE.NearestFilter;
-    t.generateMipmaps = false;
-    t.colorSpace = THREE.SRGBColorSpace;
-    if (mirror) {
-      // Back face: un-mirror the text for the -z viewer.
-      t.wrapS = THREE.RepeatWrapping;
-      t.repeat.x = -1;
-    }
-    return t;
-  };
-  const scoreTexFront = mkScoreTex(false);
-  const scoreTexBack = mkScoreTex(true);
-  const panelGeoFront = new THREE.PlaneGeometry(0.72, 0.36); // faces +z (side b)
-  const panelGeoBack = new THREE.PlaneGeometry(0.72, 0.36);
-  panelGeoBack.rotateY(Math.PI);                             // faces -z (side a)
-  place(panelGeoFront, new THREE.MeshBasicMaterial({ map: scoreTexFront, transparent: true, opacity: 0 }), 0.94, 1.58, 0.005);
-  place(panelGeoBack, new THREE.MeshBasicMaterial({ map: scoreTexBack, transparent: true, opacity: 0 }), 0.94, 1.58, -0.005);
+  // One texture serves both faces. The back face's plane is turned half about
+  // y, which already carries the canvas's left edge to the -z viewer's left:
+  // flipping the texture as well would mirror side a's scoreboard.
+  const scoreTex = new THREE.CanvasTexture(scoreCv);
+  scoreTex.minFilter = THREE.NearestFilter;
+  scoreTex.magFilter = THREE.NearestFilter;
+  scoreTex.generateMipmaps = false;
+  scoreTex.colorSpace = THREE.SRGBColorSpace;
+  const panelGeoFront = new THREE.PlaneGeometry(SCORE_W, SCORE_H); // faces +z (side b)
+  const panelGeoBack = new THREE.PlaneGeometry(SCORE_W, SCORE_H);
+  panelGeoBack.rotateY(Math.PI);                                  // faces -z (side a)
+  place(panelGeoFront, new THREE.MeshBasicMaterial({ map: scoreTex, transparent: true, opacity: 0 }), SCORE_X, SCORE_Y, 0.005);
+  place(panelGeoBack, new THREE.MeshBasicMaterial({ map: scoreTex, transparent: true, opacity: 0 }), SCORE_X, SCORE_Y, -0.005);
 
   // Animated pieces — hidden until a session shows them. All ctx.m materials
   // so they ride the morph fade like every other mesh in the group.
@@ -3258,8 +3257,7 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
       if (key === scoreKey) return; // dedupe — callers may repeat every frame
       scoreKey = key;
       drawScore(a, b, statusLine);
-      scoreTexFront.needsUpdate = true;
-      scoreTexBack.needsUpdate = true;
+      scoreTex.needsUpdate = true;
     },
     flashGoal(side): void {
       flash[side] = 1;
