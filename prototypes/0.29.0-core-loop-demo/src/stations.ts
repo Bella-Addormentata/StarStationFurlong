@@ -78,7 +78,7 @@ export interface StationRecord {
    *  fills it from the station atlas (every dock port of the station, with its
    *  gate number); a record keeps a list it learned (a station whose rooms
    *  this install has not mapped), and a plain `berthDoor` reads as one
-   *  berth. `berthDoor` stays for older builds: listStations sets it to the
+   *  berth; an empty list means known to have none. `berthDoor` stays for older builds: listStations sets it to the
    *  lowest gate in the welcome room when the record names none. */
   berths?: StationBerthRecord[];
   /** Set on stations derived from an atlas component with no record. */
@@ -105,8 +105,8 @@ export interface StationBerthRecord {
   reservedFor?: string;
 }
 
-/** Gates a station lists at most. */
-export const MAX_BERTHS = 16;
+/** Gates a station lists at most: one per gate number. */
+export const MAX_BERTHS = 99;
 
 /** One berth, shape-checked (peer-written when it came through a summary),
  *  without the local `occupied` flag. Null when it is not one. */
@@ -287,7 +287,9 @@ function clean(r: StationRecord): StationRecord {
     orbitSlot: r.orbitSlot,
     welcomeRoomId: r.welcomeRoomId,
     ...(r.berthDoor ? { berthDoor: r.berthDoor } : {}),
-    ...(cleanBerths(r.berths).length > 0 ? { berths: cleanBerths(r.berths) } : {}),
+    // An empty list is kept: it says the station is known to have no gates.
+    ...(Array.isArray(r.berths) && (r.berths.length === 0 || cleanBerths(r.berths).length > 0)
+      ? { berths: cleanBerths(r.berths) } : {}),
   };
 }
 
@@ -407,26 +409,33 @@ export function listStations(
 /**
  * ⚓🚦 A listed station with its gates: the atlas's (every dock port of the
  * station, free or docked) when it knows any, else the list the record
- * carries, else its plain berthDoor. A record naming no berthDoor gets the
+ * carries for rooms the atlas has not harvested, else its plain berthDoor. A record naming no berthDoor gets the
  * lowest gate in its welcome room as one, for builds that read only that.
  */
 function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): StationRecord {
   const gates = stationGates(atlas, st.welcomeRoomId);
   let berths: StationBerthRecord[];
+  let knownNone = false;
   if (gates.length > 0) {
     berths = gates.slice(0, MAX_BERTHS).map((g) => ({
       roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
       ...(g.access ? { access: g.access, ...(g.reservedFor ? { reservedFor: g.reservedFor } : {}) } : {}),
     }));
-  } else if (st.berths && st.berths.length > 0) {
-    berths = st.berths;
-  } else if (st.berthDoor && st.welcomeRoomId) {
-    berths = [{ roomId: st.welcomeRoomId, doorId: st.berthDoor }];
   } else {
-    berths = [];
+    // A room this client's atlas has harvested with gates (even none) is
+    // known: learned gates in it are gone, not merely unseen. Only rooms it
+    // knows nothing of keep what the record learned.
+    const unknown = (roomId: string) => atlas[roomId]?.gates === undefined;
+    berths = (st.berths ?? []).filter((b) => unknown(b.roomId));
+    // An empty list means "known to have none" (a summary's, or this atlas's
+    // own harvest of the welcome room): only an unknown station falls back.
+    knownNone = Array.isArray(st.berths) || (!!st.welcomeRoomId && !unknown(st.welcomeRoomId));
+    if (berths.length === 0 && !knownNone && st.berthDoor && st.welcomeRoomId) {
+      berths = [{ roomId: st.welcomeRoomId, doorId: st.berthDoor }];
+    }
   }
   const out: StationRecord = { ...st };
-  if (berths.length > 0) out.berths = berths; else delete out.berths;
+  if (berths.length > 0 || knownNone) out.berths = berths; else delete out.berths;
   if (!out.berthDoor) {
     const inWelcome = berths.find((b) => b.roomId === st.welcomeRoomId);
     if (inWelcome) out.berthDoor = inWelcome.doorId;
