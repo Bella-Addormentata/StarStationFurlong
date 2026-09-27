@@ -142,7 +142,17 @@ export function compareMoves(a: StationMove, b: StationMove): number {
   const by = compareFlown(a.settles ?? a, b.settles ?? b);
   if (by !== 0) return by;
   if (!a.settles !== !b.settles) return a.settles ? 1 : -1;
-  return a.settles ? compareFlown(a, b) : 0;
+  if (!a.settles) return 0;
+  // Two pins of one move: a cancel (it leaves before that move arrives)
+  // beats a pin of where the move arrived, whatever each replica saw first.
+  if (isCancelPin(a) !== isCancelPin(b)) return isCancelPin(a) ? 1 : -1;
+  return compareFlown(a, b);
+}
+
+/** A pin that undoes the move it settles (cancelTowLeftBehind) rather than
+ *  saying where it arrived: it leaves before that move arrives. */
+export function isCancelPin(m: StationMove): boolean {
+  return !!m.settles && m.departAt < m.settles.arriveAt;
 }
 
 /** Only the fields a move has — what a write publishes. */
@@ -531,10 +541,21 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
  * held or paid for, and a move that beats the tow beats the cancel too.
  * Returns whether it wrote a cancel.
  */
-export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs: number): boolean {
-  if (flightStatus === 'docked') return false;
-  const tow = readStationMove();
-  if (!tow || tow.mode !== 'tug' || tow.tugRoomId !== roomId || !isMoveActive(tow, realMs)) return false;
+export function cancelTowLeftBehind(
+  roomId: string,
+  flight: { status: string; castOffAt?: number; departedAt?: number },
+  realMs: number,
+): boolean {
+  if (flight.status === 'docked') return false;
+  const best = readStationMove();
+  if (!best || isCancelPin(best)) return false;
+  // Once a tow has arrived its arrival may be pinned; the tow is its parent.
+  const tow = best.settles ?? best;
+  if (tow.mode !== 'tug' || tow.tugRoomId !== roomId) return false;
+  // The tug left before the tow was over: by when the flight cast off when
+  // the record says, however late this tab learns of it; else by now.
+  const leftAt = flight.castOffAt ?? flight.departedAt ?? realMs;
+  if (leftAt >= tow.arriveAt) return false;
   const departAt = tow.departAt + 1;
   return writeStationMove({
     stationId: tow.stationId,
@@ -734,10 +755,14 @@ function roomMoves(): { entries: StationMove[]; legacy: StationMove | null } {
 /** Did a concurrent move of the same station win over this one? Another
  *  move booked at the same time (concurrentMoves: each before the other
  *  arrived, however far apart their flights) that wins the one order
- *  (compareMoves). The winner is also what the station list follows, so the
- *  loser never flies: it holds no tug, and its fuel is not drawn. */
+ *  (compareMoves), or a cancel of this very move. The winner is also what
+ *  the station list follows, so the loser never flies: it holds no tug, and
+ *  its fuel is not drawn. */
 function superseded(m: StationMove, known: StationMove[]): boolean {
-  return known.some((o) => sameStation(o, m) && compareMoves(o, m) > 0 && concurrentMoves(o, m));
+  const self = JSON.stringify(cleanMove(m));
+  return known.some((o) => sameStation(o, m) && compareMoves(o, m) > 0
+    // A cancel undoes its own move however late it was written.
+    && (concurrentMoves(o, m) || (isCancelPin(o) && JSON.stringify(cleanMove(o.settles!)) === self)));
 }
 
 /** Every move known here, for deciding winners: the room's own, and every

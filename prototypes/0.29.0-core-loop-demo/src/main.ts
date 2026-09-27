@@ -1893,7 +1893,7 @@ async function joinRoomAtEpoch(
     if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
-    cancelTowLeftBehind(boot.roomId, rec.status, Date.now());
+    cancelTowLeftBehind(boot.roomId, rec, Date.now());
     // 🪐 Where this station's last move settled it, shared once for everyone.
     if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
