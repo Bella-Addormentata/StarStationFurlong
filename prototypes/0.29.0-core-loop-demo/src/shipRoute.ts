@@ -587,8 +587,27 @@ interface Snapshot {
   doc: Y.Doc | null;
   route: ShipRoute | null;
   checkpoints: readonly RouteCheckpoint[];
+  /** The same route without its run: what it reads as while its run's
+   *  stamps sit past RUN_AHEAD_MS (kept, so the object stays the same). */
+  unran: ShipRoute | null;
 }
 let snap: Snapshot | null = null;
+
+/**
+ * How far past this game's clock a run's START (or STOP) may sit: the same
+ * skew the departures and summary readers allow, so every reader agrees on
+ * which run flies. The ship doc is peer-written, and a run stamped further
+ * ahead (a badly skewed clock, or a hostile write) could make no timetable
+ * until then (its start entry is ahead of the clock) yet would lock route
+ * edits, towing, the captain and the ship's parts. So it reads as no run,
+ * and a new START or a saved edit replaces it.
+ */
+export const RUN_AHEAD_MS = 6 * 3600 * 1000;
+
+function runTooFarAhead(route: ShipRoute | null, now: number): boolean {
+  if (!route || route.startedAt === undefined) return false;
+  return route.startedAt > now + RUN_AHEAD_MS || (route.stoppedAt !== undefined && route.stoppedAt > now + RUN_AHEAD_MS);
+}
 
 function snapshot(): Snapshot {
   const h = shipDocHandle();
@@ -602,19 +621,25 @@ function snapshot(): Snapshot {
       checkpoints = scanCheckpoints(h.map, route.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED).entries;
     }
   }
-  snap = { version: docVersion, doc, route, checkpoints };
+  snap = { version: docVersion, doc, route, checkpoints, unran: isRouteRunning(route) ? routeWithoutRun(route) : route };
   return snap;
 }
 
+/** The snapshot as of `now`: a run stamped past RUN_AHEAD_MS reads as none. */
+function current(now: number): { route: ShipRoute | null; checkpoints: readonly RouteCheckpoint[] } {
+  const s = snapshot();
+  return runTooFarAhead(s.route, now) ? { route: s.unran, checkpoints: [] } : s;
+}
+
 /** The ship's route, or null (none, unbound, or malformed). */
-export function readShipRoute(): ShipRoute | null {
-  return snapshot().route;
+export function readShipRoute(now = Date.now()): ShipRoute | null {
+  return current(now).route;
 }
 
 /** The running route's checkpoints, shape-checked (the timetable applies
  *  the reader checks); empty when no route runs. */
-export function readRouteCheckpoints(): readonly RouteCheckpoint[] {
-  return snapshot().checkpoints;
+export function readRouteCheckpoints(now = Date.now()): readonly RouteCheckpoint[] {
+  return current(now).checkpoints;
 }
 
 const nowCache = createRouteWalkCache();
@@ -622,7 +647,7 @@ const nowCache = createRouteWalkCache();
 /** Where the running route puts the ship at `now` (pilotRoute.routeFlightAt
  *  over the doc), or null when no route runs or none can be derived. */
 export function routeFlightNow(liveDock: LiveDockAt | null, capacity: number, now = Date.now()): RouteFlight | null {
-  const s = snapshot();
+  const s = current(now);
   return routeFlightAt(s.route, s.checkpoints, liveDock, now, capacity, nowCache);
 }
 
@@ -762,7 +787,7 @@ export interface RouteStartInput {
  */
 export function startShipRoute(o: RouteStartInput): number | null {
   const h = shipDocHandle();
-  const route = readShipRoute();
+  const route = readShipRoute(o.now);
   if (!h || !route || isRouteRunning(route)) return null;
   if (!(Number.isInteger(o.startStop) && o.startStop >= 0 && o.startStop < route.stops.length)) return null;
   if (o.pilot === 'robot' && !route.robotDockId) return null;
@@ -771,7 +796,8 @@ export function startShipRoute(o: RouteStartInput): number | null {
   let startedAt = Math.max(1, Math.floor(o.now));
   for (const key of old) {
     const run = parseCheckpointKey(key)?.run ?? 0;
-    if (run >= startedAt) startedAt = run + 1;
+    // A run stamped past RUN_AHEAD_MS is no run (its keys go below).
+    if (run >= startedAt && run <= o.now + RUN_AHEAD_MS) startedAt = run + 1;
   }
   const running: ShipRoute = { ...routeWithoutRun(route), startedAt, startStop: o.startStop };
   const fuel = clampFuelToCapacity(o.fuel, o.capacity);
@@ -900,11 +926,12 @@ export function installRouteFuelMeter(deps: RouteFuelMeterDeps): () => void {
     owed: true,
     read: () => {
       try {
-        const s = snapshot();
+        const now = clock();
+        const s = current(now);
         if (!isRouteRunning(s.route)) return 0;
         const capacity = deps.capacity();
         if (!(capacity > 0)) return 0;
-        const flight = routeFlightAt(s.route, s.checkpoints, deps.liveDock?.() ?? null, clock(), capacity, cache);
+        const flight = routeFlightAt(s.route, s.checkpoints, deps.liveDock?.() ?? null, now, capacity, cache);
         if (!flight || flight.paused) return 0;
         return routeFuelDebt(readStoredFuelLevel(), capacity, flight.fuel);
       } catch (err) {

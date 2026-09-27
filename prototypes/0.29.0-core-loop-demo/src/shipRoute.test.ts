@@ -23,6 +23,7 @@ import {
   pauseCheckpoint,
   routeLegFuel,
   skipCheckpoint,
+  startCheckpoint,
   stopAt,
 } from './pilotRoute';
 import {
@@ -42,6 +43,7 @@ import {
   MAX_CHECKPOINT_KEYS_SCANNED,
   ROUTE_FUEL_METER,
   ROUTE_MIN_CLIENT,
+  RUN_AHEAD_MS,
   capCheckpoints,
   checkpointFromWire,
   checkpointKey,
@@ -386,6 +388,28 @@ describe('writeShipRoute', () => {
 // ── START ────────────────────────────────────────────────────────────────────
 
 describe('startShipRoute', () => {
+  it('a run stamped far past the clock is no run: it locks nothing, and START replaces it', () => {
+    expect(writeShipRoute(saved())).toBe(true);
+    const far = T0 + RUN_AHEAD_MS + 1;
+    // A peer's write straight into the ship map: a run and its start entry.
+    const ghost: ShipRoute = { ...saved(), startedAt: far, startStop: 0 };
+    map().set('route', wire(ghost));
+    map().set(checkpointKey(far, 0, 'start'), checkpointToWire(startCheckpoint(ghost, { at: far, pilot: 'robot', fuel: 70 })!));
+    expect(readShipRoute(T0)).toEqual(saved());
+    expect(readRouteCheckpoints(T0)).toEqual([]);
+    expect(routeFlightNow(null, CAP, T0)).toBeNull();
+    // A clock a little behind the writer's still reads it as a run.
+    expect(readShipRoute(T0 + 1)).toMatchObject({ startedAt: far });
+    // A STOP stamped that far ahead is no run either.
+    map().set('route', wire({ ...saved(), startedAt: T0, startStop: 0, stoppedAt: far }));
+    expect(readShipRoute(T0)).toEqual(saved());
+    map().set('route', wire(ghost));
+    // START runs from now (not past the far run's id), and its keys go.
+    expect(startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 70, capacity: CAP })).toBe(T0);
+    expect(readShipRoute(T0)).toMatchObject({ startedAt: T0, startStop: 0 });
+    expect(ckptKeys()).toEqual([`ckpt:${T0}:0:start`]);
+  });
+
   it('writes the run, its start entry and the fuel in one transaction', () => {
     writeShipRoute(saved());
     writeFuelLevel(70, CAP);
