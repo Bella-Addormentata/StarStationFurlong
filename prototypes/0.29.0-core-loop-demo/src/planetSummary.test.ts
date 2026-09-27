@@ -346,6 +346,20 @@ describe('ships and the solar system', () => {
     expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ status: 'in-flight', toRoom: 'room-b' });
   });
 
+  it('settles a same-moment pair of ship values the same way in the doc', () => {
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const a = { ...ship, status: 'docked' as const, updatedAt: now };
+    const b = { ...ship, status: 'in-flight' as const, toRoom: 'room-b', departedAt: now, etaAt: now + 60_000, updatedAt: now };
+    const winner = JSON.stringify(b) > JSON.stringify(a) ? b : a;
+    const loser = winner === a ? b : a;
+    doc.getMap('shipSummaries').set('room-ship', loser);
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => null }));
+    store.set('ssf-planet-summary', JSON.stringify({ stations: {}, ships: { 'room-ship': winner } }));
+    publishPlanetSummary(now);
+    expect(doc.getMap('shipSummaries').get('room-ship')).toEqual(winner);
+  });
+
   it('forgets a ship not heard from in a day', () => {
     const doc = new Y.Doc();
     bindPlanetSummaryDoc(doc, install(null, { ship: () => ship }));

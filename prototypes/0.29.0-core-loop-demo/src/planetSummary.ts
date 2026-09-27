@@ -528,8 +528,10 @@ export function publishPlanetSummary(now = Date.now()): void {
     }
     for (const [k, s] of Object.entries(store.ships)) {
       const known = cleanShipSummary(shipMap!.get(k), now);
-      if (known && known.updatedAt >= s.updatedAt) continue;
-      shipMap!.set(k, s);
+      // The same rule as the store's (newest, then the canonical tie-break),
+      // so a same-moment pair settles on one value in the doc too.
+      const next = known ? mergeShip(known, s) : s;
+      if (next) shipMap!.set(k, next);
     }
     // The maps are never otherwise pruned, and readers stop scanning after a
     // bound: keep only the newest valid entries, so what is visible is decided
