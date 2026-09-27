@@ -75,6 +75,25 @@ describe('atlas components', () => {
     expect(listStations(atlas, []).filter((s) => s.derived)).toHaveLength(1);
   });
 
+  it('never lets a ship\'s berth join or bridge stations', () => {
+    const berth = (target: string) => ({ targetSeed: '', targetRoomId: target, transient: true as const });
+    const atlas = atlasOf(
+      room('a1', ['a2']),
+      room('a2', ['a1']),
+      room('b1'),
+      room('ship'),
+    );
+    // Station A still records the ship it hosted (a stale berth — the dock
+    // never saw it leave), and the ship is now docked at station B.
+    atlas.a1.doors['d:berth'] = berth('ship');
+    atlas.ship.doors['d:dock'] = berth('b1');
+    atlas.b1.doors['d:port'] = berth('ship');
+    expect(atlasComponents(atlas).map((c) => [...c].sort())).toEqual([['a1', 'a2'], ['b1'], ['ship']]);
+    expect(listStations(atlas, []).filter((st) => st.derived).map((st) => st.id))
+      .toEqual(['station:a1', 'station:b1', 'station:ship']);
+    expect(stationForRoom('a2', atlas)?.id).toBe('station:a1');
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });

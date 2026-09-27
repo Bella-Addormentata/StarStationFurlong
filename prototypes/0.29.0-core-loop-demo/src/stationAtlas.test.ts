@@ -425,3 +425,41 @@ describe("seedAtlasDefaults — a build's bundled station (defaultStation.ts)", 
     expect([...other.getMap('atlas').keys()]).toEqual(['module-hub']);
   });
 });
+
+describe('transient berths (a visiting ship\'s dock)', () => {
+  it('are flagged when harvested, and the flag rides the shared atlas both ways', () => {
+    harvestIntoAtlas({
+      roomId: 'module-self',
+      name: 'SELF',
+      doors: [
+        { doorId: 'd:gangway', targetSeed: 'ssf://x#room=module-hall' },
+        { doorId: 'd:dock', targetSeed: 'ssf://x#room=module-ship', transient: true },
+      ],
+    });
+    const mine = readAtlas()['module-self'];
+    expect(mine.doors['d:dock'].transient).toBe(true);
+    expect(mine.doors['d:gangway'].transient).toBeUndefined();
+
+    bind('module-self');
+    pushAtlasToDoc();
+    const published = doc.getMap('atlas').get('module-self') as { doors: Record<string, { transient?: true }> };
+    expect(published.doors['d:dock'].transient).toBe(true);
+    expect(published.doors['d:gangway'].transient).toBeUndefined();
+  });
+
+  it('are read from a peer only as exactly true', () => {
+    doc.getMap('atlas').set('module-peer', {
+      roomId: 'module-peer',
+      name: 'PEER',
+      doors: {
+        'd:dock': { targetRoomId: 'module-ship', targetSeed: '', transient: true },
+        'd:junk': { targetRoomId: 'module-hall', targetSeed: '', transient: 'yes' },
+      },
+      updatedAt: Date.now() - 60_000,
+    });
+    bind();
+    const peer = readAtlas()['module-peer'];
+    expect(peer.doors['d:dock'].transient).toBe(true);
+    expect(peer.doors['d:junk'].transient).toBeUndefined();
+  });
+});
