@@ -92,6 +92,15 @@ describe('planArrivalDock', () => {
     expect(plan).toEqual({ kind: 'dock', doorId: 'north', address: SEED_FURLONG, retarget: null });
   });
 
+  it('treats a malformed peer-written seed as another room instead of throwing', () => {
+    const bad = 'ssf://room#room=%';
+    expect(() => planArrivalDock({
+      station: { berth: { address: bad } },
+      remembered: { doorId: 'north', address: SEED_FURLONG },
+      ports: [{ doorId: 'north', state: dockedTo(SEED_FURLONG) }, { doorId: 'east', state: FREE }],
+    })).not.toThrow();
+  });
+
   it('skips a remembered port that is busy and takes the next open one', () => {
     const plan = planArrivalDock({
       station: {},

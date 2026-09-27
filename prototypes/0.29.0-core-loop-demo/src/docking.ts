@@ -2856,6 +2856,10 @@ export class DoorDockingPortSystem {
     // very tombstone read above, in the room it was read in.
     const unchanged = () => {
       if (this.roomNow() !== roomId) return false;
+      // 🚀 #30 SH3: the ship may have DEPARTED while the berth was asked —
+      // a module in flight takes no pairing, and the far write is taken back
+      // (settleChangedRedock) exactly as for a port that changed.
+      if (!pairingAllowedByFlight(readFlightRecord()).ok) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };

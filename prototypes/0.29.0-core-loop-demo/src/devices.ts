@@ -2058,6 +2058,12 @@ function portStatusText(p: DockPortView): string {
  *  on the next docked render. Cleared at DEPART. */
 let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
 
+/** Forget the last arrival — main.ts calls it on every room join, so one
+ *  ship's arrival never shows on another ship's helm. */
+export function clearShipArrivalNote(): void {
+  lastArrivalNote = null;
+}
+
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
 export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   if (!outcome) return;
