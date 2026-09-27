@@ -268,7 +268,10 @@ export type ArrivalOutcome =
   | {
       kind: 'none';
       stationName: string;
-      /** `berths-taken`: the berth refused the DOCK (taken, or closed). */
+      /** `berths-taken`: the DOCK answered false. Usually the berth refused
+       *  (taken, or closed), but redockPort also refuses for its own reasons
+       *  (no rights, no room to fit, a busy port); the port's own note names
+       *  which, so the helm points there rather than guessing. */
       reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken' | 'in-transit';
     };
 

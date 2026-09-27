@@ -89,6 +89,14 @@ export interface ShipSummary {
 export type ShipStatusInput = Omit<ShipSummary, 'updatedAt'>;
 
 export const LEARNED_PREFIX = 'shared:';
+
+/** ⚓ A record this module registered from a summary: its id is exactly the
+ *  learned prefix plus its own welcome room. A saved record that merely
+ *  starts with the prefix (made by hand before it was reserved) is the
+ *  install's own, and is never pruned or replaced as learned. */
+export function isLearnedRecord(r: { id: string; welcomeRoomId: string }): boolean {
+  return r.id === `${LEARNED_PREFIX}${r.welcomeRoomId}`;
+}
 /** stations.ts's prefix for a station derived from an atlas component. */
 const DERIVED_PREFIX = 'station:';
 
@@ -295,15 +303,19 @@ function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipS
 }
 
 /** Put a map's entries into a capped object, keeping the newest when full
- *  (by `stampOf`, the record's own stamp unless given). */
+ *  (by `stampOf`, the record's own stamp unless given). `pinned` keys (what
+ *  this client sees first-hand) are kept first, whatever their stamps: peer
+ *  stamps decide merges, never whether we forget our own station or ship. */
 function capped<T extends { updatedAt: number }>(
   rec: Record<string, T>,
   max: number,
+  pinned: ReadonlySet<string> = new Set(),
   stampOf: (v: T) => number = (v) => v.updatedAt,
 ): Record<string, T> {
   const entries = Object.entries(rec);
   if (entries.length <= max) return rec;
-  entries.sort((a, b) => stampOf(b[1]) - stampOf(a[1]));
+  const first = (k: string) => (pinned.has(k) ? 0 : 1);
+  entries.sort((a, b) => first(a[0]) - first(b[0]) || stampOf(b[1]) - stampOf(a[1]));
   const out: Record<string, T> = Object.create(null);
   for (const [k, v] of entries.slice(0, max)) out[k] = v;
   return out;
@@ -317,12 +329,24 @@ function stationRecency(s: StationSummary, now: number): number {
   return Math.max(s.updatedAt, s.move ? Math.min(s.move.departAt, now) : -Infinity);
 }
 
+/** The keys this client knows first-hand: the station it stands in and the
+ *  ship it is aboard. Retention keeps them whatever peers stamp. */
+function firstHandKeys(): { stations: Set<string>; ships: Set<string> } {
+  const stations = new Set<string>();
+  const ships = new Set<string>();
+  const here = ctx?.currentStation()?.welcomeRoomId;
+  if (here) stations.add(here);
+  const ship = ctx?.ship()?.roomId;
+  if (ship) ships.add(ship);
+  return { stations, ships };
+}
+
 // ── From this client: its station and its ship ──────────────────────────────
 
 /** A station whose record this install saved itself (not derived from the
  *  atlas, not learned from a peer). */
 function isOwned(station: StationRecord): boolean {
-  return !station.derived && !station.id.startsWith(LEARNED_PREFIX);
+  return !station.derived && !isLearnedRecord(station);
 }
 
 /** The summary this client publishes for a station it can see: its listed
@@ -424,7 +448,7 @@ export function registerLearnedStations(
   // knows which planet this client is at; the install's own records stay.
   if (opts.prune) {
     for (const r of saved.values()) {
-      if (r.id.startsWith(LEARNED_PREFIX) && planetById(r.planetId).id !== planet) {
+      if (isLearnedRecord(r) && planetById(r.planetId).id !== planet) {
         removeStation(r.id);
         saved.delete(r.id);
         changed++;
@@ -442,6 +466,8 @@ export function registerLearnedStations(
     // listed one (the list may have moved it to a free slot), extra fields
     // included (a newer build's, such as a station's move).
     const had = saved.get(rec.id) as (StationRecord & Record<string, unknown>) | undefined;
+    // The install's own record under a learned-looking id is never replaced.
+    if (had && !isLearnedRecord(had)) continue;
     const sameExt = Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
     if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
@@ -524,19 +550,25 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (next) { store.ships[k] = next; changed = true; }
   }
   if (!changed) return;
-  store.stations = capped(store.stations, MAX_STATIONS, (st) => stationRecency(st, now));
-  store.ships = capped(store.ships, MAX_SHIPS);
+  const pins = firstHandKeys();
+  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, (st) => stationRecency(st, now));
+  store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
   writeStore(store);
   applyLearned(store);
   notify();
 }
 
 /** Delete a shared map's invalid entries and all but its `max` newest valid
- *  ones (ties by key, so every client prunes the same way). Peer-writable, so
+ *  ones (ties by key), after the `pinned` first-hand keys, which stay. Peer-writable, so
  *  one pass visits at most `max * 4` keys (the pull's bound) and evicts only
  *  among those: a map a peer flooded shrinks over later publishes, and every
  *  transaction stays bounded. Below the bound the result is exact. */
-function pruneMap(map: Y.Map<unknown>, stampOf: (k: string, v: unknown) => number | null, max: number): number {
+function pruneMap(
+  map: Y.Map<unknown>,
+  stampOf: (k: string, v: unknown) => number | null,
+  max: number,
+  pinned: ReadonlySet<string> = new Set(),
+): number {
   const keep: Array<[string, number]> = [];
   const drop: string[] = [];
   let visited = 0;
@@ -545,7 +577,9 @@ function pruneMap(map: Y.Map<unknown>, stampOf: (k: string, v: unknown) => numbe
     const at = stampOf(k, v);
     if (at === null) drop.push(k); else keep.push([k, at]);
   }
-  keep.sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  // First-hand keys first (see capped), then newest, ties by key.
+  const first = (k: string) => (pinned.has(k) ? 0 : 1);
+  keep.sort((a, b) => first(a[0]) - first(b[0]) || b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   for (const [k] of keep.slice(max)) drop.push(k);
   for (const k of drop) map.delete(k);
   return drop.length;
@@ -569,8 +603,9 @@ export function publishPlanetSummary(now = Date.now()): void {
       && JSON.stringify({ ...prior, updatedAt: 0 }) === JSON.stringify({ ...s, updatedAt: 0 });
     if (s && !same) store.ships[s.roomId] = s;
   }
-  store.stations = capped(store.stations, MAX_STATIONS, (st) => stationRecency(st, now));
-  store.ships = capped(store.ships, MAX_SHIPS);
+  const pins = firstHandKeys();
+  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, (st) => stationRecency(st, now));
+  store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
   writeStore(store);
   applyLearned(store);
   let pruned = 0;
@@ -593,10 +628,10 @@ export function publishPlanetSummary(now = Date.now()): void {
     pruned = pruneMap(stationMap!, (k, v) => {
       const s = cleanStationSummary(v, now);
       return s && s.welcomeRoomId === k ? stationRecency(s, now) : null;
-    }, MAX_STATIONS) + pruneMap(shipMap!, (k, v) => {
+    }, MAX_STATIONS, pins.stations) + pruneMap(shipMap!, (k, v) => {
       const s = cleanShipSummary(v, now);
       return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? s.updatedAt : null;
-    }, MAX_SHIPS);
+    }, MAX_SHIPS, pins.ships);
   });
   // Entries a bounded pull could not reach before the prune are reachable
   // now; the observer skips this local write, so read them here.
@@ -651,14 +686,15 @@ export function installTrimResolver(): void {
  */
 export function resolveStationAlias(id: string, now = Date.now()): string | null {
   const listed = listStations();
-  if (listed.some((s) => s.id === id)) return id;
   let room: string | undefined;
   for (const prefix of [DERIVED_PREFIX, LEARNED_PREFIX]) {
     if (id.startsWith(prefix)) room = id.slice(prefix.length);
   }
-  if (room === undefined) {
-    room = Object.values(readStore(now).stations).find((s) => s.ownerId === id)?.welcomeRoomId;
-  }
+  // A prefixed id names a welcome room, which is global: resolve it by the
+  // room first, so a local record that happens to share the id never wins.
+  if (room !== undefined) return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
+  if (listed.some((s) => s.id === id)) return id;
+  room = Object.values(readStore(now).stations).find((s) => s.ownerId === id)?.welcomeRoomId;
   if (!room) return null;
   return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
 }

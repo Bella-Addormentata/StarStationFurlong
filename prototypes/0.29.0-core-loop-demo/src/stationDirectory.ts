@@ -151,10 +151,20 @@ export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | 
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
-    return plan;
+    return wholeMs(plan);
   }
   const dest = findStation(toId);
-  return { departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost };
+  return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
+}
+
+/** A hop's times as whole milliseconds, which is all a flight record stores
+ *  (shipDoc isFlightRecord): orbital math gives fractions. Rounded up, so a
+ *  ship never burns before its window; null when a time is no safe integer. */
+function wholeMs(plan: HopPlan): HopPlan | null {
+  const departAt = Math.ceil(plan.departAt);
+  const arriveAt = Math.max(departAt + 1, Math.ceil(plan.arriveAt));
+  if (!Number.isSafeInteger(departAt) || !Number.isSafeInteger(arriveAt)) return null;
+  return { ...plan, departAt, arriveAt };
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */
