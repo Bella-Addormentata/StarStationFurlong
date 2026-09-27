@@ -70,6 +70,8 @@ export function applyFarDockRequest(
     near,
     req.dockedAt,
     req.replacesUndockedAt,
+    // The requester's key is its own claim, as every door write is in the
+    // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
     gateAccessIn(doc, req.farDoor, req.requesterPub),
   );
   if (patch.action === 'refuse') {

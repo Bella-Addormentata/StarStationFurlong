@@ -264,7 +264,12 @@ export function destinationsFromRecords(
         ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
       });
     }
-    if (gates.length > 0) {
+    if (Array.isArray(r.berths) && r.berths.length === 0) {
+      // ⚓🚦 Known to have no gates (its last port was removed): no berth,
+      // not even the old public one.
+      out.berths = [];
+      delete out.berth;
+    } else if (gates.length > 0) {
       out.berths = gates;
       // The public berth names its gate when it is one of them.
       const same = out.berth && gates.find((g) => g.farDoor === out.berth!.farDoor && g.address === out.berth!.address);

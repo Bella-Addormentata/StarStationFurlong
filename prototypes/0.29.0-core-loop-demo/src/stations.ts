@@ -408,25 +408,32 @@ export function listStations(
 
 /**
  * ⚓🚦 A listed station with its gates: the atlas's (every dock port of the
- * station, free or docked) when it knows any, else the list the record
- * carries for rooms the atlas has not harvested, else its plain berthDoor. A record naming no berthDoor gets the
- * lowest gate in its welcome room as one, for builds that read only that.
+ * station, free or docked) together with the gates the record learned in
+ * rooms the atlas has not harvested, else its plain berthDoor. A record
+ * naming no berthDoor gets the lowest gate in its welcome room as one, for
+ * builds that read only that.
  */
 function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): StationRecord {
   const gates = stationGates(atlas, st.welcomeRoomId);
   let berths: StationBerthRecord[];
   let knownNone = false;
+  // A room this client's atlas has harvested with gates (even none) is
+  // known: learned gates in it are gone, not merely unseen. Only rooms it
+  // knows nothing of keep what the record learned, beside the atlas's own.
+  const unknown = (roomId: string) => atlas[roomId]?.gates === undefined;
+  const learned = (st.berths ?? []).filter((b) => unknown(b.roomId));
   if (gates.length > 0) {
-    berths = gates.slice(0, MAX_BERTHS).map((g) => ({
+    const seen: StationBerthRecord[] = gates.map((g) => ({
       roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
       ...(g.access ? { access: g.access, ...(g.reservedFor ? { reservedFor: g.reservedFor } : {}) } : {}),
     }));
+    berths = [...seen, ...learned]
+      .map((b, i) => ({ b, i }))
+      .sort((x, y) => (x.b.gate ?? MAX_BERTHS + 1) - (y.b.gate ?? MAX_BERTHS + 1) || x.i - y.i)
+      .map((x) => x.b)
+      .slice(0, MAX_BERTHS);
   } else {
-    // A room this client's atlas has harvested with gates (even none) is
-    // known: learned gates in it are gone, not merely unseen. Only rooms it
-    // knows nothing of keep what the record learned.
-    const unknown = (roomId: string) => atlas[roomId]?.gates === undefined;
-    berths = (st.berths ?? []).filter((b) => unknown(b.roomId));
+    berths = learned;
     // An empty list means "known to have none" (a summary's, or this atlas's
     // own harvest of the welcome room): only an unknown station falls back.
     knownNone = Array.isArray(st.berths) || (!!st.welcomeRoomId && !unknown(st.welcomeRoomId));

@@ -181,6 +181,29 @@ describe('the station record', () => {
     expect(mergeStation(known, out)?.berths).toEqual([]);
   });
 
+  it('keeps learned gates in rooms this atlas has not harvested beside the ones it has', () => {
+    registerStation({
+      id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far',
+      berths: [{ roomId: 'room-far', doorId: 'east', gate: 1 }, { roomId: 'room-wing', doorId: 'north', gate: 2 }],
+    });
+    // This client has seen room-far (gate 3 now), never room-wing.
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: { south: 3 } });
+    expect(listStations().find((s) => s.id === 'far')?.berths).toEqual([
+      { roomId: 'room-wing', doorId: 'north', gate: 2 },
+      { roomId: 'room-far', doorId: 'south', gate: 3 },
+    ]);
+  });
+
+  it('offers no berth at all for a station known to have no gates', () => {
+    const [dest] = destinationsFromRecords([{
+      id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'east', berths: [],
+    }], seed);
+    expect(dest.berths).toEqual([]);
+    expect(dest.berth).toBeUndefined();
+    const remembered = { address: seed('room-far'), farDoor: 'east' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station: dest, remembered })).toEqual([]);
+  });
+
   it('lists every gate up to the highest number', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 20; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
