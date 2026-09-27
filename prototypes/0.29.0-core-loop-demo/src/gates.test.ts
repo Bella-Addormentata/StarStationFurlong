@@ -26,7 +26,7 @@ import {
   stationGates,
   withSharedAtlasOf,
 } from './stationAtlas';
-import { listStations, registerStation } from './stations';
+import { cleanBerths, listStations, registerStation } from './stations';
 import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
@@ -182,6 +182,28 @@ describe('the station atlas', () => {
 });
 
 describe('gate gossip that doors alone would skip', () => {
+  it("takes an older doc copy's gates when our newer copy of the room has none", () => {
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS',
+      doors: [
+        { doorId: 'west', targetSeed: seed('room-a'), transient: false },
+        { doorId: 'north', targetSeed: seed('room-c'), transient: false },
+      ],
+    });
+    expect(readAtlas()['room-b']?.gates).toBeUndefined();
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: 1,
+      doors: { west: { targetRoomId: 'room-a', farDoor: 'east', transient: false } },
+      gates: { south: 2 }, gateAccess: { south: { access: 'closed' } },
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    const b = readAtlas()['room-b']!;
+    expect(b.gates).toEqual({ south: 2 });
+    expect(b.gateAccess).toEqual({ south: { access: 'closed' } });
+    expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
+  });
+
   it("adds our gates to an equally new doc copy that has none, keeping its doors and size", () => {
     twoRoomStation();
     // Our own (older) record of room-b also knows an older size.
@@ -342,6 +364,15 @@ describe('the station record', () => {
     expect(Object.keys(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates ?? {})).toHaveLength(99);
   });
 
+  it('puts a learned gate list in gate order, whatever order a peer sent', () => {
+    expect(cleanBerths([
+      { roomId: 'room-b', doorId: 'west' },
+      { roomId: 'room-b', doorId: 'east', gate: 3 },
+      { roomId: 'room-a', doorId: 'north', gate: 1 },
+      { roomId: 'room-b', doorId: 'south', gate: 2 },
+    ]).map((b) => b.gate)).toEqual([1, 2, 3, undefined]);
+  });
+
   it('lists every gate up to the highest number', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 20; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
@@ -441,6 +472,19 @@ describe('ship destinations', () => {
     }], (room) => (room === 'room-c' ? undefined : seed(room)));
     expect(dest.berths).toEqual([]);
     expect(dest.berth).toBeUndefined();
+  });
+});
+
+describe('an arriving ship\'s memory', () => {
+  it('is not asked in a room whose listed gates it matches none of', () => {
+    const station = { berths: [{ address: seed('room-far'), farDoor: 'east', gate: 1, access: 'closed' as const }] };
+    // A legacy memory without its door.
+    const remembered = { address: seed('room-far') } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station, remembered })).toEqual([]);
+    // One of the room's open gates, remembered, is asked.
+    const open = { berths: [...station.berths, { address: seed('room-far'), farDoor: 'west', gate: 2 }] };
+    const west = { address: seed('room-far'), farDoor: 'west' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station: open, remembered: west }).map((b) => b.farDoor)).toEqual(['west']);
   });
 });
 

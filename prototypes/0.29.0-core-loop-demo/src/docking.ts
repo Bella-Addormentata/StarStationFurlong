@@ -3770,8 +3770,10 @@ export class DoorDockingPortSystem {
         );
         return; // leave pairingPending alone; the request is not consumed
       }
-      // 🚚 Nor while this room's station is between planets (stationMove.ts).
-      if (dockLockedByMove([this.roomNow()], Date.now())) {
+      // 🚚 Nor while either end's station is between planets (stationMove.ts):
+      // this room, and the room the request comes from.
+      const farRoom = state.connectedRoomAddress ? roomIdFromSeed(state.connectedRoomAddress) : '';
+      if (dockLockedByMove([this.roomNow(), farRoom], Date.now())) {
         console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — station in transit`);
         return;
       }

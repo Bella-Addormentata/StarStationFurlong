@@ -1146,7 +1146,19 @@ function pullSharedAtlas(): void {
     if (prior
       && !prior.bundled
       && prior.lastSeen >= value.updatedAt
-      && Object.keys(prior.doors).length >= incoming) continue;
+      && Object.keys(prior.doors).length >= incoming) {
+      // ⚓🚦 Our copy stands, but one harvested by an older build carries no
+      // gates: take the doc's, and the access that rides with them, on their
+      // own, so gate numbering sees them.
+      if (prior.gates === undefined && value.gates !== undefined && isPlainGates(value.gates)) {
+        prior.gates = cleanGates(value.gates);
+        if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
+          prior.gateAccess = cleanGateAccess(value.gateAccess);
+        }
+        changed = true;
+      }
+      continue;
+    }
     const doors: Record<string, AtlasDoor> = {};
     let kept = 0;
     for (const [d, door] of Object.entries(value.doors)) {
