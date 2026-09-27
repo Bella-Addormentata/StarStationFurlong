@@ -249,6 +249,14 @@ describe('a round trip', () => {
     expect(readStationBerth('high-orbit')).toBeNull();
   });
 
+  it('never evicts a remembered station for a berth the memory would refuse', () => {
+    for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', address: SEED_HIGH });
+    // An overlong peer-written address: berth memory refuses it.
+    const bad = [{ doorId: 'north', state: { ...dockedTo(SEED_FURLONG), address: `${SEED_FURLONG}${'x'.repeat(5000)}` } as ArrivalPort['state'] }];
+    expect(rememberBerthHere('furlong-station', bad)).toBe(false);
+    expect(readStationBerth('s0')).not.toBeNull();
+  });
+
   it('forgets the oldest other station to remember this berth when memory is full', () => {
     for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', address: SEED_HIGH });
     expect(castOffForDeparture('furlong-station', fakeDocking(['north']))).toBe(true);
@@ -361,12 +369,14 @@ describe('berth memory in the ship doc', () => {
       badWall: { doorId: 'north', address: SEED_FURLONG, farWall: 'up' },
       badLat: { doorId: 'north', address: SEED_FURLONG, farLateral: Infinity },
       wideLat: { doorId: 'north', address: SEED_FURLONG, farLateral: 33 },
+      badDoor: { doorId: 'north', address: SEED_FURLONG, farDoor: 'not-a-door' },
       notObj: 7,
     });
     expect(readStationBerth('good')).toEqual({ doorId: 'north', address: SEED_FURLONG });
     expect(readStationBerth('badWall')).toBeNull();
     expect(readStationBerth('badLat')).toBeNull();
     expect(readStationBerth('wideLat')).toBeNull();
+    expect(readStationBerth('badDoor')).toBeNull();
     expect(readStationBerth('notObj')).toBeNull();
   });
 

@@ -70,6 +70,7 @@
 
 import * as Y from 'yjs';
 import type { DoorWall } from './doorLayoutDoc';
+import { isAcceptableDoorKey } from './doorsDoc';
 import {
   DEFAULT_STATIONS,
   findStation,
@@ -525,7 +526,9 @@ export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
   const r = v as Partial<BerthMemoryRecord>;
   if (!isBoundedString(r.doorId)) return false;
   if (typeof r.address !== 'string' || r.address.length === 0 || r.address.length > MAX_ADDRESS_LEN) return false;
-  if (r.farDoor !== undefined && !isBoundedString(r.farDoor)) return false;
+  // The door-key rule doorsDoc reads with: a farDoor it would strip would
+  // turn DOCK into a one-sided pairing that skips the far-berth check.
+  if (r.farDoor !== undefined && !(typeof r.farDoor === 'string' && isAcceptableDoorKey(r.farDoor))) return false;
   if (r.farWall !== undefined && !DOOR_WALLS.includes(r.farWall as string)) return false;
   if (r.farLateral !== undefined && !(typeof r.farLateral === 'number' && Number.isFinite(r.farLateral)
     && Math.abs(r.farLateral) <= MAX_FAR_LATERAL)) return false;

@@ -24,6 +24,7 @@ import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
 import {
   findDestination,
+  isBerthMemoryRecord,
   readBerthMemory,
   readFlightRecord,
   readStationBerth,
@@ -188,6 +189,9 @@ export function berthToRemember(ports: readonly ArrivalPort[]): BerthMemoryRecor
 export function rememberBerthHere(stationId: string, ports: readonly ArrivalPort[]): boolean {
   const berth = berthToRemember(ports);
   if (!berth) return true;
+  // A berth the memory would refuse anyway (a malformed peer-written dock)
+  // must never cost an unrelated station its remembered berth below.
+  if (!isBerthMemoryRecord(berth) || !isRoomSeed(berth.address)) return false;
   if (writeStationBerth(stationId, berth)) return true;
   // Memory full: evict the oldest other station — never the one we leave.
   const oldest = Object.keys(readBerthMemory()).find((id) => id !== stationId);

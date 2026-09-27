@@ -17,6 +17,7 @@
  */
 
 import type { DoorWall } from './doorLayoutDoc';
+import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -201,9 +202,11 @@ export function destinationsFromRecords(
     };
     // A public berth needs its door: DOCK only asks the far room (and so
     // only proves a port is there) when it knows the far door. Without one
-    // the ship's own berth memory decides, or arrival reports no berth.
-    const address = r.welcomeRoomId && r.berthDoor ? seedFor(r.welcomeRoomId) : undefined;
-    if (address && r.berthDoor) out.berth = { address, farDoor: r.berthDoor };
+    // the ship's own berth memory decides, or arrival reports no berth. A
+    // door name the doors doc would strip counts as none.
+    const door = r.berthDoor && isAcceptableDoorKey(r.berthDoor) ? r.berthDoor : undefined;
+    const address = r.welcomeRoomId && door ? seedFor(r.welcomeRoomId) : undefined;
+    if (address && door) out.berth = { address, farDoor: door };
     return out;
   });
 }
