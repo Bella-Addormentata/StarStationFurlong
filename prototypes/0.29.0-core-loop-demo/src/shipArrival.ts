@@ -34,7 +34,7 @@ import {
   type BerthMemoryRecord,
   type FlightRecord,
 } from './shipDoc';
-import { isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
+import { adriftAt, isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
 
 /** The slice of a dock port the planner reads (docking.ts DockPortView). */
 export interface ArrivalPort {
@@ -372,10 +372,10 @@ export function completeArrival(
   const rec = readFlightRecord();
   if (rec.status !== 'redocking') return null;
   const now = opts.now ?? Date.now();
-  const settle = (outcome: ArrivalOutcome): ArrivalOutcome | null => {
+  const settle = (outcome: ArrivalOutcome, locationId: string = rec.locationId): ArrivalOutcome | null => {
     const graceOver = rec.etaAt === undefined || now >= rec.etaAt + ARRIVAL_GRACE_MS;
     if (!opts.force && !graceOver) return null;
-    writeFlightRecord({ status: 'docked', locationId: rec.locationId });
+    writeFlightRecord({ status: 'docked', locationId });
     return outcome;
   };
   // A destination that left the directory mid-flight is NOT home: arrive
@@ -385,9 +385,14 @@ export function completeArrival(
   }
   const station = findDestination(rec.locationId);
   // 🚚 A station that left its planet while the ship was on the way (still
-  // between planets, or already at the new one) has no berth in reach: the
-  // ship arrives where it was headed and stays undocked.
-  const moved = station.lastMove ?? station.move;
+  // between planets, or already at the new one) has no berth in reach.
+  // A pin (stationMove.ts) is no journey: one of where a move arrived
+  // stands for that move, and a cancel means the station never went.
+  const latest = station.lastMove ?? station.move;
+  const moved = !latest ? undefined
+    : !latest.settles ? latest
+    : latest.departAt < latest.settles.arriveAt ? undefined
+    : latest.settles;
   // Since the ship cast off — the booking, not the launch window it waited
   // for (older records carry only the window).
   const leftAt = rec.castOffAt ?? rec.departedAt;
@@ -395,7 +400,12 @@ export function completeArrival(
   // and has begun by now overlaps its time away.
   const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
   if (stationInTransit(station, now) || movedMidFlight) {
-    return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
+    // The ship waits in open orbit where the station was, a place of its own
+    // (stationDirectory.adriftAt) that follows no station; it flies on from
+    // there to any station around that planet.
+    const from = moved ?? station.move;
+    const at = from ? adriftAt(from.fromPlanetId, from.fromSlot) : adriftAt(station.planetId, 0);
+    return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' }, at);
   }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
   const ports = docking.ports();

@@ -188,7 +188,7 @@ import {
   stationForRoom,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
-import { directoryFromStationRecords, setStationDirectory } from "./stationDirectory";
+import { adriftPlace, directoryFromStationRecords, setStationDirectory } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1222,6 +1222,23 @@ function shipStationHere(roomId: string): string | null {
   return null;
 }
 
+/** Does this room hold a live dock into a room of the station whose welcome
+ *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) */
+function dockedToStation(welcomeRoomId: string): boolean {
+  for (const [, rec] of readAllDoors()) {
+    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    if (rec.transient !== true && !isDockChain(rec.segments)) continue;
+    let partner = "";
+    try {
+      partner = roomIdFromSeed(rec.connectedRoomAddress);
+    } catch {
+      continue;
+    }
+    if (partner && stationForRoom(partner)?.welcomeRoomId === welcomeRoomId) return true;
+  }
+  return false;
+}
+
 /** The one-module station whose welcome room IS this room, straight from
  *  the list (not stationForRoom, which a ship room resolves through its dock). */
 function ownStationOf(roomId: string): string | null {
@@ -1239,7 +1256,7 @@ function planetShipStatus(): ShipStatusInput | null {
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
   const from = byId(rec.locationId);
   const to = byId(rec.destinationId);
-  const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
+  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? currentStation()?.planetId;
   if (!planetId) return null;
   const name =
     // Peer-written: only a string is a name.
@@ -1900,7 +1917,7 @@ async function joinRoomAtEpoch(
     if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
-    cancelTowLeftBehind(boot.roomId, rec, Date.now());
+    cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
     // 🪐 Where this station's last move settled it, shared once for everyone.
     if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {

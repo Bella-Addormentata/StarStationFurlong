@@ -286,34 +286,39 @@ function isRecord(v: unknown): v is StationRecord {
     && (r.berthDoor === undefined || (typeof r.berthDoor === 'string' && isAcceptableDoorKey(r.berthDoor)));
 }
 
-/** How each arrival this install has settled went: 'bounced' (its new
- *  planet was full the moment it got there, so it stayed where it left from)
- *  or 'arrived', keyed by the move itself (welcome room, times, ends, mode),
- *  so two moves leaving the same millisecond never share an outcome. Worked
- *  out again from the stations known now, a bounce could flip once the
- *  station that filled the planet moves on, pulling a station across
- *  without a transfer. */
+/** How each station's latest arrival went on this install: 'bounced' (its
+ *  new planet was full the moment it got there, so it stayed where it left
+ *  from) or 'arrived'. One entry per station (its welcome room), for the move
+ *  it is for (keyed by the whole move: times, ends, mode, tug), so two moves
+ *  leaving the same millisecond never share an outcome, and other stations'
+ *  arrivals never push out an idle station's. Worked out again from the
+ *  stations known now, a bounce could flip once the station that filled the
+ *  planet moves on, pulling a station across without a transfer. Until a
+ *  shared pin (stationMove.pinSettledArrival) takes over, this holds it. */
 const OUTCOME_KEY = 'ssf-station-arrivals';
-const MAX_OUTCOMES = 128;
+/** Well above the 64 stations the atlas and the planet summaries carry. */
+const MAX_OUTCOMES = 256;
 type ArrivalOutcome = 'bounced' | 'arrived';
+type OutcomeEntry = [station: string, move: string, outcome: ArrivalOutcome];
 
-function readArrivalOutcomes(): Array<[string, ArrivalOutcome]> {
+function readArrivalOutcomes(): OutcomeEntry[] {
   try {
     const raw = localStorage.getItem(OUTCOME_KEY);
     const arr = raw ? JSON.parse(raw) : [];
     if (!Array.isArray(arr)) return [];
-    return arr.filter((e): e is [string, ArrivalOutcome] => Array.isArray(e) && typeof e[0] === 'string'
-      && (e[1] === 'bounced' || e[1] === 'arrived')).slice(-MAX_OUTCOMES);
+    return arr.filter((e): e is OutcomeEntry => Array.isArray(e) && typeof e[0] === 'string'
+      && typeof e[1] === 'string' && (e[2] === 'bounced' || e[2] === 'arrived')).slice(-MAX_OUTCOMES);
   } catch { return []; }
 }
 
-function readArrivalOutcome(key: string): ArrivalOutcome | null {
-  return readArrivalOutcomes().find((e) => e[0] === key)?.[1] ?? null;
+function readArrivalOutcome(station: string, move: string): ArrivalOutcome | null {
+  const e = readArrivalOutcomes().find((x) => x[0] === station);
+  return e && e[1] === move ? e[2] : null;
 }
 
-function writeArrivalOutcome(key: string, outcome: ArrivalOutcome): void {
-  const list = readArrivalOutcomes().filter((e) => e[0] !== key);
-  list.push([key, outcome]);
+function writeArrivalOutcome(station: string, move: string, outcome: ArrivalOutcome): void {
+  const list = readArrivalOutcomes().filter((e) => e[0] !== station);
+  list.push([station, move, outcome]);
   try { localStorage.setItem(OUTCOME_KEY, JSON.stringify(list.slice(-MAX_OUTCOMES))); } catch { /* quota */ }
 }
 
@@ -537,9 +542,10 @@ export function listStations(
     // and move say for T.
     // Once decided here it stays decided: the others' later moves change
     // what "then" looks like from now, never where this one went.
-    const outcomeKey = [candidates[i].welcomeRoomId, m.departAt, m.bookedAt ?? m.departAt, m.fromPlanetId, m.fromSlot,
-      m.toPlanetId, m.toSlot, m.mode].join('|');
-    let outcome = readArrivalOutcome(outcomeKey);
+    const station = candidates[i].welcomeRoomId || candidates[i].id;
+    const outcomeKey = [m.departAt, m.arriveAt, m.bookedAt ?? m.departAt, m.fromPlanetId, m.fromSlot,
+      m.toPlanetId, m.toSlot, m.mode, m.tugRoomId ?? '', m.settles ? m.settles.departAt : ''].join('|');
+    let outcome = readArrivalOutcome(station, outcomeKey);
     if (!outcome) {
       const dest = planetById(m.toPlanetId).id;
       const there = candidates.filter((o, j) => {
@@ -548,7 +554,7 @@ export function listStations(
         return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
       }).length;
       outcome = there >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';
-      writeArrivalOutcome(outcomeKey, outcome);
+      writeArrivalOutcome(station, outcomeKey, outcome);
     }
     if (outcome === 'bounced') at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
     let planetId = at.planetId;
