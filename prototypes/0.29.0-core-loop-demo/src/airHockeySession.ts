@@ -1003,12 +1003,22 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     const mine = s?.players[side] === myId;
     const otherPid = s?.players[otherSide(side)] ?? null;
 
+    // A claim or a practice whose player walked off (a closed tab, a room
+    // left mid-focus) holds the table until someone clears it: canReset says
+    // who may, before the match has ended too.
+    const resetTable = (table: AirHockeyState): string => (canReset(table)
+      ? btn('ah-reset', 'RESET TABLE', false, 'Clear the table, freeing an end its player left')
+      : '');
+
     let actions = '';
     if (!s || s.status === 'waiting') {
       const takenByOther = s !== null && s.players[side] !== null && !mine;
       const iHoldOther = s !== null && s.players[otherSide(side)] === myId;
       if (takenByOther) {
-        actions = `<div style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">THIS END IS TAKEN — WALK AROUND TO THE OTHER END</div>`;
+        actions = `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <span style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">THIS END IS TAKEN — WALK AROUND TO THE OTHER END</span>
+          ${resetTable(s)}
+        </div>`;
       } else if (iHoldOther) {
         actions = `<div style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">YOU HOLD THE OTHER END — WALK BACK AROUND</div>`;
       } else if (!mine) {
@@ -1030,7 +1040,10 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     } else if (s.status === 'playing') {
       actions = mine
         ? `<div style="display:flex; gap:8px;">${btn('ah-forfeit', isVersus(s) ? 'FORFEIT MATCH' : 'END PRACTICE', false, isVersus(s) ? 'Concede — your opponent takes the win' : 'Stop practising and open the table')}</div>`
-        : `<div style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">MATCH IN PROGRESS — SPECTATING</div>`;
+        : `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <span style="font-size:10px; color:rgba(212,168,75,0.75); letter-spacing:1px;">MATCH IN PROGRESS — SPECTATING</span>
+          ${resetTable(s)}
+        </div>`;
     } else {
       actions = `<div style="display:flex; gap:8px; align-items:center;">
         <span style="font-size:11px; font-weight:800; letter-spacing:1px; color:${s.winner ? sideColor(s.winner) : AH_UI_GOLD};">${s.winner ? `${sideName(s.winner)} TAKES IT ${s.score.a}–${s.score.b}` : 'MATCH OVER'}</span>
