@@ -328,6 +328,14 @@ export function routeLegFuel(route: ShipRoute, from: number, to: number): number
   return pairWindowAfter(route.stops, from, to, 0)?.fuelCost ?? null;
 }
 
+/** 🧑‍✈️ A leg between two stops of a route still being edited (the helm's
+ *  route panel, helmRoute.ts): its fixed figures (flight time, window
+ *  spacing, fuel), planned exactly as the timetable plans it, from the stops'
+ *  own copies; null when the pair can't be flown. */
+export function stopPairWindow(stops: readonly RouteStop[], from: number, to: number): LegWindow | null {
+  return pairWindowAfter(stops, from, to, 0);
+}
+
 // ── Checkpoint helpers ───────────────────────────────────────────────────────
 
 /** Tie order at one stay: at equal `at`, the higher rank decides. */
