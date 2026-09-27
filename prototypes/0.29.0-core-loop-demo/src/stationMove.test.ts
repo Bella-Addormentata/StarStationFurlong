@@ -9,6 +9,7 @@ import {
   bindPlanetSummaryDoc,
   cleanStationSummary,
   mergeStation,
+  foldOwnStation,
   summaryForStation,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
@@ -195,6 +196,27 @@ describe('the station list follows a move', () => {
     expect(list.filter((s) => s.planetId === ARIS)).toHaveLength(16);
     expect(list.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
   });
+
+  it('keeps every incumbent when the first-listed station arrives at a full planet, for good', () => {
+    const move = moveTo();
+    // Sixteen stations at Aris; the last one leaves for Sovereign after the
+    // default station has arrived (and is back before now).
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    const leaves: StationMove = {
+      ...move, stationId: 'aris-15', welcomeRoomId: 'a15', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 6,
+      departAt: move.arriveAt + 1000, arriveAt: move.arriveAt + 2000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? leaves : null));
+    const atArrival = listStations({}, full, move.arriveAt + 1);
+    expect(atArrival.filter((s) => s.planetId === ARIS).map((s) => s.id)).toEqual(full.map((r) => r.id));
+    expect(atArrival.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    // Aris now has a free slot, and the default station still stays home: it
+    // bounced when it arrived, and a vacancy later never pulls it across.
+    const later = listStations({}, full, leaves.arriveAt + 1);
+    expect(later.filter((s) => s.planetId === ARIS)).toHaveLength(15);
+    expect(later.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+  });
 });
 
 describe('the record in the room doc and on this install', () => {
@@ -341,6 +363,17 @@ describe('moves between installs', () => {
     doc.getMap('stationSummaries').set('yard-lobby', summary);
     bindPlanetSummaryDoc(doc, { currentStation: () => null, localTrim: () => null, ship: () => null });
     expect(readRememberedMoves()).toEqual([move]);
+  });
+
+  it('freshens the summary\'s stamp when a move goes out, so the caps keep it', () => {
+    const station = listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!;
+    const known = summaryForStation(station, null, NOW - 60_000);
+    const move = yardMove();
+    rememberMove(move);
+    const moving = listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!;
+    const next = foldOwnStation(known, moving, null, NOW);
+    expect(next?.move).toEqual(move);
+    expect(next!.updatedAt).toBeGreaterThan(known.updatedAt);
   });
 });
 

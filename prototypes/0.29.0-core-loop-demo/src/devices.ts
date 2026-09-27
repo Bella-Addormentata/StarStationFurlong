@@ -2199,6 +2199,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let markers: Array<{ doorId: string; x: number; y: number }> = [];
   let pickerDestId: string | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let wasTowing = false;
   // Refuel confirm-arm — one click primes, second confirms. Cleared by any
   // record change (a peer refuel resets everyone's arm).
   let refuelArmed = false;
@@ -2517,6 +2518,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         destinationId: dest.id,
         departedAt: nowHop.departAt,
         etaAt: nowHop.arriveAt,
+        castOffAt: Math.min(Date.now(), nowHop.departAt),
       });
       if (!departed) { render(); return; }
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
@@ -2827,7 +2829,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
-      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt });
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt });
     }
     if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };
@@ -2862,7 +2864,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();
-        if (readFlightRecord().status === 'in-flight') render();
+        // A tow ends on the clock, not on a write: keep ticking while this
+        // tug tows, and once more as it arrives (DEPART and UNDOCK return).
+        const towing = isTowing(currentRoomId(), Date.now());
+        if (readFlightRecord().status === 'in-flight' || towing || wasTowing) render();
+        wasTowing = towing;
       }, HELM_TICK_MS);
       render();
     },

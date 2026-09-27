@@ -329,6 +329,11 @@ export function foldOwnStation(
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);
   const { trim: _unused, move: _unusedMove, ...rest } = base;
+  // A new move freshens the summary too: the caps keep the newest summaries,
+  // and a station that just moved must not be the one dropped.
+  if (JSON.stringify(move) !== JSON.stringify(known.move)) {
+    rest.updatedAt = Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS);
+  }
   return mergeStation(known, { ...rest, ...(applies ? { trim: applies } : {}), ...(move ? { move } : {}) });
 }
 

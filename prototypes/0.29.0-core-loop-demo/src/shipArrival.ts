@@ -317,7 +317,10 @@ export function completeArrival(
   // between planets, or already at the new one) has no berth in reach: the
   // ship arrives where it was headed and stays undocked.
   const moved = station.lastMove ?? station.move;
-  const movedMidFlight = !!moved && rec.departedAt !== undefined && moved.departAt > rec.departedAt && moved.departAt <= now;
+  // Since the ship cast off — the booking, not the launch window it waited
+  // for (older records carry only the window).
+  const leftAt = rec.castOffAt ?? rec.departedAt;
+  const movedMidFlight = !!moved && leftAt !== undefined && moved.departAt > leftAt && moved.departAt <= now;
   if (stationInTransit(station, now) || movedMidFlight) {
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
   }

@@ -125,6 +125,10 @@ export interface FlightRecord {
   /** Writer-clock epoch ms the flight will arrive. Undefined outside transit.
    *  Guard: `etaAt > departedAt` (rejected on read otherwise). */
   etaAt?: number;
+  /** Writer-clock epoch ms DEPART cast off (the booking), which can be well
+   *  before `departedAt` (the launch window it waits for). Kept through
+   *  `redocking`, so arrival can tell what changed while the ship was away. */
+  castOffAt?: number;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -213,6 +217,7 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.destinationId !== undefined && !isBoundedString(r.destinationId)) return false;
   if (r.departedAt !== undefined && !(typeof r.departedAt === 'number' && Number.isFinite(r.departedAt))) return false;
   if (r.etaAt !== undefined && !(typeof r.etaAt === 'number' && Number.isFinite(r.etaAt))) return false;
+  if (r.castOffAt !== undefined && !(typeof r.castOffAt === 'number' && Number.isFinite(r.castOffAt))) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -250,6 +255,7 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
     if (r.status === 'in-flight') {
       if (r.departedAt !== undefined) out.departedAt = r.departedAt;
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;
+      if (r.castOffAt !== undefined && (r.departedAt === undefined || r.castOffAt <= r.departedAt)) out.castOffAt = r.castOffAt;
     }
   }
   // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
@@ -259,6 +265,7 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
   // mid-flight (stationMove.ts) from one that was always there.
   if (r.status === 'redocking' && r.departedAt !== undefined && r.etaAt !== undefined && r.etaAt > r.departedAt) {
     out.departedAt = r.departedAt;
+    if (r.castOffAt !== undefined && r.castOffAt <= r.departedAt) out.castOffAt = r.castOffAt;
   }
   return out;
 }

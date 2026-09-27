@@ -350,6 +350,18 @@ describe('a round trip', () => {
     writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
     expect(completeArrival(docking, { now, force: true }))
       .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    // A move that left after the booking but before the launch window the
+    // ship waited for still happened while the ship was away.
+    const window = departedAt + 120_000;
+    setStationDirectory({ stations: () => [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth, lastMove: { ...lastMove, departAt: departedAt + 1000, arriveAt: departedAt + 60_000 } },
+    ] });
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: window, etaAt: now - 1, castOffAt: departedAt });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt: window, etaAt: now - 1, castOffAt: departedAt });
+    expect(readFlightRecord().castOffAt).toBe(departedAt);
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
     // A move finished before the ship left is just where the station is now.
     setStationDirectory({ stations: () => [
       ...DEFAULT_STATIONS.slice(0, 1),
