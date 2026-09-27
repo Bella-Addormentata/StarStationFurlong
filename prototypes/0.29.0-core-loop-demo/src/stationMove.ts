@@ -243,7 +243,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
 // at a station. Its helm tows the station to another planet: the stack leaves
 // AT ONCE and thrusts the whole way — speeding up to the halfway point, then
 // braking — on a straight course from where the old planet is at departure to
-// where the new planet will be at arrival (owner pick pending, 2026-09-27:
+// where the new planet will be at arrival (owner pick, 2026-09-27, torch drive; the ask:
 // "fast with the help of a powerful tug like ship"). Still true physics on
 // the 60× clock: t = 2·√(d / a), Δv = a·t. The sun's pull is small beside the
 // torch and is left out. The tug's tanks pay, through its own room's
