@@ -2956,13 +2956,23 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     });
   };
 
+  /** 🚚 Is a stop's station between planets now (PR 174)? No ship reaches
+   *  it, so the route checks refuse it. */
+  const stopMovingNow = (now: number) => {
+    const records = listStationRecordsNow();
+    return (id: string): boolean => {
+      const st = records.find((r) => r.id === localStationId(id)) ?? records.find((r) => r.id === id);
+      return !!st && stationInTransit(st, now);
+    };
+  };
+
   /** Everything START checks, read fresh (the panel's preview and the
    *  button's re-check agree): the draft with its stops copied afresh, the
    *  stop the ship is docked at, and why START is refused (or null). */
   const routeStartContext = (d: RouteDraft, now: number) => {
     const capacity = shipFuelCapacity();
     const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
-    const fresh = refreshDraftStops(d, listStationRecordsNow(), localStationId);
+    const fresh = refreshDraftStops(d, listStationRecordsNow(), localStationId, now);
     const flight = readResolvedFlight(now);
     const startStop = routeStopIndexAt(fresh.stops, shipLocationId(flight, hasLiveDock()), localStationId);
     const ports = docking?.ports() ?? [];
@@ -2977,7 +2987,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       flightCapable: isShipReady(),
       flightStatus: flight.status,
       startStop,
-      check: checkRouteDraft(fresh, { capacity }),
+      check: checkRouteDraft(fresh, { capacity, moving: stopMovingNow(now) }),
       portFitted: !!fresh.shipPort && ports.some((p) => p.doorId === fresh.shipPort),
       robotReady: !fresh.robotDockId || robotCaptainEligible(fresh.robotDockId),
       chainedDoors: enumerateChainedDoors().length,
@@ -2992,8 +3002,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const saveRoute = (): void => {
     if (!helmIsCommander() || !draft) return;
     if (isRouteRunning(readShipRoute())) { flashRoute('The route is running: stop it to edit.'); render(); return; }
-    const d = refreshDraftStops(draft, listStationRecordsNow(), localStationId);
-    const check = checkRouteDraft(d, { capacity: shipFuelCapacity() });
+    const now = Date.now();
+    const d = refreshDraftStops(draft, listStationRecordsNow(), localStationId, now);
+    const check = checkRouteDraft(d, { capacity: shipFuelCapacity(), moving: stopMovingNow(now) });
     const route = routeFromDraft(d);
     if (!check.ok || !route) {
       flashRoute(check.problems[0] ? describeRouteProblem(check.problems[0], d.stops) : 'The route is not complete yet.');
@@ -3334,7 +3345,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     if (!draft.shipPort && c.ports.length > 0) draft = { ...draft, shipPort: defaultRoutePort(c.ports) };
     const d = draft;
     const cands = routeCandidatesNow();
-    const check = checkRouteDraft(d, { capacity: c.capacity });
+    const check = checkRouteDraft(d, { capacity: c.capacity, moving: stopMovingNow(Date.now()) });
     const dis = c.commander ? '' : ' disabled';
     const selectStyle = 'background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:4px; font-family:inherit; font-size:10px; border-radius:5px;';
     const select = (id: string, which: string, options: string, i?: number, extra = ''): string =>

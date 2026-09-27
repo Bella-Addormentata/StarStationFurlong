@@ -26,7 +26,7 @@ import {
 import type { RouteStop, ShipRoute } from './shipRoute';
 import { adriftAt } from './stationDirectory';
 import { listStations, planetById } from './stations';
-import type { StationBerthRecord } from './stations';
+import type { StationBerthRecord, StationMove } from './stations';
 import {
   DEFAULT_WAIT_SECS,
   ROUTE_DEPART_OPENS_MS,
@@ -362,6 +362,16 @@ describe('the draft', () => {
     expect(out.stops[1]).toEqual(d.stops[1]);
     expect(d.stops[0].orbitSlot).toBe(0);
   });
+
+  it('🚚 refreshDraftStops keeps its own orbit for a station between planets (the slot it left may be another station\'s now)', () => {
+    const d = draft([0, 1]);
+    const move = { fromPlanetId: SOV, fromSlot: 1, toPlanetId: 'planet-other', toSlot: 4, bookedAt: T0 - MIN, departAt: T0 - SEC, arriveAt: T0 + 60 * MIN } as StationMove;
+    const out = refreshDraftStops(d, [station(1, 5, { name: 'Leaving', move })], (id) => id, T0);
+    expect(out.stops[1]).toMatchObject({ name: 'Leaving', planetId: SOV, orbitSlot: 1 });
+    // Before its burn, and once it has arrived, it is listed where it orbits.
+    expect(refreshDraftStops(d, [station(1, 5, { move })], (id) => id, T0 - 2 * SEC).stops[1].orbitSlot).toBe(5);
+    expect(refreshDraftStops(d, [station(1, 5, { move })], (id) => id, T0 + 60 * MIN).stops[1].orbitSlot).toBe(5);
+  });
 });
 
 // ── Checks ───────────────────────────────────────────────────────────────────
@@ -395,6 +405,17 @@ describe('checkRouteDraft', () => {
     // A loop closes back to the first stop: 0 → 1 → 2 → 0 with 2 sharing 0's orbit.
     expect(checkRouteDraft(draft([0, 1, 0], { shape: 'loop' }), { capacity: CAP }).problems)
       .toEqual([{ kind: 'shared-orbit', from: 2, to: 0 }]);
+  });
+
+  it('🚚 refuses a stop whose station is moving between planets, each stop once, named first', () => {
+    const d = draft([0, 1, 2]);
+    const c = checkRouteDraft(d, { capacity: CAP, moving: (id) => id === 'st-1' });
+    expect(c.ok).toBe(false);
+    expect(c.problems[0]).toEqual({ kind: 'stop-moving', stop: 1 });
+    expect(c.problems.filter((p) => p.kind === 'stop-moving')).toHaveLength(1);
+    expect(describeRouteProblem(c.problems[0], d.stops)).toBe('Stop 1 is moving to another planet: take it off the route.');
+    expect(checkRouteDraft(d, { capacity: CAP, moving: () => false }).problems).toEqual(checkRouteDraft(d, { capacity: CAP }).problems);
+    expect(checkRouteDraft(d, { capacity: CAP }).problems.some((p) => p.kind === 'stop-moving')).toBe(false);
   });
 
   it('refuses a leg that burns more than the tanks hold, and with the home refill a round trip too', () => {

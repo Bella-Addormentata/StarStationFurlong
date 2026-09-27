@@ -145,8 +145,8 @@ import type {
   ShipRoute,
 } from './shipRoute';
 import { adriftAt, localStationId } from './stationDirectory';
-import { listStations, planetById } from './stations';
-import type { StationBerthRecord } from './stations';
+import { listStations, planetById, stationInTransit } from './stations';
+import type { StationBerthRecord, StationMove } from './stations';
 
 // ── Constants (§2b, §5) ──────────────────────────────────────────────────────
 
@@ -240,6 +240,9 @@ export interface RouteStationLike {
   welcomeRoomId: string;
   berthDoor?: string;
   berths?: readonly StationBerthRecord[];
+  /** 🚚 PR 174's move, if any: between its burns the station orbits
+   *  nowhere (still listed where it left, a slot another may hold now). */
+  move?: StationMove;
 }
 
 /** Where a berth choice came from: a gate the station lists (with or
@@ -508,18 +511,21 @@ export function setDraftAnyGate(d: RouteDraft, index: number, anyGate: boolean):
  * Copy each stop's orbit and name afresh from this game's station list (the
  * station read as this install's id), and its gate number when the station
  * lists the same berth door with one — what START saves (A1: copied on save).
- * A stop the list no longer shows keeps the copy it has.
+ * A stop the list no longer shows keeps the copy it has, and so does the
+ * orbit of a station between planets (checkRouteDraft's `moving` refuses it).
  */
 export function refreshDraftStops(
   d: RouteDraft,
   stations: readonly RouteStationLike[],
   alias: (id: string) => string = (id) => id,
+  now = Date.now(),
 ): RouteDraft {
   const stops = d.stops.map((s) => {
     const st = stations.find((x) => x.id === alias(s.stationId)) ?? stations.find((x) => x.id === s.stationId);
     const out = cloneStop(s);
     if (!st) return out;
     out.name = st.name;
+    if (stationInTransit(st, now)) return out;
     out.planetId = st.planetId;
     out.orbitSlot = st.orbitSlot;
     const listed = (st.berths ?? []).find((b) => b.roomId === s.berth.roomId && b.doorId === s.berth.farDoor);
@@ -536,6 +542,8 @@ export type RouteProblem =
   | { kind: 'too-many-stops' }
   | { kind: 'no-port' }
   | { kind: 'no-tank' }
+  /** 🚚 The stop's station is between planets (PR 174): no ship can reach it. */
+  | { kind: 'stop-moving'; stop: number }
   | { kind: 'same-station'; from: number; to: number }
   | { kind: 'other-planet'; from: number; to: number }
   | { kind: 'shared-orbit'; from: number; to: number }
@@ -565,9 +573,15 @@ function legProblem(stops: readonly RouteStop[], a: number, b: number): { window
  * hold, and — with the home refill — no round trip either (§2 Fuel). Each
  * unordered pair is reported once. Pure.
  */
-export function checkRouteDraft(d: RouteDraft, o: { capacity: number }): RouteCheck {
+export function checkRouteDraft(
+  d: RouteDraft,
+  o: { capacity: number; moving?: (stationId: string) => boolean },
+): RouteCheck {
   const problems: RouteProblem[] = [];
   const n = d.stops.length;
+  d.stops.forEach((s, i) => {
+    if (o.moving?.(s.stationId)) problems.push({ kind: 'stop-moving', stop: i });
+  });
   if (n < MIN_ROUTE_STOPS) problems.push({ kind: 'too-few-stops' });
   if (n > MAX_ROUTE_STOPS) problems.push({ kind: 'too-many-stops' });
   if (!d.shipPort) problems.push({ kind: 'no-port' });
@@ -618,6 +632,7 @@ export function describeRouteProblem(p: RouteProblem, stops: ReadonlyArray<{ nam
     case 'too-many-stops': return `A route has at most ${MAX_ROUTE_STOPS} stops.`;
     case 'no-port': return 'Fit a dock port to this module first (door panel › +DOCK): the ferry docks with it at every stop.';
     case 'no-tank': return 'Install a fuel tank: every leg burns fuel.';
+    case 'stop-moving': return `${name(p.stop)} is moving to another planet: take it off the route.`;
     case 'same-station': return `${name(p.from)} → ${name(p.to)}: the same station twice in a row.`;
     case 'other-planet': return `${name(p.from)} → ${name(p.to)}: they orbit different planets.`;
     case 'shared-orbit': return `${name(p.from)} → ${name(p.to)}: they share an orbit, so no transfer exists.`;
