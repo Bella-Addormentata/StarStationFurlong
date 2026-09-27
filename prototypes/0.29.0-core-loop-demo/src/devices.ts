@@ -4267,6 +4267,8 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let flash = '';
   /** That state as the panel first showed `flash` (null until then). */
   let flashShownIn: string | null = null;
+  /** Whether my last drop's timing was kept: part of that drop's answer, so
+   *  it gives way with `flash`. */
   let timingNote = '';
   /** My request in flight (DROP is disabled while it is set). */
   let pending: string | null = null;
@@ -4458,7 +4460,10 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
     const dropOpen = online && pending === null && chips >= PUSHER_ANTE && !full;
     const shownIn = `${operator}|${dropOpen}`;
     if (flashShownIn === null) flashShownIn = shownIn;
-    else if (flashShownIn !== shownIn) flash = '';
+    else if (flashShownIn !== shownIn) {
+      flash = '';
+      timingNote = '';
+    }
     const status = panel.querySelector<HTMLElement>('#cp-status')!;
     status.textContent = flash || (online ? 'PICK A HOLE AND TIME YOUR DROP'
       : operator === 'starting' ? 'THE MACHINE IS STARTING UP…'
