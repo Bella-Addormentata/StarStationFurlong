@@ -1185,7 +1185,9 @@ function shipStationHere(roomId: string): string | null {
     const st = partner ? stationForRoom(partner) : null;
     if (st) return st.id;
   }
-  return ownStationOf(roomId);
+  // No host station: not the ship's own one-room station (the directory
+  // hears about that through `own`), so callers fall back to the flight.
+  return null;
 }
 
 /** The one-module station whose welcome room IS this room, straight from
