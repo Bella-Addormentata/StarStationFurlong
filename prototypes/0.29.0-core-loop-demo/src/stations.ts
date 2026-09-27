@@ -129,17 +129,25 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
 /** A list of berths, cleaned, deduplicated by port and capped. */
 export function cleanBerths(v: unknown): StationBerthRecord[] {
   if (!Array.isArray(v)) return [];
-  const out: StationBerthRecord[] = [];
+  const valid: StationBerthRecord[] = [];
   const seen = new Set<string>();
   for (const item of v.slice(0, MAX_BERTHS * 4)) {
-    if (out.length >= MAX_BERTHS) break;
     const b = cleanBerth(item);
     if (!b) continue;
     const key = `${b.roomId}\u0000${b.doorId}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    out.push(b);
+    valid.push(b);
   }
+  // One slot per gate number first (as cleanGates): ports repeating a number,
+  // or with none, only fill what is left, so they cannot crowd a gate out.
+  const numbers = new Set<number>();
+  const firsts: StationBerthRecord[] = [];
+  const rest: StationBerthRecord[] = [];
+  for (const b of valid) {
+    if (b.gate !== undefined && !numbers.has(b.gate)) { numbers.add(b.gate); firsts.push(b); } else rest.push(b);
+  }
+  const out = [...firsts, ...rest].slice(0, MAX_BERTHS);
   // In gate order whatever order a peer sent (unnumbered berths last, then
   // by room and door), so arrivals try the lowest gate first.
   const cmp = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);

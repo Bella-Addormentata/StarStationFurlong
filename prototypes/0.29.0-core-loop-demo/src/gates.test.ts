@@ -393,6 +393,13 @@ describe('the station record', () => {
     ]).map((b) => b.gate)).toEqual([1, 2, 3, undefined]);
   });
 
+  it('keeps every gate number when a peer floods the list with one number', () => {
+    const flood = Array.from({ length: 99 }, (_, i) => ({ roomId: 'room-x', doorId: `d:${String(i).padStart(8, '0')}`, gate: 1 }));
+    const out = cleanBerths([...flood, { roomId: 'room-a', doorId: 'north', gate: 2 }]);
+    expect(out).toHaveLength(99);
+    expect(out.some((b) => b.gate === 2)).toBe(true);
+  });
+
   it("keeps a record's extra fields beside a long gate list", () => {
     const berths = Array.from({ length: 40 }, (_, i) => ({ roomId: 'room-far', doorId: `d:${String(i + 1).padStart(8, '0')}`, gate: i + 1 }));
     registerStation({ id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berths, tow: { by: 'tug' } } as Parameters<typeof registerStation>[0]);
