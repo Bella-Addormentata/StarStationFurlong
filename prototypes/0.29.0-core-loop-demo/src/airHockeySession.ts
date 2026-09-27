@@ -62,6 +62,7 @@ import type { MovementTick } from './network/protocol';
 import { FURNITURE, rotXZ } from './furniture';
 import type { Rot } from './furniture';
 import type { AirHockeyVisualHandle, DeviceUI } from './devices';
+import { activeRoomId } from './roomInventory';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -746,11 +747,22 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   let lastTopHtml = '';
   let lastCardHtml = '';
 
-  /** The room doc this panel opened in (casinoDocEpoch at mount). Device focus
-   *  can outlive a room change, and the next room may hold a table with this
-   *  id: once the bound doc changes, the panel reads and writes nothing. */
+  /** The room this panel opened in, and the doc of that room it reads
+   *  (casinoDocEpoch). Device focus can outlive a room change, and the next
+   *  room may hold a table with this id: while another room is bound, the
+   *  panel reads and writes nothing. When its own room is joined again with a
+   *  new doc (a failed swap restores it, a node retry rejoins it), the panel
+   *  follows that doc and takes up the mallet again. */
+  let mountRoom: string | null = null;
   let mountEpoch = -1;
-  const live = (): boolean => mountEpoch === casinoDocEpoch();
+  const live = (): boolean => {
+    if (mountRoom === null) return false;
+    if (mountEpoch === casinoDocEpoch()) return true;
+    if (activeRoomId() !== mountRoom) return false;
+    mountEpoch = casinoDocEpoch();
+    engage();
+    return true;
+  };
   const st = (): TableSession | null => (live() ? sessionFor(deps.itemId) : null);
   const state = (): AirHockeyState | null => (live() ? readAirHockey(deps.itemId) : null);
   /** When this panel's table serves next, on this page's clock (servesAt). */
@@ -767,6 +779,25 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   const locked = (): boolean =>
     captureLayer !== null && document.pointerLockElement === captureLayer;
+
+  /** Engage the table's session in the room's current doc: my mallet spawns
+   *  mid-defence, raised. */
+  const engage = (): void => {
+    const session = sessionFor(deps.itemId);
+    if (!session) return;
+    const start = clampMallet(side, 0, side === 'a' ? -0.9 : 0.9);
+    session.engaged = {
+      side,
+      x: start.x,
+      z: start.z,
+      vx: 0,
+      vz: 0,
+      prevX: start.x,
+      prevZ: start.z,
+      down: false,
+      locked: locked(),
+    };
+  };
 
   // ── Doc transitions (read → pure engine → transacted write) ────────────────
 
@@ -1051,6 +1082,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
   return {
     mount(host: HTMLElement): void {
+      mountRoom = activeRoomId();
       mountEpoch = casinoDocEpoch();
       panel = document.createElement('div');
       panel.id = 'device-airhockey-pane';
@@ -1129,22 +1161,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
 
       host.appendChild(panel);
 
-      // Engage the session: my mallet spawns mid-defence, raised.
-      const session = st();
-      if (session) {
-        const start = clampMallet(side, 0, side === 'a' ? -0.9 : 0.9);
-        session.engaged = {
-          side,
-          x: start.x,
-          z: start.z,
-          vx: 0,
-          vz: 0,
-          prevX: start.x,
-          prevZ: start.z,
-          down: false,
-          locked: false,
-        };
-      }
+      engage();
 
       document.addEventListener('pointerlockchange', onLockChange);
       document.addEventListener('mousemove', onMouseMove);
@@ -1195,6 +1212,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       prompt = null;
       lastTopHtml = '';
       lastCardHtml = '';
+      mountRoom = null;
     },
 
     update(): void {
