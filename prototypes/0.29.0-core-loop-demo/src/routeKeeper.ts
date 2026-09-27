@@ -531,7 +531,8 @@ export function keeperBerths(o: {
  * One gate's refusal, as the keeper counts it:
  *   taken  the berth is in use (or the module would overlap there)
  *   shut   the gate is closed, or reserved for another ship
- *   gone   the berth's door, or its port, was removed
+ *   gone   the berth's door, or its port, was removed (and no port can be
+ *          fitted there again while every gate number is taken)
  *   rider  a verdict on this game alone: its key (a granted-captains gate),
  *          its pass, or its reach
  *   port   the ship's port itself cannot dock now: the pass stops
@@ -548,6 +549,7 @@ export function classifyKeeperRefusal(
       return 'taken';
     case 'gone':
     case 'closed':
+    case 'no-gate':
       return 'gone';
     case 'not-allowed': {
       // A granted-captains gate checks the docking game's key (A9.5): a

@@ -479,7 +479,10 @@ export type DockRefusal =
   | 'closed'
   | 'gone'
   | 'not-allowed'
-  | 'superseded';
+  | 'superseded'
+  /** ⚓🚦 The far door wears no port and every gate number of its station
+   *  is taken (PR 177), so none could be fitted. */
+  | 'no-gate';
 
 /** A DOCK's answer: docked (with the dock's own stamp), or why not. */
 export type DockAnswer =

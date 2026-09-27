@@ -66,14 +66,14 @@ export function applyFarDockRequest(
   }
   // The requester's key is its own claim, as every door write is in the
   // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
-  const gate = gateAccessIn(doc, req.farDoor, req.requesterPub);
+  const access = gateAccessIn(doc, req.farDoor, req.requesterPub);
   const patch = farDockPatch(
     readDoorFrom(doc, req.farDoor),
     farBerth(doc, req.farDoor),
     near,
     req.dockedAt,
     req.replacesUndockedAt,
-    gate,
+    access,
   );
   if (patch.action === 'refuse') {
     return {
@@ -84,7 +84,7 @@ export function applyFarDockRequest(
         // 🚏⚓🚦 Which setting refused: a route's keeper tells a gate open
         // only to granted captains (this rider's key) from one shut to the
         // ship. Additive; the refusal itself is farDockPatch's, unchanged.
-        ...(patch.reason === 'not-allowed' && gate.access !== 'open' ? { gateAccess: gate.access } : {}),
+        ...(patch.reason === 'not-allowed' && access.access !== 'open' ? { gateAccess: access.access } : {}),
       },
       wrote: false,
     };
