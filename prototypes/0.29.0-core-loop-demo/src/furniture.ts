@@ -71,9 +71,9 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { isBoltedIntoStation, isBurning, readOrbitTrim, subscribeStationKeeping, trimFor } from "./stationKeeping";
+import { isBoltedIntoStation, readBurnFiring, subscribeStationKeeping, trimFor } from "./stationKeeping";
 import { currentStation } from "./stations";
-import type { OrbitTrim } from "./stationKeeping";
+import type { StationRecord } from "./stations";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 // 🧬 #165: the clone vat's tank dimensions live with the avatar's clearance
@@ -4150,19 +4150,19 @@ function buildHelmSticks(
 
   // Which hand: the room's pairings say ship or station, live.
   let bolted = false;
-  let trim: OrbitTrim | null = null;
+  let station: StationRecord | null = null;
   const applyFace = () => {
     bolted = isBoltedIntoStation(readAllDoors().values());
     fighter.visible = !bolted;
     trimStick.visible = bolted;
   };
-  // Only a trim that applies to the station this install places the room in
-  // (stationKeeping.trimFor) — the one the dashboard shows and burns from.
-  const readTrim = () => {
-    trim = trimFor(currentStation(), readOrbitTrim());
+  // The station this install places the room in: the stick leans only for a
+  // burn on its orbit (stationKeeping.trimFor), as the dashboard shows it.
+  const readStation = () => {
+    station = currentStation();
   };
   applyFace();
-  readTrim();
+  readStation();
 
   // A burn leans the small stick: RAISE pulls it back toward the pilot, LOWER
   // pushes it away, AHEAD leans it to the pilot's right (−x), BACK to the left.
@@ -4172,10 +4172,13 @@ function buildHelmSticks(
     update(dt: number): void {
       let tx = 0;
       let tz = 0;
-      if (bolted && trim && isBurning(trim, Date.now())) {
-        if (trim.last === "raise") tx = -LEAN;
-        else if (trim.last === "lower") tx = LEAN;
-        else if (trim.last === "ahead") tz = LEAN;
+      // The room's burn firing now, whatever order the log keeps (a peer's
+      // clock running ahead never hides this one).
+      const firing = bolted ? trimFor(station, readBurnFiring(Date.now())) : null;
+      if (firing) {
+        if (firing.dir === "raise") tx = -LEAN;
+        else if (firing.dir === "lower") tx = LEAN;
+        else if (firing.dir === "ahead") tz = LEAN;
         else tz = -LEAN;
       }
       const k = 1 - Math.exp(-dt * 14);
@@ -4191,9 +4194,9 @@ function buildHelmSticks(
   carrier.userData.propAnim = anim;
   carrier.userData.disposeHelmFace = subscribeDoors(() => {
     applyFace();
-    readTrim(); // the doors can move the room to another station
+    readStation(); // the doors can move the room to another station
   });
-  carrier.userData.disposeHelmTrim = subscribeStationKeeping(readTrim);
+  carrier.userData.disposeHelmTrim = subscribeStationKeeping(readStation);
 }
 
 /** ⚓ #163: the helm's docking-computer face — a round port glyph (the

@@ -46,6 +46,7 @@ import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { readResolvedFlight } from './shipRoute';
+import { adriftPlace } from './stationDirectory';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -98,9 +99,21 @@ type Source =
 
 /** A flight's transfer rebuilt from its record: the Hohmann ellipse between
  *  the two stations' orbits, pinned to the record's own times. */
+/** Where a flight record's location is: a station, or open orbit (174's
+ *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
+type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
+
+function placeOf(id: string | undefined, all: readonly StationRecord[]): Place | undefined {
+  if (!id) return undefined;
+  const station = all.find((s) => s.id === id);
+  if (station) return station;
+  const adrift = adriftPlace(id);
+  return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
+}
+
 function flightPlan(
-  from: StationRecord | undefined,
-  to: StationRecord | undefined,
+  from: Place | undefined,
+  to: Place | undefined,
   departedAt: number,
   etaAt: number,
 ): TransferPlan | null {
@@ -116,7 +129,11 @@ function flightPlan(
  *  written after an arrival) is a station settled at its slot, never a
  *  transfer. */
 function reallyMoving(s: StationRecord, now: number): boolean {
-  return !!s.move && !isPinMove(s.move) && stationInTransit(s, now);
+  // Only a move with a real course right now: a malformed record (both ends
+  // on one planet, say) leaves the station at its slot (listStations), so it
+  // is drawn there, never hidden and never given a sun view.
+  return !!s.move && !isPinMove(s.move) && stationInTransit(s, now)
+    && betweenPlanets(s.move) && moveTransitPointAt(s.move, now) !== null;
 }
 
 /** A move whose ends are two different planets, once unknown ids read as
@@ -145,27 +162,26 @@ function gather(now: number): Source {
   // a ready ship that is not bolted into a station follows its flight (the
   // same test main.ts's planet publisher and station resolver use).
   let aboard: TransferPlan | null = null;
+  // Aboard a ship waiting in open orbit (its destination station left): see
+  // the planet from that orbit, not from the ship's own one-room station.
+  let adrift: Place | null = null;
   if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
     // 🚏 A running ferry route's timetable while it rules the flight (its
     // legs write no stored `flight`), else the stored record.
     const rec = readResolvedFlight(now);
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
-      aboard = flightPlan(
-        all.find((s) => s.id === rec.locationId),
-        all.find((s) => s.id === rec.destinationId),
-        rec.departedAt,
-        rec.etaAt,
-      );
+      aboard = flightPlan(placeOf(rec.locationId, all), placeOf(rec.destinationId, all), rec.departedAt, rec.etaAt);
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
     }
+    if (!aboard && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
   }
 
   // Not in a known station (offline, or before the first join): stand in
   // for the planet's slot-0 station, so it is not drawn as a neighbour on
   // top of the viewer.
-  const me = aboard
+  const me = aboard || adrift
     ? null
     : currentStation() ??
       all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0) ??
@@ -173,16 +189,19 @@ function gather(now: number): Source {
   // The sun view only while the move really has a course right now (a
   // malformed record, say both ends on one planet, has none): otherwise the
   // planet view below, never an empty backdrop.
-  if (me && reallyMoving(me, now) && me.move && betweenPlanets(me.move) && moveTransitPointAt(me.move, now)) {
+  if (me && reallyMoving(me, now) && me.move) {
     const m = me.move;
-    return { mode: 'sun', move: m, key: [
+    // JSON, not a joined string: ids come from peers and may hold any delimiter.
+    return { mode: 'sun', move: m, key: JSON.stringify([
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
-      ].join('|') };
+      ]) };
   }
 
   const planetId = aboard
     ? aboard.from.planet.id
-    : me
+    : adrift
+      ? adrift.planetId
+      : me
       ? planetById(me.planetId).id
       : planetForRoom(roomId, atlas).id;
   let viewer: (ms: number) => OrbitPoint;
@@ -190,6 +209,10 @@ function gather(now: number): Source {
   if (aboard) {
     const plan = aboard;
     viewer = (ms) => transferPointAt(plan, ms);
+  } else if (adrift) {
+    const place = adrift;
+    viewer = (ms) => stationPointAt(place, ms);
+    viewerRingRadiusKm = stationOrbit(place).radiusKm;
   } else if (me) {
     const station = me;
     viewer = (ms) => stationPointAt(station, ms);
@@ -226,16 +249,18 @@ function gather(now: number): Source {
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 
-  const key = [
+  const key = JSON.stringify([
     'planet',
     planetId,
     viewerRingRadiusKm ?? 'x',
     // Everything buildFrame draws once: ring radii (a trim moves a ring
     // without changing its slot), names, module counts and each course.
-    ...stations.map((s) => `${s.record.id}:${stationOrbit(s.record).radiusKm.toFixed(3)}:${s.modules}:${s.record.name}`),
-    ...ships.map((s) =>
-      `${s.id}:${s.name}:${s.plan.departAt}:${s.plan.arriveAt}:${s.plan.from.radiusKm.toFixed(3)}:${s.plan.from.phase0}:${s.plan.to.radiusKm.toFixed(3)}:${s.plan.to.phase0}`),
-  ].join('|');
+    ...stations.map((s) => [s.record.id, stationOrbit(s.record).radiusKm.toFixed(3), s.modules, s.record.name]),
+    ...ships.map((s) => [
+      s.id, s.name, s.plan.departAt, s.plan.arriveAt,
+      s.plan.from.radiusKm.toFixed(3), s.plan.from.phase0, s.plan.to.radiusKm.toFixed(3), s.plan.to.phase0,
+    ]),
+  ]);
   return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key };
 }
 

@@ -83,8 +83,11 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.bookedAt === undefined || isTime(r.bookedAt))
-    && (r.settles === undefined || (isStationMove(r.settles) && r.settles.settles === undefined
-      && r.settles.welcomeRoomId === r.welcomeRoomId))
+    // One level only, checked before recursing: a hostile nest is refused
+    // at the first step, never walked.
+    && (r.settles === undefined || (typeof r.settles === 'object' && r.settles !== null
+      && (r.settles as { settles?: unknown }).settles === undefined
+      && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
 }
@@ -553,16 +556,23 @@ export function cancelTowLeftBehind(
   roomId: string,
   flight: { status: string; castOffAt?: number; departedAt?: number },
   realMs: number,
+  /** Is this room still docked to a room of that station, right now? A
+   *  manual UNDOCK leaves the flight record 'docked', so the live dock is
+   *  what says the tug let go. Leave it out when it is not known. */
+  dockedTo?: (welcomeRoomId: string) => boolean,
 ): boolean {
-  if (flight.status === 'docked') return false;
   const best = readStationMove();
   if (!best || isCancelPin(best)) return false;
   // Once a tow has arrived its arrival may be pinned; the tow is its parent.
   const tow = best.settles ?? best;
   if (tow.mode !== 'tug' || tow.tugRoomId !== roomId) return false;
   // The tug left before the tow was over: by when the flight cast off when
-  // the record says, however late this tab learns of it; else by now.
-  const leftAt = flight.castOffAt ?? flight.departedAt ?? realMs;
+  // the record says, however late this tab learns of it; a tug still
+  // 'docked' that let go of the station (UNDOCK records no time) by now.
+  let leftAt: number;
+  if (flight.status !== 'docked') leftAt = flight.castOffAt ?? flight.departedAt ?? realMs;
+  else if (dockedTo && !dockedTo(tow.welcomeRoomId)) leftAt = realMs;
+  else return false;
   if (leftAt >= tow.arriveAt) return false;
   const departAt = tow.departAt + 1;
   return writeStationMove({

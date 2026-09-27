@@ -268,9 +268,24 @@ describe('the station list follows a move', () => {
       ...move, stationId: 'aris-15', welcomeRoomId: 'a15', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 6,
       departAt: move.departAt, arriveAt: move.arriveAt - 1000,
     };
+    // Many more arrivals since (other stations', well past the 128 the log
+    // once kept) never push its outcome out.
+    for (let k = 0; k < 200; k++) {
+      // Fifty stations, each arriving again and again with a new move.
+      const room = `o${k % 50}`;
+      const other: StationMove = { ...move, stationId: room, welcomeRoomId: room, toPlanetId: SOV, fromPlanetId: ARIS,
+        departAt: move.departAt + k, arriveAt: move.arriveAt + k };
+      setStationMoveResolver((st) => (st.welcomeRoomId === room ? other : null));
+      listStations({}, [{ id: room, name: 'O', planetId: ARIS, orbitSlot: 0, welcomeRoomId: room }], move.arriveAt + 1000);
+    }
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? left : null));
     expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
       .toMatchObject({ planetId: SOV });
+    // A move differing only in its arrival is a different move: decided afresh.
+    const sooner = { ...move, arriveAt: move.arriveAt - 1 };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? sooner : st.welcomeRoomId === 'a15' ? left : null));
+    expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: ARIS });
   });
 
   it('shares where an arrival settled, so installs that judged it differently agree', () => {
@@ -820,6 +835,33 @@ describe('tugs: a torch tow', () => {
     } finally {
       setStationTrimResolver(null);
     }
+  });
+
+  it('cancels a tow whose tug let go of the station with its flight record still docked', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    const docked = { status: 'docked' };
+    // Still holding the station: nothing to do (and nothing when unknown).
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 1, () => true)).toBe(false);
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 1)).toBe(false);
+    // Let go mid-tow: cancelled.
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 2, (w) => w !== plan.move.welcomeRoomId)).toBe(true);
+    expect(isCancelPin(readStationMove()!)).toBe(true);
+    // After the tow arrived an undock is just an undock.
+    store.clear();
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    expect(cancelTowLeftBehind('tug-room', docked, plan.move.arriveAt + 1, () => false)).toBe(false);
+  });
+
+  it('refuses a nest of pins at the first step', () => {
+    const base = moveTo();
+    let nest: Record<string, unknown> = { ...base };
+    for (let k = 0; k < 100_000; k++) nest = { ...base, settles: nest };
+    expect(isStationMove(nest)).toBe(false);
+    expect(isStationMove({ ...base, settles: { ...base } })).toBe(true);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {

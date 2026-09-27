@@ -148,6 +148,35 @@ export function findStation(id: string): StationDestination {
   return list.find((s) => s.id === id) ?? list[0];
 }
 
+/** Where a ship that missed a departed station waits: open orbit at the
+ *  planet and slot that station left (`adrift:<planetId>:<slot>`). A place,
+ *  never a station, so it follows no station anywhere; hops leave from it to
+ *  the stations around that planet like from any orbit. */
+export const ADRIFT_PREFIX = 'adrift:';
+
+export function adriftAt(planetId: string, orbitSlot: number): string {
+  return `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
+}
+
+/** The planet and slot an adrift location names, or null for anything else. */
+export function adriftPlace(id: string): { planetId: string; orbitSlot: number } | null {
+  if (typeof id !== 'string' || !id.startsWith(ADRIFT_PREFIX)) return null;
+  const rest = id.slice(ADRIFT_PREFIX.length);
+  const cut = rest.lastIndexOf(':');
+  const planetId = rest.slice(0, cut);
+  const orbitSlot = Number(rest.slice(cut + 1));
+  if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot > 63) return null;
+  return { planetId, orbitSlot };
+}
+
+/** The planet a ship's location is at: its station's, or an adrift
+ *  location's own; null when unlisted. */
+export function locationPlanet(id: string): string | null {
+  const adrift = adriftPlace(id);
+  if (adrift) return adrift.planetId;
+  return isKnownStation(id) ? findStation(id).planetId : null;
+}
+
 /** Is `id` a station the directory knows (no home fallback)? */
 export function isKnownStation(id: string): boolean {
   return listStations().some((s) => s.id === id);
@@ -158,13 +187,14 @@ export function isKnownStation(id: string): boolean {
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
   // Both ends must be listed: findStation would quietly read an unknown
   // origin as home.
-  if (fromId === toId || !isKnownStation(fromId) || !isKnownStation(toId)) return null;
+  if (fromId === toId || !(isKnownStation(fromId) || adriftPlace(fromId)) || !isKnownStation(toId)) return null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
     return wholeMs(plan);
   }
   const dest = findStation(toId);
+  if (locationPlanet(fromId) !== dest.planetId) return null;
   return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
 }
 
@@ -187,7 +217,8 @@ export function stationHere(): string | null {
 /** The stations a ship at `fromId` may fly to: every OTHER station orbiting
  *  the same planet (and never the one its room belongs to right now). */
 export function destinationsFrom(fromId: string): StationDestination[] {
-  const from = findStation(fromId);
+  const adrift = adriftPlace(fromId);
+  const from = adrift ? { id: fromId, planetId: adrift.planetId } : findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
   // A station between planets (stationMove.ts) is in no planet's orbits.
@@ -330,8 +361,9 @@ export function directoryFromStationRecords(
     ...(portable ? { portable } : {}),
     plan: (fromId, toId, nowMs) => {
       const records = list();
+      const adrift = adriftPlace(fromId);
       return planRecordHop(
-        records.find((r) => r.id === fromId),
+        adrift ? { id: fromId, name: '', welcomeRoomId: '', ...adrift } : records.find((r) => r.id === fromId),
         records.find((r) => r.id === toId),
         nowMs,
       );
