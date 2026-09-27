@@ -22,7 +22,7 @@
 import { stampAfter, type DockPortState } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
-import { stationInTransit } from './stations';
+import { listStations, planetById, stationInTransit } from './stations';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -34,7 +34,7 @@ import {
   type BerthMemoryRecord,
   type FlightRecord,
 } from './shipDoc';
-import { adriftAt, isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
+import { adriftAt, adriftPlace, isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
 
 /** The slice of a dock port the planner reads (docking.ts DockPortView). */
 export interface ArrivalPort {
@@ -331,12 +331,19 @@ export function completeArrival(
   // Any move that was still under way (or not yet begun) when the ship left
   // and has begun by now overlaps its time away.
   const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
-  if (stationInTransit(station, now) || movedMidFlight) {
+  // Where the station orbited at cast-off, when the flight kept it: however
+  // many moves it made since (and only the latest is kept), it is not there.
+  const castOffPlace = rec.destinationAt !== undefined ? adriftPlace(rec.destinationAt) : null;
+  const listedNow = castOffPlace ? listStations().find((s) => s.id === rec.locationId) : undefined;
+  const movedAway = !!castOffPlace && !!listedNow
+    && (planetById(listedNow.planetId).id !== planetById(castOffPlace.planetId).id || listedNow.orbitSlot !== castOffPlace.orbitSlot);
+  if (stationInTransit(station, now) || movedMidFlight || movedAway) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.
     const from = moved ?? station.move;
-    const at = from ? adriftAt(from.fromPlanetId, from.fromSlot) : adriftAt(station.planetId, 0);
+    const at = castOffPlace ? adriftAt(castOffPlace.planetId, castOffPlace.orbitSlot)
+      : from ? adriftAt(from.fromPlanetId, from.fromSlot) : adriftAt(station.planetId, 0);
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' }, at);
   }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
