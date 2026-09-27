@@ -167,6 +167,26 @@ describe('guards', () => {
     expect(readStationRecords().find((r) => r.welcomeRoomId === 'room-hab')).not.toHaveProperty('move');
   });
 
+  it('leaves out a berth a station record could not hold, keeping the station', () => {
+    const s = cleanStationSummary({ ...summary(), berthDoor: 'not a door' }, T0);
+    expect(s).not.toBeNull();
+    expect(s).not.toHaveProperty('berthDoor');
+  });
+
+  it('lets one of two installs that own the same place stand for good, in either order', () => {
+    const a = summary({ ownerId: 'alpha', orbitSlot: 2, updatedAt: T0 });
+    const b = summary({ ownerId: 'beta', orbitSlot: 3, updatedAt: T0 + 50 });
+    expect((mergeStation(a, b) ?? a).orbitSlot).toBe(2);
+    expect(mergeStation(b, a)?.orbitSlot).toBe(2);
+    // The losing install republishing, newer each time, changes nothing.
+    expect(mergeStation(a, { ...b, updatedAt: T0 + 5000 })).toBeNull();
+  });
+
+  it("does not republish over another install's identical record", () => {
+    const known = summary({ ownerId: 'alpha', updatedAt: T0 });
+    expect(foldOwnStation(known, record({ id: 'beta' }), null, T0 + 10)).toBeNull();
+  });
+
   it('checks ship summaries', () => {
     const ship = { roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'in-flight', fromRoom: 'a', toRoom: 'b', departedAt: T0, etaAt: T0 + 60_000, updatedAt: T0 };
     expect(cleanShipSummary(ship, T0)).toEqual(ship);
@@ -400,6 +420,22 @@ describe('sharing through the room doc', () => {
     publishPlanetSummary(now);
     expect(map.has('room-hab')).toBe(true);
     expect(readStore(now).stations['room-hab']).toBeDefined();
+  });
+
+  it("keeps this planet's other stations through a flood from another planet", () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const map = doc.getMap('stationSummaries');
+    map.set('room-near', summary({ welcomeRoomId: 'room-near', name: 'NEAR', orbitSlot: 5, updatedAt: now - 60 * 60 * 1000 }));
+    for (let i = 0; i < 70; i++) {
+      const id = `room-${String(i).padStart(3, '0')}`;
+      map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, planetId: ARIS, orbitSlot: 3, updatedAt: now + 60 * 60 * 1000 }));
+    }
+    bindPlanetSummaryDoc(doc, install('hab'));
+    publishPlanetSummary(now);
+    expect(map.has('room-near')).toBe(true);
+    expect(readStore(now).stations['room-near']).toBeDefined();
   });
 
   it('never publishes a seed', () => {
