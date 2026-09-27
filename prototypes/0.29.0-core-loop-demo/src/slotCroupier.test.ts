@@ -14,6 +14,7 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  depositSlotFunding,
   hasSlotEscrow,
   LEGACY_SLOT_LEASE_READ_CAP,
   readChips,
@@ -24,6 +25,7 @@ import {
   readSlotReveal,
   refundSlotWager,
   reserveSlotWager,
+  settleSlotWager,
   SLOT_OPERATOR_KEY,
   writeSlotFundingConfig,
   writeSlotMachineState,
@@ -37,10 +39,12 @@ import {
   commitSlotSeed,
   DEFAULT_PAYTABLE,
   hashSlotPaytable,
+  initialSlotMachineState,
   maxSlotPayout,
   randomSlotSeed,
   SLOT_SPIN_MS,
 } from './games/slots';
+import type { SlotFundingConfig } from './games/slots';
 import { getPlayerId } from './identity';
 import {
   closeSlotMachine,
@@ -734,6 +738,147 @@ describe('a round once this session no longer holds the lease', () => {
     expect(readSlotMachineState(M1)).toEqual(refunded);
     expect(readChips(PLAYER)).toBe(100);
     expect(readChips(OPERATOR)).toBe(10_000);
+  });
+});
+
+// ── A round's stake and its spin reach a peer together ─────────────────────
+
+/**
+ * A peer applying every update this doc emits, one at a time. After each, it
+ * records whether the machine shows a spin exactly when a stake is locked.
+ */
+function peerSeesSpinWithStake(machineId = M1): boolean[] {
+  const peer = new Y.Doc();
+  Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+  const seen: boolean[] = [];
+  doc.on('update', (update: Uint8Array) => {
+    Y.applyUpdate(peer, update);
+    const casino = peer.getMap('casino');
+    const state = casino.get(`slot:${machineId}`) as { phase?: string } | undefined;
+    seen.push(casino.has(`slot-escrow:${machineId}`) === (state?.phase === 'spinning'));
+  });
+  return seen;
+}
+
+/** A spin another operator accepted on `machineId`: its stake is locked. */
+function spinElsewhere(machineId: string, funding: SlotFundingConfig): void {
+  expect(reserveSlotWager(machineId, PLAYER, BET, funding, RESERVE)).toBe('ok');
+  writeSlotMachineState(machineId, {
+    ...initialSlotMachineState(),
+    phase: 'spinning',
+    player: PLAYER,
+    bet: BET,
+    requestId: 'req-elsewhere',
+    acceptedAt: Date.now(),
+    funding,
+    fairness: { mode: 'commit-reveal', commits: ['a'.repeat(64), 'b'.repeat(64)] },
+  });
+}
+
+describe("a round's stake and its spin", () => {
+  it('a settle pays out and ends the spin in one update', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const seen = peerSeesSpinWithStake();
+    tickSlotMachineRoom([M1], false, at(ready + SLOT_SPIN_MS + 10));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)?.phase).toBe('settled');
+    expect(hasSlotEscrow(M1)).toBe(false);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true);
+  });
+
+  it('a reveal-timeout refund returns the stake and ends the spin in one update', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    let t = becomeOperator([M1]);
+    await acceptsDone();
+    const seen = peerSeesSpinWithStake();
+    // No reveal comes: past the 30 s reveal timeout, the round is refunded.
+    for (let i = 0; i < 11; i++) tickSlotMachineRoom([M1], false, at(t += 3_000));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)?.failure).toBe('reveal-timeout');
+    expect(readChips(PLAYER)).toBe(100);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true);
+  });
+
+  it('a refund returns the stake and ends the spin in one update', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    const seen = peerSeesSpinWithStake();
+    fund(M1, OTHER); // the bankroll changes hands: the round is wound down
+    tickSlotMachineRoom([M1], false, at(ready + 100));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)?.failure).toBe('invalid-house-commit');
+    expect(readChips(PLAYER)).toBe(100);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true);
+  });
+
+  it('a teardown refunds the stake and removes the machine in one update', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    becomeOperator([M1]);
+    await acceptsDone();
+    const seen = peerSeesSpinWithStake();
+    closeSlotMachine(M1, true);
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(readChips(PLAYER)).toBe(100);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every(Boolean)).toBe(true);
+  });
+
+  it('a spin left with no stake locked is ended without moving chips', async () => {
+    fund(M1);
+    const funding = { mode: 'owner' as const, ownerId: OPERATOR };
+    // Another operator accepted a spin and paid it out, but its settled state
+    // never arrived: it left between the two, as an earlier build can.
+    spinElsewhere(M1, funding);
+    expect(settleSlotWager(M1, PLAYER, funding, 2 * BET)).toBe(true);
+    becomeOperator([M1]);
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toMatchObject({
+      phase: 'settled', requestId: 'req-elsewhere', credited: 0,
+    });
+    expect(readChips(PLAYER)).toBe(100 + BET);
+    expect(readChips(OPERATOR)).toBe(10_000 - BET);
+  });
+
+  it("a round of this session's whose stake was returned elsewhere is ended, not paid again", async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    // Another operator refunded the round meanwhile; its state never arrived.
+    expect(refundSlotWager(M1, PLAYER, BET, { mode: 'owner', ownerId: OPERATOR })).toBe(true);
+    tickSlotMachineRoom([M1], false, at(ready + SLOT_SPIN_MS + 10));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toMatchObject({ phase: 'settled', credited: 0 });
+    expect(slotRoundsInHand()).toBe(0);
+    expect(readChips(PLAYER)).toBe(100);
+    expect(readChips(OPERATOR)).toBe(10_000);
+  });
+
+  it("a teardown of a machine left spinning with no stake locked still returns the machine's bankroll", async () => {
+    const funding = { mode: 'machine' as const, ownerId: OPERATOR };
+    writeSlotFundingConfig(M1, funding);
+    expect(depositSlotFunding(M1, OPERATOR, 1_000)).toBe(true);
+    spinElsewhere(M1, funding);
+    expect(settleSlotWager(M1, PLAYER, funding, 0)).toBe(true); // its state never arrived
+    closeSlotMachine(M1, true);
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    // The bankroll, with the lost stake, is back with its owner.
+    expect(readChips(OPERATOR)).toBe(10_000 + BET);
+    expect(readChips(PLAYER)).toBe(100 - BET);
   });
 });
 

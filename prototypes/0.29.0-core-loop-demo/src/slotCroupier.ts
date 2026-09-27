@@ -28,6 +28,15 @@
  * machine's next operator, who can't operate while this session holds the
  * lease. This session keeps the lease until it has refunded the round.
  *
+ * TERMINAL WRITES: a round's stake and its spin go out together. Accepting
+ * locks the stake and publishes the spin in one transaction, and a settle, a
+ * refund or a teardown returns the stake and ends the spin (or removes the
+ * machine) in one transaction, so a peer never sees one without the other.
+ * A spin with no stake locked was settled or refunded by an operator whose
+ * state never followed (an earlier build sends the two as separate updates):
+ * the next operator ends it without moving chips, and a teardown removes the
+ * machine without a refund.
+ *
  * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
  * could each take it and settle spins; when the docs merge, only one of each
  * balance write survives. Settling can't be made split-safe without an
@@ -653,11 +662,14 @@ function tickSlotMachine(machineId: string, operatorId: string, tenure: string):
     const player = state.player;
     const houseCommit = state.fairness?.commits?.[1];
     const accepted = activeAccepted;
+    // A spin this session didn't accept is refunded, and so is one with no
+    // stake locked, which ends without moving chips (TERMINAL WRITES above).
     if (!player || !state.requestId || !houseCommit
       || !accepted
       || accepted.requestId !== state.requestId
       || accepted.player !== player
-      || accepted.houseCommit !== houseCommit) {
+      || accepted.houseCommit !== houseCommit
+      || !hasSlotEscrow(machineId)) {
       runTerminal(machineId, 'house-commit refund', () =>
         cancelForHouseCommit(machineId, state, tenure));
       return;
@@ -726,25 +738,29 @@ async function settleRevealTimeout(
   const token = accepted.sharedLeaseToken ?? undefined;
   if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
   if (!stillOperates(accepted.docEpoch, tenure)) return;
-  if (!refundSlotWager(
-    machineId,
-    accepted.player,
-    accepted.bet,
-    accepted.funding,
-    token,
-  )) return;
-  clearSlotReveal(machineId, accepted.player);
-  writeSlotMachineState(machineId, {
-    ...state,
-    bet: accepted.bet,
-    funding: accepted.funding,
-    paytable: accepted.paytable,
-    sharedLeaseToken: null,
-    phase: 'settled',
-    credited: 0,
-    settledAt: Date.now(),
-    failure: 'reveal-timeout',
+  const refunded = transactCasino(() => {
+    if (!refundSlotWager(
+      machineId,
+      accepted.player,
+      accepted.bet,
+      accepted.funding,
+      token,
+    )) return false;
+    clearSlotReveal(machineId, accepted.player);
+    writeSlotMachineState(machineId, {
+      ...state,
+      bet: accepted.bet,
+      funding: accepted.funding,
+      paytable: accepted.paytable,
+      sharedLeaseToken: null,
+      phase: 'settled',
+      credited: 0,
+      settledAt: Date.now(),
+      failure: 'reveal-timeout',
+    });
+    return true;
   });
+  if (!refunded) return;
   releaseAcceptedFundingLease(machineId, accepted);
   acceptedRounds.delete(machineId);
 }
@@ -770,32 +786,40 @@ async function cancelForHouseCommit(
     || await ensureTerminalFundingLease(machineId, refund.funding, sharedLeaseToken);
   // Nothing is written once this session no longer operates the room.
   if (!stillOperates(docEpoch, tenure)) return;
-  if (state?.player) clearSlotReveal(machineId, state.player);
-  if (!fundingReady) return;
-  if (refund && !refundSlotWager(
-    machineId,
-    refund.player,
-    refund.bet,
-    refund.funding,
-    sharedLeaseToken,
-  )) return;
-  writeSlotMachineState(machineId, {
-    ...(state ?? initialSlotMachineState()),
-    ...(accepted ? {
-      round: accepted.round,
-      player: accepted.player,
-      bet: accepted.bet,
-      requestId: accepted.requestId,
-      acceptedAt: accepted.acceptedAt,
-      funding: accepted.funding,
-      paytable: accepted.paytable,
-    } : {}),
-    phase: 'settled',
-    credited: 0,
-    settledAt: Date.now(),
-    failure: 'invalid-house-commit',
-    sharedLeaseToken: null,
+  // The refund and the settled state go out in one transaction (TERMINAL
+  // WRITES above).
+  const ended = transactCasino(() => {
+    if (state?.player) clearSlotReveal(machineId, state.player);
+    if (!fundingReady) return false;
+    // No stake locked: the round was settled or refunded already, and only
+    // its spin is left to end.
+    if (refund && hasSlotEscrow(machineId) && !refundSlotWager(
+      machineId,
+      refund.player,
+      refund.bet,
+      refund.funding,
+      sharedLeaseToken,
+    )) return false;
+    writeSlotMachineState(machineId, {
+      ...(state ?? initialSlotMachineState()),
+      ...(accepted ? {
+        round: accepted.round,
+        player: accepted.player,
+        bet: accepted.bet,
+        requestId: accepted.requestId,
+        acceptedAt: accepted.acceptedAt,
+        funding: accepted.funding,
+        paytable: accepted.paytable,
+      } : {}),
+      phase: 'settled',
+      credited: 0,
+      settledAt: Date.now(),
+      failure: 'invalid-house-commit',
+      sharedLeaseToken: null,
+    });
+    return true;
   });
+  if (!ended) return;
   if (sharedLeaseToken) releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
   acceptedRounds.delete(machineId);
 }
@@ -1011,45 +1035,47 @@ async function settle(
     || terminalState.requestId !== state.requestId
     || acceptedRounds.get(machineId) !== accepted
     || terminalState.fairness?.commits?.[1] !== accepted.houseCommit) return;
-  const paid = settleSlotWager(
-    machineId,
-    accepted.player,
-    accepted.funding,
-    resolution.credited,
-    token,
-  );
-  let escrowSettled = paid;
-  if (!paid) {
-    escrowSettled = settleSlotWager(
+  // The payout and the settled state go out in one transaction (TERMINAL
+  // WRITES above).
+  const settled = transactCasino(() => {
+    const paid = settleSlotWager(
+      machineId,
+      accepted.player,
+      accepted.funding,
+      resolution.credited,
+      token,
+    );
+    if (!paid && !settleSlotWager(
       machineId,
       accepted.player,
       accepted.funding,
       0,
       token,
-    );
-  }
-  if (!escrowSettled) return;
-  writeSlotMachineState(machineId, {
-    ...state,
-    player: accepted.player,
-    bet: accepted.bet,
-    houseSeed: accepted.houseSeed,
-    funding: accepted.funding,
-    paytable: accepted.paytable,
-    phase: 'settled',
-    seeds,
-    result,
-    credited: paid ? resolution.credited : 0,
-    settledAt: Date.now(),
-    ...(paid ? {} : { failure: 'insufficient-bankroll' as const }),
-    sharedLeaseToken: null,
-    fairness: {
-      mode: 'commit-reveal',
-      commits: [accepted.playerCommit, accepted.houseCommit],
-      seeds: [playerSeed, accepted.houseSeed],
-    },
+    )) return false;
+    writeSlotMachineState(machineId, {
+      ...state,
+      player: accepted.player,
+      bet: accepted.bet,
+      houseSeed: accepted.houseSeed,
+      funding: accepted.funding,
+      paytable: accepted.paytable,
+      phase: 'settled',
+      seeds,
+      result,
+      credited: paid ? resolution.credited : 0,
+      settledAt: Date.now(),
+      ...(paid ? {} : { failure: 'insufficient-bankroll' as const }),
+      sharedLeaseToken: null,
+      fairness: {
+        mode: 'commit-reveal',
+        commits: [accepted.playerCommit, accepted.houseCommit],
+        seeds: [playerSeed, accepted.houseSeed],
+      },
+    });
+    clearSlotReveal(machineId, accepted.player);
+    return true;
   });
-  clearSlotReveal(machineId, accepted.player);
+  if (!settled) return;
   releaseAcceptedFundingLease(machineId, accepted);
   acceptedRounds.delete(machineId);
 }
@@ -1071,45 +1097,44 @@ export function closeSlotMachine(
 async function closeSlotMachineManaged(machineId: string): Promise<void> {
   const state = readSlotMachineState(machineId);
   const accepted = currentAcceptedRound(machineId);
-  let refunded = true;
+  let refund: {
+    player: string;
+    bet: number;
+    funding: SlotFundingConfig;
+    token: string | undefined;
+  } | null = null;
   if (accepted) {
     const token = accepted.sharedLeaseToken ?? undefined;
     if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
-    refunded = refundSlotWager(
-      machineId,
-      accepted.player,
-      accepted.bet,
-      accepted.funding,
-      token,
-    );
+    refund = { player: accepted.player, bet: accepted.bet, funding: accepted.funding, token };
   } else if (state?.phase === 'spinning' && state.player && state.bet && state.funding) {
-    const sharedLeaseToken = sharedFundingLeaseToken(
+    const token = sharedFundingLeaseToken(
       machineId,
       state.funding,
       undefined,
       state.sharedLeaseToken,
     );
-    if (!await ensureTerminalFundingLease(
-      machineId,
-      state.funding,
-      sharedLeaseToken,
-    )) return;
-    refunded = refundSlotWager(
-      machineId,
-      state.player,
-      state.bet,
-      state.funding,
-      sharedLeaseToken,
-    );
-    if (refunded && sharedLeaseToken) {
-      releaseSlotSharedBankrollLease(machineId, sharedLeaseToken);
-    }
+    if (!await ensureTerminalFundingLease(machineId, state.funding, token)) return;
+    refund = { player: state.player, bet: state.bet, funding: state.funding, token };
   }
-  if (!refunded) return;
+  // The refund and the machine's removal go out in one transaction (TERMINAL
+  // WRITES above). With no stake locked there is nothing to refund.
+  const closed = transactCasino(() => {
+    if (refund && hasSlotEscrow(machineId) && !refundSlotWager(
+      machineId,
+      refund.player,
+      refund.bet,
+      refund.funding,
+      refund.token,
+    )) return false;
+    drainSlotMachineFunding(machineId);
+    clearSlotMachineKeys(machineId);
+    return true;
+  });
+  if (!closed) return;
+  if (!accepted && refund?.token) releaseSlotSharedBankrollLease(machineId, refund.token);
   releaseAcceptedFundingLease(machineId, accepted);
   acceptedRounds.delete(machineId);
-  drainSlotMachineFunding(machineId);
-  clearSlotMachineKeys(machineId);
 }
 
 /** Stop operating here and release the room's lease if this session holds
