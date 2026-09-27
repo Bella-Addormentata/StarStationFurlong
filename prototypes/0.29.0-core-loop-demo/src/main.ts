@@ -146,6 +146,14 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+import {
+  dockedStationFor,
+  listStations,
+  registerStation,
+  removeStation,
+  setRoomStationResolver,
+  setStationRoomSource,
+} from "./stations";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -427,6 +435,13 @@ setAirHockeySender((buf) => networkProvider.sendTick(buf));
   count: () => peerCount(),
   list: () => listPeers(),
   hintsFor,
+  // 🪐 Station records (stations.ts): list every station this install knows,
+  // or pin one to a planet and orbit slot, e.g.
+  //   __ssfMesh.registerStation({ id: 'l4-yard', name: 'L4 YARD',
+  //     planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'home-…' })
+  listStations: () => listStations(),
+  registerStation,
+  removeStation,
   // 🛰️ The default-station bundle: the connected component of the room you
   // are standing in (or of `roomId`), stripped of everything personal — see
   // the "Changing the default station" steps in defaultStation.ts.
@@ -1629,6 +1644,16 @@ async function joinRoomAtEpoch(
     });
     // The exterior's atlas walk starts from the CURRENT room.
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
+    // 🪐 …and the station registry's "which station am I in" (holotable).
+    setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
+    // from the station it is docked at: the current room's live docks place
+    // it (the holotable's "you are here", the exterior's planet).
+    setRoomStationResolver((roomId) =>
+      roomId && roomId === activeBootstrap?.roomId
+        ? dockedStationFor(roomId, readAllDoors().values())
+        : null,
+    );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -3341,6 +3366,13 @@ function harvestStationAtlas(): void {
         farWall: r.farWall,
         farLateral: r.farLateral,
         farYawDeg: r.farYawDeg,
+        // ⚓ A visiting ship's berth: drawn from space, never station structure.
+        // This room's own live record is the truth, and doorsDoc keeps the
+        // flag only when true, so an absent one here is a KNOWN non-berth:
+        // publishing false is what clears a stale marker from a door re-paired
+        // as structure. A dock chain counts as a berth either way
+        // (harvestIntoAtlas).
+        transient: r.transient === true,
         ...(pose
           ? {
               wall: pose.wall,
