@@ -295,6 +295,12 @@ describe('planTrim — the stick', () => {
     expect(describeTrimStatus(base, trim({ at: T0 - 100, last: 'back' }), T0)).toMatch(/^BURNING: sliding/);
   });
 
+  it('stamps the burn with what the tanks hold, when the helm says', () => {
+    const plan = planTrim(ctx({ capacity: 300 }), 'raise');
+    expect(plan.ok && plan.burn).toEqual(burnAt(T0, 'raise', { cap: 300 }));
+    expect(plan.ok && isTrimBurn(plan.burn)).toBe(true);
+  });
+
   it('plans the burn to log and the trim it leaves', () => {
     const plan = planTrim(ctx({ now: T0 + 7 }), 'lower');
     expect(plan).toEqual({ ok: true, burn: burnAt(T0 + 7, 'lower'), trim: applyBurn(null, burnAt(T0 + 7, 'lower')) });
@@ -429,6 +435,23 @@ describe('replaying the burns', () => {
     expect(replayBurns([run[0], big, run[1]], null, 2, 4).fired).toEqual([run[0], run[1]]);
   });
 
+  it('a burn stamped before the start applies at the start\'s last burn, with no jump there', () => {
+    const start = trim({ dRadiusKm: -4, dPhase: 0.01, at: T0 + HOUR });
+    const early = burnAt(T0, 'raise');
+    const out = replayBurns([early], start);
+    expect(out.trim).toEqual(applyBurn(start, { ...early, at: start.at }));
+    expect(out.trim).toMatchObject({ dRadiusKm: -4 + TRIM_STEP_KM, at: start.at });
+    const base = slotOrbit(STATION);
+    expect(slotOffsetAt(base, out.trim, start.at)).toBeCloseTo(slotOffsetAt(base, start, start.at), 12);
+    expect(out.fired).toEqual([early]);
+  });
+
+  it('holds each burn to the ceiling for the capacity it was made against', () => {
+    const burns = [burnAt(T0, 'raise', { cap: 200 }), burnAt(T0 + 1_000, 'ahead', { cap: 100 }), burnAt(T0 + 2_000, 'back')];
+    const ceiling = (cap: number) => (cap === 100 ? 1 : 5);
+    expect(replayBurns(burns, null, 0, ceiling).fired).toEqual([burns[0], burns[2]]);
+  });
+
   it('a burn on another planet or slot starts from its slot, and the next one back starts over', () => {
     const out = replayBurns([
       burnAt(T0, 'raise'),
@@ -536,6 +559,10 @@ describe('the burn log in the room doc', () => {
       { ...burnAt(T0, 'raise'), at: Number.POSITIVE_INFINITY },
       { ...burnAt(T0, 'raise'), slot: -1 },
       { ...burnAt(T0, 'raise'), planetId: '' },
+      { ...burnAt(T0, 'raise'), cap: -1 },
+      { ...burnAt(T0, 'raise'), cap: Number.NaN },
+      { ...burnAt(T0, 'raise'), cap: '100' },
+      { ...burnAt(T0, 'raise'), cap: 1e13 },
     ];
     hostileBurns.forEach((value, i) => map.set(`burn:hostile:${i}`, value));
     // A well-formed burn under a key outside the log is not a burn either.
@@ -753,6 +780,63 @@ describe('the tanks cover every burn that fires', () => {
     }
   });
 
+  it('two tabs racing for the last unit the tanks fitted now hold: stranded fuel never pays', () => {
+    // Copilot's review of #173: 180 in two tanks and 99 drawn, then one tank
+    // comes off, leaving 1 unit to burn; both tabs see it.
+    for (const [first, second] of [[900, 100], [100, 900]]) {
+      const [a, b] = pair(first, second, 180);
+      writeFuelLevel(180, 200);
+      a.transact(() => {
+        for (let i = 0; i < 99; i++) {
+          a.getMap('stationKeeping').set(`burn:earlier:${i}`, burnAt(T0 - HOUR + i * BURN_MS, i % 2 ? 'ahead' : 'back', { cap: 200 }));
+        }
+      });
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      const fire = (now: number): TrimBurn => {
+        const fuel = clampFuelToCapacity(readFuelLevel(100), 100);
+        expect(fuel).toBe(TRIM_FUEL);
+        const plan = planTrim(ctx({
+          trim: readOrbitTrim(), fuel, capacity: 100, now, firing: readBurnFiring(now), logFull: isBurnLogFull(),
+        }), 'raise');
+        if (!plan.ok) throw new Error(`refused: ${plan.refusal}`);
+        expect(writeTrimBurn(plan.burn)).toBe(true);
+        return plan.burn;
+      };
+      const ba = fire(T0);
+      bindRoom(b);
+      fire(T0 + 40);
+      sync(a, b);
+      for (const doc of [a, b]) {
+        bindRoom(doc);
+        expect(readFuelDrawn()).toBe(100 * TRIM_FUEL);
+        expect(clampFuelToCapacity(readFuelLevel(100), 100)).toBe(0);
+        expect(readOrbitTrim()).toMatchObject({ at: ba.at, last: 'raise' });
+      }
+    }
+  });
+
+  it('holds each burn to the tanks it fired with, whatever is fitted later', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(150, 200);
+    const log = doc.getMap('stationKeeping');
+    // 120 burns fired with two tanks fitted...
+    doc.transact(() => {
+      for (let i = 0; i < 120; i++) log.set(`burn:two:${i}`, burnAt(T0 + i * BURN_MS, i % 2 ? 'ahead' : 'back', { cap: 200 }));
+    });
+    expect(readFuelDrawn()).toBe(120 * TRIM_FUEL);
+    const t = readOrbitTrim();
+    // ...all stand once one comes off, and the gauge has nothing left.
+    expect(clampFuelToCapacity(readFuelLevel(100), 100)).toBe(0);
+    // A burn fired with one tank fitted draws only on what that one holds.
+    log.set('burn:one:0', burnAt(T0 + 200 * BURN_MS, 'raise', { cap: 100 }));
+    expect(readFuelDrawn()).toBe(120 * TRIM_FUEL);
+    expect(readOrbitTrim()).toEqual(t);
+    // One from a build before the stamp draws on the level as written.
+    log.set('burn:old:0', burnAt(T0 + 201 * BURN_MS, 'raise'));
+    expect(readFuelDrawn()).toBe(121 * TRIM_FUEL);
+  });
+
   it('station keeping yields to another draw that leaves too little', () => {
     const doc = new Y.Doc();
     bindRoom(doc);
@@ -847,14 +931,16 @@ describe('level writes settle the log', () => {
       writeFuelLevel(50, 100);
       const last = press('lower', T0 + 5 * BURN_MS);
       // ...while tab X, still seeing two burns, fires one stamped before the
-      // REFUEL.
+      // REFUEL: a change of radius, which changes the drift from then on.
       bindRoom(x);
-      const offlineBurn = press('back', T0 + 2 * BURN_MS + 10);
+      const offlineBurn = press('lower', T0 + 2 * BURN_MS + 10);
       sync(a, x);
       for (const doc of [a, x]) {
         bindRoom(doc);
-        const settledTrim = replayBurns([...early, ...later]).trim;
-        expect(readOrbitTrim()).toEqual(replayBurns([offlineBurn, last], settledTrim).trim);
+        // X's burn is stamped before the burns the REFUEL settled, so it
+        // applies at the time of the last of them.
+        const settledTrim = replayBurns([...early, ...later]).trim!;
+        expect(readOrbitTrim()).toEqual(applyBurn(applyBurn(settledTrim, { ...offlineBurn, at: settledTrim.at }), last));
         expect(readFuelDrawn()).toBe(7 * TRIM_FUEL);
         expect(readFuelLevel()).toBe(50 - 2 * TRIM_FUEL);
       }
@@ -929,6 +1015,32 @@ describe('level writes settle the log', () => {
     expect(readFuelSettlement(SK)).toEqual(settled);
     bindRoom(doc);
     expect(readOrbitTrim()).toEqual((settled as KeepingSettlement).trim);
+  });
+
+  it('takes the same burns out of a flood whatever order it was written in', () => {
+    const flood = Array.from({ length: 3 * MAX_LOG }, (_, i) => burnAt(T0 + i * BURN_MS, i % 3 ? 'ahead' : 'back'));
+    const junk = Array.from({ length: 2 * MAX_LOG + 10 }, (_, i) => `burn:junk:${i}`);
+    const settle = (reversed: boolean) => {
+      const doc = new Y.Doc();
+      bindRoom(doc);
+      writeFuelLevel(5_000, 5_000);
+      const entries = flood.map((b, i) => [`burn:peer:${i}`, b] as const);
+      doc.transact(() => {
+        for (const [key, b] of reversed ? [...entries].reverse() : entries) log(doc).set(key, b);
+        for (const key of reversed ? [...junk].reverse() : junk) log(doc).set(key, 'junk');
+      });
+      const before = { trim: readOrbitTrim(), drawn: readFuelDrawn() };
+      writeFuelLevel(5_000, 5_000);
+      return { before, settled: readFuelSettlement(SK) };
+    };
+    const forward = settle(false);
+    expect(settle(true)).toEqual(forward);
+    expect(forward.before.drawn).toBe(MAX_LOG * TRIM_FUEL);
+    expect(forward.before.trim).toEqual(replayBurns(flood.slice(0, MAX_LOG)).trim);
+    const settled = forward.settled as KeepingSettlement;
+    expect(isKeepingSettlement(settled)).toBe(true);
+    expect(settled.burns.slice(0, MAX_LOG)).toEqual(flood.slice(0, MAX_LOG).map((_, i) => `burn:peer:${i}`));
+    expect(settled.burns).toHaveLength(2 * MAX_LOG);
   });
 
   it('holds the stick once MAX_LOG burns wait, and takes no more than that until a level write', () => {
