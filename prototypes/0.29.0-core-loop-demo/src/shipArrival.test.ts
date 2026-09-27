@@ -23,6 +23,7 @@ import {
   castOffRefusal,
   rememberBerthHere,
   completeArrival,
+  ADRIFT_PREFIX,
   planArrivalDock,
   type ArrivalOutcome,
   shipLocationId,
@@ -330,6 +331,14 @@ describe('a round trip', () => {
     expect(completeArrival(docking, { now, force: true }))
       .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
     expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+    // The ship holds by a station still at Sovereign, never following the
+    // one that left.
+    expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: 'furlong-station' });
+    // With no other station there it waits adrift, where no hop starts.
+    setStationDirectory({ stations: () => stations.slice(1) });
+    fly('furlong-station', 'high-orbit');
+    completeArrival(docking, { now, force: true });
+    expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: `${ADRIFT_PREFIX}planet-sovereign` });
   });
 
   it('stays undocked at a station that finished moving to another planet before the ship arrived', () => {

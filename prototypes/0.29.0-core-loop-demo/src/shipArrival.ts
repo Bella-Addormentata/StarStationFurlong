@@ -34,7 +34,12 @@ import {
   type BerthMemoryRecord,
   type FlightRecord,
 } from './shipDoc';
-import { isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
+import { isKnownStation, listStations, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
+
+/** Where a ship that missed a departed station waits when no other station
+ *  orbits that planet: an unlisted id, so no hop leaves from it and it never
+ *  follows the station. Dock from a door panel to go on. */
+export const ADRIFT_PREFIX = 'adrift:';
 
 /** The slice of a dock port the planner reads (docking.ts DockPortView). */
 export interface ArrivalPort {
@@ -304,10 +309,10 @@ export function completeArrival(
   const rec = readFlightRecord();
   if (rec.status !== 'redocking') return null;
   const now = opts.now ?? Date.now();
-  const settle = (outcome: ArrivalOutcome): ArrivalOutcome | null => {
+  const settle = (outcome: ArrivalOutcome, locationId: string = rec.locationId): ArrivalOutcome | null => {
     const graceOver = rec.etaAt === undefined || now >= rec.etaAt + ARRIVAL_GRACE_MS;
     if (!opts.force && !graceOver) return null;
-    writeFlightRecord({ status: 'docked', locationId: rec.locationId });
+    writeFlightRecord({ status: 'docked', locationId });
     return outcome;
   };
   // A destination that left the directory mid-flight is NOT home: arrive
@@ -327,7 +332,13 @@ export function completeArrival(
   // and has begun by now overlaps its time away.
   const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
   if (stationInTransit(station, now) || movedMidFlight) {
-    return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
+    // The ship stays at the planet the station left, never following it: it
+    // holds by another station there, or (none) adrift where no hop starts.
+    const planetId = moved?.fromPlanetId ?? station.planetId;
+    const holdBy = listStations().find((s) => s.id !== station.id && s.planetId === planetId
+      && !stationInTransit(s, now));
+    return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' },
+      holdBy?.id ?? `${ADRIFT_PREFIX}${planetId}`);
   }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
   const ports = docking.ports();

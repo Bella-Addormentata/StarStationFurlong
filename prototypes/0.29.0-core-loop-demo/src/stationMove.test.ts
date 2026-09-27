@@ -267,9 +267,24 @@ describe('the station list follows a move', () => {
       ...move, stationId: 'aris-15', welcomeRoomId: 'a15', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 6,
       departAt: move.departAt, arriveAt: move.arriveAt - 1000,
     };
+    // Many more arrivals since (other stations', well past the 128 the log
+    // once kept) never push its outcome out.
+    for (let k = 0; k < 200; k++) {
+      // Fifty stations, each arriving again and again with a new move.
+      const room = `o${k % 50}`;
+      const other: StationMove = { ...move, stationId: room, welcomeRoomId: room, toPlanetId: SOV, fromPlanetId: ARIS,
+        departAt: move.departAt + k, arriveAt: move.arriveAt + k };
+      setStationMoveResolver((st) => (st.welcomeRoomId === room ? other : null));
+      listStations({}, [{ id: room, name: 'O', planetId: ARIS, orbitSlot: 0, welcomeRoomId: room }], move.arriveAt + 1000);
+    }
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? left : null));
     expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
       .toMatchObject({ planetId: SOV });
+    // A move differing only in its arrival is a different move: decided afresh.
+    const sooner = { ...move, arriveAt: move.arriveAt - 1 };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? sooner : st.welcomeRoomId === 'a15' ? left : null));
+    expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
+      .toMatchObject({ planetId: ARIS });
   });
 
   it('shares where an arrival settled, so installs that judged it differently agree', () => {
