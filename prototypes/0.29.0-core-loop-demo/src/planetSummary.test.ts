@@ -106,6 +106,13 @@ describe('guards', () => {
     expect(s).toEqual(summary());
   });
 
+  it('drops a trim stamped further ahead than the gossip skew', () => {
+    const far = cleanStationSummary({ ...summary(), trim: trim({ at: T0 + 7 * 3600 * 1000 }) }, T0);
+    expect(far).toEqual(summary());
+    const near = cleanStationSummary({ ...summary(), trim: trim({ at: T0 + 3600 * 1000 }) }, T0);
+    expect(near?.trim?.at).toBe(T0 + 3600 * 1000);
+  });
+
   it('carries unknown record fields in ext, bounded and without known keys', () => {
     // `move` is a typed field now (stationMove.ts): a newer build's field
     // this one does not know rides ext instead.
@@ -194,6 +201,17 @@ describe('learned stations', () => {
     expect(readStationRecords()).toEqual([]);
   });
 
+  it('drop learned records from another planet when asked to prune, never this install\'s own', () => {
+    registerStation(record({ id: 'mine', welcomeRoomId: 'room-mine', planetId: ARIS, orbitSlot: 3 }));
+    registerLearnedStations(SOV, [summary()]);
+    expect(readStationRecords().map((r) => r.id)).toContain(`${LEARNED_PREFIX}room-hab`);
+    // Not pruning (this client's planet unknown): the learned record stays.
+    registerLearnedStations(ARIS, []);
+    expect(readStationRecords().map((r) => r.id)).toContain(`${LEARNED_PREFIX}room-hab`);
+    expect(registerLearnedStations(ARIS, [], { prune: true })).toBe(1);
+    expect(readStationRecords().map((r) => r.id)).toEqual(['mine']);
+  });
+
   it('carry new record fields through to the record they register', () => {
     const move = { toPlanetId: ARIS };
     expect(learnedRecord(summary({ ext: { move } }))).toMatchObject({ move, id: 'shared:room-hab', orbitSlot: 2 });
@@ -264,6 +282,25 @@ describe('sharing through the room doc', () => {
     expect(readStore().ships).toEqual({});
   });
 
+  it('prunes the shared maps to their newest valid entries on publish', () => {
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const map = doc.getMap('stationSummaries');
+    for (let i = 0; i < 300; i++) map.set(`junk-${i}`, { name: 'junk' });
+    for (let i = 0; i < 70; i++) {
+      const id = `room-${String(i).padStart(3, '0')}`;
+      map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, updatedAt: now - (70 - i) * 1000 }));
+    }
+    bindPlanetSummaryDoc(doc, install(null));
+    publishPlanetSummary(now);
+    const keys = [...map.keys()];
+    expect(keys.some((k) => k.startsWith('junk-'))).toBe(false);
+    expect(keys).toHaveLength(64);
+    // The oldest six went; the newest stayed.
+    expect(keys).not.toContain('room-000');
+    expect(keys).toContain('room-069');
+  });
+
   it('never publishes a seed', () => {
     registerStation(record());
     const doc = new Y.Doc();
@@ -300,6 +337,16 @@ describe('ships and the solar system', () => {
     const doc = new Y.Doc();
     bindPlanetSummaryDoc(doc, install(null, { ship: () => ship }));
     expect(shipsAroundPlanet(SOV, Date.now() + SHIP_STALE_MS + 1000)).toEqual([]);
+  });
+
+  it('refreshes an unchanged ship\'s stamp once an hour, so it never goes stale aboard', () => {
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => ship }));
+    const first = (doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt;
+    publishPlanetSummary(first + 60_000);
+    expect((doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt).toBe(first);
+    publishPlanetSummary(first + 3600 * 1000);
+    expect((doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt).toBe(first + 3600 * 1000);
   });
 
   it('gives the rest of the system as names only', () => {
