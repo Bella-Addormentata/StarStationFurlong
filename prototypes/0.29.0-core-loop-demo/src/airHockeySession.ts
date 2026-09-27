@@ -54,7 +54,7 @@ import { casinoDocEpoch } from './casinoDoc';
 // #116 review fix: HTML escaper for peer-authored strings that reach
 // innerHTML (the seat-row display-name interpolation, previously an XSS).
 import { escapeHtml } from './htmlEscape';
-import { getPlayerId } from './identity';
+import { getPlayerId, PLAYER_NAME_MAX_LENGTH } from './identity';
 import {
   packTick, tickKind, TICK_KIND_AH_MALLET, TICK_KIND_AH_PUCK,
 } from './network/protocol';
@@ -520,8 +520,18 @@ export function airHockeyFrame(dt: number): void {
     // Frames stopped for over a takeover's grace (a hidden tab, a long
     // stall): side b took over meanwhile, so this page comes back as a fresh
     // operator, adopting the current puck on the rising edge below rather
-    // than resuming its own from before the stall.
-    if (now - st.lastFrameAt > OPERATOR_TAKEOVER_MS) st.wasOperator = false;
+    // than resuming its own from before the stall. Its mallet comes back at
+    // rest too: a swing from before the stall must not strike the puck it
+    // adopts.
+    if (now - st.lastFrameAt > OPERATOR_TAKEOVER_MS) {
+      st.wasOperator = false;
+      if (st.engaged) {
+        st.engaged.vx = 0;
+        st.engaged.vz = 0;
+        st.engaged.prevX = st.engaged.x;
+        st.engaged.prevZ = st.engaged.z;
+      }
+    }
     st.lastFrameAt = now;
 
     const s = readAirHockey(itemId);
@@ -779,7 +789,9 @@ const sideColor = (sd: AirHockeySide): string => (sd === 'a' ? AH_UI_CYAN : AH_U
 /**
  * One seat row of the focused HUD: the markup the card's innerHTML takes.
  * #116 review fix: the player's display name is peer-writable, so it is
- * escaped here, before it reaches the DOM. The rest is fixed strings.
+ * escaped here, before it reaches the DOM, and cut to the name limit first:
+ * the row is built every frame, and a peer's name can be any length. The
+ * rest is fixed strings.
  */
 export function airHockeySeatRowHtml(
   s: AirHockeyState | null,
@@ -789,8 +801,9 @@ export function airHockeySeatRowHtml(
   displayName: (playerId: string) => string,
 ): string {
   const pid = s?.players[sd] ?? null;
+  const name = pid ? displayName(pid).slice(0, PLAYER_NAME_MAX_LENGTH) : '';
   const label = pid
-    ? `${escapeHtml(displayName(pid).toUpperCase())}${pid === myId ? ' (YOU)' : ''}${s?.ready[sd] ? ' · READY' : ''}`
+    ? `${escapeHtml(name.toUpperCase())}${pid === myId ? ' (YOU)' : ''}${s?.ready[sd] ? ' · READY' : ''}`
     : 'OPEN';
   return `
       <div style="flex:1; display:flex; align-items:center; gap:8px; border:1px solid rgba(212,168,75,0.18); border-radius:6px; padding:6px 10px;">

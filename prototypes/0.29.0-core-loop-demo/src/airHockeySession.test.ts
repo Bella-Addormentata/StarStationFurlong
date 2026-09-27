@@ -277,4 +277,16 @@ describe('a page whose frames stalled mid-match (#116 review)', () => {
     routeAirHockeyTick('peer-b', puckToTick(takeover));
     expect(st.remotePuck).toBeNull();
   });
+
+  it('bring the mallet back at rest, so a swing from before the stall strikes nothing', () => {
+    const st = operatingSideA();
+    const input = st.engaged as { x: number; vx: number; vz: number };
+    input.vx = 6; // a swing in progress when the frames stopped
+    input.vz = 6;
+    vi.setSystemTime(served + 3000); // three seconds without a frame…
+    input.x += 0.2; // …while the mallet moved
+    airHockeyFrame(0.05);
+    expect(input.vx).toBe(0);
+    expect(input.vz).toBe(0);
+  });
 });

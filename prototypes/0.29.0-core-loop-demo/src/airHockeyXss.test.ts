@@ -25,6 +25,7 @@ import { escapeHtml } from './htmlEscape';
 vi.stubGlobal('window', { location: { search: '' } });
 const { airHockeySeatRowHtml } = await import('./airHockeySession');
 const { claimSide, initialAirHockeyState } = await import('./games/airHockey');
+const { PLAYER_NAME_MAX_LENGTH } = await import('./identity');
 
 describe('#116 XSS fix — escapeHtml on peer display names', () => {
   it('escapes the five markup-sensitive characters', () => {
@@ -89,7 +90,8 @@ describe('#116 XSS fix — escapeHtml on peer display names', () => {
 });
 
 describe('#116 XSS fix — the seat row the HUD renders', () => {
-  const attack = '<img src=x onerror="alert(1)">';
+  // Within the name limit, so the row shows it whole.
+  const attack = '<img src=x onerror=f()>';
   const opponent = claimSide(initialAirHockeyState(), 'b', 'peer-1', 'seat-1')!;
 
   it("carries a hostile display name as text, never as markup", () => {
@@ -99,7 +101,7 @@ describe('#116 XSS fix — the seat row the HUD renders', () => {
     expect(new Set(tags)).toEqual(new Set(['div', 'span']));
     for (const tag of html.match(/<[^>]*>/g) ?? []) expect(tag).not.toMatch(/\bon\w+\s*=/i);
     // The name is there, escaped (the row upper-cases it).
-    expect(html).toContain('&lt;IMG SRC=X ONERROR=&quot;ALERT(1)&quot;&gt;');
+    expect(html).toContain('&lt;IMG SRC=X ONERROR=F()&gt;');
   });
 
   it('escapes the name wherever it sits: this end or the other, yours or theirs', () => {
@@ -114,5 +116,15 @@ describe('#116 XSS fix — the seat row the HUD renders', () => {
     const html = airHockeySeatRowHtml(opponent, 'a', 'a', 'me', () => attack);
     expect(html).toContain('OPEN');
     expect(html).not.toContain('IMG');
+  });
+
+  it("cuts a peer's name to the name limit before it is transformed", () => {
+    // The row is built every frame; a peer's name can be any length.
+    const long = airHockeySeatRowHtml(opponent, 'b', 'a', 'me', () => 'x'.repeat(1_000_000));
+    expect(long).toContain('X'.repeat(PLAYER_NAME_MAX_LENGTH));
+    expect(long).not.toContain('X'.repeat(PLAYER_NAME_MAX_LENGTH + 1));
+    // Cut before escaping: each kept character becomes one entity.
+    const hostile = airHockeySeatRowHtml(opponent, 'b', 'a', 'me', () => '<'.repeat(1_000_000));
+    expect(hostile.match(/&lt;/g)).toHaveLength(PLAYER_NAME_MAX_LENGTH);
   });
 });
