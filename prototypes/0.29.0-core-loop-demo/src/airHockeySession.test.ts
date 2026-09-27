@@ -21,14 +21,15 @@ const {
   setAirHockeySender,
 } = await import('./airHockeySession');
 const {
-  AH_GOAL_PAUSE_MS, AH_SERVE_DELAY_MS, claimSide, initialAirHockeyState, malletToTick, startPractice,
-  takeSeat,
+  AH_GOAL_PAUSE_MS, AH_SERVE_DELAY_MS, claimSide, initialAirHockeyState, malletToTick, puckToTick,
+  setReady, startIfReady, startPractice, takeSeat,
 } = await import('./games/airHockey');
 
 type Session = {
   handle: unknown;
   docEpoch: number;
-  remotePuck: unknown;
+  remotePuck: { seq: number; [field: string]: unknown } | null;
+  puck: { x: number; z: number; vx: number; vz: number };
   remoteMallet: { a: { seq: number; [field: string]: unknown } | null; b: unknown };
   wasOperator: boolean;
   malletSeq: number;
@@ -226,5 +227,54 @@ describe("a player's other pages at one end (#116 review)", () => {
     practiceFrom(airHockeySeat());
     routeAirHockeyTick('echo', malletToTick({ x: 0.1, z: -0.4, down: true, seq: 3 }));
     expect(sessions.get(TABLE)!.remoteMallet.a).toBeNull();
+  });
+});
+
+describe('a page whose frames stalled mid-match (#116 review)', () => {
+  const T = 1_800_000_000_000;
+  const served = T + AH_SERVE_DELAY_MS;
+
+  /** A versus match this page plays as side a (the default operator), with
+   *  its first serve live. */
+  function operatingSideA(): Session {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T);
+    joinRoom();
+    registerAirHockeyVisual(TABLE, handle(), POSE);
+    const me = getPlayerId();
+    let s = claimSide(initialAirHockeyState(), 'a', me, airHockeySeat())!;
+    s = claimSide(s, 'b', 'peer-b', 'seat-b')!;
+    s = setReady(setReady(s, 'a', me)!, 'b', 'peer-b')!;
+    writeGame(TABLE, startIfReady(s, T)!);
+    const st = sessions.get(TABLE)!;
+    st.engaged = { side: 'a', x: 0, z: -0.9, vx: 0, vz: 0, prevX: 0, prevZ: -0.9, down: false, locked: false };
+    airHockeyFrame(0.016);
+    vi.setSystemTime(served);
+    airHockeyFrame(0.016);
+    return st;
+  }
+
+  /** Side b's puck after it took over: in b's half, heading for b's goal. */
+  const takeover = { x: 0.3, z: 0.6, heading: Math.PI / 2, speed: 1, active: true, seq: 7 };
+
+  it('keep the puck of the page that took over, and adopt it when frames resume', () => {
+    const st = operatingSideA();
+    expect(st.wasOperator).toBe(true);
+    expect(st.puck.z).toBeLessThan(0); // served into side a's half
+    vi.setSystemTime(served + 3000); // three seconds without a frame
+    routeAirHockeyTick('peer-b', puckToTick(takeover));
+    expect(st.remotePuck?.seq).toBe(7);
+    vi.setSystemTime(served + 3050);
+    airHockeyFrame(0.05);
+    expect(st.wasOperator).toBe(true);
+    expect(st.puck.x).toBeCloseTo(0.3, 1);
+    expect(st.puck.z).toBeGreaterThan(0.5); // side b's puck, not this page's stale one
+  });
+
+  it('still ignore other pucks while its frames run', () => {
+    const st = operatingSideA();
+    vi.setSystemTime(served + 100);
+    routeAirHockeyTick('peer-b', puckToTick(takeover));
+    expect(st.remotePuck).toBeNull();
   });
 });

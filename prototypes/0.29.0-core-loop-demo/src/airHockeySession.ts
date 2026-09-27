@@ -165,6 +165,10 @@ interface TableSession {
   puckActive: boolean;
   /** Was I the operator last frame — a rising edge adopts the remote puck. */
   wasOperator: boolean;
+  /** Wall-clock ms of this session's last frame (0 = none yet). A page whose
+   *  frames stop (a hidden tab gets none) isn't operating, whatever
+   *  wasOperator last recorded. */
+  lastFrameAt: number;
   /** Wall-clock ms of the last mallet evidence per side (ticks, or my own
    *  engaged frames) — feeds operator takeover + forfeit. Per-sender seq
    *  counters aren't cross-comparable, so staleness is wall-clock. */
@@ -264,6 +268,7 @@ function freshSession(handle: AirHockeyVisualHandle, pose: TablePose): TableSess
     puck: { x: 0, z: 0, vx: 0, vz: 0 },
     puckActive: false,
     wasOperator: false,
+    lastFrameAt: 0,
     lastMalletAt: { a: 0, b: 0 },
     slowSince: null,
     prevScore: null,
@@ -400,8 +405,11 @@ export function routeAirHockeyTick(senderId: string, tick: MovementTick): void {
 
   if (kind === TICK_KIND_AH_PUCK) {
     // While I'm the operator MY sim is truth — ignore echoes and the brief
-    // double-operator overlap during a takeover handoff.
-    if (st.wasOperator) return;
+    // double-operator overlap during a takeover handoff. A page whose frames
+    // have stopped isn't operating, whatever it last recorded: side b takes
+    // over after a second of silence, and this page keeps that puck, to adopt
+    // when its frames resume.
+    if (st.wasOperator && now - st.lastFrameAt <= OPERATOR_TAKEOVER_MS) return;
     const p = puckFromTick(tick);
     const l = worldToLocal(st.pose, p.x, p.z);
     const lx = Math.max(-AH_HALF_W, Math.min(AH_HALF_W, l.x));
@@ -508,6 +516,13 @@ export function airHockeyFrame(dt: number): void {
       st.pose.z = item.pos.z;
       st.pose.rot = item.rot;
     }
+
+    // Frames stopped for over a takeover's grace (a hidden tab, a long
+    // stall): side b took over meanwhile, so this page comes back as a fresh
+    // operator, adopting the current puck on the rising edge below rather
+    // than resuming its own from before the stall.
+    if (now - st.lastFrameAt > OPERATOR_TAKEOVER_MS) st.wasOperator = false;
+    st.lastFrameAt = now;
 
     const s = readAirHockey(itemId);
     const serveDue = s ? servesAt(st, s, now) : 0;
@@ -1118,7 +1133,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     const html = `
       <div style="display:flex; justify-content:space-between; align-items:baseline;">
         <span style="font-size:12px; font-weight:800; color:${AH_UI_GOLD_BRIGHT}; letter-spacing:1px;">🏒 AIR HOCKEY</span>
-        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD TO STEP BACK</span>
       </div>
       <div style="display:flex; gap:8px;">${seatRow(s, 'a')}${seatRow(s, 'b')}</div>
       ${actions}`;
