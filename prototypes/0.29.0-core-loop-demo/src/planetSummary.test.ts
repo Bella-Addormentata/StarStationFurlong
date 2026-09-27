@@ -302,8 +302,18 @@ describe('sharing through the room doc', () => {
       const id = `room-${String(i).padStart(3, '0')}`;
       map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, updatedAt: now - (70 - i) * 1000 }));
     }
+    // One prune pass visits a bounded number of keys (64 * 4), so no single
+    // transaction deletes more than that; later passes finish the job.
+    let mostDeleted = 0;
+    map.observe((e) => {
+      let n = 0;
+      e.changes.keys.forEach((c) => { if (c.action === 'delete') n++; });
+      mostDeleted = Math.max(mostDeleted, n);
+    });
     bindPlanetSummaryDoc(doc, install(null));
     publishPlanetSummary(now);
+    publishPlanetSummary(now);
+    expect(mostDeleted).toBeLessThanOrEqual(256);
     const keys = [...map.keys()];
     expect(keys.some((k) => k.startsWith('junk-'))).toBe(false);
     expect(keys).toHaveLength(64);

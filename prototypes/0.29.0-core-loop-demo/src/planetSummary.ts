@@ -483,11 +483,16 @@ export function pullPlanetSummary(now = Date.now()): void {
 }
 
 /** Delete a shared map's invalid entries and all but its `max` newest valid
- *  ones (ties by key, so every client prunes the same way). */
+ *  ones (ties by key, so every client prunes the same way). Peer-writable, so
+ *  one pass visits at most `max * 4` keys (the pull's bound) and evicts only
+ *  among those: a map a peer flooded shrinks over later publishes, and every
+ *  transaction stays bounded. Below the bound the result is exact. */
 function pruneMap(map: Y.Map<unknown>, stampOf: (k: string, v: unknown) => number | null, max: number): number {
   const keep: Array<[string, number]> = [];
   const drop: string[] = [];
+  let visited = 0;
   for (const [k, v] of map.entries()) {
+    if (++visited > max * 4) break;
     const at = stampOf(k, v);
     if (at === null) drop.push(k); else keep.push([k, at]);
   }
