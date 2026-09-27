@@ -83,6 +83,8 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.bookedAt === undefined || isTime(r.bookedAt))
+    && (r.settles === undefined || (isStationMove(r.settles) && r.settles.settles === undefined
+      && r.settles.welcomeRoomId === r.welcomeRoomId))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
 }
@@ -119,17 +121,26 @@ export function concurrentMoves(a: StationMove, b: StationMove): boolean {
 /** A move that goes nowhere: it holds a station where it is (a cancelled
  *  tow, or where an arrival settled). */
 export function isPinMove(m: StationMove): boolean {
-  return m.fromPlanetId === m.toPlanetId && m.fromSlot === m.toSlot;
+  return !!m.settles || (m.fromPlanetId === m.toPlanetId && m.fromSlot === m.toSlot);
 }
 
-/** One total order on a station's moves, the same on every client: the
- *  later departure wins, and two leaving the same millisecond are told apart
- *  by their serialized records. Positive when `a` wins. */
-export function compareMoves(a: StationMove, b: StationMove): number {
+function compareFlown(a: StationMove, b: StationMove): number {
   if (a.departAt !== b.departAt) return a.departAt - b.departAt;
   const sa = JSON.stringify(cleanMove(a));
   const sb = JSON.stringify(cleanMove(b));
   return sa === sb ? 0 : sa > sb ? 1 : -1;
+}
+
+/** One total order on a station's moves, the same on every client: the
+ *  later departure wins, and two leaving the same millisecond are told apart
+ *  by their serialized records. A pin ranks as the move it settles, just
+ *  after it (pins of one move by their records): a pin never lifts a move
+ *  that lost to a concurrent one over the winner. Positive when `a` wins. */
+export function compareMoves(a: StationMove, b: StationMove): number {
+  const by = compareFlown(a.settles ?? a, b.settles ?? b);
+  if (by !== 0) return by;
+  if (!a.settles !== !b.settles) return a.settles ? 1 : -1;
+  return a.settles ? compareFlown(a, b) : 0;
 }
 
 /** Only the fields a move has — what a write publishes. */
@@ -148,6 +159,7 @@ export function cleanMove(m: StationMove): StationMove {
     fuelDrawn: m.fuelDrawn,
     ...(m.mode === 'tug' && m.tugRoomId ? { tugRoomId: m.tugRoomId } : {}),
     ...(typeof m.bookedAt === 'number' ? { bookedAt: m.bookedAt } : {}),
+    ...(m.settles ? { settles: cleanMove({ ...m.settles, settles: undefined }) } : {}),
   };
 }
 
@@ -547,11 +559,13 @@ export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs
  * Settle an arrival for everyone: once a station's move has arrived, write
  * where the station list put it (its new slot, the next free one after a
  * clash, or home after a bounce off a full planet) as a move that goes
- * nowhere, leaving the moment the last one arrived. Each install decides a
- * bounce from the stations it knows, and those can differ; the pin is shared
- * like any move (room doc, remembered list, planet summaries), and pins for
- * one arrival all leave the same millisecond, so compareMoves settles them
- * to one place everywhere. Returns whether it wrote.
+ * nowhere, leaving the moment the last one arrived and naming the move it
+ * settles. Each install decides a bounce from the stations it knows, and
+ * those can differ; the pin is shared like any move (room doc, remembered
+ * list, planet summaries), and compareMoves ranks it as the move it settles:
+ * pins of one move settle to one place everywhere, and a pin of a move that
+ * turns out to have lost to a concurrent one loses with it (the winner is
+ * pinned in its turn). Returns whether it wrote.
  */
 export function pinSettledArrival(station: StationRecord | null, realMs: number): boolean {
   if (!station) return false;
@@ -569,6 +583,7 @@ export function pinSettledArrival(station: StationRecord | null, realMs: number)
     arriveAt: move.arriveAt + 1,
     mode: 'thrusters',
     bookedAt: Math.floor(realMs),
+    settles: move,
     fuel: 0,
     fuelDrawn: 0,
   });
@@ -749,11 +764,14 @@ export function readStationMove(): StationMove | null {
 
 /** Fuel moves have drawn in this room: the 'stationMove' draw meter — the
  *  legacy record's running total, plus each entry's own fuel unless a
- *  concurrent move beat it. */
+ *  concurrent move beat it; never below an unbeaten entry's own running
+ *  total (fuelDrawn), which carries the meter's deficit at booking, so a
+ *  move booked after a loser dropped out of the sum still pays. */
 export function readMoveFuelDrawn(): number {
   const { entries, legacy } = roomMoves();
   const known = knownMoves(legacy ? [legacy, ...entries] : entries);
   let drawn = legacy?.fuelDrawn ?? 0;
+  let floor = 0;
   // The same move written twice (two tabs, one millisecond) is one move.
   const seen = new Set<string>();
   for (const m of entries) {
@@ -761,8 +779,9 @@ export function readMoveFuelDrawn(): number {
     if (seen.has(key) || superseded(m, known)) continue;
     seen.add(key);
     drawn += m.fuel;
+    floor = Math.max(floor, m.fuelDrawn);
   }
-  return drawn;
+  return Math.max(drawn, floor);
 }
 
 /** Bind the room doc — beside bindStationKeepingDoc. Every move the room

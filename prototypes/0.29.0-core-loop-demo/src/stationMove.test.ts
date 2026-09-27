@@ -375,7 +375,8 @@ describe('the record in the room doc and on this install', () => {
     bindStationKeepingDoc(doc);
     bindStationMoveDoc(doc);
     writeFuelLevel(9_000, 10_000);
-    const move = moveTo();
+    // The room's first move: nothing drawn before it.
+    const move = { ...moveTo(), fuelDrawn: moveTo().fuel };
     writeStationMove(move);
     expect(readMoveFuelDrawn()).toBe(move.fuel);
     expect(readFuelLevel()).toBe(9_000 - move.fuel);
@@ -618,7 +619,7 @@ describe('tugs: a torch tow', () => {
   });
 
   it('charges one move written twice (two tabs, one millisecond) once', () => {
-    const plan = planStationTow(towCtx(), ARIS);
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
     const d1 = new Y.Doc();
     const d2 = new Y.Doc();
@@ -656,7 +657,7 @@ describe('tugs: a torch tow', () => {
   });
 
   it('lets a move booked at the same time beat a tow that would have flown first', () => {
-    const plan = planStationTow(towCtx(), ARIS);
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
     const tow = plan.move;
     expect(tow.bookedAt).toBe(NOW);
@@ -682,6 +683,49 @@ describe('tugs: a torch tow', () => {
     writeStationMove(tow);
     rememberMove(next, NOW);
     expect(readMoveFuelDrawn()).toBe(tow.fuel);
+  });
+
+  it('still charges a move booked after a concurrent loser dropped out of the meter', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const lost = plan.move;
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(lost);
+    expect(readMoveFuelDrawn()).toBe(lost.fuel);
+    // A concurrent winner from another room: the tank had recorded the
+    // loser's fuel, and the meter falls back below that reading.
+    const winner: StationMove = { ...lost, toSlot: lost.toSlot + 1, departAt: lost.departAt + 1, arriveAt: lost.arriveAt + 1, tugRoomId: 'other-tug' };
+    rememberMove(winner, NOW);
+    expect(readMoveFuelDrawn()).toBe(0);
+    // The next move books drawn 0 plus that deficit: the meter covers both.
+    const next: StationMove = {
+      ...moveTo(), stationId: 'yard', welcomeRoomId: 'yard-room', bookedAt: winner.arriveAt + 1,
+      fuel: 50, fuelDrawn: 0 + lost.fuel + 50,
+    };
+    writeStationMove(next);
+    expect(readMoveFuelDrawn()).toBe(lost.fuel + 50);
+  });
+
+  it('ranks a pin as the move it settles, so a losing move\'s pin loses too', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const lost = plan.move;
+    const won: StationMove = { ...lost, toSlot: lost.toSlot + 1, departAt: lost.departAt + 1, arriveAt: lost.arriveAt + 1, tugRoomId: 'other-tug' };
+    const pin: StationMove = {
+      ...lost, fromPlanetId: ARIS, fromSlot: lost.toSlot, toPlanetId: ARIS, toSlot: lost.toSlot, mode: 'thrusters',
+      tugRoomId: undefined, departAt: lost.arriveAt, arriveAt: lost.arriveAt + 1, bookedAt: lost.arriveAt + 5, fuel: 0, fuelDrawn: 0,
+      settles: lost,
+    };
+    expect(isStationMove(cleanMove(pin))).toBe(true);
+    expect(compareMoves(pin, lost)).toBeGreaterThan(0);
+    expect(compareMoves(won, pin)).toBeGreaterThan(0);
+    // Remembered in either order, the winner stands.
+    rememberMove(pin, lost.arriveAt + 10);
+    rememberMove(won, lost.arriveAt + 10);
+    expect(readRememberedMoves()).toEqual([cleanMove(won)]);
+    store.clear();
+    rememberMove(won, lost.arriveAt + 10);
+    expect(rememberMove(pin, lost.arriveAt + 10)).toBe(false);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
