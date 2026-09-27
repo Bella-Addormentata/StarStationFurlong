@@ -1949,6 +1949,7 @@ async function joinRoomAtEpoch(
         departedAt: rec.departedAt,
         etaAt: rec.etaAt,
         castOffAt: rec.castOffAt,
+        destinationAt: rec.destinationAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.

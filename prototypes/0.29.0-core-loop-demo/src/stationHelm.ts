@@ -338,7 +338,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     fuel: c.fuel,
     drawn: readMoveFuelDrawn(),
     deficit: fuelDrawDeficit('stationMove'),
-    modules: c.station?.welcomeRoomId ? Math.max(1, atlasComponent(readAtlas(), c.station.welcomeRoomId).size) : 1,
+    // 0 (refused, no quote) until this install's atlas holds the station.
+    modules: c.station ? atlasComponent(readAtlas(), c.station.welcomeRoomId).size : 0,
     now: c.now,
   });
 
@@ -354,6 +355,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       note = describeMoveRefusal('no-station', null, mc.fuel);
     } else if (move && isMoveActive(move, mc.now)) {
       note = describeMove(move, mc.now);
+    } else if (mc.modules < 1) {
+      note = describeMoveRefusal('unknown-layout', null, mc.fuel);
     } else {
       for (const planetId of otherPlanets(station)) {
         const quote = quoteMove(station, mc.stations, planetId, mc.modules, mc.now);
