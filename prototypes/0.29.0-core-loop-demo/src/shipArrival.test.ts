@@ -16,7 +16,10 @@ import {
 } from './doorsDoc';
 import {
   berthToRemember,
+  ARRIVAL_GRACE_MS,
   castOffForDeparture,
+  resolveRememberedBerth,
+  setBerthSeedResolver,
   castOffRefusal,
   rememberBerthHere,
   completeArrival,
@@ -38,6 +41,8 @@ import { setStationDirectory, DEFAULT_STATIONS, type StationDestination } from '
 const SEED_FURLONG = 'ssf://room#room=furlong-berth';
 const SEED_FURLONG_OTHER_HINTS = 'ssf://room?x=1#room=furlong-berth';
 const SEED_HIGH = 'ssf://room#room=high-orbit-berth';
+const FURLONG_ROOM = 'furlong-berth';
+const HIGH_ROOM = 'high-orbit-berth';
 
 const dockedTo = (address: string, farDoor = 'south'): ArrivalPort['state'] =>
   classifyDockPort(buildDoorPairing(address, { segments: dockChain(), farDoor, farWall: 'y+', transient: true, dockedAt: 1000 }));
@@ -103,6 +108,38 @@ describe('planArrivalDock', () => {
     })).not.toThrow();
   });
 
+  it('never plans a dock to a berth whose address names no room', () => {
+    const bad = 'ssf://room#room=%';
+    expect(planArrivalDock({
+      station: { berth: { address: bad } },
+      remembered: null,
+      ports: [{ doorId: 'east', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'no-berth' });
+    expect(planArrivalDock({
+      station: {},
+      remembered: { doorId: 'north', address: bad },
+      ports: [{ doorId: 'north', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'no-berth' });
+  });
+
+  it('passes over a port that is mid-operation or not ours to operate', () => {
+    const plan = planArrivalDock({
+      station: { berth: { address: SEED_HIGH, farDoor: 'd:a3313fdd' } },
+      remembered: { doorId: 'north', address: SEED_FURLONG },
+      ports: [
+        { doorId: 'north', state: FREE, busy: true },
+        { doorId: 'east', state: FREE, canOperate: false },
+        { doorId: 'west', state: FREE, busy: false, canOperate: true },
+      ],
+    });
+    expect(plan.kind === 'dock' && plan.doorId).toBe('west');
+    expect(planArrivalDock({
+      station: { berth: { address: SEED_HIGH, farDoor: 'd:a3313fdd' } },
+      remembered: null,
+      ports: [{ doorId: 'north', state: FREE, busy: true }],
+    })).toEqual({ kind: 'none', reason: 'no-port' });
+  });
+
   it('skips a remembered port that is busy and takes the next open one', () => {
     const plan = planArrivalDock({
       station: {},
@@ -142,8 +179,24 @@ describe('berthToRemember', () => {
     expect(berthToRemember([
       { doorId: 'east', state: FREE },
       { doorId: 'north', state: dockedTo(SEED_FURLONG) },
-    ])).toEqual({ doorId: 'north', address: SEED_FURLONG, farDoor: 'south', farWall: 'y+' });
+    ])).toEqual({ doorId: 'north', roomId: FURLONG_ROOM, farDoor: 'south', farWall: 'y+' });
     expect(berthToRemember([{ doorId: 'east', state: FREE }])).toBeNull();
+  });
+});
+
+describe('resolveRememberedBerth', () => {
+  afterEach(() => setBerthSeedResolver(null));
+
+  it("uses this client's own pass for the room, else a port that names it", () => {
+    const rec = { doorId: 'north', roomId: FURLONG_ROOM, farDoor: 'south' };
+    expect(resolveRememberedBerth(rec, [])).toBeNull();
+    expect(resolveRememberedBerth(rec, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }]))
+      .toEqual({ doorId: 'north', address: SEED_FURLONG, farDoor: 'south' });
+    setBerthSeedResolver((room) => (room === FURLONG_ROOM ? SEED_FURLONG_OTHER_HINTS : undefined));
+    expect(resolveRememberedBerth(rec, [])?.address).toBe(SEED_FURLONG_OTHER_HINTS);
+    // A resolver answering with another room's pass is not trusted.
+    setBerthSeedResolver(() => SEED_HIGH);
+    expect(resolveRememberedBerth(rec, [])).toBeNull();
   });
 });
 
@@ -193,7 +246,7 @@ describe('a round trip', () => {
 
     castOffForDeparture('furlong-station', docking);
     expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
-    expect(readStationBerth('furlong-station')).toMatchObject({ doorId: 'north', address: SEED_FURLONG, farDoor: 'south' });
+    expect(readStationBerth('furlong-station')).toMatchObject({ doorId: 'north', roomId: FURLONG_ROOM, farDoor: 'south' });
 
     fly('furlong-station', 'high-orbit');
     expect(completeArrival(docking)).toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'no-berth' });
@@ -212,15 +265,23 @@ describe('a round trip', () => {
     const docking = fakeDocking(['north']);
     expect(rememberBerthHere('furlong-station', docking.ports())).toBe(true);
     expect(classifyDockPort(readDoor('north')).kind).toBe('docked');
-    expect(readStationBerth('furlong-station')?.address).toBe(SEED_FURLONG);
+    expect(readStationBerth('furlong-station')?.roomId).toBe(FURLONG_ROOM);
     expect(rememberBerthHere('high-orbit', [])).toBe(true);
     expect(readStationBerth('high-orbit')).toBeNull();
   });
 
+  it('never evicts a remembered station for a berth the memory would refuse', () => {
+    for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', roomId: HIGH_ROOM });
+    // An overlong peer-written address: berth memory refuses it.
+    const bad = [{ doorId: 'north', state: { ...dockedTo(SEED_FURLONG), address: `${SEED_FURLONG}${'x'.repeat(5000)}` } as ArrivalPort['state'] }];
+    expect(rememberBerthHere('furlong-station', bad)).toBe(false);
+    expect(readStationBerth('s0')).not.toBeNull();
+  });
+
   it('forgets the oldest other station to remember this berth when memory is full', () => {
-    for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', address: SEED_HIGH });
+    for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', roomId: HIGH_ROOM });
     expect(castOffForDeparture('furlong-station', fakeDocking(['north']))).toBe(true);
-    expect(readStationBerth('furlong-station')?.address).toBe(SEED_FURLONG);
+    expect(readStationBerth('furlong-station')?.roomId).toBe(FURLONG_ROOM);
     expect(readStationBerth('s0')).toBeNull();
     expect(readStationBerth('s31')).not.toBeNull();
   });
@@ -241,7 +302,7 @@ describe('a round trip', () => {
     expect(north.kind === 'docked' && north.record.farDoor).toBe('d:a3313fdd');
     expect(north.kind === 'docked' && north.record.farWall).toBe('x-');
     // The berth left behind is still remembered for the trip home.
-    expect(readStationBerth('furlong-station')?.address).toBe(SEED_FURLONG);
+    expect(readStationBerth('furlong-station')?.roomId).toBe(FURLONG_ROOM);
   });
 
   it('does nothing unless the ship is redocking, and only once', () => {
@@ -270,6 +331,27 @@ describe('a round trip', () => {
     expect(docking.docks).toEqual([]);
   });
 
+  it('waits out the grace for a commander who can dock, then settles berthless', () => {
+    castOffForDeparture('furlong-station', fakeDocking(['north']));
+    const eta = 50_000;
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: 1, etaAt: eta });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', etaAt: eta });
+    const docking = fakeDocking(['north']);
+    expect(completeArrival(docking, { now: eta + 1000 })).toBeNull();
+    expect(readFlightRecord().status).toBe('redocking');
+    expect(completeArrival(docking, { now: eta + ARRIVAL_GRACE_MS }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'no-berth' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'high-orbit' });
+  });
+
+  it('settles at once when the commander forces it (DOCK NOW)', () => {
+    castOffForDeparture('furlong-station', fakeDocking(['north']));
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: 1, etaAt: 50_000 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', etaAt: 50_000 });
+    expect(completeArrival(fakeDocking(['north']), { now: 50_001, force: true })?.kind).toBe('none');
+    expect(readFlightRecord().status).toBe('docked');
+  });
+
   it('arrives without a docking system and says there is no port', () => {
     castOffForDeparture('furlong-station', fakeDocking(['north']));
     fly('furlong-station', 'high-orbit');
@@ -295,10 +377,10 @@ describe('berth memory in the ship doc', () => {
   beforeEach(() => bindShipDoc(new Y.Doc()));
 
   it('round-trips, forgets, and refuses junk', () => {
-    writeStationBerth('high-orbit', { doorId: 'north', address: SEED_HIGH, farWall: 'x+' });
-    expect(readStationBerth('high-orbit')).toEqual({ doorId: 'north', address: SEED_HIGH, farWall: 'x+' });
-    writeStationBerth('high-orbit', { doorId: 'north', address: '', farWall: 'x+' });
-    expect(readStationBerth('high-orbit')?.address).toBe(SEED_HIGH);
+    writeStationBerth('high-orbit', { doorId: 'north', roomId: HIGH_ROOM, farWall: 'x+' });
+    expect(readStationBerth('high-orbit')).toEqual({ doorId: 'north', roomId: HIGH_ROOM, farWall: 'x+' });
+    writeStationBerth('high-orbit', { doorId: 'north', roomId: '', farWall: 'x+' });
+    expect(readStationBerth('high-orbit')?.roomId).toBe(HIGH_ROOM);
     writeStationBerth('high-orbit', null);
     expect(readStationBerth('high-orbit')).toBeNull();
   });
@@ -310,14 +392,14 @@ describe('berth memory in the ship doc', () => {
 
   it('refuses a new station past the cap but still updates and forgets', () => {
     for (let i = 0; i < 32; i++) {
-      expect(writeStationBerth(`s${i}`, { doorId: 'north', address: SEED_HIGH })).toBe(true);
+      expect(writeStationBerth(`s${i}`, { doorId: 'north', roomId: HIGH_ROOM })).toBe(true);
     }
-    expect(writeStationBerth('one-too-many', { doorId: 'north', address: SEED_HIGH })).toBe(false);
+    expect(writeStationBerth('one-too-many', { doorId: 'north', roomId: HIGH_ROOM })).toBe(false);
     expect(readStationBerth('one-too-many')).toBeNull();
-    expect(writeStationBerth('s0', { doorId: 'east', address: SEED_FURLONG })).toBe(true);
+    expect(writeStationBerth('s0', { doorId: 'east', roomId: FURLONG_ROOM })).toBe(true);
     expect(readStationBerth('s0')?.doorId).toBe('east');
     expect(writeStationBerth('s1', null)).toBe(true);
-    expect(writeStationBerth('one-too-many', { doorId: 'north', address: SEED_HIGH })).toBe(true);
+    expect(writeStationBerth('one-too-many', { doorId: 'north', roomId: HIGH_ROOM })).toBe(true);
     expect(readStationBerth('one-too-many')).not.toBeNull();
   });
 
@@ -325,16 +407,21 @@ describe('berth memory in the ship doc', () => {
     const doc = new Y.Doc();
     bindShipDoc(doc);
     doc.getMap('ship').set('berths', {
-      good: { doorId: 'north', address: SEED_FURLONG },
-      badWall: { doorId: 'north', address: SEED_FURLONG, farWall: 'up' },
-      badLat: { doorId: 'north', address: SEED_FURLONG, farLateral: Infinity },
-      wideLat: { doorId: 'north', address: SEED_FURLONG, farLateral: 33 },
+      good: { doorId: 'north', roomId: FURLONG_ROOM },
+      badWall: { doorId: 'north', roomId: FURLONG_ROOM, farWall: 'up' },
+      badLat: { doorId: 'north', roomId: FURLONG_ROOM, farLateral: Infinity },
+      wideLat: { doorId: 'north', roomId: FURLONG_ROOM, farLateral: 33 },
+      badDoor: { doorId: 'north', roomId: FURLONG_ROOM, farDoor: 'not-a-door' },
+      withPass: { doorId: 'north', roomId: FURLONG_ROOM, address: SEED_FURLONG },
       notObj: 7,
     });
-    expect(readStationBerth('good')).toEqual({ doorId: 'north', address: SEED_FURLONG });
+    expect(readStationBerth('good')).toEqual({ doorId: 'north', roomId: FURLONG_ROOM });
     expect(readStationBerth('badWall')).toBeNull();
     expect(readStationBerth('badLat')).toBeNull();
     expect(readStationBerth('wideLat')).toBeNull();
+    expect(readStationBerth('badDoor')).toBeNull();
+    // A pass never rides in the shared ship doc.
+    expect(readStationBerth('withPass')).toBeNull();
     expect(readStationBerth('notObj')).toBeNull();
   });
 
@@ -343,7 +430,7 @@ describe('berth memory in the ship doc', () => {
     bindShipDoc(doc);
     const berths: Record<string, unknown> = {};
     for (let i = 0; i < 500; i++) berths[`junk${i}`] = 7;
-    berths.late = { doorId: 'north', address: SEED_FURLONG };
+    berths.late = { doorId: 'north', roomId: FURLONG_ROOM };
     doc.getMap('ship').set('berths', berths);
     expect(readStationBerth('late')).toBeNull();
   });

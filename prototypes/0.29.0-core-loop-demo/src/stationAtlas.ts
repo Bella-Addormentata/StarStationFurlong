@@ -269,7 +269,10 @@ export function harvestIntoAtlas(entry: {
       farYawDeg: d.farYawDeg,
       wall: d.wall,
       lateral: d.lateral,
-      ...(typeof d.transient === 'boolean' ? { transient: d.transient } : {}),
+      // A DOCK is always a berth (dockRules), whatever its record's flag says.
+      ...(isDockChain(d.segments)
+        ? { transient: true }
+        : typeof d.transient === 'boolean' ? { transient: d.transient } : {}),
     };
   }
   atlas[entry.roomId] = {

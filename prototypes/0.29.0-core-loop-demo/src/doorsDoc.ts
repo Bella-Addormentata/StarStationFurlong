@@ -256,7 +256,7 @@ function sanitizeBerthMemory(v: unknown): DockBerthMemory | undefined {
  *  main.ts binds it BEFORE bindDoorLayoutDoc, so a cross-doc lookup here is
  *  false on every join and would silently drop every free-door pairing, with
  *  no recovery (reconcileDoorLayout never re-runs reconcileDoors). */
-function isAcceptableDoorKey(id: string): boolean {
+export function isAcceptableDoorKey(id: string): boolean {
   if (id.length > MAX_KEY_LEN) return false;
   return (
     (DOOR_IDS as readonly string[]).includes(id) ||

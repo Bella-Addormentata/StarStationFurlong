@@ -70,6 +70,7 @@
 
 import * as Y from 'yjs';
 import type { DoorWall } from './doorLayoutDoc';
+import { isAcceptableDoorKey } from './doorsDoc';
 import {
   DEFAULT_STATIONS,
   findStation,
@@ -244,6 +245,9 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;
     }
   }
+  // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
+  // for a commander who can dock before any client settles it berthless.
+  if (r.status === 'redocking' && r.etaAt !== undefined) out.etaAt = r.etaAt;
   return out;
 }
 
@@ -499,20 +503,21 @@ export function pairingAllowedByFlight(rec: FlightRecord): PairingRefusal {
 // Plain JSON under `ship.berths`, `{ [stationId]: BerthMemoryRecord }`,
 // shape-guarded on read like every other ship value.
 
-/** One remembered berth: which ship port docked where. */
+/** One remembered berth: which ship port docked where. The ship doc is
+ *  shared with every passenger, so it names the berth ROOM, never its pass
+ *  (stationAtlas's credential rule): arrival finds a pass this client holds
+ *  for that room, or the berth is out of reach from here. */
 export interface BerthMemoryRecord {
   /** The SHIP's door that wore the dock. */
   doorId: string;
-  /** The berth room's pass seed. */
-  address: string;
+  /** The berth room's id (not its pass). */
+  roomId: string;
   farDoor?: string;
   farWall?: DoorWall;
   farLateral?: number;
 }
 
 const MAX_BERTH_STATIONS = 32;
-/** A pass seed carries hints and a key — generous, but bounded. */
-const MAX_ADDRESS_LEN = 4096;
 const DOOR_WALLS: readonly string[] = ['x+', 'x-', 'y+', 'y-'];
 /** Same bound the door and atlas records put on a lateral offset. */
 const MAX_FAR_LATERAL = 32;
@@ -524,8 +529,12 @@ export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const r = v as Partial<BerthMemoryRecord>;
   if (!isBoundedString(r.doorId)) return false;
-  if (typeof r.address !== 'string' || r.address.length === 0 || r.address.length > MAX_ADDRESS_LEN) return false;
-  if (r.farDoor !== undefined && !isBoundedString(r.farDoor)) return false;
+  if (!isBoundedString(r.roomId)) return false;
+  // A pass never rides here (see BerthMemoryRecord).
+  if ((r as { address?: unknown }).address !== undefined) return false;
+  // The door-key rule doorsDoc reads with: a farDoor it would strip would
+  // turn DOCK into a one-sided pairing that skips the far-berth check.
+  if (r.farDoor !== undefined && !(typeof r.farDoor === 'string' && isAcceptableDoorKey(r.farDoor))) return false;
   if (r.farWall !== undefined && !DOOR_WALLS.includes(r.farWall as string)) return false;
   if (r.farLateral !== undefined && !(typeof r.farLateral === 'number' && Number.isFinite(r.farLateral)
     && Math.abs(r.farLateral) <= MAX_FAR_LATERAL)) return false;
@@ -533,7 +542,7 @@ export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
 }
 
 function cleanBerth(r: BerthMemoryRecord): BerthMemoryRecord {
-  const out: BerthMemoryRecord = { doorId: r.doorId, address: r.address };
+  const out: BerthMemoryRecord = { doorId: r.doorId, roomId: r.roomId };
   if (r.farDoor !== undefined) out.farDoor = r.farDoor;
   if (r.farWall !== undefined) out.farWall = r.farWall;
   if (r.farLateral !== undefined) out.farLateral = r.farLateral;

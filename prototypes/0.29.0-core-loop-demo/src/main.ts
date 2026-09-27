@@ -114,7 +114,7 @@ import {
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
 import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
-import { completeArrival } from "./shipArrival";
+import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -159,6 +159,7 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
 import {
+  dockedStationFor,
   listStations,
   registerStation,
   removeStation,
@@ -1172,6 +1173,9 @@ function shipStationHere(roomId: string): string | null {
   if (!roomId) return null;
   for (const [, rec] of readAllDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only a dock says where the ship is: a permanent gangway leads back into
+    // the ship's own group (older docks carry only the two-half chain).
+    if (rec.transient !== true && !isDockChain(rec.segments)) continue;
     let partner = "";
     try {
       partner = roomIdFromSeed(rec.connectedRoomAddress);
@@ -1715,33 +1719,37 @@ async function joinRoomAtEpoch(
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
+    const localSeedFor = (roomId: string): string | undefined =>
+      readAtlas()[roomId]?.seed ??
+      (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
+        ? DEFAULT_STATION.welcomeRoomLink
+        : undefined);
+    // A remembered berth names its room only; the pass comes from here.
+    setBerthSeedResolver(localSeedFor);
     setStationDirectory(
       directoryFromStationRecords(
         () => listStations(),
-        (roomId) =>
-          readAtlas()[roomId]?.seed ??
-          (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
-            ? DEFAULT_STATION.welcomeRoomLink
-            : undefined),
+        localSeedFor,
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
       ),
     );
-    // A ship is its own atlas station (docks are not station structure), so
-    // the room it stands in resolves through its live dock: the backdrop
-    // planet, the holotable and every stationForRoom caller then see the
-    // station it is docked at. Station rooms keep the atlas answer — and a
-    // module bolted into a station by a gangway is a station room even when
-    // it carries engines, tanks and a helm (station keeping): its first
-    // paired door may be a visiting ship's dock, which would name the
-    // visitor's station.
-    setRoomStationResolver((roomId) =>
-      roomId === activeBootstrap?.roomId &&
-      isShipReady() &&
-      !isBoltedIntoStation(readAllDoors().values())
-        ? shipStationHere(roomId)
-        : null,
-    );
+    // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
+    // from the station it is docked at: the current room's live docks place
+    // it (the holotable's "you are here", the exterior's planet).
+    // 🚀 A ship with no live dock is where its flight record says (cast off,
+    // holding, in transit, or arrived berthless), not its own one-room
+    // station, so the backdrop keeps the right planet all the way.
+    setRoomStationResolver((roomId) => {
+      if (!roomId || roomId !== activeBootstrap?.roomId) return null;
+      const docked = dockedStationFor(roomId, readAllDoors().values());
+      if (docked) return docked;
+      // 🛰️ A module bolted into a station by a gangway is station structure
+      // even when it carries engines, tanks and a helm (station keeping): the
+      // atlas places it, not its own flight record.
+      if (isBoltedIntoStation(readAllDoors().values())) return null;
+      return isShipReady() ? readFlightRecord().locationId : null;
+    });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1797,6 +1805,7 @@ async function joinRoomAtEpoch(
       writeFlightRecord({
         status: "redocking",
         locationId: rec.destinationId ?? rec.locationId,
+        etaAt: rec.etaAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
@@ -3491,6 +3500,11 @@ function harvestStationAtlas(): void {
         farLateral: r.farLateral,
         farYawDeg: r.farYawDeg,
         // ⚓ A visiting ship's berth: drawn from space, never station structure.
+        // This room's own live record is the truth, and doorsDoc keeps the
+        // flag only when true, so an absent one here is a KNOWN non-berth:
+        // publishing false is what clears a stale marker from a door re-paired
+        // as structure. A dock chain counts as a berth either way
+        // (harvestIntoAtlas).
         transient: r.transient === true,
         ...(pose
           ? {

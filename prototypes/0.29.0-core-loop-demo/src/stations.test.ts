@@ -11,6 +11,7 @@ import {
   DEFAULT_STATION_RECORD,
   MAX_ORBIT_SLOTS,
   currentStation,
+  dockedStationFor,
   listStations,
   planetForRoom,
   readStationRecords,
@@ -260,6 +261,35 @@ describe('stationForRoom / planetForRoom', () => {
     }
   });
 
+  it('finds the station a lone module is docked at from its live doors', () => {
+    // Station A (two rooms), a lone room with a saved record around Aris, and
+    // lone modules with no record of their own.
+    const atlas = atlasOf(room('a1', ['a2']), room('a2', ['a1']), room('b1'), room('ship'), room('pod'));
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    const seed = (roomId: string) => `ssf://join#room=${roomId}`;
+    const dock = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId), transient: true });
+    const gangway = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId) });
+    expect(dockedStationFor('ship', [dock('a1')], atlas)).toBe('station:a1');
+    expect(dockedStationFor('ship', [dock('b1')], atlas)).toBe('aris-yard');
+    // Two lone modules docked together stay where they are…
+    expect(dockedStationFor('ship', [dock('pod')], atlas)).toBeNull();
+    // …a station never moves to the ship visiting it…
+    expect(dockedStationFor('b1', [dock('ship')], atlas)).toBeNull();
+    expect(dockedStationFor('a2', [dock('ship')], atlas)).toBeNull();
+    expect(dockedStationFor('a2', [dock('b1')], atlas)).toBeNull(); // the atlas holds its gangway
+    // …a module bolted into structure is the atlas's to place, and undocked
+    // ports (tombstones) count for nothing.
+    expect(dockedStationFor('ship', [gangway('pod'), dock('a1')], atlas)).toBeNull();
+    expect(dockedStationFor('ship', [{ paired: false as const, retiredAddress: seed('a1') }], atlas)).toBeNull();
+    // Installed as the room-station resolver, it gives a docked ship its host's planet.
+    try {
+      setRoomStationResolver((roomId) => (roomId === 'ship' ? dockedStationFor(roomId, [dock('b1')], atlas) : null));
+      expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
+    } finally {
+      setRoomStationResolver(null);
+    }
+  });
+
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
     const atlas = twoStations();
     expect(planetForRoom('nowhere', atlas).id).toBe(DEFAULT_PLANET_ID);
@@ -300,6 +330,10 @@ describe('saved records', () => {
     expect(registerStation({ ...base, id: 'planet-sovereign' })).toBe(false);
     expect(registerStation({ ...base, id: 'belt-ring' })).toBe(false);
     expect(registerStation({ ...base, id: 'station:yard-a' })).toBe(false);
+    expect(registerStation({ ...base, berthDoor: 'not a door' })).toBe(false); // doorsDoc would drop it
+    expect(readStationRecords()).toEqual([]);
+    expect(registerStation({ ...base, berthDoor: 'd:3' })).toBe(true);
+    store.set('ssf-stations', JSON.stringify([{ ...base, berthDoor: 'not a door' }]));
     expect(readStationRecords()).toEqual([]);
   });
 

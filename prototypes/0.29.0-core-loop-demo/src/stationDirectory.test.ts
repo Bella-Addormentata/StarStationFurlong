@@ -96,8 +96,9 @@ describe('the station record as destinations', () => {
     { id: 'furlong-station', name: 'FURLONG', planetId: 'planet-sovereign', orbitSlot: 0, welcomeRoomId: 'home-1' },
     { id: 'station:mod-2', name: 'MOD 2', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'mod-2', berthDoor: 'north' },
     { id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 30, welcomeRoomId: 'far-1' },
+    { id: 'odd', name: 'ODD', planetId: 'planet-sovereign', orbitSlot: 2, welcomeRoomId: 'odd-1', berthDoor: 'not-a-door' },
   ];
-  const seeds: Record<string, string> = { 'home-1': 'seed-home', 'mod-2': 'seed-mod' };
+  const seeds: Record<string, string> = { 'home-1': 'seed-home', 'mod-2': 'seed-mod', 'odd-1': 'seed-odd' };
 
   it('prices each hop by orbit slot, capped', () => {
     const out = destinationsFromRecords(records, (rid) => seeds[rid]);
@@ -113,11 +114,13 @@ describe('the station record as destinations', () => {
     expect(out[0].berth).toBeUndefined();
     expect(out[1].berth).toEqual({ address: 'seed-mod', farDoor: 'north' });
     expect(out[2].berth).toBeUndefined();
+    // A berth door the doors doc would strip is no berth door.
+    expect(out[3].berth).toBeUndefined();
   });
 
   it('works as the live directory', () => {
     setStationDirectory(directoryFromStationRecords(() => records, (rid) => seeds[rid], () => 'furlong-station'));
-    expect(destinationsFrom('furlong-station').map((s) => s.id)).toEqual(['station:mod-2', 'far']);
+    expect(destinationsFrom('furlong-station').map((s) => s.id)).toEqual(['station:mod-2', 'far', 'odd']);
     expect(findStation('station:mod-2').berth?.address).toBe('seed-mod');
   });
 });
