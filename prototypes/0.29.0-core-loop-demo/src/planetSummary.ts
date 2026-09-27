@@ -47,8 +47,10 @@ import type { StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
-/** A trim as it travels: the burn's orbit numbers, never its fuel meter. */
-export type SharedTrim = Omit<OrbitTrim, 'fuelDrawn'>;
+/** A trim as it travels: the burn's orbit numbers, and the fuel the room's
+ *  burns have drawn in all (optional; older builds send none), which orders
+ *  trims whose last burns share a moment (newerTrim). */
+export type SharedTrim = OrbitTrim;
 
 export interface StationSummary {
   welcomeRoomId: string;
@@ -157,7 +159,10 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
   // A burn's time is peer-written and decides which trim wins: no later
   // than the same skew any other stamp may run ahead.
   if (!isOrbitTrim(v) || v.at > now + MAX_SKEW_MS) return undefined;
-  return { planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last };
+  return {
+    planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
+    ...(v.fuelDrawn !== undefined ? { fuelDrawn: v.fuelDrawn } : {}),
+  };
 }
 
 /** Shape guard + copy: a summary crosses the peer trust boundary. */
@@ -251,11 +256,17 @@ function writeStore(store: Store): void {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch { /* quota */ }
 }
 
-/** The newer of two trims (a trim is one burn, written whole). */
+/** The newer of two trims: the later last burn; between trims whose last
+ *  burns share a moment (two sticks pushed in one millisecond), the one
+ *  that drew more fuel has replayed more burns, so it holds the other's
+ *  burns too; then tieBreak. */
 function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): SharedTrim | undefined {
   if (!a) return b;
   if (!b) return a;
   if (b.at !== a.at) return b.at > a.at ? b : a;
+  if (a.fuelDrawn !== undefined && b.fuelDrawn !== undefined && a.fuelDrawn !== b.fuelDrawn) {
+    return b.fuelDrawn > a.fuelDrawn ? b : a;
+  }
   return tieBreak(a, b);
 }
 
@@ -288,7 +299,10 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
     : incoming.updatedAt !== prior.updatedAt
       ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
       : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
-  const trim = newerTrim(prior.trim, incoming.trim);
+  // Only a trim of the orbit the standing record flies: one published for
+  // the slot that lost would be dropped by every reader anyway.
+  const fits = (t: SharedTrim | undefined) => (t && trimFor(base, t) ? t : undefined);
+  const trim = newerTrim(fits(prior.trim), fits(incoming.trim));
   const move = newerMove(prior.move, incoming.move);
   const next: StationSummary = { ...base };
   if (trim) next.trim = trim; else delete next.trim;
