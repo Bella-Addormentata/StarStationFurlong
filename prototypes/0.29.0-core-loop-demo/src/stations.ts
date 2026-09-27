@@ -108,6 +108,10 @@ export interface StationMove {
   mode: 'thrusters' | 'tug';
   /** The tug's room, on a tow. */
   tugRoomId?: string;
+  /** Real ms the helm booked it (departAt on records from before). A move is
+   *  only booked once the last has arrived, so two moves are concurrent
+   *  exactly when each was booked before the other arrived. */
+  bookedAt?: number;
   /** Propellant the move burns. */
   fuel: number;
   /** The tank's draw meter after paying for it (shipDoc.setFuelDrawMeter). */

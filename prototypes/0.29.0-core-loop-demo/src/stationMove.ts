@@ -82,6 +82,7 @@ export function isStationMove(v: unknown): v is StationMove {
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
+    && (r.bookedAt === undefined || isTime(r.bookedAt))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
 }
@@ -99,7 +100,26 @@ export const MOVE_HORIZON_MS = 7 * 24 * 3_600_000;
  * arrives from outside (room doc, remembered list, planet summary).
  */
 export function isPlausibleMove(m: StationMove, nowMs: number = Date.now()): boolean {
-  return m.departAt <= nowMs + MOVE_HORIZON_MS && m.arriveAt - m.departAt <= MOVE_HORIZON_MS;
+  return m.departAt <= nowMs + MOVE_HORIZON_MS && m.arriveAt - m.departAt <= MOVE_HORIZON_MS
+    && bookedOf(m) <= nowMs + MOVE_HORIZON_MS;
+}
+
+/** When the move was booked: its own stamp, or (older records) its departure. */
+export function bookedOf(m: StationMove): number {
+  return m.bookedAt ?? m.departAt;
+}
+
+/** Were these two booked at once — each before the other arrived? Moves
+ *  booked one after the other never are (a helm books only once the last
+ *  move has arrived), however far apart they fly. */
+export function concurrentMoves(a: StationMove, b: StationMove): boolean {
+  return bookedOf(a) < b.arriveAt && bookedOf(b) < a.arriveAt;
+}
+
+/** A move that goes nowhere: it holds a station where it is (a cancelled
+ *  tow, or where an arrival settled). */
+export function isPinMove(m: StationMove): boolean {
+  return m.fromPlanetId === m.toPlanetId && m.fromSlot === m.toSlot;
 }
 
 /** One total order on a station's moves, the same on every client: the
@@ -127,6 +147,7 @@ export function cleanMove(m: StationMove): StationMove {
     fuel: m.fuel,
     fuelDrawn: m.fuelDrawn,
     ...(m.mode === 'tug' && m.tugRoomId ? { tugRoomId: m.tugRoomId } : {}),
+    ...(typeof m.bookedAt === 'number' ? { bookedAt: m.bookedAt } : {}),
   };
 }
 
@@ -259,6 +280,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       departAt: quote.plan.departAt,
       arriveAt: quote.plan.arriveAt,
       mode: 'thrusters',
+      bookedAt: now,
       fuel: quote.fuel,
       fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
     },
@@ -433,6 +455,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
       arriveAt: quote.plan.arriveAt,
       mode: 'tug',
       tugRoomId: ctx.tugRoomId,
+      bookedAt: now,
       fuel: quote.fuel,
       fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
     },
@@ -506,6 +529,38 @@ export function cancelTowLeftBehind(roomId: string, flightStatus: string, realMs
     departAt,
     arriveAt: departAt + 1,
     mode: 'thrusters',
+    bookedAt: Math.floor(realMs),
+    fuel: 0,
+    fuelDrawn: 0,
+  });
+}
+
+/**
+ * Settle an arrival for everyone: once a station's move has arrived, write
+ * where the station list put it (its new slot, the next free one after a
+ * clash, or home after a bounce off a full planet) as a move that goes
+ * nowhere, leaving the moment the last one arrived. Each install decides a
+ * bounce from the stations it knows, and those can differ; the pin is shared
+ * like any move (room doc, remembered list, planet summaries), and pins for
+ * one arrival all leave the same millisecond, so compareMoves settles them
+ * to one place everywhere. Returns whether it wrote.
+ */
+export function pinSettledArrival(station: StationRecord | null, realMs: number): boolean {
+  if (!station) return false;
+  const move = latestMoveOf(station);
+  if (!move || realMs < move.arriveAt || isPinMove(move)) return false;
+  const planetId = planetById(station.planetId).id;
+  return writeStationMove({
+    stationId: station.id,
+    welcomeRoomId: move.welcomeRoomId,
+    fromPlanetId: planetId,
+    fromSlot: station.orbitSlot,
+    toPlanetId: planetId,
+    toSlot: station.orbitSlot,
+    departAt: move.arriveAt,
+    arriveAt: move.arriveAt + 1,
+    mode: 'thrusters',
+    bookedAt: Math.floor(realMs),
     fuel: 0,
     fuelDrawn: 0,
   });
@@ -656,12 +711,12 @@ function roomMoves(): { entries: StationMove[]; legacy: StationMove | null } {
 }
 
 /** Did a concurrent move of the same station win over this one? Another
- *  move that wins the one order (compareMoves) and left before this one
- *  arrived — a move is only planned once the last has arrived, so an
- *  overlap means the two were written at once. The loser never flies: it
- *  holds no tug, and its fuel is not drawn. */
+ *  move booked at the same time (concurrentMoves: each before the other
+ *  arrived, however far apart their flights) that wins the one order
+ *  (compareMoves). The winner is also what the station list follows, so the
+ *  loser never flies: it holds no tug, and its fuel is not drawn. */
 function superseded(m: StationMove, known: StationMove[]): boolean {
-  return known.some((o) => sameStation(o, m) && compareMoves(o, m) > 0 && o.departAt <= m.arriveAt);
+  return known.some((o) => sameStation(o, m) && compareMoves(o, m) > 0 && concurrentMoves(o, m));
 }
 
 /** Every move known here, for deciding winners: the room's own, and every
