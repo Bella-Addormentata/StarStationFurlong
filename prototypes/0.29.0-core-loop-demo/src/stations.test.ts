@@ -290,7 +290,7 @@ describe('saved records', () => {
 
 /** Runs `fn` against a stand-in document whose elements appear on first
  *  lookup, for the holotable's DOM paths. */
-function withFakeDocument(fn: (els: Map<string, { textContent: string }>) => void): void {
+function withFakeDocument(fn: (els: Map<string, { style: Record<string, string>; textContent: string }>) => void): void {
   const els = new Map<string, { style: Record<string, string>; textContent: string; innerHTML: string; disabled?: boolean }>();
   (globalThis as { document?: unknown }).document = {
     getElementById: (id: string) => {
@@ -352,6 +352,21 @@ describe('solar map station bodies', () => {
       map.refreshStations(stations, stationForRoom('yard-b', atlas, stations));
       expect(els.get('map-player-loc')?.textContent).toBe('YARD-A');
       expect(els.get('map-travel-btn')?.textContent).toBe('TRAVEL TO FURLONG LOBBY STATION');
+    });
+  });
+
+  it('hides the details of a selected station that is gone', () => {
+    withFakeDocument((els) => {
+      const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+      const map = new SolarSystemMap();
+      (map as unknown as { container: unknown }).container = {};
+      const internals = map as unknown as { selectedBody: unknown };
+      internals.selectedBody = stationBodies([rec])[0];
+      map.refreshStations(listStations({}, [rec]), DEFAULT_STATION_RECORD);
+      expect(els.get('map-selection-details')?.style.display).toBe('flex');
+      map.refreshStations(listStations({}, []), DEFAULT_STATION_RECORD);
+      expect(internals.selectedBody).toBeNull();
+      expect(els.get('map-selection-details')?.style.display).toBe('none');
     });
   });
 
