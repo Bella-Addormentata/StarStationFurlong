@@ -50,6 +50,31 @@ export interface DoorPolicyRecord {
    *  by the owner at the door panel, cleared when the port is removed. Only
    *  meaningful while `adapter` is true. */
   gate?: number;
+  /** ⚓🚦 Who may dock at this gate — the station owner's choice, shown to
+   *  captains and enforced by the far end of every DOCK (dockRules
+   *  farDockPatch refuses `not-allowed`). Absent = 'open'. Only meaningful
+   *  while `adapter` is true. */
+  gateAccess?: GateAccess;
+  /** With `gateAccess: 'reserved'`: the one ship (its ROOM id) that may dock
+   *  here — an airline's own gate. A room id, never a pass. */
+  reservedFor?: string;
+}
+
+/** ⚓🚦 open: any ship · pass: captains the owner granted at this door (the
+ *  door panel's request/grant) · reserved: one named ship · closed: none. */
+export type GateAccess = 'open' | 'pass' | 'reserved' | 'closed';
+export const GATE_ACCESS: readonly GateAccess[] = ['open', 'pass', 'reserved', 'closed'];
+const MAX_RESERVED_ID = 128;
+
+/** The access fields of a stored value, or none (open). Peer-written. */
+function cleanAccess(raw: Partial<DoorPolicyRecord> | undefined): Pick<DoorPolicyRecord, 'gateAccess' | 'reservedFor'> {
+  const a = raw?.gateAccess;
+  if (a === 'pass' || a === 'closed') return { gateAccess: a };
+  if (a === 'reserved' && typeof raw?.reservedFor === 'string'
+    && raw.reservedFor.length > 0 && raw.reservedFor.length <= MAX_RESERVED_ID) {
+    return { gateAccess: 'reserved', reservedFor: raw.reservedFor };
+  }
+  return {};
 }
 
 /** Highest gate number a port may carry. */
@@ -153,6 +178,7 @@ function sanitizePolicy(value: unknown): DoorPolicyRecord {
     construction: raw?.construction === 'request' || raw?.construction === 'public' ? raw.construction : 'owner',
     adapter: raw?.adapter === true,
     ...(raw?.adapter === true && isGateNumber(raw?.gate) ? { gate: raw.gate } : {}),
+    ...(raw?.adapter === true ? cleanAccess(raw) : {}),
   };
 }
 
@@ -164,7 +190,43 @@ function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
     construction: policy.construction,
     adapter: policy.adapter === true,
     ...(policy.adapter === true && isGateNumber(policy.gate) ? { gate: policy.gate } : {}),
+    ...(policy.adapter === true ? cleanAccess(policy) : {}),
   };
+}
+
+/** ⚓🚦 A gate's access as the atlas carries it: absent when open. */
+export interface GateAccessRecord {
+  access: Exclude<GateAccess, 'open'>;
+  reservedFor?: string;
+}
+
+function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
+  if (!p.adapter || !p.gateAccess || p.gateAccess === 'open') return null;
+  return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
+}
+
+/** ⚓🚦 Every non-open gate access of this room's ports, by door id. */
+export function readGateAccess(): Record<string, GateAccessRecord> {
+  const out: Record<string, GateAccessRecord> = {};
+  if (!docAlive()) return out;
+  for (const [doorId, value] of policyMap!.entries()) {
+    if (!isKnownDoorId(doorId)) continue;
+    const a = accessRecord(sanitizePolicy(value));
+    if (a) out[doorId] = a;
+  }
+  return out;
+}
+
+/** ⚓🚦 One door's gate access in ANY doc (the far room's, during a DOCK),
+ *  with whether `pub` holds the owner's grant at that door. */
+export function gateAccessIn(
+  doc: Y.Doc, doorId: string, pub?: string,
+): { access: GateAccess; reservedFor?: string; granted: boolean } {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { access: 'open', granted: false };
+  const a: { access: GateAccess; reservedFor?: string } =
+    accessRecord(sanitizePolicy(doc.getMap('doorPolicy').get(doorId))) ?? { access: 'open' };
+  const granted = !!pub && isGrant(doc.getMap('doorGrants').get(reqKey(doorId, pub)));
+  return { ...a, granted };
 }
 
 /** ⚓ #163: does this door of ANY doc wear a docking-adapter port? (The far

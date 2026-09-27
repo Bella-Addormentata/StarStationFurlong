@@ -32,7 +32,7 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
-import { dockGatesIn, dockPortFlagIn, fitDockPortIn } from './doorPolicy';
+import { dockGatesIn, dockPortFlagIn, fitDockPortIn, gateAccessIn } from './doorPolicy';
 import { freeGateNumber, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
@@ -70,6 +70,7 @@ export function applyFarDockRequest(
     near,
     req.dockedAt,
     req.replacesUndockedAt,
+    gateAccessIn(doc, req.farDoor, req.requesterPub),
   );
   if (patch.action === 'refuse') {
     return {

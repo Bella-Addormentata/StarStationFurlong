@@ -22,6 +22,7 @@
 import { stampAfter, type DockPortState } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
+import { currentRoomId } from './stations';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -139,16 +140,24 @@ export function arrivalBerths(input: {
   station: Pick<StationDestination, 'berth' | 'berths'>;
   remembered: RememberedBerth | null;
   gate?: number;
+  /** ⚓🚦 The arriving ship's room: a gate reserved for it comes first, and
+   *  one reserved for another ship is left out. */
+  shipRoomId?: string;
 }): StationBerth[] {
   const { station } = input;
   const remembered = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
-  const gates = (station.berths ?? []).filter((b) => isRoomSeed(b.address));
-  const listed: StationBerth[] = gates.length > 0
-    ? [
-        ...gates.filter((b) => input.gate !== undefined && b.gate === input.gate),
-        ...gates.filter((b) => !(input.gate !== undefined && b.gate === input.gate) && !b.occupied),
-        ...gates.filter((b) => !(input.gate !== undefined && b.gate === input.gate) && b.occupied),
-      ]
+  // ⚓🚦 The station decides who may dock where: a closed gate, or one
+  // reserved for another ship, is never asked (its far end would refuse).
+  // Gates open to the owner's granted captains cannot be checked from here,
+  // so they are tried after the open ones.
+  const ours = (b: StationBerth) => b.access === 'reserved' && !!input.shipRoomId && b.reservedFor === input.shipRoomId;
+  const gates = (station.berths ?? []).filter((b) => isRoomSeed(b.address)
+    && b.access !== 'closed' && (b.access !== 'reserved' || ours(b)));
+  const asked = (b: StationBerth) => input.gate !== undefined && b.gate === input.gate;
+  const rank = (b: StationBerth): number =>
+    asked(b) ? 0 : ours(b) ? 1 : b.access === 'pass' ? (b.occupied ? 5 : 3) : b.occupied ? 4 : 2;
+  const listed: StationBerth[] = (station.berths ?? []).length > 0
+    ? gates.map((b, i) => ({ b, i })).sort((x, y) => rank(x.b) - rank(y.b) || x.i - y.i).map((x) => x.b)
     : station.berth && isRoomSeed(station.berth.address) ? [station.berth] : [];
   const out: StationBerth[] = [];
   const same = (a: StationBerth, b: StationBerth) =>
@@ -178,6 +187,8 @@ export function planArrivalDock(input: {
   now?: number;
   /** ⚓🚦 The gate to try first (a route stop's). */
   gate?: number;
+  /** The arriving ship's room (arrivalBerths). */
+  shipRoomId?: string;
   /** Dock here instead of the first candidate. */
   berth?: StationBerth;
 }): ArrivalPlan {
@@ -362,7 +373,8 @@ export function completeArrival(
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
   const ports = docking.ports();
   const remembered = resolveRememberedBerth(readStationBerth(station.id), ports);
-  const plan = planArrivalDock({ station, remembered, ports, gate: opts.gate });
+  const shipRoomId = currentRoomId();
+  const plan = planArrivalDock({ station, remembered, ports, gate: opts.gate, shipRoomId });
   if (plan.kind === 'none') {
     const outcome: ArrivalOutcome = { kind: 'none', stationName: station.name, reason: plan.reason };
     if (plan.reason === 'already-docked') {
@@ -372,7 +384,7 @@ export function completeArrival(
     return settle(outcome);
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
-  const candidates = arrivalBerths({ station, remembered, gate: opts.gate });
+  const candidates = arrivalBerths({ station, remembered, gate: opts.gate, shipRoomId });
   void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled);
   return { kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) };
 }

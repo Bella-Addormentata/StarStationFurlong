@@ -34,6 +34,10 @@ export interface StationBerth {
   gate?: number;
   /** The station's atlas shows a ship docked there already. */
   occupied?: boolean;
+  /** ⚓🚦 Who the station lets dock there, when not every ship. */
+  access?: 'pass' | 'reserved' | 'closed';
+  /** With 'reserved': the one ship's room id. */
+  reservedFor?: string;
 }
 
 /** One station a ship can fly to. */
@@ -178,7 +182,10 @@ export interface StationRecordLike {
   welcomeRoomId: string;
   berthDoor?: string;
   /** ⚓🚦 Every gate of the station, in gate order (stations.ts). */
-  berths?: ReadonlyArray<{ roomId: string; doorId: string; gate?: number; occupied?: boolean }>;
+  berths?: ReadonlyArray<{
+    roomId: string; doorId: string; gate?: number; occupied?: boolean;
+    access?: 'pass' | 'reserved' | 'closed'; reservedFor?: string;
+  }>;
   /** A move to another planet, scheduled or under way (stations.ts). */
   move?: StationMove;
 }
@@ -254,6 +261,7 @@ export function destinationsFromRecords(
         farDoor: b.doorId,
         ...(b.gate !== undefined ? { gate: b.gate } : {}),
         ...(b.occupied ? { occupied: true } : {}),
+        ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
       });
     }
     if (gates.length > 0) {
