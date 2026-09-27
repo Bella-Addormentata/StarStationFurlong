@@ -504,6 +504,11 @@ async function dockThroughBerths(
   // `first` was planned for candidates[0] (planArrivalDock's own pick).
   const reasons: DockRefusal[] = [];
   for (let i = 0; i < candidates.length || i === 0; i++) {
+    // The docking system outlives a room swap and reads whichever room is
+    // bound now: once the player has left the ship's room, a retry would
+    // pick and dock a port of some other room. Stop, and say nothing (the
+    // answer belongs to a room no longer shown).
+    if (i > 0 && shipRoomId !== undefined && currentRoomId() !== shipRoomId) return;
     const plan: ArrivalPlan = i === 0
       ? first
       : planArrivalDock({ station, remembered, ports: docking.ports(), berth: candidates[i], shipRoomId });

@@ -459,19 +459,19 @@ export function fuelDrawDeficit(name: string): number {
   return Math.max(0, (recorded.get(name) ?? 0) - (entry ? meterValue(entry.meter.read()) : 0));
 }
 
-/** The highest reading meter `name` may reach while the level still covers
- *  every draw: its reading when the level was written, plus what the level
- *  holds beyond every other meter's draws since. A consumer that drops the
- *  draws the level cannot cover (station keeping) drops those that would
- *  take its meter past this, so it yields to every other draw. The level as
- *  written, not what the tanks fitted now hold of it: taking a tank off
- *  empties the gauge (readFuelLevel), but never takes back a draw it paid
- *  for. A record from before per-meter readings is read against their sum.
- *  No record, no fuel: 0. */
-export function fuelCeiling(name: string): number {
+/** The highest reading meter `name` may reach while the fuel covers every
+ *  draw: its reading when the level was written, plus what tanks of
+ *  `capacity` hold of the level beyond every other meter's draws since (the
+ *  gauge readFuelLevel(capacity) shows, turned into a bound). A consumer
+ *  that drops the draws the fuel cannot cover (station keeping) drops those
+ *  that would take its meter past this, so it yields to every other draw;
+ *  it passes the capacity each draw was made against, so a later change of
+ *  tanks never takes back a draw it paid for. A record from before
+ *  per-meter readings is read against their sum. No record, no fuel: 0. */
+export function fuelCeiling(name: string, capacity = Number.POSITIVE_INFINITY): number {
   const raw = docAlive() ? shipMap!.get('fuel') : undefined;
   if (!isFuelRecord(raw)) return 0;
-  const held = raw.level;
+  const held = capacity >= 0 ? Math.min(raw.level, capacity) : 0;
   const recorded = recordedMeters(raw);
   let others = 0;
   for (const [other, { meter }] of drawMeters) {

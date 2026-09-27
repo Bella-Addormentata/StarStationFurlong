@@ -170,6 +170,7 @@ import { createRouteKeeper, sameStationReader } from "./routeKeeper";
 import {
   bindStationKeepingDoc,
   isBoltedIntoStation,
+  readFuelDrawn,
   readOrbitTrim,
   subscribeStationKeeping,
 } from "./stationKeeping";
@@ -1866,12 +1867,6 @@ async function joinRoomAtEpoch(
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
   bindStationMoveDoc(sync.doc);
-  // 🪐 After the ship and trim records: the summary publishes both.
-  bindPlanetSummaryDoc(sync.doc, {
-    currentStation,
-    localTrim: readOrbitTrim,
-    ship: planetShipStatus,
-  });
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1880,6 +1875,20 @@ async function joinRoomAtEpoch(
 
   // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
   bindDoorPolicy(sync.doc);
+
+  // 🪐 After the ship, trim and door records: the summary publishes the
+  // first two at once, and whether this room is a ship (not one bolted into
+  // a station) is read from this room's doors, never the last room's.
+  bindPlanetSummaryDoc(sync.doc, {
+    currentStation,
+    // The fuel its burns drew rides along: between trims whose last burns
+    // share a moment, it tells the one holding more burns.
+    localTrim: () => {
+      const trim = readOrbitTrim();
+      return trim && { ...trim, fuelDrawn: readFuelDrawn() };
+    },
+    ship: planetShipStatus,
+  });
 
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
   bindExteriorDoc(sync.doc);
@@ -2246,12 +2255,16 @@ async function joinRoomAtEpoch(
     } catch (err) {
       console.warn("[route] summary re-publish failed:", err);
     }
-    if (!isLocalHelmCommander()) return;
+    // Move reconciliation runs on every game in the room, commander or not:
+    // both writes follow from records everyone shares (the same cancel or
+    // pin, ranked as the move it settles), so they need no owner, and a tow
+    // or arrival never waits for the owner to come back.
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     // (🚏 A ferry on its route is where its timetable says.)
     cancelTowLeftBehind(boot.roomId, readResolvedFlight(), Date.now(), dockedToStation);
     // 🪐 Where this station's last move settled it, shared once for everyone.
     if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
+    if (!isLocalHelmCommander()) return;
     // 🚏 A4: while a ferry route runs unpaused its timetable moves the ship
     // with no write, and PR 172's advance stands aside (it runs again while
     // the route is paused). This helm-gated game copies the timetable back

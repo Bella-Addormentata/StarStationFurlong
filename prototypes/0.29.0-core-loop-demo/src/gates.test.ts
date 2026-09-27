@@ -255,6 +255,16 @@ describe("a far room doc's shared atlas", () => {
     expect(atlas['other-000']).toBeUndefined();
   });
 
+  it("follows a newer doc copy's re-paired door to the far station's other rooms", () => {
+    // We once saw far-dock's hall lead to a room that has since gone.
+    harvestIntoAtlas({ roomId: 'far-dock', name: 'DOCK', doors: [{ doorId: 'd:hall', targetSeed: seed('old-room'), transient: false }] });
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('far-dock', entry('far-dock', Date.now() + 60_000, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
+    shared.set('far-hub', entry('far-hub', 5, { 'd:in': { targetRoomId: 'far-dock', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1 }));
+    expect(freeGateNumber(withSharedAtlasOf(doc, readAtlas(), 'far-dock'), 'far-dock', {})).toBe(2);
+  });
+
   it("takes the doc's gates for a known room when the doc's copy is newer", () => {
     harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: { 'd:p1': 1 } });
     const doc = new Y.Doc();
@@ -353,6 +363,15 @@ describe('the station record', () => {
     expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([]);
   });
 
+  it('never lets ports sharing a number push another gate out', () => {
+    const gates: Record<string, number> = {};
+    for (let i = 0; i < 120; i++) gates[`d:dup${String(i).padStart(4, '0')}`] = 1;
+    gates['d:real'] = 2;
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 5, doors: {}, gates });
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates?.['d:real']).toBe(2);
+  });
+
   it('keeps all 99 gates of one room through the atlas and its gossip', () => {
     const gates: Record<string, number> = {};
     for (let i = 1; i <= 99; i++) gates[`d:${String(i).padStart(8, '0')}`] = i;
@@ -371,6 +390,13 @@ describe('the station record', () => {
       { roomId: 'room-a', doorId: 'north', gate: 1 },
       { roomId: 'room-b', doorId: 'south', gate: 2 },
     ]).map((b) => b.gate)).toEqual([1, 2, 3, undefined]);
+  });
+
+  it("keeps a record's extra fields beside a long gate list", () => {
+    const berths = Array.from({ length: 40 }, (_, i) => ({ roomId: 'room-far', doorId: `d:${String(i + 1).padStart(8, '0')}`, gate: i + 1 }));
+    registerStation({ id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berths, tow: { by: 'tug' } } as Parameters<typeof registerStation>[0]);
+    const saved = JSON.parse(store.get('ssf-stations') ?? '[]') as Array<Record<string, unknown>>;
+    expect(saved.find((r) => r.id === 'far')?.tow).toEqual({ by: 'tug' });
   });
 
   it('lists every gate up to the highest number', () => {

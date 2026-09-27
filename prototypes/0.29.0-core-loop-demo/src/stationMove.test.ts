@@ -38,6 +38,7 @@ import {
   describeTowRefusal,
   planStationTow,
   planTow,
+  quoteTow,
   towFuelCost,
   towPointAt,
   towHoldsDock,
@@ -873,5 +874,117 @@ describe('tugs: a torch tow', () => {
     expect(towHoldsDock(['station-room', 'tug-room'], NOW + 1)).toBe(true);
     expect(towHoldsDock(['station-room', 'other-room'], NOW + 1)).toBe(false);
     expect(towHoldsDock(['tug-room'], plan.move.arriveAt)).toBe(false);
+  });
+
+  it('refuses to price a tow of a station whose layout this ship cannot see', () => {
+    expect(planStationTow(towCtx({ modules: 0 }), ARIS)).toMatchObject({ ok: false, refusal: 'unknown-layout', quote: null });
+    expect(quoteTow(towCtx().station, towCtx().stations, ARIS, 0, NOW)).toBeNull();
+    expect(quoteTow(towCtx().station, towCtx().stations, ARIS, 1, NOW)).not.toBeNull();
+    expect(planStationTow(towCtx({ modules: 1 }), ARIS)).toMatchObject({ ok: true });
+  });
+
+  it('lets the winner\'s arrival pin keep beating the move its flight beat', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b = { ...a, toSlot: a.toSlot + 1, fuel: a.fuel + 5, fuelDrawn: a.fuelDrawn + 5 };
+    const winner = compareMoves(a, b) > 0 ? a : b;
+    const loser = winner === a ? b : a;
+    // The winner arrived and was pinned long after the loser would have
+    // landed: the pin itself is not concurrent with the loser.
+    const pin: StationMove = {
+      ...winner, fromPlanetId: winner.toPlanetId, fromSlot: winner.toSlot, departAt: winner.arriveAt,
+      arriveAt: winner.arriveAt + 1, mode: 'thrusters', tugRoomId: undefined, bookedAt: winner.arriveAt + 86_400_000,
+      settles: winner, fuel: 0, fuelDrawn: 0,
+    };
+    expect(concurrentMoves(pin, loser)).toBe(false);
+    // This install only remembers the pin (it replaced the winner).
+    rememberMove(pin, NOW);
+    expect(readRememberedMoves()).toEqual([cleanMove(pin)]);
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(loser);
+    expect(readStationMove()).toBeNull();
+    expect(readMoveFuelDrawn()).toBe(0);
+    // A cancel of the winner beats the winner's arrival pin, too.
+    const cancel: StationMove = { ...pin, departAt: winner.departAt + 1, arriveAt: winner.departAt + 2, bookedAt: NOW + 5 };
+    expect(isCancelPin(cancel)).toBe(true);
+    store.clear();
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(winner);
+    writeStationMove(pin);
+    expect(readStationMove()).toEqual(cleanMove(pin));
+    writeStationMove(cancel);
+    expect(readStationMove()).toEqual(cleanMove(cancel));
+    expect(readMoveFuelDrawn()).toBe(0);
+  });
+});
+
+describe('the move log stays bounded', () => {
+  const keys = (doc: Y.Doc) => [...doc.getMap('stationKeeping').keys()];
+  const hop = (k: number, fuel: number, drawn: number): StationMove => {
+    const at = NOW + k * 10 * 86_400_000;
+    return {
+      stationId: 'yard', welcomeRoomId: 'yard-room', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 3,
+      departAt: at, arriveAt: at + 86_400_000, mode: 'thrusters', bookedAt: at - 1000, fuel, fuelDrawn: drawn,
+    };
+  };
+
+  it('prunes moves that arrived long ago and keeps the meter where it was', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    let drawn = 0;
+    for (let k = 0; k < 20; k++) {
+      drawn += 10 + k;
+      writeStationMove(hop(k, 10 + k, drawn));
+      expect(readMoveFuelDrawn()).toBe(drawn);
+    }
+    // Every earlier move arrived days ago: only the one standing when the
+    // last move was written, that move, and the settled total are left.
+    expect(keys(doc).filter((k) => k.startsWith('move:'))).toHaveLength(2);
+    expect(keys(doc).filter((k) => k.startsWith('moveSettled:'))).toHaveLength(1);
+    expect(readStationMove()).toEqual(hop(19, 29, drawn));
+    // A reload reads the same meter.
+    const again = new Y.Doc();
+    Y.applyUpdate(again, Y.encodeStateAsUpdate(doc));
+    bindStationMoveDoc(again);
+    expect(readMoveFuelDrawn()).toBe(drawn);
+  });
+
+  it('ignores a settled total from the far future or past the meter\'s range', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    writeStationMove(hop(0, 10, 10));
+    const map = doc.getMap('stationKeeping');
+    map.set('moveSettled:9:1', { through: Date.now() + 365 * 86_400_000, drawn: 0 });
+    map.set('moveSettled:9:2', { through: Date.now(), drawn: 1e15 });
+    expect(readMoveFuelDrawn()).toBe(10);
+    // A later pruning is not steered by them either.
+    writeStationMove(hop(1, 5, 15));
+    writeStationMove(hop(2, 5, 20));
+    expect(readMoveFuelDrawn()).toBe(20);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:'))).toHaveLength(1);
+  });
+
+  it('keeps a loser next to the move that beat it, so it stays unpaid', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const a = hop(0, 10, 10);
+    const b = { ...a, departAt: a.departAt + 1, toSlot: 4, fuel: 15, fuelDrawn: 15 };
+    writeStationMove(a);
+    writeStationMove(b);
+    const winner = compareMoves(a, b) > 0 ? a : b;
+    expect(readMoveFuelDrawn()).toBe(winner.fuel);
+    // A later move of another station prunes nothing the pair needs.
+    writeStationMove({ ...hop(1, 7, winner.fuel + 7), stationId: 'dock', welcomeRoomId: 'dock-room' });
+    expect(keys(doc).filter((k) => k.startsWith('move:'))).toHaveLength(3);
+    expect(readMoveFuelDrawn()).toBe(winner.fuel + 7);
+    // Once the yard has moved on, the old pair folds into the settled total
+    // at the next write.
+    writeStationMove(hop(2, 5, winner.fuel + 12));
+    expect(keys(doc).filter((k) => k.startsWith('move:'))).toHaveLength(4);
+    writeStationMove(hop(3, 4, winner.fuel + 16));
+    const left = keys(doc).filter((k) => k.startsWith('move:')).map((k) => Number(k.split(':')[2]));
+    expect(left.sort()).toEqual([hop(1, 0, 0).departAt, hop(2, 0, 0).departAt, hop(3, 0, 0).departAt]);
+    expect(readMoveFuelDrawn()).toBe(winner.fuel + 16);
   });
 });
