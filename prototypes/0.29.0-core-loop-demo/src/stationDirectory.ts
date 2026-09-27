@@ -106,11 +106,12 @@ export function listStations(): readonly StationDestination[] {
   return list.length > 0 ? list : DEFAULT_STATIONS;
 }
 
-/** This install's id for `id`: itself when listed, else the directory's
- *  alias for it when that is listed, else `id` unchanged (unknown). */
+/** This install's id for `id`: the directory's alias for it when that is
+ *  listed (asked FIRST, so a portable id resolves by its welcome room even
+ *  when a local record happens to share the id), else itself, which is
+ *  unknown when unlisted. */
 export function localStationId(id: string): string {
   const list = listStations();
-  if (list.some((s) => s.id === id)) return id;
   let alias: string | null = null;
   try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }
   return alias && list.some((s) => s.id === alias) ? alias : id;
