@@ -1740,6 +1740,9 @@ async function joinRoomAtEpoch(
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
       if (docked) return docked;
+      // A saved or built-in station whose welcome room this is stays put,
+      // whatever it wears: only a free-flying ship follows its flight.
+      if (listStations().some((st) => !st.derived && st.welcomeRoomId === roomId)) return null;
       // A module bolted into a station by structure (a station-keeping helm
       // room wears engine, tank and helm too) belongs to that station, never
       // to its own flight record: only a free-flying ship follows the flight.
