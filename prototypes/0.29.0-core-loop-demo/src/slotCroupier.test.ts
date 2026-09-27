@@ -19,6 +19,7 @@ import {
   LEGACY_SLOT_LEASE_READ_CAP,
   readChips,
   readLegacySlotOperatorMachineIds,
+  readSlotFundingConfig,
   readSlotMachineState,
   readSlotOperatorLease,
   readSlotPlayRequests,
@@ -824,10 +825,11 @@ describe("a round's stake and its spin", () => {
   it('a teardown refunds the stake and removes the machine in one update', async () => {
     fund(M1);
     await requestSpin(M1);
-    becomeOperator([M1]);
+    const ready = becomeOperator([M1]);
     await acceptsDone();
     const seen = peerSeesSpinWithStake();
     closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(ready + 100)); // the operator tears it down
     await acceptsDone();
     expect(readSlotMachineState(M1)).toBeNull();
     expect(readChips(PLAYER)).toBe(100);
@@ -874,11 +876,197 @@ describe("a round's stake and its spin", () => {
     spinElsewhere(M1, funding);
     expect(settleSlotWager(M1, PLAYER, funding, 0)).toBe(true); // its state never arrived
     closeSlotMachine(M1, true);
+    becomeOperator([]); // the bankroll is chips: the room's operator tears it down
     await acceptsDone();
     expect(readSlotMachineState(M1)).toBeNull();
     // The bankroll, with the lost stake, is back with its owner.
     expect(readChips(OPERATOR)).toBe(10_000 + BET);
     expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+});
+
+// ── Removed machines (TEARDOWN) ─────────────────────────────────────────────
+
+/** A machine with its own bankroll (1,000 chips) and a round another operator
+ *  accepted on it: both hold chips a teardown pays out. */
+function machineHoldingChips(machineId: string): void {
+  const funding = { mode: 'machine' as const, ownerId: OPERATOR };
+  writeSlotFundingConfig(machineId, funding);
+  expect(depositSlotFunding(machineId, OPERATOR, 1_000)).toBe(true);
+  spinElsewhere(machineId, funding);
+}
+
+describe('a removed machine', () => {
+  it('holding chips, is paid out only by the room\'s operator, past its settling wait', async () => {
+    machineHoldingChips(M1);
+    writeSlotOperatorLease(lease(T0 + LEASE_MS)); // another device operates the room
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(T0 + 100));
+    await acceptsDone();
+    // Nothing is paid out while another session holds the lease.
+    expect(readSlotMachineState(M1)?.phase).toBe('spinning');
+    expect(hasSlotEscrow(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+    expect(isSlotOperator()).toBe(false);
+    // That session lets the lease go: this one takes it for the teardown, and
+    // pays out only once past its settling wait.
+    doc.getMap('casino').delete(SLOT_OPERATOR_KEY);
+    const t = T0 + 200;
+    tickSlotMachineRoom([], false, at(t));
+    await acceptsDone();
+    expect(isSlotOperator()).toBe(true);
+    expect(hasSlotEscrow(M1)).toBe(true);
+    tickSlotMachineRoom([], false, at(t + SETTLE_MS));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(hasSlotEscrow(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100); // the stake back
+    expect(readChips(OPERATOR)).toBe(10_000); // the bankroll back with its owner
+    // With nothing left to tear down, the lease goes.
+    tickSlotMachineRoom([], false, at(t + SETTLE_MS + 100));
+    expect(readSlotOperatorLease()).toBeNull();
+  });
+
+  it('holding no chips, is torn down at once by whoever queued it, without the lease', async () => {
+    fund(M1); // its bankroll is the owner's balance: nothing of its own
+    await requestSpin(M1);
+    writeSlotOperatorLease(lease(T0 + LEASE_MS)); // another device operates the room
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(T0 + 100));
+    expect(readSlotFundingConfig(M1)).toBeNull();
+    expect(readSlotPlayRequests(M1)).toHaveLength(0);
+    expect(readSlotOperatorLease()?.sessionId).toBe('other-device:tab'); // never taken here
+    expect(slotOperatorWatchCount()).toBe(1); // the other session's lease; no teardown left
+  });
+
+  it('once the operator has paid it out, is dropped here without taking the lease', async () => {
+    machineHoldingChips(M1);
+    writeSlotOperatorLease(lease(T0 + LEASE_MS)); // another device operates the room
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(T0 + 100));
+    expect(slotOperatorWatchCount()).toBe(2); // the lease, and the teardown waiting
+    // The operator tears it down (its stake refunded, its bankroll paid out).
+    expect(refundSlotWager(M1, PLAYER, BET, { mode: 'machine', ownerId: OPERATOR })).toBe(true);
+    doc.getMap('casino').delete(`slot-bankroll:machine:${M1}`);
+    tickSlotMachineRoom([], false, at(T0 + 200));
+    expect(slotOperatorWatchCount()).toBe(1);
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(readSlotOperatorLease()?.sessionId).toBe('other-device:tab');
+  });
+
+  it('is torn down once a settle in flight on it here has finished', async () => {
+    fund(M1);
+    const seed = await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    reveal(M1, seed);
+    const t = ready + SLOT_SPIN_MS + 10;
+    tickSlotMachineRoom([M1], false, at(t)); // the settle starts, then awaits
+    closeSlotMachine(M1, true); // removed meanwhile
+    tickSlotMachineRoom([], false, at(t + 1));
+    await acceptsDone();
+    const settled = readSlotMachineState(M1);
+    expect(settled?.phase).toBe('settled'); // the settle ran to the end
+    tickSlotMachineRoom([], false, at(t + 2));
+    await acceptsDone();
+    expect(readSlotMachineState(M1)).toBeNull();
+    expect(readChips(PLAYER)).toBe(100 - BET + (settled?.credited ?? 0));
+  });
+
+  it('writes nothing from a teardown paused at an await once the lease goes', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    const ready = becomeOperator([M1]);
+    await acceptsDone();
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(ready + 100)); // the teardown starts, then awaits
+    releaseSlotOperatorLease();
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(hasSlotEscrow(M1)).toBe(true);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+
+  it('put back before its teardown ran, is not torn down', async () => {
+    machineHoldingChips(M1);
+    writeSlotOperatorLease(lease(T0 + LEASE_MS)); // another device operates the room
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([M1], false, at(T0 + 100)); // back in the room
+    expect(slotOperatorWatchCount()).toBe(1);
+    doc.getMap('casino').delete(SLOT_OPERATOR_KEY);
+    becomeOperator([M1], T0 + 200);
+    await acceptsDone();
+    expect(readSlotFundingConfig(M1)).not.toBeNull();
+    expect(readChips(OPERATOR)).toBe(9_000);
+  });
+
+  it('whose stake can\'t be refunded here keeps its keys, and the lease goes', async () => {
+    // A legacy shared-bankroll round: this build never touches its escrow.
+    const funding = { mode: 'shared' as const, ownerId: OPERATOR };
+    writeSlotFundingConfig(M1, funding);
+    writeSlotMachineState(M1, {
+      ...initialSlotMachineState(),
+      phase: 'spinning',
+      player: PLAYER,
+      bet: BET,
+      requestId: 'req-legacy',
+      funding,
+      fairness: { mode: 'commit-reveal', commits: ['a'.repeat(64), 'b'.repeat(64)] },
+    });
+    doc.getMap('casino').set(`slot-escrow:${M1}`, RESERVE);
+    closeSlotMachine(M1, true);
+    const ready = becomeOperator([]); // one attempt, under the lease
+    await acceptsDone();
+    expect(hasSlotEscrow(M1)).toBe(true);
+    tickSlotMachineRoom([], false, at(ready + 100));
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(slotOperatorWatchCount()).toBe(0);
+  });
+
+  it('whose refund fails keeps its keys after one attempt, and the lease goes', async () => {
+    const funding = { mode: 'machine' as const, ownerId: OPERATOR };
+    writeSlotFundingConfig(M1, funding);
+    writeSlotMachineState(M1, {
+      ...initialSlotMachineState(),
+      phase: 'spinning',
+      player: PLAYER,
+      bet: BET,
+      requestId: 'req-short',
+      funding,
+      fairness: { mode: 'commit-reveal', commits: ['a'.repeat(64), 'b'.repeat(64)] },
+    });
+    // A stake locked that can't cover its own refund, with an empty bankroll.
+    doc.getMap('casino').set(`slot-escrow:${M1}`, 0);
+    closeSlotMachine(M1, true);
+    const ready = becomeOperator([]);
+    await acceptsDone();
+    expect(spinning(M1)).toBe(true);
+    expect(hasSlotEscrow(M1)).toBe(true);
+    tickSlotMachineRoom([], false, at(ready + 100));
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(slotOperatorWatchCount()).toBe(0);
+  });
+
+  it('belongs to the room it was queued in', () => {
+    closeSlotMachine(M1, true); // queued in this room
+    // The next room's doc, bound without a leave, holds a machine of that id.
+    bindCasinoDoc(new Y.Doc());
+    buyInChips(OPERATOR, 10_000);
+    buyInChips(PLAYER, 100);
+    machineHoldingChips(M1);
+    tickSlotMachineRoom([], false, at(T0 + 100));
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(slotOperatorWatchCount()).toBe(0);
+  });
+
+  it('is forgotten on leaving the room', () => {
+    machineHoldingChips(M1);
+    writeSlotOperatorLease(lease(T0 + LEASE_MS));
+    closeSlotMachine(M1, true);
+    tickSlotMachineRoom([], false, at(T0 + 100));
+    expect(slotOperatorWatchCount()).toBe(2);
+    leaveSlotMachineRoom();
+    expect(slotOperatorWatchCount()).toBe(0);
   });
 });
 

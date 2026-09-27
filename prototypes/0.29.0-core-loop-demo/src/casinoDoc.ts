@@ -624,6 +624,14 @@ export function hasSlotEscrow(machineId: string): boolean {
   return ensureMap().has(`slot-escrow:${machineId}`);
 }
 
+/** Whether a machine still holds chips a teardown would pay out: a round's
+ *  escrow, or its own bankroll (`slot-bankroll:machine:<mid>`). */
+export function slotMachineHoldsChips(machineId: string): boolean {
+  const map = ensureMap();
+  return map.has(`slot-escrow:${machineId}`)
+    || safeCount(map, `slot-bankroll:machine:${machineId}`) > 0;
+}
+
 export interface SlotSharedBankrollLease {
   machineId: string;
   token: string;

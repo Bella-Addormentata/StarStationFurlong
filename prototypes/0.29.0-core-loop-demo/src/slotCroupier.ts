@@ -37,6 +37,17 @@
  * the next operator ends it without moving chips, and a teardown removes the
  * machine without a refund.
  *
+ * TEARDOWN: a removed machine can still hold chips (a round's stake in escrow,
+ * its own bankroll), and paying them out rewrites balances. So every session
+ * that may manage the room queues the teardown (closeSlotMachine), and only
+ * the room's operator, past its settling wait, pays the chips out and deletes
+ * the machine's keys, in one transaction and in the take it began under: a
+ * teardown never races a settle on another machine for the same player. A
+ * session with a teardown queued takes the lease if nobody holds it, as for a
+ * machine to operate, so a removal is torn down with nobody else present. A
+ * removed machine holding no chips (paid out already, or never funded) is torn
+ * down at once by whoever queued it: deleting its keys writes no balance.
+ *
  * SPLITS: a Y.Map lease is not a mutex. Two sessions cut off from each other
  * could each take it and settle spins; when the docs merge, only one of each
  * balance write survives. Settling can't be made split-safe without an
@@ -85,6 +96,7 @@ import {
   clearSlotReveal,
   drainSlotMachineFunding,
   hasSlotEscrow,
+  slotMachineHoldsChips,
   readLegacySlotOperatorLease,
   readLegacySlotOperatorMachineIds,
   readSlotFundingConfig,
@@ -152,6 +164,9 @@ interface SlotOperatorSession {
 const settling = new Set<string>();
 const accepting = new Set<string>();
 const acceptedRounds = new Map<string, AcceptedSlotRound>();
+/** Removed machines waiting for their teardown (TEARDOWN above), by the doc
+ *  epoch of the room they were removed from. */
+const pendingTeardowns = new Map<string, number>();
 /** This session's turn as the room's operator, if it has one. */
 let operator: SlotOperatorSession | null = null;
 /** Machines this page runs by hand (a venture room): started from their
@@ -444,8 +459,9 @@ function isRoundSpinning(machineId: string, accepted: AcceptedSlotRound): boolea
  * World calls this every frame, on every client, with the room's slot
  * machines, and whether this client may run machines by hand (a room owner
  * where nobody runs the croupier). It watches the room's lease, runs the
- * election for a session with machines to operate, then the operator's work
- * on each machine and the refund of any round it is winding down.
+ * election for a session with machines to operate or tear down, then the
+ * operator's work on each machine, the refund of any round it is winding
+ * down, and the teardowns queued here.
  */
 export function tickSlotMachineRoom(
   machineIds: readonly string[],
@@ -464,6 +480,11 @@ export function tickSlotMachineRoom(
   const auto = canRunCroupier();
   const docEpoch = casinoDocEpoch();
   const playerId = getPlayerId();
+  // A teardown belongs to the room it was queued in, and a machine put back
+  // before it ran is no longer to be torn down (TEARDOWN).
+  for (const [machineId, removedIn] of [...pendingTeardowns]) {
+    if (removedIn !== docEpoch || machineIds.includes(machineId)) pendingTeardowns.delete(machineId);
+  }
   for (const [machineId, manual] of manualMachines) {
     // Machines are run by hand only where nobody runs the croupier, by a room
     // owner, in the room and for the player they were started in and for.
@@ -479,11 +500,24 @@ export function tickSlotMachineRoom(
     stopSlotOperator();
     return;
   }
-  // A round of a machine that has left the room (removed by a peer, and not
-  // torn down here) is done with here: nobody operates that machine again.
+  // A round of a machine that has left the room is done with here: nobody
+  // operates that machine again. (A teardown refunds its stake from the
+  // machine's own record.)
   for (const machineId of [...acceptedRounds.keys()]) {
     if (!machineIds.includes(machineId)
       && !settling.has(machineId) && !accepting.has(machineId)) acceptedRounds.delete(machineId);
+  }
+  // A removed machine holding no chips is torn down at once: deleting its keys
+  // writes no balance. One still holding chips waits for the room's operator
+  // (TEARDOWN).
+  const teardowns: string[] = [];
+  for (const machineId of [...pendingTeardowns.keys()]) {
+    if (slotMachineHoldsChips(machineId)) {
+      teardowns.push(machineId);
+    } else {
+      clearSlotMachineKeys(machineId);
+      pendingTeardowns.delete(machineId);
+    }
   }
   const operated = machineIds.filter((machineId) =>
     (auto || manualMachines.has(machineId))
@@ -501,9 +535,9 @@ export function tickSlotMachineRoom(
     // Refunded or settled meanwhile by another operator: nothing left here.
     else acceptedRounds.delete(machineId);
   }
-  if (operated.length === 0 && windingDown.length === 0) {
-    // Nothing to operate: let the lease go, so another player's machines
-    // needn't wait it out.
+  if (operated.length === 0 && windingDown.length === 0 && teardowns.length === 0) {
+    // Nothing to operate or tear down: let the lease go, so another player's
+    // machines needn't wait it out.
     stopSlotOperator();
     return;
   }
@@ -517,6 +551,10 @@ export function tickSlotMachineRoom(
     const accepted = currentAcceptedRound(machineId);
     if (!accepted || accepting.has(machineId)) continue;
     runTerminal(machineId, 'operator-change refund', () => windDownRound(machineId, accepted, tenure));
+  }
+  for (const machineId of teardowns) {
+    if (accepting.has(machineId)) continue;
+    runTerminal(machineId, 'close', () => closeSlotMachineManaged(machineId, tenure));
   }
 }
 
@@ -1080,21 +1118,39 @@ async function settle(
   acceptedRounds.delete(machineId);
 }
 
+/**
+ * A removed machine. Every client that sees the removal stops operating it
+ * here, and one that may manage the room queues its teardown for this room's
+ * doc (TEARDOWN above). The room tick tears it down: at once when it holds no
+ * chips, otherwise as the room's operator past its settling wait, so the
+ * payout never races a settle. The room's lease isn't this machine's: the room
+ * tick lets it go once this session has nothing left to operate or tear down.
+ */
 export function closeSlotMachine(
   machineId: string,
   canManage = canRunCroupier(),
 ): void {
-  // The room's lease isn't this machine's: the room tick lets it go once this
-  // session has no machine left to operate.
   manualMachines.delete(machineId);
   requestPolls.delete(machineId);
   requestFirstSeen.delete(machineId);
   earlierBuildLeasesSeen.delete(machineId);
-  if (!canManage) return;
-  runTerminal(machineId, 'close', () => closeSlotMachineManaged(machineId));
+  // A room this session is leaving is left to the sessions still in it.
+  if (!canManage || isLeavingRoom()) {
+    pendingTeardowns.delete(machineId);
+    return;
+  }
+  pendingTeardowns.set(machineId, casinoDocEpoch());
 }
 
-async function closeSlotMachineManaged(machineId: string): Promise<void> {
+/** A queued teardown, run by the room's operator (TEARDOWN): refund a round's
+ *  stake, return the machine's bankroll to its owner, and delete its keys. One
+ *  attempt, in the take it began under: a machine whose stake can't be refunded
+ *  keeps its keys, as it always has, rather than holding the room's lease. */
+async function closeSlotMachineManaged(machineId: string, tenure: string): Promise<void> {
+  const docEpoch = casinoDocEpoch();
+  const forget = (): void => {
+    if (pendingTeardowns.get(machineId) === docEpoch) pendingTeardowns.delete(machineId);
+  };
   const state = readSlotMachineState(machineId);
   const accepted = currentAcceptedRound(machineId);
   let refund: {
@@ -1105,7 +1161,7 @@ async function closeSlotMachineManaged(machineId: string): Promise<void> {
   } | null = null;
   if (accepted) {
     const token = accepted.sharedLeaseToken ?? undefined;
-    if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return;
+    if (!await ensureTerminalFundingLease(machineId, accepted.funding, token)) return forget();
     refund = { player: accepted.player, bet: accepted.bet, funding: accepted.funding, token };
   } else if (state?.phase === 'spinning' && state.player && state.bet && state.funding) {
     const token = sharedFundingLeaseToken(
@@ -1114,9 +1170,13 @@ async function closeSlotMachineManaged(machineId: string): Promise<void> {
       undefined,
       state.sharedLeaseToken,
     );
-    if (!await ensureTerminalFundingLease(machineId, state.funding, token)) return;
+    if (!await ensureTerminalFundingLease(machineId, state.funding, token)) return forget();
     refund = { player: state.player, bet: state.bet, funding: state.funding, token };
   }
+  // Paying out rewrites balances: only this session's take of the room's
+  // lease may, and only while it lasts.
+  if (!stillOperates(docEpoch, tenure)) return;
+  forget();
   // The refund and the machine's removal go out in one transaction (TERMINAL
   // WRITES above). With no stake locked there is nothing to refund.
   const closed = transactCasino(() => {
@@ -1160,12 +1220,14 @@ export function leaveSlotMachineRoom(): void {
   releaseSlotOperatorLease();
   leaseSeen = null;
   earlierBuildLeasesSeen.clear();
+  pendingTeardowns.clear();
 }
 
 /** How much this session is watching in the room (the room's lease, earlier
- *  builds' leases): tests and debugging. */
+ *  builds' leases, removed machines waiting for their teardown): tests and
+ *  debugging. */
 export function slotOperatorWatchCount(): number {
-  return (leaseSeen ? 1 : 0) + earlierBuildLeasesSeen.size;
+  return (leaseSeen ? 1 : 0) + earlierBuildLeasesSeen.size + pendingTeardowns.size;
 }
 
 /** Rounds this session accepted in this room's doc and still holds: tests
