@@ -546,6 +546,7 @@ describe('tugs: a torch tow', () => {
     expect(end.radiusKm / to.radiusKm).toBeCloseTo(1, 6);
     expect(angleGap(end.angle, to.angle)).toBeLessThan(1e-6);
     expect(moveTransitPointAt(move, move.arriveAt)).toBeNull();
+    expect(moveTransitPointAt({ ...move, toPlanetId: SOV }, move.departAt + 1)).toBeNull();
     // The station list follows the tow like any move.
     setStationMoveResolver(() => move);
     expect(stationInTransit(listStations({}, [], NOW + 1).find((s) => s.id === DEFAULT_STATION_ID)!, NOW + 1)).toBe(true);

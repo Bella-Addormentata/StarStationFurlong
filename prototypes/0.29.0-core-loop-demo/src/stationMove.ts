@@ -378,6 +378,8 @@ export function towPointAt(move: StationMove, realMs: number): OrbitPoint {
  *  it travels; null outside the transit. */
 export function moveTransitPointAt(move: StationMove, realMs: number): OrbitPoint | null {
   if (movePhase(move, realMs) !== 'transit') return null;
+  // One planet under two ids (or a pin) crosses no space, towed or not.
+  if (planetById(move.fromPlanetId).id === planetById(move.toPlanetId).id) return null;
   if (move.mode === 'tug') return towPointAt(move, realMs);
   const plan = movePlan(move);
   return plan ? interplanetaryPointAt(plan, realMs) : null;
