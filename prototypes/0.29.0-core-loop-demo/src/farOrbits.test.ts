@@ -18,6 +18,7 @@ import {
   compressPlanetPoint,
   compressRadiusKm,
   planetLayout,
+  sampleCourse,
   sunDirectionAround,
   transitLayout,
   viewerFrameTransform,
@@ -52,6 +53,17 @@ describe('altitude compression', () => {
   it('never changes an angle', () => {
     const p = stationPointAt(station(3), T);
     expect(compressPlanetPoint(p, planet).angle).toBe(p.angle);
+  });
+});
+
+describe('sampleCourse', () => {
+  it('refuses empty or overflowing spans and never yields a non-finite time', () => {
+    const at = (ms: number) => ({ x: ms, y: 0, z: 0 });
+    expect(sampleCourse(at, 5, 5)).toEqual([]);
+    expect(sampleCourse(at, -Number.MAX_VALUE, Number.MAX_VALUE)).toEqual([]);
+    const pts = sampleCourse(at, 0, Number.MAX_VALUE, 4);
+    expect(pts).toHaveLength(5);
+    for (const p of pts) expect(Number.isFinite(p.x)).toBe(true);
   });
 });
 

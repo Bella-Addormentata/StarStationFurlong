@@ -43,7 +43,7 @@ import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { readResolvedFlight } from './shipRoute';
-import { atlasComponents, readAtlas } from './stationAtlas';
+import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -52,6 +52,10 @@ import type { StationMove, StationRecord } from './stations';
 export const SKY_LAYER = 1;
 /** Names renderer.ts gives the sky objects. */
 const SKY_NAMES = new Set(['nebula-sky', 'nebula-stars']);
+/** world.ts's older planet backdrops (the one seen through room windows and
+ *  the outdoor deck's overhead planet): hidden while the far pass draws the
+ *  real planet, or they would sit on top of it. */
+const OLD_PLANET_NAMES = ['ambientPlanet', 'ambientPlanetGlow', 'deckPlanet'];
 
 /** How far behind the viewer the far camera sits, in compressed km. Frames
  *  the nearest rings and the planet's limb around the station. */
@@ -101,9 +105,16 @@ function flightPlan(
   return plan ? { ...plan, departAt: departedAt, arriveAt: etaAt } : null;
 }
 
-function modulesOf(station: StationRecord, components: Set<string>[]): number {
+/** Modules to draw for a station: the rooms of its atlas component that
+ *  the (capped) atlas actually holds. A component also names door targets
+ *  with no entry, which peers control, so those never count. */
+function modulesOf(station: StationRecord, components: Set<string>[], atlas: Record<string, unknown>): number {
   if (!station.welcomeRoomId) return 1;
-  return components.find((c) => c.has(station.welcomeRoomId))?.size ?? 1;
+  const component = components.find((c) => c.has(station.welcomeRoomId));
+  if (!component) return 1;
+  let n = 0;
+  for (const roomId of component) if (Object.prototype.hasOwnProperty.call(atlas, roomId)) n++;
+  return Math.min(MAX_ENTRIES, Math.max(1, n));
 }
 
 function gather(now: number): Source {
@@ -165,8 +176,11 @@ function gather(now: number): Source {
   }
 
   const stations = all
-    .filter((s) => s.id !== me?.id && planetById(s.planetId).id === planetId && !stationInTransit(s, now))
-    .map((record) => ({ record, modules: modulesOf(record, components) }));
+    // Never the viewer: its own station, nor the one-module station the room
+    // it stands in (a ship, say) is listed as.
+    .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
+    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
+    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 
   const byRoom = (room: string | undefined) => (room ? all.find((s) => s.welcomeRoomId === room) : undefined);
   const ships: FarShipInput[] = [];
@@ -229,6 +243,8 @@ let sunLight: THREE.DirectionalLight | null = null;
 let source: Source | null = null;
 let builtKey = '';
 let lastRefresh = 0;
+/** OLD_PLANET_NAMES found in the scene, re-found after a refresh. */
+let oldPlanets: THREE.Object3D[] | null = null;
 /** Screen-sized objects: body id → [object, px per local unit]. */
 const bodies = new Map<string, { obj: THREE.Object3D; px: number }>();
 
@@ -487,6 +503,7 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
 export function setFarPassActive(on: boolean): void {
   active = on;
   source = null;
+  oldPlanets = null;
   if (!on) clearFrame();
 }
 
@@ -494,6 +511,7 @@ export function setFarPassActive(on: boolean): void {
  *  changed). */
 export function refreshFarPass(): void {
   source = null;
+  oldPlanets = null;
 }
 
 /** The frame's render: one plain render, or sky → far pass → station while
@@ -507,6 +525,12 @@ export function renderWithFarPass(
     renderer.render(scene, camera);
     return;
   }
+  if (!oldPlanets || oldPlanets.some((o) => !o.parent)) {
+    oldPlanets = OLD_PLANET_NAMES.map((n) => scene.getObjectByName(n)).filter((o): o is THREE.Object3D => !!o);
+  }
+  const hidden = oldPlanets;
+  const hiddenShown = hidden.map((o) => o.visible);
+  for (const o of hidden) o.visible = false;
   const sky = scene.children.filter((o) => SKY_NAMES.has(o.name));
   for (const o of sky) o.layers.enable(SKY_LAYER);
   const shown = sky.map((o) => o.visible);
@@ -532,6 +556,7 @@ export function renderWithFarPass(
   } finally {
     scene.background = background;
     sky.forEach((o, i) => { o.visible = shown[i]; });
+    hidden.forEach((o, i) => { o.visible = hiddenShown[i]; });
     camera.layers.mask = cameraLayers;
     renderer.autoClear = true;
   }
