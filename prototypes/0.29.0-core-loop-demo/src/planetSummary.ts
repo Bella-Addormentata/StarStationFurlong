@@ -107,6 +107,9 @@ export interface ShipSummary {
   nextStopRoom?: string;
   departAt?: number;
   routeStatus?: ShipRouteStatus;
+  /** 🚏 The run it flies (the route's startedAt), so a board can tell a
+   *  replacement route from a later stop of the one it holds. */
+  routeRun?: number;
   updatedAt: number;
 }
 
@@ -219,6 +222,7 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (typeof v.routeStatus === 'string' && (SHIP_ROUTE_STATUSES as readonly string[]).includes(v.routeStatus)) {
     out.routeStatus = v.routeStatus as ShipRouteStatus;
   }
+  if (Number.isSafeInteger(v.routeRun) && (v.routeRun as number) > 0) out.routeRun = v.routeRun as number;
   return out;
 }
 

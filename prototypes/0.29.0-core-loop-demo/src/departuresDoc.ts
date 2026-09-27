@@ -11,12 +11,13 @@
  * (pilotRoute.routeFlightAt): a leg on time is news to nobody, and a station
  * game needs no message to show a ferry leave, fly and arrive.
  *
- *   <shipRoomId>:route                       DepartureRouteEntry: the ferry's
+ *   <shipRoomId>:route:<at>                  DepartureRouteEntry: the ferry's
  *                                            name, ship room id, tank
  *                                            capacity, its route as the ship
  *                                            map holds it (copied stops, run
  *                                            fields; NEVER a pass), and when
- *                                            it was published
+ *                                            it was published (<at>, whole
+ *                                            ms: one key per snapshot)
  *   <shipRoomId>:ckpt:<run>:<legSeq>:<kind>  one checkpoint, the ship map's
  *                                            own key behind the ferry's id
  *
@@ -25,9 +26,13 @@
  * observation: a hold's newest seenAt, any other entry's newest `at`), and
  * one reader (pilotRoute's own checks and pruning) serves both sides. The
  * route entry is newest-wins: a newer START (a larger run id) always, STOP
- * over not stopped within one run, otherwise the later publish. A route that
- * is no longer running (finished after STOP) takes its checkpoints with it,
- * and the board drops the ferry.
+ * over not stopped within one run, otherwise the later publish. The READER
+ * picks it (departureRouteNewer over every route key of the ferry), and a
+ * writer adds its snapshot under its own key and deletes only the keys it
+ * saw: two riders publishing at once both land, and every replica picks the
+ * same one, so a stale running snapshot can't win a CRDT tie over a STOP.
+ * A route that is no longer running (finished after STOP) takes its
+ * checkpoints with it, and the board drops the ferry.
  *
  * WHO WRITES. A rider's game, through departuresWrite.ts: a short background
  * session to each stop's berth room (the farDoorWrite.ts pattern), at START
@@ -130,15 +135,19 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
     && (Object.getPrototypeOf(v) === Object.prototype || Object.getPrototypeOf(v) === null);
 }
 
+/** What separates a ferry's id from a route snapshot's stamp in its key. */
+const ROUTE_TAG = ':route:';
+
 /** A ship room id a departures key can carry unambiguously. */
 export function isDepartureShipId(v: unknown): v is string {
-  return isId(v) && !v.includes(':ckpt:');
+  return isId(v) && !v.includes(':ckpt:') && !v.includes(ROUTE_TAG);
 }
 
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
-export function departureRouteKey(shipRoomId: string): string {
-  return `${shipRoomId}:route`;
+/** A route snapshot's key: the ferry, then its publish stamp in whole ms. */
+export function departureRouteKey(shipRoomId: string, at: number): string {
+  return `${shipRoomId}${ROUTE_TAG}${Math.max(0, Math.floor(at))}`;
 }
 
 export function departureCheckpointKey(shipRoomId: string, run: number, legSeq: number, kind: RouteCheckpoint['kind']): string {
@@ -146,7 +155,7 @@ export function departureCheckpointKey(shipRoomId: string, run: number, legSeq: 
 }
 
 export type DepartureKey =
-  | { ship: string; kind: 'route' }
+  | { ship: string; kind: 'route'; version: number }
   | { ship: string; kind: 'ckpt'; run: number; legSeq: number; ckpt: RouteCheckpoint['kind'] };
 
 /** A departures key, or null (canonical spellings only, as the ship map's). */
@@ -159,9 +168,12 @@ export function parseDepartureKey(key: unknown): DepartureKey | null {
     if (!ck || !isDepartureShipId(ship)) return null;
     return { ship, kind: 'ckpt', run: ck.run, legSeq: ck.legSeq, ckpt: ck.kind };
   }
-  if (key.endsWith(':route')) {
-    const ship = key.slice(0, -':route'.length);
-    return isDepartureShipId(ship) ? { ship, kind: 'route' } : null;
+  const r = key.indexOf(ROUTE_TAG);
+  if (r > 0) {
+    const ship = key.slice(0, r);
+    const v = key.slice(r + ROUTE_TAG.length);
+    if (!/^(0|[1-9][0-9]*)$/.test(v) || !Number.isSafeInteger(Number(v)) || !isDepartureShipId(ship)) return null;
+    return { ship, kind: 'route', version: Number(v) };
   }
   return null;
 }
@@ -218,6 +230,18 @@ export function departureRouteNewer(
   return a.at > b.at;
 }
 
+/** Of a ferry's route keys, the one every replica reads: the newest by
+ *  departureRouteNewer, a tie to the larger key (replicas iterate in their
+ *  own order). */
+function newestRouteEntry<T extends { key: string; entry: Omit<DepartureFerry, 'checkpoints'> }>(list: readonly T[]): T | null {
+  let best: T | null = null;
+  for (const c of list) {
+    if (!best || departureRouteNewer(c.entry, best.entry)
+      || (!departureRouteNewer(best.entry, c.entry) && c.key > best.key)) best = c;
+  }
+  return best;
+}
+
 /** The observation a checkpoint key's value carries: a hold's newest
  *  sighting, any other entry's `at`. A rewrite of one key keeps the newer. */
 function observedAt(e: RouteCheckpoint): number {
@@ -232,7 +256,7 @@ function observedAt(e: RouteCheckpoint): number {
  * its route's current run only.
  */
 export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
-  const routes = new Map<string, Omit<DepartureFerry, 'checkpoints'>>();
+  const candidates = new Map<string, Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }>>();
   const ckpts = new Map<string, Array<{ run: number; e: RouteCheckpoint }>>();
   let visited = 0;
   for (const [key, value] of map.entries()) {
@@ -241,7 +265,7 @@ export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
     if (!k) continue;
     if (k.kind === 'route') {
       const entry = departureRouteFromWire(value, k.ship);
-      if (entry) routes.set(k.ship, entry);
+      if (entry) candidates.set(k.ship, [...(candidates.get(k.ship) ?? []), { key, entry }]);
       continue;
     }
     const list = ckpts.get(k.ship) ?? [];
@@ -251,9 +275,9 @@ export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
     ckpts.set(k.ship, list);
   }
   const out: DepartureFerry[] = [];
-  for (const ship of [...routes.keys()].sort()) {
+  for (const ship of [...candidates.keys()].sort()) {
     if (out.length >= MAX_DEPARTURE_FERRIES) break;
-    const entry = routes.get(ship)!;
+    const entry = newestRouteEntry(candidates.get(ship)!)!.entry;
     const run = entry.route.startedAt;
     // The same cap as the ship's own reader, picked by stay (never by this
     // copy's key order), so every board reads a ferry alike.
@@ -308,26 +332,38 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   if (!pub) return { wrote: false };
   const map = doc.getMap<unknown>(DEPARTURES_MAP);
   const ship = pub.shipRoomId;
-  const routeKey = departureRouteKey(ship);
-  const existing = departureRouteFromWire(map.get(routeKey), ship);
-  const takes = !existing || departureRouteNewer(pub, existing);
-  const kept = takes ? pub : existing!;
-  const run = kept.route.startedAt;
 
-  // Every key of this ferry (and, for the cap, every ferry's route entry).
+  // Every key of this ferry (and, for the cap, every other ferry's route
+  // keys, its newest entry's stamp).
   const mineKeys: Array<{ key: string; k: Extract<DepartureKey, { kind: 'ckpt' }> }> = [];
-  const others: Array<{ ship: string; at: number }> = [];
+  const mineRoutes: Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }> = [];
+  const mineRouteKeys: string[] = [];
+  const otherRoutes = new Map<string, { at: number; keys: string[] }>();
   let visited = 0;
   for (const key of map.keys()) {
     if (++visited > MAX_WRITE_KEYS_VISITED) break;
     const k = parseDepartureKey(key);
     if (!k) continue;
     if (k.kind === 'ckpt' && k.ship === ship) mineKeys.push({ key, k });
-    if (k.kind === 'route' && k.ship !== ship) {
-      const e = departureRouteFromWire(map.get(key), k.ship);
-      others.push({ ship: k.ship, at: e ? e.at : Number.NEGATIVE_INFINITY });
+    if (k.kind !== 'route') continue;
+    const e = departureRouteFromWire(map.get(key), k.ship);
+    if (k.ship === ship) {
+      mineRouteKeys.push(key);
+      if (e) mineRoutes.push({ key, entry: e });
+      continue;
     }
+    const o = otherRoutes.get(k.ship) ?? { at: Number.NEGATIVE_INFINITY, keys: [] };
+    o.keys.push(key);
+    if (e) o.at = Math.max(o.at, e.at);
+    otherRoutes.set(k.ship, o);
   }
+  const newest = newestRouteEntry(mineRoutes);
+  const existing = newest?.entry ?? null;
+  const takes = !existing || departureRouteNewer(pub, existing);
+  const kept = takes ? pub : existing!;
+  const keepKey = takes ? departureRouteKey(ship, pub.at) : newest!.key;
+  const run = kept.route.startedAt;
+  const others = [...otherRoutes].map(([s2, o]) => ({ ship: s2, ...o }));
 
   let wrote = false;
   const set = (key: string, value: unknown) => {
@@ -342,7 +378,10 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   };
 
   doc.transact(() => {
-    if (takes) set(routeKey, departureRouteToWire(pub));
+    if (takes) set(keepKey, departureRouteToWire(pub));
+    // Only the keys this writer saw: a snapshot another rider is writing
+    // right now lands beside the kept one, and readers pick between them.
+    for (const key of mineRouteKeys) if (key !== keepKey) del(key);
     // Other runs' keys go (and every key once the route stops running).
     const current = new Map<string, RouteCheckpoint>();
     for (const { key, k } of mineKeys) {
@@ -373,7 +412,7 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
     if (!existing && takes && others.length >= MAX_DEPARTURE_FERRIES) {
       others.sort((a, b) => a.at - b.at || (a.ship < b.ship ? -1 : 1));
       for (const gone of others.slice(0, others.length - MAX_DEPARTURE_FERRIES + 1)) {
-        del(departureRouteKey(gone.ship));
+        for (const key of gone.keys) del(key);
         let n = 0;
         for (const key of [...map.keys()]) {
           if (++n > MAX_WRITE_KEYS_VISITED) break;

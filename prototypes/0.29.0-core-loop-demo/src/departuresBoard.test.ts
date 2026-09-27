@@ -293,6 +293,13 @@ describe('the board', () => {
     const finished = ferry(running({ stoppedAt: T0 + SEC }), [s]);
     expect(view(mine(), finished)).toEqual([expect.objectContaining({ status: 'BOARDING', asOf: T0 + 5 * SEC })]);
     expect(view(mine({ updatedAt: T0 - SEC }), finished)).toEqual([]);
+    // A later run (a replacement route): the held run is over. Its row shows
+    // when it calls here now, and none when it doesn't (not the old run's).
+    expect(view(mine({ routeRun: T0 + MIN }))).toEqual([expect.objectContaining({ asOf: T0 + 5 * SEC })]);
+    expect(view(mine({ routeRun: T0 + MIN, fromRoom: 'room-7' }))).toEqual([]);
+    // The same run, calling elsewhere now: the held timetable still says
+    // when it calls here.
+    expect(view(mine({ routeRun: T0, fromRoom: 'room-7' }))).toEqual([expect.objectContaining({ status: 'BOARDING', at: s.departAt })]);
   });
 
   it('a summary row: docked here, or flying here; nothing stale, off route or elsewhere', () => {
@@ -322,17 +329,17 @@ describe('the route fields of the ferry’s own summary', () => {
   it('docked at a stop: its gate, next stop, departure and status', () => {
     const f = routeFlightAt(route, [s], () => T0 + SEC, T0 + 10 * SEC, 100)!;
     expect(routeSummaryFields(route, f, [s], { gate: 4 }, T0 + 10 * SEC)).toEqual({
-      nextStopRoom: 'room-1', gate: 4, departAt: s.departAt, routeStatus: 'boarding',
+      nextStopRoom: 'room-1', gate: 4, departAt: s.departAt, routeStatus: 'boarding', routeRun: T0,
     });
     expect(routeSummaryFields(route, f, [s], null, T0 + BOARD_ARRIVING_MS + SEC)).toMatchObject({ routeStatus: 'not-docked', gate: 1 });
   });
 
   it('in flight: on time to the next stop’s gate; paused; nothing once over', () => {
     const f = routeFlightAt(route, [s], null, s.departAt + SEC, 100)!;
-    expect(routeSummaryFields(route, f, [s], null, s.departAt + SEC)).toEqual({ nextStopRoom: 'room-1', gate: 2, routeStatus: 'on-time' });
+    expect(routeSummaryFields(route, f, [s], null, s.departAt + SEC)).toEqual({ nextStopRoom: 'room-1', gate: 2, routeStatus: 'on-time', routeRun: T0 });
     const pause = pauseCheckpoint(route, 0, { at: T0 + 20 * SEC });
     const p = routeFlightAt(route, [s, pause], null, T0 + 30 * SEC, 100)!;
-    expect(routeSummaryFields(route, p, [s, pause], null, T0 + 30 * SEC)).toEqual({ nextStopRoom: 'room-1', routeStatus: 'paused' });
+    expect(routeSummaryFields(route, p, [s, pause], null, T0 + 30 * SEC)).toEqual({ nextStopRoom: 'room-1', routeStatus: 'paused', routeRun: T0 });
     expect(routeSummaryFields(null, null, [], null, T0)).toEqual({});
     const stopped = running({ stoppedAt: T0 + SEC });
     const e = routeFlightAt(stopped, [s], null, T0 + 10 * SEC, 100)!;

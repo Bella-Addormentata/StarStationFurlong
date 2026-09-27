@@ -128,11 +128,11 @@ describe('guards', () => {
   it('keeps a route ferry\'s gate, next stop, departure and status; a bad one drops alone', () => {
     const ship = {
       roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a',
-      gate: 2, nextStopRoom: 'room-b', departAt: T0 + 60_000, routeStatus: 'boarding', updatedAt: T0,
+      gate: 2, nextStopRoom: 'room-b', departAt: T0 + 60_000, routeStatus: 'boarding', routeRun: T0 - 60_000, updatedAt: T0,
     };
     expect(cleanShipSummary(ship, T0)).toEqual(ship);
     for (const [field, bad] of [['gate', 0], ['gate', 100], ['gate', 1.5], ['nextStopRoom', ''], ['nextStopRoom', 'r'.repeat(129)],
-      ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3]] as const) {
+      ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3], ['routeRun', 0], ['routeRun', 1.5], ['routeRun', 'x']] as const) {
       const clean = cleanShipSummary({ ...ship, [field]: bad }, T0);
       expect(clean).not.toBeNull();
       expect(clean).not.toHaveProperty(field);

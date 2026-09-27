@@ -375,8 +375,9 @@ function scheduleMoved(mirror: DepartureRow, newer: DepartureRow): boolean {
  * The map's entry for a ferry is its last publish that reached this room
  * (DepartureFerry.at). A summary the ferry wrote AFTER it wins where they
  * disagree, since a publish can give up or a finished route's entry stays
- * behind: said since that no route runs, the ferry leaves the board; a row
- * where the map has none, or with another gate or time, replaces the map's.
+ * behind: said since that no route runs, or that a later run flies, the
+ * held row goes; a row where the map has none, from a later run, or with
+ * another gate or time, replaces the map's.
  */
 export function boardView(i: BoardInput): BoardView {
   const rows: DepartureRow[] = [];
@@ -394,11 +395,15 @@ export function boardView(i: BoardInput): BoardView {
     const s = summaryOf.get(ferry.shipRoomId);
     if (s && i.isHereRoom && s.updatedAt > ferry.at) {
       if (!s.routeStatus) continue;
+      // A later run than the one this room holds (a replacement route): the
+      // held one is over, whether or not the new one calls here now.
+      const laterRun = s.routeRun !== undefined && s.routeRun > (ferry.route.startedAt ?? ferry.endedRun ?? 0);
       const sr = summaryRow(s, i.isHereRoom, placeOf, i.now);
-      if (sr && (!r || scheduleMoved(r, sr))) {
+      if (sr && (!r || laterRun || scheduleMoved(r, sr))) {
         rows.push(sr);
         continue;
       }
+      if (laterRun) continue;
     }
     if (r) rows.push(r);
   }
@@ -439,6 +444,7 @@ export interface RouteSummaryFields {
   nextStopRoom?: string;
   departAt?: number;
   routeStatus?: RouteStatus;
+  routeRun?: number;
 }
 
 /**
@@ -456,6 +462,7 @@ export function routeSummaryFields(
   if (!isRouteRunning(route) || !f || f.ended === 'stop') return {};
   const next = route.stops[f.nextStopIndex];
   const out: RouteSummaryFields = {};
+  if (route.startedAt !== undefined) out.routeRun = route.startedAt;
   if (next) out.nextStopRoom = next.berth.roomId;
   if (f.paused) {
     out.routeStatus = 'paused';

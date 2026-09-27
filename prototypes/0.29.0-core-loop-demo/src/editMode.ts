@@ -114,6 +114,10 @@ import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
 // 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
 import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
+// 🚏 …and so do the last helm, engine and fuel tank aboard.
+import { readShipRoute } from './shipRoute';
+import { isRouteRunning } from './pilotRoute';
+import { lastRoutePartTaken } from './routeParts';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2209,6 +2213,19 @@ class RoomEditController {
     const captainDock = readRouteCaptainDockId();
     if (captainDock && (itemId === captainDock || mountDescendantsOf(itemId).some((c) => c.id === captainDock))) {
       showHint(`CAN'T REMOVE — ${CAPTAIN_LOCK_REFUSAL}.`, 2800);
+      return;
+    }
+    let routeRuns = false;
+    try {
+      routeRuns = isRouteRunning(readShipRoute());
+    } catch {
+      routeRuns = false;
+    }
+    const lastPart = lastRoutePartTaken(
+      itemId, FURNITURE, new Set([itemId, ...mountDescendantsOf(itemId).map((c) => c.id)]), routeRuns,
+    );
+    if (lastPart) {
+      showHint(`CAN'T REMOVE — the ship's route is running and this is its last ${lastPart}. Stop the route at the helm first.`, 3200);
       return;
     }
     if (import.meta.env.DEV && isDeviceFocusActive()) {

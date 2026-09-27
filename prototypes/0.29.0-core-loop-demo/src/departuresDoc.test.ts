@@ -92,8 +92,8 @@ afterEach(() => warn.mockRestore());
 
 describe('departures keys', () => {
   it('the route and each checkpoint sit behind the ferry’s ship room id, and parse back', () => {
-    expect(departureRouteKey(SHIP)).toBe('ship-room-1:route');
-    expect(parseDepartureKey('ship-room-1:route')).toEqual({ ship: SHIP, kind: 'route' });
+    expect(departureRouteKey(SHIP, T0)).toBe(`ship-room-1:route:${T0}`);
+    expect(parseDepartureKey(`ship-room-1:route:${T0}`)).toEqual({ ship: SHIP, kind: 'route', version: T0 });
     const k = departureCheckpointKey(SHIP, T0, 3, 'hold');
     expect(k).toBe(`ship-room-1:ckpt:${T0}:3:hold`);
     expect(parseDepartureKey(k)).toEqual({ ship: SHIP, kind: 'ckpt', run: T0, legSeq: 3, ckpt: 'hold' });
@@ -102,7 +102,8 @@ describe('departures keys', () => {
   it('refuses keys it can’t read back unambiguously', () => {
     for (const bad of [
       'route', ':route', `:ckpt:${T0}:0:start`, `a:ckpt:b:ckpt:${T0}:0:start`, `${SHIP}:ckpt:${T0}:0:teleport`,
-      `${SHIP}:ckpt:0${T0}:0:start`, `${'r'.repeat(129)}:route`, `${SHIP}:routes`, 42, null,
+      `${SHIP}:ckpt:0${T0}:0:start`, `${'r'.repeat(129)}:route:1`, `${SHIP}:routes`, `${SHIP}:route`, `${SHIP}:route:`,
+      `${SHIP}:route:01`, `${SHIP}:route:1.5`, `${SHIP}:route:-1`, `${SHIP}:route:99999999999999999`, `a:route:b:route:1`, 42, null,
     ]) {
       expect(parseDepartureKey(bad)).toBeNull();
     }
@@ -180,7 +181,7 @@ describe('a publish applied to a stop room', () => {
     const updates = countUpdates(doc);
     expect(applyDeparturesPublish(doc, pub(route, [s]), T0).wrote).toBe(true);
     expect(updates.n).toBe(1);
-    expect(keys(doc)).toEqual([departureCheckpointKey(SHIP, T0, 0, 'start'), departureRouteKey(SHIP)].sort());
+    expect(keys(doc)).toEqual([departureCheckpointKey(SHIP, T0, 0, 'start'), departureRouteKey(SHIP, T0)].sort());
     const [f] = departureFerriesIn(doc.getMap(DEPARTURES_MAP));
     expect(f).toMatchObject({ shipRoomId: SHIP, name: 'Ferry One', capacity: 100, route, at: T0 });
     expect(f.checkpoints).toEqual([s]);
@@ -221,7 +222,7 @@ describe('a publish applied to a stop room', () => {
     applyDeparturesPublish(doc, pub(route, [start(route)]), T0);
     const next = running([0, 1], T0 + 30 * MIN);
     expect(applyDeparturesPublish(doc, pub(next, [start(next)], T0 + 30 * MIN), T0 + 30 * MIN).wrote).toBe(true);
-    expect(keys(doc)).toEqual([departureCheckpointKey(SHIP, T0 + 30 * MIN, 0, 'start'), departureRouteKey(SHIP)].sort());
+    expect(keys(doc)).toEqual([departureCheckpointKey(SHIP, T0 + 30 * MIN, 0, 'start'), departureRouteKey(SHIP, T0 + 30 * MIN)].sort());
   });
 
   it('a finished route stays listed but running no more, its checkpoints gone', () => {
@@ -230,7 +231,7 @@ describe('a publish applied to a stop room', () => {
     applyDeparturesPublish(doc, pub(route, [start(route)]), T0);
     const { startedAt: _s, startStop: _p, ...finished } = route;
     expect(applyDeparturesPublish(doc, pub(finished, [], T0 + 20 * MIN), T0 + 20 * MIN).wrote).toBe(true);
-    expect(keys(doc)).toEqual([departureRouteKey(SHIP)]);
+    expect(keys(doc)).toEqual([departureRouteKey(SHIP, T0 + 20 * MIN)]);
     const [f] = departureFerriesIn(doc.getMap(DEPARTURES_MAP));
     expect(f.route.startedAt).toBeUndefined();
     expect(f.checkpoints).toEqual([]);
@@ -246,10 +247,40 @@ describe('a publish applied to a stop room', () => {
     // A rider's snapshot of the ended run arrives after it, stamped later.
     const hold = holdCheckpoint(route, 1, { at: s.arriveAt + SEC });
     expect(applyDeparturesPublish(doc, pub(route, [s, hold], T0 + 21 * MIN), T0 + 21 * MIN).wrote).toBe(false);
-    expect(keys(doc)).toEqual([departureRouteKey(SHIP)]);
+    expect(keys(doc)).toEqual([departureRouteKey(SHIP, T0 + 20 * MIN)]);
     const [f] = departureFerriesIn(doc.getMap(DEPARTURES_MAP));
     expect(f.route.startedAt).toBeUndefined();
     expect(f.endedRun).toBe(T0);
+  });
+
+  it('🏁 two riders publishing at once: a running snapshot never wins a CRDT tie over the finish', () => {
+    const route = running();
+    const s = start(route);
+    const { startedAt: _s, startStop: _p, ...finished } = route;
+    const hold = holdCheckpoint(route, 1, { at: s.arriveAt + SEC });
+    for (const order of ['finish-first', 'running-first'] as const) {
+      const base = new Y.Doc();
+      applyDeparturesPublish(base, pub(route, [s], T0), T0);
+      // Two riders' sessions, each from the same room state, write at once:
+      // one the finish, one a running snapshot stamped later (clock skew).
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(base));
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(base));
+      expect(applyDeparturesPublish(a, pub(finished, [], T0 + 20 * MIN, { endedRun: T0 }), T0 + 20 * MIN).wrote).toBe(true);
+      expect(applyDeparturesPublish(b, pub(route, [s, hold], T0 + 21 * MIN), T0 + 21 * MIN).wrote).toBe(true);
+      const [first, second] = order === 'finish-first' ? [a, b] : [b, a];
+      Y.applyUpdate(base, Y.encodeStateAsUpdate(first));
+      Y.applyUpdate(base, Y.encodeStateAsUpdate(second));
+      const [f] = departureFerriesIn(base.getMap(DEPARTURES_MAP));
+      expect(f.route.startedAt).toBeUndefined();
+      expect(f.endedRun).toBe(T0);
+      expect(f.checkpoints).toEqual([]);
+      // Both snapshots landed; the next writer tidies to the finish alone.
+      expect(keys(base).filter((k) => k.includes(':route:'))).toHaveLength(2);
+      applyDeparturesPublish(base, pub(route, [s, hold], T0 + 22 * MIN), T0 + 22 * MIN);
+      expect(keys(base)).toEqual([departureRouteKey(SHIP, T0 + 20 * MIN)]);
+    }
   });
 
   it('prunes as the ship does: entries below the newest timed one go, start kept', () => {
@@ -304,7 +335,7 @@ describe('reading a room’s departures', () => {
     const map = doc.getMap(DEPARTURES_MAP);
     const route = running();
     const s = start(route);
-    map.set(departureRouteKey(SHIP), departureRouteToWire({ shipRoomId: SHIP, name: 'F', capacity: 100, route, at: T0 }));
+    map.set(departureRouteKey(SHIP, T0), departureRouteToWire({ shipRoomId: SHIP, name: 'F', capacity: 100, route, at: T0 }));
     const hold = holdCheckpoint(route, 1, { at: s.arriveAt + SEC });
     const { kind: _k, legSeq: _l, ...holdWire } = hold;
     map.set(departureCheckpointKey(SHIP, T0, 1, 'hold'), holdWire);
@@ -314,7 +345,7 @@ describe('reading a room’s departures', () => {
     map.set(departureCheckpointKey(SHIP, T0, 2, 'hold'), holdWire); // stay 2 is stop 0, not st-1
     map.set(departureCheckpointKey('ghost', T0, 0, 'start'), startWire); // no route entry
     map.set('junk', { hello: 1 });
-    map.set(departureRouteKey('bad'), { shipRoomId: 'other', name: 'x', capacity: 1, at: 1, route: routeToWire(route) });
+    map.set(departureRouteKey('bad', 1), { shipRoomId: 'other', name: 'x', capacity: 1, at: 1, route: routeToWire(route) });
     const ferries = departureFerriesIn(map);
     expect(ferries.map((f) => f.shipRoomId)).toEqual([SHIP]);
     expect(ferries[0].checkpoints.map((e) => `${e.legSeq}:${e.kind}`)).toEqual(['0:start', '1:hold']);
