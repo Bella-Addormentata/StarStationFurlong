@@ -40,7 +40,7 @@ import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { shipsAroundPlanet } from './planetSummary';
 import { readFlightRecord, shipDocBound } from './shipDoc';
-import { atlasComponents, readAtlas } from './stationAtlas';
+import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -98,9 +98,16 @@ function flightPlan(
   return plan ? { ...plan, departAt: departedAt, arriveAt: etaAt } : null;
 }
 
-function modulesOf(station: StationRecord, components: Set<string>[]): number {
+/** Modules to draw for a station: the rooms of its atlas component that
+ *  the (capped) atlas actually holds. A component also names door targets
+ *  with no entry, which peers control, so those never count. */
+function modulesOf(station: StationRecord, components: Set<string>[], atlas: Record<string, unknown>): number {
   if (!station.welcomeRoomId) return 1;
-  return components.find((c) => c.has(station.welcomeRoomId))?.size ?? 1;
+  const component = components.find((c) => c.has(station.welcomeRoomId));
+  if (!component) return 1;
+  let n = 0;
+  for (const roomId of component) if (Object.prototype.hasOwnProperty.call(atlas, roomId)) n++;
+  return Math.min(MAX_ENTRIES, Math.max(1, n));
 }
 
 function gather(now: number): Source {
@@ -160,8 +167,11 @@ function gather(now: number): Source {
   }
 
   const stations = all
-    .filter((s) => s.id !== me?.id && planetById(s.planetId).id === planetId && !stationInTransit(s, now))
-    .map((record) => ({ record, modules: modulesOf(record, components) }));
+    // Never the viewer: its own station, nor the one-module station the room
+    // it stands in (a ship, say) is listed as.
+    .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
+    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
+    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 
   const byRoom = (room: string | undefined) => (room ? all.find((s) => s.welcomeRoomId === room) : undefined);
   const ships: FarShipInput[] = [];
