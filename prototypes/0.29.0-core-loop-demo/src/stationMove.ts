@@ -28,7 +28,7 @@
  * kept.
  *
  * Storage: the `stationKeeping` map in the HELM ROOM's doc, one entry per
- * move (`move:<clientID>:<departAt>`, beside the trim burns) — shared by
+ * move (`move:<clientID>:<departAt>:<station>`, beside the trim burns) — shared by
  * everyone in the room. Two moves written at once both land; compareMoves
  * picks the one that flies, the same everywhere, and only its fuel is drawn. Station records are
  * still kept per install, so each install also REMEMBERS every move it has
@@ -550,6 +550,8 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
  * cancels the tow with a move that leaves the station where it was, settling
  * that tow: it ranks just after it everywhere, so the tow is never flown,
  * held or paid for, and a move that beats the tow beats the cancel too.
+ * Every station's standing tow by this tug is checked, not only the room's
+ * latest: two offline tabs of one tug can each have towed another station.
  * Returns whether it wrote a cancel.
  */
 export function cancelTowLeftBehind(
@@ -561,35 +563,38 @@ export function cancelTowLeftBehind(
    *  what says the tug let go. Leave it out when it is not known. */
   dockedTo?: (welcomeRoomId: string) => boolean,
 ): boolean {
-  const best = readStationMove();
-  if (!best || isCancelPin(best)) return false;
-  // Once a tow has arrived its arrival may be pinned; the tow is its parent.
-  const tow = best.settles ?? best;
-  if (tow.mode !== 'tug' || tow.tugRoomId !== roomId) return false;
-  // The tug left before the tow was over: by when the flight cast off when
-  // the record says, however late this tab learns of it; a tug still
-  // 'docked' that let go of the station (UNDOCK records no time) by now.
-  let leftAt: number;
-  if (flight.status !== 'docked') leftAt = flight.castOffAt ?? flight.departedAt ?? realMs;
-  else if (dockedTo && !dockedTo(tow.welcomeRoomId)) leftAt = realMs;
-  else return false;
-  if (leftAt >= tow.arriveAt) return false;
-  const departAt = tow.departAt + 1;
-  return writeStationMove({
-    stationId: tow.stationId,
-    welcomeRoomId: tow.welcomeRoomId,
-    fromPlanetId: tow.fromPlanetId,
-    fromSlot: tow.fromSlot,
-    toPlanetId: tow.fromPlanetId,
-    toSlot: tow.fromSlot,
-    departAt,
-    arriveAt: departAt + 1,
-    mode: 'thrusters',
-    bookedAt: Math.floor(realMs),
-    settles: tow,
-    fuel: 0,
-    fuelDrawn: 0,
-  });
+  let wrote = false;
+  for (const standing of [...roomStanding()]) {
+    if (isCancelPin(standing)) continue;
+    // Once a tow has arrived its arrival may be pinned; the tow is its parent.
+    const tow = standing.settles ?? standing;
+    if (tow.mode !== 'tug' || tow.tugRoomId !== roomId) continue;
+    // The tug left before the tow was over: by when the flight cast off when
+    // the record says, however late this tab learns of it; a tug still
+    // 'docked' that let go of the station (UNDOCK records no time) by now.
+    let leftAt: number;
+    if (flight.status !== 'docked') leftAt = flight.castOffAt ?? flight.departedAt ?? realMs;
+    else if (dockedTo && !dockedTo(tow.welcomeRoomId)) leftAt = realMs;
+    else continue;
+    if (leftAt >= tow.arriveAt) continue;
+    const departAt = tow.departAt + 1;
+    wrote = writeStationMove({
+      stationId: tow.stationId,
+      welcomeRoomId: tow.welcomeRoomId,
+      fromPlanetId: tow.fromPlanetId,
+      fromSlot: tow.fromSlot,
+      toPlanetId: tow.fromPlanetId,
+      toSlot: tow.fromSlot,
+      departAt,
+      arriveAt: departAt + 1,
+      mode: 'thrusters',
+      bookedAt: Math.floor(realMs),
+      settles: tow,
+      fuel: 0,
+      fuelDrawn: 0,
+    }) || wrote;
+  }
+  return wrote;
 }
 
 /**
@@ -750,7 +755,7 @@ function docAlive(): boolean {
 }
 
 /** Prefix of a move's own entry in the room's 'stationKeeping' map: one
- *  entry per move written (`move:<clientID>:<departAt>`), never rewritten,
+ *  entry per move written (`move:<clientID>:<departAt>:<station>`), never rewritten,
  *  so two moves written at once from two tabs (or an offline one) both land
  *  and one order decides between them everywhere. */
 const ENTRY_PREFIX = 'move:';
@@ -760,9 +765,11 @@ const ENTRY_PREFIX = 'move:';
 const LEGACY_KEY = 'move';
 
 /** Prefix of the settled part of the move log: `moveSettled:<writer>:<n>`
- *  holding { n, drawn, floor } for the first `n` entries one writer (the
- *  clientID in an entry's key) wrote that have left the log: their unbeaten
- *  fuel, and their largest unbeaten running total. A writer's entries leave
+ *  holding { n, drawn, floor, recent } for the first `n` entries one writer
+ *  (the clientID in an entry's key) wrote that have left the log: the final
+ *  unbeaten fuel and largest unbeaten running total, and the moves still
+ *  reversible (MOVE_FINAL_MS), each paid only while nothing beats it. A
+ *  writer's entries leave
  *  in the order it wrote them, and Yjs hands every replica a writer's
  *  entries in that order, so two replicas pruning at once cut prefixes of
  *  one sequence: the record with the larger `n` covers the other's, and
@@ -779,21 +786,31 @@ export const MOVE_LOG_KEEP_MS = 24 * 60 * 60 * 1000;
  *  a day, and pruning keeps an honest log far below it. */
 export const MOVE_SCAN_MAX = 256;
 
-interface SettledMoves { n: number; drawn: number; floor: number }
+/** A pruned move stays reversible this long after it arrived: kept whole in
+ *  its writer's settled record, so a rival learned late that beats it still
+ *  takes its fuel back. Past it (or past SETTLED_RECENT_MAX) it is final. */
+export const MOVE_FINAL_MS = MOVE_HORIZON_MS;
+export const SETTLED_RECENT_MAX = 16;
 
-/** A settled record off the wire: a positive whole count, and totals within
- *  the fuel meter's range. */
+/** `drawn` and `floor` are final; `recent` holds pruned moves still paid for
+ *  only while nothing beats them. */
+interface SettledMoves { n: number; drawn: number; floor: number; recent: StationMove[] }
+
+/** A settled record off the wire: a positive whole count, totals within the
+ *  fuel meter's range, and at most SETTLED_RECENT_MAX well-formed moves. */
 function isSettledMoves(v: unknown): v is SettledMoves {
   const r = v as SettledMoves;
   const meter = (x: unknown) => typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= FUEL_METER_MAX;
-  return !!r && typeof r === 'object' && Number.isSafeInteger(r.n) && r.n > 0 && meter(r.drawn) && meter(r.floor);
+  return !!r && typeof r === 'object' && Number.isSafeInteger(r.n) && r.n > 0 && meter(r.drawn) && meter(r.floor)
+    && (r.recent === undefined || (Array.isArray(r.recent) && r.recent.length <= SETTLED_RECENT_MAX
+      && r.recent.every((m) => validMove(m) !== null)));
 }
 
 function validMove(raw: unknown): StationMove | null {
   return isStationMove(raw) && isPlausibleMove(raw) ? cleanMove(raw) : null;
 }
 
-/** The writer (Yjs clientID) in an entry key `move:<clientID>:<departAt>`,
+/** The writer (Yjs clientID) in an entry key `move:<clientID>:<departAt>:<station>`,
  *  or a settled key `moveSettled:<clientID>:<n>`. */
 function writerOf(key: string, prefix: string): string {
   const rest = key.slice(prefix.length);
@@ -826,7 +843,7 @@ function roomMoves(): {
       const had = settled.get(w);
       if (!had || v.n > had.n || (v.n === had.n && v.drawn > had.drawn)) {
         if (had) stale.push(had.key);
-        settled.set(w, { n: v.n, drawn: v.drawn, floor: v.floor, key: k });
+        settled.set(w, { n: v.n, drawn: v.drawn, floor: v.floor, recent: (v.recent ?? []).map(cleanMove), key: k });
       } else stale.push(k);
       continue;
     }
@@ -944,12 +961,19 @@ function meterParts(entries: StationMove[], known: StationMove[], base: number):
  *  pays. */
 export function readMoveFuelDrawn(): number {
   const { entries, legacy, settled } = roomMoves();
-  const known = knownMoves(legacy ? [legacy, ...entries] : entries);
+  const recent = recentMoves(settled);
+  const known = knownMoves([...(legacy ? [legacy] : []), ...entries, ...recent]);
   let base = legacy?.fuelDrawn ?? 0;
   let settledFloor = 0;
   for (const r of settled.values()) { base += r.drawn; settledFloor = Math.max(settledFloor, r.floor); }
-  const { sum, floor } = meterParts(entries, known, base);
+  // Recently pruned moves count like live ones: paid unless beaten.
+  const { sum, floor } = meterParts([...entries, ...recent], known, base);
   return Math.max(sum, floor, settledFloor);
+}
+
+/** Every settled record's still-reversible moves. */
+function recentMoves(settled: Map<string, SettledMoves>): StationMove[] {
+  return [...settled.values()].flatMap((r) => r.recent);
 }
 
 /** Prune the move log inside a write's transaction. An entry can leave once
@@ -964,7 +988,7 @@ function pruneMoveLog(now: number): void {
   const { entries, keyed, legacy, settled, stale } = roomMoves();
   for (const k of stale) keepMap!.delete(k);
   const own = legacy ? [legacy, ...entries] : entries;
-  const known = knownMoves(own);
+  const known = knownMoves([...own, ...recentMoves(settled)]);
   const through = now - MOVE_LOG_KEEP_MS;
   const standing = new Set(standingMoves(entries, known));
   type Entry = { key: string; move: StationMove };
@@ -999,17 +1023,33 @@ function pruneMoveLog(now: number): void {
     const had = settled.get(w);
     let drawn = had?.drawn ?? 0;
     let floor = had?.floor ?? 0;
+    // Pruned moves nothing beats stay whole (reversible) for a while; one
+    // already beaten was never paid and is dropped.
+    const recent = [...(had?.recent ?? [])];
     for (const e of gone) {
       keepMap!.delete(e.key);
       const id = JSON.stringify(e.move);
       if (counted.has(id) || superseded(e.move, known)) continue;
       counted.add(id);
-      drawn += e.move.fuel;
-      floor = Math.max(floor, e.move.fuelDrawn);
+      recent.push(e.move);
+    }
+    // The oldest past MOVE_FINAL_MS, or past the cap, become final: paid
+    // unless something beats them by now.
+    recent.sort((x, y) => x.arriveAt - y.arriveAt || compareMoves(x, y));
+    const final = recent.filter((m, i) => m.arriveAt < now - MOVE_FINAL_MS || i < recent.length - SETTLED_RECENT_MAX);
+    for (const m of final) {
+      if (superseded(m, known)) continue;
+      drawn += m.fuel;
+      floor = Math.max(floor, m.fuelDrawn);
     }
     const n = (had?.n ?? 0) + gone.length;
     if (had) keepMap!.delete(had.key);
-    keepMap!.set(`${SETTLED_PREFIX}${w}:${n}`, { n, drawn: Math.min(FUEL_METER_MAX, drawn), floor: Math.min(FUEL_METER_MAX, floor) });
+    keepMap!.set(`${SETTLED_PREFIX}${w}:${n}`, {
+      n,
+      drawn: Math.min(FUEL_METER_MAX, drawn),
+      floor: Math.min(FUEL_METER_MAX, floor),
+      recent: recent.filter((m) => !final.includes(m)),
+    });
   }
 }
 
@@ -1050,7 +1090,8 @@ export function writeStationMove(move: StationMove): boolean {
   }
   boundDoc!.transact(() => {
     pruneMoveLog(Date.now());
-    keepMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}`, clean);
+    // One key per move: a writer's moves of two stations can leave at once.
+    keepMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}:${clean.welcomeRoomId || clean.stationId}`, clean);
   });
   rememberMove(clean);
   return true;

@@ -858,6 +858,32 @@ describe('tugs: a torch tow', () => {
     expect(isStationMove({ ...base, settles: { ...base } })).toBe(true);
   });
 
+  it('cancels every tow a tug left behind, not only the latest', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1 };
+    // Two offline tabs of one tug each towed another station.
+    const d1 = new Y.Doc(); d1.clientID = 1;
+    const d2 = new Y.Doc(); d2.clientID = 2;
+    bindStationMoveDoc(d1);
+    writeStationMove(a);
+    bindStationMoveDoc(d2);
+    writeStationMove(b);
+    Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+    store.clear();
+    bindStationMoveDoc(d1);
+    expect(readMoveFuelDrawn()).toBe(a.fuel + b.fuel);
+    // Still docked to the first station only: the second tow is cancelled.
+    const docked = { status: 'docked' };
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 1, (w) => w === a.welcomeRoomId)).toBe(true);
+    expect(readMoveFuelDrawn()).toBe(a.fuel);
+    // The tug flies off: the first is cancelled too.
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 2)).toBe(true);
+    expect(readMoveFuelDrawn()).toBe(0);
+    expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 3)).toBe(false);
+  });
+
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
     const plan = planStationTow(towCtx(), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
@@ -996,6 +1022,30 @@ describe('the move log stays bounded', () => {
     writeStationMove(hop(1, 5, 15));
     writeStationMove(hop(2, 5, 20));
     expect([...map.keys()].filter((k) => k.startsWith('move:666:')).length).toBeLessThanOrEqual(1000 - 3 * 250);
+  });
+
+  it('takes back a recently pruned move\'s fuel when a rival learned late beats it', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const t0 = Date.now() - 3 * 86_400_000;
+    const at = (depart: number, fuel: number, drawn: number, booked: number): StationMove => ({
+      ...hop(0, fuel, drawn), departAt: depart, arriveAt: depart + 3_600_000, bookedAt: booked,
+    });
+    const m = at(t0, 10, 10, t0 - 1000);
+    const next = at(t0 + 2 * 3_600_000, 5, 5, m.arriveAt + 600_000);
+    writeStationMove(m);
+    writeStationMove(next);
+    writeStationMove({ ...at(t0 + 4 * 3_600_000, 7, 7, t0 + 3 * 3_600_000), stationId: 'dock', welcomeRoomId: 'dock-room' });
+    const settled = [...doc.getMap('stationKeeping').entries()].filter(([k]) => k.startsWith('moveSettled:'));
+    expect(settled).toHaveLength(1);
+    expect((settled[0][1] as { recent: StationMove[] }).recent).toEqual([m]);
+    expect(readMoveFuelDrawn()).toBe(10 + 5 + 7);
+    // An offline tab booked the station elsewhere at the same moment, and
+    // wins; its entry reaches this room only now.
+    const rival: StationMove = { ...m, departAt: m.departAt + 1, arriveAt: m.arriveAt + 1, toSlot: m.toSlot + 1, fuel: 3, fuelDrawn: 3 };
+    expect(compareMoves(rival, m)).toBeGreaterThan(0);
+    doc.getMap('stationKeeping').set(`move:99:${rival.departAt}:yard-room`, rival);
+    expect(readMoveFuelDrawn()).toBe(3 + 5 + 7);
   });
 
   it('follows a move written here even when this install cannot store it', () => {
