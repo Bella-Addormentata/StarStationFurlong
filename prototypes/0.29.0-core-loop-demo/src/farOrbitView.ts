@@ -440,7 +440,10 @@ function sizeBodies(heightPx: number): void {
 function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
   ensureScene();
   const now = Date.now();
-  if (!source || now - lastRefresh >= REFRESH_MS) {
+  // A move's capture burn is a boundary too: re-read at once so the view
+  // swaps to the new planet instead of going blank until the next refresh.
+  const arrived = source?.mode === 'sun' && now >= source.move.arriveAt;
+  if (!source || arrived || now - lastRefresh >= REFRESH_MS) {
     try {
       source = gather(now);
     } catch (err) {
