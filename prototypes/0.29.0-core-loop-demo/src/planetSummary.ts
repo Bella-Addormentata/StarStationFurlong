@@ -96,6 +96,9 @@ export interface ShipSummary {
   toRoom?: string;
   departedAt?: number;
   etaAt?: number;
+  /** Set when the room stopped being a ship (bolted into a station, a
+   *  fitting removed): a newer stamp that withdraws the entry everywhere. */
+  retired?: true;
   updatedAt: number;
 }
 
@@ -144,11 +147,14 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 /** Bounded JSON-only extras, or undefined. */
 function cleanExt(v: unknown): Record<string, unknown> | undefined {
   if (!isPlainObject(v)) return undefined;
+  // The cap is on the extras alone (as stations.ts keeps them), not on the
+  // record they came with.
+  const extras: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(v)) if (!KNOWN_FIELDS.has(k)) extras[k] = x;
   let json: string;
-  try { json = JSON.stringify(v); } catch { return undefined; }
+  try { json = JSON.stringify(extras); } catch { return undefined; }
   if (json.length > MAX_EXT_JSON) return undefined;
   const out = stripCredentials(JSON.parse(json)) as Record<string, unknown>;
-  for (const k of Object.keys(out)) if (KNOWN_FIELDS.has(k)) delete out[k];
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -229,6 +235,7 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.toRoom !== undefined && !isId(v.toRoom)) return null;
   if (v.departedAt !== undefined && !isTime(v.departedAt)) return null;
   if (v.etaAt !== undefined && !isTime(v.etaAt)) return null;
+  if (v.retired !== undefined && v.retired !== true) return null;
   const out: ShipSummary = {
     roomId: v.roomId,
     name: v.name,
@@ -240,6 +247,7 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.toRoom !== undefined) out.toRoom = v.toRoom as string;
   if (v.departedAt !== undefined) out.departedAt = v.departedAt as number;
   if (v.etaAt !== undefined) out.etaAt = v.etaAt as number;
+  if (v.retired === true) out.retired = true;
   return out;
 }
 
@@ -437,7 +445,9 @@ function capped<T extends { updatedAt: number; planetId: string }>(
   const entries = Object.entries(rec);
   if (entries.length <= max) return rec;
   const first = (k: string, v: T) => (pinned.has(k) ? 0 : onPlanet(v, planet) ? 1 : 2);
-  entries.sort((a, b) => first(a[0], a[1]) - first(b[0], b[1]) || stampOf(b[1]) - stampOf(a[1]));
+  // Ties by key, as pruneMap: every replica keeps the same subset.
+  entries.sort((a, b) => first(a[0], a[1]) - first(b[0], b[1]) || stampOf(b[1]) - stampOf(a[1])
+    || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   const out: Record<string, T> = Object.create(null);
   for (const [k, v] of entries.slice(0, max)) out[k] = v;
   return out;
@@ -679,6 +689,12 @@ export interface PlanetSummaryContext {
   localTrim: () => OrbitTrim | null;
   /** The ship this client stands in, or null when the room is no ship. */
   ship: () => ShipStatusInput | null;
+  /** The room this client stands in when it is known to be no ship (not a
+   *  ready ship, or bolted into a station), else null: a ship entry for that
+   *  room is withdrawn. A ship whose planet is not placed yet (`ship()` is
+   *  null for it too) is not this, so its entry stands. Optional: without it
+   *  nothing is withdrawn. */
+  notShipRoom?: () => string | null;
 }
 
 let doc: Y.Doc | null = null;
@@ -814,12 +830,30 @@ export function publishPlanetSummary(now = Date.now()): void {
     if (next) store.stations[here.welcomeRoomId] = next;
   }
   const ship = ctx.ship();
+  // A first-hand change goes out past any stamp already known for this ship
+  // (a peer's may run up to MAX_SKEW_MS ahead), as foldOwnStation does.
+  const stampPast = (room: string): number => {
+    const known = Math.max(
+      store.ships[room]?.updatedAt ?? -Infinity,
+      cleanShipSummary(shipMap!.get(room), now)?.updatedAt ?? -Infinity,
+    );
+    return Math.min(Math.max(now, known + 1), now + MAX_SKEW_MS);
+  };
   if (ship) {
     const s = cleanShipSummary({ ...ship, updatedAt: now }, now);
     const prior = s ? store.ships[s.roomId] : undefined;
     const same = prior && s && now - prior.updatedAt < SHIP_HEARTBEAT_MS
       && JSON.stringify({ ...prior, updatedAt: 0 }) === JSON.stringify({ ...s, updatedAt: 0 });
-    if (s && !same) store.ships[s.roomId] = s;
+    if (s && !same) store.ships[s.roomId] = { ...s, updatedAt: stampPast(s.roomId) };
+  } else {
+    // This room is no ship (any more): withdraw an entry still naming it.
+    const room = ctx.notShipRoom?.() ?? null;
+    const kept = room ? store.ships[room] : undefined;
+    const inMap = room ? cleanShipSummary(shipMap!.get(room), now) : null;
+    const prior = kept && inMap ? mergeShip(kept, inMap) ?? kept : kept ?? inMap;
+    if (room && prior && !prior.retired) {
+      store.ships[room] = { ...prior, retired: true, updatedAt: stampPast(room) };
+    }
   }
   const pins = firstHandKeys();
   store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
@@ -866,7 +900,11 @@ function applyLearned(store: Store): void {
   // Moves first: they decide which planet each station is listed at.
   for (const s of Object.values(store.stations)) if (s.move) rememberMove(s.move);
   const here = ctx?.currentStation() ?? null;
-  const planet = here ? planetById(here.planetId).id : planetById(undefined).id;
+  // Where this client is: its own saved record says so; otherwise the shared
+  // summary of the station it stands in does (a derived record sits on the
+  // default planet until its learned one registers, which needs the planet).
+  const shared = here?.welcomeRoomId ? store.stations[here.welcomeRoomId] : undefined;
+  const planet = planetById(here && !isOwned(here) && shared ? shared.planetId : here?.planetId).id;
   registerLearnedStations(planet, Object.values(store.stations), { prune: here !== null });
   refreshTrims(store);
 }
@@ -931,7 +969,7 @@ export function portableStationId(id: string): string | null {
 export function shipsAroundPlanet(planetId: string, now = Date.now()): ShipSummary[] {
   const planet = planetById(planetId).id;
   return Object.values(readStore(now).ships)
-    .filter((s) => planetById(s.planetId).id === planet)
+    .filter((s) => !s.retired && planetById(s.planetId).id === planet)
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
