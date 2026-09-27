@@ -169,6 +169,25 @@ describe('the departures publisher', () => {
     expect(h.p.busyRooms()).toEqual([]);
   });
 
+  it('another ferry this game boards never drops the first one’s retry at a shared stop', async () => {
+    const h = harness({ route: () => ({ ...running(), stops: [stop(0, 0), stop(1, 1)] }) });
+    h.p.routeWritten({ kind: 'start', legSeq: 0 });
+    await h.tick();
+    await h.answer(0, 'unreachable'); // ferry A missed room-0: a retry waits
+    await h.answer(1, 'written');
+    h.setShip('ship-room-2'); // the player boards ferry B, which calls there too
+    h.p.routeWritten({ kind: 'start', legSeq: 0 });
+    await h.tick();
+    expect(h.calls[2]).toMatchObject({ address: 'pass:room-0', pub: { shipRoomId: 'ship-room-2' } });
+    await h.answer(2, 'written');
+    await h.answer(3, 'written');
+    await h.tick(DEPARTURES_RETRY_MS[0]); // A's retry comes due, and is sent
+    expect(h.calls).toHaveLength(5);
+    expect(h.calls[4]).toMatchObject({ address: 'pass:room-0', pub: { shipRoomId: SHIP } });
+    await h.answer(4, 'written');
+    expect(h.p.busyRooms()).toEqual([]);
+  });
+
   it('skips a room it holds no pass for, and publishes nothing once it has left the ship', async () => {
     const h = harness({ seedFor: (room) => (room === 'room-1' ? undefined : `pass:${room}`) });
     h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });

@@ -19,6 +19,7 @@ import {
   learnedRecord,
   mergeStation,
   publishPlanetSummary,
+  ROUTE_SUMMARY_REFRESH_MS,
   readStore,
   refreshTrims,
   registerLearnedStations,
@@ -309,6 +310,26 @@ describe('ships and the solar system', () => {
     status = { ...ship, status: 'in-flight', toRoom: 'room-b', departedAt: T0, etaAt: T0 + 60_000 };
     publishPlanetSummary(Date.now() + 1);
     expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ status: 'in-flight', toRoom: 'room-b' });
+  });
+
+  it('🚏 re-stamps an unchanged ferry summary once it is 15 minutes old, and only a ferry\'s', () => {
+    const ferry: ShipStatusInput = { ...ship, gate: 2, nextStopRoom: 'room-b', routeStatus: 'holding' };
+    let status: ShipStatusInput = ferry;
+    const doc = new Y.Doc();
+    const t0 = Date.now();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status }));
+    const stamp = () => (doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt;
+    const first = stamp();
+    publishPlanetSummary(t0 + ROUTE_SUMMARY_REFRESH_MS - 60_000);
+    expect(stamp()).toBe(first);
+    publishPlanetSummary(first + ROUTE_SUMMARY_REFRESH_MS);
+    expect(stamp()).toBe(first + ROUTE_SUMMARY_REFRESH_MS);
+    // A ship on no route keeps its stamp (PR 176's rule).
+    status = ship;
+    publishPlanetSummary(first + ROUTE_SUMMARY_REFRESH_MS + 1);
+    const plain = stamp();
+    publishPlanetSummary(plain + 2 * ROUTE_SUMMARY_REFRESH_MS);
+    expect(stamp()).toBe(plain);
   });
 
   it('forgets a ship not heard from in a day', () => {

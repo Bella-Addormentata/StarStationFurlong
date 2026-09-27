@@ -127,6 +127,10 @@ const MAX_EXT_JSON = 1024;
 const MAX_SKEW_MS = 6 * 3600 * 1000;
 /** A ship not heard from in this long has left the picture. */
 export const SHIP_STALE_MS = 24 * 3600 * 1000;
+/** 🚏 A ferry on its route re-stamps an unchanged summary once it is this
+ *  old, so a long hold or pause never ages off the boards (they drop a
+ *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
+export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
 const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
 const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
 
@@ -536,7 +540,8 @@ export function publishPlanetSummary(now = Date.now()): void {
     const s = cleanShipSummary({ ...ship, updatedAt: now }, now);
     const prior = s ? store.ships[s.roomId] : undefined;
     const same = prior && s && JSON.stringify({ ...prior, updatedAt: 0 }) === JSON.stringify({ ...s, updatedAt: 0 });
-    if (s && !same) store.ships[s.roomId] = s;
+    const refresh = !!prior && s?.routeStatus !== undefined && now - prior.updatedAt >= ROUTE_SUMMARY_REFRESH_MS;
+    if (s && (!same || refresh)) store.ships[s.roomId] = s;
   }
   store.stations = capped(store.stations, MAX_STATIONS);
   store.ships = capped(store.ships, MAX_SHIPS);

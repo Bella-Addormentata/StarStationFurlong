@@ -25,8 +25,9 @@
  * timetable out from the clock.
  *
  * Best effort, like the far dock write: per berth room one session at a
- * time, and only the NEWEST snapshot waits behind it (a hold renewed every
- * minute never queues up). An unreachable room is retried twice, 30 s and
+ * time, and only each ferry's NEWEST snapshot waits behind it (a hold
+ * renewed every minute never queues up; another ferry this game rode never
+ * displaces it). An unreachable room is retried twice, 30 s and
  * then 60 s later, unless newer news replaced it (🔁 a retry that comes due
  * after a newer snapshot was offered to that room is dropped, even when the
  * newer one has already been delivered: re-sending the older one would only
@@ -204,11 +205,14 @@ export interface DeparturesPublisher {
   busyRooms: () => string[];
 }
 
+/** One ferry's news for one berth room (keyed by both: a player who boards
+ *  another ferry must not drop the first one's snapshot or its retry). */
 interface RoomState {
-  /** The newest snapshot waiting for this room. */
+  room: string;
+  /** The newest snapshot of this ferry waiting for this room. */
   waiting: DeparturesPublish | null;
-  /** 🔁 The newest snapshot ever offered to this room (a retry of any other
-   *  is stale). */
+  /** 🔁 The newest snapshot of this ferry ever offered to this room (a retry
+   *  of any other is stale). */
   latest: DeparturesPublish | null;
   busy: boolean;
   /** Retries spent on the snapshot now being sent. */
@@ -223,21 +227,25 @@ interface RoomState {
 export function createDeparturesPublisher(d: DeparturesPublisherDeps): DeparturesPublisher {
   const clock = d.clock ?? Date.now;
   const later = d.later ?? ((fn, ms) => { setTimeout(fn, ms); });
+  /** Per (berth room, ferry): writeDepartures still runs one session per
+   *  room at a time. */
   const rooms = new Map<string, RoomState>();
   let pending: { ship: string; legSeq: number | null; endedRun?: number } | null = null;
 
-  const stateOf = (room: string): RoomState => {
-    let st = rooms.get(room);
+  const stateOf = (room: string, ship: string): RoomState => {
+    const key = `${room}\n${ship}`;
+    let st = rooms.get(key);
     if (!st) {
-      st = { waiting: null, latest: null, busy: false, retries: 0 };
-      rooms.set(room, st);
+      st = { room, waiting: null, latest: null, busy: false, retries: 0 };
+      rooms.set(key, st);
     }
     return st;
   };
 
-  /** Send what waits for `room`; resolves once this room has answered it. */
-  const pump = async (room: string): Promise<void> => {
-    const st = stateOf(room);
+  /** Send what waits for this room from this ferry; resolves once the room
+   *  has answered it. */
+  const pump = async (st: RoomState): Promise<void> => {
+    const room = st.room;
     if (st.busy || !st.waiting) return;
     const pub = st.waiting;
     st.waiting = null;
@@ -262,20 +270,20 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
         // snapshot is stale, whatever became of the newer one.
         if (st.latest !== pub) return;
         if (!st.waiting) st.waiting = pub;
-        void pump(room);
+        void pump(st);
       }, wait);
       return;
     }
     st.retries = 0;
-    if (st.waiting) void pump(room);
+    if (st.waiting) void pump(st);
   };
 
   const offer = (room: string, pub: DeparturesPublish): Promise<void> => {
-    const st = stateOf(room);
+    const st = stateOf(room, pub.shipRoomId);
     st.waiting = pub;
     st.latest = pub;
     st.retries = 0;
-    return pump(room);
+    return pump(st);
   };
 
   const flush = (): void => {
@@ -320,6 +328,6 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
       pending = { ship, legSeq: n.legSeq ?? null, ...(ended !== undefined ? { endedRun: ended } : {}) };
       later(flush, 0);
     },
-    busyRooms: () => [...rooms.entries()].filter(([, st]) => st.busy || st.waiting !== null).map(([room]) => room),
+    busyRooms: () => [...new Set([...rooms.values()].filter((st) => st.busy || st.waiting !== null).map((st) => st.room))],
   };
 }

@@ -171,6 +171,7 @@ import {
   bindPlanetSummaryDoc,
   installTrimResolver,
   publishPlanetSummary,
+  ROUTE_SUMMARY_REFRESH_MS,
   resolveStationAlias,
   shipsAroundPlanet,
   type ShipStatusInput,
@@ -1481,6 +1482,9 @@ function departureBoardFor(itemId: string): BoardView {
 /** 🚏📋 What the 1 Hz watch last told the planet about a running route's
  *  ship ('' when no route ran), so a timetable step re-publishes once. */
 let lastRouteShipStatus = "";
+/** …and when it last did: a long hold or pause re-publishes every
+ *  ROUTE_SUMMARY_REFRESH_MS, so the boards never age the ferry out. */
+let lastRouteShipAt = 0;
 
 /** 🚀 #30 SH3: does this player command the current room's ship? */
 function isLocalHelmCommander(): boolean {
@@ -2150,14 +2154,18 @@ async function joinRoomAtEpoch(
     // 🚏📋 A9 item 7: a running route moves the ship on the clock with no
     // doc write, so nothing else would re-publish its summary (flight and
     // route fields) at a departure or an arrival. Publish when what this
-    // game would say has changed, and once more when the route has ended.
+    // game would say has changed, and once more when the route has ended;
+    // while it runs, at least every ROUTE_SUMMARY_REFRESH_MS (a long hold or
+    // pause says nothing new, and the boards drop an hour-old row).
     try {
       // 🛰️ Not from a stale replica: wait for the room's state.
       const said = !roomStateArrivedNow() ? lastRouteShipStatus
         : isRouteRunning(readShipRoute()) ? JSON.stringify(planetShipStatus()) : "";
-      if (said !== lastRouteShipStatus) {
+      const now = Date.now();
+      if (said !== lastRouteShipStatus || (said !== "" && now - lastRouteShipAt >= ROUTE_SUMMARY_REFRESH_MS)) {
         lastRouteShipStatus = said;
-        publishPlanetSummary();
+        lastRouteShipAt = now;
+        publishPlanetSummary(now);
       }
     } catch (err) {
       console.warn("[route] summary re-publish failed:", err);

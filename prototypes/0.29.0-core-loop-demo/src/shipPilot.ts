@@ -491,25 +491,17 @@ function roomOf(seed: string): string {
 }
 
 /** A gate number by far room and door: this game's atlas, else the stop's
- *  station in its directory. The last answer is kept (a docked stay asks
- *  the same question every tick). */
-let gateMemo: { key: string; gate: number | undefined } | null = null;
+ *  station in its directory. Read fresh each time (a few times a second
+ *  while docked): gate data can arrive after the dock, or be renumbered. */
 function gateLookup(stop: RouteStop): (roomId: string, farDoor: string) => number | undefined {
   return (roomId, farDoor) => {
-    const key = `${stop.stationId}|${roomId}|${farDoor}`;
-    if (gateMemo && gateMemo.key === key) return gateMemo.gate;
-    let gate: number | undefined = readAtlas()[roomId]?.gates?.[farDoor];
-    if (gate === undefined) {
-      const st = directoryStationFor(stop);
-      for (const b of [st?.berth, ...(st?.berths ?? [])]) {
-        if (b && b.farDoor === farDoor && b.gate !== undefined && roomOf(b.address) === roomId) {
-          gate = b.gate;
-          break;
-        }
-      }
+    const gate = readAtlas()[roomId]?.gates?.[farDoor];
+    if (gate !== undefined) return gate;
+    const st = directoryStationFor(stop);
+    for (const b of [st?.berth, ...(st?.berths ?? [])]) {
+      if (b && b.farDoor === farDoor && b.gate !== undefined && roomOf(b.address) === roomId) return b.gate;
     }
-    gateMemo = { key, gate };
-    return gate;
+    return undefined;
   };
 }
 
