@@ -1,8 +1,9 @@
 /**
  * 🛰️ Station keeping — which face the helm shows, the trimmed circular orbit
  * (Kepler stays honest: lower is faster), the burn planner's refusal ladder,
- * the doc record's guards, two owners burning at once, and a burn's fuel
- * surviving a REFUEL or DEPART from another tab.
+ * the burn log and its replay, the doc's guards, burns from two tabs (one of
+ * them offline) both landing, and a burn's fuel surviving a REFUEL or DEPART
+ * from another tab or another consumer's draw.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -17,6 +18,7 @@ import {
   subscribeShip,
   writeFuelLevel,
 } from './shipDoc';
+import type { FuelRecord } from './shipDoc';
 import { DEFAULT_PLANET_ID } from './stations';
 import {
   BURN_MS,
@@ -24,14 +26,17 @@ import {
   PHASE_STEP_RAD,
   TRIM_FUEL,
   TRIM_STEP_KM,
+  applyBurn,
   bindStationKeepingDoc,
   isBoltedIntoStation,
   isBurning,
   isOnStation,
   isOrbitTrim,
+  isTrimBurn,
   planTrim,
   readFuelDrawn,
   readOrbitTrim,
+  replayBurns,
   signedAngle,
   slotDriftPerHour,
   slotOffsetAt,
@@ -39,15 +44,16 @@ import {
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
-  writeOrbitTrim,
+  writeTrimBurn,
 } from './stationKeeping';
-import type { OrbitTrim, TrimContext, TrimDirection } from './stationKeeping';
+import type { OrbitTrim, TrimBurn, TrimContext, TrimDirection } from './stationKeeping';
 
 const SOV = DEFAULT_PLANET_ID;
 const STATION = { id: 'furlong-station', planetId: SOV, orbitSlot: 0 };
 const T0 = Date.UTC(2026, 8, 27, 5, 0, 0);
 const HOUR = 3600 * 1000;
 const DEG = Math.PI / 180;
+const SK = 'stationKeeping';
 
 const trim = (over: Partial<OrbitTrim> = {}): OrbitTrim => ({
   planetId: SOV,
@@ -59,6 +65,15 @@ const trim = (over: Partial<OrbitTrim> = {}): OrbitTrim => ({
   ...over,
 });
 
+const burnAt = (at: number, dir: TrimDirection, over: Partial<TrimBurn> = {}): TrimBurn => ({
+  planetId: SOV,
+  slot: 0,
+  dir,
+  at,
+  fuel: TRIM_FUEL,
+  ...over,
+});
+
 const ctx = (over: Partial<TrimContext> = {}): TrimContext => ({
   bolted: true,
   station: STATION,
@@ -66,16 +81,36 @@ const ctx = (over: Partial<TrimContext> = {}): TrimContext => ({
   commander: true,
   engines: 1,
   fuel: 100,
-  deficit: 0,
   now: T0,
   ...over,
 });
 
-/** Apply one burn and return its record (fails the test on a refusal). */
+/** Plan one burn and return the trim it leaves (fails the test on a refusal). */
 function burn(c: TrimContext, dir: TrimDirection): OrbitTrim {
   const plan = planTrim(c, dir);
   if (!plan.ok) throw new Error(`refused: ${plan.refusal}`);
   return plan.trim;
+}
+
+/** Fire one burn in the bound room the way the helm does: plan against what
+ *  the room reads now, then write the burn. */
+function press(dir: TrimDirection, now: number): TrimBurn {
+  const plan = planTrim(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), now }), dir);
+  if (!plan.ok) throw new Error(`refused: ${plan.refusal}`);
+  expect(writeTrimBurn(plan.burn)).toBe(true);
+  return plan.burn;
+}
+
+/** Bind a room doc the way main.ts does. */
+function bindRoom(doc: Y.Doc): void {
+  bindShipDoc(doc);
+  bindStationKeepingDoc(doc);
+}
+
+/** Two tabs trade everything they have. */
+function sync(a: Y.Doc, b: Y.Doc): void {
+  Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+  Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
 }
 
 describe('which face the helm shows', () => {
@@ -231,6 +266,11 @@ describe('planTrim — the stick', () => {
       .toEqual({ ok: false, refusal: 'at-limit' });
   });
 
+  it('plans the burn to log and the trim it leaves', () => {
+    const plan = planTrim(ctx({ now: T0 + 7 }), 'lower');
+    expect(plan).toEqual({ ok: true, burn: burnAt(T0 + 7, 'lower'), trim: applyBurn(null, burnAt(T0 + 7, 'lower')) });
+  });
+
   it('RAISE and LOWER step the radius and keep the station where it is', () => {
     const t1 = burn(ctx(), 'raise');
     expect(t1).toMatchObject({ planetId: SOV, slot: 0, dRadiusKm: TRIM_STEP_KM, at: T0, last: 'raise' });
@@ -269,7 +309,7 @@ describe('planTrim — the stick', () => {
     expect(planTrim(ctx({ trim: t, now }), 'raise').ok).toBe(true);
   });
 
-  it('a record for another planet or slot is ignored — the burn starts from the slot', () => {
+  it('a trim on another planet or slot is ignored — the burn starts from the slot', () => {
     for (const stray of [
       trim({ planetId: 'planet-aris', dRadiusKm: 10, dPhase: 1, at: T0 - BURN_MS }),
       trim({ slot: 2, dRadiusKm: 10, dPhase: 1, at: T0 - BURN_MS }),
@@ -279,9 +319,10 @@ describe('planTrim — the stick', () => {
     }
   });
 
-  it('writes the planet as orbits.ts resolves it', () => {
-    const t = burn(ctx({ station: { planetId: 'planet-nowhere', orbitSlot: 0 } }), 'raise');
-    expect(t.planetId).toBe(SOV);
+  it('names the planet as orbits.ts resolves it', () => {
+    const plan = planTrim(ctx({ station: { planetId: 'planet-nowhere', orbitSlot: 0 } }), 'raise');
+    expect(plan.ok && plan.burn.planetId).toBe(SOV);
+    expect(plan.ok && plan.trim.planetId).toBe(SOV);
   });
 
   it('wraps the phase offset into (−π, π]', () => {
@@ -290,18 +331,76 @@ describe('planTrim — the stick', () => {
     expect(wrapAngle(t.dPhase)).toBeCloseTo(Math.PI + PHASE_STEP_RAD / 2, 12);
   });
 
-  it('every planned record passes the doc guard', () => {
+  it('every planned burn and trim passes the doc guards', () => {
     let t: OrbitTrim | null = null;
     let now = T0;
     for (const dir of ['raise', 'ahead', 'lower', 'back', 'lower', 'lower'] as TrimDirection[]) {
-      t = burn(ctx({ trim: t, now }), dir);
-      expect(isOrbitTrim(t)).toBe(true);
+      const plan = planTrim(ctx({ trim: t, now }), dir);
+      if (!plan.ok) throw new Error(plan.refusal);
+      expect(isTrimBurn(plan.burn)).toBe(true);
+      expect(isOrbitTrim(plan.trim)).toBe(true);
+      t = plan.trim;
       now += BURN_MS + 30 * 60_000;
     }
   });
 });
 
-describe('the doc record', () => {
+describe('replaying the burns', () => {
+  const run = [
+    burnAt(T0, 'raise'),
+    burnAt(T0 + 20 * 60_000, 'ahead'),
+    burnAt(T0 + 45 * 60_000, 'raise'),
+    burnAt(T0 + HOUR, 'back'),
+    burnAt(T0 + 2 * HOUR, 'lower'),
+  ];
+
+  it('is each burn in time order, and the fuel of them all', () => {
+    let t: OrbitTrim | null = null;
+    for (const b of run) t = applyBurn(t, b);
+    expect(replayBurns(run)).toEqual({ trim: t, fuelDrawn: run.length * TRIM_FUEL });
+    expect(t).toMatchObject({ dRadiusKm: TRIM_STEP_KM, at: T0 + 2 * HOUR, last: 'lower' });
+  });
+
+  it('comes out the same whatever order the burns arrive in', () => {
+    const want = replayBurns(run);
+    expect(replayBurns([...run].reverse())).toEqual(want);
+    expect(replayBurns([run[3], run[0], run[4], run[2], run[1]])).toEqual(want);
+    // Two burns stamped the same millisecond still order the same way everywhere.
+    const tie = [burnAt(T0, 'raise'), burnAt(T0, 'ahead'), burnAt(T0, 'raise', { slot: 1 })];
+    expect(replayBurns([...tie].reverse())).toEqual(replayBurns(tie));
+  });
+
+  it('a burn past the band changes nothing but still pays', () => {
+    const start = trim({ dRadiusKm: MAX_TRIM_KM - TRIM_STEP_KM, at: T0 - HOUR });
+    const out = replayBurns([burnAt(T0, 'raise'), burnAt(T0 + 1_000, 'raise')], start, 5);
+    expect(out.trim).toEqual(applyBurn(start, burnAt(T0, 'raise')));
+    expect(out.trim!.dRadiusKm).toBe(MAX_TRIM_KM);
+    expect(out.fuelDrawn).toBe(5 + 2 * TRIM_FUEL);
+  });
+
+  it('a burn that arrives late never makes an earlier one free: the fuel only grows', () => {
+    const start = trim({ dRadiusKm: MAX_TRIM_KM - TRIM_STEP_KM, at: T0 - HOUR });
+    const later = burnAt(T0 + 1_000, 'raise');
+    const late = burnAt(T0, 'raise');
+    expect(replayBurns([later], start).trim!.at).toBe(later.at);
+    // The late one takes the last step, so the later one is now past the band.
+    const both = replayBurns([later, late], start);
+    expect(both.trim!.at).toBe(late.at);
+    expect(both.fuelDrawn).toBe(2 * TRIM_FUEL);
+  });
+
+  it('a burn on another planet or slot starts from its slot, and the next one back starts over', () => {
+    const out = replayBurns([
+      burnAt(T0, 'raise'),
+      burnAt(T0 + 1_000, 'raise', { planetId: 'planet-aris', slot: 3 }),
+      burnAt(T0 + 2_000, 'lower'),
+    ]);
+    expect(out.trim).toMatchObject({ planetId: SOV, slot: 0, dRadiusKm: -TRIM_STEP_KM });
+    expect(out.fuelDrawn).toBe(3 * TRIM_FUEL);
+  });
+});
+
+describe('the burn log in the room doc', () => {
   let doc: Y.Doc;
   beforeEach(() => {
     doc = new Y.Doc();
@@ -311,16 +410,16 @@ describe('the doc record', () => {
   it('round-trips a burn and notifies subscribers', () => {
     let calls = 0;
     const off = subscribeStationKeeping(() => { calls++; });
-    const t = trim({ dRadiusKm: 4, dPhase: 0.01 });
-    expect(writeOrbitTrim(t)).toBe(true);
-    expect(readOrbitTrim()).toEqual(t);
+    const b = burnAt(T0, 'raise');
+    expect(writeTrimBurn(b)).toBe(true);
+    expect(readOrbitTrim()).toEqual(applyBurn(null, b));
+    expect(readFuelDrawn()).toBe(TRIM_FUEL);
     expect(calls).toBeGreaterThan(0);
     off();
   });
 
-  it('a burn\'s fuel rides its trim record: one write, and the tank reads one burn less', () => {
+  it('writes each burn once, under its own key, with its fuel: the tank reads one burn less', () => {
     bindShipDoc(doc);
-    bindStationKeepingDoc(doc);
     writeFuelLevel(10, 100);
     const fuelRecord = doc.getMap('ship').get('fuel');
     let gauge = 0;
@@ -329,10 +428,9 @@ describe('the doc record', () => {
     doc.on('afterTransaction', (tr: Y.Transaction) => {
       seen.push([...tr.changed.keys()].map((m) => ((m as unknown) === doc.getMap('ship') ? 'ship' : 'keep')));
     });
-    const t = burn(ctx({ fuel: readFuelLevel(), deficit: fuelDrawDeficit() }), 'raise');
-    expect(t.fuelDrawn).toBe(TRIM_FUEL);
-    expect(writeOrbitTrim(t)).toBe(true);
+    const b = press('raise', T0);
     expect(seen).toEqual([['keep']]);
+    expect([...doc.getMap('stationKeeping').entries()]).toEqual([[`burn:${doc.clientID}:${T0}`, b]]);
     expect(doc.getMap('ship').get('fuel')).toBe(fuelRecord);
     expect(readFuelDrawn()).toBe(TRIM_FUEL);
     expect(readFuelLevel()).toBe(10 - TRIM_FUEL);
@@ -342,14 +440,23 @@ describe('the doc record', () => {
     // A later REFUEL or DEPART folds the draws it saw into the level, once.
     writeFuelLevel(readFuelLevel() - 3, 100);
     expect(readFuelLevel()).toBe(10 - TRIM_FUEL - 3);
-    const next = burn(ctx({ trim: t, fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: T0 + BURN_MS }), 'lower');
-    writeOrbitTrim(next);
+    press('lower', T0 + BURN_MS);
     expect(readFuelLevel()).toBe(10 - 2 * TRIM_FUEL - 3);
+    expect(readOrbitTrim()).toMatchObject({ dRadiusKm: 0, last: 'lower' });
   });
 
-  it('reads nothing hostile', () => {
+  it('refuses a malformed burn, and a second one from this tab in the same millisecond', () => {
+    expect(writeTrimBurn(burnAt(T0, 'raise', { fuel: 0 }))).toBe(false);
+    expect(writeTrimBurn(burnAt(T0, 'raise', { dir: 'sideways' as TrimDirection }))).toBe(false);
+    expect(writeTrimBurn(burnAt(T0, 'raise'))).toBe(true);
+    expect(writeTrimBurn(burnAt(T0, 'lower'))).toBe(false);
+    expect(readOrbitTrim()).toMatchObject({ dRadiusKm: TRIM_STEP_KM });
+    expect(readFuelDrawn()).toBe(TRIM_FUEL);
+  });
+
+  it('skips anything hostile, on the record from before the log and in the log', () => {
     const map = doc.getMap('stationKeeping');
-    const hostile: unknown[] = [
+    const hostileTrims: unknown[] = [
       null,
       'trim',
       { ...trim(), dRadiusKm: MAX_TRIM_KM + 1 },
@@ -369,31 +476,67 @@ describe('the doc record', () => {
       { ...trim(), fuelDrawn: 1e13 },
       { ...trim(), fuelDrawn: '3' },
     ];
-    for (const value of hostile) {
+    for (const value of hostileTrims) {
       map.set('trim', value);
       expect(readOrbitTrim()).toBeNull();
       expect(readFuelDrawn()).toBe(0);
     }
+    map.delete('trim');
+    const hostileBurns: unknown[] = [
+      null,
+      'burn',
+      { ...burnAt(T0, 'raise'), fuel: 0 },
+      { ...burnAt(T0, 'raise'), fuel: -1 },
+      { ...burnAt(T0, 'raise'), fuel: Number.NaN },
+      { ...burnAt(T0, 'raise'), fuel: 1e6 },
+      { ...burnAt(T0, 'raise'), fuel: '1' },
+      { ...burnAt(T0, 'raise'), dir: 'sideways' },
+      { ...burnAt(T0, 'raise'), at: 0 },
+      { ...burnAt(T0, 'raise'), at: Number.POSITIVE_INFINITY },
+      { ...burnAt(T0, 'raise'), slot: -1 },
+      { ...burnAt(T0, 'raise'), planetId: '' },
+    ];
+    hostileBurns.forEach((value, i) => map.set(`burn:hostile:${i}`, value));
+    // A well-formed burn under a key outside the log is not a burn either.
+    map.set('notaburn', burnAt(T0, 'raise'));
+    expect(readOrbitTrim()).toBeNull();
+    expect(readFuelDrawn()).toBe(0);
   });
 
-  it('strips unknown fields on read and refuses to write a malformed record', () => {
-    doc.getMap('stationKeeping').set('trim', { ...trim(), extra: 'x'.repeat(10) });
+  it('strips unknown fields on read', () => {
+    doc.getMap('stationKeeping').set('trim', { ...trim(), fuelDrawn: 2, extra: 'x'.repeat(10) });
     expect(readOrbitTrim()).toEqual(trim());
-    expect(writeOrbitTrim({ ...trim(), dRadiusKm: 99 })).toBe(false);
-    expect(readOrbitTrim()).toEqual(trim());
+    doc.getMap('stationKeeping').set('burn:peer:1', { ...burnAt(T0 + BURN_MS, 'ahead'), extra: 'x'.repeat(10) });
+    expect(readOrbitTrim()).toEqual(applyBurn(trim(), burnAt(T0 + BURN_MS, 'ahead')));
+    expect(readFuelDrawn()).toBe(2 + TRIM_FUEL);
+  });
+
+  it('a room trimmed before the log starts from its record, and its fuel still counts', () => {
+    bindShipDoc(doc);
+    const before = trim({ dRadiusKm: 4, dPhase: 0.01, fuelDrawn: 3 });
+    doc.getMap('stationKeeping').set('trim', before);
+    const { fuelDrawn: _fuel, ...orbit } = before;
+    expect(readOrbitTrim()).toEqual(orbit);
+    expect(readFuelDrawn()).toBe(3);
+    writeFuelLevel(20, 100);
+    press('raise', T0 + BURN_MS);
+    expect(readOrbitTrim()).toMatchObject({ dRadiusKm: 6, last: 'raise' });
+    expect(readFuelDrawn()).toBe(3 + TRIM_FUEL);
+    expect(readFuelLevel()).toBe(20 - TRIM_FUEL);
   });
 
   it('reads null from a destroyed doc', () => {
-    writeOrbitTrim(trim());
+    writeTrimBurn(burnAt(T0, 'raise'));
     doc.destroy();
     expect(readOrbitTrim()).toBeNull();
-    expect(writeOrbitTrim(trim())).toBe(false);
+    expect(readFuelDrawn()).toBe(0);
+    expect(writeTrimBurn(burnAt(T0 + BURN_MS, 'raise'))).toBe(false);
   });
 });
 
 describe('two owners burning at once', () => {
-  it('converge on one burn and that burn\'s debit: nothing lands free', () => {
-    // Both clients start from the same room state: 5 fuel, no trim yet.
+  it('both burns land and both pay, the same on every replica', () => {
+    // Both tabs start from the same room state: 5 fuel, no trim yet.
     const a = new Y.Doc();
     const b = new Y.Doc();
     bindShipDoc(a);
@@ -401,31 +544,51 @@ describe('two owners burning at once', () => {
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
 
     // Each burns without having seen the other's burn.
-    const fire = (doc: Y.Doc, dir: TrimDirection, now: number): OrbitTrim => {
-      bindShipDoc(doc);
-      bindStationKeepingDoc(doc);
-      const t = burn(ctx({ fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now }), dir);
-      expect(writeOrbitTrim(t)).toBe(true);
-      return t;
-    };
-    const ta = fire(a, 'raise', T0);
-    const tb = fire(b, 'ahead', T0 + 40);
-
-    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
-    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    bindRoom(a);
+    const ba = press('raise', T0);
+    bindRoom(b);
+    const bb = press('ahead', T0 + 40);
+    sync(a, b);
 
     const settled = (doc: Y.Doc) => {
-      bindShipDoc(doc);
-      bindStationKeepingDoc(doc);
+      bindRoom(doc);
       return { trim: readOrbitTrim(), fuel: readFuelLevel() };
     };
     const sa = settled(a);
-    const sb = settled(b);
-    // Both replicas agree, the trim is one whole burn (not a blend of two),
-    // and exactly one burn's fuel is gone.
-    expect(sa).toEqual(sb);
-    expect([ta, tb]).toContainEqual(sa.trim);
-    expect(sa.fuel).toBe(5 - TRIM_FUEL);
+    expect(settled(b)).toEqual(sa);
+    expect(sa.trim).toEqual(replayBurns([ba, bb]).trim);
+    expect(sa.trim).toMatchObject({ dRadiusKm: TRIM_STEP_KM, last: 'ahead' });
+    expect(sa.fuel).toBe(5 - 2 * TRIM_FUEL);
+  });
+
+  it('a burn from a tab that was offline never rolls the room\'s burns back', () => {
+    // Copilot's review of #173: with one record per room, the offline tab's
+    // record (written from the older state) could win the merge and take
+    // the online burns, and their fuel, back with it.
+    for (const [online, offline] of [[900, 100], [100, 900]]) {
+      const a = new Y.Doc();
+      const x = new Y.Doc();
+      a.clientID = online;
+      x.clientID = offline;
+      bindRoom(a);
+      writeFuelLevel(50, 100);
+      let now = T0;
+      for (let i = 0; i < 2; i++, now += BURN_MS) press('raise', now);
+      Y.applyUpdate(x, Y.encodeStateAsUpdate(a));
+      // The room burns on while tab X is offline...
+      for (let i = 0; i < 3; i++, now += BURN_MS) press('raise', now);
+      expect(readFuelLevel()).toBe(50 - 5 * TRIM_FUEL);
+      // ...and X, still seeing two burns, fires one of its own.
+      bindRoom(x);
+      press('ahead', now);
+      sync(a, x);
+      for (const doc of [a, x]) {
+        bindRoom(doc);
+        expect(readOrbitTrim()).toMatchObject({ dRadiusKm: 5 * TRIM_STEP_KM, last: 'ahead' });
+        expect(readFuelDrawn()).toBe(6 * TRIM_FUEL);
+        expect(readFuelLevel()).toBe(50 - 6 * TRIM_FUEL);
+      }
+    }
   });
 });
 
@@ -438,21 +601,17 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     const b = new Y.Doc();
     a.clientID = burner;
     b.clientID = other;
-    bindShipDoc(a);
-    bindStationKeepingDoc(a);
+    bindRoom(a);
     writeFuelLevel(50, 100);
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
 
-    writeOrbitTrim(burn(ctx({ fuel: readFuelLevel(), deficit: fuelDrawDeficit() }), 'raise'));
-    bindShipDoc(b);
-    bindStationKeepingDoc(b);
+    press('raise', T0);
+    bindRoom(b);
     writeFuelLevel(otherWrite(readFuelLevel()), 100);
 
-    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
-    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    sync(a, b);
     const settled = (doc: Y.Doc) => {
-      bindShipDoc(doc);
-      bindStationKeepingDoc(doc);
+      bindRoom(doc);
       return { fuel: readFuelLevel(), trimmed: readOrbitTrim() !== null };
     };
     const sa = settled(a);
@@ -473,79 +632,106 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     expect(race(100, 900, refuel)).toBe(100 - TRIM_FUEL);
   });
 
-  it('a meter that went back neither refunds fuel nor frees or overcharges a burn', () => {
-    const a = new Y.Doc();
-    const b = new Y.Doc();
-    bindShipDoc(a);
-    bindStationKeepingDoc(a);
-    // The level was written after 10 fuel of burns; then an older trim
-    // record (4 drawn) won a merge.
-    a.getMap('ship').set('fuel', { level: 40, meter: 10 });
-    a.getMap('stationKeeping').set('trim', trim({ fuelDrawn: 4 }));
-    expect(readFuelLevel()).toBe(40);
-    expect(fuelDrawDeficit()).toBe(10 - 4);
-    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
-
-    // Tab A burns while tab B departs on 12 fuel against the same meter.
-    writeOrbitTrim(burn(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: T0 + BURN_MS }), 'raise'));
-    expect(readFuelLevel()).toBe(40 - TRIM_FUEL);
-    bindShipDoc(b);
-    bindStationKeepingDoc(b);
-    writeFuelLevel(readFuelLevel() - 12, 100);
-
-    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
-    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
-    expect(readFuelLevel()).toBe(40 - 12 - TRIM_FUEL);
-    bindShipDoc(a);
-    bindStationKeepingDoc(a);
-    expect(readFuelLevel()).toBe(40 - 12 - TRIM_FUEL);
-  });
-
   it('a burn comes out of the tanks fitted now, not fuel stranded by a removed tank', () => {
     const doc = new Y.Doc();
-    bindShipDoc(doc);
-    bindStationKeepingDoc(doc);
+    bindRoom(doc);
     writeFuelLevel(100, 100);
     // A tank comes off: the other 50 is stranded, not burnable.
     const fuel = clampFuelToCapacity(readFuelLevel(50), 50);
     expect(fuel).toBe(50);
-    writeOrbitTrim(burn(ctx({ fuel, deficit: fuelDrawDeficit() }), 'raise'));
+    const plan = planTrim(ctx({ fuel }), 'raise');
+    expect(plan.ok && writeTrimBurn(plan.burn)).toBe(true);
     expect(clampFuelToCapacity(readFuelLevel(50), 50)).toBe(50 - TRIM_FUEL);
     // The tank goes back on, and its fuel with it.
     expect(clampFuelToCapacity(readFuelLevel(100), 100)).toBe(100 - TRIM_FUEL);
   });
+});
 
-  it('records from before the meter read as nothing drawn', () => {
+describe('the fuel record: one reading per meter', () => {
+  const fuelRecord = (doc: Y.Doc) => doc.getMap('ship').get('fuel') as FuelRecord;
+
+  it('a room with no meters reads its level as written', () => {
     const doc = new Y.Doc();
-    bindShipDoc(doc);
-    bindStationKeepingDoc(doc);
+    bindRoom(doc);
     doc.getMap('ship').set('fuel', { level: 25 });
     doc.getMap('stationKeeping').set('trim', trim());
     expect(readFuelDrawn()).toBe(0);
     expect(readFuelLevel()).toBe(25);
-    expect(fuelDrawDeficit()).toBe(0);
+    expect(fuelDrawDeficit(SK)).toBe(0);
+    writeFuelLevel(20, 100);
+    expect(fuelRecord(doc)).toEqual({ level: 20 });
   });
 
-  it('a hostile meter reading on the fuel record counts as none', () => {
+  it('a level write keeps each meter\'s reading, and their sum for builds from before them', () => {
     const doc = new Y.Doc();
-    bindShipDoc(doc);
-    bindStationKeepingDoc(doc);
+    bindRoom(doc);
+    writeFuelLevel(30, 100);
+    press('raise', T0);
+    press('raise', T0 + BURN_MS);
+    writeFuelLevel(readFuelLevel(), 100);
+    expect(fuelRecord(doc)).toEqual({ level: 30 - 2 * TRIM_FUEL, meters: { [SK]: 2 * TRIM_FUEL }, meter: 2 * TRIM_FUEL });
+    expect(readFuelLevel()).toBe(30 - 2 * TRIM_FUEL);
+  });
+
+  it('a record from before per-meter readings is read against their sum, and owes nothing', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    doc.getMap('stationKeeping').set('trim', trim({ fuelDrawn: 12 }));
+    doc.getMap('ship').set('fuel', { level: 40, meter: 10 });
+    expect(readFuelLevel()).toBe(40 - 2);
+    // Its one reading cannot say whose meter went back.
+    doc.getMap('ship').set('fuel', { level: 40, meter: 15 });
+    expect(readFuelLevel()).toBe(40);
+    expect(fuelDrawDeficit(SK)).toBe(0);
+    // The next level write keeps a reading per meter.
+    writeFuelLevel(readFuelLevel(), 100);
+    expect(fuelRecord(doc)).toEqual({ level: 40, meters: { [SK]: 12 }, meter: 12 });
+    press('raise', T0 + BURN_MS);
+    expect(readFuelLevel()).toBe(40 - TRIM_FUEL);
+  });
+
+  it('a hostile reading on the fuel record counts as none', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
     doc.getMap('stationKeeping').set('trim', trim({ fuelDrawn: 3 }));
-    for (const meter of [1e300, Number.POSITIVE_INFINITY, Number.NaN, -5, '7']) {
-      doc.getMap('ship').set('fuel', { level: 25, meter });
+    const hostile: Record<string, unknown>[] = [
+      { meter: 1e300 }, { meter: Number.POSITIVE_INFINITY }, { meter: Number.NaN }, { meter: -5 }, { meter: '7' },
+      { meters: { [SK]: 1e300 } }, { meters: { [SK]: -5 } }, { meters: { [SK]: '7' } }, { meters: { [SK]: Number.NaN } },
+      { meters: 'x' }, { meters: [3] }, { meters: null }, { meters: { 'not a name': 3 } },
+    ];
+    for (const fields of hostile) {
+      doc.getMap('ship').set('fuel', { level: 25, ...fields });
       expect(readFuelLevel()).toBe(25 - 3);
-      expect(fuelDrawDeficit()).toBe(0);
+      expect(fuelDrawDeficit(SK)).toBe(0);
     }
+  });
+
+  it('keeps at most 16 readings, this build\'s meters first', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    doc.getMap('stationKeeping').set('trim', trim({ fuelDrawn: 3 }));
+    const junk = Object.fromEntries(Array.from({ length: 20 }, (_, i) => [`junk${i}`, 1]));
+    doc.getMap('ship').set('fuel', { level: 25, meters: junk });
+    writeFuelLevel(readFuelLevel(), 100);
+    const { meters } = fuelRecord(doc);
+    expect(Object.keys(meters!)).toHaveLength(16);
+    expect(meters![SK]).toBe(3);
+    expect(readFuelLevel()).toBe(22);
+  });
+
+  it('refuses a meter name the record could not keep', () => {
+    expect(() => setFuelDrawMeter('not a name', null)).toThrow();
+    expect(() => setFuelDrawMeter('__proto__', null)).toThrow();
   });
 });
 
 describe('another consumer drawing through its own meter (a station move, say)', () => {
-  // It keeps its own running total under its own key; the tank's meter is
-  // the sum of every consumer's total.
+  // It keeps its own running total under one key that each draw rewrites
+  // whole, so an older total can win a merge; the tank reads each meter
+  // against its own recorded reading.
   const OTHER = 'test-other';
   const bindAll = (doc: Y.Doc) => {
-    bindShipDoc(doc);
-    bindStationKeepingDoc(doc);
+    bindRoom(doc);
     const map = doc.getMap('other');
     setFuelDrawMeter(OTHER, {
       read: () => (map.get('drawn') as number | undefined) ?? 0,
@@ -556,14 +742,12 @@ describe('another consumer drawing through its own meter (a station move, say)',
       },
     });
   };
-  /** The other consumer draws `amount` the way a trim burn does: its own
-   *  total, plus what the meter owes the level, plus the draw. */
+  /** The other consumer draws `amount`: its own total, plus what its own
+   *  meter owes the level, plus the draw. */
   const otherDraws = (doc: Y.Doc, amount: number) => {
     const map = doc.getMap('other');
-    map.set('drawn', ((map.get('drawn') as number | undefined) ?? 0) + fuelDrawDeficit() + amount);
+    map.set('drawn', ((map.get('drawn') as number | undefined) ?? 0) + fuelDrawDeficit(OTHER) + amount);
   };
-  const trimBurn = () =>
-    writeOrbitTrim(burn(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: Date.now() }), 'raise'));
   afterEach(() => setFuelDrawMeter(OTHER, null));
 
   it('a trim burn after its draw counts only the burn', () => {
@@ -572,9 +756,11 @@ describe('another consumer drawing through its own meter (a station move, say)',
     writeFuelLevel(50, 100);
     otherDraws(doc, 7);
     expect(readFuelLevel()).toBe(50 - 7);
-    trimBurn();
+    press('raise', T0);
     expect(readFuelDrawn()).toBe(TRIM_FUEL);
     expect(readFuelLevel()).toBe(50 - 7 - TRIM_FUEL);
+    writeFuelLevel(readFuelLevel(), 100);
+    expect((doc.getMap('ship').get('fuel') as FuelRecord).meters).toEqual({ [SK]: TRIM_FUEL, [OTHER]: 7 });
   });
 
   it('a trim burn and its draw at once from two tabs both come off, whichever tab Yjs favours', () => {
@@ -587,16 +773,63 @@ describe('another consumer drawing through its own meter (a station move, say)',
       writeFuelLevel(50, 100);
       Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
 
-      trimBurn();
+      press('raise', T0);
       bindAll(b);
       otherDraws(b, 7);
 
-      Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
-      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      sync(a, b);
       expect(readFuelLevel()).toBe(50 - 7 - TRIM_FUEL);
       bindAll(a);
       expect(readFuelLevel()).toBe(50 - 7 - TRIM_FUEL);
     }
+  });
+
+  it('its meter going back neither refunds fuel nor lets its next draw go free', () => {
+    const doc = new Y.Doc();
+    bindAll(doc);
+    // The level was written after 10 fuel of its draws; then an older total
+    // (4) won a merge.
+    doc.getMap('ship').set('fuel', { level: 40, meters: { [OTHER]: 10 } });
+    doc.getMap('other').set('drawn', 4);
+    expect(readFuelLevel()).toBe(40);
+    expect(fuelDrawDeficit(OTHER)).toBe(10 - 4);
+    otherDraws(doc, 7);
+    expect(readFuelLevel()).toBe(40 - 7);
+    expect(fuelDrawDeficit(OTHER)).toBe(0);
+  });
+
+  it('only the consumer whose meter went back owes it, so a trim burn beside it pays just the burn', () => {
+    // Copilot's review of #173: with one reading for all meters, the trim
+    // burn and the other draw each added the whole catch-up, and the tank
+    // paid it twice.
+    for (const [burner, other] of [[900, 100], [100, 900]]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      a.clientID = burner;
+      b.clientID = other;
+      bindAll(a);
+      a.getMap('ship').set('fuel', { level: 40, meters: { [OTHER]: 10 } });
+      a.getMap('other').set('drawn', 4);
+      expect(fuelDrawDeficit(SK)).toBe(0);
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+
+      press('raise', T0);
+      bindAll(b);
+      otherDraws(b, 7);
+
+      sync(a, b);
+      expect(readFuelLevel()).toBe(40 - TRIM_FUEL - 7);
+      bindAll(a);
+      expect(readFuelLevel()).toBe(40 - TRIM_FUEL - 7);
+    }
+  });
+
+  it('a meter only another build draws through keeps its recorded reading', () => {
+    const doc = new Y.Doc();
+    bindAll(doc);
+    doc.getMap('ship').set('fuel', { level: 40, meters: { stationMove: 30 } });
+    writeFuelLevel(35, 100);
+    expect((doc.getMap('ship').get('fuel') as FuelRecord).meters).toEqual({ stationMove: 30 });
   });
 });
 

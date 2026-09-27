@@ -816,3 +816,14 @@ describe('flight records written on another install', () => {
     }
   });
 });
+
+describe('flight times a peer wrote', () => {
+  it('refuses unsafe, far-future or endless flights', () => {
+    const now = Date.now();
+    const rec = { status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit' };
+    expect(isFlightRecord({ ...rec, departedAt: now, etaAt: now + 60_000 })).toBe(true);
+    expect(isFlightRecord({ ...rec, departedAt: 1, etaAt: Number.MAX_VALUE })).toBe(false);
+    expect(isFlightRecord({ ...rec, departedAt: now, etaAt: now + 3 * 24 * 3600 * 1000 })).toBe(false);
+    expect(isFlightRecord({ ...rec, departedAt: 0.5, etaAt: 2 })).toBe(false);
+  });
+});

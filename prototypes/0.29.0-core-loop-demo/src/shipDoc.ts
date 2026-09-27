@@ -10,7 +10,7 @@
  *      derived (tanks × TANK_CAPACITY, never stored); level is doc truth so a
  *      REFUEL on one client moves the gauge on every other, and a DEPART debit
  *      is seen by everyone before the starfield swap. Station keeping's trim
- *      burns draw from the same tanks through a meter in their own record
+ *      burns draw from the same tanks through a meter over their own records
  *      (setFuelDrawMeter), so a burn never races a REFUEL or DEPART for it.
  *   - `flight`     — the state machine (docked / undocking / in-flight /
  *      redocking) that spaceship-conversion-plan.md §1.4 rules is "a record,
@@ -130,10 +130,13 @@ export interface FlightRecord {
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
  *  stored — so removing a tank silently caps the effective level on read.
- *  `meter` is the draw meter's reading (setFuelDrawMeter) when the level was
- *  written; absent means 0. */
+ *  `meters` holds each draw meter's reading (setFuelDrawMeter) when the level
+ *  was written, by the meter's name; a meter it leaves out read 0. `meter` is
+ *  those readings added up: all a record from before per-meter readings
+ *  has, and what a build from before them reads. */
 export interface FuelRecord {
   level: number;
+  meters?: Record<string, number>;
   meter?: number;
 }
 
@@ -212,8 +215,8 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   // stale destinationId (a docked record just after arrival, for example) — we
   // strip in `sanitizeFlightRecord`, but the SHAPE is legal either way.
   if (r.destinationId !== undefined && !isBoundedString(r.destinationId)) return false;
-  if (r.departedAt !== undefined && !(typeof r.departedAt === 'number' && Number.isFinite(r.departedAt))) return false;
-  if (r.etaAt !== undefined && !(typeof r.etaAt === 'number' && Number.isFinite(r.etaAt))) return false;
+  if (r.departedAt !== undefined && !isFlightTime(r.departedAt)) return false;
+  if (r.etaAt !== undefined && !isFlightTime(r.etaAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -222,9 +225,23 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
     if (r.status === 'in-flight') {
       if (r.departedAt === undefined || r.etaAt === undefined) return false;
       if (!(r.etaAt > r.departedAt)) return false;
+      // A flight longer than any launch-window wait plus transfer would hold
+      // the ship in flight (and so out of DEPART) for good.
+      if (r.etaAt - r.departedAt > MAX_FLIGHT_AHEAD_MS) return false;
     }
   }
   return true;
+}
+
+/** Longest a flight may run, and how far ahead of now any of its times may
+ *  lie: the longest launch-window wait plus the longest transfer between two
+ *  slots (orbits.ts, 60x clock) come to well under a day of real time. */
+export const MAX_FLIGHT_AHEAD_MS = 2 * 24 * 3600 * 1000;
+
+/** A peer-written flight time: a whole ms epoch, no later than
+ *  MAX_FLIGHT_AHEAD_MS from now (a far-future one would never arrive). */
+function isFlightTime(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= Date.now() + MAX_FLIGHT_AHEAD_MS;
 }
 
 function isFuelRecord(v: unknown): v is FuelRecord {
@@ -264,20 +281,35 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
 // `fuel.level` is written whole, and Yjs keeps one of two concurrent writes to
 // a key. REFUEL and DEPART each write the level from the gauge they read. A
 // station-keeping burn fired at the same moment from another tab (or an
-// offline one) writes its own trim record too, and if it ALSO wrote the level,
-// one of the two debits would vanish when the tabs sync. So a consumer that
-// keeps its own record draws through a METER there instead: a running total
-// of the fuel IT has drawn, raised in the same write as the thing it paid
-// for. The tank's meter is the SUM of every consumer's total — each total
-// lives under its own key, so two consumers drawing at once both count, where
-// the larger of the two would drop one. The tank reads level − (meter − the
-// reading the level was written against), and every level write records the
-// reading it saw, so draws the writer had seen are folded into the level and
-// draws it had not seen still come off.
+// offline one) writes its own record too, and if it ALSO wrote the level, one
+// of the two debits would vanish when the tabs sync. So a consumer that keeps
+// its own records draws through a METER there instead: a running total of the
+// fuel IT has drawn, raised in the same write as the thing it paid for. Each
+// meter has its own name, and every level write records each meter's reading
+// beside the level, so the draws the writer had seen are folded into the
+// level; the tank reads the level less what each meter has drawn past its own
+// recorded reading, so draws the writer had not seen still come off, and two
+// consumers drawing at once both count.
+//
+// A total kept under one key that each draw rewrites whole can go BACK: an
+// offline tab's older total wins the merge. The draws it lost were folded
+// into the level already, so a meter below its recorded reading takes nothing
+// off (no refund), and that consumer's next draw adds what its own meter owes
+// (fuelDrawDeficit) so it does not go free either. Only the consumer whose
+// meter went back owes it: a shared catch-up would be paid again by every
+// consumer that drew. Station keeping's meter never goes back — each burn is
+// its own entry (stationKeeping.writeTrimBurn).
 
 /** A meter reads at most this: a running fuel total stays well inside exact
  *  integers, and a hostile reading past it counts as none. */
 export const FUEL_METER_MAX = 1e12;
+
+/** A meter's name, which the fuel record keys its reading by. */
+const METER_NAME = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
+
+/** A fuel record keeps at most this many meters' readings: this build's
+ *  meters first, then any another build draws through. */
+const MAX_METERS = 16;
 
 /** One consumer's running total of the fuel it has drawn, kept in its own
  *  record. */
@@ -288,10 +320,11 @@ export interface FuelDrawMeter {
 
 const drawMeters = new Map<string, { meter: FuelDrawMeter; unsubscribe: () => void }>();
 
-/** Install one consumer's draw meter under its name (null removes it). The
- *  tank's meter is the sum of them all. A meter change moves the gauge, so
- *  ship subscribers hear about it too. */
+/** Install one consumer's draw meter under its name (null removes it): a
+ *  letter, then up to 63 letters, digits, `-` or `_`. A meter change moves
+ *  the gauge, so ship subscribers hear about it too. */
 export function setFuelDrawMeter(name: string, meter: FuelDrawMeter | null): void {
+  if (!METER_NAME.test(name)) throw new Error(`[ship] not a fuel draw meter name: ${JSON.stringify(name)}`);
   drawMeters.get(name)?.unsubscribe();
   drawMeters.delete(name);
   if (meter) drawMeters.set(name, { meter, unsubscribe: meter.subscribe(() => notify()) });
@@ -302,31 +335,55 @@ function meterValue(v: unknown): number {
   return typeof v === 'number' && v > 0 && v <= FUEL_METER_MAX ? v : 0;
 }
 
-/** The tank's meter: every consumer's total, added up. */
+/** Every meter's reading, added up: what a record from before per-meter
+ *  readings was written against. */
 function meterReading(): number {
   let total = 0;
   for (const { meter } of drawMeters.values()) total += meterValue(meter.read());
   return total;
 }
 
-/** The meter reading a fuel record was written against. */
-function meterBase(rec: FuelRecord): number {
-  return meterValue(rec.meter);
+/** The readings a fuel record was written against, by meter name, or null
+ *  for a record from before per-meter readings. Names and values are checked
+ *  as they come off the wire, and at most MAX_METERS count. */
+function recordedMeters(rec: FuelRecord): Map<string, number> | null {
+  const raw: unknown = rec.meters;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const out = new Map<string, number>();
+  for (const [name, v] of Object.entries(raw)) {
+    if (out.size >= MAX_METERS) break;
+    const value = meterValue(v);
+    if (value > 0 && METER_NAME.test(name)) out.set(name, value);
+  }
+  return out;
 }
 
-/** The meter's reading, but never below the one the level was written
- *  against: what a level write records. */
-function fuelDrawFloor(): number {
+/** What the meters have drawn since the level was written: each meter past
+ *  its own recorded reading. A record from before per-meter readings is read
+ *  against their sum. */
+function drawnSince(rec: FuelRecord): number {
+  const recorded = recordedMeters(rec);
+  if (!recorded) return Math.max(0, meterReading() - meterValue(rec.meter));
+  let drawn = 0;
+  for (const [name, { meter }] of drawMeters) {
+    drawn += Math.max(0, meterValue(meter.read()) - (recorded.get(name) ?? 0));
+  }
+  return drawn;
+}
+
+/** How far meter `name` has fallen below its reading when the level was
+ *  written: 0 unless an older record of that consumer won a merge. The
+ *  consumer drawing `amount` writes its own total + fuelDrawDeficit(name) +
+ *  amount, so its meter going back neither refunds fuel nor lets its next
+ *  draw go free. A record from before per-meter readings cannot say whose
+ *  meter went back, so it owes nothing. */
+export function fuelDrawDeficit(name: string): number {
   const raw = docAlive() ? shipMap!.get('fuel') : undefined;
-  return Math.max(meterReading(), isFuelRecord(raw) ? meterBase(raw) : 0);
-}
-
-/** How far the meter has fallen below the reading the level was written
- *  against — 0 unless an older record won a merge. A consumer drawing
- *  `amount` writes its own total + fuelDrawDeficit() + amount, so a meter
- *  that went back neither refunds fuel nor lets the next draw go free. */
-export function fuelDrawDeficit(): number {
-  return fuelDrawFloor() - meterReading();
+  if (!isFuelRecord(raw)) return 0;
+  const recorded = recordedMeters(raw);
+  if (!recorded) return 0;
+  const entry = drawMeters.get(name);
+  return Math.max(0, (recorded.get(name) ?? 0) - (entry ? meterValue(entry.meter.read()) : 0));
 }
 
 // ── Reads (untrusted; every path degrades to defaults, never throws) ─────────
@@ -342,11 +399,10 @@ export function readFuelLevel(capacity = Number.POSITIVE_INFINITY): number {
   const raw = shipMap!.get('fuel');
   if (!isFuelRecord(raw)) return 0;
   const held = capacity >= 0 ? Math.min(raw.level, capacity) : 0;
-  const drawnSince = Math.max(0, meterReading() - meterBase(raw));
   // Negative-fuel guard belongs here too — a peer could write -Infinity and
   // every reader would fail-open otherwise. Clamp to [0, +∞) at the boundary;
   // capacity clamp is a caller responsibility (see clampFuelToCapacity).
-  return Math.max(0, held - drawnSince);
+  return Math.max(0, held - drawnSince(raw));
 }
 
 /** Fuel level clamped against the CURRENT derived capacity (tanks removed
@@ -369,17 +425,30 @@ export function readFlightRecord(): FlightRecord {
 // ── Writes (owner-gated at the CALLER; single-writer per key/phase) ──────────
 
 /** Publish the fuel level after clamping to the current derived capacity.
- *  `level` is what the gauge should read now; the record keeps the draw
- *  meter's floor beside it, so the draws this writer has seen stay counted
- *  once (see setFuelDrawMeter). Owner-gated at the caller (helm UI). The
- *  write is idempotent — the same level twice makes one Yjs op (Y.Map dedups
- *  equal values). */
+ *  `level` is what the gauge should read now; the record keeps each draw
+ *  meter's reading beside it, never below the one it recorded before, so
+ *  the draws this writer has seen stay counted once (see setFuelDrawMeter).
+ *  A meter only another build draws through keeps its recorded reading.
+ *  Owner-gated at the caller (helm UI). The write is idempotent: the same
+ *  level twice leaves the same record. */
 export function writeFuelLevel(level: number, capacity: number): void {
   if (!docAlive()) return;
   const safe = clampFuelToCapacity(level, capacity);
-  const meter = fuelDrawFloor();
+  const raw = shipMap!.get('fuel');
+  const before = isFuelRecord(raw) ? recordedMeters(raw) : null;
+  const meters: Record<string, number> = {};
+  let count = 0;
+  let sum = 0;
+  const record = (name: string, reading: number): void => {
+    if (reading <= 0 || count >= MAX_METERS) return;
+    meters[name] = reading;
+    count += 1;
+    sum += reading;
+  };
+  for (const [name, { meter }] of drawMeters) record(name, Math.max(meterValue(meter.read()), before?.get(name) ?? 0));
+  for (const [name, reading] of before ?? []) if (!drawMeters.has(name)) record(name, reading);
   boundDoc!.transact(() => {
-    shipMap!.set('fuel', (meter > 0 ? { level: safe, meter } : { level: safe }) as FuelRecord);
+    shipMap!.set('fuel', (count > 0 ? { level: safe, meters, meter: sum } : { level: safe }) as FuelRecord);
   });
 }
 

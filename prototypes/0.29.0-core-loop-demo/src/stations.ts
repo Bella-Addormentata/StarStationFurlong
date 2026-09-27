@@ -147,19 +147,26 @@ function clean(r: StationRecord): StationRecord {
 /** Save (or replace, by id) a station record on this install. Returns false
  *  for an invalid record, one that would shadow the built-in default, a solar
  *  map body or a derived station id, one whose planet has no free orbit slot
- *  left, or one whose welcome room is part of a station already listed. */
+ *  left (or would have none for a station already saved), or one whose
+ *  welcome room is part of a station already listed. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
-  const records = readStationRecords();
-  // Replace IN PLACE: slot clashes go to the earlier record, so moving a
-  // renamed record to the back would swap it out of its slot.
+  const saved = readStationRecords();
+  const records = [...saved];
+  // Replace IN PLACE: when two records name one place the earlier keeps it,
+  // and the list keeps record order.
   const at = records.findIndex((r) => r.id === record.id);
   if (at >= 0) records[at] = clean(record);
   else if (records.length >= MAX_RECORDS) return false;
   else records.push(clean(record));
-  // Refuse a record the list would drop: its planet has no free slot, or its
-  // welcome room already belongs to a listed station.
-  if (!listStations(readAtlas(), records).some((s) => s.id === record.id)) return false;
+  // Refuse a record the list would drop (its planet has no free slot, or its
+  // welcome room already belongs to a listed station), and one that would
+  // drop a saved station instead: winning that station's slot on a full
+  // planet, or taking its place.
+  const atlas = readAtlas();
+  const listed = new Set(listStations(atlas, records).map((s) => s.id));
+  if (!listed.has(record.id)) return false;
+  if (listStations(atlas, saved).some((s) => !s.derived && s.id !== record.id && !listed.has(s.id))) return false;
   try { localStorage.setItem(KEY, JSON.stringify(records)); } catch { return false; }
   return true;
 }
@@ -175,9 +182,10 @@ export function removeStation(id: string): void {
  * Every station this install knows: the built-in default, saved records, and
  * one derived station per unclaimed atlas component. One place is one
  * station — a record whose welcome room lies in a station already listed is
- * dropped. Orbit slots are unique per planet — a record whose slot is taken
- * moves to the next free one, and derived stations fill free slots in anchor
- * order. This is the list ship destinations read from.
+ * dropped. Orbit slots are unique per planet — a record that loses a clash
+ * for its slot moves to the next free one, settled the same way on every
+ * install whatever order it saved its records in, and derived stations fill
+ * free slots in anchor order. This is the list ship destinations read from.
  */
 export function listStations(
   atlas: Record<string, AtlasEntry> = readAtlas(),
@@ -196,24 +204,63 @@ export function listStations(
   };
 
   const taken = new Map<string, Set<number>>();
+  const used = (planetId: string): Set<number> => {
+    let slots = taken.get(planetId);
+    if (!slots) taken.set(planetId, slots = new Set());
+    return slots;
+  };
   const claim = (planetId: string, wanted: number): number | null => {
-    const used = taken.get(planetId) ?? new Set<number>();
-    taken.set(planetId, used);
+    const slots = used(planetId);
     for (let i = 0; i < MAX_ORBIT_SLOTS; i++) {
       const slot = (wanted + i) % MAX_ORBIT_SLOTS;
-      if (!used.has(slot)) { used.add(slot); return slot; }
+      if (!slots.has(slot)) { slots.add(slot); return slot; }
     }
     return null;
   };
 
+  // One place is one station: the earlier record keeps it.
+  const kept: StationRecord[] = [];
+  const seen = new Set<string>();
+  for (const r of [DEFAULT_STATION_RECORD, ...records]) {
+    if (kept.some((e) => e.id === r.id)) continue;
+    const place = placeOf(r.welcomeRoomId);
+    if (place && seen.has(place)) continue;
+    if (place) seen.add(place);
+    // An unknown planet reads as the default one, so it claims that planet's slots.
+    kept.push({ ...r, planetId: planetById(r.planetId).id });
+  }
+
+  // Slots are settled in one global order, never this install's record order,
+  // so every install holding the same stations gives each the same slot. The
+  // built-in default claims first, as it is the same everywhere. Each wanted
+  // slot then goes to the record with the smallest welcome room id, and only
+  // after that do the records that lost a clash take the next free slot on,
+  // so a clash moves only the station that lost it.
+  const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const [builtIn, ...rest] = kept;
+  const slotOf = new Map<StationRecord, number>([[builtIn, claim(builtIn.planetId, builtIn.orbitSlot)!]]);
+  const lost: StationRecord[] = [];
+  const ordered = rest.sort((a, b) => byName(a.planetId, b.planetId) || a.orbitSlot - b.orbitSlot
+    || byName(a.welcomeRoomId, b.welcomeRoomId) || byName(a.id, b.id));
+  for (const r of ordered) {
+    const slots = used(r.planetId);
+    const free = Number.isInteger(r.orbitSlot) && r.orbitSlot >= 0 && r.orbitSlot < MAX_ORBIT_SLOTS
+      && !slots.has(r.orbitSlot);
+    if (free) { slots.add(r.orbitSlot); slotOf.set(r, r.orbitSlot); } else lost.push(r);
+  }
+  for (const r of lost) {
+    const slot = claim(r.planetId, r.orbitSlot);
+    if (slot !== null) slotOf.set(r, slot);
+  }
+
+  // Listed in record order. A record left without a slot (its planet is
+  // full) is dropped, and its place is left to a derived station.
   const out: StationRecord[] = [];
   const places = new Set<string>();
-  for (const r of [DEFAULT_STATION_RECORD, ...records]) {
-    if (out.some((e) => e.id === r.id)) continue;
+  for (const r of kept) {
+    const slot = slotOf.get(r);
+    if (slot === undefined) continue;
     const place = placeOf(r.welcomeRoomId);
-    if (place && places.has(place)) continue;
-    const slot = claim(r.planetId, r.orbitSlot);
-    if (slot === null) continue;
     if (place) places.add(place);
     out.push({ ...r, orbitSlot: slot });
   }
