@@ -2,7 +2,7 @@
  * 🚚 stationMove — a station leaving its planet for another under its own
  * thrusters: planning, the record, and how the station list follows it.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS, setStationTrimResolver } from './orbits';
 import { stationBodies } from './map';
@@ -884,6 +884,21 @@ describe('tugs: a torch tow', () => {
     bindStationMoveDoc(new Y.Doc());
     writeStationMove(plan.move);
     expect(cancelTowLeftBehind('tug-room', docked, plan.move.arriveAt + 1, () => false)).toBe(false);
+    // …and one let go during the tow, learned of only after it arrived, is
+    // judged by the UNDOCK's own stamp: cancelled. A release from before the
+    // tow was booked is not this tow's.
+    store.clear();
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    const since: number[] = [];
+    const releasedMidTow = (_w: string, from: number) => { since.push(from); return plan.move.departAt + 5; };
+    expect(cancelTowLeftBehind('tug-room', docked, plan.move.arriveAt + 1, releasedMidTow)).toBe(true);
+    expect(since[0]).toBe(plan.move.bookedAt ?? plan.move.departAt);
+    expect(isCancelPin(readStationMove()!)).toBe(true);
+    store.clear();
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    expect(cancelTowLeftBehind('tug-room', docked, plan.move.arriveAt + 1, () => plan.move.arriveAt + 1)).toBe(false);
   });
 
   it('refuses a nest of pins at the first step', () => {
@@ -1093,10 +1108,16 @@ describe('the move log stays bounded', () => {
     const map = doc.getMap('stationMoves');
     for (let i = 0; i < 1000; i++) map.set(`move:666:${i}`, { junk: i });
     expect(readMoveFuelDrawn()).toBe(0);
+    // One write clears the whole flood: its own entry is read and paid for
+    // at once, here and by a peer.
     writeStationMove(hop(0, 10, 10));
-    writeStationMove(hop(1, 5, 15));
-    writeStationMove(hop(2, 5, 20));
-    expect([...map.keys()].filter((k) => k.startsWith('move:666:')).length).toBeLessThanOrEqual(1000 - 3 * 250);
+    expect([...map.keys()].filter((k) => k.startsWith('move:666:'))).toEqual([]);
+    expect(readMoveFuelDrawn()).toBe(10);
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    store.clear();
+    bindStationMoveDoc(peer);
+    expect(readStationMove()?.fuel).toBe(10);
   });
 
   it('takes back a recently pruned move\'s fuel when a rival learned late beats it', () => {
@@ -1121,6 +1142,49 @@ describe('the move log stays bounded', () => {
     expect(compareMoves(rival, m)).toBeGreaterThan(0);
     doc.getMap('stationMoves').set(`move:99:${rival.departAt}:yard-room`, rival);
     expect(readMoveFuelDrawn()).toBe(3 + 5 + 7);
+  });
+
+  it('pays once for a move two offline writers each settled, after it is final', () => {
+    const DAY = 86_400_000;
+    const t0 = Date.now();
+    vi.useFakeTimers({ now: t0, toFake: ['Date'] });
+    try {
+      const move = (station: string, depart: number, fuel: number): StationMove => ({
+        ...hop(0, fuel, fuel), stationId: station, welcomeRoomId: `${station}-room`,
+        departAt: depart, arriveAt: depart + 3_600_000, bookedAt: depart - 1000,
+      });
+      // The same move, then a later one of its station, then one elsewhere
+      // (whose write prunes the first), on two replicas that never met.
+      const m = move('yard', t0 - 3 * DAY, 10);
+      const n = move('yard', t0 - 2 * DAY, 5);
+      const y = move('dock', t0 - 2 * DAY, 7);
+      const replica = (id: number) => {
+        const d = new Y.Doc(); d.clientID = id;
+        bindStationMoveDoc(d);
+        for (const x of [m, n, y]) writeStationMove(x);
+        return d;
+      };
+      const d1 = replica(1);
+      const d2 = replica(2);
+      const recents = (d: Y.Doc) => [...d.getMap('stationMoves').entries()]
+        .filter(([k]) => k.startsWith('moveSettled:')).map(([, v]) => (v as { recent: StationMove[] }).recent);
+      expect(recents(d1)).toEqual([[m]]);
+      expect(recents(d2)).toEqual([[m]]);
+      Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+      store.clear();
+      bindStationMoveDoc(d1);
+      expect(readMoveFuelDrawn()).toBe(10 + 5 + 7);
+      // A week on, both stations move again, and each writer's old entries
+      // leave the log: the move both held becomes final once.
+      vi.setSystemTime(t0 + 8 * DAY);
+      writeStationMove(move('yard', t0 + 7 * DAY, 1));
+      writeStationMove(move('dock', t0 + 7 * DAY, 2));
+      writeStationMove(move('mill', t0 + 7 * DAY, 3));
+      expect(recents(d1).flat()).toEqual([]);
+      expect(readMoveFuelDrawn()).toBe(10 + 5 + 7 + 1 + 2 + 3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('follows a move written here even when this install cannot store it', () => {
