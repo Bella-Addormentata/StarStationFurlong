@@ -2130,7 +2130,12 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     return;
   }
   if (outcome.kind === 'docked') {
-    setArrivalNote({ text: `Docked at ${outcome.stationName}, ${gate(outcome.gate)}.`, tone: 'ok' });
+    setArrivalNote({
+      text: outcome.gate !== undefined
+        ? `Docked at ${outcome.stationName}, gate ${outcome.gate}.`
+        : `Docked at ${outcome.stationName}.`,
+      tone: 'ok',
+    });
     return;
   }
   setArrivalNote({
