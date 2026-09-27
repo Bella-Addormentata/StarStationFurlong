@@ -122,6 +122,7 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 import {
   bindStationKeepingDoc,
   isBoltedIntoStation,
+  readFuelDrawn,
   readOrbitTrim,
   subscribeStationKeeping,
 } from "./stationKeeping";
@@ -1569,7 +1570,12 @@ async function joinRoomAtEpoch(
   // 🪐 After the ship and trim records: the summary publishes both.
   bindPlanetSummaryDoc(sync.doc, {
     currentStation,
-    localTrim: readOrbitTrim,
+    // The fuel its burns drew rides along: between trims whose last burns
+    // share a moment, it tells the one holding more burns.
+    localTrim: () => {
+      const trim = readOrbitTrim();
+      return trim && { ...trim, fuelDrawn: readFuelDrawn() };
+    },
     ship: planetShipStatus,
   });
 
