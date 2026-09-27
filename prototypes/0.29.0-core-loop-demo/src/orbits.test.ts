@@ -3,15 +3,19 @@
  * transfers between them.
  */
 import { describe, expect, it } from 'vitest';
+import * as THREE from 'three';
 import {
   ORBIT_EPOCH_MS,
   ORBIT_TIME_SCALE,
   SLOT0_ALTITUDE_KM,
   angleAt,
+  inStationFrame,
   orbitForSlot,
   planTransfer,
   realMsFor,
+  stationHeadingAt,
   stationPointAt,
+  toPlanetFrame,
   transferPointAt,
   wrapAngle,
 } from './orbits';
@@ -139,5 +143,64 @@ describe('Hohmann transfers', () => {
     expect(plan.transferMs).toBeGreaterThan(30_000);
     expect(plan.transferMs).toBeLessThan(120_000);
     expect(plan.synodicMs).toBeLessThan(10 * 60_000);
+  });
+});
+
+describe('the planet frame', () => {
+  const T = ORBIT_EPOCH_MS + 55_555_555;
+
+  it('puts every orbit on the equator, with angles turning like rotation.y about +Y (north)', () => {
+    for (const angle of [0, 0.7, 2, 4.5]) {
+      const p = toPlanetFrame({ radiusKm: 7000, angle });
+      const viaThree = new THREE.Vector3(7000, 0, 0).applyAxisAngle(new THREE.Vector3(0, 1, 0), angle);
+      expect(p.y).toBe(0);
+      expect(p.x).toBeCloseTo(viaThree.x, 6);
+      expect(p.z).toBeCloseTo(viaThree.z, 6);
+    }
+    // A quarter turn goes from +X to −Z: counter-clockwise seen from the north.
+    const q = toPlanetFrame({ radiusKm: 1, angle: Math.PI / 2 });
+    expect(q.x).toBeCloseTo(0, 12);
+    expect(q.z).toBeCloseTo(-1, 12);
+  });
+
+  it('orbits prograde: angles grow with time', () => {
+    const o = orbitForSlot(SOV, 2);
+    expect(angleGap(angleAt(o, T + 1000), angleAt(o, T))).toBeGreaterThan(0);
+  });
+
+  it('keeps the planet straight off a station\'s −X, level with its floor', () => {
+    const s = station(1);
+    const planet = inStationFrame(s, T, { x: 0, y: 0, z: 0 });
+    expect(planet.x).toBeCloseTo(-orbitForSlot(SOV, 1).radiusKm, 6);
+    expect(planet.y).toBe(0);
+    expect(planet.z).toBeCloseTo(0, 6);
+    // …at every point of the orbit — the station turns with it.
+    const later = inStationFrame(s, T + 40_000, { x: 0, y: 0, z: 0 });
+    expect(later.x).toBeCloseTo(planet.x, 6);
+    expect(later.z).toBeCloseTo(0, 6);
+  });
+
+  it('shows a body just ahead in the same orbit off the station\'s −Z (its direction of travel)', () => {
+    const s = station(1);
+    const here = stationPointAt(s, T);
+    const ahead = inStationFrame(s, T, { radiusKm: here.radiusKm, angle: here.angle + 0.001 });
+    expect(ahead.z).toBeLessThan(0);
+    expect(Math.abs(ahead.x)).toBeLessThan(Math.abs(ahead.z) * 0.01);
+    expect(inStationFrame(s, T, here)).toEqual({ x: 0, y: 0, z: 0 });
+  });
+
+  it('turns a planet-locked station once per orbit', () => {
+    const s = station(0);
+    const o = orbitForSlot(SOV, 0);
+    expect(stationHeadingAt(s, T)).toBeCloseTo(angleAt(o, T), 12);
+    expect(angleGap(stationHeadingAt(s, T + realMsFor(o.periodS / 4)), stationHeadingAt(s, T))).toBeCloseTo(Math.PI / 2, 6);
+  });
+
+  it('gives a ship its vis-viva speed along the transfer: fastest low, slowest high', () => {
+    const plan = planTransfer(station(0), station(3), T)!;
+    const early = transferPointAt(plan, plan.departAt + 1);
+    const late = transferPointAt(plan, plan.arriveAt - 1);
+    expect(early.speedKmS).toBeGreaterThan(plan.from.speedKmS); // after the prograde burn
+    expect(late.speedKmS).toBeLessThan(plan.to.speedKmS); // before the circularising burn
   });
 });

@@ -19,7 +19,7 @@ import {
   stationsAroundPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
-import { SolarSystemMap, stationBodies } from './map';
+import { SolarSystemMap, screenOffset, stationBodies } from './map';
 import { DEFAULT_STATION } from './defaultStation';
 import { ORBIT_EPOCH_MS } from './orbits';
 
@@ -235,6 +235,13 @@ describe('solar map station bodies', () => {
     (map as unknown as { selectedBody: unknown }).selectedBody = stationBodies([rec])[0];
     map.refreshStations(listStations({}, [{ ...rec, name: 'L4 DEPOT' }]), null);
     expect((map as unknown as { selectedBody: { name: string } }).selectedBody.name).toBe('L4 DEPOT');
+  });
+
+  it('looks down from the north: a growing angle turns counter-clockwise on screen', () => {
+    const a = screenOffset(0, 10);
+    const b = screenOffset(Math.PI / 2, 10);
+    expect(a.dx).toBeCloseTo(10, 12);
+    expect(b.dy).toBeCloseTo(-10, 12); // up the screen (canvas y grows downward)
   });
 
   it('defaults to Furlong as the player location, as before', () => {

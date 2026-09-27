@@ -35,6 +35,15 @@ export interface MapBody {
 const STATION_ORBIT_BASE = 35;
 const STATION_ORBIT_STEP = 9;
 
+/**
+ * Canvas offset of a body at `angle` on a circle of `radius`. The holotable
+ * looks down from the NORTH, like the orbits.ts planet frame: +X to the
+ * right, −Z up the screen — so every orbit goes round counter-clockwise.
+ */
+export function screenOffset(angle: number, radius: number): { dx: number; dy: number } {
+  return { dx: Math.cos(angle) * radius, dy: -Math.sin(angle) * radius };
+}
+
 /** "1m 32s" / "3h 54m" — a real-time span for the holotable readout. */
 function formatSpan(ms: number): string {
   const s = Math.round(ms / 1000);
@@ -415,10 +424,8 @@ export class SolarSystemMap {
       const parent = this.bodies.find(b => b.id === body.parentId);
       if (parent) {
         const parentCoords = this.getBodyCoordinates(parent, centerX, centerY);
-        return {
-          x: parentCoords.x + Math.cos(angle) * radius,
-          y: parentCoords.y + Math.sin(angle) * radius,
-        };
+        const { dx, dy } = screenOffset(angle, radius);
+        return { x: parentCoords.x + dx, y: parentCoords.y + dy };
       }
     }
 
@@ -429,14 +436,12 @@ export class SolarSystemMap {
       // Ellipse focuses on Sol Prime center
       return {
         x: centerX + Math.cos(angle) * a - (a * body.eccentricity),
-        y: centerY + Math.sin(angle) * b,
+        y: centerY - Math.sin(angle) * b, // north-up, as screenOffset
       };
     }
 
-    return {
-      x: centerX + Math.cos(angle) * radius,
-      y: centerY + Math.sin(angle) * radius,
-    };
+    const { dx, dy } = screenOffset(angle, radius);
+    return { x: centerX + dx, y: centerY + dy };
   }
 
   private selectBody(body: MapBody) {
