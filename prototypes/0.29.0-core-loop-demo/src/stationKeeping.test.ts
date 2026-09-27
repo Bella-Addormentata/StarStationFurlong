@@ -8,7 +8,15 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, setStationTrimResolver, stationOrbit, wrapAngle } from './orbits';
-import { bindShipDoc, clampFuelToCapacity, fuelDrawFloor, readFuelLevel, subscribeShip, writeFuelLevel } from './shipDoc';
+import {
+  bindShipDoc,
+  clampFuelToCapacity,
+  fuelDrawDeficit,
+  readFuelLevel,
+  setFuelDrawMeter,
+  subscribeShip,
+  writeFuelLevel,
+} from './shipDoc';
 import { DEFAULT_PLANET_ID } from './stations';
 import {
   BURN_MS,
@@ -58,7 +66,7 @@ const ctx = (over: Partial<TrimContext> = {}): TrimContext => ({
   commander: true,
   engines: 1,
   fuel: 100,
-  meter: 0,
+  deficit: 0,
   now: T0,
   ...over,
 });
@@ -321,7 +329,7 @@ describe('the doc record', () => {
     doc.on('afterTransaction', (tr: Y.Transaction) => {
       seen.push([...tr.changed.keys()].map((m) => ((m as unknown) === doc.getMap('ship') ? 'ship' : 'keep')));
     });
-    const t = burn(ctx({ fuel: readFuelLevel(), meter: fuelDrawFloor() }), 'raise');
+    const t = burn(ctx({ fuel: readFuelLevel(), deficit: fuelDrawDeficit() }), 'raise');
     expect(t.fuelDrawn).toBe(TRIM_FUEL);
     expect(writeOrbitTrim(t)).toBe(true);
     expect(seen).toEqual([['keep']]);
@@ -334,7 +342,7 @@ describe('the doc record', () => {
     // A later REFUEL or DEPART folds the draws it saw into the level, once.
     writeFuelLevel(readFuelLevel() - 3, 100);
     expect(readFuelLevel()).toBe(10 - TRIM_FUEL - 3);
-    const next = burn(ctx({ trim: t, fuel: readFuelLevel(), meter: fuelDrawFloor(), now: T0 + BURN_MS }), 'lower');
+    const next = burn(ctx({ trim: t, fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: T0 + BURN_MS }), 'lower');
     writeOrbitTrim(next);
     expect(readFuelLevel()).toBe(10 - 2 * TRIM_FUEL - 3);
   });
@@ -396,7 +404,7 @@ describe('two owners burning at once', () => {
     const fire = (doc: Y.Doc, dir: TrimDirection, now: number): OrbitTrim => {
       bindShipDoc(doc);
       bindStationKeepingDoc(doc);
-      const t = burn(ctx({ fuel: readFuelLevel(), meter: fuelDrawFloor(), now }), dir);
+      const t = burn(ctx({ fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now }), dir);
       expect(writeOrbitTrim(t)).toBe(true);
       return t;
     };
@@ -435,7 +443,7 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     writeFuelLevel(50, 100);
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
 
-    writeOrbitTrim(burn(ctx({ fuel: readFuelLevel(), meter: fuelDrawFloor() }), 'raise'));
+    writeOrbitTrim(burn(ctx({ fuel: readFuelLevel(), deficit: fuelDrawDeficit() }), 'raise'));
     bindShipDoc(b);
     bindStationKeepingDoc(b);
     writeFuelLevel(otherWrite(readFuelLevel()), 100);
@@ -475,11 +483,11 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     a.getMap('ship').set('fuel', { level: 40, meter: 10 });
     a.getMap('stationKeeping').set('trim', trim({ fuelDrawn: 4 }));
     expect(readFuelLevel()).toBe(40);
-    expect(fuelDrawFloor()).toBe(10);
+    expect(fuelDrawDeficit()).toBe(10 - 4);
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
 
     // Tab A burns while tab B departs on 12 fuel against the same meter.
-    writeOrbitTrim(burn(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), meter: fuelDrawFloor(), now: T0 + BURN_MS }), 'raise'));
+    writeOrbitTrim(burn(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: T0 + BURN_MS }), 'raise'));
     expect(readFuelLevel()).toBe(40 - TRIM_FUEL);
     bindShipDoc(b);
     bindStationKeepingDoc(b);
@@ -501,7 +509,7 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     // A tank comes off: the other 50 is stranded, not burnable.
     const fuel = clampFuelToCapacity(readFuelLevel(50), 50);
     expect(fuel).toBe(50);
-    writeOrbitTrim(burn(ctx({ fuel, meter: fuelDrawFloor() }), 'raise'));
+    writeOrbitTrim(burn(ctx({ fuel, deficit: fuelDrawDeficit() }), 'raise'));
     expect(clampFuelToCapacity(readFuelLevel(50), 50)).toBe(50 - TRIM_FUEL);
     // The tank goes back on, and its fuel with it.
     expect(clampFuelToCapacity(readFuelLevel(100), 100)).toBe(100 - TRIM_FUEL);
@@ -515,7 +523,7 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     doc.getMap('stationKeeping').set('trim', trim());
     expect(readFuelDrawn()).toBe(0);
     expect(readFuelLevel()).toBe(25);
-    expect(fuelDrawFloor()).toBe(0);
+    expect(fuelDrawDeficit()).toBe(0);
   });
 
   it('a hostile meter reading on the fuel record counts as none', () => {
@@ -526,7 +534,68 @@ describe('a burn racing a REFUEL or DEPART from another tab', () => {
     for (const meter of [1e300, Number.POSITIVE_INFINITY, Number.NaN, -5, '7']) {
       doc.getMap('ship').set('fuel', { level: 25, meter });
       expect(readFuelLevel()).toBe(25 - 3);
-      expect(fuelDrawFloor()).toBe(3);
+      expect(fuelDrawDeficit()).toBe(0);
+    }
+  });
+});
+
+describe('another consumer drawing through its own meter (a station move, say)', () => {
+  // It keeps its own running total under its own key; the tank's meter is
+  // the sum of every consumer's total.
+  const OTHER = 'test-other';
+  const bindAll = (doc: Y.Doc) => {
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    const map = doc.getMap('other');
+    setFuelDrawMeter(OTHER, {
+      read: () => (map.get('drawn') as number | undefined) ?? 0,
+      subscribe: (listener) => {
+        const f = () => listener();
+        map.observe(f);
+        return () => map.unobserve(f);
+      },
+    });
+  };
+  /** The other consumer draws `amount` the way a trim burn does: its own
+   *  total, plus what the meter owes the level, plus the draw. */
+  const otherDraws = (doc: Y.Doc, amount: number) => {
+    const map = doc.getMap('other');
+    map.set('drawn', ((map.get('drawn') as number | undefined) ?? 0) + fuelDrawDeficit() + amount);
+  };
+  const trimBurn = () =>
+    writeOrbitTrim(burn(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: Date.now() }), 'raise'));
+  afterEach(() => setFuelDrawMeter(OTHER, null));
+
+  it('a trim burn after its draw counts only the burn', () => {
+    const doc = new Y.Doc();
+    bindAll(doc);
+    writeFuelLevel(50, 100);
+    otherDraws(doc, 7);
+    expect(readFuelLevel()).toBe(50 - 7);
+    trimBurn();
+    expect(readFuelDrawn()).toBe(TRIM_FUEL);
+    expect(readFuelLevel()).toBe(50 - 7 - TRIM_FUEL);
+  });
+
+  it('a trim burn and its draw at once from two tabs both come off, whichever tab Yjs favours', () => {
+    for (const [burner, other] of [[900, 100], [100, 900]]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      a.clientID = burner;
+      b.clientID = other;
+      bindAll(a);
+      writeFuelLevel(50, 100);
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+
+      trimBurn();
+      bindAll(b);
+      otherDraws(b, 7);
+
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      expect(readFuelLevel()).toBe(50 - 7 - TRIM_FUEL);
+      bindAll(a);
+      expect(readFuelLevel()).toBe(50 - 7 - TRIM_FUEL);
     }
   });
 });
