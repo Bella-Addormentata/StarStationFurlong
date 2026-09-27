@@ -118,12 +118,15 @@ function clean(r: StationRecord): StationRecord {
 }
 
 /** Save (or replace, by id) a station record on this install. Returns false
- *  for an invalid record or one that would shadow the built-in default. */
+ *  for an invalid record, one that would shadow the built-in default, or one
+ *  whose planet has no free orbit slot left. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
   const records = readStationRecords().filter((r) => r.id !== record.id);
   if (records.length >= MAX_RECORDS) return false;
   records.push(clean(record));
+  // Refuse a record the list would drop because its planet has no free slot.
+  if (!listStations({}, records).some((s) => s.id === record.id)) return false;
   try { localStorage.setItem(KEY, JSON.stringify(records)); } catch { return false; }
   return true;
 }

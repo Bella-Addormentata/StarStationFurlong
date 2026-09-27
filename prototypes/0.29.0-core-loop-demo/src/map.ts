@@ -674,7 +674,11 @@ export class SolarSystemMap {
     current: StationRecord | null = currentStation(),
   ) {
     this.bodies = [...this.bodies.filter((b) => b.type !== 'station'), ...stationBodies(stations)];
-    if (this.selectedBody && !this.bodies.some((b) => b.id === this.selectedBody!.id)) this.selectedBody = null;
+    // Rebind the selection to the refreshed body (a station may have been
+    // renamed or moved since); drop it when the station is gone.
+    const fresh = this.selectedBody && this.bodies.find((b) => b.id === this.selectedBody!.id);
+    this.selectedBody = fresh || null;
+    if (fresh && this.container) this.selectBody(fresh);
     if (!this.travelDestination && current) this.playerLocationId = current.id;
   }
 

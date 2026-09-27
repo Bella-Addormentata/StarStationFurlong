@@ -9,6 +9,7 @@ import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
+  MAX_ORBIT_SLOTS,
   listStations,
   planetForRoom,
   readStationRecords,
@@ -63,6 +64,14 @@ describe('atlas components', () => {
       [WELCOME, 'lounge'].sort(),
       ['yard-a', 'yard-b'],
     ]);
+  });
+
+  it('does not let unknown door targets crowd a real neighbour out of its component', () => {
+    const unknown = Array.from({ length: 63 }, (_, i) => `ghost-${i}`);
+    const atlas = atlasOf(room('hub', [...unknown, 'real']), room('real', []));
+    expect(atlasComponent(atlas, 'hub').has('real')).toBe(true);
+    expect(atlasComponents(atlas)).toHaveLength(1);
+    expect(listStations(atlas, []).filter((s) => s.derived)).toHaveLength(1);
   });
 
   it('returns nothing for a room the atlas does not hold', () => {
@@ -146,6 +155,17 @@ describe('saved records', () => {
     expect(readStationRecords()).toEqual([]);
   });
 
+  it('refuses a record once its planet has no free orbit slot', () => {
+    // The built-in station holds one of Sovereign's slots.
+    for (let i = 1; i < MAX_ORBIT_SLOTS; i++) {
+      expect(registerStation({ id: `s${i}`, name: `S${i}`, planetId: DEFAULT_PLANET_ID, orbitSlot: i, welcomeRoomId: `r${i}` })).toBe(true);
+    }
+    expect(registerStation({ id: 'full', name: 'FULL', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'rx' })).toBe(false);
+    expect(stationsAroundPlanet(DEFAULT_PLANET_ID, listStations({}))).toHaveLength(MAX_ORBIT_SLOTS);
+    // Another planet still has room.
+    expect(registerStation({ id: 'aris', name: 'ARIS', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'ry' })).toBe(true);
+  });
+
   it('survives a corrupt store and maps unknown planets to the default', () => {
     store.set('ssf-stations', '{not json');
     expect(readStationRecords()).toEqual([]);
@@ -177,6 +197,15 @@ describe('solar map station bodies', () => {
     const bodies = stationBodies(stations);
     expect(bodies.every((b) => b.parentId === 'planet-sovereign')).toBe(true);
     expect(bodies[1].orbitRadius).toBeGreaterThan(bodies[0].orbitRadius);
+  });
+
+  it('rebinds the selection when a station is renamed', () => {
+    const map = new SolarSystemMap();
+    const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+    map.refreshStations(listStations({}, [rec]), null);
+    (map as unknown as { selectedBody: unknown }).selectedBody = stationBodies([rec])[0];
+    map.refreshStations(listStations({}, [{ ...rec, name: 'L4 DEPOT' }]), null);
+    expect((map as unknown as { selectedBody: { name: string } }).selectedBody.name).toBe('L4 DEPOT');
   });
 
   it('defaults to Furlong as the player location, as before', () => {
