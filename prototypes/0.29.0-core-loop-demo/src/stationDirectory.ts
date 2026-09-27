@@ -112,7 +112,9 @@ export function isKnownStation(id: string): boolean {
 /** Plan the hop from → to at `nowMs`: the directory's own planner (orbits),
  *  else a flat hop that leaves now. Null for an unknown or unreachable pair. */
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
-  if (fromId === toId || !isKnownStation(toId)) return null;
+  // Both ends must be listed: findStation would quietly read an unknown
+  // origin as home.
+  if (fromId === toId || !isKnownStation(fromId) || !isKnownStation(toId)) return null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;

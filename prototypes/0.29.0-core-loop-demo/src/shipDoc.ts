@@ -213,8 +213,8 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   // stale destinationId (a docked record just after arrival, for example) — we
   // strip in `sanitizeFlightRecord`, but the SHAPE is legal either way.
   if (r.destinationId !== undefined && !isBoundedString(r.destinationId)) return false;
-  if (r.departedAt !== undefined && !(typeof r.departedAt === 'number' && Number.isFinite(r.departedAt))) return false;
-  if (r.etaAt !== undefined && !(typeof r.etaAt === 'number' && Number.isFinite(r.etaAt))) return false;
+  if (r.departedAt !== undefined && !isFlightTime(r.departedAt)) return false;
+  if (r.etaAt !== undefined && !isFlightTime(r.etaAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -223,9 +223,23 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
     if (r.status === 'in-flight') {
       if (r.departedAt === undefined || r.etaAt === undefined) return false;
       if (!(r.etaAt > r.departedAt)) return false;
+      // A flight longer than any launch-window wait plus transfer would hold
+      // the ship in flight (and so out of DEPART) for good.
+      if (r.etaAt - r.departedAt > MAX_FLIGHT_AHEAD_MS) return false;
     }
   }
   return true;
+}
+
+/** Longest a flight may run, and how far ahead of now any of its times may
+ *  lie: the longest launch-window wait plus the longest transfer between two
+ *  slots (orbits.ts, 60x clock) come to well under a day of real time. */
+export const MAX_FLIGHT_AHEAD_MS = 2 * 24 * 3600 * 1000;
+
+/** A peer-written flight time: a whole ms epoch, no later than
+ *  MAX_FLIGHT_AHEAD_MS from now (a far-future one would never arrive). */
+function isFlightTime(v: unknown): v is number {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= Date.now() + MAX_FLIGHT_AHEAD_MS;
 }
 
 function isFuelRecord(v: unknown): v is FuelRecord {
