@@ -537,13 +537,14 @@ function isSlotOperatorLease(value: unknown): value is SlotOperatorLease {
       || (typeof lease.tenure === 'string' && lease.tenure.length > 0 && lease.tenure.length <= 64));
 }
 
-/** 🎰 The room's slot operator lease: ONE session operates every slot machine
- *  in the room (slotCroupier.ts), so a player's `bal:` has one slot writer. */
+/** 🎰 The v0.38 room key for the slot operator, which the shared lease
+ *  (CASINO_OPERATOR_KEY, casinoOperator.ts) shadows: its holder writes the
+ *  same record here, so a v0.38 slot operator waits on it, and a v0.38
+ *  record here holds the shared lease off. */
 export const SLOT_OPERATOR_KEY = 'slot-operator';
 
 export function readSlotOperatorLease(): SlotOperatorLease | null {
-  const value = ensureMap().get(SLOT_OPERATOR_KEY);
-  return isSlotOperatorLease(value) ? value : null;
+  return readRoomOperatorLease(SLOT_OPERATOR_KEY);
 }
 
 export function writeSlotOperatorLease(lease: SlotOperatorLease): void {
@@ -969,7 +970,10 @@ export function clearSlotMachineKeys(machineId: string): void {
 // pusherCroupier.ts for how a second session of the same deed holder is kept
 // from operating while the first may only be cut off.
 
-/** The room's coin-pusher operator lease: one for every cabinet in the room. */
+/** The v0.38 room key for the coin-pusher operator, which the shared lease
+ *  (CASINO_OPERATOR_KEY, casinoOperator.ts) shadows: its holder writes the
+ *  same record here, so a v0.38 pusher operator waits on it and a v0.38
+ *  panel reads it, and a v0.38 record here holds the shared lease off. */
 export const COIN_PUSHER_OPERATOR_KEY = 'pusher-operator';
 
 /** The slot operator's record, plus the holder's tenure: a fresh token each
@@ -978,13 +982,6 @@ export const COIN_PUSHER_OPERATOR_KEY = 'pusher-operator';
  *  still tells a new tenure, with its settling wait, from a renewal. */
 export interface CoinPusherOperatorLease extends SlotOperatorLease {
   tenure?: string;
-}
-
-function isCoinPusherOperatorLease(value: unknown): value is CoinPusherOperatorLease {
-  if (!isSlotOperatorLease(value)) return false;
-  const tenure = (value as { tenure?: unknown }).tenure;
-  return tenure === undefined
-    || (typeof tenure === 'string' && tenure.length > 0 && tenure.length <= 64);
 }
 
 export function readCoinPusherState(machineId: string): CoinPusherState | null {
@@ -1338,17 +1335,82 @@ export function refuseCoinPusherEmpty(
 
 /** The room's coin-pusher operator lease (one for every cabinet). */
 export function readCoinPusherOperatorLease(): CoinPusherOperatorLease | null {
-  const value = ensureMap().get(COIN_PUSHER_OPERATOR_KEY);
-  return isCoinPusherOperatorLease(value) ? value : null;
+  return readRoomOperatorLease(COIN_PUSHER_OPERATOR_KEY);
 }
 
 export function writeCoinPusherOperatorLease(lease: CoinPusherOperatorLease): void {
-  if (!isCoinPusherOperatorLease(lease)) return;
+  if (!isSlotOperatorLease(lease)) return;
   ensureMap().set(COIN_PUSHER_OPERATOR_KEY, lease);
 }
 
 export function clearCoinPusherOperatorLease(): void {
   ensureMap().delete(COIN_PUSHER_OPERATOR_KEY);
+}
+
+// ── The room's one operator (casinoOperator.ts) ──────────────────────────────
+// ONE browser session operates every casino game in the room — slot machines
+// and coin pushers alike — under one lease, since a player's `bal:` is a whole
+// value whichever game writes it. The holder writes its record under the
+// primary key and, while v0.38 clients may share the room, under both of
+// their room keys as shadows, in ONE transaction: a v0.38 client reading its
+// own key sees a live foreign record and waits, and never a gap between the
+// two. A record under any of the three keys that names another session holds
+// this build off. casinoOperator.ts holds the election; this map only reads
+// and writes the records.
+
+export const CASINO_OPERATOR_KEY = 'casino-operator';
+
+/** The primary key and the two v0.38 room keys it shadows. */
+export const ROOM_OPERATOR_KEYS = [
+  CASINO_OPERATOR_KEY, SLOT_OPERATOR_KEY, COIN_PUSHER_OPERATOR_KEY,
+] as const;
+export type RoomOperatorKey = typeof ROOM_OPERATOR_KEYS[number];
+
+/** The shared lease's record: for now exactly the slot operator's. */
+export type CasinoOperatorLease = SlotOperatorLease;
+
+/** The record under one of the room's operator keys, if it reads as one. */
+export function readRoomOperatorLease(key: RoomOperatorKey): SlotOperatorLease | null {
+  const value = ensureMap().get(key);
+  return isSlotOperatorLease(value) ? value : null;
+}
+
+export function readCasinoOperatorLease(): CasinoOperatorLease | null {
+  return readRoomOperatorLease(CASINO_OPERATOR_KEY);
+}
+
+/** Write the holder's record under each of `keys`, the primary first, in ONE
+ *  transaction. A shadow carries the four lease fields only. */
+export function writeCasinoOperatorRecords(
+  lease: CasinoOperatorLease,
+  keys: readonly RoomOperatorKey[],
+): void {
+  if (!isSlotOperatorLease(lease)) return;
+  const { playerId, sessionId, tenure, expiresAt } = lease;
+  const shadow: SlotOperatorLease = tenure === undefined
+    ? { playerId, sessionId, expiresAt }
+    : { playerId, sessionId, tenure, expiresAt };
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    if (keys.includes(CASINO_OPERATOR_KEY)) map.set(CASINO_OPERATOR_KEY, lease);
+    for (const key of keys) {
+      if (key !== CASINO_OPERATOR_KEY) map.set(key, shadow);
+    }
+  });
+}
+
+/** Delete each of `keys` whose record names `sessionId`, in any tenure, in
+ *  ONE transaction; another session's record is left alone. */
+export function clearCasinoOperatorRecords(
+  sessionId: string,
+  keys: readonly RoomOperatorKey[],
+): void {
+  const map = ensureMap();
+  const mine = keys.filter((key) => readRoomOperatorLease(key)?.sessionId === sessionId);
+  if (mine.length === 0) return;
+  boundDoc!.transact(() => {
+    for (const key of mine) map.delete(key);
+  });
 }
 
 /** The fields that change on every operator write — two states that agree on
