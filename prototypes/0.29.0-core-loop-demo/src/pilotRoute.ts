@@ -1054,8 +1054,9 @@ function allowedPilot(route: ShipRoute, p: RoutePilot): RoutePilot {
   return p === 'robot' && !route.robotDockId ? 'person' : p;
 }
 
-/** Fuel after one leg's burn and arrival at `to` (the home refill). */
-function arriveWith(route: ShipRoute, fuel: number, cost: number, to: number, capacity: number): number {
+/** Fuel after one leg's burn and arrival at `to` (the home refill). The
+ *  boards project later calls with it (departuresBoard.nextArrivalHere). */
+export function arriveWith(route: ShipRoute, fuel: number, cost: number, to: number, capacity: number): number {
   let v = clampFuelToCapacity(fuel - cost, capacity);
   if (to === 0 && route.homeRefuel) v = clampFuelToCapacity(capacity, capacity);
   return v;

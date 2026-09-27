@@ -67,7 +67,7 @@
  */
 
 import { formatClock, formatWait, goneWords } from './helmRoute';
-import { isRouteRunning, legWindowAfter, routeCycleLength, routeFlightAt, stopAt } from './pilotRoute';
+import { arriveWith, isRouteRunning, legWindowAfter, routeCycleLength, routeFlightAt, routeLegFuel, stopAt } from './pilotRoute';
 import type { LiveDockAt, RouteFlight, RouteWalkCache } from './pilotRoute';
 import { staySkipWhy } from './shipPilot';
 import type { RouteCheckpoint, RouteStop, ShipRoute } from './shipRoute';
@@ -243,21 +243,30 @@ export function stayReading(
 /** The next arrival at one of `here`'s stops, from the flight's own leg on,
  *  every later leg at the first window after arrival plus the minimum wait
  *  (the schedule: a pilot who is late later is news the board can't have).
- *  Null when none comes within one cycle. */
+ *  ⛽ With the timetable's fuel rules (pilotRoute A3.5): each leg burns its
+ *  cost, the home stop refills, and a leg the fuel can't pay for is never
+ *  flown (the route ends there). Null when none comes within one cycle. */
 function nextArrivalHere(
   route: ShipRoute,
   f: RouteFlight,
   hereIdx: readonly number[],
+  capacity: number,
 ): { from: number; to: number; at: number } | null {
   let legSeq = f.legSeq;
   let arrive = f.arrivesAt;
   if (arrive === null) return null;
+  // Fuel on arriving at the flight's next stop: in flight its leg is already
+  // burned; docked, it burns on leaving.
+  const firstCost = f.status === 'in-flight' ? 0 : routeLegFuel(route, f.stopIndex, f.nextStopIndex);
+  if (firstCost === null) return null;
+  let fuel = arriveWith(route, f.fuel, firstCost, f.nextStopIndex, capacity);
   const cycle = routeCycleLength(route.stops.length, route.shape);
   for (let step = 0; step <= cycle; step++) {
     const to = stopAt(route, legSeq + 1);
     if (hereIdx.includes(to)) return { from: stopAt(route, legSeq), to, at: arrive };
     const w = legWindowAfter(route, legSeq + 1, arrive + route.stops[to].waitSecs * 1000);
-    if (!w) return null;
+    if (!w || fuel < w.fuelCost) return null;
+    fuel = arriveWith(route, fuel, w.fuelCost, w.to, capacity);
     legSeq++;
     arrive = w.arriveAt;
   }
@@ -332,7 +341,7 @@ export function ferryRow(ferry: DepartureFerry, here: BoardHere, now: number, ca
   } else if (f.stopping) {
     return null;
   }
-  const next = nextArrivalHere(route, f, liveHere);
+  const next = nextArrivalHere(route, f, liveHere, ferry.capacity);
   if (!next) return null;
   return row('from', name(next.from), stopGate(next.to), { status: 'ON TIME', at: next.at });
 }
@@ -390,6 +399,14 @@ export interface BoardInput {
   caches?: Map<string, RouteWalkCache>;
 }
 
+/** The name a board prints for a ferry, from its room's name: a new room is
+ *  named after its id until someone renames it, and a board says FERRY then.
+ *  The ferry's board entries and its ship summary on a route both use it. */
+export function ferryName(roomName: unknown, roomId: string): string {
+  const unnamed = typeof roomName !== 'string' || !roomName || roomName === roomId;
+  return (unnamed ? 'FERRY' : roomName).slice(0, 64);
+}
+
 /** Sort key: known times first, soonest first; then the ferry's name. */
 function rowOrder(a: DepartureRow, b: DepartureRow): number {
   const ta = a.at ?? Number.POSITIVE_INFINITY;
@@ -435,11 +452,14 @@ export function boardView(i: BoardInput): BoardView {
       cache = {};
       i.caches.set(ferry.shipRoomId, cache);
     }
-    const r = ferryRow(ferry, i.here, i.now, cache);
+    let r = ferryRow(ferry, i.here, i.now, cache);
     const s = summaryOf.get(ferry.shipRoomId);
     if (s && i.isHereRoom && s.updatedAt > ferry.at) {
       if (s.routeIdle) continue;
       if (s.routeStatus) {
+        // Renamed since this room's copy: the row keeps its clock-live times
+        // under the newer name (a route summary names it as boards do).
+        if (r && s.name !== r.ferry) r = { ...r, ferry: s.name };
         // A later run than the one this room holds (a replacement route): the
         // held one is over, whether or not the new one calls here now.
         const laterRun = s.routeRun !== undefined && s.routeRun > (ferry.route.startedAt ?? ferry.endedRun ?? 0);

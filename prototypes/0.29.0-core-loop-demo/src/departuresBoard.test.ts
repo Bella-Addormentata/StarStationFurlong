@@ -15,6 +15,7 @@ import {
   SUMMARY_ROW_MAX_AGE_MS,
   boardView,
   ferryDocksHere,
+  ferryName,
   ferryRow,
   routePortGate,
   routeSummaryFields,
@@ -33,6 +34,7 @@ import {
   liveDockFrom,
   pauseCheckpoint,
   routeFlightAt,
+  routeLegFuel,
   skipCheckpoint,
   startCheckpoint,
 } from './pilotRoute';
@@ -242,6 +244,46 @@ describe('a ferry on its way', () => {
   });
 });
 
+describe('⛽ a later call, with the timetable’s fuel rules', () => {
+  const loop = (over: Partial<ShipRoute> = {}) => running({ stops: [stop(0, 0), stop(1, 1), stop(2, 2)], shape: 'loop', ...over });
+  const cost = (r: ShipRoute, a: number, b: number) => routeLegFuel(r, a, b)!;
+
+  it('shows no call the fuel can’t reach: the timetable ends the route before it', () => {
+    const route = loop();
+    const low = cost(route, 0, 1) + cost(route, 1, 2) - 1;
+    const s = startCheckpoint(route, { at: T0, pilot: 'robot', fuel: low })!;
+    const full = start(route);
+    // Docked at stop 0, and in flight to stop 1: stop 2's board.
+    for (const now of [T0 + 10 * SEC, s.departAt + SEC]) {
+      expect(ferryRow(ferry(route, [s]), boardAt(2), now)).toBeNull();
+      const w = legWindowAfter(route, 1, full.arriveAt + MIN)!;
+      expect(ferryRow(ferry(route, [full]), boardAt(2), now)).toMatchObject({ dir: 'from', place: 'Stop 1', at: w.arriveAt, status: 'ON TIME' });
+    }
+    // …and the timetable agrees: it ends at stop 1, out of fuel.
+    const w = legWindowAfter(route, 1, s.arriveAt + MIN)!;
+    expect(routeFlightAt(route, [s], null, w.departAt + SEC, 100)).toMatchObject({ status: 'docked', stopIndex: 1, ended: 'fuel' });
+  });
+
+  it('counts the home refill: a call after the home stop is shown only when the tanks refill there', () => {
+    const cap = 200;
+    const trip = (homeRefuel: boolean) => {
+      const route = loop(homeRefuel ? { homeRefuel: true } : {});
+      // Enough for 0→1→2→0, not for 0→1 again.
+      const fuel = cost(route, 0, 1) + cost(route, 1, 2) + cost(route, 2, 0) + cost(route, 0, 1) - 1;
+      const s = startCheckpoint(route, { at: T0, pilot: 'robot', fuel })!;
+      const w1 = legWindowAfter(route, 1, s.arriveAt + MIN)!;
+      const w2 = legWindowAfter(route, 2, w1.arriveAt + MIN)!;
+      const w3 = legWindowAfter(route, 3, w2.arriveAt + MIN)!;
+      const now = w2.departAt + SEC;
+      expect(routeFlightAt(route, [s], null, now, cap)).toMatchObject({ status: 'in-flight', stopIndex: 2, nextStopIndex: 0 });
+      return { row: ferryRow({ ...ferry(route, [s]), capacity: cap }, boardAt(1), now), w3 };
+    };
+    const refilled = trip(true);
+    expect(refilled.row).toMatchObject({ dir: 'from', place: 'Stop 0', at: refilled.w3.arriveAt, status: 'ON TIME' });
+    expect(trip(false).row).toBeNull();
+  });
+});
+
 describe('the board', () => {
   const route = running();
   const s = start(route);
@@ -344,6 +386,22 @@ describe('the board', () => {
       routeRun: T0, routeNews: T0 + 3 * SEC, routeStatus: 'holding', status: 'in-flight', fromRoom: 'room-7', toRoom: 'room-9', nextStopRoom: 'room-9',
     });
     expect(view(holdingElsewhere)).toEqual([expect.objectContaining({ dir: 'to', status: 'DELAYED', at: null, note: 'time unknown', asOf: T0 + 5 * SEC })]);
+    // Renamed since: the held row, read from the clock, under the new name.
+    const renamed = view(mine({ name: 'Star Hopper' }));
+    expect(renamed).toEqual([expect.objectContaining({ ferry: 'Star Hopper', status: 'BOARDING', at: s.departAt })]);
+    expect(renamed[0].asOf).toBeUndefined();
+    // …only by a newer summary that speaks for the route.
+    expect(view(mine({ name: 'Star Hopper', updatedAt: T0 - SEC }))).toEqual([expect.objectContaining({ ferry: 'Ferry One' })]);
+    const { routeStatus: _r, ...noRoute } = mine({ name: 'SHIP' });
+    expect(view(noRoute)).toEqual([expect.objectContaining({ ferry: 'Ferry One' })]);
+  });
+
+  it('a ferry is named as its riders named the room, or FERRY while it has only its id', () => {
+    expect(ferryName('Star Hopper', 'room-9')).toBe('Star Hopper');
+    expect(ferryName('room-9', 'room-9')).toBe('FERRY');
+    expect(ferryName('', 'room-9')).toBe('FERRY');
+    expect(ferryName(undefined, 'room-9')).toBe('FERRY');
+    expect(ferryName('x'.repeat(80), 'room-9')).toHaveLength(64);
   });
 
   it('a summary row: docked here, or flying here; nothing stale, off route or elsewhere', () => {

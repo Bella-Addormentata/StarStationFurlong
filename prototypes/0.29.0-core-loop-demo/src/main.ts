@@ -153,6 +153,7 @@ import {
 } from "./departuresDoc";
 import {
   boardView as departuresBoardView,
+  ferryName,
   routePortGate,
   routeSummaryFields,
   type BoardDock,
@@ -1405,9 +1406,13 @@ function planetShipStatus(): ShipStatusInput | null {
   const to = byId(rec.destinationId);
   const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
   if (!planetId) return null;
-  const name =
-    (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) || "SHIP";
-  const out: ShipStatusInput = { roomId, name: name.slice(0, 64), planetId, status: rec.status };
+  const roomName = yjsSync?.doc.getMap("roomInfo").get("name");
+  // 🚏📋 A ferry on its route goes by its board name, so a newer summary can
+  // rename the rows boards hold for it.
+  const name = isRouteRunning(readShipRoute())
+    ? ferryName(roomName, roomId)
+    : ((roomName as string | undefined) || "SHIP").slice(0, 64);
+  const out: ShipStatusInput = { roomId, name, planetId, status: rec.status };
   if (from?.welcomeRoomId) out.fromRoom = from.welcomeRoomId;
   if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
   if (rec.departedAt !== undefined) out.departedAt = rec.departedAt;
@@ -2127,13 +2132,7 @@ async function joinRoomAtEpoch(
     // per join.
     const departures = createDeparturesPublisher({
       shipRoomId: () => activeBootstrap?.roomId ?? "",
-      shipName: () => {
-        const n = yjsSync?.doc.getMap("roomInfo").get("name");
-        // A new room is named after its id until someone renames it; a board
-        // says FERRY then, not the id.
-        const unnamed = typeof n !== "string" || !n || n === activeBootstrap?.roomId;
-        return (unnamed ? "FERRY" : n).slice(0, 64);
-      },
+      shipName: () => ferryName(yjsSync?.doc.getMap("roomInfo").get("name"), activeBootstrap?.roomId ?? ""),
       capacity: shipFuelCapacity,
       route: readShipRoute,
       checkpoints: readRouteCheckpoints,
