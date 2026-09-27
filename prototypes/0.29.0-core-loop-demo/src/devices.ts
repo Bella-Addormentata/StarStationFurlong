@@ -2518,7 +2518,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         destinationId: dest.id,
         departedAt: nowHop.departAt,
         etaAt: nowHop.arriveAt,
-        castOffAt: Math.min(Date.now(), nowHop.departAt),
+        // A whole ms, no later than the burn (flight times are whole ms).
+        castOffAt: Math.floor(Math.min(Date.now(), nowHop.departAt)),
       });
       if (!departed) { render(); return; }
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped

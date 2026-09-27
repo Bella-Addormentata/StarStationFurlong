@@ -330,8 +330,8 @@ describe('the record in the room doc and on this install', () => {
     writeFuelLevel(9_000, 10_000);
     const move = moveTo();
     writeStationMove(move);
-    expect(readMoveFuelDrawn()).toBe(move.fuelDrawn);
-    expect(readFuelLevel()).toBe(9_000 - move.fuelDrawn);
+    expect(readMoveFuelDrawn()).toBe(move.fuel);
+    expect(readFuelLevel()).toBe(9_000 - move.fuel);
   });
 
   it('a trim burn and a move started at once from two tabs both pay, whichever tab Yjs favours', () => {
@@ -515,6 +515,42 @@ describe('tugs: a torch tow', () => {
     expect(isTowing('tug-room', NOW + 1)).toBe(true);
     expect(isTowing('other-room', NOW + 1)).toBe(false);
     expect(isTowing('tug-room', plan.move.arriveAt)).toBe(false);
+  });
+
+  it('two moves written at once both land, and only the one that flies is paid for, everywhere', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b = { ...a, toSlot: a.toSlot + 1, fuel: a.fuel + 5 };
+    const winner = compareMoves(a, b) > 0 ? a : b;
+    const loser = winner === a ? b : a;
+    const d1 = new Y.Doc();
+    const d2 = new Y.Doc();
+    d1.clientID = 1; d2.clientID = 2;
+    bindStationMoveDoc(d1);
+    writeStationMove(a);
+    bindStationMoveDoc(d2);
+    writeStationMove(b);
+    // Offline tabs meet.
+    Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+    Y.applyUpdate(d2, Y.encodeStateAsUpdate(d1));
+    for (const d of [d1, d2]) {
+      store.clear();
+      bindStationMoveDoc(d);
+      expect(readStationMove()).toEqual(winner);
+      expect(readMoveFuelDrawn()).toBe(winner.fuel);
+      expect(isTowing('tug-room', NOW + 1)).toBe(true);
+      expect(readRememberedMoves()).toEqual([winner]);
+    }
+    // A room holding only the loser (another room's doc wrote the winner)
+    // neither tows nor pays once the winner is known here.
+    store.clear();
+    rememberMove(winner);
+    const d3 = new Y.Doc();
+    bindStationMoveDoc(d3);
+    writeStationMove(loser);
+    expect(readStationMove()).toBeNull();
+    expect(readMoveFuelDrawn()).toBe(0);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
