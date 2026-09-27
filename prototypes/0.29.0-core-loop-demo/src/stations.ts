@@ -26,9 +26,10 @@
  * planet) is the natural next step once ship travel needs it.
  */
 
-import { atlasComponents, readAtlas } from './stationAtlas';
+import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
+import type { DoorRecord } from './doorsDoc';
 
 export interface PlanetRecord {
   /** Matches the solar map's planet body id (map.ts). */
@@ -289,11 +290,55 @@ export function stationForRoom(
     const placed = id ? stations.find((s) => s.id === id) : undefined;
     if (placed) return placed;
   }
+  return atlasStationForRoom(roomId, atlas, stations);
+}
+
+/** What the atlas alone says: the station whose welcome room shares the
+ *  room's component. */
+function atlasStationForRoom(
+  roomId: string,
+  atlas: Record<string, AtlasEntry>,
+  stations: StationRecord[],
+): StationRecord | null {
+  if (!roomId) return null;
   const direct = stations.find((s) => s.welcomeRoomId === roomId);
   if (direct) return direct;
   const component = atlasComponents(atlas).find((c) => c.has(roomId));
   if (!component) return null;
   return stations.find((s) => s.welcomeRoomId !== '' && component.has(s.welcomeRoomId)) ?? null;
+}
+
+/**
+ * ⚓ The station a DOCKED module is at, read from its live door records — what
+ * main.ts installs as the room-station resolver for the room the player is in.
+ * Only a lone module moves: no structural (non-berth) pairing, live or in the
+ * atlas, and no station of its own beyond the one derived from it. It is at
+ * the station on the far side of one of its docks, when that side is a real
+ * station — a saved or built-in record, or structure of more than one room —
+ * so two lone modules docked together stay where they are, and a station
+ * never moves to the ship visiting it. null: the atlas places the room.
+ */
+export function dockedStationFor(
+  roomId: string,
+  doors: Iterable<DoorRecord>,
+  atlas: Record<string, AtlasEntry> = readAtlas(),
+  stations: StationRecord[] = listStations(atlas),
+): string | null {
+  const own = atlasStationForRoom(roomId, atlas, stations);
+  if (own && (!own.derived || atlasComponent(atlas, roomId).size > 1)) return null;
+  const partners: string[] = [];
+  for (const rec of doors) {
+    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    if (!isBerthDoor(rec)) return null; // bolted into a station: the atlas places it
+    const partner = roomIdFromSeed(rec.connectedRoomAddress);
+    if (partner && partner !== roomId) partners.push(partner);
+  }
+  for (const partner of partners) {
+    const there = atlasStationForRoom(partner, atlas, stations);
+    if (!there || there.id === own?.id) continue;
+    if (!there.derived || atlasComponent(atlas, there.welcomeRoomId).size > 1) return there.id;
+  }
+  return null;
 }
 
 /** The planet a room's station orbits — the default planet when unknown. */

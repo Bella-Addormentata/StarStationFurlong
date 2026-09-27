@@ -113,7 +113,7 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { clearShipArrivalNote, noteShipArrival, setHelmOwnerCheck } from "./devices";
 import { completeArrival } from "./shipArrival";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -154,6 +154,7 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
 import {
+  dockedStationFor,
   listStations,
   registerStation,
   removeStation,
@@ -1724,13 +1725,12 @@ async function joinRoomAtEpoch(
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
       ),
     );
-    // A ship is its own atlas station (docks are not station structure), so
-    // the room it stands in resolves through its live dock: the backdrop
-    // planet, the holotable and every stationForRoom caller then see the
-    // station it is docked at. Station rooms keep the atlas answer.
+    // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
+    // from the station it is docked at: the current room's live docks place
+    // it (the holotable's "you are here", the exterior's planet).
     setRoomStationResolver((roomId) =>
-      roomId === activeBootstrap?.roomId && isShipReady()
-        ? shipStationHere(roomId)
+      roomId && roomId === activeBootstrap?.roomId
+        ? dockedStationFor(roomId, readAllDoors().values())
         : null,
     );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
