@@ -206,7 +206,7 @@ export function atlasForBundle(
     const doors: BundledAtlasEntry['doors'] = {};
     for (const [id, d] of Object.entries(e.doors)) {
       // ⚓ A visiting ship's berth is not the station's layout.
-      if (!d?.targetRoomId || d.transient) continue;
+      if (!d?.targetRoomId || d.transient === true) continue;
       doors[id] = {
         targetRoomId: d.targetRoomId,
         ...(d.wall !== undefined ? { wall: d.wall } : {}),

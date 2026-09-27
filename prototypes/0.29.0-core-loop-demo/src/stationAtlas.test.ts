@@ -438,13 +438,64 @@ describe('transient berths (a visiting ship\'s dock)', () => {
     });
     const mine = readAtlas()['module-self'];
     expect(mine.doors['d:dock'].transient).toBe(true);
+    // A harvest passes no flag for this door, so its berth status is unknown.
     expect(mine.doors['d:gangway'].transient).toBeUndefined();
 
     bind('module-self');
     pushAtlasToDoc();
-    const published = doc.getMap('atlas').get('module-self') as { doors: Record<string, { transient?: true }> };
+    const published = doc.getMap('atlas').get('module-self') as { doors: Record<string, { transient?: boolean }> };
     expect(published.doors['d:dock'].transient).toBe(true);
-    expect(published.doors['d:gangway'].transient).toBeUndefined();
+    expect('transient' in published.doors['d:gangway']).toBe(false); // unknown stays unsent
+  });
+
+  it('publish a KNOWN non-berth as false, so readers can tell it from an older client', () => {
+    harvestIntoAtlas({
+      roomId: 'module-self',
+      name: 'SELF',
+      doors: [{ doorId: 'd:gangway', targetSeed: 'ssf://x#room=module-hall', transient: false }],
+    });
+    bind('module-self');
+    pushAtlasToDoc();
+    const published = doc.getMap('atlas').get('module-self') as { doors: Record<string, { transient?: boolean }> };
+    expect(published.doors['d:gangway'].transient).toBe(false);
+  });
+
+  it('survive gossip from an older client that never sends the flag', () => {
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-peer': {
+        roomId: 'module-peer',
+        name: 'PEER',
+        doors: {
+          'd:dock': { targetSeed: '', targetRoomId: 'module-ship', transient: true },
+          'd:moved': { targetSeed: '', targetRoomId: 'module-ship-1', transient: true },
+        },
+        lastSeen: Date.now() - 120_000,
+      },
+    }));
+    // Newer, but from a client that predates the flag.
+    doc.getMap('atlas').set('module-peer', {
+      roomId: 'module-peer',
+      name: 'PEER',
+      doors: {
+        'd:dock': { targetRoomId: 'module-ship', targetSeed: '' },
+        'd:moved': { targetRoomId: 'module-ship-2', targetSeed: '' },
+      },
+      updatedAt: Date.now() - 60_000,
+    });
+    bind();
+    let peer = readAtlas()['module-peer'];
+    expect(peer.doors['d:dock'].transient).toBe(true); // same berth: the marker is kept
+    expect(peer.doors['d:moved'].transient).toBeUndefined(); // a different room: nothing to carry
+
+    // A client that knows the flag can still clear it.
+    doc.getMap('atlas').set('module-peer', {
+      roomId: 'module-peer',
+      name: 'PEER',
+      doors: { 'd:dock': { targetRoomId: 'module-ship', targetSeed: '', transient: false } },
+      updatedAt: Date.now() - 30_000,
+    });
+    peer = readAtlas()['module-peer'];
+    expect(peer.doors['d:dock'].transient).toBe(false);
   });
 
   it('are read from a peer only as exactly true', () => {

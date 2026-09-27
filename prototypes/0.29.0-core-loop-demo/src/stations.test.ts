@@ -294,6 +294,19 @@ describe('solar map station bodies', () => {
     }
   });
 
+  it('keeps a holotable trip on its destination\'s refreshed body, and calls it off when the station is gone', () => {
+    const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+    const map = new SolarSystemMap();
+    map.refreshStations(listStations({}, [rec]), null);
+    const internals = map as unknown as { travelDestination: { id: string; name: string } | null };
+    internals.travelDestination = stationBodies([rec])[0];
+    map.refreshStations(listStations({}, [{ ...rec, name: 'L4 DEPOT' }]), null);
+    expect(internals.travelDestination?.name).toBe('L4 DEPOT');
+    map.refreshStations(listStations({}, []), DEFAULT_STATION_RECORD);
+    expect(internals.travelDestination).toBeNull();
+    expect(map.getPlayerLocationId()).toBe(DEFAULT_STATION_ID);
+  });
+
   it('defaults to Furlong as the player location, as before', () => {
     expect(new SolarSystemMap().getPlayerLocationId()).toBe('furlong-station');
   });
