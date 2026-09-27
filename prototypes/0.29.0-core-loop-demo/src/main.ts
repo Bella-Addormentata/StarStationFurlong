@@ -1588,6 +1588,7 @@ async function joinRoomAtEpoch(
       return trim && { ...trim, fuelDrawn: readFuelDrawn() };
     },
     ship: planetShipStatus,
+    roomId: () => activeBootstrap?.roomId || null,
   });
 
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.

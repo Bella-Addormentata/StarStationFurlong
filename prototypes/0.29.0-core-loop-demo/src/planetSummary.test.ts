@@ -484,6 +484,50 @@ describe('ships and the solar system', () => {
     expect(doc.getMap('shipSummaries').get('room-ship')).toEqual(winner);
   });
 
+  it('withdraws the ship entry when the room stops being a ship', () => {
+    let status: ShipStatusInput | null = ship;
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status, roomId: () => 'room-ship' }));
+    expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
+    status = null; // bolted into a station
+    publishPlanetSummary(Date.now() + 1);
+    expect(shipsAroundPlanet(SOV)).toEqual([]);
+    expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ retired: true });
+    // Another install that still holds the old entry learns the withdrawal.
+    const other = new Y.Doc();
+    sync(doc, other);
+    unbindPlanetSummaryForTest();
+    store.set('ssf-planet-summary', JSON.stringify({ stations: {}, ships: { 'room-ship': { ...ship, updatedAt: Date.now() - 1000 } } }));
+    expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
+    bindPlanetSummaryDoc(other, install(null));
+    expect(shipsAroundPlanet(SOV)).toEqual([]);
+  });
+
+  it('stamps a local ship change past a peer stamp that runs ahead', () => {
+    let status = ship;
+    const doc = new Y.Doc();
+    const ahead = Date.now() + 3600 * 1000;
+    doc.getMap('shipSummaries').set('room-ship', { ...ship, updatedAt: ahead });
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status }));
+    status = { ...ship, status: 'in-flight', toRoom: 'room-b', departedAt: T0, etaAt: T0 + 60_000 };
+    publishPlanetSummary(Date.now());
+    expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ status: 'in-flight', updatedAt: ahead + 1 });
+  });
+
+  it('keeps the same ships when more than fit share one stamp, whatever the arrival order', () => {
+    const now = Date.now();
+    const keys = Array.from({ length: 40 }, (_, i) => `room-s${String(i).padStart(2, '0')}`);
+    const kept = (order: string[]) => {
+      unbindPlanetSummaryForTest();
+      store.clear();
+      const doc = new Y.Doc();
+      for (const k of order) doc.getMap('shipSummaries').set(k, { ...ship, roomId: k, updatedAt: now });
+      bindPlanetSummaryDoc(doc, install(null));
+      return Object.keys(readStore(now).ships).sort();
+    };
+    expect(kept(keys)).toEqual(kept([...keys].reverse()));
+  });
+
   it('forgets a ship not heard from in a day', () => {
     const doc = new Y.Doc();
     bindPlanetSummaryDoc(doc, install(null, { ship: () => ship }));
