@@ -351,13 +351,14 @@ const drawMeters = new Map<string, { meter: FuelDrawMeter; unsubscribe: () => vo
 
 /** Install one consumer's draw meter under its name (null removes it): a
  *  letter, then up to 63 letters, digits, `-` or `_`. A meter change moves
- *  the gauge, so ship subscribers hear about it too. */
+ *  the gauge, and so does installing, replacing or removing a meter, so ship
+ *  subscribers hear about each. */
 export function setFuelDrawMeter(name: string, meter: FuelDrawMeter | null): void {
   if (!METER_NAME.test(name)) throw new Error(`[ship] not a fuel draw meter name: ${JSON.stringify(name)}`);
   drawMeters.get(name)?.unsubscribe();
   drawMeters.delete(name);
   if (meter) drawMeters.set(name, { meter, unsubscribe: meter.subscribe(() => notify()) });
-  version += 1;
+  notify();
 }
 
 /** A meter value off the wire: anything but a number in (0, FUEL_METER_MAX] is 0. */
@@ -373,19 +374,56 @@ function meterReading(): number {
   return total;
 }
 
-/** The readings a fuel record was written against, by meter name, or null
- *  for a record from before per-meter readings. Names and values are checked
- *  as they come off the wire, and at most MAX_METERS count. */
-function recordedMeters(rec: FuelRecord): Map<string, number> | null {
-  const raw: unknown = rec.meters;
+/** The own keys among the first MAX_METERS keys of a record's `meters` or
+ *  `settled`, with their values; not an object, null. A level write never
+ *  keeps more, so a peer's longer one is read no further than that. */
+function firstEntries(raw: unknown): Array<[string, unknown]> | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
-  const out = new Map<string, number>();
-  for (const [name, v] of Object.entries(raw)) {
-    if (out.size >= MAX_METERS) break;
-    const value = meterValue(v);
-    if (value > 0 && METER_NAME.test(name)) out.set(name, value);
+  const out: Array<[string, unknown]> = [];
+  let seen = 0;
+  for (const name in raw) {
+    if (seen++ >= MAX_METERS) break;
+    if (Object.prototype.hasOwnProperty.call(raw, name)) out.push([name, (raw as Record<string, unknown>)[name]]);
   }
   return out;
+}
+
+interface ParsedFuelRecord {
+  recorded: Map<string, number> | null;
+  settled: Map<string, unknown>;
+}
+
+/** Each fuel record's readings and settlements, parsed the first time it is
+ *  read: a value in a Yjs map is replaced, never changed in place, so every
+ *  gauge redraw and ceiling after that reads the same parse. */
+const parsedRecords = new WeakMap<FuelRecord, ParsedFuelRecord>();
+
+function parseFuelRecord(rec: FuelRecord): ParsedFuelRecord {
+  let parsed = parsedRecords.get(rec);
+  if (parsed) return parsed;
+  const meters = firstEntries(rec.meters);
+  let recorded: Map<string, number> | null = null;
+  if (meters) {
+    recorded = new Map();
+    for (const [name, v] of meters) {
+      const value = meterValue(v);
+      if (value > 0 && METER_NAME.test(name)) recorded.set(name, value);
+    }
+  }
+  const settled = new Map<string, unknown>();
+  for (const [name, v] of firstEntries(rec.settled) ?? []) {
+    if (METER_NAME.test(name) && v !== undefined) settled.set(name, v);
+  }
+  parsed = { recorded, settled };
+  parsedRecords.set(rec, parsed);
+  return parsed;
+}
+
+/** The readings a fuel record was written against, by meter name, or null
+ *  for a record from before per-meter readings. Names and values are checked
+ *  as they come off the wire, among the first MAX_METERS keys. */
+function recordedMeters(rec: FuelRecord): Map<string, number> | null {
+  return parseFuelRecord(rec).recorded;
 }
 
 /** What the meters have drawn since the level was written: each meter past
@@ -441,16 +479,9 @@ export function fuelCeiling(name: string, capacity = Number.POSITIVE_INFINITY): 
 }
 
 /** A fuel record's settlements by meter name, as they come off the wire:
- *  names checked, at most MAX_METERS. */
+ *  names checked, among the first MAX_METERS keys. */
 function settlementsOf(rec: FuelRecord): Map<string, unknown> {
-  const out = new Map<string, unknown>();
-  const raw: unknown = rec.settled;
-  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return out;
-  for (const [name, v] of Object.entries(raw)) {
-    if (out.size >= MAX_METERS) break;
-    if (METER_NAME.test(name) && v !== undefined) out.set(name, v);
-  }
-  return out;
+  return parseFuelRecord(rec).settled;
 }
 
 /** What meter `name` handed the level write that made the current fuel
