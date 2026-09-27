@@ -291,19 +291,31 @@ export function listStations(
     }
     return null;
   };
+  // A station whose move lands on a planet with every slot taken (two moves
+  // raced for its last slot) stays listed: back where it left from, else at
+  // the first planet with room. An accepted move never loses a station.
+  const place = (at: { planetId: string; orbitSlot: number; move?: StationMove }, move: StationMove | null) => {
+    const slot = claim(at.planetId, at.orbitSlot);
+    if (slot !== null || !move) return slot === null ? null : { planetId: at.planetId, orbitSlot: slot };
+    for (const [planetId, wanted] of [[move.fromPlanetId, move.fromSlot] as const, ...PLANETS.map((p) => [p.id, 0] as const)]) {
+      const s = claim(planetId, wanted);
+      if (s !== null) return { planetId, orbitSlot: s };
+    }
+    return null;
+  };
 
   const out: StationRecord[] = [];
   const places = new Set<string>();
   for (const r of [DEFAULT_STATION_RECORD, ...records]) {
     if (out.some((e) => e.id === r.id)) continue;
-    const place = placeOf(r.welcomeRoomId);
-    if (place && places.has(place)) continue;
+    const where = placeOf(r.welcomeRoomId);
+    if (where && places.has(where)) continue;
     const at = placeWithMove(r, nowMs);
-    const slot = claim(at.planetId, at.orbitSlot);
-    if (slot === null) continue;
-    if (place) places.add(place);
+    const spot = place(at, moveOf(r));
+    if (!spot) continue;
+    if (where) places.add(where);
     const { move: _stale, ...rest } = r;
-    out.push({ ...rest, planetId: planetById(at.planetId).id, orbitSlot: slot, ...(at.move ? { move: at.move } : {}) });
+    out.push({ ...rest, planetId: planetById(spot.planetId).id, orbitSlot: spot.orbitSlot, ...(at.move ? { move: at.move } : {}) });
   }
 
   // Atlas ids and names can arrive from peers unbounded, so derived records
@@ -326,14 +338,15 @@ export function listStations(
     const id = `${DERIVED_PREFIX}${d.anchor}`;
     // A derived station that has moved is listed where its move put it; one
     // that has not takes the lowest free slot around the default planet.
-    const at = placeWithMove({ id, welcomeRoomId: d.anchor, planetId: DEFAULT_PLANET_ID, orbitSlot: 0 }, nowMs);
-    const slot = claim(at.planetId, at.orbitSlot);
-    if (slot === null) continue;
+    const base = { id, welcomeRoomId: d.anchor, planetId: DEFAULT_PLANET_ID, orbitSlot: 0 };
+    const at = placeWithMove(base, nowMs);
+    const spot = place(at, moveOf(base));
+    if (!spot) continue;
     out.push({
       id,
       name: d.name,
-      planetId: planetById(at.planetId).id,
-      orbitSlot: slot,
+      planetId: planetById(spot.planetId).id,
+      orbitSlot: spot.orbitSlot,
       welcomeRoomId: d.anchor,
       derived: true,
       ...(at.move ? { move: at.move } : {}),

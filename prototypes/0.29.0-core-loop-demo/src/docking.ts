@@ -111,6 +111,7 @@ import {
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
+import { towHoldsDock } from "./stationMove";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2731,6 +2732,15 @@ export class DoorDockingPortSystem {
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
+    // 🚚 A tug under way holds its station by this dock: neither end lets go
+    // until the tow arrives.
+    if (towHoldsDock([roomId, port.roomId], Date.now())) {
+      this.setDockOp(doorId, {
+        note: "A tow is under way on this dock — it can't undock until the station arrives.",
+        tone: "bad",
+      });
+      return false;
+    }
     if (!this.canConstruct(doorId)) {
       this.setDockOp(doorId, {
         note: "Only this door's owner (or a builder here) can undock it.",

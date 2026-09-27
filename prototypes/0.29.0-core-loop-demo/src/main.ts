@@ -135,7 +135,7 @@ import {
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
-import { bindStationMoveDoc, installStationMoveResolver } from "./stationMove";
+import { bindStationMoveDoc, installStationMoveResolver, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1792,6 +1792,8 @@ async function joinRoomAtEpoch(
     installTrimResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
+    // 🚚 A move this room remembers goes out on the planet summary at once.
+    subscribeStationMove(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).

@@ -28,6 +28,7 @@ import {
   planTow,
   towFuelCost,
   towPointAt,
+  towHoldsDock,
   installStationMoveResolver,
   isStationMove,
   movePhase,
@@ -163,7 +164,34 @@ describe('the station list follows a move', () => {
     expect(planRecordHop(other, furlong, mid)).toBeNull();
     expect(planRecordHop(furlong, other, mid)).toBeNull();
     const home = listStations({}, [other], move.departAt - 1).find((s) => s.id === DEFAULT_STATION_ID)!;
-    expect(planRecordHop(other, home, move.departAt - 1)).not.toBeNull();
+    const early = move.departAt - 10 * 3_600_000;
+    expect(planRecordHop(other, home, early)).not.toBeNull();
+  });
+
+  it('refuses a hop that would arrive after the station has left', () => {
+    const move = moveTo();
+    setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
+    const other: StationRecord = { id: 'yard', name: 'YARD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'y' };
+    const justBefore = move.departAt - 1_000;
+    const home = listStations({}, [other], justBefore).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(stationInTransit(home, justBefore)).toBe(false);
+    expect(planRecordHop(other, home, justBefore)).toBeNull();
+    expect(planRecordHop(home, other, justBefore)).toBeNull();
+  });
+
+  it('keeps a station listed when its move lands on a full planet', () => {
+    const move = moveTo();
+    setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    // Sixteen stations already fill Aris; the mover is listed after them,
+    // so it loses the race for a slot there.
+    const moved: StationRecord = { id: 'mover', name: 'MOVER', planetId: SOV, orbitSlot: 4, welcomeRoomId: 'm' };
+    const mover = { ...move, stationId: 'mover', welcomeRoomId: 'm', fromSlot: 4 };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'm' ? mover : null));
+    const list = listStations({}, [...full, moved], move.arriveAt + 1);
+    expect(list.filter((s) => s.planetId === ARIS)).toHaveLength(16);
+    expect(list.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
   });
 });
 
@@ -180,6 +208,12 @@ describe('the record in the room doc and on this install', () => {
     bindStationMoveDoc(new Y.Doc());
     expect(listStations({}, [], move.arriveAt + 1).find((s) => s.id === DEFAULT_STATION_ID))
       .toMatchObject({ planetId: ARIS });
+  });
+
+  it('keeps the latest move of every station the summaries can carry', () => {
+    const move = moveTo();
+    for (let i = 0; i < 64; i++) rememberMove({ ...move, stationId: `s${i}`, welcomeRoomId: `w${i}` });
+    expect(readRememberedMoves()).toHaveLength(64);
   });
 
   it('remembers a move a peer wrote into the room', () => {
@@ -378,5 +412,16 @@ describe('tugs: a torch tow', () => {
     expect(isTowing('tug-room', NOW + 1)).toBe(true);
     expect(isTowing('other-room', NOW + 1)).toBe(false);
     expect(isTowing('tug-room', plan.move.arriveAt)).toBe(false);
+  });
+
+  it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    // The station's room: no move in its doc, but the install remembers it.
+    bindStationMoveDoc(new Y.Doc());
+    rememberMove(plan.move);
+    expect(towHoldsDock(['station-room', 'tug-room'], NOW + 1)).toBe(true);
+    expect(towHoldsDock(['station-room', 'other-room'], NOW + 1)).toBe(false);
+    expect(towHoldsDock(['tug-room'], plan.move.arriveAt)).toBe(false);
   });
 });

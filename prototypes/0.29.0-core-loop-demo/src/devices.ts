@@ -55,6 +55,7 @@ import {
   formatLongSpan,
   isMoveActive,
   isTowing,
+  towHoldsDock,
   otherPlanets,
   planStationTow,
   quoteTow,
@@ -2138,6 +2139,8 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
       ? `Arrived at ${outcome.stationName} — the berth refused the ship (taken, or closed). Dock from a door panel when one frees up.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
+      : outcome.reason === 'in-transit'
+      ? `Arrived — but ${outcome.stationName} has left for another planet, so there is no berth in reach. Pick another destination.`
       : outcome.reason === 'unlisted-station'
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
         : outcome.reason === 'no-port'
@@ -2539,7 +2542,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         `<button type="button" data-helm-dock="${verb}" data-door="${esc(p.doorId)}" ${canAct ? '' : 'disabled'} style="width:100%; margin-top:8px; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.3); color:${color}; font-size:11px; font-weight:800; padding:8px; cursor:${canAct ? 'pointer' : 'not-allowed'}; opacity:${canAct ? '1' : '0.45'}; letter-spacing:1px;">${label}</button>`;
       const who = esc(p.partnerName ?? 'the other module');
       const verb = p.state.kind === 'docked'
-        ? btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80')
+        ? (towHoldsDock([currentRoomId()], Date.now())
+          ? `<div style="margin-top:6px; color:#FFB300;">🚚 Towing — this dock holds the station until it arrives.</div>`
+          : btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80'))
         : p.state.kind === 'undocked'
           ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
           : p.state.kind === 'free'
