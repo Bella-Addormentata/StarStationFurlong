@@ -182,6 +182,28 @@ describe('the station atlas', () => {
 });
 
 describe('gate gossip that doors alone would skip', () => {
+  it("takes an older doc copy's gates when our newer copy of the room has none", () => {
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS',
+      doors: [
+        { doorId: 'west', targetSeed: seed('room-a'), transient: false },
+        { doorId: 'north', targetSeed: seed('room-c'), transient: false },
+      ],
+    });
+    expect(readAtlas()['room-b']?.gates).toBeUndefined();
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: 1,
+      doors: { west: { targetRoomId: 'room-a', farDoor: 'east', transient: false } },
+      gates: { south: 2 }, gateAccess: { south: { access: 'closed' } },
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    const b = readAtlas()['room-b']!;
+    expect(b.gates).toEqual({ south: 2 });
+    expect(b.gateAccess).toEqual({ south: { access: 'closed' } });
+    expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
+  });
+
   it("adds our gates to an equally new doc copy that has none, keeping its doors and size", () => {
     twoRoomStation();
     // Our own (older) record of room-b also knows an older size.
@@ -450,6 +472,19 @@ describe('ship destinations', () => {
     }], (room) => (room === 'room-c' ? undefined : seed(room)));
     expect(dest.berths).toEqual([]);
     expect(dest.berth).toBeUndefined();
+  });
+});
+
+describe('an arriving ship\'s memory', () => {
+  it('is not asked in a room whose listed gates it matches none of', () => {
+    const station = { berths: [{ address: seed('room-far'), farDoor: 'east', gate: 1, access: 'closed' as const }] };
+    // A legacy memory without its door.
+    const remembered = { address: seed('room-far') } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station, remembered })).toEqual([]);
+    // One of the room's open gates, remembered, is asked.
+    const open = { berths: [...station.berths, { address: seed('room-far'), farDoor: 'west', gate: 2 }] };
+    const west = { address: seed('room-far'), farDoor: 'west' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+    expect(arrivalBerths({ station: open, remembered: west }).map((b) => b.farDoor)).toEqual(['west']);
   });
 });
 

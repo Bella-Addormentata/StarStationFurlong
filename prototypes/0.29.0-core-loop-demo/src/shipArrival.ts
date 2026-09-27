@@ -160,9 +160,15 @@ export function arrivalBerths(input: {
     asked(b) ? 0 : ours(b) ? 1 : (b.access === 'pass' ? 4 : 2) + (b.occupied ? 1 : 0);
   const same = (a: StationBerth, b: StationBerth) =>
     sameRoom(a.address, b.address) && (a.farDoor ?? '') === (b.farDoor ?? '');
-  // The ship's memory of a gate the station now bars is not asked either.
+  // The ship's memory of a gate the station now bars is not asked either. In
+  // a room the station lists gates for, the memory stands only as one of the
+  // gates it may ask (a legacy memory may not name its door, and could
+  // otherwise slip past a barred one).
   const recalled = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
-  const remembered = recalled && !(station.berths ?? []).some((b) => barred(b) && same(b, recalled)) ? recalled : null;
+  const roomListed = !!recalled && (station.berths ?? []).some((b) => sameRoom(b.address, recalled.address));
+  const remembered = recalled && (roomListed
+    ? gates.some((b) => sameRoom(b.address, recalled.address) && (!b.farDoor || b.farDoor === recalled.farDoor))
+    : true) ? recalled : null;
   const listed: StationBerth[] = (station.berths ?? []).length > 0
     ? gates.map((b, i) => ({ b, i })).sort((x, y) => rank(x.b) - rank(y.b) || x.i - y.i).map((x) => x.b)
     : station.berth && isRoomSeed(station.berth.address) ? [station.berth] : [];
