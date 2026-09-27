@@ -19,7 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
-import { latestMoveOf, stationInTransit } from './stations';
+import { latestMoveOf, MAX_ORBIT_SLOTS, stationInTransit } from './stations';
 import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -155,7 +155,7 @@ export function adriftPlace(id: string): { planetId: string; orbitSlot: number }
   const cut = rest.lastIndexOf(':');
   const planetId = rest.slice(0, cut);
   const orbitSlot = Number(rest.slice(cut + 1));
-  if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot > 63) return null;
+  if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) return null;
   return { planetId, orbitSlot };
 }
 
