@@ -62,7 +62,10 @@ export function castOffRefusal(ports: readonly ArrivalPort[]): 'dock-busy' | 'do
 export interface ShipDockingApi {
   ports: () => ArrivalPort[];
   undock: (doorId: string) => void;
-  dock: (doorId: string) => void;
+  /** The shipped DOCK. Its answer (docking.ts redockPort: false when the far
+   *  berth refused, e.g. taken) settles what the helm says; no answer counts
+   *  as docked. */
+  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
 }
 
 /** A remembered berth with a pass this client holds for its room — what
@@ -259,10 +262,13 @@ export function castOffForDeparture(stationId: string, docking: ShipDockingApi):
 /** What the last arrival did — the helm shows it. */
 export type ArrivalOutcome =
   | { kind: 'docking'; stationName: string }
+  /** The DOCK went through (reported once the far berth answered). */
+  | { kind: 'docked'; stationName: string }
   | {
       kind: 'none';
       stationName: string;
-      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station';
+      /** `berths-taken`: the berth refused the DOCK (taken, or closed). */
+      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken';
     };
 
 /** How long an arrival waits for a commander who can dock (station records
@@ -283,7 +289,13 @@ export const ARRIVAL_GRACE_MS = 15_000;
  */
 export function completeArrival(
   docking: ShipDockingApi | null,
-  opts: { now?: number; force?: boolean } = {},
+  opts: {
+    now?: number;
+    force?: boolean;
+    /** Called once the DOCK answers: docked, or the berth refused. Only
+     *  when this returns `docking`. */
+    onSettled?: (outcome: ArrivalOutcome) => void;
+  } = {},
 ): ArrivalOutcome | null {
   const rec = readFlightRecord();
   if (rec.status !== 'redocking') return null;
@@ -317,6 +329,17 @@ export function completeArrival(
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
   if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
-  docking.dock(plan.doorId);
+  const settled = (ok: boolean | void): void => opts.onSettled?.(ok !== false
+    ? { kind: 'docked', stationName: station.name }
+    : { kind: 'none', stationName: station.name, reason: 'berths-taken' });
+  const failed = (err: unknown): void => {
+    console.warn('[ship] arrival DOCK threw:', err);
+    settled(false);
+  };
+  try {
+    void Promise.resolve(docking.dock(plan.doorId)).then(settled, failed);
+  } catch (err) {
+    failed(err);
+  }
   return { kind: 'docking', stationName: station.name };
 }
