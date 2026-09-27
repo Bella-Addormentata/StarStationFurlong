@@ -14,20 +14,23 @@ import {
   ROUTE_STATUSES,
   SUMMARY_ROW_MAX_AGE_MS,
   boardView,
+  ferryDocksHere,
   ferryRow,
+  routePortGate,
   routeSummaryFields,
   rowText,
   statusFromWire,
   statusToWire,
   summaryRow,
 } from './departuresBoard';
-import type { BoardHere } from './departuresBoard';
+import type { BoardDock, BoardHere } from './departuresBoard';
 import type { DepartureFerry } from './departuresDoc';
 import { formatClock } from './helmRoute';
 import {
   ROBOT_TAKEOVER_MS,
   holdCheckpoint,
   legWindowAfter,
+  liveDockFrom,
   pauseCheckpoint,
   routeFlightAt,
   skipCheckpoint,
@@ -74,11 +77,13 @@ function ferry(route: ShipRoute, checkpoints: RouteCheckpoint[], name = 'Ferry O
   return { shipRoomId: ship, name, capacity: 100, route, at: T0, checkpoints };
 }
 
-/** A board in stop `i`'s berth room, seeing `dock` (or none). */
-function boardAt(i: number, dock: { dockedAt: number; gate?: number } | null = null): BoardHere {
+/** A board in stop `i`'s berth room, seeing the ferry's `docks` there (or
+ *  none; one with no far door reads as the route port's). */
+function boardAt(i: number, docks: BoardDock | readonly BoardDock[] | null = null): BoardHere {
+  const list: readonly BoardDock[] = docks === null ? [] : 'dockedAt' in docks ? [docks] : docks;
   return {
     isHere: (s) => s.berth.roomId === `room-${i}`,
-    dockOf: (ship) => (ship === SHIP ? dock : null),
+    docksOf: (ship) => (ship === SHIP ? list : []),
   };
 }
 
@@ -104,6 +109,30 @@ describe('a ferry docked at this board’s stop', () => {
   it('a gate change shows the gate it really took', () => {
     const r = ferryRow(ferry(route, [s]), boardAt(0, { dockedAt: T0 + 2 * SEC, gate: 4 }), T0 + 10 * SEC);
     expect(r).toMatchObject({ gate: 4, status: 'BOARDING' });
+  });
+
+  it('🛟 the gate and BOARDING are the route port’s: another ship door’s pairing only holds the stay', () => {
+    // The route port is the ship's 'x-'; 'y+' is a guest or second dock.
+    const port: BoardDock = { dockedAt: T0 + 2 * SEC, gate: 3, farDoor: 'x-' };
+    const guest: BoardDock = { dockedAt: T0 + 5 * SEC, gate: 2, farDoor: 'y+' };
+    expect(ferryDocksHere([guest, port], 'x-')).toEqual({ port, at: T0 + 5 * SEC, held: T0 + 5 * SEC });
+    expect(ferryDocksHere([{ dockedAt: T0, gate: 4 }], 'x-')).toEqual({ port: { dockedAt: T0, gate: 4 }, at: T0, held: null });
+    expect(ferryDocksHere([], 'x-')).toEqual({ port: null, at: null, held: null });
+    expect(ferryRow(ferry(route, [s]), boardAt(0, [guest, port]), T0 + 10 * SEC)).toMatchObject({ gate: 3, status: 'BOARDING' });
+    // A guest pairing alone never shows BOARDING at its own gate.
+    const alone = ferryRow(ferry(route, [s]), boardAt(0, guest), T0 + BOARD_ARRIVING_MS + SEC);
+    expect(alone).toMatchObject({ gate: 1, status: 'NOT DOCKED' });
+    // The board's timetable is the riders' (the same docks, as they read them).
+    for (const now of [T0 + 10 * SEC, s.departAt + 20 * SEC, s.departAt + 10 * MIN]) {
+      const riders = routeFlightAt(route, [s], liveDockFrom(
+        [{ roomId: 'room-0', dockedAt: port.dockedAt, doorId: 'x-' }, { roomId: 'room-0', dockedAt: guest.dockedAt, doorId: 'y+' }],
+        undefined,
+        { routePort: 'x-' },
+      ), now, 100)!;
+      const row = ferryRow(ferry(route, [s]), boardAt(0, [guest, port]), now);
+      if (riders.status === 'docked' && riders.stopIndex === 0) expect(row).toMatchObject({ dir: 'to', gate: 3 });
+      else expect(row?.status).not.toBe('BOARDING');
+    }
   });
 
   it('ON TIME while it arrives, then NOT DOCKED when this berth never took it', () => {
@@ -223,7 +252,7 @@ describe('the board', () => {
     const second = ferry(other, [s2], 'Ferry Two', 'ship-room-2');
     const here: BoardHere = {
       isHere: (st) => st.berth.roomId === 'room-0',
-      dockOf: (ship) => (ship === SHIP ? { dockedAt: T0 + SEC, gate: 1 } : ship === 'ship-room-2' ? { dockedAt: T0 + MIN, gate: 3 } : null),
+      docksOf: (ship) => (ship === SHIP ? [{ dockedAt: T0 + SEC, gate: 1 }] : ship === 'ship-room-2' ? [{ dockedAt: T0 + MIN, gate: 3 }] : []),
     };
     const now = T0 + 70 * SEC;
     const all = boardView({ ferries: [second, ferry(route, [s])], here, gate: null, now });
@@ -312,6 +341,9 @@ describe('the board', () => {
     expect(summaryRow({ ...base, toRoom: 'welcome-5' }, isHereRoom, placeOf, T0)).toBeNull();
     expect(summaryRow({ ...base, status: 'docked', fromRoom: 'welcome-0', routeStatus: 'paused', departAt: T0 }, isHereRoom, placeOf, T0))
       .toMatchObject({ dir: 'to', status: 'PAUSED', at: null });
+    // Paused in flight, off its route: that flight's ETA is somewhere else's.
+    expect(summaryRow({ ...base, toRoom: 'welcome-5', nextStopRoom: 'welcome-0', routeStatus: 'paused' }, isHereRoom, placeOf, T0))
+      .toMatchObject({ dir: 'from', status: 'PAUSED', at: null });
   });
 
   it('prints a row: ferry, where, gate, HH:MM:SS, status and note', () => {
@@ -332,6 +364,18 @@ describe('the route fields of the ferry’s own summary', () => {
       nextStopRoom: 'room-1', gate: 4, departAt: s.departAt, routeStatus: 'boarding', routeRun: T0,
     });
     expect(routeSummaryFields(route, f, [s], null, T0 + BOARD_ARRIVING_MS + SEC)).toMatchObject({ routeStatus: 'not-docked', gate: 1 });
+  });
+
+  it('the gate it gives: the station records’ gate for that door, else its own berth’s', () => {
+    const st = route.stops[0];
+    const none = () => undefined;
+    expect(routePortGate(st, 'room-0', 'x+', none)).toBe(1);
+    // An older writer's record naming no far door, into the berth room.
+    expect(routePortGate(st, 'room-0', undefined, none)).toBe(1);
+    expect(routePortGate(st, 'room-0', 'y-', none)).toBeUndefined();
+    expect(routePortGate(st, 'room-0b', undefined, none)).toBeUndefined();
+    expect(routePortGate(st, 'room-0b', 'y-', (r, d) => (r === 'room-0b' && d === 'y-' ? 4 : undefined))).toBe(4);
+    expect(routePortGate(st, 'room-0', 'x+', () => 7)).toBe(7);
   });
 
   it('in flight: on time to the next stop’s gate; paused; nothing once over', () => {

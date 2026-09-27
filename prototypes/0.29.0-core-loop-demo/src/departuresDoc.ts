@@ -265,6 +265,13 @@ function newestRouteEntry<T extends { key: string; entry: Omit<DepartureFerry, '
   return best;
 }
 
+/** Ferries oldest publish first (their winning route entry's `at`), a tie
+ *  by ship id: the writer evicts from the front, the reader keeps the back,
+ *  so both drop the same ferries. */
+function byPublished(a: { ship: string; at: number }, b: { ship: string; at: number }): number {
+  return a.at - b.at || (a.ship < b.ship ? -1 : a.ship > b.ship ? 1 : 0);
+}
+
 /** The observation a checkpoint key's value carries: a hold's newest
  *  sighting, any other entry's `at`. A rewrite of one key keeps the newer. */
 function observedAt(e: RouteCheckpoint): number {
@@ -297,10 +304,18 @@ export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
     list.push({ run: k.run, e });
     ckpts.set(k.ship, list);
   }
+  // Two writers can each add a ferry to a map one short of full (each saw
+  // room for it): past the cap, the ferries published most recently stay,
+  // the same ones the next writer's eviction keeps.
+  const winners = [...candidates].map(([ship, list]) => {
+    const entry = newestRouteEntry(list)!.entry;
+    return { ship, at: entry.at, entry };
+  });
+  const kept = winners.length <= MAX_DEPARTURE_FERRIES
+    ? winners
+    : winners.sort(byPublished).slice(-MAX_DEPARTURE_FERRIES);
   const out: DepartureFerry[] = [];
-  for (const ship of [...candidates.keys()].sort()) {
-    if (out.length >= MAX_DEPARTURE_FERRIES) break;
-    const entry = newestRouteEntry(candidates.get(ship)!)!.entry;
+  for (const { ship, entry } of kept.sort((a, b) => (a.ship < b.ship ? -1 : a.ship > b.ship ? 1 : 0))) {
     const run = entry.route.startedAt;
     // The same cap as the ship's own reader, picked by stay (never by this
     // copy's key order), so every board reads a ferry alike.
@@ -357,11 +372,11 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   const ship = pub.shipRoomId;
 
   // Every key of this ferry (and, for the cap, every other ferry's route
-  // keys, its newest entry's stamp).
+  // keys and its winning entry's stamp).
   const mineKeys: Array<{ key: string; k: Extract<DepartureKey, { kind: 'ckpt' }> }> = [];
   const mineRoutes: Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }> = [];
   const mineRouteKeys: string[] = [];
-  const otherRoutes = new Map<string, { at: number; keys: string[] }>();
+  const otherRoutes = new Map<string, { keys: string[]; entries: Array<{ key: string; entry: Omit<DepartureFerry, 'checkpoints'> }> }>();
   let visited = 0;
   for (const key of map.keys()) {
     if (++visited > MAX_WRITE_KEYS_VISITED) break;
@@ -375,9 +390,9 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
       if (e) mineRoutes.push({ key, entry: e });
       continue;
     }
-    const o = otherRoutes.get(k.ship) ?? { at: Number.NEGATIVE_INFINITY, keys: [] };
+    const o = otherRoutes.get(k.ship) ?? { keys: [], entries: [] };
     o.keys.push(key);
-    if (e) o.at = Math.max(o.at, e.at);
+    if (e) o.entries.push({ key, entry: e });
     otherRoutes.set(k.ship, o);
   }
   const newest = newestRouteEntry(mineRoutes);
@@ -386,7 +401,11 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   const kept = takes ? pub : existing!;
   const keepKey = takes ? departureRouteKey(pub) : newest!.key;
   const run = kept.route.startedAt;
-  const others = [...otherRoutes].map(([s2, o]) => ({ ship: s2, ...o }));
+  const others = [...otherRoutes].map(([s2, o]) => ({
+    ship: s2,
+    keys: o.keys,
+    at: newestRouteEntry(o.entries)?.entry.at ?? Number.NEGATIVE_INFINITY,
+  }));
 
   let wrote = false;
   const set = (key: string, value: unknown) => {
@@ -433,7 +452,7 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
     }
     // A full room lets the ferry published longest ago go.
     if (!existing && takes && others.length >= MAX_DEPARTURE_FERRIES) {
-      others.sort((a, b) => a.at - b.at || (a.ship < b.ship ? -1 : 1));
+      others.sort(byPublished);
       for (const gone of others.slice(0, others.length - MAX_DEPARTURE_FERRIES + 1)) {
         for (const key of gone.keys) del(key);
         let n = 0;

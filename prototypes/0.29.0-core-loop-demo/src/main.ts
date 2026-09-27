@@ -150,7 +150,13 @@ import {
   readBoardSetting,
   readDepartureFerries,
 } from "./departuresDoc";
-import { boardView as departuresBoardView, routeSummaryFields, type BoardView } from "./departuresBoard";
+import {
+  boardView as departuresBoardView,
+  routePortGate,
+  routeSummaryFields,
+  type BoardDock,
+  type BoardView,
+} from "./departuresBoard";
 import { createDeparturesPublisher, initDeparturesWrite, writeDepartures } from "./departuresWrite";
 // 🚏🛟 A5: the route's keeper — docks and casts off a running ferry in every
 // game in the ship's room, on the timetable's moments.
@@ -1379,9 +1385,7 @@ function shipRoutePortDock(now: number): { gate?: number } | null {
     return null;
   }
   if (!farRoom || !sameStationReader()(stop, farRoom)) return null;
-  const gate =
-    stationGateOf(farRoom, rec.farDoor) ??
-    (farRoom === stop.berth.roomId && rec.farDoor === stop.berth.farDoor ? stop.berth.gate : undefined);
+  const gate = routePortGate(stop, farRoom, rec.farDoor, stationGateOf);
   return gate !== undefined ? { gate } : {};
 }
 
@@ -1428,7 +1432,8 @@ const boardWalkCaches = new Map<string, RouteWalkCache>();
  * hold, "as of" their time. Here is this room's station: this room, its
  * welcome room and its berth rooms, or the stop's station by the keeper's
  * own test. A ferry is docked here by this room's own docks (the far dock
- * write puts a ship's DOCK in the berth room's doc), at that port's gate.
+ * write puts a ship's DOCK in the berth room's doc): its route port's
+ * pairing gives the gate, and a pairing on another of its doors holds it.
  */
 function departureBoardFor(itemId: string): BoardView {
   const now = Date.now();
@@ -1439,7 +1444,7 @@ function departureBoardFor(itemId: string): BoardView {
   );
   const same = sameStationReader();
   const gates = readDockGates();
-  const docks = new Map<string, { dockedAt: number; gate?: number }>();
+  const docks = new Map<string, BoardDock[]>();
   for (const [doorId, rec] of readAllDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (rec.transient !== true && !isDockChain(rec.segments)) continue;
@@ -1452,7 +1457,12 @@ function departureBoardFor(itemId: string): BoardView {
     if (!ship) continue;
     const at = typeof rec.dockedAt === "number" && Number.isFinite(rec.dockedAt) ? rec.dockedAt : 0;
     const gate = gates[doorId];
-    docks.set(ship, gate !== undefined ? { dockedAt: at, gate } : { dockedAt: at });
+    // 🛟 Every pairing to the ship, with the ship's door it holds: the board
+    // takes the route port's gate and counts the others as holds.
+    const d: BoardDock = { dockedAt: at };
+    if (gate !== undefined) d.gate = gate;
+    if (typeof rec.farDoor === "string" && rec.farDoor) d.farDoor = rec.farDoor;
+    docks.set(ship, [...(docks.get(ship) ?? []), d]);
   }
   const ferries = readDepartureFerries();
   for (const k of [...boardWalkCaches.keys()]) {
@@ -1468,7 +1478,7 @@ function departureBoardFor(itemId: string): BoardView {
     ferries,
     here: {
       isHere: (stop) => hereRooms.has(stop.berth.roomId) || same(stop, roomId),
-      dockOf: (ship) => docks.get(ship) ?? null,
+      docksOf: (ship) => docks.get(ship) ?? [],
     },
     gate: boardGate(readBoardSetting(itemId), Object.values(gates)),
     summaries: station ? shipsAroundPlanet(station.planetId, now) : [],

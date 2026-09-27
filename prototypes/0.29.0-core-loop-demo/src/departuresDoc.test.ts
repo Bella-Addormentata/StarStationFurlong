@@ -370,6 +370,37 @@ describe('a publish applied to a stop room', () => {
 });
 
 describe('reading a room’s departures', () => {
+  it('two writers overfilling a room: readers and the next writer keep the same newest ferries', () => {
+    const route = running();
+    const s = start(route);
+    const base = new Y.Doc();
+    for (let i = 0; i < MAX_DEPARTURE_FERRIES - 1; i++) {
+      applyDeparturesPublish(base, pub(route, [s], T0 + i * SEC, { shipRoomId: `ship-${String(i).padStart(2, '0')}` }), T0 + i * SEC);
+    }
+    // Each writer sees room for one more ferry; merged, the room has one too many.
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(base));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(base));
+    applyDeparturesPublish(a, pub(route, [s], T0 + MIN, { shipRoomId: 'zz-new-a' }), T0 + MIN);
+    applyDeparturesPublish(b, pub(route, [s], T0 + MIN + SEC, { shipRoomId: 'zz-new-b' }), T0 + MIN + SEC);
+    Y.applyUpdate(base, Y.encodeStateAsUpdate(a));
+    Y.applyUpdate(base, Y.encodeStateAsUpdate(b));
+    const read = () => departureFerriesIn(base.getMap(DEPARTURES_MAP)).map((f) => f.shipRoomId);
+    const ships = read();
+    expect(ships).toHaveLength(MAX_DEPARTURE_FERRIES);
+    // The newest two stay (not the first 16 by id); the oldest is the one left out.
+    expect(ships).toContain('zz-new-a');
+    expect(ships).toContain('zz-new-b');
+    expect(ships).not.toContain('ship-00');
+    expect(ships).toEqual([...ships].sort());
+    // The next ferry's publish evicts what readers already left out, and the next oldest.
+    applyDeparturesPublish(base, pub(route, [s], T0 + 2 * MIN, { shipRoomId: 'zz-new-c' }), T0 + 2 * MIN);
+    expect(keys(base).some((k) => k.startsWith('ship-00:') || k.startsWith('ship-01:'))).toBe(false);
+    expect(read()).toEqual([...ships.filter((x) => x !== 'ship-01'), 'zz-new-c'].sort());
+  });
+
+
   it('keeps only the current run’s entries for its stops, sorted, and skips junk', () => {
     const doc = new Y.Doc();
     const map = doc.getMap(DEPARTURES_MAP);

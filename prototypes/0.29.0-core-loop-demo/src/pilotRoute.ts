@@ -837,7 +837,8 @@ function goneMarks(legs: Legs, entries: readonly RouteCheckpoint[]): Map<number,
  *  a pairing holds whatever stay the ferry is at, wherever it leads, until
  *  someone with rights over it lets it go (the ferry stays, DELAYED). Every
  *  rider reads the same door records, so every rider's timetable agrees; a
- *  station's board, which cannot see them, leaves it out. */
+ *  station's board sees only the pairings in its own room
+ *  (departuresBoard.ferryDocksHere). */
 export interface LiveDockAt {
   (stop: RouteStop, stopIndex: number): number | null;
   readonly held?: number | null;

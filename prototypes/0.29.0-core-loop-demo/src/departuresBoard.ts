@@ -144,9 +144,45 @@ export interface BoardHere {
   /** Is this route stop at the board's station (its berth room is the
    *  board's room, or another room of the same station)? */
   isHere: (stop: RouteStop) => boolean;
-  /** A door of the board's room paired to this ship room: when it was
-   *  docked and its gate; null when none is. */
-  dockOf: (shipRoomId: string) => { dockedAt: number; gate?: number } | null;
+  /** The doors of the board's room paired to this ship room (none when it
+   *  is not docked here). */
+  docksOf: (shipRoomId: string) => readonly BoardDock[];
+}
+
+/** One door of the board's room paired to a ship: when it was docked, its
+ *  gate, and which of the SHIP's doors holds the other end (`farDoor`,
+ *  absent from an older writer). */
+export interface BoardDock {
+  dockedAt: number;
+  gate?: number;
+  farDoor?: string;
+}
+
+/**
+ * A ferry's docks at the board's room, read as its riders read their own:
+ * `port` is the route port's pairing (its gate and BOARDING come from that
+ * one alone; an unnamed far door reads as it, as dockRules does), `at` the
+ * newest pairing of any door (the timetable's "docked at this stop"), and
+ * 🛟 `held` the oldest pairing on ANOTHER ship door (a guest or second dock
+ * holds the stay, as pilotRoute.liveDockFrom's `held`). Pure.
+ */
+export function ferryDocksHere(
+  docks: readonly BoardDock[],
+  shipPort: string,
+): { port: BoardDock | null; at: number | null; held: number | null } {
+  let port: BoardDock | null = null;
+  let at: number | null = null;
+  let held: number | null = null;
+  for (const d of docks) {
+    if (!Number.isFinite(d.dockedAt)) continue;
+    if (at === null || d.dockedAt > at) at = d.dockedAt;
+    if (d.farDoor === undefined || d.farDoor === shipPort) {
+      if (!port || d.dockedAt > port.dockedAt) port = d;
+    } else if (held === null || d.dockedAt < held) {
+      held = d.dockedAt;
+    }
+  }
+  return { port, at, held };
 }
 
 /** How one stay at a stop reads, from whoever is looking (a board at the
@@ -238,8 +274,11 @@ export function ferryRow(ferry: DepartureFerry, here: BoardHere, now: number, ca
   if (!isRouteRunning(route)) return null;
   const hereIdx = route.stops.map((s, i) => (here.isHere(s) ? i : -1)).filter((i) => i >= 0);
   if (hereIdx.length === 0) return null;
-  const dock = here.dockOf(ferry.shipRoomId);
-  const liveDock: LiveDockAt = (stop) => (dock && here.isHere(stop) ? dock.dockedAt : null);
+  const { port: dock, at: dockedAt, held } = ferryDocksHere(here.docksOf(ferry.shipRoomId), route.shipPort);
+  const liveDock: LiveDockAt = Object.assign(
+    (stop: RouteStop) => (dockedAt !== null && here.isHere(stop) ? dockedAt : null),
+    { held },
+  );
   const f = routeFlightAt(route, checkpoints, liveDock, now, ferry.capacity, cache);
   if (!f) return null;
   const name = (i: number) => route.stops[i]?.name ?? '?';
@@ -322,7 +361,9 @@ export function summaryRow(
   }
   if ((s.status === 'in-flight' || s.status === 'redocking')
     && ((s.toRoom && isHereRoom(s.toRoom)) || (s.nextStopRoom && isHereRoom(s.nextStopRoom)))) {
-    return { ...base, dir: 'from', place: placeOf(s.fromRoom), at: s.etaAt ?? null };
+    // A paused route's flight is its off-route one: that ETA is for
+    // somewhere else, so the time is unknown, as when docked.
+    return { ...base, dir: 'from', place: placeOf(s.fromRoom), at: paused ? null : s.etaAt ?? null };
   }
   return null;
 }
@@ -445,6 +486,23 @@ export interface RouteSummaryFields {
   departAt?: number;
   routeStatus?: RouteStatus;
   routeRun?: number;
+}
+
+/**
+ * The gate the ship's summary gives for its route port's dock at `stop`
+ * (`farRoom`/`farDoor`: the port's far end): the station records' gate for
+ * that door, else the stop's own copied gate when the dock is its own berth.
+ * An older writer's record names no far door; into the berth room it reads
+ * as the own berth (shipPilot.pilotDockAt's rule). Pure.
+ */
+export function routePortGate(
+  stop: RouteStop,
+  farRoom: string,
+  farDoor: string | undefined,
+  gateOf: (roomId: string, doorId: string | undefined) => number | undefined,
+): number | undefined {
+  const own = farRoom === stop.berth.roomId && (farDoor === undefined || farDoor === stop.berth.farDoor);
+  return gateOf(farRoom, farDoor) ?? (own ? stop.berth.gate : undefined);
 }
 
 /**
