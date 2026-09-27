@@ -27,6 +27,7 @@ import {
   withSharedAtlasOf,
 } from './stationAtlas';
 import { cleanBerths, listStations, registerStation } from './stations';
+import type { StationBerthRecord } from './stations';
 import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
@@ -470,6 +471,33 @@ describe('the per-planet summary', () => {
       { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
     ]);
     expect(foldOwnStation(next, here, null, T0 + 120_000, 'room-b')).toBeNull();
+  });
+
+  it('keeps each room\'s newest gates when two visitors publish from stale copies', () => {
+    const known = base({
+      berths: [{ roomId: 'room-a', doorId: 'west', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+      berthsAt: T0,
+    });
+    const station = (berths: StationBerthRecord[]) => ({
+      id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-b', derived: true as const, berths,
+    });
+    // A visitor in room-a closes its gate 1 and opens gate 4 instead.
+    const inA = foldOwnStation(known, station([
+      { roomId: 'room-a', doorId: 'north', gate: 4 }, { roomId: 'room-b', doorId: 'south', gate: 2 },
+    ]), null, T0 + 60_000, 'room-a')!;
+    // Later, a visitor in room-b, still holding the old room-a gate, adds gate 3.
+    const inB = foldOwnStation(known, station([
+      { roomId: 'room-a', doorId: 'west', gate: 1 },
+      { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
+    ]), null, T0 + 120_000, 'room-b')!;
+    const want = [
+      { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
+      { roomId: 'room-a', doorId: 'north', gate: 4 },
+    ];
+    expect(mergeStation(inA, inB)?.berths).toEqual(want);
+    expect(mergeStation(inB, inA)?.berths).toEqual(want);
+    // Merged either way, the result is one value.
+    expect(mergeStation(inA, inB)).toEqual(mergeStation(inB, inA));
   });
 });
 
