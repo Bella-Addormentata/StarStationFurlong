@@ -44,7 +44,7 @@
 
 import { normalizeWall } from './doorLayoutDoc';
 import type { ConnectorSegment } from './adapter';
-import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, atlasComponent, isSaneDims, roomIdFromSeed } from './stationAtlas';
+import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, atlasComponent, isBerthDoor, isSaneDims, roomIdFromSeed } from './stationAtlas';
 import type { AtlasEntry, BundledAtlasEntry } from './stationAtlas';
 import bundledAtlasJson from './defaultStation.atlas.json';
 
@@ -206,7 +206,7 @@ export function atlasForBundle(
     const doors: BundledAtlasEntry['doors'] = {};
     for (const [id, d] of Object.entries(e.doors)) {
       // ⚓ A visiting ship's berth is not the station's layout.
-      if (!d?.targetRoomId || d.transient === true) continue;
+      if (!d?.targetRoomId || isBerthDoor(d)) continue;
       doors[id] = {
         targetRoomId: d.targetRoomId,
         ...(d.wall !== undefined ? { wall: d.wall } : {}),
