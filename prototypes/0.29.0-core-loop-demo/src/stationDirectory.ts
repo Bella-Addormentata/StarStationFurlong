@@ -19,7 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
-import { latestMoveOf, MAX_ORBIT_SLOTS, stationInTransit } from './stations';
+import { adriftPlace, latestMoveOf, stationInTransit } from './stations';
 import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -138,26 +138,8 @@ export function findStation(id: string): StationDestination {
   return list.find((s) => s.id === id) ?? list[0];
 }
 
-/** Where a ship that missed a departed station waits: open orbit at the
- *  planet and slot that station left (`adrift:<planetId>:<slot>`). A place,
- *  never a station, so it follows no station anywhere; hops leave from it to
- *  the stations around that planet like from any orbit. */
-export const ADRIFT_PREFIX = 'adrift:';
-
-export function adriftAt(planetId: string, orbitSlot: number): string {
-  return `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
-}
-
-/** The planet and slot an adrift location names, or null for anything else. */
-export function adriftPlace(id: string): { planetId: string; orbitSlot: number } | null {
-  if (typeof id !== 'string' || !id.startsWith(ADRIFT_PREFIX)) return null;
-  const rest = id.slice(ADRIFT_PREFIX.length);
-  const cut = rest.lastIndexOf(':');
-  const planetId = rest.slice(0, cut);
-  const orbitSlot = Number(rest.slice(cut + 1));
-  if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) return null;
-  return { planetId, orbitSlot };
-}
+// Adrift places live in stations.ts (planetForRoom reads them too).
+export { ADRIFT_PREFIX, adriftAt, adriftPlace } from './stations';
 
 /** The planet a ship's location is at: its station's, or an adrift
  *  location's own; null when unlisted. */

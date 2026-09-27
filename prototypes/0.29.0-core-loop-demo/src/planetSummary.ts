@@ -43,7 +43,7 @@ import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
-import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation } from './stations';
+import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
@@ -512,7 +512,9 @@ function firstHandKeys(): { stations: Set<string>; ships: Set<string>; planet: s
   if (here) stations.add(here);
   const ship = ctx?.ship()?.roomId;
   if (ship) ships.add(ship);
-  return { stations, ships, planet: current ? planetById(current.planetId).id : null };
+  // A ship adrift is at its open orbit's planet, not its stand-in's.
+  const adrift = roomAdriftPlace(ctx?.currentRoom?.() || '');
+  return { stations, ships, planet: adrift ? planetById(adrift.planetId).id : current ? planetById(current.planetId).id : null };
 }
 
 // ── From this client: its station and its ship ──────────────────────────────
