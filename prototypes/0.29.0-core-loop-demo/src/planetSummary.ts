@@ -528,6 +528,21 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   delete next.berthsAt;
   delete next.berthRoomsAt;
   Object.assign(next, gates);
+  // The legacy berth follows the merged gates wherever they know the
+  // welcome room (as listStations does): its lowest gate there, or none.
+  if (gates.berths && roomStamps(gates).has(next.welcomeRoomId)) {
+    const inWelcome = gates.berths.filter((b) => b.roomId === next.welcomeRoomId);
+    if (!inWelcome.some((b) => b.doorId === next.berthDoor)) {
+      const lowest = inWelcome.reduce<StationBerthRecord | undefined>(
+        (best, b) => (!best || (b.gate ?? Infinity) < (best.gate ?? Infinity) ? b : best), undefined);
+      // In the place a cleaned summary keeps it, so equal records compare equal.
+      const { welcomeRoomId, name, planetId, orbitSlot, berthDoor: _stale, ...others } = next;
+      const moved: StationSummary = {
+        welcomeRoomId, name, planetId, orbitSlot, ...(lowest ? { berthDoor: lowest.doorId } : {}), ...others,
+      };
+      return JSON.stringify(moved) === JSON.stringify(prior) ? null : moved;
+    }
+  }
   return JSON.stringify(next) === JSON.stringify(prior) ? null : next;
 }
 
