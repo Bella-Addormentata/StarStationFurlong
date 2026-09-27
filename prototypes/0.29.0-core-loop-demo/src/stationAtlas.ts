@@ -217,8 +217,32 @@ export function compareAtlasRecency(a: AtlasEntry, b: AtlasEntry): number {
   return bt !== at ? bt - at : br - ar;
 }
 
+/**
+ * ⚓ Write down every berth the atlas only INFERS. berthDoorIds counts both
+ * records of a connection as the berth when either end is one, but that
+ * inference lives only while both records do: once the flagged end is
+ * re-harvested without its dock (the ship cast off), the unflagged end left
+ * behind would read as structure again and pull the ship back into the
+ * station it left. So an unknown flag on an inferred berth is set to true
+ * while the pair is still there to show it. A known flag, true or false, is
+ * the room's own word and is left alone; a newer harvest of that room
+ * replaces the guess.
+ */
+function markInferredBerths(atlas: Record<string, AtlasEntry>): void {
+  for (const [roomId, doorIds] of berthDoorIds(atlas)) {
+    const doors = atlas[roomId]?.doors;
+    if (!doors) continue;
+    for (const id of doorIds) {
+      const door = doors[id];
+      if (door && typeof door.transient !== 'boolean') door.transient = true;
+    }
+  }
+}
+
 function writeAtlas(atlas: Record<string, AtlasEntry>): void {
   try {
+    // Before eviction, which can drop the flagged end of a berth too.
+    markInferredBerths(atlas);
     // 🗄️ Evict in two tiers, and never on the gossip stamp. `lastSeen` is
     // derived from a peer's `updatedAt`, so ordering retention by it let a peer
     // float its own entries to the top of a 64-deep list and push out rooms the
@@ -256,6 +280,9 @@ export function harvestIntoAtlas(entry: {
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
+  // Before this entry is replaced: an atlas saved before berths were written
+  // down may hold a berth only this entry's old doors imply.
+  markInferredBerths(atlas);
   const prior = atlas[entry.roomId];
   const doors: Record<string, AtlasDoor> = {};
   for (const d of entry.doors) {
@@ -430,7 +457,8 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
 // part of the station it docks at, and a stale berth left on the station side
 // after the ship casts off can never bridge two stations through the ship.
 // Both records of a berth count as the berth (berthDoorIds), however the
-// other side happens to be flagged.
+// other side happens to be flagged, and the atlas writes that down
+// (markInferredBerths) so it outlives the flagged record.
 
 /** ⚓ Is this door a visiting ship's berth rather than station structure?
  *  Flagged transient, or a DOCK — exactly two `dock` segments, which dockRules
@@ -895,6 +923,7 @@ export function subscribeSharedAtlas(listener: () => void): () => void {
 function pullSharedAtlas(): void {
   if (!sharedAlive()) return;
   const atlas = readAtlas();
+  markInferredBerths(atlas); // before any entry is replaced, as in harvestIntoAtlas
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
