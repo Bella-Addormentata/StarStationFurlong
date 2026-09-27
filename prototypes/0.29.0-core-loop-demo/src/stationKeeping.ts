@@ -472,10 +472,23 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
     const limit = Math.min(FUEL_METER_MAX, ceiling(burn.cap ?? Number.POSITIVE_INFINITY));
     if (fuelDrawn + burn.fuel > limit) continue;
     fuelDrawn += burn.fuel;
-    trim = applyBurn(trim, burn.at < frontier ? { ...burn, at: frontier } : burn) ?? trim;
+    const at = burn.at < frontier ? frontier : burn.at;
+    // A burn that would leave the band changes nothing but still pays, and
+    // the trim still dates from it: a settlement keeps the trim's time as its
+    // frontier and its last burn as the one that fired last.
+    trim = applyBurn(trim, at === burn.at ? burn : { ...burn, at }) ?? heldTrim(trim, burn.dir, at);
     fired.push(burn);
   }
   return { trim, fuelDrawn, fired };
+}
+
+/** The orbit a trim flies, dated from a later burn that changed nothing (it
+ *  would have left the band): the same radius and course, with the offset
+ *  from the slot measured at that burn. */
+function heldTrim(trim: OrbitTrim | null, dir: TrimDirection, at: number): OrbitTrim | null {
+  if (!trim) return null;
+  const base = orbitForSlot(trim.planetId, trim.slot);
+  return { planetId: trim.planetId, slot: trim.slot, dRadiusKm: trim.dRadiusKm, dPhase: slotOffsetAt(base, trim, at), at, last: dir };
 }
 
 /**
@@ -489,7 +502,8 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
  * moves the orbit nor takes fuel, and the burns after it still get their
  * turn. A burn that would leave the band changes nothing but still pays — its
  * fuel burned wherever it fired, and a burn that arrives late (from a tab
- * that was offline) must never make an earlier one free.
+ * that was offline) must never make an earlier one free — and the trim is
+ * dated from it all the same (heldTrim).
  */
 export function replayBurns(
   burns: readonly TrimBurn[],
