@@ -109,6 +109,7 @@ import {
   doorLateralLimitForWall,
   clearDoorSlide,
   roomHalfExtents,
+  readCupolaWall,
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
@@ -541,6 +542,8 @@ export class DoorDockingPortSystem {
     const own = buildOctagonShell(
       { halfX, halfZ },
       { opacity: 0.2, edge: 0xd4a84b },
+      {},
+      readCupolaWall(),
     );
     own.group.traverse((o) => {
       o.raycast = () => {};

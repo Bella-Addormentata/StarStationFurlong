@@ -69,7 +69,7 @@ import { VoxelCharacter, POSE_ROOT_Y, STAND_ROOT_Y } from "./voxelCharacter";
 import type { WorkoutPose } from "./voxelCharacter";
 import { WaypointReticle } from "./waypoint";
 import { findPath, worldToCol, worldToRow } from "./pathfinding";
-import { roomWalkBounds } from "./floorPlanDoc";
+import { roomWalkBounds, clampToRoomWalk } from "./floorPlanDoc";
 import { OBSTACLES } from "./obstacles";
 import {
   VAT_HOLD_ALONG,
@@ -1393,6 +1393,10 @@ export class Player {
       if (r2.z === candZ) {
         pos.z = candZ;
       }
+      // 🔭 A cupola's cut corners are glass, not floor: slide along it.
+      const onFloor = clampToRoomWalk(pos.x, pos.z);
+      pos.x = onFloor.x;
+      pos.z = onFloor.z;
 
       this.character.setState("walk", this.logicalAngle);
     } else {
@@ -1499,8 +1503,10 @@ export class Player {
         r1.x,
         Math.max(-boundZ, Math.min(boundZ, candZ)),
       );
-      pos.x = r2.x;
-      pos.z = r2.z;
+      // 🔭 …and out of a cupola's cut corners (clampToRoomWalk).
+      const onFloor = clampToRoomWalk(r2.x, r2.z);
+      pos.x = onFloor.x;
+      pos.z = onFloor.z;
 
       // 🧱 Wedged on a device approach (owner report 2026-09-25): the A*
       // grid bakes raw boxes but the body collides against boxes inflated by

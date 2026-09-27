@@ -23,6 +23,14 @@
 
 import * as Y from 'yjs';
 import type { DoorId } from './doors';
+import {
+  CUPOLA_WALLS,
+  cupolaPlan,
+  cupolaCornerClearance,
+  clampOutOfCupolaCorners,
+  type CupolaPlan,
+  type CupolaWall,
+} from './cupola';
 
 export const DOOR_LATTICE = 0.5;
 /** |lateral| bound keeping opening+posts inside the 11.8 run for BOTH door
@@ -294,6 +302,60 @@ export function roomHalfExtents(): { halfX: number; halfZ: number } {
 function recomputeRoomHalf(): void {
   const { cols, rows } = readRoomDims();
   roomHalf = { halfX: cols * TILE_SIZE / 2, halfZ: rows * TILE_SIZE / 2 };
+  roomCupolaPlan = cupolaPlan(roomHalf, readCupolaWall());
+}
+
+// ── 🔭 Cupola end wall (cupola.ts) ───────────────────────────────────────────
+// `floorPlan.cupola → { wall }`: which END wall is an eight-sided observation
+// cupola. Absent / malformed ⇒ none (every existing room, unchanged). Stored as
+// the wall label, so a resize that turns that wall into a side wall simply
+// renders it plain (cupolaPlan → null) until the room is resized back.
+
+/** Cached resolved cupola for the current room size (null = no cupola). */
+let roomCupolaPlan: CupolaPlan | null = null;
+
+/** The stored cupola wall, shape-guarded (peer data), or null. */
+export function readCupolaWall(): CupolaWall | null {
+  if (!docAlive()) return null;
+  const raw = planMap!.get('cupola') as { wall?: unknown } | undefined;
+  if (!raw || typeof raw !== 'object') return null;
+  return (CUPOLA_WALLS as readonly unknown[]).includes(raw.wall) ? (raw.wall as CupolaWall) : null;
+}
+
+/** Owner UI: make `wall` the room's cupola, or `null` to clear it. The editor
+ *  gates this (end walls only, no doors on it — editMode.validateCupolaWall). */
+export function writeCupolaWall(wall: CupolaWall | null): void {
+  if (!docAlive()) return;
+  if (wall !== null && !CUPOLA_WALLS.includes(wall)) return;
+  boundDoc!.transact(() => {
+    if (wall === null) planMap!.delete('cupola');
+    else planMap!.set('cupola', { wall });
+  });
+}
+
+/** The current room's cupola resolved against its size, or null. Cached —
+ *  cheap enough for the per-cell walkable bake and the per-frame move clamps. */
+export function roomCupola(): CupolaPlan | null {
+  return roomCupolaPlan;
+}
+
+/** True when a plan point is walkable floor as far as the room's SHAPE goes:
+ *  inside the walkable box and clear of any cupola's cut corners, with the
+ *  same WALL_CLEARANCE. (Furniture is the obstacle map's business.) */
+export function insideRoomWalk(x: number, z: number): boolean {
+  const { boundX, boundZ } = roomWalkBounds();
+  if (Math.abs(x) > boundX || Math.abs(z) > boundZ) return false;
+  return !roomCupolaPlan || cupolaCornerClearance(roomCupolaPlan, x, z) >= WALL_CLEARANCE;
+}
+
+/** Clamp a plan point onto the walkable floor: the walkable box, then out of
+ *  a cupola's cut corners (sliding along the glass). */
+export function clampToRoomWalk(x: number, z: number): { x: number; z: number } {
+  const { boundX, boundZ } = roomWalkBounds();
+  const cx = Math.max(-boundX, Math.min(boundX, x));
+  const cz = Math.max(-boundZ, Math.min(boundZ, z));
+  if (!roomCupolaPlan) return { x: cx, z: cz };
+  return clampOutOfCupolaCorners(roomCupolaPlan, cx, cz, WALL_CLEARANCE);
 }
 
 /**

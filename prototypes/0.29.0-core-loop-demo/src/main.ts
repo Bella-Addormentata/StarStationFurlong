@@ -1590,6 +1590,7 @@ async function joinRoomAtEpoch(
     // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       world?.reconcileDoorPlacements();
+      world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
     });
