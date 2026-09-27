@@ -736,6 +736,11 @@ describe('canDepart — where the ship is', () => {
     expect(canDepart({ ...base, destinationId: HIGH_ORBIT.id, locationId: HOME.id })).toEqual({ ok: true });
   });
 
+  it('says the ship\'s own station is unlisted rather than blaming the orbit', () => {
+    expect(canDepart({ ...base, destinationId: HIGH_ORBIT.id, locationId: 'station:unmapped', hop: null }))
+      .toEqual({ ok: false, reason: 'unlisted-location' });
+  });
+
   it('refuses a station the directory does not list', () => {
     expect(canDepart({ ...base, destinationId: 'nowhere', locationId: HOME.id }))
       .toEqual({ ok: false, reason: 'unknown-destination' });

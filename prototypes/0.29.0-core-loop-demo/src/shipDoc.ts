@@ -266,31 +266,34 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
 // offline one) writes its own trim record too, and if it ALSO wrote the level,
 // one of the two debits would vanish when the tabs sync. So a consumer that
 // keeps its own record draws through a METER there instead: a running total
-// of the fuel it has drawn, raised in the same write as the thing it paid
-// for. The tank reads level − (meter − the reading the level was written
-// against), and every level write records the reading it saw, so draws the
-// writer had seen are folded into the level and draws it had not seen still
-// come off.
+// of the fuel IT has drawn, raised in the same write as the thing it paid
+// for. The tank's meter is the SUM of every consumer's total — each total
+// lives under its own key, so two consumers drawing at once both count, where
+// the larger of the two would drop one. The tank reads level − (meter − the
+// reading the level was written against), and every level write records the
+// reading it saw, so draws the writer had seen are folded into the level and
+// draws it had not seen still come off.
 
 /** A meter reads at most this: a running fuel total stays well inside exact
  *  integers, and a hostile reading past it counts as none. */
 export const FUEL_METER_MAX = 1e12;
 
-/** A running total of fuel drawn, kept in the consumer's own record. */
+/** One consumer's running total of the fuel it has drawn, kept in its own
+ *  record. */
 export interface FuelDrawMeter {
   read(): number;
   subscribe(listener: () => void): () => void;
 }
 
-let drawMeter: FuelDrawMeter | null = null;
-let unsubscribeDrawMeter: (() => void) | null = null;
+const drawMeters = new Map<string, { meter: FuelDrawMeter; unsubscribe: () => void }>();
 
-/** Install the tank's draw meter (null removes it). A meter change moves the
- *  gauge, so ship subscribers hear about it too. */
-export function setFuelDrawMeter(meter: FuelDrawMeter | null): void {
-  unsubscribeDrawMeter?.();
-  drawMeter = meter;
-  unsubscribeDrawMeter = meter ? meter.subscribe(() => notify()) : null;
+/** Install one consumer's draw meter under its name (null removes it). The
+ *  tank's meter is the sum of them all. A meter change moves the gauge, so
+ *  ship subscribers hear about it too. */
+export function setFuelDrawMeter(name: string, meter: FuelDrawMeter | null): void {
+  drawMeters.get(name)?.unsubscribe();
+  drawMeters.delete(name);
+  if (meter) drawMeters.set(name, { meter, unsubscribe: meter.subscribe(() => notify()) });
 }
 
 /** A meter value off the wire: anything but a number in (0, FUEL_METER_MAX] is 0. */
@@ -298,9 +301,11 @@ function meterValue(v: unknown): number {
   return typeof v === 'number' && v > 0 && v <= FUEL_METER_MAX ? v : 0;
 }
 
-/** The meter's reading. */
+/** The tank's meter: every consumer's total, added up. */
 function meterReading(): number {
-  return meterValue(drawMeter?.read());
+  let total = 0;
+  for (const { meter } of drawMeters.values()) total += meterValue(meter.read());
+  return total;
 }
 
 /** The meter reading a fuel record was written against. */
@@ -308,13 +313,19 @@ function meterBase(rec: FuelRecord): number {
   return meterValue(rec.meter);
 }
 
-/** Where a new draw starts the meter: its reading, but never below the one the
- *  level was written against, so a meter that went back (an older record won
- *  a merge) neither refunds fuel nor lets the next draw go free. A draw of
- *  `amount` writes `fuelDrawFloor() + amount` into its record. */
-export function fuelDrawFloor(): number {
+/** The meter's reading, but never below the one the level was written
+ *  against: what a level write records. */
+function fuelDrawFloor(): number {
   const raw = docAlive() ? shipMap!.get('fuel') : undefined;
   return Math.max(meterReading(), isFuelRecord(raw) ? meterBase(raw) : 0);
+}
+
+/** How far the meter has fallen below the reading the level was written
+ *  against — 0 unless an older record won a merge. A consumer drawing
+ *  `amount` writes its own total + fuelDrawDeficit() + amount, so a meter
+ *  that went back neither refunds fuel nor lets the next draw go free. */
+export function fuelDrawDeficit(): number {
+  return fuelDrawFloor() - meterReading();
 }
 
 // ── Reads (untrusted; every path degrades to defaults, never throws) ─────────
@@ -455,6 +466,8 @@ export type DepartRefusal =
   | { ok: false; reason: 'already-here' }
   | { ok: false; reason: 'other-planet' }
   | { ok: false; reason: 'no-transfer' }
+  /** The ship's station is not on this client's list: nothing to plan from. */
+  | { ok: false; reason: 'unlisted-location' }
   | { ok: false; reason: 'no-owner' };
 
 /** Inputs the caller assembles from the live docs — kept as a plain struct so
@@ -490,6 +503,9 @@ export function canDepart(ctx: DepartContext): DepartRefusal {
   const dest = findStation(ctx.destinationId);
   if (ctx.locationId !== undefined) {
     if (ctx.locationId === dest.id) return { ok: false, reason: 'already-here' };
+    // An unlisted station reads as home here (findStation's fallback), and
+    // its hops can never be planned: say so, not "a shared orbit".
+    if (!isKnownStation(ctx.locationId)) return { ok: false, reason: 'unlisted-location' };
     if (findStation(ctx.locationId).planetId !== dest.planetId) {
       return { ok: false, reason: 'other-planet' };
     }

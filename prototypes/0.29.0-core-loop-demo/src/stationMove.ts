@@ -33,9 +33,11 @@
  * walk to another room — and the per-planet summary (planetSummary.ts)
  * carries each station's latest move to every install around the planet.
  *
- * Fuel rides the tank's draw meter, like a trim burn: the record carries the
- * running total drawn, and the meter reads the higher of the trim's and the
- * move's totals (each write starts from the meter's reading).
+ * Fuel rides the tank's draw meters, like a trim burn: the record carries the
+ * running total moves have drawn in this room, and binding the doc registers
+ * it as the 'stationMove' meter (shipDoc.setFuelDrawMeter). The tank adds it
+ * to the trim's, so a trim burn and a move started at once from two tabs
+ * both pay.
  *
  * Pure except for the doc binding and the saved list. Pinned by
  * stationMove.test.ts.
@@ -43,7 +45,7 @@
 
 import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS } from './orbits';
-import { FUEL_METER_MAX } from './shipDoc';
+import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { planPlanetTransfer } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
@@ -138,8 +140,11 @@ export interface MoveContext {
   engines: number;
   /** Fuel aboard, clamped to the tanks' capacity. */
   fuel: number;
-  /** Where this draw starts the tank's meter (shipDoc.fuelDrawFloor). */
-  meter: number;
+  /** Fuel moves have drawn in this room so far (readMoveFuelDrawn). */
+  drawn: number;
+  /** What the tank's meter owes its level (shipDoc.fuelDrawDeficit), added
+   *  to this draw. */
+  deficit: number;
   /** Modules in the station (its atlas component): the mass the burns push. */
   modules: number;
   now: number;
@@ -221,7 +226,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       arriveAt: quote.plan.arriveAt,
       mode: 'thrusters',
       fuel: quote.fuel,
-      fuelDrawn: ctx.meter + quote.fuel,
+      fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
     },
   };
 }
@@ -347,8 +352,15 @@ export function readStationMove(): StationMove | null {
   return isStationMove(raw) ? cleanMove(raw) : null;
 }
 
+/** Fuel moves have drawn in this room, whichever station the latest one
+ *  moved: the 'stationMove' draw meter. */
+export function readMoveFuelDrawn(): number {
+  return readStationMove()?.fuelDrawn ?? 0;
+}
+
 /** Bind the room doc — beside bindStationKeepingDoc. Every move the room
- *  carries is remembered on this install. */
+ *  carries is remembered on this install, and the move record's running
+ *  fuel total becomes one of the tank's draw meters. */
 export function bindStationMoveDoc(doc: Y.Doc): void {
   unobserve?.();
   boundDoc = doc;
@@ -361,6 +373,7 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
   };
   map.observe(onChange);
   unobserve = () => map.unobserve(onChange);
+  setFuelDrawMeter('stationMove', { read: readMoveFuelDrawn, subscribe: subscribeStationMove });
   onChange();
 }
 

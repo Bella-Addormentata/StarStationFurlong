@@ -36,7 +36,7 @@ import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
 import { realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
-import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawFloor, readFuelLevel, subscribeShip } from './shipDoc';
+import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFuelLevel, subscribeShip } from './shipDoc';
 import type { StationRecord } from './stations';
 import {
   MAX_TRIM_KM,
@@ -69,6 +69,7 @@ import {
   otherPlanets,
   planStationMove,
   quoteMove,
+  readMoveFuelDrawn,
   subscribeStationMove,
   writeStationMove,
 } from './stationMove';
@@ -315,7 +316,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
-      meter: fuelDrawFloor(),
+      deficit: fuelDrawDeficit(),
       now: Date.now(),
       tanks,
       capacity,
@@ -330,7 +331,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     commander: c.commander,
     engines: c.engines,
     fuel: c.fuel,
-    meter: c.meter,
+    drawn: readMoveFuelDrawn(),
+    deficit: c.deficit,
     modules: c.station?.welcomeRoomId ? Math.max(1, atlasComponent(readAtlas(), c.station.welcomeRoomId).size) : 1,
     now: c.now,
   });
