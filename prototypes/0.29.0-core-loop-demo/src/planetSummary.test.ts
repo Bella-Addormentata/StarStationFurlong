@@ -107,9 +107,11 @@ describe('guards', () => {
   });
 
   it('carries unknown record fields in ext, bounded and without known keys', () => {
-    const move = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
-    const s = cleanStationSummary({ ...summary(), ext: { move, id: 'evil', orbitSlot: 9 } }, T0);
-    expect(s?.ext).toEqual({ move });
+    // `move` is a typed field now (stationMove.ts): a newer build's field
+    // this one does not know rides ext instead.
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    const s = cleanStationSummary({ ...summary(), ext: { tow, move: tow, id: 'evil', orbitSlot: 9 } }, T0);
+    expect(s?.ext).toEqual({ tow });
     expect(cleanStationSummary({ ...summary(), ext: { big: 'x'.repeat(2000) } }, T0)?.ext).toBeUndefined();
     expect(cleanStationSummary({ ...summary(), ext: [1, 2] }, T0)?.ext).toBeUndefined();
   });

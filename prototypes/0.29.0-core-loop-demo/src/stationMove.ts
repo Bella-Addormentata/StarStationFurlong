@@ -20,16 +20,18 @@
  * stations.listStations applies it through the move resolver main.ts installs,
  * so the station list, the holotable and ship travel all follow.
  *
- * The record names the station by id and carries where it leaves from, so a
- * later move simply supersedes an earlier one (its `from` is where the last
- * one arrived). Only the latest move per station is kept.
+ * The record names the station by its WELCOME ROOM (the same on every
+ * install; its id is per install and only informational) and carries where
+ * it leaves from, so a later move simply supersedes an earlier one (its
+ * `from` is where the last one arrived). Only the latest move per station is
+ * kept.
  *
  * Storage: the `stationKeeping` map in the HELM ROOM's doc (key 'move'),
  * beside the trim record — shared by everyone in the room. Station records are
  * still kept per install, so each install also REMEMBERS every move it has
  * seen (localStorage), keyed by station id: the station stays moved when you
- * walk to another room. Sharing station records between players (the
- * per-planet summary) should carry StationRecord.move the same way.
+ * walk to another room — and the per-planet summary (planetSummary.ts)
+ * carries each station's latest move to every install around the planet.
  *
  * Fuel rides the tank's draw meter, like a trim burn: the record carries the
  * running total drawn, and the meter reads the higher of the trim's and the
@@ -45,8 +47,8 @@ import { FUEL_METER_MAX } from './shipDoc';
 import { planPlanetTransfer } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
-import { MAX_ORBIT_SLOTS, PLANETS, planetById, setStationMoveResolver } from './stations';
-import type { StationMove, StationRecord } from './stations';
+import { MAX_ORBIT_SLOTS, PLANETS, moveBelongsTo, planetById, setStationMoveResolver } from './stations';
+import type { MovingStation, StationMove, StationRecord } from './stations';
 
 export type { StationMove } from './stations';
 
@@ -68,6 +70,7 @@ export function isStationMove(v: unknown): v is StationMove {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof StationMove, unknown>>;
   return isId(r.stationId)
+    && typeof r.welcomeRoomId === 'string' && r.welcomeRoomId.length <= MAX_ID_LENGTH
     && isId(r.fromPlanetId) && isSlot(r.fromSlot)
     && isId(r.toPlanetId) && isSlot(r.toSlot)
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
@@ -80,6 +83,7 @@ export function isStationMove(v: unknown): v is StationMove {
 export function cleanMove(m: StationMove): StationMove {
   return {
     stationId: m.stationId,
+    welcomeRoomId: m.welcomeRoomId,
     fromPlanetId: m.fromPlanetId,
     fromSlot: m.fromSlot,
     toPlanetId: m.toPlanetId,
@@ -208,6 +212,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
     quote,
     move: {
       stationId: station.id,
+      welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
       toPlanetId: quote.toPlanetId,
@@ -276,13 +281,18 @@ export function readRememberedMoves(): StationMove[] {
   } catch { return []; }
 }
 
-/** Remember a move this install has seen. A later departure for the same
- *  station replaces an earlier one; an older one is ignored. Returns whether
- *  the list changed. */
+/** Two moves of the same station: by welcome room, or by id without one. */
+function sameStation(a: StationMove, b: StationMove): boolean {
+  return a.welcomeRoomId ? a.welcomeRoomId === b.welcomeRoomId : !b.welcomeRoomId && a.stationId === b.stationId;
+}
+
+/** Remember a move this install has seen — from the helm room, or from the
+ *  per-planet summary. A later departure for the same station replaces an
+ *  earlier one; an older one is ignored. Returns whether the list changed. */
 export function rememberMove(move: StationMove): boolean {
   if (!isStationMove(move)) return false;
   const list = readRememberedMoves();
-  const at = list.findIndex((m) => m.stationId === move.stationId);
+  const at = list.findIndex((m) => sameStation(m, move));
   if (at >= 0) {
     const old = list[at];
     if (old.departAt > move.departAt) return false;
@@ -301,9 +311,11 @@ export function rememberMove(move: StationMove): boolean {
   return true;
 }
 
-/** The latest move this install knows for a station. */
-export function rememberedMoveFor(stationId: string): StationMove | null {
-  return readRememberedMoves().find((m) => m.stationId === stationId) ?? null;
+/** The latest move this install knows for a station, matched by its welcome
+ *  room (stations.moveBelongsTo), so a move another install wrote under its
+ *  own id for the station still applies here. */
+export function rememberedMoveFor(station: MovingStation): StationMove | null {
+  return readRememberedMoves().find((m) => moveBelongsTo(m, station)) ?? null;
 }
 
 /** Point stations.listStations at the remembered moves. */

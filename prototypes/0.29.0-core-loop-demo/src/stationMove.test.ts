@@ -5,6 +5,13 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS } from './orbits';
+import {
+  bindPlanetSummaryDoc,
+  cleanStationSummary,
+  mergeStation,
+  summaryForStation,
+  unbindPlanetSummaryForTest,
+} from './planetSummary';
 import { planPlanetTransfer } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
 import { bindStationKeepingDoc, readFuelDrawn } from './stationKeeping';
@@ -44,7 +51,7 @@ const ARIS = 'planet-aris';
 const NOW = ORBIT_EPOCH_MS + 5_000_000_000;
 
 beforeEach(() => store.clear());
-afterEach(() => setStationMoveResolver(null));
+afterEach(() => { setStationMoveResolver(null); unbindPlanetSummaryForTest(); });
 
 const ctx = (over: Partial<MoveContext> = {}): MoveContext => {
   const stations = listStations({}, [], NOW);
@@ -119,7 +126,7 @@ describe('planning a thruster move', () => {
 describe('the station list follows a move', () => {
   it('keeps the station at home until it arrives, then lists it at the new planet', () => {
     const move = moveTo();
-    setStationMoveResolver((id) => (id === move.stationId ? move : null));
+    setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
     const at = (t: number) => listStations({}, [], t).find((s) => s.id === DEFAULT_STATION_ID)!;
 
     const before = at(move.departAt - 1);
@@ -137,7 +144,7 @@ describe('the station list follows a move', () => {
 
   it('refuses ship hops to or from a station in transit', () => {
     const move = moveTo();
-    setStationMoveResolver((id) => (id === move.stationId ? move : null));
+    setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
     const mid = (move.departAt + move.arriveAt) / 2;
     const other: StationRecord = { id: 'yard', name: 'YARD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'y' };
     const furlong = listStations({}, [other], mid).find((s) => s.id === DEFAULT_STATION_ID)!;
@@ -189,5 +196,52 @@ describe('the record in the room doc and on this install', () => {
     const move = moveTo();
     writeStationMove(move);
     expect(readFuelDrawn()).toBe(move.fuelDrawn);
+  });
+});
+
+describe('moves between installs', () => {
+  const yard = (id: string): StationRecord => ({ id, name: 'YARD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'yard-lobby' });
+  const yardMove = (): StationMove => {
+    const stations = listStations({}, [yard('mine-1')], NOW);
+    const plan = planStationMove(ctx({ station: stations.find((s) => s.id === 'mine-1')!, stations }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    return plan.move;
+  };
+
+  it('matches a move to the station by its welcome room, whatever id the writer used', () => {
+    const move = yardMove();
+    expect(move).toMatchObject({ stationId: 'mine-1', welcomeRoomId: 'yard-lobby' });
+    rememberMove(move);
+    installStationMoveResolver();
+    // Another install knows the same station as a learned record.
+    const there = listStations({}, [yard('shared:yard-lobby')], move.arriveAt + 1)
+      .find((s) => s.id === 'shared:yard-lobby')!;
+    expect(there).toMatchObject({ planetId: ARIS });
+    // …and a different station with the writer's id is not moved.
+    const other = { ...yard('mine-1'), welcomeRoomId: 'elsewhere' };
+    expect(listStations({}, [other], move.arriveAt + 1).find((s) => s.id === 'mine-1'))
+      .toMatchObject({ planetId: SOV });
+  });
+
+  it('rides the per-planet summary: published, merged by departure, learned on pull', () => {
+    const move = yardMove();
+    rememberMove(move);
+    const station = listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!;
+    const summary = summaryForStation(station, null, NOW);
+    expect(summary.move).toEqual(move);
+    expect(summary.ext).toBeUndefined();
+    expect(cleanStationSummary(summary, NOW)?.move).toEqual(move);
+    // A move for another room is not this summary's.
+    expect(cleanStationSummary({ ...summary, move: { ...move, welcomeRoomId: 'x' } }, NOW)?.move).toBeUndefined();
+    const later = { ...move, departAt: move.departAt + 1000, arriveAt: move.arriveAt + 1000 };
+    expect(mergeStation(summary, { ...summary, move: later })?.move).toEqual(later);
+    expect(mergeStation({ ...summary, move: later }, summary)).toBeNull();
+
+    // A second install pulls the summary from a room doc and learns the move.
+    store.clear();
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('yard-lobby', summary);
+    bindPlanetSummaryDoc(doc, { currentStation: () => null, localTrim: () => null, ship: () => null });
+    expect(readRememberedMoves()).toEqual([move]);
   });
 });

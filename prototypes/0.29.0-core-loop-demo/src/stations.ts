@@ -88,7 +88,12 @@ export interface StationRecord {
  * whatever shares station records can carry it as it is.
  */
 export interface StationMove {
+  /** The writer's id for the station — per install, so informational. */
   stationId: string;
+  /** The station's welcome room: the same on every install, so this is what
+   *  a move is matched to a station by ('' only for a station without one,
+   *  then the id is used). */
+  welcomeRoomId: string;
   fromPlanetId: string;
   fromSlot: number;
   toPlanetId: string;
@@ -106,19 +111,30 @@ export interface StationMove {
   fuelDrawn: number;
 }
 
-let moveResolver: ((stationId: string) => StationMove | null) | null = null;
+/** What a move resolver is asked about: a station's id and welcome room. */
+export type MovingStation = Pick<StationRecord, 'id' | 'welcomeRoomId'>;
+
+let moveResolver: ((station: MovingStation) => StationMove | null) | null = null;
 
 /** Install (or remove, with null) where listStations finds each station's
  *  latest move (stationMove.installStationMoveResolver). */
-export function setStationMoveResolver(resolver: ((stationId: string) => StationMove | null) | null): void {
+export function setStationMoveResolver(resolver: ((station: MovingStation) => StationMove | null) | null): void {
   moveResolver = resolver;
 }
 
-function moveOf(stationId: string): StationMove | null {
+/** Does a move belong to this station? By welcome room — the same on every
+ *  install — and by id only for a station without one. */
+export function moveBelongsTo(move: Pick<StationMove, 'stationId' | 'welcomeRoomId'>, station: MovingStation): boolean {
+  return station.welcomeRoomId
+    ? move.welcomeRoomId === station.welcomeRoomId
+    : !move.welcomeRoomId && move.stationId === station.id;
+}
+
+function moveOf(station: MovingStation): StationMove | null {
   if (!moveResolver) return null;
   try {
-    const m = moveResolver(stationId);
-    return m && m.stationId === stationId ? m : null;
+    const m = moveResolver(station);
+    return m && moveBelongsTo(m, station) ? m : null;
   } catch {
     return null;
   }
@@ -128,10 +144,10 @@ function moveOf(stationId: string): StationMove | null {
  *  destination once it has arrived, else where it left from (a move names
  *  where it leaves, so it supersedes any earlier one). */
 function placeWithMove(
-  r: { id: string; planetId: string; orbitSlot: number },
+  r: MovingStation & { planetId: string; orbitSlot: number },
   nowMs: number,
 ): { planetId: string; orbitSlot: number; move?: StationMove } {
-  const move = moveOf(r.id);
+  const move = moveOf(r);
   if (!move) return { planetId: r.planetId, orbitSlot: r.orbitSlot };
   if (nowMs >= move.arriveAt) return { planetId: move.toPlanetId, orbitSlot: move.toSlot };
   return { planetId: move.fromPlanetId, orbitSlot: move.fromSlot, move };
@@ -307,7 +323,7 @@ export function listStations(
     const id = `${DERIVED_PREFIX}${d.anchor}`;
     // A derived station that has moved is listed where its move put it; one
     // that has not takes the lowest free slot around the default planet.
-    const at = placeWithMove({ id, planetId: DEFAULT_PLANET_ID, orbitSlot: 0 }, nowMs);
+    const at = placeWithMove({ id, welcomeRoomId: d.anchor, planetId: DEFAULT_PLANET_ID, orbitSlot: 0 }, nowMs);
     const slot = claim(at.planetId, at.orbitSlot);
     if (slot === null) continue;
     out.push({
