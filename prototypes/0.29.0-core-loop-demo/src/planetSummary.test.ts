@@ -270,6 +270,23 @@ describe('this client\'s own station', () => {
     expect(foldOwnStation(known, derived, null, T0 + 10)).toBeNull();
   });
 
+  it('supersedes a room\'s earlier readings when it changes under another room\'s trim', () => {
+    const now = T0 + 60_000;
+    const known = summary({ ownerId: 'hab', trim: { ...trim({ at: T0 + 10 }), from: 'room-b', readAt: T0 + 20 } });
+    // Room A takes back its burn while room B's later one stands.
+    const s1 = foldOwnStation(known, record(), trim({ at: T0 + 1, dRadiusKm: 1 }), now, 'room-a', true)!;
+    expect(s1.trim?.from).toBe('room-b');
+    expect(s1.trimGone?.find((g) => g.from === 'room-a')?.readAt).toBe(now);
+    // Room B is then cleared, and an offline peer replays A's old reading.
+    const s2 = mergeStation(s1, summary({ trimGone: [{ from: 'room-b', readAt: now + 1 }] }))!;
+    expect(s2.trim).toBeUndefined();
+    const old = summary({ trim: { ...trim({ at: T0 + 5, dRadiusKm: 9 }), from: 'room-a', readAt: T0 + 30 } });
+    expect(mergeStation(s2, old)?.trim ?? s2.trim).toBeUndefined();
+    // Room A's next reading still stands.
+    const s3 = foldOwnStation(s2, record(), trim({ at: T0 + 1, dRadiusKm: 1 }), now + 5, 'room-a')!;
+    expect(s3.trim?.dRadiusKm).toBe(1);
+  });
+
   it('a derived station still adds a newer trim', () => {
     const known = summary({ orbitSlot: 2 });
     const derived = record({ id: 'station:room-hab', orbitSlot: 1, derived: true });

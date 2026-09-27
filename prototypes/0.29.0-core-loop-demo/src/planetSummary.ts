@@ -541,6 +541,7 @@ export function foldOwnStation(
   trim: OrbitTrim | null,
   now: number,
   firstHandRoom?: string,
+  readChanged = false,
 ): StationSummary | null {
   const past = (at: number) => Math.min(Math.max(now, at + 1), now + MAX_SKEW_MS);
   // The trim read first-hand from the room this client stands in: stamped
@@ -574,9 +575,14 @@ export function foldOwnStation(
   const applies = cleanTrim(trimFor(base, readTrim(known)));
   // This room now reads no trim where the known one was read here: that
   // trim was taken back, and the reading says so.
+  // This room's reading changed while another room's trim stands over it:
+  // its own earlier readings are superseded all the same (a reading it
+  // takes now is stamped at or past this), so none can come back later.
   const gone: TrimGone[] | undefined = !trim && firstHandRoom !== undefined && known.trim?.from === firstHandRoom
     ? [{ from: firstHandRoom, readAt: past(known.trim.readAt ?? 0) }]
-    : undefined;
+    : readChanged && firstHandRoom !== undefined && known.trim !== undefined && known.trim.from !== firstHandRoom
+      ? [{ from: firstHandRoom, readAt: past(goneAt(known.trimGone, firstHandRoom)) }]
+      : undefined;
   const { trim: _unused, trimGone: _unusedGone, ...rest } = base;
   return mergeStation(known, {
     ...rest, ...(applies ? { trim: applies } : {}), ...(gone ? { trimGone: gone } : {}),
@@ -815,7 +821,9 @@ export function publishPlanetSummary(now = Date.now()): void {
   const store = readStore(now);
   const here = ctx.currentStation();
   if (here && here.welcomeRoomId && here.welcomeRoomId.length <= MAX_ID_LEN) {
-    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, ctx.localTrim(), now, ctx.currentRoom?.() || undefined);
+    const room = ctx.currentRoom?.() || undefined;
+    const local = ctx.localTrim();
+    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, local, now, room, room !== undefined && readingChanged(room, local));
     if (next) store.stations[here.welcomeRoomId] = next;
   }
   const ship = ctx.ship();
@@ -880,6 +888,19 @@ export function publishPlanetSummary(now = Date.now()): void {
   // What this client just applied (its own trim, records) is news to its
   // own views too: the observer skips local writes.
   notify();
+}
+
+/** What each room last read first-hand (its trim's core, or none), so a
+ *  change of reading is news even while another room's trim stands. */
+const lastReadings = new Map<string, string>();
+
+function readingChanged(room: string, trim: OrbitTrim | null): boolean {
+  const core = trim ? JSON.stringify({ ...cleanTrim(trim, Infinity), from: undefined, readAt: undefined }) : '';
+  const had = lastReadings.get(room);
+  if (had === undefined && lastReadings.size >= 256) lastReadings.clear();
+  lastReadings.set(room, core);
+  // A first reading of none says nothing (most rooms have no helm).
+  return had === undefined ? core !== '' : had !== core;
 }
 
 // ── Reading what is known ────────────────────────────────────────────────────
@@ -984,6 +1005,7 @@ export function systemStationNames(planetId: string, now = Date.now()): Array<{ 
 
 /** Test seam: forget the binding. */
 export function unbindPlanetSummaryForTest(): void {
+  lastReadings.clear();
   doc = null;
   stationMap = null;
   shipMap = null;
