@@ -9,6 +9,29 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- **🎰 One slot operator per room, so a player's balance has one slot writer ([#167](https://github.com/Bella-Addormentata/StarStationFurlong/pull/167)).** Slot machines took an operator lease per machine, so two sessions of the room's deed holder (two tabs, or two devices) could each operate a different machine. Every settle rewrites the player's whole `bal:`, so one player spinning both machines at once could lose a debit or a payout in the merge. The room now has one slot operator (`slot-operator`, `slotCroupier.ts`), as the coin pusher does. The deed holder's session operates every machine whose bankroll its player owns. In a venture room, a room owner still starts machines by hand (**RUN MANUAL CROUPIER**), which is refused while another session operates the room's slots.
+  - **The lease** keeps the coin pusher's rules: a 2 s settling wait after each take, and a renewal every 3 s. Another device's lease is judged by the renewals seen: it lapses 8 s after the last one, and is taken over only after a further 60 s split window. Tabs on one device take over as soon as it lapses.
+  - **Each take is its own term.** An accept, settle or refund paused at an `await` writes nothing once its take has ended, even when the same page has taken the lease again. The round stays on its machine for the next operator.
+  - **One transaction per step.** A round's stake and its spin go out together, and so does every terminal write: a settle or refund with the machine's settled state and the reveal's removal. A spin left with no stake locked (an earlier build can still leave one) is ended without moving chips.
+  - **Removed machines.** One holding chips (a round's stake, or its own bankroll) is paid out only by the room's operator, past its settling wait: the refund, the bankroll's return to its owner and the key removal go out in one transaction. One holding none is cleared at once. One whose chips can't all be accounted for (a stake with no round to refund it by, or a bankroll whose owner can't be credited) keeps its keys, chips included.
+  - **Earlier builds** took a lease per machine. While one of those is being renewed, this build operates nothing in the room. It never writes one, and a session that could operate deletes them once they lapse.
+  - **Leaving a room** hands back the slot lease along with the coin pusher's, before the room's doc goes.
+
+  **Testing, stated honestly:**
+  - `tsc` clean, build clean, and 889 tests at merge, 84 of them new in `slotCroupier.test.ts`, against a real Yjs casino map.
+  - Thirteen Copilot review rounds. Every finding was fixed except the split limit below, which is documented. 137 mutations of the guards each fail a test; four more survive, all harmless.
+  - In Chromium against a local node, with the deed holder on two devices and one player spinning two machines in the same instant: on the previous code each device operated one machine, two writers of the balance. With this change one session operated both, and 6 of 6 trials left both devices' balances exact.
+  - A removed machine holding chips was paid out after the operator's settling wait, and nothing moved while another session held the lease.
+  - The last round's fixes (`3dd170e`) merged before Copilot re-reviewed them.
+
+  **Deferred, documented:**
+  - The coin pusher still elects its own operator, so a slot settle and a pusher settle for the same player at the same instant can still lose one write. One casino operator for both is on TODO.
+  - Machines funded by different players (another shareholder, or another install of the deed holder) no longer run side by side: only the lease holder's run.
+  - A split between two of the deed holder's devices, longer than the window or begun before either saw the other's lease, can still put two operators in one room. Closing that needs an authoritative ledger.
+  - After a crash, another device waits the lapse plus the split window (68 s) before it operates.
+  - A removed machine's chips need an operator present to pay them out. If every session that may manage the room leaves first, they stay in its records.
+  - A peer that keeps writing earlier-build lease records keeps the room's slots closed: past 64 of them, this build fails closed rather than risk two writers.
+
 - The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO beyond the experimental opt-in node asset (a re-scoping of its "B-7" gate is proposed in the sovereign plan §14, 2026-09-05, pending ratification, with an S-0 crate audit gating the node-side lane instead), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
 
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.

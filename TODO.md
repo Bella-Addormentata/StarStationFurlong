@@ -33,6 +33,7 @@
 - [ ] Sprint 4 — chat UI (`ChatProvider`, session-capped demo), onboarding sequence, **host-sequenced** capsule claiming, polish/audio
 - [ ] [Issue #8](https://github.com/Bella-Addormentata/StarStationFurlong/issues/8) — character model demo
 - [ ] [Issue #12](https://github.com/Bella-Addormentata/StarStationFurlong/issues/12) — QR phone chat: capability skeleton early (challenge-bound QR, zxing-wasm decode), full UI later
+- [ ] **One casino operator for the room** — the slot machines ([#167](https://github.com/Bella-Addormentata/StarStationFurlong/pull/167)) and the coin pusher ([#137](https://github.com/Bella-Addormentata/StarStationFurlong/pull/137)) each elect their own operator (`slot-operator`, `pusher-operator`), so a slot settle and a pusher settle for the same player at the same instant still rewrite that player's whole `bal:` from two sessions, and the merge keeps only one of the two writes. One lease for every chip write in the room closes it; the two leases already follow the same rules (settling wait, liveness by the renewals seen, split window, tenure). The air hockey entry fee waits on it too
 
 ## 📐 Design artifacts owed
 
