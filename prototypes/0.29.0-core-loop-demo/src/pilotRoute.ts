@@ -96,6 +96,9 @@
  *    caller says when that dock was made (its DoorPairing.dockedAt), so a
  *    route that calls at one stop twice (every back-and-forth does) pins the
  *    stay the dock belongs to, never an earlier visit to the same stop.
+ *    A dock belongs to stay L when it was made before L's leg could land
+ *    (no pairing is made in flight, so a stamp past the departure is a
+ *    clock running ahead), a stamp later than now reading as now.
  *  - A PERSON at the helm: the walk stops at the departure until they press
  *    DEPART (a `go`), or until the robot captain takes over 5 minutes after it
  *    (or after the newest KEEP THE HELM) and leaves at the next window.
@@ -1302,14 +1305,18 @@ function stepStay(
   });
   if (leaves === null) return { done: true, flight: stayed({}) };
   if (now < leaves) return { done: true, flight: stayed({ overdue: false }) };
-  // LIVE DOCK: still docked at this stop's berth, by a dock made before the
-  // departure, so it has not left. 🛟 Nor has it while another live pairing
-  // made before the departure (a guest berth, another port: A5 "Rights")
-  // still holds the ship, wherever it leads: it stays, DELAYED, until
-  // someone with rights over that pairing lets it go.
-  const dockedAt = dockTimes[stop];
-  if (dockedAt !== null && dockedAt < leaves) return { done: true, flight: stayed({ overdue: true }) };
-  if (held !== null && held < leaves) return { done: true, flight: stayed({ overdue: true }) };
+  // LIVE DOCK: still docked at this stop's berth, by a dock made before this
+  // leg could land anywhere else, so it has not left. 🛟 Nor has it while
+  // another live pairing made by then (a guest berth, another port: A5
+  // "Rights") still holds the ship, wherever it leads: it stays, DELAYED,
+  // until someone with rights over that pairing lets it go.
+  // 🕰️ Made by then, not before the departure: no pairing is made in flight,
+  // so one stamped between the departure and the landing was made here by a
+  // clock running ahead. A stamp later than now says only "by now".
+  const lands = arrive ?? leaves;
+  const madeHere = (t: number | null) => t !== null && Math.min(t, now) < lands;
+  if (madeHere(dockTimes[stop])) return { done: true, flight: stayed({ overdue: true }) };
+  if (madeHere(held)) return { done: true, flight: stayed({ overdue: true }) };
 
   const flying = clampFuelToCapacity(fuel - leg.fuelCost, capacity);
   if (arrive !== null && now < arrive) {

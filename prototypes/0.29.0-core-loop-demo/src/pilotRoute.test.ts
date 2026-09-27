@@ -562,7 +562,23 @@ describe('the live-dock rule (A3.3)', () => {
     expect(at(r, [s], on[2].depart + HOUR, { liveDock: docked })).toMatchObject({
       legSeq: 2, stopIndex: 0, overdue: true, departsAt: on[2].depart,
     });
-    expect(at(r, [s], on[0].depart + SEC, { liveDock: docked }).status).toBe('in-flight');
+    // …and the first visit left on time (the dock came later).
+    expect(at(r, [s], dockedAt + 5 * SEC, { liveDock: docked })).toMatchObject({ legSeq: 2, overdue: false });
+  });
+
+  it('🕰️ a dock stamped by a clock running ahead still holds the stay it was made at', () => {
+    // Made at stay 0 by a rider whose clock runs an hour fast: the stamp is
+    // after the departure, and after now.
+    const ahead: LiveDockAt = (_stop, i) => (i === 0 ? on[0].depart + HOUR : null);
+    expect(at(r, [s], on[0].depart + SEC, { liveDock: ahead })).toMatchObject({
+      status: 'docked', legSeq: 0, stopIndex: 0, overdue: true,
+    });
+    // Stamped after the departure but before the leg could land: no pairing
+    // is made in flight, so it was this stay's, and it holds it for good.
+    const skewed: LiveDockAt = (_stop, i) => (i === 0 ? on[0].depart + 10 * SEC : null);
+    for (const t of [on[0].depart + SEC, on[0].arrive + HOUR]) {
+      expect(at(r, [s], t, { liveDock: skewed })).toMatchObject({ status: 'docked', legSeq: 0, overdue: true });
+    }
   });
 
   it('liveDockFrom matches a dock in the stop\'s berth room, or its station by the caller\'s word', () => {
@@ -1008,9 +1024,14 @@ describe('🛟 a pairing nobody aboard can release holds the stay (A5 Rights)', 
     const own = liveDockFrom([{ roomId: 'elsewhere', dockedAt: T0 + SEC, doorId: 'x-' }], undefined, { routePort: 'x-' });
     expect(own.held).toBeNull();
     expect(at(r, [s], on[0].depart + SEC, { liveDock: own }).status).toBe('in-flight');
-    // Made after the departure (the ferry had left): it holds nothing.
-    const late = liveDockFrom([{ roomId: 'guest-room', dockedAt: on[0].depart + SEC, doorId: 'x+' }], undefined, { routePort: 'x-' });
-    expect(at(r, [s], on[0].depart + 2 * SEC, { liveDock: late }).status).toBe('in-flight');
+    // Made once the ferry had landed at its next stop: it holds nothing here.
+    const late = liveDockFrom([{ roomId: 'guest-room', dockedAt: on[0].arrive + SEC, doorId: 'x+' }], undefined, { routePort: 'x-' });
+    expect(at(r, [s], on[0].arrive + 2 * SEC, { liveDock: late })).toMatchObject({ legSeq: 1, overdue: false });
+  });
+
+  it('🕰️ a pairing stamped by a clock running ahead still holds the stay the ferry is at', () => {
+    const ahead = liveDockFrom([{ roomId: 'guest-room', dockedAt: on[0].depart + HOUR, doorId: 'x+' }], undefined, { routePort: 'x-' });
+    expect(at(r, [s], on[0].depart + SEC, { liveDock: ahead })).toMatchObject({ status: 'docked', legSeq: 0, overdue: true });
     // Without the route's port, a caller (a station's board) never sets it.
     expect(liveDockFrom([{ roomId: 'guest-room', dockedAt: T0, doorId: 'x+' }]).held).toBeNull();
   });
