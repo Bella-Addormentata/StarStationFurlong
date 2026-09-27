@@ -576,8 +576,9 @@ export function freeGateNumber(
  * pairings (berths aside), looking each room up in the doc directly, so a
  * doc crowded with other stations' entries cannot push this one's out of
  * reach. A room the local atlas lacks comes from the doc; a known room gains
- * any door pairing it lacks, and the doc's gates when it has none or the
- * doc's copy is newer (as pullSharedAtlas arbitrates), so the station walk
+ * any door pairing it lacks (a newer doc copy's pairings replace ours door by
+ * door), and the doc's gates when it has none or the doc's copy is newer (as
+ * pullSharedAtlas arbitrates), so the station walk
  * and the numbers taken both see what the far station has published. Peer
  * entries are shape-checked and capped as pullSharedAtlas does. Pure:
  * nothing is written.
@@ -620,8 +621,14 @@ export function withSharedAtlasOf(
           lastSeen: value.updatedAt,
         };
       } else {
-        const merged: AtlasEntry = { ...prior, doors: { ...doors, ...prior.doors } };
-        if (gates && (prior.gates === undefined || value.updatedAt > prior.lastSeen)) merged.gates = gates;
+        // A newer doc copy's pairings win door by door (a door re-paired since
+        // we saw the room); an older one only adds pairings we lack.
+        const newer = value.updatedAt > prior.lastSeen;
+        const merged: AtlasEntry = {
+          ...prior,
+          doors: newer ? { ...prior.doors, ...doors } : { ...doors, ...prior.doors },
+        };
+        if (gates && (prior.gates === undefined || newer)) merged.gates = gates;
         out[rid] = merged;
       }
     }

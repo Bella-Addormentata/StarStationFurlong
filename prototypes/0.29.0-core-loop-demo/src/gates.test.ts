@@ -255,6 +255,16 @@ describe("a far room doc's shared atlas", () => {
     expect(atlas['other-000']).toBeUndefined();
   });
 
+  it("follows a newer doc copy's re-paired door to the far station's other rooms", () => {
+    // We once saw far-dock's hall lead to a room that has since gone.
+    harvestIntoAtlas({ roomId: 'far-dock', name: 'DOCK', doors: [{ doorId: 'd:hall', targetSeed: seed('old-room'), transient: false }] });
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('far-dock', entry('far-dock', Date.now() + 60_000, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
+    shared.set('far-hub', entry('far-hub', 5, { 'd:in': { targetRoomId: 'far-dock', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1 }));
+    expect(freeGateNumber(withSharedAtlasOf(doc, readAtlas(), 'far-dock'), 'far-dock', {})).toBe(2);
+  });
+
   it("takes the doc's gates for a known room when the doc's copy is newer", () => {
     harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: { 'd:p1': 1 } });
     const doc = new Y.Doc();
