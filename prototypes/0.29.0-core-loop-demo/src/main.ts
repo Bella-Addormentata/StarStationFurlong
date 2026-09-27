@@ -3391,6 +3391,8 @@ function resolveOwnerLabel(owner: string): string {
  *    · the exterior view ...... setExteriorOwnerCheck
  *    · the ship's helm ........ setHelmOwnerCheck (REFUEL / DEPART / arrival —
  *      "if you could rearrange the furniture, you can fly the ship", plan §6)
+ *    · the station helm ....... setStationHelmCommanderCheck (trim burns — the
+ *      same commander as the ship's helm)
  *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
  *
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
