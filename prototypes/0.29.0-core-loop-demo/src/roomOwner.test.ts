@@ -190,11 +190,11 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
 
   it('the documented authority split still covers every shareholder surface', () => {
     // WHY a bare count: main.ts's isLocalPlayerRoomOwner docblock lists the
-    // five surfaces shareholders reach, and that list is hand-maintained.
+    // six surfaces shareholders reach, and that list is hand-maintained.
     // Twice in review it was wrong — first claiming co-hosts after they left,
     // then calling itself exhaustive while omitting the room-name editor. A
     // count cannot check the prose, but it does catch the thing that makes the
-    // prose go stale: a SIXTH caller appearing with nobody revisiting it.
+    // prose go stale: a SEVENTH caller appearing with nobody revisiting it.
     //
     // If this fails you have added or removed a caller. Update the split in
     // that docblock — it is the single source of truth, roomOwner.ts and
@@ -202,7 +202,7 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     const calls = (main.match(/isLocalPlayerRoomOwner\(/g) ?? []).length;
     const declarations = (main.match(/function isLocalPlayerRoomOwner\(/g) ?? []).length;
     expect(declarations).toBe(1);
-    expect(calls - declarations).toBe(5);
+    expect(calls - declarations).toBe(6);
   });
 
   it('the co-host section repaints when either map behind the deed check moves', () => {
