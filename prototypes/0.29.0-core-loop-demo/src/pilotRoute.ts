@@ -238,17 +238,24 @@ function stopRecord(stops: readonly RouteStop[], index: number): StationRecordLi
   };
 }
 
-/** The first window at or after `base` from stop `from` to stop `to`. */
+/** The first window at or after `base` from stop `from` to stop `to`. Its
+ *  times are whole milliseconds, rounded up as stationDirectory.planHop
+ *  rounds a DEPART's (orbital math gives fractions, and a flight record
+ *  stores only safe integers: the timetable's times become its departedAt
+ *  and etaAt). Rounded up, so a ferry never burns before its window. */
 function pairWindowAfter(stops: readonly RouteStop[], from: number, to: number, base: number): LegWindow | null {
   if (!Number.isFinite(base) || !stops[from] || !stops[to]) return null;
   const hop = planRecordHop(stopRecord(stops, from), stopRecord(stops, to), base);
   if (!hop || !(hop.arriveAt > hop.departAt) || !(hop.windowEveryMs !== undefined && hop.windowEveryMs > 0)) return null;
+  const departAt = Math.ceil(hop.departAt);
+  const arriveAt = Math.max(departAt + 1, Math.ceil(hop.arriveAt));
+  if (!Number.isSafeInteger(departAt) || !Number.isSafeInteger(arriveAt)) return null;
   return {
     from,
     to,
-    departAt: hop.departAt,
-    arriveAt: hop.arriveAt,
-    transferMs: hop.arriveAt - hop.departAt,
+    departAt,
+    arriveAt,
+    transferMs: arriveAt - departAt,
     synodicMs: hop.windowEveryMs,
     fuelCost: hop.fuelCost,
   };

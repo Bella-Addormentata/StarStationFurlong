@@ -222,6 +222,36 @@ describe('window rules', () => {
     }
   });
 
+  it('windows are whole milliseconds, never before the orbital one, and a fractional stored one is still found', () => {
+    // A flight record stores only safe integer times (PR 172's
+    // isFlightRecord), and the timetable's times become its departedAt and
+    // etaAt: planHop's rounding, up, applied here too.
+    const probe = { id: 'a', planetId: SOV, orbitSlot: FERRY_SLOTS[0] };
+    const target = { id: 'b', planetId: SOV, orbitSlot: FERRY_SLOTS[1] };
+    let base = T0 + 3;
+    let fractional = 0;
+    for (let i = 0; i < 20; i++) {
+      const t = planTransfer(probe, target, base)!;
+      if (!Number.isInteger(t.departAt) || !Number.isInteger(t.arriveAt)) fractional++;
+      const w = legWindowAfter(r, 0, base)!;
+      expect(Number.isSafeInteger(w.departAt) && Number.isSafeInteger(w.arriveAt)).toBe(true);
+      expect(w.departAt).toBe(Math.ceil(t.departAt));
+      expect(w.arriveAt).toBe(Math.ceil(t.arriveAt));
+      expect(w.departAt).toBeGreaterThanOrEqual(base);
+      // A route started before the rounding stored the fraction.
+      expect(legWindowAt(r, 0, t.departAt)?.departAt).toBe(w.departAt);
+      base = w.arriveAt + 7 * SEC;
+    }
+    expect(fractional).toBeGreaterThan(0);
+    // So is every time a timetable flight hands PR 172's readers.
+    const chain = onTimeChain(r, s, 4);
+    for (const leg of chain) {
+      const f = at(r, [s], leg.depart + SEC);
+      expect(f.status).toBe('in-flight');
+      for (const v of [f.departedAt, f.etaAt, f.departsAt, f.arrivesAt]) expect(Number.isSafeInteger(v)).toBe(true);
+    }
+  });
+
   it('a time that is not a window of the leg is not found', () => {
     expect(legWindowAt(r, 0, s.departAt + 1000)).toBeNull();
     expect(legWindowAt(r, 0, s.departAt - 30 * SEC)).toBeNull();
