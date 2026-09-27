@@ -250,14 +250,21 @@ function tieBreak<T>(a: T, b: T): T {
   return JSON.stringify(b) > JSON.stringify(a) ? b : a;
 }
 
-/** Merge an incoming station summary into a known one: the newer record,
- *  the newer trim. Returns null when nothing changes. */
+/** Merge an incoming station summary into a known one, and the newer trim.
+ *  Which record stands: one its owner published (it carries `ownerId`) beats
+ *  one nobody owns, and between owned ones the newer wins; between records
+ *  nobody owns (derived stations) the FIRST published stands, so a late
+ *  install cannot move a station everyone already placed. Same-moment ties
+ *  settle on the canonical JSON. Returns null when nothing changes. */
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary): StationSummary | null {
   if (!prior) return incoming;
   const recordOf = (s: StationSummary): string => JSON.stringify({ ...s, trim: undefined });
-  const base = incoming.updatedAt !== prior.updatedAt
-    ? (incoming.updatedAt > prior.updatedAt ? incoming : prior)
-    : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
+  const owned = (s: StationSummary) => s.ownerId !== undefined;
+  const base = owned(incoming) !== owned(prior)
+    ? (owned(incoming) ? incoming : prior)
+    : incoming.updatedAt !== prior.updatedAt
+      ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
+      : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
   const trim = newerTrim(prior.trim, incoming.trim);
   const next: StationSummary = { ...base };
   if (trim) next.trim = trim; else delete next.trim;
