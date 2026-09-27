@@ -11,13 +11,14 @@
  * (pilotRoute.routeFlightAt): a leg on time is news to nobody, and a station
  * game needs no message to show a ferry leave, fly and arrive.
  *
- *   <shipRoomId>:route:<at>                  DepartureRouteEntry: the ferry's
+ *   <shipRoomId>:route:<at>:<hash>           DepartureRouteEntry: the ferry's
  *                                            name, ship room id, tank
  *                                            capacity, its route as the ship
  *                                            map holds it (copied stops, run
  *                                            fields; NEVER a pass), and when
  *                                            it was published (<at>, whole
- *                                            ms: one key per snapshot)
+ *                                            ms, then a hash of the stored
+ *                                            entry: one key per snapshot)
  *   <shipRoomId>:ckpt:<run>:<legSeq>:<kind>  one checkpoint, the ship map's
  *                                            own key behind the ferry's id
  *
@@ -29,8 +30,10 @@
  * over not stopped within one run, otherwise the later publish. The READER
  * picks it (departureRouteNewer over every route key of the ferry), and a
  * writer adds its snapshot under its own key and deletes only the keys it
- * saw: two riders publishing at once both land, and every replica picks the
- * same one, so a stale running snapshot can't win a CRDT tie over a STOP.
+ * saw: two riders publishing at once both land (in the same millisecond too:
+ * different snapshots hash apart, and the same snapshot is the same value),
+ * and every replica picks the same one, so a stale running snapshot can't
+ * win a CRDT tie over a STOP.
  * A route that is no longer running (finished after STOP) takes its
  * checkpoints with it, and the board drops the ferry.
  *
@@ -145,9 +148,29 @@ export function isDepartureShipId(v: unknown): v is string {
 
 // ── Keys ─────────────────────────────────────────────────────────────────────
 
-/** A route snapshot's key: the ferry, then its publish stamp in whole ms. */
-export function departureRouteKey(shipRoomId: string, at: number): string {
-  return `${shipRoomId}${ROUTE_TAG}${Math.max(0, Math.floor(at))}`;
+/** 53 bits of a string, as 14 hex digits (cyrb53: a key discriminator, not
+ *  a security hash). */
+function hash53(str: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < str.length; i++) {
+    const ch = str.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16).padStart(14, '0');
+}
+
+/** A route snapshot's key: the ferry, its publish stamp in whole ms, then a
+ *  hash of the entry as stored. Two riders' different snapshots in the same
+ *  millisecond get different keys (a tie would otherwise go to CRDT client
+ *  order, not departureRouteNewer); the same snapshot gets the same key and
+ *  the same value, so that tie is harmless. */
+export function departureRouteKey(f: Pick<DepartureFerry, 'shipRoomId' | 'name' | 'capacity' | 'route' | 'at' | 'endedRun'>): string {
+  const stamp = Math.max(0, Math.floor(f.at));
+  return `${f.shipRoomId}${ROUTE_TAG}${stamp}:${hash53(JSON.stringify(departureRouteToWire(f)))}`;
 }
 
 export function departureCheckpointKey(shipRoomId: string, run: number, legSeq: number, kind: RouteCheckpoint['kind']): string {
@@ -171,9 +194,9 @@ export function parseDepartureKey(key: unknown): DepartureKey | null {
   const r = key.indexOf(ROUTE_TAG);
   if (r > 0) {
     const ship = key.slice(0, r);
-    const v = key.slice(r + ROUTE_TAG.length);
-    if (!/^(0|[1-9][0-9]*)$/.test(v) || !Number.isSafeInteger(Number(v)) || !isDepartureShipId(ship)) return null;
-    return { ship, kind: 'route', version: Number(v) };
+    const v = /^(0|[1-9][0-9]*):[0-9a-f]{14}$/.exec(key.slice(r + ROUTE_TAG.length));
+    if (!v || !Number.isSafeInteger(Number(v[1])) || !isDepartureShipId(ship)) return null;
+    return { ship, kind: 'route', version: Number(v[1]) };
   }
   return null;
 }
@@ -361,7 +384,7 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
   const existing = newest?.entry ?? null;
   const takes = !existing || departureRouteNewer(pub, existing);
   const kept = takes ? pub : existing!;
-  const keepKey = takes ? departureRouteKey(ship, pub.at) : newest!.key;
+  const keepKey = takes ? departureRouteKey(pub) : newest!.key;
   const run = kept.route.startedAt;
   const others = [...otherRoutes].map(([s2, o]) => ({ ship: s2, ...o }));
 
