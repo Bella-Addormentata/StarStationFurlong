@@ -421,6 +421,17 @@ describe('moves between installs', () => {
     expect(readRememberedMoves()).toEqual([move]);
   });
 
+  it('carries a derived station\'s move although its first record stands', () => {
+    const move = yardMove();
+    const known = { ...summaryForStation(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!, null, NOW - 60_000) };
+    delete (known as { ownerId?: string }).ownerId;
+    const later = { ...known, updatedAt: NOW, orbitSlot: known.orbitSlot + 1, move };
+    const next = mergeStation(known, later)!;
+    expect(next.orbitSlot).toBe(known.orbitSlot);
+    expect(next.updatedAt).toBe(known.updatedAt);
+    expect(next.move).toEqual(move);
+  });
+
   it('freshens the summary\'s stamp when a move goes out, so the caps keep it', () => {
     const station = listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!;
     const known = summaryForStation(station, null, NOW - 60_000);

@@ -264,14 +264,22 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
   return compareMoves(b, a) > 0 ? b : a;
 }
 
-/** Merge an incoming station summary into a known one: the newer record,
- *  the newer trim, the later move. Returns null when nothing changes. */
+/** Merge an incoming station summary into a known one, and the newer trim.
+ *  Which record stands: one its owner published (it carries `ownerId`) beats
+ *  one nobody owns, and between owned ones the newer wins; between records
+ *  nobody owns (derived stations) the FIRST published stands, so a late
+ *  install cannot move a station everyone already placed. Same-moment ties
+ *  settle on the canonical JSON. A trim and a move each merge by their own
+ *  time, whichever record stands. Returns null when nothing changes. */
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary): StationSummary | null {
   if (!prior) return incoming;
-  const recordOf = (s: StationSummary): string => JSON.stringify({ ...s, trim: undefined });
-  const base = incoming.updatedAt !== prior.updatedAt
-    ? (incoming.updatedAt > prior.updatedAt ? incoming : prior)
-    : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
+  const recordOf = (s: StationSummary): string => JSON.stringify({ ...s, trim: undefined, move: undefined });
+  const owned = (s: StationSummary) => s.ownerId !== undefined;
+  const base = owned(incoming) !== owned(prior)
+    ? (owned(incoming) ? incoming : prior)
+    : incoming.updatedAt !== prior.updatedAt
+      ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
+      : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
   const trim = newerTrim(prior.trim, incoming.trim);
   const move = newerMove(prior.move, incoming.move);
   const next: StationSummary = { ...base };
@@ -286,14 +294,27 @@ function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipS
   return tieBreak(prior, incoming) === prior ? null : incoming;
 }
 
-/** Put a map's entries into a capped object, keeping the newest when full. */
-function capped<T extends { updatedAt: number }>(rec: Record<string, T>, max: number): Record<string, T> {
+/** Put a map's entries into a capped object, keeping the newest when full
+ *  (by `stampOf`, the record's own stamp unless given). */
+function capped<T extends { updatedAt: number }>(
+  rec: Record<string, T>,
+  max: number,
+  stampOf: (v: T) => number = (v) => v.updatedAt,
+): Record<string, T> {
   const entries = Object.entries(rec);
   if (entries.length <= max) return rec;
-  entries.sort((a, b) => b[1].updatedAt - a[1].updatedAt);
+  entries.sort((a, b) => stampOf(b[1]) - stampOf(a[1]));
   const out: Record<string, T> = Object.create(null);
   for (const [k, v] of entries.slice(0, max)) out[k] = v;
   return out;
+}
+
+/** How fresh a station summary is, for the caps: its record's stamp, or its
+ *  move's departure when later (up to now). A derived station's record keeps
+ *  its first stamp for good (mergeStation), so a move is what says it is
+ *  still news. */
+function stationRecency(s: StationSummary, now: number): number {
+  return Math.max(s.updatedAt, s.move ? Math.min(s.move.departAt, now) : -Infinity);
 }
 
 // ── From this client: its station and its ship ──────────────────────────────
@@ -355,9 +376,10 @@ export function foldOwnStation(
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);
   const { trim: _unused, move: _unusedMove, ...rest } = base;
-  // A new move freshens the summary too: the caps keep the newest summaries,
-  // and a station that just moved must not be the one dropped.
-  if (JSON.stringify(move) !== JSON.stringify(known.move)) {
+  // A new move freshens an owned summary's stamp too (an unowned record keeps
+  // its first stamp; stationRecency counts its move instead), so the caps
+  // never drop a station that just moved.
+  if (owned && JSON.stringify(move) !== JSON.stringify(known.move)) {
     rest.updatedAt = Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS);
   }
   return mergeStation(known, { ...rest, ...(applies ? { trim: applies } : {}), ...(move ? { move } : {}) });
@@ -502,7 +524,7 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (next) { store.ships[k] = next; changed = true; }
   }
   if (!changed) return;
-  store.stations = capped(store.stations, MAX_STATIONS);
+  store.stations = capped(store.stations, MAX_STATIONS, (st) => stationRecency(st, now));
   store.ships = capped(store.ships, MAX_SHIPS);
   writeStore(store);
   applyLearned(store);
@@ -547,7 +569,7 @@ export function publishPlanetSummary(now = Date.now()): void {
       && JSON.stringify({ ...prior, updatedAt: 0 }) === JSON.stringify({ ...s, updatedAt: 0 });
     if (s && !same) store.ships[s.roomId] = s;
   }
-  store.stations = capped(store.stations, MAX_STATIONS);
+  store.stations = capped(store.stations, MAX_STATIONS, (st) => stationRecency(st, now));
   store.ships = capped(store.ships, MAX_SHIPS);
   writeStore(store);
   applyLearned(store);
@@ -570,7 +592,7 @@ export function publishPlanetSummary(now = Date.now()): void {
     // by freshness, never by map order (and junk keys do not pile up).
     pruned = pruneMap(stationMap!, (k, v) => {
       const s = cleanStationSummary(v, now);
-      return s && s.welcomeRoomId === k ? s.updatedAt : null;
+      return s && s.welcomeRoomId === k ? stationRecency(s, now) : null;
     }, MAX_STATIONS) + pruneMap(shipMap!, (k, v) => {
       const s = cleanShipSummary(v, now);
       return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? s.updatedAt : null;

@@ -146,17 +146,30 @@ describe('guards', () => {
 });
 
 describe('merge', () => {
-  it('takes the newer record and, separately, the newer trim', () => {
-    const older = summary({ name: 'OLD', updatedAt: T0, trim: trim({ at: T0 + 5000 }) });
-    const newer = summary({ name: 'NEW', updatedAt: T0 + 1, trim: trim({ at: T0, dRadiusKm: -2 }) });
+  it('takes the owner\'s newer record and, separately, the newer trim', () => {
+    const older = summary({ name: 'OLD', ownerId: 'hab', updatedAt: T0, trim: trim({ at: T0 + 5000 }) });
+    const newer = summary({ name: 'NEW', ownerId: 'hab', updatedAt: T0 + 1, trim: trim({ at: T0, dRadiusKm: -2 }) });
     const merged = mergeStation(older, newer);
     expect(merged?.name).toBe('NEW');
     expect(merged?.trim?.at).toBe(T0 + 5000);
   });
 
+  it('keeps the first record nobody owns, and lets an owned one replace it', () => {
+    const first = summary({ orbitSlot: 2, updatedAt: T0 });
+    const late = summary({ orbitSlot: 4, updatedAt: T0 + 60_000 });
+    // A late install's first publish does not move a derived station…
+    expect(mergeStation(first, late)).toBeNull();
+    expect(mergeStation(late, first)?.orbitSlot).toBe(2);
+    // …but its owner's record does, whenever it was stamped.
+    const owners = summary({ orbitSlot: 5, ownerId: 'hab', updatedAt: T0 - 1 });
+    expect(mergeStation(first, owners)?.orbitSlot).toBe(5);
+    expect(mergeStation(owners, late)).toBeNull();
+  });
+
   it('reports no change for the same summary', () => {
     expect(mergeStation(summary(), summary())).toBeNull();
-    expect(mergeStation(summary({ updatedAt: T0 + 1 }), summary())).toBeNull();
+    expect(mergeStation(summary({ ownerId: 'hab', updatedAt: T0 + 1 }), summary({ ownerId: 'hab' }))).toBeNull();
+    expect(mergeStation(summary(), summary({ updatedAt: T0 + 1 }))).toBeNull();
   });
 });
 
