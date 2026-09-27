@@ -507,6 +507,22 @@ describe('the per-planet summary', () => {
     expect(foldOwnStation(next, here, null, T0 + 120_000, 'room-b')).toBeNull();
   });
 
+  it('keeps a gate-less room as news when the known summary had no gate list yet', () => {
+    const known = base();
+    delete known.berths;
+    delete known.berthsAt;
+    const here = {
+      id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-b', derived: true as const,
+      berths: [] as StationBerthRecord[],
+    };
+    const next = foldOwnStation(known, here, null, T0 + 60_000, 'room-b')!;
+    expect(next.berths).toEqual([]);
+    // An older peer list still showing a gate there cannot bring it back.
+    const older = base({ berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0 });
+    expect(mergeStation(next, older)?.berths ?? next.berths).toEqual([]);
+    expect(mergeStation(older, next)?.berths).toEqual([]);
+  });
+
   it('keeps each room\'s newest gates when two visitors publish from stale copies', () => {
     const known = base({
       berths: [{ roomId: 'room-a', doorId: 'west', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],

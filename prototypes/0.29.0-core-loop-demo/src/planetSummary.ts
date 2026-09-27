@@ -577,7 +577,15 @@ export function foldOwnStation(
       gates = { berths: listed, berthsAt, ...(rooms ? { berthRoomsAt: rooms } : {}) };
     }
   } else if (mine.berths && JSON.stringify(mine.berths) !== JSON.stringify(base.berths)) {
-    gates = { berths: mine.berths, berthsAt: past(base.berthsAt ?? 0) };
+    // The whole list, every room it read at the new stamp: rooms with no gate
+    // (the welcome room, the one this client stands in) stay as tombstones,
+    // so an older peer list cannot bring their removed berths back.
+    const berthsAt = past(base.berthsAt ?? 0);
+    const read = new Map<string, number>();
+    for (const room of roomStamps(mine).keys()) read.set(room, berthsAt);
+    if (firstHandRoom !== undefined) read.set(firstHandRoom, berthsAt);
+    const rooms = canonRoomStamps(mine.berths, berthsAt, read);
+    gates = { berths: mine.berths, berthsAt, ...(rooms ? { berthRoomsAt: rooms } : {}) };
   }
   const { trim: _unused, move: _unusedMove, berths: _b, berthsAt: _ba, berthRoomsAt: _bra, ...rest } = base;
   // A new move freshens an owned summary's stamp too (an unowned record keeps
