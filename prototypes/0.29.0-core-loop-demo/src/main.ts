@@ -137,7 +137,14 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
-import { listStations, registerStation, removeStation, setStationRoomSource } from "./stations";
+import {
+  dockedStationFor,
+  listStations,
+  registerStation,
+  removeStation,
+  setRoomStationResolver,
+  setStationRoomSource,
+} from "./stations";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1626,6 +1633,14 @@ async function joinRoomAtEpoch(
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🪐 …and the station registry's "which station am I in" (holotable).
     setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
+    // from the station it is docked at: the current room's live docks place
+    // it (the holotable's "you are here", the exterior's planet).
+    setRoomStationResolver((roomId) =>
+      roomId && roomId === activeBootstrap?.roomId
+        ? dockedStationFor(roomId, readAllDoors().values())
+        : null,
+    );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
