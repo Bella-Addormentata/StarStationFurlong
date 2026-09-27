@@ -154,12 +154,17 @@ describe('guards', () => {
     expect(cleanShipSummary(ship, T0)).toEqual(ship);
     for (const [field, bad] of [['gate', 0], ['gate', 100], ['gate', 1.5], ['nextStopRoom', ''], ['nextStopRoom', 'r'.repeat(129)],
       ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3], ['routeRun', 0], ['routeRun', 1.5], ['routeRun', 'x'],
-      ['routeNews', 0], ['routeNews', 1.5], ['routeNews', 'x']] as const) {
+      ['routeNews', 0], ['routeNews', 1.5], ['routeNews', 'x'],
+      // Far-future ordering stamps (past the 6 h skew every stamp gets).
+      ['routeRun', T0 + 6 * 3600_000 + 1], ['routeNews', T0 + 6 * 3600_000 + 1]] as const) {
       const clean = cleanShipSummary({ ...ship, [field]: bad }, T0);
       expect(clean).not.toBeNull();
       expect(clean).not.toHaveProperty(field);
       expect(clean?.status).toBe('docked');
     }
+    // A clock a little ahead is still a stamp.
+    const ahead = { ...ship, routeRun: T0 + 60_000, routeNews: T0 + 6 * 3600_000 };
+    expect(cleanShipSummary(ahead, T0)).toEqual(ahead);
   });
 
   it('🏁 keeps "no run flies" only as said, and never beside a route status', () => {

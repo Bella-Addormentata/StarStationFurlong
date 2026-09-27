@@ -5177,7 +5177,9 @@ export class World {
         continue;
       }
       const captain = view && view.route.robotDockId === key ? view : null;
-      const post = pilotPost(captain?.f ?? null, now);
+      // A parked pilot's post is its dock (PoolWaiter.update also parks it
+      // before the pilot branch), so none is handed over.
+      const post = cfg.parked === true ? null : pilotPost(captain?.f ?? null, now);
       const door = captain ? this.pilotDoorPost(captain.route.shipPort) : null;
       bot.setPilotPost(
         post === "helm" ? (this.pilotHelmPost() ?? door) : post === "door" ? door : null,

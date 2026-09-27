@@ -161,6 +161,9 @@ const isName = (v: unknown): v is string => typeof v === 'string' && v.length > 
 const isStamp = (v: unknown, now: number): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= now + MAX_SKEW_MS;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+/** 🚏 A route's run or news time: a whole ms stamp past 0. */
+const isRouteStamp = (v: unknown, now: number): v is number =>
+  Number.isSafeInteger(v) && (v as number) > 0 && isStamp(v, now);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -260,8 +263,10 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (typeof v.routeStatus === 'string' && (SHIP_ROUTE_STATUSES as readonly string[]).includes(v.routeStatus)) {
     out.routeStatus = v.routeStatus as ShipRouteStatus;
   }
-  if (Number.isSafeInteger(v.routeRun) && (v.routeRun as number) > 0) out.routeRun = v.routeRun as number;
-  if (Number.isSafeInteger(v.routeNews) && (v.routeNews as number) > 0) out.routeNews = v.routeNews as number;
+  // Ordering stamps a board compares against its own copy: skew-bounded
+  // like updatedAt, or one far-future value would outrank it for good.
+  if (isRouteStamp(v.routeRun, now)) out.routeRun = v.routeRun;
+  if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
   if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   return out;
 }
