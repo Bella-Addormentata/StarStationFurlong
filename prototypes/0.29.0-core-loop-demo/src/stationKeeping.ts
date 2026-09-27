@@ -57,13 +57,14 @@
  * settlement, a dropped burn stays dropped whatever the next REFUEL brings,
  * and the next burn clears the entries it covered. So the log holds only the
  * burns since the last level write. A burn that reaches us after a level
- * write settled later ones cannot be replayed before them: it applies at the
- * time of the last one. The level is still one value: a stale level write
- * that wins the merge (from a tab offline across other level writes) brings
- * back its own settlement, and the burns settled since it whose entries a
- * later burn cleared are taken back, orbit and fuel, as that write takes back
- * the levels written since. A room trimmed before the log keeps its one
- * 'trim' record, and the replay starts from it until the first settlement.
+ * write settled later ones cannot be replayed before them: it applies, and
+ * fires, at the time of the last one. The level is still one value: a stale
+ * level write that wins the merge (from a tab offline across other level
+ * writes) brings back its own settlement, and the burns settled since it
+ * whose entries a later burn cleared are taken back, orbit and fuel, as that
+ * write takes back the levels written since. A room trimmed before the log
+ * keeps its one 'trim' record, and the replay starts from it until the first
+ * settlement.
  *
  * A burn names the orbit it trims by its BASIS — planet and slot, the two
  * numbers the slot's orbit is derived from — not by a station id: station
@@ -447,7 +448,8 @@ function burnOrder(a: TrimBurn, b: TrimBurn): number {
 }
 
 /** Where a run of burns leaves the trim, the fuel they drew, and the burns
- *  that fired (in order). */
+ *  that fired (in order), each at the time it applied: one stamped before
+ *  the start's last burn at that burn's time. */
 export interface BurnRun {
   trim: OrbitTrim | null;
   fuelDrawn: number;
@@ -473,11 +475,14 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
     if (fuelDrawn + burn.fuel > limit) continue;
     fuelDrawn += burn.fuel;
     const at = burn.at < frontier ? frontier : burn.at;
+    const applied = at === burn.at ? burn : { ...burn, at };
     // A burn that would leave the band changes nothing but still pays, and
     // the trim still dates from it: a settlement keeps the trim's time as its
     // frontier and its last burn as the one that fired last.
-    trim = applyBurn(trim, at === burn.at ? burn : { ...burn, at }) ?? heldTrim(trim, burn.dir, at);
-    fired.push(burn);
+    trim = applyBurn(trim, applied) ?? heldTrim(trim, burn.dir, at);
+    // It fires when it applies, so the lockout and the stick keep the same
+    // time as the orbit.
+    fired.push(applied);
   }
   return { trim, fuelDrawn, fired };
 }
@@ -634,7 +639,8 @@ let heard: string | null = null;
 interface RoomReplay {
   trim: OrbitTrim | null;
   fuelDrawn: number;
-  /** Every burn that fired: the settled run's last one, then the burns since. */
+  /** Every burn that fired: the settled run's last one, then the burns
+   *  since, each at the time it applied (BurnRun). */
   fired: FiredBurn[];
   /** The log keys the settlement covers. */
   covered: ReadonlySet<string>;

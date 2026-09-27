@@ -1224,20 +1224,29 @@ function shipStationHere(roomId: string): string | null {
 }
 
 /** Does this room hold a live dock into a room of the station whose welcome
- *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) */
-function dockedToStation(welcomeRoomId: string): boolean {
+ *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) True when
+ *  it does; else when this room let go of it, by its dock tombstones (the
+ *  UNDOCK's own stamp, however late this tab learns of it), the earliest
+ *  release at or after `since`; else false (not docked, time unknown). */
+function dockedToStation(welcomeRoomId: string, since = -Infinity): boolean | number {
+  let released: number | null = null;
   for (const [, rec] of readAllDoors()) {
-    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
-    if (rec.transient !== true && !isDockChain(rec.segments)) continue;
+    const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
+    if (!address) continue;
+    if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
+    if (rec.paired !== true && !rec.dock) continue;
     let partner = "";
     try {
-      partner = roomIdFromSeed(rec.connectedRoomAddress);
+      partner = roomIdFromSeed(address);
     } catch {
       continue;
     }
-    if (partner && stationForRoom(partner)?.welcomeRoomId === welcomeRoomId) return true;
+    if (!partner || stationForRoom(partner)?.welcomeRoomId !== welcomeRoomId) continue;
+    if (rec.paired === true) return true;
+    const at = rec.dock!.undockedAt;
+    if (at >= since && (released === null || at < released)) released = at;
   }
-  return false;
+  return released ?? false;
 }
 
 /** The one-module station whose welcome room IS this room, straight from
@@ -2255,6 +2264,9 @@ async function joinRoomAtEpoch(
 
   roomMap.observe((_event) => {
     updateRoomUI();
+    // 🪐 A ship's shared summary carries the room's name: one that syncs in
+    // (or is changed) replaces the "SHIP" stand-in now, not at the heartbeat.
+    if (_event.keysChanged.has("name")) publishPlanetSummary();
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some

@@ -571,8 +571,10 @@ export function cancelTowLeftBehind(
   realMs: number,
   /** Is this room still docked to a room of that station, right now? A
    *  manual UNDOCK leaves the flight record 'docked', so the live dock is
-   *  what says the tug let go. Leave it out when it is not known. */
-  dockedTo?: (welcomeRoomId: string) => boolean,
+   *  what says the tug let go: true while docked, else when it let go (the
+   *  earliest release at or after `since`, the tow's booking), else false
+   *  (let go, time unknown). Leave it out when it is not known. */
+  dockedTo?: (welcomeRoomId: string, since: number) => boolean | number,
 ): boolean {
   let wrote = false;
   for (const tow of outbidTows(roomId)) wrote = writeCancelOf(tow, realMs) || wrote;
@@ -583,11 +585,15 @@ export function cancelTowLeftBehind(
     if (tow.mode !== 'tug' || tow.tugRoomId !== roomId) continue;
     // The tug left before the tow was over: by when the flight cast off when
     // the record says, however late this tab learns of it; a tug still
-    // 'docked' that let go of the station (UNDOCK records no time) by now.
+    // 'docked' that let go of the station by its UNDOCK's own stamp (the dock
+    // tombstone), else by now.
     let leftAt: number;
     if (flight.status !== 'docked') leftAt = flight.castOffAt ?? flight.departedAt ?? realMs;
-    else if (dockedTo && !dockedTo(tow.welcomeRoomId)) leftAt = realMs;
-    else continue;
+    else {
+      const docked = dockedTo ? dockedTo(tow.welcomeRoomId, bookedOf(tow)) : true;
+      if (docked === true) continue;
+      leftAt = docked === false ? realMs : docked;
+    }
     if (leftAt >= tow.arriveAt) continue;
     wrote = writeCancelOf(tow, realMs) || wrote;
   }
@@ -811,7 +817,7 @@ const ENTRY_PREFIX = 'move:';
 const LEGACY_KEY = 'move';
 
 /** Prefix of the settled part of the move log: `moveSettled:<writer>:<n>`
- *  holding { n, drawn, floor, recent } for the first `n` entries one writer
+ *  holding { n, drawn, floor, recent, done } for the first `n` entries one writer
  *  (the clientID in an entry's key) wrote that have left the log: the final
  *  unbeaten fuel and largest unbeaten running total, and the moves still
  *  reversible (MOVE_FINAL_MS), each paid only while nothing beats it. A
@@ -839,8 +845,15 @@ export const MOVE_FINAL_MS = MOVE_HORIZON_MS;
 export const SETTLED_RECENT_MAX = 16;
 
 /** `drawn` and `floor` are final; `recent` holds pruned moves still paid for
- *  only while nothing beats them. */
-interface SettledMoves { n: number; drawn: number; floor: number; recent: StationMove[] }
+ *  only while nothing beats them; `done` the latest moves made final here
+ *  (at most SETTLED_RECENT_MAX), so another writer's copy of one of them (a
+ *  move written twice, two tabs) is never paid again. */
+interface SettledMoves { n: number; drawn: number; floor: number; recent: StationMove[]; done?: StationMove[] }
+
+/** One move's identity across copies: its published fields. */
+function moveId(m: StationMove): string {
+  return JSON.stringify(cleanMove(m));
+}
 
 /** A settled record off the wire: a positive whole count, totals within the
  *  fuel meter's range, and at most SETTLED_RECENT_MAX well-formed moves. */
@@ -848,8 +861,8 @@ function isSettledMoves(v: unknown): v is SettledMoves {
   const r = v as SettledMoves;
   const meter = (x: unknown) => typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= FUEL_METER_MAX;
   return !!r && typeof r === 'object' && Number.isSafeInteger(r.n) && r.n > 0 && meter(r.drawn) && meter(r.floor)
-    && (r.recent === undefined || (Array.isArray(r.recent) && r.recent.length <= SETTLED_RECENT_MAX
-      && r.recent.every((m) => validMove(m) !== null)));
+    && [r.recent, r.done].every((list) => list === undefined || (Array.isArray(list) && list.length <= SETTLED_RECENT_MAX
+      && list.every((m) => validMove(m) !== null)));
 }
 
 function validMove(raw: unknown): StationMove | null {
@@ -890,7 +903,9 @@ function roomMoves(): {
       const had = settled.get(w);
       if (!had || v.n > had.n || (v.n === had.n && v.drawn > had.drawn)) {
         if (had) stale.push(had.key);
-        settled.set(w, { n: v.n, drawn: v.drawn, floor: v.floor, recent: (v.recent ?? []).map(cleanMove), key: k });
+        settled.set(w, {
+          n: v.n, drawn: v.drawn, floor: v.floor, recent: (v.recent ?? []).map(cleanMove), done: (v.done ?? []).map(cleanMove), key: k,
+        });
       } else stale.push(k);
       continue;
     }
@@ -1038,9 +1053,16 @@ export function readMoveFuelDrawn(): number {
   let base = legacy?.fuelDrawn ?? 0;
   let settledFloor = 0;
   for (const r of settled.values()) { base += r.drawn; settledFloor = Math.max(settledFloor, r.floor); }
-  // Recently pruned moves count like live ones: paid unless beaten.
-  const { sum, floor } = meterParts([...entries, ...recent], known, base);
+  // Recently pruned moves count like live ones: paid unless beaten, and
+  // unless a copy was already made final (and so counted in a drawn total).
+  const done = doneIds(settled);
+  const { sum, floor } = meterParts([...entries, ...recent].filter((m) => !done.has(moveId(m))), known, base);
   return Math.max(sum, floor, settledFloor);
+}
+
+/** Every settled record's final moves it still remembers, by identity. */
+function doneIds(settled: Map<string, SettledMoves>): Set<string> {
+  return new Set([...settled.values()].flatMap((r) => (r.done ?? []).map(moveId)));
 }
 
 /** Every settled record's still-reversible moves. */
@@ -1088,7 +1110,12 @@ function pruneMoveLog(now: number): void {
   if (kept.size === keyed.length) return;
   const keptMoves = keyed.filter((e) => kept.has(e)).map((e) => e.move);
   // A move written twice (two tabs) is one move: a copy that stays pays.
-  const counted = new Set(keptMoves.map((m) => JSON.stringify(m)));
+  const counted = new Set(keptMoves.map(moveId));
+  // …and so does a copy another writer's record holds: final there, or
+  // still reversible there (the smaller writer id keeps a copy both hold).
+  const heldBy = (w: string, id: string, onlyBefore: boolean): boolean => [...settled].some(([o, r]) =>
+    o !== w && ((r.done ?? []).some((m) => moveId(m) === id)
+      || ((!onlyBefore || o < w) && r.recent.some((m) => moveId(m) === id))));
   for (const [w, list] of byWriter) {
     const gone = list.filter((e) => !kept.has(e));
     if (gone.length === 0) continue;
@@ -1097,11 +1124,11 @@ function pruneMoveLog(now: number): void {
     let floor = had?.floor ?? 0;
     // Pruned moves nothing beats stay whole (reversible) for a while; one
     // already beaten was never paid and is dropped.
-    const recent = [...(had?.recent ?? [])];
+    const recent = (had?.recent ?? []).filter((m) => !heldBy(w, moveId(m), true));
     for (const e of gone) {
       moveMap!.delete(e.key);
-      const id = JSON.stringify(e.move);
-      if (counted.has(id) || superseded(e.move, known)) continue;
+      const id = moveId(e.move);
+      if (counted.has(id) || superseded(e.move, known) || heldBy(w, id, false)) continue;
       counted.add(id);
       recent.push(e.move);
     }
@@ -1109,10 +1136,12 @@ function pruneMoveLog(now: number): void {
     // unless something beats them by now.
     recent.sort((x, y) => x.arriveAt - y.arriveAt || compareMoves(x, y));
     const final = recent.filter((m, i) => m.arriveAt < now - MOVE_FINAL_MS || i < recent.length - SETTLED_RECENT_MAX);
+    const done = [...(had?.done ?? [])];
     for (const m of final) {
       if (superseded(m, known)) continue;
       drawn += m.fuel;
       floor = Math.max(floor, m.fuelDrawn);
+      done.push(m);
     }
     const n = (had?.n ?? 0) + gone.length;
     if (had) moveMap!.delete(had.key);
@@ -1121,6 +1150,7 @@ function pruneMoveLog(now: number): void {
       drawn: Math.min(FUEL_METER_MAX, drawn),
       floor: Math.min(FUEL_METER_MAX, floor),
       recent: recent.filter((m) => !final.includes(m)),
+      done: done.slice(-SETTLED_RECENT_MAX),
     });
   }
 }
@@ -1158,6 +1188,20 @@ export function subscribeStationMove(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** Clear every key in the move log that is not a well-formed entry or
+ *  settled record, however many a peer wrote: a write walks the whole map
+ *  once (writes are rare: a helm press, an arrival pin, a cancel), so the
+ *  entry it adds sits within the readers' bounded scan (MOVE_SCAN_MAX) at
+ *  once, never behind a flood only later writes would clear. */
+function sweepJunk(): void {
+  const junk: string[] = [];
+  for (const [k, v] of moveMap!.entries()) {
+    const ok = k.startsWith(SETTLED_PREFIX) ? isSettledMoves(v) : k.startsWith(ENTRY_PREFIX) && validMove(v) !== null;
+    if (!ok) junk.push(k);
+  }
+  for (const k of junk) moveMap!.delete(k);
+}
+
 /** Publish a move (owner-gated at the caller). Returns whether it wrote. */
 export function writeStationMove(move: StationMove): boolean {
   if (!docAlive()) return false;
@@ -1167,6 +1211,7 @@ export function writeStationMove(move: StationMove): boolean {
     return false;
   }
   boundDoc!.transact(() => {
+    sweepJunk();
     pruneMoveLog(Date.now());
     // One key per move: a writer's moves of two stations can leave at once.
     moveMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}:${clean.welcomeRoomId || clean.stationId}`, clean);
