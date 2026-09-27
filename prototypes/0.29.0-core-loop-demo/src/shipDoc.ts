@@ -69,6 +69,14 @@
  */
 
 import * as Y from 'yjs';
+import type { DoorWall } from './doorLayoutDoc';
+import {
+  DEFAULT_STATIONS,
+  findStation,
+  isKnownStation,
+  listStations,
+  type StationDestination,
+} from './stationDirectory';
 
 // ── Constants (plan §5) ──────────────────────────────────────────────────────
 
@@ -77,33 +85,21 @@ import * as Y from 'yjs';
  *  carries multiple hops of fuel out of the box. */
 export const TANK_CAPACITY = 100;
 
-/** Rounded travel time floor — arrivals cluster around this so clock skew never
- *  visibly stretches into minutes at typical WAN drift. Plan §5.1 target
- *  60–120 s; we bracket the middle. */
-const TRAVEL_MS_MIN = 60_000;
+/** Destinations come from the station directory (stationDirectory.ts) — one
+ *  small seam the station record can later point at. Fuel cost is flat per hop
+ *  (continuous burn needs a clock authority nobody has yet). `travelMs` is
+ *  writer-clock duration; every viewer interpolates against
+ *  `departedAt`/`etaAt` clamped to [0, 1] and treats `etaAt passed ⇒ arrived`
+ *  regardless of status — the clock-skew posture (plan §2 read-side
+ *  resolution). */
+export type Destination = StationDestination;
 
-/** Static destination table (plan §5.2). Fuel cost is flat per hop (continuous
- *  burn needs a clock authority nobody has yet). `travelMs` is writer-clock
- *  duration; every viewer interpolates against `departedAt`/`etaAt` clamped
- *  to [0, 1] and treats `etaAt passed ⇒ arrived` regardless of status — the
- *  clock-skew posture (plan §2 read-side resolution). */
-export interface Destination {
-  id: string;
-  name: string;
-  fuelCost: number;
-  travelMs: number;
-}
-
-export const DESTINATIONS: readonly Destination[] = [
-  { id: 'furlong-station', name: 'Furlong Station', fuelCost: 0, travelMs: 0 },
-  { id: 'high-orbit',      name: 'High Orbit',      fuelCost: 25, travelMs: TRAVEL_MS_MIN },
-  { id: 'l4-anchorage',    name: 'L4 Anchorage',    fuelCost: 50, travelMs: TRAVEL_MS_MIN + 30_000 },
-];
+/** The static table the directory serves until the station record lands. */
+export const DESTINATIONS: readonly Destination[] = DEFAULT_STATIONS;
 
 /** Look up a destination by id; unknown ids resolve to home (plan §2, item 4). */
 export function findDestination(id: string): Destination {
-  const hit = DESTINATIONS.find((d) => d.id === id);
-  return hit ?? DESTINATIONS[0]; // furlong-station is always DESTINATIONS[0]
+  return findStation(id);
 }
 
 // ── Records (plan §2) ────────────────────────────────────────────────────────
@@ -233,7 +229,7 @@ function isFuelRecord(v: unknown): v is FuelRecord {
  *  here. `docked at home` matches "an unopened room doc IS today's module"
  *  (plan §2, item 3). */
 export function defaultFlight(): FlightRecord {
-  return { status: 'docked', locationId: DESTINATIONS[0].id };
+  return { status: 'docked', locationId: listStations()[0].id };
 }
 
 /** Strip stale fields when the status doesn't need them. Called on write and
@@ -376,6 +372,8 @@ export type DepartRefusal =
   | { ok: false; reason: 'insufficient-fuel'; needed: number; have: number }
   | { ok: false; reason: 'chained-berth'; chainedDoors: readonly string[] }
   | { ok: false; reason: 'unknown-destination' }
+  | { ok: false; reason: 'already-here' }
+  | { ok: false; reason: 'other-planet' }
   | { ok: false; reason: 'no-owner' };
 
 /** Inputs the caller assembles from the live docs — kept as a plain struct so
@@ -391,6 +389,10 @@ export interface DepartContext {
   chainedDoors: readonly string[];
   /** True when the local player is authorized (owner-equivalent). */
   ownerAuthorized: boolean;
+  /** Where the ship is now. When given, the destination must be ANOTHER
+   *  station orbiting the same planet (ships fly between one planet's
+   *  stations; interplanetary travel is not a v1 hop). */
+  locationId?: string;
 }
 
 /** Predicate the DEPART button funnels through. Returns the refusal reason so
@@ -399,8 +401,14 @@ export function canDepart(ctx: DepartContext): DepartRefusal {
   if (!ctx.ownerAuthorized) return { ok: false, reason: 'no-owner' };
   if (!ctx.flightCapable) return { ok: false, reason: 'not-flight-capable' };
   if (ctx.currentStatus !== 'docked') return { ok: false, reason: 'not-docked' };
-  const dest = DESTINATIONS.find((d) => d.id === ctx.destinationId);
-  if (!dest) return { ok: false, reason: 'unknown-destination' };
+  if (!isKnownStation(ctx.destinationId)) return { ok: false, reason: 'unknown-destination' };
+  const dest = findStation(ctx.destinationId);
+  if (ctx.locationId !== undefined) {
+    if (ctx.locationId === dest.id) return { ok: false, reason: 'already-here' };
+    if (findStation(ctx.locationId).planetId !== dest.planetId) {
+      return { ok: false, reason: 'other-planet' };
+    }
+  }
   if (ctx.chainedDoors.length > 0) {
     return { ok: false, reason: 'chained-berth', chainedDoors: ctx.chainedDoors };
   }
@@ -468,4 +476,89 @@ export type PairingRefusal =
 export function pairingAllowedByFlight(rec: FlightRecord): PairingRefusal {
   if (rec.status === 'docked') return { ok: true };
   return { ok: false, reason: 'flight', status: rec.status };
+}
+
+// ── Berth memory — where this ship docks at each station (#30 SH3) ───────────
+//
+// A ship flies away from a dock and should come back to it. At DEPART the helm
+// records, per station, which of the ship's ports was docked and to which berth
+// (room seed + far door geometry — exactly a DOCK tombstone's memory). On
+// arrival the berth comes from the station directory when the station names a
+// public one, else from this memory; the helm re-points the port at it and
+// runs the ordinary DOCK (docking.ts redockPort), so the arrival dock obeys
+// every shipped dock rule — far CAS, overlap guard, construction rights.
+//
+// Plain JSON under `ship.berths`, `{ [stationId]: BerthMemoryRecord }`,
+// shape-guarded on read like every other ship value.
+
+/** One remembered berth: which ship port docked where. */
+export interface BerthMemoryRecord {
+  /** The SHIP's door that wore the dock. */
+  doorId: string;
+  /** The berth room's pass seed. */
+  address: string;
+  farDoor?: string;
+  farWall?: DoorWall;
+  farLateral?: number;
+}
+
+const MAX_BERTH_STATIONS = 32;
+/** A pass seed carries hints and a key — generous, but bounded. */
+const MAX_ADDRESS_LEN = 4096;
+const DOOR_WALLS: readonly string[] = ['x+', 'x-', 'y+', 'y-'];
+
+export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const r = v as Partial<BerthMemoryRecord>;
+  if (!isBoundedString(r.doorId)) return false;
+  if (typeof r.address !== 'string' || r.address.length === 0 || r.address.length > MAX_ADDRESS_LEN) return false;
+  if (r.farDoor !== undefined && !isBoundedString(r.farDoor)) return false;
+  if (r.farWall !== undefined && !DOOR_WALLS.includes(r.farWall as string)) return false;
+  if (r.farLateral !== undefined && !(typeof r.farLateral === 'number' && Number.isFinite(r.farLateral))) return false;
+  return true;
+}
+
+function cleanBerth(r: BerthMemoryRecord): BerthMemoryRecord {
+  const out: BerthMemoryRecord = { doorId: r.doorId, address: r.address };
+  if (r.farDoor !== undefined) out.farDoor = r.farDoor;
+  if (r.farWall !== undefined) out.farWall = r.farWall;
+  if (r.farLateral !== undefined) out.farLateral = r.farLateral;
+  return out;
+}
+
+/** Every remembered berth, junk entries dropped. */
+export function readBerthMemory(): Record<string, BerthMemoryRecord> {
+  const out: Record<string, BerthMemoryRecord> = {};
+  if (!docAlive()) return out;
+  const raw = shipMap!.get('berths');
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return out;
+  let n = 0;
+  for (const [stationId, rec] of Object.entries(raw as Record<string, unknown>)) {
+    if (n >= MAX_BERTH_STATIONS) break;
+    if (!isBoundedString(stationId) || !isBerthMemoryRecord(rec)) continue;
+    out[stationId] = cleanBerth(rec);
+    n++;
+  }
+  return out;
+}
+
+/** The berth this ship remembers at `stationId`, if any. */
+export function readStationBerth(stationId: string): BerthMemoryRecord | null {
+  return readBerthMemory()[stationId] ?? null;
+}
+
+/** Remember (or, with null, forget) the berth at `stationId`. Owner-gated at
+ *  the caller, like every ship write. */
+export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | null): void {
+  if (!docAlive() || !isBoundedString(stationId)) return;
+  if (rec !== null && !isBerthMemoryRecord(rec)) {
+    console.warn('[ship] refused to write malformed berth memory', rec);
+    return;
+  }
+  const next = readBerthMemory();
+  if (rec === null) delete next[stationId];
+  else next[stationId] = cleanBerth(rec);
+  boundDoc!.transact(() => {
+    shipMap!.set('berths', next);
+  });
 }

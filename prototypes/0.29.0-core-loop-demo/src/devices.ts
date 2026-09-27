@@ -32,24 +32,30 @@ import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc'
 // helm is the primary read/write surface for both. Owner-gated at the caller;
 // shape-guarded on read (a hostile peer could write any junk).
 import {
-  DESTINATIONS,
   TANK_CAPACITY,
   canDepart,
   clampFuelToCapacity,
   findDestination,
   flightArrived,
   flightProgress,
-  isLegalFlightTransition,
   readFlightRecord,
   readFuelLevel,
   subscribeShip,
   writeFlightRecord,
   writeFuelLevel,
 } from './shipDoc';
+// 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
+import { destinationsFrom } from './stationDirectory';
+// 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
+import {
+  castOffForDeparture,
+  completeArrival,
+  type ArrivalOutcome,
+  type ShipDockingApi,
+} from './shipArrival';
 // #30 SH3: the helm enumerates the room's paired doors so canDepart can
 // refuse a permanent connector-chain (a chained module cannot fly, by
-// construction — plan §5.1). DEPART also iterates the transient berths
-// and casts them off before the state advances to in-flight.
+// construction — plan §5.1). DEPART also detaches any transient berth.
 import {
   deleteDoorPairing,
   readAllDoors,
@@ -57,11 +63,23 @@ import {
 } from './doorsDoc';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
-import type { DoorDockingPortSystem, DockingState } from './docking';
+import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
+// ⚓ #163: the helm's docking computer draws the ship atlas in room metres.
+import { roomHalfExtents } from './floorPlanDoc';
 import {
   readAllDoorLayout, doorOrdinals, doorDisplayName, defaultDoorLayoutRecords,
 } from './doorLayoutDoc';
 import { physicalDoorPose, DOOR_OPENING_WIDTH } from './doorLayout';
+import { readChainSyncStatus, readRoomBindingResult, treasuryDocBound } from './treasuryDoc';
+import { treasuryNetwork } from './treasuryNetwork';
+import {
+  type FundingReadAccess,
+  TREASURY_MUTED,
+  displayHeight,
+  formatHeight,
+  roomFundingView,
+  shortId,
+} from './treasuryView';
 import {
   getItemDef, loadTrunkState,
   TOOL_SLOT_COUNT, TOTAL_SLOT_COUNT,
@@ -81,7 +99,7 @@ import {
   B_PAWN, B_KNIGHT, B_BISHOP, B_ROOK, B_QUEEN, B_KING,
 } from './games/chess';
 import type { ChessState, ChessColor } from './games/chess';
-import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readPlayerDisplayName } from './games/gamesDoc';
+import { readGame, writeGame, readTable, clearTable, subscribeGames, readRoomOwner, readRoomOwnerKey, readPlayerDisplayName } from './games/gamesDoc';
 import { getPlayerId } from './identity';
 // 🎰 #69 G1/G2: chips + the cage ledger + roulette table state (casino map).
 import {
@@ -97,7 +115,18 @@ import {
   writeSlotPlayRequest, writeSlotReveal,
   readSlotFundingConfig, writeSlotFundingConfig, readSlotFundingBalance,
   depositSlotFunding, withdrawSlotFunding, writeSlotOddsConfig,
+  // 🪙 Coin pusher (#135) — the player's and owner's request keys; the
+  // operator (pusherCroupier.ts) moves the chips.
+  readCoinPusherState, readCoinPusherRequest, writeCoinPusherRequest,
+  cancelCoinPusherRequest, coinPusherRequestKey, coinPusherResultKey, readCoinPusherResult,
+  COIN_PUSHER_OPERATOR_KEY,
+  readCoinPusherEmptyRequest, writeCoinPusherEmptyRequest, readCoinPusherDoorResult,
+  isCoinPusherRecordUnreadable,
+  subscribeCasinoKey,
 } from './casinoDoc';
+// 🪙 Whether the room's coin pushers are operated, and ready for a drop,
+// judged without comparing clocks across devices (pusherCroupier.ts CLOCKS).
+import { coinPusherOperatorState, type CoinPusherOperatorState } from './pusherCroupier';
 // 🎲🔗 #69 G5 seam: the pluggable settlement backends (local / optional Chia) —
 // the house-only toggle in the craps panel flips the per-table preference.
 import { crapsBackend } from './crapsBackend';
@@ -120,6 +149,14 @@ import {
   commitSlotSeed, computeRTP, hashSlotPaytable, isSlotOddsConfig, randomSlotSeed,
 } from './games/slots';
 import type { SlotFundingConfig, SlotPayEntry } from './games/slots';
+// 🪙 Coin pusher engine (#135) — pure physics, no doc / DOM access. The panel
+// reads the sweep clock and the machine's meter from it.
+import {
+  chipsInMachine, currentPusherPhase, pusherFaceX,
+  HOLE_COUNT, HOLE_XS, MACHINE_MAX_CHIPS, PLAT_UP_FRONT, PUSHER_ANTE,
+  PUSHER_REQUEST_TTL_MS,
+} from './games/coinPusher';
+import type { CoinPusherState, PusherHole, PusherRefusalReason } from './games/coinPusher';
 // 🎰🤖 #77B: the auto-croupier's shared settle/open helpers (the manual SPIN /
 // NEW ROUND buttons delegate to the same implementation) + operator liveness.
 import { canRunCroupier, rollAndSettle, openBetting, isCroupierLive } from './croupier';
@@ -139,11 +176,23 @@ import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
-import { chipsFor, drawChips, drawFeltStack } from './chipDisplay';
+import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+
+/**
+ * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
+ * wave, the cake's confetti burst, the river's current. The builder
+ * (furniture.ts) stows it on a MESH's userData.propAnim (registerFurnitureHandles
+ * only visits meshes); World collects it and drives update(dt) every frame —
+ * the trunk-lid idiom, so the animation dies with the item instead of
+ * outliving it on a timer.
+ */
+export interface PropAnimHandle {
+  update(dt: number): void;
+}
 
 /**
  * Hooks the player's device-focus sequence uses to talk to the focus
@@ -262,13 +311,16 @@ export interface TrunkLidHandle {
  */
 export interface CloneVatHandle {
   /**
-   * Snap to the full+closed attract state, hold a short beat, then drain the
-   * liquid and spin the glass door open. onOpen fires exactly once when the
+   * Snap to the full+closed attract state, hold a short beat, drain the
+   * liquid, hold the drained tank shut a beat (so it visibly reads EMPTY),
+   * then spin the glass door open. onOpen fires exactly once when the
    * doorway is clear (the avatar may walk out). Restarts cleanly if called
    * mid-cycle.
    */
   beginSpawnCycle(onOpen: () => void): void;
-  /** Spin the door shut, then slowly refill the tank (idle attract state). */
+  /** Spin the door shut from wherever it stands, then slowly refill the tank
+   *  (idle attract state) — the tank never refills behind an open door. A
+   *  pending onOpen is dropped; a no-op when already sealed or sealing. */
   closeAndRefill(): void;
   /** Drive from World.update — NOT a detached rAF loop (PR #29's doors). */
   update(deltaTime: number): void;
@@ -284,6 +336,31 @@ export interface SlotMachineVisualHandle {
   showMessage(message: string): void;
   /** Animate the physical axle/arm through one pull-and-return cycle. */
   pullLever(): void;
+}
+
+/**
+ * 🪙 In-world coin-pusher cabinet visuals. The pusher bar swings on a cosine
+ * profile that matches the pure engine's `pusherFaceX(phase)`, and the piles
+ * of chips on both platforms rebuild from the shared `pusher:<mid>` state each
+ * frame so every peer watches the same layout. World.update calls update(dt)
+ * every frame (the SlotMachineVisualHandle precedent — no detached rAF loop).
+ */
+export interface CoinPusherVisualHandle {
+  /** Advance the pusher animation phase and repaint pile visuals from the
+   *  shared doc state. Called every frame from World.update. */
+  update(deltaTime: number): void;
+  /** Light the rim of the hole the player's next drop will use. */
+  setSelectedHole(hole: 0 | 1 | 2): void;
+  /** Show a short panel message on the marquee for a couple of seconds. */
+  showMessage(message: string): void;
+  /** A short light pulse at a hole that fades back out. The cabinet fires it
+   *  itself for every settled drop, so spectators see drops too. */
+  triggerDropFx(hole: 0 | 1 | 2): void;
+  /** Free the chip geometry and both chip materials. They exist before any
+   *  chip is drawn, and each chip mesh holds only one material, so a
+   *  traversal of the cabinet can't reach them all. World calls this once,
+   *  as it removes the cabinet. */
+  dispose(): void;
 }
 
 // ── Game-table top handle (#45 v1 — shared with the furniture builder) ───────
@@ -472,6 +549,136 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
         : 'NO ADJACENT MODULE DATA';
     }
 
+    // 🏦 FUNDING (plan §10.2): what the room's signed binding cache says
+    // about a company funding this room — or, just as often, that it says
+    // nothing. It never concludes the costs are therefore personal: no record
+    // is not evidence of no company, and this panel's whole job is to keep
+    // those apart.
+    // Read-only by design in this PR — the terminal never spends, never asks
+    // for a treasury key, and funding a room grants nobody edit rights (§9.4).
+    const fundEl = panel.querySelector<HTMLElement>('#device-terminal-funding-source');
+    const fundDetailEl = panel.querySelector<HTMLElement>('#device-terminal-funding-detail');
+    if (fundEl && fundDetailEl) {
+      const roomId =
+        (window as unknown as { __ssfRoomId?: string }).__ssfRoomId ?? '';
+      // treasuryDocBound() only says a room document is attached: with no
+      // network pinned, every treasury read is disabled and returns null,
+      // which is NOT the same as there being no funding record. Gate on the
+      // network too so a disabled read is never reported as an absence.
+      // Three obstacles, not one. Collapsing them into a single boolean made
+      // this panel blame the room connection for an unconfigured build —
+      // which is every build with no VITE_SSF_TREASURY_GENESIS set, so a
+      // player in a perfectly healthy room read "cannot reach the room's
+      // records" while their own phone correctly said no network is
+      // configured. Two surfaces in one PR, contradicting each other.
+      const access: FundingReadAccess = !treasuryNetwork().configured
+        ? 'no-network'
+        : !roomId || !treasuryDocBound()
+          ? 'no-room'
+          : 'readable';
+      const connected = access === 'readable';
+      // Only a peer-reported height exists today. It is enough to flag a
+      // record whose end height looks passed (the conservative direction),
+      // but it can never establish that one is still live — the colour below
+      // treats every case that leans on it as unsettled.
+      const height = connected
+        ? displayHeight(readChainSyncStatus()).height
+        : null;
+      // Result form, so a record refused on size reads as a refusal rather
+      // than as an absence — the panel's whole job is keeping those apart.
+      const bindingResult = connected ? readRoomBindingResult(roomId) : null;
+      const funding = roomFundingView(
+        bindingResult?.status === 'ok' ? bindingResult.binding : null,
+        height,
+        // Every held-but-unusable state travels — see main.ts.
+        bindingResult && bindingResult.status !== 'ok' && bindingResult.status !== 'absent'
+          ? bindingResult.status
+          : access,
+        // Who the room's owner is, read live — the signer verdict rests on
+        // it, and this panel must agree with the phone about it. (Issue #138:
+        // readRoomOwnerKey is the seam an NFT-deed authority head replaces.)
+        readRoomOwnerKey(),
+      );
+      // No record is NOT the same fact as "funded personally", and an
+      // unreachable room document is a third state again — say which one.
+      // The trust status rides the headline: the read-only chain caveat says
+      // nothing about whether this record's signature was checked.
+      fundEl.textContent = connected
+        ? `${funding.headline.toUpperCase()} · ${funding.trust.label}`
+        : 'FUNDING RECORDS UNAVAILABLE · NO DATA';
+      // No green anywhere on this panel. Green reads as "funded, currently",
+      // and nothing available here establishes that: a valid signature shows
+      // who wrote the record, not that they were entitled to, that the chain
+      // confirmed it, or that it has not since been unbound. So a held record
+      // is neutral blue whatever its end height says, amber marks the two
+      // cases needing attention (no record, or one that looks ended), and grey
+      // means the lookup could not run. Green returns with a local chain
+      // verdict, not before.
+      fundEl.style.color = !connected
+        ? TREASURY_MUTED
+        : !funding.bound || funding.expiryStatus === 'passed'
+          ? '#F0C060'
+          : '#3E92B8';
+      const lines = !connected
+        ? [
+            // The model already worked out which obstacle this is and said so
+            // in the player's words. Substituting a hard-coded sentence here
+            // threw that away and named the wrong cause.
+            funding.detail,
+            funding.readOnlyNote,
+          ]
+        : funding.bound
+          ? [
+              `COMPANY ${shortId(funding.companyId ?? '')} · TREASURY ${shortId(funding.treasuryId ?? '')}`,
+              `PROFILE ${funding.profileId ?? '—'} · POLICY v${funding.policyVersion}`,
+              `BOUND AT ${formatHeight(funding.boundAtHeight ?? 0)}${funding.expiresAfterHeight !== null ? ` · ENDS ${formatHeight(funding.expiresAfterHeight)}` : ''}`,
+              // The signer, always: a record whose author is never shown is
+              // one a peer can forge without anyone noticing whose key it is.
+              // "BOUND BY" only when the signer is the room owner.
+              `${funding.signer === 'owner' ? 'BOUND BY' : 'SIGNED BY'} ${(funding.signerLabel ?? '—').toUpperCase()}`,
+              // And the half of §10.1 this device cannot check, said so.
+              `COMPANY APPROVAL ${(funding.companyApproval ?? '—').toUpperCase()}`,
+              funding.trust.detail,
+              // Only shown when the record names an end height at all. The
+              // note carries the verdict; the height it was judged against is
+              // named here so the player can see what the guess rests on.
+              ...(funding.expiryNote
+                ? [
+                    height === null
+                      ? funding.expiryNote.toUpperCase()
+                      : `${funding.expiryNote.toUpperCase()} REPORTED HEIGHT ${formatHeight(height)}.`,
+                  ]
+                : []),
+              funding.readOnlyNote,
+              funding.detail,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ]
+          : [
+              // A held record under someone else's key is still named by its
+              // signer, so "not the room owner" is a fact on screen and not a
+              // silence.
+              ...(funding.signerLabel ? [`SIGNED BY ${funding.signerLabel.toUpperCase()}`] : []),
+              funding.detail,
+              funding.readOnlyNote,
+              `NOT SHOWN YET: ${funding.unavailable.join('; ')}.`,
+            ];
+      fundDetailEl.textContent = lines.join('  ');
+
+      // §10.2's link to the phone Treasury app. A <button> so it answers the
+      // keyboard; the phone router only delegates inside the phone shell and
+      // this terminal is mounted elsewhere, so it goes through the same
+      // window seam other cross-module callers use.
+      const openBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-open-treasury');
+      if (openBtn && !openBtn.dataset.wired) {
+        openBtn.dataset.wired = '1';
+        openBtn.addEventListener('click', () => {
+          const open = (window as unknown as { __ssfOpenTreasury?: () => void })
+            .__ssfOpenTreasury;
+          if (open) open();
+        });
+      }
+    }
+
     // EDIT ROOM gate (#33 M2): re-evaluated with every refresh so an owner
     // change (e.g. set via console for the non-owner test path) shows up live.
     const editBtn = panel.querySelector<HTMLButtonElement>('#device-terminal-edit-room');
@@ -479,6 +686,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
     const editNote = panel.querySelector<HTMLElement>('#device-terminal-edit-room-note');
     if (editBtn && deps.editRoom) {
       const perm = deps.editRoom.permission();
+      // Captured BEFORE anything is disabled. Browsers blur a focused button
+      // the moment it becomes disabled, so reading document.activeElement
+      // afterwards always found focus already outside the panel and the
+      // recovery below never ran at all.
+      const focusedBefore = document.activeElement as HTMLElement | null;
+      const hadFocusInPanel = Boolean(panel && focusedBefore && panel.contains(focusedBefore));
       for (const btn of [editBtn, hullBtn]) {
         if (!btn) continue;
         btn.disabled = !perm.ok;
@@ -492,6 +705,25 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           : perm.reason;
       }
       if (editNote) editNote.textContent = perm.ok ? '' : perm.reason;
+      // A permission change can disable the button that currently HAS focus.
+      // The browser then moves focus out of the panel, so the arrow-key
+      // listener bound to it never fires again and the enabled treasury link
+      // becomes unreachable — the traversal defeating itself. Catch that here,
+      // where the disabling happens, and land on a stop that still works.
+      //
+      // Tested against the SAVED reference and the state now: focus was ours,
+      // the element that held it is disabled, and focus has since left.
+      const lostFocus =
+        hadFocusInPanel &&
+        focusedBefore instanceof HTMLButtonElement &&
+        focusedBefore.disabled &&
+        !panel?.contains(document.activeElement);
+      if (lostFocus && panel) {
+        const stops = [
+          ...panel.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]'),
+        ].filter((el) => el.offsetParent !== null);
+        stops[0]?.focus({ preventScroll: true });
+      }
     }
 
     drawWireframe();
@@ -642,7 +874,27 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           <div style="height:12px; border:1px solid rgba(212,168,75,0.22); border-radius:3px; background:repeating-linear-gradient(45deg, rgba(74,85,96,0.25) 0 6px, transparent 6px 12px);"></div>
         </div>
         <div id="device-terminal-adjacent" style="font-size:10px; color:#4A5560; letter-spacing:0.5px;">NO ADJACENT MODULE DATA</div>
-        <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only</div>
+        <div style="border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+          <div style="font-size:10px; color:${TREASURY_MUTED}; letter-spacing:1px; margin-bottom:4px;">FUNDING</div>
+          <div id="device-terminal-funding-source" style="font-size:11px; font-weight:800; color:${TREASURY_MUTED};">READING FUNDING RECORDS…</div>
+          <div id="device-terminal-funding-detail" style="font-size:9px; color:${TREASURY_MUTED}; margin-top:3px; line-height:1.5;"></div>
+          <!-- Disabled controls leave the tab order, so the reason they are
+               disabled cannot live only in their title attributes. -->
+          <div id="device-terminal-command-note" style="font-size:8.5px; color:${TREASURY_MUTED}; margin-top:6px;">These actions are not available yet — they arrive with the treasury and node lanes. This terminal never spends.</div>
+          <div role="group" aria-label="Funding commands, all currently unavailable" aria-describedby="device-terminal-command-note" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:4px;">
+            <button type="button" disabled title="Arrives with the treasury lane — the terminal cannot spend."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REQUEST COMPANY FUNDING</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">SELECT PROFILE</button>
+            <button type="button" disabled title="Arrives with the treasury lane."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">UNBIND</button>
+            <button type="button" disabled title="Asks this player's own node for chain state — that lane has not shipped."
+              style="font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.18); border-radius:3px; background:transparent; color:${TREASURY_MUTED}; cursor:not-allowed;">REFRESH PROOF</button>
+          </div>
+          <button type="button" id="device-terminal-open-treasury"
+            style="margin-top:5px; font-size:8px; letter-spacing:0.5px; padding:3px 6px; border:1px solid rgba(212,168,75,0.35); border-radius:3px; background:transparent; color:#F0C060; cursor:pointer;">OPEN 🏦 TREASURY ON YOUR PHONE ›</button>
+        </div>
+        <div style="font-size:9px; color:${TREASURY_MUTED}; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">SSF ROOM TERMINAL v1 · honest data only · ↑↓ MOVE · ENTER SELECT · ESC STEP BACK</div>
       `;
       // Input capture (plan §D0.3): clicks inside the device UI never reach
       // the canvas handler — clicks that DO reach it release the focus.
@@ -664,8 +916,45 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
           editRoom.requestHull();
         });
       }
+      // Keyboard traversal for the panel's controls.
+      //
+      // Tab cannot do it: main.ts binds Tab globally as the phone's open/close
+      // toggle and preventDefaults EVERY press, so the browser never cycles
+      // focus. Without this the panel's buttons — EDIT ROOM, EDIT HULL and the
+      // treasury link — are reachable by pointer only. Escape is left alone;
+      // it belongs to the device-focus controller that steps the player back
+      // out of the terminal.
+      //
+      // Enter and Space need no handling: these are real <button> elements and
+      // answer both natively once they can be focused. Disabled controls are
+      // skipped, which is also why the reason they are disabled is written in
+      // the note beside them rather than in their title attributes.
+      // Bound once here rather than read from the module-level `panel`, which
+      // unmount() sets to null — a late keydown would otherwise throw.
+      const mounted = panel;
+      const focusStops = (): HTMLElement[] =>
+        [...mounted.querySelectorAll<HTMLElement>('button:not([disabled]), [tabindex="0"]')]
+          .filter((el) => el.offsetParent !== null);
+      mounted.addEventListener('keydown', (e) => {
+        if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+        const stops = focusStops();
+        if (stops.length === 0) return;
+        e.preventDefault();
+        const here = stops.indexOf(document.activeElement as HTMLElement);
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        stops[here < 0 ? 0 : (here + step + stops.length) % stops.length].focus();
+      });
       deps.onEngagedChange?.(true);
+      // refresh() BEFORE choosing where focus lands. It applies the EDIT ROOM
+      // permission gate, so picking first would land a non-owner on EDIT ROOM
+      // and then disable the very button holding focus — dropping focus out of
+      // the panel and leaving the enabled treasury link unreachable by the
+      // arrow traversal.
       refresh();
+      // Somewhere to start from: arrow traversal is useless if nothing in the
+      // panel holds focus when it opens. preventScroll because the panel is
+      // positioned over the canvas and must not drag the page under it.
+      focusStops()[0]?.focus({ preventScroll: true });
     },
 
     unmount(): void {
@@ -1634,7 +1923,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   };
 }
 
-// ── 🚀 #30 SH2 + SH3: the HELM console — fuel truth + flight state machine ──
+// ── 🚀 #30 SH1–SH3: the HELM console — status, fuel, flight + ⚓ #163 docking ──
 
 /**
  * Owner gate for helm writes (REFUEL / DEPART / REDOCK). The helm is the
@@ -1723,63 +2012,132 @@ export function isShipReady(): boolean {
 }
 
 /**
- * The helm's focused UI (SH2 + SH3): fuel gauge (live from the ship doc,
- * capacity derived from mounted tanks), REFUEL button (owner-gated, dev-free
- * full-fill — a metered burn arrives with the parts-economy slice), DESTINATION
- * picker + DEPART button funneled through canDepart so the refusal reason is
- * SHOWN, and a live countdown + REDOCK button while a flight is under way.
- *
- * The flight state machine (docked → in-flight → redocking → docked on the
- * SH3 fast path; the slow-path `undocking` beat is legalized but not produced
- * by any writer in the shipped code — see shipDoc.ts's header diagram) is
- * ENFORCED at write time: every writeFlightRecord call is gated by BOTH a
- * shape guard AND isLegalFlightTransition against the current record (see
- * shipDoc.ts:writeFlightRecord). The UI produces the desired NEXT record
- * (docked → in-flight for DEPART, in-flight → redocking for auto-advance,
- * redocking → docked for REDOCK); illegal edges are refused at the writer.
- *
- * Arrival is READ-side (plan §2, item 3): once now ≥ etaAt, every viewer
- * draws "APPROACHING …" regardless of the status field, and the owner's helm
- * auto-advances the record to redocking on the next tick.
+ * ⚓ #163: what the helm's DOCKING COMPUTER reads and does. world.ts wires it
+ * to the room's docking system — the same DOCK / UNDOCK the door panel runs,
+ * so the two surfaces can never disagree about a port.
  */
-export function createHelmUI(): DeviceUI {
+export interface HelmDockingDeps {
+  /** Every dock port of this module, in door order. */
+  ports: () => DockPortView[];
+  /** Every module connected to this one, posed in this room's frame. */
+  connected: () => ReturnType<DoorDockingPortSystem['connectedModules']>;
+  /** Subscribe to port changes; returns the unsubscribe. */
+  subscribe: (cb: () => void) => () => void;
+  undock: (doorId: string) => void;
+  dock: (doorId: string) => void;
+}
+
+/** Port marker colours on the ship atlas (and the status words beside them). */
+const PORT_TONE: Record<DockPortView['state']['kind'], string> = {
+  docked: '#00E676',
+  undocked: '#FFB300',
+  free: '#80D8FF',
+  gangway: 'rgba(212,168,75,0.6)',
+};
+
+function portStatusText(p: DockPortView): string {
+  const who = p.partnerName ?? 'the other module';
+  switch (p.state.kind) {
+    case 'docked': return `DOCKED → ${who}`;
+    case 'undocked': return `UNDOCKED · last berth ${who}`;
+    case 'gangway': return 'connected by a gangway';
+    default: return 'FREE · no berth on record';
+  }
+}
+
+/** What the last arrival did, in the helm's words — set by whichever path
+ *  finished the flight (the open helm's tick, or main.ts's 1 Hz watch), shown
+ *  on the next docked render. Cleared at DEPART. */
+let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
+
+/** Record an arrival outcome for the helm (shipArrival.completeArrival). */
+export function noteShipArrival(outcome: ArrivalOutcome | null): void {
+  if (!outcome) return;
+  if (outcome.kind === 'docking') {
+    lastArrivalNote = { text: `Arrived at ${outcome.stationName} — docking at the berth.`, tone: 'ok' };
+    return;
+  }
+  lastArrivalNote = {
+    tone: 'warn',
+    text: outcome.reason === 'already-docked'
+      ? `Arrived at ${outcome.stationName} — already docked there.`
+      : outcome.reason === 'no-port'
+        ? `Arrived at ${outcome.stationName} — no free dock port to dock with. Fit one at a door (door panel › +DOCK).`
+        : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
+  };
+}
+
+/**
+ * The helm's focused UI (SH1 + SH2 + SH3): a SHIP STATUS checklist derived
+ * LIVE from the room's furniture (the fittings ARE the requirements — #62's
+ * physical-item ruling applied to ships); the fuel gauge (ship doc truth,
+ * capacity derived from mounted tanks) with REFUEL; the FLIGHT PLAN —
+ * DESTINATION picker over the other stations orbiting this planet
+ * (stationDirectory.ts) and DEPART funneled through canDepart so the refusal
+ * reason is SHOWN; a live countdown while in flight; and — ⚓ #163 — the
+ * DOCKING COMPUTER (DOCK / UNDOCK per port, the SHIP ATLAS for several).
+ *
+ * DEPART remembers the berth being left, UNDOCKs every docked port with the
+ * shipped UNDOCK, debits fuel and writes `docked → in-flight`. Arrival is
+ * READ-side (plan §2): once now ≥ etaAt every viewer draws it; the commander's
+ * tick writes `in-flight → redocking`, then shipArrival.completeArrival writes
+ * `docked` at the destination and DOCKs at the station's berth with the
+ * shipped DOCK. Every flight write passes writeFlightRecord's shape +
+ * legal-transition gate (shipDoc.ts).
+ */
+export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   const unsubs: Array<() => void> = [];
-  let pickerDestId: string = DESTINATIONS[1]?.id ?? DESTINATIONS[0].id;
+  /** The port the docking computer acts on (several ports ⇒ picked on the map). */
+  let selected: string | null = null;
+  /** Port marker hit areas on the atlas canvas, CSS px — rebuilt every draw. */
+  let markers: Array<{ doorId: string; x: number; y: number }> = [];
+  let pickerDestId: string | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
   // Refuel confirm-arm — one click primes, second confirms. Cleared by any
   // record change (a peer refuel resets everyone's arm).
   let refuelArmed = false;
+  const shipDocking: ShipDockingApi | null = docking
+    ? { ports: docking.ports, undock: docking.undock, dock: docking.dock }
+    : null;
+
+  const esc = (s: string) =>
+    s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
   const render = (): void => {
     if (!panel) return;
+    // Every render swaps the whole panel (a dock landing re-renders it too):
+    // remember which control had keyboard focus, and give it back.
+    const focused = document.activeElement as HTMLElement | null;
+    const refocus = focused && panel.contains(focused)
+      ? { pick: focused.dataset.helmPick, dock: focused.dataset.helmDock !== undefined, id: focused.id }
+      : null;
 
     // ── Derived + doc reads (all shape-guarded / defaults on failure) ───────
     const tanks = countFunction('fuelTank');
     const engines = countFunction('engine');
     const helms = countFunction('helm');
     const capacity = tanks * TANK_CAPACITY;
-    const rawFuel = readFuelLevel();
-    const fuel = clampFuelToCapacity(rawFuel, capacity);
+    const fuel = clampFuelToCapacity(readFuelLevel(), capacity);
     const flight = readFlightRecord();
     const commander = helmIsCommander();
     const chained = enumerateChainedDoors();
-    const berths = enumerateTransientBerths();
     const now = Date.now();
     const arrived = flightArrived(flight, now);
     const progress = flightProgress(flight, now);
-
-    // ── State-derived copy (never a bare string in the button) ─────────────
     const location = findDestination(flight.locationId);
     const destination = flight.destinationId ? findDestination(flight.destinationId) : null;
-    const pickerDest = findDestination(pickerDestId);
+    const choices = destinationsFrom(location.id);
+    if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
+    const pickerDest = pickerDestId ? findDestination(pickerDestId) : null;
     const refusal = canDepart({
       flightCapable: isShipReady(),
       currentStatus: flight.status,
       currentFuel: fuel,
-      destinationId: pickerDestId,
+      destinationId: pickerDestId ?? '',
       chainedDoors: chained,
       ownerAuthorized: commander,
+      locationId: location.id,
     });
 
     const check = (ok: boolean) => ok
@@ -1789,6 +2147,27 @@ export function createHelmUI(): DeviceUI {
       <div style="display:flex; justify-content:space-between; gap:10px; padding:5px 0; border-bottom:1px solid rgba(212,168,75,0.10); font-size:11px;">
         <span style="color:rgba(212,168,75,0.75);">${label}</span><span>${value}</span>
       </div>`;
+    const ready = engines >= 1 && tanks >= 1;
+    const ports = docking?.ports() ?? [];
+    if (!ports.some((p) => p.doorId === selected)) {
+      selected = (ports.find((p) => p.state.kind === 'docked') ?? ports[0])?.doorId ?? null;
+    }
+    const docked = ports.filter((p) => p.state.kind === 'docked');
+    const dockingRow = ports.length === 0
+      ? '— <span style="color:rgba(212,168,75,0.45);">no dock port</span>'
+      : `${check(true)} ${ports.length} port${ports.length === 1 ? '' : 's'} · ${
+          docked.length ? `docked to ${esc(docked.map((p) => p.partnerName ?? 'module').join(', '))}` : 'undocked'
+        }`;
+    // A GANGWAY holds a module as surely as a dock does — it is structure,
+    // and UNDOCK does not release it. "Free" means neither.
+    const bolted = [...new Set((docking?.connected() ?? []).filter((m) => !m.dock).map((m) => m.name))];
+    const message = !ready
+      ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
+      : bolted.length
+        ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
+        : docked.length
+          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
+          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
 
     // ── Fuel gauge: level / capacity, filled bar, refuel button ────────────
     const capFmt = capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK';
@@ -1803,12 +2182,12 @@ export function createHelmUI(): DeviceUI {
           ? 'TANKS FULL'
           : refuelArmed ? 'CONFIRM REFUEL' : 'REFUEL';
 
-    // ── Depart / redock button (status-driven) ─────────────────────────────
+    // ── Flight panel (status-driven) ────────────────────────────────────────
     let flightPanel = '';
     if (flight.status === 'docked') {
-      const options = DESTINATIONS.map((d) => `
-        <option value="${d.id}"${d.id === pickerDestId ? ' selected' : ''}>
-          ${d.name} — ${d.fuelCost === 0 ? 'stay put' : `${d.fuelCost} fuel · ${Math.round(d.travelMs / 1000)}s`}
+      const options = choices.map((d) => `
+        <option value="${esc(d.id)}"${d.id === pickerDestId ? ' selected' : ''}>
+          ${esc(d.name)} — ${d.fuelCost} fuel · ${Math.round(d.travelMs / 1000)}s
         </option>`).join('');
       // Refusal copy — the button is the caller's ANSWER, so name the reason.
       const refuseCopy = refusal.ok ? '' : (() => {
@@ -1816,59 +2195,58 @@ export function createHelmUI(): DeviceUI {
           case 'no-owner': return 'Only the module\'s COMMANDER may depart.';
           case 'not-flight-capable':
             return 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.';
-          case 'not-docked': return 'Ship is not docked — cannot depart from mid-flight.';
-          case 'chained-berth': return `Chained to ${refusal.chainedDoors.length} permanent connector${refusal.chainedDoors.length === 1 ? '' : 's'} — UNDOCK the module chain first (chained modules cannot fly).`;
+          case 'not-docked': return 'Ship is not at rest — cannot depart from mid-flight.';
+          case 'chained-berth': return `Chained to ${refusal.chainedDoors.length} permanent connector${refusal.chainedDoors.length === 1 ? '' : 's'} — take the gangway down first (chained modules cannot fly).`;
           case 'insufficient-fuel': return `Insufficient fuel — this hop needs ${refusal.needed}, tanks hold ${refusal.have}.`;
-          case 'unknown-destination': return 'Unknown destination.';
+          case 'already-here': return 'The ship is already here.';
+          case 'other-planet': return 'That station orbits another planet — out of range.';
+          case 'unknown-destination': return choices.length === 0
+            ? 'No other station orbits this planet yet.'
+            : 'Unknown destination.';
         }
       })();
-      const btnEnabled = refusal.ok && pickerDest.id !== flight.locationId;
-      const btnLabel = pickerDest.id === flight.locationId
-        ? 'ALREADY HERE'
-        : refusal.ok
-          ? `DEPART FOR ${pickerDest.name.toUpperCase()}`
-          : 'DEPART';
-      const berthNote = berths.length > 0
-        ? `<div style="font-size:9px; color:rgba(212,168,75,0.55); margin-top:6px;">🛰 ${berths.length} transient berth${berths.length === 1 ? '' : 's'} will be cast off at depart</div>`
+      const btnEnabled = refusal.ok && pickerDest !== null;
+      const btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
+      const castOff = docked.length + enumerateTransientBerths().filter((id) => !docked.some((p) => p.doorId === id)).length;
+      const castOffNote = castOff > 0
+        ? `<div style="font-size:9px; color:rgba(212,168,75,0.55); margin-top:6px;">⏏ ${castOff} dock${castOff === 1 ? '' : 's'} will be released at depart — the ship remembers this berth</div>`
+        : '';
+      const arrivalNote = lastArrivalNote
+        ? `<div style="font-size:10px; color:${lastArrivalNote.tone === 'ok' ? '#00E676' : '#FFB74D'}; margin-bottom:8px; line-height:1.4;">${esc(lastArrivalNote.text)}</div>`
         : '';
       flightPanel = `
         <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(212,168,75,0.18); border-radius:8px;">
           <div style="font-size:11px; letter-spacing:0.5px; color:rgba(212,168,75,0.8); margin-bottom:6px;">FLIGHT PLAN</div>
-          <select id="helm-dest-picker" style="width:100%; background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:6px; font-family:inherit; font-size:11px; border-radius:6px;">
+          ${arrivalNote}
+          ${choices.length > 0 ? `<select id="helm-dest-picker" style="width:100%; background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:6px; font-family:inherit; font-size:11px; border-radius:6px;">
             ${options}
-          </select>
+          </select>` : ''}
           <button id="helm-depart-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? 'rgba(0,230,118,0.18)' : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnLabel}</button>
           ${refuseCopy ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${refuseCopy}</div>` : ''}
-          ${berthNote}
+          ${castOffNote}
         </div>`;
     } else if (flight.status === 'undocking') {
-      // Undocking is a brief hand-off (transient-berths detached, DEPART is
-      // about to complete). Never lands on the wire in the SH3 wiring — the
-      // DEPART flow writes 'in-flight' directly — but a stale record can leave
-      // us here after a client reload, so the recovery is a nudge.
+      // Reserved slow-path beat — no writer produces it in SH3, but a stale
+      // record can leave us here after a client reload.
       flightPanel = `
         <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,235,59,0.25); border-radius:8px; background:rgba(255,235,59,0.05);">
           <div style="font-size:11px; color:#FFEB3B; letter-spacing:0.5px;">🚀 UNDOCKING …</div>
           <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">Cast-off in progress. The next transaction advances to in-flight.</div>
         </div>`;
     } else if (flight.status === 'in-flight') {
-      const remainingMs = flight.etaAt !== undefined ? Math.max(0, flight.etaAt - now) : 0;
-      const remaining = Math.ceil(remainingMs / 1000);
-      const destName = destination?.name ?? 'UNKNOWN';
+      const remaining = Math.ceil((flight.etaAt !== undefined ? Math.max(0, flight.etaAt - now) : 0) / 1000);
+      const destName = esc((destination?.name ?? 'UNKNOWN').toUpperCase());
       if (arrived) {
-        // Auto-advance driven by the tick — the button is a manual fallback
-        // (a client whose owner check refuses read-side still sees an honest
-        // "APPROACHING" state; the OWNER's tick moves the record to redocking).
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid #00E676; border-radius:8px; background:rgba(0,230,118,0.10);">
-            <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">✅ ARRIVED AT ${destName.toUpperCase()}</div>
-            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Advancing to redock — station side re-berthing follows shortly.</div>
+            <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">✅ ARRIVED AT ${destName}</div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Docking at the berth follows on the commander's next tick.</div>
           </div>`;
       } else {
         const pctFmt = Math.round(progress * 100);
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(129,199,132,0.35); border-radius:8px; background:rgba(0,230,118,0.06);">
-            <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">🚀 IN FLIGHT → ${destName.toUpperCase()}</div>
+            <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">🚀 IN FLIGHT → ${destName}</div>
             <div style="margin-top:8px; height:6px; background:rgba(0,0,0,0.5); border-radius:3px; overflow:hidden;">
               <div style="width:${pctFmt}%; height:100%; background:#00E676; transition:width 0.25s linear;"></div>
             </div>
@@ -1878,28 +2256,28 @@ export function createHelmUI(): DeviceUI {
           </div>`;
       }
     } else if (flight.status === 'redocking') {
-      const destName = location.name;
-      const btnEnabled = commander;
       flightPanel = `
         <div style="margin-top:12px; padding:10px 12px; border:1px solid #64B5F6; border-radius:8px; background:rgba(100,181,246,0.08);">
-          <div style="font-size:11px; color:#64B5F6; letter-spacing:0.5px;">🛬 REDOCKING AT ${destName.toUpperCase()}</div>
-          <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Bring the ship to rest — the commander confirms arrival and the module returns to docked.</div>
-          <button id="helm-redock-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? '#64B5F6' : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? 'rgba(100,181,246,0.18)' : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? '#64B5F6' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnEnabled ? 'COMPLETE REDOCK' : 'COMMANDER ONLY'}</button>
+          <div style="font-size:11px; color:#64B5F6; letter-spacing:0.5px;">🛬 DOCKING AT ${esc(location.name.toUpperCase())}</div>
+          <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">The commander's helm docks at the station's berth. If no commander is aboard, one can finish it here.</div>
+          <button id="helm-redock-btn"${commander ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${commander ? '#64B5F6' : 'rgba(212,168,75,0.25)'}; background:${commander ? 'rgba(100,181,246,0.18)' : 'rgba(80,80,80,0.15)'}; color:${commander ? '#64B5F6' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${commander ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${commander ? 'DOCK NOW' : 'COMMANDER ONLY'}</button>
         </div>`;
     }
 
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
-        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — ${flight.status === 'docked' ? 'BERTHED' : flight.status.toUpperCase()}</span>
+        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — ${flight.status === 'docked' ? 'SHIP STATUS' : flight.status.toUpperCase()}</span>
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
-      ${row('LOCATION', location.name)}
+      ${row('LOCATION', esc(flight.status === 'in-flight' ? `leaving ${location.name}` : location.name))}
       ${row('ENGINES', `${check(engines >= 1)} ${engines} mounted`)}
+      ${row('FUEL TANKS', `${check(tanks >= 1)} ${tanks} × ${TANK_CAPACITY}${tanks > 0 ? '' : ' — install a fuel tank'}`)}
       ${row('HELM', `${check(helms >= 1)} ${helms} online`)}
-      ${row('TANKS', `${check(tanks >= 1)} ${tanks} × ${TANK_CAPACITY} capacity`)}
+      ${row('DOCKING', dockingRow)}
       ${row('CHAINED', chained.length === 0
         ? `${check(true)} <span style="color:#00E676;">clear</span>`
         : `${check(false)} ${chained.length} permanent link${chained.length === 1 ? '' : 's'} — cannot fly`)}
+      ${row('PROVISIONS', '— <span style="color:rgba(212,168,75,0.45);">galley update coming</span>')}
       <div style="margin-top:10px;">
         <div style="display:flex; justify-content:space-between; align-items:baseline; font-size:11px;">
           <span style="color:rgba(212,168,75,0.75);">FUEL</span>
@@ -1910,111 +2288,285 @@ export function createHelmUI(): DeviceUI {
         </div>
         <button id="helm-refuel-btn"${refuelDisabled ? ' disabled' : ''} style="width:100%; margin-top:8px; padding:6px; border-radius:6px; border:1px solid ${refuelDisabled ? 'rgba(212,168,75,0.2)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; background:${refuelDisabled ? 'rgba(80,80,80,0.12)' : (refuelArmed ? 'rgba(255,138,128,0.18)' : 'rgba(240,192,96,0.12)')}; color:${refuelDisabled ? 'rgba(212,168,75,0.4)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; font-family:inherit; font-weight:700; cursor:${refuelDisabled ? 'not-allowed' : 'pointer'}; text-transform:uppercase; font-size:11px;">${refuelLabel}</button>
       </div>
+      ${flight.status === 'docked' ? `<div style="margin-top:10px; padding:10px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.6; color:${ready ? '#00E676' : 'rgba(212,168,75,0.7)'};">
+        ${message}
+      </div>` : ''}
       ${flightPanel}
-      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:12px;">
-        SSF FLIGHT SYSTEMS v1 · state machine active (SH2/SH3)
+      ${docking && flight.status === 'docked' ? renderDockingComputer(ports) : ''}
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
+        SSF FLIGHT SYSTEMS v1 · docking + station-to-station flight
       </div>
     `;
+    const canvas = panel.querySelector<HTMLCanvasElement>('#helm-ship-atlas');
+    if (canvas && docking) drawShipAtlas(canvas, ports, docking.connected());
 
-    // ── Wire the freshly-rendered controls ──────────────────────────────────
+    // ── Wire the freshly-rendered flight controls ───────────────────────────
     const picker = panel.querySelector<HTMLSelectElement>('#helm-dest-picker');
-    if (picker) {
-      picker.addEventListener('change', () => {
-        pickerDestId = picker.value;
-        render();
+    picker?.addEventListener('change', () => {
+      pickerDestId = picker.value;
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-refuel-btn')?.addEventListener('click', () => {
+      if (!helmIsCommander()) return;              // dev-phase owner gate
+      if (capacity === 0) return;
+      if (!refuelArmed) { refuelArmed = true; render(); return; }
+      // Dev-phase full-fill: real parts-economy metering is a later slice.
+      // writeFuelLevel clamps to CURRENT capacity, so removing a tank between
+      // arm + confirm cannot over-fill.
+      writeFuelLevel(capacity, capacity);
+      refuelArmed = false;
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-depart-btn')?.addEventListener('click', () => {
+      // Re-check every input at click time — the picker + doc state may have
+      // moved between render and click (a peer just bolted on a gangway).
+      const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
+      const nowFuel = clampFuelToCapacity(readFuelLevel(), nowCapacity);
+      const nowFlight = readFlightRecord();
+      const destId = pickerDestId ?? '';
+      const nowRefusal = canDepart({
+        flightCapable: isShipReady(),
+        currentStatus: nowFlight.status,
+        currentFuel: nowFuel,
+        destinationId: destId,
+        chainedDoors: enumerateChainedDoors(),
+        ownerAuthorized: helmIsCommander(),
+        locationId: nowFlight.locationId,
       });
-    }
-    const refuelBtn = panel.querySelector<HTMLButtonElement>('#helm-refuel-btn');
-    if (refuelBtn) {
-      refuelBtn.addEventListener('click', () => {
-        if (!helmIsCommander()) return;              // dev-phase owner gate
-        if (capacity === 0) return;
-        if (!refuelArmed) { refuelArmed = true; render(); return; }
-        // Dev-phase full-fill: real parts-economy metering is a later slice
-        // (plan §7 SH6). writeFuelLevel clamps to CURRENT capacity, so removing
-        // a tank between arm + confirm cannot over-fill.
-        writeFuelLevel(capacity, capacity);
-        refuelArmed = false;
-        // No render — the doc observer notifies + re-renders.
+      if (!nowRefusal.ok) { render(); return; }
+      const dest = findDestination(destId);
+      // 1) Cast off: remember this berth, UNDOCK every docked port (shipped
+      //    UNDOCK — tombstone + far-room write), then detach any other
+      //    transient guest berth (#67 D2, either-side legal).
+      if (shipDocking) castOffForDeparture(nowFlight.locationId, shipDocking);
+      for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
+      // 2) Debit the fuel cost.
+      writeFuelLevel(nowFuel - dest.fuelCost, nowCapacity);
+      // 3) Publish the flight record — the FAST path docked → in-flight.
+      const start = Date.now();
+      writeFlightRecord({
+        status: 'in-flight',
+        locationId: nowFlight.locationId,
+        destinationId: dest.id,
+        departedAt: start,
+        etaAt: start + Math.max(1, dest.travelMs),
       });
-    }
-    const departBtn = panel.querySelector<HTMLButtonElement>('#helm-depart-btn');
-    if (departBtn) {
-      departBtn.addEventListener('click', () => {
-        // Re-check every input at click time — the picker + doc state may
-        // have moved between render and click (a peer just paired a chain).
-        const nowFuel = clampFuelToCapacity(readFuelLevel(), tanks * TANK_CAPACITY);
-        const nowFlight = readFlightRecord();
-        const nowRefusal = canDepart({
-          flightCapable: isShipReady(),
-          currentStatus: nowFlight.status,
-          currentFuel: nowFuel,
-          destinationId: pickerDestId,
-          chainedDoors: enumerateChainedDoors(),
-          ownerAuthorized: helmIsCommander(),
-        });
-        if (!nowRefusal.ok) { render(); return; }
-        const dest = findDestination(pickerDestId);
-        if (dest.id === nowFlight.locationId) { render(); return; }
-        // 1) Cast off every transient berth (plan §5.1: undock via the
-        //    transient-berth detach). deleteDoorPairing is either-side legal
-        //    at a transient berth (#67 D2, already shipped).
-        for (const doorId of enumerateTransientBerths()) {
-          deleteDoorPairing(doorId);
-        }
-        // 2) Debit the fuel cost. clampFuelToCapacity keeps the write honest
-        //    even if a peer wrote a higher-than-capacity value moments ago.
-        writeFuelLevel(nowFuel - dest.fuelCost, tanks * TANK_CAPACITY);
-        // 3) Publish the flight record — sanitize, shape-guard, AND
-        //    isLegalFlightTransition all fire on the write side (shipDoc.ts).
-        //    SH3 takes the FAST path (docked → in-flight; skip the reserved
-        //    `undocking` hand-off beat — no cross-doc coordination needed for
-        //    the first flight); the state machine legalizes both paths so a
-        //    future preflight-animation slice can restore `undocking` here.
-        const start = Date.now();
-        writeFlightRecord({
-          status: 'in-flight',
-          locationId: nowFlight.locationId,
-          destinationId: dest.id,
-          departedAt: start,
-          etaAt: start + Math.max(1, dest.travelMs),
-        });
-        // Force one render so the countdown appears immediately (the doc
-        // observer would deliver it anyway, but avoiding a one-tick blank).
-        render();
-      });
-    }
-    const redockBtn = panel.querySelector<HTMLButtonElement>('#helm-redock-btn');
-    if (redockBtn) {
-      redockBtn.addEventListener('click', () => {
-        if (!helmIsCommander()) return;
-        const rec = readFlightRecord();
-        if (rec.status !== 'redocking') return;
-        // Redundant belt-and-braces: writeFlightRecord ALSO enforces the
-        // legal-transition table (see shipDoc.ts), so this early-out only
-        // saves the transact wrapper when a peer has just advanced past us.
-        if (!isLegalFlightTransition('redocking', 'docked')) return;
-        writeFlightRecord({ status: 'docked', locationId: rec.locationId });
-      });
+      lastArrivalNote = null;
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
+      if (!helmIsCommander()) return;
+      noteShipArrival(completeArrival(shipDocking));
+    });
+
+    if (refocus) {
+      const target = refocus.pick !== undefined
+        ? [...panel.querySelectorAll<HTMLElement>('[data-helm-pick]')].find((b) => b.dataset.helmPick === refocus.pick)
+        : refocus.dock
+          ? panel.querySelector<HTMLElement>('[data-helm-dock]')
+          : refocus.id
+            ? panel.querySelector<HTMLElement>(`#${refocus.id}`)
+            : null;
+      target?.focus();
     }
   };
 
-  /** Owner-driven auto-transitions. Runs on every commander's helm; the
-   *  writeFlightRecord-side isLegalFlightTransition gate + the writer-clock
-   *  etaAt make the race benign — whichever commander writes 'redocking'
-   *  first wins, the second's write reads the fresh 'redocking' state and
-   *  the transition 'redocking → redocking' is legalized as an idempotent
-   *  self-transition (a no-op republish, not a duplicate advance). */
+  /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
+   *  atlas + a port list for several. */
+  const renderDockingComputer = (ports: DockPortView[]): string => {
+    const screen = (inner: string) => `
+      <div style="margin-top:10px; border:1px solid #1E88A8; border-radius:8px; background:#06121C; padding:10px 12px; color:#80D8FF; font-size:10px; line-height:1.5; box-shadow: inset 0 0 18px rgba(0,229,255,0.08);">
+        <div style="font-size:10px; font-weight:800; letter-spacing:1px; color:#00E5FF; margin-bottom:6px;">⚓ DOCKING COMPUTER${ports.length > 1 ? ' · SHIP ATLAS' : ''}</div>
+        ${inner}
+      </div>`;
+    if (ports.length === 0) {
+      return screen(`NO DOCK PORT on this module. Fit one at any door — door panel › CONNECTION ASSEMBLY › <b>+DOCK</b>. A dock has two halves: one on your door, one on the berth's.`);
+    }
+    const sel = ports.find((p) => p.doorId === selected) ?? ports[0];
+    const action = (p: DockPortView): string => {
+      const canAct = p.canOperate && !p.busy;
+      const btn = (verb: 'undock' | 'dock', label: string, color: string) =>
+        `<button type="button" data-helm-dock="${verb}" data-door="${esc(p.doorId)}" ${canAct ? '' : 'disabled'} style="width:100%; margin-top:8px; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.3); color:${color}; font-size:11px; font-weight:800; padding:8px; cursor:${canAct ? 'pointer' : 'not-allowed'}; opacity:${canAct ? '1' : '0.45'}; letter-spacing:1px;">${label}</button>`;
+      const who = esc(p.partnerName ?? 'the other module');
+      const verb = p.state.kind === 'docked'
+        ? btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80')
+        : p.state.kind === 'undocked'
+          ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
+          : p.state.kind === 'free'
+            ? `<div style="margin-top:6px; color:rgba(128,216,255,0.7);">No berth on record — dock this port from its door panel: pick a station and INITIATE.</div>`
+            : '';
+      const note = p.note
+        ? `<div style="margin-top:6px; color:${p.busy ? '#FFB300' : p.tone === 'ok' ? '#00E676' : p.tone === 'bad' ? '#FF8A80' : '#FFB300'};">${p.busy ? '⏳ ' : ''}${esc(p.note)}</div>`
+        : '';
+      const rights = !p.canOperate && (p.state.kind === 'docked' || p.state.kind === 'undocked')
+        ? `<div style="margin-top:6px; color:rgba(128,216,255,0.55);">Only the owner — or a builder at that door — can dock and undock it.</div>`
+        : '';
+      return verb + note + rights;
+    };
+    if (ports.length === 1) {
+      const p = ports[0];
+      return screen(`
+        <div><b style="color:#F2EFE6;">${esc(p.label)}</b> · <span style="color:${PORT_TONE[p.state.kind]};">${esc(portStatusText(p))}</span></div>
+        ${action(p)}`);
+    }
+    // Real buttons, so every port is reachable and selectable from the
+    // keyboard (Tab, then Enter / Space) — the atlas canvas is pointer-only.
+    const list = ports.map((p, i) => `
+        <button type="button" data-helm-pick="${esc(p.doorId)}" aria-pressed="${p.doorId === sel.doorId}" aria-label="Port ${i + 1}: ${esc(p.label)}, ${esc(portStatusText(p))}" style="display:flex; width:100%; gap:8px; align-items:center; padding:3px 6px; margin-top:2px; border:none; border-radius:5px; background:${p.doorId === sel.doorId ? 'rgba(0,229,255,0.12)' : 'transparent'}; box-shadow:${p.doorId === sel.doorId ? 'inset 0 0 0 1px rgba(0,229,255,0.4)' : 'none'}; color:inherit; font:inherit; text-align:left; cursor:pointer;">
+          <span style="display:inline-block; flex-shrink:0; width:16px; height:16px; line-height:16px; text-align:center; border-radius:50%; background:${PORT_TONE[p.state.kind]}; color:#06121C; font-weight:800; font-size:9px;">${i + 1}</span>
+          <span style="color:#F2EFE6;">${esc(p.label)}</span>
+          <span style="color:${PORT_TONE[p.state.kind]}; margin-left:auto; text-align:right;">${esc(portStatusText(p))}</span>
+        </button>`).join('');
+    return screen(`
+      <canvas id="helm-ship-atlas" width="652" height="400" style="width:326px; height:200px; display:block; border-radius:6px; background:#030A10; cursor:pointer;" title="Pick a port on the ship atlas"></canvas>
+      ${list}
+      <div style="margin-top:6px; color:#F2EFE6;">SELECTED: <b>${esc(sel.label)}</b></div>
+      ${action(sel)}`);
+  };
+
+  /** ⚓ The SHIP ATLAS: this module top-down, every module connected to it
+   *  (docked berths dashed white, bolted-on gangway modules gold), and the
+   *  ports as numbered round markers — green docked, amber undocked with a
+   *  berth on record, blue free. North (−z) is up, like the wall computer. */
+  const drawShipAtlas = (
+    canvas: HTMLCanvasElement,
+    ports: DockPortView[],
+    connected: ReturnType<DoorDockingPortSystem['connectedModules']>,
+  ): void => {
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    const W = canvas.width, H = canvas.height;
+    const cssScale = canvas.clientWidth ? canvas.width / canvas.clientWidth : 2;
+    const { halfX, halfZ } = roomHalfExtents();
+    // Module outline corners, rotated into this room's frame (three.js
+    // rotation.y: x' = x·cos + z·sin, z' = −x·sin + z·cos).
+    const corners = (m: { x: number; z: number; rotY: number; halfX: number; halfZ: number }) => {
+      const c = Math.cos(m.rotY), s = Math.sin(m.rotY);
+      return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sz]) => {
+        const lx = sx * m.halfX, lz = sz * m.halfZ;
+        return { x: m.x + lx * c + lz * s, z: m.z - lx * s + lz * c };
+      });
+    };
+    // Where each port's round half sits: just outside its door (the stub's
+    // middle), so the marker lands on the adapter itself.
+    const portAt = (doorId: string) => {
+      const p = physicalDoorPose(doorId);
+      const out = 1.6;
+      return { x: p.x + Math.sin(p.outwardYaw) * out, z: p.z + Math.cos(p.outwardYaw) * out };
+    };
+    const pts: Array<{ x: number; z: number }> = [
+      { x: -halfX, z: -halfZ }, { x: halfX, z: halfZ },
+      ...connected.flatMap((m) => corners(m)),
+      ...ports.map((p) => portAt(p.doorId)),
+    ];
+    const minX = Math.min(...pts.map((p) => p.x)), maxX = Math.max(...pts.map((p) => p.x));
+    const minZ = Math.min(...pts.map((p) => p.z)), maxZ = Math.max(...pts.map((p) => p.z));
+    const PAD = 36;
+    const scale = Math.min((W - PAD * 2) / Math.max(1, maxX - minX), (H - PAD * 2) / Math.max(1, maxZ - minZ));
+    const ox = W / 2 - ((minX + maxX) / 2) * scale;
+    const oz = H / 2 - ((minZ + maxZ) / 2) * scale;
+    const px = (x: number) => ox + x * scale;
+    const pz = (z: number) => oz + z * scale;
+
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = '#030A10';
+    ctx.fillRect(0, 0, W, H);
+    const poly = (cs: Array<{ x: number; z: number }>) => {
+      ctx.beginPath();
+      cs.forEach((c, i) => (i ? ctx.lineTo(px(c.x), pz(c.z)) : ctx.moveTo(px(c.x), pz(c.z))));
+      ctx.closePath();
+    };
+    ctx.font = 'bold 18px monospace';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // Connected modules first (under the ports).
+    for (const m of connected) {
+      const door = physicalDoorPose(m.doorId);
+      ctx.strokeStyle = m.dock ? 'rgba(242,239,230,0.55)' : 'rgba(212,168,75,0.45)';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(px(door.x), pz(door.z));
+      ctx.lineTo(px(m.x), pz(m.z));
+      ctx.stroke();
+      poly(corners(m));
+      ctx.fillStyle = m.dock ? 'rgba(242,239,230,0.07)' : 'rgba(212,168,75,0.10)';
+      ctx.fill();
+      ctx.setLineDash(m.dock ? [10, 8] : []);
+      ctx.strokeStyle = m.dock ? '#F2EFE6' : '#D4A84B';
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = m.dock ? '#F2EFE6' : '#D4A84B';
+      ctx.fillText(m.name.slice(0, 18).toUpperCase(), px(m.x), pz(m.z));
+    }
+    // This module.
+    poly(corners({ x: 0, z: 0, rotY: 0, halfX, halfZ }));
+    ctx.fillStyle = 'rgba(62,146,184,0.16)';
+    ctx.fill();
+    ctx.strokeStyle = '#3E92B8';
+    ctx.lineWidth = 4;
+    ctx.stroke();
+    ctx.fillStyle = '#80D8FF';
+    ctx.fillText('THIS MODULE', px(0), pz(0));
+    // Ports.
+    markers = [];
+    ports.forEach((p, i) => {
+      const at = portAt(p.doorId);
+      const cx = px(at.x), cy = pz(at.z);
+      ctx.beginPath();
+      ctx.arc(cx, cy, 16, 0, Math.PI * 2);
+      ctx.fillStyle = PORT_TONE[p.state.kind];
+      ctx.fill();
+      ctx.lineWidth = p.doorId === selected ? 5 : 2;
+      ctx.strokeStyle = p.doorId === selected ? '#FFFFFF' : '#06121C';
+      ctx.stroke();
+      ctx.fillStyle = '#06121C';
+      ctx.fillText(String(i + 1), cx, cy + 1);
+      markers.push({ doorId: p.doorId, x: cx / cssScale, y: cy / cssScale });
+    });
+  };
+
+  const onClick = (e: MouseEvent): void => {
+    if (!panel || !docking) return;
+    const target = e.target as HTMLElement;
+    const act = target.closest<HTMLElement>('[data-helm-dock]');
+    if (act && !(act as HTMLButtonElement).disabled) {
+      const doorId = act.dataset.door ?? '';
+      if (act.dataset.helmDock === 'undock') docking.undock(doorId);
+      else docking.dock(doorId);
+      return;
+    }
+    const pick = target.closest<HTMLElement>('[data-helm-pick]');
+    if (pick) {
+      selected = pick.dataset.helmPick ?? selected;
+      render();
+      return;
+    }
+    if (target.id === 'helm-ship-atlas') {
+      const r = target.getBoundingClientRect();
+      const x = e.clientX - r.left, y = e.clientY - r.top;
+      let best: { doorId: string; d: number } | null = null;
+      for (const m of markers) {
+        const d = Math.hypot(m.x - x, m.y - y);
+        if (d < 18 && (!best || d < best.d)) best = { doorId: m.doorId, d };
+      }
+      if (best) {
+        selected = best.doorId;
+        render();
+      }
+    }
+  };
+
+  /** Commander-driven flight advance while the helm is open (main.ts runs the
+   *  same watch at 1 Hz for a closed helm). in-flight → redocking once etaAt
+   *  passes, then completeArrival docks at the destination's berth. Benign
+   *  under contention: writeFlightRecord's transition gate makes a second
+   *  commander's write a no-op, and completeArrival returns null once docked. */
   const autoAdvance = (): void => {
-    if (!panel) return;
-    if (!helmIsCommander()) return;
+    if (!panel || !helmIsCommander()) return;
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
-      // in-flight → redocking. Preserve the destination as the new location
-      // (we have arrived), and drop the transit fields — sanitize handles it.
-      const dest = rec.destinationId ? findDestination(rec.destinationId) : findDestination(rec.locationId);
-      writeFlightRecord({ status: 'redocking', locationId: dest.id });
+      writeFlightRecord({ status: 'redocking', locationId: findDestination(rec.destinationId ?? rec.locationId).id });
     }
+    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking));
   };
 
   return {
@@ -2030,22 +2582,22 @@ export function createHelmUI(): DeviceUI {
         color: #d4a84b; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
         box-sizing: border-box; pointer-events: auto;
       `;
-      panel.addEventListener('click', (e) => e.stopPropagation());
+      panel.addEventListener('click', (e) => {
+        e.stopPropagation();
+        onClick(e);
+      });
       host.appendChild(panel);
-      // Doc-observer subscriptions (furniture for tanks, ship for fuel + flight,
-      // doors for chained-refusal + transient enumeration). Each observer clears
-      // the refuel arm — a peer refuel is an obvious "cancel" for us.
+      // Doc observers: furniture (fittings), ship (fuel + flight), doors
+      // (chains + transient berths), docks (port states). Each clears the
+      // refuel arm — a peer refuel is an obvious "cancel" for us.
       unsubs.push(subscribeFurnitureForHelm(() => { refuelArmed = false; render(); }));
       unsubs.push(subscribeShip(() => { refuelArmed = false; render(); }));
       unsubs.push(subscribeDoors(() => render()));
-      // Countdown / arrival watch — writer-clock progress, independent of
-      // the observer notifications (which only fire when the record changes).
+      if (docking) unsubs.push(docking.subscribe(() => render()));
+      // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();
-        // Only re-render while the record needs a moving number (progress,
-        // countdown, arrival gate). Docked / redocking stays still.
-        const rec = readFlightRecord();
-        if (rec.status === 'in-flight') render();
+        if (readFlightRecord().status === 'in-flight') render();
       }, HELM_TICK_MS);
       render();
     },
@@ -2055,6 +2607,7 @@ export function createHelmUI(): DeviceUI {
       if (tickTimer !== null) { clearInterval(tickTimer); tickTimer = null; }
       panel?.remove();
       panel = null;
+      markers = [];
       refuelArmed = false;
     },
 
@@ -4051,3 +4604,408 @@ export function createCrapsUI(deps: CrapsUIDeps): DeviceUI {
     },
   };
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// 🪙 Coin pusher (#135)
+// ══════════════════════════════════════════════════════════════════════════════
+// The player's panel. The machine is run by its operator (pusherCroupier.ts);
+// this panel writes only the player's own drop request (hole + the pusher
+// phase on screen when they pressed DROP) and the owner's door request, and
+// reads the operator's answers back (the player's own result record, the
+// door's answer). No chips move here.
+
+export interface CoinPusherUIDeps {
+  /** Furniture item id — keys the machine's records in the casino map. */
+  itemId: string;
+  /** Mirror the selected hole on the in-world cabinet. */
+  onSelectedHoleChange?(hole: PusherHole): void;
+  /** Show a short message on the cabinet's marquee. */
+  onMessage?(message: string): void;
+}
+
+/** Why a drop was turned down, in plain words. No chips were taken. */
+const PUSHER_REFUSAL_TEXT: Record<PusherRefusalReason, string> = {
+  'no-chips': 'NO CHIP TO DROP — VISIT THE CASHIER',
+  'machine-full': 'THE MACHINE IS FULL — THE OWNER HAS TO EMPTY IT',
+  expired: 'YOUR DROP WAITED TOO LONG — NOTHING WAS TAKEN',
+  'balance-full': 'YOUR RACK CAN\'T HOLD ANY MORE — CASH SOME CHIPS OUT FIRST',
+  jammed: 'THE MACHINE JAMMED — NOTHING WAS TAKEN',
+};
+
+/**
+ * The coin-pusher panel: a live pusher gauge (the same clock the cabinet
+ * draws from), three drop holes, INSERT, the player's chips as a physical
+ * rack and their last drop's payout as a tray, and the owner's door.
+ */
+export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  const unsubscribers: Array<() => void> = [];
+  let selectedHole: PusherHole = 1;
+  /** The last action's message: its answer, or why it wasn't done. It stays
+   *  until the next action, or until the machine's state moves on (the
+   *  operator's state, or whether DROP is open), since it may have been about
+   *  exactly that state. */
+  let flash = '';
+  /** That state as the panel first showed `flash` (null until then). */
+  let flashShownIn: string | null = null;
+  /** Whether my last drop's timing was kept: part of that drop's answer, so
+   *  it gives way with `flash`. */
+  let timingNote = '';
+  /** My request in flight (DROP is disabled while it is set). */
+  let pending: string | null = null;
+  /** My latest request whose answer is still to be shown — kept after a
+   *  withdrawal, in case an answer that raced it still arrives. */
+  let watching: string | null = null;
+  let expiryTimer = 0;
+  /** My latest settled drop's payout (drawn in the tray). */
+  let lastPaid: number | null = null;
+  /** My door request in flight (its requestId). */
+  let door: string | null = null;
+  /** The machine as last read — the per-frame gauge draws from this. */
+  let cached: CoinPusherState | null = null;
+  /** The operator state the last render showed. */
+  let shownOperator: CoinPusherOperatorState | null = null;
+  const myId = getPlayerId();
+
+  /** A new message replaces the whole previous one, its timing note included
+   *  (a drop's answer sets its own note right after). */
+  const say = (message: string): void => {
+    flash = message;
+    flashShownIn = null;
+    timingNote = '';
+  };
+
+  const stopExpiry = (): void => {
+    if (expiryTimer) window.clearTimeout(expiryTimer);
+    expiryTimer = 0;
+  };
+
+  /** Withdraw my unanswered request (it carries no chips; if the operator
+   *  settled it meanwhile, that answer still shows when it arrives). */
+  const withdraw = (message: string): void => {
+    if (!pending) return;
+    stopExpiry();
+    cancelCoinPusherRequest(deps.itemId, myId, pending);
+    pending = null;
+    say(message);
+    render();
+  };
+
+  const setSelectedHole = (hole: PusherHole): void => {
+    selectedHole = hole;
+    deps.onSelectedHoleChange?.(hole);
+    render();
+  };
+
+  const insert = (): void => {
+    const state = readCoinPusherState(deps.itemId);
+    const operator = coinPusherOperatorState();
+    if (!state || operator !== 'ready') {
+      // A drop made while the operator is still starting up would reach it
+      // too late to keep its timing.
+      say(operator === 'starting'
+        ? 'THE MACHINE IS STARTING UP — ONE MOMENT'
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
+    } else if (pending || readCoinPusherRequest(deps.itemId, myId)) {
+      say('YOUR LAST CHIP IS STILL DROPPING');
+    } else if (readChips(myId) < PUSHER_ANTE) {
+      say('NO CHIPS — VISIT THE CASHIER');
+      deps.onMessage?.('NO CHIPS');
+    } else if (chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS) {
+      say(PUSHER_REFUSAL_TEXT['machine-full']);
+    } else {
+      const requestedAt = Date.now();
+      const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
+      // The timing IS the pusher phase on screen right now — the clock the
+      // gauge and the cabinet draw from. The operator keeps it if the request
+      // reaches it inside the timing window.
+      const phase = currentPusherPhase(state, requestedAt);
+      if (writeCoinPusherRequest(deps.itemId, {
+        requestId, player: myId, hole: selectedHole, phase, requestedAt,
+      })) {
+        pending = requestId;
+        watching = requestId;
+        stopExpiry();
+        expiryTimer = window.setTimeout(
+          () => withdraw('NO ANSWER FROM THE MACHINE — YOUR DROP WAS WITHDRAWN'),
+          PUSHER_REQUEST_TTL_MS,
+        );
+        lastPaid = null;
+        timingNote = '';
+        say('DROPPING…');
+        deps.onMessage?.('DROP');
+      } else {
+        say('YOUR LAST CHIP IS STILL DROPPING');
+      }
+    }
+    render();
+  };
+
+  const openDoor = (): void => {
+    const state = readCoinPusherState(deps.itemId);
+    if (!state || state.ownerId !== myId) {
+      say('ONLY THE OWNER HAS THE KEY');
+    } else if (coinPusherOperatorState() === 'offline') {
+      say('MACHINE OFFLINE — TRY AGAIN IN A MOMENT');
+    } else if (door || readCoinPusherEmptyRequest(deps.itemId)) {
+      say('THE DOOR IS ALREADY OPENING');
+    } else {
+      const requestedAt = Date.now();
+      const requestId = `${requestedAt.toString(36)}-${crypto.randomUUID()}`;
+      if (writeCoinPusherEmptyRequest(deps.itemId, { requestId, requester: myId, requestedAt })) {
+        door = requestId;
+        say('OPENING THE DOOR…');
+      }
+    }
+    render();
+  };
+
+  /** Read my answers back: my own result record (durable — another player's
+   *  drop can't overwrite it), a withdrawn request, or the door's answer. */
+  const readResults = (): void => {
+    const result = watching ? readCoinPusherResult(deps.itemId, myId) : null;
+    if (watching && result?.requestId === watching) {
+      stopExpiry();
+      pending = null;
+      watching = null;
+      if (result.kind === 'drop') {
+        lastPaid = result.paid;
+        say(result.paid > 0 ? 'CHIPS FELL INTO THE TRAY!' : 'NO CHIPS FELL THIS TIME');
+        timingNote = result.honored
+          ? 'YOUR TIMING WAS KEPT'
+          : 'TOO LATE, OR THIS DEVICE\'S CLOCK IS OFF — IT DROPPED WHERE THE PUSHER WAS';
+        deps.onMessage?.(result.paid > 0 ? 'WINNER' : 'DROP');
+      } else {
+        say(PUSHER_REFUSAL_TEXT[result.reason]);
+      }
+    } else if (pending && readCoinPusherRequest(deps.itemId, myId)?.requestId !== pending) {
+      // Gone without an answer: withdrawn here, in another tab, or by the
+      // operator. `watching` stays set, so an answer that raced the
+      // withdrawal still shows.
+      stopExpiry();
+      pending = null;
+      say('YOUR DROP WAS WITHDRAWN');
+    }
+    if (door) {
+      // The operator answers in the transaction that clears the request, so
+      // a request gone without this answer tells us nothing about the door.
+      const answer = readCoinPusherDoorResult(deps.itemId);
+      if (answer?.requestId === door) {
+        say(answer.kind === 'refused' ? 'THE DOOR STAYED SHUT — ONLY THE OWNER HAS THE KEY'
+          : answer.emptied > 0 ? 'DOOR OPENED — THE CHIPS ARE ON YOUR RACK'
+            : 'THE DOOR OPENED ON AN EMPTY MACHINE');
+        door = null;
+      } else if (readCoinPusherEmptyRequest(deps.itemId)?.requestId !== door) {
+        say('NO ANSWER FROM THE DOOR — TRY AGAIN');
+        door = null;
+      }
+    }
+  };
+
+  const paintTray = (id: string, chips: number[], label: string, emptyText?: string): void => {
+    const cv = panel?.querySelector<HTMLCanvasElement>(`#${id}`);
+    const c2 = cv?.getContext('2d');
+    if (!cv || !c2) return;
+    const w = cv.width / 2;
+    const h = cv.height / 2;
+    c2.setTransform(2, 0, 0, 2, 0, 0);
+    c2.clearRect(0, 0, w, h);
+    drawChips(c2, chips, 0, 0, w, h, { emptyText });
+    // The same chips for a screen reader, counted per denomination like the
+    // drawing — never as a total (the physical-chip rule).
+    const groups = groupChips(chips).map((g) => `${g.count} of ${g.denom}`);
+    cv.setAttribute('aria-label', `${label}: ${groups.length ? groups.join(', ') : (emptyText || 'none')}`);
+  };
+
+  const drawGauge = (): void => {
+    const bar = panel?.querySelector<HTMLElement>('#cp-bar');
+    if (!bar) return;
+    if (!cached) {
+      bar.style.display = 'none';
+      return;
+    }
+    bar.style.display = '';
+    const face = pusherFaceX(currentPusherPhase(cached, Date.now()));
+    bar.style.width = `${(face / PLAT_UP_FRONT) * 100}%`;
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const state = readCoinPusherState(deps.itemId);
+    cached = state;
+    readResults();
+    // A new cabinet's machine appears with its operator's first poll, after
+    // the settling wait: until then it is starting up, not offline.
+    const operator = coinPusherOperatorState();
+    shownOperator = operator;
+    const online = state !== null && operator === 'ready';
+    const chips = readChips(myId);
+    const full = state !== null && chipsInMachine(state) + PUSHER_ANTE > MACHINE_MAX_CHIPS;
+    const dropOpen = online && pending === null && chips >= PUSHER_ANTE && !full;
+    const shownIn = `${operator}|${dropOpen}`;
+    if (flashShownIn === null) flashShownIn = shownIn;
+    else if (flashShownIn !== shownIn) {
+      flash = '';
+      timingNote = '';
+    }
+    const status = panel.querySelector<HTMLElement>('#cp-status')!;
+    status.textContent = flash || (online ? 'PICK A HOLE AND TIME YOUR DROP'
+      : operator === 'starting' ? 'THE MACHINE IS STARTING UP…'
+        : 'MACHINE OFFLINE — ITS OWNER RUNS IT');
+    panel.querySelector<HTMLElement>('#cp-timing-note')!.textContent = timingNote;
+    for (let i = 0; i < HOLE_COUNT; i++) {
+      const btn = panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`);
+      if (!btn) continue;
+      btn.setAttribute('aria-pressed', String(i === selectedHole));
+      btn.style.borderColor = i === selectedHole ? '#D4A84B' : '#3A424C';
+      btn.style.background = i === selectedHole
+        ? 'rgba(212,168,75,0.18)' : 'rgba(212,168,75,0.05)';
+      const mark = panel.querySelector<HTMLElement>(`#cp-mark-${i}`);
+      if (mark) mark.style.background = i === selectedHole ? '#D4A84B' : '#3A424C';
+    }
+    const insertBtn = panel.querySelector<HTMLButtonElement>('#cp-insert')!;
+    insertBtn.disabled = !dropOpen;
+    insertBtn.textContent = operator === 'starting' ? 'STARTING UP…'
+      : !online ? 'MACHINE OFFLINE'
+        : pending ? 'DROPPING…'
+          : chips < PUSHER_ANTE ? 'NEED A CHIP — VISIT THE CASHIER'
+            : full ? 'MACHINE FULL'
+              : `DROP ONE CHIP · HOLE ${selectedHole + 1}`;
+    paintTray('cp-rack', chipsFor(chips), 'Your chips', 'NO CHIPS — VISIT THE CASHIER');
+    paintTray('cp-won', chipsFor(lastPaid ?? 0), 'Your last drop paid',
+      lastPaid === 0 ? 'NOTHING FELL' : '');
+    const meter = panel.querySelector<HTMLElement>('#cp-meter')!;
+    // A machine that reads at all balances (the guard checks its ledger), so
+    // the warning is for a record that is there but won't read.
+    const unreadable = state === null && isCoinPusherRecordUnreadable(deps.itemId);
+    meter.textContent = state ? 'METER ✓ EVERY CHIP INSIDE, PAID OUT OR EMPTIED IS ACCOUNTED FOR'
+      : unreadable ? '!! THE METER CAN\'T BE READ — TELL THE OWNER'
+        : '';
+    meter.style.color = unreadable ? '#FF6060' : GT_DIM;
+    const owner = panel.querySelector<HTMLElement>('#cp-owner')!;
+    const isOwner = state?.ownerId === myId;
+    owner.style.display = isOwner ? 'flex' : 'none';
+    if (isOwner && state) {
+      // Chips, never a total, outside the cashier (the physical-chip rule).
+      paintTray('cp-inside', chipsFor(chipsInMachine(state)), 'In the machine', 'THE MACHINE IS EMPTY');
+      const emptyBtn = panel.querySelector<HTMLButtonElement>('#cp-empty')!;
+      // The door has no timing to lose: it may be asked for while the
+      // operator starts up, and is answered once it is at work.
+      emptyBtn.disabled = operator === 'offline' || door !== null;
+    }
+    drawGauge();
+  };
+
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.repeat) return;
+    const target = event.target;
+    if (target instanceof Element
+      && target.closest('button, input, textarea, select, a, [contenteditable="true"]')) return;
+    if (event.code === 'ArrowLeft') {
+      event.preventDefault();
+      setSelectedHole(Math.max(0, selectedHole - 1) as PusherHole);
+    } else if (event.code === 'ArrowRight') {
+      event.preventDefault();
+      setSelectedHole(Math.min(HOLE_COUNT - 1, selectedHole + 1) as PusherHole);
+    } else if (event.code === 'Space') {
+      event.preventDefault();
+      insert();
+    }
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-coin-pusher-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 420px; max-height: 92vh; overflow-y: auto; box-sizing: border-box;
+        padding: 18px; display: flex; flex-direction: column; gap: 10px;
+        background: rgba(4, 8, 22, 0.95); border: 1px solid rgba(212, 168, 75, 0.35);
+        border-radius: 12px; color: ${GT_GOLD};
+        font-family: 'SF Mono','Consolas',monospace; pointer-events: auto;
+        box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+      `;
+      panel.innerHTML = `
+        <div style="font-size:13px;font-weight:800;color:${GT_GOLD_BRIGHT};letter-spacing:2px;">🪙 COIN PUSHER</div>
+        <div id="cp-status" role="status" aria-live="polite" style="min-height:14px;text-align:center;font-size:9px;color:${GT_GOLD_BRIGHT};font-weight:800;"></div>
+        <div id="cp-timing-note" aria-live="polite" style="min-height:11px;text-align:center;font-size:8px;color:#E8ECF2;"></div>
+        <div style="display:flex;flex-direction:column;gap:3px;">
+          <div style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">THE PUSHER — DROP AS IT SWEEPS PAST YOUR HOLE</div>
+          <div style="position:relative;height:24px;background:#0A0E1F;border:1px solid #3A424C;border-radius:4px;overflow:hidden;">
+            <div id="cp-bar" style="position:absolute;top:0;bottom:0;left:0;width:0;background:linear-gradient(90deg,#4A5560,#8A93A0);border-right:3px solid #D4A84B;"></div>
+            ${HOLE_XS.map((x, i) => `<div id="cp-mark-${i}" style="position:absolute;top:3px;bottom:3px;left:${((x / PLAT_UP_FRONT) * 100).toFixed(2)}%;width:2px;margin-left:-1px;background:#3A424C;"></div>`).join('')}
+          </div>
+        </div>
+        <div style="display:flex;gap:6px;">
+          ${HOLE_XS.map((_, i) => `
+            <button id="cp-hole-${i}" style="flex:1;padding:12px 6px;background:rgba(212,168,75,0.05);border:2px solid #3A424C;color:${GT_GOLD};font:800 10px inherit;cursor:pointer;">
+              HOLE ${i + 1}
+            </button>
+          `).join('')}
+        </div>
+        <button id="cp-insert" style="padding:12px;background:rgba(0,192,96,0.12);border:1px solid #00A060;color:#8FFFC0;font:800 11px inherit;cursor:pointer;letter-spacing:1px;">DROP ONE CHIP</button>
+        <div style="display:flex;gap:10px;justify-content:space-between;">
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">YOUR CHIPS</span>
+            <canvas id="cp-rack" role="img" width="380" height="112" style="width:190px;height:56px;"></canvas>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:2px;">
+            <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">YOUR LAST DROP PAID</span>
+            <canvas id="cp-won" role="img" width="380" height="112" style="width:190px;height:56px;"></canvas>
+          </div>
+        </div>
+        <div id="cp-meter" style="font-size:8px;text-align:center;"></div>
+        <div id="cp-owner" style="display:none;flex-direction:column;gap:6px;padding-top:8px;border-top:1px solid rgba(212,168,75,.20);">
+          <div style="font-size:9px;font-weight:800;letter-spacing:1px;">★ OWNER CONTROLS</div>
+          <span style="font-size:8px;color:${GT_DIM};letter-spacing:1px;">IN THE MACHINE · OPENING THE DOOR PUTS THEM ON YOUR RACK</span>
+          <canvas id="cp-inside" role="img" width="760" height="112" style="width:380px;height:56px;"></canvas>
+          <button id="cp-empty" style="padding:8px;background:rgba(230,80,60,0.10);border:1px solid #A03020;color:#FF9070;font:800 10px inherit;cursor:pointer;">OPEN THE DOOR &amp; EMPTY THE MACHINE</button>
+        </div>
+        <div style="font-size:8px;color:${GT_DIM};text-align:center;line-height:1.6;">← / → PICK A HOLE · SPACE DROPS ONE CHIP · CHIPS YOUR DROP PUSHES OFF THE FRONT ARE YOURS · THE REST STAY INSIDE UNTIL THE OWNER EMPTIES THE MACHINE</div>
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      for (let i = 0; i < HOLE_COUNT; i++) {
+        panel.querySelector<HTMLButtonElement>(`#cp-hole-${i}`)!
+          .addEventListener('click', () => setSelectedHole(i as PusherHole));
+      }
+      panel.querySelector<HTMLButtonElement>('#cp-insert')!.addEventListener('click', insert);
+      panel.querySelector<HTMLButtonElement>('#cp-empty')!.addEventListener('click', openDoor);
+      window.addEventListener('keydown', onKeyDown);
+      host.appendChild(panel);
+      deps.onSelectedHoleChange?.(selectedHole);
+      for (const key of [
+        `pusher:${deps.itemId}`,
+        coinPusherRequestKey(deps.itemId, myId),
+        coinPusherResultKey(deps.itemId, myId),
+        `pusher-empty:${deps.itemId}`,
+        `pusher-door:${deps.itemId}`,
+        COIN_PUSHER_OPERATOR_KEY,
+        `bal:${myId}`,
+      ]) {
+        unsubscribers.push(subscribeCasinoKey(key, render));
+      }
+      render();
+    },
+    unmount(): void {
+      // Walking away withdraws an unanswered drop (the slot-machine rule); a
+      // drop the operator already settled is unaffected.
+      if (pending) cancelCoinPusherRequest(deps.itemId, myId, pending);
+      stopExpiry();
+      pending = null;
+      watching = null;
+      for (const unsubscribe of unsubscribers.splice(0)) unsubscribe();
+      window.removeEventListener('keydown', onKeyDown);
+      panel?.remove();
+      panel = null;
+      cached = null;
+    },
+    update(_dt: number): void {
+      // A lease can lapse, or its operator finish starting up, with no key
+      // changing: show it as soon as this page can tell.
+      if (panel && coinPusherOperatorState() !== shownOperator) render();
+      drawGauge();
+    },
+  };
+}
+

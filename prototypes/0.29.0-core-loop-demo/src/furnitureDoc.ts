@@ -20,7 +20,7 @@
  */
 
 import * as Y from 'yjs';
-import { FURNITURE, FURNITURE_DEFS } from './furniture';
+import { DEFAULT_LOBBY_FURNITURE, FURNITURE_DEFS } from './furniture';
 import type { FurnitureItem, FurnitureKind, Rot } from './furniture';
 
 /** Serializable placement — one per furniture item id. Plain JSON (no nested
@@ -156,6 +156,15 @@ export function deleteFurnitureItem(id: string): void {
   });
 }
 
+/** Remove several items in ONE transaction (a losing + ADD batch, see
+ *  roomTemplates.reconcileConcurrentAdds) — one reconcile, not one per item. */
+export function deleteFurnitureItems(ids: readonly string[]): void {
+  if (!docAlive() || ids.length === 0) return;
+  boundDoc!.transact(() => {
+    for (const id of ids) furnitureMap!.delete(id);
+  });
+}
+
 /**
  * Owner-only seed: on the first claim of a room, publish the current (default)
  * layout so joiners converge to it. Idempotent — a no-op once the map has any
@@ -164,7 +173,9 @@ export function deleteFurnitureItem(id: string): void {
 export function seedFurnitureDefaults(): void {
   if (!docAlive() || furnitureMap!.size > 0) return;
   boundDoc!.transact(() => {
-    for (const item of FURNITURE) {
+    // The frozen manifest — NOT the live FURNITURE array, which mirrors the
+    // room you came from (see DEFAULT_LOBBY_FURNITURE).
+    for (const item of DEFAULT_LOBBY_FURNITURE) {
       furnitureMap!.set(item.id, toRecord(item));
     }
   });
@@ -177,6 +188,41 @@ export function seedFurnitureDefaults(): void {
  * per-item thrash) and every peer converges to the same layout. Owner-only in
  * practice, like the other writers.
  */
+/**
+ * ➕ ADD items to the room, keeping everything already in it.
+ *
+ * The additive sibling of replaceAllFurniture, and the one a template set
+ * should normally use: a room's structure is fixed once it is built, so what
+ * people actually do is put things IN the room they have, not swap the room
+ * for a different one. Ids are made unique against what is already there, so
+ * adding the same set twice gives two of everything rather than silently
+ * overwriting the first. Returns the ids written.
+ */
+/** 🏷️ A tag no OTHER peer mints: the bound doc's Yjs client id (random per
+ *  doc instance), for ids written by several peers into one map. addFurniture
+ *  de-duplicates only against the local map — two peers adding the same set
+ *  at once otherwise pick identical ids and the map's per-key LWW keeps one
+ *  of each pair (Copilot review, PR #169). '' with no doc bound. */
+export function peerIdTag(): string {
+  return boundDoc ? boundDoc.clientID.toString(36) : '';
+}
+
+export function addFurniture(items: FurnitureItem[]): string[] {
+  if (!docAlive()) return [];
+  const taken = new Set(furnitureMap!.keys());
+  const written: string[] = [];
+  boundDoc!.transact(() => {
+    for (const item of items) {
+      let id = item.id;
+      for (let n = 2; taken.has(id); n++) id = `${item.id}-${n}`;
+      taken.add(id);
+      written.push(id);
+      furnitureMap!.set(id, toRecord({ ...item, id }));
+    }
+  });
+  return written;
+}
+
 export function replaceAllFurniture(items: FurnitureItem[]): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
@@ -185,13 +231,10 @@ export function replaceAllFurniture(items: FurnitureItem[]): void {
   });
 }
 
-/** Pristine copy of the default layout, captured at module load — the live
- *  FURNITURE array is reconciled to doc state afterwards, so it can't serve
- *  as the reference once a room is joined. */
-const DEFAULT_LAYOUT: FurnitureItem[] = FURNITURE.map((item) => ({
-  ...item,
-  pos: { ...item.pos },
-}));
+// The pristine default layout lives in furniture.ts as DEFAULT_LOBBY_FURNITURE
+// (one frozen snapshot for every reader — the migration below, the new-room
+// seed above, and the Grand Lobby template — rather than a private copy here
+// and a live alias elsewhere).
 
 /**
  * 🛋️ One-time floor-plan migration (owner request: nothing parked in front
@@ -206,8 +249,49 @@ const DEFAULT_LAYOUT: FurnitureItem[] = FURNITURE.map((item) => ({
 export function migrateDefaultLayout(): void {
   if (!docAlive()) return;
   boundDoc!.transact(() => {
-    for (const item of DEFAULT_LAYOUT) {
+    for (const item of DEFAULT_LOBBY_FURNITURE) {
       furnitureMap!.set(item.id, toRecord(item));
+    }
+  });
+}
+
+/** Default poses from BEFORE #165 grew the clone vat to 2×2 — the only poses
+ *  relocateLegacyDefaultVat moves anything from. */
+const LEGACY_VAT_POSE = { x: -4.7, z: -4.9, rot: 0 };
+const LEGACY_CORNER_TREE_POSE = { x: -5.3, z: -5.3, rot: 0 };
+
+/**
+ * 🧬 One-time #165 migration: the clone vat is a 2×2 tank centred on the NW
+ * corner square now. A room whose DEFAULT vat still sits at the old 1×1
+ * default pose gets it moved to the new default, and the corner cherry tree
+ * the bigger tank would swallow moves to its new default too — but only
+ * while the tree is still at ITS old default and the vat now fills that
+ * corner. Anything the owner moved, and DEV-spawned vats (unique ids), keep
+ * their spot. Caller marker-gates it (main.ts), like migrateDefaultLayout.
+ */
+export function relocateLegacyDefaultVat(): void {
+  if (!docAlive()) return;
+  const vat = DEFAULT_LOBBY_FURNITURE.find((item) => item.id === 'clone-vat');
+  const tree = DEFAULT_LOBBY_FURNITURE.find((item) => item.id === 'cherry-tree-back-left');
+  if (!vat || !tree) return;
+  const isAt = (id: string, pose: { x: number; z: number; rot: number }) => {
+    const rec = furnitureMap!.get(id);
+    return (
+      isFurnitureRecord(rec) &&
+      rec.x === pose.x &&
+      rec.z === pose.z &&
+      rec.rot === pose.rot
+    );
+  };
+  boundDoc!.transact(() => {
+    if (isAt(vat.id, LEGACY_VAT_POSE)) {
+      furnitureMap!.set(vat.id, toRecord(vat));
+    }
+    if (
+      isAt(vat.id, { x: vat.pos.x, z: vat.pos.z, rot: vat.rot }) &&
+      isAt(tree.id, LEGACY_CORNER_TREE_POSE)
+    ) {
+      furnitureMap!.set(tree.id, toRecord(tree));
     }
   });
 }

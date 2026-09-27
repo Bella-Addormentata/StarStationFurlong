@@ -154,6 +154,20 @@ export function getCameraYaw(): number {
 }
 
 /**
+ * Yaw of the camera-forward direction on the GROUND plane, from the snapped
+ * yaw the camera is actually AT (detent + station bias, see getCameraYaw —
+ * an oriented door transit rotates the frame, and "face the screen" must
+ * follow it): the base iso offset (1,1)/√2 rotated by that yaw reduces to
+ * `yaw + π/4` (its XZ unit vector is `(sin, cos)` of this). Exported so
+ * facing-the-camera consumers (🏋️ the coach's stage) stop hand-inlining the
+ * `(cos±sin)·√½` transform — world.ts/docking.ts's fade math are older copies
+ * that can adopt this too.
+ */
+export function getCameraForwardYaw(): number {
+  return getCameraYaw() + Math.PI / 4;
+}
+
+/**
  * Rotate a base isometric offset by the rig's CURRENT (eased) yaw.
  * Non-mutating: `base` is copied into `out` (fresh vector by default).
  * Camera-flight code (zoom.ts first-person dive, deviceFocus eases) uses
@@ -229,8 +243,19 @@ export function updateCameraRig(deltaTime: number): void {
     currentYaw += drift;
     targetYaw += drift;
   } else if (wasDrifting) {
-    stepIndex = Math.round(targetYaw / STEP_RAD);
-    targetYaw = stepIndex * STEP_RAD;
+    // 🧭 Owner ruling (2026-09-21): entering a room ALWAYS lands on 0°. The
+    // drift left targetYaw somewhere between detents, and rounding to the
+    // nearest one meant the fox arrived at whatever angle the station happened
+    // to be turned to — usually 45°, and the chip beside DEV said so. Snap to
+    // the home detent instead; the tween below still carries the camera there
+    // smoothly, and the readout follows.
+    stepIndex = 0;
+    // A long drift leaves whole turns on currentYaw; fold them away first so
+    // the tween takes the short way to the same 0°, not every turn back
+    // (Copilot review, PR #169).
+    currentYaw = ((currentYaw + Math.PI) % (Math.PI * 2) + Math.PI * 2) % (Math.PI * 2) - Math.PI;
+    targetYaw = 0;
+    refreshAngleChip();
   }
   wasDrifting = drifting;
 

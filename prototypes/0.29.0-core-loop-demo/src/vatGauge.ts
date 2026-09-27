@@ -1,0 +1,597 @@
+/**
+ * 🧬⏳ Clone-vat clearance gauge (#165) — the one authority for the tank's
+ * dimensions and for the hourglass-shaped HARD LIMIT the avatar is squeezed
+ * to while it is held in the tank and while it walks out of it.
+ *
+ * Why a gauge at all: the chibi fox is ~3.2 m tall and ~1.75 m across the
+ * cheek ruffs, far bigger than any tank that still reads as furniture, so a
+ * full-size avatar always poked through the glass and the door. Instead the
+ * spawn choreography scales the avatar (plan-uniform in x/z, separately in y)
+ * to the largest size whose whole silhouette fits the gauge at its current
+ * position — a hard limit, never exceeded, sampled every frame.
+ *
+ * The gauge, in plan along the exit axis (q = metres from the vat's axis
+ * toward the door; the door faces +q):
+ *
+ *        tank bulb           neck        room bulb
+ *      ╭───────────╮                 ╱
+ *     (   round     )═══════════════(    flares back out to full size
+ *      ╰───────────╯                 ╲
+ *     −R           q_neck  ↔  q_lip
+ *
+ *  - TANK BULB (q < Q_NECK): the round glass interior — half-width is the
+ *    circle's chord at q — under the cap; a funnel of the neck's size
+ *    narrowing toward the door is intersected in so the limit is continuous.
+ *  - NECK (Q_NECK ≤ q ≤ Q_LIP): the doorway, from the chord line between the
+ *    two door-edge rails out to the transom glass on the arc. Half-width is
+ *    the rail gap, height is the door leaf's (a fixed transom sits above it).
+ *  - ROOM BULB (q > Q_LIP): a cone opening at FLARE_W / FLARE_H per metre, so
+ *    the avatar eases back to full size instead of popping.
+ *
+ * Every dimension below also drives the mesh (furniture.ts buildCloneVat),
+ * so the gauge and the glass can never drift apart.
+ */
+
+// ── Tank geometry (local frame: door faces +z, origin on the floor) ──────────
+
+/** Glass tube radius — the tank fills the 2×2 footprint (±1 m). */
+export const VAT_GLASS_R = 0.8;
+/** Glass tube bottom (it sits just inside the plinth). */
+export const VAT_GLASS_BASE_Y = 0.08;
+/** Glass tube height; the cap sits on its top edge. */
+export const VAT_GLASS_H = 2.7;
+/** Plinth outer radius — the lip the avatar steps down from. */
+export const VAT_PLINTH_R = 0.92;
+/**
+ * The interior floor pad the avatar stands on while inside. Kept LOW on
+ * purpose: the clone steps off it with its heels and drooping tail (~0.13 m
+ * off the floor) still over the plinth, so a tall plinth would swallow them
+ * on the way down.
+ */
+export const VAT_PAD_Y = 0.1;
+/** Front door leaf arc (the rest of the tube is the fixed back shell). */
+export const VAT_DOOR_ARC = (Math.PI * 7) / 9; // 140°
+/** Top of the door leaf; the fixed transom band fills the tube above it. */
+export const VAT_DOOR_TOP_Y = 2.49;
+/** Radius the spinning door leaf (and its edge rails) sweep around the axis. */
+export const VAT_DOOR_SWEEP_R = VAT_GLASS_R + 0.04;
+
+/** Margin the avatar's silhouette keeps from the glass, rails and cap. */
+export const VAT_CLEARANCE = 0.05;
+
+// ── Avatar silhouette ─────────────────────────────────────────────────────────
+
+/**
+ * One 0.1 m slice of the avatar along its facing axis (+z = muzzle, −z =
+ * tail): the widest |x| and the highest point of that slice.
+ */
+export interface AvatarSlice {
+  z0: number;
+  z1: number;
+  halfWidth: number;
+  top: number;
+}
+
+/**
+ * Plan silhouette of the fox rig (voxelCharacter.ts), MEASURED from its mesh
+ * vertices over the idle and walk cycles (walk bob, tail sway and arm swing
+ * included) and rounded up. Re-measure if the rig's proportions change.
+ * The tail plume trails behind (z < −0.7); the head is widest at z ≈ 0.05 and
+ * the ear tips are highest at z ≈ −0.2.
+ */
+export const AVATAR_SILHOUETTE: readonly AvatarSlice[] = [
+  { z0: -1.2, z1: -1.1, halfWidth: 0.15, top: 1.13 },
+  { z0: -1.1, z1: -1.0, halfWidth: 0.42, top: 1.25 },
+  { z0: -1.0, z1: -0.9, halfWidth: 0.55, top: 1.39 },
+  { z0: -0.9, z1: -0.8, halfWidth: 0.6, top: 1.4 },
+  { z0: -0.8, z1: -0.7, halfWidth: 0.61, top: 2.08 },
+  { z0: -0.7, z1: -0.6, halfWidth: 0.61, top: 2.3 },
+  { z0: -0.6, z1: -0.5, halfWidth: 0.59, top: 3.03 },
+  { z0: -0.5, z1: -0.4, halfWidth: 0.58, top: 3.08 },
+  { z0: -0.4, z1: -0.3, halfWidth: 0.65, top: 3.11 },
+  { z0: -0.3, z1: -0.2, halfWidth: 0.72, top: 3.23 },
+  { z0: -0.2, z1: -0.1, halfWidth: 0.72, top: 3.23 },
+  { z0: -0.1, z1: 0.0, halfWidth: 0.78, top: 3.23 },
+  { z0: 0.0, z1: 0.1, halfWidth: 0.88, top: 2.84 },
+  { z0: 0.1, z1: 0.2, halfWidth: 0.86, top: 2.77 },
+  { z0: 0.2, z1: 0.3, halfWidth: 0.74, top: 2.73 },
+  { z0: 0.3, z1: 0.4, halfWidth: 0.65, top: 2.55 },
+  { z0: 0.4, z1: 0.5, halfWidth: 0.53, top: 2.45 },
+  { z0: 0.5, z1: 0.6, halfWidth: 0.34, top: 2.01 },
+  { z0: 0.6, z1: 0.7, halfWidth: 0.08, top: 1.97 },
+];
+
+/** Tail tip — the silhouette's rearmost point (door-clearance test). */
+const AVATAR_BACK = -AVATAR_SILHOUETTE[0].z0;
+
+/** The silhouette's horizontal reach from its root in ANY direction (the
+ *  tail tip) — the door-clearance test once the clone may face anywhere. */
+export const AVATAR_REACH = Math.max(
+  ...AVATAR_SILHOUETTE.map((s) =>
+    Math.hypot(s.halfWidth, Math.max(Math.abs(s.z0), Math.abs(s.z1))),
+  ),
+);
+
+// ── The hourglass ─────────────────────────────────────────────────────────────
+
+const R_IN = VAT_GLASS_R - VAT_CLEARANCE;
+/** Chord line between the two door-edge rails — where the neck begins. */
+export const VAT_Q_NECK = VAT_GLASS_R * Math.cos(VAT_DOOR_ARC / 2);
+/** Outer face of the transom/door arc — where the neck ends. */
+export const VAT_Q_LIP = VAT_DOOR_SWEEP_R;
+/** Neck half-width: the tank's chord at the rail line (inside the rails). */
+export const VAT_NECK_HALF_W = Math.sqrt(R_IN * R_IN - VAT_Q_NECK * VAT_Q_NECK);
+/** Neck height above the pad: under the transom. */
+export const VAT_NECK_H = VAT_DOOR_TOP_Y - VAT_PAD_Y - VAT_CLEARANCE;
+/** Tank bulb height above the pad: under the cap. */
+export const VAT_TANK_H = VAT_GLASS_BASE_Y + VAT_GLASS_H - VAT_PAD_Y - VAT_CLEARANCE;
+/** Half-width the gauge gains per metre away from the neck (both bulbs). */
+export const VAT_FLARE_W = 0.5;
+/** Height the gauge gains per metre away from the neck (both bulbs). */
+export const VAT_FLARE_H = 1.2;
+
+export interface VatGauge {
+  /** Max |x| (metres) any part of the avatar may reach at this q. */
+  halfWidth: number;
+  /** Max height above the surface the avatar stands on at this q. */
+  height: number;
+}
+
+/** The hourglass hard limit at q (metres from the vat axis toward the door). */
+export function vatGaugeAt(q: number): VatGauge {
+  if (q < VAT_Q_NECK) {
+    const into = VAT_Q_NECK - q;
+    return {
+      halfWidth: Math.min(
+        Math.sqrt(Math.max(0, R_IN * R_IN - q * q)),
+        VAT_NECK_HALF_W + VAT_FLARE_W * into,
+      ),
+      height: Math.min(VAT_TANK_H, VAT_NECK_H + VAT_FLARE_H * into),
+    };
+  }
+  if (q <= VAT_Q_LIP) return { halfWidth: VAT_NECK_HALF_W, height: VAT_NECK_H };
+  const out = q - VAT_Q_LIP;
+  return {
+    halfWidth: VAT_NECK_HALF_W + VAT_FLARE_W * out,
+    height: VAT_NECK_H + VAT_FLARE_H * out,
+  };
+}
+
+/**
+ * The tightest gauge anywhere in [q0, q1]. Both profiles only ever narrow
+ * toward the neck (the tank bulb's back wall aside, which the endpoints
+ * catch), so the minimum sits at an endpoint or at the neck point nearest
+ * the span.
+ */
+function tightestIn(q0: number, q1: number): VatGauge {
+  const a = vatGaugeAt(q0);
+  const b = vatGaugeAt(q1);
+  const n = vatGaugeAt(Math.min(Math.max(VAT_Q_NECK, q0), q1));
+  return {
+    halfWidth: Math.min(a.halfWidth, b.halfWidth, n.halfWidth),
+    height: Math.min(a.height, b.height, n.height),
+  };
+}
+
+/** The smallest the avatar is ever squeezed to — a floor the walk-out never
+ *  reaches (tests pin that); only a root placed behind the vat's axis, where
+ *  the tail would have to leave the tank, could hit it. */
+export const VAT_MIN_SCALE = 0.5;
+
+export interface VatSqueeze {
+  /** Plan scale — applied to x and z alike. */
+  horizontal: number;
+  /** Height scale — applied to y. */
+  vertical: number;
+}
+
+/** Does the whole silhouette, plan-scaled by `s`, fit the gauge's width? */
+function fitsWidth(along: number, s: number): boolean {
+  for (const slice of AVATAR_SILHOUETTE) {
+    const g = tightestIn(along + s * slice.z0, along + s * slice.z1);
+    if (s * slice.halfWidth > g.halfWidth) return false;
+  }
+  return true;
+}
+
+/**
+ * The avatar's scale with its root at `along` (metres from the vat axis
+ * toward the door, avatar facing the door): the LARGEST plan scale whose
+ * silhouette fits the gauge's half-width everywhere it reaches, then the
+ * largest height scale that fits the gauge's height over that same footprint.
+ */
+export function vatSqueezeAt(along: number): VatSqueeze {
+  // Coarse scan down from full size, then bisect the boundary so the scale
+  // varies smoothly with position instead of in 2 % steps.
+  const STEP = 0.02;
+  let horizontal = VAT_MIN_SCALE;
+  for (let s = 1; s >= VAT_MIN_SCALE; s -= STEP) {
+    if (fitsWidth(along, s)) {
+      let lo = s;
+      let hi = Math.min(1, s + STEP);
+      if (hi > lo && !fitsWidth(along, hi)) {
+        for (let i = 0; i < 8; i++) {
+          const mid = (lo + hi) / 2;
+          if (fitsWidth(along, mid)) lo = mid;
+          else hi = mid;
+        }
+      } else {
+        lo = hi;
+      }
+      horizontal = lo;
+      break;
+    }
+  }
+  let vertical = 1;
+  for (const slice of AVATAR_SILHOUETTE) {
+    const g = tightestIn(
+      along + horizontal * slice.z0,
+      along + horizontal * slice.z1,
+    );
+    vertical = Math.min(vertical, g.height / slice.top);
+  }
+  return { horizontal, vertical: Math.max(VAT_MIN_SCALE, vertical) };
+}
+
+/**
+ * Does the FULL-SIZE silhouette, root `along` metres out, clear the vat
+ * itself: every slice still in the tank or the doorway fitting the gauge
+ * there? Past the lip is open room — the gauge's outer cone only paces the
+ * walk-out's easing, it is not a wall — so slices out there are free.
+ */
+export function vatFullSizeFitsAt(along: number): boolean {
+  for (const slice of AVATAR_SILHOUETTE) {
+    const q0 = along + slice.z0;
+    if (q0 > VAT_Q_LIP) continue;
+    const g = tightestIn(q0, Math.min(along + slice.z1, VAT_Q_LIP));
+    if (slice.halfWidth > g.halfWidth + 1e-9 || slice.top > g.height + 1e-9) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Is every part of the (plan-scaled) avatar outside the door leaf's sweep —
+ *  i.e. may the door spin shut without cutting through the tail? */
+export function vatDoorClear(along: number, horizontal: number): boolean {
+  return along - horizontal * AVATAR_BACK > VAT_DOOR_SWEEP_R + VAT_CLEARANCE;
+}
+
+/** A released clone `distance` metres from the vat axis, plan-scaled by
+ *  `horizontal` and facing anywhere: is all of it past the door's sweep? */
+export function vatClearOfDoorAt(distance: number, horizontal: number): boolean {
+  return distance - horizontal * AVATAR_REACH > VAT_DOOR_SWEEP_R + VAT_CLEARANCE;
+}
+
+/** An axis-aligned floor box (structurally furniture.ts's Box). */
+export interface VatFloorBox {
+  x0: number;
+  z0: number;
+  x1: number;
+  z1: number;
+}
+
+/** Half the vat's 2×2 footprint (furniture.ts FURNITURE_DEFS["clone-vat"]). */
+export const VAT_FOOTPRINT_HALF = 1;
+
+/** Is (x, z) off-limits for a player of collision radius `radius`: outside
+ *  the walkable box, or inside an obstacle inflated by the radius? */
+function spotBlocked(
+  x: number,
+  z: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): boolean {
+  if (Math.abs(x) > bounds.boundX + 1e-9 || Math.abs(z) > bounds.boundZ + 1e-9) {
+    return true;
+  }
+  return obstacles.some(
+    (b) =>
+      x > b.x0 - radius &&
+      x < b.x1 + radius &&
+      z > b.z0 - radius &&
+      z < b.z1 + radius,
+  );
+}
+
+/**
+ * How far out (metres from the vat axis) the scripted walk-out can go in
+ * this room: VAT_EXIT_ALONG when the path is free, else the last free spot
+ * (5 cm steps) before the path leaves the walkable box or comes within
+ * `radius` of another obstacle — a movable vat can face a wall or furniture.
+ * The path is scanned from `from` outward (the clone's current spot, when
+ * re-planning mid-walk: what is behind it no longer matters). The vat's own
+ * footprint is where the walk starts, so it is ignored along the way; but
+ * the end must be a valid release: clear of that footprint too
+ * (VAT_FOOTPRINT_HALF + radius out) and far enough that the clone, eased
+ * back to full size there, clears the vat (VAT_MIN_RELEASE_ALONG). null when
+ * the path is blocked before that — the walk-out cannot end anywhere valid
+ * (vatFallbackRelease).
+ */
+export function vatFreeExitAlong(
+  centre: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+  from: number = VAT_PLINTH_R,
+): number | null {
+  const dirX = Math.sin(facing);
+  const dirZ = Math.cos(facing);
+  // Skip exactly ONE box: this vat's own footprint (centre ± half). Anything
+  // else that merely overlaps the vat — furniture records are peer-written,
+  // untrusted data — still blocks the path.
+  const ownIndex = obstacles.findIndex(
+    (b) =>
+      Math.abs(b.x0 - (centre.x - VAT_FOOTPRINT_HALF)) < 1e-6 &&
+      Math.abs(b.x1 - (centre.x + VAT_FOOTPRINT_HALF)) < 1e-6 &&
+      Math.abs(b.z0 - (centre.z - VAT_FOOTPRINT_HALF)) < 1e-6 &&
+      Math.abs(b.z1 - (centre.z + VAT_FOOTPRINT_HALF)) < 1e-6,
+  );
+  const others = obstacles.filter((_, i) => i !== ownIndex);
+  let free: number | null = null;
+  for (
+    let along = Math.min(from, VAT_EXIT_ALONG);
+    ;
+    along = Math.min(VAT_EXIT_ALONG, along + 0.05)
+  ) {
+    const x = centre.x + dirX * along;
+    const z = centre.z + dirZ * along;
+    if (spotBlocked(x, z, others, bounds, radius)) break;
+    free = along;
+    if (along >= VAT_EXIT_ALONG) break;
+  }
+  const minEnd = Math.max(VAT_FOOTPRINT_HALF + radius, VAT_MIN_RELEASE_ALONG);
+  return free !== null && free >= minEnd ? free : null;
+}
+
+/**
+ * Where on the door path a clone can be put down at full size with the door
+ * shut behind it at once (the HOLD watchdog: the vat never opened). It is
+ * the free end of the path (vatFreeExitAlong), but only if the clone, facing
+ * out, is wholly past the door's sweep there (vatDoorClear). A shorter end is
+ * fine for a walk-out through the open door, but would leave the tail inside
+ * the closed door. null when the path gives no such spot.
+ */
+export function vatShutDoorReleaseAlong(
+  centre: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): number | null {
+  const along = vatFreeExitAlong(centre, facing, obstacles, bounds, radius);
+  return along !== null && vatDoorClear(along, 1) ? along : null;
+}
+
+/** The vat's outermost reach from its axis, at any height: the tilted rear
+ *  feed pipes and their clamps (about 1.05 m). A test builds the vat mesh and
+ *  checks every vertex stays inside it. */
+export const VAT_OUTER_R = 1.06;
+
+/** A fallback release is at full size at once and may face any way, so it
+ *  must clear the vat by the clone's whole reach, not just its collision
+ *  radius: the vat's outer reach plus a margin plus AVATAR_REACH from the
+ *  vat's axis. */
+export const VAT_FALLBACK_MIN_R = VAT_OUTER_R + 0.05 + AVATAR_REACH;
+
+/**
+ * Where a clone steps out when its door path is blocked (vatFreeExitAlong
+ * gave null): the nearest collision-free spot around the vat far enough
+ * that the full-size clone clears it (VAT_FALLBACK_MIN_R) — rings from
+ * there out to 4.5 m, door side first — else the nearest such spot
+ * anywhere in the walkable box (0.25 m grid). null only when nowhere in the
+ * room qualifies; the caller then keeps the clone held.
+ */
+export function vatFallbackRelease(
+  centre: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): { x: number; z: number } | null {
+  const minR = Math.max(VAT_FOOTPRINT_HALF + radius, VAT_FALLBACK_MIN_R);
+  return nearestFreeSpot(centre, facing, minR, minR + 0.05, obstacles, bounds, radius);
+}
+
+/**
+ * Where a clone whose vat was removed mid-ceremony is released: no tank is
+ * left around it, so on the spot `at` where it was held when that is free,
+ * else the nearest free spot (rings out to 4.5 m, then the whole walkable
+ * box). null when nowhere in the room is free; the caller keeps it held.
+ */
+export function vatStrandedRelease(
+  at: { x: number; z: number },
+  facing: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): { x: number; z: number } | null {
+  if (!spotBlocked(at.x, at.z, obstacles, bounds, radius)) return { x: at.x, z: at.z };
+  return nearestFreeSpot(at, facing, 0, 0.25, obstacles, bounds, radius);
+}
+
+/** Past this many obstacles in the walkable box, nearestFreeSpot gives up
+ *  rather than search: a real room has a few dozen, and furniture records
+ *  are peer-written and unbounded. */
+export const VAT_SEARCH_MAX_OBSTACLES = 1000;
+
+/**
+ * The nearest spot at least `minR` from `centre` that a player of `radius`
+ * may stand on: rings from `firstR` out to 4.5 m (16 bearings, the `facing`
+ * side first), else the nearest anywhere in the walkable box.
+ *
+ * The whole-box pass cannot miss a free pocket, however narrow. The free
+ * floor is the walkable box minus the obstacles inflated by `radius`, so it
+ * is made of rectangles whose edges lie on the bounds or on inflated
+ * obstacle edges. Every corner of such a rectangle is free, and in a
+ * rectangle that reaches `minR` from `centre` at least one corner does too
+ * (a disc is convex). So it walks the columns at those x coordinates (plus
+ * the centre's own and a 0.25 m lattice). On each it takes the exact free
+ * stretches of z between the obstacles crossing it, and the nearest point
+ * of each to `centre`. That finds a spot whenever one exists, in time
+ * quadratic in the obstacle count.
+ *
+ * Furniture records are peer-written and unbounded, so a room with more
+ * than VAT_SEARCH_MAX_OBSTACLES obstacles in the walkable box is not
+ * searched at all: null, and the clone stays held rather than the client
+ * stalling on the search.
+ */
+function nearestFreeSpot(
+  centre: { x: number; z: number },
+  facing: number,
+  minR: number,
+  firstR: number,
+  obstacles: readonly VatFloorBox[],
+  bounds: { boundX: number; boundZ: number },
+  radius: number,
+): { x: number; z: number } | null {
+  const { boundX, boundZ } = bounds;
+  // Only obstacles that reach into the walkable box matter.
+  const live = obstacles.filter(
+    (b) =>
+      b.x1 + radius > -boundX &&
+      b.x0 - radius < boundX &&
+      b.z1 + radius > -boundZ &&
+      b.z0 - radius < boundZ,
+  );
+  if (live.length > VAT_SEARCH_MAX_OBSTACLES) return null;
+  for (let r = firstR; r <= 4.5; r += 0.25) {
+    for (let k = 0; k < 16; k++) {
+      const turn = (k % 2 === 1 ? 1 : -1) * Math.ceil(k / 2) * (Math.PI / 8);
+      const x = centre.x + Math.sin(facing + turn) * r;
+      const z = centre.z + Math.cos(facing + turn) * r;
+      if (!spotBlocked(x, z, live, bounds, radius)) return { x, z };
+    }
+  }
+  const xs = new Set<number>([-boundX, boundX, centre.x]);
+  for (const b of live) {
+    xs.add(b.x0 - radius);
+    xs.add(b.x1 + radius);
+  }
+  const n = Math.floor(boundX / 0.25);
+  for (let i = -n; i <= n; i++) xs.add(i * 0.25);
+  let best: { x: number; z: number } | null = null;
+  let bestD = Infinity;
+  const consider = (x: number, z: number) => {
+    const d = Math.hypot(x - centre.x, z - centre.z);
+    if (d >= minR && d < bestD) {
+      best = { x, z };
+      bestD = d;
+    }
+  };
+  for (const x of xs) {
+    if (Math.abs(x) > boundX + 1e-9) continue;
+    const dx = x - centre.x;
+    if (Math.abs(dx) >= bestD) continue; // nothing on this column can be nearer
+    // Where this column is blocked: the open z-intervals of the obstacles
+    // it crosses (spotBlocked's strict test), sorted by start.
+    const cuts: Array<[number, number]> = [];
+    for (const b of live) {
+      if (x > b.x0 - radius && x < b.x1 + radius) cuts.push([b.z0 - radius, b.z1 + radius]);
+    }
+    cuts.sort((a, c) => a[0] - c[0]);
+    // The free closed stretches between them, and the nearest point of each
+    // (clamped centre, the ends, or where the column meets the minR circle).
+    const reach = minR > Math.abs(dx) ? Math.sqrt(minR * minR - dx * dx) + 1e-6 : 0;
+    const stretch = (z0: number, z1: number) => {
+      if (z1 < z0) return;
+      consider(x, Math.min(z1, Math.max(z0, centre.z)));
+      consider(x, z0);
+      consider(x, z1);
+      if (reach > 0) {
+        for (const z of [centre.z - reach, centre.z + reach]) {
+          if (z >= z0 && z <= z1) consider(x, z);
+        }
+      }
+    };
+    let from = -boundZ;
+    for (const [c0, c1] of cuts) {
+      if (from > boundZ) break;
+      if (c0 >= from) stretch(from, Math.min(c0, boundZ));
+      from = Math.max(from, c1);
+    }
+    if (from <= boundZ) stretch(from, boundZ);
+  }
+  return best;
+}
+
+/** Root height while walking out: on the pad inside, easing down off the
+ *  plinth lip from when the front foot reaches it until the heels are past
+ *  it, on the floor beyond. */
+export function vatFloorY(along: number): number {
+  const from = VAT_PLINTH_R - 0.12;
+  const to = VAT_PLINTH_R + 0.3;
+  if (along <= from) return VAT_PAD_Y;
+  if (along >= to) return 0;
+  const t = (along - from) / (to - from);
+  return VAT_PAD_Y * (1 - t * t * (3 - 2 * t));
+}
+
+/** Where the held clone stands (metres toward the door): the spot inside the
+ *  tank that lets it be held largest. Scanned once at module load, on a
+ *  centimetre grid. */
+export const VAT_HOLD_ALONG: number = (() => {
+  let best = 0;
+  let bestSize = -1;
+  for (let cm = 0; cm <= 50; cm++) {
+    const s = vatSqueezeAt(cm / 100);
+    const size = s.horizontal * s.vertical;
+    if (size > bestSize + 1e-9) {
+      bestSize = size;
+      best = cm / 100;
+    }
+  }
+  return best;
+})();
+
+/** Where the scripted walk-out ends (metres toward the door): the first spot
+ *  at which the avatar is back to full size AND clear of the door's sweep, so
+ *  the door can close behind it and control returns with no pop. Scanned
+ *  once at module load, on a centimetre grid. */
+export const VAT_EXIT_ALONG: number = (() => {
+  for (let cm = Math.ceil(VAT_Q_LIP * 100); cm < 400; cm++) {
+    const a = cm / 100;
+    const s = vatSqueezeAt(a);
+    if (s.horizontal >= 1 && s.vertical >= 1 && vatDoorClear(a, 1)) return a;
+  }
+  return 4;
+})();
+
+// ── Fresh-clone pallor (#165 follow-up) ───────────────────────────────────────
+
+/** The almost-white grey a fresh clone decants in (body colours only — the
+ *  dark eyes, nose and mouth stay dark so the face still reads). */
+export const VAT_PALLOR_HEX = 0xe3e5e8;
+/** Seconds after leaving the vat for the clone's own colours to come back. */
+export const VAT_PALLOR_FADE_S = 30;
+
+/** Pallor (1 = fully pale, 0 = its own colours) `seconds` after the clone
+ *  left the vat: a smooth ease back over VAT_PALLOR_FADE_S. */
+export function vatPallorAt(seconds: number): number {
+  const t = Math.min(1, Math.max(0, seconds / VAT_PALLOR_FADE_S));
+  return 1 - t * t * (3 - 2 * t);
+}
+
+/** A colour `pallor` of the way from `baseHex` to the clone grey (per-channel
+ *  sRGB lerp — the hexes the materials are authored in). */
+export function vatPallorHex(baseHex: number, pallor: number): number {
+  const k = Math.min(1, Math.max(0, pallor));
+  const mix = (shift: number) => {
+    const a = (baseHex >> shift) & 0xff;
+    const b = (VAT_PALLOR_HEX >> shift) & 0xff;
+    return Math.round(a + (b - a) * k) << shift;
+  };
+  return mix(16) | mix(8) | mix(0);
+}
+
+/** The nearest a walk-out may END (metres toward the door): from here out
+ *  the clone, eased back to full size in place, clears the tank, doorway
+ *  and transom (vatFullSizeFitsAt). Scanned once, on a centimetre grid. */
+export const VAT_MIN_RELEASE_ALONG: number = (() => {
+  for (let cm = Math.ceil(VAT_Q_LIP * 100); cm < 400; cm++) {
+    if (vatFullSizeFitsAt(cm / 100)) return cm / 100;
+  }
+  return 4;
+})();

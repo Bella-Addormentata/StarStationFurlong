@@ -59,6 +59,10 @@ const HALF_PI = Math.PI / 2;
 // assumed 2/1).
 /** Opening width — exactly 2 grid cells; centre on an integer grid line. */
 export const DOOR_OPENING_WIDTH = 2.0;
+/** Opening height, floor to the underside of the header. With the width it is
+ *  the CLEAR aperture between the frame posts — the hole the hull is cut to
+ *  (#159), so the wall can never show inside the frame or gap around it. */
+export const DOOR_OPENING_HEIGHT = 3.0;
 /** Side-post width, one each side of the opening. */
 export const DOOR_POST_WIDTH = 0.3;
 /** Full frame width (opening + both posts) = 2.6. */

@@ -26,6 +26,7 @@ import { initialState, legalMoves, applyMove, chooseBotMove, isCheckersState } f
 import type { CheckersState } from './checkers';
 import { isChessState } from './chess';
 import type { ChessState } from './chess';
+import type { RoomOwnerKey } from '../treasuryView';
 
 /** A table hosts ONE game at a time. Chess states carry `kind: 'chess'`;
  *  legacy checkers states are kind-less (isCheckersState identifies them) —
@@ -125,6 +126,79 @@ export function readRoomOwner(): string | null {
 }
 
 /**
+ * The room owner's IDENTITY KEY as the room document names it right now —
+ * the room-side half of the treasury plan's §10.1 binding check ("verify
+ * against the room deed/authority head"), read LIVE on every call because
+ * roomInfo and the owner's players entry sync in separately, and a rotated
+ * owner key must take effect without a rebind. Same chain of reads as
+ * main.ts's roomOwnerInfo and currentRoomDeedIsMine (the unmerged #67 door
+ * policy PR wires the same chain as a live reader of its own).
+ *
+ * Today that chain is roomInfo.owner → players[owner].keyB64, both peer-
+ * writable and neither pinned, so this is exactly as strong as room ownership
+ * itself is today — and no stronger. Be precise about what that buys: the
+ * rule rules out only the forgery that needs NO owner-map write (a fresh key
+ * signing a binding). A peer who overwrites players[owner].keyB64 with their
+ * own key — keeping the name, leaving roomInfo.owner alone — substitutes the
+ * owner key silently, nothing on screen changes, and it stands until the
+ * owner's own client re-registers its entry (join, name or outfit change);
+ * there is no key-change detection or first-seen pinning for the room owner
+ * today. Every other owner gate in the app concedes the same write. That is
+ * why the badge says "as its records currently name them" and no more.
+ *
+ * ISSUE #138 — room modules as Chia NFT deeds — THIS IS THE FUNCTION THAT
+ * CHANGES, and nothing downstream of it. brainstorming/chia-authority-
+ * architecture.md mints one NFT1 per room as its deed and has the owner's
+ * node publish a signed authority head {launcher_id, seq, owner_ed25519_pubkey,
+ * cohost_ed25519_pubkeys[], transferable, issued_at} into the room doc,
+ * verified against the chain-anchored root; its Phase 2 makes the head the
+ * source of truth and the raw owner map a cache of it. Implementation sketch
+ * for that day:
+ *   1. read `authority_root` from roomInfo; if absent, fall through to the
+ *      chain below (rooms without a deed keep today's trust level — the
+ *      architecture's stated Phase 1 behaviour);
+ *   2. read the highest-`seq` head record the doc holds, verify its BLS
+ *      signature against the deed's current p2 puzzle hash as the local node
+ *      reports it (the node-side lane, not the browser — the browser holds no
+ *      chain code), and refuse a head that fails or a root that no longer
+ *      resolves;
+ *   3. return { status: 'known', pub: head.owner_ed25519_pubkey, source:
+ *      'head-verified' } — in the same base64url form players.keyB64 uses,
+ *      or normalised to it here — so treasuryView's comparison against
+ *      RoomTreasuryBinding.boundByPub is unchanged; a head whose owner key
+ *      differs from a prior binding's signer demotes that binding to
+ *      NOT OWNER-SIGNED automatically, which is how a deed transfer or a key
+ *      rotation revokes room funding without a schema change. A head this
+ *      device can read but not verify (no chain access) is 'head-unverified'
+ *      and worded on screen exactly like today's room-doc trust.
+ * Two preconditions the authority architecture has not yet written down, and
+ * which an adversarial pass on this rule found load-bearing: `authority_root`
+ * must be anchored outside the peer-writable room doc (bootstrap link, room
+ * seed, or a roomId derived from the launcher id) — otherwise a peer swaps in
+ * their own NFT, p2 and head and the verifier hands back a fully consistent
+ * forgery — and readers must keep a per-peer highest-seen `seq` watermark so a
+ * rolled-back head cannot resurrect a rotated-away key's bindings.
+ * Until then the function below is the whole of the owner check, and the
+ * treasury UI labels its verdict as what it is: what this room's records say.
+ */
+export function readRoomOwnerKey(): RoomOwnerKey {
+  if (!docAlive() || !boundDoc) return { status: 'unknown' };
+  const owner = boundDoc.getMap('roomInfo').get('owner');
+  if (typeof owner !== 'string' || owner.length === 0) return { status: 'unknown' };
+  // The pre-keyed-identity self-owned marker (see main.ts isLocalPlayerRoomOwner):
+  // no player entry, no key, and none can ever appear for it.
+  if (owner === 'Local-Clone') return { status: 'legacy' };
+  const entry = boundDoc.getMap('players').get(owner) as { keyB64?: unknown } | undefined;
+  // `source: 'room-doc'` is what lets the treasury badge say only "as its
+  // records name them". A #138 head reader returns 'head-verified' when the
+  // local node checked the head against the deed, and 'head-unverified' when
+  // it could only read it — never 'head-verified' for a head nobody checked.
+  return entry && typeof entry.keyB64 === 'string' && entry.keyB64.length > 0
+    ? { status: 'known', pub: entry.keyB64, source: 'room-doc' }
+    : { status: 'unknown' };
+}
+
+/**
  * Display name for a seat-claimant player id via the doc's `players` map
  * (S2 identity), shortened-id fallback for ids with no entry yet.
  */
@@ -138,8 +212,11 @@ export function readPlayerDisplayName(playerId: string): string {
 
 // Permanent debug handle (kept deliberately — runtime verification of doc
 // state + engine legality from the console; the __players / __deviceFocus
-// precedent). See PR #45 evidence.
-(window as unknown as { __ssfGames: unknown }).__ssfGames = {
-  readGame, writeGame, subscribeGames,
-  checkers: { initialState, legalMoves, applyMove, chooseBotMove },
-};
+// precedent). See PR #45 evidence. Guarded so the module is importable where
+// there is no window — the treasury tests read readRoomOwnerKey through it.
+if (typeof window !== 'undefined') {
+  (window as unknown as { __ssfGames: unknown }).__ssfGames = {
+    readGame, writeGame, subscribeGames,
+    checkers: { initialState, legalMoves, applyMove, chooseBotMove },
+  };
+}

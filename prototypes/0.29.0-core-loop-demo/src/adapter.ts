@@ -241,9 +241,11 @@ export function buildVestibule(
 // legacy buildVestibule above stays byte-identical for v0.30.x pairings.
 // ═══════════════════════════════════════════════════════════════════════════
 
-/** One ordered piece of a door connection (the P2 wire mirrors this shape). */
+/** One ordered piece of a door connection (the P2 wire mirrors this shape).
+ *  ⚓ #163: `dock` is one HALF of a round docking adapter — no parameters; a
+ *  dock connection is exactly two of them (DOCK_CHAIN), one per door. */
 export interface ConnectorSegment {
-  kind: "flex" | "ext";
+  kind: "flex" | "ext" | "dock";
   /** flex only: bend in degrees, clamped ±FLEX_BEND_MAX_DEG, snapped. */
   bendDeg?: number;
   /** flex: length delta on FLEX_REST_LEN (clamped to the flex range).
@@ -289,6 +291,45 @@ export function clampExtBays(b: number): number {
 export const EXT_STRETCH_MAX = EXT_BAY_LEN;
 export function clampExtStretch(s: number): number {
   return Math.max(-EXT_STRETCH_MAX, Math.min(EXT_STRETCH_MAX, s));
+}
+
+// ── ⚓ #163: the two-part DOCKING ADAPTER ─────────────────────────────────────
+//
+// A dock is two round HALVES, one fitted to each door. Each half is a rigid
+// 1.2 m collar, so the mated pair folds to 0.3 + 2 × 1.2 + 0.3 = 3.0 m — the
+// same door-to-module gap as the classic vestibule, which is why a dock sits
+// exactly where a gangway would and every pose consumer (projection, atlas,
+// overlap gates, occupancy) needs no special case: they fold segments.
+
+/** Length of ONE docking-adapter half along the connection axis. */
+export const DOCK_HALF_LEN = 1.2;
+
+/** A dock connection: the near door's half + the far door's half. */
+export const DOCK_CHAIN: readonly ConnectorSegment[] = Object.freeze([
+  Object.freeze({ kind: "dock" as const }),
+  Object.freeze({ kind: "dock" as const }),
+]);
+
+/** A fresh, mutable copy of DOCK_CHAIN (records and states own their arrays). */
+export function dockChain(): ConnectorSegment[] {
+  return [{ kind: "dock" }, { kind: "dock" }];
+}
+
+/** True for a DOCK connection — exactly two halves and nothing else. A port
+ *  stub (one half) or a gangway that merely contains a half is not a dock. */
+export function isDockChain(segments?: readonly ConnectorSegment[] | null): boolean {
+  return (
+    !!segments &&
+    segments.length === 2 &&
+    segments[0]?.kind === "dock" &&
+    segments[1]?.kind === "dock"
+  );
+}
+
+/** True when a chain is nothing but docking-adapter halves (any count) — the
+ *  renderer draws those as a round tunnel instead of gangway portals. */
+export function isAllDockSegments(segments?: readonly ConnectorSegment[] | null): boolean {
+  return !!segments && segments.length > 0 && segments.every((s) => s?.kind === "dock");
 }
 
 /** Groove seam color for the solid extension skin (door-leaf groove trick). */
@@ -657,6 +698,270 @@ export function buildExtension(
   return group;
 }
 
+// ── ⚓ #163: docking-adapter meshes ───────────────────────────────────────────
+//
+// Built in the language of the IDA collar the exterior view used to hang on an
+// adapter door (#67 D2 — the owner's pixel-art reference): white soft-goods
+// shell, black capture latches round a soft-capture ring, concentric silver
+// guide rings with an X brace on a sealed hatch, blue truss struts back to the
+// hull. ROUND on purpose (issue #163): every gangway and connector part is a
+// rectangular frame, so a circle reads as "dock" at a glance, in every view.
+
+/** Tube axis height above the deck. With DOCK_R_OUT it clears the 2 × 3 m
+ *  door opening (only its top corners tuck behind the hull flange). */
+const DOCK_CY = 1.55;
+/** Inner radius of the hull flange / sealed hatch. */
+const DOCK_R_IN = 1.6;
+/** Shell radius. Ring + latches stay inside ~1.9 m, so two ports at
+ *  MIN_DOOR_GAP (4 m) never touch. */
+const DOCK_R_OUT = 1.72;
+const DOCK_RING_TUBE = 0.14;
+/** ⚓ The adapter's widest radius about its tube axis: the hull flange's rim.
+ *  The soft-capture ring (1.86), the latches (~1.87) and the truss struts
+ *  (~1.89) all stay inside it — so it is what anything testing the space a
+ *  port or dock occupies must pad its axis by (docking.ts chainBoxesFor). */
+export const DOCK_ENVELOPE_R = DOCK_R_OUT + 0.22;
+
+const COL_SOFT_GOODS = 0xf2efe6;
+const COL_LATCH = 0x14161c;
+const COL_SILVER = 0xb8bfcc;
+const COL_TRUSS = 0x2a6bd4;
+const COL_HATCH = 0x1c2230;
+
+/** One material set per build (the partMats discipline — per-build materials
+ *  are what lets setVestibuleOpacity fade one tube without touching another). */
+function dockMats() {
+  return {
+    soft: new THREE.MeshStandardMaterial({
+      color: COL_SOFT_GOODS,
+      roughness: 0.85,
+      metalness: 0.08,
+      side: THREE.DoubleSide,
+    }),
+    frame: new THREE.MeshStandardMaterial({
+      color: COL_FRAME,
+      roughness: 0.6,
+      metalness: 0.5,
+      side: THREE.DoubleSide,
+    }),
+    latch: new THREE.MeshStandardMaterial({
+      color: COL_LATCH,
+      roughness: 0.6,
+      metalness: 0.4,
+    }),
+    silver: new THREE.MeshStandardMaterial({
+      color: COL_SILVER,
+      roughness: 0.4,
+      metalness: 0.7,
+    }),
+    truss: new THREE.MeshStandardMaterial({
+      color: COL_TRUSS,
+      roughness: 0.55,
+      metalness: 0.5,
+    }),
+    hatch: new THREE.MeshStandardMaterial({
+      color: COL_HATCH,
+      roughness: 0.5,
+      metalness: 0.4,
+      side: THREE.DoubleSide,
+    }),
+    accent: new THREE.MeshStandardMaterial({
+      color: COL_ACCENT,
+      roughness: 0.4,
+      metalness: 0.5,
+    }),
+    floor: new THREE.MeshStandardMaterial({
+      color: COL_FLOOR,
+      roughness: 0.8,
+      metalness: 0.35,
+    }),
+  };
+}
+
+/**
+ * ONE half of a docking adapter. Local frame like every connector part: entry
+ * plane at z=0 facing +Z, deck at y=0, exit at z=DOCK_HALF_LEN.
+ *
+ *  - `mating`: which end carries the soft-capture ring — the end that meets
+ *    the OTHER half. The door's own half mates at its far end; the far door's
+ *    half (second in the chain) mates at its near end.
+ *  - `hullEnd`: the opposite end is fitted to a hull — a flange plus blue
+ *    truss struts reaching back across the chain's portal margin to the wall.
+ *  - `sealed`: a hatch closes the mating end — an UNDOCKED port.
+ *  - `latchPhase`: the two halves' latches interleave instead of colliding.
+ */
+export function buildDockHalf(opts: {
+  mating: "far" | "near";
+  hullEnd?: boolean;
+  sealed?: boolean;
+  latchPhase?: number;
+}): THREE.Group {
+  const group = new THREE.Group();
+  group.name = "connectorDockHalf";
+  group.userData = {
+    isConnectorPart: true,
+    kind: "dock",
+    mating: opts.mating,
+    sealed: opts.sealed === true,
+  };
+  const mats = dockMats();
+  const L = DOCK_HALF_LEN;
+  const zMate = opts.mating === "far" ? L : 0;
+  const zHull = opts.mating === "far" ? 0 : L;
+  const outward = opts.mating === "far" ? 1 : -1; // from the tube toward the mating face
+
+  const add = (mesh: THREE.Mesh, name?: string): THREE.Mesh => {
+    if (name) mesh.name = name;
+    group.add(mesh);
+    return mesh;
+  };
+
+  // Soft-goods shell — the round body.
+  const shellGeo = new THREE.CylinderGeometry(DOCK_R_OUT, DOCK_R_OUT, L, 32, 1, true);
+  shellGeo.rotateX(Math.PI / 2); // axis +Y → +Z
+  const shell = add(new THREE.Mesh(shellGeo, mats.soft));
+  shell.position.set(0, DOCK_CY, L / 2);
+
+  // A silver band round the middle (reads as a ring from above).
+  const band = add(
+    new THREE.Mesh(new THREE.TorusGeometry(DOCK_R_OUT + 0.01, 0.035, 6, 40), mats.silver),
+  );
+  band.position.set(0, DOCK_CY, L / 2);
+
+  // Deck plate + the two guide strips every vestibule carries — named
+  // 'vestibuleGlow' so the airlock light states tint a dock like a gangway.
+  boxInto(group, 1.6, 0.08, L, mats.floor, 0, 0.04, L / 2);
+  for (const side of [-1, 1]) {
+    const glowMat = new THREE.MeshBasicMaterial({ color: LIGHT_STATE_COLORS.idle });
+    boxInto(group, 0.12, 0.025, L - 0.1, glowMat, side * 0.55, 0.095, L / 2, "vestibuleGlow");
+  }
+
+  // Soft-capture ring + six black capture latches at the mating face. The
+  // ring sits one tube radius inside its OWN half, so two mated halves' rings
+  // meet face to face at the mating plane — centred on it, they were two
+  // identical tori in one place (depth fighting; doubled under a fade).
+  const ring = add(
+    new THREE.Mesh(new THREE.TorusGeometry(DOCK_R_OUT, DOCK_RING_TUBE, 10, 40), mats.soft),
+    "dockCaptureRing",
+  );
+  ring.position.set(0, DOCK_CY, zMate - outward * DOCK_RING_TUBE);
+  const phase = opts.latchPhase ?? 0;
+  for (let i = 0; i < 6; i++) {
+    const a = phase + (i / 6) * Math.PI * 2 + Math.PI / 6;
+    const latch = add(new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.28, 0.2), mats.latch));
+    latch.position.set(
+      Math.cos(a) * DOCK_R_OUT,
+      DOCK_CY + Math.sin(a) * DOCK_R_OUT,
+      zMate - outward * 0.1,
+    );
+    latch.rotation.z = a;
+  }
+
+  if (opts.hullEnd) {
+    // Hull flange: a gunmetal annulus just proud of the door frame.
+    const flange = add(
+      new THREE.Mesh(new THREE.RingGeometry(DOCK_R_IN, DOCK_ENVELOPE_R, 40), mats.frame),
+    );
+    flange.position.set(0, DOCK_CY, zHull);
+    // Blue truss struts bracing back across the portal margin to the wall.
+    for (const a of [Math.PI / 4, (3 * Math.PI) / 4, (3 * Math.PI) / 2]) {
+      const strut = add(new THREE.Mesh(new THREE.BoxGeometry(0.09, 0.09, 0.9), mats.truss));
+      const r = DOCK_R_OUT + 0.12;
+      strut.position.set(
+        Math.cos(a) * r,
+        DOCK_CY + Math.sin(a) * r,
+        zHull + outward * 0.15,
+      );
+    }
+  }
+
+  if (opts.sealed) {
+    // The hatch: a dark disc with an amber rim, silver guide rings, an X
+    // brace, and a glowing ring — ready, sealed, waiting for the other half.
+    const face = zMate + outward * 0.02;
+    const disc = add(new THREE.Mesh(new THREE.CircleGeometry(DOCK_R_OUT - 0.02, 40), mats.hatch));
+    disc.position.set(0, DOCK_CY, face);
+    const rim = add(
+      new THREE.Mesh(new THREE.TorusGeometry(DOCK_R_OUT - 0.14, 0.05, 6, 40), mats.accent),
+    );
+    rim.position.set(0, DOCK_CY, face + outward * 0.02);
+    for (const r of [0.95, 0.62]) {
+      const guide = add(new THREE.Mesh(new THREE.TorusGeometry(r, 0.045, 6, 32), mats.silver));
+      guide.position.set(0, DOCK_CY, face + outward * 0.04);
+    }
+    for (const rz of [Math.PI / 4, -Math.PI / 4]) {
+      const brace = add(new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.06, 0.06), mats.silver));
+      brace.position.set(0, DOCK_CY, face + outward * 0.05);
+      brace.rotation.z = rz;
+    }
+    const glow = add(
+      new THREE.Mesh(
+        new THREE.TorusGeometry(0.3, 0.035, 6, 24),
+        new THREE.MeshBasicMaterial({ color: LIGHT_STATE_COLORS.idle }),
+      ),
+      "vestibuleGlow",
+    );
+    glow.position.set(0, DOCK_CY, face + outward * 0.07);
+  }
+
+  group.userData.exit = { x: 0, z: L, yawRad: 0 };
+  return group;
+}
+
+/**
+ * A chain of nothing but dock halves, as a round tunnel: halves alternate
+ * near/far mating so each pair meets ring to ring, every half is fitted to a
+ * hull at its outer end (the chain's two ends are two doors), and a trailing
+ * unmated half — a lone PORT — is sealed. Same fold as foldChainEnd (halves
+ * start at the portal margin), same outer contract as buildConnectorChain.
+ */
+function buildDockTunnel(
+  doorId: VestibuleDoorId,
+  segments: ConnectorSegment[],
+  at?: { wall: DoorWall; lateral: number },
+): THREE.Group {
+  const group = new THREE.Group();
+  group.name = "dockingVestibule"; // world.ts treats docks exactly like vestibules
+  group.userData = {
+    doorId,
+    isVestibule: true,
+    isConnectorChain: true,
+    isDockAdapter: true,
+    lightState: "idle",
+    segments,
+  };
+  const n = segments.length;
+  let z = CHAIN_PORTAL_MARGIN;
+  for (let i = 0; i < n; i++) {
+    const nearHalf = i % 2 === 0;
+    const half = buildDockHalf({
+      mating: nearHalf ? "far" : "near",
+      hullEnd: true,
+      sealed: nearHalf && i === n - 1,
+      latchPhase: nearHalf ? 0 : Math.PI / 6,
+    });
+    half.position.set(0, 0, z);
+    group.add(half);
+    z += DOCK_HALF_LEN;
+  }
+  const pose = at
+    ? poseFromWall(at.wall, at.lateral, at.lateral)
+    : physicalDoorPose(doorId);
+  group.position.set(pose.x, 0, pose.z);
+  group.rotation.y = pose.outwardYaw;
+  return group;
+}
+
+/** ⚓ An UNDOCKED port: this door's half alone, hatch sealed. */
+export function buildDockPortStub(
+  doorId: VestibuleDoorId,
+  at?: { wall: DoorWall; lateral: number },
+): THREE.Group {
+  const stub = buildDockTunnel(doorId, [{ kind: "dock" }], at);
+  stub.userData.isDockPortStub = true;
+  return stub;
+}
+
 /** Exit pose of one segment in ITS OWN local frame (pure math — no meshes).
  *  🛬 Fine (unsnapped) bends + ext telescoping stretch — solved chains fold
  *  exactly as solved. */
@@ -671,6 +976,8 @@ function segmentExit(seg: ConnectorSegment): {
     const f = flexArcFrame(th, len, 1);
     return { x: f.x, z: f.z, yawRad: f.yaw };
   }
+  // ⚓ A docking-adapter half is rigid and straight.
+  if (seg.kind === "dock") return { x: 0, z: DOCK_HALF_LEN, yawRad: 0 };
   return {
     x: 0,
     z:
@@ -811,7 +1118,7 @@ export const CHAIN_PORTAL_MARGIN = 0.3;
 
 /** Room half-width (11.8 / 2) — the projection box's centre sits this far past
  *  the chain exit along the arrival heading (+ the exit-portal margin). */
-const ROOM_HALF = 5.9;
+export const ROOM_HALF = 5.9;
 /** Legacy fixed projection offset (room centre → adjoining module centre). */
 const LEGACY_PROJECTION_OFFSET = 15.2;
 
@@ -837,6 +1144,7 @@ export function projectionPoseForDoor(
   segments?: ConnectorSegment[],
   farWall?: DoorWall | null,
   farLateral = 0,
+  farHalf = ROOM_HALF,
 ): { x: number; z: number; rotY: number } {
   const p = physicalDoorPose(doorId);
   return projectionPoseFromWall(
@@ -845,6 +1153,7 @@ export function projectionPoseForDoor(
     segments,
     farWall,
     farLateral,
+    farHalf,
   );
 }
 
@@ -869,6 +1178,13 @@ export function projectionPoseFromWall(
   segments?: ConnectorSegment[],
   farWall?: DoorWall | null,
   farLateral = 0,
+  // 🛑📐 The FAR module's half-extent along its door's wall normal: the chain
+  // meets that module's face, so its centre sits this far beyond the chain's
+  // end. Defaults to the uniform box the exterior fell back to for modules of
+  // unknown size; a known-size neighbour (atlas dims) passes its true half,
+  // or a 5×5 module would be drawn 9 m closer than the tube that reaches it
+  // (review, round 8). The straight-gangway pose keeps its legacy offset.
+  farHalf = ROOM_HALF,
 ): { x: number; z: number; rotY: number } {
   const doorPose = poseFromWall(nearWall, nearLateral, nearLateral);
   const dYaw = doorPose.outwardYaw;
@@ -896,8 +1212,8 @@ export function projectionPoseFromWall(
   const zr = dPos.z - exit.x * Math.sin(dYaw) + exit.z * Math.cos(dYaw);
   const heading = dYaw + exit.yawRad; // world heading at the chain exit
   const centre = {
-    x: xr + Math.sin(heading) * ROOM_HALF,
-    z: zr + Math.cos(heading) * ROOM_HALF,
+    x: xr + Math.sin(heading) * farHalf,
+    z: zr + Math.cos(heading) * farHalf,
   };
   // Far room rotation: its far door faces BACK along the arrival heading.
   const rotY = farWall
@@ -948,6 +1264,11 @@ export function buildConnectorChain(
   segments: ConnectorSegment[],
   at?: { wall: DoorWall; lateral: number }, // see buildVestibule
 ): THREE.Group {
+  // ⚓ #163: a dock is a round tunnel, not a gangway between portal frames —
+  // and because every renderer (room view, the exterior's neighbour links, the
+  // first-person neighbour shells) comes through here, it is round in all of
+  // them without a single call-site change.
+  if (isAllDockSegments(segments)) return buildDockTunnel(doorId, segments, at);
   const group = new THREE.Group();
   group.name = "dockingVestibule"; // world.ts treats chains exactly like vestibules
   group.userData = {
@@ -972,11 +1293,15 @@ export function buildConnectorChain(
     const part =
       seg.kind === "flex"
         ? buildFlexJoint(seg.bendDeg ?? 0, seg.stretch ?? 0)
-        : buildExtension(
-            seg.bays ?? EXT_BAYS_MIN,
-            seg.skin ?? "ribbed",
-            seg.stretch ?? 0,
-          );
+        : seg.kind === "dock"
+          ? // A half inside a gangway (never built by the UI — a peer's odd
+            // record): draw it, so meshes and the fold still agree.
+            buildDockHalf({ mating: "far" })
+          : buildExtension(
+              seg.bays ?? EXT_BAYS_MIN,
+              seg.skin ?? "ribbed",
+              seg.stretch ?? 0,
+            );
     part.position.set(x, 0, z);
     part.rotation.y = yaw;
     group.add(part);
