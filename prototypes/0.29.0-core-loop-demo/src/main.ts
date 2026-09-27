@@ -267,6 +267,7 @@ import {
 import {
   harvestIntoAtlas,
   readAtlas,
+  atlasComponent,
   bindStationAtlasDoc,
   pushAtlasToDoc,
   subscribeSharedAtlas,
@@ -1205,6 +1206,9 @@ function shipStationHere(roomId: string): string | null {
       continue;
     }
     const st = partner ? stationForRoom(partner) : null;
+    // Another lone module's one-room station is no host: two lone modules
+    // docked together each stay where they are (stations.dockedStationFor).
+    if (st && st.derived && atlasComponent(readAtlas(), st.welcomeRoomId).size <= 1) continue;
     if (st) return st.id;
   }
   // No host station: not the ship's own one-room station (the directory

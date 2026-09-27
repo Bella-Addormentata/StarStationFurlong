@@ -2128,7 +2128,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'berths-taken'
-      ? `Arrived at ${outcome.stationName} — the berth refused the ship (taken, or closed). Dock from a door panel when one frees up.`
+      ? `Arrived at ${outcome.stationName} — the DOCK did not go through (the berth taken or closed, no rights, no room to fit). Check the dock port's panel, and dock from it when that clears.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
       : outcome.reason === 'unlisted-station'
