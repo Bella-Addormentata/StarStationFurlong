@@ -46,7 +46,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { adriftPlace, destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
 import {
   TUG_MIN_ENGINES,
@@ -2233,9 +2233,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const progress = flightProgress(flight, now);
     // A station that dropped out of the directory is named as unlisted, never
     // passed off as home (findDestination's fallback).
-    const named = (id: string) => isKnownStation(id)
-      ? findDestination(id)
-      : { ...findDestination(id), id, name: 'an unlisted station' };
+    const named = (id: string) => {
+      if (isKnownStation(id)) return findDestination(id);
+      // Waiting in open orbit where a station left (shipArrival).
+      const adrift = adriftPlace(id);
+      return adrift
+        ? { ...findDestination(id), id, planetId: adrift.planetId, name: `open orbit around ${planetById(adrift.planetId).name}` }
+        : { ...findDestination(id), id, name: 'an unlisted station' };
+    };
     const location = named(shipLocationId(flight, hasLiveDock()));
     const destination = flight.destinationId ? named(flight.destinationId) : null;
     const choices = destinationsFrom(location.id);

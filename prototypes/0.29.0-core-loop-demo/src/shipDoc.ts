@@ -78,6 +78,7 @@ import {
   findStation,
   isKnownStation,
   localStationId,
+  locationPlanet,
   listStations,
   portableStationId,
   type StationDestination,
@@ -591,8 +592,9 @@ export function canDepart(ctx: DepartContext): DepartRefusal {
     if (ctx.locationId === dest.id) return { ok: false, reason: 'already-here' };
     // An unlisted station reads as home here (findStation's fallback), and
     // its hops can never be planned: say so, not "a shared orbit".
-    if (!isKnownStation(ctx.locationId)) return { ok: false, reason: 'unlisted-location' };
-    if (findStation(ctx.locationId).planetId !== dest.planetId) {
+    const planet = locationPlanet(ctx.locationId);
+    if (planet === null) return { ok: false, reason: 'unlisted-location' };
+    if (planet !== dest.planetId) {
       return { ok: false, reason: 'other-planet' };
     }
   }

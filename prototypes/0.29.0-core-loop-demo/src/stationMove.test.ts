@@ -830,6 +830,33 @@ describe('tugs: a torch tow', () => {
     }
   });
 
+  it('cancels a tow whose tug let go of the station with its flight record still docked', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    const docked = { status: 'docked' };
+    // Still holding the station: nothing to do (and nothing when unknown).
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 1, () => true)).toBe(false);
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 1)).toBe(false);
+    // Let go mid-tow: cancelled.
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 2, (w) => w !== plan.move.welcomeRoomId)).toBe(true);
+    expect(isCancelPin(readStationMove()!)).toBe(true);
+    // After the tow arrived an undock is just an undock.
+    store.clear();
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    expect(cancelTowLeftBehind('tug-room', docked, plan.move.arriveAt + 1, () => false)).toBe(false);
+  });
+
+  it('refuses a nest of pins at the first step', () => {
+    const base = moveTo();
+    let nest: Record<string, unknown> = { ...base };
+    for (let k = 0; k < 100_000; k++) nest = { ...base, settles: nest };
+    expect(isStationMove(nest)).toBe(false);
+    expect(isStationMove({ ...base, settles: { ...base } })).toBe(true);
+  });
+
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
     const plan = planStationTow(towCtx(), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
