@@ -1586,7 +1586,18 @@ async function joinRoomAtEpoch(
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
   bindStationMoveDoc(sync.doc);
-  // 🪐 After the ship and trim records: the summary publishes both.
+
+  // Bind the shared door-pairing map (issue #64): keyed by door id, drives
+  // world.reconcileDoors so a module another user docks to a door becomes visible
+  // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
+  bindDoorsDoc(sync.doc);
+
+  // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
+  bindDoorPolicy(sync.doc);
+
+  // 🪐 After the ship, trim and door records: the summary publishes the
+  // first two at once, and whether this room is a ship (not one bolted into
+  // a station) is read from this room's doors, never the last room's.
   bindPlanetSummaryDoc(sync.doc, {
     currentStation,
     // The fuel its burns drew rides along: between trims whose last burns
@@ -1597,14 +1608,6 @@ async function joinRoomAtEpoch(
     },
     ship: planetShipStatus,
   });
-
-  // Bind the shared door-pairing map (issue #64): keyed by door id, drives
-  // world.reconcileDoors so a module another user docks to a door becomes visible
-  // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
-  bindDoorsDoc(sync.doc);
-
-  // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
-  bindDoorPolicy(sync.doc);
 
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
   bindExteriorDoc(sync.doc);

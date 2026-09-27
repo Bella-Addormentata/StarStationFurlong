@@ -155,11 +155,18 @@ describe('guards', () => {
   });
 
   it("saves a learned station's extra fields, and does not rewrite it when they are unchanged", () => {
-    const move = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
-    const s = summary({ ext: { move } });
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    const s = summary({ ext: { tow } });
     expect(registerLearnedStations(SOV, [s])).toBe(1);
-    expect((readStationRecords().find((r) => r.welcomeRoomId === 'room-hab') as unknown as { move?: unknown }).move).toEqual(move);
+    expect((readStationRecords().find((r) => r.welcomeRoomId === 'room-hab') as unknown as { tow?: unknown }).tow).toEqual(tow);
     expect(registerLearnedStations(SOV, [s])).toBe(0);
+  });
+
+  it("drops a learned station's extra field once the summary no longer carries it", () => {
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    registerLearnedStations(SOV, [summary({ ext: { tow } })]);
+    expect(registerLearnedStations(SOV, [summary()])).toBe(1);
+    expect(readStationRecords().find((r) => r.welcomeRoomId === 'room-hab')).not.toHaveProperty('tow');
   });
 
   it('checks ship summaries', () => {
@@ -320,6 +327,21 @@ describe('sharing through the room doc', () => {
     sync(peer, doc);
     const hab = listStations().find((s) => s.id === 'hab')!;
     expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm - 6, 6);
+  });
+
+  it('writes the winner back when a peer\'s value loses the merge', () => {
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null));
+    // The first published (unowned) record stands here…
+    const peer1 = new Y.Doc();
+    peer1.getMap('stationSummaries').set('room-hab', summary({ orbitSlot: 2, updatedAt: T0 }));
+    sync(peer1, doc);
+    // …and a later first publish from an install that was offline reaches the map.
+    const peer2 = new Y.Doc();
+    peer2.getMap('stationSummaries').set('room-hab', summary({ orbitSlot: 1, updatedAt: T0 + 50 }));
+    sync(peer2, doc);
+    expect(readStore().stations['room-hab']?.orbitSlot).toBe(2);
+    expect((doc.getMap('stationSummaries').get('room-hab') as StationSummary).orbitSlot).toBe(2);
   });
 
   it('ignores junk a peer writes into the maps', () => {
