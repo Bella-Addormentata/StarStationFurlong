@@ -2210,6 +2210,9 @@ async function joinRoomAtEpoch(
 
   roomMap.observe((_event) => {
     updateRoomUI();
+    // 🪐 A ship's shared summary carries the room's name: one that syncs in
+    // (or is changed) replaces the "SHIP" stand-in now, not at the heartbeat.
+    if (_event.keysChanged.has("name")) publishPlanetSummary();
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some

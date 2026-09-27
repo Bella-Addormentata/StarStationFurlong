@@ -151,6 +151,13 @@ describe('guards', () => {
     expect(s?.ext).toEqual({ move });
     expect(cleanStationSummary({ ...summary(), ext: { big: 'x'.repeat(2000) } }, T0)?.ext).toBeUndefined();
     expect(cleanStationSummary({ ...summary(), ext: [1, 2] }, T0)?.ext).toBeUndefined();
+    // An oversized value is dropped without walking all of it.
+    let reads = 0;
+    const huge = new Proxy(new Array(1_000_000).fill(0), {
+      get: (t, k, r) => { if (typeof k === 'string' && /^\d+$/.test(k)) reads++; return Reflect.get(t, k, r); },
+    });
+    expect(cleanStationSummary({ ...summary(), ext: { huge } }, T0)?.ext).toBeUndefined();
+    expect(reads).toBeLessThan(1000);
   });
 
   it("saves a learned station's extra fields, and does not rewrite it when they are unchanged", () => {
@@ -222,6 +229,24 @@ describe('merge', () => {
     expect(mergeStation(summary(), summary())).toBeNull();
     expect(mergeStation(summary({ ownerId: 'hab', updatedAt: T0 + 1 }), summary({ ownerId: 'hab' }))).toBeNull();
     expect(mergeStation(summary(), summary({ updatedAt: T0 + 1 }))).toBeNull();
+  });
+
+  it('keeps each helm room\'s take-back, so a replayed trim of one room stays gone', () => {
+    const fromA = summary({ trim: { ...trim(), from: 'room-a', readAt: T0 + 1 } });
+    let s = mergeStation(fromA, summary({ trimGone: [{ from: 'room-a', readAt: T0 + 2 }] }))!;
+    expect(s.trim).toBeUndefined();
+    s = mergeStation(s, summary({ trimGone: [{ from: 'room-b', readAt: T0 + 3 }] }))!;
+    expect(s.trimGone?.map((g) => g.from)).toEqual(['room-a', 'room-b']);
+    // An offline peer replays room A's trim from before its take-back.
+    expect(mergeStation(s, fromA)?.trim ?? s.trim).toBeUndefined();
+    // Room B's own later reading still counts.
+    const fromB = summary({ trim: { ...trim({ dRadiusKm: 6 }), from: 'room-b', readAt: T0 + 4 } });
+    expect(mergeStation(s, fromB)?.trim?.dRadiusKm).toBe(6);
+  });
+
+  it('reads a single take-back as the first builds sent it', () => {
+    expect(cleanStationSummary({ ...summary(), trimGone: { from: 'room-a', readAt: T0 } }, T0)?.trimGone)
+      .toEqual([{ from: 'room-a', readAt: T0 }]);
   });
 });
 
