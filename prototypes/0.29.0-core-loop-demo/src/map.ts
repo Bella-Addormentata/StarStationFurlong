@@ -7,8 +7,9 @@
  * long-distance travel system (v006 §8.2 / Phase 2 Feature 1 & 2).
  */
 
-import { DEFAULT_STATION_ID, currentStation, listStations, planetById } from './stations';
+import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
+import { angleAt, stationOrbit } from './orbits';
 
 export interface MapBody {
   id: string;
@@ -20,36 +21,50 @@ export interface MapBody {
   semiMajorAxis?: number;
   eccentricity?: number; // 0 = circular, >0 = elliptical
   angle: number; // current angle in radians
+  /** 🪐 When set, the body's true angle at a real time (orbits.ts) — replaces
+   *  angle + orbitSpeed·tick, so every client draws it in the same place. */
+  angleAt?: (nowMs: number) => number;
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
 }
 
-/** Map radius of orbit slot 0 around a planet, and the step per slot. */
+/** Map radius of orbit slot 0 around a planet, and the step per slot. The
+ *  holotable draws orbits SCHEMATICALLY (true to scale, every low station
+ *  would sit on the planet's rim); the ANGLE is the true one. */
 const STATION_ORBIT_BASE = 35;
 const STATION_ORBIT_STEP = 9;
 
+/** "1m 32s" / "3h 54m" — a real-time span for the holotable readout. */
+function formatSpan(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
 /**
- * 🪐 One map body per station, orbiting its planet (stations.ts). Slot 0
- * keeps the radius, speed and phase the single hard-coded Furlong body had;
- * each further slot sits a step farther out, a little slower, and spread
- * around the planet so neighbours don't stack.
+ * 🪐 One map body per station, on its circular orbit around its planet
+ * (stations.ts for the slot, orbits.ts for the mechanics). The angle comes
+ * from the shared orbital clock; slot 0 starts where the single hard-coded
+ * Furlong body always stood.
  */
 export function stationBodies(stations: StationRecord[]): MapBody[] {
   return stations.map((s) => {
-    const orbitRadius = STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP;
-    const planet = planetById(s.planetId);
+    const orbit = stationOrbit(s);
+    const readout = `${Math.round(orbit.altitudeKm).toLocaleString('en-US')} km up · ${orbit.speedKmS.toFixed(2)} km/s · `
+      + `one orbit every ${formatSpan((orbit.periodS / 60) * 1000)}.`;
     return {
       id: s.id,
       name: s.name,
       type: 'station' as const,
-      parentId: planet.id,
-      orbitRadius,
-      orbitSpeed: 0.015 * Math.pow(STATION_ORBIT_BASE / orbitRadius, 1.5),
-      angle: 2.1 + s.orbitSlot * 2.4,
+      parentId: orbit.planet.id,
+      orbitRadius: STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP,
+      orbitSpeed: 0,
+      angle: orbit.phase0,
+      angleAt: (nowMs: number) => angleAt(orbit, nowMs),
       description: s.id === DEFAULT_STATION_ID
-        ? 'Sovereign-serverless terminal, lounge, and trade hub for all clones.'
-        : `Station in orbit slot ${s.orbitSlot + 1} around ${planet.name}.`,
+        ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
+        : `Station around ${orbit.planet.name}: ${readout}`,
     };
   });
 }
@@ -63,6 +78,8 @@ export class SolarSystemMap {
   
   // Keplerian orbit / Sim Clock state
   private simTick = 0;
+  /** Real clock for bodies with a true orbit (angleAt). */
+  private clock: () => number = () => Date.now();
   
   // UI scaling / dragging offsets
   private scale = 1.0;
@@ -390,8 +407,9 @@ export class SolarSystemMap {
     let radius = body.orbitRadius * this.scale;
     let angle = body.angle;
 
-    // Simulate orbital movement as a function of the simulation clock tick
-    angle += body.orbitSpeed * this.simTick;
+    // Simulate orbital movement as a function of the simulation clock tick —
+    // or, for stations, the true angle on the shared orbital clock.
+    angle = body.angleAt ? body.angleAt(this.clock()) : angle + body.orbitSpeed * this.simTick;
 
     if (body.parentId) {
       const parent = this.bodies.find(b => b.id === body.parentId);

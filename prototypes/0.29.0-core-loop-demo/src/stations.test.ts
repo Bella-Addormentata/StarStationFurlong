@@ -21,6 +21,7 @@ import {
 import type { StationRecord } from './stations';
 import { SolarSystemMap, stationBodies } from './map';
 import { DEFAULT_STATION } from './defaultStation';
+import { ORBIT_EPOCH_MS } from './orbits';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -110,6 +111,31 @@ describe('listStations', () => {
     expect(stationForRoom('yard-a', twoStations(), stations)?.id).toBe('aris-forge');
   });
 
+  it('lists one station per place: a record inside a listed station is dropped', () => {
+    const insideFurlong: StationRecord = {
+      id: 'lounge-2', name: 'LOUNGE', planetId: DEFAULT_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'lounge',
+    };
+    const yard: StationRecord = {
+      id: 'yard', name: 'YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 4, welcomeRoomId: 'yard-a',
+    };
+    const yardAgain: StationRecord = { ...yard, id: 'yard-2', welcomeRoomId: 'yard-b' };
+    const offAtlas: StationRecord = { ...yard, id: 'far', welcomeRoomId: 'far-room', orbitSlot: 5 };
+    const offAtlasAgain: StationRecord = { ...offAtlas, id: 'far-2', orbitSlot: 6 };
+    const stations = listStations(twoStations(), [insideFurlong, yard, yardAgain, offAtlas, offAtlasAgain]);
+    expect(stations.map((s) => s.id)).toEqual([DEFAULT_STATION_ID, 'yard', 'far']);
+  });
+
+  it('refuses to register a record for a room of a station already listed', () => {
+    for (const e of Object.values(twoStations())) {
+      const atlas = JSON.parse(store.get('ssf-station-atlas') ?? '{}');
+      atlas[e.roomId] = e;
+      store.set('ssf-station-atlas', JSON.stringify(atlas));
+    }
+    const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2 };
+    expect(registerStation({ ...base, id: 'dup', welcomeRoomId: 'lounge' })).toBe(false);
+    expect(registerStation({ ...base, id: 'yard', welcomeRoomId: 'yard-b' })).toBe(true);
+  });
+
   it('bumps a record whose orbit slot is already taken to the next free one', () => {
     const clash: StationRecord = {
       id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'yard-a',
@@ -183,11 +209,11 @@ describe('saved records', () => {
 });
 
 describe('solar map station bodies', () => {
-  it('keeps the Furlong body where it always was', () => {
+  it('keeps the Furlong body where it always was, now moving on its true orbit', () => {
     const [furlong] = stationBodies([DEFAULT_STATION_RECORD]);
-    expect(furlong).toMatchObject({
-      id: 'furlong-station', parentId: 'planet-sovereign', orbitRadius: 35, orbitSpeed: 0.015, angle: 2.1,
-    });
+    expect(furlong).toMatchObject({ id: 'furlong-station', parentId: 'planet-sovereign', orbitRadius: 35 });
+    expect(furlong.angleAt!(ORBIT_EPOCH_MS)).toBeCloseTo(2.1, 12);
+    expect(furlong.description).toContain('400 km up · 7.67 km/s · one orbit every 1m 32s.');
   });
 
   it('shows both stations around Sovereign on the holotable and marks the current one', () => {

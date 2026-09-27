@@ -38,11 +38,17 @@ export interface PlanetRecord {
   color: number;
   emissive: number;
   atmosphere: number;
+  /** Surface radius, km — orbits.ts measures altitude from it. */
+  radiusKm: number;
+  /** Gravitational parameter GM, km³/s² — sets every orbit's period. */
+  mu: number;
 }
 
 export const PLANETS: readonly PlanetRecord[] = [
-  { id: 'planet-sovereign', name: 'SOVEREIGN II', color: 0x2a5a8f, emissive: 0x0c2038, atmosphere: 0x7fb8ff },
-  { id: 'planet-aris', name: 'ARIS PRIME', color: 0x8a3a1c, emissive: 0x3a0e04, atmosphere: 0xff9a66 },
+  // Earth-sized terra world: a 400 km orbit takes ~92 orbital minutes.
+  { id: 'planet-sovereign', name: 'SOVEREIGN II', color: 0x2a5a8f, emissive: 0x0c2038, atmosphere: 0x7fb8ff, radiusKm: 6371, mu: 398600.4418 },
+  // Smaller, dense lava world.
+  { id: 'planet-aris', name: 'ARIS PRIME', color: 0x8a3a1c, emissive: 0x3a0e04, atmosphere: 0xff9a66, radiusKm: 4800, mu: 250000 },
 ];
 
 export const DEFAULT_PLANET_ID = 'planet-sovereign';
@@ -56,7 +62,9 @@ export interface StationRecord {
   name: string;
   /** A PLANETS id; unknown ids read as the default planet. */
   planetId: string;
-  /** 0-based slot around the planet — unique per planet in listStations. */
+  /** 0-based slot around the planet — unique per planet in listStations. It
+   *  fixes the station's circular orbit (orbits.ts): slot 0 is 400 km up and
+   *  each slot is a quarter farther from the planet's centre. */
   orbitSlot: number;
   /** The room a docking ship berths at. '' when unknown (a build shipping no
    *  default station). */
@@ -67,8 +75,10 @@ export interface StationRecord {
   derived?: true;
 }
 
-/** Slots per planet — a sanity bound, not a gameplay rule. */
-export const MAX_ORBIT_SLOTS = 32;
+/** Slots per planet. orbits.ts spaces slots geometrically, so this also
+ *  bounds how far out a station can orbit (slot 15 ≈ 190,000 km for
+ *  Sovereign II — about half the distance to a moon). */
+export const MAX_ORBIT_SLOTS = 16;
 
 export const DEFAULT_STATION_ID = 'furlong-station';
 
@@ -129,15 +139,16 @@ function clean(r: StationRecord): StationRecord {
 
 /** Save (or replace, by id) a station record on this install. Returns false
  *  for an invalid record, one that would shadow the built-in default, a solar
- *  map body or a derived station id, or one whose planet has no free orbit
- *  slot left. */
+ *  map body or a derived station id, one whose planet has no free orbit slot
+ *  left, or one whose welcome room is part of a station already listed. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
   const records = readStationRecords().filter((r) => r.id !== record.id);
   if (records.length >= MAX_RECORDS) return false;
   records.push(clean(record));
-  // Refuse a record the list would drop because its planet has no free slot.
-  if (!listStations({}, records).some((s) => s.id === record.id)) return false;
+  // Refuse a record the list would drop: its planet has no free slot, or its
+  // welcome room already belongs to a listed station.
+  if (!listStations(readAtlas(), records).some((s) => s.id === record.id)) return false;
   try { localStorage.setItem(KEY, JSON.stringify(records)); } catch { return false; }
   return true;
 }
@@ -151,19 +162,27 @@ export function removeStation(id: string): void {
 
 /**
  * Every station this install knows: the built-in default, saved records, and
- * one derived station per unclaimed atlas component. Orbit slots are unique
- * per planet — a record whose slot is taken moves to the next free one, and
- * derived stations fill free slots in anchor order. This is the list ship
- * destinations read from.
+ * one derived station per unclaimed atlas component. One place is one
+ * station — a record whose welcome room lies in a station already listed is
+ * dropped. Orbit slots are unique per planet — a record whose slot is taken
+ * moves to the next free one, and derived stations fill free slots in anchor
+ * order. This is the list ship destinations read from.
  */
 export function listStations(
   atlas: Record<string, AtlasEntry> = readAtlas(),
   records: StationRecord[] = readStationRecords(),
 ): StationRecord[] {
-  const explicit: StationRecord[] = [DEFAULT_STATION_RECORD];
-  for (const r of records) {
-    if (!explicit.some((e) => e.id === r.id)) explicit.push({ ...r });
-  }
+  // Which PLACE a welcome room is: its atlas component, or the bare room when
+  // the atlas does not know it. One place is one station — a second record
+  // pointing into a station already listed is dropped, not listed twice.
+  const components = atlasComponents(atlas);
+  const componentOf = new Map<string, number>();
+  components.forEach((c, i) => { for (const rid of c) componentOf.set(rid, i); });
+  const placeOf = (roomId: string): string => {
+    if (!roomId) return '';
+    const c = componentOf.get(roomId);
+    return c === undefined ? `room:${roomId}` : `component:${c}`;
+  };
 
   const taken = new Map<string, Set<number>>();
   const claim = (planetId: string, wanted: number): number | null => {
@@ -177,20 +196,25 @@ export function listStations(
   };
 
   const out: StationRecord[] = [];
-  for (const r of explicit) {
+  const places = new Set<string>();
+  for (const r of [DEFAULT_STATION_RECORD, ...records]) {
+    if (out.some((e) => e.id === r.id)) continue;
+    const place = placeOf(r.welcomeRoomId);
+    if (place && places.has(place)) continue;
     const slot = claim(r.planetId, r.orbitSlot);
-    if (slot !== null) out.push({ ...r, orbitSlot: slot });
+    if (slot === null) continue;
+    if (place) places.add(place);
+    out.push({ ...r, orbitSlot: slot });
   }
 
-  const claimedRooms = new Set(out.map((r) => r.welcomeRoomId).filter(Boolean));
   const derived: Array<{ anchor: string; name: string }> = [];
-  for (const component of atlasComponents(atlas)) {
-    if ([...component].some((rid) => claimedRooms.has(rid))) continue;
+  components.forEach((component, i) => {
+    if (places.has(`component:${i}`)) return;
     const known = [...component].filter((rid) => atlas[rid]).sort();
     const anchor = known[0];
-    if (!anchor) continue;
+    if (!anchor) return;
     derived.push({ anchor, name: atlas[anchor].name || 'STATION' });
-  }
+  });
   derived.sort((a, b) => (a.anchor < b.anchor ? -1 : a.anchor > b.anchor ? 1 : 0));
   for (const d of derived) {
     const slot = claim(DEFAULT_PLANET_ID, 0);
