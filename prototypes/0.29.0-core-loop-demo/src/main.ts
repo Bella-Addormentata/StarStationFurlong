@@ -132,6 +132,7 @@ import {
   bindPlanetSummaryDoc,
   installTrimResolver,
   publishPlanetSummary,
+  portableStationId,
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
@@ -1228,7 +1229,8 @@ function planetShipStatus(): ShipStatusInput | null {
   const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
   if (!planetId) return null;
   const name =
-    (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) || "SHIP";
+    // Peer-written: only a string is a name.
+    (() => { const n = yjsSync?.doc.getMap("roomInfo").get("name"); return typeof n === "string" ? n : ""; })() || "SHIP";
   const out: ShipStatusInput = { roomId, name: name.slice(0, 64), planetId, status: rec.status };
   if (from?.welcomeRoomId) out.fromRoom = from.welcomeRoomId;
   if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
@@ -1772,11 +1774,18 @@ async function joinRoomAtEpoch(
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
-    const localSeedFor = (roomId: string): string | undefined =>
-      readAtlas()[roomId]?.seed ??
-      (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
-        ? DEFAULT_STATION.welcomeRoomLink
-        : undefined);
+    // A seed is only this room's when it names this room (atlas entries can
+    // come from peers): one naming another room would dock elsewhere.
+    const seedNames = (seed: string | undefined, roomId: string): seed is string => {
+      if (!seed) return false;
+      try { return roomIdFromSeed(seed) === roomId; } catch { return false; }
+    };
+    const localSeedFor = (roomId: string): string | undefined => {
+      const atlasSeed = readAtlas()[roomId]?.seed;
+      if (seedNames(atlasSeed, roomId)) return atlasSeed;
+      // The build's own pass for the default station is trusted as shipped.
+      return roomId === DEFAULT_STATION.welcomeRoomId ? DEFAULT_STATION.welcomeRoomLink || undefined : undefined;
+    };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
     setStationDirectory(
@@ -1786,6 +1795,7 @@ async function joinRoomAtEpoch(
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
         (id) => resolveStationAlias(id),
+        (id) => portableStationId(id),
       ),
     );
     // 🪐 Stations fly their shared trims, and what changes here goes out:
@@ -1805,6 +1815,9 @@ async function joinRoomAtEpoch(
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
       if (docked) return docked;
+      // A saved or built-in station whose welcome room this is stays put,
+      // whatever it wears: only a free-flying ship follows its flight.
+      if (listStations().some((st) => !st.derived && st.welcomeRoomId === roomId)) return null;
       // A module bolted into a station by structure (a station-keeping helm
       // room wears engine, tank and helm too) belongs to that station, never
       // to its own flight record: only a free-flying ship follows the flight.

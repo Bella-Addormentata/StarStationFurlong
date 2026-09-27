@@ -2722,7 +2722,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       engines,
       fuel,
       drawn: readMoveFuelDrawn(),
-      deficit: fuelDrawDeficit(),
+      deficit: fuelDrawDeficit('stationMove'),
       modules: station?.welcomeRoomId ? Math.max(1, atlasComponent(readStationAtlas(), station.welcomeRoomId).size) : 1,
       now,
     };

@@ -101,6 +101,19 @@ describe('guards', () => {
     expect(cleanStationSummary(summary({ updatedAt: T0 + 7 * 3600 * 1000 }), T0)).toBeNull();
   });
 
+  it('strips credential-named fields from ext at any depth', () => {
+    const s = cleanStationSummary({ ...summary(), ext: { seed: 'x', welcomeLink: 'y', note: { pass: 'z', ok: 1 }, passage: 'public' } }, T0);
+    expect(s?.ext).toEqual({ note: { ok: 1 }, passage: 'public' });
+  });
+
+  it('breaks a same-moment tie the same way on every client', () => {
+    const a = summary({ orbitSlot: 3, trim: trim({ dRadiusKm: 1 }) });
+    const b = summary({ orbitSlot: 5, trim: trim({ dRadiusKm: 2 }) });
+    const ab = mergeStation(a, b) ?? a;
+    const ba = mergeStation(b, a) ?? b;
+    expect(ab).toEqual(ba);
+  });
+
   it('drops a malformed trim but keeps the record', () => {
     const s = cleanStationSummary({ ...summary(), trim: { ...trim(), dRadiusKm: 999 } }, T0);
     expect(s).toEqual(summary());
@@ -291,14 +304,26 @@ describe('sharing through the room doc', () => {
       const id = `room-${String(i).padStart(3, '0')}`;
       map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, updatedAt: now - (70 - i) * 1000 }));
     }
+    // One prune pass visits a bounded number of keys (64 * 4), so no single
+    // transaction deletes more than that; later passes finish the job.
+    let mostDeleted = 0;
+    map.observe((e) => {
+      let n = 0;
+      e.changes.keys.forEach((c) => { if (c.action === 'delete') n++; });
+      mostDeleted = Math.max(mostDeleted, n);
+    });
     bindPlanetSummaryDoc(doc, install(null));
     publishPlanetSummary(now);
+    publishPlanetSummary(now);
+    expect(mostDeleted).toBeLessThanOrEqual(256);
     const keys = [...map.keys()];
     expect(keys.some((k) => k.startsWith('junk-'))).toBe(false);
     expect(keys).toHaveLength(64);
     // The oldest six went; the newest stayed.
     expect(keys).not.toContain('room-000');
     expect(keys).toContain('room-069');
+    // …and entries the first bounded pull never reached are read right after.
+    expect(readStore(now).stations['room-069']?.name).toBe('S69');
   });
 
   it('never publishes a seed', () => {
@@ -331,6 +356,20 @@ describe('ships and the solar system', () => {
     status = { ...ship, status: 'in-flight', toRoom: 'room-b', departedAt: T0, etaAt: T0 + 60_000 };
     publishPlanetSummary(Date.now() + 1);
     expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ status: 'in-flight', toRoom: 'room-b' });
+  });
+
+  it('settles a same-moment pair of ship values the same way in the doc', () => {
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const a = { ...ship, status: 'docked' as const, updatedAt: now };
+    const b = { ...ship, status: 'in-flight' as const, toRoom: 'room-b', departedAt: now, etaAt: now + 60_000, updatedAt: now };
+    const winner = JSON.stringify(b) > JSON.stringify(a) ? b : a;
+    const loser = winner === a ? b : a;
+    doc.getMap('shipSummaries').set('room-ship', loser);
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => null }));
+    store.set('ssf-planet-summary', JSON.stringify({ stations: {}, ships: { 'room-ship': winner } }));
+    publishPlanetSummary(now);
+    expect(doc.getMap('shipSummaries').get('room-ship')).toEqual(winner);
   });
 
   it('forgets a ship not heard from in a day', () => {

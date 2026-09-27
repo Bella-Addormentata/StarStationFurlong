@@ -237,19 +237,26 @@ function clean(r: StationRecord): StationRecord {
 /** Save (or replace, by id) a station record on this install. Returns false
  *  for an invalid record, one that would shadow the built-in default, a solar
  *  map body or a derived station id, one whose planet has no free orbit slot
- *  left, or one whose welcome room is part of a station already listed. */
+ *  left (or would have none for a station already saved), or one whose
+ *  welcome room is part of a station already listed. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
-  const records = readStationRecords();
-  // Replace IN PLACE: slot clashes go to the earlier record, so moving a
-  // renamed record to the back would swap it out of its slot.
+  const saved = readStationRecords();
+  const records = [...saved];
+  // Replace IN PLACE: when two records name one place the earlier keeps it,
+  // and the list keeps record order.
   const at = records.findIndex((r) => r.id === record.id);
   if (at >= 0) records[at] = clean(record);
   else if (records.length >= MAX_RECORDS) return false;
   else records.push(clean(record));
-  // Refuse a record the list would drop: its planet has no free slot, or its
-  // welcome room already belongs to a listed station.
-  if (!listStations(readAtlas(), records).some((s) => s.id === record.id)) return false;
+  // Refuse a record the list would drop (its planet has no free slot, or its
+  // welcome room already belongs to a listed station), and one that would
+  // drop a saved station instead: winning that station's slot on a full
+  // planet, or taking its place.
+  const atlas = readAtlas();
+  const listed = new Set(listStations(atlas, records).map((s) => s.id));
+  if (!listed.has(record.id)) return false;
+  if (listStations(atlas, saved).some((s) => !s.derived && s.id !== record.id && !listed.has(s.id))) return false;
   try { localStorage.setItem(KEY, JSON.stringify(records)); } catch { return false; }
   return true;
 }
@@ -265,9 +272,10 @@ export function removeStation(id: string): void {
  * Every station this install knows: the built-in default, saved records, and
  * one derived station per unclaimed atlas component. One place is one
  * station — a record whose welcome room lies in a station already listed is
- * dropped. Orbit slots are unique per planet — a record whose slot is taken
- * moves to the next free one, and derived stations fill free slots in anchor
- * order. This is the list ship destinations read from.
+ * dropped. Orbit slots are unique per planet — a record that loses a clash
+ * for its slot moves to the next free one, settled the same way on every
+ * install whatever order it saved its records in, and derived stations fill
+ * free slots in anchor order. This is the list ship destinations read from.
  */
 export function listStations(
   atlas: Record<string, AtlasEntry> = readAtlas(),
@@ -287,19 +295,26 @@ export function listStations(
   };
 
   const taken = new Map<string, Set<number>>();
+  const used = (planetId: string): Set<number> => {
+    let slots = taken.get(planetId);
+    if (!slots) taken.set(planetId, slots = new Set());
+    return slots;
+  };
   const claim = (planetId: string, wanted: number): number | null => {
-    const used = taken.get(planetId) ?? new Set<number>();
-    taken.set(planetId, used);
+    const slots = used(planetId);
     for (let i = 0; i < MAX_ORBIT_SLOTS; i++) {
       const slot = (wanted + i) % MAX_ORBIT_SLOTS;
-      if (!used.has(slot)) { used.add(slot); return slot; }
+      if (!slots.has(slot)) { slots.add(slot); return slot; }
     }
     return null;
   };
   // Every candidate first — records in list order (one per id, one per
-  // place), then one derived station per unclaimed atlas component — each
-  // with its latest move read once.
+  // place; an unknown planet reads as the default one), then one derived
+  // station per unclaimed atlas component — each with its latest move read
+  // once.
   interface Candidate {
+    id: string;
+    welcomeRoomId: string;
     base: { planetId: string; orbitSlot: number };
     move: StationMove | null;
     make: (planetId: string, orbitSlot: number, move: StationMove | undefined) => StationRecord;
@@ -315,7 +330,9 @@ export function listStations(
     if (where) places.add(where);
     const { move: _stale, ...rest } = r;
     candidates.push({
-      base: r,
+      id: r.id,
+      welcomeRoomId: r.welcomeRoomId,
+      base: { planetId: planetById(r.planetId).id, orbitSlot: r.orbitSlot },
       move: moveOf(r),
       make: (planetId, orbitSlot, move) => ({ ...rest, planetId, orbitSlot, ...(move ? { move } : {}) }),
     });
@@ -337,13 +354,15 @@ export function listStations(
     derived.push({ anchor, name: (typeof name === 'string' && name ? name : 'STATION').slice(0, MAX_NAME_LENGTH) });
   });
   derived.sort((a, b) => (a.anchor < b.anchor ? -1 : a.anchor > b.anchor ? 1 : 0));
+  const firstDerived = candidates.length;
   for (const d of derived) {
     const id = `${DERIVED_PREFIX}${d.anchor}`;
     // A derived station that has moved is listed where its move put it; one
     // that has not takes the lowest free slot around the default planet.
-    const base = { planetId: DEFAULT_PLANET_ID, orbitSlot: 0 };
     candidates.push({
-      base,
+      id,
+      welcomeRoomId: d.anchor,
+      base: { planetId: DEFAULT_PLANET_ID, orbitSlot: 0 },
       move: moveOf({ id, welcomeRoomId: d.anchor }),
       make: (planetId, orbitSlot, move) => ({
         id, name: d.name, planetId, orbitSlot, welcomeRoomId: d.anchor, derived: true, ...(move ? { move } : {}),
@@ -351,47 +370,85 @@ export function listStations(
     });
   }
 
-  // Slots go first to the stations that have been where they are longest:
-  // those that never moved (or are still waiting or on their way), then
-  // arrivals in the order they arrived. A newcomer never pushes out an
-  // incumbent.
+  // Where each candidate wants to be now: its record, or its move's end
+  // once arrived (an arrival that found its new planet full stays where it
+  // left from — see below).
   const settledAt = (c: Candidate) => (c.move && nowMs >= c.move.arriveAt ? c.move.arriveAt : -Infinity);
-  const order = candidates.map((c, i) => ({ c, i })).sort((a, b) => settledAt(a.c) - settledAt(b.c) || a.i - b.i);
   const spots: Array<{ planetId: string; orbitSlot: number; move?: StationMove } | null> = candidates.map(() => null);
-  for (const { c, i } of order) {
-    let at = placeWithMove(c.base, c.move, nowMs);
+  const wantOf = candidates.map((c) => {
+    const at = placeWithMove(c.base, c.move, nowMs);
+    return { ...at, planetId: planetById(at.planetId).id };
+  });
+
+  // Slots are settled in one global order, never this install's record
+  // order, so every install holding the same stations gives each the same
+  // slot. The built-in default claims first, as it is the same everywhere;
+  // then the stations that have been where they are longest: those that
+  // never moved (or are still waiting or on their way), each wanted slot to
+  // the smallest welcome room id, the clash losers after them to the next
+  // free slot on; then arrivals in the order they arrived. A clash moves only
+  // the station that lost it, and a newcomer never pushes out an incumbent.
+  // Derived stations follow saved records among those that never moved.
+  const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const globalOrder = (i: number, j: number) => byName(wantOf[i].planetId, wantOf[j].planetId)
+    || wantOf[i].orbitSlot - wantOf[j].orbitSlot
+    || byName(candidates[i].welcomeRoomId, candidates[j].welcomeRoomId) || byName(candidates[i].id, candidates[j].id);
+  const settle = (i: number, planetId: string, slot: number) => {
+    spots[i] = { planetId, orbitSlot: slot, ...(wantOf[i].move ? { move: wantOf[i].move } : {}) };
+  };
+  const stayers = candidates.map((_, i) => i).filter((i) => settledAt(candidates[i]) === -Infinity);
+  const [builtIn, ...rest] = stayers[0] === 0 ? stayers : [-1, ...stayers];
+  if (builtIn === 0) {
+    const slot = claim(wantOf[0].planetId, wantOf[0].orbitSlot);
+    if (slot !== null) settle(0, wantOf[0].planetId, slot);
+  }
+  for (const group of [rest.filter((i) => i < firstDerived), rest.filter((i) => i >= firstDerived)]) {
+    const lost: number[] = [];
+    for (const i of [...group].sort(globalOrder)) {
+      const { planetId, orbitSlot } = wantOf[i];
+      const slots = used(planetId);
+      const free = Number.isInteger(orbitSlot) && orbitSlot >= 0 && orbitSlot < MAX_ORBIT_SLOTS && !slots.has(orbitSlot);
+      if (free) { slots.add(orbitSlot); settle(i, planetId, orbitSlot); } else lost.push(i);
+    }
+    for (const i of lost) {
+      const slot = claim(wantOf[i].planetId, wantOf[i].orbitSlot);
+      if (slot !== null) settle(i, wantOf[i].planetId, slot);
+    }
+  }
+
+  const arrivals = candidates.map((_, i) => i).filter((i) => settledAt(candidates[i]) !== -Infinity)
+    .sort((i, j) => settledAt(candidates[i]) - settledAt(candidates[j]) || globalOrder(i, j));
+  for (const i of arrivals) {
+    const m = candidates[i].move!;
+    let at: { planetId: string; orbitSlot: number } = wantOf[i];
     // An arrival finds its new planet as it was the moment it got there: if
     // every slot was already taken then, it stayed where it left from — for
     // good, so a later vacancy never pulls it across without a transfer.
-    const m = c.move;
-    if (m && nowMs >= m.arriveAt) {
-      const T = m.arriveAt;
-      // Where each other station was at T: its settled place when it had
-      // already arrived (after any bounce of its own), else what its record
-      // and move say for T.
-      const dest = planetById(m.toPlanetId).id;
-      const there = candidates.filter((o, j) => {
-        if (j === i) return false;
-        if (settledAt(o) <= T) return spots[j]?.planetId === dest;
-        return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
-      }).length;
-      if (there >= MAX_ORBIT_SLOTS) at = { planetId: m.fromPlanetId, orbitSlot: m.fromSlot };
-    }
-    // Claim under the planet the station is listed at (an unknown id reads as
-    // the default planet), so two ids for one planet never share a slot.
-    let planetId = planetById(at.planetId).id;
+    const T = m.arriveAt;
+    // Where each other station was at T: its settled place when it had
+    // already arrived (after any bounce of its own), else what its record
+    // and move say for T.
+    const dest = planetById(m.toPlanetId).id;
+    const there = candidates.filter((o, j) => {
+      if (j === i) return false;
+      if (settledAt(o) <= T) return spots[j]?.planetId === dest;
+      return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
+    }).length;
+    if (there >= MAX_ORBIT_SLOTS) at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
+    let planetId = at.planetId;
     let slot = claim(planetId, at.orbitSlot);
-    // A station that moved and still finds no room (every planet it could
-    // be at is full) takes the first planet with a free slot, so an accepted
-    // move never loses a station. One that never moved is refused as always.
-    for (const p of m ? PLANETS : []) {
+    // Still no room (every planet it could be at is full): the first planet
+    // with a free slot, so an accepted move never loses a station.
+    for (const p of PLANETS) {
       if (slot !== null) break;
       slot = claim(p.id, 0);
       planetId = p.id;
     }
-    if (slot !== null) spots[i] = { planetId: planetById(planetId).id, orbitSlot: slot, ...(at.move ? { move: at.move } : {}) };
+    if (slot !== null) settle(i, planetId, slot);
   }
 
+  // Listed in record order, derived stations last. A station left without a
+  // slot (its planet is full) is dropped.
   const out: StationRecord[] = [];
   candidates.forEach((c, i) => {
     const spot = spots[i];

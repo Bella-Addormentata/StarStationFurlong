@@ -16,7 +16,7 @@ import {
 import { planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
 import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
-import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeOrbitTrim } from './stationKeeping';
+import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeTrimBurn } from './stationKeeping';
 import {
   TUG_ACCEL_KMS2,
   TUG_MIN_ENGINES,
@@ -352,12 +352,12 @@ describe('the record in the room doc and on this install', () => {
       const c = ctx();
       const trim = planTrim({
         bolted: true, station: c.station, trim: readOrbitTrim(), commander: true, engines: 1,
-        fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: NOW,
+        fuel: readFuelLevel(), now: NOW,
       }, 'raise');
       if (!trim.ok) throw new Error(trim.refusal);
-      writeOrbitTrim(trim.trim);
+      writeTrimBurn(trim.burn);
       bind(b);
-      const plan = planStationMove(ctx({ fuel: readFuelLevel(), drawn: readMoveFuelDrawn(), deficit: fuelDrawDeficit() }), ARIS);
+      const plan = planStationMove(ctx({ fuel: readFuelLevel(), drawn: readMoveFuelDrawn(), deficit: fuelDrawDeficit('stationMove') }), ARIS);
       if (!plan.ok) throw new Error(plan.refusal);
       writeStationMove(plan.move);
 

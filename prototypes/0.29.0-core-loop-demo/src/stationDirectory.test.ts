@@ -132,6 +132,7 @@ describe('planning a hop', () => {
     expect(planHop('furlong-station', 'high-orbit', 1000)).toEqual({ departAt: 1000, arriveAt: 1000 + TRAVEL_MS_MIN, fuelCost: 25 });
     expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
     expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
+    expect(planHop('nowhere', 'high-orbit', 1000)).toBeNull();
   });
 
   it('follows the circular-orbit model over station records', () => {
