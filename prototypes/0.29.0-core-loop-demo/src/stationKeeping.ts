@@ -42,10 +42,10 @@
  */
 
 import * as Y from 'yjs';
-import { isDockChain } from './adapter';
 import type { DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, orbitalSeconds, stationOrbit, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
+import { isBerthDoor } from './stationAtlas';
 import { MAX_ORBIT_SLOTS } from './stations';
 import type { StationRecord } from './stations';
 
@@ -56,14 +56,14 @@ const DEG = Math.PI / 180;
 
 /**
  * Is this module part of a station's structure? True when any of its doors is
- * connected by a gangway: paired, not a transient guest berth, and not a
- * docking-adapter chain (a dock is a berth a ship casts off from).
+ * paired and is not a berth — the same line station grouping draws
+ * (stationAtlas.isBerthDoor: a transient guest berth or a docking-adapter
+ * chain is a ship calling, not structure).
  */
 export function isBoltedIntoStation(doors: Iterable<DoorRecord>): boolean {
   for (const rec of doors) {
     if (rec.paired !== true) continue;
-    if (rec.transient === true) continue;
-    if (isDockChain(rec.segments)) continue;
+    if (isBerthDoor(rec)) continue;
     return true;
   }
   return false;
