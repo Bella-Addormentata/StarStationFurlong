@@ -176,6 +176,12 @@ describe('transitLayout', () => {
     expect(transitLayout(bad, (move.departAt + move.arriveAt) / 2)).toBeNull();
   });
 
+  it('is null for a tug move whose two planet ids name one planet', () => {
+    const bad: StationMove = { ...move, toPlanetId: 'no-such-planet' };
+    expect(planetById(bad.toPlanetId).id).toBe(planetById(bad.fromPlanetId).id);
+    expect(transitLayout(bad, (move.departAt + move.arriveAt) / 2)).toBeNull();
+  });
+
   it('is null outside the transit', () => {
     expect(transitLayout(move, move.departAt - 1)).toBeNull();
     expect(transitLayout(move, move.arriveAt + 1)).toBeNull();
