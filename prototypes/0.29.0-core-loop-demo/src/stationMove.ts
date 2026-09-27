@@ -248,10 +248,13 @@ export type MovePlanResult =
   | { ok: true; move: StationMove; quote: MoveQuote }
   | { ok: false; refusal: MoveRefusal; quote: MoveQuote | null };
 
-/** The lowest orbit slot around `planetId` no listed station holds. */
-export function freeSlotAround(planetId: string, stations: StationRecord[], exceptId?: string): number | null {
+/** The lowest orbit slot around `planetId` no listed station holds at
+ *  `nowMs`: a station between planets (stationInTransit) holds none, as in
+ *  stations.listStations. */
+export function freeSlotAround(planetId: string, stations: StationRecord[], exceptId?: string, nowMs: number = Date.now()): number | null {
   const id = planetById(planetId).id;
-  const used = new Set(stations.filter((s) => s.id !== exceptId && planetById(s.planetId).id === id).map((s) => s.orbitSlot));
+  const used = new Set(stations.filter((s) => s.id !== exceptId && planetById(s.planetId).id === id && !stationInTransit(s, nowMs))
+    .map((s) => s.orbitSlot));
   for (let slot = 0; slot < MAX_ORBIT_SLOTS; slot++) if (!used.has(slot)) return slot;
   return null;
 }
@@ -275,7 +278,7 @@ export function quoteMove(
   if (!station || !(modules >= 1)) return null;
   const to = planetById(toPlanetId).id;
   if (to === planetById(station.planetId).id) return null;
-  const toSlot = freeSlotAround(to, stations, station.id);
+  const toSlot = freeSlotAround(to, stations, station.id, now);
   if (toSlot === null) return null;
   const plan = planPlanetTransfer(station, { id: `${station.id}@${to}`, planetId: to, orbitSlot: toSlot }, now);
   if (!plan) return null;
@@ -467,7 +470,7 @@ export function quoteTow(
   if (!station || !(modules >= 1)) return null;
   const to = planetById(toPlanetId).id;
   if (to === planetById(station.planetId).id) return null;
-  const toSlot = freeSlotAround(to, stations, station.id);
+  const toSlot = freeSlotAround(to, stations, station.id, now);
   if (toSlot === null) return null;
   const plan = planTow(station.planetId, to, now);
   if (!plan) return null;

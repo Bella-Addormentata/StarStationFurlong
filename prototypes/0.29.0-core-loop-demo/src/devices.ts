@@ -3767,6 +3767,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
       unsubs.push(subscribeStationMove(() => render()));
+      // 🪐 Destinations and their orbits learned from peers.
+      unsubs.push(subscribePlanetSummary(() => render()));
       // 🚏 A charging dock's robot taking up 🚀 Ship pilot (the route
       // editor's pilot picker).
       unsubs.push(subscribeRobot(() => render()));

@@ -1442,7 +1442,11 @@ function planetShipStatus(): ShipStatusInput | null {
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
   const from = byId(rec.locationId);
   const to = byId(rec.destinationId);
-  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? currentStation()?.planetId;
+  // The ship's own one-room stand-in sits on the default planet until its
+  // stations are known: that is no placement, so the entry waits (null).
+  const here = currentStation();
+  const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
+  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const roomName = yjsSync?.doc.getMap("roomInfo").get("name");
   // 🚏📋 A ferry on its route goes by its board name, so a newer summary can
@@ -3810,6 +3814,8 @@ function resolveOwnerLabel(owner: string): string {
  *    · the exterior view ...... setExteriorOwnerCheck
  *    · the ship's helm ........ setHelmOwnerCheck (REFUEL / DEPART / arrival —
  *      "if you could rearrange the furniture, you can fly the ship", plan §6)
+ *    · the station helm ....... setStationHelmCommanderCheck (trim burns — the
+ *      same commander as the ship's helm)
  *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
  *
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
