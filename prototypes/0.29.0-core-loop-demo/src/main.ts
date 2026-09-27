@@ -170,7 +170,7 @@ import {
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
 // and the far room's end of every DOCK / UNDOCK.
 import { isDockChain } from "./adapter";
-import { mirrorMayWrite } from "./dockRules";
+import { gateAdmits, mirrorMayWrite } from "./dockRules";
 import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
@@ -198,6 +198,7 @@ import {
 import {
   bindDoorPolicy,
   subscribeDoorPolicy,
+  gateAccessIn,
   readDockGates,
   readGateAccess,
   readDoorPolicy,
@@ -267,6 +268,7 @@ import {
 } from "./exteriorView";
 import {
   harvestIntoAtlas,
+  freeGateNumber,
   readAtlas,
   bindStationAtlasDoc,
   pushAtlasToDoc,
@@ -1954,7 +1956,10 @@ async function joinRoomAtEpoch(
       // defaults to the wall label exactly as seedDoorLayoutSingle's does.)
       if (mintedHere.birthPort) {
         const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
-        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true });
+        // ⚓🚦 …numbered like every port (the new room's own gate list; the
+        // atlas groups it with its station once harvested).
+        const gate = freeGateNumber(readAtlas(), boot.roomId, readDockGates());
+        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
       // so the door sits centred on `birthWall` whatever the room is called.
@@ -3084,7 +3089,13 @@ async function transitTo(
       depRoomId &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
-      })
+      }) &&
+      // ⚓🚦 A dock this gate does not admit is not completed here either
+      // (one the door already holds for that ship stands).
+      (!depDock.isDock ||
+        (existing?.paired === true && roomIdFromSeed(existing.connectedRoomAddress) === depRoomId) ||
+        !yjsSync ||
+        gateAdmits(gateAccessIn(yjsSync.doc, arrivalDoorId, getIdentityPub() ?? undefined), depRoomId))
     ) {
       // ⚓ ONE transaction for the pairing and, for a dock, its port: were the
       // pairing to land alone (a session cut between two updates), the port
@@ -3114,9 +3125,12 @@ async function transitTo(
         // mating half the connection brought (staged on the far side, or the
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
         if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+          // ⚓🚦 …numbered, like every new port of the station.
+          const gate = freeGateNumber(readAtlas(), activeBootstrap?.roomId ?? "", readDockGates());
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
+            ...(gate !== null ? { gate } : {}),
           });
         }
       });

@@ -279,6 +279,15 @@ describe('ship destinations', () => {
     // The public berth names its gate.
     expect(dest.berth).toEqual({ address: seed('room-b'), farDoor: 'south', gate: 2, occupied: true });
   });
+
+  it('drop a public berth that is not one of the listed gates', () => {
+    const [dest] = destinationsFromRecords([{
+      id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b', berthDoor: 'west',
+      berths: [{ roomId: 'room-c', doorId: 'east', gate: 3 }],
+    }], (room) => (room === 'room-c' ? undefined : seed(room)));
+    expect(dest.berths).toEqual([]);
+    expect(dest.berth).toBeUndefined();
+  });
 });
 
 describe('who may dock at a gate', () => {

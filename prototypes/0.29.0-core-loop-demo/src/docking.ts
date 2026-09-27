@@ -64,6 +64,7 @@ import {
   initiateChainRefusal,
   stampAfter,
   FAR_DOCK_REFUSAL,
+  gateAdmits,
   type DockPortState,
 } from "./dockRules";
 // 🛰️ Hull space: built chains register their swept boxes so exterior mounts
@@ -2994,6 +2995,15 @@ export class DoorDockingPortSystem {
           name,
         });
       }
+    }
+    // ⚓🚦 The far room could not answer, so its gate could not admit us:
+    // dock one-sided only where this client's atlas knows the gate is open
+    // (or knows nothing of it). A gate for granted captains cannot be
+    // checked from here, so it waits for the far room too.
+    const knownAccess = !far?.ok && farDoor ? readAtlas()[port.roomId]?.gateAccess?.[farDoor] : undefined;
+    if (knownAccess && !gateAdmits(knownAccess, roomId, false)) {
+      this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL["not-allowed"], tone: "bad" }, roomId);
+      return false;
     }
     const next = redockRecord(port, dockedAt);
     writeDoorPairing(doorId, next.connectedRoomAddress, next);
