@@ -125,7 +125,7 @@ function gather(now: number): Source {
   let aboard: TransferPlan | null = null;
   if (shipDocBound()) {
     const rec = readFlightRecord();
-    if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt && rec.etaAt) {
+    if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       aboard = flightPlan(
         all.find((s) => s.id === rec.locationId),
         all.find((s) => s.id === rec.destinationId),
@@ -174,16 +174,11 @@ function gather(now: number): Source {
     viewerRingRadiusKm = orbit.radiusKm;
   }
 
-  const stations = all
-    // Never the viewer: its own station, nor the one-module station the room
-    // it stands in (a ship, say) is listed as.
-    .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
-    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
-    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
-
   const byRoom = (room: string | undefined) => (room ? all.find((s) => s.welcomeRoomId === room) : undefined);
   const ships: FarShipInput[] = [];
+  const flying = new Set<string>();
   for (const ship of shipsAroundPlanet(planetId, now)) {
+    if (ship.status === 'in-flight') flying.add(ship.roomId);
     if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
     if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
     const plan = flightPlan(byRoom(ship.fromRoom), byRoom(ship.toRoom), ship.departedAt, ship.etaAt);
@@ -195,6 +190,16 @@ function gather(now: number): Source {
     }
   }
 
+  const stations = all
+    // Never the viewer: its own station, nor the one-module station the room
+    // it stands in (a ship, say) is listed as.
+    .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
+    // A ship in flight is listed as its own one-module station too; it is
+    // drawn on its transfer instead, never also on a circular orbit.
+    .filter((s) => !flying.has(s.welcomeRoomId))
+    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
+    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
+
   const key = [
     'planet',
     planetId,
@@ -203,7 +208,7 @@ function gather(now: number): Source {
     // without changing its slot), names, module counts and each course.
     ...stations.map((s) => `${s.record.id}:${stationOrbit(s.record).radiusKm.toFixed(3)}:${s.modules}:${s.record.name}`),
     ...ships.map((s) =>
-      `${s.id}:${s.name}:${s.plan.departAt}:${s.plan.arriveAt}:${s.plan.from.radiusKm.toFixed(3)}:${s.plan.from.phase0}:${s.plan.to.radiusKm.toFixed(3)}`),
+      `${s.id}:${s.name}:${s.plan.departAt}:${s.plan.arriveAt}:${s.plan.from.radiusKm.toFixed(3)}:${s.plan.from.phase0}:${s.plan.to.radiusKm.toFixed(3)}:${s.plan.to.phase0}`),
   ].join('|');
   return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key };
 }
