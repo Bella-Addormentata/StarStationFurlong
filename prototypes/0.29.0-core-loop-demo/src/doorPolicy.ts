@@ -272,6 +272,21 @@ export function readDockGates(): Record<string, number> {
   return out;
 }
 
+/** ⚓🚦 This room's ports that carry no gate number yet (fitted before gates
+ *  existed), by door id, in id order. */
+export function readUnnumberedPorts(): string[] {
+  const out: string[] = [];
+  if (!docAlive()) return out;
+  let n = 0;
+  for (const [doorId, value] of policyMap!.entries()) {
+    if (++n > 256) break;
+    if (!isKnownDoorId(doorId)) continue;
+    const p = sanitizePolicy(value);
+    if (p.adapter && p.gate === undefined) out.push(doorId);
+  }
+  return out.sort();
+}
+
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
 export function dockGatesIn(doc: Y.Doc): Record<string, number> {
   const out: Record<string, number> = {};

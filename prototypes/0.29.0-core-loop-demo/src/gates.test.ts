@@ -268,6 +268,27 @@ describe('the per-planet summary', () => {
     // Unchanged gates change nothing.
     expect(foldOwnStation(next, here, null, T0 + 120_000)).toBeNull();
   });
+
+  it("replaces only the gates of the room the visitor stands in", () => {
+    const known = base({
+      berths: [{ roomId: 'room-a', doorId: 'west', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+      berthsAt: T0,
+    });
+    // An old atlas still shows room-a's port as gate 5; only room-b is first-hand.
+    const here = {
+      id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-b', derived: true as const,
+      berths: [
+        { roomId: 'room-a', doorId: 'west', gate: 5 },
+        { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
+      ],
+    };
+    const next = foldOwnStation(known, here, null, T0 + 60_000, 'room-b')!;
+    expect(next.berths).toEqual([
+      { roomId: 'room-a', doorId: 'west', gate: 1 },
+      { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
+    ]);
+    expect(foldOwnStation(next, here, null, T0 + 120_000, 'room-b')).toBeNull();
+  });
 });
 
 describe('ship destinations', () => {

@@ -200,6 +200,7 @@ import {
   subscribeDoorPolicy,
   gateAccessIn,
   readDockGates,
+  readUnnumberedPorts,
   readGateAccess,
   readDoorPolicy,
   writeDoorPolicy,
@@ -3609,9 +3610,23 @@ function harvestStationAtlas(): void {
           : {}),
       }];
     });
+  // ⚓🚦 A port fitted before gates existed has no number: the owner numbers
+  // it here, once. Until then (anyone else here) the room's gates are not
+  // known, so the harvest leaves them as they were rather than listing none
+  // and hiding a legacy berth.
+  const unnumbered = readUnnumberedPorts();
+  if (unnumbered.length > 0 && isLocalHelmCommander()) {
+    for (const doorId of unnumbered) {
+      const gate = freeGateNumber(readAtlas(), roomId, readDockGates());
+      if (gate === null) break;
+      writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
+    }
+  }
+  const gatesKnown = readUnnumberedPorts().length === 0;
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
   harvestIntoAtlas({
-    roomId, name, seed, dims: readRoomDims(), doors, gates: readDockGates(), gateAccess: readGateAccess(),
+    roomId, name, seed, dims: readRoomDims(), doors,
+    ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
