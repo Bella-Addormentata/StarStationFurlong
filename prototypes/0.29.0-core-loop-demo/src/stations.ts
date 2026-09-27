@@ -147,9 +147,13 @@ function clean(r: StationRecord): StationRecord {
  *  left, or one whose welcome room is part of a station already listed. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
-  const records = readStationRecords().filter((r) => r.id !== record.id);
-  if (records.length >= MAX_RECORDS) return false;
-  records.push(clean(record));
+  const records = readStationRecords();
+  // Replace IN PLACE: slot clashes go to the earlier record, so moving a
+  // renamed record to the back would swap it out of its slot.
+  const at = records.findIndex((r) => r.id === record.id);
+  if (at >= 0) records[at] = clean(record);
+  else if (records.length >= MAX_RECORDS) return false;
+  else records.push(clean(record));
   // Refuse a record the list would drop: its planet has no free slot, or its
   // welcome room already belongs to a listed station.
   if (!listStations(readAtlas(), records).some((s) => s.id === record.id)) return false;

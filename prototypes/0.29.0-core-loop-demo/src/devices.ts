@@ -45,10 +45,12 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, isKnownStation, planHop } from './stationDirectory';
+import { destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
   castOffForDeparture,
+  rememberBerthHere,
   completeArrival,
   shipLocationId,
   type ArrivalOutcome,
@@ -61,7 +63,9 @@ import {
   deleteDoorPairing,
   readAllDoors,
   subscribeDoors,
+  type DoorPairing,
 } from './doorsDoc';
+import { isDockChain } from './adapter';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
@@ -1059,7 +1063,8 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       } else {
         mapTableMap.mount(body); // re-parents the existing container
       }
-      mapTableMap.refreshStations(); // every station around each planet, "you are here" on the current one
+      // Every station around each planet, "you are here" on the current one.
+      mapTableMap.refreshStations(undefined, holotableStation());
       mapTableMap.show();
     },
 
@@ -1954,6 +1959,25 @@ function helmIsCommander(): boolean {
  *  gate treats self-transitions as legal). */
 const HELM_TICK_MS = 250;
 
+/** The station the holotable marks "you are here". A station room is its
+ *  own atlas station. A ship is its own one-module station in the atlas
+ *  (docks are not station structure), so a ship reads its live dock partner
+ *  first, then where its last flight left it; in flight it is at none. */
+function holotableStation(): StationRecord | null {
+  if (!isShipReady()) return currentStation();
+  const flight = readFlightRecord();
+  if (flight.status !== 'docked') return null;
+  const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
+  return listStationRecords().find((st) => st.id === id) ?? null;
+}
+
+/** A paired door that is a guest berth, not station structure: flagged
+ *  transient, or a DOCK chain (a dock is always transient — records from
+ *  before the flag carry only the two-half chain). */
+function isTransientBerth(rec: DoorPairing): boolean {
+  return rec.transient === true || isDockChain(rec.segments);
+}
+
 /** Enumerate the room's PERMANENT chained doors — a paired berth that is
  *  NOT a transient guest-berth. Reads the doors doc (shared truth), so a
  *  peer's dock lands here without a helm round-trip. */
@@ -1961,7 +1985,7 @@ function enumerateChainedDoors(): string[] {
   const out: string[] = [];
   for (const [id, rec] of readAllDoors()) {
     if (rec.paired !== true) continue;
-    if (rec.transient === true) continue;
+    if (isTransientBerth(rec)) continue;
     out.push(id);
   }
   return out;
@@ -1981,7 +2005,7 @@ function enumerateTransientBerths(): string[] {
   const out: string[] = [];
   for (const [id, rec] of readAllDoors()) {
     if (rec.paired !== true) continue;
-    if (rec.transient !== true) continue;
+    if (!isTransientBerth(rec)) continue;
     out.push(id);
   }
   return out;
@@ -2400,6 +2424,16 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const dest = findDestination(destId);
       if (!nowHop) { render(); return; }
       if (nowFuel < nowHop.fuelCost) { render(); return; }
+      // 0) Keep the berth here first: a ship that cannot remember where it
+      //    docked must not leave (the return trip would have nowhere to go).
+      if (shipDocking && !rememberBerthHere(fromId, shipDocking.ports())) {
+        setArrivalNote({
+          tone: 'warn',
+          text: `Cannot depart: the ship could not remember its berth at ${findDestination(fromId).name}.`,
+        });
+        render();
+        return;
+      }
       // 1) Publish the flight record FIRST — the FAST path docked → in-flight.
       //    A record the writer refuses (shape or transition) must not leave
       //    the ship cast off and charged without having departed.
@@ -2416,14 +2450,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
       //    UNDOCK — tombstone + far-room write), then detach any other
       //    transient guest berth (#67 D2, either-side legal).
-      const berthKept = shipDocking ? castOffForDeparture(fromId, shipDocking) : true;
+      if (shipDocking) castOffForDeparture(fromId, shipDocking);
       for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
       // 3) Debit the fuel cost.
       writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
-      setArrivalNote(berthKept ? null : {
-        tone: 'warn',
-        text: `The ship could not remember its berth at ${findDestination(fromId).name}; a return trip will need a dock from a door panel.`,
-      });
+      setArrivalNote(null);
       render();
     });
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {

@@ -712,12 +712,14 @@ export class SolarSystemMap {
       }
     }
     // Location FIRST: the selection repaint below reads it for the travel
-    // button ("YOU ARE HERE" belongs to the station we are in now).
-    if (!this.travelDestination && current) {
-      this.playerLocationId = current.id;
+    // button ("YOU ARE HERE" belongs to the station we are in now). A room no
+    // listed station holds (not in the atlas yet) is somewhere unknown, never
+    // the last station shown or Furlong by default.
+    if (!this.travelDestination) {
+      this.playerLocationId = current?.id ?? '';
       if (this.container) {
         const playerLocEl = document.getElementById('map-player-loc');
-        if (playerLocEl) playerLocEl.textContent = current.name;
+        if (playerLocEl) playerLocEl.textContent = current?.name ?? 'UNKNOWN';
       }
     }
     // Rebind the selection to the refreshed body (a station may have been

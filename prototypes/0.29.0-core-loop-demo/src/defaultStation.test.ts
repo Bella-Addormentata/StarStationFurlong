@@ -196,6 +196,21 @@ describe('atlasForBundle', () => {
     expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
   });
 
+  it('leaves out a berth whose station end carries no flag when the ship\'s end does', () => {
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: {
+        roomId: 'welcome', name: 'W', lastSeen: now,
+        // An older client recorded the station's end: no flag, no dock chain.
+        doors: { 'd:1': door('hub', 'd:2'), 'd:port': { targetSeed: '', targetRoomId: 'ship' } },
+      },
+      hub: { roomId: 'hub', name: 'H', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+      ship: { roomId: 'ship', name: 'SHIP', doors: { 'd:dock': { targetSeed: '', targetRoomId: 'welcome', transient: true } }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['hub', 'welcome']);
+    expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
+  });
+
   it('leaves out a dock recorded before the berth flag existed', () => {
     const dock = [{ kind: 'dock' as const }, { kind: 'dock' as const }];
     const atlas: Record<string, AtlasEntry> = {
