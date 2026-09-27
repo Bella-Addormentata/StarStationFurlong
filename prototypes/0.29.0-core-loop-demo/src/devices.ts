@@ -199,6 +199,7 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1025,6 +1026,10 @@ let mapTableMap: SolarSystemMap | null = null;
  */
 export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
   let panel: HTMLDivElement | null = null;
+  // 🚚 While the table is open, stations follow what is learned meanwhile (a
+  // move from another player, a summary pull), and a move's "departs in …"
+  // text is re-read each minute.
+  let stopLive: (() => void) | null = null;
 
   return {
     mount(host: HTMLElement): void {
@@ -1086,9 +1091,16 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
       mapTableMap.show();
+      stopLive?.();
+      const refresh = () => mapTableMap?.refreshStations(undefined, holotableStation());
+      const offSummary = subscribePlanetSummary(refresh);
+      const offMove = subscribeStationMove(refresh);
+      const tick = window.setInterval(refresh, 60_000);
+      stopLive = () => { offSummary(); offMove(); window.clearInterval(tick); stopLive = null; };
     },
 
     unmount(): void {
+      stopLive?.();
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -2815,7 +2827,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
-      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt });
     }
     if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };

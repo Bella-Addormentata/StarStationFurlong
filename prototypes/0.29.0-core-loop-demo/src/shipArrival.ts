@@ -313,9 +313,12 @@ export function completeArrival(
     return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' });
   }
   const station = findDestination(rec.locationId);
-  // 🚚 A station that left its planet while the ship was on the way has no
-  // berth in reach: the ship arrives where it was and stays undocked.
-  if (stationInTransit(station, now)) {
+  // 🚚 A station that left its planet while the ship was on the way (still
+  // between planets, or already at the new one) has no berth in reach: the
+  // ship arrives where it was headed and stays undocked.
+  const moved = station.lastMove ?? station.move;
+  const movedMidFlight = !!moved && rec.departedAt !== undefined && moved.departAt > rec.departedAt && moved.departAt <= now;
+  if (stationInTransit(station, now) || movedMidFlight) {
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
   }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });

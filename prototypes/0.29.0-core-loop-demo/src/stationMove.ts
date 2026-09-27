@@ -84,6 +84,22 @@ export function isStationMove(v: unknown): v is StationMove {
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
 }
 
+/** How far ahead a real move can be: the longest wait for a launch window
+ *  (4.3 real days between Sovereign and Aris) and the longest trip (about
+ *  two real days) each fit well inside it. */
+export const MOVE_HORIZON_MS = 7 * 24 * 3_600_000;
+
+/**
+ * Could this move have been planned by a helm at or before `nowMs`? The
+ * latest departure wins every merge, so a peer's move leaving decades from
+ * now would otherwise hold its station "moving" forever. Anything leaving
+ * past the horizon, or taking longer than it, is refused wherever a move
+ * arrives from outside (room doc, remembered list, planet summary).
+ */
+export function isPlausibleMove(m: StationMove, nowMs: number = Date.now()): boolean {
+  return m.departAt <= nowMs + MOVE_HORIZON_MS && m.arriveAt - m.departAt <= MOVE_HORIZON_MS;
+}
+
 /** Only the fields a move has — what a write publishes. */
 export function cleanMove(m: StationMove): StationMove {
   return {
@@ -496,7 +512,8 @@ export function readRememberedMoves(): StationMove[] {
     if (!raw) return [];
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    return arr.filter(isStationMove).slice(0, MAX_REMEMBERED).map(cleanMove);
+    const now = Date.now();
+    return arr.filter((m): m is StationMove => isStationMove(m) && isPlausibleMove(m, now)).slice(0, MAX_REMEMBERED).map(cleanMove);
   } catch { return []; }
 }
 
@@ -508,8 +525,8 @@ function sameStation(a: StationMove, b: StationMove): boolean {
 /** Remember a move this install has seen — from the helm room, or from the
  *  per-planet summary. A later departure for the same station replaces an
  *  earlier one; an older one is ignored. Returns whether the list changed. */
-export function rememberMove(move: StationMove): boolean {
-  if (!isStationMove(move)) return false;
+export function rememberMove(move: StationMove, nowMs: number = Date.now()): boolean {
+  if (!isStationMove(move) || !isPlausibleMove(move, nowMs)) return false;
   const list = readRememberedMoves();
   const at = list.findIndex((m) => sameStation(m, move));
   if (at >= 0) {
@@ -563,7 +580,7 @@ function docAlive(): boolean {
 export function readStationMove(): StationMove | null {
   if (!docAlive()) return null;
   const raw = keepMap!.get('move');
-  return isStationMove(raw) ? cleanMove(raw) : null;
+  return isStationMove(raw) && isPlausibleMove(raw) ? cleanMove(raw) : null;
 }
 
 /** Fuel moves have drawn in this room, whichever station the latest one

@@ -40,7 +40,7 @@ import * as Y from 'yjs';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
+import { cleanMove, isPlausibleMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
 import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -158,7 +158,7 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   if (ext) out.ext = ext;
   const trim = cleanTrim(v.trim, now);
   if (trim) out.trim = trim;
-  if (isStationMove(v.move) && v.move.welcomeRoomId === out.welcomeRoomId) out.move = cleanMove(v.move);
+  if (isStationMove(v.move) && isPlausibleMove(v.move, now) && v.move.welcomeRoomId === out.welcomeRoomId) out.move = cleanMove(v.move);
   return out;
 }
 

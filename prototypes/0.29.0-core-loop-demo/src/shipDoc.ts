@@ -255,6 +255,11 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
   // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
   // for a commander who can dock before any client settles it berthless.
   if (r.status === 'redocking' && r.etaAt !== undefined) out.etaAt = r.etaAt;
+  // … and when it left, so arrival can tell a destination that moved away
+  // mid-flight (stationMove.ts) from one that was always there.
+  if (r.status === 'redocking' && r.departedAt !== undefined && r.etaAt !== undefined && r.etaAt > r.departedAt) {
+    out.departedAt = r.departedAt;
+  }
   return out;
 }
 

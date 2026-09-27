@@ -133,6 +133,11 @@ export function moveBelongsTo(move: Pick<StationMove, 'stationId' | 'welcomeRoom
     : !move.welcomeRoomId && move.stationId === station.id;
 }
 
+/** A station's latest move, scheduled, under way or finished. */
+export function latestMoveOf(station: MovingStation): StationMove | null {
+  return moveOf(station);
+}
+
 function moveOf(station: MovingStation): StationMove | null {
   if (!moveResolver) return null;
   try {

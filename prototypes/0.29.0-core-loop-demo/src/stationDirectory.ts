@@ -19,7 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
-import { stationInTransit } from './stations';
+import { latestMoveOf, stationInTransit } from './stations';
 import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -46,6 +46,9 @@ export interface StationDestination {
   /** A move to another planet, scheduled or under way (stations.ts): while
    *  it is in transit the station is no ship's destination. */
   move?: StationMove;
+  /** Its latest move even once finished: arrival checks it against the
+   *  flight, so a ship never docks at a station that moved away meanwhile. */
+  lastMove?: StationMove;
 }
 
 /** The seam: whatever knows the stations. */
@@ -231,6 +234,8 @@ export function destinationsFromRecords(
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
       ...(r.move ? { move: r.move } : {}),
     };
+    const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
+    if (last) out.lastMove = last;
     // A public berth needs its door: DOCK only asks the far room (and so
     // only proves a port is there) when it knows the far door. Without one
     // the ship's own berth memory decides, or arrival reports no berth. A

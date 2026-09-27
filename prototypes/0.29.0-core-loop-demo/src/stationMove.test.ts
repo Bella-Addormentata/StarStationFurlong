@@ -19,7 +19,9 @@ import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeOrbitTr
 import {
   TUG_ACCEL_KMS2,
   TUG_MIN_ENGINES,
+  MOVE_HORIZON_MS,
   bindStationMoveDoc,
+  isPlausibleMove,
   cleanMove,
   freeSlotAround,
   isTowing,
@@ -214,6 +216,18 @@ describe('the record in the room doc and on this install', () => {
     const move = moveTo();
     for (let i = 0; i < 64; i++) rememberMove({ ...move, stationId: `s${i}`, welcomeRoomId: `w${i}` });
     expect(readRememberedMoves()).toHaveLength(64);
+  });
+
+  it('refuses a move leaving or lasting past the horizon, wherever it comes from', () => {
+    const move = moveTo();
+    const far = { ...move, departAt: NOW + MOVE_HORIZON_MS + 1, arriveAt: NOW + MOVE_HORIZON_MS + 2 };
+    expect(isPlausibleMove(move, NOW)).toBe(true);
+    expect(isPlausibleMove(far, NOW)).toBe(false);
+    expect(isPlausibleMove({ ...move, arriveAt: move.departAt + MOVE_HORIZON_MS + 1 }, NOW)).toBe(false);
+    expect(rememberMove(far, NOW)).toBe(false);
+    expect(readRememberedMoves()).toEqual([]);
+    const summary = cleanStationSummary({ ...summaryForStation(ctx().station!, null, NOW), move: far }, NOW);
+    expect(summary?.move).toBeUndefined();
   });
 
   it('remembers a move a peer wrote into the room', () => {

@@ -332,6 +332,34 @@ describe('a round trip', () => {
     expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
   });
 
+  it('stays undocked at a station that finished moving to another planet before the ship arrived', () => {
+    const now = Date.now();
+    const departedAt = now - 600_000;
+    // Left after the ship did, and already arrived: the listing has dropped
+    // `move`, and only `lastMove` remembers it.
+    const lastMove = {
+      stationId: 'high-orbit', welcomeRoomId: HIGH_ROOM, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: departedAt + 1000, arriveAt: now - 1000,
+      mode: 'tug' as const, tugRoomId: 'tug', fuel: 1, fuelDrawn: 0,
+    };
+    const berth = { address: SEED_HIGH, farDoor: 'd:a3313fdd', farWall: 'x-' as const };
+    setStationDirectory({ stations: () => [...DEFAULT_STATIONS.slice(0, 1), { ...DEFAULT_STATIONS[1], berth, lastMove }] });
+    const docking = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', docking);
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    // A move finished before the ship left is just where the station is now.
+    setStationDirectory({ stations: () => [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth, lastMove: { ...lastMove, departAt: departedAt - 5000, arriveAt: departedAt - 1000 } },
+    ] });
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    expect(completeArrival(docking, { now, force: true })).toEqual({ kind: 'docking', stationName: 'High Orbit' });
+  });
+
   it('does nothing unless the ship is redocking, and only once', () => {
     const docking = fakeDocking(['north']);
     expect(completeArrival(docking)).toBeNull();
