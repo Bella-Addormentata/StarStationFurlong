@@ -202,10 +202,12 @@ export function planRecordHop(
   if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
-  // Nor one whose window overlaps a scheduled move at either end: the
-  // station would be gone by the time the ship arrives (or leaves).
-  const clashes = (m: StationMove | undefined) => !!m && m.departAt <= t.arriveAt && m.arriveAt > t.departAt;
-  if (clashes(from.move) || clashes(to.move)) return null;
+  // Nor one with a move under way (or coming) while either end must hold
+  // still: the source until the ship leaves, the destination until it
+  // arrives. A move that starts at the source after the burn is no concern of
+  // this hop; one that lands before it would leave the plan on the old orbit.
+  const movesWithin = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs;
+  if (movesWithin(from.move, t.departAt) || movesWithin(to.move, t.arriveAt)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,

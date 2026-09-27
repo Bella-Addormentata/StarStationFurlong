@@ -184,6 +184,22 @@ describe('the station list follows a move', () => {
     expect(planRecordHop(home, other, justBefore)).toBeNull();
   });
 
+  it('lets a ship leave a station that only moves after the ship has left', () => {
+    const other: StationRecord = { id: 'yard', name: 'YARD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'y' };
+    const early = moveTo().departAt - 10 * 3_600_000;
+    const hop = planRecordHop({ ...DEFAULT_STATION_RECORD }, other, early)!;
+    expect(hop).not.toBeNull();
+    // The source leaves after the burn (still inside the flight): fine.
+    const later: StationMove = { ...moveTo(), departAt: hop.departAt + 1, arriveAt: hop.departAt + 3_600_000 };
+    expect(planRecordHop({ ...DEFAULT_STATION_RECORD, move: later }, other, early)).not.toBeNull();
+    // The source is still on its way to its new orbit at the burn: refused.
+    const landing: StationMove = { ...later, departAt: early - 1000, arriveAt: hop.departAt - 1 };
+    expect(planRecordHop({ ...DEFAULT_STATION_RECORD, move: landing }, other, early)).toBeNull();
+    // The destination leaves before the ship arrives: refused.
+    expect(planRecordHop({ ...DEFAULT_STATION_RECORD }, { ...other, move: { ...later, stationId: 'yard', welcomeRoomId: 'y' } }, early))
+      .toBeNull();
+  });
+
   it('keeps a station listed when its move lands on a full planet', () => {
     const move = moveTo();
     setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
