@@ -330,6 +330,10 @@ describe('saved records', () => {
     expect(registerStation({ ...base, id: 'planet-sovereign' })).toBe(false);
     expect(registerStation({ ...base, id: 'belt-ring' })).toBe(false);
     expect(registerStation({ ...base, id: 'station:yard-a' })).toBe(false);
+    expect(registerStation({ ...base, berthDoor: 'not a door' })).toBe(false); // doorsDoc would drop it
+    expect(readStationRecords()).toEqual([]);
+    expect(registerStation({ ...base, berthDoor: 'd:3' })).toBe(true);
+    store.set('ssf-stations', JSON.stringify([{ ...base, berthDoor: 'not a door' }]));
     expect(readStationRecords()).toEqual([]);
   });
 

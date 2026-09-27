@@ -460,6 +460,24 @@ describe('transient berths (a visiting ship\'s dock)', () => {
     expect(published.doors['d:gangway'].transient).toBe(false);
   });
 
+  it('count a harvested dock chain as a berth, whatever its record\'s flag says', () => {
+    harvestIntoAtlas({
+      roomId: 'module-self',
+      name: 'SELF',
+      doors: [{
+        doorId: 'd:dock',
+        targetSeed: 'ssf://x#room=module-ship',
+        segments: [{ kind: 'dock' }, { kind: 'dock' }],
+        transient: false,
+      }],
+    });
+    expect(readAtlas()['module-self'].doors['d:dock'].transient).toBe(true);
+    bind('module-self');
+    pushAtlasToDoc();
+    const published = doc.getMap('atlas').get('module-self') as { doors: Record<string, { transient?: boolean }> };
+    expect(published.doors['d:dock'].transient).toBe(true);
+  });
+
   it('survive gossip from an older client that never sends the flag', () => {
     store.set('ssf-station-atlas', JSON.stringify({
       'module-peer': {

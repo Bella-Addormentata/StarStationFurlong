@@ -3340,6 +3340,11 @@ function harvestStationAtlas(): void {
         farLateral: r.farLateral,
         farYawDeg: r.farYawDeg,
         // ⚓ A visiting ship's berth: drawn from space, never station structure.
+        // This room's own live record is the truth, and doorsDoc keeps the
+        // flag only when true, so an absent one here is a KNOWN non-berth:
+        // publishing false is what clears a stale marker from a door re-paired
+        // as structure. A dock chain counts as a berth either way
+        // (harvestIntoAtlas).
         transient: r.transient === true,
         ...(pose
           ? {
