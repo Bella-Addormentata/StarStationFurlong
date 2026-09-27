@@ -571,7 +571,8 @@ export function listStations(
  * station, free or docked) together with the gates the record learned in
  * rooms the atlas has not harvested, else its plain berthDoor. A record
  * naming no berthDoor gets the lowest gate in its welcome room as one, for
- * builds that read only that.
+ * builds that read only that; once the welcome room's gates are known, a
+ * berthDoor that is not one of them is replaced the same way, or dropped.
  */
 function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): StationRecord {
   const gates = stationGates(atlas, st.welcomeRoomId);
@@ -603,9 +604,15 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
   }
   const out: StationRecord = { ...st };
   if (berths.length > 0 || knownNone) out.berths = berths; else delete out.berths;
-  if (!out.berthDoor) {
-    const inWelcome = berths.find((b) => b.roomId === st.welcomeRoomId);
-    if (inWelcome) out.berthDoor = inWelcome.doorId;
+  const inWelcome = berths.filter((b) => b.roomId === st.welcomeRoomId);
+  if (st.welcomeRoomId && !unknown(st.welcomeRoomId)) {
+    // The welcome room's gates are known: a berthDoor that is no longer one of
+    // them is stale, so it gives way to the lowest gate there, or to none.
+    if (!inWelcome.some((b) => b.doorId === out.berthDoor)) {
+      if (inWelcome.length > 0) out.berthDoor = inWelcome[0].doorId; else delete out.berthDoor;
+    }
+  } else if (!out.berthDoor && inWelcome.length > 0) {
+    out.berthDoor = inWelcome[0].doorId;
   }
   return out;
 }

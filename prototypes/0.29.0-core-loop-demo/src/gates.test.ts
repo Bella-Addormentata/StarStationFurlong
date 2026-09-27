@@ -24,6 +24,7 @@ import {
   harvestIntoAtlas,
   readAtlas,
   stationGates,
+  withSharedAtlasOf,
 } from './stationAtlas';
 import { listStations, registerStation } from './stations';
 import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
@@ -205,6 +206,34 @@ describe('gate gossip that doors alone would skip', () => {
   });
 });
 
+describe("a far room doc's shared atlas", () => {
+  const entry = (roomId: string, updatedAt: number, doors: Record<string, unknown>, gates?: Record<string, number>) => ({
+    roomId, name: roomId, updatedAt, doors, ...(gates ? { gates } : {}),
+  });
+
+  it("walks the far room's station however many other entries the doc holds", () => {
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    for (let i = 0; i < 300; i++) shared.set(`other-${String(i).padStart(3, '0')}`, entry(`other-${String(i).padStart(3, '0')}`, 1, {}));
+    shared.set('far-dock', entry('far-dock', 5, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
+    shared.set('far-hub', entry('far-hub', 5, { 'd:in': { targetRoomId: 'far-dock', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1, 'd:p2': 2 }));
+    const atlas = withSharedAtlasOf(doc, readAtlas(), 'far-dock');
+    expect(freeGateNumber(atlas, 'far-dock', {})).toBe(3);
+    // Only that station is read.
+    expect(atlas['other-000']).toBeUndefined();
+  });
+
+  it("takes the doc's gates for a known room when the doc's copy is newer", () => {
+    harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: { 'd:p1': 1 } });
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-hub', entry('room-hub', Date.now() + 60_000, {}, { 'd:p1': 1, 'd:p2': 2 }));
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'].gates).toEqual({ 'd:p1': 1, 'd:p2': 2 });
+    // An older copy leaves what this client saw alone.
+    doc.getMap('atlas').set('room-hub', entry('room-hub', 1, {}, { 'd:p9': 9 }));
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'].gates).toEqual({ 'd:p1': 1 });
+  });
+});
+
 describe('the station record', () => {
   it('lists the station\'s gates as its berths, and names the lowest welcome-room gate as berthDoor', () => {
     twoRoomStation();
@@ -216,6 +245,14 @@ describe('the station record', () => {
       { roomId: 'room-b', doorId: 'east', gate: 3 },
     ]);
     expect(hub.berthDoor).toBe('south');
+  });
+
+  it('replaces a berthDoor that is no longer a welcome-room gate, and drops it when there are none', () => {
+    registerStation({ id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'north' });
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: { east: 6, south: 4 } });
+    expect(listStations().find((s) => s.id === 'far')?.berthDoor).toBe('south');
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: {} });
+    expect(listStations().find((s) => s.id === 'far')?.berthDoor).toBeUndefined();
   });
 
   it('keeps a learned berth list for a station this install has not mapped, and reads berthDoor as one berth', () => {
