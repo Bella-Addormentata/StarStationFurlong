@@ -46,7 +46,7 @@ import { readFlightRecord, shipDocBound } from './shipDoc';
 import { adriftPlace } from './stationDirectory';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
-import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
@@ -108,7 +108,9 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
   if (!id) return undefined;
   const station = all.find((s) => s.id === id);
   if (station) {
-    const latest = station.move;
+    // The remembered move, not the record's: listStations drops a move once
+    // it has arrived, and a ship that left before it still flies the old orbit.
+    const latest = latestMoveOf(station) ?? station.move;
     const moved = !latest ? undefined
       : !latest.settles ? latest
       : latest.departAt < latest.settles.arriveAt ? undefined
