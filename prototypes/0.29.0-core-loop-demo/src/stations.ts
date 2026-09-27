@@ -112,6 +112,10 @@ export interface StationMove {
    *  only booked once the last has arrived, so two moves are concurrent
    *  exactly when each was booked before the other arrived. */
   bookedAt?: number;
+  /** On a pin (stationMove.pinSettledArrival): the move it settles. The pin
+   *  ranks as that move, just after it, so a pin of a move that lost to a
+   *  concurrent one loses with it. */
+  settles?: StationMove;
   /** Propellant the move burns. */
   fuel: number;
   /** The tank's draw meter after paying for it (shipDoc.setFuelDrawMeter). */
