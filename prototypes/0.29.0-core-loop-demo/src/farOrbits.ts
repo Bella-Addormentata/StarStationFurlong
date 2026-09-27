@@ -151,8 +151,11 @@ export interface FarLayout {
 /** Points along a course between two times (inclusive), `n` segments. */
 export function sampleCourse(at: (ms: number) => FramePoint, fromMs: number, toMs: number, n = 64): FramePoint[] {
   const out: FramePoint[] = [];
-  if (!(toMs > fromMs)) return out;
-  for (let i = 0; i <= n; i++) out.push(at(fromMs + ((toMs - fromMs) * i) / n));
+  // Flight times come from peers: refuse a span that is empty or not finite,
+  // and step by a bounded fraction so no sample time can overflow.
+  const span = toMs - fromMs;
+  if (!Number.isFinite(span) || !(span > 0)) return out;
+  for (let i = 0; i <= n; i++) out.push(at(fromMs + span * (i / n)));
   return out;
 }
 

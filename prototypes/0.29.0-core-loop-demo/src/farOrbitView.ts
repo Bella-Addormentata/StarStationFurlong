@@ -49,6 +49,10 @@ import type { StationMove, StationRecord } from './stations';
 export const SKY_LAYER = 1;
 /** Names renderer.ts gives the sky objects. */
 const SKY_NAMES = new Set(['nebula-sky', 'nebula-stars']);
+/** world.ts's older planet backdrops (the one seen through room windows and
+ *  the outdoor deck's overhead planet): hidden while the far pass draws the
+ *  real planet, or they would sit on top of it. */
+const OLD_PLANET_NAMES = ['ambientPlanet', 'ambientPlanetGlow', 'deckPlanet'];
 
 /** How far behind the viewer the far camera sits, in compressed km. Frames
  *  the nearest rings and the planet's limb around the station. */
@@ -234,6 +238,8 @@ let sunLight: THREE.DirectionalLight | null = null;
 let source: Source | null = null;
 let builtKey = '';
 let lastRefresh = 0;
+/** OLD_PLANET_NAMES found in the scene, re-found after a refresh. */
+let oldPlanets: THREE.Object3D[] | null = null;
 /** Screen-sized objects: body id → [object, px per local unit]. */
 const bodies = new Map<string, { obj: THREE.Object3D; px: number }>();
 
@@ -492,6 +498,7 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
 export function setFarPassActive(on: boolean): void {
   active = on;
   source = null;
+  oldPlanets = null;
   if (!on) clearFrame();
 }
 
@@ -499,6 +506,7 @@ export function setFarPassActive(on: boolean): void {
  *  changed). */
 export function refreshFarPass(): void {
   source = null;
+  oldPlanets = null;
 }
 
 /** The frame's render: one plain render, or sky → far pass → station while
@@ -512,6 +520,12 @@ export function renderWithFarPass(
     renderer.render(scene, camera);
     return;
   }
+  if (!oldPlanets || oldPlanets.some((o) => !o.parent)) {
+    oldPlanets = OLD_PLANET_NAMES.map((n) => scene.getObjectByName(n)).filter((o): o is THREE.Object3D => !!o);
+  }
+  const hidden = oldPlanets;
+  const hiddenShown = hidden.map((o) => o.visible);
+  for (const o of hidden) o.visible = false;
   const sky = scene.children.filter((o) => SKY_NAMES.has(o.name));
   for (const o of sky) o.layers.enable(SKY_LAYER);
   const shown = sky.map((o) => o.visible);
@@ -537,6 +551,7 @@ export function renderWithFarPass(
   } finally {
     scene.background = background;
     sky.forEach((o, i) => { o.visible = shown[i]; });
+    hidden.forEach((o, i) => { o.visible = hiddenShown[i]; });
     camera.layers.mask = cameraLayers;
     renderer.autoClear = true;
   }
