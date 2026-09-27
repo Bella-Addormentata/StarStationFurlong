@@ -98,6 +98,10 @@ const MAX_RECORDS = 32;
 /** Prefix of derived station ids — never accepted on a saved record. */
 const DERIVED_PREFIX = 'station:';
 
+/** Length limits on every station id and name, saved or derived. */
+const MAX_ID_LENGTH = 128;
+const MAX_NAME_LENGTH = 64;
+
 /** Solar-map body ids a station may not take (map.ts initializeBodies): a
  *  station sharing an id with a planet would confuse selection and travel. */
 const RESERVED_BODY_IDS = new Set([
@@ -107,9 +111,9 @@ const RESERVED_BODY_IDS = new Set([
 function isRecord(v: unknown): v is StationRecord {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Record<string, unknown>;
-  return typeof r.id === 'string' && r.id.length > 0 && r.id.length <= 128
+  return typeof r.id === 'string' && r.id.length > 0 && r.id.length <= MAX_ID_LENGTH
     && !r.id.startsWith(DERIVED_PREFIX) && !RESERVED_BODY_IDS.has(r.id)
-    && typeof r.name === 'string' && r.name.length > 0 && r.name.length <= 64
+    && typeof r.name === 'string' && r.name.length > 0 && r.name.length <= MAX_NAME_LENGTH
     && typeof r.planetId === 'string'
     && Number.isInteger(r.orbitSlot) && (r.orbitSlot as number) >= 0 && (r.orbitSlot as number) < MAX_ORBIT_SLOTS
     && typeof r.welcomeRoomId === 'string' && r.welcomeRoomId.length > 0
@@ -207,13 +211,18 @@ export function listStations(
     out.push({ ...r, orbitSlot: slot });
   }
 
+  // Atlas ids and names can arrive from peers unbounded, so derived records
+  // get the same limits a saved record must meet: an over-long room id cannot
+  // anchor a station, and names are cut to length.
   const derived: Array<{ anchor: string; name: string }> = [];
   components.forEach((component, i) => {
     if (places.has(`component:${i}`)) return;
-    const known = [...component].filter((rid) => atlas[rid]).sort();
+    const known = [...component]
+      .filter((rid) => atlas[rid] && DERIVED_PREFIX.length + rid.length <= MAX_ID_LENGTH)
+      .sort();
     const anchor = known[0];
     if (!anchor) return;
-    derived.push({ anchor, name: atlas[anchor].name || 'STATION' });
+    derived.push({ anchor, name: (atlas[anchor].name || 'STATION').slice(0, MAX_NAME_LENGTH) });
   });
   derived.sort((a, b) => (a.anchor < b.anchor ? -1 : a.anchor > b.anchor ? 1 : 0));
   for (const d of derived) {

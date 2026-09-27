@@ -697,12 +697,20 @@ export class SolarSystemMap {
     current: StationRecord | null = currentStation(),
   ) {
     this.bodies = [...this.bodies.filter((b) => b.type !== 'station'), ...stationBodies(stations)];
+    // Location FIRST: the selection repaint below reads it for the travel
+    // button ("YOU ARE HERE" belongs to the station we are in now).
+    if (!this.travelDestination && current) {
+      this.playerLocationId = current.id;
+      if (this.container) {
+        const playerLocEl = document.getElementById('map-player-loc');
+        if (playerLocEl) playerLocEl.textContent = current.name;
+      }
+    }
     // Rebind the selection to the refreshed body (a station may have been
     // renamed or moved since); drop it when the station is gone.
     const fresh = this.selectedBody && this.bodies.find((b) => b.id === this.selectedBody!.id);
     this.selectedBody = fresh || null;
     if (fresh && this.container) this.selectBody(fresh);
-    if (!this.travelDestination && current) this.playerLocationId = current.id;
   }
 
   /** The station bodies now on the map, planet by planet (test/debug view). */

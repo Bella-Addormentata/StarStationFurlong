@@ -94,6 +94,14 @@ describe('atlas components', () => {
     expect(stationForRoom('a2', atlas)?.id).toBe('station:a1');
   });
 
+  it('holds derived stations to the saved-record limits on ids and names', () => {
+    const longId = `r${'x'.repeat(200)}`;
+    const atlas = atlasOf(room(longId), room('ok', [], 'N'.repeat(500)));
+    const derived = listStations(atlas, []).filter((st) => st.derived);
+    expect(derived.map((st) => st.id)).toEqual(['station:ok']);
+    expect(derived[0].name).toHaveLength(64);
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });
@@ -261,6 +269,29 @@ describe('solar map station bodies', () => {
     const b = screenOffset(Math.PI / 2, 10);
     expect(a.dx).toBeCloseTo(10, 12);
     expect(b.dy).toBeCloseTo(-10, 12); // up the screen (canvas y grows downward)
+  });
+
+  it('updates "you are here" before repainting a kept selection', () => {
+    const els = new Map<string, { style: Record<string, string>; textContent: string; innerHTML: string; disabled?: boolean }>();
+    (globalThis as { document?: unknown }).document = {
+      getElementById: (id: string) => {
+        if (!els.has(id)) els.set(id, { style: {}, textContent: '', innerHTML: '' });
+        return els.get(id);
+      },
+    };
+    try {
+      const atlas = twoStations();
+      const stations = listStations(atlas, []);
+      const map = new SolarSystemMap();
+      (map as unknown as { container: unknown }).container = {}; // mounted, for the repaint path
+      map.refreshStations(stations, stationForRoom('lounge', atlas, stations));
+      (map as unknown as { selectedBody: unknown }).selectedBody = stationBodies(stations)[0]; // Furlong
+      map.refreshStations(stations, stationForRoom('yard-b', atlas, stations));
+      expect(els.get('map-player-loc')?.textContent).toBe('YARD-A');
+      expect(els.get('map-travel-btn')?.textContent).toBe('TRAVEL TO FURLONG LOBBY STATION');
+    } finally {
+      delete (globalThis as { document?: unknown }).document;
+    }
   });
 
   it('defaults to Furlong as the player location, as before', () => {

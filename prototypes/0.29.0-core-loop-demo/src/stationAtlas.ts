@@ -411,10 +411,11 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
 
 // ── 🪐 Connected components — what a STATION is ──────────────────────────────
 //
-// No station record is stored anywhere: a station is the set of rooms joined
-// by door pairings. These walks are the one definition of that set, shared by
-// the default-station export (defaultStation.atlasForBundle) and the station
-// registry (stations.ts). Edges are walked both ways — a pairing recorded on
+// Which rooms make up a station is never stored: a station is the set of
+// rooms joined by door pairings. These walks are the one definition of that
+// set, shared by the default-station export (defaultStation.atlasForBundle)
+// and the station registry (stations.ts), whose records — name, planet,
+// orbit — sit on top of these components. Edges are walked both ways — a pairing recorded on
 // either side joins the two rooms — and a door may name a room the atlas holds
 // no entry for (a neighbour we only heard about); that room still belongs.
 // TRANSIENT berths are not structure and join nothing: a visiting ship is not
