@@ -21,6 +21,7 @@
 
 import { stampAfter, type DockPortState } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
+import { roomIdFromSeed } from './stationAtlas';
 import {
   findDestination,
   readFlightRecord,
@@ -28,8 +29,9 @@ import {
   writeFlightRecord,
   writeStationBerth,
   type BerthMemoryRecord,
+  type FlightRecord,
 } from './shipDoc';
-import type { StationBerth, StationDestination } from './stationDirectory';
+import { stationHere, type StationBerth, type StationDestination } from './stationDirectory';
 
 /** The slice of a dock port the planner reads (docking.ts DockPortView). */
 export interface ArrivalPort {
@@ -69,9 +71,18 @@ export function planArrivalDock(input: {
   now?: number;
 }): ArrivalPlan {
   const { station, remembered, ports } = input;
-  const berth: StationBerth | null = station.berth ?? remembered;
+  // The station's berth wins; the ship's own memory fills in when the station
+  // names none, or names the same room without saying which door (the memory
+  // knows the door and its geometry — a dock that can ask the far side).
+  const stationBerth = station.berth ?? null;
+  const berth: StationBerth | null =
+    remembered &&
+    (!stationBerth ||
+      (!stationBerth.farDoor && sameRoom(stationBerth.address, remembered.address)))
+      ? remembered
+      : stationBerth;
   if (!berth) return { kind: 'none', reason: 'no-berth' };
-  if (ports.some((p) => p.state.kind === 'docked' && p.state.address === berth.address)) {
+  if (ports.some((p) => p.state.kind === 'docked' && sameRoom(p.state.address, berth.address))) {
     return { kind: 'none', reason: 'already-docked' };
   }
   const open = (p: ArrivalPort) => p.state.kind === 'undocked' || p.state.kind === 'free';
@@ -81,7 +92,7 @@ export function planArrivalDock(input: {
   const st = port.state;
   if (
     st.kind === 'undocked' &&
-    st.address === berth.address &&
+    sameRoom(st.address, berth.address) &&
     (berth.farDoor === undefined || st.memory.farDoor === berth.farDoor)
   ) {
     return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: null };
@@ -93,6 +104,27 @@ export function planArrivalDock(input: {
   if (berth.farWall !== undefined) memory.farWall = berth.farWall;
   if (berth.farLateral !== undefined) memory.farLateral = berth.farLateral;
   return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: memory };
+}
+
+/**
+ * Where the ship is. While it sits docked into a station, its docks say so
+ * (the directory's `here`) — a ship docked by hand at a new station is AT that
+ * station, whatever the last flight wrote. Otherwise the flight record's
+ * location stands.
+ */
+export function shipLocationId(rec: FlightRecord, hasLiveDock: boolean): string {
+  if (rec.status === 'docked' && hasLiveDock) {
+    const here = stationHere();
+    if (here) return here;
+  }
+  return rec.locationId;
+}
+
+/** Two pass seeds reach the same room (a seed's hints may differ). */
+function sameRoom(a: string, b: string): boolean {
+  if (a === b) return true;
+  const ra = roomIdFromSeed(a);
+  return ra !== '' && ra === roomIdFromSeed(b);
 }
 
 /** The berth to remember at the station being left: the first docked port. */

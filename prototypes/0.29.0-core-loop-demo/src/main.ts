@@ -154,7 +154,15 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
-import { listStations, registerStation, removeStation, setStationRoomSource } from "./stations";
+import {
+  listStations,
+  registerStation,
+  removeStation,
+  setStationRoomSource,
+  stationForRoom,
+} from "./stations";
+// 🛰️ #30 SH3: ship destinations read the station record through this seam.
+import { directoryFromStationRecords, setStationDirectory } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1656,6 +1664,20 @@ async function joinRoomAtEpoch(
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🪐 …and the station registry's "which station am I in" (holotable).
     setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
+    // station's berth is its welcome room, dockable when this client holds a
+    // seed for it — the atlas's, or the build's own pass for the default one.
+    setStationDirectory(
+      directoryFromStationRecords(
+        () => listStations(),
+        (roomId) =>
+          readAtlas()[roomId]?.seed ??
+          (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
+            ? DEFAULT_STATION.welcomeRoomLink
+            : undefined),
+        () => stationForRoom(activeBootstrap?.roomId ?? "")?.id ?? null,
+      ),
+    );
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1686,12 +1708,13 @@ async function joinRoomAtEpoch(
     // 🚀 #30 SH2/SH3: the helm's writes are owner-gated at the UI. Same seam
     // as the exterior owner check — dev-phase honest-client posture (signed
     // enforcement lives in a later slice, plan §7 SH5).
-    setHelmOwnerCheck(() => {
+    const isHelmCommander = (): boolean => {
       const ownerVal =
         (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
         "";
       return isLocalPlayerRoomOwner(ownerVal);
-    });
+    };
+    setHelmOwnerCheck(isHelmCommander);
     // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
     // ticks the countdown while open, but a flight must complete even if no
     // one has the panel up — otherwise a `in-flight` record with a past
@@ -1702,10 +1725,7 @@ async function joinRoomAtEpoch(
     // arrival-latency ceiling of ~1 second is imperceptible next to the
     // 60–90 s minimum travel time.
     window.setInterval(() => {
-      const ownerVal =
-        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-        "";
-      if (!isLocalPlayerRoomOwner(ownerVal)) return;
+      if (!isHelmCommander()) return;
       const rec = readFlightRecord();
       if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
         const dest = rec.destinationId
@@ -3184,6 +3204,8 @@ function resolveOwnerLabel(owner: string): string {
  *    · docking + door policy .. dockingSystem.onOwnerCheck
  *    · the room-NAME editor ... the roomInfo 'name' write
  *    · the exterior view ...... setExteriorOwnerCheck
+ *    · the ship's helm ........ setHelmOwnerCheck (REFUEL / DEPART / arrival —
+ *      "if you could rearrange the furniture, you can fly the ship", plan §6)
  *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
  *
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:

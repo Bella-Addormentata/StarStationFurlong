@@ -50,6 +50,7 @@ import { destinationsFrom } from './stationDirectory';
 import {
   castOffForDeparture,
   completeArrival,
+  shipLocationId,
   type ArrivalOutcome,
   type ShipDockingApi,
 } from './shipArrival';
@@ -1966,6 +1967,12 @@ function enumerateChainedDoors(): string[] {
   return out;
 }
 
+/** Does any door of this room hold a live connection right now? */
+function hasLiveDock(): boolean {
+  for (const [, rec] of readAllDoors()) if (rec.paired === true) return true;
+  return false;
+}
+
 /** Enumerate the room's TRANSIENT guest-berths — a paired berth that IS a
  *  transient (#67 D2). DEPART iterates these and calls deleteDoorPairing on
  *  each so the station is "cast off" before the state advances to in-flight
@@ -2126,7 +2133,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const now = Date.now();
     const arrived = flightArrived(flight, now);
     const progress = flightProgress(flight, now);
-    const location = findDestination(flight.locationId);
+    const location = findDestination(shipLocationId(flight, hasLiveDock()));
     const destination = flight.destinationId ? findDestination(flight.destinationId) : null;
     const choices = destinationsFrom(location.id);
     if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
@@ -2323,6 +2330,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
       const nowFuel = clampFuelToCapacity(readFuelLevel(), nowCapacity);
       const nowFlight = readFlightRecord();
+      const fromId = shipLocationId(nowFlight, hasLiveDock());
       const destId = pickerDestId ?? '';
       const nowRefusal = canDepart({
         flightCapable: isShipReady(),
@@ -2331,14 +2339,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         destinationId: destId,
         chainedDoors: enumerateChainedDoors(),
         ownerAuthorized: helmIsCommander(),
-        locationId: nowFlight.locationId,
+        locationId: fromId,
       });
       if (!nowRefusal.ok) { render(); return; }
       const dest = findDestination(destId);
       // 1) Cast off: remember this berth, UNDOCK every docked port (shipped
       //    UNDOCK — tombstone + far-room write), then detach any other
       //    transient guest berth (#67 D2, either-side legal).
-      if (shipDocking) castOffForDeparture(nowFlight.locationId, shipDocking);
+      if (shipDocking) castOffForDeparture(fromId, shipDocking);
       for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
       // 2) Debit the fuel cost.
       writeFuelLevel(nowFuel - dest.fuelCost, nowCapacity);
@@ -2346,7 +2354,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const start = Date.now();
       writeFlightRecord({
         status: 'in-flight',
-        locationId: nowFlight.locationId,
+        locationId: fromId,
         destinationId: dest.id,
         departedAt: start,
         etaAt: start + Math.max(1, dest.travelMs),

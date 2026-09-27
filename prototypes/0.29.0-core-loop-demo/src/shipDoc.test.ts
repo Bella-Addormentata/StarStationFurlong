@@ -714,3 +714,29 @@ describe('shipDoc convergence', () => {
     docB.destroy();
   });
 });
+
+// ── #30 SH3: destinations are other stations around the same planet ─────────
+
+describe('canDepart — where the ship is', () => {
+  const base = {
+    flightCapable: true,
+    currentStatus: 'docked' as const,
+    currentFuel: 100,
+    chainedDoors: [] as string[],
+    ownerAuthorized: true,
+  };
+
+  it('refuses a hop to the station the ship is already at', () => {
+    expect(canDepart({ ...base, destinationId: HOME.id, locationId: HOME.id }))
+      .toEqual({ ok: false, reason: 'already-here' });
+  });
+
+  it('allows a hop to another station around the same planet', () => {
+    expect(canDepart({ ...base, destinationId: HIGH_ORBIT.id, locationId: HOME.id })).toEqual({ ok: true });
+  });
+
+  it('refuses a station the directory does not list', () => {
+    expect(canDepart({ ...base, destinationId: 'nowhere', locationId: HOME.id }))
+      .toEqual({ ok: false, reason: 'unknown-destination' });
+  });
+});
