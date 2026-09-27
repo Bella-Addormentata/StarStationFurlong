@@ -11,7 +11,7 @@
  * Flick the stick (drag the knob past its ring and let go), press a button,
  * or focus the stick and use the arrow keys. Each is ONE discrete burn
  * (stationKeeping.planTrim); everything else on the dashboard is derived
- * from the trim record and the clock.
+ * from the room's burns and the clock.
  *
  * The STATION KEEPING BOX draws the station against its slot: the crosshair
  * is where the slot's orbit puts it, across is along the orbit (behind /
@@ -31,7 +31,7 @@ import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
 import { realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
-import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFuelLevel, subscribeShip } from './shipDoc';
+import { TANK_CAPACITY, clampFuelToCapacity, readFuelLevel, subscribeShip } from './shipDoc';
 import type { StationRecord } from './stations';
 import {
   MAX_TRIM_KM,
@@ -52,7 +52,7 @@ import {
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
-  writeOrbitTrim,
+  writeTrimBurn,
 } from './stationKeeping';
 import type { OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
 
@@ -295,7 +295,6 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
-      deficit: fuelDrawDeficit(),
       now: Date.now(),
       tanks,
       capacity,
@@ -381,7 +380,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       return;
     }
     flash = null;
-    writeOrbitTrim(plan.trim);
+    writeTrimBurn(plan.burn);
     refresh();
   };
 
