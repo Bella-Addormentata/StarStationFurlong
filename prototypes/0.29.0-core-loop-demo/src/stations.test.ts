@@ -102,6 +102,12 @@ describe('atlas components', () => {
     expect(derived[0].name).toHaveLength(64);
   });
 
+  it('names a derived station STATION when its anchor room\'s name is not a string', () => {
+    const atlas = atlasOf(room('odd'));
+    (atlas.odd as unknown as { name: unknown }).name = 42;
+    expect(listStations(atlas, []).find((st) => st.derived)?.name).toBe('STATION');
+  });
+
   it('treats a dock recorded before the berth flag existed as a berth too', () => {
     // An upgrade: persisted (or older-client) entries carry the dock chain but
     // no flag — and a dock is always transient.

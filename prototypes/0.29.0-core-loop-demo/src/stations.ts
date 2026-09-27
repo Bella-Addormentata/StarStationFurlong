@@ -226,7 +226,9 @@ export function listStations(
       .sort();
     const anchor = known[0];
     if (!anchor) return;
-    derived.push({ anchor, name: (atlas[anchor].name || 'STATION').slice(0, MAX_NAME_LENGTH) });
+    // A room name is peer-written and not shape-checked on every path.
+    const name: unknown = atlas[anchor].name;
+    derived.push({ anchor, name: (typeof name === 'string' && name ? name : 'STATION').slice(0, MAX_NAME_LENGTH) });
   });
   derived.sort((a, b) => (a.anchor < b.anchor ? -1 : a.anchor > b.anchor ? 1 : 0));
   for (const d of derived) {
