@@ -23,6 +23,7 @@ import {
   type StationDestination,
 } from './stationDirectory';
 import { planTransfer } from './orbits';
+import { isFlightRecord } from './shipDoc';
 
 afterEach(() => setStationDirectory(null));
 
@@ -143,13 +144,30 @@ describe('planning a hop', () => {
     const now = Date.UTC(2026, 8, 27);
     const hop = planHop('low', 'high', now)!;
     const t = planTransfer(records[0], records[1], now)!;
-    expect(hop.departAt).toBe(t.departAt);
-    expect(hop.arriveAt).toBe(t.arriveAt);
+    // Whole milliseconds, rounded up (a flight record stores only those).
+    expect(hop.departAt).toBe(Math.ceil(t.departAt));
+    expect(hop.arriveAt).toBe(Math.ceil(t.arriveAt));
     expect(hop.departAt).toBeGreaterThanOrEqual(now);
     expect(hop.fuelCost).toBe(Math.ceil(t.deltaVKmS * FUEL_PER_KMS));
     expect(hop.windowEveryMs).toBe(t.synodicMs);
     // Two stations sharing one orbit have no transfer between them.
     expect(planHop('low', 'twin', now)).toBeNull();
+  });
+
+  it('plans hops a flight record accepts as they are', () => {
+    const records = [
+      { id: 'low', name: 'LOW', planetId: 'planet-sovereign', orbitSlot: 0, welcomeRoomId: 'r0' },
+      { id: 'high', name: 'HIGH', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'r1' },
+    ];
+    setStationDirectory(directoryFromStationRecords(() => records, () => undefined, () => null));
+    const now = Date.now();
+    for (const at of [now, now + 0.25, now + 1234.5]) {
+      const hop = planHop('low', 'high', at)!;
+      expect(Number.isSafeInteger(hop.departAt) && Number.isSafeInteger(hop.arriveAt)).toBe(true);
+      expect(isFlightRecord({
+        status: 'in-flight', locationId: 'low', destinationId: 'high', departedAt: hop.departAt, etaAt: hop.arriveAt,
+      })).toBe(true);
+    }
   });
 
   it('prices a low hop so one tank flies more than one', () => {

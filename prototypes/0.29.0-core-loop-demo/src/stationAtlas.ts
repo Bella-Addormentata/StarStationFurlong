@@ -1017,6 +1017,21 @@ function pullSharedAtlas(): void {
   if (changed) writeAtlas(atlas);
 }
 
+/** ⚓ A doc entry with a berth flag added wherever it has none and our entry
+ *  holds `transient: true` for the same door to the same room, or null when
+ *  there is nothing to add. Nothing else in the doc's copy changes. */
+function withBerthFlags(known: SharedAtlasEntry, entry: AtlasEntry): SharedAtlasEntry | null {
+  let doors: SharedAtlasEntry['doors'] | null = null;
+  for (const [id, door] of Object.entries(known.doors)) {
+    const mine = entry.doors[id];
+    if (!door || typeof door.transient === 'boolean' || mine?.transient !== true) continue;
+    if (typeof door.targetRoomId !== 'string' || door.targetRoomId !== mine.targetRoomId) continue;
+    doors ??= { ...known.doors };
+    doors[id] = { ...door, transient: true };
+  }
+  return doors ? { ...known, doors } : null;
+}
+
 /**
  * localStorage → doc (called after every harvest). Gossip carries geometry +
  * names; SEEDS DO NOT TRAVEL — except the doc's own-room entry (see header).
@@ -1043,7 +1058,21 @@ export function pushAtlasToDoc(): void {
       const known = isSharedAtlasEntry(existing) ? existing : null;
       if (known && !isOwn
         && known.updatedAt >= entry.lastSeen
-        && Object.keys(known.doors).length >= doorIds.length) continue;
+        && Object.keys(known.doors).length >= doorIds.length) {
+        // The doc's copy is at least as new as ours, so ours stays unsent,
+        // except for a berth we know and that copy has no flag for (an
+        // inferred berth is written down, markInferredBerths). That flag goes
+        // onto the DOC's copy, its geometry untouched, so a client joining
+        // after the ship casts off still reads the stale end as a berth.
+        const flagged = withBerthFlags(known, entry);
+        if (flagged) {
+          sharedMap!.set(entry.roomId, {
+            ...flagged,
+            updatedAt: Math.min(known.updatedAt + 1, Date.now() + MAX_GOSSIP_SKEW_MS),
+          });
+        }
+        continue;
+      }
       const doors: SharedAtlasEntry['doors'] = {};
       for (const d of doorIds) {
         const door = entry.doors[d];
