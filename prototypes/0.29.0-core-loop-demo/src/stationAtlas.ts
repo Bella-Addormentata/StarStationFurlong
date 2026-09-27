@@ -34,7 +34,7 @@ import type { ConnectorSegment } from './adapter';
 import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
-import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
+import { isDockChain, projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 import { halfAlongWall } from './doorMatch';
 
 export interface AtlasDoor {
@@ -64,7 +64,9 @@ export interface AtlasDoor {
    *  and a ship must not join, or bridge, the stations it calls at.
    *  Three states: true / false are KNOWN (a harvest, or gossip from a client
    *  that knows the flag); absent is UNKNOWN — gossip from an older client,
-   *  which never sends it. Unknown groups like structure, as before. */
+   *  which never sends it. Grouping asks isBerthDoor, which also counts any
+   *  DOCK chain whatever this says (a dock is always transient); an unknown
+   *  gangway groups like structure, as before. */
   transient?: boolean;
 }
 
@@ -425,6 +427,15 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
 // part of the station it docks at, and a stale berth left on the station side
 // after the ship casts off can never bridge two stations through the ship.
 
+/** ⚓ Is this door a visiting ship's berth rather than station structure?
+ *  Flagged transient, or a DOCK — exactly two `dock` segments, which dockRules
+ *  defines as always transient. The chain test is what catches docks recorded
+ *  before the flag existed (persisted, or gossiped by an older client): their
+ *  segments always travelled with them. */
+export function isBerthDoor(door: Pick<AtlasDoor, 'transient' | 'segments'>): boolean {
+  return door.transient === true || isDockChain(door.segments);
+}
+
 function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
   const adjacent = new Map<string, Set<string>>();
   const link = (a: string, b: string) => {
@@ -434,7 +445,7 @@ function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<stri
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || !e.doors) continue;
     for (const d of Object.values(e.doors)) {
-      if (!d?.targetRoomId || d.transient === true) continue;
+      if (!d?.targetRoomId || isBerthDoor(d)) continue;
       link(e.roomId, d.targetRoomId);
       link(d.targetRoomId, e.roomId);
     }

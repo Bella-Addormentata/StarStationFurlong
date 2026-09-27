@@ -102,6 +102,16 @@ describe('atlas components', () => {
     expect(derived[0].name).toHaveLength(64);
   });
 
+  it('treats a dock recorded before the berth flag existed as a berth too', () => {
+    // An upgrade: persisted (or older-client) entries carry the dock chain but
+    // no flag — and a dock is always transient.
+    const dock = [{ kind: 'dock' as const }, { kind: 'dock' as const }];
+    const atlas = atlasOf(room('a1'), room('ship'), room('b1'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', segments: dock };
+    atlas.ship.doors['d:dock'] = { targetSeed: '', targetRoomId: 'b1', segments: dock, transient: false };
+    expect(atlasComponents(atlas).map((c) => [...c].sort())).toEqual([['a1'], ['ship'], ['b1']]);
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });
