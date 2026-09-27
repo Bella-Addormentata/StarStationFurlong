@@ -528,7 +528,9 @@ function cleanBerth(r: BerthMemoryRecord): BerthMemoryRecord {
 
 /** Every remembered berth, junk entries dropped. */
 export function readBerthMemory(): Record<string, BerthMemoryRecord> {
-  const out: Record<string, BerthMemoryRecord> = {};
+  // Null prototype: station ids are peer-written strings, and an id such as
+  // 'constructor' must never read back an inherited value.
+  const out: Record<string, BerthMemoryRecord> = Object.create(null);
   if (!docAlive()) return out;
   const raw = shipMap!.get('berths');
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return out;
@@ -548,17 +550,28 @@ export function readStationBerth(stationId: string): BerthMemoryRecord | null {
 }
 
 /** Remember (or, with null, forget) the berth at `stationId`. Owner-gated at
- *  the caller, like every ship write. */
-export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | null): void {
-  if (!docAlive() || !isBoundedString(stationId)) return;
+ *  the caller, like every ship write. A NEW station past MAX_BERTH_STATIONS is
+ *  refused (a write the reader would truncate is a berth silently lost);
+ *  updating or forgetting a remembered one always works. Returns whether the
+ *  memory now holds what was asked. */
+export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | null): boolean {
+  if (!docAlive() || !isBoundedString(stationId)) return false;
   if (rec !== null && !isBerthMemoryRecord(rec)) {
     console.warn('[ship] refused to write malformed berth memory', rec);
-    return;
+    return false;
   }
   const next = readBerthMemory();
-  if (rec === null) delete next[stationId];
-  else next[stationId] = cleanBerth(rec);
+  if (rec === null) {
+    delete next[stationId];
+  } else {
+    if (!(stationId in next) && Object.keys(next).length >= MAX_BERTH_STATIONS) {
+      console.warn(`[ship] berth memory is full (${MAX_BERTH_STATIONS} stations) — not remembering ${stationId}`);
+      return false;
+    }
+    next[stationId] = cleanBerth(rec);
+  }
   boundDoc!.transact(() => {
-    shipMap!.set('berths', next);
+    shipMap!.set('berths', { ...next });
   });
+  return true;
 }

@@ -264,6 +264,24 @@ describe('berth memory in the ship doc', () => {
     expect(readStationBerth('high-orbit')).toBeNull();
   });
 
+  it('never reads an inherited value for a station id like "constructor"', () => {
+    expect(readStationBerth('constructor')).toBeNull();
+    expect(readStationBerth('toString')).toBeNull();
+  });
+
+  it('refuses a new station past the cap but still updates and forgets', () => {
+    for (let i = 0; i < 32; i++) {
+      expect(writeStationBerth(`s${i}`, { doorId: 'north', address: SEED_HIGH })).toBe(true);
+    }
+    expect(writeStationBerth('one-too-many', { doorId: 'north', address: SEED_HIGH })).toBe(false);
+    expect(readStationBerth('one-too-many')).toBeNull();
+    expect(writeStationBerth('s0', { doorId: 'east', address: SEED_FURLONG })).toBe(true);
+    expect(readStationBerth('s0')?.doorId).toBe('east');
+    expect(writeStationBerth('s1', null)).toBe(true);
+    expect(writeStationBerth('one-too-many', { doorId: 'north', address: SEED_HIGH })).toBe(true);
+    expect(readStationBerth('one-too-many')).not.toBeNull();
+  });
+
   it('drops hostile entries on read', () => {
     const doc = new Y.Doc();
     bindShipDoc(doc);

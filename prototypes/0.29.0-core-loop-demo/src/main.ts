@@ -1154,6 +1154,9 @@ async function joinRoom(
  *  re-checks the epoch and unwinds whatever it created if superseded.
  *  `claimRoomDefaults`: true only on the own-room default-bootstrap path —
  *  gates the roomInfo owner/name default writes (see below). */
+/** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
+let shipFlightWatch: number | null = null;
+
 async function joinRoomAtEpoch(
   boot: RoomBootstrap,
   epoch: number,
@@ -1723,7 +1726,10 @@ async function joinRoomAtEpoch(
     // commanders don't advance (owner-writes posture). Runs at 1 Hz — an
     // arrival-latency ceiling of ~1 second is imperceptible next to the
     // 60–90 s minimum travel time.
-    window.setInterval(() => {
+    // One watch per session: every join replaces the last room's (and
+    // leaveRoomNow clears it), so room hops never stack callbacks.
+    if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
+    shipFlightWatch = window.setInterval(() => {
       if (!isHelmCommander()) return;
       const rec = readFlightRecord();
       if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
@@ -2238,6 +2244,10 @@ async function leaveRoom(): Promise<void> {
 }
 
 async function leaveRoomNow(closed: () => void): Promise<void> {
+  if (shipFlightWatch !== null) {
+    window.clearInterval(shipFlightWatch);
+    shipFlightWatch = null;
+  }
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   const epoch = ++sessionEpoch;
   // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,
