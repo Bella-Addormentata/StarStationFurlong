@@ -24,6 +24,7 @@ import {
   rememberBerthHere,
   completeArrival,
   planArrivalDock,
+  type ArrivalOutcome,
   shipLocationId,
   type ArrivalPort,
   type ShipDockingApi,
@@ -439,5 +440,33 @@ describe('berth memory in the ship doc', () => {
     berths.late = { doorId: 'north', roomId: FURLONG_ROOM };
     doc.getMap('ship').set('berths', berths);
     expect(readStationBerth('late')).toBeNull();
+  });
+});
+
+describe('what the helm hears after an arrival DOCK', () => {
+  beforeEach(() => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    writeDoorTombstone('north', SEED_FURLONG, { farDoor: 'south', undockedAt: 2000 });
+    setStationDirectory({ stations: () => [{ ...DEFAULT_STATIONS[0], berth: { address: SEED_FURLONG, farDoor: 'south' } }, DEFAULT_STATIONS[1]] });
+  });
+  afterEach(() => setStationDirectory(null));
+
+  const arrive = (answer: boolean) => {
+    const docking = { ...fakeDocking(['north']), dock: async () => answer };
+    fly('high-orbit', 'furlong-station');
+    return new Promise<ArrivalOutcome>((resolve) => {
+      expect(completeArrival(docking, { onSettled: resolve })).toEqual({ kind: 'docking', stationName: 'Furlong Station' });
+    });
+  };
+
+  it('docked, once the berth takes the ship', async () => {
+    expect(await arrive(true)).toEqual({ kind: 'docked', stationName: 'Furlong Station' });
+  });
+
+  it('refused, when the berth is taken — not a green "docking" note left standing', async () => {
+    expect(await arrive(false)).toEqual({ kind: 'none', stationName: 'Furlong Station', reason: 'berths-taken' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
   });
 });
