@@ -104,7 +104,7 @@ function burn(c: TrimContext, dir: TrimDirection): OrbitTrim {
  *  the room reads now, then write the burn. */
 function press(dir: TrimDirection, now: number): TrimBurn {
   const plan = planTrim(ctx({
-    trim: readOrbitTrim(), fuel: readFuelLevel(), now, firing: readBurnFiring(now), logFull: isBurnLogFull(),
+    trim: readOrbitTrim(), fuel: readFuelLevel(), now, firing: readBurnFiring(now, STATION), logFull: isBurnLogFull(),
   }), dir);
   if (!plan.ok) throw new Error(`refused: ${plan.refusal}`);
   expect(writeTrimBurn(plan.burn)).toBe(true);
@@ -1090,6 +1090,25 @@ describe('a burn stamped ahead of our clock', () => {
     expect(readBurnFiring(ahead.at + 10)).toMatchObject({ dir: 'back', at: ahead.at });
     expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
     expect(b.at).toBe(T0);
+  });
+
+  it('picks the burn firing on the station\'s own orbit, whatever fired since on another', () => {
+    // Copilot's review of #173: an install that puts the room in another slot
+    // burns on that orbit. Its newer burn must not hide ours, or the stick
+    // would skip the lockout and the dashboard would miss the burn.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    const ours = press('raise', T0);
+    doc.getMap('stationKeeping').set('burn:peer:1', burnAt(T0 + 100, 'back', { slot: 1 }));
+    const now = T0 + 200;
+    expect(readBurnFiring(now)).toMatchObject({ slot: 1, at: T0 + 100 });
+    expect(readBurnFiring(now, STATION)).toEqual({ planetId: SOV, slot: 0, dir: 'raise', at: ours.at });
+    expect(readBurnFiring(now, { planetId: SOV, orbitSlot: 1 })).toMatchObject({ dir: 'back', at: T0 + 100 });
+    expect(readBurnFiring(now, null)).toBeNull();
+    expect(() => press('lower', now)).toThrow('refused: burning');
+    expect(readBurnFiring(T0 + BURN_MS, STATION)).toBeNull();
+    press('lower', T0 + BURN_MS);
   });
 
   it('a dropped burn never fires', () => {
