@@ -118,7 +118,7 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
-import { bindStationKeepingDoc, isBoltedIntoStation } from "./stationKeeping";
+import { bindStationKeepingDoc } from "./stationKeeping";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1744,10 +1744,12 @@ async function joinRoomAtEpoch(
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
       if (docked) return docked;
-      // 🛰️ A module bolted into a station by a gangway is station structure
-      // even when it carries engines, tanks and a helm (station keeping): the
-      // atlas places it, not its own flight record.
-      if (isBoltedIntoStation(readAllDoors().values())) return null;
+      // A module bolted into a station by structure (a station-keeping helm
+      // room wears engine, tank and helm too) belongs to that station, never
+      // to its own flight record: only a free-flying ship follows the flight.
+      for (const rec of readAllDoors().values()) {
+        if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) return null;
+      }
       return isShipReady() ? readFlightRecord().locationId : null;
     });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
