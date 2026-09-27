@@ -538,6 +538,31 @@ describe('transient berths (a visiting ship\'s dock)', () => {
     expect(atlasComponent(readAtlas(), 'module-ship')).toEqual(new Set(['module-ship']));
   });
 
+  it('reach a client that joins after the ship casts off', () => {
+    // An older client published the station side with no flag.
+    const stamp = Date.now() - 60_000;
+    doc.getMap('atlas').set('module-hall', {
+      roomId: 'module-hall',
+      name: 'HALL',
+      doors: { 'd:port': { targetRoomId: 'module-ship', targetSeed: '', wall: 'x+', lateral: 1 } },
+      updatedAt: stamp,
+    });
+    bind('module-ship');
+    const hall = 'ssf://x#room=module-hall';
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [{ doorId: 'd:dock', targetSeed: hall, transient: true }] });
+    pushAtlasToDoc();
+    // The flag lands on the doc's own copy of the hall, which is otherwise untouched.
+    const published = doc.getMap('atlas').get('module-hall') as { doors: Record<string, object>; updatedAt: number };
+    expect(published.doors['d:port']).toEqual({ targetRoomId: 'module-ship', targetSeed: '', wall: 'x+', lateral: 1, transient: true });
+    expect(published.updatedAt).toBe(stamp + 1);
+    // The ship casts off; then a fresh client with nothing stored joins.
+    harvestIntoAtlas({ roomId: 'module-ship', name: 'SHIP', doors: [] });
+    pushAtlasToDoc();
+    store.clear();
+    bind('module-lounge');
+    expect(atlasComponent(readAtlas(), 'module-ship')).toEqual(new Set(['module-ship']));
+  });
+
   it('mark a berth an atlas saved before implied, before the ship\'s entry is replaced', () => {
     const lastSeen = Date.now() - 120_000;
     store.set('ssf-station-atlas', JSON.stringify({
