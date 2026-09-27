@@ -69,6 +69,7 @@ import {
   otherPlanets,
   planStationMove,
   quoteMove,
+  readMoveFuelDrawn,
   subscribeStationMove,
   writeStationMove,
 } from './stationMove';
@@ -330,7 +331,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     commander: c.commander,
     engines: c.engines,
     fuel: c.fuel,
-    meter: c.meter,
+    drawn: readMoveFuelDrawn(),
+    deficit: c.deficit,
     modules: c.station?.welcomeRoomId ? Math.max(1, atlasComponent(readAtlas(), c.station.welcomeRoomId).size) : 1,
     now: c.now,
   });

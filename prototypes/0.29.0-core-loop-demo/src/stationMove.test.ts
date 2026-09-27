@@ -14,7 +14,8 @@ import {
 } from './planetSummary';
 import { planPlanetTransfer } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
-import { bindStationKeepingDoc, readFuelDrawn } from './stationKeeping';
+import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
+import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeOrbitTrim } from './stationKeeping';
 import {
   bindStationMoveDoc,
   freeSlotAround,
@@ -23,6 +24,7 @@ import {
   movePhase,
   moveFuelCost,
   planStationMove,
+  readMoveFuelDrawn,
   readRememberedMoves,
   readStationMove,
   rememberMove,
@@ -62,7 +64,8 @@ const ctx = (over: Partial<MoveContext> = {}): MoveContext => {
     commander: true,
     engines: 2,
     fuel: 10_000,
-    meter: 7,
+    drawn: 7,
+    deficit: 0,
     modules: 3,
     now: NOW,
     ...over,
@@ -191,11 +194,49 @@ describe('the record in the room doc and on this install', () => {
 
   it('draws the move\'s fuel through the tank\'s meter', () => {
     const doc = new Y.Doc();
+    bindShipDoc(doc);
     bindStationKeepingDoc(doc);
     bindStationMoveDoc(doc);
+    writeFuelLevel(9_000, 10_000);
     const move = moveTo();
     writeStationMove(move);
-    expect(readFuelDrawn()).toBe(move.fuelDrawn);
+    expect(readMoveFuelDrawn()).toBe(move.fuelDrawn);
+    expect(readFuelLevel()).toBe(9_000 - move.fuelDrawn);
+  });
+
+  it('a trim burn and a move started at once from two tabs both pay, whichever tab Yjs favours', () => {
+    for (const [burner, mover] of [[900, 100], [100, 900]]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      a.clientID = burner;
+      b.clientID = mover;
+      const bind = (doc: Y.Doc) => {
+        bindShipDoc(doc);
+        bindStationKeepingDoc(doc);
+        bindStationMoveDoc(doc);
+      };
+      bind(a);
+      writeFuelLevel(9_000, 10_000);
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+
+      const c = ctx();
+      const trim = planTrim({
+        bolted: true, station: c.station, trim: readOrbitTrim(), commander: true, engines: 1,
+        fuel: readFuelLevel(), deficit: fuelDrawDeficit(), now: NOW,
+      }, 'raise');
+      if (!trim.ok) throw new Error(trim.refusal);
+      writeOrbitTrim(trim.trim);
+      bind(b);
+      const plan = planStationMove(ctx({ fuel: readFuelLevel(), drawn: readMoveFuelDrawn(), deficit: fuelDrawDeficit() }), ARIS);
+      if (!plan.ok) throw new Error(plan.refusal);
+      writeStationMove(plan.move);
+
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      expect(readFuelLevel()).toBe(9_000 - TRIM_FUEL - plan.move.fuel);
+      bind(a);
+      expect(readFuelLevel()).toBe(9_000 - TRIM_FUEL - plan.move.fuel);
+    }
   });
 });
 
