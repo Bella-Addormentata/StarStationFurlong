@@ -137,6 +137,7 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+import { listStations, registerStation, removeStation, setStationRoomSource } from "./stations";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -414,6 +415,13 @@ const networkProvider = new NetworkProvider();
   count: () => peerCount(),
   list: () => listPeers(),
   hintsFor,
+  // 🪐 Station records (stations.ts): list every station this install knows,
+  // or pin one to a planet and orbit slot, e.g.
+  //   __ssfMesh.registerStation({ id: 'l4-yard', name: 'L4 YARD',
+  //     planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'home-…' })
+  listStations: () => listStations(),
+  registerStation,
+  removeStation,
   // 🛰️ The default-station bundle: the connected component of the room you
   // are standing in (or of `roomId`), stripped of everything personal — see
   // the "Changing the default station" steps in defaultStation.ts.
@@ -1616,6 +1624,8 @@ async function joinRoomAtEpoch(
     });
     // The exterior's atlas walk starts from the CURRENT room.
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
+    // 🪐 …and the station registry's "which station am I in" (holotable).
+    setStationRoomSource(() => activeBootstrap?.roomId ?? "");
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());

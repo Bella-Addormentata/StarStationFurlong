@@ -402,6 +402,70 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
   return written;
 }
 
+// ── 🪐 Connected components — what a STATION is ──────────────────────────────
+//
+// No station record is stored anywhere: a station is the set of rooms joined
+// by door pairings. These walks are the one definition of that set, shared by
+// the default-station export (defaultStation.atlasForBundle) and the station
+// registry (stations.ts). Edges are walked both ways — a pairing recorded on
+// either side joins the two rooms — and a door may name a room the atlas holds
+// no entry for (a neighbour we only heard about); that room still belongs.
+
+function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
+  const adjacent = new Map<string, Set<string>>();
+  const link = (a: string, b: string) => {
+    if (!adjacent.has(a)) adjacent.set(a, new Set());
+    adjacent.get(a)!.add(b);
+  };
+  for (const e of Object.values(atlas)) {
+    if (!e?.roomId || !e.doors) continue;
+    for (const d of Object.values(e.doors)) {
+      if (!d?.targetRoomId) continue;
+      link(e.roomId, d.targetRoomId);
+      link(d.targetRoomId, e.roomId);
+    }
+  }
+  return adjacent;
+}
+
+function walkComponent(adjacent: Map<string, Set<string>>, start: string): Set<string> {
+  const component = new Set<string>([start]);
+  const queue = [start];
+  while (queue.length > 0) {
+    const rid = queue.shift()!;
+    for (const next of adjacent.get(rid) ?? []) {
+      if (component.has(next) || component.size >= MAX_ENTRIES) continue;
+      component.add(next);
+      queue.push(next);
+    }
+  }
+  return component;
+}
+
+/** The connected component of `roomId`, capped at the atlas's own size.
+ *  Empty when the atlas holds no entry for the room. */
+export function atlasComponent(atlas: Record<string, AtlasEntry>, roomId: string): Set<string> {
+  if (!roomId || !atlas[roomId]) return new Set();
+  return walkComponent(atlasAdjacency(atlas), roomId);
+}
+
+/** Every connected component of the atlas — one per station this install
+ *  knows. Only rooms the atlas holds an ENTRY for start a component, so a
+ *  door naming an unknown room never invents a station of its own. Order
+ *  follows the atlas's entry order; callers that need a stable order sort. */
+export function atlasComponents(atlas: Record<string, AtlasEntry>): Set<string>[] {
+  const adjacent = atlasAdjacency(atlas);
+  const seen = new Set<string>();
+  const out: Set<string>[] = [];
+  for (const e of Object.values(atlas)) {
+    if (!e?.roomId || seen.has(e.roomId)) continue;
+    const component = walkComponent(adjacent, e.roomId);
+    for (const rid of component) seen.add(rid);
+    out.push(component);
+  }
+  return out;
+}
+
 export interface AtlasPose {
   roomId: string;
   name: string;
