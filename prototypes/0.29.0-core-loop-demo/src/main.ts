@@ -1234,7 +1234,11 @@ function planetShipStatus(): ShipStatusInput | null {
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
   const from = byId(rec.locationId);
   const to = byId(rec.destinationId);
-  const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
+  // The ship's own one-room stand-in sits on the default planet until its
+  // stations are known: that is no placement, so the entry waits (null).
+  const here = currentStation();
+  const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
+  const planetId = from?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const name =
     // Peer-written: only a string is a name.

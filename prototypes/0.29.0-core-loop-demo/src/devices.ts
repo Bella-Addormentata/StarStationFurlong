@@ -180,6 +180,7 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1006,6 +1007,8 @@ let mapTableMap: SolarSystemMap | null = null;
  */
 export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
   let panel: HTMLDivElement | null = null;
+  // 🪐 Stations and trims learned while the table is open redraw it.
+  let unhearSummary: (() => void) | null = null;
 
   return {
     mount(host: HTMLElement): void {
@@ -1066,10 +1069,14 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       }
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
+      unhearSummary?.();
+      unhearSummary = subscribePlanetSummary(() => mapTableMap?.refreshStations(undefined, holotableStation()));
       mapTableMap.show();
     },
 
     unmount(): void {
+      unhearSummary?.();
+      unhearSummary = null;
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -2734,6 +2741,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
+      // 🪐 Destinations and their orbits learned from peers.
+      unsubs.push(subscribePlanetSummary(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();
