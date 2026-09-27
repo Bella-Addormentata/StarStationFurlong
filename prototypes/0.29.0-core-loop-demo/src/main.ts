@@ -131,6 +131,7 @@ import {
 import {
   bindPlanetSummaryDoc,
   installTrimResolver,
+  LEARNED_PREFIX,
   publishPlanetSummary,
   portableStationId,
   resolveStationAlias,
@@ -469,7 +470,10 @@ const networkProvider = new NetworkProvider();
   //   __ssfMesh.registerStation({ id: 'l4-yard', name: 'L4 YARD',
   //     planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'home-…' })
   listStations: () => listStations(),
-  registerStation,
+  // 'shared:' ids are reserved for stations learned from other installs
+  // (planetSummary.ts), so a hand-made record never collides with one.
+  registerStation: (rec: Parameters<typeof registerStation>[0]) =>
+    typeof rec?.id === "string" && rec.id.startsWith(LEARNED_PREFIX) ? false : registerStation(rec),
   removeStation,
   // 🛰️ The default-station bundle: the connected component of the room you
   // are standing in (or of `roomId`), stripped of everything personal — see

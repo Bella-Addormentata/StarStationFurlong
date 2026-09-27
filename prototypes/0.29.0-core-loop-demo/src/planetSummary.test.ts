@@ -337,6 +337,23 @@ describe('sharing through the room doc', () => {
     expect(readStore(now).stations['room-069']?.name).toBe('S69');
   });
 
+  it('keeps its own station through a flood of newer peer summaries', () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const map = doc.getMap('stationSummaries');
+    map.set('room-hab', summary({ updatedAt: now - 60 * 60 * 1000 }));
+    for (let i = 0; i < 70; i++) {
+      const id = `room-${String(i).padStart(3, '0')}`;
+      // Stamped an hour ahead: inside the allowed skew, newer than ours.
+      map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, orbitSlot: 3, updatedAt: now + 60 * 60 * 1000 }));
+    }
+    bindPlanetSummaryDoc(doc, install('hab'));
+    publishPlanetSummary(now);
+    expect(map.has('room-hab')).toBe(true);
+    expect(readStore(now).stations['room-hab']).toBeDefined();
+  });
+
   it('never publishes a seed', () => {
     registerStation(record());
     const doc = new Y.Doc();
@@ -418,6 +435,16 @@ describe('station id aliases (flight records cross installs)', () => {
     expect(resolveStationAlias('station:room-hab')).toBe('mine');
     expect(resolveStationAlias('shared:room-hab')).toBe('mine');
     expect(resolveStationAlias('station:room-nowhere')).toBeNull();
+  });
+
+  it("resolves a learned id by its room even when a local record has that id", () => {
+    // A hand-made record whose id only looks learned (another room).
+    registerStation(record({ id: 'shared:room-hab', welcomeRoomId: 'room-odd', orbitSlot: 4 }));
+    registerStation(record({ id: 'mine' }));
+    expect(resolveStationAlias('shared:room-hab')).toBe('mine');
+    // …and it is the install's own: no prune takes it.
+    expect(registerLearnedStations(ARIS, [], { prune: true })).toBe(0);
+    expect(readStationRecords().some((r) => r.id === 'shared:room-hab')).toBe(true);
   });
 
   it('maps another install\'s saved id through the summary that carries it', () => {
