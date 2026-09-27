@@ -112,6 +112,37 @@ describe('atlas components', () => {
     expect(atlasComponents(atlas).map((c) => [...c].sort())).toEqual([['a1'], ['ship'], ['b1']]);
   });
 
+  it('counts both records of a berth as the berth, however the other side is flagged', () => {
+    // The ship's own records came from an older client: no flag, no dock chain.
+    const atlas = atlasOf(room('a1', ['a2']), room('a2', ['a1']), room('b1'), room('ship'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', transient: true };
+    atlas.ship.doors['d:old'] = { targetSeed: '', targetRoomId: 'a1' }; // the only unnamed record back
+    atlas.b1.doors['d:port'] = { targetSeed: '', targetRoomId: 'ship', transient: true, farDoor: 'd:dock' };
+    atlas.ship.doors['d:dock'] = { targetSeed: '', targetRoomId: 'b1' }; // named by the port
+    expect(atlasComponents(atlas).map((c) => [...c].sort())).toEqual([['a1', 'a2'], ['b1'], ['ship']]);
+  });
+
+  it('still joins two rooms by a separate permanent connection beside a berth', () => {
+    const atlas = atlasOf(room('a1'), room('ship'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', transient: true, farDoor: 'd:dock' };
+    atlas.ship.doors['d:dock'] = { targetSeed: '', targetRoomId: 'a1' };
+    expect(atlasComponents(atlas)).toHaveLength(2);
+    // A gangway between the same two rooms, each end naming the other.
+    atlas.a1.doors['d:tube'] = { targetSeed: '', targetRoomId: 'ship', farDoor: 'd:hatch' };
+    atlas.ship.doors['d:hatch'] = { targetSeed: '', targetRoomId: 'a1', farDoor: 'd:tube' };
+    expect(atlasComponents(atlas)).toHaveLength(1);
+  });
+
+  it('lets an unnamed berth take only one unflagged record opposite', () => {
+    const atlas = atlasOf(room('a1'), room('ship'));
+    atlas.a1.doors['d:berth'] = { targetSeed: '', targetRoomId: 'ship', transient: true };
+    atlas.ship.doors['d:old'] = { targetSeed: '', targetRoomId: 'a1' };
+    expect(atlasComponents(atlas)).toHaveLength(2);
+    // A second unflagged record back is a second connection: structure.
+    atlas.ship.doors['d:tube'] = { targetSeed: '', targetRoomId: 'a1' };
+    expect(atlasComponents(atlas)).toHaveLength(1);
+  });
+
   it('returns nothing for a room the atlas does not hold', () => {
     expect(atlasComponent(twoStations(), 'nowhere').size).toBe(0);
   });
@@ -209,6 +240,18 @@ describe('saved records', () => {
     expect(readStationRecords()).toEqual([]);
   });
 
+  it('keeps a renamed record\'s claim on a slot it shares with a later record', () => {
+    const a = { id: 'a', name: 'A', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'room-a' };
+    const b = { id: 'b', name: 'B', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'room-b' };
+    expect(registerStation(a)).toBe(true);
+    expect(registerStation(b)).toBe(true);
+    const slots = () => listStations({}).map((st) => [st.id, st.orbitSlot]);
+    expect(slots()).toEqual([[DEFAULT_STATION_ID, 0], ['a', 1], ['b', 2]]);
+    expect(registerStation({ ...a, name: 'A PRIME' })).toBe(true);
+    expect(slots()).toEqual([[DEFAULT_STATION_ID, 0], ['a', 1], ['b', 2]]);
+    expect(readStationRecords().map((r) => r.name)).toEqual(['A PRIME', 'B']);
+  });
+
   it('refuses invalid records and shadowing the default station', () => {
     const base = { id: 'x', name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'r' };
     expect(registerStation({ ...base, id: DEFAULT_STATION_ID })).toBe(false);
@@ -244,6 +287,23 @@ describe('saved records', () => {
     ]);
   });
 });
+
+/** Runs `fn` against a stand-in document whose elements appear on first
+ *  lookup, for the holotable's DOM paths. */
+function withFakeDocument(fn: (els: Map<string, { textContent: string }>) => void): void {
+  const els = new Map<string, { style: Record<string, string>; textContent: string; innerHTML: string; disabled?: boolean }>();
+  (globalThis as { document?: unknown }).document = {
+    getElementById: (id: string) => {
+      if (!els.has(id)) els.set(id, { style: {}, textContent: '', innerHTML: '' });
+      return els.get(id);
+    },
+  };
+  try {
+    fn(els);
+  } finally {
+    delete (globalThis as { document?: unknown }).document;
+  }
+}
 
 describe('solar map station bodies', () => {
   it('keeps the Furlong body where it always was, now moving on its true orbit', () => {
@@ -282,14 +342,7 @@ describe('solar map station bodies', () => {
   });
 
   it('updates "you are here" before repainting a kept selection', () => {
-    const els = new Map<string, { style: Record<string, string>; textContent: string; innerHTML: string; disabled?: boolean }>();
-    (globalThis as { document?: unknown }).document = {
-      getElementById: (id: string) => {
-        if (!els.has(id)) els.set(id, { style: {}, textContent: '', innerHTML: '' });
-        return els.get(id);
-      },
-    };
-    try {
+    withFakeDocument((els) => {
       const atlas = twoStations();
       const stations = listStations(atlas, []);
       const map = new SolarSystemMap();
@@ -299,9 +352,29 @@ describe('solar map station bodies', () => {
       map.refreshStations(stations, stationForRoom('yard-b', atlas, stations));
       expect(els.get('map-player-loc')?.textContent).toBe('YARD-A');
       expect(els.get('map-travel-btn')?.textContent).toBe('TRAVEL TO FURLONG LOBBY STATION');
-    } finally {
-      delete (globalThis as { document?: unknown }).document;
-    }
+    });
+  });
+
+  it('shows the location as unknown when no listed station holds the current room', () => {
+    withFakeDocument((els) => {
+      const rec = { id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: 'r' };
+      const stations = listStations({}, [rec]);
+      const map = new SolarSystemMap();
+      (map as unknown as { container: unknown }).container = {};
+      map.refreshStations(stations, DEFAULT_STATION_RECORD);
+      // A trip under way keeps the station it left from.
+      const internals = map as unknown as { travelDestination: unknown; selectedBody: unknown };
+      internals.travelDestination = stationBodies(stations)[1];
+      map.refreshStations(stations, null);
+      expect(map.getPlayerLocationId()).toBe(DEFAULT_STATION_ID);
+      // With no trip, a room no station holds is somewhere unknown, not Furlong.
+      internals.travelDestination = null;
+      internals.selectedBody = stationBodies(stations)[0]; // Furlong
+      map.refreshStations(stations, null);
+      expect(map.getPlayerLocationId()).toBe('');
+      expect(els.get('map-player-loc')?.textContent).toBe('UNKNOWN');
+      expect(els.get('map-travel-btn')?.textContent).toBe('TRAVEL TO FURLONG LOBBY STATION');
+    });
   });
 
   it('keeps a holotable trip on its destination\'s refreshed body, and calls it off when the station is gone', () => {
