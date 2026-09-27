@@ -107,6 +107,8 @@ import {
 import type { LegWindow, RouteFlight } from './pilotRoute';
 import {
   clampFuelToCapacity,
+  flightArrived,
+  flightProgress,
   flightWritePath,
   readFlightRecord,
   readFuelLevel,
@@ -187,6 +189,24 @@ export function formatRouteSpan(ms: number): string {
   const h = min / 60;
   if (h < 48) return `${h.toFixed(1)} h`;
   return `${Math.round(h / 24)} d`;
+}
+
+/** 🚏 The helm's in-flight figures at `now`: which panel shows (holding for
+ *  the window, flying, arrived) and the numbers that move with the clock.
+ *  The helm tick writes the numbers into the open panel in place and redraws
+ *  only when `phase` flips, so the panel's buttons (TAKE THE HELM, HAND TO
+ *  ROBOT, STOP ROUTE) are not swapped out from under a click four times a
+ *  second. */
+export function helmFlightFigures(
+  f: FlightRecord,
+  now: number,
+): { phase: 'hold' | 'fly' | 'arrived'; wait: number; remaining: number; pct: number } {
+  const remaining = Math.ceil((f.etaAt !== undefined ? Math.max(0, f.etaAt - now) : 0) / 1000);
+  if (f.departedAt !== undefined && now < f.departedAt) {
+    return { phase: 'hold', wait: Math.ceil((f.departedAt - now) / 1000), remaining, pct: 0 };
+  }
+  if (flightArrived(f, now)) return { phase: 'arrived', wait: 0, remaining, pct: 100 };
+  return { phase: 'fly', wait: 0, remaining, pct: Math.round(flightProgress(f, now) * 100) };
 }
 
 /** A minimum wait: "30 s", "1 min", "1.5 min", "10 min". */

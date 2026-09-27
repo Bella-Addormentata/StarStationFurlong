@@ -2108,7 +2108,10 @@ async function joinRoomAtEpoch(
       shipRoomId: () => activeBootstrap?.roomId ?? "",
       shipName: () => {
         const n = yjsSync?.doc.getMap("roomInfo").get("name");
-        return (typeof n === "string" && n ? n : "SHIP").slice(0, 64);
+        // A new room is named after its id until someone renames it; a board
+        // says FERRY then, not the id.
+        const unnamed = typeof n !== "string" || !n || n === activeBootstrap?.roomId;
+        return (unnamed ? "FERRY" : n).slice(0, 64);
       },
       capacity: shipFuelCapacity,
       route: readShipRoute,

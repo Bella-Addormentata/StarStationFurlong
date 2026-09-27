@@ -37,7 +37,6 @@ import {
   clampFuelToCapacity,
   findDestination,
   flightArrived,
-  flightProgress,
   fuelDrawDeficit,
   readFlightRecord,
   readFuelLevel,
@@ -60,7 +59,7 @@ import {
   ROUTE_WAIT_CHOICES,
   addDraftStop, checkRouteDraft, choiceIndexFor, departRouteFromHelm, describeGateChoice, describeRouteProblem,
   describeRouteStartRefusal, draftFromRoute, draftLegAfter, formatClock, formatRouteSpan, formatWait,
-  handOverRoute, moveDraftStop, pauseRouteFromHelm, readHelmCheckpoints, refreshDraftStops,
+  handOverRoute, helmFlightFigures, moveDraftStop, pauseRouteFromHelm, readHelmCheckpoints, refreshDraftStops,
   removeDraftStop, resumeRouteFromHelm, resumeStopIndex, routeDepartLine, routeDepartState, routeEndStopIndex, routeFromDraft,
   routeHelmView, routeNoteStands, routePathLabel, routeRenderKey, routeStartRefusal, routeStatusLine, routeStopCandidates,
   routeStopIndexAt, type RouteNoteTie,
@@ -2129,9 +2128,11 @@ function enumerateTransientBerths(): string[] {
  *  is invoked ONLY from (a) the helm's doc observers (furniture / ship /
  *  doors — event-driven, not per-frame), (b) discrete user gestures (picker
  *  change, refuel arm, depart / redock click), (c) the mount()-side initial
- *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY while
- *  the resolved flight (🚏 readResolvedFlight: a ferry route's timetable, or
- *  the stored record) is `in-flight`, or on the tick it changes. World.update / animate() /
+ *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY on
+ *  the tick the resolved flight (🚏 readResolvedFlight: a ferry route's
+ *  timetable, or the stored record) or its in-flight phase changes; in
+ *  flight it otherwise writes the moving numbers in place
+ *  (helmFlightFigures). World.update / animate() /
  *  requestAnimationFrame never call render() (grep-verified). No cache added:
  *  the walk is FURNITURE.filter over a bounded compile-time array — 3 tag
  *  lookups per render — and caching by furniture-map-change would add a
@@ -2417,8 +2418,6 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
     const commander = helmIsCommander();
     const chained = enumerateChainedDoors();
-    const arrived = flightArrived(flight, now);
-    const progress = flightProgress(flight, now);
     // A station that dropped out of the directory is named as unlisted, never
     // passed off as home (findDestination's fallback).
     const named = (id: string) => isKnownStation(id)
@@ -2492,9 +2491,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
       : bolted.length
         ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
-        : docked.length
-          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
-          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
+        // 🚏 A running route: the ROUTE panel below departs it, and the
+        // route keeper docks it at the stop's gate (not "free to pick").
+        : routeFlight !== null
+          ? `ALL SYSTEMS FITTED — flying its route: the ROUTE panel below has its timetable.${docked.length ? '' : ' It docks at this stop\'s gate on its own.'}`
+          : docked.length
+            ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
+            : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
 
     // 🚏 The checklist's ROUTE line (§5).
     const routeStatus = routeStatusLine(savedRoute, routeRun, now);
@@ -2645,31 +2648,31 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">Cast-off in progress. The next transaction advances to in-flight.</div>
         </div>`;
     } else if (flight.status === 'in-flight') {
-      const remaining = Math.ceil((flight.etaAt !== undefined ? Math.max(0, flight.etaAt - now) : 0) / 1000);
+      // 🚏 The figures the tick rewrites in place (data-helm-live): see
+      // helmFlightFigures.
+      const { phase, wait, remaining, pct: pctFmt } = helmFlightFigures(flight, now);
       const destName = esc((destination?.name ?? 'UNKNOWN').toUpperCase());
-      if (flight.departedAt !== undefined && now < flight.departedAt) {
-        const wait = Math.ceil((flight.departedAt - now) / 1000);
+      if (phase === 'hold') {
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,235,59,0.3); border-radius:8px; background:rgba(255,235,59,0.05);">
             <div style="font-size:11px; color:#FFEB3B; letter-spacing:0.5px;">⏳ HOLDING FOR LAUNCH WINDOW → ${destName}</div>
-            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Transfer burn in ${wait}s · arrival ETA ${remaining}s</div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Transfer burn in <span data-helm-live="wait">${wait}</span>s · arrival ETA <span data-helm-live="eta">${remaining}</span>s</div>
           </div>`;
-      } else if (arrived) {
+      } else if (phase === 'arrived') {
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid #00E676; border-radius:8px; background:rgba(0,230,118,0.10);">
             <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">✅ ARRIVED AT ${destName}</div>
             <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Docking at the berth follows on the commander's next tick.</div>
           </div>`;
       } else {
-        const pctFmt = Math.round(progress * 100);
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(129,199,132,0.35); border-radius:8px; background:rgba(0,230,118,0.06);">
             <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">🚀 IN FLIGHT → ${destName}</div>
             <div style="margin-top:8px; height:6px; background:rgba(0,0,0,0.5); border-radius:3px; overflow:hidden;">
-              <div style="width:${pctFmt}%; height:100%; background:#00E676; transition:width 0.25s linear;"></div>
+              <div data-helm-live="bar" style="width:${pctFmt}%; height:100%; background:#00E676; transition:width 0.25s linear;"></div>
             </div>
             <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px; display:flex; justify-content:space-between;">
-              <span>ETA ${remaining}s</span><span>${pctFmt}%</span>
+              <span>ETA <span data-helm-live="eta">${remaining}</span>s</span><span><span data-helm-live="pct">${pctFmt}</span>%</span>
             </div>
           </div>`;
       }
@@ -3187,10 +3190,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const path = esc(routePathLabel(route.stops, route.shape));
       const f = c.routeRun;
       const stopList = route.stops.map((s, i) => {
-        const here = !!f && f.stopIndex === i;
+        // ▶ the stop it is docked at, → the stop it is flying to.
+        const flying = !!f && f.status !== 'docked';
+        const here = !!f && !flying && f.stopIndex === i;
+        const bound = !!f && flying && f.nextStopIndex === i;
         // ⛔ A stop found gone this run is flagged red: the ferry passes it.
         const gone = !!f && f.goneStops.includes(i);
-        return `<div style="font-size:10px; line-height:1.5; color:${gone ? '#FF8A80' : here ? '#F0C060' : 'rgba(212,168,75,0.55)'};">${here ? '▶' : '·'} ${i + 1}. ${esc(s.name)} · ${
+        return `<div style="font-size:10px; line-height:1.5; color:${gone ? '#FF8A80' : here || bound ? '#F0C060' : 'rgba(212,168,75,0.55)'};">${here ? '▶' : bound ? '→' : '·'} ${i + 1}. ${esc(s.name)} · ${
           s.berth.gate !== undefined ? `gate ${s.berth.gate}` : 'berth'}${s.berth.anyGate ? '' : ' (pinned)'} · wait ${formatWait(s.waitSecs)}${gone ? ' · GONE, passed' : ''}</div>`;
       }).join('');
       const locked = `<div style="margin-top:8px;">${stopList}</div>${line('Stop the route to edit it.', 'rgba(212,168,75,0.45)')}`;
@@ -3704,13 +3710,34 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 🚏 A charging dock's robot taking up 🚀 Ship pilot (the route
       // editor's pilot picker).
       unsubs.push(subscribeRobot(() => render()));
-      // Countdown / arrival watch — re-render only while a number moves.
+      // Countdown / arrival watch — in flight the numbers move in place.
       // 🚏 A4: …or when the flight changed with no doc write: a route's
       // timetable docks, departs and arrives by the clock alone, so the test
       // reads the resolved flight and repaints on any change of it (a docked
       // panel is not repainted every tick: its picker would close).
-      const flightKey = (f: FlightRecord) =>
-        `${f.status}|${f.locationId}|${f.destinationId ?? ''}|${f.departedAt ?? ''}|${f.etaAt ?? ''}`;
+      // 🚏 In flight the key carries the panel's phase too (holding → flying
+      // → arrived flip with the clock alone); the moving numbers are written
+      // in place (writeFlightFigures), never by a redraw.
+      const flightKey = (f: FlightRecord, now: number) =>
+        `${f.status}|${f.locationId}|${f.destinationId ?? ''}|${f.departedAt ?? ''}|${f.etaAt ?? ''}|${
+          f.status === 'in-flight' ? helmFlightFigures(f, now).phase : ''}`;
+      /** Write the in-flight numbers into the open panel. False when the
+       *  panel does not show them (a redraw is due). */
+      const writeFlightFigures = (f: FlightRecord, now: number): boolean => {
+        const fig = helmFlightFigures(f, now);
+        if (!panel || fig.phase === 'arrived') return true; // nothing moves
+        const live = panel.querySelectorAll<HTMLElement>('[data-helm-live]');
+        if (live.length === 0) return false;
+        for (const el of live) {
+          switch (el.dataset.helmLive) {
+            case 'wait': el.textContent = String(fig.wait); break;
+            case 'eta': el.textContent = String(fig.remaining); break;
+            case 'pct': el.textContent = String(fig.pct); break;
+            case 'bar': el.style.width = `${fig.pct}%`; break;
+          }
+        }
+        return true;
+      };
       // 🚏 …and a running route's figures that flip with the clock alone
       // (DEPART opening 30 s before the window, the guard band, a robot
       // takeover: helmRoute.routeRenderKey), and a route answer's expiry.
@@ -3722,13 +3749,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           return `|${flash}`;
         }
       };
-      let lastFlight = flightKey(readResolvedFlight());
-      let lastRoute = routeKey(Date.now());
+      const startedAt = Date.now();
+      let lastFlight = flightKey(readResolvedFlight(startedAt), startedAt);
+      let lastRoute = routeKey(startedAt);
       tickTimer = setInterval(() => {
         autoAdvance();
         const now = Date.now();
         const f = readResolvedFlight(now);
-        const key = flightKey(f);
+        const key = flightKey(f, now);
         const rk = routeKey(now);
         let changed = key !== lastFlight || rk !== lastRoute;
         lastFlight = key;
@@ -3746,7 +3774,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           if (next.shown !== announcer.shown) changed = true;
           announcer = next;
         }
-        if (f.status === 'in-flight' || changed) render();
+        if (changed) render();
+        else if (f.status === 'in-flight' && !writeFlightFigures(f, now)) render();
       }, HELM_TICK_MS);
       render();
     },
