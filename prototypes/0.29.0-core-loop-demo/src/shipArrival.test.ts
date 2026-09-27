@@ -17,6 +17,7 @@ import {
 import {
   berthToRemember,
   castOffForDeparture,
+  castOffRefusal,
   rememberBerthHere,
   completeArrival,
   planArrivalDock,
@@ -122,6 +123,17 @@ describe('planArrivalDock', () => {
       remembered: null,
       ports: [{ doorId: 'north', state: dockedTo(SEED_FURLONG_OTHER_HINTS) }],
     })).toEqual({ kind: 'none', reason: 'already-docked' });
+  });
+});
+
+describe('castOffRefusal', () => {
+  const docked = { kind: 'docked' } as unknown as ArrivalPort['state'];
+  const free = { kind: 'free' } as ArrivalPort['state'];
+  it('refuses while a docked port is busy or locked, and ignores idle free ports', () => {
+    expect(castOffRefusal([{ doorId: 'n', state: docked, busy: false, canOperate: true }])).toBeNull();
+    expect(castOffRefusal([{ doorId: 'n', state: docked, busy: true }])).toBe('dock-busy');
+    expect(castOffRefusal([{ doorId: 'n', state: docked, canOperate: false }])).toBe('dock-locked');
+    expect(castOffRefusal([{ doorId: 'n', state: free, busy: true, canOperate: false }])).toBeNull();
   });
 });
 
