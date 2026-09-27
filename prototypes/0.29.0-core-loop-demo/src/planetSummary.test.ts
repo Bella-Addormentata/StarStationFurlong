@@ -25,13 +25,14 @@ import {
   resolveStationAlias,
   shipsAroundPlanet,
   summaryForStation,
+  summaryPlanet,
   systemStationNames,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
 import type { OrbitTrim } from './stationKeeping';
-import { DEFAULT_PLANET_ID, listStations, readStationRecords, registerStation } from './stations';
-import type { StationRecord } from './stations';
+import { DEFAULT_PLANET_ID, listStations, readStationRecords, registerStation, setStationMoveResolver } from './stations';
+import type { StationMove, StationRecord } from './stations';
 
 // Each "install" is its own localStorage.
 let store = new Map<string, string>();
@@ -289,6 +290,29 @@ describe('learned stations', () => {
     expect(readStationRecords().map((r) => r.id)).toContain(`${LEARNED_PREFIX}room-hab`);
     expect(registerLearnedStations(ARIS, [], { prune: true })).toBe(1);
     expect(readStationRecords().map((r) => r.id)).toEqual(['mine']);
+  });
+
+  it('place a moved station by its move, wherever its record was first stamped', () => {
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const moved = summary({ move });
+    expect(summaryPlanet(moved, T0 + 1)).toBe(SOV);
+    expect(summaryPlanet(moved, T0 + 1000)).toBe(ARIS);
+    expect(summaryPlanet(summary({ move: { ...move, departAt: T0 + 1001, arriveAt: T0 + 1002, settles: move } }), T0)).toBe(ARIS);
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'room-hab' ? move : null));
+    try {
+      // Around its new planet it registers, and a prune there keeps it.
+      expect(registerLearnedStations(ARIS, [moved])).toBe(1);
+      expect(registerLearnedStations(ARIS, [moved], { prune: true })).toBe(0);
+      expect(listStations().find((st) => st.welcomeRoomId === 'room-hab')?.planetId).toBe(ARIS);
+      // Around its old one it does not.
+      expect(registerLearnedStations(SOV, [moved], { prune: true })).toBe(1);
+      expect(readStationRecords()).toEqual([]);
+    } finally {
+      setStationMoveResolver(null);
+    }
   });
 
   it('carry new record fields through to the record they register', () => {

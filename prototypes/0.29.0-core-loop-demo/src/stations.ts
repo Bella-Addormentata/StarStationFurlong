@@ -525,11 +525,14 @@ export function listStations(
       slot = claim(p.id, 0);
       planetId = p.id;
     }
+    // Every planet full: it stays where its move put it, sharing a slot,
+    // rather than drop out of the list (its old slot was let go in transit).
     if (slot !== null) settle(i, planetId, slot);
+    else settle(i, at.planetId, at.orbitSlot);
   }
 
-  // Listed in record order, derived stations last. A station left without a
-  // slot (its planet is full) is dropped.
+  // Listed in record order, derived stations last. A station that never
+  // moved and finds no slot (its planet is full) is dropped.
   const out: StationRecord[] = [];
   candidates.forEach((c, i) => {
     const spot = spots[i];

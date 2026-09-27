@@ -363,6 +363,16 @@ function stationRecency(s: StationSummary, now: number): number {
   return Math.max(s.updatedAt, s.move ? Math.min(s.move.departAt, now) : -Infinity);
 }
 
+/** The planet a station summary is at now: its move's (a pin's place, the
+ *  destination once arrived, else where it left from) over its record's,
+ *  which a derived station keeps from its first stamp for good
+ *  (mergeStation leaves the move out of the standing record). */
+export function summaryPlanet(s: { planetId: string; move?: StationMove }, now: number = Date.now()): string {
+  const m = s.move;
+  if (!m) return planetById(s.planetId).id;
+  return planetById(m.settles || now >= m.arriveAt ? m.toPlanetId : m.fromPlanetId).id;
+}
+
 /** Is this summary about the planet this client is at? Retention keeps
  *  those next, after the first-hand keys: news from other planets cannot
  *  crowd out the stations and ships around this one. */
@@ -494,7 +504,9 @@ export function registerLearnedStations(
   // knows which planet this client is at; the install's own records stay.
   if (opts.prune) {
     for (const r of saved.values()) {
-      if (isLearnedRecord(r) && planetById(r.planetId).id !== planet) {
+      // Where the list has it, which follows its move.
+      const at = listed.find((st) => st.id === r.id) ?? r;
+      if (isLearnedRecord(r) && planetById(at.planetId).id !== planet) {
         removeStation(r.id);
         saved.delete(r.id);
         changed++;
@@ -502,7 +514,7 @@ export function registerLearnedStations(
     }
   }
   for (const s of stations) {
-    if (planetById(s.planetId).id !== planet) continue;
+    if (summaryPlanet(s) !== planet) continue;
     const rec = learnedRecord(s);
     if (!rec) continue;
     const owner = listed.find((st) => st.welcomeRoomId === s.welcomeRoomId);
@@ -736,7 +748,7 @@ export function publishPlanetSummary(now = Date.now()): void {
     // by freshness, never by map order (and junk keys do not pile up).
     pruned = pruneMap(stationMap!, (k, v) => {
       const s = cleanStationSummary(v, now);
-      return s && s.welcomeRoomId === k ? { at: stationRecency(s, now), planetId: s.planetId } : null;
+      return s && s.welcomeRoomId === k ? { at: stationRecency(s, now), planetId: summaryPlanet(s, now) } : null;
     }, MAX_STATIONS, pins.stations, pins.planet) + pruneMap(shipMap!, (k, v) => {
       const s = cleanShipSummary(v, now);
       return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? { at: s.updatedAt, planetId: s.planetId } : null;
@@ -761,7 +773,7 @@ function applyLearned(store: Store): void {
   // summary of the station it stands in does (a derived record sits on the
   // default planet until its learned one registers, which needs the planet).
   const shared = here?.welcomeRoomId ? store.stations[here.welcomeRoomId] : undefined;
-  const planet = planetById(here && !isOwned(here) && shared ? shared.planetId : here?.planetId).id;
+  const planet = here && !isOwned(here) && shared ? summaryPlanet(shared) : planetById(here?.planetId).id;
   registerLearnedStations(planet, Object.values(store.stations), { prune: here !== null });
   refreshTrims(store);
 }
@@ -835,8 +847,8 @@ export function shipsAroundPlanet(planetId: string, now = Date.now()): ShipSumma
 export function systemStationNames(planetId: string, now = Date.now()): Array<{ name: string; planetId: string }> {
   const planet = planetById(planetId).id;
   return Object.values(readStore(now).stations)
-    .filter((s) => planetById(s.planetId).id !== planet)
-    .map((s) => ({ name: s.name, planetId: planetById(s.planetId).id }))
+    .map((s) => ({ name: s.name, planetId: summaryPlanet(s, now) }))
+    .filter((s) => s.planetId !== planet)
     .sort((a, b) => (a.planetId === b.planetId ? a.name.localeCompare(b.name) : a.planetId.localeCompare(b.planetId)));
 }
 
