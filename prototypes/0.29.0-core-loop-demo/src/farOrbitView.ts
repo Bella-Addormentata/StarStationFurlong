@@ -39,6 +39,7 @@ import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { shipsAroundPlanet } from './planetSummary';
+import { moveTransitPointAt } from './stationMove';
 import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
@@ -129,7 +130,7 @@ function gather(now: number): Source {
     // 🚏 A running ferry route's timetable while it rules the flight (its
     // legs write no stored `flight`), else the stored record.
     const rec = readResolvedFlight(now);
-    if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt && rec.etaAt) {
+    if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       aboard = flightPlan(
         all.find((s) => s.id === rec.locationId),
         all.find((s) => s.id === rec.destinationId),
@@ -148,7 +149,10 @@ function gather(now: number): Source {
     : currentStation() ??
       all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0) ??
       null;
-  if (me?.move && stationInTransit(me, now)) {
+  // The sun view only while the move really has a course right now (a
+  // malformed record, say both ends on one planet, has none): otherwise the
+  // planet view below, never an empty backdrop.
+  if (me?.move && stationInTransit(me, now) && moveTransitPointAt(me.move, now)) {
     const m = me.move;
     return { mode: 'sun', move: m, key: [
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
@@ -175,16 +179,11 @@ function gather(now: number): Source {
     viewerRingRadiusKm = orbit.radiusKm;
   }
 
-  const stations = all
-    // Never the viewer: its own station, nor the one-module station the room
-    // it stands in (a ship, say) is listed as.
-    .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
-    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
-    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
-
   const byRoom = (room: string | undefined) => (room ? all.find((s) => s.welcomeRoomId === room) : undefined);
   const ships: FarShipInput[] = [];
+  const flying = new Set<string>();
   for (const ship of shipsAroundPlanet(planetId, now)) {
+    if (ship.status === 'in-flight') flying.add(ship.roomId);
     if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
     if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
     const plan = flightPlan(byRoom(ship.fromRoom), byRoom(ship.toRoom), ship.departedAt, ship.etaAt);
@@ -196,6 +195,16 @@ function gather(now: number): Source {
     }
   }
 
+  const stations = all
+    // Never the viewer: its own station, nor the one-module station the room
+    // it stands in (a ship, say) is listed as.
+    .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
+    // A ship in flight is listed as its own one-module station too; it is
+    // drawn on its transfer instead, never also on a circular orbit.
+    .filter((s) => !flying.has(s.welcomeRoomId))
+    .filter((s) => planetById(s.planetId).id === planetId && !stationInTransit(s, now))
+    .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
+
   const key = [
     'planet',
     planetId,
@@ -204,7 +213,7 @@ function gather(now: number): Source {
     // without changing its slot), names, module counts and each course.
     ...stations.map((s) => `${s.record.id}:${stationOrbit(s.record).radiusKm.toFixed(3)}:${s.modules}:${s.record.name}`),
     ...ships.map((s) =>
-      `${s.id}:${s.name}:${s.plan.departAt}:${s.plan.arriveAt}:${s.plan.from.radiusKm.toFixed(3)}:${s.plan.from.phase0}:${s.plan.to.radiusKm.toFixed(3)}`),
+      `${s.id}:${s.name}:${s.plan.departAt}:${s.plan.arriveAt}:${s.plan.from.radiusKm.toFixed(3)}:${s.plan.from.phase0}:${s.plan.to.radiusKm.toFixed(3)}:${s.plan.to.phase0}`),
   ].join('|');
   return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key };
 }
@@ -245,7 +254,10 @@ let builtKey = '';
 let lastRefresh = 0;
 /** OLD_PLANET_NAMES found in the scene, re-found after a refresh. */
 let oldPlanets: THREE.Object3D[] | null = null;
-/** Screen-sized objects: body id → [object, px per local unit]. */
+/** Bodies are keyed by kind AND id: a station's id is free text and could
+ *  equal a ship's `ship:<room>`. */
+const bodyKey = (b: FarBody): string => `${b.kind}\u0000${b.id}`;
+/** Screen-sized objects: body key → [object, px per local unit]. */
 const bodies = new Map<string, { obj: THREE.Object3D; px: number }>();
 
 function ensureScene(): void {
@@ -419,7 +431,7 @@ function buildFrame(layout: FarLayout): void {
     obj.add(label);
     obj.name = `far-body-${b.id}`;
     frame.add(obj);
-    bodies.set(b.id, { obj, px });
+    bodies.set(bodyKey(b), { obj, px });
   }
 
   farScene.add(frame);
@@ -431,7 +443,7 @@ function poseFrame(layout: FarLayout): void {
   frame.position.set(layout.transform.position.x, layout.transform.position.y, layout.transform.position.z);
   frame.rotation.set(0, layout.transform.rotationY, 0);
   for (const b of layout.bodies) {
-    const entry = bodies.get(b.id);
+    const entry = bodies.get(bodyKey(b));
     if (!entry) continue;
     entry.obj.position.set(b.position.x, b.position.y, b.position.z);
     // Line the impostor up with its orbit (rotation.y = its orbit angle puts
@@ -453,7 +465,9 @@ function sizeBodies(heightPx: number): void {
   const perPxAt1 = (2 * Math.tan(THREE.MathUtils.degToRad(farCamera.fov) / 2)) / Math.max(1, heightPx);
   for (const { obj, px } of bodies.values()) {
     obj.getWorldPosition(tmp);
-    const d = tmp.distanceTo(farCamera.position);
+    // Camera-space depth, not distance: a perspective projection scales
+    // by depth, so an off-axis body keeps its size as the view drifts.
+    const d = Math.max(1, -tmp.applyMatrix4(farCamera.matrixWorldInverse).z);
     obj.scale.setScalar(d * perPxAt1 * px);
   }
 }
