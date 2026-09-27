@@ -21,6 +21,24 @@
  * client puts every station — and every ship on a known transfer — in the same
  * place at the same moment, within clock skew (the plan's accepted posture).
  *
+ * THE PLANET FRAME (owner question, 2026-09-27: keep each station's "down"
+ * parallel to the planet's axis so ships stay on one flat plane around the
+ * equator). One frame per planet, shared by every view:
+ *  - origin at the planet's centre; +Y is the planet's NORTH, its rotation
+ *    axis. Every room's own up (+Y in the scene) is parallel to it, so a
+ *    station's down (−Y) points south along the axis, never at the planet;
+ *  - the XZ plane is the EQUATOR, and every orbit and every transfer lies in
+ *    it. Room floors are parallel to the plane everything flies in, so flying
+ *    and docking only ever need yaw (rotation.y) — all the atlas, adapter and
+ *    docking geometry uses already;
+ *  - angles run from +X, positive = rotation about +Y (Three's rotation.y) =
+ *    counter-clockwise seen from the north = prograde, the way the planet
+ *    spins;
+ *  - stations are PLANET-LOCKED, the usual attitude of a real station: each
+ *    turns once per orbit so the planet stays put outside — straight off its
+ *    local −X, level with the floor. Local +X points away from the planet,
+ *    −Z along the direction of travel, +Z behind.
+ *
  * Units: kilometres, radians, and ORBITAL seconds (the physics clock); every
  * `…Ms`/`…At` value is REAL milliseconds (what flight records and timers use).
  *
@@ -128,6 +146,49 @@ export function stationPointAt(station: Pick<StationRecord, 'planetId' | 'orbitS
   return { radiusKm: orbit.radiusKm, angle: angleAt(orbit, realMs) };
 }
 
+// ── The planet frame (see the header) ────────────────────────────────────────
+
+/** A position in 3D, km. */
+export interface FramePoint {
+  x: number;
+  y: number;
+  z: number;
+}
+
+/** An orbit point in the planet frame: on the equator, so y is always 0. */
+export function toPlanetFrame(p: OrbitPoint): FramePoint {
+  return { x: p.radiusKm * Math.cos(p.angle), y: 0, z: -p.radiusKm * Math.sin(p.angle) };
+}
+
+/** A planet-locked station's yaw in the planet frame — its rotation.y. It
+ *  equals the station's orbit angle: at angle 0 its local axes line up with
+ *  the planet frame's. */
+export function stationHeadingAt(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>, realMs: number): number {
+  return stationPointAt(station, realMs).angle;
+}
+
+/**
+ * Where something sits as seen from a station, in the station's own frame
+ * (km; +Y up, same axes as its rooms). The planet's centre comes out at
+ * (−r, 0, 0); a body just ahead in the same orbit at a small −z. This is what
+ * a view from the station draws the planet and passing traffic with.
+ */
+export function inStationFrame(
+  station: Pick<StationRecord, 'planetId' | 'orbitSlot'>,
+  realMs: number,
+  target: OrbitPoint | FramePoint,
+): FramePoint {
+  const here = stationPointAt(station, realMs);
+  const origin = toPlanetFrame(here);
+  const q = 'radiusKm' in target ? toPlanetFrame(target) : target;
+  const dx = q.x - origin.x;
+  const dz = q.z - origin.z;
+  const c = Math.cos(here.angle);
+  const s = Math.sin(here.angle);
+  // Undo the station's yaw: rotate the offset by −heading about +Y.
+  return { x: dx * c - dz * s, y: q.y - origin.y, z: dx * s + dz * c };
+}
+
 // ── Hohmann transfers ────────────────────────────────────────────────────────
 
 export interface TransferPlan {
@@ -217,12 +278,15 @@ export type TransferLeg = 'waiting' | 'transfer' | 'arrived';
  * from the ellipse's periapsis, inbound ones from its apoapsis; either way the
  * ship arrives opposite its departure point, where the target now is.
  */
-export function transferPointAt(plan: TransferPlan, realMs: number): OrbitPoint & { leg: TransferLeg } {
+export function transferPointAt(
+  plan: TransferPlan,
+  realMs: number,
+): OrbitPoint & { leg: TransferLeg; speedKmS: number } {
   if (realMs <= plan.departAt) {
-    return { radiusKm: plan.from.radiusKm, angle: angleAt(plan.from, realMs), leg: 'waiting' };
+    return { radiusKm: plan.from.radiusKm, angle: angleAt(plan.from, realMs), leg: 'waiting', speedKmS: plan.from.speedKmS };
   }
   if (realMs >= plan.arriveAt) {
-    return { radiusKm: plan.to.radiusKm, angle: angleAt(plan.to, realMs), leg: 'arrived' };
+    return { radiusKm: plan.to.radiusKm, angle: angleAt(plan.to, realMs), leg: 'arrived', speedKmS: plan.to.speedKmS };
   }
   const r1 = plan.from.radiusKm;
   const r2 = plan.to.radiusKm;
@@ -235,5 +299,11 @@ export function transferPointAt(plan: TransferPlan, realMs: number): OrbitPoint 
   const M = (outbound ? 0 : Math.PI) + n * orbitalSpanFor(realMs - plan.departAt);
   const E = solveKepler(M, e);
   const trueAnomaly = 2 * Math.atan2(Math.sqrt(1 + e) * Math.sin(E / 2), Math.sqrt(1 - e) * Math.cos(E / 2));
-  return { radiusKm: a * (1 - e * Math.cos(E)), angle: wrapAngle(periapsisAngle + trueAnomaly), leg: 'transfer' };
+  const radiusKm = a * (1 - e * Math.cos(E));
+  return {
+    radiusKm,
+    angle: wrapAngle(periapsisAngle + trueAnomaly),
+    leg: 'transfer',
+    speedKmS: Math.sqrt(plan.from.planet.mu * (2 / radiusKm - 1 / a)), // vis-viva
+  };
 }
