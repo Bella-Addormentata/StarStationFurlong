@@ -564,6 +564,8 @@ describe('what a station answer counts as', () => {
     expect(classifyKeeperRefusal({ reason: 'closed' })).toBe('gone');
     // PR 177: no port on the far door, and no gate number left to fit one.
     expect(classifyKeeperRefusal({ reason: 'no-gate' })).toBe('gone');
+    // PR 174: the stop's station is moving between planets (out of reach).
+    expect(classifyKeeperRefusal({ reason: 'moving' })).toBe('gone');
     expect(classifyKeeperRefusal({ reason: 'not-allowed', gateAccess: 'closed' })).toBe('shut');
     expect(classifyKeeperRefusal({ reason: 'not-allowed', gateAccess: 'reserved' })).toBe('shut');
     // A granted-captains gate checks this game's key: never the ship's verdict.
