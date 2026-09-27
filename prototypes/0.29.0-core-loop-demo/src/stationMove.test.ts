@@ -170,6 +170,21 @@ describe('the station list follows a move', () => {
     expect(after.move).toBeUndefined();
   });
 
+  it('frees a station\'s old slot while it is between planets', () => {
+    const move = moveTo();
+    setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
+    const mid = (move.departAt + move.arriveAt) / 2;
+    // A station that wants Furlong's slot takes it once Furlong has left,
+    // not before.
+    const other: StationRecord = { id: 'yard', name: 'YARD', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'y' };
+    const yardAt = (t: number) => listStations({}, [other], t).find((s) => s.id === 'yard')!;
+    expect(yardAt(move.departAt - 1).orbitSlot).toBe(1);
+    expect(yardAt(mid).orbitSlot).toBe(0);
+    const listed = listStations({}, [], mid);
+    expect(freeSlotAround(SOV, listed, undefined, mid)).toBe(0);
+    expect(freeSlotAround(SOV, listStations({}, [], move.departAt - 1), undefined, move.departAt - 1)).toBe(1);
+  });
+
   it('refuses ship hops to or from a station in transit', () => {
     const move = moveTo();
     setStationMoveResolver((st) => (st.id === move.stationId ? move : null));
