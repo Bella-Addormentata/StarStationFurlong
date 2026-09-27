@@ -29,6 +29,7 @@
 import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
+import { isAcceptableDoorKey } from './doorsDoc';
 import type { DoorRecord } from './doorsDoc';
 
 export interface PlanetRecord {
@@ -70,7 +71,8 @@ export interface StationRecord {
   /** The room a docking ship berths at. '' when unknown (a build shipping no
    *  default station). */
   welcomeRoomId: string;
-  /** Optional door id of the berth port in the welcome room. */
+  /** Optional door id of the berth port in the welcome room — a door key
+   *  doorsDoc accepts (a record naming any other could never be docked at). */
   berthDoor?: string;
   /** Set on stations derived from an atlas component with no record. */
   derived?: true;
@@ -118,7 +120,7 @@ function isRecord(v: unknown): v is StationRecord {
     && typeof r.planetId === 'string'
     && Number.isInteger(r.orbitSlot) && (r.orbitSlot as number) >= 0 && (r.orbitSlot as number) < MAX_ORBIT_SLOTS
     && typeof r.welcomeRoomId === 'string' && r.welcomeRoomId.length > 0
-    && (r.berthDoor === undefined || typeof r.berthDoor === 'string');
+    && (r.berthDoor === undefined || (typeof r.berthDoor === 'string' && isAcceptableDoorKey(r.berthDoor)));
 }
 
 export function readStationRecords(): StationRecord[] {
