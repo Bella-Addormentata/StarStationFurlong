@@ -67,7 +67,6 @@ describe('isAirHockeyState guard', () => {
       ...initialAirHockeyState(),
       players: { a: 'p1', b: 'p2' },
       ready: { a: true, b: true },
-      paid: { a: 25, b: 25 },
       score: { a: 3, b: 6 },
       status: 'playing',
       servingSide: 'b',
@@ -88,7 +87,7 @@ describe('isAirHockeyState guard', () => {
 
   it('rejects peer-writable field corruption (fractions, negatives, unsafe ints)', () => {
     const base = initialAirHockeyState();
-    expect(isAirHockeyState({ ...base, paid: { a: 1.5, b: 0 } })).toBe(false);
+    expect(isAirHockeyState({ ...base, score: { a: 1.5, b: 0 } })).toBe(false);
     expect(isAirHockeyState({ ...base, score: { a: -1, b: 0 } })).toBe(false);
     expect(isAirHockeyState({ ...base, score: { a: Number.MAX_SAFE_INTEGER + 2, b: 0 } })).toBe(false);
     expect(isAirHockeyState({ ...base, serveAt: Number.NaN })).toBe(false);
@@ -115,37 +114,34 @@ describe('claim / ready lifecycle', () => {
     expect(s2?.players).toEqual({ a: 'p1', b: 'p2' });
   });
 
-  it('release clears the claim plus ready and paid, only pre-game and only by owner', () => {
+  it('release clears the claim plus ready, only pre-game and only by owner', () => {
     let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
-    s = setReady(s, 'a', 'p1', 10)!;
+    s = setReady(s, 'a', 'p1')!;
     expect(releaseSide(s, 'a', 'p2')).toBeNull();
     const released = releaseSide(s, 'a', 'p1')!;
     expect(released.players.a).toBeNull();
     expect(released.ready.a).toBe(false);
-    expect(released.paid.a).toBe(0);
   });
 
-  it('ready records the fee; unready clears it; both gate on claimant + status', () => {
+  it('ready and unready gate on claimant + status', () => {
     let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
-    expect(setReady(s, 'a', 'p2', 0)).toBeNull();       // not the claimant
-    expect(setReady(s, 'a', 'p1', 2.5)).toBeNull();     // fractional fee
-    expect(setReady(s, 'a', 'p1', -1)).toBeNull();      // negative fee
-    s = setReady(s, 'a', 'p1', 25)!;
+    expect(setReady(s, 'a', 'p2')).toBeNull();          // not the claimant
+    s = setReady(s, 'a', 'p1')!;
     expect(s.ready.a).toBe(true);
-    expect(s.paid.a).toBe(25);
-    expect(setReady(s, 'a', 'p1', 25)).toBeNull();      // already ready
+    expect(setReady(s, 'a', 'p1')).toBeNull();          // already ready
+    expect(setUnready(s, 'a', 'p2')).toBeNull();        // not the claimant
     const un = setUnready(s, 'a', 'p1')!;
     expect(un.ready.a).toBe(false);
-    expect(un.paid.a).toBe(0);
+    expect(setUnready(un, 'a', 'p1')).toBeNull();       // not ready
   });
 
   it('startIfReady fires only with both sides claimed AND ready, and resets score', () => {
     let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
-    s = setReady(s, 'a', 'p1', 0)!;
+    s = setReady(s, 'a', 'p1')!;
     expect(startIfReady(s, 1000)).toBeNull();           // b missing
     s = claimSide(s, 'b', 'p2')!;
     expect(startIfReady(s, 1000)).toBeNull();           // b not ready
-    s = setReady(s, 'b', 'p2', 0)!;
+    s = setReady(s, 'b', 'p2')!;
     const playing = startIfReady({ ...s, score: { a: 3, b: 1 } }, 1000)!;
     expect(playing.status).toBe('playing');
     expect(playing.score).toEqual({ a: 0, b: 0 });
@@ -156,12 +152,11 @@ describe('claim / ready lifecycle', () => {
 
   it('practice starts solo only, and versus takes priority once b is claimed', () => {
     let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
-    const practice = startPractice(s, 'a', 'p1', 5, 500)!;
+    const practice = startPractice(s, 'a', 'p1', 500)!;
     expect(practice.status).toBe('playing');
-    expect(practice.paid.a).toBe(5);
     expect(isVersus(practice)).toBe(false);
     s = claimSide(s, 'b', 'p2')!;
-    expect(startPractice(s, 'a', 'p1', 5, 500)).toBeNull();
+    expect(startPractice(s, 'a', 'p1', 500)).toBeNull();
   });
 });
 
@@ -169,8 +164,8 @@ describe('goals, wins, forfeits', () => {
   function playingVersus(): AirHockeyState {
     let s = claimSide(initialAirHockeyState(), 'a', 'p1')!;
     s = claimSide(s, 'b', 'p2')!;
-    s = setReady(s, 'a', 'p1', 0)!;
-    s = setReady(s, 'b', 'p2', 0)!;
+    s = setReady(s, 'a', 'p1')!;
+    s = setReady(s, 'b', 'p2')!;
     return startIfReady(s, 1000)!;
   }
 
@@ -197,7 +192,7 @@ describe('goals, wins, forfeits', () => {
 
   it('practice never ends on score', () => {
     const solo = claimSide(initialAirHockeyState(), 'a', 'p1')!;
-    let s = startPractice(solo, 'a', 'p1', 0, 500)!;
+    let s = startPractice(solo, 'a', 'p1', 500)!;
     for (let i = 0; i < AH_GOALS_TO_WIN + 3; i++) s = withGoal(s, 'b', 1000 + i)!;
     expect(s.status).toBe('playing');
     expect(s.winner).toBeNull();
@@ -208,7 +203,7 @@ describe('goals, wins, forfeits', () => {
     const s = withForfeit(playingVersus(), 'a')!;
     expect(s.status).toBe('ended');
     expect(s.winner).toBe('a');
-    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1')!, 'a', 'p1', 0, 1)!;
+    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1')!, 'a', 'p1', 1)!;
     expect(withForfeit(solo, 'a')).toBeNull();
   });
 
@@ -216,7 +211,7 @@ describe('goals, wins, forfeits', () => {
     const versus = playingVersus();
     expect(servePosition({ ...versus, servingSide: 'a' }).z).toBeLessThan(0);
     expect(servePosition({ ...versus, servingSide: 'b' }).z).toBeGreaterThan(0);
-    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1')!, 'a', 'p1', 0, 1)!;
+    const solo = startPractice(claimSide(initialAirHockeyState(), 'a', 'p1')!, 'a', 'p1', 1)!;
     expect(servePosition(solo)).toEqual({ x: 0, z: 0 });
   });
 });

@@ -24,7 +24,7 @@ import type { WorkoutPose } from "./voxelCharacter";
 import { InputManager } from "./input";
 import { findSeatAt, rebuildSeats, SEATS } from "./seats";
 import { STANDS, rebuildStands, standsForItem } from "./stands";
-import { readTableState, readCrapsTableState, clearAirHockeyKeys } from "./casinoDoc";
+import { readTableState, readCrapsTableState } from "./casinoDoc";
 import {
   beatCroupier,
   canRunCroupier,
@@ -3072,18 +3072,12 @@ export class World {
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
     } else if (removedKind === "air-hockey-table") {
       // 🏒 #115: drop the runtime session (stops the frame drive + tick
-      // routing to the freed handle) and wipe the table's doc state + fee
-      // CONFIG. Moves never pass here (the reconcile re-poses the existing
-      // group), so this only fires on true removals; both cleanups are
-      // idempotent deletes, safe for every observing client to run. Fee
-      // escrow records are deliberately NOT touched: each is settled by its
-      // one rightful writer via the session's escrow upkeep — a pre-start
-      // 'held' record refunds to ITS payer (table gone → not seated), a
-      // 'final' one sweeps to the recorded owner. Removal therefore never
-      // burns or redirects another player's chips.
+      // routing to the freed handle) and wipe the table's doc state. Moves
+      // never pass here (the reconcile re-poses the existing group), so this
+      // only fires on true removals; the delete is idempotent, safe for every
+      // observing client to run.
       closeAirHockeyTable(itemId);
       clearTable(itemId);
-      clearAirHockeyKeys(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -5665,11 +5659,7 @@ export class World {
       const target: DeviceTarget = stand
         ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
         : { ...device, eye };
-      const ui = createAirHockeyUI({
-        itemId: deviceId,
-        side,
-        isHouse: () => canEditRoom().ok,
-      });
+      const ui = createAirHockeyUI({ itemId: deviceId, side });
       deviceFocus.beginFocus(this.player, target, ui);
       return;
     }

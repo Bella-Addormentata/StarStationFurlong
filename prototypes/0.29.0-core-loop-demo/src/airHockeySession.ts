@@ -2,12 +2,9 @@
  * 🏒 Air-hockey session (#115) — the LIVE layer between the pure engine
  * (games/airHockey.ts) and everything it touches:
  *
- *  - the room doc (games/gamesDoc.ts `games` map): claims, ready/fee state,
+ *  - the room doc (games/gamesDoc.ts `games` map): claims, ready state,
  *    score, serve schedule — every transition is read → pure engine →
  *    transacted whole-value write (the checkers/chess discipline);
- *  - the casino ledger (casinoDoc.ts): pay-to-play fees ride the SAME chip
- *    machine as the slots/roulette (#115 "can use the same machine as casino
- *    chips to pay to play");
  *  - the 13-byte tick lane (network/protocol.ts): mallet ticks at 30 Hz and
  *    puck ticks at 20 Hz share the movement datagram path, discriminated by
  *    the flags-bits-6..7 lane kind — positions travel in WORLD space so a
@@ -16,7 +13,7 @@
  *  - the in-world table meshes (furniture.ts → AirHockeyVisualHandle): the
  *    SAME puck/mallet meshes serve players and spectators (the diegetic-
  *    display rule) — there is no separate DOM game surface, the DOM is only
- *    a HUD (score bar, claim/ready/fee card, pointer-lock prompt).
+ *    a HUD (score bar, claim/ready card, pointer-lock prompt).
  *
  * AUTHORITY MODEL (single operator, doc-recorded outcomes):
  *  - Exactly one client SIMULATES the puck at a time — the "operator". Side
@@ -40,8 +37,7 @@
 
 import {
   AH_GOALS_TO_WIN, AH_HALF_L, AH_HALF_W, AH_PUCK_R,
-  AH_SERVE_DELAY_MS, AH_STUCK_SPEED, AH_STUCK_TIMEOUT_MS, AH_MAX_FEE,
-  airHockeyEscrowAction,
+  AH_SERVE_DELAY_MS, AH_STUCK_SPEED, AH_STUCK_TIMEOUT_MS,
   claimSide, clampMallet, initialAirHockeyState, isVersus, otherSide, releaseSide,
   malletFromTick, malletToTick, puckFromTick, puckToTick,
   servePosition, setReady, setUnready, startIfReady, startPractice, stepPuck,
@@ -54,18 +50,11 @@ import {
   readAirHockey, readPlayerDisplayName, readRoomOwner, subscribeGames,
   writeGame,
 } from './games/gamesDoc';
-import {
-  casinoDocEpoch, finalizeAirHockeyFee, payAirHockeyFee, readAirHockeyFeeConfig,
-  readAirHockeyPaidRecord, readChips, refundAirHockeyFee,
-  scanAirHockeyPaidRecords, subscribeCasino, sweepAirHockeyFees,
-  writeAirHockeyFeeConfig,
-} from './casinoDoc';
-import { chipDotsHtml } from './chipDisplay';
+import { casinoDocEpoch } from './casinoDoc';
 // #116 review fix: HTML escaper for peer-authored strings that reach
 // innerHTML (the seat-row display-name interpolation, previously an XSS).
 import { escapeHtml } from './htmlEscape';
 import { getPlayerId } from './identity';
-import { legacyOwnerMarker } from './roomOwner';
 import {
   packTick, tickKind, TICK_KIND_AH_MALLET, TICK_KIND_AH_PUCK,
 } from './network/protocol';
@@ -96,8 +85,6 @@ const PUCK_DISPLAY_RATE = 18;
 const MALLET_DISPLAY_RATE = 22;
 /** Furthest ahead a remote puck is dead-reckoned (covers one dropped tick). */
 const PUCK_EXTRAPOLATE_MAX_S = 0.25;
-/** Escrow reconcile/sweep cadence — a cheap prefix scan of the casino map. */
-const ESCROW_UPKEEP_MS = 2000;
 
 // ── Per-table runtime state ──────────────────────────────────────────────────
 
@@ -256,8 +243,7 @@ function freshSession(handle: AirHockeyVisualHandle, pose: TablePose): TableSess
 }
 
 /** Drop a removed table's runtime state (world.ts removeFurnitureVisuals).
- *  Doc/ledger cleanup (clearTable, clearAirHockeyKeys) stays with the
- *  caller — this is runtime only. */
+ *  Doc cleanup (clearTable) stays with the caller — this is runtime only. */
 export function closeAirHockeyTable(itemId: string): void {
   sessions.delete(itemId);
 }
@@ -441,37 +427,6 @@ function amIOperator(st: TableSession, s: AirHockeyState, myId: string, now: num
   return now - st.lastMalletAt.a > OPERATOR_TAKEOVER_MS;
 }
 
-// ── Escrow upkeep (fee self-healing — see the casinoDoc.ts lane header) ──────
-
-let escrowUpkeepAt = 0;
-
-/**
- * One pass over every `ah-paid:` escrow record, each party acting only on
- * what is THEIRS:
- *  - my own records run the pure airHockeyEscrowAction predicate — a 'held'
- *    orphan (crash between pay and ready, a reset that unseated me, a
- *    removed table) refunds itself; a 'held' record whose match provably
- *    started finalizes (backstop for the start-transition hook below);
- *  - 'final' records ADDRESSED to me trigger one sweep (self-limiting:
- *    records name their recipient, so non-owners move nothing).
- * Runs on a slow timer even with zero live tables — records outlive their
- * table's doc state on purpose (removal must not touch other players'
- * money), so the interested party settles them here on return.
- */
-function runEscrowUpkeep(myId: string): void {
-  const records = scanAirHockeyPaidRecords();
-  if (records.length === 0) return;
-  let sweepDue = false;
-  for (const { tableId, playerId, record } of records) {
-    if (record.state === 'final' && record.ownerId === myId) sweepDue = true;
-    if (playerId !== myId) continue;
-    const action = airHockeyEscrowAction(record, readAirHockey(tableId), myId);
-    if (action === 'refund') refundAirHockeyFee(tableId, myId);
-    else if (action === 'finalize') finalizeAirHockeyFee(tableId, myId);
-  }
-  if (sweepDue) sweepAirHockeyFees(myId);
-}
-
 // ── Per-frame drive (called from World.update for ALL tables, every frame) ───
 
 /**
@@ -480,16 +435,8 @@ function runEscrowUpkeep(myId: string): void {
  * smoothing, and the in-world visuals (mallets, puck, scoreboard, lamps).
  */
 export function airHockeyFrame(dt: number): void {
-  const frameNow = Date.now();
-  // Escrow upkeep runs BEFORE the no-sessions bail: a removed table has no
-  // session, but its stranded fee records still need their payer/owner.
-  if (frameNow - escrowUpkeepAt >= ESCROW_UPKEEP_MS) {
-    escrowUpkeepAt = frameNow;
-    runEscrowUpkeep(getPlayerId());
-  }
-
   if (sessions.size === 0) return;
-  const now = frameNow;
+  const now = Date.now();
   const myId = getPlayerId();
 
   for (const itemId of sessions.keys()) {
@@ -518,14 +465,6 @@ export function airHockeyFrame(dt: number): void {
       st.puckActive = false;
       st.wasOperator = false;
       st.remotePuck = null;
-      // Fee settlement: the PAYER promotes their escrow to 'final' the frame
-      // they observe the start ("fees final once the match starts") — a
-      // no-op without a held record (free/owner/already final); the slow
-      // upkeep pass above is the crash backstop. Also covers a mid-match
-      // rejoin: the first observed startedAt settles the record then.
-      if (s && s.startedAt > 0 && (s.players.a === myId || s.players.b === myId)) {
-        finalizeAirHockeyFee(itemId, myId);
-      }
     }
 
     const input = st.engaged;
@@ -718,7 +657,7 @@ export function airHockeyFrame(dt: number): void {
 
     // ── Visuals: scoreboard + goal lamps (doc-driven — identical on every
     // client, operator or spectator; setScore dedupes internally). ──
-    st.handle.setScore(s?.score.a ?? 0, s?.score.b ?? 0, scoreboardLine(itemId, s, now));
+    st.handle.setScore(s?.score.a ?? 0, s?.score.b ?? 0, scoreboardLine(s, now));
     if (s && st.prevScore && s.startedAt === st.prevScore.startedAt) {
       // withGoal increments the SCORER; the lamp lights at the scored-on end.
       if (s.score.a > st.prevScore.a) st.handle.flashGoal('b');
@@ -731,12 +670,9 @@ export function airHockeyFrame(dt: number): void {
 }
 
 /** Pole-scoreboard status line (≤26 chars — the painter slices anyway). */
-function scoreboardLine(itemId: string, s: AirHockeyState | null, now: number): string {
+function scoreboardLine(s: AirHockeyState | null, now: number): string {
   if (!s || (s.status === 'waiting' && !s.players.a && !s.players.b)) {
-    const cfg = readAirHockeyFeeConfig(itemId);
-    return cfg?.enabled && cfg.feeAmount > 0
-      ? `FEE ${cfg.feeAmount} CHIPS TO PLAY`
-      : 'STAND AT AN END TO PLAY';
+    return 'STAND AT AN END TO PLAY';
   }
   if (s.status === 'waiting') {
     return s.players.a && s.players.b ? 'READY UP TO START' : 'WAITING FOR CHALLENGER';
@@ -757,8 +693,6 @@ export interface AirHockeyUIDeps {
   itemId: string;
   /** The END the player walked to (world.ts picks the free stand). */
   side: AirHockeySide;
-  /** Room-owner gate for the fee service row (canEditRoom().ok). */
-  isHouse: () => boolean;
 }
 
 const AH_UI_CYAN = '#35c8e8';
@@ -767,7 +701,7 @@ const AH_UI_GOLD = '#d4a84b';
 const AH_UI_GOLD_BRIGHT = '#F0C060';
 
 /**
- * The focused first-person HUD for one table end: claim/ready/fee/practice
+ * The focused first-person HUD for one table end: claim/ready/practice
  * card at the bottom, score strip on top, and the pointer-lock capture layer
  * that turns the mouse into the mallet (#115's control scheme). Mounted by
  * deviceFocus after the walk-up + camera ease; ALL shared state lives in the
@@ -782,9 +716,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   let card: HTMLDivElement | null = null;
   let prompt: HTMLDivElement | null = null;
   let unsubGames: (() => void) | null = null;
-  let unsubCasino: (() => void) | null = null;
-  /** Transient card error line ("NOT ENOUGH CHIPS") + its expiry. */
-  let notice: { text: string; until: number } | null = null;
   let lastTopHtml = '';
   let lastCardHtml = '';
 
@@ -800,18 +731,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   const locked = (): boolean =>
     captureLayer !== null && document.pointerLockElement === captureLayer;
 
-  /** The fee a ready-up would cost ME right now (0 = free/owner/off). */
-  const myFee = (): number => {
-    const cfg = readAirHockeyFeeConfig(deps.itemId);
-    if (!cfg?.enabled || cfg.feeAmount <= 0) return 0;
-    return cfg.ownerId === myId ? 0 : cfg.feeAmount;
-  };
-
-  const showNotice = (text: string): void => {
-    notice = { text, until: Date.now() + 4000 };
-    render();
-  };
-
   // ── Doc transitions (read → pure engine → transacted write) ────────────────
 
   const doClaim = (): void => {
@@ -820,93 +739,33 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     if (ns) writeGame(deps.itemId, ns);
   };
 
-  /** Escrow the fee (if one applies) then ready. The pay debits ME and
-   *  creates MY 'held' record (casinoDoc — idempotent on a crash retry); if
-   *  the ready write is beaten by a state change the escrow comes straight
-   *  back (a self-credit that cannot fail — no owner balance involved). */
-  /** #116 review fix: distinguish "prev fee not swept" from "insufficient
-   *  balance" — payAirHockeyFee now returns null for BOTH, and only a peek
-   *  at my record reveals which. A 'final' record means the previous match
-   *  ran, its fee is owed to the owner, and the owner hasn't swept yet
-   *  (typically because they're offline). */
-  const payFailureNotice = (): string => {
-    const existing = readAirHockeyPaidRecord(deps.itemId, myId);
-    if (existing && existing.state === 'final') {
-      return 'PREVIOUS FEE PENDING SWEEP — WAIT FOR ROOM OWNER';
-    }
-    return `NOT ENOUGH CHIPS — ENTRY FEE IS ${myFee()}`;
-  };
-
   const doReady = (): void => {
     const s = state();
     if (!s || s.status !== 'waiting' || s.players[side] !== myId || s.ready[side]) return;
-    const paid = payAirHockeyFee(deps.itemId, myId);
-    if (paid === null) {
-      showNotice(payFailureNotice());
-      return;
-    }
-    const ns = setReady(state() ?? s, side, myId, paid);
-    if (!ns) {
-      if (paid > 0) refundAirHockeyFee(deps.itemId, myId);
-      return;
-    }
+    const ns = setReady(s, side, myId);
+    if (!ns) return;
     writeGame(deps.itemId, ns);
     // Second readier promotes the start directly (frame loop is the backstop).
     const after = state();
     if (after) {
       const started = startIfReady(after, Date.now());
-      if (started) {
-        writeGame(deps.itemId, started);
-        // #116 review fix: finalize MY escrow immediately once the match-start
-        // write has landed. The frame loop's startedAt-transition hook is now
-        // only a crash backstop — if it were the sole path, a fast unready /
-        // unmount before the next frame could clear startedAt again and the
-        // reconciler would refund a fee whose match provably ran (violating
-        // "fees final once the match starts"). No-op when nothing is held
-        // (owner/free/already-final). The other side's finalize runs on its
-        // own client when that client observes startedAt.
-        if (paid > 0) finalizeAirHockeyFee(deps.itemId, myId);
-      }
+      if (started) writeGame(deps.itemId, started);
     }
   };
 
-  /** Un-ready. The refund deletes MY escrow record and credits MY balance —
-   *  pre-start money never reaches the owner, so it ALWAYS comes back (the
-   *  old "house cannot refund" dead-end is structurally gone). State first,
-   *  money second: a crash between the two strands a 'held' record that the
-   *  upkeep reconciler refunds on return. */
   const doUnready = (): void => {
     const s = state();
     if (!s || s.status !== 'waiting' || s.players[side] !== myId || !s.ready[side]) return;
     const ns = setUnready(s, side, myId);
-    if (!ns) return;
-    writeGame(deps.itemId, ns);
-    refundAirHockeyFee(deps.itemId, myId);
+    if (ns) writeGame(deps.itemId, ns);
   };
 
   const doPractice = (): void => {
     const s = state();
     if (!s || s.status !== 'waiting' || s.players[side] !== myId) return;
     if (s.players[otherSide(side)] !== null) return;
-    const paid = payAirHockeyFee(deps.itemId, myId);
-    if (paid === null) {
-      showNotice(payFailureNotice());
-      return;
-    }
-    const ns = startPractice(state() ?? s, side, myId, paid, Date.now());
-    if (!ns) {
-      // Same rollback shape as doReady — the escrow self-credit cannot fail.
-      if (paid > 0) refundAirHockeyFee(deps.itemId, myId);
-      return;
-    }
-    writeGame(deps.itemId, ns);
-    // #116 review fix: startPractice always yields startedAt > 0, so this
-    // fee is IMMEDIATELY final. Finalize inline rather than waiting for the
-    // next frame — otherwise a fast END PRACTICE (which writes the initial
-    // state before the frame observes the transition) would let the
-    // reconciler refund a fee whose match provably ran. No-op when nothing
-    // is held (owner/free).
-    if (paid > 0) finalizeAirHockeyFee(deps.itemId, myId);
+    const ns = startPractice(s, side, myId, Date.now());
+    if (ns) writeGame(deps.itemId, ns);
   };
 
   const doForfeit = (): void => {
@@ -931,23 +790,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   const doReset = (): void => {
     const s = state();
     if (!canReset(s)) return;
-    // Deliberately NO money code: refunding OTHER players here would put a
-    // second writer on their balance keys — the exact LWW hazard the escrow
-    // lane exists to remove. Unseating everyone instead makes each pre-start
-    // 'held' record refundable by ITS OWN payer (airHockeyEscrowAction:
-    // not seated → 'refund'), which every affected client's upkeep pass
-    // executes within seconds. Started fees are 'final' already — kept.
     writeGame(deps.itemId, initialAirHockeyState());
-  };
-
-  const writeFee = (enabled: boolean, amount: number): void => {
-    const owner = readRoomOwner();
-    if (!owner || legacyOwnerMarker(owner) || !deps.isHouse()) return;
-    writeAirHockeyFeeConfig(deps.itemId, {
-      enabled,
-      feeAmount: Math.max(0, Math.min(AH_MAX_FEE, Math.round(amount))),
-      ownerId: owner,
-    });
   };
 
   // ── Pointer lock + mouse → mallet ──────────────────────────────────────────
@@ -1068,8 +911,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
   const renderCard = (): void => {
     if (!card || !prompt) return;
     const s = state();
-    const now = Date.now();
-    if (notice && notice.until < now) notice = null;
 
     // Centre prompt: visible whenever I could be driving but the mouse is free.
     const showPrompt = canDrive() && !locked();
@@ -1080,9 +921,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     card.style.display = locked() ? 'none' : 'flex';
     if (locked()) return;
 
-    const chips = readChips(myId);
-    const fee = myFee();
-    const cfg = readAirHockeyFeeConfig(deps.itemId);
     const mine = s?.players[side] === myId;
     const otherPid = s?.players[otherSide(side)] ?? null;
 
@@ -1097,17 +935,15 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       } else if (!mine) {
         actions = `<div style="display:flex; gap:8px; align-items:center;">
           ${btn('ah-claim', `TAKE THE ${sideName(side)} END`, false, 'Claim this end of the table')}
-          ${fee > 0 ? `<span style="font-size:9px; color:rgba(212,168,75,0.6);">ENTRY FEE ${fee} ⛁ — CHARGED WHEN YOU READY UP</span>` : ''}
         </div>`;
       } else {
         const ready = s.ready[side];
-        const feeNote = fee > 0 && !ready ? ` — PAY ${fee} ⛁` : '';
         actions = `<div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
           ${ready
-            ? btn('ah-unready', 'UNREADY' + (s.paid[side] > 0 ? ` (REFUND ${s.paid[side]} ⛁)` : ''), false, 'Step back from ready — refunds your fee')
-            : btn('ah-ready', `READY UP${feeNote}`, fee > chips, fee > chips ? `Need ${fee} chips — you have ${chips}` : 'Lock in — the match starts when both ends are ready')}
+            ? btn('ah-unready', 'UNREADY', false, 'Step back from ready')
+            : btn('ah-ready', 'READY UP', false, 'Lock in — the match starts when both ends are ready')}
           ${otherPid === null && !ready
-            ? btn('ah-practice', `PRACTICE ALONE${feeNote}`, fee > chips, 'Free-play against both goals until someone joins')
+            ? btn('ah-practice', 'PRACTICE ALONE', false, 'Free-play against both goals until someone joins')
             : ''}
           ${btn('ah-leave', 'LEAVE TABLE', false, 'Release this end')}
         </div>`;
@@ -1123,36 +959,13 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       </div>`;
     }
 
-    // Owner service row — the #115 fee knob ("set by owner"), stored beside
-    // the chip ledger. Needs a claimed room (someone must RECEIVE the fee):
-    // a legacy 'Local-Clone' owner can't collect one either.
-    let service = '';
-    const roomOwner = readRoomOwner();
-    if (deps.isHouse() && roomOwner !== null && !legacyOwnerMarker(roomOwner)) {
-      const enabled = cfg?.enabled === true && (cfg?.feeAmount ?? 0) > 0;
-      const amount = cfg?.feeAmount ?? 0;
-      service = `
-        <div style="display:flex; gap:8px; align-items:center; border-top:1px solid rgba(212,168,75,0.15); padding-top:8px;">
-          <span style="font-size:9px; letter-spacing:1.5px; color:rgba(212,168,75,0.6);">HOUSE · TABLE FEE</span>
-          ${btn('ah-fee-dec', '−5', amount <= 0)}
-          <span style="font-size:11px; font-weight:800; color:${enabled ? AH_UI_GOLD_BRIGHT : '#4A5560'}; min-width:52px; text-align:center;">${amount} ⛁${enabled ? '' : ' (OFF)'}</span>
-          ${btn('ah-fee-inc', '+5', amount >= AH_MAX_FEE)}
-          ${enabled ? btn('ah-fee-off', 'DISABLE', false, 'Free play') : btn('ah-fee-on', 'ENABLE', amount <= 0, amount <= 0 ? 'Set an amount first' : 'Charge per player per match')}
-        </div>`;
-    }
-
     const html = `
       <div style="display:flex; justify-content:space-between; align-items:baseline;">
         <span style="font-size:12px; font-weight:800; color:${AH_UI_GOLD_BRIGHT}; letter-spacing:1px;">🏒 AIR HOCKEY</span>
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
       <div style="display:flex; gap:8px;">${seatRow(s, 'a')}${seatRow(s, 'b')}</div>
-      ${actions}
-      ${notice ? `<div style="font-size:10px; font-weight:800; letter-spacing:1px; color:#FF8A80;">${notice.text}</div>` : ''}
-      <div style="display:flex; align-items:center; gap:8px; font-size:9px; color:rgba(212,168,75,0.6);">
-        <span>YOUR CHIPS: ${chips}</span>${chipDotsHtml(chips)}
-      </div>
-      ${service}`;
+      ${actions}`;
     if (html !== lastCardHtml) {
       lastCardHtml = html;
       card.innerHTML = html;
@@ -1168,8 +981,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     e.stopPropagation();
     const target = (e.target as HTMLElement).closest('button');
     if (!target || target.disabled) return;
-    const cfg = readAirHockeyFeeConfig(deps.itemId);
-    const amount = cfg?.feeAmount ?? 0;
     switch (target.id) {
       case 'ah-claim': doClaim(); break;
       case 'ah-ready': doReady(); break;
@@ -1178,23 +989,16 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       case 'ah-forfeit': doForfeit(); break;
       case 'ah-reset': doReset(); break;
       case 'ah-leave': leaveSide(); render(); break;
-      case 'ah-fee-dec': writeFee(cfg?.enabled === true, amount - 5); break;
-      case 'ah-fee-inc': writeFee(cfg?.enabled === true, amount + 5); break;
-      case 'ah-fee-on': writeFee(true, amount); break;
-      case 'ah-fee-off': writeFee(false, amount); break;
     }
   };
 
-  /** Give up my claim (refunding a readied fee) — the LEAVE button and the
-   *  waiting-state unmount share this. Same state-then-money order as
-   *  doUnready; the self-credit refund is a no-op when nothing is held and
-   *  cannot fail when something is, so walking away never strands a fee. */
+  /** Give up my claim — the LEAVE button and the waiting-state unmount share
+   *  this. */
   const leaveSide = (): void => {
     const s = state();
     if (!s || s.status !== 'waiting' || s.players[side] !== myId) return;
     const ns = releaseSide(s, side, myId);
     if (ns) writeGame(deps.itemId, ns);
-    refundAirHockeyFee(deps.itemId, myId);
   };
 
   return {
@@ -1298,7 +1102,6 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       document.addEventListener('mousedown', onMouseDown);
       document.addEventListener('mouseup', onMouseUp);
       unsubGames = subscribeGames(() => render());
-      unsubCasino = subscribeCasino(() => render());
       render();
     },
 
@@ -1310,12 +1113,10 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
       if (locked()) document.exitPointerLock();
       unsubGames?.();
       unsubGames = null;
-      unsubCasino?.();
-      unsubCasino = null;
 
       // Walk-away semantics per state:
-      //  waiting  → release the end (refund a readied fee);
-      //  practice → abandon: reopen the table (the fee is spent — final);
+      //  waiting  → release the end;
+      //  practice → abandon: reopen the table;
       //  versus   → KEEP the claim: my ticks stop, the opponent's forfeit
       //             clock takes the match from here (#115 walkover);
       //  ended    → leave the result standing for NEW MATCH.
@@ -1348,7 +1149,7 @@ export function createAirHockeyUI(deps: AirHockeyUIDeps): DeviceUI {
     },
 
     update(): void {
-      // Time-driven text only (serve countdown, notice expiry) — the HTML
+      // Time-driven text only (the serve countdown) — the HTML
       // diff in render() makes the per-frame call cheap; doc changes repaint
       // via the observers.
       render();

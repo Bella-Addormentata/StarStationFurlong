@@ -5,7 +5,7 @@
  * layering contract as checkers.ts/chess.ts. Three concerns live here so they
  * are unit-testable in isolation (airHockey.test.ts):
  *
- *  1. THE DOC STATE (AirHockeyState) — claims/ready/fees/score/lifecycle,
+ *  1. THE DOC STATE (AirHockeyState) — claims/ready/score/lifecycle,
  *     stored whole-value in the room doc's `games` map keyed by the table's
  *     furniture item id (games/gamesDoc.ts). Every transition is
  *     read → pure helper here → transacted write, LWW per table key.
@@ -80,8 +80,6 @@ export const AH_SERVE_DELAY_MS = 1200;
 /** A puck slower than this for AH_STUCK_TIMEOUT_MS gets re-served. */
 export const AH_STUCK_SPEED = 0.05;
 export const AH_STUCK_TIMEOUT_MS = 8000;
-/** Owner-set per-player fee ceiling (chips) — see casinoDoc.ts. */
-export const AH_MAX_FEE = 500;
 
 // ── Doc state ────────────────────────────────────────────────────────────────
 
@@ -99,16 +97,13 @@ export interface AirHockeyState {
   players: { a: string | null; b: string | null };
   /** Ready flags — both true flips status to 'playing'. */
   ready: { a: boolean; b: boolean };
-  /** Chips each side paid at ready-up (0 = free) — refunded on un-ready,
-   *  final once startedAt is set. */
-  paid: { a: number; b: number };
   score: { a: number; b: number };
   status: AirHockeyStatus;
   /** Who receives the next serve (the side just scored on, per convention). */
   servingSide: AirHockeySide;
   /** Wall-clock ms when the operator serves next, 0 = no serve scheduled. */
   serveAt: number;
-  /** Wall-clock ms the match started, 0 = not started (fees refundable). */
+  /** Wall-clock ms the match started, 0 = not started. */
   startedAt: number;
   winner: AirHockeySide | null;
 }
@@ -118,7 +113,6 @@ export function initialAirHockeyState(): AirHockeyState {
     kind: 'airhockey',
     players: { a: null, b: null },
     ready: { a: false, b: false },
-    paid: { a: 0, b: 0 },
     score: { a: 0, b: 0 },
     status: 'waiting',
     servingSide: 'a',
@@ -143,115 +137,20 @@ export function isAirHockeyState(value: unknown): value is AirHockeyState {
     typeof r === 'object' && r !== null
     && ok((r as Record<string, unknown>).a) && ok((r as Record<string, unknown>).b);
   const boolOk = (v: unknown) => typeof v === 'boolean';
-  // Fee/score/time fields must be SAFE non-negative integers: a peer-written
-  // fractional or astronomically large number would otherwise flow into chip
-  // arithmetic and countdown math (the checkers guard F2 lesson).
+  // Score/time fields must be SAFE non-negative integers: a peer-written
+  // fractional or astronomically large number would otherwise flow into the
+  // score and countdown math (the checkers guard F2 lesson).
   const countOk = (v: unknown) =>
     Number.isSafeInteger(v) && (v as number) >= 0;
   return s.kind === 'airhockey'
     && sideRecord(s.players, playerOk)
     && sideRecord(s.ready, boolOk)
-    && sideRecord(s.paid, countOk)
     && sideRecord(s.score, countOk)
     && (s.status === 'waiting' || s.status === 'playing' || s.status === 'ended')
     && (s.servingSide === 'a' || s.servingSide === 'b')
     && countOk(s.serveAt)
     && countOk(s.startedAt)
     && (s.winner === null || s.winner === 'a' || s.winner === 'b');
-}
-
-// ── Fee config (lives in the CASINO map, key `ah-fee:<tableId>`) ─────────────
-
-/**
- * Owner-set pay-to-play config (#115 "optionally can enable a fee to start a
- * game / set by owner"). Stored beside the chip balances so fees "use the same
- * machine as casino chips" — casinoDoc.ts owns the reads/writes/transfers.
- */
-export interface AirHockeyFeeConfig {
-  enabled: boolean;
-  /** Chips per player per match, 0..AH_MAX_FEE. */
-  feeAmount: number;
-  /** Room owner the fee is paid to; the owner plays their own table free. */
-  ownerId: string;
-}
-
-/** Shape guard for peer-written fee configs (slots/roulette guard pattern). */
-export function isAirHockeyFeeConfig(value: unknown): value is AirHockeyFeeConfig {
-  if (typeof value !== 'object' || value === null) return false;
-  const c = value as Partial<AirHockeyFeeConfig>;
-  return typeof c.enabled === 'boolean'
-    && Number.isSafeInteger(c.feeAmount)
-    && (c.feeAmount as number) >= 0 && (c.feeAmount as number) <= AH_MAX_FEE
-    && typeof c.ownerId === 'string' && c.ownerId.length > 0 && c.ownerId.length <= 128;
-}
-
-// ── Fee escrow record (CASINO map, key `ah-paid:<tableId>:<playerId>`) ───────
-
-/**
- * One player's escrowed entry fee for one table. Created by the PAYER (their
- * own balance debited in the same transaction), refunded by the payer while
- * 'held', promoted to 'final' by the payer when they observe the match start,
- * and swept (credited + deleted) by the recorded owner once 'final'. Every
- * lifecycle phase has exactly ONE writer, so per-key LWW can neither mint nor
- * destroy chips — see casinoDoc.ts for the money moves.
- */
-export interface AirHockeyPaidRecord {
-  /** Chips debited from the payer at creation — the refund/sweep amount. */
-  amount: number;
-  /** Fee recipient captured at pay time (the validated config's ownerId). */
-  ownerId: string;
-  /** 'held' = refundable by the payer; 'final' = sweepable by the owner. */
-  state: 'held' | 'final';
-}
-
-/** Shape guard for peer-written escrow records. The AH_MAX_FEE cap bounds
- *  what a forged record could ever move in a sweep (hostile peers sit outside
- *  the casino map's trust model, but a bound costs nothing). */
-export function isAirHockeyPaidRecord(value: unknown): value is AirHockeyPaidRecord {
-  if (typeof value !== 'object' || value === null) return false;
-  const r = value as Partial<AirHockeyPaidRecord>;
-  return Number.isSafeInteger(r.amount)
-    && (r.amount as number) > 0 && (r.amount as number) <= AH_MAX_FEE
-    && typeof r.ownerId === 'string' && r.ownerId.length > 0 && r.ownerId.length <= 128
-    && (r.state === 'held' || r.state === 'final');
-}
-
-/** What the PAYER should do with their own escrow record right now. */
-export type AirHockeyEscrowAction = 'none' | 'refund' | 'finalize';
-
-/**
- * Pure reconciler predicate: given MY record and the table's current state,
- * decide the payer-side action. Run on the start transition and on a slow
- * timer (airHockeySession), it self-heals every orphan a crash, reset, kick,
- * or table removal can strand — without ever touching another player's keys.
- *
- * Arms, in precedence order:
- *  - 'final' records are the OWNER's business (sweep) — the payer never
- *    touches them again ("fees become final once the match starts");
- *  - no table state → the table was cleared/removed pre-start → refund;
- *  - not seated → reset/kick/release happened → refund;
- *  - startedAt stamped while seated → the match ran (playing OR already
- *    ended) → finalize (covers a crash between start and the normal
- *    finalize hook);
- *  - seated + ready, not started → the legitimate waiting escrow → none;
- *  - seated, NOT ready → the pay landed but the ready write never did
- *    (crash between the two) → refund.
- *
- * Ties break toward the PLAYER: a stale 'held' record refunds rather than
- * finalizes whenever the state cannot prove the match ran.
- */
-export function airHockeyEscrowAction(
-  record: AirHockeyPaidRecord,
-  s: AirHockeyState | null,
-  playerId: string,
-): AirHockeyEscrowAction {
-  if (record.state === 'final') return 'none';
-  if (!s) return 'refund';
-  const side = s.players.a === playerId ? 'a' : s.players.b === playerId ? 'b' : null;
-  if (side === null) return 'refund';
-  if (s.startedAt > 0) return 'finalize';
-  if (s.ready[side]) return 'none';
-  return 'refund';
 }
 
 // ── Doc-state transitions (pure — callers wrap in read → here → write) ───────
@@ -269,7 +168,7 @@ export function claimSide(
   return { ...s, players: { ...s.players, [side]: playerId } };
 }
 
-/** Release a side pre-game (walk-away/un-claim); ready + paid reset with it. */
+/** Release a side pre-game (walk-away/un-claim); ready resets with it. */
 export function releaseSide(
   s: AirHockeyState,
   side: AirHockeySide,
@@ -280,31 +179,21 @@ export function releaseSide(
     ...s,
     players: { ...s.players, [side]: null },
     ready: { ...s.ready, [side]: false },
-    paid: { ...s.paid, [side]: 0 },
   };
 }
 
-/** Mark a claimed side ready, recording the fee it paid (0 = free). */
+/** Mark a claimed side ready. */
 export function setReady(
   s: AirHockeyState,
   side: AirHockeySide,
   playerId: string,
-  paidAmount: number,
 ): AirHockeyState | null {
   if (s.status !== 'waiting' || s.players[side] !== playerId) return null;
   if (s.ready[side]) return null;
-  if (!Number.isSafeInteger(paidAmount) || paidAmount < 0) return null;
-  return {
-    ...s,
-    ready: { ...s.ready, [side]: true },
-    paid: { ...s.paid, [side]: paidAmount },
-  };
+  return { ...s, ready: { ...s.ready, [side]: true } };
 }
 
-/** Un-ready a side pre-start. The caller refunds the player's escrow record
- *  after the write (casinoDoc.refundAirHockeyFee — self-credit, refused
- *  only by its MAX_SAFE_INTEGER overflow guard, which keeps the record for
- *  a later retry); `paid` here is display/guard state only. */
+/** Un-ready a side pre-start. */
 export function setUnready(
   s: AirHockeyState,
   side: AirHockeySide,
@@ -312,11 +201,7 @@ export function setUnready(
 ): AirHockeyState | null {
   if (s.status !== 'waiting' || s.players[side] !== playerId) return null;
   if (!s.ready[side]) return null;
-  return {
-    ...s,
-    ready: { ...s.ready, [side]: false },
-    paid: { ...s.paid, [side]: 0 },
-  };
+  return { ...s, ready: { ...s.ready, [side]: false } };
 }
 
 /** Both sides ready → the match begins. Idempotent-safe on the LWW ready
@@ -335,21 +220,18 @@ export function startIfReady(s: AirHockeyState, now: number): AirHockeyState | n
   };
 }
 
-/** Solo practice: one claimant free-plays (no win condition, fee still due). */
+/** Solo practice: one claimant plays against both goals (no win condition). */
 export function startPractice(
   s: AirHockeyState,
   side: AirHockeySide,
   playerId: string,
-  paidAmount: number,
   now: number,
 ): AirHockeyState | null {
   if (s.status !== 'waiting' || s.players[side] !== playerId) return null;
   if (s.players[otherSide(side)] !== null) return null; // versus takes priority
-  if (!Number.isSafeInteger(paidAmount) || paidAmount < 0) return null;
   return {
     ...s,
     ready: { ...s.ready, [side]: true },
-    paid: { ...s.paid, [side]: paidAmount },
     status: 'playing',
     score: { a: 0, b: 0 },
     servingSide: side,
