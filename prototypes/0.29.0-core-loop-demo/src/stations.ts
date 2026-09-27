@@ -103,8 +103,11 @@ export interface StationMove {
   departAt: number;
   /** Real ms of the capture burn at the new planet. */
   arriveAt: number;
-  /** Under its own thrusters. ('tug' comes with tugs.) */
-  mode: 'thrusters';
+  /** Under its own thrusters (a Hohmann transfer at a launch window), or
+   *  towed by a tug (a torch flight that leaves at once). */
+  mode: 'thrusters' | 'tug';
+  /** The tug's room, on a tow. */
+  tugRoomId?: string;
   /** Propellant the move burns. */
   fuel: number;
   /** The tank's draw meter after paying for it (shipDoc.setFuelDrawMeter). */
@@ -445,6 +448,11 @@ let currentRoomGetter: () => string = () => '';
 /** main.ts injects the room the player is standing in (no import cycle). */
 export function setStationRoomSource(cb: () => string): void {
   currentRoomGetter = cb;
+}
+
+/** The room the player is standing in ('' before main.ts wires it). */
+export function currentRoomId(): string {
+  return currentRoomGetter();
 }
 
 /** The station the player is in now, or null before the atlas knows the room. */

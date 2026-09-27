@@ -10,8 +10,8 @@
 import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
 import { angleAt, realMsFor, stationOrbit } from './orbits';
-import { AU_KM, interplanetaryPointAt, planetSunOrbit, sunAngleAt } from './solarOrbits';
-import { describeMove, movePlan } from './stationMove';
+import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
+import { describeMove, moveTransitPointAt } from './stationMove';
 import type { StationMove } from './stations';
 
 export interface MapBody {
@@ -92,17 +92,15 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
 const MAP_PER_AU = 180;
 
 /** Where a moving station is drawn: around its old planet until the burn,
- *  on the transfer ellipse around the sun, then around its new planet. */
+ *  on its course around the sun (the transfer ellipse, or a tug's straight
+ *  torch run), then around its new planet. */
 function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['placeAt']> {
-  const plan = movePlan(move);
   const from = stationOrbit({ planetId: move.fromPlanetId, orbitSlot: move.fromSlot });
   const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });
   const slotRadius = (slot: number) => STATION_ORBIT_BASE + slot * STATION_ORBIT_STEP;
   return (nowMs: number) => {
-    if (plan && nowMs >= move.departAt && nowMs < move.arriveAt) {
-      const p = interplanetaryPointAt(plan, nowMs);
-      return { angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU };
-    }
+    const p = moveTransitPointAt(move, nowMs);
+    if (p) return { angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU };
     if (nowMs >= move.arriveAt) return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
     return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: slotRadius(s.orbitSlot) };
   };

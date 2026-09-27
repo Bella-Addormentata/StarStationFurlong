@@ -12,13 +12,22 @@ import {
   summaryForStation,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
-import { planPlanetTransfer } from './solarOrbits';
+import { planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
 import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
 import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeOrbitTrim } from './stationKeeping';
 import {
+  TUG_ACCEL_KMS2,
+  TUG_MIN_ENGINES,
   bindStationMoveDoc,
+  cleanMove,
   freeSlotAround,
+  isTowing,
+  moveTransitPointAt,
+  planStationTow,
+  planTow,
+  towFuelCost,
+  towPointAt,
   installStationMoveResolver,
   isStationMove,
   movePhase,
@@ -30,7 +39,7 @@ import {
   rememberMove,
   writeStationMove,
 } from './stationMove';
-import type { MoveContext, StationMove } from './stationMove';
+import type { MoveContext, StationMove, TowContext } from './stationMove';
 import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
@@ -284,5 +293,90 @@ describe('moves between installs', () => {
     doc.getMap('stationSummaries').set('yard-lobby', summary);
     bindPlanetSummaryDoc(doc, { currentStation: () => null, localTrim: () => null, ship: () => null });
     expect(readRememberedMoves()).toEqual([move]);
+  });
+});
+
+describe('tugs: a torch tow', () => {
+  const towCtx = (over: Partial<TowContext> = {}): TowContext => {
+    const stations = listStations({}, [], NOW);
+    return {
+      station: stations.find((s) => s.id === DEFAULT_STATION_ID)!,
+      stations,
+      tugRoomId: 'tug-room',
+      commander: true,
+      engines: TUG_MIN_ENGINES,
+      fuel: 10_000,
+      drawn: 3,
+      deficit: 0,
+      modules: 2,
+      now: NOW,
+      ...over,
+    };
+  };
+  const angleGap = (a: number, b: number) => {
+    const d = ((a - b) % (2 * Math.PI) + 3 * Math.PI) % (2 * Math.PI) - Math.PI;
+    return Math.abs(d);
+  };
+
+  it('leaves at once and takes hours, not days, wherever the planets are', () => {
+    for (let k = 0; k < 12; k++) {
+      const t0 = NOW + k * 9 * 3_600_000;
+      const plan = planTow(SOV, ARIS, t0)!;
+      expect(plan.departAt).toBe(t0);
+      const hours = plan.transferMs / 3_600_000;
+      expect(hours).toBeGreaterThan(6);
+      expect(hours).toBeLessThan(16);
+      // Constant thrust: Δv = a·t, and the course is 2·√(d/a) long.
+      const tS = (plan.transferMs / 1000) * 60;
+      expect(plan.deltaVKmS).toBeCloseTo(TUG_ACCEL_KMS2 * tS, 0);
+      expect(tS).toBeCloseTo(2 * Math.sqrt(plan.distanceKm / TUG_ACCEL_KMS2), -3);
+    }
+    expect(planTow(SOV, SOV, NOW)).toBeNull();
+  });
+
+  it('writes a tug move that starts at the old planet and ends on the new one', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const move = plan.move;
+    expect(move).toMatchObject({ mode: 'tug', tugRoomId: 'tug-room', departAt: NOW, fromPlanetId: SOV, toPlanetId: ARIS });
+    expect(isStationMove(move)).toBe(true);
+    expect(move.fuel).toBe(towFuelCost(plan.quote.plan.deltaVKmS, 2));
+    expect(move.fuelDrawn).toBe(3 + move.fuel);
+    const start = moveTransitPointAt(move, move.departAt + 1)!;
+    const from = planetSunPointAt(SOV, move.departAt);
+    expect(start.radiusKm / from.radiusKm).toBeCloseTo(1, 3);
+    expect(angleGap(start.angle, from.angle)).toBeLessThan(1e-3);
+    const end = towPointAt(move, move.arriveAt);
+    const to = planetSunPointAt(ARIS, move.arriveAt);
+    expect(end.radiusKm / to.radiusKm).toBeCloseTo(1, 6);
+    expect(angleGap(end.angle, to.angle)).toBeLessThan(1e-6);
+    expect(moveTransitPointAt(move, move.arriveAt)).toBeNull();
+    // The station list follows the tow like any move.
+    setStationMoveResolver(() => move);
+    expect(stationInTransit(listStations({}, [], NOW + 1).find((s) => s.id === DEFAULT_STATION_ID)!, NOW + 1)).toBe(true);
+    expect(listStations({}, [], move.arriveAt).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS });
+  });
+
+  it('refuses a weak ship, a dry one, and a station already moving', () => {
+    expect(planStationTow(towCtx({ station: null }), ARIS)).toMatchObject({ ok: false, refusal: 'not-docked' });
+    expect(planStationTow(towCtx({ commander: false }), ARIS)).toMatchObject({ ok: false, refusal: 'not-commander' });
+    expect(planStationTow(towCtx({ engines: TUG_MIN_ENGINES - 1 }), ARIS)).toMatchObject({ ok: false, refusal: 'too-weak' });
+    expect(planStationTow(towCtx({ fuel: 1 }), ARIS)).toMatchObject({ ok: false, refusal: 'no-fuel' });
+    expect(planStationTow(towCtx(), SOV)).toMatchObject({ ok: false, refusal: 'same-planet' });
+    const busy = { ...towCtx().station!, move: moveTo() };
+    expect(planStationTow(towCtx({ station: busy }), ARIS)).toMatchObject({ ok: false, refusal: 'moving' });
+  });
+
+  it('keeps the tug\'s room on the record and holds that tug while it tows', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(isStationMove({ ...plan.move, tugRoomId: undefined })).toBe(false);
+    expect(cleanMove(plan.move).tugRoomId).toBe('tug-room');
+    expect(cleanMove(moveTo())).not.toHaveProperty('tugRoomId');
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(plan.move);
+    expect(isTowing('tug-room', NOW + 1)).toBe(true);
+    expect(isTowing('other-room', NOW + 1)).toBe(false);
+    expect(isTowing('tug-room', plan.move.arriveAt)).toBe(false);
   });
 });
