@@ -171,6 +171,11 @@ describe('transitLayout', () => {
     fuelDrawn: 1,
   };
 
+  it('is null for a thruster move whose ends are one planet (no course to show)', () => {
+    const bad: StationMove = { ...move, mode: 'thrusters', toPlanetId: 'planet-sovereign', tugRoomId: undefined };
+    expect(transitLayout(bad, (move.departAt + move.arriveAt) / 2)).toBeNull();
+  });
+
   it('is null outside the transit', () => {
     expect(transitLayout(move, move.departAt - 1)).toBeNull();
     expect(transitLayout(move, move.arriveAt + 1)).toBeNull();

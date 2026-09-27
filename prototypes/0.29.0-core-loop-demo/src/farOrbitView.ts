@@ -39,6 +39,7 @@ import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { shipsAroundPlanet } from './planetSummary';
+import { moveTransitPointAt } from './stationMove';
 import { readFlightRecord, shipDocBound } from './shipDoc';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -143,7 +144,10 @@ function gather(now: number): Source {
     : currentStation() ??
       all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0) ??
       null;
-  if (me?.move && stationInTransit(me, now)) {
+  // The sun view only while the move really has a course right now (a
+  // malformed record, say both ends on one planet, has none): otherwise the
+  // planet view below, never an empty backdrop.
+  if (me?.move && stationInTransit(me, now) && moveTransitPointAt(me.move, now)) {
     const m = me.move;
     return { mode: 'sun', move: m, key: [
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
@@ -240,7 +244,10 @@ let builtKey = '';
 let lastRefresh = 0;
 /** OLD_PLANET_NAMES found in the scene, re-found after a refresh. */
 let oldPlanets: THREE.Object3D[] | null = null;
-/** Screen-sized objects: body id → [object, px per local unit]. */
+/** Bodies are keyed by kind AND id: a station's id is free text and could
+ *  equal a ship's `ship:<room>`. */
+const bodyKey = (b: FarBody): string => `${b.kind}\u0000${b.id}`;
+/** Screen-sized objects: body key → [object, px per local unit]. */
 const bodies = new Map<string, { obj: THREE.Object3D; px: number }>();
 
 function ensureScene(): void {
@@ -414,7 +421,7 @@ function buildFrame(layout: FarLayout): void {
     obj.add(label);
     obj.name = `far-body-${b.id}`;
     frame.add(obj);
-    bodies.set(b.id, { obj, px });
+    bodies.set(bodyKey(b), { obj, px });
   }
 
   farScene.add(frame);
@@ -426,7 +433,7 @@ function poseFrame(layout: FarLayout): void {
   frame.position.set(layout.transform.position.x, layout.transform.position.y, layout.transform.position.z);
   frame.rotation.set(0, layout.transform.rotationY, 0);
   for (const b of layout.bodies) {
-    const entry = bodies.get(b.id);
+    const entry = bodies.get(bodyKey(b));
     if (!entry) continue;
     entry.obj.position.set(b.position.x, b.position.y, b.position.z);
     // Line the impostor up with its orbit (rotation.y = its orbit angle puts
@@ -448,7 +455,9 @@ function sizeBodies(heightPx: number): void {
   const perPxAt1 = (2 * Math.tan(THREE.MathUtils.degToRad(farCamera.fov) / 2)) / Math.max(1, heightPx);
   for (const { obj, px } of bodies.values()) {
     obj.getWorldPosition(tmp);
-    const d = tmp.distanceTo(farCamera.position);
+    // Camera-space depth, not distance: a perspective projection scales
+    // by depth, so an off-axis body keeps its size as the view drifts.
+    const d = Math.max(1, -tmp.applyMatrix4(farCamera.matrixWorldInverse).z);
     obj.scale.setScalar(d * perPxAt1 * px);
   }
 }
