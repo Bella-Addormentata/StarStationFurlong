@@ -411,6 +411,7 @@ export type TowRefusal =
   | 'same-planet'
   | 'no-slot'
   | 'too-weak' // fewer than TUG_MIN_ENGINES engine blocks
+  | 'unknown-layout' // this install does not know the station's modules
   | 'no-fuel';
 
 export interface TowContext {
@@ -425,7 +426,8 @@ export interface TowContext {
   /** Fuel tows and moves have drawn in the tug's room (readMoveFuelDrawn). */
   drawn: number;
   deficit: number;
-  /** Modules in the station being towed. */
+  /** Modules in the station being towed; 0 when this install does not know
+   *  its layout (its welcome room is not in the atlas), and no tow is priced. */
   modules: number;
   now: number;
 }
@@ -448,7 +450,9 @@ export function quoteTow(
   modules: number,
   now: number,
 ): TowQuote | null {
-  if (!station) return null;
+  // No quote for a layout this install cannot see (0 modules): a price
+  // clamped to one module would undercharge the tow.
+  if (!station || !(modules >= 1)) return null;
   const to = planetById(toPlanetId).id;
   if (to === planetById(station.planetId).id) return null;
   const toSlot = freeSlotAround(to, stations, station.id);
@@ -466,6 +470,9 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
+  // A tow's price scales with the modules pushed: one guessed from a layout
+  // this install cannot see would undercharge it.
+  if (!(ctx.modules >= 1)) return { ok: false, refusal: 'unknown-layout', quote: null };
   const quote = quoteTow(station, ctx.stations, toPlanetId, ctx.modules, now);
   if (!quote) return { ok: false, refusal: 'no-slot', quote: null };
   if (ctx.engines < TUG_MIN_ENGINES) return { ok: false, refusal: 'too-weak', quote };
@@ -499,6 +506,7 @@ export function describeTowRefusal(refusal: TowRefusal, quote: TowQuote | null, 
     case 'same-planet': return 'The station already orbits that planet.';
     case 'no-slot': return 'Every orbit around that planet is taken.';
     case 'too-weak': return `A tug needs at least ${TUG_MIN_ENGINES} ENGINE BLOCKs.`;
+    case 'unknown-layout': return 'This ship does not know the station\'s layout yet, so the tow cannot be priced.';
     case 'no-fuel': return `Needs ${quote?.fuel ?? '?'} fuel; ${Math.floor(fuel)} aboard. Fit more FUEL TANKs and refuel.`;
   }
 }
@@ -746,33 +754,87 @@ const ENTRY_PREFIX = 'move:';
  *  whose fuelDrawn was the room's running total. Still read, never written. */
 const LEGACY_KEY = 'move';
 
+/** Prefix of the settled part of the move log: `moveSettled:<clientID>:<at>`
+ *  holding { through, drawn }: the 'stationMove' meter's total for every
+ *  entry pruned from the log so far (the legacy record's too). Readers take
+ *  the one with the latest `through`; each pruning writes a new one and
+ *  drops the old ones it saw. */
+const SETTLED_PREFIX = 'moveSettled:';
+
+/** Entries that arrived longer ago than this can leave the log, unless they
+ *  still stand as a station's move or next to a move that stays. */
+export const MOVE_LOG_KEEP_MS = 24 * 60 * 60 * 1000;
+
+interface SettledMoves { through: number; drawn: number }
+
+/** A settled total off the wire: `through` no later than the move horizon
+ *  past `nowMs` (a far-future one would stand over every later pruning) and
+ *  `drawn` within the fuel meter's range. */
+function isSettledMoves(v: unknown, nowMs: number = Date.now()): v is SettledMoves {
+  const r = v as SettledMoves;
+  return !!r && typeof r === 'object' && Number.isFinite(r.through) && r.through <= nowMs + MOVE_HORIZON_MS
+    && Number.isFinite(r.drawn) && r.drawn >= 0 && r.drawn <= FUEL_METER_MAX;
+}
+
 function validMove(raw: unknown): StationMove | null {
   return isStationMove(raw) && isPlausibleMove(raw) ? cleanMove(raw) : null;
 }
 
-/** Every move this room's doc holds: its entries, and a legacy record. */
-function roomMoves(): { entries: StationMove[]; legacy: StationMove | null } {
-  if (!docAlive()) return { entries: [], legacy: null };
-  const entries: StationMove[] = [];
+/** Every move this room's doc holds: its entries (with their keys), a legacy
+ *  record, and the settled total of the entries already pruned. */
+function roomMoves(): {
+  entries: StationMove[];
+  keyed: Array<{ key: string; move: StationMove }>;
+  legacy: StationMove | null;
+  settled: SettledMoves | null;
+  settledKeys: string[];
+} {
+  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled: null, settledKeys: [] };
+  const keyed: Array<{ key: string; move: StationMove }> = [];
+  let settled: SettledMoves | null = null;
+  const settledKeys: string[] = [];
   keepMap!.forEach((v, k) => {
+    if (k.startsWith(SETTLED_PREFIX)) {
+      settledKeys.push(k);
+      if (isSettledMoves(v) && (!settled || v.through > settled.through
+        || (v.through === settled.through && v.drawn > settled.drawn))) settled = { through: v.through, drawn: v.drawn };
+      return;
+    }
     if (!k.startsWith(ENTRY_PREFIX)) return;
     const m = validMove(v);
-    if (m) entries.push(m);
+    if (m) keyed.push({ key: k, move: m });
   });
-  return { entries, legacy: validMove(keepMap!.get(LEGACY_KEY)) };
+  return { entries: keyed.map((e) => e.move), keyed, legacy: validMove(keepMap!.get(LEGACY_KEY)), settled, settledKeys };
+}
+
+/** The move a record stands for: a pin's settled move, else itself. */
+function flownOf(m: StationMove): StationMove {
+  return m.settles ?? m;
 }
 
 /** Did a concurrent move of the same station win over this one? Another
  *  move booked at the same time (concurrentMoves: each before the other
  *  arrived, however far apart their flights) that wins the one order
- *  (compareMoves), or a cancel of this very move. The winner is also what
- *  the station list follows, so the loser never flies: it holds no tug, and
- *  its fuel is not drawn. */
+ *  (compareMoves), or a cancel of this very move. A pin stands for the move
+ *  it settles on both counts, so the winner's arrival pin still beats every
+ *  move its flight beat, and a cancel beats its move's own arrival pin. The
+ *  winner is also what the station list follows, so the loser never flies:
+ *  it holds no tug, and its fuel is not drawn. */
 function superseded(m: StationMove, known: StationMove[]): boolean {
-  const self = JSON.stringify(cleanMove(m));
-  return known.some((o) => sameStation(o, m) && compareMoves(o, m) > 0
-    // A cancel undoes its own move however late it was written.
-    && (concurrentMoves(o, m) || (isCancelPin(o) && JSON.stringify(cleanMove(o.settles!)) === self)));
+  const self = JSON.stringify(cleanMove(flownOf(m)));
+  return known.some((o) => {
+    if (!sameStation(o, m) || compareMoves(o, m) <= 0) return false;
+    // A pin of this same move: only a cancel undoes it, however late.
+    if (JSON.stringify(cleanMove(flownOf(o))) === self) return isCancelPin(o);
+    return concurrentMoves(flownOf(o), flownOf(m));
+  });
+}
+
+/** Can one of these two moves decide whether the other is superseded? */
+function related(a: StationMove, b: StationMove): boolean {
+  if (!sameStation(a, b)) return false;
+  const fa = flownOf(a), fb = flownOf(b);
+  return concurrentMoves(fa, fb) || JSON.stringify(cleanMove(fa)) === JSON.stringify(cleanMove(fb));
 }
 
 /** Every move known here, for deciding winners: the room's own, and every
@@ -781,29 +843,36 @@ function knownMoves(own: StationMove[]): StationMove[] {
   return [...own, ...readRememberedMoves()];
 }
 
+/** Each station's standing move among `own`: the best one no concurrent
+ *  move beat (a tug's room can hold tows of several stations). */
+function standingMoves(own: StationMove[], known: StationMove[]): StationMove[] {
+  const best: StationMove[] = [];
+  for (const m of own) {
+    if (superseded(m, known)) continue;
+    const at = best.findIndex((b) => sameStation(b, m));
+    if (at < 0) best.push(m);
+    else if (compareMoves(m, best[at]) > 0) best[at] = m;
+  }
+  return best;
+}
+
 /** The room's latest move that is not beaten by a concurrent one, or null
  *  (none, unbound, or malformed). */
 export function readStationMove(): StationMove | null {
   const { entries, legacy } = roomMoves();
   const own = legacy ? [legacy, ...entries] : entries;
-  const known = knownMoves(own);
   let best: StationMove | null = null;
-  for (const m of own) {
-    if (superseded(m, known)) continue;
+  for (const m of standingMoves(own, knownMoves(own))) {
     if (!best || compareMoves(m, best) > 0) best = m;
   }
   return best;
 }
 
-/** Fuel moves have drawn in this room: the 'stationMove' draw meter — the
- *  legacy record's running total, plus each entry's own fuel unless a
- *  concurrent move beat it; never below an unbeaten entry's own running
- *  total (fuelDrawn), which carries the meter's deficit at booking, so a
- *  move booked after a loser dropped out of the sum still pays. */
-export function readMoveFuelDrawn(): number {
-  const { entries, legacy } = roomMoves();
-  const known = knownMoves(legacy ? [legacy, ...entries] : entries);
-  let drawn = legacy?.fuelDrawn ?? 0;
+/** The meter's parts: the settled base (else the legacy record's running
+ *  total), each distinct unbeaten entry's own fuel, and the largest unbeaten
+ *  running total (fuelDrawn). */
+function meterParts(entries: StationMove[], known: StationMove[], base: number): { sum: number; floor: number } {
+  let sum = base;
   let floor = 0;
   // The same move written twice (two tabs, one millisecond) is one move.
   const seen = new Set<string>();
@@ -811,25 +880,69 @@ export function readMoveFuelDrawn(): number {
     const key = JSON.stringify(m);
     if (seen.has(key) || superseded(m, known)) continue;
     seen.add(key);
-    drawn += m.fuel;
+    sum += m.fuel;
     floor = Math.max(floor, m.fuelDrawn);
   }
-  return Math.max(drawn, floor);
+  return { sum, floor };
 }
 
-/** Bind the room doc — beside bindStationKeepingDoc. Every move the room
- *  carries is remembered on this install, and the move record's running
- *  fuel total becomes one of the tank's draw meters. */
+/** Fuel moves have drawn in this room: the 'stationMove' draw meter — the
+ *  settled total of pruned entries (else the legacy record's running total),
+ *  plus each entry's own fuel unless a concurrent move beat it; never below
+ *  an unbeaten entry's own running total (fuelDrawn), which carries the
+ *  meter's deficit at booking, so a move booked after a loser dropped out of
+ *  the sum still pays. */
+export function readMoveFuelDrawn(): number {
+  const { entries, legacy, settled } = roomMoves();
+  const known = knownMoves(legacy ? [legacy, ...entries] : entries);
+  const { sum, floor } = meterParts(entries, known, settled ? settled.drawn : legacy?.fuelDrawn ?? 0);
+  return Math.max(sum, floor);
+}
+
+/** Prune the move log inside a write's transaction: entries that arrived
+ *  before `now - MOVE_LOG_KEEP_MS` leave it, except each station's standing
+ *  move and anything that could still decide whether a kept entry is beaten
+ *  (related, closed over). The meter's reading is unchanged: what left is
+ *  folded into a new settled total. Keeps the log, and every read's
+ *  superseded checks, bounded by the moves of about a day. */
+function pruneMoveLog(now: number): void {
+  const { entries, keyed, legacy, settled, settledKeys } = roomMoves();
+  const own = legacy ? [legacy, ...entries] : entries;
+  const known = knownMoves(own);
+  const through = now - MOVE_LOG_KEEP_MS;
+  const standing = new Set(standingMoves(entries, known));
+  const kept = new Set(keyed.filter((e) => e.move.arriveAt >= through || standing.has(e.move)));
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const e of keyed) {
+      if (kept.has(e)) continue;
+      if ([...kept].some((k) => related(k.move, e.move))) { kept.add(e); grew = true; }
+    }
+  }
+  if (kept.size === keyed.length) return;
+  const drawn = Math.max(readMoveFuelDrawn(), 0);
+  const keptMoves = keyed.filter((e) => kept.has(e)).map((e) => e.move);
+  // The new base is what the kept entries' own fuel does not already cover,
+  // so base + kept fuel reads what the whole log read.
+  const { sum } = meterParts(keptMoves, known, 0);
+  const next: SettledMoves = { through: Math.max(through, settled?.through ?? -Infinity), drawn: Math.min(FUEL_METER_MAX, Math.max(0, drawn - sum)) };
+  for (const e of keyed) if (!kept.has(e)) keepMap!.delete(e.key);
+  for (const k of settledKeys) keepMap!.delete(k);
+  keepMap!.set(`${SETTLED_PREFIX}${boundDoc!.clientID}:${now}`, next);
+}
+
+/** Bind the room doc — beside bindStationKeepingDoc. Each station's standing
+ *  move in the room is remembered on this install, and the move log's fuel
+ *  total becomes one of the tank's draw meters. */
 export function bindStationMoveDoc(doc: Y.Doc): void {
   unobserve?.();
   boundDoc = doc;
   const map = doc.getMap('stationKeeping');
   keepMap = map;
   const onChange = () => {
-    // Remember every move the room holds; the remembered list keeps each
-    // station's winner.
     const { entries, legacy } = roomMoves();
-    for (const m of legacy ? [legacy, ...entries] : entries) rememberMove(m);
+    const own = legacy ? [legacy, ...entries] : entries;
+    for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
     notify();
   };
   map.observe(onChange);
@@ -852,6 +965,7 @@ export function writeStationMove(move: StationMove): boolean {
     return false;
   }
   boundDoc!.transact(() => {
+    pruneMoveLog(Date.now());
     keepMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}`, clean);
   });
   rememberMove(clean);

@@ -5,6 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { setStationRoomSource } from './stations';
 import { dockChain } from './adapter';
 import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
 import {
@@ -338,6 +339,8 @@ describe('a round trip', () => {
     const at = adriftAt('planet-sovereign', 1);
     expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: at });
     expect(adriftPlace(at)).toEqual({ planetId: 'planet-sovereign', orbitSlot: 1 });
+    expect(adriftPlace(adriftAt('planet-sovereign', 15))).not.toBeNull();
+    expect(adriftPlace(adriftAt('planet-sovereign', 16))).toBeNull();
     expect(locationPlanet(at)).toBe('planet-sovereign');
     expect(destinationsFrom(at).map((d) => d.id)).toEqual(['furlong-station']);
     expect(planHop(at, 'furlong-station', now)).not.toBeNull();
@@ -636,6 +639,20 @@ describe('arrival gates', () => {
       const s = settled();
       completeArrival(docking, { onSettled: s.onSettled });
       expect(await s.promise).toEqual({ kind: 'docked', stationName: 'High Orbit', gate: 2 });
+    });
+
+    it('stops trying gates once the player has left the ship\'s room', async () => {
+      let room = 'ship-room';
+      setStationRoomSource(() => room);
+      arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
+      const base = gatedDocking(['east', 'west']);
+      const docking = { ...base, dock: async (doorId: string) => { room = 'another-room'; return base.dock(doorId); } };
+      let heard: ArrivalOutcome | null = null;
+      completeArrival(docking, { onSettled: (o) => { heard = o; } });
+      await new Promise((r) => setTimeout(r, 0));
+      setStationRoomSource(() => '');
+      expect(base.tried).toEqual(['east']);
+      expect(heard).toBeNull();
     });
 
     it('says so when every gate refuses, and leaves the ship arrived undocked', async () => {

@@ -70,7 +70,7 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { isBoltedIntoStation, readBurnFiring, subscribeStationKeeping, trimFor } from "./stationKeeping";
+import { isBoltedIntoStation, readBurnFiring, subscribeStationKeeping } from "./stationKeeping";
 import { currentStation } from "./stations";
 import type { StationRecord } from "./stations";
 import { poseFromWall } from "./doorLayout";
@@ -3984,7 +3984,7 @@ function buildHelmSticks(
     trimStick.visible = bolted;
   };
   // The station this install places the room in: the stick leans only for a
-  // burn on its orbit (stationKeeping.trimFor), as the dashboard shows it.
+  // burn on its orbit (readBurnFiring), as the dashboard shows it.
   const readStation = () => {
     station = currentStation();
   };
@@ -3999,9 +3999,10 @@ function buildHelmSticks(
     update(dt: number): void {
       let tx = 0;
       let tz = 0;
-      // The room's burn firing now, whatever order the log keeps (a peer's
-      // clock running ahead never hides this one).
-      const firing = bolted ? trimFor(station, readBurnFiring(Date.now())) : null;
+      // The burn firing now on this station's orbit, whatever order the log
+      // keeps (a peer's clock running ahead, or a newer burn on an orbit
+      // another install puts the room in, never hides this one).
+      const firing = bolted ? readBurnFiring(Date.now(), station) : null;
       if (firing) {
         if (firing.dir === "raise") tx = -LEAN;
         else if (firing.dir === "lower") tx = LEAN;

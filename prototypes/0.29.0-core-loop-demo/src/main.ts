@@ -123,6 +123,7 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 import {
   bindStationKeepingDoc,
   isBoltedIntoStation,
+  readFuelDrawn,
   readOrbitTrim,
   subscribeStationKeeping,
 } from "./stationKeeping";
@@ -1591,12 +1592,6 @@ async function joinRoomAtEpoch(
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
   bindStationMoveDoc(sync.doc);
-  // 🪐 After the ship and trim records: the summary publishes both.
-  bindPlanetSummaryDoc(sync.doc, {
-    currentStation,
-    localTrim: readOrbitTrim,
-    ship: planetShipStatus,
-  });
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1605,6 +1600,20 @@ async function joinRoomAtEpoch(
 
   // #67 D1/D1b: per-door policy + rights requests/grants ride the same doc.
   bindDoorPolicy(sync.doc);
+
+  // 🪐 After the ship, trim and door records: the summary publishes the
+  // first two at once, and whether this room is a ship (not one bolted into
+  // a station) is read from this room's doors, never the last room's.
+  bindPlanetSummaryDoc(sync.doc, {
+    currentStation,
+    // The fuel its burns drew rides along: between trims whose last burns
+    // share a moment, it tells the one holding more burns.
+    localTrim: () => {
+      const trim = readOrbitTrim();
+      return trim && { ...trim, fuelDrawn: readFuelDrawn() };
+    },
+    ship: planetShipStatus,
+  });
 
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.
   bindExteriorDoc(sync.doc);
@@ -1915,12 +1924,16 @@ async function joinRoomAtEpoch(
     // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
     // publishPlanetSummary refreshes its stamp once an hour).
     if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
-    if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
+    // Move reconciliation runs on every game in the room, commander or not:
+    // both writes follow from records everyone shares (the same cancel or
+    // pin, ranked as the move it settles), so they need no owner, and a tow
+    // or arrival never waits for the owner to come back.
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
     // 🪐 Where this station's last move settled it, shared once for everyone.
     if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
+    if (!isLocalHelmCommander()) return;
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).

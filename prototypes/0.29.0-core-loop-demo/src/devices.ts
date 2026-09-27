@@ -2735,7 +2735,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       fuel,
       drawn: readMoveFuelDrawn(),
       deficit: fuelDrawDeficit('stationMove'),
-      modules: station?.welcomeRoomId ? Math.max(1, atlasComponent(readStationAtlas(), station.welcomeRoomId).size) : 1,
+      // 0 (refused) when the station's layout is not in this install's atlas.
+      modules: station ? atlasComponent(readStationAtlas(), station.welcomeRoomId).size : 0,
       now,
     };
   };
@@ -2754,6 +2755,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     let body = '';
     if (move && isMoveActive(move, now)) {
       body = `<div style="font-size:10px; color:#00E676; line-height:1.5;">${esc(describeMove(move, now))}</div>`;
+    } else if (c.modules < 1) {
+      // No price without the station's modules: say why, not a guess.
+      body = `<div style="font-size:10px; color:rgba(212,168,75,0.7); line-height:1.5;">${esc(describeTowRefusal('unknown-layout', null, fuel))}</div>`;
     } else {
       for (const planetId of otherPlanets(station)) {
         const quote = quoteTow(station, c.stations, planetId, c.modules, now);

@@ -475,14 +475,29 @@ function isPlainGates(v: unknown): v is Record<string, unknown> {
     && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
 }
 
-/** Only door id → integer gate pairs, at most one per gate number. */
+/** Only door id → integer gate pairs, at most MAX_GATE_NUMBER of them. Every
+ *  distinct number is taken first, so ports sharing a number (two stations
+ *  joined, a peer's junk) can never push another gate out; a duplicate
+ *  fills only room that is left. */
 function cleanGates(v: Record<string, unknown>): Record<string, number> {
   const out: Record<string, number> = {};
+  const numbers = new Set<number>();
+  const repeats: Array<[string, number]> = [];
   let kept = 0;
   for (const [doorId, gate] of Object.entries(v)) {
     if (kept >= MAX_GATE_NUMBER) break;
     if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
     if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
+    if (numbers.has(gate)) {
+      if (repeats.length < MAX_GATE_NUMBER) repeats.push([doorId, gate]);
+      continue;
+    }
+    numbers.add(gate);
+    out[doorId] = gate;
+    kept++;
+  }
+  for (const [doorId, gate] of repeats) {
+    if (kept >= MAX_GATE_NUMBER) break;
     out[doorId] = gate;
     kept++;
   }
@@ -576,8 +591,9 @@ export function freeGateNumber(
  * pairings (berths aside), looking each room up in the doc directly, so a
  * doc crowded with other stations' entries cannot push this one's out of
  * reach. A room the local atlas lacks comes from the doc; a known room gains
- * any door pairing it lacks, and the doc's gates when it has none or the
- * doc's copy is newer (as pullSharedAtlas arbitrates), so the station walk
+ * any door pairing it lacks (a newer doc copy's pairings replace ours door by
+ * door), and the doc's gates when it has none or the doc's copy is newer (as
+ * pullSharedAtlas arbitrates), so the station walk
  * and the numbers taken both see what the far station has published. Peer
  * entries are shape-checked and capped as pullSharedAtlas does. Pure:
  * nothing is written.
@@ -620,8 +636,14 @@ export function withSharedAtlasOf(
           lastSeen: value.updatedAt,
         };
       } else {
-        const merged: AtlasEntry = { ...prior, doors: { ...doors, ...prior.doors } };
-        if (gates && (prior.gates === undefined || value.updatedAt > prior.lastSeen)) merged.gates = gates;
+        // A newer doc copy's pairings win door by door (a door re-paired since
+        // we saw the room); an older one only adds pairings we lack.
+        const newer = value.updatedAt > prior.lastSeen;
+        const merged: AtlasEntry = {
+          ...prior,
+          doors: newer ? { ...prior.doors, ...doors } : { ...doors, ...prior.doors },
+        };
+        if (gates && (prior.gates === undefined || newer)) merged.gates = gates;
         out[rid] = merged;
       }
     }
