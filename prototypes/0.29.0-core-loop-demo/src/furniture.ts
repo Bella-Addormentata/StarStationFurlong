@@ -35,14 +35,21 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  CoinPusherVisualHandle,
   PropAnimHandle,
 } from "./devices";
+// 🪙 Coin pusher visual driver: the cabinet draws the engine's cross-section —
+// the pusher bar from the sweep clock, the piles from the shared state.
+import {
+  CHIP_R, HOLE_XS, PLAT_LOW_BACK, PLAT_LOW_FRONT, PLAT_UP_FRONT,
+  currentPusherPhase, pusherFaceX, unseenDropHoles,
+} from "./games/coinPusher";
 // 🎰 #69: the in-world roulette wheel disc is painted with the REAL pocket
 // order/colors from the pure engine — one source of truth with the focused UI.
 import { WHEEL_ORDER, pocketColor } from "./games/roulette";
 import { DEFAULT_PAYTABLE, SLOT_SYMBOLS, computeRTP } from "./games/slots";
 import type { SlotFailure, SlotPayEntry, SlotSymbol } from "./games/slots";
-import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey } from "./casinoDoc";
+import { readSlotMachineState, readSlotOddsConfig, subscribeCasinoKey, readCoinPusherState } from "./casinoDoc";
 // 🎉 Party props read their own per-instance state (candles, lids, the music)
 // straight from the room doc, the same way the slot machine reads the casino
 // map — the doc is the phase, a local click is never the phase.
@@ -62,6 +69,17 @@ import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } from "./doorLayoutDoc";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
+// 🧬 #165: the clone vat's tank dimensions live with the avatar's clearance
+// gauge (pure, no imports) so the glass and the squeeze never drift apart.
+import {
+  VAT_GLASS_R,
+  VAT_GLASS_BASE_Y,
+  VAT_GLASS_H,
+  VAT_PLINTH_R,
+  VAT_PAD_Y,
+  VAT_DOOR_ARC,
+  VAT_DOOR_TOP_Y,
+} from "./vatGauge";
 
 // ── Shared XZ-plane AABB type (re-exported by obstacles.ts) ───────────────────
 export interface Box {
@@ -121,6 +139,7 @@ export type FurnitureKind =
   | "bunk-bed"
   | "clone-vat"
   | "slot-machine"
+  | "coin-pusher"
   // 🎉 Party fixtures — the cake is the anchor, the rest cluster around it.
   | "cake-table"
   | "gift-box"
@@ -3519,21 +3538,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 0.85, z: 0 },
     },
   },
-  // 🧬 Clone vat — the diegetic spawn point (owner request). 1×1 obstacle,
-  // no seats. The DEVICE panel is the spawn-point picker ("wake up here");
-  // the decant choreography itself stays with World.respawnAtVat. Front is
-  // the door face (+z at rot 0 — the walk-out side).
+  // 🧬 Clone vat — the diegetic spawn point (owner request). 2×2 obstacle
+  // (#165: the tank sits centred on a 2×2 square — even extents snap its
+  // centre to the integer lattice), no seats. The DEVICE panel is the
+  // spawn-point picker ("wake up here"); the decant choreography itself stays
+  // with World.respawnAtVat. Front is the door face (+z at rot 0 — the
+  // walk-out side), the first cell past the footprint edge.
   "clone-vat": {
     kind: "clone-vat",
     build: buildCloneVat,
-    footprint: { w: 1, d: 1 },
+    footprint: { w: 2, d: 2 },
     functions: ["cloneVat"],
     device: {
       kind: "cloneVat",
-      front: { x: 0, z: 1.0 },
+      front: { x: 0, z: 1.5 },
       faceAngle: Math.PI,
-      eye: { x: 0, y: 1.6, z: 0.95 },
-      anchor: { x: 0, y: 1.2, z: 0 },
+      eye: { x: 0, y: 1.9, z: 1.45 },
+      anchor: { x: 0, y: 1.6, z: 0 },
     },
   },
   // 🛏️ Bunk bed — two lie-down berths (SeatTemplates with sitY + lie), no
@@ -3577,6 +3598,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: 0,
       eye: { x: 0, y: 1.50, z: -1.45 },
       anchor: { x: 0, y: 1.35, z: 0.45 },
+    },
+  },
+  // 🪙 Coin pusher (issue #135) — 1×1 stand-up arcade cabinet. Standing device
+  // (no seat): player walks to the -z side, focuses, times a chip drop through
+  // one of three holes. Owner-only OPEN DOOR empties the machine. Same device-
+  // focus flow as the slot machine, minus the built-in chair.
+  "coin-pusher": {
+    kind: "coin-pusher",
+    build: buildCoinPusher,
+    footprint: { w: 1, d: 1 },
+    functions: ["coinPusher"],
+    device: {
+      kind: "coinPusher",
+      front: { x: 0, z: -1.0 },
+      faceAngle: 0,
+      eye: { x: 0, y: 1.30, z: -0.85 },
+      anchor: { x: 0, y: 0.90, z: 0.05 },
     },
   },
 };
@@ -5545,19 +5583,21 @@ function buildBunkBed({ m, place }: BuildCtx) {
 // ── 🧬 Clone vat (owner request) — the diegetic spawn point ──────────────────
 // Concept-art-faithful cloning tank: gunmetal plinth + cap, a glass cylinder
 // full of glowing green nutrient bath, orange feed pipes and a status plate.
-// Local frame (rot 0): the DOOR faces +z. The spawn choreography (drain the
-// liquid, then SPIN the front glass segment around the cylinder axis until it
-// tucks behind the fixed back shell) is driven by a CloneVatHandle stowed in
-// a base mesh's userData.cloneVat — World collects it and drives update(dt)
-// every frame (trunk-lid idiom, never a detached rAF).
-const VAT_GLASS_R = 0.4; // glass tube radius
-const VAT_GLASS_H = 1.8; // glass tube height (y 0.30 → 2.10)
-const VAT_DOOR_ARC = (Math.PI * 2) / 3; // 120° front door segment
-const VAT_DOOR_OPEN = Math.PI * 0.72; // spun back behind the shell
+// Local frame (rot 0): the DOOR faces +z. #165 grew the tank to fill its 2×2
+// square; every tank dimension comes from vatGauge.ts, which also holds the
+// hourglass clearance the avatar is squeezed to on its way out. The spawn
+// choreography (drain the liquid, hold the tank visibly EMPTY, then SPIN the
+// front glass leaf around the cylinder axis until it tucks behind the fixed
+// back shell — and once the clone is clear, spin it shut and only THEN
+// refill) is driven by a CloneVatHandle stowed in a base mesh's
+// userData.cloneVat — World collects it and drives update(dt) every frame
+// (trunk-lid idiom, never a detached rAF).
+const VAT_DOOR_OPEN = Math.PI; // leaf spun round to the back, behind the shell
 const VAT_BEAT_TIME = 0.5; // full-tank hold before the drain starts
-const VAT_DRAIN_TIME = 1.4;
-const VAT_DOOR_TIME = 0.9;
-const VAT_REFILL_TIME = 2.6;
+const VAT_DRAIN_TIME = 1.6;
+const VAT_EMPTY_TIME = 0.5; // drained tank held shut so "empty" reads first
+const VAT_DOOR_TIME = 1.1;
+const VAT_REFILL_TIME = 2.8;
 const VAT_GREEN = 0x39ff6a;
 
 /** One-shot status-plate decal (trunk stencil idiom, two-line variant). */
@@ -5590,77 +5630,91 @@ function buildCloneVat(ctx: BuildCtx) {
   const TRIM = 0x3d4a5e; // bezel slate
   const PIPE_O = 0xe8760a; // trunk orange conduits
   const STEEL = 0x8a93a0;
+  const R = VAT_GLASS_R;
+  const GLASS_TOP = VAT_GLASS_BASE_Y + VAT_GLASS_H; // the cap sits here
+  const CAP_H = 0.26;
+  const CAP_Y = GLASS_TOP + CAP_H / 2 - 0.02;
 
-  // ── Plinth + interior floor pad
+  // ── Low plinth + interior floor pad (the held clone stands ON the pad; it
+  //    stays low so the clone's heels and tail clear it stepping off)
+  const plinthH = VAT_PAD_Y - 0.01;
   place(
-    new THREE.CylinderGeometry(0.5, 0.52, 0.08, 20),
+    new THREE.CylinderGeometry(VAT_PLINTH_R + 0.05, VAT_PLINTH_R + 0.05, 0.03, 36),
     m(TRIM, 0.6, 0.4),
     0,
-    0.04,
+    0.015,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.46, 0.48, 0.24, 20),
+    new THREE.CylinderGeometry(VAT_PLINTH_R - 0.02, VAT_PLINTH_R, plinthH, 36),
     m(BODY, 0.55, 0.45),
     0,
-    0.2,
+    plinthH / 2,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.38, 0.38, 0.03, 20),
+    new THREE.CylinderGeometry(R - 0.03, R - 0.03, 0.03, 36),
     m(0x14181e, 0.9, 0.1),
     0,
-    0.315,
+    VAT_PAD_Y - 0.015,
     0,
   );
-  // Drain grate + green-lit outflow at the door side (concept art's spout)
+  // Drain grate + green-lit outflow at the door side (concept art's spout),
+  // set flush into the plinth face so the stepping clone has nothing to snag
   place(
-    new THREE.BoxGeometry(0.22, 0.07, 0.1),
+    new THREE.BoxGeometry(0.4, 0.045, 0.08),
     m(0x14181e, 0.8, 0.2),
     0,
-    0.1,
-    0.48,
+    0.04,
+    VAT_PLINTH_R - 0.035,
   );
-  place(new THREE.BoxGeometry(0.14, 0.02, 0.03), flat(VAT_GREEN), 0, 0.1, 0.53);
+  place(
+    new THREE.BoxGeometry(0.26, 0.015, 0.02),
+    flat(VAT_GREEN),
+    0,
+    0.04,
+    VAT_PLINTH_R,
+  );
 
   // ── Cap + head-end greebles
   place(
-    new THREE.CylinderGeometry(0.48, 0.46, 0.22, 20),
+    new THREE.CylinderGeometry(R + 0.1, R + 0.12, CAP_H, 36),
     m(BODY, 0.55, 0.45),
     0,
-    2.21,
+    CAP_Y,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.14, 0.14, 0.34, 12),
+    new THREE.CylinderGeometry(0.26, 0.26, 0.3, 16),
     m(TRIM, 0.5, 0.5),
     0,
-    2.49,
+    CAP_Y + CAP_H / 2 + 0.15,
     0,
   );
   place(
-    new THREE.CylinderGeometry(0.05, 0.05, 0.2, 8),
+    new THREE.CylinderGeometry(0.08, 0.08, 0.18, 10),
     m(STEEL, 0.45, 0.6),
     0,
-    2.72,
+    CAP_Y + CAP_H / 2 + 0.39,
     0,
   );
-  // Orange feed conduits arcing down the back
+  // Orange feed conduits down the back, outside the leaf's sweep (the open
+  // door parks behind the shell between them and the glass)
   for (const sx of [-1, 1]) {
     const pipe = place(
-      new THREE.CylinderGeometry(0.035, 0.035, 1.9, 8),
+      new THREE.CylinderGeometry(0.045, 0.045, VAT_GLASS_H, 8),
       m(PIPE_O, 0.5, 0.4),
-      sx * 0.3,
-      1.2,
-      -0.4,
+      sx * 0.42,
+      VAT_GLASS_BASE_Y + VAT_GLASS_H / 2,
+      -(R + 0.06),
     );
-    pipe.rotation.x = 0.08;
+    pipe.rotation.x = 0.04;
     place(
-      new THREE.CylinderGeometry(0.045, 0.045, 0.1, 8),
+      new THREE.CylinderGeometry(0.06, 0.06, 0.12, 8),
       m(STEEL, 0.45, 0.6),
-      sx * 0.3,
-      2.18,
-      -0.42,
+      sx * 0.42,
+      GLASS_TOP - 0.03,
+      -(R + 0.09),
     );
   }
   // Status plate on the cap front (faces the door side)
@@ -5669,19 +5723,20 @@ function buildCloneVat(ctx: BuildCtx) {
     transparent: true,
     opacity: 0,
   });
-  place(new THREE.PlaneGeometry(0.34, 0.17), plateMat, 0, 2.21, 0.475);
-  // Green status pip strip on the plinth front
+  place(new THREE.PlaneGeometry(0.56, 0.2), plateMat, 0, CAP_Y, R + 0.125);
+  // Green status pip strip along the cap's lower rim, under the plate
   place(
-    new THREE.BoxGeometry(0.2, 0.035, 0.02),
+    new THREE.BoxGeometry(0.36, 0.025, 0.02),
     flat(VAT_GREEN),
     0,
-    0.24,
-    0.475,
+    CAP_Y - CAP_H / 2 + 0.015,
+    R + 0.125,
   );
 
-  // ── Glass: fixed back shell (240°) + spinning front door segment (120°).
-  //    CylinderGeometry θ=0 sits on +z (vertex = (sinθ, y, cosθ)), so a door
-  //    centred on the +z axis is thetaStart −60° for 120°.
+  // ── Glass: fixed back shell + fixed transom over the doorway + the
+  //    spinning front door leaf (VAT_DOOR_ARC wide, VAT_DOOR_TOP_Y tall).
+  //    CylinderGeometry θ=0 sits on +z (vertex = (sinθ, y, cosθ)), so a leaf
+  //    centred on the +z axis starts at −arc/2.
   const glassMat = () => {
     const gm = m(0x9bd4e8, 0.05, 0.1);
     gm.side = THREE.DoubleSide;
@@ -5690,30 +5745,67 @@ function buildCloneVat(ctx: BuildCtx) {
   };
   place(
     new THREE.CylinderGeometry(
-      VAT_GLASS_R,
-      VAT_GLASS_R,
+      R,
+      R,
       VAT_GLASS_H,
-      28,
+      40,
       1,
       true,
-      Math.PI / 3,
-      (Math.PI * 4) / 3,
+      VAT_DOOR_ARC / 2,
+      Math.PI * 2 - VAT_DOOR_ARC,
     ),
     glassMat(),
     0,
-    0.3 + VAT_GLASS_H / 2,
+    VAT_GLASS_BASE_Y + VAT_GLASS_H / 2,
     0,
   );
+  const transomH = GLASS_TOP - VAT_DOOR_TOP_Y;
+  place(
+    new THREE.CylinderGeometry(
+      R,
+      R,
+      transomH,
+      20,
+      1,
+      true,
+      -VAT_DOOR_ARC / 2,
+      VAT_DOOR_ARC,
+    ),
+    glassMat(),
+    0,
+    VAT_DOOR_TOP_Y + transomH / 2,
+    0,
+  );
+  // Steel lintel strip along the transom's lower edge — frames the doorway
+  const lintelMat = m(STEEL, 0.5, 0.5);
+  lintelMat.side = THREE.DoubleSide;
+  place(
+    new THREE.CylinderGeometry(
+      R + 0.015,
+      R + 0.015,
+      0.05,
+      20,
+      1,
+      true,
+      -VAT_DOOR_ARC / 2,
+      VAT_DOOR_ARC,
+    ),
+    lintelMat,
+    0,
+    VAT_DOOR_TOP_Y + 0.025,
+    0,
+  );
+  const leafH = VAT_DOOR_TOP_Y - VAT_GLASS_BASE_Y;
   const doorGroup = new THREE.Group();
   doorGroup.name = "cloneVatDoor";
-  doorGroup.position.set(0, 0.3 + VAT_GLASS_H / 2, 0); // on the tube axis
+  doorGroup.position.set(0, VAT_GLASS_BASE_Y + leafH / 2, 0); // on the tube axis
   attach(doorGroup);
   const doorMesh = new THREE.Mesh(
     new THREE.CylinderGeometry(
-      VAT_GLASS_R + 0.012,
-      VAT_GLASS_R + 0.012,
-      VAT_GLASS_H,
-      12,
+      R + 0.012,
+      R + 0.012,
+      leafH,
+      20,
       1,
       true,
       -VAT_DOOR_ARC / 2,
@@ -5722,47 +5814,48 @@ function buildCloneVat(ctx: BuildCtx) {
     glassMat(),
   );
   doorGroup.add(doorMesh);
-  // Thin steel edge rails on the door segment so the spin reads from afar
+  // Thin steel edge rails on the door leaf so the spin reads from afar
   for (const edge of [-VAT_DOOR_ARC / 2, VAT_DOOR_ARC / 2]) {
     const rail = new THREE.Mesh(
-      new THREE.BoxGeometry(0.03, VAT_GLASS_H, 0.03),
+      new THREE.BoxGeometry(0.035, leafH, 0.035),
       m(STEEL, 0.5, 0.5),
     );
     rail.position.set(
-      Math.sin(edge) * (VAT_GLASS_R + 0.02),
+      Math.sin(edge) * (R + 0.02),
       0,
-      Math.cos(edge) * (VAT_GLASS_R + 0.02),
+      Math.cos(edge) * (R + 0.02),
     );
     doorGroup.add(rail);
   }
 
-  // ── Nutrient bath: emissive green column, origin at its BOTTOM so scale.y
-  //    is the fill level (drains downward like the art's outflow panels).
-  const liquidGeo = new THREE.CylinderGeometry(
-    0.355,
-    0.355,
-    VAT_GLASS_H - 0.1,
-    24,
-  );
-  liquidGeo.translate(0, (VAT_GLASS_H - 0.1) / 2, 0);
+  // ── Nutrient bath: emissive green column, origin at its BOTTOM (the pad)
+  //    so scale.y is the fill level (drains downward like the art's outflow
+  //    panels).
+  const liquidH = GLASS_TOP - 0.05 - VAT_PAD_Y;
+  const liquidGeo = new THREE.CylinderGeometry(R - 0.04, R - 0.04, liquidH, 36);
+  liquidGeo.translate(0, liquidH / 2, 0);
   const liquidMat = flat(VAT_GREEN);
   liquidMat.userData.baseOpacity = 0.5;
-  const liquid = place(liquidGeo, liquidMat, 0, 0.33, 0);
+  const liquid = place(liquidGeo, liquidMat, 0, VAT_PAD_Y, 0);
   // Inner glow core (brighter, thinner — reads as depth in the bath)
-  const coreGeo = new THREE.CylinderGeometry(0.16, 0.16, VAT_GLASS_H - 0.3, 12);
-  coreGeo.translate(0, (VAT_GLASS_H - 0.3) / 2, 0);
+  const coreH = liquidH - 0.25;
+  const coreGeo = new THREE.CylinderGeometry(0.28, 0.28, coreH, 16);
+  coreGeo.translate(0, coreH / 2, 0);
   const coreMat = flat(0x9fffb8);
   coreMat.userData.baseOpacity = 0.35;
-  const core = place(coreGeo, coreMat, 0, 0.36, 0);
+  const core = place(coreGeo, coreMat, 0, VAT_PAD_Y + 0.03, 0);
   // Bath glow light (dims as the tank drains — handle-owned post-morph)
-  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 4.5);
-  addLight(bathLight, 0, 1.3, 0, 1.4);
+  const bathLight = new THREE.PointLight(VAT_GREEN, 0, 5.5);
+  addLight(bathLight, 0, 1.7, 0, 1.6);
 
-  // ── Handle: BEAT → DRAIN → OPEN (onOpen) / CLOSE → REFILL state machine.
+  // ── Handle: BEAT → DRAIN → EMPTY → OPEN (onOpen) / CLOSE → REFILL.
+  //    The door only ever opens on a drained tank (OPEN follows EMPTY), and
+  //    the tank only ever refills behind a shut door (REFILL follows CLOSE).
   type VatPhase =
     | "IDLE_FULL"
     | "BEAT"
     | "DRAIN"
+    | "EMPTY"
     | "OPEN"
     | "IDLE_OPEN"
     | "CLOSE"
@@ -5771,15 +5864,27 @@ function buildCloneVat(ctx: BuildCtx) {
   let t = 0;
   let level = 1; // liquid fill 0..1
   let doorAngle = 0; // 0 closed → VAT_DOOR_OPEN tucked behind
+  // Where CLOSE / REFILL start from: a cycle cut short mid-drain or mid-spin
+  // eases home from where it is instead of snapping wide open first.
+  let closeFrom = 0;
+  let refillFrom = 0;
   let onOpenCb: (() => void) | null = null;
   const smooth = (v: number) => v * v * (3 - 2 * v);
 
+  // World re-shows every furniture mesh each frame while the room view is up
+  // (zoom ≤ 2) and hides them all from space, so the bath is never forced
+  // VISIBLE here — but a drained one is re-hidden every frame, idle phases
+  // included, or the empty column renders as a flat green disc on the pad.
+  const hideIfDrained = () => {
+    if (level > 0.005) return;
+    liquid.visible = false;
+    core.visible = false;
+  };
   const applyPose = () => {
     const l = Math.max(0.0001, level); // scale 0 breaks matrix inversion
     liquid.scale.y = l;
     core.scale.y = l;
-    liquid.visible = level > 0.005;
-    core.visible = level > 0.005;
+    hideIfDrained();
     doorGroup.rotation.y = doorAngle;
   };
 
@@ -5793,13 +5898,24 @@ function buildCloneVat(ctx: BuildCtx) {
       applyPose();
     },
     closeAndRefill(): void {
+      // Idempotent: already sealed, or already sealing.
+      if (phase === "IDLE_FULL" || phase === "CLOSE" || phase === "REFILL") {
+        return;
+      }
       phase = "CLOSE";
       t = 0;
+      closeFrom = doorAngle;
       onOpenCb = null; // a pending open is superseded — never fire it late
     },
     update(deltaTime: number): void {
-      if (phase === "IDLE_FULL" || phase === "IDLE_OPEN") return;
+      if (phase === "IDLE_FULL" || phase === "IDLE_OPEN") {
+        hideIfDrained();
+        return;
+      }
       t += Math.max(0, deltaTime);
+      // onOpen fires only after this frame's pose is on the meshes, so the
+      // clone never starts out through a door still a frame short of open.
+      let fireOnOpen: (() => void) | null = null;
       switch (phase) {
         case "BEAT":
           if (t >= VAT_BEAT_TIME) {
@@ -5811,6 +5927,13 @@ function buildCloneVat(ctx: BuildCtx) {
           level = 1 - smooth(Math.min(1, t / VAT_DRAIN_TIME));
           if (t >= VAT_DRAIN_TIME) {
             level = 0;
+            phase = "EMPTY";
+            t = 0;
+          }
+          break;
+        case "EMPTY":
+          // Hold the drained tank shut a beat — the reveal reads "empty".
+          if (t >= VAT_EMPTY_TIME) {
             phase = "OPEN";
             t = 0;
           }
@@ -5820,24 +5943,23 @@ function buildCloneVat(ctx: BuildCtx) {
           if (t >= VAT_DOOR_TIME) {
             doorAngle = VAT_DOOR_OPEN;
             phase = "IDLE_OPEN";
-            if (onOpenCb) {
-              const cb = onOpenCb;
-              onOpenCb = null; // exactly once
-              cb();
-            }
+            fireOnOpen = onOpenCb;
+            onOpenCb = null; // exactly once
           }
           break;
         case "CLOSE":
-          doorAngle =
-            VAT_DOOR_OPEN * (1 - smooth(Math.min(1, t / VAT_DOOR_TIME)));
-          if (t >= VAT_DOOR_TIME) {
+          doorAngle = closeFrom * (1 - smooth(Math.min(1, t / VAT_DOOR_TIME)));
+          if (t >= VAT_DOOR_TIME || closeFrom === 0) {
             doorAngle = 0;
             phase = "REFILL";
             t = 0;
+            refillFrom = level;
           }
           break;
         case "REFILL":
-          level = smooth(Math.min(1, t / VAT_REFILL_TIME));
+          level =
+            refillFrom +
+            (1 - refillFrom) * smooth(Math.min(1, t / VAT_REFILL_TIME));
           if (t >= VAT_REFILL_TIME) {
             level = 1;
             phase = "IDLE_FULL";
@@ -5847,9 +5969,10 @@ function buildCloneVat(ctx: BuildCtx) {
       // Bath glow follows the liquid (idle phases return early above, so the
       // morph fade-in owns the light until a spawn cycle actually runs).
       bathLight.intensity =
-        ((bathLight.userData.targetIntensity as number) ?? 1.4) *
+        ((bathLight.userData.targetIntensity as number) ?? 1.6) *
         (0.2 + 0.8 * level);
       applyPose();
+      fireOnOpen?.();
     },
   };
   // Stow on a tiny carrier mesh inside the plinth — collected by
@@ -6394,6 +6517,289 @@ function buildSlotMachine({
     -0.84,
   ));
   for (const mesh of chairMeshes) mesh.userData.skipDeviceHit = true;
+}
+
+// ── 🪙 Coin pusher (issue #135) ──────────────────────────────────────────────
+// A stand-up arcade cabinet with a glass-fronted box: three drop holes in the
+// top, a stepped upper/lower platform inside, a sweeping pusher bar at the
+// back of the upper platform, and a coin tray at the front. Chips stay INSIDE
+// the machine until a drop pushes them off the front of the LOWER platform
+// (paid to that drop's player) or the owner opens the door to empty it. No
+// auto-siphon.
+//
+// The engine (games/coinPusher.ts) models ONE back-to-front axis, and the
+// cabinet draws exactly that cross-section: the holes sit in a back-to-front
+// row over the upper platform at the engine's hole positions, every pile is
+// drawn on the centre line at its engine position, and the pusher bar's front
+// face follows the engine's pusherFaceX(phase) through the same mapping.
+//
+// The cabinet occupies the rear ~1 m of the 1×1 footprint. Standing-only
+// device (no seat); the player walks up, focuses, times a drop, and inserts.
+//
+// Coordinate scheme (metres, item origin at rot 0):
+//   +z points AWAY from the player standing at the front (x=0, z=-1.0).
+//   Upper platform:  z ∈ [+0.10, +0.32], y ≈ 0.90   engine x ∈ [0, 0.60]
+//   Lower platform:  z ∈ [-0.14, +0.10], y ≈ 0.70   engine x ∈ [0.60, 1.20]
+//   Payout tray:     z ≈ -0.20 (chips paid out leave the model)
+function buildCoinPusher({ itemId, m, place: addPlace, addLight: addPointLight, attach }: BuildCtx) {
+  // Palette (matches slot machine gunmetal + gold family so machines read as
+  // a coherent arcade set on the floor).
+  const BODY    = 0x2a3444; // gunmetal
+  const CHROME  = 0x8a93a0; // steel trim
+  const GOLD    = 0xd4a84b; // accent gold
+  const GLASS   = 0xb8d4f8; // pale-blue glass tint
+  const CHIP_G  = 0xd4a84b; // pusher chip gold (matches cage chip color)
+  const CHIP_C  = 0xe8e2d2; // ivory chip alt
+  const LIGHT   = 0xfff0c8; // warm top light
+
+  // Engine axis → cabinet z. Upper platform back edge sits 5 mm in front of
+  // the rear wall so the retracted bar never z-fights it.
+  const UPPER_Z_BACK = 0.315, UPPER_Z_FRONT = 0.10;
+  const LOWER_Z_BACK = 0.10, LOWER_Z_FRONT = -0.14;
+  const Z_SCALE = (UPPER_Z_BACK - UPPER_Z_FRONT) / (PLAT_UP_FRONT - 0);
+  const upperZ = (x: number): number =>
+    UPPER_Z_BACK - (x / PLAT_UP_FRONT) * (UPPER_Z_BACK - UPPER_Z_FRONT);
+  const lowerZ = (x: number): number =>
+    LOWER_Z_BACK - ((x - PLAT_LOW_BACK) / (PLAT_LOW_FRONT - PLAT_LOW_BACK))
+      * (LOWER_Z_BACK - LOWER_Z_FRONT);
+
+  const cabinet = new THREE.Group();
+  attach(cabinet);
+  const place: BuildCtx["place"] = (...args) => {
+    const mesh = addPlace(...args);
+    cabinet.add(mesh);
+    return mesh;
+  };
+  const addLight: BuildCtx["addLight"] = (light, ...args) => {
+    addPointLight(light, ...args);
+    cabinet.add(light);
+  };
+
+  // ── Cabinet outer shell ────────────────────────────────────────────────────
+  // Base plinth
+  place(new THREE.BoxGeometry(0.80, 0.10, 0.80), m(BODY, 0.55, 0.40), 0, 0.05, 0.10);
+  // Legs
+  for (const [lx, lz] of [[-0.32, -0.24], [0.32, -0.24], [-0.32, 0.44], [0.32, 0.44]] as const) {
+    place(new THREE.BoxGeometry(0.09, 0.42, 0.09), m(CHROME, 0.4, 0.6), lx, 0.31, lz);
+    place(new THREE.BoxGeometry(0.11, 0.03, 0.11), m(0x14181e, 0.9, 0.1), lx, 0.015, lz);
+  }
+  // Machine body — an open-fronted shell (back, floor, low skirts), so the
+  // playfield shows through the glass. (A solid body box here would hide the
+  // platforms, the pusher and every chip from outside the cabinet.)
+  place(new THREE.BoxGeometry(0.72, 0.60, 0.02), m(BODY, 0.55, 0.45), 0, 0.84, 0.45);
+  place(new THREE.BoxGeometry(0.72, 0.02, 0.72), m(BODY, 0.55, 0.45), 0, 0.55, 0.10);
+  for (const sx of [-0.35, 0.35]) {
+    place(new THREE.BoxGeometry(0.02, 0.16, 0.72), m(BODY, 0.55, 0.45), sx, 0.62, 0.10);
+  }
+  place(new THREE.BoxGeometry(0.72, 0.12, 0.02), m(BODY, 0.55, 0.45), 0, 0.60, -0.26);
+  // Chrome corner posts front-facing
+  for (const sx of [-0.36, 0.36]) {
+    place(new THREE.BoxGeometry(0.03, 0.62, 0.03), m(CHROME, 0.35, 0.7), sx, 0.84, -0.25);
+  }
+  // Marquee / top box (holds the drop holes)
+  place(new THREE.BoxGeometry(0.76, 0.30, 0.76), m(BODY, 0.55, 0.45), 0, 1.29, 0.10);
+  place(new THREE.BoxGeometry(0.72, 0.04, 0.72), m(GOLD, 0.4, 0.5), 0, 1.46, 0.10);
+  // Top warm light
+  addLight(new THREE.PointLight(LIGHT, 0, 2.2), 0, 1.60, 0.10, 0.40);
+
+  // ── Marquee display: the title, or a short message from the panel ─────────
+  const marqueeCanvas = document.createElement('canvas');
+  marqueeCanvas.width = 512; marqueeCanvas.height = 96;
+  const marqueeCtx = marqueeCanvas.getContext('2d')!;
+  const marqueeTex = new THREE.CanvasTexture(marqueeCanvas);
+  marqueeTex.minFilter = THREE.LinearMipmapLinearFilter;
+  marqueeTex.magFilter = THREE.LinearFilter;
+  marqueeTex.generateMipmaps = true;
+  marqueeTex.anisotropy =
+    window.gameRenderer?.renderer?.capabilities?.getMaxAnisotropy?.() ?? 4;
+  marqueeTex.colorSpace = THREE.SRGBColorSpace;
+  const paintMarquee = (text: string): void => {
+    marqueeCtx.fillStyle = '#04140B';
+    marqueeCtx.fillRect(0, 0, 512, 96);
+    marqueeCtx.strokeStyle = '#00C060';
+    marqueeCtx.lineWidth = 4;
+    marqueeCtx.strokeRect(3, 3, 506, 90);
+    marqueeCtx.fillStyle = '#73FFAA';
+    marqueeCtx.font = "bold 44px 'SF Mono','Consolas',monospace";
+    marqueeCtx.textAlign = 'center';
+    marqueeCtx.textBaseline = 'middle';
+    marqueeCtx.fillText(text, 256, 50, 480);
+    marqueeTex.needsUpdate = true;
+  };
+  paintMarquee('COIN PUSHER');
+  {
+    const mat = new THREE.MeshBasicMaterial({ map: marqueeTex, transparent: true, opacity: 0 });
+    mat.userData.baseOpacity = 0.96;
+    place(new THREE.PlaneGeometry(0.60, 0.18), mat, 0, 1.30, -0.28);
+  }
+
+  // ── Three drop holes in a back-to-front row over the upper platform ───────
+  // At the engine's HOLE_XS, so a chip lands under the hole it went into.
+  // The RIM (gold torus) takes the highlight; the DISC is the dark opening.
+  const holeRimMeshes: THREE.Mesh[] = [];
+  for (let i = 0; i < HOLE_XS.length; i++) {
+    const z = upperZ(HOLE_XS[i]);
+    const rim = place(new THREE.TorusGeometry(0.022, 0.005, 8, 20), m(GOLD, 0.35, 0.6), 0, 1.485, z);
+    rim.rotation.x = -Math.PI / 2;
+    const disc = place(new THREE.CircleGeometry(0.018, 20), m(0x040814, 0.9, 0.05), 0, 1.484, z);
+    disc.rotation.x = -Math.PI / 2;
+    holeRimMeshes.push(rim);
+  }
+
+  // ── Interior stepped platforms (upper is BEHIND lower, one step down) ──────
+  // Upper platform (rear half of interior, higher). z ∈ [+0.10, +0.32].
+  const upperPlatform = place(
+    new THREE.BoxGeometry(0.68, 0.02, 0.22),
+    m(0xc0c8d0, 0.35, 0.55),
+    0, 0.90, 0.21,
+  );
+  // Lower platform (front half, lower). z ∈ [-0.14, +0.10]
+  place(
+    new THREE.BoxGeometry(0.68, 0.02, 0.24),
+    m(0xc0c8d0, 0.35, 0.55),
+    0, 0.70, -0.02,
+  );
+  // Rear wall of upper platform (pusher hides behind)
+  place(new THREE.BoxGeometry(0.72, 0.20, 0.02), m(BODY, 0.55, 0.4), 0, 1.00, 0.33);
+  // Step riser between upper and lower
+  place(new THREE.BoxGeometry(0.68, 0.20, 0.02), m(0x2f3846, 0.55, 0.4), 0, 0.80, 0.10);
+  // Payout tray at the very front — chips falling off the lower platform land here.
+  place(new THREE.BoxGeometry(0.68, 0.04, 0.14), m(CHROME, 0.4, 0.5), 0, 0.68, -0.20);
+  place(new THREE.BoxGeometry(0.64, 0.02, 0.12), m(0x14181e, 0.85, 0.1), 0, 0.685, -0.20);
+
+  // ── Glass front / sides ────────────────────────────────────────────────────
+  const glassMat = m(GLASS, 0.05, 0.0);
+  glassMat.transparent = true;
+  glassMat.userData.baseOpacity = 0.20;
+  // Front glass
+  place(new THREE.BoxGeometry(0.68, 0.60, 0.008), glassMat, 0, 0.84, -0.24);
+  // Side glass L/R
+  place(new THREE.BoxGeometry(0.008, 0.60, 0.70), glassMat, -0.34, 0.84, 0.10);
+  place(new THREE.BoxGeometry(0.008, 0.60, 0.70), glassMat, 0.34, 0.84, 0.10);
+
+  // ── Pusher bar (its front face tracks the engine's pusherFaceX) ────────────
+  const BAR_DEPTH = 0.08;
+  const pusher = new THREE.Group();
+  pusher.position.set(0, 0.93, UPPER_Z_BACK + BAR_DEPTH / 2);
+  cabinet.add(pusher);
+  const barMat = m(CHROME, 0.35, 0.7);
+  pusher.add(new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.05, BAR_DEPTH), barMat));
+
+  // ── Chip pile visuals (rebuilt from state each frame) ──────────────────────
+  // Chips are drawn at the engine's scale, so neighbouring piles touch but
+  // never overlap, exactly as the engine keeps them.
+  const CHIP_H = 0.006;
+  const chipGeometry = new THREE.CylinderGeometry(CHIP_R * Z_SCALE, CHIP_R * Z_SCALE, CHIP_H, 14);
+  // Built after the registration traversal, so the fade-in never reaches
+  // these materials: update() copies the bar's revealed opacity onto them.
+  const chipMaterials = [m(CHIP_G, 0.4, 0.35), m(CHIP_C, 0.4, 0.15)];
+  const chipPool: THREE.Mesh[] = [];
+  const pileGroup = new THREE.Group();
+  cabinet.add(pileGroup);
+  const acquireChip = (index: number): THREE.Mesh => {
+    if (index >= chipPool.length) {
+      const mesh = new THREE.Mesh(chipGeometry, chipMaterials[0]);
+      chipPool.push(mesh);
+      pileGroup.add(mesh);
+    }
+    const chip = chipPool[index];
+    chip.visible = true;
+    return chip;
+  };
+
+  // ── Hole lighting: the selected hole glows; each drop flashes and fades ───
+  const DROP_FX_S = 0.6;
+  let selected: 0 | 1 | 2 = 1;
+  /** Seconds of flash left per hole — several drops can land in one frame. */
+  const fxLeft = [0, 0, 0];
+  const paintHoles = (): void => {
+    for (let i = 0; i < holeRimMeshes.length; i++) {
+      const std = holeRimMeshes[i].material as THREE.MeshStandardMaterial;
+      let intensity = i === selected ? 0.4 : 0;
+      if (fxLeft[i] > 0) intensity = Math.max(intensity, 0.9 * (fxLeft[i] / DROP_FX_S));
+      std.emissive.setHex(intensity > 0 ? GOLD : 0x000000);
+      std.emissiveIntensity = intensity;
+    }
+  };
+  paintHoles();
+
+  let messageLeft = 0;
+  /** The machine's nextChipId when this cabinet last looked; undefined until
+   *  the first read, so drops already on the record when it loads don't
+   *  flash. */
+  let shownUpTo: number | undefined;
+
+  const handle: CoinPusherVisualHandle = {
+    update(dt: number): void {
+      const step = Number.isFinite(dt) && dt > 0 ? dt : 0;
+      const state = readCoinPusherState(itemId);
+
+      // Every drop settled since the last frame, even several at once.
+      if (state && shownUpTo !== undefined) {
+        for (const hole of unseenDropHoles(state, shownUpTo)) handle.triggerDropFx(hole);
+      }
+      shownUpTo = state?.nextChipId;
+
+      if (state) {
+        const face = pusherFaceX(currentPusherPhase(state, Date.now()));
+        pusher.position.z = upperZ(face) + BAR_DEPTH / 2;
+      }
+
+      for (const mat of chipMaterials) mat.opacity = barMat.opacity;
+      // World's zoom-level hiding doesn't reach the chips either (it hides only
+      // the meshes it registered): they show and hide with their platform.
+      pileGroup.visible = upperPlatform.visible;
+      let idx = 0;
+      if (state) {
+        for (const [piles, toZ, baseY] of [
+          [state.upper, upperZ, 0.91 + CHIP_H / 2],
+          [state.lower, lowerZ, 0.71 + CHIP_H / 2],
+        ] as const) {
+          for (const pile of piles) {
+            const z = toZ(pile.x);
+            for (let ci = 0; ci < pile.count; ci++) {
+              const chip = acquireChip(idx++);
+              chip.position.set(0, baseY + ci * (CHIP_H + 0.0005), z);
+              chip.material = chipMaterials[pile.chipIds[ci] % 2];
+            }
+          }
+        }
+      }
+      for (let i = idx; i < chipPool.length; i++) chipPool[i].visible = false;
+
+      if (fxLeft.some((left) => left > 0)) {
+        for (let i = 0; i < fxLeft.length; i++) fxLeft[i] = Math.max(0, fxLeft[i] - step);
+        paintHoles();
+      }
+      if (messageLeft > 0) {
+        messageLeft -= step;
+        if (messageLeft <= 0) paintMarquee('COIN PUSHER');
+      }
+    },
+    setSelectedHole(hole: 0 | 1 | 2): void {
+      selected = hole;
+      paintHoles();
+    },
+    showMessage(message: string): void {
+      paintMarquee(message.slice(0, 16).toUpperCase());
+      messageLeft = 2;
+    },
+    triggerDropFx(hole: 0 | 1 | 2): void {
+      fxLeft[hole] = DROP_FX_S;
+      paintHoles();
+    },
+    dispose(): void {
+      // The chip meshes come out of the cabinet first, so the removal's
+      // traversal doesn't free their geometry and material a second time.
+      pileGroup.clear();
+      chipPool.length = 0;
+      chipGeometry.dispose();
+      for (const mat of chipMaterials) mat.dispose();
+    },
+  };
+  // The upper platform mesh carries the handle so world.ts collects it the
+  // same way it collects SlotMachineVisualHandle.
+  upperPlatform.userData.coinPusherVisual = handle;
 }
 
 
@@ -8857,10 +9263,15 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 0,
     movable: true,
   }, // moved — bar occupies right-front corner
+  // 🧬 #165: moved out of the NW corner, which the 2×2 clone vat now fills
+  // (its canopy was already clipping the old 1×1 tank). West wall, between
+  // the paired west door's lane (z[-4,-2]) and armchair-left-0; its canopy
+  // (reaching z≈-2.1) stays clear of the clone's muzzle where the vat
+  // walk-out stops (z≈-2.25).
   {
     id: "cherry-tree-back-left",
     kind: "cherry-tree",
-    pos: { x: -5.3, z: -5.3 },
+    pos: { x: -5.35, z: -1.6 },
     rot: 0,
     movable: true,
   },
@@ -8966,17 +9377,22 @@ export const FURNITURE: FurnitureItem[] = [
     rot: 1,
     movable: true,
   },
-  // 🧬 Clone vat in the NW pocket: AABB x[-4,-3] z[-5,-4] fills the 1×1
-  // dead-end between the back-left lamp table (x[-5,-4] z[-5,-4]) and the
-  // storage trunk (x[-3,-2] z[-5,-4]), flush against the fireplace line
-  // (z=-5) — zero residual gaps, same wedge-trap-safe-by-construction
-  // reasoning as the bunk bed's nook. rot 0 ⇒ the glass door faces +z into
-  // the open x[-4,-3] z[-4,-3] cell; the spawn walk-out exits to (-3.5,-3.5).
-  // Parity: w=1/d=1 both odd → centre at n+0.5 on both axes ✓.
+  // 🧬 Clone vat centred on the NW corner's 2×2 square x[-6,-4] z[-6,-4]
+  // (#165), flush against both walls — zero residual gaps, the same
+  // wedge-trap-safe-by-construction reasoning as the bunk bed's nook. It is
+  // the only 2×2 in that corner clear of the paired lobby doors (north wall
+  // x=-3 → lane x[-4,-2]; west wall z=-3 → lane z[-4,-2]) as well as the
+  // centred ones. Like the map table and lamp tables it hugs the wall past
+  // the edit-mode placement box (±5), so a drag can't return it exactly here.
+  // rot 0 ⇒ the glass door faces +z along the west wall; the panel front is
+  // (-5,-3.5) and the spawn walk-out ends VAT_EXIT_ALONG (~2.1 m) out, at
+  // about (-5,-2.9). Parity: w=2/d=2 both even → centre at integer n ✓. The
+  // previous 1×1 default pose (-4.7,-4.9) is migrated here once
+  // (furnitureDoc.relocateLegacyDefaultVat).
   {
     id: "clone-vat",
     kind: "clone-vat",
-    pos: { x: -4.7, z: -4.9 },
+    pos: { x: -5, z: -5 },
     rot: 0,
     movable: true,
   },
@@ -9055,8 +9471,7 @@ if (import.meta.env.DEV) assertPlacementClear("clone-vat");
 // ── Derivation helpers ────────────────────────────────────────────────────────
 
 /** Rotate a local XZ offset by quarter-turns CCW about +y (exact — no FP
- *  drift). Exported for the clone-vat spawn choreography (world.ts derives
- *  the walk-out exit point from the vat item's rot). */
+ *  drift). */
 export function rotXZ(
   x: number,
   z: number,

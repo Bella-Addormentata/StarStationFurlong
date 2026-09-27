@@ -31,6 +31,7 @@ import type {
   GameTableTopHandle,
   CloneVatHandle,
   SlotMachineVisualHandle,
+  CoinPusherVisualHandle,
   PropAnimHandle,
 } from './devices';
 
@@ -55,6 +56,8 @@ export interface FurnitureHandleSinks {
   cloneVats: Map<string, CloneVatHandle>;
   /** 🎰 Slot-machine cabinet visuals (reels/lamps), keyed by item id. */
   slotMachineVisuals: Map<string, SlotMachineVisualHandle>;
+  /** 🪙 Coin-pusher cabinet visuals (pusher sweep, chips, hole lamps), keyed by item id. */
+  coinPusherVisuals: Map<string, CoinPusherVisualHandle>;
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   propAnims: Map<string, PropAnimHandle>;
 }
@@ -83,6 +86,9 @@ export function registerFurnitureHandles(
   if (d.cloneVat) sinks.cloneVats.set(itemId, d.cloneVat as CloneVatHandle);
   if (d.slotMachineVisual) {
     sinks.slotMachineVisuals.set(itemId, d.slotMachineVisual as SlotMachineVisualHandle);
+  }
+  if (d.coinPusherVisual) {
+    sinks.coinPusherVisuals.set(itemId, d.coinPusherVisual as CoinPusherVisualHandle);
   }
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
 }

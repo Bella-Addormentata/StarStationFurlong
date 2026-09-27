@@ -54,6 +54,7 @@
 
 import * as THREE from 'three';
 import type { OutfitDef, PaletteRole, AccessoryKind } from './outfits';
+import { vatPallorHex } from './vatGauge';
 
 export type CharacterState = 'idle' | 'walk' | 'sit_chair' | 'sit_ground' | 'sleep' | 'swim' | 'dive';
 
@@ -459,6 +460,19 @@ export class VoxelCharacter {
   >();
   /** Currently attached head accessory (one slot), or null. */
   private accessoryGroup: THREE.Group | null = null;
+
+  // ── 🧬 Fresh-clone pallor (#165) ───────────────────────────────────────────
+  /** 0 = its own colours, 1 = the clone grey (vatGauge.VAT_PALLOR_HEX). */
+  private pallor = 0;
+  /**
+   * The TRUE colour/emissive of every material the pallor recolours, captured
+   * the moment it first touches one — the source every pallored colour is
+   * lerped from, and what setPallor(0) writes back (exact, no drift).
+   */
+  private pallorBase = new Map<
+    THREE.MeshToonMaterial,
+    { color: number; emissive: number; emissiveSeeded: boolean }
+  >();
 
   constructor(scene: THREE.Scene) {
     // ── 1. Master / visual group hierarchy ───────────────────────────────────
@@ -1649,6 +1663,15 @@ export class VoxelCharacter {
    * the same outfit twice is exactly idempotent.
    */
   setOutfit(outfit: OutfitDef): void {
+    // 🧬 Dye the TRUE colours: lift any clone pallor first (so the pristine
+    // capture below never records a pallored hex), re-apply it after.
+    const pallor = this.pallor;
+    if (pallor > 0) this.setPallor(0);
+    this._applyOutfit(outfit);
+    if (pallor > 0) this.setPallor(pallor);
+  }
+
+  private _applyOutfit(outfit: OutfitDef): void {
     const seen = new Set<THREE.Material>();
     this.visualGroup.traverse((obj) => {
       const mesh = obj as THREE.Mesh;
@@ -1685,11 +1708,60 @@ export class VoxelCharacter {
   /** Restore every outfit-touched material to its pristine color/emissive and
    *  detach any accessory. Exact inverse of setOutfit (no drift). */
   clearOutfit(): void {
+    const pallor = this.pallor;
+    if (pallor > 0) this.setPallor(0);
     for (const [mat, orig] of this.outfitOriginals) {
       mat.color.setHex(orig.color);
       if (mat.emissive) mat.emissive.setHex(orig.emissive);
     }
     this.removeAccessory();
+    if (pallor > 0) this.setPallor(pallor);
+  }
+
+  /**
+   * 🧬 Fresh-clone pallor (#165): blend the rig's body colours — every
+   * palette-role material (fur, cream, paws…) and the head accessory — from
+   * their true colours (k = 0) to an almost-white grey (k = 1). The dark
+   * face marks and the shared outline are left alone. Cheap enough to call
+   * every frame of a fade; setPallor(0) restores the true colours exactly.
+   */
+  setPallor(k: number): void {
+    const next = Math.min(1, Math.max(0, k));
+    if (next === this.pallor) return;
+    this.pallor = next;
+    const seen = new Set<THREE.Material>();
+    const visit = (obj: THREE.Object3D, all: boolean) => {
+      const mesh = obj as THREE.Mesh;
+      if (!mesh.isMesh) return;
+      if (!all && !mesh.userData.paletteRole) return;
+      const mats = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+      for (const m of mats) {
+        if (!m || m === OUTLINE_MAT || seen.has(m)) continue;
+        seen.add(m);
+        const mat = m as THREE.MeshToonMaterial;
+        if (!mat.color) continue;
+        let base = this.pallorBase.get(mat);
+        if (!base) {
+          base = {
+            color: mat.color.getHex(),
+            emissive: mat.emissive ? mat.emissive.getHex() : 0,
+            emissiveSeeded:
+              !!mat.emissive && mat.emissive.getHex() === mat.color.getHex(),
+          };
+          this.pallorBase.set(mat, base);
+        }
+        const hex = vatPallorHex(base.color, next);
+        mat.color.setHex(hex);
+        if (mat.emissive) {
+          mat.emissive.setHex(base.emissiveSeeded ? hex : base.emissive);
+        }
+      }
+    };
+    this.visualGroup.traverse((obj) => visit(obj, false));
+    this.accessoryGroup?.traverse((obj) => visit(obj, true));
+    // Fully restored: forget the captures, so a later outfit change is the
+    // truth the next pallor starts from.
+    if (next === 0) this.pallorBase.clear();
   }
 
   /**

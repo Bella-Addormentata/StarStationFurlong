@@ -54,7 +54,6 @@ import {
   buildItemGroup,
   furnitureVisualYaw,
   BUNK_TOP_Y,
-  rotXZ,
   POOL_SWIM_Y,
   POOL_WATER_Y,
   isPoolKind,
@@ -124,11 +123,17 @@ import {
   createSlotMachineUI,
   operateActiveSlotMachine,
   clearPendingSlotPlays,
+  createCoinPusherUI,
   createRobotDockUI,
   createCloneVatUI,
   readLiveRoomStatus,
 } from "./devices";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
+import {
+  closeCoinPusher,
+  tickCoinPusherRoom,
+  tickCoinPusherTeardowns,
+} from "./pusherCroupier";
 import { preferredSpawnVat, setPreferredSpawnVat } from "./spawnPoint";
 import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
@@ -140,6 +145,7 @@ import type {
   SlotMachineVisualHandle,
   PropAnimHandle,
   SlotMachineCabinetControl,
+  CoinPusherVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
@@ -375,10 +381,18 @@ export class World {
   private cloneVats: Map<string, CloneVatHandle> = new Map();
   private slotMachineVisuals: Map<string, SlotMachineVisualHandle> = new Map();
   private seatedSlotSession: { itemId: string; ui: DeviceUI } | null = null;
+  /** 🪙 Coin-pusher cabinets (issue #135) — animated pusher bar + rebuilt chip
+   *  piles from shared state each frame. Same driven-every-frame idiom as the
+   *  slot-machine visuals; the userData key on the upper platform mesh carries
+   *  the handle so the traversal below picks it up. */
+  private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
   private pendingVatSpawn = false;
+  /** 🧬 The vat item the clone is bound to (its ceremony, or its pending
+   *  seal) — the clone follows it if the vat is moved mid-ceremony. */
+  private activeVatId: string | null = null;
   /** 🧬 True once the queued spawn has seen the exterior boot view (zoom ≥ 3)
    *  — the PRIMARY arming signal: the reveal then fires on the zoom-in
    *  transition, however long the v0.32.20 auto-boot's join-under-intro takes
@@ -1602,6 +1616,7 @@ export class World {
       gameTableTops: this.gameTableTops,
       cloneVats: this.cloneVats,
       slotMachineVisuals: this.slotMachineVisuals,
+      coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
     };
   }
@@ -3023,6 +3038,10 @@ export class World {
     // mirror re-uploads a freed CanvasTexture every doc change.
     this.gameTableTops.delete(itemId);
     this.slotMachineVisuals.delete(itemId);
+    // 🪙 The cabinet frees its chip geometry and materials itself: they exist
+    // before any chip is drawn, so the traversal below can't reach them all.
+    this.coinPusherVisuals.get(itemId)?.dispose();
+    this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
@@ -3037,11 +3056,21 @@ export class World {
     } else if (removedKind === "slot-machine") {
       clearPendingSlotPlays(itemId);
       closeSlotMachine(itemId, canRunCroupier() || canEditRoom().ok);
+    } else if (removedKind === "coin-pusher") {
+      // 🪙 Stop operating it here. The deed holder's session that operates it
+      // pays the chips still inside to the deed holder and wipes its keys.
+      closeCoinPusher(itemId);
     }
-    // 🧬 A vat removed mid-spawn-cycle must also release the held avatar —
+    // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
-    if (this.cloneVats.delete(itemId) && this.player.isVatSpawning()) {
+    // The clone is released on its next update, once the vat has left the
+    // obstacles, where it stands or at the nearest free spot. A clone already
+    // released but with the seal still pending is unbound too, so nothing
+    // keeps pointing at the removed vat (or rebinds to a new item with the
+    // same id). Removing some other vat leaves the ceremony alone.
+    if (this.cloneVats.delete(itemId) && itemId === this.activeVatId) {
       this.player.abortVatSpawn();
+      this.activeVatId = null;
     }
 
     const groupMeshes = new Set<THREE.Object3D>();
@@ -3425,6 +3454,7 @@ export class World {
           { x: vat.item.pos.x, z: vat.item.pos.z },
           vat.item.rot * (Math.PI / 2),
         );
+        this.activeVatId = vat.item.id;
         this.pendingVatSpawn = true;
         this.vatSawExterior = false;
         this.pendingVatSpawnGrace = 8; // fallback only — see the field docs
@@ -3665,6 +3695,24 @@ export class World {
       this.deckPlanet.rotation.y += deltaTime * 0.015;
     }
 
+    // 🧬 The vat running the clone's ceremony can be moved or turned under it
+    // (edit mode, a synced move — its group moves in place and the handle
+    // survives): keep the clone and its door-clearance bound to it — BEFORE the
+    // player's update, whose walk-out re-plan measures from the vat's pose.
+    if (this.activeVatId !== null) {
+      const bound = this.player.isVatBound()
+        ? FURNITURE.find((i) => i.id === this.activeVatId)
+        : undefined;
+      if (bound) {
+        this.player.rebindVat(
+          { x: bound.pos.x, z: bound.pos.z },
+          bound.rot * (Math.PI / 2),
+        );
+      } else if (!this.player.isVatBound()) {
+        this.activeVatId = null;
+      }
+    }
+
     // Keep updating while device-FOCUSED too: the mesh is hidden then, but
     // player.update() is where WASD-to-release lives (#33 D0.3).
     if (this.isPlayerActive()) {
@@ -3722,6 +3770,10 @@ export class World {
 
     // 🎰 Keep physical cabinet reels synchronized for nearby spectators.
     for (const slot of this.slotMachineVisuals.values()) slot.update(deltaTime);
+    // 🪙 Coin-pusher cabinets — animate the sweep bar + rebuild piles every
+    // frame from the shared state. update(dt) is idempotent per-frame so it
+    // is safe to drive from the same loop regardless of focus / DOM UI.
+    for (const pusher of this.coinPusherVisuals.values()) pusher.update(deltaTime);
 
     // 🧍 Tell the props whether the local player is IN the room, and where —
     // the party speaker strikes up on the fox walking in and fades with
@@ -5166,6 +5218,9 @@ export class World {
     const rouletteTables = FURNITURE.filter((i) => i.kind === "roulette-table");
     const crapsTables = FURNITURE.filter((i) => i.kind === "craps-table");
     const slotMachines = FURNITURE.filter((i) => i.kind === "slot-machine");
+    // 🪙 Coin pushers need no robot at the cabinet (the operator runs
+    // headless), only the room's elected operator session (below).
+    const coinPushers = FURNITURE.filter((i) => i.kind === "coin-pusher");
     const tables = [...rouletteTables, ...crapsTables];
 
     // Auto-drive (the elected operator only): heartbeat + betting timer. Runs
@@ -5194,6 +5249,19 @@ export class World {
       slotMachines.map((machine) => machine.id),
       !autoCroupier && canEditRoom().ok,
     );
+
+    // 🪙 Coin pushers: ONE of the deed holder's sessions operates every
+    // cabinet in the room (one lease, pusherCroupier.ts), so a player's
+    // balance has a single pusher writer. Every client ticks the room: it
+    // watches the lease's renewals (how the panel tells a live operator), and
+    // a client that may not operate stops operating there.
+    // The operator also drains removed cabinets there, once past its settling
+    // wait (closeCoinPusher).
+    tickCoinPusherRoom(coinPushers.map((machine) => machine.id));
+    // …and carry on with removed cabinets: the sweep of their per-player
+    // keys, one batch a frame (after the room tick, which may have just
+    // drained one).
+    tickCoinPusherTeardowns();
 
     // Robot post (all clients): stand ONE eligible robot at EACH live table's
     // reserved operator slot (roulette wheel-head / craps stickman). The owner
@@ -5514,6 +5582,24 @@ export class World {
       return;
     }
 
+    // 🪙 Coin pusher (#135) — the DOM panel writes the player's drop request
+    // (and the owner's door request); the operator settles them. The cabinet
+    // mirrors the selected hole and the panel's messages, and lights every
+    // settled drop by itself.
+    if (device.kind === "coinPusher") {
+      const visual = this.coinPusherVisuals.get(deviceId);
+      deviceFocus.beginFocus(
+        this.player,
+        device,
+        createCoinPusherUI({
+          itemId: deviceId,
+          onSelectedHoleChange: (hole) => visual?.setSelectedHole(hole),
+          onMessage: (message) => visual?.showMessage(message),
+        }),
+      );
+      return;
+    }
+
     // 🎉 Party props. The cake carries the gated moment; the other two are
     // ungated (anyone may open a present or kill the music).
     if (
@@ -5641,26 +5727,32 @@ export class World {
 
   /**
    * Run the full spawn ceremony at the room's clone vat: the avatar is held
-   * inside the tube, the nutrient bath drains, the glass door spins open,
-   * and the clone walks out to the cell in front of the door — then the vat
-   * seals and slowly refills behind them. Used at boot (deferred via
-   * pendingVatSpawn), by the DEV RESPAWN button, and by any future death
-   * flow. Returns false when the room has no vat (legacy spawn applies).
+   * inside the tube (squeezed to fit it — vatGauge.ts), the nutrient bath
+   * drains and the empty tank is held a beat, the glass door spins open, and
+   * the clone walks out through the doorway's hourglass gauge — then, once
+   * it is clear of the door, the vat shuts and slowly refills behind it. Used
+   * at boot (deferred via pendingVatSpawn), by the DEV RESPAWN button, and by
+   * any future death flow. Returns false when the room has no vat (legacy
+   * spawn applies).
    */
   public respawnAtVat(): boolean {
     const found = this.findSpawnVat();
     if (!found || this.isMorphing) return false;
     const { item, handle } = found;
-    // Exit = one tile out through the door face (local +z, rotated with the
-    // item) — for the default NW-pocket vat that is the open (-3.5, -3.5).
-    const exitOff = rotXZ(0, 1.0, item.rot);
-    const exit = { x: item.pos.x + exitOff.x, z: item.pos.z + exitOff.z };
+    // The door faces local +z, rotated with the item: rot quarter-turns CCW
+    // map onto facing angles (atan2(x, z)) one-for-one. The seal is armed
+    // with the hold, so a cycle abandoned mid-drain shuts down at once.
+    const seal = () => handle.closeAndRefill();
     this.player.beginVatSpawn(
       { x: item.pos.x, z: item.pos.z },
       item.rot * (Math.PI / 2),
+      seal,
     );
+    this.activeVatId = item.id;
     handle.beginSpawnCycle(() => {
-      this.player.walkOutOfVat(exit, () => handle.closeAndRefill());
+      // A released clone has already sealed the vat (which drops this
+      // callback); belt and braces — never leave the door open and dry.
+      if (!this.player.walkOutOfVat()) seal();
     });
     return true;
   }

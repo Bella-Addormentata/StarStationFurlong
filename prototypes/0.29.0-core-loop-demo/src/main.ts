@@ -103,6 +103,7 @@ import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveSlotMachineRoom } from "./slotCroupier";
+import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 import { bindRobotDoc } from "./robotDoc";
@@ -111,6 +112,7 @@ import {
   bindFurnitureDoc,
   seedFurnitureDefaults,
   migrateDefaultLayout,
+  relocateLegacyDefaultVat,
   furnitureDocSize,
   subscribeFurniture,
   writeFurnitureItem,
@@ -1811,6 +1813,25 @@ async function joinRoomAtEpoch(
     });
   }
 
+  // 🧬 #165 one-time: the clone vat grew to a 2×2 tank centred on the NW
+  // corner square. An unmoved default vat (and the corner cherry tree it
+  // would swallow) moves to the new default pose. Unlike the migrations
+  // above, this runs on every join, not only the first-claim path: a normal
+  // restart resumes the last room as a join, and an un-migrated room would
+  // draw the 2×2 tank at the old 1×1 pose, across the tree. It runs on a
+  // first claim, as before, or for anyone who may edit the room. It only moves
+  // items still at their old defaults, and the marker makes it one-time.
+  // Registered after the claim block, so on a first claim it runs after V5,
+  // which already writes the new pose into rooms it upgrades.
+  const vatMigrationEpoch = epoch;
+  void sync.whenServerSynced.then(() => {
+    if (vatMigrationEpoch !== sessionEpoch) return; // superseded by a newer session
+    if (roomMap.get("cloneVat2x2V1")) return;
+    if (!claimRoomDefaults && !canEditRoom().ok) return;
+    relocateLegacyDefaultVat();
+    roomMap.set("cloneVat2x2V1", true);
+  });
+
   // 🌌 Resolve this room's VISUAL theme: an explicit roomInfo['theme'] (stamped
   // by a template on provision, synced from the host) wins; otherwise fall back
   // to the room's identity so the flagship rooms paint right at the first frame
@@ -2144,15 +2165,17 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // this leave must leave alone.
     const cache = roomCacheHandle;
     roomCacheHandle = null;
-    // 🎰 Hand back this session's slot operator lease while the room's doc
-    // is still the bound casino doc, and send the release before the doc
-    // goes: another of the operator's devices then takes over at once instead
+    // 🎰🪙 Hand back this session's slot and coin-pusher operator leases
+    // while the room's doc is still the bound casino doc, and send the
+    // releases before the doc goes: another of the operator's devices then
+    // takes over at once instead
     // of waiting out the lapse and the split window. Frames keep running
     // meanwhile, but nothing is operated or edited in this room while it can
     // still send: the gates refuse until its sync is closed to new writes
     // (roomLeavesUnderWay). stop() doesn't wait for sends in flight, so flush
     // first (bounded: a stalled transport must not hold the swap).
     leaveSlotMachineRoom();
+    leaveCoinPusherRoom();
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),
