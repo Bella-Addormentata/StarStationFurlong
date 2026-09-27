@@ -3069,13 +3069,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     switch (action) {
       case 'stop': {
         const r = stopRouteFromHelm({ now });
-        const f = r === 'stopping' ? readRouteFlight(now) : null;
-        const end = f && route ? route.stops[routeEndStopIndex(f)]?.name : null;
-        flashRoute(r === 'finished'
-          ? 'Route stopped. The helm flies by hand from here.'
-          : r === 'stopping'
-            ? `STOP: the route ends at ${end ?? 'the next stop'}, and the helm flies by hand from there.`
-            : 'STOP was refused. Look again.', r ? 'ok' : 'warn');
+        // 'stopping': the panel's own STOP PRESSED line says where it ends.
+        if (r !== 'stopping') {
+          flashRoute(r === 'finished' ? 'Route stopped. The helm flies by hand from here.' : 'STOP was refused. Look again.', r ? 'ok' : 'warn');
+        }
         break;
       }
       case 'take':
