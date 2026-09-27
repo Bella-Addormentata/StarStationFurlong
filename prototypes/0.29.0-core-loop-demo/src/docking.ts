@@ -388,7 +388,19 @@ export class DoorDockingPortSystem {
     opts: DockOpOptions,
   ): boolean {
     if (this.canConstruct(doorId)) return true;
-    if (opts.keeper !== true || !this.routeDockRight) return false;
+    return this.keeperRight(doorId, op, farRoomId, opts) === true;
+  }
+
+  /** 🚏 Does the route's keeper want to `op` this door toward the far room
+   *  right now (the carve-out's own question)? Null for a call that is not
+   *  the keeper's, or with nothing wired. */
+  private keeperRight(
+    doorId: string,
+    op: "dock" | "undock",
+    farRoomId: string,
+    opts: DockOpOptions,
+  ): boolean | null {
+    if (opts.keeper !== true || !this.routeDockRight) return null;
     try {
       return this.routeDockRight(doorId, op, farRoomId) === true;
     } catch (err) {
@@ -3014,6 +3026,9 @@ export class DoorDockingPortSystem {
     // re-dock as a stale berth (dockRules.mirrorMayWrite) and never heal it.
     const dockedAt = stampAfter(port.memory.undockedAt);
     const near = this.doorLateral(doorId);
+    // 🚏 A keeper's DOCK the route wanted as it asked: still wanted when the
+    // berth answers? (SKIP, STOP or the guard band may come meanwhile.)
+    const keeperWanted = this.keeperRight(doorId, "dock", port.roomId, opts) === true;
     // The far berth is asked over an await, and a peer may dock, re-connect or
     // strip this port meanwhile — or the player may walk into another room,
     // whose doc is the bound one now: this side is only ever written over the
@@ -3024,6 +3039,9 @@ export class DoorDockingPortSystem {
       // a module in flight takes no pairing, and the far write is taken back
       // (settleChangedRedock) exactly as for a port that changed.
       if (!pairingAllowedByFlight(readResolvedFlight()).ok) return false;
+      // 🚏 …or the route stopped wanting this dock: nor does this side take
+      // it (the carve-out may have been this rider's only right to it).
+      if (keeperWanted && this.keeperRight(doorId, "dock", port.roomId, opts) !== true) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
