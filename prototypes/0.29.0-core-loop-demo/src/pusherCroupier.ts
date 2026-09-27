@@ -19,16 +19,21 @@
  * could each take it and settle drops; when the docs merge only one machine
  * value survives while both players' balance writes do (or one balance write
  * survives where both debited it). Settling can't be made partition-safe
- * without an authoritative ledger (the Registry-anchored chips), so the rule
- * here keeps a second operator from ever starting while the first may only be
- * cut off: a session on ANOTHER device may take over a lapsed lease only after
- * OPERATOR_UNCLEAN_TAKEOVER_MS more. (Only the deed holder operates, so
- * another device's lease is the deed holder's own, whatever player id it
- * names: an install that restored their identity key has its own.) Tabs on one
- * device share its local node, so they take over as soon as the lease lapses
- * (a reload, a closed tab); a session that stops operating releases its lease
- * so a successor needn't wait. Only a split outlasting that window can still
- * put two operators in one room.
+ * without an authoritative ledger (the Registry-anchored chips), so a session
+ * on ANOTHER device takes over a lease it has seen lapse only
+ * OPERATOR_UNCLEAN_TAKEOVER_MS later, in case its holder is only cut off.
+ * (Only the deed holder operates, so another device's lease is the deed
+ * holder's own, whatever player id it names: an install that restored their
+ * identity key has its own.) Tabs on one device share its local node, so they
+ * take over as soon as the lease lapses (a reload, a closed tab); a session
+ * that stops operating releases its lease so a successor needn't wait. That
+ * window guards only a lease this page has seen. One that sees no lease at all
+ * (cut off from the operator, or joining from a cached copy of the room before
+ * its live state arrives) takes it at once and operates after the settling
+ * wait, which is enough only where the two are connected: each sees the
+ * other's take, and the merge keeps one. So a split of any length that begins
+ * before a device has seen the other's lease can put two operators in one
+ * room; once it has, only a split outlasting the window can.
  *
  * CLOCKS: devices' clocks aren't synchronised, so a lease written on another
  * device is never judged by the expiry it claims: it lapses one
@@ -37,8 +42,10 @@
  * expiry. Every client watches the renewals (World ticks the room on every
  * client), and the panel asks the same question: its DROP waits until the
  * operator is past its settling wait (coinPusherOperatorState). A request is
- * aged the same way, from when the operator first saw it; its `requestedAt`,
- * the player's clock, decides only whether the drop's timing is kept.
+ * aged on this page's clock too, from when it arrived in this page's doc
+ * (readCoinPusherRequestArrival), however deep in the queue it waits; its
+ * `requestedAt`, the player's clock, decides only whether the drop's timing is
+ * kept.
  *
  * OWNERSHIP: the operator creates a missing machine with itself as owner, and
  * re-owns one whose owner is anyone else (a deed transfer, a peer-written
@@ -87,6 +94,7 @@ import {
   readChips,
   readCoinPusherEmptyRequest,
   readCoinPusherOperatorLease,
+  readCoinPusherRequestArrival,
   readCoinPusherRequests,
   readCoinPusherState,
   refuseCoinPusherEmpty,
@@ -130,11 +138,6 @@ interface PusherOperatorSession {
 /** This session's turn as the room's operator, if it has one. */
 let operator: PusherOperatorSession | null = null;
 const lastPolls = new Map<string, { docEpoch: number; checkedAt: number }>();
-/** When this session first saw each machine's pending requests (player →
- *  request id and time), in the room of `docEpoch`. A request's age is
- *  measured on this page's clock from that sighting, never from its
- *  `requestedAt`, which is the player's clock (CLOCKS). */
-const requestsSeen = new Map<string, { docEpoch: number; byPlayer: Map<string, { requestId: string; at: number }> }>();
 /** Removed cabinets this session is to clear once no other session may be
  *  operating them (closeCoinPusher), with the doc epoch each was removed in:
  *  one never reads or writes a different room's doc. */
@@ -284,7 +287,6 @@ export function stopCoinPusherOperator(): void {
   if (!operator) return;
   operator = null;
   lastPolls.clear();
-  requestsSeen.clear();
   if (readCoinPusherOperatorLease()?.sessionId === operatorSessionId) {
     clearCoinPusherOperatorLease();
   }
@@ -436,44 +438,19 @@ export function operateCoinPusher(
     if (!state) return;
   }
 
-  // Every pending request the read returns counts as seen now (the first
-  // time it is); a batch of the first to arrive is then settled or refused.
-  const pending = readCoinPusherRequests(machineId);
-  const seen = seeRequests(machineId, pending, now);
-  for (const request of pending.slice(0, MAX_REQUESTS_PER_POLL)) {
-    const waited = now - (seen.get(request.player)?.at ?? now);
-    state = settleOneInsert(machineId, state, request, waited, now, drawSeed);
+  // A batch of the first to arrive is settled or refused, each aged from its
+  // arrival in this page's doc (CLOCKS): the index stamps every request as it
+  // arrives, so one deep in a flood's queue is aged from then too, not from
+  // when a read first reaches it.
+  for (const request of readCoinPusherRequests(machineId, MAX_REQUESTS_PER_POLL)) {
+    const arrived = readCoinPusherRequestArrival(machineId, request.player) ?? now;
+    state = settleOneInsert(machineId, state, request, Math.max(0, now - arrived), now, drawSeed);
     if (!state) return;
   }
 }
 
-/** Note the machine's pending requests as seen: a request keeps the time this
- *  session first saw it until its player files another. */
-function seeRequests(
-  machineId: string,
-  pending: readonly PusherInsertRequest[],
-  now: number,
-): Map<string, { requestId: string; at: number }> {
-  const docEpoch = casinoDocEpoch();
-  let seen = requestsSeen.get(machineId);
-  if (seen?.docEpoch !== docEpoch) {
-    seen = { docEpoch, byPlayer: new Map() };
-    requestsSeen.set(machineId, seen);
-  }
-  const current = new Map<string, { requestId: string; at: number }>();
-  for (const request of pending) {
-    const before = seen.byPlayer.get(request.player);
-    current.set(request.player, before?.requestId === request.requestId
-      ? before
-      : { requestId: request.requestId, at: now });
-  }
-  // Only what is still pending is kept: an answered or withdrawn request goes.
-  seen.byPlayer = current;
-  return current;
-}
-
-/** Settle or refuse one request, which has waited `waitedMs` since this
- *  session first saw it; returns the machine as stored afterwards. */
+/** Settle or refuse one request, which has waited `waitedMs` since it arrived
+ *  in this page's doc; returns the machine as stored afterwards. */
 function settleOneInsert(
   machineId: string,
   state: CoinPusherState,
@@ -563,7 +540,6 @@ export function closeCoinPusher(
   now = Date.now(),
 ): void {
   lastPolls.delete(machineId);
-  requestsSeen.delete(machineId);
   // A room this session is leaving is left to the sessions still in it.
   if (!canManage || isLeavingRoom()) {
     pendingTeardowns.delete(machineId);
@@ -652,16 +628,14 @@ export function leaveCoinPusherRoom(): void {
   leavingDocEpoch = casinoDocEpoch();
   releaseCoinPusherLease();
   leaseSeen = null;
-  requestsSeen.clear();
   pendingTeardowns.clear();
   sweeps.clear();
 }
 
 /** How much this session is watching or tidying up (the room's lease
- *  observation, request sightings, pending teardowns, key sweeps): tests and
- *  debugging. */
+ *  observation, pending teardowns, key sweeps): tests and debugging. */
 export function coinPusherWatchCount(): number {
-  return (leaseSeen ? 1 : 0) + requestsSeen.size + pendingTeardowns.size + sweeps.size;
+  return (leaseSeen ? 1 : 0) + pendingTeardowns.size + sweeps.size;
 }
 
 // Best effort on page close: the write may not flush. (A page restored from

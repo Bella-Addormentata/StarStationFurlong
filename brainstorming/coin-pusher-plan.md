@@ -103,8 +103,9 @@ claim outside the window gains nothing. The result says which happened
 record carries must lie in the Date range (±8.64e15 ms, `MAX_TIMESTAMP_MS`):
 the guards refuse a peer-written one outside it, so the phase arithmetic
 between any two stays finite. The operator ages a request on its own clock,
-from when it first saw it (`PUSHER_STALE_REQUEST_MS`, the tail of a flood),
-never by `requestedAt`. Browser clocks aren't
+from when it arrived in the operator's doc (`PUSHER_STALE_REQUEST_MS`, the
+tail of a flood; the request index stamps each one as it arrives, however deep
+in the queue), never by `requestedAt`. Browser clocks aren't
 synchronised: a device whose clock is off by more than the window never has
 its timing kept (it still plays, dropping where the pusher is), and the panel
 says the drop was late or the device's clock is off.
@@ -161,9 +162,9 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   merge only one machine value survives while both players' balance writes do.
   Settling can't be made partition-safe without an authoritative ledger (the
   Registry-anchored chips), and reconciling afterwards from receipts would
-  only move the problem (a forged receipt would pay its writer). So the rule
-  is to never start a second operator while the first may only be cut off:
-  another *device* takes over a lapsed lease only after a further 60 s (only
+  only move the problem (a forged receipt would pay its writer). So another
+  *device* takes over a lease it has seen lapse only after a further 60 s, in
+  case its holder is only cut off (only
   the deed holder operates, so another device's lease is the deed holder's
   own, whatever player id it names: an install that restored their identity
   key has its own); tabs on one device share its local node and take over as
@@ -175,8 +176,14 @@ player ids, `<kind>-<n>` item ids) are written as they are.
   leaves no record of its own for a successor to wait out. While it leaves the
   room, it operates and watches nothing more in that room, so no frame takes a
   lease back as the release goes out, and the room's lease observation,
-  pending teardowns and sweeps go with it. Only a split outlasting that window
-  can still put two operators in one room.
+  pending teardowns and sweeps go with it. That window guards only a lease a
+  device has seen. One that sees no lease at all (cut off from the operator,
+  or joining from a cached copy of the room before its live state arrives)
+  takes it at once and operates after the settling wait, which is enough only
+  where the two are connected: each sees the other's take, and the merge keeps
+  one. So a split of any length that begins before a device has seen the
+  other's lease can put two operators in one room; once it has, only a split
+  outlasting the window can.
 - **Ownership.** The operator creates a missing machine with itself as owner,
   and re-owns one owned by anyone else (a deed transfer, or a peer-written
   owner). It creates one only where there is no record at all: a record that
@@ -334,9 +341,10 @@ model as it is.
   DROP is disabled; nothing is lost.
 - A cabinet removed while the deed holder is offline leaves its records
   behind (the same as a slot machine removed with no managing client online).
-- A network split between two of the deed holder's devices that outlasts the
-  takeover window can still settle drops, or drain a removed cabinet, on both
-  sides (see *Splits*).
+- A network split between two of the deed holder's devices can still settle
+  drops, or drain a removed cabinet, on both sides: one that outlasts the
+  takeover window, or one of any length that begins before a device has seen
+  the other's lease (see *Splits*).
 - The machine's owner is the player id of the install operating the room (the
   operator re-owns every machine it runs). The deed holder's other installs
   each have a player id of their own, so OPEN THE DOOR shows only on the

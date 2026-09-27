@@ -4,7 +4,7 @@
  * Yjs-backed casino map.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindCasinoDoc,
@@ -13,6 +13,7 @@ import {
   clearCoinPusherOperatorLease,
   drainAndClearCoinPusher,
   isCoinPusherRecordUnreadable,
+  PUSHER_REQUEST_SCAN,
   PUSHER_SWEEP_BATCH,
   readChips,
   readCoinPusherDoorResult,
@@ -77,6 +78,9 @@ const SETTLE_MS = 2_000;
 let doc: Y.Doc;
 
 beforeEach(() => {
+  // The request index stamps each request's arrival with the page's clock.
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(NOW);
   doc = new Y.Doc();
   bindCasinoDoc(doc);
   setSoleCroupierPredicate(() => true);
@@ -85,6 +89,7 @@ beforeEach(() => {
 afterEach(() => {
   setSoleCroupierPredicate(() => true);
   leaveCoinPusherRoom(); // reset this session's operator and watch state
+  vi.useRealTimers();
 });
 
 /** A machine owned by `owner` that has taken `n` drops from OTHER. */
@@ -282,7 +287,7 @@ describe('operateCoinPusher', () => {
     expect(readChips(PLAYER)).toBe(3 - PUSHER_ANTE + (result?.kind === 'drop' ? result.paid : NaN));
   });
 
-  it('refuses a request that has waited longer than PUSHER_STALE_REQUEST_MS since it first saw it', () => {
+  it('refuses a request that has waited longer than PUSHER_STALE_REQUEST_MS since it arrived', () => {
     writeCoinPusherState(MACHINE, machineWith(5));
     // One more request than a poll settles: the last one waits.
     const players = Array.from({ length: MAX_REQUESTS_PER_POLL + 1 }, (_, i) => `player-${i}`);
@@ -292,8 +297,9 @@ describe('operateCoinPusher', () => {
     }
     operateCoinPusher(MACHINE, OPERATOR, NOW);
     const waiting = players[players.length - 1];
-    expect(readCoinPusherResult(MACHINE, waiting)).toBeNull(); // seen, not reached
-    // A newcomer is aged from when it is first seen, not from its own time.
+    expect(readCoinPusherResult(MACHINE, waiting)).toBeNull(); // arrived, not reached
+    // A newcomer is aged from its own arrival here, not from its own time.
+    vi.setSystemTime(NOW + PUSHER_STALE_REQUEST_MS);
     buyInChips(OTHER, 3);
     writeCoinPusherRequest(MACHINE, request(OTHER, 'r9', 0.5, NOW - 10 * 60_000));
     operateCoinPusher(MACHINE, OPERATOR, NOW + PUSHER_STALE_REQUEST_MS + 1);
@@ -302,7 +308,7 @@ describe('operateCoinPusher', () => {
     expect(readCoinPusherResult(MACHINE, OTHER)).toMatchObject({ kind: 'drop' });
   });
 
-  it('ages a replaced request from its own first sighting, not the one it replaced', () => {
+  it('ages a replaced request from its own arrival, not the one it replaced', () => {
     writeCoinPusherState(MACHINE, machineWith(5));
     const players = Array.from({ length: MAX_REQUESTS_PER_POLL + 1 }, (_, i) => `player-${i}`);
     for (const [i, player] of players.entries()) {
@@ -311,11 +317,38 @@ describe('operateCoinPusher', () => {
     }
     operateCoinPusher(MACHINE, OPERATOR, NOW);
     const waiting = players[players.length - 1];
-    // Its panel withdrew it and asked again, between two polls.
+    // Its panel withdrew it and asked again, later.
+    vi.setSystemTime(NOW + PUSHER_STALE_REQUEST_MS / 2);
     expect(cancelCoinPusherRequest(MACHINE, waiting, 'r4')).toBe(true);
     expect(writeCoinPusherRequest(MACHINE, request(waiting, 'r5', 0.5, NOW))).toBe(true);
     operateCoinPusher(MACHINE, OPERATOR, NOW + PUSHER_STALE_REQUEST_MS + 1);
     expect(readCoinPusherResult(MACHINE, waiting)).toMatchObject({ kind: 'drop', requestId: 'r5' });
+  });
+
+  it('ages a request deep in a flood from its arrival, not from when a read first reaches it', () => {
+    writeCoinPusherState(MACHINE, machineWith(5));
+    // More requests than one read looks at (PUSHER_REQUEST_SCAN): the last
+    // arrive with the rest, far behind the part any read sees.
+    const players = Array.from({ length: PUSHER_REQUEST_SCAN + 8 }, (_, i) => `flood-${i}`);
+    for (const [i, player] of players.entries()) {
+      buyInChips(player, 3);
+      writeCoinPusherRequest(MACHINE, request(player, `f${i}`, 0.5, NOW));
+    }
+    operateCoinPusher(MACHINE, OPERATOR, NOW);
+    // Past the stale limit, polls work through the queue: every request
+    // reached is refused as expired, the deepest too.
+    const last = players[players.length - 1];
+    let t = NOW + PUSHER_STALE_REQUEST_MS + 1;
+    for (let polls = 0; polls < players.length && !readCoinPusherResult(MACHINE, last); polls++) {
+      vi.setSystemTime(t);
+      operateCoinPusher(MACHINE, OPERATOR, t);
+      t += 1_000;
+    }
+    expect(readCoinPusherResult(MACHINE, last)).toMatchObject({ kind: 'refused', reason: 'expired' });
+    expect(readChips(last)).toBe(3);
+    for (const player of players.slice(MAX_REQUESTS_PER_POLL)) {
+      expect(readCoinPusherResult(MACHINE, player)).toMatchObject({ kind: 'refused', reason: 'expired' });
+    }
   });
 
   it('refuses a drop into a full machine', () => {
@@ -768,7 +801,7 @@ describe('tickCoinPusherRoom', () => {
     expect(readCoinPusherOperatorLease()?.sessionId).toBe(coinPusherOperatorSession());
   });
 
-  it('leaving the room forgets its lease observation, request sightings, teardowns and sweeps', () => {
+  it('leaving the room forgets its lease observation, teardowns and sweeps', () => {
     // A removed cabinet whose keys are still being swept (drained by this
     // session as the room's operator, which then lets the lease go)…
     writeCoinPusherState('pusher-3', machineWith(5));
@@ -777,17 +810,13 @@ describe('tickCoinPusherRoom', () => {
     const ready = becomeReadyOperator([SPARE], NOW - SETTLE_MS);
     closeCoinPusher('pusher-3', true, ready);
     releaseCoinPusherLease();
-    // …a request this session has seen…
-    writeCoinPusherState('pusher-5', machineWith(5));
-    writeCoinPusherRequest('pusher-5', request(PLAYER, 'seen', 0.5));
-    operateCoinPusher('pusher-5', OPERATOR, NOW); // no chips: refused, but seen
     // …then a remote operator's lease, watched, and another removed cabinet
     // left to it.
     writeCoinPusherOperatorLease({ playerId: OTHER, sessionId: 'their-device:tab', expiresAt: NOW + 5_000 });
     tickCoinPusherRoom([MACHINE], NOW);
     writeCoinPusherState('pusher-4', machineWith(2));
     closeCoinPusher('pusher-4', true, NOW);
-    expect(coinPusherWatchCount()).toBe(4);
+    expect(coinPusherWatchCount()).toBe(3);
     leaveCoinPusherRoom();
     expect(coinPusherWatchCount()).toBe(0);
     // Nor is anything watched there again: the remote lease reads as no

@@ -4286,9 +4286,12 @@ export function createCoinPusherUI(deps: CoinPusherUIDeps): DeviceUI {
   let shownOperator: CoinPusherOperatorState | null = null;
   const myId = getPlayerId();
 
+  /** A new message replaces the whole previous one, its timing note included
+   *  (a drop's answer sets its own note right after). */
   const say = (message: string): void => {
     flash = message;
     flashShownIn = null;
+    timingNote = '';
   };
 
   const stopExpiry = (): void => {

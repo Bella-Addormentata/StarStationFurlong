@@ -925,8 +925,10 @@ export const PUSHER_REQUEST_SCAN = 64;
 // walks the map. The keys escape their ids, so each is filed under exactly
 // one machine: the one it names.
 interface PusherRequestIndex {
-  /** machineId → the keys holding its well-formed requests, in arrival order. */
-  byMachine: Map<string, Set<string>>;
+  /** machineId → the keys holding its well-formed requests, in arrival order,
+   *  each with when this page filed it (Date.now(): its arrival here, on this
+   *  page's clock). */
+  byMachine: Map<string, Map<string, number>>;
   /** machineId → every per-player key naming that machine, whatever it holds
    *  (a removal sweeps them from here — see startCoinPusherKeySweep). */
   playerKeys: Map<string, Set<string>>;
@@ -1055,8 +1057,9 @@ export function continueCoinPusherKeySweep(
 }
 
 /** File a request key afresh under its machine: any change is a new arrival,
- *  so it goes to the back. One that no longer holds a well-formed request of
- *  the player its key names (the cross-key guard) is unfiled. */
+ *  so it goes to the back, stamped with this page's clock. One that no longer
+ *  holds a well-formed request of the player its key names (the cross-key
+ *  guard) is unfiled. */
 function reindexPusherRequest(
   index: PusherRequestIndex,
   key: string,
@@ -1068,10 +1071,10 @@ function reindexPusherRequest(
   keys?.delete(key);
   if (isPusherInsertRequest(value) && value.player === playerId) {
     if (!keys) {
-      keys = new Set();
+      keys = new Map();
       index.byMachine.set(machineId, keys);
     }
-    keys.add(key);
+    keys.set(key, Date.now());
   } else if (keys?.size === 0) {
     index.byMachine.delete(machineId);
   }
@@ -1127,12 +1130,22 @@ export function readCoinPusherRequests(
   const keys = pusherRequestIndex(map).byMachine.get(machineId);
   const out: PusherInsertRequest[] = [];
   let looked = 0;
-  for (const key of keys ?? []) {
+  for (const key of keys?.keys() ?? []) {
     if (looked++ === PUSHER_REQUEST_SCAN) break;
     const value = map.get(key);
     if (isPusherInsertRequest(value)) out.push(value);
   }
   return out.slice(0, Math.max(0, limit));
+}
+
+/** When a player's pending request on this machine arrived in this page's
+ *  doc, on this page's clock (Date.now() when the index filed it; a doc bound
+ *  with the request already in it counts from the bind), or null when none is
+ *  pending. The operator ages every request from here, however deep in the
+ *  queue it waits, never from its `requestedAt`, which is the player's clock. */
+export function readCoinPusherRequestArrival(machineId: string, playerId: string): number | null {
+  const key = coinPusherRequestKey(machineId, playerId);
+  return pusherRequestIndex(ensureMap()).byMachine.get(machineId)?.get(key) ?? null;
 }
 
 /** One player's pending request on this machine (null when none). */

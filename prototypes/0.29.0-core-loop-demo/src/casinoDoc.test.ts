@@ -17,6 +17,7 @@ import {
   buyInChips,
   cancelCoinPusherRequest,
   coinPusherRequestKey,
+  readCoinPusherRequestArrival,
   coinPusherResultKey,
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
@@ -210,6 +211,37 @@ describe('coin-pusher requests', () => {
     writeCoinPusherRequest(MACHINE, request(PLAYER, 'a-1'));
     doc.getMap('casino').set(`pusher-req:${MACHINE}:${ATTACKER}`, request(PLAYER, 'a-0'));
     expect(readCoinPusherRequests(MACHINE).map((r) => r.requestId)).toEqual(['b-2', 'a-1']);
+  });
+
+  it("stamps each request with its arrival on this page's clock, afresh on every change", () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(5_000);
+      writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-1'));
+      expect(readCoinPusherRequestArrival(MACHINE, PLAYER)).toBe(5_000);
+      // A read doesn't restamp it.
+      vi.setSystemTime(7_000);
+      readCoinPusherRequests(MACHINE);
+      expect(readCoinPusherRequestArrival(MACHINE, PLAYER)).toBe(5_000);
+      // Withdrawn and filed again is a new arrival.
+      vi.setSystemTime(9_000);
+      expect(cancelCoinPusherRequest(MACHINE, PLAYER, 'req-1')).toBe(true);
+      expect(readCoinPusherRequestArrival(MACHINE, PLAYER)).toBeNull();
+      writeCoinPusherRequest(MACHINE, request(PLAYER, 'req-2'));
+      expect(readCoinPusherRequestArrival(MACHINE, PLAYER)).toBe(9_000);
+      // One a peer rewrote in place is a new arrival too.
+      vi.setSystemTime(11_000);
+      doc.getMap('casino').set(coinPusherRequestKey(MACHINE, PLAYER), request(PLAYER, 'req-3'));
+      expect(readCoinPusherRequestArrival(MACHINE, PLAYER)).toBe(11_000);
+      // A doc bound with a request already in it counts from the bind.
+      const other = new Y.Doc();
+      other.getMap('casino').set(coinPusherRequestKey(MACHINE, OTHER), request(OTHER, 'o-1'));
+      vi.setSystemTime(12_000);
+      bindCasinoDoc(other);
+      expect(readCoinPusherRequestArrival(MACHINE, OTHER)).toBe(12_000);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('a bounded read keeps the first to arrive, whatever ids they carry', () => {
