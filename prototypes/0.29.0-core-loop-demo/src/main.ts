@@ -1923,12 +1923,16 @@ async function joinRoomAtEpoch(
     // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
     // publishPlanetSummary refreshes its stamp once an hour).
     if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
-    if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
+    // Move reconciliation runs on every game in the room, commander or not:
+    // both writes follow from records everyone shares (the same cancel or
+    // pin, ranked as the move it settles), so they need no owner, and a tow
+    // or arrival never waits for the owner to come back.
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
     // 🪐 Where this station's last move settled it, shared once for everyone.
     if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
+    if (!isLocalHelmCommander()) return;
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).

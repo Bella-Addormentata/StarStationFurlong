@@ -37,6 +37,7 @@
  */
 
 import * as Y from 'yjs';
+import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
@@ -176,7 +177,6 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   if (!isPlainObject(v)) return null;
   if (!isId(v.welcomeRoomId) || !isName(v.name) || !isId(v.planetId)) return null;
   if (!Number.isInteger(v.orbitSlot) || (v.orbitSlot as number) < 0 || (v.orbitSlot as number) >= MAX_ORBIT_SLOTS) return null;
-  if (v.berthDoor !== undefined && !isId(v.berthDoor)) return null;
   if (v.ownerId !== undefined && !isId(v.ownerId)) return null;
   if (!isStamp(v.updatedAt, now)) return null;
   const out: StationSummary = {
@@ -186,7 +186,9 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
     orbitSlot: v.orbitSlot as number,
     updatedAt: v.updatedAt,
   };
-  if (v.berthDoor !== undefined) out.berthDoor = v.berthDoor as string;
+  // An optional berth a station record could not hold (not a door key) is
+  // left out, not the whole summary: the station still registers.
+  if (isId(v.berthDoor) && isAcceptableDoorKey(v.berthDoor)) out.berthDoor = v.berthDoor;
   if (v.ownerId !== undefined) out.ownerId = v.ownerId as string;
   // An empty list is news too (the station's last gate was removed); a list
   // whose every entry was malformed is not.
@@ -309,7 +311,8 @@ function newerBerths(a: StationSummary, b: StationSummary): Pick<StationSummary,
 
 /** Merge an incoming station summary into a known one, and the newer trim.
  *  Which record stands: one its owner published (it carries `ownerId`) beats
- *  one nobody owns, and between owned ones the newer wins; between records
+ *  one nobody owns; between one owner's records the newer wins, and between
+ *  two installs' owned records the smaller owner id stands; between records
  *  nobody owns (derived stations) the FIRST published stands, so a late
  *  install cannot move a station everyone already placed. Same-moment ties
  *  settle on the canonical JSON. A trim, a move and the gate list each merge
@@ -320,11 +323,16 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   const recordOf = (s: StationSummary): string =>
     JSON.stringify({ ...s, trim: undefined, move: undefined, berths: undefined, berthsAt: undefined });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
+  // Two installs that each saved the place under their own id: one of them
+  // stands for good (the smaller id), so their republishes cannot take turns.
+  const rivals = owned(incoming) && owned(prior) && incoming.ownerId !== prior.ownerId;
   const base = owned(incoming) !== owned(prior)
     ? (owned(incoming) ? incoming : prior)
-    : incoming.updatedAt !== prior.updatedAt
-      ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
-      : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
+    : rivals
+      ? (incoming.ownerId! < prior.ownerId! ? incoming : prior)
+      : incoming.updatedAt !== prior.updatedAt
+        ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
+        : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
   // Only a trim of the orbit the standing record flies: one published for
   // the slot that lost would be dropped by every reader anyway.
   const fits = (t: SharedTrim | undefined) => (t && trimFor(base, t) ? t : undefined);
@@ -349,17 +357,19 @@ function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipS
 /** Put a map's entries into a capped object, keeping the newest when full
  *  (by `stampOf`, the record's own stamp unless given). `pinned` keys (what
  *  this client sees first-hand) are kept first, whatever their stamps: peer
- *  stamps decide merges, never whether we forget our own station or ship. */
-function capped<T extends { updatedAt: number }>(
+ *  stamps decide merges, never whether we forget our own station or ship.
+ *  This planet's entries come next. */
+function capped<T extends { updatedAt: number; planetId: string }>(
   rec: Record<string, T>,
   max: number,
   pinned: ReadonlySet<string> = new Set(),
+  planet: string | null = null,
   stampOf: (v: T) => number = (v) => v.updatedAt,
 ): Record<string, T> {
   const entries = Object.entries(rec);
   if (entries.length <= max) return rec;
-  const first = (k: string) => (pinned.has(k) ? 0 : 1);
-  entries.sort((a, b) => first(a[0]) - first(b[0]) || stampOf(b[1]) - stampOf(a[1]));
+  const first = (k: string, v: T) => (pinned.has(k) ? 0 : onPlanet(v, planet) ? 1 : 2);
+  entries.sort((a, b) => first(a[0], a[1]) - first(b[0], b[1]) || stampOf(b[1]) - stampOf(a[1]));
   const out: Record<string, T> = Object.create(null);
   for (const [k, v] of entries.slice(0, max)) out[k] = v;
   return out;
@@ -373,16 +383,25 @@ function stationRecency(s: StationSummary, now: number): number {
   return Math.max(s.updatedAt, s.move ? Math.min(s.move.departAt, now) : -Infinity);
 }
 
+/** Is this summary about the planet this client is at? Retention keeps
+ *  those next, after the first-hand keys: news from other planets cannot
+ *  crowd out the stations and ships around this one. */
+function onPlanet(v: { planetId: string }, planet: string | null): boolean {
+  return planet !== null && planetById(v.planetId).id === planet;
+}
+
 /** The keys this client knows first-hand: the station it stands in and the
- *  ship it is aboard. Retention keeps them whatever peers stamp. */
-function firstHandKeys(): { stations: Set<string>; ships: Set<string> } {
+ *  ship it is aboard. Retention keeps them whatever peers stamp. And the
+ *  planet it is at (null when it cannot place itself). */
+function firstHandKeys(): { stations: Set<string>; ships: Set<string>; planet: string | null } {
   const stations = new Set<string>();
   const ships = new Set<string>();
-  const here = ctx?.currentStation()?.welcomeRoomId;
+  const current = ctx?.currentStation() ?? null;
+  const here = current?.welcomeRoomId;
   if (here) stations.add(here);
   const ship = ctx?.ship()?.roomId;
   if (ship) ships.add(ship);
-  return { stations, ships };
+  return { stations, ships, planet: current ? planetById(current.planetId).id : null };
 }
 
 // ── From this client: its station and its ship ──────────────────────────────
@@ -439,8 +458,11 @@ export function foldOwnStation(
   const mine = summaryForStation(station, trim, now);
   const owned = isOwned(station);
   if (!known) return mine;
-  const recordOnly = (a: StationSummary) =>
-    JSON.stringify({ ...a, trim: undefined, move: undefined, berths: undefined, berthsAt: undefined, updatedAt: 0 });
+  // The owner id is per install: another install's identical record is the
+  // same record, not news to republish over.
+  const recordOnly = (a: StationSummary) => JSON.stringify({
+    ...a, trim: undefined, move: undefined, berths: undefined, berthsAt: undefined, updatedAt: 0, ownerId: undefined,
+  });
   const sameRecord = (a: StationSummary, b: StationSummary): boolean => recordOnly(a) === recordOnly(b);
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
@@ -641,8 +663,8 @@ export function pullPlanetSummary(now = Date.now()): void {
   }
   const pins = firstHandKeys();
   if (changed) {
-    store.stations = capped(store.stations, MAX_STATIONS, pins.stations, (st) => stationRecency(st, now));
-    store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
+    store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
+    store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
     writeStore(store);
   }
   if (staleStations.size > 0 || staleShips.size > 0) {
@@ -672,21 +694,23 @@ export function pullPlanetSummary(now = Date.now()): void {
  *  transaction stays bounded. Below the bound the result is exact. */
 function pruneMap(
   map: Y.Map<unknown>,
-  stampOf: (k: string, v: unknown) => number | null,
+  stampOf: (k: string, v: unknown) => { at: number; planetId: string } | null,
   max: number,
   pinned: ReadonlySet<string> = new Set(),
+  planet: string | null = null,
 ): number {
-  const keep: Array<[string, number]> = [];
+  const keep: Array<[string, number, number]> = [];
   const drop: string[] = [];
   let visited = 0;
   for (const [k, v] of map.entries()) {
     if (++visited > max * 4) break;
-    const at = stampOf(k, v);
-    if (at === null) drop.push(k); else keep.push([k, at]);
+    const s = stampOf(k, v);
+    if (s === null) drop.push(k);
+    else keep.push([k, s.at, pinned.has(k) ? 0 : onPlanet(s, planet) ? 1 : 2]);
   }
-  // First-hand keys first (see capped), then newest, ties by key.
-  const first = (k: string) => (pinned.has(k) ? 0 : 1);
-  keep.sort((a, b) => first(a[0]) - first(b[0]) || b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  // First-hand keys first, then this planet's (see capped), then newest,
+  // ties by key.
+  keep.sort((a, b) => a[2] - b[2] || b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   for (const [k] of keep.slice(max)) drop.push(k);
   for (const k of drop) map.delete(k);
   return drop.length;
@@ -711,8 +735,8 @@ export function publishPlanetSummary(now = Date.now()): void {
     if (s && !same) store.ships[s.roomId] = s;
   }
   const pins = firstHandKeys();
-  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, (st) => stationRecency(st, now));
-  store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
+  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
+  store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
   writeStore(store);
   applyLearned(store);
   let pruned = 0;
@@ -734,11 +758,11 @@ export function publishPlanetSummary(now = Date.now()): void {
     // by freshness, never by map order (and junk keys do not pile up).
     pruned = pruneMap(stationMap!, (k, v) => {
       const s = cleanStationSummary(v, now);
-      return s && s.welcomeRoomId === k ? stationRecency(s, now) : null;
-    }, MAX_STATIONS, pins.stations) + pruneMap(shipMap!, (k, v) => {
+      return s && s.welcomeRoomId === k ? { at: stationRecency(s, now), planetId: s.planetId } : null;
+    }, MAX_STATIONS, pins.stations, pins.planet) + pruneMap(shipMap!, (k, v) => {
       const s = cleanShipSummary(v, now);
-      return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? s.updatedAt : null;
-    }, MAX_SHIPS, pins.ships);
+      return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? { at: s.updatedAt, planetId: s.planetId } : null;
+    }, MAX_SHIPS, pins.ships, pins.planet);
   });
   // Entries a bounded pull could not reach before the prune are reachable
   // now; the observer skips this local write, so read them here.

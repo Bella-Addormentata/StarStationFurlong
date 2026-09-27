@@ -450,7 +450,9 @@ export function quoteTow(
   modules: number,
   now: number,
 ): TowQuote | null {
-  if (!station) return null;
+  // No quote for a layout this install cannot see (0 modules): a price
+  // clamped to one module would undercharge the tow.
+  if (!station || !(modules >= 1)) return null;
   const to = planetById(toPlanetId).id;
   if (to === planetById(station.planetId).id) return null;
   const toSlot = freeSlotAround(to, stations, station.id);
@@ -468,12 +470,12 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
-  const quote = quoteTow(station, ctx.stations, toPlanetId, ctx.modules, now);
-  if (!quote) return { ok: false, refusal: 'no-slot', quote: null };
-  if (ctx.engines < TUG_MIN_ENGINES) return { ok: false, refusal: 'too-weak', quote };
   // A tow's price scales with the modules pushed: one guessed from a layout
   // this install cannot see would undercharge it.
   if (!(ctx.modules >= 1)) return { ok: false, refusal: 'unknown-layout', quote: null };
+  const quote = quoteTow(station, ctx.stations, toPlanetId, ctx.modules, now);
+  if (!quote) return { ok: false, refusal: 'no-slot', quote: null };
+  if (ctx.engines < TUG_MIN_ENGINES) return { ok: false, refusal: 'too-weak', quote };
   if (!(ctx.fuel >= quote.fuel)) return { ok: false, refusal: 'no-fuel', quote };
   return {
     ok: true,
@@ -765,9 +767,13 @@ export const MOVE_LOG_KEEP_MS = 24 * 60 * 60 * 1000;
 
 interface SettledMoves { through: number; drawn: number }
 
-function isSettledMoves(v: unknown): v is SettledMoves {
+/** A settled total off the wire: `through` no later than the move horizon
+ *  past `nowMs` (a far-future one would stand over every later pruning) and
+ *  `drawn` within the fuel meter's range. */
+function isSettledMoves(v: unknown, nowMs: number = Date.now()): v is SettledMoves {
   const r = v as SettledMoves;
-  return !!r && typeof r === 'object' && Number.isFinite(r.through) && Number.isFinite(r.drawn) && r.drawn >= 0;
+  return !!r && typeof r === 'object' && Number.isFinite(r.through) && r.through <= nowMs + MOVE_HORIZON_MS
+    && Number.isFinite(r.drawn) && r.drawn >= 0 && r.drawn <= FUEL_METER_MAX;
 }
 
 function validMove(raw: unknown): StationMove | null {
@@ -919,7 +925,7 @@ function pruneMoveLog(now: number): void {
   // The new base is what the kept entries' own fuel does not already cover,
   // so base + kept fuel reads what the whole log read.
   const { sum } = meterParts(keptMoves, known, 0);
-  const next: SettledMoves = { through: Math.max(through, settled?.through ?? -Infinity), drawn: Math.max(0, drawn - sum) };
+  const next: SettledMoves = { through: Math.max(through, settled?.through ?? -Infinity), drawn: Math.min(FUEL_METER_MAX, Math.max(0, drawn - sum)) };
   for (const e of keyed) if (!kept.has(e)) keepMap!.delete(e.key);
   for (const k of settledKeys) keepMap!.delete(k);
   keepMap!.set(`${SETTLED_PREFIX}${boundDoc!.clientID}:${now}`, next);

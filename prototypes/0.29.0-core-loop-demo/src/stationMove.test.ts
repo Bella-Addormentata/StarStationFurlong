@@ -37,6 +37,7 @@ import {
   moveTransitPointAt,
   planStationTow,
   planTow,
+  quoteTow,
   towFuelCost,
   towPointAt,
   towHoldsDock,
@@ -870,6 +871,8 @@ describe('tugs: a torch tow', () => {
 
   it('refuses to price a tow of a station whose layout this ship cannot see', () => {
     expect(planStationTow(towCtx({ modules: 0 }), ARIS)).toMatchObject({ ok: false, refusal: 'unknown-layout', quote: null });
+    expect(quoteTow(towCtx().station, towCtx().stations, ARIS, 0, NOW)).toBeNull();
+    expect(quoteTow(towCtx().station, towCtx().stations, ARIS, 1, NOW)).not.toBeNull();
     expect(planStationTow(towCtx({ modules: 1 }), ARIS)).toMatchObject({ ok: true });
   });
 
@@ -938,6 +941,21 @@ describe('the move log stays bounded', () => {
     Y.applyUpdate(again, Y.encodeStateAsUpdate(doc));
     bindStationMoveDoc(again);
     expect(readMoveFuelDrawn()).toBe(drawn);
+  });
+
+  it('ignores a settled total from the far future or past the meter\'s range', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    writeStationMove(hop(0, 10, 10));
+    const map = doc.getMap('stationKeeping');
+    map.set('moveSettled:9:1', { through: Date.now() + 365 * 86_400_000, drawn: 0 });
+    map.set('moveSettled:9:2', { through: Date.now(), drawn: 1e15 });
+    expect(readMoveFuelDrawn()).toBe(10);
+    // A later pruning is not steered by them either.
+    writeStationMove(hop(1, 5, 15));
+    writeStationMove(hop(2, 5, 20));
+    expect(readMoveFuelDrawn()).toBe(20);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:'))).toHaveLength(1);
   });
 
   it('keeps a loser next to the move that beat it, so it stays unpaid', () => {
