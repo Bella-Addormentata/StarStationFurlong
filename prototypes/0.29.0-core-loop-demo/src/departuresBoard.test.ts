@@ -174,6 +174,15 @@ describe('a ferry holding, or skipping, at this board’s stop', () => {
     const helm = skipCheckpoint(route, 1, { at, pilot: 'robot', why: 'helm' })!;
     expect(ferryRow(ferry(route, [s, helm]), boardAt(1), at + SEC)).toMatchObject({ status: 'NOT DOCKED', note: 'not stopping here', at: helm.departAt });
   });
+
+  it('⛔ a stop found gone leaves a two-stop route BLOCKED: "Stop 1 is gone", here and elsewhere', () => {
+    const gone = skipCheckpoint(route, 1, { at: s.arriveAt + 5 * SEC, pilot: 'robot', why: 'gone' })!;
+    const t = gone.arriveAt + SEC; // back at stop 0: the only stop left
+    expect(ferryRow(ferry(route, [s, gone]), boardAt(0), t)).toMatchObject({ status: 'ROUTE BLOCKED', note: 'Stop 1 is gone', at: null });
+    expect(ferryRow(ferry(route, [s, gone]), boardAt(1), t)).toMatchObject({
+      status: 'ROUTE BLOCKED', note: 'Stop 1 is gone · stopped at Stop 0', dir: 'from', at: null,
+    });
+  });
 });
 
 describe('a ferry on its way', () => {

@@ -66,7 +66,7 @@
  * Pure: no doc, no DOM, no clock of its own. Pinned by departuresBoard.test.ts.
  */
 
-import { formatClock, formatWait } from './helmRoute';
+import { formatClock, formatWait, goneWords } from './helmRoute';
 import { isRouteRunning, legWindowAfter, routeCycleLength, routeFlightAt, stopAt } from './pilotRoute';
 import type { LiveDockAt, RouteFlight, RouteWalkCache } from './pilotRoute';
 import { staySkipWhy } from './shipPilot';
@@ -171,6 +171,8 @@ export function stayReading(
 ): StayReading {
   const stop = route.stops[f.stopIndex];
   if (f.ended === 'fuel') return { status: 'ROUTE BLOCKED', at: null, note: 'out of fuel' };
+  // ⛔ Fewer than two stops left to dock at (design §4): "B is gone".
+  if (f.ended === 'blocked') return { status: 'ROUTE BLOCKED', at: null, note: goneWords(route, f) };
   if (f.holding) {
     return {
       status: 'HOLDING FOR BERTH',
@@ -253,12 +255,17 @@ export function ferryRow(ferry: DepartureFerry, here: BoardHere, now: number, ca
     ...(r.note ? { note: r.note } : {}),
   });
   const atHere = hereIdx.includes(f.stopIndex);
+  // ⛔ This station's stops found gone this run: the ferry passes them.
+  const liveHere = hereIdx.filter((i) => !f.goneStops.includes(i));
 
   if (f.paused) {
     const r: StayReading = { status: 'PAUSED', at: null, note: 'time unknown' };
     return atHere
       ? row('to', name(f.nextStopIndex), stopGate(f.stopIndex), r)
       : row('from', name(f.stopIndex), stopGate(hereIdx[0]), r);
+  }
+  if (!atHere && liveHere.length === 0 && f.ended === null && !f.stopping) {
+    return row('from', name(f.stopIndex), stopGate(hereIdx[0]), { status: 'ROUTE BLOCKED', at: null, note: 'berth removed · passed' });
   }
 
   if (f.status === 'docked') {
@@ -271,19 +278,22 @@ export function ferryRow(ferry: DepartureFerry, here: BoardHere, now: number, ca
     if (f.ended === 'fuel') {
       return row('from', name(f.stopIndex), stopGate(hereIdx[0]), { status: 'ROUTE BLOCKED', at: null, note: `out of fuel at ${name(f.stopIndex)}` });
     }
+    if (f.ended === 'blocked') {
+      return row('from', name(f.stopIndex), stopGate(hereIdx[0]), { status: 'ROUTE BLOCKED', at: null, note: `${goneWords(route, f)} · stopped at ${name(f.stopIndex)}` });
+    }
     if (f.stopping) return null;
     // Held up elsewhere: when it reaches here is not known.
     const late = f.holding || f.departsAt === null || (now >= f.departsAt && (f.overdue || f.pilot === 'person'));
     if (late) {
       return row('from', name(f.stopIndex), stopGate(hereIdx[0]), { status: 'DELAYED', at: null, note: 'time unknown' });
     }
-  } else if (hereIdx.includes(f.nextStopIndex)) {
+  } else if (liveHere.includes(f.nextStopIndex)) {
     // On its way here.
     return row('from', name(f.stopIndex), stopGate(f.nextStopIndex), { status: 'ON TIME', at: f.arrivesAt });
   } else if (f.stopping) {
     return null;
   }
-  const next = nextArrivalHere(route, f, hereIdx);
+  const next = nextArrivalHere(route, f, liveHere);
   if (!next) return null;
   return row('from', name(next.from), stopGate(next.to), { status: 'ON TIME', at: next.at });
 }

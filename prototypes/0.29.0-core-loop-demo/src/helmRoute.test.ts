@@ -41,6 +41,7 @@ import {
   formatClock,
   formatRouteSpan,
   formatWait,
+  goneWords,
   handOverRoute,
   helmEntryStay,
   isShipPilotRoutine,
@@ -54,8 +55,10 @@ import {
   resumeStopIndex,
   routeDepartLine,
   routeDepartState,
+  routeEndStopIndex,
   routeFromDraft,
   routeHelmView,
+  routeNoteStands,
   routePathLabel,
   routeRenderKey,
   routeStartRefusal,
@@ -122,6 +125,8 @@ function flight(over: Partial<RouteFlight> = {}): RouteFlight {
     holdSince: null,
     overdue: false,
     skipped: false,
+    gone: false,
+    goneStops: [],
     takeoverAt: null,
     pilot: 'person',
     fuel: 50,
@@ -251,12 +256,20 @@ describe('routeStopCandidates', () => {
     const st1 = c.find((x) => x.stationId === 'st-1')!;
     // The memory points at the closed gate 2: not offered.
     expect(st1.choices.some((x) => x.berth.roomId === 'room-1b')).toBe(false);
-    expect(st1.choices[st1.choices.length - 1]).toEqual({ berth: { roomId: 'room-1h', farDoor: 'y+' }, source: 'dock', held: true });
+    // 🧭 The berth the ship is docked in comes first: the editor's default.
+    expect(st1.choices[0]).toEqual({ berth: { roomId: 'room-1h', farDoor: 'y+' }, source: 'dock', held: true });
+    expect(st1.choices.slice(1).map((x) => x.berth.roomId)).toEqual(['room-1e', 'room-1a', 'room-1f', 'room-1d']);
     const st3 = c.find((x) => x.stationId === 'st-3')!;
     expect(st3.choices).toEqual([{ berth: { roomId: 'room-3', farDoor: 'y+', farWall: 'y+' }, source: 'memory', held: true }]);
-    // A live dock that is a listed gate is not listed twice.
+    // A live dock that is a listed gate is not listed twice; it comes first.
     const again = routeStopCandidates({ stations, planetId: SOV, shipRoomId: SHIP, liveDock: { stationId: 'st-1', roomId: 'room-1a', farDoor: 'x+' } });
     expect(again[0].choices.filter((x) => x.berth.roomId === 'room-1a')).toHaveLength(1);
+    expect(again[0].choices[0]).toMatchObject({ berth: { roomId: 'room-1a', gate: 1 }, source: 'gate' });
+    // 🧭 Docked in a gate the atlas shows taken: taken by this ship, so not
+    // "taken now", and first.
+    const inFour = routeStopCandidates({ stations, planetId: SOV, shipRoomId: SHIP, liveDock: { stationId: 'st-1', roomId: 'room-1d', farDoor: 'x+' } });
+    expect(inFour[0].choices[0]).toEqual({ berth: { roomId: 'room-1d', farDoor: 'x+', gate: 4 }, source: 'gate', access: 'pass', held: true });
+    expect(describeGateChoice(inFour[0].choices[0])).not.toContain('taken now');
   });
 
   it('describes each choice and finds a berth among them', () => {
@@ -579,6 +592,41 @@ describe('the ROUTE and FLIGHT PLAN lines', () => {
     expect(routeDepartLine(running, flight({ status: 'in-flight' }), T0)).toBe('ROUTE Stop 0→Stop 1→Stop 0 · In flight to Stop 1');
   });
 
+  it('⛔ a route blocked by gone stops says which, and that STOP ends it', () => {
+    const three = saved([0, 1, 2], { startedAt: T0 });
+    expect(goneWords(three, { goneStops: [1] })).toBe('Stop 1 is gone');
+    expect(goneWords(three, { goneStops: [1, 2] })).toBe('Stop 1 and Stop 2 are gone');
+    expect(routeStatusLine(running, flight({ ended: 'blocked', goneStops: [1] }), T0))
+      .toEqual({ text: 'ROUTE BLOCKED · Stop 1 is gone · STOP to end', tone: 'warn' });
+    expect(routeDepartLine(running, flight({ ended: 'blocked', goneStops: [1] }), T0))
+      .toBe('ROUTE Stop 0→Stop 1→Stop 0 · Blocked at Stop 0: Stop 1 is gone. STOP ends the route here');
+    expect(routeStatusLine(running, flight({ pilot: 'robot', skipped: true, gone: true, goneStops: [0] }), T0).text)
+      .toBe(`Stop 0→Stop 1→Stop 0 · robot · departs ${clk(W)} for Stop 1 · passing: its berth is gone`);
+  });
+
+  it('🛑 STOP ends at this stop once the timetable ended it here, else at the next one', () => {
+    expect(routeEndStopIndex(flight({ ended: 'stop' }))).toBe(0);
+    // Pressed inside the guard band: still docked here, ending at the next.
+    expect(routeEndStopIndex(flight({ stopping: true }))).toBe(1);
+    expect(routeEndStopIndex(flight({ status: 'in-flight', stopping: true }))).toBe(1);
+  });
+
+  it('🧾 a keeper\'s note stands only at its stay, and a hold note only while the ferry holds', () => {
+    const tie = { run: T0, legSeq: 4 };
+    expect(routeNoteStands(undefined, null, null)).toBe(true);
+    expect(routeNoteStands(tie, running, flight())).toBe(true);
+    expect(routeNoteStands(tie, running, flight({ legSeq: 5 }))).toBe(false);
+    expect(routeNoteStands(tie, { ...running, startedAt: T0 + 1 }, flight())).toBe(false);
+    expect(routeNoteStands(tie, running, flight({ paused: true }))).toBe(false);
+    expect(routeNoteStands(tie, running, null)).toBe(false);
+    const hold = { ...tie, hold: true };
+    expect(routeNoteStands(hold, running, flight({ holding: true }))).toBe(true);
+    // Another rider's dock, STOP or SKIP ended the hold.
+    expect(routeNoteStands(hold, running, flight())).toBe(false);
+    expect(routeNoteStands(hold, running, flight({ ended: 'stop' }))).toBe(false);
+    expect(routeNoteStands(hold, running, flight({ skipped: true }))).toBe(false);
+  });
+
   it('the render key flips when DEPART opens, the window passes, the band starts and the robot takes over', () => {
     const f = flight({ takeoverAt: W + 5 * MIN, departsAt: W + 6 * MIN });
     expect(routeRenderKey(null, T0)).toBe('');
@@ -755,6 +803,17 @@ describe('the helm writers', () => {
     expect(handOverRoute({ now: T0 + SEC, pilot: 'robot' })).toBeNull();
     expect(pauseRouteFromHelm({ now: T0 + 2 * SEC, capacity: CAP })).toBe(true);
     expect(handOverRoute({ now: T0 + 3 * SEC, pilot: 'person' })).toBeNull();
+  });
+
+  it('HAND TO ROBOT at a skipped stay is a plain helm entry: it never re-times the skip', () => {
+    start();
+    clock = T0 + 5 * SEC;
+    expect(skipRouteStop({ now: clock })).toBe(true);
+    const skipped = readRouteFlight()!;
+    expect(handOverRoute({ now: clock + SEC, pilot: 'person' })).not.toBeNull();
+    const hand = handOverRoute({ now: clock + 2 * SEC, pilot: 'robot' })!;
+    expect(hand).not.toHaveProperty('departAt');
+    expect(readRouteFlight()).toMatchObject({ skipped: true, departsAt: skipped.departsAt, pilot: 'robot' });
   });
 
   it('SKIP STOP at a stop: the ferry leaves at the next window; not in flight, not twice', () => {

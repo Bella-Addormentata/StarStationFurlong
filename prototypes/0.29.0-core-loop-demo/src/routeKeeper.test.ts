@@ -30,6 +30,7 @@ import {
   holdCheckpoint,
   legWindowAfter,
   liveDockFrom,
+  pauseCheckpoint,
   routeFlightAt,
   skipCheckpoint,
   startCheckpoint,
@@ -56,6 +57,7 @@ import {
   runKeeperPass,
   standingHold,
   stayHasDock,
+  stayResumed,
 } from './routeKeeper';
 import type { KeeperGateResult, KeeperMemory, KeeperView } from './routeKeeper';
 import { arrivalRefusal, setBerthSeedResolver, type ShipDockingApi } from './shipArrival';
@@ -373,6 +375,69 @@ describe('one tick of the keeper', () => {
     const f = { ...flightAt(R, [S], now), paused: true };
     expect(keeperStep(view(R, f, now))).toEqual({ kind: 'idle', why: 'paused' });
   });
+
+  it('🛟 neither casts off nor restarts while a pairing it may not release holds the ferry', () => {
+    const docks = { atStop: T0 - SEC, atNext: null, elsewhere: 1, stuck: 1 };
+    for (const late of [2 * SEC, 45 * SEC, 10 * MIN]) {
+      const now = S.departAt + late;
+      const f = flightAt(R, [S], now, dockedAtStop(0, T0 - SEC));
+      expect(keeperStep(view(R, f, now, { port: DOCKED_HERE, docks }))).toEqual({ kind: 'idle', why: 'held' });
+    }
+    // Before the departure it is docked as usual.
+    const early = S.departAt - 30 * SEC;
+    expect(keeperStep(view(R, flightAt(R, [S], early, dockedAtStop(0, T0 - SEC)), early, { port: DOCKED_HERE, docks })))
+      .toEqual({ kind: 'idle', why: 'docked' });
+  });
+
+  it('🚚 leaves a tug towing a station alone', () => {
+    const now = S.departAt + 2 * SEC;
+    const f = flightAt(R, [S], now, dockedAtStop(0, T0 - SEC));
+    expect(keeperStep(view(R, f, now, { towing: true, port: DOCKED_HERE, docks: { atStop: T0 - SEC, atNext: null, elsewhere: 0 } })))
+      .toEqual({ kind: 'idle', why: 'towing' });
+  });
+
+  describe('🔁 a RESUMEd stay', () => {
+    const pause = pauseCheckpoint(R, 1, { at: S.arriveAt + 10 * SEC });
+    const resume = dockCheckpoint(R, 2, { at: pause.at + 90 * SEC, pilot: 'robot', resume: true })!;
+    const all = [S, pause, resume];
+
+    it('is known by its dock entry', () => {
+      expect(stayResumed(all, 2)).toBe(true);
+      expect(stayResumed([S, dockCheckpoint(R, 2, { at: resume.at, pilot: 'robot' })!], 2)).toBe(false);
+    });
+
+    it('keeps its mark when the keeper restarts it, so the route still reads resumed', () => {
+      const late = resume.departAt + 45 * SEC;
+      const live = dockedAtStop(0, resume.at);
+      const f = flightAt(R, all, late, live);
+      expect(f).toMatchObject({ legSeq: 2, status: 'docked', overdue: true, paused: false });
+      const step = keeperStep(view(R, f, late, {
+        port: DOCKED_HERE, docks: { atStop: resume.at, atNext: null, elsewhere: 0 }, stayDock: true, stayResume: true,
+      }));
+      expect(step).toMatchObject({ kind: 'write', why: 'restart', entry: { kind: 'dock', legSeq: 2, resume: true, at: late, stayStart: late } });
+      if (step.kind !== 'write') return;
+      // The rewrite takes the RESUME's key: still resumed, the stay restarted.
+      expect(flightAt(R, [S, pause, step.entry], late + SEC, live)).toMatchObject({ paused: false, legSeq: 2, stayStart: late });
+      // A plain dock there (the bug) would read paused again.
+      const plain = dockCheckpoint(R, 2, { at: late, stayStart: late, pilot: 'robot' })!;
+      expect(flightAt(R, [S, pause, plain], late + SEC, live).paused).toBe(true);
+    });
+
+    it('keeps its mark when a dock ends a hold there, stamped no earlier than the hold', () => {
+      const hold = holdCheckpoint(R, 2, { at: resume.at + 20 * SEC });
+      const dockedAt = hold.at + 30 * SEC;
+      const now = dockedAt + 5 * SEC;
+      const f = flightAt(R, [...all, hold], now, dockedAtStop(0, dockedAt));
+      expect(f.holding).toBe(true);
+      const step = keeperStep(view(R, f, now, {
+        hold, port: DOCKED_HERE, docks: { atStop: dockedAt, atNext: null, elsewhere: 0 }, stayDock: true, stayResume: true,
+      }));
+      expect(step).toMatchObject({ kind: 'write', why: 'end-hold', entry: { kind: 'dock', legSeq: 2, resume: true, at: dockedAt, stayStart: dockedAt } });
+      if (step.kind !== 'write') return;
+      const g = flightAt(R, [S, pause, step.entry, hold], now, dockedAtStop(0, dockedAt));
+      expect(g).toMatchObject({ paused: false, holding: false, legSeq: 2, stayStart: dockedAt });
+    });
+  });
 });
 
 describe('the rider carve-out', () => {
@@ -621,14 +686,21 @@ describe('what a pass writes', () => {
 describe('what the helm hears', () => {
   const f = flightAt(R, [S], S.arriveAt + SEC);
 
-  it('announces the dock, and a gate change', () => {
-    expect(keeperNote(R, f, { kind: 'docked', gate: 1, gateChange: false })).toEqual({ kind: 'docked', stationName: 'Stop 1', gate: 1 });
-    expect(keeperNote(R, f, { kind: 'docked', gate: 3, gateChange: true })).toEqual({ kind: 'docked', stationName: 'Stop 1', gate: 3, gateChange: true });
+  const stay = { run: T0, legSeq: 1 };
+
+  it('announces the dock, and a gate change, tied to the stay', () => {
+    expect(keeperNote(R, f, { kind: 'docked', gate: 1, gateChange: false })).toEqual({ kind: 'docked', stationName: 'Stop 1', gate: 1, routeStay: stay });
+    expect(keeperNote(R, f, { kind: 'docked', gate: 3, gateChange: true })).toEqual({ kind: 'docked', stationName: 'Stop 1', gate: 3, gateChange: true, routeStay: stay });
   });
 
   it('says what the ferry does about a refusal', () => {
-    expect(keeperNote(R, f, { kind: 'hold' })).toEqual({ kind: 'none', stationName: 'Stop 1', reason: 'occupied', route: { action: 'hold', nextStopName: 'Stop 0' } });
+    expect(keeperNote(R, f, { kind: 'hold' })).toEqual({
+      kind: 'none', stationName: 'Stop 1', reason: 'occupied', route: { action: 'hold', nextStopName: 'Stop 0' }, routeStay: stay,
+    });
     expect(keeperNote(R, f, { kind: 'skip' })).toMatchObject({ reason: 'berth-gone', route: { action: 'skip' } });
+    // 🧾 A skip says why: removed, or closed to this ferry.
+    expect(keeperNote(R, f, { kind: 'skip' }, 'gone')).toMatchObject({ reason: 'berth-gone', route: { action: 'skip', why: 'gone' } });
+    expect(keeperNote(R, f, { kind: 'skip' }, 'shut')).toMatchObject({ reason: 'occupied', route: { action: 'skip', why: 'shut' } });
     expect(keeperNote(R, f, { kind: 'none', reason: 'no-berth' })).toMatchObject({ reason: 'no-berth', route: { action: 'ride-on' } });
     expect(keeperNote(R, f, { kind: 'none', reason: 'stale' })).toBeNull();
   });
@@ -666,16 +738,18 @@ function fakeDocking(clock: () => number, answer: (roomId: string, farDoor: stri
   return { api, asked, undocks };
 }
 
-/** The ship's live docks as main.ts reads them (same berth room only). */
+/** The ship's live docks as main.ts reads them (same berth room only; 🛟
+ *  a dock on any door but the route's port holds the stay). */
 function testLiveDock(): LiveDockAt {
-  const docks: Array<{ roomId: string; dockedAt: number }> = [];
-  for (const [, rec] of readAllDoors()) {
+  const docks: Array<{ roomId: string; dockedAt: number; doorId: string }> = [];
+  for (const [doorId, rec] of readAllDoors()) {
     if (rec.paired !== true) continue;
     const st = classifyDockPort(rec);
     if (st.kind !== 'docked') continue;
-    docks.push({ roomId: st.roomId, dockedAt: rec.dockedAt ?? 0 });
+    docks.push({ roomId: st.roomId, dockedAt: rec.dockedAt ?? 0, doorId });
   }
-  return liveDockFrom(docks);
+  const routePort = readShipRoute()?.shipPort;
+  return liveDockFrom(docks, undefined, routePort !== undefined ? { routePort } : {});
 }
 
 const flush = () => new Promise<void>((r) => setTimeout(r, 0));
@@ -782,13 +856,18 @@ describe('the keeper over a running ferry', () => {
     setBerthSeedResolver(null);
   });
 
-  const keeperWith = (d: ReturnType<typeof fakeDocking>, notes: unknown[] = []) => createRouteKeeper({
+  const keeperWith = (
+    d: ReturnType<typeof fakeDocking>,
+    notes: unknown[] = [],
+    more: Partial<Parameters<typeof createRouteKeeper>[0]> = {},
+  ) => createRouteKeeper({
     docking: () => d.api,
     shipRoomId: () => 'ship-1',
     sameStation: (s, roomId) => roomId === s.berth.roomId,
     station: () => null,
     note: (o) => notes.push(o),
     clock,
+    ...more,
   });
   const start = () => readRouteCheckpoints().find((e): e is StartCheckpoint => e.kind === 'start')!;
   const portRoom = () => {
@@ -815,7 +894,7 @@ describe('the keeper over a running ferry', () => {
     await flush();
     expect(portRoom()).toBe('room-1');
     expect(d.asked).toEqual([{ roomId: 'room-1', farDoor: 'x+', keeper: true }]);
-    expect(notes).toEqual([{ kind: 'docked', stationName: 'Stop 1' }]);
+    expect(notes).toEqual([{ kind: 'docked', stationName: 'Stop 1', routeStay: { run: T0, legSeq: 1 } }]);
     expect(readRouteCheckpoints().map((e) => e.kind)).toEqual(['start']);
     expect(keeper.dockAnswered(readRouteFlight(now)!)).toBe(true);
     // Docked on time: nothing more to do.
@@ -983,6 +1062,104 @@ describe('the keeper over a running ferry', () => {
     await flush();
     await flush();
     expect(readRouteCheckpoints().some((e) => e.kind === 'hold')).toBe(false);
+  });
+
+  it('🛰️ reads and does nothing before the room\'s shared state has arrived', () => {
+    let ready = false;
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d, [], { ready: () => ready });
+    const s = start();
+    now = ms(s.departAt + 2 * SEC);
+    keeper.tick();
+    expect(portRoom()).toBe('room-0');
+    expect(d.undocks).toEqual([]);
+    expect(keeper.mayOperate('x-', 'undock', 'room-0')).toBe(false);
+    ready = true;
+    keeper.tick();
+    expect(portRoom()).toBeNull();
+  });
+
+  it('🚚 leaves a tug towing a station docked', () => {
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d, [], { towing: () => true });
+    now = ms(start().departAt + 2 * SEC);
+    keeper.tick();
+    expect(portRoom()).toBe('room-0');
+  });
+
+  it('🛟 a port nobody aboard may release holds the ferry, DELAYED, until someone lets it go', () => {
+    // Another port of the ferry, docked before the departure.
+    writeDoorPairing('y+', seed('room-9'), buildDoorPairing(seed('room-9'), {
+      segments: dockChain(), farDoor: 'x+', transient: true, dockedAt: T0 - MIN,
+    }));
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d, [], { mayRelease: (id) => id !== 'y+' });
+    const s = start();
+    for (const late of [2 * SEC, 45 * SEC, 20 * MIN]) {
+      now = ms(s.departAt + late);
+      keeper.tick();
+      expect(portRoom()).toBe('room-0');
+      expect(readRouteFlight(now)).toMatchObject({ status: 'docked', legSeq: 0, overdue: true });
+    }
+    expect(readRouteCheckpoints().map((e) => e.kind)).toEqual(['start']);
+    // Its owner lets it go: the stay restarts, and the ferry leaves at the
+    // restarted stay's departure.
+    writeDoorTombstone('y+', seed('room-9'), { farDoor: 'x+', undockedAt: now });
+    now += SEC;
+    keeper.tick();
+    const restart = readRouteCheckpoints().find((e) => e.kind === 'dock')!;
+    expect(restart).toMatchObject({ legSeq: 0, stayStart: now });
+    now = ms(readRouteFlight(now)!.departsAt! + SEC);
+    keeper.tick();
+    expect(portRoom()).toBeNull();
+  });
+
+  it('casting off in flight remembers no berth (the stop it left is not where the dock is)', () => {
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d);
+    const s = start();
+    now = ms(s.departAt + SEC);
+    keeper.tick(); // cast off at the departure: remembers stop 0's berth
+    expect(readStationBerth('st-0')).toMatchObject({ roomId: 'room-0' });
+    // Mid-leg the port is found docked somewhere else (by hand, say), and a
+    // rider whose game never saw the stay boards.
+    now = ms(s.departAt + 20 * SEC);
+    writeDoorPairing('x-', seed('room-5'), buildDoorPairing(seed('room-5'), {
+      segments: dockChain(), farDoor: 'x+', transient: true, dockedAt: now,
+    }));
+    const rider = keeperWith(d);
+    now += SEC;
+    rider.tick();
+    expect(portRoom()).toBeNull();
+    expect(readStationBerth('st-0')).toMatchObject({ roomId: 'room-0' });
+  });
+
+  it('🧾 says docked once another rider\'s dock ended the hold it announced', async () => {
+    const d = fakeDocking(clock, () => ({ ok: false, reason: 'occupied' }));
+    const notes: Array<{ kind: string }> = [];
+    const keeper = keeperWith(d, notes);
+    const s = start();
+    now = ms(s.departAt + SEC);
+    keeper.tick();
+    now = ms(s.arriveAt + SEC);
+    keeper.tick();
+    await flush();
+    expect(notes.at(-1)).toMatchObject({ route: { action: 'hold' }, routeStay: { run: T0, legSeq: 1 } });
+    // Another rider docks the ferry and ends the hold before this game does.
+    now += 3 * SEC;
+    const route = readShipRoute()!;
+    writeDoorPairing('x-', seed('room-1'), buildDoorPairing(seed('room-1'), {
+      segments: dockChain(), farDoor: 'x+', transient: true, dockedAt: now,
+    }));
+    const dock = dockCheckpoint(route, 1, { at: now, stayStart: now, pilot: 'robot' })!;
+    expect(writeRouteCheckpoint(T0, dock, now)).toBe(true);
+    now += SEC;
+    keeper.tick();
+    expect(notes.at(-1)).toMatchObject({ kind: 'docked', stationName: 'Stop 1', routeStay: { run: T0, legSeq: 1 } });
+    const n = notes.length;
+    now += SEC;
+    keeper.tick();
+    expect(notes).toHaveLength(n); // said once
   });
 
   it('writes nothing about a stay a checkpoint write refuses', () => {

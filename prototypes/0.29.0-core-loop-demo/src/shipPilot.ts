@@ -216,10 +216,12 @@ export function pilotDockAt(
 export type PilotSkipWhy = SkipWhy | 'unwatched' | 'unknown';
 
 /** The newest `skip` entry at the stay says why; a skipped stay with none
- *  is a hold nobody renewed (pilotRoute: it ends unwatched). Null when the
- *  stay is not skipped. Pure. */
+ *  is a hold nobody renewed (pilotRoute: it ends unwatched), or ⛔ a stop
+ *  found gone at an earlier visit (`f.gone`: passed at every later one).
+ *  Null when the stay is not skipped. Pure. */
 export function staySkipWhy(f: RouteFlight, checkpoints: readonly RouteCheckpoint[]): PilotSkipWhy | null {
   if (!f.skipped) return null;
+  if (f.gone) return 'gone';
   let skip: Extract<RouteCheckpoint, { kind: 'skip' }> | null = null;
   for (const e of checkpoints) {
     if (e.kind === 'skip' && e.legSeq === f.legSeq && (!skip || e.at > skip.at)) skip = e;
@@ -350,6 +352,12 @@ export function pilotLine(v: PilotLineView, mem: PilotSpeech | null): PilotLine 
   if (f.ended === 'fuel') {
     return said('end') ? null : { key: 'end', text: `We are out of fuel at ${stop.name}. The route ends here.` };
   }
+  if (f.ended === 'blocked') {
+    // ⛔ Design §4: fewer than two stops left to dock at.
+    const gone = f.goneStops.map((i) => route.stops[i]?.name).filter((n): n is string => !!n);
+    const what = gone.length === 1 ? `The berth at ${gone[0]} has been removed` : `The berths at ${gone.join(' and ')} have been removed`;
+    return said('end') ? null : { key: 'end', text: `${what}. The route cannot go on: we stay at ${stop.name}.` };
+  }
   if (f.ended === 'stop') {
     if (!v.dock || said('end')) return null;
     return { key: 'end', text: `${welcomeTo(stop.name, v.dock)} This is the last stop: the route ends here.` };
@@ -367,7 +375,9 @@ export function pilotLine(v: PilotLineView, mem: PilotSpeech | null): PilotLine 
   if (v.dock && departAt !== null) {
     const left = departAt - now;
     if (!said('welcome') && left > PILOT_WELCOME_UNTIL_MS) {
-      if (v.dock.gateChange && v.dock.gate !== undefined && !said('gate')) {
+      // At START the ferry arrived nowhere: the gate it is docked at is no
+      // gate change (the editor's berth may simply name another one).
+      if (v.dock.gateChange && v.dock.gate !== undefined && !said('gate') && f.legSeq > 0) {
         return { key: 'gate', text: `Gate change: arriving at gate ${v.dock.gate}.` };
       }
       const last = f.stopping ? ', the last stop of the route' : '';

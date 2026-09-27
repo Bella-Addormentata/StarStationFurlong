@@ -33,8 +33,10 @@
  * checked (ids bounded to 128 characters, times finite, the berth door a key
  * the doors doc keeps, no pass field) and a malformed value reads as absent.
  * The timetable's own reader checks (pilotRoute.validateCheckpoints) go
- * further. Readers look at no more than 64 checkpoint keys: top-level keys
- * iterate in each replica's own order, so pruning keeps the count far below.
+ * further. Readers keep no more than 64 checkpoints of a run, picked by stay
+ * (capCheckpoints: the marks the walk starts from, then the newest), never by
+ * the order this copy's top-level keys iterate in, which differs between
+ * replicas; pruning keeps the count far below.
  *
  * FUEL. The ferry's fuel is derived like its position (A3 rule 5: the newest
  * level less every leg since, full again at each arrival at the first stop
@@ -509,7 +511,7 @@ export function checkpointFromWire(kind: CheckpointKind, legSeq: number, v: unkn
 
 // ── Reading the doc ──────────────────────────────────────────────────────────
 
-/** Checkpoint keys a reader looks at, at most (A2). */
+/** Checkpoints of one run a reader keeps, at most (A2; capCheckpoints). */
 export const MAX_CHECKPOINT_KEYS_SCANNED = 64;
 /** Ship-map keys a reader visits to find them, at most: junk keys a peer
  *  wrote must not make every read walk an unbounded map. */
@@ -525,25 +527,51 @@ interface CheckpointScan {
   otherRuns: string[];
 }
 
+/** Stay order, then kind order: how every reader sorts a run's entries. */
+function byStayAndKind(a: RouteCheckpoint, b: RouteCheckpoint): number {
+  return a.legSeq - b.legSeq || CHECKPOINT_KINDS.indexOf(a.kind) - CHECKPOINT_KINDS.indexOf(b.kind);
+}
+
+/**
+ * The entries a reader keeps of one run (A2's cap), sorted by stay and kind.
+ * Pruning keeps a run far below `max`; this is the backstop, and it answers
+ * the same in every game whatever order its copy of the map iterates in
+ * (the key set decides, never the order): `start`, every RESUME `dock` and
+ * every gone `skip` (the marks the timetable is checked and walked from),
+ * then the NEWEST others by stay, so a reader never loses the latest news
+ * to old entries. Pure.
+ */
+export function capCheckpoints(entries: readonly RouteCheckpoint[], max: number): RouteCheckpoint[] {
+  const sorted = [...entries].sort(byStayAndKind);
+  if (sorted.length <= max) return sorted;
+  const marks = (e: RouteCheckpoint) => e.kind === 'start'
+    || (e.kind === 'dock' && e.resume === true)
+    || (e.kind === 'skip' && e.why === 'gone');
+  const kept = sorted.filter(marks).slice(-max);
+  const rest = sorted.filter((e) => !marks(e));
+  const room = Math.max(0, max - kept.length);
+  return [...kept, ...(room > 0 ? rest.slice(-room) : [])].sort(byStayAndKind);
+}
+
 function scanCheckpoints(map: Y.Map<unknown>, run: number | null, maxKeys: number, maxVisits: number): CheckpointScan {
   const out: CheckpointScan = { entries: [], keys: new Map(), otherRuns: [] };
   let visited = 0;
-  let scanned = 0;
+  const found: RouteCheckpoint[] = [];
   for (const key of map.keys()) {
     if (++visited > maxVisits) break;
     if (!key.startsWith(CHECKPOINT_PREFIX)) continue;
-    if (++scanned > maxKeys) break;
     const parsed = parseCheckpointKey(key);
     // An unparseable key may be a newer client's: left alone.
     if (!parsed) continue;
     if (parsed.run !== run) { out.otherRuns.push(key); continue; }
     const entry = checkpointFromWire(parsed.kind, parsed.legSeq, map.get(key));
     if (!entry) continue;
-    out.entries.push(entry);
+    found.push(entry);
     out.keys.set(entry, key);
   }
-  // Replicas iterate in their own order: sort so every game reads alike.
-  out.entries.sort((a, b) => a.legSeq - b.legSeq || CHECKPOINT_KINDS.indexOf(a.kind) - CHECKPOINT_KINDS.indexOf(b.kind));
+  // Replicas iterate in their own order: the cap picks by stay, never by the
+  // order this copy happened to visit them, so every game reads alike.
+  out.entries = Number.isFinite(maxKeys) ? capCheckpoints(found, maxKeys) : found.sort(byStayAndKind);
   return out;
 }
 
@@ -616,6 +644,9 @@ export interface RouteWriteNotice {
   kind: 'start' | 'checkpoint' | 'stop' | 'finish';
   /** The stay the write concerns (START: 0). */
   legSeq?: number;
+  /** 🚏📋 The finish: the run it ended (route.startedAt), so a board ranks
+   *  it above any late snapshot of that run (departuresDoc). */
+  run?: number;
 }
 
 const writeListeners = new Set<(n: RouteWriteNotice) => void>();
@@ -828,7 +859,7 @@ export function finishShipRoute(apply?: () => void): boolean {
     touched();
     apply?.();
   });
-  announce({ kind: 'finish' });
+  announce({ kind: 'finish', run: route.startedAt });
   return true;
 }
 

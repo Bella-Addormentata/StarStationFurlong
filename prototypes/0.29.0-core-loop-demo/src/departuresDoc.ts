@@ -56,8 +56,8 @@
 import * as Y from 'yjs';
 import { checkpointsToPrune, isRouteRunning, stopAt } from './pilotRoute';
 import {
-  CHECKPOINT_KINDS,
   MAX_CHECKPOINT_KEYS_SCANNED,
+  capCheckpoints,
   checkpointFromWire,
   checkpointKey,
   checkpointToWire,
@@ -96,6 +96,10 @@ export interface DepartureFerry {
   route: ShipRoute;
   /** The publisher's clock when it was published. */
   at: number;
+  /** 🏁 A finished route (no run): the run its finish ended. It outranks
+   *  every snapshot of that run whatever the clocks say (departureRouteNewer).
+   *  Absent: an older publisher's finish, or a route that never ran. */
+  endedRun?: number;
   /** The current run's checkpoints, shape-checked, sorted by stay and kind
    *  (empty when the route is not running). */
   checkpoints: readonly RouteCheckpoint[];
@@ -110,12 +114,16 @@ export interface DeparturesPublish {
   /** The ship map's checkpoints of the current run (none after a finish). */
   checkpoints: readonly RouteCheckpoint[];
   at: number;
+  /** 🏁 The finish: the run it ended (shipRoute.RouteWriteNotice.run). */
+  endedRun?: number;
 }
 
 /** A board's console setting. */
 export type BoardSetting = { all: true } | { gate: number };
 
 const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LEN;
+/** A run id (route.startedAt): the ship map's own rule. */
+const isRunId = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v > 0;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -160,9 +168,12 @@ export function parseDepartureKey(key: unknown): DepartureKey | null {
 
 // ── The route entry ──────────────────────────────────────────────────────────
 
-/** The route entry as stored. */
-export function departureRouteToWire(f: Pick<DepartureFerry, 'shipRoomId' | 'name' | 'capacity' | 'route' | 'at'>): Record<string, unknown> {
-  return { shipRoomId: f.shipRoomId, name: f.name, capacity: f.capacity, at: f.at, route: routeToWire(f.route) };
+/** The route entry as stored (🏁 `endedRun` only on a route with no run). */
+export function departureRouteToWire(f: Pick<DepartureFerry, 'shipRoomId' | 'name' | 'capacity' | 'route' | 'at' | 'endedRun'>): Record<string, unknown> {
+  return {
+    shipRoomId: f.shipRoomId, name: f.name, capacity: f.capacity, at: f.at, route: routeToWire(f.route),
+    ...(f.route.startedAt === undefined && isRunId(f.endedRun) ? { endedRun: f.endedRun } : {}),
+  };
 }
 
 /** A route entry off the wire under `ship`'s key, cleaned, or null. The route
@@ -175,17 +186,29 @@ export function departureRouteFromWire(v: unknown, ship: string): Omit<Departure
   if (!(typeof v.at === 'number' && Number.isFinite(v.at) && v.at >= 0)) return null;
   const route = shipRouteFromWire(v.route);
   if (!route) return null;
-  return { shipRoomId: ship, name: v.name, capacity: v.capacity, at: v.at, route };
+  // 🏁 A bad or misplaced endedRun is dropped, never the entry.
+  const endedRun = route.startedAt === undefined && isRunId(v.endedRun) ? v.endedRun : undefined;
+  return { shipRoomId: ship, name: v.name, capacity: v.capacity, at: v.at, route, ...(endedRun !== undefined ? { endedRun } : {}) };
 }
 
-/** Does route entry `a` replace `b`? A newer START always; within one run,
- *  STOP over not stopped; otherwise the later publish (a tie keeps `b`). */
+/** Does route entry `a` replace `b`? 🏁 A finish that names its run beats
+ *  every snapshot of that run (and of older ones), and nothing from those
+ *  runs beats it back, whatever the publishers' clocks say (a rider's
+ *  running snapshot can carry a later `at` than the finish: clock skew, or a
+ *  checkpoint written just before the finish reached it); a newer START
+ *  beats the finish. Otherwise a newer START always; within one run, STOP
+ *  over not stopped; otherwise the later publish (a tie keeps `b`). */
 export function departureRouteNewer(
-  a: Pick<DepartureFerry, 'route' | 'at'>,
-  b: Pick<DepartureFerry, 'route' | 'at'>,
+  a: Pick<DepartureFerry, 'route' | 'at' | 'endedRun'>,
+  b: Pick<DepartureFerry, 'route' | 'at' | 'endedRun'>,
 ): boolean {
   const ra = a.route.startedAt;
   const rb = b.route.startedAt;
+  const ea = ra === undefined && isRunId(a.endedRun) ? a.endedRun : undefined;
+  const eb = rb === undefined && isRunId(b.endedRun) ? b.endedRun : undefined;
+  if (ea !== undefined && rb !== undefined) return ea >= rb;
+  if (eb !== undefined && ra !== undefined) return ra > eb;
+  if (ea !== undefined && eb !== undefined && ea !== eb) return ea > eb;
   if (ra !== undefined && rb !== undefined && ra !== rb) return ra > rb;
   if (ra !== undefined && ra === rb) {
     const sa = a.route.stoppedAt !== undefined;
@@ -222,7 +245,6 @@ export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
       continue;
     }
     const list = ckpts.get(k.ship) ?? [];
-    if (list.length >= MAX_CHECKPOINT_KEYS_SCANNED) continue;
     const e = checkpointFromWire(k.ckpt, k.legSeq, value);
     if (!e) continue;
     list.push({ run: k.run, e });
@@ -233,12 +255,13 @@ export function departureFerriesIn(map: Y.Map<unknown>): DepartureFerry[] {
     if (out.length >= MAX_DEPARTURE_FERRIES) break;
     const entry = routes.get(ship)!;
     const run = entry.route.startedAt;
+    // The same cap as the ship's own reader, picked by stay (never by this
+    // copy's key order), so every board reads a ferry alike.
     const mine = run === undefined
       ? []
-      : (ckpts.get(ship) ?? [])
+      : capCheckpoints((ckpts.get(ship) ?? [])
         .filter(({ run: r, e }) => r === run && e.stationId === entry.route.stops[stopAt(entry.route, e.legSeq)]?.stationId)
-        .map(({ e }) => e);
-    mine.sort((a, b) => a.legSeq - b.legSeq || CHECKPOINT_KINDS.indexOf(a.kind) - CHECKPOINT_KINDS.indexOf(b.kind));
+        .map(({ e }) => e), MAX_CHECKPOINT_KEYS_SCANNED);
     out.push({ ...entry, checkpoints: mine });
   }
   return out;
@@ -263,7 +286,11 @@ export function cleanDeparturesPublish(pub: DeparturesPublish, now: number): Dep
       checkpoints.push(clean);
     }
   }
-  return { shipRoomId: pub.shipRoomId, name: name || 'FERRY', capacity: pub.capacity, route, checkpoints, at: pub.at };
+  const endedRun = run === undefined && isRunId(pub.endedRun) ? pub.endedRun : undefined;
+  return {
+    shipRoomId: pub.shipRoomId, name: name || 'FERRY', capacity: pub.capacity, route, checkpoints, at: pub.at,
+    ...(endedRun !== undefined ? { endedRun } : {}),
+  };
 }
 
 /**

@@ -149,6 +149,26 @@ describe('the departures publisher', () => {
     expect(h.p.busyRooms()).toEqual([]);
   });
 
+  it('🔁 a retry that comes due after newer news was delivered is dropped, never re-sent', async () => {
+    const h = harness({ route: () => ({ ...running(), stops: [stop(0, 0), stop(1, 1)] }) });
+    h.p.routeWritten({ kind: 'start', legSeq: 0 });
+    await h.tick();
+    await h.answer(0, 'unreachable'); // room-0 missed snapshot A: a retry waits
+    await h.answer(1, 'written');
+    expect(h.timers.map((t) => t.ms)).toEqual([DEPARTURES_RETRY_MS[0]]);
+    const route = running();
+    const s = startCheckpoint(route, { at: T0, pilot: 'person', fuel: 100 })!;
+    h.setCkpts([s, holdCheckpoint(route, 1, { at: s.arriveAt + 1000 })]);
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 0 }); // snapshot B
+    await h.tick();
+    await h.answer(2, 'written'); // room-0 took B
+    await h.answer(3, 'written');
+    const sent = h.calls.length;
+    await h.tick(DEPARTURES_RETRY_MS[0]); // A's retry comes due
+    expect(h.calls).toHaveLength(sent);
+    expect(h.p.busyRooms()).toEqual([]);
+  });
+
   it('skips a room it holds no pass for, and publishes nothing once it has left the ship', async () => {
     const h = harness({ seedFor: (room) => (room === 'room-1' ? undefined : `pass:${room}`) });
     h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
@@ -165,11 +185,18 @@ describe('the departures publisher', () => {
     const h = harness();
     const { startedAt: _a, startStop: _b, ...finished } = running();
     h.setRoute(finished);
-    h.p.routeWritten({ kind: 'finish' });
+    h.p.routeWritten({ kind: 'finish', run: T0 });
     await h.tick();
     expect(h.calls[0].address).toBe('pass:room-0');
     expect(h.calls[0].pub.route.startedAt).toBeUndefined();
     expect(h.calls[0].pub.checkpoints).toEqual([]);
+    // 🏁 It names the run it ended, so a board ranks it above that run's
+    // late snapshots.
+    expect(h.calls[0].pub.endedRun).toBe(T0);
+    const g = harness();
+    g.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await g.tick();
+    expect(g.calls[0].pub.endedRun).toBeUndefined();
   });
 });
 
@@ -200,7 +227,7 @@ describe('shipRoute tells the publisher about this game’s own writes', () => {
       { kind: 'start', legSeq: 0 },
       { kind: 'checkpoint', legSeq: 1 },
       { kind: 'stop' },
-      { kind: 'finish' },
+      { kind: 'finish', run },
     ]);
   });
 });

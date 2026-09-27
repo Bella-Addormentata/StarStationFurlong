@@ -146,6 +146,30 @@ describe('the route entry', () => {
     expect(departureRouteNewer(finished, a)).toBe(true);
     expect(departureRouteNewer({ ...a, at: a.at }, a)).toBe(false);
   });
+
+  it('🏁 a finish naming its run beats every snapshot of that run, whatever the clocks say', () => {
+    const run = running([0, 1], T0);
+    const { startedAt: _s, startStop: _p, ...idle } = run;
+    const finish = { route: idle, at: T0 + 20 * MIN, endedRun: T0 };
+    // A rider's running snapshot of that run, stamped LATER (clock skew).
+    const late = { route: run, at: T0 + 25 * MIN };
+    const lateStopped = { route: { ...run, stoppedAt: T0 + 19 * MIN }, at: T0 + 25 * MIN };
+    expect(departureRouteNewer(late, finish)).toBe(false);
+    expect(departureRouteNewer(lateStopped, finish)).toBe(false);
+    expect(departureRouteNewer(finish, late)).toBe(true);
+    // A newer START beats it; an older run's snapshot never does.
+    const next = { route: running([0, 1], T0 + 30 * MIN), at: T0 + 10 * MIN };
+    expect(departureRouteNewer(next, finish)).toBe(true);
+    expect(departureRouteNewer(finish, next)).toBe(false);
+    expect(departureRouteNewer({ route: running([0, 1], T0 - MIN), at: T0 + 40 * MIN }, finish)).toBe(false);
+    // Two finishes: the later run's.
+    expect(departureRouteNewer({ ...finish, endedRun: T0 + MIN, at: T0 }, finish)).toBe(true);
+    // It round-trips, only on a route with no run.
+    const wire = departureRouteToWire({ shipRoomId: SHIP, name: 'F', capacity: 100, ...finish });
+    expect(departureRouteFromWire(wire, SHIP)?.endedRun).toBe(T0);
+    expect(departureRouteToWire({ shipRoomId: SHIP, name: 'F', capacity: 100, route: run, at: T0, endedRun: T0 })).not.toHaveProperty('endedRun');
+    expect(departureRouteFromWire({ ...wire, endedRun: 'x' }, SHIP)).not.toHaveProperty('endedRun');
+  });
 });
 
 describe('a publish applied to a stop room', () => {
@@ -210,6 +234,22 @@ describe('a publish applied to a stop room', () => {
     const [f] = departureFerriesIn(doc.getMap(DEPARTURES_MAP));
     expect(f.route.startedAt).toBeUndefined();
     expect(f.checkpoints).toEqual([]);
+  });
+
+  it('🏁 a late running snapshot never puts a finished ferry back on the board', () => {
+    const doc = new Y.Doc();
+    const route = running();
+    const s = start(route);
+    applyDeparturesPublish(doc, pub(route, [s], T0), T0);
+    const { startedAt: _s, startStop: _p, ...finished } = route;
+    expect(applyDeparturesPublish(doc, pub(finished, [], T0 + 20 * MIN, { endedRun: T0 }), T0 + 20 * MIN).wrote).toBe(true);
+    // A rider's snapshot of the ended run arrives after it, stamped later.
+    const hold = holdCheckpoint(route, 1, { at: s.arriveAt + SEC });
+    expect(applyDeparturesPublish(doc, pub(route, [s, hold], T0 + 21 * MIN), T0 + 21 * MIN).wrote).toBe(false);
+    expect(keys(doc)).toEqual([departureRouteKey(SHIP)]);
+    const [f] = departureFerriesIn(doc.getMap(DEPARTURES_MAP));
+    expect(f.route.startedAt).toBeUndefined();
+    expect(f.endedRun).toBe(T0);
   });
 
   it('prunes as the ship does: entries below the newest timed one go, start kept', () => {

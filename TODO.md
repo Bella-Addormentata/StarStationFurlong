@@ -33,12 +33,6 @@
 - [ ] Sprint 4 — chat UI (`ChatProvider`, session-capped demo), onboarding sequence, **host-sequenced** capsule claiming, polish/audio
 - [ ] [Issue #8](https://github.com/Bella-Addormentata/StarStationFurlong/issues/8) — character model demo
 - [ ] [Issue #12](https://github.com/Bella-Addormentata/StarStationFurlong/issues/12) — QR phone chat: capability skeleton early (challenge-bound QR, zxing-wasm decode), full UI later
-- [ ] **🚏 Ferry follow-ups** (robot pilot routes; the ferry ships choice 8 (a), riders only): **(1) station-end docking for empty ferries** (choice 8 (b), planned as the PR right after the ferry): a gate setting, "Dock scheduled ferries automatically", lets a player's game in that station room dock and cast off a due ferry. It writes the ferry's side through the ferry's room, which its owner's node keeps reachable. The ferry must have docked at that gate once with a rider aboard, so that the gate's record holds its address. **(2) "Grant this ship"** (build notes A9 item 5): a door's grant list also takes a ship room id, checked like `reservedFor`, so a robot ferry docks at a Granted-captains gate under its ship's grant, whoever rides. `requesterPub` is unsigned today, so this carries Reserved's level of trust. **(3) Node-side ferries (SH5)**: a small ferry keeper in `ssf-p2p-node` follows the same clock timetable and opens and closes the docks while nobody is online. Smaller known gaps:
-  - fly a full trip in a browser (none flown yet);
-  - the gate number above the port in the vestibule (§5a);
-  - the captain's end-of-route welcome after STOP rarely plays, because the route finishes as soon as the end dock answers;
-  - a ferry that gate-changed into another room of a stop reads NOT DOCKED on the board in the stop's berth room;
-  - no DOM tests for the helm's ROUTE panel, the board console or the `main.ts` wiring.
 
 ## 📐 Design artifacts owed
 

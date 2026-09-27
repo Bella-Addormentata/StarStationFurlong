@@ -42,6 +42,7 @@ import {
   MAX_CHECKPOINT_KEYS_SCANNED,
   ROUTE_FUEL_METER,
   ROUTE_MIN_CLIENT,
+  capCheckpoints,
   checkpointFromWire,
   checkpointKey,
   checkpointToWire,
@@ -572,6 +573,39 @@ describe('writeRouteCheckpoint', () => {
     for (let k = 1; k <= 100; k++) map().set(checkpointKey(run, 10_000 + k, 'pause'), { at: T0 + k, stationId: `st-${k % 2}` });
     expect(readRouteCheckpoints().length).toBeLessThanOrEqual(MAX_CHECKPOINT_KEYS_SCANNED);
     expect(readRouteCheckpoints()[0]).toMatchObject({ kind: 'start' });
+  });
+
+  it('the cap picks by stay, never by the copy\'s key order: marks first, then the newest', () => {
+    const { run, route } = started();
+    const pauses = Array.from({ length: 100 }, (_, i) => ({ k: 10_000 + i + 1, at: T0 + i + 1 }));
+    const resume = { k: 10_050, kind: 'dock' as const };
+    // Two copies of one map, keys set in opposite orders.
+    const fill = (m: Y.Map<unknown>, order: typeof pauses) => {
+      for (const p of order) m.set(checkpointKey(run, p.k, 'pause'), { at: p.at, stationId: `st-${stopAt(route, p.k)}` });
+    };
+    fill(map(), pauses);
+    map().set(checkpointKey(run, resume.k, 'dock'), {
+      at: T0 + 50, stationId: `st-${stopAt(route, resume.k)}`, stayStart: T0 + 50, departAt: T0 + 60, arriveAt: T0 + 70, pilot: 'robot', resume: true,
+    });
+    const a = readRouteCheckpoints();
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(shipDocHandle()!.doc));
+    const reversed = new Y.Doc();
+    const rm = reversed.getMap('ship');
+    const src = other.getMap('ship');
+    for (const key of [...src.keys()].reverse()) rm.set(key, src.get(key));
+    bindShipDoc(reversed);
+    const b = readRouteCheckpoints();
+    expect(b).toEqual(a);
+    expect(a).toHaveLength(MAX_CHECKPOINT_KEYS_SCANNED);
+    expect(a[0]).toMatchObject({ kind: 'start' });
+    expect(a.some((e) => e.kind === 'dock' && e.resume === true)).toBe(true);
+    // The newest others fill the rest: 62 pauses, stays 10039 to 10100.
+    const kept = a.filter((e) => e.kind === 'pause').map((e) => e.legSeq);
+    expect(kept).toEqual(pauses.slice(-62).map((p) => p.k));
+    // Pure, and under the cap it only sorts.
+    const few = capCheckpoints([a[3], a[1], a[0]], 64);
+    expect(few).toEqual([a[0], a[1], a[3]]);
   });
 });
 

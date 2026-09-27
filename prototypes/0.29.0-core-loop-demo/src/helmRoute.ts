@@ -303,7 +303,10 @@ function cleanChoiceBerth(b: KnownBerth & { gate?: number }): Omit<RouteBerth, '
  * gate, open gates, granted-captains gates), then the berth it remembers,
  * then the dock it is in now (A1: berthDoor, else memory, else the live
  * dock). A gate the station closed or reserved for another ship is never
- * offered, and neither is a memory or dock that points at one. Pure.
+ * offered, and neither is a memory or dock that points at one. 🧭 At the
+ * station the ship is docked at, the berth it is docked in comes FIRST (the
+ * editor's default: START there is no gate change), and it is not "taken
+ * now" (the ship taking it is this one). Pure.
  */
 export function routeStopCandidates(input: RouteCandidateInput): RouteStopCandidate[] {
   const holds = input.holdsPass ?? (() => true);
@@ -349,7 +352,16 @@ export function routeStopCandidates(input: RouteCandidateInput): RouteStopCandid
       choices.push({ berth, source, held: holds(k.roomId) });
     };
     extra(input.remembered?.(st.id), 'memory');
-    if (input.liveDock && input.liveDock.stationId === st.id) extra(input.liveDock, 'dock');
+    const live = input.liveDock && input.liveDock.stationId === st.id ? input.liveDock : null;
+    if (live) {
+      extra(live, 'dock');
+      const i = live.farDoor ? choiceIndexFor(choices, { roomId: live.roomId, farDoor: live.farDoor }) : -1;
+      if (i >= 0) {
+        const { occupied: _taken, ...mine } = choices[i];
+        choices.splice(i, 1);
+        choices.unshift(mine);
+      }
+    }
     out.push({ stationId: st.id, name: st.name, planetId: st.planetId, orbitSlot: st.orbitSlot, choices });
   }
   return out;
@@ -809,6 +821,7 @@ export function routeStatusLine(route: ShipRoute | null, f: RouteFlight | null, 
   const next = route.stops[f.nextStopIndex]?.name ?? '?';
   if (f.ended === 'stop') return { text: `STOPPING AT ${stop}`, tone: 'dim' };
   if (f.ended === 'fuel') return { text: `OUT OF FUEL AT ${stop} · REFUEL or STOP`, tone: 'warn' };
+  if (f.ended === 'blocked') return { text: `ROUTE BLOCKED · ${goneWords(route, f)} · STOP to end`, tone: 'warn' };
   const who = f.pilot === 'robot' ? 'robot' : 'person';
   if (f.status !== 'docked') {
     return {
@@ -826,13 +839,46 @@ export function routeStatusLine(route: ShipRoute | null, f: RouteFlight | null, 
   }
   if (f.overdue) return { text: `DELAYED AT ${stop} · was due ${formatClock(f.departsAt)}`, tone: 'warn' };
   const tail = [
-    f.skipped ? 'passing without docking' : '',
+    f.gone ? 'passing: its berth is gone' : f.skipped ? 'passing without docking' : '',
     f.stopping ? 'the route ends at the next stop' : '',
   ].filter(Boolean).join(' · ');
   return {
     text: `${path} · ${who} · departs ${formatClock(f.departsAt)} for ${next}${tail ? ` · ${tail}` : ''}`,
     tone: 'ok',
   };
+}
+
+/** ⛔ "B is gone", "B and C are gone": the stops found gone this run. */
+export function goneWords(route: ShipRoute, f: Pick<RouteFlight, 'goneStops'>): string {
+  const names = f.goneStops.map((i) => route.stops[i]?.name).filter((n): n is string => !!n);
+  if (names.length === 0) return 'its stops are gone';
+  const list = names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+  return `${list} ${names.length === 1 ? 'is' : 'are'} gone`;
+}
+
+/** 🛑 The stop a STOPped route ends at: this stop once the timetable has
+ *  ended it here, else the next one (STOP inside the guard band, or in
+ *  flight). Pure. */
+export function routeEndStopIndex(f: Pick<RouteFlight, 'status' | 'ended' | 'stopIndex' | 'nextStopIndex'>): number {
+  return f.status === 'docked' && f.ended !== null ? f.stopIndex : f.nextStopIndex;
+}
+
+/** 🧾 A keeper's helm note, tied to the stay it is about (`hold`: it says
+ *  the ferry holds). */
+export interface RouteNoteTie {
+  run: number;
+  legSeq: number;
+  hold?: boolean;
+}
+
+/** 🧾 Does a helm note still hold? One with no tie (not a keeper's) always
+ *  does; a keeper's only at its run and stay, unpaused, and a hold note only
+ *  while the ferry still holds (another rider's dock, STOP or SKIP ends it).
+ *  Pure. */
+export function routeNoteStands(tie: RouteNoteTie | undefined, route: ShipRoute | null, f: RouteFlight | null): boolean {
+  if (!tie) return true;
+  if (!route || route.startedAt !== tie.run || !f || f.paused || f.legSeq !== tie.legSeq) return false;
+  return tie.hold === true ? f.holding : true;
 }
 
 /** The FLIGHT PLAN's route line (§2b): "ROUTE A→B→A · Depart for B at
@@ -844,7 +890,9 @@ export function routeDepartLine(route: ShipRoute, f: RouteFlight, now: number): 
   const st = routeDepartState(f, now);
   switch (st.kind) {
     case 'holding': return `${path} · Holding for a berth at ${stop}`;
-    case 'ended': return f.ended === 'fuel' ? `${path} · Out of fuel at ${stop}` : `${path} · The route ends here at ${stop}`;
+    case 'ended': return f.ended === 'fuel' ? `${path} · Out of fuel at ${stop}`
+      : f.ended === 'blocked' ? `${path} · Blocked at ${stop}: ${goneWords(route, f)}. STOP ends the route here`
+        : `${path} · The route ends here at ${stop}`;
     case 'robot': return `${path} · The robot captain departs for ${next} at ${formatClock(st.departsAt)} (launch window)`;
     case 'away': return `${path} · In flight to ${next}`;
     case 'unknown': return `${path} · Next stop ${next}`;
@@ -864,7 +912,7 @@ export function routeRenderKey(f: RouteFlight | null, now: number): string {
   const w = personWindow(f);
   return [
     f.legSeq, f.status, f.stopIndex, f.holding, f.pilot, f.departsAt, f.arrivesAt, f.overdue, f.paused,
-    f.ended, f.stopping, f.skipped, f.takeoverAt,
+    f.ended, f.stopping, f.skipped, f.takeoverAt, f.goneStops.join(','),
     w !== null && now >= w - ROUTE_DEPART_OPENS_MS,
     w !== null && now >= w,
     f.departsAt !== null && now >= f.departsAt - GUARD_BAND_MS,
@@ -1017,7 +1065,10 @@ export function handOverRoute(o: { now: number; pilot: RoutePilot }): HelmCheckp
   const f = readRouteFlight(o.now);
   if (!routeRulesFlight(f) || f.ended !== null) return null;
   const stay = helmEntryStay(f, o.now);
-  const timed = o.pilot === 'robot' && stay === f.legSeq && f.status === 'docked' && !f.holding && f.stayStart !== null;
+  // A skipped stay has no stay of its own to time from (it leaves at the
+  // first window after arrival): the HAND there is a plain helm entry.
+  const timed = o.pilot === 'robot' && stay === f.legSeq && f.status === 'docked' && !f.holding && !f.skipped
+    && f.stayStart !== null;
   const entry = helmCheckpoint(route, stay, {
     at: o.now,
     pilot: o.pilot,

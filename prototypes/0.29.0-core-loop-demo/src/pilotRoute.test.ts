@@ -833,6 +833,159 @@ describe('pruning (A2)', () => {
   });
 });
 
+describe('pruning keeps what the reader still needs (review fixes)', () => {
+  it('⛽ a ferry refuelled at every stop, on time, keeps one REFUEL key, and reads the same', () => {
+    const r = running(FERRY_SLOTS);
+    const s = start(r, { fuel: 40 }); // 33 a leg: it must refuel at every stop
+    const on = onTimeChain(r, s, 30);
+    const all: RouteCheckpoint[] = [s];
+    for (let k = 1; k < 30; k++) all.push(fuelCheckpoint(r, k, { at: on[k - 1].arrive + 10 * SEC, fuel: 40 }));
+    const now = on[28].arrive + 20 * SEC; // docked at stay 29, after its REFUEL
+    expect(validateCheckpoints(r, all, now).rejected).toEqual([]);
+    const pruned = new Set(checkpointsToPrune(r, all, now));
+    const kept = all.filter((e) => !pruned.has(e));
+    expect(kept).toEqual([s, all[29]]);
+    for (const t of [now, on[29].depart + SEC, on[29].arrive + SEC]) {
+      expect(at(r, kept, t)).toEqual(at(r, all, t));
+    }
+    expect(at(r, kept, now)).toMatchObject({ legSeq: 29, fuel: 40, ended: null });
+    // With no REFUEL at the next stop, it ends there for fuel, as before.
+    expect(at(r, kept, on[29].arrive + SEC)).toMatchObject({ legSeq: 30, ended: 'fuel' });
+  });
+
+  it('🔁 the RESUME dock survives pruning, so the entries after it still read', () => {
+    const r = running([0, 1, 2]);
+    const s = start(r);
+    const on = onTimeChain(r, s, 4);
+    const pause = pauseCheckpoint(r, 1, { at: on[0].arrive + 10 * SEC });
+    const k = nextStayAtStop(r, 1, 0);
+    const resume = dockCheckpoint(r, k, { at: pause.at + 90 * SEC, pilot: 'robot', resume: true })!;
+    // Two stays on, a hold and its dock: the dock is the new floor.
+    const w = legWindowAfter(r, k + 1, resume.arriveAt + 60 * SEC)!;
+    const hold = holdCheckpoint(r, k + 2, { at: w.arriveAt + 2 * SEC });
+    const dock = dockCheckpoint(r, k + 2, { at: w.arriveAt + 90 * SEC, stayStart: w.arriveAt + 85 * SEC, pilot: 'robot' })!;
+    const all = [s, pause, resume, hold, dock];
+    const now = dock.at + SEC;
+    expect(validateCheckpoints(r, all, now).rejected).toEqual([]);
+    const pruned = new Set(checkpointsToPrune(r, all, now));
+    expect(pruned.has(resume)).toBe(false);
+    expect(pruned.has(pause)).toBe(true);
+    const kept = all.filter((e) => !pruned.has(e));
+    expect(validateCheckpoints(r, kept, now).rejected).toEqual([]);
+    for (const t of [now, dock.departAt + SEC, now + HOUR]) expect(at(r, kept, t)).toEqual(at(r, all, t));
+  });
+
+  it('🧭 a timed HAND TO ROBOT is no floor: TAKE over it later still reads the history', () => {
+    const r = running(FERRY_SLOTS);
+    const s = start(r);
+    const on = onTimeChain(r, s, 3);
+    const A0 = on[0].arrive;
+    const hold1 = holdCheckpoint(r, 1, { at: A0 + 5 * SEC });
+    const dock1 = dockCheckpoint(r, 1, { at: A0 + 400 * SEC, stayStart: A0 + 399 * SEC, pilot: 'robot' })!;
+    const take2 = helmCheckpoint(r, 2, { at: dock1.arriveAt + 5 * SEC, pilot: 'person' })!;
+    const hand2 = helmCheckpoint(r, 2, { at: dock1.arriveAt + 10 * SEC, pilot: 'robot', stayStart: dock1.arriveAt })!;
+    const withHand = [s, hold1, dock1, hand2];
+    const now = hand2.at + SEC;
+    expect(validateCheckpoints(r, withHand, now).anchor).toBe(hand2);
+    const pruned = new Set(checkpointsToPrune(r, withHand, now));
+    expect(pruned.size).toBe(0); // the floor is dock1 (stay 1), not the HAND
+    // TAKE again at stay 2 rewrites that key, untimed.
+    const retake = { ...take2, at: hand2.at + 5 * SEC };
+    const after = withHand.filter((e) => !pruned.has(e) && e !== hand2).concat(retake);
+    const full = [s, hold1, dock1, retake];
+    for (const t of [retake.at + SEC, retake.at + HOUR]) expect(at(r, after, t)).toEqual(at(r, full, t));
+  });
+
+  it('🧭 a keeper\'s restart after a TAKE, stamped later, stands: the robot flies on', () => {
+    const r = running(FERRY_SLOTS);
+    const s = start(r);
+    const on = onTimeChain(r, s, 3);
+    const take = helmCheckpoint(r, 1, { at: on[0].arrive + 5 * SEC, pilot: 'person' })!;
+    // The robot captain took over; the keeper then restarted the stay (a
+    // dock stamped robot), written after the TAKE.
+    const restart = dockCheckpoint(r, 1, { at: take.at + 10 * MIN, stayStart: take.at + 10 * MIN, pilot: 'robot' })!;
+    const f = at(r, [s, take, restart], restart.departAt + SEC);
+    expect(f).toMatchObject({ legSeq: 1, status: 'in-flight', pilot: 'robot' });
+    expect(at(r, [s, take, restart], restart.arriveAt + SEC)).toMatchObject({ legSeq: 2, pilot: 'robot' });
+    // A TAKE after the restart is the newer word.
+    const retake = { ...take, at: restart.at + SEC };
+    expect(at(r, [s, retake, restart], restart.at + 2 * SEC).pilot).toBe('person');
+  });
+});
+
+/** The flight when stay `legSeq` is first docked, walking the clock from `from`. */
+function dockedAt(r: ShipRoute, ckpts: readonly RouteCheckpoint[], legSeq: number, from: number): RouteFlight {
+  for (let t = from; t < from + 24 * HOUR; t += 5 * SEC) {
+    const f = at(r, ckpts, t);
+    if (f.legSeq === legSeq && f.status === 'docked') return f;
+    if (f.legSeq > legSeq) break;
+  }
+  throw new Error(`stay ${legSeq} never docked`);
+}
+
+describe('⛔ a stop found gone (design §4)', () => {
+  it('is passed at every later visit, and flagged from the stay after it was found', () => {
+    const r = running([0, 1, 2], 'loop');
+    const s = start(r);
+    const on = onTimeChain(r, s, 2);
+    const gone = skipCheckpoint(r, 1, { at: on[0].arrive + SEC, pilot: 'robot', why: 'gone' })!;
+    const f1 = at(r, [s, gone], gone.at + SEC);
+    expect(f1).toMatchObject({ legSeq: 1, stopIndex: 1, skipped: true, gone: false, goneStops: [] });
+    const f2 = at(r, [s, gone], gone.arriveAt + SEC);
+    expect(f2).toMatchObject({ legSeq: 2, stopIndex: 2, skipped: false, goneStops: [1], ended: null });
+    // Stay 4 is stop 1 again: passed on arrival, as a skip, never docked.
+    const back = dockedAt(r, [s, gone], 4, gone.arriveAt);
+    expect(back).toMatchObject({ stopIndex: 1, skipped: true, gone: true, overdue: false, goneStops: [1] });
+    expect(back.departsAt).toBe(legWindowAfter(r, 4, back.stayStart!)!.departAt); // no minimum wait
+    // A dock at stay 5 is a new floor: the mark survives pruning, and stay 7
+    // (stop 1 once more) is still passed.
+    const f5 = dockedAt(r, [s, gone], 5, back.stayStart!);
+    const dock5 = dockCheckpoint(r, 5, { at: f5.stayStart! + 70 * SEC, stayStart: f5.stayStart!, pilot: 'robot' })!;
+    const all = [s, gone, dock5];
+    const pruned = checkpointsToPrune(r, all, dock5.at + SEC);
+    expect(pruned).toEqual([]);
+    expect(dockedAt(r, all, 7, dock5.at)).toMatchObject({ stopIndex: 1, gone: true, skipped: true });
+  });
+
+  it('with fewer than two stops left, the route ends BLOCKED at the next one still there', () => {
+    const r = running(FERRY_SLOTS);
+    const s = start(r);
+    const on = onTimeChain(r, s, 2);
+    const gone = skipCheckpoint(r, 1, { at: on[0].arrive + SEC, pilot: 'robot', why: 'gone' })!;
+    const f = at(r, [s, gone], gone.arriveAt + SEC);
+    expect(f).toMatchObject({ legSeq: 2, stopIndex: 0, status: 'docked', ended: 'blocked', departsAt: null, goneStops: [1] });
+    expect(at(r, [s, gone], gone.arriveAt + 30 * HOUR)).toMatchObject({ legSeq: 2, ended: 'blocked' });
+    // STOP then ends it there for good.
+    const stopped = { ...r, stoppedAt: gone.arriveAt + MIN };
+    expect(at(stopped, [s, gone], gone.arriveAt + 2 * MIN)).toMatchObject({ legSeq: 2, ended: 'stop' });
+    // A helm SKIP is no gone mark: the ferry comes back to that stop.
+    const skip = skipCheckpoint(r, 1, { at: on[0].arrive + SEC, pilot: 'robot', why: 'helm' })!;
+    expect(at(r, [s, skip], skip.arriveAt + SEC)).toMatchObject({ legSeq: 2, ended: null, goneStops: [] });
+  });
+});
+
+describe('🛟 a pairing nobody aboard can release holds the stay (A5 Rights)', () => {
+  const r = running(FERRY_SLOTS);
+  const s = start(r);
+  const on = onTimeChain(r, s, 3);
+
+  it('a guest berth or another port docked before the departure keeps it docked, overdue', () => {
+    const guest = liveDockFrom([{ roomId: 'guest-room', dockedAt: T0 + SEC, doorId: 'x+' }], undefined, { routePort: 'x-' });
+    expect(guest.held).toBe(T0 + SEC);
+    expect(at(r, [s], on[0].depart + HOUR, { liveDock: guest })).toMatchObject({ status: 'docked', legSeq: 0, overdue: true });
+    // A dock on the route's own port is no hold of this kind (the live-dock
+    // rule covers it at its own stop only).
+    const own = liveDockFrom([{ roomId: 'elsewhere', dockedAt: T0 + SEC, doorId: 'x-' }], undefined, { routePort: 'x-' });
+    expect(own.held).toBeNull();
+    expect(at(r, [s], on[0].depart + SEC, { liveDock: own }).status).toBe('in-flight');
+    // Made after the departure (the ferry had left): it holds nothing.
+    const late = liveDockFrom([{ roomId: 'guest-room', dockedAt: on[0].depart + SEC, doorId: 'x+' }], undefined, { routePort: 'x-' });
+    expect(at(r, [s], on[0].depart + 2 * SEC, { liveDock: late }).status).toBe('in-flight');
+    // Without the route's port, a caller (a station's board) never sets it.
+    expect(liveDockFrom([{ roomId: 'guest-room', dockedAt: T0, doorId: 'x+' }]).held).toBeNull();
+  });
+});
+
 // ── The walk cache ───────────────────────────────────────────────────────────
 
 describe('the walk cache', () => {

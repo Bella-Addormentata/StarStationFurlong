@@ -111,6 +111,8 @@ function docked(over: Partial<RouteFlight> = {}): RouteFlight {
     holdSince: null,
     overdue: false,
     skipped: false,
+    gone: false,
+    goneStops: [],
     takeoverAt: null,
     pilot: 'robot',
     fuel: 50,
@@ -262,6 +264,8 @@ describe('how the captain reads its dock and a skip', () => {
     expect(staySkipWhy(f, [sk(D - MIN)])).toBe('unknown');
     expect(staySkipWhy(f, [sk(D - MIN, 'gone', 3)])).toBe('unwatched');
     expect(staySkipWhy(f, [])).toBe('unwatched');
+    // ⛔ Found gone at an earlier visit: passed with no entry of its own.
+    expect(staySkipWhy(docked({ skipped: true, gone: true, goneStops: [0] }), [])).toBe('gone');
     expect(r.stops).toHaveLength(2);
   });
 });
@@ -325,6 +329,11 @@ describe('what the captain says (pilotLine)', () => {
     const [b, m2] = say(lineView(docked(), now + PILOT_LINE_GAP_MS, { dock: moved }), m1);
     expect(b?.text).toBe('Welcome to Stop 0, gate 3. Next stop Stop 1, departing in 3 minutes, at 14:05.');
     expect(pilotLine(lineView(docked(), now + 10 * SEC, { dock: moved }), m2)).toBeNull();
+  });
+
+  it('never announces a gate change at START: the ferry arrived nowhere', () => {
+    const v = lineView(docked({ legSeq: 0 }), D - 4 * MIN, { dock: { gate: 3, gateChange: true } });
+    expect(pilotLine(v, null)).toMatchObject({ key: 'welcome', text: expect.stringContaining('Welcome to Stop 0, gate 3.') });
   });
 
   it('a gate change with no known number just welcomes', () => {
@@ -415,6 +424,10 @@ describe('what the captain says (pilotLine)', () => {
     expect(pilotLine(lineView(end, D + MIN), mem)).toBeNull();
     const dry = docked({ ended: 'fuel', departsAt: null, scheduledAt: null });
     expect(pilotLine(lineView(dry, D, { dock: null }), null)?.text).toBe('We are out of fuel at Stop 0. The route ends here.');
+    // ⛔ Blocked: fewer than two stops left to dock at.
+    const blocked = docked({ ended: 'blocked', departsAt: null, scheduledAt: null, goneStops: [1] });
+    expect(pilotLine(lineView(blocked, D, { dock: null }), null)?.text)
+      .toBe('The berth at Stop 1 has been removed. The route cannot go on: we stay at Stop 0.');
   });
 
   it('announces a departure that moved after the welcome (a restart, a takeover), and counts down to it again', () => {

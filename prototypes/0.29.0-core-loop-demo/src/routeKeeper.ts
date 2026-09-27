@@ -85,7 +85,21 @@
  * stop's station, at the timetable's moments, and nothing else
  * (keeperMayOperate, wired into docking.ts as onRouteDockRight and used only
  * by keeper-mode calls). Another port or guest berth still needs someone with
- * rights over it; until then the ferry stays at the stop (DELAYED).
+ * rights over it; until then the ferry stays at the stop (DELAYED). 🛟 The
+ * timetable holds the stay while such a pairing, made before the departure,
+ * is live (pilotRoute.LiveDockAt.held: every rider reads it alike), and a
+ * keeper that cannot release it (RouteKeeperDeps.mayRelease) neither casts
+ * off nor restarts the stay at the departure (`held`): it waits for someone
+ * with rights to let it go, then restarts the stay as for any ferry found
+ * docked late.
+ *
+ * 🛰️ A keeper reads nothing before the room's shared state has arrived
+ * (RouteKeeperDeps.ready): an IndexedDB replica can hold a stale route or
+ * stale door records, and a keeper acting on them would cast off or restart
+ * a ferry the room has already moved on. 🔁 A stay the ferry RESUMEd at keeps
+ * its RESUME mark through the keeper's own rewrites of that stay's `dock`
+ * (end-hold, restart), or every entry after it would read as too early.
+ * 🚚 A tug towing a station is left alone (its tow holds the ship).
  *
  * Pure decision functions (keeperStep, keeperAfterPass, passVerdict,
  * keeperBerths, keeperMayOperate …) plus a thin effectful loop
@@ -182,6 +196,9 @@ export interface KeeperDocks {
   atNext: number | null;
   /** Docks anywhere else. */
   elsewhere: number;
+  /** 🛟 Live pairings on doors other than the route's port that this game
+   *  may not release (a guest berth, another port: A5 Rights). Absent: 0. */
+  stuck?: number;
 }
 
 /** What a keeper remembers between ticks, about one stay of one run. Local
@@ -240,6 +257,12 @@ export interface KeeperView {
   hold: HoldCheckpoint | null;
   /** The stay already carries a `dock` entry (a keeper skips only without). */
   stayDock: boolean;
+  /** 🔁 That `dock` is a RESUME (stayResumed): the keeper's own rewrite of
+   *  it keeps the mark. Absent: false. */
+  stayResume?: boolean;
+  /** 🚚 This ship is towing a station (stationMove.isTowing): the keeper
+   *  leaves it docked. Absent: false. */
+  towing?: boolean;
   memory: KeeperMemory;
 }
 
@@ -265,6 +288,12 @@ export function standingHold(checkpoints: readonly RouteCheckpoint[], legSeq: nu
 /** Does stay `legSeq` carry a `dock` entry? */
 export function stayHasDock(checkpoints: readonly RouteCheckpoint[], legSeq: number): boolean {
   return checkpoints.some((e) => e.legSeq === legSeq && e.kind === 'dock');
+}
+
+/** 🔁 Is stay `legSeq`'s `dock` entry a RESUME (the key holds one dock per
+ *  stay, so a keeper's rewrite of it must keep the mark)? */
+export function stayResumed(checkpoints: readonly RouteCheckpoint[], legSeq: number): boolean {
+  return checkpoints.some((e) => e.legSeq === legSeq && e.kind === 'dock' && e.resume === true);
 }
 
 /** A person at the helm flies this stay's leg, and no robot captain will take
@@ -330,7 +359,11 @@ export type KeeperIdle =
   | 'backoff'
   | 'port-busy'
   | 'unplannable'
-  | 'wrote-recently';
+  | 'wrote-recently'
+  /** 🛟 A pairing this game may not release holds the ferry here. */
+  | 'held'
+  /** 🚚 The ship is towing a station. */
+  | 'towing';
 
 export type KeeperStep =
   | { kind: 'idle'; why: KeeperIdle }
@@ -356,6 +389,7 @@ function mayWrite(mem: KeeperMemory, why: KeeperWrite, now: number): boolean {
 export function keeperStep(v: KeeperView): KeeperStep {
   const { flight: f, now, route, port, docks, memory: mem } = v;
   if (f.paused) return idle('paused');
+  if (v.towing === true) return idle('towing');
 
   // In flight: nothing may stay docked.
   if (f.status !== 'docked') {
@@ -385,19 +419,31 @@ export function keeperStep(v: KeeperView): KeeperStep {
       const floor = f.stayStart ?? 0;
       let stayStart = Math.min(now, Math.max(docks.atStop, floor));
       if (!(stayStart > 0)) stayStart = now;
-      const entry = dockCheckpoint(route, f.legSeq, { at: now, stayStart, pilot: f.pilot });
+      // 🔁 At a RESUMEd stay the dock stays a RESUME (its stay starts at its
+      // own `at`), stamped no earlier than the hold it ends.
+      const entry = v.stayResume === true
+        ? dockCheckpoint(route, f.legSeq, {
+          at: Math.min(now, Math.max(stayStart, f.holdSince ?? 0, v.hold?.at ?? 0)), pilot: f.pilot, resume: true,
+        })
+        : dockCheckpoint(route, f.legSeq, { at: now, stayStart, pilot: f.pilot });
       return entry ? { kind: 'write', why: 'end-hold', entry } : idle('unplannable');
     }
     if (f.ended !== null) return idle('ended');
     if (personDeparts(f)) return idle('person-departs');
     if (!dueToLeave(f, now)) return idle('docked');
+    // 🛟 Another pairing this game may not release holds the ferry: no
+    // cast-off (it would leave half-docked) and no restart (it would restart
+    // every window) until someone with rights lets it go.
+    if ((docks.stuck ?? 0) > 0) return idle('held');
     if (now - f.departsAt! <= CAST_OFF_LATE_MS) {
       return port.busy ? idle('port-busy') : { kind: 'cast-off', why: 'departure' };
     }
     // Found docked late (nobody aboard at the departure, or the port busy):
     // restart the stay from now, and cast off at its new departure.
     if (!mayWrite(mem, 'restart', now)) return idle('wrote-recently');
-    const entry = dockCheckpoint(route, f.legSeq, { at: now, stayStart: now, pilot: f.pilot });
+    const entry = dockCheckpoint(route, f.legSeq, {
+      at: now, stayStart: now, pilot: f.pilot, ...(v.stayResume === true ? { resume: true } : {}),
+    });
     return entry ? { kind: 'write', why: 'restart', entry } : idle('unplannable');
   }
 
@@ -624,12 +670,21 @@ export function keeperAfterPass(v: KeeperView, pass: { legSeq: number; verdict: 
   return { memory, write: null };
 }
 
-/** The helm's line for a pass (noteShipArrival), or null for none. */
-export function keeperNote(route: ShipRoute, f: RouteFlight, verdict: PassVerdict): ArrivalOutcome | null {
+/** The helm's line for a pass (noteShipArrival), or null for none. 🧾 It
+ *  names the stay it is about (`routeStay`: the helm shows it only while it
+ *  still holds, helmRoute.routeNoteStands), and a skip says why (`gone` or
+ *  `shut`, skipWhyOf). */
+export function keeperNote(
+  route: ShipRoute & { startedAt: number },
+  f: RouteFlight,
+  verdict: PassVerdict,
+  skipWhy?: 'gone' | 'shut',
+): ArrivalOutcome | null {
   const stop = route.stops[f.stopIndex];
   const next = route.stops[f.nextStopIndex];
   if (!stop) return null;
   const nextStopName = next?.name ?? stop.name;
+  const routeStay = { run: route.startedAt, legSeq: f.legSeq };
   switch (verdict.kind) {
     case 'docked':
       return {
@@ -637,11 +692,18 @@ export function keeperNote(route: ShipRoute, f: RouteFlight, verdict: PassVerdic
         stationName: stop.name,
         ...(verdict.gate !== undefined ? { gate: verdict.gate } : {}),
         ...(verdict.gateChange && verdict.gate !== undefined ? { gateChange: true } : {}),
+        routeStay,
       };
     case 'hold':
-      return { kind: 'none', stationName: stop.name, reason: 'occupied', route: { action: 'hold', nextStopName } };
+      return { kind: 'none', stationName: stop.name, reason: 'occupied', route: { action: 'hold', nextStopName }, routeStay };
     case 'skip':
-      return { kind: 'none', stationName: stop.name, reason: 'berth-gone', route: { action: 'skip', nextStopName } };
+      return {
+        kind: 'none',
+        stationName: stop.name,
+        reason: skipWhy === 'shut' ? 'occupied' : 'berth-gone',
+        route: { action: 'skip', nextStopName, ...(skipWhy !== undefined ? { why: skipWhy } : {}) },
+        routeStay,
+      };
     case 'none':
       if (verdict.reason === 'stale') return null;
       return {
@@ -652,6 +714,7 @@ export function keeperNote(route: ShipRoute, f: RouteFlight, verdict: PassVerdic
             : verdict.reason === 'not-allowed' ? 'occupied'
               : 'unreachable',
         route: { action: 'ride-on', nextStopName },
+        routeStay,
       };
   }
 }
@@ -762,6 +825,15 @@ export interface RouteKeeperDeps {
   detachGuestBerths?: () => void;
   /** Tell the helm (devices.noteShipArrival). */
   note?: (outcome: ArrivalOutcome) => void;
+  /** 🛰️ Has the room's shared state arrived (main.ts initialRoomStateReady)?
+   *  Until it has, the keeper reads and does nothing. Default: yes. */
+  ready?: () => boolean;
+  /** 🛟 May this game release the live pairing on `doorId` (undock that
+   *  port, or delete that guest berth)? Asked for every door but the
+   *  route's port. Default: yes. */
+  mayRelease?: (doorId: string) => boolean;
+  /** 🚚 Is this ship towing a station (stationMove.isTowing)? Default: no. */
+  towing?: () => boolean;
   clock?: () => number;
 }
 
@@ -858,6 +930,27 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
   let memory: KeeperMemory | null = null;
   /** Bumped by reset: a pass from before it is ignored when it answers. */
   let generation = 0;
+  const ready = (): boolean => {
+    try {
+      return deps.ready ? deps.ready() : true;
+    } catch {
+      return false;
+    }
+  };
+  const mayRelease = (doorId: string): boolean => {
+    try {
+      return deps.mayRelease ? deps.mayRelease(doorId) : true;
+    } catch {
+      return false;
+    }
+  };
+  const towingNow = (): boolean => {
+    try {
+      return deps.towing?.() === true;
+    } catch {
+      return false;
+    }
+  };
 
   const flightNow = (now: number): { route: ShipRoute & { startedAt: number }; f: RouteFlight } | null => {
     const route = readShipRoute();
@@ -886,11 +979,12 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
             && route.stops.some((s, i) => i !== f.stopIndex && sameStation(s, portRoom)),
         }
       : { state: 'missing', busy: false, atStop: false, atOtherStop: false };
-    const docks: KeeperDocks = { atStop: null, atNext: null, elsewhere: 0 };
+    const docks: KeeperDocks = { atStop: null, atNext: null, elsewhere: 0, stuck: 0 };
     for (const d of liveBerthDocks()) {
       if (stop && sameStation(stop, d.roomId)) docks.atStop = Math.max(docks.atStop ?? 0, d.dockedAt);
       else if (f.status !== 'docked' && next && sameStation(next, d.roomId)) docks.atNext = Math.max(docks.atNext ?? 0, d.dockedAt);
       else docks.elsewhere++;
+      if (d.doorId !== route.shipPort && !mayRelease(d.doorId)) docks.stuck = (docks.stuck ?? 0) + 1;
     }
     const ckpts = readRouteCheckpoints();
     memory = keeperMemoryAt(memory, route.startedAt, f.legSeq);
@@ -902,6 +996,8 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       docks,
       hold: standingHold(ckpts, f.legSeq),
       stayDock: stayHasDock(ckpts, f.legSeq),
+      stayResume: stayResumed(ckpts, f.legSeq),
+      towing: towingNow(),
       memory,
     };
   };
@@ -913,12 +1009,18 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       return;
     }
     const mem = v.memory;
-    if (!mem.castOff) {
+    if (why === 'departure' && !mem.castOff) {
       // The first cast-off of the stay remembers the berth, as DEPART does.
       mem.castOff = true;
       castOffForDeparture(localStationId(v.route.stops[v.flight.stopIndex].stationId), k);
     } else {
-      for (const p of k.ports()) if (p.state.kind === 'docked') void k.undock(p.doorId);
+      // In flight (the stop left behind, or a dock the destination took
+      // early) there is no berth here to remember: the flight's stopIndex is
+      // the stop it LEFT, and remembering that station's berth from a dock
+      // elsewhere would be wrong. Only undock, and only what this game may.
+      for (const p of k.ports()) {
+        if (p.state.kind === 'docked' && (p.doorId === v.route.shipPort || mayRelease(p.doorId))) void k.undock(p.doorId);
+      }
     }
     deps.detachGuestBerths?.();
   };
@@ -981,7 +1083,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       if (after.write) writeRouteCheckpoint(run, after.write.entry, fresh.now);
       // Say it once per change (not on every retry of the same answer).
       if (verdict.kind !== lastVerdict || verdict.kind === 'docked') {
-        const n = keeperNote(fresh.route, fresh.flight, verdict);
+        const n = keeperNote(fresh.route, fresh.flight, verdict, verdict.kind === 'skip' ? skipWhyOf(results) : undefined);
         if (n && fresh.flight.legSeq === legSeq) deps.note?.(n);
       }
     }).catch((err) => {
@@ -995,6 +1097,8 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
 
   return {
     tick(): void {
+      // 🛰️ Nothing before the room's shared state has arrived.
+      if (!ready()) return;
       const now = clock();
       if (!isRouteRunning(readShipRoute())) { memory = null; return; }
       const docking = deps.docking();
@@ -1008,6 +1112,13 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       }
       if (!v) return;
       const step = keeperStep(v);
+      // 🧾 A hold another rider's dock ended (their keeper wrote the dock):
+      // this helm's hold note gives way to the dock, said once.
+      if (v.memory.verdict === 'hold' && v.docks.atStop !== null && !v.flight.holding && v.flight.status === 'docked') {
+        v.memory.verdict = 'docked';
+        const n = keeperNote(v.route, v.flight, { kind: 'docked', gateChange: false });
+        if (n) deps.note?.(n);
+      }
       switch (step.kind) {
         case 'idle':
           return;
@@ -1019,6 +1130,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
           const wrote = write(v, step.why, step.entry);
           // A hold another rider's dock ended: say so here too.
           if (wrote && step.why === 'end-hold' && said !== 'docked') {
+            v.memory.verdict = 'docked';
             const n = keeperNote(v.route, v.flight, { kind: 'docked', gateChange: false });
             if (n) deps.note?.(n);
           }
@@ -1045,6 +1157,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
     },
 
     mayOperate(doorId: string, op: 'dock' | 'undock', farRoomId: string): boolean {
+      if (!ready()) return false;
       const now = clock();
       const r = flightNow(now);
       if (!r) return false;

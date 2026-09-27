@@ -175,7 +175,7 @@ import {
   shipsAroundPlanet,
   type ShipStatusInput,
 } from "./planetSummary";
-import { bindStationMoveDoc, installStationMoveResolver } from "./stationMove";
+import { bindStationMoveDoc, installStationMoveResolver, isTowing } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1260,11 +1260,13 @@ function shipStationHere(roomId: string): string | null {
  * change) counts through the same station test the keeper uses
  * (routeKeeper.sameStationReader: the atlas component around the stop's
  * berth room, or a room the directory lists one of its gates in), so the
- * timetable and the keeper always agree on "docked at this stop".
+ * timetable and the keeper always agree on "docked at this stop". 🛟 Each
+ * dock carries its door, so a pairing on any door but the route's port
+ * holds the stay (pilotRoute.LiveDockAt.held, A5 Rights).
  */
 function shipRouteLiveDock(): LiveDockAt {
-  const docks: Array<{ roomId: string; dockedAt: number }> = [];
-  for (const [, rec] of readAllDoors()) {
+  const docks: Array<{ roomId: string; dockedAt: number; doorId: string }> = [];
+  for (const [doorId, rec] of readAllDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (rec.transient !== true && !isDockChain(rec.segments)) continue;
     let roomId = "";
@@ -1275,11 +1277,20 @@ function shipRouteLiveDock(): LiveDockAt {
     }
     if (!roomId) continue;
     const at = rec.dockedAt;
-    docks.push({ roomId, dockedAt: typeof at === "number" && Number.isFinite(at) ? at : 0 });
+    docks.push({ roomId, dockedAt: typeof at === "number" && Number.isFinite(at) ? at : 0, doorId });
   }
   if (docks.length === 0) return () => null;
+  const routePort = readShipRoute()?.shipPort;
   // Only a dock outside the stop's own berth room asks the atlas.
-  return liveDockFrom(docks, sameStationReader());
+  return liveDockFrom(docks, sameStationReader(), routePort !== undefined ? { routePort } : {});
+}
+
+/** 🛰️ Has the active room's shared state arrived (initialRoomStateReady)?
+ *  Before it has, the replica may be IndexedDB's stale copy: the route's
+ *  keeper and its copy-back wait. */
+function roomStateArrivedNow(): boolean {
+  const sync = yjsSync;
+  return !!sync && initialRoomStateReady(sync);
 }
 
 /**
@@ -1315,6 +1326,16 @@ const routeKeeper = createRouteKeeper({
     }
   },
   note: noteShipArrival,
+  // 🛰️ Never on a stale replica.
+  ready: roomStateArrivedNow,
+  // 🛟 A5 Rights: a port or guest berth this player may not operate holds
+  // the ferry (the keeper waits for someone who may).
+  mayRelease: (doorId) => {
+    const ds = world?.dockingSystem;
+    return !!ds && ds.canOperateDock(doorId);
+  },
+  // 🚚 A tug mid-tow is the station's engine: the keeper leaves it docked.
+  towing: () => isTowing(activeBootstrap?.roomId ?? "", Date.now()),
 });
 
 /** The one-module station whose welcome room IS this room, straight from
@@ -2128,7 +2149,9 @@ async function joinRoomAtEpoch(
     // route fields) at a departure or an arrival. Publish when what this
     // game would say has changed, and once more when the route has ended.
     try {
-      const said = isRouteRunning(readShipRoute()) ? JSON.stringify(planetShipStatus()) : "";
+      // 🛰️ Not from a stale replica: wait for the room's state.
+      const said = !roomStateArrivedNow() ? lastRouteShipStatus
+        : isRouteRunning(readShipRoute()) ? JSON.stringify(planetShipStatus()) : "";
       if (said !== lastRouteShipStatus) {
         lastRouteShipStatus = said;
         publishPlanetSummary();
@@ -2144,7 +2167,8 @@ async function joinRoomAtEpoch(
     // end stop and the keeper's dock there has answered (at once when STOP
     // came during a hold), or when a person's `in-flight` has been landed.
     if (routeRulesFlightNow()) {
-      settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) });
+      // 🛰️ Never copy a stale replica's timetable back.
+      if (roomStateArrivedNow()) settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) });
       return;
     }
     const rec = readFlightRecord();

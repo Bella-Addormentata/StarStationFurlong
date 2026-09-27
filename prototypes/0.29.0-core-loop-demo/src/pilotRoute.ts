@@ -753,11 +753,27 @@ export function fuelCheckpoint(route: ShipRoute, legSeq: number, o: { at: number
 // ── Pruning (A2) ─────────────────────────────────────────────────────────────
 
 /**
- * Which of this run's entries a writer deletes: everything below the anchor
- * (the newest valid timed entry) except the `start` entry and the newest
- * `helm` and `fuel` entries below it (the pilot and fuel the anchor's stay is
- * entered with), so the timetable reads the same after pruning and only a
- * handful of keys remain. Entries at or above the anchor's stay are kept.
+ * Which of this run's entries a writer deletes, so the timetable reads the
+ * same after pruning and only a handful of keys remain (readers look at no
+ * more than 64):
+ *
+ *  - The FLOOR is the newest valid timed entry of a kind no later write can
+ *    strip of its times: start, dock, skip or go. 🧭 Never a timed `helm`
+ *    (HAND TO ROBOT): a TAKE at the same stay rewrites that key without
+ *    times, and the history under it must still be there when it does.
+ *  - Below the floor everything goes except: `start`; the newest RESUME
+ *    `dock` (the reader checks every later entry from it, not from the
+ *    route's own legs: the ship came back off route, often sooner); the
+ *    newest `helm` (the pilot the floor's stay is entered with) unless that
+ *    RESUME, newer, stamps the pilot itself; and ⛔ the newest gone `skip` of
+ *    each stop, with the RESUME its check walks from (a stop found gone is
+ *    passed for the rest of the run, design §4).
+ *  - ⛽ Only the newest `fuel` entry is kept, below or above the floor: a
+ *    REFUEL sets the level outright, and a later REFUEL proves the ferry flew
+ *    on to it (the timetable never ends a route for fuel before its newest
+ *    REFUEL), so the older ones say nothing any more. A ferry refuelled at
+ *    every stop, on time, writing nothing else, keeps one key for it.
+ *  - Entries at or above the floor are kept; junk below it goes.
  */
 export function checkpointsToPrune(
   route: ShipRoute,
@@ -765,45 +781,94 @@ export function checkpointsToPrune(
   now: number,
 ): RouteCheckpoint[] {
   const v = validateCheckpoints(route, checkpoints, now);
-  if (!v.anchor) return [];
-  const floor = v.anchor.legSeq;
-  const below = v.entries.filter((e) => e.legSeq < floor);
-  const keep = new Set<RouteCheckpoint>([
-    ...below.filter((e) => e.kind === 'start'),
-    ...[newestOf(below.filter((e) => e.kind === 'helm')), newestOf(below.filter((e) => e.kind === 'fuel'))]
-      .filter(present),
-  ]);
+  const legs = new Legs(route);
   const validSet = new Set(v.entries);
+  const newestFuel = newestOf(v.entries.filter((e) => e.kind === 'fuel'));
+  const stable = newestOf(v.entries.filter((e) => isTimedCheckpoint(e) && e.kind !== 'helm'));
+  const floor = stable ? stable.legSeq : Number.NEGATIVE_INFINITY;
+  const below = v.entries.filter((e) => e.legSeq < floor);
+  const resumes = below.filter(isResume);
+  const resumeAtOrBefore = (legSeq: number) => newestOf(resumes.filter((e) => e.legSeq <= legSeq));
+  const keep = new Set<RouteCheckpoint>(below.filter((e) => e.kind === 'start'));
+  const resume = newestOf(resumes);
+  if (resume) keep.add(resume);
+  const helm = newestOf(below.filter((e) => e.kind === 'helm'));
+  if (helm && (!resume || resume.pilot === undefined || helm.legSeq >= resume.legSeq)) keep.add(helm);
+  for (const g of goneMarks(legs, below).values()) {
+    keep.add(g);
+    const r = resumeAtOrBefore(g.legSeq);
+    if (r) keep.add(r);
+  }
   return normalize(checkpoints).filter((e) => {
+    if (!validSet.has(e)) return e.legSeq < floor; // junk below the floor
+    if (e.kind === 'fuel') return e !== newestFuel;
     if (e.legSeq >= floor) return false;
-    if (validSet.has(e)) return !keep.has(e);
-    return true; // junk below the anchor
+    return !keep.has(e);
   });
+}
+
+/** ⛔ Design §4: a `skip` a keeper wrote because every gate of its stop was
+ *  GONE (the berth door, or its port, removed). */
+function isGoneSkip(e: RouteCheckpoint): e is SkipCheckpoint & { why: 'gone' } {
+  return e.kind === 'skip' && e.why === 'gone';
+}
+
+/** The newest gone skip of each stop among `entries`, by stop index. */
+function goneMarks(legs: Legs, entries: readonly RouteCheckpoint[]): Map<number, SkipCheckpoint> {
+  const out = new Map<number, SkipCheckpoint>();
+  for (const e of entries) {
+    if (!isGoneSkip(e)) continue;
+    const stop = legs.stopAt(e.legSeq);
+    const had = out.get(stop);
+    if (!had || newerOverall(e, had)) out.set(stop, e);
+  }
+  return out;
 }
 
 // ── The timetable (A3) ───────────────────────────────────────────────────────
 
 /** When the ship's port was docked at stop `stopIndex`'s station (the
  *  pairing's dockedAt), or null when it is not docked there. Ship readers
- *  answer from their docked ports, station readers from their berth door. */
-export type LiveDockAt = (stop: RouteStop, stopIndex: number) => number | null;
+ *  answer from their docked ports, station readers from their berth door.
+ *
+ *  🛟 `held` (A5 "Rights"): when the oldest of the ship's OTHER live berth
+ *  pairings was made (a guest berth on the ferry, or another of its dock
+ *  ports: anything but the route's own port), or null/absent when none. Such
+ *  a pairing holds whatever stay the ferry is at, wherever it leads, until
+ *  someone with rights over it lets it go (the ferry stays, DELAYED). Every
+ *  rider reads the same door records, so every rider's timetable agrees; a
+ *  station's board, which cannot see them, leaves it out. */
+export interface LiveDockAt {
+  (stop: RouteStop, stopIndex: number): number | null;
+  readonly held?: number | null;
+}
 
 /** A live dock list turned into a LiveDockAt: a dock counts for a stop when
  *  it is in that stop's berth room (a gate change within the room still
  *  counts), or when `sameStation` says the room belongs to that stop's
- *  station (a gate in another room). */
+ *  station (a gate in another room). 🛟 With `routePort`, every dock on
+ *  ANOTHER door also sets `held` (its oldest stamp). */
 export function liveDockFrom(
-  docks: ReadonlyArray<{ roomId: string; dockedAt: number }>,
+  docks: ReadonlyArray<{ roomId: string; dockedAt: number; doorId?: string }>,
   sameStation?: (stop: RouteStop, roomId: string) => boolean,
+  o: { routePort?: string } = {},
 ): LiveDockAt {
-  return (stop) => {
-    let at: number | null = null;
+  const at = (stop: RouteStop): number | null => {
+    let t: number | null = null;
     for (const d of docks) {
       if (d.roomId !== stop.berth.roomId && !(sameStation?.(stop, d.roomId) ?? false)) continue;
-      if (Number.isFinite(d.dockedAt) && (at === null || d.dockedAt > at)) at = d.dockedAt;
+      if (Number.isFinite(d.dockedAt) && (t === null || d.dockedAt > t)) t = d.dockedAt;
     }
-    return at;
+    return t;
   };
+  let held: number | null = null;
+  if (o.routePort !== undefined) {
+    for (const d of docks) {
+      if (d.doorId === o.routePort || !Number.isFinite(d.dockedAt)) continue;
+      if (held === null || d.dockedAt < held) held = d.dockedAt;
+    }
+  }
+  return Object.assign(at, { held });
 }
 
 /** PR 172's FlightRecord, as the timetable derives it, plus the route's own
@@ -831,8 +896,15 @@ export interface RouteFlight extends FlightRecord {
    *  helm who let the departure pass. */
   overdue: boolean;
   /** This stay is passed without docking (skip, or a hold that ended
-   *  unwatched). */
+   *  unwatched, or ⛔ a stop found gone earlier in the run). */
   skipped: boolean;
+  /** ⛔ Design §4: passed because its berth was found GONE at an earlier
+   *  visit this run (a keeper's gone skip there): only a hand edit brings a
+   *  stop back, so the ferry passes it at every later visit. */
+  gone: boolean;
+  /** ⛔ The stops found gone before this stay (by index, ascending): the
+   *  helm flags them, and the boards say which one blocks a route. */
+  goneStops: readonly number[];
   /** When the robot captain takes the helm from the person (null: no takeover
    *  due at this stay). */
   takeoverAt: number | null;
@@ -843,8 +915,10 @@ export interface RouteFlight extends FlightRecord {
   paused: boolean;
   /** STOP was pressed: the route ends at stopIndex, or the next stop. */
   stopping: boolean;
-  /** The route has ended here, pinned docked: STOP, or out of fuel. */
-  ended: 'stop' | 'fuel' | null;
+  /** The route has ended here, pinned docked: STOP, out of fuel, or ⛔
+   *  `blocked` (fewer than two of its stops are left to dock at: it ends at
+   *  the next one that is, design §4, until someone presses STOP). */
+  ended: 'stop' | 'fuel' | 'blocked' | null;
 }
 
 /** What a walk remembers at the start of a stay. */
@@ -866,6 +940,12 @@ interface Prepared {
   /** The pause that pauses the route, if its newest stay decision is one. */
   pause: PauseCheckpoint | null;
   fuelSources: Array<StartCheckpoint | FuelCheckpoint>;
+  /** ⛽ The stay of the newest REFUEL (−1: none). The route never ends for
+   *  fuel before it: that REFUEL proves the ferry flew on to it (the older
+   *  REFUELs that carried it there may be pruned). */
+  lastFuelStay: number;
+  /** ⛔ Each stop found gone this run, by the first stay that found it. */
+  goneAt: Map<number, number>;
 }
 
 /**
@@ -911,13 +991,29 @@ function prepare(route: ShipRoute, v: ValidatedCheckpoints): Prepared | null {
     if (d.kind === 'paused') pause = d.pause;
     break;
   }
+  const legs = new Legs(route);
+  const goneAt = new Map<number, number>();
+  for (const e of v.entries) {
+    if (!isGoneSkip(e)) continue;
+    const stop = legs.stopAt(e.legSeq);
+    goneAt.set(stop, Math.min(goneAt.get(stop) ?? Number.POSITIVE_INFINITY, e.legSeq));
+  }
   return {
-    legs: new Legs(route),
+    legs,
     byStay,
     anchor: v.anchor,
     pause,
     fuelSources: v.entries.filter((e): e is StartCheckpoint | FuelCheckpoint => e.kind === 'start' || e.kind === 'fuel'),
+    lastFuelStay: v.entries.reduce((m, e) => (e.kind === 'fuel' ? Math.max(m, e.legSeq) : m), -1),
+    goneAt,
   };
+}
+
+/** ⛔ The stops found gone at a stay before `legSeq`, ascending. */
+function goneBefore(p: Prepared, legSeq: number): number[] {
+  const out: number[] = [];
+  for (const [stop, at] of p.goneAt) if (at < legSeq) out.push(stop);
+  return out.sort((a, b) => a - b);
 }
 
 /** The pilot an entry names (or stamps): a go is a person's DEPART. */
@@ -936,17 +1032,19 @@ function pilotOf(e: RouteCheckpoint): RoutePilot | null {
   }
 }
 
-/** Apply one stay's pilot entries: stamps by `at`, then a helm entry, which
- *  beats a stamp at the same stay. */
+/** Apply one stay's pilot entries in `at` order, the newest word deciding: a
+ *  keeper's restart or skip stamps the pilot it derived, so one written after
+ *  a TAKE or KEEP (once the robot captain took over, say) is the newer word
+ *  and stands. At the same `at` a helm entry beats a stamp (then go, skip,
+ *  dock, start: the array order, kept by the stable sort). */
 function pilotAfterStay(pilot: RoutePilot, s: StayEntries | undefined): RoutePilot {
   if (!s) return pilot;
-  const stamps: RouteCheckpoint[] = [s.start, s.dock, s.skip, s.go]
+  const words: RouteCheckpoint[] = [s.start, s.dock, s.skip, s.go, s.helm]
     .filter(present)
     .filter((e) => pilotOf(e) !== null)
     .sort((a, b) => a.at - b.at);
   let p = pilot;
-  for (const e of stamps) p = pilotOf(e)!;
-  if (s.helm) p = s.helm.pilot;
+  for (const e of words) p = pilotOf(e)!;
   return p;
 }
 
@@ -997,6 +1095,7 @@ function stepStay(
   cur: StayCursor,
   now: number,
   dockTimes: ReadonlyArray<number | null>,
+  held: number | null,
   capacity: number,
 ): Step {
   const k = cur.legSeq;
@@ -1005,6 +1104,10 @@ function stepStay(
   const stop = legs.stopAt(k);
   const next = legs.stopAt(k + 1);
   const leg = legs.pair(stop, next);
+  // ⛔ Stops found gone earlier in the run (design §4).
+  const goneStops = goneBefore(p, k);
+  const passGone = goneStops.includes(stop);
+  const dockable = route.stops.length - goneStops.length;
 
   // This stay's REFUEL (or START) sets the level; its helm entries the pilot.
   let fuel = cur.fuel;
@@ -1019,6 +1122,7 @@ function stepStay(
     stopIndex: stop,
     nextStopIndex: next,
     stopping: route.stoppedAt !== undefined,
+    goneStops,
   };
   const docked = (o: Partial<RouteFlight>): RouteFlight => ({
     status: 'docked',
@@ -1032,6 +1136,7 @@ function stepStay(
     holdSince: null,
     overdue: false,
     skipped: false,
+    gone: false,
     takeoverAt: null,
     pilot,
     fuel,
@@ -1049,6 +1154,7 @@ function stepStay(
   let arrive: number | null = null;
   let goAt: number | null = null;
   let skipped = false;
+  let gone = false;
   let holding: HoldCheckpoint | null = null;
   if (decision.kind === 'hold') {
     const h = decision.hold;
@@ -1067,9 +1173,23 @@ function stepStay(
     if (e.kind !== 'skip') stayStart = e.stayStart;
     if (e.kind === 'go') goAt = e.at;
     if (e.kind === 'skip') skipped = true;
+  } else if (cur.arrival !== null && passGone && dockable > 0) {
+    // ⛔ Found gone at an earlier visit: passed without docking, like a skip
+    // written on arrival (it leaves at the first window after it).
+    const w = legs.windowAfter(k, cur.arrival);
+    if (w) { depart = w.departAt; arrive = w.arriveAt; }
+    skipped = true;
+    gone = true;
   } else if (cur.arrival !== null) {
     const w = legs.windowAfter(k, cur.arrival + legs.waitMs(k));
     if (w) { depart = w.departAt; arrive = w.arriveAt; }
+  }
+
+  // ⛔ Fewer than two stops left to dock at: the route ends at this one (the
+  // first it reaches that is still there), pinned docked, until STOP (every
+  // stop gone: wherever it is).
+  if (passGone ? dockable === 0 : dockable < 2) {
+    return { done: true, flight: docked({ stayStart, ended: route.stoppedAt !== undefined ? 'stop' : 'blocked' }) };
   }
 
   // A person at the helm who has not pressed DEPART: the robot captain
@@ -1097,7 +1217,8 @@ function stepStay(
   if (route.stoppedAt !== undefined && (leaves === null || route.stoppedAt < leaves - STOP_GUARD_MS)) {
     return { done: true, flight: docked({ stayStart, ended: 'stop' }) };
   }
-  if (fuel < leg.fuelCost) return { done: true, flight: docked({ stayStart, ended: 'fuel' }) };
+  // ⛽ …unless a newer REFUEL further on proves the ferry flew on to it.
+  if (fuel < leg.fuelCost && !(p.lastFuelStay > k)) return { done: true, flight: docked({ stayStart, ended: 'fuel' }) };
 
   if (holding) {
     return { done: true, flight: docked({ stayStart, holding: true, holdSince: holding.since }) };
@@ -1110,6 +1231,7 @@ function stepStay(
     scheduledAt: scheduled,
     arrivesAt: arrive,
     skipped,
+    gone,
     takeoverAt,
     pilot: shownPilot,
     overdue: shownDepart !== null && now >= shownDepart,
@@ -1118,9 +1240,13 @@ function stepStay(
   if (leaves === null) return { done: true, flight: stayed({}) };
   if (now < leaves) return { done: true, flight: stayed({ overdue: false }) };
   // LIVE DOCK: still docked at this stop's berth, by a dock made before the
-  // departure, so it has not left.
+  // departure, so it has not left. 🛟 Nor has it while another live pairing
+  // made before the departure (a guest berth, another port: A5 "Rights")
+  // still holds the ship, wherever it leads: it stays, DELAYED, until
+  // someone with rights over that pairing lets it go.
   const dockedAt = dockTimes[stop];
   if (dockedAt !== null && dockedAt < leaves) return { done: true, flight: stayed({ overdue: true }) };
+  if (held !== null && held < leaves) return { done: true, flight: stayed({ overdue: true }) };
 
   const flying = clampFuelToCapacity(fuel - leg.fuelCost, capacity);
   if (arrive !== null && now < arrive) {
@@ -1141,6 +1267,7 @@ function stepStay(
         holdSince: null,
         overdue: false,
         skipped,
+        gone,
         takeoverAt,
         pilot: goAt !== null ? 'person' : legPilot,
         fuel: flying,
@@ -1220,6 +1347,8 @@ export function routeFlightAt(
       holdSince: null,
       overdue: false,
       skipped: false,
+      gone: false,
+      goneStops: goneBefore(p, k),
       takeoverAt: null,
       pilot: cur.pilot,
       fuel: cur.fuel,
@@ -1233,16 +1362,18 @@ export function routeFlightAt(
     const t = liveDock ? liveDock(stop, i) : null;
     return typeof t === 'number' && Number.isFinite(t) ? t : null;
   });
+  const heldRaw = liveDock?.held;
+  const held = typeof heldRaw === 'number' && Number.isFinite(heldRaw) ? heldRaw : null;
   let cur: StayCursor;
   const saved = cache?.cursor;
   if (same && saved && now >= saved.now
-    && dockTimes.every((t) => t === null || saved.arrival === null || t >= saved.arrival)) {
+    && [...dockTimes, held].every((t) => t === null || saved.arrival === null || t >= saved.arrival)) {
     cur = saved;
   } else {
     cur = anchorCursor(route, p, capacity);
   }
   for (let steps = 0; steps <= MAX_WALK_STAYS; steps++) {
-    const step = stepStay(route, p, cur, now, dockTimes, capacity);
+    const step = stepStay(route, p, cur, now, dockTimes, held, capacity);
     if (step.done) {
       if (cache) cache.cursor = { ...cur, now };
       return step.flight;

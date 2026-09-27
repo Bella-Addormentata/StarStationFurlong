@@ -61,8 +61,9 @@ import {
   addDraftStop, checkRouteDraft, choiceIndexFor, departRouteFromHelm, describeGateChoice, describeRouteProblem,
   describeRouteStartRefusal, draftFromRoute, draftLegAfter, formatClock, formatRouteSpan, formatWait,
   handOverRoute, moveDraftStop, pauseRouteFromHelm, readHelmCheckpoints, refreshDraftStops,
-  removeDraftStop, resumeRouteFromHelm, resumeStopIndex, routeDepartLine, routeDepartState, routeFromDraft, routeHelmView,
-  routePathLabel, routeRenderKey, routeStartRefusal, routeStatusLine, routeStopCandidates, routeStopIndexAt,
+  removeDraftStop, resumeRouteFromHelm, resumeStopIndex, routeDepartLine, routeDepartState, routeEndStopIndex, routeFromDraft,
+  routeHelmView, routeNoteStands, routePathLabel, routeRenderKey, routeStartRefusal, routeStatusLine, routeStopCandidates,
+  routeStopIndexAt, type RouteNoteTie,
   setDraftAnyGate, setDraftBerth, setDraftWait, skipRouteStop, startRouteFromHelm, stopRouteFromHelm,
   type RouteDraft, type RouteStopCandidate,
 } from './helmRoute';
@@ -230,6 +231,7 @@ import {
   readPilotView,
   routeCaptainDockId,
   shipPilotEligible,
+  skipLine,
   type HelmAnnouncer,
 } from './shipPilot';
 import { rowText } from './departuresBoard';
@@ -2234,12 +2236,21 @@ function portStatusText(p: DockPortView): string {
 /** What the last arrival did, in the helm's words — set by whichever path
  *  finished the flight (the open helm's tick, or main.ts's 1 Hz watch), shown
  *  on the next docked render. Cleared at DEPART. */
-let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
+let lastArrivalNote: ArrivalNote | null = null;
 /** Open helms re-render when the note changes — an arrival finished by
  *  main.ts's watch writes no doc value the helm observes. */
 const arrivalNoteListeners = new Set<() => void>();
 
-function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
+/** 🧾 `tie`: a route keeper's note, shown only while it still holds at its
+ *  stay (helmRoute.routeNoteStands): another rider's dock, STOP or SKIP ends
+ *  a hold, and the ferry moving on ends every other one. */
+interface ArrivalNote {
+  text: string;
+  tone: 'ok' | 'warn';
+  tie?: RouteNoteTie;
+}
+
+function setArrivalNote(note: ArrivalNote | null): void {
   lastArrivalNote = note;
   for (const fn of arrivalNoteListeners) fn();
 }
@@ -2270,6 +2281,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
         ? `Gate change: docked at ${outcome.stationName}, gate ${outcome.gate}.`
         : `Docked at ${outcome.stationName}, ${gate(outcome.gate)}.`,
       tone: 'ok',
+      ...(outcome.routeStay ? { tie: { ...outcome.routeStay } } : {}),
     });
     return;
   }
@@ -2279,10 +2291,12 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     const at = outcome.stationName;
     setArrivalNote({
       tone: 'warn',
+      ...(outcome.routeStay ? { tie: { ...outcome.routeStay, ...(route.action === 'hold' ? { hold: true } : {}) } } : {}),
       text: route.action === 'hold'
         ? `Berth at ${at} is occupied. Holding until it is free.`
         : route.action === 'skip'
-          ? `The berth at ${at} has been removed. Continuing to ${route.nextStopName}.`
+          // 🧾 The captain's §4 line: removed, or closed to this ferry.
+          ? skipLine(route.why ?? 'gone', at, route.nextStopName)
           : outcome.reason === 'no-berth'
             ? `Can't open the berth at ${at} from here (no pass). Riding on to ${route.nextStopName}.`
             : outcome.reason === 'unreachable'
@@ -2602,7 +2616,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const castOffNote = castOff > 0
         ? `<div style="font-size:9px; color:rgba(212,168,75,0.55); margin-top:6px;">⏏ ${castOff} dock${castOff === 1 ? '' : 's'} will be released at depart — the ship remembers this berth</div>`
         : '';
-      const arrivalNote = lastArrivalNote
+      const arrivalNote = lastArrivalNote && routeNoteStands(lastArrivalNote.tie, savedRoute, routeFlight)
         ? `<div style="font-size:10px; color:${lastArrivalNote.tone === 'ok' ? '#00E676' : '#FFB74D'}; margin-bottom:8px; line-height:1.4;">${esc(lastArrivalNote.text)}</div>`
         : '';
       const routeLine = onRoute
@@ -2870,7 +2884,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // Never the ship's own one-module station, nor one between planets.
     const stations = stationsAroundPlanet(planetId, records).filter((st) => !stationInTransit(st, now)
       && !(st.welcomeRoomId && (st.welcomeRoomId === shipRoom || atlasComponent(atlas, st.welcomeRoomId).has(shipRoom))));
-    const live = flight.status === 'docked' ? (docking?.ports() ?? []).find((p) => p.state.kind === 'docked') : undefined;
+    // 🧭 The dock the draft's route port is in (else any): the editor's
+    // default berth at the station the ship is docked at.
+    const livePorts = flight.status === 'docked' ? (docking?.ports() ?? []).filter((p) => p.state.kind === 'docked') : [];
+    const live = livePorts.find((p) => p.doorId === draft?.shipPort) ?? livePorts[0];
     const liveDock = live && live.state.kind === 'docked'
       ? {
           stationId: locId,
@@ -3050,7 +3067,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       case 'stop': {
         const r = stopRouteFromHelm({ now });
         const f = r === 'stopping' ? readRouteFlight(now) : null;
-        const end = f && route ? route.stops[f.status === 'docked' && f.ended !== null ? f.stopIndex : f.nextStopIndex]?.name : null;
+        const end = f && route ? route.stops[routeEndStopIndex(f)]?.name : null;
         flashRoute(r === 'finished'
           ? 'Route stopped. The helm flies by hand from here.'
           : r === 'stopping'
@@ -3171,8 +3188,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const f = c.routeRun;
       const stopList = route.stops.map((s, i) => {
         const here = !!f && f.stopIndex === i;
-        return `<div style="font-size:10px; line-height:1.5; color:${here ? '#F0C060' : 'rgba(212,168,75,0.55)'};">${here ? '▶' : '·'} ${i + 1}. ${esc(s.name)} · ${
-          s.berth.gate !== undefined ? `gate ${s.berth.gate}` : 'berth'}${s.berth.anyGate ? '' : ' (pinned)'} · wait ${formatWait(s.waitSecs)}</div>`;
+        // ⛔ A stop found gone this run is flagged red: the ferry passes it.
+        const gone = !!f && f.goneStops.includes(i);
+        return `<div style="font-size:10px; line-height:1.5; color:${gone ? '#FF8A80' : here ? '#F0C060' : 'rgba(212,168,75,0.55)'};">${here ? '▶' : '·'} ${i + 1}. ${esc(s.name)} · ${
+          s.berth.gate !== undefined ? `gate ${s.berth.gate}` : 'berth'}${s.berth.anyGate ? '' : ' (pinned)'} · wait ${formatWait(s.waitSecs)}${gone ? ' · GONE, passed' : ''}</div>`;
       }).join('');
       const locked = `<div style="margin-top:8px;">${stopList}</div>${line('Stop the route to edit it.', 'rgba(212,168,75,0.45)')}`;
       if (!f || f.paused) {
@@ -3217,10 +3236,17 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       if (view.skip) routeButtons.push(btn('skip', 'SKIP STOP', { enabled: c.commander, title: 'Leave this stop at the next launch window, without waiting or docking' }));
       if (view.stop) routeButtons.push(btn('stop', 'STOP ROUTE', { enabled: c.commander, tone: '#FF8A80' }));
       const stopping = route.stoppedAt !== undefined && f.ended === null
-        ? line(`STOP pressed: the route ends at ${esc(route.stops[docked ? f.stopIndex : f.nextStopIndex]?.name ?? 'the next stop')}; the helm flies by hand from there.`, AMBER)
+        ? line(`STOP pressed: the route ends at ${esc(route.stops[routeEndStopIndex(f)]?.name ?? 'the next stop')}; the helm flies by hand from there.`, AMBER)
         : '';
       const aboard = docked && f.ended === null
         ? line('Riders keep the ferry running: stay aboard until it casts off.', 'rgba(212,168,75,0.5)')
+        : '';
+      // 🛟 A5 Rights: another dock port or guest berth still paired holds
+      // the ferry past its departure until someone with rights releases it.
+      const others = c.ports.filter((p) => p.doorId !== route.shipPort && p.state.kind === 'docked').length
+        + enumerateTransientBerths().filter((id) => id !== route.shipPort && !c.ports.some((p) => p.doorId === id)).length;
+      const heldLine = docked && f.overdue && f.ended === null && others > 0
+        ? line(`DELAYED: ${others === 1 ? 'another dock or guest berth holds' : `${others} other docks or guest berths hold`} the ferry here until someone with rights over ${others === 1 ? 'it' : 'them'} releases ${others === 1 ? 'it' : 'them'}.`, AMBER)
         : '';
       return box(
         title(`🚏 ROUTE · ${path}`, badge('RUNNING', '#00E676'))
@@ -3232,7 +3258,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         + takeover
         + buttons(helmButtons)
         + buttons(routeButtons)
-        + stopping + aboard + gateNote + flash + locked,
+        + stopping + heldLine + aboard + gateNote + flash + locked,
       );
     }
 
@@ -3524,6 +3550,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       deficit: fuelDrawDeficit(),
       modules: station?.welcomeRoomId ? Math.max(1, atlasComponent(readStationAtlas(), station.welcomeRoomId).size) : 1,
       now,
+      // 🚏 A running ferry route refuses a tow: STOP it first.
+      routeRunning: isRouteRunning(readShipRoute()),
     };
   };
 

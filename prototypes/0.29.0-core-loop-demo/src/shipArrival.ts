@@ -320,13 +320,20 @@ export function castOffForDeparture(stationId: string, docking: ShipDockingApi):
   return remembered;
 }
 
+/** 🧾 The stay of a route a keeper's note is about (routeKeeper.keeperNote):
+ *  the helm shows the note only while it still holds there. */
+export interface RouteNoteStay {
+  run: number;
+  legSeq: number;
+}
+
 /** What the last arrival did — the helm shows it. */
 export type ArrivalOutcome =
   | { kind: 'docking'; stationName: string; gate?: number }
   /** ⚓🚦 The DOCK went through (reported once the far berth answered).
    *  🚏 `gateChange`: a route's ferry docked at another gate than its stop's
    *  own (choice 9, announced as a gate change). */
-  | { kind: 'docked'; stationName: string; gate?: number; gateChange?: boolean }
+  | { kind: 'docked'; stationName: string; gate?: number; gateChange?: boolean; routeStay?: RouteNoteStay }
   | {
       kind: 'none';
       stationName: string;
@@ -343,8 +350,10 @@ export type ArrivalOutcome =
         | 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken'
         | 'occupied' | 'unreachable' | 'berth-gone';
       /** 🚏 A route's keeper: what the ferry does about it — holds at the
-       *  stop, skips it, or rides on (this game could not dock it). */
-      route?: { action: 'hold' | 'skip' | 'ride-on'; nextStopName: string };
+       *  stop, skips it (🧾 `why`: every gate gone, or shut to this ferry),
+       *  or rides on (this game could not dock it). */
+      route?: { action: 'hold' | 'skip' | 'ride-on'; nextStopName: string; why?: 'gone' | 'shut' };
+      routeStay?: RouteNoteStay;
     };
 
 /** 🚏 Why a whole arrival refused, from each berth's DOCK answer (A5):

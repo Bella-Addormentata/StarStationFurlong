@@ -27,7 +27,12 @@
  * Best effort, like the far dock write: per berth room one session at a
  * time, and only the NEWEST snapshot waits behind it (a hold renewed every
  * minute never queues up). An unreachable room is retried twice, 30 s and
- * then 60 s later, unless newer news replaced it; a room this game holds no
+ * then 60 s later, unless newer news replaced it (🔁 a retry that comes due
+ * after a newer snapshot was offered to that room is dropped, even when the
+ * newer one has already been delivered: re-sending the older one would only
+ * spend a session, and a board ranks it below the newer one anyway); the
+ * finish carries the run it ended (🏁 endedRun), so a board ranks it above
+ * any late snapshot of that run; a room this game holds no
  * pass for is skipped (another rider may reach it, and the planet's ship
  * summaries carry the ferry to all-gates boards anyway). Never throws.
  *
@@ -202,6 +207,9 @@ export interface DeparturesPublisher {
 interface RoomState {
   /** The newest snapshot waiting for this room. */
   waiting: DeparturesPublish | null;
+  /** 🔁 The newest snapshot ever offered to this room (a retry of any other
+   *  is stale). */
+  latest: DeparturesPublish | null;
   busy: boolean;
   /** Retries spent on the snapshot now being sent. */
   retries: number;
@@ -216,12 +224,12 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
   const clock = d.clock ?? Date.now;
   const later = d.later ?? ((fn, ms) => { setTimeout(fn, ms); });
   const rooms = new Map<string, RoomState>();
-  let pending: { ship: string; legSeq: number | null } | null = null;
+  let pending: { ship: string; legSeq: number | null; endedRun?: number } | null = null;
 
   const stateOf = (room: string): RoomState => {
     let st = rooms.get(room);
     if (!st) {
-      st = { waiting: null, busy: false, retries: 0 };
+      st = { waiting: null, latest: null, busy: false, retries: 0 };
       rooms.set(room, st);
     }
     return st;
@@ -250,6 +258,9 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
       const wait = DEPARTURES_RETRY_MS[st.retries];
       st.retries++;
       later(() => {
+        // 🔁 Newer news was offered meanwhile (and sent, or waiting): this
+        // snapshot is stale, whatever became of the newer one.
+        if (st.latest !== pub) return;
         if (!st.waiting) st.waiting = pub;
         void pump(room);
       }, wait);
@@ -262,6 +273,7 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
   const offer = (room: string, pub: DeparturesPublish): Promise<void> => {
     const st = stateOf(room);
     st.waiting = pub;
+    st.latest = pub;
     st.retries = 0;
     return pump(room);
   };
@@ -283,6 +295,8 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
       route,
       checkpoints: isRouteRunning(route) ? [...d.checkpoints()] : [],
       at: clock(),
+      // 🏁 The finish names the run it ended (only while no run follows it).
+      ...(p.endedRun !== undefined && route.startedAt === undefined ? { endedRun: p.endedRun } : {}),
     };
     const order = publishRoomOrder(route, p.legSeq);
     if (order.length === 0) return;
@@ -296,12 +310,14 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     routeWritten: (n) => {
       const ship = d.shipRoomId();
       if (!ship) return;
+      const ended = n.kind === 'finish' && n.run !== undefined ? n.run : undefined;
       if (pending && pending.ship === ship) {
         // Several writes in one gesture: the first names the stop.
         if (pending.legSeq === null && n.legSeq !== undefined) pending.legSeq = n.legSeq;
+        if (ended !== undefined) pending.endedRun = ended;
         return;
       }
-      pending = { ship, legSeq: n.legSeq ?? null };
+      pending = { ship, legSeq: n.legSeq ?? null, ...(ended !== undefined ? { endedRun: ended } : {}) };
       later(flush, 0);
     },
     busyRooms: () => [...rooms.entries()].filter(([, st]) => st.busy || st.waiting !== null).map(([room]) => room),
