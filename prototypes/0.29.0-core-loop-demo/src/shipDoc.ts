@@ -79,6 +79,7 @@ import {
   isKnownStation,
   localStationId,
   listStations,
+  portableStationId,
   type StationDestination,
 } from './stationDirectory';
 
@@ -422,8 +423,12 @@ export function writeFlightRecord(rec: FlightRecord): boolean {
       return false;
     }
   }
+  // Station ids are per install: the shared record names each station by
+  // its welcome room, so every install reads the same one back.
+  const shared: FlightRecord = { ...clean, locationId: portableStationId(clean.locationId) };
+  if (clean.destinationId !== undefined) shared.destinationId = portableStationId(clean.destinationId);
   boundDoc!.transact(() => {
-    shipMap!.set('flight', clean);
+    shipMap!.set('flight', isFlightRecord(shared) ? shared : clean);
   });
   return true;
 }

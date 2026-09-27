@@ -132,6 +132,7 @@ import {
   bindPlanetSummaryDoc,
   installTrimResolver,
   publishPlanetSummary,
+  portableStationId,
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
@@ -1227,7 +1228,8 @@ function planetShipStatus(): ShipStatusInput | null {
   const planetId = from?.planetId ?? to?.planetId ?? currentStation()?.planetId;
   if (!planetId) return null;
   const name =
-    (yjsSync?.doc.getMap("roomInfo").get("name") as string | undefined) || "SHIP";
+    // Peer-written: only a string is a name.
+    (() => { const n = yjsSync?.doc.getMap("roomInfo").get("name"); return typeof n === "string" ? n : ""; })() || "SHIP";
   const out: ShipStatusInput = { roomId, name: name.slice(0, 64), planetId, status: rec.status };
   if (from?.welcomeRoomId) out.fromRoom = from.welcomeRoomId;
   if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
@@ -1781,6 +1783,7 @@ async function joinRoomAtEpoch(
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
         (id) => resolveStationAlias(id),
+        (id) => portableStationId(id),
       ),
     );
     // 🪐 Stations fly their shared trims, and what changes here goes out:

@@ -101,6 +101,19 @@ describe('guards', () => {
     expect(cleanStationSummary(summary({ updatedAt: T0 + 7 * 3600 * 1000 }), T0)).toBeNull();
   });
 
+  it('strips credential-named fields from ext at any depth', () => {
+    const s = cleanStationSummary({ ...summary(), ext: { seed: 'x', welcomeLink: 'y', note: { pass: 'z', ok: 1 }, passage: 'public' } }, T0);
+    expect(s?.ext).toEqual({ note: { ok: 1 }, passage: 'public' });
+  });
+
+  it('breaks a same-moment tie the same way on every client', () => {
+    const a = summary({ orbitSlot: 3, trim: trim({ dRadiusKm: 1 }) });
+    const b = summary({ orbitSlot: 5, trim: trim({ dRadiusKm: 2 }) });
+    const ab = mergeStation(a, b) ?? a;
+    const ba = mergeStation(b, a) ?? b;
+    expect(ab).toEqual(ba);
+  });
+
   it('drops a malformed trim but keeps the record', () => {
     const s = cleanStationSummary({ ...summary(), trim: { ...trim(), dRadiusKm: 999 } }, T0);
     expect(s).toEqual(summary());
@@ -297,6 +310,8 @@ describe('sharing through the room doc', () => {
     // The oldest six went; the newest stayed.
     expect(keys).not.toContain('room-000');
     expect(keys).toContain('room-069');
+    // …and entries the first bounded pull never reached are read right after.
+    expect(readStore(now).stations['room-069']?.name).toBe('S69');
   });
 
   it('never publishes a seed', () => {

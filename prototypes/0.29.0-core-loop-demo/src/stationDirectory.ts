@@ -63,6 +63,10 @@ export interface StationDirectory {
    *  are per install, and a flight record travels in the ship's room doc),
    *  or null when none matches. Absent ⇒ ids are taken as written. */
   resolve?(id: string): string | null;
+  /** The id to write into a shared record for this install's station `id`,
+   *  one every install resolves to the same station (its welcome room), or
+   *  null to write `id` as it is. */
+  portable?(id: string): string | null;
 }
 
 /** One planned hop. Times are real epoch ms; `departAt` may be in the future
@@ -110,6 +114,13 @@ export function localStationId(id: string): string {
   let alias: string | null = null;
   try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }
   return alias && list.some((s) => s.id === alias) ? alias : id;
+}
+
+/** The id a shared record carries for this install's station `id`. */
+export function portableStationId(id: string): string {
+  let out: string | null = null;
+  try { out = directory.portable?.(id) ?? null; } catch { out = null; }
+  return out ?? id;
 }
 
 /** Look a station up; unknown ids resolve to home (plan §2, item 4). */
@@ -234,12 +245,14 @@ export function directoryFromStationRecords(
   hereId: () => string | null,
   ownId: () => string | null = () => null,
   resolve?: (id: string) => string | null,
+  portable?: (id: string) => string | null,
 ): StationDirectory {
   return {
     stations: () => destinationsFromRecords(list(), seedFor),
     here: hereId,
     own: ownId,
     ...(resolve ? { resolve } : {}),
+    ...(portable ? { portable } : {}),
     plan: (fromId, toId, nowMs) => {
       const records = list();
       return planRecordHop(
