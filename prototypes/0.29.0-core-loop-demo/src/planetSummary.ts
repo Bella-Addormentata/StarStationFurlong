@@ -57,8 +57,8 @@ export interface StationSummary {
   orbitSlot: number;
   berthDoor?: string;
   /** ⚓🚦 The station's gates (StationRecord.berths, without the local
-   *  `occupied` flag), and when a client standing in the station last read
-   *  them from its atlas. Newest `berthsAt` wins, apart from the record: any
+   *  `occupied` flag; empty when it is known to have none), and when a
+   *  client standing in the station last read them from its atlas. Newest `berthsAt` wins, apart from the record: any
    *  visitor's live atlas knows the gates, not only the record's owner. */
   berths?: StationBerthRecord[];
   berthsAt?: number;
@@ -155,8 +155,10 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   };
   if (v.berthDoor !== undefined) out.berthDoor = v.berthDoor as string;
   if (v.ownerId !== undefined) out.ownerId = v.ownerId as string;
+  // An empty list is news too (the station's last gate was removed); a list
+  // whose every entry was malformed is not.
   const berths = cleanBerths(v.berths);
-  if (berths.length > 0 && isStamp(v.berthsAt, now)) {
+  if (Array.isArray(v.berths) && (berths.length > 0 || v.berths.length === 0) && isStamp(v.berthsAt, now)) {
     out.berths = berths;
     out.berthsAt = v.berthsAt;
   }
@@ -306,9 +308,9 @@ export function summaryForStation(station: StationRecord, trim: OrbitTrim | null
     updatedAt,
   };
   if (station.berthDoor) out.berthDoor = station.berthDoor;
-  const berths = cleanBerths(station.berths);
-  if (berths.length > 0) {
-    out.berths = berths;
+  // An empty list goes out too: it means the station is known to have none.
+  if (Array.isArray(station.berths)) {
+    out.berths = cleanBerths(station.berths);
     out.berthsAt = updatedAt;
   }
   if (isOwned(station) && isId(station.id)) out.ownerId = station.id;
