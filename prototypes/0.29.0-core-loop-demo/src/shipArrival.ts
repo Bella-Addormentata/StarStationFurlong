@@ -515,10 +515,22 @@ async function dockThroughBerths(
     } catch (err) {
       console.warn('[ship] arrival DOCK threw:', err);
     }
+    // The await may have outlived the ship's room: the answer belongs to a
+    // room no longer shown, so say nothing.
+    if (shipRoomId !== undefined && currentRoomId() !== shipRoomId) return;
     if (ok !== false) {
       onSettled?.({ kind: 'docked', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) });
       return;
     }
+  }
+  // Every berth refused: unless another commander docked the ship while
+  // the last one was answering.
+  const last = candidates[candidates.length - 1];
+  const again = planArrivalDock({ station, remembered, ports: docking.ports(), ...(last ? { berth: last } : {}), shipRoomId });
+  if (again.kind === 'none' && again.reason === 'already-docked') {
+    const gate = dockedGate(docking.ports(), candidates);
+    onSettled?.({ kind: 'docked', stationName: station.name, ...(gate !== undefined ? { gate } : {}) });
+    return;
   }
   onSettled?.({ kind: 'none', stationName: station.name, reason: 'berths-taken' });
 }
