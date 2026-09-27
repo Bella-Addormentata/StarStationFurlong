@@ -140,7 +140,11 @@ export function cleanBerths(v: unknown): StationBerthRecord[] {
     seen.add(key);
     out.push(b);
   }
-  return out;
+  // In gate order whatever order a peer sent (unnumbered berths last, then
+  // by room and door), so arrivals try the lowest gate first.
+  const cmp = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
+  return out.sort((x, y) => (x.gate ?? Infinity) - (y.gate ?? Infinity)
+    || cmp(x.roomId, y.roomId) || cmp(x.doorId, y.doorId));
 }
 
 /**

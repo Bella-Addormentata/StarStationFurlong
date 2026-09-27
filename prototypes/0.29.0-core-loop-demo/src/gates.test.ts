@@ -26,7 +26,7 @@ import {
   stationGates,
   withSharedAtlasOf,
 } from './stationAtlas';
-import { listStations, registerStation } from './stations';
+import { cleanBerths, listStations, registerStation } from './stations';
 import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
@@ -340,6 +340,15 @@ describe('the station record', () => {
     const doc = new Y.Doc();
     doc.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 5, doors: {}, gates });
     expect(Object.keys(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates ?? {})).toHaveLength(99);
+  });
+
+  it('puts a learned gate list in gate order, whatever order a peer sent', () => {
+    expect(cleanBerths([
+      { roomId: 'room-b', doorId: 'west' },
+      { roomId: 'room-b', doorId: 'east', gate: 3 },
+      { roomId: 'room-a', doorId: 'north', gate: 1 },
+      { roomId: 'room-b', doorId: 'south', gate: 2 },
+    ]).map((b) => b.gate)).toEqual([1, 2, 3, undefined]);
   });
 
   it('lists every gate up to the highest number', () => {
