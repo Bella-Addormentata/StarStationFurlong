@@ -137,14 +137,30 @@ export type ArrivalPlan =
  * would reach the door record as a tombstone DOCK cannot parse).
  */
 export function arrivalBerths(input: {
-  station: Pick<StationDestination, 'berth' | 'berths'>;
+  station: Pick<StationDestination, 'berth' | 'berths' | 'unaddressed'>;
   remembered: RememberedBerth | null;
   gate?: number;
   /** ⚓🚦 The arriving ship's room: a gate reserved for it comes first, and
    *  one reserved for another ship is left out. */
   shipRoomId?: string;
 }): StationBerth[] {
-  const { station } = input;
+  const recalledAt = input.remembered && isRoomSeed(input.remembered.address) ? input.remembered : null;
+  // ⚓🚦 A gate this client holds no pass for, in the room the ship's memory
+  // knows: the memory's address reaches it, so it is a gate like the others
+  // (barred, ranked and matched the same way).
+  const reached: StationBerth[] = recalledAt
+    ? (input.station.unaddressed ?? [])
+      .filter((u) => u.roomId === roomOf(recalledAt.address))
+      .map((u) => ({
+        address: recalledAt.address,
+        farDoor: u.farDoor,
+        ...(u.gate !== undefined ? { gate: u.gate } : {}),
+        ...(u.access ? { access: u.access, ...(u.reservedFor ? { reservedFor: u.reservedFor } : {}) } : {}),
+      }))
+    : [];
+  const station = Array.isArray(input.station.berths) && reached.length > 0
+    ? { ...input.station, berths: [...input.station.berths, ...reached] }
+    : input.station;
   // A station known to have no gates (an empty list, not a missing one) has
   // no berth to ask, remembered or not.
   if (Array.isArray(station.berths) && station.berths.length === 0) return [];
@@ -192,7 +208,7 @@ export function arrivalBerths(input: {
  * remembered one when it is free, else the first port that is not docked.
  */
 export function planArrivalDock(input: {
-  station: Pick<StationDestination, 'berth' | 'berths' | 'berthRooms'>;
+  station: Pick<StationDestination, 'berth' | 'berths' | 'berthRooms' | 'unaddressed'>;
   remembered: RememberedBerth | null;
   ports: readonly ArrivalPort[];
   now?: number;

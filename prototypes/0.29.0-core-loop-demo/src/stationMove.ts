@@ -561,6 +561,8 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
  * held or paid for, and a move that beats the tow beats the cancel too.
  * Every station's standing tow by this tug is checked, not only the room's
  * latest: two offline tabs of one tug can each have towed another station.
+ * Those two tows are rivals anyway (one tug, one set of tanks): the one
+ * that ranks lower is cancelled too, whatever the flight (outbidTows).
  * Returns whether it wrote a cancel.
  */
 export function cancelTowLeftBehind(
@@ -573,6 +575,7 @@ export function cancelTowLeftBehind(
   dockedTo?: (welcomeRoomId: string) => boolean,
 ): boolean {
   let wrote = false;
+  for (const tow of outbidTows(roomId)) wrote = writeCancelOf(tow, realMs) || wrote;
   for (const standing of [...roomStanding()]) {
     if (isCancelPin(standing)) continue;
     // Once a tow has arrived its arrival may be pinned; the tow is its parent.
@@ -586,24 +589,51 @@ export function cancelTowLeftBehind(
     else if (dockedTo && !dockedTo(tow.welcomeRoomId)) leftAt = realMs;
     else continue;
     if (leftAt >= tow.arriveAt) continue;
-    const departAt = tow.departAt + 1;
-    wrote = writeStationMove({
-      stationId: tow.stationId,
-      welcomeRoomId: tow.welcomeRoomId,
-      fromPlanetId: tow.fromPlanetId,
-      fromSlot: tow.fromSlot,
-      toPlanetId: tow.fromPlanetId,
-      toSlot: tow.fromSlot,
-      departAt,
-      arriveAt: departAt + 1,
-      mode: 'thrusters',
-      bookedAt: Math.floor(realMs),
-      settles: tow,
-      fuel: 0,
-      fuelDrawn: 0,
-    }) || wrote;
+    wrote = writeCancelOf(tow, realMs) || wrote;
   }
   return wrote;
+}
+
+/** This tug's tows that no move of their own station beat but another
+ *  station's tow by the same tug outranked (tugRivals), and that nothing
+ *  cancels yet. The tug room already neither flies nor pays for them; the
+ *  station list elsewhere follows each station's own latest move, so the
+ *  loss spreads as a cancel like any other. */
+function outbidTows(roomId: string): StationMove[] {
+  if (!docAlive()) return [];
+  const { entries, legacy } = roomMoves();
+  const own = legacy ? [legacy, ...entries] : entries;
+  const known = knownMoves(own);
+  const seen = new Set<string>();
+  return own.filter((m) => {
+    if (m.settles || m.mode !== 'tug' || m.tugRoomId !== roomId) return false;
+    const id = JSON.stringify(cleanMove(m));
+    if (seen.has(id)) return false;
+    seen.add(id);
+    if (beatenForStation(m, known) || !outbidForTug(m, known)) return false;
+    return !known.some((o) => isCancelPin(o) && JSON.stringify(cleanMove(flownOf(o))) === id);
+  });
+}
+
+/** Cancel a tow: a move that leaves its station where it was, settling the
+ *  tow and ranking just after it everywhere. */
+function writeCancelOf(tow: StationMove, realMs: number): boolean {
+  const departAt = tow.departAt + 1;
+  return writeStationMove({
+    stationId: tow.stationId,
+    welcomeRoomId: tow.welcomeRoomId,
+    fromPlanetId: tow.fromPlanetId,
+    fromSlot: tow.fromSlot,
+    toPlanetId: tow.fromPlanetId,
+    toSlot: tow.fromSlot,
+    departAt,
+    arriveAt: departAt + 1,
+    mode: 'thrusters',
+    bookedAt: Math.floor(realMs),
+    settles: tow,
+    fuel: 0,
+    fuelDrawn: 0,
+  });
 }
 
 /**
@@ -876,6 +906,12 @@ function flownOf(m: StationMove): StationMove {
   return m.settles ?? m;
 }
 
+/** Is this move out of the running: beaten by a concurrent move of its
+ *  station, or outbid by another tow of the same tug? */
+function superseded(m: StationMove, known: StationMove[]): boolean {
+  return beatenForStation(m, known) || outbidForTug(m, known);
+}
+
 /** Did a concurrent move of the same station win over this one? Another
  *  move booked at the same time (concurrentMoves: each before the other
  *  arrived, however far apart their flights) that wins the one order
@@ -884,7 +920,7 @@ function flownOf(m: StationMove): StationMove {
  *  move its flight beat, and a cancel beats its move's own arrival pin. The
  *  winner is also what the station list follows, so the loser never flies:
  *  it holds no tug, and its fuel is not drawn. */
-function superseded(m: StationMove, known: StationMove[]): boolean {
+function beatenForStation(m: StationMove, known: StationMove[]): boolean {
   const self = JSON.stringify(cleanMove(flownOf(m)));
   return known.some((o) => {
     if (!sameStation(o, m) || compareMoves(o, m) <= 0) return false;
@@ -894,8 +930,27 @@ function superseded(m: StationMove, known: StationMove[]): boolean {
   });
 }
 
+/** Two tows by one tug booked at once, of different stations: one tug has
+ *  one set of tanks and flies one tow at a time, so only the one that ranks
+ *  first (compareFlown, the same everywhere) flies and is paid for. Cancel
+ *  pins take no part: they fly nothing and draw nothing, and the loser's own
+ *  cancel must stand. */
+function tugRivals(a: StationMove, b: StationMove): boolean {
+  if (isCancelPin(a) || isCancelPin(b)) return false;
+  const fa = flownOf(a), fb = flownOf(b);
+  return fa.mode === 'tug' && fb.mode === 'tug' && !!fa.tugRoomId && fa.tugRoomId === fb.tugRoomId
+    && !sameStation(fa, fb) && concurrentMoves(fa, fb);
+}
+
+/** Did a concurrent tow of another station by the same tug outrank this
+ *  one (tugRivals)? */
+function outbidForTug(m: StationMove, known: StationMove[]): boolean {
+  return known.some((o) => tugRivals(o, m) && compareFlown(flownOf(o), flownOf(m)) > 0);
+}
+
 /** Can one of these two moves decide whether the other is superseded? */
 function related(a: StationMove, b: StationMove): boolean {
+  if (tugRivals(a, b)) return true;
   if (!sameStation(a, b)) return false;
   const fa = flownOf(a), fb = flownOf(b);
   return concurrentMoves(fa, fb) || JSON.stringify(cleanMove(fa)) === JSON.stringify(cleanMove(fb));

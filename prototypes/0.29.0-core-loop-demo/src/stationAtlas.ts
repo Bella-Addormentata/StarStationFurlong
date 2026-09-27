@@ -316,15 +316,16 @@ export function harvestIntoAtlas(entry: {
         : typeof d.transient === 'boolean' ? { transient: d.transient } : {}),
     };
   }
+  const entryGates = entry.gates ? cleanGates(entry.gates) : undefined;
   atlas[entry.roomId] = {
     roomId: entry.roomId,
     name: entry.name || prior?.name || 'Module',
     seed: entry.seed ?? prior?.seed,
     dims: entry.dims ?? prior?.dims,
     doors,
-    ...(entry.gates ? { gates: cleanGates(entry.gates) } : prior?.gates ? { gates: prior.gates } : {}),
-    ...(entry.gates
-      ? (entry.gateAccess ? { gateAccess: cleanGateAccess(entry.gateAccess) } : {})
+    ...(entryGates ? { gates: entryGates } : prior?.gates ? { gates: prior.gates } : {}),
+    ...(entryGates
+      ? (entry.gateAccess ? { gateAccess: cleanGateAccess(entry.gateAccess, entryGates) } : {})
       : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
     lastSeen: Date.now(),
     // We are standing in it — the strongest possible local recency signal.
@@ -512,13 +513,15 @@ export interface AtlasGateAccess {
   reservedFor?: string;
 }
 
-/** Door id → access pairs a peer may send, cleaned and capped (one per gate number). */
-function cleanGateAccess(v: Record<string, unknown>): Record<string, AtlasGateAccess> {
+/** Door id → access pairs a peer may send, cleaned and capped (one per gate
+ *  number). Only doors of the cleaned `gates` count, so entries for other
+ *  doors cannot crowd out a real gate's policy. */
+function cleanGateAccess(v: Record<string, unknown>, gates: Record<string, number>): Record<string, AtlasGateAccess> {
   const out: Record<string, AtlasGateAccess> = {};
   let kept = 0;
   for (const [doorId, raw] of Object.entries(v)) {
     if (kept >= MAX_GATE_NUMBER) break;
-    if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
+    if (!Object.prototype.hasOwnProperty.call(gates, doorId)) continue;
     if (typeof raw !== 'object' || raw === null) continue;
     const r = raw as { access?: unknown; reservedFor?: unknown };
     if (r.access === 'pass' || r.access === 'closed') out[doorId] = { access: r.access };
@@ -1184,7 +1187,7 @@ function pullSharedAtlas(): void {
       if (prior.gates === undefined && value.gates !== undefined && isPlainGates(value.gates)) {
         prior.gates = cleanGates(value.gates);
         if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
-          prior.gateAccess = cleanGateAccess(value.gateAccess);
+          prior.gateAccess = cleanGateAccess(value.gateAccess, prior.gates);
         }
         changed = true;
       }
@@ -1255,7 +1258,7 @@ function pullSharedAtlas(): void {
       // gates sent every non-open access, so absent here means all open.
       ...(value.gates !== undefined && isPlainGates(value.gates)
         ? (value.gateAccess !== undefined && isPlainGates(value.gateAccess)
-          ? { gateAccess: cleanGateAccess(value.gateAccess) }
+          ? { gateAccess: cleanGateAccess(value.gateAccess, cleanGates(value.gates)) }
           : {})
         : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
