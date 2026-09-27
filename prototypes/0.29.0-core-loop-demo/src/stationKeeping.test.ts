@@ -1,12 +1,13 @@
 /**
  * 🛰️ Station keeping — which face the helm shows, the trimmed circular orbit
  * (Kepler stays honest: lower is faster), the burn planner's refusal ladder,
- * and the doc record's guards.
+ * the doc record's guards, and two owners burning at once.
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
-import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, stationOrbit, wrapAngle } from './orbits';
+import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, wrapAngle } from './orbits';
+import { bindShipDoc, readFuelLevel, writeFuelLevel } from './shipDoc';
 import { DEFAULT_PLANET_ID } from './stations';
 import {
   BURN_MS,
@@ -24,6 +25,7 @@ import {
   signedAngle,
   slotDriftPerHour,
   slotOffsetAt,
+  slotOrbit,
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
@@ -38,7 +40,7 @@ const HOUR = 3600 * 1000;
 const DEG = Math.PI / 180;
 
 const trim = (over: Partial<OrbitTrim> = {}): OrbitTrim => ({
-  stationId: STATION.id,
+  planetId: SOV,
   slot: 0,
   dRadiusKm: 0,
   dPhase: 0,
@@ -48,6 +50,7 @@ const trim = (over: Partial<OrbitTrim> = {}): OrbitTrim => ({
 });
 
 const ctx = (over: Partial<TrimContext> = {}): TrimContext => ({
+  bolted: true,
   station: STATION,
   trim: null,
   commander: true,
@@ -90,7 +93,11 @@ describe('which face the helm shows', () => {
 });
 
 describe('the trimmed orbit', () => {
-  const base = stationOrbit(STATION);
+  const base = slotOrbit(STATION);
+
+  it('is measured from the untrimmed slot orbit', () => {
+    expect(base).toEqual(orbitForSlot(SOV, 0));
+  });
 
   it('no trim is the slot orbit itself', () => {
     expect(trimmedOrbit(base, null)).toBe(base);
@@ -150,15 +157,16 @@ describe('the trimmed orbit', () => {
 
   it('works around every planet and slot orbits.ts knows', () => {
     const aris = { id: 'aris-3', planetId: 'planet-aris', orbitSlot: 3 };
-    const b = stationOrbit(aris);
+    const b = slotOrbit(aris);
     expect(b).toEqual(orbitForSlot('planet-aris', 3));
-    const t = { ...trim({ stationId: aris.id, slot: 3, dRadiusKm: -8 }) };
+    const t = trim({ planetId: 'planet-aris', slot: 3, dRadiusKm: -8 });
+    expect(trimFor(aris, t)).toBe(t);
     expect(trimmedOrbit(b, t).meanMotion).toBeGreaterThan(b.meanMotion);
   });
 });
 
 describe('on station and burning', () => {
-  const base = stationOrbit(STATION);
+  const base = slotOrbit(STATION);
 
   it('on station means at the slot radius and within a degree of it', () => {
     expect(isOnStation(base, null, T0)).toBe(true);
@@ -178,20 +186,30 @@ describe('on station and burning', () => {
 });
 
 describe('trimFor', () => {
-  it('applies only to the station and slot it was written for', () => {
+  it('applies to whatever the station is called, while it flies the planet and slot the trim names', () => {
     const t = trim();
     expect(trimFor(STATION, t)).toBe(t);
-    expect(trimFor({ id: 'other', orbitSlot: 0 }, t)).toBeNull();
-    expect(trimFor({ id: STATION.id, orbitSlot: 1 }, t)).toBeNull();
+    // Station records are per install: another client may know this station
+    // by another id. The orbit basis is what must agree.
+    const renamed = { ...STATION, id: 'station:home-abc' };
+    expect(trimFor(renamed, t)).toBe(t);
+    expect(trimFor({ planetId: 'planet-aris', orbitSlot: 0 }, t)).toBeNull();
+    expect(trimFor({ planetId: SOV, orbitSlot: 1 }, t)).toBeNull();
     expect(trimFor(null, t)).toBeNull();
     expect(trimFor(STATION, null)).toBeNull();
+  });
+
+  it('resolves the planet the way orbits.ts does: an unknown id orbits the default planet', () => {
+    expect(trimFor({ planetId: 'planet-nowhere', orbitSlot: 0 }, trim())).not.toBeNull();
+    expect(trimFor({ planetId: 'planet-nowhere', orbitSlot: 0 }, trim({ planetId: 'planet-nowhere' }))).toBeNull();
   });
 });
 
 describe('planTrim — the stick', () => {
-  const base = stationOrbit(STATION);
+  const base = slotOrbit(STATION);
 
-  it('refuses in the helm\'s order: station, commander, thrusters, fuel, burning, limit', () => {
+  it('refuses in the helm\'s order: bolted, station, commander, thrusters, fuel, burning, limit', () => {
+    expect(planTrim(ctx({ bolted: false, station: null }), 'raise')).toEqual({ ok: false, refusal: 'not-bolted' });
     expect(planTrim(ctx({ station: null, commander: false }), 'raise')).toEqual({ ok: false, refusal: 'no-station' });
     expect(planTrim(ctx({ commander: false, engines: 0 }), 'raise')).toEqual({ ok: false, refusal: 'not-commander' });
     expect(planTrim(ctx({ engines: 0, fuel: 0 }), 'raise')).toEqual({ ok: false, refusal: 'no-thrusters' });
@@ -204,7 +222,7 @@ describe('planTrim — the stick', () => {
 
   it('RAISE and LOWER step the radius and keep the station where it is', () => {
     const t1 = burn(ctx(), 'raise');
-    expect(t1).toMatchObject({ stationId: STATION.id, slot: 0, dRadiusKm: TRIM_STEP_KM, at: T0, last: 'raise' });
+    expect(t1).toMatchObject({ planetId: SOV, slot: 0, dRadiusKm: TRIM_STEP_KM, at: T0, last: 'raise' });
     expect(t1.dPhase).toBe(0);
     // An hour later the raised station has fallen behind; lowering keeps that offset.
     const later = T0 + HOUR;
@@ -240,11 +258,19 @@ describe('planTrim — the stick', () => {
     expect(planTrim(ctx({ trim: t, now }), 'raise').ok).toBe(true);
   });
 
-  it('a record for another station or slot is ignored — the burn starts from the slot', () => {
-    const stray = trim({ stationId: 'elsewhere', dRadiusKm: 10, dPhase: 1 });
-    const t = burn(ctx({ trim: stray }), 'raise');
-    expect(t.dRadiusKm).toBe(TRIM_STEP_KM);
-    expect(t.dPhase).toBe(0);
+  it('a record for another planet or slot is ignored — the burn starts from the slot', () => {
+    for (const stray of [
+      trim({ planetId: 'planet-aris', dRadiusKm: 10, dPhase: 1, at: T0 - BURN_MS }),
+      trim({ slot: 2, dRadiusKm: 10, dPhase: 1, at: T0 - BURN_MS }),
+    ]) {
+      const t = burn(ctx({ trim: stray }), 'raise');
+      expect(t).toMatchObject({ planetId: SOV, slot: 0, dRadiusKm: TRIM_STEP_KM, dPhase: 0 });
+    }
+  });
+
+  it('writes the planet as orbits.ts resolves it', () => {
+    const t = burn(ctx({ station: { planetId: 'planet-nowhere', orbitSlot: 0 } }), 'raise');
+    expect(t.planetId).toBe(SOV);
   });
 
   it('wraps the phase offset into (−π, π]', () => {
@@ -303,8 +329,9 @@ describe('the doc record', () => {
       { ...trim(), at: Number.MAX_VALUE },
       { ...trim(), slot: 99 },
       { ...trim(), slot: 1.5 },
-      { ...trim(), stationId: '' },
-      { ...trim(), stationId: 'x'.repeat(200) },
+      { ...trim(), planetId: '' },
+      { ...trim(), planetId: 'x'.repeat(200) },
+      { ...trim(), planetId: 7 },
       { ...trim(), last: 'sideways' },
     ];
     for (const value of hostile) {
@@ -325,5 +352,44 @@ describe('the doc record', () => {
     doc.destroy();
     expect(readOrbitTrim()).toBeNull();
     expect(writeOrbitTrim(trim())).toBe(false);
+  });
+});
+
+describe('two owners burning at once', () => {
+  it('converge on one burn and that burn\'s debit: nothing lands free', () => {
+    // Both clients start from the same room state: 5 fuel, no trim yet.
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    bindShipDoc(a);
+    writeFuelLevel(5, 100);
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+
+    // Each burns without having seen the other's burn.
+    const fire = (doc: Y.Doc, dir: TrimDirection, now: number): OrbitTrim => {
+      bindShipDoc(doc);
+      bindStationKeepingDoc(doc);
+      const c = ctx({ fuel: readFuelLevel(), now });
+      const t = burn(c, dir);
+      expect(writeOrbitTrim(t, () => writeFuelLevel(c.fuel - TRIM_FUEL, 100))).toBe(true);
+      return t;
+    };
+    const ta = fire(a, 'raise', T0);
+    const tb = fire(b, 'ahead', T0 + 40);
+
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+
+    const settled = (doc: Y.Doc) => {
+      bindShipDoc(doc);
+      bindStationKeepingDoc(doc);
+      return { trim: readOrbitTrim(), fuel: readFuelLevel() };
+    };
+    const sa = settled(a);
+    const sb = settled(b);
+    // Both replicas agree, the trim is one whole burn (not a blend of two),
+    // and exactly one burn's fuel is gone.
+    expect(sa).toEqual(sb);
+    expect([ta, tb]).toContainEqual(sa.trim);
+    expect(sa.fuel).toBe(5 - TRIM_FUEL);
   });
 });

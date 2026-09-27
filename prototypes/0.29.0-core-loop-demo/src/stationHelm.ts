@@ -26,9 +26,10 @@
  */
 
 import type { DeviceUI } from './devices';
+import { subscribeDoors } from './doorsDoc';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
-import { realMsFor, stationOrbit } from './orbits';
+import { realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { TANK_CAPACITY, clampFuelToCapacity, readFuelLevel, subscribeShip, writeFuelLevel } from './shipDoc';
 import type { StationRecord } from './stations';
@@ -47,6 +48,7 @@ import {
   readOrbitTrim,
   slotDriftPerHour,
   slotOffsetAt,
+  slotOrbit,
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
@@ -84,7 +86,7 @@ const GREEN = '#00E676';
 const WARN = '#FFB74D';
 
 /** The refusals that disable the whole stick (as opposed to one direction). */
-const STICK_REFUSALS: readonly TrimRefusal[] = ['no-station', 'not-commander', 'no-thrusters', 'no-fuel'];
+const STICK_REFUSALS: readonly TrimRefusal[] = ['not-bolted', 'no-station', 'not-commander', 'no-thrusters', 'no-fuel'];
 
 /** "1m 32s" / "3h 54m" — a real-time span. */
 function formatSpan(ms: number): string {
@@ -228,6 +230,10 @@ function drawKeepingBox(
 // ── The face ─────────────────────────────────────────────────────────────────
 
 export interface StationHelmDeps {
+  /** Is the module still bolted into a station — read at every refresh and
+   *  every burn, since a peer can take the gangway down while this is open
+   *  (stationKeeping.isBoltedIntoStation over the live door records). */
+  bolted: () => boolean;
   /** The station this module belongs to (stations.currentStation). */
   station: () => StationRecord | null;
   /** The ship helm face, mounted by the FUEL & DOCKING tab. */
@@ -283,6 +289,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     const tanks = countFunction('fuelTank');
     const capacity = tanks * TANK_CAPACITY;
     return {
+      bolted: deps.bolted(),
       station: deps.station(),
       trim: readOrbitTrim(),
       commander: isCommander(),
@@ -300,7 +307,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     const c = readContext();
     const station = c.station;
     const trim = trimFor(station, c.trim);
-    const base = station ? stationOrbit(station) : null;
+    const base = station ? slotOrbit(station) : null;
     view = station && base ? { station, base, trim, planet: base.planet.name } : null;
 
     if (view && base) {
@@ -509,6 +516,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     unsubs.push(subscribeStationKeeping(refresh));
     unsubs.push(subscribeShip(refresh));
     unsubs.push(subscribeFurniture(refresh));
+    unsubs.push(subscribeDoors(refresh));
     refresh();
     placeKnob(Date.now());
   };

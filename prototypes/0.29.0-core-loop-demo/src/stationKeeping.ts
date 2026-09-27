@@ -32,21 +32,27 @@
  * from those three numbers, never stored or ticked.
  *
  * Storage: the `stationKeeping` map in the HELM ROOM's doc (key 'trim') —
- * shared by everyone in the room, like the ship doc. Trust: owner-writes at
- * the UI, honest-client reads with shape guards and clamps (the shipDoc
- * posture). Other rooms of the station do not see a trim until station
- * records are shared (the per-planet summary); until then the holotable and
- * ship transfers keep using the slot's orbit.
+ * shared by everyone in the room, like the ship doc. The record names the
+ * orbit it trims by its BASIS — planet and slot, the two numbers the slot's
+ * orbit is derived from — not by a station id: station records are still
+ * kept per install, so two people in the room may know the station by
+ * different ids, but everyone who puts it in the same slot derives the same
+ * trimmed orbit, and anyone who puts it elsewhere ignores the trim rather
+ * than misapplying it. Trust: owner-writes at the UI, honest-client reads
+ * with shape guards and clamps (the shipDoc posture). Other rooms of the
+ * station do not see a trim until station records are shared (the
+ * per-planet summary); until then the holotable and ship transfers keep
+ * using the slot's orbit.
  *
  * Pure except for the doc binding. Pinned by stationKeeping.test.ts.
  */
 
 import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
-import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, orbitalSeconds, stationOrbit, wrapAngle } from './orbits';
+import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { isBerthDoor } from './stationAtlas';
-import { MAX_ORBIT_SLOTS } from './stations';
+import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationRecord } from './stations';
 
 const TAU = 2 * Math.PI;
@@ -98,12 +104,15 @@ export const TRIM_DIRECTIONS: readonly TrimDirection[] = ['raise', 'lower', 'ahe
 
 // ── The trim record ──────────────────────────────────────────────────────────
 
-/** One station's trim — written whole by each burn. Plain JSON. */
+/** One station's trim — written whole by each burn. Plain JSON. The orbit
+ *  it trims is named by its basis (planet and slot), never by a station id:
+ *  see the header. */
 export interface OrbitTrim {
-  /** The station it steers (stations.ts id). */
-  stationId: string;
-  /** The slot it was trimmed in. A station moved to another slot flies that
-   *  slot's orbit untrimmed until its next burn. */
+  /** The planet the orbit goes round (a PLANETS id, as orbits.ts resolves
+   *  it). */
+  planetId: string;
+  /** The slot it was trimmed in. A station moved to another slot or planet
+   *  flies that slot's orbit untrimmed until its next burn. */
   slot: number;
   /** Orbit radius minus the slot's, km, within ±MAX_TRIM_KM. */
   dRadiusKm: number;
@@ -122,7 +131,7 @@ export function signedAngle(a: number): number {
   return w > Math.PI ? w - TAU : w;
 }
 
-const MAX_STATION_ID_LEN = 128;
+const MAX_PLANET_ID_LEN = 128;
 /** A burn's time must sit between the orbital epoch and a century after it —
  *  a bound that keeps the phase arithmetic finite and exact enough, not a
  *  freshness rule (a peer's clock may run ahead; the offset line is
@@ -133,7 +142,7 @@ const MAX_AT_MS = ORBIT_EPOCH_MS + 100 * 365.25 * 24 * 3600 * 1000;
 export function isOrbitTrim(v: unknown): v is OrbitTrim {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof OrbitTrim, unknown>>;
-  return typeof r.stationId === 'string' && r.stationId.length > 0 && r.stationId.length <= MAX_STATION_ID_LEN
+  return typeof r.planetId === 'string' && r.planetId.length > 0 && r.planetId.length <= MAX_PLANET_ID_LEN
     && Number.isInteger(r.slot) && (r.slot as number) >= 0 && (r.slot as number) < MAX_ORBIT_SLOTS
     && typeof r.dRadiusKm === 'number' && Number.isFinite(r.dRadiusKm) && Math.abs(r.dRadiusKm) <= MAX_TRIM_KM
     && typeof r.dPhase === 'number' && Number.isFinite(r.dPhase) && Math.abs(r.dPhase) <= Math.PI
@@ -144,7 +153,7 @@ export function isOrbitTrim(v: unknown): v is OrbitTrim {
 /** Only the fields a trim has — what a write publishes. */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
   return {
-    stationId: t.stationId,
+    planetId: t.planetId,
     slot: t.slot,
     dRadiusKm: t.dRadiusKm,
     dPhase: t.dPhase,
@@ -153,17 +162,26 @@ function cleanTrim(t: OrbitTrim): OrbitTrim {
   };
 }
 
-/** The trim that applies to `station`: the record, while it names this
- *  station and the slot the station still flies; otherwise none. */
+/** The trim that applies to `station`: the record, while it names the
+ *  planet and slot the station flies (the planet as orbits.ts resolves it,
+ *  so an unknown id matches the default planet it orbits); otherwise none. */
 export function trimFor(
-  station: Pick<StationRecord, 'id' | 'orbitSlot'> | null,
+  station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null,
   trim: OrbitTrim | null,
 ): OrbitTrim | null {
   if (!station || !trim) return null;
-  return trim.stationId === station.id && trim.slot === station.orbitSlot ? trim : null;
+  return trim.planetId === planetById(station.planetId).id && trim.slot === station.orbitSlot ? trim : null;
 }
 
 // ── The trimmed orbit (on orbits.ts) ─────────────────────────────────────────
+
+/** The station's UNTRIMMED slot orbit — the basis every trim is measured
+ *  from. Not orbits.stationOrbit: that one follows a station's trim once a
+ *  trim resolver is installed, and measuring from it would apply the trim
+ *  twice. */
+export function slotOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>): CircularOrbit {
+  return orbitForSlot(station.planetId, station.orbitSlot);
+}
 
 /**
  * The station's orbit with its trim applied: a circle `dRadiusKm` farther out,
@@ -219,6 +237,7 @@ export function isBurning(trim: OrbitTrim | null, realMs: number): boolean {
 
 /** Why the stick will not fire, in the order the helm checks. */
 export type TrimRefusal =
+  | 'not-bolted' // the module is no longer station structure (a gangway came down)
   | 'no-station' // the atlas does not place this module in a station yet
   | 'not-commander' // only the module's owner flies the station
   | 'no-thrusters' // no engine block on this module
@@ -227,7 +246,11 @@ export type TrimRefusal =
   | 'at-limit'; // RAISE / LOWER would leave the trim band
 
 export interface TrimContext {
-  station: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'> | null;
+  /** Is the module STILL bolted into a station (isBoltedIntoStation, read
+   *  live — the face was picked when the helm opened, and a peer can take a
+   *  gangway down while it is open)? */
+  bolted: boolean;
+  station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null;
   /** The doc's record, as read — trimFor is applied here, not by the caller. */
   trim: OrbitTrim | null;
   commander: boolean;
@@ -248,6 +271,7 @@ export type TrimPlan = { ok: true; trim: OrbitTrim } | { ok: false; refusal: Tri
  */
 export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
   const { station, now } = ctx;
+  if (!ctx.bolted) return { ok: false, refusal: 'not-bolted' };
   if (!station) return { ok: false, refusal: 'no-station' };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander' };
   if (ctx.engines < 1) return { ok: false, refusal: 'no-thrusters' };
@@ -255,7 +279,7 @@ export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
   const current = trimFor(station, ctx.trim);
   if (isBurning(current, now)) return { ok: false, refusal: 'burning' };
 
-  const base = stationOrbit(station);
+  const base = slotOrbit(station);
   const radius = current?.dRadiusKm ?? 0;
   const offset = slotOffsetAt(base, current, now);
   let dRadiusKm = radius;
@@ -271,7 +295,7 @@ export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
   return {
     ok: true,
     trim: {
-      stationId: station.id,
+      planetId: base.planet.id,
       slot: station.orbitSlot,
       dRadiusKm,
       dPhase: signedAngle(dPhase),
@@ -308,6 +332,8 @@ export function describeDrift(perHour: number): string {
  *  between "fit a tank" and "refuel it". */
 export function describeRefusal(refusal: TrimRefusal, tanks: number, dRadiusKm = 0): string {
   switch (refusal) {
+    case 'not-bolted':
+      return 'This module is no longer bolted into a station, so it flies as a ship now. Its helm is on the FUEL & DOCKING tab.';
     case 'no-station':
       return 'The station map does not place this module in a station yet.';
     case 'not-commander':
@@ -386,6 +412,13 @@ export function readOrbitTrim(): OrbitTrim | null {
  * Publish a burn's trim record. `alongside` runs inside the same transaction
  * — the fuel debit — so peers never see the burn without its cost. Owner-gated
  * at the caller. Returns whether it wrote.
+ *
+ * Two burns fired at once from two clients (the owner in two tabs) never both
+ * land, and neither lands free. Each writes a whole trim and the fuel it saw
+ * less one burn; Yjs settles concurrent writes to a key by client id, so when
+ * both started from the same record the same writer wins BOTH keys, and the
+ * room converges on one burn and that burn's debit. The other press drops
+ * whole, and its dashboard redraws from the doc on the next sync.
  */
 export function writeOrbitTrim(trim: OrbitTrim, alongside?: () => void): boolean {
   if (!docAlive()) return false;
