@@ -23,6 +23,9 @@ import {
   MOVE_HORIZON_MS,
   bindStationMoveDoc,
   cancelTowLeftBehind,
+  concurrentMoves,
+  isPinMove,
+  pinSettledArrival,
   isPlausibleMove,
   compareMoves,
   dockLockedByMove,
@@ -265,6 +268,30 @@ describe('the station list follows a move', () => {
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'a15' ? left : null));
     expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
       .toMatchObject({ planetId: SOV });
+  });
+
+  it('shares where an arrival settled, so installs that judged it differently agree', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    // This install saw Aris full: the station bounced home, and it pins that.
+    bindStationMoveDoc(new Y.Doc());
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? readStationMove() ?? move : null));
+    const t = move.arriveAt + 5;
+    const here = listStations({}, full, t).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(here).toMatchObject({ planetId: SOV });
+    expect(pinSettledArrival(here, t)).toBe(true);
+    const pin = readStationMove()!;
+    expect(pin).toMatchObject({ fromPlanetId: SOV, toPlanetId: SOV, fromSlot: here.orbitSlot, departAt: move.arriveAt });
+    expect(isPinMove(pin)).toBe(true);
+    expect(isStationMove(pin)).toBe(true);
+    // Another install knew no one at Aris and would have let it land; given
+    // the pin (the station's latest move), it lists it home too.
+    store.clear();
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? pin : null));
+    expect(listStations({}, [], t + 1).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
+    // A pinned station is not pinned again.
+    expect(pinSettledArrival(here, t + 2)).toBe(false);
   });
 
   it('never lets an unknown planet id share a slot with the planet it reads as', () => {
@@ -619,6 +646,35 @@ describe('tugs: a torch tow', () => {
       .toMatchObject({ planetId: SOV, orbitSlot: plan.move.fromSlot });
     // Once is enough.
     expect(cancelTowLeftBehind('tug-room', 'in-flight', NOW + 3)).toBe(false);
+  });
+
+  it('lets a move booked at the same time beat a tow that would have flown first', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    expect(tow.bookedAt).toBe(NOW);
+    // Another tab booked the station's own thruster move at the same moment,
+    // for a window days after the tow would have landed.
+    const later: StationMove = {
+      ...moveTo(), stationId: tow.stationId, welcomeRoomId: tow.welcomeRoomId,
+      departAt: tow.arriveAt + 3 * 86_400_000, arriveAt: tow.arriveAt + 5 * 86_400_000, bookedAt: NOW,
+    };
+    expect(concurrentMoves(tow, later)).toBe(true);
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(tow);
+    rememberMove(later, NOW);
+    // The later move wins everywhere, so the tow holds nothing and costs nothing.
+    expect(readStationMove()).toBeNull();
+    expect(isTowing('tug-room', NOW + 1)).toBe(false);
+    expect(readMoveFuelDrawn()).toBe(0);
+    // A move booked after the tow landed is not concurrent: both fly.
+    const next = { ...later, bookedAt: tow.arriveAt + 1 };
+    expect(concurrentMoves(tow, next)).toBe(false);
+    store.clear();
+    bindStationMoveDoc(new Y.Doc());
+    writeStationMove(tow);
+    rememberMove(next, NOW);
+    expect(readMoveFuelDrawn()).toBe(tow.fuel);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {

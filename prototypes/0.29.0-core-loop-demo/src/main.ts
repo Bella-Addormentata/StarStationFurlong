@@ -137,7 +137,7 @@ import {
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
-import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, subscribeStationMove } from "./stationMove";
+import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, pinSettledArrival, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1901,6 +1901,8 @@ async function joinRoomAtEpoch(
     const rec = readFlightRecord();
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     cancelTowLeftBehind(boot.roomId, rec.status, Date.now());
+    // 🪐 Where this station's last move settled it, shared once for everyone.
+    if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).

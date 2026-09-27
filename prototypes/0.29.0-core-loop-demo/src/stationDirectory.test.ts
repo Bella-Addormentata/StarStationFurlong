@@ -199,6 +199,14 @@ describe('station ids written on another install', () => {
     expect(localStationId('unknown')).toBe('unknown');
   });
 
+  it('ask the resolver before taking a listed id as written', () => {
+    // A local record whose id collides with a portable id for another room.
+    const clash = [...records, { id: 'shared:room-odd', name: 'ODD', planetId: HOME_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'room-x' }];
+    const byRoom: Record<string, string> = { 'shared:room-odd': 'shared:room-hab' };
+    setStationDirectory(directoryFromStationRecords(() => clash, () => undefined, () => null, () => null, (id) => byRoom[id] ?? null));
+    expect(localStationId('shared:room-odd')).toBe('shared:room-hab');
+  });
+
   it('are taken as written without a resolver', () => {
     setStationDirectory(directoryFromStationRecords(() => records, () => undefined, () => null));
     expect(localStationId('station:room-hab')).toBe('station:room-hab');
