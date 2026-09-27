@@ -772,6 +772,9 @@ export function publishPlanetSummary(now = Date.now()): void {
   // Entries a bounded pull could not reach before the prune are reachable
   // now; the observer skips this local write, so read them here.
   if (pruned > 0) pullPlanetSummary(now);
+  // What this client just applied (its own trim, records) is news to its
+  // own views too: the observer skips local writes.
+  notify();
 }
 
 // ── Reading what is known ────────────────────────────────────────────────────
@@ -781,13 +784,24 @@ let trimsByStationId = new Map<string, SharedTrim>();
 /** Refresh records and trims from the store: register this planet's learned
  *  stations, then map every listed station to its newest known trim. */
 function applyLearned(store: Store): void {
-  const here = ctx?.currentStation() ?? null;
-  // Where this client is: its own saved record says so; otherwise the shared
-  // summary of the station it stands in does (a derived record sits on the
-  // default planet until its learned one registers, which needs the planet).
+  const room = ctx?.currentRoom?.() || null;
+  const found = ctx?.currentStation() ?? null;
+  // A ship's own one-room stand-in (derived, its welcome room this room)
+  // places nothing: it sits on the default planet until stations are known.
+  const here = found && !(found.derived && found.welcomeRoomId === room) ? found : null;
+  // Where this client is: the shared summary of the station it stands in,
+  // unless this install's own saved record is the one that stands there (a
+  // derived record sits on the default planet until its learned one
+  // registers, which needs the planet; a rival install's standing record
+  // moves ours, which needs its planet too).
   const shared = here?.welcomeRoomId ? store.stations[here.welcomeRoomId] : undefined;
-  const planet = planetById(here && !isOwned(here) && shared ? shared.planetId : here?.planetId).id;
-  registerLearnedStations(planet, Object.values(store.stations), { prune: here !== null });
+  const ours = here !== null && isOwned(here) && (shared?.ownerId === undefined || shared.ownerId === here.id);
+  // No station placement: a ship room's own summary says which planet it is at.
+  const ship = !here && room ? store.ships[room] : undefined;
+  const shipPlanet = ship && !ship.retired ? ship.planetId : undefined;
+  const planetOf = here ? (!ours && shared ? shared.planetId : here.planetId) : shipPlanet;
+  const planet = planetById(planetOf).id;
+  registerLearnedStations(planet, Object.values(store.stations), { prune: planetOf !== undefined });
   refreshTrims(store);
 }
 

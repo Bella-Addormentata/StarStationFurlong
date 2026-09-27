@@ -1828,6 +1828,8 @@ async function joinRoomAtEpoch(
     installTrimResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
+    // A fitted or removed engine, tank or helm makes or unmakes a ship.
+    subscribeFurniture(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).
