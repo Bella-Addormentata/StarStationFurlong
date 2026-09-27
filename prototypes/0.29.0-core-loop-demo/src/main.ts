@@ -3615,12 +3615,17 @@ function harvestStationAtlas(): void {
   // known, so the harvest leaves them as they were rather than listing none
   // and hiding a legacy berth.
   const unnumbered = readUnnumberedPorts();
-  if (unnumbered.length > 0 && isLocalHelmCommander()) {
-    for (const doorId of unnumbered) {
-      const gate = freeGateNumber(readAtlas(), roomId, readDockGates());
-      if (gate === null) break;
-      writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
-    }
+  if (unnumbered.length > 0 && isLocalHelmCommander() && yjsSync) {
+    // One transaction: the policy observer (which harvests again) runs only
+    // once every port has its number, so none is numbered twice.
+    yjsSync.doc.transact(() => {
+      for (const doorId of unnumbered) {
+        if (readDoorPolicy(doorId).gate !== undefined) continue;
+        const gate = freeGateNumber(readAtlas(), roomId, readDockGates());
+        if (gate === null) break;
+        writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
+      }
+    });
   }
   const gatesKnown = readUnnumberedPorts().length === 0;
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.

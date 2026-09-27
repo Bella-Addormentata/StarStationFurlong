@@ -14,6 +14,7 @@ import {
   nextFreeGate,
   readGateAccess,
   readDockGates,
+  readUnnumberedPorts,
   readDoorPolicy,
   writeDoorPolicy,
 } from './doorPolicy';
@@ -100,6 +101,19 @@ describe('the gate on a dock port', () => {
     fitDockPortIn(far, 'south', 2);
     far.getMap('doorPolicy').set('d:phantom1', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
     expect(dockGatesIn(far)).toEqual({ south: 2 });
+  });
+
+  it("lists no gate on a door the room's layout has removed", () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    // The layout is authoritative once it holds records: only 'north' remains.
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    doc.getMap('doorPolicy').set('south', { passage: 'public', construction: 'owner', adapter: true, gate: 2, gateAccess: 'closed' });
+    doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
+    expect(readDockGates()).toEqual({ north: 1 });
+    expect(readGateAccess()).toEqual({});
+    expect(readUnnumberedPorts()).toEqual([]);
   });
 
   it('takes the lowest number free in the station', () => {
@@ -309,7 +323,7 @@ describe('ship destinations', () => {
     expect(dest.berth).toEqual({ address: seed('room-b'), farDoor: 'south', gate: 2, occupied: true });
   });
 
-  it('drop a public berth that is not one of the listed gates', () => {
+  it('drops a public berth that is not one of the listed gates', () => {
     const [dest] = destinationsFromRecords([{
       id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b', berthDoor: 'west',
       berths: [{ roomId: 'room-c', doorId: 'east', gate: 3 }],

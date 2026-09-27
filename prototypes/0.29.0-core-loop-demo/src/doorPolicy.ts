@@ -213,7 +213,7 @@ export function readGateAccess(): Record<string, GateAccessRecord> {
   let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
     if (++n > 256) break;
-    if (!isKnownDoorId(doorId)) continue;
+    if (!doorExistsIn(boundDoc!, doorId)) continue; // a door the layout has
     const a = accessRecord(sanitizePolicy(value));
     if (a) out[doorId] = a;
   }
@@ -265,7 +265,7 @@ export function readDockGates(): Record<string, number> {
   let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
     if (++n > 256) break;
-    if (!isKnownDoorId(doorId)) continue;
+    if (!doorExistsIn(boundDoc!, doorId)) continue; // a door the layout has
     const p = sanitizePolicy(value);
     if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
   }
@@ -280,7 +280,7 @@ export function readUnnumberedPorts(): string[] {
   let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
     if (++n > 256) break;
-    if (!isKnownDoorId(doorId)) continue;
+    if (!doorExistsIn(boundDoc!, doorId)) continue; // a door the layout has
     const p = sanitizePolicy(value);
     if (p.adapter && p.gate === undefined) out.push(doorId);
   }
