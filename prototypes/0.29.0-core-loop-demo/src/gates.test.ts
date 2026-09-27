@@ -218,6 +218,21 @@ describe('gate gossip that doors alone would skip', () => {
     expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
   });
 
+  it('keeps a real gate\'s access when a doc copy carries access for many other doors', () => {
+    twoRoomStation();
+    const doc = new Y.Doc();
+    const gateAccess: Record<string, unknown> = {};
+    for (let i = 0; i < 120; i++) gateAccess[`junk-${i}`] = { access: 'pass' };
+    gateAccess.south = { access: 'closed' };
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: Date.now() + 60_000,
+      doors: { west: { targetRoomId: 'room-a', farDoor: 'east', transient: false } },
+      gates: { south: 2 }, gateAccess,
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-b']?.gateAccess).toEqual({ south: { access: 'closed' } });
+  });
+
   it("adds our gates to an equally new doc copy that has none, keeping its doors and size", () => {
     twoRoomStation();
     // Our own (older) record of room-b also knows an older size.
@@ -470,6 +485,17 @@ describe('the per-planet summary', () => {
     }, T0);
     expect(s?.berths).toBeUndefined();
     expect(s?.name).toBe('HUB');
+  });
+
+  it('keeps every listed room\'s own gate stamp when room tombstones overflow the cap', () => {
+    const berths = Array.from({ length: 99 }, (_, i) => ({ roomId: `room-${String(i).padStart(2, '0')}`, doorId: 'south', gate: i + 1 }));
+    const full = base({ ownerId: 'hub', berths, berthsAt: T0 });
+    // A later reading of a room that no longer lists any gate.
+    const gone = base({ ownerId: 'hub', berths: [], berthsAt: T0 + 5, berthRoomsAt: { 'room-zz': T0 + 5 } });
+    for (const merged of [mergeStation(full, gone)!, mergeStation(gone, full)!]) {
+      expect(merged.berths).toHaveLength(99);
+      for (const b of merged.berths!) expect(merged.berthRoomsAt?.[b.roomId] ?? merged.berthsAt).toBe(T0);
+    }
   });
 
   it('shares gates without the local occupied flag', () => {

@@ -341,7 +341,10 @@ function roomStamps(x: Gates): Map<string, number> {
 }
 
 /** The per-room stamps worth carrying (sorted, bounded): a room read at
- *  another time than `berthsAt`, or one that lists no berth any more. */
+ *  another time than `berthsAt`, or one that lists no berth any more. Rooms
+ *  that list berths keep theirs first (at most MAX_BERTHS of them, since the
+ *  list is), so no listed room falls back to `berthsAt`; room tombstones
+ *  fill what is left, newest first. */
 function canonRoomStamps(
   berths: readonly StationBerthRecord[],
   berthsAt: number | undefined,
@@ -350,7 +353,8 @@ function canonRoomStamps(
   const listed = new Set(berths.map((b) => b.roomId));
   const entries = (rooms instanceof Map ? [...rooms] : Object.entries(rooms))
     .filter(([room, at]) => at !== berthsAt || !listed.has(room))
-    .sort((x, y) => y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
+    .sort((x, y) => Number(listed.has(y[0])) - Number(listed.has(x[0]))
+      || y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
     .slice(0, MAX_BERTHS)
     .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
   if (entries.length === 0) return undefined;
