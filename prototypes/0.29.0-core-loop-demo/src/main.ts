@@ -2185,8 +2185,12 @@ async function joinRoomAtEpoch(
       checkpoints: readRouteCheckpoints,
       seedFor: localSeedFor,
       write: writeDepartures,
+      // ⛽ Only the room's owner fits or takes off tanks (editMode's gate).
+      editsShip: isLocalHelmCommander,
     });
     onRouteWritten((n) => departures.routeWritten(n));
+    // ⛽ …and a tank fitted or taken off while the route runs.
+    subscribeFurniture(() => departures.tanksChanged());
     // …and every board in the room reads its rows here.
     setDepartureBoardSource(departureBoardFor);
   }

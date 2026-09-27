@@ -254,7 +254,11 @@ export function departureRouteFromWire(v: unknown, ship: string, now = Date.now(
  *  running snapshot can carry a later `at` than the finish: clock skew, or a
  *  checkpoint written just before the finish reached it); a newer START
  *  beats the finish. Otherwise a newer START always; within one run, STOP
- *  over not stopped; otherwise the later publish (a tie keeps `b`). */
+ *  over not stopped; otherwise the later publish (a tie keeps `b`). The
+ *  ship reads runs in the same order: a run id only goes up (the next START
+ *  moves past the finished run's kept start key, whatever the riders'
+ *  clocks), and of two STARTs at once the ship flies the later run
+ *  (shipRoute.laterRuns), the one this ranks first. */
 export function departureRouteNewer(
   a: Pick<DepartureFerry, 'route' | 'at' | 'endedRun'>,
   b: Pick<DepartureFerry, 'route' | 'at' | 'endedRun'>,

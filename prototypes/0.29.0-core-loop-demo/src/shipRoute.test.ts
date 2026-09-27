@@ -51,6 +51,7 @@ import {
   finishShipRoute,
   installRouteFlight,
   installRouteFuelMeter,
+  onRouteWritten,
   parseCheckpointKey,
   pruneRouteCheckpoints,
   raisedMinClient,
@@ -701,6 +702,50 @@ describe('two games writing one event converge', () => {
     pruneRouteCheckpoints(T0 + 2 * SEC);
     expect([...b.getMap('ship').keys()].filter((k) => k.startsWith('ckpt:'))).toEqual([`ckpt:${route.startedAt}:0:start`]);
   });
+
+  it('two STARTs at once: every game reads the later run, as boards do, whichever route write the merge kept', () => {
+    for (const aKept of [true, false]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      // Of two concurrent writes to one key, the merge keeps the larger client id's.
+      a.clientID = aKept ? 2 : 1;
+      b.clientID = aKept ? 1 : 2;
+      bindShipDoc(a);
+      writeShipRoute(saved());
+      sync(a, b);
+      startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 50, capacity: CAP });
+      bindShipDoc(b);
+      startShipRoute({ now: T0 + SEC, startStop: 1, pilot: 'person', fuel: 50, capacity: CAP });
+      sync(a, b);
+      expect((a.getMap('ship').get('route') as { startedAt: number }).startedAt).toBe(aKept ? T0 : T0 + SEC);
+      for (const d of [a, b]) {
+        bindShipDoc(d);
+        expect(readShipRoute()).toEqual({ ...saved(), startedAt: T0 + SEC, startStop: 1 });
+        expect(readRouteCheckpoints()).toEqual([expect.objectContaining({ kind: 'start', pilot: 'person', stationId: 'st-1' })]);
+      }
+      // The earlier run's writes are dropped, and the finish names the later run.
+      bindShipDoc(a);
+      expect(writeRouteCheckpoint(T0, pauseCheckpoint(saved(), 0, { at: T0 + 2 * SEC })!, T0 + 2 * SEC)).toBe(false);
+      const heard: unknown[] = [];
+      const off = onRouteWritten((n) => heard.push(n));
+      expect(finishShipRoute()).toBe(true);
+      off();
+      expect(heard).toEqual([{ kind: 'finish', run: T0 + SEC }]);
+    }
+  });
+
+  it('a later start entry that names no stop, or sits past RUN_AHEAD_MS, leaves the stored run', () => {
+    const { run, route } = started();
+    const far = T0 + RUN_AHEAD_MS + 1;
+    const ghost: ShipRoute = { ...saved(), startedAt: far, startStop: 1 };
+    map().set(checkpointKey(far, 0, 'start'), checkpointToWire(startCheckpoint(ghost, { at: far, pilot: 'person', fuel: 70 })!));
+    const stray = { ...checkpointToWire(startCheckpoint({ ...ghost, startedAt: T0 + SEC }, { at: T0 + SEC, pilot: 'person', fuel: 70 })!), stationId: 'st-elsewhere' };
+    map().set(checkpointKey(T0 + SEC, 0, 'start'), stray);
+    expect(readShipRoute(T0)).toEqual(route);
+    expect(readShipRoute(T0)!.startedAt).toBe(run);
+    // A clock a little behind the far writer's reads the far run.
+    expect(readShipRoute(T0 + 1)).toMatchObject({ startedAt: far, startStop: 1 });
+  });
 });
 
 // ── STOP and finish ──────────────────────────────────────────────────────────
@@ -722,6 +767,22 @@ describe('STOP and finish', () => {
     expect(stopShipRoute(T0)).toBe(false);
   });
 
+  it("a finish keeps its run's start key: a START from a clock behind that run still gets a later run id", () => {
+    // Rider A's clock runs a minute fast: its run's id is T0 + MIN.
+    writeShipRoute(saved());
+    writeFuelLevel(70, CAP);
+    const first = startShipRoute({ now: T0 + MIN, startStop: 0, pilot: 'person', fuel: 70, capacity: CAP })!;
+    expect(first).toBe(T0 + MIN);
+    expect(writeRouteCheckpoint(first, pauseCheckpoint(readShipRoute()!, 0, { at: T0 + MIN + SEC })!, T0 + MIN + SEC)).toBe(true);
+    expect(stopShipRoute(T0 + MIN + 2 * SEC)).toBe(true);
+    expect(finishShipRoute()).toBe(true);
+    expect(ckptKeys()).toEqual([`ckpt:${first}:0:start`]);
+    // Rider B, whose clock is right, STARTs again 20 s later.
+    const next = startShipRoute({ now: T0 + 20 * SEC, startStop: 0, pilot: 'person', fuel: 70, capacity: CAP });
+    expect(next).toBe(first + 1);
+    expect(ckptKeys()).toEqual([`ckpt:${first + 1}:0:start`]);
+  });
+
   it('finish clears the run and its keys first, then runs the caller writes, in one transaction', () => {
     const { route, start } = started(saved(), 70);
     installRouteFuelMeter({ capacity: () => CAP, clock: () => clock });
@@ -741,7 +802,9 @@ describe('STOP and finish', () => {
     expect(updates.n).toBe(1);
     expect(meterDuringApply).toBe(0);
     expect(readShipRoute()).toEqual(routeWithoutRun(route));
-    expect(ckptKeys()).toEqual([]);
+    // 🏁 Only the run's start key stays: the next run's id goes past it.
+    expect(ckptKeys()).toEqual([`ckpt:${route.startedAt}:0:start`]);
+    expect(readRouteCheckpoints()).toEqual([]);
     expect(readFuelLevel(CAP)).toBe(level);
     expect(fuelDrawDeficit(ROUTE_FUEL_METER)).toBe(0);
     expect(finishShipRoute()).toBe(false);
@@ -1101,7 +1164,7 @@ describe('the copy-back after STOP (A4)', () => {
     expect(settleRouteFlight()).toBe('finish');
     expect(updates.n).toBe(1);
     expect(readShipRoute()).toEqual(routeWithoutRun(route));
-    expect(ckptKeys()).toEqual([]);
+    expect(ckptKeys()).toEqual([`ckpt:${route.startedAt}:0:start`]); // 🏁 the next run's floor
     // The stored records are true again, for every reader old and new.
     expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-1' });
     expect(readResolvedFlight()).toEqual({ status: 'docked', locationId: 'st-1' });

@@ -55,6 +55,7 @@ import {
   passVerdict,
   personDeparts,
   runKeeperPass,
+  skipWhyOf,
   standingHold,
   stayHasDock,
   stayResumed,
@@ -818,6 +819,27 @@ describe('a dock pass over the gate list', () => {
     let calls = 0;
     expect((await pass(e.api, { stillWanted: () => ++calls < 2 })).verdict).toEqual({ kind: 'none', reason: 'stale' });
     expect(e.asked).toHaveLength(1);
+  });
+
+  it('🚚 a stop whose station has moved to another planet is out of reach: skipped as gone, no gate asked', async () => {
+    const d = fakeDocking(clock);
+    const at = (planetId: string) => runKeeperPass({
+      docking: d.api,
+      route,
+      stop: route.stops[1],
+      station: { ...station, planetId },
+      shipRoomId: 'ship-1',
+      mayDock: () => true,
+      stillWanted: () => true,
+      now: clock,
+    });
+    const moved = await at('planet-elsewhere');
+    expect(moved.verdict).toEqual({ kind: 'skip' });
+    expect(skipWhyOf(moved.results)).toBe('gone');
+    expect(moved.results.every((r) => r.kind === 'refused' && r.reason === 'moving')).toBe(true);
+    expect(d.asked).toHaveLength(0);
+    // Still around the planet the route copied: asked as before.
+    expect((await at(route.stops[1].planetId)).verdict.kind).toBe('docked');
   });
 
   it('never re-points a port this rider may not dock', async () => {

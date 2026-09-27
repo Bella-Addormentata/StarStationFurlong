@@ -533,7 +533,7 @@ export function keeperBerths(o: {
  *   shut   the gate is closed, or reserved for another ship
  *   gone   the berth's door, or its port, was removed (and no port can be
  *          fitted there again while every gate number is taken), or its
- *          station is moving between planets
+ *          station is moving between planets (or has moved: runKeeperPass)
  *   rider  a verdict on this game alone: its key (a granted-captains gate),
  *          its pass, or its reach
  *   port   the ship's port itself cannot dock now: the pass stops
@@ -732,7 +732,9 @@ export interface KeeperPassDeps {
   docking: ShipDockingApi;
   route: ShipRoute;
   stop: RouteStop;
-  station: Pick<StationDestination, 'berth' | 'berths'> | null;
+  /** The stop's station in this game's directory (🚚 `planetId`: the planet
+   *  it orbits now), or null when it is not listed. */
+  station: (Pick<StationDestination, 'berth' | 'berths'> & { planetId?: string }) | null;
   shipRoomId: string;
   /** May this game dock the route's port toward `farRoomId` now (its own
    *  rights, or the carve-out)? */
@@ -773,6 +775,16 @@ export async function runKeeperPass(deps: KeeperPassDeps): Promise<{ verdict: Pa
   );
   const own = remembered ? ownStopBerth(deps.stop, remembered.address) : null;
   const berths = keeperBerths({ stop: deps.stop, own, station: deps.station, shipRoomId: deps.shipRoomId });
+  // 🚚 The stop's station has moved to another planet since the route copied
+  // where it orbits (PR 174; a move under way answers DOCK 'moving' itself):
+  // the timetable brings the ferry to where it was, so no gate is in reach.
+  // Every gate counts as that refusal, unasked, and the stop is skipped.
+  const planetId = deps.station?.planetId;
+  if (planetId !== undefined && planetId !== deps.stop.planetId) {
+    const gone = (berth: StationBerth): KeeperGateResult => ({ kind: 'refused', berth, reason: 'moving', cls: 'gone' });
+    const results = (berths.length > 0 ? berths : [ownStopBerth(deps.stop, remembered?.address ?? '')]).map(gone);
+    return { verdict: passVerdict(results, own), results, own };
+  }
   for (const berth of berths) {
     if (!deps.stillWanted()) return { verdict: { kind: 'none', reason: 'stale' }, results, own };
     const plan = planArrivalDock({
@@ -821,10 +833,10 @@ export interface RouteKeeperDeps {
   /** Is `roomId` part of the stop's station? Default: the stop's berth room,
    *  or a room the atlas joins to it. */
   sameStation?: (stop: RouteStop, roomId: string) => boolean;
-  /** The stop's station in this game's directory (its gates), or null.
-   *  Default: the directory entry for the stop's id, else for its berth
-   *  room's station. */
-  station?: (stop: RouteStop) => Pick<StationDestination, 'berth' | 'berths'> | null;
+  /** The stop's station in this game's directory (its gates, and 🚚 the
+   *  planet it orbits now), or null. Default: the directory entry for the
+   *  stop's id, else for its berth room's station. */
+  station?: (stop: RouteStop) => KeeperPassDeps['station'];
   /** Release the ship's other guest berths (not dock ports) this player may
    *  release — the transient-berth detach PR 172's DEPART does. */
   detachGuestBerths?: () => void;
@@ -1045,7 +1057,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
     const k = keeperMode(docking);
     const lastVerdict = mem.verdict;
     const sameStation = samePredicate();
-    let station: Pick<StationDestination, 'berth' | 'berths'> | null = null;
+    let station: KeeperPassDeps['station'] = null;
     try {
       station = stationOf(stop);
     } catch (err) {

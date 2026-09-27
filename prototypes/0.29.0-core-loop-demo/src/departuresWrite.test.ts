@@ -200,6 +200,54 @@ describe('the departures publisher', () => {
     expect(g.calls).toHaveLength(0);
   });
 
+  it('⛽ a tank fitted or taken off while the route runs republishes the capacity, from the game that edits the ship', async () => {
+    let cap = 100;
+    let editor = true;
+    const h = harness({ capacity: () => cap, editsShip: () => editor });
+    // The check, then the gesture's publish: one timer hop each.
+    const settle = async () => { await h.tick(); await h.tick(); };
+    // Joining the room: the first reading publishes nothing, nor does a
+    // furniture change that leaves the tanks alone.
+    h.p.tanksChanged();
+    await settle();
+    h.p.tanksChanged();
+    await settle();
+    expect(h.calls).toHaveLength(0);
+    cap = 200; // a second tank
+    h.p.tanksChanged();
+    expect(h.calls).toHaveLength(0); // read once the change has settled
+    await settle();
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-0']);
+    await h.answer(0, 'written');
+    expect(h.calls.map((c) => c.pub.capacity)).toEqual([200, 200, 200]);
+    expect(h.calls[0].pub.checkpoints.map((e) => e.kind)).toEqual(['start']);
+    for (const i of [1, 2]) await h.answer(i, 'written');
+    // A rider's game that does not edit the ship leaves it to the one that does.
+    editor = false;
+    cap = 100;
+    h.p.tanksChanged();
+    await settle();
+    expect(h.calls).toHaveLength(3);
+    // With no run on, no board shows the ferry's legs.
+    editor = true;
+    h.setRoute({ ...running(), startedAt: undefined, startStop: undefined });
+    cap = 300;
+    h.p.tanksChanged();
+    await settle();
+    expect(h.calls).toHaveLength(3);
+    // A publish tells the boards the capacity it carries: no second one for it.
+    cap = 400;
+    h.setRoute(running());
+    h.p.routeWritten({ kind: 'start', legSeq: 0 });
+    await h.tick();
+    await h.answer(3, 'written');
+    for (const i of [4, 5]) await h.answer(i, 'written');
+    expect(h.calls.slice(3).map((c) => c.pub.capacity)).toEqual([400, 400, 400]);
+    h.p.tanksChanged();
+    await settle();
+    expect(h.calls).toHaveLength(6);
+  });
+
   it('the finish after STOP publishes the route running no more, with no checkpoints', async () => {
     const h = harness();
     const { startedAt: _a, startStop: _b, ...finished } = running();

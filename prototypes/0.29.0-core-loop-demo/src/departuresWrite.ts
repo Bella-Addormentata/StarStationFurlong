@@ -21,8 +21,10 @@
  * them from shipRoute.onRouteWritten, waits for the gesture to end (one
  * helm press may write several entries), and sends one snapshot of the whole
  * route and run: the stop the change concerns first, every other stop once
- * that one has answered. On-time legs publish nothing: every board works the
- * timetable out from the clock.
+ * that one has answered. ⛽ So does a tank fitted or taken off while the
+ * route runs, from the game that edits the ship (tanksChanged): the boards
+ * work every leg out with the capacity a snapshot carries. On-time legs
+ * publish nothing: every board works the timetable out from the clock.
  *
  * Best effort, like the far dock write: per berth room one session at a
  * time, and only each ferry's NEWEST snapshot waits behind it (a hold
@@ -193,6 +195,10 @@ export interface DeparturesPublisherDeps {
   /** A pass this game holds for a room, or undefined. */
   seedFor: (roomId: string) => string | undefined;
   write: (address: string, pub: DeparturesPublish) => Promise<DeparturesWriteResult>;
+  /** ⛽ Does this game edit the ship's parts (the room's owner: editMode's
+   *  gate)? Only it republishes a change of the tanks (tanksChanged), so a
+   *  change goes out once, not once per rider. Default: yes. */
+  editsShip?: () => boolean;
   clock?: () => number;
   /** setTimeout (tests pass their own). */
   later?: (fn: () => void, ms: number) => void;
@@ -201,6 +207,9 @@ export interface DeparturesPublisherDeps {
 export interface DeparturesPublisher {
   /** Hear one of this game's route writes (shipRoute.onRouteWritten). */
   routeWritten: (n: RouteWriteNotice) => void;
+  /** ⛽ Hear a change to the room's furniture: a tank fitted or taken off
+   *  changes the capacity every board works the timetable out with. */
+  tanksChanged: () => void;
   /** Rooms with a publish in flight or waiting (tests). */
   busyRooms: () => string[];
 }
@@ -231,6 +240,8 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
    *  room at a time. */
   const rooms = new Map<string, RoomState>();
   let pending: { ship: string; legSeq: number | null; endedRun?: number } | null = null;
+  /** ⛽ Per ferry, the capacity this game last saw (or published). */
+  const tanksSeen = new Map<string, number>();
 
   const stateOf = (room: string, ship: string): RoomState => {
     const key = `${room}\n${ship}`;
@@ -296,10 +307,12 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     if (!ship || ship !== p.ship) return;
     const route = d.route();
     if (!route) return;
+    const capacity = d.capacity();
+    tanksSeen.set(ship, capacity);
     const pub: DeparturesPublish = {
       shipRoomId: ship,
       name: d.shipName(),
-      capacity: d.capacity(),
+      capacity,
       route,
       checkpoints: isRouteRunning(route) ? [...d.checkpoints()] : [],
       at: clock(),
@@ -314,20 +327,42 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     });
   };
 
+  /** Publish once the gesture has ended: several writes in one gesture
+   *  send one snapshot, and the first that names a stay names the stop. */
+  const want = (ship: string, legSeq: number | null, ended?: number): void => {
+    if (pending && pending.ship === ship) {
+      if (pending.legSeq === null && legSeq !== null) pending.legSeq = legSeq;
+      if (ended !== undefined) pending.endedRun = ended;
+      return;
+    }
+    pending = { ship, legSeq, ...(ended !== undefined ? { endedRun: ended } : {}) };
+    later(flush, 0);
+  };
+
+  /** ⛽ The boards hold the capacity of the last publish, and a board works
+   *  every leg out with it (where the fuel runs out, the home refill). A
+   *  running route's timetable follows the tanks fitted now, so when they
+   *  change, the game that edits the ship sends a snapshot with the new
+   *  capacity. Read once the change has settled (every furniture listener
+   *  has run); the first reading of a ferry is only noted. */
+  const checkTanks = (): void => {
+    const ship = d.shipRoomId();
+    if (!ship) return;
+    const capacity = d.capacity();
+    const seen = tanksSeen.get(ship);
+    tanksSeen.set(ship, capacity);
+    if (seen === undefined || seen === capacity) return;
+    if (!isRouteRunning(d.route()) || !(d.editsShip?.() ?? true)) return;
+    want(ship, null);
+  };
+
   return {
     routeWritten: (n) => {
       const ship = d.shipRoomId();
       if (!ship) return;
-      const ended = n.kind === 'finish' && n.run !== undefined ? n.run : undefined;
-      if (pending && pending.ship === ship) {
-        // Several writes in one gesture: the first names the stop.
-        if (pending.legSeq === null && n.legSeq !== undefined) pending.legSeq = n.legSeq;
-        if (ended !== undefined) pending.endedRun = ended;
-        return;
-      }
-      pending = { ship, legSeq: n.legSeq ?? null, ...(ended !== undefined ? { endedRun: ended } : {}) };
-      later(flush, 0);
+      want(ship, n.legSeq ?? null, n.kind === 'finish' && n.run !== undefined ? n.run : undefined);
     },
+    tanksChanged: () => later(checkTanks, 0),
     busyRooms: () => [...new Set([...rooms.values()].filter((st) => st.busy || st.waiting !== null).map((st) => st.room))],
   };
 }

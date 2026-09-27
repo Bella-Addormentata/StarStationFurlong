@@ -21,7 +21,10 @@
  * the two values: the room converges. An event at a later stay has another
  * key, so a late write about an old stay never overwrites a newer one. START
  * deletes every other run's keys in its own transaction, and a writer whose
- * run is no longer route.startedAt drops its write.
+ * run is no longer route.startedAt drops its write. 🏁 Run ids only go up:
+ * START moves its id past every run key still in the map, and a finish
+ * keeps its run's start key for that; of two STARTs at once, every reader
+ * takes the later run (laterRuns), as the departures boards do.
  *
  * A route COPIES what it needs from each stop (planet, orbit slot, berth
  * room and door, gate): station lists and ids are kept per install, and two
@@ -525,6 +528,8 @@ interface CheckpointScan {
   keys: Map<RouteCheckpoint, string>;
   /** Keys of other runs (START and pruning delete them). */
   otherRuns: string[];
+  /** 🏁 Well-formed start entries of runs later than the one scanned for. */
+  laterStarts: Array<{ run: number; entry: StartCheckpoint }>;
 }
 
 /** Stay order, then kind order: how every reader sorts a run's entries. */
@@ -554,7 +559,7 @@ export function capCheckpoints(entries: readonly RouteCheckpoint[], max: number)
 }
 
 function scanCheckpoints(map: Y.Map<unknown>, run: number | null, maxKeys: number, maxVisits: number): CheckpointScan {
-  const out: CheckpointScan = { entries: [], keys: new Map(), otherRuns: [] };
+  const out: CheckpointScan = { entries: [], keys: new Map(), otherRuns: [], laterStarts: [] };
   let visited = 0;
   const found: RouteCheckpoint[] = [];
   for (const key of map.keys()) {
@@ -563,7 +568,14 @@ function scanCheckpoints(map: Y.Map<unknown>, run: number | null, maxKeys: numbe
     const parsed = parseCheckpointKey(key);
     // An unparseable key may be a newer client's: left alone.
     if (!parsed) continue;
-    if (parsed.run !== run) { out.otherRuns.push(key); continue; }
+    if (parsed.run !== run) {
+      out.otherRuns.push(key);
+      if (run !== null && parsed.run > run && parsed.kind === 'start') {
+        const entry = checkpointFromWire('start', parsed.legSeq, map.get(key));
+        if (entry?.kind === 'start') out.laterStarts.push({ run: parsed.run, entry });
+      }
+      continue;
+    }
     const entry = checkpointFromWire(parsed.kind, parsed.legSeq, map.get(key));
     if (!entry) continue;
     found.push(entry);
@@ -585,8 +597,14 @@ subscribeShip(() => { docVersion++; });
 interface Snapshot {
   version: number;
   doc: Y.Doc | null;
-  route: ShipRoute | null;
-  checkpoints: readonly RouteCheckpoint[];
+  map: Y.Map<unknown> | null;
+  /** The route as the ship map stores it. */
+  stored: ShipRoute | null;
+  /** 🏁 The runs a START began after the stored one's, newest first, each
+   *  as the route reads while it flies (see laterRuns). */
+  later: ShipRoute[];
+  /** Each run's checkpoints, scanned when first read. */
+  checkpoints: Map<number, readonly RouteCheckpoint[]>;
   /** The same route without its run: what it reads as while its run's
    *  stamps sit past RUN_AHEAD_MS (kept, so the object stays the same). */
   unran: ShipRoute | null;
@@ -609,26 +627,63 @@ function runTooFarAhead(route: ShipRoute | null, now: number): boolean {
   return route.startedAt > now + RUN_AHEAD_MS || (route.stoppedAt !== undefined && route.stoppedAt > now + RUN_AHEAD_MS);
 }
 
+/**
+ * 🏁 Two STARTs at once (two riders' games, before either saw the other's)
+ * each write the whole route, and the merge keeps ONE of the two writes by
+ * the games' client ids, not by which run is later. Each START's own start
+ * entry is a key of its own, so both survive. Every reader here, like every
+ * departures board (departuresDoc.departureRouteNewer: the larger run id),
+ * takes the LATER run: the stored route with that run's id, starting at the
+ * stop its start entry names (the stored start stop when it names the same
+ * station), not stopped. A STOP or checkpoint then writes it as that run,
+ * and the earlier run's keys go at the next prune. A start entry naming no
+ * stop of the route is ignored.
+ */
+function laterRuns(stored: ShipRoute & { startedAt: number }, starts: CheckpointScan['laterStarts']): ShipRoute[] {
+  const out: ShipRoute[] = [];
+  for (const { run, entry } of [...starts].sort((a, b) => b.run - a.run)) {
+    const same = stored.startStop !== undefined && stored.stops[stored.startStop]?.stationId === entry.stationId;
+    const startStop = same ? stored.startStop! : stored.stops.findIndex((st) => st.stationId === entry.stationId);
+    if (startStop >= 0) out.push({ ...routeWithoutRun(stored), startedAt: run, startStop });
+  }
+  return out;
+}
+
 function snapshot(): Snapshot {
   const h = shipDocHandle();
   const doc = h?.doc ?? null;
   if (snap && snap.version === docVersion && snap.doc === doc) return snap;
-  let route: ShipRoute | null = null;
-  let checkpoints: readonly RouteCheckpoint[] = [];
+  let stored: ShipRoute | null = null;
+  let later: ShipRoute[] = [];
+  const checkpoints = new Map<number, readonly RouteCheckpoint[]>();
   if (h) {
-    route = shipRouteFromWire(h.map.get('route'));
-    if (isRouteRunning(route)) {
-      checkpoints = scanCheckpoints(h.map, route.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED).entries;
+    stored = shipRouteFromWire(h.map.get('route'));
+    if (isRouteRunning(stored)) {
+      const scan = scanCheckpoints(h.map, stored.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED);
+      checkpoints.set(stored.startedAt, scan.entries);
+      later = laterRuns(stored, scan.laterStarts);
     }
   }
-  snap = { version: docVersion, doc, route, checkpoints, unran: isRouteRunning(route) ? routeWithoutRun(route) : route };
+  snap = {
+    version: docVersion, doc, map: h?.map ?? null, stored, later, checkpoints,
+    unran: isRouteRunning(stored) ? routeWithoutRun(stored) : stored,
+  };
   return snap;
 }
 
-/** The snapshot as of `now`: a run stamped past RUN_AHEAD_MS reads as none. */
+/** The snapshot as of `now`: the latest run not stamped past RUN_AHEAD_MS
+ *  (🏁 laterRuns), or, when there is none, no run. */
 function current(now: number): { route: ShipRoute | null; checkpoints: readonly RouteCheckpoint[] } {
   const s = snapshot();
-  return runTooFarAhead(s.route, now) ? { route: s.unran, checkpoints: [] } : s;
+  if (!isRouteRunning(s.stored)) return { route: s.stored, checkpoints: [] };
+  const route = [...s.later, s.stored].find((r) => !runTooFarAhead(r, now));
+  if (!route || !isRouteRunning(route)) return { route: s.unran, checkpoints: [] };
+  let checkpoints = s.checkpoints.get(route.startedAt);
+  if (!checkpoints) {
+    checkpoints = s.map ? scanCheckpoints(s.map, route.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED).entries : [];
+    s.checkpoints.set(route.startedAt, checkpoints);
+  }
+  return { route, checkpoints };
 }
 
 /** The ship's route, or null (none, unbound, or malformed). */
@@ -873,12 +928,20 @@ export function pruneRouteCheckpoints(now = Date.now()): number {
  * meter reads 0, then run `apply` — the caller's writes of the derived flight
  * and fuel (writeFlightRecord, writeFuelLevel), which join this transaction.
  * Compute what `apply` writes before calling. Returns whether a run ended.
+ *
+ * 🏁 The ended run's START entry stays (nothing reads it while no run is on):
+ * a run id is its START's clock, and the next START moves its id past every
+ * run key still in the map, so a rider whose clock is behind the one that
+ * started this run still starts a LATER run, which every board ranks above
+ * this finish. That START deletes it.
  */
 export function finishShipRoute(apply?: () => void): boolean {
   const h = shipDocHandle();
   const route = readShipRoute();
   if (!h || !isRouteRunning(route)) return false;
-  const keys = scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns;
+  const floor = checkpointKey(route.startedAt, 0, 'start');
+  const keys = scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns
+    .filter((key) => key !== floor);
   h.doc.transact(() => {
     h.map.set('route', routeToWire(routeWithoutRun(route)));
     for (const key of keys) h.map.delete(key);
