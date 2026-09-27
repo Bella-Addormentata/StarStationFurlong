@@ -116,6 +116,8 @@ export const MAX_ENTRIES = 64;
  *  consumer walks it (atlasLayout, the exterior, the CONNECT matcher's claim
  *  scan), so without this one entry could carry an arbitrarily large set. */
 export const MAX_DOORS_PER_ENTRY = 64;
+/** ⚓🚦 Most shared-atlas entries withSharedAtlasOf reads from one room doc. */
+const MAX_SHARED_SCAN = 256;
 /** Raw `doors` keys a shared entry may carry before the whole entry is refused
  *  at ingest. An honest publisher never exceeds MAX_DOORS_PER_ENTRY (it pushes
  *  what readAllDoors read); the slack tolerates junk keys among real ones
@@ -538,6 +540,57 @@ export function freeGateNumber(
   for (const g of stationGates(atlas, roomId)) if (g.roomId !== roomId) taken.add(g.gate);
   for (let g = 1; g <= MAX_GATE_NUMBER; g++) if (!taken.has(g)) return g;
   return null;
+}
+
+/**
+ * ⚓🚦 `atlas` with a room doc's shared atlas folded in, for gate numbering in
+ * a room this client may never have visited (a far DOCK's port). A room the
+ * local atlas lacks comes from the doc; a known room gains the doc's gates when
+ * it has none, and any door pairing it lacks, so the station walk and the
+ * numbers taken both see what the far station has already published. Local
+ * knowledge wins wherever it exists. Peer entries are shape-checked and
+ * capped as pullSharedAtlas does. Pure: nothing is written.
+ */
+export function withSharedAtlasOf(
+  doc: Y.Doc,
+  atlas: Record<string, AtlasEntry>,
+): Record<string, AtlasEntry> {
+  const out: Record<string, AtlasEntry> = { ...atlas };
+  let seen = 0;
+  for (const [rid, value] of doc.getMap('atlas').entries()) {
+    if (++seen > MAX_SHARED_SCAN) break;
+    if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
+    const doors: Record<string, AtlasDoor> = {};
+    let kept = 0;
+    for (const [d, door] of Object.entries(value.doors)) {
+      if (kept >= MAX_DOORS_PER_ENTRY) break;
+      if (!door || typeof door.targetRoomId !== 'string' || !door.targetRoomId) continue;
+      doors[d] = {
+        targetSeed: '',
+        targetRoomId: door.targetRoomId,
+        segments: door.segments,
+        farDoor: door.farDoor,
+        ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
+      };
+      kept++;
+    }
+    const gates = value.gates !== undefined ? cleanGates(value.gates) : undefined;
+    const prior = out[rid];
+    if (!prior) {
+      out[rid] = {
+        roomId: rid,
+        name: value.name || 'Module',
+        doors,
+        ...(gates ? { gates } : {}),
+        lastSeen: value.updatedAt,
+      };
+      continue;
+    }
+    const merged: AtlasEntry = { ...prior, doors: { ...doors, ...prior.doors } };
+    if (prior.gates === undefined && gates) merged.gates = gates;
+    out[rid] = merged;
+  }
+  return out;
 }
 
 // ── 🪐 Connected components — what a STATION is ──────────────────────────────

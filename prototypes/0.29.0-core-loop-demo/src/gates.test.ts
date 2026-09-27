@@ -14,6 +14,7 @@ import {
   nextFreeGate,
   readGateAccess,
   readDockGates,
+  readUnnumberedPorts,
   readDoorPolicy,
   writeDoorPolicy,
 } from './doorPolicy';
@@ -92,6 +93,27 @@ describe('the gate on a dock port', () => {
     // An existing port keeps its number.
     fitDockPortIn(far, 'south', 9);
     expect(dockGatesIn(far)).toEqual({ south: 7 });
+  });
+
+  it('counts only ports on doors the room has', () => {
+    const far = new Y.Doc();
+    far.getMap('doorLayout').set('south', { id: 'south', wall: 'y+', lateral: 0, placed: true });
+    fitDockPortIn(far, 'south', 2);
+    far.getMap('doorPolicy').set('d:phantom1', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    expect(dockGatesIn(far)).toEqual({ south: 2 });
+  });
+
+  it("lists no gate on a door the room's layout has removed", () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    // The layout is authoritative once it holds records: only 'north' remains.
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    doc.getMap('doorPolicy').set('south', { passage: 'public', construction: 'owner', adapter: true, gate: 2, gateAccess: 'closed' });
+    doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
+    expect(readDockGates()).toEqual({ north: 1 });
+    expect(readGateAccess()).toEqual({});
+    expect(readUnnumberedPorts()).toEqual([]);
   });
 
   it('takes the lowest number free in the station', () => {
@@ -260,6 +282,27 @@ describe('the per-planet summary', () => {
     // Unchanged gates change nothing.
     expect(foldOwnStation(next, here, null, T0 + 120_000)).toBeNull();
   });
+
+  it("replaces only the gates of the room the visitor stands in", () => {
+    const known = base({
+      berths: [{ roomId: 'room-a', doorId: 'west', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+      berthsAt: T0,
+    });
+    // An old atlas still shows room-a's port as gate 5; only room-b is first-hand.
+    const here = {
+      id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-b', derived: true as const,
+      berths: [
+        { roomId: 'room-a', doorId: 'west', gate: 5 },
+        { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
+      ],
+    };
+    const next = foldOwnStation(known, here, null, T0 + 60_000, 'room-b')!;
+    expect(next.berths).toEqual([
+      { roomId: 'room-a', doorId: 'west', gate: 1 },
+      { roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 },
+    ]);
+    expect(foldOwnStation(next, here, null, T0 + 120_000, 'room-b')).toBeNull();
+  });
 });
 
 describe('ship destinations', () => {
@@ -278,6 +321,15 @@ describe('ship destinations', () => {
     ]);
     // The public berth names its gate.
     expect(dest.berth).toEqual({ address: seed('room-b'), farDoor: 'south', gate: 2, occupied: true });
+  });
+
+  it('drops a public berth that is not one of the listed gates', () => {
+    const [dest] = destinationsFromRecords([{
+      id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b', berthDoor: 'west',
+      berths: [{ roomId: 'room-c', doorId: 'east', gate: 3 }],
+    }], (room) => (room === 'room-c' ? undefined : seed(room)));
+    expect(dest.berths).toEqual([]);
+    expect(dest.berth).toBeUndefined();
   });
 });
 

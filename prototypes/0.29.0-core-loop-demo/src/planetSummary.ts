@@ -44,7 +44,7 @@ import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
-import { MAX_ORBIT_SLOTS, cleanBerths, listStations, planetById, readStationRecords, registerStation, removeStation } from './stations';
+import { MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation } from './stations';
 import type { StationBerthRecord, StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
@@ -388,6 +388,7 @@ export function foldOwnStation(
   station: StationRecord,
   trim: OrbitTrim | null,
   now: number,
+  firstHandRoom?: string,
 ): StationSummary | null {
   const mine = summaryForStation(station, trim, now);
   const owned = isOwned(station);
@@ -403,15 +404,35 @@ export function foldOwnStation(
   const applies = cleanTrim(trimFor(base, trim));
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);
-  // Gates: what this client's atlas lists goes out whenever it differs from
-  // what is known, stamped past it — any visitor's live atlas is first-hand.
-  const gates = mine.berths && JSON.stringify(mine.berths) !== JSON.stringify(base.berths)
-    ? { berths: mine.berths, berthsAt: Math.min(Math.max(now, (base.berthsAt ?? 0) + 1), now + MAX_SKEW_MS) }
+  // Gates: only the room this client stands in is first-hand; its other rooms
+  // may be old atlas data or gossip. So once a list is known, only that room's
+  // part of it is replaced (and a new list goes out stamped past the known
+  // one); a station with no known list takes this client's whole one.
+  const listed = mine.berths && base.berths && firstHandRoom !== undefined
+    ? firstHandBerths(base.berths, mine.berths, firstHandRoom)
+    : mine.berths;
+  const gates = listed && JSON.stringify(listed) !== JSON.stringify(base.berths)
+    ? { berths: listed, berthsAt: Math.min(Math.max(now, (base.berthsAt ?? 0) + 1), now + MAX_SKEW_MS) }
     : base.berths ? { berths: base.berths, berthsAt: base.berthsAt } : {};
   const { trim: _unused, move: _unusedMove, berths: _b, berthsAt: _ba, ...rest } = base;
   return mergeStation(known, {
     ...rest, ...(applies ? { trim: applies } : {}), ...(move ? { move } : {}), ...gates,
   });
+}
+
+/** ⚓🚦 `known` with `room`'s gates swapped for the ones `mine` lists there,
+ *  in gate order (unnumbered berths last); every other room's stay as known. */
+function firstHandBerths(
+  known: StationBerthRecord[],
+  mine: StationBerthRecord[],
+  room: string,
+): StationBerthRecord[] {
+  const out = [...known.filter((b) => b.roomId !== room), ...mine.filter((b) => b.roomId === room)];
+  const order = (b: StationBerthRecord) => b.gate ?? Number.MAX_SAFE_INTEGER;
+  out.sort((a, b) => order(a) - order(b)
+    || (a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0)
+    || (a.doorId < b.doorId ? -1 : a.doorId > b.doorId ? 1 : 0));
+  return cleanBerths(out);
 }
 
 // ── Learned stations → station records ───────────────────────────────────────
@@ -584,7 +605,7 @@ export function publishPlanetSummary(now = Date.now()): void {
   const store = readStore(now);
   const here = ctx.currentStation();
   if (here && here.welcomeRoomId && here.welcomeRoomId.length <= MAX_ID_LEN) {
-    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, ctx.localTrim(), now);
+    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, ctx.localTrim(), now, currentRoomId() || undefined);
     if (next) store.stations[here.welcomeRoomId] = next;
   }
   const ship = ctx.ship();

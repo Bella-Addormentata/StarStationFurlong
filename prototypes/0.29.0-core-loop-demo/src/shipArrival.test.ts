@@ -553,6 +553,23 @@ describe('arrival gates', () => {
       expect(await s.promise).toMatchObject({ kind: 'docked', gate: 2 });
     });
 
+    it('reports the gate another commander docked the ship at meanwhile', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
+      const base = fakeDocking(['north']);
+      const docking = {
+        ...base,
+        // Gate 1 refuses, and while it does another commander docks at gate 2.
+        dock: async (doorId: string) => {
+          writeDoorTombstone(doorId, SEED_GATE_ROOM, { farDoor: 'west', undockedAt: 3000 });
+          base.dock(doorId);
+          return false;
+        },
+      };
+      const s = settled();
+      completeArrival(docking, { onSettled: s.onSettled });
+      expect(await s.promise).toEqual({ kind: 'docked', stationName: 'High Orbit', gate: 2 });
+    });
+
     it('says so when every gate refuses, and leaves the ship arrived undocked', async () => {
       arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
       const docking = gatedDocking(['east', 'west']);

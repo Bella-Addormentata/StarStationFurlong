@@ -268,16 +268,13 @@ export function destinationsFromRecords(
         ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
       });
     }
-    if (Array.isArray(r.berths) && r.berths.length === 0) {
-      // ⚓🚦 Known to have no gates (its last port was removed): no berth,
-      // not even the old public one.
-      out.berths = [];
-      delete out.berth;
-    } else if (gates.length > 0) {
+    if (Array.isArray(r.berths)) {
+      // ⚓🚦 The record knows its gates: these are the berths (none, when its
+      // last port was removed or this client holds no pass for any), and the
+      // old public berth stands only as one of them, naming its gate.
       out.berths = gates;
-      // The public berth names its gate when it is one of them.
       const same = out.berth && gates.find((g) => g.farDoor === out.berth!.farDoor && g.address === out.berth!.address);
-      if (same) out.berth = same;
+      if (same) out.berth = same; else delete out.berth;
     }
     return out;
   });

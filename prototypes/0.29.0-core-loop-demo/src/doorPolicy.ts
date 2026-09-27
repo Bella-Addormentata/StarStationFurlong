@@ -25,7 +25,7 @@
  */
 
 import * as Y from 'yjs';
-import { hasDoorLayout } from './doorLayoutDoc';
+import { doorExistsIn, hasDoorLayout } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -213,7 +213,7 @@ export function readGateAccess(): Record<string, GateAccessRecord> {
   let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
     if (++n > 256) break;
-    if (!isKnownDoorId(doorId)) continue;
+    if (!doorExistsIn(boundDoc!, doorId)) continue; // a door the layout has
     const a = accessRecord(sanitizePolicy(value));
     if (a) out[doorId] = a;
   }
@@ -265,11 +265,26 @@ export function readDockGates(): Record<string, number> {
   let n = 0;
   for (const [doorId, value] of policyMap!.entries()) {
     if (++n > 256) break;
-    if (!isKnownDoorId(doorId)) continue;
+    if (!doorExistsIn(boundDoc!, doorId)) continue; // a door the layout has
     const p = sanitizePolicy(value);
     if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;
+}
+
+/** ⚓🚦 This room's ports that carry no gate number yet (fitted before gates
+ *  existed), by door id, in id order. */
+export function readUnnumberedPorts(): string[] {
+  const out: string[] = [];
+  if (!docAlive()) return out;
+  let n = 0;
+  for (const [doorId, value] of policyMap!.entries()) {
+    if (++n > 256) break;
+    if (!doorExistsIn(boundDoc!, doorId)) continue; // a door the layout has
+    const p = sanitizePolicy(value);
+    if (p.adapter && p.gate === undefined) out.push(doorId);
+  }
+  return out.sort();
 }
 
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
@@ -280,7 +295,9 @@ export function dockGatesIn(doc: Y.Doc): Record<string, number> {
   for (const [doorId, value] of doc.getMap('doorPolicy').entries()) {
     if (++n > 256) break;
     const p = sanitizePolicy(value);
-    if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
+    // Only doors the room's layout has: a peer's policy for a door that does
+    // not exist must not use up gate numbers.
+    if (p.adapter && p.gate !== undefined && doorExistsIn(doc, doorId)) out[doorId] = p.gate;
   }
   return out;
 }

@@ -64,6 +64,7 @@ import {
   initiateChainRefusal,
   stampAfter,
   FAR_DOCK_REFUSAL,
+  gateAdmits,
   type DockAnswer,
   type DockOpOptions,
   type DockPortState,
@@ -3091,6 +3092,15 @@ export class DoorDockingPortSystem {
         return settled ? { ok: true, dockedAt } : { ok: false, reason: "changed" };
       }
     }
+    // ⚓🚦 The far room could not answer, so its gate could not admit us:
+    // dock one-sided only where this client's atlas knows the gate is open
+    // (or knows nothing of it). A gate for granted captains cannot be
+    // checked from here, so it waits for the far room too.
+    const knownAccess = !far?.ok && farDoor ? readAtlas()[port.roomId]?.gateAccess?.[farDoor] : undefined;
+    if (knownAccess && !gateAdmits(knownAccess, roomId, false)) {
+      this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL["not-allowed"], tone: "bad" }, roomId);
+      return { ok: false, reason: "not-allowed", gateAccess: knownAccess.access };
+    }
     const next = redockRecord(port, dockedAt);
     writeDoorPairing(doorId, next.connectedRoomAddress, next);
     this.setDockOp(
@@ -3228,7 +3238,7 @@ export class DoorDockingPortSystem {
     const clash = gate !== undefined && stationGates(readAtlas(), roomId)
       .some((g) => g.gate === gate && !(g.roomId === roomId && g.doorId === doorId));
     const gateBtn = (dir: "down" | "up", label: string) =>
-      `<button type="button" data-dock-action="gate-${dir}" title="${dir === "up" ? "Next" : "Previous"} gate number" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${label}</button>`;
+      `<button type="button" data-dock-action="gate-${dir}" title="${dir === "up" ? "Next" : "Previous"} gate number" aria-label="${dir === "up" ? "Next" : "Previous"} gate number" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${label}</button>`;
     const policyNow = readDoorPolicy(doorId);
     const accessLabel =
       policyNow.gateAccess === "closed" ? "CLOSED"

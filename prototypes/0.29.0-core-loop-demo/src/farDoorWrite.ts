@@ -33,7 +33,7 @@ import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
 import { dockGatesIn, dockPortFlagIn, fitDockPortIn, gateAccessIn } from './doorPolicy';
-import { freeGateNumber, readAtlas, roomIdFromSeed } from './stationAtlas';
+import { freeGateNumber, readAtlas, roomIdFromSeed, withSharedAtlasOf } from './stationAtlas';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
   farDockPatch, farUndockPatch, findFarDoor, holdsDockTo, type NearEnd,
@@ -90,9 +90,13 @@ export function applyFarDockRequest(
     };
   }
   // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate; with
-  // every number taken, neither record is written.
+  // every number taken, neither record is written. The far doc's shared atlas
+  // is read too: on a first visit this client's own atlas may not know the far
+  // station's other rooms or the gates they already use.
   const newPort = !dockPortFlagIn(doc, req.farDoor);
-  const gate = newPort ? freeGateNumber(readAtlas(), farRoomOf(req.farAddress), dockGatesIn(doc)) : null;
+  const gate = newPort
+    ? freeGateNumber(withSharedAtlasOf(doc, readAtlas()), farRoomOf(req.farAddress), dockGatesIn(doc))
+    : null;
   if (newPort && gate === null) {
     return { result: { ok: false, reason: 'no-gate' }, wrote: false };
   }

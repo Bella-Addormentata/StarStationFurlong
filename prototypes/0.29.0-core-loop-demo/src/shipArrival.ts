@@ -443,6 +443,21 @@ export function completeArrival(
   return { kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) };
 }
 
+/** ⚓🚦 The gate of the station berth a port is docked at, matched by room
+ *  and far door; undefined when none matches for certain. */
+function dockedGate(ports: readonly ArrivalPort[], candidates: readonly StationBerth[]): number | undefined {
+  for (const p of ports) {
+    if (p.state.kind !== 'docked') continue;
+    const { address, record } = p.state;
+    const inRoom = candidates.filter((b) => b.gate !== undefined && sameRoom(address, b.address));
+    const exact = record.farDoor ? inRoom.find((b) => b.farDoor === record.farDoor) : undefined;
+    // Without the far door, a room's gate is only certain when it has one.
+    const berth = exact ?? (!record.farDoor && inRoom.length === 1 ? inRoom[0] : undefined);
+    if (berth) return berth.gate;
+  }
+  return undefined;
+}
+
 /**
  * ⚓🚦 DOCK at the planned berth; when the far berth refuses (taken, or its
  * room out of reach), try the next berth in arrivalBerths order, re-planned
@@ -467,9 +482,13 @@ async function dockThroughBerths(
       ? first
       : planArrivalDock({ station, remembered, ports: docking.ports(), berth: candidates[i], shipRoomId });
     if (plan.kind === 'none') {
-      onSettled?.(plan.reason === 'already-docked'
-        ? { kind: 'docked', stationName: station.name }
-        : { kind: 'none', stationName: station.name, reason: plan.reason });
+      if (plan.reason === 'already-docked') {
+        // Another commander docked the ship meanwhile: report the gate it got.
+        const gate = dockedGate(docking.ports(), candidates);
+        onSettled?.({ kind: 'docked', stationName: station.name, ...(gate !== undefined ? { gate } : {}) });
+      } else {
+        onSettled?.({ kind: 'none', stationName: station.name, reason: plan.reason });
+      }
       return;
     }
     if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
