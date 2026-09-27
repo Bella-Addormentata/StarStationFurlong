@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
-import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
+import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter, type DockAnswer } from './dockRules';
 import {
   bindDoorsDoc,
   buildDoorPairing,
@@ -570,5 +570,20 @@ describe('what the helm hears after an arrival DOCK', () => {
   it('refused, when the berth is taken — not a green "docking" note left standing', async () => {
     expect(await arrive(false)).toEqual({ kind: 'none', stationName: 'Furlong Station', reason: 'berths-taken' });
     expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
+  });
+
+  // 🚏 A5: docking.ts redockPortAnswer says why, and the helm says so too.
+  const answer = (a: DockAnswer) => {
+    const docking = { ...fakeDocking(['north']), dock: async () => a };
+    fly('high-orbit', 'furlong-station');
+    return new Promise<ArrivalOutcome>((resolve) => { completeArrival(docking, { onSettled: resolve }); });
+  };
+
+  it('occupied, unreachable or gone, when the berth said which', async () => {
+    expect(await answer({ ok: true, dockedAt: 5 })).toEqual({ kind: 'docked', stationName: 'Furlong Station' });
+    expect(await answer({ ok: false, reason: 'occupied' })).toMatchObject({ kind: 'none', reason: 'occupied' });
+    expect(await answer({ ok: false, reason: 'not-allowed', gateAccess: 'closed' })).toMatchObject({ reason: 'occupied' });
+    expect(await answer({ ok: false, reason: 'unreachable' })).toMatchObject({ reason: 'unreachable' });
+    expect(await answer({ ok: false, reason: 'gone' })).toMatchObject({ reason: 'berth-gone' });
   });
 });

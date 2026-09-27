@@ -5526,7 +5526,8 @@ export class World {
                 connected: () => ds.connectedModules(),
                 subscribe: (cb) => ds.onDockChange(cb),
                 undock: (doorId) => void ds.undockPort(doorId),
-                dock: (doorId) => ds.redockPort(doorId),
+                // 🚏 A5: the DOCK's answer (docked, or why not) reaches the helm.
+                dock: (doorId) => ds.redockPortAnswer(doorId),
               }
             : undefined,
         );

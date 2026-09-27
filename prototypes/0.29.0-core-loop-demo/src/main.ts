@@ -133,6 +133,9 @@ import {
   settleRouteFlight,
 } from "./shipRoute";
 import { liveDockFrom, type LiveDockAt } from "./pilotRoute";
+// 🚏🛟 A5: the route's keeper — docks and casts off a running ferry in every
+// game in the ship's room, on the timetable's moments.
+import { createRouteKeeper, sameStationReader } from "./routeKeeper";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -183,6 +186,7 @@ import {
   readDoor,
   subscribeDoors,
   transactDoorWrites,
+  deleteDoorPairing,
 } from "./doorsDoc";
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
 // and the far room's end of every DOCK / UNDOCK.
@@ -283,7 +287,6 @@ import {
   tickExterior,
 } from "./exteriorView";
 import {
-  atlasComponent,
   harvestIntoAtlas,
   readAtlas,
   bindStationAtlasDoc,
@@ -1234,7 +1237,10 @@ function shipStationHere(roomId: string): string | null {
  * shipStationHere test) by its far room and when the dock was made. A dock
  * with no stamp (an older client's) counts as made long ago, so it holds the
  * ferry where it is. A dock in another room of the stop's station (a gate
- * change) counts through the atlas component around the stop's berth room.
+ * change) counts through the same station test the keeper uses
+ * (routeKeeper.sameStationReader: the atlas component around the stop's
+ * berth room, or a room the directory lists one of its gates in), so the
+ * timetable and the keeper always agree on "docked at this stop".
  */
 function shipRouteLiveDock(): LiveDockAt {
   const docks: Array<{ roomId: string; dockedAt: number }> = [];
@@ -1253,18 +1259,43 @@ function shipRouteLiveDock(): LiveDockAt {
   }
   if (docks.length === 0) return () => null;
   // Only a dock outside the stop's own berth room asks the atlas.
-  let atlas: ReturnType<typeof readAtlas> | null = null;
-  const components = new Map<string, Set<string>>();
-  return liveDockFrom(docks, (stop, roomId) => {
-    let c = components.get(stop.berth.roomId);
-    if (!c) {
-      atlas ??= readAtlas();
-      c = atlasComponent(atlas, stop.berth.roomId);
-      components.set(stop.berth.roomId, c);
-    }
-    return c.has(roomId);
-  });
+  return liveDockFrom(docks, sameStationReader());
 }
+
+/**
+ * 🚏🛟 The route's keeper (routeKeeper.ts, build notes A5): once a second, in
+ * EVERY game in the ship's room (not only the helm's commander — any rider
+ * keeps a running ferry docked on time), it casts off at the timetable's
+ * departures and docks at each stop through its gate list, holding at a
+ * taken berth. It docks through the room's own docking system in KEEPER MODE
+ * (docking.ts redockPortAnswer), and the rider carve-out below lets a rider's
+ * game do so for the route's own port only.
+ */
+const routeKeeper = createRouteKeeper({
+  docking: () => {
+    const ds = world?.dockingSystem;
+    if (!ds) return null;
+    return {
+      ports: () => ds.listDockPorts(),
+      undock: (doorId, opts) => ds.undockPort(doorId, opts),
+      dock: (doorId, opts) => ds.redockPortAnswer(doorId, opts),
+    };
+  },
+  shipRoomId: () => activeBootstrap?.roomId ?? "",
+  // PR 172's DEPART detaches every other guest berth; a rider's keeper only
+  // those this player may release (a dock port is UNDOCKed, never deleted).
+  detachGuestBerths: () => {
+    const ds = world?.dockingSystem;
+    if (!ds) return;
+    for (const [doorId, rec] of readAllDoors()) {
+      if (rec.paired !== true) continue;
+      if (rec.transient !== true && !isDockChain(rec.segments)) continue;
+      if (ds.doorHasPort(doorId) || !ds.canOperateDock(doorId)) continue;
+      deleteDoorPairing(doorId);
+    }
+  },
+  note: noteShipArrival,
+});
 
 /** The one-module station whose welcome room IS this room, straight from
  *  the list (not stationForRoom, which a ship room resolves through its dock). */
@@ -1922,15 +1953,25 @@ async function joinRoomAtEpoch(
   // join replaces the last room's watch and leaveRoomNow clears it, so room
   // hops neither stack callbacks nor leave a flight without its watch.
   if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
+  // 🚏🛟 A new room is a new ship: the keeper forgets the last one.
+  routeKeeper.reset();
   shipFlightWatch = window.setInterval(() => {
+    // 🚏🛟 A5: every rider's game keeps a running ferry docked on time —
+    // before the commander gate, which only the copy-back below needs.
+    try {
+      routeKeeper.tick();
+    } catch (err) {
+      console.warn("[route] keeper tick failed:", err);
+    }
     if (!isLocalHelmCommander()) return;
     // 🚏 A4: while a ferry route runs unpaused its timetable moves the ship
     // with no write, and PR 172's advance stands aside (it runs again while
     // the route is paused). This helm-gated game copies the timetable back
     // into the stored records when due: after STOP once the ship is at its
-    // end stop, or when a person's `in-flight` has been landed by it.
+    // end stop and the keeper's dock there has answered (at once when STOP
+    // came during a hold), or when a person's `in-flight` has been landed.
     if (routeRulesFlightNow()) {
-      settleRouteFlight();
+      settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) });
       return;
     }
     const rec = readFlightRecord();
@@ -1952,7 +1993,8 @@ async function joinRoomAtEpoch(
           ? {
               ports: () => ds.listDockPorts(),
               undock: (doorId) => void ds.undockPort(doorId),
-              dock: (doorId) => ds.redockPort(doorId),
+              // 🚏 A5: the DOCK's answer (docked, or why not), not a bare boolean.
+              dock: (doorId) => ds.redockPortAnswer(doorId),
             }
           : null,
         { onSettled: noteShipArrival },
@@ -3292,6 +3334,11 @@ function wireAdapterTransit(): void {
       roomId === activeBootstrap?.roomId && yjsSync ? yjsSync.doc : null,
   });
   world.dockingSystem?.onFarDockWrite(farDockWrite);
+  // 🚏🛟 A5 "Rights": a running route lets a rider's keeper dock and undock
+  // the route's own port toward the current stop, at the timetable's moments.
+  world.dockingSystem?.onRouteDockRight((doorId, op, farRoomId) =>
+    routeKeeper.mayOperate(doorId, op, farRoomId),
+  );
   // #62 P4: auto-accept decider — a pairing may complete without a far-side
   // human only for rooms THIS client minted (the ledger / this session's
   // mints) or its own current room, and only while the DEV toggle is on.

@@ -64,13 +64,14 @@ export function applyFarDockRequest(
     writeDoorRecordTo(doc, farDoor, patch.record);
     return { result: { ok: true, detail: 'written' }, wrote: true };
   }
+  const gate = gateAccessIn(doc, req.farDoor, req.requesterPub);
   const patch = farDockPatch(
     readDoorFrom(doc, req.farDoor),
     farBerth(doc, req.farDoor),
     near,
     req.dockedAt,
     req.replacesUndockedAt,
-    gateAccessIn(doc, req.farDoor, req.requesterPub),
+    gate,
   );
   if (patch.action === 'refuse') {
     return {
@@ -78,6 +79,10 @@ export function applyFarDockRequest(
         ok: false,
         reason: patch.reason,
         ...(patch.stamp !== undefined ? { stamp: patch.stamp } : {}),
+        // 🚏⚓🚦 Which setting refused: a route's keeper tells a gate open
+        // only to granted captains (this rider's key) from one shut to the
+        // ship. Additive; the refusal itself is farDockPatch's, unchanged.
+        ...(patch.reason === 'not-allowed' && gate.access !== 'open' ? { gateAccess: gate.access } : {}),
       },
       wrote: false,
     };

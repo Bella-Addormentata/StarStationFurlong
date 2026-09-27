@@ -64,6 +64,8 @@ import {
   initiateChainRefusal,
   stampAfter,
   FAR_DOCK_REFUSAL,
+  type DockAnswer,
+  type DockOpOptions,
   type DockPortState,
 } from "./dockRules";
 // 🛰️ Hull space: built chains register their swept boxes so exterior mounts
@@ -243,6 +245,10 @@ export type FarDockResult =
       /** With `unreachable`: the far write WAS made, but its acknowledgment
        *  never came — it may still land (redockPort takes it back anyway). */
       unconfirmed?: boolean;
+      /** 🚏⚓🚦 With `not-allowed`: the gate's access that refused (the far
+       *  doc's own setting). A route's keeper reads 'pass' (granted captains)
+       *  as a verdict on this rider's key alone, never on the ship. */
+      gateAccess?: "pass" | "reserved" | "closed";
     };
 
 /** ⚓ One dock port as the helm's docking computer and the pane list it. */
@@ -355,6 +361,34 @@ export class DoorDockingPortSystem {
     if (mode === "public") return true;
     if (mode === "request") return hasDoorGrant(doorId, getIdentityPub());
     return false;
+  }
+
+  /** 🚏 A5 "Rights": main.ts answers whether a route's keeper may dock or
+   *  undock this door toward the far room right now (routeKeeper.ts
+   *  routeKeeperMayOperate: the route's own port, toward the current stop's
+   *  berth, at the timetable's moments). Unwired: no carve-out. */
+  private routeDockRight:
+    | ((doorId: string, op: "dock" | "undock", farRoomId: string) => boolean)
+    | null = null;
+
+  /** 🚏 DOCK / UNDOCK rights: the door's construction rights, or — for a
+   *  keeper-mode call only — the rider carve-out a running route grants. The
+   *  carve-out never opens the door panel, the gate settings or any other
+   *  port: only the route's own port, only through its keeper. */
+  private mayDockHere(
+    doorId: string,
+    op: "dock" | "undock",
+    farRoomId: string,
+    opts: DockOpOptions,
+  ): boolean {
+    if (this.canConstruct(doorId)) return true;
+    if (opts.keeper !== true || !this.routeDockRight) return false;
+    try {
+      return this.routeDockRight(doorId, op, farRoomId) === true;
+    } catch (err) {
+      console.warn("[dock] route dock right threw:", err);
+      return false;
+    }
   }
 
   /** #67 D1: may the LOCAL player operate (lock/unlock) this door? Follows the
@@ -2773,14 +2807,15 @@ export class DoorDockingPortSystem {
    * back), then the far room's end through the injected writer — best effort;
    * an unreachable far room is said, not hidden.
    */
-  public async undockPort(doorId: string): Promise<boolean> {
+  public async undockPort(doorId: string, opts: DockOpOptions = {}): Promise<boolean> {
     if (this.dockOp(doorId)?.busy) return false;
     // Every status this call reports belongs to the room it started in — the
     // far write is awaited, and the player may walk on meanwhile.
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
-    if (!this.canConstruct(doorId)) {
+    // 🚏 A route's keeper casts off the route's port at its departure.
+    if (!this.mayDockHere(doorId, "undock", port.roomId, opts)) {
       this.setDockOp(doorId, {
         note: "Only this door's owner (or a builder here) can undock it.",
         tone: "bad",
@@ -2838,15 +2873,38 @@ export class DoorDockingPortSystem {
    * mirror completes it (dockRules.mirrorMayWrite: a dock newer than the
    * berth's undock re-docks). If this port changes while the berth is asked,
    * this side is left alone and the far write is taken back
-   * (settleChangedRedock).
+   * (settleChangedRedock). True when docked (redockPortAnswer has why not).
    */
-  public async redockPort(doorId: string): Promise<boolean> {
-    if (this.dockOp(doorId)?.busy) return false;
+  public async redockPort(doorId: string, opts: DockOpOptions = {}): Promise<boolean> {
+    return (await this.redockPortAnswer(doorId, opts)).ok;
+  }
+
+  /**
+   * 🚏 redockPort with its answer (build notes A5): docked with the dock's own
+   * stamp (DoorPairing.dockedAt — the one a route's keeper after a hold
+   * writes as the stay's start), or the reason it did not dock, the far
+   * berth's refusals under their own names. The helm's arrival and a
+   * route's keeper read it through ShipDockingApi.dock.
+   *
+   * KEEPER MODE (`opts.keeper`, dockRules.DockOpOptions): the local atlas's
+   * "taken" check is skipped (a stale atlas holds "taken" long after the
+   * berth frees), and only the station's answer counts: a station that
+   * cannot be asked (no writer, no far door) or reached (unreachable, no
+   * address) leaves the port UNDOCKED — never one side alone — so a keeper's
+   * dock never lands on a taken berth and a hold ends only on a dock the
+   * station confirmed. A write that was made but never acknowledged may still
+   * land at the berth: the keeper's next DOCK then finds it (`superseded`
+   * with its stamp) and joins it. The route's own port also passes the rider
+   * carve-out (mayDockHere) in this mode.
+   */
+  public async redockPortAnswer(doorId: string, opts: DockOpOptions = {}): Promise<DockAnswer> {
+    const keeper = opts.keeper === true;
+    if (this.dockOp(doorId)?.busy) return { ok: false, reason: "busy" };
     // The room this DOCK belongs to: its status is reported there, and this
     // side is written only while the player still stands in it.
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
-    if (port.kind !== "undocked" || !readDoorPolicy(doorId).adapter) return false;
+    if (port.kind !== "undocked" || !readDoorPolicy(doorId).adapter) return { ok: false, reason: "no-port" };
     // 🚀 #30 SH3: no dock while this module is flying — the same flight gate
     // every pairing completion passes (completePairing). Arrival docking
     // writes `docked` first (shipArrival.completeArrival), then DOCKs.
@@ -2856,23 +2914,26 @@ export class DoorDockingPortSystem {
         note: `This module is ${flightGate.status.toUpperCase()} — it docks when it arrives.`,
         tone: "bad",
       });
-      return false;
+      return { ok: false, reason: "in-flight" };
     }
-    if (!this.canConstruct(doorId)) {
+    if (!this.mayDockHere(doorId, "dock", port.roomId, opts)) {
       this.setDockOp(doorId, {
         note: "Only this door's owner (or a builder here) can dock it.",
         tone: "bad",
       });
-      return false;
+      return { ok: false, reason: "no-rights" };
     }
     const name = this.partnerLabel(port.roomId);
     const { farDoor, farWall, farLateral } = port.memory;
     // The same near-side gates INITIATE applies: the far door must not be
-    // known to be taken, and the module must not land on another.
-    const taken = this.farDoorTakenBy(port.roomId, farDoor, farWall, farLateral);
-    if (taken && !(taken.roomId === roomId && taken.doorId === doorId)) {
-      this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL.occupied, tone: "bad" });
-      return false;
+    // known to be taken, and the module must not land on another. 🚏 Keeper
+    // mode asks the station instead of the local atlas.
+    if (!keeper) {
+      const taken = this.farDoorTakenBy(port.roomId, farDoor, farWall, farLateral);
+      if (taken && !(taken.roomId === roomId && taken.doorId === doorId)) {
+        this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL.occupied, tone: "bad" });
+        return { ok: false, reason: "occupied" };
+      }
     }
     if (roomId) {
       const dims = readAtlas()[port.roomId]?.dims;
@@ -2891,8 +2952,17 @@ export class DoorDockingPortSystem {
           note: `Can't dock — ${name} would overlap ${clash.name}.`,
           tone: "bad",
         });
-        return false;
+        return { ok: false, reason: "overlap" };
       }
+    }
+    // 🚏 Keeper mode never docks one side alone: a station that cannot be
+    // asked is no answer.
+    if (keeper && (!this.farDockWriter || !farDoor)) {
+      this.setDockOp(doorId, {
+        note: `Can't ask ${name} for its berth from here — not docked.`,
+        tone: "warn",
+      });
+      return { ok: false, reason: !farDoor ? "no-far-door" : "no-writer" };
     }
     // Causally after the undock it replaces, whatever this client's clock
     // says — or the far side's walk-through mirror would read this deliberate
@@ -2951,14 +3021,14 @@ export class DoorDockingPortSystem {
             { note: `Docked to ${name} — joining the dock already made to this port.`, tone: "ok" },
             roomId,
           );
-          return true;
+          return { ok: true, dockedAt: far.stamp, joined: true };
         }
         this.setDockOp(
           doorId,
           { note: `Another DOCK of this port reached ${name} at the same moment — that one stands.`, tone: "warn" },
           roomId,
         );
-        return false;
+        return { ok: false, reason: "superseded" };
       }
       if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone" || far.reason === "not-allowed")) {
         // A closed or vanished berth is not coming back: drop the memory so
@@ -2966,16 +3036,38 @@ export class DoorDockingPortSystem {
         // not open to us now may open later.
         if (far.reason !== "occupied" && far.reason !== "not-allowed" && unchanged()) writeDoorTombstone(doorId, port.address);
         this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" }, roomId);
-        return false;
+        return {
+          ok: false,
+          reason: far.reason,
+          ...(far.reason === "not-allowed" && far.gateAccess ? { gateAccess: far.gateAccess } : {}),
+        };
+      }
+      // 🚏 Keeper mode: an unreachable station (or no address for it) is no
+      // answer — the port stays undocked, and the keeper retries.
+      if (keeper && !far.ok) {
+        // A port that changed meanwhile is settled as always (our dock
+        // joined by a peer stands; a write that may still land is taken back).
+        if (!unchanged()) {
+          const settled = await this.settleChangedRedock(doorId, port, far, { roomId, farDoor, dockedAt, near, name });
+          if (settled) return { ok: true, dockedAt };
+        } else {
+          this.setDockOp(
+            doorId,
+            { note: `${name} could not be reached — not docked; the route will try again.`, tone: "warn" },
+            roomId,
+          );
+        }
+        return { ok: false, reason: far.reason };
       }
       if (!unchanged()) {
-        return this.settleChangedRedock(doorId, port, far, {
+        const settled = await this.settleChangedRedock(doorId, port, far, {
           roomId,
           farDoor,
           dockedAt,
           near,
           name,
         });
+        return settled ? { ok: true, dockedAt } : { ok: false, reason: "changed" };
       }
     }
     const next = redockRecord(port, dockedAt);
@@ -2990,7 +3082,7 @@ export class DoorDockingPortSystem {
           },
       roomId,
     );
-    return true;
+    return far?.ok ? { ok: true, dockedAt } : { ok: true, dockedAt, oneSided: true };
   }
 
   /**
@@ -4422,5 +4514,12 @@ export class DoorDockingPortSystem {
   /** ⚓ #163: main.ts wires the far-room writer (farDoorWrite.ts). */
   public onFarDockWrite(cb: (req: FarDockRequest) => Promise<FarDockResult>) {
     this.farDockWriter = cb;
+  }
+
+  /** 🚏 main.ts wires the route keeper's rider carve-out (see mayDockHere). */
+  public onRouteDockRight(
+    cb: ((doorId: string, op: "dock" | "undock", farRoomId: string) => boolean) | null,
+  ) {
+    this.routeDockRight = cb;
   }
 }

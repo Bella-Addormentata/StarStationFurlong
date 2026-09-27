@@ -79,6 +79,7 @@ import {
   type ArrivalOutcome,
   type ShipDockingApi,
 } from './shipArrival';
+import type { DockAnswer } from './dockRules';
 // #30 SH3: the helm enumerates the room's paired doors so canDepart can
 // refuse a permanent connector-chain (a chained module cannot fly, by
 // construction — plan §5.1). DEPART also detaches any transient berth.
@@ -2087,8 +2088,10 @@ export interface HelmDockingDeps {
   /** Subscribe to port changes; returns the unsubscribe. */
   subscribe: (cb: () => void) => () => void;
   undock: (doorId: string) => void;
-  /** The shipped DOCK; its answer (false: refused) lets an arrival try the next berth. */
-  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
+  /** The shipped DOCK; its answer (🚏 docking.ts redockPortAnswer: docked, or
+   *  why not; a bare false: refused) lets an arrival try the next berth and
+   *  say why none took the ship. */
+  dock: (doorId: string) => void | boolean | DockAnswer | Promise<boolean | void | DockAnswer>;
 }
 
 /** Port marker colours on the ship atlas (and the status words beside them). */
@@ -2142,13 +2145,43 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     return;
   }
   if (outcome.kind === 'docked') {
-    setArrivalNote({ text: `Docked at ${outcome.stationName}, ${gate(outcome.gate)}.`, tone: 'ok' });
+    // 🚏 A route's ferry announces a gate change (choice 9).
+    setArrivalNote({
+      text: outcome.gateChange && outcome.gate !== undefined
+        ? `Gate change: docked at ${outcome.stationName}, gate ${outcome.gate}.`
+        : `Docked at ${outcome.stationName}, ${gate(outcome.gate)}.`,
+      tone: 'ok',
+    });
+    return;
+  }
+  // 🚏 A route's keeper says what the ferry does about a refusal (A5).
+  const route = outcome.route;
+  if (route) {
+    const at = outcome.stationName;
+    setArrivalNote({
+      tone: 'warn',
+      text: route.action === 'hold'
+        ? `Berth at ${at} is occupied. Holding until it is free.`
+        : route.action === 'skip'
+          ? `The berth at ${at} has been removed. Continuing to ${route.nextStopName}.`
+          : outcome.reason === 'no-berth'
+            ? `Can't open the berth at ${at} from here (no pass). Riding on to ${route.nextStopName}.`
+            : outcome.reason === 'unreachable'
+              ? `Can't reach the berth at ${at} from here. Riding on to ${route.nextStopName} unless another rider docks.`
+              : `Can't dock at ${at} from here. Riding on to ${route.nextStopName} unless another rider docks.`,
+    });
     return;
   }
   setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'berths-taken'
       ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, or out of reach). Dock from a door panel when one frees up.`
+      : outcome.reason === 'occupied'
+      ? `Arrived at ${outcome.stationName} — every berth the ship tried is occupied (or not open to this ship). Dock from a door panel when one frees up.`
+      : outcome.reason === 'unreachable'
+      ? `Arrived at ${outcome.stationName} — its berths could not be reached from here, so the ship did not dock. Try DOCK from a door panel.`
+      : outcome.reason === 'berth-gone'
+      ? `Arrived at ${outcome.stationName} — the berth the ship knew there has been removed. Dock from a door panel at another one.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
       : outcome.reason === 'unlisted-station'
