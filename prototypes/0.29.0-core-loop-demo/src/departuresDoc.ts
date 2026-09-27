@@ -53,9 +53,10 @@
  * Trust: honest-client reads, like every room value. Every entry is shape-
  * checked (ids bounded to 128 characters, times finite, the route rebuilt by
  * shipRoute's own guard, which drops any field it does not know, a pass
- * included) and a malformed one reads as absent. Readers visit at most 1024
- * keys, keep at most 16 ferries and 64 checkpoints each. An old client never
- * reads either map (degrade, not corrupt).
+ * included) and a malformed one reads as absent. Readers keep at most 16
+ * ferries and 64 checkpoints each (writers keep a room to that too), and
+ * visit at most four full rooms' worth of keys. An old client never reads
+ * either map (degrade, not corrupt).
  *
  * Pure helpers and the decision are pinned by departuresDoc.test.ts; the
  * board's rows by departuresBoard.test.ts.
@@ -82,8 +83,10 @@ export const DEPARTURES_MAP = 'departures';
 export const DEPARTURE_BOARDS_MAP = 'departureBoards';
 /** Ferries a room keeps (the oldest publish goes first when a new one comes). */
 export const MAX_DEPARTURE_FERRIES = 16;
-/** Keys a reader visits in the departures map. */
-export const MAX_DEPARTURE_KEYS_VISITED = 1024;
+/** Keys a reader visits in the departures map: four times a full room
+ *  (every ferry's route key and its capped checkpoints), room to spare for
+ *  concurrent snapshots, a transient overfill, and junk. */
+export const MAX_DEPARTURE_KEYS_VISITED = 4 * MAX_DEPARTURE_FERRIES * (MAX_CHECKPOINT_KEYS_SCANNED + 1);
 /** Keys a writer visits (it must see every key of the ferry it tidies). */
 const MAX_WRITE_KEYS_VISITED = 8192;
 const MAX_ID_LEN = 128;
@@ -441,13 +444,19 @@ export function applyDeparturesPublish(doc: Y.Doc, input: DeparturesPublish, now
         current.set(key, e);
       }
     }
-    // The timetable's own pruning, over what the room now holds.
+    // The timetable's own pruning, over what the room now holds, then the
+    // readers' own cap: a full room stays inside what a reader visits.
     if (run !== undefined) {
       const byEntry = new Map<RouteCheckpoint, string>();
       for (const [key, e] of current) byEntry.set(e, key);
       for (const e of checkpointsToPrune(kept.route, [...current.values()], now)) {
         const key = byEntry.get(e);
         if (key) del(key);
+      }
+      const left = [...current].filter(([key]) => map.has(key));
+      if (left.length > MAX_CHECKPOINT_KEYS_SCANNED) {
+        const keep = new Set(capCheckpoints(left.map(([, e]) => e), MAX_CHECKPOINT_KEYS_SCANNED));
+        for (const [key, e] of left) if (!keep.has(e)) del(key);
       }
     }
     // A full room lets the ferry published longest ago go.

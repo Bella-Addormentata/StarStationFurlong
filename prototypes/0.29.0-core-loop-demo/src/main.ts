@@ -2118,7 +2118,9 @@ async function joinRoomAtEpoch(
     // 🚏📋 A6: after each of this game's own route writes (START, a
     // checkpoint, STOP, the finish), publish the ferry to its stops' boards,
     // through a pass this game holds for each berth room. Module-wide like
-    // the route itself: it reads whichever ship doc is bound.
+    // the route itself: it reads whichever ship doc is bound, so it is
+    // subscribed once per page (this block's roomPassesInited guard), never
+    // per join.
     const departures = createDeparturesPublisher({
       shipRoomId: () => activeBootstrap?.roomId ?? "",
       shipName: () => {

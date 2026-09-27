@@ -36,7 +36,7 @@ import {
   startCheckpoint,
   stopAt,
 } from './pilotRoute';
-import { routeToWire } from './shipRoute';
+import { MAX_CHECKPOINT_KEYS_SCANNED, routeToWire } from './shipRoute';
 import type { RouteCheckpoint, RouteStop, ShipRoute, StartCheckpoint } from './shipRoute';
 
 const SOV = 'planet-sovereign';
@@ -370,6 +370,36 @@ describe('a publish applied to a stop room', () => {
 });
 
 describe('reading a room’s departures', () => {
+  it('reads every key of a full room: 16 ferries, each a route key and 64 checkpoints', () => {
+    const doc = new Y.Doc();
+    const map = doc.getMap(DEPARTURES_MAP);
+    const route = running();
+    const s = start(route);
+    const { kind: _k, legSeq: _l, ...startWire } = s;
+    doc.transact(() => {
+      for (let i = 0; i < MAX_DEPARTURE_FERRIES; i++) {
+        const ship = `ship-${String(i).padStart(2, '0')}`;
+        // Checkpoints first, the route key last: the last ferry's route key
+        // is the full room's very last key.
+        map.set(departureCheckpointKey(ship, T0, 0, 'start'), startWire);
+        for (let leg = 1; leg < MAX_CHECKPOINT_KEYS_SCANNED; leg++) {
+          const { kind: _hk, legSeq: _hl, ...holdWire } = holdCheckpoint(route, leg, { at: s.arriveAt + leg * SEC });
+          map.set(departureCheckpointKey(ship, T0, leg, 'hold'), holdWire);
+        }
+        const entry = { shipRoomId: ship, name: 'F', capacity: 100, route, at: T0 + i * SEC };
+        map.set(departureRouteKey(entry), departureRouteToWire(entry));
+      }
+    });
+    expect(map.size).toBeGreaterThan(1024);
+    const ferries = departureFerriesIn(map);
+    expect(ferries).toHaveLength(MAX_DEPARTURE_FERRIES);
+    for (const f of ferries) expect(f.checkpoints).toHaveLength(MAX_CHECKPOINT_KEYS_SCANNED);
+    // A writer keeps a ferry's checkpoints to the readers' cap.
+    const extra = holdCheckpoint(route, MAX_CHECKPOINT_KEYS_SCANNED, { at: s.arriveAt + MAX_CHECKPOINT_KEYS_SCANNED * SEC });
+    applyDeparturesPublish(doc, pub(route, [s, extra], T0 + MIN, { shipRoomId: 'ship-00' }), T0 + MIN);
+    expect(keys(doc).filter((k) => k.startsWith('ship-00:ckpt:'))).toHaveLength(MAX_CHECKPOINT_KEYS_SCANNED);
+  });
+
   it('two writers overfilling a room: readers and the next writer keep the same newest ferries', () => {
     const route = running();
     const s = start(route);
