@@ -1167,6 +1167,9 @@ function shipStationHere(roomId: string): string | null {
   if (!roomId) return null;
   for (const [, rec] of readAllDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only a dock says where the ship is: a permanent gangway leads back into
+    // the ship's own group (older docks carry only the two-half chain).
+    if (rec.transient !== true && !isDockChain(rec.segments)) continue;
     let partner = "";
     try {
       partner = roomIdFromSeed(rec.connectedRoomAddress);
