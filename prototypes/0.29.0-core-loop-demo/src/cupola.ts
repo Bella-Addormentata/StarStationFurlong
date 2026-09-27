@@ -234,3 +234,22 @@ export function boxClearOfCupolaCorners(
   }
   return true;
 }
+
+/** The extrude-axis run [lo, hi] the barrel strips (and so windows) cover:
+ *  the whole ±longHalf, or up to where a cupola starts tapering. */
+export function cupolaStripRun(plan: CupolaPlan | null, longHalf: number): [number, number] {
+  if (!plan) return [-longHalf, longHalf];
+  return plan.sign > 0 ? [-longHalf, plan.b0] : [plan.b0, longHalf];
+}
+
+/** True when a plan box reaches past where the cupola starts tapering — a
+ *  wall panel there would hang on glass (or on wall the taper removed). */
+export function boxInCupolaTaper(
+  plan: CupolaPlan,
+  box: { x0: number; x1: number; z0: number; z1: number },
+): boolean {
+  const onX = plan.profile.narrowAxis === 'z'; // the extrude axis is x
+  const lo = onX ? box.x0 : box.z0;
+  const hi = onX ? box.x1 : box.z1;
+  return plan.sign > 0 ? hi > plan.b0 + 1e-6 : lo < plan.b0 - 1e-6;
+}

@@ -79,7 +79,7 @@ import {
 } from './floorPlanDoc';
 import {
   cupolaPlan, cupolaEndWalls, cupolaSideWallRun, cupolaCornerClearance,
-  boxClearOfCupolaCorners, type CupolaPlan, type CupolaWall,
+  boxClearOfCupolaCorners, boxInCupolaTaper, cupolaStripRun, type CupolaPlan, type CupolaWall,
 } from './cupola';
 import { SEATS, rebuildSeats } from './seats';
 import { rebuildStands } from './stands';
@@ -294,12 +294,11 @@ export function validatePlacement(
   }
   // 1a. 🔭 …and out of a cupola's cut corners, with the same 1 m of wall
   //     clearance the placement box keeps.
+  //     A wall panel may not hang anywhere past where the taper starts (on
+  //     the glass, or on side wall the taper removed).
   const cupola = roomCupola();
-  if (cupola && !isWallMounted(item.kind)) {
-    const inside = box
-      ? boxClearOfCupolaCorners(cupola, box, CUPOLA_PLACE_CLEARANCE)
-      : cupolaCornerClearance(cupola, pos.x, pos.z) >= CUPOLA_PLACE_CLEARANCE;
-    if (!inside) return { ok: false, reason: 'in the cupola glass' };
+  if (cupola && !cupolaClearsItem(cupola, item.kind, pos, rot, box)) {
+    return { ok: false, reason: 'in the cupola glass' };
   }
 
   // 1b. 🖥️ Wall-mounted panel rules (doorways, windows, other furniture).
@@ -799,6 +798,25 @@ const CUPOLA_PLACE_CLEARANCE = 1.0;
  *  the cupola — the same margin the door keeps from a window. */
 const CUPOLA_DOOR_MARGIN = 0.4;
 
+/** True when a piece (at `pos`/`rot`, floor footprint `box`) stays out of
+ *  the cupola: floor pieces clear of the cut corners, wall panels short of
+ *  the taper. */
+function cupolaClearsItem(
+  plan: CupolaPlan,
+  kind: FurnitureItem['kind'],
+  pos: { x: number; z: number },
+  rot: Rot,
+  box: Box | null,
+): boolean {
+  if (isWallMounted(kind)) {
+    const mount = wallMountBox(kind, pos, rot);
+    return !mount || !boxInCupolaTaper(plan, mount);
+  }
+  return box
+    ? boxClearOfCupolaCorners(plan, box, CUPOLA_PLACE_CLEARANCE)
+    : cupolaCornerClearance(plan, pos.x, pos.z) >= CUPOLA_PLACE_CLEARANCE;
+}
+
 /** True when a door on `wall` at `lateral` leaves the cupola alone: always on
  *  the far end cap, and on a side wall only while its doorway stops short of
  *  the taper. (The cupola wall itself is refused before this.) */
@@ -818,7 +836,9 @@ export type CupolaVerdict = { ok: true } | { ok: false; reason: string };
  *  1. it must be an END wall (where the module's octagon shows);
  *  2. no door on it — the owner removes it first (a docked door can't be);
  *  3. no side-wall door reaching into the taper;
- *  4. no furniture standing in the corners the cupola cuts off.
+ *  4. no furniture standing in the corners the cupola cuts off, and no wall
+ *     panel hung past where it starts tapering;
+ *  5. no hull window reaching into the taper.
  */
 export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
   const { halfX, halfZ } = roomHalfExtents();
@@ -833,12 +853,16 @@ export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
     return { ok: false, reason: `move ${doorDisplayName(intruder.id)} away from the ${wall} end first` };
   }
   for (const item of FURNITURE) {
-    if (isWallMounted(item.kind)) continue;
-    const box = itemAabb(item);
-    const inside = box
-      ? boxClearOfCupolaCorners(plan, box, CUPOLA_PLACE_CLEARANCE)
-      : cupolaCornerClearance(plan, item.pos.x, item.pos.z) >= CUPOLA_PLACE_CLEARANCE;
-    if (!inside) return { ok: false, reason: `move ${item.id} out of the ${wall} corners first` };
+    if (!cupolaClearsItem(plan, item.kind, item.pos, item.rot, itemAabb(item))) {
+      return { ok: false, reason: `move ${item.id} away from the ${wall} end first` };
+    }
+  }
+  // 5. …nor a hull window reaching into the taper (the strips end there).
+  const [lo, hi] = cupolaStripRun(plan, plan.profile.longHalf);
+  for (const rec of readAllWindowLayout().values()) {
+    if (rec.along - rec.w / 2 < lo - 1e-6 || rec.along + rec.w / 2 > hi + 1e-6) {
+      return { ok: false, reason: `move the window near the ${wall} end first` };
+    }
   }
   return { ok: true };
 }
@@ -3773,6 +3797,12 @@ class RoomEditController {
 
   private hideCupolaButton(): void {
     if (this.cupolaBtnEl) this.cupolaBtnEl.style.display = 'none';
+  }
+
+  /** 🔭 A floorPlan change (a peer set or cleared the cupola, or a resize)
+   *  relabels the open 🔭 button. */
+  public onFloorPlanChanged(): void {
+    this.syncCupolaButton();
   }
 
   /** Label the button with the room's current cupola wall (or OFF). */

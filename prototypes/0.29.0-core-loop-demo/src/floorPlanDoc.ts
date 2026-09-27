@@ -302,7 +302,7 @@ export function roomHalfExtents(): { halfX: number; halfZ: number } {
 function recomputeRoomHalf(): void {
   const { cols, rows } = readRoomDims();
   roomHalf = { halfX: cols * TILE_SIZE / 2, halfZ: rows * TILE_SIZE / 2 };
-  roomCupolaPlan = cupolaPlan(roomHalf, readCupolaWall());
+  roomCupolaPlan = OCTAGON_HULL ? cupolaPlan(roomHalf, readCupolaWall()) : null;
 }
 
 // ── 🔭 Cupola end wall (cupola.ts) ───────────────────────────────────────────
@@ -310,6 +310,12 @@ function recomputeRoomHalf(): void {
 // cupola. Absent / malformed ⇒ none (every existing room, unchanged). Stored as
 // the wall label, so a resize that turns that wall into a side wall simply
 // renders it plain (cupolaPlan → null) until the room is resized back.
+
+/** The cupola is part of the octagon hull; the legacy flat-box room
+ *  (`?octagon=0`) draws none, so it must not walk or place round one either.
+ *  Same flag world.ts reads (no window under the unit tests ⇒ on). */
+const OCTAGON_HULL =
+  typeof window === 'undefined' || new URLSearchParams(window.location.search).get('octagon') !== '0';
 
 /** Cached resolved cupola for the current room size (null = no cupola). */
 let roomCupolaPlan: CupolaPlan | null = null;

@@ -14,8 +14,11 @@ import {
   clampOutOfCupolaCorners,
   cupolaSideWallRun,
   boxClearOfCupolaCorners,
+  boxInCupolaTaper,
+  cupolaStripRun,
 } from './cupola';
 import { buildOctagonHull, buildOctagonShell, cupolaPieces } from './octagonHull';
+import { clampWindowAlong, windowFitsSurface } from './windowLayout';
 import {
   bindFloorPlan,
   writeRoomDims,
@@ -185,5 +188,27 @@ describe('buildOctagonHull with a cupola', () => {
     expect(ms.filter((m) => m.name === 'octagon-shell-cap')).toHaveLength(1);
     expect(ms.filter((m) => m.name === 'octagon-shell-cupola-glass')).toHaveLength(11);
     shell.dispose();
+  });
+});
+
+describe('the taper and the things near it', () => {
+  it('shortens the strip run and spots wall panels hung past it', () => {
+    const plan = cupolaPlan(SQUARE, 'y+')!;
+    expect(cupolaStripRun(plan, 6)).toEqual([-6, 4]);
+    expect(cupolaStripRun(null, 6)).toEqual([-6, 6]);
+    expect(boxInCupolaTaper(plan, { x0: 5.85, x1: 6.15, z0: 2, z1: 3.5 })).toBe(false); // side wall, short of it
+    expect(boxInCupolaTaper(plan, { x0: 5.85, x1: 6.15, z0: 3.5, z1: 4.5 })).toBe(true); // reaches into it
+    expect(boxInCupolaTaper(plan, { x0: -1, x1: 1, z0: 5.85, z1: 6.15 })).toBe(true); // on the tip glass
+    const neg = cupolaPlan(WIDE, 'x-')!;
+    expect(boxInCupolaTaper(neg, { x0: -9.15, x1: -8.85, z0: -1, z1: 1 })).toBe(true);
+  });
+
+  it('keeps the window editor inside the shortened run', () => {
+    bindFloorPlan(new Y.Doc());
+    expect(clampWindowAlong(6, 3)).toBeCloseTo(6 - 1.5 - 0.05, 9);
+    writeCupolaWall('y+');
+    expect(clampWindowAlong(6, 3)).toBeCloseTo(4 - 1.5 - 0.05, 9);
+    expect(windowFitsSurface('wall-pos', 9.95, 1)).toBe(false);
+    expect(windowFitsSurface('wall-pos', 9.8, 1)).toBe(true);
   });
 });

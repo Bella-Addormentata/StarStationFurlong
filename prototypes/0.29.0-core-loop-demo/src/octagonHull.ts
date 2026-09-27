@@ -38,7 +38,7 @@ import {
   type HullSurface,
 } from './hullSection';
 import { resolveWallpaper, type WallpaperPresetId, type WallpaperSpec } from './wallpaper';
-import { cupolaPlan, cupolaTipOutline, type CupolaPlan, type CupolaWall } from './cupola';
+import { cupolaPlan, cupolaStripRun, cupolaTipOutline, type CupolaPlan, type CupolaWall } from './cupola';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
 /** First-person resting opacities (you're INSIDE — see everything). The roof is
@@ -973,12 +973,10 @@ function capGeometry(profile: OctagonProfile, b: number): THREE.BufferGeometry {
 /** Width (m) of the frame round each cupola pane. */
 const CUPOLA_FRAME = 0.14;
 
-/** The extrude-axis run the barrel strips cover: the whole [−longHalf,
- *  longHalf], or up to where a cupola starts tapering. */
+/** The extrude-axis run the barrel strips cover (cupola.cupolaStripRun — the
+ *  window editor clamps to the same run). */
 function stripRun(profile: OctagonProfile, cupola: CupolaPlan | null): [number, number] {
-  const l = profile.longHalf;
-  if (!cupola) return [-l, l];
-  return cupola.sign > 0 ? [-l, cupola.b0] : [cupola.b0, l];
+  return cupolaStripRun(cupola, profile.longHalf);
 }
 
 /** Door notches trimmed to a shortened side wall (DOOR_FACE_INSET kept at its

@@ -1435,6 +1435,7 @@ async function joinRoomAtEpoch(
   // door anchors from the fresh doc immediately (joiners see slid doors).
   bindFloorPlan(sync.doc);
   world?.reconcileDoorPlacements();
+  world?.reconcileCupola(); // 🔭 a warm doc may already carry a cupola
 
   // 🚪↔🛰️ #28 S4: the door-LAYOUT map (WHICH doors the room has) rides the doc,
   // separate from the pairing map + floor-plan position. Binding re-notifies →
@@ -1591,6 +1592,7 @@ async function joinRoomAtEpoch(
     subscribeFloorPlan(() => {
       world?.reconcileDoorPlacements();
       world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
+      roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
     });
