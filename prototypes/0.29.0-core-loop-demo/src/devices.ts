@@ -2876,7 +2876,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         // as this DEPART's own writes: the pause, the route's fuel level and
         // stop copied into the stored records, then the in-flight record and
         // the fuel debit (helmRoute.pauseRouteFromHelm).
-        const paused = pauseRouteFromHelm({
+        // 🛑 After STOP it finishes the route here instead: nothing could
+        // RESUME it.
+        const left = pauseRouteFromHelm({
           now: nowMs,
           capacity: nowCapacity,
           apply: (level) => {
@@ -2884,8 +2886,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             if (departed) writeFuelLevel(level - nowHop.fuelCost, nowCapacity);
           },
         });
-        if (paused) flashRoute('ROUTE PAUSED · off route. Dock at a route stop to RESUME.');
-        if (!paused || !departed) { render(); return; }
+        if (left === 'paused') flashRoute('ROUTE PAUSED · off route. Dock at a route stop to RESUME.');
+        if (left === 'finished') flashRoute('Route stopped. The helm flies by hand from here.', 'ok');
+        if (!left || !departed) { render(); return; }
       } else {
         departed = writeFlightRecord(inFlight);
         if (!departed) { render(); return; }

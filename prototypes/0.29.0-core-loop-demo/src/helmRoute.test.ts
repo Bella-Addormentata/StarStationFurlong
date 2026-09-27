@@ -13,7 +13,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { GUARD_BAND_MS, ROBOT_TAKEOVER_MS, helmCheckpoint, routeLegFuel, stopPairWindow } from './pilotRoute';
+import { GUARD_BAND_MS, ROBOT_TAKEOVER_MS, STOP_GUARD_MS, helmCheckpoint, routeLegFuel, stopPairWindow } from './pilotRoute';
 import type { RouteFlight } from './pilotRoute';
 import { bindShipDoc, readFlightRecord, readFuelLevel, setFuelDrawMeter, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import {
@@ -758,28 +758,65 @@ describe('the helm writers', () => {
         writeFlightRecord({ status: 'in-flight', locationId: 'st-1', destinationId: 'elsewhere', departedAt: clock, etaAt: clock + MIN });
       },
     });
-    expect(ok).toBe(true);
+    expect(ok).toBe('paused');
     expect(updates.n).toBe(1);
     expect(seen).toEqual([70 - cost]);
     expect(readRouteFlight()).toMatchObject({ paused: true });
     expect(readFuelLevel(CAP)).toBe(70 - cost);
     expect(readFlightRecord()).toMatchObject({ status: 'in-flight', locationId: 'st-1', destinationId: 'elsewhere' });
     // Paused: nothing more to pause.
-    expect(pauseRouteFromHelm({ now: clock + SEC, capacity: CAP })).toBe(false);
+    expect(pauseRouteFromHelm({ now: clock + SEC, capacity: CAP })).toBeNull();
   });
 
   it('a pause with no caller writes leaves the stored flight docked at the stop', () => {
     const { arriveAt } = start();
     clock = arriveAt + 5 * SEC;
-    expect(pauseRouteFromHelm({ now: clock, capacity: CAP })).toBe(true);
+    expect(pauseRouteFromHelm({ now: clock, capacity: CAP })).toBe('paused');
     expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-1' });
+  });
+
+  it('DEPART off route after STOP finishes the route where the ship is, in the same one transaction: a pause there could never RESUME', () => {
+    const { route, arriveAt } = start();
+    const cost = routeLegFuel(route, 0, 1)!;
+    clock = arriveAt + 5 * SEC;
+    expect(stopRouteFromHelm({ now: clock })).toBe('stopping');
+    // Pinned at its end stop, before the copy-back has run.
+    expect(readRouteFlight()).toMatchObject({ status: 'docked', stopIndex: 1, ended: 'stop' });
+    clock += SEC;
+    const updates = countUpdates(doc);
+    const seen: number[] = [];
+    const left = pauseRouteFromHelm({
+      now: clock,
+      capacity: CAP,
+      apply: (level) => {
+        seen.push(level);
+        writeFlightRecord({ status: 'in-flight', locationId: 'st-1', destinationId: 'elsewhere', departedAt: clock, etaAt: clock + MIN });
+      },
+    });
+    expect(left).toBe('finished');
+    expect(updates.n).toBe(1);
+    expect(seen).toEqual([70 - cost]);
+    expect(readShipRoute()!.startedAt).toBeUndefined();
+    expect(readRouteCheckpoints()).toEqual([]);
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    expect(readFlightRecord()).toMatchObject({ status: 'in-flight', locationId: 'st-1', destinationId: 'elsewhere' });
+  });
+
+  it('DEPART off route after a STOP too late for this stay (the route ends at the next stop) finishes it here too', () => {
+    const { departAt } = start();
+    clock = departAt - STOP_GUARD_MS / 2;
+    expect(stopRouteFromHelm({ now: clock })).toBe('stopping');
+    expect(readRouteFlight()).toMatchObject({ status: 'docked', stopIndex: 0, ended: null, stopping: true });
+    expect(pauseRouteFromHelm({ now: clock, capacity: CAP })).toBe('finished');
+    expect(readShipRoute()!.startedAt).toBeUndefined();
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-0' });
   });
 
   it('RESUME at a stop: the ceiling first, a fresh stay at the first later visit, the level aboard kept', () => {
     const { route, arriveAt } = start();
     const cost = routeLegFuel(route, 0, 1)!;
     clock = arriveAt + 5 * SEC;
-    expect(pauseRouteFromHelm({ now: clock, capacity: CAP })).toBe(true);
+    expect(pauseRouteFromHelm({ now: clock, capacity: CAP })).toBe('paused');
     // Refused on a stop the route does not have, or while not paused.
     expect(resumeRouteFromHelm({ now: clock, capacity: CAP, stopIndex: 5 })).toBe(false);
     clock += MIN;
@@ -837,7 +874,7 @@ describe('the helm writers', () => {
   it('HAND TO ROBOT is refused without a robot captain; nothing is handed on a paused route', () => {
     start(saved([0, 1], { robotDockId: undefined }));
     expect(handOverRoute({ now: T0 + SEC, pilot: 'robot' })).toBeNull();
-    expect(pauseRouteFromHelm({ now: T0 + 2 * SEC, capacity: CAP })).toBe(true);
+    expect(pauseRouteFromHelm({ now: T0 + 2 * SEC, capacity: CAP })).toBe('paused');
     expect(handOverRoute({ now: T0 + 3 * SEC, pilot: 'person' })).toBeNull();
   });
 
@@ -878,7 +915,7 @@ describe('the helm writers', () => {
     doc = new Y.Doc();
     bindShipDoc(doc);
     start();
-    expect(pauseRouteFromHelm({ now: T0 + 5 * SEC, capacity: CAP })).toBe(true);
+    expect(pauseRouteFromHelm({ now: T0 + 5 * SEC, capacity: CAP })).toBe('paused');
     expect(stopRouteFromHelm({ now: T0 + 6 * SEC })).toBe('finished');
     const r = readShipRoute()!;
     expect(r.startedAt).toBeUndefined();

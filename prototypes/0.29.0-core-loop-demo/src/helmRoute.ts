@@ -57,8 +57,9 @@
  *                 checkpoint), copies the timetable's stop and fuel into the
  *                 stored records, then runs PR 172's DEPART — one
  *                 transaction. "ROUTE PAUSED · off route. Dock at a route stop
- *                 to RESUME."
- *   RESUME        docked at a route stop: a fresh fuel ceiling FIRST (the
+ *                 to RESUME." After STOP it finishes the route there
+ *                 instead, with the same writes: nothing could RESUME it.
+ *   RESUME       docked at a route stop: a fresh fuel ceiling FIRST (the
  *                 route meter still reads 0 while paused), then a RESUME
  *                 `dock` (the first later visit to that stop, a fresh minimum
  *                 wait) and a `fuel` entry with the level aboard.
@@ -1037,29 +1038,37 @@ export function departRouteFromHelm(o: { now: number }): GoCheckpoint | null {
  * entry at the stay the ship is docked at (the route meter reads 0 from
  * here), the level the route had the tank at, the stored flight brought to
  * `docked` at that stop (robot legs never wrote it), then `apply(level)` —
- * the caller's PR 172 DEPART writes (in-flight record, fuel debit). Returns
- * whether it paused.
+ * the caller's PR 172 DEPART writes (in-flight record, fuel debit).
+ *
+ * 🛑 After STOP it FINISHES the route there instead, with the same writes
+ * (the copy-back STOP was waiting for, brought forward): a paused route
+ * with STOP pressed could never RESUME, and would hold the route's locks
+ * until a second STOP. Returns which it did, or null.
  */
-export function pauseRouteFromHelm(o: { now: number; capacity: number; apply?: (level: number) => void }): boolean {
+export function pauseRouteFromHelm(o: { now: number; capacity: number; apply?: (level: number) => void }): 'paused' | 'finished' | null {
   const h = shipDocHandle();
   const route = readShipRoute();
-  if (!h || !isRouteRunning(route)) return false;
+  if (!h || !isRouteRunning(route)) return null;
   const f = readRouteFlight(o.now);
-  if (!routeRulesFlight(f) || f.status !== 'docked') return false;
-  const entry = pauseCheckpoint(route, f.legSeq, { at: o.now });
-  if (!writable(route, entry)) return false;
+  if (!routeRulesFlight(f) || f.status !== 'docked') return null;
   const level = clampFuelToCapacity(readFuelLevel(o.capacity), o.capacity);
   const here: FlightRecord = { status: 'docked', locationId: localStationId(route.stops[f.stopIndex].stationId) };
-  let wrote = false;
-  h.doc.transact(() => {
-    wrote = writeRouteCheckpoint(route.startedAt, entry, o.now);
-    if (!wrote) return;
-    // Paused: the stored level rules now, and the route's share is folded in.
+  // Off the route from here: the stored level rules, the route's share
+  // folded in, and the stored flight at this stop.
+  const leave = () => {
     writeFuelLevel(level, o.capacity);
     for (const r of flightWritePath(readFlightRecord(), here)) writeFlightRecord(r);
     o.apply?.(level);
+  };
+  if (route.stoppedAt !== undefined) return finishShipRoute(leave) ? 'finished' : null;
+  const entry = pauseCheckpoint(route, f.legSeq, { at: o.now });
+  if (!writable(route, entry)) return null;
+  let wrote = false;
+  h.doc.transact(() => {
+    wrote = writeRouteCheckpoint(route.startedAt, entry, o.now);
+    if (wrote) leave();
   });
-  return wrote;
+  return wrote ? 'paused' : null;
 }
 
 /**
