@@ -130,11 +130,14 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
 /** Bounded JSON-only extras, or undefined. */
 function cleanExt(v: unknown): Record<string, unknown> | undefined {
   if (!isPlainObject(v)) return undefined;
+  // The cap is on the extras alone (as stations.ts keeps them), not on the
+  // record they came with.
+  const extras: Record<string, unknown> = {};
+  for (const [k, x] of Object.entries(v)) if (!KNOWN_FIELDS.has(k)) extras[k] = x;
   let json: string;
-  try { json = JSON.stringify(v); } catch { return undefined; }
+  try { json = JSON.stringify(extras); } catch { return undefined; }
   if (json.length > MAX_EXT_JSON) return undefined;
   const out = stripCredentials(JSON.parse(json)) as Record<string, unknown>;
-  for (const k of Object.keys(out)) if (KNOWN_FIELDS.has(k)) delete out[k];
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -493,9 +496,12 @@ export interface PlanetSummaryContext {
   localTrim: () => OrbitTrim | null;
   /** The ship this client stands in, or null when the room is no ship. */
   ship: () => ShipStatusInput | null;
-  /** The room this client stands in, so a ship entry for it is withdrawn
-   *  when the room stops being a ship. Optional: without it nothing is. */
-  roomId?: () => string | null;
+  /** The room this client stands in when it is known to be no ship (not a
+   *  ready ship, or bolted into a station), else null: a ship entry for that
+   *  room is withdrawn. A ship whose planet is not placed yet (`ship()` is
+   *  null for it too) is not this, so its entry stands. Optional: without it
+   *  nothing is withdrawn. */
+  notShipRoom?: () => string | null;
 }
 
 let doc: Y.Doc | null = null;
@@ -648,7 +654,7 @@ export function publishPlanetSummary(now = Date.now()): void {
     if (s && !same) store.ships[s.roomId] = { ...s, updatedAt: stampPast(s.roomId) };
   } else {
     // This room is no ship (any more): withdraw an entry still naming it.
-    const room = ctx.roomId?.() ?? null;
+    const room = ctx.notShipRoom?.() ?? null;
     const kept = room ? store.ships[room] : undefined;
     const inMap = room ? cleanShipSummary(shipMap!.get(room), now) : null;
     const prior = kept && inMap ? mergeShip(kept, inMap) ?? kept : kept ?? inMap;
@@ -699,7 +705,11 @@ let trimsByStationId = new Map<string, SharedTrim>();
  *  stations, then map every listed station to its newest known trim. */
 function applyLearned(store: Store): void {
   const here = ctx?.currentStation() ?? null;
-  const planet = here ? planetById(here.planetId).id : planetById(undefined).id;
+  // Where this client is: its own saved record says so; otherwise the shared
+  // summary of the station it stands in does (a derived record sits on the
+  // default planet until its learned one registers, which needs the planet).
+  const shared = here?.welcomeRoomId ? store.stations[here.welcomeRoomId] : undefined;
+  const planet = planetById(here && !isOwned(here) && shared ? shared.planetId : here?.planetId).id;
   registerLearnedStations(planet, Object.values(store.stations), { prune: here !== null });
   refreshTrims(store);
 }

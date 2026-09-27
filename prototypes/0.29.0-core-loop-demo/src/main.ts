@@ -1588,7 +1588,13 @@ async function joinRoomAtEpoch(
       return trim && { ...trim, fuelDrawn: readFuelDrawn() };
     },
     ship: planetShipStatus,
-    roomId: () => activeBootstrap?.roomId || null,
+    // Only a room known to be no ship withdraws its entry: a ship whose
+    // planet is not placed yet also reads null from planetShipStatus.
+    notShipRoom: () => {
+      const roomId = activeBootstrap?.roomId ?? "";
+      if (!roomId) return null;
+      return isShipReady() && !isBoltedIntoStation(readAllDoors().values()) ? null : roomId;
+    },
   });
 
   // 🛰️ #65: exterior attachments (solar panels) ride the room doc too.

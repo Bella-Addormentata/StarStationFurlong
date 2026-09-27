@@ -311,6 +311,26 @@ function sync(from: Y.Doc, to: Y.Doc): void {
 }
 
 describe('sharing through the room doc', () => {
+  it('places a fresh install standing in an off-home station by the room\'s shared summary', () => {
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('room-x', {
+      welcomeRoomId: 'room-x', name: 'ARIS DEPOT', planetId: ARIS, orbitSlot: 3, updatedAt: Date.now() - 1000,
+    });
+    // This install only knows the room from its atlas: a derived record on the
+    // default planet.
+    const derived = { id: 'station:room-x', name: 'ROOM X', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-x', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => derived }));
+    const learned = listStations().find((s) => s.id === 'shared:room-x');
+    expect(learned?.planetId).toBe(ARIS);
+    expect(learned?.orbitSlot).toBe(3);
+  });
+
+  it('keeps extras near the cap on a record whose core fields are long', () => {
+    const extra = { note: 'x'.repeat(900) };
+    const out = summaryForStation({ ...record(), name: 'N'.repeat(60), ...extra } as never, null, T0);
+    expect(out.ext).toEqual(extra);
+  });
+
   it('a station and its trim reach another install, which flies the same orbit', () => {
     // Install A owns HAB RING in slot 2 and has trimmed it.
     const a = new Map<string, string>();
@@ -484,10 +504,19 @@ describe('ships and the solar system', () => {
     expect(doc.getMap('shipSummaries').get('room-ship')).toEqual(winner);
   });
 
+  it('keeps the ship entry while a ship\'s planet is not placed yet', () => {
+    let status: ShipStatusInput | null = ship;
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status, notShipRoom: () => null }));
+    status = null; // still a ship, but its stations are not listed yet
+    publishPlanetSummary(Date.now() + 1);
+    expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
+  });
+
   it('withdraws the ship entry when the room stops being a ship', () => {
     let status: ShipStatusInput | null = ship;
     const doc = new Y.Doc();
-    bindPlanetSummaryDoc(doc, install(null, { ship: () => status, roomId: () => 'room-ship' }));
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status, notShipRoom: () => (status ? null : 'room-ship') }));
     expect(shipsAroundPlanet(SOV).map((s) => s.name)).toEqual(['FERRY']);
     status = null; // bolted into a station
     publishPlanetSummary(Date.now() + 1);
