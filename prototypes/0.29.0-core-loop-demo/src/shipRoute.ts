@@ -65,6 +65,12 @@
  *   its REFUEL or DEPART writes fold nothing of the route's (degrade, not
  *   corrupt). Routes should ship once clients have updated (A4).
  *
+ * THE FLIGHT PR 172'S READERS FOLLOW (A4, the last section): while the
+ * route runs unpaused, readResolvedFlight hands them the timetable's flight
+ * instead of the stored one, PR 172's advance paths stand aside
+ * (routeRulesFlightNow), and a helm-gated game copies the timetable back into
+ * `flight` and `fuel` after STOP (settleRouteFlight).
+ *
  * Pure helpers (guards, key codec) plus the doc binding. Pinned by
  * shipRoute.test.ts; the timetable by pilotRoute.test.ts.
  */
@@ -77,21 +83,30 @@ import {
   MAX_LEG_SEQ,
   checkpointsToPrune,
   createRouteWalkCache,
+  fuelCheckpoint,
   isRouteRunning,
+  resolvedFlight,
   routeFlightAt,
   routeLegsPlannable,
+  routeRefuelStay,
+  routeRulesFlight,
+  routeSettleAction,
   startCheckpoint,
   stopAt,
 } from './pilotRoute';
-import type { LiveDockAt, RouteFlight } from './pilotRoute';
+import type { LiveDockAt, RouteFlight, RouteSettleAction } from './pilotRoute';
 import {
   clampFuelToCapacity,
+  readFlightRecord,
   readStoredFuelLevel,
   setFuelDrawMeter,
   shipDocHandle,
   subscribeShip,
+  writeFlightRecord,
   writeFuelLevel,
 } from './shipDoc';
+import type { FlightRecord } from './shipDoc';
+import { localStationId } from './stationDirectory';
 import { MAX_ORBIT_SLOTS } from './stations';
 
 // ── Stored shapes (A1, A9.6) ─────────────────────────────────────────────────
@@ -773,4 +788,170 @@ export function installRouteFuelMeter(deps: RouteFuelMeterDeps): () => void {
     subscribe: () => () => {},
   });
   return () => setFuelDrawMeter(ROUTE_FUEL_METER, null);
+}
+
+// ── The flight PR 172's readers follow (A4) ─────────────────────────────────
+//
+// 🧭 readResolvedFlight lives here, not in shipDoc.ts as A4 sketched: this
+// file imports shipDoc (and pilotRoute imports it too), so shipDoc importing
+// the route back would be a cycle whose top-level subscribeShip call runs
+// before shipDoc's listener set exists.
+//
+// Every reader of PR 172's flight record that decides what the ship may do
+// now reads it through here: the helm (render, DEPART, its tick), the
+// holotable, the dock gates in docking.ts (pairingAllowedByFlight, redock's
+// re-check included) and main.ts's room-station resolver (which the map and
+// the exterior follow). While the route runs unpaused they see the
+// timetable's flight, which moves with the clock and is never written: the
+// ferry leaves, flies and arrives for them with no write (the docks at each
+// end are the keeper's, A5). Paused, not
+// running, or with no checkpoint to anchor it, they see the stored `flight`.
+//
+// PR 172's two advance paths (main.ts's 1 Hz watch, the helm's autoAdvance)
+// skip while the route rules the flight: routeRulesFlightNow. The copy-back
+// that makes the stored records true again runs from the 1 Hz watch
+// (settleRouteFlight, helm-gated there).
+
+/** What the route's flight reads from the game: the tanks' capacity, the
+ *  ship's live docks (pilotRoute.liveDockFrom over its berth pairings), and a
+ *  clock (tests). */
+export type RouteFlightDeps = RouteFuelMeterDeps;
+
+let flightDeps: RouteFlightDeps | null = null;
+
+/**
+ * Install the route's flight for this game (main.ts, once, beside the other
+ * ship hooks): the route's fuel draw meter and the deps readResolvedFlight
+ * derives with. Before this runs every read below answers with the stored
+ * records. Returns the uninstaller.
+ */
+export function installRouteFlight(deps: RouteFlightDeps): () => void {
+  const offMeter = installRouteFuelMeter(deps);
+  flightDeps = deps;
+  return () => {
+    if (flightDeps !== deps) return;
+    offMeter();
+    flightDeps = null;
+  };
+}
+
+/** The timetable's flight now (a paused route's included), or null: no route
+ *  running, none anchored, no deps installed, or a read that failed. */
+export function readRouteFlight(now?: number): RouteFlight | null {
+  const d = flightDeps;
+  // Checked before the deps run: most rooms have no route, and the resolver
+  // asks often.
+  if (!d || !isRouteRunning(readShipRoute())) return null;
+  try {
+    const t = now ?? (d.clock ?? Date.now)();
+    return routeFlightNow(d.liveDock?.() ?? null, d.capacity(), t);
+  } catch (err) {
+    console.error('[route] flight read failed:', err);
+    return null;
+  }
+}
+
+/** The flight PR 172's readers follow, and the timetable's own flight when it
+ *  is the one they follow (null otherwise). */
+export interface ResolvedShipFlight {
+  flight: FlightRecord;
+  route: RouteFlight | null;
+}
+
+/** readResolvedFlight with the timetable's own figures beside it (the helm
+ *  reads both). */
+export function resolveShipFlight(now?: number): ResolvedShipFlight {
+  const route = readRouteFlight(now);
+  const rules = routeRulesFlight(route);
+  return {
+    flight: resolvedFlight(readFlightRecord(), route, localStationId),
+    route: rules ? route : null,
+  };
+}
+
+/** A4: the flight PR 172's readers follow. The timetable's (as PR 172's
+ *  FlightRecord, station ids read as this install's) while the route runs
+ *  unpaused, else readFlightRecord(). */
+export function readResolvedFlight(now?: number): FlightRecord {
+  return resolveShipFlight(now).flight;
+}
+
+/** Does the timetable rule the flight now (a route running, anchored, not
+ *  paused)? PR 172's advance paths skip while it does. */
+export function routeRulesFlightNow(now?: number): boolean {
+  return routeRulesFlight(readRouteFlight(now));
+}
+
+/** How the copy-back decides the end stop's dock has answered. */
+export interface RouteSettleOptions {
+  now?: number;
+  /** Has the dock at the end stop answered (A4: the keeper's dock there,
+   *  docked or refused)? Absent reads as yes: until a keeper docks the
+   *  ferry, nothing will, and the route finishes as soon as the ship is at
+   *  its end stop, berthless if nobody docked it (dock by hand from there). */
+  dockAnswered?: (f: RouteFlight) => boolean;
+}
+
+/**
+ * The A4 copy-back, run by a helm-gated game (main.ts's 1 Hz watch):
+ *  - after STOP, once the ship is pinned at its end stop and the dock there
+ *    has answered: in ONE transaction, clear the run and its checkpoints
+ *    (finishShipRoute: the route meter reads 0 from here), then write the
+ *    derived flight (through `redocking` when the stored one is `in-flight`)
+ *    and the derived fuel level;
+ *  - mid-route, when a person's `in-flight` has been landed by the
+ *    timetable: walk the stored flight to `docked` there, one transaction.
+ * Returns which it did, or null.
+ */
+export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction['kind'] | null {
+  const d = flightDeps;
+  const h = shipDocHandle();
+  if (!d || !h) return null;
+  const now = o.now ?? (d.clock ?? Date.now)();
+  const route = readRouteFlight(now);
+  if (!routeRulesFlight(route)) return null;
+  const action = routeSettleAction(readFlightRecord(), route, {
+    dockAnswered: o.dockAnswered ? o.dockAnswered(route) : true,
+    alias: localStationId,
+  });
+  if (!action) return null;
+  if (action.kind === 'finish') {
+    const capacity = d.capacity();
+    const finished = finishShipRoute(() => {
+      for (const rec of action.writes) writeFlightRecord(rec);
+      writeFuelLevel(action.fuel, capacity);
+    });
+    return finished ? 'finish' : null;
+  }
+  h.doc.transact(() => {
+    for (const rec of action.writes) writeFlightRecord(rec);
+  });
+  return 'follow';
+}
+
+/**
+ * REFUEL on a running route (helm gate; A2's `fuel`): in one transaction,
+ * the `fuel` checkpoint at the stay the ship is docked at FIRST (the derived
+ * level jumps to full and the route meter reads 0), then the level (see the
+ * header). False when the timetable does not rule the flight (the caller
+ * refuels as PR 172 does) or has the ship in flight (REFUEL waits for the
+ * next stop: routeRefuelStay).
+ */
+export function refuelShipRoute(capacity: number, now?: number): boolean {
+  const h = shipDocHandle();
+  const route = readShipRoute();
+  const d = flightDeps;
+  if (!h || !d || !isRouteRunning(route) || !(capacity > 0)) return false;
+  const at = now ?? (d.clock ?? Date.now)();
+  const f = readRouteFlight(at);
+  if (!routeRulesFlight(f)) return false;
+  const stay = routeRefuelStay(f);
+  if (stay === null) return false;
+  const full = clampFuelToCapacity(capacity, capacity);
+  let wrote = false;
+  h.doc.transact(() => {
+    wrote = writeRouteCheckpoint(route.startedAt, fuelCheckpoint(route, stay, { at, fuel: full }), at);
+    if (wrote) writeFuelLevel(full, capacity);
+  });
+  return wrote;
 }

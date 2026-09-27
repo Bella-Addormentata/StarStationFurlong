@@ -115,8 +115,24 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import {
+  clearShipArrivalNote,
+  isShipReady,
+  noteShipArrival,
+  setHelmOwnerCheck,
+  shipFuelCapacity,
+} from "./devices";
 import { completeArrival, setBerthSeedResolver } from "./shipArrival";
+// 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
+// is the ship's flight — the resolver below reads it, the 1 Hz watch stands
+// aside for it and copies it back into the stored records when due.
+import {
+  installRouteFlight,
+  readResolvedFlight,
+  routeRulesFlightNow,
+  settleRouteFlight,
+} from "./shipRoute";
+import { liveDockFrom, type LiveDockAt } from "./pilotRoute";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -267,6 +283,7 @@ import {
   tickExterior,
 } from "./exteriorView";
 import {
+  atlasComponent,
   harvestIntoAtlas,
   readAtlas,
   bindStationAtlasDoc,
@@ -1211,6 +1228,44 @@ function shipStationHere(roomId: string): string | null {
   return null;
 }
 
+/**
+ * 🚏 The ship's live docks as the route's timetable reads them
+ * (pilotRoute.LiveDockAt): each berth pairing of the current room (the
+ * shipStationHere test) by its far room and when the dock was made. A dock
+ * with no stamp (an older client's) counts as made long ago, so it holds the
+ * ferry where it is. A dock in another room of the stop's station (a gate
+ * change) counts through the atlas component around the stop's berth room.
+ */
+function shipRouteLiveDock(): LiveDockAt {
+  const docks: Array<{ roomId: string; dockedAt: number }> = [];
+  for (const [, rec] of readAllDoors()) {
+    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    if (rec.transient !== true && !isDockChain(rec.segments)) continue;
+    let roomId = "";
+    try {
+      roomId = roomIdFromSeed(rec.connectedRoomAddress);
+    } catch {
+      continue;
+    }
+    if (!roomId) continue;
+    const at = rec.dockedAt;
+    docks.push({ roomId, dockedAt: typeof at === "number" && Number.isFinite(at) ? at : 0 });
+  }
+  if (docks.length === 0) return () => null;
+  // Only a dock outside the stop's own berth room asks the atlas.
+  let atlas: ReturnType<typeof readAtlas> | null = null;
+  const components = new Map<string, Set<string>>();
+  return liveDockFrom(docks, (stop, roomId) => {
+    let c = components.get(stop.berth.roomId);
+    if (!c) {
+      atlas ??= readAtlas();
+      c = atlasComponent(atlas, stop.berth.roomId);
+      components.set(stop.berth.roomId, c);
+    }
+    return c.has(roomId);
+  });
+}
+
 /** The one-module station whose welcome room IS this room, straight from
  *  the list (not stationForRoom, which a ship room resolves through its dock). */
 function ownStationOf(roomId: string): string | null {
@@ -1813,7 +1868,8 @@ async function joinRoomAtEpoch(
       for (const rec of readAllDoors().values()) {
         if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) return null;
       }
-      return isShipReady() ? readFlightRecord().locationId : null;
+      // 🚏 A running ferry route's timetable, when it rules the flight (A4).
+      return isShipReady() ? readResolvedFlight().locationId : null;
     });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
@@ -1848,6 +1904,10 @@ async function joinRoomAtEpoch(
     // enforcement lives in a later slice, plan §7 SH5).
     setHelmOwnerCheck(isLocalHelmCommander);
     setStationHelmCommanderCheck(isLocalHelmCommander);
+    // 🚏 A4: a ferry route's flight and fuel. The route's draw meter and the
+    // timetable read the tanks and the current room's live docks; both are
+    // module-wide and read whichever ship doc is bound, so once is enough.
+    installRouteFlight({ capacity: shipFuelCapacity, liveDock: shipRouteLiveDock });
   }
   // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
   // ticks the countdown while open, but a flight must complete even if no
@@ -1864,6 +1924,15 @@ async function joinRoomAtEpoch(
   if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
   shipFlightWatch = window.setInterval(() => {
     if (!isLocalHelmCommander()) return;
+    // 🚏 A4: while a ferry route runs unpaused its timetable moves the ship
+    // with no write, and PR 172's advance stands aside (it runs again while
+    // the route is paused). This helm-gated game copies the timetable back
+    // into the stored records when due: after STOP once the ship is at its
+    // end stop, or when a person's `in-flight` has been landed by it.
+    if (routeRulesFlightNow()) {
+      settleRouteFlight();
+      return;
+    }
     const rec = readFlightRecord();
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped

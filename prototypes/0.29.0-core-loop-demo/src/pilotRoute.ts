@@ -109,9 +109,17 @@
  *    the ship goes in flight. The route ends, docked, at the last stop the
  *    fuel reaches. (shipRoute.ts turns this level into the tank's 'route'
  *    draw meter, so on-time legs write no fuel either.)
+ *
+ * ─── The flight PR 172's readers follow (A4) ─────────────────────────────────
+ *
+ *  resolvedFlight: the timetable's flight while the route runs unpaused, the
+ *  stored `flight` otherwise (shipRoute.readResolvedFlight feeds it the doc).
+ *  routeSettleAction: what a helm-gated game writes to copy the timetable
+ *  back into the stored records (after STOP; or a person's `in-flight` the
+ *  timetable has landed), along legal edges only (shipDoc.flightWritePath).
  */
 
-import { clampFuelToCapacity } from './shipDoc';
+import { clampFuelToCapacity, flightWritePath } from './shipDoc';
 import type { FlightRecord } from './shipDoc';
 import { planRecordHop } from './stationDirectory';
 import type { StationRecordLike } from './stationDirectory';
@@ -1227,6 +1235,99 @@ export function routeFlightAt(
       return step.flight;
     }
     cur = step.next;
+  }
+  return null;
+}
+
+// ── The flight every existing reader follows (A4) ───────────────────────────
+//
+// PR 172's readers (the helm, the holotable, the dock gates, the room-station
+// resolver) each read ONE flight record. While a route runs unpaused that is
+// the timetable's flight, which moves with the clock and is never written;
+// otherwise (no route, a paused one, or one no checkpoint anchors) it is the
+// stored `flight`. shipRoute.readResolvedFlight hands them the right one.
+// The stored record only catches up when a helm-gated game copies the
+// timetable back (routeSettleAction): after STOP, and when a person's route
+// DEPART wrote `in-flight` that the timetable has since landed.
+
+/** A derived flight as PR 172's plain FlightRecord: the route's own figures
+ *  dropped, and its copied station ids read through `alias` (the reader's
+ *  localStationId: ids are kept per install). */
+export function routeFlightRecord(f: RouteFlight, alias: (id: string) => string = (id) => id): FlightRecord {
+  const out: FlightRecord = { status: f.status, locationId: alias(f.locationId) };
+  if (f.status === 'in-flight') {
+    if (f.destinationId !== undefined) out.destinationId = alias(f.destinationId);
+    if (f.departedAt !== undefined) out.departedAt = f.departedAt;
+    if (f.etaAt !== undefined) out.etaAt = f.etaAt;
+  }
+  return out;
+}
+
+/** Does the timetable rule the ship's flight: a route running, anchored and
+ *  not paused? */
+export function routeRulesFlight(f: RouteFlight | null): f is RouteFlight {
+  return f !== null && !f.paused;
+}
+
+/** A4: the flight existing readers follow. The timetable's while the route
+ *  runs unpaused (`route` is routeFlightAt's answer), else the stored one. */
+export function resolvedFlight(
+  stored: FlightRecord,
+  route: RouteFlight | null,
+  alias?: (id: string) => string,
+): FlightRecord {
+  return routeRulesFlight(route) ? routeFlightRecord(route, alias) : stored;
+}
+
+/** The stay a REFUEL on a running route sets the level at: this stay, while
+ *  docked (before its leg). Null in flight: the tank's stored level is the
+ *  ceiling the route's meter reads down from, and the meter must read 0 when
+ *  the level is written (shipRoute.ts's header); in flight it reads the leg's
+ *  burn, so REFUEL waits for the next stop. */
+export function routeRefuelStay(f: RouteFlight): number | null {
+  return f.status === 'docked' ? f.legSeq : null;
+}
+
+/** A copy-back of the timetable into the stored records (routeSettleAction). */
+export type RouteSettleAction =
+  | { kind: 'finish'; writes: FlightRecord[]; fuel: number }
+  | { kind: 'follow'; writes: FlightRecord[] };
+
+/**
+ * What a helm-gated game writes to bring the STORED flight in line with the
+ * timetable (A4), or null when nothing is due:
+ *
+ *  - `finish`: STOP was pressed and the ship is pinned docked at its end
+ *    stop (or the fuel ran out first), and the dock there has answered (the
+ *    keeper's call; `dockAnswered`). The route clears, and the derived flight
+ *    and fuel are copied into `flight` and `fuel`, through `redocking` when
+ *    the stored record is `in-flight`.
+ *  - `follow`: the route runs on, the stored record is in transit (a
+ *    person's route DEPART wrote `in-flight`, as PR 172's DEPART does, so
+ *    older clients follow the ferry) and the timetable has since docked the
+ *    ship: walk it to `docked` there, with no dock of its own.
+ *
+ * Robot legs never write the stored flight, so a stored `docked` record is
+ * left alone mid-route whatever the timetable says. Pure.
+ */
+export function routeSettleAction(
+  stored: FlightRecord,
+  route: RouteFlight | null,
+  o: { dockAnswered: boolean; alias?: (id: string) => string },
+): RouteSettleAction | null {
+  if (!routeRulesFlight(route)) return null;
+  const target = routeFlightRecord(route, o.alias);
+  if (route.stopping && route.ended !== null && route.status === 'docked' && o.dockAnswered) {
+    const writes = flightWritePath(stored, target);
+    // No legal path (never from a stored record the route can leave): keep
+    // the run on rather than clear it and strand the stored flight.
+    return writes.length > 0 ? { kind: 'finish', writes, fuel: route.fuel } : null;
+  }
+  // (Also while the end stop's dock is still to answer: older clients should
+  // not see a stored flight still in transit.)
+  if (route.status === 'docked' && stored.status !== 'docked') {
+    const writes = flightWritePath(stored, target);
+    return writes.length > 0 ? { kind: 'follow', writes } : null;
   }
   return null;
 }

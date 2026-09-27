@@ -45,6 +45,10 @@ import {
   writeFlightRecord,
   writeFuelLevel,
 } from './shipDoc';
+import type { FlightRecord } from './shipDoc';
+// 🚏 A4: while a ferry route runs, its timetable is the flight every reader
+// here follows (readResolvedFlight), and REFUEL goes through the route.
+import { readResolvedFlight, refuelShipRoute, resolveShipFlight, routeRulesFlightNow } from './shipRoute';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
 import { destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
@@ -1984,7 +1988,8 @@ const HELM_TICK_MS = 250;
  *  first, then where its last flight left it; in flight it is at none. */
 function holotableStation(): StationRecord | null {
   if (!isShipReady()) return currentStation();
-  const flight = readFlightRecord();
+  // 🚏 A running route's timetable, when it rules the flight (A4).
+  const flight = readResolvedFlight();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
   return listStationRecords().find((st) => st.id === id) ?? null;
@@ -2041,7 +2046,8 @@ function enumerateTransientBerths(): string[] {
  *  doors — event-driven, not per-frame), (b) discrete user gestures (picker
  *  change, refuel arm, depart / redock click), (c) the mount()-side initial
  *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY while
- *  `readFlightRecord().status === 'in-flight'`. World.update / animate() /
+ *  the resolved flight (🚏 readResolvedFlight: a ferry route's timetable, or
+ *  the stored record) is `in-flight`, or on the tick it changes. World.update / animate() /
  *  requestAnimationFrame never call render() (grep-verified). No cache added:
  *  the walk is FURNITURE.filter over a bounded compile-time array — 3 tag
  *  lookups per render — and caching by furniture-map-change would add a
@@ -2060,6 +2066,12 @@ export function isShipReady(): boolean {
   return countFunction('engine') >= 1
       && countFunction('fuelTank') >= 1
       && countFunction('helm') >= 1;
+}
+
+/** 🚏 The tanks' derived capacity (tanks × TANK_CAPACITY): what the route's
+ *  fuel meter and timetable clamp to (main.ts installs them with it). */
+export function shipFuelCapacity(): number {
+  return countFunction('fuelTank') * TANK_CAPACITY;
 }
 
 /**
@@ -2198,11 +2210,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const engines = countFunction('engine');
     const helms = countFunction('helm');
     const capacity = tanks * TANK_CAPACITY;
+    const now = Date.now();
+    // 🚏 A4: the route's timetable while it rules the flight, else the stored
+    // record (routeFlight is null then).
+    const { flight, route: routeFlight } = resolveShipFlight(now);
     const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
-    const flight = readFlightRecord();
     const commander = helmIsCommander();
     const chained = enumerateChainedDoors();
-    const now = Date.now();
     const arrived = flightArrived(flight, now);
     const progress = flightProgress(flight, now);
     // A station that dropped out of the directory is named as unlisted, never
@@ -2227,6 +2241,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       ownerAuthorized: commander,
       locationId: location.id,
       ...(pickerDestId ? { hop } : {}),
+      routeRunning: routeFlight !== null,
     });
 
     const check = (ok: boolean) => ok
@@ -2262,14 +2277,19 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const capFmt = capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK';
     const barPct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
     const barColor = barPct > 40 ? '#00E676' : barPct > 10 ? '#FFB74D' : '#FF8A80';
-    const refuelDisabled = !commander || capacity === 0 || fuel >= capacity;
+    // 🚏 On a running route REFUEL sets the level at the stay the ship is
+    // docked at; in flight it waits for the next stop (routeRefuelStay).
+    const refuelWaits = routeFlight !== null && routeFlight.status !== 'docked';
+    const refuelDisabled = !commander || capacity === 0 || fuel >= capacity || refuelWaits;
     const refuelLabel = !commander
       ? 'COMMANDER ONLY'
       : capacity === 0
         ? 'INSTALL A TANK'
         : fuel >= capacity
           ? 'TANKS FULL'
-          : refuelArmed ? 'CONFIRM REFUEL' : 'REFUEL';
+          : refuelWaits
+            ? 'REFUEL AT THE NEXT STOP'
+            : refuelArmed ? 'CONFIRM REFUEL' : 'REFUEL';
 
     // ── Flight panel (status-driven) ────────────────────────────────────────
     let flightPanel = '';
@@ -2308,6 +2328,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             : 'No transfer orbit from here to there (the two stations share an orbit).';
           case 'unlisted-location':
             return 'This station is not on your station list, so no hop from it can be planned. Dock at a listed station, or wait for this one\'s record to arrive.';
+          case 'route-running':
+            return 'A ferry route is flying this ship on its timetable. Stop the route to fly it by hand.';
           case 'unknown-destination': return choices.length === 0
             ? 'No other station orbits this planet yet.'
             : 'Unknown destination.';
@@ -2432,7 +2454,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Dev-phase full-fill: real parts-economy metering is a later slice.
       // writeFuelLevel clamps to CURRENT capacity, so removing a tank between
       // arm + confirm cannot over-fill.
-      writeFuelLevel(capacity, capacity);
+      // 🚏 While a route rules the flight its checkpoint goes first, then the
+      // level, in one transaction (refuelShipRoute); in flight it waits.
+      if (routeRulesFlightNow()) {
+        refuelShipRoute(capacity);
+      } else {
+        writeFuelLevel(capacity, capacity);
+      }
       refuelArmed = false;
     });
     panel.querySelector<HTMLButtonElement>('#helm-depart-btn')?.addEventListener('click', () => {
@@ -2440,7 +2468,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // moved between render and click (a peer just bolted on a gangway).
       const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
       const nowFuel = clampFuelToCapacity(readFuelLevel(nowCapacity), nowCapacity);
-      const nowFlight = readFlightRecord();
+      const nowResolved = resolveShipFlight();
+      const nowFlight = nowResolved.flight;
       if (isTowing(currentRoomId(), Date.now())) return;
       const fromId = shipLocationId(nowFlight, hasLiveDock());
       const destId = pickerDestId ?? '';
@@ -2454,6 +2483,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         ownerAuthorized: helmIsCommander(),
         locationId: fromId,
         ...(destId ? { hop: nowHop } : {}),
+        routeRunning: nowResolved.route !== null,
       });
       if (!nowRefusal.ok) { render(); return; }
       const dest = findDestination(destId);
@@ -2746,7 +2776,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const plan = planStationTow(towContext(countFunction('engine'), fuel, helmIsCommander(), now), planetId);
     if (!plan.ok) {
       towFlash = { text: describeTowRefusal(plan.refusal, plan.quote, fuel), until: now + 5_000 };
-    } else if (readFlightRecord().status === 'docked') {
+    } else if (readResolvedFlight(now).status === 'docked') {
       towFlash = null;
       writeStationMove(plan.move);
     }
@@ -2797,6 +2827,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    *  commander's write a no-op, and completeArrival returns null once docked. */
   const autoAdvance = (): void => {
     if (!panel || !helmIsCommander()) return;
+    // 🚏 A4: a route running unpaused moves the ship by its timetable; PR
+    // 172's advance stands aside (and runs again while the route is paused).
+    if (routeRulesFlightNow()) return;
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
@@ -2833,9 +2866,20 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeArrivalNote(() => render()));
       unsubs.push(subscribeStationMove(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
+      // 🚏 A4: …or when the flight changed with no doc write: a route's
+      // timetable docks, departs and arrives by the clock alone, so the test
+      // reads the resolved flight and repaints on any change of it (a docked
+      // panel is not repainted every tick: its picker would close).
+      const flightKey = (f: FlightRecord) =>
+        `${f.status}|${f.locationId}|${f.destinationId ?? ''}|${f.departedAt ?? ''}|${f.etaAt ?? ''}`;
+      let lastFlight = flightKey(readResolvedFlight());
       tickTimer = setInterval(() => {
         autoAdvance();
-        if (readFlightRecord().status === 'in-flight') render();
+        const f = readResolvedFlight();
+        const key = flightKey(f);
+        const changed = key !== lastFlight;
+        lastFlight = key;
+        if (f.status === 'in-flight' || changed) render();
       }, HELM_TICK_MS);
       render();
     },

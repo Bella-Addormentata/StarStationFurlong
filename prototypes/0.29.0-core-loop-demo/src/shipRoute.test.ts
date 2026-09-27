@@ -6,7 +6,9 @@
  * on-time legs writing nothing, one key per event (two writers converge),
  * pruning inside the writer's transaction, the reader's key cap, STOP and
  * finish, and the route's fuel draw meter (the home refill with no write,
- * REFUEL's order, a paused route reading the stored level).
+ * REFUEL's order, a paused route reading the stored level). A4: the flight
+ * PR 172's readers follow (readResolvedFlight), the copy-back after STOP in
+ * one transaction (through redocking), and REFUEL through the route.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
@@ -28,8 +30,10 @@ import {
   readStoredFuelLevel,
   setFuelDrawMeter,
   shipDocHandle,
+  writeFlightRecord,
   writeFuelLevel,
 } from './shipDoc';
+import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
 import {
   CHECKPOINT_KINDS,
   MAX_CHECKPOINT_KEYS_SCANNED,
@@ -38,16 +42,23 @@ import {
   checkpointKey,
   checkpointToWire,
   finishShipRoute,
+  installRouteFlight,
   installRouteFuelMeter,
   parseCheckpointKey,
   pruneRouteCheckpoints,
+  readResolvedFlight,
   readRouteCheckpoints,
+  readRouteFlight,
   readShipRoute,
+  refuelShipRoute,
+  resolveShipFlight,
   routeBerthFromWire,
   routeFlightNow,
   routeFuelDebt,
+  routeRulesFlightNow,
   routeToWire,
   routeWithoutRun,
+  settleRouteFlight,
   shipRouteFromWire,
   startShipRoute,
   stopShipRoute,
@@ -738,5 +749,232 @@ describe('the route fuel meter', () => {
     expect(readFuelLevel(CAP)).toBeLessThan(70);
     off();
     expect(readFuelLevel(CAP)).toBe(70);
+  });
+});
+
+// ── The flight PR 172's readers follow (A4) ──────────────────────────────────
+
+describe('readResolvedFlight (A4)', () => {
+  let off: (() => void) | null = null;
+  let docks: Array<{ stop: number; dockedAt: number }> = [];
+  const install = () => {
+    off = installRouteFlight({
+      capacity: () => CAP,
+      clock: () => clock,
+      liveDock: () => (_stop, i) => docks.find((d) => d.stop === i)?.dockedAt ?? null,
+    });
+  };
+  const home = { status: 'docked' as const, locationId: 'st-0' };
+
+  beforeEach(() => { docks = []; });
+  afterEach(() => { off?.(); off = null; });
+
+  it('reads the stored flight with no route, and before the route flight is installed', () => {
+    writeFlightRecord(home);
+    expect(readResolvedFlight()).toEqual(home);
+    const { route, start } = started();
+    clock = onTime(route, start, 1)[0].depart + SEC;
+    expect(readResolvedFlight()).toEqual(home);
+    expect(readRouteFlight()).toBeNull();
+    expect(routeRulesFlightNow()).toBe(false);
+    install();
+    expect(readResolvedFlight()).toMatchObject({ status: 'in-flight', locationId: 'st-0', destinationId: 'st-1' });
+  });
+
+  it('while the route runs unpaused the clock alone moves it: docked, in flight, docked at the next stop, no write', () => {
+    writeFlightRecord(home);
+    const { route, start } = started();
+    install();
+    const on = onTime(route, start, 3);
+    const updates = countUpdates(doc);
+    clock = T0 + SEC;
+    expect(readResolvedFlight()).toEqual({ status: 'docked', locationId: 'st-0' });
+    expect(routeRulesFlightNow()).toBe(true);
+    clock = on[0].depart + SEC;
+    expect(readResolvedFlight()).toEqual({
+      status: 'in-flight', locationId: 'st-0', destinationId: 'st-1', departedAt: on[0].depart, etaAt: on[0].arrive,
+    });
+    clock = on[0].arrive + SEC;
+    expect(readResolvedFlight()).toEqual({ status: 'docked', locationId: 'st-1' });
+    clock = on[1].depart + SEC;
+    expect(readResolvedFlight()).toMatchObject({ status: 'in-flight', locationId: 'st-1', destinationId: 'st-0' });
+    // The stored record, which older clients read, never moved.
+    expect(readFlightRecord()).toEqual(home);
+    expect(updates.n).toBe(0);
+  });
+
+  it('a live dock at the stop holds the ferry past its departure (the dock gates stay open)', () => {
+    const { route, start } = started();
+    install();
+    const on = onTime(route, start, 2);
+    docks = [{ stop: 0, dockedAt: T0 - MIN }];
+    clock = on[0].depart + 5 * SEC;
+    expect(readResolvedFlight().status).toBe('docked');
+    expect(resolveShipFlight().route).toMatchObject({ overdue: true, legSeq: 0 });
+    docks = [];
+    expect(readResolvedFlight().status).toBe('in-flight');
+  });
+
+  it('paused, it reads the stored flight again, and PR 172\'s advance paths run', () => {
+    writeFlightRecord(home);
+    const { run, route, start } = started();
+    install();
+    const on = onTime(route, start, 2);
+    clock = on[0].arrive + 20 * SEC;
+    expect(writeRouteCheckpoint(run, pauseCheckpoint(route, 1, { at: clock }), clock)).toBe(true);
+    expect(readRouteFlight()).toMatchObject({ paused: true });
+    expect(routeRulesFlightNow()).toBe(false);
+    expect(resolveShipFlight()).toEqual({ flight: home, route: null });
+  });
+
+  it("reads the route's station ids as this install's", () => {
+    setStationDirectory({
+      stations: () => DEFAULT_STATIONS,
+      resolve: (id) => (id === 'st-0' ? DEFAULT_STATIONS[0].id : id === 'st-1' ? DEFAULT_STATIONS[1].id : null),
+    });
+    try {
+      const { route, start } = started();
+      install();
+      clock = onTime(route, start, 1)[0].depart + SEC;
+      expect(readResolvedFlight()).toMatchObject({ locationId: DEFAULT_STATIONS[0].id, destinationId: DEFAULT_STATIONS[1].id });
+    } finally {
+      setStationDirectory(null);
+    }
+  });
+
+  it('a hostile route in the doc reads as none: the stored flight rules', () => {
+    writeFlightRecord(home);
+    install();
+    map().set('route', { ...wire(saved()), startedAt: T0, shape: 'spiral' });
+    clock = T0 + HOUR;
+    expect(readResolvedFlight()).toEqual(home);
+    expect(routeRulesFlightNow()).toBe(false);
+  });
+});
+
+describe('the copy-back after STOP (A4)', () => {
+  let off: (() => void) | null = null;
+  const install = () => { off = installRouteFlight({ capacity: () => CAP, clock: () => clock }); };
+  afterEach(() => { off?.(); off = null; });
+
+  it('at the end stop, ONE transaction clears the run and writes the derived flight and fuel', () => {
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const { route, start } = started(saved(), 70);
+    install();
+    const cost = routeLegFuel(route, 0, 1)!;
+    const on = onTime(route, start, 4);
+    stopShipRoute(on[0].arrive + 10 * SEC);
+    clock = on[3].arrive;
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-0' }); // what old clients see
+    const updates = countUpdates(doc);
+    expect(settleRouteFlight()).toBe('finish');
+    expect(updates.n).toBe(1);
+    expect(readShipRoute()).toEqual(routeWithoutRun(route));
+    expect(ckptKeys()).toEqual([]);
+    // The stored records are true again, for every reader old and new.
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-1' });
+    expect(readResolvedFlight()).toEqual({ status: 'docked', locationId: 'st-1' });
+    expect(readStoredFuelLevel()).toBe(70 - cost);
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    expect(fuelDrawDeficit()).toBe(0);
+    // Hours later nothing more burns, and there is nothing left to settle.
+    clock += 5 * HOUR;
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    expect(settleRouteFlight()).toBeNull();
+  });
+
+  it('a stored in-flight record walks through redocking to docked, with no dock of its own', () => {
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const { route, start } = started(saved(), 70);
+    install();
+    const on = onTime(route, start, 4);
+    // As a person's route DEPART writes it (PR 172's own record, for old clients).
+    expect(writeFlightRecord({
+      status: 'in-flight', locationId: 'st-0', destinationId: 'st-1', departedAt: on[0].depart, etaAt: on[0].arrive,
+    })).toBe(true);
+    stopShipRoute(on[0].depart + 20 * SEC); // in flight: ends at the next stop
+    clock = on[0].arrive + 2 * MIN;
+    const seen: string[] = [];
+    map().observe((ev) => { if (ev.keysChanged.has('flight')) seen.push((map().get('flight') as { status: string }).status); });
+    expect(settleRouteFlight()).toBe('finish');
+    expect(seen).toEqual(['docked']); // one transaction: observers see only where it ends
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-1' });
+    expect(readShipRoute()!.startedAt).toBeUndefined();
+  });
+
+  it('waits for the dock at the end stop to answer', () => {
+    const { route, start } = started(saved(), 70);
+    install();
+    const on = onTime(route, start, 2);
+    stopShipRoute(on[0].arrive + 10 * SEC);
+    clock = on[1].arrive;
+    expect(settleRouteFlight({ dockAnswered: () => false })).toBeNull();
+    expect(readShipRoute()!.stoppedAt).toBeDefined();
+    let asked: number | null = null;
+    expect(settleRouteFlight({ dockAnswered: (f) => { asked = f.stopIndex; return true; } })).toBe('finish');
+    expect(asked).toBe(1);
+  });
+
+  it('mid-route, robot legs write nothing; a landed person\'s in-flight is walked to docked and the route runs on', () => {
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const { route, start } = started(saved([0, 1], { homeRefuel: true }), 70);
+    install();
+    const on = onTime(route, start, 4);
+    const updates = countUpdates(doc);
+    for (const t of [T0 + SEC, on[0].depart + SEC, on[0].arrive + SEC, on[2].arrive + SEC]) {
+      clock = t;
+      expect(settleRouteFlight()).toBeNull();
+    }
+    expect(updates.n).toBe(0);
+    expect(writeFlightRecord({
+      status: 'in-flight', locationId: 'st-1', destinationId: 'st-0', departedAt: 1, etaAt: 2,
+    })).toBe(true);
+    expect(settleRouteFlight()).toBe('follow');
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-1' });
+    expect(readShipRoute()!.startedAt).toBe(T0);
+  });
+
+  it('does nothing before the route flight is installed, or with no route', () => {
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    expect(settleRouteFlight()).toBeNull();
+    const { route, start } = started();
+    stopShipRoute(T0 + SEC);
+    clock = onTime(route, start, 1)[0].arrive;
+    expect(settleRouteFlight()).toBeNull();
+    expect(readShipRoute()!.startedAt).toBe(T0);
+  });
+});
+
+describe('REFUEL on a running route (A2 fuel, through the route)', () => {
+  let off: (() => void) | null = null;
+  afterEach(() => { off?.(); off = null; });
+
+  it('docked: its checkpoint first, then the level, in one transaction; later burns still come off', () => {
+    const { route, start } = started(saved(), 70);
+    off = installRouteFlight({ capacity: () => CAP, clock: () => clock });
+    const cost = routeLegFuel(route, 0, 1)!;
+    const on = onTime(route, start, 3);
+    clock = on[0].arrive + 30 * SEC;
+    expect(readFuelLevel(CAP)).toBe(70 - cost);
+    const updates = countUpdates(doc);
+    expect(refuelShipRoute(CAP)).toBe(true);
+    expect(updates.n).toBe(1);
+    expect(readRouteCheckpoints().some((e) => e.kind === 'fuel' && e.legSeq === 1 && e.fuel === CAP)).toBe(true);
+    expect(readFuelLevel(CAP)).toBe(CAP);
+    expect(fuelDrawDeficit()).toBe(0);
+    clock = on[1].depart + SEC;
+    expect(readFuelLevel(CAP)).toBe(CAP - cost);
+  });
+
+  it('in flight it waits for the next stop, and with no route it is PR 172\'s REFUEL', () => {
+    const { route, start } = started(saved(), 70);
+    off = installRouteFlight({ capacity: () => CAP, clock: () => clock });
+    clock = onTime(route, start, 1)[0].depart + SEC;
+    const updates = countUpdates(doc);
+    expect(refuelShipRoute(CAP)).toBe(false);
+    expect(updates.n).toBe(0);
+    finishShipRoute();
+    expect(refuelShipRoute(CAP)).toBe(false);
   });
 });

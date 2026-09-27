@@ -113,7 +113,11 @@ import {
 // would leave the station side pointing at a moving target — the plan's
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
-import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
+import { pairingAllowedByFlight } from "./shipDoc";
+// 🚏 A4: every flight gate here reads the flight the ship is really on — a
+// running ferry route's timetable (never written) while it rules, else the
+// stored record — or a far write lands while the ferry is between stops.
+import { readResolvedFlight } from "./shipRoute";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -1454,7 +1458,7 @@ export class DoorDockingPortSystem {
         // audit MAJOR — the ACCEPT handler used to bypass this check when a
         // remote peer's request had already gone pending); this early UX check
         // just moves the "why" copy to the player earlier in the flow.
-        const initiateFlightGate = pairingAllowedByFlight(readFlightRecord());
+        const initiateFlightGate = pairingAllowedByFlight(readResolvedFlight());
         if (!initiateFlightGate.ok) {
           alert(
             `This module is ${initiateFlightGate.status.toUpperCase()} — new berths are refused until the flight completes and the ship redocks.`,
@@ -1652,7 +1656,7 @@ export class DoorDockingPortSystem {
         // gate — every completion path funnels through it — but the
         // early UX check here (mirroring the INITIATE handler) puts the
         // "why" copy in front of the player instead of a silent no-op.
-        const acceptFlightGate = pairingAllowedByFlight(readFlightRecord());
+        const acceptFlightGate = pairingAllowedByFlight(readResolvedFlight());
         if (!acceptFlightGate.ok) {
           alert(
             `This module is ${acceptFlightGate.status.toUpperCase()} — new berths are refused until the flight completes and the ship redocks.`,
@@ -2846,7 +2850,7 @@ export class DoorDockingPortSystem {
     // 🚀 #30 SH3: no dock while this module is flying — the same flight gate
     // every pairing completion passes (completePairing). Arrival docking
     // writes `docked` first (shipArrival.completeArrival), then DOCKs.
-    const flightGate = pairingAllowedByFlight(readFlightRecord());
+    const flightGate = pairingAllowedByFlight(readResolvedFlight());
     if (!flightGate.ok) {
       this.setDockOp(doorId, {
         note: `This module is ${flightGate.status.toUpperCase()} — it docks when it arrives.`,
@@ -2904,7 +2908,7 @@ export class DoorDockingPortSystem {
       // 🚀 #30 SH3: the ship may have DEPARTED while the berth was asked —
       // a module in flight takes no pairing, and the far write is taken back
       // (settleChangedRedock) exactly as for a port that changed.
-      if (!pairingAllowedByFlight(readFlightRecord()).ok) return false;
+      if (!pairingAllowedByFlight(readResolvedFlight()).ok) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
@@ -3708,7 +3712,7 @@ export class DoorDockingPortSystem {
     // withdraw, matching today's "silent no-op" refusal shape for owner-gated
     // paths. The pure predicate lives in shipDoc.ts (testable without a doc).
     if (accept) {
-      const flightGate = pairingAllowedByFlight(readFlightRecord());
+      const flightGate = pairingAllowedByFlight(readResolvedFlight());
       if (!flightGate.ok) {
         console.warn(
           `[docking] refused ACCEPTED pairing on ${doorId} — ship is ${flightGate.status} (SH3 gate)`,

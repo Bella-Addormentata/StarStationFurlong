@@ -472,6 +472,34 @@ export function isLegalFlightTransition(from: FlightStatus, to: FlightStatus): b
   }
 }
 
+/**
+ * 🚏 The records to write, in order, to take the stored flight `from` to
+ * `to` along legal edges only (robot pilot routes, build notes A4). A route's
+ * timetable moves the ship without writing the stored flight, so when a game
+ * copies the timetable back (after STOP, or following a person's route
+ * DEPART that wrote `in-flight`) the stored record may be several edges
+ * behind: `in-flight` reaches `docked` only through `redocking`, arrived
+ * where the timetable has the ship, with no dock of its own. One record when
+ * the edge is legal (or nothing is stored); empty when no path needs no
+ * flight fields the target lacks (the route never asks for those). Pure.
+ */
+export function flightWritePath(from: FlightRecord | null, to: FlightRecord): FlightRecord[] {
+  if (!from || isLegalFlightTransition(from.status, to.status)) return [to];
+  const docked: FlightRecord = { status: 'docked', locationId: to.locationId };
+  if (from.status === 'in-flight') {
+    const redocking: FlightRecord = {
+      status: 'redocking',
+      locationId: to.locationId,
+      ...(from.etaAt !== undefined ? { etaAt: from.etaAt } : {}),
+    };
+    if (to.status === 'docked') return [redocking, to];
+    if (to.status === 'undocking') return [redocking, docked, to];
+  }
+  if (from.status === 'redocking' && to.status === 'undocking') return [docked, to];
+  // docked or undocking → redocking would need an in-flight record first.
+  return [];
+}
+
 /** Reasons a DEPART is refused. Surface these in the helm UI verbatim — the
  *  player deserves to know WHY, not just that a button is greyed. */
 export type DepartRefusal =
@@ -486,6 +514,9 @@ export type DepartRefusal =
   | { ok: false; reason: 'no-transfer' }
   /** The ship's station is not on this client's list: nothing to plan from. */
   | { ok: false; reason: 'unlisted-location' }
+  /** 🚏 A route's timetable flies the ship (shipRoute.routeRulesFlightNow):
+   *  a hand DEPART would write a flight nobody follows. */
+  | { ok: false; reason: 'route-running' }
   | { ok: false; reason: 'no-owner' };
 
 /** Inputs the caller assembles from the live docs — kept as a plain struct so
@@ -509,6 +540,9 @@ export interface DepartContext {
    *  replaces the destination's flat one, and null means no transfer exists
    *  (a shared orbit, say). */
   hop?: { fuelCost: number } | null;
+  /** 🚏 True while a route's timetable rules the flight (running, not
+   *  paused): the helm's own route controls fly it then. Absent = false. */
+  routeRunning?: boolean;
 }
 
 /** Predicate the DEPART button funnels through. Returns the refusal reason so
@@ -516,6 +550,7 @@ export interface DepartContext {
 export function canDepart(ctx: DepartContext): DepartRefusal {
   if (!ctx.ownerAuthorized) return { ok: false, reason: 'no-owner' };
   if (!ctx.flightCapable) return { ok: false, reason: 'not-flight-capable' };
+  if (ctx.routeRunning === true) return { ok: false, reason: 'route-running' };
   if (ctx.currentStatus !== 'docked') return { ok: false, reason: 'not-docked' };
   if (!isKnownStation(ctx.destinationId)) return { ok: false, reason: 'unknown-destination' };
   const dest = findStation(ctx.destinationId);

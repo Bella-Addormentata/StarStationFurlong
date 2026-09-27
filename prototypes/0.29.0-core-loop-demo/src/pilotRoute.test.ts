@@ -5,7 +5,9 @@
  * leg, two writers of one event agreeing, the reader checks against hostile
  * or impossible entries, the live-dock rule, a person at the helm and the
  * robot captain's takeover, STOP, fuel with the home refill, pause and
- * RESUME, pruning that keeps the anchor, and the walk cache.
+ * RESUME, pruning that keeps the anchor, and the walk cache. A4: the
+ * resolved flight and what a helm-gated game copies back into the stored
+ * records (after STOP, or following a landed person's in-flight).
  */
 import { describe, expect, it } from 'vitest';
 import { planTransfer } from './orbits';
@@ -26,17 +28,23 @@ import {
   nextStayAtStop,
   pauseCheckpoint,
   renewedHold,
+  resolvedFlight,
   routeCycleLength,
   routeFlightAt,
+  routeFlightRecord,
   routeLegFuel,
   routeLegPairs,
   routeLegsPlannable,
+  routeRefuelStay,
+  routeRulesFlight,
+  routeSettleAction,
   skipCheckpoint,
   startCheckpoint,
   stopAt,
   validateCheckpoints,
 } from './pilotRoute';
 import type { LiveDockAt, RouteFlight } from './pilotRoute';
+import type { FlightRecord } from './shipDoc';
 import type { RouteCheckpoint, RoutePilot, RouteShape, RouteStop, ShipRoute, StartCheckpoint } from './shipRoute';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
@@ -858,5 +866,110 @@ describe('the walk cache', () => {
     const t = performance.now();
     for (let i = 1; i <= 100; i++) routeFlightAt(r, ck, null, month + i * SEC, 100, cache);
     expect(performance.now() - t).toBeLessThan(200);
+  });
+});
+
+// ── The flight PR 172's readers follow (A4) ──────────────────────────────────
+
+describe('the resolved flight (A4)', () => {
+  const r = running(FERRY_SLOTS);
+  const s = start(r);
+  const on = onTimeChain(r, s, 4);
+  const stored: FlightRecord = { status: 'docked', locationId: 'furlong-station' };
+  const alias = (id: string) => `here:${id}`;
+
+  it('is PR 172\'s plain record: the route\'s own figures dropped, its station ids aliased', () => {
+    const docked = at(r, [s], on[0].arrive + SEC);
+    expect(routeFlightRecord(docked, alias)).toEqual({ status: 'docked', locationId: 'here:st-1' });
+    const flying = at(r, [s], on[1].depart + SEC);
+    expect(routeFlightRecord(flying, alias)).toEqual({
+      status: 'in-flight', locationId: 'here:st-1', destinationId: 'here:st-0',
+      departedAt: on[1].depart, etaAt: on[1].arrive,
+    });
+    expect(routeFlightRecord(flying)).toMatchObject({ locationId: 'st-1', destinationId: 'st-0' });
+  });
+
+  it('follows the timetable while the route runs unpaused, the stored record otherwise', () => {
+    const flying = at(r, [s], on[0].depart + SEC);
+    expect(routeRulesFlight(flying)).toBe(true);
+    expect(resolvedFlight(stored, flying)).toMatchObject({ status: 'in-flight', departedAt: on[0].depart, etaAt: on[0].arrive });
+    // Each leg lands and leaves with no write: the clock alone moves it.
+    expect(resolvedFlight(stored, at(r, [s], on[0].arrive + SEC))).toEqual({ status: 'docked', locationId: 'st-1' });
+    // No route, none anchored, or paused: the stored record.
+    expect(resolvedFlight(stored, null)).toBe(stored);
+    const pause = pauseCheckpoint(r, 1, { at: on[0].arrive + 10 * SEC });
+    const paused = at(r, [s, pause], on[0].arrive + 20 * SEC);
+    expect(routeRulesFlight(paused)).toBe(false);
+    expect(resolvedFlight(stored, paused)).toBe(stored);
+  });
+
+  it('REFUEL on a route sets the level at the stay the ship is docked at, never in flight', () => {
+    expect(routeRefuelStay(at(r, [s], on[0].arrive + SEC))).toBe(1);
+    expect(routeRefuelStay(at(r, [s], T0 + SEC))).toBe(0);
+    expect(routeRefuelStay(at(r, [s], on[1].depart + SEC))).toBeNull();
+  });
+});
+
+describe('copying the timetable back (A4)', () => {
+  const r = running(FERRY_SLOTS);
+  const s = start(r, { fuel: 70 });
+  const on = onTimeChain(r, s, 4);
+  const cost = routeLegFuel(r, 0, 1)!;
+  const stopped = { ...r, stoppedAt: on[0].arrive + 10 * SEC };
+  const home: FlightRecord = { status: 'docked', locationId: 'st-0' };
+  const answered = { dockAnswered: true };
+
+  it('after STOP, at the end stop, the derived flight and fuel are copied back', () => {
+    const end = at(stopped, [s], on[3].arrive, { capacity: 100 });
+    expect(end).toMatchObject({ ended: 'stop', stopIndex: 1 });
+    expect(routeSettleAction(home, end, answered)).toEqual({
+      kind: 'finish',
+      writes: [{ status: 'docked', locationId: 'st-1' }],
+      fuel: 70 - cost,
+    });
+  });
+
+  it('a stored in-flight record (a person\'s route DEPART) goes through redocking', () => {
+    const end = at(stopped, [s], on[3].arrive, { capacity: 100 });
+    const flown: FlightRecord = { status: 'in-flight', locationId: 'st-0', destinationId: 'st-1', departedAt: on[0].depart, etaAt: on[0].arrive };
+    expect(routeSettleAction(flown, end, answered)).toEqual({
+      kind: 'finish',
+      writes: [{ status: 'redocking', locationId: 'st-1', etaAt: on[0].arrive }, { status: 'docked', locationId: 'st-1' }],
+      fuel: 70 - cost,
+    });
+  });
+
+  it('waits for the end stop\'s dock to answer, for STOP, and for the end stop itself', () => {
+    const end = at(stopped, [s], on[3].arrive, { capacity: 100 });
+    expect(routeSettleAction(home, end, { dockAnswered: false })).toBeNull();
+    // Not stopped: the route runs on, and robot legs never write the stored flight.
+    expect(routeSettleAction(home, at(r, [s], on[0].arrive + SEC, { capacity: 100 }), answered)).toBeNull();
+    // Stopped, still on the way to the end stop.
+    const late = { ...r, stoppedAt: on[0].depart + 10 * SEC };
+    expect(routeSettleAction(home, at(late, [s], on[0].depart + 20 * SEC, { capacity: 100 }), answered)).toBeNull();
+    expect(routeSettleAction(home, at(late, [s], on[0].arrive + SEC, { capacity: 100 }), answered)).toMatchObject({ kind: 'finish' });
+    // Out of fuel ends the route too, but only STOP finishes it.
+    const dry = start(r, { fuel: cost - 1 });
+    expect(routeSettleAction(home, at(r, [dry], on[0].depart + SEC, { capacity: 100 }), answered)).toBeNull();
+    expect(routeSettleAction(home, at(stopped, [dry], on[0].depart + SEC, { capacity: 100 }), answered)).toMatchObject({
+      kind: 'finish', writes: [{ status: 'docked', locationId: 'st-0' }], fuel: cost - 1,
+    });
+  });
+
+  it('mid-route, a stored in-flight the timetable has landed is walked to docked there', () => {
+    const flown: FlightRecord = { status: 'in-flight', locationId: 'st-0', destinationId: 'st-1', departedAt: on[0].depart, etaAt: on[0].arrive };
+    // In flight on both: nothing to do.
+    expect(routeSettleAction(flown, at(r, [s], on[0].depart + SEC), answered)).toBeNull();
+    expect(routeSettleAction(flown, at(r, [s], on[0].arrive + SEC), { dockAnswered: false })).toEqual({
+      kind: 'follow',
+      writes: [{ status: 'redocking', locationId: 'st-1', etaAt: on[0].arrive }, { status: 'docked', locationId: 'st-1' }],
+    });
+  });
+
+  it('a paused route or none leaves the stored records alone', () => {
+    const pause = pauseCheckpoint(r, 1, { at: on[0].arrive + 10 * SEC });
+    const flown: FlightRecord = { status: 'in-flight', locationId: 'st-1', destinationId: 'x', departedAt: 1, etaAt: 2 };
+    expect(routeSettleAction(flown, at(stopped, [s, pause], on[3].arrive), answered)).toBeNull();
+    expect(routeSettleAction(flown, null, answered)).toBeNull();
   });
 });
