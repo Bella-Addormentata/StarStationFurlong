@@ -15,6 +15,7 @@ import {
   isCoinPusherRecordUnreadable,
   PUSHER_REQUEST_SCAN,
   PUSHER_SWEEP_BATCH,
+  readCasinoOperatorLease,
   readChips,
   readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
@@ -783,6 +784,7 @@ describe('tickCoinPusherRoom', () => {
     tickCoinPusherRoom([MACHINE], NOW + 16);
     expect(isCoinPusherOperator(NOW + 16)).toBe(false);
     expect(readCoinPusherOperatorLease()).toEqual(theirs);
+    expect(readCasinoOperatorLease()).toBeNull(); // the shared stop deleted the primary that named us
   });
 
   it('leaving the room releases its leases and takes none back while the release is sent', () => {
