@@ -1738,6 +1738,12 @@ async function joinRoomAtEpoch(
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
       if (docked) return docked;
+      // A module bolted into a station by structure (a station-keeping helm
+      // room wears engine, tank and helm too) belongs to that station, never
+      // to its own flight record: only a free-flying ship follows the flight.
+      for (const rec of readAllDoors().values()) {
+        if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) return null;
+      }
       return isShipReady() ? readFlightRecord().locationId : null;
     });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
