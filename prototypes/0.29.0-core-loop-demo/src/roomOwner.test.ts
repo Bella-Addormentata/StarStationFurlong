@@ -324,3 +324,99 @@ describe('isDeedHolder — the deed, not owner-equivalence', () => {
     expect(isDeedHolder('player-them', noEntries)).toBe(false);
   });
 });
+
+/**
+ * Leaving a room hands this client none of it. `leaveRoom` gives up `yjsSync`
+ * before it waits for the sync to flush and stop, and both main.ts gates fall
+ * back to "offline: this client is alone" when there is no sync. Without the
+ * leaving check first, a departing client — a visitor included — ran the old
+ * room's croupiers and its owner-gated paths (the manual slot operator among
+ * them) while its writes still went out (PR #137 review). A second leave in
+ * that wait finds no sync and returns, and its caller may join the next room;
+ * the first leave then tears down only what was its own room's (PR #167
+ * review).
+ *
+ * A leave holds the gates only while its room can still send: once its sync's
+ * writer is closing, a stalled close must not keep them shut in a room joined
+ * meanwhile (PR #167 review).
+ *
+ * ⚠️ Like the #142 block above, this SCANS the source: main.ts can't be loaded
+ * by vitest. It pins the wiring (both gates check the flag before the offline
+ * fallback, a leave holds the flag until its sync is closed to new writes and
+ * no longer, and a leave claims its room's resources before the wait), not
+ * that a frame lands inside the window.
+ */
+describe('leaving a room hands this client none of it (source scan)', () => {
+  const main = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'main.ts'), 'utf8');
+
+  /** The body of the predicate registered with `setter(() => { … });`. */
+  const gate = (setter: string): string => {
+    const start = main.indexOf(`${setter}(() => {`);
+    expect(start, `${setter} not found in main.ts`).toBeGreaterThan(-1);
+    return main.slice(start, main.indexOf('\n  });', start));
+  };
+
+  /** The body of a named top-level (async) function, up to the next one. */
+  const bodyOf = (name: string): string => {
+    const start = main.indexOf(`function ${name}(`);
+    expect(start, `${name} not found in main.ts`).toBeGreaterThan(-1);
+    const next = main.slice(start + 1).search(/\n(async )?function /);
+    return main.slice(start, next === -1 ? main.length : start + 1 + next);
+  };
+
+  it('both gates refuse while a leave is under way, before their offline fallback', () => {
+    for (const setter of ['setRoomEditPermission', 'setSoleCroupierPredicate']) {
+      const body = gate(setter);
+      const leaving = body.indexOf('if (roomLeavesUnderWay > 0)');
+      expect(leaving, `${setter} must refuse while leaving`).toBeGreaterThan(-1);
+      expect(leaving, `${setter} must refuse before "no sync ⇒ alone"`).toBeLessThan(body.indexOf('if (!yjsSync)'));
+    }
+  });
+
+  it('a leave holds the flag until its sync is closed to new writes, and no longer', () => {
+    // leaveRoom raises it and lowers it once: when the leave says its room can
+    // send nothing more, or at the leave's end, whichever comes first.
+    expect(bodyOf('leaveRoom')).toMatch(
+      /roomLeavesUnderWay\+\+;[\s\S]*if \(!sending\) return;\s*sending = false;\s*roomLeavesUnderWay--;[\s\S]*try \{\s*await leaveRoomNow\(closed\);\s*\} finally \{\s*closed\(\);\s*\}/,
+    );
+    // Nothing else lowers it.
+    expect(main.match(/roomLeavesUnderWay--/g)).toHaveLength(1);
+    const now = bodyOf('leaveRoomNow');
+    expect(now).toContain('yjsSync = null');
+    // Held through the flush wait: the room's last writes still go out then.
+    const wait = now.indexOf('sync.flush()');
+    const stop = now.indexOf('const stopping = sync.stop();');
+    expect(wait).toBeGreaterThan(-1);
+    expect(stop, 'stop the sync after the flush wait').toBeGreaterThan(wait);
+    // Lowered once stop() has asked the writer to close, before the close is
+    // awaited: a stalled transport can hold the close indefinitely.
+    const lowered = now.indexOf('closed();');
+    expect(lowered, 'lower the flag once the sync is stopping, not before').toBeGreaterThan(stop);
+    expect(lowered).toBeLessThan(now.indexOf('await stopping;'));
+    // A leave that claimed no sync lowers it before it drops the link.
+    const noSync = now.indexOf('closed();', lowered + 1);
+    expect(noSync, 'a leave with no sync lowers it too').toBeGreaterThan(now.indexOf('await stopping;'));
+    expect(noSync).toBeLessThan(now.indexOf('networkProvider.disconnect()'));
+  });
+
+  it('a leave that a newer leave or join overlaps tears down only its own room', () => {
+    const now = bodyOf('leaveRoomNow');
+    const wait = now.indexOf('sync.flush()');
+    // The room's snapshot writer is claimed with the sync, before the wait…
+    const claim = now.indexOf('const cache = roomCacheHandle;');
+    expect(claim, 'claim the snapshot writer').toBeGreaterThan(-1);
+    expect(claim).toBeLessThan(wait);
+    expect(now.indexOf('roomCacheHandle = null;')).toBeGreaterThan(claim);
+    expect(now.indexOf('roomCacheHandle = null;')).toBeLessThan(wait);
+    // …and only that writer is flushed and detached after it, never whichever
+    // one a newer join has attached meanwhile.
+    expect(now).toContain('cache?.flushNow()');
+    expect(now).toContain('cache?.detach()');
+    expect(now).not.toMatch(/roomCacheHandle\?\.(flushNow|detach)\(/);
+    // The shared link is dropped only while this leave still owns the session.
+    expect(now).toMatch(/const epoch = \+\+sessionEpoch;/);
+    const owns = now.indexOf('if (epoch !== sessionEpoch) return;');
+    expect(owns, 'drop the link only while this leave owns the session').toBeGreaterThan(wait);
+    expect(owns).toBeLessThan(now.indexOf('networkProvider.disconnect()'));
+  });
+});
