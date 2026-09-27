@@ -47,8 +47,10 @@ import type { StationBerthRecord, StationMove, StationRecord } from './stations'
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
-/** A trim as it travels: the burn's orbit numbers, never its fuel meter. */
-export type SharedTrim = Omit<OrbitTrim, 'fuelDrawn'>;
+/** A trim as it travels: the burn's orbit numbers, and the fuel the room's
+ *  burns have drawn in all (optional; older builds send none), which orders
+ *  trims whose last burns share a moment (newerTrim). */
+export type SharedTrim = OrbitTrim;
 
 export interface StationSummary {
   welcomeRoomId: string;
@@ -163,7 +165,10 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
   // A burn's time is peer-written and decides which trim wins: no later
   // than the same skew any other stamp may run ahead.
   if (!isOrbitTrim(v) || v.at > now + MAX_SKEW_MS) return undefined;
-  return { planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last };
+  return {
+    planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
+    ...(v.fuelDrawn !== undefined ? { fuelDrawn: v.fuelDrawn } : {}),
+  };
 }
 
 /** Shape guard + copy: a summary crosses the peer trust boundary. */
@@ -264,11 +269,17 @@ function writeStore(store: Store): void {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch { /* quota */ }
 }
 
-/** The newer of two trims (a trim is one burn, written whole). */
+/** The newer of two trims: the later last burn; between trims whose last
+ *  burns share a moment (two sticks pushed in one millisecond), the one
+ *  that drew more fuel has replayed more burns, so it holds the other's
+ *  burns too; then tieBreak. */
 function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): SharedTrim | undefined {
   if (!a) return b;
   if (!b) return a;
   if (b.at !== a.at) return b.at > a.at ? b : a;
+  if (a.fuelDrawn !== undefined && b.fuelDrawn !== undefined && a.fuelDrawn !== b.fuelDrawn) {
+    return b.fuelDrawn > a.fuelDrawn ? b : a;
+  }
   return tieBreak(a, b);
 }
 
@@ -314,7 +325,10 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
     : incoming.updatedAt !== prior.updatedAt
       ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
       : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
-  const trim = newerTrim(prior.trim, incoming.trim);
+  // Only a trim of the orbit the standing record flies: one published for
+  // the slot that lost would be dropped by every reader anyway.
+  const fits = (t: SharedTrim | undefined) => (t && trimFor(base, t) ? t : undefined);
+  const trim = newerTrim(fits(prior.trim), fits(incoming.trim));
   const move = newerMove(prior.move, incoming.move);
   const gates = newerBerths(prior, incoming);
   const next: StationSummary = { ...base };
@@ -533,7 +547,10 @@ export function registerLearnedStations(
     const had = saved.get(rec.id) as (StationRecord & Record<string, unknown>) | undefined;
     // The install's own record under a learned-looking id is never replaced.
     if (had && !isLearnedRecord(had)) continue;
-    const sameExt = Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
+    // Both ways: a field the summary no longer carries must go too.
+    const hadExt = Object.keys(had ?? {}).filter((k) => !KNOWN_FIELDS.has(k));
+    const sameExt = hadExt.length === Object.keys(s.ext ?? {}).length
+      && Object.entries(s.ext ?? {}).every(([k, v]) => JSON.stringify(had?.[k]) === JSON.stringify(v));
     if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
       && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor
@@ -601,12 +618,17 @@ export function pullPlanetSummary(now = Date.now()): void {
   const store = readStore(now);
   let changed = false;
   let scanned = 0;
+  // Entries whose visible value lost to what this install holds: written
+  // back below, so the map shows the same winner every install keeps.
+  const staleStations = new Map<string, StationSummary>();
+  const staleShips = new Map<string, ShipSummary>();
   for (const [k, v] of stationMap!.entries()) {
     if (++scanned > MAX_STATIONS * 4) break;
     const s = cleanStationSummary(v, now);
     if (!s || s.welcomeRoomId !== k) continue;
     const next = mergeStation(store.stations[k], s);
     if (next) { store.stations[k] = next; changed = true; }
+    if (JSON.stringify(store.stations[k]) !== JSON.stringify(s)) staleStations.set(k, s);
   }
   scanned = 0;
   for (const [k, v] of shipMap!.entries()) {
@@ -615,12 +637,30 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (!s || s.roomId !== k || now - s.updatedAt > SHIP_STALE_MS) continue;
     const next = mergeShip(store.ships[k], s);
     if (next) { store.ships[k] = next; changed = true; }
+    if (JSON.stringify(store.ships[k]) !== JSON.stringify(s)) staleShips.set(k, s);
+  }
+  const pins = firstHandKeys();
+  if (changed) {
+    store.stations = capped(store.stations, MAX_STATIONS, pins.stations, (st) => stationRecency(st, now));
+    store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
+    writeStore(store);
+  }
+  if (staleStations.size > 0 || staleShips.size > 0) {
+    // A local write: the observer skips it, so this never loops.
+    doc!.transact(() => {
+      for (const [k, s] of staleStations) {
+        const won = store.stations[k];
+        const next = won && mergeStation(s, won);
+        if (next) stationMap!.set(k, next);
+      }
+      for (const [k, s] of staleShips) {
+        const won = store.ships[k];
+        const next = won && mergeShip(s, won);
+        if (next) shipMap!.set(k, next);
+      }
+    });
   }
   if (!changed) return;
-  const pins = firstHandKeys();
-  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, (st) => stationRecency(st, now));
-  store.ships = capped(store.ships, MAX_SHIPS, pins.ships);
-  writeStore(store);
   applyLearned(store);
   notify();
 }

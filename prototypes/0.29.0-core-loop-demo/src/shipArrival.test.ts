@@ -338,6 +338,8 @@ describe('a round trip', () => {
     const at = adriftAt('planet-sovereign', 1);
     expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: at });
     expect(adriftPlace(at)).toEqual({ planetId: 'planet-sovereign', orbitSlot: 1 });
+    expect(adriftPlace(adriftAt('planet-sovereign', 15))).not.toBeNull();
+    expect(adriftPlace(adriftAt('planet-sovereign', 16))).toBeNull();
     expect(locationPlanet(at)).toBe('planet-sovereign');
     expect(destinationsFrom(at).map((d) => d.id)).toEqual(['furlong-station']);
     expect(planHop(at, 'furlong-station', now)).not.toBeNull();

@@ -2735,7 +2735,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       fuel,
       drawn: readMoveFuelDrawn(),
       deficit: fuelDrawDeficit('stationMove'),
-      modules: station?.welcomeRoomId ? Math.max(1, atlasComponent(readStationAtlas(), station.welcomeRoomId).size) : 1,
+      // 0 (refused) when the station's layout is not in this install's atlas.
+      modules: station ? atlasComponent(readStationAtlas(), station.welcomeRoomId).size : 0,
       now,
     };
   };

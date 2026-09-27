@@ -86,9 +86,27 @@ afterEach(() => {
 
 describe('guards', () => {
   it('accepts a well-formed station summary and copies only known fields', () => {
-    const s = cleanStationSummary({ ...summary(), trim: { ...trim(), fuelDrawn: 7 }, junk: 1 }, T0);
-    expect(s).toEqual({ ...summary(), trim: { ...trim() } });
-    expect(s?.trim).not.toHaveProperty('fuelDrawn');
+    const s = cleanStationSummary({ ...summary(), trim: { ...trim(), fuelDrawn: 7, junk: 2 }, junk: 1 }, T0);
+    expect(s).toEqual({ ...summary(), trim: { ...trim(), fuelDrawn: 7 } });
+  });
+
+  it('settles trims whose last burns share a moment on the one with more burns, in either order', () => {
+    const lower = summary({ trim: trim({ dRadiusKm: -2, fuelDrawn: 1 }) });
+    const raise = summary({ trim: trim({ dRadiusKm: 2, fuelDrawn: 1 }) });
+    const both = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+    for (const [a, b] of [[lower, raise], [raise, lower]]) {
+      const partial = mergeStation(a, b) ?? a;
+      expect(mergeStation(partial, both)?.trim?.dRadiusKm).toBe(0);
+      expect(mergeStation(both, partial)).toBeNull();
+    }
+  });
+
+  it("keeps the standing record's trim over a newer one for another slot", () => {
+    const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
+    const late = summary({ orbitSlot: 1, updatedAt: T0 + 50, trim: trim({ slot: 1, at: T0 + 40 }) });
+    const merged = mergeStation(first, late) ?? first;
+    expect(merged.orbitSlot).toBe(2);
+    expect(merged.trim?.slot).toBe(2);
   });
 
   it('refuses bad shapes, slots and future stamps', () => {
@@ -134,6 +152,21 @@ describe('guards', () => {
     expect(s?.ext).toEqual({ tow });
     expect(cleanStationSummary({ ...summary(), ext: { big: 'x'.repeat(2000) } }, T0)?.ext).toBeUndefined();
     expect(cleanStationSummary({ ...summary(), ext: [1, 2] }, T0)?.ext).toBeUndefined();
+  });
+
+  it("saves a learned station's extra fields, and does not rewrite it when they are unchanged", () => {
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    const s = summary({ ext: { tow } });
+    expect(registerLearnedStations(SOV, [s])).toBe(1);
+    expect((readStationRecords().find((r) => r.welcomeRoomId === 'room-hab') as unknown as { tow?: unknown }).tow).toEqual(tow);
+    expect(registerLearnedStations(SOV, [s])).toBe(0);
+  });
+
+  it("drops a learned station's extra field once the summary no longer carries it", () => {
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    registerLearnedStations(SOV, [summary({ ext: { tow } })]);
+    expect(registerLearnedStations(SOV, [summary()])).toBe(1);
+    expect(readStationRecords().find((r) => r.welcomeRoomId === 'room-hab')).not.toHaveProperty('tow');
   });
 
   it('checks ship summaries', () => {
@@ -294,6 +327,21 @@ describe('sharing through the room doc', () => {
     sync(peer, doc);
     const hab = listStations().find((s) => s.id === 'hab')!;
     expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm - 6, 6);
+  });
+
+  it('writes the winner back when a peer\'s value loses the merge', () => {
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install(null));
+    // The first published (unowned) record stands here…
+    const peer1 = new Y.Doc();
+    peer1.getMap('stationSummaries').set('room-hab', summary({ orbitSlot: 2, updatedAt: T0 }));
+    sync(peer1, doc);
+    // …and a later first publish from an install that was offline reaches the map.
+    const peer2 = new Y.Doc();
+    peer2.getMap('stationSummaries').set('room-hab', summary({ orbitSlot: 1, updatedAt: T0 + 50 }));
+    sync(peer2, doc);
+    expect(readStore().stations['room-hab']?.orbitSlot).toBe(2);
+    expect((doc.getMap('stationSummaries').get('room-hab') as StationSummary).orbitSlot).toBe(2);
   });
 
   it('ignores junk a peer writes into the maps', () => {
