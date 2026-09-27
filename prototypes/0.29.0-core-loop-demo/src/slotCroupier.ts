@@ -481,9 +481,12 @@ export function tickSlotMachineRoom(
   const docEpoch = casinoDocEpoch();
   const playerId = getPlayerId();
   // A teardown belongs to the room it was queued in, and a machine put back
-  // before it ran is no longer to be torn down (TEARDOWN).
+  // before it ran is no longer to be torn down (TEARDOWN). A session that may
+  // no longer manage the room tears nothing down: those that may queued the
+  // same removals.
   for (const [machineId, removedIn] of [...pendingTeardowns]) {
-    if (removedIn !== docEpoch || machineIds.includes(machineId)) pendingTeardowns.delete(machineId);
+    if (removedIn !== docEpoch || machineIds.includes(machineId)
+      || !(auto || manualAuthorized)) pendingTeardowns.delete(machineId);
   }
   for (const [machineId, manual] of manualMachines) {
     // Machines are run by hand only where nobody runs the croupier, by a room
@@ -1134,6 +1137,13 @@ export function closeSlotMachine(
   requestPolls.delete(machineId);
   requestFirstSeen.delete(machineId);
   earlierBuildLeasesSeen.delete(machineId);
+  // No longer operated here from now on, not just from the next room tick: an
+  // accept paused at an await takes no new wager on it (operatedNow).
+  if (operatedNow?.ids.has(machineId)) {
+    const ids = new Set(operatedNow.ids);
+    ids.delete(machineId);
+    operatedNow = { docEpoch: operatedNow.docEpoch, ids };
+  }
   // A room this session is leaving is left to the sessions still in it.
   if (!canManage || isLeavingRoom()) {
     pendingTeardowns.delete(machineId);
@@ -1144,8 +1154,11 @@ export function closeSlotMachine(
 
 /** A queued teardown, run by the room's operator (TEARDOWN): refund a round's
  *  stake, return the machine's bankroll to its owner, and delete its keys. One
- *  attempt, in the take it began under: a machine whose stake can't be refunded
- *  keeps its keys, as it always has, rather than holding the room's lease. */
+ *  attempt, in the take it began under. A machine whose chips can't all be
+ *  accounted for keeps its keys, chips and all, rather than holding the room's
+ *  lease: a stake locked with no round to refund it by (an earlier build's
+ *  stake whose spin never arrived, an unreadable spin), a stake that can't be
+ *  refunded, or a bankroll its owner can't be credited. */
 async function closeSlotMachineManaged(machineId: string, tenure: string): Promise<void> {
   const docEpoch = casinoDocEpoch();
   const forget = (): void => {
@@ -1178,16 +1191,17 @@ async function closeSlotMachineManaged(machineId: string, tenure: string): Promi
   if (!stillOperates(docEpoch, tenure)) return;
   forget();
   // The refund and the machine's removal go out in one transaction (TERMINAL
-  // WRITES above). With no stake locked there is nothing to refund.
+  // WRITES above). With no stake locked there is nothing to refund; a stake
+  // locked with no round to refund it by stays, and the machine with it.
   const closed = transactCasino(() => {
-    if (refund && hasSlotEscrow(machineId) && !refundSlotWager(
+    if (hasSlotEscrow(machineId) && (!refund || !refundSlotWager(
       machineId,
       refund.player,
       refund.bet,
       refund.funding,
       refund.token,
-    )) return false;
-    drainSlotMachineFunding(machineId);
+    ))) return false;
+    if (!drainSlotMachineFunding(machineId)) return false;
     clearSlotMachineKeys(machineId);
     return true;
   });

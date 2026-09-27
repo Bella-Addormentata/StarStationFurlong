@@ -881,21 +881,24 @@ export function refundSlotWager(
   return true;
 }
 
-/** Return a removed machine's private bankroll to the configured owner. */
-export function drainSlotMachineFunding(machineId: string): void {
-  const config = readSlotFundingConfig(machineId);
-  if (!config) return;
+/** Return a removed machine's private bankroll to the configured owner.
+ *  False when it holds chips that can't be paid out (no owner to pay, or
+ *  the owner's balance can't take them): nothing is written then. */
+export function drainSlotMachineFunding(machineId: string): boolean {
   const map = ensureMap();
   const fundingKey = `slot-bankroll:machine:${machineId}`;
   const amount = safeCount(map, fundingKey);
-  if (amount <= 0) return;
+  if (amount <= 0) return true;
+  const config = readSlotFundingConfig(machineId);
+  if (!config) return false;
   const ownerKey = `bal:${config.ownerId}`;
   const ownerBalance = safeCount(map, ownerKey);
-  if (!Number.isSafeInteger(ownerBalance + amount)) return;
+  if (!Number.isSafeInteger(ownerBalance + amount)) return false;
   boundDoc!.transact(() => {
     map.delete(fundingKey);
     map.set(ownerKey, ownerBalance + amount);
   });
+  return true;
 }
 
 /** Remove all casino-map keys for a slot machine (teardown on item removal). */

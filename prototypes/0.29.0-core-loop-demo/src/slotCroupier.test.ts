@@ -1047,6 +1047,71 @@ describe('a removed machine', () => {
     expect(slotOperatorWatchCount()).toBe(0);
   });
 
+  it('whose bankroll its owner can\'t be credited keeps it, and the lease goes', async () => {
+    const funding = { mode: 'machine' as const, ownerId: OPERATOR };
+    writeSlotFundingConfig(M1, funding);
+    expect(depositSlotFunding(M1, OPERATOR, 1_000)).toBe(true);
+    // The owner's balance can't take another 1,000 chips.
+    doc.getMap('casino').set(`bal:${OPERATOR}`, Number.MAX_SAFE_INTEGER - 10);
+    closeSlotMachine(M1, true);
+    const ready = becomeOperator([]);
+    await acceptsDone();
+    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000);
+    expect(readSlotFundingConfig(M1)).not.toBeNull();
+    tickSlotMachineRoom([], false, at(ready + 100));
+    expect(readSlotOperatorLease()).toBeNull();
+  });
+
+  it('whose bankroll has no owner on record keeps it', async () => {
+    const funding = { mode: 'machine' as const, ownerId: OPERATOR };
+    writeSlotFundingConfig(M1, funding);
+    expect(depositSlotFunding(M1, OPERATOR, 1_000)).toBe(true);
+    doc.getMap('casino').delete(`slot-funding:${M1}`); // a peer deleted its funding record
+    closeSlotMachine(M1, true);
+    becomeOperator([]);
+    await acceptsDone();
+    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000);
+  });
+
+  it('with a stake locked but no round to refund it by, keeps the stake and the machine', async () => {
+    // An earlier build's stake whose spin never arrived: an escrow, no spin.
+    const funding = { mode: 'machine' as const, ownerId: OPERATOR };
+    writeSlotFundingConfig(M1, funding);
+    expect(depositSlotFunding(M1, OPERATOR, 1_000)).toBe(true);
+    expect(reserveSlotWager(M1, PLAYER, BET, funding, RESERVE)).toBe('ok');
+    closeSlotMachine(M1, true);
+    const ready = becomeOperator([]);
+    await acceptsDone();
+    expect(hasSlotEscrow(M1)).toBe(true);
+    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).toBe(1_000 + BET - RESERVE);
+    expect(readChips(PLAYER)).toBe(100 - BET);
+    tickSlotMachineRoom([], false, at(ready + 100));
+    expect(readSlotOperatorLease()).toBeNull();
+  });
+
+  it('is left to the sessions that may still manage the room', async () => {
+    machineHoldingChips(M1);
+    closeSlotMachine(M1, true);
+    setSoleCroupierPredicate(() => false); // the deed changed hands
+    becomeOperator([]); // …and this client may not run machines by hand either
+    await acceptsDone();
+    expect(slotOperatorWatchCount()).toBe(0);
+    expect(readSlotOperatorLease()).toBeNull();
+    expect(hasSlotEscrow(M1)).toBe(true);
+    expect(doc.getMap('casino').get(`slot-bankroll:machine:${M1}`)).not.toBeUndefined();
+  });
+
+  it('takes no wager from an accept paused at an await when it is removed', async () => {
+    fund(M1);
+    await requestSpin(M1);
+    becomeOperator([M1]); // the accept starts, then awaits
+    closeSlotMachine(M1, true); // removed before the next room tick
+    await acceptsDone();
+    expect(spinning(M1)).toBe(false);
+    expect(hasSlotEscrow(M1)).toBe(false);
+    expect(readChips(PLAYER)).toBe(100);
+  });
+
   it('belongs to the room it was queued in', () => {
     closeSlotMachine(M1, true); // queued in this room
     // The next room's doc, bound without a leave, holds a machine of that id.
