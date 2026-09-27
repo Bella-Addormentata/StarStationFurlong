@@ -52,8 +52,9 @@
  * client replays the same burns to the same trim, and merging burns never
  * loses one or its fuel. Each level write (REFUEL, DEPART) SETTLES the log:
  * the fuel record keeps, beside the meter's reading, where the burns so far
- * left the trim, the fuel they drew, and the keys of the burns it covered,
- * paid for or dropped (KeepingSettlement). The replay starts from the
+ * left the trim, the fuel they drew, the keys of the burns it covered, paid
+ * for or dropped, and the last of them to fire, which the lockout on each
+ * orbit still follows (KeepingSettlement). The replay starts from the
  * settlement, a dropped burn stays dropped whatever the next REFUEL brings,
  * and the next burn clears the entries it covered. So the log holds only the
  * burns since the last level write. A burn that reaches us after a level
@@ -204,6 +205,11 @@ export interface KeepingSettlement {
   /** The log keys it covered: the burns paid for, and the ones dropped
    *  because the fuel could not cover them. */
   burns: string[];
+  /** The last burns that fired, on whatever orbit, each at the time it
+   *  applied (at most MAX_SETTLED_FIRED): the replay skips the burns the
+   *  settlement covers, and the stick's lockout on each orbit still follows
+   *  them. Left out (a settlement from before), the trim's last burn. */
+  fired?: FiredBurn[];
 }
 
 /** An angle folded into (−π, π]. */
@@ -266,6 +272,17 @@ const MAX_SETTLED_BURNS = 2 * MAX_LOG;
 /** A log key is `burn:`, a client id and a time: well under this. */
 const MAX_BURN_KEY_LEN = 64;
 
+/** A settlement keeps at most this many of the last burns that fired: far
+ *  more than can fire within one burn of each other. */
+const MAX_SETTLED_FIRED = 16;
+
+/** Shape guard for a fired burn off the wire. */
+function isFiredBurn(v: unknown): v is FiredBurn {
+  if (typeof v !== 'object' || v === null) return false;
+  const r = v as Partial<Record<keyof FiredBurn, unknown>>;
+  return isBasis(r.planetId, r.slot) && isDirection(r.dir) && isBurnTime(r.at);
+}
+
 /** Shape guard for a settlement off the fuel record. */
 export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
   if (typeof v !== 'object' || v === null) return false;
@@ -273,13 +290,20 @@ export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
   return (r.trim === null || isOrbitTrim(r.trim))
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX
     && Array.isArray(r.burns) && r.burns.length <= MAX_SETTLED_BURNS
-    && r.burns.every((k) => typeof k === 'string' && k.startsWith(BURN_KEY_PREFIX) && k.length <= MAX_BURN_KEY_LEN);
+    && r.burns.every((k) => typeof k === 'string' && k.startsWith(BURN_KEY_PREFIX) && k.length <= MAX_BURN_KEY_LEN)
+    && (r.fired === undefined
+      || (Array.isArray(r.fired) && r.fired.length <= MAX_SETTLED_FIRED && r.fired.every(isFiredBurn)));
 }
 
 /** A trim's orbit fields only (a record from before the log also carries
  *  its fuel, which the meter reads apart). */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
   return { planetId: t.planetId, slot: t.slot, dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
+}
+
+/** Only the fields a fired burn has — what a settlement keeps. */
+function cleanFired(b: FiredBurn): FiredBurn {
+  return { planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at };
 }
 
 /** Only the fields a burn has — what a write publishes. */
@@ -639,8 +663,9 @@ let heard: string | null = null;
 interface RoomReplay {
   trim: OrbitTrim | null;
   fuelDrawn: number;
-  /** Every burn that fired: the settled run's last one, then the burns
-   *  since, each at the time it applied (BurnRun). */
+  /** Every burn that fired: the last ones the settlement kept (or the
+   *  settled trim's last burn), then the burns since, each at the time it
+   *  applied (BurnRun). */
   fired: FiredBurn[];
   /** The log keys the settlement covers. */
   covered: ReadonlySet<string>;
@@ -813,15 +838,23 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   // room, so the next burn clears it.
   const keys = [...settledKeys, ...taken.map((p) => p.key)];
   keys.push(...junk.sorted().slice(0, MAX_SETTLED_BURNS - keys.length));
+  // The burns a settlement covers are replayed no more, so it keeps the last
+  // that fired, on every orbit, for the lockout.
+  const fired = [...(settled?.fired ?? (start ? [lastBurnOf(start)] : [])), ...run.fired];
   return {
     trim: run.trim,
     fuelDrawn: run.fuelDrawn,
-    fired: start ? [lastBurnOf(start), ...run.fired] : run.fired,
+    fired,
     covered,
     settledKeys,
     pending: waiting,
     settlement: settled || keys.length > 0
-      ? { trim: run.trim && cleanTrim(run.trim), fuelDrawn: run.fuelDrawn, burns: keys }
+      ? {
+        trim: run.trim && cleanTrim(run.trim),
+        fuelDrawn: run.fuelDrawn,
+        burns: keys,
+        fired: fired.slice(-MAX_SETTLED_FIRED).map(cleanFired),
+      }
       : undefined,
   };
 }
@@ -861,7 +894,12 @@ function replayRoom(): RoomReplay {
 function settleLog(): KeepingSettlement | undefined {
   if (!docAlive()) return undefined;
   const s = replayRoom().settlement;
-  return s && { trim: s.trim && { ...s.trim }, fuelDrawn: s.fuelDrawn, burns: [...s.burns] };
+  return s && {
+    trim: s.trim && { ...s.trim },
+    fuelDrawn: s.fuelDrawn,
+    burns: [...s.burns],
+    ...(s.fired ? { fired: s.fired.map(cleanFired) } : {}),
+  };
 }
 
 /** The room's trim (its burns replayed), or null: none, unbound, or nothing
