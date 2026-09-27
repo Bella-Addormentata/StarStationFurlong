@@ -9,6 +9,12 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 ## Unreleased
 
+- The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO beyond the experimental opt-in node asset (a re-scoping of its "B-7" gate is proposed in the sovereign plan §14, 2026-09-05, pending ratification, with an S-0 crate audit gating the node-side lane instead), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
+
+- **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
+
+## v0.38.0 — 2026-09-27
+
 - **🏒 A two-player air hockey table, free to play ([#116](https://github.com/Bella-Addormentata/StarStationFurlong/pull/116), part of [#115](https://github.com/Bella-Addormentata/StarStationFurlong/issues/115)).** A new 2×3 game table with a stand at each end, spawnable from the DEV menu's FURNITURE list (🏒 AIR HOCKEY TABLE). Walk up to an end and the camera locks into a first-person view over your goal. Pointer lock steers your mallet: hold the mouse button to press it onto the table, and let go to lift it (a lifted mallet passes over the puck). First to 7 wins. A pole-mounted scoreboard, readable from both ends, and goal lamps follow the match. Serves run on a countdown, **PRACTICE** plays solo against both goals, and an opponent silent for 10 s forfeits. Esc or WASD steps back.
   - **Over the network.** Mallet and puck positions ride the 13-byte tick datagram as two new lane kinds (mallet at 30 Hz, puck at 20 Hz), with u16 serials and echo drops; movement ticks are unchanged. Score and match state sync through the shared `games` map with the same shape-guarded writes as chess and checkers. One client runs the puck's physics, and everyone else smooths.
   - **One page plays each end.** A player id is shared by every tab and device of that player, so the table records which page plays each claimed end. Another page of the same player shows **PLAY HERE**, which moves the end to it.
@@ -51,9 +57,7 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
   - A removed machine's chips need an operator present to pay them out. If every session that may manage the room leaves first, they stay in its records.
   - A peer that keeps writing earlier-build lease records keeps the room's slots closed: past 64 of them, this build fails closed rather than risk two writers.
 
-- The mesh increments deliberately deferred out of v0.29.0 (see that entry's scope note): **M5.5** per-tick authorship (amortized epoch-signature on the 13-byte tick lane — closes the last tick-spoof gap), **M5.4** lazy-pull graduation from opt-in (`SSF_MESH_LAZYPULL`) to on-by-default once its dropped-frame recovery is hardware-verified, and the **large-room hardening** (emit `graft`/`prune`/`px` so membership is symmetric above 8 nodes, plus the eclipse tier-diversity floor + IWANT rate limit). Also still ahead: **ChiaHub C1** chain IO beyond the experimental opt-in node asset (a re-scoping of its "B-7" gate is proposed in the sovereign plan §14, 2026-09-05, pending ratification, with an S-0 crate audit gating the node-side lane instead), **E4** furniture PERSISTENCE, **S3** presence (name tags + remote outfits), and the station-doc flight-control authority tree.
-
-- **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
+- **🔒 vitest 4.1.11: Dependabot's two moderate alerts closed ([GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9)).** A path traversal in `@vitest/mocker` let a client that could reach a vitest dev server read files the server process can read; 3.x gets no fix. Nothing here was exposed: `npm test` and CI run `vitest run`, which opens no listening socket, and no build ships vitest. 4.1.11 keeps vite 6 and CI's Node 20, and all 951 tests pass on it unchanged.
 
 ## v0.37.0 — 2026-09-27
 
