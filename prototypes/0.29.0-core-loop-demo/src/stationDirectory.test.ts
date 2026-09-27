@@ -12,13 +12,17 @@ import {
   destinationsFrom,
   destinationsFromRecords,
   directoryFromStationRecords,
+  FUEL_PER_KMS,
   findStation,
+  planHop,
+  planRecordHop,
   isKnownStation,
   listStations,
   setStationDirectory,
   stationHere,
   type StationDestination,
 } from './stationDirectory';
+import { planTransfer } from './orbits';
 
 afterEach(() => setStationDirectory(null));
 
@@ -106,5 +110,41 @@ describe('the station record as destinations', () => {
     setStationDirectory(directoryFromStationRecords(() => records, (rid) => seeds[rid], () => 'furlong-station'));
     expect(destinationsFrom('furlong-station').map((s) => s.id)).toEqual(['station:mod-2', 'far']);
     expect(findStation('station:mod-2').berth?.address).toBe('seed-mod');
+  });
+});
+
+describe('planning a hop', () => {
+  it('leaves now at the flat cost when the directory has no planner', () => {
+    expect(planHop('furlong-station', 'high-orbit', 1000)).toEqual({ departAt: 1000, arriveAt: 1000 + TRAVEL_MS_MIN, fuelCost: 25 });
+    expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
+    expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
+  });
+
+  it('follows the circular-orbit model over station records', () => {
+    const records = [
+      { id: 'low', name: 'LOW', planetId: 'planet-sovereign', orbitSlot: 0, welcomeRoomId: 'r0' },
+      { id: 'high', name: 'HIGH', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'r1' },
+      { id: 'twin', name: 'TWIN', planetId: 'planet-sovereign', orbitSlot: 0, welcomeRoomId: 'r2' },
+    ];
+    setStationDirectory(directoryFromStationRecords(() => records, () => undefined, () => null));
+    const now = Date.UTC(2026, 8, 27);
+    const hop = planHop('low', 'high', now)!;
+    const t = planTransfer(records[0], records[1], now)!;
+    expect(hop.departAt).toBe(t.departAt);
+    expect(hop.arriveAt).toBe(t.arriveAt);
+    expect(hop.departAt).toBeGreaterThanOrEqual(now);
+    expect(hop.fuelCost).toBe(Math.ceil(t.deltaVKmS * FUEL_PER_KMS));
+    expect(hop.windowEveryMs).toBe(t.synodicMs);
+    // Two stations sharing one orbit have no transfer between them.
+    expect(planHop('low', 'twin', now)).toBeNull();
+  });
+
+  it('prices a low hop so one tank flies more than one', () => {
+    const now = Date.UTC(2026, 8, 27);
+    const low = { id: 'a', name: 'A', planetId: 'planet-sovereign', orbitSlot: 0, welcomeRoomId: 'a' };
+    const next = { id: 'b', name: 'B', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'b' };
+    const cost = planRecordHop(low, next, now)!.fuelCost;
+    expect(cost).toBeGreaterThan(0);
+    expect(cost).toBeLessThanOrEqual(50);
   });
 });

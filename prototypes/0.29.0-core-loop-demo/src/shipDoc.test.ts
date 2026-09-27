@@ -756,3 +756,25 @@ describe('writeFlightRecord — station ids and the result DEPART checks', () =>
     expect(readFlightRecord().status).toBe('docked');
   });
 });
+
+describe('canDepart — a planned hop', () => {
+  const base = {
+    flightCapable: true,
+    currentStatus: 'docked' as const,
+    currentFuel: 30,
+    chainedDoors: [] as string[],
+    ownerAuthorized: true,
+    locationId: HOME.id,
+    destinationId: HIGH_ORBIT.id,
+  };
+
+  it("prices on the hop's fuel, not the destination's flat cost", () => {
+    expect(canDepart({ ...base, hop: { fuelCost: 31 } }))
+      .toEqual({ ok: false, reason: 'insufficient-fuel', needed: 31, have: 30 });
+    expect(canDepart({ ...base, currentFuel: 5, hop: { fuelCost: 5 } })).toEqual({ ok: true });
+  });
+
+  it('refuses when no transfer exists', () => {
+    expect(canDepart({ ...base, hop: null })).toEqual({ ok: false, reason: 'no-transfer' });
+  });
+});

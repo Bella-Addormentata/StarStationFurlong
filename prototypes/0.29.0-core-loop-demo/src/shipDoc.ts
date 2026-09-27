@@ -375,6 +375,7 @@ export type DepartRefusal =
   | { ok: false; reason: 'unknown-destination' }
   | { ok: false; reason: 'already-here' }
   | { ok: false; reason: 'other-planet' }
+  | { ok: false; reason: 'no-transfer' }
   | { ok: false; reason: 'no-owner' };
 
 /** Inputs the caller assembles from the live docs — kept as a plain struct so
@@ -394,6 +395,10 @@ export interface DepartContext {
    *  station orbiting the same planet (ships fly between one planet's
    *  stations; interplanetary travel is not a v1 hop). */
   locationId?: string;
+  /** The planned hop (stationDirectory.planHop). When given, its fuel cost
+   *  replaces the destination's flat one, and null means no transfer exists
+   *  (a shared orbit, say). */
+  hop?: { fuelCost: number } | null;
 }
 
 /** Predicate the DEPART button funnels through. Returns the refusal reason so
@@ -413,8 +418,10 @@ export function canDepart(ctx: DepartContext): DepartRefusal {
   if (ctx.chainedDoors.length > 0) {
     return { ok: false, reason: 'chained-berth', chainedDoors: ctx.chainedDoors };
   }
-  if (ctx.currentFuel < dest.fuelCost) {
-    return { ok: false, reason: 'insufficient-fuel', needed: dest.fuelCost, have: ctx.currentFuel };
+  if (ctx.hop === null) return { ok: false, reason: 'no-transfer' };
+  const cost = ctx.hop ? ctx.hop.fuelCost : dest.fuelCost;
+  if (ctx.currentFuel < cost) {
+    return { ok: false, reason: 'insufficient-fuel', needed: cost, have: ctx.currentFuel };
   }
   return { ok: true };
 }
