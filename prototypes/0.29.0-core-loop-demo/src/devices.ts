@@ -55,6 +55,7 @@ import {
   formatLongSpan,
   isMoveActive,
   isTowing,
+  towHoldsDock,
   otherPlanets,
   planStationTow,
   quoteTow,
@@ -2118,7 +2119,18 @@ function subscribeArrivalNote(fn: () => void): () => void {
 /** Forget the last arrival — main.ts calls it on every room join, so one
  *  ship's arrival never shows on another ship's helm. */
 export function clearShipArrivalNote(): void {
+  arrivalNoteRoom++;
   setArrivalNote(null);
+}
+
+/** Bumped on every room join (clearShipArrivalNote). */
+let arrivalNoteRoom = 0;
+
+/** The arrival-note callback for a DOCK started in this room: its answer can
+ *  come after the player has left, and then it is not the new room's news. */
+export function arrivalNoteHere(): (outcome: ArrivalOutcome | null) => void {
+  const room = arrivalNoteRoom;
+  return (outcome) => { if (room === arrivalNoteRoom) noteShipArrival(outcome); };
 }
 
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
@@ -2144,6 +2156,8 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
       ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, out of reach, or not open to this ship). Dock from a door panel when one frees up, or ask the station's owner for a grant at a gate that admits only granted captains.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
+      : outcome.reason === 'in-transit'
+      ? `Arrived — but ${outcome.stationName} has left for another planet, so there is no berth in reach. Pick another destination.`
       : outcome.reason === 'unlisted-station'
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
         : outcome.reason === 'no-port'
@@ -2512,7 +2526,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;
       // DOCK NOW is the commander's call: settle the arrival here and now.
-      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: noteShipArrival }));
+      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
     });
 
     if (refocus) {
@@ -2545,7 +2559,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         `<button type="button" data-helm-dock="${verb}" data-door="${esc(p.doorId)}" ${canAct ? '' : 'disabled'} style="width:100%; margin-top:8px; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.3); color:${color}; font-size:11px; font-weight:800; padding:8px; cursor:${canAct ? 'pointer' : 'not-allowed'}; opacity:${canAct ? '1' : '0.45'}; letter-spacing:1px;">${label}</button>`;
       const who = esc(p.partnerName ?? 'the other module');
       const verb = p.state.kind === 'docked'
-        ? btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80')
+        ? (towHoldsDock([currentRoomId()], Date.now())
+          ? `<div style="margin-top:6px; color:#FFB300;">🚚 Towing — this dock holds the station until it arrives.</div>`
+          : btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80'))
         : p.state.kind === 'undocked'
           ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
           : p.state.kind === 'free'
@@ -2807,7 +2823,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Arrive where the ship flew, even if the directory no longer lists it.
       writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
     }
-    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: noteShipArrival }));
+    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };
 
   return {

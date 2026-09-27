@@ -22,7 +22,7 @@
 import { stampAfter, type DockPortState } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
-import { currentRoomId } from './stations';
+import { currentRoomId, stationInTransit } from './stations';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -328,8 +328,9 @@ export type ArrivalOutcome =
   | {
       kind: 'none';
       stationName: string;
-      /** `berths-taken`: every berth tried refused (taken, or unreachable). */
-      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken';
+      /** `berths-taken`: every berth tried refused (taken, or unreachable).
+       *  `in-transit`: the destination is between planets. */
+      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken' | 'in-transit';
     };
 
 /** How long an arrival waits for a commander who can dock (station records
@@ -375,6 +376,11 @@ export function completeArrival(
     return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' });
   }
   const station = findDestination(rec.locationId);
+  // 🚚 A station that left its planet while the ship was on the way has no
+  // berth in reach: the ship arrives where it was and stays undocked.
+  if (stationInTransit(station, now)) {
+    return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
+  }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
   const ports = docking.ports();
   const remembered = resolveRememberedBerth(readStationBerth(station.id), ports);
