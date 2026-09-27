@@ -311,6 +311,37 @@ function sync(from: Y.Doc, to: Y.Doc): void {
 }
 
 describe('sharing through the room doc', () => {
+  it('spreads a trim its room took back, to an older one and to none', () => {
+    registerStation(record());
+    let local: OrbitTrim | null = trim({ at: T0 + 1000, dRadiusKm: 4 });
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install('hab', { localTrim: () => local, currentRoom: () => 'room-hab' }));
+    // Another install learns the trim.
+    const other = new Map<string, string>();
+    const seen = (): number | undefined => {
+      const keep = store;
+      store = other;
+      const docB = new Y.Doc();
+      sync(docA, docB);
+      unbindPlanetSummaryForTest();
+      bindPlanetSummaryDoc(docB, install(null));
+      const d = readStore().stations['room-hab']?.trim?.dRadiusKm;
+      unbindPlanetSummaryForTest();
+      store = keep;
+      bindPlanetSummaryDoc(docA, install('hab', { localTrim: () => local, currentRoom: () => 'room-hab' }));
+      return d;
+    };
+    expect(seen()).toBe(4);
+    // A stale level write won in the helm room: the trim is back to an older burn.
+    local = trim({ at: T0, dRadiusKm: 2 });
+    publishPlanetSummary(Date.now() + 1000);
+    expect(seen()).toBe(2);
+    // …and then to none at all.
+    local = null;
+    publishPlanetSummary(Date.now() + 2000);
+    expect(seen()).toBeUndefined();
+  });
+
   it('two installs that each saved one place fly the standing record\'s slot', () => {
     // Install A saved HAB RING as 'a-hab' in slot 2 and published it.
     store = new Map();

@@ -1594,6 +1594,8 @@ async function joinRoomAtEpoch(
     ship: planetShipStatus,
     // Only a room known to be no ship withdraws its entry: a ship whose
     // planet is not placed yet also reads null from planetShipStatus.
+    // Its trim (localTrim) is read here, so a trim this room takes back spreads.
+    currentRoom: () => activeBootstrap?.roomId || null,
     notShipRoom: () => {
       const roomId = activeBootstrap?.roomId ?? "";
       if (!roomId) return null;
