@@ -1179,6 +1179,13 @@ function shipStationHere(roomId: string): string | null {
   return own && own.welcomeRoomId === roomId ? own.id : null;
 }
 
+/** 🚀 #30 SH3: does this player command the current room's ship? */
+function isLocalHelmCommander(): boolean {
+  const ownerVal =
+    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
+  return isLocalPlayerRoomOwner(ownerVal);
+}
+
 /** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
 let shipFlightWatch: number | null = null;
 
@@ -1741,52 +1748,47 @@ async function joinRoomAtEpoch(
     // 🚀 #30 SH2/SH3: the helm's writes are owner-gated at the UI. Same seam
     // as the exterior owner check — dev-phase honest-client posture (signed
     // enforcement lives in a later slice, plan §7 SH5).
-    const isHelmCommander = (): boolean => {
-      const ownerVal =
-        (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ??
-        "";
-      return isLocalPlayerRoomOwner(ownerVal);
-    };
-    setHelmOwnerCheck(isHelmCommander);
-    // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
-    // ticks the countdown while open, but a flight must complete even if no
-    // one has the panel up — otherwise a `in-flight` record with a past
-    // `etaAt` would strand the ship (canDepart refuses because status !==
-    // 'docked'). Idempotent under contention: whichever commander writes
-    // first wins; the second's next tick reads `redocking` and skips. Non-
-    // commanders don't advance (owner-writes posture). Runs at 1 Hz — an
-    // arrival-latency ceiling of ~1 second is imperceptible next to the
-    // 60–90 s minimum travel time.
-    // One watch per session: every join replaces the last room's (and
-    // leaveRoomNow clears it), so room hops never stack callbacks.
-    if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
-    shipFlightWatch = window.setInterval(() => {
-      if (!isHelmCommander()) return;
-      const rec = readFlightRecord();
-      if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
-        // Arrive where the ship flew — even if that station has since dropped
-        // out of the directory (never silently home).
-        writeFlightRecord({
-          status: "redocking",
-          locationId: rec.destinationId ?? rec.locationId,
-        });
-      }
-      // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
-      if (readFlightRecord().status !== "redocking") return;
-      const ds = world?.dockingSystem ?? null;
-      noteShipArrival(
-        completeArrival(
-          ds
-            ? {
-                ports: () => ds.listDockPorts(),
-                undock: (doorId) => void ds.undockPort(doorId),
-                dock: (doorId) => void ds.redockPort(doorId),
-              }
-            : null,
-        ),
-      );
-    }, 1_000);
+    setHelmOwnerCheck(isLocalHelmCommander);
   }
+  // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
+  // ticks the countdown while open, but a flight must complete even if no
+  // one has the panel up — otherwise a `in-flight` record with a past
+  // `etaAt` would strand the ship (canDepart refuses because status !==
+  // 'docked'). Idempotent under contention: whichever commander writes
+  // first wins; the second's next tick reads `redocking` and skips. Non-
+  // commanders don't advance (owner-writes posture). Runs at 1 Hz — an
+  // arrival-latency ceiling of ~1 second is imperceptible next to the
+  // 60–90 s minimum travel time.
+  // Installed on EVERY join (not in the one-time hook block above): each
+  // join replaces the last room's watch and leaveRoomNow clears it, so room
+  // hops neither stack callbacks nor leave a flight without its watch.
+  if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
+  shipFlightWatch = window.setInterval(() => {
+    if (!isLocalHelmCommander()) return;
+    const rec = readFlightRecord();
+    if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
+      // Arrive where the ship flew — even if that station has since dropped
+      // out of the directory (never silently home).
+      writeFlightRecord({
+        status: "redocking",
+        locationId: rec.destinationId ?? rec.locationId,
+      });
+    }
+    // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
+    if (readFlightRecord().status !== "redocking") return;
+    const ds = world?.dockingSystem ?? null;
+    noteShipArrival(
+      completeArrival(
+        ds
+          ? {
+              ports: () => ds.listDockPorts(),
+              undock: (doorId) => void ds.undockPort(doorId),
+              dock: (doorId) => void ds.redockPort(doorId),
+            }
+          : null,
+      ),
+    );
+  }, 1_000);
   setActivePassRoom(boot.roomId);
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)

@@ -17,6 +17,7 @@ import {
 import {
   berthToRemember,
   castOffForDeparture,
+  rememberBerthHere,
   completeArrival,
   planArrivalDock,
   shipLocationId,
@@ -193,6 +194,15 @@ describe('a round trip', () => {
     expect(north.kind).toBe('docked');
     expect(north.kind === 'docked' && north.address).toBe(SEED_FURLONG);
     expect(north.kind === 'docked' && north.record.farDoor).toBe('south');
+  });
+
+  it('remembers the berth before any cast-off, and has nothing to keep when undocked', () => {
+    const docking = fakeDocking(['north']);
+    expect(rememberBerthHere('furlong-station', docking.ports())).toBe(true);
+    expect(classifyDockPort(readDoor('north')).kind).toBe('docked');
+    expect(readStationBerth('furlong-station')?.address).toBe(SEED_FURLONG);
+    expect(rememberBerthHere('high-orbit', [])).toBe(true);
+    expect(readStationBerth('high-orbit')).toBeNull();
   });
 
   it('forgets the oldest other station to remember this berth when memory is full', () => {

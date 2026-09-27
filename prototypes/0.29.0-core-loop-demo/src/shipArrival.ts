@@ -148,25 +148,29 @@ export function berthToRemember(ports: readonly ArrivalPort[]): BerthMemoryRecor
   return null;
 }
 
-/** DEPART's cast-off: remember the berth here (evicting the oldest other
- *  station when memory is full), then UNDOCK every docked port. Returns
- *  whether the berth here is remembered (true when there was none to keep). */
+/** Remember the berth the ship is docked at here, forgetting the oldest
+ *  other station when memory is full. DEPART calls this BEFORE it commits the
+ *  flight, so a berth that cannot be kept stops the departure rather than
+ *  stranding the return trip. True when remembered, or when there is no
+ *  berth to keep. */
+export function rememberBerthHere(stationId: string, ports: readonly ArrivalPort[]): boolean {
+  const berth = berthToRemember(ports);
+  if (!berth) return true;
+  if (writeStationBerth(stationId, berth)) return true;
+  // Memory full: evict the oldest other station — never the one we leave.
+  const oldest = Object.keys(readBerthMemory()).find((id) => id !== stationId);
+  if (oldest !== undefined && writeStationBerth(oldest, null)) {
+    return writeStationBerth(stationId, berth);
+  }
+  return false;
+}
+
+/** DEPART's cast-off: remember the berth here, then UNDOCK every docked port.
+ *  Returns whether the berth here is remembered. */
 export function castOffForDeparture(stationId: string, docking: ShipDockingApi): boolean {
   const ports = docking.ports();
-  const berth = berthToRemember(ports);
-  let remembered = berth === null;
-  if (berth) {
-    remembered = writeStationBerth(stationId, berth);
-    if (!remembered) {
-      // Memory full: forget the oldest other station so the berth we are
-      // leaving (the one a return trip needs) is never the one dropped.
-      const oldest = Object.keys(readBerthMemory()).find((id) => id !== stationId);
-      if (oldest !== undefined && writeStationBerth(oldest, null)) {
-        remembered = writeStationBerth(stationId, berth);
-      }
-    }
-    if (!remembered) console.warn(`[ship] could not remember the berth at ${stationId}`);
-  }
+  const remembered = rememberBerthHere(stationId, ports);
+  if (!remembered) console.warn(`[ship] could not remember the berth at ${stationId}`);
   for (const p of ports) {
     if (p.state.kind === 'docked') docking.undock(p.doorId);
   }
