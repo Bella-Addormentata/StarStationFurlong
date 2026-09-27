@@ -437,6 +437,18 @@ export function isTowing(roomId: string, realMs: number): boolean {
   return !!move && move.mode === 'tug' && move.tugRoomId === roomId && isMoveActive(move, realMs);
 }
 
+/** Is any of these rooms a tug whose tow is under way (or about to leave),
+ *  by the bound room's record or any move this install remembers? Its dock
+ *  holds the station, so neither end may UNDOCK it — from the tug's docking
+ *  computer or from the station's door panel. */
+export function towHoldsDock(roomIds: string[], realMs: number): boolean {
+  const ids = new Set(roomIds.filter(Boolean));
+  if (ids.size === 0) return false;
+  const bound = readStationMove();
+  return [...(bound ? [bound] : []), ...readRememberedMoves()].some((m) =>
+    m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
+}
+
 // ── What the dashboard says ──────────────────────────────────────────────────
 
 /** "2d 03h" / "5h 12m" / "4m" — a real-time span. */
@@ -482,7 +494,9 @@ export function otherPlanets(station: StationRecord | null): string[] {
 // ── Remembered moves (per install) ───────────────────────────────────────────
 
 const KEY = 'ssf-station-moves';
-const MAX_REMEMBERED = 32;
+/** Twice the stations the atlas and the planet summaries can carry (64), so
+ *  every station's latest move is kept even with finished ones about. */
+const MAX_REMEMBERED = 128;
 
 export function readRememberedMoves(): StationMove[] {
   try {

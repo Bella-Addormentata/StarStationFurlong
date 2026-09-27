@@ -116,6 +116,7 @@ import {
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
 import {
+  arrivalNoteHere,
   clearShipArrivalNote,
   isShipReady,
   noteShipArrival,
@@ -182,7 +183,7 @@ import {
   shipsAroundPlanet,
   type ShipStatusInput,
 } from "./planetSummary";
-import { bindStationMoveDoc, installStationMoveResolver, isTowing } from "./stationMove";
+import { bindStationMoveDoc, installStationMoveResolver, isTowing, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1506,6 +1507,7 @@ function isLocalHelmCommander(): boolean {
 
 /** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
 let shipFlightWatch: number | null = null;
+let planetSummaryBeat = 0;
 
 async function joinRoomAtEpoch(
   boot: RoomBootstrap,
@@ -2059,6 +2061,8 @@ async function joinRoomAtEpoch(
     installTrimResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
+    // 🚚 A move this room remembers goes out on the planet summary at once.
+    subscribeStationMove(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).
@@ -2140,6 +2144,10 @@ async function joinRoomAtEpoch(
     // …and every board in the room reads its rows here.
     setDepartureBoardSource(departureBoardFor);
   }
+  // 🪐 Publish again now the room's station, doors and directory are all in
+  // place (the bind-time publish ran before them, and on a first join the
+  // one-time seams above did not exist yet).
+  publishPlanetSummary();
   // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
   // ticks the countdown while open, but a flight must complete even if no
   // one has the panel up — otherwise a `in-flight` record with a past
@@ -2156,7 +2164,11 @@ async function joinRoomAtEpoch(
   // 🚏🛟 A new room is a new ship: the keeper forgets the last one.
   routeKeeper.reset();
   lastRouteShipStatus = "";
+  planetSummaryBeat = 0;
   shipFlightWatch = window.setInterval(() => {
+    // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
+    // publishPlanetSummary refreshes its stamp once an hour).
+    if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
     // 🚏🛟 A5: every rider's game keeps a running ferry docked on time —
     // before the commander gate, which only the copy-back below needs.
     try {
@@ -2218,7 +2230,7 @@ async function joinRoomAtEpoch(
               dock: (doorId) => ds.redockPortAnswer(doorId),
             }
           : null,
-        { onSettled: noteShipArrival },
+        { onSettled: arrivalNoteHere() },
       ),
     );
   }, 1_000);

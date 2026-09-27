@@ -22,7 +22,7 @@
 import { dockAnswerOf, stampAfter, type DockAnswer, type DockOpOptions, type DockPortState, type DockRefusal } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
-import { currentRoomId } from './stations';
+import { currentRoomId, stationInTransit } from './stations';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -345,6 +345,7 @@ export type ArrivalOutcome =
       /**
        * `berths-taken`: every berth tried refused, and at least one without
        * saying why (an older docking API's bare false).
+       * `in-transit`: the destination is between planets.
        * 🚏 A5, when every berth said why:
        *   `occupied`     one or more was taken (or the module would overlap
        *                  there, or the gate is not open to this ship);
@@ -353,7 +354,7 @@ export type ArrivalOutcome =
        */
       reason:
         | 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken'
-        | 'occupied' | 'unreachable' | 'berth-gone';
+        | 'in-transit' | 'occupied' | 'unreachable' | 'berth-gone';
       /** 🚏 A route's keeper: what the ferry does about it — holds at the
        *  stop, skips it (🧾 `why`: every gate gone, or shut to this ferry),
        *  or rides on (this game could not dock it). */
@@ -418,6 +419,11 @@ export function completeArrival(
     return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' });
   }
   const station = findDestination(rec.locationId);
+  // 🚚 A station that left its planet while the ship was on the way has no
+  // berth in reach: the ship arrives where it was and stays undocked.
+  if (stationInTransit(station, now)) {
+    return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' });
+  }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });
   const ports = docking.ports();
   const remembered = resolveRememberedBerth(readStationBerth(station.id), ports);

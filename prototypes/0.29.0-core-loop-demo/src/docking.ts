@@ -116,6 +116,7 @@ import {
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
 import { pairingAllowedByFlight } from "./shipDoc";
+import { towHoldsDock } from "./stationMove";
 // 🚏 A4: every flight gate here reads the flight the ship is really on — a
 // running ferry route's timetable (never written) while it rules, else the
 // stored record — or a far write lands while the ferry is between stops.
@@ -2825,6 +2826,15 @@ export class DoorDockingPortSystem {
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
+    // 🚚 A tug under way holds its station by this dock: neither end lets go
+    // until the tow arrives.
+    if (towHoldsDock([roomId, port.roomId], Date.now())) {
+      this.setDockOp(doorId, {
+        note: "A tow is under way on this dock — it can't undock until the station arrives.",
+        tone: "bad",
+      });
+      return false;
+    }
     // 🚏 A route's keeper casts off the route's port at its departure.
     if (!this.mayDockHere(doorId, "undock", port.roomId, opts)) {
       this.setDockOp(doorId, {

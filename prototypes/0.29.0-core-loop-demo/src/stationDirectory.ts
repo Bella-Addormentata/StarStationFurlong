@@ -214,6 +214,10 @@ export function planRecordHop(
   if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
+  // Nor one whose window overlaps a scheduled move at either end: the
+  // station would be gone by the time the ship arrives (or leaves).
+  const clashes = (m: StationMove | undefined) => !!m && m.departAt <= t.arriveAt && m.arriveAt > t.departAt;
+  if (clashes(from.move) || clashes(to.move)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,

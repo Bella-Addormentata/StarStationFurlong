@@ -313,6 +313,26 @@ describe('a round trip', () => {
     expect(readStationBerth('furlong-station')?.roomId).toBe(FURLONG_ROOM);
   });
 
+  it('stays undocked at a station that left for another planet mid-flight', () => {
+    const now = Date.now();
+    const move = {
+      stationId: 'high-orbit', welcomeRoomId: HIGH_ROOM, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 1000, arriveAt: now + 3_600_000,
+      mode: 'tug' as const, tugRoomId: 'tug', fuel: 1, fuelDrawn: 0,
+    };
+    const stations: StationDestination[] = [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth: { address: SEED_HIGH, farDoor: 'd:a3313fdd', farWall: 'x-' }, move },
+    ];
+    setStationDirectory({ stations: () => stations });
+    const docking = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', docking);
+    fly('furlong-station', 'high-orbit');
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+  });
+
   it('does nothing unless the ship is redocking, and only once', () => {
     const docking = fakeDocking(['north']);
     expect(completeArrival(docking)).toBeNull();
