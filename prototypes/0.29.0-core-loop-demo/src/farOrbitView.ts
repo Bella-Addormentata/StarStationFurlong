@@ -43,6 +43,7 @@ import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
+import { adriftPlace } from './stationDirectory';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
 import { currentRoomId, currentStation, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -95,9 +96,21 @@ type Source =
 
 /** A flight's transfer rebuilt from its record: the Hohmann ellipse between
  *  the two stations' orbits, pinned to the record's own times. */
+/** Where a flight record's location is: a station, or open orbit (174's
+ *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
+type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
+
+function placeOf(id: string | undefined, all: readonly StationRecord[]): Place | undefined {
+  if (!id) return undefined;
+  const station = all.find((s) => s.id === id);
+  if (station) return station;
+  const adrift = adriftPlace(id);
+  return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
+}
+
 function flightPlan(
-  from: StationRecord | undefined,
-  to: StationRecord | undefined,
+  from: Place | undefined,
+  to: Place | undefined,
   departedAt: number,
   etaAt: number,
 ): TransferPlan | null {
@@ -146,25 +159,24 @@ function gather(now: number): Source {
   // a ready ship that is not bolted into a station follows its flight (the
   // same test main.ts's planet publisher and station resolver use).
   let aboard: TransferPlan | null = null;
+  // Aboard a ship waiting in open orbit (its destination station left): see
+  // the planet from that orbit, not from the ship's own one-room station.
+  let adrift: Place | null = null;
   if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
-      aboard = flightPlan(
-        all.find((s) => s.id === rec.locationId),
-        all.find((s) => s.id === rec.destinationId),
-        rec.departedAt,
-        rec.etaAt,
-      );
+      aboard = flightPlan(placeOf(rec.locationId, all), placeOf(rec.destinationId, all), rec.departedAt, rec.etaAt);
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
     }
+    if (!aboard && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
   }
 
   // Not in a known station (offline, or before the first join): stand in
   // for the planet's slot-0 station, so it is not drawn as a neighbour on
   // top of the viewer.
-  const me = aboard
+  const me = aboard || adrift
     ? null
     : currentStation() ??
       all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0) ??
@@ -182,7 +194,9 @@ function gather(now: number): Source {
 
   const planetId = aboard
     ? aboard.from.planet.id
-    : me
+    : adrift
+      ? adrift.planetId
+      : me
       ? planetById(me.planetId).id
       : planetForRoom(roomId, atlas).id;
   let viewer: (ms: number) => OrbitPoint;
@@ -190,6 +204,10 @@ function gather(now: number): Source {
   if (aboard) {
     const plan = aboard;
     viewer = (ms) => transferPointAt(plan, ms);
+  } else if (adrift) {
+    const place = adrift;
+    viewer = (ms) => stationPointAt(place, ms);
+    viewerRingRadiusKm = stationOrbit(place).radiusKm;
   } else if (me) {
     const station = me;
     viewer = (ms) => stationPointAt(station, ms);
