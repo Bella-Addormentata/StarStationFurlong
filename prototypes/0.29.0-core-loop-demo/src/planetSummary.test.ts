@@ -24,6 +24,7 @@ import {
   registerLearnedStations,
   resolveStationAlias,
   shipsAroundPlanet,
+  subscribePlanetSummary,
   summaryForStation,
   summaryPlanet,
   systemStationNames,
@@ -337,6 +338,37 @@ function sync(from: Y.Doc, to: Y.Doc): void {
 }
 
 describe('sharing through the room doc', () => {
+  it('spreads a trim its room took back, to an older one and to none', () => {
+    registerStation(record());
+    let local: OrbitTrim | null = trim({ at: T0 + 1000, dRadiusKm: 4 });
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install('hab', { localTrim: () => local, currentRoom: () => 'room-hab' }));
+    // Another install learns the trim.
+    const other = new Map<string, string>();
+    const seen = (): number | undefined => {
+      const keep = store;
+      store = other;
+      const docB = new Y.Doc();
+      sync(docA, docB);
+      unbindPlanetSummaryForTest();
+      bindPlanetSummaryDoc(docB, install(null));
+      const d = readStore().stations['room-hab']?.trim?.dRadiusKm;
+      unbindPlanetSummaryForTest();
+      store = keep;
+      bindPlanetSummaryDoc(docA, install('hab', { localTrim: () => local, currentRoom: () => 'room-hab' }));
+      return d;
+    };
+    expect(seen()).toBe(4);
+    // A stale level write won in the helm room: the trim is back to an older burn.
+    local = trim({ at: T0, dRadiusKm: 2 });
+    publishPlanetSummary(Date.now() + 1000);
+    expect(seen()).toBe(2);
+    // …and then to none at all.
+    local = null;
+    publishPlanetSummary(Date.now() + 2000);
+    expect(seen()).toBeUndefined();
+  });
+
   it('two installs that each saved one place fly the standing record\'s slot', () => {
     // Install A saved HAB RING as 'a-hab' in slot 2 and published it.
     store = new Map();
@@ -358,6 +390,50 @@ describe('sharing through the room doc', () => {
     const before = JSON.stringify(docB.getMap('stationSummaries').toJSON());
     publishPlanetSummary(Date.now() + 1000);
     expect(JSON.stringify(docB.getMap('stationSummaries').toJSON())).toBe(before);
+  });
+
+  it('moves this install\'s place to the standing record\'s planet', () => {
+    // Install A saved HAB RING around ARIS in slot 2 and published it.
+    registerStation(record({ id: 'a-hab', planetId: ARIS, orbitSlot: 2 }));
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install('a-hab'));
+    // Install B saved the same place around the home planet, then joins.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    registerStation(record({ id: 'b-hab', orbitSlot: 5 }));
+    const docB = new Y.Doc();
+    sync(docA, docB);
+    bindPlanetSummaryDoc(docB, install('b-hab'));
+    const b = listStations().find((s) => s.id === 'b-hab');
+    expect(b?.planetId).toBe(ARIS);
+    expect(b?.orbitSlot).toBe(2);
+  });
+
+  it('places a fresh install standing in a ship by the ship\'s shared summary', () => {
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('room-x', {
+      welcomeRoomId: 'room-x', name: 'ARIS DEPOT', planetId: ARIS, orbitSlot: 3, updatedAt: Date.now() - 1000,
+    });
+    doc.getMap('shipSummaries').set('room-ship', {
+      roomId: 'room-ship', name: 'FERRY', planetId: ARIS, status: 'docked', fromRoom: 'room-x', updatedAt: Date.now() - 1000,
+    });
+    // The ship's own one-room stand-in sits on the default planet.
+    const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
+    expect(listStations().find((s) => s.id === 'shared:room-x')?.planetId).toBe(ARIS);
+  });
+
+  it('tells its own views about what it just published', () => {
+    registerStation(record());
+    let local: OrbitTrim | null = null;
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => local, currentRoom: () => 'room-hab' }));
+    let heard = 0;
+    const stop = subscribePlanetSummary(() => { heard++; });
+    local = trim({ at: T0 + 1000 });
+    publishPlanetSummary(Date.now() + 1000);
+    stop();
+    expect(heard).toBeGreaterThan(0);
   });
 
   it('places a fresh install standing in an off-home station by the room\'s shared summary', () => {
