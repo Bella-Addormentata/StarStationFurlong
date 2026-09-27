@@ -3085,8 +3085,13 @@ async function transitTo(
     // re-dock the mirror completes, while an older one is a stale berth. A
     // DOCK never lands on a tombstoned door whose port was removed: it would
     // re-fit the port below.
+    // ⚓🚦 A dock that fits a new port here needs a free gate number; with
+    // every number taken, the dock is not completed (as the far DOCK refuses).
+    const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
+    const newGate = needsPort ? freeGateNumber(readAtlas(), activeBootstrap?.roomId ?? "", readDockGates()) : null;
     if (
       depRoomId &&
+      !(needsPort && newGate === null) &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
       }) &&
@@ -3124,13 +3129,12 @@ async function transitTo(
         // ⚓ A dock has a half on BOTH doors: the arrival door wears the
         // mating half the connection brought (staged on the far side, or the
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
-        if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+        if (needsPort && newGate !== null) {
           // ⚓🚦 …numbered, like every new port of the station.
-          const gate = freeGateNumber(readAtlas(), activeBootstrap?.roomId ?? "", readDockGates());
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
-            ...(gate !== null ? { gate } : {}),
+            gate: newGate,
           });
         }
       });

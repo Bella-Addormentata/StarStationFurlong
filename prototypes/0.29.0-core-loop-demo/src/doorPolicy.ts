@@ -25,7 +25,7 @@
  */
 
 import * as Y from 'yjs';
-import { hasDoorLayout } from './doorLayoutDoc';
+import { doorExistsIn, hasDoorLayout } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -280,7 +280,9 @@ export function dockGatesIn(doc: Y.Doc): Record<string, number> {
   for (const [doorId, value] of doc.getMap('doorPolicy').entries()) {
     if (++n > 256) break;
     const p = sanitizePolicy(value);
-    if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
+    // Only doors the room's layout has: a peer's policy for a door that does
+    // not exist must not use up gate numbers.
+    if (p.adapter && p.gate !== undefined && doorExistsIn(doc, doorId)) out[doorId] = p.gate;
   }
   return out;
 }

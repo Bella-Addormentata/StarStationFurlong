@@ -94,6 +94,14 @@ describe('the gate on a dock port', () => {
     expect(dockGatesIn(far)).toEqual({ south: 7 });
   });
 
+  it('counts only ports on doors the room has', () => {
+    const far = new Y.Doc();
+    far.getMap('doorLayout').set('south', { id: 'south', wall: 'y+', lateral: 0, placed: true });
+    fitDockPortIn(far, 'south', 2);
+    far.getMap('doorPolicy').set('d:phantom1', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    expect(dockGatesIn(far)).toEqual({ south: 2 });
+  });
+
   it('takes the lowest number free in the station', () => {
     expect(nextFreeGate([])).toBe(1);
     expect(nextFreeGate([1, 2, 4])).toBe(3);
