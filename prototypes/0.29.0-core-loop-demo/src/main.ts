@@ -113,8 +113,8 @@ import {
 // 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
-import { clearShipArrivalNote, noteShipArrival, setHelmOwnerCheck } from "./devices";
-import { completeArrival } from "./shipArrival";
+import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
@@ -1713,14 +1713,17 @@ async function joinRoomAtEpoch(
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
+    const localSeedFor = (roomId: string): string | undefined =>
+      readAtlas()[roomId]?.seed ??
+      (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
+        ? DEFAULT_STATION.welcomeRoomLink
+        : undefined);
+    // A remembered berth names its room only; the pass comes from here.
+    setBerthSeedResolver(localSeedFor);
     setStationDirectory(
       directoryFromStationRecords(
         () => listStations(),
-        (roomId) =>
-          readAtlas()[roomId]?.seed ??
-          (roomId === DEFAULT_STATION.welcomeRoomId && DEFAULT_STATION.welcomeRoomLink
-            ? DEFAULT_STATION.welcomeRoomLink
-            : undefined),
+        localSeedFor,
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
       ),
@@ -1728,11 +1731,15 @@ async function joinRoomAtEpoch(
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).
-    setRoomStationResolver((roomId) =>
-      roomId && roomId === activeBootstrap?.roomId
-        ? dockedStationFor(roomId, readAllDoors().values())
-        : null,
-    );
+    // 🚀 A ship with no live dock is where its flight record says (cast off,
+    // holding, in transit, or arrived berthless), not its own one-room
+    // station, so the backdrop keeps the right planet all the way.
+    setRoomStationResolver((roomId) => {
+      if (!roomId || roomId !== activeBootstrap?.roomId) return null;
+      const docked = dockedStationFor(roomId, readAllDoors().values());
+      if (docked) return docked;
+      return isShipReady() ? readFlightRecord().locationId : null;
+    });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1787,6 +1794,7 @@ async function joinRoomAtEpoch(
       writeFlightRecord({
         status: "redocking",
         locationId: rec.destinationId ?? rec.locationId,
+        etaAt: rec.etaAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
