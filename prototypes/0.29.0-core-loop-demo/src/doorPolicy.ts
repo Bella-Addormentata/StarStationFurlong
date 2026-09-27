@@ -205,23 +205,28 @@ function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
   return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
 }
 
-/** ⚓🚦 The doors a room's layout has, whose policies the gate readers look
- *  up directly. Walking the layout rather than the policy map means stale or
- *  junk policy keys (a removed door's, a peer's) can never crowd a live port
- *  out of a capped scan. The walk covers the whole layout map, as the room's
- *  own door list (doorLayoutDoc.readAllDoorLayout) does, so malformed layout
- *  keys cannot hide a real door either; only valid doors count toward the
- *  cap. */
-function layoutDoorsIn(doc: Y.Doc): string[] {
-  const out: string[] = [];
+/** ⚓🚦 The dock ports a room's layout has (doors whose policy fits an
+ *  adapter), with their policies, for the gate readers. Walking the layout
+ *  rather than the policy map means stale or junk policy keys (a removed
+ *  door's, a peer's) can never crowd a live port out of a capped scan. The
+ *  walk covers the whole layout map, as the room's own door list
+ *  (doorLayoutDoc.readAllDoorLayout) does, and only ports count toward the
+ *  cap: doors without an adapter, however many, cannot hide one. */
+function portsIn(doc: Y.Doc, policies: Y.Map<unknown>): Array<[string, DoorPolicyRecord]> {
+  const out: Array<[string, DoorPolicyRecord]> = [];
+  const take = (id: string): void => {
+    if (!doorExistsIn(doc, id)) return;
+    const p = sanitizePolicy(policies.get(id));
+    if (p.adapter) out.push([id, p]);
+  };
+  let any = false;
   for (const id of doc.getMap('doorLayout').keys()) {
-    if (doorExistsIn(doc, id)) {
-      out.push(id);
-      if (out.length >= 256) break;
-    }
+    if (doorExistsIn(doc, id)) any = true;
+    take(id);
+    if (out.length >= 256) break;
   }
   // A legacy room keeps no layout records: its doors are the cardinal ones.
-  if (out.length === 0) for (const id of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, id)) out.push(id);
+  if (!any) for (const id of Object.keys(LEGACY_ID_WALL)) take(id);
   return out;
 }
 
@@ -229,8 +234,8 @@ function layoutDoorsIn(doc: Y.Doc): string[] {
 export function readGateAccess(): Record<string, GateAccessRecord> {
   const out: Record<string, GateAccessRecord> = {};
   if (!docAlive()) return out;
-  for (const doorId of layoutDoorsIn(boundDoc!)) {
-    const a = accessRecord(sanitizePolicy(policyMap!.get(doorId)));
+  for (const [doorId, p] of portsIn(boundDoc!, policyMap!)) {
+    const a = accessRecord(p);
     if (a) out[doorId] = a;
   }
   return out;
@@ -277,9 +282,8 @@ export function fitDockPortIn(doc: Y.Doc, doorId: string, gate?: number | null):
 export function readDockGates(): Record<string, number> {
   const out: Record<string, number> = {};
   if (!docAlive()) return out;
-  for (const doorId of layoutDoorsIn(boundDoc!)) {
-    const p = sanitizePolicy(policyMap!.get(doorId));
-    if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
+  for (const [doorId, p] of portsIn(boundDoc!, policyMap!)) {
+    if (p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;
 }
@@ -289,9 +293,8 @@ export function readDockGates(): Record<string, number> {
 export function readUnnumberedPorts(): string[] {
   const out: string[] = [];
   if (!docAlive()) return out;
-  for (const doorId of layoutDoorsIn(boundDoc!)) {
-    const p = sanitizePolicy(policyMap!.get(doorId));
-    if (p.adapter && p.gate === undefined) out.push(doorId);
+  for (const [doorId, p] of portsIn(boundDoc!, policyMap!)) {
+    if (p.gate === undefined) out.push(doorId);
   }
   return out.sort();
 }
@@ -302,10 +305,8 @@ export function dockGatesIn(doc: Y.Doc): Record<string, number> {
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return out;
   // Only doors the room's layout has: a peer's policy for a door that does
   // not exist must not use up gate numbers.
-  const policies = doc.getMap('doorPolicy');
-  for (const doorId of layoutDoorsIn(doc)) {
-    const p = sanitizePolicy(policies.get(doorId));
-    if (p.adapter && p.gate !== undefined) out[doorId] = p.gate;
+  for (const [doorId, p] of portsIn(doc, doc.getMap('doorPolicy'))) {
+    if (p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;
 }

@@ -28,7 +28,7 @@ import {
 } from './stationAtlas';
 import { cleanBerths, listStations, registerStation } from './stations';
 import type { StationBerthRecord } from './stations';
-import { foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
+import { cleanStationSummary, foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
 import { farDockPatch } from './dockRules';
@@ -134,6 +134,19 @@ describe('the gate on a dock port', () => {
     const doc = new Y.Doc();
     bindDoorPolicy(doc);
     for (let i = 0; i < 1100; i++) doc.getMap('doorLayout').set(`d:junk${String(i).padStart(4, '0')}`, { nope: true });
+    doc.getMap('doorLayout').set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
+    expect(readDockGates()).toEqual({ 'd:live': 5 });
+    expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
+  });
+
+  it('finds a live gate however many valid non-port doors come first', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    for (let i = 0; i < 300; i++) {
+      const id = `d:plain${String(i).padStart(4, '0')}`;
+      doc.getMap('doorLayout').set(id, { id, wall: 'y+', lateral: 0, placed: true });
+    }
     doc.getMap('doorLayout').set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
     doc.getMap('doorPolicy').set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
     expect(readDockGates()).toEqual({ 'd:live': 5 });
@@ -447,6 +460,16 @@ describe('the per-planet summary', () => {
   const T0 = Date.UTC(2026, 8, 27, 10, 0, 0);
   const base = (over: Partial<StationSummary> = {}): StationSummary => ({
     welcomeRoomId: 'room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, updatedAt: T0, ...over,
+  });
+
+  it('drops a summary\'s gates when its room stamps are oversized', () => {
+    const stamps: Record<string, number> = {};
+    for (let i = 0; i < 200; i++) stamps[`room-${i}`] = T0;
+    const s = cleanStationSummary({
+      ...base(), berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0, berthRoomsAt: stamps,
+    }, T0);
+    expect(s?.berths).toBeUndefined();
+    expect(s?.name).toBe('HUB');
   });
 
   it('shares gates without the local occupied flag', () => {
