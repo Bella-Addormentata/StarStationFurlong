@@ -478,12 +478,41 @@ describe('the per-planet summary', () => {
       id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-b', derived: true as const,
       berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }, { roomId: 'room-b', doorId: 'east', gate: 3 }],
     };
-    const next = foldOwnStation(known, here, null, T0 + 60_000)!;
+    const next = foldOwnStation(known, here, null, T0 + 60_000, 'room-b')!;
     expect(next.orbitSlot).toBe(3);
     expect(next.berths).toHaveLength(2);
     expect(next.berthsAt).toBe(T0 + 60_000);
     // Unchanged gates change nothing.
-    expect(foldOwnStation(next, here, null, T0 + 120_000)).toBeNull();
+    expect(foldOwnStation(next, here, null, T0 + 120_000, 'room-b')).toBeNull();
+  });
+
+  it("stamps only the visitor's room fresh on a station's first publication", () => {
+    const here = {
+      id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 1, welcomeRoomId: 'room-b', derived: true as const,
+      berths: [{ roomId: 'room-a', doorId: 'west', gate: 5 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+    };
+    const first = foldOwnStation(undefined, here, null, T0 + 60_000, 'room-b')!;
+    // An earlier summary read room-a first-hand: its gate 1 beats our atlas's old gate 5.
+    const earlier = base({ berths: [{ roomId: 'room-a', doorId: 'west', gate: 1 }], berthsAt: T0, berthRoomsAt: { 'room-b': T0 } });
+    const want = [{ roomId: 'room-a', doorId: 'west', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }];
+    expect(mergeStation(earlier, first)?.berths).toEqual(want);
+    expect(mergeStation(first, earlier)?.berths).toEqual(want);
+  });
+
+  it("keeps the known per-room gate stamps when an owned record changes", () => {
+    const known = base({
+      ownerId: 'hub',
+      berths: [{ roomId: 'room-a', doorId: 'west', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+      berthsAt: T0,
+    });
+    // Our own record, renamed; our atlas still shows room-a's old gate 5.
+    const mineRec = {
+      id: 'hub', name: 'HUB PRIME', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b',
+      berths: [{ roomId: 'room-a', doorId: 'west', gate: 5 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+    };
+    const next = foldOwnStation(known, mineRec, null, T0 + 60_000, 'room-b')!;
+    expect(next.name).toBe('HUB PRIME');
+    expect(next.berths).toEqual(known.berths);
   });
 
   it("replaces only the gates of the room the visitor stands in", () => {
