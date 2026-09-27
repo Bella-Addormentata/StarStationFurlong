@@ -51,6 +51,7 @@ import {
   readMoveFuelDrawn,
   readRememberedMoves,
   readStationMove,
+  rememberedMoveFor,
   rememberMove,
   writeStationMove,
 } from './stationMove';
@@ -238,6 +239,23 @@ describe('the station list follows a move', () => {
     setStationMoveResolver((st) => (st.welcomeRoomId === 'm' ? mover : null));
     const list = listStations({}, [...full, moved], move.arriveAt + 1);
     expect(list.filter((s) => s.planetId === ARIS)).toHaveLength(16);
+    expect(list.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
+  });
+
+  it('keeps a bounced arrival listed when its home filled up while it was away', () => {
+    const move = moveTo();
+    const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    // Its home slot was let go in transit, and Sovereign filled up behind it.
+    const home: StationRecord[] = Array.from({ length: 15 }, (_, i) => (
+      { id: `sov-${i + 1}`, name: `S${i + 1}`, planetId: SOV, orbitSlot: i + 1, welcomeRoomId: `s${i + 1}` }));
+    const moved: StationRecord = { id: 'mover', name: 'MOVER', planetId: SOV, orbitSlot: 4, welcomeRoomId: 'm' };
+    const mover = { ...move, stationId: 'mover', welcomeRoomId: 'm', fromSlot: 4 };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'm' ? mover : null));
+    const list = listStations({}, [...full, ...home, moved], move.arriveAt + 1);
+    expect(list.filter((s) => s.planetId === ARIS)).toHaveLength(16);
+    expect(list.filter((s) => s.planetId === SOV && s.id !== 'mover')).toHaveLength(16);
+    // Both planets full: it stays home, sharing its old slot, not dropped.
     expect(list.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
   });
 
@@ -887,8 +905,9 @@ describe('tugs: a torch tow', () => {
     const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
     const a = plan.move;
-    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1 };
-    // Two offline tabs of one tug each towed another station.
+    // Two offline tabs of one tug each towed another station (the second
+    // booked first, so the first outranks it).
+    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt - 1 };
     const d1 = new Y.Doc(); d1.clientID = 1;
     const d2 = new Y.Doc(); d2.clientID = 2;
     bindStationMoveDoc(d1);
@@ -898,7 +917,8 @@ describe('tugs: a torch tow', () => {
     Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
     store.clear();
     bindStationMoveDoc(d1);
-    expect(readMoveFuelDrawn()).toBe(a.fuel + b.fuel);
+    // One tug, one set of tanks: only the tow that ranks first is paid for.
+    expect(readMoveFuelDrawn()).toBe(a.fuel);
     // Still docked to the first station only: the second tow is cancelled.
     const docked = { status: 'docked' };
     expect(cancelTowLeftBehind('tug-room', docked, NOW + 1, (w) => w === a.welcomeRoomId)).toBe(true);
@@ -912,6 +932,38 @@ describe('tugs: a torch tow', () => {
     expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 2)).toBe(true);
     expect(readMoveFuelDrawn()).toBe(0);
     expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 3)).toBe(false);
+  });
+
+  it('flies and pays for one of two tows a tug booked at once, and cancels the other', () => {
+    // Two offline tabs of one tug, each seeing a full tank, each towed another
+    // station: together they would draw more than the tanks hold.
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt + 1, arriveAt: a.arriveAt + 1 };
+    const d1 = new Y.Doc(); d1.clientID = 1;
+    const d2 = new Y.Doc(); d2.clientID = 2;
+    bindStationMoveDoc(d1);
+    writeStationMove(a);
+    bindStationMoveDoc(d2);
+    writeStationMove(b);
+    Y.applyUpdate(d1, Y.encodeStateAsUpdate(d2));
+    store.clear();
+    bindStationMoveDoc(d1);
+    // The later departure outranks: only it stands and is paid for.
+    expect(readMoveFuelDrawn()).toBe(b.fuel);
+    expect(readStationMove()?.welcomeRoomId).toBe('yard-room');
+    // Docked to both, the tug still spreads the loss as a cancel of the first,
+    // once.
+    const docked = { status: 'docked' };
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 1)).toBe(true);
+    expect(cancelTowLeftBehind('tug-room', docked, NOW + 2)).toBe(false);
+    const cancel = rememberedMoveFor({ id: a.stationId, welcomeRoomId: a.welcomeRoomId });
+    expect(cancel && isCancelPin(cancel)).toBe(true);
+    expect(cancel?.settles?.welcomeRoomId).toBe(a.welcomeRoomId);
+    expect(readMoveFuelDrawn()).toBe(b.fuel);
+    // The winner still holds the tug.
+    expect(isTowing('tug-room', NOW + 2)).toBe(true);
   });
 
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {

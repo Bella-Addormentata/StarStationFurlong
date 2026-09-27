@@ -1894,6 +1894,8 @@ async function joinRoomAtEpoch(
     ship: planetShipStatus,
     // Only a room known to be no ship withdraws its entry: a ship whose
     // planet is not placed yet also reads null from planetShipStatus.
+    // Its trim (localTrim) is read here, so a trim this room takes back spreads.
+    currentRoom: () => activeBootstrap?.roomId || null,
     notShipRoom: () => {
       const roomId = activeBootstrap?.roomId ?? "";
       if (!roomId) return null;
@@ -2133,6 +2135,8 @@ async function joinRoomAtEpoch(
     subscribeShip(() => publishPlanetSummary());
     // 🚚 A move this room remembers goes out on the planet summary at once.
     subscribeStationMove(() => publishPlanetSummary());
+    // A fitted or removed engine, tank or helm makes or unmakes a ship.
+    subscribeFurniture(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).

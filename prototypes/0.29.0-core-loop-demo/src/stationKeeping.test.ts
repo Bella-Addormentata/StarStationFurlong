@@ -413,11 +413,16 @@ describe('replaying the burns', () => {
     expect(replayBurns([...tie].reverse())).toEqual(replayBurns(tie));
   });
 
-  it('a burn past the band changes nothing but still pays', () => {
+  it('a burn past the band changes nothing but still pays, and the trim dates from it', () => {
     const start = trim({ dRadiusKm: MAX_TRIM_KM - TRIM_STEP_KM, at: T0 - HOUR });
+    const edge = applyBurn(start, burnAt(T0, 'raise'))!;
     const out = replayBurns([burnAt(T0, 'raise'), burnAt(T0 + 1_000, 'raise')], start, 5);
-    expect(out.trim).toEqual(applyBurn(start, burnAt(T0, 'raise')));
-    expect(out.trim!.dRadiusKm).toBe(MAX_TRIM_KM);
+    expect(out.trim).toMatchObject({ dRadiusKm: MAX_TRIM_KM, at: T0 + 1_000, last: 'raise' });
+    // The same orbit, only dated from the later burn.
+    const base = slotOrbit(STATION);
+    for (const at of [T0, T0 + 1_000, T0 + HOUR]) {
+      expect(slotOffsetAt(base, out.trim, at)).toBeCloseTo(slotOffsetAt(base, edge, at), 12);
+    }
     expect(out.fuelDrawn).toBe(5 + 2 * TRIM_FUEL);
   });
 
@@ -426,10 +431,26 @@ describe('replaying the burns', () => {
     const later = burnAt(T0 + 1_000, 'raise');
     const late = burnAt(T0, 'raise');
     expect(replayBurns([later], start).trim!.at).toBe(later.at);
-    // The late one takes the last step, so the later one is now past the band.
+    // The late one takes the last step, so the later one is now past the
+    // band: it changes nothing, but the trim dates from it.
     const both = replayBurns([later, late], start);
-    expect(both.trim!.at).toBe(late.at);
+    expect(both.trim).toMatchObject({ dRadiusKm: MAX_TRIM_KM, at: later.at });
     expect(both.fuelDrawn).toBe(2 * TRIM_FUEL);
+  });
+
+  it('a burn stamped before a settled burn at the band edge applies after it', () => {
+    // Two tabs RAISE one step below the edge: the first takes the last step,
+    // the second pays and changes nothing. A level write settles both.
+    const start = trim({ dRadiusKm: MAX_TRIM_KM - TRIM_STEP_KM, at: T0 - HOUR });
+    const first = burnAt(T0, 'raise');
+    const second = burnAt(T0 + 1_000, 'raise');
+    const settled = replayBurns([first, second], start).trim!;
+    // A LOWER from a tab that was offline, stamped between them, applies at
+    // the settled run's last burn.
+    const late = burnAt(T0 + 500, 'lower');
+    const out = replayBurns([late], settled);
+    expect(out.trim).toEqual(applyBurn(settled, { ...late, at: second.at }));
+    expect(out.trim).toMatchObject({ dRadiusKm: MAX_TRIM_KM - TRIM_STEP_KM, at: second.at });
   });
 
   it('drops the burns the tanks cannot cover: they neither move the orbit nor take fuel', () => {
@@ -952,6 +973,36 @@ describe('level writes settle the log', () => {
         expect(readFuelDrawn()).toBe(7 * TRIM_FUEL);
         expect(readFuelLevel()).toBe(50 - 2 * TRIM_FUEL);
       }
+    }
+  });
+
+  it('a level write keeps a burn at the band edge firing: the stick still waits for it', () => {
+    for (const [first, second] of [[900, 100], [100, 900]]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      a.clientID = first;
+      b.clientID = second;
+      bindRoom(a);
+      writeFuelLevel(50, 100);
+      let now = T0;
+      for (let i = 0; i < MAX_TRIM_KM / TRIM_STEP_KM - 1; i++, now += BURN_MS) press('raise', now);
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      // Both tabs RAISE from one step below the edge: A takes the last step,
+      // and B's burn pays and changes nothing.
+      press('raise', now);
+      bindRoom(b);
+      const edge = press('raise', now + 2_000);
+      sync(a, b);
+      bindRoom(a);
+      expect(readOrbitTrim()).toMatchObject({ dRadiusKm: MAX_TRIM_KM, at: edge.at });
+      // A REFUEL settles both while B's burn still fires...
+      writeFuelLevel(50, 100);
+      const then = edge.at + 1_000;
+      expect(readBurnFiring(then, STATION)).toEqual({ planetId: SOV, slot: 0, dir: 'raise', at: edge.at });
+      // ...so the next press waits for it to end.
+      const c = ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), now: then, firing: readBurnFiring(then, STATION) });
+      expect(planTrim(c, 'lower')).toEqual({ ok: false, refusal: 'burning' });
+      expect(press('lower', edge.at + BURN_MS).at).toBe(edge.at + BURN_MS);
     }
   });
 
