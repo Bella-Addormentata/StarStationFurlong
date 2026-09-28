@@ -505,30 +505,29 @@ export function listStations(
     let outcome = readArrivalOutcome(station, outcomeKey);
     if (!outcome) {
       const dest = planetById(m.toPlanetId).id;
-      const there = candidates.filter((o, j) => {
-        if (j === i) return false;
-        if (settledAt(o) <= T) return spots[j]?.planetId === dest;
+      // The slots taken there at T, not the stations: two that share a slot
+      // (an arrival that found every planet full) leave the others free.
+      const taken = new Set<number>();
+      candidates.forEach((o, j) => {
+        if (j === i) return;
+        if (settledAt(o) <= T) {
+          if (spots[j]?.planetId === dest) taken.add(spots[j]!.orbitSlot);
+          return;
+        }
         // One between planets at T held no slot anywhere.
-        if (stationInTransit({ move: o.move ?? undefined }, T)) return false;
-        return planetById(placeWithMove(o.base, o.move, T).planetId).id === dest;
-      }).length;
-      outcome = there >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';
+        if (stationInTransit({ move: o.move ?? undefined }, T)) return;
+        const place = placeWithMove(o.base, o.move, T);
+        if (planetById(place.planetId).id === dest) taken.add(place.orbitSlot);
+      });
+      outcome = taken.size >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';
       writeArrivalOutcome(station, outcomeKey, outcome);
     }
     if (outcome === 'bounced') at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
-    let planetId = at.planetId;
-    let slot = claim(planetId, at.orbitSlot);
-    // Still no room (every planet it could be at is full): the first planet
-    // with a free slot, so an accepted move never loses a station.
-    for (const p of PLANETS) {
-      if (slot !== null) break;
-      slot = claim(p.id, 0);
-      planetId = p.id;
-    }
-    // Every planet full: it stays where its move put it, sharing a slot,
-    // rather than drop out of the list (its old slot was let go in transit).
-    if (slot !== null) settle(i, planetId, slot);
-    else settle(i, at.planetId, at.orbitSlot);
+    const slot = claim(at.planetId, at.orbitSlot);
+    // Its planet full (it left its old slot in transit): it stays where its
+    // move put it, sharing that slot, rather than drop out of the list or
+    // turn up at another planet no transfer took it to.
+    settle(i, at.planetId, slot ?? at.orbitSlot);
   }
 
   // Listed in record order, derived stations last. A station that never
