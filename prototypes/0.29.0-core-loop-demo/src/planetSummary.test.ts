@@ -190,8 +190,11 @@ describe('guards', () => {
     const b = summary({ ownerId: 'beta', orbitSlot: 3, updatedAt: T0 + 50 });
     expect((mergeStation(a, b) ?? a).orbitSlot).toBe(2);
     expect(mergeStation(b, a)?.orbitSlot).toBe(2);
-    // The losing install republishing, newer each time, changes nothing.
-    expect(mergeStation(a, { ...b, updatedAt: T0 + 5000 })).toBeNull();
+    // The losing install republishing, newer each time, changes nothing
+    // once its id is kept as an alias.
+    const settled = mergeStation(a, b)!;
+    expect(settled.ownerAliases).toEqual(['beta']);
+    expect(mergeStation(settled, { ...b, updatedAt: T0 + 5000 })).toBeNull();
   });
 
   it("does not republish over another install's identical record", () => {
@@ -796,6 +799,18 @@ describe('ships and the solar system', () => {
 });
 
 describe('station id aliases (flight records cross installs)', () => {
+  it('resolves a losing install\'s owner id to the standing record\'s room', () => {
+    const merged = mergeStation(summary({ ownerId: 'beta' }), summary({ ownerId: 'alpha' }))!;
+    expect(merged.ownerId).toBe('alpha');
+    expect(merged.ownerAliases).toEqual(['beta']);
+    // A later republish by the winner keeps the alias.
+    expect(mergeStation(merged, summary({ ownerId: 'alpha', updatedAt: T0 + 5 }))?.ownerAliases).toEqual(['beta']);
+    store.set('ssf-planet-summary', JSON.stringify({ stations: { 'room-hab': merged }, ships: {} }));
+    registerStation(record({ id: 'mine' }));
+    expect(resolveStationAlias('beta')).toBe('mine');
+    expect(cleanStationSummary({ ...merged, ownerAliases: ['beta', 'alpha', 7] }, T0)?.ownerAliases).toEqual(['beta']);
+  });
+
   it('maps derived and learned ids to the station this install lists for that room', () => {
     registerStation(record({ id: 'mine' }));
     expect(resolveStationAlias('mine')).toBe('mine');
