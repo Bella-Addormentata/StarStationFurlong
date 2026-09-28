@@ -21,6 +21,7 @@ import {
 import {
   bindStationAtlasDoc,
   freeGateNumber,
+  freeGateNumberHere,
   harvestIntoAtlas,
   readAtlas,
   stationGates,
@@ -282,6 +283,20 @@ describe("a far room doc's shared atlas", () => {
     expect(freeGateNumber(atlas, 'far-dock', {})).toBe(3);
     // Only that station is read.
     expect(atlas['other-000']).toBeUndefined();
+  });
+
+  it("numbers a port fitted here past the gates of a room only the bound doc still holds", () => {
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('here', entry('here', 5, { 'd:hall': { targetRoomId: 'hub', farDoor: 'd:in', transient: false } }));
+    shared.set('hub', entry('hub', 5, { 'd:in': { targetRoomId: 'here', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1 }));
+    bindStationAtlasDoc(doc, { roomId: 'here', isPassagePublic: () => false });
+    // The local atlas has let 'hub' go (evicted past MAX_ENTRIES).
+    const local = readAtlas();
+    delete local.hub;
+    store.set('ssf-station-atlas', JSON.stringify(local));
+    expect(freeGateNumber(readAtlas(), 'here', {})).toBe(1);
+    expect(freeGateNumberHere('here', {})).toBe(2);
   });
 
   it("follows a newer doc copy's re-paired door to the far station's other rooms", () => {

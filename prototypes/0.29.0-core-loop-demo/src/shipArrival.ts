@@ -156,6 +156,7 @@ export function arrivalBerths(input: {
         farDoor: u.farDoor,
         ...(u.gate !== undefined ? { gate: u.gate } : {}),
         ...(u.access ? { access: u.access, ...(u.reservedFor ? { reservedFor: u.reservedFor } : {}) } : {}),
+        ...(u.occupied ? { occupied: true } : {}),
       }))
     : [];
   const station = Array.isArray(input.station.berths) && reached.length > 0
