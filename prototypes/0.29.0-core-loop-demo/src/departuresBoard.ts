@@ -436,14 +436,18 @@ function scheduleMoved(mirror: DepartureRow, newer: DepartureRow): boolean {
  * soonest first, capped at MAX_BOARD_ROWS. Pure.
  *
  * The map's entry for a ferry is its last publish that reached this room
- * (DepartureFerry.at). A summary the ferry wrote AFTER it wins where they
- * disagree, since a publish can give up or a finished route's entry stays
- * behind: said since that no run flies (🏁 `routeIdle`), or that a later
- * run flies, the held row goes; a row where the map has none, from a later
- * run, with another gate or time, or knowing of a checkpoint the map lacks
- * (a hold, a pause…: `routeNews`), replaces the map's, and with no row of
- * its own that last reads DELAYED, time unknown. A summary with no route
- * fields at all (an older client's relay drops them) changes nothing.
+ * (DepartureFerry.at). A summary wins where they disagree, since a publish
+ * can give up or a finished route's entry stays behind: one that flies a
+ * later run (`routeRun`) ends the held row, and one that knows of a
+ * checkpoint of the held run the map lacks (a hold, a pause…: `routeNews`)
+ * replaces it, or with no row of its own makes it DELAYED, time unknown,
+ * whatever the stamps say (🕰️ run ids and checkpoint times order
+ * themselves). One the ferry wrote AFTER the map's entry, by the stamps,
+ * also has its say where nothing else orders the two: said since that no
+ * run flies (🏁 `routeIdle`), the held row goes; a row where the map has
+ * none, or with another gate or time, replaces the map's; a new name
+ * renames it. A summary with no route fields at all (an older client's
+ * relay drops them) changes nothing.
  */
 export function boardView(i: BoardInput): BoardView {
   const rows: DepartureRow[] = [];
@@ -459,12 +463,17 @@ export function boardView(i: BoardInput): BoardView {
     }
     let r = ferryRow(ferry, i.here, i.now, cache);
     const s = summaryOf.get(ferry.shipRoomId);
-    if (s && i.isHereRoom && s.updatedAt > ferry.at) {
-      if (s.routeIdle) continue;
+    if (s && i.isHereRoom) {
+      // Written after this room's copy, by the stamps: the say on what has
+      // no order of its own (a gate, a time, a name, "no run flies").
+      const newer = s.updatedAt > ferry.at;
+      if (newer && s.routeIdle) continue;
       if (s.routeStatus) {
         // Renamed since this room's copy: the row keeps its clock-live times
         // under the newer name (a route summary names it as boards do).
-        if (r && s.name !== r.ferry) r = { ...r, ferry: s.name };
+        if (newer && r && s.name !== r.ferry) r = { ...r, ferry: s.name };
+        // 🕰️ Run ids and checkpoint times order themselves, whatever the
+        // two riders' clocks stamped the copy and the summary with.
         // A later run than the one this room holds (a replacement route): the
         // held one is over, whether or not the new one calls here now.
         const laterRun = s.routeRun !== undefined && s.routeRun > (ferry.route.startedAt ?? ferry.endedRun ?? 0);
@@ -473,7 +482,7 @@ export function boardView(i: BoardInput): BoardView {
         const missed = !laterRun && s.routeRun !== undefined && s.routeRun === ferry.route.startedAt
           && s.routeNews !== undefined && s.routeNews > newestRouteNews(ferry.checkpoints);
         const sr = summaryRow(s, i.isHereRoom, placeOf, i.now);
-        if (sr && (!r || laterRun || missed || scheduleMoved(r, sr))) {
+        if (sr && (laterRun || missed || (newer && (!r || scheduleMoved(r, sr))))) {
           rows.push(sr);
           continue;
         }

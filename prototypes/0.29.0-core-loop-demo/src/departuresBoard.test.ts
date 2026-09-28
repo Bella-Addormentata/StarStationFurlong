@@ -422,6 +422,34 @@ describe('the board', () => {
     expect(view(noRoute)).toEqual([expect.objectContaining({ ferry: 'Ferry One' })]);
   });
 
+  it('🕰️ a later run or a checkpoint the map missed wins whatever the two riders\' clocks say', () => {
+    const here = boardAt(0, { dockedAt: T0 + 2 * SEC });
+    const isHereRoom = (room: string) => room === 'room-0';
+    const placeOf = (room: string | undefined) => (room === 'room-1' ? 'Stop 1' : '?');
+    const now = T0 + 10 * SEC;
+    // This room's copy came from a rider whose clock runs an hour fast: its
+    // stamp is after the summary's, though it was published before it.
+    const fast = { ...ferry(route, [s]), at: T0 + 60 * MIN };
+    const mine = (over: Partial<ShipSummary> = {}): ShipSummary => ({
+      roomId: SHIP, name: 'Ferry One', planetId: SOV, status: 'docked', fromRoom: 'room-0', nextStopRoom: 'room-1',
+      departAt: s.departAt, gate: 1, routeStatus: 'boarding', updatedAt: T0 + 5 * SEC, ...over,
+    });
+    const view = (summary: ShipSummary) =>
+      boardView({ ferries: [fast], here, gate: null, summaries: [summary], isHereRoom, placeOf, now }).rows;
+    // A replacement route: the held run is over, calling here or not.
+    expect(view(mine({ routeRun: T0 + MIN }))).toEqual([expect.objectContaining({ asOf: T0 + 5 * SEC })]);
+    expect(view(mine({ routeRun: T0 + MIN, fromRoom: 'room-7' }))).toEqual([]);
+    // The same run, with a pause this room's copy lacks.
+    expect(view(mine({ routeRun: T0, routeNews: T0 + 3 * SEC, routeStatus: 'paused' })))
+      .toEqual([expect.objectContaining({ status: 'PAUSED', at: null, asOf: T0 + 5 * SEC })]);
+    // Nothing that orders itself (a gate, a time, a name, no run at all):
+    // the copy's stamp still rules.
+    expect(view(mine({ routeRun: T0, gate: 3 }))).toEqual([expect.objectContaining({ status: 'BOARDING', gate: 1, at: s.departAt })]);
+    expect(view(mine({ routeRun: T0, name: 'Star Hopper' }))).toEqual([expect.objectContaining({ ferry: 'Ferry One' })]);
+    const idle: ShipSummary = { roomId: SHIP, name: 'Ferry One', planetId: SOV, status: 'docked', fromRoom: 'room-0', routeIdle: true, updatedAt: T0 + 5 * SEC };
+    expect(view(idle)).toHaveLength(1);
+  });
+
   it('a ferry is named as its riders named the room, or FERRY while it has only its id', () => {
     expect(ferryName('Star Hopper', 'room-9')).toBe('Star Hopper');
     expect(ferryName('room-9', 'room-9')).toBe('FERRY');
