@@ -103,6 +103,16 @@ describe('guards', () => {
     }
   });
 
+  it("keeps a newer trim the standing record's own install flies on another slot", () => {
+    // A slot clash moved this station off the slot its record asks for; its
+    // own republish carries the record unchanged with the flown slot's trim.
+    const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
+    const same = { ...first, trim: trim({ slot: 3, at: T0 + 40 }) };
+    expect(mergeStation(first, same)?.trim?.slot).toBe(3);
+    // …but never a trim of another planet.
+    expect(mergeStation(first, { ...first, trim: trim({ planetId: ARIS, slot: 3, at: T0 + 40 }) })).toBeNull();
+  });
+
   it("keeps the standing record's trim over a newer one for another slot", () => {
     const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
     const late = summary({ orbitSlot: 1, updatedAt: T0 + 50, trim: trim({ slot: 1, at: T0 + 40 }) });
@@ -450,6 +460,38 @@ describe('sharing through the room doc', () => {
     const b = listStations().find((s) => s.id === 'b-hab');
     expect(b?.planetId).toBe(ARIS);
     expect(b?.orbitSlot).toBe(2);
+  });
+
+  it('shares the trim of a station a slot clash moved, and every install flies it', () => {
+    // Two stations nobody owns were each first published for ARIS slot 2;
+    // room-a keeps it, so room-z flies the next free slot everywhere.
+    const doc = new Y.Doc();
+    const at = Date.now() - 1000;
+    for (const room of ['room-a', 'room-z']) {
+      doc.getMap('stationSummaries').set(room, {
+        welcomeRoomId: room, name: room.toUpperCase(), planetId: ARIS, orbitSlot: 2, updatedAt: at,
+      });
+    }
+    registerLearnedStations(ARIS, Object.values(doc.getMap('stationSummaries').toJSON() as Record<string, StationSummary>));
+    const z = listStations().find((s) => s.welcomeRoomId === 'room-z')!;
+    expect(z.orbitSlot).toBe(3);
+    // A burn in room-z trims the orbit it flies.
+    const burn = trim({ planetId: ARIS, slot: 3, at: at + 500 });
+    bindPlanetSummaryDoc(doc, install(z.id, { localTrim: () => burn, currentRoom: () => 'room-z' }));
+    expect(readStore().stations['room-z']?.orbitSlot).toBe(2);
+    expect(readStore().stations['room-z']?.trim?.slot).toBe(3);
+    // Another install learns both stations and flies room-z trimmed.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    const other = new Y.Doc();
+    sync(doc, other);
+    bindPlanetSummaryDoc(other, install(null, { ship: () => null }));
+    registerLearnedStations(ARIS, Object.values(readStore().stations));
+    refreshTrims();
+    installTrimResolver();
+    const seen = listStations().find((s) => s.welcomeRoomId === 'room-z')!;
+    expect(seen.orbitSlot).toBe(3);
+    expect(stationOrbit(seen).radiusKm).toBeCloseTo(orbitForSlot(ARIS, 3).radiusKm + 4, 6);
   });
 
   it('places a one-room off-home station that is no ship by its shared summary', () => {

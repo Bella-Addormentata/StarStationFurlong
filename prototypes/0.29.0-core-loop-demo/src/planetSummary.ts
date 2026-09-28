@@ -412,13 +412,24 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
         ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
         : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
   // Only a trim of the orbit the standing record flies: one published for
-  // the slot that lost would be dropped by every reader anyway.
-  const fits = (t: SharedTrim | undefined) => (t && trimFor(base, t) ? t : undefined);
+  // the slot that lost would be dropped by every reader anyway. A slot clash
+  // in listStations can move the standing record off the slot it asks for
+  // (the same way on every install), so a trim of its planet also stands
+  // when it comes with the standing record itself, unchanged: that is the
+  // station's own republish, trimming the slot it flies.
+  const standing = recordOf(canonOrder({ ...base, updatedAt: 0 }));
+  const fits = (s: StationSummary): SharedTrim | undefined => {
+    const t = s.trim;
+    if (!t) return undefined;
+    if (trimFor(base, t)) return t;
+    return planetById(t.planetId).id === planetById(base.planetId).id
+      && recordOf(canonOrder({ ...s, updatedAt: 0 })) === standing ? t : undefined;
+  };
   const gone = mergeGone(prior.trimGone, incoming.trimGone);
   // A room's trim read before that room read none is taken back.
   const alive = (t: SharedTrim | undefined) =>
     (t && (t.from === undefined || (t.readAt ?? 0) >= goneAt(gone, t.from)) ? t : undefined);
-  const trim = newerTrim(alive(fits(prior.trim)), alive(fits(incoming.trim)));
+  const trim = newerTrim(alive(fits(prior)), alive(fits(incoming)));
   // Every owner id seen for this place but the standing one's.
   const aliases = mergeAliases(
     [...(prior.ownerAliases ?? []), ...(incoming.ownerAliases ?? []), prior.ownerId, incoming.ownerId],
@@ -627,7 +638,10 @@ export function foldOwnStation(
     : known;
   // A trim is keyed by the orbit it trims: it goes out when it names the
   // planet and slot of the record that is kept, whichever client's that is.
-  const applies = cleanTrim(trimFor(base, readTrim(known)));
+  // A learned station flies the slot listStations settled for that record,
+  // which a slot clash can move off the one the record asks for.
+  const flies = !owned && isLearnedRecord(station) ? station : base;
+  const applies = cleanTrim(trimFor(flies, readTrim(known)));
   // This room now reads no trim where the known one was read here: that
   // trim was taken back, and the reading says so.
   // This room's reading changed while another room's trim stands over it:
