@@ -264,6 +264,10 @@ describe('the station list follows a move', () => {
     expect(list.filter((s) => s.planetId === SOV && s.id !== 'mover')).toHaveLength(16);
     // Both planets full: it stays home, sharing its old slot, not dropped.
     expect(list.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
+    // A vacancy at the other planet later never pulls it across without a
+    // transfer: it bounced home, and home it stays.
+    const later = listStations({}, [...full.slice(1), ...home, moved], move.arriveAt + 2);
+    expect(later.find((s) => s.id === 'mover')).toMatchObject({ planetId: SOV, orbitSlot: 4 });
   });
 
   it('keeps every incumbent when the first-listed station arrives at a full planet, for good', () => {
