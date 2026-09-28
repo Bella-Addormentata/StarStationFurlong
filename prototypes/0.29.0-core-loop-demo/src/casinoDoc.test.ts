@@ -16,18 +16,24 @@ import {
   bindCasinoDoc,
   buyInChips,
   cancelCoinPusherRequest,
+  CASINO_OPERATOR_CLAIM_KEY,
   CASINO_OPERATOR_KEY,
+  clearCasinoOperatorClaim,
   clearCasinoOperatorRecords,
+  COIN_PUSHER_OPERATOR_KEY,
   coinPusherRequestKey,
   readCoinPusherRequestArrival,
   coinPusherResultKey,
   commitCoinPusherEmpty,
   continueCoinPusherKeySweep,
   drainAndClearCoinPusher,
+  isCasinoOperatorLease,
   isCoinPusherRecordUnreadable,
   PUSHER_REQUEST_SCAN,
   PUSHER_SWEEP_BATCH,
+  readCasinoOperatorClaim,
   readCasinoOperatorLease,
+  readCasinoOperatorRecord,
   readChips,
   readCoinPusherDoorResult,
   readCoinPusherEmptyRequest,
@@ -42,7 +48,9 @@ import {
   refuseCoinPusherInsert,
   ROOM_OPERATOR_KEYS,
   settleCoinPusherInsert,
+  SLOT_OPERATOR_KEY,
   startCoinPusherKeySweep,
+  writeCasinoOperatorClaim,
   writeCasinoOperatorRecords,
   writeCoinPusherEmptyRequest,
   writeCoinPusherOperatorLease,
@@ -246,6 +254,63 @@ describe("the room's operator records", () => {
     expect(readCasinoOperatorLease()).toBeNull();
     expect(readRoomOperatorLease(CASINO_OPERATOR_KEY)).toBeNull();
     expect(readSlotOperatorLease()).toEqual(mine);
+  });
+
+  it("reads, writes and clears another install's claim, clearing it only for the session it names", () => {
+    const claim = { playerId: OTHER, sessionId: 'their-device:tab', expiresAt: 8_000 };
+    expect(readCasinoOperatorClaim()).toBeNull();
+    writeCasinoOperatorClaim(claim);
+    expect(readCasinoOperatorClaim()).toEqual(claim);
+    expect(doc.getMap('casino').get(CASINO_OPERATOR_CLAIM_KEY)).toEqual(claim);
+    clearCasinoOperatorClaim(SESSION); // another session's: left alone
+    expect(readCasinoOperatorClaim()).toEqual(claim);
+    clearCasinoOperatorClaim('their-device:tab');
+    expect(readCasinoOperatorClaim()).toBeNull();
+    // Junk under the key is no claim, and a malformed one is never written.
+    const map = doc.getMap('casino');
+    for (const junk of [{ ...claim, expiresAt: Infinity }, { ...claim, sessionId: '' }, { ...claim, tenure: 't1' }, 'claim']) {
+      map.set(CASINO_OPERATOR_CLAIM_KEY, junk);
+      expect(readCasinoOperatorClaim()).toBeNull();
+    }
+    map.delete(CASINO_OPERATOR_CLAIM_KEY);
+    writeCasinoOperatorClaim({ ...claim, playerId: '' });
+    expect(map.has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
+    // The claim is none of the three records.
+    writeCasinoOperatorClaim(claim);
+    for (const key of ROOM_OPERATOR_KEYS) expect(readRoomOperatorLease(key)).toBeNull();
+  });
+
+  it('carries what the holder serves on the primary alone, a short list of known games, and strips junk without losing the record', () => {
+    const serving = { ...mine, serves: ['slots', 'pusher'] as const };
+    expect(isCasinoOperatorLease(serving)).toBe(true);
+    expect(isCasinoOperatorLease(mine)).toBe(true); // none said
+    expect(isCasinoOperatorLease({ ...mine, serves: [] })).toBe(true);
+    expect(isCasinoOperatorLease({ ...mine, serves: Array(8).fill('air-hockey') })).toBe(true);
+    for (const serves of [['roulette'], ['slots', 7], Array(9).fill('slots'), 'slots', null]) {
+      expect(isCasinoOperatorLease({ ...mine, serves })).toBe(false);
+    }
+    expect(isCasinoOperatorLease({ ...mine, tenure: 7, serves: ['slots'] })).toBe(false);
+
+    writeCasinoOperatorRecords(serving, ROOM_OPERATOR_KEYS);
+    expect(readCasinoOperatorRecord()).toEqual(serving);
+    // The four lease fields everywhere else: the shadows carry no list, and
+    // the keyed readers (hold-off, lapse, ownership) read the primary's four.
+    const map = doc.getMap('casino');
+    expect(map.get(SLOT_OPERATOR_KEY)).toEqual(mine);
+    expect(map.get(COIN_PUSHER_OPERATOR_KEY)).toEqual(mine);
+    for (const key of ROOM_OPERATOR_KEYS) expect(readRoomOperatorLease(key)).toEqual(mine);
+    expect(readCasinoOperatorLease()).toEqual(mine);
+
+    // A peer's junk list is stripped, never the record: it still holds the room off.
+    for (const serves of [['roulette'], Array(9).fill('slots'), { slots: true }]) {
+      map.set(CASINO_OPERATOR_KEY, { ...mine, serves });
+      expect(readCasinoOperatorRecord()).toEqual(mine);
+      expect(readCasinoOperatorLease()).toEqual(mine);
+    }
+    // And a junk list is never written.
+    for (const key of ROOM_OPERATOR_KEYS) map.delete(key);
+    writeCasinoOperatorRecords({ ...mine, serves: ['roulette'] as never }, ROOM_OPERATOR_KEYS);
+    for (const key of ROOM_OPERATOR_KEYS) expect(map.has(key)).toBe(false);
   });
 });
 

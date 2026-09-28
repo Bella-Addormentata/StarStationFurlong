@@ -40,7 +40,7 @@
  * funding names its own id. That binding is why the lease is not widened to
  * "every machine the deed holder funds". A deed holder with two installs (two
  * player ids) therefore has the slot work of one install served only by that
- * install's session; the other install's session serves the pushers.
+ * install's session, and the lease passes between the two (TWO INSTALLS).
  *
  * WIND-DOWN: a round accepted on a machine this session no longer operates
  * keeps the lease until it is refunded: see slotCroupier.ts, WIND-DOWN. The
@@ -71,7 +71,12 @@
  * OPERATOR_LEASE_MS after this page last saw it renewed (leaseLapsesAt). Only
  * a tab on this device, which shares the clock, is also held to its own
  * expiry. The records are peer-writable: one claiming a far-future expiry
- * holds the room for one lease term, not forever. Every client watches the
+ * holds the room for one lease term, not forever. So is the claim (TWO
+ * INSTALLS), judged the same way: a claim forged and renewed every
+ * OPERATOR_LEASE_RENEW_MS makes a holder with no slot work step aside for a
+ * term, take the room back, and step aside again, for as long as the forger
+ * keeps at it: the same class as a forged record renewed the same way, which
+ * holds the room off outright. Every client watches the
  * renewals (World ticks the room on every client), and a panel asks the same
  * question: the pusher's DROP waits until the operator is past its settling
  * wait (coinPusherOperatorState).
@@ -105,7 +110,9 @@
  * see a live foreign record where they look, and wait or read 'ready' as
  * they would for one of their own; a stop deletes every key naming this
  * session. Ownership needs every key this build writes to name this session
- * in this take: a shadow a v0.38 peer overwrote ends the take. The device
+ * in this take: a shadow a v0.38 peer overwrote ends the take. The shadows
+ * carry the four lease fields only; what the holder serves is on the primary
+ * alone (TWO INSTALLS), and nothing judges a record by it. The device
  * id is one per profile, seeded from and backfilled into the two old keys,
  * and both old ids are remembered as this device (loadDeviceIds).
  *
@@ -124,10 +131,13 @@
  *                                                        and honours the record's own expiry.
  *   a5 Same device, NEW tab hides        OLD after lapse NEW backfilled the old keys, so an OLD tab of
  *                                                        the profile is this device to NEW's shadows.
- *   b  Two installs of one deed holder   Either          Work binding unchanged (WHO THE RECORD NAMES);
- *                                                        a holder with no slot need starves the other
- *                                                        install's funded machines (a claim/yield rule
- *                                                        is a later step).
+ *   b  Two installs A (funds slot        A, or B until   Work binding unchanged (WHO THE RECORD NAMES).
+ *      machines) and B (pushers only)    A claims        A, held off by B's live primary with slots
+ *                                                        missing from what it serves, writes a claim; B,
+ *                                                        with no slot need, deletes its records and
+ *                                                        takes nothing back for a term; A takes the
+ *                                                        MISSING records and serves both games after
+ *                                                        its settling wait. No live record is taken.
  *   c  Hidden operator tab               Successor       rAF-only ticks: no renewal, no release; the
  *                                                        record lapses (8 s same device, +60 s other);
  *                                                        on resume the tab's own clock ends its take and
@@ -140,6 +150,30 @@
  *                                        after pagehide  naming this session; on restore the tick holds
  *                                                        off or retakes with a new tenure.
  *
+ * TWO INSTALLS of one deed holder (two player ids) each have work only their
+ * own session may do: install A's funded slot machines are A's alone (WHO
+ * THE RECORD NAMES), while either may run the pushers. Under the union of
+ * needs alone, B holding the lease for its cabinets would renew it forever
+ * and starve A's machines. So the primary says which games its holder had
+ * need of at its last write (`serves`: a game gained goes out at once, one
+ * lost at the next renewal), and a session held off with slot work claims
+ * the room (`casino-operator-claim`) while the primary names a live holder
+ * of another player that doesn't serve slots, renewing its claim as the
+ * holder renews its lease. A holder with no slot need that sees a live claim of
+ * another player steps aside (`yielded`): it deletes its records and takes
+ * nothing back, RUN included, for OPERATOR_LEASE_MS, so the claimant takes
+ * the MISSING records as any session would; nothing ever takes a live
+ * record, so no two takes overlap. A claim lives one OPERATOR_LEASE_MS from
+ * this page's sighting of it (CLOCKS), never by the expiry it claims: a
+ * claimant that crashed costs the holder one term aside, then the holder
+ * takes the room back and deletes the lapsed claim at a renewal. Nobody
+ * claims against a v0.38 holder (it writes no primary and reads no claim),
+ * the same player (its session serves the same machines), or a holder
+ * serving slots (two installs with machines each: the take decided, as the
+ * one slot lease did in v0.38). A holder with slot need, a machine run by
+ * hand included, never steps aside. The claimant drops its claim once it
+ * takes the room, runs out of slot work or has nothing to claim against.
+ *
  * MIXED ROOMS, one regression to know: a v0.38 install holding
  * `pusher-operator` with no slot work holds a NEW install's funded slot
  * machines off for as long as it stays (in v0.38 the two keys let both
@@ -149,16 +183,20 @@
 import {
   CASINO_OPERATOR_KEY,
   casinoDocEpoch,
+  clearCasinoOperatorClaim,
   clearCasinoOperatorRecords,
   clearLegacySlotOperatorLease,
   COIN_PUSHER_OPERATOR_KEY,
+  readCasinoOperatorClaim,
+  readCasinoOperatorRecord,
   readLegacySlotOperatorLease,
   readLegacySlotOperatorMachineIds,
   readRoomOperatorLease,
   ROOM_OPERATOR_KEYS,
+  writeCasinoOperatorClaim,
   writeCasinoOperatorRecords,
 } from './casinoDoc';
-import type { RoomOperatorKey, SlotOperatorLease } from './casinoDoc';
+import type { CasinoOperatorClaim, OperatorServed, RoomOperatorKey, SlotOperatorLease } from './casinoDoc';
 import { getPlayerId } from './identity';
 
 export const OPERATOR_LEASE_MS = 8_000;
@@ -249,6 +287,8 @@ interface CasinoOperatorTake {
   tenure: string;
   readyAt: number;
   renewedAt: number;
+  /** What the records last written in this take say it serves. */
+  serves: readonly OperatorServed[];
 }
 
 /** This session's turn as the room's operator, if it has one. */
@@ -425,15 +465,21 @@ export function earlierBuildLeasesWatched(): number {
 
 // ── The games ────────────────────────────────────────────────────────────────
 
-export type OperatorGame = 'slots' | 'pusher' | 'air-hockey';
+/** The games that share the lease: the ones a primary record can say its
+ *  holder serves. */
+export type OperatorGame = OperatorServed;
+/** Every game, in the order a record lists them. */
+const OPERATOR_GAMES: readonly OperatorGame[] = ['slots', 'pusher', 'air-hockey'];
 
 /** Why this page's take ended. `lost-own`: its record lapsed, went missing
  *  or was rewritten with another take while no other session's record was
  *  there (the slot side keeps its machines run by hand; the next frame takes
  *  the lease afresh). `lost-foreign`: another session's record was there.
  *  `legacy`: an earlier build is operating. `released`: no game needed the
- *  room, or the page released it. `leaving`: leaveCasinoRoom. `yielded`: the
- *  holder stepped aside for a claimant (a later step). */
+ *  room, or the page released it. `leaving`: leaveCasinoRoom. `yielded`: this
+ *  page had no slot work and stepped aside for another install's live claim
+ *  (TWO INSTALLS); it takes nothing back for OPERATOR_LEASE_MS, and forgets
+ *  its machines run by hand as on any stop but `lost-own`. */
 export type OperatorStopReason = 'lost-own' | 'lost-foreign' | 'legacy' | 'released' | 'leaving' | 'yielded';
 
 export interface OperatorGameHooks {
@@ -464,6 +510,17 @@ function unionNeed(docEpoch: number): boolean {
     if (entry.docEpoch === docEpoch && entry.need) return true;
   }
   return false;
+}
+
+function gameNeeds(game: OperatorGame, docEpoch: number): boolean {
+  const entry = needs.get(game);
+  return entry !== undefined && entry.docEpoch === docEpoch && entry.need;
+}
+
+/** What a record written now says its holder serves: the games that need the
+ *  room in this doc, as their ticks last reported. */
+function servedNow(docEpoch: number): OperatorServed[] {
+  return OPERATOR_GAMES.filter((game) => gameNeeds(game, docEpoch));
 }
 
 function notifyStop(reason: OperatorStopReason): void {
@@ -545,11 +602,13 @@ function take(playerId: string, now: number): void {
     if (ended) notifyStop('lost-own');
   }
   const tenure = crypto.randomUUID();
+  const serves = servedNow(docEpoch);
   writeCasinoOperatorRecords({
     playerId,
     sessionId: operatorSessionId,
     tenure,
     expiresAt: now + OPERATOR_LEASE_MS,
+    serves,
   }, LEASE_KEYS);
   operator = {
     docEpoch,
@@ -557,17 +616,27 @@ function take(playerId: string, now: number): void {
     tenure,
     readyAt: now + OPERATOR_LEASE_SETTLE_MS,
     renewedAt: now,
+    serves,
   };
+  dropOwnClaim(); // the holder claims nothing
 }
 
-function renew(own: CasinoOperatorTake, now: number): void {
+/** Renew the records (what the holder serves goes out afresh with them), and
+ *  delete a claim no longer live by this page's sightings, or one naming this
+ *  page from another doc: a holder never needs a claim of its own. */
+function renew(own: CasinoOperatorTake, now: number, claim: CasinoOperatorClaim | null): void {
   writeCasinoOperatorRecords({
     playerId: own.playerId,
     sessionId: operatorSessionId,
     tenure: own.tenure,
     expiresAt: now + OPERATOR_LEASE_MS,
+    serves: own.serves = servedNow(own.docEpoch),
   }, LEASE_KEYS);
   own.renewedAt = now;
+  if (claim && (claim.sessionId === operatorSessionId || !claimLive(claim, now))) {
+    clearCasinoOperatorClaim(claim.sessionId);
+    claimSeen = null;
+  }
 }
 
 /** End this page's take: every room record naming this session goes,
@@ -576,7 +645,96 @@ function renew(own: CasinoOperatorTake, now: number): void {
 function endTake(reason: OperatorStopReason): void {
   operator = null;
   clearCasinoOperatorRecords(operatorSessionId, ROOM_OPERATOR_KEYS);
+  dropOwnClaim();
   notifyStop(reason);
+}
+
+// ── Two installs: claim and yield ────────────────────────────────────────────
+
+/** Another session's claim as this page saw it in this room's doc: when it
+ *  first saw that exact record (the claimant rewrites it at every renewal),
+ *  by the same rule as the room's records (seeLease). */
+let claimSeen: { docEpoch: number; id: string; at: number } | null = null;
+/** When this page last wrote its own claim, in the doc it wrote it to. Null
+ *  when it has none out: dropping it then reads nothing. */
+let claimRenewedAt: { docEpoch: number; at: number } | null = null;
+/** Until when this page, having stepped aside, takes nothing back. */
+let yieldUntil: { docEpoch: number; at: number } | null = null;
+
+/** Read the claim and note another session's as this page sees it now: every
+ *  election does, holder and claimant alike, so a claim's age is this page's
+ *  own count of it. This page's own claim is never fed. */
+function observeClaim(now: number): CasinoOperatorClaim | null {
+  const claim = readCasinoOperatorClaim();
+  if (!claim || claim.sessionId === operatorSessionId) {
+    claimSeen = null;
+    return claim;
+  }
+  const docEpoch = casinoDocEpoch();
+  const id = `${docEpoch}|${claim.playerId}|${claim.sessionId}|${claim.expiresAt}`;
+  if (claimSeen?.id !== id) claimSeen = { docEpoch, id, at: now };
+  return claim;
+}
+
+/** Whether another session's claim is live: one OPERATOR_LEASE_MS after this
+ *  page first saw that exact record, never by the expiry it claims (CLOCKS). */
+function claimLive(claim: CasinoOperatorClaim, now: number): boolean {
+  const docEpoch = casinoDocEpoch();
+  return claim.sessionId !== operatorSessionId
+    && claimSeen !== null
+    && claimSeen.id === `${docEpoch}|${claim.playerId}|${claim.sessionId}|${claim.expiresAt}`
+    && now < claimSeen.at + OPERATOR_LEASE_MS;
+}
+
+/** The holder steps aside when it has no slot work and another install (a
+ *  session of another player) claims the room with slot work of its own. */
+function shouldYield(now: number, docEpoch: number, playerId: string, claim: CasinoOperatorClaim | null): boolean {
+  return !gameNeeds('slots', docEpoch)
+    && claim !== null
+    && claim.playerId !== playerId
+    && claimLive(claim, now);
+}
+
+function yieldInForce(now: number, docEpoch: number): boolean {
+  return yieldUntil !== null && yieldUntil.docEpoch === docEpoch && now < yieldUntil.at;
+}
+
+/**
+ * Held off, with slot work: claim the room when the primary names a live
+ * holder of another player that doesn't serve the slots (another install of
+ * the deed holder, running the pushers), so it steps aside. Written when
+ * there is no claim, when another session's has lapsed, or when this page's
+ * own is due a renewal; dropped once this page has no slot work or nothing
+ * to claim against. Never against a v0.38 holder (no primary: it reads no
+ * claim), the same player (it serves the same machines), or a holder
+ * serving slots (the take decided between two installs with machines).
+ */
+function maintainClaim(now: number, docEpoch: number, playerId: string, claim: CasinoOperatorClaim | null): void {
+  const primary = readCasinoOperatorRecord();
+  const claimable = gameNeeds('slots', docEpoch)
+    && primary !== null
+    && primary.sessionId !== operatorSessionId
+    && now < takeoverAt(CASINO_OPERATOR_KEY, primary, now)
+    && primary.playerId !== playerId
+    && !primary.serves?.includes('slots');
+  if (!claimable) {
+    dropOwnClaim();
+    return;
+  }
+  const due = claim === null
+    || (claim.sessionId !== operatorSessionId && !claimLive(claim, now))
+    || (claim.sessionId === operatorSessionId
+      && (claimRenewedAt?.docEpoch !== docEpoch || now - claimRenewedAt.at >= OPERATOR_LEASE_RENEW_MS));
+  if (!due) return;
+  writeCasinoOperatorClaim({ playerId, sessionId: operatorSessionId, expiresAt: now + OPERATOR_LEASE_MS });
+  claimRenewedAt = { docEpoch, at: now };
+}
+
+/** Delete this page's claim, if it wrote one in this room's doc. */
+function dropOwnClaim(): void {
+  if (claimRenewedAt === null) return;
+  if (claimRenewedAt.docEpoch === casinoDocEpoch()) clearCasinoOperatorClaim(operatorSessionId);
+  claimRenewedAt = null;
 }
 
 // ── The election ─────────────────────────────────────────────────────────────
@@ -587,7 +745,9 @@ export type ElectionOutcome =
   | { kind: 'idle' }
   /** An earlier build's `slot-operator:<mid>` is live. */
   | { kind: 'legacy-build' }
-  /** A live record of another session under any key. */
+  /** A live record of another session under any key, or this page stepped
+   *  aside for another install's claim (in this call, or within the last
+   *  OPERATOR_LEASE_MS). */
   | { kind: 'held-elsewhere' }
   /** This call ended the take; `foreignHolder` says whether another
    *  session's record was there. */
@@ -608,6 +768,7 @@ export function electCasinoOperator(now: number, tidyLegacy: boolean): ElectionO
   const docEpoch = casinoDocEpoch();
   const playerId = getPlayerId();
   observeRoomLeases(now);
+  const claim = observeClaim(now);
   const legacyLive = watchEarlierBuilds(tidyLegacy, now);
   const own = operator !== null && operator.docEpoch === docEpoch && operator.playerId === playerId
     ? operator
@@ -639,13 +800,30 @@ export function electCasinoOperator(now: number, tidyLegacy: boolean): ElectionO
       endTake('released');
       return { kind: 'idle' };
     }
-    if (now - own.renewedAt >= OPERATOR_LEASE_RENEW_MS) renew(own, now);
+    if (shouldYield(now, docEpoch, playerId, claim)) {
+      // Another install claims the room for slot work this page can't do
+      // (WHO THE RECORD NAMES): step aside, and stay aside a term so it
+      // takes the MISSING records; nothing live is ever taken (TWO INSTALLS).
+      endTake('yielded');
+      yieldUntil = { docEpoch, at: now + OPERATOR_LEASE_MS };
+      return { kind: 'held-elsewhere' };
+    }
+    // A game gained since the last write goes out now, not a renewal later
+    // (a DROP panel reads it: coinPusherOperatorState); one lost waits.
+    const gained = servedNow(docEpoch).some((game) => !own.serves.includes(game));
+    if (gained || now - own.renewedAt >= OPERATOR_LEASE_RENEW_MS) renew(own, now, claim);
     return now < own.readyAt
       ? { kind: 'starting', playerId, tenure: own.tenure }
       : { kind: 'ready', docEpoch, playerId, tenure: own.tenure };
   }
-  if (!unionNeed(docEpoch)) return { kind: 'idle' };
-  if (heldElsewhere(now)) return { kind: 'held-elsewhere' };
+  if (!unionNeed(docEpoch)) {
+    dropOwnClaim();
+    return { kind: 'idle' };
+  }
+  if (heldElsewhere(now) || yieldInForce(now, docEpoch)) {
+    maintainClaim(now, docEpoch, playerId, claim);
+    return { kind: 'held-elsewhere' };
+  }
   take(playerId, now);
   return { kind: 'starting', playerId, tenure: operator!.tenure };
 }
@@ -653,7 +831,8 @@ export function electCasinoOperator(now: number, tidyLegacy: boolean): ElectionO
 /**
  * The RUN path (a machine started by hand from its service panel): refuses
  * while this session is leaving the room, while an earlier build is
- * operating (read afresh), or while any key is held elsewhere; otherwise
+ * operating (read afresh), while any key is held elsewhere, or while this
+ * page stays aside after yielding (TWO INSTALLS); otherwise
  * records the game's need — so the next election, by another game's tick,
  * keeps the lease — and takes the room at once unless this page already
  * holds it in its current take. A record naming this page with another
@@ -663,7 +842,7 @@ export function takeCasinoOperatorLease(game: OperatorGame, playerId: string, no
   if (isLeavingCasinoRoom()) return false;
   observeRoomLeases(now);
   if (watchEarlierBuilds(false, now)) return false;
-  if (heldElsewhere(now)) return false;
+  if (heldElsewhere(now) || yieldInForce(now, casinoDocEpoch())) return false;
   reportOperatorNeed(game, true);
   if (!ownsCasinoOperatorLease(playerId, now)) take(playerId, now);
   return true;
@@ -707,9 +886,21 @@ export function casinoOperatorState(now = Date.now()): CasinoOperatorState {
 
 /** By the v0.38 pusher key, which this build's holders shadow and v0.38
  *  holders write, so a player's DROP panel reads either. (Reads the primary
- *  once WRITE_LEGACY_ROOM_SHADOWS is retired.) */
+ *  once WRITE_LEGACY_ROOM_SHADOWS is retired.) A shadow of this build's
+ *  holder is `offline` while its primary says the holder serves no game that
+ *  takes the croupier deed (slots alone: a machine run by hand in a venture
+ *  room), since nobody there settles drops. A game the holder gains goes out
+ *  in the frame it reports its need, so a first take or a cabinet just
+ *  placed never reads `offline` here. */
 export function coinPusherOperatorState(now = Date.now()): CasinoOperatorState {
-  return stateForKey(COIN_PUSHER_OPERATOR_KEY, now);
+  const state = stateForKey(COIN_PUSHER_OPERATOR_KEY, now);
+  if (state === 'offline') return state;
+  const shadow = readRoomOperatorLease(COIN_PUSHER_OPERATOR_KEY);
+  const primary = readCasinoOperatorRecord();
+  if (shadow && primary?.serves
+    && primary.sessionId === shadow.sessionId && primary.tenure === shadow.tenure
+    && !primary.serves.includes('pusher') && !primary.serves.includes('air-hockey')) return 'offline';
+  return state;
 }
 
 // ── Release and leave ────────────────────────────────────────────────────────
@@ -735,8 +926,11 @@ export function releaseCasinoOperatorLease(): void {
  */
 export function leaveCasinoRoom(): void {
   leavingDocEpoch = casinoDocEpoch();
-  endTake('leaving');
+  endTake('leaving'); // this page's claim goes with its records
   seen.clear();
+  claimSeen = null;
+  claimRenewedAt = null;
+  yieldUntil = null;
   earlierBuildLeasesSeen.clear();
   needs.clear();
   for (const game of hooks.values()) game.onLeave();

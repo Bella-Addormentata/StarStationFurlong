@@ -8,8 +8,10 @@
  * both, an earlier build holding both off, teardowns holding the lease, one
  * leave. Part 2 pins the hold-off on a v0.38 peer's record, the shadows a
  * v0.38 peer reads, device continuity, the race for one key, and the three
- * records a crashed new page leaves. Last, where the settle's pre-write check
- * sits: after its last await. The election's own rules are
+ * records a crashed new page leaves. Then where the settle's pre-write check
+ * sits: after its last await. Last, two installs of one deed holder (a peer
+ * doc with another player id): the claim, the yield, and what the primary
+ * says its holder serves. The election's own rules are
  * casinoOperator.test.ts's; each croupier's wiring is its own test file's.
  */
 
@@ -18,11 +20,14 @@ import * as Y from 'yjs';
 import {
   bindCasinoDoc,
   buyInChips,
+  CASINO_OPERATOR_CLAIM_KEY,
   CASINO_OPERATOR_KEY,
   COIN_PUSHER_OPERATOR_KEY,
   depositSlotFunding,
   hasSlotEscrow,
+  readCasinoOperatorClaim,
   readCasinoOperatorLease,
+  readCasinoOperatorRecord,
   readChips,
   readCoinPusherOperatorLease,
   readCoinPusherRequest,
@@ -46,8 +51,8 @@ import {
   writeSlotPlayRequest,
   writeSlotReveal,
 } from './casinoDoc';
-import type { RoomOperatorKey, SlotOperatorLease } from './casinoDoc';
-import { registerOperatorGame } from './casinoOperator';
+import type { CasinoOperatorClaim, OperatorServed, RoomOperatorKey, SlotOperatorLease } from './casinoDoc';
+import { casinoOperatorState, currentTake, registerOperatorGame, releaseCasinoOperatorLease } from './casinoOperator';
 import type { OperatorStopReason } from './casinoOperator';
 import { setSoleCroupierPredicate } from './croupier';
 import {
@@ -71,8 +76,10 @@ import type { SlotFundingConfig } from './games/slots';
 import { getPlayerId } from './identity';
 import {
   closeCoinPusher,
+  coinPusherOperatorState,
   coinPusherWatchCount,
   isCoinPusherOperator,
+  isCoinPusherOperatorLive,
   leaveCoinPusherRoom,
   tickCoinPusherRoom,
   tickCoinPusherTeardowns,
@@ -1069,5 +1076,442 @@ describe("the settle's pre-write check", () => {
     expect(spinning(M1)).toBe(true); // nothing written behind the new holder
     expect(hasSlotEscrow(M1)).toBe(true);
     expect(readChips(PLAYER)).toBe(100 - BET);
+  });
+});
+
+// ── Two installs: claim and yield ────────────────────────────────────────────
+
+describe('two installs', () => {
+  /** Install A: the deed holder's other install (another player id), a page
+   *  on another device, simulated by a peer doc kept in sync. */
+  const INSTALL_A = 'player-install-A';
+  const A_SESSION = 'install-a-device:tab';
+
+  /** A's claim, as its election writes it while held off with slot work. */
+  function claimFrom(peer: Y.Doc, expiresAt: number, playerId = INSTALL_A): CasinoOperatorClaim {
+    const claim = { playerId, sessionId: A_SESSION, expiresAt };
+    peer.getMap('casino').set(CASINO_OPERATOR_CLAIM_KEY, claim);
+    sync(doc, peer);
+    return claim;
+  }
+
+  /** A new build's take (or renewal) from the peer: the primary with what it
+   *  serves, the two shadows with the four fields, in one transaction. */
+  function takenBy(
+    peer: Y.Doc,
+    t: number,
+    serves: readonly OperatorServed[],
+    playerId = INSTALL_A,
+  ): SlotOperatorLease {
+    const record = { playerId, sessionId: A_SESSION, tenure: 'a-take', expiresAt: t + LEASE_MS };
+    peer.transact(() => {
+      const map = peer.getMap('casino');
+      map.set(CASINO_OPERATOR_KEY, { ...record, serves: [...serves] });
+      map.set(SLOT_OPERATOR_KEY, record);
+      map.set(COIN_PUSHER_OPERATOR_KEY, record);
+    });
+    sync(doc, peer);
+    return record;
+  }
+
+  it('a holder with pusher work only steps aside for a claim, stays aside a term though its cabinet still needs the room, then waits on the claimant', () => {
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    frame(T0, [], [CABINET]); // B takes for its cabinet alone
+    frame(T0 + RENEW_MS, [], [CABINET]); // and renews, saying what it serves
+    expect(readCasinoOperatorRecord()).toMatchObject({ sessionId: SESSION, serves: ['pusher'] });
+    const tenure = readCasinoOperatorLease()!.tenure;
+
+    const t1 = T0 + RENEW_MS + 500;
+    const claim = claimFrom(peer, t1 + LEASE_MS);
+    frame(t1, [], [CABINET]);
+    expect(records()).toEqual([null, null, null]); // every record naming B, in its first election
+    expect(stops).toEqual(['yielded']);
+    expect(isCoinPusherOperator()).toBe(false);
+    sync(doc, peer);
+    for (const key of ROOM_OPERATOR_KEYS) expect(peer.getMap('casino').has(key)).toBe(false);
+
+    // Nothing taken back for a term, cabinet or not; the claim isn't B's to delete.
+    for (let t = t1 + 500; t < t1 + LEASE_MS; t += 500) {
+      frame(t, [], [CABINET]);
+      expect(records()).toEqual([null, null, null]);
+    }
+    frame(t1 + LEASE_MS - 1, [], [CABINET]);
+    expect(records()).toEqual([null, null, null]);
+    expect(readCasinoOperatorClaim()).toEqual(claim);
+
+    // A takes the missing records (and drops its claim); B holds off on them.
+    const aTakes = t1 + LEASE_MS - 1;
+    peer.getMap('casino').delete(CASINO_OPERATOR_CLAIM_KEY);
+    takenBy(peer, aTakes, ['slots', 'pusher']);
+    for (let t = aTakes + 1; t <= aTakes + 20_000; t += 500) {
+      if ((t - aTakes - 1) % RENEW_MS === 0) takenBy(peer, t, ['slots', 'pusher']);
+      frame(t, [], [CABINET]);
+      expect(readCasinoOperatorLease()?.sessionId).toBe(A_SESSION);
+      for (const record of records()) expect(record?.sessionId).toBe(A_SESSION);
+    }
+    expect(readCasinoOperatorClaim()).toBeNull();
+    expect(stops).toEqual(['yielded']);
+    expect(currentTake()).toBeNull();
+    expect(readCasinoOperatorLease()?.tenure).not.toBe(tenure);
+    // B's DROP panel reads A, which serves the pushers too.
+    expect(coinPusherOperatorState()).toBe('ready');
+  });
+
+  it('a first take with a funded machine and a cabinet serves both from its first frame: its DROP panel is never offline', () => {
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    frame(T0, [M1], [CABINET]); // the slot tick takes before the pusher tick reports its need
+    expect(readCasinoOperatorRecord()?.serves).toEqual(['slots', 'pusher']);
+    expect(coinPusherOperatorState(T0)).toBe('starting');
+    frame(T0 + SETTLE_MS, [M1], [CABINET]);
+    expect(coinPusherOperatorState(T0 + SETTLE_MS)).toBe('ready');
+    expect(isCoinPusherOperatorLive()).toBe(true);
+  });
+
+  it('never claims against a holder with its own player id: that session serves the same machines', () => {
+    fund(M1); // B has slot work of its own…
+    const peer = new Y.Doc();
+    for (let t = T0; t <= T0 + 20_000; t += 500) {
+      // …and the room is held by another session of the same player, pushers only.
+      if ((t - T0) % RENEW_MS === 0) takenBy(peer, t, ['pusher'], OPERATOR);
+      frame(t, [M1], []);
+      expect(readCasinoOperatorLease()?.sessionId).toBe(A_SESSION);
+      expect(readCasinoOperatorClaim()).toBeNull();
+    }
+    sync(doc, peer);
+    expect(peer.getMap('casino').has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
+  });
+
+  it('a holder never steps aside for a claim of its own player id: that session serves the same machines', () => {
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    frame(T0, [], [CABINET]); // B takes for its cabinet alone
+    frame(T0 + RENEW_MS, [], [CABINET]);
+    expect(readCasinoOperatorRecord()?.serves).toEqual(['pusher']);
+    const tenure = readCasinoOperatorLease()!.tenure;
+    const t1 = T0 + RENEW_MS + 500;
+    for (let t = t1; t <= t1 + 20_000; t += 500) {
+      if ((t - t1) % RENEW_MS === 0) claimFrom(peer, t + LEASE_MS, OPERATOR); // same player, renewed: live all along
+      frame(t, [], [CABINET]);
+      expect(readCasinoOperatorLease()?.tenure).toBe(tenure);
+      for (const record of records()) expect(record?.sessionId).toBe(SESSION);
+    }
+    expect(stops).toEqual([]);
+  });
+
+  it('never claims against a holder already serving slots (two installs with machines of their own: the take decides)', () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    for (let t = T0; t <= T0 + 20_000; t += 500) {
+      if ((t - T0) % RENEW_MS === 0) takenBy(peer, t, ['slots', 'pusher']);
+      frame(t, [M1], []);
+      expect(readCasinoOperatorLease()?.sessionId).toBe(A_SESSION);
+      expect(readCasinoOperatorClaim()).toBeNull();
+    }
+  });
+
+  it('never claims against a v0.38 holder, which writes no primary and reads no claim', () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    const theirs = (t: number): SlotOperatorLease =>
+      ({ playerId: INSTALL_A, sessionId: A_SESSION, tenure: 'old-take', expiresAt: t + LEASE_MS });
+    for (let t = T0; t <= T0 + 20_000; t += 500) {
+      if ((t - T0) % RENEW_MS === 0) {
+        peer.getMap('casino').set(SLOT_OPERATOR_KEY, theirs(t));
+        peer.getMap('casino').set(COIN_PUSHER_OPERATOR_KEY, theirs(t));
+        sync(doc, peer);
+      }
+      frame(t, [M1], []);
+      expect(readCasinoOperatorLease()).toBeNull();
+      expect(readCasinoOperatorClaim()).toBeNull();
+    }
+  });
+
+  it('a holder with slot work never steps aside, and deletes a claim once it has lapsed', () => {
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    becomeOperator([M1], [CABINET]);
+    const tenure = readCasinoOperatorLease()!.tenure;
+    frame(T0 + RENEW_MS, [M1], [CABINET]);
+    expect(readCasinoOperatorRecord()?.serves).toEqual(['slots', 'pusher']);
+    let lastClaim = T0 + RENEW_MS;
+    for (let t = T0 + RENEW_MS; t <= T0 + 20_000; t += 500) {
+      if ((t - T0) % RENEW_MS === 0) {
+        claimFrom(peer, t + LEASE_MS); // renewed: live all along
+        lastClaim = t;
+      }
+      frame(t, [M1], [CABINET]);
+      expect(readCasinoOperatorLease()?.tenure).toBe(tenure);
+      expect(readCasinoOperatorClaim()?.sessionId).toBe(A_SESSION); // a live claim is left alone
+    }
+    expect(stops).toEqual([]);
+    // The claimant goes quiet: a term after the holder last saw it renewed,
+    // its next renewal deletes it.
+    let t = T0 + 20_000;
+    while (t < lastClaim + LEASE_MS) {
+      t += 500;
+      frame(t, [M1], [CABINET]);
+    }
+    for (let u = t; u <= t + RENEW_MS; u += 500) frame(u, [M1], [CABINET]);
+    expect(readCasinoOperatorClaim()).toBeNull();
+    expect(readCasinoOperatorLease()?.tenure).toBe(tenure);
+    expect(stops).toEqual([]);
+  });
+
+  it('a stale claim costs a pusher-only holder one term aside: it takes the room back while the claim is still there, and never steps aside for it again', () => {
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    frame(T0, [], [CABINET]);
+    frame(T0 + RENEW_MS, [], [CABINET]);
+    expect(readCasinoOperatorRecord()?.serves).toEqual(['pusher']);
+    // A claimant that wrote once and crashed, on a clock far ahead: its
+    // expiry is never believed, only the renewals this page sees.
+    const t1 = T0 + RENEW_MS + 500;
+    const claim = claimFrom(peer, t1 + 3_600_000);
+    frame(t1, [], [CABINET]);
+    expect(stops).toEqual(['yielded']);
+    // Aside means aside: RUN is refused too while it lasts.
+    fund(M1);
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(t1 + 1_000))).toBe(false);
+    expect(records()).toEqual([null, null, null]);
+    frame(t1 + LEASE_MS - 1, [], [CABINET]);
+    expect(records()).toEqual([null, null, null]);
+    frame(t1 + LEASE_MS, [], [CABINET]);
+    const retaken = readCasinoOperatorLease();
+    expect(retaken?.sessionId).toBe(SESSION);
+    expect(readCasinoOperatorClaim()).toEqual(claim); // still there
+    for (let t = t1 + LEASE_MS + 500; t <= t1 + LEASE_MS + 20_000; t += 500) {
+      frame(t, [], [CABINET]);
+      expect(readCasinoOperatorLease()?.tenure).toBe(retaken?.tenure);
+    }
+    expect(stops).toEqual(['yielded']);
+    expect(readCasinoOperatorClaim()).toBeNull(); // deleted at a renewal, lapsed
+  });
+
+  it("a new DROP panel reads offline under a slot holder that doesn't serve the pushers", () => {
+    setSoleCroupierPredicate(() => false); // a venture room: a machine run by hand
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(T0))).toBe(true);
+    frame(T0 + 16, [M1], [CABINET], true);
+    frame(T0 + SETTLE_MS, [M1], [CABINET], true);
+    expect(readCasinoOperatorRecord()?.serves).toEqual(['slots']);
+    expect(isSlotOperator()).toBe(true);
+    expect(casinoOperatorState()).toBe('ready');
+    expect(readCoinPusherOperatorLease()?.sessionId).toBe(SESSION); // the shadow a v0.38 panel reads
+    expect(coinPusherOperatorState()).toBe('offline');
+    expect(isCoinPusherOperatorLive()).toBe(false);
+
+    // The same holder seen from another page, and one that serves the pushers.
+    leaveSlotMachineRoom();
+    doc = new Y.Doc();
+    bindCasinoDoc(doc);
+    const peer = new Y.Doc();
+    const t1 = T0 + 10_000;
+    takenBy(peer, t1, ['slots']);
+    at(t1);
+    expect(casinoOperatorState(t1)).toBe('starting');
+    expect(coinPusherOperatorState(t1)).toBe('offline');
+    expect(coinPusherOperatorState(t1 + SETTLE_MS)).toBe('offline');
+    takenBy(peer, t1 + RENEW_MS, ['slots', 'pusher']); // a cabinet placed: the holder says so at once
+    expect(coinPusherOperatorState(t1 + RENEW_MS)).toBe('ready');
+    // A v0.38 holder's pusher record carries no primary to ask: read as before.
+    peer.getMap('casino').delete(CASINO_OPERATOR_KEY);
+    sync(doc, peer);
+    expect(coinPusherOperatorState(t1 + RENEW_MS + 1)).toBe('ready');
+  });
+
+  it('a DROP panel reads a pusher record of another session as itself, whatever the primary serves', () => {
+    const peer = new Y.Doc();
+    const t1 = T0 + 10_000;
+    at(t1);
+    takenBy(peer, t1, ['slots']);
+    // A v0.38 pusher operator's take won the merge on its key.
+    peer.getMap('casino').set(COIN_PUSHER_OPERATOR_KEY, { playerId: OTHER, sessionId: 'v038-device:tab', expiresAt: t1 + LEASE_MS });
+    sync(doc, peer);
+    expect(coinPusherOperatorState(t1)).toBe('starting');
+    expect(coinPusherOperatorState(t1 + SETTLE_MS)).toBe('ready');
+  });
+
+  it("…and one of the primary's session under another tenure (another take)", () => {
+    const peer = new Y.Doc();
+    const t1 = T0 + 10_000;
+    at(t1);
+    const record = takenBy(peer, t1, ['slots']);
+    peer.getMap('casino').set(COIN_PUSHER_OPERATOR_KEY, { ...record, tenure: 'other-take' });
+    sync(doc, peer);
+    expect(coinPusherOperatorState(t1)).toBe('starting');
+    expect(coinPusherOperatorState(t1 + SETTLE_MS)).toBe('ready');
+  });
+
+  it("as a claimant, leaves another claimant's live claim alone and overwrites it only once it has lapsed by its own sightings", () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    const mine = (t: number): CasinoOperatorClaim => ({ playerId: OPERATOR, sessionId: SESSION, expiresAt: t + LEASE_MS });
+    const theirs: CasinoOperatorClaim = { playerId: 'player-install-C', sessionId: 'install-c-device:tab', expiresAt: T0 + LEASE_MS };
+    takenBy(peer, T0, ['pusher']);
+    peer.getMap('casino').set(CASINO_OPERATOR_CLAIM_KEY, theirs);
+    sync(doc, peer);
+    for (let t = T0; t < T0 + LEASE_MS; t += 500) {
+      if ((t - T0) % RENEW_MS === 0) takenBy(peer, t, ['pusher']);
+      frame(t, [M1], []);
+      expect(readCasinoOperatorLease()?.sessionId).toBe(A_SESSION);
+      expect(readCasinoOperatorClaim()).toEqual(theirs); // live by this page's sightings: left alone
+    }
+    frame(T0 + LEASE_MS, [M1], []);
+    expect(readCasinoOperatorClaim()).toEqual(mine(T0 + LEASE_MS)); // lapsed (C never renewed): overwritten
+  });
+
+  it('as the claimant: claims against a holder whose primary says nothing, or junk, about what it serves', () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    const cases: unknown[] = [undefined, ['roulette']];
+    cases.forEach((serves, i) => {
+      const start = T0 + i * 10_000;
+      for (let t = start; t < start + 10_000; t += 500) {
+        if ((t - start) % RENEW_MS === 0) {
+          const record = { playerId: INSTALL_A, sessionId: A_SESSION, tenure: 'a-take', expiresAt: t + LEASE_MS };
+          peer.transact(() => {
+            const map = peer.getMap('casino');
+            map.set(CASINO_OPERATOR_KEY, serves === undefined ? record : { ...record, serves });
+            map.set(SLOT_OPERATOR_KEY, record);
+            map.set(COIN_PUSHER_OPERATOR_KEY, record);
+          });
+          sync(doc, peer);
+        }
+        frame(t, [M1], []);
+        expect(readCasinoOperatorLease()?.sessionId).toBe(A_SESSION);
+        expect(readCasinoOperatorClaim()?.sessionId).toBe(SESSION);
+      }
+      expect(readCasinoOperatorRecord()?.serves).toBeUndefined();
+    });
+  });
+
+  it('as the claimant: drops its claim once the primary is past its takeover time, though a v0.38 shadow still holds it off', () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    takenBy(peer, T0, ['pusher']); // the primary, never renewed
+    const v038 = (t: number): SlotOperatorLease => ({ playerId: INSTALL_A, sessionId: PEER_SESSION, expiresAt: t + LEASE_MS });
+    const takeover = T0 + LEASE_MS + OPERATOR_UNCLEAN_TAKEOVER_MS;
+    for (let t = T0; t <= takeover + 10_000; t += 500) {
+      if ((t - T0) % RENEW_MS === 0 && t > T0) {
+        peer.getMap('casino').set(COIN_PUSHER_OPERATOR_KEY, v038(t));
+        sync(doc, peer);
+      }
+      frame(t, [M1], []);
+      expect(readRoomOperatorLease(CASINO_OPERATOR_KEY)?.sessionId).toBe(A_SESSION);
+      if (t < takeover) expect(readCasinoOperatorClaim()?.sessionId).toBe(SESSION);
+      else expect(readCasinoOperatorClaim()).toBeNull();
+    }
+    expect(currentTake()).toBeNull();
+  });
+
+  it('as the claimant: claims while held off with slot work, renews its claim every 3 s, takes its claim back with the work, and drops it on the take', () => {
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    const mine = (t: number): CasinoOperatorClaim => ({ playerId: OPERATOR, sessionId: SESSION, expiresAt: t + LEASE_MS });
+    // A's holder serves the pushers only, and has published it.
+    for (const t of [T0, T0 + 1_000, T0 + RENEW_MS - 1, T0 + RENEW_MS, T0 + 5_000, T0 + 2 * RENEW_MS]) {
+      if ((t - T0) % RENEW_MS === 0) takenBy(peer, t, ['pusher']);
+      frame(t, [M1], [CABINET]);
+      expect(readCasinoOperatorLease()?.sessionId).toBe(A_SESSION);
+      expect(readCasinoOperatorClaim()).toEqual(mine(t - ((t - T0) % RENEW_MS)));
+    }
+    sync(doc, peer);
+    expect(peer.getMap('casino').get(CASINO_OPERATOR_CLAIM_KEY)).toEqual(mine(T0 + 2 * RENEW_MS));
+    // No slot work for a frame, the cabinet still there: the claim goes with it.
+    frame(T0 + 6_500, [], [CABINET]);
+    expect(readCasinoOperatorClaim()).toBeNull();
+    frame(T0 + 7_000, [M1], [CABINET]);
+    expect(readCasinoOperatorClaim()).toEqual(mine(T0 + 7_000));
+    // A steps aside (its records gone): this page takes the missing records at once.
+    peer.transact(() => {
+      for (const key of ROOM_OPERATOR_KEYS) peer.getMap('casino').delete(key);
+    });
+    sync(doc, peer);
+    frame(T0 + 7_500, [M1], [CABINET]);
+    expect(readCasinoOperatorRecord()).toEqual({
+      playerId: OPERATOR, sessionId: SESSION, tenure: TENURE, expiresAt: T0 + 7_500 + LEASE_MS, serves: ['slots', 'pusher'],
+    });
+    for (const record of records()) expect(record?.sessionId).toBe(SESSION);
+    expect(readCasinoOperatorClaim()).toBeNull();
+    sync(doc, peer);
+    expect(peer.getMap('casino').has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
+    frame(T0 + 7_500 + SETTLE_MS, [M1], [CABINET]);
+    expect(isSlotOperator()).toBe(true);
+    expect(stops).toEqual([]);
+  });
+
+  it('as the claimant: drops its claim on release and on leave', () => {
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    const mine = (t: number): CasinoOperatorClaim => ({ playerId: OPERATOR, sessionId: SESSION, expiresAt: t + LEASE_MS });
+    takenBy(peer, T0, ['pusher']);
+    frame(T0, [M1], [CABINET]);
+    expect(readCasinoOperatorClaim()).toEqual(mine(T0));
+    releaseCasinoOperatorLease(); // pagehide
+    expect(readCasinoOperatorClaim()).toBeNull();
+    frame(T0 + RENEW_MS, [M1], [CABINET]); // claims again, still held off
+    expect(readCasinoOperatorClaim()).toEqual(mine(T0 + RENEW_MS));
+    leaveSlotMachineRoom();
+    sync(doc, peer);
+    expect(peer.getMap('casino').has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
+  });
+
+  it('as the claimant: drops its claim once no game needs the room (no cabinet here, slot work ended)', () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    takenBy(peer, T0, ['pusher']);
+    frame(T0, [M1], []); // held off with slot work only: claims
+    expect(readCasinoOperatorClaim()?.sessionId).toBe(SESSION);
+    frame(T0 + 500, [], []); // no game needs the room
+    expect(readCasinoOperatorClaim()).toBeNull();
+    sync(doc, peer);
+    expect(peer.getMap('casino').has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
+  });
+
+  it("a page that stepped aside in one room's doc takes and runs in the next room's at once", () => {
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    frame(T0, [], [CABINET]);
+    frame(T0 + RENEW_MS, [], [CABINET]);
+    const t1 = T0 + RENEW_MS + 500;
+    claimFrom(peer, t1 + LEASE_MS);
+    frame(t1, [], [CABINET]);
+    expect(stops).toEqual(['yielded']);
+    // Another room's doc, bound with no leave (a join from offline).
+    doc = new Y.Doc();
+    bindCasinoDoc(doc);
+    writeCoinPusherState(CABINET, machineWith(10));
+    frame(t1 + 500, [], [CABINET]);
+    expect(records()[0]?.sessionId).toBe(SESSION);
+    // And RUN, in a third, still within the term it stayed aside in the first.
+    doc = new Y.Doc();
+    bindCasinoDoc(doc);
+    setSoleCroupierPredicate(() => false);
+    fund(M1);
+    expect(setManualSlotMachineRunning(M1, OPERATOR, true, at(t1 + 1_000))).toBe(true);
+  });
+
+  it("a claimant that claimed in one room's doc renews a leftover claim of its own in the next room's at once", () => {
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    takenBy(new Y.Doc(), T0, ['pusher']);
+    frame(T0, [M1], [CABINET]);
+    expect(readCasinoOperatorClaim()?.sessionId).toBe(SESSION);
+    // Another room's doc, bound with no leave, holding a claim this session left there.
+    doc = new Y.Doc();
+    bindCasinoDoc(doc);
+    fund(M1);
+    writeCoinPusherState(CABINET, machineWith(10));
+    const peer = new Y.Doc();
+    peer.getMap('casino').set(CASINO_OPERATOR_CLAIM_KEY, { playerId: OPERATOR, sessionId: SESSION, expiresAt: T0 - 60_000 });
+    takenBy(peer, T0 + 500, ['pusher']);
+    frame(T0 + 500, [M1], [CABINET]);
+    expect(readCasinoOperatorClaim()).toEqual({ playerId: OPERATOR, sessionId: SESSION, expiresAt: T0 + 500 + LEASE_MS });
   });
 });

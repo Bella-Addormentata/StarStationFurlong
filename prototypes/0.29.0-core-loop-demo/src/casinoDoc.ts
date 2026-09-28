@@ -1356,7 +1356,9 @@ export function clearCoinPusherOperatorLease(): void {
 // own key sees a live foreign record and waits, and never a gap between the
 // two. A record under any of the three keys that names another session holds
 // this build off. casinoOperator.ts holds the election; this map only reads
-// and writes the records.
+// and writes the records. The primary alone also says which games its holder
+// serves, and one more key carries another install's claim (casinoOperator.ts,
+// TWO INSTALLS).
 
 export const CASINO_OPERATOR_KEY = 'casino-operator';
 
@@ -1366,33 +1368,80 @@ export const ROOM_OPERATOR_KEYS = [
 ] as const;
 export type RoomOperatorKey = typeof ROOM_OPERATOR_KEYS[number];
 
-/** The shared lease's record: for now exactly the slot operator's. */
-export type CasinoOperatorLease = SlotOperatorLease;
+/** The games a holder can say it serves (casinoOperator.ts OperatorGame). */
+export type OperatorServed = 'slots' | 'pusher' | 'air-hockey';
+const OPERATOR_SERVED: readonly unknown[] = ['slots', 'pusher', 'air-hockey'] satisfies OperatorServed[];
+/** Longest `serves` list a record may carry: peers write these keys. */
+const SERVES_CAP = 8;
 
-/** The record under one of the room's operator keys, if it reads as one. */
-export function readRoomOperatorLease(key: RoomOperatorKey): SlotOperatorLease | null {
-  const value = ensureMap().get(key);
-  return isSlotOperatorLease(value) ? value : null;
+/** The shared lease's primary record: the slot operator's four fields, and
+ *  the games its holder had need of at its last take or renewal. `serves`
+ *  is never on a shadow, and never an input to ownership, lapse or takeover:
+ *  it only tells another install whether to claim, and a pusher panel whether
+ *  anyone settles drops. */
+export type CasinoOperatorLease = SlotOperatorLease & { serves?: readonly OperatorServed[] };
+
+function isServesList(value: unknown): value is readonly OperatorServed[] {
+  return Array.isArray(value) && value.length <= SERVES_CAP
+    && value.every((game) => OPERATOR_SERVED.includes(game));
 }
 
-export function readCasinoOperatorLease(): CasinoOperatorLease | null {
+/** A primary record: a lease, with no `serves` or a short list of known games. */
+export function isCasinoOperatorLease(value: unknown): value is CasinoOperatorLease {
+  return isSlotOperatorLease(value)
+    && ((value as { serves?: unknown }).serves === undefined
+      || isServesList((value as { serves?: unknown }).serves));
+}
+
+/** The four lease fields of a record, whatever else a writer put beside them. */
+function leaseFields(lease: SlotOperatorLease): SlotOperatorLease {
+  const { playerId, sessionId, tenure, expiresAt } = lease;
+  return tenure === undefined
+    ? { playerId, sessionId, expiresAt }
+    : { playerId, sessionId, tenure, expiresAt };
+}
+
+/** The four lease fields under one of the room's operator keys, if it reads
+ *  as a lease: the same guard whatever else the record carries, so a primary
+ *  with a `serves` list (a peer's junk one too) holds the room off exactly as
+ *  a shadow does. */
+export function readRoomOperatorLease(key: RoomOperatorKey): SlotOperatorLease | null {
+  const value = ensureMap().get(key);
+  return isSlotOperatorLease(value) ? leaseFields(value) : null;
+}
+
+/** The primary's four lease fields (as its shadows carry them). */
+export function readCasinoOperatorLease(): SlotOperatorLease | null {
   return readRoomOperatorLease(CASINO_OPERATOR_KEY);
 }
 
+/** The primary with what its holder serves. A `serves` that doesn't read (an
+ *  unknown game, a long list) is stripped, never the record: a record that
+ *  read as none here would stop holding this build off wherever this reader
+ *  is asked, and the peer that wrote the junk could write a live record
+ *  anyway. */
+export function readCasinoOperatorRecord(): CasinoOperatorLease | null {
+  const value = ensureMap().get(CASINO_OPERATOR_KEY);
+  if (!isSlotOperatorLease(value)) return null;
+  const serves = (value as { serves?: unknown }).serves;
+  return isServesList(serves) ? { ...leaseFields(value), serves: [...serves] } : leaseFields(value);
+}
+
 /** Write the holder's record under each of `keys`, the primary first, in ONE
- *  transaction. A shadow carries the four lease fields only. */
+ *  transaction. The primary carries `serves`; a shadow the four lease fields
+ *  only. */
 export function writeCasinoOperatorRecords(
   lease: CasinoOperatorLease,
   keys: readonly RoomOperatorKey[],
 ): void {
-  if (!isSlotOperatorLease(lease)) return;
-  const { playerId, sessionId, tenure, expiresAt } = lease;
-  const shadow: SlotOperatorLease = tenure === undefined
-    ? { playerId, sessionId, expiresAt }
-    : { playerId, sessionId, tenure, expiresAt };
+  if (!isCasinoOperatorLease(lease)) return;
+  const shadow = leaseFields(lease);
+  const primary: CasinoOperatorLease = lease.serves === undefined
+    ? shadow
+    : { ...shadow, serves: [...lease.serves] };
   const map = ensureMap();
   boundDoc!.transact(() => {
-    if (keys.includes(CASINO_OPERATOR_KEY)) map.set(CASINO_OPERATOR_KEY, lease);
+    if (keys.includes(CASINO_OPERATOR_KEY)) map.set(CASINO_OPERATOR_KEY, primary);
     for (const key of keys) {
       if (key !== CASINO_OPERATOR_KEY) map.set(key, shadow);
     }
@@ -1411,6 +1460,41 @@ export function clearCasinoOperatorRecords(
   boundDoc!.transact(() => {
     for (const key of mine) map.delete(key);
   });
+}
+
+/** Another install's claim on the room (casinoOperator.ts, TWO INSTALLS): a
+ *  session held off with slot work of its own asks a holder that has none to
+ *  step aside. Peer-writable like every record here, and never a lease: no
+ *  tenure, and nothing holds off on it. */
+export const CASINO_OPERATOR_CLAIM_KEY = 'casino-operator-claim';
+
+export interface CasinoOperatorClaim {
+  playerId: string;
+  sessionId: string;
+  expiresAt: number;
+}
+
+function isCasinoOperatorClaim(value: unknown): value is CasinoOperatorClaim {
+  return isSlotOperatorLease(value) && value.tenure === undefined;
+}
+
+export function readCasinoOperatorClaim(): CasinoOperatorClaim | null {
+  const value = ensureMap().get(CASINO_OPERATOR_CLAIM_KEY);
+  if (!isCasinoOperatorClaim(value)) return null;
+  const { playerId, sessionId, expiresAt } = value;
+  return { playerId, sessionId, expiresAt };
+}
+
+export function writeCasinoOperatorClaim(claim: CasinoOperatorClaim): void {
+  if (!isCasinoOperatorClaim(claim)) return;
+  const { playerId, sessionId, expiresAt } = claim;
+  ensureMap().set(CASINO_OPERATOR_CLAIM_KEY, { playerId, sessionId, expiresAt });
+}
+
+/** Delete the claim if it names `sessionId`; another session's is left alone. */
+export function clearCasinoOperatorClaim(sessionId: string): void {
+  if (readCasinoOperatorClaim()?.sessionId !== sessionId) return;
+  ensureMap().delete(CASINO_OPERATOR_CLAIM_KEY);
 }
 
 /** The fields that change on every operator write — two states that agree on
