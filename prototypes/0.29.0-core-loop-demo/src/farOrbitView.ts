@@ -130,8 +130,31 @@ function flightPlan(
   etaAt: number,
 ): TransferPlan | null {
   if (!from || !to || !(etaAt > departedAt)) return null;
-  const plan = planTransfer(from, to, departedAt - 1);
-  return plan ? { ...plan, departAt: departedAt, arriveAt: etaAt } : null;
+  // A flight's orbits are fixed once it is seen: planTransfer reads the ends
+  // through today's trims, and a station-keeping burn after launch must not
+  // move a transfer already flown. Keyed by the flight (ends and times).
+  const key = JSON.stringify([from.id, to.id, departedAt, etaAt]);
+  const known = frozenPlans.get(key);
+  if (known) {
+    known.seenAt = gatherNow;
+    return known.plan;
+  }
+  const planned = planTransfer(from, to, departedAt - 1);
+  const plan = planned ? { ...planned, departAt: departedAt, arriveAt: etaAt } : null;
+  if (plan) frozenPlans.set(key, { plan, seenAt: gatherNow });
+  return plan;
+}
+
+/** Flight plans already drawn, by flight; one not seen for a while is dropped. */
+const frozenPlans = new Map<string, { plan: TransferPlan; seenAt: number }>();
+const FROZEN_PLAN_TTL_MS = 60_000;
+const MAX_FROZEN_PLANS = 256;
+let gatherNow = 0;
+
+function pruneFrozenPlans(now: number): void {
+  for (const [key, entry] of frozenPlans) {
+    if (now - entry.seenAt > FROZEN_PLAN_TTL_MS || frozenPlans.size > MAX_FROZEN_PLANS) frozenPlans.delete(key);
+  }
 }
 
 /** Modules to draw for a station: the rooms of its atlas component that
@@ -164,6 +187,8 @@ function modulesOf(station: StationRecord, components: Set<string>[], atlas: Rec
 }
 
 function gather(now: number): Source {
+  gatherNow = now;
+  pruneFrozenPlans(now);
   const roomId = currentRoomId();
   const atlas = readAtlas();
   const all = listStations(atlas);
