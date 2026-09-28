@@ -129,7 +129,7 @@ import {
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
-  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumber, stationGates,
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumberHere, stationGates,
 } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -1931,7 +1931,7 @@ export class DoorDockingPortSystem {
         // ⚓🚦 A new port takes the lowest gate number free in the station;
         // with every number taken it is not fitted (and no part is spent).
         const gate = step.kind === "fit-port"
-          ? freeGateNumber(readAtlas(), this.roomNow(), readDockGates())
+          ? freeGateNumberHere(this.roomNow(), readDockGates())
           : null;
         if (step.kind === "fit-port" && gate === null) {
           this.showAssemblyNotice(doorId, `Every gate number (1–${MAX_GATE}) is taken in this station — remove a port first.`);
@@ -2075,7 +2075,7 @@ export class DoorDockingPortSystem {
         const own = readDockGates();
         // A port fitted before gates existed gets the lowest free number first.
         if (policy.gate === undefined) {
-          const first = freeGateNumber(readAtlas(), roomId, own);
+          const first = freeGateNumberHere(roomId, own);
           if (first !== null) writeDoorPolicy(doorId, { ...policy, gate: first });
           return;
         }

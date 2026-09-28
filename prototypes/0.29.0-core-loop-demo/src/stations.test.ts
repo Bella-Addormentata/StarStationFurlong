@@ -15,6 +15,7 @@ import {
   listStations,
   planetForRoom,
   roomAdriftPlace,
+  adriftPlace,
   readStationRecords,
   registerStation,
   removeStation,
@@ -309,6 +310,8 @@ describe('stationForRoom / planetForRoom', () => {
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
       expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
       expect(roomAdriftPlace('ship')).toEqual({ planetId: 'planet-aris', orbitSlot: 3 });
+      // An unknown planet reads as the default one, as everywhere else.
+      expect(adriftPlace('adrift:planet-nowhere:3')).toEqual({ planetId: DEFAULT_PLANET_ID, orbitSlot: 3 });
     } finally {
       setRoomStationResolver(null);
       setStationRoomSource(() => '');
@@ -335,6 +338,9 @@ describe('stationForRoom / planetForRoom', () => {
     // ports (tombstones) count for nothing.
     expect(dockedStationFor('ship', [gangway('pod'), dock('a1')], atlas)).toBeNull();
     expect(dockedStationFor('ship', [{ paired: false as const, retiredAddress: seed('a1') }], atlas)).toBeNull();
+    // A pairing whose address names no room (peer-written junk) is no
+    // structure: the real dock beside it still places the ship.
+    expect(dockedStationFor('ship', [{ paired: true as const, connectedRoomAddress: 'not a room' }, dock('b1')], atlas)).toBe('aris-yard');
     // Installed as the room-station resolver, it gives a docked ship its host's planet.
     try {
       setRoomStationResolver((roomId) => (roomId === 'ship' ? dockedStationFor(roomId, [dock('b1')], atlas) : null));

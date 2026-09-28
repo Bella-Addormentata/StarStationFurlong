@@ -21,6 +21,7 @@ import {
 import {
   bindStationAtlasDoc,
   freeGateNumber,
+  freeGateNumberHere,
   harvestIntoAtlas,
   readAtlas,
   stationGates,
@@ -284,6 +285,20 @@ describe("a far room doc's shared atlas", () => {
     expect(atlas['other-000']).toBeUndefined();
   });
 
+  it("numbers a port fitted here past the gates of a room only the bound doc still holds", () => {
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('here', entry('here', 5, { 'd:hall': { targetRoomId: 'hub', farDoor: 'd:in', transient: false } }));
+    shared.set('hub', entry('hub', 5, { 'd:in': { targetRoomId: 'here', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1 }));
+    bindStationAtlasDoc(doc, { roomId: 'here', isPassagePublic: () => false });
+    // The local atlas has let 'hub' go (evicted past MAX_ENTRIES).
+    const local = readAtlas();
+    delete local.hub;
+    store.set('ssf-station-atlas', JSON.stringify(local));
+    expect(freeGateNumber(readAtlas(), 'here', {})).toBe(1);
+    expect(freeGateNumberHere('here', {})).toBe(2);
+  });
+
   it("follows a newer doc copy's re-paired door to the far station's other rooms", () => {
     // We once saw far-dock's hall lead to a room that has since gone.
     harvestIntoAtlas({ roomId: 'far-dock', name: 'DOCK', doors: [{ doorId: 'd:hall', targetSeed: seed('old-room'), transient: false }] });
@@ -508,6 +523,16 @@ describe('the per-planet summary', () => {
     // Then it lists none at all.
     const none = mergeStation(moved, base({ berths: [], berthsAt: T0 + 9, berthRoomsAt: { 'room-b': T0 + 9 } }))!;
     expect(none.berthDoor).toBeUndefined();
+  });
+
+  it('settles a merged gate list with a cleaned copy of itself', () => {
+    const one = base({ ownerId: 'beta', trim: { planetId: 'planet-sovereign', slot: 3, dRadiusKm: 1, dPhase: 0, at: T0, last: 'raise' } as never });
+    const two = base({ ownerId: 'alpha', berths: [{ roomId: 'room-b', doorId: 'east', gate: 2 }], berthsAt: T0 + 5 });
+    const merged = mergeStation(one, two)!;
+    const copy = cleanStationSummary(merged, T0 + 10)!;
+    expect(JSON.stringify(copy)).toBe(JSON.stringify(merged));
+    expect(mergeStation(copy, merged)).toBeNull();
+    expect(mergeStation(merged, copy)).toBeNull();
   });
 
   it('shares gates without the local occupied flag', () => {

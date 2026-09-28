@@ -16,7 +16,7 @@ import {
 } from './planetSummary';
 import { AU_KM, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
-import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
+import { FUEL_METER_MAX, bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
 import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeTrimBurn } from './stationKeeping';
 import {
   TUG_ACCEL_KMS2,
@@ -785,13 +785,37 @@ describe('tugs: a torch tow', () => {
     expect(isStationMove(cleanMove(pin))).toBe(true);
     expect(compareMoves(pin, lost)).toBeGreaterThan(0);
     expect(compareMoves(won, pin)).toBeGreaterThan(0);
-    // Remembered in either order, the winner stands.
+    // Remembered in either order, the winner stands; the pin stays as
+    // recent history, so what it could decide is still known.
+    const station = { id: lost.stationId, welcomeRoomId: lost.welcomeRoomId };
     rememberMove(pin, lost.arriveAt + 10);
     rememberMove(won, lost.arriveAt + 10);
-    expect(readRememberedMoves()).toEqual([cleanMove(won)]);
+    expect(readRememberedMoves()).toEqual([cleanMove(won), cleanMove(pin)]);
+    expect(rememberedMoveFor(station)).toEqual(cleanMove(won));
     store.clear();
     rememberMove(won, lost.arriveAt + 10);
+    expect(rememberMove(pin, lost.arriveAt + 10)).toBe(true);
     expect(rememberMove(pin, lost.arriveAt + 10)).toBe(false);
+    expect(rememberedMoveFor(station)).toEqual(cleanMove(won));
+  });
+
+  it('keeps a winner learned elsewhere after the station\'s next move, so its loser stays unpaid', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const t0 = Date.now() - 2 * 86_400_000;
+    const at = (depart: number, booked: number, slot: number, fuel: number): StationMove => ({
+      ...moveTo(), departAt: depart, arriveAt: depart + 3_600_000, bookedAt: booked, toSlot: slot, fuel, fuelDrawn: fuel,
+    });
+    const lost = at(t0, t0 - 1000, 3, 10);
+    writeStationMove(lost);
+    // Another room's concurrent move wins; this room's goes unpaid.
+    const won = at(t0 + 1, t0 - 500, 4, 7);
+    rememberMove(won);
+    expect(readMoveFuelDrawn()).toBe(0);
+    // The station's next move, booked after the winner arrived, is now its
+    // latest: the loser stays beaten.
+    rememberMove(at(t0 + 7_200_000, won.arriveAt + 1, 5, 2));
+    expect(readMoveFuelDrawn()).toBe(0);
   });
 
   it('lets a cancel lose with its tow, and refuses a pin of an implausible move', () => {
@@ -1157,6 +1181,19 @@ describe('the move log stays bounded', () => {
     store.clear();
     bindStationMoveDoc(peer);
     expect(readStationMove()).toEqual(mine);
+  });
+
+  it('keeps the meter in range when several writers\' settled totals add past it', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    map.set('moveSettled:1:1', { n: 1, drawn: FUEL_METER_MAX, floor: 0, recent: [] });
+    map.set('moveSettled:2:1', { n: 1, drawn: FUEL_METER_MAX, floor: 0, recent: [] });
+    expect(readMoveFuelDrawn()).toBe(FUEL_METER_MAX);
+    // A move planned on top of it is still well-formed.
+    const plan = planStationMove(ctx({ drawn: readMoveFuelDrawn() }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(isStationMove(plan.move)).toBe(true);
   });
 
   it('takes back a recently pruned move\'s fuel when a rival learned late beats it', () => {
