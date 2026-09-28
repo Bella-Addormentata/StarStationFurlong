@@ -139,16 +139,74 @@ describe('the departures publisher', () => {
     h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
     await h.tick();
     expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1']);
-    // room-1 answers the first: the others get it, and room-1 the second.
+    // room-1 answers the first: it takes the second, and the first, stale
+    // now, goes no further.
     await h.answer(0, 'written');
-    expect(h.calls.map((c) => c.address).sort()).toEqual(['pass:room-0', 'pass:room-1', 'pass:room-1', 'pass:room-2']);
-    const second = h.calls.findIndex((c, i) => i > 0 && c.address === 'pass:room-1');
-    for (let i = 1; i < h.calls.length; i++) if (i !== second) await h.answer(i, 'written');
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-1']);
     // Only once room-1 has answered the second do the others get it.
-    expect(h.calls).toHaveLength(4);
-    await h.answer(second, 'written');
-    expect(h.calls.slice(4).map((c) => c.address).sort()).toEqual(['pass:room-0', 'pass:room-2']);
-    expect(h.calls[4].pub).toBe(h.calls[second].pub);
+    await h.answer(1, 'written');
+    expect(h.calls.slice(2).map((c) => c.address).sort()).toEqual(['pass:room-0', 'pass:room-2']);
+    expect(h.calls[2].pub).toBe(h.calls[1].pub);
+  });
+
+  it('a snapshot a newer one replaced while the stop concerned was busy never goes on to the other stops', async () => {
+    const h = harness();
+    const route = running();
+    const s = startCheckpoint(route, { at: T0, pilot: 'person', fuel: 100 })!;
+    const holdAt = (ms: number) => h.setCkpts([s, holdCheckpoint(route, 1, { at: s.arriveAt + ms })]);
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // A goes to room-1
+    holdAt(1000);
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // B waits for room-1…
+    holdAt(2000);
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // …and C takes its place
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1']);
+    await h.answer(0, 'written');
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-1']);
+    const c = h.calls[1].pub;
+    expect(c.checkpoints.find((e) => e.kind === 'hold')?.at).toBe(s.arriveAt + 2000);
+    await h.answer(1, 'written');
+    // Only C goes on: B, answered by C's write, starts no session of its own.
+    expect(h.calls.slice(2).map((x) => x.address).sort()).toEqual(['pass:room-0', 'pass:room-2']);
+    expect(h.calls.slice(2).every((x) => x.pub === c)).toBe(true);
+  });
+
+  it('a newer snapshot that went first to another stop overtakes an older one still at its own: the older goes nowhere the newer goes', async () => {
+    const h = harness();
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // B goes to room-1 and stays in flight
+    const route = running();
+    const s = startCheckpoint(route, { at: T0, pilot: 'person', fuel: 100 })!;
+    h.setCkpts([s, holdCheckpoint(route, 2, { at: s.arriveAt + 1000 })]);
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 2 });
+    await h.tick(); // C, about stop 2, goes straight to room-2
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-2']);
+    const b = h.calls[0].pub;
+    const c = h.calls[1].pub;
+    await h.answer(0, 'written'); // room-1 answers B: C goes everywhere B would
+    expect(h.calls).toHaveLength(2);
+    await h.answer(1, 'written');
+    expect(h.calls.slice(2).map((x) => x.address).sort()).toEqual(['pass:room-0', 'pass:room-1']);
+    expect(h.calls.slice(2).every((x) => x.pub === c)).toBe(true);
+    expect(h.calls.filter((x) => x.pub === b)).toHaveLength(1);
+  });
+
+  it('a newer snapshot for other stops (a new route after the finish) leaves the older one its own stops', async () => {
+    const h = harness();
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // B goes to room-1 and stays in flight
+    const next: ShipRoute = { ...running(), stops: [stop(3, 3), stop(4, 4)] };
+    h.setRoute(next);
+    h.setCkpts([startCheckpoint(next, { at: T0 + 1000, pilot: 'person', fuel: 100 })!]);
+    h.p.routeWritten({ kind: 'start', legSeq: 0 });
+    await h.tick(); // C goes to room-3
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-3']);
+    await h.answer(0, 'written');
+    // room-1's answer sends B on to the stops only it serves.
+    expect(h.calls.slice(2).map((c) => c.address).sort()).toEqual(['pass:room-0', 'pass:room-2']);
+    expect(h.calls.slice(2).every((c) => c.pub === h.calls[0].pub)).toBe(true);
   });
 
   it('retries an unreachable room twice, 30 s then 60 s later, then gives up', async () => {
@@ -266,6 +324,19 @@ describe('the departures publisher', () => {
     h.p.tanksChanged();
     await settle();
     expect(h.calls).toHaveLength(6);
+  });
+
+  it('⛽ a page that opens on a running ferry takes the tanks it finds as its first reading', async () => {
+    // The first room's furniture was bound before the publisher existed, so
+    // no furniture change reached it: the first one it hears is a real fit.
+    let cap = 100;
+    const h = harness({ capacity: () => cap, editsShip: () => true });
+    cap = 200;
+    h.p.tanksChanged();
+    await h.tick();
+    await h.tick();
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-0']);
+    expect(h.calls[0].pub.capacity).toBe(200);
   });
 
   it('the finish after STOP publishes the route running no more, with no checkpoints', async () => {

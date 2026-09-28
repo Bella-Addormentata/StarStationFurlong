@@ -245,6 +245,8 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
   let pending: { ship: string; legSeq: number | null; endedRun?: number } | null = null;
   /** ⛽ Per ferry, the capacity this game last saw (or published). */
   const tanksSeen = new Map<string, number>();
+  /** Per ferry, its newest snapshot and every room it goes to. */
+  const newest = new Map<string, { pub: DeparturesPublish; rooms: ReadonlySet<string> }>();
 
   const stateOf = (room: string, ship: string): RoomState => {
     const key = `${room}\n${ship}`;
@@ -340,8 +342,17 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     const order = publishRoomOrder(route, p.legSeq);
     if (order.length === 0) return;
     const [first, ...rest] = order;
-    void offer(first, pub).finally(() => {
-      for (const room of rest) void offer(room, pub);
+    newest.set(ship, { pub, rooms: new Set(order) });
+    void offer(first, pub).then(() => {
+      // A snapshot a newer one replaced at the first room, or overtook while
+      // it was sent, goes on to none of the newer one's rooms: that one goes
+      // there in its place (a finish still reaches the stops only its route
+      // served).
+      const n = newest.get(ship);
+      for (const room of rest) {
+        if (n && n.pub !== pub && n.rooms.has(room)) continue;
+        void offer(room, pub);
+      }
     });
   };
 
@@ -373,6 +384,13 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     if (!isRouteRunning(d.route()) || !(d.editsShip?.() ?? true)) return;
     want(ship, null);
   };
+  // The room this page opened on was bound before this publisher existed,
+  // and no furniture change will say so: its tanks now are its first
+  // reading, so the first fit or removal after is a change.
+  {
+    const ship = d.shipRoomId();
+    if (ship) tanksSeen.set(ship, d.capacity());
+  }
 
   return {
     routeWritten: (n) => {
