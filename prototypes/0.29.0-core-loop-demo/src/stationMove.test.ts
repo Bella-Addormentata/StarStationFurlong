@@ -778,13 +778,37 @@ describe('tugs: a torch tow', () => {
     expect(isStationMove(cleanMove(pin))).toBe(true);
     expect(compareMoves(pin, lost)).toBeGreaterThan(0);
     expect(compareMoves(won, pin)).toBeGreaterThan(0);
-    // Remembered in either order, the winner stands.
+    // Remembered in either order, the winner stands; the pin stays as
+    // recent history, so what it could decide is still known.
+    const station = { id: lost.stationId, welcomeRoomId: lost.welcomeRoomId };
     rememberMove(pin, lost.arriveAt + 10);
     rememberMove(won, lost.arriveAt + 10);
-    expect(readRememberedMoves()).toEqual([cleanMove(won)]);
+    expect(readRememberedMoves()).toEqual([cleanMove(won), cleanMove(pin)]);
+    expect(rememberedMoveFor(station)).toEqual(cleanMove(won));
     store.clear();
     rememberMove(won, lost.arriveAt + 10);
+    expect(rememberMove(pin, lost.arriveAt + 10)).toBe(true);
     expect(rememberMove(pin, lost.arriveAt + 10)).toBe(false);
+    expect(rememberedMoveFor(station)).toEqual(cleanMove(won));
+  });
+
+  it('keeps a winner learned elsewhere after the station\'s next move, so its loser stays unpaid', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const t0 = Date.now() - 2 * 86_400_000;
+    const at = (depart: number, booked: number, slot: number, fuel: number): StationMove => ({
+      ...moveTo(), departAt: depart, arriveAt: depart + 3_600_000, bookedAt: booked, toSlot: slot, fuel, fuelDrawn: fuel,
+    });
+    const lost = at(t0, t0 - 1000, 3, 10);
+    writeStationMove(lost);
+    // Another room's concurrent move wins; this room's goes unpaid.
+    const won = at(t0 + 1, t0 - 500, 4, 7);
+    rememberMove(won);
+    expect(readMoveFuelDrawn()).toBe(0);
+    // The station's next move, booked after the winner arrived, is now its
+    // latest: the loser stays beaten.
+    rememberMove(at(t0 + 7_200_000, won.arriveAt + 1, 5, 2));
+    expect(readMoveFuelDrawn()).toBe(0);
   });
 
   it('lets a cancel lose with its tow, and refuses a pin of an implausible move', () => {

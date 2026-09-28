@@ -15,6 +15,7 @@ import {
   listStations,
   planetForRoom,
   roomAdriftPlace,
+  adriftPlace,
   readStationRecords,
   registerStation,
   removeStation,
@@ -309,6 +310,8 @@ describe('stationForRoom / planetForRoom', () => {
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
       expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
       expect(roomAdriftPlace('ship')).toEqual({ planetId: 'planet-aris', orbitSlot: 3 });
+      // An unknown planet reads as the default one, as everywhere else.
+      expect(adriftPlace('adrift:planet-nowhere:3')).toEqual({ planetId: DEFAULT_PLANET_ID, orbitSlot: 3 });
     } finally {
       setRoomStationResolver(null);
       setStationRoomSource(() => '');

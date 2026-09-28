@@ -787,7 +787,9 @@ export function adriftPlace(id: string): { planetId: string; orbitSlot: number }
   const planetId = rest.slice(0, cut);
   const orbitSlot = Number(rest.slice(cut + 1));
   if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) return null;
-  return { planetId, orbitSlot };
+  // The planet as every other reader names it (an unknown one reads as the
+  // default planet, as in listStations), so destinations around it match.
+  return { planetId: planetById(planetId).id, orbitSlot };
 }
 
 /** Where the room resolver puts a room when that is open orbit (a ship
