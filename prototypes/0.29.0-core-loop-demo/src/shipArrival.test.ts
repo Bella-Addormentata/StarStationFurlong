@@ -454,6 +454,15 @@ describe('a round trip', () => {
     expect(docking.docks).toEqual([]);
   });
 
+  it('waits in open orbit where an unlisted destination was at cast-off, when the flight kept it', () => {
+    const now = Date.now();
+    const then = 'adrift:planet-aris:4';
+    writeFlightRecord({ status: 'redocking', locationId: 'gone-soon', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    expect(completeArrival(fakeDocking(['north']), { force: true }))
+      .toEqual({ kind: 'none', stationName: 'gone-soon', reason: 'unlisted-station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: then });
+  });
+
   it('waits out the grace for a commander who can dock, then settles berthless', () => {
     castOffForDeparture('furlong-station', fakeDocking(['north']));
     const eta = 50_000;
@@ -676,6 +685,35 @@ describe('arrival gates', () => {
       await new Promise((r) => setTimeout(r, 0));
       setStationRoomSource(() => '');
       expect(base.tried).toEqual(['east']);
+      expect(heard).toBeNull();
+    });
+
+    it('reports a dock another commander made while the last gate refused', async () => {
+      arriveAtGates([gate(1, 'east')]);
+      const base = fakeDocking(['north']);
+      const docking = {
+        ...base,
+        dock: async (doorId: string) => {
+          writeDoorTombstone(doorId, SEED_GATE_ROOM, { farDoor: 'east', undockedAt: 3000 });
+          base.dock(doorId);
+          return false;
+        },
+      };
+      const s = settled();
+      completeArrival(docking, { onSettled: s.onSettled });
+      expect(await s.promise).toEqual({ kind: 'docked', stationName: 'High Orbit', gate: 1 });
+    });
+
+    it('says nothing when the player left the ship\'s room during the last gate\'s answer', async () => {
+      let room = 'ship-room';
+      setStationRoomSource(() => room);
+      arriveAtGates([gate(1, 'east')]);
+      const base = gatedDocking(['east']);
+      const docking = { ...base, dock: async (doorId: string) => { room = 'another-room'; return base.dock(doorId); } };
+      let heard: ArrivalOutcome | null = null;
+      completeArrival(docking, { onSettled: (o) => { heard = o; } });
+      await new Promise((r) => setTimeout(r, 0));
+      setStationRoomSource(() => '');
       expect(heard).toBeNull();
     });
 
