@@ -52,7 +52,9 @@ import {
   readRememberedMoves,
   readStationMove,
   rememberedMoveFor,
+  MOVE_SCAN_MAX,
   rememberMove,
+  subscribeStationMove,
   writeStationMove,
 } from './stationMove';
 import type { MoveContext, StationMove, TowContext } from './stationMove';
@@ -185,6 +187,11 @@ describe('the station list follows a move', () => {
     const listed = listStations({}, [], mid);
     expect(freeSlotAround(SOV, listed, undefined, mid)).toBe(0);
     expect(freeSlotAround(SOV, listStations({}, [], move.departAt - 1), undefined, move.departAt - 1)).toBe(1);
+    // Its destination slot is not offered to the next move there, booked
+    // before it arrives or on its way; once it is there, it simply holds it.
+    expect(freeSlotAround(ARIS, listStations({}, [], move.departAt - 1), undefined, move.departAt - 1)).not.toBe(move.toSlot);
+    expect(freeSlotAround(ARIS, listed, undefined, mid)).not.toBe(move.toSlot);
+    expect(freeSlotAround(ARIS, listStations({}, [], move.arriveAt + 1), undefined, move.arriveAt + 1)).not.toBe(move.toSlot);
   });
 
   it('refuses ship hops to or from a station in transit', () => {
@@ -1127,6 +1134,27 @@ describe('the move log stays bounded', () => {
     expect(readStationMove()?.fuel).toBe(10);
   });
 
+  it('keeps a write visible past a flood of well-formed entries a peer wrote', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    // Valid-looking moves of other stations, booked long ago.
+    doc.transact(() => {
+      for (let i = 0; i < 400; i++) {
+        map.set(`move:666:${i}:s${i}`, { ...hop(0, 0, 0), stationId: `s${i}`, welcomeRoomId: `s${i}-room`, bookedAt: NOW - 10_000 - i });
+      }
+    });
+    const mine = { ...hop(1, 9, 9), bookedAt: NOW + 5 };
+    writeStationMove(mine);
+    expect(map.size).toBeLessThanOrEqual(MOVE_SCAN_MAX);
+    expect(readStationMove()).toEqual(mine);
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    store.clear();
+    bindStationMoveDoc(peer);
+    expect(readStationMove()).toEqual(mine);
+  });
+
   it('takes back a recently pruned move\'s fuel when a rival learned late beats it', () => {
     const doc = new Y.Doc();
     bindStationMoveDoc(doc);
@@ -1191,6 +1219,33 @@ describe('the move log stays bounded', () => {
       expect(readMoveFuelDrawn()).toBe(10 + 5 + 7 + 1 + 2 + 3);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it('tells the fuel meter when a move learned elsewhere beats this room\'s', async () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const m = hop(0, 10, 10);
+    writeStationMove(m);
+    await Promise.resolve();
+    expect(readMoveFuelDrawn()).toBe(10);
+    let heard = 0;
+    const off = subscribeStationMove(() => { heard++; });
+    try {
+      // A concurrent move of the same station that wins, learned from a
+      // planet summary: this room's move goes unpaid, and the meter hears.
+      const rival: StationMove = { ...m, departAt: m.departAt + 1, arriveAt: m.arriveAt + 1, toSlot: m.toSlot + 1 };
+      expect(rememberMove(rival)).toBe(true);
+      expect(heard).toBe(0);
+      await Promise.resolve();
+      expect(heard).toBe(1);
+      expect(readMoveFuelDrawn()).toBe(0);
+      // Nothing new: nothing heard.
+      expect(rememberMove(rival)).toBe(false);
+      await Promise.resolve();
+      expect(heard).toBe(1);
+    } finally {
+      off();
     }
   });
 

@@ -46,10 +46,9 @@ import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { readResolvedFlight } from './shipRoute';
-import { adriftPlace } from './stationDirectory';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
-import { currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw

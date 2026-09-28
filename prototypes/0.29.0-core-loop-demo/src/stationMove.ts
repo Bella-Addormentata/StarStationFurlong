@@ -249,12 +249,20 @@ export type MovePlanResult =
   | { ok: false; refusal: MoveRefusal; quote: MoveQuote | null };
 
 /** The lowest orbit slot around `planetId` no listed station holds at
- *  `nowMs`: a station between planets (stationInTransit) holds none, as in
- *  stations.listStations. */
+ *  `nowMs` or is on its way to: a station between planets (stationInTransit)
+ *  holds none where it left, as in stations.listStations, but keeps the slot
+ *  its move is bound for. */
 export function freeSlotAround(planetId: string, stations: StationRecord[], exceptId?: string, nowMs: number = Date.now()): number | null {
   const id = planetById(planetId).id;
-  const used = new Set(stations.filter((s) => s.id !== exceptId && planetById(s.planetId).id === id && !stationInTransit(s, nowMs))
+  const others = stations.filter((s) => s.id !== exceptId);
+  const used = new Set(others.filter((s) => planetById(s.planetId).id === id && !stationInTransit(s, nowMs))
     .map((s) => s.orbitSlot));
+  // A station on its way here (or booked to come) has its slot paid for:
+  // it is not offered again, so the move that follows never clashes there.
+  for (const s of others) {
+    const m = s.move;
+    if (m && !isPinMove(m) && m.arriveAt > nowMs && planetById(m.toPlanetId).id === id) used.add(m.toSlot);
+  }
   for (let slot = 0; slot < MAX_ORBIT_SLOTS; slot++) if (!used.has(slot)) return slot;
   return null;
 }
@@ -771,7 +779,21 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
     }
   }
   try { localStorage.setItem(KEY, JSON.stringify(list)); } catch { return false; }
+  // A new winner learned here (a planet summary, another room) can change
+  // this room's standing move and so its 'stationMove' meter: tell the
+  // listeners, the fuel meter among them, once the caller is done.
+  notifySoon();
   return true;
+}
+
+let notifyQueued = false;
+
+/** notify(), after the current task: coalesced, and never inside the
+ *  caller's own write (a planet summary publish remembers moves). */
+function notifySoon(): void {
+  if (notifyQueued) return;
+  notifyQueued = true;
+  queueMicrotask(() => { notifyQueued = false; notify(); });
 }
 
 /** The latest move this install knows for a station, matched by its welcome
@@ -1196,17 +1218,38 @@ export function subscribeStationMove(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
+/** At most this many move entries and settled records stay after a write's
+ *  sweep: an honest log (pruned to about a day) is far below either, and
+ *  together they leave the entry the write adds inside MOVE_SCAN_MAX. */
+export const MOVE_ENTRIES_KEEP = MOVE_SCAN_MAX / 2;
+export const MOVE_SETTLED_KEEP = MOVE_SCAN_MAX / 4;
+
 /** Clear every key in the move log that is not a well-formed entry or
- *  settled record, however many a peer wrote: a write walks the whole map
- *  once (writes are rare: a helm press, an arrival pin, a cancel), so the
- *  entry it adds sits within the readers' bounded scan (MOVE_SCAN_MAX) at
- *  once, never behind a flood only later writes would clear. */
+ *  settled record, however many a peer wrote, and past the caps above the
+ *  surplus by one order every replica shares: the entries booked longest
+ *  ago (then by key), and the settled records that drew least (then by
+ *  key), so a flood never lowers what the rest charge. A write walks the
+ *  whole map once (writes are rare: a helm press, an arrival pin, a
+ *  cancel; reads stay bounded), so the entry it adds sits within the
+ *  readers' scan at once, never behind a flood. */
 function sweepJunk(): void {
   const junk: string[] = [];
+  const entries: Array<{ key: string; move: StationMove }> = [];
+  const settled: Array<{ key: string; drawn: number }> = [];
   for (const [k, v] of moveMap!.entries()) {
-    const ok = k.startsWith(SETTLED_PREFIX) ? isSettledMoves(v) : k.startsWith(ENTRY_PREFIX) && validMove(v) !== null;
-    if (!ok) junk.push(k);
+    if (k.startsWith(SETTLED_PREFIX)) {
+      if (isSettledMoves(v)) settled.push({ key: k, drawn: v.drawn });
+      else junk.push(k);
+      continue;
+    }
+    const m = k.startsWith(ENTRY_PREFIX) ? validMove(v) : null;
+    if (m) entries.push({ key: k, move: m });
+    else junk.push(k);
   }
+  const byKey = (x: { key: string }, y: { key: string }) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0);
+  entries.sort((x, y) => bookedOf(y.move) - bookedOf(x.move) || byKey(x, y));
+  settled.sort((x, y) => y.drawn - x.drawn || byKey(x, y));
+  junk.push(...entries.slice(MOVE_ENTRIES_KEEP).map((e) => e.key), ...settled.slice(MOVE_SETTLED_KEEP).map((e) => e.key));
   for (const k of junk) moveMap!.delete(k);
 }
 

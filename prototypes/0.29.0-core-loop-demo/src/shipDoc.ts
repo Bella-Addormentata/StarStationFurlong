@@ -393,11 +393,17 @@ export interface FuelDrawMeter {
 const drawMeters = new Map<string, { meter: FuelDrawMeter; unsubscribe: () => void }>();
 
 /** Install one consumer's draw meter under its name (null removes it): a
- *  letter, then up to 63 letters, digits, `-` or `_`. A meter change moves
- *  the gauge, and so does installing, replacing or removing a meter, so ship
- *  subscribers hear about each. */
+ *  letter, then up to 63 letters, digits, `-` or `_`. At most MAX_METERS are
+ *  installed at once (replacing one is always allowed): the fuel record keeps
+ *  no more readings, and a meter it could not keep would be charged its whole
+ *  reading again after every level write. A meter change moves the gauge, and
+ *  so does installing, replacing or removing a meter, so ship subscribers
+ *  hear about each. */
 export function setFuelDrawMeter(name: string, meter: FuelDrawMeter | null): void {
   if (!METER_NAME.test(name)) throw new Error(`[ship] not a fuel draw meter name: ${JSON.stringify(name)}`);
+  if (meter && !drawMeters.has(name) && drawMeters.size >= MAX_METERS) {
+    throw new Error(`[ship] no room for fuel draw meter ${JSON.stringify(name)}: ${MAX_METERS} are installed`);
+  }
   drawMeters.get(name)?.unsubscribe();
   drawMeters.delete(name);
   if (meter) drawMeters.set(name, { meter, unsubscribe: meter.subscribe(() => notify()) });

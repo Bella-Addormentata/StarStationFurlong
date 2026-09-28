@@ -446,8 +446,12 @@ export function completeArrival(
   };
   // A destination that left the directory mid-flight is NOT home: arrive
   // there undocked rather than docking at findDestination's fallback.
+  // It waits in open orbit where the station was at cast-off, when the
+  // flight kept that (a station pruned from this install's list after it
+  // moved): a place every planet reader resolves, unlike a lost station id.
   if (!isKnownStation(rec.locationId)) {
-    return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' });
+    const at = rec.destinationAt && adriftPlace(rec.destinationAt) ? rec.destinationAt : rec.locationId;
+    return settle({ kind: 'none', stationName: rec.locationId, reason: 'unlisted-station' }, at);
   }
   const station = findDestination(rec.locationId);
   // 🚚 A station that left its planet while the ship was on the way (still
@@ -559,11 +563,23 @@ async function dockThroughBerths(
     } catch (err) {
       console.warn('[ship] arrival DOCK threw:', err);
     }
+    // The await may have outlived the ship's room: the answer belongs to a
+    // room no longer shown, so say nothing.
+    if (shipRoomId !== undefined && currentRoomId() !== shipRoomId) return;
     if (answer.ok) {
       onSettled?.({ kind: 'docked', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) });
       return;
     }
     reasons.push(answer.reason);
+  }
+  // Every berth refused: unless another commander docked the ship while
+  // the last one was answering.
+  const last = candidates[candidates.length - 1];
+  const again = planArrivalDock({ station, remembered, ports: docking.ports(), ...(last ? { berth: last } : {}), shipRoomId });
+  if (again.kind === 'none' && again.reason === 'already-docked') {
+    const gate = dockedGate(docking.ports(), candidates);
+    onSettled?.({ kind: 'docked', stationName: station.name, ...(gate !== undefined ? { gate } : {}) });
+    return;
   }
   // 🚏 A5: say why, when every berth said why (the helm's note no longer
   // shows a refused berth as green, nor one reason for all).
