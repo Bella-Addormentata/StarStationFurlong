@@ -23,6 +23,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 import type { FuelRecord } from './shipDoc';
+import { roomIdFromSeed } from './stationAtlas';
 import { DEFAULT_PLANET_ID } from './stations';
 import {
   BURN_MS,
@@ -131,17 +132,19 @@ function sync(a: Y.Doc, b: Y.Doc): void {
 }
 
 describe('which face the helm shows', () => {
-  const gangway: DoorRecord = { paired: true, connectedRoomAddress: 'seed-a' };
+  /** A pass in the real format the atlas reads: base64(JSON{roomId}). */
+  const seedFor = (roomId: string) => btoa(JSON.stringify({ roomId }));
+  const gangway: DoorRecord = { paired: true, connectedRoomAddress: seedFor('room-a') };
   const dock: DoorRecord = {
     paired: true,
-    connectedRoomAddress: 'seed-b',
+    connectedRoomAddress: seedFor('room-b'),
     segments: [
       { kind: 'dock' } as never,
       { kind: 'dock' } as never,
     ],
   };
-  const guestBerth: DoorRecord = { paired: true, connectedRoomAddress: 'seed-c', transient: true };
-  const retired: DoorRecord = { paired: false, retiredAddress: 'seed-d' };
+  const guestBerth: DoorRecord = { paired: true, connectedRoomAddress: seedFor('room-c'), transient: true };
+  const retired: DoorRecord = { paired: false, retiredAddress: seedFor('room-d') };
 
   it('a gangway bolts the module into a station', () => {
     expect(isBoltedIntoStation([gangway])).toBe(true);
@@ -159,6 +162,25 @@ describe('which face the helm shows', () => {
     expect(isBoltedIntoStation([unaddressed])).toBe(false);
     expect(isBoltedIntoStation([unaddressed, dock])).toBe(false);
     expect(isBoltedIntoStation([unaddressed, gangway])).toBe(true);
+  });
+
+  it('a pairing whose address the atlas cannot read joins nothing either', () => {
+    // Copilot's review of #173: a peer could write junk that the atlas
+    // decodes to no room, and the lone module still opened the station helm.
+    const junk = ['not-a-seed', 'ssf://join#room=', btoa(JSON.stringify({ roomId: 7 })), btoa('{}'), '#room=%'];
+    // The last one makes the parser throw, as it does for the atlas.
+    expect(() => roomIdFromSeed('#room=%')).toThrow();
+    for (const address of junk) {
+      const door: DoorRecord = { paired: true, connectedRoomAddress: address };
+      expect(isBoltedIntoStation([door])).toBe(false);
+      expect(isBoltedIntoStation([door, dock])).toBe(false);
+      expect(isBoltedIntoStation([door, gangway])).toBe(true);
+    }
+    // Every form the atlas reads a room from still bolts it in.
+    for (const address of [seedFor('room-a'), `https://ssf.example/join?seed=${seedFor('room-a')}`, 'ssf://join#room=room-a']) {
+      expect(roomIdFromSeed(address)).toBe('room-a');
+      expect(isBoltedIntoStation([{ paired: true, connectedRoomAddress: address }])).toBe(true);
+    }
   });
 });
 
@@ -914,7 +936,7 @@ describe('level writes settle the log', () => {
       trim: t,
       fuelDrawn: 3 * TRIM_FUEL,
       burns: burns.map((b) => keyOf(doc, b)),
-      fired: burns.map(firedOf),
+      fired: [firedOf(burns[2])],
     });
     expect(readOrbitTrim()).toEqual(t);
     expect(readFuelLevel()).toBe(gauge);
@@ -1080,6 +1102,68 @@ describe('level writes settle the log', () => {
     expect(readBurnFiring(now, OTHER)).toEqual(firing[1]);
   });
 
+  it('a level write keeps the last burn on each orbit, however many fired on another', () => {
+    // Copilot's review of #173: the settlement kept the last 16 burns on any
+    // orbit, so 16 burns on slot 1 pushed slot 0's still-firing one out.
+    const OTHER = { ...STATION, orbitSlot: 1 };
+    const a = new Y.Doc();
+    const x = new Y.Doc();
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    const mine = press('raise', T0);
+    // Tabs that place the room in slot 1 burn there 20 times, and write one
+    // burn on a planet this build doesn't know.
+    Y.applyUpdate(x, Y.encodeStateAsUpdate(a));
+    bindRoom(x);
+    const theirs = Array.from({ length: 20 }, (_, i) => burnAt(T0 + 1 + i, 'ahead', { slot: 1 }));
+    for (const b of theirs) expect(writeTrimBurn(b)).toBe(true);
+    expect(writeTrimBurn(burnAt(T0 + 50, 'back', { planetId: 'planet-nowhere' }))).toBe(true);
+    sync(a, x);
+    // A REFUEL settles them all while slot 0's burn still fires.
+    bindRoom(a);
+    writeFuelLevel(readFuelLevel(), 100);
+    const last = theirs[theirs.length - 1];
+    expect((readFuelSettlement(SK) as KeepingSettlement).fired).toEqual([firedOf(mine), firedOf(last)]);
+    // A burn from slot 1 clears the settled entries.
+    sync(a, x);
+    bindRoom(x);
+    expect(writeTrimBurn(burnAt(T0 + 600, 'back', { slot: 1 }))).toBe(true);
+    sync(a, x);
+    bindRoom(a);
+    expect(log(a).size).toBe(1);
+    const now = T0 + 1_000;
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(a));
+    for (const doc of [a, reload]) {
+      bindRoom(doc);
+      expect(readBurnFiring(now, STATION)).toEqual(firedOf(mine));
+      expect(planTrim(ctx({ trim: readOrbitTrim(), fuel: readFuelLevel(), now, firing: readBurnFiring(now, STATION) }), 'raise'))
+        .toEqual({ ok: false, refusal: 'burning' });
+      expect(readBurnFiring(now, OTHER)).toEqual({ planetId: SOV, slot: 1, dir: 'back', at: T0 + 600 });
+    }
+  });
+
+  it('a level write leaves the stick on the burn it showed, even for two in the same millisecond', () => {
+    const a = new Y.Doc();
+    const x = new Y.Doc();
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    Y.applyUpdate(x, Y.encodeStateAsUpdate(a));
+    expect(writeTrimBurn(burnAt(T0, 'raise'))).toBe(true);
+    bindRoom(x);
+    expect(writeTrimBurn(burnAt(T0, 'ahead'))).toBe(true);
+    sync(a, x);
+    bindRoom(a);
+    const now = T0 + 1_000;
+    const shown = readBurnFiring(now, STATION);
+    expect(shown).not.toBeNull();
+    writeFuelLevel(readFuelLevel(), 100);
+    expect((readFuelSettlement(SK) as KeepingSettlement).fired).toEqual([shown]);
+    press('back', T0 + BURN_MS);
+    expect(log(a).size).toBe(1);
+    expect(readBurnFiring(now, STATION)).toEqual(shown);
+  });
+
   it('ignores a hostile settlement: every burn in the log still counts', () => {
     const doc = new Y.Doc();
     bindRoom(doc);
@@ -1105,7 +1189,8 @@ describe('level writes settle the log', () => {
       { trim: null, fuelDrawn: 0, burns: keys, fired: 'fired' },
       { trim: null, fuelDrawn: 0, burns: keys, fired: [{ planetId: SOV, slot: 0, dir: 'up', at: T0 }] },
       { trim: null, fuelDrawn: 0, burns: keys, fired: [{ planetId: SOV, slot: -1, dir: 'raise', at: T0 }] },
-      { trim: null, fuelDrawn: 0, burns: keys, fired: Array.from({ length: 17 }, () => ({ planetId: SOV, slot: 0, dir: 'raise', at: T0 })) },
+      // Past the 256 a settlement may carry.
+      { trim: null, fuelDrawn: 0, burns: keys, fired: Array.from({ length: 257 }, () => ({ planetId: SOV, slot: 0, dir: 'raise', at: T0 })) },
     ];
     for (const value of hostile) {
       expect(isKeepingSettlement(value)).toBe(false);
@@ -1324,7 +1409,7 @@ describe('the fuel record: one reading per meter', () => {
           trim: readOrbitTrim(),
           fuelDrawn: 2 * TRIM_FUEL,
           burns: [keyOf(doc, b1), keyOf(doc, b2)],
-          fired: [firedOf(b1), firedOf(b2)],
+          fired: [firedOf(b2)],
         },
       },
     });
