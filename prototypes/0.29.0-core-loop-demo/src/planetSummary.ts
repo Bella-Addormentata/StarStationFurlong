@@ -93,8 +93,14 @@ export interface StationSummary {
   /** The owning install's own id for its saved record, so a flight record
    *  written there (station ids are per install) still resolves here. */
   ownerId?: string;
+  /** Other installs' ids for their saved records of the same place (their
+   *  records lost to `ownerId`'s), sorted, at most MAX_OWNER_ALIASES: a
+   *  flight record one of them wrote still resolves here. */
+  ownerAliases?: string[];
   updatedAt: number;
 }
+
+export const MAX_OWNER_ALIASES = 8;
 
 export interface ShipSummary {
   /** The ship's room id. */
@@ -283,6 +289,11 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // left out, not the whole summary: the station still registers.
   if (isId(v.berthDoor) && isAcceptableDoorKey(v.berthDoor)) out.berthDoor = v.berthDoor;
   if (v.ownerId !== undefined) out.ownerId = v.ownerId as string;
+  // Peer-sent: bounded before it is walked.
+  if (Array.isArray(v.ownerAliases) && v.ownerAliases.length <= MAX_OWNER_ALIASES * 4) {
+    const aliases = mergeAliases(v.ownerAliases.filter(isId), [], out.ownerId);
+    if (aliases) out.ownerAliases = aliases;
+  }
   const ext = cleanExt(v.ext);
   if (ext) out.ext = ext;
   const trim = cleanTrim(v.trim, now);
@@ -402,7 +413,8 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
  *  time, whichever record stands. Returns null when nothing changes. */
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary): StationSummary | null {
   if (!prior) return incoming;
-  const recordOf = (s: StationSummary): string => JSON.stringify({ ...s, trim: undefined, move: undefined, trimGone: undefined });
+  const recordOf = (s: StationSummary): string =>
+    JSON.stringify({ ...s, trim: undefined, move: undefined, trimGone: undefined, ownerAliases: undefined });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
   // Two installs that each saved the place under their own id: one of them
   // stands for good (the smaller id), so their republishes cannot take turns.
@@ -423,11 +435,24 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
     (t && (t.from === undefined || (t.readAt ?? 0) >= goneAt(gone, t.from)) ? t : undefined);
   const trim = newerTrim(alive(fits(prior.trim)), alive(fits(incoming.trim)));
   const move = newerMove(prior.move, incoming.move);
+  // Every owner id seen for this place but the standing one's.
+  const aliases = mergeAliases(
+    [...(prior.ownerAliases ?? []), ...(incoming.ownerAliases ?? []), prior.ownerId, incoming.ownerId],
+    [], base.ownerId);
   const next: StationSummary = { ...base };
   if (trim) next.trim = trim; else delete next.trim;
   if (gone) next.trimGone = gone; else delete next.trimGone;
+  if (aliases) next.ownerAliases = aliases; else delete next.ownerAliases;
   if (move) next.move = move; else delete next.move;
   return JSON.stringify(next) === JSON.stringify(prior) ? null : next;
+}
+
+/** Owner ids, deduplicated, without `standing`, sorted and capped (the
+ *  smallest kept, so every client settles on the same list). */
+function mergeAliases(a: readonly (string | undefined)[], b: readonly (string | undefined)[], standing?: string): string[] | undefined {
+  const ids = [...new Set([...a, ...b])].filter((x): x is string => x !== undefined && x !== standing);
+  ids.sort();
+  return ids.length > 0 ? ids.slice(0, MAX_OWNER_ALIASES) : undefined;
 }
 
 /** Two lists of "trim gone" readings, room by room: the later reading of
@@ -623,8 +648,8 @@ export function foldOwnStation(
   const sameRecord = (a: StationSummary, b: StationSummary): boolean =>
     // The owner id is per install: another install's identical record is the
     // same record, not news to republish over.
-    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, move: undefined, updatedAt: 0, ownerId: undefined })
-      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, move: undefined, updatedAt: 0, ownerId: undefined });
+    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, move: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined })
+      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, move: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined });
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
     : known;
@@ -1040,7 +1065,8 @@ export function resolveStationAlias(id: string, now = Date.now()): string | null
   // room first, so a local record that happens to share the id never wins.
   if (room !== undefined) return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
   if (listed.some((s) => s.id === id)) return id;
-  room = Object.values(readStore(now).stations).find((s) => s.ownerId === id)?.welcomeRoomId;
+  const stations = Object.values(readStore(now).stations);
+  room = (stations.find((s) => s.ownerId === id) ?? stations.find((s) => s.ownerAliases?.includes(id)))?.welcomeRoomId;
   if (!room) return null;
   return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
 }
