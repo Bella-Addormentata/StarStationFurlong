@@ -133,6 +133,7 @@ import {
   onRouteWritten,
   raiseRouteFuelCeiling,
   readResolvedFlight,
+  readEndedRun,
   readRouteCheckpoints,
   readRouteFlight,
   readShipRoute,
@@ -1474,7 +1475,7 @@ function planetShipStatus(): ShipStatusInput | null {
   // the fields.
   Object.assign(
     out,
-    routeSummaryFields(readShipRoute(), readRouteFlight(now), readRouteCheckpoints(), shipRoutePortDock(now), now),
+    routeSummaryFields(readShipRoute(), readRouteFlight(now), readRouteCheckpoints(), shipRoutePortDock(now), now, readEndedRun(now)),
   );
   return out;
 }

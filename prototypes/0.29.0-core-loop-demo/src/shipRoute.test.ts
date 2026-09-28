@@ -59,6 +59,7 @@ import {
   readResolvedFlight,
   readRouteCheckpoints,
   readRouteFlight,
+  readEndedRun,
   readShipRoute,
   refuelShipRoute,
   resolveShipFlight,
@@ -772,16 +773,21 @@ describe('STOP and finish', () => {
     // Rider A's clock runs a minute fast: its run's id is T0 + MIN.
     writeShipRoute(saved());
     writeFuelLevel(70, CAP);
+    expect(readEndedRun(T0)).toBeUndefined();
     const first = startShipRoute({ now: T0 + MIN, startStop: 0, pilot: 'person', fuel: 70, capacity: CAP })!;
     expect(first).toBe(T0 + MIN);
     expect(writeRouteCheckpoint(first, pauseCheckpoint(readShipRoute()!, 0, { at: T0 + MIN + SEC })!, T0 + MIN + SEC)).toBe(true);
     expect(stopShipRoute(T0 + MIN + 2 * SEC)).toBe(true);
+    expect(readEndedRun(T0 + MIN + 2 * SEC)).toBeUndefined(); // a run still flies
     expect(finishShipRoute()).toBe(true);
     expect(ckptKeys()).toEqual([`ckpt:${first}:0:start`]);
+    // 🏁 The kept key says which run ended (boards order "no run flies" by it).
+    expect(readEndedRun(T0 + 10 * SEC)).toBe(first);
     // Rider B, whose clock is right, STARTs again 20 s later.
     const next = startShipRoute({ now: T0 + 20 * SEC, startStop: 0, pilot: 'person', fuel: 70, capacity: CAP });
     expect(next).toBe(first + 1);
     expect(ckptKeys()).toEqual([`ckpt:${first + 1}:0:start`]);
+    expect(readEndedRun(T0 + 20 * SEC)).toBeUndefined();
   });
 
   it('finish clears the run and its keys first, then runs the caller writes, in one transaction', () => {

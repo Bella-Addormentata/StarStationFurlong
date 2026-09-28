@@ -450,6 +450,30 @@ describe('the board', () => {
     expect(view(idle)).toHaveLength(1);
   });
 
+  it('🕰️ a summary of an older run than the one this room holds changes nothing, whatever its stamp', () => {
+    const here = boardAt(0, { dockedAt: T0 + 2 * SEC });
+    const isHereRoom = (room: string) => room === 'room-0';
+    const placeOf = (room: string | undefined) => (room === 'room-1' ? 'Stop 1' : '?');
+    const now = T0 + 10 * SEC;
+    // A delayed relay of the run before this one, stamped by a rider whose
+    // clock runs an hour fast.
+    const old = (over: Partial<ShipSummary> = {}): ShipSummary => ({
+      roomId: SHIP, name: 'Old Hopper', planetId: SOV, status: 'docked', fromRoom: 'room-0', nextStopRoom: 'room-1',
+      departAt: s.departAt + MIN, gate: 3, routeStatus: 'holding', routeRun: T0 - 60 * MIN, updatedAt: T0 + 60 * MIN, ...over,
+    });
+    const view = (summary: ShipSummary) =>
+      boardView({ ferries: [ferry(route, [s])], here, gate: null, summaries: [summary], isHereRoom, placeOf, now }).rows;
+    const held = [expect.objectContaining({ ferry: 'Ferry One', status: 'BOARDING', gate: 1, at: s.departAt })];
+    expect(view(old())).toEqual(held);
+    expect(view(old({ routeNews: T0 + 9 * SEC }))).toEqual(held);
+    // …nor does its end: an older run's "no run flies" leaves this one's row.
+    const { routeStatus: _s, gate: _g, departAt: _d, nextStopRoom: _n, ...bare } = old();
+    expect(view({ ...bare, routeIdle: true })).toEqual(held);
+    // This run's own end drops the row whatever the stamps, as a later run's does.
+    expect(view({ ...bare, routeIdle: true, routeRun: T0, updatedAt: T0 - SEC })).toEqual([]);
+    expect(view({ ...bare, routeIdle: true, routeRun: T0 + MIN, updatedAt: T0 - SEC })).toEqual([]);
+  });
+
   it('a ferry is named as its riders named the room, or FERRY while it has only its id', () => {
     expect(ferryName('Star Hopper', 'room-9')).toBe('Star Hopper');
     expect(ferryName('room-9', 'room-9')).toBe('FERRY');
@@ -523,6 +547,8 @@ describe('the route fields of the ferry’s own summary', () => {
     });
     // 🏁 No run flies: said outright.
     expect(routeSummaryFields(null, null, [], null, T0)).toEqual({ routeIdle: true });
+    // 🏁 With the run the last finish ended, so a board can order it.
+    expect(routeSummaryFields(null, null, [], null, T0, T0 - MIN)).toEqual({ routeIdle: true, routeRun: T0 - MIN });
     // A run that flies but can't be worked out yet (no anchor checkpoint
     // here): no word either way, so boards keep what they hold.
     expect(routeFlightAt(route, [], null, T0 + 10 * SEC, 100)).toBeNull();
@@ -530,6 +556,6 @@ describe('the route fields of the ferry’s own summary', () => {
     const stopped = running({ stoppedAt: T0 + SEC });
     const e = routeFlightAt(stopped, [s], null, T0 + 10 * SEC, 100)!;
     expect(e.ended).toBe('stop');
-    expect(routeSummaryFields(stopped, e, [s], null, T0 + 10 * SEC)).toEqual({ routeIdle: true });
+    expect(routeSummaryFields(stopped, e, [s], null, T0 + 10 * SEC)).toEqual({ routeIdle: true, routeRun: stopped.startedAt });
   });
 });

@@ -438,15 +438,17 @@ function scheduleMoved(mirror: DepartureRow, newer: DepartureRow): boolean {
  * The map's entry for a ferry is its last publish that reached this room
  * (DepartureFerry.at). A summary wins where they disagree, since a publish
  * can give up or a finished route's entry stays behind: one that flies a
- * later run (`routeRun`) ends the held row, and one that knows of a
- * checkpoint of the held run the map lacks (a hold, a pause…: `routeNews`)
- * replaces it, or with no row of its own makes it DELAYED, time unknown,
- * whatever the stamps say (🕰️ run ids and checkpoint times order
- * themselves). One the ferry wrote AFTER the map's entry, by the stamps,
- * also has its say where nothing else orders the two: said since that no
- * run flies (🏁 `routeIdle`), the held row goes; a row where the map has
- * none, or with another gate or time, replaces the map's; a new name
- * renames it. A summary with no route fields at all (an older client's
+ * later run (`routeRun`) ends the held row, as does one that says the held
+ * run or a later one has ended (🏁 `routeIdle` with its run), and one that
+ * knows of a checkpoint of the held run the map lacks (a hold, a pause…:
+ * `routeNews`) replaces it, or with no row of its own makes it DELAYED, time
+ * unknown, whatever the stamps say (🕰️ run ids and checkpoint times order
+ * themselves). A summary of an OLDER run than the held one (a delayed relay)
+ * changes nothing, whatever its stamp. One the ferry wrote AFTER the map's
+ * entry, by the stamps, also has its say where nothing else orders the two:
+ * said since that no run flies, naming none, the held row goes; a row where
+ * the map has none, or with another gate or time, replaces the map's; a new
+ * name renames it. A summary with no route fields at all (an older client's
  * relay drops them) changes nothing.
  */
 export function boardView(i: BoardInput): BoardView {
@@ -467,16 +469,25 @@ export function boardView(i: BoardInput): BoardView {
       // Written after this room's copy, by the stamps: the say on what has
       // no order of its own (a gate, a time, a name, "no run flies").
       const newer = s.updatedAt > ferry.at;
-      if (newer && s.routeIdle) continue;
+      // 🕰️ Run ids and checkpoint times order themselves, whatever the two
+      // riders' clocks stamped the copy and the summary with.
+      const heldRun = ferry.route.startedAt ?? ferry.endedRun;
+      // A later run than the one this room holds (a replacement route): the
+      // held one is over, whether or not the new one calls here now.
+      const laterRun = s.routeRun !== undefined && s.routeRun > (heldRun ?? 0);
+      // An older run's summary (a delayed relay): its route fields say
+      // nothing of the held run, whatever its stamp.
+      if (s.routeRun !== undefined && heldRun !== undefined && s.routeRun < heldRun) {
+        if (r) rows.push(r);
+        continue;
+      }
+      // 🏁 No run flies: the held run's end, or a later run's, whatever the
+      // stamps; one that names no run by the stamps.
+      if (s.routeIdle && (laterRun || (s.routeRun !== undefined && s.routeRun === heldRun) || (newer && s.routeRun === undefined))) continue;
       if (s.routeStatus) {
         // Renamed since this room's copy: the row keeps its clock-live times
         // under the newer name (a route summary names it as boards do).
         if (newer && r && s.name !== r.ferry) r = { ...r, ferry: s.name };
-        // 🕰️ Run ids and checkpoint times order themselves, whatever the
-        // two riders' clocks stamped the copy and the summary with.
-        // A later run than the one this room holds (a replacement route): the
-        // held one is over, whether or not the new one calls here now.
-        const laterRun = s.routeRun !== undefined && s.routeRun > (ferry.route.startedAt ?? ferry.endedRun ?? 0);
         // The same run, and the ship knows of a checkpoint this room's copy
         // lacks (its publish gave up): the held timetable is out of date.
         const missed = !laterRun && s.routeRun !== undefined && s.routeRun === ferry.route.startedAt
@@ -571,7 +582,9 @@ export function routePortGate(
  * The route fields of the ship's own summary (A9 item 7), from its
  * timetable and its own live dock at the stop (`dock`: docked there, and at
  * which gate when known), with the run's newest checkpoint. 🏁 `routeIdle`
- * alone when no route runs or it has ended; nothing at all while a running
+ * when no route runs or it has ended, with the run that ended when known
+ * (the running one's, or `endedRun`: shipRoute.readEndedRun), so a board
+ * never takes an older run's end for its own; nothing at all while a running
  * route's timetable can't be worked out yet (its anchor checkpoint has not
  * arrived), so a board keeps what it holds. Pure.
  */
@@ -581,8 +594,12 @@ export function routeSummaryFields(
   checkpoints: readonly RouteCheckpoint[],
   dock: { gate?: number } | null,
   now: number,
+  endedRun?: number,
 ): RouteSummaryFields {
-  if (!isRouteRunning(route) || f?.ended === 'stop') return { routeIdle: true };
+  if (!isRouteRunning(route) || f?.ended === 'stop') {
+    const run = isRouteRunning(route) ? route.startedAt : endedRun;
+    return run !== undefined ? { routeIdle: true, routeRun: run } : { routeIdle: true };
+  }
   if (!f) return {};
   const next = route.stops[f.nextStopIndex];
   const out: RouteSummaryFields = {};

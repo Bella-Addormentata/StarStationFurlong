@@ -954,6 +954,23 @@ export function finishShipRoute(apply?: () => void): boolean {
   return true;
 }
 
+/** 🏁 The run the last finish ended, while no run flies: the start key a
+ *  finish keeps (above). Undefined while a run flies or none is left; a key
+ *  stamped past RUN_AHEAD_MS is no run. The ship's summary says "no run
+ *  flies" with it, so a board can tell that end from an older run's
+ *  (departuresBoard.routeSummaryFields). */
+export function readEndedRun(now = Date.now()): number | undefined {
+  const h = shipDocHandle();
+  if (!h || isRouteRunning(readShipRoute(now))) return undefined;
+  let run: number | undefined;
+  for (const key of scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns) {
+    const p = parseCheckpointKey(key);
+    if (p?.kind !== 'start' || p.run > now + RUN_AHEAD_MS) continue;
+    if (run === undefined || p.run > run) run = p.run;
+  }
+  return run;
+}
+
 // ── The route's fuel draw meter ──────────────────────────────────────────────
 
 /** The route's draw meter name (shipDoc.setFuelDrawMeter). */
