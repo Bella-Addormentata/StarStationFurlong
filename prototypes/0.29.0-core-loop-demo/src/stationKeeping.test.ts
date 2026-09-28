@@ -472,7 +472,8 @@ describe('replaying the burns', () => {
     expect(out.trim).toMatchObject({ dRadiusKm: -4 + TRIM_STEP_KM, at: start.at });
     const base = slotOrbit(STATION);
     expect(slotOffsetAt(base, out.trim, start.at)).toBeCloseTo(slotOffsetAt(base, start, start.at), 12);
-    expect(out.fired).toEqual([early]);
+    // It fires when it applies.
+    expect(out.fired).toEqual([{ ...early, at: start.at }]);
   });
 
   it('holds each burn to the ceiling for the capacity it was made against', () => {
@@ -1004,6 +1005,32 @@ describe('level writes settle the log', () => {
       expect(planTrim(c, 'lower')).toEqual({ ok: false, refusal: 'burning' });
       expect(press('lower', edge.at + BURN_MS).at).toBe(edge.at + BURN_MS);
     }
+  });
+
+  it('a late burn on another orbit fires when it applies, so the stick there still waits for it', () => {
+    const OTHER = { ...STATION, orbitSlot: 1 };
+    const a = new Y.Doc();
+    const x = new Y.Doc();
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    Y.applyUpdate(x, Y.encodeStateAsUpdate(a));
+    // The room burns on its slot and REFUELs, settling that burn...
+    const settled = press('raise', T0 + 5_000);
+    writeFuelLevel(50, 100);
+    // ...while tab X, offline, places the room in another slot and fires
+    // there before it.
+    bindRoom(x);
+    const plan = planTrim(ctx({ station: OTHER, trim: readOrbitTrim(), fuel: readFuelLevel(), now: T0 }), 'ahead');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(writeTrimBurn(plan.burn)).toBe(true);
+    sync(a, x);
+    bindRoom(a);
+    // X's burn applies at the settled burn's time, and fires then too.
+    const now = settled.at + 1_000;
+    expect(readOrbitTrim()).toMatchObject({ slot: 1, at: settled.at, last: 'ahead' });
+    expect(readBurnFiring(now, OTHER)).toEqual({ planetId: SOV, slot: 1, dir: 'ahead', at: settled.at });
+    const c = ctx({ station: OTHER, trim: readOrbitTrim(), fuel: readFuelLevel(), now, firing: readBurnFiring(now, OTHER) });
+    expect(planTrim(c, 'ahead')).toEqual({ ok: false, refusal: 'burning' });
   });
 
   it('ignores a hostile settlement: every burn in the log still counts', () => {
