@@ -38,7 +38,7 @@ import {
 import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
-import { readStore, shipsAroundPlanet } from './planetSummary';
+import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
@@ -271,18 +271,20 @@ function gather(now: number): Source {
   // station, which may sit around another planet than its summary, so it is
   // hidden in every view, not only its own planet's.
   const flying = new Set<string>();
-  for (const ship of Object.values(readStore(now).ships)) {
-    if (ship.status === 'in-flight' && !ship.retired) flying.add(ship.roomId);
-  }
-  for (const ship of shipsAroundPlanet(planetId, now)) {
-    if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
-    if (ship.retired) continue;
+  const inFlight = Object.values(readStore(now).ships).filter((ship) => ship.status === 'in-flight' && !ship.retired);
+  for (const ship of inFlight) flying.add(ship.roomId);
+  // Each flight is placed by its own plan's planet, not the summary's
+  // planetId: that follows the origin station's current record, which a
+  // move since the ship left has taken to another planet.
+  for (const ship of inFlight) {
+    if (ship.roomId === roomId) continue;
     if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
     const plan = flightPlan(byRoom(ship.fromRoom, ship.departedAt), byRoom(ship.toRoom, ship.departedAt), ship.departedAt, ship.etaAt);
+    if (!plan || plan.from.planet.id !== planetId) continue;
     // Only ships on their transfer right now: the gather re-runs every
     // REFRESH_MS, so a ship joins the key at departure and leaves it at
     // arrival, and the static frame is rebuilt at both.
-    if (plan && transferPointAt(plan, now).leg === 'transfer') {
+    if (transferPointAt(plan, now).leg === 'transfer') {
       ships.push({ id: `ship:${ship.roomId}`, name: ship.name, plan });
     }
   }
