@@ -43,10 +43,9 @@ import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
-import { adriftPlace } from './stationDirectory';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
-import { currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
