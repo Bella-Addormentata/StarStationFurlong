@@ -225,19 +225,19 @@ export function planArrivalDock(input: {
   const candidates = arrivalBerths(input);
   const berth: StationBerth | null =
     input.berth && isRoomSeed(input.berth.address) ? input.berth : candidates[0] ?? null;
-  if (!berth) return { kind: 'none', reason: 'no-berth' };
   // Docked at any of this station's berths: already there. Its rooms count
   // too, so a dock another commander made at a gate this client cannot
-  // address is never doubled.
+  // address is never doubled, even when it can address no gate at all.
   const stationRooms = new Set(input.station.berthRooms ?? []);
   const inStation = (address: string): boolean => {
     try { return stationRooms.has(roomIdFromSeed(address)); } catch { return false; }
   };
   if (ports.some((p) => p.state.kind === 'docked'
     && (inStation((p.state as { address: string }).address)
-      || [berth, ...candidates].some((b) => sameRoom((p.state as { address: string }).address, b.address))))) {
+      || [...(berth ? [berth] : []), ...candidates].some((b) => sameRoom((p.state as { address: string }).address, b.address))))) {
     return { kind: 'none', reason: 'already-docked' };
   }
+  if (!berth) return { kind: 'none', reason: 'no-berth' };
   // Open = free to dock AND ours to use right now: a busy or locked port
   // would refuse DOCK after its door record was already re-pointed.
   const open = (p: ArrivalPort) =>
