@@ -751,9 +751,14 @@ export function dockedStationFor(
   const partners: string[] = [];
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only an address that names a room is a pairing (as stationKeeping's
+    // isBoltedIntoStation reads it): peer-written junk beside a real dock
+    // neither bolts the room in nor hides that dock.
+    let partner = '';
+    try { partner = roomIdFromSeed(rec.connectedRoomAddress); } catch { partner = ''; }
+    if (!partner) continue;
     if (!isBerthDoor(rec)) return null; // bolted into a station: the atlas places it
-    const partner = roomIdFromSeed(rec.connectedRoomAddress);
-    if (partner && partner !== roomId) partners.push(partner);
+    if (partner !== roomId) partners.push(partner);
   }
   for (const partner of partners) {
     const there = atlasStationForRoom(partner, atlas, stations);
@@ -782,7 +787,9 @@ export function adriftPlace(id: string): { planetId: string; orbitSlot: number }
   const planetId = rest.slice(0, cut);
   const orbitSlot = Number(rest.slice(cut + 1));
   if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) return null;
-  return { planetId, orbitSlot };
+  // The planet as every other reader names it (an unknown one reads as the
+  // default planet, as in listStations), so destinations around it match.
+  return { planetId: planetById(planetId).id, orbitSlot };
 }
 
 /** Where the room resolver puts a room when that is open orbit (a ship

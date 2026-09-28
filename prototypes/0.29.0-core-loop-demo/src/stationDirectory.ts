@@ -47,6 +47,8 @@ export interface UnaddressedGate {
   gate?: number;
   access?: StationBerth['access'];
   reservedFor?: string;
+  /** A ship is docked there (the atlas shows a pairing). */
+  occupied?: true;
 }
 
 /** One station a ship can fly to. */
@@ -327,6 +329,7 @@ export function destinationsFromRecords(
           farDoor: b.doorId,
           ...(b.gate !== undefined ? { gate: b.gate } : {}),
           ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
+          ...(b.occupied ? { occupied: true as const } : {}),
         });
         continue;
       }

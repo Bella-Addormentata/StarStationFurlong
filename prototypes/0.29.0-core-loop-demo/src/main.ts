@@ -273,7 +273,7 @@ import {
 } from "./exteriorView";
 import {
   harvestIntoAtlas,
-  freeGateNumber,
+  freeGateNumberHere,
   readAtlas,
   atlasComponent,
   bindStationAtlasDoc,
@@ -2045,7 +2045,7 @@ async function joinRoomAtEpoch(
         const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
         // ⚓🚦 …numbered like every port (the new room's own gate list; the
         // atlas groups it with its station once harvested).
-        const gate = freeGateNumber(readAtlas(), boot.roomId, readDockGates());
+        const gate = freeGateNumberHere(boot.roomId, readDockGates());
         writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
@@ -3178,7 +3178,7 @@ async function transitTo(
     // ⚓🚦 A dock that fits a new port here needs a free gate number; with
     // every number taken, the dock is not completed (as the far DOCK refuses).
     const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
-    const newGate = needsPort ? freeGateNumber(readAtlas(), activeBootstrap?.roomId ?? "", readDockGates()) : null;
+    const newGate = needsPort ? freeGateNumberHere(activeBootstrap?.roomId ?? "", readDockGates()) : null;
     if (
       depRoomId &&
       !(needsPort && newGate === null) &&
@@ -3712,7 +3712,7 @@ function harvestStationAtlas(): void {
     yjsSync.doc.transact(() => {
       for (const doorId of unnumbered) {
         if (readDoorPolicy(doorId).gate !== undefined) continue;
-        const gate = freeGateNumber(readAtlas(), roomId, readDockGates());
+        const gate = freeGateNumberHere(roomId, readDockGates());
         if (gate === null) break;
         writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
       }

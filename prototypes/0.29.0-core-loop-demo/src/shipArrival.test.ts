@@ -585,6 +585,21 @@ describe('arrival gates', () => {
     expect(order).toEqual([3, 2, 1, 'south']);
   });
 
+  it("ranks a taken gate the ship's memory reaches after a free one", () => {
+    const remembered = { doorId: 'north', address: SEED_GATE_ROOM, farDoor: 'x' };
+    const order = arrivalBerths({
+      station: {
+        berths: [],
+        unaddressed: [
+          { roomId: 'high-gates', farDoor: 'east', gate: 1, occupied: true },
+          { roomId: 'high-gates', farDoor: 'west', gate: 2 },
+        ],
+      },
+      remembered,
+    }).map((b) => b.gate ?? b.farDoor);
+    expect(order.slice(0, 2)).toEqual([2, 1]);
+  });
+
   it('keeps the old single-berth rules when a station lists no gates', () => {
     const remembered = { doorId: 'north', address: SEED_HIGH, farDoor: 'east' };
     expect(arrivalBerths({ station: { berth: { address: SEED_HIGH } }, remembered })).toEqual([remembered]);

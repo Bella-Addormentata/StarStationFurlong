@@ -588,6 +588,17 @@ export function freeGateNumber(
 }
 
 /**
+ * ⚓🚦 freeGateNumber for a port fitted here and now: the local atlas with
+ * the bound room doc's shared atlas folded in around `roomId`
+ * (withSharedAtlasOf), since the local atlas keeps only MAX_ENTRIES rooms
+ * and a room of this station it has let go may already hold a number.
+ */
+export function freeGateNumberHere(roomId: string, own: Record<string, number>): number | null {
+  const doc = sharedDoc && (sharedDoc as { isDestroyed?: boolean }).isDestroyed !== true ? sharedDoc : null;
+  return freeGateNumber(doc ? withSharedAtlasOf(doc, readAtlas(), roomId) : readAtlas(), roomId, own);
+}
+
+/**
  * ⚓🚦 `atlas` with a room doc's shared atlas folded in, for gate numbering in
  * a room this client may never have visited (a far DOCK's port). Only the
  * station around `roomId` is read: a walk from that room along its door

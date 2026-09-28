@@ -326,7 +326,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       mode: 'thrusters',
       bookedAt: now,
       fuel: quote.fuel,
-      fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
+      fuelDrawn: Math.min(FUEL_METER_MAX, ctx.drawn + ctx.deficit + quote.fuel),
     },
   };
 }
@@ -510,7 +510,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
       tugRoomId: ctx.tugRoomId,
       bookedAt: now,
       fuel: quote.fuel,
-      fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
+      fuelDrawn: Math.min(FUEL_METER_MAX, ctx.drawn + ctx.deficit + quote.fuel),
     },
   };
 }
@@ -730,9 +730,15 @@ export function otherPlanets(station: StationRecord | null): string[] {
 // ── Remembered moves (per install) ───────────────────────────────────────────
 
 const KEY = 'ssf-station-moves';
-/** Twice the stations the atlas and the planet summaries can carry (64), so
- *  every station's latest move is kept even with finished ones about. */
-const MAX_REMEMBERED = 128;
+/** Room for every station's latest move (the atlas and the planet summaries
+ *  carry up to 64 stations) with finished ones and recent history about. */
+const MAX_REMEMBERED = 256;
+/** A station's earlier moves stay remembered while an entry they could
+ *  decide is still reversible (pruned after MOVE_LOG_KEEP_MS, final after
+ *  MOVE_FINAL_MS more), at most this many per station: a winner learned
+ *  here keeps its loser unpaid after the station's next move replaces it
+ *  as the latest. */
+const HISTORY_PER_STATION = 8;
 
 export function readRememberedMoves(): StationMove[] {
   try {
@@ -751,31 +757,46 @@ function sameStation(a: StationMove, b: StationMove): boolean {
 }
 
 /** Remember a move this install has seen — from the helm room, or from the
- *  per-planet summary. A later departure for the same station replaces an
- *  earlier one; an older one is ignored. Returns whether the list changed. */
+ *  per-planet summary. Each station's best move (compareMoves) is kept, and
+ *  its earlier ones while still recent enough to decide a pending entry
+ *  (HISTORY_PER_STATION). Returns whether the list changed. */
 export function rememberMove(move: StationMove, nowMs: number = Date.now()): boolean {
   if (!isStationMove(move) || !isPlausibleMove(move, nowMs)) return false;
-  const list = readRememberedMoves();
-  const at = list.findIndex((m) => sameStation(m, move));
-  if (at >= 0) {
-    const old = list[at];
-    if (compareMoves(move, old) <= 0) return false;
-    list[at] = cleanMove(move);
-  } else {
-    list.push(cleanMove(move));
-    // Forget the move that finished longest ago when full.
-    while (list.length > MAX_REMEMBERED) {
-      let oldest = 0;
-      list.forEach((m, i) => { if (m.arriveAt < list[oldest].arriveAt) oldest = i; });
-      list.splice(oldest, 1);
-    }
-  }
+  const clean = cleanMove(move);
+  const id = moveId(clean);
+  const before = readRememberedMoves();
+  if (before.some((m) => moveId(m) === id)) return false;
+  const list = trimRemembered([...before, clean], nowMs);
+  if (!list.some((m) => moveId(m) === id)) return false;
   try { localStorage.setItem(KEY, JSON.stringify(list)); } catch { return false; }
   // A new winner learned here (a planet summary, another room) can change
   // this room's standing move and so its 'stationMove' meter: tell the
   // listeners, the fuel meter among them, once the caller is done.
   notifySoon();
   return true;
+}
+
+/** Each station's best move, then its recent history, within the caps:
+ *  history goes first when full (longest finished first), then the bests
+ *  that finished longest ago. */
+function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
+  const since = nowMs - MOVE_LOG_KEEP_MS - MOVE_FINAL_MS;
+  const groups: StationMove[][] = [];
+  for (const m of list) {
+    const g = groups.find((x) => sameStation(x[0], m));
+    if (g) g.push(m); else groups.push([m]);
+  }
+  const bests: StationMove[] = [];
+  const history: StationMove[] = [];
+  for (const g of groups) {
+    g.sort((x, y) => compareMoves(y, x));
+    bests.push(g[0]);
+    history.push(...g.slice(1).filter((m) => m.arriveAt >= since).slice(0, HISTORY_PER_STATION));
+  }
+  const byFinish = (x: StationMove, y: StationMove) => y.arriveAt - x.arriveAt;
+  const keptBests = bests.sort(byFinish).slice(0, MAX_REMEMBERED);
+  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length);
+  return [...keptBests, ...keptHistory];
 }
 
 let notifyQueued = false;
@@ -792,7 +813,10 @@ function notifySoon(): void {
  *  room (stations.moveBelongsTo), so a move another install wrote under its
  *  own id for the station still applies here. */
 export function rememberedMoveFor(station: MovingStation): StationMove | null {
-  const remembered = readRememberedMoves().find((m) => moveBelongsTo(m, station)) ?? null;
+  let remembered: StationMove | null = null;
+  for (const m of readRememberedMoves()) {
+    if (moveBelongsTo(m, station) && (!remembered || compareMoves(m, remembered) > 0)) remembered = m;
+  }
   // The bound room's own standing move too, so a move written here applies
   // even when this install cannot store it (localStorage full or blocked).
   const here = roomStanding().find((m) => moveBelongsTo(m, station)) ?? null;
@@ -1079,7 +1103,9 @@ export function readMoveFuelDrawn(): number {
   // unless a copy was already made final (and so counted in a drawn total).
   const done = doneIds(settled);
   const { sum, floor } = meterParts([...entries, ...recent].filter((m) => !done.has(moveId(m))), known, base);
-  return Math.max(sum, floor, settledFloor);
+  // Each record is capped, their sum is not: a reading past the meter's range
+  // would read as none at all (shipDoc), so it stops at the cap.
+  return Math.min(FUEL_METER_MAX, Math.max(sum, floor, settledFloor));
 }
 
 /** Every settled record's final moves it still remembers, by identity. */
