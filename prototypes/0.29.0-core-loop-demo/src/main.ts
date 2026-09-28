@@ -2298,7 +2298,9 @@ async function joinRoomAtEpoch(
     if (routeRulesFlightNow()) {
       // 🛰️ Never copy a stale replica's timetable back.
       if (roomStateArrivedNow()) {
-        // ⛽ A tank fitted mid-run: the home refill's ceiling follows it.
+        // ⛽ A tank that lands mid-run anyway (edit mode and the DEV menu
+        // refuse one while the timetable flies the ship, so only from a game
+        // that had not yet seen the route): the home refill's ceiling follows.
         raiseRouteFuelCeiling(shipFuelCapacity());
         settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) });
       }

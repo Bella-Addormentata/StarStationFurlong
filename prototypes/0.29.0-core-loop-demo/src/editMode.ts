@@ -115,9 +115,9 @@ import { addToRoomInventory, activeRoomId } from './roomInventory';
 // 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
 import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
 // 🚏 …and so do the last helm, engine and fuel tank aboard.
-import { readShipRoute } from './shipRoute';
+import { readShipRoute, routeRulesFlightNow } from './shipRoute';
 import { isRouteRunning } from './pilotRoute';
-import { lastRoutePartTaken } from './routeParts';
+import { lastRoutePartTaken, tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2221,11 +2221,21 @@ class RoomEditController {
     } catch {
       routeRuns = false;
     }
-    const lastPart = lastRoutePartTaken(
-      itemId, FURNITURE, new Set([itemId, ...mountDescendantsOf(itemId).map((c) => c.id)]), routeRuns,
-    );
+    const going = new Set([itemId, ...mountDescendantsOf(itemId).map((c) => c.id)]);
+    const lastPart = lastRoutePartTaken(itemId, FURNITURE, going, routeRuns);
     if (lastPart) {
       showHint(`CAN'T REMOVE — the ship's route is running and this is its last ${lastPart}. Stop the route at the helm first.`, 3200);
+      return;
+    }
+    // ⛽ …and while the timetable flies the ship, no tank comes off at all.
+    let timetableRules = false;
+    try {
+      timetableRules = routeRulesFlightNow();
+    } catch {
+      timetableRules = false;
+    }
+    if (tanksLockedByRoute(FURNITURE, FURNITURE.filter((i) => !going.has(i.id)), timetableRules)) {
+      showHint(`CAN'T REMOVE — ${TANKS_LOCK_REFUSAL}.`, 3200);
       return;
     }
     if (import.meta.env.DEV && isDeviceFocusActive()) {

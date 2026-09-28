@@ -58,7 +58,10 @@ import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 import { readGame } from './games/gamesDoc';
 import {
   ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
+  findTemplate, templateItemsFor,
 } from './roomTemplates';
+import { routeRulesFlightNow } from './shipRoute';
+import { tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
@@ -256,6 +259,21 @@ function equipOutfit(outfitId: string): void {
   showHint(setOutfit(outfitId)
     ? `DEV: equipped ${outfit?.name ?? outfitId}.`
     : `DEV: could not equip '${outfitId}'.`);
+}
+
+/** ⛽ Refuse, with a hint, a spawn or template that would change the ship's
+ *  tanks while its route's timetable flies it (routeParts.tanksLockedByRoute;
+ *  edit mode's REMOVE asks the same). */
+function tanksLocked(after: readonly FurnitureItem[], what: string): boolean {
+  let rules = false;
+  try {
+    rules = routeRulesFlightNow();
+  } catch {
+    rules = false;
+  }
+  if (!tanksLockedByRoute(FURNITURE, after, rules)) return false;
+  showHint(`DEV: CAN'T ${what} — ${TANKS_LOCK_REFUSAL}.`, 3200);
+  return true;
 }
 
 // ── FURNITURE: spawn a new registry item at the nearest valid snapped spot ───
@@ -473,6 +491,7 @@ function spawnFurniture(kind: FurnitureKind): void {
     rot: 0,
     movable: true,
   };
+  if (tanksLocked([...FURNITURE, item], `SPAWN ${kind}`)) return;
   // 🚀 Exterior-wall fittings mount on the hull, not the floor: hull.ts
   // searches the walls' outer lattices AND stackable faces (🛰️ a DEV-spawned
   // engine lands on the nearest free wall spot or tank stack automatically).
@@ -626,6 +645,7 @@ function placeFromInventory(index: number, kind: FurnitureKind): void {
     rot: 0,
     movable: true,
   };
+  if (tanksLocked([...FURNITURE, item], `PLACE ${kind}`)) return;
   // 🚀 Exterior-wall fittings re-mount on the hull (same routing as spawn).
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
@@ -971,6 +991,8 @@ function buildPanel(): HTMLDivElement {
         btn.dataset.armed = '';
         btn.textContent = 'PLACE'; // restore from the armed look (timeout skips executed buttons)
         btn.style.cssText = BTN_STYLE;
+        const wanted = findTemplate(btn.dataset.template ?? '');
+        if (wanted && tanksLocked(templateItemsFor(wanted), 'PLACE A TEMPLATE')) break;
         const t = applyRoomTemplate(btn.dataset.template ?? '');
         if (!t) break;
         // Furniture rebuilds via the doc subscription (replaceAllFurniture);
@@ -997,6 +1019,8 @@ function buildPanel(): HTMLDivElement {
           ...[{ x: me.x, z: me.z }, ...w.getRemotePlayerPositions()].map((p) => around(p, PLAYER_R + 0.1)),
           ...collectRequiredReachable(floodOrigin(w.getPlayer())).map((p) => around(p, PLAYER_R + 0.06)),
         ];
+        const adding = findTemplate(btn.dataset.template ?? '');
+        if (adding?.layout && tanksLocked([...FURNITURE, ...adding.layout(roomHalfExtents())], 'ADD A TEMPLATE')) break;
         const r = addRoomTemplateItems(btn.dataset.template ?? '', keepClear);
         if (!r) break;
         w.reconcileDoorPlacements();

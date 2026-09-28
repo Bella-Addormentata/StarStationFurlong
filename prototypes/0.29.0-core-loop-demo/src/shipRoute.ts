@@ -1165,8 +1165,12 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
  * the route's own debt takes the raise, so the gauge does not move until
  * the route's level does. Only while the route rules the flight: paused,
  * the stored level is the tank's own, and RESUME writes the ceiling anew.
- * Never lowers it (taking a tank off, the gauge clamps to the tanks). The
- * helm-gated game calls it (main.ts's watch). Returns whether it wrote.
+ * Never lowers it (taking a tank off, the gauge clamps to the tanks). Edit
+ * mode and the DEV menu refuse a tank change while the timetable flies the
+ * ship (routeParts.tanksLockedByRoute: the timetable replays every home
+ * refill at the capacity now), so this only meets one made by a game that had
+ * not yet seen the route. The helm-gated game calls it (main.ts's watch).
+ * Returns whether it wrote.
  */
 export function raiseRouteFuelCeiling(capacity: number, now = Date.now()): boolean {
   const route = readShipRoute(now);
