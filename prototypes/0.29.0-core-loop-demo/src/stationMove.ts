@@ -326,7 +326,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       mode: 'thrusters',
       bookedAt: now,
       fuel: quote.fuel,
-      fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
+      fuelDrawn: Math.min(FUEL_METER_MAX, ctx.drawn + ctx.deficit + quote.fuel),
     },
   };
 }
@@ -510,7 +510,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
       tugRoomId: ctx.tugRoomId,
       bookedAt: now,
       fuel: quote.fuel,
-      fuelDrawn: ctx.drawn + ctx.deficit + quote.fuel,
+      fuelDrawn: Math.min(FUEL_METER_MAX, ctx.drawn + ctx.deficit + quote.fuel),
     },
   };
 }
@@ -1079,7 +1079,9 @@ export function readMoveFuelDrawn(): number {
   // unless a copy was already made final (and so counted in a drawn total).
   const done = doneIds(settled);
   const { sum, floor } = meterParts([...entries, ...recent].filter((m) => !done.has(moveId(m))), known, base);
-  return Math.max(sum, floor, settledFloor);
+  // Each record is capped, their sum is not: a reading past the meter's range
+  // would read as none at all (shipDoc), so it stops at the cap.
+  return Math.min(FUEL_METER_MAX, Math.max(sum, floor, settledFloor));
 }
 
 /** Every settled record's final moves it still remembers, by identity. */

@@ -333,7 +333,7 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   if (isStationMove(v.move) && isPlausibleMove(v.move, now) && v.move.welcomeRoomId === out.welcomeRoomId) out.move = cleanMove(v.move);
   const gone = cleanTrimGone(v.trimGone, now);
   if (gone) out.trimGone = gone;
-  return out;
+  return canonOrder(out);
 }
 
 export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | null {
@@ -558,15 +558,27 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
     if (!inWelcome.some((b) => b.doorId === next.berthDoor)) {
       const lowest = inWelcome.reduce<StationBerthRecord | undefined>(
         (best, b) => (!best || (b.gate ?? Infinity) < (best.gate ?? Infinity) ? b : best), undefined);
-      // In the place a cleaned summary keeps it, so equal records compare equal.
-      const { welcomeRoomId, name, planetId, orbitSlot, berthDoor: _stale, ...others } = next;
-      const moved: StationSummary = {
-        welcomeRoomId, name, planetId, orbitSlot, ...(lowest ? { berthDoor: lowest.doorId } : {}), ...others,
-      };
-      return JSON.stringify(moved) === JSON.stringify(prior) ? null : moved;
+      if (lowest) next.berthDoor = lowest.doorId; else delete next.berthDoor;
     }
   }
-  return JSON.stringify(next) === JSON.stringify(prior) ? null : next;
+  const out = canonOrder(next);
+  return JSON.stringify(out) === JSON.stringify(prior) ? null : out;
+}
+
+/** A summary's fields in one fixed order (then any others as they came), so
+ *  equal summaries serialize alike wherever a field was added: records are
+ *  compared, and settled between installs, by their JSON. */
+const SUMMARY_ORDER = [
+  'welcomeRoomId', 'name', 'planetId', 'orbitSlot', 'updatedAt', 'berthDoor', 'ownerId', 'ownerAliases',
+  'berths', 'berthsAt', 'berthRoomsAt', 'ext', 'trim', 'move', 'trimGone',
+] as const;
+
+function canonOrder(s: StationSummary): StationSummary {
+  const out: Record<string, unknown> = {};
+  const src = s as unknown as Record<string, unknown>;
+  for (const k of SUMMARY_ORDER) if (src[k] !== undefined) out[k] = src[k];
+  for (const [k, v] of Object.entries(src)) if (!(k in out) && v !== undefined) out[k] = v;
+  return out as unknown as StationSummary;
 }
 
 /** Owner ids, deduplicated, without `standing`, sorted and capped (the

@@ -510,6 +510,16 @@ describe('the per-planet summary', () => {
     expect(none.berthDoor).toBeUndefined();
   });
 
+  it('settles a merged gate list with a cleaned copy of itself', () => {
+    const one = base({ ownerId: 'beta', trim: { planetId: 'planet-sovereign', slot: 3, dRadiusKm: 1, dPhase: 0, at: T0, last: 'raise' } as never });
+    const two = base({ ownerId: 'alpha', berths: [{ roomId: 'room-b', doorId: 'east', gate: 2 }], berthsAt: T0 + 5 });
+    const merged = mergeStation(one, two)!;
+    const copy = cleanStationSummary(merged, T0 + 10)!;
+    expect(JSON.stringify(copy)).toBe(JSON.stringify(merged));
+    expect(mergeStation(copy, merged)).toBeNull();
+    expect(mergeStation(merged, copy)).toBeNull();
+  });
+
   it('shares gates without the local occupied flag', () => {
     const s = summaryForStation({
       id: 'station:room-b', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-b', derived: true,

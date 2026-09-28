@@ -264,6 +264,16 @@ describe('merge', () => {
     expect(mergeStation(s, fromA)?.trim ?? s.trim).toBeUndefined();
   });
 
+  it('settles a merged record with a cleaned copy of itself, whatever order its fields were added in', () => {
+    const withTrim = (owner: string) => summary({ ownerId: owner, trim: { ...trim(), from: 'room-hab', readAt: T0 } });
+    const x = mergeStation(withTrim('beta'), withTrim('alpha'))!;
+    expect(x.ownerAliases).toEqual(['beta']);
+    const c = cleanStationSummary(x, T0 + 1)!;
+    expect(JSON.stringify(c)).toBe(JSON.stringify(x));
+    expect(mergeStation(c, x)).toBeNull();
+    expect(mergeStation(x, c)).toBeNull();
+  });
+
   it('reads a single take-back as the first builds sent it', () => {
     expect(cleanStationSummary({ ...summary(), trimGone: { from: 'room-a', readAt: T0 } }, T0)?.trimGone)
       .toEqual([{ from: 'room-a', readAt: T0 }]);

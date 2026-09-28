@@ -751,9 +751,14 @@ export function dockedStationFor(
   const partners: string[] = [];
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only an address that names a room is a pairing (as stationKeeping's
+    // isBoltedIntoStation reads it): peer-written junk beside a real dock
+    // neither bolts the room in nor hides that dock.
+    let partner = '';
+    try { partner = roomIdFromSeed(rec.connectedRoomAddress); } catch { partner = ''; }
+    if (!partner) continue;
     if (!isBerthDoor(rec)) return null; // bolted into a station: the atlas places it
-    const partner = roomIdFromSeed(rec.connectedRoomAddress);
-    if (partner && partner !== roomId) partners.push(partner);
+    if (partner !== roomId) partners.push(partner);
   }
   for (const partner of partners) {
     const there = atlasStationForRoom(partner, atlas, stations);

@@ -10,7 +10,8 @@
  * STATION, so its helm opens the station keeping face (stationHelm.ts). Any
  * other module flies ITSELF: the ship helm (devices.ts createHelmUI). It is
  * the line the ship helm already draws when it says a bolted module cannot
- * fly, except that a pairing naming no room joins nothing, as in the atlas.
+ * fly, except that a pairing whose address names no room (none at all, or
+ * one the atlas cannot read) joins nothing, as in the atlas.
  *
  * THE ORBIT. Stations fly perfect circles (orbits.ts, owner pick 2026-09-27):
  * a station's slot fixes its radius and its phase. Station keeping adds a
@@ -53,8 +54,8 @@
  * loses one or its fuel. Each level write (REFUEL, DEPART) SETTLES the log:
  * the fuel record keeps, beside the meter's reading, where the burns so far
  * left the trim, the fuel they drew, the keys of the burns it covered, paid
- * for or dropped, and the last of them to fire, which the lockout on each
- * orbit still follows (KeepingSettlement). The replay starts from the
+ * for or dropped, and each orbit's last burn to fire, which that orbit's
+ * lockout still follows (KeepingSettlement). The replay starts from the
  * settlement, a dropped burn stays dropped whatever the next REFUEL brings,
  * and the next burn clears the entries it covered. So the log holds only the
  * burns since the last level write. A burn that reaches us after a level
@@ -90,7 +91,7 @@ import type { DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, circularOrbit, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { FUEL_METER_MAX, fuelCeiling, readFuelSettlement, setFuelDrawMeter, shipVersion, subscribeShip } from './shipDoc';
-import { isBerthDoor } from './stationAtlas';
+import { isBerthDoor, roomIdFromSeed } from './stationAtlas';
 import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationRecord } from './stations';
 
@@ -102,17 +103,27 @@ const DEG = Math.PI / 180;
 /**
  * Is this module part of a station's structure? True when any of its doors is
  * paired to a room and is not a berth — the same line station grouping draws
- * (the atlas harvest skips a pairing that names no room, and
- * stationAtlas.isBerthDoor calls a transient guest berth or a docking-adapter
- * chain a ship calling, not structure).
+ * (the atlas joins rooms only through an address that names a room, read by
+ * stationAtlas.roomIdFromSeed, and stationAtlas.isBerthDoor calls a transient
+ * guest berth or a docking-adapter chain a ship calling, not structure).
  */
 export function isBoltedIntoStation(doors: Iterable<DoorRecord>): boolean {
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (isBerthDoor(rec)) continue;
-    return true;
+    if (namesRoom(rec.connectedRoomAddress)) return true;
   }
   return false;
+}
+
+/** Does a pairing's address name a room, as the atlas reads it? A malformed
+ *  peer-written one names none, or makes the parser throw: it joins nothing. */
+function namesRoom(address: string): boolean {
+  try {
+    return roomIdFromSeed(address) !== '';
+  } catch {
+    return false;
+  }
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -205,10 +216,11 @@ export interface KeepingSettlement {
   /** The log keys it covered: the burns paid for, and the ones dropped
    *  because the fuel could not cover them. */
   burns: string[];
-  /** The last burns that fired, on whatever orbit, each at the time it
-   *  applied (at most MAX_SETTLED_FIRED): the replay skips the burns the
+  /** The last burn to fire on each orbit a station can take here, at the
+   *  time it applied (lastFiredPerOrbit): the replay skips the burns the
    *  settlement covers, and the stick's lockout on each orbit still follows
-   *  them. Left out (a settlement from before), the trim's last burn. */
+   *  its own, however many burns fired on other orbits since. Left out (a
+   *  settlement from before), the trim's last burn. */
   fired?: FiredBurn[];
 }
 
@@ -272,9 +284,10 @@ const MAX_SETTLED_BURNS = 2 * MAX_LOG;
 /** A log key is `burn:`, a client id and a time: well under this. */
 const MAX_BURN_KEY_LEN = 64;
 
-/** A settlement keeps at most this many of the last burns that fired: far
- *  more than can fire within one burn of each other. */
-const MAX_SETTLED_FIRED = 16;
+/** A settlement keeps one fired burn per orbit, so at most PLANETS ×
+ *  MAX_ORBIT_SLOTS of them. One off the wire may carry this many: room for a
+ *  build that knows more planets, and still a bound on a peer-written list. */
+const MAX_SETTLED_FIRED = 256;
 
 /** Shape guard for a fired burn off the wire. */
 function isFiredBurn(v: unknown): v is FiredBurn {
@@ -304,6 +317,22 @@ function cleanTrim(t: OrbitTrim): OrbitTrim {
 /** Only the fields a fired burn has — what a settlement keeps. */
 function cleanFired(b: FiredBurn): FiredBurn {
   return { planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at };
+}
+
+/** The last burn to fire on each orbit a station can take here, in firing
+ *  order: what a settlement keeps for the lockout. A burn on a planet this
+ *  build does not know holds no station's stick here and is left out, so the
+ *  list never outgrows the orbits there are (PLANETS × MAX_ORBIT_SLOTS). */
+function lastFiredPerOrbit(fired: readonly FiredBurn[]): FiredBurn[] {
+  const last = new Map<string, FiredBurn>();
+  for (const b of fired) {
+    if (planetById(b.planetId).id !== b.planetId) continue;
+    const orbit = `${b.planetId}:${b.slot}`;
+    const kept = last.get(orbit);
+    // Of two at the same time, the first: the one readBurnFiring picks.
+    if (!kept || b.at > kept.at) last.set(orbit, b);
+  }
+  return [...last.values()].sort((a, b) => a.at - b.at).map(cleanFired);
 }
 
 /** Only the fields a burn has — what a write publishes. */
@@ -663,9 +692,9 @@ let heard: string | null = null;
 interface RoomReplay {
   trim: OrbitTrim | null;
   fuelDrawn: number;
-  /** Every burn that fired: the last ones the settlement kept (or the
-   *  settled trim's last burn), then the burns since, each at the time it
-   *  applied (BurnRun). */
+  /** Every burn that fired: the ones the settlement kept (or the settled
+   *  trim's last burn), then the burns since, each at the time it applied
+   *  (BurnRun). */
   fired: FiredBurn[];
   /** The log keys the settlement covers. */
   covered: ReadonlySet<string>;
@@ -839,7 +868,7 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   const keys = [...settledKeys, ...taken.map((p) => p.key)];
   keys.push(...junk.sorted().slice(0, MAX_SETTLED_BURNS - keys.length));
   // The burns a settlement covers are replayed no more, so it keeps the last
-  // that fired, on every orbit, for the lockout.
+  // to fire on each orbit, for that orbit's lockout.
   const fired = [...(settled?.fired ?? (start ? [lastBurnOf(start)] : [])), ...run.fired];
   return {
     trim: run.trim,
@@ -853,7 +882,7 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
         trim: run.trim && cleanTrim(run.trim),
         fuelDrawn: run.fuelDrawn,
         burns: keys,
-        fired: fired.slice(-MAX_SETTLED_FIRED).map(cleanFired),
+        fired: lastFiredPerOrbit(fired),
       }
       : undefined,
   };
