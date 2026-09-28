@@ -41,7 +41,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, compareMoves, isPlausibleMove, isStationMove, rememberMove, rememberedMoveFor } from './stationMove';
+import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
 import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -923,6 +923,17 @@ function pruneMap(
   return drop.length;
 }
 
+/** Each station's best remembered move (compareMoves), by welcome room. */
+function latestRememberedMoves(): StationMove[] {
+  const best = new Map<string, StationMove>();
+  for (const m of readRememberedMoves()) {
+    if (!m.welcomeRoomId) continue;
+    const had = best.get(m.welcomeRoomId);
+    if (!had || compareMoves(m, had) > 0) best.set(m.welcomeRoomId, m);
+  }
+  return [...best.values()];
+}
+
 /** This install → doc: its own station and ship first, then everything it
  *  knows (so news travels with players from station to station). */
 export function publishPlanetSummary(now = Date.now()): void {
@@ -934,6 +945,15 @@ export function publishPlanetSummary(now = Date.now()): void {
     const local = ctx.localTrim();
     const next = foldOwnStation(store.stations[here.welcomeRoomId], here, local, now, room, room !== undefined && readingChanged(room, local));
     if (next) store.stations[here.welcomeRoomId] = next;
+  }
+  // Every other known station's latest move this install remembers goes out
+  // too, by its welcome room: a tug's tows and their cancels, and arrival
+  // pins written for stations nobody here is aboard (stationMove).
+  for (const move of latestRememberedMoves()) {
+    const k = move.welcomeRoomId!;
+    const known = store.stations[k];
+    const next = known ? mergeStation(known, { ...known, move }) : null;
+    if (next) store.stations[k] = next;
   }
   const ship = ctx.ship();
   // A first-hand change goes out past any stamp already known for this ship

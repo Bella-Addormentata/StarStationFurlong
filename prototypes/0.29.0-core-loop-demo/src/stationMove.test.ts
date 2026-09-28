@@ -28,6 +28,7 @@ import {
   isCancelPin,
   isPinMove,
   pinSettledArrival,
+  pinSettledArrivals,
   isPlausibleMove,
   compareMoves,
   dockLockedByMove,
@@ -357,6 +358,27 @@ describe('the station list follows a move', () => {
     expect(listStations({}, [], t + 1).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
     // A pinned station is not pinned again.
     expect(pinSettledArrival(here, t + 2)).toBe(false);
+  });
+
+  it('pins every listed station that arrived, aboard or not', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const far: StationMove = { ...move, stationId: 'far', welcomeRoomId: 'far-room', fromSlot: 3, toSlot: 4 };
+    const farRecord: StationRecord = { id: 'far', name: 'FAR', planetId: SOV, orbitSlot: 3, welcomeRoomId: 'far-room' };
+    const t = move.arriveAt + 5;
+    vi.useFakeTimers({ now: t, toFake: ['Date'] });
+    try {
+      bindStationMoveDoc(new Y.Doc());
+      installStationMoveResolver();
+      // This game's room belongs to neither station.
+      expect(rememberMove(move, t)).toBe(true);
+      expect(rememberMove(far, t)).toBe(true);
+      expect(pinSettledArrivals(listStations({}, [farRecord], t), t)).toBe(2);
+      const pins = readRememberedMoves().filter(isPinMove);
+      expect(pins.map((p) => p.welcomeRoomId).sort()).toEqual([move.welcomeRoomId, 'far-room'].sort());
+      expect(pinSettledArrivals(listStations({}, [farRecord], t + 1), t + 1)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('never lets an unknown planet id share a slot with the planet it reads as', () => {
@@ -713,6 +735,26 @@ describe('tugs: a torch tow', () => {
       .toMatchObject({ planetId: SOV, orbitSlot: plan.move.fromSlot });
     // Once is enough.
     expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 3)).toBe(false);
+  });
+
+  it('lets a cancelled tow kept in remembered history release the dock', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+    try {
+      const plan = planStationTow(towCtx(), ARIS);
+      if (!plan.ok) throw new Error(plan.refusal);
+      bindStationMoveDoc(new Y.Doc());
+      writeStationMove(plan.move);
+      expect(towHoldsDock(['tug-room'], NOW + 1)).toBe(true);
+      expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 1)).toBe(true);
+      // The tow stays remembered as history beside its cancel, holding nothing.
+      expect(readRememberedMoves().some((m) => m.mode === 'tug' && !m.settles)).toBe(true);
+      expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
+      // With another room bound, the remembered pair alone lets go too.
+      bindStationMoveDoc(new Y.Doc());
+      expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('lets a move booked at the same time beat a tow that would have flown first', () => {

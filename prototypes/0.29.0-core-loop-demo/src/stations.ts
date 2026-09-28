@@ -196,7 +196,10 @@ export const DEFAULT_STATION_RECORD: StationRecord = {
 const KEY = 'ssf-stations';
 const MAX_RECORDS = 32;
 
-/** Prefix of derived station ids — never accepted on a saved record. */
+/** Prefix of derived station ids — never accepted on a saved record, nor is
+ *  ADRIFT_PREFIX: a location that reads as open orbit is never a station. A
+ *  record saved by hand under it before it was reserved reads as invalid and
+ *  drops; its rooms still list, as the station the atlas derives for them. */
 const DERIVED_PREFIX = 'station:';
 
 /** Length limits on every station id and name, saved or derived. */
@@ -213,7 +216,7 @@ function isRecord(v: unknown): v is StationRecord {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Record<string, unknown>;
   return typeof r.id === 'string' && r.id.length > 0 && r.id.length <= MAX_ID_LENGTH
-    && !r.id.startsWith(DERIVED_PREFIX) && !RESERVED_BODY_IDS.has(r.id)
+    && !r.id.startsWith(DERIVED_PREFIX) && !r.id.startsWith(ADRIFT_PREFIX) && !RESERVED_BODY_IDS.has(r.id)
     && typeof r.name === 'string' && r.name.length > 0 && r.name.length <= MAX_NAME_LENGTH
     && typeof r.planetId === 'string'
     && Number.isInteger(r.orbitSlot) && (r.orbitSlot as number) >= 0 && (r.orbitSlot as number) < MAX_ORBIT_SLOTS
@@ -299,7 +302,7 @@ function clean(r: StationRecord): StationRecord {
 
 /** Save (or replace, by id) a station record on this install. Returns false
  *  for an invalid record, one that would shadow the built-in default, a solar
- *  map body or a derived station id, one whose planet has no free orbit slot
+ *  map body, a derived station id or an open-orbit place (adriftAt), one whose planet has no free orbit slot
  *  left (or would have none for a station already saved), or one whose
  *  welcome room is part of a station already listed. */
 export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {

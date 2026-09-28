@@ -35,6 +35,7 @@ import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './pl
 import type { OrbitTrim } from './stationKeeping';
 import { DEFAULT_PLANET_ID, listStations, readStationRecords, registerStation, setStationMoveResolver } from './stations';
 import type { StationMove, StationRecord } from './stations';
+import { rememberMove } from './stationMove';
 
 // Each "install" is its own localStorage.
 let store = new Map<string, string>();
@@ -362,7 +363,7 @@ describe('learned stations', () => {
     expect(readStationRecords().map((r) => r.id)).toEqual(['mine']);
   });
 
-  it('place a moved station by its move, wherever its record was first stamped', () => {
+  it('places a moved station by its move, wherever its record was first stamped', () => {
     const move: StationMove = {
       stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
       departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
@@ -436,6 +437,30 @@ describe('sharing through the room doc', () => {
     local = null;
     publishPlanetSummary(Date.now() + 2000);
     expect(seen()).toBeUndefined();
+  });
+
+  it('publishes a remembered move of a station this game is not aboard', () => {
+    registerStation(record());
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install('hab'));
+    expect(readStore().stations['room-hab']?.move).toBeUndefined();
+    // Now aboard a tug elsewhere, which cancels that station's tow.
+    unbindPlanetSummaryForTest();
+    bindPlanetSummaryDoc(docA, install(null));
+    const now = Date.now();
+    const tow: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: now, arriveAt: now + 86_400_000, mode: 'tug', tugRoomId: 'tug', fuel: 10, fuelDrawn: 10, bookedAt: now,
+    };
+    const cancel: StationMove = {
+      ...tow, toPlanetId: SOV, toSlot: 2, departAt: now + 1, arriveAt: now + 2, mode: 'thrusters', tugRoomId: undefined,
+      fuel: 0, fuelDrawn: 0, settles: tow,
+    };
+    expect(rememberMove(tow, now)).toBe(true);
+    expect(rememberMove(cancel, now)).toBe(true);
+    publishPlanetSummary(now + 10);
+    expect(readStore().stations['room-hab']?.move).toMatchObject({ settles: { mode: 'tug' }, toPlanetId: SOV });
+    expect((docA.getMap('stationSummaries').get('room-hab') as StationSummary).move?.settles).toBeDefined();
   });
 
   it('two installs that each saved one place fly the standing record\'s slot', () => {

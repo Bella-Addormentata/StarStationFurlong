@@ -556,8 +556,25 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
 export function towHoldsDock(roomIds: string[], realMs: number): boolean {
   const ids = new Set(roomIds.filter(Boolean));
   if (ids.size === 0) return false;
-  return [...roomStanding(), ...readRememberedMoves()].some((m) =>
+  return knownStanding().some((m) =>
     m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
+}
+
+/** Each station's standing move among everything known here: the bound
+ *  room's and every remembered one, history included. Only a standing move
+ *  flies, so a cancelled or outbid tow kept as history holds no dock.
+ *  Cached like roomStanding. */
+let knownStandingCache: { version: string; moves: StationMove[] } | null = null;
+
+function knownStanding(): StationMove[] {
+  let stored: string | null = null;
+  try { stored = localStorage.getItem(KEY); } catch { /* none stored */ }
+  const version = `${docAlive() ? roomVersion : -1}|${stored ?? ''}`;
+  if (knownStandingCache?.version === version) return knownStandingCache.moves;
+  const all = [...roomStanding(), ...readRememberedMoves()];
+  const moves = standingMoves(all, all);
+  knownStandingCache = { version, moves };
+  return moves;
 }
 
 /**
@@ -682,6 +699,16 @@ export function pinSettledArrival(station: StationRecord | null, realMs: number)
     fuel: 0,
     fuelDrawn: 0,
   });
+}
+
+/** pinSettledArrival for every station this install lists: a long move can
+ *  finish while nobody is aboard that station, and every game that knows it
+ *  settles it, so no install keeps its own bounce outcome for long. Returns
+ *  how many pins it wrote. */
+export function pinSettledArrivals(stations: StationRecord[], realMs: number): number {
+  let wrote = 0;
+  for (const station of stations) if (pinSettledArrival(station, realMs)) wrote++;
+  return wrote;
 }
 
 // ── What the dashboard says ──────────────────────────────────────────────────
