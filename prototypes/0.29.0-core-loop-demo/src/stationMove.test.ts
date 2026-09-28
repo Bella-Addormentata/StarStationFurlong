@@ -16,7 +16,7 @@ import {
 } from './planetSummary';
 import { AU_KM, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import { FUEL_PER_KMS, planRecordHop } from './stationDirectory';
-import { bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
+import { FUEL_METER_MAX, bindShipDoc, fuelDrawDeficit, readFuelLevel, writeFuelLevel } from './shipDoc';
 import { TRIM_FUEL, bindStationKeepingDoc, planTrim, readOrbitTrim, writeTrimBurn } from './stationKeeping';
 import {
   TUG_ACCEL_KMS2,
@@ -1150,6 +1150,19 @@ describe('the move log stays bounded', () => {
     store.clear();
     bindStationMoveDoc(peer);
     expect(readStationMove()).toEqual(mine);
+  });
+
+  it('keeps the meter in range when several writers\' settled totals add past it', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    map.set('moveSettled:1:1', { n: 1, drawn: FUEL_METER_MAX, floor: 0, recent: [] });
+    map.set('moveSettled:2:1', { n: 1, drawn: FUEL_METER_MAX, floor: 0, recent: [] });
+    expect(readMoveFuelDrawn()).toBe(FUEL_METER_MAX);
+    // A move planned on top of it is still well-formed.
+    const plan = planStationMove(ctx({ drawn: readMoveFuelDrawn() }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(isStationMove(plan.move)).toBe(true);
   });
 
   it('takes back a recently pruned move\'s fuel when a rival learned late beats it', () => {
