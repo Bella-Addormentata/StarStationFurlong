@@ -1583,6 +1583,9 @@ async function joinRoomAtEpoch(
   // 🪐 After the ship, trim and door records: the summary publishes the
   // first two at once, and whether this room is a ship (not one bolted into
   // a station) is read from this room's doors, never the last room's.
+  // The station this room belongs to must be known before the summary's
+  // first pull and publish, which pin it (and its planet) against the caps.
+  setStationRoomSource(() => activeBootstrap?.roomId ?? "");
   bindPlanetSummaryDoc(sync.doc, {
     currentStation,
     // The fuel its burns drew rides along: between trims whose last burns
