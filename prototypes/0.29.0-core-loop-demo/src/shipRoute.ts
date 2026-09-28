@@ -426,6 +426,17 @@ export function routeWithoutRun(route: ShipRoute): ShipRoute {
 
 export const CHECKPOINT_PREFIX = 'ckpt:';
 
+/** 🏁 `runRoute:<run>`: the route a START started (routeToWire, with its
+ *  run), beside its start entry. The stored `route` is ONE value the merge
+ *  keeps by client id, so of two STARTs at once it may hold the other
+ *  rider's route (see laterRuns). START, pruning and the finish delete other
+ *  runs' copies with their keys. */
+export const RUN_ROUTE_PREFIX = 'runRoute:';
+
+export function runRouteKey(run: number): string {
+  return `${RUN_ROUTE_PREFIX}${run}`;
+}
+
 /** `ckpt:<run>:<legSeq>:<kind>`. */
 export function checkpointKey(run: number, legSeq: number, kind: CheckpointKind): string {
   return `${CHECKPOINT_PREFIX}${run}:${legSeq}:${kind}`;
@@ -530,6 +541,8 @@ interface CheckpointScan {
   keys: Map<RouteCheckpoint, string>;
   /** Keys of other runs (START and pruning delete them). */
   otherRuns: string[];
+  /** 🏁 Other runs' route copies (runRouteKey), deleted with them. */
+  otherRunRoutes: string[];
   /** 🏁 Well-formed start entries of runs later than the one scanned for. */
   laterStarts: Array<{ run: number; entry: StartCheckpoint }>;
 }
@@ -561,11 +574,15 @@ export function capCheckpoints(entries: readonly RouteCheckpoint[], max: number)
 }
 
 function scanCheckpoints(map: Y.Map<unknown>, run: number | null, maxKeys: number, maxVisits: number): CheckpointScan {
-  const out: CheckpointScan = { entries: [], keys: new Map(), otherRuns: [], laterStarts: [] };
+  const out: CheckpointScan = { entries: [], keys: new Map(), otherRuns: [], otherRunRoutes: [], laterStarts: [] };
   let visited = 0;
   const found: RouteCheckpoint[] = [];
   for (const key of map.keys()) {
     if (++visited > maxVisits) break;
+    if (key.startsWith(RUN_ROUTE_PREFIX)) {
+      if (key !== (run !== null ? runRouteKey(run) : null)) out.otherRunRoutes.push(key);
+      continue;
+    }
     if (!key.startsWith(CHECKPOINT_PREFIX)) continue;
     const parsed = parseCheckpointKey(key);
     // An unparseable key may be a newer client's: left alone.
@@ -633,17 +650,26 @@ function runTooFarAhead(route: ShipRoute | null, now: number): boolean {
  * 🏁 Two STARTs at once (two riders' games, before either saw the other's)
  * each write the whole route, and the merge keeps ONE of the two writes by
  * the games' client ids, not by which run is later. Each START's own start
- * entry is a key of its own, so both survive. Every reader here, like every
- * departures board (departuresDoc.departureRouteNewer: the larger run id),
- * takes the LATER run: the stored route with that run's id, starting at the
+ * entry and route copy (runRouteKey) are keys of their own, so both survive.
+ * Every reader here, like every departures board
+ * (departuresDoc.departureRouteNewer: the larger run id), takes the LATER
+ * run: the route its START wrote, whatever route the other rider had saved
+ * (the one that START sent the boards), not stopped. With no such copy (a
+ * build before it) the stored route with that run's id, starting at the
  * stop its start entry names (the stored start stop when it names the same
- * station), not stopped. A STOP or checkpoint then writes it as that run,
- * and the earlier run's keys go at the next prune. A start entry naming no
- * stop of the route is ignored.
+ * station). A STOP or checkpoint then writes it as that run, and the earlier
+ * run's keys go at the next prune. A start entry naming no stop of its route
+ * is ignored.
  */
-function laterRuns(stored: ShipRoute & { startedAt: number }, starts: CheckpointScan['laterStarts']): ShipRoute[] {
+function laterRuns(stored: ShipRoute & { startedAt: number }, starts: CheckpointScan['laterStarts'], map: Y.Map<unknown>): ShipRoute[] {
   const out: ShipRoute[] = [];
   for (const { run, entry } of [...starts].sort((a, b) => b.run - a.run)) {
+    const own = shipRouteFromWire(map.get(runRouteKey(run)));
+    if (own && own.startedAt === run && own.stoppedAt === undefined
+      && own.stops[own.startStop ?? 0]?.stationId === entry.stationId) {
+      out.push(own);
+      continue;
+    }
     const same = stored.startStop !== undefined && stored.stops[stored.startStop]?.stationId === entry.stationId;
     const startStop = same ? stored.startStop! : stored.stops.findIndex((st) => st.stationId === entry.stationId);
     if (startStop >= 0) out.push({ ...routeWithoutRun(stored), startedAt: run, startStop });
@@ -663,7 +689,7 @@ function snapshot(): Snapshot {
     if (isRouteRunning(stored)) {
       const scan = scanCheckpoints(h.map, stored.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED);
       checkpoints.set(stored.startedAt, scan.entries);
-      later = laterRuns(stored, scan.laterStarts);
+      later = laterRuns(stored, scan.laterStarts, h.map);
     }
   }
   snap = {
@@ -754,7 +780,7 @@ function announce(n: RouteWriteNotice): void {
 function pruneIn(map: Y.Map<unknown>, route: ShipRoute & { startedAt: number }, now: number): number {
   const scan = scanCheckpoints(map, route.startedAt, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED);
   let deleted = 0;
-  for (const key of scan.otherRuns) { map.delete(key); deleted++; }
+  for (const key of [...scan.otherRuns, ...scan.otherRunRoutes]) { map.delete(key); deleted++; }
   for (const e of checkpointsToPrune(route, scan.entries, now)) {
     const key = scan.keys.get(e);
     if (key) { map.delete(key); deleted++; }
@@ -849,7 +875,8 @@ export function startShipRoute(o: RouteStartInput): number | null {
   if (!(Number.isInteger(o.startStop) && o.startStop >= 0 && o.startStop < route.stops.length)) return null;
   if (o.pilot === 'robot' && !route.robotDockId) return null;
   if (!Number.isFinite(o.now) || !(o.capacity >= 0)) return null;
-  const old = scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns;
+  const scan = scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED);
+  const old = scan.otherRuns;
   let startedAt = Math.max(1, Math.floor(o.now));
   for (const key of old) {
     const run = parseCheckpointKey(key)?.run ?? 0;
@@ -863,10 +890,12 @@ export function startShipRoute(o: RouteStartInput): number | null {
   h.doc.transact(() => {
     // 1. The level first, while no route runs and its meter reads 0.
     writeFuelLevel(route.homeRefuel ? o.capacity : fuel, o.capacity);
-    // 2. The run, its anchor, and no other run's checkpoints.
+    // 2. The run, its anchor, its own copy of the route (laterRuns), and no
+    // other run's keys.
     h.map.set('route', routeToWire(running));
     h.map.set(checkpointKey(startedAt, 0, 'start'), checkpointToWire(entry));
-    for (const key of old) h.map.delete(key);
+    h.map.set(runRouteKey(startedAt), routeToWire(running));
+    for (const key of [...old, ...scan.otherRunRoutes]) h.map.delete(key);
     touched();
     // 3. The advisory: an older client flies this ship by its stored flight.
     const info = h.doc.getMap('roomInfo');
@@ -942,8 +971,9 @@ export function finishShipRoute(apply?: () => void): boolean {
   const route = readShipRoute();
   if (!h || !isRouteRunning(route)) return false;
   const floor = checkpointKey(route.startedAt, 0, 'start');
-  const keys = scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns
-    .filter((key) => key !== floor);
+  const scan = scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED);
+  // Every run's route copy goes too: with no run on, nothing reads one.
+  const keys = [...scan.otherRuns.filter((key) => key !== floor), ...scan.otherRunRoutes];
   h.doc.transact(() => {
     h.map.set('route', routeToWire(routeWithoutRun(route)));
     for (const key of keys) h.map.delete(key);

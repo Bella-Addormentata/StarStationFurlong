@@ -736,6 +736,36 @@ describe('two games writing one event converge', () => {
     }
   });
 
+  it("two STARTs of different routes at once: every game flies the later START's own route, the one boards were sent", () => {
+    for (const aKept of [true, false]) {
+      const a = new Y.Doc();
+      const b = new Y.Doc();
+      a.clientID = aKept ? 2 : 1;
+      b.clientID = aKept ? 1 : 2;
+      bindShipDoc(a);
+      writeShipRoute(saved());
+      sync(a, b);
+      startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 50, capacity: CAP });
+      // B saves another route (a third stop, another port) and STARTs it
+      // before either game has seen the other's writes.
+      bindShipDoc(b);
+      const other = saved([0, 1, 2], { shipPort: 'y+' });
+      expect(writeShipRoute(other)).toBe(true);
+      startShipRoute({ now: T0 + SEC, startStop: 1, pilot: 'person', fuel: 50, capacity: CAP });
+      sync(a, b);
+      for (const d of [a, b]) {
+        bindShipDoc(d);
+        expect(readShipRoute()).toEqual({ ...other, startedAt: T0 + SEC, startStop: 1 });
+      }
+      // STOP writes it as that run, whole; a finish leaves no run's route copy.
+      bindShipDoc(a);
+      expect(stopShipRoute(T0 + 2 * SEC)).toBe(true);
+      expect(readShipRoute()).toEqual({ ...other, startedAt: T0 + SEC, startStop: 1, stoppedAt: T0 + 2 * SEC });
+      expect(finishShipRoute()).toBe(true);
+      expect([...a.getMap('ship').keys()].filter((k) => k.startsWith('runRoute:'))).toEqual([]);
+    }
+  });
+
   it('a later start entry that names no stop, or sits past RUN_AHEAD_MS, leaves the stored run', () => {
     const { run, route } = started();
     const far = T0 + RUN_AHEAD_MS + 1;
