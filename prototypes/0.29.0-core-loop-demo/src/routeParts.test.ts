@@ -2,7 +2,7 @@
 // aboard (routeParts.lastRoutePartTaken): without a helm nobody could STOP it.
 
 import { describe, expect, it } from 'vitest';
-import { lastRoutePartTaken, tanksLockedByRoute } from './routeParts';
+import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute } from './routeParts';
 import type { FurnitureItem } from './furniture';
 
 const item = (id: string, kind: string): FurnitureItem => ({ id, kind, x: 0, z: 0, rot: 0, movable: true } as unknown as FurnitureItem);
@@ -43,5 +43,20 @@ describe('the tanks while the timetable flies the ship', () => {
     expect(tanksLockedByRoute(ship, ship.filter((i) => i.id !== 'sofa'), true)).toBe(false);
     expect(tanksLockedByRoute(ship, [...ship, item('s2', 'sofa')], true)).toBe(false);
     expect(tanksLockedByRoute(ship, [item('h9', 'helm-console'), item('t8', 'fuel-tank'), item('t9', 'fuel-tank')], true)).toBe(false);
+  });
+});
+
+// 🚪 Copilot (PR 180, 21st review): in flight the route's ship port is
+// unpaired, so edit mode's paired-door refusal let it be removed, and the
+// ferry could then dock nowhere.
+describe('the route’s ship port', () => {
+  it('stays while the route runs (paused included), and only that door', () => {
+    expect(routePortTaken('x-', { shipPort: 'x-', startedAt: 1000 })).toBe(true);
+    expect(routePortTaken('d:7', { shipPort: 'x-', startedAt: 1000 })).toBe(false);
+  });
+
+  it('may go once the route is stopped, or with no route', () => {
+    expect(routePortTaken('x-', { shipPort: 'x-' })).toBe(false);
+    expect(routePortTaken('x-', null)).toBe(false);
   });
 });

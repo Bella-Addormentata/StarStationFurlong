@@ -117,7 +117,7 @@ import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
 // 🚏 …and so do the last helm, engine and fuel tank aboard.
 import { readShipRoute, routeRulesFlightNow } from './shipRoute';
 import { isRouteRunning } from './pilotRoute';
-import { lastRoutePartTaken, tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
+import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2325,6 +2325,18 @@ class RoomEditController {
   private removeSelectedDoor(doorId: string): void {
     const world = this.world;
     if (!world) return;
+    // 🚏 The running route's ship port: the keeper docks through it at every
+    // stop, and in flight it is unpaired, so the check below would let it go.
+    let route: ReturnType<typeof readShipRoute> = null;
+    try {
+      route = readShipRoute();
+    } catch {
+      route = null;
+    }
+    if (routePortTaken(doorId, route)) {
+      showHint("CAN'T REMOVE — the ship's route docks through this door. Stop the route at the helm first.", 3200);
+      return;
+    }
     if (world.dockingSystem?.isDoorPaired(doorId)) {
       showHint('Unpair this door first (open its keypad), then remove it.', 2800);
       return;

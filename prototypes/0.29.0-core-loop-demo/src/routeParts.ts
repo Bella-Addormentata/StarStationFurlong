@@ -3,8 +3,9 @@
  * engine block and fuel tank aboard while the ship's route runs (a paused
  * one included): without a helm nobody could STOP, SKIP or RESUME it (the
  * route keeper would fly on regardless), and without an engine or a tank the
- * module is no ship. And while the timetable flies the ship, its tanks stay
- * as they are (tanksLockedByRoute). Pure; pinned by routeParts.test.ts.
+ * module is no ship. The route's ship port stays too (routePortTaken). And
+ * while the timetable flies the ship, its tanks stay as they are
+ * (tanksLockedByRoute). Pure; pinned by routeParts.test.ts.
  */
 
 import { FURNITURE_DEFS } from './furniture';
@@ -54,4 +55,14 @@ export function tanksLockedByRoute(
   timetableRules: boolean,
 ): boolean {
   return timetableRules && before.filter(isTank).length !== after.filter(isTank).length;
+}
+
+/**
+ * 🚪 Would removing door `doorId` take a running route's ship port (a paused
+ * route included)? The keeper docks and casts off through it at every stop,
+ * and in flight it is unpaired, so edit mode's paired-door refusal would let
+ * it go and leave the ferry nowhere to dock. `route`: the ship's route.
+ */
+export function routePortTaken(doorId: string, route: { shipPort: string; startedAt?: number } | null): boolean {
+  return !!route && route.startedAt !== undefined && route.shipPort === doorId;
 }
