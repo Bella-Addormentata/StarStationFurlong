@@ -153,6 +153,20 @@ describe('speed zones', () => {
     expect(Math.hypot(backing.near!.along, backing.near!.radial)).toBeGreaterThan(HULL_KM);
   });
 
+  it('a long coast still meets the approach zone on the way, not jumping past it', () => {
+    const st = stationAt(2);
+    // On its circle 3000 km behind, closing at 0.2 km/s: it meets the zone
+    // minutes in, long after a fixed-step sampler would give up.
+    const at = st.pointAt(T0);
+    const pose: FreePose = { planetId: SOV, at: T0, radiusKm: at.radiusKm, angle: at.angle - 3000 / at.radiusKm, vAlong: 0.2, vRadial: 0, heading: 0 };
+    const r = coastTo(pose, T0 + 20 * 60_000, [st]);
+    expect(r.changed).toBe(true);
+    expect(r.pose.near?.room).toBe(st.room);
+    const d = Math.hypot(r.pose.near!.along, r.pose.near!.radial);
+    expect(d).toBeGreaterThanOrEqual(HULL_KM - 1e-6);
+    expect(d).toBeLessThanOrEqual(APPROACH_ZONE_KM * 1.1);
+  });
+
   it('coasts the same however often it is sampled', () => {
     const st = stationAt(0);
     const start = poseOff(st, T0, -200, 3, { vAlong: 1 });

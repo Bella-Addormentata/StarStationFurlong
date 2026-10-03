@@ -70,10 +70,12 @@ const MAX_RADIUS_FACTOR = 1.1;
 /** Where UNDOCK leaves the ship: this far behind the station it left, facing
  *  away from it. */
 export const UNDOCK_OFFSET_KM = 0.3;
-/** coastTo samples a coast this often (real ms) to catch a zone boundary. */
+/** coastTo's shortest step (real ms); far from every boundary it steps
+ *  further, never past one (coastStep). */
 const COAST_STEP_MS = 100;
-/** …at most this many times; a longer gap is jumped in one step. */
-const COAST_MAX_STEPS = 600;
+/** A safety net: past this many steps the rest is one jump (a boundary is
+ *  then always far off, since steps only stay short near one). */
+const COAST_MAX_STEPS = 100_000;
 
 // ── Records ──────────────────────────────────────────────────────────────────
 
@@ -393,18 +395,61 @@ export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { 
   return { pose: p, changed };
 }
 
+/** Real ms per orbital second (the orbital clock runs faster). */
+const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
+
+/**
+ * How far (real ms) a coast from `p` may step without passing a zone
+ * boundary: half the time the boundary could at the soonest be met, never
+ * under COAST_STEP_MS. In a station's frame the ship moves in a straight
+ * line at its own speed; in open space the gap to the nearest approach zone
+ * closes at most as fast as the ship and the fastest station move.
+ */
+function coastStep(p: FreePose, ms: number, stations: readonly FreeStation[]): number {
+  const rest = ms - p.at;
+  // Parked: no zone takes it up, so nothing to catch on the way.
+  if (p.parked || rest <= COAST_STEP_MS) return rest;
+  if (p.near) {
+    const speed = speedOf(p);
+    if (speed === 0) return rest;
+    const d = Math.hypot(p.near.along, p.near.radial);
+    const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
+    return onGrid((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S, rest);
+  }
+  const nearest = nearestStation(p, stations);
+  if (!nearest) return rest;
+  const gap = nearest.distanceKm - APPROACH_ZONE_KM;
+  if (gap <= 0) return Math.min(rest, COAST_STEP_MS);
+  // Speeds in km per real ms, from where each is a short step later.
+  const here: OrbitPoint = { radiusKm: p.radiusKm, angle: p.angle };
+  const probe = p.at + COAST_STEP_MS;
+  const ahead = propagate(p, probe, []);
+  const moved = (a: OrbitPoint, b: OrbitPoint) => { const o = offsetFrom(a, b); return Math.hypot(o.along, o.radial); };
+  let fastest = 0;
+  for (const st of stations) fastest = Math.max(fastest, moved(st.pointAt(p.at), st.pointAt(probe)));
+  const closing = (moved(here, ahead) + fastest) / COAST_STEP_MS;
+  if (closing <= 0) return rest;
+  return onGrid((0.5 * gap) / closing, rest);
+}
+
+/** A step cut to whole COAST_STEP_MS (at least one, at most `rest`), so a
+ *  boundary is met at the same moment however a coast is sampled. */
+function onGrid(step: number, rest: number): number {
+  return Math.min(rest, Math.max(1, Math.floor(step / COAST_STEP_MS)) * COAST_STEP_MS);
+}
+
 /**
  * Coast a pose to `ms` with the zone rules applied on the way: the coast is
- * sampled every COAST_STEP_MS (at most COAST_MAX_STEPS times, then the rest
- * is one step), so a ship crossing a zone's edge is slowed there, the same
- * on every client. `changed` when any rule acted.
+ * stepped no further than a zone boundary could be reached (coastStep), so
+ * a ship crossing a zone's edge is slowed there however long the coast, the
+ * same on every client. `changed` when any rule acted.
  */
 export function coastTo(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
   let p = pose;
   let changed = false;
   let steps = 0;
   while (p.at < ms) {
-    const next = steps < COAST_MAX_STEPS ? Math.min(ms, p.at + COAST_STEP_MS) : ms;
+    const next = steps < COAST_MAX_STEPS ? Math.min(ms, p.at + coastStep(p, ms, stations)) : ms;
     steps++;
     const moved = propagate(p, next, stations);
     const zoned = applyZones(moved, stations);

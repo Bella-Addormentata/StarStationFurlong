@@ -2968,7 +2968,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     });
     panel.querySelector<HTMLButtonElement>('#helm-free-stick')?.addEventListener('click', () => {
       if (stickKeysTaken()) letGo();
-      else if (helmIsCommander()) takeStickKeys();
+      else if (helmIsCommander() && isShipReady()) takeStickKeys();
       render();
     });
     panel.querySelector<HTMLButtonElement>('#helm-free-park')?.addEventListener('click', () => {
@@ -4081,7 +4081,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       }
       const now = Date.now();
       if (stickKeysTaken()) {
-        if (!helmIsCommander()) { letGo(); render(); return; }
+        // No longer the commander, or a part it flies by was taken off.
+        if (!helmIsCommander() || !isShipReady()) { letGo(); render(); return; }
         pilotFrame(readStick(), dt, countFunction('fuelTank') * TANK_CAPACITY, now);
       }
       drawFreePanel(now);
