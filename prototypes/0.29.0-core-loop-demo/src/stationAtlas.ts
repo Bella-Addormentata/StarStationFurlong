@@ -252,7 +252,10 @@ export function visibleAtlas(atlas: Record<string, AtlasEntry>): Record<string, 
   const gone = new Set<string>();
   for (const e of Object.values(atlas)) if (e?.dismantledAt !== undefined) gone.add(e.roomId);
   if (gone.size === 0) return atlas;
-  const out: Record<string, AtlasEntry> = {};
+  // No prototype: a room or door id off the wire such as `constructor` or
+  // `__proto__` is an ordinary own key here, never an inherited value read
+  // as its entry, nor a write that swaps the prototype.
+  const out: Record<string, AtlasEntry> = Object.create(null);
   for (const [rid, e] of Object.entries(atlas)) {
     if (gone.has(rid)) continue;
     const doors = Object.entries(e?.doors ?? {});
@@ -260,7 +263,7 @@ export function visibleAtlas(atlas: Record<string, AtlasEntry>): Record<string, 
       out[rid] = e;
       continue;
     }
-    const kept: Record<string, AtlasDoor> = {};
+    const kept: Record<string, AtlasDoor> = Object.create(null);
     for (const [id, d] of doors) if (!d || !gone.has(d.targetRoomId)) kept[id] = d;
     out[rid] = { ...e, doors: kept };
   }

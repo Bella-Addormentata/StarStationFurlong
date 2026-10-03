@@ -10,7 +10,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, isDismantled, noteRoomSeed, pushAtlasToDoc,
-  readAtlas, seedAtlasDefaults, withSharedAtlasOf, MAX_DISMANTLED, MAX_ENTRIES,
+  readAtlas, seedAtlasDefaults, visibleAtlas, withSharedAtlasOf, MAX_DISMANTLED, MAX_ENTRIES,
+  type AtlasEntry,
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobAnnouncement, jobDueAt, jobFraction, jobStatusText,
@@ -536,6 +537,23 @@ describe('a module taken apart', () => {
     // The bundled default station never brings it back.
     expect(seedAtlasDefaults([{ roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } } }])).toBe(0);
     expect(readAtlas()['room-b']).toBeUndefined();
+  });
+
+  it('leaves a room or door named like an Object property an ordinary entry', () => {
+    // As the stored atlas parses: `__proto__` an own key, room and door alike.
+    const atlas = JSON.parse(`{
+      "__proto__": {"roomId": "__proto__", "name": "PROTO", "doors": {"east": {"targetSeed": "", "targetRoomId": "room-y"}}, "lastSeen": 1},
+      "room-y": {"roomId": "room-y", "name": "Y", "doors": {
+        "__proto__": {"targetSeed": "", "targetRoomId": "__proto__"},
+        "south": {"targetSeed": "", "targetRoomId": "room-x"}}, "lastSeen": 1},
+      "room-x": {"roomId": "room-x", "name": "GONE", "doors": {}, "dismantledAt": 5, "lastSeen": 5}
+    }`) as Record<string, AtlasEntry>;
+    const seen = visibleAtlas(atlas);
+    expect(Object.keys(seen).sort()).toEqual(['__proto__', 'room-y']);
+    expect(seen['constructor']).toBeUndefined();
+    expect(Object.keys(seen['room-y'].doors)).toEqual(['__proto__']);
+    expect(seen['room-y'].doors['__proto__'].targetRoomId).toBe('__proto__');
+    expect(atlasComponents(seen).find((c) => c.has('room-y'))?.has('__proto__')).toBe(true);
   });
 
   it('travels through the shared atlas, and older gossip cannot bring it back', () => {
