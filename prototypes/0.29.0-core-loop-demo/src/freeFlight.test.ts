@@ -21,6 +21,8 @@ import {
   isFreePose,
   nearestStation,
   offsetFrom,
+  parkCost,
+  parkPose,
   pointOff,
   propagate,
   readout,
@@ -271,3 +273,57 @@ describe('the record', () => {
     expect(propagate(pose, T0 + realMsFor(60), [st]).near!.along).toBeCloseTo(-14, 9);
   });
 });
+
+describe('🅿️ PARK and passing stations', () => {
+  it('a slow ship a station passes is passed, not picked up and dragged along', () => {
+    const st = stationAt(0);
+    const r = st.pointAt(T0).radiusKm - 30;
+    const start: FreePose = { planetId: SOV, at: T0, radiusKm: r, angle: st.pointAt(T0).angle - 0.01, vAlong: 0, vRadial: 0, heading: 0 };
+    const end = T0 + 60_000;
+    let pose = start;
+    let held = false;
+    for (let ms = T0 + 500; ms <= end; ms += 500) {
+      pose = coastTo(pose, ms, [st]).pose;
+      if (pose.near) held = true;
+    }
+    expect(held).toBe(true); // it did pass through the approach zone
+    expect(pose.near).toBeUndefined();
+    const free = propagate(start, end, []);
+    expect(pose.radiusKm).toBeCloseTo(free.radiusKm, 1);
+    expect(Math.abs(pose.angle - free.angle)).toBeLessThan(3e-4);
+    expect(speedOf(pose)).toBeLessThan(0.005);
+  });
+
+  it('parks dead still for the fuel a brake would take, and holds there', () => {
+    const st = stationAt(0);
+    const moving: FreePose = { ...poseOff(st, T0, -3, 0.5, { vAlong: 0.06, vRadial: -0.08 }), near: { room: st.room, along: -3, radial: 0.5 } };
+    expect(parkCost(moving)).toBeCloseTo(0.1 * 10, 9);
+    const parked = parkPose(moving);
+    expect(parked.parked).toBe(true);
+    expect(speedOf(parked)).toBe(0);
+    expect(isFreePose(parked)).toBe(true);
+    const later = coastTo(parked, T0 + 600_000, [st]);
+    expect(later.changed).toBe(false);
+    expect(later.pose.near).toEqual({ room: st.room, along: -3, radial: 0.5 });
+  });
+
+  it('parked in open space, a station passing close by leaves it where it is', () => {
+    const st = stationAt(0);
+    const r = st.pointAt(T0).radiusKm - 10;
+    const parked = parkPose({ planetId: SOV, at: T0, radiusKm: r, angle: st.pointAt(T0).angle - 0.003, vAlong: 0, vRadial: 0, heading: 0 });
+    const end = T0 + 60_000;
+    const after = coastTo(parked, end, [st]).pose;
+    expect(after.near).toBeUndefined();
+    expect(after.angle).toBeCloseTo(propagate(parked, end, []).angle, 9);
+  });
+
+  it('turning keeps it parked; thrust or brake takes it out', () => {
+    const st = stationAt(4);
+    const parked = parkPose(poseOff(st, T0, -5000, 0));
+    expect(stepPilot(parked, { ...NO_INPUT, yaw: 1 }, T0, 0.1, [st], 10).pose.parked).toBe(true);
+    expect(stepPilot(parked, { ...NO_INPUT, thrust: 1 }, T0, 0.1, [st], 10).pose.parked).toBeUndefined();
+    expect(stepPilot(parked, { ...NO_INPUT, brake: true }, T0, 0.1, [st], 10).pose.parked).toBeUndefined();
+    expect(isFreePose({ ...parked, parked: false })).toBe(false);
+  });
+});
+

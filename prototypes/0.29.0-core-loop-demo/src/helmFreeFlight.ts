@@ -53,7 +53,7 @@ export function freeFigures(r: FreeReadout): Record<string, string> {
 
 /** What a redraw of the panel's buttons depends on (the rest moves in place). */
 export function freePanelKey(r: FreeReadout | null): string {
-  return r ? `${r.zone}|${r.dockAt?.id ?? ''}` : 'none';
+  return r ? `${r.zone}|${r.dockAt?.id ?? ''}|${r.parked}|${Math.ceil(r.parkFuel - 1e-9)}` : 'none';
 }
 
 export interface FreePanelInput {
@@ -63,6 +63,8 @@ export interface FreePanelInput {
   padName: string | null;
   /** A note under AUTO-DOCK (why it could not dock, say). */
   note: string | null;
+  /** Fuel in the tanks (PARK needs parkFuel of it). */
+  fuel: number;
   esc: (s: string) => string;
 }
 
@@ -84,6 +86,16 @@ export function renderFreeFlightPanel(i: FreePanelInput): string {
   const dockLabel = r.dockAt
     ? `AUTO-DOCK AT ${i.esc(r.dockAt.name.toUpperCase())}`
     : `AUTO-DOCK · within ${formatDistance(DOCK_ZONE_KM)} of a station`;
+  // 🅿️ PARK: stop dead and hold a steady orbit here.
+  const parkNeed = Math.ceil(r.parkFuel - 1e-9);
+  const parkOk = i.commander && !r.parked && i.fuel >= parkNeed;
+  const parkLabel = r.parked
+    ? `🅿️ PARKED · ${r.nearest && r.zone !== 'open' ? `holding beside ${i.esc(r.nearest.station.name.toUpperCase())}` : 'steady orbit'}`
+    : `🅿️ PARK${parkNeed > 0 ? ` · ${parkNeed} fuel to stop` : ''}`;
+  const parkBtn = `<button id="helm-free-park"${parkOk ? '' : ' disabled'} style="${btnStyle(parkOk || r.parked, '#CE93D8')} margin-top:8px;">${parkLabel}</button>`;
+  const parkNote = r.parked
+    ? 'Parked: the ship holds this orbit until you thrust again. Turning does not unpark it.'
+    : !i.commander ? '' : i.fuel < parkNeed ? `PARK needs ${parkNeed} fuel to stop the ship; the tanks hold ${Math.floor(i.fuel)}. Brake by hand instead.` : '';
   const legend = i.stickTaken
     ? `<div style="font-size:9px; color:rgba(212,168,75,0.6); margin-top:6px; line-height:1.5;">
         W/S or ↑/↓ thrust · A/D or ←/→ turn · Q/E slide · X or SPACE brake${i.padName ? `<br>🎮 ${i.esc(i.padName.slice(0, 48))}: stick turns and thrusts, button 1 brakes` : ''}
@@ -103,6 +115,8 @@ export function renderFreeFlightPanel(i: FreePanelInput): string {
       </div>
       <div style="margin-top:8px;">${stickBtn}</div>
       ${legend}
+      ${parkBtn}
+      ${parkNote ? `<div style="font-size:9px; color:rgba(212,168,75,0.6); margin-top:6px; line-height:1.5;">${parkNote}</div>` : ''}
       <button id="helm-free-dock"${dockOk ? '' : ' disabled'} style="${btnStyle(dockOk, '#00E676')} margin-top:8px;">${dockLabel}</button>
       ${i.note ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${i.esc(i.note)}</div>` : ''}
       <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:6px; line-height:1.4;">Speed limits: ${formatSpeed(speedCap('approach'))} within ${APPROACH_ZONE_KM} km of a station, ${formatSpeed(speedCap('dock'))} within ${DOCK_ZONE_KM} km. Nothing gets closer than ${Math.round(HULL_KM * 1000)} m.</div>

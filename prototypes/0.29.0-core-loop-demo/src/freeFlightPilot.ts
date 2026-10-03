@@ -217,3 +217,13 @@ export function resetFreeFlightPilot(): void {
   coastCache = null;
   stationCache = null;
 }
+
+/**
+ * A saved or built-in station's own welcome room (not one derived from the
+ * atlas, which is how a free ship's own room is listed): it is the station,
+ * so it does not fly off as a ship. PR 172's stations.isStationRoom says the
+ * same for DEPART once it reaches this branch.
+ */
+export function isStationOwnRoom(room = currentRoomId()): boolean {
+  return !!room && listStations().some((s) => s.welcomeRoomId === room && !s.derived);
+}

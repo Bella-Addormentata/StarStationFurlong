@@ -36,7 +36,7 @@
  * the stick and the live pose).
  */
 
-import { orbitForSlot, orbitalSeconds, toPlanetFrame, wrapAngle } from './orbits';
+import { ORBIT_EPOCH_MS, orbitForSlot, orbitalSeconds, toPlanetFrame, wrapAngle } from './orbits';
 import type { FramePoint, OrbitPoint } from './orbits';
 import { MAX_ORBIT_SLOTS, planetById } from './stations';
 
@@ -96,6 +96,10 @@ export interface FreePose {
    *  welcome room and the ship's offset from it along its orbit and away
    *  from the planet, km. */
   near?: { room: string; along: number; radial: number };
+  /** 🅿️ PARKED: still, in a steady orbit (its own circular one, or held
+   *  beside a station), and kept there: no zone takes it up or slows it
+   *  until the pilot thrusts again. */
+  parked?: true;
 }
 
 /** A station a free-flying ship can meet: where it is at any time. */
@@ -145,6 +149,7 @@ export function isFreePose(v: unknown): v is FreePose {
     if (!finite(n.along) || !finite(n.radial)) return false;
     if (Math.hypot(n.along, n.radial) > APPROACH_ZONE_KM * LEAVE_MARGIN * 2) return false;
   }
+  if (p.parked !== undefined && p.parked !== true) return false;
   return true;
 }
 
@@ -160,6 +165,7 @@ export function cleanPose(p: FreePose): FreePose {
     heading: wrapAngle(p.heading),
   };
   if (p.near) out.near = { room: p.near.room, along: p.near.along, radial: p.near.radial };
+  if (p.parked === true) out.parked = true;
   return out;
 }
 
@@ -288,6 +294,25 @@ export function speedOf(pose: Pick<FreePose, 'vAlong' | 'vRadial'>): number {
   return Math.hypot(pose.vAlong, pose.vRadial);
 }
 
+/** How fast a station turns about the planet at `ms`, radians per orbital
+ *  second (from its own place a moment apart, so trims count). */
+function turnRate(st: FreeStation, ms: number): number {
+  const a = st.pointAt(ms).angle;
+  const b = st.pointAt(ms + 1000).angle;
+  let d = b - a;
+  if (d > Math.PI) d -= 2 * Math.PI;
+  if (d < -Math.PI) d += 2 * Math.PI;
+  return d / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
+}
+/** One real second after the orbital epoch: orbitalSeconds of it is the
+ *  orbital seconds in a real second. */
+const ORBIT_EPOCH_PLUS_1S = ORBIT_EPOCH_MS + 1000;
+
+/** The circular rate at a radius, radians per orbital second. */
+function circularRate(planetId: string, radiusKm: number): number {
+  return Math.sqrt(planetById(planetId).mu / radiusKm ** 3);
+}
+
 /**
  * Apply the zone rules to a pose at its own time: take up (or leave) the
  * nearest station's frame at the approach zone's edge, cap the speed for the
@@ -295,23 +320,36 @@ export function speedOf(pose: Pick<FreePose, 'vAlong' | 'vRadial'>): number {
  * rule did anything (a pilot's game writes the pose then).
  */
 export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
+  // Parked: kept where it is (it is still, so no zone would slow it, and a
+  // station passing by must not pick it up).
+  if (pose.parked) return { pose, changed: false };
   let p = pose;
   let changed = false;
   const nearest = nearestStation(p, stations);
   if (p.near) {
     // Past the zone's edge (with a margin), or its station is gone: back on
     // the ship's own orbit.
-    const held = stations.some((s) => s.room === p.near!.room);
+    const held = stations.find((s) => s.room === p.near!.room);
     if (!held || Math.hypot(p.near.along, p.near.radial) > APPROACH_ZONE_KM * LEAVE_MARGIN) {
       const { near: _gone, ...open } = p;
-      p = open;
+      // Its speed along, from the station's frame to its own orbit's: the
+      // same motion about the planet, told against another circular rate.
+      const vAlong = held
+        ? (turnRate(held, p.at) + p.vAlong / held.pointAt(p.at).radiusKm - circularRate(p.planetId, p.radiusKm)) * p.radiusKm
+        : p.vAlong;
+      p = { ...open, vAlong };
       changed = true;
     }
   }
   if (!p.near && nearest && nearest.distanceKm <= APPROACH_ZONE_KM) {
-    // The ship's offset from the station, in the station's frame.
-    const off = offsetFrom(nearest.station.pointAt(p.at), { radiusKm: p.radiusKm, angle: p.angle });
-    p = { ...p, near: { room: nearest.station.room, along: off.along, radial: off.radial } };
+    // The ship's offset from the station, in the station's frame, and its
+    // speed against the station's (a slow ship a station passes is passed,
+    // not picked up).
+    const st = nearest.station;
+    const here = st.pointAt(p.at);
+    const off = offsetFrom(here, { radiusKm: p.radiusKm, angle: p.angle });
+    const ownRate = circularRate(p.planetId, p.radiusKm) + p.vAlong / p.radiusKm;
+    p = { ...p, vAlong: (ownRate - turnRate(st, p.at)) * here.radiusKm, near: { room: st.room, along: off.along, radial: off.radial } };
     changed = true;
   }
   const distance = p.near ? Math.hypot(p.near.along, p.near.radial) : nearest?.distanceKm ?? null;
@@ -430,8 +468,27 @@ export function stepPilot(
       fuelUsed = cost * k;
     }
   }
+  // Any thrust or brake takes the ship out of PARK (turning in place does not).
+  if (p.parked && (mag > 0 || input.brake)) {
+    const { parked: _off, ...flying } = p;
+    p = flying;
+  }
   const zoned = applyZones(p, stations);
   return { pose: zoned.pose, fuelUsed, zoned: coasted.changed || zoned.changed };
+}
+
+/** What PARK costs: the fuel to stop the ship dead, as a brake would. */
+export function parkCost(pose: Pick<FreePose, 'vAlong' | 'vRadial'>): number {
+  return speedOf(pose) * FREE_FUEL_PER_KMS;
+}
+
+/**
+ * 🅿️ PARK: stop the ship dead where it is (paying parkCost) and keep it
+ * there, in a steady orbit: its own circular orbit in open space, or held
+ * beside the station whose approach zone it is in.
+ */
+export function parkPose(pose: FreePose): FreePose {
+  return { ...pose, vAlong: 0, vRadial: 0, parked: true };
 }
 
 // ── Starting and reading ─────────────────────────────────────────────────────
@@ -459,6 +516,10 @@ export interface FreeReadout {
   nearest: Nearest | null;
   /** The station AUTO-DOCK would dock at, or null. */
   dockAt: FreeStation | null;
+  /** 🅿️ Parked, and where: beside a station (its name) or in open orbit. */
+  parked: boolean;
+  /** Fuel PARK takes now (to stop the ship dead). */
+  parkFuel: number;
 }
 
 export function readout(pose: FreePose, stations: readonly FreeStation[]): FreeReadout {
@@ -470,6 +531,8 @@ export function readout(pose: FreePose, stations: readonly FreeStation[]): FreeR
     altitudeKm: pose.radiusKm - planetById(pose.planetId).radiusKm,
     nearest,
     dockAt: nearest && nearest.distanceKm <= DOCK_ZONE_KM ? nearest.station : null,
+    parked: pose.parked === true,
+    parkFuel: parkCost(pose),
   };
 }
 

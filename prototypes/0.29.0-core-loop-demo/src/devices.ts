@@ -102,9 +102,9 @@ import {
 import type { DockAnswer } from './dockRules';
 // 🕹️ Free flight (issue 203): a person flies the ship by hand and docks with
 // AUTO-DOCK.
-import { readout as freeReadout } from './freeFlight';
+import { parkCost, parkPose, readout as freeReadout } from './freeFlight';
 import {
-  freeStationsAround, pilotFrame, releaseStick, resolvedFreePose, undockPoseFrom, writeFreePose,
+  freeStationsAround, isStationOwnRoom, pilotFrame, releaseStick, resolvedFreePose, undockPoseFrom, writeFreePose,
 } from './freeFlightPilot';
 import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, takeStickKeys } from './freeFlightStick';
 import { drawFreeRadar, freePanelKey, renderFreeFlightPanel, writeFreeFigures } from './helmFreeFlight';
@@ -2679,6 +2679,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 🕹️ UNDOCK & FLY (issue 203): cast off and take the stick.
       const freeBlock = !commander ? 'Only the module\'s COMMANDER may fly it.'
         : !isShipReady() ? 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.'
+          : isStationOwnRoom() ? 'This module is the station itself (its welcome room), so it stays put.'
           : chained.length > 0 ? 'Chained to a permanent connector — take the gangway down first (chained modules cannot fly).'
             : towingNow ? 'Towing a station — the tug stays docked until it arrives.'
               : isRouteRunning(savedRoute) ? 'A ferry route is set to run: STOP it (ROUTE, below) to fly by hand.'
@@ -2772,6 +2773,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         stickTaken: stickKeysTaken(),
         padName: stickPadName(),
         note: freeNote && now < freeNote.until ? freeNote.text : null,
+        fuel,
         esc,
       });
     }
@@ -2967,6 +2969,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#helm-free-stick')?.addEventListener('click', () => {
       if (stickKeysTaken()) letGo();
       else if (helmIsCommander()) takeStickKeys();
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-free-park')?.addEventListener('click', () => {
+      parkHere();
       render();
     });
     panel.querySelector<HTMLButtonElement>('#helm-free-dock')?.addEventListener('click', () => {
@@ -3813,7 +3819,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const capacity = countFunction('fuelTank') * TANK_CAPACITY;
     const flight = readResolvedFlight(nowMs);
     if (flight.status !== 'docked' || isRouteRunning(readShipRoute())) return;
-    if (enumerateChainedDoors().length > 0 || isTowing(currentRoomId(), nowMs)) return;
+    if (enumerateChainedDoors().length > 0 || isTowing(currentRoomId(), nowMs) || isStationOwnRoom()) return;
     if (clampFuelToCapacity(readFuelLevel(capacity), capacity) <= 0) return;
     const fromId = shipLocationId(flight, hasLiveDock());
     const pose = undockPoseFrom(fromId, nowMs);
@@ -3876,6 +3882,29 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     letGo();
     if (!writeFlightRecord({ status: 'redocking', locationId: station.id })) return;
     noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
+  };
+
+  /**
+   * 🅿️ PARK: stop the ship dead where it is, paying the fuel a brake would,
+   * and hold it there in a steady orbit (freeFlight.parkPose) until the
+   * pilot thrusts again. The stick is let go first, so its last pose is the
+   * one parked.
+   */
+  const parkHere = (): void => {
+    if (!helmIsCommander() || readFlightRecord().status !== 'free-flight') return;
+    letGo();
+    const now = Date.now();
+    const pose = resolvedFreePose(now);
+    if (!pose || pose.parked) return;
+    const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+    const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+    const cost = Math.ceil(parkCost(pose) - 1e-9);
+    if (fuel < cost) {
+      flashFree(`PARK needs ${cost} fuel to stop the ship; the tanks hold ${Math.floor(fuel)}.`);
+      return;
+    }
+    if (!writeFreePose(parkPose(pose))) return;
+    if (cost > 0) writeFuelLevel(fuel - cost, capacity);
   };
 
   /** 🕹️ The radar and the moving figures, every frame while flying free; a
