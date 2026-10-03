@@ -138,13 +138,35 @@ export function stationPlan(
       links.push({ doorId, toRoomId: door.targetRoomId, berth: roomBerths?.has(doorId) ?? false });
     }
     // 🗺️ A pairing only the far room recorded (atlasPoses' reverse hop) is a
-    // link here too. Our door is the one its record names (farDoor) when it
-    // names one; otherwise a stand-in id that no door or gate matches.
+    // link here too. Two rooms may share more than one connection, so a far
+    // record is matched to OUR record of the same connection the way
+    // berthDoorIds pairs them: by a farDoor naming the other end, then
+    // unnamed records one for one. Only a far record left unmatched adds a
+    // link — through the door it names, or a stand-in id no door or gate
+    // matches.
     for (const q of poses) {
-      if (q.roomId === p.roomId || links.some((l) => l.toRoomId === q.roomId)) continue;
-      for (const [farId, door] of Object.entries(atlas[q.roomId]?.doors ?? {})) {
-        if (door?.targetRoomId !== p.roomId) continue;
-        const doorId = door.farDoor && !entry?.doors[door.farDoor] ? door.farDoor : `~${q.roomId}:${farId}`;
+      if (q.roomId === p.roomId) continue;
+      const ours = Object.entries(entry?.doors ?? {}).filter(([, d]) => d?.targetRoomId === q.roomId);
+      const theirs = Object.entries(atlas[q.roomId]?.doors ?? {}).filter(([, d]) => d?.targetRoomId === p.roomId);
+      if (theirs.length === 0) continue;
+      const usedOurs = new Set<string>();
+      const unmatched: typeof theirs = [];
+      for (const [farId, far] of theirs) {
+        const named = ours.find(([id, d]) => !usedOurs.has(id) && (id === far.farDoor || d.farDoor === farId));
+        if (named) usedOurs.add(named[0]);
+        else unmatched.push([farId, far]);
+      }
+      for (const [farId, far] of unmatched) {
+        // An unnamed far record pairs with one of our records that names no
+        // far door and was not matched above.
+        const loose = far.farDoor === undefined
+          ? ours.find(([id, d]) => !usedOurs.has(id) && d.farDoor === undefined)
+          : undefined;
+        if (loose) {
+          usedOurs.add(loose[0]);
+          continue;
+        }
+        const doorId = far.farDoor && !entry?.doors[far.farDoor] ? far.farDoor : `~${q.roomId}:${farId}`;
         links.push({ doorId, toRoomId: q.roomId, berth: berths.get(q.roomId)?.has(farId) ?? false });
       }
     }

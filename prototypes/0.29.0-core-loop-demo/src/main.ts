@@ -4105,7 +4105,8 @@ function harvestStationAtlas(): void {
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
     ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
-    ...(ownerId ? { owner: ownerName ? { id: ownerId, name: ownerName } : { id: ownerId } } : {}),
+    // null: this synced room has no verifiable owner (clears a stale one).
+    owner: ownerId ? (ownerName ? { id: ownerId, name: ownerName } : { id: ownerId }) : null,
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).

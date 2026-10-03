@@ -3,7 +3,7 @@
  * docked ships beside their gates, module owners, and the ships at or near
  * the station from the planet's shared summary.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
 import { moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
@@ -139,6 +139,21 @@ describe('the station plan', () => {
     expect(plan.modules[0].links).toEqual([{ doorId: 'east', toRoomId: 'r-bar', berth: false }]);
   });
 
+  it('keeps a second connection only the far room recorded', () => {
+    // Two gangways between the same rooms: the hub recorded one, the bar
+    // alone recorded the other.
+    harvestIntoAtlas({ roomId: 'p-hub', name: 'HUB', doors: [{ doorId: 'east', targetSeed: seed('p-bar'), wall: 'x+', lateral: 0, farDoor: 'west', farWall: 'x-', farLateral: 0, transient: false }] });
+    harvestIntoAtlas({ roomId: 'p-bar', name: 'BAR', doors: [
+      { doorId: 'west', targetSeed: seed('p-hub'), wall: 'x-', lateral: 0, farDoor: 'east', farWall: 'x+', farLateral: 0, transient: false },
+      { doorId: 'd:2', targetSeed: seed('p-hub'), wall: 'x-', lateral: 3, farDoor: 'd:9', farWall: 'x+', farLateral: 3, transient: false },
+    ] });
+    const hub = stationPlan(readAtlas(), 'p-hub').modules[0];
+    expect(hub.links).toEqual([
+      { doorId: 'd:9', toRoomId: 'p-bar', berth: false },
+      { doorId: 'east', toRoomId: 'p-bar', berth: false },
+    ]);
+  });
+
   it('docks a ship whose berth only the ship recorded', () => {
     harvestIntoAtlas({ roomId: 'q-hub', name: 'HUB', doors: [], gates: { south: 4 } });
     harvestIntoAtlas({ roomId: 'q-ship', name: 'SKIFF', doors: [{ doorId: 'north', targetSeed: seed('q-hub'), wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0, transient: true }] });
@@ -192,6 +207,32 @@ describe('a module owner in the atlas', () => {
     station();
     harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [] });
     expect(readAtlas()['room-a'].owner).toEqual({ id: 'p-ada', name: 'Ada' });
+  });
+
+  it('is cleared by a harvest that saw the room ownerless, and that travels', () => {
+    station();
+    const doc = new Y.Doc();
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    // Later, the room's owner is gone (same doors as before).
+    const later = Date.now() + 1000;
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(later);
+    harvestIntoAtlas({
+      roomId: 'room-a', name: 'HUB',
+      doors: [{ doorId: 'east', targetSeed: seed('room-b'), wall: 'x+', lateral: 0, farDoor: 'west', farWall: 'x-', farLateral: 0, transient: false }],
+      owner: null,
+    });
+    expect(readAtlas()['room-a'].owner).toBeNull();
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    expect((doc.getMap('atlas').get('room-a') as { owner?: unknown }).owner).toBeNull();
+    // A peer that knew the old owner drops it on the ownerless record.
+    store.clear();
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [], owner: { id: 'p-ada' } });
+    const mine = readAtlas();
+    mine['room-a'].lastSeen = 0;
+    store.set('ssf-station-atlas', JSON.stringify(mine));
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-a'].owner).toBeNull();
+    clock.mockRestore();
   });
 
   it('travels through the shared atlas to a client that never stood there', () => {

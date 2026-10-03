@@ -92,8 +92,10 @@ export interface AtlasEntry {
   /** 🗺️ Who owns the module (roomInfo.owner) and the name they go by there,
    *  read while standing in it (#192: the holotable's station atlas shows a
    *  module's owner). Public like the room's name; the name is the players
-   *  map's display name, peer-written and unverified, so it is a label only. */
-  owner?: AtlasOwner;
+   *  map's display name, peer-written and unverified, so it is a label only.
+   *  null: known to have no verifiable owner (none set, or the legacy
+   *  marker); absent: not known. */
+  owner?: AtlasOwner | null;
   /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
    *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
    *  ranking that decides what the player KEEPS or SEES must not read it:
@@ -133,6 +135,12 @@ export function cleanAtlasOwner(v: unknown): AtlasOwner | undefined {
   if (typeof o.id !== 'string' || !o.id || o.id.length > MAX_OWNER_ID) return undefined;
   const name = typeof o.name === 'string' && o.name && o.name.length <= MAX_OWNER_NAME ? o.name : undefined;
   return name ? { id: o.id, name } : { id: o.id };
+}
+
+/** A peer-written owner field: null (known ownerless) passes as null, a
+ *  sane owner as itself, anything else as undefined (unknown). */
+function ownerOf(v: unknown): AtlasOwner | null | undefined {
+  return v === null ? null : cleanAtlasOwner(v);
 }
 
 const KEY = 'ssf-station-atlas';
@@ -318,8 +326,9 @@ export function harvestIntoAtlas(entry: {
   gates?: Record<string, number>;
   /** ⚓🚦 Non-open gate access by door id (doorPolicy readGateAccess). */
   gateAccess?: Record<string, AtlasGateAccess>;
-  /** 🗺️ The room's owner (roomInfo.owner) and their display name. */
-  owner?: AtlasOwner;
+  /** 🗺️ The room's owner (roomInfo.owner) and their display name; null
+   *  when the synced room has no verifiable owner; absent when unread. */
+  owner?: AtlasOwner | null;
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
@@ -358,7 +367,8 @@ export function harvestIntoAtlas(entry: {
       : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
     // 🗺️ A harvest that could not read the owner (not synced yet) keeps the
     // one we knew, like dims.
-    ...((cleanAtlasOwner(entry.owner) ?? prior?.owner) ? { owner: cleanAtlasOwner(entry.owner) ?? prior!.owner } : {}),
+    // An explicit null (the synced room has no verifiable owner) clears it.
+    ...ownerSpread(ownerOf(entry.owner) !== undefined ? ownerOf(entry.owner) : prior?.owner),
     lastSeen: Date.now(),
     // We are standing in it — the strongest possible local recency signal.
     localSeenAt: Date.now(),
@@ -1152,9 +1162,9 @@ interface SharedAtlasEntry {
   /** ⚓🚦 Non-open gate access (AtlasEntry.gateAccess). Public: a captain
    *  must know which gates admit them. */
   gateAccess?: Record<string, AtlasGateAccess>;
-  /** 🗺️ The module's owner (AtlasEntry.owner). Public: the room doc already
-   *  shows it to anyone inside. */
-  owner?: AtlasOwner;
+  /** 🗺️ The module's owner (AtlasEntry.owner), null when known ownerless.
+   *  Public: the room doc already shows it to anyone inside. */
+  owner?: AtlasOwner | null;
   /** The dial-in credential. Rides only while a door that ACTUALLY EXISTS is
    *  set to public passage — this is the access restriction, and it is
    *  deliberately NOT the same question as "may you see this module". */
@@ -1208,7 +1218,12 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     && (e.gateAccess === undefined || isPlainGates(e.gateAccess))
     // 🗺️ An owner is a small object or absent; a malformed one is refused here
     // rather than half-read (cleanAtlasOwner checks its fields).
-    && (e.owner === undefined || cleanAtlasOwner(e.owner) !== undefined);
+    && (e.owner === undefined || ownerOf(e.owner) !== undefined);
+}
+
+/** `{ owner }` when the owner is known (an owner or null), else nothing. */
+function ownerSpread(owner: AtlasOwner | null | undefined): { owner?: AtlasOwner | null } {
+  return owner !== undefined ? { owner } : {};
 }
 
 /** True once `obj` has more than `limit` own keys — stops counting there, so
@@ -1304,8 +1319,8 @@ function pullSharedAtlas(): void {
         changed = true;
       }
       // 🗺️ Likewise an owner our copy never learned (an older build's harvest).
-      const owner = prior.owner === undefined ? cleanAtlasOwner(value.owner) : undefined;
-      if (owner) {
+      const owner = prior.owner === undefined ? ownerOf(value.owner) : undefined;
+      if (owner !== undefined) {
         prior.owner = owner;
         changed = true;
       }
@@ -1380,7 +1395,8 @@ function pullSharedAtlas(): void {
           : {})
         : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
       // 🗺️ Peer-written and checked; silence keeps what we knew.
-      ...((cleanAtlasOwner(value.owner) ?? prior?.owner) ? { owner: cleanAtlasOwner(value.owner) ?? prior!.owner } : {}),
+      // (null: the publisher saw the room ownerless — that clears ours.)
+      ...ownerSpread(ownerOf(value.owner) !== undefined ? ownerOf(value.owner) : prior?.owner),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
       // Gossip is SECOND-hand and must never mint local recency: stamping it
       // here would let one peer's station sweep outrank every room the player
@@ -1498,9 +1514,7 @@ export function pushAtlasToDoc(): void {
           ? { gateAccess: entry.gateAccess }
           : {}),
         // 🗺️ The owner travels with the layout (the holotable's atlas card).
-        ...((onlyGates ? known!.owner ?? entry.owner : entry.owner)
-          ? { owner: (onlyGates ? known!.owner ?? entry.owner : entry.owner)! }
-          : {}),
+        ...ownerSpread(onlyGates && known!.owner !== undefined ? known!.owner : entry.owner),
         // 🧭 F5 (redo review): MONOTONIC, not just lastSeen. A corrective
         // re-push with the same second's stamp would lose the LWW tie against
         // the poisoned entry it is correcting (pull skips on >=); bumping past
