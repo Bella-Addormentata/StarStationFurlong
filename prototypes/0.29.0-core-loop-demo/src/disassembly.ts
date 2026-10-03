@@ -10,11 +10,14 @@
  * off the station and out of every map.
  *
  * The job lives in the room doc's `robot` map beside the robots' configs
- * (robotDoc.ts), one record per module being taken apart. Its progress is a
- * pure function of the clock: the labor done as of `asOf`, plus the crew
- * working since then. Every change to the crew settles the progress first,
- * so the clock is never read backwards and nothing has to be written while
- * the robots simply work.
+ * (robotDoc.ts), one record per module being taken apart. Its crew is not
+ * stored in it: the crew is every robot whose config is set to the module
+ * and not stopped, so each robot's membership rides on its own config key
+ * and concurrent edits to different robots never overwrite each other. Its
+ * progress is a pure function of the clock: the labor done as of `asOf`,
+ * plus the crew working since then. Every change to the crew settles the
+ * progress first, so the clock is never read backwards and nothing has to
+ * be written while the robots simply work.
  *
  * Pure: no DOM, no docs. Pinned by disassembly.test.ts.
  */
@@ -55,18 +58,24 @@ export interface DisassemblyTarget {
   laborHours: number;
 }
 
-export interface DisassemblyJob extends DisassemblyTarget {
+/** A job as the room doc stores it. */
+export interface DisassemblyJobRecord extends DisassemblyTarget {
   startedAt: number;
   /** Labor done as of `asOf`, in real ms of one robot's work. */
   doneMs: number;
   asOf: number;
-  /** The charging docks whose robots work on it now. */
-  crew: string[];
   /** When the labor ran out and the job ended (absent: still open). */
   finishedAt?: number;
   /** removed: the module came off the station. detached: it was no longer
    *  joined to this room when the labor ran out, so nothing was removed. */
   outcome?: 'removed' | 'detached';
+}
+
+/** A job as read: its record, and its crew, the charging docks whose robots
+ *  are set to the module and not stopped (robotDoc.ts reads it from their
+ *  configs, sorted, at most MAX_CREW). */
+export interface DisassemblyJob extends DisassemblyJobRecord {
+  crew: string[];
 }
 
 /** Labor hours to take apart a module of this size. */
@@ -83,19 +92,21 @@ export function laborMsFor(hours: number): number {
 const isStr = (v: unknown, max: number): v is string => typeof v === 'string' && v.length > 0 && v.length <= max;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 
-/** Shape guard: a job crosses the room-doc trust boundary (peer writes). */
-export function isDisassemblyJob(v: unknown): v is DisassemblyJob {
+/** Shape guard: a job record crosses the room-doc trust boundary (peer
+ *  writes). Its labor can't be more than a full crew could have done since
+ *  it started, nor more than the job takes. */
+export function isDisassemblyJobRecord(v: unknown): v is DisassemblyJobRecord {
   if (typeof v !== 'object' || v === null) return false;
-  const j = v as Partial<DisassemblyJob>;
+  const j = v as Partial<DisassemblyJobRecord>;
   return isStr(j.roomId, MAX_ID)
     && typeof j.name === 'string' && j.name.length <= MAX_NAME
     && isStr(j.doorId, MAX_DOOR_ID)
     && typeof j.laborHours === 'number' && Number.isFinite(j.laborHours)
     && j.laborHours > 0 && j.laborHours <= MAX_LABOR_HOURS
     && isTime(j.startedAt) && isTime(j.doneMs) && isTime(j.asOf)
-    && Array.isArray(j.crew) && j.crew.length <= MAX_CREW
-    && j.crew.every((d) => isStr(d, MAX_ID))
-    && new Set(j.crew).size === j.crew.length
+    && j.asOf >= j.startedAt
+    && j.doneMs <= laborMsFor(j.laborHours)
+    && j.doneMs <= MAX_CREW * (j.asOf - j.startedAt)
     && (j.finishedAt === undefined || isTime(j.finishedAt))
     && (j.outcome === undefined || j.outcome === 'removed' || j.outcome === 'detached');
 }
@@ -112,11 +123,13 @@ export function workedMs(job: DisassemblyJob, now: number): number {
   return Math.min(total, job.doneMs + job.crew.length * Math.max(0, now - job.asOf));
 }
 
-/** The job with its progress folded in at `now`, ready for a crew change.
- *  A clock behind `asOf` (another writer's ran ahead) changes nothing. */
-export function settleJob(job: DisassemblyJob, now: number): DisassemblyJob {
-  if (now <= job.asOf) return job;
-  return { ...job, doneMs: workedMs(job, now), asOf: now };
+/** The job's record with its progress folded in at `now`, as worked by its
+ *  crew until then: what a crew change writes first. A clock behind `asOf`
+ *  (another writer's ran ahead) changes nothing. */
+export function settleJob(job: DisassemblyJob, now: number): DisassemblyJobRecord {
+  const { crew: _crew, ...record } = job;
+  if (now <= job.asOf) return record;
+  return { ...record, doneMs: workedMs(job, now), asOf: now };
 }
 
 /** When the labor runs out at the current crew, or null (nobody working, or
@@ -149,7 +162,8 @@ export function jobStatusText(job: DisassemblyJob, now: number, blocked: string 
   const pct = Math.floor(jobFraction(job, now) * 100);
   const left = laborHoursLeft(job, now);
   if (left <= 0) {
-    return blocked ? `Work done, but it can't come off yet: ${blocked}.` : 'Work done; coming off the station.';
+    // The room's owner's game takes it off (world.ts), at once when they are here.
+    return blocked ? `Work done, but it can't come off yet: ${blocked}.` : "Work done; it comes off once the room's owner is here.";
   }
   const hours = `${Math.ceil(left)} labor hour${Math.ceil(left) === 1 ? '' : 's'} left`;
   if (job.crew.length === 0) return `${pct}% · ${hours} · paused, no robot working on it`;
@@ -205,8 +219,11 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
  * Why `roomId` can't come off the station now, or null. Checked when a robot
  * is set to it and again when the labor runs out:
  *  - the station's welcome room stays (the station is known by it);
+ *  - its own doors must be known (the atlas has its layout, seen from inside
+ *    or gossiped): without them, what else it is joined to is unknown;
  *  - only its owner takes a module apart (one with no verified owner may be
- *    taken apart by this room's owner, as the console is owner-only);
+ *    taken apart by this room's owner, as the console is owner-only; one
+ *    this install minted, whose owner the atlas never learned, likewise);
  *  - it must hang only off this room: a module still joined to another, or
  *    with a ship docked at it, would leave that one cut off.
  */
@@ -214,7 +231,8 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   const { atlas } = input;
   if (input.welcomeRoomId && roomId === input.welcomeRoomId) return "it is the station's welcome room";
   const entry = atlas[roomId];
-  const owner = entry?.owner;
+  if (!entry || Object.keys(entry.doors ?? {}).length === 0) return "its layout isn't known yet; step inside it once";
+  const owner = entry.owner;
   if (owner === undefined) {
     if (!input.minted?.(roomId)) return "its owner isn't known yet; step inside it once";
   } else if (owner !== null && !legacyOwnerMarker(owner.id) && owner.id !== input.playerId) {
@@ -224,7 +242,7 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   // record pointing at it, berths included.
   const berths = berthDoorIds(atlas);
   const nameOf = (rid: string) => atlas[rid]?.name || 'another module';
-  for (const [doorId, door] of Object.entries(entry?.doors ?? {})) {
+  for (const [doorId, door] of Object.entries(entry.doors)) {
     const other = door?.targetRoomId;
     if (!other || other === input.hereRoomId || other === roomId) continue;
     return berths.get(roomId)?.has(doorId) ? 'a ship is docked at it' : `it is still joined to ${nameOf(other)}`;

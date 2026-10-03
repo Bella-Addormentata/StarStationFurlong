@@ -14,8 +14,8 @@
  */
 
 import * as Y from 'yjs';
-import type { DisassemblyJob, DisassemblyTarget } from './disassembly';
-import { MAX_CREW, isDisassemblyJob, settleJob } from './disassembly';
+import type { DisassemblyJob, DisassemblyJobRecord, DisassemblyTarget } from './disassembly';
+import { MAX_CREW, isDisassemblyJobRecord, settleJob } from './disassembly';
 
 /** 🚀 'pilot' (robot pilot routes, design §2a): the Ship pilot routine. It holds
  *  no route: it makes the dock's robot ELIGIBLE to be named the ship's robot
@@ -46,7 +46,8 @@ export interface RobotConfig {
    *  resumes the routine. Independent of `routine` so it survives a routine edit. */
   parked?: boolean;
   /** 🔧 'disassemble' (#192): the room id of the module this robot takes
-   *  apart — its job is `job:<target>` in the same map (disassembly.ts).
+   *  apart — its job is `job:<target>` in the same map (disassembly.ts), and
+   *  this config is what puts the robot in that job's crew (unless parked).
    *  Absent: no module picked yet, the robot waits on its dock. */
   target?: string;
 }
@@ -139,9 +140,9 @@ export function readRobotConfig(dockId: string): RobotConfig | null {
 }
 
 /** Owner-only in practice (the programming UI gates on canEditRoom).
- *  🔧 Every config write also keeps the disassembly crews true: a robot
- *  joins or leaves a job's crew as its routine, target or STOP/START says,
- *  with the job's progress settled at `now` first (disassembly.ts). */
+ *  🔧 A robot joins or leaves a disassembly job's crew as its routine,
+ *  target or STOP/START says; every config write settles the progress of
+ *  each job whose crew it changes, at `now` (disassembly.ts). */
 export function writeRobotConfig(dockId: string, config: RobotConfig, now = Date.now()): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
@@ -165,63 +166,89 @@ const MAX_JOBS = 64;
 
 const jobKey = (roomId: string) => `job:${roomId}`;
 
-/** Write (or drop, null) a dock's config and bring every job's crew in line
- *  with it, inside the caller's transaction. A finished job no robot is set
- *  to any more is dropped; an open one stays, its progress kept for later. */
-function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | null, now: number): void {
-  const wantTarget = config?.routine === 'disassemble' && config.parked !== true ? config.target : undefined;
-  for (const job of jobsIn(map)) {
-    if (job.finishedAt !== undefined) continue;
-    const want = job.roomId === wantTarget;
-    if (want === job.crew.includes(dockId)) continue;
-    // A full crew takes no one more: the job record would no longer read.
-    if (want && job.crew.length >= MAX_CREW) continue;
-    const settled = settleJob(job, now);
-    const crew = want ? [...settled.crew, dockId] : settled.crew.filter((d) => d !== dockId);
-    map.set(jobKey(job.roomId), { ...settled, crew });
-  }
-  if (config) map.set(`cfg:${dockId}`, config);
-  else map.delete(`cfg:${dockId}`);
-  const targeted = new Set<string>();
+/** A job's crew: the docks whose configs set their robots to `roomId` and
+ *  not stopped, sorted (the same on every client), at most MAX_CREW. Each
+ *  robot's membership lives in its own config key, so two robots edited at
+ *  once never overwrite each other's (a crew stored in the job record
+ *  would be one value, and Yjs keeps one of two concurrent writes). */
+function crewIn(map: Y.Map<unknown>, roomId: string): string[] {
+  const crew: string[] = [];
   for (const [key, value] of map.entries()) {
-    if (key.startsWith('cfg:') && isRobotConfig(value) && value.routine === 'disassemble' && value.target) targeted.add(value.target);
+    if (!key.startsWith('cfg:') || !isRobotConfig(value)) continue;
+    if (value.routine === 'disassemble' && value.target === roomId && value.parked !== true) crew.push(key.slice(4));
   }
-  for (const job of jobsIn(map)) {
-    if (job.finishedAt !== undefined && !targeted.has(job.roomId)) map.delete(jobKey(job.roomId));
-  }
+  return crew.sort().slice(0, MAX_CREW);
 }
 
-function jobsIn(map: Y.Map<unknown>): DisassemblyJob[] {
-  const out: DisassemblyJob[] = [];
+function recordsIn(map: Y.Map<unknown>): DisassemblyJobRecord[] {
+  const out: DisassemblyJobRecord[] = [];
   for (const [key, value] of map.entries()) {
     if (out.length >= MAX_JOBS) break;
-    if (!key.startsWith('job:') || !isDisassemblyJob(value) || jobKey(value.roomId) !== key) continue;
+    if (!key.startsWith('job:') || !isDisassemblyJobRecord(value) || jobKey(value.roomId) !== key) continue;
     out.push(value);
   }
   return out;
 }
 
-/** Every disassembly job in this room, open or finished. */
+/** A stored record as a job, its crew read from the configs (none once it
+ *  has ended: the robots set to it are back on their docks). */
+function withCrew(map: Y.Map<unknown>, record: DisassemblyJobRecord): DisassemblyJob {
+  return { ...record, crew: record.finishedAt !== undefined ? [] : crewIn(map, record.roomId) };
+}
+
+function readJobIn(map: Y.Map<unknown>, roomId: string): DisassemblyJob | null {
+  const v = map.get(jobKey(roomId));
+  return isDisassemblyJobRecord(v) && v.roomId === roomId ? withCrew(map, v) : null;
+}
+
+/** Write (or drop, null) a dock's config inside the caller's transaction.
+ *  Each open job whose crew that changes is settled at `now` with the crew
+ *  it had, so the labor so far is kept. A finished job no robot is set to
+ *  any more is dropped; an open one stays, its progress kept for later. */
+function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | null, now: number): void {
+  const before = recordsIn(map)
+    .filter((r) => r.finishedAt === undefined)
+    .map((r) => withCrew(map, r));
+  if (config) map.set(`cfg:${dockId}`, config);
+  else map.delete(`cfg:${dockId}`);
+  for (const job of before) {
+    const crew = crewIn(map, job.roomId);
+    if (crew.length === job.crew.length && crew.every((d, i) => d === job.crew[i])) continue;
+    map.set(jobKey(job.roomId), settleJob(job, now));
+  }
+  const targeted = new Set<string>();
+  for (const [key, value] of map.entries()) {
+    if (key.startsWith('cfg:') && isRobotConfig(value) && value.routine === 'disassemble' && value.target) targeted.add(value.target);
+  }
+  for (const record of recordsIn(map)) {
+    if (record.finishedAt !== undefined && !targeted.has(record.roomId)) map.delete(jobKey(record.roomId));
+  }
+}
+
+/** Every disassembly job in this room, open or finished, with its crew. */
 export function readDisassemblyJobs(): DisassemblyJob[] {
-  return jobsIn(ensureMap());
+  const map = ensureMap();
+  return recordsIn(map).map((r) => withCrew(map, r));
 }
 
-/** The job on one module, or null. */
+/** The job on one module, with its crew, or null. */
 export function readDisassemblyJob(roomId: string): DisassemblyJob | null {
-  const v = ensureMap().get(jobKey(roomId));
-  return isDisassemblyJob(v) && v.roomId === roomId ? v : null;
+  return readJobIn(ensureMap(), roomId);
 }
 
-/** 🔧 Set a dock's robot to take `target` apart: the job is opened if it
- *  has none (or only a finished one), and the robot joins its crew unless it
- *  is parked. Its script and STOP/START state are kept. */
+/** 🔧 Set a dock's robot to take `target` apart. The job is opened if it has
+ *  none (or only a finished one); an open one costed below `target`'s labor
+ *  is raised to it (raiseJobLaborIn). The robot joins its crew unless it is
+ *  parked. Its script and STOP/START state are kept. */
 export function assignDisassembly(dockId: string, target: DisassemblyTarget, now = Date.now()): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
-    const open = readDisassemblyJob(target.roomId);
+    const open = readJobIn(map, target.roomId);
     if (!open || open.finishedAt !== undefined) {
-      const job: DisassemblyJob = { ...target, startedAt: now, doneMs: 0, asOf: now, crew: [] };
+      const job: DisassemblyJobRecord = { ...target, startedAt: now, doneMs: 0, asOf: now };
       map.set(jobKey(target.roomId), job);
+    } else {
+      raiseJobLaborIn(map, open, target.laborHours, now);
     }
     const c = readRobotConfig(dockId);
     setConfigIn(map, dockId, {
@@ -233,16 +260,35 @@ export function assignDisassembly(dockId: string, target: DisassemblyTarget, now
   });
 }
 
+/** The module needs more labor than its open job was costed at: the labor
+ *  is worked out by whoever sets a robot to it or ends it, from the
+ *  module's size, so a record costed below it (the module was enlarged
+ *  since, or the record was written short) is raised. The work done so far
+ *  is settled at `now` and stands; the rest is still to do. Never lowered. */
+function raiseJobLaborIn(map: Y.Map<unknown>, job: DisassemblyJob, laborHours: number, now: number): void {
+  if (job.finishedAt !== undefined || job.laborHours >= laborHours) return;
+  map.set(jobKey(job.roomId), { ...settleJob(job, now), laborHours });
+}
+
+/** 🔧 Raise an open job to the module's labor (raiseJobLaborIn). */
+export function raiseDisassemblyLabor(roomId: string, laborHours: number, now = Date.now()): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    const job = readJobIn(map, roomId);
+    if (job) raiseJobLaborIn(map, job, laborHours, now);
+  });
+}
+
 /** 🔧 End a job: its labor is done at `at` (the due time, the same on every
  *  client) and the module either came off the station or had already been
- *  disconnected. Its crew goes back to their docks. */
+ *  disconnected. Its crew goes back to their docks (their configs still
+ *  point at it, so the console can say how it ended). */
 export function finishDisassemblyJob(roomId: string, at: number, outcome: 'removed' | 'detached'): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
-    const job = readDisassemblyJob(roomId);
+    const job = readJobIn(map, roomId);
     if (!job || job.finishedAt !== undefined) return;
-    const done = settleJob(job, at);
-    map.set(jobKey(roomId), { ...done, crew: [], finishedAt: at, outcome });
+    map.set(jobKey(roomId), { ...settleJob(job, at), finishedAt: at, outcome });
   });
 }
 

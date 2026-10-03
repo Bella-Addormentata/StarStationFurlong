@@ -152,6 +152,11 @@ function ownerOf(v: unknown): AtlasOwner | null | undefined {
 
 const KEY = 'ssf-station-atlas';
 export const MAX_ENTRIES = 64;
+/** 🔧 Tombstones of modules taken apart (AtlasEntry.dismantledAt) kept
+ *  besides the MAX_ENTRIES rooms, in their own pool: visiting new rooms must
+ *  never evict the record that keeps a module gone, or older gossip would
+ *  bring it back. Small, doorless records. */
+export const MAX_DISMANTLED = 64;
 /** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
  *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
  *  peer-written object that isSharedAtlasEntry does not size-check, and every
@@ -207,6 +212,12 @@ export function roomIdFromSeed(seed: string): string {
  */
 export function readAtlas(): Record<string, AtlasEntry> {
   return visibleAtlas(readStoredAtlas());
+}
+
+/** 🔧 True when this install holds `roomId` as taken apart (a tombstone the
+ *  maps never see). */
+export function isDismantled(roomId: string): boolean {
+  return readStoredAtlas()[roomId]?.dismantledAt !== undefined;
 }
 
 /** 🔧 `atlas` without the rooms taken apart or the doors naming them. The
@@ -342,7 +353,15 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     // Legacy entries written before the field existed have no stamp and so land
     // in tier 2, ordered among themselves by `lastSeen` — an upgrade loses the
     // visited/gossip distinction for old entries rather than mis-ranking them.
-    const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
+    //
+    // 🔧 Tombstones (modules taken apart) are kept in a pool of their own,
+    // ranked the same way: they never count against the rooms, and rooms
+    // never push them out.
+    const all = Object.values(atlas);
+    const entries = [
+      ...all.filter((e) => e.dismantledAt === undefined).sort(compareAtlasRecency).slice(0, MAX_ENTRIES),
+      ...all.filter((e) => e.dismantledAt !== undefined).sort(compareAtlasRecency).slice(0, MAX_DISMANTLED),
+    ];
     const out: Record<string, AtlasEntry> = {};
     for (const e of entries) out[e.roomId] = e;
     localStorage.setItem(KEY, JSON.stringify(out));

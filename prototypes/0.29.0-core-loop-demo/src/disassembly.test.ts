@@ -6,17 +6,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, noteRoomSeed, readAtlas,
-  seedAtlasDefaults, withSharedAtlasOf,
+  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, isDismantled, noteRoomSeed, readAtlas,
+  seedAtlasDefaults, withSharedAtlasOf, MAX_ENTRIES,
 } from './stationAtlas';
 import {
-  disassemblyCandidates, doorsJoinedTo, isDisassemblyJob, jobDueAt, jobFraction, jobStatusText,
+  disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobDueAt, jobFraction, jobStatusText,
   laborHoursFor, laborMsFor, removalBlocker, settleJob, workedMs,
-  type CandidateInput, type DisassemblyJob,
+  type CandidateInput, type DisassemblyJob, type DisassemblyJobRecord,
 } from './disassembly';
 import {
-  assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, readDisassemblyJob,
-  readDisassemblyJobs, readRobotConfig, writeRobotConfig,
+  assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, raiseDisassemblyLabor,
+  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, writeRobotConfig,
 } from './robotDoc';
 import type { DoorRecord } from './doorsDoc';
 
@@ -59,13 +59,16 @@ describe('labor on the orbital clock', () => {
     // A second robot from minute 10: the rest goes twice as fast.
     const two = { ...settleJob(j, 10 * MIN), crew: ['d1', 'd2'] };
     expect(two).toMatchObject({ doneMs: 10 * MIN, asOf: 10 * MIN });
+    // What a crew change writes is the record alone: the crew is the configs'.
+    expect('crew' in settleJob(j, 10 * MIN)).toBe(false);
     expect(jobDueAt(two)).toBe(17 * MIN);
     expect(workedMs(two, 12 * MIN)).toBe(14 * MIN);
     // Never past the total.
     expect(workedMs(two, 99 * MIN)).toBe(24 * MIN);
     expect(jobFraction(two, 99 * MIN)).toBe(1);
     // A clock behind the last writer's changes nothing.
-    expect(settleJob(two, 5 * MIN)).toBe(two);
+    const { crew: _crew, ...twoRecord } = two;
+    expect(settleJob(two, 5 * MIN)).toEqual(twoRecord);
     expect(workedMs(two, 5 * MIN)).toBe(10 * MIN);
     // Nobody on it: paused, no due time.
     expect(jobDueAt({ ...two, crew: [] })).toBeNull();
@@ -77,21 +80,30 @@ describe('labor on the orbital clock', () => {
     expect(jobStatusText(job({ crew: ['d1', 'd2'], doneMs: 12 * MIN }), 0)).toBe('50% · 12 labor hours left · 2 robots · about 6 min at this pace');
     expect(jobStatusText(job(), 0)).toContain('paused');
     expect(jobStatusText(job({ crew: ['d1'] }), 30 * MIN, "it is still joined to POOL")).toBe("Work done, but it can't come off yet: it is still joined to POOL.");
+    expect(jobStatusText(job({ crew: ['d1'] }), 30 * MIN)).toBe("Work done; it comes off once the room's owner is here.");
     expect(jobStatusText(job({ finishedAt: 5, outcome: 'removed' }), 0)).toBe('GARDEN was taken apart and is off the station.');
     expect(jobStatusText(job({ finishedAt: 5, outcome: 'detached' }), 0)).toContain('nothing was taken apart');
   });
 
-  it('reads only well-formed jobs from the room doc', () => {
-    expect(isDisassemblyJob(job())).toBe(true);
-    expect(isDisassemblyJob(job({ finishedAt: 3, outcome: 'removed' }))).toBe(true);
-    expect(isDisassemblyJob({ ...job(), crew: ['d1', 'd1'] })).toBe(false);
-    expect(isDisassemblyJob({ ...job(), crew: Array.from({ length: 17 }, (_, i) => `d${i}`) })).toBe(false);
-    expect(isDisassemblyJob({ ...job(), laborHours: 0 })).toBe(false);
-    expect(isDisassemblyJob({ ...job(), laborHours: Infinity })).toBe(false);
-    expect(isDisassemblyJob({ ...job(), doneMs: -1 })).toBe(false);
-    expect(isDisassemblyJob({ ...job(), outcome: 'exploded' })).toBe(false);
-    expect(isDisassemblyJob({ ...job(), name: 'x'.repeat(65) })).toBe(false);
-    expect(isDisassemblyJob(null)).toBe(false);
+  it('reads only well-formed job records from the room doc', () => {
+    const rec = (over: Partial<DisassemblyJobRecord> = {}): DisassemblyJobRecord => ({
+      roomId: 'room-b', name: 'GARDEN', doorId: 'east', laborHours: 24,
+      startedAt: 0, doneMs: 10 * MIN, asOf: 10 * MIN, ...over,
+    });
+    expect(isDisassemblyJobRecord(rec())).toBe(true);
+    expect(isDisassemblyJobRecord(rec({ finishedAt: 3, outcome: 'removed' }))).toBe(true);
+    expect(isDisassemblyJobRecord(rec({ laborHours: 0 }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ laborHours: Infinity }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ doneMs: -1 }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ outcome: 'exploded' as never }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ name: 'x'.repeat(65) }))).toBe(false);
+    expect(isDisassemblyJobRecord(null)).toBe(false);
+    // Labor no crew could have done since it started, or past the job's.
+    expect(isDisassemblyJobRecord(rec({ asOf: 0, doneMs: 1 }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ startedAt: 10 * MIN, asOf: 5 * MIN, doneMs: 0 }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ asOf: 60 * MIN, doneMs: 25 * MIN }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ asOf: 1 * MIN, doneMs: 16 * MIN }))).toBe(true);
+    expect(isDisassemblyJobRecord(rec({ asOf: 1 * MIN, doneMs: 16 * MIN + 1 }))).toBe(false);
   });
 });
 
@@ -148,6 +160,16 @@ describe('what a room can take apart', () => {
   it('keeps the welcome room, and asks to see inside a module whose owner is unknown', () => {
     const doors = hub();
     expect(removalBlocker(input(doors, { welcomeRoomId: 'room-b' }), 'room-b')).toBe("it is the station's welcome room");
+    // A module this install minted but whose layout the atlas doesn't hold
+    // (never learned, or evicted): what else it is joined to is unknown.
+    doors.set('d:shed', pairing('room-s'));
+    const minted = (r: string) => r === 'room-s';
+    expect(removalBlocker(input(doors, { minted }), 'room-s')).toBe("its layout isn't known yet; step inside it once");
+    // A stub (named by a neighbour's door, never seen from inside) is no better.
+    harvestIntoAtlas({ roomId: 'room-z', name: 'ZED', doors: [{ doorId: 'n', targetSeed: seed('room-s') }] });
+    expect(readAtlas()['room-s']?.doors).toEqual({});
+    expect(removalBlocker(input(doors, { minted }), 'room-s')).toBe("its layout isn't known yet; step inside it once");
+    doors.delete('d:shed');
     harvestIntoAtlas({ roomId: 'room-d', name: 'SHED', doors: [{ doorId: 'w', targetSeed: seed('room-a') }] });
     // A harvest without an owner keeps it unknown.
     expect(removalBlocker(input(doors), 'room-d')).toBe("its owner isn't known yet; step inside it once");
@@ -221,7 +243,7 @@ describe('the job in the robot map', () => {
     expect(readDisassemblyJob('room-b')).toMatchObject({ crew: ['d2'], doneMs: 8 * MIN, asOf: 6 * MIN });
     // START puts it back.
     writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b' }, 7 * MIN);
-    expect(readDisassemblyJob('room-b')).toMatchObject({ crew: ['d2', 'd1'], doneMs: 9 * MIN });
+    expect(readDisassemblyJob('room-b')).toMatchObject({ crew: ['d1', 'd2'], doneMs: 9 * MIN });
     // d2 is set to serve drinks, and d1's dock is removed: the work is kept.
     writeRobotConfig('d2', { routine: 'serve' }, 8 * MIN);
     clearRobotConfig('d1', 9 * MIN);
@@ -269,10 +291,53 @@ describe('the job in the robot map', () => {
     expect(readDisassemblyJob('room-b')?.finishedAt).toBeUndefined();
   });
 
-  it('a full crew takes no one more', () => {
-    for (let i = 0; i < 16; i++) assignDisassembly(`d${i}`, target, 0);
-    assignDisassembly('d16', target, 0);
-    expect(readDisassemblyJob('room-b')?.crew).toHaveLength(16);
+  it('a crew counts at most 16 robots', () => {
+    for (let i = 0; i < 17; i++) assignDisassembly(`d${String(i).padStart(2, '0')}`, target, 0);
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(Array.from({ length: 16 }, (_, i) => `d${String(i).padStart(2, '0')}`));
+  });
+
+  it('two robots stopped at once on two clients both leave the crew', () => {
+    const a = new Y.Doc();
+    bindRobotDoc(a);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    // Each client stops one robot at minute 6, before hearing of the other.
+    writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b', parked: true }, 6 * MIN);
+    bindRobotDoc(b);
+    writeRobotConfig('d2', { routine: 'disassemble', target: 'room-b', parked: true }, 6 * MIN);
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const doc of [a, b]) {
+      bindRobotDoc(doc);
+      const j = readDisassemblyJob('room-b')!;
+      // Whichever settlement won, nobody works on it any more: no stale
+      // crew keeps the labor running, and it is never due.
+      expect(j.crew).toEqual([]);
+      expect(jobDueAt(j)).toBeNull();
+      expect(workedMs(j, 60 * MIN)).toBe(workedMs(j, 7 * MIN));
+    }
+  });
+
+  it('raises an open job costed below the module, keeping the work done', () => {
+    assignDisassembly('d1', { ...target, laborHours: 1 }, 0);
+    expect(readDisassemblyJob('room-b')?.laborHours).toBe(1);
+    // The console costs the module from its size: a short record is raised,
+    // its one labor hour done standing and the rest still to do.
+    assignDisassembly('d2', target, 1 * MIN);
+    expect(readDisassemblyJob('room-b')).toMatchObject({
+      laborHours: 24, doneMs: 1 * MIN, asOf: 1 * MIN, startedAt: 0, crew: ['d1', 'd2'],
+    });
+    // The module grew when the end is checked: likewise.
+    raiseDisassemblyLabor('room-b', 36, 5 * MIN);
+    const j = readDisassemblyJob('room-b')!;
+    expect(j).toMatchObject({ laborHours: 36, doneMs: 9 * MIN, asOf: 5 * MIN });
+    expect(jobDueAt(j)).toBe(5 * MIN + 13.5 * MIN);
+    // Never lowered.
+    raiseDisassemblyLabor('room-b', 6, 6 * MIN);
+    assignDisassembly('d3', target, 6 * MIN);
+    expect(readDisassemblyJob('room-b')?.laborHours).toBe(36);
   });
 });
 
@@ -353,5 +418,33 @@ describe('a module taken apart', () => {
     dismantleInAtlas('room-b', 5);
     noteRoomSeed('room-b', 'GARDEN', seed('room-b'));
     expect(readAtlas()['room-b']).toBeUndefined();
+    expect(isDismantled('room-b')).toBe(true);
+    expect(isDismantled('room-a')).toBe(false);
+  });
+
+  it('stays gone however many rooms are visited after', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      hub();
+      now.mockReturnValue(1_000_500);
+      dismantleInAtlas('room-b', 1_000_400);
+      // More first-hand rooms than the atlas keeps.
+      for (let i = 0; i < MAX_ENTRIES + 6; i++) {
+        now.mockReturnValue(1_001_000 + i);
+        harvestIntoAtlas({ roomId: `walk-${i}`, name: `W${i}`, doors: [] });
+      }
+      expect(isDismantled('room-b')).toBe(true);
+      // A room doc still holding GARDEN from before the job ended.
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('room-b', {
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, updatedAt: 1_000_000,
+      });
+      bindStationAtlasDoc(doc, { roomId: 'walk-0', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(withSharedAtlasOf(doc, readAtlas(), 'room-b')['room-b']).toBeUndefined();
+    } finally {
+      now.mockRestore();
+    }
   });
 });

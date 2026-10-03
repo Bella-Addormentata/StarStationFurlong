@@ -43,13 +43,14 @@ import {
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
-import { finishDisassemblyJob, readDisassemblyJobs, readRobotConfig, subscribeRobot } from "./robotDoc";
+import { finishDisassemblyJob, raiseDisassemblyLabor, readDisassemblyJobs, readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 import {
   disassemblyCandidates,
   doorsJoinedTo,
   jobDueAt,
   jobFraction,
+  laborHoursFor,
   removalBlocker,
   type CandidateInput,
   type DisassemblyCandidate,
@@ -102,7 +103,7 @@ import {
 } from "./doorsDoc";
 import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
-import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas } from "./stationAtlas";
+import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
 import { isBoltedIntoStation } from "./stationKeeping";
 import { createStationHelmUI } from "./stationHelm";
@@ -5264,13 +5265,14 @@ export class World {
 
   /**
    * 🔧 The Disassemble robots (#192, disassembly.ts). A job whose labor has
-   * run out ends here, on the first client in the room to see it (each
-   * writes the same thing): the room's doors to the module are sealed as
-   * UNDOCK seals them, the job is marked done, and the module leaves the
-   * atlas for every map. A blocker found then (the module was joined to
-   * another meanwhile) holds it at 100% until it clears. Each robot on an
-   * open job works at that job's door, side by side with its crew; any
-   * other Disassemble robot waits on its dock. Run twice a second.
+   * run out ends here, on the room owner's client while they are in the
+   * room (their two tabs would write the same thing): the room's doors to
+   * the module are sealed as UNDOCK seals them, the job is marked done, and
+   * the module leaves the atlas for every map. A blocker found then (the
+   * module was joined to another meanwhile) holds it at 100% until it
+   * clears. Each robot on an open job works at that job's door, side by
+   * side with its crew; any other Disassemble robot waits on its dock. Run
+   * twice a second.
    */
   private updateDisassembly(): void {
     const now = Date.now();
@@ -5282,9 +5284,12 @@ export class World {
       this.disassemblySaid.clear();
       return;
     }
-    // Only a client standing in the room ends a job: its copy of the doors
-    // and the atlas is the room as it is.
-    if (this.hadActivePlayer) {
+    // Only the owner's client, standing in the room, ends a job. The owner is
+    // who sets robots to a module (the console is owner-only), so the
+    // removal is theirs to carry out; their copy of the doors and the atlas
+    // is the room as it is. (The job record is peer-written, like all of
+    // the room doc: this decides what this client does, roomOwner.ts.)
+    if (this.hadActivePlayer && canEditRoom().ok) {
       let ended = false;
       for (const job of jobs) {
         const due = jobDueAt(job);
@@ -5319,13 +5324,22 @@ export class World {
     }
   }
 
-  /** 🔧 End a job whose labor ran out at `due`. True when it ended. */
+  /** 🔧 End a job whose labor ran out at `due`. True when the job changed. */
   private finishDisassembly(job: DisassemblyJob, due: number): boolean {
     const input = this.disassemblyInput();
     const joined = doorsJoinedTo(input, job.roomId);
     if (joined.length === 0) {
-      // Disconnected some other way first: nothing here to take off.
-      finishDisassemblyJob(job.roomId, due, "detached");
+      // Disconnected some other way first: nothing here to take off. (Or it
+      // already came off, and a write that crossed the end reopened the job.)
+      finishDisassemblyJob(job.roomId, due, isDismantled(job.roomId) ? "removed" : "detached");
+      return true;
+    }
+    // The labor is worked out here, from the module's size, not taken from
+    // the record: a job costed below it (the module grew, or the record was
+    // written short) is raised to it and carries on.
+    const labor = laborHoursFor(input.atlas[job.roomId]?.dims);
+    if (job.laborHours < labor) {
+      raiseDisassemblyLabor(job.roomId, labor);
       return true;
     }
     if (removalBlocker(input, job.roomId)) return false;
