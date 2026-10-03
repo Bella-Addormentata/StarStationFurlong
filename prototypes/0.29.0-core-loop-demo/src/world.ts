@@ -174,7 +174,7 @@ import {
   type PartyDeviceDeps,
 } from "./partyUI";
 import { getIdentityPub } from "./keypair";
-import { getPlayerName } from "./identity";
+import { getPlayerId, getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
@@ -5589,6 +5589,15 @@ export class World {
       // M4: the solar map, diegetic — mounted inside the focus overlay.
       const ui = createMapTableUI({
         requestRelease: () => deviceFocus.release(),
+        // 🗺️ #192: the station atlas edits through the room's own door panels.
+        currentDoors: () =>
+          [...(this.dockingSystem?.getDoorGroups().keys() ?? [])].map((id) => ({
+            id,
+            label: doorDisplayName(id),
+          })),
+        openDoorPanel: (doorId) =>
+          deviceFocus.releaseThen(() => this.dockingSystem?.handlePanelRaycast(doorId)),
+        playerId: () => getPlayerId(),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

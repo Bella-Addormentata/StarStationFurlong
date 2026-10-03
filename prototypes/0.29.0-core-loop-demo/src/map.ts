@@ -150,6 +150,7 @@ export class SolarSystemMap {
   
   // Callbacks
   private onTravelCompleteCallback: ((destinationId: string) => void) | null = null;
+  private onStationAtlasCallback: ((stationId: string) => void) | null = null;
 
   constructor() {
     this.initializeBodies();
@@ -336,6 +337,9 @@ export class SolarSystemMap {
             <div id="map-selected-resources-list" style="font-size: 11px; display:flex; flex-direction:column; gap:3px;"></div>
           </div>
           
+          <!-- 🗺️ #192: a station's layout from its atlas -->
+          <button id="map-atlas-btn" style="display:none; width: 100%; border-radius: 8px; border: 1px solid rgba(212,168,75,0.5); background: rgba(212,168,75,0.10); color: #F0C060; font-weight: bold; padding: 10px; cursor: pointer; text-transform: uppercase; font-size:11px;">🗺 View station atlas</button>
+
           <!-- Launch Travel Trigger -->
           <button id="map-travel-btn" style="width: 100%; border-radius: 8px; border: 1px solid #1e88e5; background: rgba(30,136,229,0.15); color: #90caf9; font-weight: bold; padding: 10px; cursor: pointer; text-transform: uppercase; font-size:11px; transition: background 0.2s;">Initiate Travel</button>
         </div>
@@ -403,6 +407,14 @@ export class SolarSystemMap {
     const closeBtn = document.getElementById('solarmap-close-btn');
     if (closeBtn) {
       closeBtn.addEventListener('click', () => this.hide());
+    }
+
+    // 🗺️ Station atlas button (#192): the holotable opens the station plan.
+    const atlasBtn = document.getElementById('map-atlas-btn');
+    if (atlasBtn) {
+      atlasBtn.addEventListener('click', () => {
+        if (this.selectedBody?.type === 'station') this.onStationAtlasCallback?.(this.selectedBody.id);
+      });
     }
 
     // Travel Button trigger
@@ -526,6 +538,9 @@ export class SolarSystemMap {
       } else {
         resBox.style.display = 'none';
       }
+
+      const atlasBtn = document.getElementById('map-atlas-btn');
+      if (atlasBtn) atlasBtn.style.display = body.type === 'station' && this.onStationAtlasCallback ? 'block' : 'none';
 
       // Configure Travel actions
       if (body.id === this.playerLocationId) {
@@ -819,6 +834,11 @@ export class SolarSystemMap {
     if (this.container) {
       this.container.style.display = 'none';
     }
+  }
+
+  /** 🗺️ #192: called with a station's id when VIEW STATION ATLAS is pressed. */
+  public onStationAtlas(cb: (stationId: string) => void) {
+    this.onStationAtlasCallback = cb;
   }
 
   public onTravelComplete(cb: (destinationId: string) => void) {

@@ -2622,6 +2622,8 @@ async function joinRoomAtEpoch(
     // 🪐 A ship's shared summary carries the room's name: one that syncs in
     // (or is changed) replaces the "SHIP" stand-in now, not at the heartbeat.
     if (_event.keysChanged.has("name")) publishPlanetSummary();
+    // 🗺️ #192: the atlas carries the room's name and owner to the holotable.
+    if (_event.keysChanged.has("name") || _event.keysChanged.has("owner")) harvestStationAtlas();
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some
@@ -2651,6 +2653,10 @@ async function joinRoomAtEpoch(
     // 🏦 The owner's identity key lives in THIS map (players[owner].keyB64)
     // and can land after roomInfo — the OWNER UNKNOWN → OWNER-SIGNED flip.
     queueTreasuryRepaint();
+    // 🗺️ #192: the owner's display name rides into the atlas once their
+    // entry lands or changes (only theirs: the rest of the roster is noise).
+    const owner = sync.doc.getMap("roomInfo").get("owner");
+    if (typeof owner === "string" && owner && _event.keysChanged.has(owner)) harvestStationAtlas();
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -4087,9 +4093,17 @@ function harvestStationAtlas(): void {
   }
   const gatesKnown = readUnnumberedPorts().length === 0;
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
+  // 🗺️ #192: the module's owner, for the holotable's station atlas — with
+  // the name they go by here when their players entry has synced.
+  const ownerId = (sync.doc.getMap("roomInfo").get("owner") as string | undefined) || "";
+  const ownerEntry = ownerId
+    ? (sync.doc.getMap("players").get(ownerId) as Partial<PlayerEntry> | undefined)
+    : undefined;
+  const ownerName = typeof ownerEntry?.name === "string" && ownerEntry.name ? ownerEntry.name : undefined;
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
     ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
+    ...(ownerId ? { owner: ownerName ? { id: ownerId, name: ownerName } : { id: ownerId } } : {}),
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
