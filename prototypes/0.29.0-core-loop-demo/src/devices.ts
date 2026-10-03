@@ -48,7 +48,7 @@ import {
   type FlightRecord,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { adriftPlace, destinationsFrom, isKnownStation, planHop, stationHere, type HopPlan } from './stationDirectory';
+import { adriftPlace, destinationsFrom, flightCapable, isKnownStation, planHop, stationHere, type HopPlan } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
 import {
   TUG_MIN_ENGINES,
@@ -2000,7 +2000,7 @@ const HELM_TICK_MS = 250;
  *  (docks are not station structure), so a ship reads its live dock partner
  *  first, then where its last flight left it; in flight it is at none. */
 function holotableStation(): StationRecord | null {
-  if (!isShipReady()) return currentStation();
+  if (!flightCapable(isShipReady())) return currentStation();
   const flight = readFlightRecord();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
@@ -2206,7 +2206,7 @@ function departureNow(fromId: string, destId: string): { hop: HopPlan; fuel: num
   const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
   const hop = destId ? planHop(fromId, destId, Date.now()) : null;
   const refusal = canDepart({
-    flightCapable: isShipReady(),
+    flightCapable: flightCapable(isShipReady()),
     currentStatus: readFlightRecord().status,
     currentFuel: fuel,
     destinationId: destId,
@@ -2314,7 +2314,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // still be to come), when it lands, and what it burns.
     const hop = pickerDestId ? planHop(location.id, pickerDestId, now) : null;
     const refusal = canDepart({
-      flightCapable: isShipReady(),
+      flightCapable: flightCapable(isShipReady()),
       currentStatus: flight.status,
       currentFuel: fuel,
       destinationId: pickerDestId ?? '',

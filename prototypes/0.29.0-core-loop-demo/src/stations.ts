@@ -871,6 +871,23 @@ export function dockedStationFor(
   return null;
 }
 
+/** Is `roomId` a station's own room, never a ship that flies: a saved or
+ *  built-in station's welcome room, or a module bolted into a station by
+ *  structure (a paired door that is no berth). Such a room may wear engine,
+ *  tank and helm for station keeping. */
+export function isStationRoom(
+  roomId: string,
+  doors: Iterable<DoorRecord>,
+  stations: StationRecord[] = listStations(),
+): boolean {
+  if (!roomId) return false;
+  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) return true;
+  for (const rec of doors) {
+    if (rec.paired === true && !isBerthDoor(rec)) return true;
+  }
+  return false;
+}
+
 /** The planet a room's station orbits — the default planet when unknown. */
 /** Where a ship that missed a departed station waits: open orbit at the
  *  planet and slot that station left (`adrift:<planetId>:<slot>`). A place,

@@ -4,7 +4,7 @@
 // near-side writes as docking.ts's UNDOCK / DOCK.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { listStations, planetById, setStationMoveResolver } from './stations';
+import { listStations, planetById, setStationMoveResolver, setStationRoomSource } from './stations';
 import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, writeStationMove, type StationMove } from './stationMove';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
@@ -161,15 +161,34 @@ describe('planArrivalDock', () => {
   it('skips a remembered port that is busy and takes the next open one', () => {
     const plan = planArrivalDock({
       station: {},
-      remembered: { doorId: 'north', address: SEED_FURLONG },
+      remembered: { doorId: 'north', address: SEED_FURLONG, farDoor: 'south' },
       ports: [{ doorId: 'north', state: dockedTo(SEED_HIGH) }, { doorId: 'east', state: FREE }],
     });
     expect(plan).toMatchObject({ kind: 'dock', doorId: 'east' });
   });
 
-  it('refuses with no open port, and does nothing when already docked there', () => {
+  it('never plans a dock to a berth that names no far door, which the station would never answer', () => {
+    expect(planArrivalDock({
+      station: {},
+      remembered: { doorId: 'north', address: SEED_FURLONG },
+      ports: [{ doorId: 'north', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'no-berth' });
     expect(planArrivalDock({
       station: { berth: { address: SEED_FURLONG } },
+      remembered: null,
+      ports: [{ doorId: 'north', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'no-berth' });
+    // Already docked in that room counts all the same.
+    expect(planArrivalDock({
+      station: {},
+      remembered: { doorId: 'north', address: SEED_FURLONG },
+      ports: [{ doorId: 'north', state: dockedTo(SEED_FURLONG) }],
+    })).toEqual({ kind: 'none', reason: 'already-docked' });
+  });
+
+  it('refuses with no open port, and does nothing when already docked there', () => {
+    expect(planArrivalDock({
+      station: { berth: { address: SEED_FURLONG, farDoor: 'south' } },
       remembered: null,
       ports: [{ doorId: 'north', state: dockedTo(SEED_HIGH) }, { doorId: 'east', state: { kind: 'gangway' } }],
     })).toEqual({ kind: 'none', reason: 'no-port' });
@@ -1041,6 +1060,24 @@ describe('what the helm hears after an arrival DOCK', () => {
 
   it('docked, once the berth takes the ship', async () => {
     expect(await arrive(true)).toEqual({ kind: 'docked', stationName: 'Furlong Station' });
+  });
+
+  it('says nothing once the player has joined another room before the berth answers', async () => {
+    let room = 'ship-room';
+    setStationRoomSource(() => room);
+    try {
+      let answer: (ok: boolean) => void = () => {};
+      const docking = { ...fakeDocking(['north']), dock: () => new Promise<boolean>((r) => { answer = r; }) };
+      fly('high-orbit', 'furlong-station');
+      const heard: ArrivalOutcome[] = [];
+      expect(completeArrival(docking, { onSettled: (o) => heard.push(o) })?.kind).toBe('docking');
+      room = 'other-room';
+      answer(true);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(heard).toEqual([]);
+    } finally {
+      setStationRoomSource(() => '');
+    }
   });
 
   it('refused, when the berth is taken — not a green "docking" note left standing', async () => {

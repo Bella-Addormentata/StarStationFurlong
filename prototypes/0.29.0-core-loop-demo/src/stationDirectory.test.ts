@@ -16,6 +16,8 @@ import {
   HOME_PLANET_ID,
   localStationId,
   findStation,
+  flightCapable,
+  setStationRoomCheck,
   planHop,
   planRecordHop,
   isKnownStation,
@@ -28,7 +30,7 @@ import { planTransfer } from './orbits';
 import { isFlightRecord } from './shipDoc';
 import type { StationMove } from './stations';
 
-afterEach(() => setStationDirectory(null));
+afterEach(() => { setStationDirectory(null); setStationRoomCheck(null); });
 
 const station = (id: string, planetId: string, extra: Partial<StationDestination> = {}): StationDestination => ({
   id, name: id.toUpperCase(), planetId, fuelCost: 10, travelMs: TRAVEL_MS_MIN, ...extra,
@@ -129,6 +131,17 @@ describe('the station record as destinations', () => {
   });
 });
 
+describe('flight capability', () => {
+  it('flies a fitted room, but never a station room wearing the same fittings', () => {
+    expect(flightCapable(true)).toBe(true);
+    expect(flightCapable(false)).toBe(false);
+    setStationRoomCheck(() => true);
+    expect(flightCapable(true)).toBe(false);
+    setStationRoomCheck(() => { throw new Error('no doors yet'); });
+    expect(flightCapable(true)).toBe(true);
+  });
+});
+
 describe('planning a hop', () => {
   it('leaves now at the flat cost when the directory has no planner', () => {
     expect(planHop('furlong-station', 'high-orbit', 1000)).toEqual({ departAt: 1000, arriveAt: 1000 + TRAVEL_MS_MIN, fuelCost: 25 });
@@ -158,6 +171,16 @@ describe('planning a hop', () => {
     expect(hop({ move: move({ departAt: 1002 }) }, {})).not.toBeNull();
     expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 1002 + TRAVEL_MS_MIN }) })).not.toBeNull();
     expect(hop({ move: move({ toPlanetId: 'p1', departAt: 1000, arriveAt: 1001 }) }, {})).not.toBeNull();
+  });
+
+  it('refuses a hop that would burn a negative amount of fuel', () => {
+    const list = [station('a', 'planet-sovereign'), station('b', 'planet-sovereign', { fuelCost: -5 })];
+    setStationDirectory({ stations: () => list });
+    expect(planHop('a', 'b', 1000)).toBeNull();
+    setStationDirectory({ stations: () => list, plan: () => ({ departAt: 1000, arriveAt: 2000, fuelCost: -1 }) });
+    expect(planHop('b', 'a', 1000)).toBeNull();
+    setStationDirectory({ stations: () => list, plan: () => ({ departAt: 1000, arriveAt: 2000, fuelCost: 0 }) });
+    expect(planHop('b', 'a', 1000)?.fuelCost).toBe(0);
   });
 
   it('follows the circular-orbit model over station records', () => {

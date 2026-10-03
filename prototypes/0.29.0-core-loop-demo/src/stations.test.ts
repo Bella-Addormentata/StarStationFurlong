@@ -12,6 +12,7 @@ import {
   MAX_ORBIT_SLOTS,
   currentStation,
   dockedStationFor,
+  isStationRoom,
   listStations,
   planetForRoom,
   roomAdriftPlace,
@@ -324,6 +325,23 @@ describe('stationForRoom / planetForRoom', () => {
       setRoomStationResolver(null);
       setStationRoomSource(() => '');
     }
+  });
+
+  it('tells a station room that wears ship fittings from a ship', () => {
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    const seed = (roomId: string) => `ssf://join#room=${roomId}`;
+    const dock = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId), transient: true });
+    const gangway = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId) });
+    // A saved station's (or the built-in one's) welcome room, docked or not.
+    expect(isStationRoom('b1', [])).toBe(true);
+    expect(isStationRoom('b1', [dock('ship')])).toBe(true);
+    expect(isStationRoom(DEFAULT_STATION_RECORD.welcomeRoomId, [])).toBe(true);
+    // A module bolted into a station by structure.
+    expect(isStationRoom('helm-room', [gangway('a1')])).toBe(true);
+    // A lone module, free or docked, is a ship.
+    expect(isStationRoom('ship', [])).toBe(false);
+    expect(isStationRoom('ship', [dock('b1')])).toBe(false);
+    expect(isStationRoom('', [])).toBe(false);
   });
 
   it('finds the station a lone module is docked at from its live doors', () => {

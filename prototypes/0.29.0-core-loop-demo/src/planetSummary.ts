@@ -98,12 +98,18 @@ export interface StationSummary {
    *  helm room's take-back never forgets another's. */
   trimGone?: TrimGone[];
   /** The owning install's own id for its saved record, so a flight record
-   *  written there (station ids are per install) still resolves here. */
+   *  written there (station ids are per install) can still resolve here. */
   ownerId?: string;
-  /** Other installs' ids for their saved records of the same place (their
-   *  records lost to `ownerId`'s), sorted, at most MAX_OWNER_ALIASES: a
-   *  flight record one of them wrote still resolves here. */
+  /** The other ids this place's owned records went by (records that lost to
+   *  this one: other installs', or its install's under an earlier id),
+   *  sorted, at most MAX_OWNER_ALIASES: a flight record written under one of
+   *  them can still resolve here (resolveStationAlias). */
   ownerAliases?: string[];
+  /** The install that published an owned record (identity.ts
+   *  getStationOwnerId), only beside `ownerId`: station ids are each
+   *  install's own, so two installs can save one place under one id, and
+   *  this is what settles whose record stands (mergeStation). */
+  ownerInstall?: string;
   updatedAt: number;
 }
 
@@ -230,16 +236,44 @@ function boundedJson(v: unknown, budget: { left: number }, depth: number): unkno
 }
 
 /** Field names that may carry a room's dial-in credentials (a seed, a pass,
- *  a link or invite): layout is public, admission is not. */
-const CREDENTIAL_KEY = /seed|pass(?!age)|link|invite|token|secret|cred/i;
+ *  a link or invite, a room key): layout is public, admission is not. */
+const CREDENTIAL_KEY = /seed|pass(?!age)|link|invite|token|secret|cred|key/i;
+/** A parameter named the same way, in a link or a line (ssf://room?seed=…). */
+const CREDENTIAL_PARAM = new RegExp(`(?:^|[?#&;\\s])[^=?#&;\\s]*(?:${CREDENTIAL_KEY.source})[^=?#&;\\s]*=`, 'i');
 
-/** A JSON value with every credential-named field removed, at any depth. */
+/** A string that is, or carries, a room's dial-in credentials, whatever
+ *  field it sits under: a credential-named parameter (a link's), JSON text
+ *  holding a credential, or base64 JSON, which is how a pass is written
+ *  (main.ts's encodeBootstrapSeed). */
+function isCredentialValue(s: string): boolean {
+  let text = s;
+  try { text = decodeURIComponent(s); } catch { /* not URI-encoded */ }
+  if (CREDENTIAL_PARAM.test(text)) return true;
+  try {
+    // Every string inside is shorter than this one, so this ends.
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed === 'object' && parsed !== null
+      && JSON.stringify(stripCredentials(parsed)) !== JSON.stringify(parsed)) return true;
+  } catch { /* not JSON text */ }
+  for (const [token] of text.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g)) {
+    try {
+      const decoded: unknown = JSON.parse(atob(token.replace(/-/g, '+').replace(/_/g, '/')));
+      if (typeof decoded === 'object' && decoded !== null) return true;
+    } catch { /* not base64 JSON */ }
+  }
+  return false;
+}
+
+const isCredential = (v: unknown): boolean => typeof v === 'string' && isCredentialValue(v);
+
+/** A JSON value with every credential-named field and every credential
+ *  string (a value, a list item or a field name) removed, at any depth. */
 function stripCredentials(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(stripCredentials);
+  if (Array.isArray(v)) return v.filter((x) => !isCredential(x)).map(stripCredentials);
   if (typeof v !== 'object' || v === null) return v;
   const out: Record<string, unknown> = {};
   for (const [k, x] of Object.entries(v)) {
-    if (!CREDENTIAL_KEY.test(k)) out[k] = stripCredentials(x);
+    if (!CREDENTIAL_KEY.test(k) && !isCredential(k) && !isCredential(x)) out[k] = stripCredentials(x);
   }
   return out;
 }
@@ -296,6 +330,7 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // left out, not the whole summary: the station still registers.
   if (isId(v.berthDoor) && isAcceptableDoorKey(v.berthDoor)) out.berthDoor = v.berthDoor;
   if (v.ownerId !== undefined) out.ownerId = v.ownerId as string;
+  if (out.ownerId !== undefined && isId(v.ownerInstall)) out.ownerInstall = v.ownerInstall;
   // Peer-sent: bounded before it is walked.
   if (Array.isArray(v.ownerAliases) && v.ownerAliases.length <= MAX_OWNER_ALIASES * 4) {
     const aliases = mergeAliases(v.ownerAliases.filter(isId), [], out.ownerId);
@@ -416,8 +451,9 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
 
 /** Merge an incoming station summary into a known one, and the newer trim.
  *  Which record stands: one its owner published (it carries `ownerId`) beats
- *  one nobody owns; between one owner's records the newer wins, and between
- *  two installs' owned records the smaller owner id stands; between records
+ *  one nobody owns; between one install's records the newer wins, whatever
+ *  station id it went by, and between two installs' owned records the
+ *  smaller install id stands (ownerRank); between records
  *  nobody owns (derived stations) the FIRST published stands, so a late
  *  install cannot move a station everyone already placed. Same-moment ties
  *  settle on the canonical JSON. A trim and a move each merge by their own
@@ -427,16 +463,17 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   const recordOf = (s: StationSummary): string =>
     JSON.stringify({ ...s, trim: undefined, move: undefined, stands: undefined, trimGone: undefined, ownerAliases: undefined });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
-  // Two installs that each saved the place under their own id: one of them
-  // stands for good (the smaller id), so their republishes cannot take turns.
-  const rivals = owned(incoming) && owned(prior) && incoming.ownerId !== prior.ownerId;
+  // Two installs that each saved the place, under any station ids (the same
+  // one too): one of them stands for good, so their republishes cannot take
+  // turns.
+  const rivals = owned(incoming) && owned(prior) && ownerRank(incoming) !== ownerRank(prior);
   const base = owned(incoming) !== owned(prior)
     ? (owned(incoming) ? incoming : prior)
     : rivals
-      ? (incoming.ownerId! < prior.ownerId! ? incoming : prior)
+      ? (ownerRank(incoming) < ownerRank(prior) ? incoming : prior)
       : incoming.updatedAt !== prior.updatedAt
         ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
-        : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
+        : (recordOf(canonOrder(incoming)) > recordOf(canonOrder(prior)) ? incoming : prior);
   // Only a trim of the orbit the standing record flies: one published for
   // the slot that lost would be dropped by every reader anyway. A slot clash
   // in listStations can move the standing record off the slot it asks for
@@ -620,8 +657,9 @@ function onPlanet(v: { planetId: string }, planet: string | null): boolean {
 }
 
 /** The keys this client knows first-hand: the station it stands in and the
- *  ship it is aboard. Retention keeps them whatever peers stamp. And the
- *  planet it is at (null when it cannot place itself). */
+ *  ship it is aboard. Retention keeps them whatever peers stamp, and the
+ *  stations its planet lists too (listedAt). And the planet it is at (null
+ *  when it cannot place itself). */
 function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<string>; planet: string | null } {
   const stations = new Set<string>();
   const ships = new Set<string>();
@@ -642,7 +680,7 @@ function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<strin
     : current && !standIn ? planetById(current.planetId).id
       : shipEntry && !shipEntry.retired ? planetById(shipEntry.planetId).id
         : null;
-  return { stations, ships, planet };
+  return { stations: listedAt(planet, store, stations), ships, planet };
 }
 
 /** The room this client stands in, unless it is known to be no ship. */
@@ -675,6 +713,28 @@ function isOwned(station: StationRecord): boolean {
   return !station.derived && !isLearnedRecord(station);
 }
 
+/** This install's own id for the records it saves (the context's), when it
+ *  has a usable one. */
+function thisInstall(): string | undefined {
+  const id = ctx?.installId?.();
+  return isId(id) ? id : undefined;
+}
+
+/** Whose an owned summary is, for settling two installs' records of one
+ *  place: the install that published it, or, from a build that sent none,
+ *  its station id, ranked after every install. */
+function ownerRank(s: StationSummary): string {
+  return s.ownerInstall !== undefined ? `0${s.ownerInstall}` : `1${s.ownerId ?? ''}`;
+}
+
+/** Is `s` another install's record than this install's own `ownId` one? By
+ *  install where both are known, else (a build that sent none) by station id. */
+function otherOwner(s: StationSummary, ownId: string): boolean {
+  if (s.ownerId === undefined) return false;
+  const me = thisInstall();
+  return s.ownerInstall !== undefined && me !== undefined ? s.ownerInstall !== me : s.ownerId !== ownId;
+}
+
 /** The summary this client publishes for a station it can see: its listed
  *  record, and a trim when one applies to it. */
 export function summaryForStation(station: StationRecord, trim: OrbitTrim | null, updatedAt: number): StationSummary {
@@ -687,6 +747,8 @@ export function summaryForStation(station: StationRecord, trim: OrbitTrim | null
   };
   if (station.berthDoor) out.berthDoor = station.berthDoor;
   if (isOwned(station) && isId(station.id)) out.ownerId = station.id;
+  const install = thisInstall();
+  if (out.ownerId !== undefined && install !== undefined) out.ownerInstall = install;
   const ext = cleanExt(station);
   if (ext) out.ext = ext;
   const applies = cleanTrim(trimFor(station, trim));
@@ -736,11 +798,17 @@ export function foldOwnStation(
   const sameRecord = (a: StationSummary, b: StationSummary): boolean =>
     // The owner id is per install: another install's identical record is the
     // same record, not news to republish over.
-    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined })
-      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined });
+    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, updatedAt: 0, ownerId: undefined, ownerInstall: undefined, ownerAliases: undefined })
+      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, updatedAt: 0, ownerId: undefined, ownerInstall: undefined, ownerAliases: undefined });
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
-    : known;
+    // The same record as another install's, or under another station id, or
+    // nobody's: this one's goes out too, under the known stamp, so
+    // mergeStation settles the owner and keeps the other id as an alias (a
+    // flight record written on either install can still resolve).
+    : owned && (mine.ownerId !== known.ownerId || mine.ownerInstall !== known.ownerInstall)
+      ? { ...mine, updatedAt: known.updatedAt }
+      : known;
   // A trim is keyed by the orbit it trims: it goes out when it names the
   // planet and slot of the record that is kept, whichever client's that is.
   // A learned station flies the slot listStations settled for that record,
@@ -793,6 +861,53 @@ export function learnedRecord(s: StationSummary): Omit<StationRecord, 'derived'>
   };
 }
 
+/** Does a saved record already say what a summary says? Its extra fields
+ *  count both ways: one the summary no longer carries must go too. */
+function holdsSummary(had: StationRecord & Record<string, unknown>, s: StationSummary): boolean {
+  const ext = s.ext ?? {};
+  return Object.keys(had).filter((k) => !KNOWN_FIELDS.has(k)).length === Object.keys(ext).length
+    && Object.entries(ext).every(([k, v]) => JSON.stringify(had[k]) === JSON.stringify(v))
+    && had.name === s.name && had.orbitSlot === s.orbitSlot
+    && planetById(had.planetId).id === planetById(s.planetId).id
+    && had.welcomeRoomId === s.welcomeRoomId && had.berthDoor === s.berthDoor;
+}
+
+/** Which of a planet's summaries for places this install has no station of
+ *  its own it lists (`admitted`) and which it leaves out (`displaced`): ranked
+ *  owned first, then by welcome room, as many as the planet's slots its own
+ *  stations leave free. The same summaries rank alike everywhere, so a
+ *  crowded planet lists the same learned stations on every install. 🚚 A
+ *  summary is at the planet its move puts it at (settledPlanet: an arrival
+ *  not pinned yet where this install's list settled it), and this install's
+ *  own stations where its list has them (their moves applied). */
+function admittedAt(planet: string, stations: Iterable<StationSummary>, listed: StationRecord[]): {
+  admitted: Set<string>;
+  displaced: Set<string>;
+} {
+  const own = listed.filter((st) => !st.derived && !isLearnedRecord(st) && planetById(st.planetId).id === planet);
+  const ownRooms = new Set(own.map((st) => st.welcomeRoomId));
+  const now = Date.now();
+  const listedAt = (room: string) => listed.find((st) => st.welcomeRoomId === room);
+  const ranked = [...stations]
+    .filter((s) => settledPlanet(s, now, listedAt) === planet && !ownRooms.has(s.welcomeRoomId))
+    .sort((a, b) => Number(b.ownerId !== undefined) - Number(a.ownerId !== undefined)
+      || (a.welcomeRoomId < b.welcomeRoomId ? -1 : a.welcomeRoomId > b.welcomeRoomId ? 1 : 0));
+  const free = Math.max(0, MAX_ORBIT_SLOTS - own.length);
+  return {
+    admitted: new Set(ranked.slice(0, free).map((s) => s.welcomeRoomId)),
+    displaced: new Set(ranked.slice(free).map((s) => s.welcomeRoomId)),
+  };
+}
+
+/** `keep`, plus the rooms of the learned stations `planet` lists from what
+ *  `store` knows (admittedAt): a store or map past its cap keeps them by
+ *  rank, not by stamp, so every install that heard them lists the same. */
+function listedAt(planet: string | null, store: Store | undefined, keep: Set<string>): Set<string> {
+  if (!planet || !store) return keep;
+  for (const room of admittedAt(planet, Object.values(store.stations), listStations()).admitted) keep.add(room);
+  return keep;
+}
+
 /**
  * Register the learned stations around `planetId` as station records, so
  * their slots (and so their orbits) match every other client's. A place this
@@ -823,6 +938,23 @@ export function registerLearnedStations(
       }
     }
   }
+  // A planet with more stations than slots lists the same learned ones on
+  // every install, whatever order their summaries came in (admittedAt); a
+  // learned record ranked out goes, since an earlier order may have let it in.
+  // So, when these summaries are all the planet has (prune), does one whose
+  // summary is gone: a full store let it go, and it would hold a slot.
+  stations = [...stations]; // walked twice
+  const { admitted, displaced } = admittedAt(planet, stations, listed);
+  for (const r of [...saved.values()]) {
+    // 🚚 Where the list has it, which follows its move (as the prune above).
+    const at = listed.find((st) => st.id === r.id) ?? r;
+    if (isLearnedRecord(r) && planetById(at.planetId).id === planet
+      && (opts.prune ? !admitted.has(r.welcomeRoomId) : displaced.has(r.welcomeRoomId))) {
+      removeStation(r.id);
+      saved.delete(r.id);
+      changed++;
+    }
+  }
   for (const s of stations) {
     if (summaryPlanet(s) !== planet) continue;
     const rec = learnedRecord(s);
@@ -832,15 +964,17 @@ export function registerLearnedStations(
     if (owner && !owner.derived && owner.id !== rec.id) {
       // …except where it stands: when another install's record of the same
       // place stood (rival owners settle on one, mergeStation), this one
-      // flies that planet and slot too, under its own id, so both installs
-      // agree and the standing trim fits.
-      const own = saved.get(owner.id);
-      if (own && !isLearnedRecord(own) && s.ownerId !== undefined && s.ownerId !== owner.id
-        && (own.orbitSlot !== s.orbitSlot || planetById(own.planetId).id !== planetById(s.planetId).id)) {
-        if (registerStation({ ...own, planetId: s.planetId, orbitSlot: s.orbitSlot }, { reservations: false })) changed++;
+      // takes that record whole under its own id (its planet and slot, so
+      // the standing trim fits, and its name, berth and a newer build's
+      // fields), so every install registers the same station.
+      const own = saved.get(owner.id) as (StationRecord & Record<string, unknown>) | undefined;
+      if (own && !isLearnedRecord(own) && otherOwner(s, owner.id) && !holdsSummary(own, s)) {
+        if (registerStation({ ...rec, id: own.id }, { reservations: false })) changed++;
       }
       continue;
     }
+    // Past the slots this planet has left for learned stations.
+    if (!admitted.has(s.welcomeRoomId)) continue;
     // Unchanged since it was saved: compare with the SAVED record, not the
     // listed one (the list may have moved it to a free slot), extra fields
     // included (a newer build's, such as a station's move).
@@ -869,15 +1003,20 @@ export interface PlanetSummaryContext {
   /** The ship this client stands in, or null when the room is no ship. */
   ship: () => ShipStatusInput | null;
   /** The room this client stands in when it is known to be no ship (not a
-   *  ready ship, or bolted into a station), else null: a ship entry for that
-   *  room is withdrawn. A ship whose planet is not placed yet (`ship()` is
-   *  null for it too) is not this, so its entry stands. Optional: without it
-   *  nothing is withdrawn. */
+   *  ready ship, a station's own room, or bolted into a station), else
+   *  null: a ship entry for that room is withdrawn. A ship whose planet is
+   *  not placed yet (`ship()` is null for it too) is not this, so its entry
+   *  stands. Optional: without it nothing is withdrawn. */
   notShipRoom?: () => string | null;
   /** The room this client stands in: its trim (localTrim) is read
    *  first-hand there, so a trim that room takes back spreads. Optional:
    *  without it trims only merge by burn time. */
   currentRoom?: () => string | null;
+  /** This install's own id (identity.ts getStationOwnerId): the stations it
+   *  saved go out under it (`ownerInstall`), so two installs that saved one
+   *  place under one station id still settle on one record. Optional:
+   *  without it they settle by station id alone. */
+  installId?: () => string;
 }
 
 let doc: Y.Doc | null = null;
@@ -912,7 +1051,12 @@ export function bindPlanetSummaryDoc(d: Y.Doc, c: PlanetSummaryContext): void {
   shipMap = d.getMap('shipSummaries');
   const onChange = (_e: unknown, tx: Y.Transaction) => {
     if (tx.local) return;
+    // What this client says of its ship reads the station list: a pull that
+    // registers the station its flight names places the ship (or moves it),
+    // and that goes out now, not at the heartbeat.
+    const ship = JSON.stringify(ctx?.ship() ?? null);
     pullPlanetSummary();
+    if (JSON.stringify(ctx?.ship() ?? null) !== ship) publishPlanetSummary();
   };
   stationMap.observe(onChange);
   shipMap.observe(onChange);
@@ -1143,7 +1287,7 @@ function applyLearned(store: Store): void {
   // registers, which needs the planet; a rival install's standing record
   // moves ours, which needs its planet too).
   const shared = here?.welcomeRoomId ? store.stations[here.welcomeRoomId] : undefined;
-  const ours = here !== null && isOwned(here) && (shared?.ownerId === undefined || shared.ownerId === here.id);
+  const ours = here !== null && isOwned(here) && (shared === undefined || !otherOwner(shared, here.id));
   // No station placement: a ship room's own summary says which planet it is at.
   const ship = !here && room ? store.ships[room] : undefined;
   const shipPlanet = ship && !ship.retired ? ship.planetId : undefined;
@@ -1206,8 +1350,12 @@ export function installTrimResolver(): void {
 /**
  * This install's id for a station id another install wrote (a flight record
  * travels in the ship's room doc; station ids are per install). A derived or
- * learned id names its welcome room; a saved record's id is found through the
- * summary that carries it as `ownerId`. Null when no listed station matches.
+ * learned id names its welcome room. Any other id is some install's saved
+ * record's (written before ids were portable), and installs pick theirs
+ * freely: it names a place only when every record this install knows under
+ * it (its own, and the summaries' `ownerId`s and `ownerAliases`) is of that
+ * one place. Null when several are (whose it was cannot be told), or when no
+ * listed station matches.
  */
 export function resolveStationAlias(id: string, now = Date.now()): string | null {
   const listed = listStations();
@@ -1218,11 +1366,15 @@ export function resolveStationAlias(id: string, now = Date.now()): string | null
   // A prefixed id names a welcome room, which is global: resolve it by the
   // room first, so a local record that happens to share the id never wins.
   if (room !== undefined) return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
-  if (listed.some((s) => s.id === id)) return id;
-  const stations = Object.values(readStore(now).stations);
-  room = (stations.find((s) => s.ownerId === id) ?? stations.find((s) => s.ownerAliases?.includes(id)))?.welcomeRoomId;
-  if (!room) return null;
-  return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
+  const own = listed.find((s) => s.id === id);
+  const places = new Set<string>(own ? [own.welcomeRoomId] : []);
+  for (const s of Object.values(readStore(now).stations)) {
+    if (s.ownerId === id || s.ownerAliases?.includes(id)) places.add(s.welcomeRoomId);
+  }
+  if (places.size !== 1) return null;
+  if (own) return own.id;
+  const [only] = places;
+  return listed.find((s) => s.welcomeRoomId === only)?.id ?? null;
 }
 
 /** The id another install can resolve without ambiguity for this install's

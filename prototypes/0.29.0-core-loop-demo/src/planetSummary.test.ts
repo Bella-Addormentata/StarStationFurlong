@@ -285,9 +285,11 @@ describe('guards', () => {
     expect(mergeStation(settled, { ...b, updatedAt: T0 + 5000 })).toBeNull();
   });
 
-  it("does not republish over another install's identical record", () => {
+  it("does not republish over another install's identical record, past its own id as an alias", () => {
     const known = summary({ ownerId: 'alpha', updatedAt: T0 });
-    expect(foldOwnStation(known, record({ id: 'beta' }), null, T0 + 10)).toBeNull();
+    const aliased = foldOwnStation(known, record({ id: 'beta' }), null, T0 + 10);
+    expect(aliased).toEqual({ ...known, ownerAliases: ['beta'] });
+    expect(foldOwnStation(aliased!, record({ id: 'beta' }), null, T0 + 20)).toBeNull();
   });
 
   it('checks ship summaries', () => {
@@ -538,6 +540,26 @@ describe('learned stations', () => {
       expect(listStations().find((st) => st.welcomeRoomId === 'room-hab')?.planetId).toBe(ARIS);
       // Around its old one it does not.
       expect(registerLearnedStations(SOV, [moved], { prune: true })).toBe(1);
+      expect(readStationRecords()).toEqual([]);
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  it('keeps a learned station between planets where it left from until it arrives, a prune there included', () => {
+    const now = Date.now();
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: now - 1000, arriveAt: now + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const moving = summary({ move });
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'room-hab' ? move : null));
+    try {
+      expect(registerLearnedStations(SOV, [moving])).toBe(1);
+      expect(registerLearnedStations(SOV, [moving], { prune: true })).toBe(0);
+      expect(listStations().find((st) => st.welcomeRoomId === 'room-hab')?.planetId).toBe(SOV);
+      // Around where it is bound, not yet.
+      expect(registerLearnedStations(ARIS, [moving], { prune: true })).toBe(1);
       expect(readStationRecords()).toEqual([]);
     } finally {
       setStationMoveResolver(null);
