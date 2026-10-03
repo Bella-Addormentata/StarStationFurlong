@@ -28,6 +28,7 @@ import {
   isCancelPin,
   isPinMove,
   pinSettledArrival,
+  pinSettledArrivals,
   isPlausibleMove,
   compareMoves,
   dockLockedByMove,
@@ -51,7 +52,9 @@ import {
   readRememberedMoves,
   readStationMove,
   rememberedMoveFor,
+  MOVE_ENTRIES_KEEP,
   MOVE_SCAN_MAX,
+  MOVE_SETTLED_KEEP,
   rememberMove,
   subscribeStationMove,
   writeStationMove,
@@ -357,6 +360,27 @@ describe('the station list follows a move', () => {
     expect(listStations({}, [], t + 1).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV });
     // A pinned station is not pinned again.
     expect(pinSettledArrival(here, t + 2)).toBe(false);
+  });
+
+  it('pins every listed station that arrived, aboard or not', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const far: StationMove = { ...move, stationId: 'far', welcomeRoomId: 'far-room', fromSlot: 3, toSlot: 4 };
+    const farRecord: StationRecord = { id: 'far', name: 'FAR', planetId: SOV, orbitSlot: 3, welcomeRoomId: 'far-room' };
+    const t = move.arriveAt + 5;
+    vi.useFakeTimers({ now: t, toFake: ['Date'] });
+    try {
+      bindStationMoveDoc(new Y.Doc());
+      installStationMoveResolver();
+      // This game's room belongs to neither station.
+      expect(rememberMove(move, t)).toBe(true);
+      expect(rememberMove(far, t)).toBe(true);
+      expect(pinSettledArrivals(listStations({}, [farRecord], t), t)).toBe(2);
+      const pins = readRememberedMoves().filter(isPinMove);
+      expect(pins.map((p) => p.welcomeRoomId).sort()).toEqual([move.welcomeRoomId, 'far-room'].sort());
+      expect(pinSettledArrivals(listStations({}, [farRecord], t + 1), t + 1)).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('never lets an unknown planet id share a slot with the planet it reads as', () => {
@@ -713,6 +737,26 @@ describe('tugs: a torch tow', () => {
       .toMatchObject({ planetId: SOV, orbitSlot: plan.move.fromSlot });
     // Once is enough.
     expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 3)).toBe(false);
+  });
+
+  it('lets a cancelled tow kept in remembered history release the dock', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+    try {
+      const plan = planStationTow(towCtx(), ARIS);
+      if (!plan.ok) throw new Error(plan.refusal);
+      bindStationMoveDoc(new Y.Doc());
+      writeStationMove(plan.move);
+      expect(towHoldsDock(['tug-room'], NOW + 1)).toBe(true);
+      expect(cancelTowLeftBehind('tug-room', { status: 'in-flight' }, NOW + 1)).toBe(true);
+      // The tow stays remembered as history beside its cancel, holding nothing.
+      expect(readRememberedMoves().some((m) => m.mode === 'tug' && !m.settles)).toBe(true);
+      expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
+      // With another room bound, the remembered pair alone lets go too.
+      bindStationMoveDoc(new Y.Doc());
+      expect(towHoldsDock(['tug-room'], NOW + 2)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('lets a move booked at the same time beat a tow that would have flown first', () => {
@@ -1174,6 +1218,43 @@ describe('the move log stays bounded', () => {
     store.clear();
     bindStationMoveDoc(peer);
     expect(readStationMove()).toEqual(mine);
+  });
+
+  it('keeps every charge when a zero-fuel write caps the log', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    const zero = { ...hop(1, 0, 0), stationId: 'z', welcomeRoomId: 'z-room', bookedAt: NOW + 5 };
+    // Settled records past the cap, each with a charge of its own.
+    doc.transact(() => {
+      for (let i = 0; i < MOVE_SETTLED_KEEP + 1; i++) map.set(`moveSettled:${100 + i}:1`, { n: 1, drawn: 1, floor: 1, recent: [] });
+    });
+    expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 1);
+    writeStationMove(zero);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:')).length).toBeLessThanOrEqual(MOVE_SETTLED_KEEP);
+    expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 1);
+    // Entries past the cap, each paid for, and still under way.
+    const doc2 = new Y.Doc();
+    bindStationMoveDoc(doc2);
+    const map2 = doc2.getMap('stationMoves');
+    const n = MOVE_ENTRIES_KEEP + 2;
+    doc2.transact(() => {
+      for (let i = 0; i < n; i++) {
+        map2.set(`move:7:${i}:s${i}`, { ...hop(0, 1, 1), stationId: `s${i}`, welcomeRoomId: `s${i}-room`, bookedAt: NOW - 10_000 - i });
+      }
+    });
+    expect(readMoveFuelDrawn()).toBe(n);
+    writeStationMove(zero);
+    expect([...map2.keys()].filter((k) => k.startsWith('move:')).length).toBeLessThanOrEqual(MOVE_ENTRIES_KEEP + 1);
+    expect(readMoveFuelDrawn()).toBe(n);
+    // A peer that folds the same surplus writes the same record: no double charge.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc2));
+    store.clear();
+    bindStationMoveDoc(peer);
+    writeStationMove({ ...zero, departAt: zero.departAt + 1, arriveAt: zero.arriveAt + 1 });
+    Y.applyUpdate(doc2, Y.encodeStateAsUpdate(peer));
+    expect(readMoveFuelDrawn()).toBe(n);
   });
 
   it('keeps the meter in range when several writers\' settled totals add past it', () => {
