@@ -122,7 +122,16 @@ function orbitChangeFits(o: OrbitChange, planetId: string, slot: number, departA
 function isOrbitChangeRecord(v: unknown): v is OrbitChange {
   if (typeof v !== 'object' || v === null) return false;
   const o = v as Partial<Record<keyof OrbitChange, unknown>>;
-  return isRadius(o.fromRadiusKm) && isPhase(o.fromPhase0) && isRadius(o.toRadiusKm) && isPhase(o.toPhase0);
+  return isRadius(o.fromRadiusKm) && isPhase(o.fromPhase0) && isRadius(o.toRadiusKm) && isPhase(o.toPhase0)
+    && (o.fromSince === undefined || isTime(o.fromSince));
+}
+
+/** 🎚️ When the custom orbit an altitude change leaves was claimed (the
+ *  epoch when unknown); nothing when the station flies its slot's own. */
+function sourceClaimOf(station: StationRecord): { fromSince?: number } {
+  if (!station.orbit) return {};
+  const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
+  return { fromSince: isTime(since) ? since : ORBIT_EPOCH_MS };
 }
 
 /** 🎚️ The custom orbit a station's next move keeps until it leaves (its
@@ -249,6 +258,7 @@ export function cleanMove(m: StationMove): StationMove {
       orbit: {
         fromRadiusKm: m.orbit.fromRadiusKm, fromPhase0: m.orbit.fromPhase0,
         toRadiusKm: m.orbit.toRadiusKm, toPhase0: m.orbit.toPhase0,
+        ...(typeof m.orbit.fromSince === 'number' ? { fromSince: m.orbit.fromSince } : {}),
       },
     } : {}),
     ...(m.mode !== 'orbit' && m.fromOrbit ? {
@@ -564,6 +574,7 @@ export function planStationAltitude(ctx: MoveContext, altitudeKm: number): Altit
         fromPhase0: plan.from.phase0,
         toRadiusKm: plan.to.radiusKm,
         toPhase0: plan.to.phase0,
+        ...sourceClaimOf(station),
       },
       bookedAt: now,
       fuel: quote.fuel,

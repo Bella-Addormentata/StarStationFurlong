@@ -874,6 +874,23 @@ describe('a dock pass over the gate list', () => {
     expect((await at(route.stops[1].planetId)).verdict.kind).toBe('docked');
   });
 
+  it('🎚️ a stop whose station has changed altitude since the route copied it is skipped as gone', async () => {
+    const d = fakeDocking(clock);
+    const climbed = await runKeeperPass({
+      docking: d.api,
+      route,
+      stop: route.stops[1],
+      station: { ...station, planetId: route.stops[1].planetId, orbit: { radiusKm: 99_999 } },
+      shipRoomId: 'ship-1',
+      mayDock: () => true,
+      stillWanted: () => true,
+      now: clock,
+    });
+    expect(climbed.verdict).toEqual({ kind: 'skip' });
+    expect(skipWhyOf(climbed.results)).toBe('gone');
+    expect(d.asked).toHaveLength(0);
+  });
+
   it('never re-points a port this rider may not dock', async () => {
     const d = fakeDocking(clock);
     const locked: ShipDockingApi = { ...d.api, ports: () => d.api.ports().map((p) => ({ ...p, canOperate: false })) };

@@ -113,6 +113,10 @@ export interface OrbitChange {
   fromPhase0: number;
   toRadiusKm: number;
   toPhase0: number;
+  /** When the custom orbit it leaves was claimed (orbitClaimedAt), so a
+   *  change that loses still holds the orbit its station stays on, for
+   *  installs that never saw the move before it; absent: the slot's own. */
+  fromSince?: number;
 }
 
 /** ⚓🚦 One gate of a station: a dock port an arriving ship may berth at. */
@@ -287,6 +291,7 @@ export function orbitClaimedAt(move: StationMove | null | undefined, orbit: Stat
   const m = move.settles ?? move;
   const same = (r: number) => Math.abs(r - orbit.radiusKm) < 1e-6;
   if (m.mode === 'orbit' && m.orbit && same(m.orbit.toRadiusKm)) return m.bookedAt ?? m.departAt;
+  if (m.mode === 'orbit' && m.orbit && same(m.orbit.fromRadiusKm)) return m.orbit.fromSince ?? 0;
   if (m.mode !== 'orbit' && m.fromOrbit && same(m.fromOrbit.radiusKm)) return m.fromOrbit.since ?? 0;
   return 0;
 }
@@ -361,10 +366,18 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
       const key = altitudeMoveKey(m);
       const booked = bookedOf(m);
       if (isChange(m)) {
-        claims.push({
-          key, station, planet: planetById(m.toPlanetId).id, radiusKm: m.orbit!.toRadiusKm, at: booked,
-          held: (t) => !endedBy(list, booked, t),
-        });
+        const planet = planetById(m.toPlanetId).id;
+        claims.push({ key, station, planet, radiusKm: m.orbit!.toRadiusKm, at: booked, held: (t) => !endedBy(list, booked, t) });
+        // The custom orbit it leaves, held until a move from this one on
+        // flies (this one, unless it loses), whether or not the change that
+        // took the station there is known here.
+        const since = m.orbit!.fromSince;
+        if (since !== undefined) {
+          claims.push({
+            key: `${key}|from`, station, planet, radiusKm: m.orbit!.fromRadiusKm, at: since,
+            held: (t) => !endedBy(list, booked - 1, t),
+          });
+        }
         continue;
       }
       const src = m.settles ?? m;

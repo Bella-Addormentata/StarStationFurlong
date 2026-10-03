@@ -651,4 +651,38 @@ describe('Copilot round 5', () => {
     expect(lost.has(altitudeMoveKey(cTry))).toBe(true);
     expect(lost.has(altitudeMoveKey(aHold))).toBe(false);
   });
+
+  it('a lost altitude change still holds the orbit it leaves, for an install that never saw the climb there', () => {
+    const bHold = climbOf('b', 'b-room', 1, 2_000, NOW + 10);
+    const aPlan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, 0.4), SOV_R + 2_020, NOW + 200_000)!;
+    const aFails: StationMove = {
+      stationId: 'a', welcomeRoomId: 'a-room', fromPlanetId: SOV, fromSlot: 0, toPlanetId: SOV, toSlot: 0,
+      departAt: aPlan.departAt, arriveAt: aPlan.arriveAt, mode: 'orbit', bookedAt: NOW + 200_000, fuel: 5, fuelDrawn: 5,
+      orbit: {
+        fromRadiusKm: aPlan.from.radiusKm, fromPhase0: aPlan.from.phase0, toRadiusKm: aPlan.to.radiusKm,
+        toPhase0: aPlan.to.phase0, fromSince: NOW,
+      },
+    };
+    expect(isStationMove(aFails)).toBe(true);
+    expect(cleanMove(aFails).orbit?.fromSince).toBe(NOW);
+    const cTry = climbOf('c', 'c-room', 2, 1_020, NOW + 400_000);
+    const lost = lostAltitudeClaims([bHold, aFails, cTry]);
+    expect(lost.has(altitudeMoveKey(aFails))).toBe(true);
+    expect(lost.has(altitudeMoveKey(cTry))).toBe(true);
+    // Once a move of A's flies, the old orbit is free again.
+    const later = climbOf('c', 'c-room', 2, 1_020, NOW + 400_000);
+    const aWins = { ...aFails, orbit: { ...aFails.orbit!, toRadiusKm: SOV_R + 3_000 } };
+    expect(lostAltitudeClaims([bHold, aWins, later]).has(altitudeMoveKey(later))).toBe(false);
+  });
+
+  it('the planner stamps when the orbit an altitude change leaves was claimed', () => {
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW) : null));
+    const climbed = listStations({}, [], NOW + 200_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    const plan = planStationAltitude(ctx({ station: climbed, now: NOW + 200_000 }), 1_200);
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(plan.move.orbit?.fromSince).toBe(NOW);
+    // From the slot's own orbit: nothing to stamp.
+    setStationMoveResolver(null);
+    expect(climbTo(1_200).orbit?.fromSince).toBeUndefined();
+  });
 });
