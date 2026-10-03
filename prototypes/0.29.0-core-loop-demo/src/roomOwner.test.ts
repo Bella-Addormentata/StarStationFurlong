@@ -188,6 +188,15 @@ describe('#142 — destructive surfaces gate on the deed (source scan)', () => {
     expect(body).not.toContain('isLocalOwnerOfCurrentRoom');
   });
 
+  it('the TV\'s spare remote registers the deed predicate, not the edit gate', () => {
+    // Taking the remote from its holder (TAKE BACK), or handing theirs on,
+    // unseats them: the same class as the four surfaces above. The TV module
+    // takes its predicate through a seam, so the scan pins the registration.
+    expect(main).toContain('setTvHostPredicate(() => currentRoomDeedIsMine())');
+    expect(main).not.toMatch(/setTvHostPredicate\(\(\) => canEditRoom/);
+    expect(main).not.toMatch(/setTvHostPredicate\(\(\) => isLocalPlayerRoomOwner/);
+  });
+
   it('the documented authority split still covers every shareholder surface', () => {
     // WHY a bare count: main.ts's isLocalPlayerRoomOwner docblock lists the
     // five surfaces shareholders reach, and that list is hand-maintained.

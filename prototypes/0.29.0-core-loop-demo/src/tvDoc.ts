@@ -317,9 +317,19 @@ let identityProvider: () => { pub: string; name: string } = () => ({ pub: '', na
 export function setTvIdentity(provider: () => { pub: string; name: string }): void {
   identityProvider = provider;
 }
+/** The spare remote's holder: the room's DEED holder, as main.ts registers
+ *  it (#142's split: taking the remote from someone, or handing theirs on,
+ *  unseats them, so this is the raw deed predicate, never the shareholder-
+ *  extended edit gate a peer-written venture record can satisfy). */
 let hostPredicate: () => boolean = () => false;
 export function setTvHostPredicate(predicate: () => boolean): void {
   hostPredicate = predicate;
+}
+/** Whether this client holds the spare remote. The panels paint TAKE BACK
+ *  and the owner's HAND TO from here — the same predicate that gates the
+ *  write, so no button is offered that the write then refuses. */
+export function holdsSpareRemote(): boolean {
+  return hostPredicate();
 }
 /** This page's id for the lease: a page LOAD, not a device and not a key
  *  (the pusherCroupier sessionId idea). main.ts sets a fresh one per load. */

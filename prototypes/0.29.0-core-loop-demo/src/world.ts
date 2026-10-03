@@ -5736,7 +5736,6 @@ export class World {
         label,
         myPub: () => getIdentityPub(),
         myName: () => getPlayerName(),
-        canEdit: () => canEditRoom().ok,
         roomPlayers: () => tvRoomPlayers(getIdentityPub()),
         openTheatre: () => deviceFocus.releaseThen(() => openTvTheatre(deviceId, { label })),
         openRemote: () =>
