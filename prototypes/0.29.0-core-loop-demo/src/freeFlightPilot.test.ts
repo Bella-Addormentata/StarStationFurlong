@@ -214,6 +214,17 @@ describe('🅿️ a station flying by itself', () => {
   });
 });
 
+describe('fuel with the last tank taken out mid-flight', () => {
+  it('still comes off the kept level when the stick is let go', () => {
+    const t = Date.now();
+    fly(farPose(t));
+    let ms = t;
+    for (let i = 0; i < 4; i++) pilotFrame({ ...NO_INPUT, thrust: 1 }, 0.05, CAP, (ms += 50));
+    releaseStick(0, ms + 50);
+    expect(readFuelLevel(CAP)).toBeLessThan(CAP);
+  });
+});
+
 describe('🅿️ a parked station whose orbit claim loses', () => {
   afterEach(() => {
     setStationRoomSource(() => '');

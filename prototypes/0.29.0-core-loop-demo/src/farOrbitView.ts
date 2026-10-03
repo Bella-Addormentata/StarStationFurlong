@@ -391,9 +391,10 @@ function readSource(now: number): Source {
     .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
     // A ship is listed as its own one-module station too; a flying one is
     // drawn on its transfer instead, a docked one not at all. A saved or
-    // built-in station that flew by itself (Fly and park) is drawn as a
-    // ship only while it flies free; parked, it is a station again.
-    .filter((s) => !flying.has(s.welcomeRoomId) || (!s.derived && !flyingFree.has(s.welcomeRoomId)))
+    // built-in station that flew by itself (Fly and park) is no station
+    // while it flies free (remembered past its summary: flyingFreeRooms),
+    // drawn as a ship while its summary lasts; parked, it is one again.
+    .filter((s) => !flyingFree.has(s.welcomeRoomId) && (!flying.has(s.welcomeRoomId) || !s.derived))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 

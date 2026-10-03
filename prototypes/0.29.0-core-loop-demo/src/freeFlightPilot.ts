@@ -24,7 +24,8 @@ import {
 import type { FreePose, FreeStation, StickInput } from './freeFlight';
 import { orbitForSlot, angleAt, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
-import { readFlightRecord, readFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
+import { readFlightRecord, readFuelLevel, readStoredFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
+import { localStationId, portableStationId } from './stationDirectory';
 import { adriftPlace, currentRoomId, latestMoveOf, listStations, planetById, stationInTransit } from './stations';
 import type { StationRecord } from './stations';
 
@@ -94,7 +95,9 @@ let markSeen: { doc: unknown; at: number; seenAt: number } | null = null;
 export function markFreeDock(stationId: string, from: string, pose: FreePose, now = Date.now()): boolean {
   const h = shipDocHandle();
   if (!h) return false;
-  const mark: FreeDockMark = { stationId, from, pose: cleanPose(pose), at: now };
+  // Station ids as the shared flight record carries them: every install
+  // reads them back as its own (localStationId).
+  const mark: FreeDockMark = { stationId: portableStationId(stationId), from: portableStationId(from), pose: cleanPose(pose), at: now };
   if (!isDockMark(mark)) return false;
   h.doc.transact(() => h.map.set(DOCK_MARK_KEY, mark));
   dockPending = { doc: h.doc, at: now };
@@ -132,7 +135,7 @@ export function recoverFreeDock(
   if (rec.status !== 'docked' || ports.some((p) => p.state.kind === 'docked')) { clear(); return false; }
   // Another install names the station its own way: not ours to judge (this
   // game's own answer settled somewhere else, say open orbit, is).
-  if (rec.locationId !== raw.stationId) { if (answered) { dockPending = null; clear(); } return false; }
+  if (rec.locationId !== localStationId(raw.stationId)) { if (answered) { dockPending = null; clear(); } return false; }
   if (answered) {
     dockPending = null;
   } else {
@@ -144,7 +147,7 @@ export function recoverFreeDock(
     if (now - markSeen.seenAt < FREE_DOCK_SETTLE_MS) return false;
   }
   if (!writeFreePose(raw.pose)) return false;
-  if (!writeFlightRecord({ status: 'free-flight', locationId: raw.from })) return false;
+  if (!writeFlightRecord({ status: 'free-flight', locationId: localStationId(raw.from) })) return false;
   clear();
   return true;
 }
@@ -400,8 +403,11 @@ function flushLive(capacity: number, now: number): void {
   if (!live) return;
   if (writeFreePose(live.pose)) live.writtenAt = now;
   const whole = Math.floor(live.owedFuel);
-  if (whole >= 1 && capacity > 0) {
-    writeFuelLevel(Math.max(0, readFuelLevel(capacity) - whole), capacity);
+  if (whole >= 1) {
+    // With no tank fitted any more (the last one taken out mid-flight), the
+    // burn still comes out of the level kept for when one is fitted again.
+    const cap = capacity > 0 ? capacity : readStoredFuelLevel();
+    writeFuelLevel(Math.max(0, readFuelLevel(cap) - whole), cap);
     live.owedFuel -= whole;
   }
 }
