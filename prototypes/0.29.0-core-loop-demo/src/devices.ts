@@ -70,8 +70,10 @@ import { currentRoomId, dockedStationFor, listStations as listStationRecordsNow,
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
+  berthHeldByMove,
   castOffPlaces,
   castOffRefusal,
+  detachBerth,
   releaseEveryDock,
   rememberBerthHere,
   completeArrival,
@@ -83,7 +85,6 @@ import {
 // refuse a permanent connector-chain (a chained module cannot fly, by
 // construction — plan §5.1). DEPART also detaches any transient berth.
 import {
-  deleteDoorPairing,
   readAllDoors,
   subscribeDoors,
   type DoorPairing,
@@ -2033,9 +2034,9 @@ function hasLiveDock(): boolean {
 }
 
 /** Enumerate the room's TRANSIENT guest-berths — a paired berth that IS a
- *  transient (#67 D2). DEPART iterates these and calls deleteDoorPairing on
- *  each so the station is "cast off" before the state advances to in-flight
- *  (plan §5.1: undock via the transient-berth detach). */
+ *  transient (#67 D2). DEPART releases each (shipArrival.detachBerth) so the
+ *  station is "cast off" before the state advances to in-flight (plan §5.1:
+ *  undock via the transient-berth detach). */
 function enumerateTransientBerths(): string[] {
   const out: string[] = [];
   for (const [id, rec] of readAllDoors()) {
@@ -2044,6 +2045,15 @@ function enumerateTransientBerths(): string[] {
     out.push(id);
   }
   return out;
+}
+
+/** 🚚 Does a station move hold any of them now, a dock or a legacy berth
+ *  (shipArrival.berthHeldByMove)? A station between planets keeps the ships
+ *  it holds, and UNDOCK and DETACH both refuse: so does DEPART. */
+function transientBerthHeld(): boolean {
+  const room = currentRoomId();
+  const now = Date.now();
+  return enumerateTransientBerths().some((id) => berthHeldByMove(room, id, now));
 }
 
 /** Derived flight capability — plan §1.4: at least one fuel tank, engine, and
@@ -2533,6 +2543,16 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         render();
         return;
       }
+      //    Nor one a station move holds, legacy berths included: they are no
+      //    dock port, so no UNDOCK would answer for them.
+      if (transientBerthHeld()) {
+        setArrivalNote({
+          tone: 'warn',
+          text: 'Cannot depart: a station moving between planets holds this ship until it arrives.',
+        });
+        render();
+        return;
+      }
       //    Keep the berth here first: a ship that cannot remember where it
       //    docked must not leave (the return trip would have nowhere to go).
       if (shipDocking && !rememberBerthHere(fromId, shipDocking.ports())) {
@@ -2568,6 +2588,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             });
             return;
           }
+          // A move heard of meanwhile holds whatever it holds.
+          if (transientBerthHeld()) {
+            setArrivalNote({
+              tone: 'warn',
+              text: 'Did not depart: a station moving between planets holds this ship until it arrives.',
+            });
+            return;
+          }
           // 2) Every check again, as things are once the docks have let go
           //    (the far writes take a while: a launch window can pass, a
           //    peer can draw on the tanks), and still free here — no dock
@@ -2575,8 +2603,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           const go = shipDocking?.ports().some((p) => p.state.kind === 'docked')
             ? null
             : departureNow(fromId, destId);
-          // 3) Publish the flight record, then detach any other transient
-          //    guest berth (#67 D2, either-side legal).
+          // 3) Release every other transient guest berth (#67 D2, either-side
+          //    legal; a legacy berth is no dock port), then publish the
+          //    flight record.
+          if (go) for (const doorId of enumerateTransientBerths()) detachBerth(doorId);
           if (!go || !writeFlightRecord(departureFlight(fromId, dest.id, go.hop))) {
             setArrivalNote({
               tone: 'warn',
@@ -2584,7 +2614,6 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             });
             return;
           }
-          for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
           // 4) Debit the fuel cost.
           writeFuelLevel(go.fuel - go.hop.fuelCost, go.capacity);
           setArrivalNote(null);

@@ -167,6 +167,7 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readAllDoorsIfComplete,
   readDoor,
   subscribeDoors,
   transactDoorWrites,
@@ -1227,10 +1228,15 @@ function ownStationOf(roomId: string): string | null {
 }
 
 /** 🪐 What this client tells the planet about the ship it stands in: null
- *  when the room is no ready ship, or is a module bolted into a station. */
+ *  when the room is no ready ship, or is a module bolted into a station —
+ *  or when its doors are more than a snapshot holds (the entry stands). */
 function planetShipStatus(): ShipStatusInput | null {
   const roomId = activeBootstrap?.roomId ?? "";
-  if (!roomId || !isShipReady() || isBoltedIntoStation(readAllDoors().values())) return null;
+  // 🚚 Only a snapshot that holds every door: a capped one could leave out
+  // the gangway bolting this module into a station, or the ship's live dock,
+  // and then this would publish where its flight record left it instead.
+  const doors = readAllDoorsIfComplete();
+  if (!roomId || !isShipReady() || !doors || isBoltedIntoStation(doors.values())) return null;
   const rec = readFlightRecord();
   const stations = listStations();
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
@@ -1239,7 +1245,7 @@ function planetShipStatus(): ShipStatusInput | null {
   // where its flight record leaves it, wherever its stations have moved
   // without it (shipPlaceId). It is at that station, or (in open orbit)
   // left its record's.
-  const host = dockedStationFor(roomId, readAllDoors().values());
+  const host = dockedStationFor(roomId, doors.values());
   const at = host ?? shipPlaceId(rec);
   const from = byId(at) ?? byId(rec.locationId);
   const to = byId(rec.destinationId);

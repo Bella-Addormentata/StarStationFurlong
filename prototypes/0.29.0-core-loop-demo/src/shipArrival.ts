@@ -20,10 +20,10 @@
  */
 
 import { isDockChain } from './adapter';
-import { stampAfter, type DockPortState } from './dockRules';
+import { berthMemoryFrom, stampAfter, type DockPortState } from './dockRules';
 import { readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
-import { stationLeftFrom } from './stationMove';
+import { dockLockedByMove, stationLeftFrom } from './stationMove';
 import {
   currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
 } from './stations';
@@ -259,6 +259,46 @@ export function releasePlaceOf(roomId: string, now: number = Date.now()): string
   return host && !stationInTransit(host, now) ? placeOf(host) : undefined;
 }
 
+/** The room a door's record leads to (paired) or last led to (a tombstone);
+ *  '' for none, or for a peer-written address that names no room. */
+function doorPartnerRoom(record: DoorRecord | undefined): string {
+  if (!record) return '';
+  try {
+    return roomIdFromSeed(record.paired === true ? record.connectedRoomAddress : record.retiredAddress);
+  } catch {
+    return '';
+  }
+}
+
+/** 🚚 Does a station move hold the connection through this door of `roomId`:
+ *  a station between planets, or a tug's tow, at either end? Then neither
+ *  end lets go until it arrives (docking.ts undockPort and DETACH). */
+export function berthHeldByMove(roomId: string, doorId: string, now: number = Date.now()): boolean {
+  const record = readDoor(doorId);
+  return dockLockedByMove([roomId, record?.paired === true ? doorPartnerRoom(record) : ''], now);
+}
+
+/**
+ * ⏏ #67 D2: DETACH a transient berth here — a tombstone, not a delete. 🚚 As
+ * an UNDOCK's does, it records when this end let go and where the other
+ * end's station was then (DockBerthMemory.at, releasePlaceOf), so a ship the
+ * berth held rests there (restingPlace), wherever the berth had carried it;
+ * and no walk-through mirrors the berth back (dockRules.mirrorMayWrite).
+ * Returns whether it wrote. A berth a station move holds is the caller's to
+ * refuse first (berthHeldByMove).
+ */
+export function detachBerth(doorId: string, now: number = Date.now()): boolean {
+  const record = readDoor(doorId);
+  if (record?.paired !== true) return false;
+  const far = doorPartnerRoom(record);
+  writeDoorTombstone(
+    doorId,
+    record.connectedRoomAddress,
+    berthMemoryFrom(record, stampAfter(record.dockedAt, now), far ? releasePlaceOf(far, now) : undefined),
+  );
+  return true;
+}
+
 /**
  * What a ship's rest record (shipDoc.RestPlace) says at `now`, from the doors
  * it names, each read directly: a scan of the doors is capped, and a peer
@@ -354,8 +394,12 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
     // record names (MAX_REST_DOCKS).
     docks.sort();
     if (docks.length === 0) return false;
-    if (rest?.docks?.length === docks.length && rest.docks.every((d, i) => d === docks[i])) return false;
-    return writeRestPlace({ at: placeOf(host), since: Math.floor(now), docks });
+    // The station's place too: docks that carried the ship to another planet
+    // are the same doors, and a release that records no place (an older
+    // build's DETACH) falls back on where the record says it rests.
+    const at = placeOf(host);
+    if (rest?.at === at && rest.docks?.length === docks.length && rest.docks.every((d, i) => d === docks[i])) return false;
+    return writeRestPlace({ at, since: Math.floor(now), docks });
   }
   if (!rest?.docks?.length) return false;
   const resting = restingPlace(rest, now, stations);

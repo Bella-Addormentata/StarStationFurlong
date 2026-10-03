@@ -17,7 +17,9 @@ import {
   writeDoorTombstone,
 } from './doorsDoc';
 import {
+  berthHeldByMove,
   berthToRemember,
+  detachBerth,
   ARRIVAL_GRACE_MS,
   castOffForDeparture,
   resolveRememberedBerth,
@@ -704,6 +706,46 @@ describe('where a ship with no live dock is', () => {
     })).toBe(true);
     expect(keepRestPlace('ship-room', now + 10_000)).toBe(false);
     expect(shipPlaceId(readFlightRecord(), now + 10_000)).toBe(was);
+  });
+
+  it('leaves a ship a legacy berth carried to another planet where its DETACH let go of it', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    writeFlightRecord({ status: 'docked', locationId: 'furlong-station' });
+    // A transient gangway from before docks were round: no dock chain.
+    writeDoorPairing('east', seed, buildDoorPairing(seed, {
+      segments: [{ kind: 'flex', bendDeg: 0 }], farDoor: 'south', farWall: 'y+', transient: true,
+    }));
+    expect(keepRestPlace('ship-room', now)).toBe(true);
+    expect(readRestPlace()).toEqual({ at: placeOfStation('furlong-station'), since: now, docks: ['east'] });
+    // Furlong carries it to Aris: the berth holds all the way.
+    expect(writeStationMove({
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now + 1000, arriveAt: now + 10_000,
+      mode: 'thrusters', bookedAt: now + 500, fuel: 1, fuelDrawn: 0,
+    })).toBe(true);
+    expect(berthHeldByMove('ship-room', 'east', now + 5000)).toBe(true);
+    expect(keepRestPlace('ship-room', now + 5000)).toBe(false);
+    // There, the rest record follows the station to its new place.
+    const atAris = listStations(undefined, undefined, now + 11_000).find((st) => st.id === 'furlong-station')!;
+    const there = adriftAt('planet-aris', atAris.orbitSlot);
+    expect(berthHeldByMove('ship-room', 'east', now + 11_000)).toBe(false);
+    expect(keepRestPlace('ship-room', now + 11_000)).toBe(true);
+    expect(readRestPlace()).toEqual({ at: there, since: now + 11_000, docks: ['east'] });
+    // DETACHed: a tombstone recording when and where Furlong let go of it.
+    expect(detachBerth('east', now + 12_000)).toBe(true);
+    expect(readDoor('east')).toEqual({
+      paired: false, retiredAddress: seed, dock: { undockedAt: now + 12_000, farDoor: 'south', farWall: 'y+', at: there },
+    });
+    expect(detachBerth('east', now + 13_000)).toBe(false);
+    expect(restingPlace(readRestPlace()!, now + 14_000)).toMatchObject({ at: there, releasedAt: now + 12_000, recorded: true });
+    expect(shipPlaceId(readFlightRecord(), now + 14_000)).toBe('furlong-station');
   });
 
   it('names every dock holding the ship, so one that lets go after a move still counts', () => {

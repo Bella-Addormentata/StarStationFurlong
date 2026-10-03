@@ -39,7 +39,7 @@ import {
   setStationMoveResolver,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
-import { freeSlotAround, installStationMoveResolver, rememberMove } from './stationMove';
+import { freeSlotAround, installStationMoveResolver, rememberMove, rememberedMoveFor } from './stationMove';
 import { directoryFromStationRecords, localStationId, setStationDirectory } from './stationDirectory';
 import { bindShipDoc, readFlightRecord, writeFlightRecord } from './shipDoc';
 
@@ -277,6 +277,29 @@ describe('guards', () => {
   });
 });
 
+/** HAB RING moved from Sovereign to Aris (its first record still says
+ *  Sovereign) and its arrival was pinned there; then a tug booked to tow it
+ *  was outbid by the yard's tow on the same tug. */
+function outbidTow(now: number): { moved: StationMove; pin: StationMove; tow: StationMove; rival: StationMove } {
+  const moved: StationMove = {
+    stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+    departAt: now - 20_000, arriveAt: now - 10_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10, bookedAt: now - 25_000,
+  };
+  const pin: StationMove = {
+    ...moved, fromPlanetId: ARIS, fromSlot: 5, departAt: moved.arriveAt, arriveAt: moved.arriveAt + 1,
+    fuel: 0, fuelDrawn: 0, bookedAt: now - 9000, settles: moved,
+  };
+  const tow: StationMove = {
+    stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: ARIS, fromSlot: 5, toPlanetId: SOV, toSlot: 3,
+    departAt: now + 1000, arriveAt: now + 86_400_000, mode: 'tug', tugRoomId: 'tug', fuel: 10, fuelDrawn: 10, bookedAt: now,
+  };
+  const rival: StationMove = {
+    ...tow, stationId: 'yard', welcomeRoomId: 'room-yard', fromPlanetId: SOV, fromSlot: 4, toPlanetId: ARIS, toSlot: 6,
+    departAt: now + 1001, arriveAt: now + 86_400_001,
+  };
+  return { moved, pin, tow, rival };
+}
+
 describe('merge', () => {
   it('takes the owner\'s newer record and, separately, the newer trim', () => {
     const older = summary({ name: 'OLD', ownerId: 'hab', updatedAt: T0, trim: trim({ at: T0 + 5000 }) });
@@ -343,6 +366,31 @@ describe('merge', () => {
   it('reads a single take-back as the first builds sent it', () => {
     expect(cleanStationSummary({ ...summary(), trimGone: { from: 'room-a', readAt: T0 } }, T0)?.trimGone)
       .toEqual([{ from: 'room-a', readAt: T0 }]);
+  });
+
+  it('keeps what a station follows instead of its latest move only beside that move', () => {
+    const now = Date.now();
+    const { pin, tow } = outbidTow(now);
+    const withTow = summary({ move: tow });
+    const beside = summary({ move: tow, stands: pin });
+    // Published beside the very move it ranks below…
+    expect(cleanStationSummary(beside, now)?.stands).toEqual(pin);
+    // …and never alone, beside a move it ranks above, or as that move.
+    expect(cleanStationSummary(summary({ stands: pin }), now)?.stands).toBeUndefined();
+    expect(cleanStationSummary(summary({ move: pin, stands: tow }), now)?.stands).toBeUndefined();
+    expect(cleanStationSummary(summary({ move: tow, stands: tow }), now)?.stands).toBeUndefined();
+    // A reader places the station by it: long after the tow was due, at the
+    // planet its arrival settled, not the one the tow was bound for.
+    expect(summaryPlanet(beside, tow.arriveAt + 1)).toBe(ARIS);
+    expect(summaryPlanet(withTow, tow.arriveAt + 1)).toBe(SOV);
+    // Merged, it stays beside its move, whichever side brought it…
+    expect(mergeStation(withTow, beside, now)?.stands).toEqual(pin);
+    expect(mergeStation(beside, withTow, now)).toBeNull();
+    // …and goes once a later move of the station comes without it.
+    const later: StationMove = { ...tow, departAt: tow.departAt + 5000, arriveAt: tow.arriveAt + 5000 };
+    const merged = mergeStation(beside, summary({ move: later }), now);
+    expect(merged?.move).toEqual(later);
+    expect(merged?.stands).toBeUndefined();
   });
 });
 
@@ -628,6 +676,48 @@ describe('sharing through the room doc', () => {
     publishPlanetSummary(now + 10);
     expect(readStore().stations['room-hab']?.move).toMatchObject({ settles: { mode: 'tug' }, toPlanetId: SOV });
     expect((docA.getMap('stationSummaries').get('room-hab') as StationSummary).move?.settles).toBeDefined();
+  });
+
+  it('shares what a station follows beside its tow another outbid, so a fresh install still places it', () => {
+    const now = Date.now();
+    const { moved, pin, tow, rival } = outbidTow(now);
+    // Install A, aboard the tug, knows both stations as first recorded and
+    // every move: HAB RING's tow lost the tug to the yard's.
+    const docA = new Y.Doc();
+    docA.getMap('stationSummaries').set('room-hab', summary({ updatedAt: now }));
+    docA.getMap('stationSummaries').set('room-yard', summary({ welcomeRoomId: 'room-yard', name: 'YARD', orbitSlot: 4, updatedAt: now }));
+    bindPlanetSummaryDoc(docA, install(null));
+    for (const m of [moved, pin, tow, rival]) expect(rememberMove(m, now)).toBe(true);
+    publishPlanetSummary(now + 10);
+    const hab = docA.getMap('stationSummaries').get('room-hab') as StationSummary;
+    expect(hab.move).toMatchObject({ mode: 'tug', toPlanetId: SOV });
+    expect(hab.stands).toMatchObject({ toPlanetId: ARIS, toSlot: 5, settles: { fromPlanetId: SOV } });
+    // Install B has only the summaries, standing in a station around Aris.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    registerStation(record({ id: 'b-home', name: 'B HOME', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'room-b' }));
+    const docB = new Y.Doc();
+    sync(docA, docB);
+    installStationMoveResolver();
+    const habAt = () => rememberedMoveFor({ id: `${LEARNED_PREFIX}room-hab`, welcomeRoomId: 'room-hab' });
+    try {
+      bindPlanetSummaryDoc(docB, install('b-home'));
+      // It learns the yard's tow too, so HAB RING's never flies: the station
+      // follows where its arrival settled, not its record at Sovereign.
+      expect(habAt()).toMatchObject({ toPlanetId: ARIS, toSlot: 5 });
+      expect(listStations().find((st) => st.welcomeRoomId === 'room-hab')).toMatchObject({ planetId: ARIS, orbitSlot: 5 });
+      // The same summaries without it leave a fresh install nothing to follow.
+      unbindPlanetSummaryForTest();
+      store = new Map();
+      const docC = new Y.Doc();
+      const { stands: _unused, ...withoutStands } = hab;
+      docC.getMap('stationSummaries').set('room-hab', withoutStands);
+      docC.getMap('stationSummaries').set('room-yard', docA.getMap('stationSummaries').get('room-yard'));
+      bindPlanetSummaryDoc(docC, install(null));
+      expect(habAt()).toBeNull();
+    } finally {
+      setStationMoveResolver(null);
+    }
   });
 
   it('two installs that each saved one place fly the standing record\'s slot', () => {

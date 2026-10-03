@@ -41,7 +41,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor } from './stationMove';
+import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { setStationTrimResolver } from './orbits';
 import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver } from './stations';
 import type { KnownPlace, StationMove, StationRecord } from './stations';
@@ -87,6 +87,13 @@ export interface StationSummary {
    *  after it arrives so a late install still learns where it went. Matched
    *  to the station by its welcome room, so the writer's id never matters. */
   move?: StationMove;
+  /** 🚚 When `move` does not stand (a tow outbid by another station's on the
+   *  same tug, say), the move the station follows instead, as an install
+   *  that knew it published it beside that very `move` (mergeStation keeps
+   *  it only there): a reader that learns the rival rejects `move`, and
+   *  without this would place the station by its first record. Ranks below
+   *  `move`. */
+  stands?: StationMove;
   /** One reading per room (sorted by room, at most MAX_TRIM_GONE), so one
    *  helm room's take-back never forgets another's. */
   trimGone?: TrimGone[];
@@ -299,6 +306,9 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   const trim = cleanTrim(v.trim, now);
   if (trim) out.trim = trim;
   if (isStationMove(v.move) && isPlausibleMove(v.move, now) && v.move.welcomeRoomId === out.welcomeRoomId) out.move = cleanMove(v.move);
+  // Only beside a move it ranks below: anything else says nothing more.
+  if (out.move && isStationMove(v.stands) && isPlausibleMove(v.stands, now) && v.stands.welcomeRoomId === out.welcomeRoomId
+    && compareMoves(v.stands, out.move) < 0) out.stands = cleanMove(v.stands);
   const gone = cleanTrimGone(v.trimGone, now);
   if (gone) out.trimGone = gone;
   return canonOrder(out);
@@ -415,7 +425,7 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary, now: number = Date.now()): StationSummary | null {
   if (!prior) return incoming;
   const recordOf = (s: StationSummary): string =>
-    JSON.stringify({ ...s, trim: undefined, move: undefined, trimGone: undefined, ownerAliases: undefined });
+    JSON.stringify({ ...s, trim: undefined, move: undefined, stands: undefined, trimGone: undefined, ownerAliases: undefined });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
   // Two installs that each saved the place under their own id: one of them
   // stands for good (the smaller id), so their republishes cannot take turns.
@@ -443,8 +453,15 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   // (each install decides that from the stations it knows), so the planet
   // it left from counts too.
   const move = newerMove(prior.move, incoming.move);
-  const planet = summaryPlanet({ planetId: base.planetId, move }, now);
-  const leftFrom = move && !move.settles && now >= move.arriveAt ? planetById(move.fromPlanetId).id : null;
+  // What the station follows instead of that move, as published beside it:
+  // beside another move it says nothing.
+  const beside = (s: StationSummary) =>
+    (move && s.stands && JSON.stringify(s.move) === JSON.stringify(move) ? s.stands : undefined);
+  const standsAt = newerMove(beside(prior), beside(incoming));
+  const stands = move && standsAt && compareMoves(standsAt, move) < 0 ? standsAt : undefined;
+  const planet = summaryPlanet({ planetId: base.planetId, move, stands }, now);
+  const flown = stands ?? move;
+  const leftFrom = flown && !flown.settles && now >= flown.arriveAt ? planetById(flown.fromPlanetId).id : null;
   const standing = recordOf(canonOrder({ ...base, updatedAt: 0 }));
   const fits = (s: StationSummary): SharedTrim | undefined => {
     const t = s.trim;
@@ -468,6 +485,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   if (gone) next.trimGone = gone; else delete next.trimGone;
   if (aliases) next.ownerAliases = aliases; else delete next.ownerAliases;
   if (move) next.move = move; else delete next.move;
+  if (stands) next.stands = stands; else delete next.stands;
   const out = canonOrder(next);
   return JSON.stringify(out) === JSON.stringify(prior) ? null : out;
 }
@@ -476,7 +494,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
  *  equal summaries serialize alike wherever a field was added: records are
  *  compared, and settled between installs, by their JSON. */
 const SUMMARY_ORDER = [
-  'welcomeRoomId', 'name', 'planetId', 'orbitSlot', 'updatedAt', 'berthDoor', 'ownerId', 'ownerAliases', 'ext', 'trim', 'move', 'trimGone',
+  'welcomeRoomId', 'name', 'planetId', 'orbitSlot', 'updatedAt', 'berthDoor', 'ownerId', 'ownerAliases', 'ext', 'trim', 'move', 'stands', 'trimGone',
 ] as const;
 
 function canonOrder(s: StationSummary): StationSummary {
@@ -568,9 +586,10 @@ function stationRecency(s: StationSummary, now: number): number {
 /** The planet a station summary is at now: its move's (a pin's place, the
  *  destination once arrived, else where it left from) over its record's,
  *  which a derived station keeps from its first stamp for good
- *  (mergeStation leaves the move out of the standing record). */
-export function summaryPlanet(s: { planetId: string; move?: StationMove }, now: number = Date.now()): string {
-  const m = s.move;
+ *  (mergeStation leaves the move out of the standing record). The move it
+ *  follows, that is: the one beside its latest when that does not stand. */
+export function summaryPlanet(s: { planetId: string; move?: StationMove; stands?: StationMove }, now: number = Date.now()): string {
+  const m = s.stands ?? s.move;
   if (!m) return planetById(s.planetId).id;
   return planetById(m.settles || now >= m.arriveAt ? m.toPlanetId : m.fromPlanetId).id;
 }
@@ -584,7 +603,7 @@ function settledPlanet(
   now: number,
   listedAt: (welcomeRoomId: string) => StationRecord | null | undefined,
 ): string {
-  const m = s.move;
+  const m = s.stands ?? s.move;
   const st = m && !m.settles && now >= m.arriveAt ? listedAt(s.welcomeRoomId) : null;
   return st ? planetById(st.planetId).id : summaryPlanet(s, now);
 }
@@ -713,8 +732,8 @@ export function foldOwnStation(
   const sameRecord = (a: StationSummary, b: StationSummary): boolean =>
     // The owner id is per install: another install's identical record is the
     // same record, not news to republish over.
-    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, move: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined })
-      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, move: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined });
+    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined })
+      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined });
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
     : known;
@@ -739,7 +758,8 @@ export function foldOwnStation(
       : undefined;
   // A move rides by its own departure time, whoever's record is kept.
   const move = newerMove(base.move, mine.move);
-  const { trim: _unused, trimGone: _unusedGone, move: _unusedMove, ...rest } = base;
+  // (What stood beside the known move stays with it: mergeStation keeps it.)
+  const { trim: _unused, trimGone: _unusedGone, move: _unusedMove, stands: _unusedStands, ...rest } = base;
   // A new move freshens an owned summary's stamp too (an unowned record keeps
   // its first stamp; stationRecency counts its move instead), so the caps
   // never drop a station that just moved.
@@ -1011,8 +1031,15 @@ export function publishPlanetSummary(now = Date.now()): void {
   for (const move of latestRememberedMoves()) {
     const k = move.welcomeRoomId!;
     const known = store.stations[k];
-    const next = known ? mergeStation(known, { ...known, move }, now) : null;
-    if (next) store.stations[k] = next;
+    if (!known) continue;
+    const { stands: _unusedStands, ...bare } = known;
+    let next = mergeStation(known, { ...bare, move }, now) ?? known;
+    // 🚚 When that move does not stand here (a tow another station's
+    // outbid on the same tug, say), the one the station follows goes
+    // beside it, so a reader that learns the rival still places it.
+    const stands = next.move ? standingInsteadOf(next.move) : null;
+    if (stands) next = mergeStation(next, { ...next, stands }, now) ?? next;
+    if (next !== known) store.stations[k] = next;
   }
   const ship = ctx.ship();
   // A first-hand change goes out past any stamp already known for this ship
@@ -1099,7 +1126,10 @@ let trimsByStationId = new Map<string, SharedTrim>();
  *  stations, then map every listed station to its newest known trim. */
 function applyLearned(store: Store): void {
   // Moves first: they decide which planet each station is listed at.
-  for (const s of Object.values(store.stations)) if (s.move) rememberMove(s.move);
+  for (const s of Object.values(store.stations)) {
+    if (s.move) rememberMove(s.move);
+    if (s.stands) rememberMove(s.stands);
+  }
   const room = mayBeShipRoom();
   const found = ctx?.currentStation() ?? null;
   const here = found && !isShipStandIn(found, room) ? found : null;
@@ -1152,7 +1182,7 @@ export function installKnownPlacesResolver(): void {
       welcomeRoomId: s.welcomeRoomId,
       planetId: s.planetId,
       orbitSlot: s.orbitSlot,
-      ...(s.move ? { move: s.move } : {}),
+      ...(s.move ? { move: s.stands ?? s.move } : {}),
     }));
     knownPlacesCache = { text, places };
     return places;

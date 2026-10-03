@@ -977,6 +977,20 @@ export function rememberedMoveFor(station: MovingStation): StationMove | null {
   return knownStanding().find((m) => moveBelongsTo(m, station)) ?? null;
 }
 
+/** 🚚 The move a station follows instead of `latest` (the latest move known
+ *  for it), when that one does not stand here: a tow outbid by another
+ *  station's on the same tug, or a move beaten by a concurrent one of its
+ *  station (superseded). Null when it stands, or when nothing of the
+ *  station's ranking below it does. A planet summary carries it beside
+ *  `latest` (planetSummary.ts `stands`): a reader that learns the rival
+ *  rejects `latest`, and without this would place the station by its first
+ *  record. */
+export function standingInsteadOf(latest: StationMove): StationMove | null {
+  if (!superseded(latest, [...roomStanding(), ...readRememberedMoves()])) return null;
+  const stands = knownStanding().find((m) => sameStation(m, latest));
+  return stands && compareMoves(stands, latest) < 0 ? stands : null;
+}
+
 /** Where a station left from on the first of its moves to depart between
  *  `sinceMs` and `nowMs`: where it was at `sinceMs`, once it has left since
  *  (null: it has not). Among the moves this install knows (the bound room's

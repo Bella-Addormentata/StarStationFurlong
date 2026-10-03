@@ -99,7 +99,6 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import {
-  deleteDoorPairing,
   writeDoorTombstone,
   writeDoorPairing,
   readDoor,
@@ -112,7 +111,7 @@ import {
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
 import { dockLockedByMove } from "./stationMove";
-import { releasePlaceOf } from "./shipArrival";
+import { berthHeldByMove, detachBerth, releasePlaceOf } from "./shipArrival";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2069,8 +2068,10 @@ export class DoorDockingPortSystem {
           // The doc delete reconciles to every client (projection torn down,
           // door re-locked) through the normal doors-doc path.
           // 🚚 Not while a station move holds it: a berth carries its ship
-          // between planets as a dock does (undockPort).
-          if (!this.heldByMove(doorId)) deleteDoorPairing(doorId);
+          // between planets as a dock does (undockPort). And a tombstone,
+          // as an UNDOCK leaves, recording where its station let go of the
+          // ship (shipArrival.detachBerth).
+          if (!this.heldByMove(doorId)) detachBerth(doorId);
         } else if (!this.isRoomOwner()) {
           return; // every action below is owner-only (UI gate, dev-phase posture)
         } else if (action === "cycle-passage") {
@@ -2645,14 +2646,7 @@ export class DoorDockingPortSystem {
    *  planets, or a tug's tow, at either end? Then neither end lets go until
    *  it arrives (undockPort). */
   private heldByMove(doorId: string): boolean {
-    const record = readDoor(doorId);
-    let far = "";
-    try {
-      far = record?.paired ? roomIdFromSeed(record.connectedRoomAddress) : "";
-    } catch {
-      far = "";
-    }
-    return dockLockedByMove([this.roomNow(), far], Date.now());
+    return berthHeldByMove(this.roomNow(), doorId);
   }
 
   /** The module on the other side, by name when the atlas knows it. */
