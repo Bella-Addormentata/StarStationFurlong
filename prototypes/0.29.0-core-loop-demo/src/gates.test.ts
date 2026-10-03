@@ -269,6 +269,79 @@ describe('gate gossip that doors alone would skip', () => {
   });
 });
 
+describe('a room with a port not numbered yet', () => {
+  // A port fitted before gates has no number until the room's owner numbers
+  // it, so a harvest there cannot list the room's gates.
+  it("drops the room's older gate list, so it cannot hide a legacy berth there", () => {
+    registerStation({ id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'north' });
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: {} });
+    expect(listStations().find((s) => s.id === 'far')?.berthDoor).toBeUndefined();
+    // An older client fits a port on north, with no number.
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: null });
+    expect(readAtlas()['room-far']?.gates).toBeUndefined();
+    const far = listStations().find((s) => s.id === 'far')!;
+    expect(far.berthDoor).toBe('north');
+    expect(far.berths).toEqual([{ roomId: 'room-far', doorId: 'north' }]);
+    // A harvest that says nothing of gates leaves them unknown; one that
+    // knows them lists them again.
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [] });
+    expect(readAtlas()['room-far']?.gates).toBeUndefined();
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: { north: 1 } });
+    expect(readAtlas()['room-far']?.gates).toEqual({ north: 1 });
+    expect(readAtlas()['room-far']?.gatesUnknown).toBeUndefined();
+  });
+
+  it("keeps the gates unknown through an older doc copy's list", () => {
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: {} });
+    const doc = new Y.Doc();
+    bindStationAtlasDoc(doc, { roomId: 'room-far', isPassagePublic: () => false });
+    expect((doc.getMap('atlas').get('room-far') as { gates?: unknown }).gates).toEqual({});
+    // Another room's doc holds that copy, listing no gates.
+    const elsewhere = new Y.Doc();
+    Y.applyUpdate(elsewhere, Y.encodeStateAsUpdate(doc));
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: null });
+    bindStationAtlasDoc(elsewhere, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-far']?.gates).toBeUndefined();
+  });
+
+  it('lets no older copy decide the gates, though it lists more doors', () => {
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: null });
+    const door = { targetRoomId: 'room-a', farDoor: 'east', transient: false };
+    const doc = new Y.Doc();
+    // Older than our harvest, with a door ours lacks: it rebuilds the entry.
+    doc.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 1, doors: { west: door }, gates: {} });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(Object.keys(readAtlas()['room-far']!.doors)).toEqual(['west']);
+    expect(readAtlas()['room-far']?.gates).toBeUndefined();
+    expect(readAtlas()['room-far']?.gatesUnknown).toBe(true);
+    // Nor does an older copy saying they are not known drop a newer list.
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: { north: 1 } });
+    const later = new Y.Doc();
+    later.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 1, doors: { west: door }, gatesUnknown: true });
+    bindStationAtlasDoc(later, { roomId: 'room-y', isPassagePublic: () => false });
+    expect(readAtlas()['room-far']?.gates).toEqual({ north: 1 });
+    expect(readAtlas()['room-far']?.gatesUnknown).toBeUndefined();
+  });
+
+  it('tells peers the gates are not known, and they drop the list they had', () => {
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: null });
+    const doc = new Y.Doc();
+    bindStationAtlasDoc(doc, { roomId: 'room-far', isPassagePublic: () => false });
+    const shared = doc.getMap('atlas').get('room-far') as { gates?: unknown; gatesUnknown?: unknown };
+    expect(shared.gates).toBeUndefined();
+    expect(shared.gatesUnknown).toBe(true);
+    // A peer learned earlier that the room had no gates.
+    store.clear();
+    const old = new Y.Doc();
+    old.getMap('atlas').set('room-far', { roomId: 'room-far', name: 'FAR', updatedAt: 1, doors: {}, gates: {} });
+    bindStationAtlasDoc(old, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-far']?.gates).toEqual({});
+    bindStationAtlasDoc(doc, { roomId: 'room-y', isPassagePublic: () => false });
+    expect(readAtlas()['room-far']?.gates).toBeUndefined();
+    expect(readAtlas()['room-far']?.gatesUnknown).toBe(true);
+  });
+});
+
 describe("a far room doc's shared atlas", () => {
   const entry = (roomId: string, updatedAt: number, doors: Record<string, unknown>, gates?: Record<string, number>) => ({
     roomId, name: roomId, updatedAt, doors, ...(gates ? { gates } : {}),

@@ -3705,8 +3705,8 @@ function harvestStationAtlas(): void {
     });
   // ⚓🚦 A port fitted before gates existed has no number: the owner numbers
   // it here, once. Until then (anyone else here) the room's gates are not
-  // known, so the harvest leaves them as they were rather than listing none
-  // and hiding a legacy berth.
+  // known, and the harvest says so (null): an older list, even one of none,
+  // would hide that port as a legacy berth.
   const unnumbered = readUnnumberedPorts();
   if (unnumbered.length > 0 && isLocalHelmCommander() && yjsSync) {
     // One transaction: the policy observer (which harvests again) runs only
@@ -3724,7 +3724,7 @@ function harvestStationAtlas(): void {
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
-    ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
+    ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : { gates: null }),
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
