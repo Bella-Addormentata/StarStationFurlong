@@ -242,10 +242,18 @@ export class StationPlanView {
   private render(): void {
     if (!this.title || !this.station) return;
     this.title.textContent = `🗺 ${this.station.name}`;
+    // The side panel is rebuilt below: remember which of its buttons held
+    // focus and give it back, so keyboard users keep their place.
+    const active = document.activeElement;
+    const keep = active instanceof HTMLElement && this.root?.contains(active)
+      ? (active.dataset.roomId !== undefined ? `[data-room-id="${CSS.escape(active.dataset.roomId)}"]`
+        : active.dataset.doorId !== undefined ? `[data-door-id="${CSS.escape(active.dataset.doorId)}"]` : null)
+      : null;
     this.drawCanvas();
     this.renderCard();
     this.renderShips();
     this.renderModuleList();
+    if (keep) this.root?.querySelector<HTMLElement>(keep)?.focus();
   }
 
   private drawCanvas(): void {
@@ -378,9 +386,9 @@ export class StationPlanView {
   }
 
   private ownerText(m: PlanModule): string {
-    if (!m.owner) return 'Owner not known yet (someone must stand in it once).';
-    // The pre-S2 marker names no verifiable owner (roomOwner.ts).
-    if (legacyOwnerMarker(m.owner.id)) return 'No verified owner';
+    if (m.owner === undefined) return 'Owner not known yet (someone must stand in it once).';
+    // null, or the pre-S2 marker: no verifiable owner (roomOwner.ts).
+    if (m.owner === null || legacyOwnerMarker(m.owner.id)) return 'No verified owner';
     if (m.owner.id === this.deps.playerId()) return 'You';
     return m.owner.name ?? shortId(m.owner.id);
   }

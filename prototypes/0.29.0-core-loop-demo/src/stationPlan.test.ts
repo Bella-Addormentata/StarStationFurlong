@@ -222,6 +222,7 @@ describe('a module owner in the atlas', () => {
       owner: null,
     });
     expect(readAtlas()['room-a'].owner).toBeNull();
+    expect(stationPlan(readAtlas(), 'room-a').modules[0].owner).toBeNull();
     bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
     expect((doc.getMap('atlas').get('room-a') as { owner?: unknown }).owner).toBeNull();
     // A peer that knew the old owner drops it on the ownerless record.

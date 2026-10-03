@@ -4096,7 +4096,9 @@ function harvestStationAtlas(): void {
   // 🗺️ #192: the module's owner, for the holotable's station atlas — with
   // the name they go by here when their players entry has synced.
   // The legacy marker names no verifiable owner: it is not carried.
-  const rawOwner = (sync.doc.getMap("roomInfo").get("owner") as string | undefined) || "";
+  // roomInfo is peer-written: anything but a string names no owner.
+  const ownerValue: unknown = sync.doc.getMap("roomInfo").get("owner");
+  const rawOwner = typeof ownerValue === "string" ? ownerValue : "";
   const ownerId = legacyOwnerMarker(rawOwner) ? "" : rawOwner;
   const ownerEntry = ownerId
     ? (sync.doc.getMap("players").get(ownerId) as Partial<PlayerEntry> | undefined)

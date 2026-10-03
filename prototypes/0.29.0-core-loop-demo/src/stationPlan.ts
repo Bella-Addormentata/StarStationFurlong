@@ -47,7 +47,8 @@ export interface PlanModule {
   /** The true tile size, when the atlas learned it (a module someone stood in). */
   dims?: { cols: number; rows: number };
   hops: number;
-  owner?: AtlasOwner;
+  /** null: known to have no verifiable owner; absent: not known. */
+  owner?: AtlasOwner | null;
   /** 'ship' for a visiting ship docked at one of the station's berths. */
   kind: 'module' | 'ship';
   /** The room this client stands in. */
@@ -188,7 +189,7 @@ export function stationPlan(
       halfZ: (size.rows * TILE_SIZE) / 2,
       ...(dims ? { dims } : {}),
       hops: p.hops,
-      ...(entry?.owner ? { owner: entry.owner } : {}),
+      ...(entry?.owner !== undefined ? { owner: entry.owner } : {}),
       kind: station.has(p.roomId) ? 'module' : 'ship',
       here: p.roomId === liveRoomId,
       gates,
