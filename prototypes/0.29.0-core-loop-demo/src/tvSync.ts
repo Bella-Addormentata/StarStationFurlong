@@ -168,18 +168,28 @@ export class TvSyncController {
     // Not playing: whatever transport revision brought us here is followed
     // by the state itself; a later resume is a new revision to follow.
     this.appliedJump = this.jump();
-    this.pendingTarget = null;
 
     if (pb.state === 'paused') {
       if (p.isPlaying()) p.pause();
       this.setRate(1);
-      if (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
+      if (hold && this.pendingTarget !== null) {
+        // The holder, with a seek still landing from before the pause: the
+        // paused position is the newer target, re-aimed, or the old seek
+        // would land later and be heartbeated over it on resume.
+        const target = clampToEnd(pb.positionMs, p.durationMs());
+        if (this.pendingTarget !== target) this.aim(p, target, now);
+        this.settlePending(p, now);
+      } else if (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
         && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
         p.seek(pb.positionMs);
         this.lastSeekAt = now;
       }
       return pb;
     }
+
+    // Scheduled, home or off: the programme is not running; a target from
+    // before is void.
+    this.pendingTarget = null;
 
     if (pb.state === 'scheduled') {
       if (p.isPlaying()) p.pause();
@@ -215,47 +225,13 @@ export class TvSyncController {
       // reissued — even inside the band of where the player still reads —
       // or the old seek would land later and be heartbeated over this one.
       const landing = this.pendingTarget !== null;
-      if (landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) {
-        if (p.canSeek) {
-          p.seek(target);
-          this.lastSeekAt = now;
-          this.pendingTarget = target;
-          this.pendingSeekIssued = true;
-          this.pendingSince = now;
-        } else if (p.hasClock) {
-          // A player that cannot seek YET keeps the target, and the beat
-          // waits with it (publishing where the player is would rewind the
-          // room); the seek goes out on the first tick it can. One that never
-          // can (a live stream) gives the target up after TV_SEEK_WAIT_MS.
-          this.pendingTarget = target;
-          this.pendingSeekIssued = false;
-          this.pendingSince = now;
-        }
+      // A player that cannot seek YET (hasClock, !canSeek) keeps the target
+      // too, and the beat waits with it; a start-only embed keeps nothing.
+      if ((landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) && (p.canSeek || p.hasClock)) {
+        this.aim(p, target, now);
       }
     }
-    if (this.pendingTarget !== null && !this.pendingSeekIssued) {
-      if (p.canSeek) {
-        p.seek(this.pendingTarget);
-        this.lastSeekAt = now;
-        this.pendingSeekIssued = true;
-      } else if (now - this.pendingSince >= TV_SEEK_WAIT_MS) {
-        this.pendingTarget = null; // never seekable: the room follows the player
-      }
-    }
-    // A jump has landed once the player reads within the band of it — checked
-    // every tick, not only when a beat is due, so a player that then runs to
-    // its end (a replay of a short film) is seen to end, and so the next beat
-    // goes out as soon as it may. Clamped again here, with a length the
-    // player may not have known at the jump; and a FORWARD seek that ended
-    // the player has landed wherever the media stops, whether or not it ever
-    // said how long it was — a backward one from the end has not.
-    if (this.pendingTarget !== null) {
-      const target = clampToEnd(this.pendingTarget, p.durationMs());
-      const at = p.currentMs();
-      const landed = Math.abs(at - target) <= TV_SEEK_OVER_MS
-        || (p.isEnded() && target >= at - TV_SEEK_OVER_MS);
-      if (landed) this.pendingTarget = null;
-    }
+    this.settlePending(p, now);
     this.setRate(1);
     if (p.isEnded()) {
       // A seek that un-ends the player may still be landing (YouTube's is
@@ -277,6 +253,50 @@ export class TvSyncController {
       this.lastBeatAt = now;
     }
     return pb;
+  }
+
+  /** The holder takes aim at a transport target: the seek goes out now if
+   *  the player can seek, else it waits (an HTML video reports ready at its
+   *  metadata, before its ranges) — the target is kept either way, and no
+   *  beat goes out until it has landed. */
+  private aim(p: TvPlayer, target: number, now: number): void {
+    if (p.canSeek) {
+      p.seek(target);
+      this.lastSeekAt = now;
+      this.pendingSeekIssued = true;
+    } else {
+      this.pendingSeekIssued = false;
+    }
+    this.pendingTarget = target;
+    this.pendingSince = now;
+  }
+
+  /** The holder's pending target: issue the seek on the first tick the
+   *  player can; give it up after TV_SEEK_WAIT_MS on one that never can (a
+   *  live stream — the room then follows the player); and clear it once
+   *  landed — within the band, checked every tick, not only when a beat is
+   *  due, so a player that then runs to its end (a replay of a short film)
+   *  is seen to end. Clamped again here, with a length the player may not
+   *  have known at the jump; and a FORWARD seek that ended the player has
+   *  landed wherever the media stops, whether or not it ever said how long
+   *  it was — a backward one from the end has not. */
+  private settlePending(p: TvPlayer, now: number): void {
+    if (this.pendingTarget === null) return;
+    if (!this.pendingSeekIssued) {
+      if (p.canSeek) {
+        p.seek(this.pendingTarget);
+        this.lastSeekAt = now;
+        this.pendingSeekIssued = true;
+      } else {
+        if (now - this.pendingSince >= TV_SEEK_WAIT_MS) this.pendingTarget = null;
+        return;
+      }
+    }
+    const target = clampToEnd(this.pendingTarget, p.durationMs());
+    const at = p.currentMs();
+    const landed = Math.abs(at - target) <= TV_SEEK_OVER_MS
+      || (p.isEnded() && target >= at - TV_SEEK_OVER_MS);
+    if (landed) this.pendingTarget = null;
   }
 
   /** A viewer: converge on the record (seek when far, nudge when near). */

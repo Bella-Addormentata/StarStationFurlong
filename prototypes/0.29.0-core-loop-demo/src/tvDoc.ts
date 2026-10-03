@@ -7,6 +7,7 @@
  *   tv:<itemId>     → TvProgramme  the programme and the playback clock
  *   remote:<itemId> → RemoteRecord the remote control's holder (a lease)
  *   volume:<itemId> → { volume }   the set's volume, a body button
+ *   power:<itemId>  → { on, seq }  the set's switch, a body button
  * They are SEPARATE keys so renewing the remote's lease never collides with
  * a playback write (the `giftwish:` precedent in partyDoc.ts), and so a
  * viewer turning the sound down while the holder seeks can never carry a
@@ -148,6 +149,19 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
 export const TV_DEFAULT: TvRecord = { ...TV_DEFAULT_PROGRAMME, volume: 70 };
 
 export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by: '', page: '' };
+
+/** The `power:` key: the set's switch, a body button anyone may press. Its
+ *  own key, like the volume, so a press never races the holder's heartbeat
+ *  in the programme's LWW slot. Off keeps the programme, like a real TV; on
+ *  brings it back — the holder's tick parks a programme that was playing
+ *  where it was (tvSession), and a set with nothing on shows the home
+ *  screen. `seq` is a revision: a lookup in flight is void past it. */
+export interface PowerRecord {
+  on: boolean;
+  seq: number;
+}
+
+export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0 };
 
 // ── Binding (the partyDoc shape) ─────────────────────────────────────────────
 
@@ -293,6 +307,9 @@ export function remoteKey(itemId: string): string {
 export function volumeKey(itemId: string): string {
   return `volume:${itemId}`;
 }
+export function powerKey(itemId: string): string {
+  return `power:${itemId}`;
+}
 
 // ── Identity and host seams (registered by main.ts, never asserted by a caller) ──
 
@@ -401,10 +418,27 @@ export function readVolume(itemId: string): number {
   return Math.min(100, Math.max(0, Math.round(v)));
 }
 
-/** What a screen, a phone or the theatre shows: the programme and the
- *  volume, joined from their two keys. */
+/** The set's switch, from its own key; off until someone turns it on. */
+export function readPower(itemId: string): PowerRecord {
+  const raw = ensureMap().get(powerKey(itemId)) as Partial<PowerRecord> | undefined;
+  if (!raw || typeof raw !== 'object') return { ...POWER_DEFAULT };
+  return { on: raw.on === true, seq: Math.max(0, Math.floor(num(raw.seq))) };
+}
+
+/** What a screen, a phone or the theatre shows: the programme, the switch
+ *  and the volume, joined from their keys. Off is off whatever the programme
+ *  says; on with nothing on (or a legacy 'off' written into the programme)
+ *  is the home screen. */
 export function readTv(itemId: string): TvRecord {
-  return { ...readProgramme(itemId), volume: readVolume(itemId) };
+  const programme = readProgramme(itemId);
+  const state: TvState = !readPower(itemId).on ? 'off' : programme.state === 'off' ? 'home' : programme.state;
+  return { ...programme, state, volume: readVolume(itemId) };
+}
+
+/** The revision a lookup in flight is checked against: any programme action
+ *  (`jump`) or power press (`seq`) meanwhile voids it. */
+export function tvRevision(itemId: string): string {
+  return `${readProgramme(itemId).jump}:${readPower(itemId).seq}`;
 }
 
 export function readRemote(itemId: string): RemoteRecord {
@@ -554,6 +588,7 @@ export function tvPlay(itemId: string, source: TvSource, now = clock()): TvActio
   if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
+  switchOn(itemId);
   const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec,
@@ -576,6 +611,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
   const clean = sanitizeSource(source);
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
   if (!Number.isFinite(startAt) || startAt <= now) return { ok: false, error: 'Pick a time that is still ahead.' };
+  switchOn(itemId);
   const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec,
@@ -595,6 +631,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
 export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
+  if (!readPower(itemId).on) return { ok: false, error: 'The set is off.' };
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'scheduled') return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
@@ -656,18 +693,22 @@ export function tvStop(itemId: string): TvAction {
 
 // ── The body buttons: no remote needed ───────────────────────────────────────
 
-/** POWER on the set. Off keeps the programme, like a real TV; on brings it
- *  back paused where it was, or to the home screen with nothing on. */
+/** POWER on the set — its own key, so a press never races the holder's
+ *  heartbeat in the programme's slot (a viewer's press and the holder's beat
+ *  used to meet there, and whichever won undid the other). Off keeps the
+ *  programme, like a real TV; on brings it back: the holder's tick parks a
+ *  programme that was playing where it was (tvSession), and a set with
+ *  nothing on shows the home screen. Returns the new state of the switch. */
 export function tvTogglePower(itemId: string): boolean {
-  const rec = readProgramme(itemId);
-  if (rec.state === 'off') {
-    write(tvKey(itemId), {
-      ...rec, state: rec.source ? 'paused' : 'home', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1,
-    } satisfies TvProgramme);
-    return true;
-  }
-  write(tvKey(itemId), { ...rec, state: 'off', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvProgramme);
-  return false;
+  const power = readPower(itemId);
+  write(powerKey(itemId), { on: !power.on, seq: power.seq + 1 } satisfies PowerRecord);
+  return !power.on;
+}
+
+/** The remote's PLAY and SCHEDULE turn the set on, like a real remote. */
+function switchOn(itemId: string): void {
+  const power = readPower(itemId);
+  if (!power.on) write(powerKey(itemId), { on: true, seq: power.seq + 1 } satisfies PowerRecord);
 }
 
 /** VOLUME on the set: its own key, so a press here never carries a stale
@@ -716,7 +757,7 @@ export function expectedPositionMs(
 
 /** What the room should be showing right now. */
 export function readPlayback(itemId: string, now = clock(), rttMs = 0): PlaybackNow {
-  const rec = readProgramme(itemId);
+  const rec = readTv(itemId); // the composed state: a set that is off is off
   if (rec.state === 'scheduled') {
     const countdownMs = Math.max(0, rec.startAt - now);
     if (countdownMs > 0) return { state: 'scheduled', positionMs: 0, running: false, countdownMs };
@@ -887,7 +928,7 @@ export interface TvScreenView {
 /** Derive what the in-world screen shows from the records alone, so every
  *  client's prop agrees and the drawing code has nothing to decide. */
 export function tvScreenView(itemId: string, now = clock()): TvScreenView {
-  const rec = readProgramme(itemId);
+  const rec = readTv(itemId);
   const remote = readRemote(itemId);
   const holderLine = remote.holder && !remoteLapsed(itemId, now)
     ? `REMOTE · ${remote.name || 'a clone'}`
