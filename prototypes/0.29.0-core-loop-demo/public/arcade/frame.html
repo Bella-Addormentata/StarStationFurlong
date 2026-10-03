@@ -19,7 +19,11 @@
                       { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
     EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
     this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
-    cdn.emulatorjs.org, the owner's call per cabinet.
+    cdn.emulatorjs.org, the owner's call per cabinet. On the CDN lane the
+    parent mounts this frame SANDBOXED (no allow-same-origin): CDN code runs
+    in an opaque origin and cannot reach the app's origin, storage or DOM;
+    `isolated` in the config says so, and every message then travels with
+    the '*' target (an opaque origin has no name to match).
   -->
   <style>
     html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
@@ -61,6 +65,9 @@
         // Its netplay is WebRTC with its own signalling and TURN, marked
         // unstable upstream: not depended on (plan §9). Hide the button.
         window.EJS_Buttons = { netplay: false };
+        // The CDN lane runs this frame sandboxed, in an opaque origin, with
+        // no storage of its own: save states would have nowhere to go.
+        window.EJS_disableDatabases = !!c.isolated;
         window.EJS_ready = function () { post('arcade-ready'); };
         window.EJS_onGameStart = function () { post('arcade-started'); };
         var s = document.createElement('script');

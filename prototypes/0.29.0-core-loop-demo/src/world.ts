@@ -181,8 +181,8 @@ import { tvScreenView } from "./tvDoc";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
 // attract card the prop draws.
 import { createArcadeCabinetUI } from "./arcadeUI";
-import { openArcadeStage } from "./arcadeStage";
-import { tickArcadeRoom } from "./arcadeSession";
+import { closeArcadeStage, isArcadeStageOpen, openArcadeStage } from "./arcadeStage";
+import { forgetCabinet, tickArcadeRoom } from "./arcadeSession";
 import { arcadeScreenView } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
@@ -3100,6 +3100,10 @@ export class World {
     // whose set is gone (no-ops for every other kind).
     if (isTvTheatreOpen(itemId)) closeTvTheatre();
     forgetTv(itemId);
+    // 🕹 #193: likewise a removed cabinet takes its stage (which swallows
+    // the world's keys while it is up) and this page's seat with it.
+    if (isArcadeStageOpen(itemId)) closeArcadeStage();
+    forgetCabinet(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the

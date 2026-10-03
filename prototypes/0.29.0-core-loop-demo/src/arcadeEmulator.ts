@@ -88,6 +88,26 @@ export interface EmulatorConfig {
   pathToData: string;
   /** 0–1. */
   volume: number;
+  /** Engine code from another origin (the CDN lane) runs in a sandboxed
+   *  frame with an OPAQUE origin: it may run scripts, but it never touches
+   *  the app's origin, its storage or the parent page. The station's own
+   *  files are trusted and keep the same origin (so the canvas stays
+   *  reachable for the spectator lane). */
+  isolated: boolean;
+}
+
+/** Whether engine files at `pathToData` come from another origin than the
+ *  app — the CDN lane — and must therefore run isolated. */
+export function emulatorIsolated(
+  pathToData: string,
+  origin = typeof location === 'undefined' ? '' : location.origin,
+): boolean {
+  if (!/^https?:\/\//i.test(pathToData)) return false;
+  try {
+    return new URL(pathToData).origin !== origin;
+  } catch {
+    return true;
+  }
 }
 
 export type EmulatorEvent =
@@ -116,13 +136,18 @@ export function mountEmulatorFrame(
 ): EmulatorHandle {
   const iframe = document.createElement('iframe');
   iframe.className = 'arcade-frame';
-  iframe.setAttribute('allow', 'gamepad; autoplay; fullscreen');
+  iframe.setAttribute('allow', 'gamepad *; autoplay *; fullscreen *');
   iframe.setAttribute('title', `Furlong Arcade — ${config.gameName}`);
+  // The CDN lane: no allow-same-origin, so the frame is an opaque origin —
+  // CDN code runs, and cannot read this page, its storage or its DOM. Only
+  // messages cross (and they are matched to this frame's window below).
+  if (config.isolated) iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups');
   iframe.src = frameUrl;
   let alive = true;
   let configured = false;
   const origin = window.location.origin;
-  const target = origin && origin !== 'null' ? origin : '*';
+  // An opaque-origin frame can only be addressed with '*' (its origin reads "null").
+  const target = !config.isolated && origin && origin !== 'null' ? origin : '*';
   const onMessage = (e: MessageEvent) => {
     if (!alive || e.source !== iframe.contentWindow) return;
     const d = e.data as { type?: unknown; why?: unknown } | null;
@@ -140,6 +165,7 @@ export function mountEmulatorFrame(
           gameName: config.gameName,
           pathToData: config.pathToData,
           volume: config.volume,
+          isolated: config.isolated,
           timeoutMs: EMULATOR_LOAD_TIMEOUT_MS,
         }, target);
         break;

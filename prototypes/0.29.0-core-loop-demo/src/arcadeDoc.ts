@@ -489,8 +489,11 @@ export function countPlay(itemId: string): void {
 
 // ── Games: identity, lanes, parsing (pure) ───────────────────────────────────
 
+/** Stable identity of a game: the link, or — for a file on a player's disk —
+ *  its name AND size, so two different ROMs that happen to share a name do
+ *  not share an identity (the page keeps local files by this id). */
 export function gameId(g: ArcadeGame): string {
-  return `${g.core}:${g.url || `file:${g.name}`}`;
+  return `${g.core}:${g.url || `file:${g.name}:${g.size}`}`;
 }
 
 export type ArcadeLane = 'SOVEREIGN' | 'CONVENIENCE';

@@ -8,7 +8,7 @@ import {
   bindArcadeDoc, insertCoin, readSeat, setArcadeClock, setArcadeHostPredicate, setArcadeIdentity,
   setArcadePageId, ARCADE_SEAT_RENEW_MS,
 } from './arcadeDoc';
-import { leaveArcadeRoom, tickArcadeRoom } from './arcadeSession';
+import { forgetCabinet, leaveArcadeRoom, tickArcadeRoom } from './arcadeSession';
 
 const CAB = 'arcade-cabinet-1';
 let now = 5_000_000;
@@ -54,5 +54,14 @@ describe('the P1 page keeps its seat', () => {
     leaveArcadeRoom([CAB, 'arcade-cabinet-2', 'arcade-cabinet-3']);
     expect(readSeat(CAB).holder).toBe('');
     expect(readSeat('arcade-cabinet-2').holder).toBe('');
+  });
+
+  it('a removed cabinet takes this page\'s seat with it, and nobody else\'s', () => {
+    insertCoin(CAB);
+    insertCoin('arcade-cabinet-2');
+    forgetCabinet(CAB);
+    expect(readSeat(CAB).holder).toBe('');
+    expect(readSeat('arcade-cabinet-2').holder).toBe('AAAAalicepub');
+    forgetCabinet('arcade-cabinet-9'); // never sat: nothing to do
   });
 });

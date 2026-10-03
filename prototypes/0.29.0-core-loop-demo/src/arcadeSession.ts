@@ -37,3 +37,11 @@ export function leaveArcadeRoom(itemIds: readonly string[]): void {
   }
   lastRenew.clear();
 }
+
+/** A cabinet removed from the room: this page stands up from it and drops
+ *  the cadence it kept (World.removeFurnitureVisuals; the stage, if it was
+ *  on that cabinet, closes beside this). */
+export function forgetCabinet(itemId: string): void {
+  if (iAmP1(itemId)) standUp(itemId);
+  lastRenew.delete(itemId);
+}

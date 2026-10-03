@@ -6,8 +6,8 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, localRomFor, probeEmulatorData,
-  rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND,
+  arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated, localRomFor,
+  probeEmulatorData, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
 
 const res = (status: number, type = 'application/javascript'): Response =>
@@ -32,6 +32,14 @@ describe('where the emulator files come from', () => {
     expect(arcadeFrameUrl('/furlong/')).toBe('/furlong/arcade/frame.html');
     expect(emulatorDataLane('station')).toBe('SOVEREIGN');
     expect(emulatorDataLane('cdn')).toBe('CONVENIENCE');
+  });
+
+  it('runs engine code from another origin isolated, and the station\'s own with the app', () => {
+    expect(emulatorIsolated('/emulatorjs/data/', 'http://localhost:4173')).toBe(false);
+    expect(emulatorIsolated('http://localhost:4173/emulatorjs/data/', 'http://localhost:4173')).toBe(false);
+    expect(emulatorIsolated(EMULATOR_CDN_DATA, 'http://localhost:4173')).toBe(true);
+    expect(emulatorIsolated(EMULATOR_CDN_DATA, 'tauri://localhost')).toBe(true);
+    expect(emulatorIsolated('http://[bad', 'http://localhost')).toBe(true);
   });
 
   it('probes the station path for loader.js and leaves a cross-origin CDN to the loader', async () => {
@@ -64,6 +72,7 @@ describe('where the emulator files come from', () => {
     rememberLocalRom(game, file);
     expect(localRomFor(game)).toBe(file);
     expect(localRomFor({ ...game, core: 'snes' })).toBeNull();
+    expect(localRomFor({ ...game, size: 1 })).toBeNull(); // another size is another file, whatever its name
     expect(romAcceptList()).toContain('.nes');
     expect(romAcceptList()).toContain('.zip');
     expect(romAcceptList().startsWith('.')).toBe(true);

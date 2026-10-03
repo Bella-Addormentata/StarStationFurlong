@@ -8,7 +8,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   addToShelf, arcadePageId, arcadeScreenView, bindArcadeDoc, cabinetKey, coreForName, coreLabel,
-  countPlay, gameLane, iAmP1, insertCoin, maySit, parseRomUrl, pickFromShelf, putOnCabinet,
+  countPlay, gameId, gameLane, iAmP1, insertCoin, maySit, parseRomUrl, pickFromShelf, putOnCabinet,
   readCabinet, readSeat, removeFromShelf, renewSeat, sanitizeGame, seatKey, seatLapsed, seatStatus,
   setArcadeClock, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
   standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_SEAT_LAPSE_MS, ARCADE_SHELF_MAX,
@@ -94,6 +94,12 @@ describe('games', () => {
     expect(parseRomUrl('ftp://example.org/x.nes')).toBeNull();
     expect(parseRomUrl('   ')).toBeNull();
     expect(parseRomUrl('https://example.org/')?.name).toBe('example.org');
+  });
+
+  it('gameId: a link is itself; a file on a disk is its name AND its size', () => {
+    expect(gameId(PACMAN)).toBe('arcade:https://example.org/roms/pacman.zip');
+    expect(gameId(TETRIS)).toBe('nes:file:tetris.nes:40976');
+    expect(gameId({ ...TETRIS, size: 40_977 })).not.toBe(gameId(TETRIS));
   });
 
   it('gameLane: the player\'s own disk and loopback are sovereign, the web is convenience', () => {

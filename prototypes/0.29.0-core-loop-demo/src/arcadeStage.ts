@@ -2,7 +2,9 @@
  * 🕹 arcadeStage — P1's stage (#193): the emulator frame in a 4:3 panel with
  * the CRT pass over it, opened by INSERT COIN from the cabinet's panel (the
  * device focus is released first, the TV theatre's posture) and closed by
- * Escape, the ✕, STAND UP, or losing the seat. Closing stands P1 up.
+ * Escape, the ✕, STAND UP, losing the seat, or the cabinet leaving the
+ * room. Closing on P1's own account stands P1 up; closing because the seat
+ * went to someone else never touches their seat.
  *
  * WHILE THE STAGE IS OPEN THE WORLD GETS NO KEYS. The world's InputManager
  * listens on the window with no target check, so W/A/S/D typed into the
@@ -11,22 +13,25 @@
  * up. Keys typed into the focused frame never reach the parent at all —
  * that is the normal path; the swallow covers the moments the frame has
  * not got focus (a click on the chrome). Escape, from either side, stands
- * P1 up.
+ * P1 up. Because of that swallow, a stage whose seat is gone closes AT ONCE
+ * rather than lingering behind a notice.
  *
  * What it shows before the game runs, honestly: CHECKING / LOADING /
  * STARTING, NOT PROVISIONED with the command when this station has no
  * emulator files, BRING YOUR COPY when the game is a file on its owner's
- * disk, and a RETRY on any fault.
+ * disk (the copy must be the same size as the shelf's), and a RETRY on any
+ * fault.
  */
 
 import { coreLabel, countPlay, gameId, gameLane, iAmP1, readCabinet, readSeat, standUp } from './arcadeDoc';
 import type { ArcadeGame, EmulatorData } from './arcadeDoc';
 import {
-  emulatorDataLane, emulatorDataPath, emulatorErrorText, localRomFor, mountEmulatorFrame,
-  probeEmulatorData, rememberLocalRom, romAcceptList,
+  emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated, localRomFor,
+  mountEmulatorFrame, probeEmulatorData, rememberLocalRom, romAcceptList,
 } from './arcadeEmulator';
 import type { EmulatorHandle } from './arcadeEmulator';
 import { escapeHtml } from './htmlEscape';
+import { showHint } from './hud';
 
 type Phase = 'checking' | 'loading' | 'starting' | 'in play' | 'waiting' | 'fault' | 'idle';
 
@@ -50,6 +55,8 @@ interface Stage {
   lastHead: string;
   lastStatus: string;
   lastControls: string;
+  /** A wrong file picked for BRING YOUR COPY: said once, under the notice. */
+  fileNote: string;
 }
 
 let stage: Stage | null = null;
@@ -110,22 +117,28 @@ export function openArcadeStage(itemId: string): void {
     lastHead: '',
     lastStatus: '',
     lastControls: '',
+    fileNote: '',
   };
   stage.timer = window.setInterval(stageTick, 500);
   stageTick();
 }
 
-/** Close the stage and stand up (the seat is P1's page, and the page left). */
+/** Close the stage; stand up only if this page still holds P1 (the owner
+ *  closing a stage whose seat went to someone else must not kick them). */
 export function closeArcadeStage(): void {
   if (!stage) return;
   const t = stage;
-  stage = null;
+  teardown(t);
+  if (iAmP1(t.itemId)) standUp(t.itemId);
+}
+
+function teardown(t: Stage): void {
+  if (stage === t) stage = null;
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
   window.removeEventListener('keyup', t.onKeyUp, true);
   unmountFrame(t);
   t.root.remove();
-  standUp(t.itemId);
 }
 
 function unmountFrame(t: Stage): void {
@@ -163,13 +176,11 @@ function stageTick(): void {
   const t = stage;
   if (!t) return;
   if (!iAmP1(t.itemId)) {
-    // Kicked, lapsed from another page's view, or stood up elsewhere.
-    if (t.mounted !== 'seat') {
-      unmountFrame(t);
-      t.mounted = 'seat';
-      showNotice(t, 'YOU ARE NOT AT THE CONTROLS', 'The seat was taken or lapsed. Insert a coin at the cabinet to play.');
-    }
-    renderStageChrome(t);
+    // Kicked by the owner, lapsed from another page's view and taken, or
+    // stood up elsewhere: the stage goes down now — it swallows the world's
+    // keys while it is up — and nobody's seat is touched.
+    teardown(t);
+    showHint('🕹 You are no longer at the controls.');
     return;
   }
   const rec = readCabinet(t.itemId);
@@ -188,6 +199,12 @@ function stageTick(): void {
     void mountGame(t, game, rec.data, key);
   }
   renderStageChrome(t);
+}
+
+function waitingNotice(t: Stage, game: ArcadeGame): void {
+  const size = game.size > 0 ? ` (${game.size.toLocaleString()} bytes)` : '';
+  showNotice(t, `BRING YOUR COPY OF ${game.name.toUpperCase()}`,
+    `This game is a file on its owner's disk, not a link. Pick the same file${escapeHtml(size)} from yours below — the blob lane will carry it between players later.${t.fileNote ? `<br><span style="color:#ff8a50;">${escapeHtml(t.fileNote)}</span>` : ''}`);
 }
 
 async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: string): Promise<void> {
@@ -210,8 +227,7 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     if (!file) {
       t.mounted = `waiting:${key}`;
       t.phase = 'waiting';
-      showNotice(t, `BRING YOUR COPY OF ${game.name.toUpperCase()}`,
-        'This game is a file on its owner\'s disk, not a link. Pick the same file from yours below — the blob lane will carry it between players later.');
+      waitingNotice(t, game);
       renderStageChrome(t);
       return;
     }
@@ -225,6 +241,7 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     gameName: game.name,
     pathToData: path,
     volume: 0.7,
+    isolated: emulatorIsolated(path),
   }, (ev) => {
     if (stage !== t || t.mounted !== key) return;
     if (ev.type === 'frame-ready') t.phase = 'loading';
@@ -261,7 +278,8 @@ function renderStageChrome(t: Stage): void {
     t.lastHead = head;
     t.head.querySelector<HTMLButtonElement>('[data-arcade-close]')?.addEventListener('click', () => closeArcadeStage());
   }
-  const who = seat.holder ? `P1 · ${escapeHtml(seat.name || 'a clone')}` : 'NOBODY AT THE CONTROLS';
+  // Plain text, set with textContent: the raw name, never an escaped one.
+  const who = seat.holder ? `P1 · ${seat.name || 'a clone'}` : 'NOBODY AT THE CONTROLS';
   const status = `${who} · ${t.phase.toUpperCase()} · EMULATOR FILES: ${emulatorDataLane(rec.data)}`;
   if (status !== t.lastStatus) {
     t.status.textContent = status;
@@ -276,9 +294,19 @@ function renderStageChrome(t: Stage): void {
     t.lastControls = controls;
     t.controls.querySelector<HTMLButtonElement>('[data-arcade-standup]')?.addEventListener('click', () => closeArcadeStage());
     t.controls.querySelector<HTMLInputElement>('[data-arcade-stage-file]')?.addEventListener('change', (e) => {
-      const file = (e.target as HTMLInputElement).files?.[0];
+      const input = e.target as HTMLInputElement;
+      const file = input.files?.[0];
       const g = readCabinet(t.itemId).game;
       if (!file || !g) return;
+      // The shelf's copy has a size: a file of another size is another file,
+      // whatever its name says — it is not launched under this game's name.
+      if (g.size > 0 && file.size !== g.size) {
+        t.fileNote = `${file.name} is ${file.size.toLocaleString()} bytes; the shelf's ${g.name} is ${g.size.toLocaleString()}. Not the same file.`;
+        input.value = '';
+        waitingNotice(t, g);
+        return;
+      }
+      t.fileNote = '';
       rememberLocalRom(g, file);
       t.mounted = '';
       stageTick();
