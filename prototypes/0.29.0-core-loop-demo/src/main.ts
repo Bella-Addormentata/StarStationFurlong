@@ -1962,6 +1962,9 @@ async function joinRoomAtEpoch(
       roomMap.set("owner", getPlayerId());
       roomMap.set("name", boot.roomId || "Lobby");
     });
+    // 🪐 A ship's shared summary carries this name, and the roomInfo observer
+    // that republishes it on a name change is only installed further down.
+    publishPlanetSummary();
     // 🛰️🚪 A module added from a berth is born with ONE door. This runs HERE,
     // in the synchronous claim, and not with the other seeds below: those wait
     // on whenServerSynced, while awaitInitialRoomState returns as soon as

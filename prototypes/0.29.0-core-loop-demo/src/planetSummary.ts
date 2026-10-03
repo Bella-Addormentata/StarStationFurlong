@@ -855,7 +855,12 @@ export function bindPlanetSummaryDoc(d: Y.Doc, c: PlanetSummaryContext): void {
   shipMap = d.getMap('shipSummaries');
   const onChange = (_e: unknown, tx: Y.Transaction) => {
     if (tx.local) return;
+    // What this client says of its ship reads the station list: a pull that
+    // registers the station its flight names places the ship (or moves it),
+    // and that goes out now, not at the heartbeat.
+    const ship = JSON.stringify(ctx?.ship() ?? null);
     pullPlanetSummary();
+    if (JSON.stringify(ctx?.ship() ?? null) !== ship) publishPlanetSummary();
   };
   stationMap.observe(onChange);
   shipMap.observe(onChange);
