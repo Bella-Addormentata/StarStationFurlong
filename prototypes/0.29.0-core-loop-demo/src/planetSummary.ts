@@ -85,12 +85,18 @@ export interface StationSummary {
    *  helm room's take-back never forgets another's. */
   trimGone?: TrimGone[];
   /** The owning install's own id for its saved record, so a flight record
-   *  written there (station ids are per install) still resolves here. */
+   *  written there (station ids are per install) can still resolve here. */
   ownerId?: string;
-  /** Other installs' ids for their saved records of the same place (their
-   *  records lost to `ownerId`'s), sorted, at most MAX_OWNER_ALIASES: a
-   *  flight record one of them wrote still resolves here. */
+  /** The other ids this place's owned records went by (records that lost to
+   *  this one: other installs', or its install's under an earlier id),
+   *  sorted, at most MAX_OWNER_ALIASES: a flight record written under one of
+   *  them can still resolve here (resolveStationAlias). */
   ownerAliases?: string[];
+  /** The install that published an owned record (identity.ts
+   *  getStationOwnerId), only beside `ownerId`: station ids are each
+   *  install's own, so two installs can save one place under one id, and
+   *  this is what settles whose record stands (mergeStation). */
+  ownerInstall?: string;
   updatedAt: number;
 }
 
@@ -311,6 +317,7 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // left out, not the whole summary: the station still registers.
   if (isId(v.berthDoor) && isAcceptableDoorKey(v.berthDoor)) out.berthDoor = v.berthDoor;
   if (v.ownerId !== undefined) out.ownerId = v.ownerId as string;
+  if (out.ownerId !== undefined && isId(v.ownerInstall)) out.ownerInstall = v.ownerInstall;
   // Peer-sent: bounded before it is walked.
   if (Array.isArray(v.ownerAliases) && v.ownerAliases.length <= MAX_OWNER_ALIASES * 4) {
     const aliases = mergeAliases(v.ownerAliases.filter(isId), [], out.ownerId);
@@ -420,8 +427,9 @@ function tieBreak<T>(a: T, b: T): T {
 
 /** Merge an incoming station summary into a known one, and the newer trim.
  *  Which record stands: one its owner published (it carries `ownerId`) beats
- *  one nobody owns; between one owner's records the newer wins, and between
- *  two installs' owned records the smaller owner id stands; between records
+ *  one nobody owns; between one install's records the newer wins, whatever
+ *  station id it went by, and between two installs' owned records the
+ *  smaller install id stands (ownerRank); between records
  *  nobody owns (derived stations) the FIRST published stands, so a late
  *  install cannot move a station everyone already placed. Same-moment ties
  *  settle on the canonical JSON. Returns null when nothing changes. */
@@ -430,16 +438,17 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   const recordOf = (s: StationSummary): string =>
     JSON.stringify({ ...s, trim: undefined, trimGone: undefined, ownerAliases: undefined });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
-  // Two installs that each saved the place under their own id: one of them
-  // stands for good (the smaller id), so their republishes cannot take turns.
-  const rivals = owned(incoming) && owned(prior) && incoming.ownerId !== prior.ownerId;
+  // Two installs that each saved the place, under any station ids (the same
+  // one too): one of them stands for good, so their republishes cannot take
+  // turns.
+  const rivals = owned(incoming) && owned(prior) && ownerRank(incoming) !== ownerRank(prior);
   const base = owned(incoming) !== owned(prior)
     ? (owned(incoming) ? incoming : prior)
     : rivals
-      ? (incoming.ownerId! < prior.ownerId! ? incoming : prior)
+      ? (ownerRank(incoming) < ownerRank(prior) ? incoming : prior)
       : incoming.updatedAt !== prior.updatedAt
         ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
-        : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
+        : (recordOf(canonOrder(incoming)) > recordOf(canonOrder(prior)) ? incoming : prior);
   // Only a trim of the orbit the standing record flies: one published for
   // the slot that lost would be dropped by every reader anyway. A slot clash
   // in listStations can move the standing record off the slot it asks for
@@ -613,6 +622,28 @@ function isOwned(station: StationRecord): boolean {
   return !station.derived && !isLearnedRecord(station);
 }
 
+/** This install's own id for the records it saves (the context's), when it
+ *  has a usable one. */
+function thisInstall(): string | undefined {
+  const id = ctx?.installId?.();
+  return isId(id) ? id : undefined;
+}
+
+/** Whose an owned summary is, for settling two installs' records of one
+ *  place: the install that published it, or, from a build that sent none,
+ *  its station id, ranked after every install. */
+function ownerRank(s: StationSummary): string {
+  return s.ownerInstall !== undefined ? `0${s.ownerInstall}` : `1${s.ownerId ?? ''}`;
+}
+
+/** Is `s` another install's record than this install's own `ownId` one? By
+ *  install where both are known, else (a build that sent none) by station id. */
+function otherOwner(s: StationSummary, ownId: string): boolean {
+  if (s.ownerId === undefined) return false;
+  const me = thisInstall();
+  return s.ownerInstall !== undefined && me !== undefined ? s.ownerInstall !== me : s.ownerId !== ownId;
+}
+
 /** The summary this client publishes for a station it can see: its listed
  *  record, and a trim when one applies to it. */
 export function summaryForStation(station: StationRecord, trim: OrbitTrim | null, updatedAt: number): StationSummary {
@@ -625,6 +656,8 @@ export function summaryForStation(station: StationRecord, trim: OrbitTrim | null
   };
   if (station.berthDoor) out.berthDoor = station.berthDoor;
   if (isOwned(station) && isId(station.id)) out.ownerId = station.id;
+  const install = thisInstall();
+  if (out.ownerId !== undefined && install !== undefined) out.ownerInstall = install;
   const ext = cleanExt(station);
   if (ext) out.ext = ext;
   const applies = cleanTrim(trimFor(station, trim));
@@ -670,15 +703,17 @@ export function foldOwnStation(
   const sameRecord = (a: StationSummary, b: StationSummary): boolean =>
     // The owner id is per install: another install's identical record is the
     // same record, not news to republish over.
-    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined })
-      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined });
+    JSON.stringify({ ...a, trim: undefined, trimGone: undefined, updatedAt: 0, ownerId: undefined, ownerInstall: undefined, ownerAliases: undefined })
+      === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, updatedAt: 0, ownerId: undefined, ownerInstall: undefined, ownerAliases: undefined });
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
-    // The same record under another install's id, or nobody's: this one's
-    // goes out too, under the known stamp, so mergeStation settles the owner
-    // and keeps the other id as an alias (a flight record written on either
-    // install still resolves).
-    : owned && mine.ownerId !== known.ownerId ? { ...mine, updatedAt: known.updatedAt } : known;
+    // The same record as another install's, or under another station id, or
+    // nobody's: this one's goes out too, under the known stamp, so
+    // mergeStation settles the owner and keeps the other id as an alias (a
+    // flight record written on either install can still resolve).
+    : owned && (mine.ownerId !== known.ownerId || mine.ownerInstall !== known.ownerInstall)
+      ? { ...mine, updatedAt: known.updatedAt }
+      : known;
   // A trim is keyed by the orbit it trims: it goes out when it names the
   // planet and slot of the record that is kept, whichever client's that is.
   // A learned station flies the slot listStations settled for that record,
@@ -817,8 +852,7 @@ export function registerLearnedStations(
       // the standing trim fits, and its name, berth and a newer build's
       // fields), so every install registers the same station.
       const own = saved.get(owner.id) as (StationRecord & Record<string, unknown>) | undefined;
-      if (own && !isLearnedRecord(own) && s.ownerId !== undefined && s.ownerId !== owner.id
-        && !holdsSummary(own, s)) {
+      if (own && !isLearnedRecord(own) && otherOwner(s, owner.id) && !holdsSummary(own, s)) {
         if (registerStation({ ...rec, id: own.id })) changed++;
       }
       continue;
@@ -862,6 +896,11 @@ export interface PlanetSummaryContext {
    *  first-hand there, so a trim that room takes back spreads. Optional:
    *  without it trims only merge by burn time. */
   currentRoom?: () => string | null;
+  /** This install's own id (identity.ts getStationOwnerId): the stations it
+   *  saved go out under it (`ownerInstall`), so two installs that saved one
+   *  place under one station id still settle on one record. Optional:
+   *  without it they settle by station id alone. */
+  installId?: () => string;
 }
 
 let doc: Y.Doc | null = null;
@@ -1100,7 +1139,7 @@ function applyLearned(store: Store): void {
   // registers, which needs the planet; a rival install's standing record
   // moves ours, which needs its planet too).
   const shared = here?.welcomeRoomId ? store.stations[here.welcomeRoomId] : undefined;
-  const ours = here !== null && isOwned(here) && (shared?.ownerId === undefined || shared.ownerId === here.id);
+  const ours = here !== null && isOwned(here) && (shared === undefined || !otherOwner(shared, here.id));
   // No station placement: a ship room's own summary says which planet it is at.
   const ship = !here && room ? store.ships[room] : undefined;
   const shipPlanet = ship && !ship.retired ? ship.planetId : undefined;
@@ -1138,8 +1177,12 @@ export function installTrimResolver(): void {
 /**
  * This install's id for a station id another install wrote (a flight record
  * travels in the ship's room doc; station ids are per install). A derived or
- * learned id names its welcome room; a saved record's id is found through the
- * summary that carries it as `ownerId`. Null when no listed station matches.
+ * learned id names its welcome room. Any other id is some install's saved
+ * record's (written before ids were portable), and installs pick theirs
+ * freely: it names a place only when every record this install knows under
+ * it (its own, and the summaries' `ownerId`s and `ownerAliases`) is of that
+ * one place. Null when several are (whose it was cannot be told), or when no
+ * listed station matches.
  */
 export function resolveStationAlias(id: string, now = Date.now()): string | null {
   const listed = listStations();
@@ -1150,11 +1193,15 @@ export function resolveStationAlias(id: string, now = Date.now()): string | null
   // A prefixed id names a welcome room, which is global: resolve it by the
   // room first, so a local record that happens to share the id never wins.
   if (room !== undefined) return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
-  if (listed.some((s) => s.id === id)) return id;
-  const stations = Object.values(readStore(now).stations);
-  room = (stations.find((s) => s.ownerId === id) ?? stations.find((s) => s.ownerAliases?.includes(id)))?.welcomeRoomId;
-  if (!room) return null;
-  return listed.find((s) => s.welcomeRoomId === room)?.id ?? null;
+  const own = listed.find((s) => s.id === id);
+  const places = new Set<string>(own ? [own.welcomeRoomId] : []);
+  for (const s of Object.values(readStore(now).stations)) {
+    if (s.ownerId === id || s.ownerAliases?.includes(id)) places.add(s.welcomeRoomId);
+  }
+  if (places.size !== 1) return null;
+  if (own) return own.id;
+  const [only] = places;
+  return listed.find((s) => s.welcomeRoomId === only)?.id ?? null;
 }
 
 /** The id another install can resolve without ambiguity for this install's

@@ -32,6 +32,7 @@ import {
   setPlayerName,
   PLAYER_NAME_MAX_LENGTH,
   getDefaultRoomId,
+  getStationOwnerId,
 } from "./identity";
 import {
   getIdentityPub,
@@ -1591,6 +1592,9 @@ async function joinRoomAtEpoch(
   setStationRoomSource(() => activeBootstrap?.roomId ?? "");
   bindPlanetSummaryDoc(sync.doc, {
     currentStation,
+    // The stations this install saved go out under its own id, which tells
+    // two installs' records of one place apart.
+    installId: getStationOwnerId,
     // The fuel its burns drew rides along: between trims whose last burns
     // share a moment, it tells the one holding more burns.
     localTrim: () => {
