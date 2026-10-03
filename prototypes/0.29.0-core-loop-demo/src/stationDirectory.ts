@@ -158,19 +158,46 @@ export function isKnownStation(id: string): boolean {
 }
 
 /** Plan the hop from → to at `nowMs`: the directory's own planner (orbits),
- *  else a flat hop that leaves now. Null for an unknown or unreachable pair. */
+ *  else a flat hop that leaves now. Null for an unknown or unreachable pair,
+ *  and for one a station move cuts into. */
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
   // Both ends must be listed: findStation would quietly read an unknown
   // origin as home.
   if (fromId === toId || !(isKnownStation(fromId) || adriftPlace(fromId)) || !isKnownStation(toId)) return null;
+  let hop: HopPlan | null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
-    return wholeMs(plan);
+    hop = wholeMs(plan);
+  } else {
+    const dest = findStation(toId);
+    if (locationPlanet(fromId) !== dest.planetId) return null;
+    hop = wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
   }
-  const dest = findStation(toId);
-  if (locationPlanet(fromId) !== dest.planetId) return null;
-  return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
+  if (!hop) return null;
+  // 🚚 Checked by the times the flight record keeps (rounded up): a flat hop
+  // has no planner to check them, and rounding can carry a burn past the
+  // moment a station leaves.
+  const list = listStations();
+  const moveOf = (id: string) => list.find((s) => s.id === id)?.move;
+  return moveCutsHop(adriftPlace(fromId) ? undefined : moveOf(fromId), moveOf(toId), hop, nowMs) ? null : hop;
+}
+
+/** Does a station move cut into a hop planned at `nowMs`: one under way (or
+ *  coming) while either end must hold still — the source until the ship
+ *  leaves, the destination until it arrives? A move that starts at the
+ *  source after the burn is no concern of the hop; one that lands before it
+ *  would leave the plan on the old orbit. A move that goes nowhere (a pin)
+ *  holds its station where it is. */
+function moveCutsHop(
+  fromMove: StationMove | undefined,
+  toMove: StationMove | undefined,
+  hop: Pick<HopPlan, 'departAt' | 'arriveAt'>,
+  nowMs: number,
+): boolean {
+  const within = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs
+    && (m.fromPlanetId !== m.toPlanetId || m.fromSlot !== m.toSlot);
+  return within(fromMove, hop.departAt) || within(toMove, hop.arriveAt);
 }
 
 /** A hop's times as whole milliseconds, which is all a flight record stores
@@ -242,12 +269,8 @@ export function planRecordHop(
   if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
-  // Nor one with a move under way (or coming) while either end must hold
-  // still: the source until the ship leaves, the destination until it
-  // arrives. A move that starts at the source after the burn is no concern of
-  // this hop; one that lands before it would leave the plan on the old orbit.
-  const movesWithin = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs;
-  if (movesWithin(from.move, t.departAt) || movesWithin(to.move, t.arriveAt)) return null;
+  // Nor one a move cuts into (moveCutsHop).
+  if (moveCutsHop(from.move, to.move, t, nowMs)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,

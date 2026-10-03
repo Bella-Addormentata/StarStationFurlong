@@ -2749,7 +2749,9 @@ export class DoorDockingPortSystem {
    * ⏏ UNDOCK — release a dock: the module on the far side is free to fly.
    * THIS side first (the tombstone keeps the berth memory, so DOCK can come
    * back), then the far room's end through the injected writer — best effort;
-   * an unreachable far room is said, not hidden.
+   * an unreachable far room is said, not hidden. A far room whose station is
+   * between planets keeps its end, and this side is put back. True when this
+   * side let go.
    */
   public async undockPort(doorId: string): Promise<boolean> {
     if (this.dockOp(doorId)?.busy) return false;
@@ -2811,6 +2813,26 @@ export class DoorDockingPortSystem {
     } catch (err) {
       console.warn("[dock] far undock threw:", err);
       result = { ok: false, reason: "unreachable" };
+    }
+    if (!result.ok && result.reason === "moving") {
+      // 🚚 The far room knew of a move this install had not heard of (the
+      // far write learns it now): that station is between planets, and its
+      // end held the dock. This side goes back to it — over the very
+      // tombstone written above, in the room it was written in, and never
+      // on a module that has cast off meanwhile; anything else changed this
+      // port since, and stays as it is.
+      const still = this.roomNow() === roomId ? classifyDockPort(readDoor(doorId)) : null;
+      const back = still?.kind === "undocked" && still.memory.undockedAt === undockedAt
+        && pairingAllowedByFlight(readFlightRecord()).ok;
+      if (back) writeDoorPairing(doorId, port.address, port.record);
+      this.setDockOp(
+        doorId,
+        back
+          ? { note: "This station is moving between planets — the dock holds until it arrives.", tone: "bad" }
+          : { note: `This station is moving between planets — ${name} keeps its end of the dock until it arrives, but this port changed meanwhile.`, tone: "bad" },
+        roomId,
+      );
+      return !back;
     }
     this.setDockOp(
       doorId,

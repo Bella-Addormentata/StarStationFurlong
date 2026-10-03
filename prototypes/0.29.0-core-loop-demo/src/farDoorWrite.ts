@@ -47,7 +47,8 @@ import { rememberMovesIn, roomDocLockedByMove } from './stationMove';
  * Apply one DOCK / UNDOCK to the far room's doc. Returns what to tell the
  * player and whether anything was written (only a write needs an ack).
  * `farRoomId` is the room the doc is (by default, the one its address
- * names), and `nowMs` the moment a DOCK is judged at.
+ * names), and `nowMs` the moment a DOCK is judged at (an UNDOCK goes by its
+ * own stamp).
  */
 export function applyFarDockRequest(
   doc: Y.Doc,
@@ -65,6 +66,15 @@ export function applyFarDockRequest(
     const patch = farUndockPatch(readDoorFrom(doc, farDoor), near, req.undockedAt, req.onlyDockedAt, req.at);
     if (patch.action === 'skip') {
       return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
+    }
+    // 🚚 Nor does a station between planets let go of a ship, by the moves
+    // booked in this room too (as for a DOCK below): one the asking install
+    // has not heard of yet would set the ship loose mid-transfer. Judged at
+    // the release's own stamp, so one made before its station left still
+    // lands however late it gets here; a take-back of a DOCK this client
+    // never completed (onlyDockedAt) is never held.
+    if (req.onlyDockedAt === undefined && roomDocLockedByMove(doc, farRoomId, req.undockedAt)) {
+      return { result: { ok: false, reason: 'moving' }, wrote: false };
     }
     writeDoorRecordTo(doc, farDoor, patch.record);
     return { result: { ok: true, detail: 'written' }, wrote: true };
@@ -368,8 +378,9 @@ async function session(
     const since = Y.encodeStateVector(s.doc);
     const { result, wrote } = applyFarDockRequest(s.doc, req, near, boot.roomId);
     written = wrote;
-    // 🚚 A move this install had not heard of refused the dock: learn it, so
-    // the station list shows that station between planets too.
+    // 🚚 A move this install had not heard of refused the dock (or the
+    // undock): learn it, so the station list shows that station between
+    // planets too.
     if (!result.ok && result.reason === 'moving') rememberMovesIn(s.doc);
     if (wrote && !(await s.confirmOwnWrites(since, ACK_TIMEOUT_MS))) {
       console.warn(`[farDoorWrite] ${boot.roomId}: the node did not acknowledge the write`);

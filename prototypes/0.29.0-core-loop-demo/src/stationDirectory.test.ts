@@ -26,6 +26,7 @@ import {
 } from './stationDirectory';
 import { planTransfer } from './orbits';
 import { isFlightRecord } from './shipDoc';
+import type { StationMove } from './stations';
 
 afterEach(() => setStationDirectory(null));
 
@@ -134,6 +135,29 @@ describe('planning a hop', () => {
     expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
     expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
     expect(planHop('nowhere', 'high-orbit', 1000)).toBeNull();
+  });
+
+  it('refuses a flat hop a station move cuts into, by the times the flight record keeps', () => {
+    const now = 1000.5;
+    const move = (over: Partial<StationMove>): StationMove => ({
+      stationId: 'a', welcomeRoomId: 'ra', fromPlanetId: 'p1', fromSlot: 0, toPlanetId: 'p2', toSlot: 0,
+      departAt: 5000, arriveAt: 90_000, mode: 'thrusters', fuel: 1, fuelDrawn: 1, ...over,
+    });
+    const hop = (from: Partial<StationDestination>, to: Partial<StationDestination>) => {
+      setStationDirectory({ stations: () => [station('a', 'p1', from), station('b', 'p1', to)] });
+      return planHop('a', 'b', now);
+    };
+    // No move: a flat hop that leaves now, in whole milliseconds.
+    expect(hop({}, {})).toEqual({ departAt: 1001, arriveAt: 1001 + TRAVEL_MS_MIN, fuelCost: 10 });
+    // The source between planets, or the destination leaving before the ship gets there.
+    expect(hop({ move: move({ departAt: 0 }) }, {})).toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 30_000 }) })).toBeNull();
+    // The source leaving the very millisecond the rounded burn does.
+    expect(hop({ move: move({ departAt: 1001 }) }, {})).toBeNull();
+    // Leaving after the burn, the destination after the arrival, or a move that goes nowhere: fine.
+    expect(hop({ move: move({ departAt: 1002 }) }, {})).not.toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 1002 + TRAVEL_MS_MIN }) })).not.toBeNull();
+    expect(hop({ move: move({ toPlanetId: 'p1', departAt: 1000, arriveAt: 1001 }) }, {})).not.toBeNull();
   });
 
   it('follows the circular-orbit model over station records', () => {

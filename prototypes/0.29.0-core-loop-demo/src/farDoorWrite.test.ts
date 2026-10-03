@@ -357,6 +357,51 @@ describe('applyFarDockRequest — DOCK into a room between planets', () => {
   });
 });
 
+describe('applyFarDockRequest — UNDOCK from a room between planets', () => {
+  const now = Date.now();
+  /** Under way from Sovereign to Aris, booked from the berth's own room. */
+  const transit: StationMove = {
+    stationId: 'home', welcomeRoomId: STATION, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+    toPlanetId: 'planet-aris', toSlot: 2, departAt: now - 1000, arriveAt: now + 3_600_000,
+    mode: 'thrusters', bookedAt: now - 2000, fuel: 1, fuelDrawn: 1,
+  };
+  /** The berth's room: d:bay docked to the ship at 100, and the move booked there. */
+  const movingRoom = (): Y.Doc => {
+    const doc = stationDoc();
+    doc.getMap('stationMoves').set(`move:1:${transit.departAt}:${STATION}`, transit);
+    return doc;
+  };
+  const undockAt = (doc: Y.Doc, undockedAt: number, onlyDockedAt?: number) => applyFarDockRequest(
+    doc,
+    {
+      kind: 'undock', farAddress: seedFor(STATION), farDoor: 'd:bay', nearDoorId: near.doorId, undockedAt,
+      ...(onlyDockedAt !== undefined ? { onlyDockedAt } : {}),
+    },
+    near,
+    STATION,
+    now,
+  );
+
+  it('holds the dock while the berth\'s own room has its station in transit — a move this install never heard of — and writes nothing', () => {
+    const doc = movingRoom();
+    const before = Y.encodeStateVector(doc);
+    expect(undockAt(doc, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
+  });
+
+  it('judges a release by its own stamp: one made before the station left still lands, however late', () => {
+    expect(undockAt(movingRoom(), transit.departAt - 1).wrote).toBe(true);
+    expect(undockAt(movingRoom(), transit.arriveAt).wrote).toBe(true);
+  });
+
+  it('never holds the take-back of a DOCK this client did not complete', () => {
+    const doc = movingRoom();
+    expect(undockAt(doc, now, 100).wrote).toBe(true);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(false);
+  });
+});
+
 describe('berthAfterSettle — two modules claiming one berth', () => {
   const other: NearEnd = {
     roomId: 'module-other', address: seedFor('module-other'), doorId: 'd:otherport', wall: 'x+', lateral: 0,
