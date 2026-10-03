@@ -199,9 +199,12 @@ describe('the station plan', () => {
     expect(atlasLayout('room-a').map((p) => [p.roomId, p.name]).sort()).toEqual(unknown);
     expect(stationPlan(atlas, 'room-a').modules.map((m) => [m.roomId, m.name]).sort())
       .toEqual([...unknown, ['room-a', 'HUB']].sort());
-    // None of them is a room to start from.
-    expect(atlasPoses(atlas, 'toString')).toEqual([]);
-    expect(stationPlan(atlas, 'constructor').modules).toEqual([]);
+    // None of them is a room to start from without an entry of its own (a
+    // harvest that keeps a stub for each gives them one: #171).
+    const bare: typeof atlas = Object.assign(Object.create(null), atlas);
+    for (const name of ['__proto__', 'constructor', 'toString']) delete bare[name];
+    expect(atlasPoses(bare, 'toString')).toEqual([]);
+    expect(stationPlan(bare, 'constructor').modules).toEqual([]);
   });
 
   it('is empty for a room the atlas does not know', () => {
