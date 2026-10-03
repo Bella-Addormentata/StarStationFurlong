@@ -332,8 +332,9 @@ export class StationPlanView {
       }
     }
 
-    // Ships whose own word still says docked here; any other berth is stale.
-    const listed = new Set(this.visiting.filter((s) => s.state === 'docked').map((s) => s.roomId));
+    // Ships whose own word still says docked here, at the berth drawn; any
+    // other berth is stale.
+    const listed = new Set(this.visiting.filter((s) => s.state === 'docked' && s.onPlan).map((s) => s.roomId));
     for (const m of [...plan.modules, ...plan.ships]) {
       const corners = moduleCorners(m).map((c) => toPx(c.x, c.z));
       const isShip = m.kind === 'ship';
@@ -459,8 +460,11 @@ export class StationPlanView {
         card.append(heading('Docked'), row(`At ${gate} of ${this.nameOf(m.dockedAt.roomId)}`));
       }
       const v = this.visiting.find((s) => s.roomId === m.roomId);
-      if (!v || v.state !== 'docked') {
-        card.append(row(v ? 'It reports it is leaving; this berth may be out of date.' : 'Its own last report puts it elsewhere; this berth is out of date.', DIM));
+      if (!v) card.append(row('Its own last report puts it elsewhere; this berth is out of date.', DIM));
+      else if (v.state === 'docked' && !v.onPlan) {
+        card.append(row(`It reports it is docked at ${v.gate !== undefined ? `gate ${v.gate}` : 'another berth'}; this berth is out of date.`, DIM));
+      } else if (v.state !== 'docked') {
+        card.append(row(`It reports it is ${v.state}; this berth may be out of date.`, DIM));
       }
       // Aboard this ship: its doors (undock among them) are yours to work.
       if (m.here) this.renderDoorButtons(card, m);
@@ -555,6 +559,9 @@ export class StationPlanView {
       return;
     }
     const now = Date.now();
+    // A ship drawn on the plan is picked from the list too, its berth there
+    // out of date or not (its card says which).
+    const drawn = new Set(this.plan?.ships.map((m) => m.roomId) ?? []);
     for (const s of this.visiting) {
       const where = s.state === 'docked'
         ? (s.gate !== undefined ? `docked at gate ${s.gate}` : 'docked')
@@ -562,9 +569,9 @@ export class StationPlanView {
           // Past its arrival time (late, or arrived and still docking): when it was due.
           ? `arriving${s.at !== undefined ? (s.at >= now ? ` ${when(s.at, now)}` : `, due ${when(s.at, now)}`) : ''}`
           : `leaving${s.at !== undefined ? ` (${when(s.at, now)})` : ''}`;
-      const item = el('div', `font-size:11px; line-height:1.5; color:${s.state === 'docked' ? SHIP : GOLD}; cursor:${s.onPlan ? 'pointer' : 'default'};`,
+      const item = el('div', `font-size:11px; line-height:1.5; color:${s.state === 'docked' ? SHIP : GOLD}; cursor:${drawn.has(s.roomId) ? 'pointer' : 'default'};`,
         `🚀 ${s.name} · ${where}${s.routeStatus ? ` · ${s.routeStatus.toUpperCase()}` : ''}`);
-      if (s.onPlan) {
+      if (drawn.has(s.roomId)) {
         item.addEventListener('click', () => {
           this.selected = s.roomId;
           this.render();

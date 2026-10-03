@@ -434,6 +434,70 @@ describe('the job in the robot map', () => {
     expect(jobDueAt(j)).toBe(1.5 * MIN);
   });
 
+  it('two clients starting robots at once still count 16, the later start waiting uncredited', () => {
+    const dock = (i: number) => `d${String(i).padStart(2, '0')}`;
+    const big = { ...target, laborHours: 600 };
+    const a = roomWithDocks();
+    bindRobotDoc(a);
+    for (let i = 0; i < 15; i++) assignDisassembly(dock(i), big, 0);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    // Each client sets one more robot to it, sixteen as far as it knows:
+    // one at minute 1, the other at minute 2.
+    assignDisassembly(dock(15), big, MIN);
+    bindRobotDoc(b);
+    assignDisassembly(dock(16), big, 2 * MIN);
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const doc of [a, b]) {
+      bindRobotDoc(doc);
+      const j = readDisassemblyJob('room-b')!;
+      // The earlier start works; the later one waits on its dock, and its
+      // time is no labor.
+      expect(j.crew).toEqual(Array.from({ length: 16 }, (_, i) => dock(i)));
+      expect(workedMs(j, 2 * MIN)).toBe(31 * MIN);
+      expect(workedMs(j, 3 * MIN)).toBe(47 * MIN);
+    }
+    // One stopped at minute 3: the waiting robot starts then.
+    writeRobotConfig(dock(0), { routine: 'disassemble', target: 'room-b', parked: true }, 3 * MIN);
+    const j = readDisassemblyJob('room-b')!;
+    expect(j.crew).toEqual(Array.from({ length: 16 }, (_, i) => dock(i + 1)));
+    expect(workedMs(j, 4 * MIN)).toBe(63 * MIN);
+  });
+
+  it('a robot whose edits crossed works again once they meet, never credited for the wait', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const a = roomWithDocks();
+      a.clientID = 1;
+      bindRobotDoc(a);
+      assignDisassembly('d1', target, 0);
+      const b = new Y.Doc();
+      b.clientID = 2;
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      // One client stops d1 at minute 2; the other, not having heard, writes
+      // its config again as it stood (Disassemble pressed again), leaving
+      // its record as it was. That config is the one kept.
+      writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b', parked: true }, 2 * MIN);
+      bindRobotDoc(b);
+      writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b' }, 3 * MIN);
+      now.mockReturnValue(10 * MIN);
+      Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+      Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+      for (const doc of [a, b]) {
+        bindRobotDoc(doc);
+        expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
+        const j = readDisassemblyJob('room-b')!;
+        // Back on the job from when the edits met: the two minutes before
+        // the stop, none for the eight it stood, then on.
+        expect(j.crew).toEqual(['d1']);
+        expect(workedMs(j, 11 * MIN)).toBe(3 * MIN);
+      }
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('two robots stopped at once on two clients leave the crew, each with its own labor', () => {
     const a = roomWithDocks();
     bindRobotDoc(a);

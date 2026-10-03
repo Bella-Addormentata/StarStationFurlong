@@ -354,6 +354,20 @@ describe('ships at or near a station', () => {
     ]);
   });
 
+  it('reads a berth at another gate than the ship names as out of date', () => {
+    station();
+    const plan = stationPlan(readAtlas(), 'room-a');
+    const docked = (gate?: number) => visitingShips(plan, [
+      ship({ roomId: 'ship-1', name: 'SKIFF', status: 'docked', fromRoom: 'room-a', ...(gate !== undefined ? { gate } : {}) }),
+    ], 'room-a');
+    // SKIFF is drawn at gate 2; its own word moves it to gate 3: listed
+    // there, and the berth drawn is not where it is.
+    expect(docked(3)).toEqual([{ roomId: 'ship-1', name: 'SKIFF', state: 'docked', gate: 3, onPlan: false }]);
+    // At the gate drawn, or naming none, the berth stands.
+    expect(docked(2)[0]).toMatchObject({ gate: 2, onPlan: true });
+    expect(docked()[0]).toMatchObject({ gate: 2, onPlan: true });
+  });
+
   it('drops a stale berth when the ship says it is somewhere else', () => {
     station();
     const plan = stationPlan(readAtlas(), 'room-a');

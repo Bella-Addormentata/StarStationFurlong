@@ -216,7 +216,8 @@ export interface VisitingShip {
   at?: number;
   /** The planet summary's word on a ferry's route (departuresBoard.ts). */
   routeStatus?: ShipSummary['routeStatus'];
-  /** The atlas shows it docked here (it is on the plan). */
+  /** The atlas shows it docked here (it is on the plan), and at the gate
+   *  the ship names when it names one. */
   onPlan: boolean;
 }
 
@@ -268,7 +269,9 @@ export function visitingShips(
     }
     const prior = out.get(s.roomId);
     // The atlas's berth may outlive the ship (the dock never sees it leave):
-    // the ship's own newer word on where it is wins over the stale berth.
+    // the ship's own newer word on where it is wins over the stale berth,
+    // and a berth at another gate than the one it names is not where it is.
+    const movedGate = s.gate !== undefined && prior?.gate !== undefined && s.gate !== prior.gate;
     out.set(s.roomId, {
       roomId: s.roomId,
       name: s.name || prior?.name || 'Ship',
@@ -277,7 +280,7 @@ export function visitingShips(
       ...(state === 'arriving' && s.etaAt !== undefined ? { at: s.etaAt } : {}),
       ...(state === 'leaving' && (s.departAt ?? s.departedAt) !== undefined ? { at: (s.departAt ?? s.departedAt)! } : {}),
       ...(s.routeStatus ? { routeStatus: s.routeStatus } : {}),
-      onPlan: prior?.onPlan ?? false,
+      onPlan: (prior?.onPlan ?? false) && !movedGate,
     });
   }
   const rank = { docked: 0, arriving: 1, leaving: 2 } as const;

@@ -16,7 +16,7 @@
 import * as Y from 'yjs';
 import type { DisassemblyJob, DisassemblyJobRecord, DisassemblyTarget, DisassemblyWork } from './disassembly';
 import {
-  MAX_CREW, isDisassemblyJobRecord, isDisassemblyWork, jobFromWork, jobLaborMs, startWork, stopWork,
+  MAX_CREW, isDisassemblyJobRecord, isDisassemblyWork, jobFromWork, jobLaborMs, startWork, stopWork, workingCrew,
 } from './disassembly';
 import { placedFurnitureIn } from './furnitureDoc';
 
@@ -96,6 +96,11 @@ export function bindRobotDoc(doc: Y.Doc): void {
   const map = doc.getMap('robot');
   robotMap = map;
   map.observe(() => notify());
+  // 🔧 Edits made elsewhere may have crossed ours: once they arrive, each
+  // job's crew is held to its robots' records (reconcileCrews).
+  map.observe((event) => {
+    if (!event.transaction.local) reconcileCrews(map);
+  });
   // 🔧 A charging dock taken out of the layout ends its robot's
   // disassembly work for good (releaseRemovedDocks).
   doc.getMap('furniture').observe((event) => releaseRemovedDocks(map, event));
@@ -261,12 +266,11 @@ function readJobIn(map: Y.Map<unknown>, roomId: string): DisassemblyJob | null {
  *  time since its last record its labor, if it was working) and starts if
  *  it joins. Only its own record is credited: another robot's labor is
  *  never written here, so two clients editing two robots at once can't
- *  credit either with time only the other saw. A robot set to the job and
- *  not stopped that isn't working (it waited for room in the crew, or two
- *  crossed edits left its record stopped) starts now, while the crew has
- *  room: its clock is started, never credited. A finished job no robot is
- *  set to any more is dropped, and so are the work records no open job
- *  counts; an open one stays, its robots' labor kept for later. */
+ *  credit either with time only the other saw. The crew is then held to
+ *  the records (fillCrewIn): another robot is only ever started or
+ *  stopped uncredited. A finished job no robot is set to any more is
+ *  dropped, and so are the work records no open job counts; an open one
+ *  stays, its robots' labor kept for later. */
 function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | null, now: number): void {
   const before = indexJobs(map);
   if (config) map.set(`cfg:${dockId}`, config);
@@ -287,8 +291,7 @@ function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | 
   }
   for (const record of after.records) {
     if (record.finishedAt !== undefined) continue;
-    const work = new Map<string, DisassemblyWork>();
-    for (const w of after.work.get(record.roomId) ?? []) if (w.startedAt === record.startedAt) work.set(w.dockId, w);
+    const work = workOf(after, record);
     const active = after.active.get(record.roomId) ?? NO_DOCKS;
     const wasWorking = asJob(before, record).crew.includes(dockId);
     const mine = work.get(dockId);
@@ -301,14 +304,69 @@ function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | 
       map.set(workKey(record.roomId, dockId), stopped);
       work.set(dockId, stopped);
     }
-    let crew = [...active].filter((d) => work.get(d)?.working).length;
-    for (const d of [...active].sort()) {
-      if (crew >= MAX_CREW) break;
-      if (work.get(d)?.working) continue;
-      map.set(workKey(record.roomId, d), startWork(record, d, work.get(d), now));
-      crew++;
-    }
+    fillCrewIn(map, record, work, active, now);
   }
+}
+
+/** One opening of a job's robot work records, by dock. */
+function workOf(index: JobIndex, record: DisassemblyJobRecord): Map<string, DisassemblyWork> {
+  const work = new Map<string, DisassemblyWork>();
+  for (const w of index.work.get(record.roomId) ?? []) if (w.startedAt === record.startedAt) work.set(w.dockId, w);
+  return work;
+}
+
+/** Hold an open job's crew to its records, inside the caller's transaction
+ *  (`work` is updated with what is written). A robot whose record says it
+ *  works but that workingCrew leaves out (two clients each started a robot
+ *  at once, past MAX_CREW) stops, uncredited: its time was never counted.
+ *  A robot set to the job and not stopped that isn't working (it waited for
+ *  room, or crossed edits left its record stopped) starts at `now` while
+ *  the crew has room, never credited for the wait. Every client reading
+ *  the same records stops and starts the same robots. */
+function fillCrewIn(
+  map: Y.Map<unknown>,
+  record: DisassemblyJobRecord,
+  work: Map<string, DisassemblyWork>,
+  active: ReadonlySet<string>,
+  now: number,
+): void {
+  const crew = workingCrew(work.values(), active);
+  for (const w of [...work.values()]) {
+    if (!w.working || !active.has(w.dockId) || crew.has(w.dockId)) continue;
+    const stopped = { ...w, working: false };
+    map.set(workKey(record.roomId, w.dockId), stopped);
+    work.set(w.dockId, stopped);
+  }
+  let size = crew.size;
+  for (const d of [...active].sort()) {
+    if (size >= MAX_CREW) break;
+    if (crew.has(d)) continue;
+    const started = startWork(record, d, work.get(d), now);
+    map.set(workKey(record.roomId, d), started);
+    work.set(d, started);
+    size++;
+  }
+}
+
+/** 🔧 After edits made elsewhere arrive: each open job's crew held to its
+ *  records (fillCrewIn) as of their arrival. Two clients' edits to one
+ *  robot can cross so that its config says it works while its record says
+ *  it stopped (one stops it while the other writes its config as it was);
+ *  it starts now, never credited for the time before, instead of waiting
+ *  on its dock until its config is next written. Edits made here hold the
+ *  crew as they are written (setConfigIn). */
+function reconcileCrews(map: Y.Map<unknown>): void {
+  const doc = map.doc;
+  if (!doc) return;
+  const index = indexJobs(map);
+  const open = index.records.filter((r) => r.finishedAt === undefined);
+  if (open.length === 0) return;
+  const now = Date.now();
+  doc.transact(() => {
+    for (const record of open) {
+      fillCrewIn(map, record, workOf(index, record), index.active.get(record.roomId) ?? NO_DOCKS, now);
+    }
+  });
 }
 
 /**

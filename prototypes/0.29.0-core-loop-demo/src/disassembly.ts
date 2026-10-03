@@ -42,10 +42,10 @@ export const LABOR_HOURS_PER_TILE = 6;
  *  costed as the default room. */
 const FALLBACK_DIMS = { cols: 2, rows: 2 };
 
-/** Most robots that start work on one job (a room holds few docks): one
+/** Most robots that work on one job at once (a room holds few docks): one
  *  set to it while that many work waits on its dock until one stops
- *  (robotDoc.ts). Nor can a job's own record claim more labor than that
- *  many robots could have done. */
+ *  (workingCrew, robotDoc.ts). Nor can a job's own record claim more labor
+ *  than that many robots could have done. */
 export const MAX_CREW = 16;
 
 const MAX_ID = 128;
@@ -194,9 +194,9 @@ export function stopWork(work: DisassemblyWork, now: number): DisassemblyWork {
 
 /** 🔧 The job as read: `record` with the labor of its robots' records folded
  *  in as of the latest of them (or the record's own `asOf`), so workedMs and
- *  jobDueAt read it as one crew working since then. A robot works on it
- *  while its record says it is working and it is still set to the job (in
- *  `active`: not stopped, its dock placed); a robot that isn't adds what
+ *  jobDueAt read it as one crew working since then. The crew is
+ *  workingCrew's (its record says it works, it is still set to the job:
+ *  in `active`, not stopped, its dock placed); a robot outside it adds what
  *  its record holds and no more. An ended job keeps its record's labor and
  *  has no crew. */
 export function jobFromWork(
@@ -207,16 +207,26 @@ export function jobFromWork(
   if (record.finishedAt !== undefined) return { ...record, crew: [] };
   const mine = [...work].filter((w) => w.roomId === record.roomId && w.startedAt === record.startedAt);
   const asOf = mine.reduce((t, w) => Math.max(t, w.asOf), record.asOf);
+  const crew = workingCrew(mine, active);
   let done = record.doneMs;
-  const crew: string[] = [];
   for (const w of mine) {
     done += w.ms;
-    if (w.working && active.has(w.dockId)) {
-      crew.push(w.dockId);
-      done += asOf - w.asOf;
-    }
+    if (crew.has(w.dockId)) done += asOf - w.asOf;
   }
-  return { ...record, doneMs: Math.min(jobLaborMs(record), done), asOf, crew: crew.sort() };
+  return { ...record, doneMs: Math.min(jobLaborMs(record), done), asOf, crew: [...crew].sort() };
+}
+
+/** 🔧 Which robots work on a job, from its records (`work`, all of the one
+ *  job): those whose record says they work and that are still set to it
+ *  (`active`), at most MAX_CREW of them, the earliest started first (then
+ *  by dock id), the same on every client. One past them (two clients each
+ *  started a robot at once) is not counted, so its time is never labor:
+ *  robotDoc stops its record uncredited and starts it again when a place
+ *  in the crew frees. */
+export function workingCrew(work: Iterable<DisassemblyWork>, active: ReadonlySet<string>): Set<string> {
+  const working = [...work].filter((w) => w.working && active.has(w.dockId));
+  working.sort((a, b) => a.asOf - b.asOf || (a.dockId < b.dockId ? -1 : a.dockId > b.dockId ? 1 : 0));
+  return new Set(working.slice(0, MAX_CREW).map((w) => w.dockId));
 }
 
 /** When the labor runs out at the current crew, or null (already finished,
