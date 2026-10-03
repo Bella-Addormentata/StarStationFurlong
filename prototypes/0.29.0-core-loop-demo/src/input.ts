@@ -5,6 +5,7 @@
 
 import * as THREE from 'three';
 import { getCameraYaw } from './cameraRig';
+import { isTextEntryTarget, type TextEntryTarget } from './typingFocus';
 
 // World up axis — WASD vectors rotate around this by the camera-rig yaw.
 const UP = new THREE.Vector3(0, 1, 0);
@@ -16,19 +17,49 @@ export class InputManager {
     // Listen for keyboard events
     window.addEventListener('keydown', (e) => this.onKeyDown(e));
     window.addEventListener('keyup', (e) => this.onKeyUp(e));
-    
+
+    // Focus ARRIVING in a text surface drops whatever is already held (#188).
+    // The keydown guard below only stops NEW presses: a key still down when
+    // the player clicks into the chat box would otherwise stay in the set for
+    // as long as they typed, so the walk already under way would never end.
+    // `focusin` rather than `focus` because only the former bubbles to window.
+    window.addEventListener('focusin', (e) => {
+      if (isTextEntryTarget(e.target as TextEntryTarget | null)) this.keys.clear();
+    });
+
+    // Leaving the window entirely (alt-tab, a native dialog, the OS taking
+    // focus) delivers no keyup, so anything held sticks down and the avatar
+    // is still walking when the player comes back. Same stuck-key class as
+    // the chat case above, so it is closed in the same place.
+    window.addEventListener('blur', () => this.keys.clear());
+
     console.log('✅ Input manager initialized');
   }
-  
+
   /**
    * Handle key down event
+   *
+   * Keys typed into a chat box, a rename field or any other text surface are
+   * not world input (#188): recording them walked the avatar across the room
+   * — and stood it up out of a seat — while the player was only writing a
+   * message.
+   *
+   * Guarded at capture rather than inside getMoveDirection() so that
+   * isKeyPressed() and isInteracting() fall silent too; 'e' would otherwise
+   * fire an interaction in the middle of a word.
    */
   private onKeyDown(event: KeyboardEvent) {
+    if (isTextEntryTarget(event.target as TextEntryTarget | null)) return;
     this.keys.add(event.key.toLowerCase());
   }
-  
+
   /**
    * Handle key up event
+   *
+   * Deliberately UNGUARDED, unlike onKeyDown. A key pressed in the world and
+   * only released after focus moved into a text field must still be cleared,
+   * or it sticks down forever. Releasing a key that was never recorded is a
+   * harmless no-op, so the guard would buy nothing and cost that.
    */
   private onKeyUp(event: KeyboardEvent) {
     this.keys.delete(event.key.toLowerCase());
