@@ -1014,6 +1014,144 @@ describe('a module taken apart', () => {
     }
   });
 
+  it('goes by the later of two removals tied at the six-hour ceiling', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const T = 1_000_000;
+      const CEILING = T + 6 * 60 * 60 * 1000;
+      now.mockReturnValue(T);
+      hub();
+      // GARDEN was taken apart (FIRST), brought back by someone standing
+      // inside it (a copy naming FIRST), and taken apart again (SECOND): all
+      // three stamped at the bound every reader enforces, so they tie.
+      const FIRST = T - 5000;
+      const SECOND = T - 1000;
+      const tomb = (at: number) => ({ roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: at, updatedAt: CEILING });
+      const revived = {
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, revives: FIRST, updatedAt: CEILING,
+      };
+      const docWith = (value: object) => {
+        const doc = new Y.Doc();
+        doc.getMap('atlas').set('room-b', value);
+        return doc;
+      };
+      bindStationAtlasDoc(docWith(tomb(FIRST)), { roomId: 'room-a', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      // A doc read for its gates, given the later removal, goes by it: the
+      // copy from between the two does not bring the module back.
+      const given = { ...readAtlas(), 'room-b': { roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: SECOND, lastSeen: CEILING } };
+      expect(withSharedAtlasOf(docWith(revived), given, 'room-b')['room-b']).toBeUndefined();
+      // The pull takes the later removal over the one we hold…
+      bindStationAtlasDoc(docWith(tomb(SECOND)), { roomId: 'room-a', isPassagePublic: () => false });
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBe(SECOND);
+      // …so the copy from between the two cannot bring the module back,
+      const stale = docWith(revived);
+      bindStationAtlasDoc(stale, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(stale.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: SECOND });
+      // and the push puts it over the first removal where a doc still holds that.
+      const old = docWith(tomb(FIRST));
+      bindStationAtlasDoc(old, { roomId: 'room-c', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      expect(old.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: SECOND, updatedAt: CEILING });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('keeps a later removal of its own that ties the saved one at the ceiling, when the store cannot take it', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const T = 1_000_000;
+      const CEILING = T + 6 * 60 * 60 * 1000;
+      const FIRST = T - 5000;
+      const SECOND = T - 1000;
+      now.mockReturnValue(T);
+      hub();
+      // GARDEN's first removal reached us at the six-hour ceiling, and was saved.
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('room-b', { roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: FIRST, updatedAt: CEILING });
+      bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+      const ls = globalThis.localStorage as { setItem: (k: string, v: string) => void };
+      const setItem = ls.setItem;
+      ls.setItem = () => { throw new Error('QuotaExceededError'); };
+      try {
+        // Our robots take it apart again (someone brought it back meanwhile)
+        // while the store is full: the later removal can only tie the saved
+        // one's stamp, and it stands.
+        dismantleInAtlas('room-b', SECOND);
+        expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBe(FIRST);
+        expect(doc.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: SECOND });
+        const next = new Y.Doc();
+        bindStationAtlasDoc(next, { roomId: 'room-c', isPassagePublic: () => false });
+        expect(next.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: SECOND });
+      } finally {
+        ls.setItem = setItem;
+      }
+      // Once the store takes writes again, a copy from between the two
+      // removals cannot bring the module back, and the later one is saved, as ours.
+      const stale = new Y.Doc();
+      stale.getMap('atlas').set('room-b', {
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, revives: FIRST, updatedAt: CEILING,
+      });
+      bindStationAtlasDoc(stale, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b']).toMatchObject({ dismantledAt: SECOND, dismantledHere: true });
+      expect(stale.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: SECOND });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('names the later of two removals tied at the ceiling when someone stands inside it', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const T = 1_000_000;
+      const CEILING = T + 6 * 60 * 60 * 1000;
+      const FIRST = T - 5000;
+      const SECOND = T - 1000;
+      now.mockReturnValue(T);
+      hub();
+      const tomb = (at: number) => ({ roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: at, updatedAt: CEILING });
+      const first = new Y.Doc();
+      first.getMap('atlas').set('room-b', tomb(FIRST));
+      bindStationAtlasDoc(first, { roomId: 'room-a', isPassagePublic: () => false });
+      // Someone steps into GARDEN by an old pass. Its own doc gets the later
+      // removal, tied at the ceiling, while the store is full: the store
+      // still holds the first.
+      const garden = new Y.Doc();
+      bindStationAtlasDoc(garden, { roomId: 'room-b', isPassagePublic: () => false });
+      const ls = globalThis.localStorage as { setItem: (k: string, v: string) => void };
+      const setItem = ls.setItem;
+      ls.setItem = () => { throw new Error('QuotaExceededError'); };
+      try {
+        garden.getMap('atlas').set('room-b', tomb(SECOND));
+      } finally {
+        ls.setItem = setItem;
+      }
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBe(FIRST);
+      const withSecond = Y.encodeStateAsUpdate(garden);
+      // The harvest of the room they stand in names the later removal, the
+      // one that would otherwise take the module back.
+      harvestIntoAtlas({ roomId: 'room-b', name: 'GARDEN', doors: [{ doorId: 'west', targetSeed: seed('room-a') }], owner: { id: 'p-me' } });
+      pushAtlasToDoc();
+      expect(readAtlas()['room-b']).toMatchObject({ revives: SECOND, lastSeen: CEILING });
+      expect(garden.getMap('atlas').get('room-b')).toMatchObject({ revives: SECOND, updatedAt: CEILING });
+      // Another install holding the later removal at that stamp takes the copy.
+      store.clear();
+      hub();
+      const other = new Y.Doc();
+      Y.applyUpdate(other, withSecond);
+      bindStationAtlasDoc(other, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      Y.applyUpdate(other, Y.encodeStateAsUpdate(garden));
+      expect(isDismantled('room-b')).toBe(false);
+      expect(readAtlas()['room-b']).toMatchObject({ revives: SECOND });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('a seed handed over later does not bring it back', () => {
     hub();
     dismantleInAtlas('room-b', 5);

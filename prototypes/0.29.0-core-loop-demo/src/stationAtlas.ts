@@ -192,6 +192,16 @@ function revivesTomb(
 ): boolean {
   return live.dismantledAt === undefined && tomb.dismantledAt !== undefined && live.revives === tomb.dismantledAt;
 }
+
+/** 🔧 Of two tombstones of one room at the same stamp, is `a` the later
+ *  dismantling (the larger dismantledAt)? Then it outranks `b`: where stamps
+ *  can only tie (the six-hour ceiling), a module taken apart again after a
+ *  copy brought it back must not lose to its first tombstone, which that old
+ *  copy revives. The pull, the push, withSharedAtlasOf, the harvest and this
+ *  session's unsaved tombstones all rank a tie this way. */
+function laterTomb(a: { dismantledAt?: number }, b: { dismantledAt?: number }): boolean {
+  return a.dismantledAt !== undefined && b.dismantledAt !== undefined && a.dismantledAt > b.dismantledAt;
+}
 /** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
  *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
  *  peer-written object that isSharedAtlasEntry does not size-check, and every
@@ -280,12 +290,15 @@ function readStoredAtlas(): Record<string, AtlasEntry> {
 }
 
 /** Does the saved record of a room outrank this session's tombstone of it:
- *  the same tombstone or a newer one, a newer live copy, or one that brought
- *  the module back (revivesTomb)? */
+ *  the same tombstone or a newer one (at an equal stamp, any but an earlier
+ *  dismantling: laterTomb), a newer live copy, or one that brought the
+ *  module back (revivesTomb)? */
 function supersedesTomb(saved: AtlasEntry | undefined, tomb: AtlasEntry): boolean {
   if (!saved) return false;
   if (revivesTomb(saved, tomb)) return true;
-  return saved.dismantledAt !== undefined ? saved.lastSeen >= tomb.lastSeen : saved.lastSeen > tomb.lastSeen;
+  return saved.dismantledAt !== undefined
+    ? saved.lastSeen > tomb.lastSeen || (saved.lastSeen === tomb.lastSeen && !laterTomb(tomb, saved))
+    : saved.lastSeen > tomb.lastSeen;
 }
 
 /** Save this session's unsaved tombstones, once the store takes writes
@@ -500,9 +513,10 @@ export function harvestIntoAtlas(entry: {
   // 🔧 Standing inside a module taken apart brings it back. This copy names
   // the tombstone it beats (revives): ours, or the one in the module's own
   // doc (bound: we are in it) when that one would otherwise take the module
-  // back from what we hold. It is stamped past it too, for readers that rank
-  // by stamp alone. A copy that already brought the module back keeps
-  // naming the tombstone it beat.
+  // back from what we hold (of two tombstones, the newer; at an equal stamp,
+  // the later dismantling: laterTomb). It is stamped past it too, for
+  // readers that rank by stamp alone. A copy that already brought the module
+  // back keeps naming the tombstone it beat.
   const now = Date.now();
   const docCopy = sharedAlive() && sharedCtx?.roomId === entry.roomId ? sharedMap!.get(entry.roomId) : undefined;
   const docTomb = isSharedAtlasEntry(docCopy) && docCopy.roomId === entry.roomId && docCopy.dismantledAt !== undefined
@@ -510,7 +524,7 @@ export function harvestIntoAtlas(entry: {
     : null;
   let tomb: { dismantledAt?: number; lastSeen: number } | null = prior?.dismantledAt !== undefined ? prior : null;
   if (docTomb && (tomb
-    ? docTomb.lastSeen > tomb.lastSeen
+    ? docTomb.lastSeen > tomb.lastSeen || (docTomb.lastSeen === tomb.lastSeen && laterTomb(docTomb, tomb))
     : !prior || !(revivesTomb(prior, docTomb) || prior.lastSeen > docTomb.lastSeen))) {
     tomb = docTomb;
   }
@@ -899,13 +913,17 @@ export function withSharedAtlasOf(
   // given is newer. Only a newer doc copy of such a room counts below; an
   // older one is gossip from before the job ended.
   // (A copy that brought the module back outranks the very tombstone it
-  // names, whatever their stamps: revivesTomb.)
+  // names, whatever their stamps: revivesTomb. Of two tombstones at an equal
+  // stamp, the later dismantling stands: laterTomb.)
   const gone = new Map<string, AtlasEntry>();
   for (const e of [...Object.values(readStoredAtlas()), ...Object.values(atlas)]) {
-    if (e?.dismantledAt === undefined || (gone.get(e.roomId)?.lastSeen ?? -Infinity) >= e.lastSeen) continue;
+    if (e?.dismantledAt === undefined) continue;
+    const seen = gone.get(e.roomId);
+    if (seen && (seen.lastSeen > e.lastSeen || (seen.lastSeen === e.lastSeen && !laterTomb(e, seen)))) continue;
     gone.set(e.roomId, e);
     const held = out[e.roomId];
-    if (!held || (!revivesTomb(held, e) && held.lastSeen <= e.lastSeen)) {
+    if (!held || (!revivesTomb(held, e) && (held.lastSeen < e.lastSeen
+      || (held.lastSeen === e.lastSeen && !laterTomb(held, e))))) {
       out[e.roomId] = { roomId: e.roomId, name: e.name, doors: {}, dismantledAt: e.dismantledAt, lastSeen: e.lastSeen };
     }
   }
@@ -921,7 +939,7 @@ export function withSharedAtlasOf(
       // live copy: a tie goes to the tombstone, as in the pull), joins nothing.
       const held = out[rid];
       if (!held || (!revivesTomb(held, value) && (value.updatedAt > held.lastSeen
-        || (value.updatedAt === held.lastSeen && held.dismantledAt === undefined)))) {
+        || (value.updatedAt === held.lastSeen && (held.dismantledAt === undefined || laterTomb(value, held)))))) {
         out[rid] = { roomId: rid, name: value.name || 'Module', doors: {}, dismantledAt: value.dismantledAt, lastSeen: value.updatedAt };
       }
     } else if (isSharedAtlasEntry(value) && value.roomId === rid && !stale) {
@@ -1652,7 +1670,8 @@ function pullSharedAtlas(): void {
     // incoming tombstone is not outranked by a stub, however fresh: a door
     // naming the room is no news about the room itself. At an equal stamp
     // the tombstone wins either way (pushAtlasToDoc publishes it at a tie:
-    // over a copy stamped at the six-hour ceiling it can do no better).
+    // over a copy stamped at the six-hour ceiling it can do no better), and
+    // of two tombstones, the later dismantling (laterTomb).
     const stub = Object.keys(prior?.doors ?? {}).length === 0 && prior?.localSeenAt === undefined;
     // 🔧 A copy that brought the module back outranks the tombstone it names,
     // whichever of the two we hold.
@@ -1662,9 +1681,10 @@ function pullSharedAtlas(): void {
       && !revivesTomb(value, prior)
       && prior.lastSeen >= value.updatedAt
       && (prior.dismantledAt !== undefined
-        || (value.dismantledAt !== undefined
+        ? prior.lastSeen > value.updatedAt || !laterTomb(value, prior)
+        : value.dismantledAt !== undefined
           ? !stub && prior.lastSeen > value.updatedAt
-          : Object.keys(prior.doors).length >= incoming))) {
+          : Object.keys(prior.doors).length >= incoming)) {
       // ⚓🚦 Our copy stands, but one harvested by an older build carries no
       // gates: take the doc's, and the access that rides with them, on their
       // own, so gate numbering sees them.
@@ -1827,11 +1847,12 @@ export function pushAtlasToDoc(): void {
       // 🔧 Between a tombstone and a live copy, the tombstone wins a tie, as
       // the pull and withSharedAtlasOf rank them: over a copy stamped at the
       // six-hour ceiling, dismantleInAtlas can only tie it, and the module
-      // must still come off.
+      // must still come off. Between two tombstones, the later dismantling
+      // wins a tie (laterTomb).
       // A copy that brought the module back outranks the tombstone it names,
       // whatever their stamps (revivesTomb).
       const knownAsNew = !!known && !revivesTomb(entry, known) && (revivesTomb(known, entry)
-        || (entry.dismantledAt !== undefined && known.dismantledAt === undefined
+        || (entry.dismantledAt !== undefined && (known.dismantledAt === undefined || laterTomb(entry, known))
           ? known.updatedAt > entry.lastSeen
           : known.updatedAt >= entry.lastSeen));
       // ⚓🚦 A doc copy with no gates (an older client's, or a stub) gains the
