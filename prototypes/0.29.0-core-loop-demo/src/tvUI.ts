@@ -17,7 +17,7 @@ import {
   formatClock, handRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
   putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource,
   sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
-  tvResume, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower,
+  tvResume, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, volumeKey,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
@@ -236,7 +236,11 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
       lastHtml = '';
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
-      const subs = [subscribeTvKey(tvKey(deps.itemId), render), subscribeTvKey(remoteKey(deps.itemId), render)];
+      const subs = [
+        subscribeTvKey(tvKey(deps.itemId), render),
+        subscribeTvKey(remoteKey(deps.itemId), render),
+        subscribeTvKey(volumeKey(deps.itemId), render),
+      ];
       unsubscribe = () => { for (const s of subs) s(); };
       // The clock and countdown move without a doc write.
       clockTimer = window.setInterval(render, 1000);

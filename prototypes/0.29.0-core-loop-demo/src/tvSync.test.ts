@@ -20,6 +20,10 @@ class FakePlayer implements TvPlayer {
   log: string[] = [];
   /** A lazy player's seek lands only on land() — YouTube's asynchronous seekTo. */
   lazy = false;
+  /** The media's length: where a seek is clamped (a player knows its end
+   *  before it can say so), and what durationMs() reports when `reportsDuration`. */
+  duration = NaN;
+  reportsDuration = true;
   private pendingSeek: number | null = null;
   constructor(public readonly canNudge: boolean, public readonly canSeek = true, public readonly hasClock = true) {}
   isReady() { return this.ready; }
@@ -27,25 +31,31 @@ class FakePlayer implements TvPlayer {
   isEnded() { return this.ended; }
   play() { this.playing = true; this.log.push('play'); }
   pause() { this.playing = false; this.log.push('pause'); }
-  /** A seek lands at once (unless lazy), and un-ends the player as a <video>'s does. */
+  /** A seek lands at once (unless lazy): past the end is the end, and ended;
+   *  anywhere else un-ends the player as a <video>'s does. */
   seek(ms: number) {
     this.log.push(`seek:${ms}`);
     if (this.lazy) { this.pendingSeek = ms; return; }
-    this.position = ms;
-    this.ended = false;
+    this.arrive(ms);
   }
   land() {
     if (this.pendingSeek === null) return;
-    this.position = this.pendingSeek;
+    const ms = this.pendingSeek;
     this.pendingSeek = null;
-    this.ended = false;
+    this.arrive(ms);
+  }
+  private arrive(ms: number) {
+    const end = Number.isFinite(this.duration) ? this.duration : Infinity;
+    this.position = Math.min(ms, end);
+    this.ended = this.position >= end;
   }
   currentMs() { return this.position; }
+  durationMs() { return this.reportsDuration ? this.duration : NaN; }
   setRate(rate: number) { this.rate = rate; this.log.push(`rate:${rate.toFixed(2)}`); }
   setVolume(v: number) { this.volume = v; }
 }
 
-function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number } = {}) {
+function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded?: () => void } = {}) {
   let now = 100_000;
   let pb: PlaybackNow = { state: 'playing', positionMs: 0, running: true, countdownMs: 0 };
   let jump = 0;
@@ -60,6 +70,7 @@ function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number } = {}) 
     jump: () => jump,
     heartbeat: (p) => beats.push(p),
     volume: () => 55,
+    onEnded: opts.onEnded,
   });
   return {
     c, beats,
@@ -333,6 +344,63 @@ describe('the holder as the room\'s clock', () => {
     p.land();
     h.tick(500);
     expect(h.beats).toEqual([0, 30_000]); // what landed is what goes out
+  });
+
+  it('a transport seek past the end lands at the end, and the programme is over — not stuck', () => {
+    const p = new FakePlayer(true);
+    p.duration = 60_000;
+    let ended = 0;
+    const h = harness(p, { hold: true, onEnded: () => { ended++; } });
+    p.position = 55_000;
+    h.set({ positionMs: 55_000 });
+    h.tick(); // the baseline beat
+    expect(h.beats).toEqual([55_000]);
+    h.transport({ positionMs: 65_000 }); // +10 s with five left
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:60000']); // the end, not beyond it
+    expect(p.ended).toBe(true);
+    expect(ended).toBe(1); // over at once: no target left to wait for
+    h.tick(TV_HEARTBEAT_MS);
+    expect(ended).toBe(1);
+  });
+
+  it('a seek past an end the player has not announced still lands when the player ends there', () => {
+    const p = new FakePlayer(true);
+    p.duration = 60_000;
+    p.reportsDuration = false; // YouTube before its metadata: nothing to clamp to
+    let ended = 0;
+    const h = harness(p, { hold: true, onEnded: () => { ended++; } });
+    p.position = 55_000;
+    h.set({ positionMs: 55_000 });
+    h.tick();
+    h.transport({ positionMs: 65_000 });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:65000']);
+    expect(p.position).toBe(60_000); // the player stopped where the media does
+    expect(ended).toBe(1); // a forward seek that ended the player has landed
+  });
+
+  it('an asynchronous rewind from the end is not mistaken for a landed seek', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    p.duration = 60_000;
+    let ended = 0;
+    const h = harness(p, { hold: true, onEnded: () => { ended++; } });
+    h.tick(); // the baseline beat, at 0
+    p.position = 60_000; p.playing = false; p.ended = true;
+    h.set({ positionMs: 60_000 });
+    h.tick(); // the programme ends once…
+    expect(ended).toBe(1);
+    h.transport({ positionMs: 0 }); // …and PLAY NOW replays it
+    h.tick();
+    expect(p.log.at(-1)).toBe('seek:0');
+    h.tick(); // the seek has not landed: still at the end, still "ended"
+    expect(ended).toBe(1); // not closed again — the jump is still landing
+    expect(h.beats).toEqual([0]); // and nothing published meanwhile
+    p.land();
+    h.tick();
+    expect(p.position).toBe(0);
+    expect(p.playing).toBe(true);
   });
 
   it('a player with no clock (the archive embed) is played and never beats', () => {

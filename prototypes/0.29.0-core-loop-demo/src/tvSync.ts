@@ -51,8 +51,18 @@ export interface TvPlayer {
   pause(): void;
   seek(ms: number): void;
   currentMs(): number;
+  /** The media's length in ms when the player knows it, else NaN (a live
+   *  stream, the archive embed, YouTube before its metadata arrives). */
+  durationMs(): number;
   setRate(rate: number): void;
   setVolume(volume: number): void;
+}
+
+/** A position past the media's end is the end, when the length is known:
+ *  a player clamps such a seek there, so the target must agree with it or
+ *  it would never be reached. */
+function clampToEnd(ms: number, durationMs: number): number {
+  return Number.isFinite(durationMs) && durationMs > 0 ? Math.min(ms, durationMs) : ms;
 }
 
 export interface TvSyncDeps {
@@ -95,7 +105,8 @@ export class TvSyncController {
   /** The scheduled countdown parks the player at 0 once, not every tick. */
   private parked = false;
   /** The holder: the transport revision it has followed, and the position a
-   *  jump is still carrying the player to (null once landed). */
+   *  jump is still carrying the player to (null once landed; never past the
+   *  media's end once the player has said how long it is). */
   private appliedJump: number | null = null;
   private pendingTarget: number | null = null;
 
@@ -186,19 +197,29 @@ export class TvSyncController {
       // (PLAY NOW from the top, a resume where it paused) stays put.
       this.appliedJump = jump;
       this.endedHandled = false;
-      if (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS) {
-        p.seek(pb.positionMs);
+      // A target past the end (+10 s with five left) is the end: the player
+      // clamps the seek there, and so must the target, or it would never be
+      // reached and the programme never closed.
+      const target = clampToEnd(pb.positionMs, p.durationMs());
+      if (p.canSeek && Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) {
+        p.seek(target);
         this.lastSeekAt = now;
-        this.pendingTarget = pb.positionMs;
+        this.pendingTarget = target;
       }
     }
     // A jump has landed once the player reads within the band of it — checked
     // every tick, not only when a beat is due, so a player that then runs to
     // its end (a replay of a short film) is seen to end, and so the next beat
-    // goes out as soon as it may.
-    if (this.pendingTarget !== null
-      && Math.abs(p.currentMs() - this.pendingTarget) <= TV_SEEK_OVER_MS) {
-      this.pendingTarget = null;
+    // goes out as soon as it may. Clamped again here, with a length the
+    // player may not have known at the jump; and a FORWARD seek that ended
+    // the player has landed wherever the media stops, whether or not it ever
+    // said how long it was — a backward one from the end has not.
+    if (this.pendingTarget !== null) {
+      const target = clampToEnd(this.pendingTarget, p.durationMs());
+      const at = p.currentMs();
+      const landed = Math.abs(at - target) <= TV_SEEK_OVER_MS
+        || (p.isEnded() && target >= at - TV_SEEK_OVER_MS);
+      if (landed) this.pendingTarget = null;
     }
     this.setRate(1);
     if (p.isEnded()) {
@@ -242,7 +263,7 @@ export class TvSyncController {
     const action = driftAction(p.currentMs(), pb.positionMs, p.canNudge);
     if (action === 'seek') {
       if (p.canSeek && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
-        p.seek(pb.positionMs);
+        p.seek(clampToEnd(pb.positionMs, p.durationMs()));
         this.lastSeekAt = now;
         this.setRate(1);
       }

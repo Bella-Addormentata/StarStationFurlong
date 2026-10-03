@@ -13,7 +13,7 @@ import {
   setTvHostPredicate, setTvIdentity, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
   tvKey, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
   tvTogglePower, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
-  TV_SEEK_OVER_MS,
+  TV_SEEK_OVER_MS, volumeKey,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 
@@ -270,10 +270,42 @@ describe('the programme', () => {
     const calls: string[] = [];
     subscribeTvKey(tvKey(TV), () => calls.push('tv'));
     subscribeTvKey(remoteKey(TV), () => calls.push('remote'));
+    subscribeTvKey(volumeKey(TV), () => calls.push('volume'));
     tvPlay(TV, FILM);
     renewRemote(TV);
+    tvSetVolume(TV, 30);
     pickUpRemote('smart-tv-2');
-    expect(calls).toEqual(['tv', 'remote']);
+    expect(calls).toEqual(['tv', 'remote', 'volume']);
+  });
+
+  it('a peer\'s garbage volume reads as the default, and an out-of-range one is clamped', () => {
+    doc.getMap('tv').set(volumeKey(TV), 'loud');
+    expect(readTv(TV).volume).toBe(70);
+    doc.getMap('tv').set(volumeKey(TV), { volume: 250 });
+    expect(readTv(TV).volume).toBe(100);
+  });
+
+  it('a volume press on one device never carries a stale programme over a seek on another', () => {
+    // Two pages with a doc each, syncing afterwards: Alice (the holder)
+    // seeks while Bob turns the sound down. The volume has a key of its own,
+    // so the two writes never meet in one LWW slot — both land, on both.
+    const alice = doc;
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    const bob = new Y.Doc();
+    Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+    bindTvDoc(bob);
+    iAm(BOB, 'Bob');
+    tvSetVolume(TV, 20); // on Bob's page, not yet synced
+    bindTvDoc(alice);
+    iAm(ALICE, 'Alice');
+    expect(tvSeek(TV, 60_000)).toEqual({ ok: true }); // on Alice's, the same moment
+    Y.applyUpdate(alice, Y.encodeStateAsUpdate(bob));
+    Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+    for (const d of [alice, bob]) {
+      bindTvDoc(d);
+      expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 60_000, volume: 20 });
+    }
   });
 });
 

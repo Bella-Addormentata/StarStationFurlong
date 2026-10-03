@@ -34,6 +34,8 @@ interface YtPlayerLike {
   pauseVideo(): void;
   seekTo(seconds: number, allowSeekAhead: boolean): void;
   getCurrentTime(): number;
+  /** Seconds; 0 until the video's metadata has loaded. */
+  getDuration(): number;
   getPlayerState(): number;
   setVolume(volume: number): void;
   destroy(): void;
@@ -122,6 +124,12 @@ class YouTubePlayerAdapter implements Adapter {
   currentMs(): number {
     try { return (this.player?.getCurrentTime() ?? 0) * 1000; } catch { return 0; }
   }
+  durationMs(): number {
+    try {
+      const seconds = this.player?.getDuration() ?? 0;
+      return seconds > 0 ? seconds * 1000 : NaN;
+    } catch { return NaN; }
+  }
   setRate(): void { /* YouTube's rate steps are coarse: the controller only seeks */ }
   setVolume(volume: number): void { try { this.player?.setVolume(volume); } catch { /* not ready */ } }
   destroy(): void {
@@ -164,6 +172,11 @@ class HtmlVideoPlayerAdapter implements Adapter {
   pause(): void { this.video.pause(); }
   seek(ms: number): void { try { this.video.currentTime = ms / 1000; } catch { /* not seekable yet */ } }
   currentMs(): number { return this.video.currentTime * 1000; }
+  /** NaN before the metadata, and for a live stream (Infinity). */
+  durationMs(): number {
+    const seconds = this.video.duration;
+    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : NaN;
+  }
   setRate(rate: number): void { this.video.playbackRate = rate; }
   setVolume(volume: number): void { this.video.volume = Math.min(1, Math.max(0, volume / 100)); }
   destroy(): void {
@@ -197,6 +210,7 @@ class ArchiveEmbedAdapter implements Adapter {
   pause(): void { /* no API */ }
   seek(): void { /* no API */ }
   currentMs(): number { return 0; }
+  durationMs(): number { return NaN; }
   setRate(): void { /* no API */ }
   setVolume(): void { /* no API */ }
   destroy(): void { this.iframe.remove(); }

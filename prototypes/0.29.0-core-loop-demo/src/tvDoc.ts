@@ -2,12 +2,17 @@
  * 📺 tvDoc — the smart TV's shared records (#186): what is on, where the
  * playback is, and who holds the remote.
  *
- * Two keys per TV in the room doc's `tv` map, plain JSON, whole-value
+ * Three keys per TV in the room doc's `tv` map, plain JSON, whole-value
  * transacted writes, LWW per key (the partyDoc discipline):
- *   tv:<itemId>     → TvRecord     the programme and the playback clock
+ *   tv:<itemId>     → TvProgramme  the programme and the playback clock
  *   remote:<itemId> → RemoteRecord the remote control's holder (a lease)
+ *   volume:<itemId> → { volume }   the set's volume, a body button
  * They are SEPARATE keys so renewing the remote's lease never collides with
- * a playback write (the `giftwish:` precedent in partyDoc.ts).
+ * a playback write (the `giftwish:` precedent in partyDoc.ts), and so a
+ * viewer turning the sound down while the holder seeks can never carry a
+ * stale programme back over the holder's write: whole-value LWW keeps one
+ * writer per key, so each thing that changes on its own has a key of its
+ * own. readTv joins the programme and the volume for the readers.
  *
  * THE SYNC RULE (plan §3.1, brainstorming/smart-tv-arcade-media-plan.md):
  * the holder writes `{positionMs, seq}` every TV_HEARTBEAT_MS while playing.
@@ -74,7 +79,10 @@ export interface TvHistoryEntry {
   playedAt: number;
 }
 
-export interface TvRecord {
+/** The `tv:` key: what is on and where the playback is. The set's volume is
+ *  NOT here (its own key, below), so a volume press can never overwrite a
+ *  transport write. */
+export interface TvProgramme {
   source: TvSource | null;
   state: TvState;
   /** UTC ms — the countdown, 'scheduled' only (0 otherwise). */
@@ -96,8 +104,12 @@ export interface TvRecord {
   jump: number;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
+}
+
+/** What a reader sees: the programme joined with the set's volume. */
+export interface TvRecord extends TvProgramme {
   /** 0–100, a body button: anyone may change it (it is the SET's volume,
-   *  every client scales its own output by it). */
+   *  every client scales its own output by it). Read from `volume:<itemId>`. */
   volume: number;
 }
 
@@ -114,7 +126,7 @@ export interface RemoteRecord {
   by: string;
 }
 
-export const TV_DEFAULT: TvRecord = {
+export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   source: null,
   state: 'off',
   startAt: 0,
@@ -123,8 +135,9 @@ export const TV_DEFAULT: TvRecord = {
   started: 0,
   jump: 0,
   history: [],
-  volume: 70,
 };
+
+export const TV_DEFAULT: TvRecord = { ...TV_DEFAULT_PROGRAMME, volume: 70 };
 
 export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by: '' };
 
@@ -203,7 +216,7 @@ function noteSamples(keys: Iterable<string>): void {
     }
     if (!key.startsWith('tv:')) continue;
     const itemId = key.slice(3);
-    const rec = readTv(itemId);
+    const rec = readProgramme(itemId);
     const prev = samples.get(itemId);
     if (!prev || prev.seq !== rec.seq) {
       samples.set(itemId, { seq: rec.seq, positionMs: rec.positionMs, receivedAt: now });
@@ -268,6 +281,9 @@ export function tvKey(itemId: string): string {
 export function remoteKey(itemId: string): string {
   return `remote:${itemId}`;
 }
+export function volumeKey(itemId: string): string {
+  return `volume:${itemId}`;
+}
 
 // ── Identity and host seams (registered by main.ts, never asserted by a caller) ──
 
@@ -329,9 +345,10 @@ export function isHttpUrl(s: string): boolean {
 
 const STATES: ReadonlySet<string> = new Set(['off', 'home', 'scheduled', 'playing', 'paused']);
 
-export function readTv(itemId: string): TvRecord {
-  const raw = ensureMap().get(tvKey(itemId)) as Partial<TvRecord> | undefined;
-  if (!raw || typeof raw !== 'object') return { ...TV_DEFAULT };
+/** The `tv:` key as a peer may have written it: the programme alone. */
+export function readProgramme(itemId: string): TvProgramme {
+  const raw = ensureMap().get(tvKey(itemId)) as Partial<TvProgramme> | undefined;
+  if (!raw || typeof raw !== 'object') return { ...TV_DEFAULT_PROGRAMME };
   const source = sanitizeSource(raw.source);
   const state = typeof raw.state === 'string' && STATES.has(raw.state) ? (raw.state as TvState) : 'off';
   const history = Array.isArray(raw.history)
@@ -355,8 +372,21 @@ export function readTv(itemId: string): TvRecord {
     started: Math.max(0, Math.floor(num(raw.started))),
     jump: Math.max(0, Math.floor(num(raw.jump))),
     history,
-    volume: Math.min(100, Math.max(0, Math.round(num(raw.volume, TV_DEFAULT.volume)))),
   };
+}
+
+/** The set's volume, 0–100, from its own key; the default for anything a
+ *  peer may have written there that is not a number. */
+export function readVolume(itemId: string): number {
+  const raw = ensureMap().get(volumeKey(itemId)) as { volume?: unknown } | undefined;
+  const v = raw && typeof raw === 'object' ? num(raw.volume, TV_DEFAULT.volume) : TV_DEFAULT.volume;
+  return Math.min(100, Math.max(0, Math.round(v)));
+}
+
+/** What a screen, a phone or the theatre shows: the programme and the
+ *  volume, joined from their two keys. */
+export function readTv(itemId: string): TvRecord {
+  return { ...readProgramme(itemId), volume: readVolume(itemId) };
 }
 
 export function readRemote(itemId: string): RemoteRecord {
@@ -470,7 +500,7 @@ function titleOf(source: TvSource): string {
   return source.title || sourceLabel(source);
 }
 
-function withHistory(rec: TvRecord, source: TvSource, now: number): TvHistoryEntry[] {
+function withHistory(rec: TvProgramme, source: TvSource, now: number): TvHistoryEntry[] {
   const key = sourceId(source);
   const rest = rec.history.filter((h) => sourceId(h.source) !== key);
   return [{ source, title: titleOf(source), playedAt: now }, ...rest].slice(0, TV_HISTORY_MAX);
@@ -482,7 +512,7 @@ export function tvPlay(itemId: string, source: TvSource, now = clock()): TvActio
   if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -493,7 +523,7 @@ export function tvPlay(itemId: string, source: TvSource, now = clock()): TvActio
     started: rec.seq + 1,
     jump: rec.jump + 1,
     history: withHistory(rec, clean, now),
-  } satisfies TvRecord);
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -504,7 +534,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
   const clean = sanitizeSource(source);
   if (!clean) return { ok: false, error: 'That is not something the TV can play.' };
   if (!Number.isFinite(startAt) || startAt <= now) return { ok: false, error: 'Pick a time that is still ahead.' };
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec,
     source: clean,
@@ -515,7 +545,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     started: rec.seq + 1,
     jump: rec.jump + 1,
     history: withHistory(rec, clean, now),
-  } satisfies TvRecord);
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -523,7 +553,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
 export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'scheduled') return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
     ...rec,
@@ -531,14 +561,14 @@ export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
     startAt: 0,
     positionMs: Math.max(0, Math.floor(positionMs)),
     seq: rec.seq + 1,
-  } satisfies TvRecord);
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
 export function tvPause(itemId: string, positionMs: number): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   if (rec.state !== 'playing') return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
     ...rec,
@@ -546,16 +576,16 @@ export function tvPause(itemId: string, positionMs: number): TvAction {
     positionMs: Math.max(0, Math.floor(positionMs)),
     seq: rec.seq + 1,
     jump: rec.jump + 1,
-  } satisfies TvRecord);
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
 export function tvResume(itemId: string): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   if (rec.state !== 'paused' || !rec.source) return { ok: false, error: 'Nothing is paused.' };
-  write(tvKey(itemId), { ...rec, state: 'playing', seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvRecord);
+  write(tvKey(itemId), { ...rec, state: 'playing', seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -563,11 +593,11 @@ export function tvResume(itemId: string): TvAction {
 export function tvSeek(itemId: string, positionMs: number): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'paused') return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
     ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: rec.seq + 1, jump: rec.jump + 1,
-  } satisfies TvRecord);
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -575,10 +605,10 @@ export function tvSeek(itemId: string, positionMs: number): TvAction {
 export function tvStop(itemId: string): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   write(tvKey(itemId), {
     ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: rec.seq + 1, jump: rec.jump + 1,
-  } satisfies TvRecord);
+  } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -587,20 +617,22 @@ export function tvStop(itemId: string): TvAction {
 /** POWER on the set. Off keeps the programme, like a real TV; on brings it
  *  back paused where it was, or to the home screen with nothing on. */
 export function tvTogglePower(itemId: string): boolean {
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   if (rec.state === 'off') {
     write(tvKey(itemId), {
       ...rec, state: rec.source ? 'paused' : 'home', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1,
-    } satisfies TvRecord);
+    } satisfies TvProgramme);
     return true;
   }
-  write(tvKey(itemId), { ...rec, state: 'off', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvRecord);
+  write(tvKey(itemId), { ...rec, state: 'off', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvProgramme);
   return false;
 }
 
+/** VOLUME on the set: its own key, so a press here never carries a stale
+ *  programme over a transport write the holder made at the same moment. */
 export function tvSetVolume(itemId: string, volume: number): void {
-  const rec = readTv(itemId);
-  write(tvKey(itemId), { ...rec, volume: Math.min(100, Math.max(0, Math.round(volume))) } satisfies TvRecord);
+  const v = Number.isFinite(volume) ? Math.round(volume) : TV_DEFAULT.volume;
+  write(volumeKey(itemId), { volume: Math.min(100, Math.max(0, v)) });
 }
 
 // ── Sync maths (pure) ────────────────────────────────────────────────────────
@@ -642,7 +674,7 @@ export function expectedPositionMs(
 
 /** What the room should be showing right now. */
 export function readPlayback(itemId: string, now = clock(), rttMs = 0): PlaybackNow {
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   if (rec.state === 'scheduled') {
     const countdownMs = Math.max(0, rec.startAt - now);
     if (countdownMs > 0) return { state: 'scheduled', positionMs: 0, running: false, countdownMs };
@@ -813,7 +845,7 @@ export interface TvScreenView {
 /** Derive what the in-world screen shows from the records alone, so every
  *  client's prop agrees and the drawing code has nothing to decide. */
 export function tvScreenView(itemId: string, now = clock()): TvScreenView {
-  const rec = readTv(itemId);
+  const rec = readProgramme(itemId);
   const remote = readRemote(itemId);
   const holderLine = remote.holder && !remoteLapsed(itemId, now)
     ? `REMOTE · ${remote.name || 'a clone'}`
