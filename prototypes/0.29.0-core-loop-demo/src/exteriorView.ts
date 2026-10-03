@@ -32,6 +32,7 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
+import { planetForRoom } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 import {
   buildConnectorChain,
@@ -438,14 +439,16 @@ function buildGroup(): THREE.Group {
     }
   }
 
-  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.
+  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell — the
+  // planet the CURRENT station orbits (stations.ts; Sovereign when unknown).
+  const orbited = planetForRoom(currentRoomId);
   const planet = new THREE.Mesh(
     new THREE.SphereGeometry(42, 48, 32),
     new THREE.MeshStandardMaterial({
-      color: 0x2a5a8f,
+      color: orbited.color,
       roughness: 0.9,
       metalness: 0.05,
-      emissive: 0x0c2038,
+      emissive: orbited.emissive,
       emissiveIntensity: 0.5,
     }),
   );
@@ -454,7 +457,7 @@ function buildGroup(): THREE.Group {
   const atmo = new THREE.Mesh(
     new THREE.SphereGeometry(43.6, 48, 32),
     new THREE.MeshBasicMaterial({
-      color: 0x7fb8ff,
+      color: orbited.atmosphere,
       transparent: true,
       opacity: 0.1,
       side: THREE.BackSide,

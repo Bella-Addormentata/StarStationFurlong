@@ -7,6 +7,10 @@
  * long-distance travel system (v006 §8.2 / Phase 2 Feature 1 & 2).
  */
 
+import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
+import type { StationRecord } from './stations';
+import { angleAt, stationOrbit } from './orbits';
+
 export interface MapBody {
   id: string;
   name: string;
@@ -17,9 +21,61 @@ export interface MapBody {
   semiMajorAxis?: number;
   eccentricity?: number; // 0 = circular, >0 = elliptical
   angle: number; // current angle in radians
+  /** 🪐 When set, the body's true angle at a real time (orbits.ts) — replaces
+   *  angle + orbitSpeed·tick, so every client draws it in the same place. */
+  angleAt?: (nowMs: number) => number;
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
+}
+
+/** Map radius of orbit slot 0 around a planet, and the step per slot. The
+ *  holotable draws orbits SCHEMATICALLY (true to scale, every low station
+ *  would sit on the planet's rim); the ANGLE is the true one. */
+const STATION_ORBIT_BASE = 35;
+const STATION_ORBIT_STEP = 9;
+
+/**
+ * Canvas offset of a body at `angle` on a circle of `radius`. The holotable
+ * looks down from the NORTH, like the orbits.ts planet frame: +X to the
+ * right, −Z up the screen — so every orbit goes round counter-clockwise.
+ */
+export function screenOffset(angle: number, radius: number): { dx: number; dy: number } {
+  return { dx: Math.cos(angle) * radius, dy: -Math.sin(angle) * radius };
+}
+
+/** "1m 32s" / "3h 54m" — a real-time span for the holotable readout. */
+function formatSpan(ms: number): string {
+  const s = Math.round(ms / 1000);
+  if (s < 3600) return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+/**
+ * 🪐 One map body per station, on its circular orbit around its planet
+ * (stations.ts for the slot, orbits.ts for the mechanics). The angle comes
+ * from the shared orbital clock; slot 0 starts where the single hard-coded
+ * Furlong body always stood.
+ */
+export function stationBodies(stations: StationRecord[]): MapBody[] {
+  return stations.map((s) => {
+    const orbit = stationOrbit(s);
+    const readout = `${Math.round(orbit.altitudeKm).toLocaleString('en-US')} km up · ${orbit.speedKmS.toFixed(2)} km/s · `
+      + `one orbit every ${formatSpan((orbit.periodS / 60) * 1000)}.`;
+    return {
+      id: s.id,
+      name: s.name,
+      type: 'station' as const,
+      parentId: orbit.planet.id,
+      orbitRadius: STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP,
+      orbitSpeed: 0,
+      angle: orbit.phase0,
+      angleAt: (nowMs: number) => angleAt(orbit, nowMs),
+      description: s.id === DEFAULT_STATION_ID
+        ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
+        : `Station around ${orbit.planet.name}: ${readout}`,
+    };
+  });
 }
 
 export class SolarSystemMap {
@@ -31,6 +87,8 @@ export class SolarSystemMap {
   
   // Keplerian orbit / Sim Clock state
   private simTick = 0;
+  /** Real clock for bodies with a true orbit (angleAt). */
+  private clock: () => number = () => Date.now();
   
   // UI scaling / dragging offsets
   private scale = 1.0;
@@ -42,7 +100,7 @@ export class SolarSystemMap {
   
   // Selection / Travel tracking
   private selectedBody: MapBody | null = null;
-  private playerLocationId = 'furlong-station';
+  private playerLocationId = DEFAULT_STATION_ID;
   private travelDestination: MapBody | null = null;
   private departureTick = 0;
   private travelDurationTicks = 0; // calculated distance / speed ratio
@@ -87,16 +145,7 @@ export class SolarSystemMap {
         description: 'Carbon-silica rich terra planet holding Furlong System main station.',
         resources: [{ type: 'Silica', yield: 1200 }],
       },
-      {
-        id: 'furlong-station',
-        name: 'FURLONG LOBBY STATION',
-        type: 'station',
-        parentId: 'planet-sovereign',
-        orbitRadius: 35, // Distance from parent Planet Sovereign
-        orbitSpeed: 0.015,
-        angle: 2.1,
-        description: 'Sovereign-serverless terminal, lounge, and trade hub for all clones.',
-      },
+      ...stationBodies(listStations()),
       {
         id: 'lagrange-l4',
         name: 'SOVEREIGN L4 APEX',
@@ -367,17 +416,16 @@ export class SolarSystemMap {
     let radius = body.orbitRadius * this.scale;
     let angle = body.angle;
 
-    // Simulate orbital movement as a function of the simulation clock tick
-    angle += body.orbitSpeed * this.simTick;
+    // Simulate orbital movement as a function of the simulation clock tick —
+    // or, for stations, the true angle on the shared orbital clock.
+    angle = body.angleAt ? body.angleAt(this.clock()) : angle + body.orbitSpeed * this.simTick;
 
     if (body.parentId) {
       const parent = this.bodies.find(b => b.id === body.parentId);
       if (parent) {
         const parentCoords = this.getBodyCoordinates(parent, centerX, centerY);
-        return {
-          x: parentCoords.x + Math.cos(angle) * radius,
-          y: parentCoords.y + Math.sin(angle) * radius,
-        };
+        const { dx, dy } = screenOffset(angle, radius);
+        return { x: parentCoords.x + dx, y: parentCoords.y + dy };
       }
     }
 
@@ -388,14 +436,12 @@ export class SolarSystemMap {
       // Ellipse focuses on Sol Prime center
       return {
         x: centerX + Math.cos(angle) * a - (a * body.eccentricity),
-        y: centerY + Math.sin(angle) * b,
+        y: centerY - Math.sin(angle) * b, // north-up, as screenOffset
       };
     }
 
-    return {
-      x: centerX + Math.cos(angle) * radius,
-      y: centerY + Math.sin(angle) * radius,
-    };
+    const { dx, dy } = screenOffset(angle, radius);
+    return { x: centerX + dx, y: centerY + dy };
   }
 
   private selectBody(body: MapBody) {
@@ -638,6 +684,67 @@ export class SolarSystemMap {
   public getIrohNodeId(): string | undefined {
     const boot = this.getBootRecord();
     return boot ? boot.irohNodeId : undefined;
+  }
+
+  /**
+   * Re-read the station list (stations.ts) and mark the station the player is
+   * standing in. Called each time the holotable opens, so stations learned
+   * since the last look appear. A mock transit in progress keeps its own
+   * location until it lands.
+   */
+  public refreshStations(
+    stations: StationRecord[] = listStations(),
+    current: StationRecord | null = currentStation(),
+  ) {
+    this.bodies = [...this.bodies.filter((b) => b.type !== 'station'), ...stationBodies(stations)];
+    // A transit under way follows its destination's refreshed body, or is
+    // called off when that station is gone (it could never land).
+    if (this.travelDestination) {
+      const dest = this.bodies.find((b) => b.id === this.travelDestination!.id);
+      if (dest) {
+        this.travelDestination = dest;
+      } else {
+        this.travelDestination = null;
+        if (this.container) {
+          const travelPanel = document.getElementById('map-traveling-panel');
+          if (travelPanel) travelPanel.style.display = 'none';
+        }
+      }
+    }
+    // Location FIRST: the selection repaint below reads it for the travel
+    // button ("YOU ARE HERE" belongs to the station we are in now). A room no
+    // listed station holds (not in the atlas yet) is somewhere unknown, never
+    // the last station shown or Furlong by default.
+    if (!this.travelDestination) {
+      this.playerLocationId = current?.id ?? '';
+      if (this.container) {
+        const playerLocEl = document.getElementById('map-player-loc');
+        if (playerLocEl) playerLocEl.textContent = current?.name ?? 'UNKNOWN';
+      }
+    }
+    // Rebind the selection to the refreshed body (a station may have been
+    // renamed or moved since); drop it, and hide its details, when the
+    // station is gone.
+    const had = this.selectedBody;
+    const fresh = had && this.bodies.find((b) => b.id === had.id);
+    this.selectedBody = fresh || null;
+    if (this.container) {
+      if (fresh) {
+        this.selectBody(fresh);
+      } else if (had) {
+        const panel = document.getElementById('map-selection-details');
+        if (panel) panel.style.display = 'none';
+      }
+    }
+  }
+
+  /** The station bodies now on the map, planet by planet (test/debug view). */
+  public stationIds(): string[] {
+    return this.bodies.filter((b) => b.type === 'station').map((b) => b.id);
+  }
+
+  public getPlayerLocationId(): string {
+    return this.playerLocationId;
   }
 
   public show() {

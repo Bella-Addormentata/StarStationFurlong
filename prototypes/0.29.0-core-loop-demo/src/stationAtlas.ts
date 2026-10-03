@@ -34,7 +34,7 @@ import type { ConnectorSegment } from './adapter';
 import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
-import { projectionPoseForDoor, projectionPoseFromWall } from './adapter';
+import { isDockChain, projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 import { halfAlongWall } from './doorMatch';
 
 export interface AtlasDoor {
@@ -57,6 +57,17 @@ export interface AtlasDoor {
    *  room's snapshot, which was only ever right by coincidence. */
   wall?: DoorWall;
   lateral?: number;
+  /** ⚓ A TRANSIENT berth (doorsDoc `transient`, #67 D2): a visiting ship's
+   *  DOCK, not station structure. The exterior still draws the docked ship,
+   *  but station grouping (atlasComponents) skips the edge — the station-side
+   *  record can outlive the ship's departure (the dock never sees it leave),
+   *  and a ship must not join, or bridge, the stations it calls at.
+   *  Three states: true / false are KNOWN (a harvest, or gossip from a client
+   *  that knows the flag); absent is UNKNOWN — gossip from an older client,
+   *  which never sends it. Grouping asks isBerthDoor, which also counts any
+   *  DOCK chain whatever this says (a dock is always transient); an unknown
+   *  gangway groups like structure, as before. */
+  transient?: boolean;
 }
 
 export interface AtlasEntry {
@@ -140,10 +151,13 @@ export function roomIdFromSeed(seed: string): string {
 export function readAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return {};
+    if (!raw) return Object.create(null);
     const obj = JSON.parse(raw);
-    if (typeof obj !== 'object' || obj === null) return {};
-    const atlas = obj as Record<string, AtlasEntry>;
+    if (typeof obj !== 'object' || obj === null) return Object.create(null);
+    // No prototype: a room id such as `__proto__` or `constructor` is an own
+    // key like any other, never an inherited value, and writing one never
+    // sets the map's prototype (writeAtlas defines each key outright).
+    const atlas: Record<string, AtlasEntry> = Object.assign(Object.create(null), obj);
     // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
     // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
     // — and it does not just sit there: pushAtlasToDoc republishes it as
@@ -177,7 +191,7 @@ export function readAtlas(): Record<string, AtlasEntry> {
     }
     if (repaired) writeAtlas(atlas);
     return atlas;
-  } catch { return {}; }
+  } catch { return Object.create(null); }
 }
 
 /**
@@ -206,8 +220,32 @@ export function compareAtlasRecency(a: AtlasEntry, b: AtlasEntry): number {
   return bt !== at ? bt - at : br - ar;
 }
 
+/**
+ * ⚓ Write down every berth the atlas only INFERS. berthDoorIds counts both
+ * records of a connection as the berth when either end is one, but that
+ * inference lives only while both records do: once the flagged end is
+ * re-harvested without its dock (the ship cast off), the unflagged end left
+ * behind would read as structure again and pull the ship back into the
+ * station it left. So an unknown flag on an inferred berth is set to true
+ * while the pair is still there to show it. A known flag, true or false, is
+ * the room's own word and is left alone; a newer harvest of that room
+ * replaces the guess.
+ */
+function markInferredBerths(atlas: Record<string, AtlasEntry>): void {
+  for (const [roomId, doorIds] of berthDoorIds(atlas)) {
+    const doors = atlas[roomId]?.doors;
+    if (!doors) continue;
+    for (const id of doorIds) {
+      const door = doors[id];
+      if (door && typeof door.transient !== 'boolean') door.transient = true;
+    }
+  }
+}
+
 function writeAtlas(atlas: Record<string, AtlasEntry>): void {
   try {
+    // Before eviction, which can drop the flagged end of a berth too.
+    markInferredBerths(atlas);
     // 🗄️ Evict in two tiers, and never on the gossip stamp. `lastSeen` is
     // derived from a peer's `updatedAt`, so ordering retention by it let a peer
     // float its own entries to the top of a 64-deep list and push out rooms the
@@ -226,7 +264,11 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     // visited/gossip distinction for old entries rather than mis-ranking them.
     const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
-    for (const e of entries) out[e.roomId] = e;
+    // Defined, not assigned: assigning a room id `__proto__` would set the
+    // object's prototype, and the room would be left out of the store.
+    for (const e of entries) {
+      Object.defineProperty(out, e.roomId, { value: e, enumerable: true, writable: true, configurable: true });
+    }
     localStorage.setItem(KEY, JSON.stringify(out));
   } catch { /* privacy mode — the atlas degrades to the current room */ }
 }
@@ -240,11 +282,14 @@ export function harvestIntoAtlas(entry: {
   doors: Array<{
     doorId: string; targetSeed: string; segments?: ConnectorSegment[];
     farDoor?: string; farWall?: DoorWall; farLateral?: number; farYawDeg?: 0 | 45;
-    wall?: DoorWall; lateral?: number;
+    wall?: DoorWall; lateral?: number; transient?: boolean;
   }>;
 }): void {
   if (!entry.roomId) return;
   const atlas = readAtlas();
+  // Before this entry is replaced: an atlas saved before berths were written
+  // down may hold a berth only this entry's old doors imply.
+  markInferredBerths(atlas);
   const prior = atlas[entry.roomId];
   const doors: Record<string, AtlasDoor> = {};
   for (const d of entry.doors) {
@@ -258,6 +303,10 @@ export function harvestIntoAtlas(entry: {
       farYawDeg: d.farYawDeg,
       wall: d.wall,
       lateral: d.lateral,
+      // A DOCK is always a berth (dockRules), whatever its record's flag says.
+      ...(isDockChain(d.segments)
+        ? { transient: true }
+        : typeof d.transient === 'boolean' ? { transient: d.transient } : {}),
     };
   }
   atlas[entry.roomId] = {
@@ -400,6 +449,192 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
   }
   if (written) writeAtlas(atlas);
   return written;
+}
+
+// ── 🪐 Connected components — what a STATION is ──────────────────────────────
+//
+// Which rooms make up a station is never stored: a station is the set of
+// rooms joined by door pairings. These walks are the one definition of that
+// set, shared by the default-station export (defaultStation.atlasForBundle)
+// and the station registry (stations.ts), whose records — name, planet,
+// orbit — sit on top of these components. Edges are walked both ways — a pairing recorded on
+// either side joins the two rooms — and a door may name a room the atlas holds
+// no entry for (a neighbour we only heard about); that room still belongs.
+// TRANSIENT berths are not structure and join nothing: a visiting ship is not
+// part of the station it docks at, and a stale berth left on the station side
+// after the ship casts off can never bridge two stations through the ship.
+// Both records of a berth count as the berth (berthDoorIds), however the
+// other side happens to be flagged, and the atlas writes that down
+// (markInferredBerths) so it outlives the flagged record.
+
+/** ⚓ Is this door a visiting ship's berth rather than station structure?
+ *  Flagged transient, or a DOCK — exactly two `dock` segments, which dockRules
+ *  defines as always transient. The chain test is what catches docks recorded
+ *  before the flag existed (persisted, or gossiped by an older client): their
+ *  segments always travelled with them. */
+export function isBerthDoor(door: Pick<AtlasDoor, 'transient' | 'segments'>): boolean {
+  return door.transient === true || isDockChain(door.segments);
+}
+
+/**
+ * ⚓ Every door record that is part of a berth, as room id → door ids. A
+ * pairing is usually recorded on BOTH sides — the station room's door names
+ * the ship, the ship's door names the room — and the two records are ONE
+ * connection: when either side is a berth (isBerthDoor), so is the other,
+ * so a stale or older-client record left unflagged on one side can never
+ * join the ship to a station by itself.
+ *
+ * Records are matched per pair of rooms the way dockRules.findFarDoor finds
+ * a connection's far end: a record's `farDoor` is the far room's own key for
+ * its door, so a record naming one, or named by one, pairs with exactly that
+ * record. Records naming no far door then pair across: a berth with a berth
+ * opposite first (one connection flagged at both ends), and only a berth left
+ * over with one unflagged record opposite. Whatever is left over is a
+ * SEPARATE connection and keeps its own flag — a permanent gangway between
+ * the same two rooms still joins them.
+ */
+export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
+  type Side = Array<{ doorId: string; door: AtlasDoor }>;
+  // Each record filed under its (unordered) pair of rooms, by which end owns it.
+  const pairs = new Map<string, { owners: [string, string]; sides: [Side, Side] }>();
+  for (const e of Object.values(atlas)) {
+    if (!e?.roomId || !e.doors) continue;
+    for (const [doorId, door] of Object.entries(e.doors)) {
+      if (!door?.targetRoomId) continue;
+      const owners: [string, string] = e.roomId < door.targetRoomId
+        ? [e.roomId, door.targetRoomId]
+        : [door.targetRoomId, e.roomId];
+      const key = JSON.stringify(owners);
+      let pair = pairs.get(key);
+      if (!pair) pairs.set(key, pair = { owners, sides: [[], []] });
+      pair.sides[owners[0] === e.roomId ? 0 : 1].push({ doorId, door });
+    }
+  }
+
+  const berths = new Map<string, Set<string>>();
+  const mark = (roomId: string, doorId: string) => {
+    if (!berths.has(roomId)) berths.set(roomId, new Set());
+    berths.get(roomId)!.add(doorId);
+  };
+  for (const { owners, sides } of pairs.values()) {
+    const partnered = new Set<Side[number]>();
+    const partner = (i: 0 | 1, mine: Side[number], theirs: Side[number]) => {
+      partnered.add(mine);
+      partnered.add(theirs);
+      if (isBerthDoor(mine.door) || isBerthDoor(theirs.door)) {
+        mark(owners[i], mine.doorId);
+        mark(owners[1 - i], theirs.doorId);
+      }
+    };
+    // Named: `farDoor` picks out the other end exactly — the record's own
+    // name first, else a record opposite naming it.
+    for (const i of [0, 1] as const) {
+      for (const r of sides[i]) {
+        if (partnered.has(r)) continue;
+        const open = sides[1 - i].filter((c) => !partnered.has(c));
+        const t = open.find((c) => c.doorId === r.door.farDoor) ?? open.find((c) => c.door.farDoor === r.doorId);
+        if (t) partner(i, r, t);
+      }
+    }
+    // Unnamed: a berth flagged at both ends is one connection, so berths pair
+    // with berths first; only a berth left over (flagged on one side alone)
+    // takes one unflagged, unnamed record opposite.
+    const loose = (i: number, berth: boolean) =>
+      sides[i].filter((r) => r.door.farDoor === undefined && !partnered.has(r) && isBerthDoor(r.door) === berth);
+    const [flagged0, flagged1] = [loose(0, true), loose(1, true)];
+    for (let k = 0; k < Math.min(flagged0.length, flagged1.length); k++) partner(0, flagged0[k], flagged1[k]);
+    for (const i of [0, 1] as const) {
+      const unflagged = loose(1 - i, false);
+      for (const r of loose(i, true)) {
+        const t = unflagged.shift();
+        if (!t) break;
+        partner(i, r, t);
+      }
+    }
+    // Every record flagged itself, partnered or not.
+    for (const i of [0, 1] as const) {
+      for (const r of sides[i]) if (isBerthDoor(r.door)) mark(owners[i], r.doorId);
+    }
+  }
+  return berths;
+}
+
+function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
+  const adjacent = new Map<string, Set<string>>();
+  const link = (a: string, b: string) => {
+    if (!adjacent.has(a)) adjacent.set(a, new Set());
+    adjacent.get(a)!.add(b);
+  };
+  const berths = berthDoorIds(atlas);
+  for (const e of Object.values(atlas)) {
+    if (!e?.roomId || !e.doors) continue;
+    const skip = berths.get(e.roomId);
+    for (const [doorId, d] of Object.entries(e.doors)) {
+      if (!d?.targetRoomId || skip?.has(doorId)) continue;
+      link(e.roomId, d.targetRoomId);
+      link(d.targetRoomId, e.roomId);
+    }
+  }
+  return adjacent;
+}
+
+/** Does the atlas hold an entry of its own for this room? A door can name a
+ *  room `constructor` or `__proto__`, and what such a name inherits is no
+ *  entry. */
+function hasEntry(atlas: Record<string, AtlasEntry>, roomId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(atlas, roomId) && !!atlas[roomId];
+}
+
+/** The cap counts rooms the atlas holds an entry for; unknown door targets
+ *  are still walked (they are bounded by the per-entry door cap), so a room
+ *  listing many unknown neighbours cannot crowd a real one out of its
+ *  component and split one station into two. */
+function walkComponent(
+  atlas: Record<string, AtlasEntry>,
+  adjacent: Map<string, Set<string>>,
+  start: string,
+): Set<string> {
+  const component = new Set<string>([start]);
+  let known = hasEntry(atlas, start) ? 1 : 0;
+  const queue = [start];
+  while (queue.length > 0) {
+    const rid = queue.shift()!;
+    for (const next of adjacent.get(rid) ?? []) {
+      if (component.has(next)) continue;
+      if (hasEntry(atlas, next)) {
+        if (known >= MAX_ENTRIES) continue;
+        known++;
+      }
+      component.add(next);
+      queue.push(next);
+    }
+  }
+  return component;
+}
+
+/** The connected component of `roomId`, capped at the atlas's own size in
+ *  known rooms.
+ *  Empty when the atlas holds no entry for the room. */
+export function atlasComponent(atlas: Record<string, AtlasEntry>, roomId: string): Set<string> {
+  if (!roomId || !hasEntry(atlas, roomId)) return new Set();
+  return walkComponent(atlas, atlasAdjacency(atlas), roomId);
+}
+
+/** Every connected component of the atlas — one per station this install
+ *  knows. Only rooms the atlas holds an ENTRY for start a component, so a
+ *  door naming an unknown room never invents a station of its own. Order
+ *  follows the atlas's entry order; callers that need a stable order sort. */
+export function atlasComponents(atlas: Record<string, AtlasEntry>): Set<string>[] {
+  const adjacent = atlasAdjacency(atlas);
+  const seen = new Set<string>();
+  const out: Set<string>[] = [];
+  for (const e of Object.values(atlas)) {
+    if (!e?.roomId || seen.has(e.roomId)) continue;
+    const component = walkComponent(atlas, adjacent, e.roomId);
+    for (const rid of component) seen.add(rid);
+    out.push(component);
+  }
+  return out;
 }
 
 export interface AtlasPose {
@@ -587,6 +822,10 @@ interface SharedAtlasEntry {
     /** 🧭 This door's own physical pose — see AtlasDoor. */
     wall?: DoorWall;
     lateral?: number;
+    /** ⚓ A transient berth — see AtlasDoor. Sent whenever KNOWN, false
+     *  included, so a reader can tell "not a berth" from an older client's
+     *  silence. */
+    transient?: boolean;
   }>;
   /** 🛑📐 The module's true tile size. PUBLIC by owner ruling — anyone may see
    *  a module's outside: its size, its position and its connections. Only the
@@ -698,10 +937,13 @@ export function subscribeSharedAtlas(listener: () => void): () => void {
 function pullSharedAtlas(): void {
   if (!sharedAlive()) return;
   const atlas = readAtlas();
+  markInferredBerths(atlas); // before any entry is replaced, as in harvestIntoAtlas
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
-    const prior = atlas[rid];
+    // Our own entry only: what a room named `constructor` or `__proto__`
+    // inherits has no doors, and reading it as a prior entry threw.
+    const prior = hasEntry(atlas, rid) ? atlas[rid] : undefined;
     // Compared against what the value NORMALIZES to — the count of VALID
     // records, capped — never its raw key count: a stored 64 against a raw
     // 100, or a stored 1 against 100 malformed keys plus one valid, would
@@ -754,6 +996,16 @@ function pullSharedAtlas(): void {
         lateral: Number.isFinite(door.lateral) && Math.abs(door.lateral as number) <= 32
           ? (door.lateral as number)
           : prior?.doors[d]?.lateral,
+        // A berth flag is exactly true or false. Anything else is an older
+        // client's silence, and silence must not erase what we knew: keep the
+        // prior value while the door still leads to the same room (review of
+        // #171 — legacy gossip was clearing markers and re-merging stations).
+        ...(typeof door.transient === 'boolean'
+          ? { transient: door.transient }
+          : prior?.doors[d]?.targetRoomId === door.targetRoomId
+            && typeof prior?.doors[d]?.transient === 'boolean'
+            ? { transient: prior.doors[d].transient }
+            : {}),
       };
       kept++;
     }
@@ -779,6 +1031,21 @@ function pullSharedAtlas(): void {
     changed = true;
   }
   if (changed) writeAtlas(atlas);
+}
+
+/** ⚓ A doc entry with a berth flag added wherever it has none and our entry
+ *  holds `transient: true` for the same door to the same room, or null when
+ *  there is nothing to add. Nothing else in the doc's copy changes. */
+function withBerthFlags(known: SharedAtlasEntry, entry: AtlasEntry): SharedAtlasEntry | null {
+  let doors: SharedAtlasEntry['doors'] | null = null;
+  for (const [id, door] of Object.entries(known.doors)) {
+    const mine = entry.doors[id];
+    if (!door || typeof door.transient === 'boolean' || mine?.transient !== true) continue;
+    if (typeof door.targetRoomId !== 'string' || door.targetRoomId !== mine.targetRoomId) continue;
+    doors ??= { ...known.doors };
+    doors[id] = { ...door, transient: true };
+  }
+  return doors ? { ...known, doors } : null;
 }
 
 /**
@@ -807,7 +1074,21 @@ export function pushAtlasToDoc(): void {
       const known = isSharedAtlasEntry(existing) ? existing : null;
       if (known && !isOwn
         && known.updatedAt >= entry.lastSeen
-        && Object.keys(known.doors).length >= doorIds.length) continue;
+        && Object.keys(known.doors).length >= doorIds.length) {
+        // The doc's copy is at least as new as ours, so ours stays unsent,
+        // except for a berth we know and that copy has no flag for (an
+        // inferred berth is written down, markInferredBerths). That flag goes
+        // onto the DOC's copy, its geometry untouched, so a client joining
+        // after the ship casts off still reads the stale end as a berth.
+        const flagged = withBerthFlags(known, entry);
+        if (flagged) {
+          sharedMap!.set(entry.roomId, {
+            ...flagged,
+            updatedAt: Math.min(known.updatedAt + 1, Date.now() + MAX_GOSSIP_SKEW_MS),
+          });
+        }
+        continue;
+      }
       const doors: SharedAtlasEntry['doors'] = {};
       for (const d of doorIds) {
         const door = entry.doors[d];
@@ -821,6 +1102,8 @@ export function pushAtlasToDoc(): void {
           farYawDeg: door.farYawDeg,
           wall: door.wall,
           lateral: door.lateral,
+          // Known either way ⇒ published either way; unknown stays unsent.
+          ...(typeof door.transient === 'boolean' ? { transient: door.transient } : {}),
           ...(isOwn && door.targetSeed ? { targetSeed: door.targetSeed } : {}),
         };
       }
