@@ -391,6 +391,11 @@ export function completeArrival(
     /** Called once the docking settles: docked (at which gate), or every
      *  berth refused. Not called when this returns anything but `docking`. */
     onSettled?: (outcome: ArrivalOutcome) => void;
+    /** ⚓🚦 Called before each retry's DOCK, once an earlier gate refused,
+     *  with the gate now tried: the helm's "docking at gate N" follows the
+     *  ship from gate to gate. Never called for the first gate (this
+     *  returns that one) nor after the docking settles. */
+    onProgress?: (outcome: Extract<ArrivalOutcome, { kind: 'docking' }>) => void;
   } = {},
 ): ArrivalOutcome | null {
   const rec = readFlightRecord();
@@ -457,7 +462,7 @@ export function completeArrival(
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
   const candidates = arrivalBerths({ station, remembered, gate: opts.gate, shipRoomId });
-  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled, shipRoomId);
+  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled, shipRoomId, opts.onProgress);
   return { kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) };
 }
 
@@ -492,6 +497,8 @@ async function dockThroughBerths(
   /** The arriving ship's room, captured at arrival: every retry plans for
    *  the same ship (its reserved gates count, and a dock it gained counts). */
   shipRoomId?: string,
+  /** Told the gate each retry docks at, before its DOCK. */
+  onProgress?: (outcome: Extract<ArrivalOutcome, { kind: 'docking' }>) => void,
 ): Promise<void> {
   // `first` was planned for candidates[0] (planArrivalDock's own pick).
   for (let i = 0; i < candidates.length || i === 0; i++) {
@@ -514,6 +521,8 @@ async function dockThroughBerths(
       return;
     }
     if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
+    // A gate change: say which gate the ship docks at now, before asking it.
+    if (i > 0) onProgress?.({ kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) });
     let ok: boolean | void = false;
     try {
       ok = await docking.dock(plan.doorId);

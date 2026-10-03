@@ -1976,6 +1976,8 @@ async function joinRoomAtEpoch(
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
     if (readFlightRecord().status !== "redocking") return;
     const ds = world?.dockingSystem ?? null;
+    // ⚓🚦 One note for this room: each gate a retry moves on to, then the end.
+    const note = arrivalNoteHere();
     noteShipArrival(
       completeArrival(
         ds
@@ -1985,7 +1987,7 @@ async function joinRoomAtEpoch(
               dock: (doorId) => ds.redockPort(doorId),
             }
           : null,
-        { onSettled: arrivalNoteHere() },
+        { onSettled: note, onProgress: note },
       ),
     );
   }, 1_000);

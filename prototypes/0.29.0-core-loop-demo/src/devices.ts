@@ -2556,7 +2556,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;
       // DOCK NOW is the commander's call: settle the arrival here and now.
-      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
+      const note = arrivalNoteHere();
+      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: note, onProgress: note }));
     });
 
     if (refocus) {
@@ -2868,7 +2869,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Arrive where the ship flew, even if the directory no longer lists it.
       writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt, destinationAt: rec.destinationAt });
     }
-    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
+    if (readFlightRecord().status === 'redocking') {
+      const note = arrivalNoteHere();
+      noteShipArrival(completeArrival(shipDocking, { onSettled: note, onProgress: note }));
+    }
   };
 
   return {

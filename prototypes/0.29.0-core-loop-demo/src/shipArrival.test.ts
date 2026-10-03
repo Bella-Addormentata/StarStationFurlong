@@ -672,6 +672,25 @@ describe('arrival gates', () => {
       expect(north.kind === 'docked' && north.record.farDoor).toBe('north');
     });
 
+    it('says which gate each retry docks at, before it docks there', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west'), gate(3, 'north')]);
+      const docking = gatedDocking(['east', 'west']);
+      const s = settled();
+      const progress: ArrivalOutcome[] = [];
+      const tried: string[][] = [];
+      completeArrival(docking, {
+        onSettled: s.onSettled,
+        onProgress: (o) => { progress.push(o); tried.push([...docking.tried]); },
+      });
+      expect(await s.promise).toEqual({ kind: 'docked', stationName: 'High Orbit', gate: 3 });
+      expect(progress).toEqual([
+        { kind: 'docking', stationName: 'High Orbit', gate: 2 },
+        { kind: 'docking', stationName: 'High Orbit', gate: 3 },
+      ]);
+      // Each note comes before that gate's DOCK.
+      expect(tried).toEqual([['east'], ['east', 'west']]);
+    });
+
     it('tries the gate it was asked for first', async () => {
       arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
       const docking = gatedDocking([]);
