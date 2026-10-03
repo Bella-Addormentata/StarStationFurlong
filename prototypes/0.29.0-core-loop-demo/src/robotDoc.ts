@@ -296,6 +296,14 @@ export function readDisassemblyJob(roomId: string): DisassemblyJob | null {
   return readJobIn(ensureMap(), roomId);
 }
 
+/** 🔧 Would START on this config put its robot back on a module's job: a
+ *  stopped Disassemble robot set to one? That is the room's deed holder's
+ *  call, like setting it to the module (the console checks both). STOP is
+ *  not: it only pauses the job. */
+export function startResumesDisassembly(config: RobotConfig | null | undefined): boolean {
+  return config?.parked === true && config.routine === 'disassemble' && !!config.target;
+}
+
 /** 🔧 Set a dock's robot to take `target` apart. The job is opened if it has
  *  none (or only a finished one); an open one costed below `target`'s labor
  *  is raised to it (raiseJobLaborIn). The robot joins its crew unless it is

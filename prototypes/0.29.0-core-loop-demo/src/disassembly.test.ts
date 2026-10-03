@@ -10,7 +10,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, isDismantled, noteRoomSeed, pushAtlasToDoc,
-  readAtlas, seedAtlasDefaults, withSharedAtlasOf, MAX_ENTRIES,
+  readAtlas, seedAtlasDefaults, withSharedAtlasOf, MAX_DISMANTLED, MAX_ENTRIES,
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobAnnouncement, jobDueAt, jobFraction, jobStatusText,
@@ -19,7 +19,7 @@ import {
 } from './disassembly';
 import {
   assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, raiseDisassemblyLabor,
-  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
+  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, startResumesDisassembly, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
 } from './robotDoc';
 import type { DoorRecord } from './doorsDoc';
 import { bindFurnitureDoc, deleteFurnitureItem, replaceAllFurniture, writeFurnitureItem } from './furnitureDoc';
@@ -328,6 +328,13 @@ describe('the job in the robot map', () => {
     assignDisassembly('d1', target, 0);
     expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b', parked: true });
     expect(readDisassemblyJob('room-b')?.crew).toEqual([]);
+    // So START on it is a pick of that module (the deed holder's), and
+    // STOP, or START on a robot set to no module, is not.
+    expect(startResumesDisassembly(readRobotConfig('d1'))).toBe(true);
+    expect(startResumesDisassembly({ routine: 'disassemble', target: 'room-b' })).toBe(false);
+    expect(startResumesDisassembly({ routine: 'disassemble', parked: true })).toBe(false);
+    expect(startResumesDisassembly({ routine: 'serve', parked: true })).toBe(false);
+    expect(startResumesDisassembly(null)).toBe(false);
   });
 
   it('moving a robot to another module moves its labor', () => {
@@ -693,6 +700,8 @@ describe('a module taken apart', () => {
     expect(readAtlas()['room-b']).toBeUndefined();
     expect(isDismantled('room-b')).toBe(true);
     expect(isDismantled('room-a')).toBe(false);
+    // Still this install's own tombstone, kept for good.
+    expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b']).toMatchObject({ dismantledAt: 5, dismantledHere: true });
   });
 
   it('stays gone however many rooms are visited after', () => {
@@ -716,6 +725,56 @@ describe('a module taken apart', () => {
       bindStationAtlasDoc(doc, { roomId: 'walk-0', isPassagePublic: () => false });
       expect(readAtlas()['room-b']).toBeUndefined();
       expect(withSharedAtlasOf(doc, readAtlas(), 'room-b')['room-b']).toBeUndefined();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('stays gone however many modules are taken apart after, here or elsewhere', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      hub();
+      now.mockReturnValue(1_000_500);
+      dismantleInAtlas('room-b', 1_000_400);
+      // More modules taken apart here since than the pool keeps of others'…
+      const more = MAX_DISMANTLED + 6;
+      for (let i = 0; i < more; i++) {
+        now.mockReturnValue(1_001_000 + i);
+        dismantleInAtlas(`mod-${i}`, 1_001_000 + i);
+      }
+      // …and as many heard of from a room doc.
+      const gossip = new Y.Doc();
+      for (let i = 0; i < more; i++) {
+        gossip.getMap('atlas').set(`far-${i}`, {
+          roomId: `far-${i}`, name: `F${i}`, doors: {}, dismantledAt: 1_002_000 + i, updatedAt: 1_002_000 + i,
+        });
+      }
+      now.mockReturnValue(1_003_000);
+      bindStationAtlasDoc(gossip, { roomId: 'room-a', isPassagePublic: () => false });
+      // Every module this install took apart is still held as gone; the
+      // ones heard of fill the pool.
+      expect(isDismantled('room-b')).toBe(true);
+      for (let i = 0; i < more; i++) expect(isDismantled(`mod-${i}`)).toBe(true);
+      const stored = JSON.parse(store.get('ssf-station-atlas')!) as Record<string, { dismantledHere?: true }>;
+      expect(Object.keys(stored).filter((rid) => rid.startsWith('far-'))).toHaveLength(MAX_DISMANTLED);
+      // Only this install's own are marked, and the mark never goes out.
+      expect(Object.keys(stored).filter((rid) => stored[rid].dismantledHere).sort())
+        .toEqual(['room-b', ...Array.from({ length: more }, (_, i) => `mod-${i}`)].sort());
+      expect(gossip.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: 1_000_400 });
+      expect(gossip.getMap('atlas').get('room-b')).not.toHaveProperty('dismantledHere');
+      // A room doc still holding GARDEN from before the job ended.
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('room-b', {
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, updatedAt: 1_000_000,
+      });
+      bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(withSharedAtlasOf(doc, readAtlas(), 'room-b')['room-b']).toBeUndefined();
+      // Taken apart again elsewhere since (a newer tombstone): still ours to keep.
+      gossip.getMap('atlas').set('room-b', { roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: 1_002_900, updatedAt: 1_002_950 });
+      bindStationAtlasDoc(gossip, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b']).toMatchObject({ dismantledAt: 1_002_900, dismantledHere: true });
     } finally {
       now.mockRestore();
     }
@@ -757,6 +816,16 @@ describe('the deed takes a module apart (source scan)', () => {
     expect(recheck).toBeGreaterThan(click);
     expect(recheck).toBeLessThan(wire.indexOf('assignDisassembly(', click));
     expect(between(source('world.ts'), 'createRobotDockUI({', '});')).toContain('holdsDeed: () => holdsRoomDeed()');
+  });
+
+  it('puts a stopped robot back on its module for the deed holder alone, checked again at the click', () => {
+    const devices = source('devices.ts');
+    expect(devices).toContain('const parkUsable = owner && (!startResumesDisassembly(cfg) || mayTakeApart());');
+    expect(devices).toContain("<button data-park=\"1\" ${parkUsable ? '' : 'disabled'}");
+    const park = between(devices, "panel.querySelector<HTMLButtonElement>('[data-park]')", 'wireDisassemblyPicks();');
+    const recheck = park.indexOf('if (startResumesDisassembly(c) && !mayTakeApart())');
+    expect(recheck).toBeGreaterThan(-1);
+    expect(recheck).toBeLessThan(park.indexOf('writeRobotConfig('));
   });
 
   it('is the raw deed check, refused while a leave is under way', () => {

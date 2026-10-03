@@ -220,7 +220,7 @@ import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
   ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
-  assignDisassembly, readDisassemblyJobs,
+  assignDisassembly, readDisassemblyJobs, startResumesDisassembly,
 } from './robotDoc';
 // 🔧 #192: the Disassemble job's labor and progress.
 import { jobFraction, jobStatusText, type DisassemblyCandidate } from './disassembly';
@@ -4236,7 +4236,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       status = `<div style="height:6px; border-radius:3px; background:rgba(212,168,75,0.15); overflow:hidden;">
           <div style="height:100%; width:${pct}%; background:#2fe6a0;"></div></div>
         <div style="font-size:9.5px; line-height:1.45; color:#2fe6a0;">🔧 ${escAttr(job.name)}: ${escAttr(jobStatusText(job, now, blocked))}</div>${
-        parked && job.finishedAt === undefined ? `<div style="font-size:9.5px; color:#ff8a50;">⏸ This robot is parked: ▶ START puts it back on the job.</div>` : ''}`;
+        parked && job.finishedAt === undefined
+          ? `<div style="font-size:9.5px; color:#ff8a50;">⏸ This robot is parked: ${may ? '' : 'the deed holder&apos;s '}▶ START puts it back on the job.</div>`
+          : ''}`;
     } else {
       status = `<div style="font-size:9.5px; line-height:1.45; color:#2fe6a0;">🔧 ${
         candidates.length === 0
@@ -4360,14 +4362,17 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const script = curScript();
     // 🤖 STOP/START (owner request): a big toggle to park the robot on its dock.
     const parked = cfg?.parked === true;
-    const parkBtn = `<button data-park="1" ${owner ? '' : 'disabled'} style="
+    // 🔧 START on a stopped Disassemble robot puts it back on its module's
+    // job: the deed holder's, like the pick (STOP only pauses the job).
+    const parkUsable = owner && (!startResumesDisassembly(cfg) || mayTakeApart());
+    const parkBtn = `<button data-park="1" ${parkUsable ? '' : 'disabled'} style="
       display:flex; justify-content:center; align-items:center;
       padding:10px 12px; width:100%;
       background:${parked ? 'rgba(47,230,160,0.16)' : 'rgba(255,138,80,0.12)'};
       border:1px solid ${parked ? '#2fe6a0' : '#ff8a50'};
       border-radius:7px; color:${parked ? '#2fe6a0' : '#ff8a50'};
       font-family:inherit; font-size:12px; font-weight:800; letter-spacing:0.5px;
-      cursor:${owner ? 'pointer' : 'default'};
+      cursor:${parkUsable ? 'pointer' : 'default'}; opacity:${parkUsable || !owner ? 1 : 0.5};
     ">${parked ? '▶ START · resume routine' : '⏸ STOP · park at dock'}</button>`;
     const addBtn = (kind: string, label: string): string =>
       `<button data-add="${kind}" style="flex:1; padding:6px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,0.35); border-radius:6px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; font-weight:800; cursor:pointer;">${label}</button>`;
@@ -4434,6 +4439,12 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     // START puts it back).
     panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
       const c = readRobotConfig(deps.itemId);
+      // 🔧 Re-checked at the click, like the pick: the gate or the robot's
+      // config may have changed since the draw.
+      if (startResumesDisassembly(c) && !mayTakeApart()) {
+        render();
+        return;
+      }
       writeRobotConfig(deps.itemId, {
         routine: c?.routine ?? 'serve',
         ...(c?.script?.length ? { script: c.script } : {}),

@@ -103,6 +103,13 @@ export interface AtlasEntry {
    *  naming it). A harvest from inside the room rebuilds the entry without
    *  it: someone standing in the module is first-hand proof it is there. */
   dismantledAt?: number;
+  /** 🔧 This install took the module apart (dismantleInAtlas): its own
+   *  first-hand tombstone, which writeAtlas keeps however many others the
+   *  pool holds, so older gossip can never bring back a module this install
+   *  took apart. Never published (the push names each field it sends) nor
+   *  read from gossip (the pull rebuilds entries), and a copy that brings
+   *  the module back drops it with the tombstone. */
+  dismantledHere?: true;
   /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
    *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
    *  ranking that decides what the player KEEPS or SEES must not read it:
@@ -155,7 +162,8 @@ export const MAX_ENTRIES = 64;
 /** 🔧 Tombstones of modules taken apart (AtlasEntry.dismantledAt) kept
  *  besides the MAX_ENTRIES rooms, in their own pool: visiting new rooms must
  *  never evict the record that keeps a module gone, or older gossip would
- *  bring it back. Small, doorless records. */
+ *  bring it back. Small, doorless records. This caps the ones learned from
+ *  gossip; the ones this install made (dismantledHere) are all kept. */
 export const MAX_DISMANTLED = 64;
 /** 🚪 Doors kept per gossiped entry — the same cap doorsDoc.readAllDoors puts
  *  on a room's own pairings (MAX_PAIRINGS). A shared entry's `doors` is a
@@ -356,11 +364,17 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     //
     // 🔧 Tombstones (modules taken apart) are kept in a pool of their own,
     // ranked the same way: they never count against the rooms, and rooms
-    // never push them out.
+    // never push them out. The ones this install made are all kept: each is
+    // a module its own robots took hours of labor to take apart, so they
+    // grow only as fast as play does, and evicting one would let older
+    // gossip bring back a module this install took apart. Gossiped ones
+    // fill MAX_DISMANTLED.
     const all = Object.values(atlas);
+    const tombs = all.filter((e) => e.dismantledAt !== undefined);
     const entries = [
       ...all.filter((e) => e.dismantledAt === undefined).sort(compareAtlasRecency).slice(0, MAX_ENTRIES),
-      ...all.filter((e) => e.dismantledAt !== undefined).sort(compareAtlasRecency).slice(0, MAX_DISMANTLED),
+      ...tombs.filter((e) => e.dismantledHere === true),
+      ...tombs.filter((e) => e.dismantledHere !== true).sort(compareAtlasRecency).slice(0, MAX_DISMANTLED),
     ];
     const out: Record<string, AtlasEntry> = {};
     for (const e of entries) out[e.roomId] = e;
@@ -476,6 +490,7 @@ export function dismantleInAtlas(roomId: string, at: number): void {
     ...(prior?.dims ? { dims: prior.dims } : {}),
     doors: {},
     dismantledAt: at,
+    dismantledHere: true,
     lastSeen: Math.min(Math.max(now, (prior?.lastSeen ?? 0) + 1, docStamp), now + MAX_GOSSIP_SKEW_MS),
     localSeenAt: now,
   };
@@ -509,6 +524,7 @@ export function noteRoomSeed(roomId: string, name: string, seed: string): void {
     localSeenAt: prior?.localSeenAt ?? Date.now(),
     // 🔧 …nor that a module taken apart is back.
     ...(prior?.dismantledAt !== undefined ? { dismantledAt: prior.dismantledAt } : {}),
+    ...(prior?.dismantledAt !== undefined && prior.dismantledHere ? { dismantledHere: true as const } : {}),
   };
   writeAtlas(atlas);
 }
@@ -1619,8 +1635,12 @@ function pullSharedAtlas(): void {
       // (null: the publisher saw the room ownerless — that clears ours.)
       ...ownerSpread(ownerOf(value.owner) !== undefined ? ownerOf(value.owner) : prior?.owner),
       // 🔧 A newer copy saying the module was taken apart: the tombstone, and
-      // no doors (a tombstone joins nothing, whatever its writer sent).
+      // no doors (a tombstone joins nothing, whatever its writer sent). Still
+      // gone after this install took it apart: still its own to keep.
       ...(value.dismantledAt !== undefined ? { dismantledAt: value.dismantledAt } : {}),
+      ...(value.dismantledAt !== undefined && prior?.dismantledAt !== undefined && prior.dismantledHere
+        ? { dismantledHere: true as const }
+        : {}),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
       // Gossip is SECOND-hand and must never mint local recency: stamping it
       // here would let one peer's station sweep outrank every room the player
