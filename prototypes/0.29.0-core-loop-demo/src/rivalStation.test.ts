@@ -30,7 +30,8 @@ let store = new Map<string, string>();
 
 const SOV = DEFAULT_PLANET_ID;
 const T0 = Date.UTC(2026, 9, 3, 21, 0, 0);
-const move = { toPlanetId: 'planet-aris', departAt: T0 + 60_000 };
+// A newer build's record field, unknown here and on every branch below.
+const beacon = { color: 'amber', pulseMs: 800 };
 
 const record = (over: Partial<StationRecord> & Record<string, unknown> = {}): StationRecord => ({
   id: 'b-hab',
@@ -49,7 +50,7 @@ const standing = (over: Partial<StationSummary> = {}): StationSummary => ({
   orbitSlot: 2,
   berthDoor: 'd:3',
   ownerId: 'a-hab',
-  ext: { move },
+  ext: { beacon },
   updatedAt: T0,
   ...over,
 });
@@ -80,7 +81,7 @@ describe("a losing install's own record of a place", () => {
     registerStation(record({ berthDoor: 'd:5', paint: 'red' }));
     expect(registerLearnedStations(SOV, [standing()])).toBe(1);
     expect(saved('b-hab')).toEqual({
-      move, id: 'b-hab', name: 'HAB RING', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'room-hab', berthDoor: 'd:3',
+      beacon, id: 'b-hab', name: 'HAB RING', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'room-hab', berthDoor: 'd:3',
     });
     // Nothing is left to change.
     expect(registerLearnedStations(SOV, [standing()])).toBe(0);
@@ -95,9 +96,9 @@ describe("a losing install's own record of a place", () => {
     expect(saved('b-hab')).not.toHaveProperty('berthDoor');
     // …and so does a field it no longer carries.
     expect(registerLearnedStations(SOV, [standing()])).toBe(1);
-    expect(saved('b-hab')?.move).toEqual(move);
+    expect(saved('b-hab')?.beacon).toEqual(beacon);
     expect(registerLearnedStations(SOV, [standing({ ext: undefined, berthDoor: undefined })])).toBe(1);
-    expect(saved('b-hab')).not.toHaveProperty('move');
+    expect(saved('b-hab')).not.toHaveProperty('beacon');
   });
 
   it('stays as it is while its own install is the one standing', () => {
@@ -109,8 +110,8 @@ describe("a losing install's own record of a place", () => {
   });
 
   it('two installs sharing one room doc register the same station, with nothing to republish', () => {
-    // Install A saved HAB RING as 'a-hab', berth d:3, a move under way.
-    registerStation(record({ id: 'a-hab', name: 'HAB RING', orbitSlot: 2, berthDoor: 'd:3', move }));
+    // Install A saved HAB RING as 'a-hab', berth d:3, with a newer field.
+    registerStation(record({ id: 'a-hab', name: 'HAB RING', orbitSlot: 2, berthDoor: 'd:3', beacon }));
     const docA = new Y.Doc();
     bindPlanetSummaryDoc(docA, install('a-hab'));
     // Install B saved the same place as 'b-hab' under another name and berth.
@@ -125,7 +126,7 @@ describe("a losing install's own record of a place", () => {
     // written on B still resolves on every other install.
     expect(readStore().stations['room-hab']?.ownerAliases).toEqual(['b-hab']);
     const b = listStations().find((s) => s.id === 'b-hab') as (StationRecord & Record<string, unknown>) | undefined;
-    expect(b).toMatchObject({ name: 'HAB RING', orbitSlot: 2, berthDoor: 'd:3', move });
+    expect(b).toMatchObject({ name: 'HAB RING', orbitSlot: 2, berthDoor: 'd:3', beacon });
     const before = JSON.stringify(docB.getMap('stationSummaries').toJSON());
     publishPlanetSummary(Date.now() + 1000);
     expect(JSON.stringify(docB.getMap('stationSummaries').toJSON())).toBe(before);
