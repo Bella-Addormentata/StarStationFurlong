@@ -5,6 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { listStations, setStationMoveResolver } from './stations';
+import { bindStationMoveDoc, writeStationMove, type StationMove } from './stationMove';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
@@ -29,6 +30,7 @@ import {
   shipLocationId,
   shipPlaceId,
   castOffPlaces,
+  lastReleaseFrom,
   type ArrivalPort,
   type ShipDockingApi,
 } from './shipArrival';
@@ -263,11 +265,11 @@ describe('a round trip', () => {
 
     fly('furlong-station', 'high-orbit');
     expect(completeArrival(docking)).toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'no-berth' });
-    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'high-orbit' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'high-orbit', arrivedAt: expect.any(Number) });
 
     fly('high-orbit', 'furlong-station');
     expect(completeArrival(docking)).toEqual({ kind: 'docking', stationName: 'Furlong Station' });
-    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station', arrivedAt: expect.any(Number) });
     const north = classifyDockPort(readDoor('north'));
     expect(north.kind).toBe('docked');
     expect(north.kind === 'docked' && north.address).toBe(SEED_FURLONG);
@@ -439,7 +441,7 @@ describe('a round trip', () => {
     fly('furlong-station', 'gone-soon');
     stations = [DEFAULT_STATIONS[0]]; // the record vanished while in flight
     expect(completeArrival(docking)).toEqual({ kind: 'none', stationName: 'gone-soon', reason: 'unlisted-station' });
-    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'gone-soon' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'gone-soon', arrivedAt: expect.any(Number) });
     // Not re-docked at Furlong's remembered berth.
     expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
     expect(docking.docks).toEqual([]);
@@ -464,7 +466,7 @@ describe('a round trip', () => {
     expect(readFlightRecord().status).toBe('redocking');
     expect(completeArrival(docking, { now: eta + ARRIVAL_GRACE_MS }))
       .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'no-berth' });
-    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'high-orbit' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'high-orbit', arrivedAt: expect.any(Number) });
   });
 
   it('settles at once when the commander forces it (DOCK NOW)', () => {
@@ -530,6 +532,42 @@ describe('where a ship with no live dock is', () => {
     // A flight that kept no place, and a ship at rest, go by the record.
     expect(shipPlaceId({ ...flight, originAt: undefined }, now)).toBe('furlong-station');
     expect(shipPlaceId({ status: 'docked', locationId: 'furlong-station', originAt: left }, now)).toBe('furlong-station');
+  });
+
+  it('keeps a ship at rest beside its station where the station was once it leaves without it', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const was = adriftAt(home.planetId, home.orbitSlot);
+    // Arrived beside Furlong without a dock (its berth refused the DOCK).
+    const rest: FlightRecord = { status: 'docked', locationId: 'furlong-station', arrivedAt: now - 60_000 };
+    expect(shipPlaceId(rest, now)).toBe('furlong-station');
+    // Furlong then leaves for Aris: until it goes the ship is beside it, and
+    // from then on it stays where Furlong was, on the way and after.
+    const move: StationMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 1000, arriveAt: now + 3_600_000,
+      mode: 'thrusters', bookedAt: now - 30_000, fuel: 1, fuelDrawn: 0,
+    };
+    expect(writeStationMove(move)).toBe(true);
+    expect(shipPlaceId(rest, now - 2000)).toBe('furlong-station');
+    expect(shipPlaceId(rest, now)).toBe(was);
+    expect(shipPlaceId(rest, move.arriveAt + 1)).toBe(was);
+    expect(shipLocationId(rest, false)).toBe(was);
+    // One that arrived beside it at Aris, after it got there, is there.
+    expect(shipPlaceId({ ...rest, arrivedAt: move.arriveAt + 5 }, move.arriveAt + 10)).toBe('furlong-station');
+    // Let go of its last dock there: by that UNDOCK's own stamp, left behind
+    // when it came before the move, carried along when it came after.
+    const docked: FlightRecord = { status: 'docked', locationId: 'furlong-station' };
+    expect(shipPlaceId(docked, now)).toBe('furlong-station');
+    writeDoorTombstone('east', `ssf://room#room=${home.welcomeRoomId}`, { farDoor: 'south', undockedAt: now - 5000 });
+    expect(lastReleaseFrom(home)).toBe(now - 5000);
+    expect(shipPlaceId(docked, now)).toBe(was);
+    writeDoorTombstone('east', `ssf://room#room=${home.welcomeRoomId}`, { farDoor: 'south', undockedAt: move.arriveAt + 5 });
+    expect(shipPlaceId(docked, move.arriveAt + 10)).toBe('furlong-station');
   });
 
   it('keeps where DEPART casts off from and flies to, through the flight only', () => {
@@ -635,6 +673,6 @@ describe('what the helm hears after an arrival DOCK', () => {
 
   it('refused, when the berth is taken — not a green "docking" note left standing', async () => {
     expect(await arrive(false)).toEqual({ kind: 'none', stationName: 'Furlong Station', reason: 'berths-taken' });
-    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station', arrivedAt: expect.any(Number) });
   });
 });

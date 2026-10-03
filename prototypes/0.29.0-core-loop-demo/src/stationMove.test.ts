@@ -52,6 +52,7 @@ import {
   readRememberedMoves,
   readStationMove,
   rememberedMoveFor,
+  FOLD_ITEMS_MAX,
   MOVE_ENTRIES_KEEP,
   MOVE_SCAN_MAX,
   MOVE_SETTLED_KEEP,
@@ -64,6 +65,7 @@ import type { MoveContext, StationMove, TowContext } from './stationMove';
 import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
+  knownSlotsAround,
   listStations,
   registerStation,
   setKnownPlacesResolver,
@@ -434,6 +436,17 @@ describe('the station list follows a move', () => {
     const clashed = listStations({}, clash, NOW);
     expect(clashed.find((s) => s.id === 'x')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
     expect(clashed.find((s) => s.id === 'y')).toMatchObject({ planetId: ARIS, orbitSlot: 4 });
+  });
+
+  it('counts two stations heard of in one slot where the list settles them, in two', () => {
+    setKnownPlacesResolver(() => [
+      { welcomeRoomId: 'k0', planetId: ARIS, orbitSlot: 0 },
+      { welcomeRoomId: 'k1', planetId: ARIS, orbitSlot: 0 },
+    ]);
+    const listed = listStations({}, [], NOW);
+    expect(listed.some((s) => s.planetId === ARIS)).toBe(false);
+    expect(knownSlotsAround(ARIS, listed.map((s) => s.welcomeRoomId), NOW)).toEqual({ taken: new Set([0, 1]), reserved: new Set() });
+    expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(2);
   });
 
   it('bounces an arrival off a planet it only knows is full from the summaries', () => {
@@ -1204,6 +1217,24 @@ describe('tugs: a torch tow', () => {
     expect(isTowing('tug-room', NOW + 2)).toBe(true);
   });
 
+  it('cancels an outbid tow the log has bundled past its cap', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt + 1, arriveAt: a.arriveAt + 1 };
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    writeStationMove(b);
+    // A sweep has moved the losing tow into a bundle.
+    doc.getMap('stationMoves').set('moveFold:0:0000000000000000', { settled: {}, entries: { [`move:7:${a.departAt}:${a.stationId}`]: a } });
+    store.clear();
+    expect(readMoveFuelDrawn()).toBe(b.fuel);
+    expect(cancelTowLeftBehind('tug-room', { status: 'docked' }, NOW + 1)).toBe(true);
+    const cancel = rememberedMoveFor({ id: a.stationId, welcomeRoomId: a.welcomeRoomId });
+    expect(cancel && isCancelPin(cancel)).toBe(true);
+    expect(cancelTowLeftBehind('tug-room', { status: 'docked' }, NOW + 2)).toBe(false);
+  });
+
   it('lists a station where it was while another station\'s tow by the same tug outranks its own', () => {
     bindStationMoveDoc(new Y.Doc());
     const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
@@ -1457,6 +1488,26 @@ describe('the move log stays bounded', () => {
     // The next sweep joins the two replicas' bundles; nothing is lost or doubled.
     writeStationMove({ ...zero, departAt: zero.departAt + 2, arriveAt: zero.arriveAt + 2 });
     expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 3);
+  });
+
+  it('reads a bundle up to its cap and refuses one past it, however often it is read', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    const entries = (n: number, from: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [
+      `move:9:${i}:b${from + i}`, { ...hop(0, 1, 1), stationId: `b${from + i}`, welcomeRoomId: `b${from + i}-room` },
+    ]));
+    map.set('moveFold:1:0000000000000001', { settled: {}, entries: entries(FOLD_ITEMS_MAX, 0) });
+    map.set('moveFold:2:0000000000000002', { settled: {}, entries: entries(FOLD_ITEMS_MAX + 1, 100) });
+    for (let pass = 0; pass < 2; pass++) {
+      store.clear();
+      bindStationMoveDoc(doc);
+      expect(rememberedMoveFor({ id: 'b0', welcomeRoomId: 'b0-room' })).not.toBeNull();
+      expect(rememberedMoveFor({ id: 'b100', welcomeRoomId: 'b100-room' })).toBeNull();
+    }
+    // The next write clears the one past the cap.
+    writeStationMove(hop(1, 1, 1));
+    expect(map.has('moveFold:2:0000000000000002')).toBe(false);
   });
 
   it('clears a settled record without its recent list instead of failing a write', () => {

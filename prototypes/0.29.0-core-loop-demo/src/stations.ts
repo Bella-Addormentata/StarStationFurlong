@@ -215,26 +215,12 @@ function reservesSlot(m: StationMove | null | undefined, nowMs: number): m is St
     && !(planetById(m.fromPlanetId).id === planetById(m.toPlanetId).id && m.fromSlot === m.toSlot);
 }
 
-/** Each slot the stations in `places` hold at `nowMs` (none while between
- *  planets), and each slot their moves are bound for (`reserved`). */
-function eachKnownHold(
-  places: KnownPlace[],
-  nowMs: number,
-  hold: (planetId: string, slot: number, reserved: boolean) => void,
-): void {
-  for (const p of places) {
-    const move = p.move ?? null;
-    if (!stationInTransit({ move: move ?? undefined }, nowMs)) {
-      const at = placeWithMove(p, move, nowMs);
-      hold(planetById(at.planetId).id, at.orbitSlot, false);
-    }
-    if (reservesSlot(move, nowMs)) hold(planetById(move.toPlanetId).id, move.toSlot, true);
-  }
-}
-
 /** Around `planetId` at `nowMs`, by the stations heard of whose welcome room
- *  is none of `listedRooms` nor a room of `atlas`: the slots they hold (none
- *  while between planets), and the slots their moves are bound for. */
+ *  is none of `listedRooms` nor a room of `atlas`: the slots they hold where
+ *  the station list settles them (none while between planets), and the slots
+ *  their moves are bound for. Settled with this install's records as
+ *  listStations settles them, every clash included, so two heard of in one
+ *  slot hold two, as on an install that lists them. */
 export function knownSlotsAround(
   planetId: string,
   listedRooms: Iterable<string>,
@@ -244,13 +230,12 @@ export function knownSlotsAround(
   const id = planetById(planetId).id;
   const taken = new Set<number>();
   const reserved = new Set<number>();
-  // A room the atlas knows belongs to a station listed here (as in
-  // listStations), whatever welcome room the summary gives it.
-  const covered = new Set(listedRooms);
-  for (const component of atlasComponents(atlas)) for (const rid of component) covered.add(rid);
-  eachKnownHold(knownPlaces(covered), nowMs, (planet, slot, isReserved) => {
-    if (planet === id) (isReserved ? reserved : taken).add(slot);
-  });
+  const listed = new Set(listedRooms);
+  for (const st of placeStations(atlas, readStationRecords(), nowMs).heard) {
+    if (listed.has(st.welcomeRoomId)) continue;
+    if (!stationInTransit(st, nowMs) && planetById(st.planetId).id === id) taken.add(st.orbitSlot);
+    if (reservesSlot(st.move, nowMs) && planetById(st.move.toPlanetId).id === id) reserved.add(st.move.toSlot);
+  }
   return { taken, reserved };
 }
 
@@ -447,6 +432,16 @@ export function listStations(
   records: StationRecord[] = readStationRecords(),
   nowMs: number = Date.now(),
 ): StationRecord[] {
+  return placeStations(atlas, records, nowMs).listed;
+}
+
+/** listStations, with where it settled the stations heard of (`heard`:
+ *  never listed, but holding their slots all the same). */
+function placeStations(
+  atlas: Record<string, AtlasEntry>,
+  records: StationRecord[],
+  nowMs: number,
+): { listed: StationRecord[]; heard: StationRecord[] } {
   // Which PLACE a welcome room is: its atlas component, or the bare room when
   // the atlas does not know it. One place is one station — a second record
   // pointing into a station already listed is dropped, not listed twice.
@@ -545,7 +540,9 @@ export function listStations(
       base: { planetId: planetById(p.planetId).id, orbitSlot: p.orbitSlot },
       move: moveOf(stub) ?? (p.move && moveBelongsTo(p.move, stub) ? p.move : null),
       listed: false,
-      make: (planetId, orbitSlot) => ({ id: stub.id, name: 'STATION', planetId, orbitSlot, welcomeRoomId: p.welcomeRoomId }),
+      make: (planetId, orbitSlot, move) => ({
+        id: stub.id, name: 'STATION', planetId, orbitSlot, welcomeRoomId: p.welcomeRoomId, ...(move ? { move } : {}),
+      }),
     });
   }
 
@@ -702,12 +699,13 @@ export function listStations(
   // Listed in record order, derived stations last. A station that never
   // moved and finds no slot (its planet is full) is dropped, and a station
   // heard of is never listed.
-  const out: StationRecord[] = [];
+  const listed: StationRecord[] = [];
+  const heard: StationRecord[] = [];
   candidates.forEach((c, i) => {
     const spot = spots[i];
-    if (spot && c.listed) out.push(c.make(spot.planetId, spot.orbitSlot, spot.move));
+    if (spot) (c.listed ? listed : heard).push(c.make(spot.planetId, spot.orbitSlot, spot.move));
   });
-  return out;
+  return { listed, heard };
 }
 
 /** The stations orbiting one planet, in slot order. */

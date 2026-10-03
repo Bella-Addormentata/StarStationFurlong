@@ -636,8 +636,8 @@ export function cancelTowLeftBehind(
  *  loss spreads as a cancel like any other. */
 function outbidTows(roomId: string): StationMove[] {
   if (!docAlive()) return [];
-  const { entries, legacy } = roomMoves();
-  const own = legacy ? [legacy, ...entries] : entries;
+  // Bundled tows too: placement and the meter read them.
+  const own = roomOwn();
   const known = knownMoves(own);
   const seen = new Set<string>();
   return own.filter((m) => {
@@ -879,6 +879,32 @@ export function rememberedMoveFor(station: MovingStation): StationMove | null {
   return knownStanding().find((m) => moveBelongsTo(m, station)) ?? null;
 }
 
+/** Where a station left from on the first of its moves to depart between
+ *  `sinceMs` and `nowMs`: where it was at `sinceMs`, once it has left since
+ *  (null: it has not). Among the moves this install knows (the bound room's
+ *  and every remembered one): a move beaten, outbid or cancelled never flew,
+ *  and an arrival's pin stands for the move it settles. */
+export function stationLeftFrom(
+  station: MovingStation,
+  sinceMs: number,
+  nowMs: number = Date.now(),
+): { planetId: string; orbitSlot: number } | null {
+  // Its standing move is the last it made (rememberedMoveFor): when even
+  // that left before `sinceMs`, none did since.
+  const latest = rememberedMoveFor(station);
+  if (!latest || flownOf(latest).departAt < sinceMs) return null;
+  const all = [...roomOwn(), ...readRememberedMoves()];
+  let first: StationMove | null = null;
+  for (const rec of all) {
+    if (!moveBelongsTo(rec, station) || isCancelPin(rec)) continue;
+    const m = flownOf(rec);
+    if (m.departAt < sinceMs || m.departAt > nowMs || isPinMove(m)) continue;
+    if (first && m.departAt >= first.departAt) continue;
+    if (!superseded(m, all)) first = m;
+  }
+  return first ? { planetId: planetById(first.fromPlanetId).id, orbitSlot: first.fromSlot } : null;
+}
+
 /** Point stations.listStations at the remembered moves. */
 export function installStationMoveResolver(): void {
   setStationMoveResolver(rememberedMoveFor);
@@ -990,16 +1016,39 @@ interface FoldBundle { settled: Record<string, SettledMoves>; entries: Record<st
 /** A writer id or entry key a bundle may hold: as long as a key may be. */
 const FOLD_ID_MAX = 160;
 
-/** A bundle off the wire: at most FOLD_ITEMS_MAX well-formed items. */
+/** Bundle values already checked, and found sound (or too big ever to be):
+ *  a doc value is replaced, never changed in place, so each is checked once.
+ *  A sound one stays sound (a move only grows more plausible with time). */
+const foldVerdicts = new WeakMap<object, boolean>();
+
+/** A bundle off the wire: at most FOLD_ITEMS_MAX well-formed items, counted
+ *  as they are met, so an oversized one is refused at its first item past
+ *  the cap without copying it. */
 function isFoldBundle(v: unknown): v is FoldBundle {
+  if (!v || typeof v !== 'object') return false;
+  const known = foldVerdicts.get(v);
+  if (known !== undefined) return known;
   const b = v as FoldBundle;
-  if (!b || typeof b !== 'object' || !b.settled || typeof b.settled !== 'object' || Array.isArray(b.settled)
+  if (!b.settled || typeof b.settled !== 'object' || Array.isArray(b.settled)
     || !b.entries || typeof b.entries !== 'object' || Array.isArray(b.entries)) return false;
-  const settled = Object.entries(b.settled);
-  const entries = Object.entries(b.entries);
-  if (settled.length + entries.length > FOLD_ITEMS_MAX) return false;
-  return settled.every(([w, r]) => w.length > 0 && w.length <= FOLD_ID_MAX && isSettledMoves(r))
-    && entries.every(([k, m]) => k.startsWith(ENTRY_PREFIX) && k.length <= FOLD_ID_MAX && validMove(m) !== null);
+  const own = Object.prototype.hasOwnProperty;
+  let items = 0;
+  let sound = true;
+  for (const part of [b.settled, b.entries] as Array<Record<string, unknown>>) {
+    for (const k in part) {
+      if (!own.call(part, k)) continue;
+      if (++items > FOLD_ITEMS_MAX) {
+        foldVerdicts.set(v, false);
+        return false;
+      }
+      if (!sound) continue;
+      sound = part === b.settled
+        ? k.length > 0 && k.length <= FOLD_ID_MAX && isSettledMoves(part[k])
+        : k.startsWith(ENTRY_PREFIX) && k.length <= FOLD_ID_MAX && validMove(part[k]) !== null;
+    }
+  }
+  if (sound) foldVerdicts.set(v, true);
+  return sound;
 }
 
 /** The bucket a bundle key names (one hex digit), or null. */

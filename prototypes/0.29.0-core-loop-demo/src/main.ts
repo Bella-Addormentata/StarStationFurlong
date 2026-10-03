@@ -1260,11 +1260,14 @@ function planetShipStatus(): ShipStatusInput | null {
   const rec = readFlightRecord();
   const stations = listStations();
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
-  const from = byId(rec.locationId);
+  // 🚚 Where the ship is: the station its live dock leads into (a tug docked
+  // by hand at a station it has since towed to another planet, say), else
+  // where its flight record leaves it, wherever its stations have moved
+  // without it (shipPlaceId).
+  const host = dockedStationFor(roomId, readAllDoors().values());
+  const at = host ?? shipPlaceId(rec);
+  const from = byId(host ?? rec.locationId);
   const to = byId(rec.destinationId);
-  // 🚚 Cast off, the ship is where it left (arrived, where it found its
-  // destination), wherever those stations have moved since.
-  const at = shipPlaceId(rec);
   // The ship's own one-room stand-in sits on the default planet until its
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();

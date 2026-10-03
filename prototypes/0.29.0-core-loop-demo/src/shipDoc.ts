@@ -141,6 +141,11 @@ export interface FlightRecord {
    *  window or on its way stays there whatever its origin does meanwhile
    *  (shipArrival.shipPlaceId): only a live dock carries a ship along. */
   originAt?: string;
+  /** When a `docked` ship arrived at its location. Without a live dock it
+   *  stays where the station was then once the station leaves on a move,
+   *  as it does where the station was when it last let go of a dock there
+   *  (shipArrival.shipPlaceId): only a live dock carries a ship along. */
+  arrivedAt?: number;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -248,6 +253,7 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.castOffAt !== undefined && !isFlightTime(r.castOffAt)) return false;
   if (r.destinationAt !== undefined && !isBoundedString(r.destinationAt)) return false;
   if (r.originAt !== undefined && !isBoundedString(r.originAt)) return false;
+  if (r.arrivedAt !== undefined && !isFlightTime(r.arrivedAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -294,6 +300,7 @@ export function defaultFlight(): FlightRecord {
 function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
   // Station ids are per install: read another install's ids as ours.
   const out: FlightRecord = { status: r.status, locationId: localStationId(r.locationId) };
+  if (r.status === 'docked' && r.arrivedAt !== undefined) out.arrivedAt = r.arrivedAt;
   if (r.status === 'undocking' || r.status === 'in-flight') {
     if (r.destinationId !== undefined) out.destinationId = localStationId(r.destinationId);
     if (r.status === 'in-flight') {
