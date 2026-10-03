@@ -7,6 +7,7 @@ import * as Y from 'yjs';
 import { NO_INPUT, speedOf } from './freeFlight';
 import type { FreePose } from './freeFlight';
 import {
+  FLYING_MEMORY_MS,
   FREE_DOCK_SETTLE_MS,
   WRITE_EVERY_MS,
   isPilotingHere,
@@ -202,6 +203,9 @@ describe('🅿️ a station flying by itself', () => {
       setStationRoomSource(() => 'another-room');
       resetFreeFlightPilot();
       expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + 25 * 3600_000)).toBe(true);
+      // Heard of no more for FLYING_MEMORY_MS: forgotten (a false claim ends).
+      resetFreeFlightPilot();
+      expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + FLYING_MEMORY_MS + 1)).toBe(false);
       // Back aboard, parked (docked): open again.
       setStationRoomSource(() => ROOM);
       writeFlightRecord({ status: 'redocking', locationId: HOME.id });
@@ -221,6 +225,16 @@ describe('fuel with the last tank taken out mid-flight', () => {
     let ms = t;
     for (let i = 0; i < 4; i++) pilotFrame({ ...NO_INPUT, thrust: 1 }, 0.05, CAP, (ms += 50));
     releaseStick(0, ms + 50);
+    expect(readFuelLevel(CAP)).toBeLessThan(CAP);
+  });
+
+  it('is still paid when another game moved the flight on before the stick was let go', () => {
+    const t = Date.now();
+    fly(farPose(t));
+    let ms = t;
+    for (let i = 0; i < 4; i++) pilotFrame({ ...NO_INPUT, thrust: 1 }, 0.05, CAP, (ms += 50));
+    writeFlightRecord({ status: 'redocking', locationId: HOME.id });
+    releaseStick(CAP, ms + 50);
     expect(readFuelLevel(CAP)).toBeLessThan(CAP);
   });
 });

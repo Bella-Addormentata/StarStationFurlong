@@ -178,15 +178,47 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
   // holds no frame.
   const flying = flyingFreeRooms(now);
   const list: FreeStation[] = listStations()
-    .filter((s) => planetById(s.planetId).id === planet && !stationInTransit(s, now))
     // Only a derived one-module stand-in is a ship; a saved or built-in
     // station keeps its zones whoever stands in it or claims its room,
     // unless it is flying free itself.
     .filter((s) => !!s.welcomeRoomId && !flying.has(s.welcomeRoomId)
       && (!s.derived || (s.welcomeRoomId !== room && !ships.has(s.welcomeRoomId))))
-    .map((s) => ({ id: s.id, room: s.welcomeRoomId, name: s.name, pointAt: (ms: number) => stationPointAt(s, ms) }));
+    .flatMap((s) => {
+      const st = timedStation(s, planet);
+      return st ? [st] : [];
+    });
   stationCache = { planetId: planet, room, at: now, list };
   return list;
+}
+
+/**
+ * 🚚 A station as a free-flying ship meets it around `planet`, over time:
+ * a coast replayed from an old pose meets it where it was then. With a
+ * move (its latest), it is around on the planet it left until departure,
+ * on the planet it reached from arrival, and nowhere in between (nor while
+ * changing altitude); before departure it flies the orbit it left. Null
+ * when it is never around this planet.
+ */
+function timedStation(s: StationRecord, planet: string): FreeStation | null {
+  const base = { id: s.id, room: s.welcomeRoomId, name: s.name };
+  // A pin stands for the move it settles; a cancel's pin, for none.
+  const raw = latestMoveOf(s) ?? s.move ?? null;
+  const m = !raw ? null : !raw.settles ? raw : raw.departAt < raw.settles.arriveAt ? null : raw.settles;
+  const here = planetById(s.planetId).id === planet;
+  if (!m) return here ? { ...base, pointAt: (ms: number) => stationPointAt(s, ms) } : null;
+  const fromHere = planetById(m.fromPlanetId).id === planet;
+  const toHere = planetById(m.toPlanetId).id === planet;
+  if (!fromHere && !toHere) return null;
+  // The orbit it left: an altitude change's own, else the slot it left.
+  const before: StationRecord = m.mode === 'orbit' && m.orbit
+    ? { ...s, planetId: m.fromPlanetId, orbitSlot: m.fromSlot, orbit: { radiusKm: m.orbit.fromRadiusKm, phase0: m.orbit.fromPhase0 } }
+    : { ...s, planetId: m.fromPlanetId, orbitSlot: m.fromSlot, orbit: undefined };
+  return {
+    ...base,
+    pointAt: (ms: number) => stationPointAt(ms < m.departAt ? before : s, ms),
+    presentAt: (ms: number) => (ms < m.departAt ? fromHere : ms >= m.arriveAt ? toHere : false),
+    edges: [m.departAt, m.arriveAt],
+  };
 }
 
 let flyingCache: { room: string; at: number; status: string; since: Map<string, number> } | null = null;
@@ -196,15 +228,21 @@ let flyingCache: { room: string; at: number; status: string; since: Map<string, 
  *  cap: a station's docks stay closed here until it is heard otherwise. */
 const FLYING_KEY = 'ssf.freeFlight.flyingRooms.v1';
 const MAX_FLYING_ROOMS = 64;
+/** How long a room heard flying free is remembered once nothing more is
+ *  heard of it. The summaries are peer-written (the dev-phase trust of the
+ *  planet summaries): a false claim closes a station's docks here for at
+ *  most this long, and any newer summary of its room, or a move of its own
+ *  booked since, ends it sooner. */
+export const FLYING_MEMORY_MS = 3 * 24 * 3600 * 1000;
 
-function readFlyingMemory(): Map<string, number> {
+function readFlyingMemory(now: number): Map<string, number> {
   const out = new Map<string, number>();
   try {
     const raw: unknown = JSON.parse(localStorage.getItem(FLYING_KEY) ?? 'null');
     if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
       for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
         if (out.size >= MAX_FLYING_ROOMS) break;
-        if (k.length > 0 && k.length <= 256 && typeof v === 'number' && Number.isFinite(v)) out.set(k, v);
+        if (k.length > 0 && k.length <= 256 && typeof v === 'number' && Number.isFinite(v) && now - v <= FLYING_MEMORY_MS) out.set(k, v);
       }
     }
   } catch {
@@ -238,7 +276,7 @@ function flyingSince(now: number): Map<string, number> {
   if (flyingCache && flyingCache.room === room && flyingCache.status === status && now - flyingCache.at < STATIONS_EVERY_MS) {
     return flyingCache.since;
   }
-  const since = readFlyingMemory();
+  const since = readFlyingMemory(now);
   let dirty = false;
   try {
     for (const s of Object.values(readStore(now).ships)) {
@@ -255,7 +293,9 @@ function flyingSince(now: number): Map<string, number> {
   }
   // This room's own record is first-hand.
   if (room && status === 'free-flight') {
-    if (!since.has(room)) { since.set(room, now); dirty = true; }
+    // Kept fresh (hourly) while it flies, so it never lapses first-hand.
+    const known = since.get(room);
+    if (known === undefined || now - known > 3600_000) { since.set(room, now); dirty = true; }
   } else if (room && since.delete(room)) {
     dirty = true;
   }
@@ -402,6 +442,12 @@ export function pilotFrame(input: StickInput, dtS: number, capacity: number, now
 function flushLive(capacity: number, now: number): void {
   if (!live) return;
   if (writeFreePose(live.pose)) live.writtenAt = now;
+  payOwedFuel(capacity);
+}
+
+/** Take the whole units of fuel the live stick owes out of the tanks. */
+function payOwedFuel(capacity: number): void {
+  if (!live) return;
   const whole = Math.floor(live.owedFuel);
   if (whole >= 1) {
     // With no tank fitted any more (the last one taken out mid-flight), the
@@ -415,12 +461,15 @@ function flushLive(capacity: number, now: number): void {
 /** Let go of the stick: the ship coasts on from the pose written now. */
 export function releaseStick(capacity: number, now = Date.now()): void {
   if (!liveHere() || !live) return;
+  // A part unit owed rounds up as the stick is let go: never free, even
+  // when another commander's game moved the flight on meanwhile.
+  live.owedFuel = Math.ceil(live.owedFuel - 1e-9);
   if (readFlightRecord().status === 'free-flight') {
     const stations = freeStationsAround(live.pose.planetId, now);
     live.pose = stepPilot(live.pose, NO_INPUT, now, 0, stations, 0).pose;
-    // A part unit owed rounds up as the stick is let go: never free.
-    live.owedFuel = Math.ceil(live.owedFuel - 1e-9);
     flushLive(capacity, now);
+  } else {
+    payOwedFuel(capacity);
   }
   live = null;
 }

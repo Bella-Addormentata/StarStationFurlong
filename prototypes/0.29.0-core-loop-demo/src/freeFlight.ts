@@ -112,6 +112,24 @@ export interface FreeStation {
   room: string;
   name: string;
   pointAt: (ms: number) => OrbitPoint;
+  /** 🚚 Whether it is around this planet at `ms` (absent: always). A
+   *  station between planets, or changing altitude, is met by no ship. */
+  presentAt?: (ms: number) => boolean;
+  /** The times its presence may change (a move's departure and arrival), so
+   *  a coast steps onto each and never across one. */
+  edges?: readonly number[];
+}
+
+/** The stations around at `ms`. */
+export function presentStations(stations: readonly FreeStation[], ms: number): readonly FreeStation[] {
+  return stations.some((s) => s.presentAt) ? stations.filter((s) => !s.presentAt || s.presentAt(ms)) : stations;
+}
+
+/** The first time after `ms` any station's presence may change. */
+function nextEdge(stations: readonly FreeStation[], ms: number): number {
+  let best = Infinity;
+  for (const s of stations) for (const t of s.edges ?? []) if (t > ms && t < best) best = t;
+  return best;
 }
 
 /** What the pilot asks for this frame, each in [−1, 1] (brake on or off). */
@@ -231,7 +249,7 @@ export function propagate(pose: FreePose, ms: number, stations: readonly FreeSta
   if (!(ms > pose.at)) return pose;
   const t = orbitalSeconds(ms) - orbitalSeconds(pose.at);
   if (pose.near) {
-    const st = stations.find((s) => s.room === pose.near!.room);
+    const st = presentStations(stations, ms).find((s) => s.room === pose.near!.room);
     if (st) {
       const along = pose.near.along + pose.vAlong * t;
       const radial = pose.near.radial + pose.vRadial * t;
@@ -284,7 +302,7 @@ export interface Nearest {
 export function nearestStation(pose: FreePose, stations: readonly FreeStation[]): Nearest | null {
   let best: Nearest | null = null;
   const here: OrbitPoint = { radiusKm: pose.radiusKm, angle: pose.angle };
-  for (const station of stations) {
+  for (const station of presentStations(stations, pose.at)) {
     const off = offsetFrom(here, station.pointAt(pose.at));
     const distanceKm = Math.hypot(off.along, off.radial);
     if (!best || distanceKm < best.distanceKm) best = { station, distanceKm, ...off };
@@ -330,7 +348,8 @@ function circularRate(planetId: string, radiusKm: number): number {
  * zone, and stop the ship dead at the hull bubble. `changed` says whether a
  * rule did anything (a pilot's game writes the pose then).
  */
-export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
+export function applyZones(pose: FreePose, all: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
+  const stations = presentStations(all, pose.at);
   let p = pose;
   let changed = false;
   const nearest = nearestStation(p, stations);
@@ -427,7 +446,8 @@ const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
  * bodies' turning (v²/r) since, which bounds the cost of a long quiet coast
  * by how near it comes to a station, not by how long it is.
  */
-function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
+function coastStep(p: FreePose, all: readonly FreeStation[]): number {
+  const stations = presentStations(all, p.at);
   // A frame whose station is gone: one step lets propagate drop it now.
   if (p.near && !stations.some((s) => s.room === p.near!.room)) return 1;
   if (!p.near && !p.parked) return wholeStep(closingStep(p, stations, APPROACH_ZONE_KM));
@@ -501,7 +521,9 @@ export function coastGrid(pose: FreePose, ms: number, stations: readonly FreeSta
   let p = pose;
   let changed = false;
   for (let steps = 0; ; steps++) {
-    const step = coastStep(p, stations);
+    // Never across a station's arrival or departure: onto it, where the
+    // zones see the station come or go.
+    const step = Math.min(coastStep(p, stations), nextEdge(stations, p.at) - p.at);
     const next = Number.isFinite(step) ? p.at + step : Infinity;
     if (next > ms) break;
     if (steps >= COAST_MAX_STEPS) return { pose: p, changed, capped: true };

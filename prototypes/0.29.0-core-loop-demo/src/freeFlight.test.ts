@@ -450,3 +450,17 @@ describe('a station in the next orbit', () => {
     expect(pose.near?.room).toBe('room-a');
   });
 });
+
+describe('a station that comes and goes', () => {
+  it('is met only while it is around: a replay never meets it before it arrives', () => {
+    const A = stationAt(2);
+    const arrives = T0 + 10_000;
+    const late: FreeStation = { ...A, presentAt: (ms) => ms >= arrives, edges: [arrives] };
+    // Still on A's own orbit, 20 km behind it: inside its approach zone.
+    const pose = poseOff(A, T0, -20, 0);
+    expect(coastTo(pose, T0 + 5_000, [late]).pose.near).toBeUndefined();
+    const after = coastTo(pose, T0 + 20_000, [late]);
+    expect(after.pose.near?.room).toBe(A.room);
+    expect(after.changed).toBe(true);
+  });
+});
