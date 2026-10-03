@@ -23,6 +23,7 @@ import { dockAnswerOf, stampAfter, type DockAnswer, type DockOpOptions, type Doc
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
 import { altitudeChangedSince, currentRoomId, listStations, planetById, stationInTransit } from './stations';
+import { stationFlyingFree } from './freeFlightPilot';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -480,7 +481,10 @@ export function completeArrival(
   // is looked for among every move known, not only the latest.
   const listed = listedNow ?? listStations().find((s) => s.id === rec.locationId);
   const climbedAway = !!listed && leftAt !== undefined && altitudeChangedSince(listed, leftAt, now);
-  if (stationInTransit(station, now) || movedMidFlight || movedAway || climbedAway) {
+  // 🅿️ A station flying by itself (Fly and park) has its docks closed: the
+  // ship waits where it was, like for one between planets.
+  const flyingFree = stationFlyingFree(listStations().find((s) => s.id === rec.locationId), now);
+  if (stationInTransit(station, now) || movedMidFlight || movedAway || climbedAway || flyingFree) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.

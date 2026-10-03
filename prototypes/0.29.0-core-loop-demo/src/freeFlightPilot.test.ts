@@ -21,7 +21,7 @@ import {
 import { bindShipDoc, readFlightRecord, readFuelLevel, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { DEFAULT_STATIONS } from './stationDirectory';
 import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, setStationRoomSource } from './stations';
-import { freeStationsAround, ownStationOf, stationUndockPose } from './freeFlightPilot';
+import { freeStationsAround, ownStationOf, stationFlyingFree, stationUndockPose } from './freeFlightPilot';
 import { ORBIT_EPOCH_MS } from './orbits';
 
 const HOME = DEFAULT_STATIONS[0];
@@ -167,8 +167,12 @@ describe('🅿️ a station flying by itself', () => {
     expect(speedOf(pose)).toBe(0);
     resetFreeFlightPilot();
     expect(freeStationsAround(DEFAULT_PLANET_ID, now).some((s) => s.room === ROOM)).toBe(true);
+    expect(stationFlyingFree(DEFAULT_STATION_RECORD, now)).toBe(false);
     fly(pose);
     resetFreeFlightPilot();
     expect(freeStationsAround(DEFAULT_PLANET_ID, now).some((s) => s.room === ROOM)).toBe(false);
+    // Docking is closed while it flies: DEPART, routes and arrivals skip it.
+    expect(stationFlyingFree(DEFAULT_STATION_RECORD, now)).toBe(true);
+    expect(stationFlyingFree({ welcomeRoomId: 'elsewhere' }, now)).toBe(false);
   });
 });

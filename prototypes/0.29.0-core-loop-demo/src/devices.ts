@@ -104,8 +104,8 @@ import type { DockAnswer } from './dockRules';
 // AUTO-DOCK.
 import { parkCost, parkPose, readout as freeReadout } from './freeFlight';
 import {
-  freeStationsAround, isStationOwnRoom, ownStationOf, pilotFrame, releaseStick, resolvedFreePose, stationUndockPose, undockPoseFrom,
-  writeFreePose,
+  freeStationsAround, isStationOwnRoom, ownStationOf, pilotFrame, releaseStick, resolvedFreePose, stationFlyingFree, stationUndockPose,
+  undockPoseFrom, writeFreePose,
 } from './freeFlightPilot';
 import { planStationPark } from './freeStation';
 import { isBoltedIntoStation } from './stationKeeping';
@@ -260,6 +260,12 @@ import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 function destinationAtOf(stationId: string): { destinationAt?: string } {
   const st = listStationRecordsNow().find((r) => r.id === stationId);
   return st ? { destinationAt: adriftAt(planetById(st.planetId).id, st.orbitSlot) } : {};
+}
+
+/** 🕹️ Is this station's own module flying by hand ("Fly and park")? Docking
+ *  is closed meanwhile, so no DEPART or route stop names it. */
+function stationFliesFree(stationId: string, now: number): boolean {
+  return stationFlyingFree(listStationRecordsNow().find((r) => r.id === stationId), now);
 }
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
@@ -2499,7 +2505,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     };
     const location = named(shipLocationId(flight, hasLiveDock()));
     const destination = flight.destinationId ? named(flight.destinationId) : null;
-    const choices = destinationsFrom(location.id);
+    const choices = destinationsFrom(location.id).filter((d) => !stationFliesFree(d.id, now));
     // 🚏 The ship's route: saved, running (a paused one included: routeRun),
     // and — while its timetable rules the flight — the next stop, which the
     // picker starts on at each stay (§2b). The route DEPART flies there from
@@ -2897,6 +2903,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         routeRunning: isRouteRunning(nowRoute) && readRouteFlight(nowMs) === null,
       });
       if (!nowRefusal.ok) { render(); return; }
+      if (destId && stationFliesFree(destId, nowMs)) {
+        setArrivalNote({ tone: 'warn', text: `Cannot depart: ${findDestination(destId).name} is flying by hand and takes no ships until it parks.` });
+        render();
+        return;
+      }
       const dest = findDestination(destId);
       if (!nowHop) { render(); return; }
       if (nowFuel < nowHop.fuelCost) { render(); return; }
@@ -3020,7 +3031,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const shipRoom = currentRoomId();
     const atlas = readStationAtlas();
     // Never the ship's own one-module station, nor one between planets.
-    const stations = stationsAroundPlanet(planetId, records).filter((st) => !stationInTransit(st, now)
+    const stations = stationsAroundPlanet(planetId, records).filter((st) => !stationInTransit(st, now) && !stationFlyingFree(st, now)
       && !(st.welcomeRoomId && (st.welcomeRoomId === shipRoom || atlasComponent(atlas, st.welcomeRoomId).has(shipRoom))));
     // 🧭 The dock the draft's route port is in (else any): the editor's
     // default berth at the station the ship is docked at.
@@ -3051,7 +3062,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const records = listStationRecordsNow();
     return (id: string): boolean => {
       const st = records.find((r) => r.id === localStationId(id)) ?? records.find((r) => r.id === id);
-      return !!st && stationInTransit(st, now);
+      return !!st && (stationInTransit(st, now) || stationFlyingFree(st, now));
     };
   };
 

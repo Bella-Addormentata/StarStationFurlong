@@ -76,19 +76,14 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
     return stationCache.list;
   }
   let ships: Set<string>;
-  let flying: Set<string>;
   try {
-    const live = Object.values(readStore(now).ships).filter((s) => !s.retired);
-    ships = new Set(live.map((s) => s.roomId));
-    flying = new Set(live.filter((s) => s.status === 'free-flight').map((s) => s.roomId));
+    ships = new Set(Object.values(readStore(now).ships).filter((s) => !s.retired).map((s) => s.roomId));
   } catch {
     ships = new Set();
-    flying = new Set();
   }
-  // 🅿️ A one-module station flying by itself is a ship until it parks: its
-  // docks are closed, and it holds no frame (this room's, or one the planet
-  // summaries say is flying free).
-  if (readFlightRecord().status === 'free-flight') flying.add(room);
+  // 🅿️ A one-module station flying by itself is a ship until it parks: it
+  // holds no frame.
+  const flying = flyingFreeRooms(now);
   const list: FreeStation[] = listStations()
     .filter((s) => planetById(s.planetId).id === planet && !stationInTransit(s, now))
     // Only a derived one-module stand-in is a ship; a saved or built-in
@@ -99,6 +94,36 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
     .map((s) => ({ id: s.id, room: s.welcomeRoomId, name: s.name, pointAt: (ms: number) => stationPointAt(s, ms) }));
   stationCache = { planetId: planet, room, at: now, list };
   return list;
+}
+
+let flyingCache: { room: string; at: number; status: string; rooms: Set<string> } | null = null;
+
+/**
+ * 🅿️ The rooms flying free now: this room when its flight record says so,
+ * and every one the planet summaries say is. A station whose welcome room
+ * is among them is flying by itself (Fly and park): its docks are closed,
+ * so no DEPART, route or arrival takes it as a destination until it parks.
+ */
+export function flyingFreeRooms(now = Date.now()): Set<string> {
+  const room = currentRoomId();
+  const status = readFlightRecord().status;
+  if (flyingCache && flyingCache.room === room && flyingCache.status === status && now - flyingCache.at < STATIONS_EVERY_MS) {
+    return flyingCache.rooms;
+  }
+  const rooms = new Set<string>();
+  try {
+    for (const s of Object.values(readStore(now).ships)) if (!s.retired && s.status === 'free-flight') rooms.add(s.roomId);
+  } catch {
+    /* the summary store is optional here */
+  }
+  if (room && status === 'free-flight') rooms.add(room);
+  flyingCache = { room, at: now, status, rooms };
+  return rooms;
+}
+
+/** 🅿️ Is this station flying by itself now (its docks closed)? */
+export function stationFlyingFree(station: { welcomeRoomId?: string } | null | undefined, now = Date.now()): boolean {
+  return !!station?.welcomeRoomId && flyingFreeRooms(now).has(station.welcomeRoomId);
 }
 
 /** The pose UNDOCK & FLY starts from, leaving `locationId` (a station, or
@@ -317,6 +342,7 @@ export function resetFreeFlightPilot(): void {
   live = null;
   coastCache = null;
   stationCache = null;
+  flyingCache = null;
   remoteCache = null;
   remoteCoasts.clear();
 }
