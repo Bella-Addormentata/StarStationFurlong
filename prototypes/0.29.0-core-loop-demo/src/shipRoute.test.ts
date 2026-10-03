@@ -48,6 +48,7 @@ import {
   checkpointFromWire,
   checkpointKey,
   checkpointToWire,
+  endedRunIn,
   finishShipRoute,
   installRouteFlight,
   installRouteFuelMeter,
@@ -1440,6 +1441,23 @@ describe('any ship map, read and written as the bound one is', () => {
     expect(routeIn(copy, T0 + 1).route).toEqual(readShipRoute(T0 + 1));
     expect(routeIn(copy, T0 + 1).route).toMatchObject({ startedAt: far, startStop: 1 });
     expect(routeIn(copy, T0 + 1).checkpoints).toEqual(readRouteCheckpoints(T0 + 1));
+  });
+
+  it('reads the run a finish ended, as readEndedRun does', () => {
+    const { run } = started();
+    const t = T0 + 10 * SEC;
+    expect(endedRunIn(copyOf(doc).getMap('ship'), t)).toBeUndefined(); // a run still flies
+    expect(stopShipRoute(T0 + SEC)).toBe(true);
+    expect(finishShipRoute()).toBe(true);
+    expect(endedRunIn(copyOf(doc).getMap('ship'), t)).toBe(run);
+    expect(readEndedRun(t)).toBe(run);
+    // A saved route that never ran ended none, and a start key stamped past
+    // RUN_AHEAD_MS is no run.
+    const idle = new Y.Doc();
+    idle.getMap('ship').set('route', routeToWire(saved()));
+    expect(endedRunIn(idle.getMap('ship'), t)).toBeUndefined();
+    idle.getMap('ship').set(checkpointKey(t + RUN_AHEAD_MS + 1, 0, 'start'), {});
+    expect(endedRunIn(idle.getMap('ship'), t)).toBeUndefined();
   });
 
   it('writes the key the bound writer writes, prunes alike, and announces nothing', () => {

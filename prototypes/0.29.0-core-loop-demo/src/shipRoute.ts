@@ -966,6 +966,12 @@ export function routeIn(map: Y.Map<unknown>, now = Date.now()): { route: ShipRou
   return { route, checkpoints };
 }
 
+/** 🏁 readEndedRun for any ship map: the run the last finish ended, while no
+ *  run flies there (as routeIn reads it). Pure over the map. */
+export function endedRunIn(map: Y.Map<unknown>, now = Date.now()): number | undefined {
+  return isRouteRunning(routeIn(map, now).route) ? undefined : newestRunStartIn(map, now);
+}
+
 /**
  * writeRouteCheckpoint for any ship doc: the same checks (the run is still
  * the route's, the entry well formed and at its stay's stop), the same key
@@ -1038,8 +1044,14 @@ export function finishShipRoute(apply?: () => void): boolean {
 export function readEndedRun(now = Date.now()): number | undefined {
   const h = shipDocHandle();
   if (!h || isRouteRunning(readShipRoute(now))) return undefined;
+  return newestRunStartIn(h.map, now);
+}
+
+/** The newest run whose start key a ship map holds, not stamped past
+ *  RUN_AHEAD_MS: while no run flies there, the run the last finish ended. */
+function newestRunStartIn(map: Y.Map<unknown>, now: number): number | undefined {
   let run: number | undefined;
-  for (const key of scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns) {
+  for (const key of scanCheckpoints(map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns) {
     const p = parseCheckpointKey(key);
     if (p?.kind !== 'start' || p.run > now + RUN_AHEAD_MS) continue;
     if (run === undefined || p.run > run) run = p.run;
