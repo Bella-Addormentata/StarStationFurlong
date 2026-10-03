@@ -58,7 +58,7 @@ import { interplanetaryPointAt, planPlanetTransfer, planetSunPointAt } from './s
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
 import {
-  MAX_ORBIT_SLOTS, PLANETS, isOrbitChange, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom,
+  MAX_ORBIT_SLOTS, PLANETS, altitudeChangeBeats, isOrbitChange, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom,
   stationInTransit, stationLeftPlanet,
 } from './stations';
 import type { MovingStation, OrbitChange, StationMove, StationRecord } from './stations';
@@ -800,7 +800,9 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
     if (!id) return false;
     const station = stationForRoom(id);
     const move = station ? latestMoveOf(station) : null;
-    return !!move && stationInTransit({ move }, realMs);
+    // An aborted altitude change (another station claimed its orbit first)
+    // never flew: it holds nothing.
+    return !!move && stationInTransit({ move }, realMs) && !isAbortedAltitudeChange(move);
   });
 }
 
@@ -1242,7 +1244,23 @@ function flownOf(m: StationMove): StationMove {
 /** Is this move out of the running: beaten by a concurrent move of its
  *  station, or outbid by another tow of the same tug? */
 function superseded(m: StationMove, known: StationMove[]): boolean {
-  return beatenForStation(m, known) || outbidForTug(m, known);
+  return beatenForStation(m, known) || outbidForTug(m, known) || outbidForAltitude(m, known);
+}
+
+/** 🎚️ Did another station's altitude change, still its station's latest
+ *  move, claim the orbit this one ends in first (stations.altitudeChangeBeats)?
+ *  The station list aborts the loser, so it neither flies, holds docks nor
+ *  draws fuel. */
+function outbidForAltitude(m: StationMove, known: StationMove[]): boolean {
+  if (m.mode !== 'orbit' || m.settles) return false;
+  return known.some((o) => altitudeChangeBeats(o, m)
+    && !known.some((later) => sameStation(later, o) && compareMoves(later, o) > 0));
+}
+
+/** 🎚️ Is this an altitude change another station's claimed the orbit for
+ *  first, by every move this install knows? */
+export function isAbortedAltitudeChange(m: StationMove): boolean {
+  return m.mode === 'orbit' && outbidForAltitude(m, knownMoves([...roomStanding()]));
 }
 
 /** Did a concurrent move of the same station win over this one? Another

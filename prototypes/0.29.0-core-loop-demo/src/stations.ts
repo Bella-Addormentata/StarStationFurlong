@@ -271,6 +271,23 @@ export function isOrbitChange(move: Pick<StationMove, 'mode' | 'settles'> | null
   return !!move && (move.settles ?? move).mode === 'orbit';
 }
 
+/** 🎚️ Does altitude change `a` beat `b`, another station's, for the orbit
+ *  they both end in? Both are altitude changes around one planet ending
+ *  within MIN_ORBIT_SEPARATION_KM; the one booked first wins, then the
+ *  smaller welcome room (or id), then the smaller serialized record — one
+ *  order, the same on every install, whenever each was booked. */
+export function altitudeChangeBeats(a: StationMove, b: StationMove): boolean {
+  if (a.settles || b.settles || a.mode !== 'orbit' || b.mode !== 'orbit' || !a.orbit || !b.orbit) return false;
+  const ka = a.welcomeRoomId || a.stationId, kb = b.welcomeRoomId || b.stationId;
+  if (ka === kb) return false;
+  if (planetById(a.toPlanetId).id !== planetById(b.toPlanetId).id) return false;
+  if (!(Math.abs(a.orbit.toRadiusKm - b.orbit.toRadiusKm) < MIN_ORBIT_SEPARATION_KM)) return false;
+  const ba = a.bookedAt ?? a.departAt, bb = b.bookedAt ?? b.departAt;
+  if (ba !== bb) return ba < bb;
+  if (ka !== kb) return ka < kb;
+  return JSON.stringify(a) < JSON.stringify(b);
+}
+
 /** 🎚️ The orbit a station flies at `nowMs` by its latest move: an altitude
  *  change's new orbit once it has arrived, the one it left until then; none
  *  (its slot's orbit) for any other move. */
@@ -598,31 +615,16 @@ export function listStations(
     const at = placeWithMove(c.base, c.move, nowMs);
     return { ...at, planetId: planetById(at.planetId).id };
   });
-  // 🎚️ Two stations that each booked an altitude change before seeing the
-  // other's, ending within MIN_ORBIT_SEPARATION_KM: the one booked first
-  // (then by welcome room, then id) flies; the other's burn is aborted, and
-  // it stays on the orbit it left, listed with no move.
-  const booked = (m: StationMove) => m.bookedAt ?? m.departAt;
-  const changeOf = (i: number) => {
-    const m = candidates[i].move;
-    return m && m.mode === 'orbit' && m.orbit ? m : null;
-  };
-  const firstOf = (i: number, j: number) => {
-    const a = changeOf(i)!, b = changeOf(j)!;
-    if (booked(a) !== booked(b)) return booked(a) < booked(b) ? i : j;
-    const ka = candidates[i].welcomeRoomId || candidates[i].id, kb = candidates[j].welcomeRoomId || candidates[j].id;
-    return ka !== kb ? (ka < kb ? i : j) : (candidates[i].id <= candidates[j].id ? i : j);
-  };
+  // 🎚️ Two stations whose standing altitude changes end within
+  // MIN_ORBIT_SEPARATION_KM (booked unaware of each other, at once or from
+  // a tab offline): the one booked first flies (altitudeChangeBeats); the
+  // other's burn is aborted, and it stays on the orbit it left, listed with
+  // no move. stationMove.ts holds the same loser out of the dock lock and
+  // the fuel meter.
   candidates.forEach((_, i) => {
-    const m = changeOf(i);
-    if (!m) return;
-    const lost = candidates.some((__, j) => {
-      const n = j === i ? null : changeOf(j);
-      return !!n && planetById(n.toPlanetId).id === planetById(m.toPlanetId).id
-        && booked(m) < n.arriveAt && booked(n) < m.arriveAt
-        && Math.abs(m.orbit!.toRadiusKm - n.orbit!.toRadiusKm) < MIN_ORBIT_SEPARATION_KM
-        && firstOf(i, j) === j;
-    });
+    const m = candidates[i].move;
+    if (!m || m.mode !== 'orbit' || !m.orbit) return;
+    const lost = candidates.some((o, j) => j !== i && !!o.move && altitudeChangeBeats(o.move, m));
     if (lost) {
       wantOf[i] = {
         planetId: wantOf[i].planetId, orbitSlot: wantOf[i].orbitSlot,

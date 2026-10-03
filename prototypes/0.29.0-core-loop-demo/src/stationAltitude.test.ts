@@ -36,6 +36,7 @@ import {
   dockLockedByMove,
   freeSlotAround,
   installStationMoveResolver,
+  isAbortedAltitudeChange,
   isPinMove,
   isStationMove,
   moveTransitPointAt,
@@ -43,7 +44,9 @@ import {
   orbitsToKeepClear,
   planStationAltitude,
   planStationMove,
+  readMoveFuelDrawn,
   readStationMove,
+  rememberMove,
   stationAltitudeKm,
   stationPointWithMoveAt,
   writeStationMove,
@@ -419,10 +422,34 @@ describe('Copilot round 1', () => {
     expect(after.find((s) => s.id === 'other')?.orbit?.radiusKm).toBe(orbitForSlot(SOV, 1).radiusKm);
     const during = listStations({}, [OTHER], NOW + 30_000).find((s) => s.id === 'other')!;
     expect(during.move).toBeUndefined();
-    // Booked one after the other arrived: both fly (the planner keeps them apart).
+    // Booked offline after the first had already arrived: still the later
+    // booking, still aborted.
     const later = climbOf('other', 'other-room', 1, 1_020, NOW + 60_001);
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? mine : st.id === 'other' ? later : null));
-    expect(listStations({}, [OTHER], NOW + 200_000).find((s) => s.id === 'other')?.orbit?.radiusKm).toBe(SOV_R + 1_020);
+    expect(listStations({}, [OTHER], NOW + 200_000).find((s) => s.id === 'other')?.orbit?.radiusKm)
+      .toBe(orbitForSlot(SOV, 1).radiusKm);
+    // Far enough apart: both fly.
+    const apart = climbOf('other', 'other-room', 1, 1_100, NOW + 5);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? mine : st.id === 'other' ? apart : null));
+    expect(listStations({}, [OTHER], NOW + 200_000).find((s) => s.id === 'other')?.orbit?.radiusKm).toBe(SOV_R + 1_100);
+  });
+
+  it('an aborted altitude change neither locks docks nor draws fuel', () => {
+    bindStationMoveDoc(new Y.Doc());
+    installStationMoveResolver();
+    const theirs = climbOf('other', 'other-room', 1, 1_020, NOW);
+    const mine = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW + 5);
+    expect(writeStationMove(mine)).toBe(true);
+    const drawnAlone = readMoveFuelDrawn();
+    expect(drawnAlone).toBe(5);
+    expect(dockLockedByMove([DEFAULT_STATION_RECORD.welcomeRoomId], NOW + 30_000)).toBe(true);
+    // This install learns the other station booked that orbit first.
+    expect(rememberMove(theirs, NOW + 10)).toBe(true);
+    expect(isAbortedAltitudeChange(mine)).toBe(true);
+    expect(readMoveFuelDrawn()).toBe(0);
+    expect(dockLockedByMove([DEFAULT_STATION_RECORD.welcomeRoomId], NOW + 30_000)).toBe(false);
+    expect(listStations({}, [OTHER], NOW + 120_000).find((s) => s.id === DEFAULT_STATION_ID)?.orbit?.radiusKm)
+      .toBe(orbitForSlot(SOV, 0).radiusKm);
   });
 
   it('keeps the altitude flown until a later move leaves, and for good when it is cancelled', () => {
