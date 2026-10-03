@@ -52,7 +52,7 @@ import {
   type FlightRecord,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { adriftPlace, destinationsFrom, flightCapable, isKnownStation, planHop, stationHere, type HopPlan } from './stationDirectory';
+import { adriftPlace, destinationsFrom, flightCapable, groundedBy, isKnownStation, planHop, stationHere, type HopPlan } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
 import {
   TUG_MIN_ENGINES,
@@ -215,7 +215,7 @@ import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -315,6 +315,32 @@ export interface WallScreenHandle {
   updateStatus(status: WallComputerStatus): void;
   /** Dim the in-world screen to "TERMINAL IN USE" while a player is focused. */
   setEngaged(engaged: boolean): void;
+}
+
+// ── 🏒 Air-hockey table handle (#115 — shared with the furniture builder) ────
+
+/**
+ * Handle onto an air-hockey table's animated pieces: the puck and two mallet
+ * meshes plus the pole-mounted scoreboard CanvasTexture. The builder
+ * (furniture.ts) stows it in the playfield mesh's userData.airHockey; World
+ * collects it, hands it to airHockeySession (which drives the pieces from
+ * mallet/puck ticks for EVERYONE — spectators watch the same in-world meshes
+ * the players do, the diegetic-display rule), and drives update(dt) for the
+ * goal-flash decay. All coordinates are LOCAL table space (x across, z along,
+ * table-surface plane) — the session converts from the world-space ticks.
+ */
+export interface AirHockeyVisualHandle {
+  /** Place one mallet; `down` rests it on the surface, up hovers it (#115
+   *  "holding the mouse button places the mallet down"). */
+  setMallet(side: 'a' | 'b', x: number, z: number, down: boolean, visible: boolean): void;
+  /** Place the puck (visible false while nobody is playing / between serves). */
+  setPuck(x: number, z: number, visible: boolean): void;
+  /** Redraw the scoreboard (internally deduped — safe to call every frame). */
+  setScore(a: number, b: number, statusLine: string): void;
+  /** Strobe the scored-on goal lamp; decays inside update(dt). */
+  flashGoal(side: 'a' | 'b'): void;
+  /** Per-frame animation (goal flash, mallet hover ease). World drives this. */
+  update(dt: number): void;
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
@@ -1593,6 +1619,11 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
     const t = readTable(deps.itemId);
     if (!t) return false;
     if (t.kind === 'checkers') return canReset(t.state);
+    // 🏒 An air-hockey state under a GAME TABLE's key is foreign — the
+    // air-hockey UI writes only under its own table's item id, so this can
+    // only be a malformed/hostile peer write. No participants are derivable
+    // for a game this table can't host: let ANYONE clear it (unwedge rule).
+    if (t.kind === 'airhockey') return true;
     const s = t.state;
     if (s.status !== 'waiting' && s.status !== 'playing') return true;
     if (s.bot) return true;
@@ -1809,7 +1840,7 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           ${btn('gt-reset', 'RESET', !canClearTable(),
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
         </div>`;
-    } else {
+    } else if (table.kind === 'checkers') {
       const state = table.state;
       const showBot = state.status === 'waiting' && state.players.black === null
         && (state.players.red === null || state.players.red === myId);
@@ -1828,6 +1859,21 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
           ${showForfeit ? btn('gt-forfeit', 'FORFEIT', false, 'Concede the game') : ''}
           ${btn('gt-reset', 'RESET', !canClearTable(),
             canClearTable() ? 'Clear the table (back to the game menu)' : 'Participants or the room owner reset a live game')}
+        </div>`;
+    } else {
+      // 🏒 Foreign state: an air-hockey record under this GAME TABLE's key.
+      // The air-hockey UI writes only under its own table's item id, so this
+      // can only come from a malformed or hostile peer write. Render a
+      // recovery strip instead of wedging — RESET (enabled for anyone via
+      // canClearTable's airhockey arm) clears it back to the game picker.
+      boardFace = `
+        <div id="gt-status" style="font-size:10px; font-weight:800; letter-spacing:1px; color:#FF6E40;">UNRECOGNISED TABLE STATE</div>
+        <div style="font-size:10px; color:rgba(212,168,75,0.75); line-height:1.6;">
+          This table's synced entry holds a game this surface can't host
+          (air hockey). RESET clears it back to the game menu.
+        </div>
+        <div style="display:flex; gap:8px; justify-content:flex-end;">
+          ${btn('gt-reset', 'RESET', !canClearTable(), 'Clear the table (back to the game menu)')}
         </div>`;
     }
 
@@ -1887,7 +1933,9 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
       drawChessBoard(table.state);
     } else {
       boardCanvas?.addEventListener('click', onBoardClick);
-      drawBoard(table?.state ?? null);
+      // Checkers state feeds the board; picker (null) and the foreign
+      // air-hockey face draw the empty felt (no #gt-board in that face).
+      drawBoard(table?.kind === 'checkers' ? table.state : null);
     }
   };
 
@@ -2413,13 +2461,23 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           }${hop.windowEveryMs ? ` Windows every ${secs(hop.windowEveryMs)}.` : ''}</div>`
         : '';
       // Refusal copy — the button is the caller's ANSWER, so name the reason.
+      const chainedCopy = (n: number) =>
+        `Chained to ${n} permanent connector${n === 1 ? '' : 's'} — take the gangway down first (chained modules cannot fly).`;
       const refuseCopy = refusal.ok ? '' : (() => {
         switch (refusal.reason) {
           case 'no-owner': return 'Only the module\'s COMMANDER may depart.';
-          case 'not-flight-capable':
+          case 'not-flight-capable': {
+            // Fitted, yet a station's own room (stationDirectory.groundedBy):
+            // name what holds it, not systems it already has.
+            const why = isShipReady() ? groundedBy() : null;
+            if (why === 'bolted') return chainedCopy(chained.length);
+            if (why !== null) {
+              return 'This is the station\'s own room: its engine, tank and helm keep the station in orbit, and a station never DEPARTs like a ship.';
+            }
             return 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.';
+          }
           case 'not-docked': return 'Ship is not at rest — cannot depart from mid-flight.';
-          case 'chained-berth': return `Chained to ${refusal.chainedDoors.length} permanent connector${refusal.chainedDoors.length === 1 ? '' : 's'} — take the gangway down first (chained modules cannot fly).`;
+          case 'chained-berth': return chainedCopy(refusal.chainedDoors.length);
           case 'insufficient-fuel': return `Insufficient fuel — this hop needs ${refusal.needed}, tanks hold ${refusal.have}.`;
           case 'already-here': return 'The ship is already here.';
           case 'other-planet': return 'That station orbits another planet — out of range.';
