@@ -721,3 +721,79 @@ describe('Copilot round 5', () => {
     expect(me.orbit?.radiusKm).toBeCloseTo(top, 6);
   });
 });
+
+describe('Copilot round 10', () => {
+  afterEach(() => { setStationMoveResolver(null); });
+  const changeFrom = (fromRadiusKm: number, toAlt: number, bookedAt: number, fromSince: number): StationMove => {
+    const plan = planOrbitChange(circularOrbit(planetById(SOV), fromRadiusKm, 0), SOV_R + toAlt, bookedAt)!;
+    return {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: SOV, toSlot: 0, departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+      orbit: { fromRadiusKm, fromPhase0: 0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0, fromSince },
+    };
+  };
+
+  it('a change whose source claim lost loses its destination too, and that defeats no later claim', () => {
+    // B holds 1,000 km; A says it came from 1,020 km and aims for a clear 3,000 km.
+    const other = climbOf('other', 'other-room', 1, 1_000, NOW);
+    const mine = changeFrom(SOV_R + 1_020, 3_000, NOW + 100_000, NOW + 50);
+    const later = climbOf('third', 'third-room', 2, 3_020, NOW + 200_000);
+    const lost = lostAltitudeClaims([other, mine, later]);
+    expect(lost.has(`${altitudeMoveKey(mine)}|from`)).toBe(true);
+    expect(lost.has(altitudeMoveKey(mine))).toBe(true);
+    expect(lost.has(altitudeMoveKey(later))).toBe(false);
+    // Listed back on its slot's orbit, not flying from the rejected one.
+    const moves: Record<string, StationMove> = { [DEFAULT_STATION_ID]: mine, other };
+    setStationMoveResolver((st) => moves[st.id] ?? null);
+    const me = listStations({}, [OTHER], NOW + 10_000_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(me.move).toBeUndefined();
+    expect(me.orbit).toBeUndefined();
+  });
+
+  it('weighs the source first even when it was claimed at the booking time or after', () => {
+    const other = climbOf('other', 'other-room', 1, 1_000, NOW);
+    for (const since of [NOW + 100_000, NOW + 150_000]) {
+      const mine = changeFrom(SOV_R + 1_020, 3_000, NOW + 100_000, since);
+      expect(lostAltitudeClaims([other, mine]).has(altitudeMoveKey(mine))).toBe(true);
+    }
+    // With a clear source, the destination stands.
+    const clear = changeFrom(SOV_R + 1_500, 3_000, NOW + 100_000, NOW + 50);
+    expect(lostAltitudeClaims([other, clear]).size).toBe(0);
+  });
+
+  it('refuses a route stop whose orbit its planet\'s stations can\'t fly', () => {
+    const stop: RouteStop = {
+      stationId: DEFAULT_STATION_ID, name: 'FURLONG', planetId: SOV, orbitSlot: 0,
+      berth: { roomId: 'r', farDoor: 'x+', anyGate: true }, waitSecs: 60,
+    };
+    expect(routeStopFromWire({ ...stop, orbit: { radiusKm: SOV_R + MIN_ALTITUDE_KM, phase0: 0 } })).not.toBeNull();
+    expect(routeStopFromWire({ ...stop, orbit: { radiusKm: SOV_R + 50, phase0: 0 } })).toBeNull();
+    expect(routeStopFromWire({ ...stop, orbit: { radiusKm: SOV_R + maxAltitudeKm(SOV) + 10, phase0: 0 } })).toBeNull();
+  });
+});
+
+describe('Copilot round 10 (on PR 205)', () => {
+  it('refuses a source claim stamped after the move was booked', () => {
+    const plan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, 0), SOV_R + 3_000, NOW)!;
+    const change: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: SOV, toSlot: 0, departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt: NOW, fuel: 5, fuelDrawn: 5,
+      orbit: { fromRadiusKm: SOV_R + 1_000, fromPhase0: 0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0, fromSince: NOW },
+    };
+    expect(isStationMove(change)).toBe(true);
+    expect(isStationMove({ ...change, orbit: { ...change.orbit!, fromSince: NOW + 1 } })).toBe(false);
+    // A legacy record with no booking time is held to its departure.
+    const { bookedAt: _b, ...legacy } = change;
+    expect(isStationMove({ ...legacy, orbit: { ...change.orbit!, fromSince: plan.departAt } })).toBe(true);
+    expect(isStationMove({ ...legacy, orbit: { ...change.orbit!, fromSince: plan.departAt + 1 } })).toBe(false);
+
+    const hop = climbOf('x', 'x-room', 1, 1_000, NOW);
+    const thruster: StationMove = {
+      ...hop, mode: 'thrusters', orbit: undefined, toPlanetId: hop.fromPlanetId, toSlot: 3, bookedAt: NOW,
+      fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW - 10 },
+    };
+    delete (thruster as { orbit?: unknown }).orbit;
+    expect(isStationMove(thruster)).toBe(true);
+    expect(isStationMove({ ...thruster, fromOrbit: { ...thruster.fromOrbit!, since: NOW + 1 } })).toBe(false);
+  });
+});

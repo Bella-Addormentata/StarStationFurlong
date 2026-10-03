@@ -371,7 +371,11 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
   }
   const bookedOf = (m: StationMove) => (m.settles ?? m).bookedAt ?? (m.settles ?? m).departAt;
   const isChange = (m: StationMove) => m.mode === 'orbit' && !m.settles && !!m.orbit;
-  interface Claim { key: string; station: string; planet: string; radiusKm: number; at: number; held: (t: number) => boolean }
+  interface Claim {
+    key: string; station: string; planet: string; radiusKm: number; at: number; held: (t: number) => boolean;
+    /** A claim this one stands on: a change's destination falls with its source. */
+    needs?: string;
+  }
   const accepted = new Set<string>();
   // A claim ends when a later move of its station leaves: any other move,
   // or an altitude change that was itself accepted. One that lost never
@@ -385,14 +389,19 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
       const booked = bookedOf(m);
       if (isChange(m)) {
         const planet = planetById(m.toPlanetId).id;
-        claims.push({ key, station, planet, radiusKm: m.orbit!.toRadiusKm, at: booked, held: (t) => !endedBy(list, booked, t) });
         // The custom orbit it leaves, held until a move from this one on
         // flies (this one, unless it loses), whether or not the change that
-        // took the station there is known here.
+        // took the station there is known here. Weighed no later than the
+        // destination, which can't fly from an orbit the station never held.
         const since = m.orbit!.fromSince;
-        if (since !== undefined) {
+        const from = since !== undefined ? `${key}|from` : undefined;
+        claims.push({
+          key, station, planet, radiusKm: m.orbit!.toRadiusKm, at: booked, held: (t) => !endedBy(list, booked, t),
+          ...(from ? { needs: from } : {}),
+        });
+        if (from) {
           claims.push({
-            key: `${key}|from`, station, planet, radiusKm: m.orbit!.fromRadiusKm, at: since,
+            key: from, station, planet, radiusKm: m.orbit!.fromRadiusKm, at: Math.min(since!, booked),
             held: (t) => !endedBy(list, booked - 1, t),
           });
         }
@@ -411,11 +420,12 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
   // by a given time (booked no later than it leaves) is settled before any
   // claim made at that time is weighed.
   claims.sort((a, b) => a.at - b.at || (a.station < b.station ? -1 : a.station > b.station ? 1 : 0)
+    || (a.needs === b.key ? 1 : b.needs === a.key ? -1 : 0)
     || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
   const kept: Claim[] = [];
   const lost = new Set<string>();
   for (const c of claims) {
-    const beaten = kept.some((a) => a.station !== c.station && a.planet === c.planet
+    const beaten = (!!c.needs && lost.has(c.needs)) || kept.some((a) => a.station !== c.station && a.planet === c.planet
       && Math.abs(a.radiusKm - c.radiusKm) < MIN_ORBIT_SEPARATION_KM && a.held(c.at));
     if (beaten) lost.add(c.key);
     else { kept.push(c); accepted.add(c.key); }

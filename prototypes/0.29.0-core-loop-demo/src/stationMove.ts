@@ -142,6 +142,10 @@ function heldOrbitOf(station: StationRecord): { fromOrbit?: NonNullable<StationM
   return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, ...(isTime(since) ? { since } : {}) } };
 }
 
+function claimedByBooking(since: number | undefined, bookedAt: number): boolean {
+  return since === undefined || since <= bookedAt;
+}
+
 /** Shape guard — a hostile peer can write anything into the map. */
 export function isStationMove(v: unknown): v is StationMove {
   if (typeof v !== 'object' || v === null) return false;
@@ -161,6 +165,10 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)
       && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)))
     && (r.bookedAt === undefined || isTime(r.bookedAt))
+    // 🎚️ The orbit it leaves was claimed by the time it was booked: claims
+    // are weighed in time order, so a later stamp would jump the queue.
+    && claimedByBooking(r.mode === 'orbit' ? (r.orbit as { fromSince?: number } | undefined)?.fromSince : (r.fromOrbit as { since?: number } | undefined)?.since,
+      (r.bookedAt ?? r.departAt) as number)
     // One level only, checked before recursing: a hostile nest is refused
     // at the first step, never walked.
     && (r.settles === undefined || (typeof r.settles === 'object' && r.settles !== null

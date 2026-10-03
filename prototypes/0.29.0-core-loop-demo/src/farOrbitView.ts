@@ -48,10 +48,11 @@ import type { FreePose } from './freeFlight';
 import { flyingFreeRooms, remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
+import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
-import { adriftPlace, altitudeChangesSince, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { adriftPlace, altitudeChangesSince, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
@@ -146,6 +147,16 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
   }
   const adrift = adriftPlace(id);
   return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
+}
+
+/** A flight's destination where it orbited at cast-off (the record's
+ *  destinationAt, as shipArrival.ts reads it): however many moves the station
+ *  made since (only the latest is remembered), that is where the ship flies.
+ *  Under the station's own id, so its trim still applies while it flies that
+ *  slot (a trim names the slot it is for). Undefined when the record kept none. */
+function castOffPlace(id: string, destinationAt: string | undefined): Place | undefined {
+  const at = destinationAt ? adriftPlace(destinationAt) : null;
+  return at ? { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot } : undefined;
 }
 
 /** A flight's transfer rebuilt from its record: the Hohmann ellipse between
@@ -258,21 +269,32 @@ function readSource(now: number): Source {
       // a stop's station may have left for another planet: those are its ends.
       aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => (places?.to
         ? [places.from, places.to]
-        : [placeOf(rec.locationId, all, leftAt, now), placeOf(to, all, leftAt, now)]));
+        : [placeOf(rec.locationId, all, leftAt, now), castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now)]));
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
     }
     if (rec.status === 'free-flight') free = resolvedFreePose(now);
     if (!aboard && !free && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    // 🚚 A timetable stay at a stop whose station has left the place the
+    // route copied (moved planets, or gone): the keeper passes that berth, so
+    // with no live dock carrying the ship along it waits on the copy's orbit,
+    // where its next leg leaves from (and where its planet summary puts it).
+    if (!aboard && !adrift && !free && places && !places.to) {
+      const station = all.find((s) => s.id === places.from.id);
+      adrift = routeStayOffList(
+        places,
+        station ? { planetId: station.planetId, orbitSlot: station.orbitSlot, moving: reallyMoving(station, now) } : null,
+        dockedStationFor(roomId, readAllDoors().values(), atlas, all) !== null,
+        (id) => planetById(id).id,
+      );
+    }
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
     if (!aboard && !adrift && !free && rec.status === 'redocking') {
-      const was = rec.destinationAt ? adriftPlace(rec.destinationAt) : null;
-      const place: Place | undefined = was
-        ? { id: rec.locationId, planetId: planetById(was.planetId).id, orbitSlot: was.orbitSlot }
-        : placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
+      const place = castOffPlace(rec.locationId, rec.destinationAt)
+        ?? placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
       const station = all.find((s) => s.id === rec.locationId);
       // A destination still in transit is listed at its origin until it arrives,
       // so a matching slot proves nothing: the ship stays on its own orbit.

@@ -122,8 +122,9 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 import type { FlightRecord } from './shipDoc';
+import { isUsableOrbit } from './orbits';
 import { localStationId } from './stationDirectory';
-import { MAX_ORBIT_SLOTS } from './stations';
+import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationOrbit } from './stations';
 
 // ── Stored shapes (A1, A9.6) ─────────────────────────────────────────────────
@@ -355,6 +356,9 @@ export function routeStopFromWire(v: unknown): RouteStop | null {
     if (!(isPlainObject(o) && typeof o.radiusKm === 'number' && Number.isFinite(o.radiusKm) && o.radiusKm > 0
       && typeof o.phase0 === 'number' && Number.isFinite(o.phase0) && Math.abs(o.phase0) <= 2 * Math.PI)) return null;
     orbit = { radiusKm: o.radiusKm, phase0: o.phase0 };
+    // One the station could fly around that planet (orbits.baseOrbit): else
+    // the timetable would plan the slot's orbit and the keeper skip the stop.
+    if (!isUsableOrbit(planetById(v.planetId), orbit)) return null;
   }
   return {
     stationId: v.stationId, name: v.name, planetId: v.planetId, orbitSlot: slot, ...(orbit ? { orbit } : {}), berth, waitSecs: wait,
@@ -626,7 +630,10 @@ function scanCheckpoints(map: Y.Map<unknown>, run: number | null, maxKeys: numbe
 // inside the same transaction must already see). The same objects come back
 // between changes, so the timetable's walk cache recognises them.
 let docVersion = 0;
-subscribeShip(() => { docVersion++; });
+subscribeShip(() => {
+  docVersion++;
+  noteRun();
+});
 
 interface Snapshot {
   version: number;
@@ -1170,6 +1177,62 @@ export function readResolvedFlight(now?: number): FlightRecord {
  *  paused)? PR 172's advance paths skip while it does. */
 export function routeRulesFlightNow(now?: number): boolean {
   return routeRulesFlight(readRouteFlight(now));
+}
+
+// 🏁 The run a finish cleared. A finish (this game's, or one that reaches it
+// from the helm commander's game) clears the run in one transaction, and a
+// speaker that had not read the route's end by then (the captain reads twice
+// a second, the helm once) would never say it (shipPilot.readPilotView). So
+// each change to the bound ship map notes the run the doc then holds, and the
+// change that clears it keeps that run, with its flight at that moment. A
+// STOP that reaches this game in the same update as the finish was never
+// seen here: the run keeps the flight it would have flown on (no end, unless
+// its timetable had reached one by then). Local, never synced.
+
+/** A run this game saw cleared from the bound ship doc. */
+export interface ClearedRun {
+  route: ShipRoute & { startedAt: number };
+  checkpoints: readonly RouteCheckpoint[];
+  /** Its flight when this game saw it cleared (null: none derivable). */
+  flight: RouteFlight | null;
+  /** When this game saw it cleared. */
+  at: number;
+}
+
+let runSeen: { doc: Y.Doc; route: ShipRoute & { startedAt: number }; checkpoints: readonly RouteCheckpoint[] } | null = null;
+let runCleared: (ClearedRun & { doc: Y.Doc }) | null = null;
+
+/** After each change to the bound ship map (and each bind): the run it
+ *  holds now, or, when the run seen before in this doc is gone, that run. */
+function noteRun(): void {
+  const h = shipDocHandle();
+  if (runCleared && runCleared.doc !== h?.doc) runCleared = null;
+  const d = flightDeps;
+  const now = (d?.clock ?? Date.now)();
+  const s = h ? current(now) : null;
+  if (h && s && isRouteRunning(s.route)) {
+    runSeen = { doc: h.doc, route: s.route, checkpoints: s.checkpoints };
+    return;
+  }
+  const was = runSeen;
+  runSeen = null;
+  if (!h || !was || was.doc !== h.doc) return;
+  let flight: RouteFlight | null = null;
+  try {
+    flight = d ? routeFlightAt(was.route, was.checkpoints, d.liveDock?.() ?? null, now, d.capacity(), nowCache) : null;
+  } catch (err) {
+    console.error('[route] cleared run flight failed:', err);
+  }
+  runCleared = { doc: h.doc, route: was.route, checkpoints: was.checkpoints, flight, at: now };
+}
+
+/** 🏁 The run this game last saw cleared from the ship doc bound now (null:
+ *  none since it was bound). */
+export function readClearedRun(): ClearedRun | null {
+  const h = shipDocHandle();
+  if (!runCleared || !h || runCleared.doc !== h.doc) return null;
+  const { doc: _doc, ...run } = runCleared;
+  return run;
 }
 
 /** How the copy-back decides the end stop's dock has answered. */
