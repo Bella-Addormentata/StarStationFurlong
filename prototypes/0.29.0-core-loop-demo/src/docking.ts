@@ -2879,6 +2879,9 @@ export class DoorDockingPortSystem {
       // a module in flight takes no pairing, and the far write is taken back
       // (settleChangedRedock) exactly as for a port that changed.
       if (!pairingAllowedByFlight(readFlightRecord()).ok) return false;
+      // 🚚 So may either end's station have cast off between planets: no ship
+      // joins a station in transit, and the far write is taken back the same way.
+      if (dockLockedByMove([roomId, port.roomId], Date.now())) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
@@ -2964,7 +2967,8 @@ export class DoorDockingPortSystem {
   /**
    * ⚓ redockPort's far berth answered, but THIS port changed while it was
    * asked (a peer docked, re-connected or stripped it — or the player left
-   * the room, so this side can no longer be written). Docked meanwhile to
+   * the room, so this side can no longer be written — or either end's station
+   * cast off between planets, which no ship joins). Docked meanwhile to
    * this very berth under OUR stamp — a crew member here joining our dock, or
    * the walk-through mirror of our far write — both sides hold one dock and
    * nothing is taken back (dockRules.holdsOurRedock). Anything else, the far
@@ -2992,17 +2996,24 @@ export class DoorDockingPortSystem {
       this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" }, ask.roomId);
       return true;
     }
+    // 🚚 A station that cast off meanwhile is said as such — its port may be
+    // just as it was — and the dock waits for its arrival, not a retry.
+    const moving = dockLockedByMove([ask.roomId, port.roomId], Date.now());
+    const lead = moving
+      ? "That station started moving between planets while docking"
+      : "This port changed while docking";
+    const retry = moving ? "Dock when it arrives." : "Try again.";
     // Acknowledged, or made but never acknowledged (it may still land): either
     // way the berth may hold our write, and it is taken back.
     if (!farWriteMayStand(far) || !this.farDockWriter) {
-      this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" }, ask.roomId);
+      this.setDockOp(doorId, { note: `${lead}. ${retry}`, tone: "warn" }, ask.roomId);
       return false;
     }
     this.setDockOp(
       doorId,
       {
         busy: true,
-        note: `This port changed while docking — releasing the berth at ${ask.name}…`,
+        note: `${lead} — releasing the berth at ${ask.name}…`,
       },
       ask.roomId,
     );
@@ -3028,13 +3039,13 @@ export class DoorDockingPortSystem {
       doorId,
       undone.ok
         ? {
-            note: `This port changed while docking — the berth at ${ask.name} was released again. Try again.`,
+            note: `${lead} — the berth at ${ask.name} was released again. ${retry}`,
             tone: "warn",
           }
         : {
             note: far.ok
-              ? `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`
-              : `This port changed while docking, and ${ask.name} could not be reached to let go — its side may show the dock until it undocks.`,
+              ? `${lead}, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`
+              : `${lead}, and ${ask.name} could not be reached to let go — its side may show the dock until it undocks.`,
             tone: "bad",
           },
       ask.roomId,

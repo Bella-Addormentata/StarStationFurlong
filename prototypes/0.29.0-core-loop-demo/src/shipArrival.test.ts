@@ -4,7 +4,7 @@
 // near-side writes as docking.ts's UNDOCK / DOCK.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { listStations } from './stations';
+import { listStations, setStationMoveResolver } from './stations';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
@@ -27,6 +27,8 @@ import {
   planArrivalDock,
   type ArrivalOutcome,
   shipLocationId,
+  shipPlaceId,
+  castOffPlaces,
   type ArrivalPort,
   type ShipDockingApi,
 } from './shipArrival';
@@ -36,6 +38,7 @@ import {
   readStationBerth,
   writeFlightRecord,
   writeStationBerth,
+  type FlightRecord,
 } from './shipDoc';
 import {
   adriftAt, adriftPlace, destinationsFrom, locationPlanet, planHop, setStationDirectory, DEFAULT_STATIONS, type StationDestination,
@@ -490,6 +493,58 @@ describe('shipLocationId', () => {
     expect(shipLocationId({
       status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', departedAt: 1, etaAt: 2,
     }, true)).toBe('high-orbit');
+  });
+});
+
+describe('where a ship with no live dock is', () => {
+  afterEach(() => setStationMoveResolver(null));
+
+  it('keeps a ship cast off where it left, wherever its origin moves meanwhile', () => {
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const left = adriftAt(home.planetId, home.orbitSlot);
+    // Cast off and waiting for its launch window.
+    const flight: FlightRecord = {
+      status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit',
+      departedAt: now + 600_000, etaAt: now + 900_000, castOffAt: now - 1000, originAt: left,
+    };
+    expect(shipPlaceId(flight, now)).toBe('furlong-station');
+    // Its origin leaves for another planet: the ship stays in open orbit
+    // where it was, on the way and once the station is there.
+    const move = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 500, arriveAt: now + 3_600_000,
+      mode: 'tug' as const, tugRoomId: 'tug', fuel: 1, fuelDrawn: 0,
+    };
+    setStationMoveResolver((st) => (st.id === 'furlong-station' ? move : null));
+    expect(shipPlaceId(flight, now)).toBe(left);
+    setStationMoveResolver((st) => (st.id === 'furlong-station' ? { ...move, departAt: now - 2000, arriveAt: now - 1000 } : null));
+    expect(listStations().find((st) => st.id === 'furlong-station')!.planetId).toBe('planet-aris');
+    expect(shipPlaceId(flight, now)).toBe(left);
+    expect(adriftPlace(shipPlaceId(flight, now))?.planetId).toBe(home.planetId);
+    // Arrived, it is where its destination was at cast-off once that moved on.
+    const then = adriftAt('planet-sovereign', 9);
+    const arrived: FlightRecord = { status: 'redocking', locationId: 'furlong-station', departedAt: now - 2, etaAt: now - 1, destinationAt: then };
+    expect(shipPlaceId(arrived, now)).toBe(then);
+    expect(shipPlaceId({ ...arrived, destinationAt: adriftAt('planet-aris', 0) }, now)).toBe('furlong-station');
+    // A flight that kept no place, and a ship at rest, go by the record.
+    expect(shipPlaceId({ ...flight, originAt: undefined }, now)).toBe('furlong-station');
+    expect(shipPlaceId({ status: 'docked', locationId: 'furlong-station', originAt: left }, now)).toBe('furlong-station');
+  });
+
+  it('keeps where DEPART casts off from and flies to, through the flight only', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const homeAt = adriftAt(home.planetId, home.orbitSlot);
+    expect(castOffPlaces('furlong-station', 'nowhere')).toEqual({ originAt: homeAt });
+    expect(castOffPlaces(adriftAt('planet-aris', 3), 'furlong-station'))
+      .toEqual({ originAt: adriftAt('planet-aris', 3), destinationAt: homeAt });
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: now - 2, etaAt: now - 1, ...castOffPlaces('furlong-station', 'high-orbit') });
+    expect(readFlightRecord().originAt).toBe(homeAt);
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt: now - 2, etaAt: now - 1, originAt: homeAt });
+    expect(readFlightRecord().originAt).toBeUndefined();
   });
 });
 

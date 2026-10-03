@@ -177,6 +177,44 @@ export function planArrivalDock(input: {
 }
 
 /**
+ * 🚚 Where a ship with no live dock is, as a location id: its flight
+ * record's location — unless the flight kept where that station orbited at
+ * cast-off (the origin's while the ship waits for its launch window or flies,
+ * the destination's once it has arrived) and the station has left that place
+ * since. Then the ship is in open orbit there (stationDirectory.adriftAt), a
+ * place that follows no station: only a live dock carries a ship along.
+ */
+export function shipPlaceId(rec: FlightRecord, now: number = Date.now()): string {
+  const kept = rec.status === 'redocking' ? rec.destinationAt
+    : rec.status === 'in-flight' ? rec.originAt
+      : undefined;
+  const place = kept !== undefined ? adriftPlace(kept) : null;
+  if (kept === undefined || !place) return rec.locationId;
+  const listed = listStations().find((s) => s.id === rec.locationId);
+  const there = !!listed && !stationInTransit(listed, now)
+    && planetById(listed.planetId).id === place.planetId && listed.orbitSlot === place.orbitSlot;
+  return there ? rec.locationId : kept;
+}
+
+/**
+ * 🚚 What DEPART keeps of where its stations orbit as the ship casts off, as
+ * open-orbit places: the origin's (one in open orbit already is its own
+ * place) and the destination's. Nothing for a station this install cannot
+ * list.
+ */
+export function castOffPlaces(fromId: string, destinationId: string): Pick<FlightRecord, 'originAt' | 'destinationAt'> {
+  const records = listStations();
+  const placeOf = (id: string): string | undefined => {
+    if (adriftPlace(id)) return id;
+    const st = records.find((r) => r.id === id);
+    return st ? adriftAt(planetById(st.planetId).id, st.orbitSlot) : undefined;
+  };
+  const originAt = placeOf(fromId);
+  const destinationAt = placeOf(destinationId);
+  return { ...(originAt ? { originAt } : {}), ...(destinationAt ? { destinationAt } : {}) };
+}
+
+/**
  * Where the ship is. While it sits docked into a station, its docks say so
  * (the directory's `here`) — a ship docked by hand at a new station is AT that
  * station, whatever the last flight wrote. Otherwise the flight record's

@@ -115,7 +115,7 @@ import {
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
 import { arrivalNoteHere, clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
-import { completeArrival, setBerthSeedResolver } from "./shipArrival";
+import { completeArrival, setBerthSeedResolver, shipPlaceId } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -1262,11 +1262,14 @@ function planetShipStatus(): ShipStatusInput | null {
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
   const from = byId(rec.locationId);
   const to = byId(rec.destinationId);
+  // 🚚 Cast off, the ship is where it left (arrived, where it found its
+  // destination), wherever those stations have moved since.
+  const at = shipPlaceId(rec);
   // The ship's own one-room stand-in sits on the default planet until its
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
-  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
+  const planetId = byId(at)?.planetId ?? adriftPlace(at)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const name =
     // Peer-written: only a string is a name.
@@ -1874,7 +1877,8 @@ async function joinRoomAtEpoch(
     // it (the holotable's "you are here", the exterior's planet).
     // 🚀 A ship with no live dock is where its flight record says (cast off,
     // holding, in transit, or arrived berthless), not its own one-room
-    // station, so the backdrop keeps the right planet all the way.
+    // station, so the backdrop keeps the right planet all the way. 🚚 Cast
+    // off, that is where it left, whatever its origin did since (shipPlaceId).
     setRoomStationResolver((roomId) => {
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
@@ -1888,7 +1892,7 @@ async function joinRoomAtEpoch(
       for (const rec of readAllDoors().values()) {
         if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) return null;
       }
-      return isShipReady() ? readFlightRecord().locationId : null;
+      return isShipReady() ? shipPlaceId(readFlightRecord()) : null;
     });
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.

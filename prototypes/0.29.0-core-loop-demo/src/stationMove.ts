@@ -771,15 +771,31 @@ const MAX_REMEMBERED = 256;
  *  as the latest. */
 const HISTORY_PER_STATION = 8;
 
-export function readRememberedMoves(): StationMove[] {
+/** The remembered list as last parsed, with each move's id: parsed again
+ *  only when the stored text changes (the station list, and every move a
+ *  room's doc holds, ask for it often). A move stored here was plausible
+ *  when it was stored, so it stays plausible. */
+let rememberedCache: { raw: string; moves: StationMove[]; ids: Set<string> } | null = null;
+
+function rememberedState(): { moves: StationMove[]; ids: Set<string> } {
+  let raw: string | null = null;
+  try { raw = localStorage.getItem(KEY); } catch { /* none stored */ }
+  if (!raw) return { moves: [], ids: new Set() };
+  if (rememberedCache?.raw === raw) return rememberedCache;
+  let moves: StationMove[] = [];
   try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return [];
     const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return [];
     const now = Date.now();
-    return arr.filter((m): m is StationMove => isStationMove(m) && isPlausibleMove(m, now)).slice(0, MAX_REMEMBERED).map(cleanMove);
-  } catch { return []; }
+    if (Array.isArray(arr)) {
+      moves = arr.filter((m): m is StationMove => isStationMove(m) && isPlausibleMove(m, now)).slice(0, MAX_REMEMBERED).map(cleanMove);
+    }
+  } catch { /* corrupt: none */ }
+  rememberedCache = { raw, moves, ids: new Set(moves.map(moveId)) };
+  return rememberedCache;
+}
+
+export function readRememberedMoves(): StationMove[] {
+  return rememberedState().moves.slice();
 }
 
 /** Two moves of the same station: by welcome room, or by id without one. */
@@ -795,10 +811,10 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
   if (!isStationMove(move) || !isPlausibleMove(move, nowMs)) return false;
   const clean = cleanMove(move);
   const id = moveId(clean);
-  const before = readRememberedMoves();
-  if (before.some((m) => moveId(m) === id)) return false;
+  const { moves: before, ids } = rememberedState();
+  if (ids.has(id)) return false;
   const list = trimRemembered([...before, clean], nowMs);
-  if (!list.some((m) => moveId(m) === id)) return false;
+  if (!list.includes(clean)) return false;
   try { localStorage.setItem(KEY, JSON.stringify(list)); } catch { return false; }
   // A new winner learned here (a planet summary, another room) can change
   // this room's standing move and so its 'stationMove' meter: tell the
@@ -807,22 +823,32 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
   return true;
 }
 
-/** Each station's best move, then its recent history, within the caps:
- *  history goes first when full (longest finished first), then the bests
- *  that finished longest ago. */
+/** Each station's best move (and its best standing one, when that one is
+ *  beaten or outbid), then its recent history, within the caps: history goes
+ *  first when full (longest finished first), then the bests that finished
+ *  longest ago. */
 function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
   const since = nowMs - MOVE_LOG_KEEP_MS - MOVE_FINAL_MS;
-  const groups: StationMove[][] = [];
+  // By station, as sameStation: its welcome room, or its id without one.
+  const byStation = new Map<string, StationMove[]>();
   for (const m of list) {
-    const g = groups.find((x) => sameStation(x[0], m));
-    if (g) g.push(m); else groups.push([m]);
+    const k = m.welcomeRoomId ? `w:${m.welcomeRoomId}` : `s:${m.stationId}`;
+    const g = byStation.get(k);
+    if (g) g.push(m); else byStation.set(k, [m]);
   }
+  const groups = [...byStation.values()];
   const bests: StationMove[] = [];
   const history: StationMove[] = [];
   for (const g of groups) {
     g.sort((x, y) => compareMoves(y, x));
     bests.push(g[0]);
-    history.push(...g.slice(1).filter((m) => m.arriveAt >= since).slice(0, HISTORY_PER_STATION));
+    // When another station's tow by the same tug outbids that one (nothing
+    // of its own station ranks above it to beat it), the best that stands
+    // is what the station follows (rememberedMoveFor): kept too, however old.
+    const stands = flownOf(g[0]).mode === 'tug' && outbidForTug(g[0], list)
+      ? g.find((m) => !superseded(m, list)) : undefined;
+    if (stands) bests.push(stands);
+    history.push(...g.slice(1).filter((m) => m !== stands && m.arriveAt >= since).slice(0, HISTORY_PER_STATION));
   }
   const byFinish = (x: StationMove, y: StationMove) => y.arriveAt - x.arriveAt;
   const keptBests = bests.sort(byFinish).slice(0, MAX_REMEMBERED);
@@ -840,19 +866,17 @@ function notifySoon(): void {
   queueMicrotask(() => { notifyQueued = false; notify(); });
 }
 
-/** The latest move this install knows for a station, matched by its welcome
- *  room (stations.moveBelongsTo), so a move another install wrote under its
- *  own id for the station still applies here. */
+/** The move a station follows: its standing move among everything this
+ *  install knows (knownStanding: the bound room's, so a move written here
+ *  applies even when this install cannot store it, and every remembered
+ *  one), matched by its welcome room (stations.moveBelongsTo), so a move
+ *  another install wrote under its own id for the station still applies
+ *  here. A move beaten by a concurrent one of its station, or outbid by
+ *  another station's tow by the same tug, never flies: the station follows
+ *  the best of its moves that stands, as the fuel meter and the dock locks
+ *  do. */
 export function rememberedMoveFor(station: MovingStation): StationMove | null {
-  let remembered: StationMove | null = null;
-  for (const m of readRememberedMoves()) {
-    if (moveBelongsTo(m, station) && (!remembered || compareMoves(m, remembered) > 0)) remembered = m;
-  }
-  // The bound room's own standing move too, so a move written here applies
-  // even when this install cannot store it (localStorage full or blocked).
-  const here = roomStanding().find((m) => moveBelongsTo(m, station)) ?? null;
-  if (!here) return remembered;
-  return !remembered || compareMoves(here, remembered) > 0 ? here : remembered;
+  return knownStanding().find((m) => moveBelongsTo(m, station)) ?? null;
 }
 
 /** Point stations.listStations at the remembered moves. */
@@ -1068,6 +1092,13 @@ function roomMoves(): {
   };
 }
 
+/** The moves this room's doc holds for deciding where stations are: its
+ *  legacy record, its entries, and the entries bundled past the caps. */
+function roomOwn(): StationMove[] {
+  const { entries, legacy, folded } = roomMoves();
+  return [...(legacy ? [legacy] : []), ...entries, ...folded];
+}
+
 /** The move a record stands for: a pin's settled move, else itself. */
 function flownOf(m: StationMove): StationMove {
   return m.settles ?? m;
@@ -1154,8 +1185,7 @@ function roomStanding(): StationMove[] {
   try { stored = localStorage.getItem(KEY); } catch { /* none stored */ }
   const version = `${roomVersion}|${stored ?? ''}`;
   if (standingCache?.version === version) return standingCache.moves;
-  const { entries, legacy } = roomMoves();
-  const own = legacy ? [legacy, ...entries] : entries;
+  const own = roomOwn();
   const moves = standingMoves(own, knownMoves(own));
   standingCache = { version, moves };
   return moves;
@@ -1164,8 +1194,7 @@ function roomStanding(): StationMove[] {
 /** The room's latest move that is not beaten by a concurrent one, or null
  *  (none, unbound, or malformed). */
 export function readStationMove(): StationMove | null {
-  const { entries, legacy } = roomMoves();
-  const own = legacy ? [legacy, ...entries] : entries;
+  const own = roomOwn();
   let best: StationMove | null = null;
   for (const m of standingMoves(own, knownMoves(own))) {
     if (!best || compareMoves(m, best) > 0) best = m;
@@ -1324,8 +1353,7 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
   roomVersion++;
   const onChange = () => {
     roomVersion++;
-    const { entries, legacy } = roomMoves();
-    const own = legacy ? [legacy, ...entries] : entries;
+    const own = roomOwn();
     for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
     notify();
   };
@@ -1360,15 +1388,15 @@ export const SWEEP_BATCH = 4 * MOVE_SCAN_MAX;
  * One bounded pass over the move log, inside a write's transaction: it
  * walks at most SWEEP_BATCH keys, clears every one that is not a
  * well-formed entry, settled record or bundle, and any settled record its
- * writer's later one covers. When it saw the whole log, the entries and
- * settled records past the caps move into bundles: entries still under way
- * stay first, then the ones booked latest; settled records that drew most
- * stay. When it saw only part of it (more keys than one pass walks: a
- * flood), everything there that can wait in a bundle goes: every settled
- * record and every entry no longer under way. Bundling keeps each item
- * whole (repack), so the meter, and every move that decides another, read
- * the same. Returns whether it saw the whole log, and whether it changed
- * anything.
+ * writer's later one covers. The entries past the cap among those it met
+ * move into bundles (entries still under way stay first, then the ones
+ * booked latest), and so do the settled records past theirs (those that
+ * drew most stay) — or every settled record it met, when it saw only part
+ * of the log (more keys than one pass walks: a flood). Bundling keeps each
+ * item whole (repack), and readers unpack bundles into the same places, so
+ * the meter, where each station is, and every move that decides another
+ * read the same. Returns whether it saw the whole log, and whether it
+ * changed anything.
  */
 function sweepLog(now: number): { complete: boolean; progress: boolean } {
   const junk: string[] = [];
@@ -1402,22 +1430,31 @@ function sweepLog(now: number): { complete: boolean; progress: boolean } {
   }
   for (const k of junk) moveMap!.delete(k);
   const settled = [...best.values()];
-  let foldEntries: Array<{ key: string; move: StationMove }>;
-  let foldSettled: Array<{ key: string; record: SettledMoves }>;
+  const byKey = (x: { key: string }, y: { key: string }) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0);
+  const active = (m: StationMove) => (m.arriveAt > now ? 1 : 0);
+  // The entries keep one order and cap whether or not the pass saw the
+  // whole log, so a flood of moves still under way is bundled a pass at a
+  // time like any other; past the cap only the settled records differ.
+  entries.sort((x, y) => active(y.move) - active(x.move) || bookedOf(y.move) - bookedOf(x.move) || byKey(x, y));
+  const foldEntries = entries.slice(MOVE_ENTRIES_KEEP);
+  let foldSettled = settled;
   let liveSettled: Array<{ key: string; record: SettledMoves }> = [];
   if (complete) {
-    const byKey = (x: { key: string }, y: { key: string }) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0);
-    const active = (m: StationMove) => (m.arriveAt > now ? 1 : 0);
-    entries.sort((x, y) => active(y.move) - active(x.move) || bookedOf(y.move) - bookedOf(x.move) || byKey(x, y));
     settled.sort((x, y) => y.record.drawn - x.record.drawn || byKey(x, y));
-    foldEntries = entries.slice(MOVE_ENTRIES_KEEP);
     foldSettled = settled.slice(MOVE_SETTLED_KEEP);
     liveSettled = settled.slice(0, MOVE_SETTLED_KEEP);
-  } else {
-    foldEntries = entries.filter((e) => e.move.arriveAt <= now);
-    foldSettled = settled;
   }
-  const repacked = repack(bundles, foldSettled, foldEntries, liveSettled);
+  // The move each station follows among those this pass sees, worked out
+  // only when a bundle overflows: those stay first.
+  let stands: Set<string> | null = null;
+  const standingIds = (): Set<string> => {
+    if (!stands) {
+      const seen = [...entries.map((e) => e.move), ...bundles.flatMap((b) => Object.values(b.bundle.entries))];
+      stands = new Set(standingMoves(seen, knownMoves(seen)).map(moveId));
+    }
+    return stands;
+  };
+  const repacked = repack(bundles, foldSettled, foldEntries, liveSettled, standingIds);
   return { complete, progress: junk.length > 0 || repacked };
 }
 
@@ -1431,13 +1468,15 @@ function sweepLog(now: number): { complete: boolean; progress: boolean } {
  * when it holds nothing to pay or decide: no total, no running total, no
  * move still reversible), and an entry its key. Past FOLD_ITEMS_MAX in one
  * bucket (a flood of well-formed records, never an honest log) the items
- * worth least go. Returns whether the map changed.
+ * worth least go, after every move a station follows (`standingIds`).
+ * Returns whether the map changed.
  */
 function repack(
   bundles: Array<{ key: string; bucket: string; bundle: FoldBundle }>,
   foldSettled: Array<{ key: string; record: SettledMoves }>,
   foldEntries: Array<{ key: string; move: StationMove }>,
   liveSettled: Array<{ key: string; record: SettledMoves }>,
+  standingIds: () => Set<string>,
 ): boolean {
   type Bucket = { keys: string[]; settled: Map<string, SettledMoves>; entries: Map<string, StationMove>; dirty: boolean };
   const buckets = new Map<string, Bucket>();
@@ -1487,20 +1526,25 @@ function repack(
   for (const k of [...foldSettled, ...foldEntries].map((e) => e.key)) { moveMap!.delete(k); changed = true; }
   for (const [b, at] of buckets) {
     if (!at.dirty) continue;
-    type Item = { id: string; value: number; put: (into: FoldBundle) => void };
+    type Item = { id: string; value: number; move?: StationMove; rank: number; put: (into: FoldBundle) => void };
     const items: Item[] = [];
     for (const [w, r] of at.settled) {
       if (bucketOfItem(`s:${w}`) !== b || covered(w, r) || idle(r)) continue;
       items.push({
-        id: `s:${w}`, value: r.drawn + r.recent.reduce((sum, m) => sum + m.fuel, 0), put: (into) => { into.settled[w] = r; },
+        id: `s:${w}`, value: r.drawn + r.recent.reduce((sum, m) => sum + m.fuel, 0), rank: 1, put: (into) => { into.settled[w] = r; },
       });
     }
     for (const [k, m] of at.entries) {
       if (bucketOfItem(`e:${k}`) !== b) continue;
-      items.push({ id: `e:${k}`, value: m.fuel, put: (into) => { into.entries[k] = m; } });
+      items.push({ id: `e:${k}`, value: m.fuel, move: m, rank: 1, put: (into) => { into.entries[k] = m; } });
+    }
+    // Overflowing (a flood): the move each station follows stays first.
+    if (items.length > FOLD_ITEMS_MAX) {
+      const stands = standingIds();
+      for (const it of items) if (it.move && stands.has(moveId(it.move))) it.rank = 0;
     }
     const byId = (x: Item, y: Item) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0);
-    items.sort((x, y) => y.value - x.value || byId(x, y));
+    items.sort((x, y) => x.rank - y.rank || y.value - x.value || byId(x, y));
     const kept = items.slice(0, FOLD_ITEMS_MAX).sort(byId);
     const next: FoldBundle = { settled: {}, entries: {} };
     for (const it of kept) it.put(next);

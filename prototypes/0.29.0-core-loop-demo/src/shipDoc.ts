@@ -136,6 +136,11 @@ export interface FlightRecord {
    *  place (stationDirectory.adriftAt). Kept through `redocking`, so arrival
    *  can tell the destination moved away however many moves it made since. */
   destinationAt?: string;
+  /** Where the ship cast off from, as an open-orbit place: where its origin
+   *  orbited then. Kept through `in-flight`, so a ship waiting for its launch
+   *  window or on its way stays there whatever its origin does meanwhile
+   *  (shipArrival.shipPlaceId): only a live dock carries a ship along. */
+  originAt?: string;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -242,6 +247,7 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.etaAt !== undefined && !isFlightTime(r.etaAt)) return false;
   if (r.castOffAt !== undefined && !isFlightTime(r.castOffAt)) return false;
   if (r.destinationAt !== undefined && !isBoundedString(r.destinationAt)) return false;
+  if (r.originAt !== undefined && !isBoundedString(r.originAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -295,6 +301,7 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;
       if (r.castOffAt !== undefined && (r.departedAt === undefined || r.castOffAt <= r.departedAt)) out.castOffAt = r.castOffAt;
       if (r.destinationAt !== undefined) out.destinationAt = r.destinationAt;
+      if (r.originAt !== undefined) out.originAt = r.originAt;
     }
   }
   // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
