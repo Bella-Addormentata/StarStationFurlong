@@ -701,6 +701,28 @@ function holdsSummary(had: StationRecord & Record<string, unknown>, s: StationSu
     && had.welcomeRoomId === s.welcomeRoomId && had.berthDoor === s.berthDoor;
 }
 
+/** Which of a planet's summaries for places this install has no station of
+ *  its own it lists (`admitted`) and which it leaves out (`displaced`): ranked
+ *  owned first, then by welcome room, as many as the planet's slots its own
+ *  stations leave free. The same summaries rank alike everywhere, so a
+ *  crowded planet lists the same learned stations on every install. */
+function admittedAt(planet: string, stations: Iterable<StationSummary>, listed: StationRecord[]): {
+  admitted: Set<string>;
+  displaced: Set<string>;
+} {
+  const own = listed.filter((st) => !st.derived && !isLearnedRecord(st) && planetById(st.planetId).id === planet);
+  const ownRooms = new Set(own.map((st) => st.welcomeRoomId));
+  const ranked = [...stations]
+    .filter((s) => planetById(s.planetId).id === planet && !ownRooms.has(s.welcomeRoomId))
+    .sort((a, b) => Number(b.ownerId !== undefined) - Number(a.ownerId !== undefined)
+      || (a.welcomeRoomId < b.welcomeRoomId ? -1 : a.welcomeRoomId > b.welcomeRoomId ? 1 : 0));
+  const free = Math.max(0, MAX_ORBIT_SLOTS - own.length);
+  return {
+    admitted: new Set(ranked.slice(0, free).map((s) => s.welcomeRoomId)),
+    displaced: new Set(ranked.slice(free).map((s) => s.welcomeRoomId)),
+  };
+}
+
 /**
  * Register the learned stations around `planetId` as station records, so
  * their slots (and so their orbits) match every other client's. A place this
@@ -729,6 +751,18 @@ export function registerLearnedStations(
       }
     }
   }
+  // A planet with more stations than slots lists the same learned ones on
+  // every install, whatever order their summaries came in (admittedAt); a
+  // learned record ranked out goes, since an earlier order may have let it in.
+  stations = [...stations]; // walked twice
+  const { admitted, displaced } = admittedAt(planet, stations, listed);
+  for (const r of [...saved.values()]) {
+    if (isLearnedRecord(r) && planetById(r.planetId).id === planet && displaced.has(r.welcomeRoomId)) {
+      removeStation(r.id);
+      saved.delete(r.id);
+      changed++;
+    }
+  }
   for (const s of stations) {
     if (planetById(s.planetId).id !== planet) continue;
     const rec = learnedRecord(s);
@@ -748,6 +782,8 @@ export function registerLearnedStations(
       }
       continue;
     }
+    // Past the slots this planet has left for learned stations.
+    if (!admitted.has(s.welcomeRoomId)) continue;
     // Unchanged since it was saved: compare with the SAVED record, not the
     // listed one (the list may have moved it to a free slot), extra fields
     // included (a newer build's, such as a station's move).
