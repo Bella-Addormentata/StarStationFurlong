@@ -3888,8 +3888,33 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       return;
     }
     letGo();
+    // Kept to fly on from if the far berth refuses after all (the preflight
+    // above cannot promise its answer).
+    const flewFrom = readFlightRecord().locationId;
+    const flewAt = resolvedFreePose(Date.now()) ?? pose;
+    const docking = shipDocking;
+    const room = currentRoomId();
+    const backToFree = (outcome: ArrivalOutcome | null): void => {
+      if (!outcome || outcome.kind !== 'none' || outcome.reason === 'already-docked') return;
+      // Only this ship, only while it still reads as docked there with no
+      // port actually docked (another commander's dock is never undone).
+      if (currentRoomId() !== room) return;
+      const rec = readFlightRecord();
+      if (rec.status !== 'docked' || rec.locationId !== station.id) return;
+      if (docking.ports().some((p) => p.state.kind === 'docked')) return;
+      writeFreePose(flewAt);
+      writeFlightRecord({ status: 'free-flight', locationId: flewFrom });
+      flashFree(`${station.name} did not take the ship: still flying free.`);
+      if (panel) render();
+    };
     if (!writeFlightRecord({ status: 'redocking', locationId: station.id })) return;
-    noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
+    const note = arrivalNoteHere();
+    const first = completeArrival(docking, {
+      force: true,
+      onSettled: (outcome) => { note(outcome); backToFree(outcome); },
+    });
+    noteShipArrival(first);
+    backToFree(first);
   };
 
   /**

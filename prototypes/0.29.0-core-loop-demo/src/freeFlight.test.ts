@@ -199,6 +199,17 @@ describe('speed zones', () => {
     expect(Math.hypot(r.pose.near!.along, r.pose.near!.radial)).toBeGreaterThan(30);
   });
 
+  it('a ship grazing the hull bubble is stopped on its edge, not passed through between steps', () => {
+    const st = stationAt(2);
+    const near = { room: st.room, along: -0.3, radial: 0.1 };
+    const p0 = pointOff(st.pointAt(T0), near.along, near.radial);
+    const pose: FreePose = { planetId: SOV, at: T0, radiusKm: p0.radiusKm, angle: p0.angle, vAlong: DOCK_MAX_KMS, vRadial: 0, heading: 0, near };
+    const r = coastTo(pose, T0 + 60_000, [st]);
+    expect(r.changed).toBe(true);
+    expect(speedOf(r.pose)).toBe(0);
+    expect(Math.hypot(r.pose.near!.along, r.pose.near!.radial)).toBeCloseTo(HULL_KM, 6);
+  });
+
   it('a coast stopped by the safety cap is held there, not carried on unchecked', () => {
     const st = stationAt(2);
     // Crawling just outside the hull bubble: every step stays short.

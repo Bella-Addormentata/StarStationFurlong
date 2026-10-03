@@ -27,8 +27,8 @@
  *   - DOCKING zone (DOCK_ZONE_KM): a crawl (DOCK_MAX_KMS), and AUTO-DOCK;
  *   - HULL bubble (HULL_KM): the ship stops dead at its edge, no damage.
  * A ship that coasts into a zone is slowed to its cap at the boundary, the
- * same way on every client (coastGrid steps the coast on a grid that never
- * steps past a boundary).
+ * same way on every client (coastGrid's steps, worked out from the pose
+ * alone, never step past a boundary).
  *
  * Velocities are km per ORBITAL second (orbits.ts runs the clock 60× real
  * time), so a ship and the stations around it move on one clock.
@@ -71,8 +71,7 @@ const MAX_RADIUS_FACTOR = 1.1;
 /** Where UNDOCK leaves the ship: this far behind the station it left, facing
  *  away from it. */
 export const UNDOCK_OFFSET_KM = 0.3;
-/** coastTo's shortest step (real ms); far from every boundary it steps
- *  further, never past one (coastStep). */
+/** How far ahead (real ms) coastStep looks to measure speeds. */
 const COAST_STEP_MS = 100;
 /** A safety net on one coast's steps (each costs a pass over the
  *  stations); see coastGrid. */
@@ -400,7 +399,7 @@ export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { 
 const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
 
 /**
- * How far (real ms, whole COAST_STEP_MS) a coast from `p` may step without
+ * How far (real ms) a coast from `p` may step without
  * passing a zone boundary: half the time the soonest one could be met, or
  * Infinity when nothing can be met. In a station's frame the ship moves in
  * a straight line at its own speed. In open space each station's gap to its
@@ -416,7 +415,7 @@ function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
     if (speed === 0) return Infinity;
     const d = Math.hypot(p.near.along, p.near.radial);
     const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
-    return onGrid((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S);
+    return wholeStep((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S);
   }
   if (stations.length === 0) return Infinity;
   const probe = p.at + COAST_STEP_MS;
@@ -429,7 +428,7 @@ function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
     const s0 = toPlanetFrame(a);
     const s1 = toPlanetFrame(st.pointAt(probe));
     const gap = Math.hypot(s0.x - ship0.x, s0.z - ship0.z) - APPROACH_ZONE_KM;
-    if (gap <= 0) return COAST_STEP_MS;
+    if (gap <= 0) return 1;
     const stV = Math.hypot(s1.x - s0.x, s1.z - s0.z) / COAST_STEP_MS;
     // Relative speed now (km per real ms), and a bound on how fast it grows.
     const v = Math.hypot((s1.x - s0.x) - (ship1.x - ship0.x), (s1.z - s0.z) - (ship1.z - ship0.z)) / COAST_STEP_MS;
@@ -438,14 +437,16 @@ function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
     const t = acc > 0 ? (Math.sqrt(v * v + acc * gap) - v) / acc : v > 0 ? gap / (2 * v) : Infinity;
     best = Math.min(best, t);
   }
-  return onGrid(best);
+  return wholeStep(best);
 }
 
-/** A step cut to whole COAST_STEP_MS (at least one), so a boundary is met
- *  at the same moment however a coast is sampled. */
-function onGrid(step: number): number {
+/** A safe step in whole ms (at least one): never rounded above what is
+ *  safe, so no boundary is crossed inside a step. Near one the steps
+ *  shrink toward it (each half the time left) until a 1 ms step lands just
+ *  past it, where applyZones acts. */
+function wholeStep(step: number): number {
   if (!Number.isFinite(step)) return Infinity;
-  return Math.max(1, Math.floor(step / COAST_STEP_MS)) * COAST_STEP_MS;
+  return Math.max(1, Math.floor(step));
 }
 
 /**
