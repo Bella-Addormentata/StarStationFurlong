@@ -68,7 +68,8 @@ import {
 } from './helmRoute';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
 import { adriftAt, adriftPlace, destinationsFrom, isKnownStation, localStationId, planHop, stationHere } from './stationDirectory';
-import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
+import { atlasComponent, readAtlas as readStationAtlas, subscribeSharedAtlas } from './stationAtlas';
+import { StationPlanView } from './stationPlanView';
 import {
   TUG_MIN_ENGINES,
   describeMove,
@@ -237,7 +238,7 @@ import {
 import { rowText } from './departuresBoard';
 import type { BoardView } from './departuresBoard';
 import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './departuresDoc';
-import { subscribePlanetSummary } from './planetSummary';
+import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1100,6 +1101,12 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
 export interface MapTableDeps {
   /** Ask the focus controller to step back (wired to the map's CLOSE button). */
   requestRelease?: () => void;
+  /** 🗺️ #192: the current room's doors, for the station atlas's edit buttons. */
+  currentDoors?: () => Array<{ id: string; label: string }>;
+  /** 🗺️ Step back from the table and open a door's own panel. */
+  openDoorPanel?: (doorId: string) => void;
+  /** 🗺️ The local player's id, so a module's owner can read "You". */
+  playerId?: () => string;
 }
 
 /**
@@ -1111,6 +1118,10 @@ export interface MapTableDeps {
  * whole lifetime.
  */
 let mapTableMap: SolarSystemMap | null = null;
+/** 🗺️ #192: the station atlas over the plot — one, like the map. Its deps
+ *  are re-pointed at each focus session's. */
+let stationPlanView: StationPlanView | null = null;
+let stationPlanDeps: MapTableDeps = {};
 
 /**
  * The map table's focused DOM UI (plan §2 M4): a gold-framed panel hosting
@@ -1183,19 +1194,52 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       } else {
         mapTableMap.mount(body); // re-parents the existing container
       }
+      // 🗺️ #192: VIEW STATION ATLAS covers the plot with that station's plan.
+      stationPlanDeps = deps;
+      if (!stationPlanView) {
+        stationPlanView = new StationPlanView({
+          atlas: () => readStationAtlas(),
+          currentRoomId: () => currentRoomId(),
+          playerId: () => stationPlanDeps.playerId?.() ?? '',
+          ships: () => Object.values(readPlanetStore().ships),
+          doors: () => stationPlanDeps.currentDoors?.() ?? [],
+          openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
+          onBack: () => stationPlanView?.hide(),
+        });
+      }
+      stationPlanView.mount(body);
+      mapTableMap.onStationAtlas((stationId) => {
+        const station = listStationRecords().find((st) => st.id === stationId);
+        if (station) stationPlanView?.show(station);
+      });
+      // An open plan follows its station's CURRENT record (a move changes its
+      // planet, so its ships), and closes when the station is gone.
+      const refreshPlan = () => {
+        const open = stationPlanView?.openStationId();
+        if (!open) return;
+        const fresh = listStationRecords().find((st) => st.id === open);
+        if (fresh) stationPlanView?.refresh(fresh);
+        else stationPlanView?.hide();
+      };
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
       mapTableMap.show();
       stopLive?.();
-      const refresh = () => mapTableMap?.refreshStations(undefined, holotableStation());
+      const refresh = () => {
+        mapTableMap?.refreshStations(undefined, holotableStation());
+        refreshPlan();
+      };
       const offSummary = subscribePlanetSummary(refresh);
       const offMove = subscribeStationMove(refresh);
+      // A layout learned while the plan is open (a peer's harvest) redraws it.
+      const offAtlas = subscribeSharedAtlas(refreshPlan);
       const tick = window.setInterval(refresh, 60_000);
-      stopLive = () => { offSummary(); offMove(); window.clearInterval(tick); stopLive = null; };
+      stopLive = () => { offSummary(); offMove(); offAtlas(); window.clearInterval(tick); stopLive = null; };
     },
 
     unmount(): void {
       stopLive?.();
+      stationPlanView?.hide();
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
