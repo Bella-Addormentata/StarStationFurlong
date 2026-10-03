@@ -21,7 +21,7 @@
 
 import { isDockChain } from './adapter';
 import { stampAfter, type DockPortState } from './dockRules';
-import { readAllDoors, readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
+import { readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { stationLeftFrom } from './stationMove';
 import {
@@ -310,7 +310,10 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
   const rec = readFlightRecord();
   if (!roomId || rec.status !== 'docked') return false;
   const rest = readRestPlace();
-  const doors = readAllDoors();
+  // Only a snapshot that holds every door: a dock it left out could be the
+  // one still holding the ship, or the last to let go.
+  const doors = readAllDoorsIfComplete();
+  if (!doors) return false;
   const stations = listStations(undefined, undefined, now);
   const hostId = dockedStationFor(roomId, doors.values(), readAtlas(), stations);
   const host = hostId ? stations.find((s) => s.id === hostId) : undefined;
@@ -323,11 +326,12 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
       try { room = roomIdFromSeed(door.connectedRoomAddress); } catch { room = ''; }
       if (room && dockHost(room, stations)?.id === host.id) docks.push(doorId);
     }
+    // Every one of them: a complete snapshot holds no more than a rest
+    // record names (MAX_REST_DOCKS).
     docks.sort();
-    const held = docks.slice(0, MAX_REST_DOCKS);
-    if (held.length === 0) return false;
-    if (rest?.docks?.length === held.length && rest.docks.every((d, i) => d === held[i])) return false;
-    return writeRestPlace({ at: placeOf(host), since: Math.floor(now), docks: held });
+    if (docks.length === 0) return false;
+    if (rest?.docks?.length === docks.length && rest.docks.every((d, i) => d === docks[i])) return false;
+    return writeRestPlace({ at: placeOf(host), since: Math.floor(now), docks });
   }
   if (!rest?.docks?.length) return false;
   const resting = restingPlace(rest, now, stations);

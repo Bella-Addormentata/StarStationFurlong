@@ -18,6 +18,8 @@ import {
 } from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
 import { classifyDockPort, holdsOurRedock, type NearEnd } from './dockRules';
+import { bindStationMoveDoc } from './stationMove';
+import { DEFAULT_STATION_RECORD, type StationMove } from './stations';
 
 const seedFor = (roomId: string): string => btoa(JSON.stringify({ roomId }));
 const SHIP = 'module-ship';
@@ -197,6 +199,66 @@ describe('applyFarDockRequest — DOCK', () => {
     );
     expect(gone).toEqual({ result: { ok: false, reason: 'gone' }, wrote: false });
     expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+});
+
+describe('applyFarDockRequest — DOCK into a room between planets', () => {
+  const now = Date.now();
+  const TUG = 'tug-room';
+  /** Under way from Sovereign to Aris, booked from the berth's own room. */
+  const transit: StationMove = {
+    stationId: 'home', welcomeRoomId: STATION, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+    toPlanetId: 'planet-aris', toSlot: 2, departAt: now - 1000, arriveAt: now + 3_600_000,
+    mode: 'thrusters', bookedAt: now - 2000, fuel: 1, fuelDrawn: 1,
+  };
+  /** The berth's room: its port free (our dock released) and these moves booked from it. */
+  function bookedRoom(...moves: StationMove[]): Y.Doc {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    for (const m of moves) doc.getMap('stationMoves').set(`move:1:${m.departAt}:${m.welcomeRoomId}`, m);
+    return doc;
+  }
+  const dockAt = (doc: Y.Doc, room: string, at: number) => applyFarDockRequest(
+    doc,
+    { kind: 'dock', farAddress: seedFor(room), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 },
+    near,
+    room,
+    at,
+  );
+
+  it('refuses while the berth\'s own room has its station in transit — a move this install never heard of — and writes nothing', () => {
+    const doc = bookedRoom(transit);
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc, STATION, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    // Before it leaves, and once it has arrived, the berth docks as usual.
+    expect(dockAt(bookedRoom(transit), STATION, transit.departAt - 1).wrote).toBe(true);
+    expect(dockAt(bookedRoom(transit), STATION, transit.arriveAt).wrote).toBe(true);
+  });
+
+  it('goes by the station this install lists the room at, whatever else its doc holds', () => {
+    const home = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const ours = { ...transit, stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: home };
+    expect(dockAt(bookedRoom(ours), home, now).result).toEqual({ ok: false, reason: 'moving' });
+    // Another station's move in that room's doc (booked before the room was
+    // part of this one) moves nothing here.
+    expect(dockAt(bookedRoom({ ...transit, welcomeRoomId: 'elsewhere' }), home, now).wrote).toBe(true);
+  });
+
+  it('refuses a tug whose tow is booked or under way — not one whose station since moves on its own', () => {
+    const tow: StationMove = { ...transit, mode: 'tug', tugRoomId: TUG, departAt: now, arriveAt: now + 600_000, bookedAt: now };
+    expect(dockAt(bookedRoom(tow), TUG, now).result).toEqual({ ok: false, reason: 'moving' });
+    // Long towed: the station now flies under its own thrusters (known here),
+    // and the tug that once towed it stays where it is.
+    const towed: StationMove = { ...tow, departAt: now - 50_000, arriveAt: now - 40_000, bookedAt: now - 50_000 };
+    const known = new Y.Doc();
+    known.getMap('stationMoves').set(`move:2:${transit.departAt}:${STATION}`, transit);
+    bindStationMoveDoc(known);
+    try {
+      expect(dockAt(bookedRoom(towed), TUG, now).wrote).toBe(true);
+    } finally {
+      bindStationMoveDoc(new Y.Doc());
+    }
   });
 });
 

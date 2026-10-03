@@ -83,7 +83,12 @@ export function isStationMove(v: unknown): v is StationMove {
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
-    && (r.bookedAt === undefined || isTime(r.bookedAt))
+    // Booked no later than it leaves: one stamped after a rival arrived
+    // would read as booked after it (concurrentMoves) and escape it. Only a
+    // move that goes nowhere may be later: a pin is written once what it
+    // records is over.
+    && (r.bookedAt === undefined || (isTime(r.bookedAt) && ((r.bookedAt as number) <= (r.departAt as number)
+      || (r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))))
     // One level only, checked before recursing: a hostile nest is refused
     // at the first step, never walked.
     && (r.settles === undefined || (typeof r.settles === 'object' && r.settles !== null
@@ -551,6 +556,40 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
     const move = station ? latestMoveOf(station) : null;
     return !!move && stationInTransit({ move }, realMs);
   });
+}
+
+/** dockLockedByMove for a room whose own doc is in hand: a far room's,
+ *  fetched for a DOCK (farDoorWrite). The moves booked in that room count
+ *  with every move known here, so a ship that has not heard of one yet
+ *  still joins no station between planets: a tow that room is the tug of,
+ *  ahead or under way, or a move of its station in transit. Its station is
+ *  the one this install lists the room at, else the one its own moves name
+ *  (a move is booked from a room of its station, a tow from the tug). */
+export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
+  const there = docOwn(doc);
+  const all = [...there, ...roomOwn(), ...readRememberedMoves()];
+  const standing = standingMoves(all, all);
+  if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
+  const station = roomId ? stationForRoom(roomId) : null;
+  const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
+  const ofRoom = (m: StationMove) => (station
+    ? moveBelongsTo(m, station)
+    : there.some((o) => !towedBy(o) && sameStation(o, m)));
+  return standing.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs));
+}
+
+/** Remember the standing moves a room's own doc holds (a far room's), as
+ *  the bound room's are (bindStationMoveDoc). */
+export function rememberMovesIn(doc: Y.Doc): void {
+  const own = docOwn(doc);
+  for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
+}
+
+/** roomOwn for a room's doc that is not the bound one. */
+function docOwn(doc: Y.Doc): StationMove[] {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return [];
+  const { entries, legacy, folded } = movesIn(doc.getMap('stationMoves'), doc.getMap('stationKeeping'));
+  return [...(legacy ? [legacy] : []), ...entries, ...folded];
 }
 
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
@@ -1085,22 +1124,30 @@ function writerOf(key: string, prefix: string): string {
   return cut > 0 ? rest.slice(0, cut) : rest;
 }
 
-/** Every move this room's doc holds (a bounded scan): its entries (with
- *  their keys), a legacy record, each writer's best settled record, the
- *  entries bundled past the caps, and the keys that hold junk or a settled
- *  record another covers. A bundle's items unpack within their own budget,
- *  each in its place: a record as its writer's (key null: never stale, its
- *  bundle holds others), an entry once per key. */
-function roomMoves(): {
+/** What a room's doc holds of the move log (roomMoves). */
+interface RoomMoves {
   entries: StationMove[];
   keyed: Array<{ key: string; move: StationMove }>;
   legacy: StationMove | null;
   settled: Map<string, SettledMoves & { key: string | null }>;
   folded: StationMove[];
   stale: string[];
-} {
+}
+
+/** Every move this room's doc holds (a bounded scan): its entries (with
+ *  their keys), a legacy record, each writer's best settled record, the
+ *  entries bundled past the caps, and the keys that hold junk or a settled
+ *  record another covers. A bundle's items unpack within their own budget,
+ *  each in its place: a record as its writer's (key null: never stale, its
+ *  bundle holds others), an entry once per key. */
+function roomMoves(): RoomMoves {
+  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled: new Map(), folded: [], stale: [] };
+  return movesIn(moveMap!, keepMap!);
+}
+
+/** roomMoves over any room's maps: its 'stationMoves' and 'stationKeeping'. */
+function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
   const settled = new Map<string, SettledMoves & { key: string | null }>();
-  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled, folded: [], stale: [] };
   const keyed: Array<{ key: string; move: StationMove }> = [];
   const folded = new Map<string, StationMove>();
   const stale: string[] = [];
@@ -1116,7 +1163,7 @@ function roomMoves(): {
       });
     } else if (key) stale.push(key);
   };
-  for (const [k, v] of moveMap!.entries()) {
+  for (const [k, v] of moveLog.entries()) {
     // Every key visited counts, whatever it holds: the walk itself is bounded.
     if (++scanned > MOVE_SCAN_MAX) break;
     if (k.startsWith(SETTLED_PREFIX)) {
@@ -1138,7 +1185,7 @@ function roomMoves(): {
     else stale.push(k);
   }
   return {
-    entries: keyed.map((e) => e.move), keyed, legacy: validMove(keepMap!.get(LEGACY_KEY)), settled, folded: [...folded.values()], stale,
+    entries: keyed.map((e) => e.move), keyed, legacy: validMove(keep.get(LEGACY_KEY)), settled, folded: [...folded.values()], stale,
   };
 }
 

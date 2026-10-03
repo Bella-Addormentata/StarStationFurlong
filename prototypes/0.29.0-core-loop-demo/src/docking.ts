@@ -226,7 +226,10 @@ export type FarDockResult =
         /** The berth holds a dock of this very port with another stamp — a
          *  claim made at the same moment that the CRDT kept, or one made
          *  from the far side: it stands, this one yields (and may join it). */
-        | "superseded";
+        | "superseded"
+        /** 🚚 The berth's own room holds a move that has its station between
+         *  planets (or its tow under way): nothing was written there. */
+        | "moving";
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
       /** With `unreachable`: the far write WAS made, but its acknowledgment
@@ -2928,6 +2931,16 @@ export class DoorDockingPortSystem {
         this.setDockOp(
           doorId,
           { note: `Another DOCK of this port reached ${name} at the same moment — that one stands.`, tone: "warn" },
+          roomId,
+        );
+        return false;
+      }
+      if (!far.ok && far.reason === "moving") {
+        // 🚚 A move this install had not heard of: the berth wrote nothing,
+        // and neither does this side.
+        this.setDockOp(
+          doorId,
+          { note: "That station is moving between planets — dock when it arrives.", tone: "bad" },
           roomId,
         );
         return false;

@@ -73,7 +73,7 @@
 
 import * as Y from 'yjs';
 import type { DoorWall } from './doorLayoutDoc';
-import { isAcceptableDoorKey } from './doorsDoc';
+import { MAX_PAIRINGS, isAcceptableDoorKey } from './doorsDoc';
 import {
   adriftPlace,
   DEFAULT_STATIONS,
@@ -951,8 +951,10 @@ export interface RestPlace {
   from?: string;
 }
 
-/** Most dock doors a rest record names: a ship has a handful of ports. */
-export const MAX_REST_DOCKS = 8;
+/** Most dock doors a rest record names: every door record a complete
+ *  snapshot of the room holds (doorsDoc.readAllDoorsIfComplete), so none of
+ *  the docks holding the ship is ever left out. */
+export const MAX_REST_DOCKS = MAX_PAIRINGS;
 
 export function isRestPlace(v: unknown): v is RestPlace {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;

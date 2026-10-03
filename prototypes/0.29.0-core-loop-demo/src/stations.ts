@@ -182,7 +182,8 @@ export function stationInTransit(station: Pick<StationRecord, 'move'>, nowMs: nu
  *  another planet, say) but does not list: its record's planet and slot,
  *  and its latest move. The orbit it holds counts as taken, and the slot its
  *  move is bound for as reserved, wherever a slot is chosen or an arrival
- *  settled; it never becomes a ship's destination. */
+ *  settled; it never becomes a ship's destination, unless the atlas knows
+ *  its rooms (then it is listed: placeStations). */
 export interface KnownPlace { welcomeRoomId: string; planetId: string; orbitSlot: number; move?: StationMove }
 
 let knownPlacesResolver: (() => KnownPlace[]) | null = null;
@@ -499,7 +500,8 @@ function placeStations(
     welcomeRoomId: string;
     base: { planetId: string; orbitSlot: number };
     move: StationMove | null;
-    /** False for a station heard of: it takes its slot, and is never listed. */
+    /** False for a station heard of whose rooms the atlas does not know: it
+     *  takes its slot, and is never listed. */
     listed: boolean;
     make: (planetId: string, orbitSlot: number, move: StationMove | undefined) => StationRecord;
   }
@@ -523,29 +525,46 @@ function placeStations(
     });
   }
 
+  // A room name is peer-written and not shape-checked on every path.
+  const atlasName = (rid: string): string => {
+    const name: unknown = atlas[rid]?.name;
+    return (typeof name === 'string' && name ? name : 'STATION').slice(0, MAX_NAME_LENGTH);
+  };
+
   // The stations heard of (planet summaries, around other planets mostly)
   // that nothing here lists: each takes part in the slots below as it does
-  // on an install that lists it, so both settle every slot alike, but none
-  // is listed (no ship flies to a station this install cannot place). A
-  // room the atlas knows is left to the station listed for it. Its move is
-  // the installed resolver's, as a listed station's is: that has heard the
-  // summary's move too (planetSummary remembers it), so its answer is what
-  // stands, null included (a tow outbid for its tug flies nowhere). Only
-  // with no resolver does the summary's own move stand in.
-  for (const p of knownPlaces(candidates.map((c) => c.welcomeRoomId))) {
+  // on an install that lists it, so both settle every slot alike. One whose
+  // rooms the atlas does not know is never listed (no ship flies to a
+  // station this install cannot place). One whose rooms it knows, though no
+  // record here claims them (a learned record pruned once it was at another
+  // planet, say), is listed as the station derived for those rooms, but
+  // where its summary has it and by its welcome room, so its slot and the
+  // one its move is bound for stay its own. Its move is the installed
+  // resolver's, as a listed station's is: that has heard the summary's move
+  // too (planetSummary remembers it), so its answer is what stands, null
+  // included (a tow outbid for its tug flies nowhere). Only with no resolver
+  // does the summary's own move stand in. Taken in welcome room order, so
+  // two summaries of one station's rooms pick the same one everywhere.
+  const heardOf = [...knownPlaces(candidates.map((c) => c.welcomeRoomId))]
+    .sort((a, b) => (a.welcomeRoomId < b.welcomeRoomId ? -1 : a.welcomeRoomId > b.welcomeRoomId ? 1 : 0));
+  for (const p of heardOf) {
     const where = placeOf(p.welcomeRoomId);
-    if (!where.startsWith('room:') || places.has(where)) continue;
+    if (places.has(where)) continue;
     if (typeof p.planetId !== 'string' || !Number.isInteger(p.orbitSlot) || p.orbitSlot < 0 || p.orbitSlot >= MAX_ORBIT_SLOTS) continue;
+    const inAtlas = !where.startsWith('room:');
+    if (inAtlas && DERIVED_PREFIX.length + p.welcomeRoomId.length > MAX_ID_LENGTH) continue;
     places.add(where);
-    const stub = { id: `${HEARD_PREFIX}${p.welcomeRoomId}`, welcomeRoomId: p.welcomeRoomId };
+    const stub = { id: `${inAtlas ? DERIVED_PREFIX : HEARD_PREFIX}${p.welcomeRoomId}`, welcomeRoomId: p.welcomeRoomId };
+    const name = inAtlas ? atlasName(p.welcomeRoomId) : 'STATION';
     candidates.push({
       id: stub.id,
       welcomeRoomId: p.welcomeRoomId,
       base: { planetId: planetById(p.planetId).id, orbitSlot: p.orbitSlot },
       move: moveResolver ? moveOf(stub) : p.move && moveBelongsTo(p.move, stub) ? p.move : null,
-      listed: false,
+      listed: inAtlas,
       make: (planetId, orbitSlot, move) => ({
-        id: stub.id, name: 'STATION', planetId, orbitSlot, welcomeRoomId: p.welcomeRoomId, ...(move ? { move } : {}),
+        id: stub.id, name, planetId, orbitSlot, welcomeRoomId: p.welcomeRoomId,
+        ...(inAtlas ? { derived: true } : {}), ...(move ? { move } : {}),
       }),
     });
   }
@@ -561,9 +580,7 @@ function placeStations(
       .sort();
     const anchor = known[0];
     if (!anchor) return;
-    // A room name is peer-written and not shape-checked on every path.
-    const name: unknown = atlas[anchor].name;
-    derived.push({ anchor, name: (typeof name === 'string' && name ? name : 'STATION').slice(0, MAX_NAME_LENGTH) });
+    derived.push({ anchor, name: atlasName(anchor) });
   });
   derived.sort((a, b) => (a.anchor < b.anchor ? -1 : a.anchor > b.anchor ? 1 : 0));
   const firstDerived = candidates.length;
@@ -702,7 +719,7 @@ function placeStations(
 
   // Listed in record order, derived stations last. A station that never
   // moved and finds no slot (its planet is full) is dropped, and a station
-  // heard of is never listed.
+  // only heard of is never listed.
   const listed: StationRecord[] = [];
   const heard: StationRecord[] = [];
   candidates.forEach((c, i) => {

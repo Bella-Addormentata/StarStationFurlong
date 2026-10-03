@@ -39,6 +39,7 @@ import {
 import {
   bindShipDoc,
   isRestPlace,
+  MAX_REST_DOCKS,
   readFlightRecord,
   readRestPlace,
   readStationBerth,
@@ -666,6 +667,49 @@ describe('where a ship with no live dock is', () => {
     expect(shipPlaceId(readFlightRecord(), now + 10_000)).toBe(was);
   });
 
+  it('names every dock holding the ship, so one that lets go after a move still counts', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    const ports = Array.from({ length: 9 }, (_, i) => `d:port${i}`);
+    writeFlightRecord({ status: 'docked', locationId: 'furlong-station' });
+    for (const p of ports) {
+      writeDoorPairing(p, seed, buildDoorPairing(seed, {
+        segments: dockChain(), farDoor: `d:bay${p}`, farWall: 'y+', transient: true, dockedAt: now - 30_000,
+      }));
+    }
+    expect(keepRestPlace('ship-room', now)).toBe(true);
+    expect(readRestPlace()?.docks).toEqual(ports);
+    // Eight let go, with nobody aboard to record it; the ninth carries the
+    // ship to Aris with Furlong, and lets go there.
+    for (const p of ports.slice(0, 8)) writeDoorTombstone(p, seed, { farDoor: `d:bay${p}`, undockedAt: now + 1000 });
+    expect(writeStationMove({
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now + 2000, arriveAt: now + 10_000,
+      mode: 'thrusters', bookedAt: now + 1500, fuel: 1, fuelDrawn: 0,
+    })).toBe(true);
+    writeDoorTombstone(ports[8], seed, { farDoor: `d:bay${ports[8]}`, undockedAt: now + 20_000 });
+    const atAris = listStations(undefined, undefined, now + 21_000).find((st) => st.id === 'furlong-station')!;
+    expect(atAris.planetId).toBe('planet-aris');
+    expect(restingPlace(readRestPlace()!, now + 21_000)).toMatchObject({
+      at: adriftAt('planet-aris', atAris.orbitSlot), releasedAt: now + 20_000,
+    });
+    expect(shipPlaceId(readFlightRecord(), now + 21_000)).toBe('furlong-station');
+    // Recorded only off a snapshot that holds every door: a flood of keys
+    // could hide a dock.
+    const junk = Array.from({ length: 300 }, (_, i) => `junk${i}`);
+    doc.transact(() => { for (const k of junk) doc.getMap('doors').set(k, 1); });
+    expect(keepRestPlace('ship-room', now + 21_000)).toBe(false);
+    doc.transact(() => { for (const k of junk) doc.getMap('doors').delete(k); });
+    expect(keepRestPlace('ship-room', now + 21_000)).toBe(true);
+    expect(readRestPlace()).toEqual({ at: adriftAt('planet-aris', atAris.orbitSlot), since: now + 20_000, from: 'furlong-station' });
+  });
+
   it('takes a ship docked by hand from open orbit wherever its dock carries it', () => {
     const doc = new Y.Doc();
     bindShipDoc(doc);
@@ -723,7 +767,9 @@ describe('where a ship with no live dock is', () => {
     expect(isRestPlace({ at: 'furlong-station', since: 5 })).toBe(false);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: -1 })).toBe(false);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, docks: ['no such door'] })).toBe(false);
-    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, docks: Array.from({ length: 9 }, (_, i) => `d:${i}`) })).toBe(false);
+    const ports = (n: number) => Array.from({ length: n }, (_, i) => `d:${i}`);
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, docks: ports(MAX_REST_DOCKS) })).toBe(true);
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, docks: ports(MAX_REST_DOCKS + 1) })).toBe(false);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 'furlong-station' })).toBe(true);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 7 })).toBe(false);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 'x'.repeat(129) })).toBe(false);

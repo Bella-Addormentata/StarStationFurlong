@@ -278,7 +278,7 @@ const AXIS_IDS = ['x+', 'x-', 'y+', 'y-'] as const;
  *  before, whatever a peer wrote we read exactly four entries. Mirrors the
  *  station atlas's MAX_ENTRIES discipline. */
 const MAX_KEY_LEN = 64;
-const MAX_PAIRINGS = 64;
+export const MAX_PAIRINGS = 64;
 /** Most keys readAllDoorsIfComplete looks at, junk included: a peer can write
  *  any number of keys no reader keeps, and a room's own doors fit well inside
  *  (as stationAtlas bounds the raw door list it ingests). */

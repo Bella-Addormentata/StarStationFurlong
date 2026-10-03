@@ -73,6 +73,7 @@ import {
   stationInTransit,
 } from './stations';
 import type { KnownPlace, StationRecord } from './stations';
+import type { AtlasEntry } from './stationAtlas';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -447,6 +448,44 @@ describe('the station list follows a move', () => {
     expect(listed.some((s) => s.planetId === ARIS)).toBe(false);
     expect(knownSlotsAround(ARIS, listed.map((s) => s.welcomeRoomId), NOW)).toEqual({ taken: new Set([0, 1]), reserved: new Set() });
     expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(2);
+  });
+
+  it('places a station whose rooms no record claims where its summary has it, by its welcome room', () => {
+    // A learned station dropped once this install was at another planet: its
+    // rooms are still in the atlas, and its summary says where it is. Its
+    // welcome room is the room the atlas would derive it from, and then not.
+    for (const [w, v] of [['a-room', 'b-room'], ['w-room', 'v-room']]) {
+      const atlas: Record<string, AtlasEntry> = {
+        [w]: { roomId: w, name: 'HUB', doors: { 'x+': { targetSeed: `ssf://room#room=${v}`, targetRoomId: v } }, lastSeen: 0 },
+        [v]: { roomId: v, name: 'ANNEX', doors: {}, lastSeen: 0 },
+      };
+      const ofIt = (list: StationRecord[]) => list.filter((s) => s.welcomeRoomId === w || s.welcomeRoomId === v);
+      // Never moved, around Aris: listed there once, its slot taken.
+      setKnownPlacesResolver(() => [{ welcomeRoomId: w, planetId: ARIS, orbitSlot: 0 }]);
+      let listed = listStations(atlas, [], NOW);
+      expect(ofIt(listed)).toEqual([{ id: `station:${w}`, name: 'HUB', planetId: ARIS, orbitSlot: 0, welcomeRoomId: w, derived: true }]);
+      expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(1);
+      // On its way there from Sovereign: the slot it is bound for stays booked.
+      const inbound: StationMove = {
+        ...moveTo(), stationId: 'hub', welcomeRoomId: w, fromPlanetId: SOV, fromSlot: 6, toPlanetId: ARIS, toSlot: 0,
+      };
+      setKnownPlacesResolver(() => [{ welcomeRoomId: w, planetId: SOV, orbitSlot: 6, move: inbound }]);
+      setStationMoveResolver((st) => (st.welcomeRoomId === w ? inbound : null));
+      listed = listStations(atlas, [], NOW);
+      expect(ofIt(listed)).toEqual([expect.objectContaining({ id: `station:${w}`, planetId: SOV, orbitSlot: 6, move: inbound })]);
+      expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(1);
+      setStationMoveResolver(null);
+      // Two summaries naming its rooms, in either order: one station, the
+      // same one everywhere (the first welcome room).
+      const both: KnownPlace[] = [{ welcomeRoomId: v, planetId: ARIS, orbitSlot: 5 }, { welcomeRoomId: w, planetId: ARIS, orbitSlot: 0 }];
+      const first = w < v ? both[1] : both[0];
+      for (const order of [both, [...both].reverse()]) {
+        setKnownPlacesResolver(() => order);
+        expect(ofIt(listStations(atlas, [], NOW))).toEqual([expect.objectContaining({
+          welcomeRoomId: first.welcomeRoomId, planetId: ARIS, orbitSlot: first.orbitSlot,
+        })]);
+      }
+    }
   });
 
   it('bounces an arrival off a planet it only knows is full from the summaries', () => {
@@ -1152,13 +1191,39 @@ describe('tugs: a torch tow', () => {
     expect(isStationMove({ ...base, settles: { ...base } })).toBe(true);
   });
 
+  it('refuses a move booked after it leaves: only a pin is written once what it records is over', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    // A peer's rival of that tow, leaving beside it but stamped as booked
+    // once it landed: it would read as booked after it (concurrentMoves), so
+    // neither would beat the other and both would be paid for.
+    const rival: StationMove = {
+      ...tow, toSlot: tow.toSlot + 1, tugRoomId: 'other-tug',
+      departAt: tow.departAt + 1, arriveAt: tow.arriveAt + 1, bookedAt: tow.arriveAt + 1,
+    };
+    expect(concurrentMoves(tow, rival)).toBe(false);
+    expect(isStationMove(rival)).toBe(false);
+    expect(isStationMove({ ...rival, bookedAt: rival.departAt })).toBe(true);
+    // One that goes nowhere (a pin) may be stamped later.
+    expect(isStationMove({ ...rival, toPlanetId: rival.fromPlanetId, toSlot: rival.fromSlot })).toBe(true);
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    writeStationMove(tow);
+    doc.getMap('stationMoves').set(`move:9:${rival.departAt}:${rival.welcomeRoomId}`, rival);
+    expect(readMoveFuelDrawn()).toBe(tow.fuel);
+    expect(readStationMove()).toEqual(cleanMove(tow));
+  });
+
   it('cancels every tow a tug left behind, not only the latest', () => {
     const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
     const a = plan.move;
     // Two offline tabs of one tug each towed another station (the second
     // booked first, so the first outranks it).
-    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt - 1 };
+    const b: StationMove = {
+      ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt - 1, bookedAt: a.departAt - 1,
+    };
     const d1 = new Y.Doc(); d1.clientID = 1;
     const d2 = new Y.Doc(); d2.clientID = 2;
     bindStationMoveDoc(d1);
