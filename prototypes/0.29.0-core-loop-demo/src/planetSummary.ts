@@ -804,8 +804,12 @@ export function foldOwnStation(
   now: number,
   firstHandRoom?: string,
   readChanged = false,
+  gatesRead = true,
 ): StationSummary | null {
   const past = (at: number) => Math.min(Math.max(now, at + 1), now + MAX_SKEW_MS);
+  // ⚓🚦 That room's gates are first-hand only once this visit has read them
+  // (`gatesRead`); until then they are the atlas's older copy, like any other.
+  const gateRoom = gatesRead ? firstHandRoom : undefined;
   // The trim read first-hand from the room this client stands in: stamped
   // as that room's reading, past any earlier reading of it.
   const readTrim = (known?: StationSummary): SharedTrim | null => {
@@ -830,7 +834,9 @@ export function foldOwnStation(
     if (!mine.berths) return {};
     const read = new Map<string, number>();
     for (const room of roomStamps(mine).keys()) read.set(room, 0);
-    if (firstHandRoom !== undefined) read.set(firstHandRoom, at);
+    // Not read yet this visit, the room goes out stamped 0 too (even listing
+    // no gate), so its reading, once taken, is news over it.
+    if (firstHandRoom !== undefined) read.set(firstHandRoom, gateRoom !== undefined ? at : 0);
     const rooms = canonRoomStamps(mine.berths, at, read);
     return { berths: mine.berths, berthsAt: at, ...(rooms ? { berthRoomsAt: rooms } : {}) };
   };
@@ -875,14 +881,16 @@ export function foldOwnStation(
   // list merges on its own: it starts from what is known, whichever record
   // stands (an owned record's edit is not news about the gates).
   let gates: Gates = gatesOf(known);
-  if (mine.berths && known.berths && firstHandRoom !== undefined) {
-    const listed = firstHandBerths(known.berths, mine.berths, firstHandRoom);
+  if (mine.berths && known.berths && gateRoom !== undefined) {
+    const listed = firstHandBerths(known.berths, mine.berths, gateRoom);
     const stamps = roomStamps(known);
-    const mineHere = JSON.stringify(mine.berths.filter((b) => b.roomId === firstHandRoom));
-    const knownHere = JSON.stringify(known.berths.filter((b) => b.roomId === firstHandRoom));
-    if (mineHere !== knownHere) {
-      const at = past(stamps.get(firstHandRoom) ?? known.berthsAt ?? 0);
-      stamps.set(firstHandRoom, at);
+    const mineHere = JSON.stringify(mine.berths.filter((b) => b.roomId === gateRoom));
+    const knownHere = JSON.stringify(known.berths.filter((b) => b.roomId === gateRoom));
+    // A room known only as gossip (stamped 0, as this client's own list goes
+    // out before it has read the room) is news once read, changed or not.
+    if (mineHere !== knownHere || stamps.get(gateRoom) === 0) {
+      const at = past(stamps.get(gateRoom) ?? known.berthsAt ?? 0);
+      stamps.set(gateRoom, at);
       const berthsAt = Math.max(known.berthsAt ?? 0, at);
       const rooms = canonRoomStamps(listed, berthsAt, stamps);
       gates = { berths: listed, berthsAt, ...(rooms ? { berthRoomsAt: rooms } : {}) };
@@ -1024,6 +1032,11 @@ export interface PlanetSummaryContext {
    *  first-hand there, so a trim that room takes back spreads. Optional:
    *  without it trims only merge by burn time. */
   currentRoom?: () => string | null;
+  /** ⚓🚦 Has this visit read the gates of that room yet (main.ts's harvest,
+   *  once the room's state has landed)? Until it has, the atlas holds them
+   *  from an earlier visit or from gossip: they go out as such, never past a
+   *  newer reading. Optional: without it they count as read. */
+  gatesReadHere?: () => boolean;
 }
 
 let doc: Y.Doc | null = null;
@@ -1172,7 +1185,10 @@ export function publishPlanetSummary(now = Date.now()): void {
   if (here && here.welcomeRoomId && here.welcomeRoomId.length <= MAX_ID_LEN) {
     const room = ctx.currentRoom?.() || currentRoomId() || undefined;
     const local = ctx.localTrim();
-    const next = foldOwnStation(store.stations[here.welcomeRoomId], here, local, now, room, room !== undefined && readingChanged(room, local));
+    const next = foldOwnStation(
+      store.stations[here.welcomeRoomId], here, local, now, room, room !== undefined && readingChanged(room, local),
+      ctx.gatesReadHere?.() ?? true,
+    );
     if (next) store.stations[here.welcomeRoomId] = next;
   }
   // Every other known station's latest move this install remembers goes out

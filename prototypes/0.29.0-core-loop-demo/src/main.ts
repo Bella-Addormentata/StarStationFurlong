@@ -1632,6 +1632,8 @@ async function joinRoomAtEpoch(
     // planet is not placed yet also reads null from planetShipStatus.
     // Its trim (localTrim) is read here, so a trim this room takes back spreads.
     currentRoom: () => activeBootstrap?.roomId || null,
+    // ⚓🚦 Its gates are news only once this visit's harvest has read them.
+    gatesReadHere: () => gatesReadIn !== null && gatesReadIn === activeBootstrap?.roomId,
     notShipRoom: () => {
       const roomId = activeBootstrap?.roomId ?? "";
       if (!roomId) return null;
@@ -3648,7 +3650,12 @@ function renderPhonePlayersList(): void {
 let atlasHarvestArmed = false;
 export function setAtlasHarvestArmed(on: boolean): void {
   atlasHarvestArmed = on;
+  if (!on) gatesReadIn = null;
 }
+/** ⚓🚦 The room whose gates this visit has read (its harvest, once the
+ *  room's state landed): until then the planet summary does not take the
+ *  atlas's copy of them, which may be an earlier visit's, as news. */
+let gatesReadIn: string | null = null;
 
 function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
@@ -3726,6 +3733,8 @@ function harvestStationAtlas(): void {
     roomId, name, seed, dims: readRoomDims(), doors,
     ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : { gates: null }),
   });
+  // Before the push below, whose write publishes the planet summary again.
+  gatesReadIn = roomId;
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
   pushAtlasToDoc();
