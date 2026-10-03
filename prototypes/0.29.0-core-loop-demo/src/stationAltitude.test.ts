@@ -46,8 +46,11 @@ import {
   planStationAltitude,
   planStationMove,
   readMoveFuelDrawn,
+  readRememberedMoves,
   readStationMove,
   rememberMove,
+  MOVE_FINAL_MS,
+  MOVE_LOG_KEEP_MS,
   stationAltitudeKm,
   stationPointWithMoveAt,
   writeStationMove,
@@ -464,7 +467,7 @@ describe('Copilot round 1', () => {
     const climbed = { ...ctx().station!, orbit: { radiusKm: SOV_R + 1_000, phase0: 0.5 } };
     const plan = planStationMove(ctx({ station: climbed }), 'planet-aris');
     if (!plan.ok) throw new Error(plan.refusal);
-    expect(plan.move.fromOrbit).toEqual(climbed.orbit);
+    expect(plan.move.fromOrbit).toEqual({ ...climbed.orbit, since: ORBIT_EPOCH_MS });
     expect(isStationMove(plan.move)).toBe(true);
     expect(cleanMove(plan.move)).toEqual(plan.move);
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? plan.move : null));
@@ -816,5 +819,63 @@ describe('Copilot round 11', () => {
     expect(isStationMove(mk(slotR + 15))).toBe(true); // a trimmed slot orbit
     expect(isStationMove(mk(SOV_R + 1_020))).toBe(false);
     expect(isStationMove(mk(SOV_R + 1_020, NOW - 10))).toBe(true);
+  });
+});
+
+describe('Copilot round 13', () => {
+  it('keeps an old claim that still beats some station\'s latest altitude change remembered', () => {
+    store.clear();
+    const aHold = climbOf('a', 'a-room', 0, 1_000, NOW);
+    const nextAt = aHold.arriveAt + 1_000;
+    const nextPlan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, aHold.orbit!.toPhase0), SOV_R + 3_000, nextAt)!;
+    const aNext: StationMove = {
+      ...aHold, departAt: nextPlan.departAt, arriveAt: nextPlan.arriveAt, bookedAt: nextAt,
+      orbit: {
+        fromRadiusKm: nextPlan.from.radiusKm, fromPhase0: nextPlan.from.phase0, toRadiusKm: nextPlan.to.radiusKm,
+        toPhase0: nextPlan.to.phase0, fromSince: NOW,
+      },
+    };
+    const next2At = aNext.arriveAt + 1_000;
+    const next2Plan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 3_000, nextPlan.to.phase0), SOV_R + 2_000, next2At)!;
+    const aNext2: StationMove = {
+      ...aHold, departAt: next2Plan.departAt, arriveAt: next2Plan.arriveAt, bookedAt: next2At,
+      orbit: {
+        fromRadiusKm: next2Plan.from.radiusKm, fromPhase0: next2Plan.from.phase0, toRadiusKm: next2Plan.to.radiusKm,
+        toPhase0: next2Plan.to.phase0, fromSince: nextAt,
+      },
+    };
+    const bLose = climbOf('b', 'b-room', 1, 1_020, aHold.arriveAt + 500);
+    expect(isStationMove(aNext)).toBe(true);
+    expect(isStationMove(aNext2)).toBe(true);
+    expect(lostAltitudeClaims([aHold, aNext, aNext2, bLose]).has(altitudeMoveKey(bLose))).toBe(true);
+    // A's latest alone no longer shows the 1,000 km claim that beat B.
+    expect(lostAltitudeClaims([aNext2, bLose]).has(altitudeMoveKey(bLose))).toBe(false);
+    const late = Math.max(aNext2.arriveAt, bLose.arriveAt) + MOVE_LOG_KEEP_MS + MOVE_FINAL_MS + 10_000_000;
+    const soon = aNext2.arriveAt + 1_000;
+    for (const m of [aHold, aNext, aNext2, bLose]) rememberMove(m, soon);
+    expect(readRememberedMoves()).toHaveLength(4);
+    // Time passes: the next move learned trims the history.
+    const cMove = climbOf('c', 'c-room', 3, 6_000, late);
+    expect(rememberMove(cMove, late)).toBe(true);
+    // Only what decides it is kept: aNext's stamped source claim suffices.
+    expect(readRememberedMoves().map(altitudeMoveKey).sort()).toEqual([aNext, aNext2, bLose, cMove].map(altitudeMoveKey).sort());
+    expect(lostAltitudeClaims(readRememberedMoves()).has(altitudeMoveKey(bLose))).toBe(true);
+    // With no loser left to decide, old history ages out as usual.
+    store.clear();
+    for (const m of [aHold, aNext, aNext2]) rememberMove(m, soon);
+    rememberMove(cMove, late);
+    expect(readRememberedMoves().map(altitudeMoveKey).sort()).toEqual([aNext2, cMove].map(altitudeMoveKey).sort());
+    store.clear();
+  });
+
+  it('refuses an unstamped held orbit that is not the slot\'s own', () => {
+    const climbed = { ...ctx().station!, orbit: { radiusKm: SOV_R + 1_000, phase0: 0.5 } };
+    const plan = planStationMove(ctx({ station: climbed }), 'planet-aris');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(isStationMove(plan.move)).toBe(true);
+    const { since: _s, ...bare } = plan.move.fromOrbit!;
+    expect(isStationMove({ ...plan.move, fromOrbit: bare })).toBe(false);
+    const slotR = orbitForSlot(SOV, plan.move.fromSlot).radiusKm;
+    expect(isStationMove({ ...plan.move, fromOrbit: { radiusKm: slotR + 10, phase0: 0 } })).toBe(true);
   });
 });

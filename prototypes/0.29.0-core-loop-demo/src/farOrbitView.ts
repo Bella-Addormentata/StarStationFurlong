@@ -128,7 +128,12 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
       : latest.departAt < latest.settles.arriveAt ? undefined
       : latest.settles;
     if (moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now && betweenPlanets(moved)) {
-      return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot };
+      // 🎚️ At the altitude it flew there when the ship left: the orbit an
+      // altitude change since then left, else the one this move left.
+      const climb = altitudeChangesSince(station, leftAt, now)[0]?.orbit;
+      const orbit = climb ? { radiusKm: climb.fromRadiusKm, phase0: climb.fromPhase0 }
+        : moved.fromOrbit ? { radiusKm: moved.fromOrbit.radiusKm, phase0: moved.fromOrbit.phase0 } : undefined;
+      return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot, ...(orbit ? { orbit } : {}) };
     }
     // 🎚️ Likewise an altitude change since the ship left, found among every
     // move known (a later booking can hide it from the latest): the flight

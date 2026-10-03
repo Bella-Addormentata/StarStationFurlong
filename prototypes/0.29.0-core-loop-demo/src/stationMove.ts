@@ -144,7 +144,7 @@ function sourceClaimOf(station: StationRecord): { fromSince?: number } {
 function heldOrbitOf(station: StationRecord): { fromOrbit?: NonNullable<StationMove['fromOrbit']> } {
   if (!station.orbit) return {};
   const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
-  return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, ...(isTime(since) ? { since } : {}) } };
+  return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, since: isTime(since) ? since : ORBIT_EPOCH_MS } };
 }
 
 function claimedByBooking(since: number | undefined, bookedAt: number): boolean {
@@ -168,7 +168,11 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.orbit === undefined || r.mode === 'orbit')
     && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)
-      && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)))
+      && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)
+      // Unstamped, it could never be weighed against other claims: only
+      // the slot's own orbit (trimmed, perhaps) goes without (orbitChangeFits).
+      && ((r.fromOrbit as { since?: number }).since !== undefined
+        || Math.abs(r.fromOrbit.radiusKm - orbitForSlot(r.fromPlanetId as string, r.fromSlot as number).radiusKm) <= MAX_TRIM_KM + 1e-6)))
     && (r.bookedAt === undefined || isTime(r.bookedAt))
     // 🎚️ The orbit it leaves was claimed by the time it was booked: claims
     // are weighed in time order, so a later stamp would jump the queue.
@@ -1157,15 +1161,40 @@ function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
   }
   const bests: StationMove[] = [];
   const history: StationMove[] = [];
+  const dropped: StationMove[] = [];
   for (const g of groups) {
     g.sort((x, y) => compareMoves(y, x));
     bests.push(g[0]);
-    history.push(...g.slice(1).filter((m) => m.arriveAt >= since).slice(0, HISTORY_PER_STATION));
+    const recent = g.slice(1).filter((m) => m.arriveAt >= since).slice(0, HISTORY_PER_STATION);
+    history.push(...recent);
+    dropped.push(...g.slice(1).filter((m) => !recent.includes(m)));
   }
   const byFinish = (x: StationMove, y: StationMove) => y.arriveAt - x.arriveAt;
   const keptBests = bests.sort(byFinish).slice(0, MAX_REMEMBERED);
-  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length);
-  return [...keptBests, ...keptHistory];
+  const evidence = altitudeEvidence(keptBests, history, dropped).slice(0, MAX_REMEMBERED - keptBests.length);
+  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length - evidence.length);
+  return [...keptBests, ...evidence, ...keptHistory];
+}
+
+/** 🎚️ Of the moves history would drop (too old, or past a station's cap),
+ *  those an altitude change that is still some station's best move needs to
+ *  stay lost: a claim that beat it ages out of history only by being kept
+ *  here, or the loser would be accepted later, unflown and unpaid. Each is
+ *  tried without, oldest first, and kept only if the losses change. */
+function altitudeEvidence(bests: StationMove[], history: StationMove[], dropped: StationMove[]): StationMove[] {
+  const losers = (moves: StationMove[]) => {
+    const lost = lostAltitudeClaims(flownAmong(moves));
+    return bests.filter((b) => b.mode === 'orbit' && !b.settles && lost.has(altitudeMoveKey(b))).map(altitudeMoveKey).join('\n');
+  };
+  if (dropped.length === 0 || !bests.some((b) => b.mode === 'orbit' && !b.settles)) return [];
+  let kept = [...dropped];
+  const want = losers([...bests, ...history, ...kept]);
+  if (!want) return [];
+  for (const m of [...dropped].sort((x, y) => x.arriveAt - y.arriveAt)) {
+    const without = kept.filter((k) => k !== m);
+    if (losers([...bests, ...history, ...without]) === want) kept = without;
+  }
+  return kept;
 }
 
 let notifyQueued = false;
