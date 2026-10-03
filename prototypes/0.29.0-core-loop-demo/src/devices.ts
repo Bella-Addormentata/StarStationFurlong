@@ -2179,7 +2179,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const engines = countFunction('engine');
     const helms = countFunction('helm');
     const capacity = tanks * TANK_CAPACITY;
-    const fuel = clampFuelToCapacity(readFuelLevel(), capacity);
+    const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
     const flight = readFlightRecord();
     const commander = helmIsCommander();
     const chained = enumerateChainedDoors();
@@ -2415,7 +2415,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Re-check every input at click time — the picker + doc state may have
       // moved between render and click (a peer just bolted on a gangway).
       const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
-      const nowFuel = clampFuelToCapacity(readFuelLevel(), nowCapacity);
+      const nowFuel = clampFuelToCapacity(readFuelLevel(nowCapacity), nowCapacity);
       const nowFlight = readFlightRecord();
       const fromId = shipLocationId(nowFlight, hasLiveDock());
       const destId = pickerDestId ?? '';
