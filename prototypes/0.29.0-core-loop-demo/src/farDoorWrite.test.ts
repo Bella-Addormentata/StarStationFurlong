@@ -59,6 +59,14 @@ describe('applyFarDockRequest — UNDOCK', () => {
     expect(rec && !rec.paired && rec.dock).toEqual({ farDoor: near.doorId, farWall: 'x-', farLateral: 0, undockedAt: 200 });
   });
 
+  it('keeps on the far tombstone where our end\'s station let go, when the request says', () => {
+    const doc = stationDoc();
+    const at = 'adrift:planet-aris:3';
+    applyFarDockRequest(doc, { kind: 'undock', farAddress: seedFor(STATION), nearDoorId: near.doorId, undockedAt: 200, at }, near);
+    const rec = readAllDoorsFrom(doc).get('d:bay');
+    expect(rec && !rec.paired && rec.dock).toEqual({ farDoor: near.doorId, farWall: 'x-', farLateral: 0, undockedAt: 200, at });
+  });
+
   it('writes nothing when the far side no longer holds our dock', () => {
     const doc = stationDoc();
     doc.getMap('doors').set('d:bay', buildDoorPairing(seedFor('someone-else'), { segments: dockChain() }));

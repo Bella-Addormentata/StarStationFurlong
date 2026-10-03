@@ -761,6 +761,43 @@ describe('where a ship with no live dock is', () => {
     expect(shipPlaceId(readFlightRecord(), now + 50_000)).toBe(there);
   });
 
+  it('rests where its UNDOCK recorded the station letting go, whatever moves this install hears of since', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    const homeAt = adriftAt(home.planetId, home.orbitSlot);
+    writeFlightRecord({ status: 'docked', locationId: 'furlong-station' });
+    writeDoorPairing('east', seed, buildDoorPairing(seed, {
+      segments: dockChain(), farDoor: 'south', farWall: 'y+', transient: true, dockedAt: now - 60_000,
+    }));
+    expect(keepRestPlace('ship-room', now - 50_000)).toBe(true);
+    // Let go of from Furlong's side while nobody was aboard: its UNDOCK
+    // recorded where Furlong was.
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt: now - 40_000, at: homeAt });
+    // Furlong went to Aris and came back to another slot; this install has
+    // heard only of the way back (a planet summary's latest move, say).
+    expect(writeStationMove({
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: 'planet-aris', fromSlot: 0,
+      toPlanetId: home.planetId, toSlot: (home.orbitSlot + 2) % 16, departAt: now - 20_000, arriveAt: now - 10_000,
+      mode: 'thrusters', bookedAt: now - 25_000, fuel: 1, fuelDrawn: 0,
+    })).toBe(true);
+    const back = listStations(undefined, undefined, now).find((st) => st.id === 'furlong-station')!;
+    expect(back.planetId).toBe(home.planetId);
+    expect(back.orbitSlot).not.toBe(home.orbitSlot);
+    // Where it was let go, not where this install first heard Furlong leave from.
+    expect(restingPlace(readRestPlace()!, now)).toMatchObject({ at: homeAt, recorded: true });
+    expect(shipPlaceId(readFlightRecord(), now)).toBe(homeAt);
+    // Kept so, with no move history needed.
+    expect(keepRestPlace('ship-room', now)).toBe(true);
+    expect(readRestPlace()).toEqual({ at: homeAt, since: now - 40_000, from: 'furlong-station' });
+    expect(shipPlaceId(readFlightRecord(), now)).toBe(homeAt);
+  });
+
   it('reads a rest record off the wire only when it is well formed', () => {
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5 })).toBe(true);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, docks: ['north', 'd:bay'] })).toBe(true);

@@ -35,10 +35,11 @@ import {
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
 import type { OrbitTrim } from './stationKeeping';
 import {
-  DEFAULT_PLANET_ID, knownSlotsAround, listStations, readStationRecords, registerStation, setKnownPlacesResolver, setStationMoveResolver,
+  DEFAULT_PLANET_ID, MAX_ORBIT_SLOTS, knownSlotsAround, listStations, readStationRecords, registerStation, setKnownPlacesResolver,
+  setStationMoveResolver,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
-import { freeSlotAround, rememberMove } from './stationMove';
+import { freeSlotAround, installStationMoveResolver, rememberMove } from './stationMove';
 
 // Each "install" is its own localStorage.
 let store = new Map<string, string>();
@@ -418,6 +419,39 @@ describe('learned stations', () => {
       expect(registerLearnedStations(SOV, [moved], { prune: true })).toBe(1);
       expect(readStationRecords()).toEqual([]);
     } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  it('keep this client at the planet its list settled a bounced arrival at, before the pin is shared', () => {
+    const now = Date.now();
+    // Learned here, around this planet: the station this client is aboard,
+    // and a neighbour.
+    expect(registerLearnedStations(SOV, [summary(), summary({ welcomeRoomId: 'room-x', name: 'X', orbitSlot: 4 })])).toBe(2);
+    const doc = new Y.Doc();
+    const map = doc.getMap('stationSummaries');
+    // ARIS is full…
+    for (let i = 0; i < MAX_ORBIT_SLOTS; i++) {
+      map.set(`room-a${i}`, summary({ welcomeRoomId: `room-a${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, updatedAt: now }));
+    }
+    // …when HAB RING gets there: it bounces home, and no pin is shared yet.
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: now - 2000, arriveAt: now - 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    map.set('room-hab', summary({ updatedAt: now, move }));
+    map.set('room-x', summary({ welcomeRoomId: 'room-x', name: 'X', orbitSlot: 4, updatedAt: now }));
+    installKnownPlacesResolver();
+    installStationMoveResolver();
+    try {
+      bindPlanetSummaryDoc(doc, install(`${LEARNED_PREFIX}room-hab`));
+      expect(listStations().find((st) => st.welcomeRoomId === 'room-hab')).toMatchObject({ planetId: SOV, orbitSlot: 2 });
+      // Still around this planet with its neighbour: nothing pruned here,
+      // nothing registered around ARIS.
+      expect(readStationRecords().map((r) => r.id).sort()).toEqual([`${LEARNED_PREFIX}room-hab`, `${LEARNED_PREFIX}room-x`]);
+      expect(systemStationNames(SOV).some((st) => st.name === 'HAB RING')).toBe(false);
+    } finally {
+      setKnownPlacesResolver(null);
       setStationMoveResolver(null);
     }
   });

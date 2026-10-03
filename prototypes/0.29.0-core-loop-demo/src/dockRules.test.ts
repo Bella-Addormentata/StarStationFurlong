@@ -518,6 +518,29 @@ describe('dockRules — the far end', () => {
     expect(farUndockPatch(newer, near, 20)).toEqual({ action: 'skip', reason: 'newer-dock' });
   });
 
+  it('UNDOCK keeps where the station across it let go, on both ends, and the wire keeps it', () => {
+    const at = 'adrift:planet-aris:3';
+    const live = buildDoorPairing(seedFor(STATION), { segments: dockChain(), farDoor: 'd:bay', dockedAt: 10 });
+    expect(berthMemoryFrom(live, 20, at)).toEqual({ farDoor: 'd:bay', undockedAt: 20, at });
+    expect(berthMemoryFrom(live, 20)).toEqual({ farDoor: 'd:bay', undockedAt: 20 });
+    const ours = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), dockedAt: 10 });
+    const w = farUndockPatch(ours, near, 20, undefined, at);
+    expect(w.action === 'write' && w.record).toEqual({
+      paired: false,
+      retiredAddress: near.address,
+      dock: { farDoor: near.doorId, farWall: near.wall, farLateral: near.lateral, undockedAt: 20, at },
+    });
+    // Off the wire: a bounded string is kept as written; anything else drops,
+    // the berth memory with it intact.
+    const doc = new Y.Doc();
+    writeDoorRecordTo(doc, 'd:1', buildDoorTombstone(seedFor(STATION), { undockedAt: 20, at }));
+    expect(readDoorFrom(doc, 'd:1')).toEqual({ paired: false, retiredAddress: seedFor(STATION), dock: { undockedAt: 20, at } });
+    for (const junk of [7, '', 'x'.repeat(161)]) {
+      doc.getMap('doors').set('d:2', { paired: false, retiredAddress: seedFor(STATION), dock: { undockedAt: 20, at: junk } });
+      expect(readDoorFrom(doc, 'd:2')).toEqual({ paired: false, retiredAddress: seedFor(STATION), dock: { undockedAt: 20 } });
+    }
+  });
+
   it('UNDOCK leaves the OTHER connection between the same two modules alone', () => {
     // Two docks between the ship and the station: this far record names
     // another of the ship's doors — a delayed UNDOCK of ours must not touch it.

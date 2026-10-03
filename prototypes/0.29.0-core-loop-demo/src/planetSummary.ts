@@ -567,6 +567,20 @@ export function summaryPlanet(s: { planetId: string; move?: StationMove }, now: 
   return planetById(m.settles || now >= m.arriveAt ? m.toPlanetId : m.fromPlanetId).id;
 }
 
+/** summaryPlanet, but an arrival not pinned yet (pinSettledArrival runs on
+ *  the flight watch's beat) is where this install's list settled it — home,
+ *  after a bounce off a full planet — when the list has that station: what
+ *  this client acts on agrees with what it lists. */
+function settledPlanet(
+  s: StationSummary,
+  now: number,
+  listedAt: (welcomeRoomId: string) => StationRecord | null | undefined,
+): string {
+  const m = s.move;
+  const st = m && !m.settles && now >= m.arriveAt ? listedAt(s.welcomeRoomId) : null;
+  return st ? planetById(st.planetId).id : summaryPlanet(s, now);
+}
+
 /** Is this summary about the planet this client is at? Retention keeps
  *  those next, after the first-hand keys: news from other planets cannot
  *  crowd out the stations and ships around this one. */
@@ -1088,7 +1102,9 @@ function applyLearned(store: Store): void {
   // No station placement: a ship room's own summary says which planet it is at.
   const ship = !here && room ? store.ships[room] : undefined;
   const shipPlanet = ship && !ship.retired ? ship.planetId : undefined;
-  const planetOf = here ? (!ours && shared ? summaryPlanet(shared) : here.planetId) : shipPlanet;
+  const planetOf = here
+    ? (!ours && shared ? settledPlanet(shared, Date.now(), (w) => (w === here.welcomeRoomId ? here : null)) : here.planetId)
+    : shipPlanet;
   const planet = planetById(planetOf).id;
   registerLearnedStations(planet, Object.values(store.stations), { prune: planetOf !== undefined });
   refreshTrims(store);
@@ -1186,8 +1202,11 @@ export function shipsAroundPlanet(planetId: string, now = Date.now()): ShipSumma
  *  planets than `planetId`. */
 export function systemStationNames(planetId: string, now = Date.now()): Array<{ name: string; planetId: string }> {
   const planet = planetById(planetId).id;
+  let listed: Map<string, StationRecord> | null = null;
+  const listedAt = (w: string) =>
+    (listed ??= new Map(listStations(undefined, undefined, now).map((st) => [st.welcomeRoomId, st]))).get(w);
   return Object.values(readStore(now).stations)
-    .map((s) => ({ name: s.name, planetId: summaryPlanet(s, now) }))
+    .map((s) => ({ name: s.name, planetId: settledPlanet(s, now, listedAt) }))
     .filter((s) => s.planetId !== planet)
     .sort((a, b) => (a.planetId === b.planetId ? a.name.localeCompare(b.name) : a.planetId.localeCompare(b.planetId)));
 }

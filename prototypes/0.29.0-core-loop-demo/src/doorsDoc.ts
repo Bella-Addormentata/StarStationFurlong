@@ -84,7 +84,16 @@ export interface DockBerthMemory {
   farLateral?: number;
   /** When the dock was released (writer clock, epoch ms). */
   undockedAt: number;
+  /** 🚚 Where the station across the dock was as it let go, when its writer
+   *  knew: an open-orbit place (stations.adriftAt), read where it is used
+   *  (shipArrival.restingPlace). A ship released while nobody aboard saw it
+   *  rests there, whatever moves of that station an install hears of later. */
+  at?: string;
 }
+
+/** A recorded release place no longer than this is kept (a planet id and a
+ *  slot, with their prefix, are far shorter). */
+const MAX_PLACE_LEN = 160;
 
 /** ⏏ An UNDOCK leaves this rather than deleting the entry: only one room doc
  *  is bound at a time, so an undock can never reach the far room's mirror
@@ -247,6 +256,7 @@ function sanitizeBerthMemory(v: unknown): DockBerthMemory | undefined {
       && Math.abs(m.farLateral) <= 32) {
     out.farLateral = m.farLateral;
   }
+  if (typeof m.at === 'string' && m.at.length > 0 && m.at.length <= MAX_PLACE_LEN) out.at = m.at;
   return out;
 }
 
@@ -504,6 +514,7 @@ export function buildDoorTombstone(retiredAddress: string, dock?: DockBerthMemor
     if (dock.farDoor) memory.farDoor = dock.farDoor;
     if (dock.farWall) memory.farWall = dock.farWall;
     if (dock.farLateral !== undefined) memory.farLateral = dock.farLateral;
+    if (dock.at) memory.at = dock.at;
     record.dock = memory;
   }
   return record;

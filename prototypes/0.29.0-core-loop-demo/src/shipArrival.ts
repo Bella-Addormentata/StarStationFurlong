@@ -244,6 +244,17 @@ function dockHost(roomId: string, stations: StationRecord[] = listStations()): S
   return st && !(st.derived && atlasComponent(atlas, st.welcomeRoomId).size <= 1) ? st : null;
 }
 
+/** 🚚 Where the station a dock into `roomId` holds a ship at is as that dock
+ *  lets go, for the UNDOCK to record on the other end's tombstone
+ *  (doorsDoc.DockBerthMemory.at): none for a lone module, or for a station
+ *  between planets (no dock lets go then). */
+export function releasePlaceOf(roomId: string, now: number = Date.now()): string | undefined {
+  if (!roomId) return undefined;
+  const stations = listStations(undefined, undefined, now);
+  const host = dockHost(roomId, stations);
+  return host && !stationInTransit(host, now) ? placeOf(host) : undefined;
+}
+
 /**
  * What a ship's rest record (shipDoc.RestPlace) says at `now`, from the doors
  * it names, each read directly: a scan of the doors is capped, and a peer
@@ -252,11 +263,14 @@ function dockHost(roomId: string, stations: StationRecord[] = listStations()): S
  *   when listed);
  * - else, once one of them let go since the ship came to rest (the latest,
  *   by its UNDOCK's own stamp: `releasedAt`), where that dock's station
- *   (`from`) was then. A station lets go of no dock between planets, so that
- *   is where it is now, unless it has moved since: then where it left from on
- *   its first move after (stationMove.stationLeftFrom, from the moves this
- *   install knows; keepRestPlace records the place before that can happen,
- *   whenever anyone is aboard);
+ *   (`from`) was then: where its UNDOCK recorded it (DockBerthMemory.at,
+ *   `recorded`), which no move heard of since can change. From a tombstone
+ *   that records none (written before UNDOCKs did, or by one that could not
+ *   place its station), the station's place: a station lets go of no dock
+ *   between planets, so that is where it is now, unless it has moved since:
+ *   then where it left from on its first move after (stationMove.
+ *   stationLeftFrom, from the moves this install knows; keepRestPlace
+ *   records the place before that can happen, whenever anyone is aboard);
  * - else where the ship came to rest, beside the station the rest record
  *   names as `from` (when listed).
  */
@@ -264,8 +278,8 @@ export function restingPlace(
   rest: RestPlace,
   now: number = Date.now(),
   stations: StationRecord[] = listStations(undefined, undefined, now),
-): { heldBy: string | null } | { at: string; from?: StationRecord; releasedAt?: number } {
-  let release: { at: number; room: string } | null = null;
+): { heldBy: string | null } | { at: string; from?: StationRecord; releasedAt?: number; recorded?: true } {
+  let release: { at: number; room: string; place?: string } | null = null;
   for (const doorId of rest.docks ?? []) {
     const door = readDoor(doorId);
     if (!door) continue;
@@ -283,13 +297,18 @@ export function restingPlace(
     }
     // A release before the ship came to rest here belongs to an earlier stay.
     if (!door.dock || door.dock.undockedAt < rest.since) continue;
-    if (!release || door.dock.undockedAt > release.at) release = { at: door.dock.undockedAt, room };
+    if (!release || door.dock.undockedAt > release.at) release = { at: door.dock.undockedAt, room, place: door.dock.at };
   }
   if (!release) {
     const from = rest.from === undefined ? undefined : stations.find((st) => st.id === rest.from);
     return from ? { at: rest.at, from } : { at: rest.at };
   }
   const from = dockHost(release.room, stations);
+  const told = release.place === undefined ? null : adriftPlace(release.place);
+  if (told) {
+    const at = adriftAt(told.planetId, told.orbitSlot);
+    return from ? { at, from, releasedAt: release.at, recorded: true } : { at, releasedAt: release.at, recorded: true };
+  }
   if (!from) return { at: rest.at, releasedAt: release.at };
   const left = stationLeftFrom(from, release.at, now);
   const at = left ? adriftAt(left.planetId, left.orbitSlot) : stationInTransit(from, now) ? rest.at : placeOf(from);
@@ -302,9 +321,10 @@ export function restingPlace(
  * heard of: while docks hold it, which doors they are and where their station
  * is (only when they change, and never while that station is between
  * planets); once the last of them lets go, where its station was then, when
- * that takes no move history (the station has not moved since). For a docked
- * ship only, one in open orbit by its record included: docked by hand there,
- * it goes where its dock takes it. Returns whether it wrote.
+ * that takes no move history (its UNDOCK recorded it, or the station has not
+ * moved since). For a docked ship only, one in open orbit by its record
+ * included: docked by hand there, it goes where its dock takes it. Returns
+ * whether it wrote.
  */
 export function keepRestPlace(roomId: string = currentRoomId(), now: number = Date.now()): boolean {
   const rec = readFlightRecord();
@@ -336,7 +356,9 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
   if (!rest?.docks?.length) return false;
   const resting = restingPlace(rest, now, stations);
   if ('heldBy' in resting || resting.from === undefined || resting.releasedAt === undefined) return false;
-  if (stationInTransit(resting.from, now) || stationLeftFrom(resting.from, resting.releasedAt, now)) return false;
+  // A place its UNDOCK recorded takes no move history; one read off the
+  // station only while it has not moved since.
+  if (!resting.recorded && (stationInTransit(resting.from, now) || stationLeftFrom(resting.from, resting.releasedAt, now))) return false;
   return writeRestPlace({ at: resting.at, since: Math.floor(resting.releasedAt), from: resting.from.id });
 }
 

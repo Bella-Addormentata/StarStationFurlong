@@ -62,7 +62,7 @@ export function applyFarDockRequest(
     const farDoor =
       req.farDoor || findFarDoor(readAllDoorsFrom(doc), near.roomId, near.doorId);
     if (!farDoor) return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
-    const patch = farUndockPatch(readDoorFrom(doc, farDoor), near, req.undockedAt, req.onlyDockedAt);
+    const patch = farUndockPatch(readDoorFrom(doc, farDoor), near, req.undockedAt, req.onlyDockedAt, req.at);
     if (patch.action === 'skip') {
       return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
     }

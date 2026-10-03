@@ -519,8 +519,9 @@ function placeStations(
     welcomeRoomId: string;
     base: { planetId: string; orbitSlot: number };
     move: StationMove | null;
-    /** False for a station heard of whose rooms the atlas does not know: it
-     *  takes its slot, and is never listed. */
+    /** False for a station heard of whose rooms the atlas does not know (or
+     *  whose welcome room is too long to anchor a derived record): it takes
+     *  its slot, and is never listed. */
     listed: boolean;
     make: (planetId: string, orbitSlot: number, move: StationMove | undefined) => StationRecord;
   }
@@ -570,9 +571,11 @@ function placeStations(
     const where = placeOf(p.welcomeRoomId);
     if (places.has(where)) continue;
     if (typeof p.planetId !== 'string' || !Number.isInteger(p.orbitSlot) || p.orbitSlot < 0 || p.orbitSlot >= MAX_ORBIT_SLOTS) continue;
-    const inAtlas = !where.startsWith('room:');
-    if (inAtlas && DERIVED_PREFIX.length + p.welcomeRoomId.length > MAX_ID_LENGTH) continue;
-    places.add(where);
+    // Its rooms known, but too long a welcome room to anchor a derived
+    // record: heard of only, as if the atlas did not know them, so it still
+    // holds its slot (and its rooms derive as any others do).
+    const inAtlas = !where.startsWith('room:') && DERIVED_PREFIX.length + p.welcomeRoomId.length <= MAX_ID_LENGTH;
+    places.add(inAtlas ? where : `room:${p.welcomeRoomId}`);
     const stub = { id: `${inAtlas ? DERIVED_PREFIX : HEARD_PREFIX}${p.welcomeRoomId}`, welcomeRoomId: p.welcomeRoomId };
     const name = inAtlas ? atlasName(p.welcomeRoomId) : 'STATION';
     candidates.push({

@@ -112,6 +112,7 @@ import {
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
 import { dockLockedByMove } from "./stationMove";
+import { releasePlaceOf } from "./shipArrival";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -196,6 +197,9 @@ export type FarDockRequest =
        *  stamp — and nothing else (redockPort's compensation when its own
        *  side changed under it). */
       onlyDockedAt?: number;
+      /** 🚚 Where THIS end's station was as it let go, when known: kept on
+       *  the far end's tombstone (DockBerthMemory.at). */
+      at?: string;
     }
   | {
       kind: "dock";
@@ -2755,7 +2759,13 @@ export class DoorDockingPortSystem {
     // Causally after the dock it releases, whatever this client's clock says
     // (the far side's newer-dock guard and the mirror compare these stamps).
     const undockedAt = stampAfter(port.record.dockedAt);
-    writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt));
+    // 🚚 Each end's tombstone keeps where the OTHER end's station was as it
+    // let go: a ship released here rests there, whatever moves of that
+    // station anyone hears of later (shipArrival.restingPlace).
+    const now = Date.now();
+    const farAt = releasePlaceOf(port.roomId, now);
+    const nearAt = releasePlaceOf(roomId, now);
+    writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt, farAt));
     const name = this.partnerLabel(port.roomId);
     if (!this.farDockWriter) {
       this.setDockOp(doorId, {
@@ -2777,6 +2787,7 @@ export class DoorDockingPortSystem {
         nearWall: near.wall,
         nearLateral: near.lateral,
         undockedAt,
+        ...(nearAt ? { at: nearAt } : {}),
       });
     } catch (err) {
       console.warn("[dock] far undock threw:", err);

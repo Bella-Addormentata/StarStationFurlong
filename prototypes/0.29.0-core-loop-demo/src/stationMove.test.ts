@@ -496,6 +496,20 @@ describe('the station list follows a move', () => {
     }
   });
 
+  it('holds the slot of a station heard of whose rooms it knows, by a welcome room too long to anchor one', () => {
+    const w = 'w'.repeat(125);
+    const atlas: Record<string, AtlasEntry> = {
+      [w]: { roomId: w, name: 'HUB', doors: { 'x+': { targetSeed: 'ssf://room#room=v-room', targetRoomId: 'v-room' } }, lastSeen: 0 },
+      'v-room': { roomId: 'v-room', name: 'ANNEX', doors: {}, lastSeen: 0 },
+    };
+    setKnownPlacesResolver(() => [{ welcomeRoomId: w, planetId: ARIS, orbitSlot: 0 }]);
+    // `station:` and that room run past an id's length: heard of only, never
+    // listed by it, and its slot still taken.
+    const listed = listStations(atlas, [], NOW);
+    expect(listed.some((s) => s.welcomeRoomId === w || s.planetId === ARIS)).toBe(false);
+    expect(knownSlotsAround(ARIS, listed.map((s) => s.welcomeRoomId), NOW, atlas)).toEqual({ taken: new Set([0]), reserved: new Set() });
+  });
+
   it('bounces an arrival off a planet it only knows is full from the summaries', () => {
     const move = { ...moveTo(), bookedAt: moveTo().departAt };
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
@@ -1769,6 +1783,35 @@ describe('the move log stays bounded', () => {
     // The next write clears the one past the cap.
     writeStationMove(hop(1, 1, 1));
     expect(map.has('moveFold:2:0000000000000002')).toBe(false);
+  });
+
+  it('bundles entries under the longest keys a write makes, and still counts them', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    // The largest client id, a departure with four decimals, and a welcome
+    // room as long as an id may be.
+    const departAt = NOW + 0.2725;
+    const n = MOVE_ENTRIES_KEEP + 2;
+    const keys: string[] = [];
+    doc.transact(() => {
+      for (let i = 0; i < n; i++) {
+        const room = `${i}-`.padEnd(128, 'r');
+        const key = `move:4294967295:${departAt}:${room}`;
+        keys.push(key);
+        map.set(key, { ...hop(0, 1, 1), stationId: `s${i}`, welcomeRoomId: room, departAt, bookedAt: NOW - 10_000 - i });
+      }
+    });
+    expect(keys[0].length).toBeGreaterThan(160);
+    expect(readMoveFuelDrawn()).toBe(n);
+    writeStationMove({ ...hop(1, 0, 0), stationId: 'z', welcomeRoomId: 'z-room', bookedAt: NOW + 5 });
+    expect([...map.keys()].some((k) => k.startsWith('moveFold:'))).toBe(true);
+    expect(keys.filter((k) => map.has(k)).length).toBeLessThan(n);
+    for (let pass = 0; pass < 2; pass++) {
+      store.clear();
+      bindStationMoveDoc(doc);
+      expect(readMoveFuelDrawn()).toBe(n);
+    }
   });
 
   it('clears a settled record without its recent list instead of failing a write', () => {

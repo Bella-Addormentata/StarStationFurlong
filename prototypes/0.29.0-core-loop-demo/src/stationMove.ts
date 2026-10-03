@@ -1109,8 +1109,11 @@ const MOVE_FOLD_READ_MAX = 2 * FOLD_BUCKETS * FOLD_ITEMS_MAX;
 
 interface FoldBundle { settled: Record<string, SettledMoves>; entries: Record<string, StationMove> }
 
-/** A writer id or entry key a bundle may hold: as long as a key may be. */
-const FOLD_ID_MAX = 160;
+/** A writer id or entry key a bundle may hold: as long as writeStationMove
+ *  makes one — the prefix, a client id (a uint32: 10 digits), a departure
+ *  time (13 digits and up to 4 decimals within isTime's bounds) and a
+ *  welcome room or station id, with the two colons between them. */
+const FOLD_ID_MAX = ENTRY_PREFIX.length + 10 + 1 + 18 + 1 + MAX_ID_LENGTH;
 
 /** Bundle values already checked, and found sound (or too big ever to be):
  *  a doc value is replaced, never changed in place, so each is checked once.
