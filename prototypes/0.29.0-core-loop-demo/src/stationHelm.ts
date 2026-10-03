@@ -490,6 +490,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     well.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      // That also keeps the press from focusing the stick: focus it here, so
+      // the arrow keys steer it next.
+      well.focus({ preventScroll: true });
       const r = well.getBoundingClientRect();
       drag = { id: e.pointerId, cx: r.left + r.width / 2, cy: r.top + r.height / 2, dx: 0, dy: 0 };
       well.setPointerCapture?.(e.pointerId);

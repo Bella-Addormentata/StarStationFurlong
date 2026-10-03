@@ -1666,6 +1666,88 @@ describe('the fuel record: one reading per meter', () => {
       for (const name of names) setFuelDrawMeter(name, null);
     }
   });
+
+  it('a level write from a build from before the meters charges no draw twice', () => {
+    // Copilot's review of #173: such a build writes the level alone, which
+    // dropped the readings the level was written against.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    press('raise', T0);
+    press('ahead', T0 + BURN_MS);
+    writeFuelLevel(readFuelLevel(), 100);
+    const { level, ...parts } = fuelRecord(doc);
+    expect(doc.getMap('ship').get('fuelCopy')).toEqual(parts);
+    const settled = readFuelSettlement(SK);
+    // Its DEPART takes a 10-unit trip off the level as written.
+    doc.getMap('ship').set('fuel', { level: level - 10 });
+    expect(readFuelLevel()).toBe(level - 10);
+    expect(readFuelSettlement(SK)).toEqual(settled);
+    expect(fuelCeiling(SK)).toBe(2 * TRIM_FUEL + level - 10);
+  });
+
+  it('keeps the settled orbit and every draw through level writes from a build from before the meters', () => {
+    // Copilot's review of #173: once the next burn had cleared the burns a
+    // level write settled, the settlement was their only account, and such
+    // a write dropped it.
+    const doc = new Y.Doc();
+    const old = new Y.Doc(); // a tab on that build, fully synced
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    press('raise', T0);
+    press('ahead', T0 + BURN_MS);
+    writeFuelLevel(readFuelLevel(), 100);
+    press('lower', T0 + 2 * BURN_MS);
+    expect(doc.getMap('stationKeeping').size).toBe(1);
+    const t = readOrbitTrim();
+    const { level } = fuelRecord(doc);
+    expect(readFuelLevel()).toBe(level - TRIM_FUEL);
+    // That tab DEPARTs on a 10-unit trip, off the level as written...
+    sync(doc, old);
+    old.getMap('ship').set('fuel', { level: (old.getMap('ship').get('fuel') as FuelRecord).level - 10 });
+    sync(doc, old);
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
+    expect(readFuelLevel()).toBe(level - 10 - TRIM_FUEL);
+    // ...and REFUELs: the burn since the last level write here comes off the
+    // full tanks too (never a refund)...
+    old.getMap('ship').set('fuel', { level: 100 });
+    sync(doc, old);
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelLevel()).toBe(100 - TRIM_FUEL);
+    // ...until a level write here records it, and keeps the readings again.
+    writeFuelLevel(readFuelLevel(), 100);
+    expect(fuelRecord(doc)).toMatchObject({ level: 100 - TRIM_FUEL, meters: { [SK]: 3 * TRIM_FUEL }, meter: 3 * TRIM_FUEL });
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelLevel()).toBe(100 - TRIM_FUEL);
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(doc));
+    bindRoom(reload);
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
+    expect(readFuelLevel()).toBe(100 - TRIM_FUEL);
+  });
+
+  it('reads a record that keeps readings of its own with them, and a copy that is no object as none', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    press('raise', T0);
+    writeFuelLevel(readFuelLevel(), 100);
+    // Another build's meter only: station keeping's whole reading comes off.
+    doc.getMap('ship').set('fuel', { level: 30, meters: { stationMove: 4 } });
+    expect(readFuelLevel()).toBe(30 - TRIM_FUEL);
+    expect(readFuelSettlement(SK)).toBeUndefined();
+    // A record from before per-meter readings is read against its sum.
+    doc.getMap('ship').set('fuel', { level: 30, meter: TRIM_FUEL / 2 });
+    expect(readFuelLevel()).toBe(30 - TRIM_FUEL / 2);
+    for (const copy of ['x', [1], null, 5]) {
+      doc.getMap('ship').set('fuelCopy', copy);
+      doc.getMap('ship').set('fuel', { level: 30 });
+      expect(readFuelLevel()).toBe(30 - TRIM_FUEL);
+      expect(readFuelSettlement(SK)).toBeUndefined();
+    }
+  });
 });
 
 describe('another consumer drawing through its own meter (a station move, say)', () => {

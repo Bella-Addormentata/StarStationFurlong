@@ -322,6 +322,16 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
 // beside the meter's reading, naming what the level has paid for and what was
 // dropped. A later REFUEL that raises the ceiling brings nothing dropped back,
 // and the consumer can clear what was settled from its own records.
+//
+// A build from before the meters writes the level alone (`{ level }`), which
+// drops every reading and settlement from the record: for station keeping,
+// the only account left of burns whose entries were cleared. So each level
+// write also copies them under a key of their own (FUEL_COPY), which such a
+// build never writes, and a record that keeps none of them is read with the
+// copy's (fuelParts). That build read the level as written, so the draws
+// since the copy still come off what it wrote: rightly after its DEPART, and
+// once more after its REFUEL (never a refund), until a level write here
+// records them.
 
 /** A meter reads at most this: a running fuel total stays well inside exact
  *  integers, and a hostile reading past it counts as none. */
@@ -391,20 +401,40 @@ function firstEntries(raw: unknown): Array<[string, unknown]> | null {
   return out;
 }
 
+/** A fuel record's readings and settlements: all of it but the level. */
+type FuelParts = Omit<FuelRecord, 'level'>;
+
+/** The key where each level write keeps a copy of the record's readings and
+ *  settlements, which a build from before them never writes (see
+ *  setFuelDrawMeter). */
+const FUEL_COPY = 'fuelCopy';
+
+/** The readings and settlements fuel record `rec` is read with: its own, or,
+ *  when it keeps none (a build from before them wrote the level alone), the
+ *  copy beside it. A copy keeps `meter` only beside `meters`, so a record
+ *  read with one is never read against `meter` alone. */
+function fuelParts(rec: FuelRecord): FuelParts {
+  if (rec.meters !== undefined || rec.meter !== undefined || rec.settled !== undefined) return rec;
+  const copy = shipMap?.get(FUEL_COPY);
+  return typeof copy === 'object' && copy !== null && !Array.isArray(copy) ? (copy as FuelParts) : rec;
+}
+
 interface ParsedFuelRecord {
   recorded: Map<string, number> | null;
   settled: Map<string, unknown>;
 }
 
-/** Each fuel record's readings and settlements, parsed the first time it is
- *  read: a value in a Yjs map is replaced, never changed in place, so every
- *  gauge redraw and ceiling after that reads the same parse. */
-const parsedRecords = new WeakMap<FuelRecord, ParsedFuelRecord>();
+/** Each fuel record's readings and settlements (or its copy's: fuelParts),
+ *  parsed the first time they are read: a value in a Yjs map is replaced,
+ *  never changed in place, so every gauge redraw and ceiling after that
+ *  reads the same parse. */
+const parsedRecords = new WeakMap<FuelParts, ParsedFuelRecord>();
 
 function parseFuelRecord(rec: FuelRecord): ParsedFuelRecord {
-  let parsed = parsedRecords.get(rec);
+  const parts = fuelParts(rec);
+  let parsed = parsedRecords.get(parts);
   if (parsed) return parsed;
-  const meters = firstEntries(rec.meters);
+  const meters = firstEntries(parts.meters);
   let recorded: Map<string, number> | null = null;
   if (meters) {
     recorded = new Map();
@@ -414,11 +444,11 @@ function parseFuelRecord(rec: FuelRecord): ParsedFuelRecord {
     }
   }
   const settled = new Map<string, unknown>();
-  for (const [name, v] of firstEntries(rec.settled) ?? []) {
+  for (const [name, v] of firstEntries(parts.settled) ?? []) {
     if (METER_NAME.test(name) && v !== undefined) settled.set(name, v);
   }
   parsed = { recorded, settled };
-  parsedRecords.set(rec, parsed);
+  parsedRecords.set(parts, parsed);
   return parsed;
 }
 
@@ -539,8 +569,10 @@ export function readFlightRecord(): FlightRecord {
  *  the draws this writer has seen stay counted once (see setFuelDrawMeter),
  *  and each meter's settlement (FuelDrawMeter.settle) with it. A meter only
  *  another build draws through keeps its recorded reading and settlement.
- *  Owner-gated at the caller (helm UI). The write is idempotent: the same
- *  level twice leaves the same record. */
+ *  Both are copied under FUEL_COPY in the same write, for a build from
+ *  before them that writes the level alone. Owner-gated at the caller (helm
+ *  UI). The write is idempotent: the same level twice leaves the same
+ *  record. */
 export function writeFuelLevel(level: number, capacity: number): void {
   if (!docAlive()) return;
   const safe = clampFuelToCapacity(level, capacity);
@@ -569,10 +601,11 @@ export function writeFuelLevel(level: number, capacity: number): void {
   }
   for (const [name, reading] of before ?? []) if (!drawMeters.has(name)) record(name, reading);
   for (const [name, settlement] of settledBefore ?? []) if (!drawMeters.has(name)) keep(name, settlement);
-  const next: FuelRecord = count > 0 ? { level: safe, meters, meter: sum } : { level: safe };
-  if (settledCount > 0) next.settled = settled;
+  const parts: FuelParts = count > 0 ? { meters, meter: sum } : {};
+  if (settledCount > 0) parts.settled = settled;
   boundDoc!.transact(() => {
-    shipMap!.set('fuel', next);
+    shipMap!.set('fuel', { level: safe, ...parts });
+    shipMap!.set(FUEL_COPY, parts);
   });
 }
 

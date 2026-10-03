@@ -3980,8 +3980,12 @@ function buildHelmSticks(
   // ends), or its being a station's own welcome room, say ship or station.
   let bolted = false;
   let station: StationRecord | null = null;
+  // The room the face was read for. On the first join, main.ts names the
+  // room only after this console is built, and says nothing when it does.
+  let faceRoom = "";
   const applyFace = () => {
-    bolted = steersStation(currentRoomId(), readAllDoors());
+    faceRoom = currentRoomId();
+    bolted = steersStation(faceRoom, readAllDoors());
     fighter.visible = !bolted;
     trimStick.visible = bolted;
   };
@@ -3999,6 +4003,10 @@ function buildHelmSticks(
   const lean = { x: 0, z: 0 };
   const anim = {
     update(dt: number): void {
+      if (currentRoomId() !== faceRoom) {
+        applyFace();
+        readStation();
+      }
       let tx = 0;
       let tz = 0;
       // The burn firing now on this station's orbit, whatever order the log
