@@ -89,10 +89,11 @@ export interface AtlasEntry {
   /** ⚓🚦 Who may dock at each gate, by door id — only gates not open to all
    *  (closed, pass holders, or reserved for one ship's room). */
   gateAccess?: Record<string, AtlasGateAccess>;
-  /** 🗺️ Who owns the module (roomInfo.owner) and the name they go by there,
-   *  read while standing in it (#192: the holotable's station atlas shows a
-   *  module's owner). Public like the room's name; the name is the players
-   *  map's display name, peer-written and unverified, so it is a label only.
+  /** 🗺️ Who owns the module (roomInfo.owner), the name they go by there and
+   *  their identity key, read while standing in it (#192: the holotable's
+   *  station atlas shows a module's owner). Public like the room's name; the
+   *  name is the players map's display name, peer-written and unverified, so
+   *  it is a label only, and the key is public too (a players entry's keyB64).
    *  null: known to have no verifiable owner (none set, or the legacy
    *  marker); absent: not known. */
   owner?: AtlasOwner | null;
@@ -143,20 +144,28 @@ export interface AtlasOwner {
   id: string;
   /** Their display name in that room's players map, when it was known. */
   name?: string;
+  /** Their identity key in that room's players map (keyB64), when it was
+   *  known: an owner back on a fresh player id is still matched by it, as
+   *  the deed check matches one (disassembly.ts ownerIsMe). */
+  key?: string;
 }
 
-/** Longest owner id / name the atlas keeps from gossip. */
+/** Longest owner id / name / identity key the atlas keeps from gossip (an
+ *  identity key is 43 characters: base64url of 32 bytes). */
 const MAX_OWNER_ID = 128;
 const MAX_OWNER_NAME = 64;
+const MAX_OWNER_KEY = 64;
 
-/** A peer-written owner, checked: an id of sane length, and a name kept only
- *  when it is a short string. Anything else is unknown (undefined). */
+/** A peer-written owner, checked: an id of sane length, and a name and an
+ *  identity key each kept only when it is a short string. Anything else is
+ *  unknown (undefined). */
 export function cleanAtlasOwner(v: unknown): AtlasOwner | undefined {
   if (typeof v !== 'object' || v === null) return undefined;
-  const o = v as { id?: unknown; name?: unknown };
+  const o = v as { id?: unknown; name?: unknown; key?: unknown };
   if (typeof o.id !== 'string' || !o.id || o.id.length > MAX_OWNER_ID) return undefined;
   const name = typeof o.name === 'string' && o.name && o.name.length <= MAX_OWNER_NAME ? o.name : undefined;
-  return name ? { id: o.id, name } : { id: o.id };
+  const key = typeof o.key === 'string' && o.key && o.key.length <= MAX_OWNER_KEY ? o.key : undefined;
+  return { id: o.id, ...(name ? { name } : {}), ...(key ? { key } : {}) };
 }
 
 /** A peer-written owner field: null (known ownerless) passes as null, a
@@ -458,8 +467,9 @@ export function harvestIntoAtlas(entry: {
   gates?: Record<string, number>;
   /** ⚓🚦 Non-open gate access by door id (doorPolicy readGateAccess). */
   gateAccess?: Record<string, AtlasGateAccess>;
-  /** 🗺️ The room's owner (roomInfo.owner) and their display name; null
-   *  when the synced room has no verifiable owner; absent when unread. */
+  /** 🗺️ The room's owner (roomInfo.owner), their display name and identity
+   *  key; null when the synced room has no verifiable owner; absent when
+   *  unread. */
   owner?: AtlasOwner | null;
 }): void {
   if (!entry.roomId) return;

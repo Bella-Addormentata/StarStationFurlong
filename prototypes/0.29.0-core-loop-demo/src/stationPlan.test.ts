@@ -235,13 +235,31 @@ describe('the station plan', () => {
 });
 
 describe('a module owner in the atlas', () => {
-  it('keeps only a sane id and name', () => {
+  it('keeps only a sane id, name and identity key', () => {
     expect(cleanAtlasOwner({ id: 'p', name: 'Ada' })).toEqual({ id: 'p', name: 'Ada' });
     expect(cleanAtlasOwner({ id: 'p', name: 7 })).toEqual({ id: 'p' });
     expect(cleanAtlasOwner({ id: 'p', name: 'x'.repeat(65) })).toEqual({ id: 'p' });
+    expect(cleanAtlasOwner({ id: 'p', name: 'Ada', key: 'k'.repeat(43) })).toEqual({ id: 'p', name: 'Ada', key: 'k'.repeat(43) });
+    expect(cleanAtlasOwner({ id: 'p', key: 7 })).toEqual({ id: 'p' });
+    expect(cleanAtlasOwner({ id: 'p', key: '' })).toEqual({ id: 'p' });
+    expect(cleanAtlasOwner({ id: 'p', key: 'k'.repeat(65) })).toEqual({ id: 'p' });
     expect(cleanAtlasOwner({ id: '' })).toBeUndefined();
     expect(cleanAtlasOwner({ id: 'x'.repeat(129) })).toBeUndefined();
     expect(cleanAtlasOwner('p')).toBeUndefined();
+  });
+
+  it('travels with its identity key', () => {
+    const owner = { id: 'p-ada', name: 'Ada', key: 'k'.repeat(43) };
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [{ doorId: 'east', targetSeed: seed('room-b'), transient: false }], owner });
+    const doc = new Y.Doc();
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    expect((doc.getMap('atlas').get('room-a') as { owner?: unknown }).owner).toEqual(owner);
+    // Another install learns it from the doc.
+    store.clear();
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    bindStationAtlasDoc(other, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-a'].owner).toEqual(owner);
   });
 
   it('survives a harvest that could not read it', () => {

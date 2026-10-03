@@ -28,12 +28,12 @@
  * Pure: no DOM, no docs. Pinned by disassembly.test.ts.
  */
 
-import type { AtlasEntry } from './stationAtlas';
+import type { AtlasEntry, AtlasOwner } from './stationAtlas';
 import { berthDoorIds, isSaneDims, ownValue, roomIdFromSeed } from './stationAtlas';
 import type { DoorRecord } from './doorsDoc';
 import { isDockChain } from './adapter';
 import { realMsFor } from './orbits';
-import { legacyOwnerMarker } from './roomOwner';
+import { isDeedHolder, legacyOwnerMarker } from './roomOwner';
 
 /** Labor hours per floor tile: a default 2 × 2 module is 24 labor hours,
  *  24 real minutes for one robot; the largest, 5 × 5, is 150. */
@@ -350,6 +350,9 @@ export interface CandidateInput {
   doors: ReadonlyMap<string, DoorRecord>;
   /** The local player's id (roomInfo.owner's vocabulary). */
   playerId: string;
+  /** The local identity key (keypair getIdentityPub), which still names an
+   *  owner back on a fresh player id (ownerIsMe). */
+  identityPub?: string;
   /** The station's welcome room: its front door, never taken apart. */
   welcomeRoomId?: string | null;
 }
@@ -373,6 +376,21 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
 }
 
 /**
+ * Is a module's owner (its atlas entry's) the local player? By the deed
+ * check's rule (roomOwner.ts isDeedHolder): the owner id is our player id, or
+ * the owner's players entry carried our identity key when the module was
+ * harvested, so an owner back on a fresh player id still owns their modules.
+ * Never the legacy marker: isDeedHolder refuses it before reading the key.
+ */
+export function ownerIsMe(owner: AtlasOwner, me: { playerId: string; identityPub?: string }): boolean {
+  return isDeedHolder(owner.id, {
+    playerId: me.playerId,
+    identityPub: me.identityPub ?? '',
+    ownerKeyB64: () => owner.key || undefined,
+  });
+}
+
+/**
  * Why `roomId` can't come off the station now, or null. Checked when a robot
  * is set to it and again when the labor runs out:
  *  - the station's welcome room stays (the station is known by it);
@@ -381,8 +399,9 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
  *    from inside, says nothing of what else it is joined to. A module seen
  *    from inside with no doors of its own is known: it is joined only by
  *    doors other rooms recorded;
- *  - only its owner takes a module apart (one with no verified owner may be
- *    taken apart by this room's deed holder, who alone sets robots to it).
+ *  - only its owner takes a module apart (yours as the deed check reads it:
+ *    ownerIsMe; one with no verified owner may be taken apart by this
+ *    room's deed holder, who alone sets robots to it).
  *    One whose owner the atlas never learned waits for someone to step
  *    inside: having minted it is no proof it is still ours, as its deed may
  *    have changed hands since;
@@ -397,7 +416,7 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   if (!entry || stub) return "its layout isn't known yet; step inside it once";
   const owner = entry.owner;
   if (owner === undefined) return "its owner isn't known yet; step inside it once";
-  if (owner !== null && !legacyOwnerMarker(owner.id) && owner.id !== input.playerId) {
+  if (owner !== null && !legacyOwnerMarker(owner.id) && !ownerIsMe(owner, input)) {
     return `it belongs to ${owner.name || 'someone else'}`;
   }
   // Its other connections, as the atlas knows them: its own records and any

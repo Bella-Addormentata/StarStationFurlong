@@ -15,7 +15,7 @@ import {
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, isDisassemblyWork, jobAnnouncement, jobDueAt, jobFraction,
-  jobFromWork, jobStatusText, laborHoursFor, laborMsFor, removalBlocker, startWork, stopWork, workRanOut, workedMs,
+  jobFromWork, jobStatusText, laborHoursFor, laborMsFor, ownerIsMe, removalBlocker, startWork, stopWork, workRanOut, workedMs,
   type CandidateInput, type DisassemblyJob, type DisassemblyJobRecord, type DisassemblyWork,
 } from './disassembly';
 import {
@@ -272,6 +272,27 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
     harvestIntoAtlas({ roomId: 'room-d', name: 'SHED', doors: [{ doorId: 'w', targetSeed: seed('room-a') }], owner: { id: 'Local-Clone' } });
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
+  });
+
+  it('takes apart a module of yours from before a new player id, by your identity key', () => {
+    const doors = hub();
+    const KEY = 'k'.repeat(43);
+    // LAB as harvested: owned by an old player id of ours, whose players
+    // entry carried this install's identity key.
+    harvestIntoAtlas({
+      roomId: 'room-c', name: 'LAB',
+      doors: [{ doorId: 'east', targetSeed: seed('room-a'), transient: false }],
+      owner: { id: 'p-old', name: 'Ada', key: KEY },
+    });
+    expect(removalBlocker(input(doors, { identityPub: KEY }), 'room-c')).toBeNull();
+    // Another key, or none here: someone else's.
+    expect(removalBlocker(input(doors, { identityPub: 'j'.repeat(43) }), 'room-c')).toBe('it belongs to Ada');
+    expect(removalBlocker(input(doors), 'room-c')).toBe('it belongs to Ada');
+    // As the deed check reads it: the player id alone, or the key; never the
+    // legacy marker, whatever key a peer pinned on it.
+    expect(ownerIsMe({ id: 'p-me' }, { playerId: 'p-me' })).toBe(true);
+    expect(ownerIsMe({ id: 'p-old' }, { playerId: 'p-me', identityPub: '' })).toBe(false);
+    expect(ownerIsMe({ id: 'Local-Clone', key: KEY }, { playerId: 'p-me', identityPub: KEY })).toBe(false);
   });
 
   it('reads a neighbour named like an Object property as a module it knows nothing of', () => {
@@ -1137,7 +1158,22 @@ describe('the deed takes a module apart (source scan)', () => {
 
   it("reads an owner id the atlas can't carry as no owner, never keeping a former one", () => {
     const harvest = between(source('main.ts'), 'const ownerValue: unknown = sync.doc.getMap("roomInfo").get("owner");', 'pushAtlasToDoc();');
-    expect(harvest).toContain('owner: ownerId ? cleanAtlasOwner(ownerName ? { id: ownerId, name: ownerName } : { id: ownerId }) ?? null : null,');
+    expect(harvest).toContain('owner: ownerId ? cleanAtlasOwner({ id: ownerId, name: ownerName, key: ownerKey }) ?? null : null,');
+  });
+
+  it('knows your modules by your identity key, as the deed check does', () => {
+    // Harvested with the owner's key from the players map, never the legacy
+    // marker's (ownerId is empty for it, so nothing is looked up).
+    const harvest = between(source('main.ts'), 'const ownerValue: unknown = sync.doc.getMap("roomInfo").get("owner");', 'pushAtlasToDoc();');
+    expect(harvest).toContain('const ownerId = legacyOwnerMarker(rawOwner) ? "" : rawOwner;');
+    expect(harvest).toContain('const ownerKey = typeof ownerEntry?.keyB64 === "string" && ownerEntry.keyB64 ? ownerEntry.keyB64 : undefined;');
+    // Matched at the robot pick and the end of the job, and on the plan card.
+    expect(between(source('world.ts'), 'private disassemblyInput(', '\n  }')).toContain('identityPub: getIdentityPub(),');
+    expect(source('world.ts')).toContain('identityPub: () => getIdentityPub(),');
+    expect(source('devices.ts')).toContain("identityPub: () => stationPlanDeps.identityPub?.() ?? '',");
+    expect(source('stationPlanView.ts')).toContain(
+      "if (ownerIsMe(m.owner, { playerId: this.deps.playerId(), identityPub: this.deps.identityPub() })) return 'You';",
+    );
   });
 
   it('is the raw deed check, refused while a leave is under way', () => {

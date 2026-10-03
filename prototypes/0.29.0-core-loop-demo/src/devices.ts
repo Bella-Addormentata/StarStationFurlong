@@ -1110,6 +1110,8 @@ export interface MapTableDeps {
   openDoorPanel?: (doorId: string) => void;
   /** 🗺️ The local player's id, so a module's owner can read "You". */
   playerId?: () => string;
+  /** 🗺️ The local identity key: "You" still, back on a fresh player id. */
+  identityPub?: () => string;
   /** 🔧 The modules this room's robots could take apart (#192). */
   disassemblyCandidates?: () => DisassemblyCandidate[];
 }
@@ -1206,6 +1208,7 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           atlas: () => readStationAtlas(),
           currentRoomId: () => currentRoomId(),
           playerId: () => stationPlanDeps.playerId?.() ?? '',
+          identityPub: () => stationPlanDeps.identityPub?.() ?? '',
           ships: () => Object.values(readPlanetStore().ships),
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),

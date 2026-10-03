@@ -5255,6 +5255,7 @@ export class World {
       hereRoomId: World.activeRoomId(),
       doors: readAllDoors(),
       playerId: getPlayerId(),
+      identityPub: getIdentityPub(),
       welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
     };
   }
@@ -5763,6 +5764,7 @@ export class World {
         openDoorPanel: (doorId) =>
           deviceFocus.releaseThen(() => this.dockingSystem?.handlePanelRaycast(doorId)),
         playerId: () => getPlayerId(),
+        identityPub: () => getIdentityPub(),
         disassemblyCandidates: () => this.disassemblyCandidates(),
       });
       deviceFocus.beginFocus(this.player, device, ui);

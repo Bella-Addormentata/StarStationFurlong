@@ -28,7 +28,7 @@ import { moduleCorners, planModuleAt, stationPlan, visitingShips } from './stati
 import { TILE_SIZE } from './floorPlanDoc';
 import { legacyOwnerMarker } from './roomOwner';
 import type { DisassemblyCandidate, DisassemblyJob } from './disassembly';
-import { jobFraction, jobStatusText } from './disassembly';
+import { jobFraction, jobStatusText, ownerIsMe } from './disassembly';
 
 export interface StationPlanDeps {
   atlas: () => Record<string, AtlasEntry>;
@@ -36,6 +36,9 @@ export interface StationPlanDeps {
   currentRoomId: () => string;
   /** The local player's id (roomInfo.owner's vocabulary), to say "you". */
   playerId: () => string;
+  /** The local identity key, which still says "you" for an owner back on a
+   *  fresh player id (ownerIsMe). */
+  identityPub: () => string;
   /** Every ship summary this client holds, retired ones included: a ship's
    *  own report anywhere (another planet, retired) can contradict a berth
    *  the atlas still draws here. visitingShips picks this station's. */
@@ -425,7 +428,7 @@ export class StationPlanView {
     if (m.owner === undefined) return 'Owner not known yet (someone must stand in it once).';
     // null, or the pre-S2 marker: no verifiable owner (roomOwner.ts).
     if (m.owner === null || legacyOwnerMarker(m.owner.id)) return 'No verified owner';
-    if (m.owner.id === this.deps.playerId()) return 'You';
+    if (ownerIsMe(m.owner, { playerId: this.deps.playerId(), identityPub: this.deps.identityPub() })) return 'You';
     return m.owner.name ?? shortId(m.owner.id);
   }
 

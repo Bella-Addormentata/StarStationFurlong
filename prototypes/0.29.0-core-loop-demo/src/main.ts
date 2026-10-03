@@ -4111,8 +4111,11 @@ function harvestStationAtlas(): void {
   const gatesKnown = readUnnumberedPorts().length === 0;
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
   // 🗺️ #192: the module's owner, for the holotable's station atlas — with
-  // the name they go by here when their players entry has synced.
-  // The legacy marker names no verifiable owner: it is not carried.
+  // the name they go by here and their identity key (which still names them
+  // back on a fresh player id, as the deed check reads it) when their
+  // players entry has synced.
+  // The legacy marker names no verifiable owner: it is not carried, nor
+  // ever looked up in the players map (#141).
   // roomInfo is peer-written: anything but a string names no owner.
   const ownerValue: unknown = sync.doc.getMap("roomInfo").get("owner");
   const rawOwner = typeof ownerValue === "string" ? ownerValue : "";
@@ -4121,6 +4124,7 @@ function harvestStationAtlas(): void {
     ? (sync.doc.getMap("players").get(ownerId) as Partial<PlayerEntry> | undefined)
     : undefined;
   const ownerName = typeof ownerEntry?.name === "string" && ownerEntry.name ? ownerEntry.name : undefined;
+  const ownerKey = typeof ownerEntry?.keyB64 === "string" && ownerEntry.keyB64 ? ownerEntry.keyB64 : undefined;
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
     ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
@@ -4128,7 +4132,7 @@ function harvestStationAtlas(): void {
     // and neither has one whose id the atlas can't carry (cleanAtlasOwner
     // refuses it): left out, the owner would read as unread, keeping a
     // former owner for the card and for taking the module apart.
-    owner: ownerId ? cleanAtlasOwner(ownerName ? { id: ownerId, name: ownerName } : { id: ownerId }) ?? null : null,
+    owner: ownerId ? cleanAtlasOwner({ id: ownerId, name: ownerName, key: ownerKey }) ?? null : null,
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
