@@ -17,7 +17,7 @@
  */
 
 import { TvSyncController } from './tvSync';
-import type { TvPlayer } from './tvSync';
+import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
@@ -139,11 +139,12 @@ class YouTubePlayerAdapter implements Adapter {
   currentMs(): number {
     try { return (this.player?.getCurrentTime() ?? 0) * 1000; } catch { return 0; }
   }
-  durationMs(): number {
+  /** The whole video, once its metadata has said how long it is. */
+  seekableRange(): SeekableRange | null {
     try {
       const seconds = this.player?.getDuration() ?? 0;
-      return seconds > 0 ? seconds * 1000 : NaN;
-    } catch { return NaN; }
+      return seconds > 0 ? { startMs: 0, endMs: seconds * 1000 } : null;
+    } catch { return null; }
   }
   setRate(): void { /* YouTube's rate steps are coarse: the controller only seeks */ }
   setVolume(volume: number): void { try { this.player?.setVolume(volume); } catch { /* not ready */ } }
@@ -200,10 +201,13 @@ class HtmlVideoPlayerAdapter implements Adapter {
   pause(): void { this.video.pause(); }
   seek(ms: number): void { try { this.video.currentTime = ms / 1000; } catch { /* not seekable yet */ } }
   currentMs(): number { return this.video.currentTime * 1000; }
-  /** NaN before the metadata, and for a live stream (Infinity). */
-  durationMs(): number {
-    const seconds = this.video.duration;
-    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : NaN;
+  /** The element's own `seekable` ranges, first start to last end: a file's
+   *  whole length, a live stream's sliding window (its end may be open);
+   *  null before the ranges arrive. */
+  seekableRange(): SeekableRange | null {
+    const ranges = this.video.seekable;
+    if (ranges.length === 0) return null;
+    return { startMs: ranges.start(0) * 1000, endMs: ranges.end(ranges.length - 1) * 1000 };
   }
   setRate(rate: number): void { this.video.playbackRate = rate; }
   setVolume(volume: number): void { this.video.volume = Math.min(1, Math.max(0, volume / 100)); }
@@ -239,7 +243,7 @@ class ArchiveEmbedAdapter implements Adapter {
   pause(): void { /* no API */ }
   seek(): void { /* no API */ }
   currentMs(): number { return 0; }
-  durationMs(): number { return NaN; }
+  seekableRange(): null { return null; }
   setRate(): void { /* no API */ }
   setVolume(): void { /* no API */ }
   destroy(): void { this.iframe.remove(); }
@@ -335,7 +339,18 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
         ? focusable[(at <= 0 ? focusable.length : at) - 1]!
         : focusable[(at + 1) % focusable.length]!;
       next.focus();
+      return;
     }
+    // Every other key pressed in the dialog stays in it, like its clicks:
+    // the world listens on window, and Enter on a focused button would also
+    // open the quick chat, WASD walk the clone behind the overlay, Space
+    // and E wake whatever the player stands at. The key's own action (the
+    // button's click, the slider's step) is untouched, and keyup is never
+    // held back, so a key held across the open is still released to the
+    // world. A key with nothing focused (the body) is the dialog's too — it
+    // is the one thing open.
+    const target = e.target;
+    if (target === document.body || (target instanceof Node && root.contains(target))) e.stopPropagation();
   };
   window.addEventListener('keydown', onKey, true);
   theatre = {
@@ -447,13 +462,17 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     }
     hideNotice(t);
     t.player = player;
-    t.controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
+    const controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
+    t.controller = controller;
     // Only a player with a clock becomes the room's clock; the archive embed
     // reports nothing, so the headless heartbeat (tvSession) keeps beating.
-    // The phone's transport asks this player where it is, not the record.
+    // The phone's transport asks the controller where the room is: the
+    // player's clock once in step, the target a jump is still carrying it
+    // to until then (a pause written from where the player still reads
+    // would park the room there).
     if (player.hasClock) {
       t.unregister = registerTvPlayerOfRecord(t.itemId, {
-        positionMs: () => player.currentMs(),
+        positionMs: () => controller.positionMs(),
         canSeek: () => player.canSeek,
       });
     }
@@ -605,11 +624,24 @@ function renderTheatreChrome(t: Theatre): void {
     !mine && held ? `<span class="tv-theatre-lane">${escapeHtml(remote.name || 'someone')} has the remote</span>` : '',
   ].join('');
   if (controls !== t.lastControls) {
+    // A control row rebuilt under the keyboard keeps its place: ⏸ pressed
+    // with Enter becomes ▶ in the same slot, and the next Enter must find
+    // it — focus dropped to the body would go nowhere (and nowhere is where
+    // the world's shortcuts would have taken it, before onKey held them).
+    const focused = document.activeElement;
+    const slot = focused instanceof HTMLElement && t.controls.contains(focused)
+      ? theatreFocusable(t.controls).indexOf(focused) : -1;
     t.controls.innerHTML = controls;
     t.lastControls = controls;
+    if (slot >= 0) {
+      const rebuilt = theatreFocusable(t.controls);
+      (rebuilt[Math.min(slot, rebuilt.length - 1)] ?? t.root).focus();
+    }
     const c = t.controls;
-    // Where the room is: the player's own clock when it has one, else the record's.
-    const pos = () => (t.player && t.player.hasClock ? t.player.currentMs() : readPlayback(t.itemId).positionMs);
+    // Where the room is: the controller's word when a player with a clock
+    // is mounted (its own clock, or the target a jump is still carrying it
+    // to), else the record's.
+    const pos = () => (t.controller && t.player?.hasClock ? t.controller.positionMs() : readPlayback(t.itemId).positionMs);
     c.querySelector<HTMLButtonElement>('[data-tv-pause]')?.addEventListener('click', () => { tvPause(t.itemId, pos()); });
     c.querySelector<HTMLButtonElement>('[data-tv-resume]')?.addEventListener('click', () => { tvResume(t.itemId); });
     c.querySelector<HTMLButtonElement>('[data-tv-back]')?.addEventListener('click', () => { tvSeek(t.itemId, Math.max(0, pos() - 10_000)); });

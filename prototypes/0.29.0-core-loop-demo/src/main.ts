@@ -7039,19 +7039,33 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
 async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   let fingerprint: LocalFingerprint = { hex: "", base64: "", port: 4443 };
   let nodeOrigin = "";
-  try {
-    const res = await fetch("http://127.0.0.1:8080/api/fingerprint");
-    fingerprint = await res.json();
-    nodeOrigin = "http://127.0.0.1:8080";
-  } catch {
-    const res = await fetch("http://127.0.0.1:8081/api/fingerprint").catch(
-      () => null,
-    );
-    if (res) {
-      fingerprint = await res.json();
-      nodeOrigin = "http://127.0.0.1:8081";
+  // The node's HTTP origin as this page finds it: 8080, or 8081 when 8080
+  // was taken. A port that does not answer, or answers with something that
+  // is not JSON, is tried past; nothing here throws — the probe's verdict
+  // is `fingerprint.hex`, below, every round.
+  for (const origin of ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]) {
+    try {
+      const res = await fetch(`${origin}/api/fingerprint`);
+      const body: unknown = await res.json();
+      if (body && typeof body === "object") {
+        fingerprint = body as LocalFingerprint;
+        nodeOrigin = origin;
+        break;
+      }
+    } catch {
+      // unreachable, or not JSON: the next port
     }
   }
+  // Media from the node's origin plays in the theatre without asking
+  // (tvConsent.ts) — ONLY while the node answers as ours, with a fingerprint,
+  // not merely on a loopback port. The trust is decided afresh on every
+  // probe, so a round the node does not answer withdraws it: once the node
+  // is gone, whatever next binds its port is a stranger, until a
+  // fingerprint says otherwise.
+  const ours = Boolean(fingerprint.hex) && nodeOrigin !== "";
+  setOwnMediaOrigins(
+    ours ? [window.location.origin, nodeOrigin] : [window.location.origin],
+  );
   if (!fingerprint.hex) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
@@ -7066,10 +7080,6 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     fingerprint.iroh_direct_addrs,
   );
   localFingerprint = fingerprint;
-  // Identified as OUR node (it answered with a fingerprint, not merely on a
-  // loopback port): media from its origin is this machine serving this
-  // viewer, so the theatre fetches it without asking (tvConsent.ts).
-  if (nodeOrigin) setOwnMediaOrigins([window.location.origin, nodeOrigin]);
   renderReachabilityRow(fingerprint);
   return fingerprint;
 }
