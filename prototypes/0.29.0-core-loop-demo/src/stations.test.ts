@@ -331,6 +331,10 @@ describe('stationForRoom / planetForRoom', () => {
     expect(stationRoomCause('b1', [gangway('a1')])).toBe('welcome-room');
     expect(stationRoomCause('helm-room', [gangway('a1'), dock('ship')])).toBe('bolted');
     expect(stationRoomCause('ship', [dock('b1')])).toBeNull();
+    // A one-module station: its welcome room with no gangway (a docked ship
+    // is no part of it), free to fly by hand but still never to DEPART.
+    expect(stationRoomCause('b1', [])).toBe('lone-station');
+    expect(stationRoomCause('b1', [dock('ship')])).toBe('lone-station');
   });
 
   it('finds the station a lone module is docked at from its live doors', () => {

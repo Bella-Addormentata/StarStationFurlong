@@ -155,10 +155,22 @@ export function groundedBy(): StationRoomCause | null {
 }
 
 /** Engine, tank and helm fly a ship (`shipReady`), but a station's own room
- *  wearing them, for station keeping, never takes off: no flight, and no
- *  location taken from the ship's flight record. */
+ *  wearing them, for station keeping, never DEPARTs on a hop: no flight, and
+ *  no location taken from the ship's flight record. */
 export function flightCapable(shipReady: boolean): boolean {
   return shipReady && groundedBy() === null;
+}
+
+/** May engine, tank and helm (`shipReady`) fly the current room freely, by
+ *  hand and on to PARK in a new orbit? A ship may, and so may a one-module
+ *  station's own room ('lone-station'), though it never DEPARTs
+ *  (flightCapable): no gangway holds it, so it leaves nothing of the station
+ *  behind. A module bolted in, or the welcome room of a station of several
+ *  modules, may not. */
+export function freeFlightCapable(shipReady: boolean): boolean {
+  if (!shipReady) return false;
+  const why = groundedBy();
+  return why === null || why === 'lone-station';
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */

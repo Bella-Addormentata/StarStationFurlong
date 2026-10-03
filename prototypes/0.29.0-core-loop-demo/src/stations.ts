@@ -391,24 +391,28 @@ export function dockedStationFor(
 }
 
 /** Why a room is a station's own (stationRoomCause). */
-export type StationRoomCause = 'welcome-room' | 'bolted';
+export type StationRoomCause = 'welcome-room' | 'lone-station' | 'bolted';
 
-/** Why `roomId` is a station's own room, never a ship that flies: a saved or
- *  built-in station's welcome room, or a module bolted into a station by
- *  structure (a paired door that is no berth: taking that gangway down frees
- *  it). Null for a ship. Such a room may wear engine, tank and helm for
- *  station keeping. */
+/** Why `roomId` is a station's own room, never a ship that DEPARTs: a saved
+ *  or built-in station's welcome room ('lone-station' when no gangway joins
+ *  it to another module: a one-module station, which may still fly by hand
+ *  and PARK), or a module bolted into a station by structure (a paired door
+ *  that is no berth: taking that gangway down frees it). Null for a ship.
+ *  Such a room may wear engine, tank and helm for station keeping. */
 export function stationRoomCause(
   roomId: string,
   doors: Iterable<DoorRecord>,
   stations: StationRecord[] = listStations(),
 ): StationRoomCause | null {
   if (!roomId) return null;
-  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) return 'welcome-room';
+  let bolted = false;
   for (const rec of doors) {
-    if (rec.paired === true && !isBerthDoor(rec)) return 'bolted';
+    if (rec.paired === true && !isBerthDoor(rec)) { bolted = true; break; }
   }
-  return null;
+  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) {
+    return bolted ? 'welcome-room' : 'lone-station';
+  }
+  return bolted ? 'bolted' : null;
 }
 
 /** Is `roomId` a station's own room (stationRoomCause)? */

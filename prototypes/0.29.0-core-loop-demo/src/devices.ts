@@ -2284,8 +2284,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             // name what holds it, not systems it already has.
             const why = isShipReady() ? groundedBy() : null;
             if (why === 'bolted') return chainedCopy(chained.length);
-            if (why === 'welcome-room') {
-              return 'This is the station\'s own room: its engine, tank and helm keep the station in orbit, and it never flies.';
+            if (why !== null) {
+              return 'This is the station\'s own room: its engine, tank and helm keep the station in orbit, and a station never DEPARTs like a ship.';
             }
             return 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.';
           }

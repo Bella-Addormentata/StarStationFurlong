@@ -15,6 +15,7 @@ import {
   FUEL_PER_KMS,
   findStation,
   flightCapable,
+  freeFlightCapable,
   groundedBy,
   setStationRoomCheck,
   planHop,
@@ -151,6 +152,20 @@ describe('flight capability', () => {
     expect(groundedBy()).toBeNull();
     setStationRoomCheck(null);
     expect(groundedBy()).toBeNull();
+  });
+
+  it('flies a one-module station freely, though it never DEPARTs', () => {
+    setStationRoomCheck(() => 'lone-station');
+    expect(flightCapable(true)).toBe(false);
+    expect(freeFlightCapable(true)).toBe(true);
+    expect(freeFlightCapable(false)).toBe(false);
+    for (const why of ['welcome-room', 'bolted'] as const) {
+      setStationRoomCheck(() => why);
+      expect(freeFlightCapable(true)).toBe(false);
+    }
+    setStationRoomCheck(() => null);
+    expect(freeFlightCapable(true)).toBe(true);
+    setStationRoomCheck(null);
   });
 });
 
