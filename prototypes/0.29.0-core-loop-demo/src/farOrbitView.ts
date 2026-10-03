@@ -39,7 +39,7 @@ import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { readStore, shipsAroundPlanet } from './planetSummary';
-import { isPinMove, moveTransitPointAt } from './stationMove';
+import { isPinMove, moveTransitPointAt, stationPointWithMoveAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
@@ -100,7 +100,7 @@ type Source =
  *  the two stations' orbits, pinned to the record's own times. */
 /** Where a flight record's location is: a station, or open orbit (174's
  *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
-type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
+type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot' | 'orbit'>;
 
 /** A flight's end as it was when the ship left (`leftAt`): a station that
  *  has moved to another planet since then is still at its old slot for the
@@ -119,6 +119,14 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
       : latest.settles;
     if (moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now && betweenPlanets(moved)) {
       return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot };
+    }
+    // 🎚️ Likewise an altitude change since the ship left: the flight was
+    // planned to the orbit the station flew then.
+    if (moved?.mode === 'orbit' && moved.orbit && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now) {
+      return {
+        id: station.id, planetId: station.planetId, orbitSlot: station.orbitSlot,
+        orbit: { radiusKm: moved.orbit.fromRadiusKm, phase0: moved.orbit.fromPhase0 },
+      };
     }
     return station;
   }
@@ -261,7 +269,8 @@ function gather(now: number): Source {
     viewerRingRadiusKm = stationOrbit(place).radiusKm;
   } else if (me) {
     const station = me;
-    viewer = (ms) => stationPointAt(station, ms);
+    // 🎚️ On its altitude change's course while it flies one.
+    viewer = (ms) => stationPointWithMoveAt(station, ms);
     viewerRingRadiusKm = stationOrbit(me).radiusKm;
   } else {
     const orbit = orbitForSlot(planetId, 0);
@@ -324,7 +333,7 @@ function layoutFor(source: Source, now: number, withPaths: boolean): FarLayout |
   const stations: FarStationInput[] = source.stations.map(({ record, modules }) => ({
     id: record.id,
     name: record.name,
-    point: stationPointAt(record, now),
+    point: stationPointWithMoveAt(record, now),
     ringRadiusKm: stationOrbit(record).radiusKm,
     modules,
   }));

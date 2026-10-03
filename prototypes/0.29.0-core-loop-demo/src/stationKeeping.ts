@@ -88,12 +88,12 @@
 
 import * as Y from 'yjs';
 import type { DoorRecord } from './doorsDoc';
-import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, circularOrbit, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
+import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, baseOrbit, circularOrbit, isUsableOrbit, orbitalSeconds, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { FUEL_METER_MAX, fuelCeiling, readFuelSettlement, setFuelDrawMeter, shipVersion, subscribeShip } from './shipDoc';
 import { isBerthDoor, roomIdFromSeed } from './stationAtlas';
-import { MAX_ORBIT_SLOTS, planetById } from './stations';
-import type { StationRecord } from './stations';
+import { MAX_ORBIT_SLOTS, orbitAfterMove, planetById } from './stations';
+import type { StationOrbit, StationRecord } from './stations';
 
 const TAU = 2 * Math.PI;
 const DEG = Math.PI / 180;
@@ -170,6 +170,11 @@ export interface OrbitTrim {
   /** The slot it was trimmed in. A station moved to another slot or planet
    *  flies that slot's orbit untrimmed until its next burn. */
   slot: number;
+  /** 🎚️ The altitude orbit it was trimmed on (StationRecord.orbit), when the
+   *  station flew one; left out, the slot's. Part of the basis: a station
+   *  that changes altitude flies its new orbit untrimmed until its next burn.
+   *  "The slot" below means this base orbit. */
+  base?: StationOrbit;
   /** Orbit radius minus the slot's, km, within ±MAX_TRIM_KM. */
   dRadiusKm: number;
   /** Angle from the slot's nominal position at `at`, radians in (−π, π];
@@ -186,9 +191,11 @@ export interface OrbitTrim {
 
 /** One burn of the stick, as the log keeps it. Plain JSON. */
 export interface TrimBurn {
-  /** The basis of the orbit it trimmed: a PLANETS id and a slot. */
+  /** The basis of the orbit it trimmed: a PLANETS id and a slot, and the
+   *  altitude orbit when the station flew one (OrbitTrim.base). */
   planetId: string;
   slot: number;
+  base?: StationOrbit;
   /** Which way it pushed. */
   dir: TrimDirection;
   /** Real ms it fired. */
@@ -202,7 +209,7 @@ export interface TrimBurn {
 }
 
 /** A burn that fired, as the stick and the dashboard show it. */
-export type FiredBurn = Pick<TrimBurn, 'planetId' | 'slot' | 'dir' | 'at'>;
+export type FiredBurn = Pick<TrimBurn, 'planetId' | 'slot' | 'base' | 'dir' | 'at'>;
 
 /** What a level write keeps of the room's burn log, beside station keeping's
  *  meter reading on the fuel record (shipDoc.writeFuelLevel asks the meter
@@ -241,9 +248,46 @@ const MAX_AT_MS = ORBIT_EPOCH_MS + 100 * 365.25 * 24 * 3600 * 1000;
  *  above TRIM_FUEL. */
 const MAX_BURN_FUEL = 1_000;
 
-function isBasis(planetId: unknown, slot: unknown): boolean {
+function isBasis(planetId: unknown, slot: unknown, base?: unknown): boolean {
   return typeof planetId === 'string' && planetId.length > 0 && planetId.length <= MAX_PLANET_ID_LEN
-    && Number.isInteger(slot) && (slot as number) >= 0 && (slot as number) < MAX_ORBIT_SLOTS;
+    && Number.isInteger(slot) && (slot as number) >= 0 && (slot as number) < MAX_ORBIT_SLOTS
+    && (base === undefined || isBaseOrbit(base));
+}
+
+/** 🎚️ An altitude orbit off the wire: plain finite numbers, nothing else. */
+function isBaseOrbit(v: unknown): v is StationOrbit {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Partial<Record<keyof StationOrbit, unknown>>;
+  return typeof o.radiusKm === 'number' && Number.isFinite(o.radiusKm) && o.radiusKm > 0
+    && typeof o.phase0 === 'number' && Number.isFinite(o.phase0) && Math.abs(o.phase0) <= TAU;
+}
+
+/** 🎚️ The basis orbit a station flies: its altitude orbit when it has one it
+ *  can fly (StationRecord.orbit, or for a record that carries its latest
+ *  move instead, what that move left), else none (the slot's). */
+export function basisOf(
+  station: Pick<StationRecord, 'planetId' | 'orbit'> & { move?: StationRecord['move'] },
+  nowMs: number = Date.now(),
+): StationOrbit | undefined {
+  const o = station.orbit ?? orbitAfterMove(station.move, nowMs);
+  return isUsableOrbit(planetById(station.planetId), o) ? { radiusKm: o.radiusKm, phase0: o.phase0 } : undefined;
+}
+
+/** Do two bases name the same orbit: both the slot's, or one altitude orbit
+ *  (the very numbers its move carries, so equal everywhere)? */
+export function sameBase(a: StationOrbit | undefined, b: StationOrbit | undefined): boolean {
+  if (!a || !b) return !a && !b;
+  return a.radiusKm === b.radiusKm && a.phase0 === b.phase0;
+}
+
+/** The untrimmed orbit a basis names. */
+function basisOrbit(b: { planetId: string; slot: number; base?: StationOrbit }): CircularOrbit {
+  return baseOrbit({ planetId: b.planetId, orbitSlot: b.slot, orbit: b.base });
+}
+
+/** The basis fields, as a record carries them (no `base` for the slot's). */
+function basisFields(b: { planetId: string; slot: number; base?: StationOrbit }): { planetId: string; slot: number; base?: StationOrbit } {
+  return { planetId: b.planetId, slot: b.slot, ...(b.base ? { base: { radiusKm: b.base.radiusKm, phase0: b.base.phase0 } } : {}) };
 }
 
 function isBurnTime(at: unknown): boolean {
@@ -258,7 +302,7 @@ function isDirection(v: unknown): v is TrimDirection {
 export function isOrbitTrim(v: unknown): v is OrbitTrim {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof OrbitTrim, unknown>>;
-  return isBasis(r.planetId, r.slot)
+  return isBasis(r.planetId, r.slot, r.base)
     && typeof r.dRadiusKm === 'number' && Number.isFinite(r.dRadiusKm) && Math.abs(r.dRadiusKm) <= MAX_TRIM_KM
     && typeof r.dPhase === 'number' && Number.isFinite(r.dPhase) && Math.abs(r.dPhase) <= Math.PI
     && isBurnTime(r.at)
@@ -271,7 +315,7 @@ export function isOrbitTrim(v: unknown): v is OrbitTrim {
 export function isTrimBurn(v: unknown): v is TrimBurn {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof TrimBurn, unknown>>;
-  return isBasis(r.planetId, r.slot)
+  return isBasis(r.planetId, r.slot, r.base)
     && isDirection(r.dir)
     && isBurnTime(r.at)
     && typeof r.fuel === 'number' && r.fuel > 0 && r.fuel <= MAX_BURN_FUEL
@@ -293,7 +337,7 @@ const MAX_SETTLED_FIRED = 256;
 function isFiredBurn(v: unknown): v is FiredBurn {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof FiredBurn, unknown>>;
-  return isBasis(r.planetId, r.slot) && isDirection(r.dir) && isBurnTime(r.at);
+  return isBasis(r.planetId, r.slot, r.base) && isDirection(r.dir) && isBurnTime(r.at);
 }
 
 /** Shape guard for a settlement off the fuel record. */
@@ -311,12 +355,12 @@ export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
 /** A trim's orbit fields only (a record from before the log also carries
  *  its fuel, which the meter reads apart). */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
-  return { planetId: t.planetId, slot: t.slot, dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
+  return { ...basisFields(t), dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
 }
 
 /** Only the fields a fired burn has — what a settlement keeps. */
 function cleanFired(b: FiredBurn): FiredBurn {
-  return { planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at };
+  return { ...basisFields(b), dir: b.dir, at: b.at };
 }
 
 /** The last burn to fire on each orbit a station can take here, in firing
@@ -327,17 +371,20 @@ function lastFiredPerOrbit(fired: readonly FiredBurn[]): FiredBurn[] {
   const last = new Map<string, FiredBurn>();
   for (const b of fired) {
     if (planetById(b.planetId).id !== b.planetId) continue;
-    const orbit = `${b.planetId}:${b.slot}`;
+    const orbit = `${b.planetId}:${b.slot}${b.base ? `:${b.base.radiusKm}:${b.base.phase0}` : ''}`;
     const kept = last.get(orbit);
     // Of two at the same time, the first: the one readBurnFiring picks.
     if (!kept || b.at > kept.at) last.set(orbit, b);
   }
-  return [...last.values()].sort((a, b) => a.at - b.at).map(cleanFired);
+  // 🎚️ Each altitude orbit is an orbit of its own, so their count has no
+  // fixed bound: the latest ones, which hold any lockout, stay within the
+  // bound a settlement off the wire is held to.
+  return [...last.values()].sort((a, b) => a.at - b.at).slice(-MAX_SETTLED_FIRED).map(cleanFired);
 }
 
 /** Only the fields a burn has — what a write publishes. */
 function cleanBurn(b: TrimBurn): TrimBurn {
-  const out: TrimBurn = { planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at, fuel: b.fuel };
+  const out: TrimBurn = { ...basisFields(b), dir: b.dir, at: b.at, fuel: b.fuel };
   if (b.cap !== undefined) out.cap = b.cap;
   return out;
 }
@@ -346,22 +393,23 @@ function cleanBurn(b: TrimBurn): TrimBurn {
  *  names the planet and slot the station flies (the planet as orbits.ts
  *  resolves it, so an unknown id matches the default planet it orbits);
  *  otherwise none. */
-export function trimFor<T extends Pick<OrbitTrim, 'planetId' | 'slot'>>(
-  station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null,
+export function trimFor<T extends Pick<OrbitTrim, 'planetId' | 'slot' | 'base'>>(
+  station: (Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'> & { move?: StationRecord['move'] }) | null,
   trim: T | null,
 ): T | null {
   if (!station || !trim) return null;
-  return trim.planetId === planetById(station.planetId).id && trim.slot === station.orbitSlot ? trim : null;
+  return trim.planetId === planetById(station.planetId).id && trim.slot === station.orbitSlot
+    && sameBase(trim.base, basisOf(station)) ? trim : null;
 }
 
 // ── The trimmed orbit (on orbits.ts) ─────────────────────────────────────────
 
-/** The station's UNTRIMMED slot orbit — the basis every trim is measured
- *  from. Not orbits.stationOrbit: that one follows a station's trim once a
- *  trim resolver is installed, and measuring from it would apply the trim
- *  twice. */
-export function slotOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot'>): CircularOrbit {
-  return orbitForSlot(station.planetId, station.orbitSlot);
+/** The station's UNTRIMMED base orbit (its slot's, or its altitude's) — the
+ *  basis every trim is measured from. Not orbits.stationOrbit: that one
+ *  follows a station's trim once a trim resolver is installed, and measuring
+ *  from it would apply the trim twice. */
+export function slotOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'>): CircularOrbit {
+  return baseOrbit(station);
 }
 
 /**
@@ -434,7 +482,7 @@ export interface TrimContext {
    *  live — the face was picked when the helm opened, and a peer can take a
    *  gangway down while it is open)? */
   bolted: boolean;
-  station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null;
+  station: Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'> | null;
   /** The room's trim, as read — trimFor is applied here, not by the caller. */
   trim: OrbitTrim | null;
   commander: boolean;
@@ -468,9 +516,10 @@ export type TrimPlan = { ok: true; burn: TrimBurn; trim: OrbitTrim } | { ok: fal
  * from the slot carries across, so nothing jumps); AHEAD / BACK slide it a
  * step along the orbit and keep the radius.
  */
-export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planetId' | 'slot' | 'dir' | 'at'>): OrbitTrim | null {
-  const current = before && before.planetId === burn.planetId && before.slot === burn.slot ? before : null;
-  const base = orbitForSlot(burn.planetId, burn.slot);
+export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planetId' | 'slot' | 'base' | 'dir' | 'at'>): OrbitTrim | null {
+  const current = before && before.planetId === burn.planetId && before.slot === burn.slot
+    && sameBase(before.base, burn.base) ? before : null;
+  const base = basisOrbit(burn);
   const radius = current?.dRadiusKm ?? 0;
   const offset = slotOffsetAt(base, current, burn.at);
   let dRadiusKm = radius;
@@ -483,7 +532,7 @@ export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planet
   // peer-written radius that was not a whole step.
   dRadiusKm = Math.round(dRadiusKm * 1000) / 1000;
   if (Math.abs(dRadiusKm) > MAX_TRIM_KM) return null;
-  return { planetId: burn.planetId, slot: burn.slot, dRadiusKm, dPhase: signedAngle(dPhase), at: burn.at, last: burn.dir };
+  return { ...basisFields(burn), dRadiusKm, dPhase: signedAngle(dPhase), at: burn.at, last: burn.dir };
 }
 
 /** Burn order: by time, then by every other field, so all clients replay
@@ -494,6 +543,9 @@ function burnOrder(a: TrimBurn, b: TrimBurn): number {
   if (a.dir !== b.dir) return a.dir < b.dir ? -1 : 1;
   if (a.planetId !== b.planetId) return a.planetId < b.planetId ? -1 : 1;
   if (a.slot !== b.slot) return a.slot - b.slot;
+  const baseA = a.base ? JSON.stringify([a.base.radiusKm, a.base.phase0]) : '';
+  const baseB = b.base ? JSON.stringify([b.base.radiusKm, b.base.phase0]) : '';
+  if (baseA !== baseB) return baseA < baseB ? -1 : 1;
   if (a.fuel !== b.fuel) return a.fuel - b.fuel;
   const capA = a.cap ?? Number.POSITIVE_INFINITY;
   const capB = b.cap ?? Number.POSITIVE_INFINITY;
@@ -545,8 +597,8 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
  *  from the slot measured at that burn. */
 function heldTrim(trim: OrbitTrim | null, dir: TrimDirection, at: number): OrbitTrim | null {
   if (!trim) return null;
-  const base = orbitForSlot(trim.planetId, trim.slot);
-  return { planetId: trim.planetId, slot: trim.slot, dRadiusKm: trim.dRadiusKm, dPhase: slotOffsetAt(base, trim, at), at, last: dir };
+  const base = basisOrbit(trim);
+  return { ...basisFields(trim), dRadiusKm: trim.dRadiusKm, dPhase: slotOffsetAt(base, trim, at), at, last: dir };
 }
 
 /**
@@ -587,7 +639,8 @@ export function planTrim(ctx: TrimContext, dir: TrimDirection): TrimPlan {
   const current = trimFor(station, ctx.trim);
   const firing = ctx.firing === undefined ? current : trimFor(station, ctx.firing);
   if (isFiring(firing, now)) return { ok: false, refusal: 'burning' };
-  const burn: TrimBurn = { planetId: planetById(station.planetId).id, slot: station.orbitSlot, dir, at: now, fuel: TRIM_FUEL };
+  const base = basisOf(station, now);
+  const burn: TrimBurn = { planetId: planetById(station.planetId).id, slot: station.orbitSlot, ...(base ? { base } : {}), dir, at: now, fuel: TRIM_FUEL };
   if (ctx.capacity !== undefined) burn.cap = ctx.capacity;
   const trim = applyBurn(current, burn);
   return trim ? { ok: true, burn, trim } : { ok: false, refusal: 'at-limit' };
@@ -643,7 +696,7 @@ export function describeRefusal(refusal: TrimRefusal, tanks: number, dRadiusKm =
 
 /** The burn a trim's last one was. */
 function lastBurnOf(trim: OrbitTrim): FiredBurn {
-  return { planetId: trim.planetId, slot: trim.slot, dir: trim.last, at: trim.at };
+  return { ...basisFields(trim), dir: trim.last, at: trim.at };
 }
 
 /** The dashboard's status line when nothing refuses: the burn firing, on
@@ -956,7 +1009,7 @@ export function readFuelDrawn(): number {
  *  any orbit's. A dropped burn never fired. */
 export function readBurnFiring(
   realMs: number,
-  station?: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null,
+  station?: Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'> | null,
 ): FiredBurn | null {
   if (!docAlive() || station === null) return null;
   let latest: FiredBurn | null = null;
@@ -966,7 +1019,7 @@ export function readBurnFiring(
     latest = b;
   }
   return latest && isFiring(latest, realMs)
-    ? { planetId: latest.planetId, slot: latest.slot, dir: latest.dir, at: latest.at }
+    ? { ...basisFields(latest), dir: latest.dir, at: latest.at }
     : null;
 }
 

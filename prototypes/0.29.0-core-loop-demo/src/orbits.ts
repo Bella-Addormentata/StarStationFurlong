@@ -52,8 +52,8 @@
  * Pure: no DOM, no Three, no docs. Pinned by orbits.test.ts.
  */
 
-import { planetById } from './stations';
-import type { PlanetRecord, StationRecord } from './stations';
+import { MAX_ORBIT_SLOTS, planetById } from './stations';
+import type { PlanetRecord, StationOrbit, StationRecord } from './stations';
 
 /** The orbital clock runs this many times faster than real time: one real
  *  second is one orbital minute. A low orbit (92 orbital minutes) goes round
@@ -148,15 +148,63 @@ export function orbitForSlot(planetId: string, slot: number): CircularOrbit {
   return circularOrbit(planet, radiusKm, PHASE_SLOT0 + s * PHASE_STEP);
 }
 
+// ── 🎚️ Altitude orbits ───────────────────────────────────────────────────────
+//
+// A station's helm can pick an ALTITUDE around its planet (issue 191): any
+// altitude in the band below, clear of every other station's orbit, so
+// stations need not keep to the slots' widely spaced orbits. The slot stays
+// the station's place in the list (stations.listStations); the orbit it flies
+// is the one its latest altitude change left it in (StationRecord.orbit).
+
+/** The lowest altitude a station may pick: clear of the atmosphere's drag. */
+export const MIN_ALTITUDE_KM = 200;
+
+/** Two stations' orbits around one planet stay at least this far apart, in
+ *  radius: past both their station-keeping bands (±20 km each), so trimming
+ *  never brings two stations within 10 km of each other's orbit. */
+export const MIN_ORBIT_SEPARATION_KM = 50;
+
+/** The highest altitude a station may pick around a planet: the top slot's. */
+export function maxAltitudeKm(planetId: string): number {
+  return orbitForSlot(planetId, MAX_ORBIT_SLOTS - 1).altitudeKm;
+}
+
+/** Where an orbit of `radiusKm` falls among a planet's slots, counted in
+ *  slots: a slot's own orbit is its index, and an altitude between two slots
+ *  falls between their indices (schematic maps space stations by it). */
+export function slotPosition(planetId: string, radiusKm: number): number {
+  const r0 = orbitForSlot(planetId, 0).radiusKm;
+  return Math.log(radiusKm / r0) / Math.log(SLOT_RADIUS_RATIO);
+}
+
+/** Can a station fly this orbit around this planet: finite, within the
+ *  altitude band (a hair of rounding allowed either side)? */
+export function isUsableOrbit(planet: PlanetRecord, orbit: StationOrbit | null | undefined): orbit is StationOrbit {
+  if (!orbit || !Number.isFinite(orbit.radiusKm) || !Number.isFinite(orbit.phase0)) return false;
+  const alt = orbit.radiusKm - planet.radiusKm;
+  return alt >= MIN_ALTITUDE_KM - 1e-6 && alt <= maxAltitudeKm(planet.id) + 1e-6;
+}
+
 // ── Station keeping: the trim seam ───────────────────────────────────────────
 
 /** What the orbit helpers need to know about a station. A trim resolver finds
- *  the station by `id`; without one, the station flies its slot's orbit. */
-export type OrbitingStation = Pick<StationRecord, 'planetId' | 'orbitSlot'> & { id?: string };
+ *  the station by `id`; without one, the station flies its base orbit: the
+ *  one an altitude change left it in (`orbit`), else its slot's. */
+export type OrbitingStation = Pick<StationRecord, 'planetId' | 'orbitSlot'> & { id?: string; orbit?: StationOrbit };
+
+/** 🎚️ A station's BASE orbit, untrimmed: the orbit its latest altitude change
+ *  left it in, when that is one it can fly, else its slot's. Station keeping
+ *  measures its trim from this one. */
+export function baseOrbit(station: OrbitingStation): CircularOrbit {
+  const slot = orbitForSlot(station.planetId, station.orbitSlot);
+  const o = station.orbit;
+  return isUsableOrbit(slot.planet, o) ? circularOrbit(slot.planet, o.radiusKm, o.phase0) : slot;
+}
 
 /** The orbit a station flies when station keeping has trimmed it off its
- *  slot's, or null for none. Only the radius and phase are read: stationOrbit
- *  rebuilds the rest around the slot's planet. */
+ *  base orbit (baseOrbit: its slot's, or its altitude's), or null for none.
+ *  Only the radius and phase are read: stationOrbit rebuilds the rest around
+ *  the slot's planet. */
 export type StationTrimResolver = (
   station: OrbitingStation & { id: string },
   slotOrbit: CircularOrbit,
@@ -171,18 +219,18 @@ export function setStationTrimResolver(resolver: StationTrimResolver | null): vo
   trimResolver = resolver;
 }
 
-/** How far a trim may move a station from its slot's radius, as a fraction of
+/** How far a trim may move a station from its base radius, as a fraction of
  *  that radius: a sanity bound well inside half the gap to either neighbouring
  *  slot (a tenth of the radius below, an eighth above), so a trimmed station
  *  always stays nearest its own slot. Station keeping holds a far tighter
  *  limit of its own. */
 const MAX_TRIM_FRACTION = 0.05;
 
-/** The orbit a station flies: its slot's, or the trimmed one the resolver
- *  gives. A resolver answer that throws, is not finite, or strays out of
- *  bounds is ignored. */
+/** The orbit a station flies: its base orbit (baseOrbit), or the trimmed one
+ *  the resolver gives. A resolver answer that throws, is not finite, or
+ *  strays out of bounds is ignored. */
 export function stationOrbit(station: OrbitingStation): CircularOrbit {
-  const slot = orbitForSlot(station.planetId, station.orbitSlot);
+  const slot = baseOrbit(station);
   if (!trimResolver || typeof station.id !== 'string' || !station.id) return slot;
   let trim: Pick<CircularOrbit, 'radiusKm' | 'phase0'> | null;
   try {
@@ -286,8 +334,8 @@ export interface TransferPlan {
  * π − ω₂·tH at the burn. The lead changes at ω₂ − ω₁, which fixes the wait.
  */
 export function planTransfer(
-  from: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>,
-  to: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>,
+  from: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot' | 'orbit'>,
+  to: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot' | 'orbit'>,
   nowMs: number,
 ): TransferPlan | null {
   if (from.id === to.id || planetById(from.planetId).id !== planetById(to.planetId).id) return null;
@@ -376,4 +424,52 @@ export function transferPointAt(
     leg: 'transfer',
     speedKmS: Math.sqrt(plan.from.planet.mu * (2 / radiusKm - 1 / a)), // vis-viva
   };
+}
+
+// ── 🎚️ Altitude changes ──────────────────────────────────────────────────────
+
+/** An altitude change's flight: the Hohmann transfer from the orbit a station
+ *  flies to a circle at another radius, leaving AT ONCE. No target needs
+ *  meeting, so there is no launch window: the new orbit is phased to wherever
+ *  the station arrives, opposite where it left. */
+export interface OrbitChangePlan {
+  from: CircularOrbit;
+  to: CircularOrbit;
+  /** Real ms of the two burns (whole ms, as move records keep them). */
+  departAt: number;
+  arriveAt: number;
+  /** Both burns together, km/s. */
+  deltaVKmS: number;
+}
+
+/** Plan an altitude change from `from` to a circle `toRadiusKm` from the
+ *  planet's centre, leaving at `departAt` (rounded up to a whole ms). Null for
+ *  a radius that is not finite and positive, or the same as the one flown. */
+export function planOrbitChange(from: CircularOrbit, toRadiusKm: number, departAt: number): OrbitChangePlan | null {
+  if (!Number.isFinite(toRadiusKm) || toRadiusKm <= 0 || toRadiusKm === from.radiusKm || !Number.isFinite(departAt)) return null;
+  const mu = from.planet.mu;
+  const r1 = from.radiusKm;
+  const r2 = toRadiusKm;
+  const tH = Math.PI * Math.sqrt(((r1 + r2) / 2) ** 3 / mu);
+  const dv1 = Math.abs(Math.sqrt(mu / r1) * (Math.sqrt((2 * r2) / (r1 + r2)) - 1));
+  const dv2 = Math.abs(Math.sqrt(mu / r2) * (1 - Math.sqrt((2 * r1) / (r1 + r2))));
+  const depart = Math.ceil(departAt);
+  const arrive = Math.max(depart + 1, Math.round(depart + realMsFor(tH)));
+  // The station arrives opposite where it left; its new orbit is phased so
+  // it stands there at the arrival burn.
+  const meanMotion = Math.sqrt(mu / r2 ** 3);
+  const arriveAngle = angleAt(from, depart) + Math.PI;
+  const to = circularOrbit(from.planet, r2, arriveAngle - meanMotion * orbitalSeconds(arrive));
+  return { from, to, departAt: depart, arriveAt: arrive, deltaVKmS: dv1 + dv2 };
+}
+
+/** Where a station changing altitude is at a real time, planet-centred: on
+ *  its old orbit before the first burn, on the transfer ellipse between the
+ *  burns, on its new orbit after. */
+export function orbitChangePointAt(plan: Pick<OrbitChangePlan, 'from' | 'to' | 'departAt' | 'arriveAt'>, realMs: number): OrbitPoint {
+  const p = transferPointAt({
+    fromId: '', toId: '', from: plan.from, to: plan.to, departAt: plan.departAt, arriveAt: plan.arriveAt,
+    waitMs: 0, transferMs: plan.arriveAt - plan.departAt, deltaVKmS: 0, synodicMs: Infinity,
+  }, realMs);
+  return { radiusKm: p.radiusKm, angle: p.angle };
 }
