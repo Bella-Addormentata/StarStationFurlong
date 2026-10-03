@@ -108,6 +108,7 @@ import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } fr
 import {
   bindShipDoc,
   flightArrived,
+  pairingAllowedByFlight,
   readFlightRecord,
   subscribeShip,
   writeFlightRecord,
@@ -148,6 +149,7 @@ import { isRouteRunning, liveDockFrom, type LiveDockAt, type RouteWalkCache } fr
 // the ship's planet summary carries the route's gate, next stop, departure
 // and status so an all-gates board anywhere around the planet can show it.
 import {
+  applyDeparturesPublish,
   bindDeparturesDoc,
   boardGate,
   readBoardSetting,
@@ -165,6 +167,11 @@ import { createDeparturesPublisher, initDeparturesWrite, writeDepartures } from 
 // 🚏🛟 A5: the route's keeper — docks and casts off a running ferry in every
 // game in the ship's room, on the timetable's moments.
 import { createRouteKeeper, sameStationReader } from "./routeKeeper";
+// 🚏🤖 …and a station's gate keeper: a gate set to AUTO-DOCK FERRIES docks
+// a ferry that calls with nobody aboard, through a background session to the
+// ferry's room.
+import { createGateKeeper } from "./gateKeeper";
+import { openRoomSession, type RoomSessionDeps } from "./roomSession";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -192,10 +199,12 @@ import {
 import {
   bindStationMoveDoc,
   cancelTowLeftBehind,
+  dockLockedByMove,
   installStationMoveResolver,
   isTowing,
   pinSettledArrivals,
   subscribeStationMove,
+  towHoldsDock,
 } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
@@ -223,6 +232,7 @@ import {
 import {
   bindDoorsDoc,
   writeDoorPairing,
+  writeDoorRecordTo,
   readAllDoors,
   readDoor,
   subscribeDoors,
@@ -261,6 +271,7 @@ import {
   bindDoorPolicy,
   subscribeDoorPolicy,
   gateAccessIn,
+  readAutoFerryGates,
   readDockGates,
   readUnnumberedPorts,
   readGateAccess,
@@ -1369,6 +1380,56 @@ const routeKeeper = createRouteKeeper({
   towing: () => isTowing(activeBootstrap?.roomId ?? "", Date.now()),
 });
 
+/** 🚏🤖 The seams a background room session opens through: the far dock
+ *  write's own (wireAdapterTransit sets them). Null until then. */
+let roomSessionDeps: RoomSessionDeps | null = null;
+/** 🚏🤖 A pass this game holds for a room, by id (the join block's
+ *  localSeedFor, as the departures publisher reads it). Null until then. */
+let localSeedForRoom: ((roomId: string) => string | undefined) | null = null;
+
+/**
+ * 🚏🤖 The station's gate keeper (gateKeeper.ts, robot pilot routes open
+ * choice 8): once a second, in EVERY game standing in a room with a gate
+ * set to AUTO-DOCK FERRIES, it docks a route ferry that calls here with
+ * nobody aboard and casts it off at its departure, through a background
+ * session to the ferry's room. A rider's own keeper (above) goes first.
+ */
+const gateKeeper = createGateKeeper({
+  roomId: () => activeBootstrap?.roomId ?? "",
+  // 🛰️ Never on a stale replica.
+  ready: roomStateArrivedNow,
+  gates: () =>
+    readAutoFerryGates().map(({ doorId, policy }) => ({
+      doorId,
+      ...(policy.gate !== undefined ? { gate: policy.gate } : {}),
+      ...(policy.gateAccess ? { access: policy.gateAccess } : {}),
+      ...(policy.reservedFor ? { reservedFor: policy.reservedFor } : {}),
+      record: readDoor(doorId),
+    })),
+  doors: readAllDoors,
+  ferries: readDepartureFerries,
+  open: (address) => (roomSessionDeps ? openRoomSession(roomSessionDeps, address) : Promise.resolve(null)),
+  ownAddress: resolveOwnRoomAddress,
+  doorPose: (doorId) => world?.dockingSystem?.doorWallLateral(doorId) ?? null,
+  writeDoor: (doorId, rec) => {
+    if (yjsSync) writeDoorRecordTo(yjsSync.doc, doorId, rec);
+  },
+  // 🚚 A station between planets, or a tug's tow, holds its docks.
+  dockLocked: dockLockedByMove,
+  mayPair: () => pairingAllowedByFlight(readResolvedFlight()).ok,
+  sameStation: sameStationReader,
+  towing: (shipRoomId, now) => towHoldsDock([shipRoomId], now),
+  publishHere: (pub) => {
+    if (yjsSync) applyDeparturesPublish(yjsSync.doc, pub);
+  },
+  publishTo: (roomId, pub) => {
+    const seed = localSeedForRoom?.(roomId);
+    if (seed) void writeDepartures(seed, pub);
+  },
+  note: (doorId, text, tone) => world?.dockingSystem?.noteDockOp(doorId, text, tone),
+  requesterPub: () => getIdentityPub() ?? undefined,
+});
+
 /** Does this room hold a live dock into a room of the station whose welcome
  *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) True when
  *  it does; else when this room let go of it, by its dock tombstones (the
@@ -2131,6 +2192,8 @@ async function joinRoomAtEpoch(
     };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
+    // 🚏🤖 …and the gate keeper's publishes to a ferry's other stops.
+    localSeedForRoom = localSeedFor;
     setStationDirectory(
       directoryFromStationRecords(
         () => listStations(),
@@ -2251,6 +2314,8 @@ async function joinRoomAtEpoch(
   if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
   // 🚏🛟 A new room is a new ship: the keeper forgets the last one.
   routeKeeper.reset();
+  // 🚏🤖 …and the gate keeper hangs up on the last room's ferries.
+  gateKeeper.reset();
   lastRouteShipStatus = "";
   planetSummaryBeat = 0;
   shipFlightWatch = window.setInterval(() => {
@@ -2263,6 +2328,13 @@ async function joinRoomAtEpoch(
       routeKeeper.tick();
     } catch (err) {
       console.warn("[route] keeper tick failed:", err);
+    }
+    // 🚏🤖 …and every game in a room with an AUTO-DOCK FERRIES gate docks a
+    // ferry that calls here with nobody aboard (gateKeeper.ts).
+    try {
+      gateKeeper.tick();
+    } catch (err) {
+      console.warn("[gate] keeper tick failed:", err);
     }
     // 🚏📋 A9 item 7: a running route moves the ship on the clock with no
     // doc write, so nothing else would re-publish its summary (flight and
@@ -2845,6 +2917,8 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // game is leaving while the old doc flushes. The boards' walk caches and
   // the route summary's last word belong to the room we leave.
   routeKeeper.reset();
+  // 🚏🤖 The gate keeper's sessions to ferries end with the room too.
+  gateKeeper.reset();
   lastRouteShipStatus = "";
   boardWalkCaches.clear();
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
@@ -3703,6 +3777,8 @@ function wireAdapterTransit(): void {
   initFarDoorWrite(farWriteDeps);
   // 🚏📋 A6: the ferry's publishes to its stops' boards ride the same seams.
   initDeparturesWrite(farWriteDeps);
+  // 🚏🤖 …and so do the gate keeper's sessions to ferries.
+  roomSessionDeps = farWriteDeps;
   world.dockingSystem?.onFarDockWrite(farDockWrite);
   // 🚏🛟 A5 "Rights": a running route lets a rider's keeper dock and undock
   // the route's own port toward the current stop, at the timetable's moments.

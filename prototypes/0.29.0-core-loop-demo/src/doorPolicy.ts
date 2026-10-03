@@ -58,6 +58,11 @@ export interface DoorPolicyRecord {
   /** With `gateAccess: 'reserved'`: the one ship (its ROOM id) that may dock
    *  here — an airline's own gate. A room id, never a pass. */
   reservedFor?: string;
+  /** 🚏🤖 The owner lets this gate DOCK SCHEDULED FERRIES AUTOMATICALLY: a
+   *  game in this room docks a route ferry the gate admits when it arrives
+   *  and casts it off at its departure, with nobody aboard (gateKeeper.ts).
+   *  Absent = off. Only meaningful while `adapter` is true. */
+  autoFerry?: boolean;
 }
 
 /** ⚓🚦 open: any ship · pass: captains the owner granted at this door (the
@@ -179,6 +184,7 @@ function sanitizePolicy(value: unknown): DoorPolicyRecord {
     adapter: raw?.adapter === true,
     ...(raw?.adapter === true && isGateNumber(raw?.gate) ? { gate: raw.gate } : {}),
     ...(raw?.adapter === true ? cleanAccess(raw) : {}),
+    ...(raw?.adapter === true && raw?.autoFerry === true ? { autoFerry: true } : {}),
   };
 }
 
@@ -191,6 +197,7 @@ function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
     adapter: policy.adapter === true,
     ...(policy.adapter === true && isGateNumber(policy.gate) ? { gate: policy.gate } : {}),
     ...(policy.adapter === true ? cleanAccess(policy) : {}),
+    ...(policy.adapter === true && policy.autoFerry === true ? { autoFerry: true } : {}),
   };
 }
 
@@ -297,6 +304,16 @@ export function readUnnumberedPorts(): string[] {
     if (p.gate === undefined) out.push(doorId);
   }
   return out.sort();
+}
+
+/** 🚏🤖 This room's ports whose owner lets them dock scheduled ferries
+ *  automatically (`autoFerry`), with their policies, in door id order. */
+export function readAutoFerryGates(): Array<{ doorId: string; policy: DoorPolicyRecord }> {
+  if (!docAlive()) return [];
+  return portsIn(boundDoc!, policyMap!)
+    .filter(([, p]) => p.autoFerry === true)
+    .map(([doorId, policy]) => ({ doorId, policy }))
+    .sort((a, b) => (a.doorId < b.doorId ? -1 : a.doorId > b.doorId ? 1 : 0));
 }
 
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */

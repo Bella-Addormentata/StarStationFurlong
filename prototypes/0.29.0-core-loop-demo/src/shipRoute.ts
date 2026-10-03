@@ -943,6 +943,51 @@ export function writeRouteCheckpoint(run: number, entry: RouteCheckpoint, now = 
   return true;
 }
 
+// 🚏🤖 The same reading and writing for ANY ship map: a ferry room a
+// station's gate keeper holds a background session to (gateKeeper.ts), which
+// is never the bound ship.
+
+/**
+ * The route and the running run's checkpoints of any ship map, read exactly
+ * as readShipRoute and readRouteCheckpoints read the bound ship's (the latest
+ * run not stamped past RUN_AHEAD_MS, 🏁 laterRuns; shape-checked, capped by
+ * stay), with no cache. Pure over the map.
+ */
+export function routeIn(map: Y.Map<unknown>, now = Date.now()): { route: ShipRoute | null; checkpoints: readonly RouteCheckpoint[] } {
+  const stored = shipRouteFromWire(map.get('route'));
+  if (!isRouteRunning(stored)) return { route: stored, checkpoints: [] };
+  const scan = scanCheckpoints(map, stored.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED);
+  const route = [...laterRuns(stored, scan.laterStarts, map), stored].find((r) => !runTooFarAhead(r, now));
+  if (!route || !isRouteRunning(route)) return { route: routeWithoutRun(stored), checkpoints: [] };
+  const checkpoints = route.startedAt === stored.startedAt
+    ? scan.entries
+    : scanCheckpoints(map, route.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED).entries;
+  return { route, checkpoints };
+}
+
+/**
+ * writeRouteCheckpoint for any ship doc: the same checks (the run is still
+ * the route's, the entry well formed and at its stay's stop), the same key
+ * and the same pruning, in one transaction of that doc. No write notice: the
+ * departures publisher publishes the bound ship only, and the gate keeper
+ * publishes its own writes. Returns whether it wrote.
+ */
+export function writeRouteCheckpointIn(doc: Y.Doc, map: Y.Map<unknown>, run: number, entry: RouteCheckpoint, now = Date.now()): boolean {
+  const route = routeIn(map, now).route;
+  if (!isRouteRunning(route) || route.startedAt !== run) return false;
+  const wire = checkpointToWire(entry);
+  const clean = checkpointFromWire(entry.kind, entry.legSeq, wire);
+  if (!clean || clean.stationId !== route.stops[stopAt(route, clean.legSeq)].stationId) {
+    console.warn('[route] refused to write a malformed checkpoint', entry);
+    return false;
+  }
+  doc.transact(() => {
+    map.set(checkpointKey(run, clean.legSeq, clean.kind), wire);
+    pruneIn(map, route, now);
+  });
+  return true;
+}
+
 /** Prune on its own (a writer tidying up): returns how many keys went. */
 export function pruneRouteCheckpoints(now = Date.now()): number {
   const h = shipDocHandle();

@@ -12,6 +12,7 @@ import {
   fitDockPortIn,
   gateAccessIn,
   nextFreeGate,
+  readAutoFerryGates,
   readGateAccess,
   readDockGates,
   readUnnumberedPorts,
@@ -88,6 +89,29 @@ describe('the gate on a dock port', () => {
     writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: false });
     writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: true });
     expect(readDoorPolicy('north').gate).toBeUndefined();
+  });
+
+  it('lets the owner turn on AUTO-DOCK FERRIES, kept only on a port of a door the room has', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('west', { id: 'west', wall: 'x-', lateral: 0, placed: true });
+    writeDoorPolicy('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1, autoFerry: true });
+    writeDoorPolicy('east', { passage: 'public', construction: 'owner', adapter: false, autoFerry: true });
+    doc.getMap('doorPolicy').set('west', { adapter: true, gate: 2, autoFerry: 'yes' });
+    doc.getMap('doorPolicy').set('south', { adapter: true, gate: 3, autoFerry: true }); // no such door
+    expect(readDoorPolicy('north').autoFerry).toBe(true);
+    expect(readDoorPolicy('east').autoFerry).toBeUndefined();
+    expect(readDoorPolicy('west').autoFerry).toBeUndefined();
+    expect(readAutoFerryGates()).toEqual([{ doorId: 'north', policy: readDoorPolicy('north') }]);
+    // Renumbering and the gate's access keep it; removing the port drops it.
+    writeDoorPolicy('north', { ...readDoorPolicy('north'), gate: 4, gateAccess: 'closed' });
+    expect(readDoorPolicy('north')).toMatchObject({ gate: 4, gateAccess: 'closed', autoFerry: true });
+    writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: false });
+    writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: true });
+    expect(readDoorPolicy('north').autoFerry).toBeUndefined();
+    expect(readAutoFerryGates()).toEqual([]);
   });
 
   it('is given to a port a DOCK fits in the far room', () => {
