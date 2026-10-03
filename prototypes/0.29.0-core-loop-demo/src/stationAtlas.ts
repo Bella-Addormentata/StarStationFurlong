@@ -237,54 +237,52 @@ export function roomIdFromSeed(seed: string): string {
  * stale record, or gossip from before the job ended.
  */
 export function readAtlas(): Record<string, AtlasEntry> {
-  return visibleAtlas(withUnsavedTombs(readStoredAtlas()));
+  return visibleAtlas(readStoredAtlas());
 }
 
 /** 🔧 True when this install holds `roomId` as taken apart (a tombstone the
  *  maps never see). */
 export function isDismantled(roomId: string): boolean {
-  return ownValue(withUnsavedTombs(readStoredAtlas()), roomId)?.dismantledAt !== undefined;
+  return ownValue(readStoredAtlas(), roomId)?.dismantledAt !== undefined;
 }
 
 /** 🔧 Tombstones this install made that its store could not take (full, or
  *  privacy mode: writeAtlas swallows the error). Read as if stored for the
- *  rest of the session, so this install's maps drop the module too, and
- *  published with every push, so the station's other visitors get it
- *  whatever the store does; saved by the first push after the store takes
- *  writes again (saveUnsavedTombs). */
+ *  rest of the session (readStoredAtlas), so this install's maps, merges and
+ *  gate reads drop the module too, and published with every push, so the
+ *  station's other visitors get it whatever the store does; saved by the
+ *  first push after the store takes writes again (saveUnsavedTombs). */
 const unsavedTombs = new Map<string, AtlasEntry>();
 
-/** `atlas` with this session's unsaved tombstones in it, unless it holds a
- *  newer record of the room (or a copy that brought it back). The same
- *  object back when there are none. */
-function withUnsavedTombs(atlas: Record<string, AtlasEntry>): Record<string, AtlasEntry> {
-  if (unsavedTombs.size === 0) return atlas;
+/** The atlas this install holds, tombstones included: what merges and gossip
+ *  work on. The saved store (readSavedAtlas) with this session's unsaved
+ *  tombstones in it, each unless the store holds a newer record of the room
+ *  (or a copy that brought it back), which lets that tombstone go. */
+function readStoredAtlas(): Record<string, AtlasEntry> {
+  const saved = readSavedAtlas();
+  if (unsavedTombs.size === 0) return saved;
   // No prototype: a room named `__proto__` is an ordinary own key here.
-  const out: Record<string, AtlasEntry> = Object.assign(Object.create(null), atlas);
+  const atlas: Record<string, AtlasEntry> = Object.assign(Object.create(null), saved);
   for (const [rid, tomb] of unsavedTombs) {
-    if (!supersedesTomb(ownValue(atlas, rid), tomb)) out[rid] = tomb;
+    if (supersedesTomb(ownValue(saved, rid), tomb)) unsavedTombs.delete(rid);
+    else atlas[rid] = tomb;
   }
-  return out;
+  return atlas;
 }
 
-/** Does the stored record of a room outrank this session's tombstone of it:
+/** Does the saved record of a room outrank this session's tombstone of it:
  *  the same tombstone or a newer one, a newer live copy, or one that brought
  *  the module back (revivesTomb)? */
-function supersedesTomb(stored: AtlasEntry | undefined, tomb: AtlasEntry): boolean {
-  if (!stored) return false;
-  if (revivesTomb(stored, tomb)) return true;
-  return stored.dismantledAt !== undefined ? stored.lastSeen >= tomb.lastSeen : stored.lastSeen > tomb.lastSeen;
+function supersedesTomb(saved: AtlasEntry | undefined, tomb: AtlasEntry): boolean {
+  if (!saved) return false;
+  if (revivesTomb(saved, tomb)) return true;
+  return saved.dismantledAt !== undefined ? saved.lastSeen >= tomb.lastSeen : saved.lastSeen > tomb.lastSeen;
 }
 
 /** Save this session's unsaved tombstones, once the store takes writes
- *  again; each one the store now holds (or outranks) is let go. */
+ *  again (the next read lets go of each one the store then holds). */
 function saveUnsavedTombs(): void {
-  if (unsavedTombs.size === 0) return;
-  writeAtlas(withUnsavedTombs(readStoredAtlas()));
-  const stored = readStoredAtlas();
-  for (const [rid, tomb] of unsavedTombs) {
-    if (supersedesTomb(ownValue(stored, rid), tomb)) unsavedTombs.delete(rid);
-  }
+  if (unsavedTombs.size > 0) writeAtlas(readStoredAtlas());
 }
 
 /** 🔧 `atlas` without the rooms taken apart or the doors naming them. The
@@ -311,8 +309,9 @@ export function visibleAtlas(atlas: Record<string, AtlasEntry>): Record<string, 
   return out;
 }
 
-/** The stored atlas, tombstones included: what merges and gossip work on. */
-function readStoredAtlas(): Record<string, AtlasEntry> {
+/** The atlas as this install's store holds it, tombstones included. Read
+ *  through readStoredAtlas, which adds the ones the store could not take. */
+function readSavedAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return {};
@@ -557,7 +556,7 @@ export function harvestIntoAtlas(entry: {
  */
 export function dismantleInAtlas(roomId: string, at: number): void {
   if (!roomId) return;
-  const atlas = withUnsavedTombs(readStoredAtlas());
+  const atlas = readStoredAtlas();
   const prior = ownValue(atlas, roomId);
   const now = Date.now();
   // Newer than any copy the doc holds, so the push below publishes it (and
@@ -580,7 +579,7 @@ export function dismantleInAtlas(roomId: string, at: number): void {
   // The doors are sealed and the job ended already, so the record must not
   // be lost to a store that could not take it (writeAtlas swallows that):
   // this session keeps it, and the push publishes it from here.
-  if (ownValue(readStoredAtlas(), roomId)?.dismantledAt === at) unsavedTombs.delete(roomId);
+  if (ownValue(readSavedAtlas(), roomId)?.dismantledAt === at) unsavedTombs.delete(roomId);
   else unsavedTombs.set(roomId, tomb);
   pushAtlasToDoc();
 }
@@ -1796,8 +1795,7 @@ export function pushAtlasToDoc(): void {
   saveUnsavedTombs();
   if (!sharedAlive() || !sharedCtx) return;
   const ctx = sharedCtx;
-  // 🔧 With this session's unsaved tombstones (withUnsavedTombs).
-  const atlas = withUnsavedTombs(readStoredAtlas());
+  const atlas = readStoredAtlas();
   sharedDoc!.transact(() => {
     for (const entry of Object.values(atlas)) {
       const isOwn = entry.roomId === ctx.roomId;

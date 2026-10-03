@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, isDismantled, noteRoomSeed, pushAtlasToDoc,
-  readAtlas, seedAtlasDefaults, visibleAtlas, withSharedAtlasOf, MAX_DISMANTLED, MAX_ENTRIES,
+  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, freeGateNumber, harvestIntoAtlas, isDismantled, noteRoomSeed,
+  pushAtlasToDoc, readAtlas, seedAtlasDefaults, stationGates, visibleAtlas, withSharedAtlasOf, MAX_DISMANTLED, MAX_ENTRIES,
   type AtlasEntry,
 } from './stationAtlas';
 import {
@@ -807,6 +807,34 @@ describe('a module taken apart', () => {
       roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, updatedAt: Date.now() + 1000,
     });
     expect(withSharedAtlasOf(doc, readAtlas(), 'room-b')['room-b']?.doors).toMatchObject({ west: { targetRoomId: 'room-a' } });
+  });
+
+  it('reads as gone in a far room doc read for its gates when the store cannot take it', () => {
+    hub();
+    // A far doc still holding HUB and GARDEN from before, GARDEN with gate 1.
+    const far = new Y.Doc();
+    far.getMap('atlas').set('room-a', { roomId: 'room-a', name: 'HUB', doors: { east: { targetRoomId: 'room-b' } }, updatedAt: 1 });
+    far.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, gates: { south: 1 }, updatedAt: 1,
+    });
+    const ls = globalThis.localStorage as { setItem: (k: string, v: string) => void };
+    const setItem = ls.setItem;
+    ls.setItem = () => { throw new Error('QuotaExceededError'); };
+    try {
+      dismantleInAtlas('room-b', 5);
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBeUndefined();
+      // The far doc brings back neither the module nor its gate.
+      const merged = withSharedAtlasOf(far, readAtlas(), 'room-a');
+      expect(merged['room-b']).toBeUndefined();
+      expect(stationGates(merged, 'room-a')).toEqual([]);
+      expect(freeGateNumber(merged, 'room-a', {})).toBe(1);
+      expect(withSharedAtlasOf(far, readAtlas(), 'room-b')['room-b']).toBeUndefined();
+    } finally {
+      ls.setItem = setItem;
+    }
+    pushAtlasToDoc();
+    expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b']).toMatchObject({ dismantledAt: 5, dismantledHere: true });
+    expect(withSharedAtlasOf(far, readAtlas(), 'room-b')['room-b']).toBeUndefined();
   });
 
   it('wins a tie with the copy it replaces, at the six-hour ceiling', () => {
