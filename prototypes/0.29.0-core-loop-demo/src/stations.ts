@@ -133,8 +133,27 @@ export function readStationRecords(): StationRecord[] {
   } catch { return []; }
 }
 
+/** Most JSON a record's extra fields may take (a newer build's, or a peer's
+ *  carried by the shared planet summary); past it they are dropped. */
+const MAX_EXTRA_JSON = 1024;
+const CORE_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'derived']);
+
+/** The record's fields this build does not know, kept as they are while
+ *  they are plain JSON within MAX_EXTRA_JSON, so a newer build's (or a
+ *  learned station's) survive a save here. */
+function extraFields(r: StationRecord): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(r)) if (!CORE_FIELDS.has(k) && k !== '__proto__') out[k] = v;
+  if (Object.keys(out).length === 0) return out;
+  try {
+    const json = JSON.stringify(out);
+    return json.length <= MAX_EXTRA_JSON ? JSON.parse(json) as Record<string, unknown> : {};
+  } catch { return {}; }
+}
+
 function clean(r: StationRecord): StationRecord {
   return {
+    ...extraFields(r),
     id: r.id,
     name: r.name,
     planetId: planetById(r.planetId).id,
@@ -378,9 +397,14 @@ export function dockedStationFor(
   const partners: string[] = [];
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only an address that names a room is a pairing (as stationKeeping's
+    // isBoltedIntoStation reads it): peer-written junk beside a real dock
+    // neither bolts the room in nor hides that dock.
+    let partner = '';
+    try { partner = roomIdFromSeed(rec.connectedRoomAddress); } catch { partner = ''; }
+    if (!partner) continue;
     if (!isBerthDoor(rec)) return null; // bolted into a station: the atlas places it
-    const partner = roomIdFromSeed(rec.connectedRoomAddress);
-    if (partner && partner !== roomId) partners.push(partner);
+    if (partner !== roomId) partners.push(partner);
   }
   for (const partner of partners) {
     const there = atlasStationForRoom(partner, atlas, stations);

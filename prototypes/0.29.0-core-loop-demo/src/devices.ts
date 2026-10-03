@@ -180,6 +180,7 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1006,6 +1007,8 @@ let mapTableMap: SolarSystemMap | null = null;
  */
 export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
   let panel: HTMLDivElement | null = null;
+  // 🪐 Stations and trims learned while the table is open redraw it.
+  let unhearSummary: (() => void) | null = null;
 
   return {
     mount(host: HTMLElement): void {
@@ -1066,10 +1069,14 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       }
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
+      unhearSummary?.();
+      unhearSummary = subscribePlanetSummary(() => mapTableMap?.refreshStations(undefined, holotableStation()));
       mapTableMap.show();
     },
 
     unmount(): void {
+      unhearSummary?.();
+      unhearSummary = null;
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -2100,7 +2107,18 @@ function subscribeArrivalNote(fn: () => void): () => void {
 /** Forget the last arrival — main.ts calls it on every room join, so one
  *  ship's arrival never shows on another ship's helm. */
 export function clearShipArrivalNote(): void {
+  arrivalNoteRoom++;
   setArrivalNote(null);
+}
+
+/** Bumped on every room join (clearShipArrivalNote). */
+let arrivalNoteRoom = 0;
+
+/** The arrival-note callback for a DOCK started in this room: its answer can
+ *  come after the player has left, and then it is not the new room's news. */
+export function arrivalNoteHere(): (outcome: ArrivalOutcome | null) => void {
+  const room = arrivalNoteRoom;
+  return (outcome) => { if (room === arrivalNoteRoom) noteShipArrival(outcome); };
 }
 
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
@@ -2482,7 +2500,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;
       // DOCK NOW is the commander's call: settle the arrival here and now.
-      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: noteShipArrival }));
+      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
     });
 
     if (refocus) {
@@ -2694,7 +2712,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Arrive where the ship flew, even if the directory no longer lists it.
       writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
     }
-    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: noteShipArrival }));
+    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };
 
   return {
@@ -2723,6 +2741,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
+      // 🪐 Destinations and their orbits learned from peers.
+      unsubs.push(subscribePlanetSummary(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();

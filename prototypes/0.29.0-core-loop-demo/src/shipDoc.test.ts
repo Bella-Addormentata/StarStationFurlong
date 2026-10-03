@@ -18,6 +18,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
 import {
   DESTINATIONS,
   TANK_CAPACITY,
@@ -781,6 +782,38 @@ describe('canDepart — a planned hop', () => {
 
   it('refuses when no transfer exists', () => {
     expect(canDepart({ ...base, hop: null })).toEqual({ ok: false, reason: 'no-transfer' });
+  });
+});
+
+describe('flight records written on another install', () => {
+  it('read their station ids as this install\'s', () => {
+    const aliases: Record<string, string> = { 'station:room-high': 'high-orbit', 'their-l4': 'l4-anchorage' };
+    setStationDirectory({ stations: () => DEFAULT_STATIONS, resolve: (id) => aliases[id] ?? null });
+    try {
+      const doc = freshDoc();
+      hostileSetFlight(doc, { status: 'in-flight', locationId: 'station:room-high', destinationId: 'their-l4', departedAt: 1, etaAt: 2 });
+      expect(readFlightRecord()).toMatchObject({ locationId: 'high-orbit', destinationId: 'l4-anchorage' });
+    } finally {
+      setStationDirectory(null);
+    }
+  });
+
+  it('are written with each station\'s portable id, and read back as this install\'s', () => {
+    const rooms: Record<string, string> = { 'high-orbit': 'room-high', 'l4-anchorage': 'room-l4' };
+    const back: Record<string, string> = { 'shared:room-high': 'high-orbit', 'shared:room-l4': 'l4-anchorage' };
+    setStationDirectory({
+      stations: () => DEFAULT_STATIONS,
+      resolve: (id) => back[id] ?? null,
+      portable: (id) => (rooms[id] ? `shared:${rooms[id]}` : null),
+    });
+    try {
+      const doc = freshDoc();
+      expect(writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'l4-anchorage', departedAt: 1, etaAt: 2 })).toBe(true);
+      expect(doc.getMap('ship').get('flight')).toMatchObject({ locationId: 'shared:room-high', destinationId: 'shared:room-l4' });
+      expect(readFlightRecord()).toMatchObject({ locationId: 'high-orbit', destinationId: 'l4-anchorage' });
+    } finally {
+      setStationDirectory(null);
+    }
   });
 });
 
