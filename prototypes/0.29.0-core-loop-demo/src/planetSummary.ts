@@ -312,8 +312,8 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // (counting stops early), and so is the gate list it came with, since
   // without its stamps each room would pass for as fresh as the whole list.
   let roomCount = 0;
-  if (isPlainObject(v.berthRoomsAt)) for (const _k in v.berthRoomsAt) if (++roomCount > MAX_BERTHS) break;
-  const roomsOk = v.berthRoomsAt === undefined || (isPlainObject(v.berthRoomsAt) && roomCount <= MAX_BERTHS);
+  if (isPlainObject(v.berthRoomsAt)) for (const _k in v.berthRoomsAt) if (++roomCount > MAX_ROOM_STAMPS) break;
+  const roomsOk = v.berthRoomsAt === undefined || (isPlainObject(v.berthRoomsAt) && roomCount <= MAX_ROOM_STAMPS);
   if (Array.isArray(v.berths) && (berths.length > 0 || v.berths.length === 0) && isStamp(v.berthsAt, now) && roomsOk) {
     out.berths = berths;
     out.berthsAt = v.berthsAt;
@@ -450,23 +450,31 @@ function roomStamps(x: Gates): Map<string, number> {
   return out;
 }
 
+/** ⚓🚦 Room tombstones (rooms that list no gate any more) a summary carries
+ *  beside its listed rooms' stamps: their own budget, so a station with a
+ *  gate in each of MAX_BERTHS rooms still remembers its newest removals. */
+export const MAX_ROOM_TOMBSTONES = 32;
+/** The most room stamps one summary carries. */
+const MAX_ROOM_STAMPS = MAX_BERTHS + MAX_ROOM_TOMBSTONES;
+
 /** The per-room stamps worth carrying (sorted, bounded): a room read at
- *  another time than `berthsAt`, or one that lists no berth any more. Rooms
- *  that list berths keep theirs first (at most MAX_BERTHS of them, since the
- *  list is), so no listed room falls back to `berthsAt`; room tombstones
- *  fill what is left, newest first. */
+ *  another time than `berthsAt`, or one that lists no berth any more. Every
+ *  room that lists berths keeps its own (at most MAX_BERTHS, since the list
+ *  is), so no listed room falls back to `berthsAt`; room tombstones keep the
+ *  newest MAX_ROOM_TOMBSTONES on a budget of their own. */
 function canonRoomStamps(
   berths: readonly StationBerthRecord[],
   berthsAt: number | undefined,
   rooms: Record<string, number> | Map<string, number>,
 ): Record<string, number> | undefined {
   const listed = new Set(berths.map((b) => b.roomId));
-  const entries = (rooms instanceof Map ? [...rooms] : Object.entries(rooms))
-    .filter(([room, at]) => at !== berthsAt || !listed.has(room))
-    .sort((x, y) => Number(listed.has(y[0])) - Number(listed.has(x[0]))
-      || y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0))
-    .slice(0, MAX_BERTHS)
-    .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
+  const newest = (x: [string, number], y: [string, number]) => y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0);
+  const all = (rooms instanceof Map ? [...rooms] : Object.entries(rooms))
+    .filter(([room, at]) => at !== berthsAt || !listed.has(room));
+  const entries = [
+    ...all.filter(([room]) => listed.has(room)).sort(newest).slice(0, MAX_BERTHS),
+    ...all.filter(([room]) => !listed.has(room)).sort(newest).slice(0, MAX_ROOM_TOMBSTONES),
+  ].sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
   if (entries.length === 0) return undefined;
   const out: Record<string, number> = {};
   for (const [room, at] of entries) out[room] = at;
