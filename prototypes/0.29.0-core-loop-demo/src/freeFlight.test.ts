@@ -342,6 +342,10 @@ describe('the record', () => {
     expect(isFreePose({ ...ok, near: { room: '', along: 0, radial: 0 } })).toBe(false);
     expect(isFreePose({ ...ok, near: { room: 'r', along: 1e6, radial: 0 } })).toBe(false);
     expect(isFreePose({ ...ok, planetId: 'x'.repeat(200) })).toBe(false);
+    // Parked is still: one that moves would skip every zone.
+    expect(isFreePose({ ...ok, vAlong: 0, parked: true })).toBe(true);
+    expect(isFreePose({ ...ok, parked: true })).toBe(false);
+    expect(isFreePose({ ...ok, vAlong: 0, vRadial: 0.01, parked: true })).toBe(false);
   });
 
   it('refuses a pose stamped far ahead of the clock, and never coasts backwards', () => {

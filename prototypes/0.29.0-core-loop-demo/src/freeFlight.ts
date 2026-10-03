@@ -156,7 +156,9 @@ export function isFreePose(v: unknown, now = Date.now()): v is FreePose {
     if (!finite(n.along) || !finite(n.radial)) return false;
     if (Math.hypot(n.along, n.radial) > APPROACH_ZONE_KM * LEAVE_MARGIN * 2) return false;
   }
-  if (p.parked !== undefined && p.parked !== true) return false;
+  // A parked pose is still (parkPose): zones skip it, so one that moved
+  // would coast through a station unchecked.
+  if (p.parked !== undefined && (p.parked !== true || p.vAlong !== 0 || p.vRadial !== 0)) return false;
   return true;
 }
 
