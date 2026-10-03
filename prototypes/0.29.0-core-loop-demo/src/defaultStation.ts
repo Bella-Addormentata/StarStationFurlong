@@ -191,7 +191,10 @@ export function defaultStationAtlas(): BundledAtlasEntry[] {
  * transient berth (a visiting ship is not the station). Edges are
  * walked both ways (a pairing recorded on either side joins the two rooms),
  * the component is capped at the atlas's own size, and doorless stubs add no
- * geometry so they are left out. Empty when the room is unknown.
+ * geometry so they are left out. The welcome room itself always stays, doors
+ * or not: the welcome link must name a room the bundle knows, and a one-room
+ * station hosting a ship has no doors left once the berth goes. Empty when
+ * the room is unknown.
  */
 export function atlasForBundle(
   atlas: Record<string, AtlasEntry>,
@@ -220,7 +223,7 @@ export function atlasForBundle(
         ...(d.segments !== undefined ? { segments: d.segments } : {}),
       };
     }
-    if (Object.keys(doors).length === 0) continue;
+    if (Object.keys(doors).length === 0 && rid !== welcomeRoomId) continue;
     out[rid] = {
       roomId: rid,
       name: e.name,
