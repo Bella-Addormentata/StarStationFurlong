@@ -311,9 +311,14 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   from the station's owners (room owners, by key); the library-station
   operator approves each item before any fetch (or allowlists signers); the
   fetch verifies hash and size against the op; storage and egress run under
-  quotas; and a `library-remove` op (a denylist) is honoured by every node.
-  Nobody can make the volunteer fetch and seed arbitrary or oversized
-  content by writing an op.
+  quotas; and a `library-remove` op (a denylist) is honoured by every node
+  — from the same keys that may add (the station's owners, or the
+  library-station operator): a removal signed by any other writer is
+  rejected before the denylist is applied, since a signature identifies a
+  writer without authorizing one, and an open remove would let any room
+  peer blank the whole library. Nobody can make the volunteer fetch and
+  seed arbitrary or oversized content, or drop what it holds, by writing
+  an op.
 
 ## 8. Tribler / IPv8, evaluated seriously
 
