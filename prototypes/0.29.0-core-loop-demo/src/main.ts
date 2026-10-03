@@ -194,7 +194,7 @@ import {
   cancelTowLeftBehind,
   installStationMoveResolver,
   isTowing,
-  pinSettledArrival,
+  pinSettledArrivals,
   subscribeStationMove,
 } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
@@ -2290,8 +2290,9 @@ async function joinRoomAtEpoch(
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     // (🚏 A ferry on its route is where its timetable says.)
     cancelTowLeftBehind(boot.roomId, readResolvedFlight(), Date.now(), dockedToStation);
-    // 🪐 Where this station's last move settled it, shared once for everyone.
-    if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
+    // 🪐 Where each station's last move settled it, shared once for everyone:
+    // every station this game lists, aboard or not.
+    if (planetSummaryBeat % 10 === 0) pinSettledArrivals(listStations(), Date.now());
     if (!isLocalHelmCommander()) return;
     // 🚏 A4: while a ferry route runs unpaused its timetable moves the ship
     // with no write, and PR 172's advance stands aside (it runs again while
