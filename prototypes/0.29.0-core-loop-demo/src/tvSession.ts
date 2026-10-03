@@ -16,7 +16,7 @@
  */
 
 import {
-  iHoldRemote, putDownRemote, readPlayback, readTv, renewRemote, tvHeartbeat,
+  claimRemote, iHoldRemote, putDownRemote, readPlayback, readTv, renewRemote, tvHeartbeat,
   TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
@@ -34,14 +34,22 @@ export function tvRoomPlayers(myPub: string): RoomPlayer[] {
   return roomPlayersProvider().filter((p) => p.pub && p.pub !== myPub);
 }
 
-/** TVs whose playback clock a live player (the theatre) is driving. */
-const playersOfRecord = new Set<string>();
-export function registerTvPlayerOfRecord(itemId: string): () => void {
-  playersOfRecord.add(itemId);
-  return () => playersOfRecord.delete(itemId);
+/** TVs whose playback clock a live player (the theatre) is driving, and
+ *  where that player is: the phone's transport asks it rather than the
+ *  record's extrapolation, which runs on while a player buffers. */
+const playersOfRecord = new Map<string, (() => number) | null>();
+export function registerTvPlayerOfRecord(itemId: string, positionMs?: () => number): () => void {
+  playersOfRecord.set(itemId, positionMs ?? null);
+  return () => { playersOfRecord.delete(itemId); };
 }
 export function hasTvPlayerOfRecord(itemId: string): boolean {
   return playersOfRecord.has(itemId);
+}
+/** The live player's position for a set, or null when no player of record
+ *  is mounted here (then the record's estimate is all there is). */
+export function tvPlayerPositionMs(itemId: string): number | null {
+  const at = playersOfRecord.get(itemId);
+  return at ? at() : null;
 }
 
 const lastRenew = new Map<string, number>();
@@ -53,6 +61,11 @@ export function tickTvRoom(itemIds: readonly string[], now = Date.now()): void {
   for (const id of [...lastRenew.keys()]) if (!live.has(id)) lastRenew.delete(id);
   for (const id of [...lastHeadlessBeat.keys()]) if (!live.has(id)) lastHeadlessBeat.delete(id);
   for (const id of itemIds) {
+    // A remote handed to my identity is nobody's page yet: this page takes
+    // it (two tabs, one key — the first to tick wins, the other stays a
+    // viewer). The claim refreshes the lease, so it is this tick's renewal
+    // too, and `by` stays the giver until the next one: the phone's cue.
+    if (claimRemote(id, now)) lastRenew.set(id, now);
     if (!iHoldRemote(id)) {
       lastRenew.delete(id);
       lastHeadlessBeat.delete(id);

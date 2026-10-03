@@ -29,7 +29,10 @@
  * THIS PAGE SAW (never by the holder's clock — the pusherCroupier.ts
  * CLOCKS rule); the room owner (the registered host predicate) may take it
  * from anyone. The set's body buttons — power and volume — need no remote,
- * like a real one.
+ * like a real one. A remote is held by a PAGE, never a key: two tabs of one
+ * browser share the key (the seed lives in localStorage), and only the page
+ * that picked the remote up renews it, beats the clock and lets go on leave;
+ * the other tab is a viewer that may take it over, as the same person.
  *
  * ENFORCEMENT POSTURE (dev phase, the doorPolicy.ts rule): every write is
  * gated here and every read is shape-checked, so a peer running edited code
@@ -124,6 +127,11 @@ export interface RemoteRecord {
   /** Who wrote the record: the holder on a pick-up or renewal, the GIVER on
    *  a hand-over — which is how a phone knows to pop open on receipt. */
   by: string;
+  /** The holder's PAGE — a per-page-load id, never the identity: two tabs
+   *  with one key are two pages, and only the one that picked the remote up
+   *  renews it, beats the clock and lets go on leave. '' on a hand-over,
+   *  until the first of the receiver's pages claims it (claimRemote). */
+  page: string;
 }
 
 export const TV_DEFAULT_PROGRAMME: TvProgramme = {
@@ -139,7 +147,7 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
 
 export const TV_DEFAULT: TvRecord = { ...TV_DEFAULT_PROGRAMME, volume: 70 };
 
-export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by: '' };
+export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by: '', page: '' };
 
 // ── Binding (the partyDoc shape) ─────────────────────────────────────────────
 
@@ -172,6 +180,7 @@ const samples = new Map<string, Sample>();
  *  clock when that pair first appeared (the pusherCroupier `seeLease` idea). */
 interface SeenLease {
   holder: string;
+  page: string;
   leaseAt: number;
   at: number;
 }
@@ -295,6 +304,15 @@ let hostPredicate: () => boolean = () => false;
 export function setTvHostPredicate(predicate: () => boolean): void {
   hostPredicate = predicate;
 }
+/** This page's id for the lease: a page LOAD, not a device and not a key
+ *  (the pusherCroupier sessionId idea). main.ts sets a fresh one per load. */
+let pageId = `page-${Math.random().toString(36).slice(2, 12)}`;
+export function setTvPageId(id: string): void {
+  pageId = id.slice(0, 128);
+}
+export function tvPageId(): string {
+  return pageId;
+}
 
 // ── Shape-checked reads ──────────────────────────────────────────────────────
 
@@ -393,7 +411,13 @@ export function readRemote(itemId: string): RemoteRecord {
   const raw = ensureMap().get(remoteKey(itemId)) as Partial<RemoteRecord> | undefined;
   if (!raw || typeof raw !== 'object') return { ...REMOTE_FREE };
   const holder = str(raw.holder, 128);
-  return { holder, name: holder ? str(raw.name, TV_MAX_NAME) : '', leaseAt: num(raw.leaseAt), by: str(raw.by, 128) };
+  return {
+    holder,
+    name: holder ? str(raw.name, TV_MAX_NAME) : '',
+    leaseAt: num(raw.leaseAt),
+    by: str(raw.by, 128),
+    page: holder ? str(raw.page, 128) : '',
+  };
 }
 
 // ── The remote: possession ───────────────────────────────────────────────────
@@ -404,8 +428,8 @@ export type RemoteStatus = 'free' | 'mine' | 'held';
  *  restarts the page's own lapse clock. */
 function seeLease(itemId: string, rec: RemoteRecord, now: number): SeenLease {
   const seen = seenLeases.get(itemId);
-  if (seen && seen.holder === rec.holder && seen.leaseAt === rec.leaseAt) return seen;
-  const fresh = { holder: rec.holder, leaseAt: rec.leaseAt, at: now };
+  if (seen && seen.holder === rec.holder && seen.page === rec.page && seen.leaseAt === rec.leaseAt) return seen;
+  const fresh = { holder: rec.holder, page: rec.page, leaseAt: rec.leaseAt, at: now };
   seenLeases.set(itemId, fresh);
   return fresh;
 }
@@ -422,7 +446,9 @@ export function remoteLapsed(itemId: string, now = clock()): boolean {
 export function remoteStatus(itemId: string, now = clock()): RemoteStatus {
   const rec = readRemote(itemId);
   if (!rec.holder) return 'free';
-  if (rec.holder === identityProvider().pub && rec.holder !== '') return 'mine';
+  // Mine only on the page that holds it: the same key in another tab reads
+  // "held" (by me, elsewhere), and so does a hand-over not yet claimed.
+  if (rec.holder === identityProvider().pub && rec.holder !== '' && rec.page === pageId) return 'mine';
   return remoteLapsed(itemId, now) ? 'free' : 'held';
 }
 
@@ -433,10 +459,11 @@ export function iHoldRemote(itemId: string): boolean {
 export type TvAction = { ok: true } | { ok: false; error: string };
 
 /** May this client take the remote right now: it is free, it lapsed, I am
- *  the room's owner (the spare remote), or I already hold it. */
+ *  the room's owner (the spare remote), I already hold it, or it is in my
+ *  own other tab (one person, one place: the newer tab takes it). */
 export function mayPickUpRemote(itemId: string, now = clock()): boolean {
   const status = remoteStatus(itemId, now);
-  return status !== 'held' || hostPredicate();
+  return status !== 'held' || hostPredicate() || readRemote(itemId).holder === identityProvider().pub;
 }
 
 export function pickUpRemote(itemId: string, now = clock()): TvAction {
@@ -446,15 +473,29 @@ export function pickUpRemote(itemId: string, now = clock()): TvAction {
   if (!mayPickUpRemote(itemId, now)) {
     return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
   }
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: pageId } satisfies RemoteRecord);
   return { ok: true };
 }
 
-/** Renew my hold (the holder's tick calls this every TV_LEASE_RENEW_MS). */
+/** Renew my hold (the holder's tick calls this every TV_LEASE_RENEW_MS) —
+ *  from the page that holds it; my other tabs have nothing to renew. */
 export function renewRemote(itemId: string, now = clock()): void {
   const { pub, name } = identityProvider();
-  if (!pub || readRemote(itemId).holder !== pub) return;
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub } satisfies RemoteRecord);
+  const rec = readRemote(itemId);
+  if (!pub || rec.holder !== pub || rec.page !== pageId) return;
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: pageId } satisfies RemoteRecord);
+}
+
+/** A remote handed to my identity is nobody's page yet: the first of my
+ *  pages to see it takes it (two tabs, one key — the loser of the race sees
+ *  another page on it and stays a viewer). False when there is nothing to
+ *  claim. The giver stays in `by`, so the phone still pops open on receipt. */
+export function claimRemote(itemId: string, now = clock()): boolean {
+  const { pub, name } = identityProvider();
+  const rec = readRemote(itemId);
+  if (!pub || rec.holder !== pub || rec.page !== '') return false;
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: rec.by, page: pageId } satisfies RemoteRecord);
+  return true;
 }
 
 /** Put it back on the TV. The holder may; so may the owner (taking it away). */
@@ -465,19 +506,19 @@ export function putDownRemote(itemId: string, now = clock()): TvAction {
   if (rec.holder !== pub && !hostPredicate()) {
     return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
   }
-  write(remoteKey(itemId), { holder: '', name: '', leaseAt: now, by: pub } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: '', name: '', leaseAt: now, by: pub, page: '' } satisfies RemoteRecord);
   return { ok: true };
 }
 
-/** Hand the remote to another player. No accept step, as in life. */
+/** Hand the remote to another player. No accept step, as in life. The
+ *  receiver's page is unknown here: `page` is '' until one of theirs claims it. */
 export function handRemote(itemId: string, toPub: string, toName: string, now = clock()): TvAction {
   const { pub } = identityProvider();
   if (!toPub || toPub === pub) return { ok: false, error: 'Pick someone else.' };
-  const rec = readRemote(itemId);
-  if (rec.holder !== pub && !hostPredicate()) {
+  if (remoteStatus(itemId, now) !== 'mine' && !hostPredicate()) {
     return { ok: false, error: 'You are not holding the remote.' };
   }
-  write(remoteKey(itemId), { holder: toPub, name: toName.slice(0, TV_MAX_NAME), leaseAt: now, by: pub } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: toPub, name: toName.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: '' } satisfies RemoteRecord);
   return { ok: true };
 }
 
@@ -486,10 +527,11 @@ function mayControl(itemId: string): TvAction {
   const status = remoteStatus(itemId);
   if (status === 'mine') return { ok: true };
   const rec = readRemote(itemId);
+  const elsewhere = rec.holder !== '' && rec.holder === identityProvider().pub;
   return {
     ok: false,
     error: status === 'held'
-      ? `${rec.name || 'Someone'} has the remote.`
+      ? (elsewhere ? 'You are holding the remote in another tab.' : `${rec.name || 'Someone'} has the remote.`)
       : 'Pick up the remote first.',
   };
 }

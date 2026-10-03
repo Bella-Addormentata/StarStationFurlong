@@ -21,6 +21,7 @@ import {
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
+import { tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
 
 const GOLD = '#d4a84b';
@@ -340,6 +341,13 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
   paint();
 }
 
+/** The set whose remote the phone shows when it holds more than one (a
+ *  pick-up, a hand-over received, USE THIS REMOTE on another held set). */
+let selectedTvId = '';
+export function selectTvRemote(itemId: string): void {
+  selectedTvId = itemId;
+}
+
 function renderTvApp(deps: TvPhoneDeps): string {
   const tvs = deps.tvs();
   if (tvs.length === 0) {
@@ -349,14 +357,17 @@ function renderTvApp(deps: TvPhoneDeps): string {
     </div>`;
   }
   const me = deps.myPub();
-  const held = tvs.find((t) => iHoldRemote(t.id));
-  const current = held ?? tvs[0]!;
+  // The remote on show: the one this phone chose, else the first held, else
+  // the first set. A second held remote is a row below with USE.
+  const heldAll = tvs.filter((t) => iHoldRemote(t.id));
+  const current = heldAll.find((t) => t.id === selectedTvId) ?? heldAll[0]
+    ?? tvs.find((t) => t.id === selectedTvId) ?? tvs[0]!;
   const others = tvs.filter((t) => t.id !== current.id);
   return `
     ${renderRemoteSection(current, deps, me)}
     ${others.length ? `<div class="phone-access-section">
       <div class="phone-access-header">OTHER TVS IN THE ROOM</div>
-      ${others.map((t) => `<div class="phone-access-room-row"><span class="phone-access-room-label">${esc(t.label)}:</span>${statusSpan(t.id, STATUS_ROW_STYLE)}${smallButton(`data-tv-watch="${esc(t.id)}"`, '▶')}${!iHoldRemote(t.id) && mayPickUpRemote(t.id) ? smallButton(`data-tv-pickup="${esc(t.id)}"`, '🎛') : ''}</div>`).join('')}
+      ${others.map((t) => `<div class="phone-access-room-row"><span class="phone-access-room-label">${esc(t.label)}:</span>${statusSpan(t.id, STATUS_ROW_STYLE)}${smallButton(`data-tv-watch="${esc(t.id)}"`, '▶')}${iHoldRemote(t.id) ? smallButton(`data-tv-select="${esc(t.id)}"`, '🎛 USE') : mayPickUpRemote(t.id) ? smallButton(`data-tv-pickup="${esc(t.id)}"`, '🎛') : ''}</div>`).join('')}
     </div>` : ''}
   `;
 }
@@ -400,9 +411,9 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${!startOnly && pb.state === 'playing' ? smallButton(`data-tv-pause="${esc(tv.id)}"`, '⏸') : ''}
         ${!startOnly && pb.state === 'paused' ? smallButton(`data-tv-resume="${esc(tv.id)}"`, '▶') : ''}
         ${!startOnly && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
-        ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause or seek</span>` : ''}
+        ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
-        <label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" style="width:70px;"></label>
+        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" style="width:70px;"></label>`}
       </div>`
     : '';
   const history = rec.history.length
@@ -447,7 +458,12 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-power]').forEach((b) => b.addEventListener('click', () => { tvTogglePower(b.dataset.tvPower!); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-pickup]').forEach((b) => b.addEventListener('click', () => {
     const r = pickUpRemote(b.dataset.tvPickup!);
-    if (!r.ok) feedback(r.error);
+    if (r.ok) selectedTvId = b.dataset.tvPickup!;
+    else feedback(r.error);
+  }));
+  host.querySelectorAll<HTMLButtonElement>('[data-tv-select]').forEach((b) => b.addEventListener('click', () => {
+    selectedTvId = b.dataset.tvSelect!;
+    renderTvPhoneApp(host, deps);
   }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-putdown]').forEach((b) => b.addEventListener('click', () => {
     const r = putDownRemote(b.dataset.tvPutdown!);
@@ -515,7 +531,10 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     const r = tvPlay(id, entry.source);
     feedback(r.ok ? `Now on: ${entry.title}` : r.error);
   }));
-  const pos = (id: string) => readPlayback(id).positionMs;
+  // Where the holder's own player is, when one is mounted here: the record's
+  // estimate runs on while a player buffers, and a pause written from it
+  // would park the room past unplayed footage.
+  const pos = (id: string) => tvPlayerPositionMs(id) ?? readPlayback(id).positionMs;
   host.querySelectorAll<HTMLButtonElement>('[data-tv-pause]').forEach((b) => b.addEventListener('click', () => { tvPause(b.dataset.tvPause!, pos(b.dataset.tvPause!)); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-resume]').forEach((b) => b.addEventListener('click', () => { tvResume(b.dataset.tvResume!); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-back]').forEach((b) => b.addEventListener('click', () => { tvSeek(b.dataset.tvBack!, Math.max(0, pos(b.dataset.tvBack!) - 10_000)); }));

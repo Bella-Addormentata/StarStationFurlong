@@ -6,11 +6,12 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
-  setTvIdentity, tvPlay, tvSchedule, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
+  setTvIdentity, setTvPageId, tvPlay, tvSchedule, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
-  forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvRoomPlayers,
+  forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvPlayerPositionMs,
+  tvRoomPlayers,
 } from './tvSession';
 
 const TV = 'tv-stand-1';
@@ -90,6 +91,41 @@ describe('tickTvRoom', () => {
     expect(readRemote(TV).holder).toBe('');
     expect(readRemote('tv-2').holder).toBe('AAAAme');
     forgetTv('tv-9'); // never held: nothing to do
+  });
+
+  it('a second tab of the same identity neither renews nor releases the first tab\'s remote', () => {
+    setTvPageId('A');
+    pickUpRemote(TV);
+    tickTvRoom([TV], now);
+    const lease = readRemote(TV).leaseAt;
+    setTvPageId('B'); // the same key in another tab
+    now += TV_LEASE_RENEW_MS;
+    tickTvRoom([TV], now);
+    expect(readRemote(TV).leaseAt).toBe(lease);
+    leaveTvRoom([TV]);
+    forgetTv(TV);
+    expect(readRemote(TV)).toMatchObject({ holder: 'AAAAme', page: 'A' });
+  });
+
+  it('a remote handed to my identity is claimed by the page that ticks first', () => {
+    setTvIdentity(() => ({ pub: 'BBBBgiver', name: 'Giver' }));
+    setTvPageId('G');
+    pickUpRemote(TV);
+    handRemote(TV, 'AAAAme', 'Me');
+    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
+    setTvPageId('A');
+    expect(iHoldRemote(TV)).toBe(false);
+    tickTvRoom([TV], now);
+    expect(iHoldRemote(TV)).toBe(true);
+    expect(readRemote(TV)).toMatchObject({ holder: 'AAAAme', page: 'A', by: 'BBBBgiver', leaseAt: now });
+  });
+
+  it('tells the phone where the live player is, and nothing when none is mounted', () => {
+    expect(tvPlayerPositionMs(TV)).toBeNull();
+    const unregister = registerTvPlayerOfRecord(TV, () => 12_345);
+    expect(tvPlayerPositionMs(TV)).toBe(12_345);
+    unregister();
+    expect(tvPlayerPositionMs(TV)).toBeNull();
   });
 
   it('lists the room\'s other keyed players for HAND TO', () => {

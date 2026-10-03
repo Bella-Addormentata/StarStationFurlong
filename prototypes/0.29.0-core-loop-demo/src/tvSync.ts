@@ -201,7 +201,11 @@ export class TvSyncController {
       // clamps the seek there, and so must the target, or it would never be
       // reached and the programme never closed.
       const target = clampToEnd(pb.positionMs, p.durationMs());
-      if (p.canSeek && Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) {
+      // While an earlier seek is still landing, the newest target is always
+      // reissued — even inside the band of where the player still reads —
+      // or the old seek would land later and be heartbeated over this one.
+      const landing = this.pendingTarget !== null;
+      if (p.canSeek && (landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS)) {
         p.seek(target);
         this.lastSeekAt = now;
         this.pendingTarget = target;

@@ -116,8 +116,8 @@ import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
-import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, subscribeTv } from "./tvDoc";
-import { renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv } from "./tvDoc";
+import { renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
 import { setOwnMediaOrigins } from "./tvConsent";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
@@ -8742,6 +8742,13 @@ async function init() {
   // theatre from anywhere in the room.
   setTvHostPredicate(() => canEditRoom().ok);
   setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  // The remote is held by a PAGE, not a key: two tabs share the identity
+  // (the seed is in localStorage) and must not both renew, beat and release.
+  setTvPageId(
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `page-${Math.random().toString(36).slice(2, 12)}`,
+  );
   setTvRoomPlayersProvider(() => {
     const out: Array<{ pub: string; name: string }> = [];
     const map = yjsSync?.doc.getMap("players");
@@ -8774,6 +8781,7 @@ async function init() {
       if (tvHeldBefore.has(id)) continue;
       const rec = readRemote(id);
       if (rec.by && rec.by !== me) {
+        selectTvRemote(id); // the phone shows the remote just received, not an earlier one
         showHint("📺 Someone handed you the TV remote.");
         (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
       }

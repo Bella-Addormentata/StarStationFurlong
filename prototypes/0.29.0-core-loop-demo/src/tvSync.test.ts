@@ -403,6 +403,23 @@ describe('the holder as the room\'s clock', () => {
     expect(p.playing).toBe(true);
   });
 
+  it('a newer transport target replaces a seek still landing — the old one never beats over it', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    h.transport({ positionMs: 30_000 }); // a seek…
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
+    h.transport({ positionMs: 0 }); // …then PLAY NOW from the top before it lands: within the band of where the player still reads
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000', 'seek:0']);
+    p.land(); // the newest target is what lands
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.position).toBe(0);
+    expect(h.beats).toEqual([0, 0]);
+  });
+
   it('a player with no clock (the archive embed) is played and never beats', () => {
     const p = new FakePlayer(false, false, false);
     const h = harness(p, { hold: true });

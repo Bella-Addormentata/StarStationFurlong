@@ -47,6 +47,9 @@ interface YtNamespace {
 type WindowWithYt = Window & { YT?: YtNamespace; onYouTubeIframeAPIReady?: () => void };
 
 const YT_API_URL = 'https://www.youtube.com/iframe_api';
+/** The API script can load while the nocookie iframe never says ready
+ *  (blocked, broken): a player that stays silent this long has failed. */
+const YT_READY_TIMEOUT_MS = 20_000;
 let ytLoading: Promise<YtNamespace> | null = null;
 
 /** Load the IFrame API script once. Rejects when it cannot be reached (no
@@ -91,13 +94,23 @@ class YouTubePlayerAdapter implements Adapter {
   private player: YtPlayerLike | null = null;
   private ready = false;
   private state = -1;
+  private readonly readyTimer: number;
 
-  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void) {
+  /** `autoplay` only when the room is playing at mount time: a countdown or
+   *  a paused set must not sound for the 400 ms before the controller's
+   *  first tick — the controller starts the player when the record says. */
+  constructor(host: HTMLElement, videoId: string, yt: YtNamespace, onFail: (why: string) => void, autoplay = true) {
     const mount = document.createElement('div');
     host.appendChild(mount);
     const playerVars: Record<string, unknown> = {
-      autoplay: 1, playsinline: 1, rel: 0, enablejsapi: 1, modestbranding: 1,
+      autoplay: autoplay ? 1 : 0, playsinline: 1, rel: 0, enablejsapi: 1, modestbranding: 1,
     };
+    // Bounded readiness, through the attempt-scoped failure path: an
+    // adopted player that never reports ready would otherwise hide the
+    // notice, silence the headless beat and offer no RETRY, for good.
+    this.readyTimer = window.setTimeout(() => {
+      if (!this.ready) onFail("YouTube's player did not become ready");
+    }, YT_READY_TIMEOUT_MS);
     // The `origin` guard only makes sense from an http(s) page; a custom
     // scheme (tauri://) must not send one YouTube will refuse.
     if (location.protocol === 'https:' || location.protocol === 'http:') playerVars.origin = location.origin;
@@ -108,7 +121,7 @@ class YouTubePlayerAdapter implements Adapter {
       height: '100%',
       playerVars,
       events: {
-        onReady: () => { this.ready = true; },
+        onReady: () => { this.ready = true; window.clearTimeout(this.readyTimer); },
         onStateChange: (e: { data: number }) => { this.state = e.data; },
         onError: (e: { data: number }) => onFail(`YouTube player error ${e.data}`),
       },
@@ -134,6 +147,7 @@ class YouTubePlayerAdapter implements Adapter {
   setRate(): void { /* YouTube's rate steps are coarse: the controller only seeks */ }
   setVolume(volume: number): void { try { this.player?.setVolume(volume); } catch { /* not ready */ } }
   destroy(): void {
+    window.clearTimeout(this.readyTimer);
     try { this.player?.destroy(); } catch { /* already gone */ }
     this.player = null;
   }
@@ -246,6 +260,8 @@ interface Theatre {
   lastHead: string;
   lastNotice: string;
   onKey: (e: KeyboardEvent) => void;
+  /** What had focus when the theatre opened: focus goes back there on close. */
+  opener: HTMLElement | null;
 }
 
 let theatre: Theatre | null = null;
@@ -279,8 +295,11 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
       <div class="tv-theatre-status"></div>
       <div class="tv-theatre-controls"></div>
     </div>`;
-  // Clicks inside the panel stay inside it; a click on the dark surround closes.
+  // Clicks inside the panel stay inside it — the world's click handler
+  // listens on window and would walk the player or wake a device behind the
+  // overlay — and a click on the dark surround closes.
   root.addEventListener('click', (e) => {
+    e.stopPropagation();
     if (e.target === root) closeTvTheatre();
   });
   document.body.appendChild(root);
@@ -288,6 +307,20 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     if (e.key === 'Escape') {
       e.stopPropagation();
       closeTvTheatre();
+      return;
+    }
+    // Tab stays inside the dialog (the phone's own Tab shortcut would
+    // otherwise swallow it): cycle through the theatre's controls.
+    if (e.key === 'Tab') {
+      const focusable = theatreFocusable(root);
+      if (focusable.length === 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const at = focusable.indexOf(document.activeElement as HTMLElement);
+      const next = e.shiftKey
+        ? focusable[(at <= 0 ? focusable.length : at) - 1]!
+        : focusable[(at + 1) % focusable.length]!;
+      next.focus();
     }
   };
   window.addEventListener('keydown', onKey, true);
@@ -311,11 +344,20 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     lastHead: '',
     lastNotice: '',
     onKey,
+    opener: document.activeElement instanceof HTMLElement ? document.activeElement : null,
   };
+  // The dialog takes focus (Tab then reaches its controls); it goes back on close.
+  root.tabIndex = -1;
+  root.focus();
   const rtt = deps.rttMs ?? (() => 0);
   theatre.timer = window.setInterval(() => theatreTick(rtt), 400);
   theatreTick(rtt);
   updateTvChip([itemId]);
+}
+
+/** The theatre's controls in Tab order: its buttons and the volume slider. */
+function theatreFocusable(root: HTMLElement): HTMLElement[] {
+  return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')];
 }
 
 export function closeTvTheatre(): void {
@@ -326,6 +368,7 @@ export function closeTvTheatre(): void {
   window.removeEventListener('keydown', t.onKey, true);
   unmountPlayer(t);
   t.root.remove();
+  if (t.opener && t.opener.isConnected) t.opener.focus();
 }
 
 function unmountPlayer(t: Theatre): void {
@@ -391,12 +434,15 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     t.controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
     // Only a player with a clock becomes the room's clock; the archive embed
     // reports nothing, so the headless heartbeat (tvSession) keeps beating.
-    if (player.hasClock) t.unregister = registerTvPlayerOfRecord(t.itemId);
+    // The phone's transport asks this player where it is, not the record.
+    if (player.hasClock) t.unregister = registerTvPlayerOfRecord(t.itemId, () => player.currentMs());
   };
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
     loadYouTubeApi().then(
-      (yt) => adopt(new YouTubePlayerAdapter(t.screen, source.videoId, yt, fail)),
+      (yt) => adopt(new YouTubePlayerAdapter(
+        t.screen, source.videoId, yt, fail, readPlayback(t.itemId).state === 'playing',
+      )),
       (err: Error) => fail(err.message || 'YouTube is unreachable'),
     );
     return;
@@ -524,7 +570,13 @@ function renderTheatreChrome(t: Theatre): void {
     mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
     mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
-    `<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="1" aria-label="Set volume"></label>`,
+    // archive.org's own player takes no volume from us: the set's level
+    // drives every other player; theirs is adjusted inside the frame. And
+    // a frame that never loaded gives no sign of it: RELOAD is the retry.
+    startOnly
+      ? '<span class="tv-theatre-lane">volume: in archive.org\'s player</span>'
+      : `<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="1" aria-label="Set volume"></label>`,
+    startOnly && t.player ? btn('data-tv-reload="1"', '↻ RELOAD PLAYER', "archive.org's player did not load? Reload it") : '',
     !mine && mayPickUpRemote(t.itemId) ? btn('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE') : '',
     !mine && held ? `<span class="tv-theatre-lane">${escapeHtml(remote.name || 'someone')} has the remote</span>` : '',
   ].join('');
@@ -543,6 +595,7 @@ function renderTheatreChrome(t: Theatre): void {
     c.querySelector<HTMLInputElement>('[data-tv-volume]')?.addEventListener('change', (e) => {
       tvSetVolume(t.itemId, Number((e.target as HTMLInputElement).value));
     });
+    c.querySelector<HTMLButtonElement>('[data-tv-reload]')?.addEventListener('click', () => { t.mounted = ''; });
   }
 }
 
@@ -589,7 +642,8 @@ export function updateTvChip(itemIds: readonly string[]): void {
     chip = document.createElement('button');
     chip.type = 'button';
     chip.id = 'tv-chip';
-    chip.addEventListener('click', () => {
+    chip.addEventListener('click', (e) => {
+      e.stopPropagation(); // the world's click handler on window must not see it
       if (chip?.dataset.tv) chipOpen?.(chip.dataset.tv);
     });
     document.body.appendChild(chip);

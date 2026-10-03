@@ -1353,6 +1353,11 @@
       }
       .tv-theatre-panel {
         width: min(92vw, 960px);
+        /* A short or landscape window: the panel scrolls rather than losing
+           its close button and controls past the edge (html/body hide overflow). */
+        max-height: calc(100vh - 24px);
+        box-sizing: border-box;
+        overflow-y: auto;
         background: rgba(4, 8, 22, 0.97);
         border: 1px solid rgba(212, 168, 75, 0.28);
         border-radius: 12px;
@@ -1394,6 +1399,7 @@
       .tv-theatre-screen {
         position: relative;
         aspect-ratio: 16 / 9;
+        max-height: calc(100vh - 160px);
         background: #000;
         border-radius: 6px;
         overflow: hidden;
