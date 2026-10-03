@@ -211,9 +211,11 @@ describe('guards', () => {
     expect(mergeStation(settled, { ...b, updatedAt: T0 + 5000 })).toBeNull();
   });
 
-  it("does not republish over another install's identical record", () => {
+  it("does not republish over another install's identical record, past its own id as an alias", () => {
     const known = summary({ ownerId: 'alpha', updatedAt: T0 });
-    expect(foldOwnStation(known, record({ id: 'beta' }), null, T0 + 10)).toBeNull();
+    const aliased = foldOwnStation(known, record({ id: 'beta' }), null, T0 + 10);
+    expect(aliased).toEqual({ ...known, ownerAliases: ['beta'] });
+    expect(foldOwnStation(aliased!, record({ id: 'beta' }), null, T0 + 20)).toBeNull();
   });
 
   it('checks ship summaries', () => {

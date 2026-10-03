@@ -645,7 +645,11 @@ export function foldOwnStation(
       === JSON.stringify({ ...b, trim: undefined, trimGone: undefined, updatedAt: 0, ownerId: undefined, ownerAliases: undefined });
   const base = owned && !sameRecord(known, mine)
     ? { ...mine, updatedAt: Math.min(Math.max(now, known.updatedAt + 1), now + MAX_SKEW_MS) }
-    : known;
+    // The same record under another install's id, or nobody's: this one's
+    // goes out too, under the known stamp, so mergeStation settles the owner
+    // and keeps the other id as an alias (a flight record written on either
+    // install still resolves).
+    : owned && mine.ownerId !== known.ownerId ? { ...mine, updatedAt: known.updatedAt } : known;
   // A trim is keyed by the orbit it trims: it goes out when it names the
   // planet and slot of the record that is kept, whichever client's that is.
   // A learned station flies the slot listStations settled for that record,
@@ -686,6 +690,17 @@ export function learnedRecord(s: StationSummary): Omit<StationRecord, 'derived'>
   };
 }
 
+/** Does a saved record already say what a summary says? Its extra fields
+ *  count both ways: one the summary no longer carries must go too. */
+function holdsSummary(had: StationRecord & Record<string, unknown>, s: StationSummary): boolean {
+  const ext = s.ext ?? {};
+  return Object.keys(had).filter((k) => !KNOWN_FIELDS.has(k)).length === Object.keys(ext).length
+    && Object.entries(ext).every(([k, v]) => JSON.stringify(had[k]) === JSON.stringify(v))
+    && had.name === s.name && had.orbitSlot === s.orbitSlot
+    && planetById(had.planetId).id === planetById(s.planetId).id
+    && had.welcomeRoomId === s.welcomeRoomId && had.berthDoor === s.berthDoor;
+}
+
 /**
  * Register the learned stations around `planetId` as station records, so
  * their slots (and so their orbits) match every other client's. A place this
@@ -723,12 +738,13 @@ export function registerLearnedStations(
     if (owner && !owner.derived && owner.id !== rec.id) {
       // …except where it stands: when another install's record of the same
       // place stood (rival owners settle on one, mergeStation), this one
-      // flies that planet and slot too, under its own id, so both installs
-      // agree and the standing trim fits.
-      const own = saved.get(owner.id);
+      // takes that record whole under its own id (its planet and slot, so
+      // the standing trim fits, and its name, berth and a newer build's
+      // fields), so every install registers the same station.
+      const own = saved.get(owner.id) as (StationRecord & Record<string, unknown>) | undefined;
       if (own && !isLearnedRecord(own) && s.ownerId !== undefined && s.ownerId !== owner.id
-        && (own.orbitSlot !== s.orbitSlot || planetById(own.planetId).id !== planetById(s.planetId).id)) {
-        if (registerStation({ ...own, planetId: s.planetId, orbitSlot: s.orbitSlot })) changed++;
+        && !holdsSummary(own, s)) {
+        if (registerStation({ ...rec, id: own.id })) changed++;
       }
       continue;
     }
