@@ -484,6 +484,40 @@ describe('the station record', () => {
     expect(out.some((b) => b.gate === 2)).toBe(true);
   });
 
+  it('keeps the same berths from the same list in any order', () => {
+    // 99 numbers plus a second port on gate 5: one port has to go, and it
+    // must be the same one whichever order the list comes in.
+    const list: StationBerthRecord[] = Array.from({ length: 99 }, (_, i) => ({ roomId: 'room-a', doorId: `d:${String(i + 1).padStart(8, '0')}`, gate: i + 1 }));
+    list.push({ roomId: 'room-b', doorId: 'north', gate: 5 });
+    // One port listed twice, differently: the same copy stands either way.
+    const twice: StationBerthRecord[] = [
+      { roomId: 'room-c', doorId: 'east', gate: 7 },
+      { roomId: 'room-c', doorId: 'east', gate: 7, access: 'closed' },
+    ];
+    for (const v of [list, twice]) {
+      const forward = cleanBerths(v);
+      expect(cleanBerths([...v].reverse())).toEqual(forward);
+      expect(cleanBerths([...v.slice(40), ...v.slice(0, 40)])).toEqual(forward);
+    }
+    expect(cleanBerths(list).find((b) => b.gate === 5)).toEqual({ roomId: 'room-a', doorId: 'd:00000005', gate: 5 });
+  });
+
+  it('merges full gate lists from two rooms alike in either order', () => {
+    const T = Date.UTC(2026, 8, 27, 10, 0, 0);
+    const summary = (over: Partial<StationSummary>): StationSummary => ({
+      welcomeRoomId: 'room-a', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, updatedAt: T, ownerId: 'hub', ...over,
+    });
+    const a = summary({
+      berths: Array.from({ length: 99 }, (_, i) => ({ roomId: 'room-a', doorId: `d:${String(i + 1).padStart(8, '0')}`, gate: i + 1 })),
+      berthsAt: T,
+    });
+    const b = summary({ berths: [{ roomId: 'room-b', doorId: 'north', gate: 5 }], berthsAt: T + 5 });
+    const ab = (mergeStation(a, b) ?? a).berths;
+    const ba = (mergeStation(b, a) ?? b).berths;
+    expect(ab).toHaveLength(99);
+    expect(ba).toEqual(ab);
+  });
+
   it('rejects a peer gate list longer than any station lists, rather than trusting a prefix', () => {
     const flood = Array.from({ length: 396 }, (_, i) => ({ roomId: 'room-x', doorId: `d:${String(i).padStart(8, '0')}`, gate: 1 }));
     expect(cleanBerths([...flood, { roomId: 'room-a', doorId: 'north', gate: 2 }])).toEqual([]);

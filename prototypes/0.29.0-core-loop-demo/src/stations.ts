@@ -129,16 +129,36 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
   return out;
 }
 
+/** Berths in gate order (unnumbered last), then by room and door, so
+ *  arrivals try the lowest gate first; two copies of one port by access, the
+ *  strictest first, then by the ship reserved. */
+function berthOrder(x: StationBerthRecord, y: StationBerthRecord): number {
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const strictness = (b: StationBerthRecord) =>
+    b.access === 'closed' ? 0 : b.access === 'reserved' ? 1 : b.access === 'pass' ? 2 : 3;
+  return (x.gate ?? Infinity) - (y.gate ?? Infinity)
+    || cmp(x.roomId, y.roomId) || cmp(x.doorId, y.doorId)
+    || strictness(x) - strictness(y) || cmp(x.reservedFor ?? '', y.reservedFor ?? '');
+}
+
 /** A list of berths, cleaned, deduplicated by port and capped. */
 export function cleanBerths(v: unknown): StationBerthRecord[] {
   // A longer list than any station lists is junk, not a prefix to trust:
   // duplicates could otherwise push a real gate past the cut.
   if (!Array.isArray(v) || v.length > MAX_BERTHS * 4) return [];
-  const valid: StationBerthRecord[] = [];
-  const seen = new Set<string>();
+  // One canonical order before any port is dropped or cut, so the same
+  // berths in any order keep the same ports: a merge of two lists taken
+  // either way round (planetSummary newerBerths) settles alike on every
+  // install.
+  const sorted: StationBerthRecord[] = [];
   for (const item of v) {
     const b = cleanBerth(item);
-    if (!b) continue;
+    if (b) sorted.push(b);
+  }
+  sorted.sort(berthOrder);
+  const valid: StationBerthRecord[] = [];
+  const seen = new Set<string>();
+  for (const b of sorted) {
     const key = `${b.roomId}\u0000${b.doorId}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -152,12 +172,7 @@ export function cleanBerths(v: unknown): StationBerthRecord[] {
   for (const b of valid) {
     if (b.gate !== undefined && !numbers.has(b.gate)) { numbers.add(b.gate); firsts.push(b); } else rest.push(b);
   }
-  const out = [...firsts, ...rest].slice(0, MAX_BERTHS);
-  // In gate order whatever order a peer sent (unnumbered berths last, then
-  // by room and door), so arrivals try the lowest gate first.
-  const cmp = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
-  return out.sort((x, y) => (x.gate ?? Infinity) - (y.gate ?? Infinity)
-    || cmp(x.roomId, y.roomId) || cmp(x.doorId, y.doorId));
+  return [...firsts, ...rest].slice(0, MAX_BERTHS).sort(berthOrder);
 }
 
 /**
