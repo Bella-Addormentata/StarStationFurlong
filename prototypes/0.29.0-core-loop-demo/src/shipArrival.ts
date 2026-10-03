@@ -477,7 +477,9 @@ export function completeArrival(
   const leftAt = rec.castOffAt ?? rec.departedAt;
   // Any move that was still under way (or not yet begun) when the ship left
   // and has begun by now overlaps its time away.
-  const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
+  // 🎚️ Not an altitude change: one that lost its claim never flew, and
+  // climbedAway below weighs those that did.
+  const movedMidFlight = !!moved && moved.mode !== 'orbit' && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
   // Where the station orbited at cast-off, when the flight kept it: however
   // many moves it made since (and only the latest is kept), it is not there.
   const castOffPlace = rec.destinationAt !== undefined ? adriftPlace(rec.destinationAt) : null;

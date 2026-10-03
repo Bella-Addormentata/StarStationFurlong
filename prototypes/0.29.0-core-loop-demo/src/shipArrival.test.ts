@@ -461,6 +461,22 @@ describe('a round trip', () => {
     writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
     writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
     expect(completeArrival(docking, { now, force: true })).toEqual({ kind: 'docking', stationName: 'High Orbit' });
+    // 🎚️ An altitude change mid-flight is not a move away by itself: one
+    // that lost its claim never flew, and climbedAway weighs those that did
+    // (here none is known to the station list, so the dock goes ahead).
+    setStationDirectory({ stations: () => [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth, lastMove: {
+        ...lastMove, toPlanetId: 'planet-sovereign', toSlot: 1, mode: 'orbit' as const, tugRoomId: undefined,
+        departAt: departedAt + 1000, arriveAt: now - 1000,
+        orbit: { fromRadiusKm: 7_000, fromPhase0: 0, toRadiusKm: 8_000, toPhase0: 0 },
+      } },
+    ] });
+    const again = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', again);
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    expect(completeArrival(again, { now, force: true })).toEqual({ kind: 'docking', stationName: 'High Orbit' });
   });
 
   it('does nothing unless the ship is redocking, and only once', () => {

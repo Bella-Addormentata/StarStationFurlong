@@ -1181,6 +1181,19 @@ describe("🚚 where a ruling timetable flies the ship (the route's own copy of 
     expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[1].depart + SEC)), null, false)).toBeNull();
     expect(routeStayOffList(null, null, false)).toBeNull();
   });
+
+  it('🎚️ counts a station that changed altitude at the same slot as gone from the copy', () => {
+    const orbit = { radiusKm: 7_000, phase0: 0.5 };
+    const withOrbit = { ...r, stops: r.stops.map((st, i) => (i === 1 ? { ...st, orbit } : st)) };
+    const stay = routeFlightPlaces(withOrbit, at(r, [s], on[0].arrive + SEC));
+    const here = { planetId: SOV, orbitSlot: 1, moving: false };
+    expect(routeStayOffList(stay, { ...here, orbit }, false)).toBeNull();
+    expect(routeStayOffList(stay, { ...here, orbit: { ...orbit, phase0: orbit.phase0 + 2 * Math.PI } }, false)).toBeNull();
+    expect(routeStayOffList(stay, { ...here, orbit: { ...orbit, radiusKm: 7_200 } }, false)).toEqual({ ...copyOf(1), orbit });
+    expect(routeStayOffList(stay, here, false)).toEqual({ ...copyOf(1), orbit });
+    // A copy on the slot's orbit, a station since on an altitude of its own.
+    expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[0].arrive + SEC)), { ...here, orbit }, false)).toEqual(copyOf(1));
+  });
 });
 
 describe('copying the timetable back (A4)', () => {

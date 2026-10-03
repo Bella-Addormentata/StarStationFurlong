@@ -127,6 +127,7 @@ import type { FlightRecord } from './shipDoc';
 import { planRecordHop } from './stationDirectory';
 import type { StationRecordLike } from './stationDirectory';
 import type { StationOrbit } from './stations';
+import { wrapAngle } from './orbits';
 import type {
   CheckpointKind,
   DockCheckpoint,
@@ -1538,13 +1539,18 @@ export function routeFlightPlaces(
  *  a planet id as the station list does (stations.planetById). Pure. */
 export function routeStayOffList(
   places: RouteFlightPlaces | null,
-  listed: { planetId: string; orbitSlot: number; moving: boolean } | null,
+  listed: { planetId: string; orbitSlot: number; moving: boolean; orbit?: StationOrbit } | null,
   docked: boolean,
   planet: (id: string) => string = (id) => id,
 ): RouteFlightPlace | null {
   if (!places || places.to || docked) return null;
   const at = { ...places.from, planetId: planet(places.from.planetId) };
-  if (listed && !listed.moving && planet(listed.planetId) === at.planetId && listed.orbitSlot === at.orbitSlot) return null;
+  // 🎚️ On the copy's altitude too: a station that changed altitude since
+  // has left it as surely as one that changed slot (the keeper skips it).
+  const sameOrbit = !listed?.orbit === !at.orbit && (!listed?.orbit || !at.orbit
+    || (Math.abs(listed.orbit.radiusKm - at.orbit.radiusKm) < 1e-6
+      && Math.abs(wrapAngle(listed.orbit.phase0 - at.orbit.phase0)) < 1e-9));
+  if (listed && !listed.moving && planet(listed.planetId) === at.planetId && listed.orbitSlot === at.orbitSlot && sameOrbit) return null;
   return at;
 }
 

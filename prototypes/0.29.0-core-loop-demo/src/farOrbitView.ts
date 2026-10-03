@@ -284,7 +284,7 @@ function readSource(now: number): Source {
       const station = all.find((s) => s.id === places.from.id);
       adrift = routeStayOffList(
         places,
-        station ? { planetId: station.planetId, orbitSlot: station.orbitSlot, moving: reallyMoving(station, now) } : null,
+        station ? { planetId: station.planetId, orbitSlot: station.orbitSlot, moving: reallyMoving(station, now), ...(station.orbit ? { orbit: station.orbit } : {}) } : null,
         dockedStationFor(roomId, readAllDoors().values(), atlas, all) !== null,
         (id) => planetById(id).id,
       );
