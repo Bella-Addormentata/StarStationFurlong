@@ -152,6 +152,8 @@ export function isStationMove(v: unknown): v is StationMove {
     // at the first step, never walked.
     && (r.settles === undefined || (typeof r.settles === 'object' && r.settles !== null
       && (r.settles as { settles?: unknown }).settles === undefined
+      // 🎚️ An altitude change is never pinned (stations.isPinMove).
+      && (r.settles as { mode?: unknown }).mode !== 'orbit'
       && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
@@ -1166,7 +1168,7 @@ export function rememberedMoveFor(station: MovingStation): StationMove | null {
 /** Point stations.listStations at the remembered moves. */
 export function installStationMoveResolver(): void {
   setStationMoveResolver(rememberedMoveFor);
-  setAltitudeHistory(allKnownMoves);
+  setAltitudeHistory(flownKnownMoves);
 }
 
 // ── The room doc ─────────────────────────────────────────────────────────────
@@ -1319,25 +1321,37 @@ function superseded(m: StationMove, known: StationMove[]): boolean {
 function outbidForAltitude(m: StationMove, known: StationMove[]): boolean {
   if (m.mode !== 'orbit' || m.settles) return false;
   let lost = lostCache.get(known);
-  if (!lost) lostCache.set(known, lost = lostAltitudeClaims(known));
+  if (!lost) lostCache.set(known, lost = lostAltitudeClaims(flownAmong(known)));
   return lost.has(altitudeMoveKey(m));
 }
 
 /** The losing claims per list of known moves: superseded asks once per entry. */
 const lostCache = new WeakMap<StationMove[], Set<string>>();
 
+/** 🎚️ The known moves that flew: a concurrent move its own station (or tug)
+ *  preferred never did, so it claims no orbit. */
+function flownAmong(known: StationMove[]): StationMove[] {
+  return known.filter((m) => !beatenForStation(m, known) && !outbidForTug(m, known));
+}
+
 /** Every move this install knows: the bound room's log and the remembered
- *  ones (what listStations weighs altitude claims among). */
+ *  ones. */
 function allKnownMoves(): StationMove[] {
   if (!docAlive()) return readRememberedMoves();
   const { entries, legacy } = roomMoves();
   return knownMoves(legacy ? [legacy, ...entries] : entries);
 }
 
+/** 🎚️ The moves listStations weighs altitude claims among: every known one
+ *  that flew. */
+function flownKnownMoves(): StationMove[] {
+  return flownAmong(allKnownMoves());
+}
+
 /** 🎚️ Is this an altitude change another station's claimed the orbit for
  *  first, by every move this install knows? */
 export function isAbortedAltitudeChange(m: StationMove): boolean {
-  return m.mode === 'orbit' && !m.settles && lostAltitudeClaims([m, ...allKnownMoves()]).has(altitudeMoveKey(m));
+  return m.mode === 'orbit' && !m.settles && lostAltitudeClaims([m, ...flownKnownMoves()]).has(altitudeMoveKey(m));
 }
 
 /** Did a concurrent move of the same station win over this one? Another

@@ -48,7 +48,7 @@ import { shipDocBound } from './shipDoc';
 import { readResolvedFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
-import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { adriftPlace, altitudeChangesSince, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
@@ -129,12 +129,14 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
     if (moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now && betweenPlanets(moved)) {
       return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot };
     }
-    // 🎚️ Likewise an altitude change since the ship left: the flight was
-    // planned to the orbit the station flew then.
-    if (moved?.mode === 'orbit' && moved.orbit && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now) {
+    // 🎚️ Likewise an altitude change since the ship left, found among every
+    // move known (a later booking can hide it from the latest): the flight
+    // was planned to the orbit the station flew then.
+    const climbed = leftAt !== undefined ? altitudeChangesSince(station, leftAt, now)[0]?.orbit : undefined;
+    if (climbed) {
       return {
         id: station.id, planetId: station.planetId, orbitSlot: station.orbitSlot,
-        orbit: { radiusKm: moved.orbit.fromRadiusKm, phase0: moved.orbit.fromPhase0 },
+        orbit: { radiusKm: climbed.fromRadiusKm, phase0: climbed.fromPhase0 },
       };
     }
     return station;

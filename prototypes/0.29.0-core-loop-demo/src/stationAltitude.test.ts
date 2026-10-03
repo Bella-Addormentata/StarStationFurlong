@@ -31,6 +31,7 @@ import {
   altitudeConflict,
   bindStationMoveDoc,
   cleanMove,
+  compareMoves,
   describeAltitudeRefusal,
   describeMove,
   dockLockedByMove,
@@ -68,7 +69,7 @@ import {
   stationLeftPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
-import { altitudeChangedSince, setAltitudeHistory } from './stations';
+import { altitudeChangedSince, altitudeChangesSince, setAltitudeHistory } from './stations';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -575,6 +576,56 @@ describe('Copilot round 3', () => {
       const theirs = climbOf('other', 'other-room', 1, 1_020, NOW - 10);
       setAltitudeHistory(() => [climb, theirs]);
       expect(altitudeChangedSince(station, NOW - 1_000, NOW + 200_000)).toBe(false);
+    } finally {
+      setAltitudeHistory(null);
+    }
+  });
+});
+
+describe('Copilot round 5', () => {
+  const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => ({
+    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
+    departAt: bookedAt, arriveAt: bookedAt + 60_000, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+    orbit: { fromRadiusKm: orbitForSlot(SOV, slot).radiusKm, fromPhase0: 0, toRadiusKm: SOV_R + toAlt, toPhase0: 0 },
+  });
+
+  it('refuses a pin of an altitude change', () => {
+    const climb = climbOf('other', 'other-room', 1, 1_000, NOW);
+    expect(isStationMove({ ...climb, departAt: NOW + 70_000, arriveAt: NOW + 70_001, settles: climb })).toBe(false);
+  });
+
+  it('a concurrent altitude change its own station passed over claims no orbit', () => {
+    bindStationMoveDoc(new Y.Doc());
+    installStationMoveResolver();
+    const now = Date.now();
+    const x1 = climbOf('other', 'other-room', 1, 1_000, now);
+    const x2 = climbOf('other', 'other-room', 1, 1_500, now + 10);
+    // Booked within moments (two tabs): one order picks the one that flies.
+    const [winner, loser] = compareMoves(x1, x2) > 0 ? [x1, x2] : [x2, x1];
+    // Both in the other station's room log, as two tabs would write them.
+    expect(writeStationMove(x1)).toBe(true);
+    expect(writeStationMove(x2)).toBe(true);
+    const nearLoser = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0,
+      loser.orbit!.toRadiusKm - SOV_R + 20, now + 5);
+    const nearWinner = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0,
+      winner.orbit!.toRadiusKm - SOV_R + 20, now + 15);
+    expect(isAbortedAltitudeChange(nearLoser)).toBe(false);
+    expect(isAbortedAltitudeChange(nearWinner)).toBe(true);
+  });
+
+  it('the distant view keeps a flight\'s old orbit when a later move hides the climb', () => {
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW);
+    const leave: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: NOW + 5_000_000, arriveAt: NOW + 9_000_000, mode: 'thrusters',
+      bookedAt: NOW + 100_000, fuel: 5, fuelDrawn: 10, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW },
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? leave : null));
+    setAltitudeHistory(() => [climb]);
+    try {
+      const first = altitudeChangesSince({ id: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId },
+        NOW - 1_000, NOW + 200_000)[0];
+      expect(first?.orbit?.fromRadiusKm).toBe(orbitForSlot(SOV, 0).radiusKm);
     } finally {
       setAltitudeHistory(null);
     }

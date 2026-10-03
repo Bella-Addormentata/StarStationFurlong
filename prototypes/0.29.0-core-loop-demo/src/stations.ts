@@ -300,20 +300,27 @@ export function setAltitudeHistory(source: (() => StationMove[]) | null): void {
   altitudeHistory = source;
 }
 
-/** 🎚️ Has the station begun an altitude change, not aborted, that was still
- *  to come or under way at `sinceMs` (a ship's cast-off)? It keeps its
- *  planet and slot, so only the moves this install knows tell: a later move
- *  booked since can hide it from the latest. */
-export function altitudeChangedSince(station: MovingStation, sinceMs: number, nowMs: number): boolean {
+/** 🎚️ The station's altitude changes, not aborted, that were still to come
+ *  or under way at `sinceMs` (a ship's cast-off) and have begun by `nowMs`,
+ *  earliest first. They keep the planet and slot, so only the moves this
+ *  install knows tell: a later move booked since can hide one from the
+ *  latest. */
+export function altitudeChangesSince(station: MovingStation, sinceMs: number, nowMs: number): StationMove[] {
   let history: StationMove[] = [];
   try { history = altitudeHistory?.() ?? []; } catch { history = []; }
   const latest = moveOf(station);
   const known = latest ? [latest, ...history] : history;
   const changes = known.filter((m) => moveBelongsTo(m, station) && m.mode === 'orbit' && !m.settles && !!m.orbit
     && m.arriveAt > sinceMs && m.departAt <= nowMs);
-  if (changes.length === 0) return false;
+  if (changes.length === 0) return [];
   const lost = lostAltitudeClaims(known);
-  return changes.some((m) => !lost.has(altitudeMoveKey(m)));
+  return changes.filter((m) => !lost.has(altitudeMoveKey(m))).sort((a, b) => a.departAt - b.departAt);
+}
+
+/** 🎚️ Has the station begun an altitude change since `sinceMs`
+ *  (altitudeChangesSince)? */
+export function altitudeChangedSince(station: MovingStation, sinceMs: number, nowMs: number): boolean {
+  return altitudeChangesSince(station, sinceMs, nowMs).length > 0;
 }
 
 /**
