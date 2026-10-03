@@ -708,6 +708,35 @@ describe('a module taken apart', () => {
     expect(readAtlas()['room-b']).toBeUndefined();
   });
 
+  it('stays off the maps and reaches the station when the store cannot take it', () => {
+    hub();
+    const doc = new Y.Doc();
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    const ls = globalThis.localStorage as { setItem: (k: string, v: string) => void };
+    const setItem = ls.setItem;
+    ls.setItem = () => { throw new Error('QuotaExceededError'); };
+    try {
+      dismantleInAtlas('room-b', 1000);
+      // Not saved (the store is full)…
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBeUndefined();
+      // …yet this install's maps drop it for the session,
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(isDismantled('room-b')).toBe(true);
+      // the station's other visitors get it,
+      expect(doc.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: 1000, doors: {} });
+      // and so does the next room doc this install joins.
+      const next = new Y.Doc();
+      bindStationAtlasDoc(next, { roomId: 'room-c', isPassagePublic: () => false });
+      expect(next.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: 1000 });
+    } finally {
+      ls.setItem = setItem;
+    }
+    // The first push once the store takes writes again saves it, as ours.
+    pushAtlasToDoc();
+    expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b']).toMatchObject({ dismantledAt: 1000, dismantledHere: true });
+    expect(readAtlas()['room-b']).toBeUndefined();
+  });
+
   it('leaves a room or door named like an Object property an ordinary entry', () => {
     // As the stored atlas parses: `__proto__` an own key, room and door alike.
     const atlas = JSON.parse(`{
@@ -1076,6 +1105,11 @@ describe('the deed takes a module apart (source scan)', () => {
     const input = between(source('world.ts'), 'private disassemblyInput(', '\n  }');
     expect(input).toContain('playerId: getPlayerId()');
     expect(input).not.toContain('ledgerHasRoom');
+  });
+
+  it("reads an owner id the atlas can't carry as no owner, never keeping a former one", () => {
+    const harvest = between(source('main.ts'), 'const ownerValue: unknown = sync.doc.getMap("roomInfo").get("owner");', 'pushAtlasToDoc();');
+    expect(harvest).toContain('owner: ownerId ? cleanAtlasOwner(ownerName ? { id: ownerId, name: ownerName } : { id: ownerId }) ?? null : null,');
   });
 
   it('is the raw deed check, refused while a leave is under way', () => {

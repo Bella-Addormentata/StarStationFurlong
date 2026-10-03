@@ -333,6 +333,7 @@ import {
 } from "./exteriorView";
 import {
   harvestIntoAtlas,
+  cleanAtlasOwner,
   freeGateNumberHere,
   readAtlas,
   atlasComponent,
@@ -4123,8 +4124,11 @@ function harvestStationAtlas(): void {
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
     ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : {}),
-    // null: this synced room has no verifiable owner (clears a stale one).
-    owner: ownerId ? (ownerName ? { id: ownerId, name: ownerName } : { id: ownerId }) : null,
+    // null: this synced room has no verifiable owner (clears a stale one),
+    // and neither has one whose id the atlas can't carry (cleanAtlasOwner
+    // refuses it): left out, the owner would read as unread, keeping a
+    // former owner for the card and for taking the module apart.
+    owner: ownerId ? cleanAtlasOwner(ownerName ? { id: ownerId, name: ownerName } : { id: ownerId }) ?? null : null,
   });
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
