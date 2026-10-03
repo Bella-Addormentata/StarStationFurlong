@@ -29,6 +29,7 @@
 import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
+import { MIN_ALTITUDE_KM, maxAltitudeKm } from './orbits';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { DoorRecord } from './doorsDoc';
 
@@ -751,8 +752,18 @@ export function listStations(
     const m = c.move;
     if (!m || !lostClaims.has(altitudeMoveKey(m))) return;
     const { planetId, orbitSlot } = wantOf[i];
-    if (m.mode === 'orbit' && !m.settles && m.orbit) {
-      wantOf[i] = { planetId, orbitSlot, orbit: { radiusKm: m.orbit.fromRadiusKm, phase0: m.orbit.fromPhase0 } };
+    if (m.mode === 'orbit' && !m.settles && m.orbit && !lostClaims.has(`${altitudeMoveKey(m)}|from`)) {
+      // It stays on the orbit it left: inside the altitude band, as the
+      // orbit it left may sit a trim beyond its edge (baseOrbit flies only
+      // the band).
+      const planet = planetById(planetId);
+      const low = planet.radiusKm + MIN_ALTITUDE_KM;
+      const high = planet.radiusKm + maxAltitudeKm(planet.id);
+      const radiusKm = Math.min(high, Math.max(low, m.orbit.fromRadiusKm));
+      wantOf[i] = { planetId, orbitSlot, orbit: { radiusKm, phase0: m.orbit.fromPhase0 } };
+    } else if (m.mode === 'orbit' && !m.settles && m.orbit) {
+      // The orbit it left was lost too: its slot's own.
+      wantOf[i] = { planetId, orbitSlot };
     } else {
       wantOf[i] = { planetId, orbitSlot, ...(wantOf[i].move ? { move: wantOf[i].move } : {}) };
     }

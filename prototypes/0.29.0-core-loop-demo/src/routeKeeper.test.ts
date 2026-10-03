@@ -10,6 +10,7 @@
  * whole pass, what a pass writes, the helm's lines — and whole ferry trips
  * over real ship + doors docs with a stand-in docking system.
  */
+import { destinationsFromRecords } from './stationDirectory';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { berthMemoryFrom, classifyDockPort, dockAnswerOf, redockRecord, stampAfter } from './dockRules';
@@ -876,19 +877,31 @@ describe('a dock pass over the gate list', () => {
 
   it('🎚️ a stop whose station has changed altitude since the route copied it is skipped as gone', async () => {
     const d = fakeDocking(clock);
-    const climbed = await runKeeperPass({
+    const stop = { ...route.stops[1], orbit: { radiusKm: 8_000, phase0: 0.2 } };
+    // The station as the game's directory lists it, orbit and all.
+    const listed = (radiusKm: number) => destinationsFromRecords([{
+      id: 'st', name: 'ST', planetId: stop.planetId, orbitSlot: stop.orbitSlot, welcomeRoomId: stop.berth.roomId,
+      orbit: { radiusKm, phase0: 0.2 },
+    }], () => undefined)[0];
+    expect(listed(8_000).orbit).toEqual({ radiusKm: 8_000, phase0: 0.2 });
+    const at = (orbit: { radiusKm: number; phase0: number } | undefined) => runKeeperPass({
       docking: d.api,
       route,
-      stop: route.stops[1],
-      station: { ...station, planetId: route.stops[1].planetId, orbit: { radiusKm: 99_999 } },
+      stop,
+      station: { ...station, planetId: stop.planetId, ...(orbit ? { orbit } : {}) },
       shipRoomId: 'ship-1',
       mayDock: () => true,
       stillWanted: () => true,
       now: clock,
     });
+    const climbed = await at(listed(9_000).orbit);
     expect(climbed.verdict).toEqual({ kind: 'skip' });
     expect(skipWhyOf(climbed.results)).toBe('gone');
+    // Back on its slot's own orbit is a change too.
+    expect((await at(undefined)).verdict).toEqual({ kind: 'skip' });
     expect(d.asked).toHaveLength(0);
+    // Still on the orbit the route copied: asked as before.
+    expect((await at(listed(8_000).orbit)).verdict.kind).toBe('docked');
   });
 
   it('never re-points a port this rider may not dock', async () => {

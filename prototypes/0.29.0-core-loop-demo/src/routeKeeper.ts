@@ -771,7 +771,7 @@ export interface KeeperPassDeps {
   stop: RouteStop;
   /** The stop's station in this game's directory (🚚 `planetId`: the planet
    *  it orbits now), or null when it is not listed. */
-  station: (Pick<StationDestination, 'berth' | 'berths'> & { planetId?: string; orbit?: { radiusKm: number } }) | null;
+  station: Pick<StationDestination, 'berth' | 'berths' | 'orbit'> & { planetId?: string } | null;
   shipRoomId: string;
   /** May this game dock the route's port toward `farRoomId` now (its own
    *  rights, or the carve-out)? */

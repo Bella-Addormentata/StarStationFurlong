@@ -685,4 +685,34 @@ describe('Copilot round 5', () => {
     setStationMoveResolver(null);
     expect(climbTo(1_200).orbit?.fromSince).toBeUndefined();
   });
+
+  const changeFrom = (fromRadiusKm: number, toAlt: number, bookedAt: number, fromSince: number): StationMove => {
+    const plan = planOrbitChange(circularOrbit(planetById(SOV), fromRadiusKm, 0), SOV_R + toAlt, bookedAt)!;
+    return {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: SOV, toSlot: 0, departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+      orbit: { fromRadiusKm, fromPhase0: 0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0, fromSince },
+    };
+  };
+  const THIRD2: StationRecord = { id: 'third', name: 'THIRD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'third-room' };
+
+  it('an aborted change whose old orbit was lost too falls back to the slot', () => {
+    const mine = changeFrom(SOV_R + 1_020, 3_000, NOW + 100_000, NOW + 50);
+    const other = climbOf('other', 'other-room', 1, 1_000, NOW);
+    const third = climbOf('third', 'third-room', 2, 3_020, NOW);
+    const moves: Record<string, StationMove> = { [DEFAULT_STATION_ID]: mine, other, third };
+    setStationMoveResolver((st) => moves[st.id] ?? null);
+    const me = listStations({}, [OTHER, THIRD2], NOW + 10_000_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(me.move).toBeUndefined();
+    expect(me.orbit).toBeUndefined();
+  });
+
+  it('an aborted change from a trim past the band\'s edge stays at the edge', () => {
+    const top = SOV_R + maxAltitudeKm(SOV);
+    const mine = changeFrom(top + 15, 3_000, NOW + 100_000, NOW + 50);
+    const third = climbOf('third', 'third-room', 2, 3_020, NOW);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? mine : st.id === 'third' ? third : null));
+    const me = listStations({}, [THIRD2], NOW + 10_000_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(me.orbit?.radiusKm).toBeCloseTo(top, 6);
+  });
 });

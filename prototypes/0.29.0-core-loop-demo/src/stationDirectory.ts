@@ -78,6 +78,9 @@ export interface StationDestination {
   /** Its latest move even once finished: arrival checks it against the
    *  flight, so a ship never docks at a station that moved away meanwhile. */
   lastMove?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's (the
+   *  route keeper checks it against the orbit a ferry route copied). */
+  orbit?: StationOrbit;
 }
 
 /** The seam: whatever knows the stations. */
@@ -308,6 +311,7 @@ export function destinationsFromRecords(
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
       ...(r.move ? { move: r.move } : {}),
+      ...(r.orbit ? { orbit: { radiusKm: r.orbit.radiusKm, phase0: r.orbit.phase0 } } : {}),
     };
     const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
     if (last) out.lastMove = last;
