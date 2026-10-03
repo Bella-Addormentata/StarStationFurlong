@@ -53,7 +53,7 @@ the sources that fail have to say so on the screen.
 |---|---|---|
 | Shared switch state | Whole-value LWW records per item, shape-checked reads, per-key subscribe, owner-predicate seam | `partyDoc.ts` (`speaker:<itemId>`, `setPartyHostPredicate`) |
 | Single-writer clocks | The operator stamps absolute deadlines; others render `deadline − localNow`; heartbeat 3 s, stale at 9 s | `croupier.ts` |
-| An "anyone can grab it" lease | Operator lease: renew every 3 s, lapses after 8 s, same-device takeover at once | `pusherCroupier.ts` |
+| A renewable lease, liveness judged by the renewals a page saw | Operator lease: renew every 3 s, lapse after 8 s. Its CLAIM policy is the pusher's own — owner-only, and a 60 s split window before another device takes over — and is NOT what the TV reuses: the remote's claim policy is distinct (§3.2): anyone takes a free or lapsed remote, at once, no owner gate | `pusherCroupier.ts` |
 | Per-frame unreliable lane | 13-byte datagrams, relayed content-blind to every room member; 2-bit lane kind, one kind (3) still free | `network/protocol.ts`; `ssf-p2p-node/src/main.rs` accepts only `datagram.len() == 13` from the browser |
 | Reliable lane | JSON envelopes with base64 payloads (`ysync`); `'asset'` kind declared, unimplemented; no `iroh-blobs` in the node | `network/YjsSync.ts`, `protocol.ts` |
 | Fan-out | The hub relays ticks and control frames to the room (M5), with heartbeat pruning and a signed control plane (`graft`/`prune`/`px`/`ihave`/`iwant`) | `main.rs` |
@@ -78,28 +78,41 @@ the sources that fail have to say so on the screen.
   state: 'off' | 'scheduled' | 'playing' | 'paused',
   startAt: number,       // UTC ms — the countdown only
   positionMs: number,    // where the holder's player was…
-  atMs: number,          // …at the holder's Date.now(); never compared across devices
+  seq: number,           // …stamped with a per-write counter: a NEW seq is a new sample, which a
+                         // reader anchors to its OWN receipt time; never a wall clock
   history: Array<{ source, title, playedAt }>,    // cap 20
   ui: { screen, cursor, text },                   // the start screen everyone watches the holder navigate
 }
 // key remote:<itemId> — its own record so a lease renewal never collides with a playback write
-{ holder: pub | null, name, leaseAt }
+{ holder: pub | '', name, leaseAt, by }
 ```
 
-**Sync rule.** While playing, the holder's client writes `{positionMs, atMs}`
-every 3 s. Every other client records `receivedAt = Date.now()` when the
-record lands and computes `expected = positionMs + (now − receivedAt) +
-rttMs/2`. The error is bounded by one transit, never by clock skew: no device
-compares its clock with another's (the `croupier.ts` rule, and the air-hockey
-staleness clocks). Drift correction: `<video>` elements nudge `playbackRate`
-±3 % under 1 s of drift and seek beyond 1.5 s; the YouTube player only seeks
-(its rate steps are coarse), with a 1.5 s dead band so we never fight its own
-buffering. Pause is a record write. A late joiner reads once, computes, seeks.
+**Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
+every 3 s. Every other client records `receivedAt = Date.now()` when a new
+`seq` lands and computes `expected = positionMs + (now − receivedAt) + lead`.
+`lead` is half the round trip the viewer's `NetworkProvider` measures to the
+node it is connected to, capped at 1 s, and zero for the holder (its own
+writes land locally). That term is an approximation of the one-way transit,
+not a measurement of it — the measured round trip is to the viewer's own
+node, which on a desktop build is loopback — so the honest bound is "one
+delivery lag, corrected within a heartbeat", never clock skew: no device
+compares its clock with another's (the `croupier.ts` rule, and the
+air-hockey staleness clocks). An end-to-end probe correlated with the current
+holder could replace the term later. Drift correction: `<video>` elements
+nudge `playbackRate` ±3 % under 1 s of drift and seek beyond 1.5 s; the
+YouTube player only seeks (its rate steps are coarse), with a 1.5 s dead band
+so we never fight its own buffering. Pause is a record write. A late joiner
+reads once, computes, seeks.
 
 **Scheduled start.** `state: 'scheduled'` renders the countdown from
-`startAt − localNow` (display only). At T0 each client starts from 0 on its
-own; the holder's first heartbeat pulls everyone to within a transit. For
-`blob` and torrent sources the countdown doubles as the prefetch window.
+`startAt − localNow` (display only). At T0 only the HOLDER's clock decides:
+it reads the record as playing and its first heartbeat flips the record to
+`playing`; every viewer starts on receipt of that write and anchors to it, so
+clock skew never starts a film early or late. A viewer whose countdown has
+reached 0 shows STARTING… until the write lands (within a heartbeat). Only
+when nobody holds the remote does a viewer free-run from `startAt`, best
+effort, until someone picks the remote up and beats. For `blob` and torrent
+sources the countdown doubles as the prefetch window.
 
 ### 3.2 The remote: possession, not a role
 
@@ -107,15 +120,21 @@ own; the holder's first heartbeat pulls everyone to within a transit. For
 |---|---|
 | The remote sits by the TV | `remote:<tvId> → { holder: null }` |
 | You pick it up | Walk to the TV and press PICK UP REMOTE, or click the remote in the holder's hand |
-| You hand it to someone | HAND TO… lists players within arm's reach (~2 m); the receiver's phone opens on the remote; no accept step |
+| You hand it to someone | HAND TO… lists the room's players (v1: everyone the players map has seen — there is no liveness until S3 presence, so a remote handed to someone who has left lapses back to the set in 8 s; arm's reach comes with the rig work); the receiver's phone opens on the remote; no accept step |
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
 | You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
 | The TV has buttons on its body | Anyone standing at the TV can press POWER, VOLUME and INPUT without the remote |
 | The owner has the spare | The room owner may take the remote from anyone, always |
 
-Only the holder writes `tv:<id>`; every read is shape-checked, so a hacked
-client can at worst switch the TV off. The holder shows as a 📺 badge on the
-name tag first; the remote prop in the hand is rig work shared with #190.
+The holder gate is client-side and best effort — the dev-phase posture of
+`doorPolicy.ts`, not an authority boundary. The `tv` map is peer-writable:
+a modified client can write any shape-valid `tv:<id>` or `remote:<id>` (a
+different programme, position, history or lease). Every read is
+shape-checked, so the worst it can do is change what is on; nothing here is
+worth forging. When an authority boundary is needed it is the signed-op
+acceptance rule of the RoomLog (Phase 2), not more checks in the client. The
+holder shows as a 📺 badge on the name tag first; the remote prop in the hand
+is rig work shared with #190.
 
 ### 3.3 The start screen and the sources
 
@@ -149,7 +168,11 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   blob, torrent). Lit, occluded, shader-able (the #194 CRT pass only works
   here), audio through the `partyAudio.ts` graph with distance falloff. Needs
   CORS-clean bytes: a `/api/media` range pipe on the node, behind its CORS
-  allowlist and a host allowlist.
+  allowlist and a host allowlist — and, because a loopback service that
+  fetches URLs is an SSRF surface, the destination is validated AFTER DNS
+  resolution and on EVERY redirect (loopback, private, link-local and
+  metadata addresses refused; redirects capped), with a size ceiling and a
+  timeout. A hostname allowlist alone closes nothing.
 - **v1 ships neither on the in-world plane.** The first slice draws the status,
   menu, countdown and now-playing card on the in-world `CanvasTexture` and plays
   the actual video in a **theatre panel** (DOM) that anyone in the room opens
@@ -186,7 +209,12 @@ it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
 their own webview with range support. No re-encode, every platform; the
 countdown spreads the host's upload before T0. Honest caveat: a transfer, not
 a stream — delete-on-leave cache and private rooms keep it in the shape of
-sending a friend a file. The same lane later carries room assets, ROMs and the
+sending a friend a file. And the record is peer-writable, so a fetch is never
+automatic beyond a cap: the source carries its declared size; a viewer's node
+fetches on its own only under a per-room ceiling the viewer sets (a FETCH
+button above it), under per-room and global cache quotas, with cancellation
+and delete-on-leave — nobody in a room can spend another viewer's bandwidth
+or disk unasked. The same lane later carries room assets, ROMs and the
 station library (§7).
 
 **Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
@@ -194,9 +222,13 @@ WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → WebTransport unidirectional
 streams (one per frame or keyframe group; 20 ms Opus frames may use datagrams)
 → node → iroh fan-out as an opaque `media` lane → viewers' `VideoDecoder` →
 three.js `VideoFrameTexture`. A keyframe every ~2 s plus keyframe-on-request.
-A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, so the
-sender works on Chromium, Firefox 130+, Safari 16.4+ and WebKitGTK 2.44+;
-only true screen capture (`getDisplayMedia`) is Chromium-first. Budget per
+A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
+three legs are detected separately and a sender advertises only the legs it
+has: `WebTransport` (Safari 26.4 is the floor per
+`docs/TDD/BrowserSupportMatrix.md`), `VideoEncoder` (Chromium, Firefox 130+,
+Safari 16.4+, WebKitGTK 2.44+) and `AudioEncoder` (absent on Safari
+16.4–18.x and WebKitGTK 2.44). Only true screen capture (`getDisplayMedia`)
+is Chromium-first. Budget per
 viewer: ~24–32 kbps voice, ~96–128 kbps music, ~0.3–0.8 Mbps for a
 native-resolution arcade screen, ~1.5–3 Mbps for a 720p desktop. **Build
 audio first**: it is a tenth of the work, it is #189, and it unlocks karaoke.
@@ -260,6 +292,9 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   addedBy }` op in the RoomLog, per station or venture — v002's "Chia infohash
   registry + our seeders" with the registry in the signed log and a
   ChiaHub-shaped record for a station's library root as the floor.
+  **Prerequisite:** the SsfLog-backed RoomLog adapter. Today `RoomLog.append`
+  and `subscribe` are contract stubs on the Phase 2 horizon; the adapter is
+  an explicit gate that lands before the library, not beside it.
 - **Resolution order on the TV:** library (any member who has it) → archive /
   PeerTube / URL via the proxy → the item's torrent over the DHT; an
   `identifier → hash` map keeps a second viewing off archive.org.
@@ -269,6 +304,14 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   beacon-toggle shape) fetches from the public swarm and the archive, seeds
   into the public DHT, and serves the station. That volunteer alone exposes
   an IP to public swarms; everyone else is hidden by construction.
+- **Who may fill it:** a signature says who enqueued an item, not that the
+  content is theirs to share or fit to seed. `library-add` is accepted only
+  from the station's owners (room owners, by key); the library-station
+  operator approves each item before any fetch (or allowlists signers); the
+  fetch verifies hash and size against the op; storage and egress run under
+  quotas; and a `library-remove` op (a denylist) is honoured by every node.
+  Nobody can make the volunteer fetch and seed arbitrary or oversized
+  content by writing an op.
 
 ## 8. Tribler / IPv8, evaluated seriously
 
@@ -300,8 +343,11 @@ having — players' IPs never in public swarms — comes cheaper from host-only
 fetch, the library-station volunteer, and later an opt-in embedded I2P router
 (`emissary`, Rust, experimental, several independent implementations, no
 exits). **Recommendation:** do not port IPv8 now; if the owners still want it
-after the library, run stage A as a two-week opt-in spike that measures exit
-count and three-hop throughput before anything else is committed.
+after the library, run stage A as a two-week opt-in spike measured on what
+discovery alone can show — bootstrap success and latency, peers walked per
+minute, introduction success rate, how many peers advertise the tunnel
+community — before anything else is committed. Exit-peer count and three-hop
+throughput need stage B's circuits: they gate B→C, not A→B.
 
 ## 9. The arcade cabinet
 
@@ -318,8 +364,12 @@ canvas is the picture. Spectators subscribe by distance (§4): live within
 ~10 m, the attract still beyond. With the lane in place the cheapest player
 two is **also over the video** (inputs on the tick lane's extended kind,
 P1's emulator applies them): any core, no determinism work, ~50 ms input lag
-on a LAN and ~120 ms at a 40 ms RTT; the game dies when P1 leaves. Lockstep
-stays the upgrade for games where lag matters.
+on a LAN and ~120 ms at a 40 ms round trip between the players; the game dies
+when P1 leaves. **Prerequisite:** a lane-id → player-id binding. The tick
+lane is keyed per connection today with no binding to an identity (S3
+presence), so until that lands P1 cannot tell the P2 seat's inputs from
+anyone else's; P1 accepts kind-3 inputs only from the lane bound to the
+seat's identity. Lockstep stays the upgrade for games where lag matters.
 
 **Sources.** The archive.org embed (`archive.org/embed/<id>`) is single-player
 only (cross-origin, no input injection, no CRT). The ROM file loaded into an
