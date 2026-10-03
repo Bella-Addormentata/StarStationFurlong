@@ -21,7 +21,7 @@
 
 import { isDockChain } from './adapter';
 import { stampAfter, type DockPortState } from './dockRules';
-import { readAllDoors, readDoor, writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
+import { readAllDoors, readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { stationLeftFrom } from './stationMove';
 import {
@@ -195,13 +195,15 @@ export function planArrivalDock(input: {
  * - at rest (docked, by the record), where its rest record leaves it
  *   (shipDoc.RestPlace, restingPlace), once no station it rests beside is
  *   there. A docked ship with no rest record follows its station.
+ * A ship in open orbit by its record is there, unless a dock has held it
+ * since (docked by hand: its rest record), wherever that took it.
  */
 export function shipPlaceId(
   rec: FlightRecord,
   now: number = Date.now(),
   rest: RestPlace | null = readRestPlace(),
 ): string {
-  if (adriftPlace(rec.locationId)) return rec.locationId;
+  if (adriftPlace(rec.locationId) && (rec.status !== 'docked' || !rest)) return rec.locationId;
   const stations = listStations(undefined, undefined, now);
   const listed = stations.find((s) => s.id === rec.locationId);
   if (rec.status === 'docked') {
@@ -255,7 +257,8 @@ function dockHost(roomId: string, stations: StationRecord[] = listStations()): S
  *   its first move after (stationMove.stationLeftFrom, from the moves this
  *   install knows; keepRestPlace records the place before that can happen,
  *   whenever anyone is aboard);
- * - else where the ship came to rest.
+ * - else where the ship came to rest, beside the station the rest record
+ *   names as `from` (when listed).
  */
 export function restingPlace(
   rest: RestPlace,
@@ -282,7 +285,10 @@ export function restingPlace(
     if (!door.dock || door.dock.undockedAt < rest.since) continue;
     if (!release || door.dock.undockedAt > release.at) release = { at: door.dock.undockedAt, room };
   }
-  if (!release) return { at: rest.at };
+  if (!release) {
+    const from = rest.from === undefined ? undefined : stations.find((st) => st.id === rest.from);
+    return from ? { at: rest.at, from } : { at: rest.at };
+  }
   const from = dockHost(release.room, stations);
   if (!from) return { at: rest.at, releasedAt: release.at };
   const left = stationLeftFrom(from, release.at, now);
@@ -297,11 +303,12 @@ export function restingPlace(
  * is (only when they change, and never while that station is between
  * planets); once the last of them lets go, where its station was then, when
  * that takes no move history (the station has not moved since). For a docked
- * ship only. Returns whether it wrote.
+ * ship only, one in open orbit by its record included: docked by hand there,
+ * it goes where its dock takes it. Returns whether it wrote.
  */
 export function keepRestPlace(roomId: string = currentRoomId(), now: number = Date.now()): boolean {
   const rec = readFlightRecord();
-  if (!roomId || rec.status !== 'docked' || adriftPlace(rec.locationId)) return false;
+  if (!roomId || rec.status !== 'docked') return false;
   const rest = readRestPlace();
   const doors = readAllDoors();
   const stations = listStations(undefined, undefined, now);
@@ -326,7 +333,44 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
   const resting = restingPlace(rest, now, stations);
   if ('heldBy' in resting || resting.from === undefined || resting.releasedAt === undefined) return false;
   if (stationInTransit(resting.from, now) || stationLeftFrom(resting.from, resting.releasedAt, now)) return false;
-  return writeRestPlace({ at: resting.at, since: Math.floor(resting.releasedAt) });
+  return writeRestPlace({ at: resting.at, since: Math.floor(resting.releasedAt), from: resting.from.id });
+}
+
+/**
+ * 🚚 Does a ship room with these `doors` hold a live dock into a room of the
+ * station whose welcome room is `welcomeRoomId`? A tug's tow lasts only while
+ * it does (stationMove.cancelTowLeftBehind). True when it does, or when
+ * `doors` could leave one out (null: readAllDoorsIfComplete; no proof it let
+ * go); else, when the room let go of that station by its dock tombstones
+ * (each UNDOCK's own stamp, however late this tab learns of it), the moment
+ * the LAST of those docks let go, at or after `since` (the tow's booking): a
+ * station held through two ports stays in tow until both have let go; else
+ * false (not docked, time unknown).
+ */
+export function dockedToStation(
+  welcomeRoomId: string,
+  since = -Infinity,
+  doors: ReadonlyMap<string, DoorRecord> | null = readAllDoorsIfComplete(),
+): boolean | number {
+  if (!doors) return true;
+  let released: number | null = null;
+  for (const [, rec] of doors) {
+    const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
+    if (!address) continue;
+    if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
+    if (rec.paired !== true && !rec.dock) continue;
+    let partner = '';
+    try {
+      partner = roomIdFromSeed(address);
+    } catch {
+      continue;
+    }
+    if (!partner || stationForRoom(partner)?.welcomeRoomId !== welcomeRoomId) continue;
+    if (rec.paired === true) return true;
+    const at = rec.dock!.undockedAt;
+    if (at >= since && (released === null || at > released)) released = at;
+  }
+  return released ?? false;
 }
 
 /** Record that the ship came to rest beside the station `locationId` names,

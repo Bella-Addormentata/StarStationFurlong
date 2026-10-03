@@ -279,6 +279,10 @@ const AXIS_IDS = ['x+', 'x-', 'y+', 'y-'] as const;
  *  station atlas's MAX_ENTRIES discipline. */
 const MAX_KEY_LEN = 64;
 const MAX_PAIRINGS = 64;
+/** Most keys readAllDoorsIfComplete looks at, junk included: a peer can write
+ *  any number of keys no reader keeps, and a room's own doors fit well inside
+ *  (as stationAtlas bounds the raw door list it ingests). */
+const MAX_SCANNED_DOOR_KEYS = 4 * MAX_PAIRINGS;
 
 /**
  * Snapshot every valid door pairing as id → SANITIZED record (malformed
@@ -310,15 +314,18 @@ function readDoorsMap(map: Y.Map<unknown>): Map<string, DoorRecord> {
 
 /**
  * 🚚 readAllDoors, or null when the room holds more valid door records than
- * a snapshot keeps (MAX_PAIRINGS): one that might leave out the very door. A
- * caller that reads a dock's ABSENCE as news (a tug that let go of the
+ * a snapshot keeps (MAX_PAIRINGS), or more keys of any kind than this looks
+ * at (MAX_SCANNED_DOOR_KEYS): either snapshot might leave out the very door.
+ * A caller that reads a dock's ABSENCE as news (a tug that let go of the
  * station it tows) must not take a capped snapshot, which a peer could have
- * flooded, for the whole room.
+ * flooded, for the whole room; and a flood of junk costs it a bounded scan.
  */
 export function readAllDoorsIfComplete(): Map<string, DoorRecord> | null {
   if (!docAlive()) return new Map<string, DoorRecord>();
   const out = new Map<string, DoorRecord>();
+  let scanned = 0;
   for (const [id, value] of doorsMap!.entries()) {
+    if (++scanned > MAX_SCANNED_DOOR_KEYS) return null;
     if (!isAcceptableDoorKey(id) || !isDoorRecord(value)) continue;
     if (out.size >= MAX_PAIRINGS) return null;
     out.set(id, sanitizeDoorGeometry(value));

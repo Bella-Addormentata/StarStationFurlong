@@ -209,6 +209,17 @@ describe('dock — the wire', () => {
     doors.set('north', { ...buildDoorPairing(seedFor(STATION), { segments: dockChain(), transient: true, dockedAt: 7 }) });
     expect(readAllDoors().size).toBe(64);
     expect(readAllDoorsIfComplete()).toBeNull();
+    // Junk costs a bounded scan: past four snapshots' worth of keys of any
+    // kind the reader stops, and cannot say that it saw every door.
+    const flooded = new Y.Doc();
+    bindDoorsDoc(flooded);
+    const map = flooded.getMap('doors');
+    map.set('north', buildDoorTombstone(seedFor(STATION)));
+    for (let i = 0; i < 255; i++) map.set(`junk ${i}`, i);
+    expect(readAllDoorsIfComplete()?.size).toBe(1);
+    map.set('junk 255', 255);
+    expect(readAllDoorsIfComplete()).toBeNull();
+    expect(readAllDoors().size).toBe(1);
   });
 
   it('writeDoorRecordTo writes the exact shape the bound reader reads back', () => {

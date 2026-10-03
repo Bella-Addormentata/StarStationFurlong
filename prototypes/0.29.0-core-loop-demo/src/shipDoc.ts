@@ -936,14 +936,18 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
  * ship's doors that held a live dock then (or, just after an arrival, were
  * docking): once none of them does, the ship is where its station was at the
  * last of their UNDOCKs since, read off those doors directly
- * (shipArrival.restingPlace). Kept first-hand in this room (completeArrival,
- * shipArrival.keepRestPlace), so every install reads the same place, whatever
- * station moves it has heard of. A docked ship with none follows its station.
+ * (shipArrival.restingPlace). Once that is recorded as `at`, `from` names the
+ * station those docks let go of: the ship rests beside it while it is there,
+ * as beside its own (the flight record's). Kept first-hand in this room
+ * (completeArrival, shipArrival.keepRestPlace), so every install reads the
+ * same place, whatever station moves it has heard of. A docked ship with none
+ * follows its station.
  */
 export interface RestPlace {
   at: string;
   since: number;
   docks?: string[];
+  from?: string;
 }
 
 /** Most dock doors a rest record names: a ship has a handful of ports. */
@@ -953,6 +957,7 @@ export function isRestPlace(v: unknown): v is RestPlace {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const r = v as Partial<RestPlace>;
   if (!isBoundedString(r.at) || !adriftPlace(r.at) || !isFlightTime(r.since)) return false;
+  if (r.from !== undefined && !isBoundedString(r.from)) return false;
   if (r.docks === undefined) return true;
   return Array.isArray(r.docks) && r.docks.length <= MAX_REST_DOCKS
     && r.docks.every((d) => typeof d === 'string' && isAcceptableDoorKey(d));
@@ -965,6 +970,7 @@ export function readRestPlace(): RestPlace | null {
   if (!isRestPlace(raw)) return null;
   const out: RestPlace = { at: raw.at, since: raw.since };
   if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
+  if (raw.from !== undefined) out.from = raw.from;
   return out;
 }
 
@@ -978,7 +984,14 @@ export function writeRestPlace(rest: RestPlace | null): boolean {
   }
   boundDoc!.transact(() => {
     if (rest === null) shipMap!.delete('rest');
-    else shipMap!.set('rest', { at: rest.at, since: rest.since, ...(rest.docks?.length ? { docks: [...rest.docks] } : {}) });
+    else {
+      shipMap!.set('rest', {
+        at: rest.at,
+        since: rest.since,
+        ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
+        ...(rest.from !== undefined ? { from: rest.from } : {}),
+      });
+    }
   });
   return true;
 }

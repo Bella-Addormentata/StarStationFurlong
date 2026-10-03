@@ -600,8 +600,9 @@ export function cancelTowLeftBehind(
   realMs: number,
   /** Is this room still docked to a room of that station, right now? A
    *  manual UNDOCK leaves the flight record 'docked', so the live dock is
-   *  what says the tug let go: true while docked, else when it let go (the
-   *  earliest release at or after `since`, the tow's booking), else false
+   *  what says the tug let go: true while any dock holds, else when it let
+   *  go (the last of its docks into that station to let go, at or after
+   *  `since`, the tow's booking: shipArrival.dockedToStation), else false
    *  (let go, time unknown). Leave it out when it is not known. */
   dockedTo?: (welcomeRoomId: string, since: number) => boolean | number,
 ): boolean {

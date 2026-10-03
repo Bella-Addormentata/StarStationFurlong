@@ -115,7 +115,7 @@ import {
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
 import { arrivalNoteHere, clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
-import { completeArrival, keepRestPlace, setBerthSeedResolver, shipPlaceId } from "./shipArrival";
+import { completeArrival, dockedToStation, keepRestPlace, setBerthSeedResolver, shipPlaceId } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -167,7 +167,6 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
-  readAllDoorsIfComplete,
   readDoor,
   subscribeDoors,
   transactDoorWrites,
@@ -1218,36 +1217,6 @@ function shipStationHere(roomId: string): string | null {
   // No host station: not the ship's own one-room station (the directory
   // hears about that through `own`), so callers fall back to the flight.
   return null;
-}
-
-/** Does this room hold a live dock into a room of the station whose welcome
- *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) True when
- *  it does, or when its door records are more than a snapshot holds (one left
- *  out could be that dock: no proof it let go); else when this room let go of
- *  it, by its dock tombstones (the UNDOCK's own stamp, however late this tab
- *  learns of it), the earliest release at or after `since`; else false (not
- *  docked, time unknown). */
-function dockedToStation(welcomeRoomId: string, since = -Infinity): boolean | number {
-  const doors = readAllDoorsIfComplete();
-  if (!doors) return true;
-  let released: number | null = null;
-  for (const [, rec] of doors) {
-    const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
-    if (!address) continue;
-    if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
-    if (rec.paired !== true && !rec.dock) continue;
-    let partner = "";
-    try {
-      partner = roomIdFromSeed(address);
-    } catch {
-      continue;
-    }
-    if (!partner || stationForRoom(partner)?.welcomeRoomId !== welcomeRoomId) continue;
-    if (rec.paired === true) return true;
-    const at = rec.dock!.undockedAt;
-    if (at >= since && (released === null || at < released)) released = at;
-  }
-  return released ?? false;
 }
 
 /** The one-module station whose welcome room IS this room, straight from
