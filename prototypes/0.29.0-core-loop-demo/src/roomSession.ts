@@ -56,8 +56,9 @@ const DIAL_TIMEOUT_MS = 10_000;
 const READY_TIMEOUT_MS = 10_000;
 /** …for a room hosted elsewhere, whose live host must answer. */
 const HOST_READY_TIMEOUT_MS = 20_000;
-/** The longest an open may take, end to end. */
-const OPEN_DEADLINE_MS = 45_000;
+/** The longest an open may take, end to end (a gate keeper dials this long
+ *  and more before it needs the session: gateKeeper.GATE_PRE_DIAL_MS). */
+export const ROOM_SESSION_OPEN_MS = 45_000;
 
 /**
  * Open a session to the room `address` names (a pass or link for it), or
@@ -157,9 +158,9 @@ export function openRoomSession(deps: RoomSessionDeps, address: string): Promise
     };
     const timer = setTimeout(() => {
       late = true;
-      console.warn(`[roomSession] ${boot0.roomId}: not open within ${OPEN_DEADLINE_MS} ms — abandoned`);
+      console.warn(`[roomSession] ${boot0.roomId}: not open within ${ROOM_SESSION_OPEN_MS} ms — abandoned`);
       finish(null);
-    }, OPEN_DEADLINE_MS);
+    }, ROOM_SESSION_OPEN_MS);
     open().then(finish, (err) => {
       console.warn('[roomSession] session failed:', err);
       finish(null);

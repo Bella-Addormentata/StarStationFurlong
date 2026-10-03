@@ -1427,7 +1427,6 @@ const gateKeeper = createGateKeeper({
     if (seed) void writeDepartures(seed, pub);
   },
   note: (doorId, text, tone) => world?.dockingSystem?.noteDockOp(doorId, text, tone),
-  requesterPub: () => getIdentityPub() ?? undefined,
 });
 
 /** Does this room hold a live dock into a room of the station whose welcome

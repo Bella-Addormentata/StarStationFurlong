@@ -33,9 +33,10 @@
  *                         A dock anywhere else is not this keeper's.
  *   write end-hold,       for a dock one of this room's auto-dock gates
  *     restart, anchor     holds: writes that checkpoint into the ferry's
- *                         ship map and publishes the ferry to every stop's
- *                         board it can reach (a restart is a ferry found
- *                         docked after its departure: its stay starts again)
+ *                         ship map and, once the ferry's room acknowledges
+ *                         it, publishes the ferry to every stop's board it
+ *                         can reach (a restart is a ferry found docked after
+ *                         its departure: its stay starts again)
  *   anything else         nothing: holds and skips are its riders' to write
  *
  * ─── Docking from the station side ───────────────────────────────────────────
@@ -67,7 +68,14 @@
  * landed here, the walk-through mirror's job); a dock the gate holds that the
  * ferry has provably let go (its port undocked after it, or docked elsewhere
  * since) or has not held for GATE_STALE_MS is let go at the gate; and an
- * undock made at the gate after the ferry's dock reaches the ferry.
+ * undock made at the gate after the ferry's dock reaches the ferry. A claim
+ * at a gate that the keeper has not yet seen the ferry's port hold keeps a
+ * session open until the two ends agree, whatever the route does (paused,
+ * ended or finished). A write to the ferry's room that is never acknowledged
+ * hangs its session up, so nothing is read from a doc the room may never
+ * hold: a fresh session reads what the room does hold (at once, then backing
+ * off while acknowledgments keep failing), and what is missing is written
+ * again.
  *
  * ─── Limits (v1) ─────────────────────────────────────────────────────────────
  *
@@ -145,6 +153,7 @@ import {
   type RouteStop,
   type ShipRoute,
 } from './shipRoute';
+import { ROOM_SESSION_OPEN_MS } from './roomSession';
 import { roomIdFromSeed } from './stationAtlas';
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -156,8 +165,10 @@ export const GATE_DOCK_DEFER_MS = 8_000;
  *  is at the departure), well inside routeKeeper.CAST_OFF_LATE_MS. */
 export const GATE_CAST_OFF_DEFER_MS = 3_000;
 /** A session to the ferry opens this long before its departure from here, so
- *  it is ready to cast off on time. */
-export const GATE_PRE_DIAL_MS = 30_000;
+ *  it is ready to cast off on time: a whole open (roomSession's deadline) and
+ *  a quarter minute to spare, well before the keeper's CAST_OFF_LATE_MS after
+ *  the departure would restart the stay instead. */
+export const GATE_PRE_DIAL_MS = ROOM_SESSION_OPEN_MS + 15_000;
 /** A session still wanted is replaced by a fresh one after this long (one
  *  whose transport died says nothing), except around a departure. */
 export const GATE_SESSION_MAX_MS = 3 * 60_000;
@@ -199,11 +210,15 @@ export interface GateView {
   record: DoorRecord | undefined;
 }
 
-/** Does this record hold a DOCK to the ferry's route port (an unnamed far
- *  door reads as it, as dockRules does)? */
+/** Is `farDoor` (a record's far door, or its dock memory's) the ferry's
+ *  route port? An older writer's record names none, and then reads as it, as
+ *  the boards and dockRules read it. */
+const namesPort = (farDoor: string | undefined, shipPort: string): boolean => !farDoor || farDoor === shipPort;
+
+/** Does this record hold a DOCK to the ferry's route port? */
 export function holdsFerry(rec: DoorRecord | undefined, shipRoomId: string, shipPort: string): rec is DoorPairing {
   return !!rec && rec.paired === true && isDockChain(rec.segments)
-    && roomOf(rec.connectedRoomAddress) === shipRoomId && (!rec.farDoor || rec.farDoor === shipPort);
+    && roomOf(rec.connectedRoomAddress) === shipRoomId && namesPort(rec.farDoor, shipPort);
 }
 
 /** What a gate's record needs to name the ferry: an address that reaches its
@@ -216,9 +231,10 @@ export interface FerryBerthing {
 
 /**
  * The newest record of this room that names the ferry through its route
- * port: a dock to it, or a dock tombstone that remembers it. Null when there
- * is none (the ferry never docked in this room with someone aboard): then
- * nothing here can address it or pose its port. Pure.
+ * port (an unnamed far door included, as holdsFerry reads it): a dock to it,
+ * or a dock tombstone that remembers it. Null when there is none (the ferry
+ * never docked in this room with someone aboard): then nothing here can
+ * address it or pose its port. Pure.
  */
 export function ferryBerthingIn(
   doors: ReadonlyMap<string, DoorRecord>,
@@ -235,9 +251,9 @@ export function ferryBerthingIn(
   };
   for (const rec of doors.values()) {
     if (rec.paired) {
-      if (rec.farDoor !== shipPort || !holdsFerry(rec, shipRoomId, shipPort)) continue;
+      if (!holdsFerry(rec, shipRoomId, shipPort)) continue;
       take(rec.dockedAt ?? 0, rec.connectedRoomAddress, rec.farWall, rec.farLateral);
-    } else if (rec.dock && rec.dock.farDoor === shipPort && roomOf(rec.retiredAddress) === shipRoomId) {
+    } else if (rec.dock && namesPort(rec.dock.farDoor, shipPort) && roomOf(rec.retiredAddress) === shipRoomId) {
       take(rec.dock.undockedAt, rec.retiredAddress, rec.dock.farWall, rec.dock.farLateral);
     }
   }
@@ -565,7 +581,7 @@ export function gateFixes(o: {
       // admits the ferry, posed from its own memory of it, else the room's.
       if (!admitsFerry(g, o.shipRoomId)) continue;
       const mine: FerryBerthing | null =
-        rec?.dock && rec.dock.farDoor === o.shipPort && roomOf(rec.retiredAddress) === o.shipRoomId
+        rec?.dock && namesPort(rec.dock.farDoor, o.shipPort) && roomOf(rec.retiredAddress) === o.shipRoomId
           ? { address: rec.retiredAddress, farWall: rec.dock.farWall, farLateral: rec.dock.farLateral }
           : o.berthing;
       if (mine) out.push(join(g.doorId, mine, x));
@@ -636,7 +652,9 @@ export type StationDockResult =
  * header's "Docking from the station side"): the gate's claim first, then the
  * ferry's side through the far-room decision, each settled; a refusal or a
  * lost ferry side takes the claim back. A port already docked to this gate is
- * joined; a claim on the ferry the gate already holds is left to land.
+ * joined; a claim on the ferry the gate already holds is left to land. The
+ * request carries no requester key: nobody aboard docks it, so a ferry port
+ * open only to granted captains refuses it, whoever stands in the station.
  * Never throws.
  */
 export async function stationDock(o: {
@@ -645,7 +663,6 @@ export async function stationDock(o: {
   shipRoomId: string;
   shipPort: string;
   berthing: FerryBerthing;
-  requesterPub?: string;
   now: () => number;
   wait: (ms: number) => Promise<void>;
 }): Promise<StationDockResult> {
@@ -715,7 +732,6 @@ export async function stationDock(o: {
     ...(gate.near.wall !== undefined ? { nearWall: gate.near.wall } : {}),
     ...(gate.near.lateral !== undefined ? { nearLateral: gate.near.lateral } : {}),
     dockedAt,
-    ...(o.requesterPub ? { requesterPub: o.requesterPub } : {}),
   };
   const since = Y.encodeStateVector(doc);
   let applied: ReturnType<typeof applyFarDockRequest>;
@@ -844,8 +860,6 @@ export interface GateKeeperDeps {
   publishTo?: (roomId: string, pub: DeparturesPublish) => void;
   /** Say what happened at a gate (the door panel's dock row). */
   note?: (doorId: string, text: string, tone: 'ok' | 'warn' | 'bad') => void;
-  /** This player's identity key (the dock request's requester). */
-  requesterPub?: () => string | undefined;
   clock?: () => number;
   wait?: (ms: number) => Promise<void>;
 }
@@ -867,6 +881,10 @@ interface Watch {
   openedAt: number;
   nextDialAt: number;
   dialBackoffMs: number;
+  /** How long the re-dial after the next unacknowledged write waits: nothing
+   *  at first, then GATE_REDIAL_MS doubling to GATE_REDIAL_MAX_MS while
+   *  acknowledgments keep failing. An acknowledged write starts it over. */
+  ackBackoffMs: number;
   /** The address the ferry's room was dialled by. */
   address: string;
   /** This room's address as the ferry reaches it (resolved per dial). */
@@ -876,15 +894,29 @@ interface Watch {
   memory: KeeperMemory | null;
   stationCache: RouteWalkCache;
   ferryCache: RouteWalkCache;
-  /** The session's doc has changed since the last look. */
-  dirty: boolean;
-  look: { route: ShipRoute; checkpoints: readonly RouteCheckpoint[] } | null;
   /** Each gate pairing to this ferry this keeper has watched, by
-   *  `${doorId}|${dockedAt}`: when it was first seen. */
+   *  pairKey: when it was first seen. */
   pairSeen: Map<string, number>;
+  /** The gate pairings to this ferry (pairKey) this keeper has seen its port
+   *  hold too. Any other is a claim the two ends may not agree on: a DOCK
+   *  under way, or one never acknowledged (this keeper's own included), so a
+   *  session stays open until they do, whatever the route does. */
+  settled: Set<string>;
+  /** The stay of a checkpoint this keeper wrote that was never acknowledged:
+   *  it was published nowhere, and the next session tells every stop what
+   *  the ferry's room really holds. */
+  unpublished: number | null;
+  /** A write of this keeper's to the ferry's side of a dock (a cast-off, a
+   *  release) was never acknowledged: a session stays open, or opens again,
+   *  until the ferry's port agrees with the gate (reconcile). */
+  repair: boolean;
   /** The departures entry was refreshed from this session already. */
   refreshed: boolean;
 }
+
+/** A gate pairing's key: its gate and its stamp. */
+const stampKey = (doorId: string, dockedAt: number | undefined): string => `${doorId}|${dockedAt ?? ''}`;
+const pairKey = (doorId: string, rec: DoorPairing): string => stampKey(doorId, rec.dockedAt);
 
 /** Do two route snapshots say the same (the route and its checkpoints)? */
 function sameNews(a: { route: ShipRoute; checkpoints: readonly RouteCheckpoint[] }, b: { route: ShipRoute; checkpoints: readonly RouteCheckpoint[] }): boolean {
@@ -913,7 +945,6 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
   const hangUp = (w: Watch): void => {
     w.session?.close();
     w.session = null;
-    w.look = null;
     w.refreshed = false;
   };
 
@@ -927,15 +958,17 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         openedAt: 0,
         nextDialAt: Number.NEGATIVE_INFINITY,
         dialBackoffMs: GATE_REDIAL_MS,
+        ackBackoffMs: 0,
         address: '',
         ownAddress: '',
         busy: false,
         memory: null,
         stationCache: createRouteWalkCache(),
         ferryCache: createRouteWalkCache(),
-        dirty: true,
-        look: null,
         pairSeen: new Map(),
+        settled: new Set(),
+        unpublished: null,
+        repair: false,
         refreshed: false,
       };
       watches.set(ship, w);
@@ -989,22 +1022,29 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       w.ownAddress = own;
       w.openedAt = clock();
       w.dialBackoffMs = GATE_REDIAL_MS;
-      w.dirty = true;
       w.refreshed = false;
-      session.doc.on('update', () => { w.dirty = true; });
     });
   };
 
-  /** The ferry's route and checkpoints, re-read only when its doc changed
-   *  (so the timetable's walk cache keeps its place). */
+  /** The ferry's route and checkpoints as its doc has them at `now`, read
+   *  afresh each time: which run counts depends on the clock too (a later
+   *  START counts once it is within shipRoute.RUN_AHEAD_MS). */
   const newsOf = (w: Watch, now: number): { route: ShipRoute; checkpoints: readonly RouteCheckpoint[] } | null => {
     if (!w.session) return null;
-    if (w.dirty || !w.look) {
-      const r = routeIn(w.session.doc.getMap(SHIP_MAP), now);
-      w.look = r.route ? { route: r.route, checkpoints: r.checkpoints } : null;
-      w.dirty = false;
-    }
-    return w.look;
+    const r = routeIn(w.session.doc.getMap(SHIP_MAP), now);
+    return r.route ? { route: r.route, checkpoints: r.checkpoints } : null;
+  };
+
+  /** A write of this keeper's to the ferry's room was never acknowledged
+   *  (`repair`: one to its side of a dock). The session hangs up, so nothing
+   *  is read from a doc the room may never hold, and a fresh one reads what
+   *  it does hold (reconcile and the keeper's step write again what is
+   *  missing): at once the first time, then backing off. */
+  const unacked = (w: Watch, repair: boolean): void => {
+    if (repair) w.repair = true;
+    hangUp(w);
+    w.nextDialAt = clock() + w.ackBackoffMs;
+    w.ackBackoffMs = Math.min(Math.max(w.ackBackoffMs * 2, GATE_REDIAL_MS), GATE_REDIAL_MAX_MS);
   };
 
   /** Publish the ferry as its doc has it now: here, and (after this keeper's
@@ -1028,7 +1068,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
   };
 
   const heldFor = (w: Watch, now: number) => (doorId: string, rec: DoorPairing): number => {
-    const key = `${doorId}|${rec.dockedAt ?? ''}`;
+    const key = pairKey(doorId, rec);
     const first = w.pairSeen.get(key);
     if (first === undefined) {
       w.pairSeen.set(key, now);
@@ -1037,15 +1077,92 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     return now - first;
   };
 
+  /**
+   * The gate follows the ferry (gateFixes), whatever its route does: paused,
+   * ended or finished, a claim at a gate is still settled. Returns whether it
+   * changed anything (then the step waits for the next tick).
+   */
+  const reconcile = (
+    w: Watch,
+    session: FerrySession,
+    gates: GateView[],
+    shipPort: string,
+    berthing: FerryBerthing | null,
+    now: number,
+  ): boolean => {
+    const roomId = room;
+    const near = (doorId: string) => nearOf(w, doorId);
+    const port = readDoorFrom(session.doc, shipPort);
+    const fixes = gateFixes({
+      gates, port, shipRoomId: w.ship, shipPort, berthing, near, heldFor: heldFor(w, now), now,
+    });
+    // What it watches: the gate pairings to the ferry there are now, and
+    // which of them the ferry's port holds too.
+    const live = new Set<string>();
+    for (const g of gates) {
+      if (!holdsFerry(g.record, w.ship, shipPort)) continue;
+      const key = pairKey(g.doorId, g.record);
+      live.add(key);
+      if (port?.paired === true && holdsDockTo(port, near(g.doorId)) && port.dockedAt === g.record.dockedAt) w.settled.add(key);
+    }
+    for (const k of [...w.pairSeen.keys()]) if (!live.has(k)) w.pairSeen.delete(k);
+    for (const k of [...w.settled]) if (!live.has(k)) w.settled.delete(k);
+    // The ferry's port agrees with the gate (as this fresh look has it).
+    if (!fixes.some((f) => f.kind === 'release-ferry')) w.repair = false;
+    if (fixes.length === 0) return false;
+    for (const fix of fixes) {
+      const end = gateEnd(w, fix.gate, roomId);
+      if (fix.kind === 'join' || fix.kind === 'release-gate') {
+        // A join takes the port's own stamp: the two ends agree.
+        if (end.write(fix.record) && fix.kind === 'join') w.settled.add(pairKey(fix.gate, fix.record));
+        continue;
+      }
+      const since = Y.encodeStateVector(session.doc);
+      let wrote = false;
+      try {
+        wrote = applyFarDockRequest(session.doc, {
+          kind: 'undock',
+          nearRoomId: roomId,
+          farAddress: w.address,
+          farDoor: shipPort,
+          nearDoorId: fix.gate,
+          ...(end.near.wall !== undefined ? { nearWall: end.near.wall } : {}),
+          ...(end.near.lateral !== undefined ? { nearLateral: end.near.lateral } : {}),
+          undockedAt: fix.undockedAt,
+        }, end.near).wrote;
+      } catch (err) {
+        console.warn('[gate] ferry-side release threw:', err);
+      }
+      if (!wrote) continue;
+      // Kept open until the ferry's room acknowledges it.
+      w.busy = true;
+      const gen = generation;
+      void session.confirm(since, GATE_ACK_MS).then((ok) => {
+        if (gen !== generation) return;
+        w.busy = false;
+        if (ok) w.ackBackoffMs = 0;
+        else unacked(w, true);
+      });
+    }
+    return true;
+  };
+
   /** One in-session step for one ferry. */
   const act = (w: Watch, ferry: DepartureFerry, gates: GateView[], berthing: FerryBerthing | null, now: number): void => {
     const session = w.session!;
     const news = newsOf(w, now);
+
+    // 1. The gate follows the ferry (by the port the departures entry names,
+    // as tend watches it).
+    if (reconcile(w, session, gates, ferry.route.shipPort, berthing, now)) return;
     if (!news || !isRouteRunning(news.route)) return;
-    // The board here learns what the ferry's doc says, once per session.
+    // The board here learns what the ferry's doc says, once per session; and
+    // after a write of this keeper's that was never acknowledged, every stop
+    // does (it may have landed after all).
     if (!w.refreshed) {
       w.refreshed = true;
-      if (!sameNews(news, ferry)) publish(w, ferry, false, null);
+      if (!sameNews(news, ferry)) publish(w, ferry, w.unpublished !== null, w.unpublished);
+      w.unpublished = null;
     }
     const sameStation = safe(deps.sameStation, null)
       ?? ((stop: RouteStop, roomId: string) => roomId === stop.berth.roomId);
@@ -1065,47 +1182,6 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const near = (doorId: string) => nearOf(w, doorId);
     const roomId = room;
 
-    // 1. The gate follows the ferry.
-    const seen = heldFor(w, now);
-    const fixes = gateFixes({
-      gates, port: look.port, shipRoomId: w.ship, shipPort: route.shipPort, berthing, near, heldFor: seen, now,
-    });
-    for (const k of [...w.pairSeen.keys()]) {
-      const [doorId, stamp] = k.split('|');
-      const rec = gates.find((g) => g.doorId === doorId)?.record;
-      if (!holdsFerry(rec, w.ship, route.shipPort) || `${rec.dockedAt ?? ''}` !== stamp) w.pairSeen.delete(k);
-    }
-    if (fixes.length > 0) {
-      for (const fix of fixes) {
-        const end = gateEnd(w, fix.gate, roomId);
-        if (fix.kind === 'join' || fix.kind === 'release-gate') {
-          end.write(fix.record);
-          continue;
-        }
-        const since = Y.encodeStateVector(session.doc);
-        let wrote = false;
-        try {
-          wrote = applyFarDockRequest(session.doc, {
-            kind: 'undock',
-            nearRoomId: roomId,
-            farAddress: w.address,
-            farDoor: route.shipPort,
-            nearDoorId: fix.gate,
-            ...(end.near.wall !== undefined ? { nearWall: end.near.wall } : {}),
-            ...(end.near.lateral !== undefined ? { nearLateral: end.near.lateral } : {}),
-            undockedAt: fix.undockedAt,
-          }, end.near).wrote;
-        } catch (err) {
-          console.warn('[gate] ferry-side release threw:', err);
-        }
-        if (wrote) {
-          w.dirty = true;
-          void session.confirm(since, GATE_ACK_MS);
-        }
-      }
-      return;
-    }
-
     // 2. The ferry's riders' decision, on the ferry's own doc.
     const step = keeperStep(look.view);
     const move = gateMove({ step, look, gates, roomId, shipRoomId: w.ship, near, now });
@@ -1122,13 +1198,27 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         const since = Y.encodeStateVector(session.doc);
         const wrote = writeRouteCheckpointIn(session.doc, session.doc.getMap(SHIP_MAP), route.startedAt, move.entry, now);
         if (!wrote) return;
-        w.dirty = true;
-        void session.confirm(since, GATE_ACK_MS);
-        publish(w, ferry, true, move.entry.legSeq);
-        if (move.why === 'restart') {
-          const gate = gates.find((g) => holdsFerry(g.record, w.ship, route.shipPort));
-          if (gate) safe(() => deps.note?.(gate.doorId, `${ferry.name} was still docked after its departure: its stay starts again.`, 'warn'), undefined);
-        }
+        // Boards hear of it only once the ferry's room holds it.
+        w.busy = true;
+        const gen = generation;
+        const legSeq = move.entry.legSeq;
+        void session.confirm(since, GATE_ACK_MS).then((ok) => {
+          if (gen !== generation) return;
+          w.busy = false;
+          if (!ok) {
+            // It may never land: a fresh session reads what the ferry's room
+            // does hold (the keeper writes it again if it is missing).
+            w.unpublished = legSeq;
+            unacked(w, false);
+            return;
+          }
+          w.ackBackoffMs = 0;
+          publish(w, ferry, true, legSeq);
+          if (move.why === 'restart') {
+            const gate = gates.find((g) => holdsFerry(g.record, w.ship, route.shipPort));
+            if (gate) safe(() => deps.note?.(gate.doorId, `${ferry.name} was still docked after its departure: its stay starts again.`, 'warn'), undefined);
+          }
+        });
         return;
       }
       case 'cast-off': {
@@ -1138,7 +1228,6 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         const { wrote, since } = stationCastOff({
           doc: session.doc, address: w.address, gate: end, shipRoomId: w.ship, shipPort: route.shipPort, now,
         });
-        w.dirty = true;
         if (!wrote) return;
         w.busy = true;
         const gen = generation;
@@ -1148,6 +1237,8 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
           safe(() => deps.note?.(move.gate.doorId, ok
             ? `Cast off ${ferry.name} on its timetable.`
             : `Cast off ${ferry.name}, but its module did not confirm yet.`, ok ? 'ok' : 'warn'), undefined);
+          if (ok) w.ackBackoffMs = 0;
+          else unacked(w, true);
         });
         return;
       }
@@ -1167,13 +1258,20 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
           shipRoomId: w.ship,
           shipPort: route.shipPort,
           berthing,
-          requesterPub: safe(() => deps.requesterPub?.(), undefined),
           now: clock,
           wait,
         }).then((r) => {
           if (gen !== generation) return;
           w.busy = false;
-          w.dirty = true;
+          if (r.ok) {
+            // Both ends hold this stamp now.
+            w.settled.add(stampKey(move.gate.doorId, r.dockedAt));
+            w.ackBackoffMs = 0;
+          } else if (r.reason === 'unconfirmed') {
+            // The gate keeps its claim, unsettled, and a fresh session reads
+            // whether the ferry's side landed.
+            unacked(w, false);
+          }
           const m = w.memory;
           if (!m || m.run !== run || m.legSeq !== legSeq) return;
           m.passing = false;
@@ -1209,22 +1307,27 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     if (w.busy || w.dialing) return;
     const shipPort = ferry.route.shipPort;
     const berthing = ferryBerthingIn(doors, ferry.shipRoomId, shipPort);
-    // Gates this ferry is any business of: free to take it, or holding it.
-    const mine = gates.filter((g) => (g.record?.paired !== true
-      ? !!berthing && admitsFerry(g, ferry.shipRoomId)
-      : holdsFerry(g.record, ferry.shipRoomId, shipPort)));
-    if (mine.length === 0 || (!berthing && !mine.some((g) => g.record?.paired === true))) {
+    const running = isRouteRunning(ferry.route);
+    // Gates this ferry is any business of: holding it, or (its route
+    // running) free to take it.
+    const holding = gates.filter((g) => holdsFerry(g.record, ferry.shipRoomId, shipPort));
+    const free = running && !!berthing && gates.some((g) => g.record?.paired !== true && admitsFerry(g, ferry.shipRoomId));
+    if (holding.length === 0 && !free && !w.repair) {
       hangUp(w);
       return;
     }
-    const look = stationLook(ferry, room, boardDocksOf(doors, ferry.shipRoomId), now, w.stationCache);
-    if (!gateSessionWanted(look, now)) {
+    // A claim this keeper has not seen the ferry's port hold, or a write of
+    // its own to the ferry's side never acknowledged, keeps a session
+    // whatever the route does, until the two ends agree (reconcile).
+    const unsettled = w.repair || holding.some((g) => !w.settled.has(pairKey(g.doorId, g.record as DoorPairing)));
+    const look = running ? stationLook(ferry, room, boardDocksOf(doors, ferry.shipRoomId), now, w.stationCache) : null;
+    if (!unsettled && !(look && gateSessionWanted(look, now))) {
       hangUp(w);
       return;
     }
     if (!w.session) {
       const address = berthing?.address
-        ?? mine.map((g) => (g.record?.paired === true ? g.record.connectedRoomAddress : '')).find(Boolean);
+        ?? holding.map((g) => (g.record as DoorPairing).connectedRoomAddress).find(Boolean);
       if (address && now >= w.nextDialAt) dial(w, address);
       return;
     }
@@ -1233,7 +1336,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       w.nextDialAt = now + GATE_REDIAL_MS;
       return;
     }
-    if (now - w.openedAt >= GATE_SESSION_MAX_MS && !departureClose(look, now)) {
+    if (now - w.openedAt >= GATE_SESSION_MAX_MS && !(look && departureClose(look, now))) {
       hangUp(w);
       w.nextDialAt = now;
       return;
@@ -1267,7 +1370,9 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       const doors = safe(deps.doors, new Map<string, DoorRecord>() as ReadonlyMap<string, DoorRecord>);
       const seen = new Set<string>();
       for (const ferry of safe(deps.ferries, [] as readonly DepartureFerry[])) {
-        if (!isRouteRunning(ferry.route) || !ferry.route.stops.some((s) => s.berth.roomId === roomId)) continue;
+        // A route that is not running (finished) is tended too: a gate's
+        // claim on its ferry is still settled.
+        if (!ferry.route.stops.some((s) => s.berth.roomId === roomId)) continue;
         seen.add(ferry.shipRoomId);
         try {
           tend(ferry, gates, doors, now);
