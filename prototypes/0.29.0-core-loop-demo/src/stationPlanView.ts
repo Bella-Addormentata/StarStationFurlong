@@ -32,8 +32,10 @@ export interface StationPlanDeps {
   currentRoomId: () => string;
   /** The local player's id (roomInfo.owner's vocabulary), to say "you". */
   playerId: () => string;
-  /** Ship summaries around a planet (planetSummary.shipsAroundPlanet). */
-  ships: (planetId: string) => ShipSummary[];
+  /** Every ship summary this client holds, retired ones included: a ship's
+   *  own report anywhere (another planet, retired) can contradict a berth
+   *  the atlas still draws here. visitingShips picks this station's. */
+  ships: () => ShipSummary[];
   /** The current room's doors, for the edit buttons. */
   doors: () => Array<{ id: string; label: string }>;
   /** Step back from the table and open a door's own panel. */
@@ -213,7 +215,7 @@ export class StationPlanView {
     this.station = station;
     const here = this.deps.currentRoomId();
     this.plan = stationPlan(this.deps.atlas(), station.welcomeRoomId, here);
-    this.visiting = visitingShips(this.plan, this.deps.ships(station.planetId), station.welcomeRoomId);
+    this.visiting = visitingShips(this.plan, this.deps.ships(), station.welcomeRoomId);
     if (this.selected && !this.findModule(this.selected)) this.selected = null;
     this.render();
   }
@@ -309,7 +311,8 @@ export class StationPlanView {
       }
     }
 
-    const listed = new Set(this.visiting.map((s) => s.roomId));
+    // Ships whose own word still says docked here; any other berth is stale.
+    const listed = new Set(this.visiting.filter((s) => s.state === 'docked').map((s) => s.roomId));
     for (const m of [...plan.modules, ...plan.ships]) {
       const corners = moduleCorners(m).map((c) => toPx(c.x, c.z));
       const isShip = m.kind === 'ship';
@@ -413,7 +416,11 @@ export class StationPlanView {
         card.append(heading('Docked'), row(`At ${gate} of ${this.nameOf(m.dockedAt.roomId)}`));
       }
       const v = this.visiting.find((s) => s.roomId === m.roomId);
-      if (!v) card.append(row('Its own last report puts it elsewhere; this berth is out of date.', DIM));
+      if (!v || v.state !== 'docked') {
+        card.append(row(v ? 'It reports it is leaving; this berth may be out of date.' : 'Its own last report puts it elsewhere; this berth is out of date.', DIM));
+      }
+      // Aboard this ship: its doors (undock among them) are yours to work.
+      if (m.here) this.renderDoorButtons(card, m);
       return;
     }
 
@@ -437,6 +444,12 @@ export class StationPlanView {
         : 'Edit a module from a holotable inside the station.', DIM));
       return;
     }
+    this.renderDoorButtons(card, m);
+  }
+
+  /** ✏️ OPEN DOOR PANEL for each door of the room you stand in. */
+  private renderDoorButtons(card: HTMLElement, m: PlanModule): void {
+    if (m.kind === 'ship') card.append(heading('Build and edit'));
     card.append(row('Each door\'s panel can provision a new module, fit or remove a vestibule, or undock.', DIM));
     const doors = this.deps.doors();
     if (doors.length === 0) card.append(row('No doors in this room.', DIM));

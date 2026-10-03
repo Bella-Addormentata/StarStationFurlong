@@ -137,6 +137,17 @@ export function stationPlan(
       if (!door?.targetRoomId || !byId.has(door.targetRoomId)) continue;
       links.push({ doorId, toRoomId: door.targetRoomId, berth: roomBerths?.has(doorId) ?? false });
     }
+    // 🗺️ A pairing only the far room recorded (atlasPoses' reverse hop) is a
+    // link here too. Our door is the one its record names (farDoor) when it
+    // names one; otherwise a stand-in id that no door or gate matches.
+    for (const q of poses) {
+      if (q.roomId === p.roomId || links.some((l) => l.toRoomId === q.roomId)) continue;
+      for (const [farId, door] of Object.entries(atlas[q.roomId]?.doors ?? {})) {
+        if (door?.targetRoomId !== p.roomId) continue;
+        const doorId = door.farDoor && !entry?.doors[door.farDoor] ? door.farDoor : `~${q.roomId}:${farId}`;
+        links.push({ doorId, toRoomId: q.roomId, berth: berths.get(q.roomId)?.has(farId) ?? false });
+      }
+    }
     links.sort((a, b) => a.doorId.localeCompare(b.doorId));
     const gates: PlanGate[] = Object.entries(entry?.gates ?? {})
       .map(([doorId, gate]) => ({
@@ -227,7 +238,13 @@ export function visitingShips(
     });
   }
   for (const s of ships) {
-    if (s.retired || stationRooms.has(s.roomId)) continue;
+    if (stationRooms.has(s.roomId)) continue;
+    // A ship that stopped being one (bolted in, fitting removed) is no
+    // visitor, whatever berth the atlas still draws.
+    if (s.retired) {
+      out.delete(s.roomId);
+      continue;
+    }
     const at = s.fromRoom === welcomeRoomId;
     const to = s.toRoom === welcomeRoomId;
     let state: VisitingShip['state'] | null = null;

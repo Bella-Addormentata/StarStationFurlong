@@ -135,6 +135,17 @@ describe('the station plan', () => {
     expect(bar.x).toBeCloseTo(forward.x, 6);
     expect(bar.z).toBeCloseTo(forward.z, 6);
     expect(Math.cos(bar.rotY - forward.rotY)).toBeCloseTo(1, 6);
+    // The hub links to the bar through the door the bar's record names.
+    expect(plan.modules[0].links).toEqual([{ doorId: 'east', toRoomId: 'r-bar', berth: false }]);
+  });
+
+  it('docks a ship whose berth only the ship recorded', () => {
+    harvestIntoAtlas({ roomId: 'q-hub', name: 'HUB', doors: [], gates: { south: 4 } });
+    harvestIntoAtlas({ roomId: 'q-ship', name: 'SKIFF', doors: [{ doorId: 'north', targetSeed: seed('q-hub'), wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0, transient: true }] });
+    const plan = stationPlan(readAtlas(), 'q-hub');
+    expect(plan.ships.map((m) => m.roomId)).toEqual(['q-ship']);
+    expect(plan.modules[0].gates).toEqual([{ doorId: 'south', gate: 4, occupied: true }]);
+    expect(plan.ships[0].dockedAt).toEqual({ roomId: 'q-hub', doorId: 'south', gate: 4 });
   });
 
   it('is empty for a room the atlas does not know', () => {
@@ -260,5 +271,7 @@ describe('ships at or near a station', () => {
       ship({ roomId: 'room-b', status: 'docked', fromRoom: 'room-a' }),
     ], 'room-a');
     expect(list.map((s) => s.roomId)).toEqual(['ship-1']);
+    // A retired ship's berth on the plan is no visitor either.
+    expect(visitingShips(plan, [ship({ roomId: 'ship-1', status: 'docked', retired: true })], 'room-a')).toEqual([]);
   });
 });

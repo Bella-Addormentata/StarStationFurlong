@@ -238,7 +238,7 @@ import {
 import { rowText } from './departuresBoard';
 import type { BoardView } from './departuresBoard';
 import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './departuresDoc';
-import { shipsAroundPlanet, subscribePlanetSummary } from './planetSummary';
+import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1201,7 +1201,7 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           atlas: () => readStationAtlas(),
           currentRoomId: () => currentRoomId(),
           playerId: () => stationPlanDeps.playerId?.() ?? '',
-          ships: (planetId) => shipsAroundPlanet(planetId),
+          ships: () => Object.values(readPlanetStore().ships),
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
           onBack: () => stationPlanView?.hide(),
