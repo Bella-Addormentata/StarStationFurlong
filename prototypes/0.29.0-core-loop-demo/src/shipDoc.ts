@@ -1035,3 +1035,72 @@ export function writeRestPlace(rest: RestPlace | null): boolean {
   });
   return true;
 }
+
+// ── A DEPART under way (station moves) ───────────────────────────────────────
+
+/**
+ * 🚚 A DEPART under way on one helm: it has begun letting go of the ship's
+ * docks and waits for every far room's answer (devices.ts DEPART). Shared,
+ * so a helm in another tab or install waits for it too: a dock the first
+ * lets go of reads as released at once (its tombstone), but a far station
+ * whose move holds it puts it back, and that is too late once another helm
+ * has flown. `by` names that DEPART (a token of its own), `at` when it took
+ * the hold (writer clock). It lasts until that DEPART ends (releaseCastOff),
+ * or CAST_OFF_HOLD_MS at most, should its helm go away mid-way.
+ */
+export interface CastOffHold {
+  by: string;
+  at: number;
+}
+
+/** How long a cast-off hold lasts at most: a far room's whole session
+ *  (farDoorWrite's deadline, a minute), with room to spare. */
+export const CAST_OFF_HOLD_MS = 90_000;
+
+function isCastOffHold(v: unknown): v is CastOffHold {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const h = v as Partial<CastOffHold>;
+  return isBoundedString(h.by) && typeof h.at === 'number' && Number.isFinite(h.at);
+}
+
+/** The cast-off hold in force at `now`, or null. One stamped further ahead
+ *  than CAST_OFF_HOLD_MS is none: no peer's clock holds a ship longer. */
+export function readCastOffHold(now: number = Date.now()): CastOffHold | null {
+  if (!docAlive()) return null;
+  const raw = shipMap!.get('castOff');
+  if (!isCastOffHold(raw)) return null;
+  return now < raw.at + CAST_OFF_HOLD_MS && raw.at <= now + CAST_OFF_HOLD_MS ? { by: raw.by, at: raw.at } : null;
+}
+
+/** Take the cast-off hold for the DEPART `by`, unless another DEPART holds
+ *  it. Returns whether the doc now names `by`. Two helms taking it at the
+ *  same moment both get true: the doc keeps one of the two, so each checks
+ *  it still holds it (castOffHeldBy) once the other's write has had time to
+ *  arrive. */
+export function holdCastOff(by: string, now: number = Date.now()): boolean {
+  if (!docAlive()) return false;
+  const held = readCastOffHold(now);
+  if (held && held.by !== by) return false;
+  const hold: CastOffHold = { by, at: Math.floor(now) };
+  if (!isCastOffHold(hold)) return false;
+  boundDoc!.transact(() => {
+    shipMap!.set('castOff', hold);
+  });
+  return true;
+}
+
+/** Does the DEPART `by` hold the cast-off at `now`? */
+export function castOffHeldBy(by: string, now: number = Date.now()): boolean {
+  return readCastOffHold(now)?.by === by;
+}
+
+/** End the DEPART `by`'s hold: only its own, so a hold another DEPART took
+ *  since (this one's ran out), or another room's, is left alone. */
+export function releaseCastOff(by: string): void {
+  if (!docAlive()) return;
+  const raw = shipMap!.get('castOff');
+  if (!isCastOffHold(raw) || raw.by !== by) return;
+  boundDoc!.transact(() => {
+    shipMap!.delete('castOff');
+  });
+}

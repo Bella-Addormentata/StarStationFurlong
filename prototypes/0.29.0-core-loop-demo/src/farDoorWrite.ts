@@ -44,11 +44,11 @@ import { rememberMovesIn, roomDocLockedByMove } from './stationMove';
 // ── The decision (pure over a doc) ───────────────────────────────────────────
 
 /**
- * Apply one DOCK / UNDOCK to the far room's doc. Returns what to tell the
- * player and whether anything was written (only a write needs an ack).
- * `farRoomId` is the room the doc is (by default, the one its address
- * names), and `nowMs` the moment a DOCK is judged at (an UNDOCK goes by its
- * own stamp).
+ * Apply one DOCK / UNDOCK to the far room's doc, or answer a legacy berth's
+ * release (read only). Returns what to tell the player and whether anything
+ * was written (only a write needs an ack). `farRoomId` is the room the doc
+ * is (by default, the one its address names), and `nowMs` the moment a DOCK
+ * is judged at (an UNDOCK or a release goes by its own stamp).
  */
 export function applyFarDockRequest(
   doc: Y.Doc,
@@ -57,6 +57,15 @@ export function applyFarDockRequest(
   farRoomId: string = roomIdFromSeed(req.farAddress),
   nowMs: number = Date.now(),
 ): { result: FarDockResult; wrote: boolean } {
+  if (req.kind === 'release') {
+    // 🚚 A legacy berth's far end is not this end's to change (DETACH lets
+    // go of this end only), but its room may know of a move the asking
+    // install has not heard of: judged as an UNDOCK is, at the release's
+    // own stamp.
+    return roomDocLockedByMove(doc, farRoomId, req.undockedAt)
+      ? { result: { ok: false, reason: 'moving' }, wrote: false }
+      : { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
+  }
   if (req.kind === 'undock') {
     // A named door is read on its own (readDoorFrom — the capped snapshot
     // could hide it); the snapshot only serves the scan when none is named.
@@ -378,10 +387,12 @@ async function session(
     const since = Y.encodeStateVector(s.doc);
     const { result, wrote } = applyFarDockRequest(s.doc, req, near, boot.roomId);
     written = wrote;
-    // 🚚 A move this install had not heard of refused the dock (or the
-    // undock): learn it, so the station list shows that station between
-    // planets too.
-    if (!result.ok && result.reason === 'moving') rememberMovesIn(s.doc);
+    // 🚚 Learn the moves the far room holds, whatever it decided: one this
+    // install had not heard of refused the request (the station list then
+    // shows that station between planets too), or moved its station since
+    // this install last heard (an UNDOCK then records where it really let
+    // go: docking.ts undockPort).
+    rememberMovesIn(s.doc);
     if (wrote && !(await s.confirmOwnWrites(since, ACK_TIMEOUT_MS))) {
       console.warn(`[farDoorWrite] ${boot.roomId}: the node did not acknowledge the write`);
       // Unacknowledged is not unwritten: the write may still land.

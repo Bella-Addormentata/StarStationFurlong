@@ -307,6 +307,31 @@ export function detachBerth(doorId: string, now: number = Date.now()): boolean {
 }
 
 /**
+ * 🚚 An UNDOCK records where the far end's station was as it let go (`was`,
+ * DockBerthMemory.at) before it asks the far room, whose moves it learns
+ * then (farDoorWrite): when those place the station elsewhere at that moment
+ * (`at`), this end's tombstone takes `at`, while it is still that UNDOCK's
+ * (`undockedAt`), and so does the rest a ship took from it meanwhile
+ * (keepRestPlace). Returns whether it wrote.
+ */
+export function correctReleasePlace(
+  doorId: string,
+  undockedAt: number,
+  was: string | undefined,
+  at: string | undefined,
+): boolean {
+  if (at === undefined || at === was) return false;
+  const record = readDoor(doorId);
+  if (!record || record.paired === true || record.dock?.undockedAt !== undockedAt) return false;
+  writeDoorTombstone(doorId, record.retiredAddress, { ...record.dock, at });
+  const rest = readRestPlace();
+  if (rest && !rest.docks?.length && rest.since === Math.floor(undockedAt) && rest.at === was) {
+    writeRestPlace({ ...rest, at });
+  }
+  return true;
+}
+
+/**
  * What a ship's rest record (shipDoc.RestPlace) says at `now`, from the doors
  * it names, each read directly: a scan of the doors is capped, and a peer
  * could push the very door out of it.
