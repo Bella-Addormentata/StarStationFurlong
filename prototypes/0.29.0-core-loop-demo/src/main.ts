@@ -124,7 +124,7 @@ import {
   setHelmOwnerCheck,
   shipFuelCapacity,
 } from "./devices";
-import { completeArrival, setBerthSeedResolver } from "./shipArrival";
+import { berthPassFor, completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
 // aside for it and copies it back into the stored records when due.
@@ -2240,7 +2240,10 @@ async function joinRoomAtEpoch(
       capacity: shipFuelCapacity,
       route: readShipRoute,
       checkpoints: readRouteCheckpoints,
-      seedFor: localSeedFor,
+      // 🎫 The passes the helm's "no pass" check counts (berthPassFor): this
+      // game's own, else the address a port of the ship remembers there, so
+      // a rider who never stood in a stop's room still reaches its board.
+      seedFor: (roomId) => berthPassFor(roomId, world?.dockingSystem?.listDockPorts() ?? []),
       write: writeDepartures,
       // ⛽ Only the room's owner fits or takes off tanks (editMode's gate).
       editsShip: isLocalHelmCommander,
