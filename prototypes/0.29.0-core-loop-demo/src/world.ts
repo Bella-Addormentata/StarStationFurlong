@@ -80,7 +80,7 @@ import {
   isFloorCutKind,
 } from "./furniture";
 import type { FurnitureItem, RoomTheme } from "./furniture";
-import { ledgerHasRoom, northDoorUnlocked } from "./stationParts";
+import { northDoorUnlocked } from "./stationParts";
 import { rebuildObstacles } from "./obstacles";
 import {
   rebakeWalkableGrid,
@@ -5256,7 +5256,6 @@ export class World {
       doors: readAllDoors(),
       playerId: getPlayerId(),
       welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
-      minted: (roomId) => ledgerHasRoom(roomId),
     };
   }
 

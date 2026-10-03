@@ -192,21 +192,19 @@ describe('what a room can take apart', () => {
   it('keeps the welcome room, and asks to see inside a module whose owner is unknown', () => {
     const doors = hub();
     expect(removalBlocker(input(doors, { welcomeRoomId: 'room-b' }), 'room-b')).toBe("it is the station's welcome room");
-    // A module this install minted but whose layout the atlas doesn't hold
-    // (never learned, or evicted): what else it is joined to is unknown.
+    // A module whose layout the atlas doesn't hold (never learned, or
+    // evicted): what else it is joined to is unknown.
     doors.set('d:shed', pairing('room-s'));
-    const minted = (r: string) => r === 'room-s';
-    expect(removalBlocker(input(doors, { minted }), 'room-s')).toBe("its layout isn't known yet; step inside it once");
+    expect(removalBlocker(input(doors), 'room-s')).toBe("its layout isn't known yet; step inside it once");
     // A stub (named by a neighbour's door, never seen from inside) is no better.
     harvestIntoAtlas({ roomId: 'room-z', name: 'ZED', doors: [{ doorId: 'n', targetSeed: seed('room-s') }] });
     expect(readAtlas()['room-s']?.doors).toEqual({});
-    expect(removalBlocker(input(doors, { minted }), 'room-s')).toBe("its layout isn't known yet; step inside it once");
+    expect(removalBlocker(input(doors), 'room-s')).toBe("its layout isn't known yet; step inside it once");
     doors.delete('d:shed');
     harvestIntoAtlas({ roomId: 'room-d', name: 'SHED', doors: [{ doorId: 'w', targetSeed: seed('room-a') }] });
-    // A harvest without an owner keeps it unknown.
+    // A harvest without an owner keeps it unknown, even for a module this
+    // install minted: its deed may have changed hands since.
     expect(removalBlocker(input(doors), 'room-d')).toBe("its owner isn't known yet; step inside it once");
-    // …unless this install minted it.
-    expect(removalBlocker(input(doors, { minted: (r) => r === 'room-d' }), 'room-d')).toBeNull();
     // No verified owner (none, or the legacy marker): this room's owner may.
     harvestIntoAtlas({ roomId: 'room-d', name: 'SHED', doors: [{ doorId: 'w', targetSeed: seed('room-a') }], owner: null });
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
@@ -693,6 +691,64 @@ describe('a module taken apart', () => {
     }
   });
 
+  it('comes back for good once someone stands inside it, even past a tombstone at the six-hour ceiling', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const T = 1_000_000;
+      const CEILING = T + 6 * 60 * 60 * 1000;
+      now.mockReturnValue(T);
+      hub();
+      // A peer six hours ahead took GARDEN apart: its tombstone sits in
+      // HUB's doc at the bound every reader enforces.
+      const D = CEILING - 100;
+      const hubDoc = new Y.Doc();
+      hubDoc.getMap('atlas').set('room-b', { roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: D, updatedAt: CEILING });
+      const before = Y.encodeStateAsUpdate(hubDoc);
+      bindStationAtlasDoc(hubDoc, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      // Someone steps into GARDEN by an old pass, its own doc still empty.
+      // The harvest of the room they stand in names the tombstone it beats,
+      // and can only tie its stamp at the ceiling.
+      const garden = new Y.Doc();
+      bindStationAtlasDoc(garden, { roomId: 'room-b', isPassagePublic: () => false });
+      harvestIntoAtlas({ roomId: 'room-b', name: 'GARDEN', doors: [{ doorId: 'west', targetSeed: seed('room-a') }], owner: { id: 'p-me' } });
+      pushAtlasToDoc();
+      expect(readAtlas()['room-b']).toMatchObject({ revives: D, lastSeen: CEILING });
+      expect(garden.getMap('atlas').get('room-b')).toMatchObject({ revives: D, updatedAt: CEILING });
+      // Back in HUB, whose doc still holds the tombstone at that stamp: the
+      // module stays, and its copy goes out over the tombstone.
+      bindStationAtlasDoc(hubDoc, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']?.doors).toMatchObject({ west: { targetRoomId: 'room-a' } });
+      const shared = hubDoc.getMap('atlas').get('room-b') as { dismantledAt?: number; revives?: number; updatedAt: number };
+      expect(shared.dismantledAt).toBeUndefined();
+      expect(shared).toMatchObject({ revives: D, updatedAt: CEILING });
+      // A doc read for its gates that still holds the tombstone agrees.
+      const far = new Y.Doc();
+      Y.applyUpdate(far, before);
+      expect(withSharedAtlasOf(far, readAtlas(), 'room-b')['room-b']?.doors).toMatchObject({ west: { targetRoomId: 'room-a' } });
+      // Another install holding the tombstone at that same stamp takes the
+      // copy when it arrives.
+      store.clear();
+      hub();
+      const other = new Y.Doc();
+      Y.applyUpdate(other, before);
+      bindStationAtlasDoc(other, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      Y.applyUpdate(other, Y.encodeStateAsUpdate(hubDoc));
+      expect(isDismantled('room-b')).toBe(false);
+      expect(readAtlas()['room-b']).toMatchObject({ revives: D });
+      // Taking it apart again still takes it off, and the old copy can't
+      // bring it back from that.
+      dismantleInAtlas('room-b', T + 5000);
+      expect(readAtlas()['room-b']).toBeUndefined();
+      bindStationAtlasDoc(hubDoc, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(hubDoc.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: T + 5000 });
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('a seed handed over later does not bring it back', () => {
     hub();
     dismantleInAtlas('room-b', 5);
@@ -826,6 +882,12 @@ describe('the deed takes a module apart (source scan)', () => {
     const recheck = park.indexOf('if (startResumesDisassembly(c) && !mayTakeApart())');
     expect(recheck).toBeGreaterThan(-1);
     expect(recheck).toBeLessThan(park.indexOf('writeRobotConfig('));
+  });
+
+  it("never takes having minted a module for owning it", () => {
+    const input = between(source('world.ts'), 'private disassemblyInput(', '\n  }');
+    expect(input).toContain('playerId: getPlayerId()');
+    expect(input).not.toContain('ledgerHasRoom');
   });
 
   it('is the raw deed check, refused while a leave is under way', () => {

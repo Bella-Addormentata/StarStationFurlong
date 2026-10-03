@@ -229,9 +229,6 @@ export interface CandidateInput {
   playerId: string;
   /** The station's welcome room: its front door, never taken apart. */
   welcomeRoomId?: string | null;
-  /** True for rooms this install minted (stationParts ledger): its own
-   *  modules, whose owner the atlas may not have learned yet. */
-  minted?: (roomId: string) => boolean;
 }
 
 /** This room's structural doors, grouped by the module behind them: paired,
@@ -262,8 +259,10 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
  *    from inside with no doors of its own is known: it is joined only by
  *    doors other rooms recorded;
  *  - only its owner takes a module apart (one with no verified owner may be
- *    taken apart by this room's deed holder, who alone sets robots to it;
- *    one this install minted, whose owner the atlas never learned, likewise);
+ *    taken apart by this room's deed holder, who alone sets robots to it).
+ *    One whose owner the atlas never learned waits for someone to step
+ *    inside: having minted it is no proof it is still ours, as its deed may
+ *    have changed hands since;
  *  - it must hang only off this room: a module still joined to another, or
  *    with a ship docked at it, would leave that one cut off.
  */
@@ -274,9 +273,8 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   const stub = !!entry && Object.keys(entry.doors ?? {}).length === 0 && entry.localSeenAt === undefined;
   if (!entry || stub) return "its layout isn't known yet; step inside it once";
   const owner = entry.owner;
-  if (owner === undefined) {
-    if (!input.minted?.(roomId)) return "its owner isn't known yet; step inside it once";
-  } else if (owner !== null && !legacyOwnerMarker(owner.id) && owner.id !== input.playerId) {
+  if (owner === undefined) return "its owner isn't known yet; step inside it once";
+  if (owner !== null && !legacyOwnerMarker(owner.id) && owner.id !== input.playerId) {
     return `it belongs to ${owner.name || 'someone else'}`;
   }
   // Its other connections, as the atlas knows them: its own records and any
