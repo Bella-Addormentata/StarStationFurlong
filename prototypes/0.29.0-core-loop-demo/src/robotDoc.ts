@@ -16,7 +16,8 @@
 import * as Y from 'yjs';
 import type { DisassemblyJob, DisassemblyJobRecord, DisassemblyTarget, DisassemblyWork } from './disassembly';
 import {
-  MAX_CREW, isDisassemblyJobRecord, isDisassemblyWork, jobFromWork, jobLaborMs, startWork, stopWork, workingCrew,
+  MAX_CREW, isDisassemblyJobRecord, isDisassemblyWork, jobDueAt, jobFromWork, jobLaborMs, startWork, stopWork,
+  workRanOut, workedMs, workingCrew,
 } from './disassembly';
 import { placedFurnitureIn } from './furnitureDoc';
 
@@ -263,12 +264,12 @@ function readJobIn(map: Y.Map<unknown>, roomId: string): DisassemblyJob | null {
 
 /** Write (or drop, null) a dock's config inside the caller's transaction.
  *  On each open job, the robot's clock stops if it leaves the crew (the
- *  time since its last record its labor, if it was working) and starts if
- *  it joins. Only its own record is credited: another robot's labor is
- *  never written here, so two clients editing two robots at once can't
- *  credit either with time only the other saw. The crew is then held to
- *  the records (fillCrewIn): another robot is only ever started or
- *  stopped uncredited. A finished job no robot is set to any more is
+ *  time since its last record its labor, if it was working, up to when the
+ *  job's labor ran out if it did) and starts if it joins. Only its own
+ *  record is credited: another robot's labor is never written here, so two
+ *  clients editing two robots at once can't credit either with time only
+ *  the other saw. The crew is then held to the records (fillCrewIn):
+ *  another robot is only ever started or stopped uncredited. A finished job no robot is set to any more is
  *  dropped, and so are the work records no open job counts; an open one
  *  stays, its robots' labor kept for later. */
 function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | null, now: number): void {
@@ -293,14 +294,17 @@ function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | 
     if (record.finishedAt !== undefined) continue;
     const work = workOf(after, record);
     const active = after.active.get(record.roomId) ?? NO_DOCKS;
-    const wasWorking = asJob(before, record).crew.includes(dockId);
+    const job = asJob(before, record);
+    const wasWorking = job.crew.includes(dockId);
     const mine = work.get(dockId);
     if (mine?.working && !(wasWorking && active.has(dockId))) {
       // Leaving the crew: its clock stops, the time since its last record
-      // its labor. A record that says it works though it wasn't counted (its
-      // dock was gone, or edits crossed) stops uncredited, and the robot
-      // starts afresh below if it is joining.
-      const stopped = wasWorking ? stopWork(mine, now) : { ...mine, working: false };
+      // its labor, though none after the job's labor ran out (it has waited
+      // on its dock since). A record that says it works though it wasn't
+      // counted (its dock was gone, or edits crossed) stops uncredited, and
+      // the robot starts afresh below if it is joining.
+      const due = jobDueAt(job);
+      const stopped = wasWorking ? stopWork(mine, due === null ? now : Math.min(now, due)) : { ...mine, working: false };
       map.set(workKey(record.roomId, dockId), stopped);
       work.set(dockId, stopped);
     }
@@ -321,7 +325,9 @@ function workOf(index: JobIndex, record: DisassemblyJobRecord): Map<string, Disa
  *  at once, past MAX_CREW) stops, uncredited: its time was never counted.
  *  A robot set to the job and not stopped that isn't working (it waited for
  *  room, or crossed edits left its record stopped) starts at `now` while
- *  the crew has room, never credited for the wait. Every client reading
+ *  the crew has room, never credited for the wait, unless the job's labor
+ *  has run out: then it waits on its dock with the crew until the module
+ *  comes off or the job is raised (raiseJobLaborIn). Every client reading
  *  the same records stops and starts the same robots. */
 function fillCrewIn(
   map: Y.Map<unknown>,
@@ -337,6 +343,7 @@ function fillCrewIn(
     map.set(workKey(record.roomId, w.dockId), stopped);
     work.set(w.dockId, stopped);
   }
+  if (workedMs(jobFromWork(record, work.values(), active), now) >= jobLaborMs(record)) return;
   let size = crew.size;
   for (const d of [...active].sort()) {
     if (size >= MAX_CREW) break;
@@ -430,7 +437,7 @@ export function assignDisassembly(dockId: string, target: DisassemblyTarget, now
       const job: DisassemblyJobRecord = { ...target, startedAt: now, doneMs: 0, asOf: now };
       map.set(jobKey(target.roomId), job);
     } else {
-      raiseJobLaborIn(map, open, target.laborHours);
+      raiseJobLaborIn(map, open, target.laborHours, now);
     }
     const c = readRobotConfig(dockId);
     setConfigIn(map, dockId, {
@@ -447,18 +454,33 @@ export function assignDisassembly(dockId: string, target: DisassemblyTarget, now
  *  module's size, so a record costed below it (the module was enlarged
  *  since, or the record was written short) is raised. The work its robots
  *  have done stands (it is in their own records); the rest is still to do.
- *  Never lowered. */
-function raiseJobLaborIn(map: Y.Map<unknown>, record: DisassemblyJobRecord, laborHours: number): void {
+ *  A job whose labor ran out before `now` has its crew's clocks settled at
+ *  that time first (workRanOut): the robots waited on their docks since,
+ *  and that wait is no labor on the raised job. They start again now, as
+ *  the rest of the job begins (fillCrewIn). This writes the crew's records,
+ *  so a robot stopped elsewhere at the same moment, before its labor ran
+ *  out, may be credited to when it ran out: at most the time the two edits
+ *  took to meet, the same on every client. Never lowered. */
+function raiseJobLaborIn(map: Y.Map<unknown>, record: DisassemblyJobRecord, laborHours: number, now: number): void {
   if (record.finishedAt !== undefined || record.laborHours >= laborHours) return;
-  map.set(jobKey(record.roomId), { ...record, laborHours });
+  const index = indexJobs(map);
+  const work = workOf(index, record);
+  const active = index.active.get(record.roomId) ?? NO_DOCKS;
+  for (const w of workRanOut(record, work.values(), active, now)) {
+    map.set(workKey(record.roomId, w.dockId), w);
+    work.set(w.dockId, w);
+  }
+  const raised = { ...record, laborHours };
+  map.set(jobKey(record.roomId), raised);
+  fillCrewIn(map, raised, work, active, now);
 }
 
 /** 🔧 Raise an open job to the module's labor (raiseJobLaborIn). */
-export function raiseDisassemblyLabor(roomId: string, laborHours: number): void {
+export function raiseDisassemblyLabor(roomId: string, laborHours: number, now = Date.now()): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
     const record = readRecordIn(map, roomId);
-    if (record) raiseJobLaborIn(map, record, laborHours);
+    if (record) raiseJobLaborIn(map, record, laborHours, now);
   });
 }
 

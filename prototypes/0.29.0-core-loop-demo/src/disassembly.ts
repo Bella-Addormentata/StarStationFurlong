@@ -16,10 +16,11 @@
  * membership rides on its own config key and concurrent edits to different
  * robots never overwrite each other. Nor is its progress: each robot keeps
  * its own record of the labor it did on the job (DisassemblyWork), written
- * when that robot starts or stops working on it, and the job's progress is
- * the sum of them. So two clients changing two robots at once never write
- * the same value, and neither can credit one robot with time that only the
- * other knew it spent stopped. Progress is a pure function of the clock:
+ * when that robot starts or stops working on it (and settled when its
+ * labor ran out, if the job is raised after: workRanOut), and the job's
+ * progress is the sum of them. So two clients changing two robots at once
+ * never write the same value, and neither can credit one robot with time
+ * that only the other knew it spent stopped. Progress is a pure function of the clock:
  * each robot's labor as of its last record, plus the time the working ones
  * have worked since, so the clock is never read backwards and nothing has
  * to be written while the robots simply work.
@@ -89,9 +90,10 @@ export interface DisassemblyJob extends DisassemblyJobRecord {
 
 /** 🔧 One robot's labor on one job, as the room doc stores it (robotDoc's
  *  `work:` keys): what it had done as of `asOf`, and whether it has been
- *  working since. Written only when that robot starts or stops working on
- *  the job, from its own config; a job opened again on the same module
- *  (another `startedAt`) counts none of the old job's. */
+ *  working since. Written when that robot starts or stops working on the
+ *  job, from its own config, or settled when the job's labor ran out if
+ *  the job is raised after (workRanOut); a job opened again on the same
+ *  module (another `startedAt`) counts none of the old job's. */
 export interface DisassemblyWork {
   roomId: string;
   dockId: string;
@@ -224,9 +226,41 @@ export function jobFromWork(
  *  robotDoc stops its record uncredited and starts it again when a place
  *  in the crew frees. */
 export function workingCrew(work: Iterable<DisassemblyWork>, active: ReadonlySet<string>): Set<string> {
-  const working = [...work].filter((w) => w.working && active.has(w.dockId));
-  working.sort((a, b) => a.asOf - b.asOf || (a.dockId < b.dockId ? -1 : a.dockId > b.dockId ? 1 : 0));
+  const working = [...work].filter((w) => w.working && active.has(w.dockId)).sort(byStart);
   return new Set(working.slice(0, MAX_CREW).map((w) => w.dockId));
+}
+
+/** Earliest started first, then by dock id: the same order on every client. */
+function byStart(a: DisassemblyWork, b: DisassemblyWork): number {
+  return a.asOf - b.asOf || (a.dockId < b.dockId ? -1 : a.dockId > b.dockId ? 1 : 0);
+}
+
+/** 🔧 Its crew's records once a job's labor has run out by `now`: each robot
+ *  of the crew stopped when the labor ran out, credited for its work up to
+ *  then and never for the time since, which it spent back on its dock while
+ *  the module waited to come off (a blocker, or the deed holder away); all
+ *  of them together never past the job's labor. None while labor is left at
+ *  `now`. robotDoc writes them before raising the job's labor (the module
+ *  grew), so the raised job counts none of the wait. */
+export function workRanOut(
+  record: DisassemblyJobRecord,
+  work: Iterable<DisassemblyWork>,
+  active: ReadonlySet<string>,
+  now: number,
+): DisassemblyWork[] {
+  if (record.finishedAt !== undefined) return [];
+  const mine = [...work].filter((w) => w.roomId === record.roomId && w.startedAt === record.startedAt);
+  const job = jobFromWork(record, mine, active);
+  const due = jobDueAt(job);
+  if (due === null || due > now) return [];
+  let left = jobLaborMs(record) - mine.reduce((t, w) => t + w.ms, record.doneMs);
+  const out: DisassemblyWork[] = [];
+  for (const w of mine.filter((m) => job.crew.includes(m.dockId)).sort(byStart)) {
+    const credit = Math.max(0, Math.min(due - w.asOf, left));
+    left -= credit;
+    out.push({ ...w, ms: w.ms + credit, asOf: w.asOf + credit, working: false });
+  }
+  return out;
 }
 
 /** When the labor runs out at the current crew, or null (already finished,

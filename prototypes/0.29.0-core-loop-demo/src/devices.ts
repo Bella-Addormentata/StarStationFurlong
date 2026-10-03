@@ -4213,9 +4213,11 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const candidates = deps.disassemblyCandidates?.() ?? [];
     const may = mayTakeApart();
     const pick = (c: DisassemblyCandidate): string => {
-      const on = c.roomId === target;
-      const usable = may && !on && c.blocked === null;
       const open = jobs.find((j) => j.roomId === c.roomId && j.finishedAt === undefined);
+      // On it while its job is open: a module re-joined after the robot's
+      // job on it ended is picked again, for a fresh job (assignDisassembly).
+      const on = c.roomId === target && open !== undefined;
+      const usable = may && !on && c.blocked === null;
       const done = open ? ` · ${Math.floor(jobFraction(open, now) * 100)}% done` : '';
       return `<button data-dis-target="${escAttr(c.roomId)}" ${usable ? '' : 'disabled'} style="
         display:flex; justify-content:space-between; align-items:center; gap:8px;
