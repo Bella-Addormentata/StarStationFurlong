@@ -38,7 +38,7 @@ import {
 import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
-import { readStore, shipsAroundPlanet } from './planetSummary';
+import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
@@ -47,7 +47,7 @@ import { shipDocBound } from './shipDoc';
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { readResolvedFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
-import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
+import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -93,11 +93,20 @@ type Source =
       stations: Array<{ record: StationRecord; modules: number }>;
       ships: FarShipInput[];
       key: string;
+      /** See stationYaw. */
+      yaw: number;
     }
-  | { mode: 'sun'; move: StationMove; key: string };
+  | { mode: 'sun'; move: StationMove; key: string; yaw: number };
 
-/** A flight's transfer rebuilt from its record: the Hohmann ellipse between
- *  the two stations' orbits, pinned to the record's own times. */
+/** The far frame is the station's (its welcome room's): the iso scene is
+ *  drawn in the current room's, which atlasLayout anchors at zero yaw, so a
+ *  room turned against the welcome room turns the planet with it. Zero when
+ *  the welcome room is out of reach (or is the current room). */
+function stationYaw(welcomeRoomId: string | undefined, roomId: string | undefined): number {
+  if (!welcomeRoomId || !roomId || welcomeRoomId === roomId) return 0;
+  return atlasLayout(roomId, MAX_ENTRIES).find((p) => p.roomId === welcomeRoomId)?.rotY ?? 0;
+}
+
 /** Where a flight record's location is: a station, or open orbit (174's
  *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
 type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
@@ -126,22 +135,29 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
   return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
 }
 
+/** A flight's transfer rebuilt from its record: the Hohmann ellipse between
+ *  the two ends' orbits, pinned to the record's own times. `flight` names it
+ *  by what its record says (who flies, and the two ends as named there). */
 function flightPlan(
-  from: Place | undefined,
-  to: Place | undefined,
+  flight: readonly string[],
   departedAt: number,
   etaAt: number,
+  ends: () => readonly [Place | undefined, Place | undefined],
 ): TransferPlan | null {
-  if (!from || !to || !(etaAt > departedAt)) return null;
+  if (!(etaAt > departedAt)) return null;
   // A flight's orbits are fixed once it is seen: planTransfer reads the ends
   // through today's trims, and a station-keeping burn after launch must not
-  // move a transfer already flown. Keyed by the flight (ends and times).
-  const key = JSON.stringify([from.id, to.id, departedAt, etaAt]);
+  // move a transfer already flown. The ends are placed only the first time,
+  // so a flight already drawn keeps its course once an end can no longer be
+  // placed at all (a learned station dropped after a move, say).
+  const key = JSON.stringify([...flight, departedAt, etaAt]);
   const known = frozenPlans.get(key);
   if (known) {
     known.seenAt = gatherNow;
     return known.plan;
   }
+  const [from, to] = ends();
+  if (!from || !to) return null;
   const planned = planTransfer(from, to, departedAt - 1);
   const plan = planned ? { ...planned, departAt: departedAt, arriveAt: etaAt } : null;
   if (plan) frozenPlans.set(key, { plan, seenAt: gatherNow });
@@ -160,9 +176,6 @@ function pruneFrozenPlans(now: number): void {
   }
 }
 
-/** Modules to draw for a station: the rooms of its atlas component that
- *  the (capped) atlas actually holds. A component also names door targets
- *  with no entry, which peers control, so those never count. */
 /** Between planets right now. A stay-put pin move (stationMove.isPinMove,
  *  written after an arrival) is a station settled at its slot, never a
  *  transfer. */
@@ -180,6 +193,9 @@ function betweenPlanets(m: StationMove): boolean {
   return planetById(m.fromPlanetId).id !== planetById(m.toPlanetId).id;
 }
 
+/** Modules to draw for a station: the rooms of its atlas component that
+ *  the (capped) atlas actually holds. A component also names door targets
+ *  with no entry, which peers control, so those never count. */
 function modulesOf(station: StationRecord, components: Set<string>[], atlas: Record<string, unknown>): number {
   if (!station.welcomeRoomId) return 1;
   const component = components.find((c) => c.has(station.welcomeRoomId));
@@ -189,9 +205,18 @@ function modulesOf(station: StationRecord, components: Set<string>[], atlas: Rec
   return Math.min(MAX_ENTRIES, Math.max(1, n));
 }
 
+/** What is out there now. Old plans are dropped after the read, not before
+ *  it, so a flight it looks up is kept however long the far pass was off. */
 function gather(now: number): Source {
   gatherNow = now;
-  pruneFrozenPlans(now);
+  try {
+    return readSource(now);
+  } finally {
+    pruneFrozenPlans(now);
+  }
+}
+
+function readSource(now: number): Source {
   const roomId = currentRoomId();
   const atlas = readAtlas();
   const all = listStations(atlas);
@@ -211,17 +236,32 @@ function gather(now: number): Source {
     const rec = readResolvedFlight(now);
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
-      aboard = flightPlan(
+      const to = rec.destinationId;
+      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => [
         placeOf(rec.locationId, all, leftAt, now),
-        placeOf(rec.destinationId, all, leftAt, now),
-        rec.departedAt,
-        rec.etaAt,
-      );
+        placeOf(to, all, leftAt, now),
+      ]);
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
     }
     if (!aboard && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    // Redocking: the ship has arrived where its destination was when it cast
+    // off (destinationAt), which a move since then has left: it stays on that
+    // orbit until the dock completes, not at the station's new place.
+    if (!aboard && !adrift && rec.status === 'redocking') {
+      const was = rec.destinationAt ? adriftPlace(rec.destinationAt) : null;
+      const place: Place | undefined = was
+        ? { id: rec.locationId, planetId: planetById(was.planetId).id, orbitSlot: was.orbitSlot }
+        : placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
+      const station = all.find((s) => s.id === rec.locationId);
+      // A destination still in transit is listed at its origin until it arrives,
+      // so a matching slot proves nothing: the ship stays on its own orbit.
+      if (place && (!station || reallyMoving(station, now)
+        || planetById(station.planetId).id !== place.planetId || station.orbitSlot !== place.orbitSlot)) {
+        adrift = place;
+      }
+    }
   }
 
   // Not in a known station (offline, or before the first join): stand in
@@ -235,10 +275,11 @@ function gather(now: number): Source {
   // The sun view only while the move really has a course right now (a
   // malformed record, say both ends on one planet, has none): otherwise the
   // planet view below, never an empty backdrop.
+  const yaw = me ? stationYaw(me.welcomeRoomId, roomId) : 0;
   if (me && reallyMoving(me, now) && me.move) {
     const m = me.move;
     // JSON, not a joined string: ids come from peers and may hold any delimiter.
-    return { mode: 'sun', move: m, key: JSON.stringify([
+    return { mode: 'sun', move: m, yaw, key: JSON.stringify([
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
       ]) };
   }
@@ -272,22 +313,30 @@ function gather(now: number): Source {
   const byRoom = (room: string | undefined, leftAt: number) =>
     placeOf(room ? all.find((s) => s.welcomeRoomId === room)?.id : undefined, all, leftAt, now);
   const ships: FarShipInput[] = [];
-  // Every ship in flight anywhere: its room is also listed as a one-module
-  // station, which may sit around another planet than its summary, so it is
-  // hidden in every view, not only its own planet's.
+  // Every known ship anywhere, flying or docked: its room is also listed as a
+  // one-module station (a dock berth leaves it its own atlas component), which
+  // may sit around another planet than the ship, so it is hidden in every
+  // view, not only its own planet's. Only flights are drawn, on their courses.
   const flying = new Set<string>();
-  for (const ship of Object.values(readStore(now).ships)) {
-    if (ship.status === 'in-flight' && !ship.retired) flying.add(ship.roomId);
-  }
-  for (const ship of shipsAroundPlanet(planetId, now)) {
-    if (ship.roomId === roomId || ship.status !== 'in-flight') continue;
-    if (ship.retired) continue;
-    if (ship.departedAt === undefined || ship.etaAt === undefined) continue;
-    const plan = flightPlan(byRoom(ship.fromRoom, ship.departedAt), byRoom(ship.toRoom, ship.departedAt), ship.departedAt, ship.etaAt);
+  const known = Object.values(readStore(now).ships).filter((ship) => !ship.retired);
+  for (const ship of known) flying.add(ship.roomId);
+  const inFlight = known.filter((ship) => ship.status === 'in-flight');
+  // Each flight is placed by its own plan's planet, not the summary's
+  // planetId: that follows the origin station's current record, which a
+  // move since the ship left has taken to another planet.
+  for (const ship of inFlight) {
+    if (ship.roomId === roomId) continue;
+    const { fromRoom, toRoom, departedAt } = ship;
+    if (!fromRoom || !toRoom || departedAt === undefined || ship.etaAt === undefined) continue;
+    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => [
+      byRoom(fromRoom, departedAt),
+      byRoom(toRoom, departedAt),
+    ]);
+    if (!plan || plan.from.planet.id !== planetId) continue;
     // Only ships on their transfer right now: the gather re-runs every
     // REFRESH_MS, so a ship joins the key at departure and leaves it at
     // arrival, and the static frame is rebuilt at both.
-    if (plan && transferPointAt(plan, now).leg === 'transfer') {
+    if (transferPointAt(plan, now).leg === 'transfer') {
       ships.push({ id: `ship:${ship.roomId}`, name: ship.name, plan });
     }
   }
@@ -296,8 +345,8 @@ function gather(now: number): Source {
     // Never the viewer: its own station, nor the one-module station the room
     // it stands in (a ship, say) is listed as.
     .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
-    // A ship in flight is listed as its own one-module station too; it is
-    // drawn on its transfer instead, never also on a circular orbit.
+    // A ship is listed as its own one-module station too; a flying one is
+    // drawn on its transfer instead, a docked one not at all.
     .filter((s) => !flying.has(s.welcomeRoomId))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
@@ -314,7 +363,7 @@ function gather(now: number): Source {
       s.plan.from.radiusKm.toFixed(3), s.plan.from.phase0, s.plan.to.radiusKm.toFixed(3), s.plan.to.phase0,
     ]),
   ]);
-  return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key };
+  return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key, yaw };
 }
 
 /** The layout now; `withPaths` samples the courses too, which only a
@@ -537,10 +586,13 @@ function buildFrame(layout: FarLayout): void {
 }
 
 /** Move everything to where it is now. */
-function poseFrame(layout: FarLayout): void {
+function poseFrame(layout: FarLayout, yaw: number): void {
   if (!frame) return;
-  frame.position.set(layout.transform.position.x, layout.transform.position.y, layout.transform.position.z);
-  frame.rotation.set(0, layout.transform.rotationY, 0);
+  // The layout is in the station's frame; turn it (about the viewer, the
+  // origin) into the current room's, with the sun turned the same way.
+  const p = layout.transform.position;
+  frame.position.set(p.x, p.y, p.z).applyAxisAngle(UP, yaw);
+  frame.rotation.set(0, layout.transform.rotationY + yaw, 0);
   for (const b of layout.bodies) {
     const entry = bodies.get(bodyKey(b));
     if (!entry) continue;
@@ -551,12 +603,13 @@ function poseFrame(layout: FarLayout): void {
   }
   if (sunLight) {
     const d = layout.sunDirection;
-    sunLight.position.set(d.x * 1e5, d.y * 1e5, d.z * 1e5);
+    sunLight.position.set(d.x * 1e5, d.y * 1e5, d.z * 1e5).applyAxisAngle(UP, yaw);
     sunLight.target.position.set(0, 0, 0);
   }
 }
 
 const tmp = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0);
 
 /** Keep every impostor at its on-screen size. */
 function sizeBodies(heightPx: number): void {
@@ -594,7 +647,7 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
       buildFrame(layout);
       builtKey = source.key;
     }
-    poseFrame(layout);
+    poseFrame(layout, source?.yaw ?? 0);
   }
 
   const cam = farCamera!;

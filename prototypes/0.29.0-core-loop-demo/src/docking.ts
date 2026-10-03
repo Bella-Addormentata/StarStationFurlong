@@ -129,7 +129,7 @@ import {
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
-  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumberHere, stationGates,
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumberHere, stationGates, steppedGateNumberHere,
 } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -2079,13 +2079,11 @@ export class DoorDockingPortSystem {
           if (first !== null) writeDoorPolicy(doorId, { ...policy, gate: first });
           return;
         }
-        const taken = new Set<number>();
-        for (const g of stationGates(readAtlas(), roomId)) if (g.roomId !== roomId) taken.add(g.gate);
-        for (const [d, g] of Object.entries(own)) if (d !== doorId) taken.add(g);
+        // The station is read as freeGateNumberHere reads it, so a room the
+        // local atlas has let go still holds its numbers.
         const step = el.dataset.dockAction === "gate-up" ? 1 : -1;
-        let gate = policy.gate + step;
-        while (gate >= 1 && gate <= MAX_GATE && taken.has(gate)) gate += step;
-        if (gate < 1 || gate > MAX_GATE) return; // nothing free that way
+        const gate = steppedGateNumberHere(roomId, own, doorId, policy.gate, step);
+        if (gate === null) return; // nothing free that way
         writeDoorPolicy(doorId, { ...policy, gate });
       } else if (el.dataset.dockAction === "gate-access") {
         // ⚓🚦 The owner decides who may dock here: OPEN → PASS (captains
