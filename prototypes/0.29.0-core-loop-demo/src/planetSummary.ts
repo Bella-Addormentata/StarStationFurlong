@@ -898,7 +898,11 @@ function pruneMap(
 export function publishPlanetSummary(now = Date.now()): void {
   if (!alive() || !ctx) return;
   const store = readStore(now);
-  const here = ctx.currentStation();
+  // A free ship's own one-room stand-in is no station: published, it would
+  // stand for good and peers would learn the ship as one (applyLearned
+  // skips it too).
+  const found = ctx.currentStation();
+  const here = found && !isShipStandIn(found, mayBeShipRoom()) ? found : null;
   if (here && here.welcomeRoomId && here.welcomeRoomId.length <= MAX_ID_LEN) {
     const room = ctx.currentRoom?.() || undefined;
     const local = ctx.localTrim();

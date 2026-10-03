@@ -566,6 +566,20 @@ describe('sharing through the room doc', () => {
     expect(shipsAroundPlanet(ARIS)).toEqual([]);
   });
 
+  it('never publishes a ship\'s own one-room stand-in as a station', () => {
+    const doc = new Y.Doc();
+    const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
+    expect(doc.getMap('stationSummaries').has('room-ship')).toBe(false);
+    expect(readStore().stations['room-ship']).toBeUndefined();
+    // The same one-room place, known to be no ship, is a station.
+    unbindPlanetSummaryForTest();
+    bindPlanetSummaryDoc(doc, install(null, {
+      currentStation: () => standIn, currentRoom: () => 'room-ship', notShipRoom: () => 'room-ship',
+    }));
+    expect(doc.getMap('stationSummaries').has('room-ship')).toBe(true);
+  });
+
   it('tells its own views about what it just published', () => {
     registerStation(record());
     let local: OrbitTrim | null = null;
