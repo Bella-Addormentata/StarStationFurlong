@@ -33,8 +33,8 @@ import type { StationBerthRecord } from './stations';
 import { cleanStationSummary, foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
 import { destinationsFromRecords } from './stationDirectory';
-import { farDockPatch } from './dockRules';
-import { arrivalBerths } from './shipArrival';
+import { farDockPatch, farGateAdmitted } from './dockRules';
+import { arrivalBerths, planArrivalDock } from './shipArrival';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -1039,6 +1039,39 @@ describe('who may dock at a gate', () => {
     expect(dock({ access: 'reserved', reservedFor: 'ship-1' }).action).toBe('write');
     expect(dock({ access: 'pass', granted: false })).toEqual({ action: 'refuse', reason: 'not-allowed' });
     expect(dock({ access: 'pass', granted: true }).action).toBe('write');
+  });
+
+  it("lets the far room's half decide when it was written but its answer was lost", () => {
+    // The far room writes its half only past its gate, and an unacknowledged
+    // write may stand: this side docks to match it, whatever this client's
+    // atlas holds of the gate (a gate for granted captains it cannot check).
+    expect(farGateAdmitted({ ok: false, reason: 'unreachable', unconfirmed: true })).toBe(true);
+    expect(farGateAdmitted({ ok: true, detail: 'written' })).toBe(true);
+    // Unanswered with nothing written, or never asked: the atlas decides.
+    expect(farGateAdmitted({ ok: false, reason: 'unreachable' })).toBe(false);
+    expect(farGateAdmitted(null)).toBe(false);
+  });
+
+  it("says a station's gates are shut to the ship rather than that it has no berth", () => {
+    const port = { doorId: 'north', state: { kind: 'free' as const } };
+    const address = seed('room-b');
+    // Every gate closed, or reserved for another ship.
+    expect(planArrivalDock({
+      station: {
+        berths: [
+          { address, farDoor: 'south', gate: 1, access: 'closed' },
+          { address, farDoor: 'east', gate: 2, access: 'reserved', reservedFor: 'ship-2' },
+        ],
+      },
+      remembered: null, ports: [port], shipRoomId: 'ship-1',
+    })).toEqual({ kind: 'none', reason: 'no-berth', barred: true });
+    // Gates only in rooms this client cannot address.
+    expect(planArrivalDock({
+      station: { berths: [], unaddressed: [{ roomId: 'room-c', farDoor: 'south', gate: 3 }] }, remembered: null, ports: [port],
+    })).toEqual({ kind: 'none', reason: 'no-berth', barred: true });
+    // A station known to have no gates, or one that names no berth at all, has none.
+    expect(planArrivalDock({ station: { berths: [] }, remembered: null, ports: [port] })).toEqual({ kind: 'none', reason: 'no-berth' });
+    expect(planArrivalDock({ station: {}, remembered: null, ports: [port] })).toEqual({ kind: 'none', reason: 'no-berth' });
   });
 
   it('reads the owner\'s grant at the door for a gate open to granted captains', () => {

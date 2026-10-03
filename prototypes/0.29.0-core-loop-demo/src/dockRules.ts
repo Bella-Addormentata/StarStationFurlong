@@ -201,6 +201,14 @@ export function farWriteMayStand(far: FarDockResult): boolean {
   return far.ok ? far.detail === 'written' : far.reason === 'unreachable' && far.unconfirmed === true;
 }
 
+/** ⚓🚦 Did the far gate admit this DOCK? When the far room said so, and when
+ *  it wrote its half but the answer was lost (farWriteMayStand): it writes
+ *  only past its gate, and that half may stand, so this side matches it
+ *  rather than fall back on what this client's atlas holds of the gate. */
+export function farGateAdmitted(far: FarDockResult | null): boolean {
+  return far !== null && (far.ok || farWriteMayStand(far));
+}
+
 // ── The transit mirror ───────────────────────────────────────────────────────
 
 /**

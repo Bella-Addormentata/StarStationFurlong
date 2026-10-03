@@ -61,6 +61,7 @@ import {
   redockRecord,
   holdsOurRedock,
   farWriteMayStand,
+  farGateAdmitted,
   initiateChainRefusal,
   stampAfter,
   FAR_DOCK_REFUSAL,
@@ -3020,8 +3021,10 @@ export class DoorDockingPortSystem {
     // ⚓🚦 The far room could not answer, so its gate could not admit us:
     // dock one-sided only where this client's atlas knows the gate is open
     // (or knows nothing of it). A gate for granted captains cannot be
-    // checked from here, so it waits for the far room too.
-    const knownAccess = !far?.ok && farDoor ? readAtlas()[port.roomId]?.gateAccess?.[farDoor] : undefined;
+    // checked from here, so it waits for the far room too. Not when the far
+    // room wrote its half before the answer was lost (farGateAdmitted): its
+    // gate let us in, and this side must match the half that may stand.
+    const knownAccess = !farGateAdmitted(far) && farDoor ? readAtlas()[port.roomId]?.gateAccess?.[farDoor] : undefined;
     if (knownAccess && !gateAdmits(knownAccess, roomId, false)) {
       this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL["not-allowed"], tone: "bad" }, roomId);
       return false;

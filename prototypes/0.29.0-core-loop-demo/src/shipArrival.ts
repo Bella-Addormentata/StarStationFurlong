@@ -122,7 +122,10 @@ export type ArrivalPlan =
       /** ⚓🚦 The gate being docked at, when the berth has one. */
       gate?: number;
     }
-  | { kind: 'none'; reason: 'no-berth' | 'no-port' | 'already-docked' };
+  /** ⚓🚦 `barred`, with no-berth: the station lists gates, but none this ship
+   *  may dock at from here (closed to it, reserved for another ship, or in a
+   *  room this client cannot address). */
+  | { kind: 'none'; reason: 'no-berth' | 'no-port' | 'already-docked'; barred?: true };
 
 /**
  * ⚓🚦 Every berth an arriving ship may try, in order:
@@ -237,7 +240,10 @@ export function planArrivalDock(input: {
       || [...(berth ? [berth] : []), ...candidates].some((b) => sameRoom((p.state as { address: string }).address, b.address))))) {
     return { kind: 'none', reason: 'already-docked' };
   }
-  if (!berth) return { kind: 'none', reason: 'no-berth' };
+  if (!berth) {
+    const listsGates = (input.station.berths?.length ?? 0) > 0 || (input.station.unaddressed?.length ?? 0) > 0;
+    return { kind: 'none', reason: 'no-berth', ...(listsGates ? { barred: true as const } : {}) };
+  }
   // Open = free to dock AND ours to use right now: a busy or locked port
   // would refuse DOCK after its door record was already re-pointed.
   const open = (p: ArrivalPort) =>
@@ -357,6 +363,9 @@ export type ArrivalOutcome =
   | { kind: 'docked'; stationName: string; gate?: number }
   | {
       kind: 'none';
+      /** ⚓🚦 With no-berth: the station's gates are all shut to this ship
+       *  from here (ArrivalPlan's `barred`). */
+      barred?: true;
       stationName: string;
       /** `berths-taken`: every berth tried refused. Usually taken, closed or
        *  unreachable, but redockPort also refuses for its own reasons (no
@@ -453,7 +462,9 @@ export function completeArrival(
   const shipRoomId = currentRoomId();
   const plan = planArrivalDock({ station, remembered, ports, gate: opts.gate, shipRoomId });
   if (plan.kind === 'none') {
-    const outcome: ArrivalOutcome = { kind: 'none', stationName: station.name, reason: plan.reason };
+    const outcome: ArrivalOutcome = {
+      kind: 'none', stationName: station.name, reason: plan.reason, ...(plan.barred ? { barred: true as const } : {}),
+    };
     if (plan.reason === 'already-docked') {
       writeFlightRecord({ status: 'docked', locationId: rec.locationId });
       return outcome;

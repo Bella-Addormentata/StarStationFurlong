@@ -2182,6 +2182,8 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
         : outcome.reason === 'no-port'
         ? `Arrived at ${outcome.stationName} — no free dock port to dock with. Fit one at a door (door panel › +DOCK).`
+        : outcome.barred
+        ? `Arrived at ${outcome.stationName} — none of its gates is open to this ship from here (closed to it, reserved for another ship, or in a module this game holds no pass for). Ask the station's owner, or dock from a door panel.`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
   });
 }
