@@ -478,14 +478,14 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       const roll = (n: number) => (n + 10) % 10;
       cells += `
         <div data-alt-place="${place}" title="Scroll to turn the ${place === 0 ? 'units' : `${(10 ** place).toLocaleString('en-US')}s`} wheel" style="display:flex; flex-direction:column; align-items:center; width:26px; cursor:ns-resize; user-select:none;">
-          <button type="button" data-alt-step="${place}:1" aria-label="Up ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:3px 3px 0 0; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▲</button>
+          <button type="button" tabindex="-1" data-alt-step="${place}:1" aria-label="Up ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:3px 3px 0 0; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▲</button>
           <div style="position:relative; width:24px; height:46px; overflow:hidden; background:linear-gradient(#000 0%, #1a0d00 22%, #120800 50%, #1a0d00 78%, #000 100%); border:1px solid ${sel ? 'rgba(255,179,0,0.85)' : 'rgba(255,179,0,0.25)'}; border-radius:3px; box-shadow:inset 0 0 6px rgba(0,0,0,0.95);">
             <div style="position:absolute; left:0; right:0; top:-3px; text-align:center; font-size:11px; color:rgba(255,179,0,0.18);">${roll(d + 1)}</div>
             <div style="position:absolute; left:0; right:0; top:10px; text-align:center; font-size:22px; font-weight:800; color:rgba(255,179,0,0.07);">8</div>
             <div style="position:absolute; left:0; right:0; top:10px; text-align:center; font-size:22px; font-weight:800; color:${lit ? LED : 'rgba(255,179,0,0.22)'}; text-shadow:${lit ? LED_GLOW : 'none'};">${d}</div>
             <div style="position:absolute; left:0; right:0; bottom:-3px; text-align:center; font-size:11px; color:rgba(255,179,0,0.18);">${roll(d - 1)}</div>
           </div>
-          <button type="button" data-alt-step="${place}:-1" aria-label="Down ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:0 0 3px 3px; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▼</button>
+          <button type="button" tabindex="-1" data-alt-step="${place}:-1" aria-label="Down ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:0 0 3px 3px; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▼</button>
         </div>`;
       // A thin gap marks the thousands, as the window's "1,250" would.
       if (place === 3) cells += '<div style="width:4px;"></div>';
@@ -837,6 +837,10 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       turnAltitude(place, -notches);
     }, { passive: false });
     altWindow.addEventListener('keydown', (e) => {
+      // The window's own keys only: the digit buttons inside it are for the
+      // pointer (out of the tab order, as each refresh redraws them), and a
+      // key on one never engages.
+      if (e.target !== altWindow) return;
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
         turnAltitude(altPlace, e.key === 'ArrowUp' ? 1 : -1);

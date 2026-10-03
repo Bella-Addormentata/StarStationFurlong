@@ -347,15 +347,24 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
     if (list) list.push(m); else byStation.set(station, [m]);
   }
   const bookedOf = (m: StationMove) => (m.settles ?? m).bookedAt ?? (m.settles ?? m).departAt;
-  interface Claim { key: string; station: string; planet: string; radiusKm: number; at: number; until: number }
+  const isChange = (m: StationMove) => m.mode === 'orbit' && !m.settles && !!m.orbit;
+  interface Claim { key: string; station: string; planet: string; radiusKm: number; at: number; held: (t: number) => boolean }
+  const accepted = new Set<string>();
+  // A claim ends when a later move of its station leaves: any other move,
+  // or an altitude change that was itself accepted. One that lost never
+  // flew, so the orbit before it is still held.
+  const endedBy = (list: StationMove[], after: number, t: number) => list.some((o) => bookedOf(o) > after
+    && o.departAt <= t && (!isChange(o) || accepted.has(altitudeMoveKey(o))));
   const claims: Claim[] = [];
   for (const [station, list] of byStation) {
     for (const m of list) {
-      let next = Infinity;
-      for (const o of list) if (bookedOf(o) > bookedOf(m)) next = Math.min(next, o.departAt);
       const key = altitudeMoveKey(m);
-      if (m.mode === 'orbit' && !m.settles && m.orbit) {
-        claims.push({ key, station, planet: planetById(m.toPlanetId).id, radiusKm: m.orbit.toRadiusKm, at: bookedOf(m), until: next });
+      const booked = bookedOf(m);
+      if (isChange(m)) {
+        claims.push({
+          key, station, planet: planetById(m.toPlanetId).id, radiusKm: m.orbit!.toRadiusKm, at: booked,
+          held: (t) => !endedBy(list, booked, t),
+        });
         continue;
       }
       const src = m.settles ?? m;
@@ -363,18 +372,22 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
       const cancelled = !!m.settles && m.departAt < m.settles.arriveAt;
       claims.push({
         key, station, planet: planetById(src.fromPlanetId).id, radiusKm: src.fromOrbit.radiusKm,
-        at: src.fromOrbit.since ?? 0, until: cancelled ? next : src.departAt,
+        at: src.fromOrbit.since ?? 0, held: cancelled ? (t) => !endedBy(list, booked, t) : (t) => t < src.departAt,
       });
     }
   }
+  // In claim order, so every altitude change that could end an earlier claim
+  // by a given time (booked no later than it leaves) is settled before any
+  // claim made at that time is weighed.
   claims.sort((a, b) => a.at - b.at || (a.station < b.station ? -1 : a.station > b.station ? 1 : 0)
     || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  const accepted: Claim[] = [];
+  const kept: Claim[] = [];
   const lost = new Set<string>();
   for (const c of claims) {
-    const beaten = accepted.some((a) => a.station !== c.station && a.planet === c.planet
-      && Math.abs(a.radiusKm - c.radiusKm) < MIN_ORBIT_SEPARATION_KM && a.until > c.at);
-    if (beaten) lost.add(c.key); else accepted.push(c);
+    const beaten = kept.some((a) => a.station !== c.station && a.planet === c.planet
+      && Math.abs(a.radiusKm - c.radiusKm) < MIN_ORBIT_SEPARATION_KM && a.held(c.at));
+    if (beaten) lost.add(c.key);
+    else { kept.push(c); accepted.add(c.key); }
   }
   return lost;
 }

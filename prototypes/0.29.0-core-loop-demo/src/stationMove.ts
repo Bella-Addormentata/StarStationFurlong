@@ -104,14 +104,18 @@ function inAltitudeBand(radiusKm: number, planetId: string, slackKm: number): bo
 
 /** 🎚️ Does an altitude change fit its planet: it leaves from inside the band
  *  (a trimmed orbit, so with the trim's slack) and ends inside it, clear of
- *  every other slot's own orbit (which the planner always keeps clear)? */
-function orbitChangeFits(o: OrbitChange, planetId: string, slot: number): boolean {
+ *  every other slot's own orbit (which the planner always keeps clear), and
+ *  its times and new orbit are the Hohmann transfer its two orbits make from
+ *  its departure (planOrbitChange), so it is flown the way it is drawn? */
+function orbitChangeFits(o: OrbitChange, planetId: string, slot: number, departAt: number, arriveAt: number): boolean {
   if (!inAltitudeBand(o.fromRadiusKm, planetId, MAX_TRIM_KM) || !inAltitudeBand(o.toRadiusKm, planetId, 0)) return false;
-  const id = planetById(planetId).id;
+  const planet = planetById(planetId);
   for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
-    if (s !== slot && Math.abs(orbitForSlot(id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
+    if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
   }
-  return true;
+  const plan = planOrbitChange(circularOrbit(planet, o.fromRadiusKm, o.fromPhase0), o.toRadiusKm, departAt);
+  return !!plan && plan.departAt === departAt && plan.arriveAt === arriveAt
+    && Math.abs(wrapAngle(plan.to.phase0 - o.toPhase0)) < 1e-6;
 }
 
 /** 🎚️ Shape guard for an altitude change's two orbits. */
@@ -142,7 +146,7 @@ export function isStationMove(v: unknown): v is StationMove {
       // An altitude change stays around its planet, in its slot.
       || (r.mode === 'orbit' && r.tugRoomId === undefined && isOrbitChangeRecord(r.orbit)
         && r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot
-        && orbitChangeFits(r.orbit, r.toPlanetId as string, r.toSlot as number)))
+        && orbitChangeFits(r.orbit, r.toPlanetId as string, r.toSlot as number, r.departAt as number, r.arriveAt as number)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.orbit === undefined || r.mode === 'orbit')
     && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)

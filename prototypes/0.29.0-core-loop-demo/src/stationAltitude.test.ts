@@ -69,7 +69,7 @@ import {
   stationLeftPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
-import { altitudeChangedSince, altitudeChangesSince, setAltitudeHistory } from './stations';
+import { altitudeChangedSince, altitudeChangesSince, altitudeMoveKey, lostAltitudeClaims, setAltitudeHistory } from './stations';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -109,6 +109,17 @@ const climbTo = (altitudeKm: number, over: Partial<MoveContext> = {}): StationMo
   const plan = planStationAltitude(ctx(over), altitudeKm);
   if (!plan.ok) throw new Error(plan.refusal);
   return plan.move;
+};
+
+/** Another station's altitude change from its slot's orbit, flown as the
+ *  planner would plan it (the move guard checks the transfer). */
+const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => {
+  const plan = planOrbitChange(orbitForSlot(SOV, slot), SOV_R + toAlt, bookedAt)!;
+  return {
+    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
+    departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+    orbit: { fromRadiusKm: plan.from.radiusKm, fromPhase0: plan.from.phase0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0 },
+  };
 };
 
 describe('the transfer between two altitudes', () => {
@@ -387,11 +398,6 @@ describe('ferry routes to a station on an altitude orbit', () => {
 });
 
 describe('Copilot round 1', () => {
-  const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => ({
-    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
-    departAt: bookedAt, arriveAt: bookedAt + 60_000, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
-    orbit: { fromRadiusKm: orbitForSlot(SOV, slot).radiusKm, fromPhase0: 0, toRadiusKm: SOV_R + toAlt, toPhase0: 0 },
-  });
 
   it('keeps every other slot\'s own orbit clear, held or not', () => {
     // OTHER holds slot 1 but flies 1,500 km: slot 1's own orbit stays kept.
@@ -475,11 +481,6 @@ describe('Copilot round 1', () => {
 });
 
 describe('Copilot round 3', () => {
-  const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => ({
-    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
-    departAt: bookedAt, arriveAt: bookedAt + 60_000, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
-    orbit: { fromRadiusKm: orbitForSlot(SOV, slot).radiusKm, fromPhase0: 0, toRadiusKm: SOV_R + toAlt, toPhase0: 0 },
-  });
   const orbitOf = (list: StationRecord[], id: string) => list.find((s) => s.id === id)?.orbit?.radiusKm;
   const THIRD: StationRecord = { id: 'third', name: 'THIRD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'third-room' };
 
@@ -492,8 +493,15 @@ describe('Copilot round 3', () => {
     expect(isStationMove(withOrbit({ fromRadiusKm: 10 }))).toBe(false);
     // Slot 0's own orbit (400 km) belongs to slot 0, not this slot-1 station.
     expect(isStationMove(withOrbit({ toRadiusKm: orbitForSlot(SOV, 0).radiusKm + 20 }))).toBe(false);
-    // A trimmed start is fine.
-    expect(isStationMove(withOrbit({ fromRadiusKm: orbitForSlot(SOV, 1).radiusKm + 15 }))).toBe(true);
+    // A trimmed start is fine, flown as the transfer it makes.
+    const trimmed = planOrbitChange(circularOrbit(planetById(SOV), orbitForSlot(SOV, 1).radiusKm + 15, 0.3), SOV_R + 1_000, NOW)!;
+    expect(isStationMove({
+      ...ok, departAt: trimmed.departAt, arriveAt: trimmed.arriveAt,
+      orbit: { fromRadiusKm: trimmed.from.radiusKm, fromPhase0: trimmed.from.phase0, toRadiusKm: SOV_R + 1_000, toPhase0: trimmed.to.phase0 },
+    })).toBe(true);
+    // Its times and new orbit must be that transfer's.
+    expect(isStationMove({ ...ok, arriveAt: ok.departAt + 1 })).toBe(false);
+    expect(isStationMove(withOrbit({ toPhase0: ok.orbit!.toPhase0 + 0.5 }))).toBe(false);
     const thrust: StationMove = {
       ...ok, mode: 'thrusters', toPlanetId: 'planet-aris', orbit: undefined, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW },
     };
@@ -539,7 +547,7 @@ describe('Copilot round 3', () => {
     const climbed = listStations({}, [], NOW + 200_000).find((s) => s.id === DEFAULT_STATION_ID)!;
     const plan = planStationMove(ctx({ station: climbed, now: NOW + 200_000 }), 'planet-aris');
     if (!plan.ok) throw new Error(plan.refusal);
-    expect(plan.move.fromOrbit).toEqual({ radiusKm: SOV_R + 1_000, phase0: 0, since: NOW });
+    expect(plan.move.fromOrbit).toEqual({ radiusKm: SOV_R + 1_000, phase0: climbed.orbit!.phase0, since: NOW });
   });
 
   it('draws the altitude kept until departure on the holotable', () => {
@@ -583,11 +591,6 @@ describe('Copilot round 3', () => {
 });
 
 describe('Copilot round 5', () => {
-  const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => ({
-    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
-    departAt: bookedAt, arriveAt: bookedAt + 60_000, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
-    orbit: { fromRadiusKm: orbitForSlot(SOV, slot).radiusKm, fromPhase0: 0, toRadiusKm: SOV_R + toAlt, toPhase0: 0 },
-  });
 
   it('refuses a pin of an altitude change', () => {
     const climb = climbOf('other', 'other-room', 1, 1_000, NOW);
@@ -629,5 +632,23 @@ describe('Copilot round 5', () => {
     } finally {
       setAltitudeHistory(null);
     }
+  });
+
+  it('a lost altitude change leaves the orbit before it held', () => {
+    // A holds 1,000 km, B 2,000 km; A asks for 2,020 km and loses to B; then
+    // C asks for 1,020 km: A is still at 1,000 km, so C loses.
+    const aHold = climbOf('a', 'a-room', 0, 1_000, NOW);
+    const bHold = climbOf('b', 'b-room', 1, 2_000, NOW + 10);
+    const aTry = { ...climbOf('a', 'a-room', 0, 2_020, NOW + 200_000), orbit: undefined } as StationMove;
+    const aPlan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, aHold.orbit!.toPhase0), SOV_R + 2_020, NOW + 200_000)!;
+    const aFails: StationMove = {
+      ...aTry, departAt: aPlan.departAt, arriveAt: aPlan.arriveAt,
+      orbit: { fromRadiusKm: aPlan.from.radiusKm, fromPhase0: aPlan.from.phase0, toRadiusKm: aPlan.to.radiusKm, toPhase0: aPlan.to.phase0 },
+    };
+    const cTry = climbOf('c', 'c-room', 2, 1_020, NOW + 400_000);
+    const lost = lostAltitudeClaims([aHold, bHold, aFails, cTry]);
+    expect(lost.has(altitudeMoveKey(aFails))).toBe(true);
+    expect(lost.has(altitudeMoveKey(cTry))).toBe(true);
+    expect(lost.has(altitudeMoveKey(aHold))).toBe(false);
   });
 });
