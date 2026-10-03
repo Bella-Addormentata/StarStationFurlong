@@ -56,6 +56,7 @@ import {
   ownStopBerth,
   passVerdict,
   personDeparts,
+  routeRoomReady,
   runKeeperPass,
   skipWhyOf,
   standingHold,
@@ -63,6 +64,7 @@ import {
   stayResumed,
 } from './routeKeeper';
 import type { KeeperGateResult, KeeperMemory, KeeperView } from './routeKeeper';
+import { YjsSync } from './network/YjsSync';
 import { arrivalRefusal, setBerthSeedResolver, type ShipDockingApi } from './shipArrival';
 import { bindShipDoc, readStationBerth, writeFuelLevel } from './shipDoc';
 import {
@@ -1224,5 +1226,63 @@ describe('the keeper over a running ferry', () => {
     // A checkpoint for a run that is not the route's is dropped by the writer.
     const s = start();
     expect(writeRouteCheckpoint(s.at + 1, holdCheckpoint(readShipRoute()!, 1, { at: s.arriveAt + SEC }), s.arriveAt + SEC)).toBe(false);
+  });
+});
+
+// ── 🛰️ Whose copy of the ship's room counts (routeRoomReady) ─────────────────
+
+/** The local node's answer as YjsSync reads it off the wire: an unsigned
+ *  SyncStep2 carrying `state` (y-sync varuints in a JSON envelope, behind a
+ *  u32 LE length). */
+function nodeSyncStep2(state: Uint8Array): Uint8Array {
+  const varUint = (n: number): number[] => {
+    const out: number[] = [];
+    while (n >= 0x80) {
+      out.push((n & 0x7f) | 0x80);
+      n >>>= 7;
+    }
+    out.push(n);
+    return out;
+  };
+  const payload = new Uint8Array([...varUint(0), ...varUint(1), ...varUint(state.length), ...state]);
+  const json = new TextEncoder().encode(JSON.stringify({
+    v: 1, room: 'ferry', kind: 'ysync', seq: 0, payload: btoa(String.fromCharCode(...payload)),
+  }));
+  const frame = new Uint8Array(4 + json.length);
+  new DataView(frame.buffer).setUint32(0, json.length, true);
+  frame.set(json, 4);
+  return frame;
+}
+
+describe("🛰️ whose copy of the ship's room the keeper may act on", () => {
+  it("a revisited room's cached snapshot is not its state, owner and name included: it waits for the node", async () => {
+    let toClient!: ReadableStreamDefaultController<Uint8Array>;
+    const channel = {
+      readable: new ReadableStream<Uint8Array>({ start: (c) => { toClient = c; } }),
+      writable: new WritableStream<Uint8Array>(),
+    };
+    const sync = new YjsSync({ roomId: 'ferry', channel, bootRecord: () => ({}) });
+    // main.ts applies the cached snapshot before the sync starts.
+    const cached = new Y.Doc();
+    cached.getMap('roomInfo').set('owner', 'owner-pub');
+    cached.getMap('roomInfo').set('name', 'Ferry');
+    Y.applyUpdate(sync.doc, Y.encodeStateAsUpdate(cached));
+    await sync.start();
+    expect(sync.doc.getMap('roomInfo').get('name')).toBe('Ferry');
+    expect(routeRoomReady(sync, true)).toBe(false);
+    expect(routeRoomReady(sync, false)).toBe(false);
+    // The node answers from its replica: the room's own copy when the room
+    // is hosted on it, maybe a stale one when its host is elsewhere.
+    toClient.enqueue(nodeSyncStep2(Y.encodeStateAsUpdate(cached)));
+    await sync.whenServerSynced;
+    expect(routeRoomReady(sync, true)).toBe(true);
+    expect(routeRoomReady(sync, false)).toBe(false);
+    await sync.stop();
+    toClient.close();
+  });
+
+  it('a room hosted elsewhere: a frame from its live host after the link', () => {
+    expect(routeRoomReady({ linkedSynced: true, serverSynced: false }, false)).toBe(true);
+    expect(routeRoomReady({ linkedSynced: true, serverSynced: true }, true)).toBe(true);
   });
 });

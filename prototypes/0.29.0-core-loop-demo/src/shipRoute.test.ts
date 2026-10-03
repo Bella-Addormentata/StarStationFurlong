@@ -1205,7 +1205,7 @@ describe('readResolvedFlight (A4)', () => {
     expect(writeRouteCheckpoint(run, pauseCheckpoint(route, 1, { at: clock }), clock)).toBe(true);
     expect(readRouteFlight()).toMatchObject({ paused: true });
     expect(routeRulesFlightNow()).toBe(false);
-    expect(resolveShipFlight()).toEqual({ flight: home, route: null });
+    expect(resolveShipFlight()).toEqual({ flight: home, route: null, places: null });
   });
 
   it("paused, the tanks may change, but the DEV menu's PLACE stays refused: the route still runs", () => {
@@ -1228,6 +1228,36 @@ describe('readResolvedFlight (A4)', () => {
       install();
       clock = onTime(route, start, 1)[0].depart + SEC;
       expect(readResolvedFlight()).toMatchObject({ locationId: DEFAULT_STATIONS[0].id, destinationId: DEFAULT_STATIONS[1].id });
+    } finally {
+      setStationDirectory(null);
+    }
+  });
+
+  it("🚚 places the ferry where the route copied its stops, though a stop's station has since moved planets", () => {
+    // This install lists stop 1's station around ARIS now: its move ended
+    // before the ferry's leg out of it.
+    const moved = [{ ...DEFAULT_STATIONS[0] }, { ...DEFAULT_STATIONS[1], planetId: 'planet-aris' }];
+    setStationDirectory({
+      stations: () => moved,
+      resolve: (id) => (id === 'st-0' ? moved[0].id : id === 'st-1' ? moved[1].id : null),
+    });
+    try {
+      const { route, start } = started();
+      install();
+      const on = onTime(route, start, 2);
+      clock = on[0].arrive + SEC;
+      expect(resolveShipFlight()).toMatchObject({
+        flight: { status: 'docked', locationId: moved[1].id },
+        places: { from: { id: moved[1].id, planetId: SOV, orbitSlot: 1 }, to: null },
+      });
+      clock = on[1].depart + SEC;
+      expect(resolveShipFlight()).toMatchObject({
+        flight: { status: 'in-flight', locationId: moved[1].id, destinationId: moved[0].id },
+        places: {
+          from: { id: moved[1].id, planetId: SOV, orbitSlot: 1 },
+          to: { id: moved[0].id, planetId: SOV, orbitSlot: 0 },
+        },
+      });
     } finally {
       setStationDirectory(null);
     }

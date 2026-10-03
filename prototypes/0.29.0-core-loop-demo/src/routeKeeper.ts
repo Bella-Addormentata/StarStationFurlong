@@ -860,6 +860,18 @@ export async function runKeeperPass(deps: KeeperPassDeps): Promise<{ verdict: Pa
 
 // ── The loop (effectful, thin) ───────────────────────────────────────────────
 
+/** 🛰️ Has the ship's room state arrived, for the keeper and the copy-back
+ *  (main.ts)? A frame from the live host after the link (`linkedSynced`),
+ *  or, for a room hosted on this machine's node (whose replica there is the
+ *  room's own copy), that node's first answer (`serverSynced`). Never the
+ *  room's owner and name alone: a revisited room's cached snapshot
+ *  (roomCache.restoreRoomSnapshot, applied before the sync starts) carries
+ *  them, and a keeper acting on that copy could dock or cast off for a run
+ *  that has since changed, or copy a stale flight and fuel back. */
+export function routeRoomReady(sync: { linkedSynced: boolean; serverSynced: boolean }, hostedHere: boolean): boolean {
+  return sync.linkedSynced || (hostedHere && sync.serverSynced);
+}
+
 /** What the keeper reads from the game (main.ts wires it). */
 export interface RouteKeeperDeps {
   /** The room's docking system (docking.ts: ports, UNDOCK, DOCK passing
@@ -879,8 +891,8 @@ export interface RouteKeeperDeps {
   detachGuestBerths?: () => void;
   /** Tell the helm (devices.noteShipArrival). */
   note?: (outcome: ArrivalOutcome) => void;
-  /** 🛰️ Has the room's shared state arrived (main.ts initialRoomStateReady)?
-   *  Until it has, the keeper reads and does nothing. Default: yes. */
+  /** 🛰️ Has the room's shared state arrived (routeRoomReady)? Until it
+   *  has, the keeper reads and does nothing. Default: yes. */
   ready?: () => boolean;
   /** 🛟 May this game release the live pairing on `doorId` (undock that
    *  port, or delete that guest berth)? Asked for every door but the
