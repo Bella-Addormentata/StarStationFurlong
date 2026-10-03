@@ -33,7 +33,7 @@ import {
   undockPose,
 } from './freeFlight';
 import type { FreePose, FreeStation } from './freeFlight';
-import { ORBIT_EPOCH_MS, angleAt, circularOrbit, orbitForSlot, realMsFor } from './orbits';
+import { ORBIT_EPOCH_MS, angleAt, circularOrbit, orbitForSlot, orbitalSeconds, realMsFor } from './orbits';
 import { DEFAULT_PLANET_ID, planetById } from './stations';
 
 const SOV = DEFAULT_PLANET_ID;
@@ -417,3 +417,36 @@ describe('🅿️ PARK and passing stations', () => {
   });
 });
 
+
+describe('a station in the next orbit', () => {
+  const planet = planetById(SOV);
+  const a = circularOrbit(planet, orbitForSlot(SOV, 2).radiusKm, 0);
+  const rB = a.radiusKm + 50;
+  // B, 50 km higher (the closest two orbits may be), starts 0.1 rad (about 1000 km) ahead.
+  const phaseB = angleAt(a, T0) + 0.1 - Math.sqrt(planet.mu / rB ** 3) * orbitalSeconds(T0);
+  const b = circularOrbit(planet, rB, phaseB);
+  const A: FreeStation = { id: 'a', room: 'room-a', name: 'A', pointAt: (ms) => ({ radiusKm: a.radiusKm, angle: angleAt(a, ms) }) };
+  const B: FreeStation = { id: 'b', room: 'room-b', name: 'B', pointAt: (ms) => ({ radiusKm: rB, angle: angleAt(b, ms) }) };
+  // The ship sits still in A's frame, 49 km out: on B's way.
+  const held = (parked: boolean): FreePose => {
+    const p = pointOff(A.pointAt(T0), 0, 49);
+    return { planetId: SOV, at: T0, radiusKm: p.radiusKm, angle: p.angle, vAlong: 0, vRadial: 0, heading: 0, near: { room: 'room-a', along: 0, radial: 49 }, ...(parked ? { parked: true as const } : {}) };
+  };
+  // When B reaches the ship (A outruns B: lower is faster).
+  const meetS = 0.1 / (a.meanMotion - Math.sqrt(planet.mu / rB ** 3));
+  const after = T0 + Math.round(realMsFor(meetS)) + 60_000;
+
+  for (const parked of [false, true]) {
+    it(`hands a ${parked ? 'parked' : 'stopped'} ship to it at its docking zone, never through its hull`, () => {
+      const { pose, changed } = coastTo(held(parked), after, [A, B]);
+      expect(changed).toBe(true);
+      expect(pose.near?.room).toBe('room-b');
+      expect(Math.hypot(pose.near!.along, pose.near!.radial)).toBeGreaterThanOrEqual(HULL_KM - 1e-6);
+    });
+  }
+
+  it('keeps a stopped ship in A\'s frame while B is far off', () => {
+    const { pose } = coastTo(held(false), T0 + 60_000, [A, B]);
+    expect(pose.near?.room).toBe('room-a');
+  });
+});

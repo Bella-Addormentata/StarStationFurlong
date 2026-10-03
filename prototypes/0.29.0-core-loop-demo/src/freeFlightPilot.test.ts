@@ -179,6 +179,36 @@ describe('🅿️ a station flying by itself', () => {
     expect(stationFlyingFree(DEFAULT_STATION_RECORD, now)).toBe(true);
     expect(stationFlyingFree({ welcomeRoomId: 'elsewhere' }, now)).toBe(false);
   });
+
+  it('stays closed in this game after leaving it, with no summary left to say so', () => {
+    const saved = new Map<string, string>();
+    const g = globalThis as { localStorage?: unknown };
+    const before = g.localStorage;
+    g.localStorage = {
+      getItem: (k: string) => saved.get(k) ?? null,
+      setItem: (k: string, v: string) => { saved.set(k, v); },
+      removeItem: (k: string) => { saved.delete(k); },
+    };
+    try {
+      const now = ORBIT_EPOCH_MS + 7_200_000;
+      setStationRoomSource(() => ROOM);
+      fly(stationUndockPose(ownStationOf()!, now));
+      resetFreeFlightPilot();
+      expect(stationFlyingFree(DEFAULT_STATION_RECORD, now)).toBe(true);
+      // Elsewhere, a day on: no summary of it is left, its docks stay closed.
+      setStationRoomSource(() => 'another-room');
+      resetFreeFlightPilot();
+      expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + 25 * 3600_000)).toBe(true);
+      // Back aboard, parked (docked): open again.
+      setStationRoomSource(() => ROOM);
+      writeFlightRecord({ status: 'redocking', locationId: HOME.id });
+      writeFlightRecord({ status: 'docked', locationId: HOME.id });
+      resetFreeFlightPilot();
+      expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + 26 * 3600_000)).toBe(false);
+    } finally {
+      g.localStorage = before;
+    }
+  });
 });
 
 describe("🕹️ AUTO-DOCK's way back", () => {

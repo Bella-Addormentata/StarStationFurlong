@@ -25,7 +25,7 @@ import type { FreePose, FreeStation, StickInput } from './freeFlight';
 import { orbitForSlot, angleAt, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
 import { readFlightRecord, readFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
-import { adriftPlace, currentRoomId, listStations, planetById, stationInTransit } from './stations';
+import { adriftPlace, currentRoomId, latestMoveOf, listStations, planetById, stationInTransit } from './stations';
 import type { StationRecord } from './stations';
 
 /** The ship map key the pose lives under (old clients never read it). */
@@ -186,34 +186,97 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
   return list;
 }
 
-let flyingCache: { room: string; at: number; status: string; rooms: Set<string> } | null = null;
+let flyingCache: { room: string; at: number; status: string; since: Map<string, number> } | null = null;
+
+/** This game's memory of the rooms it has heard flying free (room → the
+ *  newest such summary's time), kept past the planet summaries' expiry and
+ *  cap: a station's docks stay closed here until it is heard otherwise. */
+const FLYING_KEY = 'ssf.freeFlight.flyingRooms.v1';
+const MAX_FLYING_ROOMS = 64;
+
+function readFlyingMemory(): Map<string, number> {
+  const out = new Map<string, number>();
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(FLYING_KEY) ?? 'null');
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+      for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+        if (out.size >= MAX_FLYING_ROOMS) break;
+        if (k.length > 0 && k.length <= 256 && typeof v === 'number' && Number.isFinite(v)) out.set(k, v);
+      }
+    }
+  } catch {
+    /* no storage here: the summaries alone */
+  }
+  return out;
+}
+
+function writeFlyingMemory(m: Map<string, number>): void {
+  // Over the cap, the longest unheard go first.
+  const kept = [...m.entries()].sort((x, y) => y[1] - x[1]).slice(0, MAX_FLYING_ROOMS);
+  try {
+    localStorage.setItem(FLYING_KEY, JSON.stringify(Object.fromEntries(kept)));
+  } catch {
+    /* quota or no storage */
+  }
+}
 
 /**
- * 🅿️ The rooms flying free now: this room when its flight record says so,
- * and every one the planet summaries say is. A station whose welcome room
- * is among them is flying by itself (Fly and park): its docks are closed,
- * so no DEPART, route or arrival takes it as a destination until it parks.
+ * 🅿️ The rooms flying free now, each with when it was last heard so: this
+ * room when its flight record says so, and every one the planet summaries
+ * say is, remembered (FLYING_KEY) until a newer summary of that room says
+ * otherwise, so a summary that expires or is crowded out never reopens a
+ * flying station's docks. A station whose welcome room is among them is
+ * flying by itself (Fly and park) until it parks: no DEPART, route or
+ * arrival takes it as a destination meanwhile.
  */
-export function flyingFreeRooms(now = Date.now()): Set<string> {
+function flyingSince(now: number): Map<string, number> {
   const room = currentRoomId();
   const status = readFlightRecord().status;
   if (flyingCache && flyingCache.room === room && flyingCache.status === status && now - flyingCache.at < STATIONS_EVERY_MS) {
-    return flyingCache.rooms;
+    return flyingCache.since;
   }
-  const rooms = new Set<string>();
+  const since = readFlyingMemory();
+  let dirty = false;
   try {
-    for (const s of Object.values(readStore(now).ships)) if (!s.retired && s.status === 'free-flight') rooms.add(s.roomId);
+    for (const s of Object.values(readStore(now).ships)) {
+      const known = since.get(s.roomId);
+      if (!s.retired && s.status === 'free-flight') {
+        if (known === undefined || s.updatedAt > known) { since.set(s.roomId, s.updatedAt); dirty = true; }
+      } else if (known !== undefined && s.updatedAt > known) {
+        since.delete(s.roomId);
+        dirty = true;
+      }
+    }
   } catch {
     /* the summary store is optional here */
   }
-  if (room && status === 'free-flight') rooms.add(room);
-  flyingCache = { room, at: now, status, rooms };
-  return rooms;
+  // This room's own record is first-hand.
+  if (room && status === 'free-flight') {
+    if (!since.has(room)) { since.set(room, now); dirty = true; }
+  } else if (room && since.delete(room)) {
+    dirty = true;
+  }
+  if (dirty) writeFlyingMemory(since);
+  flyingCache = { room, at: now, status, since };
+  return since;
 }
 
-/** 🅿️ Is this station flying by itself now (its docks closed)? */
-export function stationFlyingFree(station: { welcomeRoomId?: string } | null | undefined, now = Date.now()): boolean {
-  return !!station?.welcomeRoomId && flyingFreeRooms(now).has(station.welcomeRoomId);
+/** 🅿️ The rooms flying free now (flyingSince). */
+export function flyingFreeRooms(now = Date.now()): Set<string> {
+  return new Set(flyingSince(now).keys());
+}
+
+/** 🅿️ Is this station flying by itself now (its docks closed)? Not once a
+ *  move of its own was booked since it was last heard flying: PARK books
+ *  one (freeStation.planStationPark). */
+export function stationFlyingFree(station: { id?: string; welcomeRoomId?: string } | null | undefined, now = Date.now()): boolean {
+  const room = station?.welcomeRoomId;
+  if (!room) return false;
+  const since = flyingSince(now).get(room);
+  if (since === undefined) return false;
+  if (room === currentRoomId()) return true;
+  const move = latestMoveOf({ id: station.id ?? '', welcomeRoomId: room });
+  return !(move && (move.bookedAt ?? move.departAt) >= since);
 }
 
 /** The pose UNDOCK & FLY starts from, leaving `locationId` (a station, or

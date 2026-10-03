@@ -331,17 +331,30 @@ function circularRate(planetId: string, radiusKm: number): number {
  * rule did anything (a pilot's game writes the pose then).
  */
 export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
-  // Parked: kept where it is (it is still, so no zone would slow it, and a
-  // station passing by must not pick it up).
-  if (pose.parked) return { pose, changed: false };
   let p = pose;
   let changed = false;
   const nearest = nearestStation(p, stations);
+  // The nearest station but the one holding the ship.
+  const other = p.near ? nearestStation(p, stations.filter((s) => s.room !== p.near!.room)) : nearest;
+  if (p.parked) {
+    // Parked: kept where it is (it is still, so no zone would slow it, and a
+    // station merely passing must not pick it up), until another station
+    // sweeps into its docking zone: then that one takes it.
+    if (!other || other.distanceKm > DOCK_ZONE_KM || other.station.room === p.near?.room) return { pose, changed: false };
+    const { parked: _off, ...flying } = p;
+    p = flying;
+    changed = true;
+  }
   if (p.near) {
     // Past the zone's edge (with a margin), or its station is gone: back on
-    // the ship's own orbit.
+    // the ship's own orbit. So too when another station comes much nearer
+    // (into its docking zone, or within FRAME_HANDOVER of the held one's
+    // distance): the take-up below then hands the ship to it, so its zones
+    // and hull count (orbits are only MIN_ORBIT_SEPARATION apart).
     const held = stations.find((s) => s.room === p.near!.room);
-    if (!held || Math.hypot(p.near.along, p.near.radial) > APPROACH_ZONE_KM * LEAVE_MARGIN) {
+    const heldKm = Math.hypot(p.near.along, p.near.radial);
+    const handOver = !!other && (other.distanceKm <= DOCK_ZONE_KM || other.distanceKm < heldKm * FRAME_HANDOVER);
+    if (!held || heldKm > APPROACH_ZONE_KM * LEAVE_MARGIN || handOver) {
       const { near: _gone, ...open } = p;
       // Its speed along, from the station's frame to its own orbit's: the
       // same motion about the planet, told against another circular rate.
@@ -397,6 +410,11 @@ export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { 
   return { pose: p, changed };
 }
 
+/** A ship held by one station is handed to another once that one is
+ *  nearer than this share of the held one's distance (hysteresis, so two
+ *  stations about as near never trade it back and forth). */
+const FRAME_HANDOVER = 0.8;
+
 /** Real ms per orbital second (the orbital clock runs faster). */
 const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
 
@@ -410,28 +428,44 @@ const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
  * by how near it comes to a station, not by how long it is.
  */
 function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
-  // Parked: no zone takes it up, so nothing to catch on the way.
   // A frame whose station is gone: one step lets propagate drop it now.
   if (p.near && !stations.some((s) => s.room === p.near!.room)) return 1;
-  if (p.parked) return Infinity;
-  if (p.near) {
+  if (!p.near && !p.parked) return wholeStep(closingStep(p, stations, APPROACH_ZONE_KM));
+  // Held by a station, or parked: its own frame's edges (a moving held
+  // ship), and every other station closing on its docking zone, where
+  // applyZones hands the ship over (closingStep, skipping the held one).
+  let own = Infinity;
+  if (p.near && !p.parked) {
     const speed = speedOf(p);
-    if (speed === 0) return Infinity;
-    const d = Math.hypot(p.near.along, p.near.radial);
-    const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
-    return wholeStep((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S);
+    if (speed > 0) {
+      const d = Math.hypot(p.near.along, p.near.radial);
+      const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
+      own = (0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S;
+    }
   }
-  if (stations.length === 0) return Infinity;
+  return wholeStep(Math.min(own, closingStep(p, stations, DOCK_ZONE_KM, p.near?.room)));
+}
+
+/**
+ * Real ms until any station (but `skipRoom`) could come within `edgeKm` of
+ * the ship, halved: their gap closes no faster than their relative speed
+ * now plus both bodies' turning (v²/r) since, which bounds the cost of a
+ * long quiet coast by how near it comes to a station, not by how long it
+ * is. 1 when one is already within `edgeKm`.
+ */
+function closingStep(p: FreePose, stations: readonly FreeStation[], edgeKm: number, skipRoom?: string): number {
+  const others = skipRoom === undefined ? stations : stations.filter((s) => s.room !== skipRoom);
+  if (others.length === 0) return Infinity;
   const probe = p.at + COAST_STEP_MS;
   const ship0 = toPlanetFrame({ radiusKm: p.radiusKm, angle: p.angle });
-  const ship1 = toPlanetFrame(propagate(p, probe, []));
+  const ship1 = toPlanetFrame(propagate(p, probe, stations));
   const shipV = Math.hypot(ship1.x - ship0.x, ship1.z - ship0.z) / COAST_STEP_MS;
   let best = Infinity;
-  for (const st of stations) {
+  for (const st of others) {
     const a = st.pointAt(p.at);
     const s0 = toPlanetFrame(a);
     const s1 = toPlanetFrame(st.pointAt(probe));
-    const gap = Math.hypot(s0.x - ship0.x, s0.z - ship0.z) - APPROACH_ZONE_KM;
+    const gap = Math.hypot(s0.x - ship0.x, s0.z - ship0.z) - edgeKm;
     if (gap <= 0) return 1;
     const stV = Math.hypot(s1.x - s0.x, s1.z - s0.z) / COAST_STEP_MS;
     // Relative speed now (km per real ms), and a bound on how fast it grows.
@@ -441,7 +475,7 @@ function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
     const t = acc > 0 ? (Math.sqrt(v * v + acc * gap) - v) / acc : v > 0 ? gap / (2 * v) : Infinity;
     best = Math.min(best, t);
   }
-  return wholeStep(best);
+  return best;
 }
 
 /** A safe step in whole ms (at least one): never rounded above what is
