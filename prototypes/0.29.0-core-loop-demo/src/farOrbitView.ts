@@ -39,7 +39,7 @@ import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
 import { readStore } from './planetSummary';
-import { isPinMove, moveTransitPointAt } from './stationMove';
+import { isPinMove, moveTransitPointAt, stationPointWithMoveAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
@@ -51,7 +51,7 @@ import { remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
 import { readResolvedFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
-import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { adriftPlace, altitudeChangesSince, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
@@ -112,7 +112,7 @@ function stationYaw(welcomeRoomId: string | undefined, roomId: string | undefine
 
 /** Where a flight record's location is: a station, or open orbit (174's
  *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
-type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
+type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot' | 'orbit'>;
 
 /** A flight's end as it was when the ship left (`leftAt`): a station that
  *  has moved to another planet since then is still at its old slot for the
@@ -131,6 +131,16 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
       : latest.settles;
     if (moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now && betweenPlanets(moved)) {
       return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot };
+    }
+    // 🎚️ Likewise an altitude change since the ship left, found among every
+    // move known (a later booking can hide it from the latest): the flight
+    // was planned to the orbit the station flew then.
+    const climbed = leftAt !== undefined ? altitudeChangesSince(station, leftAt, now)[0]?.orbit : undefined;
+    if (climbed) {
+      return {
+        id: station.id, planetId: station.planetId, orbitSlot: station.orbitSlot,
+        orbit: { radiusKm: climbed.fromRadiusKm, phase0: climbed.fromPhase0 },
+      };
     }
     return station;
   }
@@ -320,7 +330,8 @@ function readSource(now: number): Source {
     viewerRingRadiusKm = stationOrbit(place).radiusKm;
   } else if (me) {
     const station = me;
-    viewer = (ms) => stationPointAt(station, ms);
+    // 🎚️ On its altitude change's course while it flies one.
+    viewer = (ms) => stationPointWithMoveAt(station, ms);
     viewerRingRadiusKm = stationOrbit(me).radiusKm;
   } else {
     const orbit = orbitForSlot(planetId, 0);
@@ -404,7 +415,7 @@ function layoutFor(source: Source, now: number, withPaths: boolean): FarLayout |
   const stations: FarStationInput[] = source.stations.map(({ record, modules }) => ({
     id: record.id,
     name: record.name,
-    point: stationPointAt(record, now),
+    point: stationPointWithMoveAt(record, now),
     ringRadiusKm: stationOrbit(record).radiusKm,
     modules,
   }));
