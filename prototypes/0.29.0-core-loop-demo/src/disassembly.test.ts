@@ -74,6 +74,10 @@ describe('labor on the orbital clock', () => {
     // Nobody on it: paused, no due time.
     expect(jobDueAt({ ...two, crew: [] })).toBeNull();
     expect(workedMs({ ...two, crew: [] }, 50 * MIN)).toBe(10 * MIN);
+    // Its labor all done when its last robot left: still due, as of then.
+    const done = { ...settleJob(two, 30 * MIN), crew: [] };
+    expect(done).toMatchObject({ doneMs: 24 * MIN, asOf: 30 * MIN });
+    expect(jobDueAt(done)).toBe(30 * MIN);
   });
 
   it('says where the job stands', () => {
@@ -325,6 +329,19 @@ describe('the job in the robot map', () => {
     // …until it is set to something else.
     writeRobotConfig('d1', { routine: 'idle' }, 30 * MIN);
     expect(readDisassemblyJobs()).toHaveLength(0);
+  });
+
+  it('a job worked through stays due when its last robot is stopped', () => {
+    assignDisassembly('d1', target, 0);
+    // Done at minute 24 while the room's owner is away; at minute 30 the
+    // robot is stopped. The work stands, and the job still ends when the
+    // owner is back.
+    writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b', parked: true }, 30 * MIN);
+    const j = readDisassemblyJob('room-b')!;
+    expect(j).toMatchObject({ crew: [], doneMs: 24 * MIN, asOf: 30 * MIN });
+    expect(jobDueAt(j)).toBe(30 * MIN);
+    finishDisassemblyJob('room-b', 30 * MIN, 'removed');
+    expect(readDisassemblyJob('room-b')).toMatchObject({ finishedAt: 30 * MIN, outcome: 'removed', doneMs: 24 * MIN });
   });
 
   it('a module re-joined after a finished job starts a fresh one', () => {

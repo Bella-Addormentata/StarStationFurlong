@@ -140,13 +140,16 @@ export function settleJob(job: DisassemblyJob, now: number): DisassemblyJobRecor
   return { ...record, doneMs: workedMs(job, now), asOf: now };
 }
 
-/** When the labor runs out at the current crew, or null (nobody working, or
- *  already finished). Deterministic, so every client finishing the job
- *  writes the same time. */
+/** When the labor runs out at the current crew, or null (already finished,
+ *  or labor left and nobody working). A job whose labor is all done is due
+ *  as of then, crew or not: its last robot may have been stopped or moved
+ *  while it waited on a blocker or the room's owner. Deterministic, so every
+ *  client finishing the job writes the same time. */
 export function jobDueAt(job: DisassemblyJob): number | null {
-  if (job.finishedAt !== undefined || job.crew.length === 0) return null;
+  if (job.finishedAt !== undefined) return null;
   const left = jobLaborMs(job) - job.doneMs;
-  return left <= 0 ? job.asOf : job.asOf + Math.ceil(left / job.crew.length);
+  if (left <= 0) return job.asOf;
+  return job.crew.length === 0 ? null : job.asOf + Math.ceil(left / job.crew.length);
 }
 
 /** Fraction of the labor done by `now`, 0 to 1. */
