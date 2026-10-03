@@ -355,7 +355,7 @@ export function readStore(now = Date.now()): Store {
     for (const [k, v] of Object.entries(raw.ships)) {
       if (n >= MAX_SHIPS) break;
       const s = cleanShipSummary(v, now);
-      if (s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS) { out.ships[k] = s; n++; }
+      if (s && s.roomId === k && shipKept(s, now)) { out.ships[k] = s; n++; }
     }
   }
   return out;
@@ -368,7 +368,7 @@ function writeStore(store: Store): void {
 /** The newer of two trims: the later last burn; between trims whose last
  *  burns share a moment (two sticks pushed in one millisecond), the one
  *  that drew more fuel has replayed more burns, so it holds the other's
- *  burns too; then tieBreak. */
+ *  burns too (a trim without the count ranks lowest); then tieBreak. */
 function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): SharedTrim | undefined {
   if (!a) return b;
   if (!b) return a;
@@ -377,9 +377,10 @@ function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): Shared
     return (b.readAt ?? 0) > (a.readAt ?? 0) ? b : a;
   }
   if (b.at !== a.at) return b.at > a.at ? b : a;
-  if (a.fuelDrawn !== undefined && b.fuelDrawn !== undefined && a.fuelDrawn !== b.fuelDrawn) {
-    return b.fuelDrawn > a.fuelDrawn ? b : a;
-  }
+  // A trim without the count (an older build's) has replayed no more burns
+  // than one with it: it ranks below every counted trim.
+  const drawn = (t: SharedTrim) => t.fuelDrawn ?? -1;
+  if (drawn(a) !== drawn(b)) return drawn(b) > drawn(a) ? b : a;
   return tieBreak(a, b);
 }
 
@@ -557,6 +558,15 @@ function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<strin
 function mayBeShipRoom(): string | null {
   const room = ctx?.currentRoom?.() || null;
   return room && ctx?.notShipRoom?.() !== room ? room : null;
+}
+
+/** A ship summary worth keeping: heard from within SHIP_STALE_MS, or the
+ *  summary of the room this client stands in, however old. A ship left empty
+ *  for a day is still where its summary says, and a fresh install aboard has
+ *  nothing else to place it by until it republishes; shipsAroundPlanet still
+ *  lists only fresh ships. */
+function shipKept(s: ShipSummary, now: number): boolean {
+  return now - s.updatedAt <= SHIP_STALE_MS || s.roomId === mayBeShipRoom();
 }
 
 /** A ship's own one-room stand-in (derived, its welcome room the ship's
@@ -823,7 +833,7 @@ export function pullPlanetSummary(now = Date.now()): void {
   for (const [k, v] of shipMap!.entries()) {
     if (++scanned > MAX_SHIPS * 4) break;
     const s = cleanShipSummary(v, now);
-    if (!s || s.roomId !== k || now - s.updatedAt > SHIP_STALE_MS) continue;
+    if (!s || s.roomId !== k || !shipKept(s, now)) continue;
     const next = mergeShip(store.ships[k], s);
     if (next) { store.ships[k] = next; changed = true; }
     if (JSON.stringify(store.ships[k]) !== JSON.stringify(s)) staleShips.set(k, s);
@@ -948,7 +958,7 @@ export function publishPlanetSummary(now = Date.now()): void {
       return s && s.welcomeRoomId === k ? { at: s.updatedAt, planetId: s.planetId } : null;
     }, MAX_STATIONS, pins.stations, pins.planet) + pruneMap(shipMap!, (k, v) => {
       const s = cleanShipSummary(v, now);
-      return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? { at: s.updatedAt, planetId: s.planetId } : null;
+      return s && s.roomId === k && shipKept(s, now) ? { at: s.updatedAt, planetId: s.planetId } : null;
     }, MAX_SHIPS, pins.ships, pins.planet);
   });
   // Entries a bounded pull could not reach before the prune are reachable
@@ -1059,7 +1069,7 @@ export function portableStationId(id: string): string | null {
 export function shipsAroundPlanet(planetId: string, now = Date.now()): ShipSummary[] {
   const planet = planetById(planetId).id;
   return Object.values(readStore(now).ships)
-    .filter((s) => !s.retired && planetById(s.planetId).id === planet)
+    .filter((s) => !s.retired && now - s.updatedAt <= SHIP_STALE_MS && planetById(s.planetId).id === planet)
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 

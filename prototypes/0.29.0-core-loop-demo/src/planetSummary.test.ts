@@ -103,6 +103,13 @@ describe('guards', () => {
     }
   });
 
+  it('settles a same-moment trim from a build without fuel counts on the one that has them, in either order', () => {
+    const old = summary({ trim: trim({ dRadiusKm: 2 }) });
+    const counted = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+    expect((mergeStation(old, counted) ?? old).trim?.dRadiusKm).toBe(0);
+    expect(mergeStation(counted, old)).toBeNull();
+  });
+
   it("keeps a newer trim the standing record's own install flies on another slot", () => {
     // A slot clash moved this station off the slot its record asks for; its
     // own republish carries the record unchanged with the flown slot's trim.
@@ -535,6 +542,28 @@ describe('sharing through the room doc', () => {
     const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
     bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
     expect(listStations().find((s) => s.id === 'shared:room-x')?.planetId).toBe(ARIS);
+  });
+
+  it('places a fresh install by its own ship\'s summary however long the ship stood empty', () => {
+    const doc = new Y.Doc();
+    const old = Date.now() - 2 * SHIP_STALE_MS;
+    doc.getMap('stationSummaries').set('room-x', {
+      welcomeRoomId: 'room-x', name: 'ARIS DEPOT', planetId: ARIS, orbitSlot: 3, updatedAt: old,
+    });
+    doc.getMap('shipSummaries').set('room-ship', {
+      roomId: 'room-ship', name: 'FERRY', planetId: ARIS, status: 'docked', fromRoom: 'room-x', updatedAt: old,
+    });
+    doc.getMap('shipSummaries').set('room-gone', {
+      roomId: 'room-gone', name: 'HULK', planetId: ARIS, status: 'docked', updatedAt: old,
+    });
+    const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
+    expect(listStations().find((s) => s.id === 'shared:room-x')?.planetId).toBe(ARIS);
+    // The entry stays for its own room, but other ships long gone go, and
+    // neither is listed as a ship around the planet.
+    expect(doc.getMap('shipSummaries').has('room-ship')).toBe(true);
+    expect(doc.getMap('shipSummaries').has('room-gone')).toBe(false);
+    expect(shipsAroundPlanet(ARIS)).toEqual([]);
   });
 
   it('tells its own views about what it just published', () => {
