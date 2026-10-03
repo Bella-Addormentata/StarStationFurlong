@@ -782,9 +782,12 @@ describe('who may dock at a gate', () => {
     writeDoorPolicy('east', { passage: 'public', construction: 'owner', adapter: true, gate: 2, gateAccess: 'closed' });
     doc.getMap('doorPolicy').set('west', { adapter: true, gate: 3, gateAccess: 'reserved' }); // no ship named
     doc.getMap('doorPolicy').set('south', { adapter: true, gate: 4, gateAccess: 'vip' });
+    // A restriction that cannot be read closes the gate rather than open it.
     expect(readGateAccess()).toEqual({
       north: { access: 'reserved', reservedFor: 'ship-1' },
       east: { access: 'closed' },
+      west: { access: 'closed' },
+      south: { access: 'closed' },
     });
     writeDoorPolicy('east', { ...readDoorPolicy('east'), adapter: false });
     expect(readDoorPolicy('east').gateAccess).toBeUndefined();
@@ -809,6 +812,54 @@ describe('who may dock at a gate', () => {
     expect(gateAccessIn(far, 'south', 'pub-a')).toEqual({ access: 'pass', granted: true });
     expect(gateAccessIn(far, 'south', 'pub-b')).toEqual({ access: 'pass', granted: false });
     expect(gateAccessIn(far, 'north')).toEqual({ access: 'open', granted: false });
+  });
+
+  it('refuses a DOCK at a gate whose stored access cannot be read', () => {
+    const far = new Y.Doc();
+    const policies = far.getMap('doorPolicy');
+    policies.set('north', { adapter: true, gate: 1, gateAccess: 'reserved' }); // no ship named
+    policies.set('east', { adapter: true, gate: 2, gateAccess: 'reserved', reservedFor: 'x'.repeat(129) });
+    policies.set('south', { adapter: true, gate: 3, gateAccess: 'vip' });
+    policies.set('west', { adapter: true, gate: 4, gateAccess: 7 });
+    far.getMap('doorGrants').set('south|pub-a', { doorId: 'south', pub: 'pub-a', name: 'A', grantedAt: 1 });
+    const berth = { exists: true, portFlag: true };
+    for (const door of ['north', 'east', 'south', 'west']) {
+      const access = gateAccessIn(far, door, 'pub-a');
+      expect(access.access).toBe('closed');
+      expect(farDockPatch(undefined, berth, near, 5000, undefined, access)).toEqual({ action: 'refuse', reason: 'not-allowed' });
+    }
+    // Only no access at all, or an explicit open, leaves a gate open.
+    policies.set('north', { adapter: true, gate: 1 });
+    policies.set('east', { adapter: true, gate: 2, gateAccess: 'open' });
+    expect(gateAccessIn(far, 'north')).toEqual({ access: 'open', granted: false });
+    expect(gateAccessIn(far, 'east')).toEqual({ access: 'open', granted: false });
+  });
+
+  it('closes a gate whose access a peer sent unreadable, in the atlas and in a station\'s berths', () => {
+    twoRoomStation();
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: Date.now() + 60_000,
+      doors: { west: { targetRoomId: 'room-a', farDoor: 'east', transient: false } },
+      gates: { south: 2, east: 3, north: 4, 'd:00000005': 5 },
+      gateAccess: { south: { access: 'reserved' }, east: { access: 'vip' }, north: 'closed', 'd:00000005': { access: 'open' } },
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-b']?.gateAccess).toEqual({
+      south: { access: 'closed' }, east: { access: 'closed' }, north: { access: 'closed' },
+    });
+
+    expect(cleanBerths([
+      { roomId: 'room-b', doorId: 'south', gate: 2, access: 'reserved' },
+      { roomId: 'room-b', doorId: 'east', gate: 3, access: 'vip' },
+      { roomId: 'room-b', doorId: 'north', gate: 4, access: 'open' },
+      { roomId: 'room-b', doorId: 'd:00000005', gate: 5 },
+    ])).toEqual([
+      { roomId: 'room-b', doorId: 'south', gate: 2, access: 'closed' },
+      { roomId: 'room-b', doorId: 'east', gate: 3, access: 'closed' },
+      { roomId: 'room-b', doorId: 'north', gate: 4 },
+      { roomId: 'room-b', doorId: 'd:00000005', gate: 5 },
+    ]);
   });
 
   it('travels with the gates to the station record', () => {

@@ -117,12 +117,15 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
   if (typeof b.doorId !== 'string' || !isAcceptableDoorKey(b.doorId)) return null;
   const out: StationBerthRecord = { roomId: b.roomId, doorId: b.doorId };
   if (typeof b.gate === 'number' && Number.isInteger(b.gate) && b.gate >= 1 && b.gate <= 99) out.gate = b.gate;
+  // Access that cannot be read closes the gate (as doorPolicy reads a port's):
+  // only none, or an explicit 'open', leaves it open.
+  if (b.access === undefined || b.access === 'open') return out;
   if (b.access === 'pass' || b.access === 'closed') out.access = b.access;
   else if (b.access === 'reserved' && typeof b.reservedFor === 'string'
     && b.reservedFor.length > 0 && b.reservedFor.length <= MAX_ID_LENGTH) {
     out.access = 'reserved';
     out.reservedFor = b.reservedFor;
-  }
+  } else out.access = 'closed';
   return out;
 }
 

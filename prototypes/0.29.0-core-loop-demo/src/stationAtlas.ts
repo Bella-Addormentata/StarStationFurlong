@@ -515,20 +515,22 @@ export interface AtlasGateAccess {
 
 /** Door id → access pairs a peer may send, cleaned and capped (one per gate
  *  number). Only doors of the cleaned `gates` count, so entries for other
- *  doors cannot crowd out a real gate's policy. */
+ *  doors cannot crowd out a real gate's policy. A gate's access that cannot
+ *  be read closes it (as doorPolicy reads a port's): only an explicit 'open'
+ *  leaves it open. */
 function cleanGateAccess(v: Record<string, unknown>, gates: Record<string, number>): Record<string, AtlasGateAccess> {
   const out: Record<string, AtlasGateAccess> = {};
   let kept = 0;
   for (const [doorId, raw] of Object.entries(v)) {
     if (kept >= MAX_GATE_NUMBER) break;
     if (!Object.prototype.hasOwnProperty.call(gates, doorId)) continue;
-    if (typeof raw !== 'object' || raw === null) continue;
-    const r = raw as { access?: unknown; reservedFor?: unknown };
-    if (r.access === 'pass' || r.access === 'closed') out[doorId] = { access: r.access };
+    const r = (typeof raw === 'object' && raw !== null ? raw : {}) as { access?: unknown; reservedFor?: unknown };
+    if (r.access === 'open') continue;
+    if (r.access === 'pass') out[doorId] = { access: 'pass' };
     else if (r.access === 'reserved' && typeof r.reservedFor === 'string'
       && r.reservedFor.length > 0 && r.reservedFor.length <= 128) {
       out[doorId] = { access: 'reserved', reservedFor: r.reservedFor };
-    } else continue;
+    } else out[doorId] = { access: 'closed' };
     kept++;
   }
   return out;
