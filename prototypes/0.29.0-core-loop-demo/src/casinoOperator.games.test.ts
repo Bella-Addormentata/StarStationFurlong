@@ -1474,6 +1474,37 @@ describe('two installs', () => {
     expect(peer.getMap('casino').has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
   });
 
+  it('as the claimant: drops its claim while an earlier build operates here, slot work or not, and claims afresh once it has gone', () => {
+    fund(M1);
+    const peer = new Y.Doc();
+    const map = doc.getMap('casino');
+    const legacyKey = `slot-operator:${M2}`;
+    takenBy(peer, T0, ['pusher']);
+    frame(T0, [M1], []); // held off with slot work: claims
+    expect(readCasinoOperatorClaim()?.sessionId).toBe(SESSION);
+    // An earlier build operates a machine here, renewing its lease: nobody
+    // takes while it lasts, so the claim goes at once and isn't written again,
+    // nor left behind once this page's slot work ends.
+    let last = T0;
+    for (let t = T0 + 500; t <= T0 + 10_000; t += 500) {
+      if ((t - T0 - 500) % RENEW_MS === 0) {
+        map.set(legacyKey, legacy(t + LEASE_MS));
+        last = t;
+      }
+      frame(t, t < T0 + 5_000 ? [M1] : [], []);
+      expect(readCasinoOperatorClaim()).toBeNull();
+    }
+    sync(doc, peer);
+    expect(peer.getMap('casino').has(CASINO_OPERATOR_CLAIM_KEY)).toBe(false);
+    // Gone (tidied a term after its last renewal), the pusher-only holder back
+    // and slot work here again: a fresh claim.
+    const back = last + LEASE_MS;
+    takenBy(peer, back, ['pusher']);
+    frame(back, [M1], []);
+    expect(map.has(legacyKey)).toBe(false);
+    expect(readCasinoOperatorClaim()).toEqual({ playerId: OPERATOR, sessionId: SESSION, expiresAt: back + LEASE_MS });
+  });
+
   it("a page that stepped aside in one room's doc takes and runs in the next room's at once", () => {
     writeCoinPusherState(CABINET, machineWith(10));
     const peer = new Y.Doc();

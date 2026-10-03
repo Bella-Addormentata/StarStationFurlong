@@ -113,8 +113,8 @@
  * in this take: a shadow a v0.38 peer overwrote ends the take. The shadows
  * carry the four lease fields only; what the holder serves is on the primary
  * alone (TWO INSTALLS), and nothing judges a record by it. The device
- * id is one per profile, seeded from and backfilled into the two old keys,
- * and both old ids are remembered as this device (loadDeviceIds).
+ * id is one per profile, seeded from the two old keys and written to both,
+ * and the old ids they held are kept as this device's (loadDeviceIds).
  *
  *   Scenario                             Who holds       Why nobody else writes
  *   a1 OLD tab first, NEW joins          OLD, own keys   NEW sees a live foreign old-key record and holds
@@ -127,10 +127,13 @@
  *   a3 Both take in one window           LWW per key     Both wait the settling wait; each sees the
  *                                                        other's record and ends its take, deleting only
  *                                                        records naming itself (the SPLITS caveat stays).
- *   a4 Same device, OLD tab hides        NEW after lapse NEW remembers both old device ids as this device
- *                                                        and honours the record's own expiry.
- *   a5 Same device, NEW tab hides        OLD after lapse NEW backfilled the old keys, so an OLD tab of
- *                                                        the profile is this device to NEW's shadows.
+ *   a4 Same device, OLD tab hides        NEW after lapse Every NEW page knows both old device ids as this
+ *                                                        device (kept when the keys were rewritten) and
+ *                                                        honours the record's own expiry.
+ *   a5 Same device, NEW tab hides        OLD after lapse NEW wrote its id to both old keys, so an OLD tab
+ *                                                        opened since is this device to NEW's shadows;
+ *                                                        one opened before keeps the ids it loaded and
+ *                                                        may wait the split window on one key.
  *   b  Two installs A (funds slot        A, or B until   Work binding unchanged (WHO THE RECORD NAMES).
  *      machines) and B (pushers only)    A claims        A, held off by B's live primary with slots
  *                                                        missing from what it serves, writes a claim; B,
@@ -172,7 +175,8 @@
  * serving slots (two installs with machines each: the take decided, as the
  * one slot lease did in v0.38). A holder with slot need, a machine run by
  * hand included, never steps aside. The claimant drops its claim once it
- * takes the room, runs out of slot work or has nothing to claim against.
+ * takes the room, runs out of slot work, has nothing to claim against, or
+ * sees an earlier build operating here.
  *
  * MIXED ROOMS, one regression to know: a v0.38 install holding
  * `pusher-operator` with no slot work holds a NEW install's funded slot
@@ -228,20 +232,41 @@ const LEASE_KEYS: readonly RoomOperatorKey[] = WRITE_LEGACY_ROOM_SHADOWS
 
 const DEVICE_KEY = 'ssf-casino-operator-device';
 /** The keys v0.38 kept a device id under, one per game: seeded from, in this
- *  order, and backfilled, so a v0.38 tab opened later on this profile mints
- *  nothing new (scenario a5). */
+ *  order, and rewritten to this build's id, so a v0.38 tab opened later on
+ *  this profile is this device to this build's records (scenario a5). */
 const LEGACY_DEVICE_KEYS = ['ssf-slot-operator-device', 'ssf-pusher-operator-device'] as const;
+/** The ids those keys held before they were rewritten: a v0.38 tab opened
+ *  before keeps writing under its own, so every later page of this build
+ *  knows them as this device too (scenario a4). A profile retires one or
+ *  two; the list is capped all the same. */
+const RETIRED_DEVICES_KEY = 'ssf-casino-operator-retired-devices';
+const RETIRED_DEVICES_CAP = 8;
 const DEVICE_ID = /^[0-9a-f-]{36}$/;
 
+/** The retired ids as stored, junk dropped. */
+function parseRetiredDevices(raw: string | null): string[] {
+  let parsed: unknown = [];
+  try {
+    if (raw !== null) parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  const ids = parsed.filter((id): id is string => typeof id === 'string' && DEVICE_ID.test(id));
+  return [...new Set(ids)].slice(-RETIRED_DEVICES_CAP);
+}
+
 /** One id per browser profile (localStorage), shared by its tabs, and every
- *  id this profile's v0.38 tabs write under (knownDeviceIds). */
+ *  id this profile's v0.38 tabs may still write under (knownDeviceIds). */
 function loadDeviceIds(): { deviceId: string; knownDeviceIds: Set<string> } {
   const stored = new Map<string, string>();
+  let retired: string[];
   try {
     for (const key of [DEVICE_KEY, ...LEGACY_DEVICE_KEYS]) {
       const value = localStorage.getItem(key);
       if (value && DEVICE_ID.test(value)) stored.set(key, value);
     }
+    retired = parseRetiredDevices(localStorage.getItem(RETIRED_DEVICES_KEY));
   } catch {
     const fresh = crypto.randomUUID(); // private mode: this page is its own device
     return { deviceId: fresh, knownDeviceIds: new Set([fresh]) };
@@ -254,8 +279,18 @@ function loadDeviceIds(): { deviceId: string; knownDeviceIds: Set<string> } {
     for (const key of [DEVICE_KEY, ...LEGACY_DEVICE_KEYS]) {
       if (!stored.has(key)) localStorage.setItem(key, deviceId);
     }
-  } catch { /* not kept: this page is its own device, as when nothing is stored */ }
-  return { deviceId, knownDeviceIds: new Set([deviceId, ...stored.values()]) };
+    // v0.38 minted an id per game, so its two keys usually differ. An old key
+    // holding another id is rewritten only once that id is retired, so no
+    // later page forgets it.
+    const replaced = [...new Set(stored.values())].filter((id) => id !== deviceId && !retired.includes(id));
+    if (replaced.length > 0) {
+      localStorage.setItem(RETIRED_DEVICES_KEY, JSON.stringify([...retired, ...replaced].slice(-RETIRED_DEVICES_CAP)));
+    }
+    for (const key of LEGACY_DEVICE_KEYS) {
+      if (stored.has(key) && stored.get(key) !== deviceId) localStorage.setItem(key, deviceId);
+    }
+  } catch { /* what failed stays as stored; a fresh id not kept is this page's own device */ }
+  return { deviceId, knownDeviceIds: new Set([deviceId, ...stored.values(), ...retired]) };
 }
 
 const { deviceId, knownDeviceIds } = loadDeviceIds();
@@ -777,7 +812,11 @@ export function electCasinoOperator(now: number, tidyLegacy: boolean): ElectionO
   if (legacyLive) {
     // An earlier build is operating a machine here: it doesn't read these
     // records, so any work here could settle alongside it (EARLIER BUILDS).
+    // This page's claim goes too (endTake drops it with a take): nobody takes
+    // while that lasts, and a claim left standing could outlive this page's
+    // slot work and send a later holder aside for nothing (TWO INSTALLS).
     if (own) endTake('legacy');
+    else dropOwnClaim();
     return { kind: 'legacy-build' };
   }
   if (own) {
