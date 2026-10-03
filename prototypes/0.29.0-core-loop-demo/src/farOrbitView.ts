@@ -151,9 +151,17 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
  *  made since (only the latest is remembered), that is where the ship flies.
  *  Under the station's own id, so its trim still applies while it flies that
  *  slot (a trim names the slot it is for). Undefined when the record kept none. */
-function castOffPlace(id: string, destinationAt: string | undefined): Place | undefined {
+function castOffPlace(
+  id: string, destinationAt: string | undefined, all: readonly StationRecord[], leftAt: number, now: number,
+): Place | undefined {
   const at = destinationAt ? adriftPlace(destinationAt) : null;
-  return at ? { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot } : undefined;
+  if (!at) return undefined;
+  const place: Place = { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot };
+  // 🎚️ The record keeps only the slot: the altitude the station flew there
+  // at cast-off is the one placeOf finds (its orbit then, climbs since undone).
+  const then = placeOf(id, all, leftAt, now);
+  return then?.orbit && planetById(then.planetId).id === place.planetId && then.orbitSlot === place.orbitSlot
+    ? { ...place, orbit: then.orbit } : place;
 }
 
 /** A flight's transfer rebuilt from its record: the Hohmann ellipse between
@@ -262,7 +270,7 @@ function readSource(now: number): Source {
       // a stop's station may have left for another planet: those are its ends.
       aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => (places?.to
         ? [places.from, places.to]
-        : [placeOf(rec.locationId, all, leftAt, now), castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now)]));
+        : [placeOf(rec.locationId, all, leftAt, now), castOffPlace(to, rec.destinationAt, all, leftAt, now) ?? placeOf(to, all, leftAt, now)]));
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
@@ -285,8 +293,9 @@ function readSource(now: number): Source {
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
     if (!aboard && !adrift && rec.status === 'redocking') {
-      const place = castOffPlace(rec.locationId, rec.destinationAt)
-        ?? placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
+      const castOffAt = rec.castOffAt ?? rec.departedAt;
+      const place = (castOffAt !== undefined ? castOffPlace(rec.locationId, rec.destinationAt, all, castOffAt, now) : undefined)
+        ?? placeOf(rec.locationId, all, castOffAt, now);
       const station = all.find((s) => s.id === rec.locationId);
       // A destination still in transit is listed at its origin until it arrives,
       // so a matching slot proves nothing: the ship stays on its own orbit.

@@ -797,3 +797,24 @@ describe('Copilot round 10 (on PR 205)', () => {
     expect(isStationMove({ ...thruster, fromOrbit: { ...thruster.fromOrbit!, since: NOW + 1 } })).toBe(false);
   });
 });
+
+describe('Copilot round 11', () => {
+  it('refuses an unstamped change that leaves a custom orbit, not the slot\'s', () => {
+    const slotR = orbitForSlot(SOV, 0).radiusKm;
+    const mk = (fromRadiusKm: number, fromSince?: number): StationMove => {
+      const plan = planOrbitChange(circularOrbit(planetById(SOV), fromRadiusKm, 0), SOV_R + 3_000, NOW)!;
+      return {
+        stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+        toPlanetId: SOV, toSlot: 0, departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt: NOW, fuel: 5, fuelDrawn: 5,
+        orbit: {
+          fromRadiusKm, fromPhase0: 0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0,
+          ...(fromSince !== undefined ? { fromSince } : {}),
+        },
+      };
+    };
+    expect(isStationMove(mk(slotR))).toBe(true);
+    expect(isStationMove(mk(slotR + 15))).toBe(true); // a trimmed slot orbit
+    expect(isStationMove(mk(SOV_R + 1_020))).toBe(false);
+    expect(isStationMove(mk(SOV_R + 1_020, NOW - 10))).toBe(true);
+  });
+});

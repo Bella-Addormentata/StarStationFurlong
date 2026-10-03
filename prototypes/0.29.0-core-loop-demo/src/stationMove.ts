@@ -110,6 +110,11 @@ function inAltitudeBand(radiusKm: number, planetId: string, slackKm: number): bo
 function orbitChangeFits(o: OrbitChange, planetId: string, slot: number, departAt: number, arriveAt: number): boolean {
   if (!inAltitudeBand(o.fromRadiusKm, planetId, MAX_TRIM_KM) || !inAltitudeBand(o.toRadiusKm, planetId, 0)) return false;
   const planet = planetById(planetId);
+  // Only a change from the slot's own orbit (trimmed, perhaps) goes without a
+  // claim stamp: a custom orbit it leaves is always stamped (sourceClaimOf),
+  // so an unstamped one could never be weighed against other claims.
+  if (o.fromSince === undefined
+    && Math.abs(o.fromRadiusKm - orbitForSlot(planet.id, slot).radiusKm) > MAX_TRIM_KM + 1e-6) return false;
   for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
     if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
   }
