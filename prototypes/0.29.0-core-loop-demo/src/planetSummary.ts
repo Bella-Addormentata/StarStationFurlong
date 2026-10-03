@@ -12,7 +12,9 @@
  *   - per station: its record (name, planet, slot, berth door, and any fields
  *     a newer build adds, carried through untouched), its latest trim and its
  *     latest move to another planet;
- *   - per ship: its name, planet and flight (status, from, to, times).
+ *   - per ship: its name, planet and flight (status, from, to, times), and
+ *     for a ferry on a route its gate, next stop, departure and status word
+ *     (departures boards in rooms its riders never publish to read these).
  *
  * Three levels, not full-atlas gossip:
  *   - your own station: its full atlas, as before (stationAtlas);
@@ -113,6 +115,14 @@ export interface StationSummary {
 
 export const MAX_OWNER_ALIASES = 8;
 
+/** 🚏📋 A route ferry's status, as departures boards show it
+ *  (departuresBoard.ts: BOARDING, ON TIME, HOLDING FOR BERTH, DELAYED,
+ *  NOT DOCKED, PAUSED, ROUTE BLOCKED). */
+export type ShipRouteStatus = 'boarding' | 'on-time' | 'holding' | 'delayed' | 'not-docked' | 'paused' | 'blocked';
+export const SHIP_ROUTE_STATUSES: readonly ShipRouteStatus[] = [
+  'boarding', 'on-time', 'holding', 'delayed', 'not-docked', 'paused', 'blocked',
+];
+
 export interface ShipSummary {
   /** The ship's room id. */
   roomId: string;
@@ -125,6 +135,26 @@ export interface ShipSummary {
   toRoom?: string;
   departedAt?: number;
   etaAt?: number;
+  /** 🚏📋 A ferry on a route (build notes A9 item 7), so an all-gates board
+   *  in a room its riders never publish to can still show it, "as of"
+   *  updatedAt: the gate it is docked at (or bound for), its next stop's
+   *  berth room, its departure from here, and its status word. Additive: an
+   *  older client's clean drops them, and its relay passes the rest. */
+  gate?: number;
+  nextStopRoom?: string;
+  departAt?: number;
+  routeStatus?: ShipRouteStatus;
+  /** 🚏 The run it flies (the route's startedAt), so a board can tell a
+   *  replacement route from a later stop of the one it holds. */
+  routeRun?: number;
+  /** 🚏 The newest checkpoint of that run (its event time: a hold's newest
+   *  sighting, a skip, a pause, a person's departure…), so a board can tell
+   *  that its own copy of the timetable missed one. */
+  routeNews?: number;
+  /** 🏁 No route run flies (none set, not started, or ended). Said outright
+   *  because an older client's relay drops every route field: a summary
+   *  with none of them says nothing about a route. */
+  routeIdle?: true;
   /** Set when the room stopped being a ship (bolted into a station, a
    *  fitting removed): a newer stamp that withdraws the entry everywhere. */
   retired?: true;
@@ -159,6 +189,10 @@ export const SHIP_STALE_MS = 24 * 3600 * 1000;
 /** An unchanged ship's stamp is refreshed this often, so it never goes stale
  *  while its players are aboard. */
 export const SHIP_HEARTBEAT_MS = 3600 * 1000;
+/** 🚏 A ferry on its route re-stamps an unchanged summary once it is this
+ *  old, so a long hold or pause never ages off the boards (they drop a
+ *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
+export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
 const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
 const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
 
@@ -167,6 +201,9 @@ const isName = (v: unknown): v is string => typeof v === 'string' && v.length > 
 const isStamp = (v: unknown, now: number): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= now + MAX_SKEW_MS;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+/** 🚏 A route's run or news time: a whole ms stamp past 0. */
+const isRouteStamp = (v: unknown, now: number): v is number =>
+  Number.isSafeInteger(v) && (v as number) > 0 && isStamp(v, now);
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -357,6 +394,19 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.toRoom !== undefined) out.toRoom = v.toRoom as string;
   if (v.departedAt !== undefined) out.departedAt = v.departedAt as number;
   if (v.etaAt !== undefined) out.etaAt = v.etaAt as number;
+  // 🚏📋 The route fields each stand or drop alone: a bad one never costs
+  // the ship its summary.
+  if (Number.isInteger(v.gate) && (v.gate as number) >= 1 && (v.gate as number) <= 99) out.gate = v.gate as number;
+  if (isId(v.nextStopRoom)) out.nextStopRoom = v.nextStopRoom;
+  if (isTime(v.departAt)) out.departAt = v.departAt;
+  if (typeof v.routeStatus === 'string' && (SHIP_ROUTE_STATUSES as readonly string[]).includes(v.routeStatus)) {
+    out.routeStatus = v.routeStatus as ShipRouteStatus;
+  }
+  // Ordering stamps a board compares against its own copy: skew-bounded
+  // like updatedAt, or one far-future value would outrank it for good.
+  if (isRouteStamp(v.routeRun, now)) out.routeRun = v.routeRun;
+  if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
+  if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
   return out;
 }
@@ -1195,7 +1245,9 @@ export function publishPlanetSummary(now = Date.now()): void {
   if (ship) {
     const s = cleanShipSummary({ ...ship, updatedAt: now }, now);
     const prior = s ? store.ships[s.roomId] : undefined;
-    const same = prior && s && now - prior.updatedAt < SHIP_HEARTBEAT_MS
+    // 🚏 A ferry on its route keeps a shorter heartbeat than other ships.
+    const beat = s?.routeStatus !== undefined ? ROUTE_SUMMARY_REFRESH_MS : SHIP_HEARTBEAT_MS;
+    const same = prior && s && now - prior.updatedAt < beat
       && JSON.stringify({ ...prior, updatedAt: 0 }) === JSON.stringify({ ...s, updatedAt: 0 });
     if (s && !same) store.ships[s.roomId] = { ...s, updatedAt: stampPast(s.roomId) };
   } else {

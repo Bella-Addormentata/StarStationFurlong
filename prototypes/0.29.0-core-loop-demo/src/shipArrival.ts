@@ -19,7 +19,7 @@
  * file nor its tests touch Three or the DOM.
  */
 
-import { stampAfter, type DockPortState } from './dockRules';
+import { dockAnswerOf, stampAfter, type DockAnswer, type DockOpOptions, type DockPortState, type DockRefusal } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
 import { currentRoomId, listStations, planetById, stationInTransit } from './stations';
@@ -59,14 +59,19 @@ export function castOffRefusal(ports: readonly ArrivalPort[]): 'dock-busy' | 'do
   return null;
 }
 
-/** The docking system as departure/arrival drive it (world.ts wires it). */
+/** The docking system as departure/arrival drive it (world.ts and main.ts
+ *  wire it; a route's keeper too, in keeper mode). */
 export interface ShipDockingApi {
   ports: () => ArrivalPort[];
-  undock: (doorId: string) => void;
-  /** The shipped DOCK. Its answer (docking.ts redockPort: false when the far
-   *  berth refused, e.g. taken) lets an arrival try the station's next gate;
-   *  no answer counts as docked. */
-  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
+  /** The shipped UNDOCK. 🚏 `opts.keeper`: a route's keeper casting off the
+   *  route's port (docking.ts's rider carve-out). */
+  undock: (doorId: string, opts?: DockOpOptions) => void | boolean | Promise<boolean | void>;
+  /** The shipped DOCK. Its answer — 🚏 docking.ts redockPortAnswer: docked
+   *  with the dock's stamp, or why not (dockRules.DockAnswer); a bare false
+   *  when the far berth refused, from an older wrapper — lets an arrival try
+   *  the station's next gate and say why none took the ship. No answer
+   *  counts as docked. `opts.keeper`: KEEPER MODE (dockRules.DockOpOptions). */
+  dock: (doorId: string, opts?: DockOpOptions) => void | boolean | DockAnswer | Promise<boolean | void | DockAnswer>;
 }
 
 /** A remembered berth with a pass this client holds for its room — what
@@ -350,20 +355,58 @@ export function castOffForDeparture(stationId: string, docking: ShipDockingApi):
   return remembered;
 }
 
+/** 🧾 The stay of a route a keeper's note is about (routeKeeper.keeperNote):
+ *  the helm shows the note only while it still holds there. */
+export interface RouteNoteStay {
+  run: number;
+  legSeq: number;
+}
+
 /** What the last arrival did — the helm shows it. */
 export type ArrivalOutcome =
   | { kind: 'docking'; stationName: string; gate?: number }
-  /** ⚓🚦 The DOCK went through (reported once the far berth answered). */
-  | { kind: 'docked'; stationName: string; gate?: number }
+  /** ⚓🚦 The DOCK went through (reported once the far berth answered).
+   *  🚏 `gateChange`: a route's ferry docked at another gate than its stop's
+   *  own (choice 9, announced as a gate change). */
+  | { kind: 'docked'; stationName: string; gate?: number; gateChange?: boolean; routeStay?: RouteNoteStay }
   | {
       kind: 'none';
       stationName: string;
-      /** `berths-taken`: every berth tried refused. Usually taken, closed or
-       *  unreachable, but redockPort also refuses for its own reasons (no
-       *  rights, no room to fit, a busy port); the port's panel says which.
-       *  `in-transit`: the destination is between planets. */
-      reason: 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken' | 'in-transit';
+      /**
+       * `berths-taken`: every berth tried refused, and at least one without
+       * saying why (an older docking API's bare false). Usually taken, closed
+       * or unreachable, but redockPort also refuses for its own reasons (no
+       * rights, no room to fit, a busy port); the port's panel says which.
+       * `in-transit`: the destination is between planets.
+       * 🚏 A5, when every berth said why:
+       *   `occupied`     one or more was taken (or the module would overlap
+       *                  there, or the gate is not open to this ship);
+       *   `unreachable`  none could be reached or asked from this game;
+       *   `berth-gone`   every one was removed (its door, or its port).
+       */
+      reason:
+        | 'no-berth' | 'no-port' | 'already-docked' | 'unlisted-station' | 'berths-taken'
+        | 'in-transit' | 'occupied' | 'unreachable' | 'berth-gone';
+      /** 🚏 A route's keeper: what the ferry does about it — holds at the
+       *  stop, skips it (🧾 `why`: every gate gone, or shut to this ferry),
+       *  or rides on (this game could not dock it). */
+      route?: { action: 'hold' | 'skip' | 'ride-on'; nextStopName: string; why?: 'gone' | 'shut' };
+      routeStay?: RouteNoteStay;
     };
+
+/** 🚏 Why a whole arrival refused, from each berth's DOCK answer (A5):
+ *  `berth-gone` when every berth was removed, `occupied` when any was taken
+ *  (or shut to this ship), `unreachable` when none could be asked or reached,
+ *  and `berths-taken` when any answer came without a reason. */
+export function arrivalRefusal(reasons: readonly DockRefusal[]): 'berths-taken' | 'occupied' | 'unreachable' | 'berth-gone' {
+  if (reasons.length === 0 || reasons.includes('refused')) return 'berths-taken';
+  if (reasons.every((r) => r === 'gone' || r === 'closed')) return 'berth-gone';
+  const taken: readonly DockRefusal[] = ['occupied', 'overlap', 'not-allowed', 'superseded'];
+  if (reasons.some((r) => taken.includes(r))) return 'occupied';
+  const unreached: readonly DockRefusal[] = ['unreachable', 'no-address', 'no-far-door', 'no-writer'];
+  if (reasons.every((r) => unreached.includes(r) || r === 'gone' || r === 'closed')) return 'unreachable';
+  return 'berths-taken';
+}
 
 /** How long an arrival waits for a commander who can dock (station records
  *  and passes are per install) before any commander settles it berthless. */
@@ -494,6 +537,7 @@ async function dockThroughBerths(
   shipRoomId?: string,
 ): Promise<void> {
   // `first` was planned for candidates[0] (planArrivalDock's own pick).
+  const reasons: DockRefusal[] = [];
   for (let i = 0; i < candidates.length || i === 0; i++) {
     // The docking system outlives a room swap and reads whichever room is
     // bound now: once the player has left the ship's room, a retry would
@@ -514,19 +558,20 @@ async function dockThroughBerths(
       return;
     }
     if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
-    let ok: boolean | void = false;
+    let answer: DockAnswer = { ok: false, reason: 'refused' };
     try {
-      ok = await docking.dock(plan.doorId);
+      answer = dockAnswerOf(await docking.dock(plan.doorId));
     } catch (err) {
       console.warn('[ship] arrival DOCK threw:', err);
     }
     // The await may have outlived the ship's room: the answer belongs to a
     // room no longer shown, so say nothing.
     if (shipRoomId !== undefined && currentRoomId() !== shipRoomId) return;
-    if (ok !== false) {
+    if (answer.ok) {
       onSettled?.({ kind: 'docked', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) });
       return;
     }
+    reasons.push(answer.reason);
   }
   // Every berth refused: unless another commander docked the ship while
   // the last one was answering.
@@ -537,5 +582,7 @@ async function dockThroughBerths(
     onSettled?.({ kind: 'docked', stationName: station.name, ...(gate !== undefined ? { gate } : {}) });
     return;
   }
-  onSettled?.({ kind: 'none', stationName: station.name, reason: 'berths-taken' });
+  // 🚏 A5: say why, when every berth said why (the helm's note no longer
+  // shows a refused berth as green, nor one reason for all).
+  onSettled?.({ kind: 'none', stationName: station.name, reason: arrivalRefusal(reasons) });
 }

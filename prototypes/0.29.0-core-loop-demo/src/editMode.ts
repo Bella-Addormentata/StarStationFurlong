@@ -112,6 +112,12 @@ import { showHint } from './hud';
 import { isDeviceFocusActive } from './deviceFocus';
 import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
+// 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
+import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
+// 🚏 …and so do the last helm, engine and fuel tank aboard.
+import { readShipRoute, routeRulesFlightNow } from './shipRoute';
+import { isRouteRunning } from './pilotRoute';
+import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2201,6 +2207,37 @@ class RoomEditController {
       showHint("CAN'T REMOVE — the room terminal is the way back into edit mode.", 2600);
       return;
     }
+    // 🚀 The robot captain's charging dock (itself, or mounted under the item)
+    // can't go while the ship's route runs: the route names it, and its robot
+    // walks the helm and the berth door. Stop the route at the helm first.
+    const captainDock = readRouteCaptainDockId();
+    if (captainDock && (itemId === captainDock || mountDescendantsOf(itemId).some((c) => c.id === captainDock))) {
+      showHint(`CAN'T REMOVE — ${CAPTAIN_LOCK_REFUSAL}.`, 2800);
+      return;
+    }
+    let routeRuns = false;
+    try {
+      routeRuns = isRouteRunning(readShipRoute());
+    } catch {
+      routeRuns = false;
+    }
+    const going = new Set([itemId, ...mountDescendantsOf(itemId).map((c) => c.id)]);
+    const lastPart = lastRoutePartTaken(itemId, FURNITURE, going, routeRuns);
+    if (lastPart) {
+      showHint(`CAN'T REMOVE — the ship's route is running and this is its last ${lastPart}. Stop the route at the helm first.`, 3200);
+      return;
+    }
+    // ⛽ …and while the timetable flies the ship, no tank comes off at all.
+    let timetableRules = false;
+    try {
+      timetableRules = routeRulesFlightNow();
+    } catch {
+      timetableRules = false;
+    }
+    if (tanksLockedByRoute(FURNITURE, FURNITURE.filter((i) => !going.has(i.id)), timetableRules)) {
+      showHint(`CAN'T REMOVE — ${TANKS_LOCK_REFUSAL}.`, 3200);
+      return;
+    }
     if (import.meta.env.DEV && isDeviceFocusActive()) {
       console.error('[editMode] removeSelected during device focus — the edit-mode/device-focus mutual exclusion is broken');
     }
@@ -2288,6 +2325,18 @@ class RoomEditController {
   private removeSelectedDoor(doorId: string): void {
     const world = this.world;
     if (!world) return;
+    // 🚏 The running route's ship port: the keeper docks through it at every
+    // stop, and in flight it is unpaired, so the check below would let it go.
+    let route: ReturnType<typeof readShipRoute> = null;
+    try {
+      route = readShipRoute();
+    } catch {
+      route = null;
+    }
+    if (routePortTaken(doorId, route)) {
+      showHint("CAN'T REMOVE — the ship's route docks through this door. Stop the route at the helm first.", 3200);
+      return;
+    }
     if (world.dockingSystem?.isDoorPaired(doorId)) {
       showHint('Unpair this door first (open its keypad), then remove it.', 2800);
       return;

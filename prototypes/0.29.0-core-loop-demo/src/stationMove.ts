@@ -424,6 +424,9 @@ export function towFuelCost(deltaVKmS: number, stationModules: number): number {
 export type TowRefusal =
   | 'not-docked' // the ship is not docked at a known station
   | 'not-commander'
+  /** 🚏 The tug runs a ferry route: its keeper would cast off from the
+   *  station mid-tow (and a tow pins the ship the route moves). */
+  | 'route-running'
   | 'moving' // the station is already scheduled to move, or moving
   | 'same-planet'
   | 'no-slot'
@@ -447,6 +450,9 @@ export interface TowContext {
    *  its layout (its welcome room is not in the atlas), and no tow is priced. */
   modules: number;
   now: number;
+  /** 🚏 A ferry route runs on the tug (shipRoute.isRouteRunning): STOP it
+   *  first. Absent reads as none (an older caller). */
+  routeRunning?: boolean;
 }
 
 export interface TowQuote {
@@ -485,6 +491,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
   const { station, now } = ctx;
   if (!station) return { ok: false, refusal: 'not-docked', quote: null };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  if (ctx.routeRunning === true) return { ok: false, refusal: 'route-running', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
   // A tow's price scales with the modules pushed: one guessed from a layout
@@ -519,6 +526,7 @@ export function describeTowRefusal(refusal: TowRefusal, quote: TowQuote | null, 
   switch (refusal) {
     case 'not-docked': return 'Dock at a station to tow it.';
     case 'not-commander': return 'Only the ship\'s owner can tow.';
+    case 'route-running': return 'Stop the ferry route to tow: its timetable would cast the tug off mid-tow.';
     case 'moving': return 'That station is already scheduled to move, or moving.';
     case 'same-planet': return 'The station already orbits that planet.';
     case 'no-slot': return 'Every orbit around that planet is taken.';

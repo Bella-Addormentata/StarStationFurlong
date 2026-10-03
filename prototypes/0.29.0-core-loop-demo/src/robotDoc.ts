@@ -15,7 +15,15 @@
 
 import * as Y from 'yjs';
 
-export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom' | 'coach' | 'dance';
+/** 🚀 'pilot' (robot pilot routes, design §2a): the Ship pilot routine. It holds
+ *  no route: it makes the dock's robot ELIGIBLE to be named the ship's robot
+ *  captain at the helm (shipPilot.ts), and while a running route names it the
+ *  robot walks to the helm and the berth door and announces the timetable.
+ *  Offered at the console only in a flight-capable module. An older client
+ *  reads a config with an unknown routine as unprogrammed (isRobotConfig
+ *  rejects it), so its copy of the robot serves drinks: it degrades, and
+ *  nothing it reads is corrupted. */
+export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom' | 'coach' | 'dance' | 'pilot';
 
 /** 🤖 #77C s4: one bounded step of an owner-authored routine (a chip list, NOT
  *  a DSL). The robot loops the list: walk to a spot, say a line, or pause. */
@@ -37,7 +45,7 @@ export interface RobotConfig {
   parked?: boolean;
 }
 
-export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom', 'coach', 'dance'];
+export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom', 'coach', 'dance', 'pilot'];
 
 /** Human labels for the routine dropdown. */
 export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
@@ -47,6 +55,7 @@ export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
   custom: 'Custom script',
   coach: '🏋️ Fitness coach',
   dance: '🎉 Party dancer',
+  pilot: '🚀 Ship pilot',
 };
 
 let boundDoc: Y.Doc | null = null;

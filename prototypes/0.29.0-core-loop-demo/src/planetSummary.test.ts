@@ -11,6 +11,7 @@ import { ORBIT_EPOCH_MS, orbitForSlot, setStationTrimResolver, stationOrbit } fr
 import {
   LEARNED_PREFIX,
   MAX_TRIM_GONE,
+  SHIP_HEARTBEAT_MS,
   SHIP_STALE_MS,
   bindPlanetSummaryDoc,
   cleanShipSummary,
@@ -20,6 +21,7 @@ import {
   learnedRecord,
   mergeStation,
   publishPlanetSummary,
+  ROUTE_SUMMARY_REFRESH_MS,
   readStore,
   refreshTrims,
   registerLearnedStations,
@@ -242,6 +244,34 @@ describe('guards', () => {
     expect(cleanShipSummary({ ...ship, status: 'warp' }, T0)).toBeNull();
     expect(cleanShipSummary({ ...ship, etaAt: Infinity }, T0)).toBeNull();
     expect(cleanShipSummary({ ...ship, seed: 'secret' }, T0)).not.toHaveProperty('seed');
+  });
+
+  it('keeps a route ferry\'s gate, next stop, departure and status; a bad one drops alone', () => {
+    const ship = {
+      roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a',
+      gate: 2, nextStopRoom: 'room-b', departAt: T0 + 60_000, routeStatus: 'boarding', routeRun: T0 - 60_000, routeNews: T0 - 30_000, updatedAt: T0,
+    };
+    expect(cleanShipSummary(ship, T0)).toEqual(ship);
+    for (const [field, bad] of [['gate', 0], ['gate', 100], ['gate', 1.5], ['nextStopRoom', ''], ['nextStopRoom', 'r'.repeat(129)],
+      ['departAt', Infinity], ['routeStatus', 'teleporting'], ['routeStatus', 3], ['routeRun', 0], ['routeRun', 1.5], ['routeRun', 'x'],
+      ['routeNews', 0], ['routeNews', 1.5], ['routeNews', 'x'],
+      // Far-future ordering stamps (past the 6 h skew every stamp gets).
+      ['routeRun', T0 + 6 * 3600_000 + 1], ['routeNews', T0 + 6 * 3600_000 + 1]] as const) {
+      const clean = cleanShipSummary({ ...ship, [field]: bad }, T0);
+      expect(clean).not.toBeNull();
+      expect(clean).not.toHaveProperty(field);
+      expect(clean?.status).toBe('docked');
+    }
+    // A clock a little ahead is still a stamp.
+    const ahead = { ...ship, routeRun: T0 + 60_000, routeNews: T0 + 6 * 3600_000 };
+    expect(cleanShipSummary(ahead, T0)).toEqual(ahead);
+  });
+
+  it('🏁 keeps "no run flies" only as said, and never beside a route status', () => {
+    const idle = { roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a', routeIdle: true, updatedAt: T0 };
+    expect(cleanShipSummary(idle, T0)).toEqual(idle);
+    expect(cleanShipSummary({ ...idle, routeIdle: 'yes' }, T0)).not.toHaveProperty('routeIdle');
+    expect(cleanShipSummary({ ...idle, routeStatus: 'boarding' }, T0)).not.toHaveProperty('routeIdle');
   });
 });
 
@@ -837,6 +867,28 @@ describe('ships and the solar system', () => {
     status = { ...ship, status: 'in-flight', toRoom: 'room-b', departedAt: T0, etaAt: T0 + 60_000 };
     publishPlanetSummary(Date.now() + 1);
     expect(doc.getMap('shipSummaries').get('room-ship')).toMatchObject({ status: 'in-flight', toRoom: 'room-b' });
+  });
+
+  it('🚏 re-stamps an unchanged ferry summary once it is 15 minutes old, and only a ferry\'s', () => {
+    const ferry: ShipStatusInput = { ...ship, gate: 2, nextStopRoom: 'room-b', routeStatus: 'holding' };
+    let status: ShipStatusInput = ferry;
+    const doc = new Y.Doc();
+    const t0 = Date.now();
+    bindPlanetSummaryDoc(doc, install(null, { ship: () => status }));
+    const stamp = () => (doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt;
+    const first = stamp();
+    publishPlanetSummary(t0 + ROUTE_SUMMARY_REFRESH_MS - 60_000);
+    expect(stamp()).toBe(first);
+    publishPlanetSummary(first + ROUTE_SUMMARY_REFRESH_MS);
+    expect(stamp()).toBe(first + ROUTE_SUMMARY_REFRESH_MS);
+    // A ship on no route keeps its stamp until the hourly heartbeat.
+    status = ship;
+    publishPlanetSummary(first + ROUTE_SUMMARY_REFRESH_MS + 1);
+    const plain = stamp();
+    publishPlanetSummary(plain + 2 * ROUTE_SUMMARY_REFRESH_MS);
+    expect(stamp()).toBe(plain);
+    publishPlanetSummary(plain + SHIP_HEARTBEAT_MS);
+    expect(stamp()).toBe(plain + SHIP_HEARTBEAT_MS);
   });
 
   it('settles a same-moment pair of ship values the same way in the doc', () => {

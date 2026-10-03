@@ -64,15 +64,16 @@ export function applyFarDockRequest(
     writeDoorRecordTo(doc, farDoor, patch.record);
     return { result: { ok: true, detail: 'written' }, wrote: true };
   }
+  // The requester's key is its own claim, as every door write is in the
+  // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
+  const access = gateAccessIn(doc, req.farDoor, req.requesterPub);
   const patch = farDockPatch(
     readDoorFrom(doc, req.farDoor),
     farBerth(doc, req.farDoor),
     near,
     req.dockedAt,
     req.replacesUndockedAt,
-    // The requester's key is its own claim, as every door write is in the
-    // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
-    gateAccessIn(doc, req.farDoor, req.requesterPub),
+    access,
   );
   if (patch.action === 'refuse') {
     return {
@@ -80,6 +81,10 @@ export function applyFarDockRequest(
         ok: false,
         reason: patch.reason,
         ...(patch.stamp !== undefined ? { stamp: patch.stamp } : {}),
+        // 🚏⚓🚦 Which setting refused: a route's keeper tells a gate open
+        // only to granted captains (this rider's key) from one shut to the
+        // ship. Additive; the refusal itself is farDockPatch's, unchanged.
+        ...(patch.reason === 'not-allowed' && access.access !== 'open' ? { gateAccess: access.access } : {}),
       },
       wrote: false,
     };
@@ -419,8 +424,9 @@ async function session(
 /** Wait for roomStateReady on a doc that is not the active one. Until it
  *  holds, the replica is EMPTY (or, for a room hosted elsewhere, possibly
  *  STALE), and neither is knowledge about the room — a decision made on it
- *  could overwrite a record it simply had not received yet. */
-function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean): Promise<boolean> {
+ *  could overwrite a record it simply had not received yet. (🚏📋 Exported
+ *  for departuresWrite.ts, whose sessions wait the same way.) */
+export function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean): Promise<boolean> {
   const roomMap = sync.doc.getMap('roomInfo');
   const ready = () =>
     roomStateReady({
@@ -463,7 +469,7 @@ function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean)
   });
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
     p.then(

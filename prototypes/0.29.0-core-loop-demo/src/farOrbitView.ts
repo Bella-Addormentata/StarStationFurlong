@@ -42,7 +42,10 @@ import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
-import { readFlightRecord, shipDocBound } from './shipDoc';
+import { shipDocBound } from './shipDoc';
+// 🚏 A ferry route's leg is flown by its timetable, never written to the
+// stored flight (robot pilot routes, build notes A4): the resolved flight.
+import { readResolvedFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -228,7 +231,9 @@ function readSource(now: number): Source {
   // the planet from that orbit, not from the ship's own one-room station.
   let adrift: Place | null = null;
   if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
-    const rec = readFlightRecord();
+    // 🚏 A running ferry route's timetable while it rules the flight (its
+    // legs write no stored `flight`), else the stored record.
+    const rec = readResolvedFlight(now);
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;

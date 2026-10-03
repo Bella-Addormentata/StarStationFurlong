@@ -1680,6 +1680,43 @@ describe('another consumer drawing through its own meter (a station move, say)',
   });
 });
 
+describe('an owed meter (the ferry route\'s debt) beside the trims', () => {
+  const ROUTE = 'test-owed';
+  afterEach(() => setFuelDrawMeter(ROUTE, null));
+
+  it('comes off the ceiling in full, so station keeping yields to it', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    const map = doc.getMap('route');
+    setFuelDrawMeter(ROUTE, {
+      owed: true,
+      read: () => (map.get('owed') as number | undefined) ?? 0,
+      subscribe: (listener) => {
+        map.observe(listener);
+        return () => map.unobserve(listener);
+      },
+    });
+    writeFuelLevel(10, 100);
+    map.set('owed', 4);
+    expect(fuelCeiling(SK)).toBe(10 - 4);
+    const b1 = press('raise', T0);
+    press('raise', T0 + BURN_MS);
+    expect(readFuelLevel()).toBe(10 - 4 - 2 * TRIM_FUEL);
+    // The route's debt grows past what the burns left: the latest is dropped.
+    map.set('owed', 9);
+    expect(fuelCeiling(SK)).toBe(TRIM_FUEL);
+    expect(readFuelDrawn()).toBe(TRIM_FUEL);
+    expect(readOrbitTrim()).toEqual(replayBurns([b1]).trim);
+    expect(readFuelLevel()).toBe(0);
+    // A reading recorded for it by a build from before it was owed changes
+    // nothing: the gauge takes the whole debt, and so does the ceiling.
+    doc.getMap('ship').set('fuel', { level: 10, meters: { [ROUTE]: 3 } });
+    map.set('owed', 4);
+    expect(readFuelLevel()).toBe(10 - 4 - 2 * TRIM_FUEL);
+    expect(fuelCeiling(SK)).toBe(10 - 4);
+  });
+});
+
 describe('with a trim resolver installed (orbits.setStationTrimResolver)', () => {
   afterEach(() => setStationTrimResolver(null));
 

@@ -37,16 +37,37 @@ import {
   clampFuelToCapacity,
   findDestination,
   flightArrived,
-  flightProgress,
   fuelDrawDeficit,
   readFlightRecord,
   readFuelLevel,
+  readStationBerth,
   subscribeShip,
   writeFlightRecord,
   writeFuelLevel,
 } from './shipDoc';
+import type { FlightRecord } from './shipDoc';
+// 🚏 A4: while a ferry route runs, its timetable is the flight every reader
+// here follows (readResolvedFlight), and REFUEL goes through the route.
+import {
+  MAX_ROUTE_STOPS, readResolvedFlight, readRouteFlight, readShipRoute, refuelShipRoute, resolveShipFlight,
+  routeRulesFlightNow, routeToWire, routeWithoutRun, writeShipRoute,
+} from './shipRoute';
+import type { ShipRoute } from './shipRoute';
+// 🚏🧑‍✈️ The helm's ROUTE panel and a person flying the route (slice 4).
+import { isRouteRunning, routeRulesFlight, stopAt, stopPairWindow, type RouteFlight } from './pilotRoute';
+import {
+  ROUTE_WAIT_CHOICES,
+  addDraftStop, checkRouteDraft, choiceIndexFor, departRouteFromHelm, describeGateChoice, describeRouteProblem,
+  describeRouteStartRefusal, draftFromRoute, draftLegAfter, formatClock, formatRouteSpan, formatWait,
+  handOverRoute, helmFlightFigures, moveDraftStop, pauseRouteFromHelm, readHelmCheckpoints, refreshDraftStops,
+  removeDraftStop, resumeRouteFromHelm, resumeStopIndex, routeDepartLine, routeDepartState, routeEndStopIndex, routeFromDraft,
+  routeHelmView, routeNoteStands, routePathLabel, routeRenderKey, routeStartRefusal, routeStatusLine, routeStopCandidates,
+  routeStopIndexAt, type RouteNoteTie,
+  setDraftAnyGate, setDraftBerth, setDraftWait, skipRouteStop, startRouteFromHelm, stopRouteFromHelm,
+  type RouteDraft, type RouteStopCandidate,
+} from './helmRoute';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { adriftAt, adriftPlace, destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { adriftAt, adriftPlace, destinationsFrom, isKnownStation, localStationId, planHop, stationHere } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
 import {
   TUG_MIN_ENGINES,
@@ -64,7 +85,7 @@ import {
   writeStationMove,
 } from './stationMove';
 import type { TowContext } from './stationMove';
-import { currentRoomId, listStations as listStationRecordsNow, planetById, stationInTransit } from './stations';
+import { currentRoomId, listStations as listStationRecordsNow, planetById, stationInTransit, stationsAroundPlanet } from './stations';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
@@ -72,10 +93,12 @@ import {
   castOffRefusal,
   rememberBerthHere,
   completeArrival,
+  resolveRememberedBerth,
   shipLocationId,
   type ArrivalOutcome,
   type ShipDockingApi,
 } from './shipArrival';
+import type { DockAnswer } from './dockRules';
 // #30 SH3: the helm enumerates the room's paired doors so canDepart can
 // refuse a permanent connector-chain (a chained module cannot fly, by
 // construction — plan §5.1). DEPART also detaches any transient berth.
@@ -199,6 +222,21 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+// 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
+import {
+  consoleRoutineRefusal,
+  freshHelmAnnouncer,
+  helmAnnouncerStep,
+  pilotRoutineOffered,
+  readPilotView,
+  routeCaptainDockId,
+  shipPilotEligible,
+  skipLine,
+  type HelmAnnouncer,
+} from './shipPilot';
+import { rowText } from './departuresBoard';
+import type { BoardView } from './departuresBoard';
+import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './departuresDoc';
 import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
@@ -214,7 +252,7 @@ function destinationAtOf(stationId: string): { destinationAt?: string } {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -302,6 +340,19 @@ export interface WallComputerStatus {
   roomName: string;
   peers: number;
   nodeOnline: boolean;
+  /** 🚏📋 A departures board's rows (build notes A6): World fills them per
+   *  screen, for the screens that ask (WallScreenHandle.departures); the
+   *  plain terminal ignores them. */
+  departures?: DepartureScreen;
+}
+
+/** 🚏📋 A board's rows as its screen prints them (departuresBoard.rowText). */
+export interface DepartureScreen {
+  /** "DEPARTURES · ALL GATES" / "DEPARTURES · GATE 2". */
+  title: string;
+  rows: Array<{ ferry: string; place: string; gate: string; time: string; status: string; note: string }>;
+  /** Nothing to show, and why ("NO FERRIES DUE", "NO DEPARTURES NEWS"). */
+  empty?: string;
 }
 
 /**
@@ -314,6 +365,42 @@ export interface WallScreenHandle {
   updateStatus(status: WallComputerStatus): void;
   /** Dim the in-world screen to "TERMINAL IN USE" while a player is focused. */
   setEngaged(engaged: boolean): void;
+  /** 🚏📋 A departures board (the wall computer's wide variant): World adds
+   *  its rows to the status it pushes. */
+  readonly departures?: boolean;
+}
+
+// ── 🚏📋 Departures boards (robot pilot routes, A6 + A9 item 7) ──────────────
+
+/** Where a board's rows come from (main.ts installs it: the room's
+ *  departures map, its berth doors, the planet's ship summaries). */
+let departureBoardSource: ((itemId: string) => BoardView | null) | null = null;
+
+export function setDepartureBoardSource(fn: ((itemId: string) => BoardView | null) | null): void {
+  departureBoardSource = fn;
+}
+
+/** A board's rows now, or null when nothing is installed or the read failed
+ *  (the screen then says so; it never throws into World's frame loop). */
+export function readDepartureBoard(itemId: string): BoardView | null {
+  if (!departureBoardSource) return null;
+  try {
+    return departureBoardSource(itemId);
+  } catch (err) {
+    console.warn('[departures] board read failed:', err);
+    return null;
+  }
+}
+
+/** A board's rows as its in-world screen prints them. */
+export function readDepartureScreen(itemId: string): DepartureScreen {
+  const view = readDepartureBoard(itemId);
+  if (!view) return { title: 'DEPARTURES', rows: [], empty: 'NO DEPARTURES NEWS' };
+  return {
+    title: view.title,
+    rows: view.rows.map(rowText),
+    ...(view.rows.length === 0 ? { empty: view.gate !== null ? `NO FERRIES DUE AT GATE ${view.gate}` : 'NO FERRIES DUE' } : {}),
+  };
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────
@@ -2005,7 +2092,8 @@ const HELM_TICK_MS = 250;
  *  first, then where its last flight left it; in flight it is at none. */
 function holotableStation(): StationRecord | null {
   if (!isShipReady()) return currentStation();
-  const flight = readFlightRecord();
+  // 🚏 A running route's timetable, when it rules the flight (A4).
+  const flight = readResolvedFlight();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
   return listStationRecords().find((st) => st.id === id) ?? null;
@@ -2061,8 +2149,11 @@ function enumerateTransientBerths(): string[] {
  *  is invoked ONLY from (a) the helm's doc observers (furniture / ship /
  *  doors — event-driven, not per-frame), (b) discrete user gestures (picker
  *  change, refuel arm, depart / redock click), (c) the mount()-side initial
- *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY while
- *  `readFlightRecord().status === 'in-flight'`. World.update / animate() /
+ *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY on
+ *  the tick the resolved flight (🚏 readResolvedFlight: a ferry route's
+ *  timetable, or the stored record) or its in-flight phase changes; in
+ *  flight it otherwise writes the moving numbers in place
+ *  (helmFlightFigures). World.update / animate() /
  *  requestAnimationFrame never call render() (grep-verified). No cache added:
  *  the walk is FURNITURE.filter over a bounded compile-time array — 3 tag
  *  lookups per render — and caching by furniture-map-change would add a
@@ -2083,6 +2174,50 @@ export function isShipReady(): boolean {
       && countFunction('helm') >= 1;
 }
 
+/** 🚏 The tanks' derived capacity (tanks × TANK_CAPACITY): what the route's
+ *  fuel meter and timetable clamp to (main.ts installs them with it). */
+export function shipFuelCapacity(): number {
+  return countFunction('fuelTank') * TANK_CAPACITY;
+}
+
+// ── 🚏🤖 The robot captain (design §2a) ───────────────────────────────────────
+//
+// A charging dock aboard whose robot runs the 🚀 Ship pilot routine
+// (robotDoc.ts `pilot`) may be named the route's robot captain at the helm,
+// while the module can fly (shipPilot.shipPilotEligible). A test or a later
+// rule may install its own check. Whether a RUNNING route has a robot captain
+// is never read from here: the timetable reads route.robotDockId alone.
+
+let robotCaptainCheck: ((dockItemId: string) => boolean) | null = null;
+
+/** Replace (or, with null, restore) how the helm decides a charging dock's
+ *  robot may be the ship's robot captain. */
+export function setRobotCaptainCheck(fn: ((dockItemId: string) => boolean) | null): void {
+  robotCaptainCheck = fn;
+}
+
+/** May the robot of charging dock `dockItemId` (in this module) be the
+ *  ship's robot captain? */
+export function robotCaptainEligible(dockItemId: string): boolean {
+  if (!FURNITURE.some((i) => i.id === dockItemId && i.kind === 'charging-dock')) return false;
+  try {
+    return robotCaptainCheck
+      ? robotCaptainCheck(dockItemId) === true
+      : shipPilotEligible({ dockAboard: true, routine: readRobotConfig(dockItemId)?.routine, flightCapable: isShipReady() });
+  } catch {
+    return false;
+  }
+}
+
+/** Every charging dock aboard, for the route editor's pilot picker. */
+export function robotCaptainOptions(): Array<{ dockId: string; label: string; eligible: boolean }> {
+  return FURNITURE.filter((i) => i.kind === 'charging-dock').map((i, n) => ({
+    dockId: i.id,
+    label: `🤖 Robot captain (charging dock ${n + 1})`,
+    eligible: robotCaptainEligible(i.id),
+  }));
+}
+
 /**
  * ⚓ #163: what the helm's DOCKING COMPUTER reads and does. world.ts wires it
  * to the room's docking system — the same DOCK / UNDOCK the door panel runs,
@@ -2096,8 +2231,10 @@ export interface HelmDockingDeps {
   /** Subscribe to port changes; returns the unsubscribe. */
   subscribe: (cb: () => void) => () => void;
   undock: (doorId: string) => void;
-  /** The shipped DOCK; its answer (false: refused) lets an arrival try the next berth. */
-  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
+  /** The shipped DOCK; its answer (🚏 docking.ts redockPortAnswer: docked, or
+   *  why not; a bare false: refused) lets an arrival try the next berth and
+   *  say why none took the ship. */
+  dock: (doorId: string) => void | boolean | DockAnswer | Promise<boolean | void | DockAnswer>;
 }
 
 /** Port marker colours on the ship atlas (and the status words beside them). */
@@ -2121,12 +2258,21 @@ function portStatusText(p: DockPortView): string {
 /** What the last arrival did, in the helm's words — set by whichever path
  *  finished the flight (the open helm's tick, or main.ts's 1 Hz watch), shown
  *  on the next docked render. Cleared at DEPART. */
-let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
+let lastArrivalNote: ArrivalNote | null = null;
 /** Open helms re-render when the note changes — an arrival finished by
  *  main.ts's watch writes no doc value the helm observes. */
 const arrivalNoteListeners = new Set<() => void>();
 
-function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
+/** 🧾 `tie`: a route keeper's note, shown only while it still holds at its
+ *  stay (helmRoute.routeNoteStands): another rider's dock, STOP or SKIP ends
+ *  a hold, and the ferry moving on ends every other one. */
+interface ArrivalNote {
+  text: string;
+  tone: 'ok' | 'warn';
+  tie?: RouteNoteTie;
+}
+
+function setArrivalNote(note: ArrivalNote | null): void {
   lastArrivalNote = note;
   for (const fn of arrivalNoteListeners) fn();
 }
@@ -2162,11 +2308,35 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     return;
   }
   if (outcome.kind === 'docked') {
+    // 🚏 A route's ferry announces a gate change (choice 9).
     setArrivalNote({
-      text: outcome.gate !== undefined
-        ? `Docked at ${outcome.stationName}, gate ${outcome.gate}.`
-        : `Docked at ${outcome.stationName}.`,
+      text: outcome.gateChange && outcome.gate !== undefined
+        ? `Gate change: docked at ${outcome.stationName}, gate ${outcome.gate}.`
+        : outcome.gate !== undefined
+          ? `Docked at ${outcome.stationName}, gate ${outcome.gate}.`
+          : `Docked at ${outcome.stationName}.`,
       tone: 'ok',
+      ...(outcome.routeStay ? { tie: { ...outcome.routeStay } } : {}),
+    });
+    return;
+  }
+  // 🚏 A route's keeper says what the ferry does about a refusal (A5).
+  const route = outcome.route;
+  if (route) {
+    const at = outcome.stationName;
+    setArrivalNote({
+      tone: 'warn',
+      ...(outcome.routeStay ? { tie: { ...outcome.routeStay, ...(route.action === 'hold' ? { hold: true } : {}) } } : {}),
+      text: route.action === 'hold'
+        ? `Berth at ${at} is occupied. Holding until it is free.`
+        : route.action === 'skip'
+          // 🧾 The captain's §4 line: removed, or closed to this ferry.
+          ? skipLine(route.why ?? 'gone', at, route.nextStopName)
+          : outcome.reason === 'no-berth'
+            ? `Can't open the berth at ${at} from here (no pass). Riding on to ${route.nextStopName}.`
+            : outcome.reason === 'unreachable'
+              ? `Can't reach the berth at ${at} from here. Riding on to ${route.nextStopName} unless another rider docks.`
+              : `Can't dock at ${at} from here. Riding on to ${route.nextStopName} unless another rider docks.`,
     });
     return;
   }
@@ -2174,6 +2344,12 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
     tone: 'warn',
     text: outcome.reason === 'berths-taken'
       ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, closed, out of reach, not open to this ship, or no rights or room at the port). Check the dock port's panel, dock from it when that clears, or ask the station's owner for a grant at a gate that admits only granted captains.`
+      : outcome.reason === 'occupied'
+      ? `Arrived at ${outcome.stationName} — every berth the ship tried is occupied (or not open to this ship). Dock from a door panel when one frees up.`
+      : outcome.reason === 'unreachable'
+      ? `Arrived at ${outcome.stationName} — its berths could not be reached from here, so the ship did not dock. Try DOCK from a door panel.`
+      : outcome.reason === 'berth-gone'
+      ? `Arrived at ${outcome.stationName} — the berth the ship knew there has been removed. Dock from a door panel at another one.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
       : outcome.reason === 'in-transit'
@@ -2221,6 +2397,40 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     ? { ports: docking.ports, undock: docking.undock, dock: docking.dock }
     : null;
 
+  // 🚏 The ROUTE panel (helmRoute.ts): the editor works on a local draft (a
+  // route needs two stops before it can be saved, and a peer's save must not
+  // be overwritten by a half-built one). `draftSeed` is the saved route the
+  // draft was taken from; an unedited draft follows the saved route.
+  let routeOpen = false;
+  let draft: RouteDraft | null = null;
+  let draftDirty = false;
+  let draftSeed = '';
+  /** A route answer said under its buttons for a moment. */
+  let routeFlash: { text: string; tone: 'ok' | 'warn'; until: number } | null = null;
+  /** The picker value for the route's next stop when this game does not list
+   *  it (the route DEPART still flies there: it plans from its own copy). */
+  const ROUTE_NEXT = 'route:next';
+  /** The run and stay the picker was last put on the next stop for. */
+  let pickerRouteKey = '';
+  /** 🚏📢 Design §5: the captain's lines, shown at the helm too (a person
+   *  flying with no robot captain hears no robot). Its own memory, local to
+   *  this open helm (shipPilot.helmAnnouncerStep); stepped once a second. */
+  let announcer: HelmAnnouncer = freshHelmAnnouncer();
+  let announcedAt = 0;
+
+  const flashRoute = (text: string, tone: 'ok' | 'warn' = 'warn'): void => {
+    routeFlash = { text, tone, until: Date.now() + 8_000 };
+  };
+  /** Does this game hold a pass for `roomId` (choice 6: the editor warns
+   *  about stops it holds none for)? */
+  const holdsPassFor = (roomId: string): boolean =>
+    resolveRememberedBerth({ doorId: 'north', roomId }, shipDocking?.ports() ?? []) !== null;
+  /** The port a new route docks with: the one docked now, else the first. */
+  const defaultRoutePort = (ports: DockPortView[]): string | null =>
+    (ports.find((p) => p.state.kind === 'docked') ?? ports[0])?.doorId ?? null;
+  const routeSeed = (r: ShipRoute | null): string =>
+    JSON.stringify(r ? routeToWire(routeWithoutRun(r)) : null);
+
   const esc = (s: string) =>
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
@@ -2238,13 +2448,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const engines = countFunction('engine');
     const helms = countFunction('helm');
     const capacity = tanks * TANK_CAPACITY;
+    const now = Date.now();
+    // 🚏 A4: the route's timetable while it rules the flight, else the stored
+    // record (routeFlight is null then).
+    const { flight, route: routeFlight } = resolveShipFlight(now);
     const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
-    const flight = readFlightRecord();
     const commander = helmIsCommander();
     const chained = enumerateChainedDoors();
-    const now = Date.now();
-    const arrived = flightArrived(flight, now);
-    const progress = flightProgress(flight, now);
     // A station that dropped out of the directory is named as unlisted, never
     // passed off as home (findDestination's fallback).
     const named = (id: string) => {
@@ -2258,20 +2468,44 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const location = named(shipLocationId(flight, hasLiveDock()));
     const destination = flight.destinationId ? named(flight.destinationId) : null;
     const choices = destinationsFrom(location.id);
-    if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
-    const pickerDest = pickerDestId ? findDestination(pickerDestId) : null;
+    // 🚏 The ship's route: saved, running (a paused one included: routeRun),
+    // and — while its timetable rules the flight — the next stop, which the
+    // picker starts on at each stay (§2b). The route DEPART flies there from
+    // the route's own copy, so it is offered even when this game's list has
+    // dropped it (ROUTE_NEXT).
+    const savedRoute = readShipRoute();
+    const routeRun = isRouteRunning(savedRoute) ? readRouteFlight(now) : null;
+    const routeNext = routeFlight && savedRoute ? savedRoute.stops[routeFlight.nextStopIndex] ?? null : null;
+    const routeNextId = routeNext ? localStationId(routeNext.stationId) : null;
+    const routeNextListed = routeNextId !== null && choices.some((d) => d.id === routeNextId);
+    if (routeFlight && savedRoute && routeFlight.status === 'docked') {
+      const key = `${savedRoute.startedAt}:${routeFlight.legSeq}`;
+      if (key !== pickerRouteKey) {
+        pickerRouteKey = key;
+        pickerDestId = routeNextListed ? routeNextId : ROUTE_NEXT;
+      }
+    }
+    if (pickerDestId === ROUTE_NEXT && (!routeNext || routeNextListed)) pickerDestId = routeNextListed ? routeNextId : null;
+    if (pickerDestId !== ROUTE_NEXT && !choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
+    /** The picker is on the route's next stop: DEPART is the route's own. */
+    const routePick = routeNext !== null && (pickerDestId === ROUTE_NEXT || pickerDestId === routeNextId);
+    const pickerDest = pickerDestId && pickerDestId !== ROUTE_NEXT ? findDestination(pickerDestId) : null;
     // The next hop to the picked station: when it leaves (a launch window may
     // still be to come), when it lands, and what it burns.
-    const hop = pickerDestId ? planHop(location.id, pickerDestId, now) : null;
+    const hop = pickerDest ? planHop(location.id, pickerDest.id, now) : null;
     const refusal = canDepart({
       flightCapable: isShipReady(),
       currentStatus: flight.status,
       currentFuel: fuel,
-      destinationId: pickerDestId ?? '',
+      destinationId: pickerDest?.id ?? '',
       chainedDoors: chained,
       ownerAuthorized: commander,
       locationId: location.id,
-      ...(pickerDestId ? { hop } : {}),
+      ...(pickerDest ? { hop } : {}),
+      // 🚏 A route whose timetable rules flies by its own DEPART (the next
+      // stop) or pauses for any other (off route: the DEPART handler). One
+      // running that no checkpoint anchors yet holds the ship.
+      routeRunning: isRouteRunning(savedRoute) && routeRun === null,
     });
 
     const check = (ok: boolean) => ok
@@ -2299,38 +2533,61 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
       : bolted.length
         ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
-        : docked.length
-          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
-          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
+        // 🚏 A running route: the ROUTE panel below departs it, and the
+        // route keeper docks it at the stop's gate (not "free to pick").
+        : routeFlight !== null
+          ? `ALL SYSTEMS FITTED — flying its route: the ROUTE panel below has its timetable.${docked.length ? '' : ' It docks at this stop\'s gate on its own.'}`
+          : docked.length
+            ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
+            : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
+
+    // 🚏 The checklist's ROUTE line (§5).
+    const routeStatus = routeStatusLine(savedRoute, routeRun, now);
+    const routeRow = `<span style="text-align:right; color:${routeStatus.tone === 'ok' ? '#00E676' : routeStatus.tone === 'warn' ? '#FFB74D' : 'rgba(212,168,75,0.55)'};">${esc(routeStatus.text)}</span>`;
 
     // ── Fuel gauge: level / capacity, filled bar, refuel button ────────────
     const capFmt = capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK';
     const barPct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
     const barColor = barPct > 40 ? '#00E676' : barPct > 10 ? '#FFB74D' : '#FF8A80';
-    const refuelDisabled = !commander || capacity === 0 || fuel >= capacity;
+    // 🚏 On a running route REFUEL sets the level at the stay the ship is
+    // docked at; in flight it waits for the next stop (routeRefuelStay).
+    const refuelWaits = routeFlight !== null && routeFlight.status !== 'docked';
+    const refuelDisabled = !commander || capacity === 0 || fuel >= capacity || refuelWaits;
     const refuelLabel = !commander
       ? 'COMMANDER ONLY'
       : capacity === 0
         ? 'INSTALL A TANK'
         : fuel >= capacity
           ? 'TANKS FULL'
-          : refuelArmed ? 'CONFIRM REFUEL' : 'REFUEL';
+          : refuelWaits
+            ? 'REFUEL AT THE NEXT STOP'
+            : refuelArmed ? 'CONFIRM REFUEL' : 'REFUEL';
 
     // ── Flight panel (status-driven) ────────────────────────────────────────
     let flightPanel = '';
     if (flight.status === 'docked') {
       const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
-      const options = choices.map((d) => {
+      const options = (routeNext && !routeNextListed
+        ? `
+        <option value="${ROUTE_NEXT}"${pickerDestId === ROUTE_NEXT ? ' selected' : ''}>
+          ${esc(routeNext.name)} — next stop on the route
+        </option>`
+        : '') + choices.map((d) => {
         const h = planHop(location.id, d.id, now);
         const label = h
           ? `${h.fuelCost} fuel · ${secs(h.arriveAt - h.departAt)} flight`
           : 'no transfer from here';
         return `
         <option value="${esc(d.id)}"${d.id === pickerDestId ? ' selected' : ''}>
-          ${esc(d.name)} — ${label}
+          ${esc(d.name)} — ${d.id === routeNextId ? 'next stop on the route' : label}
         </option>`;
       }).join('');
-      const windowNote = hop && refusal.ok
+      // A tug towing a station holds on: it is the station's engine.
+      const towingNow = isTowing(currentRoomId(), now);
+      // 🚏 On a route: its DEPART for the next stop, or DEPART off the route.
+      const onRoute = routeFlight !== null && savedRoute !== null;
+      const routePlan = onRoute && routePick ? routeDepartState(routeFlight!, now) : null;
+      const windowNote = !onRoute && hop && refusal.ok
         ? `<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px; line-height:1.4;">${
             hop.departAt - now > 1000
               ? `Next launch window in ${secs(hop.departAt - now)} — DEPART casts off now and burns at the window.`
@@ -2353,32 +2610,75 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             : 'No transfer orbit from here to there (the two stations share an orbit).';
           case 'unlisted-location':
             return 'This station is not on your station list, so no hop from it can be planned. Dock at a listed station, or wait for this one\'s record to arrive.';
+          case 'route-running':
+            return 'The ferry route is starting: its timetable has no checkpoint to run from yet. STOP the route (ROUTE, below) to fly by hand.';
           case 'unknown-destination': return choices.length === 0
             ? 'No other station orbits this planet yet.'
             : 'Unknown destination.';
         }
       })();
-      // A tug towing a station holds on: it is the station's engine.
-      const towingNow = isTowing(currentRoomId(), now);
-      const btnEnabled = refusal.ok && pickerDest !== null && !towingNow;
-      const btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
+      // 🚏 The route DEPART's own checks (a person flies the leg; §2b).
+      const routeBlock = !routePlan ? ''
+        : !commander ? 'Only whoever may fly this ship (its owner or a shareholder) can DEPART on its route.'
+          : !isShipReady() ? 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.'
+            : chained.length > 0 ? 'Chained to a permanent connector — take the gangway down first (chained modules cannot fly).'
+              : '';
+      let btnEnabled: boolean;
+      let btnLabel: string;
+      let btnTone = '#00E676';
+      let planNote = '';
+      if (routePlan) {
+        btnEnabled = routePlan.kind === 'open' && !routeBlock && !towingNow;
+        const nextName = esc((routeNext?.name ?? 'the next stop').toUpperCase());
+        switch (routePlan.kind) {
+          case 'open': btnLabel = `DEPART FOR ${nextName}`; break;
+          case 'boarding': btnLabel = `BOARDING · DEPART OPENS ${formatClock(routePlan.opensAt)}`; break;
+          case 'robot': btnLabel = `ROBOT CAPTAIN DEPARTS ${formatClock(routePlan.departsAt)}`; break;
+          case 'holding': btnLabel = 'HOLDING FOR BERTH'; break;
+          case 'ended': btnLabel = 'THE ROUTE ENDS HERE'; break;
+          default: btnLabel = 'DEPART';
+        }
+        planNote = routePlan.kind === 'robot'
+          ? 'The robot captain flies this leg: TAKE THE HELM (ROUTE, below) to fly it yourself.'
+          : routePlan.kind === 'boarding'
+            ? 'Boarding: DEPART opens 30 s before the launch window.'
+            : routePlan.kind === 'open' && !routeNextListed
+              ? 'Your station list no longer shows this stop: the route flies there from its own copy.'
+              : '';
+      } else if (onRoute) {
+        btnEnabled = refusal.ok && pickerDest !== null && !towingNow;
+        btnLabel = refusal.ok && pickerDest ? `DEPART OFF ROUTE FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
+        btnTone = '#FFB74D';
+        planNote = 'Leaves the route: it PAUSES until the ship docks at a route stop and you RESUME.';
+      } else {
+        btnEnabled = refusal.ok && pickerDest !== null && !towingNow;
+        btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
+      }
+      const warnCopy = towingNow
+        ? 'Towing a station — the tug stays docked until it arrives.'
+        : routePlan ? routeBlock : refuseCopy;
       const castOff = docked.length + enumerateTransientBerths().filter((id) => !docked.some((p) => p.doorId === id)).length;
       const castOffNote = castOff > 0
         ? `<div style="font-size:9px; color:rgba(212,168,75,0.55); margin-top:6px;">⏏ ${castOff} dock${castOff === 1 ? '' : 's'} will be released at depart — the ship remembers this berth</div>`
         : '';
-      const arrivalNote = lastArrivalNote
+      const arrivalNote = lastArrivalNote && routeNoteStands(lastArrivalNote.tie, savedRoute, routeFlight)
         ? `<div style="font-size:10px; color:${lastArrivalNote.tone === 'ok' ? '#00E676' : '#FFB74D'}; margin-bottom:8px; line-height:1.4;">${esc(lastArrivalNote.text)}</div>`
+        : '';
+      const routeLine = onRoute
+        ? `<div style="font-size:10px; color:#FFB74D; margin-bottom:6px; line-height:1.4;">🚏 ${esc(routeDepartLine(savedRoute!, routeFlight!, now))}</div>`
         : '';
       flightPanel = `
         <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(212,168,75,0.18); border-radius:8px;">
           <div style="font-size:11px; letter-spacing:0.5px; color:rgba(212,168,75,0.8); margin-bottom:6px;">FLIGHT PLAN</div>
           ${arrivalNote}
-          ${choices.length > 0 ? `<select id="helm-dest-picker" style="width:100%; background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:6px; font-family:inherit; font-size:11px; border-radius:6px;">
+          ${routeLine}
+          ${choices.length > 0 || (routeNext && !routeNextListed) ? `<select id="helm-dest-picker" style="width:100%; background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:6px; font-family:inherit; font-size:11px; border-radius:6px;">
             ${options}
           </select>` : ''}
-          <button id="helm-depart-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? 'rgba(0,230,118,0.18)' : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnLabel}</button>
+          <button id="helm-depart-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? btnTone : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? (btnTone === '#00E676' ? 'rgba(0,230,118,0.18)' : 'rgba(255,183,77,0.16)') : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? btnTone : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnLabel}</button>
           ${windowNote}
-          ${refuseCopy || towingNow ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${towingNow ? 'Towing a station — the tug stays docked until it arrives.' : refuseCopy}</div>` : ''}
+          ${planNote ? `<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px; line-height:1.4;">${esc(planNote)}</div>` : ''}
+          ${warnCopy ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${esc(warnCopy)}</div>` : ''}
           ${castOffNote}
         </div>`;
     } else if (flight.status === 'undocking') {
@@ -2390,31 +2690,31 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">Cast-off in progress. The next transaction advances to in-flight.</div>
         </div>`;
     } else if (flight.status === 'in-flight') {
-      const remaining = Math.ceil((flight.etaAt !== undefined ? Math.max(0, flight.etaAt - now) : 0) / 1000);
+      // 🚏 The figures the tick rewrites in place (data-helm-live): see
+      // helmFlightFigures.
+      const { phase, wait, remaining, pct: pctFmt } = helmFlightFigures(flight, now);
       const destName = esc((destination?.name ?? 'UNKNOWN').toUpperCase());
-      if (flight.departedAt !== undefined && now < flight.departedAt) {
-        const wait = Math.ceil((flight.departedAt - now) / 1000);
+      if (phase === 'hold') {
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,235,59,0.3); border-radius:8px; background:rgba(255,235,59,0.05);">
             <div style="font-size:11px; color:#FFEB3B; letter-spacing:0.5px;">⏳ HOLDING FOR LAUNCH WINDOW → ${destName}</div>
-            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Transfer burn in ${wait}s · arrival ETA ${remaining}s</div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Transfer burn in <span data-helm-live="wait">${wait}</span>s · arrival ETA <span data-helm-live="eta">${remaining}</span>s</div>
           </div>`;
-      } else if (arrived) {
+      } else if (phase === 'arrived') {
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid #00E676; border-radius:8px; background:rgba(0,230,118,0.10);">
             <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">✅ ARRIVED AT ${destName}</div>
             <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Docking at the berth follows on the commander's next tick.</div>
           </div>`;
       } else {
-        const pctFmt = Math.round(progress * 100);
         flightPanel = `
           <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(129,199,132,0.35); border-radius:8px; background:rgba(0,230,118,0.06);">
             <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">🚀 IN FLIGHT → ${destName}</div>
             <div style="margin-top:8px; height:6px; background:rgba(0,0,0,0.5); border-radius:3px; overflow:hidden;">
-              <div style="width:${pctFmt}%; height:100%; background:#00E676; transition:width 0.25s linear;"></div>
+              <div data-helm-live="bar" style="width:${pctFmt}%; height:100%; background:#00E676; transition:width 0.25s linear;"></div>
             </div>
             <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px; display:flex; justify-content:space-between;">
-              <span>ETA ${remaining}s</span><span>${pctFmt}%</span>
+              <span>ETA <span data-helm-live="eta">${remaining}</span>s</span><span><span data-helm-live="pct">${pctFmt}</span>%</span>
             </div>
           </div>`;
       }
@@ -2440,6 +2740,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       ${row('CHAINED', chained.length === 0
         ? `${check(true)} <span style="color:#00E676;">clear</span>`
         : `${check(false)} ${chained.length} permanent link${chained.length === 1 ? '' : 's'} — cannot fly`)}
+      ${row('ROUTE', routeRow)}
       ${row('PROVISIONS', '— <span style="color:rgba(212,168,75,0.45);">galley update coming</span>')}
       <div style="margin-top:10px;">
         <div style="display:flex; justify-content:space-between; align-items:baseline; font-size:11px;">
@@ -2455,6 +2756,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         ${message}
       </div>` : ''}
       ${flightPanel}
+      ${renderRoutePanel({ now, commander, flight, location: location.id, savedRoute, routeRun, ports, capacity })}
       ${flight.status === 'docked' ? renderTowPanel(engines, fuel, commander, now) : ''}
       ${docking && flight.status === 'docked' ? renderDockingComputer(ports) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
@@ -2470,6 +2772,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       pickerDestId = picker.value;
       render();
     });
+    // 🚏 The route editor's pickers (its buttons go through onClick).
+    panel.querySelectorAll<HTMLSelectElement>('select[data-helm-route-select]').forEach((el) => {
+      el.addEventListener('change', () => {
+        routeSelect(el.dataset.helmRouteSelect ?? '', Number(el.dataset.i ?? -1), el.value);
+      });
+    });
     panel.querySelector<HTMLButtonElement>('#helm-refuel-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;              // dev-phase owner gate
       if (capacity === 0) return;
@@ -2477,7 +2785,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Dev-phase full-fill: real parts-economy metering is a later slice.
       // writeFuelLevel clamps to CURRENT capacity, so removing a tank between
       // arm + confirm cannot over-fill.
-      writeFuelLevel(capacity, capacity);
+      // 🚏 While a route rules the flight its checkpoint goes first, then the
+      // level, in one transaction (refuelShipRoute); in flight it waits.
+      if (routeRulesFlightNow()) {
+        refuelShipRoute(capacity);
+      } else {
+        writeFuelLevel(capacity, capacity);
+      }
       refuelArmed = false;
     });
     panel.querySelector<HTMLButtonElement>('#helm-depart-btn')?.addEventListener('click', () => {
@@ -2485,11 +2799,22 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // moved between render and click (a peer just bolted on a gangway).
       const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
       const nowFuel = clampFuelToCapacity(readFuelLevel(nowCapacity), nowCapacity);
-      const nowFlight = readFlightRecord();
-      if (isTowing(currentRoomId(), Date.now())) return;
+      const nowMs = Date.now();
+      const nowResolved = resolveShipFlight(nowMs);
+      const nowFlight = nowResolved.flight;
+      const nowRoute = readShipRoute();
+      // 🚏 The picker on the route's next stop: the route's own DEPART (§2b).
+      if (nowResolved.route && nowRoute) {
+        const next = nowRoute.stops[nowResolved.route.nextStopIndex];
+        if (next && (pickerDestId === ROUTE_NEXT || pickerDestId === localStationId(next.stationId))) {
+          routeDepart();
+          return;
+        }
+      }
+      if (isTowing(currentRoomId(), nowMs)) return;
       const fromId = shipLocationId(nowFlight, hasLiveDock());
-      const destId = pickerDestId ?? '';
-      const nowHop = destId ? planHop(fromId, destId, Date.now()) : null;
+      const destId = pickerDestId && pickerDestId !== ROUTE_NEXT ? pickerDestId : '';
+      const nowHop = destId ? planHop(fromId, destId, nowMs) : null;
       const nowRefusal = canDepart({
         flightCapable: isShipReady(),
         currentStatus: nowFlight.status,
@@ -2499,6 +2824,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         ownerAuthorized: helmIsCommander(),
         locationId: fromId,
         ...(destId ? { hop: nowHop } : {}),
+        // Off route, the DEPART below pauses the route first; a route no
+        // checkpoint anchors yet holds the ship.
+        routeRunning: isRouteRunning(nowRoute) && readRouteFlight(nowMs) === null,
       });
       if (!nowRefusal.ok) { render(); return; }
       const dest = findDestination(destId);
@@ -2531,7 +2859,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       //    the ship cast off and charged without having departed.
       //    departedAt is the transfer burn — the next launch window, which
       //    may still be ahead (every viewer shows the hold until then).
-      const departed = writeFlightRecord({
+      const inFlight: FlightRecord = {
         status: 'in-flight',
         locationId: fromId,
         destinationId: dest.id,
@@ -2541,15 +2869,37 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         castOffAt: Math.floor(Math.min(Date.now(), nowHop.departAt)),
         // Where the destination orbits now: arrival compares against it.
         ...destinationAtOf(dest.id),
-      });
-      if (!departed) { render(); return; }
+      };
+      let departed = false;
+      if (nowResolved.route) {
+        // 🚏 DEPART off the route PAUSES it (§2b), in the same transaction
+        // as this DEPART's own writes: the pause, the route's fuel level and
+        // stop copied into the stored records, then the in-flight record and
+        // the fuel debit (helmRoute.pauseRouteFromHelm).
+        // 🛑 After STOP it finishes the route here instead: nothing could
+        // RESUME it.
+        const left = pauseRouteFromHelm({
+          now: nowMs,
+          capacity: nowCapacity,
+          apply: (level) => {
+            departed = writeFlightRecord(inFlight);
+            if (departed) writeFuelLevel(level - nowHop.fuelCost, nowCapacity);
+          },
+        });
+        if (left === 'paused') flashRoute('ROUTE PAUSED · off route. Dock at a route stop to RESUME.');
+        if (left === 'finished') flashRoute('Route stopped. The helm flies by hand from here.', 'ok');
+        if (!left || !departed) { render(); return; }
+      } else {
+        departed = writeFlightRecord(inFlight);
+        if (!departed) { render(); return; }
+      }
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
       //    UNDOCK — tombstone + far-room write), then detach any other
       //    transient guest berth (#67 D2, either-side legal).
       if (shipDocking) castOffForDeparture(fromId, shipDocking);
       for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
-      // 3) Debit the fuel cost.
-      writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
+      // 3) Debit the fuel cost (off route it went with the pause, above).
+      if (!nowResolved.route) writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
       setArrivalNote(null);
       render();
     });
@@ -2569,6 +2919,528 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             : null;
       target?.focus();
     }
+  };
+
+  // ── 🚏 The ROUTE panel (design §2b, §5; helmRoute.ts) ─────────────────────
+
+  /** The stations a stop can be added for, with the berths this ship may
+   *  use (helmRoute.routeStopCandidates over this game's station list). */
+  const routeCandidatesNow = (): RouteStopCandidate[] => {
+    const now = Date.now();
+    const flight = readResolvedFlight(now);
+    const locId = shipLocationId(flight, hasLiveDock());
+    const records = listStationRecordsNow();
+    const planetId = records.find((st) => st.id === locId)?.planetId ?? findDestination(locId).planetId;
+    const shipRoom = currentRoomId();
+    const atlas = readStationAtlas();
+    // Never the ship's own one-module station, nor one between planets.
+    const stations = stationsAroundPlanet(planetId, records).filter((st) => !stationInTransit(st, now)
+      && !(st.welcomeRoomId && (st.welcomeRoomId === shipRoom || atlasComponent(atlas, st.welcomeRoomId).has(shipRoom))));
+    // 🧭 The dock the draft's route port is in (else any): the editor's
+    // default berth at the station the ship is docked at.
+    const livePorts = flight.status === 'docked' ? (docking?.ports() ?? []).filter((p) => p.state.kind === 'docked') : [];
+    const live = livePorts.find((p) => p.doorId === draft?.shipPort) ?? livePorts[0];
+    const liveDock = live && live.state.kind === 'docked'
+      ? {
+          stationId: locId,
+          roomId: live.state.roomId,
+          ...(live.state.record.farDoor !== undefined ? { farDoor: live.state.record.farDoor } : {}),
+          ...(live.state.record.farWall !== undefined ? { farWall: live.state.record.farWall } : {}),
+          ...(live.state.record.farLateral !== undefined ? { farLateral: live.state.record.farLateral } : {}),
+        }
+      : null;
+    return routeStopCandidates({
+      stations,
+      planetId,
+      shipRoomId: shipRoom,
+      remembered: (id) => readStationBerth(id),
+      liveDock,
+      holdsPass: holdsPassFor,
+    });
+  };
+
+  /** 🚚 Is a stop's station between planets now (PR 174)? No ship reaches
+   *  it, so the route checks refuse it. */
+  const stopMovingNow = (now: number) => {
+    const records = listStationRecordsNow();
+    return (id: string): boolean => {
+      const st = records.find((r) => r.id === localStationId(id)) ?? records.find((r) => r.id === id);
+      return !!st && stationInTransit(st, now);
+    };
+  };
+
+  /** Everything START checks, read fresh (the panel's preview and the
+   *  button's re-check agree): the draft with its stops copied afresh, the
+   *  stop the ship is docked at, and why START is refused (or null). */
+  const routeStartContext = (d: RouteDraft, now: number) => {
+    const capacity = shipFuelCapacity();
+    const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+    const fresh = refreshDraftStops(d, listStationRecordsNow(), localStationId, now);
+    const flight = readResolvedFlight(now);
+    const startStop = routeStopIndexAt(fresh.stops, shipLocationId(flight, hasLiveDock()), localStationId);
+    const ports = docking?.ports() ?? [];
+    let firstLegFuel: number | null = null;
+    if (startStop >= 0 && fresh.stops.length >= 2) {
+      const next = stopAt({ stops: fresh.stops, shape: fresh.shape, startStop }, 1);
+      firstLegFuel = stopPairWindow(fresh.stops, startStop, next)?.fuelCost ?? null;
+    }
+    const refusal = routeStartRefusal({
+      commander: helmIsCommander(),
+      running: isRouteRunning(readShipRoute()),
+      flightCapable: isShipReady(),
+      flightStatus: flight.status,
+      startStop,
+      check: checkRouteDraft(fresh, { capacity, moving: stopMovingNow(now) }),
+      portFitted: !!fresh.shipPort && ports.some((p) => p.doorId === fresh.shipPort),
+      robotReady: !fresh.robotDockId || robotCaptainEligible(fresh.robotDockId),
+      chainedDoors: enumerateChainedDoors().length,
+      towing: isTowing(currentRoomId(), now),
+      fuel,
+      firstLegFuel,
+    });
+    return { fresh, startStop, refusal, capacity, fuel, firstLegFuel };
+  };
+
+  /** SAVE: the draft, its stops copied afresh (A1: copied on save). */
+  const saveRoute = (): void => {
+    if (!helmIsCommander() || !draft) return;
+    if (isRouteRunning(readShipRoute())) { flashRoute('The route is running: stop it to edit.'); render(); return; }
+    const now = Date.now();
+    const d = refreshDraftStops(draft, listStationRecordsNow(), localStationId, now);
+    const check = checkRouteDraft(d, { capacity: shipFuelCapacity(), moving: stopMovingNow(now) });
+    const route = routeFromDraft(d);
+    if (!check.ok || !route) {
+      flashRoute(check.problems[0] ? describeRouteProblem(check.problems[0], d.stops) : 'The route is not complete yet.');
+      render();
+      return;
+    }
+    if (!writeShipRoute(route)) { flashRoute('The route could not be saved.'); render(); return; }
+    draft = null;
+    draftDirty = false;
+    flashRoute('Route saved.', 'ok');
+    render();
+  };
+
+  /** START (§5): save and start in one transaction, docked at a stop. */
+  const startRoute = (): void => {
+    if (!helmIsCommander() || !draft) return;
+    const now = Date.now();
+    const c = routeStartContext(draft, now);
+    if (c.refusal) {
+      flashRoute(describeRouteStartRefusal(c.refusal, { stops: c.fresh.stops, firstLegFuel: c.firstLegFuel, fuel: c.fuel }));
+      render();
+      return;
+    }
+    const route = routeFromDraft(c.fresh);
+    const run = route ? startRouteFromHelm({ route, now, startStop: c.startStop, fuel: c.fuel, capacity: c.capacity }) : null;
+    if (run === null) {
+      flashRoute('START was refused: the route could not be saved as it is.');
+      render();
+      return;
+    }
+    draft = null;
+    draftDirty = false;
+    routeOpen = false;
+    // Choice 8 (a): with nobody aboard nothing docks or undocks.
+    setArrivalNote({ text: `Route started at ${c.fresh.stops[c.startStop].name}. Stay aboard until the ferry casts off.`, tone: 'ok' });
+    render();
+  };
+
+  /** The route's own DEPART (§2b): a person flies this leg. */
+  const routeDepart = (): void => {
+    if (!helmIsCommander()) return;
+    const now = Date.now();
+    if (isTowing(currentRoomId(), now) || !isShipReady() || enumerateChainedDoors().length > 0) { render(); return; }
+    const castOffBlock = shipDocking ? castOffRefusal(shipDocking.ports()) : null;
+    if (castOffBlock) {
+      setArrivalNote({
+        tone: 'warn',
+        text: castOffBlock === 'dock-busy'
+          ? 'Cannot depart yet: a dock port is still busy. Try again in a moment.'
+          : 'Cannot depart: a dock port here is one you may not undock.',
+      });
+      render();
+      return;
+    }
+    const route = readShipRoute();
+    const f = readRouteFlight(now);
+    if (!isRouteRunning(route) || !routeRulesFlight(f)) { render(); return; }
+    const fromId = localStationId(route.stops[f.stopIndex].stationId);
+    // The `go` entry and PR 172's in-flight record first, in one transaction;
+    // then cast off, as PR 172's DEPART does. The fuel is the route's meter's.
+    const go = departRouteFromHelm({ now });
+    if (!go) {
+      flashRoute('DEPART was refused: the route\'s departure has moved. Look again.');
+      render();
+      return;
+    }
+    if (shipDocking) castOffForDeparture(fromId, shipDocking);
+    for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
+    setArrivalNote(null);
+    render();
+  };
+
+  /** RESUME (§2b): paused off route, docked at one of its stops. */
+  const resumeRoute = (): void => {
+    if (!helmIsCommander()) return;
+    const now = Date.now();
+    const route = readShipRoute();
+    const f = isRouteRunning(route) ? readRouteFlight(now) : null;
+    if (!route || !f?.paused) return;
+    const stored = readFlightRecord();
+    const at = stored.status === 'docked' ? shipLocationId(stored, hasLiveDock()) : '';
+    const idx = at ? resumeStopIndex(route, f.legSeq + 1, at, localStationId) : -1;
+    if (idx < 0) {
+      flashRoute('Dock at one of the route\'s stops to RESUME.');
+    } else if (resumeRouteFromHelm({ now, capacity: shipFuelCapacity(), stopIndex: idx })) {
+      flashRoute(`Route resumed at ${route.stops[idx].name}, with a fresh minimum wait.`, 'ok');
+    } else {
+      flashRoute('RESUME was refused. Look again.');
+    }
+    render();
+  };
+
+  /** The running route's buttons and the editor's (a delegated click). */
+  const routeAction = (action: string, i: number): void => {
+    const now = Date.now();
+    const d = draft;
+    const edit = (next: RouteDraft): void => {
+      if (next === d) return;
+      draft = next;
+      draftDirty = true;
+      render();
+    };
+    switch (action) {
+      case 'toggle': routeOpen = !routeOpen; render(); return;
+      case 'remove': if (d) edit(removeDraftStop(d, i)); return;
+      case 'up': if (d) edit(moveDraftStop(d, i, -1)); return;
+      case 'down': if (d) edit(moveDraftStop(d, i, 1)); return;
+      case 'pin': if (d?.stops[i]) edit(setDraftAnyGate(d, i, !d.stops[i].berth.anyGate)); return;
+      case 'shape-loop': if (d && d.shape !== 'loop') edit({ ...d, shape: 'loop' }); return;
+      case 'shape-back': if (d && d.shape !== 'backAndForth') edit({ ...d, shape: 'backAndForth' }); return;
+      case 'revert': draft = null; draftDirty = false; render(); return;
+      case 'save': saveRoute(); return;
+      case 'start': startRoute(); return;
+      case 'resume': resumeRoute(); return;
+    }
+    // The running route's controls: the helm gate (choice 7).
+    if (!helmIsCommander()) return;
+    const route = readShipRoute();
+    switch (action) {
+      case 'stop': {
+        const r = stopRouteFromHelm({ now });
+        // 'stopping': the panel's own STOP PRESSED line says where it ends.
+        if (r !== 'stopping') {
+          flashRoute(r === 'finished' ? 'Route stopped. The helm flies by hand from here.' : 'STOP was refused. Look again.', r ? 'ok' : 'warn');
+        }
+        break;
+      }
+      case 'take':
+      case 'keep': {
+        const e = handOverRoute({ now, pilot: 'person' });
+        const f = e ? readRouteFlight(now) : null;
+        flashRoute(!e
+          ? 'The helm could not change hands now. Look again.'
+          : action === 'keep'
+            ? `The helm stays yours: the robot takes it at ${formatClock(f?.takeoverAt ?? now + 5 * 60_000)} unless you DEPART.`
+            : f && e.legSeq > f.legSeq
+              ? 'You take the helm from the next stop: DEPART there from the FLIGHT PLAN.'
+              : 'You have the helm: DEPART from the FLIGHT PLAN when boarding ends.', e ? 'ok' : 'warn');
+        break;
+      }
+      case 'hand': {
+        const e = handOverRoute({ now, pilot: 'robot' });
+        const f = e ? readRouteFlight(now) : null;
+        flashRoute(!e
+          ? 'The helm could not change hands now. Look again.'
+          : f && e.legSeq > f.legSeq
+            ? 'The robot captain takes the helm from the next stop.'
+            : `The robot captain has the helm: it departs at ${formatClock(f?.departsAt)}.`, e ? 'ok' : 'warn');
+        break;
+      }
+      case 'skip': {
+        const f = readRouteFlight(now);
+        const ok = skipRouteStop({ now });
+        const name = f && route ? route.stops[f.stopIndex]?.name : null;
+        flashRoute(ok
+          ? `Skipping ${name ?? 'this stop'}: the ferry leaves at the next launch window without docking.`
+          : 'SKIP STOP was refused (the departure is under way). Look again.', ok ? 'ok' : 'warn');
+        break;
+      }
+      default:
+        return;
+    }
+    render();
+  };
+
+  /** The editor's pickers (a change on a select). */
+  const routeSelect = (which: string, i: number, value: string): void => {
+    const d = draft;
+    if (!d) return;
+    const edit = (next: RouteDraft): void => {
+      if (next === d) return;
+      draft = next;
+      draftDirty = true;
+      render();
+    };
+    switch (which) {
+      case 'add': {
+        const cand = routeCandidatesNow().find((c) => c.stationId === value);
+        if (cand) edit(addDraftStop(d, cand));
+        else render();
+        return;
+      }
+      case 'wait': edit(setDraftWait(d, i, Number(value))); return;
+      case 'gate': {
+        const s = d.stops[i];
+        if (!s) return;
+        const cand = routeCandidatesNow().find((c) => c.stationId === localStationId(s.stationId) || c.stationId === s.stationId);
+        const choice = cand?.choices[Number(value)];
+        if (choice) edit(setDraftBerth(d, i, choice));
+        return;
+      }
+      case 'pilot': edit({ ...d, robotDockId: value || null }); return;
+      case 'port': edit({ ...d, shipPort: value || null }); return;
+    }
+  };
+
+  /** 🚏 The ROUTE panel: the running route's controls (every status), or the
+   *  editor (docked, not running). */
+  const renderRoutePanel = (c: {
+    now: number;
+    commander: boolean;
+    flight: FlightRecord;
+    location: string;
+    savedRoute: ShipRoute | null;
+    routeRun: RouteFlight | null;
+    ports: DockPortView[];
+    capacity: number;
+  }): string => {
+    const AMBER = '#FFB74D';
+    const box = (inner: string) => `
+      <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,183,77,0.28); border-radius:8px; background:rgba(255,183,77,0.03);">${inner}</div>`;
+    const btn = (action: string, label: string, o: { enabled?: boolean; tone?: string; i?: number; title?: string; grow?: boolean } = {}): string => {
+      const on = o.enabled !== false;
+      const tone = o.tone ?? AMBER;
+      return `<button type="button" data-helm-route="${action}"${o.i !== undefined ? ` data-i="${o.i}"` : ''}${on ? '' : ' disabled'}${o.title ? ` title="${esc(o.title)}"` : ''} style="${o.grow === false ? '' : 'flex:1; '}padding:6px 8px; border-radius:6px; border:1px solid ${on ? tone : 'rgba(212,168,75,0.2)'}; background:${on ? 'rgba(255,183,77,0.08)' : 'rgba(80,80,80,0.12)'}; color:${on ? tone : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:0.5px; cursor:${on ? 'pointer' : 'not-allowed'};">${label}</button>`;
+    };
+    const line = (text: string, color = 'rgba(212,168,75,0.7)'): string =>
+      `<div style="font-size:10px; color:${color}; margin-top:6px; line-height:1.45;">${text}</div>`;
+    const buttons = (list: string[]): string => list.length
+      ? `<div style="display:flex; gap:6px; margin-top:8px;">${list.join('')}</div>`
+      : '';
+    const title = (text: string, right = ''): string =>
+      `<div style="display:flex; justify-content:space-between; align-items:center; gap:8px;"><span style="font-size:11px; letter-spacing:0.5px; color:${AMBER};">${text}</span>${right}</div>`;
+    const badge = (text: string, color: string): string =>
+      `<span style="font-size:9px; font-weight:800; letter-spacing:1px; color:${color}; border:1px solid ${color}; border-radius:4px; padding:1px 5px;">${text}</span>`;
+    const flash = routeFlash && c.now < routeFlash.until
+      ? line(esc(routeFlash.text), routeFlash.tone === 'ok' ? '#00E676' : AMBER)
+      : '';
+    const gateNote = c.commander
+      ? ''
+      : line('Only whoever may fly this ship (its owner or a shareholder) can change or fly its route.', 'rgba(212,168,75,0.5)');
+    const route = c.savedRoute;
+    const pilotWord = (p: 'robot' | 'person') => (p === 'robot' ? '🤖 the robot captain' : '🧑 a person at the helm');
+
+    // ── A running route: locked, with the helm's controls ──────────────────
+    if (route && isRouteRunning(route)) {
+      const path = esc(routePathLabel(route.stops, route.shape));
+      const f = c.routeRun;
+      const stopList = route.stops.map((s, i) => {
+        // ▶ the stop it is docked at, → the stop it is flying to.
+        const flying = !!f && f.status !== 'docked';
+        const here = !!f && !flying && f.stopIndex === i;
+        const bound = !!f && flying && f.nextStopIndex === i;
+        // ⛔ A stop found gone this run is flagged red: the ferry passes it.
+        const gone = !!f && f.goneStops.includes(i);
+        return `<div style="font-size:10px; line-height:1.5; color:${gone ? '#FF8A80' : here || bound ? '#F0C060' : 'rgba(212,168,75,0.55)'};">${here ? '▶' : bound ? '→' : '·'} ${i + 1}. ${esc(s.name)} · ${
+          s.berth.gate !== undefined ? `gate ${s.berth.gate}` : 'berth'}${s.berth.anyGate ? '' : ' (pinned)'} · wait ${formatWait(s.waitSecs)}${gone ? ' · GONE, passed' : ''}</div>`;
+      }).join('');
+      const locked = `<div style="margin-top:8px;">${stopList}</div>${line('Stop the route to edit it.', 'rgba(212,168,75,0.45)')}`;
+      if (!f || f.paused) {
+        // Paused off route (or running with no checkpoint to run from yet).
+        const stored = c.flight;
+        const idx = f && stored.status === 'docked' && route.stoppedAt === undefined
+          ? resumeStopIndex(route, f.legSeq + 1, c.location, localStationId)
+          : -1;
+        return box(
+          title(`🚏 ROUTE · ${path}`, badge(f ? 'PAUSED' : 'STARTING', AMBER))
+          + line(f
+            ? 'ROUTE PAUSED · off route. Dock at a route stop to RESUME.'
+            : 'Starting: waiting for the route\'s start checkpoint to arrive.', AMBER)
+          + buttons([
+            ...(f ? [btn('resume', idx >= 0 ? `RESUME AT ${esc(route.stops[idx].name.toUpperCase())}` : 'RESUME', { enabled: c.commander && idx >= 0 })] : []),
+            btn('stop', 'STOP ROUTE', { enabled: c.commander, tone: '#FF8A80' }),
+          ])
+          + gateNote + flash + locked,
+        );
+      }
+      const view = routeHelmView(route, f, readHelmCheckpoints(), c.now);
+      const st = routeStatusLine(route, f, c.now);
+      const docked = f.status === 'docked';
+      const pilotLine = docked
+        ? `${view.helmStay === f.legSeq ? 'Flies this departure' : 'Flies the next departure'}: ${pilotWord(view.nextPilot)}`
+        : `Flying this leg: ${pilotWord(f.pilot)} · next departure: ${pilotWord(view.nextPilot)}`;
+      const takeover = docked && f.pilot === 'person' && f.takeoverAt !== null && f.ended === null
+        ? line(view.keepUseful
+          ? `Robot takes the helm at ${formatClock(f.takeoverAt)} and leaves at the next window.`
+          : `If nobody departs, the robot takes the helm at ${formatClock(f.takeoverAt)}.`, AMBER)
+        : '';
+      const helmButtons: string[] = [];
+      if (view.take) helmButtons.push(btn('take', 'TAKE THE HELM', { enabled: c.commander }));
+      if (view.hand) helmButtons.push(btn('hand', 'HAND TO ROBOT', { enabled: c.commander }));
+      if (view.keep) {
+        helmButtons.push(btn('keep', 'KEEP THE HELM', {
+          enabled: c.commander && view.keepUseful,
+          title: view.keepUseful ? 'Restart the robot captain\'s 5 minutes' : 'Once the departure has passed, this restarts the robot captain\'s 5 minutes',
+        }));
+      }
+      const routeButtons: string[] = [];
+      if (view.skip) routeButtons.push(btn('skip', 'SKIP STOP', { enabled: c.commander, title: 'Leave this stop at the next launch window, without waiting or docking' }));
+      if (view.stop) routeButtons.push(btn('stop', 'STOP ROUTE', { enabled: c.commander, tone: '#FF8A80' }));
+      const stopping = route.stoppedAt !== undefined && f.ended === null
+        ? line(`STOP pressed: the route ends at ${esc(route.stops[routeEndStopIndex(f)]?.name ?? 'the next stop')}; the helm flies by hand from there.`, AMBER)
+        : '';
+      const aboard = docked && f.ended === null
+        ? line('Riders keep the ferry running: stay aboard until it casts off.', 'rgba(212,168,75,0.5)')
+        : '';
+      // 🛟 A5 Rights: another dock port or guest berth still paired holds
+      // the ferry past its departure until someone with rights releases it.
+      const others = c.ports.filter((p) => p.doorId !== route.shipPort && p.state.kind === 'docked').length
+        + enumerateTransientBerths().filter((id) => id !== route.shipPort && !c.ports.some((p) => p.doorId === id)).length;
+      const heldLine = docked && f.overdue && f.ended === null && others > 0
+        ? line(`DELAYED: ${others === 1 ? 'another dock or guest berth holds' : `${others} other docks or guest berths hold`} the ferry here until someone with rights over ${others === 1 ? 'it' : 'them'} releases ${others === 1 ? 'it' : 'them'}.`, AMBER)
+        : '';
+      return box(
+        title(`🚏 ROUTE · ${path}`, badge('RUNNING', '#00E676'))
+        + line(esc(st.text), st.tone === 'ok' ? '#00E676' : st.tone === 'warn' ? AMBER : 'rgba(212,168,75,0.55)')
+        + line(esc(pilotLine))
+        + (announcer.shown && announcer.shown.run === route.startedAt
+          ? line(`📢 ${esc(announcer.shown.text)}`, '#F0C060')
+          : '')
+        + takeover
+        + buttons(helmButtons)
+        + buttons(routeButtons)
+        + stopping + heldLine + aboard + gateNote + flash + locked,
+      );
+    }
+
+    // ── Not running: a summary, or the editor (docked) ─────────────────────
+    const docked = c.flight.status === 'docked';
+    const savedPath = route ? esc(routePathLabel(route.stops, route.shape)) : '';
+    if (!routeOpen || !docked) {
+      return box(
+        title(`🚏 ROUTE${route ? ` · ${savedPath}` : ''}`, docked ? btn('toggle', route ? 'EDIT ROUTE' : 'SET UP A ROUTE', { grow: false }) : '')
+        + line(route
+          ? 'Saved, not running. Dock at one of its stops and START it from the editor.'
+          : 'A ferry route flies this ship around the stations of its planet on a timetable, with a robot captain or a person at the helm.')
+        + (docked ? '' : line('Dock to edit the route.', 'rgba(212,168,75,0.5)'))
+        + flash,
+      );
+    }
+
+    // The editor works on the draft; an unedited one follows the saved route.
+    const seed = routeSeed(route);
+    if (draft === null || (!draftDirty && seed !== draftSeed)) {
+      draft = draftFromRoute(route ? routeWithoutRun(route) : null, defaultRoutePort(c.ports));
+      draftSeed = seed;
+    }
+    if (!draft.shipPort && c.ports.length > 0) draft = { ...draft, shipPort: defaultRoutePort(c.ports) };
+    const d = draft;
+    const cands = routeCandidatesNow();
+    const check = checkRouteDraft(d, { capacity: c.capacity, moving: stopMovingNow(Date.now()) });
+    const dis = c.commander ? '' : ' disabled';
+    const selectStyle = 'background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:4px; font-family:inherit; font-size:10px; border-radius:5px;';
+    const select = (id: string, which: string, options: string, i?: number, extra = ''): string =>
+      `<select id="${id}" data-helm-route-select="${which}"${i !== undefined ? ` data-i="${i}"` : ''}${dis} style="${selectStyle}${extra}">${options}</select>`;
+    const iconBtn = (action: string, glyph: string, i: number, enabled: boolean, label: string): string =>
+      `<button type="button" data-helm-route="${action}" data-i="${i}" aria-label="${label}"${enabled && c.commander ? '' : ' disabled'} style="padding:1px 6px; border-radius:4px; border:1px solid rgba(212,168,75,0.3); background:none; color:${enabled && c.commander ? '#F0C060' : 'rgba(212,168,75,0.3)'}; font-family:inherit; font-size:11px; cursor:${enabled && c.commander ? 'pointer' : 'not-allowed'};">${glyph}</button>`;
+    const candFor = (stationId: string) =>
+      cands.find((x) => x.stationId === localStationId(stationId)) ?? cands.find((x) => x.stationId === stationId);
+
+    const stopRows = d.stops.map((s, i) => {
+      const cand = candFor(s.stationId);
+      const choices = cand?.choices ?? [];
+      const ci = choiceIndexFor(choices, s.berth);
+      const gateOptions = (ci < 0
+        ? `<option value="-1" selected>${esc(s.berth.gate !== undefined ? `Gate ${s.berth.gate}` : 'The saved berth')}</option>`
+        : '') + choices.map((ch, k) => `<option value="${k}"${k === ci ? ' selected' : ''}>${esc(describeGateChoice(ch))}</option>`).join('');
+      const waits = ROUTE_WAIT_CHOICES.includes(s.waitSecs) ? ROUTE_WAIT_CHOICES : [...ROUTE_WAIT_CHOICES, s.waitSecs].sort((a, b) => a - b);
+      const waitOptions = waits.map((w) => `<option value="${w}"${w === s.waitSecs ? ' selected' : ''}>wait ${formatWait(w)}</option>`).join('');
+      const warns: string[] = [];
+      if (!cand) warns.push('Not on your station list any more: the route keeps its own copy of it.');
+      else if (cand.orbitSlot !== s.orbitSlot || cand.planetId !== s.planetId) warns.push('Its orbit changed since it was added: SAVE or START copies the new one.');
+      if (!holdsPassFor(s.berth.roomId)) warns.push('You hold no pass for its berth room: another rider must dock the ferry there.');
+      if (ci >= 0 && choices[ci].access === 'pass') warns.push('A granted-captains gate: it docks only with a granted rider aboard, else the ferry uses another gate.');
+      const leg = draftLegAfter(d, i);
+      const legLine = !leg ? ''
+        : leg.window
+          ? `→ ${esc(d.stops[leg.to].name)} · ${formatRouteSpan(leg.window.transferMs)} flight · a window every ${formatRouteSpan(leg.window.synodicMs)} · ${leg.window.fuelCost} fuel${d.shape === 'backAndForth' ? ' each way' : ''}`
+          : `→ ${esc(d.stops[leg.to].name)} · ${leg.problem === 'same-station' ? 'the same station' : leg.problem === 'other-planet' ? 'another planet' : 'a shared orbit: no transfer'}`;
+      return `
+        <div style="padding:6px 0; border-bottom:1px solid rgba(212,168,75,0.10);">
+          <div style="display:flex; gap:6px; align-items:center; font-size:11px;">
+            <b style="color:#F0C060;">${i + 1}. ${esc(s.name)}</b>
+            <span style="margin-left:auto; display:flex; gap:4px;">
+              ${iconBtn('up', '↑', i, i > 0, 'Move up')}${iconBtn('down', '↓', i, i < d.stops.length - 1, 'Move down')}${iconBtn('remove', '×', i, true, 'Remove stop')}
+            </span>
+          </div>
+          <div style="display:flex; gap:6px; align-items:center; margin-top:4px; flex-wrap:wrap;">
+            ${select(`helm-route-wait-${i}`, 'wait', waitOptions, i)}
+            ${select(`helm-route-gate-${i}`, 'gate', gateOptions, i, ' max-width:170px;')}
+            ${btn('pin', s.berth.anyGate ? 'ANY OPEN GATE' : '📌 THIS GATE ONLY', { i, grow: false, enabled: c.commander, title: s.berth.anyGate ? 'Dock at any free gate this ship may use (a gate change is announced); click to pin this gate' : 'Dock only at this gate, waiting while it is taken; click to allow any open gate' })}
+          </div>
+          ${warns.map((w) => line(`⚠ ${esc(w)}`, AMBER)).join('')}
+          ${legLine ? line(legLine, leg?.window ? 'rgba(212,168,75,0.7)' : '#FF8A80') : ''}
+        </div>`;
+    }).join('');
+    const addOptions = `<option value="">+ ADD A STOP…</option>` + cands.map((x) => x.choices.length > 0
+      ? `<option value="${esc(x.stationId)}">${esc(x.name)} · orbit ${x.orbitSlot}</option>`
+      : `<option value="${esc(x.stationId)}" disabled>${esc(x.name)} · no berth door known (dock there once by hand)</option>`).join('');
+    const addRow = d.stops.length < MAX_ROUTE_STOPS
+      ? `<div style="margin-top:8px;">${select('helm-route-add', 'add', addOptions, undefined, ' width:100%;')}</div>`
+      : line(`A route has at most ${MAX_ROUTE_STOPS} stops.`, 'rgba(212,168,75,0.5)');
+    const shapeRow = buttons([
+      btn('shape-back', `${d.shape === 'backAndForth' ? '● ' : ''}⇄ BACK AND FORTH`, { enabled: c.commander, tone: d.shape === 'backAndForth' ? '#00E676' : AMBER }),
+      btn('shape-loop', `${d.shape === 'loop' ? '● ' : ''}↻ LOOP`, { enabled: c.commander, tone: d.shape === 'loop' ? '#00E676' : AMBER }),
+    ]);
+    const robots = robotCaptainOptions();
+    const pilotOptions = `<option value=""${d.robotDockId ? '' : ' selected'}>🧑 People only (a person at the helm)</option>`
+      + robots.map((r) => `<option value="${esc(r.dockId)}"${r.dockId === d.robotDockId ? ' selected' : ''}${r.eligible || r.dockId === d.robotDockId ? '' : ' disabled'}>${esc(r.label)}${r.eligible ? '' : ' · not on 🚀 Ship pilot'}</option>`).join('')
+      + (d.robotDockId && !robots.some((r) => r.dockId === d.robotDockId) ? `<option value="${esc(d.robotDockId)}" selected disabled>🤖 Robot captain (its dock is gone)</option>` : '');
+    const pilotHint = robots.some((r) => r.eligible)
+      ? ''
+      : line('No robot captain aboard yet: place a charging dock and pick 🚀 Ship pilot at its console. People fly the route until then.', 'rgba(212,168,75,0.5)');
+    const portRow = c.ports.length > 1
+      ? `<div style="display:flex; gap:6px; align-items:center; margin-top:8px; font-size:10px;">DOCK PORT ${select('helm-route-port', 'port', c.ports.map((p) => `<option value="${esc(p.doorId)}"${p.doorId === d.shipPort ? ' selected' : ''}>${esc(p.label)}</option>`).join(''), undefined, ' flex:1;')}</div>`
+      : c.ports.length === 1 ? line(`Docks with ${esc(c.ports[0].label)} at every stop.`, 'rgba(212,168,75,0.55)') : '';
+    const fuelLine = d.homeRefuel && d.stops.length > 0
+      ? line(`⛽ Free refill at ${esc(d.stops[0].name)} on each arrival${check.cycleFuel !== null ? ` · a round trip burns ${check.cycleFuel} of ${c.capacity}` : ''}.`, 'rgba(212,168,75,0.7)')
+      : '';
+    const problems = check.problems
+      .filter((p) => p.kind !== 'too-few-stops' || d.stops.length > 0)
+      .map((p) => line(`✗ ${esc(describeRouteProblem(p, d.stops))}`, '#FF8A80')).join('');
+    const changedUnder = draftDirty && seed !== draftSeed
+      ? line('The saved route changed since you began editing: SAVE replaces it, REVERT takes it.', AMBER)
+      : '';
+    const start = routeStartContext(d, c.now);
+    const startNote = start.refusal
+      ? line(esc(describeRouteStartRefusal(start.refusal, { stops: start.fresh.stops, firstLegFuel: start.firstLegFuel, fuel: readFuelLevel(c.capacity) })), 'rgba(212,168,75,0.55)')
+      : line(`START here at ${esc(start.fresh.stops[start.startStop].name)}: stay aboard until the ferry casts off.`, '#00E676');
+    return box(
+      title('🚏 ROUTE', btn('toggle', 'CLOSE', { grow: false }))
+      + (d.stops.length ? stopRows : line('No stops yet. Add the stations the ferry calls at, in order.', 'rgba(212,168,75,0.55)'))
+      + addRow
+      + shapeRow
+      + `<div style="display:flex; gap:6px; align-items:center; margin-top:8px; font-size:10px;">PILOT ${select('helm-route-pilot', 'pilot', pilotOptions, undefined, ' flex:1;')}</div>`
+      + pilotHint + portRow + fuelLine + problems + changedUnder
+      + buttons([
+        btn('save', 'SAVE ROUTE', { enabled: c.commander && check.ok && draftDirty }),
+        btn('revert', 'REVERT', { enabled: draftDirty }),
+        btn('start', 'START ROUTE', { enabled: start.refusal === null, tone: '#00E676' }),
+      ])
+      + startNote + gateNote + flash,
+    );
   };
 
   /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
@@ -2748,6 +3620,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 0 (refused) when the station's layout is not in this install's atlas.
       modules: station ? atlasComponent(readStationAtlas(), station.welcomeRoomId).size : 0,
       now,
+      // 🚏 A running ferry route refuses a tow: STOP it first.
+      routeRunning: isRouteRunning(readShipRoute()),
     };
   };
 
@@ -2812,7 +3686,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         towFlash = null;
         if (panel) render();
       }, 5_050);
-    } else if (readFlightRecord().status === 'docked') {
+    } else if (readResolvedFlight(now).status === 'docked') {
       towFlash = null;
       writeStationMove(plan.move);
     }
@@ -2825,6 +3699,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const tow = target.closest<HTMLElement>('[data-helm-tow]');
     if (tow?.dataset.helmTow) {
       startTow(tow.dataset.helmTow);
+      return;
+    }
+    // 🚏 The ROUTE panel's buttons.
+    const routeBtn = target.closest<HTMLElement>('[data-helm-route]');
+    if (routeBtn) {
+      if (!(routeBtn as HTMLButtonElement).disabled) routeAction(routeBtn.dataset.helmRoute ?? '', Number(routeBtn.dataset.i ?? -1));
       return;
     }
     if (!docking) return;
@@ -2863,6 +3743,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    *  commander's write a no-op, and completeArrival returns null once docked. */
   const autoAdvance = (): void => {
     if (!panel || !helmIsCommander()) return;
+    // 🚏 A4: a route running unpaused moves the ship by its timetable; PR
+    // 172's advance stands aside (and runs again while the route is paused).
+    if (routeRulesFlightNow()) return;
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
@@ -2900,14 +3783,80 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeStationMove(() => render()));
       // 🪐 Destinations and their orbits learned from peers.
       unsubs.push(subscribePlanetSummary(() => render()));
-      // Countdown / arrival watch — re-render only while a number moves.
+      // 🚏 A charging dock's robot taking up 🚀 Ship pilot (the route
+      // editor's pilot picker).
+      unsubs.push(subscribeRobot(() => render()));
+      // Countdown / arrival watch — in flight the numbers move in place.
+      // 🚏 A4: …or when the flight changed with no doc write: a route's
+      // timetable docks, departs and arrives by the clock alone, so the test
+      // reads the resolved flight and repaints on any change of it (a docked
+      // panel is not repainted every tick: its picker would close).
+      // 🚏 In flight the key carries the panel's phase too (holding → flying
+      // → arrived flip with the clock alone); the moving numbers are written
+      // in place (writeFlightFigures), never by a redraw.
+      const flightKey = (f: FlightRecord, now: number) =>
+        `${f.status}|${f.locationId}|${f.destinationId ?? ''}|${f.departedAt ?? ''}|${f.etaAt ?? ''}|${
+          f.status === 'in-flight' ? helmFlightFigures(f, now).phase : ''}`;
+      /** Write the in-flight numbers into the open panel. False when the
+       *  panel does not show them (a redraw is due). */
+      const writeFlightFigures = (f: FlightRecord, now: number): boolean => {
+        const fig = helmFlightFigures(f, now);
+        if (!panel || fig.phase === 'arrived') return true; // nothing moves
+        const live = panel.querySelectorAll<HTMLElement>('[data-helm-live]');
+        if (live.length === 0) return false;
+        for (const el of live) {
+          switch (el.dataset.helmLive) {
+            case 'wait': el.textContent = String(fig.wait); break;
+            case 'eta': el.textContent = String(fig.remaining); break;
+            case 'pct': el.textContent = String(fig.pct); break;
+            case 'bar': el.style.width = `${fig.pct}%`; break;
+          }
+        }
+        return true;
+      };
+      // 🚏 …and a running route's figures that flip with the clock alone
+      // (DEPART opening 30 s before the window, the guard band, a robot
+      // takeover: helmRoute.routeRenderKey), and a route answer's expiry.
+      const routeKey = (now: number): string => {
+        const flash = routeFlash !== null && now < routeFlash.until;
+        try {
+          return `${routeRenderKey(readRouteFlight(now), now)}|${flash}`;
+        } catch {
+          return `|${flash}`;
+        }
+      };
+      const startedAt = Date.now();
+      let lastFlight = flightKey(readResolvedFlight(startedAt), startedAt);
+      let lastRoute = routeKey(startedAt);
       tickTimer = setInterval(() => {
         autoAdvance();
+        const now = Date.now();
+        const f = readResolvedFlight(now);
+        const key = flightKey(f, now);
+        const rk = routeKey(now);
+        let changed = key !== lastFlight || rk !== lastRoute;
+        lastFlight = key;
+        lastRoute = rk;
+        // 🚏📢 The captain's next line, or the shown one going stale.
+        if (now - announcedAt >= 1000) {
+          announcedAt = now;
+          let view: ReturnType<typeof readPilotView> = null;
+          try {
+            view = readPilotView(now);
+          } catch {
+            view = null;
+          }
+          const next = helmAnnouncerStep(announcer, view);
+          if (next.shown !== announcer.shown) changed = true;
+          announcer = next;
+        }
         // A tow ends on the clock, not on a write: keep ticking while this
         // tug tows, and once more as it arrives (DEPART and UNDOCK return).
-        const towing = isTowing(currentRoomId(), Date.now());
-        if (readFlightRecord().status === 'in-flight' || towing || wasTowing) render();
+        const towing = isTowing(currentRoomId(), now);
+        if (towing || wasTowing) changed = true;
         wasTowing = towing;
+        if (changed) render();
+        else if (f.status === 'in-flight' && !writeFlightFigures(f, now)) render();
       }, HELM_TICK_MS);
       render();
     },
@@ -3168,6 +4117,12 @@ function escAttr(s: string): string {
 export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
   let unsubscribe: (() => void) | null = null;
+  /** 🚀 A refused routine switch says why here, until the next change. */
+  let flash: string | null = null;
+  /** 🚀 Whether the last render drew this dock as a running route's captain
+   *  (the ship map re-renders the console only when that flips, so a script
+   *  edit in progress is not redrawn under the owner's cursor). */
+  let drawnCaptain = false;
 
   const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
     writeRobotConfig(deps.itemId, { routine, script });
@@ -3179,18 +4134,39 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const cfg = readRobotConfig(deps.itemId);
     const current = cfg?.routine ?? 'serve';
     const owner = deps.canEdit();
+    // 🚀 The captain's lock (design §2a): while a running route names this
+    // dock as its robot captain, its routine can't change (and edit mode
+    // won't remove the dock). Ship pilot itself is offered only aboard a
+    // module that can fly.
+    const captain = routeCaptainDockId(readShipRoute()) === deps.itemId;
+    drawnCaptain = captain;
+    const flightCapable = isShipReady();
     const routineBtn = (r: RobotRoutine): string => {
       const on = r === current;
-      return `<button data-routine="${r}" ${owner ? '' : 'disabled'} style="
+      const usable = owner && (on || !captain);
+      return `<button data-routine="${r}" ${usable ? '' : 'disabled'} style="
         display:flex; justify-content:space-between; align-items:center; gap:8px;
         padding:9px 12px; text-align:left;
         background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
         border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
         border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
         font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
-        cursor:${owner ? 'pointer' : 'default'};
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !owner ? 1 : 0.45};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
+    const routines = ROBOT_ROUTINES.filter((r) => r !== 'pilot' || pilotRoutineOffered({ flightCapable, current }));
+    const pilotNote = captain
+      ? `🚀 Captain of this ship&apos;s route: it walks to the helm and the berth door and announces each stop. Stop the route at the helm to change its routine or remove its dock. ⏸ STOP here only parks it on its dock: the ferry keeps its timetable.`
+      : current === 'pilot'
+        ? flightCapable
+          ? '🚀 Ready to fly: name this robot the robot captain in the helm&apos;s ROUTE panel.'
+          : '🚀 This module can&apos;t fly yet: mount a FUEL TANK, ENGINE BLOCK and HELM CONSOLE, then name this robot captain at the helm.'
+        : '';
+    const pilotBlock = pilotNote || flash
+      ? `<div style="font-size:9.5px; line-height:1.45; color:${flash ? CH_PINK : '#2fe6a0'}; letter-spacing:0.3px;">
+          ${flash ? `⚠ ${escAttr(flash)}.` : ''}${flash && pilotNote ? '<br>' : ''}${pilotNote}
+        </div>`
+      : '';
     const inp = (idx: number, field: string, val: string, w: string, type = 'text'): string =>
       `<input data-idx="${idx}" data-f="${field}" type="${type}" value="${val}" ${owner ? '' : 'disabled'} style="
         width:${w}; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3);
@@ -3257,8 +4233,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       ${parkBtn}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">ROUTINE</div>
       <div style="display:flex; flex-direction:column; gap:8px;">
-        ${ROBOT_ROUTINES.map(routineBtn).join('')}
+        ${routines.map(routineBtn).join('')}
       </div>
+      ${pilotBlock}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
       ${voiceBtn}
       ${editor}
@@ -3292,8 +4269,20 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       b.addEventListener('click', () => {
         // Keep any authored script AND the parked state when switching routines.
         const c = readRobotConfig(deps.itemId);
+        const to = b.dataset.routine as RobotRoutine;
+        // 🚀 Re-checked at the click: the route may have started since the
+        // render ("Captain of this ship's route: stop the route first").
+        const refused = consoleRoutineRefusal({
+          route: readShipRoute(), dockId: deps.itemId, from: c?.routine ?? 'serve', to,
+        });
+        if (refused) {
+          flash = refused;
+          render();
+          return;
+        }
+        flash = null;
         writeRobotConfig(deps.itemId, {
-          routine: b.dataset.routine as RobotRoutine,
+          routine: to,
           ...(script.length ? { script } : {}),
           ...(c?.parked ? { parked: true } : {}),
         });
@@ -3346,17 +4335,158 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       `;
       panel.addEventListener('click', (e) => e.stopPropagation());
       host.appendChild(panel);
-      unsubscribe = subscribeRobot(() => render());
+      // 🚀 The ship map too: a route starting or finishing locks or frees
+      // a captain's console.
+      const offRobot = subscribeRobot(() => render());
+      const offShip = subscribeShip(() => {
+        if ((routeCaptainDockId(readShipRoute()) === deps.itemId) !== drawnCaptain) render();
+      });
+      unsubscribe = () => { offRobot(); offShip(); };
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      flash = null;
       panel?.remove();
       panel = null;
     },
     update(): void {
       /* observer-driven; nothing per-frame */
+    },
+  };
+}
+
+// ── 🚏📋 DEPARTURES BOARD console (robot pilot routes, design §5a) ──────────
+
+export interface DeparturesBoardUIDeps {
+  /** The board's furniture item id — keys its setting (departuresDoc). */
+  itemId: string;
+  /** Owner gate — only the room owner changes what the board shows. */
+  canEdit: () => boolean;
+  /** Gate numbers the console offers: this room's gates and the station's. */
+  gateChoices: () => number[];
+  /** The gate an unset board shows (the room's one gate), or null (all). */
+  defaultGate: () => number | null;
+  /** Dims the in-world screen to "BOARD IN USE" while focused. */
+  onEngagedChange?: (engaged: boolean) => void;
+}
+
+/**
+ * The board's console (design §5a): what the board shows — ALL GATES (a
+ * departures hall) or GATE N (a gate-side board, that gate's ferries) — and
+ * the rows it shows now, live. An unset board shows the gate in its room when
+ * there is exactly one, else all gates. The rows are the in-world screen's
+ * (readDepartureBoard); ferries put them here from their riders' games.
+ */
+export function createDeparturesBoardUI(deps: DeparturesBoardUIDeps): DeviceUI {
+  let panel: HTMLDivElement | null = null;
+  let unsubscribe: (() => void) | null = null;
+  let since = 0;
+
+  const rowsHtml = (): string => {
+    const view = readDepartureBoard(deps.itemId);
+    if (!view) return `<span style="font-size:10px; color:${CH_DIM};">No departures news in this room.</span>`;
+    if (view.rows.length === 0) {
+      return `<span style="font-size:10px; color:${CH_DIM};">No ferries due${view.gate !== null ? ` at gate ${view.gate}` : ''}.</span>`;
+    }
+    const tone = (st: string) =>
+      st === 'BOARDING' || st === 'ON TIME' ? '#2fe6a0' : st === 'ROUTE BLOCKED' ? '#FF1744' : '#FFB300';
+    return view.rows.map((r) => {
+      const t = rowText(r);
+      return `<div style="display:grid; grid-template-columns: 1.3fr 1.3fr 0.4fr 0.9fr; gap:4px; font-size:10px; align-items:baseline;">
+        <span style="color:${CH_GOLD_BRIGHT};">${escAttr(t.ferry)}</span>
+        <span style="color:${CH_GOLD};">${escAttr(t.place)}</span>
+        <span style="color:#00E5FF;">G${escAttr(t.gate)}</span>
+        <span style="color:${CH_GOLD};">${escAttr(t.time)}</span>
+        <span style="grid-column: 1 / span 4; color:${tone(t.status)}; font-weight:800; letter-spacing:0.5px;">${escAttr(t.status)}${t.note ? ` <span style="font-weight:400; color:${CH_DIM};">· ${escAttr(t.note)}</span>` : ''}</span>
+      </div>`;
+    }).join('');
+  };
+
+  const render = (): void => {
+    if (!panel) return;
+    const owner = deps.canEdit();
+    const setting = readBoardSetting(deps.itemId);
+    const def = deps.defaultGate();
+    const showing = setting ? ('gate' in setting ? setting.gate : null) : def;
+    const choices = [...new Set([...deps.gateChoices(), ...(setting && 'gate' in setting ? [setting.gate] : [])])]
+      .filter((g) => Number.isInteger(g) && g >= 1 && g <= 99)
+      .sort((a, b) => a - b);
+    const btn = (id: string, label: string, on: boolean): string => `<button data-show="${id}" ${owner ? '' : 'disabled'} style="
+        padding:7px 10px; background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
+        border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'}; border-radius:7px;
+        color:${on ? '#2fe6a0' : CH_GOLD}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:0.5px;
+        cursor:${owner ? 'pointer' : 'default'};">${label}</button>`;
+    panel.innerHTML = `
+      <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
+        <span style="font-size:12px; font-weight:800; color:${CH_GOLD_BRIGHT}; letter-spacing:1px;">🚏 DEPARTURES BOARD</span>
+        <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
+      </div>
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">SHOWS</div>
+      <div style="display:flex; flex-wrap:wrap; gap:6px;">
+        ${btn('all', 'ALL GATES', showing === null)}
+        ${choices.map((g) => btn(String(g), `GATE ${g}`, showing === g)).join('')}
+      </div>
+      <div style="font-size:9.5px; line-height:1.45; color:${CH_DIM};">
+        ${setting
+          ? `Set to ${showing === null ? 'all gates' : `gate ${showing}`}.${owner ? ' <button data-show="default" style="background:none; border:none; color:#00E5FF; font-family:inherit; font-size:9.5px; cursor:pointer; padding:0;">Back to the default</button>' : ''}`
+          : `Default: ${def !== null ? `gate ${def}, the one gate in this room` : 'all gates'}.`}
+      </div>
+      <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">NOW</div>
+      <div data-rows style="display:flex; flex-direction:column; gap:8px;">${rowsHtml()}</div>
+      <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
+        ${owner ? 'Choose what this board shows: a departures hall, or one gate&apos;s ferries.' : 'Only the room owner can change what this board shows.'}
+      </div>
+      <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
+        SSF DEPARTURES v1 · ferries post their timetables here from riders&apos; games · other ferries as of their last news
+      </div>
+    `;
+    if (!owner) return;
+    panel.querySelectorAll<HTMLButtonElement>('[data-show]').forEach((b) => {
+      b.addEventListener('click', () => {
+        if (!deps.canEdit()) return;
+        const v = b.dataset.show ?? '';
+        if (v === 'default') writeBoardSetting(deps.itemId, null);
+        else if (v === 'all') writeBoardSetting(deps.itemId, { all: true });
+        else writeBoardSetting(deps.itemId, { gate: Number(v) });
+      });
+    });
+  };
+
+  return {
+    mount(host: HTMLElement): void {
+      panel = document.createElement('div');
+      panel.id = 'device-departures-pane';
+      panel.style.cssText = `
+        position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
+        width: 380px; max-height: 90vh; overflow-y: auto;
+        background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
+        padding: 18px; display: flex; flex-direction: column; gap: 12px;
+        color: ${CH_GOLD}; font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+        box-sizing: border-box; pointer-events: auto;
+      `;
+      panel.addEventListener('click', (e) => e.stopPropagation());
+      host.appendChild(panel);
+      unsubscribe = subscribeDepartures(() => render());
+      deps.onEngagedChange?.(true);
+      render();
+    },
+    unmount(): void {
+      unsubscribe?.();
+      unsubscribe = null;
+      deps.onEngagedChange?.(false);
+      panel?.remove();
+      panel = null;
+    },
+    update(dt: number): void {
+      // The rows move with the clock: redraw them (not the buttons) each second.
+      since += dt;
+      if (since < 1 || !panel) return;
+      since = 0;
+      const rows = panel.querySelector<HTMLElement>('[data-rows]');
+      if (rows) rows.innerHTML = rowsHtml();
     },
   };
 }

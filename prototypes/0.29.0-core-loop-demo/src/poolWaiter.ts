@@ -270,6 +270,12 @@ export class PoolWaiter {
    *  the head of the wheel, and stands the table as the croupier. Overrides dock
    *  and serving — one bot per client, croupier duty first. */
   private croupierPost: { x: number; z: number; faceAngle: number } | null = null;
+  /** 🚀 Ship pilot routine (robot pilot routes, design §2a): where the robot
+   *  captain stands now — the helm, or inside the berth door — or null for
+   *  its charging dock. The WORLD works it out from the ship's shared
+   *  timetable (shipPilot.pilotPost) and pushes it here; the walk itself is
+   *  local to this game, like every robot's. */
+  private pilotPost: { x: number; z: number; faceAngle: number } | null = null;
   private activity: "PATROL" | "DOCK" | "CROUPIER" = "PATROL";
   private idleTimer = 0;
   /** 🤖 #77C s3: owner-programmed routine (the dock's console writes it, synced).
@@ -649,6 +655,16 @@ export class PoolWaiter {
       this.tray.visible = false; // a croupier carries no drink tray
       this.activity = "CROUPIER";
       this.updateCroupierPost(dt);
+      return;
+    }
+
+    // 🚀 A 'pilot' robot (the Ship pilot routine) goes where the ship's
+    // timetable puts its captain — the helm in flight and before a
+    // departure, the berth door at a stop — and otherwise waits on its dock.
+    // Never serves or croupiers (world's croupier eligibility skips it).
+    if (this.routine === "pilot") {
+      this.tray.visible = false;
+      this.updatePilot(dt);
       return;
     }
 
@@ -1293,6 +1309,33 @@ export class PoolWaiter {
     if (!post && this.activity === "CROUPIER") {
       this.activity = "PATROL";
       this.idleTimer = 0;
+    }
+  }
+
+  /** 🚀 Point the robot captain at its post (world pos + facing): the helm
+   *  or the berth door; null sends it back to its dock. Only a 'pilot'
+   *  robot reads it. The world re-sends it about twice a second, so a moved
+   *  helm or a new stop is followed without a reconcile. */
+  public setPilotPost(post: { x: number; z: number; faceAngle: number } | null): void {
+    this.pilotPost = post;
+  }
+
+  /** 🚀 Walk to the captain's post and stand it (facing the helm or the
+   *  door, a small attentive bob); with no post, wait on the dock. */
+  private updatePilot(dt: number): void {
+    const post = this.pilotPost;
+    if (!post) {
+      this.activity = "DOCK";
+      if (this.dockTarget) this.updateDock(dt);
+      else this.idlePose();
+      return;
+    }
+    this.activity = "PATROL";
+    if (this.walkTo(dt, post.x, post.z, 0.15)) {
+      this.turnToward(post.faceAngle, dt);
+      this.legL.rotation.x = 0;
+      this.legR.rotation.x = 0;
+      this.body.position.y = Math.sin(this.time * 2.0) * 0.015;
     }
   }
 
