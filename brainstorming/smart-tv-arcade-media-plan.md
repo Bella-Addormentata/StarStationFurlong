@@ -105,10 +105,12 @@ so we never fight its own buffering. Pause is a record write. A late joiner
 reads once, computes, seeks.
 
 **Scheduled start.** `state: 'scheduled'` renders the countdown from
-`startAt − localNow` (display only). At T0 only the HOLDER's clock decides:
-it reads the record as playing and its first heartbeat flips the record to
-`playing`; every viewer starts on receipt of that write and anchors to it, so
-clock skew never starts a film early or late. A viewer whose countdown has
+`startAt − localNow` (display only). At T0 only the HOLDER's clock decides.
+The shared record is still `scheduled`: the holder's own read treats the due
+schedule as running (locally, and nowhere else), and its first heartbeat
+performs the shared transition to `playing`; every viewer starts on receipt
+of that write and anchors to it, so clock skew never starts a film early or
+late. A viewer whose countdown has
 reached 0 shows STARTING… until the write lands (within a heartbeat). Only
 when nobody holds the remote does a viewer free-run from `startAt`, best
 effort, until someone picks the remote up and beats. For `blob` and torrent
@@ -118,7 +120,7 @@ sources the countdown doubles as the prefetch window.
 
 | Real life | In the room |
 |---|---|
-| The remote sits by the TV | `remote:<tvId> → { holder: null }` |
+| The remote sits by the TV | `remote:<tvId> → { holder: '' }` (the schema above; never `null`) |
 | You pick it up | Walk to the TV and press PICK UP REMOTE, or click the remote in the holder's hand |
 | You hand it to someone | HAND TO… lists the room's players (v1: everyone the players map has seen — there is no liveness until S3 presence, so a remote handed to someone who has left lapses back to the set in 8 s; arm's reach comes with the rig work); the receiver's phone opens on the remote; no accept step |
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
@@ -343,10 +345,13 @@ having — players' IPs never in public swarms — comes cheaper from host-only
 fetch, the library-station volunteer, and later an opt-in embedded I2P router
 (`emissary`, Rust, experimental, several independent implementations, no
 exits). **Recommendation:** do not port IPv8 now; if the owners still want it
-after the library, run stage A as a two-week opt-in spike measured on what
-discovery alone can show — bootstrap success and latency, peers walked per
-minute, introduction success rate, how many peers advertise the tunnel
-community — before anything else is committed. Exit-peer count and three-hop
+after the library, run a two-week opt-in FEASIBILITY SPIKE — a subset of
+stage A, not stage A: the wire format, keys and one Discovery walk against
+the shipped bootstrap list, with no persistence or relay polish — measured on
+what discovery alone can show: bootstrap success and latency, introductions
+received, peers walked per minute, how many advertise the tunnel community.
+Those are its exit criteria; stage A proper stays the 3–4 weeks in the table,
+and nothing past it is committed on the spike. Exit-peer count and three-hop
 throughput need stage B's circuits: they gate B→C, not A→B.
 
 ## 9. The arcade cabinet
@@ -389,16 +394,23 @@ non-commercial clause, MAME a GPL-2.0/BSD-3 mix. The emulator data files are
 `public/emulatorjs/` by a script for sovereign builds, and the CDN is an
 opt-in labelled CONVENIENCE.
 
-**Display and controls.** The emulator draws to a canvas; the cabinet's screen
-is a `CanvasTexture` of it; the #194 CRT pass applies to that texture. Focus is
-the device-focus first-person framing; keyboard first (RetroPad defaults,
-WASD suppressed while focused), Gamepad API, mouse under pointer lock as a
-trackball, the virtual gamepad on Android.
+**Display and controls.** The emulator draws to a canvas. In P1 the picture
+lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
+cabinet's `CanvasTexture` shows the attract card and "P1 · name" — the TV's
+posture (§3.4), for the TV's reason: nothing else in the room can see P1's
+canvas yet. The canvas on the prop's texture, with the #194 shader pass, comes
+with the spectator lane, which is what puts the picture in front of other
+players in the first place. Focus is the device-focus first-person framing;
+keyboard first (RetroPad defaults, WASD suppressed while at the controls),
+Gamepad API, mouse under pointer lock as a trackball, the virtual gamepad on
+Android.
 
 **Phasing.** P1 cabinet + single player (attract mode, owner-set game or menu,
-EmulatorJS in our origin, P1 focus and controls, CRT pass) → the media lane
-with subscriptions (shared with the TV's screen share and karaoke) → P2 over
-video → lockstep only for the games that need it.
+EmulatorJS in our origin — the CDN lane sandboxed — P1 focus and controls, the
+CSS CRT pass on the stage) → the media lane with subscriptions (shared with
+the TV's screen share and karaoke), which brings the picture and the texture
+CRT pass to the prop → P2 over video → lockstep only for the games that need
+it.
 
 ## 10. Options considered
 
