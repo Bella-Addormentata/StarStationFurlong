@@ -238,6 +238,18 @@ describe('how the captain reads its dock and a skip', () => {
     expect(pilotDockAt(bare, { roomId: 'room-0', farDoor: 'x+' }, true, none)).toEqual({ gateChange: false });
   });
 
+  // Copilot (PR 180, 24th review): the gate copied when the route was saved
+  // may since have been renumbered; the captain announces the live one.
+  it('announces the own berth by its live gate number, the copied one only when none is known', () => {
+    const live = (roomId: string, farDoor: string) => (roomId === 'room-0' && farDoor === 'x+' ? 3 : undefined);
+    expect(pilotDockAt(s, { roomId: 'room-0', farDoor: 'x+' }, true, live)).toEqual({ gate: 3, gateChange: false });
+    // An older dock record with no far door is looked up by the berth's door.
+    expect(pilotDockAt(s, { roomId: 'room-0' }, true, live)).toEqual({ gate: 3, gateChange: false });
+    // A live number outside 1..99, or a lookup that throws, leaves the copy.
+    expect(pilotDockAt(s, { roomId: 'room-0', farDoor: 'x+' }, true, () => 0)).toEqual({ gate: 2, gateChange: false });
+    expect(pilotDockAt(s, { roomId: 'room-0', farDoor: 'x+' }, true, () => { throw new Error('x'); })).toEqual({ gate: 2, gateChange: false });
+  });
+
   it('reads any other gate of the station as a gate change', () => {
     const gateOf = (roomId: string, farDoor: string) => (roomId === 'room-0b' && farDoor === 'y-' ? 3 : undefined);
     expect(pilotDockAt(s, { roomId: 'room-0b', farDoor: 'y-' }, true, gateOf)).toEqual({ gate: 3, gateChange: true });

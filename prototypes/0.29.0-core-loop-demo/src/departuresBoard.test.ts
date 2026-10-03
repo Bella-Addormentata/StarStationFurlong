@@ -535,6 +535,8 @@ describe('the route fields of the ferry’s own summary', () => {
     expect(routePortGate(st, 'room-0b', undefined, none)).toBeUndefined();
     expect(routePortGate(st, 'room-0b', 'y-', (r, d) => (r === 'room-0b' && d === 'y-' ? 4 : undefined))).toBe(4);
     expect(routePortGate(st, 'room-0', 'x+', () => 7)).toBe(7);
+    // …the live number first, for an older record too (by the berth's door).
+    expect(routePortGate(st, 'room-0', undefined, (r, d) => (r === 'room-0' && d === st.berth.farDoor ? 6 : undefined))).toBe(6);
   });
 
   it('in flight: on time to the next stop’s gate; paused; nothing once over', () => {
