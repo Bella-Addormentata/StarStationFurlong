@@ -5273,8 +5273,11 @@ export class World {
    * module was joined to another meanwhile) holds it at 100% until it
    * clears. Each robot on an open job works at that job's door, side by
    * side with its crew, saying how far along it is, until the labor is done;
-   * then, and for any other Disassemble robot, it waits on its dock. Run
-   * twice a second.
+   * then, and for any other Disassemble robot, it waits on its dock. The
+   * job's door is the one it was opened at while that still joins the
+   * module, else another door of this room that does (the first was
+   * undocked since); while none does, its robots wait on their docks, and
+   * the job ends detached when its labor is due. Run twice a second.
    */
   private updateDisassembly(): void {
     const now = Date.now();
@@ -5300,6 +5303,16 @@ export class World {
       }
       if (ended) jobs = readDisassemblyJobs();
     }
+    let doorsNow: Pick<CandidateInput, "doors" | "hereRoomId"> | null = null;
+    const workDoors = new Map<string, string | null>();
+    const workDoor = (job: DisassemblyJob): string | null => {
+      if (!workDoors.has(job.roomId)) {
+        doorsNow ??= { doors: readAllDoors(), hereRoomId: World.activeRoomId() };
+        const joined = doorsJoinedTo(doorsNow, job.roomId);
+        workDoors.set(job.roomId, (joined.find((d) => d.doorId === job.doorId) ?? joined[0])?.doorId ?? null);
+      }
+      return workDoors.get(job.roomId) ?? null;
+    };
     for (const [key, bot] of this.robots) {
       const cfg = readRobotConfig(key);
       if (cfg?.routine !== "disassemble") {
@@ -5318,7 +5331,8 @@ export class World {
       // waits on its dock until the module comes off (a blocker, or the
       // deed holder away), having said it is done.
       const fraction = jobFraction(job, now);
-      bot.setWorkPost(fraction < 1 ? this.workPost(job.doorId, slot) : null);
+      const door = fraction < 1 ? workDoor(job) : null;
+      bot.setWorkPost(door ? this.workPost(door, slot) : null);
       // A line on starting on the job and at each tenth of it, once
       // delivered (a robot set to another module starts over there).
       const line = jobAnnouncement(job, fraction, this.disassemblySaid.get(key));

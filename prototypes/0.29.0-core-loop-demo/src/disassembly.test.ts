@@ -1033,15 +1033,16 @@ describe('a module taken apart', () => {
  * these tests cannot run, so they read the source, as roomOwner.test.ts does
  * for #142's: what they catch is a gate widened back to the edit permission.
  */
+const source = (file: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), file), 'utf8');
+const between = (text: string, from: string, to: string): string => {
+  const start = text.indexOf(from);
+  expect(start, `${from} not found`).toBeGreaterThan(-1);
+  const end = text.indexOf(to, start + from.length);
+  expect(end, `${to} not found after ${from}`).toBeGreaterThan(start);
+  return text.slice(start, end);
+};
+
 describe('the deed takes a module apart (source scan)', () => {
-  const source = (file: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), file), 'utf8');
-  const between = (text: string, from: string, to: string): string => {
-    const start = text.indexOf(from);
-    expect(start, `${from} not found`).toBeGreaterThan(-1);
-    const end = text.indexOf(to, start + from.length);
-    expect(end, `${to} not found after ${from}`).toBeGreaterThan(start);
-    return text.slice(start, end);
-  };
 
   it("ends a job on the deed holder's game", () => {
     const body = between(source('world.ts'), 'private updateDisassembly(', 'private finishDisassembly(');
@@ -1084,5 +1085,15 @@ describe('the deed takes a module apart (source scan)', () => {
     const leaving = gate.indexOf('if (roomLeavesUnderWay > 0) return false;');
     expect(leaving).toBeGreaterThan(-1);
     expect(leaving).toBeLessThan(gate.indexOf('if (!yjsSync)'));
+  });
+});
+
+/** The robots' door is world.ts's to pick, which these tests cannot run. */
+describe('where the robots work (source scan)', () => {
+  it("works at a door that still joins the module, the job's own first", () => {
+    const body = between(source('world.ts'), 'private updateDisassembly(', 'private finishDisassembly(');
+    expect(body).toContain('doorsJoinedTo(doorsNow, job.roomId)');
+    expect(body).toContain('joined.find((d) => d.doorId === job.doorId) ?? joined[0]');
+    expect(body).not.toContain('this.workPost(job.doorId');
   });
 });
