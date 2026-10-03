@@ -188,9 +188,12 @@ export function planArrivalDock(input: {
   const port = preferred ?? ports.find(open);
   if (!port) return { kind: 'none', reason: 'no-port' };
   const st = port.state;
+  // DOCK dials the pass the tombstone holds: one that names the same room
+  // but is not the station's (a fresh pass, with new ways to reach the room)
+  // is re-pointed too.
   if (
     st.kind === 'undocked' &&
-    sameRoom(st.address, berth.address) &&
+    st.address === berth.address &&
     holdsPoseOf(st.memory, berth) &&
     (berth.farDoor === undefined || st.memory.farDoor === berth.farDoor)
   ) {
@@ -199,6 +202,13 @@ export function planArrivalDock(input: {
   const memory: DockBerthMemory = {
     undockedAt: stampAfter(st.kind === 'undocked' ? st.memory.undockedAt : undefined, input.now),
   };
+  // A fresh pass to the far door the tombstone already names keeps the pose
+  // it holds of that door wherever the berth names none.
+  if (st.kind === 'undocked' && sameRoom(st.address, berth.address)
+    && st.memory.farDoor === berth.farDoor && holdsPoseOf(st.memory, berth)) {
+    if (st.memory.farWall !== undefined) memory.farWall = st.memory.farWall;
+    if (st.memory.farLateral !== undefined) memory.farLateral = st.memory.farLateral;
+  }
   if (berth.farDoor !== undefined) memory.farDoor = berth.farDoor;
   if (berth.farWall !== undefined) memory.farWall = berth.farWall;
   if (berth.farLateral !== undefined) memory.farLateral = berth.farLateral;
