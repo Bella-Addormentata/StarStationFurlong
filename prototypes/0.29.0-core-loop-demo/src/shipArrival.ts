@@ -94,22 +94,30 @@ function roomOf(seed: string): string {
   }
 }
 
-/** Pair a remembered berth room with a pass this client holds for it: its
- *  own store first, else a port that already names that room (its live or
- *  last dock, in the doors doc every passenger shares anyway). */
+/** 🎫 A pass this client holds for `roomId`: its own store first, else a
+ *  port that already names that room (its live or last dock, in the doors doc
+ *  every passenger shares anyway). Undefined when it holds none. The helm's
+ *  "no pass" check, a remembered berth's DOCK and the ferry's board publishes
+ *  (main.ts) all count passes this way. */
+export function berthPassFor(roomId: string, ports: readonly ArrivalPort[]): string | undefined {
+  if (!roomId) return undefined;
+  const own = berthSeedFor(roomId);
+  if (own && roomOf(own) === roomId) return own;
+  for (const p of ports) {
+    if (p.state.kind !== 'docked' && p.state.kind !== 'undocked') continue;
+    if (roomOf(p.state.address) === roomId) return p.state.address;
+  }
+  return undefined;
+}
+
+/** Pair a remembered berth room with a pass this client holds for it
+ *  (berthPassFor). */
 export function resolveRememberedBerth(
   rec: BerthMemoryRecord | null,
   ports: readonly ArrivalPort[],
 ): RememberedBerth | null {
   if (!rec) return null;
-  let address = berthSeedFor(rec.roomId);
-  if (!address || roomOf(address) !== rec.roomId) {
-    address = undefined;
-    for (const p of ports) {
-      if (p.state.kind !== 'docked' && p.state.kind !== 'undocked') continue;
-      if (roomOf(p.state.address) === rec.roomId) { address = p.state.address; break; }
-    }
-  }
+  const address = berthPassFor(rec.roomId, ports);
   if (!address) return null;
   const { roomId: _room, ...rest } = rec;
   return { ...rest, address };

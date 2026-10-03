@@ -566,7 +566,8 @@ export function newestRouteNews(checkpoints: readonly RouteCheckpoint[]): number
  * (`farRoom`/`farDoor`: the port's far end): the station records' gate for
  * that door, else the stop's own copied gate when the dock is its own berth.
  * An older writer's record names no far door; into the berth room it reads
- * as the own berth (shipPilot.pilotDockAt's rule). Pure.
+ * as the own berth, looked up by the berth's door (shipPilot.pilotDockAt's
+ * rule). Pure.
  */
 export function routePortGate(
   stop: RouteStop,
@@ -575,7 +576,7 @@ export function routePortGate(
   gateOf: (roomId: string, doorId: string | undefined) => number | undefined,
 ): number | undefined {
   const own = farRoom === stop.berth.roomId && (farDoor === undefined || farDoor === stop.berth.farDoor);
-  return gateOf(farRoom, farDoor) ?? (own ? stop.berth.gate : undefined);
+  return gateOf(farRoom, farDoor ?? (own ? stop.berth.farDoor : undefined)) ?? (own ? stop.berth.gate : undefined);
 }
 
 /**

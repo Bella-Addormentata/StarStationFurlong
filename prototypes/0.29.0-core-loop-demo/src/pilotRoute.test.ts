@@ -31,6 +31,8 @@ import {
   resolvedFlight,
   routeCycleLength,
   routeFlightAt,
+  routeFlightPlaces,
+  routeStayOffList,
   routeFlightRecord,
   routeLegFuel,
   routeLegPairs,
@@ -1111,6 +1113,65 @@ describe('the resolved flight (A4)', () => {
     expect(routeRefuelStay(at(r, [s], on[0].arrive + SEC))).toBe(1);
     expect(routeRefuelStay(at(r, [s], T0 + SEC))).toBe(0);
     expect(routeRefuelStay(at(r, [s], on[1].depart + SEC))).toBeNull();
+  });
+});
+
+describe("🚚 where a ruling timetable flies the ship (the route's own copy of each stop)", () => {
+  const r = running([0, 1, 2], 'loop');
+  const s = start(r);
+  const on = onTimeChain(r, s, 3);
+  const copyOf = (i: number) => ({ id: `st-${i}`, planetId: SOV, orbitSlot: i });
+  // Stop 1's station moved to another planet before the ferry's leg out of
+  // it (PR 174): the station list now places it there.
+  const listed1 = { id: 'st-1', planetId: 'planet-aris', orbitSlot: 1 };
+
+  it('the stay at a stop whose station has moved, and the leg out of it, are where the route copied the stops', () => {
+    expect(routeFlightPlaces(r, at(r, [s], on[0].arrive + SEC))).toEqual({ from: copyOf(1), to: null });
+    const leaving = at(r, [s], on[1].depart + SEC);
+    expect(leaving).toMatchObject({ status: 'in-flight', stopIndex: 1, nextStopIndex: 2 });
+    const places = routeFlightPlaces(r, leaving)!;
+    expect(places).toEqual({ from: copyOf(1), to: copyOf(2) });
+    // The station list's ends span two planets: no transfer to draw.
+    expect(planTransfer(listed1, places.to!, on[1].depart - 1)).toBeNull();
+    // The copies give the leg the timetable flies.
+    const plan = planTransfer(places.from, places.to!, on[1].depart - 1)!;
+    expect(plan).not.toBeNull();
+    expect(Math.abs(plan.transferMs - (on[1].arrive - on[1].depart))).toBeLessThanOrEqual(1);
+  });
+
+  it("names the stops by this install's ids", () => {
+    const places = routeFlightPlaces(r, at(r, [s], on[1].depart + SEC), (id) => `here:${id}`);
+    expect(places).toMatchObject({ from: { id: 'here:st-1' }, to: { id: 'here:st-2' } });
+  });
+
+  it('none while the timetable does not rule (no route, or paused): the station list places the ship then', () => {
+    expect(routeFlightPlaces(r, null)).toBeNull();
+    expect(routeFlightPlaces(null, at(r, [s], T0 + SEC))).toBeNull();
+    const pause = pauseCheckpoint(r, 1, { at: on[0].arrive + 10 * SEC });
+    expect(routeFlightPlaces(r, at(r, [s, pause], on[0].arrive + 20 * SEC))).toBeNull();
+  });
+
+  // Copilot (PR 180): the station list placed a ferry at its stay where the
+  // stop's station had moved since, until the next departure.
+  it("keeps a stay at a stop its station has left on the stop's copy, unless a live dock carries the ship along", () => {
+    const stay = routeFlightPlaces(r, at(r, [s], on[0].arrive + SEC));
+    const listed = (over: Partial<{ planetId: string; orbitSlot: number; moving: boolean }> = {}) =>
+      ({ planetId: SOV, orbitSlot: 1, moving: false, ...over });
+    // Moved planets, moved slots, between planets now, or listed nowhere.
+    expect(routeStayOffList(stay, listed({ planetId: 'planet-aris' }), false)).toEqual(copyOf(1));
+    expect(routeStayOffList(stay, listed({ orbitSlot: 3 }), false)).toEqual(copyOf(1));
+    expect(routeStayOffList(stay, listed({ moving: true }), false)).toEqual(copyOf(1));
+    expect(routeStayOffList(stay, null, false)).toEqual(copyOf(1));
+    // Still where the route copied it: the station list places the ship.
+    expect(routeStayOffList(stay, listed(), false)).toBeNull();
+    // Planet ids read as the station list reads them.
+    const planet = (id: string) => (id === 'planet-old-name' ? SOV : id);
+    expect(routeStayOffList(stay, listed({ planetId: 'planet-old-name' }), false, planet)).toBeNull();
+    // Docked: the station it is docked at carries it, wherever that went.
+    expect(routeStayOffList(stay, listed({ planetId: 'planet-aris' }), true)).toBeNull();
+    // In flight, or with no ruling timetable, the leg's own ends place it.
+    expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[1].depart + SEC)), null, false)).toBeNull();
+    expect(routeStayOffList(null, null, false)).toBeNull();
   });
 });
 
