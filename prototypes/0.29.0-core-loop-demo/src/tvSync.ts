@@ -29,6 +29,10 @@ export interface TvPlayer {
   readonly canNudge: boolean;
   /** Can jump to a position; false for the archive.org embed (start only). */
   readonly canSeek: boolean;
+  /** Reports a real position. False for the archive.org embed, whose
+   *  currentMs() is always 0: such a player is never the room's clock — the
+   *  holder's headless heartbeat (tvSession) keeps it instead. */
+  readonly hasClock: boolean;
   /** Media is loaded enough to play/seek. Nothing is applied before this. */
   isReady(): boolean;
   isPlaying(): boolean;
@@ -90,30 +94,50 @@ export class TvSyncController {
     this.onEnded = deps.onEnded ?? (() => { tvStop(deps.itemId); });
   }
 
+  /** The transit lead for this page: half the round trip for a viewer, none
+   *  for the holder, whose own writes land here without crossing a wire. */
+  private lead(): number {
+    return this.iHold() ? 0 : this.rttMs();
+  }
+
   /** The room's playback as of this tick (what the UI shows). */
   current(): PlaybackNow {
-    return this.playback(this.now(), this.rttMs());
+    return this.playback(this.now(), this.lead());
   }
 
   /** Drive every ~250–500 ms. Idempotent: a tick with nothing to change
    *  touches nothing. */
   tick(): PlaybackNow {
     const now = this.now();
-    const pb = this.playback(now, this.rttMs());
+    const hold = this.iHold();
+    const pb = this.playback(now, this.lead());
     const p = this.deps.player;
+    if (!p.isReady()) return pb;
+    // The set's volume, applied once the player can take it: a YouTube
+    // player swallows a setVolume before onReady, and caching it then would
+    // leave the room's setting unapplied for good.
     const vol = this.volume();
     if (vol !== this.appliedVolume) {
       p.setVolume(vol);
       this.appliedVolume = vol;
     }
-    if (!p.isReady()) return pb;
 
     if (pb.state === 'playing') {
       this.parked = false;
       if (p.isEnded()) {
-        // Never play() an ended player (it would start over). The holder
+        // A player at its end is never play()ed as it stands (it would start
+        // over). A record well BEFORE the end is a rewind or a replay: seek
+        // there — which un-ends the player — and go. Otherwise the holder
         // closes the programme, once; a viewer holds until the record moves.
-        if (this.iHold() && !this.endedHandled) {
+        if (p.canSeek && pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS) {
+          p.seek(pb.positionMs);
+          this.lastSeekAt = now;
+          this.setRate(1);
+          this.endedHandled = false;
+          p.play();
+          return pb;
+        }
+        if (hold && !this.endedHandled) {
           this.endedHandled = true;
           this.onEnded();
         }
@@ -136,9 +160,14 @@ export class TvSyncController {
         this.setRate(1);
       }
       // The holder is the clock: its own player's position goes out on the
-      // heartbeat (after any seek above, so a remote-driven jump is what
-      // gets reported, not where the player was before it).
-      if (this.iHold() && now - this.lastBeatAt >= TV_HEARTBEAT_MS) {
+      // heartbeat — from a player that HAS a clock (the archive embed reports
+      // nothing; the headless beat keeps the room's clock for it), and only
+      // once the player is back within the band of the record. A seek still
+      // landing (YouTube's is asynchronous) or deferred by the cooldown
+      // leaves the player far from the record, and publishing where it still
+      // is would undo the very jump that was asked for.
+      if (hold && p.hasClock && now - this.lastBeatAt >= TV_HEARTBEAT_MS
+        && Math.abs(p.currentMs() - pb.positionMs) <= TV_SEEK_OVER_MS) {
         this.heartbeat(p.currentMs());
         this.lastBeatAt = now;
       }

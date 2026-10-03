@@ -69,7 +69,8 @@ export function tickTvRoom(itemIds: readonly string[], now = Date.now()): void {
     const rec = readTv(id);
     // Headless: free-run the clock so the room keeps a sample to anchor to.
     // A scheduled programme flips to playing at T0 the same way the theatre
-    // would (readPlayback already reports 'playing' past T0).
+    // would: readPlayback reports 'playing' past T0 to the HOLDER, and this
+    // beat is the write everyone else starts on.
     const pb = readPlayback(id, now);
     if (pb.state !== 'playing' || !rec.source) {
       lastHeadlessBeat.delete(id);
@@ -90,4 +91,13 @@ export function leaveTvRoom(itemIds: readonly string[]): void {
   }
   lastRenew.clear();
   lastHeadlessBeat.clear();
+}
+
+/** A set removed from the room: this client lets go of its remote and of the
+ *  cadence it kept for it (World.removeFurnitureVisuals; the theatre, if it
+ *  was on that set, closes beside this). */
+export function forgetTv(itemId: string): void {
+  if (iHoldRemote(itemId)) putDownRemote(itemId);
+  lastRenew.delete(itemId);
+  lastHeadlessBeat.delete(itemId);
 }

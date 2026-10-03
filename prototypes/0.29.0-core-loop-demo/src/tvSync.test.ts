@@ -18,13 +18,14 @@ class FakePlayer implements TvPlayer {
   rate = 1;
   volume = -1;
   log: string[] = [];
-  constructor(public readonly canNudge: boolean, public readonly canSeek = true) {}
+  constructor(public readonly canNudge: boolean, public readonly canSeek = true, public readonly hasClock = true) {}
   isReady() { return this.ready; }
   isPlaying() { return this.playing; }
   isEnded() { return this.ended; }
   play() { this.playing = true; this.log.push('play'); }
   pause() { this.playing = false; this.log.push('pause'); }
-  seek(ms: number) { this.position = ms; this.log.push(`seek:${ms}`); }
+  /** A seek lands at once here, and un-ends the player as a <video>'s does. */
+  seek(ms: number) { this.position = ms; this.ended = false; this.log.push(`seek:${ms}`); }
   currentMs() { return this.position; }
   setRate(rate: number) { this.rate = rate; this.log.push(`rate:${rate.toFixed(2)}`); }
   setVolume(v: number) { this.volume = v; }
@@ -137,18 +138,76 @@ describe('a viewer following the room', () => {
     expect(p.playing).toBe(true);
   });
 
-  it('applies nothing to a player that is not ready, and pauses when the TV goes off', () => {
+  it('applies nothing to a player that is not ready — the volume included — and pauses when the TV goes off', () => {
     const p = new FakePlayer(true);
     p.ready = false;
     const h = harness(p);
     h.set({ positionMs: 30_000 });
     h.tick();
     expect(p.log).toEqual([]);
+    expect(p.volume).toBe(-1); // a YouTube player swallows setVolume before onReady: not cached as applied
     p.ready = true;
     h.set({ state: 'off', positionMs: 0, running: false });
     p.playing = true;
     h.tick();
     expect(p.log).toEqual(['pause']);
+    expect(p.volume).toBe(55);
+  });
+
+  it('hands the round trip to the playback read for a viewer, and zero for the holder (its own writes land here)', () => {
+    const leads: number[] = [];
+    const make = (hold: boolean) => new TvSyncController({
+      itemId: 'tv-1', player: new FakePlayer(true), now: () => 100_000, rttMs: () => 1_000,
+      iHold: () => hold, volume: () => 50, heartbeat: () => undefined,
+      playback: (_now, rtt) => {
+        leads.push(rtt);
+        return { state: 'playing', positionMs: 0, running: true, countdownMs: 0 };
+      },
+    });
+    make(false).tick();
+    make(true).tick();
+    make(false).current();
+    make(true).current();
+    expect(leads).toEqual([1_000, 0, 1_000, 0]);
+  });
+
+  it('a player that ended follows a rewind, and the holder can end a replayed programme again', () => {
+    const viewer = new FakePlayer(true);
+    const hv = harness(viewer);
+    hv.tick();
+    viewer.position = 60_000;
+    viewer.playing = false;
+    viewer.ended = true;
+    hv.set({ positionMs: 60_100 }); // at the end with the room: wait
+    hv.tick();
+    expect(viewer.log).toEqual(['play']);
+    hv.set({ positionMs: 10_000 }); // the holder rewound
+    hv.tick();
+    expect(viewer.log).toEqual(['play', 'seek:10000', 'play']);
+    expect(viewer.ended).toBe(false);
+    expect(viewer.playing).toBe(true);
+
+    const holder = new FakePlayer(true);
+    let now = 100_000;
+    let pos = 0;
+    let ended = 0;
+    const c = new TvSyncController({
+      itemId: 'tv-1', player: holder, now: () => now, iHold: () => true,
+      playback: () => ({ state: 'playing', positionMs: pos, running: true, countdownMs: 0 }),
+      heartbeat: () => undefined, volume: () => 50, onEnded: () => { ended++; },
+    });
+    c.tick();
+    holder.position = 60_000; holder.playing = false; holder.ended = true; pos = 60_100;
+    now += 500; c.tick();
+    now += 500; c.tick();
+    expect(ended).toBe(1);
+    pos = 0; // played again from the top
+    now += 500; c.tick();
+    expect(holder.log.at(-2)).toBe('seek:0');
+    expect(holder.ended).toBe(false);
+    holder.position = 60_000; holder.playing = false; holder.ended = true; pos = 60_100;
+    now += 500; c.tick();
+    expect(ended).toBe(2); // the end counts again after a replay
   });
 });
 
@@ -219,5 +278,33 @@ describe('the holder as the room\'s clock', () => {
     c.tick();
     expect(p.position).toBe(63_000);
     expect(beats.at(-1)).toBe(63_000);
+  });
+
+  it('does not beat while its player is still far from the record — a seek landing, or deferred by the cooldown', () => {
+    const p = new FakePlayer(true);
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    expect(h.beats).toEqual([0]);
+    h.set({ positionMs: 30_000 }); // a remote seek: the holder's player follows
+    h.tick(2_600);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
+    p.position = 30_000;
+    h.set({ positionMs: 60_000 }); // another, inside the seek cooldown
+    h.tick(500); // a beat is due, but the player is 30 s from the record and the seek deferred
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
+    expect(h.beats).toEqual([0]); // publishing 30 000 now would undo the jump to 60 000
+    h.tick(1_500); // cooldown over: the seek lands, and THAT is what goes out
+    expect(p.position).toBe(60_000);
+    expect(h.beats).toEqual([0, 60_000]);
+  });
+
+  it('a player with no clock (the archive embed) is played and never beats', () => {
+    const p = new FakePlayer(false, false, false);
+    const h = harness(p, { hold: true });
+    h.set({ positionMs: 90_000 });
+    h.tick();
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.log).toEqual(['play']);
+    expect(h.beats).toEqual([]); // the headless beat keeps the room's clock for it
   });
 });

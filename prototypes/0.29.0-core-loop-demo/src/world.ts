@@ -175,8 +175,8 @@ import { listContacts, getContact } from "./contacts";
 // 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
 // screen view the prop draws.
 import { createSmartTvUI } from "./tvUI";
-import { openTvTheatre, updateTvChip } from "./tvTheatre";
-import { tickTvRoom, tvRoomPlayers } from "./tvSession";
+import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
+import { forgetTv, tickTvRoom, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 // 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
 // attract card the prop draws.
@@ -3095,6 +3095,11 @@ export class World {
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
     this.arcadeScreens.delete(itemId);
+    // 📺 #186: a removed set takes its theatre and this client's hold on its
+    // remote with it — nothing keeps playing, or heartbeating, to a record
+    // whose set is gone (no-ops for every other kind).
+    if (isTvTheatreOpen(itemId)) closeTvTheatre();
+    forgetTv(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3917,19 +3922,17 @@ export class World {
     this.tvTimer += deltaTime;
     if (this.tvTimer >= 0.5) {
       this.tvTimer = 0;
+      // Unconditionally: with the last set gone, an empty list is what takes
+      // the stale WATCH chip down and clears the session's bookkeeping.
       const tvIds = FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
-      if (tvIds.length > 0 || this.tvScreens.size > 0) {
-        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
-        tickTvRoom(tvIds);
-        updateTvChip(tvIds);
-      }
+      for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+      tickTvRoom(tvIds);
+      updateTvChip(tvIds);
       // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
-      // P1 page renews its seat.
+      // P1 page renews its seat — and, like the TVs, with an empty list too.
       const arcadeIds = FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
-      if (arcadeIds.length > 0 || this.arcadeScreens.size > 0) {
-        for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
-        tickArcadeRoom(arcadeIds);
-      }
+      for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
+      tickArcadeRoom(arcadeIds);
     }
 
     // Float dust motes upward, reset at ceiling

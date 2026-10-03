@@ -118,11 +118,12 @@ import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDo
 // room-level duties (lease renewals, the hand-back on leave).
 import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, subscribeTv } from "./tvDoc";
 import { renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
-import { openTvTheatre, setTvChipOpener } from "./tvTheatre";
+import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
+import { closeArcadeStage } from "./arcadeStage";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -2196,6 +2197,18 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   // 🤝 Detach this room's settleReq observer before its doc is destroyed.
   settleReqUnsub?.();
   settleReqUnsub = null;
+  // 📺 #186: the theatre, its chip and every remote I hold belong to THIS
+  // room. Tear them down now, synchronously and on every path (sync or
+  // not): nothing may keep a player, an interval or a clock registration
+  // pointed at the old set, or write under its item id to the next room's
+  // map once the doc rebinds. The put-downs go out with the flush below.
+  closeTvTheatre();
+  updateTvChip([]);
+  leaveTvRoom(roomTvIds());
+  // 🕹 #193: the same for the cabinet — the stage (its frame, its seat
+  // renewals) is this room's; a P1 who leaves stands up before the doc goes.
+  closeArcadeStage();
+  leaveArcadeRoom(roomArcadeIds());
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -2218,10 +2231,6 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // first (bounded: a stalled transport must not hold the swap).
     leaveSlotMachineRoom();
     leaveCoinPusherRoom();
-    // 📺 #186: a remote leaves with nobody — put every one I hold back on its set.
-    leaveTvRoom(roomTvIds());
-    // 🕹 #193: a P1 who leaves the room stands up from the cabinet.
-    leaveArcadeRoom(roomArcadeIds());
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),

@@ -7,7 +7,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote,
+  bindTvDoc, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote, isStartOnly,
   mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readRemote,
   readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
   setTvHostPredicate, setTvIdentity, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
@@ -180,13 +180,33 @@ describe('the programme', () => {
     expect(tvScreenView(TV).detail).toBe('STARTS IN 0:01');
   });
 
-  it('past T0 every client free-runs from the UTC start until the holder\'s first heartbeat', () => {
+  it('past T0 the HOLDER reads playing and flips the record with its first heartbeat; a viewer starts on that write', () => {
+    pickUpRemote(TV);
     tvSchedule(TV, FILM, now + 10_000);
     tick(12_500);
-    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
+    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 }); // Alice holds
     expect(readTv(TV).state).toBe('scheduled'); // the record itself has not flipped yet
+    renewRemote(TV); // the holder's lease, as every page keeps seeing it
+    iAm(BOB, 'Bob');
+    // Bob's clock may say anything about T0: he waits for the holder's write.
+    expect(readPlayback(TV)).toEqual({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 0 });
+    expect(tvScreenView(TV).detail).toBe('STARTING…');
+    expect(countdownText(0)).toBe('STARTING…');
+    expect(countdownText(61_000)).toBe('STARTS IN 1:01');
+    iAm(ALICE, 'Alice');
     expect(tvHeartbeat(TV, 2_600)).toEqual({ ok: true });
     expect(readTv(TV)).toMatchObject({ state: 'playing', startAt: 0, positionMs: 2600 });
+    iAm(BOB, 'Bob');
+    expect(readPlayback(TV).state).toBe('playing'); // on receipt, anchored to it
+  });
+
+  it('past T0 with nobody holding the remote, a viewer free-runs from the UTC start, best effort', () => {
+    pickUpRemote(TV);
+    tvSchedule(TV, FILM, now + 10_000);
+    putDownRemote(TV);
+    iAm(BOB, 'Bob');
+    tick(12_500);
+    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
   });
 
   it('the body buttons need no remote: power keeps the programme, volume is the set\'s', () => {
@@ -201,6 +221,16 @@ describe('the programme', () => {
     expect(readTv(TV).volume).toBe(100);
     tvSetVolume(TV, -3);
     expect(readTv(TV).volume).toBe(0);
+  });
+
+  it('bounds a peer\'s history before the shape check, not only after it', () => {
+    const entries = Array.from({ length: 500 }, (_, i) => ({
+      source: { kind: 'url', url: `https://example.org/${i}.mp4` }, title: `film ${i}`, playedAt: i,
+    }));
+    doc.getMap('tv').set(tvKey(TV), { ...readTv(TV), state: 'home', history: entries });
+    const history = readTv(TV).history;
+    expect(history).toHaveLength(TV_HISTORY_MAX);
+    expect(history[0]!.title).toBe('film 0');
   });
 
   it('a peer\'s garbage record degrades to "off", never to a wedged TV', () => {
@@ -295,6 +325,27 @@ describe('sources', () => {
     expect(parseTvSource('javascript:alert(1)')).toBeNull();
     expect(parseTvSource('ftp://example.org/film.mp4')).toBeNull(); // a scheme of its own is kept, then refused
     expect(parseTvSource('https://www.youtube.com/watch?v=short')).toBeNull();
+  });
+
+  it('never carries credentials into the room, keeps spaces in archive filenames, survives bad encoding', () => {
+    // user:password@host would be read by every peer, not just the media host.
+    expect(parseTvSource('https://user:secret@example.org/film.mp4')).toBeNull();
+    expect(sanitizeSource({ kind: 'url', url: 'https://user:secret@example.org/film.mp4' })).toBeNull();
+    expect(sanitizeSource({ kind: 'url', url: 'https://user@example.org/film.mp4' })).toBeNull();
+    // archive filenames carry spaces as a rule; sourceFileUrl encodes them.
+    expect(parseTvSource('https://archive.org/download/his_girl_friday/a%20film.mp4')).toEqual({
+      kind: 'archive', identifier: 'his_girl_friday', file: 'a film.mp4',
+    });
+    expect(sourceFileUrl({ kind: 'archive', identifier: 'his_girl_friday', file: 'a film.mp4' }))
+      .toBe('https://archive.org/download/his_girl_friday/a%20film.mp4');
+    expect(sanitizeSource({ kind: 'archive', identifier: 'x', file: 'a\u0000b.mp4' })).toBeNull();
+    expect(sanitizeSource({ kind: 'archive', identifier: 'x', file: ' leading.mp4' })).toBeNull();
+    expect(sanitizeSource({ kind: 'archive', identifier: 'x', file: '/etc/passwd' })).toBeNull();
+    // "%ZZ" passes new URL() but not decodeURIComponent: an invalid link, said the normal way.
+    expect(parseTvSource('https://archive.org/download/movie/clip%ZZ.mp4')).toBeNull();
+    expect(isStartOnly({ kind: 'archive', identifier: 'x', file: '' })).toBe(true);
+    expect(isStartOnly({ kind: 'archive', identifier: 'x', file: 'a.mp4' })).toBe(false);
+    expect(isStartOnly({ kind: 'youtube', videoId: 'uPwPecwX2zs' })).toBe(false);
   });
 
   it('labels and file URLs', () => {
