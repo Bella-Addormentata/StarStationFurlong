@@ -336,6 +336,18 @@ export function tvPageId(): string {
 const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
 const num = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+/** One rule for every revision counter (`seq`, `started`, `jump`, the
+ *  switch's `seq`): a reader compares it for CHANGE, never for order, and a
+ *  writer moves it by one, so it must be a whole number that one more still
+ *  moves. A peer's `Number.MAX_VALUE` passes as a finite number, yet adding
+ *  one to it changes nothing — and a `seq` that cannot move is a sample
+ *  nobody re-anchors to, a `jump` no holder follows, a power press that
+ *  voids no lookup. So a counter reads as a safe integer or as the floor,
+ *  and the bump past the ceiling is the floor again: a wrap costs a
+ *  change-only comparison nothing, and no counter can ever stop moving. */
+export const TV_COUNTER_MAX = Number.MAX_SAFE_INTEGER;
+const counter = (v: unknown): number => (Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : 0);
+const bump = (v: number): number => (v >= TV_COUNTER_MAX ? 0 : v + 1);
 
 /** A source as a peer may have written it, or null. Unknown kinds and
  *  non-http(s) URLs are dropped at the read boundary — a `javascript:` URL
@@ -403,9 +415,9 @@ export function readProgramme(itemId: string): TvProgramme {
     state: source === null && (state === 'playing' || state === 'paused' || state === 'scheduled') ? 'home' : state,
     startAt: Math.max(0, num(raw.startAt)),
     positionMs: Math.max(0, num(raw.positionMs)),
-    seq: Math.max(0, Math.floor(num(raw.seq))),
-    started: Math.max(0, Math.floor(num(raw.started))),
-    jump: Math.max(0, Math.floor(num(raw.jump))),
+    seq: counter(raw.seq),
+    started: counter(raw.started),
+    jump: counter(raw.jump),
     history,
   };
 }
@@ -422,7 +434,7 @@ export function readVolume(itemId: string): number {
 export function readPower(itemId: string): PowerRecord {
   const raw = ensureMap().get(powerKey(itemId)) as Partial<PowerRecord> | undefined;
   if (!raw || typeof raw !== 'object') return { ...POWER_DEFAULT };
-  return { on: raw.on === true, seq: Math.max(0, Math.floor(num(raw.seq))) };
+  return { on: raw.on === true, seq: counter(raw.seq) };
 }
 
 /** What a screen, a phone or the theatre shows: the programme, the switch
@@ -596,9 +608,9 @@ export function tvPlay(itemId: string, source: TvSource, now = clock()): TvActio
     state: 'playing',
     startAt: 0,
     positionMs: 0,
-    seq: rec.seq + 1,
-    started: rec.seq + 1,
-    jump: rec.jump + 1,
+    seq: bump(rec.seq),
+    started: bump(rec.seq),
+    jump: bump(rec.jump),
     history: withHistory(rec, clean, now),
   } satisfies TvProgramme);
   return { ok: true };
@@ -619,9 +631,9 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     state: 'scheduled',
     startAt: Math.floor(startAt),
     positionMs: 0,
-    seq: rec.seq + 1,
-    started: rec.seq + 1,
-    jump: rec.jump + 1,
+    seq: bump(rec.seq),
+    started: bump(rec.seq),
+    jump: bump(rec.jump),
     history: withHistory(rec, clean, now),
   } satisfies TvProgramme);
   return { ok: true };
@@ -639,7 +651,7 @@ export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
     state: 'playing',
     startAt: 0,
     positionMs: Math.max(0, Math.floor(positionMs)),
-    seq: rec.seq + 1,
+    seq: bump(rec.seq),
   } satisfies TvProgramme);
   return { ok: true };
 }
@@ -653,8 +665,8 @@ export function tvPause(itemId: string, positionMs: number): TvAction {
     ...rec,
     state: 'paused',
     positionMs: Math.max(0, Math.floor(positionMs)),
-    seq: rec.seq + 1,
-    jump: rec.jump + 1,
+    seq: bump(rec.seq),
+    jump: bump(rec.jump),
   } satisfies TvProgramme);
   return { ok: true };
 }
@@ -664,7 +676,7 @@ export function tvResume(itemId: string): TvAction {
   if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   if (rec.state !== 'paused' || !rec.source) return { ok: false, error: 'Nothing is paused.' };
-  write(tvKey(itemId), { ...rec, state: 'playing', seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvProgramme);
+  write(tvKey(itemId), { ...rec, state: 'playing', seq: bump(rec.seq), jump: bump(rec.jump) } satisfies TvProgramme);
   return { ok: true };
 }
 
@@ -675,7 +687,7 @@ export function tvSeek(itemId: string, positionMs: number): TvAction {
   const rec = readProgramme(itemId);
   if (rec.state !== 'playing' && rec.state !== 'paused') return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
-    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: rec.seq + 1, jump: rec.jump + 1,
+    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: bump(rec.seq), jump: bump(rec.jump),
   } satisfies TvProgramme);
   return { ok: true };
 }
@@ -686,7 +698,7 @@ export function tvStop(itemId: string): TvAction {
   if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   write(tvKey(itemId), {
-    ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: rec.seq + 1, jump: rec.jump + 1,
+    ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: bump(rec.seq), jump: bump(rec.jump),
   } satisfies TvProgramme);
   return { ok: true };
 }
@@ -701,14 +713,14 @@ export function tvStop(itemId: string): TvAction {
  *  nothing on shows the home screen. Returns the new state of the switch. */
 export function tvTogglePower(itemId: string): boolean {
   const power = readPower(itemId);
-  write(powerKey(itemId), { on: !power.on, seq: power.seq + 1 } satisfies PowerRecord);
+  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq) } satisfies PowerRecord);
   return !power.on;
 }
 
 /** The remote's PLAY and SCHEDULE turn the set on, like a real remote. */
 function switchOn(itemId: string): void {
   const power = readPower(itemId);
-  if (!power.on) write(powerKey(itemId), { on: true, seq: power.seq + 1 } satisfies PowerRecord);
+  if (!power.on) write(powerKey(itemId), { on: true, seq: bump(power.seq) } satisfies PowerRecord);
 }
 
 /** VOLUME on the set: its own key, so a press here never carries a stale

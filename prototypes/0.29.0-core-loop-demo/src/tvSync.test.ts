@@ -20,10 +20,15 @@ class FakePlayer implements TvPlayer {
   log: string[] = [];
   /** A lazy player's seek lands only on land() — YouTube's asynchronous seekTo. */
   lazy = false;
-  /** The media's length: where a seek is clamped (a player knows its end
-   *  before it can say so), and what durationMs() reports when `reportsDuration`. */
+  /** The media's length: where a seek is clamped and the player ends (a
+   *  player knows its end before it can say so); NaN for a live stream. */
   duration = NaN;
-  reportsDuration = true;
+  /** A live stream's sliding window: seeks clamp into it (never "ended"),
+   *  and it is what seekableRange() reports, over a file's [0, duration]. */
+  window: { startMs: number; endMs: number } | null = null;
+  /** Whether the player has said yet where it can seek (YouTube before its
+   *  metadata, an HTML video before its ranges: nothing to clamp to). */
+  reportsRange = true;
   private pendingSeek: number | null = null;
   /** `canSeek` is mutable: an HTML video's ranges arrive after its metadata. */
   constructor(public readonly canNudge: boolean, public canSeek = true, public readonly hasClock = true) {}
@@ -46,16 +51,22 @@ class FakePlayer implements TvPlayer {
     this.arrive(ms);
   }
   private arrive(ms: number) {
-    const end = Number.isFinite(this.duration) ? this.duration : Infinity;
-    this.position = Math.min(ms, end);
-    this.ended = this.position >= end;
+    const start = this.window ? this.window.startMs : 0;
+    const end = this.window ? this.window.endMs : Number.isFinite(this.duration) ? this.duration : Infinity;
+    this.position = Math.min(Math.max(ms, start), end);
+    this.ended = !this.window && this.position >= end;
   }
   currentMs() { return this.position; }
-  durationMs() { return this.reportsDuration ? this.duration : NaN; }
+  seekableRange() {
+    if (!this.reportsRange) return null;
+    if (this.window) return { ...this.window };
+    return Number.isFinite(this.duration) ? { startMs: 0, endMs: this.duration } : null;
+  }
   setRate(rate: number) { this.rate = rate; this.log.push(`rate:${rate.toFixed(2)}`); }
   setVolume(v: number) { this.volume = v; }
 }
 
+/** `opts.hold` is read on every tick: a test flips it to hand the remote over. */
 function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded?: () => void } = {}) {
   let now = 100_000;
   let pb: PlaybackNow = { state: 'playing', positionMs: 0, running: true, countdownMs: 0 };
@@ -141,6 +152,16 @@ describe('a viewer following the room', () => {
     h.set({ positionMs: 90_000 });
     h.tick();
     expect(p.log).toEqual(['play']);
+  });
+
+  it('seeks into its own window when the record names a position its stream no longer has', () => {
+    const p = new FakePlayer(true);
+    p.window = { startMs: 50_000, endMs: 60_000 };
+    p.position = 55_000;
+    const h = harness(p);
+    h.set({ positionMs: 10_000 });
+    h.tick();
+    expect(p.log).toEqual(['play', 'seek:50000']);
   });
 
   it('holds on pause (and jumps to the paused position when far from it)', () => {
@@ -368,7 +389,7 @@ describe('the holder as the room\'s clock', () => {
   it('a seek past an end the player has not announced still lands when the player ends there', () => {
     const p = new FakePlayer(true);
     p.duration = 60_000;
-    p.reportsDuration = false; // YouTube before its metadata: nothing to clamp to
+    p.reportsRange = false; // YouTube before its metadata: nothing to clamp to
     let ended = 0;
     const h = harness(p, { hold: true, onEnded: () => { ended++; } });
     p.position = 55_000;
@@ -450,6 +471,71 @@ describe('the holder as the room\'s clock', () => {
     expect(h.beats).toEqual([0]); // the room follows the player
   });
 
+  it('gives up a seek that went out and never landed after TV_SEEK_WAIT_MS, and beats where the player is', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true; // and never land()s: a seek YouTube swallowed
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    h.transport({ positionMs: 30_000 });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
+    h.tick(TV_SEEK_WAIT_MS / 2);
+    expect(h.beats).toEqual([0]); // still waiting on it
+    h.tick(TV_SEEK_WAIT_MS / 2);
+    expect(h.beats).toEqual([0, 0]); // given up: the room has a clock again, the player's
+    expect(h.c.positionMs()).toBe(0); // and nothing is pending any more
+  });
+
+  it('a seek issued late (the ranges arrived) gets its own full wait to land', () => {
+    const p = new FakePlayer(true);
+    p.canSeek = false;
+    const h = harness(p, { hold: true });
+    h.transport({ positionMs: 60_000 });
+    h.tick();
+    h.tick(TV_SEEK_WAIT_MS - 2_000); // kept, not yet given up
+    expect(h.beats).toEqual([]);
+    p.canSeek = true;
+    p.lazy = true;
+    h.tick(); // the seek goes out now…
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:60000']);
+    h.tick(TV_SEEK_WAIT_MS - 2_000); // …and the 8 s it waited before do not count against it
+    expect(h.beats).toEqual([]);
+    h.tick(2_000);
+    expect(h.beats).toEqual([0]); // given up only TV_SEEK_WAIT_MS after it went out
+  });
+
+  it('a rewind out of a live window lands at the window\'s start, and the room follows from there', () => {
+    const p = new FakePlayer(true);
+    p.window = { startMs: 50_000, endMs: 60_000 }; // a live stream's DVR window
+    p.position = 58_000;
+    const h = harness(p, { hold: true });
+    h.set({ positionMs: 58_000 });
+    h.tick(); // the baseline beat
+    expect(h.beats).toEqual([58_000]);
+    h.transport({ positionMs: 10_000 }); // a rewind the stream no longer has
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:50000']); // the window's start, not before it
+    h.tick(TV_HEARTBEAT_MS);
+    expect(h.beats).toEqual([58_000, 50_000]); // landed, and the room is told where
+  });
+
+  it('a seek into a window that moved on meanwhile is still seen to land', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    p.window = { startMs: 50_000, endMs: 60_000 };
+    p.position = 58_000;
+    const h = harness(p, { hold: true });
+    h.set({ positionMs: 58_000 });
+    h.tick();
+    h.transport({ positionMs: 10_000 });
+    h.tick(); // aimed at 50 000…
+    p.window = { startMs: 52_000, endMs: 62_000 }; // …but the window slid before the seek landed
+    p.land(); // the player clamps it to 52 000
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.position).toBe(52_000);
+    expect(h.beats).toEqual([58_000, 52_000]); // landed where the player could go, not stuck at 50 000
+  });
+
   it('a seek still landing is not forgotten by a pause: the paused position is re-aimed, and the old seek never lands over it', () => {
     const p = new FakePlayer(true);
     p.lazy = true;
@@ -466,6 +552,60 @@ describe('the holder as the room\'s clock', () => {
     h.tick(TV_HEARTBEAT_MS);
     expect(p.position).toBe(0);
     expect(h.beats).toEqual([0, 0]);
+  });
+
+  it('a hand-over while a seek is still landing leaves nothing behind: picked up again, the page follows the room once and beats from there', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const opts = { hold: true };
+    const h = harness(p, opts);
+    h.tick(); // the baseline beat, at 0
+    h.transport({ positionMs: 30_000 }); // a seek, in flight…
+    h.tick();
+    expect(h.c.positionMs()).toBe(30_000);
+    opts.hold = false; // …and the remote is handed over before it lands
+    h.set({ positionMs: 45_000 }); // the new holder has moved the room on
+    h.tick(TV_SEEK_COOLDOWN_MS); // a viewer now: follows the record, carries no target
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000', 'seek:45000']);
+    expect(h.c.positionMs()).toBe(0); // the player's own clock: nothing pending for a viewer
+    p.land();
+    expect(p.position).toBe(45_000);
+    opts.hold = true; // picked up again, no transport write since: `jump` unchanged
+    h.set({ positionMs: 46_000 });
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toHaveLength(2); // within the band of the room: nothing to follow
+    expect(h.beats).toEqual([0, 45_000]); // the beat is not withheld by the old 30 s target
+    // Picked up far from the room (the player stalled while viewing): the
+    // room's position is followed once, as on a first pick-up.
+    opts.hold = false;
+    h.tick();
+    p.position = 20_000;
+    opts.hold = true;
+    h.set({ positionMs: 50_000 });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log.filter((l) => l.startsWith('seek')).at(-1)).toBe('seek:50000');
+  });
+
+  it('names where the room is for a transport write: the target a jump still carries the player to, the record for a jump not yet followed, else the player', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    expect(h.c.positionMs()).toBe(0); // in step: the player's clock
+    h.transport({ positionMs: 30_000 }); // a remote seek, not ticked yet
+    expect(h.c.positionMs()).toBe(30_000); // the record's word, not the player's stale 0
+    h.tick(); // the seek goes out and has not landed: the player still reads 0
+    expect(p.position).toBe(0);
+    expect(h.c.positionMs()).toBe(30_000); // a pause written now parks the room at 30 s, not at 0
+    p.land();
+    h.tick();
+    p.position = 31_000;
+    expect(h.c.positionMs()).toBe(31_000); // landed: the player's clock again
+    const viewer = new FakePlayer(true);
+    viewer.position = 5_000;
+    const hv = harness(viewer);
+    hv.set({ positionMs: 40_000 });
+    expect(hv.c.positionMs()).toBe(5_000); // a viewer's player is only ever where it is
   });
 
   it('a player with no clock (the archive embed) is played and never beats', () => {

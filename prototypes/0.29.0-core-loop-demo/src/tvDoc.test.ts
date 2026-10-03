@@ -8,11 +8,11 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindTvDoc, claimRemote, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote, isStartOnly,
-  mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readRemote,
+  mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readPower, readProgramme, readRemote,
   readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
   tvKey, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
-  tvTogglePower, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
+  tvTogglePower, TV_COUNTER_MAX, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
@@ -335,6 +335,37 @@ describe('the programme', () => {
     doc.getMap('tv').set(powerKey(TV), { on: 'yes', seq: -2 });
     expect(readTv(TV).state).toBe('off');
     expect(tvHeartbeat(TV, 1_000)).toEqual({ ok: false, error: 'The set is off.' });
+  });
+
+  it('a peer\'s revision counter that cannot move reads as the floor, so every write after it still moves', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    // Finite, a number, and useless: + 1 changes none of these.
+    for (const stuck of [Number.MAX_VALUE, Number.MAX_SAFE_INTEGER + 1, 2 ** 60, 1.5, -1, 'x', null]) {
+      doc.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), seq: stuck, started: stuck, jump: stuck });
+      expect(readProgramme(TV)).toMatchObject({ seq: 0, started: 0, jump: 0 });
+      doc.getMap('tv').set(powerKey(TV), { on: true, seq: stuck });
+      expect(readPower(TV).seq).toBe(0);
+    }
+    // The ceiling reads as itself, and the bump past it is the floor again —
+    // moved, which is all a revision must do: a heartbeat over it is a NEW
+    // sample to anchor to.
+    doc.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), seq: TV_COUNTER_MAX, jump: TV_COUNTER_MAX });
+    expect(readProgramme(TV)).toMatchObject({ seq: TV_COUNTER_MAX, jump: TV_COUNTER_MAX });
+    expect(tvHeartbeat(TV, 1_000).ok).toBe(true);
+    expect(readProgramme(TV).seq).toBe(0);
+    expect(readSample(TV)).toMatchObject({ seq: 0, positionMs: 1_000 });
+    // A seek over a stuck seq and jump is a new seq and a new jump…
+    doc.getMap('tv').set(tvKey(TV), { ...readProgramme(TV), seq: Number.MAX_VALUE, jump: Number.MAX_VALUE });
+    expect(tvSeek(TV, 5_000).ok).toBe(true);
+    expect(readProgramme(TV)).toMatchObject({ seq: 1, jump: 1 });
+    // …and a press over a stuck power seq a new revision: the lookup in
+    // flight is voided, and the set does go off.
+    doc.getMap('tv').set(powerKey(TV), { on: true, seq: Number.MAX_VALUE });
+    const revision = tvRevision(TV);
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(tvRevision(TV)).not.toBe(revision);
+    expect(readPower(TV)).toEqual({ on: false, seq: 1 });
   });
 
   it('a power press on one device never undoes the holder\'s heartbeat on another, nor the other way round', () => {
