@@ -91,6 +91,8 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
  *  open orbit), or null when that place is not known here. */
 export function undockPoseFrom(locationId: string, now = Date.now()): FreePose | null {
   const station = listStations().find((s) => s.id === locationId);
+  // Between planets it is on no orbit here to fly off from (DEPART waits too).
+  if (station && stationInTransit(station, now)) return null;
   if (station) {
     const planetId = planetById(station.planetId).id;
     const known = freeStationsAround(planetId, now).find((s) => s.id === station.id);

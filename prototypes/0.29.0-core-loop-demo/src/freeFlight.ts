@@ -415,7 +415,7 @@ function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
     const speed = speedOf(p);
     if (speed === 0) return Infinity;
     const d = Math.hypot(p.near.along, p.near.radial);
-    const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
+    const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
     return onGrid((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S);
   }
   if (stations.length === 0) return Infinity;

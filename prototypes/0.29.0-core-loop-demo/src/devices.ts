@@ -2691,6 +2691,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             : towingNow ? 'Towing a station — the tug stays docked until it arrives.'
               : isRouteRunning(savedRoute) ? 'A ferry route is set to run: STOP it (ROUTE, below) to fly by hand.'
                 : fuel <= 0 ? 'No fuel to fly on.'
+                  : stationInTransit(listStationRecordsNow().find((st) => st.id === location.id) ?? {}, now) ? 'The station is between planets: fly by hand once it arrives.'
                   : undockPoseFrom(location.id, now) === null ? 'This station is not on your station list, so there is nowhere to fly from.'
                     : '';
       const freeNoteNow = freeNote && now < freeNote.until ? freeNote.text : '';

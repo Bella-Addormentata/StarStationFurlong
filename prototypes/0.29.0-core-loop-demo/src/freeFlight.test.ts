@@ -187,6 +187,18 @@ describe('speed zones', () => {
     expect(shown.near?.radial).toBeCloseTo(once.near!.radial, 6);
   });
 
+  it('a fast ship held in a frame past the zone edge is slowed as it comes back inside', () => {
+    const st = stationAt(2);
+    const at = st.pointAt(T0);
+    const p0 = pointOff(at, 54, 0);
+    // In the leave margin (50–55 km), at the open cap, heading in.
+    const pose: FreePose = { planetId: SOV, at: T0, radiusKm: p0.radiusKm, angle: p0.angle, vAlong: -OPEN_MAX_KMS, vRadial: 0, heading: Math.PI, near: { room: st.room, along: 54, radial: 0 } };
+    const r = coastTo(pose, T0 + 1000, [st]);
+    expect(r.changed).toBe(true);
+    expect(speedOf(r.pose)).toBeLessThanOrEqual(APPROACH_MAX_KMS + 1e-9);
+    expect(Math.hypot(r.pose.near!.along, r.pose.near!.radial)).toBeGreaterThan(30);
+  });
+
   it('a coast stopped by the safety cap is held there, not carried on unchecked', () => {
     const st = stationAt(2);
     // Crawling just outside the hull bubble: every step stays short.

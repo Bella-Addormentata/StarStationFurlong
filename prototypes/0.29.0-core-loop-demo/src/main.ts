@@ -1445,7 +1445,10 @@ function shipRoutePortDock(now: number): { gate?: number } | null {
  *  when the room is no ready ship, or is a module bolted into a station. */
 function planetShipStatus(): ShipStatusInput | null {
   const roomId = activeBootstrap?.roomId ?? "";
-  if (!roomId || !isShipReady() || isBoltedIntoStation(readAllDoors().values())) return null;
+  // 🕹️ A ship flown by hand that lost a part it flies by still coasts, so
+  // it stays on the planet's maps.
+  const ready = isShipReady() || readFlightRecord().status === "free-flight";
+  if (!roomId || !ready || isBoltedIntoStation(readAllDoors().values())) return null;
   const now = Date.now();
   // 🚏 A running route's timetable, while it rules the flight (A4): the
   // stored record only catches up at the copy-back.

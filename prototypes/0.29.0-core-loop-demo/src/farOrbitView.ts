@@ -42,7 +42,7 @@ import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
-import { shipDocBound } from './shipDoc';
+import { readFlightRecord, shipDocBound } from './shipDoc';
 // 🕹️ Ships flown by hand (issue 203): this one's pose, and others' coasted on.
 import type { FreePose } from './freeFlight';
 import { remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
@@ -235,7 +235,9 @@ function readSource(now: number): Source {
   let adrift: Place | null = null;
   // Aboard a ship flown by hand: see the planet from where it flies.
   let free: FreePose | null = null;
-  if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
+  // A ship flown by hand that lost a part it flies by still coasts: follow it.
+  const aboardShip = shipDocBound() && (isShipReady() || readFlightRecord().status === 'free-flight');
+  if (aboardShip && !isBoltedIntoStation(readAllDoors().values())) {
     // 🚏 A running ferry route's timetable while it rules the flight (its
     // legs write no stored `flight`), else the stored record.
     const rec = readResolvedFlight(now);
