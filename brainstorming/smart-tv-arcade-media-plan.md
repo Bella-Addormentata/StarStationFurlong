@@ -85,6 +85,10 @@ the sources that fail have to say so on the screen.
 }
 // key remote:<itemId> — its own record so a lease renewal never collides with a playback write
 { holder: pub | '', name, leaseAt, by }
+// key volume:<itemId> — the set's volume (a body button anyone may press), its own key so a
+// viewer turning the sound down never carries a stale programme over the holder's seek:
+// whole-value LWW keeps one writer per key, so each thing that changes on its own has one
+{ volume: 0..100 }
 ```
 
 **Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
