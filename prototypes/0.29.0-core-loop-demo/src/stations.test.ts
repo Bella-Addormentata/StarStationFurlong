@@ -368,6 +368,19 @@ describe('stationForRoom / planetForRoom', () => {
     expect(planetForRoom('yard-b', atlas).id).toBe('planet-aris');
     expect(planetForRoom('lounge', atlas).id).toBe(DEFAULT_PLANET_ID);
   });
+
+  it('keeps structure in place when a full planet lists no station for it', () => {
+    // Furlong and fifteen lone stations fill Sovereign, so neither the
+    // two-room yard nor the lone pod (anchored last) is listed. The yard's
+    // pairing is recorded on z2 alone, so z1's live doors show only its dock.
+    const lone = Array.from({ length: MAX_ORBIT_SLOTS - 1 }, (_, i) => room(`a${String(i).padStart(2, '0')}`));
+    const atlas = atlasOf(...lone, room('z1'), room('z2', ['z1']), room('zz'));
+    expect(listStations(atlas, []).filter((s) => ['z1', 'z2', 'zz'].includes(s.welcomeRoomId))).toEqual([]);
+    const dock = { paired: true as const, connectedRoomAddress: `ssf://join#room=${WELCOME}`, transient: true };
+    expect(dockedStationFor('z1', [dock], atlas)).toBeNull();
+    // A lone module the full planet left out still moves to its host.
+    expect(dockedStationFor('zz', [dock], atlas)).toBe(DEFAULT_STATION_ID);
+  });
 });
 
 describe('saved records', () => {

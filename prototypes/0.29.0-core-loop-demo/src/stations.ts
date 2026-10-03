@@ -377,7 +377,9 @@ export function dockedStationFor(
   stations: StationRecord[] = listStations(atlas),
 ): string | null {
   const own = atlasStationForRoom(roomId, atlas, stations);
-  if (own && (!own.derived || atlasComponent(atlas, roomId).size > 1)) return null;
+  // Structure stays put whether or not it is listed: a full planet lists no
+  // station for it, but its rooms still are not a lone module.
+  if ((own && !own.derived) || atlasComponent(atlas, roomId).size > 1) return null;
   const partners: string[] = [];
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
