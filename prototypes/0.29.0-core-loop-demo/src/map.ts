@@ -114,8 +114,9 @@ function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['
     };
   }
   // Until the burn it is the station it always was: its id keeps its trim,
-  // 🎚️ on the altitude it keeps until it leaves (fromOrbit), if any.
-  const held = (move.settles ?? move).fromOrbit;
+  // 🎚️ on the altitude the list says it keeps until it leaves (the move's
+  // fromOrbit, unless another station's claim beat it), if any.
+  const held = s.orbit;
   // A cancelled move keeps it for good (stations.orbitAfterMove).
   const cancelled = !!move.settles && move.departAt < move.settles.arriveAt;
   const fromStation = {

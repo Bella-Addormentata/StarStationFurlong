@@ -68,6 +68,7 @@ import {
   stationLeftPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
+import { altitudeChangedSince, setAltitudeHistory } from './stations';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -546,9 +547,36 @@ describe('Copilot round 3', () => {
       toPlanetId: 'planet-aris', toSlot: 0, departAt: NOW + 5_000_000, arriveAt: NOW + 9_000_000, mode: 'thrusters',
       bookedAt: NOW, fuel: 5, fuelDrawn: 5, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0 },
     };
-    const station = { ...DEFAULT_STATION_RECORD, move: leave };
+    const station = { ...DEFAULT_STATION_RECORD, move: leave, orbit: { radiusKm: SOV_R + 1_000, phase0: 0 } };
     const body = stationBodies([station], NOW)[0];
     const slot0 = stationBodies([DEFAULT_STATION_RECORD], NOW)[0].orbitRadius;
     expect(body.placeAt!(NOW).radius).toBeGreaterThan(slot0);
+    // A kept altitude the list dropped (another station claimed it first)
+    // is drawn at the slot, as listed.
+    const dropped = stationBodies([{ ...DEFAULT_STATION_RECORD, move: leave }], NOW)[0];
+    expect(dropped.placeAt!(NOW).radius).toBeCloseTo(slot0, 6);
+  });
+
+  it('tells an arriving ship its station changed altitude, even when a later move hides it', () => {
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW);
+    const leave: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: NOW + 5_000_000, arriveAt: NOW + 9_000_000, mode: 'thrusters',
+      bookedAt: NOW + 100_000, fuel: 5, fuelDrawn: 10, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW },
+    };
+    const station = { id: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? leave : null));
+    setAltitudeHistory(() => [climb]);
+    try {
+      // Cast off before the climb: refused. After it had arrived: fine.
+      expect(altitudeChangedSince(station, NOW - 1_000, NOW + 200_000)).toBe(true);
+      expect(altitudeChangedSince(station, NOW + 70_000, NOW + 200_000)).toBe(false);
+      // A climb another station's earlier claim aborted never happened.
+      const theirs = climbOf('other', 'other-room', 1, 1_020, NOW - 10);
+      setAltitudeHistory(() => [climb, theirs]);
+      expect(altitudeChangedSince(station, NOW - 1_000, NOW + 200_000)).toBe(false);
+    } finally {
+      setAltitudeHistory(null);
+    }
   });
 });

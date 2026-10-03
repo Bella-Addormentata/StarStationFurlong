@@ -22,7 +22,7 @@
 import { dockAnswerOf, stampAfter, type DockAnswer, type DockOpOptions, type DockPortState, type DockRefusal } from './dockRules';
 import { writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
 import { roomIdFromSeed } from './stationAtlas';
-import { currentRoomId, listStations, planetById, stationInTransit } from './stations';
+import { altitudeChangedSince, currentRoomId, listStations, planetById, stationInTransit } from './stations';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -476,7 +476,11 @@ export function completeArrival(
   const listedNow = castOffPlace ? listStations().find((s) => s.id === rec.locationId) : undefined;
   const movedAway = !!castOffPlace && !!listedNow
     && (planetById(listedNow.planetId).id !== planetById(castOffPlace.planetId).id || listedNow.orbitSlot !== castOffPlace.orbitSlot);
-  if (stationInTransit(station, now) || movedMidFlight || movedAway) {
+  // 🎚️ An altitude change since cast-off keeps the planet and slot, so it
+  // is looked for among every move known, not only the latest.
+  const listed = listedNow ?? listStations().find((s) => s.id === rec.locationId);
+  const climbedAway = !!listed && leftAt !== undefined && altitudeChangedSince(listed, leftAt, now);
+  if (stationInTransit(station, now) || movedMidFlight || movedAway || climbedAway) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.

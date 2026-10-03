@@ -300,6 +300,22 @@ export function setAltitudeHistory(source: (() => StationMove[]) | null): void {
   altitudeHistory = source;
 }
 
+/** 🎚️ Has the station begun an altitude change, not aborted, that was still
+ *  to come or under way at `sinceMs` (a ship's cast-off)? It keeps its
+ *  planet and slot, so only the moves this install knows tell: a later move
+ *  booked since can hide it from the latest. */
+export function altitudeChangedSince(station: MovingStation, sinceMs: number, nowMs: number): boolean {
+  let history: StationMove[] = [];
+  try { history = altitudeHistory?.() ?? []; } catch { history = []; }
+  const latest = moveOf(station);
+  const known = latest ? [latest, ...history] : history;
+  const changes = known.filter((m) => moveBelongsTo(m, station) && m.mode === 'orbit' && !m.settles && !!m.orbit
+    && m.arriveAt > sinceMs && m.departAt <= nowMs);
+  if (changes.length === 0) return false;
+  const lost = lostAltitudeClaims(known);
+  return changes.some((m) => !lost.has(altitudeMoveKey(m)));
+}
+
 /**
  * 🎚️ Which of `moves` lose the orbit they claim, by their altitudeMoveKey.
  * A claim is an altitude change's destination (from its booking until its
