@@ -179,7 +179,7 @@ import type {
 } from "./devices";
 import { subscribeGames, readGame } from "./games/gamesDoc";
 import { deviceFocus } from "./deviceFocus";
-import { roomEdit, canEditRoom } from "./editMode";
+import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
 import { showHint } from "./hud";
 // 🎉 Party props: the focused panels and the doc the moment lives in.
 import {
@@ -5265,7 +5265,7 @@ export class World {
 
   /**
    * 🔧 The Disassemble robots (#192, disassembly.ts). A job whose labor has
-   * run out ends here, on the room owner's client while they are in the
+   * run out ends here, on the deed holder's client while they are in the
    * room (their two tabs would write the same thing): the room's doors to
    * the module are sealed as UNDOCK seals them, the job is marked done, and
    * the module leaves the atlas for every map. A blocker found then (the
@@ -5285,12 +5285,13 @@ export class World {
       this.disassemblySaid.clear();
       return;
     }
-    // Only the owner's client, standing in the room, ends a job. The owner is
-    // who sets robots to a module (the console is owner-only), so the
-    // removal is theirs to carry out; their copy of the doors and the atlas
-    // is the room as it is. (The job record is peer-written, like all of
-    // the room doc: this decides what this client does, roomOwner.ts.)
-    if (this.hadActivePlayer && canEditRoom().ok) {
+    // Only the deed holder's client, standing in the room, ends a job: a
+    // module off the station can't be put back, so it is the deed's, not
+    // every venture shareholder's (main.ts's authority split), and the deed
+    // holder is who sets robots to a module. Their copy of the doors and the
+    // atlas is the room as it is. (The job record is peer-written, like all
+    // of the room doc: this decides what this client does, roomOwner.ts.)
+    if (this.hadActivePlayer && holdsRoomDeed()) {
       let ended = false;
       for (const job of jobs) {
         const due = jobDueAt(job);
@@ -5314,7 +5315,7 @@ export class World {
       }
       // In the crew: it works at the job's door while labor is left, then
       // waits on its dock until the module comes off (a blocker, or the
-      // owner away), having said it is done.
+      // deed holder away), having said it is done.
       const fraction = jobFraction(job, now);
       bot.setWorkPost(fraction < 1 ? this.workPost(job.doorId, slot) : null);
       // A line on starting and at each tenth of the job, once delivered.
@@ -5938,6 +5939,7 @@ export class World {
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+        holdsDeed: () => holdsRoomDeed(),
         disassemblyCandidates: () => this.disassemblyCandidates(),
       });
       deviceFocus.beginFocus(this.player, device, ui);

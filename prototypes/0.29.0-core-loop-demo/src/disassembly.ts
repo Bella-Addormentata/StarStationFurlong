@@ -173,7 +173,7 @@ export function jobStatusText(job: DisassemblyJob, now: number, blocked: string 
   const pct = Math.floor(jobFraction(job, now) * 100);
   const left = laborHoursLeft(job, now);
   if (left <= 0) {
-    // The room's owner's game takes it off (world.ts), at once when they are here.
+    // The deed holder's game takes it off (world.ts), at once when they are here.
     return blocked ? `Work done, but it can't come off yet: ${blocked}.` : "Work done; it comes off once the room's owner is here.";
   }
   const hours = `${Math.ceil(left)} labor hour${Math.ceil(left) === 1 ? '' : 's'} left`;
@@ -236,8 +236,8 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
  *    from inside with no doors of its own is known: it is joined only by
  *    doors other rooms recorded;
  *  - only its owner takes a module apart (one with no verified owner may be
- *    taken apart by this room's owner, as the console is owner-only; one
- *    this install minted, whose owner the atlas never learned, likewise);
+ *    taken apart by this room's deed holder, who alone sets robots to it;
+ *    one this install minted, whose owner the atlas never learned, likewise);
  *  - it must hang only off this room: a module still joined to another, or
  *    with a ship docked at it, would leave that one cut off.
  */

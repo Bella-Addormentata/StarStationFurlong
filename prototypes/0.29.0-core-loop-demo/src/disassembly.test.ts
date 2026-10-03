@@ -3,11 +3,14 @@
  * crew that settles the progress whenever it changes, which modules a room's
  * robots may take apart, and a module taken apart leaving every map.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, isDismantled, noteRoomSeed, readAtlas,
-  seedAtlasDefaults, withSharedAtlasOf, MAX_ENTRIES,
+  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, harvestIntoAtlas, isDismantled, noteRoomSeed, pushAtlasToDoc,
+  readAtlas, seedAtlasDefaults, withSharedAtlasOf, MAX_ENTRIES,
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobDueAt, jobFraction, jobStatusText,
@@ -520,6 +523,104 @@ describe('a module taken apart', () => {
     expect(withSharedAtlasOf(doc, readAtlas(), 'room-b')['room-b']?.doors).toMatchObject({ west: { targetRoomId: 'room-a' } });
   });
 
+  it('wins a tie with the copy it replaces, at the six-hour ceiling', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const T = 1_000_000;
+      const CEILING = T + 6 * 60 * 60 * 1000;
+      now.mockReturnValue(T);
+      hub();
+      // A copy of GARDEN stamped at the bound every reader enforces (a peer
+      // six hours ahead) sits in the doc.
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('room-b', {
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, owner: { id: 'p-me' }, updatedAt: CEILING,
+      });
+      const before = Y.encodeStateAsUpdate(doc);
+      bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+      // Taken apart: its stamp can only tie that copy's, and it goes out anyway.
+      dismantleInAtlas('room-b', T);
+      const shared = doc.getMap('atlas').get('room-b') as { dismantledAt?: number; doors: object; updatedAt: number };
+      expect(shared).toMatchObject({ dismantledAt: T, updatedAt: CEILING });
+      expect(shared.doors).toEqual({});
+      // Another install holding that copy at the same stamp…
+      store.clear();
+      hub();
+      const doc2 = new Y.Doc();
+      Y.applyUpdate(doc2, before);
+      bindStationAtlasDoc(doc2, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']?.lastSeen).toBe(CEILING);
+      // …reads it as gone in the doc read for its gates, and takes the
+      // tombstone when it arrives.
+      expect(withSharedAtlasOf(doc, readAtlas(), 'room-b')['room-b']).toBeUndefined();
+      Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc));
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(isDismantled('room-b')).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('goes out over a live copy as new as it, without that copy\'s doors', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      hub();
+      // A tombstone learned with the module's gates…
+      const tomb = new Y.Doc();
+      tomb.getMap('atlas').set('room-b', {
+        roomId: 'room-b', name: 'GARDEN', doors: {}, gates: { south: 4 }, owner: { id: 'p-me' }, dismantledAt: 1_000_100, updatedAt: 1_000_200,
+      });
+      bindStationAtlasDoc(tomb, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      expect(tomb.getMap('atlas').get('room-b')).toMatchObject({ updatedAt: 1_000_200 });
+      // …meets, in another room's doc, a copy of GARDEN as new as it and
+      // with no gates: the tombstone wins, and joins nothing.
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('room-b', {
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, updatedAt: 1_000_200,
+      });
+      bindStationAtlasDoc(doc, { roomId: 'room-c', isPassagePublic: () => false });
+      const shared = doc.getMap('atlas').get('room-b') as { dismantledAt?: number; doors: object };
+      expect(shared.dismantledAt).toBe(1_000_100);
+      expect(shared.doors).toEqual({});
+      expect(isDismantled('room-b')).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('stands in the doc against a live copy of ours as new as it', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      now.mockReturnValue(1_000_000);
+      hub();
+      const tombstone = {
+        roomId: 'room-b', name: 'GARDEN', doors: {}, owner: { id: 'p-me' }, dismantledAt: 1_000_100, updatedAt: 1_000_200,
+      };
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('room-b', tombstone);
+      bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(isDismantled('room-b')).toBe(true);
+      // Another tab of this install, sharing its store, wrote a live copy at
+      // the same stamp meanwhile: with doors, then with none but its gates.
+      const relive = (over: object) => {
+        const stored = JSON.parse(store.get('ssf-station-atlas')!);
+        const { dismantledAt: _gone, ...live } = stored['room-b'];
+        stored['room-b'] = { ...live, lastSeen: 1_000_200, ...over };
+        store.set('ssf-station-atlas', JSON.stringify(stored));
+      };
+      relive({ doors: { west: { targetSeed: seed('room-a'), targetRoomId: 'room-a' } } });
+      pushAtlasToDoc();
+      expect(doc.getMap('atlas').get('room-b')).toEqual(tombstone);
+      relive({ doors: {}, gates: { south: 4 } });
+      pushAtlasToDoc();
+      expect(doc.getMap('atlas').get('room-b')).toEqual(tombstone);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('a seed handed over later does not bring it back', () => {
     hub();
     dismantleInAtlas('room-b', 5);
@@ -553,5 +654,52 @@ describe('a module taken apart', () => {
     } finally {
       now.mockRestore();
     }
+  });
+});
+
+// ── Who takes a module apart ─────────────────────────────────────────────────
+
+/**
+ * A module off the station can't be put back, so taking one apart is the
+ * room's deed holder's (main.ts's authority split), never every venture
+ * shareholder's. The gates live in world.ts, devices.ts and main.ts, which
+ * these tests cannot run, so they read the source, as roomOwner.test.ts does
+ * for #142's: what they catch is a gate widened back to the edit permission.
+ */
+describe('the deed takes a module apart (source scan)', () => {
+  const source = (file: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), file), 'utf8');
+  const between = (text: string, from: string, to: string): string => {
+    const start = text.indexOf(from);
+    expect(start, `${from} not found`).toBeGreaterThan(-1);
+    const end = text.indexOf(to, start + from.length);
+    expect(end, `${to} not found after ${from}`).toBeGreaterThan(start);
+    return text.slice(start, end);
+  };
+
+  it("ends a job on the deed holder's game", () => {
+    const body = between(source('world.ts'), 'private updateDisassembly(', 'private finishDisassembly(');
+    expect(body).toContain('holdsRoomDeed()');
+    expect(body).not.toContain('canEditRoom');
+  });
+
+  it('sets a robot to a module for the deed holder alone, checked again at the click', () => {
+    const devices = source('devices.ts');
+    expect(devices).toContain('const mayTakeApart = (): boolean => deps.canEdit() && (deps.holdsDeed?.() ?? true);');
+    const wire = between(devices, 'const wireDisassemblyPicks = ', 'const redrawDisassembly = ');
+    const click = wire.indexOf("addEventListener('click'");
+    expect(click).toBeGreaterThan(-1);
+    const recheck = wire.indexOf('mayTakeApart()', click);
+    expect(recheck).toBeGreaterThan(click);
+    expect(recheck).toBeLessThan(wire.indexOf('assignDisassembly(', click));
+    expect(between(source('world.ts'), 'createRobotDockUI({', '});')).toContain('holdsDeed: () => holdsRoomDeed()');
+  });
+
+  it('is the raw deed check, refused while a leave is under way', () => {
+    const gate = between(source('main.ts'), 'setRoomDeedCheck(() => {', '\n  });');
+    expect(gate).toContain('currentRoomDeedIsMine()');
+    expect(gate).not.toContain('isLocalPlayerRoomOwner');
+    const leaving = gate.indexOf('if (roomLeavesUnderWay > 0) return false;');
+    expect(leaving).toBeGreaterThan(-1);
+    expect(leaving).toBeLessThan(gate.indexOf('if (!yjsSync)'));
   });
 });

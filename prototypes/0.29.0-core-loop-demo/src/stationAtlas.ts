@@ -466,7 +466,8 @@ export function dismantleInAtlas(roomId: string, at: number): void {
   const prior = atlas[roomId];
   const now = Date.now();
   // Newer than any copy the doc holds, so the push below publishes it (and
-  // within the bound every reader enforces).
+  // within the bound every reader enforces: over a copy stamped at that
+  // ceiling it ties instead, and a tie goes to the tombstone).
   const existing = sharedAlive() ? sharedMap!.get(roomId) : undefined;
   const docStamp = isSharedAtlasEntry(existing) ? existing.updatedAt + 1 : 0;
   atlas[roomId] = {
@@ -798,8 +799,11 @@ export function withSharedAtlasOf(
     const value = shared.get(rid);
     const stale = isSharedAtlasEntry(value) && (gone.get(rid) ?? -Infinity) >= value.updatedAt;
     if (isSharedAtlasEntry(value) && value.roomId === rid && value.dismantledAt !== undefined) {
-      // 🔧 Taken apart: a tombstone, newer than what we hold, joins nothing.
-      if (!out[rid] || value.updatedAt > out[rid].lastSeen) {
+      // 🔧 Taken apart: a tombstone, newer than what we hold (or as new as a
+      // live copy: a tie goes to the tombstone, as in the pull), joins nothing.
+      const held = out[rid];
+      if (!held || value.updatedAt > held.lastSeen
+        || (value.updatedAt === held.lastSeen && held.dismantledAt === undefined)) {
         out[rid] = { roomId: rid, name: value.name || 'Module', doors: {}, dismantledAt: value.dismantledAt, lastSeen: value.updatedAt };
       }
     } else if (isSharedAtlasEntry(value) && value.roomId === rid && !stale) {
@@ -1514,13 +1518,17 @@ function pullSharedAtlas(): void {
     // 🔧 A tombstone of ours has no doors, yet it outranks any older copy:
     // the module was taken apart after that copy was written. And an
     // incoming tombstone is not outranked by a stub, however fresh: a door
-    // naming the room is no news about the room itself.
+    // naming the room is no news about the room itself. At an equal stamp
+    // the tombstone wins either way (pushAtlasToDoc publishes it at a tie:
+    // over a copy stamped at the six-hour ceiling it can do no better).
     const stub = Object.keys(prior?.doors ?? {}).length === 0 && prior?.localSeenAt === undefined;
     if (prior
       && !prior.bundled
       && prior.lastSeen >= value.updatedAt
       && (prior.dismantledAt !== undefined
-        || (value.dismantledAt !== undefined ? !stub : Object.keys(prior.doors).length >= incoming))) {
+        || (value.dismantledAt !== undefined
+          ? !stub && prior.lastSeen > value.updatedAt
+          : Object.keys(prior.doors).length >= incoming))) {
       // ⚓🚦 Our copy stands, but one harvested by an older build carries no
       // gates: take the doc's, and the access that rides with them, on their
       // own, so gate numbering sees them.
@@ -1668,15 +1676,26 @@ export function pushAtlasToDoc(): void {
       if (entry.bundled) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
+      // 🔧 Between a tombstone and a live copy, the tombstone wins a tie, as
+      // the pull and withSharedAtlasOf rank them: over a copy stamped at the
+      // six-hour ceiling, dismantleInAtlas can only tie it, and the module
+      // must still come off.
+      const knownAsNew = !!known && (entry.dismantledAt !== undefined && known.dismantledAt === undefined
+        ? known.updatedAt > entry.lastSeen
+        : known.updatedAt >= entry.lastSeen);
       // ⚓🚦 A doc copy with no gates (an older client's, or a stub) gains the
       // gates we know even when it is otherwise as new as ours: its own doors
-      // are kept, and only the gates are added.
+      // are kept, and only the gates are added. (Live copies only: a module
+      // taken apart has no gates to give or take.)
       const onlyGates = !!known && !isOwn && entry.gates !== undefined && known.gates === undefined
-        && known.updatedAt >= entry.lastSeen
+        && entry.dismantledAt === undefined && known.dismantledAt === undefined
+        && knownAsNew
         && Object.keys(known.doors).length >= doorIds.length;
+      // (A tombstone there as new as ours stands whatever doors ours has: the
+      // module came off after ours was written.)
       if (known && !isOwn && !onlyGates
-        && known.updatedAt >= entry.lastSeen
-        && Object.keys(known.doors).length >= doorIds.length) {
+        && knownAsNew
+        && (known.dismantledAt !== undefined || Object.keys(known.doors).length >= doorIds.length)) {
         // The doc's copy is at least as new as ours, so ours stays unsent,
         // except for a berth we know and that copy has no flag for (an
         // inferred berth is written down, markInferredBerths). That flag goes

@@ -99,7 +99,7 @@ import {
   voteTallyView,
   windowsView,
 } from "./treasuryView";
-import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom, setRoomDeedCheck } from "./editMode";
 // 🚀 #30 SH2 + SH3: the ship's own doc (fuel truth + flight state machine).
 // Rebinds at the T0 seam alongside furniture / doors / games — see the
 // bindShipDoc call below for the rebind rationale. flightArrived + findDest
@@ -3850,6 +3850,8 @@ function resolveOwnerLabel(owner: string): string {
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
  *    · the deed hand-over          · the sole-croupier election
  *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *    · 🔧 #192 taking a module apart (a Disassemble job's pick and its end:
+ *      a module off the station can't be put back) — setRoomDeedCheck
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
  *  own venture map entry, which is peer-written, shape-checked only, and tied
@@ -9460,6 +9462,14 @@ async function init() {
     if (!yjsSync) return true;
     const owner = yjsSync.doc.getMap("roomInfo").get("owner");
     if (owner === "Local-Clone") return false;
+    return currentRoomDeedIsMine();
+  });
+
+  // 🔧 #192: the same one deed holder takes a module apart (its Disassemble
+  // job's pick and its end), since a module off the station can't be put back.
+  setRoomDeedCheck(() => {
+    if (roomLeavesUnderWay > 0) return false; // leaving: see the edit gate above
+    if (!yjsSync) return true;
     return currentRoomDeedIsMine();
   });
 

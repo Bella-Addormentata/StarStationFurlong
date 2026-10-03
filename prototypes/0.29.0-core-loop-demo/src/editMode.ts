@@ -145,6 +145,24 @@ export function canEditRoom(): RoomEditPermission {
 }
 
 /**
+ * 🔒 The narrower gate of main.ts's authority split: does the local player
+ * hold this room's DEED (the raw owner, never a venture's shareholders)?
+ * What can't be undone takes it: 🔧 #192, a module taken off the station.
+ * main.ts registers the raw deed check (currentRoomDeedIsMine), as it does
+ * for the sole-croupier election. Default: permissive (offline = your room).
+ */
+let deedPredicate: () => boolean = () => true;
+
+export function setRoomDeedCheck(predicate: () => boolean): void {
+  deedPredicate = predicate;
+}
+
+/** Does the local player hold this room's deed? */
+export function holdsRoomDeed(): boolean {
+  return deedPredicate();
+}
+
+/**
  * 🖱️ Context-menu world access: the right-click menu works OUTSIDE edit mode
  * (right-click an item in the plain room view → MOVE / DELETE), so it can't
  * rely on the `world` reference enter() captures. main.ts registers the live

@@ -4161,6 +4161,10 @@ export interface RobotDockUIDeps {
   itemId: string;
   /** Owner gate — only the room owner may program the robot. */
   canEdit: () => boolean;
+  /** 🔧 The narrower gate (#192): only the room's deed holder, never a
+   *  venture's shareholders, sets a robot to take a module apart, as only
+   *  their game ends the job (world.ts). */
+  holdsDeed?: () => boolean;
   /** 🔧 The modules this room's robots could take apart (#192). */
   disassemblyCandidates?: () => DisassemblyCandidate[];
 }
@@ -4196,16 +4200,21 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
    *  replaces only a part that changed (a click in progress survives it). */
   let drawnDis = { picks: '', status: '' };
 
+  /** 🔧 May this player set a robot to take a module apart: the console's
+   *  owner gate, and the room's deed. */
+  const mayTakeApart = (): boolean => deps.canEdit() && (deps.holdsDeed?.() ?? true);
+
   /** 🔧 The Disassemble routine's section: which joined module to take
    *  apart (each with its labor hours, or what stops it), and how the job on
    *  this robot's module stands. Names are peer-written: escaped. */
-  const disassemblyParts = (target: string | undefined, parked: boolean, owner: boolean): { picks: string; status: string } => {
+  const disassemblyParts = (target: string | undefined, parked: boolean): { picks: string; status: string } => {
     const now = Date.now();
     const jobs = readDisassemblyJobs();
     const candidates = deps.disassemblyCandidates?.() ?? [];
+    const may = mayTakeApart();
     const pick = (c: DisassemblyCandidate): string => {
       const on = c.roomId === target;
-      const usable = owner && !on && c.blocked === null;
+      const usable = may && !on && c.blocked === null;
       const open = jobs.find((j) => j.roomId === c.roomId && j.finishedAt === undefined);
       const done = open ? ` · ${Math.floor(jobFraction(open, now) * 100)}% done` : '';
       return `<button data-dis-target="${escAttr(c.roomId)}" ${usable ? '' : 'disabled'} style="
@@ -4215,7 +4224,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
         border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
         font-family:inherit; font-size:10.5px; font-weight:800;
-        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !owner ? 1 : 0.5};
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !may ? 1 : 0.5};
       "><span>${escAttr(c.name)} · ${c.laborHours} labor h${done}</span><span>${on ? '● ON' : ''}</span></button>${
         c.blocked ? `<div style="font-size:9px; color:${CH_DIM}; margin:-4px 0 0 12px;">⚠ Can't: ${escAttr(c.blocked)}.</div>` : ''}`;
     };
@@ -4234,23 +4243,30 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
           ? 'No module is joined to this room. A robot takes apart a module joined to the room its dock is in.'
           : 'Pick the module to take apart. The robot works at the door to it, more robots finish sooner, and when the labor hours are done the module comes off the station and leaves every map.'}</div>`;
     }
+    // A venture's shareholders program its robots, but the deed is one person's.
+    if (!may && deps.canEdit()) {
+      status += `<div style="font-size:9.5px; line-height:1.45; color:${CH_DIM};">🔒 Only this room's deed holder can set a robot to take a module apart.</div>`;
+    }
     return { picks: candidates.map(pick).join(''), status };
   };
 
   /** 🔧 The section as render() draws it. */
-  const disassemblyBlock = (target: string | undefined, parked: boolean, owner: boolean): string => {
-    drawnDis = disassemblyParts(target, parked, owner);
+  const disassemblyBlock = (target: string | undefined, parked: boolean): string => {
+    drawnDis = disassemblyParts(target, parked);
     return `<div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">MODULE TO TAKE APART</div>
       <div data-dis-picks style="display:flex; flex-direction:column; gap:6px;">${drawnDis.picks}</div>
       <div data-dis-status style="display:flex; flex-direction:column; gap:6px;">${drawnDis.status}</div>`;
   };
 
-  /** 🔧 Set this robot to take a joined module apart (re-checked at the click). */
+  /** 🔧 Set this robot to take a joined module apart (the gate and the
+   *  module re-checked at the click: either may have changed since the draw). */
   const wireDisassemblyPicks = (): void => {
-    if (!panel || !deps.canEdit()) return;
+    if (!panel || !mayTakeApart()) return;
     panel.querySelectorAll<HTMLButtonElement>('[data-dis-target]').forEach((b) => {
       b.addEventListener('click', () => {
-        const c = (deps.disassemblyCandidates?.() ?? []).find((x) => x.roomId === b.dataset.disTarget);
+        const c = mayTakeApart()
+          ? (deps.disassemblyCandidates?.() ?? []).find((x) => x.roomId === b.dataset.disTarget)
+          : undefined;
         if (!c || c.blocked !== null) {
           render();
           return;
@@ -4268,7 +4284,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const picksEl = panel?.querySelector<HTMLElement>('[data-dis-picks]');
     const statusEl = panel?.querySelector<HTMLElement>('[data-dis-status]');
     if (cfg?.routine !== 'disassemble' || !picksEl || !statusEl) return;
-    const next = disassemblyParts(cfg.target, cfg.parked === true, deps.canEdit());
+    const next = disassemblyParts(cfg.target, cfg.parked === true);
     if (next.picks !== drawnDis.picks) {
       picksEl.innerHTML = next.picks;
       drawnDis.picks = next.picks;
@@ -4392,7 +4408,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         ${routines.map(routineBtn).join('')}
       </div>
       ${pilotBlock}
-      ${current === 'disassemble' ? disassemblyBlock(cfg?.target, parked, owner) : ''}
+      ${current === 'disassemble' ? disassemblyBlock(cfg?.target, parked) : ''}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
       ${voiceBtn}
       ${editor}
