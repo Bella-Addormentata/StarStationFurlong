@@ -11,7 +11,8 @@
  * Flick the stick (drag the knob past its ring and let go), press a button,
  * or use the arrow keys (the stick takes the keyboard focus as the face
  * opens). Each is ONE discrete burn (stationKeeping.planTrim); everything
- * else on the dashboard is derived from the room's burns and the clock.
+ * else on the dashboard is derived from the room's burns and the clock. Tab
+ * is the SpacePhone's (main.ts), so F opens FUEL & DOCKING and K comes back.
  *
  * Every helm opens through here (world.ts): one in a module that steers no
  * station opens on the ship face, which offers station keeping within half
@@ -77,6 +78,20 @@ export function setStationHelmCommanderCheck(cb: (() => boolean) | null): void {
 
 function isCommander(): boolean {
   return commanderCheck?.() === true;
+}
+
+/** Is the SpacePhone open over the helm (main.ts marks its container
+ *  active)? It opens without taking the focus, so keys pressed at it still
+ *  reach the helm. */
+function phoneOpen(): boolean {
+  return document.getElementById('spacephone-container')?.classList.contains('active') === true;
+}
+
+/** Does `el` take keys of its own (a text field the player is typing in, or
+ *  a select): none of them is a helm command. */
+function takesKeys(el: Element | null): boolean {
+  const tag = el?.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el as HTMLElement | null)?.isContentEditable === true;
 }
 
 function countFunction(tag: string): number {
@@ -440,8 +455,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
       <div style="display:flex; gap:6px; margin:8px 0 4px;">
-        <button type="button" data-sk-tab="keep" aria-pressed="true" style="${tabStyle(true)}">STATION KEEPING</button>
-        <button type="button" data-sk-tab="ship" aria-pressed="false" style="${tabStyle(false)}">FUEL &amp; DOCKING</button>
+        <button type="button" data-sk-tab="keep" aria-pressed="true" aria-keyshortcuts="K" style="${tabStyle(true)}">STATION KEEPING [K]</button>
+        <button type="button" data-sk-tab="ship" aria-pressed="false" aria-keyshortcuts="F" style="${tabStyle(false)}">FUEL &amp; DOCKING [F]</button>
       </div>
       ${row('STATION', 'sk-station')}
       ${row('ORBIT', 'sk-orbit')}
@@ -489,9 +504,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     well.addEventListener('keydown', (e) => {
       const dir = ARROW_KEYS[e.key];
       if (!dir) return;
-      // The SpacePhone opens over the helm without taking the focus (main.ts
-      // binds Tab to it): no key pressed at the phone fires a burn.
-      if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
+      // No key pressed at the SpacePhone fires a burn.
+      if (phoneOpen()) return;
       e.preventDefault();
       // One press, one burn: a held key's auto-repeat is not a new press
       // (it would fire again the moment the last burn ends).
@@ -549,8 +563,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     // opens, on the way back from FUEL & DOCKING too, unless the player is
     // typing (the SpacePhone's chat). preventScroll: the panel sits over the
     // canvas.
-    const typingIn = document.activeElement as HTMLElement | null;
-    if (typingIn?.tagName !== 'INPUT' && typingIn?.tagName !== 'TEXTAREA') well.focus({ preventScroll: true });
+    if (!takesKeys(document.activeElement)) well.focus({ preventScroll: true });
   };
 
   const unmountKeep = (): void => {
@@ -571,7 +584,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     if (steers && !back) {
       back = document.createElement('button');
       back.type = 'button';
-      back.textContent = '◂ STATION KEEPING';
+      back.textContent = '◂ STATION KEEPING [K]';
+      back.setAttribute('aria-keyshortcuts', 'K');
       back.style.cssText = `position:absolute; top:14px; left:50%; transform:translateX(-50%); pointer-events:auto; padding:7px 14px; border-radius:8px; border:1px solid ${AMBER}; background:rgba(4,8,22,0.94); color:${AMBER}; font-family:'SF Mono','Monaco','Consolas',monospace; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer; box-shadow:0 6px 24px rgba(0,0,0,0.8);`;
       back.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -607,9 +621,27 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     mountKeep(host);
   };
 
+  /** The faces' keys, since Tab is the SpacePhone's and the stick keeps the
+   *  arrows: F opens FUEL & DOCKING, and K comes back to station keeping
+   *  while the ship face offers it. Never while typing, at the SpacePhone, or
+   *  with a modifier held (the browser's own shortcuts). */
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (takesKeys(e.target as Element | null) || phoneOpen()) return;
+    const key = e.key.toLowerCase();
+    if (key === 'f' && face === 'keep') {
+      e.preventDefault();
+      showShip();
+    } else if (key === 'k' && face === 'ship' && back) {
+      e.preventDefault();
+      showKeep();
+    }
+  };
+
   return {
     mount(h: HTMLElement): void {
       host = h;
+      window.addEventListener('keydown', onKey);
       if (deps.bolted()) {
         face = 'keep';
         mountKeep(h);
@@ -618,6 +650,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       }
     },
     unmount(): void {
+      window.removeEventListener('keydown', onKey);
       if (face === 'ship') {
         ship?.unmount();
         ship = null;

@@ -276,12 +276,31 @@ const arrowUp = { key: 'ArrowUp', repeat: false, preventDefault: () => {} };
 let phoneOpen = false;
 /** A text field the player is typing in, holding the focus. */
 let typingIn: { tagName: string } | null = null;
+/** The keydown listeners on the stand-in window. */
+const windowKeys: Array<(e: unknown) => void> = [];
+
+/** A key pressed (not held) at whatever holds the focus, which the window
+ *  hears after it. */
+function press(key: string, more: Record<string, unknown> = {}): void {
+  const e = { key, repeat: false, ctrlKey: false, metaKey: false, altKey: false, target: typingIn ?? focused, preventDefault: () => {}, ...more };
+  focused?.dispatch('keydown', e);
+  for (const fn of [...windowKeys]) fn(e);
+}
 
 describe('the helm dashboard\'s faces', () => {
   beforeEach(() => {
     focused = null;
     phoneOpen = false;
     typingIn = null;
+    windowKeys.length = 0;
+    vi.stubGlobal('window', {
+      addEventListener: (type: string, fn: (e: unknown) => void) => {
+        if (type === 'keydown') windowKeys.push(fn);
+      },
+      removeEventListener: (type: string, fn: (e: unknown) => void) => {
+        if (type === 'keydown' && windowKeys.includes(fn)) windowKeys.splice(windowKeys.indexOf(fn), 1);
+      },
+    });
     const phone = { classList: { contains: (name: string) => name === 'active' && phoneOpen } };
     vi.stubGlobal('document', {
       createElement: (tag: string) => new FakeElement(tag),
@@ -419,6 +438,72 @@ describe('the helm dashboard\'s faces', () => {
       for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
       setStationHelmCommanderCheck(null);
     }
+  });
+
+  it('F opens FUEL & DOCKING and K comes back to station keeping, from the keyboard alone', () => {
+    // Copilot's review of #173: with Tab the SpacePhone's and the arrows the
+    // stick's, a keyboard player could not switch faces either way.
+    let steers = true;
+    const { built, shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => steers, station: () => null, shipFace });
+    const host = new FakeElement('host');
+    ui.mount(host as unknown as HTMLElement);
+    expect(keepFace(host)!.innerHTML).toMatch(/data-sk-tab="ship"[^>]*aria-keyshortcuts="F"[^>]*>FUEL &amp; DOCKING \[F\]</);
+    expect(keepFace(host)!.innerHTML).toMatch(/data-sk-tab="keep"[^>]*aria-keyshortcuts="K"[^>]*>STATION KEEPING \[K\]</);
+    press('k');
+    expect(built).toHaveLength(0);
+    press('F');
+    expect(keepFace(host)).toBeNull();
+    expect(built).toHaveLength(1);
+    expect(built[0].host).toBe(host);
+    const way = waysToKeeping(host)[0];
+    expect(way.textContent).toBe('◂ STATION KEEPING [K]');
+    expect(way.getAttribute('aria-keyshortcuts')).toBe('K');
+    press('f');
+    expect(built).toHaveLength(1);
+    press('k');
+    expect(built[0].host).toBeNull();
+    expect(keepFace(host)).not.toBeNull();
+    expect(focused).toBe(keepFace(host)!.querySelector('#sk-well'));
+
+    // K waits for the ship face to offer station keeping.
+    press('f');
+    steers = false;
+    for (let i = 0; i < 2; i++) ui.update(0.25);
+    expect(waysToKeeping(host)).toHaveLength(0);
+    press('k');
+    expect(keepFace(host)).toBeNull();
+    expect(built[1].host).toBe(host);
+
+    // Closed, the helm hears no more keys.
+    ui.unmount();
+    expect(windowKeys).toHaveLength(0);
+  });
+
+  it('F and K are no commands while typing, at the SpacePhone, with a modifier held or held down', () => {
+    const { built, shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => null, shipFace });
+    const host = new FakeElement('host');
+    ui.mount(host as unknown as HTMLElement);
+    for (const tagName of ['INPUT', 'TEXTAREA', 'SELECT']) {
+      typingIn = { tagName };
+      press('f');
+    }
+    typingIn = null;
+    press('f', { target: { tagName: 'DIV', isContentEditable: true } });
+    phoneOpen = true;
+    press('f');
+    phoneOpen = false;
+    for (const mod of ['ctrlKey', 'metaKey', 'altKey']) press('f', { [mod]: true });
+    press('f', { repeat: true });
+    expect(built).toHaveLength(0);
+    expect(keepFace(host)).not.toBeNull();
+    press('f');
+    expect(built).toHaveLength(1);
+    phoneOpen = true;
+    press('k');
+    expect(built[0].host).toBe(host);
+    ui.unmount();
   });
 
   it('World opens every helm through the station helm, a ship\'s too', () => {
