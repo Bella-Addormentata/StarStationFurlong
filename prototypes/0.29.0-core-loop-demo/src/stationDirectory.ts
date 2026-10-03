@@ -126,12 +126,33 @@ export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | 
 
 /** A hop's times as whole milliseconds, which is all a flight record stores
  *  (shipDoc isFlightRecord): orbital math gives fractions. Rounded up, so a
- *  ship never burns before its window; null when a time is no safe integer. */
+ *  ship never burns before its window; null when a time is no safe integer,
+ *  or when the hop would burn a negative amount (DEPART would add fuel). */
 function wholeMs(plan: HopPlan): HopPlan | null {
+  if (!(Number.isFinite(plan.fuelCost) && plan.fuelCost >= 0)) return null;
   const departAt = Math.ceil(plan.departAt);
   const arriveAt = Math.max(departAt + 1, Math.ceil(plan.arriveAt));
   if (!Number.isSafeInteger(departAt) || !Number.isSafeInteger(arriveAt)) return null;
   return { ...plan, departAt, arriveAt };
+}
+
+// ── Flight capability ────────────────────────────────────────────────────────
+
+let stationRoomCheck: (() => boolean) | null = null;
+
+/** Say whether the current room is a station's own (stations.isStationRoom):
+ *  wired from main.ts; null clears it. */
+export function setStationRoomCheck(check: (() => boolean) | null): void {
+  stationRoomCheck = check;
+}
+
+/** Engine, tank and helm fly a ship (`shipReady`), but a station's own room
+ *  wearing them, for station keeping, never takes off: no flight, and no
+ *  location taken from the ship's flight record. A check that throws reads
+ *  as no station room. */
+export function flightCapable(shipReady: boolean): boolean {
+  if (!shipReady) return false;
+  try { return stationRoomCheck?.() !== true; } catch { return true; }
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */
