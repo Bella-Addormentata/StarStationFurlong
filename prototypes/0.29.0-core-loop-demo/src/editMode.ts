@@ -101,6 +101,14 @@ import {
 } from './windowLayoutDoc';
 import { writeWallpaper, readAllWallpaper } from './wallpaperLayoutDoc';
 import {
+  AIR_HOCKEY_THEMES,
+  AIR_HOCKEY_THEME_LABELS,
+  AIR_HOCKEY_THEME_SPECS,
+  hexCss,
+  isAirHockeyThemeId,
+} from './airHockeyTheme';
+import { readAirHockeyTheme, writeAirHockeyTheme } from './airHockeyThemeDoc';
+import {
   WALLPAPER_PRESETS, WALLPAPER_LABELS, type WallpaperPresetId,
 } from './wallpaper';
 import { SURFACES, narrowAxisFor } from './hullSection';
@@ -1753,10 +1761,49 @@ class RoomEditController {
     const deleteBtn = isRoomTerminalKind(item.kind)
       ? ''
       : `<button type="button" data-ctx-action="delete" style="${btn} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">🗑 DELETE</button>`;
-    menu.innerHTML = `
-      <div style="font-size:9px; letter-spacing:1px; color:rgba(212,168,75,0.55); padding:2px 4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">📦 ${item.kind.toUpperCase()}</div>
+    const hdr = `font-size:9px; letter-spacing:1px; color:rgba(212,168,75,0.55); padding:2px 4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;`;
+
+    // 🎨 #184: an air-hockey table can be recoloured from here — the "table's
+    // menu settings" the issue asked for. Owner-only by inheritance: the
+    // right-click gate above refuses to open this menu at all unless
+    // canEditRoom() passes, and writeAirHockeyTheme is a doc write like any
+    // other edit. The kind is compared against the FurnitureKind union, so a
+    // rename breaks the build rather than silently dropping the entry.
+    const themeBtn = item.kind === 'air-hockey-table'
+      ? `<button type="button" data-ctx-action="theme-open" style="${btn}">🎨 COLOUR…</button>`
+      : '';
+
+    /** Root view — MOVE / COLOUR / DELETE. */
+    const rootView = (): string => `
+      <div style="${hdr}">📦 ${item.kind.toUpperCase()}</div>
       <button type="button" data-ctx-action="move" style="${btn}">✥ MOVE</button>
+      ${themeBtn}
       ${deleteBtn}`;
+
+    /** Colour view — one row per preset, a felt swatch and a ✓ on the current
+     *  one. Reads the doc live, so a peer's recolour shows the moment the
+     *  menu is reopened. */
+    const themeView = (): string => {
+      const current = readAirHockeyTheme(itemId);
+      const rows = AIR_HOCKEY_THEMES.map((id) => {
+        const spec = AIR_HOCKEY_THEME_SPECS[id];
+        const swatch = `<span style="display:inline-block; width:10px; height:10px; margin-right:6px;`
+          + ` border-radius:2px; vertical-align:middle; background:${hexCss(spec.feltBase)};`
+          + ` border:1px solid ${hexCss(spec.feltLines)};"></span>`;
+        const tick = id === current ? '✓&nbsp;' : '&nbsp;&nbsp;&nbsp;';
+        return `<button type="button" data-ctx-action="theme-set" data-ctx-theme="${id}"`
+          + ` style="${btn}">${swatch}${tick}${AIR_HOCKEY_THEME_LABELS[id]}</button>`;
+      }).join('');
+      return `<div style="${hdr}">🎨 TABLE COLOUR</div>${rows}`
+        + `<button type="button" data-ctx-action="theme-back" style="${btn}">← BACK</button>`;
+    };
+
+    /** Swap the body and re-fit — the colour view is taller than the root. */
+    const render = (html: string): void => {
+      menu.innerHTML = html;
+      this.clampContextMenu(menu, clientX, clientY);
+    };
+    menu.innerHTML = rootView();
 
     // Keep menu clicks OUT of the window-level click routing (onCanvasClick
     // would raycast "through" the menu and deselect / navigate). contextmenu
@@ -1772,6 +1819,22 @@ class RoomEditController {
       const el = (ev.target as HTMLElement).closest<HTMLElement>('[data-ctx-action]');
       if (!el) return;
       const action = el.dataset.ctxAction;
+      // 🎨 The two navigation actions swap the body and KEEP the menu open;
+      // everything below commits and closes it.
+      if (action === 'theme-open') return render(themeView());
+      if (action === 'theme-back') return render(rootView());
+      if (action === 'theme-set') {
+        // Guarded rather than cast: the id round-trips through a DOM dataset
+        // string, and the doc writer takes a union.
+        const next = el.dataset.ctxTheme;
+        if (isAirHockeyThemeId(next)) writeAirHockeyTheme(itemId, next);
+        // STAY OPEN, re-rendered so the ✓ moves. The doc observer repaints the
+        // table synchronously, so the owner sees each preset against the puck
+        // immediately and can step through them — which is the whole point of
+        // #184. Closing here would force a fresh right-click per comparison.
+        // Click away or press Escape to dismiss, as with any other menu.
+        return render(themeView());
+      }
       this.hideContextMenu();
       // MOVE picks the item up at the ORIGINAL right-click point (closure
       // clientX/clientY) — the button click's own coords are the menu's screen
@@ -1780,11 +1843,7 @@ class RoomEditController {
       else if (action === 'delete') this.ctxDelete(itemId);
     });
     document.body.appendChild(menu);
-
-    // Clamp inside the viewport once the size is known.
-    const r = menu.getBoundingClientRect();
-    if (r.right > window.innerWidth) menu.style.left = `${Math.max(0, window.innerWidth - r.width - 4)}px`;
-    if (r.bottom > window.innerHeight) menu.style.top = `${Math.max(0, window.innerHeight - r.height - 4)}px`;
+    this.clampContextMenu(menu, clientX, clientY); // once the size is known
     this.ctxMenuEl = menu;
 
     // Dismiss on any outside pointerdown (capture — before the game reacts)
@@ -1800,6 +1859,21 @@ class RoomEditController {
     };
     window.addEventListener('pointerdown', this.ctxDismissPointer, true);
     window.addEventListener('keydown', this.ctxDismissKey, true);
+  }
+
+  /**
+   * Keep the menu inside the viewport. Re-run on every view swap, because the
+   * colour view is taller than the root one and could otherwise hang off the
+   * bottom. It re-anchors to the ORIGINAL right-click point first, so repeated
+   * fits measure the same starting position instead of compounding and walking
+   * the menu across the screen.
+   */
+  private clampContextMenu(menu: HTMLDivElement, clientX: number, clientY: number): void {
+    menu.style.left = `${clientX}px`;
+    menu.style.top = `${clientY}px`;
+    const r = menu.getBoundingClientRect();
+    if (r.right > window.innerWidth) menu.style.left = `${Math.max(0, window.innerWidth - r.width - 4)}px`;
+    if (r.bottom > window.innerHeight) menu.style.top = `${Math.max(0, window.innerHeight - r.height - 4)}px`;
   }
 
   private hideContextMenu(): void {

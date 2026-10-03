@@ -184,6 +184,11 @@ import {
   readAllWallpaper,
   subscribeWallpaperLayout,
 } from "./wallpaperLayoutDoc";
+import { airHockeyTheme } from "./airHockeyTheme";
+import {
+  readAirHockeyTheme,
+  subscribeAirHockeyTheme,
+} from "./airHockeyThemeDoc";
 import {
   surfaceCenterWorld,
   surfaceBasis,
@@ -527,6 +532,8 @@ export class World {
     subscribeWindowLayout(() => this.reconcileWindowLayout());
     // 🖼️ #80 S6: rebuild the hull (wall coverings) when wallpaper changes.
     subscribeWallpaperLayout(() => this.reconcileWallpaper());
+    // 🎨 #184: repaint air-hockey tables when their colour skins change.
+    subscribeAirHockeyTheme(() => this.reconcileAirHockeyTheme());
 
     console.log("✅ World initialized - Station planet ready");
   }
@@ -1441,6 +1448,27 @@ export class World {
   private reconcileWallpaper(): void {
     if (!OCTAGON_HULL || !this.octagonHull) return;
     this.addOctagonHull(); // rebuilds hull faces (with coverings) + click-boxes + edit index
+  }
+
+  /**
+   * 🎨 #184: repaint air-hockey tables when the shared skin set changes.
+   *
+   * A REPAINT, not a rebuild — and deliberately so. removeFurnitureVisuals()
+   * calls closeAirHockeyTable() + clearTable() for this kind, so recolouring by
+   * rebuilding the group would end a match in progress and wipe the score.
+   * handle.setTheme() only touches `color` / `emissive` and the two canvases,
+   * which leaves the session, the registered handle and the morph fade alone.
+   *
+   * airHockeyVisuals IS the set of built tables, keyed by item id, so this
+   * needs no membership bookkeeping of its own: a table that does not exist
+   * has no handle, and one that is deleted loses its handle in
+   * removeFurnitureVisuals. Tables whose skin did not change short-circuit
+   * inside setTheme (same spec object), so the common notify costs nothing.
+   */
+  private reconcileAirHockeyTheme(): void {
+    for (const [itemId, handle] of this.airHockeyVisuals) {
+      handle.setTheme(airHockeyTheme(readAirHockeyTheme(itemId)));
+    }
   }
 
   /**

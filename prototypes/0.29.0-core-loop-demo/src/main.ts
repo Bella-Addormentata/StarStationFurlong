@@ -179,6 +179,7 @@ import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
 import { bindWindowLayoutDoc, subscribeWindowLayout } from "./windowLayoutDoc";
 import { bindWallpaperLayoutDoc } from "./wallpaperLayoutDoc";
+import { bindAirHockeyThemeDoc } from "./airHockeyThemeDoc";
 import {
   bindRoomRoles,
   subscribeRoomRoles,
@@ -1458,6 +1459,9 @@ async function joinRoomAtEpoch(
   bindWindowLayoutDoc(sync.doc);
   // 🖼️ #80 S6: wall coverings (surface → wallpaper preset) ride the doc too.
   bindWallpaperLayoutDoc(sync.doc);
+  // 🎨 #184: air-hockey table skins (item id → theme) ride the doc too, so a
+  // joiner sees the host's tables in the right colours on entry.
+  bindAirHockeyThemeDoc(sync.doc);
 
   // 🗺️ #62 P5: this room joins the local station atlas (name + doors + seed).
   // Armed HERE — every doc this harvest reads (doors, doorLayout, floorPlan)

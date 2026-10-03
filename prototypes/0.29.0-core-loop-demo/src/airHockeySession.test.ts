@@ -44,7 +44,12 @@ const TABLE = 'air-hockey-table-1';
 const POSE = { x: 0, z: 0, rot: 0 as const };
 
 function handle() {
-  return { setMallet: vi.fn(), setPuck: vi.fn(), setScore: vi.fn(), flashGoal: vi.fn(), update: vi.fn() };
+  return {
+    setMallet: vi.fn(), setPuck: vi.fn(), setScore: vi.fn(), flashGoal: vi.fn(), update: vi.fn(),
+    // 🎨 #184: the skin is the builder's business, never the session's —
+    // asserted below (the session must not repaint a table under the players).
+    setTheme: vi.fn(),
+  };
 }
 
 /** Join a room: bind both docs to a fresh one, as main.ts does. */
