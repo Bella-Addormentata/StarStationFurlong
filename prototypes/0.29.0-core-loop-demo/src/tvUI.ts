@@ -14,10 +14,10 @@
 
 import type { DeviceUI } from './devices';
 import {
-  formatClock, handRemote, iHoldRemote, mayPickUpRemote, parseTvSource, pickUpRemote,
+  formatClock, handRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
   putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource,
-  sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvKey, tvPause, tvPlay, tvResume,
-  tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower,
+  sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
+  tvResume, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
@@ -95,7 +95,7 @@ function statusText(itemId: string): string {
   if (rec.state === 'off') return 'off';
   if (!rec.source || rec.state === 'home') return 'on — the home screen';
   const what = sourceLabel(rec.source);
-  if (pb.state === 'scheduled') return `${what} · starts in ${formatClock(pb.countdownMs)}`;
+  if (pb.state === 'scheduled') return `${what} · ${pb.countdownMs > 0 ? `starts in ${formatClock(pb.countdownMs)}` : 'starting…'}`;
   if (pb.state === 'paused') return `${what} · paused at ${formatClock(pb.positionMs)}`;
   return `${what} · ${formatClock(pb.positionMs)}`;
 }
@@ -124,7 +124,9 @@ function remoteLine(itemId: string, myPub: string): string {
   return `${esc(r.name || 'A clone')} is holding the remote.`;
 }
 
-function handToBlock(deps: { myPub: () => string; roomPlayers: () => RoomPlayer[] }): string {
+/** HAND TO… for ONE set: the select and the button carry its id, so a phone
+ *  showing one remote while holding two hands over only the one on show. */
+function handToBlock(deps: { myPub: () => string; roomPlayers: () => RoomPlayer[] }, itemId: string): string {
   const others = deps.roomPlayers().filter((p) => p.pub && p.pub !== deps.myPub());
   if (others.length === 0) {
     return `<div style="font-size:9px; color:${DIM};">Nobody else in the room to hand it to.</div>`;
@@ -133,11 +135,25 @@ function handToBlock(deps: { myPub: () => string; roomPlayers: () => RoomPlayer[
     .map((p) => `<option value="${esc(p.pub)}">${esc(p.name || p.pub.slice(0, 8))}</option>`)
     .join('');
   return `<div style="display:flex; gap:6px; align-items:center;">
-    <select data-tv-hand-to="1" aria-label="Hand the remote to" style="flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:5px 6px;">${options}</select>
-    ${smallButton('data-tv-hand="1"', '🤝 HAND TO')}
-  </div>`;
+    <select data-tv-hand-to="${esc(itemId)}" aria-label="Hand the remote to" style="flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:5px 6px;">${options}</select>
+    ${smallButton(`data-tv-hand="${esc(itemId)}"`, '🤝 HAND TO')}
+  </div>
+  <div style="font-size:9px; color:${DIM}; line-height:1.4;">Everyone this room has seen. A remote handed to someone who has left comes back to the set on its own after 8 s.</div>`;
 }
 
+/** Wire every HAND TO block in `root` to the set its button names. */
+function wireHandOver(root: HTMLElement, note: (text: string) => void): void {
+  root.querySelectorAll<HTMLButtonElement>('[data-tv-hand]').forEach((b) => b.addEventListener('click', () => {
+    const itemId = b.dataset.tvHand!;
+    const sel = root.querySelector<HTMLSelectElement>(`[data-tv-hand-to="${CSS.escape(itemId)}"]`);
+    if (!sel) return;
+    const name = sel.options[sel.selectedIndex]?.textContent ?? '';
+    const r = handRemote(itemId, sel.value, name);
+    if (!r.ok) note(r.error);
+  }));
+}
+
+/** The focused panel's remote buttons (one set: the buttons are unqualified). */
 function wireRemoteActions(panel: HTMLElement, itemId: string, note: (text: string) => void): void {
   panel.querySelector<HTMLButtonElement>('[data-tv-pickup]')?.addEventListener('click', () => {
     const r = pickUpRemote(itemId);
@@ -147,13 +163,7 @@ function wireRemoteActions(panel: HTMLElement, itemId: string, note: (text: stri
     const r = putDownRemote(itemId);
     if (!r.ok) note(r.error);
   });
-  panel.querySelector<HTMLButtonElement>('[data-tv-hand]')?.addEventListener('click', () => {
-    const sel = panel.querySelector<HTMLSelectElement>('[data-tv-hand-to]');
-    if (!sel) return;
-    const name = sel.options[sel.selectedIndex]?.textContent ?? '';
-    const r = handRemote(itemId, sel.value, name);
-    if (!r.ok) note(r.error);
-  });
+  wireHandOver(panel, note);
 }
 
 function showNote(panel: HTMLElement, text: string): void {
@@ -200,7 +210,7 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
         ${mine ? bigButton('data-tv-open-remote="1"', '📱 OPEN THE REMOTE', '0,229,255') : ''}
         ${mayPick ? bigButton('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE', '212,168,75') : ''}
         ${mine || (owner && readRemote(deps.itemId).holder) ? bigButton('data-tv-putdown="1"', mine ? '🪑 PUT IT DOWN' : '🪑 TAKE IT BACK (OWNER)', '212,168,75') : ''}
-        ${mine || owner ? handToBlock(deps) : ''}
+        ${mine || owner ? handToBlock(deps, deps.itemId) : ''}
       </div>
     `;
     // Rebuild only when something other than the clock changed.
@@ -296,9 +306,11 @@ export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
     // Rebuild only when something other than the clock changed (the status
     // spans tick in place); the clocks move on the timer without a write.
     if (html !== phoneHtml || host.childElementCount === 0) {
-      // Keep what the player is TYPING across a peer-driven repaint.
+      // Keep what the player is TYPING across a peer-driven repaint — the
+      // paste box only (a focused volume slider is an input too, and its
+      // number must not land in the box).
       const active = document.activeElement as HTMLInputElement | null;
-      const draft = active && active.tagName === 'INPUT' && host.contains(active)
+      const draft = active && active.matches('input[data-tv-paste]') && host.contains(active)
         ? { value: active.value, start: active.selectionStart, end: active.selectionEnd }
         : null;
       host.innerHTML = html;
@@ -377,11 +389,14 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
     </button>`;
   }).join('');
   const tile = TILES.find((t) => t.key === activeTile) ?? TILES[0]!;
+  // A start-only source (archive.org's own player) offers no transport.
+  const startOnly = rec.source ? isStartOnly(rec.source) : false;
   const transport = rec.source && rec.state !== 'off' && rec.state !== 'home'
     ? `<div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
-        ${pb.state === 'playing' ? smallButton(`data-tv-pause="${esc(tv.id)}"`, '⏸') : ''}
-        ${pb.state === 'paused' ? smallButton(`data-tv-resume="${esc(tv.id)}"`, '▶') : ''}
-        ${pb.state === 'playing' || pb.state === 'paused' ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
+        ${!startOnly && pb.state === 'playing' ? smallButton(`data-tv-pause="${esc(tv.id)}"`, '⏸') : ''}
+        ${!startOnly && pb.state === 'paused' ? smallButton(`data-tv-resume="${esc(tv.id)}"`, '▶') : ''}
+        ${!startOnly && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
+        ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause or seek</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
         <label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" style="width:70px;"></label>
       </div>`
@@ -410,9 +425,14 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
     </div>
     <div class="phone-access-section">
       <div class="phone-access-header">HAND THE REMOTE TO…</div>
-      ${handToBlock(deps)}
+      ${handToBlock(deps, tv.id)}
     </div>`;
 }
+
+/** The archive metadata lookups in flight: a result is applied only when it
+ *  is still the newest ask, in the same room (a slow answer to an earlier
+ *  PLAY NOW must not replace a newer programme, or land in the next room). */
+let resolveGen = 0;
 
 function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   const feedback = (text: string) => {
@@ -447,12 +467,16 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a link first.');
       return null;
     }
+    const gen = ++resolveGen;
     if (parsed.kind === 'archive' && !parsed.file && deps.resolveArchive) {
       feedback('Asking archive.org which file to play…');
+      const epoch = tvDocEpoch();
+      let found: { file: string; title: string } | null = null;
       try {
-        const found = await deps.resolveArchive(parsed.identifier);
-        if (found) return sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed;
+        found = await deps.resolveArchive(parsed.identifier);
       } catch { /* fall through to the embed */ }
+      if (gen !== resolveGen || epoch !== tvDocEpoch()) return null; // overtaken, or another room
+      if (found) return sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed;
       feedback('No playable file found — using their embed (start-time sync only).');
     }
     return parsed;
@@ -490,9 +514,8 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-fwd]').forEach((b) => b.addEventListener('click', () => { tvSeek(b.dataset.tvFwd!, pos(b.dataset.tvFwd!) + 10_000); }));
   host.querySelectorAll<HTMLButtonElement>('[data-tv-stop]').forEach((b) => b.addEventListener('click', () => { tvStop(b.dataset.tvStop!); }));
   host.querySelectorAll<HTMLInputElement>('[data-tv-volume]').forEach((i) => i.addEventListener('change', () => { tvSetVolume(i.dataset.tvVolume!, Number(i.value)); }));
-  for (const tv of deps.tvs()) {
-    if (iHoldRemote(tv.id)) wireRemoteActions(host, tv.id, feedback);
-  }
+  // PICK UP / PUT DOWN are wired by set id above; HAND TO… names its set too.
+  wireHandOver(host, feedback);
 }
 
 /**

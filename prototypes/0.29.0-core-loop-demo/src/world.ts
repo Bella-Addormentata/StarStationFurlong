@@ -174,8 +174,8 @@ import { listContacts, getContact } from "./contacts";
 // 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
 // screen view the prop draws.
 import { createSmartTvUI } from "./tvUI";
-import { openTvTheatre, updateTvChip } from "./tvTheatre";
-import { tickTvRoom, tvRoomPlayers } from "./tvSession";
+import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
+import { forgetTv, tickTvRoom, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
@@ -3083,6 +3083,11 @@ export class World {
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
+    // 📺 #186: a removed set takes its theatre and this client's hold on its
+    // remote with it — nothing keeps playing, or heartbeating, to a record
+    // whose set is gone (no-ops for every other kind).
+    if (isTvTheatreOpen(itemId)) closeTvTheatre();
+    forgetTv(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3905,12 +3910,12 @@ export class World {
     this.tvTimer += deltaTime;
     if (this.tvTimer >= 0.5) {
       this.tvTimer = 0;
+      // Unconditionally: with the last set gone, an empty list is what takes
+      // the stale WATCH chip down and clears the session's bookkeeping.
       const tvIds = FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
-      if (tvIds.length > 0 || this.tvScreens.size > 0) {
-        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
-        tickTvRoom(tvIds);
-        updateTvChip(tvIds);
-      }
+      for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+      tickTvRoom(tvIds);
+      updateTvChip(tvIds);
     }
 
     // Float dust motes upward, reset at ceiling

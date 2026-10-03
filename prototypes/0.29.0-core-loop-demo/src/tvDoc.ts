@@ -290,7 +290,10 @@ export function sanitizeSource(raw: unknown): TvSource | null {
     const identifier = str(r.identifier, 120);
     const file = str(r.file, 400);
     if (!/^[A-Za-z0-9._-]+$/.test(identifier)) return null;
-    if (file && !/^[^\s/\\][^\s]*$/.test(file)) return null;
+    // Archive filenames carry spaces as a rule ("a film.mp4"): sourceFileUrl
+    // percent-encodes each segment, so only a leading separator or blank and
+    // control characters are refused here.
+    if (file && !/^[^\s/\\][^\x00-\x1f\x7f]*$/.test(file)) return null;
     return withTitle({ kind: 'archive', identifier, file });
   }
   if (r.kind === 'url') {
@@ -300,10 +303,13 @@ export function sanitizeSource(raw: unknown): TvSource | null {
   return null;
 }
 
+/** http(s) only, and never a URL carrying credentials: a source goes into
+ *  the room-shared record and its history, where `user:password@host` would
+ *  be read by every peer, not just the media host. */
 export function isHttpUrl(s: string): boolean {
   try {
     const u = new URL(s);
-    return u.protocol === 'https:' || u.protocol === 'http:';
+    return (u.protocol === 'https:' || u.protocol === 'http:') && !u.username && !u.password;
   } catch {
     return false;
   }
@@ -318,6 +324,7 @@ export function readTv(itemId: string): TvRecord {
   const state = typeof raw.state === 'string' && STATES.has(raw.state) ? (raw.state as TvState) : 'off';
   const history = Array.isArray(raw.history)
     ? raw.history
+        .slice(0, TV_HISTORY_MAX) // bound the work before the shape check: a peer's array is not
         .map((h) => {
           const e = h as Partial<TvHistoryEntry> | null;
           const s = e && typeof e === 'object' ? sanitizeSource(e.source) : null;
@@ -614,9 +621,16 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
   if (rec.state === 'scheduled') {
     const countdownMs = Math.max(0, rec.startAt - now);
     if (countdownMs > 0) return { state: 'scheduled', positionMs: 0, running: false, countdownMs };
-    // Past T0 and the holder's first heartbeat hasn't landed: free-run from
-    // the UTC start. Clock skew shows here for at most one heartbeat.
-    return { state: 'playing', positionMs: now - rec.startAt, running: true, countdownMs: 0 };
+    // Past T0. The HOLDER's clock says go: it reads playing, and its first
+    // heartbeat (the theatre's or the headless one, within 3 s) flips the
+    // record, so everyone else starts on receipt of THAT write — never on
+    // their own clock's reading of startAt. A viewer waits ("STARTING…").
+    // Only with nobody holding the remote does a viewer free-run from the
+    // UTC start, best effort, until someone picks the remote up and beats.
+    if (iHoldRemote(itemId) || remoteLapsed(itemId, now)) {
+      return { state: 'playing', positionMs: now - rec.startAt, running: true, countdownMs: 0 };
+    }
+    return { state: 'scheduled', positionMs: 0, running: false, countdownMs: 0 };
   }
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
@@ -649,6 +663,18 @@ export function formatClock(ms: number): string {
   const s = total % 60;
   const mm = h > 0 ? String(m).padStart(2, '0') : String(m);
   return `${h > 0 ? `${h}:` : ''}${mm}:${String(s).padStart(2, '0')}`;
+}
+
+/** The countdown line: STARTS IN m:ss, then STARTING… while the holder's
+ *  first heartbeat is on its way (readPlayback past T0). */
+export function countdownText(countdownMs: number): string {
+  return countdownMs > 0 ? `STARTS IN ${formatClock(countdownMs)}` : 'STARTING…';
+}
+
+/** A source the TV can only start, never drive: archive.org's own player
+ *  (an archive item with no chosen file). No pause, no seek, no clock. */
+export function isStartOnly(s: TvSource): boolean {
+  return s.kind === 'archive' && !s.file;
 }
 
 // ── Sources: parsing and labels ──────────────────────────────────────────────
@@ -722,7 +748,14 @@ export function parseTvSource(text: string): TvSource | null {
     const m = u.pathname.match(/^\/(details|download|embed)\/([A-Za-z0-9._-]+)(?:\/(.+))?/);
     if (!m) return null;
     const identifier = m[2];
-    const file = m[1] === 'download' && m[3] ? decodeURIComponent(m[3]).replace(/\/+$/, '') : '';
+    let file = '';
+    if (m[1] === 'download' && m[3]) {
+      try {
+        file = decodeURIComponent(m[3]).replace(/\/+$/, '');
+      } catch {
+        return null; // "%ZZ": not a link the TV can play, said the normal way
+      }
+    }
     return sanitizeSource({ kind: 'archive', identifier, file });
   }
   if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
@@ -768,7 +801,7 @@ export function tvScreenView(itemId: string, now = clock()): TvScreenView {
   const lane = sourceLane(rec.source);
   const pb = readPlayback(itemId, now);
   if (pb.state === 'scheduled') {
-    return { state: 'scheduled', title: label, detail: `STARTS IN ${formatClock(pb.countdownMs)}`, lane, clockText: '' };
+    return { state: 'scheduled', title: label, detail: countdownText(pb.countdownMs), lane, clockText: '' };
   }
   if (pb.state === 'paused') {
     return { state: 'paused', title: label, detail: `PAUSED · ${holderLine}`, lane, clockText: formatClock(pb.positionMs) };

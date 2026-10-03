@@ -19,9 +19,9 @@
 import { TvSyncController } from './tvSync';
 import type { TvPlayer } from './tvSync';
 import {
-  formatClock, iHoldRemote, mayPickUpRemote, pickUpRemote, readPlayback, readRemote,
-  readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel, sourceLane, tvPause,
-  tvResume, tvSeek, tvSetVolume, tvStop,
+  countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
+  readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
+  sourceLane, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
@@ -84,6 +84,7 @@ interface Adapter extends TvPlayer {
 class YouTubePlayerAdapter implements Adapter {
   readonly canNudge = false;
   readonly canSeek = true;
+  readonly hasClock = true;
   private player: YtPlayerLike | null = null;
   private ready = false;
   private state = -1;
@@ -132,6 +133,7 @@ class YouTubePlayerAdapter implements Adapter {
 class HtmlVideoPlayerAdapter implements Adapter {
   readonly canNudge = true;
   readonly canSeek = true;
+  readonly hasClock = true;
   readonly video: HTMLVideoElement;
   /** The browser refused play() without a gesture: the panel shows TAP TO PLAY. */
   blocked = false;
@@ -177,6 +179,7 @@ class HtmlVideoPlayerAdapter implements Adapter {
 class ArchiveEmbedAdapter implements Adapter {
   readonly canNudge = false;
   readonly canSeek = false;
+  readonly hasClock = false;
   private readonly iframe: HTMLIFrameElement;
   constructor(host: HTMLElement, identifier: string) {
     const f = document.createElement('iframe');
@@ -219,6 +222,7 @@ interface Theatre {
   lastStatus: string;
   lastControls: string;
   lastHead: string;
+  lastNotice: string;
   onKey: (e: KeyboardEvent) => void;
 }
 
@@ -282,6 +286,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     lastStatus: '',
     lastControls: '',
     lastHead: '',
+    lastNotice: '',
     onKey,
   };
   const rtt = deps.rttMs ?? (() => 0);
@@ -310,13 +315,18 @@ function unmountPlayer(t: Theatre): void {
   for (const child of [...t.screen.children]) if (child !== t.notice) child.remove();
 }
 
+/** Put the notice up; the same words again leave the DOM (and a button in
+ *  it, under a finger) alone. */
 function showNotice(t: Theatre, html: string): void {
+  if (!t.notice.hidden && t.lastNotice === html) return;
   t.notice.innerHTML = html;
+  t.lastNotice = html;
   t.notice.hidden = false;
 }
 function hideNotice(t: Theatre): void {
   t.notice.hidden = true;
   t.notice.innerHTML = '';
+  t.lastNotice = '';
 }
 
 /** Build the adapter for `source`; the controller then drives it. */
@@ -342,7 +352,9 @@ function mountPlayer(t: Theatre, source: TvSource, rtt: () => number): void {
     hideNotice(t);
     t.player = player;
     t.controller = new TvSyncController({ itemId: t.itemId, player, rttMs: rtt });
-    t.unregister = registerTvPlayerOfRecord(t.itemId);
+    // Only a player with a clock becomes the room's clock; the archive embed
+    // reports nothing, so the headless heartbeat (tvSession) keeps beating.
+    if (player.hasClock) t.unregister = registerTvPlayerOfRecord(t.itemId);
   };
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
@@ -356,6 +368,9 @@ function mountPlayer(t: Theatre, source: TvSource, rtt: () => number): void {
   if (url) {
     adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, () => {
       if (theatre !== t) return;
+      // The controller retries play() every tick while blocked: the notice
+      // (and the button under the finger) that is already up stays up.
+      if (!t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) return;
       showNotice(t, `<button type="button" data-tv-tap="1">▶ TAP TO PLAY</button>
         <div class="tv-theatre-lane">your browser wants a tap before sound</div>`);
       t.notice.querySelector<HTMLButtonElement>('[data-tv-tap]')?.addEventListener('click', () => {
@@ -382,6 +397,16 @@ function theatreTick(rtt: () => number): void {
     showNotice(t, rec.state === 'off'
       ? '<div>THE SET IS OFF</div><div class="tv-theatre-lane">press POWER on the TV, or pick up the remote</div>'
       : '<div>FURLONG TV</div><div class="tv-theatre-lane">nothing on — the remote picks a programme</div>');
+  } else if (isStartOnly(rec.source!) && readPlayback(t.itemId).state !== 'playing') {
+    // archive.org's own player autoplays and can neither pause nor seek: it
+    // goes up only while the room is playing. A countdown or a pause is
+    // words here, no iframe — else WATCH during a countdown would start the
+    // film early, and reopening a paused one would start it over.
+    if (t.mounted) unmountPlayer(t);
+    const pb = readPlayback(t.itemId);
+    showNotice(t, pb.state === 'scheduled'
+      ? `<div>${countdownText(pb.countdownMs)}</div><div class="tv-theatre-lane">archive.org's player starts at T0 — start-time sync only</div>`
+      : '<div>❚❚ PAUSED</div><div class="tv-theatre-lane">archive.org\'s player has no pause: it starts from the top when the film resumes</div>');
   } else if (t.mounted !== sourceId(rec.source!) && t.mounted !== `failed:${sourceId(rec.source!)}`) {
     mountPlayer(t, rec.source!, rtt);
   }
@@ -405,9 +430,10 @@ function renderTheatreChrome(t: Theatre): void {
     t.lastHead = head;
     t.head.querySelector<HTMLButtonElement>('[data-tv-close]')?.addEventListener('click', () => closeTvTheatre());
   }
-  const sync = rec.source?.kind === 'archive' && !rec.source.file ? ' · start-time sync only' : '';
+  const startOnly = rec.source ? isStartOnly(rec.source) : false;
+  const sync = startOnly ? ' · start-time sync only' : '';
   const who = held ? `REMOTE · ${escapeHtml(remote.name || 'a clone')}` : 'REMOTE ON THE SET';
-  const where = pb.state === 'scheduled' ? `STARTS IN ${formatClock(pb.countdownMs)}`
+  const where = pb.state === 'scheduled' ? countdownText(pb.countdownMs)
     : pb.state === 'paused' ? `PAUSED · ${formatClock(pb.positionMs)}`
     : pb.state === 'playing' ? `● ${formatClock(pb.positionMs)}` : '';
   const status = `${who}${where ? ` · ${where}` : ''}${sync}`;
@@ -417,10 +443,11 @@ function renderTheatreChrome(t: Theatre): void {
   }
   const btn = (attr: string, label: string, title = '') =>
     `<button type="button" ${attr} ${title ? `title="${escapeHtml(title)}"` : ''}>${label}</button>`;
+  // A start-only source offers no transport: the embed cannot pause or seek.
   const controls = [
-    mine && pb.state === 'playing' ? btn('data-tv-pause="1"', '⏸') : '',
-    mine && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
-    mine && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
+    mine && !startOnly && pb.state === 'playing' ? btn('data-tv-pause="1"', '⏸') : '',
+    mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
+    mine && !startOnly && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
     `<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="1" aria-label="Set volume"></label>`,
     !mine && mayPickUpRemote(t.itemId) ? btn('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE') : '',
@@ -430,7 +457,8 @@ function renderTheatreChrome(t: Theatre): void {
     t.controls.innerHTML = controls;
     t.lastControls = controls;
     const c = t.controls;
-    const pos = () => t.player?.currentMs() ?? pb.positionMs;
+    // Where the room is: the player's own clock when it has one, else the record's.
+    const pos = () => (t.player && t.player.hasClock ? t.player.currentMs() : readPlayback(t.itemId).positionMs);
     c.querySelector<HTMLButtonElement>('[data-tv-pause]')?.addEventListener('click', () => { tvPause(t.itemId, pos()); });
     c.querySelector<HTMLButtonElement>('[data-tv-resume]')?.addEventListener('click', () => { tvResume(t.itemId); });
     c.querySelector<HTMLButtonElement>('[data-tv-back]')?.addEventListener('click', () => { tvSeek(t.itemId, Math.max(0, pos() - 10_000)); });
@@ -446,7 +474,9 @@ function renderTheatreChrome(t: Theatre): void {
 // ── The HUD chip: "something is on" ──────────────────────────────────────────
 
 let chip: HTMLButtonElement | null = null;
-let chipLabel = '';
+/** `<itemId>|<label>` of what the chip shows: two sets with the same words
+ *  are still two sets, and WATCH must open the one still playing. */
+let chipKey = '';
 let chipOpen: ((itemId: string) => void) | null = null;
 
 /** Register how the chip opens the theatre (main.ts supplies the deps). */
@@ -466,14 +496,15 @@ export function updateTvChip(itemIds: readonly string[]): void {
       const pb = readPlayback(id);
       const what = sourceLabel(rec.source).toUpperCase();
       label = pb.state === 'scheduled'
-        ? `📺 ${what} · STARTS IN ${formatClock(pb.countdownMs)} · WATCH`
+        ? `📺 ${what} · ${countdownText(pb.countdownMs)} · WATCH`
         : pb.state === 'paused' ? `📺 ${what} · PAUSED · WATCH` : `📺 NOW ON: ${what} · WATCH`;
       target = id;
       break;
     }
   }
-  if (label === chipLabel) return;
-  chipLabel = label;
+  const key = label ? `${target}|${label}` : '';
+  if (key === chipKey) return;
+  chipKey = key;
   if (!label) {
     chip?.remove();
     chip = null;

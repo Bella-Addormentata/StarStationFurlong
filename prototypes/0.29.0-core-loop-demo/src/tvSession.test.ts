@@ -9,7 +9,9 @@ import {
   bindTvDoc, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
   setTvIdentity, tvPlay, tvSchedule, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
-import { leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvRoomPlayers } from './tvSession';
+import {
+  forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvRoomPlayers,
+} from './tvSession';
 
 const TV = 'tv-stand-1';
 let now = 5_000_000;
@@ -79,6 +81,15 @@ describe('tickTvRoom', () => {
     leaveTvRoom([TV, 'tv-2', 'tv-3']);
     expect(readRemote(TV).holder).toBe('');
     expect(readRemote('tv-2').holder).toBe('');
+  });
+
+  it('a removed set takes this client\'s hold on its remote with it', () => {
+    pickUpRemote(TV);
+    pickUpRemote('tv-2');
+    forgetTv(TV);
+    expect(readRemote(TV).holder).toBe('');
+    expect(readRemote('tv-2').holder).toBe('AAAAme');
+    forgetTv('tv-9'); // never held: nothing to do
   });
 
   it('lists the room\'s other keyed players for HAND TO', () => {
