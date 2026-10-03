@@ -460,10 +460,17 @@ lane-to-key binding — M5.5's per-epoch Ed25519 binding of `origin_lane_id`
 to a trusted pubkey, carried on the reliable lane and verified before relay;
 today the id is minted unauthenticated and relayed verbatim (the M5.5-STUB
 note in `ssf-p2p-node/src/main.rs`), so an admitted neighbour can forge any
-lane, and a lookup alone would let it drive P2 — and then the S3 mapping
-from that verified key to the player holding the seat. P1 accepts kind-3
-inputs only from a lane whose signed key is the P2 seat's identity. Lockstep
-stays the upgrade for games where lag matters.
+lane, and a lookup alone would let it drive P2. The binding must carry the
+PLAYER's proof of possession, not the node's word alone: a node signature
+authenticates the node, and an admitted node gone bad could attest its own
+lane as the P2 occupant's key and sail through the lookup. So the page
+identity signs a fresh binding over {room, origin node key, epoch, lane id};
+the originating node verifies it on the connection that owns the lane and
+relays that proof with its own attestation; P1 verifies both against the
+seat before any lane is mapped to a player. And then the S3 mapping from
+that proven key to the player holding the seat. P1 accepts kind-3 inputs
+only from a lane whose proven key is the P2 seat's identity. Lockstep stays
+the upgrade for games where lag matters.
 
 **Sources.** The archive.org embed (`archive.org/embed/<id>`) is single-player
 only (cross-origin, no input injection, no CRT). The ROM file loaded into an
