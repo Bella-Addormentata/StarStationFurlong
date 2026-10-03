@@ -55,6 +55,7 @@ import {
   MOVE_ENTRIES_KEEP,
   MOVE_SCAN_MAX,
   MOVE_SETTLED_KEEP,
+  SWEEP_BATCH,
   rememberMove,
   subscribeStationMove,
   writeStationMove,
@@ -64,10 +65,12 @@ import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
   listStations,
+  registerStation,
+  setKnownPlacesResolver,
   setStationMoveResolver,
   stationInTransit,
 } from './stations';
-import type { StationRecord } from './stations';
+import type { KnownPlace, StationRecord } from './stations';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -82,7 +85,7 @@ const ARIS = 'planet-aris';
 const NOW = ORBIT_EPOCH_MS + 5_000_000_000;
 
 beforeEach(() => store.clear());
-afterEach(() => { setStationMoveResolver(null); unbindPlanetSummaryForTest(); });
+afterEach(() => { setStationMoveResolver(null); setKnownPlacesResolver(null); unbindPlanetSummaryForTest(); });
 
 const ctx = (over: Partial<MoveContext> = {}): MoveContext => {
   const stations = listStations({}, [], NOW);
@@ -336,6 +339,106 @@ describe('the station list follows a move', () => {
     setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? sooner : st.welcomeRoomId === 'a15' ? left : null));
     expect(listStations({}, full, move.arriveAt + 2).find((s) => s.id === DEFAULT_STATION_ID))
       .toMatchObject({ planetId: ARIS });
+  });
+
+  it('lets an arrival into the slot a station still on its way out has left', () => {
+    const inbound = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = inbound.arriveAt;
+    // Fifteen stations stay at Aris; the sixteenth left before T and is
+    // still between planets now.
+    const residents: StationRecord[] = Array.from({ length: 15 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    const leaver: StationRecord = { id: 'leaver', name: 'L', planetId: ARIS, orbitSlot: 15, welcomeRoomId: 'l-room' };
+    const outbound: StationMove = {
+      stationId: 'leaver', welcomeRoomId: 'l-room', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 5,
+      departAt: T - 1000, arriveAt: T + 10 * 86_400_000, mode: 'thrusters', fuel: 1, fuelDrawn: 1, bookedAt: T - 2000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? inbound : st.welcomeRoomId === 'l-room' ? outbound : null));
+    const listed = listStations({}, [...residents, leaver], T + 5);
+    expect(listed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 15 });
+    expect(stationInTransit(listed.find((s) => s.id === 'leaver')!, T + 5)).toBe(true);
+  });
+
+  it('keeps a booked slot for its arrival from clash losers, derived stations and new records', () => {
+    // Furlong books Aris slot 2; two records there clash for slot 1.
+    const move = { ...moveTo(), toSlot: 2, bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    const winner: StationRecord = { id: 'aris-a', name: 'A', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'a' };
+    const loser: StationRecord = { id: 'aris-b', name: 'B', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'b' };
+    const mid = (move.departAt + move.arriveAt) / 2;
+    for (const t of [move.departAt - 1, mid]) {
+      expect(listStations({}, [winner, loser], t).find((s) => s.id === 'aris-b')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
+    }
+    const landed = listStations({}, [winner, loser], move.arriveAt + 1);
+    expect(landed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 2 });
+    expect(landed.find((s) => s.id === 'aris-b')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
+
+    // A record saved here for that slot is refused while the move is booked
+    // (one mirrored from a peer stands where its own install put it).
+    vi.useFakeTimers({ now: mid, toFake: ['Date'] });
+    try {
+      const squatter: StationRecord = { id: 'squat', name: 'SQUAT', planetId: ARIS, orbitSlot: 2, welcomeRoomId: 'sq' };
+      expect(registerStation(squatter)).toBe(false);
+      expect(registerStation({ ...squatter, orbitSlot: 4 })).toBe(true);
+      expect(registerStation(squatter, { reservations: false })).toBe(true);
+      // Saved there, it keeps its slot through a rename.
+      expect(registerStation({ ...squatter, name: 'SQUATTER' })).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // With Furlong gone, Aris station A books Sovereign slot 0: a derived
+    // station, which takes the lowest free slot there, passes over it, and
+    // A finds it on arrival.
+    const away = move;
+    const inbound: StationMove = {
+      ...away, stationId: 'aris-a', welcomeRoomId: 'a', fromPlanetId: ARIS, fromSlot: 1, toPlanetId: SOV, toSlot: 0,
+      departAt: away.departAt + 1, arriveAt: away.arriveAt + 1000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? away : st.welcomeRoomId === 'a' ? inbound : null));
+    const atlas = { 'd-room': { roomId: 'd-room', name: 'DERIVED', doors: {}, lastSeen: 0 } };
+    const derivedAt = (t: number) => listStations(atlas, [winner], t).find((s) => s.derived);
+    expect(derivedAt(away.departAt - 1)).toMatchObject({ planetId: SOV, orbitSlot: 1 });
+    expect(derivedAt((away.departAt + away.arriveAt) / 2)).toMatchObject({ planetId: SOV, orbitSlot: 1 });
+    const home = listStations(atlas, [winner], inbound.arriveAt + 1);
+    expect(home.find((s) => s.id === 'aris-a')).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(home.find((s) => s.derived)).toMatchObject({ planetId: SOV, orbitSlot: 1 });
+  });
+
+  it('counts the stations heard of around another planet where it picks a slot there', () => {
+    const pending: StationMove = {
+      ...moveTo(), stationId: 'k2', welcomeRoomId: 'k2', fromPlanetId: SOV, fromSlot: 5, toPlanetId: ARIS, toSlot: 2,
+    };
+    // Two Aris residents and a station on its way there, none listed here.
+    const known: KnownPlace[] = [
+      { welcomeRoomId: 'k0', planetId: ARIS, orbitSlot: 0 },
+      { welcomeRoomId: 'k1', planetId: ARIS, orbitSlot: 1 },
+      { welcomeRoomId: 'k2', planetId: SOV, orbitSlot: 5, move: pending },
+    ];
+    setKnownPlacesResolver(() => known);
+    const listed = listStations({}, [], NOW);
+    expect(listed.some((s) => s.planetId === ARIS)).toBe(false);
+    expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(3);
+    const plan = planStationMove(ctx(), ARIS);
+    expect(plan.ok && plan.move.toSlot).toBe(3);
+    // One listed here counts where the list has it, not twice.
+    const k0: StationRecord = { id: 'k0-rec', name: 'K0', planetId: ARIS, orbitSlot: 4, welcomeRoomId: 'k0' };
+    expect(freeSlotAround(ARIS, listStations({}, [k0], NOW), undefined, NOW)).toBe(0);
+    // A clash loser here passes over their slots too.
+    const clash: StationRecord[] = [
+      { id: 'x', name: 'X', planetId: ARIS, orbitSlot: 0, welcomeRoomId: 'x' },
+      { id: 'y', name: 'Y', planetId: ARIS, orbitSlot: 0, welcomeRoomId: 'y' },
+    ];
+    expect(listStations({}, clash, NOW).find((s) => s.id === 'y')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
+  });
+
+  it('bounces an arrival off a planet it only knows is full from the summaries', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+    const listed = listStations({}, [], move.arriveAt + 1);
+    expect(listed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(listed.filter((s) => s.planetId === ARIS)).toHaveLength(0);
   });
 
   it('shares where an arrival settled, so installs that judged it differently agree', () => {
@@ -1255,6 +1358,73 @@ describe('the move log stays bounded', () => {
     writeStationMove({ ...zero, departAt: zero.departAt + 1, arriveAt: zero.arriveAt + 1 });
     Y.applyUpdate(doc2, Y.encodeStateAsUpdate(peer));
     expect(readMoveFuelDrawn()).toBe(n);
+  });
+
+  it('counts a record two replicas bundle at once only once', () => {
+    const base = new Y.Doc();
+    const baseMap = base.getMap('stationMoves');
+    base.transact(() => {
+      for (let i = 0; i < MOVE_SETTLED_KEEP + 2; i++) baseMap.set(`moveSettled:${100 + i}:1`, { n: 1, drawn: 1, floor: 1, recent: [] });
+    });
+    const zero = { ...hop(1, 0, 0), stationId: 'z', welcomeRoomId: 'z-room', bookedAt: NOW + 5 };
+    // A bundles the two records past the cap; B, which also holds one more,
+    // bundles three at the same time, two of them the same as A's.
+    const a = new Y.Doc();
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(base));
+    bindStationMoveDoc(a);
+    writeStationMove(zero);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(base));
+    b.getMap('stationMoves').set('moveSettled:099:1', { n: 1, drawn: 1, floor: 1, recent: [] });
+    store.clear();
+    bindStationMoveDoc(b);
+    writeStationMove({ ...zero, departAt: zero.departAt + 1, arriveAt: zero.arriveAt + 1 });
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      store.clear();
+      bindStationMoveDoc(d);
+      expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 3);
+    }
+    // The next sweep joins the two replicas' bundles; nothing is lost or doubled.
+    writeStationMove({ ...zero, departAt: zero.departAt + 2, arriveAt: zero.arriveAt + 2 });
+    expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 3);
+  });
+
+  it('clears a settled record without its recent list instead of failing a write', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    doc.transact(() => {
+      for (let i = 0; i < MOVE_SETTLED_KEEP + 1; i++) map.set(`moveSettled:${100 + i}:1`, { n: 1, drawn: 0, floor: 0 });
+    });
+    expect(readMoveFuelDrawn()).toBe(0);
+    expect(writeStationMove(hop(0, 10, 10))).toBe(true);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:'))).toEqual([]);
+    expect(readMoveFuelDrawn()).toBe(10);
+  });
+
+  it('clears a flood bigger than one sweep over the turns that follow', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    doc.transact(() => {
+      for (let i = 0; i < 3 * SWEEP_BATCH; i++) map.set(`junk:${i}`, i);
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      writeStationMove(hop(0, 10, 10));
+      // The write itself walked one pass's worth (and its prune one scan).
+      const left = [...map.keys()].filter((k) => k.startsWith('junk:')).length;
+      expect(left).toBeGreaterThanOrEqual(2 * SWEEP_BATCH - MOVE_SCAN_MAX);
+      expect(left).toBeLessThanOrEqual(2 * SWEEP_BATCH);
+      vi.runAllTimers();
+      expect([...map.keys()].filter((k) => k.startsWith('junk:'))).toEqual([]);
+      expect(readMoveFuelDrawn()).toBe(10);
+      expect(readStationMove()?.fuel).toBe(10);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps the meter in range when several writers\' settled totals add past it', () => {

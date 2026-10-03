@@ -176,6 +176,79 @@ export function stationInTransit(station: Pick<StationRecord, 'move'>, nowMs: nu
   return !!m && nowMs >= m.departAt && nowMs < m.arriveAt;
 }
 
+// ── Stations heard of but not listed ─────────────────────────────────────────
+
+/** A station this install has heard of (a planet summary, from around
+ *  another planet, say) but does not list: its record's planet and slot,
+ *  and its latest move. The orbit it holds counts as taken, and the slot its
+ *  move is bound for as reserved, wherever a slot is chosen or an arrival
+ *  settled; it never becomes a ship's destination. */
+export interface KnownPlace { welcomeRoomId: string; planetId: string; orbitSlot: number; move?: StationMove }
+
+let knownPlacesResolver: (() => KnownPlace[]) | null = null;
+
+/** Install (or remove, with null) where the stations heard of come from
+ *  (planetSummary.installKnownPlacesResolver). */
+export function setKnownPlacesResolver(resolver: (() => KnownPlace[]) | null): void {
+  knownPlacesResolver = resolver;
+}
+
+/** The stations heard of whose welcome room is none of `listedRooms`, each once. */
+function knownPlaces(listedRooms: Iterable<string>): KnownPlace[] {
+  if (!knownPlacesResolver) return [];
+  let all: KnownPlace[];
+  try { all = knownPlacesResolver(); } catch { return []; }
+  const seen = new Set(listedRooms);
+  const out: KnownPlace[] = [];
+  for (const p of all) {
+    if (!p || typeof p.welcomeRoomId !== 'string' || !p.welcomeRoomId || seen.has(p.welcomeRoomId)) continue;
+    seen.add(p.welcomeRoomId);
+    out.push(p);
+  }
+  return out;
+}
+
+/** Does a move still hold the slot it is bound for at `nowMs`: booked, not
+ *  yet arrived, and going somewhere (a pin goes nowhere)? */
+function reservesSlot(m: StationMove | null | undefined, nowMs: number): m is StationMove {
+  return !!m && nowMs < m.arriveAt && !m.settles
+    && !(planetById(m.fromPlanetId).id === planetById(m.toPlanetId).id && m.fromSlot === m.toSlot);
+}
+
+/** Each slot the stations in `places` hold at `nowMs` (none while between
+ *  planets), and each slot their moves are bound for (`reserved`). */
+function eachKnownHold(
+  places: KnownPlace[],
+  nowMs: number,
+  hold: (planetId: string, slot: number, reserved: boolean) => void,
+): void {
+  for (const p of places) {
+    const move = p.move ?? null;
+    if (!stationInTransit({ move: move ?? undefined }, nowMs)) {
+      const at = placeWithMove(p, move, nowMs);
+      hold(planetById(at.planetId).id, at.orbitSlot, false);
+    }
+    if (reservesSlot(move, nowMs)) hold(planetById(move.toPlanetId).id, move.toSlot, true);
+  }
+}
+
+/** Around `planetId` at `nowMs`, by the stations heard of whose welcome room
+ *  is none of `listedRooms`: the slots they hold (none while between
+ *  planets), and the slots their moves are bound for. */
+export function knownSlotsAround(
+  planetId: string,
+  listedRooms: Iterable<string>,
+  nowMs: number = Date.now(),
+): { taken: Set<number>; reserved: Set<number> } {
+  const id = planetById(planetId).id;
+  const taken = new Set<number>();
+  const reserved = new Set<number>();
+  eachKnownHold(knownPlaces(listedRooms), nowMs, (planet, slot, isReserved) => {
+    if (planet === id) (isReserved ? reserved : taken).add(slot);
+  });
+  return { taken, reserved };
+}
+
 /** Slots per planet. orbits.ts spaces slots geometrically, so this also
  *  bounds how far out a station can orbit (slot 15 ≈ 190,000 km for
  *  Sovereign II — about half the distance to a moon). */
@@ -302,12 +375,20 @@ function clean(r: StationRecord): StationRecord {
 
 /** Save (or replace, by id) a station record on this install. Returns false
  *  for an invalid record, one that would shadow the built-in default, a solar
- *  map body, a derived station id or an open-orbit place (adriftAt), one whose planet has no free orbit slot
- *  left (or would have none for a station already saved), or one whose
- *  welcome room is part of a station already listed. */
-export function registerStation(record: Omit<StationRecord, 'derived'>): boolean {
+ *  map body, a derived station id or an open-orbit place (adriftAt), one
+ *  whose planet has no free orbit slot left (or would have none for a
+ *  station already saved), one whose welcome room is part of a station
+ *  already listed, or one taking a slot another station's move is bound for
+ *  (reservations: a record that already had that planet and slot keeps
+ *  them; a record mirrored from a peer passes false, as it stands where its
+ *  own install put it). */
+export function registerStation(
+  record: Omit<StationRecord, 'derived'>,
+  opts: { reservations?: boolean } = {},
+): boolean {
   if (!isRecord(record) || record.id === DEFAULT_STATION_ID) return false;
   const saved = readStationRecords();
+  if (opts.reservations !== false && slotReservedFor(record, saved)) return false;
   const records = [...saved];
   // Replace IN PLACE: when two records name one place the earlier keeps it,
   // and the list keeps record order.
@@ -327,6 +408,19 @@ export function registerStation(record: Omit<StationRecord, 'derived'>): boolean
   return true;
 }
 
+/** Is the slot a record asks for one another station's move is bound for:
+ *  a listed station's, or one heard of? Not when the record already had it. */
+function slotReservedFor(record: Omit<StationRecord, 'derived'>, saved: StationRecord[], nowMs: number = Date.now()): boolean {
+  const planet = planetById(record.planetId).id;
+  const had = saved.find((r) => r.id === record.id);
+  if (had && planetById(had.planetId).id === planet && had.orbitSlot === record.orbitSlot) return false;
+  const listed = listStations(readAtlas(), saved, nowMs);
+  const bound = listed.some((st) => st.welcomeRoomId !== record.welcomeRoomId && reservesSlot(st.move, nowMs)
+    && planetById(st.move.toPlanetId).id === planet && st.move.toSlot === record.orbitSlot);
+  return bound || knownSlotsAround(planet, [...listed.map((st) => st.welcomeRoomId), record.welcomeRoomId], nowMs)
+    .reserved.has(record.orbitSlot);
+}
+
 export function removeStation(id: string): void {
   const records = readStationRecords().filter((r) => r.id !== id);
   try { localStorage.setItem(KEY, JSON.stringify(records)); } catch { /* quota */ }
@@ -341,7 +435,9 @@ export function removeStation(id: string): void {
  * dropped. Orbit slots are unique per planet — a record that loses a clash
  * for its slot moves to the next free one, settled the same way on every
  * install whatever order it saved its records in, and derived stations fill
- * free slots in anchor order. This is the list ship destinations read from.
+ * free slots in anchor order; both pass over a slot a move is bound for, or
+ * one a station heard of holds. This is the list ship destinations read
+ * from.
  */
 export function listStations(
   atlas: Record<string, AtlasEntry> = readAtlas(),
@@ -366,11 +462,33 @@ export function listStations(
     if (!slots) taken.set(planetId, slots = new Set());
     return slots;
   };
-  const claim = (planetId: string, wanted: number): number | null => {
+  // Slots held for a station that is not in them yet, by planet: the slot
+  // each move is bound for (booked, under way or arrived), and those the
+  // stations heard of hold or are bound for (knownSlotsAround). Filled once
+  // every candidate is known (below).
+  const held = new Map<string, Set<number>>();
+  const hold = (planetId: string, slot: number) => {
+    let slots = held.get(planetId);
+    if (!slots) held.set(planetId, slots = new Set());
+    slots.add(slot);
+  };
+  // A station placed here takes `wanted` when it is its own (`own`: the
+  // slot its record or move puts it in) and free; else the next free slot
+  // on that nobody holds, else the next free one at all. So a clash loser
+  // or a derived station never takes the slot a move has booked, and an
+  // arrival finds its own slot waiting, while every install holding the
+  // same moves passes over the same slots.
+  const claim = (planetId: string, wanted: number, own = false): number | null => {
     const slots = used(planetId);
-    for (let i = 0; i < MAX_ORBIT_SLOTS; i++) {
-      const slot = (wanted + i) % MAX_ORBIT_SLOTS;
-      if (!slots.has(slot)) { slots.add(slot); return slot; }
+    if (own && Number.isInteger(wanted) && wanted >= 0 && wanted < MAX_ORBIT_SLOTS && !slots.has(wanted)) {
+      slots.add(wanted);
+      return wanted;
+    }
+    for (const passOver of [held.get(planetId), undefined]) {
+      for (let i = 0; i < MAX_ORBIT_SLOTS; i++) {
+        const slot = (wanted + i) % MAX_ORBIT_SLOTS;
+        if (!slots.has(slot) && !passOver?.has(slot)) { slots.add(slot); return slot; }
+      }
     }
     return null;
   };
@@ -445,6 +563,14 @@ export function listStations(
     const at = placeWithMove(c.base, c.move, nowMs);
     return { ...at, planetId: planetById(at.planetId).id };
   });
+  for (const c of candidates) {
+    const m = c.move;
+    if (m && (nowMs >= m.arriveAt || reservesSlot(m, nowMs))) hold(planetById(m.toPlanetId).id, m.toSlot);
+  }
+  // The stations heard of but not listed here (around other planets, say)
+  // count where slots are claimed and arrivals settled, never as listed.
+  const known = knownPlaces(candidates.map((c) => c.welcomeRoomId));
+  eachKnownHold(known, nowMs, hold);
 
   // Slots are settled in one global order, never this install's record
   // order, so every install holding the same stations gives each the same
@@ -470,7 +596,7 @@ export function listStations(
   const inTransit = (i: number) => stationInTransit({ move: candidates[i].move ?? undefined }, nowMs);
   if (builtIn === 0 && inTransit(0)) settle(0, wantOf[0].planetId, wantOf[0].orbitSlot);
   else if (builtIn === 0) {
-    const slot = claim(wantOf[0].planetId, wantOf[0].orbitSlot);
+    const slot = claim(wantOf[0].planetId, wantOf[0].orbitSlot, true);
     if (slot !== null) settle(0, wantOf[0].planetId, slot);
   }
   for (const i of rest.filter(inTransit)) settle(i, wantOf[i].planetId, wantOf[i].orbitSlot);
@@ -479,7 +605,10 @@ export function listStations(
     for (const i of [...group].sort(globalOrder)) {
       const { planetId, orbitSlot } = wantOf[i];
       const slots = used(planetId);
-      const free = Number.isInteger(orbitSlot) && orbitSlot >= 0 && orbitSlot < MAX_ORBIT_SLOTS && !slots.has(orbitSlot);
+      // A derived station that never moved has no slot of its own: it
+      // claims the lowest free one, with the clash losers.
+      const own = i < firstDerived || candidates[i].move !== null;
+      const free = own && Number.isInteger(orbitSlot) && orbitSlot >= 0 && orbitSlot < MAX_ORBIT_SLOTS && !slots.has(orbitSlot);
       if (free) { slots.add(orbitSlot); settle(i, planetId, orbitSlot); } else lost.push(i);
     }
     for (const i of lost) {
@@ -513,20 +642,26 @@ export function listStations(
       const taken = new Set<number>();
       candidates.forEach((o, j) => {
         if (j === i) return;
+        // One between planets at T held no slot anywhere: first, since one
+        // still on its way now is listed where it left from.
+        if (stationInTransit({ move: o.move ?? undefined }, T)) return;
         if (settledAt(o) <= T) {
           if (spots[j]?.planetId === dest) taken.add(spots[j]!.orbitSlot);
           return;
         }
-        // One between planets at T held no slot anywhere.
-        if (stationInTransit({ move: o.move ?? undefined }, T)) return;
         const place = placeWithMove(o.base, o.move, T);
         if (planetById(place.planetId).id === dest) taken.add(place.orbitSlot);
       });
+      for (const p of known) {
+        if (stationInTransit({ move: p.move }, T)) continue;
+        const place = placeWithMove(p, p.move ?? null, T);
+        if (planetById(place.planetId).id === dest) taken.add(place.orbitSlot);
+      }
       outcome = taken.size >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';
       writeArrivalOutcome(station, outcomeKey, outcome);
     }
     if (outcome === 'bounced') at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
-    const slot = claim(at.planetId, at.orbitSlot);
+    const slot = claim(at.planetId, at.orbitSlot, true);
     // Its planet full (it left its old slot in transit): it stays where its
     // move put it, sharing that slot, rather than drop out of the list or
     // turn up at another planet no transfer took it to.

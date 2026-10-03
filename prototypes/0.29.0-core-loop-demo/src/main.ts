@@ -131,6 +131,7 @@ import {
 // orbits, and flight records written on another install still resolve here.
 import {
   bindPlanetSummaryDoc,
+  installKnownPlacesResolver,
   installTrimResolver,
   LEARNED_PREFIX,
   publishPlanetSummary,
@@ -1860,6 +1861,8 @@ async function joinRoomAtEpoch(
     // 🪐 Stations fly their shared trims, and what changes here goes out:
     // a burn, a flight step, a station the atlas now groups differently.
     installTrimResolver();
+    // Stations heard of around other planets count where slots are picked.
+    installKnownPlacesResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
     // 🚚 A move this room remembers goes out on the planet summary at once.

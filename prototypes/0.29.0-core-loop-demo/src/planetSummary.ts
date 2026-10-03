@@ -43,8 +43,8 @@ import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor } from './stationMove';
 import { setStationTrimResolver } from './orbits';
-import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace } from './stations';
-import type { StationMove, StationRecord } from './stations';
+import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver } from './stations';
+import type { KnownPlace, StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
@@ -528,17 +528,19 @@ function mergeShip(prior: ShipSummary | undefined, incoming: ShipSummary): ShipS
  *  (by `stampOf`, the record's own stamp unless given). `pinned` keys (what
  *  this client sees first-hand) are kept first, whatever their stamps: peer
  *  stamps decide merges, never whether we forget our own station or ship.
- *  This planet's entries come next. */
+ *  This planet's entries come next, each placed by `placeOf` (a station by
+ *  its move, as pruneMap does; its record's planet unless given). */
 function capped<T extends { updatedAt: number; planetId: string }>(
   rec: Record<string, T>,
   max: number,
   pinned: ReadonlySet<string> = new Set(),
   planet: string | null = null,
   stampOf: (v: T) => number = (v) => v.updatedAt,
+  placeOf: (v: T) => string = (v) => v.planetId,
 ): Record<string, T> {
   const entries = Object.entries(rec);
   if (entries.length <= max) return rec;
-  const first = (k: string, v: T) => (pinned.has(k) ? 0 : onPlanet(v, planet) ? 1 : 2);
+  const first = (k: string, v: T) => (pinned.has(k) ? 0 : onPlanet({ planetId: placeOf(v) }, planet) ? 1 : 2);
   // Ties by key, as pruneMap: every replica keeps the same subset.
   entries.sort((a, b) => first(a[0], a[1]) - first(b[0], b[1]) || stampOf(b[1]) - stampOf(a[1])
     || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
@@ -786,7 +788,7 @@ export function registerLearnedStations(
       const own = saved.get(owner.id);
       if (own && !isLearnedRecord(own) && s.ownerId !== undefined && s.ownerId !== owner.id
         && (own.orbitSlot !== s.orbitSlot || planetById(own.planetId).id !== planetById(s.planetId).id)) {
-        if (registerStation({ ...own, planetId: s.planetId, orbitSlot: s.orbitSlot })) changed++;
+        if (registerStation({ ...own, planetId: s.planetId, orbitSlot: s.orbitSlot }, { reservations: false })) changed++;
       }
       continue;
     }
@@ -803,7 +805,7 @@ export function registerLearnedStations(
     if (had && sameExt && had.name === rec.name && had.orbitSlot === rec.orbitSlot
       && planetById(had.planetId).id === planetById(rec.planetId).id
       && had.welcomeRoomId === rec.welcomeRoomId && had.berthDoor === rec.berthDoor) continue;
-    if (registerStation(rec)) changed++;
+    if (registerStation(rec, { reservations: false })) changed++;
   }
   return changed;
 }
@@ -898,7 +900,7 @@ export function pullPlanetSummary(now = Date.now()): void {
   }
   const pins = firstHandKeys(store);
   if (changed) {
-    store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
+    store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now), (st) => summaryPlanet(st, now));
     store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
     writeStore(store);
   }
@@ -1014,7 +1016,7 @@ export function publishPlanetSummary(now = Date.now()): void {
     }
   }
   const pins = firstHandKeys(store);
-  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now));
+  store.stations = capped(store.stations, MAX_STATIONS, pins.stations, pins.planet, (st) => stationRecency(st, now), (st) => summaryPlanet(st, now));
   store.ships = capped(store.ships, MAX_SHIPS, pins.ships, pins.planet);
   writeStore(store);
   applyLearned(store);
@@ -1105,6 +1107,29 @@ export function refreshTrims(store: Store = readStore()): void {
     if (applies) next.set(st.id, applies);
   }
   trimsByStationId = next;
+}
+
+let knownPlacesCache: { text: string | null; places: KnownPlace[] } | null = null;
+
+/** Install the resolver stations.ts reads the stations heard of from: every
+ *  stored summary's place and latest move, around every planet (most are
+ *  never listed here, as only this planet's register), so slot picks and
+ *  arrivals count the slots they hold or are bound for. Read again only
+ *  when the store changes. */
+export function installKnownPlacesResolver(): void {
+  setKnownPlacesResolver(() => {
+    let text: string | null;
+    try { text = localStorage.getItem(STORE_KEY); } catch { return []; }
+    if (knownPlacesCache?.text === text) return knownPlacesCache.places;
+    const places = Object.values(readStore().stations).map((s): KnownPlace => ({
+      welcomeRoomId: s.welcomeRoomId,
+      planetId: s.planetId,
+      orbitSlot: s.orbitSlot,
+      ...(s.move ? { move: s.move } : {}),
+    }));
+    knownPlacesCache = { text, places };
+    return places;
+  });
 }
 
 /** Install the orbit trim resolver over what this install knows. */
