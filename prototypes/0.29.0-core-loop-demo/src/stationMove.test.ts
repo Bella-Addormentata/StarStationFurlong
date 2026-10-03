@@ -115,6 +115,12 @@ const moveTo = (to = ARIS): StationMove => {
   return plan.move;
 };
 
+/** The pin pinSettledArrival writes once `m` has arrived where it was bound. */
+const pinOf = (m: StationMove): StationMove => ({
+  ...m, fromPlanetId: m.toPlanetId, fromSlot: m.toSlot, departAt: m.arriveAt, arriveAt: m.arriveAt + 1,
+  mode: 'thrusters', tugRoomId: undefined, bookedAt: m.arriveAt, settles: m, fuel: 0, fuelDrawn: 0,
+});
+
 describe('planning a thruster move', () => {
   it('leaves at the next launch window and takes the Hohmann transfer time', () => {
     const plan = planStationMove(ctx(), ARIS);
@@ -1308,7 +1314,52 @@ describe('tugs: a torch tow', () => {
     let nest: Record<string, unknown> = { ...base };
     for (let k = 0; k < 100_000; k++) nest = { ...base, settles: nest };
     expect(isStationMove(nest)).toBe(false);
-    expect(isStationMove({ ...base, settles: { ...base } })).toBe(true);
+    expect(isStationMove({ ...pinOf(base), settles: { ...base } })).toBe(true);
+  });
+
+  it('refuses a move between two slots of one planet, an unknown planet read as the default one', () => {
+    const base = moveTo();
+    expect(base.fromPlanetId).toBe(SOV);
+    expect(isStationMove({ ...base, toPlanetId: SOV, toSlot: base.fromSlot + 1 })).toBe(false);
+    expect(isStationMove({ ...base, toPlanetId: 'planet-nowhere', toSlot: base.fromSlot + 1 })).toBe(false);
+    expect(isStationMove({ ...base, toPlanetId: 'planet-nowhere', toSlot: base.fromSlot })).toBe(false);
+    // Going nowhere, written as such, still reads.
+    expect(isStationMove({ ...base, toPlanetId: SOV, toSlot: base.fromSlot })).toBe(true);
+  });
+
+  it('takes a pin only in the form one is written: an arrival as the move got there, a cancel of a tow as it left', () => {
+    const move = moveTo();
+    const arrived = pinOf(move);
+    expect(isStationMove(arrived)).toBe(true);
+    // At either end (home after a bounce), in any slot the list put it in.
+    const home = { ...arrived, fromPlanetId: SOV, toPlanetId: SOV, fromSlot: 7, toSlot: 7 };
+    expect(isStationMove(home)).toBe(true);
+    // Never before the move got there, nor anywhere else, nor anything but
+    // a zero-fuel millisecond in one place.
+    expect(isStationMove({ ...arrived, departAt: move.arriveAt - 60_000, arriveAt: move.arriveAt - 59_999 })).toBe(false);
+    expect(isStationMove({ ...arrived, departAt: move.arriveAt + 1, arriveAt: move.arriveAt + 2 })).toBe(false);
+    const stay: StationMove = { ...move, toPlanetId: SOV, toSlot: move.fromSlot };
+    expect(isStationMove(stay)).toBe(true);
+    expect(isStationMove({ ...pinOf(stay), fromPlanetId: ARIS, toPlanetId: ARIS })).toBe(false);
+    expect(isStationMove({ ...arrived, arriveAt: arrived.arriveAt + 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, fuel: 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, fuelDrawn: 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, toSlot: arrived.toSlot + 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, mode: 'tug', tugRoomId: 'tug-room' })).toBe(false);
+    // A cancel: a tow's, the millisecond after it left, where it left from.
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    const cancel: StationMove = {
+      ...tow, toPlanetId: tow.fromPlanetId, toSlot: tow.fromSlot, departAt: tow.departAt + 1, arriveAt: tow.departAt + 2,
+      mode: 'thrusters', tugRoomId: undefined, bookedAt: tow.departAt + 10, settles: tow, fuel: 0, fuelDrawn: 0,
+    };
+    expect(isCancelPin(cancel)).toBe(true);
+    expect(isStationMove(cancel)).toBe(true);
+    expect(isStationMove({ ...cancel, settles: { ...tow, mode: 'thrusters', tugRoomId: undefined } })).toBe(false);
+    expect(isStationMove({ ...cancel, departAt: tow.departAt + 2, arriveAt: tow.departAt + 3 })).toBe(false);
+    expect(isStationMove({ ...cancel, fromPlanetId: tow.toPlanetId, toPlanetId: tow.toPlanetId })).toBe(false);
+    expect(isStationMove({ ...cancel, fromSlot: tow.fromSlot + 1, toSlot: tow.fromSlot + 1 })).toBe(false);
   });
 
   it('refuses a move booked after it leaves: only a pin is written once what it records is over', () => {
@@ -1503,7 +1554,10 @@ describe('tugs: a torch tow', () => {
     expect(readStationMove()).toBeNull();
     expect(readMoveFuelDrawn()).toBe(0);
     // A cancel of the winner beats the winner's arrival pin, too.
-    const cancel: StationMove = { ...pin, departAt: winner.departAt + 1, arriveAt: winner.departAt + 2, bookedAt: NOW + 5 };
+    const cancel: StationMove = {
+      ...pin, fromPlanetId: winner.fromPlanetId, fromSlot: winner.fromSlot, toPlanetId: winner.fromPlanetId, toSlot: winner.fromSlot,
+      departAt: winner.departAt + 1, arriveAt: winner.departAt + 2, bookedAt: NOW + 5,
+    };
     expect(isCancelPin(cancel)).toBe(true);
     store.clear();
     bindStationMoveDoc(new Y.Doc());

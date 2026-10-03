@@ -80,6 +80,11 @@ export function isStationMove(v: unknown): v is StationMove {
     && typeof r.welcomeRoomId === 'string' && r.welcomeRoomId.length <= MAX_ID_LENGTH
     && isId(r.fromPlanetId) && isSlot(r.fromSlot)
     && isId(r.toPlanetId) && isSlot(r.toSlot)
+    // Within one planet only by going nowhere, written as such (both
+    // planners refuse a same-planet move): an unknown planet reads as the
+    // default one, so it is compared as read.
+    && (planetById(r.fromPlanetId as string).id !== planetById(r.toPlanetId as string).id
+      || (r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
@@ -93,9 +98,29 @@ export function isStationMove(v: unknown): v is StationMove {
     // at the first step, never walked.
     && (r.settles === undefined || (typeof r.settles === 'object' && r.settles !== null
       && (r.settles as { settles?: unknown }).settles === undefined
-      && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId))
+      && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId
+      && isPinOf(r as StationMove, r.settles)))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
+}
+
+/** Is `p` a pin of `of` in the form one is written (pinSettledArrival,
+ *  writeCancelOf)? It holds its station where it is for a millisecond and
+ *  draws no fuel. An arrival pin leaves the moment that move arrived, at
+ *  either end of it (home after a bounce; any slot there, as the list may
+ *  have moved it on); a cancel undoes a tow the moment after it left, where
+ *  it left from. Anything else would rank as that move (compareMoves) and
+ *  place its station early, or somewhere it never went. */
+function isPinOf(p: StationMove, of: StationMove): boolean {
+  const planet = planetById(p.fromPlanetId).id;
+  if (p.toPlanetId !== p.fromPlanetId || p.toSlot !== p.fromSlot || p.arriveAt !== p.departAt + 1
+    || p.mode !== 'thrusters' || p.fuel !== 0 || p.fuelDrawn !== 0) return false;
+  if (p.departAt < of.arriveAt) {
+    return of.mode === 'tug' && p.departAt === of.departAt + 1
+      && planet === planetById(of.fromPlanetId).id && p.fromSlot === of.fromSlot;
+  }
+  return p.departAt === of.arriveAt
+    && (planet === planetById(of.toPlanetId).id || planet === planetById(of.fromPlanetId).id);
 }
 
 /** How far ahead a real move can be: the longest wait for a launch window
