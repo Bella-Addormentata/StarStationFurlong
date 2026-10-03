@@ -776,10 +776,10 @@ export interface PlanetSummaryContext {
   /** The ship this client stands in, or null when the room is no ship. */
   ship: () => ShipStatusInput | null;
   /** The room this client stands in when it is known to be no ship (not a
-   *  ready ship, or bolted into a station), else null: a ship entry for that
-   *  room is withdrawn. A ship whose planet is not placed yet (`ship()` is
-   *  null for it too) is not this, so its entry stands. Optional: without it
-   *  nothing is withdrawn. */
+   *  ready ship, a station's own room, or bolted into a station), else
+   *  null: a ship entry for that room is withdrawn. A ship whose planet is
+   *  not placed yet (`ship()` is null for it too) is not this, so its entry
+   *  stands. Optional: without it nothing is withdrawn. */
   notShipRoom?: () => string | null;
   /** The room this client stands in: its trim (localTrim) is read
    *  first-hand there, so a trim that room takes back spreads. Optional:

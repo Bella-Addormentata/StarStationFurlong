@@ -1226,10 +1226,12 @@ function ownStationOf(roomId: string): string | null {
 }
 
 /** 🪐 What this client tells the planet about the ship it stands in: null
- *  when the room is no ready ship, or is a module bolted into a station. */
+ *  when the room is no ready ship, or is a station's own room or a module
+ *  bolted into a station (where the helm steers the station: a station room
+ *  wearing engine, tank and helm keeps its orbit, it never flies). */
 function planetShipStatus(): ShipStatusInput | null {
   const roomId = activeBootstrap?.roomId ?? "";
-  if (!roomId || !isShipReady() || isBoltedIntoStation(readAllDoors(), roomId)) return null;
+  if (!roomId || !isShipReady() || isStationRoom(roomId, []) || isBoltedIntoStation(readAllDoors(), roomId)) return null;
   const rec = readFlightRecord();
   const stations = listStations();
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
@@ -1603,7 +1605,7 @@ async function joinRoomAtEpoch(
     notShipRoom: () => {
       const roomId = activeBootstrap?.roomId ?? "";
       if (!roomId) return null;
-      return isShipReady() && !isBoltedIntoStation(readAllDoors(), roomId) ? null : roomId;
+      return isShipReady() && !isStationRoom(roomId, []) && !isBoltedIntoStation(readAllDoors(), roomId) ? null : roomId;
     },
   });
 
