@@ -18,7 +18,9 @@
 
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
+import type { FlightStatus } from './shipDoc';
 import { planTransfer } from './orbits';
+import type { StationRoomCause } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -138,21 +140,48 @@ function wholeMs(plan: HopPlan): HopPlan | null {
 
 // ── Flight capability ────────────────────────────────────────────────────────
 
-let stationRoomCheck: (() => boolean) | null = null;
+let stationRoomCheck: (() => StationRoomCause | null) | null = null;
 
-/** Say whether the current room is a station's own (stations.isStationRoom):
- *  wired from main.ts; null clears it. */
-export function setStationRoomCheck(check: (() => boolean) | null): void {
+/** Say why the current room is a station's own, or null when it is not
+ *  (stations.stationRoomCause): wired from main.ts; null clears it. */
+export function setStationRoomCheck(check: (() => StationRoomCause | null) | null): void {
   stationRoomCheck = check;
 }
 
+/** Why the current room is a station's own, so engine, tank and helm do not
+ *  fly it (flightCapable), or null: what the helm names in place of missing
+ *  systems. A check that throws reads as no station room. */
+export function groundedBy(): StationRoomCause | null {
+  try { return stationRoomCheck?.() ?? null; } catch { return null; }
+}
+
 /** Engine, tank and helm fly a ship (`shipReady`), but a station's own room
- *  wearing them, for station keeping, never takes off: no flight, and no
- *  location taken from the ship's flight record. A check that throws reads
- *  as no station room. */
+ *  wearing them, for station keeping, never DEPARTs on a hop: no flight, and
+ *  no location taken from the ship's flight record. */
 export function flightCapable(shipReady: boolean): boolean {
+  return shipReady && groundedBy() === null;
+}
+
+/** May engine, tank and helm (`shipReady`) fly the current room freely, by
+ *  hand and on to PARK in a new orbit? A ship may, and so may a one-module
+ *  station's own room ('lone-station'), though it never DEPARTs
+ *  (flightCapable): no gangway holds it, so it leaves nothing of the station
+ *  behind. A module bolted in, or the welcome room of a station of several
+ *  modules, may not. */
+export function freeFlightCapable(shipReady: boolean): boolean {
   if (!shipReady) return false;
-  try { return stationRoomCheck?.() !== true; } catch { return true; }
+  const why = groundedBy();
+  return why === null || why === 'lone-station';
+}
+
+/** Does the current room take its place from the ship's flight record
+ *  (`status`)? A flight under way (casting off, in transit, arriving) keeps
+ *  it whatever the room wears now, since a fitting may come off mid-trip; a
+ *  docked record only while the room may fly (`capable`, flightCapable's
+ *  answer: a module that never flew reads the record's default place). A
+ *  station's own room never does. */
+export function followsFlightRecord(status: FlightStatus, capable: boolean): boolean {
+  return status === 'docked' ? capable : groundedBy() === null;
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */
@@ -214,6 +243,40 @@ export function planRecordHop(
   };
 }
 
+/** A berth door's own pose in its room: its wall, and its centre along that
+ *  wall (the currency of a dock record's farWall and farLateral). */
+export interface BerthPose {
+  wall: DoorWall;
+  lateral?: number;
+}
+
+type BerthPoseLookup = (roomId: string, doorId: string) => BerthPose | null | undefined;
+
+let berthPoseLookup: BerthPoseLookup | null = null;
+
+/** main.ts points this at the atlas: a berth door's pose as a client standing
+ *  in its room last saw it. Null clears it. */
+export function setBerthPoseLookup(lookup: BerthPoseLookup | null): void {
+  berthPoseLookup = lookup;
+}
+
+const WALLS: readonly DoorWall[] = ['x+', 'x-', 'y+', 'y-'];
+
+/** The far end of a DOCK at a station's berth, where known: a first visit
+ *  then poses the station's module (and checks overlap) at its real port.
+ *  Unknown or junk is none, and the DOCK faces the arrival heading as for
+ *  any port of unknown pose; a lateral the doors doc would not keep
+ *  (|lateral| ≤ 32) leaves the wall alone. */
+function berthPose(roomId: string, doorId: string): Pick<StationBerth, 'farWall' | 'farLateral'> {
+  let pose: BerthPose | null | undefined;
+  try { pose = berthPoseLookup?.(roomId, doorId); } catch { return {}; }
+  if (!pose || !WALLS.includes(pose.wall)) return {};
+  const lateral = pose.lateral;
+  return typeof lateral === 'number' && Number.isFinite(lateral) && Math.abs(lateral) <= 32
+    ? { farWall: pose.wall, farLateral: lateral }
+    : { farWall: pose.wall };
+}
+
 /**
  * Turn station records into destinations. A station's berth is its welcome
  * room — dockable only when this client holds a seed for it (`seedFor`: the
@@ -239,7 +302,8 @@ export function destinationsFromRecords(
     // door name the doors doc would strip counts as none.
     const door = r.berthDoor && isAcceptableDoorKey(r.berthDoor) ? r.berthDoor : undefined;
     const address = r.welcomeRoomId && door ? seedFor(r.welcomeRoomId) : undefined;
-    if (address && door) out.berth = { address, farDoor: door };
+    // With its door's pose where known (setBerthPoseLookup).
+    if (address && door) out.berth = { address, farDoor: door, ...berthPose(r.welcomeRoomId, door) };
     return out;
   });
 }
