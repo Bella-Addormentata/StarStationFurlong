@@ -840,6 +840,7 @@ export class World {
           side: THREE.BackSide,
         }),
       );
+      glow.name = "ambientPlanetGlow";
       glow.position.copy(ambient.position);
       this.platformGroup.add(glow);
     }
