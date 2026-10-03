@@ -9,7 +9,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  atlasComponent, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas, seedAtlasDefaults,
+  atlasComponent, atlasLayout, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas,
+  seedAtlasDefaults,
 } from './stationAtlas';
 import type { BundledAtlasEntry } from './stationAtlas';
 
@@ -105,7 +106,9 @@ describe('door-set bound at ingest', () => {
     const raw = JSON.parse(store.get('ssf-station-atlas')!) as Record<string, { doors: object }>;
     expect(Object.keys(raw['module-old'].doors).length).toBe(64);
   });
+});
 
+describe('rooms named like Object properties', () => {
   it('takes a peer room named like an Object property without dropping the rest', () => {
     for (const odd of ['constructor', '__proto__', 'toString']) {
       store.clear();
@@ -116,6 +119,46 @@ describe('door-set bound at ingest', () => {
       expect(() => bindStationAtlasDoc(peer, { roomId: 'module-self', isPassagePublic: () => false })).not.toThrow();
       expect(readAtlas()['module-yard']?.name).toBe('MODULE-YARD');
     }
+  });
+
+  it('stores a peer room keyed __proto__ under its own key, leaving the prototype alone', () => {
+    doc.getMap('atlas').set('__proto__', {
+      roomId: '__proto__', name: 'ODD', doors: { n: { targetRoomId: 'module-yard' } }, updatedAt: Date.now(),
+    });
+    bind();
+    const atlas = readAtlas();
+    expect(Object.getPrototypeOf(atlas)).toBe(null);
+    expect(Object.prototype.hasOwnProperty.call(atlas, '__proto__')).toBe(true);
+    expect(atlas['__proto__'].name).toBe('ODD');
+    expect(Object.keys(JSON.parse(store.get('ssf-station-atlas')!))).toContain('__proto__');
+  });
+
+  it('keeps a stub for a neighbour named like an Object property', () => {
+    const seed = (roomId: string) => btoa(JSON.stringify({ roomId }));
+    harvestIntoAtlas({
+      roomId: 'module-here',
+      name: 'HERE',
+      doors: ['constructor', '__proto__', 'toString'].map((rid, i) => ({ doorId: `d:${i}`, targetSeed: seed(rid) })),
+    });
+    const atlas = readAtlas();
+    for (const rid of ['constructor', '__proto__', 'toString']) {
+      expect(Object.prototype.hasOwnProperty.call(atlas, rid)).toBe(true);
+      expect(atlas[rid].name).toBe('Module');
+    }
+  });
+
+  it('lays out past a door naming one the atlas does not hold', () => {
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-self': {
+        roomId: 'module-self', name: 'SELF', lastSeen: 1,
+        doors: {
+          'd:a': { targetSeed: '', targetRoomId: 'constructor' },
+          'd:b': { targetSeed: '', targetRoomId: 'toString', farDoor: 'd:x' },
+        },
+      },
+    }));
+    expect(atlasLayout('module-self').map((p) => [p.roomId, p.name]))
+      .toEqual([['constructor', 'Module'], ['toString', 'Module']]);
   });
 });
 

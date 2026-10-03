@@ -151,10 +151,13 @@ export function roomIdFromSeed(seed: string): string {
 export function readAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return {};
+    if (!raw) return Object.create(null);
     const obj = JSON.parse(raw);
-    if (typeof obj !== 'object' || obj === null) return {};
-    const atlas = obj as Record<string, AtlasEntry>;
+    if (typeof obj !== 'object' || obj === null) return Object.create(null);
+    // No prototype: a room id such as `__proto__` or `constructor` is an own
+    // key like any other, never an inherited value, and writing one never
+    // sets the map's prototype (writeAtlas defines each key outright).
+    const atlas: Record<string, AtlasEntry> = Object.assign(Object.create(null), obj);
     // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
     // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
     // — and it does not just sit there: pushAtlasToDoc republishes it as
@@ -188,7 +191,7 @@ export function readAtlas(): Record<string, AtlasEntry> {
     }
     if (repaired) writeAtlas(atlas);
     return atlas;
-  } catch { return {}; }
+  } catch { return Object.create(null); }
 }
 
 /**
@@ -261,7 +264,11 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     // visited/gossip distinction for old entries rather than mis-ranking them.
     const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
-    for (const e of entries) out[e.roomId] = e;
+    // Defined, not assigned: assigning a room id `__proto__` would set the
+    // object's prototype, and the room would be left out of the store.
+    for (const e of entries) {
+      Object.defineProperty(out, e.roomId, { value: e, enumerable: true, writable: true, configurable: true });
+    }
     localStorage.setItem(KEY, JSON.stringify(out));
   } catch { /* privacy mode — the atlas degrades to the current room */ }
 }
