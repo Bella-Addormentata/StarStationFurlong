@@ -45,7 +45,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, flightCapable, groundedBy, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { destinationsFrom, flightCapable, followsFlightRecord, groundedBy, isKnownStation, planHop, stationHere } from './stationDirectory';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
@@ -2011,10 +2011,12 @@ const HELM_TICK_MS = 250;
 /** The station the holotable marks "you are here". A station room is its
  *  own atlas station. A ship is its own one-module station in the atlas
  *  (docks are not station structure), so a ship reads its live dock partner
- *  first, then where its last flight left it; in flight it is at none. */
-function holotableStation(): StationRecord | null {
-  if (!flightCapable(isShipReady())) return currentStation();
+ *  first, then where its last flight left it; in flight it is at none, even
+ *  should a fitting come off mid-trip (the room still follows its flight:
+ *  followsFlightRecord, as main.ts places it). Exported for tests. */
+export function holotableStation(): StationRecord | null {
   const flight = readFlightRecord();
+  if (!followsFlightRecord(flight.status, flightCapable(isShipReady()))) return currentStation();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
   return listStationRecords().find((st) => st.id === id) ?? null;
