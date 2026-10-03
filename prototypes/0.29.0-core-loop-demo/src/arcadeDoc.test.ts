@@ -66,6 +66,9 @@ describe('reads', () => {
     expect(sanitizeGame(PACMAN)).toEqual(PACMAN);
     expect(sanitizeGame(TETRIS)).toEqual(TETRIS);
     expect(sanitizeGame({ ...PACMAN, url: 'ftp://x/y.zip' })).toBeNull();
+    // user:password@host would be read by every peer, not just the file's host.
+    expect(sanitizeGame({ ...PACMAN, url: 'https://user:secret@example.org/pacman.zip' })).toBeNull();
+    expect(parseRomUrl('https://user:secret@example.org/x.nes')).toBeNull();
     expect(sanitizeGame({ ...PACMAN, core: 'ps5' })).toBeNull();
     expect(sanitizeGame({ ...PACMAN, name: '   ' })).toBeNull();
     expect(sanitizeGame({ ...PACMAN, size: -5 })?.size).toBe(0);

@@ -280,10 +280,13 @@ const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slic
 const num = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback;
 
+/** http(s) only, and never a URL carrying credentials: a game's link goes
+ *  into the room-shared record and the shelf, where `user:password@host`
+ *  would be read by every peer, not just the host serving the file. */
 export function isHttpUrl(s: string): boolean {
   try {
     const u = new URL(s);
-    return u.protocol === 'https:' || u.protocol === 'http:';
+    return (u.protocol === 'https:' || u.protocol === 'http:') && !u.username && !u.password;
   } catch {
     return false;
   }
@@ -525,7 +528,7 @@ export function parseRomUrl(text: string): ParsedRom | null {
   } catch {
     return null;
   }
-  if (u.protocol !== 'https:' && u.protocol !== 'http:') return null;
+  if (!isHttpUrl(u.href)) return null; // http(s) only, and no credentials for the room to read
   const tail = u.pathname.split('/').filter(Boolean).pop() ?? '';
   let name = '';
   try {
