@@ -375,6 +375,18 @@ describe('stationForRoom / planetForRoom', () => {
     }
   });
 
+  it('finds a docked ship past pairings that name no other room', () => {
+    // Peer-written: an address the parser throws on, or a pairing back to the
+    // module itself, bolts it into nothing and hides no real dock.
+    const atlas = atlasOf(room('b1'), room('ship'));
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    const dock = { paired: true as const, connectedRoomAddress: 'ssf://join#room=b1', transient: true };
+    const junk = (address: string) => ({ paired: true as const, connectedRoomAddress: address });
+    expect(dockedStationFor('ship', [junk('ssf://join#room=%'), dock], atlas)).toBe('aris-yard');
+    expect(dockedStationFor('ship', [{ ...junk('ssf://join#room=%'), transient: true }, dock], atlas)).toBe('aris-yard');
+    expect(dockedStationFor('ship', [junk('ssf://join#room=ship'), dock], atlas)).toBe('aris-yard');
+  });
+
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
     const atlas = twoStations();
     expect(planetForRoom('nowhere', atlas).id).toBe(DEFAULT_PLANET_ID);
