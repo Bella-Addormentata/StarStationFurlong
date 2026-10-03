@@ -88,6 +88,12 @@ export interface TvSyncDeps {
  *  tick. (The holder seeks only on a transport write, at once.) */
 export const TV_SEEK_COOLDOWN_MS = 2_000;
 
+/** How long the holder keeps a transport target for a player that cannot
+ *  seek YET (an HTML video reports ready at its metadata, before its
+ *  ranges) before deciding it never will (a live stream) and letting the
+ *  room follow wherever the player is. */
+export const TV_SEEK_WAIT_MS = 10_000;
+
 export class TvSyncController {
   private readonly now: () => number;
   private readonly rttMs: () => number;
@@ -109,6 +115,10 @@ export class TvSyncController {
    *  media's end once the player has said how long it is). */
   private appliedJump: number | null = null;
   private pendingTarget: number | null = null;
+  /** Whether the seek for pendingTarget has gone out, and since when the
+   *  target waits (a player that cannot seek yet keeps it, bounded). */
+  private pendingSeekIssued = false;
+  private pendingSince = -Infinity;
 
   constructor(private readonly deps: TvSyncDeps) {
     this.now = deps.now ?? (() => Date.now());
@@ -205,10 +215,31 @@ export class TvSyncController {
       // reissued — even inside the band of where the player still reads —
       // or the old seek would land later and be heartbeated over this one.
       const landing = this.pendingTarget !== null;
-      if (p.canSeek && (landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS)) {
-        p.seek(target);
+      if (landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) {
+        if (p.canSeek) {
+          p.seek(target);
+          this.lastSeekAt = now;
+          this.pendingTarget = target;
+          this.pendingSeekIssued = true;
+          this.pendingSince = now;
+        } else if (p.hasClock) {
+          // A player that cannot seek YET keeps the target, and the beat
+          // waits with it (publishing where the player is would rewind the
+          // room); the seek goes out on the first tick it can. One that never
+          // can (a live stream) gives the target up after TV_SEEK_WAIT_MS.
+          this.pendingTarget = target;
+          this.pendingSeekIssued = false;
+          this.pendingSince = now;
+        }
+      }
+    }
+    if (this.pendingTarget !== null && !this.pendingSeekIssued) {
+      if (p.canSeek) {
+        p.seek(this.pendingTarget);
         this.lastSeekAt = now;
-        this.pendingTarget = target;
+        this.pendingSeekIssued = true;
+      } else if (now - this.pendingSince >= TV_SEEK_WAIT_MS) {
+        this.pendingTarget = null; // never seekable: the room follows the player
       }
     }
     // A jump has landed once the player reads within the band of it — checked

@@ -521,11 +521,14 @@ function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refus
       <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is inside a private network — nobody in the room can ask your browser to fetch from there</div>`);
     return;
   }
-  // The button under the finger stays: the same ask every tick is one ask.
-  if (!t.notice.hidden && t.notice.querySelector('[data-tv-allow]')) return;
+  // The button under the finger stays — the same ask every tick is one ask —
+  // but only for the SAME origin: a programme that moves on to another
+  // unapproved host gets its own ask, not the old button and its handler.
+  const asking = t.notice.hidden ? null : t.notice.querySelector<HTMLButtonElement>('[data-tv-allow]');
+  if (asking && asking.dataset.tvAllow === origin) return;
   showNotice(t, `<div>PLAY FROM ${escapeHtml(host)}?</div>
     <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — your browser would fetch this from ${escapeHtml(host)}; whoever pasted it cannot decide that for you</div>
-    <button type="button" data-tv-allow="1">▶ PLAY FROM ${escapeHtml(host)}</button>`);
+    <button type="button" data-tv-allow="${escapeHtml(origin)}">▶ PLAY FROM ${escapeHtml(host)}</button>`);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-allow]')?.addEventListener('click', () => {
     acceptMediaOrigin(origin);
     hideNotice(t);
