@@ -49,16 +49,22 @@
  * checked again after a settle window (berthAfterSettle). Writing the gate
  * first means a rider's DOCK crossing it meets the claim at the gate and
  * JOINS it (docking.ts redockPortAnswer's `superseded` rule), so both ends
- * hold one stamp. A refused or lost ferry side takes the claim back. A
- * cast-off writes both ends in the same tick: the ferry's port remembers the
- * gate, and the gate remembers the ferry.
+ * hold one stamp. A refused or lost ferry side takes the claim back, as does
+ * a gate whose AUTO-DOCK is switched off (or that stops admitting the ferry)
+ * while its claim settles. A cast-off writes both ends in the same tick: the
+ * ferry's port remembers the gate, and the gate remembers the ferry. Nothing
+ * is written to the gate once the keeper has reset (the player left, even if
+ * they came straight back).
  *
  * The gate's record needs the ferry's address and its port's pose (the far
  * wall and lateral): both come from a record in this room that names the
  * ferry through its route port (ferryBerthingIn): a dock made here before,
  * live or remembered. So a ferry docks automatically at a station once it has
  * docked in that room with someone aboard (a gate change to any free
- * auto-dock gate of the room included).
+ * auto-dock gate of the room included). The keeper docks and casts off
+ * only while the ferry's own route names the port that the departures entry
+ * here names: a newer route on another port waits until this board has heard
+ * of it (the session tells it).
  *
  * ─── Keeping the two ends agreeing ───────────────────────────────────────────
  *
@@ -616,10 +622,14 @@ export interface FerryDocSession {
 export interface GateEnd {
   /** The gate's end of the dock (this room, its address, the gate, its pose). */
   near: NearEnd;
+  /** The gate's record now, whatever its gate setting. */
   read: () => DoorRecord | undefined;
   /** Write the gate's record; false when this room is no longer the one
-   *  bound (the player walked on). */
+   *  bound (the player walked on, even if they came straight back). */
   write: (rec: DoorRecord) => boolean;
+  /** Is it still a gate this keeper docks at: written to as above, its
+   *  AUTO-DOCK still on, admitting the ferry? */
+  live: () => boolean;
 }
 
 export type StationDockResult =
@@ -644,7 +654,11 @@ export type StationDockResult =
          *  land (the gate keeps the claim; gateFixes settles it). */
         | 'unconfirmed'
         /** The player left the room. */
-        | 'left';
+        | 'left'
+        /** The gate stopped being one this keeper docks at while its claim
+         *  settled (AUTO-DOCK switched off, it no longer admits the ferry, or
+         *  the keeper reset): the claim is taken back where it may be. */
+        | 'disabled';
     };
 
 /**
@@ -719,6 +733,12 @@ export async function stationDock(o: {
   if (!held(claimed) || claimed.dockedAt !== dockedAt) {
     // Another claim won the gate: theirs to finish (gateFixes settles it).
     return { ok: false, reason: 'lost' };
+  }
+  // No keeper settles a claim at a gate that is no longer auto-dock: it is
+  // taken back before the ferry's side is asked.
+  if (!gate.live()) {
+    takeBack();
+    return { ok: false, reason: 'disabled' };
   }
 
   // 2. The ferry's side: the far-room decision a ship's DOCK uses.
@@ -835,6 +855,9 @@ export interface GateKeeperDeps {
   gates: () => GateView[];
   /** This room's door records (doorsDoc.readAllDoors). */
   doors: () => ReadonlyMap<string, DoorRecord>;
+  /** One of this room's door records, whatever its gate setting
+   *  (doorsDoc.readDoor). Default: from `doors`. */
+  door?: (doorId: string) => DoorRecord | undefined;
   /** The ferries this room's departures map holds. */
   ferries: () => readonly DepartureFerry[];
   /** Open a session to the room `address` reaches (roomSession). */
@@ -987,16 +1010,23 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
   };
 
   /** This room's side of a dock at `doorId`, written only while this room is
-   *  still the one bound. */
-  const gateEnd = (w: Watch, doorId: string, roomId: string): GateEnd => ({
-    near: nearOf(w, doorId),
-    read: () => safe(() => deps.gates().find((g) => g.doorId === doorId)?.record, undefined),
-    write: (rec) => {
-      if (deps.roomId() !== roomId) return false;
-      deps.writeDoor(doorId, rec);
-      return true;
-    },
-  });
+   *  still the one bound and the keeper has not reset since (a dock's await
+   *  may outlast both). Read whatever its gate setting, so a claim at a gate
+   *  switched off meanwhile is still seen, and taken back. */
+  const gateEnd = (w: Watch, doorId: string, roomId: string): GateEnd => {
+    const gen = generation;
+    const bound = (): boolean => gen === generation && safe(deps.roomId, '') === roomId;
+    return {
+      near: nearOf(w, doorId),
+      read: () => safe(() => (deps.door ? deps.door(doorId) : deps.doors().get(doorId)), undefined),
+      write: (rec) => {
+        if (!bound()) return false;
+        deps.writeDoor(doorId, rec);
+        return true;
+      },
+      live: () => bound() && safe(() => deps.gates().some((g) => g.doorId === doorId && admitsFerry(g, w.ship)), false),
+    };
+  };
 
   const dial = (w: Watch, address: string): void => {
     w.dialing = true;
@@ -1164,6 +1194,10 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       if (!sameNews(news, ferry)) publish(w, ferry, w.unpublished !== null, w.unpublished);
       w.unpublished = null;
     }
+    // A newer route on another port than the entry here names (the refresh
+    // above tells this board): the berthing and the gates' claims are the
+    // entry's port's, so nothing is done until the two agree.
+    if (news.route.shipPort !== ferry.route.shipPort) return;
     const sameStation = safe(deps.sameStation, null)
       ?? ((stop: RouteStop, roomId: string) => roomId === stop.berth.roomId);
     const look = ferryLook({

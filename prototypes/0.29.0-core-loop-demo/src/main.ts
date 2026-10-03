@@ -1407,6 +1407,7 @@ const gateKeeper = createGateKeeper({
       record: readDoor(doorId),
     })),
   doors: readAllDoors,
+  door: readDoor,
   ferries: readDepartureFerries,
   open: (address) => (roomSessionDeps ? openRoomSession(roomSessionDeps, address) : Promise.resolve(null)),
   ownAddress: resolveOwnRoomAddress,
