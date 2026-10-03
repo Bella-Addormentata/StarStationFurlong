@@ -21,11 +21,16 @@ import { keeperAfterPass, skipWhyOf, freshKeeperMemory, type KeeperGateResult, t
 import { setBerthSeedResolver } from './shipArrival';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
 import {
+  CHECKPOINT_PREFIX,
   checkpointFromWire,
+  checkpointKey,
   checkpointToWire,
   finishShipRoute,
   installRouteFlight,
   readRouteCheckpoints,
+  routeToWire,
+  routeWithoutRun,
+  shipRouteFromWire,
   startShipRoute,
   stopShipRoute,
   writeShipRoute,
@@ -49,7 +54,6 @@ import {
   pilotRoutineOffered,
   pilotSpeechAfter,
   pilotSpeechAt,
-  pilotViewHeld,
   readCaptainLock,
   readPilotView,
   readRouteCaptainDockId,
@@ -60,7 +64,7 @@ import {
   speakLeft,
   staySkipWhy,
 } from './shipPilot';
-import type { PilotDock, PilotEndHold, PilotLine, PilotLineView, PilotSpeech } from './shipPilot';
+import type { PilotDock, PilotLine, PilotLineView, PilotSpeech } from './shipPilot';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -536,63 +540,6 @@ describe("the helm's announcer (the same lines at the helm)", () => {
   });
 });
 
-// ── The route's end, once the route has finished ────────────────────────────
-
-describe("the route's end, once STOP has finished the route", () => {
-  const t = D - 4 * MIN;
-  const end = docked({ ended: 'stop', departsAt: null, scheduledAt: null });
-  const END_LINE = 'Welcome to Stop 0, gate 2. This is the last stop: the route ends here.';
-
-  // Copilot (PR 180): STOP just after the welcome waited out the gap between
-  // lines, and the next tick finished the route, so nothing said its end.
-  it('is said by the captain from its last view of the end, after the gap since the welcome', () => {
-    let [line, mem] = say(lineView(docked(), t), null);
-    expect(line?.key).toBe('welcome');
-    // STOP a second later, at the stop the ferry is docked at.
-    let held = pilotViewHeld(lineView(end, t + SEC), null, t + SEC, 'ferry');
-    expect(say(held.view!, mem)[0]).toBeNull();
-    // The next tick finishes the route: readPilotView reads none.
-    held = pilotViewHeld(null, held.hold, t + 2 * SEC, 'ferry');
-    expect(held.view?.now).toBe(t + 2 * SEC);
-    expect(say(held.view!, mem)[0]).toBeNull();
-    expect(pilotPost(held.view!.f, t + 2 * SEC)).toBe('door');
-    held = pilotViewHeld(null, held.hold, t + PILOT_LINE_GAP_MS, 'ferry');
-    [line, mem] = say(held.view!, mem);
-    expect(line?.text).toBe(END_LINE);
-    // Said once.
-    held = pilotViewHeld(null, held.hold, t + 10 * SEC, 'ferry');
-    expect(say(held.view!, mem)[0]).toBeNull();
-    // The hold runs out.
-    expect(pilotViewHeld(null, held.hold, t + SEC + PILOT_END_HOLD_MS, 'ferry')).toEqual({ view: null, hold: null });
-  });
-
-  it('is shown at the helm, and stays a while after the route has gone', () => {
-    let a = helmAnnouncerStep(freshHelmAnnouncer(), lineView(docked(), t));
-    let held = pilotViewHeld(lineView(end, t + SEC), null, t + SEC, 'ferry');
-    a = helmAnnouncerStep(a, held.view);
-    expect(a.shown?.key).toBe('welcome');
-    held = pilotViewHeld(null, held.hold, t + 2 * SEC, 'ferry');
-    a = helmAnnouncerStep(a, held.view);
-    held = pilotViewHeld(null, held.hold, t + PILOT_LINE_GAP_MS, 'ferry');
-    a = helmAnnouncerStep(a, held.view);
-    expect(a.shown).toMatchObject({ key: 'end', text: END_LINE });
-    held = pilotViewHeld(null, held.hold, t + 30 * SEC, 'ferry');
-    expect(helmAnnouncerStep(a, held.view)).toBe(a);
-    held = pilotViewHeld(null, held.hold, t + SEC + PILOT_END_HOLD_MS, 'ferry');
-    expect(helmAnnouncerStep(a, held.view).shown).toBeNull();
-  });
-
-  it('holds only a view of the end, in its own room, and lets it go for a new run', () => {
-    expect(pilotViewHeld(lineView(docked(), t), null, t, 'ferry').hold).toBeNull();
-    expect(pilotViewHeld(null, null, t, 'ferry')).toEqual({ view: null, hold: null });
-    const held = pilotViewHeld(lineView(end, t), null, t, 'ferry');
-    // Another room's speaker (the player walked on) says none of it.
-    expect(pilotViewHeld(null, held.hold, t + SEC, 'other-ship')).toEqual({ view: null, hold: null });
-    const next = lineView(docked(), t + SEC, { route: running({ startedAt: D - 9 * MIN }) });
-    expect(pilotViewHeld(next, held.hold, t + SEC, 'ferry')).toEqual({ view: next, hold: null });
-  });
-});
-
 // ── The skip's reason on the wire ────────────────────────────────────────────
 
 describe('the reason a stop is skipped, on the wire (additive)', () => {
@@ -651,9 +598,11 @@ describe('the captain\'s readers over a running ferry', () => {
     return liveDockFrom(docks);
   };
 
+  let doc: Y.Doc;
+
   beforeEach(() => {
     now = T0;
-    const doc = new Y.Doc();
+    doc = new Y.Doc();
     bindShipDoc(doc);
     bindDoorsDoc(doc);
     setBerthSeedResolver((room) => seed(room));
@@ -698,36 +647,151 @@ describe('the captain\'s readers over a running ferry', () => {
     expect(readCaptainLock('dock-1')).toBe(CAPTAIN_LOCK_REFUSAL);
     expect(finishShipRoute()).toBe(true);
     expect(readCaptainLock('dock-1')).toBeNull();
-    expect(readPilotView(now)).toBeNull();
+    expect(readRouteCaptainDockId()).toBeNull();
+    // The route's end is still read a while (the end line), then none.
+    expect(readPilotView(now)?.f.ended).toBe('stop');
+    expect(readPilotView(now + PILOT_END_HOLD_MS)).toBeNull();
   });
 
-  // Copilot (PR 180): STOP right after the welcome, and the finish on the
-  // next tick, left the route's end unsaid.
-  it("still says the route's end when STOP right after the welcome has finished the route", () => {
-    expect(startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: CAP, capacity: CAP })).toBe(T0);
-    let hold: PilotEndHold | null = null;
-    const read = (): PilotLineView | null => {
-      const held = pilotViewHeld(readPilotView(now), hold, now, 'ferry');
-      hold = held.hold;
-      return held.view;
-    };
-    now = T0 + 5 * SEC;
-    let v = read()!;
-    const welcome = pilotLine(v, null)!;
-    expect(welcome.key).toBe('welcome');
-    const mem = pilotSpeechAfter(v, null, welcome);
-    now += SEC;
-    expect(stopShipRoute(now)).toBe(true);
-    v = read()!;
-    expect(v.f.ended).toBe('stop');
-    expect(pilotLine(v, mem)).toBeNull();
-    // The helm commander's next tick finishes the route.
-    expect(finishShipRoute()).toBe(true);
-    now += SEC;
-    expect(readPilotView(now)).toBeNull();
-    expect(pilotLine(read()!, mem)).toBeNull();
-    now = T0 + 5 * SEC + PILOT_LINE_GAP_MS;
-    expect(pilotLine(read()!, mem)?.text).toBe('Welcome to Stop 0, gate 2. This is the last stop: the route ends here.');
+  // Copilot (PR 180): STOP at the stop the ferry is docked at, and the helm
+  // commander's finish on its next tick, can both come before a speaker
+  // reads the route again (the captain reads twice a second, the helm once,
+  // and the gap after a welcome holds the end line back).
+  describe("the route's end, once the route has finished", () => {
+    const END_LINE = 'Welcome to Stop 0, gate 2. This is the last stop: the route ends here.';
+
+    /** START at T0, and the welcome read and said at T0 + 5 s. */
+    function welcomed(): PilotSpeech | null {
+      expect(startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: CAP, capacity: CAP })).toBe(T0);
+      now = T0 + 5 * SEC;
+      const v = readPilotView(now)!;
+      const welcome = pilotLine(v, null)!;
+      expect(welcome.key).toBe('welcome');
+      return pilotSpeechAfter(v, null, welcome);
+    }
+
+    it('is said by the captain after STOP and the finish, with no read of the end between them', () => {
+      let mem = welcomed();
+      now += SEC;
+      const finishedAt = now;
+      expect(stopShipRoute(now)).toBe(true);
+      expect(finishShipRoute()).toBe(true);
+      now += SEC;
+      let v = readPilotView(now)!;
+      expect(v.route.startedAt).toBe(T0);
+      expect(v.f).toMatchObject({ ended: 'stop', stopIndex: 0, status: 'docked' });
+      expect(v.dock).toEqual({ gate: 2, gateChange: false });
+      expect(pilotPost(v.f, now)).toBe('door');
+      // The gap since the welcome first.
+      expect(pilotLine(v, mem)).toBeNull();
+      now = T0 + 5 * SEC + PILOT_LINE_GAP_MS;
+      v = readPilotView(now)!;
+      const line = pilotLine(v, mem)!;
+      expect(line).toMatchObject({ key: 'end', text: END_LINE });
+      mem = pilotSpeechAfter(v, mem, line);
+      // Said once.
+      now += 10 * SEC;
+      expect(pilotLine(readPilotView(now)!, mem)).toBeNull();
+      // Then it is gone.
+      now = finishedAt + PILOT_END_HOLD_MS - 1;
+      expect(readPilotView(now)).not.toBeNull();
+      now = finishedAt + PILOT_END_HOLD_MS;
+      expect(readPilotView(now)).toBeNull();
+    });
+
+    it('is shown at the helm after STOP and the finish, and a while after the route has gone', () => {
+      expect(startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: CAP, capacity: CAP })).toBe(T0);
+      now = T0 + 5 * SEC;
+      let a = helmAnnouncerStep(freshHelmAnnouncer(), readPilotView(now));
+      expect(a.shown?.key).toBe('welcome');
+      now += SEC;
+      const finishedAt = now;
+      expect(stopShipRoute(now)).toBe(true);
+      expect(finishShipRoute()).toBe(true);
+      now += SEC;
+      a = helmAnnouncerStep(a, readPilotView(now));
+      expect(a.shown?.key).toBe('welcome');
+      now = T0 + 5 * SEC + PILOT_LINE_GAP_MS;
+      a = helmAnnouncerStep(a, readPilotView(now));
+      expect(a.shown).toMatchObject({ key: 'end', text: END_LINE });
+      now = finishedAt + 30 * SEC;
+      expect(helmAnnouncerStep(a, readPilotView(now))).toBe(a);
+      now = finishedAt + PILOT_END_HOLD_MS;
+      expect(helmAnnouncerStep(a, readPilotView(now)).shown).toBeNull();
+    });
+
+    it("is said in a rider's game when another game's STOP and finish reach it, unread between them", () => {
+      const mem = welcomed();
+      // The helm commander's game holds a copy of this ferry's doc. It
+      // STOPs, then finishes on its next tick: two updates, as
+      // stopShipRoute and finishShipRoute write them (one game binds one
+      // doc, so they are written here by hand).
+      const there = new Y.Doc();
+      Y.applyUpdate(there, Y.encodeStateAsUpdate(doc));
+      const sent: Uint8Array[] = [];
+      there.on('update', (u: Uint8Array) => { sent.push(u); });
+      const ship = there.getMap('ship');
+      const run = shipRouteFromWire(ship.get('route'))!;
+      expect(run.startedAt).toBe(T0);
+      ship.set('route', routeToWire({ ...run, stoppedAt: T0 + 6 * SEC }));
+      there.transact(() => {
+        ship.set('route', routeToWire(routeWithoutRun(run)));
+        for (const key of [...ship.keys()]) {
+          if (key.startsWith(CHECKPOINT_PREFIX) && key !== checkpointKey(T0, 0, 'start')) ship.delete(key);
+        }
+      });
+      expect(sent).toHaveLength(2);
+      // Both reach this game before its captain reads again.
+      now = T0 + 6 * SEC;
+      for (const u of sent) Y.applyUpdate(doc, u);
+      expect(readCaptainLock('dock-1')).toBeNull();
+      now = T0 + 5 * SEC + PILOT_LINE_GAP_MS;
+      const v = readPilotView(now)!;
+      expect(v.f.ended).toBe('stop');
+      expect(pilotLine(v, mem)?.text).toBe(END_LINE);
+      expect(pilotLine(v, null)?.text).toBe(END_LINE);
+    });
+
+    it('is read only in the ferry it finished in, and gives way to a new run', () => {
+      welcomed();
+      expect(stopShipRoute(now)).toBe(true);
+      expect(finishShipRoute()).toBe(true);
+      expect(readPilotView(now)?.f.ended).toBe('stop');
+      // A new START here reads as itself.
+      now += SEC;
+      const next = startShipRoute({ now, startStop: 0, pilot: 'robot', fuel: CAP, capacity: CAP })!;
+      expect(next).toBe(now);
+      let v = readPilotView(now)!;
+      expect(v.route.startedAt).toBe(next);
+      expect(v.f.ended).toBeNull();
+      expect(pilotLine(v, null)?.key).toBe('welcome');
+      // That run finished too: its own end.
+      expect(stopShipRoute(now)).toBe(true);
+      expect(finishShipRoute()).toBe(true);
+      v = readPilotView(now)!;
+      expect(v.route.startedAt).toBe(next);
+      expect(v.f.ended).toBe('stop');
+      // Another room (the player walked on): none of it.
+      bindShipDoc(new Y.Doc());
+      expect(readPilotView(now)).toBeNull();
+    });
+
+    it('is not read in the next room the player walks into before the finish', () => {
+      welcomed();
+      expect(stopShipRoute(now)).toBe(true);
+      // The player walks on before the finish: the next room's doc has no route.
+      bindShipDoc(new Y.Doc());
+      expect(readPilotView(now)).toBeNull();
+    });
+
+    it('is never made up for a run that was not seen to end', () => {
+      expect(startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: CAP, capacity: CAP })).toBe(T0);
+      now = T0 + 5 * SEC;
+      // The run is cleared without an end (a finish from a game whose STOP
+      // reached this one in the same update).
+      expect(finishShipRoute()).toBe(true);
+      expect(readPilotView(now)).toBeNull();
+    });
   });
 
   it('knows a SKIP STOP from the helm is not a removed berth', () => {
