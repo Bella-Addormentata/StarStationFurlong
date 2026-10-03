@@ -535,6 +535,18 @@ describe('the station record', () => {
     expect(cleanBerths(list).find((b) => b.gate === 5)).toEqual({ roomId: 'room-a', doorId: 'd:00000005', gate: 5 });
   });
 
+  it('keeps the strictest copy of a port listed twice, whatever numbers the copies carry', () => {
+    const port = { roomId: 'room-c', doorId: 'east' };
+    const open: StationBerthRecord = { ...port, gate: 1 };
+    const closed: StationBerthRecord = { ...port, gate: 2, access: 'closed' };
+    expect(cleanBerths([open, closed])).toEqual([closed]);
+    expect(cleanBerths([closed, open])).toEqual([closed]);
+    const pass: StationBerthRecord = { ...port, gate: 1, access: 'pass' };
+    const reserved: StationBerthRecord = { ...port, gate: 3, access: 'reserved', reservedFor: 'ship-1' };
+    expect(cleanBerths([pass, open, reserved])).toEqual([reserved]);
+    expect(cleanBerths([open, pass])).toEqual([pass]);
+  });
+
   it('merges full gate lists from two rooms alike in either order', () => {
     const T = Date.UTC(2026, 8, 27, 10, 0, 0);
     const summary = (over: Partial<StationSummary>): StationSummary => ({

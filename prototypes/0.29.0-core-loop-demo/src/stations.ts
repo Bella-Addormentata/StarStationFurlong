@@ -129,16 +129,24 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
   return out;
 }
 
+const textOrder = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+
 /** Berths in gate order (unnumbered last), then by room and door, so
- *  arrivals try the lowest gate first; two copies of one port by access, the
- *  strictest first, then by the ship reserved. */
+ *  arrivals try the lowest gate first. */
 function berthOrder(x: StationBerthRecord, y: StationBerthRecord): number {
-  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  return (x.gate ?? Infinity) - (y.gate ?? Infinity)
+    || textOrder(x.roomId, y.roomId) || textOrder(x.doorId, y.doorId);
+}
+
+/** Which of two copies of one port stands (negative: `x`): the strictest
+ *  access, whatever numbers the copies carry, so a list stays fail-closed
+ *  as cleanBerth reads it; then the lower gate, then the ship reserved. */
+function copyOrder(x: StationBerthRecord, y: StationBerthRecord): number {
   const strictness = (b: StationBerthRecord) =>
     b.access === 'closed' ? 0 : b.access === 'reserved' ? 1 : b.access === 'pass' ? 2 : 3;
-  return (x.gate ?? Infinity) - (y.gate ?? Infinity)
-    || cmp(x.roomId, y.roomId) || cmp(x.doorId, y.doorId)
-    || strictness(x) - strictness(y) || cmp(x.reservedFor ?? '', y.reservedFor ?? '');
+  return strictness(x) - strictness(y)
+    || (x.gate ?? Infinity) - (y.gate ?? Infinity)
+    || textOrder(x.reservedFor ?? '', y.reservedFor ?? '');
 }
 
 /** A list of berths, cleaned, deduplicated by port and capped. */
@@ -146,24 +154,19 @@ export function cleanBerths(v: unknown): StationBerthRecord[] {
   // A longer list than any station lists is junk, not a prefix to trust:
   // duplicates could otherwise push a real gate past the cut.
   if (!Array.isArray(v) || v.length > MAX_BERTHS * 4) return [];
-  // One canonical order before any port is dropped or cut, so the same
-  // berths in any order keep the same ports: a merge of two lists taken
-  // either way round (planetSummary newerBerths) settles alike on every
-  // install.
-  const sorted: StationBerthRecord[] = [];
+  // One copy per port (copyOrder), then one canonical order before any port
+  // is cut, so the same berths in any order keep the same ports: a merge of
+  // two lists taken either way round (planetSummary newerBerths) settles
+  // alike on every install.
+  const byPort = new Map<string, StationBerthRecord>();
   for (const item of v) {
     const b = cleanBerth(item);
-    if (b) sorted.push(b);
-  }
-  sorted.sort(berthOrder);
-  const valid: StationBerthRecord[] = [];
-  const seen = new Set<string>();
-  for (const b of sorted) {
+    if (!b) continue;
     const key = `${b.roomId}\u0000${b.doorId}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    valid.push(b);
+    const held = byPort.get(key);
+    if (!held || copyOrder(b, held) < 0) byPort.set(key, b);
   }
+  const valid = [...byPort.values()].sort(berthOrder);
   // One slot per gate number first (as cleanGates): ports repeating a number,
   // or with none, only fill what is left, so they cannot crowd a gate out.
   const numbers = new Set<number>();
