@@ -5533,11 +5533,11 @@ export class World {
       // 🛰️ A module bolted into a station by a gangway, or a station's own
       // welcome room standing alone, steers the STATION: its helm opens the
       // station keeping face (small trim stick) and keeps the ship face one
-      // tab away for fuel and the docking computer.
+      // tab away for fuel and the docking computer. Every helm opens through
+      // the station helm, so one opened on the ship face offers station
+      // keeping once its module comes to steer a station.
       const bolted = () => steersStation(currentRoomId(), readAllDoors());
-      const ui = bolted()
-        ? createStationHelmUI({ bolted, station: () => currentStation(), shipFace })
-        : shipFace();
+      const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }

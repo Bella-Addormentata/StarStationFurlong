@@ -13,6 +13,11 @@
  * (stationKeeping.planTrim); everything else on the dashboard is derived
  * from the room's burns and the clock.
  *
+ * Every helm opens through here (world.ts): one in a module that steers no
+ * station opens on the ship face, which offers station keeping within half
+ * a second of the module coming to steer one (a gangway paired, or the room
+ * saved as a station, while the helm is open).
+ *
  * The STATION KEEPING BOX draws the station against its slot: the crosshair
  * is where the slot's orbit puts it, across is along the orbit (behind /
  * ahead) and up is altitude. A lower orbit is a faster one, so the marker
@@ -234,11 +239,13 @@ function drawKeepingBox(
 export interface StationHelmDeps {
   /** Does the module still steer a station — read at every refresh and
    *  every burn, since a peer can take the gangway down while this is open
-   *  (stationKeeping.steersStation over the live door records). */
+   *  (stationKeeping.steersStation over the live door records), and on the
+   *  ship face every TEXT_REFRESH_S, to offer station keeping once it does. */
   bolted: () => boolean;
   /** The station this module belongs to (stations.currentStation). */
   station: () => StationRecord | null;
-  /** The ship helm face, mounted by the FUEL & DOCKING tab. */
+  /** The ship helm face: where a helm that steers no station opens, and
+   *  what the FUEL & DOCKING tab mounts. */
   shipFace: () => DeviceUI;
 }
 
@@ -271,6 +278,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   let face: 'keep' | 'ship' = 'keep';
   let ship: DeviceUI | null = null;
   let back: HTMLButtonElement | null = null;
+  let sinceBack = 0;
   const unsubs: Array<() => void> = [];
 
   // What the dashboard last read (refresh), and what the box draws each frame.
@@ -542,21 +550,41 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     panel = null;
   };
 
+  /** On the ship face, the way back to station keeping: offered while the
+   *  module steers a station, so a helm opened as a ship's offers it once a
+   *  gangway is paired or the room is saved as a station. Never switches
+   *  faces itself: the pilot may be at the ship face's REFUEL or DOCK. */
+  const placeBack = (): void => {
+    sinceBack = 0;
+    if (!host || face !== 'ship') return;
+    const steers = deps.bolted();
+    if (steers && !back) {
+      back = document.createElement('button');
+      back.type = 'button';
+      back.textContent = '◂ STATION KEEPING';
+      back.style.cssText = `position:absolute; top:14px; left:50%; transform:translateX(-50%); pointer-events:auto; padding:7px 14px; border-radius:8px; border:1px solid ${AMBER}; background:rgba(4,8,22,0.94); color:${AMBER}; font-family:'SF Mono','Monaco','Consolas',monospace; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer; box-shadow:0 6px 24px rgba(0,0,0,0.8);`;
+      back.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showKeep();
+      });
+      host.appendChild(back);
+    } else if (!steers && back) {
+      back.remove();
+      back = null;
+    }
+  };
+
+  const mountShip = (h: HTMLElement): void => {
+    face = 'ship';
+    ship = deps.shipFace();
+    ship.mount(h);
+    placeBack();
+  };
+
   const showShip = (): void => {
     if (!host || face === 'ship') return;
     unmountKeep();
-    face = 'ship';
-    ship = deps.shipFace();
-    ship.mount(host);
-    back = document.createElement('button');
-    back.type = 'button';
-    back.textContent = '◂ STATION KEEPING';
-    back.style.cssText = `position:absolute; top:14px; left:50%; transform:translateX(-50%); pointer-events:auto; padding:7px 14px; border-radius:8px; border:1px solid ${AMBER}; background:rgba(4,8,22,0.94); color:${AMBER}; font-family:'SF Mono','Monaco','Consolas',monospace; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer; box-shadow:0 6px 24px rgba(0,0,0,0.8);`;
-    back.addEventListener('click', (e) => {
-      e.stopPropagation();
-      showKeep();
-    });
-    host.appendChild(back);
+    mountShip(host);
   };
 
   const showKeep = (): void => {
@@ -572,8 +600,12 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   return {
     mount(h: HTMLElement): void {
       host = h;
-      face = 'keep';
-      mountKeep(h);
+      if (deps.bolted()) {
+        face = 'keep';
+        mountKeep(h);
+      } else {
+        mountShip(h);
+      }
     },
     unmount(): void {
       if (face === 'ship') {
@@ -592,6 +624,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     update(dt: number): void {
       if (face === 'ship') {
         ship?.update(dt);
+        if ((sinceBack += dt) >= TEXT_REFRESH_S) placeBack();
         return;
       }
       if (!panel) return;

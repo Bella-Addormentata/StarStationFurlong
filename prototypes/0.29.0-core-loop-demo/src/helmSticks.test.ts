@@ -2,19 +2,21 @@
  * 🕹️ The helm's sticks. The console's two (furniture.ts buildHelmSticks)
  * are built for real (buildItemGroup, with a stand-in canvas for its docking
  * screen), their frame handle filed the way World files it and driven a
- * frame at a time the way World drives it. The station helm's on-screen
- * stick (stationHelm.ts) needs a DOM these tests run without, so it is
- * pinned on its source.
+ * frame at a time the way World drives it. The station helm's dashboard
+ * (stationHelm.ts) is opened on a stand-in for just the DOM it touches; how
+ * its on-screen stick takes the focus, and how World opens it, are pinned on
+ * their source.
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
 import * as Y from 'yjs';
-import type { PropAnimHandle } from './devices';
+import type { DeviceUI, PropAnimHandle } from './devices';
 import { buildItemGroup } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
+import { createStationHelmUI } from './stationHelm';
 import { TRIM_FUEL, bindStationKeepingDoc } from './stationKeeping';
 import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, registerStation, setStationRoomSource } from './stations';
 
@@ -179,5 +181,170 @@ describe('the station helm\'s on-screen stick', () => {
     const handler = from.slice(0, from.indexOf('\n    });'));
     expect(handler).toContain('e.preventDefault();');
     expect(handler).toContain('well.focus(');
+  });
+});
+
+/** Just enough of an element for the station helm's dashboard: what it
+ *  builds, reads, writes and wires up. Whatever a selector asks an element
+ *  for is a stand-in of its own. */
+class FakeElement {
+  id = '';
+  type = '';
+  textContent = '';
+  innerHTML = '';
+  disabled = false;
+  style: Record<string, string> = {};
+  dataset: Record<string, string> = {};
+  children: FakeElement[] = [];
+  parent: FakeElement | null = null;
+  private attributes = new Map<string, string>();
+  private listeners = new Map<string, Array<(e: unknown) => void>>();
+  private found = new Map<string, FakeElement>();
+  constructor(readonly tag: string) {}
+  getAttribute(name: string): string | null {
+    return this.attributes.get(name) ?? null;
+  }
+  setAttribute(name: string, value: string): void {
+    this.attributes.set(name, String(value));
+  }
+  addEventListener(type: string, fn: (e: unknown) => void): void {
+    this.listeners.set(type, [...(this.listeners.get(type) ?? []), fn]);
+  }
+  dispatch(type: string, e: unknown): void {
+    for (const fn of this.listeners.get(type) ?? []) fn(e);
+  }
+  appendChild(child: FakeElement): FakeElement {
+    child.remove();
+    child.parent = this;
+    this.children.push(child);
+    return child;
+  }
+  remove(): void {
+    if (!this.parent) return;
+    this.parent.children.splice(this.parent.children.indexOf(this), 1);
+    this.parent = null;
+  }
+  querySelector(sel: string): FakeElement {
+    let el = this.found.get(sel);
+    if (!el) this.found.set(sel, (el = new FakeElement(sel)));
+    return el;
+  }
+  focus(): void {}
+  getBoundingClientRect(): { left: number; top: number; width: number; height: number } {
+    return { left: 0, top: 0, width: 0, height: 0 };
+  }
+  getContext(): null {
+    return null;
+  }
+}
+
+/** Stand-in ship faces: where each is mounted (null once unmounted) and how many frames it was given. */
+function shipFaces(): { built: Array<{ host: unknown; frames: number }>; shipFace: () => DeviceUI } {
+  const built: Array<{ host: unknown; frames: number }> = [];
+  const shipFace = (): DeviceUI => {
+    const face = { host: null as unknown, frames: 0 };
+    built.push(face);
+    return {
+      mount: (h) => { face.host = h; },
+      unmount: () => { face.host = null; },
+      update: () => { face.frames++; },
+    };
+  };
+  return { built, shipFace };
+}
+
+/** The station keeping face on `host`, if it shows. */
+const keepFace = (host: FakeElement): FakeElement | null => host.children.find((c) => c.id === 'device-station-helm-pane') ?? null;
+/** The ship face's way to station keeping on `host`, each one it shows. */
+const waysToKeeping = (host: FakeElement): FakeElement[] =>
+  host.children.filter((c) => c.tag === 'button' && c.textContent.includes('STATION KEEPING'));
+/** A click on the dashboard's tab `name`. */
+const tabClick = (name: string) => ({
+  stopPropagation: () => {},
+  target: { closest: (sel: string) => (sel === '[data-sk-tab]' ? { dataset: { skTab: name } } : null) },
+});
+const click = { stopPropagation: () => {} };
+
+describe('the helm dashboard\'s faces', () => {
+  beforeEach(() => {
+    vi.stubGlobal('document', { createElement: (tag: string) => new FakeElement(tag) });
+  });
+
+  it('a helm whose module steers a station opens on station keeping', () => {
+    const { built, shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => null, shipFace });
+    const host = new FakeElement('host');
+    ui.mount(host as unknown as HTMLElement);
+    expect(keepFace(host)).not.toBeNull();
+    expect(built).toHaveLength(0);
+    ui.unmount();
+    expect(host.children).toHaveLength(0);
+  });
+
+  it('a helm opened on the ship face offers station keeping once its module steers a station, and stays where the pilot is', () => {
+    // Copilot's review of #173: a helm opened as a ship's never offered
+    // station keeping when its module came to steer a station (a gangway
+    // paired, or the room saved as a station) while it was open.
+    let steers = false;
+    let reads = 0;
+    const { built, shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => (reads++, steers), station: () => null, shipFace });
+    const host = new FakeElement('host');
+    ui.mount(host as unknown as HTMLElement);
+    expect(built).toHaveLength(1);
+    expect(built[0].host).toBe(host);
+    expect(keepFace(host)).toBeNull();
+    expect(waysToKeeping(host)).toHaveLength(0);
+    // It asks twice a second, not every frame.
+    reads = 0;
+    for (let i = 0; i < 60; i++) ui.update(1 / 60);
+    expect(built[0].frames).toBe(60);
+    expect(reads).toBeGreaterThanOrEqual(1);
+    expect(reads).toBeLessThanOrEqual(2);
+    expect(waysToKeeping(host)).toHaveLength(0);
+
+    // Steering a station now: the way to station keeping shows within half
+    // a second, once, and the pilot stays on the ship face.
+    steers = true;
+    for (let i = 0; i < 2; i++) ui.update(0.25);
+    expect(waysToKeeping(host)).toHaveLength(1);
+    for (let i = 0; i < 4; i++) ui.update(0.25);
+    expect(waysToKeeping(host)).toHaveLength(1);
+    expect(built).toHaveLength(1);
+    expect(built[0].host).toBe(host);
+    expect(keepFace(host)).toBeNull();
+
+    // Taking it opens station keeping.
+    waysToKeeping(host)[0].dispatch('click', click);
+    expect(built[0].host).toBeNull();
+    expect(waysToKeeping(host)).toHaveLength(0);
+    expect(keepFace(host)).not.toBeNull();
+
+    // FUEL & DOCKING goes back to a ship face, the way back on it at once.
+    keepFace(host)!.dispatch('click', tabClick('ship'));
+    expect(keepFace(host)).toBeNull();
+    expect(built).toHaveLength(2);
+    expect(built[1].host).toBe(host);
+    expect(waysToKeeping(host)).toHaveLength(1);
+
+    // Steering no station again: the way back goes, the ship face stays.
+    steers = false;
+    for (let i = 0; i < 2; i++) ui.update(0.25);
+    expect(waysToKeeping(host)).toHaveLength(0);
+    expect(built[1].host).toBe(host);
+
+    ui.unmount();
+    expect(built[1].host).toBeNull();
+    expect(host.children).toHaveLength(0);
+  });
+
+  it('World opens every helm through the station helm, a ship\'s too', () => {
+    const src = readFileSync(new URL('./world.ts', import.meta.url), 'utf8');
+    const open = 'if (device.kind === "helm") {';
+    expect(src.split(open)).toHaveLength(2);
+    const from = src.slice(src.indexOf(open));
+    const block = from.slice(0, from.indexOf('\n      return;'));
+    expect(block).toContain('const ui = createStationHelmUI(');
+    expect(block).toContain('deviceFocus.beginFocus(this.player, device, ui);');
   });
 });
