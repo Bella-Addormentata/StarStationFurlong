@@ -502,10 +502,16 @@ export function remoteLapsed(itemId: string, now = clock()): boolean {
 export function remoteStatus(itemId: string, now = clock()): RemoteStatus {
   const rec = readRemote(itemId);
   if (!rec.holder) return 'free';
+  const lapsed = remoteLapsed(itemId, now);
   // Mine only on the page that holds it: the same key in another tab reads
-  // "held" (by me, elsewhere), and so does a hand-over not yet claimed.
-  if (rec.holder === identityProvider().pub && rec.holder !== '' && rec.page === pageId) return 'mine';
-  return remoteLapsed(itemId, now) ? 'free' : 'held';
+  // "held" (by me, elsewhere), and so does a hand-over not yet claimed. And
+  // only while the lease is live BY THIS PAGE'S OWN WATCH: a holder tab
+  // that slept past the lapse (a closed lid, a suspended tab) has let the
+  // remote go as far as the room is concerned, and must not wake up
+  // renewing a claim that someone else may already have taken over —
+  // it reads the set as free and picks the remote up again, like anyone.
+  if (rec.holder === identityProvider().pub && rec.holder !== '' && rec.page === pageId) return lapsed ? 'free' : 'mine';
+  return lapsed ? 'free' : 'held';
 }
 
 export function iHoldRemote(itemId: string): boolean {
@@ -534,11 +540,12 @@ export function pickUpRemote(itemId: string, now = clock()): TvAction {
 }
 
 /** Renew my hold (the holder's tick calls this every TV_LEASE_RENEW_MS) —
- *  from the page that holds it; my other tabs have nothing to renew. */
+ *  from the page that holds it, while it still does by its own watch; my
+ *  other tabs have nothing to renew, and a hold that lapsed while this
+ *  page slept is not renewed on waking (remoteStatus). */
 export function renewRemote(itemId: string, now = clock()): void {
   const { pub, name } = identityProvider();
-  const rec = readRemote(itemId);
-  if (!pub || rec.holder !== pub || rec.page !== pageId) return;
+  if (!pub || remoteStatus(itemId, now) !== 'mine') return;
   write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: pageId } satisfies RemoteRecord);
 }
 

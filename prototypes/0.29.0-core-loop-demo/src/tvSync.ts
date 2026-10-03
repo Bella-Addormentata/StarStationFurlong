@@ -157,15 +157,19 @@ export class TvSyncController {
     return this.playback(this.now(), this.lead());
   }
 
-  /** Where the room is, for a transport write from this page (a pause, ±10 s):
-   *  the target a jump is still carrying the player to — the player reads
-   *  where it WAS until the seek lands, and a pause written from that would
-   *  park the room there, footage unplayed — then the record's own position
-   *  for a jump this holder has not followed yet, and the player's clock
-   *  once in step. */
+  /** Where the room is, for a transport write from this page (a pause, ±10 s).
+   *  In order: the record's own position while a transport write stands
+   *  that this holder has not followed yet (the newest word — two +10 s in
+   *  a row before a tick must add up, not both read the target before
+   *  them); then the target a jump is still carrying the player to (the
+   *  player reads where it WAS until the seek lands, and a pause written
+   *  from that would park the room there, footage unplayed); then the
+   *  player's clock, once in step. A viewer's player is only ever where it
+   *  is. */
   positionMs(): number {
+    if (!this.iHold()) return this.deps.player.currentMs();
+    if (this.jump() !== this.appliedJump) return this.current().positionMs;
     if (this.pendingTarget !== null) return this.pendingTarget;
-    if (this.iHold() && this.jump() !== this.appliedJump) return this.current().positionMs;
     return this.deps.player.currentMs();
   }
 

@@ -7,7 +7,7 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindTvDoc, handRemote, iHoldRemote, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
-  setTvIdentity, setTvPageId, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  setTvIdentity, setTvPageId, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
   forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvPlayerCanSeek,
@@ -16,6 +16,14 @@ import {
 
 const TV = 'tv-stand-1';
 let now = 5_000_000;
+/** The room tick as World runs it: every half second, for `ms` — the
+ *  holder's renewals happen along the way, as they do live. */
+const run = (ms: number, ids: readonly string[] = [TV]) => {
+  for (let t = 0; t < ms; t += 500) {
+    now += 500;
+    tickTvRoom(ids, now);
+  }
+};
 
 beforeEach(() => {
   now = 5_000_000;
@@ -57,9 +65,10 @@ describe('tickTvRoom', () => {
   it('flips a scheduled programme to playing at T0 the way the theatre would', () => {
     pickUpRemote(TV);
     tvSchedule(TV, { kind: 'url', url: 'https://example.org/a.mp4' }, now + 60_000);
-    tickTvRoom([TV], now + 30_000);
+    run(30_000);
     expect(readTv(TV).state).toBe('scheduled');
-    now += 60_500;
+    run(29_000); // to T0 − 1 s, the lease renewed along the way
+    now += 1_500; // T0 + 0.5 s
     tickTvRoom([TV], now);
     expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 500 });
   });
@@ -140,12 +149,24 @@ describe('tickTvRoom', () => {
     setTvIdentity(() => ({ pub: 'BBBBviewer', name: 'Viewer' })); // anyone may press the body button
     expect(tvTogglePower(TV)).toBe(false);
     setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
-    now += 60_000;
-    tickTvRoom([TV], now); // off: no beat, the programme untouched
+    run(60_000); // off for a minute, the holder still here: no beat, the programme untouched
     expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: TV_HEARTBEAT_MS });
     tvTogglePower(TV);
     tickTvRoom([TV], now + 500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+  });
+
+  it('a holder tab suspended past the lapse does not renew on waking: the room tick finds no remote of its own', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now);
+    const lease = readRemote(TV).leaseAt;
+    const seq = readTv(TV).seq;
+    now += TV_LEASE_LAPSE_MS + 60_000; // a closed lid: no ticks, no renewals
+    tickTvRoom([TV], now);
+    expect(readRemote(TV).leaseAt).toBe(lease); // the expired claim is not renewed…
+    expect(readTv(TV).seq).toBe(seq); // …and the headless beat stays silent: not this page's clock any more
+    expect(iHoldRemote(TV)).toBe(false);
   });
 
   it('lists the room\'s other keyed players for HAND TO', () => {

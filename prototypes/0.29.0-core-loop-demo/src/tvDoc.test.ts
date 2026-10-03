@@ -115,6 +115,25 @@ describe('the remote as possession', () => {
     expect(readRemote(TV).holder).toBe(BOB);
   });
 
+  it('a holder that slept past the lapse has let go by its own watch: not mine on waking, not renewed, picked up again like anyone', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    const lease = readRemote(TV).leaseAt;
+    now += TV_LEASE_LAPSE_MS - 1;
+    expect(remoteStatus(TV)).toBe('mine');
+    now += 1; // the tab slept through its renewals
+    expect(remoteStatus(TV)).toBe('free');
+    expect(iHoldRemote(TV)).toBe(false);
+    renewRemote(TV); // waking up renewing would race whoever took over meanwhile
+    expect(readRemote(TV).leaseAt).toBe(lease);
+    expect(tvSeek(TV, 5_000)).toEqual({ ok: false, error: 'Pick up the remote first.' });
+    // Free to everyone, this page included: picked up again, a fresh lease.
+    expect(mayPickUpRemote(TV)).toBe(true);
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(readRemote(TV).leaseAt).toBe(now);
+    expect(remoteStatus(TV)).toBe('mine');
+  });
+
   it('a hacked remote record is read as held by nobody in particular, never trusted for names', () => {
     doc.getMap('tv').set(remoteKey(TV), { holder: 42, name: { x: 1 }, leaseAt: 'soon', by: [] });
     expect(readRemote(TV)).toEqual({ holder: '', name: '', leaseAt: 0, by: '', page: '' });
@@ -239,7 +258,9 @@ describe('the programme', () => {
   it('past T0 the HOLDER reads playing and flips the record with its first heartbeat; a viewer starts on that write', () => {
     pickUpRemote(TV);
     tvSchedule(TV, FILM, now + 10_000);
-    tick(12_500);
+    tick(7_000);
+    renewRemote(TV); // the holder's tick keeps the lease live through the countdown
+    tick(5_500);
     expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 }); // Alice holds
     expect(readTv(TV).state).toBe('scheduled'); // the record itself has not flipped yet
     renewRemote(TV); // the holder's lease, as every page keeps seeing it
