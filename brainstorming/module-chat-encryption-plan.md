@@ -96,8 +96,12 @@ That sentence is the real cost of this feature, and §6 takes it seriously.
 ### 1.5 One unrelated gap worth recording while we are here
 
 The chat read path does `const items: any[] = sharedChat.toArray()` (`src/main.ts:2010`) with no
-shape guard — the only peer-facing doc read in the codebase without the `isXRecord` convention that
-`doorPolicy`, `roomRoles`, `doorLayoutDoc`, `airHockeyTheme` and the rest all follow. Rendering is
+shape guard. Two other reads also take the array raw — `readMessages`
+(`directMessages.ts:175`) and the introductions ingest (`main.ts:8152`) — but both then filter:
+the first on `verifyMessage`, a *cryptographic* guard stronger than a shape check, the second on an
+`isTrustedIntroducer` predicate. Chat applies **neither** a shape guard nor a trust filter, which
+makes it the weakest peer-facing read in the codebase rather than merely an inconsistent one —
+`doorPolicy`, `roomRoles`, `doorLayoutDoc`, `furnitureDoc` and the rest all define an `isXRecord`. Rendering is
 via `textContent`/`createTextNode` (`:2026`, `:2028`), so this is **not** an XSS: it is a robustness and
 consistency gap, and it is the natural place a `isChatRecord` guard would go when chat records gain
 a signature. Worth its own small issue regardless of whether encryption ships.
@@ -240,11 +244,16 @@ reason the work is tractable.
 | `roomKeyB64` (32 random bytes, per room) | `src/main.ts:618-630` | **the epoch-key seed** — but it must gain an epoch counter and rotate on membership change, which it never does today |
 | Signed contact cards + the friends tier | `src/contacts.ts:145-190` | **the out-of-band channel** for pair setup, and the trust anchor deciding who may be invited |
 | DM pair-doc (deterministic from sorted pubkeys, authenticated) | `src/directMessages.ts:71-103` | **the pairwise channel Sender Keys distributes over.** Seal it first (it is two parties, no group machinery) and the group case inherits a working transport |
+| Co-present settle requests: nonce-bound signed ask → verified answer, with a TTL | `src/copresent.ts:56-57`, `:80-93`, `SETTLE_REQ_TTL_MS` `:99` | **the precedent for an "ask for the current epoch key" exchange.** Already binds `roomId‖nonce‖playerId‖pub`, already re-verifies the name cert, already expires. Its own comment states the posture the rest of this design needs: *"the owner is taken from the SIGNED request, not from any attacker-writable players lookup"* (`:78-79`) |
 | The ysync sign/verify seam | `src/network/YjsSync.ts:302-317`, `signBytes.ts:19-31` | **where a ciphertext envelope rides.** Already domain-separated by `roomId`, so a sealed payload cannot be replayed into another module |
 | `chia_lane::seal/open`, XChaCha20-Poly1305 | node-side, per `keyed-identity-contacts-plan.md:29`, `:82` | **the AEAD**, already written and tested; match it in the browser rather than picking a different cipher |
 
 **The gap list is correspondingly short:** no X25519 key; no key-epoch record; no rekey on membership
-change; no enforcement of anything, anywhere (`roomOwner.ts:26-32`).
+change; and no enforcement on the paths that matter here — `roomOwner.ts:26-32` holds for *doc
+writes*, which remain unauthorized. The exception is worth naming, because it is the model to copy:
+`verifiedRequestOwner` (`copresent.ts:80-93`) **is** a real cryptographic gate, refusing to act on a
+request whose signature does not bind this room and nonce. The project already knows how to do this;
+it simply has not done it for chat.
 
 ---
 
