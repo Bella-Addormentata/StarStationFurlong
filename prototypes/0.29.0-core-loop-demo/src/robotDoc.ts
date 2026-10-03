@@ -14,6 +14,8 @@
  */
 
 import * as Y from 'yjs';
+import type { DisassemblyJob, DisassemblyTarget } from './disassembly';
+import { MAX_CREW, isDisassemblyJob, settleJob } from './disassembly';
 
 /** 🚀 'pilot' (robot pilot routes, design §2a): the Ship pilot routine. It holds
  *  no route: it makes the dock's robot ELIGIBLE to be named the ship's robot
@@ -23,7 +25,7 @@ import * as Y from 'yjs';
  *  reads a config with an unknown routine as unprogrammed (isRobotConfig
  *  rejects it), so its copy of the robot serves drinks: it degrades, and
  *  nothing it reads is corrupted. */
-export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom' | 'coach' | 'dance' | 'pilot';
+export type RobotRoutine = 'serve' | 'croupier' | 'idle' | 'custom' | 'coach' | 'dance' | 'pilot' | 'disassemble';
 
 /** 🤖 #77C s4: one bounded step of an owner-authored routine (a chip list, NOT
  *  a DSL). The robot loops the list: walk to a spot, say a line, or pause. */
@@ -43,9 +45,13 @@ export interface RobotConfig {
    *  stands on it, OFF, overriding the routine. START (parked false/absent)
    *  resumes the routine. Independent of `routine` so it survives a routine edit. */
   parked?: boolean;
+  /** 🔧 'disassemble' (#192): the room id of the module this robot takes
+   *  apart — its job is `job:<target>` in the same map (disassembly.ts).
+   *  Absent: no module picked yet, the robot waits on its dock. */
+  target?: string;
 }
 
-export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom', 'coach', 'dance', 'pilot'];
+export const ROBOT_ROUTINES: readonly RobotRoutine[] = ['serve', 'croupier', 'idle', 'custom', 'coach', 'dance', 'pilot', 'disassemble'];
 
 /** Human labels for the routine dropdown. */
 export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
@@ -56,6 +62,7 @@ export const ROUTINE_LABELS: Record<RobotRoutine, string> = {
   coach: '🏋️ Fitness coach',
   dance: '🎉 Party dancer',
   pilot: '🚀 Ship pilot',
+  disassemble: '🔧 Disassemble module',
 };
 
 let boundDoc: Y.Doc | null = null;
@@ -121,6 +128,7 @@ function isRobotConfig(value: unknown): value is RobotConfig {
     if (!c.script.every(isRobotStep)) return false;
   }
   if (c.parked !== undefined && typeof c.parked !== 'boolean') return false;
+  if (c.target !== undefined && (typeof c.target !== 'string' || c.target.length === 0 || c.target.length > 128)) return false;
   return true;
 }
 
@@ -130,19 +138,111 @@ export function readRobotConfig(dockId: string): RobotConfig | null {
   return isRobotConfig(v) ? v : null;
 }
 
-/** Owner-only in practice (the programming UI gates on canEditRoom). */
-export function writeRobotConfig(dockId: string, config: RobotConfig): void {
+/** Owner-only in practice (the programming UI gates on canEditRoom).
+ *  🔧 Every config write also keeps the disassembly crews true: a robot
+ *  joins or leaves a job's crew as its routine, target or STOP/START says,
+ *  with the job's progress settled at `now` first (disassembly.ts). */
+export function writeRobotConfig(dockId: string, config: RobotConfig, now = Date.now()): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
-    map.set(`cfg:${dockId}`, config);
+    setConfigIn(map, dockId, config, now);
   });
 }
 
-/** Drop a dock's config (its dock was removed). */
-export function clearRobotConfig(dockId: string): void {
+/** Drop a dock's config (its dock was removed): its robot leaves any crew. */
+export function clearRobotConfig(dockId: string, now = Date.now()): void {
   const map = ensureMap();
   boundDoc!.transact(() => {
-    map.delete(`cfg:${dockId}`);
+    setConfigIn(map, dockId, null, now);
+  });
+}
+
+// ── 🔧 Disassembly jobs (#192) ───────────────────────────────────────────────
+
+/** Most job records read from one room's map (a peer's junk must not make
+ *  every read walk an unbounded list). */
+const MAX_JOBS = 64;
+
+const jobKey = (roomId: string) => `job:${roomId}`;
+
+/** Write (or drop, null) a dock's config and bring every job's crew in line
+ *  with it, inside the caller's transaction. A finished job no robot is set
+ *  to any more is dropped; an open one stays, its progress kept for later. */
+function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | null, now: number): void {
+  const wantTarget = config?.routine === 'disassemble' && config.parked !== true ? config.target : undefined;
+  for (const job of jobsIn(map)) {
+    if (job.finishedAt !== undefined) continue;
+    const want = job.roomId === wantTarget;
+    if (want === job.crew.includes(dockId)) continue;
+    // A full crew takes no one more: the job record would no longer read.
+    if (want && job.crew.length >= MAX_CREW) continue;
+    const settled = settleJob(job, now);
+    const crew = want ? [...settled.crew, dockId] : settled.crew.filter((d) => d !== dockId);
+    map.set(jobKey(job.roomId), { ...settled, crew });
+  }
+  if (config) map.set(`cfg:${dockId}`, config);
+  else map.delete(`cfg:${dockId}`);
+  const targeted = new Set<string>();
+  for (const [key, value] of map.entries()) {
+    if (key.startsWith('cfg:') && isRobotConfig(value) && value.routine === 'disassemble' && value.target) targeted.add(value.target);
+  }
+  for (const job of jobsIn(map)) {
+    if (job.finishedAt !== undefined && !targeted.has(job.roomId)) map.delete(jobKey(job.roomId));
+  }
+}
+
+function jobsIn(map: Y.Map<unknown>): DisassemblyJob[] {
+  const out: DisassemblyJob[] = [];
+  for (const [key, value] of map.entries()) {
+    if (out.length >= MAX_JOBS) break;
+    if (!key.startsWith('job:') || !isDisassemblyJob(value) || jobKey(value.roomId) !== key) continue;
+    out.push(value);
+  }
+  return out;
+}
+
+/** Every disassembly job in this room, open or finished. */
+export function readDisassemblyJobs(): DisassemblyJob[] {
+  return jobsIn(ensureMap());
+}
+
+/** The job on one module, or null. */
+export function readDisassemblyJob(roomId: string): DisassemblyJob | null {
+  const v = ensureMap().get(jobKey(roomId));
+  return isDisassemblyJob(v) && v.roomId === roomId ? v : null;
+}
+
+/** 🔧 Set a dock's robot to take `target` apart: the job is opened if it
+ *  has none (or only a finished one), and the robot joins its crew unless it
+ *  is parked. Its script and STOP/START state are kept. */
+export function assignDisassembly(dockId: string, target: DisassemblyTarget, now = Date.now()): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    const open = readDisassemblyJob(target.roomId);
+    if (!open || open.finishedAt !== undefined) {
+      const job: DisassemblyJob = { ...target, startedAt: now, doneMs: 0, asOf: now, crew: [] };
+      map.set(jobKey(target.roomId), job);
+    }
+    const c = readRobotConfig(dockId);
+    setConfigIn(map, dockId, {
+      routine: 'disassemble',
+      target: target.roomId,
+      ...(c?.script?.length ? { script: c.script } : {}),
+      ...(c?.parked ? { parked: true } : {}),
+    }, now);
+  });
+}
+
+/** 🔧 End a job: its labor is done at `at` (the due time, the same on every
+ *  client) and the module either came off the station or had already been
+ *  disconnected. Its crew goes back to their docks. */
+export function finishDisassemblyJob(roomId: string, at: number, outcome: 'removed' | 'detached'): void {
+  const map = ensureMap();
+  boundDoc!.transact(() => {
+    const job = readDisassemblyJob(roomId);
+    if (!job || job.finishedAt !== undefined) return;
+    const done = settleJob(job, at);
+    map.set(jobKey(roomId), { ...done, crew: [], finishedAt: at, outcome });
   });
 }
 
@@ -154,5 +254,6 @@ if (typeof window !== 'undefined') {
     readRobotConfig,
     writeRobotConfig,
     clearRobotConfig,
+    readDisassemblyJobs,
   };
 }

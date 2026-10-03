@@ -220,7 +220,10 @@ import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
   ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
+  assignDisassembly, readDisassemblyJobs,
 } from './robotDoc';
+// 🔧 #192: the Disassemble job's labor and progress.
+import { jobFraction, jobStatusText, type DisassemblyCandidate } from './disassembly';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
@@ -1107,6 +1110,8 @@ export interface MapTableDeps {
   openDoorPanel?: (doorId: string) => void;
   /** 🗺️ The local player's id, so a module's owner can read "You". */
   playerId?: () => string;
+  /** 🔧 The modules this room's robots could take apart (#192). */
+  disassemblyCandidates?: () => DisassemblyCandidate[];
 }
 
 /**
@@ -1205,6 +1210,10 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
           onBack: () => stationPlanView?.hide(),
+          disassembly: () => ({
+            jobs: readDisassemblyJobs(),
+            candidates: stationPlanDeps.disassemblyCandidates?.() ?? [],
+          }),
         });
       }
       stationPlanView.mount(body);
@@ -1233,8 +1242,17 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       const offMove = subscribeStationMove(refresh);
       // A layout learned while the plan is open (a peer's harvest) redraws it.
       const offAtlas = subscribeSharedAtlas(refreshPlan);
+      // 🔧 A robot set to (or taken off) a module, and the job's own clock.
+      const offRobot = subscribeRobot(refreshPlan);
+      const jobTick = window.setInterval(() => {
+        if (readDisassemblyJobs().some((j) => j.finishedAt === undefined)) refreshPlan();
+      }, DISASSEMBLY_REDRAW_MS);
       const tick = window.setInterval(refresh, 60_000);
-      stopLive = () => { offSummary(); offMove(); offAtlas(); window.clearInterval(tick); stopLive = null; };
+      stopLive = () => {
+        offSummary(); offMove(); offAtlas(); offRobot();
+        window.clearInterval(tick); window.clearInterval(jobTick);
+        stopLive = null;
+      };
     },
 
     unmount(): void {
@@ -4143,7 +4161,12 @@ export interface RobotDockUIDeps {
   itemId: string;
   /** Owner gate — only the room owner may program the robot. */
   canEdit: () => boolean;
+  /** 🔧 The modules this room's robots could take apart (#192). */
+  disassemblyCandidates?: () => DisassemblyCandidate[];
 }
+
+/** 🔧 How often an open Disassemble console redraws its progress. */
+const DISASSEMBLY_REDRAW_MS = 5_000;
 
 /** HTML-attribute escape for owner-authored 'say' text (rendered in the editor
  *  on every client's owner view — never trust the value even from a peer). */
@@ -4167,6 +4190,95 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
    *  (the ship map re-renders the console only when that flips, so a script
    *  edit in progress is not redrawn under the owner's cursor). */
   let drawnCaptain = false;
+  /** 🔧 Redraws an open Disassemble console's job as its clock runs. */
+  let redraw: ReturnType<typeof setInterval> | null = null;
+  /** 🔧 What the Disassemble section last drew, so the clock's redraw
+   *  replaces only a part that changed (a click in progress survives it). */
+  let drawnDis = { picks: '', status: '' };
+
+  /** 🔧 The Disassemble routine's section: which joined module to take
+   *  apart (each with its labor hours, or what stops it), and how the job on
+   *  this robot's module stands. Names are peer-written: escaped. */
+  const disassemblyParts = (target: string | undefined, parked: boolean, owner: boolean): { picks: string; status: string } => {
+    const now = Date.now();
+    const jobs = readDisassemblyJobs();
+    const candidates = deps.disassemblyCandidates?.() ?? [];
+    const pick = (c: DisassemblyCandidate): string => {
+      const on = c.roomId === target;
+      const usable = owner && !on && c.blocked === null;
+      const open = jobs.find((j) => j.roomId === c.roomId && j.finishedAt === undefined);
+      const done = open ? ` · ${Math.floor(jobFraction(open, now) * 100)}% done` : '';
+      return `<button data-dis-target="${escAttr(c.roomId)}" ${usable ? '' : 'disabled'} style="
+        display:flex; justify-content:space-between; align-items:center; gap:8px;
+        padding:8px 12px; text-align:left;
+        background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
+        border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
+        border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
+        font-family:inherit; font-size:10.5px; font-weight:800;
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !owner ? 1 : 0.5};
+      "><span>${escAttr(c.name)} · ${c.laborHours} labor h${done}</span><span>${on ? '● ON' : ''}</span></button>${
+        c.blocked ? `<div style="font-size:9px; color:${CH_DIM}; margin:-4px 0 0 12px;">⚠ Can't: ${escAttr(c.blocked)}.</div>` : ''}`;
+    };
+    const job = target ? jobs.find((j) => j.roomId === target) ?? null : null;
+    let status: string;
+    if (job) {
+      const pct = Math.floor(jobFraction(job, now) * 100);
+      const blocked = candidates.find((c) => c.roomId === job.roomId)?.blocked ?? null;
+      status = `<div style="height:6px; border-radius:3px; background:rgba(212,168,75,0.15); overflow:hidden;">
+          <div style="height:100%; width:${pct}%; background:#2fe6a0;"></div></div>
+        <div style="font-size:9.5px; line-height:1.45; color:#2fe6a0;">🔧 ${escAttr(job.name)}: ${escAttr(jobStatusText(job, now, blocked))}</div>${
+        parked && job.finishedAt === undefined ? `<div style="font-size:9.5px; color:#ff8a50;">⏸ This robot is parked: ▶ START puts it back on the job.</div>` : ''}`;
+    } else {
+      status = `<div style="font-size:9.5px; line-height:1.45; color:#2fe6a0;">🔧 ${
+        candidates.length === 0
+          ? 'No module is joined to this room. A robot takes apart a module joined to the room its dock is in.'
+          : 'Pick the module to take apart. The robot works at the door to it, more robots finish sooner, and when the labor hours are done the module comes off the station and leaves every map.'}</div>`;
+    }
+    return { picks: candidates.map(pick).join(''), status };
+  };
+
+  /** 🔧 The section as render() draws it. */
+  const disassemblyBlock = (target: string | undefined, parked: boolean, owner: boolean): string => {
+    drawnDis = disassemblyParts(target, parked, owner);
+    return `<div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">MODULE TO TAKE APART</div>
+      <div data-dis-picks style="display:flex; flex-direction:column; gap:6px;">${drawnDis.picks}</div>
+      <div data-dis-status style="display:flex; flex-direction:column; gap:6px;">${drawnDis.status}</div>`;
+  };
+
+  /** 🔧 Set this robot to take a joined module apart (re-checked at the click). */
+  const wireDisassemblyPicks = (): void => {
+    if (!panel || !deps.canEdit()) return;
+    panel.querySelectorAll<HTMLButtonElement>('[data-dis-target]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const c = (deps.disassemblyCandidates?.() ?? []).find((x) => x.roomId === b.dataset.disTarget);
+        if (!c || c.blocked !== null) {
+          render();
+          return;
+        }
+        assignDisassembly(deps.itemId, {
+          roomId: c.roomId, name: c.name, doorId: c.doorId, laborHours: c.laborHours,
+        });
+      });
+    });
+  };
+
+  /** 🔧 The job's clock moved: redraw the parts of the section it changed. */
+  const redrawDisassembly = (): void => {
+    const cfg = readRobotConfig(deps.itemId);
+    const picksEl = panel?.querySelector<HTMLElement>('[data-dis-picks]');
+    const statusEl = panel?.querySelector<HTMLElement>('[data-dis-status]');
+    if (cfg?.routine !== 'disassemble' || !picksEl || !statusEl) return;
+    const next = disassemblyParts(cfg.target, cfg.parked === true, deps.canEdit());
+    if (next.picks !== drawnDis.picks) {
+      picksEl.innerHTML = next.picks;
+      drawnDis.picks = next.picks;
+      wireDisassemblyPicks();
+    }
+    if (next.status !== drawnDis.status) {
+      statusEl.innerHTML = next.status;
+      drawnDis.status = next.status;
+    }
+  };
 
   const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
     writeRobotConfig(deps.itemId, { routine, script });
@@ -4280,6 +4392,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         ${routines.map(routineBtn).join('')}
       </div>
       ${pilotBlock}
+      ${current === 'disassemble' ? disassemblyBlock(cfg?.target, parked, owner) : ''}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
       ${voiceBtn}
       ${editor}
@@ -4300,15 +4413,19 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       render();
     });
     if (!owner) return;
-    // 🤖 STOP/START: toggle parked, preserving routine + script.
+    // 🤖 STOP/START: toggle parked, preserving routine + script (and the
+    // 🔧 module a Disassemble robot is on: parked, it leaves the crew, and
+    // START puts it back).
     panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
       const c = readRobotConfig(deps.itemId);
       writeRobotConfig(deps.itemId, {
         routine: c?.routine ?? 'serve',
         ...(c?.script?.length ? { script: c.script } : {}),
+        ...(c?.target ? { target: c.target } : {}),
         parked: !(c?.parked === true),
       });
     });
+    wireDisassemblyPicks();
     panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
       b.addEventListener('click', () => {
         // Keep any authored script AND the parked state when switching routines.
@@ -4386,11 +4503,15 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         if ((routeCaptainDockId(readShipRoute()) === deps.itemId) !== drawnCaptain) render();
       });
       unsubscribe = () => { offRobot(); offShip(); };
+      // 🔧 The job's clock runs with no doc write: redraw its progress.
+      redraw = setInterval(redrawDisassembly, DISASSEMBLY_REDRAW_MS);
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      if (redraw) clearInterval(redraw);
+      redraw = null;
       flash = null;
       panel?.remove();
       panel = null;

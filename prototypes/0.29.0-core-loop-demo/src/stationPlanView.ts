@@ -12,7 +12,9 @@
  * Editing reuses the door panels rather than copying them: in the room you
  * stand in, each door has an OPEN DOOR PANEL button, which steps back from
  * the table and opens that door's own panel (provision a new module, fit or
- * remove a vestibule, undock).
+ * remove a vestibule, undock). 🔧 Taking a module apart is a robot job set
+ * at a charging dock (disassembly.ts): the plan shows each job's progress,
+ * and a module joined to your room says what it would take.
  *
  * All text from the atlas and the summaries is peer-written: it reaches the
  * page through textContent only.
@@ -25,6 +27,8 @@ import type { PlanModule, StationPlan, VisitingShip } from './stationPlan';
 import { moduleCorners, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import { TILE_SIZE } from './floorPlanDoc';
 import { legacyOwnerMarker } from './roomOwner';
+import type { DisassemblyCandidate, DisassemblyJob } from './disassembly';
+import { jobFraction, jobStatusText } from './disassembly';
 
 export interface StationPlanDeps {
   atlas: () => Record<string, AtlasEntry>;
@@ -42,6 +46,9 @@ export interface StationPlanDeps {
   openDoorPanel: (doorId: string) => void;
   /** Leave the plan for the solar plot. */
   onBack: () => void;
+  /** 🔧 The room you stand in: its disassembly jobs, and the modules joined
+   *  to it that its robots could take apart. */
+  disassembly?: () => { jobs: DisassemblyJob[]; candidates: DisassemblyCandidate[] };
 }
 
 const GOLD = '#d4a84b';
@@ -117,6 +124,9 @@ export class StationPlanView {
   private station: StationRecord | null = null;
   private plan: StationPlan | null = null;
   private visiting: VisitingShip[] = [];
+  /** 🔧 Open jobs by module, and what this room's robots could take apart. */
+  private jobs = new Map<string, DisassemblyJob>();
+  private candidates: DisassemblyCandidate[] = [];
   private selected: string | null = null;
   /** Plan → canvas: scale and the canvas point of the plan origin. */
   private view = { scale: 1, ox: 0, oy: 0 };
@@ -216,6 +226,9 @@ export class StationPlanView {
     const here = this.deps.currentRoomId();
     this.plan = stationPlan(this.deps.atlas(), station.welcomeRoomId, here);
     this.visiting = visitingShips(this.plan, this.deps.ships(), station.welcomeRoomId);
+    const dis = this.deps.disassembly?.() ?? { jobs: [], candidates: [] };
+    this.jobs = new Map(dis.jobs.filter((j) => j.finishedAt === undefined).map((j) => [j.roomId, j]));
+    this.candidates = dis.candidates;
     if (this.selected && !this.findModule(this.selected)) this.selected = null;
     this.render();
   }
@@ -368,6 +381,23 @@ export class StationPlanView {
       ctx.setLineDash([]);
 
       const c = toPx(m.x, m.z);
+      // 🔧 Being taken apart: hatched, with how far the robots have got.
+      const job = isShip ? undefined : this.jobs.get(m.roomId);
+      if (job) {
+        ctx.save();
+        ctx.beginPath();
+        corners.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+        ctx.closePath();
+        ctx.clip();
+        ctx.strokeStyle = 'rgba(255,138,80,0.22)';
+        ctx.lineWidth = 2;
+        const xs = corners.map((p) => p.x), ys = corners.map((p) => p.y);
+        const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...ys), y1 = Math.max(...ys);
+        for (let x = x0 - (y1 - y0); x < x1; x += 10) {
+          ctx.beginPath(); ctx.moveTo(x, y1); ctx.lineTo(x + (y1 - y0), y0); ctx.stroke();
+        }
+        ctx.restore();
+      }
       ctx.textAlign = 'center';
       ctx.fillStyle = selected ? GOLD_BRIGHT : isShip ? SHIP : m.here ? CYAN : GOLD;
       ctx.font = `bold ${Math.max(9, Math.min(13, scale * 1.6))}px monospace`;
@@ -375,6 +405,11 @@ export class StationPlanView {
       if (m.here) {
         ctx.font = '9px monospace';
         ctx.fillText('YOU ARE HERE', c.x, c.y + 18);
+      }
+      if (job) {
+        ctx.font = 'bold 10px monospace';
+        ctx.fillStyle = '#ff8a50';
+        ctx.fillText(`🔧 ${Math.floor(jobFraction(job, Date.now()) * 100)}%`, c.x, c.y + (m.here ? 32 : 18));
       }
     }
     for (const j of joins) {
@@ -432,6 +467,7 @@ export class StationPlanView {
       return;
     }
 
+    this.renderDisassembly(card, m);
     const links = m.links.filter((l) => !l.berth);
     card.append(heading('Connections'));
     if (links.length === 0) card.append(row('None known', DIM));
@@ -453,6 +489,23 @@ export class StationPlanView {
       return;
     }
     this.renderDoorButtons(card, m);
+  }
+
+  /** 🔧 A module being taken apart says how far along; one joined to your
+   *  room says what it would take. */
+  private renderDisassembly(card: HTMLElement, m: PlanModule): void {
+    const job = this.jobs.get(m.roomId);
+    const candidate = this.candidates.find((c) => c.roomId === m.roomId);
+    if (job) {
+      card.append(heading('Being taken apart'), row(jobStatusText(job, Date.now(), candidate?.blocked ?? null), '#ff8a50'));
+    } else if (candidate) {
+      card.append(
+        heading('Take apart'),
+        candidate.blocked
+          ? row(`${candidate.laborHours} labor hours, but not now: ${candidate.blocked}.`, DIM)
+          : row(`${candidate.laborHours} labor hours. Set a robot to it at a charging dock in your room: 🔧 Disassemble module.`, DIM),
+      );
+    }
   }
 
   /** ✏️ OPEN DOOR PANEL for each door of the room you stand in. */
@@ -481,7 +534,8 @@ export class StationPlanView {
     for (const m of all) {
       const selected = m.roomId === this.selected;
       const btn = el('button', `margin-top:4px; width:100%; text-align:left; border-radius:6px; border:1px solid ${selected ? GOLD_BRIGHT : 'rgba(212,168,75,0.25)'}; background:rgba(212,168,75,${selected ? '0.16' : '0.05'}); color:${m.kind === 'ship' ? SHIP : m.here ? CYAN : GOLD}; padding:5px 8px; cursor:pointer; font-size:10px; font-family:inherit;`,
-        `${m.kind === 'ship' ? '🚀' : '▣'} ${m.name}${m.here ? ' (you are here)' : ''}`);
+        `${m.kind === 'ship' ? '🚀' : '▣'} ${m.name}${m.here ? ' (you are here)' : ''}${
+          this.jobs.has(m.roomId) ? ` · being taken apart, ${Math.floor(jobFraction(this.jobs.get(m.roomId)!, Date.now()) * 100)}%` : ''}`);
       btn.setAttribute('aria-pressed', selected ? 'true' : 'false');
       btn.dataset.roomId = m.roomId;
       btn.addEventListener('click', () => {

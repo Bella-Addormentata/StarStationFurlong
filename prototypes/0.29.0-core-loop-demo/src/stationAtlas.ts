@@ -96,6 +96,13 @@ export interface AtlasEntry {
    *  null: known to have no verifiable owner (none set, or the legacy
    *  marker); absent: not known. */
   owner?: AtlasOwner | null;
+  /** 🔧 When the module was taken apart (#192, disassembly.ts): it is off
+   *  the station and out of every map. The entry stays, doorless, as a
+   *  tombstone so older gossip about the module can't bring it back; the
+   *  maps never see it (readAtlas leaves it out, with every door still
+   *  naming it). A harvest from inside the room rebuilds the entry without
+   *  it: someone standing in the module is first-hand proof it is there. */
+  dismantledAt?: number;
   /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
    *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
    *  ranking that decides what the player KEEPS or SEES must not read it:
@@ -193,7 +200,38 @@ export function roomIdFromSeed(seed: string): string {
   return m ? decodeURIComponent(m[1]) : '';
 }
 
+/**
+ * The atlas as every map sees it: rooms taken apart (dismantledAt) left out,
+ * and with them every door record that still names one — a neighbour's
+ * stale record, or gossip from before the job ended.
+ */
 export function readAtlas(): Record<string, AtlasEntry> {
+  return visibleAtlas(readStoredAtlas());
+}
+
+/** 🔧 `atlas` without the rooms taken apart or the doors naming them. The
+ *  same object back when there are none. */
+export function visibleAtlas(atlas: Record<string, AtlasEntry>): Record<string, AtlasEntry> {
+  const gone = new Set<string>();
+  for (const e of Object.values(atlas)) if (e?.dismantledAt !== undefined) gone.add(e.roomId);
+  if (gone.size === 0) return atlas;
+  const out: Record<string, AtlasEntry> = {};
+  for (const [rid, e] of Object.entries(atlas)) {
+    if (gone.has(rid)) continue;
+    const doors = Object.entries(e?.doors ?? {});
+    if (!doors.some(([, d]) => d && gone.has(d.targetRoomId))) {
+      out[rid] = e;
+      continue;
+    }
+    const kept: Record<string, AtlasDoor> = {};
+    for (const [id, d] of doors) if (!d || !gone.has(d.targetRoomId)) kept[id] = d;
+    out[rid] = { ...e, doors: kept };
+  }
+  return out;
+}
+
+/** The stored atlas, tombstones included: what merges and gossip work on. */
+function readStoredAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return {};
@@ -331,7 +369,7 @@ export function harvestIntoAtlas(entry: {
   owner?: AtlasOwner | null;
 }): void {
   if (!entry.roomId) return;
-  const atlas = readAtlas();
+  const atlas = readStoredAtlas();
   // Before this entry is replaced: an atlas saved before berths were written
   // down may hold a berth only this entry's old doors imply.
   markInferredBerths(atlas);
@@ -397,6 +435,35 @@ export function harvestIntoAtlas(entry: {
 }
 
 /**
+ * 🔧 A module was taken apart (#192, disassembly.ts): its entry becomes a
+ * doorless tombstone stamped now (first-hand: this client ended the job),
+ * every map stops showing it (readAtlas), and the tombstone is published to
+ * the bound room doc's shared atlas so the station's other visitors drop it
+ * too. Its name and size are kept for the record.
+ */
+export function dismantleInAtlas(roomId: string, at: number): void {
+  if (!roomId) return;
+  const atlas = readStoredAtlas();
+  const prior = atlas[roomId];
+  const now = Date.now();
+  // Newer than any copy the doc holds, so the push below publishes it (and
+  // within the bound every reader enforces).
+  const existing = sharedAlive() ? sharedMap!.get(roomId) : undefined;
+  const docStamp = isSharedAtlasEntry(existing) ? existing.updatedAt + 1 : 0;
+  atlas[roomId] = {
+    roomId,
+    name: prior?.name || 'Module',
+    ...(prior?.dims ? { dims: prior.dims } : {}),
+    doors: {},
+    dismantledAt: at,
+    lastSeen: Math.min(Math.max(now, (prior?.lastSeen ?? 0) + 1, docStamp), now + MAX_GOSSIP_SKEW_MS),
+    localSeenAt: now,
+  };
+  writeAtlas(atlas);
+  pushAtlasToDoc();
+}
+
+/**
  * Record a reach-this-room seed learned elsewhere (ledger mints, passes).
  *
  * ⚠️ NO PRODUCTION CALLERS as of this commit — it predates #144 and the seed
@@ -408,7 +475,7 @@ export function harvestIntoAtlas(entry: {
  */
 export function noteRoomSeed(roomId: string, name: string, seed: string): void {
   if (!roomId || !seed) return;
-  const atlas = readAtlas();
+  const atlas = readStoredAtlas();
   const prior = atlas[roomId];
   atlas[roomId] = {
     roomId,
@@ -420,6 +487,8 @@ export function noteRoomSeed(roomId: string, name: string, seed: string): void {
     // about a room we already knew — so keep the prior recency when there is
     // one and only stamp on first learn.
     localSeenAt: prior?.localSeenAt ?? Date.now(),
+    // 🔧 …nor that a module taken apart is back.
+    ...(prior?.dismantledAt !== undefined ? { dismantledAt: prior.dismantledAt } : {}),
   };
   writeAtlas(atlas);
 }
@@ -464,12 +533,14 @@ export interface BundledAtlasEntry {
  * Returns the number of entries written.
  */
 export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
-  const atlas = readAtlas();
+  const atlas = readStoredAtlas();
   let written = 0;
   for (const b of bundle) {
     if (!b.roomId) continue;
     const prior = atlas[b.roomId];
-    if (prior && (prior.localSeenAt !== undefined || Object.keys(prior.doors).length > 0)) continue;
+    // 🔧 …and a module known to be taken apart stays gone.
+    if (prior && (prior.localSeenAt !== undefined || Object.keys(prior.doors).length > 0
+      || prior.dismantledAt !== undefined)) continue;
     const doors: Record<string, AtlasDoor> = {};
     let kept = 0;
     for (const [d, door] of Object.entries(b.doors)) {
@@ -689,12 +760,30 @@ export function withSharedAtlasOf(
 ): Record<string, AtlasEntry> {
   const out: Record<string, AtlasEntry> = { ...atlas };
   const shared = doc.getMap('atlas');
+  // 🔧 Rooms known to be taken apart — in the atlas given, or in our stored
+  // one (readAtlas leaves them out) — stand as tombstones unless the copy
+  // given is newer. Only a newer doc copy of such a room counts below; an
+  // older one is gossip from before the job ended.
+  const gone = new Map<string, number>();
+  for (const e of [...Object.values(readStoredAtlas()), ...Object.values(atlas)]) {
+    if (e?.dismantledAt === undefined || (gone.get(e.roomId) ?? -Infinity) >= e.lastSeen) continue;
+    gone.set(e.roomId, e.lastSeen);
+    if (!out[e.roomId] || out[e.roomId].lastSeen <= e.lastSeen) {
+      out[e.roomId] = { roomId: e.roomId, name: e.name, doors: {}, dismantledAt: e.dismantledAt, lastSeen: e.lastSeen };
+    }
+  }
   const queued = new Set<string>([roomId]);
   const queue: string[] = [roomId];
   for (let i = 0; i < queue.length && i < MAX_SHARED_SCAN; i++) {
     const rid = queue[i];
     const value = shared.get(rid);
-    if (isSharedAtlasEntry(value) && value.roomId === rid) {
+    const stale = isSharedAtlasEntry(value) && (gone.get(rid) ?? -Infinity) >= value.updatedAt;
+    if (isSharedAtlasEntry(value) && value.roomId === rid && value.dismantledAt !== undefined) {
+      // 🔧 Taken apart: a tombstone, newer than what we hold, joins nothing.
+      if (!out[rid] || value.updatedAt > out[rid].lastSeen) {
+        out[rid] = { roomId: rid, name: value.name || 'Module', doors: {}, dismantledAt: value.dismantledAt, lastSeen: value.updatedAt };
+      }
+    } else if (isSharedAtlasEntry(value) && value.roomId === rid && !stale) {
       const doors: Record<string, AtlasDoor> = {};
       let kept = 0;
       let whole = true;
@@ -711,7 +800,9 @@ export function withSharedAtlasOf(
         kept++;
       }
       const gates = value.gates !== undefined ? cleanGates(value.gates) : undefined;
-      const prior = out[rid];
+      // 🔧 A tombstone held here is older than this copy (else it is stale,
+      // above): the module is back, so the copy stands on its own.
+      const prior = out[rid]?.dismantledAt === undefined ? out[rid] : undefined;
       if (!prior) {
         out[rid] = {
           roomId: rid,
@@ -746,7 +837,8 @@ export function withSharedAtlasOf(
       queue.push(door.targetRoomId);
     }
   }
-  return out;
+  // What the maps see: no room taken apart, and no door naming one.
+  return visibleAtlas(out);
 }
 
 // ── 🪐 Connected components — what a STATION is ──────────────────────────────
@@ -1193,6 +1285,9 @@ interface SharedAtlasEntry {
   /** 🗺️ The module's owner (AtlasEntry.owner), null when known ownerless.
    *  Public: the room doc already shows it to anyone inside. */
   owner?: AtlasOwner | null;
+  /** 🔧 The module was taken apart (AtlasEntry.dismantledAt); its doors are
+   *  empty. */
+  dismantledAt?: number;
   /** The dial-in credential. Rides only while a door that ACTUALLY EXISTS is
    *  set to public passage — this is the access restriction, and it is
    *  deliberately NOT the same question as "may you see this module". */
@@ -1246,7 +1341,11 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     && (e.gateAccess === undefined || isPlainGates(e.gateAccess))
     // 🗺️ An owner is a small object or absent; a malformed one is refused here
     // rather than half-read (cleanAtlasOwner checks its fields).
-    && (e.owner === undefined || ownerOf(e.owner) !== undefined);
+    && (e.owner === undefined || ownerOf(e.owner) !== undefined)
+    // 🔧 A tombstone's stamp is a plain time; the record's own updatedAt is
+    // what arbitrates it, bounded above.
+    && (e.dismantledAt === undefined
+      || (typeof e.dismantledAt === 'number' && Number.isFinite(e.dismantledAt) && e.dismantledAt >= 0));
 }
 
 /** `{ owner }` when the owner is known (an owner or null), else nothing. */
@@ -1310,7 +1409,7 @@ export function subscribeSharedAtlas(listener: () => void): () => void {
 /** Doc → localStorage. Never erases a locally-earned seed. */
 function pullSharedAtlas(): void {
   if (!sharedAlive()) return;
-  const atlas = readAtlas();
+  const atlas = readStoredAtlas();
   markInferredBerths(atlas); // before any entry is replaced, as in harvestIntoAtlas
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
@@ -1332,10 +1431,16 @@ function pullSharedAtlas(): void {
     // `updatedAt: 0`, which the `>=` below would otherwise let the bundle
     // outrank when the door counts tie, leaving the flag stuck forever
     // (review of #156, round 3). Any valid shared record replaces it.
+    // 🔧 A tombstone of ours has no doors, yet it outranks any older copy:
+    // the module was taken apart after that copy was written. And an
+    // incoming tombstone is not outranked by a stub, however fresh: a door
+    // naming the room is no news about the room itself.
+    const stub = Object.keys(prior?.doors ?? {}).length === 0 && prior?.localSeenAt === undefined;
     if (prior
       && !prior.bundled
       && prior.lastSeen >= value.updatedAt
-      && Object.keys(prior.doors).length >= incoming) {
+      && (prior.dismantledAt !== undefined
+        || (value.dismantledAt !== undefined ? !stub : Object.keys(prior.doors).length >= incoming))) {
       // ⚓🚦 Our copy stands, but one harvested by an older build carries no
       // gates: take the doc's, and the access that rides with them, on their
       // own, so gate numbering sees them.
@@ -1356,7 +1461,7 @@ function pullSharedAtlas(): void {
     }
     const doors: Record<string, AtlasDoor> = {};
     let kept = 0;
-    for (const [d, door] of Object.entries(value.doors)) {
+    for (const [d, door] of Object.entries(value.dismantledAt !== undefined ? {} : value.doors)) {
       // Bounded (MAX_DOORS_PER_ENTRY): a room cannot honestly have more
       // pairings than doorsDoc reads back, so past the cap the rest is dropped,
       // deterministically, in entry order.
@@ -1425,6 +1530,9 @@ function pullSharedAtlas(): void {
       // 🗺️ Peer-written and checked; silence keeps what we knew.
       // (null: the publisher saw the room ownerless — that clears ours.)
       ...ownerSpread(ownerOf(value.owner) !== undefined ? ownerOf(value.owner) : prior?.owner),
+      // 🔧 A newer copy saying the module was taken apart: the tombstone, and
+      // no doors (a tombstone joins nothing, whatever its writer sent).
+      ...(value.dismantledAt !== undefined ? { dismantledAt: value.dismantledAt } : {}),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
       // Gossip is SECOND-hand and must never mint local recency: stamping it
       // here would let one peer's station sweep outrank every room the player
@@ -1461,14 +1569,15 @@ function withBerthFlags(known: SharedAtlasEntry, entry: AtlasEntry): SharedAtlas
 export function pushAtlasToDoc(): void {
   if (!sharedAlive() || !sharedCtx) return;
   const ctx = sharedCtx;
-  const atlas = readAtlas();
+  const atlas = readStoredAtlas();
   sharedDoc!.transact(() => {
     for (const entry of Object.values(atlas)) {
       const isOwn = entry.roomId === ctx.roomId;
       const doorIds = Object.keys(entry.doors) as DoorId[];
       // Stubs add no geometry; ⚓🚦 one that knows a room's gates still has
       // something to carry.
-      if (!isOwn && doorIds.length === 0 && entry.gates === undefined) continue;
+      // 🔧 A tombstone (a module taken apart) has no doors and still travels.
+      if (!isOwn && doorIds.length === 0 && entry.gates === undefined && entry.dismantledAt === undefined) continue;
       // 🛰️ Never publish what this install never observed: an entry the
       // build's bundled default station wrote (seedAtlasDefaults) would reach
       // every room we join as if we had seen it. The room we are standing in
@@ -1543,6 +1652,8 @@ export function pushAtlasToDoc(): void {
           : {}),
         // 🗺️ The owner travels with the layout (the holotable's atlas card).
         ...ownerSpread(onlyGates && known!.owner !== undefined ? known!.owner : entry.owner),
+        // 🔧 The module was taken apart: the tombstone travels like the layout.
+        ...(entry.dismantledAt !== undefined ? { dismantledAt: entry.dismantledAt } : {}),
         // 🧭 F5 (redo review): MONOTONIC, not just lastSeen. A corrective
         // re-push with the same second's stamp would lose the LWW tie against
         // the poisoned entry it is correcting (pull skips on >=); bumping past

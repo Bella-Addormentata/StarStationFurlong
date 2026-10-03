@@ -117,6 +117,7 @@ import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
 // 🚏 …and so do the last helm, engine and fuel tank aboard.
 import { readShipRoute, routeRulesFlightNow } from './shipRoute';
 import { isRouteRunning } from './pilotRoute';
+import { clearRobotConfig, readRobotConfig } from './robotDoc';
 import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
@@ -2299,6 +2300,11 @@ class RoomEditController {
     // reconcileRobots never runs on THIS client (the exact mirror of the
     // commitSpawn dock fix in devMenu.ts; remote peers reconcile normally).
     if (item.kind === 'charging-dock' || cascade.some((c) => c.kind === 'charging-dock')) {
+      // 🔧 A robot taking a module apart leaves the job's crew with its dock
+      // (the job keeps the work done so far).
+      for (const d of [item, ...cascade]) {
+        if (d.kind === 'charging-dock' && readRobotConfig(d.id)?.routine === 'disassemble') clearRobotConfig(d.id);
+      }
       world.refreshRobots();
     }
 
