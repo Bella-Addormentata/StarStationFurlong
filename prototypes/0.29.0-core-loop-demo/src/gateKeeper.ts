@@ -54,13 +54,15 @@
  * hold one stamp. A refused or lost ferry side takes the claim back, as does
  * a gate whose AUTO-DOCK is switched off (or that stops admitting the ferry)
  * while its claim settles, or a station move, a tow or this room's flight
- * that starts meanwhile. The gate is read again before the dock counts, or
- * before it takes a crossing DOCK's stamp: another game may have written over
- * the claim while the ferry's side was asked, and then the gate keeps what it
- * holds and the keeper's next look settles the ferry's port. A cast-off
- * writes both ends in the same tick: the ferry's port remembers the gate, and
- * the gate remembers the ferry. Nothing is written to the gate once the
- * keeper has reset (the player left, even if they came straight back).
+ * that starts meanwhile; once the ferry's side has docked too, such a gate
+ * has the dock withdrawn at both ends. The gate is read again before the
+ * dock counts, or before it takes a crossing DOCK's stamp: another game may
+ * have written over the claim while the ferry's side was asked, and then the
+ * gate keeps what it holds and the keeper's next look settles the ferry's
+ * port. A cast-off writes both ends in the same tick: the ferry's port
+ * remembers the gate, and the gate remembers the ferry. Nothing is written to
+ * the gate once the keeper has reset (the player left, even if they came
+ * straight back).
  *
  * The gate's record needs the ferry's address and its port's pose (the far
  * wall and lateral): both come from a record in this room that names the
@@ -187,13 +189,15 @@ export const GATE_DOCK_DEFER_MS = 8_000;
 /** A cast-off at the departure waits this long for a rider's keeper (its own
  *  is at the departure), well inside routeKeeper.CAST_OFF_LATE_MS. */
 export const GATE_CAST_OFF_DEFER_MS = 3_000;
-/** A session to the ferry opens this long before its departure from here, so
- *  it is ready to cast off on time: a whole open (roomSession's deadline) and
- *  a quarter minute to spare, well before the keeper's CAST_OFF_LATE_MS after
- *  the departure would restart the stay instead. */
+/** A session to the ferry opens this long before its arrival here, so it is
+ *  ready to dock it however short the stay, and before its departure from
+ *  here, so it is ready to cast off on time (well before the keeper's
+ *  CAST_OFF_LATE_MS after the departure would restart the stay instead): a
+ *  whole open (roomSession's deadline) and a quarter minute to spare. */
 export const GATE_PRE_DIAL_MS = ROOM_SESSION_OPEN_MS + 15_000;
 /** A session still wanted is replaced by a fresh one after this long (one
- *  whose transport died says nothing), except around a departure. */
+ *  whose transport died says nothing), except around the ferry's call here
+ *  (callClose), when a fresh dial could miss the dock or the cast-off. */
 export const GATE_SESSION_MAX_MS = 3 * 60_000;
 /** The first wait after a dial that failed (or a session that closed),
  *  doubling to GATE_REDIAL_MAX_MS. */
@@ -340,16 +344,22 @@ export interface StationLook {
   dockedAt: number | null;
   /** Its stay is at a stop whose berth room is this room. */
   atHere: boolean;
+  /** Bound for a stop of this room next (in flight there, or due to leave
+   *  the stop before it): the stay it makes here, as the timetable has it on
+   *  arrival (a stop it passes, or where its route ends, shows). Else null. */
+  inbound: RouteFlight | null;
 }
 
 /** The ferry's timetable as this room sees it (departuresBoard.ferryRow's
- *  reading, with this room alone as "here"). Pure. */
+ *  reading, with this room alone as "here"). `aheadCache` walks to its
+ *  arrival here (its own: that walk's clock runs ahead of `cache`'s). Pure. */
 export function stationLook(
   ferry: DepartureFerry,
   roomId: string,
   docks: readonly BoardDock[],
   now: number,
   cache?: RouteWalkCache,
+  aheadCache?: RouteWalkCache,
 ): StationLook {
   const route = ferry.route;
   const isHere = (s: RouteStop | undefined): boolean => !!s && s.berth.roomId === roomId;
@@ -359,15 +369,25 @@ export function stationLook(
     { held },
   );
   const f = isRouteRunning(route) ? routeFlightAt(route, ferry.checkpoints, liveDock, now, ferry.capacity, cache) : null;
-  return { f, dockedAt: at, atHere: !!f && f.status === 'docked' && isHere(route.stops[f.stopIndex]) };
+  let inbound: RouteFlight | null = null;
+  if (
+    f && !f.paused && f.ended === null && f.arrivesAt !== null && isHere(route.stops[f.nextStopIndex])
+    && (f.status === 'in-flight' || (!isHere(route.stops[f.stopIndex]) && !f.holding && !f.overdue))
+  ) {
+    const a = routeFlightAt(route, ferry.checkpoints, liveDock, f.arrivesAt, ferry.capacity, aheadCache);
+    if (a && a.status === 'docked' && isHere(route.stops[a.stopIndex])) inbound = a;
+  }
+  return { f, dockedAt: at, atHere: !!f && f.status === 'docked' && isHere(route.stops[f.stopIndex]), inbound };
 }
 
 /**
  * Is a session to the ferry wanted now? Docked here: when its stay has moved
  * on (a cast-off to make, or a dock left over), a hold is to end, or its
- * departure is GATE_PRE_DIAL_MS away. Not docked here: from its arrival at a
- * stop of this room until the guard band before its departure (not a stay it
- * skips, nor a route that has ended or is paused). Pure.
+ * departure is GATE_PRE_DIAL_MS away. Not docked here: from GATE_PRE_DIAL_MS
+ * before its arrival at a stop of this room (look.inbound), so a session is
+ * ready to dock it however short the stay, until the guard band before its
+ * departure (not a stay it passes, nor a route that has ended or is paused).
+ * Pure.
  */
 export function gateSessionWanted(look: StationLook, now: number): boolean {
   const f = look.f;
@@ -377,15 +397,20 @@ export function gateSessionWanted(look: StationLook, now: number): boolean {
     if (f.ended !== null || f.departsAt === null) return false;
     return now >= f.departsAt - GATE_PRE_DIAL_MS;
   }
+  const a = look.inbound;
+  if (a) return !a.skipped && a.ended === null && f.arrivesAt !== null && now >= f.arrivesAt - GATE_PRE_DIAL_MS;
   if (!look.atHere || f.skipped || f.ended !== null) return false;
   if (f.departsAt !== null && now >= f.departsAt - GUARD_BAND_MS) return false;
   return f.holding || (f.stayStart !== null && now >= f.stayStart);
 }
 
-/** Is the ferry's departure from here close (GATE_PRE_DIAL_MS either side)?
- *  A session is then never recycled: the cast-off must not wait on a dial.
+/** Is the ferry's call here close: its arrival (in the GATE_PRE_DIAL_MS
+ *  before it), or its departure (GATE_PRE_DIAL_MS either side)? A session is
+ *  then never recycled: neither the dock nor the cast-off may wait on a dial.
  *  Pure. */
-export function departureClose(look: StationLook, now: number): boolean {
+export function callClose(look: StationLook, now: number): boolean {
+  const arrives = look.inbound ? look.f?.arrivesAt ?? null : null;
+  if (arrives !== null && now >= arrives - GATE_PRE_DIAL_MS) return true;
   const at = look.f?.departsAt ?? null;
   return look.atHere && at !== null && now >= at - GATE_PRE_DIAL_MS && now <= at + GATE_PRE_DIAL_MS;
 }
@@ -708,10 +733,15 @@ export type StationDockResult =
         /** The player left the room. */
         | 'left'
         /** The gate stopped being one this keeper docks at while its claim
-         *  settled (AUTO-DOCK switched off, it no longer admits the ferry, a
-         *  station move, a tow or this room's flight locks it, or the keeper
-         *  reset): the claim is taken back where it may be. */
+         *  or its dock settled (AUTO-DOCK switched off, it no longer admits
+         *  the ferry, a station move, a tow or this room's flight locks it,
+         *  or the keeper reset): the claim is taken back, or a dock both ends
+         *  held is withdrawn at both, where it may be. */
         | 'disabled';
+      /** A withdrawn dock's release was written to the ferry's room but
+       *  never acknowledged: its port may still hold the gate, which has let
+       *  go (a fresh session reads it, and reconcile lets the port go). */
+      releaseUnconfirmed?: true;
     };
 
 /**
@@ -721,9 +751,11 @@ export type StationDockResult =
  * lost ferry side takes the claim back. A port already docked to this gate is
  * joined; a claim on the ferry the gate already holds is left to land. A dock
  * counts only while both ends hold its stamp, and nothing is written over a
- * gate record another game wrote meanwhile. The request carries no requester
- * key: nobody aboard docks it, so a ferry port open only to granted captains
- * refuses it, whoever stands in the station. Never throws.
+ * gate record another game wrote meanwhile. A gate no longer live (GateEnd)
+ * once the dock has landed has it withdrawn at both ends. The request
+ * carries no requester key: nobody aboard docks it, so a ferry port open only
+ * to granted captains refuses it, whoever stands in the station. Never
+ * throws.
  */
 export async function stationDock(o: {
   session: FerryDocSession;
@@ -793,6 +825,38 @@ export async function stationDock(o: {
     if (held(rec) && rec.dockedAt === stamp) return { ok: true, dockedAt: stamp, joined: true };
     return ours(rec) ? join(stamp) : { ok: false, reason: 'lost' };
   };
+  /** Withdraw this dock once both ends hold it: the gate lets go of its
+   *  claim (only while it is still ours), then the ferry's port of exactly
+   *  this dock (stamp-scoped), each remembering the other. A room no longer
+   *  bound here writes nothing: the dock both ends hold stands, and a later
+   *  keeper here settles it. */
+  const withdraw = async (): Promise<StationDockResult> => {
+    const rec = gate.read();
+    if (!ours(rec)) return { ok: false, reason: 'lost' };
+    const undockedAt = stampAfter(dockedAt, o.now());
+    if (!gate.write(buildDoorTombstone(berthing.address, berthMemoryFrom(rec, undockedAt)))) return { ok: false, reason: 'left' };
+    const since = Y.encodeStateVector(doc);
+    let wrote = false;
+    try {
+      wrote = applyFarDockRequest(doc, {
+        kind: 'undock',
+        nearRoomId: gate.near.roomId,
+        farAddress: berthing.address,
+        farDoor: shipPort,
+        nearDoorId: gate.near.doorId,
+        ...(gate.near.wall !== undefined ? { nearWall: gate.near.wall } : {}),
+        ...(gate.near.lateral !== undefined ? { nearLateral: gate.near.lateral } : {}),
+        undockedAt,
+        onlyDockedAt: dockedAt,
+      }, gate.near).wrote;
+    } catch (err) {
+      console.warn('[gate] ferry-side undock threw:', err);
+    }
+    if (wrote && !(await session.confirm(since, GATE_ACK_MS))) {
+      return { ok: false, reason: 'disabled', releaseUnconfirmed: true };
+    }
+    return { ok: false, reason: 'disabled' };
+  };
 
   // 1. The claim at the gate, and a moment for any other claim to arrive.
   if (!gate.write(pairingAt(dockedAt))) return { ok: false, reason: 'left' };
@@ -853,7 +917,12 @@ export async function stationDock(o: {
     takeBack();
     return { ok: false, reason: !lost.ok && lost.reason === 'occupied' ? 'occupied' : 'refused' };
   }
-  return ours(gate.read()) ? { ok: true, dockedAt } : { ok: false, reason: 'lost' };
+  if (!ours(gate.read())) return { ok: false, reason: 'lost' };
+  // 4. Both ends hold the dock. A gate that stopped being one this keeper
+  // docks at while the ferry's side was asked and settled has it withdrawn,
+  // as its claim would have been taken back before the ferry's side was
+  // asked (and as a ship's DOCK takes back its far write once it departed).
+  return gate.live() ? { ok: true, dockedAt } : withdraw();
 }
 
 /**
@@ -995,6 +1064,8 @@ interface Watch {
   busy: boolean;
   memory: KeeperMemory | null;
   stationCache: RouteWalkCache;
+  /** stationLook's walk to the ferry's arrival here. */
+  aheadCache: RouteWalkCache;
   ferryCache: RouteWalkCache;
   /** Each gate pairing to this ferry this keeper has watched, by
    *  pairKey: when it was first seen. */
@@ -1076,6 +1147,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         busy: false,
         memory: null,
         stationCache: createRouteWalkCache(),
+        aheadCache: createRouteWalkCache(),
         ferryCache: createRouteWalkCache(),
         pairSeen: new Map(),
         settled: new Set(),
@@ -1469,6 +1541,11 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
             // The gate keeps its claim, unsettled, and a fresh session reads
             // whether the ferry's side landed.
             unacked(w, false);
+          } else if (r.releaseUnconfirmed) {
+            // A dock withdrawn whose release the ferry's room never took: a
+            // fresh session reads whether its port let go (reconcile lets it
+            // go again).
+            unacked(w, true);
           }
           const m = w.memory;
           if (!m || m.run !== run || m.legSeq !== legSeq) return;
@@ -1553,7 +1630,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       hangUp(w);
       return true;
     }
-    const look = ferry && running ? stationLook(ferry, room, boardDocksOf(doors, w.ship), now, w.stationCache) : null;
+    const look = ferry && running ? stationLook(ferry, room, boardDocksOf(doors, w.ship), now, w.stationCache, w.aheadCache) : null;
     if (!unsettled && !(look && gateSessionWanted(look, now))) {
       hangUp(w);
       return true;
@@ -1573,7 +1650,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       w.nextDialAt = now + GATE_REDIAL_MS;
       return true;
     }
-    if (now - w.openedAt >= GATE_SESSION_MAX_MS && !(look && departureClose(look, now))) {
+    if (now - w.openedAt >= GATE_SESSION_MAX_MS && !(look && callClose(look, now))) {
       hangUp(w);
       w.nextDialAt = now;
       return true;

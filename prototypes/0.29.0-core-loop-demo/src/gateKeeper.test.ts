@@ -36,7 +36,7 @@ import {
   GATE_SESSION_MAX_MS,
   GATE_STALE_MS,
   createGateKeeper,
-  departureClose,
+  callClose,
   dockableGates,
   ferryBerthingIn,
   ferryLook,
@@ -52,9 +52,10 @@ import {
   type GateView,
 } from './gateKeeper';
 import { ROOM_SESSION_OPEN_MS } from './roomSession';
-import { GUARD_BAND_MS, legWindowAfter, pauseCheckpoint, startCheckpoint } from './pilotRoute';
+import { GUARD_BAND_MS, legWindowAfter, pauseCheckpoint, skipCheckpoint, startCheckpoint } from './pilotRoute';
 import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep } from './routeKeeper';
 import {
+  MIN_WAIT_SECS,
   checkpointKey,
   checkpointToWire,
   routeIn,
@@ -143,13 +144,17 @@ const BERTHING = { address: seed(FERRY), farWall: 'x-' as const, farLateral: 0 }
 const gate = (doorId: string, n: number, record?: DoorRecord, over: Partial<GateView> = {}): GateView =>
   ({ doorId, gate: n, record, ...over });
 
-/** The ferry's room: its running route, its route port (fitted, and as
- *  given: by default undocked from stop 0 on time). */
-function ferryDoc(port: DoorRecord = leftStop0(), ckpts: readonly RouteCheckpoint[] = [S]): Y.Doc {
+/** The ferry's room: its running route (R unless given), its route port
+ *  (fitted, and as given: by default undocked from stop 0 on time). */
+function ferryDoc(
+  port: DoorRecord = leftStop0(),
+  ckpts: readonly RouteCheckpoint[] = [S],
+  route: ShipRoute & { startedAt: number } = R,
+): Y.Doc {
   const doc = new Y.Doc();
   const ship = doc.getMap('ship');
-  ship.set('route', routeToWire(R));
-  for (const e of ckpts) ship.set(checkpointKey(R.startedAt, e.legSeq, e.kind), checkpointToWire(e));
+  ship.set('route', routeToWire(route));
+  for (const e of ckpts) ship.set(checkpointKey(route.startedAt, e.legSeq, e.kind), checkpointToWire(e));
   doc.getMap('doorLayout').set(PORT, { id: PORT, wall: 'x-', lateral: 0, placed: true });
   doc.getMap('doorPolicy').set(PORT, { passage: 'public', construction: 'owner', adapter: true });
   doc.getMap('doors').set(PORT, port);
@@ -235,13 +240,37 @@ describe('when the station opens a session to the ferry', () => {
   const look = (now: number, docks: BoardDock[] = [], e = entry()) => stationLook(e, HERE, docks, now);
   const wanted = (now: number, docks: BoardDock[] = [], e = entry()) => gateSessionWanted(look(now, docks, e), now);
 
-  it('from its arrival here until the guard band before its departure', () => {
-    expect(wanted(ms(S.departAt) - 10 * SEC)).toBe(false); // still at stop 0
-    expect(wanted(ARRIVE - 10 * SEC)).toBe(false); // in flight
-    expect(look(ARRIVE + SEC)).toMatchObject({ dockedAt: null, atHere: true });
+  // Copilot (PR 204): a session may take its whole open deadline, so one
+  // dialled only on arrival could be ready after a short stay's departure.
+  it('from GATE_PRE_DIAL_MS before its arrival here until the guard band before its departure', () => {
+    expect(wanted(ARRIVE - GATE_PRE_DIAL_MS - 1)).toBe(false);
+    // A hop shorter than that: dialled while still at stop 0, due to leave
+    // for here.
+    expect(ARRIVE - GATE_PRE_DIAL_MS).toBeLessThan(ms(S.departAt));
+    expect(look(ARRIVE - GATE_PRE_DIAL_MS).inbound).toMatchObject({ status: 'docked', stopIndex: 1, stayStart: S.arriveAt });
+    expect(wanted(ARRIVE - GATE_PRE_DIAL_MS)).toBe(true);
+    expect(wanted(ARRIVE - 10 * SEC)).toBe(true); // in flight
+    expect(look(ARRIVE + SEC)).toMatchObject({ dockedAt: null, atHere: true, inbound: null });
     expect(wanted(ARRIVE + SEC)).toBe(true);
     expect(wanted(DEPART - GUARD_BAND_MS - 1)).toBe(true);
     expect(wanted(DEPART - GUARD_BAND_MS)).toBe(false);
+  });
+
+  it('never ahead of a stay here it passes, or where its route ends', () => {
+    // A stop found gone earlier this run is passed at every later visit.
+    const r3 = running({ stops: [stop(0, 0), stop(1, 1), stop(2, 2)] });
+    const s3 = startCheckpoint(r3, { at: T0, pilot: 'robot', fuel: BIG })!;
+    const gone = skipCheckpoint(r3, 1, { at: ms(s3.arriveAt) + SEC, pilot: 'robot', why: 'gone' })!;
+    const e3 = entry({ route: r3, checkpoints: [s3, gone] });
+    const at2 = stationLook(e3, HERE, [], ms(gone.arriveAt) + SEC).f!;
+    expect(at2).toMatchObject({ status: 'docked', stopIndex: 2, nextStopIndex: 1 });
+    const t = at2.arrivesAt! - SEC;
+    expect(look(t, [], e3).inbound).toMatchObject({ stopIndex: 1, skipped: true, gone: true });
+    expect(wanted(t, [], e3)).toBe(false);
+    // STOP pressed in flight: the route ends here.
+    const stopped = entry({ route: running({ stoppedAt: ms(S.departAt) + SEC }) });
+    expect(look(ARRIVE - SEC, [], stopped).inbound).toMatchObject({ stopIndex: 1, ended: 'stop' });
+    expect(wanted(ARRIVE - SEC, [], stopped)).toBe(false);
   });
 
   it('docked here: from GATE_PRE_DIAL_MS before its departure, and on while it is overdue', () => {
@@ -266,12 +295,20 @@ describe('when the station opens a session to the ferry', () => {
     expect(GATE_CAST_OFF_DEFER_MS).toBeLessThan(CAST_OFF_LATE_MS);
   });
 
-  it('keeps a session through the moments around a departure', () => {
-    expect(departureClose(look(DEPART - GATE_PRE_DIAL_MS - 1), DEPART - GATE_PRE_DIAL_MS - 1)).toBe(false);
-    expect(departureClose(look(DEPART - GATE_PRE_DIAL_MS), DEPART - GATE_PRE_DIAL_MS)).toBe(true);
+  it('keeps a session through the moments before an arrival and around a departure', () => {
+    expect(callClose(look(ARRIVE - GATE_PRE_DIAL_MS - 1), ARRIVE - GATE_PRE_DIAL_MS - 1)).toBe(false);
+    expect(callClose(look(ARRIVE - GATE_PRE_DIAL_MS), ARRIVE - GATE_PRE_DIAL_MS)).toBe(true);
+    expect(callClose(look(ARRIVE - SEC), ARRIVE - SEC)).toBe(true);
+    // Gone on to stop 0, its arrival there is another room's call.
+    const away = look(DEPART + SEC);
+    expect(away).toMatchObject({ atHere: false, inbound: null, f: { status: 'in-flight', nextStopIndex: 0 } });
+    expect(DEPART + SEC).toBeGreaterThanOrEqual(away.f!.arrivesAt! - GATE_PRE_DIAL_MS);
+    expect(callClose(away, DEPART + SEC)).toBe(false);
+    expect(callClose(look(DEPART - GATE_PRE_DIAL_MS - 1), DEPART - GATE_PRE_DIAL_MS - 1)).toBe(false);
+    expect(callClose(look(DEPART - GATE_PRE_DIAL_MS), DEPART - GATE_PRE_DIAL_MS)).toBe(true);
     const docks: BoardDock[] = [{ dockedAt: D0, farDoor: PORT }];
-    expect(departureClose(look(DEPART + GATE_PRE_DIAL_MS, docks), DEPART + GATE_PRE_DIAL_MS)).toBe(true);
-    expect(departureClose(look(DEPART + GATE_PRE_DIAL_MS + 1, docks), DEPART + GATE_PRE_DIAL_MS + 1)).toBe(false);
+    expect(callClose(look(DEPART + GATE_PRE_DIAL_MS, docks), DEPART + GATE_PRE_DIAL_MS)).toBe(true);
+    expect(callClose(look(DEPART + GATE_PRE_DIAL_MS + 1, docks), DEPART + GATE_PRE_DIAL_MS + 1)).toBe(false);
   });
 });
 
@@ -621,6 +658,58 @@ describe('docking from the station side', () => {
     expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(T0 - HOUR));
     expect(readDoorFrom(ferry, PORT)).toEqual(leftStop0());
   });
+
+  // Copilot (PR 204): the gate is checked again once the dock has landed at
+  // both ends. Switched off, no longer admitting the ferry, or locked by a
+  // station move, a tow or this room's flight meanwhile, it has the dock
+  // withdrawn at both, each end remembering the other.
+  it('withdraws the dock at both ends when the gate stops being one it docks at while the dock settles', async () => {
+    const station = stationWith(memoryOf(T0 - HOUR));
+    const ferry = ferryDoc();
+    let live = true;
+    let n = 0;
+    const r = await dock(station, ferry, { live: () => live, wait: async () => { if (++n === 2) live = false; } });
+    expect(r).toEqual({ ok: false, reason: 'disabled' });
+    expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+    expect(readDoorFrom(ferry, PORT)).toEqual(
+      buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }),
+    );
+  });
+
+  it("says so when a withdrawn dock's release is never acknowledged, and withdraws nothing once the player has walked on", async () => {
+    {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let live = true;
+      let n = 0;
+      let confirms = 0;
+      const r = await stationDock({
+        // The dock is acknowledged; its release is not.
+        session: { doc: ferry, confirm: async () => ++confirms === 1 },
+        gate: gateEndOn(station, 'x+', () => true, () => live),
+        shipRoomId: FERRY,
+        shipPort: PORT,
+        berthing: BERTHING,
+        now: () => D0,
+        wait: async () => { if (++n === 2) live = false; },
+      });
+      expect(r).toEqual({ ok: false, reason: 'disabled', releaseUnconfirmed: true });
+      expect(confirms).toBe(2);
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+    }
+    {
+      // Walked on as it landed: nothing more is written, and the dock both
+      // ends hold stands (a later keeper here settles it).
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let stay = true;
+      let n = 0;
+      const r = await dock(station, ferry, { stay: () => stay, wait: async () => { if (++n === 2) stay = false; } });
+      expect(r).toEqual({ ok: false, reason: 'left' });
+      expect(readDoorFrom(station, 'x+')).toEqual(dockOf(D0));
+      expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0));
+    }
+  });
 });
 
 describe('casting off from the station side', () => {
@@ -657,19 +746,25 @@ function replicaOf(room: Y.Doc): Y.Doc {
 
 /** A station room HERE with auto-dock gates `x+` (gate 1, remembering the
  *  ferry from an earlier call with someone aboard) and `y-` (gate 2), the
- *  ferry's room behind a stand-in session, and a clock. With `replica`, each
- *  session holds its own copy of the ferry's room, and the room takes a write
- *  only once it is acknowledged; without, a write unacknowledged has landed
- *  after all. */
-function harness(o: { port?: DoorRecord; gateRec?: DoorRecord | null; ckpts?: RouteCheckpoint[]; replica?: boolean } = {}) {
+ *  ferry's room behind a stand-in session (on R unless `route` is given), and
+ *  a clock. With `replica`, each session holds its own copy of the ferry's
+ *  room, and the room takes a write only once it is acknowledged; without, a
+ *  write unacknowledged has landed after all. */
+function harness(o: {
+  port?: DoorRecord;
+  gateRec?: DoorRecord | null;
+  ckpts?: RouteCheckpoint[];
+  replica?: boolean;
+  route?: ShipRoute & { startedAt: number };
+} = {}) {
   const station = new Y.Doc();
   if (o.gateRec !== null) station.getMap('doors').set('x+', o.gateRec ?? memoryOf(T0 - HOUR));
-  const ferry = ferryDoc(o.port, o.ckpts);
+  const ferry = ferryDoc(o.port, o.ckpts, o.route);
   const h = {
     now: T0,
     station,
     ferry,
-    entry: entry(o.ckpts ? { checkpoints: o.ckpts } : {}),
+    entry: entry({ ...(o.route ? { route: o.route } : {}), ...(o.ckpts ? { checkpoints: o.ckpts } : {}) }),
     /** Does the node acknowledge writes? */
     ack: true,
     /** The gates whose AUTO-DOCK is on. */
@@ -747,12 +842,15 @@ describe('the gate keeper over a stand-in session', () => {
   it('docks an empty ferry on its arrival and casts it off at its departure', async () => {
     const { h, deps } = harness();
     const keeper = createGateKeeper(deps);
-    await tickAt(keeper, h, ARRIVE - 10 * SEC);
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS - SEC);
     expect(h.opened).toEqual([]);
-    // The arrival: a session opens, and the dock waits for a rider's keeper.
-    await tickAt(keeper, h, ARRIVE + SEC);
+    // A whole session open (and more) before the arrival, a session opens…
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
     expect(h.opened).toEqual([seed(FERRY)]);
     expect(keeper.sessions()).toEqual([FERRY]);
+    // …and on the arrival the dock waits for a rider's keeper.
+    await tickAt(keeper, h, ARRIVE + SEC);
+    expect(h.opened).toEqual([seed(FERRY)]);
     await tickAt(keeper, h, ARRIVE + 2 * SEC);
     expect(readDoorFrom(h.station, 'x+')?.paired).toBe(false);
     await tickAt(keeper, h, D0);
@@ -780,6 +878,43 @@ describe('the gate keeper over a stand-in session', () => {
     expect(h.closes).toBe(2);
     expect(routeIn(h.ferry.getMap('ship'), t + SEC).checkpoints.map((e) => e.kind)).toEqual(['start']);
     expect(h.published).toEqual([]);
+  });
+
+  // Copilot (PR 204): a session may take its whole open deadline, and a stay
+  // may be the shortest a route allows: dialled only on arrival, it would be
+  // ready after the departure, and the empty ferry would pass.
+  it('dials a ferry bound here a whole session open before it arrives, so a slow open still docks it at the shortest stay', async () => {
+    const quick = running({ stops: [stop(0, 0), stop(1, 3, { waitSecs: MIN_WAIT_SECS })] });
+    const qs = startCheckpoint(quick, { at: T0, pilot: 'robot', fuel: BIG })!;
+    const arrive = ms(qs.arriveAt);
+    const depart = ms(legWindowAfter(quick, 1, qs.arriveAt + MIN_WAIT_SECS * SEC)!.departAt);
+    expect(depart - arrive).toBeLessThan(ROOM_SESSION_OPEN_MS);
+    const left = buildDoorTombstone(seed('room-0'), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: ms(qs.departAt) });
+    const { h, deps } = harness({ route: quick, ckpts: [qs], port: left });
+    // The ferry's room answers only once a whole session open has passed.
+    const answer: { now?: () => void } = {};
+    const open = deps.open;
+    deps.open = (address) => new Promise((resolve) => { answer.now = () => resolve(open(address)); });
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, arrive - GATE_PRE_DIAL_MS - SEC);
+    expect(answer.now).toBeUndefined();
+    await tickAt(keeper, h, arrive - GATE_PRE_DIAL_MS);
+    expect(keeper.sessions()).toEqual([FERRY]);
+    h.now = arrive - GATE_PRE_DIAL_MS + ROOM_SESSION_OPEN_MS;
+    answer.now!();
+    await flush();
+    // On its arrival the dock waits for a rider's keeper, then is made…
+    await tickAt(keeper, h, arrive + SEC);
+    expect(readDoorFrom(h.station, 'x+')?.paired).toBe(false);
+    const d = arrive + GATE_DOCK_DEFER_MS;
+    await tickAt(keeper, h, d);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(d));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(d));
+    // …and it is cast off on time.
+    const t = depart + GATE_CAST_OFF_DEFER_MS;
+    await tickAt(keeper, h, t);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(t));
+    expect(readDoorFrom(h.ferry, PORT)?.paired).toBe(false);
   });
 
   it('opens nothing for a ferry this room has never seen dock', async () => {
@@ -1210,6 +1345,40 @@ describe('the gate keeper over a stand-in session', () => {
     await tickAt(keeper, h, D0);
     expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
     expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
+  });
+
+  // Copilot (PR 204): switched off once the dock has landed, the gate has it
+  // withdrawn at both ends; a release the ferry's room never acknowledged is
+  // read back by a fresh session and made again.
+  it("withdraws a dock whose gate is switched off as it lands, and makes a release the ferry's room never took again", async () => {
+    const { h, deps } = harness({ replica: true });
+    h.auto.delete('y-');
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, ARRIVE + SEC);
+    let n = 0;
+    h.wait = async () => {
+      if (++n !== 2) return;
+      h.auto.delete('x+');
+      h.ack = false;
+    };
+    await tickAt(keeper, h, D0);
+    // The gate let go at once; the ferry's room took the dock, not its release.
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+    expect(keeper.sessions()).toEqual([]);
+    h.ack = true;
+    h.wait = instant;
+    await tickAt(keeper, h, D0 + SEC);
+    await tickAt(keeper, h, D0 + 2 * SEC);
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(
+      buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }),
+    );
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+    expect(h.notes).toEqual([]);
+    // Both ends agree: nothing is left to settle there.
+    await tickAt(keeper, h, D0 + 3 * SEC);
+    await tickAt(keeper, h, D0 + 4 * SEC);
+    expect(keeper.sessions()).toEqual([]);
   });
 
   // Copilot (PR 204): a gate that takes another pairing never gives it up,
