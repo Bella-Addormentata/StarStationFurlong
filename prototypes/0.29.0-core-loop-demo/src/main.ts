@@ -1514,9 +1514,10 @@ async function joinRoomAtEpoch(
   // the stale doc would refuse legal advances). Fuel-tank capacity is DERIVED
   // from furniture, so the two docs are consumed together in the helm UI;
   // binding shipDoc right after furniture guarantees both observers are
-  // installed before the first reconcile. (A future exterior-view flight
-  // branch will read this same doc — plan §7 SH4 — but no exterior code
-  // consumes shipDoc in the shipped SH3 slice.)
+  // installed before the first reconcile. The exterior view reads it too,
+  // indirectly: its planet backdrop comes from planetForRoom, whose
+  // room-station resolver (set below) places a free-flying ship by its
+  // flight record.
   bindShipDoc(sync.doc);
   clearShipArrivalNote(); // the last ship's arrival is not this room's
 
