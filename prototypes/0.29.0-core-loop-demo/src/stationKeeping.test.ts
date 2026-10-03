@@ -26,6 +26,7 @@ import type { FuelRecord } from './shipDoc';
 import { roomIdFromSeed } from './stationAtlas';
 import type { AtlasDoor, AtlasEntry } from './stationAtlas';
 import { DEFAULT_PLANET_ID } from './stations';
+import type { StationRecord } from './stations';
 import {
   BURN_MS,
   MAX_LOG,
@@ -52,6 +53,7 @@ import {
   slotDriftPerHour,
   slotOffsetAt,
   slotOrbit,
+  steersStation,
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
@@ -217,6 +219,23 @@ describe('which face the helm shows', () => {
     expect(isBoltedIntoStation(named, here, namedAtlas)).toBe(true);
     // Take the gangway down, and the berth alone joins nothing.
     expect(isBoltedIntoStation(new Map([['west', toStation({ farDoor: 'east' })]]), here, namedAtlas)).toBe(false);
+  });
+
+  it('a station\'s own welcome room steers the station even standing alone; any other lone room flies', () => {
+    // Dorkmo's "Fly and park" (free flight, #203): a one-module station
+    // keeps its orbit with the trim stick too, its ship face a tab away.
+    const stations: StationRecord[] = [
+      { id: 'my-station', name: 'Mine', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'room-w' },
+      { id: 'station:room-x', name: 'Module', planetId: SOV, orbitSlot: 3, welcomeRoomId: 'room-x', derived: true },
+    ];
+    expect(steersStation('room-w', new Map(), {}, stations)).toBe(true);
+    // A module the list only derives a station from is a ship.
+    expect(steersStation('room-x', new Map(), {}, stations)).toBe(false);
+    expect(steersStation('room-y', new Map(), {}, stations)).toBe(false);
+    expect(steersStation('', new Map(), {}, stations)).toBe(false);
+    // Bolted in, any room steers its station.
+    expect(steersStation('room-y', new Map([['north', gangway]]), {}, stations)).toBe(true);
+    expect(steersStation('room-y', new Map([['north', guestBerth]]), {}, stations)).toBe(false);
   });
 });
 

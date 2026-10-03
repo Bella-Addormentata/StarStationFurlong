@@ -1,9 +1,9 @@
 /**
  * 🛰️ The helm's STATION KEEPING face (owner request, 2026-09-27) — what a
- * helm console shows in a module bolted into a station
- * (stationKeeping.isBoltedIntoStation). A ship's helm flies the ship; this
- * one flies the station, with a small TRIM STICK for fine orbital
- * maintenance:
+ * helm console shows in a module bolted into a station, or in a station's
+ * own welcome room standing alone (stationKeeping.steersStation). A ship's
+ * helm flies the ship; this one flies the station, with a small TRIM STICK
+ * for fine orbital maintenance:
  *
  *   ▲ RAISE / ▼ LOWER — one burn moves the orbit TRIM_STEP_KM,
  *   ◀ BACK / AHEAD ▶  — one burn slides the station PHASE_STEP_DEG along it.
@@ -232,9 +232,9 @@ function drawKeepingBox(
 // ── The face ─────────────────────────────────────────────────────────────────
 
 export interface StationHelmDeps {
-  /** Is the module still bolted into a station — read at every refresh and
+  /** Does the module still steer a station — read at every refresh and
    *  every burn, since a peer can take the gangway down while this is open
-   *  (stationKeeping.isBoltedIntoStation over the live door records). */
+   *  (stationKeeping.steersStation over the live door records). */
   bolted: () => boolean;
   /** The station this module belongs to (stations.currentStation). */
   station: () => StationRecord | null;

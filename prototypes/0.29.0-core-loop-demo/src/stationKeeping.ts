@@ -7,12 +7,14 @@
  * WHICH FACE THE HELM SHOWS. The helm console is one piece of furniture with
  * two faces. A module BOLTED into a station (a door connected by a gangway,
  * which is structure: a dock can be released, a gangway cannot) steers the
- * STATION, so its helm opens the station keeping face (stationHelm.ts). Any
- * other module flies ITSELF: the ship helm (devices.ts createHelmUI). It is
- * the line the ship helm already draws when it says a bolted module cannot
- * fly, except that a pairing whose address names no room (none at all, or
- * one the atlas cannot read) joins nothing, and a connection flagged as a
- * berth at either end is a berth, as in the atlas.
+ * STATION, so its helm opens the station keeping face (stationHelm.ts), and
+ * so does a station's own welcome room standing alone, a one-module station
+ * (steersStation). Any other module flies ITSELF: the ship helm (devices.ts
+ * createHelmUI), which the station face keeps one tab away. "Bolted" is the
+ * line the ship helm already draws when it says a bolted module cannot fly,
+ * except that a pairing whose address names no room (none at all, or one the
+ * atlas cannot read) joins nothing, and a connection flagged as a berth at
+ * either end is a berth, as in the atlas.
  *
  * THE ORBIT. Stations fly perfect circles (orbits.ts, owner pick 2026-09-27):
  * a station's slot fixes its radius and its phase. Station keeping adds a
@@ -98,7 +100,7 @@ import type { CircularOrbit } from './orbits';
 import { FUEL_METER_MAX, fuelCeiling, readFuelSettlement, setFuelDrawMeter, shipVersion, subscribeShip } from './shipDoc';
 import { berthDoorIds, isBerthDoor, readAtlas, roomIdFromSeed } from './stationAtlas';
 import type { AtlasDoor, AtlasEntry } from './stationAtlas';
-import { MAX_ORBIT_SLOTS, planetById } from './stations';
+import { MAX_ORBIT_SLOTS, isStationRoom, planetById } from './stations';
 import type { StationRecord } from './stations';
 
 const TAU = 2 * Math.PI;
@@ -171,6 +173,24 @@ function berthsHere(roomId: string, live: Record<string, AtlasDoor>, atlas: Reco
     if (far !== roomId && Object.prototype.hasOwnProperty.call(atlas, far)) view[far] = atlas[far];
   }
   return berthDoorIds(view).get(roomId) ?? new Set();
+}
+
+/**
+ * Does a helm in this room steer a STATION, rather than fly the room as a
+ * ship? When the room is bolted into a station (isBoltedIntoStation), and
+ * when it is a saved or built-in station's own welcome room, even standing
+ * alone: a one-module station keeps its orbit with the trim stick too
+ * (#172's stations.isStationRoom, asked of the station records alone, since
+ * a door counts here only by the stricter rule above). Its ship face stays
+ * one tab away.
+ */
+export function steersStation(
+  roomId: string,
+  doors: Iterable<DoorRecord> | ReadonlyMap<string, DoorRecord>,
+  atlas?: Record<string, AtlasEntry>,
+  stations?: StationRecord[],
+): boolean {
+  return isBoltedIntoStation(doors, roomId, atlas) || isStationRoom(roomId, [], stations);
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -469,7 +489,7 @@ export function isBurning(trim: OrbitTrim | null, realMs: number): boolean {
 
 /** Why the stick will not fire, in the order the helm checks. */
 export type TrimRefusal =
-  | 'not-bolted' // the module is no longer station structure (a gangway came down)
+  | 'not-bolted' // the module no longer steers a station (a gangway came down)
   | 'no-station' // the atlas does not place this module in a station yet
   | 'not-commander' // only the module's owner flies the station
   | 'no-thrusters' // no engine block on this module
@@ -479,9 +499,9 @@ export type TrimRefusal =
   | 'at-limit'; // RAISE / LOWER would leave the trim band
 
 export interface TrimContext {
-  /** Is the module STILL bolted into a station (isBoltedIntoStation, read
-   *  live — the face was picked when the helm opened, and a peer can take a
-   *  gangway down while it is open)? */
+  /** Does the module STILL steer a station (steersStation: bolted into one,
+   *  or its own welcome room), read live — the face was picked when the helm
+   *  opened, and a peer can take a gangway down while it is open? */
   bolted: boolean;
   station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null;
   /** The room's trim, as read — trimFor is applied here, not by the caller. */

@@ -70,7 +70,7 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { isBoltedIntoStation, readBurnFiring, subscribeStationKeeping } from "./stationKeeping";
+import { readBurnFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
 import { subscribeSharedAtlas } from "./stationAtlas";
 import { currentRoomId, currentStation } from "./stations";
 import type { StationRecord } from "./stations";
@@ -3977,11 +3977,11 @@ function buildHelmSticks(
   attach(trimStick);
 
   // Which hand: the room's pairings (and the atlas's word on their far
-  // ends) say ship or station, live.
+  // ends), or its being a station's own welcome room, say ship or station.
   let bolted = false;
   let station: StationRecord | null = null;
   const applyFace = () => {
-    bolted = isBoltedIntoStation(readAllDoors(), currentRoomId());
+    bolted = steersStation(currentRoomId(), readAllDoors());
     fighter.visible = !bolted;
     trimStick.visible = bolted;
   };
