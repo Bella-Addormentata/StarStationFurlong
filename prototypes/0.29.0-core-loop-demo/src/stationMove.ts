@@ -49,7 +49,7 @@
 
 import * as Y from 'yjs';
 import {
-  MIN_ALTITUDE_KM, MIN_ORBIT_SEPARATION_KM, ORBIT_EPOCH_MS, circularOrbit, maxAltitudeKm, orbitForSlot,
+  MIN_ALTITUDE_KM, MIN_ORBIT_SEPARATION_KM, ORBIT_EPOCH_MS, baseOrbit, circularOrbit, maxAltitudeKm, orbitForSlot,
   orbitChangePointAt, orbitalSeconds, planOrbitChange, realMsFor, stationOrbit, stationPointAt, wrapAngle,
 } from './orbits';
 import type { CircularOrbit, OrbitChangePlan, OrbitPoint } from './orbits';
@@ -84,6 +84,13 @@ const isRadius = (v: unknown): v is number =>
 const isPhase = (v: unknown): v is number =>
   typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 2 * Math.PI;
 
+/** 🎚️ Shape guard for the altitude orbit a move leaves from. */
+function isStationOrbit(v: unknown): v is { radiusKm: number; phase0: number } {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return isRadius(o.radiusKm) && isPhase(o.phase0);
+}
+
 /** 🎚️ Shape guard for an altitude change's two orbits. */
 function isOrbitChangeRecord(v: unknown): v is OrbitChange {
   if (typeof v !== 'object' || v === null) return false;
@@ -106,6 +113,7 @@ export function isStationMove(v: unknown): v is StationMove {
         && r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.orbit === undefined || r.mode === 'orbit')
+    && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)))
     && (r.bookedAt === undefined || isTime(r.bookedAt))
     // One level only, checked before recursing: a hostile nest is refused
     // at the first step, never walked.
@@ -204,6 +212,7 @@ export function cleanMove(m: StationMove): StationMove {
         toRadiusKm: m.orbit.toRadiusKm, toPhase0: m.orbit.toPhase0,
       },
     } : {}),
+    ...(m.mode !== 'orbit' && m.fromOrbit ? { fromOrbit: { radiusKm: m.fromOrbit.radiusKm, phase0: m.fromOrbit.phase0 } } : {}),
     ...(typeof m.bookedAt === 'number' ? { bookedAt: m.bookedAt } : {}),
     ...(m.settles ? { settles: cleanMove({ ...m.settles, settles: undefined }) } : {}),
   };
@@ -349,6 +358,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
+      ...(station.orbit ? { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0 } } : {}),
       toPlanetId: quote.toPlanetId,
       toSlot: quote.toSlot,
       departAt: quote.plan.departAt,
@@ -395,10 +405,10 @@ export type AltitudePlanResult =
   | { ok: false; refusal: AltitudeRefusal; quote: AltitudeQuote | null; near?: OrbitNeighbour };
 
 /** An orbit an altitude would come too close to: a station's (by name), or
- *  an open slot's, kept clear for the next station to come. */
+ *  another slot's own orbit, kept clear for whoever settles there. */
 export interface OrbitNeighbour {
   radiusKm: number;
-  /** The station's name; absent for an open slot's orbit. */
+  /** The station's name; absent for a slot's own orbit. */
   name?: string;
 }
 
@@ -414,28 +424,26 @@ export function formatAltitude(km: number): string {
 
 /**
  * The orbits around `station`'s planet an altitude change must keep clear of:
- * every other station there (what it flies now, and where an altitude
- * change of its own is taking it), and each open slot's orbit, where the
- * next station to arrive or be built will settle. A station between planets
- * holds none; one on its way here holds the slot it is bound for.
+ * every other station there (its BASE orbit, so both keep their whole trim
+ * band, and where an altitude change of its own is taking it), and every
+ * other slot's own orbit — open now or held by a station flying an altitude
+ * of its own, which may come back to it or leave the slot to the next
+ * station to arrive or be built. A station between planets holds none.
  */
 export function orbitsToKeepClear(station: StationRecord, stations: StationRecord[], nowMs: number): OrbitNeighbour[] {
   const planet = planetById(station.planetId);
   const out: OrbitNeighbour[] = [];
-  const held = new Set<number>();
   for (const s of stations) {
     if (s.id === station.id || (station.welcomeRoomId && s.welcomeRoomId === station.welcomeRoomId)) continue;
     if (planetById(s.planetId).id !== planet.id || stationLeftPlanet(s, nowMs)) continue;
-    held.add(s.orbitSlot);
-    out.push({ radiusKm: stationOrbit(s).radiusKm, name: s.name });
+    out.push({ radiusKm: baseOrbit(s).radiusKm, name: s.name });
     const m = s.move;
     if (m && isOrbitChange(m) && m.orbit && nowMs < m.arriveAt) out.push({ radiusKm: m.orbit.toRadiusKm, name: s.name });
   }
-  // The station's own slot is its own; every other slot nobody holds is
-  // kept clear (a station on its way here settles in one of those).
-  held.add(station.orbitSlot);
+  // The station's own slot is its own to come back to; every other slot's
+  // orbit is kept clear, held or not.
   for (let slot = 0; slot < MAX_ORBIT_SLOTS; slot++) {
-    if (!held.has(slot)) out.push({ radiusKm: orbitForSlot(planet.id, slot).radiusKm });
+    if (slot !== station.orbitSlot) out.push({ radiusKm: orbitForSlot(planet.id, slot).radiusKm });
   }
   return out;
 }
@@ -534,7 +542,7 @@ export function describeAltitudeRefusal(
     case 'too-high': return `Too high: ${formatAltitude(maxAltitudeKm(planet.id))} is the highest orbit around ${planet.name}.`;
     case 'too-close': {
       const alt = near ? formatAltitude(near.radiusKm - planet.radiusKm) : '';
-      const whose = near?.name ? `${near.name}'s orbit` : 'an open orbit slot, kept clear for the next station';
+      const whose = near?.name ? `${near.name}'s orbit` : 'another slot\'s orbit, kept clear for the station it is kept for';
       return `Too close to ${whose}${alt ? ` at ${alt}` : ''}: keep ${MIN_ORBIT_SEPARATION_KM} km clear.`;
     }
     case 'moving': return 'A move or altitude change is already scheduled or under way.';
@@ -747,6 +755,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
       welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
+      ...(station.orbit ? { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0 } } : {}),
       toPlanetId: quote.toPlanetId,
       toSlot: quote.toSlot,
       departAt: quote.plan.departAt,

@@ -52,7 +52,7 @@
  * Pure: no DOM, no Three, no docs. Pinned by orbits.test.ts.
  */
 
-import { MAX_ORBIT_SLOTS, planetById } from './stations';
+import { MAX_ORBIT_SLOTS, MIN_ORBIT_SEPARATION_KM, planetById } from './stations';
 import type { PlanetRecord, StationOrbit, StationRecord } from './stations';
 
 /** The orbital clock runs this many times faster than real time: one real
@@ -159,10 +159,9 @@ export function orbitForSlot(planetId: string, slot: number): CircularOrbit {
 /** The lowest altitude a station may pick: clear of the atmosphere's drag. */
 export const MIN_ALTITUDE_KM = 200;
 
-/** Two stations' orbits around one planet stay at least this far apart, in
- *  radius: past both their station-keeping bands (±20 km each), so trimming
- *  never brings two stations within 10 km of each other's orbit. */
-export const MIN_ORBIT_SEPARATION_KM = 50;
+/** Two stations' orbits around one planet stay at least this far apart
+ *  (stations.ts keeps the value, as listStations settles clashes by it). */
+export { MIN_ORBIT_SEPARATION_KM };
 
 /** The highest altitude a station may pick around a planet: the top slot's. */
 export function maxAltitudeKm(planetId: string): number {

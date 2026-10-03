@@ -20,6 +20,7 @@ import {
   slotPosition,
   stationOrbit,
   wrapAngle,
+  setStationTrimResolver as setStationTrimResolverForTest,
 } from './orbits';
 import { stationBodies } from './map';
 import { cleanStationSummary, summaryForStation, unbindPlanetSummaryForTest } from './planetSummary';
@@ -377,5 +378,69 @@ describe('ferry routes to a station on an altitude orbit', () => {
     expect(routeStopFromWire({ ...stop, orbit })).toEqual({ ...stop, orbit });
     expect(routeStopFromWire(stop)).toEqual(stop);
     expect(routeStopFromWire({ ...stop, orbit: { radiusKm: 'far', phase0: 0 } })).toBeNull();
+  });
+});
+
+describe('Copilot round 1', () => {
+  const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => ({
+    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
+    departAt: bookedAt, arriveAt: bookedAt + 60_000, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+    orbit: { fromRadiusKm: orbitForSlot(SOV, slot).radiusKm, fromPhase0: 0, toRadiusKm: SOV_R + toAlt, toPhase0: 0 },
+  });
+
+  it('keeps every other slot\'s own orbit clear, held or not', () => {
+    // OTHER holds slot 1 but flies 1,500 km: slot 1's own orbit stays kept.
+    const other = { ...OTHER, orbit: { radiusKm: SOV_R + 1_500, phase0: 0 } };
+    const slot1 = Math.round(orbitForSlot(SOV, 1).altitudeKm);
+    const st = listStations({}, [], NOW)[0];
+    expect(altitudeConflict(SOV_R + slot1 + 10, orbitsToKeepClear(st, [st, other], NOW))?.name).toBeUndefined();
+    expect(altitudeConflict(SOV_R + slot1 + 10, orbitsToKeepClear(st, [st, other], NOW))).not.toBeNull();
+  });
+
+  it('measures the separation from base orbits, not trimmed ones', () => {
+    const base = { radiusKm: SOV_R + 1_000, phase0: 0 };
+    const other = { ...OTHER, orbit: base };
+    setStationTrimResolverForTest((s, slot) => (s.id === 'other' ? { radiusKm: slot.radiusKm + 20, phase0: slot.phase0 } : null));
+    try {
+      const st = listStations({}, [], NOW)[0];
+      // 970 km is 50 km from the trimmed 1,020 km, but only 30 from the base.
+      expect(altitudeConflict(SOV_R + 970, orbitsToKeepClear(st, [st, other], NOW))?.name).toBe('OTHER');
+    } finally {
+      setStationTrimResolverForTest(null);
+    }
+  });
+
+  it('aborts the later of two concurrent altitude changes that end too close', () => {
+    const mine = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW);
+    const theirs = climbOf('other', 'other-room', 1, 1_020, NOW + 5);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? mine : st.id === 'other' ? theirs : null));
+    const after = listStations({}, [OTHER], NOW + 120_000);
+    expect(after.find((s) => s.id === DEFAULT_STATION_ID)?.orbit?.radiusKm).toBe(SOV_R + 1_000);
+    expect(after.find((s) => s.id === 'other')?.orbit?.radiusKm).toBe(orbitForSlot(SOV, 1).radiusKm);
+    const during = listStations({}, [OTHER], NOW + 30_000).find((s) => s.id === 'other')!;
+    expect(during.move).toBeUndefined();
+    // Booked one after the other arrived: both fly (the planner keeps them apart).
+    const later = climbOf('other', 'other-room', 1, 1_020, NOW + 60_001);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? mine : st.id === 'other' ? later : null));
+    expect(listStations({}, [OTHER], NOW + 200_000).find((s) => s.id === 'other')?.orbit?.radiusKm).toBe(SOV_R + 1_020);
+  });
+
+  it('keeps the altitude flown until a later move leaves, and for good when it is cancelled', () => {
+    const climbed = { ...ctx().station!, orbit: { radiusKm: SOV_R + 1_000, phase0: 0.5 } };
+    const plan = planStationMove(ctx({ station: climbed }), 'planet-aris');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(plan.move.fromOrbit).toEqual(climbed.orbit);
+    expect(isStationMove(plan.move)).toBe(true);
+    expect(cleanMove(plan.move)).toEqual(plan.move);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? plan.move : null));
+    const waiting = listStations({}, [], plan.move.departAt - 1).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(waiting.orbit).toEqual(climbed.orbit);
+    const cancel: StationMove = {
+      ...plan.move, fromOrbit: undefined, toPlanetId: SOV, toSlot: 0, departAt: plan.move.departAt + 1,
+      arriveAt: plan.move.departAt + 2, settles: plan.move, fuel: 0, fuelDrawn: 0,
+    };
+    delete cancel.fromOrbit;
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? cancel : null));
+    expect(listStations({}, [], plan.move.arriveAt + 10).find((s) => s.id === DEFAULT_STATION_ID)?.orbit).toEqual(climbed.orbit);
   });
 });

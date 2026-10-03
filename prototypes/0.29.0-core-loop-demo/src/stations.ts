@@ -211,6 +211,10 @@ export interface StationMove {
   mode: 'thrusters' | 'tug' | 'orbit';
   /** 🎚️ On an altitude change: the two orbits it connects. */
   orbit?: OrbitChange;
+  /** 🎚️ On any other move: the altitude orbit the station flew when it was
+   *  booked, which it keeps until it leaves (and for good if the move is
+   *  cancelled). Absent: its slot's orbit. */
+  fromOrbit?: StationOrbit;
   /** The tug's room, on a tow. */
   tugRoomId?: string;
   /** Real ms the helm booked it (departAt on records from before). A move is
@@ -271,8 +275,14 @@ export function isOrbitChange(move: Pick<StationMove, 'mode' | 'settles'> | null
  *  change's new orbit once it has arrived, the one it left until then; none
  *  (its slot's orbit) for any other move. */
 export function orbitAfterMove(move: StationMove | null | undefined, nowMs: number): StationOrbit | undefined {
-  if (!move || !isOrbitChange(move)) return undefined;
+  if (!move) return undefined;
   const m = move.settles ?? move;
+  if (!isOrbitChange(move)) {
+    // Any other move keeps the altitude it left from until it leaves, and
+    // for good when a pin cancels it (it leaves before the move arrives).
+    const cancelled = !!move.settles && move.departAt < move.settles.arriveAt;
+    return (cancelled || nowMs < m.departAt) && m.fromOrbit ? { ...m.fromOrbit } : undefined;
+  }
   const o = m.orbit;
   if (!o) return undefined;
   return nowMs >= m.arriveAt
@@ -310,6 +320,11 @@ export function stationInTransit(station: Pick<StationRecord, 'move'>, nowMs: nu
 export function stationLeftPlanet(station: Pick<StationRecord, 'move'>, nowMs: number = Date.now()): boolean {
   return stationInTransit(station, nowMs) && !isOrbitChange(station.move);
 }
+
+/** 🎚️ Two stations' base orbits around one planet stay at least this far
+ *  apart in radius: past both their station-keeping bands (±20 km each), so
+ *  trimming never brings two stations within 10 km of each other's orbit. */
+export const MIN_ORBIT_SEPARATION_KM = 50;
 
 /** Slots per planet. orbits.ts spaces slots geometrically, so this also
  *  bounds how far out a station can orbit (slot 15 ≈ 190,000 km for
@@ -582,6 +597,38 @@ export function listStations(
   const wantOf = candidates.map((c) => {
     const at = placeWithMove(c.base, c.move, nowMs);
     return { ...at, planetId: planetById(at.planetId).id };
+  });
+  // 🎚️ Two stations that each booked an altitude change before seeing the
+  // other's, ending within MIN_ORBIT_SEPARATION_KM: the one booked first
+  // (then by welcome room, then id) flies; the other's burn is aborted, and
+  // it stays on the orbit it left, listed with no move.
+  const booked = (m: StationMove) => m.bookedAt ?? m.departAt;
+  const changeOf = (i: number) => {
+    const m = candidates[i].move;
+    return m && m.mode === 'orbit' && m.orbit ? m : null;
+  };
+  const firstOf = (i: number, j: number) => {
+    const a = changeOf(i)!, b = changeOf(j)!;
+    if (booked(a) !== booked(b)) return booked(a) < booked(b) ? i : j;
+    const ka = candidates[i].welcomeRoomId || candidates[i].id, kb = candidates[j].welcomeRoomId || candidates[j].id;
+    return ka !== kb ? (ka < kb ? i : j) : (candidates[i].id <= candidates[j].id ? i : j);
+  };
+  candidates.forEach((_, i) => {
+    const m = changeOf(i);
+    if (!m) return;
+    const lost = candidates.some((__, j) => {
+      const n = j === i ? null : changeOf(j);
+      return !!n && planetById(n.toPlanetId).id === planetById(m.toPlanetId).id
+        && booked(m) < n.arriveAt && booked(n) < m.arriveAt
+        && Math.abs(m.orbit!.toRadiusKm - n.orbit!.toRadiusKm) < MIN_ORBIT_SEPARATION_KM
+        && firstOf(i, j) === j;
+    });
+    if (lost) {
+      wantOf[i] = {
+        planetId: wantOf[i].planetId, orbitSlot: wantOf[i].orbitSlot,
+        orbit: { radiusKm: m.orbit!.fromRadiusKm, phase0: m.orbit!.fromPhase0 },
+      };
+    }
   });
 
   // Slots are settled in one global order, never this install's record

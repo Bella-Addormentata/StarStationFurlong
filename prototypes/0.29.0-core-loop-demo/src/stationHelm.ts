@@ -491,6 +491,12 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       if (place === 3) cells += '<div style="width:4px;"></div>';
     });
     setText('#sk-alt-digits', cells);
+    const spin = q<HTMLElement>('#sk-alt-digits');
+    const spoken = `${formatAltitude(target)}, turning the ${(10 ** altPlace).toLocaleString('en-US')}s digit`;
+    if (spin && spin.getAttribute('aria-valuetext') !== spoken) {
+      spin.setAttribute('aria-valuenow', String(target));
+      spin.setAttribute('aria-valuetext', spoken);
+    }
 
     const planet = station ? planetById(station.planetId) : null;
     setText('#sk-alt-band', planet
@@ -747,7 +753,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
           <span style="font-size:10px; font-weight:800; color:#e8e2d0; letter-spacing:2px;">ALT</span>
           <span style="font-size:8px; color:${GOLD_DIM};">KM</span>
         </div>
-        <div id="sk-alt-digits" tabindex="0" role="spinbutton" aria-label="Target orbit altitude in km. Scroll a digit to turn it, or use the arrow keys: up and down turn the selected digit, left and right pick the digit." style="display:flex; gap:3px; padding:3px 5px; border-radius:5px; background:#050302; border:1px solid rgba(0,0,0,0.9); outline-offset:2px;"></div>
+        <div id="sk-alt-digits" tabindex="0" role="spinbutton" aria-valuemin="0" aria-valuemax="${ALT_MAX}" aria-label="Target orbit altitude in km. Scroll a digit to turn it, or use the arrow keys: up and down turn the selected digit, left and right pick the digit." style="display:flex; gap:3px; padding:3px 5px; border-radius:5px; background:#050302; border:1px solid rgba(0,0,0,0.9); outline-offset:2px;"></div>
         <div style="display:flex; flex-direction:column; gap:5px; margin-left:auto;">
           <button type="button" id="sk-alt-engage" title="Fly the station to the altitude dialled (two burns)" style="padding:6px 10px; border-radius:6px; border:1px solid rgba(0,230,118,0.6); background:rgba(0,230,118,0.10); color:${GREEN}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:1px; cursor:pointer;">ENGAGE</button>
           <button type="button" id="sk-alt-sync" title="Set the window back to the altitude flown" style="padding:4px 10px; border-radius:6px; border:1px solid rgba(255,179,0,0.45); background:rgba(255,179,0,0.08); color:${AMBER}; font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">SYNC</button>
@@ -810,18 +816,25 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     // zoom while a wheel turns.
     const altWindow = panel.querySelector<HTMLElement>('#sk-alt-digits')!;
     let wheelRest = 0;
+    let wheelPlace = -1;
     altWindow.addEventListener('wheel', (e) => {
       const cell = (e.target as HTMLElement).closest<HTMLElement>('[data-alt-place]');
       if (!cell?.dataset.altPlace) return;
       e.preventDefault();
       e.stopPropagation();
+      // A part-turn on one wheel never carries over to the next one.
+      const place = Number(cell.dataset.altPlace);
+      if (place !== wheelPlace) {
+        wheelPlace = place;
+        wheelRest = 0;
+      }
       // A notched wheel sends about 100 px (or 3 lines) per notch; a
       // touchpad sends many small deltas, gathered here into notches.
       wheelRest += e.deltaMode === 0 ? e.deltaY : e.deltaMode === 1 ? e.deltaY * (WHEEL_NOTCH_PX / 3) : e.deltaY * WHEEL_NOTCH_PX;
       const notches = Math.trunc(wheelRest / WHEEL_NOTCH_PX);
       if (notches === 0) return;
       wheelRest -= notches * WHEEL_NOTCH_PX;
-      turnAltitude(Number(cell.dataset.altPlace), -notches);
+      turnAltitude(place, -notches);
     }, { passive: false });
     altWindow.addEventListener('keydown', (e) => {
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
