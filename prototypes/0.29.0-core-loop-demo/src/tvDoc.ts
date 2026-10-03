@@ -701,7 +701,9 @@ export function parseTvSource(text: string): TvSource | null {
   if (/^[A-Za-z0-9_-]{11}$/.test(t)) return { kind: 'youtube', videoId: t };
   let u: URL;
   try {
-    u = new URL(/^https?:\/\//i.test(t) ? t : `https://${t}`);
+    // A bare host gets https://; anything with a scheme of its own keeps it
+    // (and a scheme that is not http(s) is refused below, not rewritten).
+    u = new URL(/^[a-z][a-z0-9+.-]*:/i.test(t) ? t : `https://${t}`);
   } catch {
     return null;
   }

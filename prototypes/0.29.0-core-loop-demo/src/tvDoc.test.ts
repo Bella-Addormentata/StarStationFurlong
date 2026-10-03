@@ -293,6 +293,7 @@ describe('sources', () => {
     expect(parseTvSource('')).toBeNull();
     expect(parseTvSource('not a link at all')).toBeNull();
     expect(parseTvSource('javascript:alert(1)')).toBeNull();
+    expect(parseTvSource('ftp://example.org/film.mp4')).toBeNull(); // a scheme of its own is kept, then refused
     expect(parseTvSource('https://www.youtube.com/watch?v=short')).toBeNull();
   });
 
