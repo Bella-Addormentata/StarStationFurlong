@@ -421,6 +421,11 @@ export function setStationRoomSource(cb: () => string): void {
   currentRoomGetter = cb;
 }
 
+/** The room the player is standing in ('' before main.ts wires it). */
+export function currentRoomId(): string {
+  return currentRoomGetter();
+}
+
 /** The station the player is in now, or null before the atlas knows the room. */
 export function currentStation(): StationRecord | null {
   return stationForRoom(currentRoomGetter());
