@@ -7,10 +7,10 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote, isStartOnly,
+  bindTvDoc, claimRemote, countdownText, driftAction, expectedPositionMs, formatClock, handRemote, iHoldRemote, isStartOnly,
   mayPickUpRemote, parseTvSource, pickUpRemote, putDownRemote, readPlayback, readRemote,
   readSample, readTv, remoteKey, remoteStatus, renewRemote, sanitizeSource, setTvClock,
-  setTvHostPredicate, setTvIdentity, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
+  setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
   tvKey, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
   tvTogglePower, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
   TV_SEEK_OVER_MS, volumeKey,
@@ -33,6 +33,7 @@ beforeEach(() => {
   now = 1_000_000;
   setTvClock(() => now);
   setTvHostPredicate(() => false);
+  setTvPageId('A');
   bindTvDoc(doc);
   iAm(ALICE, 'Alice');
 });
@@ -43,7 +44,7 @@ describe('the remote as possession', () => {
     expect(mayPickUpRemote(TV)).toBe(true);
     expect(pickUpRemote(TV)).toEqual({ ok: true });
     expect(iHoldRemote(TV)).toBe(true);
-    expect(readRemote(TV)).toEqual({ holder: ALICE, name: 'Alice', leaseAt: now, by: ALICE });
+    expect(readRemote(TV)).toEqual({ holder: ALICE, name: 'Alice', leaseAt: now, by: ALICE, page: 'A' });
   });
 
   it('is refused to a second player while the holder keeps renewing', () => {
@@ -86,7 +87,7 @@ describe('the remote as possession', () => {
     pickUpRemote(TV);
     expect(handRemote(TV, BOB, 'Bob')).toEqual({ ok: true });
     // `by` names the GIVER: Bob's phone can tell a hand-over from his own pick-up.
-    expect(readRemote(TV)).toEqual({ holder: BOB, name: 'Bob', leaseAt: now, by: ALICE });
+    expect(readRemote(TV)).toEqual({ holder: BOB, name: 'Bob', leaseAt: now, by: ALICE, page: '' });
     expect(iHoldRemote(TV)).toBe(false);
     // Alice no longer holds it; she may not hand it on to a third player.
     expect(handRemote(TV, 'CCCCcarolpub', 'Carol')).toEqual({ ok: false, error: 'You are not holding the remote.' });
@@ -116,8 +117,41 @@ describe('the remote as possession', () => {
 
   it('a hacked remote record is read as held by nobody in particular, never trusted for names', () => {
     doc.getMap('tv').set(remoteKey(TV), { holder: 42, name: { x: 1 }, leaseAt: 'soon', by: [] });
-    expect(readRemote(TV)).toEqual({ holder: '', name: '', leaseAt: 0, by: '' });
+    expect(readRemote(TV)).toEqual({ holder: '', name: '', leaseAt: 0, by: '', page: '' });
     expect(remoteStatus(TV)).toBe('free');
+  });
+
+  it('is held by a PAGE, not a key: a second tab of the same identity is a viewer, and may take over', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    const lease = readRemote(TV).leaseAt;
+    setTvPageId('B'); // the same person, another tab (the seed is shared through localStorage)
+    expect(iHoldRemote(TV)).toBe(false);
+    expect(remoteStatus(TV)).toBe('held');
+    tick(1000);
+    renewRemote(TV);
+    expect(readRemote(TV).leaseAt).toBe(lease); // not this tab's to renew
+    expect(tvHeartbeat(TV, 5_000)).toEqual({ ok: false, error: 'You are holding the remote in another tab.' });
+    expect(mayPickUpRemote(TV)).toBe(true); // one person, one place: the newer tab takes it
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(readRemote(TV).page).toBe('B');
+    setTvPageId('A');
+    expect(iHoldRemote(TV)).toBe(false);
+  });
+
+  it('a handed remote belongs to the first of the receiver\'s pages to claim it', () => {
+    pickUpRemote(TV);
+    handRemote(TV, BOB, 'Bob');
+    expect(readRemote(TV).page).toBe('');
+    iAm(BOB, 'Bob');
+    setTvPageId('B1');
+    expect(iHoldRemote(TV)).toBe(false);
+    expect(claimRemote(TV)).toBe(true);
+    expect(iHoldRemote(TV)).toBe(true);
+    expect(readRemote(TV)).toMatchObject({ holder: BOB, page: 'B1', by: ALICE }); // the giver stays on it: the phone pops open
+    setTvPageId('B2');
+    expect(claimRemote(TV)).toBe(false); // claimed already
+    expect(iHoldRemote(TV)).toBe(false);
   });
 });
 

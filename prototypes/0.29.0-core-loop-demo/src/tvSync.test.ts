@@ -5,7 +5,7 @@
  * scheduled programme parks at 0 and starts at T0; a paused one holds.
  */
 import { describe, expect, it } from 'vitest';
-import { TvSyncController, TV_SEEK_COOLDOWN_MS } from './tvSync';
+import { TvSyncController, TV_SEEK_COOLDOWN_MS, TV_SEEK_WAIT_MS } from './tvSync';
 import type { TvPlayer } from './tvSync';
 import { TV_HEARTBEAT_MS, TV_NUDGE_RATE } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -25,7 +25,8 @@ class FakePlayer implements TvPlayer {
   duration = NaN;
   reportsDuration = true;
   private pendingSeek: number | null = null;
-  constructor(public readonly canNudge: boolean, public readonly canSeek = true, public readonly hasClock = true) {}
+  /** `canSeek` is mutable: an HTML video's ranges arrive after its metadata. */
+  constructor(public readonly canNudge: boolean, public canSeek = true, public readonly hasClock = true) {}
   isReady() { return this.ready; }
   isPlaying() { return this.playing; }
   isEnded() { return this.ended; }
@@ -401,6 +402,52 @@ describe('the holder as the room\'s clock', () => {
     h.tick();
     expect(p.position).toBe(0);
     expect(p.playing).toBe(true);
+  });
+
+  it('a newer transport target replaces a seek still landing — the old one never beats over it', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    h.transport({ positionMs: 30_000 }); // a seek…
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
+    h.transport({ positionMs: 0 }); // …then PLAY NOW from the top before it lands: within the band of where the player still reads
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000', 'seek:0']);
+    p.land(); // the newest target is what lands
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.position).toBe(0);
+    expect(h.beats).toEqual([0, 0]);
+  });
+
+  it('keeps a jump the player cannot seek to YET, withholding the beat until the seek goes out', () => {
+    const p = new FakePlayer(true);
+    p.canSeek = false; // an HTML video: ready at its metadata, ranges still to come
+    const h = harness(p, { hold: true });
+    h.transport({ positionMs: 60_000 }); // the holder's theatre opens mid-programme
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    expect(h.beats).toEqual([]); // publishing 0 now would rewind the room
+    h.tick(2_000);
+    expect(h.beats).toEqual([]);
+    p.canSeek = true; // the ranges arrived
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:60000']);
+    expect(p.position).toBe(60_000);
+    expect(h.beats).toEqual([60_000]); // landed: the first beat is where the room is
+  });
+
+  it('gives a jump up after TV_SEEK_WAIT_MS on a player that never can seek (a live stream), and beats where it is', () => {
+    const p = new FakePlayer(true);
+    p.canSeek = false;
+    const h = harness(p, { hold: true });
+    h.transport({ positionMs: 60_000 });
+    h.tick();
+    expect(h.beats).toEqual([]);
+    h.tick(TV_SEEK_WAIT_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    expect(h.beats).toEqual([0]); // the room follows the player
   });
 
   it('a player with no clock (the archive embed) is played and never beats', () => {

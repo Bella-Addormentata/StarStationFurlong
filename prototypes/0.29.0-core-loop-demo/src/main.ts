@@ -116,8 +116,8 @@ import { leaveCoinPusherRoom } from "./pusherCroupier";
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
-import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, subscribeTv } from "./tvDoc";
-import { renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv } from "./tvDoc";
+import { renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
 import { setOwnMediaOrigins } from "./tvConsent";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
@@ -7053,15 +7053,18 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
  *  pin the row (and freshly-minted invite hints) to a stale state. */
 async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
   let fingerprint: LocalFingerprint = { hex: "", base64: "", port: 4443 };
+  let nodeOrigin = "";
   try {
     const res = await fetch("http://127.0.0.1:8080/api/fingerprint");
     fingerprint = await res.json();
+    nodeOrigin = "http://127.0.0.1:8080";
   } catch {
     const res = await fetch("http://127.0.0.1:8081/api/fingerprint").catch(
       () => null,
     );
     if (res) {
       fingerprint = await res.json();
+      nodeOrigin = "http://127.0.0.1:8081";
     }
   }
   if (!fingerprint.hex) {
@@ -7078,6 +7081,10 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     fingerprint.iroh_direct_addrs,
   );
   localFingerprint = fingerprint;
+  // Identified as OUR node (it answered with a fingerprint, not merely on a
+  // loopback port): media from its origin is this machine serving this
+  // viewer, so the theatre fetches it without asking (tvConsent.ts).
+  if (nodeOrigin) setOwnMediaOrigins([window.location.origin, nodeOrigin]);
   renderReachabilityRow(fingerprint);
   return fingerprint;
 }
@@ -8757,6 +8764,13 @@ async function init() {
   // theatre from anywhere in the room.
   setTvHostPredicate(() => canEditRoom().ok);
   setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  // The remote is held by a PAGE, not a key: two tabs share the identity
+  // (the seed is in localStorage) and must not both renew, beat and release.
+  setTvPageId(
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `page-${Math.random().toString(36).slice(2, 12)}`,
+  );
   // 🕹 #193: the owner curates the cabinet and may eject P1; the seat is
   // held under my identity from this page.
   setArcadeHostPredicate(() => canEditRoom().ok);
@@ -8775,13 +8789,12 @@ async function init() {
   });
   setTvChipOpener((itemId) => openTvTheatre(itemId, tvTheatreDeps(itemId)));
   // The theatre fetches a peer-written URL only with this viewer's consent
-  // (tvConsent.ts). The page's own origin and its node's loopback origins
-  // (8080, or 8081 when 8080 is taken — the same two the fingerprint probe
-  // tries) are this viewer's own machine serving this viewer: no asking.
-  setOwnMediaOrigins([
-    window.location.origin,
-    "http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://localhost:8080", "http://localhost:8081",
-  ]);
+  // (tvConsent.ts). The page's own origin is this viewer's own machine; the
+  // node's origin joins it once the node has identified itself through the
+  // fingerprint probe (refreshLocalFingerprint) — a loopback port is never
+  // trusted for merely answering, since 8080 may be someone else's service
+  // the day the node fell back to 8081.
+  setOwnMediaOrigins([window.location.origin]);
   // A remote handed to me pops the phone open on it (plan §3.2: the
   // receiver's phone opens on the remote; no accept step). A pick-up of my
   // own is not announced — `by` names the giver.
@@ -8793,6 +8806,7 @@ async function init() {
       if (tvHeldBefore.has(id)) continue;
       const rec = readRemote(id);
       if (rec.by && rec.by !== me) {
+        selectTvRemote(id); // the phone shows the remote just received, not an earlier one
         showHint("📺 Someone handed you the TV remote.");
         (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
       }
