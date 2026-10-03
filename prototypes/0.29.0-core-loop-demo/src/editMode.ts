@@ -114,10 +114,10 @@ import { writeFurnitureItem, deleteFurnitureItem } from './furnitureDoc';
 import { addToRoomInventory, activeRoomId } from './roomInventory';
 // 🚀 The robot captain's dock stays while its ship's route runs (design §2a).
 import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
-// 🚏 …and so do the last helm, engine and fuel tank aboard.
+// 🚏 …and so do a helm, engine and fuel tank, the same ones in every game.
 import { readShipRoute, routeRulesFlightNow } from './shipRoute';
 import { isRouteRunning } from './pilotRoute';
-import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
+import { keptRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2221,10 +2221,14 @@ class RoomEditController {
     } catch {
       routeRuns = false;
     }
+    // Every game keeps the same one of each (routeKeptParts), so two people
+    // removing parts at once never take the last.
     const going = new Set([itemId, ...mountDescendantsOf(itemId).map((c) => c.id)]);
-    const lastPart = lastRoutePartTaken(itemId, FURNITURE, going, routeRuns);
-    if (lastPart) {
-      showHint(`CAN'T REMOVE — the ship's route is running and this is its last ${lastPart}. Stop the route at the helm first.`, 3200);
+    const kept = keptRoutePartTaken(itemId, FURNITURE, going, routeRuns);
+    if (kept) {
+      showHint(kept.others
+        ? `CAN'T REMOVE — the ship's route is running and keeps this ${kept.name} aboard. Remove another ${kept.name}, or stop the route at the helm first.`
+        : `CAN'T REMOVE — the ship's route is running and this is its last ${kept.name}. Stop the route at the helm first.`, 3200);
       return;
     }
     // ⛽ …and while the timetable flies the ship, no tank comes off at all.
