@@ -56,6 +56,7 @@ import {
   pruneRouteCheckpoints,
   raiseRouteFuelCeiling,
   raisedMinClient,
+  readClearedRun,
   readResolvedFlight,
   readRouteCheckpoints,
   readRouteFlight,
@@ -1364,6 +1365,99 @@ describe('the copy-back after STOP (A4)', () => {
     clock = onTime(route, start, 1)[0].arrive;
     expect(settleRouteFlight()).toBeNull();
     expect(readShipRoute()!.startedAt).toBe(T0);
+  });
+});
+
+// 🏁 The run a finish cleared: what the captain and the helm still read the
+// route's end from (shipPilot.readPilotView), even when neither read the
+// end before the finish.
+describe('the run a finish cleared (readClearedRun)', () => {
+  let off: (() => void) | null = null;
+  const install = () => { off = installRouteFlight({ capacity: () => CAP, clock: () => clock }); };
+  afterEach(() => { off?.(); off = null; });
+
+  it('keeps the run with its flight when the finish cleared it, for the doc it was cleared from', () => {
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const { route, start } = started(saved(), 70);
+    install();
+    const on = onTime(route, start, 4);
+    clock = on[0].arrive + 10 * SEC;
+    expect(stopShipRoute(clock)).toBe(true);
+    clock = on[3].arrive;
+    expect(readClearedRun()).toBeNull();
+    expect(settleRouteFlight()).toBe('finish');
+    const run = readClearedRun()!;
+    expect(run.route).toEqual({ ...route, stoppedAt: on[0].arrive + 10 * SEC });
+    expect(run.checkpoints).toEqual([start]);
+    expect(run.flight).toMatchObject({ status: 'docked', stopIndex: 1, ended: 'stop' });
+    expect(run.at).toBe(on[3].arrive);
+    // Read later, it stays as it was then.
+    clock += HOUR;
+    expect(readClearedRun()).toEqual(run);
+    // Another doc bound (another room): none.
+    bindShipDoc(new Y.Doc());
+    expect(readClearedRun()).toBeNull();
+  });
+
+  it("keeps a run another game's finish cleared, its STOP and finish reaching this game unread", () => {
+    const { route, start } = started(saved(), 70);
+    install();
+    const on = onTime(route, start, 4);
+    // The helm commander's game, with a copy of this doc.
+    const there = new Y.Doc();
+    Y.applyUpdate(there, Y.encodeStateAsUpdate(doc));
+    const sent: Uint8Array[] = [];
+    there.on('update', (u: Uint8Array) => { sent.push(u); });
+    bindShipDoc(there);
+    clock = on[0].arrive + 10 * SEC;
+    expect(stopShipRoute(clock)).toBe(true);
+    clock = on[1].arrive;
+    expect(settleRouteFlight()).toBe('finish');
+    expect(sent).toHaveLength(2);
+    // Back in this game, which has heard neither yet.
+    bindShipDoc(doc);
+    expect(readClearedRun()).toBeNull();
+    for (const u of sent) Y.applyUpdate(doc, u);
+    expect(readShipRoute()).toEqual(routeWithoutRun(route));
+    expect(readClearedRun()).toMatchObject({
+      route: { startedAt: route.startedAt, stoppedAt: on[0].arrive + 10 * SEC },
+      flight: { stopIndex: 1, ended: 'stop' },
+      at: on[1].arrive,
+    });
+  });
+
+  it('has no end for a run whose end this game never saw (STOP and the finish in one update)', () => {
+    // Refilled at home, the run would fly on: no end of its own.
+    const { route, start } = started(saved([0, 1], { homeRefuel: true }), 70);
+    install();
+    const on = onTime(route, start, 4);
+    const there = new Y.Doc();
+    Y.applyUpdate(there, Y.encodeStateAsUpdate(doc));
+    const sent: Uint8Array[] = [];
+    there.on('update', (u: Uint8Array) => { sent.push(u); });
+    bindShipDoc(there);
+    clock = on[0].arrive + 10 * SEC;
+    stopShipRoute(clock);
+    clock = on[1].arrive;
+    expect(settleRouteFlight()).toBe('finish');
+    bindShipDoc(doc);
+    Y.applyUpdate(doc, Y.mergeUpdates(sent));
+    expect(readShipRoute()).toEqual(routeWithoutRun(route));
+    expect(readClearedRun()).toMatchObject({ route: { startedAt: route.startedAt }, flight: { ended: null } });
+    expect(readClearedRun()!.route.stoppedAt).toBeUndefined();
+  });
+
+  it('keeps no flight before the route flight is installed, and the next run takes over', () => {
+    started(saved(), 70);
+    expect(stopShipRoute(T0 + SEC)).toBe(true);
+    expect(finishShipRoute()).toBe(true);
+    expect(readClearedRun()).toMatchObject({ route: { startedAt: T0 }, flight: null });
+    install();
+    clock = T0 + MIN;
+    const next = startShipRoute({ now: clock, startStop: 0, pilot: 'robot', fuel: 70, capacity: CAP })!;
+    expect(stopShipRoute(clock)).toBe(true);
+    expect(finishShipRoute()).toBe(true);
+    expect(readClearedRun()).toMatchObject({ route: { startedAt: next }, flight: { ended: 'stop' }, at: T0 + MIN });
   });
 });
 

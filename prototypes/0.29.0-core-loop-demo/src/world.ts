@@ -5183,6 +5183,8 @@ export class World {
       return;
     }
     const now = Date.now();
+    // The route's end is still read (and said from the berth door) for a
+    // while once STOP or the fuel has finished the route.
     let view: ReturnType<typeof readPilotView> = null;
     try {
       view = readPilotView(now);

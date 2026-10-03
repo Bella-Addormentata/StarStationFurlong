@@ -65,6 +65,8 @@
  * Each line is said once per stay (the memory is local, like the robot), a
  * line that went stale unsaid (the player was not in the room yet) is
  * dropped, and lines are spaced so one bubble does not replace another.
+ * The route's end is still said once the route has finished, as STOP at a
+ * docked stop does on the next tick (readPilotView's cleared run).
  * Lines go through world.ts robotSay, the one bubble-plus-voice seam. An
  * open helm shows the same lines as text (helmAnnouncerStep), so a route a
  * person flies with no robot captain still announces its stops aboard.
@@ -78,6 +80,7 @@ import { GUARD_BAND_MS, isRouteRunning, type RouteFlight } from './pilotRoute';
 import type { RobotRoutine } from './robotDoc';
 import { directoryStationFor, sameStationReader } from './routeKeeper';
 import {
+  readClearedRun,
   readRouteCheckpoints,
   readRouteFlight,
   readShipRoute,
@@ -437,10 +440,11 @@ export function pilotSpeechAfter(v: PilotLineView, mem: PilotSpeech | null, line
  *  in 3 minutes"), and the status line above it carries the exact second. */
 export const HELM_LINE_SHOW_MS = 45_000;
 
-/** One open helm's announcer: what it has "said" and the line it shows. */
+/** One open helm's announcer: what it has "said" and the line it shows
+ *  (`key`: pilotLine's, so the route's end is told from the rest). */
 export interface HelmAnnouncer {
   speech: PilotSpeech | null;
-  shown: { text: string; run: number; at: number } | null;
+  shown: { key: string; text: string; run: number; at: number } | null;
 }
 
 /** A helm that has said nothing yet. */
@@ -461,7 +465,7 @@ export function helmAnnouncerStep(a: HelmAnnouncer, v: PilotLineView | null): He
   if (line) {
     return {
       speech: pilotSpeechAfter(v, a.speech, line),
-      shown: { text: line.text, run: v.route.startedAt, at: v.now },
+      shown: { key: line.key, text: line.text, run: v.route.startedAt, at: v.now },
     };
   }
   if (a.shown && (a.shown.run !== v.route.startedAt || v.f.paused || v.now - a.shown.at >= HELM_LINE_SHOW_MS)) {
@@ -469,6 +473,21 @@ export function helmAnnouncerStep(a: HelmAnnouncer, v: PilotLineView | null): He
   }
   return a;
 }
+
+// ── The route's end, once the route has finished ────────────────────────────
+//
+// STOP at a stop the ferry is docked at ends the route there, and the helm
+// commander's game copies the timetable back and clears the run on its next
+// tick (pilotRoute.routeSettleAction's finish), as running out of fuel or of
+// berths does. The end line may not have been said by then (the gap after
+// the welcome, the room's quiet window), and a speaker may not even have
+// read the end before the finish. So for PILOT_END_HOLD_MS after this game
+// saw the run cleared, readPilotView reads the route's end as the run stood
+// then (shipRoute.readClearedRun), for the captain and the helm alike.
+
+/** How long after its route has finished a speaker still says or shows the
+ *  route's end (as long as the helm shows any line). */
+export const PILOT_END_HOLD_MS = HELM_LINE_SHOW_MS;
 
 // ── Readers (thin, effectful) ────────────────────────────────────────────────
 
@@ -513,29 +532,36 @@ function gateLookup(stop: RouteStop): (roomId: string, farDoor: string) => numbe
   };
 }
 
+/** The route port's dock at the flight's stop, read now (pilotDockAt), or
+ *  null. */
+function readPilotDock(route: ShipRoute, f: RouteFlight): PilotDock | null {
+  const stop = route.stops[f.stopIndex];
+  if (!stop || f.status !== 'docked') return null;
+  const rec = readDoor(route.shipPort);
+  if (!rec || rec.paired !== true || typeof rec.connectedRoomAddress !== 'string') return null;
+  const roomId = roomOf(rec.connectedRoomAddress);
+  if (!roomId) return null;
+  const atStop = sameStationReader()(stop, roomId);
+  const farDoor = typeof rec.farDoor === 'string' ? rec.farDoor : undefined;
+  return pilotDockAt(stop, { roomId, ...(farDoor !== undefined ? { farDoor } : {}) }, atStop, gateLookup(stop));
+}
+
 /**
  * What the captain reads at `now`: the running route, its timetable's
- * flight, the route port's dock at the stop and why a stay is skipped — or
- * null when no route runs unpaused-or-paused in this room (or no flight can
- * be derived).
+ * flight, the route port's dock at the stop and why a stay is skipped. For
+ * PILOT_END_HOLD_MS after this game saw the run cleared, the route's end as
+ * that run stood then (none when it had not ended: no end this game never
+ * saw is said). Otherwise null: no route runs, paused or not, in this room
+ * (or no flight can be derived).
  */
 export function readPilotView(now = Date.now()): PilotLineView | null {
   const route = readShipRoute();
-  if (!isRouteRunning(route)) return null;
+  if (!isRouteRunning(route)) {
+    const run = readClearedRun();
+    if (!run?.flight || run.flight.ended === null || now - run.at >= PILOT_END_HOLD_MS) return null;
+    return { route: run.route, f: run.flight, now, dock: readPilotDock(run.route, run.flight), skipWhy: staySkipWhy(run.flight, run.checkpoints) };
+  }
   const f = readRouteFlight(now);
   if (!f) return null;
-  const stop = route.stops[f.stopIndex];
-  let dock: PilotDock | null = null;
-  if (stop && f.status === 'docked') {
-    const rec = readDoor(route.shipPort);
-    if (rec && rec.paired === true && typeof rec.connectedRoomAddress === 'string') {
-      const roomId = roomOf(rec.connectedRoomAddress);
-      if (roomId) {
-        const atStop = sameStationReader()(stop, roomId);
-        const farDoor = typeof rec.farDoor === 'string' ? rec.farDoor : undefined;
-        dock = pilotDockAt(stop, { roomId, ...(farDoor !== undefined ? { farDoor } : {}) }, atStop, gateLookup(stop));
-      }
-    }
-  }
-  return { route, f, now, dock, skipWhy: staySkipWhy(f, readRouteCheckpoints()) };
+  return { route, f, now, dock: readPilotDock(route, f), skipWhy: staySkipWhy(f, readRouteCheckpoints()) };
 }

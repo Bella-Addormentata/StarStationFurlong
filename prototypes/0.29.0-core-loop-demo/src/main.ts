@@ -124,7 +124,7 @@ import {
   setHelmOwnerCheck,
   shipFuelCapacity,
 } from "./devices";
-import { completeArrival, setBerthSeedResolver } from "./shipArrival";
+import { berthPassFor, completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
 // aside for it and copies it back into the stored records when due.
@@ -1469,10 +1469,14 @@ function planetShipStatus(): ShipStatusInput | null {
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
   // 🚚 The timetable flies the route's own copy of each stop, which a stop's
   // station may have left for another planet since: its planet, not the
-  // station list's, while it rules.
-  const planetId = places
-    ? planetById(places.from.planetId).id
-    : from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
+  // station list's, while it rules, unless a live dock carries the ship
+  // along with a station at a stay (stationMove: only a live dock does).
+  const carriedBy = places && !places.to ? byId(dockedStationFor(roomId, readAllDoors().values()) ?? undefined) : undefined;
+  const planetId = carriedBy
+    ? carriedBy.planetId
+    : places
+      ? planetById(places.from.planetId).id
+      : from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const roomName = yjsSync?.doc.getMap("roomInfo").get("name");
   // 🚏📋 A ferry on its route goes by its board name, so a newer summary can
@@ -2237,7 +2241,10 @@ async function joinRoomAtEpoch(
       capacity: shipFuelCapacity,
       route: readShipRoute,
       checkpoints: readRouteCheckpoints,
-      seedFor: localSeedFor,
+      // 🎫 The passes the helm's "no pass" check counts (berthPassFor): this
+      // game's own, else the address a port of the ship remembers there, so
+      // a rider who never stood in a stop's room still reaches its board.
+      seedFor: (roomId) => berthPassFor(roomId, world?.dockingSystem?.listDockPorts() ?? []),
       write: writeDepartures,
       // ⛽ Only the room's owner fits or takes off tanks (editMode's gate).
       editsShip: isLocalHelmCommander,

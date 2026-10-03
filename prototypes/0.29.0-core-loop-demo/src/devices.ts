@@ -3393,9 +3393,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // ── Not running: a summary, or the editor (docked) ─────────────────────
     const docked = c.flight.status === 'docked';
     const savedPath = route ? esc(routePathLabel(route.stops, route.shape)) : '';
+    // 🏁 The route that just finished: its end line, a while longer.
+    const ended = announcer.shown?.key === 'end' ? line(`📢 ${esc(announcer.shown.text)}`, '#F0C060') : '';
     if (!routeOpen || !docked) {
       return box(
         title(`🚏 ROUTE${route ? ` · ${savedPath}` : ''}`, docked ? btn('toggle', route ? 'EDIT ROUTE' : 'SET UP A ROUTE', { grow: false }) : '')
+        + ended
         + line(route
           ? 'Saved, not running. Dock at one of its stops and START it from the editor.'
           : 'A ferry route flies this ship around the stations of its planet on a timetable, with a robot captain or a person at the helm.')
@@ -3494,6 +3497,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       : line(`START here at ${esc(start.fresh.stops[start.startStop].name)}: stay aboard until the ferry casts off.`, '#00E676');
     return box(
       title('🚏 ROUTE', btn('toggle', 'CLOSE', { grow: false }))
+      + ended
       + (d.stops.length ? stopRows : line('No stops yet. Add the stations the ferry calls at, in order.', 'rgba(212,168,75,0.55)'))
       + addRow
       + shapeRow
