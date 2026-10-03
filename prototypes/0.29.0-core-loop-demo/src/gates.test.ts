@@ -512,6 +512,19 @@ describe("a far room doc's shared atlas", () => {
     doc.getMap('atlas').set('room-hub', entry('room-hub', 1, {}, { 'd:p9': 9 }));
     expect(withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'].gates).toEqual({ 'd:p1': 1 });
   });
+
+  it('reads a room a peer named constructor or __proto__ as a room like any other', () => {
+    for (const odd of ['constructor', '__proto__', 'toString']) {
+      const doc = new Y.Doc();
+      const shared = doc.getMap('atlas');
+      shared.set('far-dock', entry('far-dock', 5, { 'd:hall': { targetRoomId: odd, farDoor: 'd:in', transient: false } }));
+      shared.set(odd, entry(odd, 5, { 'd:in': { targetRoomId: 'far-dock', farDoor: 'd:hall', transient: false } }, { 'd:p1': 1 }));
+      const atlas = withSharedAtlasOf(doc, readAtlas(), 'far-dock');
+      expect(Object.prototype.hasOwnProperty.call(atlas, odd)).toBe(true);
+      expect(atlas[odd].gates).toEqual({ 'd:p1': 1 });
+      expect(freeGateNumber(atlas, 'far-dock', {})).toBe(2);
+    }
+  });
 });
 
 describe('the station record', () => {

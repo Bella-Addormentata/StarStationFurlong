@@ -675,7 +675,9 @@ export function withSharedAtlasOf(
   atlas: Record<string, AtlasEntry>,
   roomId: string,
 ): Record<string, AtlasEntry> {
-  const out: Record<string, AtlasEntry> = { ...atlas };
+  // No prototype: a room id off the wire such as `constructor` or `__proto__`
+  // is a room like any other, never an inherited value read as its entry.
+  const out: Record<string, AtlasEntry> = Object.assign(Object.create(null), atlas);
   const shared = doc.getMap('atlas');
   const queued = new Set<string>([roomId]);
   const queue: string[] = [roomId];
