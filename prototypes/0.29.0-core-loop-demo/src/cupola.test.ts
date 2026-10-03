@@ -149,6 +149,15 @@ describe('floorPlan cupola setting', () => {
     writeRoomDims(2, 2);
     expect(roomCupola()).toBeNull(); // not revived over whatever went there meanwhile
   });
+
+  it('drops a cupola left dormant by a racing resize on the next resize', () => {
+    writeRoomDims(3, 2); // 18 × 12: y± are side walls
+    writeCupolaWall('y+'); // a peer's write that raced the resize
+    expect(roomCupola()).toBeNull();
+    writeRoomDims(2, 2); // y+ would be an end wall again
+    expect(readCupolaWall()).toBeNull();
+    expect(roomCupola()).toBeNull();
+  });
 });
 
 describe('buildOctagonHull with a cupola', () => {

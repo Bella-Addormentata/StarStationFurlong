@@ -888,12 +888,19 @@ export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
  * written at the same moment by two players, can both land: each was checked
  * against a doc that did not yet hold the other. Every game reaches the same
  * verdict from the merged docs, so an editor's game clears the cupola (an
- * idempotent write) and the other change stands. Run after any change to the
- * floor plan, doors, windows or furniture; returns true when it cleared.
+ * idempotent write) and the other change stands. A stored wall that is no
+ * longer an end wall is cleared the same way. Run after any change to the
+ * floor plan, doors, windows or furniture, and once on join; returns true
+ * when it cleared.
  */
 export function settleCupolaConflicts(): boolean {
+  const raw = readCupolaWall();
+  if (!raw) return false;
+  // A stored wall that is not an end wall at this size is stale too (a peer
+  // set it while another resized): left dormant it would return on a resize.
+  const dormant = !cupolaPlan(roomHalfExtents(), raw);
   const wall = roomCupola()?.wall;
-  if (!wall || validateCupolaWall(wall).ok) return false;
+  if (!dormant && (!wall || validateCupolaWall(wall).ok)) return false;
   if (!canEditRoom().ok) return false;
   writeCupolaWall(null);
   return true;

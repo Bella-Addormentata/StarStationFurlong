@@ -438,14 +438,20 @@ export function writeRoomDims(cols: number, rows: number): void {
   const r = sanitizeTileCount(rows);
   if (c === null || r === null) return;
   boundDoc!.transact(() => {
-    planMap!.set('dims', { cols: c, rows: r });
     // 🔭 A resize that makes the cupola wall a SIDE wall ends the cupola —
     // kept dormant, it could come back over doors or windows placed on that
-    // wall meanwhile, none of which validateCupolaWall ever saw.
+    // wall meanwhile, none of which validateCupolaWall ever saw. One already
+    // dormant before this resize (a peer set it while another resized) is
+    // just as stale, so it goes too.
     const cupolaWall = readCupolaWall();
-    if (cupolaWall && !cupolaPlan({ halfX: c * TILE_SIZE / 2, halfZ: r * TILE_SIZE / 2 }, cupolaWall)) {
+    if (
+      cupolaWall &&
+      (!cupolaPlan(roomHalfExtents(), cupolaWall) ||
+        !cupolaPlan({ halfX: c * TILE_SIZE / 2, halfZ: r * TILE_SIZE / 2 }, cupolaWall))
+    ) {
       planMap!.delete('cupola');
     }
+    planMap!.set('dims', { cols: c, rows: r });
     const nonDefault = c !== DEFAULT_DIMS.cols || r !== DEFAULT_DIMS.rows;
     if (nonDefault) {
       planMap!.set('meta', { v: 2 });

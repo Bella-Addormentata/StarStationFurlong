@@ -1587,9 +1587,6 @@ async function joinRoomAtEpoch(
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
-    // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
-    // the door slide), refresh an open keypad's POSITION row, and re-dress
-    // the exterior (a slid door carries its vestibule and dock port along).
     // ⚖️ A cupola that raced a door, window or furniture write ends once the
     // merged docs show the clash — after this tick's reconciles have run, so
     // the furniture list it checks matches the doc.
@@ -1605,6 +1602,10 @@ async function joinRoomAtEpoch(
     subscribeFurniture(queueCupolaSettle);
     subscribeWindowLayout(queueCupolaSettle);
     subscribeDoorLayout(queueCupolaSettle);
+    queueCupolaSettle(); // …and a clash already in the docs on join
+    // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
+    // the door slide), refresh an open keypad's POSITION row, and re-dress
+    // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
       queueCupolaSettle();
       world?.reconcileDoorPlacements();
