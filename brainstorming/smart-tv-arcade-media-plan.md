@@ -80,8 +80,12 @@ the sources that fail have to say so on the screen.
   positionMs: number,    // where the holder's player was…
   seq: number,           // …stamped with a per-write counter: a NEW seq is a new sample, which a
                          // reader anchors to its OWN receipt time; never a wall clock
+  started: number,       // the seq of the write that started the programme: a replay is a new start
+  jump: number,          // bumped by every transport write, never by a heartbeat; the holder follows it once
   history: Array<{ source, title, playedAt }>,    // cap 20
-  ui: { screen, cursor, text },                   // the start screen everyone watches the holder navigate
+  // later, not v1 — ui: { screen, cursor, text }: the start screen everyone watches the holder
+  // navigate on the prop. v1 (#207) picks sources on the phone's remote app or the panel at
+  // the set, and the prop's texture shows what is on (the status, the countdown, the holder).
 }
 // key remote:<itemId> — its own record so a lease renewal never collides with a playback write
 { holder: pub | '', name, leaseAt, by }
@@ -136,26 +140,37 @@ The holder gate is client-side and best effort — the dev-phase posture of
 `doorPolicy.ts`, not an authority boundary. The `tv` map is peer-writable:
 a modified client can write any shape-valid `tv:<id>` or `remote:<id>` (a
 different programme, position, history or lease). Every read is
-shape-checked, so the worst it can do is change what is on; nothing here is
-worth forging. When an authority boundary is needed it is the signed-op
-acceptance rule of the RoomLog (Phase 2), not more checks in the client. The
-holder shows as a 📺 badge on the name tag first; the remote prop in the hand
-is rig work shared with #190.
+shape-checked, and nothing is FETCHED on a peer's say-so: a shape-valid
+http(s) source would otherwise make every open theatre's browser request it
+(a `<video>` preloads the moment it is mounted), so the theatre mounts a
+source only when its origin is one of the product's own lanes
+(`youtube-nocookie.com`, `archive.org`), the page's own origin or its node's,
+or one this viewer accepted in this session by pressing PLAY FROM <host>; a
+loopback, link-local or private-network host that is not the viewer's own
+node is refused outright, no button offered (`tvConsent.ts` in #207). So the
+worst a modified client can do is change what is on — never make a browser
+fetch what its owner did not agree to. When an authority boundary is needed
+it is the signed-op acceptance rule of the RoomLog (Phase 2), not more checks
+in the client. The holder shows as a 📺 badge on the name tag first; the
+remote prop in the hand is rig work shared with #190.
 
 ### 3.3 The start screen and the sources
 
-The TV boots to its own home screen, drawn on the screen texture, and everyone
-watches the holder navigate it because the cursor lives in the record. The
-phone's remote app is the buttons; the TV is the display. Every tile wears its
+The TV boots to its own home screen, drawn on the screen texture. In v1 (#207)
+that texture shows what is on — the status, the countdown, who holds the
+remote — and the sources are picked on the phone's remote app or the panel at
+the set; everyone watching the holder navigate the start screen on the prop
+(a cursor in the record, the `ui` field) is a later slice. The phone's remote
+app is the buttons; the TV is the display. Every tile wears its
 lane badge (**SOVEREIGN** / **PLAYER-RUN** / **PUBLIC SWARM** / **CONVENIENCE**),
 and strict-sovereign builds grey out the convenience tiles and the public DHT.
 
 | Tile | Who fetches the bytes | Reaches the screen as | Sync | Class | Posture |
 |---|---|---|---|---|---|
-| ▶️ YouTube | each viewer, from YouTube | iframe, IFrame API | full | Convenience, single vendor | allowed, labelled, greyed out when unreachable; `youtube-nocookie.com`; no other feature may require it |
-| 🏛️ archive.org | each viewer (direct `<video>`, or via the node proxy for a texture) | `<video>` / `VideoTexture`, or their embed | full / start-time | Convenience host, sovereign backup exists | the item's `licenseurl` shown; marked-PD shelf only; every fetch offered to the station library |
+| ▶️ YouTube | each viewer, from YouTube | iframe, IFrame API | full | Convenience, single vendor | allowed, labelled, greyed out when unreachable; `youtube-nocookie.com`; no other feature may require it; on the desktop shells gated on §3.5's error-153 check — until it passes, the tile may fail from `tauri://localhost`, which v1's theatre reports as a lane failure with RETRY (browsers are unaffected) |
+| 🏛️ archive.org | each viewer (direct `<video>`, or via the node proxy for a texture) | `<video>` / `VideoTexture`, or their embed | full (a chosen file) / start-time (their embed) | Convenience host, sovereign backup exists | later, not v1: the item's `licenseurl` shown and a marked-PD shelf (v1's resolver accepts any identifier and reads only the file list and the title); every fetch offered to the station library |
 | 📺 PeerTube | the instance named; a station can run its own | iframe, embed API (`play`/`pause`/`seek`) | full | Convenience, or player-run | add it: the player-run answer to "YouTube-shaped" content |
-| 🔗 URL | the host named | `<video>` | full | Convenience | whoever pastes it is responsible for it |
+| 🔗 URL | the host named | `<video>` | full for finite, seekable media (a host with range support); start-only for a live stream or a host without usable ranges — the element's `seekable` decides, and the controller never seeks what cannot be sought | Convenience | whoever pastes it is responsible for it; each viewer's browser fetches it only after PLAY FROM <host> (§3.2), and never from a private-network host |
 | 📁 File (host's own) | host node → blob lane → viewers' nodes | `VideoTexture` from the local node | full | Pure P2P | private rooms, delete-on-leave cache |
 | 🧲 Magnet / `.torrent` | the host node from the public swarm, then the blob lane (§6) | `VideoTexture` from the local node | full | Public swarm for the fetch, pure P2P for the room | paste only, no search, no tracker list, seeding notice |
 | 🎤 Karaoke MP3+G | the singer's client (§5) | CD+G on the `CanvasTexture` + audio through Web Audio | full | Pure P2P | the host's own files; stream, don't copy |
@@ -189,10 +204,15 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
 ### 3.5 Tauri checks before the in-world iframe
 
 - YouTube **error 153** is a referrer problem: on macOS and Linux Tauri serves
-  the UI from `tauri://localhost`, which sends no `Referer`. Try
+  the UI from `tauri://localhost`, which sends no `Referer`. It gates TV v1 on
+  those shells, not only the in-world iframe: v1's theatre is itself an IFrame
+  API embed from the same origin. Until the three-shell check passes, v1's
+  defined state on a shell that fails is the lane-failure notice with RETRY
+  and nothing else depending on it (browsers are unaffected). Try
   `referrerpolicy="strict-origin-when-cross-origin"` and `youtube-nocookie.com`
-  first; the fallback is serving the UI from an http(s) loopback origin (the
-  node already listens on 8080), which also makes the proxy same-origin but
+  first; the fallback is serving the UI from an http(s) loopback origin — the
+  node's HTTP origin as the frontend discovered it (8080, or 8081 when 8080 is
+  taken; never a fixed port) — which also makes the proxy same-origin but
   moves the app's storage origin, so it is a measured decision.
 - The Linux webview (WebKitGTK) is the weakest: codecs via GStreamer; WebCodecs
   from 2.44; WebRTC reportedly absent in many builds. Treat Linux as "embeds
@@ -227,7 +247,9 @@ station library (§7).
 WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → WebTransport unidirectional
 streams (one per frame or keyframe group; 20 ms Opus frames may use datagrams)
 → node → iroh fan-out as an opaque `media` lane → viewers' `VideoDecoder` →
-three.js `VideoFrameTexture`. A keyframe every ~2 s plus keyframe-on-request.
+three.js `VideoFrameTexture`, and viewers' `AudioDecoder` (Opus) → a 60–120 ms
+jitter buffer → the Web Audio graph, spatialised at the source's position. A
+keyframe every ~2 s plus keyframe-on-request.
 A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
 three legs are detected separately and a sender advertises only the legs it
 has: `WebTransport` (Safari 26.4 is the floor per
@@ -311,18 +333,19 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   into the public DHT, and serves the station. That volunteer alone exposes
   an IP to public swarms; everyone else is hidden by construction.
 - **Who may fill it:** a signature says who enqueued an item, not that the
-  content is theirs to share or fit to seed. `library-add` is accepted only
-  from the station's owners (room owners, by key); the library-station
-  operator approves each item before any fetch (or allowlists signers); the
-  fetch verifies hash and size against the op; storage and egress run under
-  quotas; and a `library-remove` op (a denylist) is honoured by every node
-  — from the same keys that may add (the station's owners, or the
-  library-station operator): a removal signed by any other writer is
-  rejected before the denylist is applied, since a signature identifies a
-  writer without authorizing one, and an open remove would let any room
-  peer blank the whole library. Nobody can make the volunteer fetch and
-  seed arbitrary or oversized content, or drop what it holds, by writing
-  an op.
+  content is theirs to share or fit to seed. Two writer sets, stated apart.
+  `library-add` is accepted only from the station's owners (room owners, by
+  key) — the library-station operator approves each item before any fetch
+  (or allowlists signers) but does not add; the fetch verifies hash and size
+  against the op; storage and egress run under quotas. `library-remove` (a
+  denylist honoured by every node) is accepted from the station's owners AND
+  from the library-station operator, an additional remove-only authority
+  (the volunteer must be able to drop what it will not host); a removal
+  signed by anyone else is rejected before the denylist is applied, since a
+  signature identifies a writer without authorizing one, and an open remove
+  would let any room peer blank the whole library. Nobody can make the
+  volunteer fetch and seed arbitrary or oversized content, or drop what it
+  holds, by writing an op.
 
 ## 8. Tribler / IPv8, evaluated seriously
 
@@ -391,7 +414,9 @@ emulator in our page is the path that can do netplay, save states and #194.
 ROM-set versions must match the core; the owner's shelf is curated by test.
 The archive is a convenience source; the owner's own file is the sovereign
 one; the station library (§7) is the sovereign backup for ROMs exactly as for
-films, and its BLAKE3 hash doubles as the netplay determinism check.
+films, and its BLAKE3 hash is the first half of the netplay determinism check
+— the bytes. Lockstep also binds the exact core build, the emulator settings
+and the initial state, or two identical ROMs still diverge.
 
 **Engine.** EmulatorJS (libretro cores in WASM) for single-player, the menu,
 save states, gamepads and touch; its own netplay is WebRTC-based with its own
