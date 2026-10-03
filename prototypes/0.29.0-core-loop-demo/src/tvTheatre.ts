@@ -215,8 +215,12 @@ interface Theatre {
   head: HTMLDivElement;
   player: Adapter | null;
   controller: TvSyncController | null;
-  /** sourceId of what the adapter was built for ('' = nothing mounted). */
+  /** The mount key of what the adapter was built for ('' = nothing mounted):
+   *  the sourceId, plus the programme's `started` for a start-only embed. */
   mounted: string;
+  /** Bumped on every unmount: an adapter still being built (the YouTube API
+   *  loading) for an earlier attempt is thrown away when it arrives. */
+  attempt: number;
   timer: number;
   unregister: (() => void) | null;
   lastStatus: string;
@@ -281,6 +285,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     player: null,
     controller: null,
     mounted: '',
+    attempt: 0,
     timer: 0,
     unregister: null,
     lastStatus: '',
@@ -306,6 +311,7 @@ export function closeTvTheatre(): void {
 }
 
 function unmountPlayer(t: Theatre): void {
+  t.attempt += 1; // whatever is still being built for the old mount is void
   t.unregister?.();
   t.unregister = null;
   t.controller = null;
@@ -313,6 +319,14 @@ function unmountPlayer(t: Theatre): void {
   t.player = null;
   t.mounted = '';
   for (const child of [...t.screen.children]) if (child !== t.notice) child.remove();
+}
+
+/** What a mounted adapter is keyed by. A start-only embed can neither seek
+ *  nor replay, so a new programme START of the same source (PLAY NOW again,
+ *  PREVIOUSLY ON) is a new key and gets a fresh iframe; seekable players
+ *  follow a replay through the controller instead. */
+function mountKey(source: TvSource, started: number): string {
+  return isStartOnly(source) ? `${sourceId(source)}@${started}` : sourceId(source);
 }
 
 /** Put the notice up; the same words again leave the DOM (and a button in
@@ -329,14 +343,19 @@ function hideNotice(t: Theatre): void {
   t.lastNotice = '';
 }
 
-/** Build the adapter for `source`; the controller then drives it. */
-function mountPlayer(t: Theatre, source: TvSource, rtt: () => number): void {
+/** Build the adapter for `source`; the controller then drives it. Every
+ *  callback belongs to THIS attempt: an unmount in between (another source,
+ *  a failure, the set going off) voids it, so an adapter arriving late is
+ *  destroyed on arrival and never overwrites a live one. */
+function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => number): void {
   unmountPlayer(t);
-  t.mounted = sourceId(source);
+  t.mounted = key;
+  const token = t.attempt;
+  const live = () => theatre === t && t.attempt === token;
   const fail = (why: string) => {
-    if (theatre !== t || t.mounted !== sourceId(source)) return;
+    if (!live()) return;
     unmountPlayer(t);
-    t.mounted = `failed:${sourceId(source)}`;
+    t.mounted = `failed:${key}`;
     showNotice(t, `<div>${escapeHtml(why)}</div>
       <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — nothing else in the room depends on it</div>
       <button type="button" data-tv-retry="1">RETRY</button>`);
@@ -345,7 +364,7 @@ function mountPlayer(t: Theatre, source: TvSource, rtt: () => number): void {
     });
   };
   const adopt = (player: Adapter) => {
-    if (theatre !== t || t.mounted !== sourceId(source)) {
+    if (!live()) {
       player.destroy();
       return;
     }
@@ -367,7 +386,7 @@ function mountPlayer(t: Theatre, source: TvSource, rtt: () => number): void {
   const url = sourceFileUrl(source);
   if (url) {
     adopt(new HtmlVideoPlayerAdapter(t.screen, url, fail, () => {
-      if (theatre !== t) return;
+      if (!live()) return;
       // The controller retries play() every tick while blocked: the notice
       // (and the button under the finger) that is already up stays up.
       if (!t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) return;
@@ -407,8 +426,9 @@ function theatreTick(rtt: () => number): void {
     showNotice(t, pb.state === 'scheduled'
       ? `<div>${countdownText(pb.countdownMs)}</div><div class="tv-theatre-lane">archive.org's player starts at T0 — start-time sync only</div>`
       : '<div>❚❚ PAUSED</div><div class="tv-theatre-lane">archive.org\'s player has no pause: it starts from the top when the film resumes</div>');
-  } else if (t.mounted !== sourceId(rec.source!) && t.mounted !== `failed:${sourceId(rec.source!)}`) {
-    mountPlayer(t, rec.source!, rtt);
+  } else {
+    const key = mountKey(rec.source!, rec.started);
+    if (t.mounted !== key && t.mounted !== `failed:${key}`) mountPlayer(t, rec.source!, key, rtt);
   }
   t.controller?.tick();
   renderTheatreChrome(t);

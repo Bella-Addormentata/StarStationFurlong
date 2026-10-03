@@ -18,14 +18,28 @@ class FakePlayer implements TvPlayer {
   rate = 1;
   volume = -1;
   log: string[] = [];
+  /** A lazy player's seek lands only on land() — YouTube's asynchronous seekTo. */
+  lazy = false;
+  private pendingSeek: number | null = null;
   constructor(public readonly canNudge: boolean, public readonly canSeek = true, public readonly hasClock = true) {}
   isReady() { return this.ready; }
   isPlaying() { return this.playing; }
   isEnded() { return this.ended; }
   play() { this.playing = true; this.log.push('play'); }
   pause() { this.playing = false; this.log.push('pause'); }
-  /** A seek lands at once here, and un-ends the player as a <video>'s does. */
-  seek(ms: number) { this.position = ms; this.ended = false; this.log.push(`seek:${ms}`); }
+  /** A seek lands at once (unless lazy), and un-ends the player as a <video>'s does. */
+  seek(ms: number) {
+    this.log.push(`seek:${ms}`);
+    if (this.lazy) { this.pendingSeek = ms; return; }
+    this.position = ms;
+    this.ended = false;
+  }
+  land() {
+    if (this.pendingSeek === null) return;
+    this.position = this.pendingSeek;
+    this.pendingSeek = null;
+    this.ended = false;
+  }
   currentMs() { return this.position; }
   setRate(rate: number) { this.rate = rate; this.log.push(`rate:${rate.toFixed(2)}`); }
   setVolume(v: number) { this.volume = v; }
@@ -34,6 +48,7 @@ class FakePlayer implements TvPlayer {
 function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number } = {}) {
   let now = 100_000;
   let pb: PlaybackNow = { state: 'playing', positionMs: 0, running: true, countdownMs: 0 };
+  let jump = 0;
   const beats: number[] = [];
   const c = new TvSyncController({
     itemId: 'tv-1',
@@ -42,12 +57,15 @@ function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number } = {}) 
     rttMs: () => opts.rtt ?? 0,
     iHold: () => opts.hold ?? false,
     playback: () => pb,
+    jump: () => jump,
     heartbeat: (p) => beats.push(p),
     volume: () => 55,
   });
   return {
     c, beats,
     set: (next: Partial<PlaybackNow>) => { pb = { ...pb, ...next }; },
+    /** A transport write (a seek, PLAY NOW, a resume): the record's `jump` moves. */
+    transport: (next: Partial<PlaybackNow>) => { pb = { ...pb, ...next }; jump += 1; },
     tick: (ms = 500) => { now += ms; return c.tick(); },
   };
 }
@@ -190,10 +208,12 @@ describe('a viewer following the room', () => {
     const holder = new FakePlayer(true);
     let now = 100_000;
     let pos = 0;
+    let jump = 0;
     let ended = 0;
     const c = new TvSyncController({
       itemId: 'tv-1', player: holder, now: () => now, iHold: () => true,
       playback: () => ({ state: 'playing', positionMs: pos, running: true, countdownMs: 0 }),
+      jump: () => jump,
       heartbeat: () => undefined, volume: () => 50, onEnded: () => { ended++; },
     });
     c.tick();
@@ -201,7 +221,7 @@ describe('a viewer following the room', () => {
     now += 500; c.tick();
     now += 500; c.tick();
     expect(ended).toBe(1);
-    pos = 0; // played again from the top
+    pos = 0; jump += 1; // PLAY NOW again: a transport write, from the top
     now += 500; c.tick();
     expect(holder.log.at(-2)).toBe('seek:0');
     expect(holder.ended).toBe(false);
@@ -239,12 +259,13 @@ describe('an ended programme', () => {
 });
 
 describe('the holder as the room\'s clock', () => {
-  it('heartbeats its own player position every TV_HEARTBEAT_MS, after any remote-driven seek', () => {
+  it('heartbeats its own player position every TV_HEARTBEAT_MS, and follows a remote seek once', () => {
     // The record follows the holder's own beats (its write lands on itself
     // at once and extrapolates from there, as readPlayback does live).
     const p = new FakePlayer(true);
     let now = 100_000;
     let sample = { positionMs: 0, receivedAt: now };
+    let jump = 0;
     const beats: number[] = [];
     const c = new TvSyncController({
       itemId: 'tv-1',
@@ -255,6 +276,7 @@ describe('the holder as the room\'s clock', () => {
         state: 'playing', running: true, countdownMs: 0,
         positionMs: sample.positionMs + (now - sample.receivedAt),
       }),
+      jump: () => jump,
       heartbeat: (pos) => { beats.push(pos); sample = { positionMs: pos, receivedAt: now }; },
       volume: () => 50,
     });
@@ -271,31 +293,46 @@ describe('the holder as the room\'s clock', () => {
     c.tick();
     expect(beats).toEqual([1_000, 4_000]);
     expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]); // in step: never seeked itself
-    // A seek written by the remote (the record jumps far): the holder's
-    // player follows, and the SAME tick's beat reports the new place.
+    // A seek written by the remote (a transport write: the record jumps far
+    // and `jump` moves): the holder's player follows, and the SAME tick's
+    // beat reports the new place.
     sample = { positionMs: 60_000, receivedAt: now };
+    jump += 1;
     now += TV_HEARTBEAT_MS;
     c.tick();
     expect(p.position).toBe(63_000);
     expect(beats.at(-1)).toBe(63_000);
   });
 
-  it('does not beat while its player is still far from the record — a seek landing, or deferred by the cooldown', () => {
+  it('is never corrected by the record\'s own extrapolation: a buffering holder publishes where it is', () => {
     const p = new FakePlayer(true);
     const h = harness(p, { hold: true });
     h.tick(); // the baseline beat, at 0
     expect(h.beats).toEqual([0]);
-    h.set({ positionMs: 30_000 }); // a remote seek: the holder's player follows
+    // The holder's player stalls at 10 s while the record (its own last
+    // beat, extrapolated) says 20 s. No transport write happened.
+    p.position = 10_000;
+    h.set({ positionMs: 20_000 });
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    expect(p.rate).toBe(1);
+    expect(h.beats).toEqual([0, 10_000]); // the room follows the holder, not the other way round
+  });
+
+  it('does not beat while a transport seek is still landing (YouTube\'s is asynchronous)', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    expect(h.beats).toEqual([0]);
+    h.transport({ positionMs: 30_000 }); // a remote seek
     h.tick(2_600);
     expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
-    p.position = 30_000;
-    h.set({ positionMs: 60_000 }); // another, inside the seek cooldown
-    h.tick(500); // a beat is due, but the player is 30 s from the record and the seek deferred
-    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000']);
-    expect(h.beats).toEqual([0]); // publishing 30 000 now would undo the jump to 60 000
-    h.tick(1_500); // cooldown over: the seek lands, and THAT is what goes out
-    expect(p.position).toBe(60_000);
-    expect(h.beats).toEqual([0, 60_000]);
+    h.tick(500); // a beat is due, but the seek has not landed: the player still reads 0
+    expect(h.beats).toEqual([0]); // publishing 0 now would undo the jump
+    p.land();
+    h.tick(500);
+    expect(h.beats).toEqual([0, 30_000]); // what landed is what goes out
   });
 
   it('a player with no clock (the archive embed) is played and never beats', () => {

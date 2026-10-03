@@ -84,6 +84,16 @@ export interface TvRecord {
   /** …stamped with a per-write counter: a NEW seq is a new sample, which is
    *  what a receiver anchors its own clock to. Never a wall-clock time. */
   seq: number;
+  /** The seq of the write that STARTED the current programme (PLAY NOW, a
+   *  schedule): a replay of the same source is a new start, which a player
+   *  that cannot seek (the archive embed) needs to know. */
+  started: number;
+  /** The programme-ACTION revision: bumped by every transport write (play,
+   *  schedule, pause, resume, seek, stop, power) and never by a heartbeat.
+   *  The holder follows a new revision exactly once and otherwise only ever
+   *  publishes where its own player is; a lookup started under an older
+   *  revision is void. */
+  jump: number;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
   /** 0–100, a body button: anyone may change it (it is the SET's volume,
@@ -110,6 +120,8 @@ export const TV_DEFAULT: TvRecord = {
   startAt: 0,
   positionMs: 0,
   seq: 0,
+  started: 0,
+  jump: 0,
   history: [],
   volume: 70,
 };
@@ -340,6 +352,8 @@ export function readTv(itemId: string): TvRecord {
     startAt: Math.max(0, num(raw.startAt)),
     positionMs: Math.max(0, num(raw.positionMs)),
     seq: Math.max(0, Math.floor(num(raw.seq))),
+    started: Math.max(0, Math.floor(num(raw.started))),
+    jump: Math.max(0, Math.floor(num(raw.jump))),
     history,
     volume: Math.min(100, Math.max(0, Math.round(num(raw.volume, TV_DEFAULT.volume)))),
   };
@@ -476,6 +490,8 @@ export function tvPlay(itemId: string, source: TvSource, now = clock()): TvActio
     startAt: 0,
     positionMs: 0,
     seq: rec.seq + 1,
+    started: rec.seq + 1,
+    jump: rec.jump + 1,
     history: withHistory(rec, clean, now),
   } satisfies TvRecord);
   return { ok: true };
@@ -496,6 +512,8 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     startAt: Math.floor(startAt),
     positionMs: 0,
     seq: rec.seq + 1,
+    started: rec.seq + 1,
+    jump: rec.jump + 1,
     history: withHistory(rec, clean, now),
   } satisfies TvRecord);
   return { ok: true };
@@ -527,6 +545,7 @@ export function tvPause(itemId: string, positionMs: number): TvAction {
     state: 'paused',
     positionMs: Math.max(0, Math.floor(positionMs)),
     seq: rec.seq + 1,
+    jump: rec.jump + 1,
   } satisfies TvRecord);
   return { ok: true };
 }
@@ -536,7 +555,7 @@ export function tvResume(itemId: string): TvAction {
   if (!gate.ok) return gate;
   const rec = readTv(itemId);
   if (rec.state !== 'paused' || !rec.source) return { ok: false, error: 'Nothing is paused.' };
-  write(tvKey(itemId), { ...rec, state: 'playing', seq: rec.seq + 1 } satisfies TvRecord);
+  write(tvKey(itemId), { ...rec, state: 'playing', seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvRecord);
   return { ok: true };
 }
 
@@ -546,7 +565,9 @@ export function tvSeek(itemId: string, positionMs: number): TvAction {
   if (!gate.ok) return gate;
   const rec = readTv(itemId);
   if (rec.state !== 'playing' && rec.state !== 'paused') return { ok: false, error: 'Nothing is playing.' };
-  write(tvKey(itemId), { ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: rec.seq + 1 } satisfies TvRecord);
+  write(tvKey(itemId), {
+    ...rec, positionMs: Math.max(0, Math.floor(positionMs)), seq: rec.seq + 1, jump: rec.jump + 1,
+  } satisfies TvRecord);
   return { ok: true };
 }
 
@@ -555,7 +576,9 @@ export function tvStop(itemId: string): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const rec = readTv(itemId);
-  write(tvKey(itemId), { ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: rec.seq + 1 } satisfies TvRecord);
+  write(tvKey(itemId), {
+    ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: rec.seq + 1, jump: rec.jump + 1,
+  } satisfies TvRecord);
   return { ok: true };
 }
 
@@ -566,10 +589,12 @@ export function tvStop(itemId: string): TvAction {
 export function tvTogglePower(itemId: string): boolean {
   const rec = readTv(itemId);
   if (rec.state === 'off') {
-    write(tvKey(itemId), { ...rec, state: rec.source ? 'paused' : 'home', startAt: 0, seq: rec.seq + 1 } satisfies TvRecord);
+    write(tvKey(itemId), {
+      ...rec, state: rec.source ? 'paused' : 'home', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1,
+    } satisfies TvRecord);
     return true;
   }
-  write(tvKey(itemId), { ...rec, state: 'off', startAt: 0, seq: rec.seq + 1 } satisfies TvRecord);
+  write(tvKey(itemId), { ...rec, state: 'off', startAt: 0, seq: rec.seq + 1, jump: rec.jump + 1 } satisfies TvRecord);
   return false;
 }
 

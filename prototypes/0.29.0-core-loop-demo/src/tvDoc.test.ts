@@ -171,6 +171,25 @@ describe('the programme', () => {
     expect(readTv(TV).history[0]!.source).toEqual(FILM);
   });
 
+  it('every programme ACTION moves the transport revision, a heartbeat never does, and a start marks `started`', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    expect(readTv(TV)).toMatchObject({ seq: 1, started: 1, jump: 1 });
+    tvHeartbeat(TV, 3_000);
+    expect(readTv(TV)).toMatchObject({ seq: 2, started: 1, jump: 1 });
+    tvSeek(TV, 9_000);
+    expect(readTv(TV).jump).toBe(2);
+    tvPause(TV, 9_500);
+    tvResume(TV);
+    expect(readTv(TV).jump).toBe(4);
+    tvPlay(TV, FILM); // the same film again is a new START
+    expect(readTv(TV)).toMatchObject({ seq: 6, started: 6, jump: 5 });
+    tvStop(TV);
+    expect(readTv(TV).jump).toBe(6);
+    tvTogglePower(TV);
+    expect(readTv(TV).jump).toBe(7);
+  });
+
   it('schedules a start only in the future, and the countdown reads from the record alone', () => {
     expect(tvSchedule(TV, FILM, now - 1)).toEqual({ ok: false, error: 'Pick a time that is still ahead.' });
     expect(tvSchedule(TV, FILM, now + 300_000)).toEqual({ ok: true });
