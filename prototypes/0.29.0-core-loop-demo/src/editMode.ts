@@ -883,6 +883,22 @@ export function validateCupolaWall(wall: CupolaWall): CupolaVerdict {
   return { ok: true };
 }
 
+/**
+ * ⚖️ A cupola and a door, window or piece of furniture that conflicts with it,
+ * written at the same moment by two players, can both land: each was checked
+ * against a doc that did not yet hold the other. Every game reaches the same
+ * verdict from the merged docs, so an editor's game clears the cupola (an
+ * idempotent write) and the other change stands. Run after any change to the
+ * floor plan, doors, windows or furniture; returns true when it cleared.
+ */
+export function settleCupolaConflicts(): boolean {
+  const wall = roomCupola()?.wall;
+  if (!wall || validateCupolaWall(wall).ok) return false;
+  if (!canEditRoom().ok) return false;
+  writeCupolaWall(null);
+  return true;
+}
+
 // ── Window placement validity (#80 S4 — the window editor's add/tint gate) ─────
 
 /** 🪟 #80: windows are holes in the octagon side walls, so the ＋ WINDOW

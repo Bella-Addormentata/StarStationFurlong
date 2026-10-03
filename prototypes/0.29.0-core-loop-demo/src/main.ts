@@ -98,7 +98,7 @@ import {
   voteTallyView,
   windowsView,
 } from "./treasuryView";
-import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom, settleCupolaConflicts } from "./editMode";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
@@ -165,6 +165,7 @@ import {
   doorSetIsMarkedEmpty,
   seedDoorLayoutEmpty,
   seedDoorLayoutDefaults,
+  subscribeDoorLayout,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -1589,7 +1590,23 @@ async function joinRoomAtEpoch(
     // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
     // the door slide), refresh an open keypad's POSITION row, and re-dress
     // the exterior (a slid door carries its vestibule and dock port along).
+    // ⚖️ A cupola that raced a door, window or furniture write ends once the
+    // merged docs show the clash — after this tick's reconciles have run, so
+    // the furniture list it checks matches the doc.
+    let cupolaSettleQueued = false;
+    const queueCupolaSettle = () => {
+      if (cupolaSettleQueued) return;
+      cupolaSettleQueued = true;
+      setTimeout(() => {
+        cupolaSettleQueued = false;
+        settleCupolaConflicts();
+      }, 0);
+    };
+    subscribeFurniture(queueCupolaSettle);
+    subscribeWindowLayout(queueCupolaSettle);
+    subscribeDoorLayout(queueCupolaSettle);
     subscribeFloorPlan(() => {
+      queueCupolaSettle();
       world?.reconcileDoorPlacements();
       world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
       roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
