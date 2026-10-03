@@ -175,13 +175,12 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
     ships = new Set();
   }
   // 🅿️ A one-module station flying by itself is a ship until it parks: it
-  // holds no frame.
-  const flying = flyingFreeRooms(now);
+  // holds no frame (a move of its own booked since ends that: PARK).
   const list: FreeStation[] = listStations()
     // Only a derived one-module stand-in is a ship; a saved or built-in
     // station keeps its zones whoever stands in it or claims its room,
     // unless it is flying free itself.
-    .filter((s) => !!s.welcomeRoomId && !flying.has(s.welcomeRoomId)
+    .filter((s) => !!s.welcomeRoomId && !stationFlyingFree(s, now)
       && (!s.derived || (s.welcomeRoomId !== room && !ships.has(s.welcomeRoomId))))
     .flatMap((s) => {
       const st = timedStation(s, planet);
@@ -209,10 +208,12 @@ function timedStation(s: StationRecord, planet: string): FreeStation | null {
   const fromHere = planetById(m.fromPlanetId).id === planet;
   const toHere = planetById(m.toPlanetId).id === planet;
   if (!fromHere && !toHere) return null;
-  // The orbit it left: an altitude change's own, else the slot it left.
-  const before: StationRecord = m.mode === 'orbit' && m.orbit
-    ? { ...s, planetId: m.fromPlanetId, orbitSlot: m.fromSlot, orbit: { radiusKm: m.orbit.fromRadiusKm, phase0: m.orbit.fromPhase0 } }
-    : { ...s, planetId: m.fromPlanetId, orbitSlot: m.fromSlot, orbit: undefined };
+  // The orbit it left: an altitude change's own, else the custom orbit a
+  // move recorded leaving (fromOrbit), else the slot it left.
+  const fromOrbit = m.mode === 'orbit' && m.orbit
+    ? { radiusKm: m.orbit.fromRadiusKm, phase0: m.orbit.fromPhase0 }
+    : m.fromOrbit ? { radiusKm: m.fromOrbit.radiusKm, phase0: m.fromOrbit.phase0 } : undefined;
+  const before: StationRecord = { ...s, planetId: m.fromPlanetId, orbitSlot: m.fromSlot, orbit: fromOrbit };
   return {
     ...base,
     pointAt: (ms: number) => stationPointAt(ms < m.departAt ? before : s, ms),
@@ -372,12 +373,13 @@ export function isPilotingHere(): boolean {
 }
 
 /** What a cached coast depends on: the record, and the stations it met
- *  (each where it was at the record's time), so a station learned, lost or
- *  moved restarts the coast from the record, as a fresh reader would. */
+ *  (each where it was at the record's time, and when it comes or goes:
+ *  edges), so a station learned, lost or moved restarts the coast from the
+ *  record, as a fresh reader would. */
 function coastKey(rec: FreePose, stations: readonly FreeStation[]): string {
   const where = stations.map((s) => {
     const p = s.pointAt(rec.at);
-    return `${s.room}@${p.radiusKm.toFixed(6)},${p.angle.toFixed(9)}`;
+    return `${s.room}@${p.radiusKm.toFixed(6)},${p.angle.toFixed(9)}~${(s.edges ?? []).join(',')}`;
   });
   return `${JSON.stringify(rec)}|${where.join(';')}`;
 }

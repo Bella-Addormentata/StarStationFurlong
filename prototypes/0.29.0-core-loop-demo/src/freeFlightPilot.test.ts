@@ -163,7 +163,10 @@ describe('the coast watch', () => {
 const ROOM = DEFAULT_STATION_RECORD.welcomeRoomId;
 
 describe('🅿️ a station flying by itself', () => {
-  afterEach(() => setStationRoomSource(() => ''));
+  afterEach(() => {
+    setStationRoomSource(() => '');
+    setStationMoveResolver(null);
+  });
 
   it('is its own station, starts still where it is, and holds no frame while it flies', () => {
     const now = ORBIT_EPOCH_MS + 7_200_000;
@@ -203,6 +206,16 @@ describe('🅿️ a station flying by itself', () => {
       setStationRoomSource(() => 'another-room');
       resetFreeFlightPilot();
       expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + 25 * 3600_000)).toBe(true);
+      // A move of its own booked since (its PARK) opens it at once, here
+      // and among the stations a flight meets, before the memory lapses.
+      const park = { stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: ROOM, fromPlanetId: DEFAULT_PLANET_ID, fromSlot: 0,
+        toPlanetId: DEFAULT_PLANET_ID, toSlot: 0, departAt: now + 3600_000, arriveAt: now + 3600_000,
+        mode: 'thrusters' as const, bookedAt: now + 3600_000, fuel: 0, fuelDrawn: 0 };
+      setStationMoveResolver((st) => (st.welcomeRoomId === ROOM ? park : null));
+      resetFreeFlightPilot();
+      expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + 25 * 3600_000)).toBe(false);
+      expect(freeStationsAround(DEFAULT_PLANET_ID, now + 25 * 3600_000).some((s) => s.room === ROOM)).toBe(true);
+      setStationMoveResolver(null);
       // Heard of no more for FLYING_MEMORY_MS: forgotten (a false claim ends).
       resetFreeFlightPilot();
       expect(stationFlyingFree(DEFAULT_STATION_RECORD, now + FLYING_MEMORY_MS + 1)).toBe(false);
@@ -215,6 +228,24 @@ describe('🅿️ a station flying by itself', () => {
     } finally {
       g.localStorage = before;
     }
+  });
+});
+
+describe('🚚 a station booked to leave from a custom orbit', () => {
+  afterEach(() => setStationMoveResolver(null));
+
+  it('is met on that orbit until it departs', () => {
+    const now = ORBIT_EPOCH_MS + 7_200_000;
+    const r = orbitForSlot(DEFAULT_PLANET_ID, 0).radiusKm + 1_000;
+    const room = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const move = { stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: room, fromPlanetId: DEFAULT_PLANET_ID, fromSlot: 0,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now + 3600_000, arriveAt: now + 7_200_000,
+      mode: 'thrusters' as const, fromOrbit: { radiusKm: r, phase0: 0, since: now - 60_000 }, bookedAt: now, fuel: 0, fuelDrawn: 0 };
+    setStationMoveResolver((st) => (st.welcomeRoomId === room ? move : null));
+    resetFreeFlightPilot();
+    const met = freeStationsAround(DEFAULT_PLANET_ID, now).find((s) => s.room === room);
+    expect(met?.pointAt(now).radiusKm).toBeCloseTo(r, 3);
+    expect(met?.presentAt?.(now + 3_700_000)).toBe(false);
   });
 });
 

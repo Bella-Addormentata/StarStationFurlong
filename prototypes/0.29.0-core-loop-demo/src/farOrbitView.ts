@@ -45,7 +45,7 @@ import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
 // 🕹️ Ships flown by hand (issue 203): this one's pose, and others' coasted on.
 import type { FreePose } from './freeFlight';
-import { flyingFreeRooms, remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
+import { remoteFreeShips, resolvedFreePose, stationFlyingFree } from './freeFlightPilot';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { routeStayOffList } from './pilotRoute';
@@ -370,7 +370,6 @@ function readSource(now: number): Source {
   // may sit around another planet than the ship, so it is hidden in every
   // view, not only its own planet's. Only flights are drawn, on their courses.
   const flying = new Set<string>();
-  const flyingFree = flyingFreeRooms(now);
   const known = Object.values(readStore(now).ships).filter((ship) => !ship.retired);
   for (const ship of known) flying.add(ship.roomId);
   const inFlight = known.filter((ship) => ship.status === 'in-flight');
@@ -414,9 +413,10 @@ function readSource(now: number): Source {
     // A ship is listed as its own one-module station too; a flying one is
     // drawn on its transfer instead, a docked one not at all. A saved or
     // built-in station that flew by itself (Fly and park) is no station
-    // while it flies free (remembered past its summary: flyingFreeRooms),
-    // drawn as a ship while its summary lasts; parked, it is one again.
-    .filter((s) => !flyingFree.has(s.welcomeRoomId) && (!flying.has(s.welcomeRoomId) || !s.derived))
+    // while it flies free (remembered past its summary, until a move of its
+    // own is booked: stationFlyingFree), drawn as a ship while its summary
+    // lasts; parked, it is one again.
+    .filter((s) => !stationFlyingFree(s, now) && (!flying.has(s.welcomeRoomId) || !s.derived))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 
