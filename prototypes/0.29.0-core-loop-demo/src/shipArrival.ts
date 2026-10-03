@@ -191,6 +191,7 @@ export function planArrivalDock(input: {
   if (
     st.kind === 'undocked' &&
     sameRoom(st.address, berth.address) &&
+    holdsPoseOf(st.memory, berth) &&
     (berth.farDoor === undefined || st.memory.farDoor === berth.farDoor)
   ) {
     return { kind: 'dock', doorId: port.doorId, address: berth.address, retarget: null };
@@ -238,6 +239,14 @@ function sameRoom(a: string, b: string): boolean {
   } catch {
     return false;
   }
+}
+
+/** A port's tombstone holds the berth door's pose, wherever the berth gives
+ *  one: a door moved along its wall keeps its room and id, so the berth's
+ *  pose (the directory's, as the door is now) is what DOCK must place by. */
+function holdsPoseOf(memory: DockBerthMemory, berth: StationBerth): boolean {
+  return (berth.farWall === undefined || memory.farWall === berth.farWall)
+    && (berth.farLateral === undefined || memory.farLateral === berth.farLateral);
 }
 
 /** The berth to remember at the station being left: the first docked port,
