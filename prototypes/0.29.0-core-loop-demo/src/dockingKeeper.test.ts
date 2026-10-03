@@ -2,7 +2,8 @@
  * 🚏 A route keeper's DOCK through the docking system (docking.ts
  * redockPortAnswer, keeper mode): the far berth is asked over an await, and
  * the rider carve-out that let the keeper ask may be gone by the answer; a
- * far write the station never acknowledged is taken back.
+ * far write the station never acknowledged is taken back. And the keypad
+ * keeps the route's port on its door while the route runs (removeDockPort).
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -29,9 +30,10 @@ import * as Y from 'yjs';
 import { DoorDockingPortSystem } from './docking';
 import type { FarDockRequest, FarDockResult } from './docking';
 import { classifyDockPort } from './dockRules';
-import { bindDoorPolicy, writeDoorPolicy } from './doorPolicy';
+import { bindDoorPolicy, readDoorPolicy, writeDoorPolicy } from './doorPolicy';
 import { bindDoorsDoc, readDoor, writeDoorTombstone } from './doorsDoc';
-import { bindShipDoc } from './shipDoc';
+import { bindShipDoc, writeFuelLevel } from './shipDoc';
+import { finishShipRoute, startShipRoute, stopShipRoute, writeShipRoute, type RouteStop } from './shipRoute';
 
 const SEED_BERTH = 'ssf://room#room=stop-berth';
 
@@ -117,5 +119,51 @@ describe("a keeper's DOCK and the rider carve-out", () => {
     expect(answer).toMatchObject({ ok: false, reason: 'unreachable' });
     expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
     expect(asks.map((a) => a.kind)).toEqual(['dock']);
+  });
+});
+
+describe("the route's port at the keypad", () => {
+  const stop = (i: number): RouteStop => ({
+    stationId: `st-${i}`,
+    name: `Stop ${i}`,
+    planetId: 'planet-sovereign',
+    orbitSlot: i,
+    berth: { roomId: `room-${i}`, farDoor: 'x+', anyGate: true },
+    waitSecs: 60,
+  });
+  let docking: DoorDockingPortSystem;
+
+  beforeEach(() => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindDoorPolicy(doc);
+    // The route's port, undocked from a stop it has left (in flight).
+    writeDoorPolicy('north', { passage: 'public', construction: 'owner', adapter: true });
+    writeDoorTombstone('north', SEED_BERTH, { farDoor: 'south', farWall: 'y+', undockedAt: 1000 });
+    writeDoorPolicy('east', { passage: 'public', construction: 'owner', adapter: true });
+    docking = new DoorDockingPortSystem(new THREE.Group());
+    expect(writeShipRoute({ stops: [stop(0), stop(1)], shape: 'backAndForth', shipPort: 'north' })).toBe(true);
+    writeFuelLevel(100, 100);
+  });
+
+  // Copilot (PR 180): in flight the route's port is undocked, so the docked
+  // refusal alone let the keypad take it off, and the ferry could dock
+  // nowhere at its next stop.
+  it('keeps the port on while the route runs, and lets it go once the route has ended', () => {
+    const now = Date.now();
+    expect(startShipRoute({ now, startStop: 0, pilot: 'person', fuel: 100, capacity: 100 })).not.toBeNull();
+    expect(docking.removeDockPort('north')).toMatch(/the ship's route docks through this door/);
+    expect(readDoorPolicy('north').adapter).toBe(true);
+    expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+    // STOP pressed, the route still runs until it finishes.
+    expect(stopShipRoute(now + 1000)).toBe(true);
+    expect(docking.removeDockPort('north')).not.toBeNull();
+    // Another door's port is not the route's.
+    expect(docking.removeDockPort('east')).toBeNull();
+    expect(readDoorPolicy('east').adapter).toBe(false);
+    expect(finishShipRoute()).toBe(true);
+    expect(docking.removeDockPort('north')).toBeNull();
+    expect(readDoorPolicy('north').adapter).toBe(false);
   });
 });

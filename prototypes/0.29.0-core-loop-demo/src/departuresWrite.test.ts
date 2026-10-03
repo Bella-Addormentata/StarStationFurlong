@@ -247,6 +247,42 @@ describe('the departures publisher', () => {
     expect(h.p.busyRooms()).toEqual([]);
   });
 
+  // Copilot (PR 180): a snapshot sent on late, after a newer route left its
+  // other stops behind, must not overwrite a finish offered there since.
+  it('🔢 an older snapshot sent on late never replaces newer news offered to a stop, nor drops its retry', async () => {
+    const h = harness();
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // A (running) goes to room-1 and stays in flight
+    const a = h.calls[0].pub;
+    const { startedAt: _a, startStop: _b, ...finished } = running();
+    h.setRoute(finished);
+    h.p.routeWritten({ kind: 'finish', run: T0 });
+    await h.tick(); // B (the finish) goes to room-0…
+    const b = h.calls[1].pub;
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-0']);
+    await h.answer(1, 'written'); // …then on to room-2 (room-1, busy with A, keeps it waiting)
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-0', 'pass:room-2']);
+    await h.answer(2, 'unreachable'); // room-2 missed B: a retry waits
+    expect(h.timers.map((t) => t.ms)).toEqual([DEPARTURES_RETRY_MS[0]]);
+    // START C: a route that calls at none of these stops.
+    const next: ShipRoute = { ...running(), stops: [stop(3, 3), stop(4, 4)] };
+    h.setRoute(next);
+    h.setCkpts([startCheckpoint(next, { at: T0 + 1000, pilot: 'person', fuel: 100 })!]);
+    h.p.routeWritten({ kind: 'start', legSeq: 0 });
+    await h.tick(); // C goes to room-3
+    // room-1 answers A at last: B, waiting there, goes next, and A goes on to
+    // no stop B was offered to.
+    await h.answer(0, 'written');
+    expect(h.calls.filter((c) => c.pub === a)).toHaveLength(1);
+    expect(h.calls.filter((c) => c.address === 'pass:room-1').map((c) => c.pub)).toEqual([a, b]);
+    // B's retry at room-2 comes due, and is sent.
+    const sent = h.calls.length;
+    await h.tick(DEPARTURES_RETRY_MS[0]);
+    expect(h.calls).toHaveLength(sent + 1);
+    expect(h.calls[sent]).toMatchObject({ address: 'pass:room-2' });
+    expect(h.calls[sent].pub).toBe(b);
+  });
+
   it('another ferry this game boards never drops the first one’s retry at a shared stop', async () => {
     const h = harness({ route: () => ({ ...running(), stops: [stop(0, 0), stop(1, 1)] }) });
     h.p.routeWritten({ kind: 'start', legSeq: 0 });
