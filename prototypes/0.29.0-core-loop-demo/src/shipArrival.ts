@@ -34,6 +34,7 @@ import {
   type FlightRecord,
 } from './shipDoc';
 import { isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
+import { currentRoomId } from './stations';
 
 /** The slice of a dock port the planner reads (docking.ts DockPortView). */
 export interface ArrivalPort {
@@ -147,7 +148,14 @@ export function planArrivalDock(input: {
       (!stationBerth.farDoor && sameRoom(stationBerth.address, remembered.address)))
       ? remembered
       : stationBerth;
-  if (!berth) return { kind: 'none', reason: 'no-berth' };
+  if (ports.some((p) => p.state.kind === 'docked'
+    && [stationBerth, remembered].some((b) => b && sameRoom((p.state as { address: string }).address, b.address)))) {
+    return { kind: 'none', reason: 'already-docked' };
+  }
+  // A berth that names no far door is none: DOCK only asks the station for a
+  // named door, and without that answer it would pair this side alone, a
+  // dock the station never accepted.
+  if (!berth || berth.farDoor === undefined) return { kind: 'none', reason: 'no-berth' };
   if (ports.some((p) => p.state.kind === 'docked' && sameRoom(p.state.address, berth.address))) {
     return { kind: 'none', reason: 'already-docked' };
   }
@@ -332,9 +340,15 @@ export function completeArrival(
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
   if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
-  const settled = (ok: boolean | void): void => opts.onSettled?.(ok !== false
-    ? { kind: 'docked', stationName: station.name }
-    : { kind: 'none', stationName: station.name, reason: 'berths-taken' });
+  // The answer belongs to the ship's room: once the player has joined another
+  // room, whose helm is the one shown now, it is not heard.
+  const shipRoom = currentRoomId();
+  const settled = (ok: boolean | void): void => {
+    if (currentRoomId() !== shipRoom) return;
+    opts.onSettled?.(ok !== false
+      ? { kind: 'docked', stationName: station.name }
+      : { kind: 'none', stationName: station.name, reason: 'berths-taken' });
+  };
   const failed = (err: unknown): void => {
     console.warn('[ship] arrival DOCK threw:', err);
     settled(false);

@@ -89,9 +89,9 @@ import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
-import { isBoltedIntoStation } from "./stationKeeping";
+import { steersStation } from "./stationKeeping";
 import { createStationHelmUI } from "./stationHelm";
-import { currentStation } from "./stations";
+import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
 import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
@@ -5530,13 +5530,14 @@ export class World {
               }
             : undefined,
         );
-      // 🛰️ A module bolted into a station by a gangway steers the STATION:
-      // its helm opens the station keeping face (small trim stick) and keeps
-      // the ship face one tab away for fuel and the docking computer.
-      const bolted = () => isBoltedIntoStation(readAllDoors().values());
-      const ui = bolted()
-        ? createStationHelmUI({ bolted, station: () => currentStation(), shipFace })
-        : shipFace();
+      // 🛰️ A module bolted into a station by a gangway, or a station's own
+      // welcome room standing alone, steers the STATION: its helm opens the
+      // station keeping face (small trim stick) and keeps the ship face one
+      // tab away for fuel and the docking computer. Every helm opens through
+      // the station helm, so one opened on the ship face offers station
+      // keeping once its module comes to steer a station.
+      const bolted = () => steersStation(currentRoomId(), readAllDoors());
+      const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }

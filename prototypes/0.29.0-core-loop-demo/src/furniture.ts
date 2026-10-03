@@ -70,8 +70,9 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { isBoltedIntoStation, readBurnFiring, subscribeStationKeeping } from "./stationKeeping";
-import { currentStation } from "./stations";
+import { readBurnFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
+import { subscribeSharedAtlas } from "./stationAtlas";
+import { currentRoomId, currentStation } from "./stations";
 import type { StationRecord } from "./stations";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
@@ -3975,21 +3976,29 @@ function buildHelmSticks(
   part(gimbal, new THREE.SphereGeometry(0.02, 12, 10), m(0xffb300, 0.4, 0.2, 0xffb300, 0.3), 0, 0.066, 0);
   attach(trimStick);
 
-  // Which hand: the room's pairings say ship or station, live.
+  // Which hand: the room's pairings (and the atlas's word on their far
+  // ends), or its being a station's own welcome room, say ship or station.
+  // With it, the station this install places the room in: the stick leans
+  // only for a burn on its orbit (readBurnFiring), as the dashboard shows
+  // it. Both are read again on every door, atlas or station keeping change,
+  // as soon as the room changes (on the first join, main.ts names the room
+  // only after this console is built, and says nothing when it does), and
+  // once a second besides: a station record saved on this install
+  // (stations.registerStation) says nothing either.
+  const FACE_EVERY_S = 1;
   let bolted = false;
   let station: StationRecord | null = null;
-  const applyFace = () => {
-    bolted = isBoltedIntoStation(readAllDoors().values());
+  let faceRoom = "";
+  let faceAge = 0;
+  const readFace = () => {
+    faceRoom = currentRoomId();
+    faceAge = 0;
+    bolted = steersStation(faceRoom, readAllDoors());
     fighter.visible = !bolted;
     trimStick.visible = bolted;
-  };
-  // The station this install places the room in: the stick leans only for a
-  // burn on its orbit (readBurnFiring), as the dashboard shows it.
-  const readStation = () => {
     station = currentStation();
   };
-  applyFace();
-  readStation();
+  readFace();
 
   // A burn leans the small stick: RAISE pulls it back toward the pilot, LOWER
   // pushes it away, AHEAD leans it to the pilot's right (−x), BACK to the left.
@@ -3997,6 +4006,8 @@ function buildHelmSticks(
   const lean = { x: 0, z: 0 };
   const anim = {
     update(dt: number): void {
+      faceAge += dt;
+      if (faceAge >= FACE_EVERY_S || currentRoomId() !== faceRoom) readFace();
       let tx = 0;
       let tz = 0;
       // The burn firing now on this station's orbit, whatever order the log
@@ -4020,11 +4031,11 @@ function buildHelmSticks(
   const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(0x1c262e, 1, 0), 0, 0.01, 0);
   carrier.visible = false;
   carrier.userData.propAnim = anim;
-  carrier.userData.disposeHelmFace = subscribeDoors(() => {
-    applyFace();
-    readStation(); // the doors can move the room to another station
-  });
-  carrier.userData.disposeHelmTrim = subscribeStationKeeping(readStation);
+  // The doors can move the room to another station too.
+  carrier.userData.disposeHelmFace = subscribeDoors(readFace);
+  // A far room's records arrive by gossip: one can make a door a berth.
+  carrier.userData.disposeHelmAtlas = subscribeSharedAtlas(readFace);
+  carrier.userData.disposeHelmTrim = subscribeStationKeeping(readFace);
 }
 
 /** ⚓ #163: the helm's docking-computer face — a round port glyph (the
