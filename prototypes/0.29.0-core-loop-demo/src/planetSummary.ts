@@ -560,8 +560,9 @@ function onPlanet(v: { planetId: string }, planet: string | null): boolean {
 }
 
 /** The keys this client knows first-hand: the station it stands in and the
- *  ship it is aboard. Retention keeps them whatever peers stamp. And the
- *  planet it is at (null when it cannot place itself). */
+ *  ship it is aboard. Retention keeps them whatever peers stamp, and the
+ *  stations its planet lists too (listedAt). And the planet it is at (null
+ *  when it cannot place itself). */
 function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<string>; planet: string | null } {
   const stations = new Set<string>();
   const ships = new Set<string>();
@@ -579,7 +580,7 @@ function firstHandKeys(store?: Store): { stations: Set<string>; ships: Set<strin
   const planet = current && !standIn ? planetById(current.planetId).id
     : shipEntry && !shipEntry.retired ? planetById(shipEntry.planetId).id
       : null;
-  return { stations, ships, planet };
+  return { stations: listedAt(planet, store, stations), ships, planet };
 }
 
 /** The room this client stands in, unless it is known to be no ship. */
@@ -751,6 +752,15 @@ function admittedAt(planet: string, stations: Iterable<StationSummary>, listed: 
   };
 }
 
+/** `keep`, plus the rooms of the learned stations `planet` lists from what
+ *  `store` knows (admittedAt): a store or map past its cap keeps them by
+ *  rank, not by stamp, so every install that heard them lists the same. */
+function listedAt(planet: string | null, store: Store | undefined, keep: Set<string>): Set<string> {
+  if (!planet || !store) return keep;
+  for (const room of admittedAt(planet, Object.values(store.stations), listStations()).admitted) keep.add(room);
+  return keep;
+}
+
 /**
  * Register the learned stations around `planetId` as station records, so
  * their slots (and so their orbits) match every other client's. A place this
@@ -782,10 +792,13 @@ export function registerLearnedStations(
   // A planet with more stations than slots lists the same learned ones on
   // every install, whatever order their summaries came in (admittedAt); a
   // learned record ranked out goes, since an earlier order may have let it in.
+  // So, when these summaries are all the planet has (prune), does one whose
+  // summary is gone: a full store let it go, and it would hold a slot.
   stations = [...stations]; // walked twice
   const { admitted, displaced } = admittedAt(planet, stations, listed);
   for (const r of [...saved.values()]) {
-    if (isLearnedRecord(r) && planetById(r.planetId).id === planet && displaced.has(r.welcomeRoomId)) {
+    if (isLearnedRecord(r) && planetById(r.planetId).id === planet
+      && (opts.prune ? !admitted.has(r.welcomeRoomId) : displaced.has(r.welcomeRoomId))) {
       removeStation(r.id);
       saved.delete(r.id);
       changed++;
