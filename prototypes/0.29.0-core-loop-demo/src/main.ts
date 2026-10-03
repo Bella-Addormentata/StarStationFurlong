@@ -125,6 +125,8 @@ import {
   shipFuelCapacity,
 } from "./devices";
 import { completeArrival, setBerthSeedResolver } from "./shipArrival";
+// 🕹️ Free flight (issue 203): the coast watch and the shared pose.
+import { readFreePose, settleFreeCoast } from "./freeFlightPilot";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
 // aside for it and copies it back into the stored records when due.
@@ -1469,6 +1471,11 @@ function planetShipStatus(): ShipStatusInput | null {
   if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
   if (rec.departedAt !== undefined) out.departedAt = rec.departedAt;
   if (rec.etaAt !== undefined) out.etaAt = rec.etaAt;
+  // 🕹️ Flown by hand: where it is, as last written (readers coast it on).
+  if (rec.status === "free-flight") {
+    const free = readFreePose();
+    if (free) out.free = free;
+  }
   // 🚏📋 A9 item 7: a route ferry's gate, next stop, departure and status,
   // for the all-gates boards of other rooms ("as of" this summary's time).
   // 🏁 Just routeIdle for a ship with no running route. Old clients drop
@@ -2312,6 +2319,13 @@ async function joinRoomAtEpoch(
       return;
     }
     const rec = readFlightRecord();
+    // 🕹️ Flown by hand with nobody at the stick here: the coast's zone rules
+    // (a ship drifting into a station's approach zone slows at its edge) are
+    // written back for everyone.
+    if (rec.status === "free-flight") {
+      settleFreeCoast();
+      return;
+    }
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).

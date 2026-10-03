@@ -340,8 +340,16 @@ describe('shipDoc flight record', () => {
     expect(isLegalFlightTransition('redocking', 'docked')).toBe(true);
     expect(isLegalFlightTransition('redocking', 'in-flight')).toBe(true);
     expect(isLegalFlightTransition('redocking', 'undocking')).toBe(false);
+    // 🕹️ Flown by hand (issue 203): in from docked, out only through
+    // redocking (AUTO-DOCK).
+    expect(isLegalFlightTransition('docked', 'free-flight')).toBe(true);
+    expect(isLegalFlightTransition('free-flight', 'redocking')).toBe(true);
+    expect(isLegalFlightTransition('free-flight', 'docked')).toBe(false);
+    expect(isLegalFlightTransition('free-flight', 'in-flight')).toBe(false);
+    expect(isLegalFlightTransition('in-flight', 'free-flight')).toBe(false);
+    expect(isLegalFlightTransition('redocking', 'free-flight')).toBe(false);
     // Idempotent self-transitions always legal (an owner republish).
-    for (const s of ['docked', 'undocking', 'in-flight', 'redocking'] as const) {
+    for (const s of ['docked', 'undocking', 'in-flight', 'redocking', 'free-flight'] as const) {
       expect(isLegalFlightTransition(s, s)).toBe(true);
     }
   });
@@ -859,6 +867,19 @@ describe('flightWritePath — copying a derived flight back along legal edges', 
     expect(flightWritePath({ status: 'redocking', locationId: HIGH_ORBIT.id }, docked)).toEqual([docked]);
     expect(flightWritePath({ status: 'undocking', locationId: HOME.id, destinationId: L4.id }, docked)).toEqual([docked]);
     expect(flightWritePath({ status: 'docked', locationId: HOME.id }, inFlight)).toEqual([inFlight]);
+  });
+
+  it('🕹️ free flight reaches docked through redocking', () => {
+    const free = { status: 'free-flight' as const, locationId: HOME.id };
+    expect(flightWritePath(free, docked)).toEqual([{ status: 'redocking', locationId: HIGH_ORBIT.id }, docked]);
+    expect(isFlightRecord(free)).toBe(true);
+    // Free flight names no destination and keeps no flight times.
+    const doc = freshDoc();
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    expect(writeFlightRecord({ ...free, destinationId: L4.id, departedAt: 1_000, etaAt: 2_000 })).toBe(true);
+    expect(readFlightRecord()).toEqual(free);
+    expect(pairingAllowedByFlight(readFlightRecord()).ok).toBe(false);
+    doc.destroy();
   });
 
   it('in-flight reaches docked only through redocking, arrived where the target is', () => {

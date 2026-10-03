@@ -43,6 +43,8 @@
  *     in-flight    ▶  redocking   commander tick, once now ≥ etaAt
  *     redocking    ▶  docked      COMPLETE REDOCK (helm button)
  *     redocking    ▶  in-flight   reserved bounce-back
+ *     docked       ▶  free-flight 🕹️ UNDOCK & FLY: a person takes the stick
+ *     free-flight  ▶  redocking   🕹️ AUTO-DOCK close to a station
  *     <any>        ▶  <same>      idempotent self-republish (commander race)
  *
  * Two legal DEPART paths — the state machine (isLegalFlightTransition) accepts
@@ -112,8 +114,11 @@ export function findDestination(id: string): Destination {
 // ── Records (plan §2) ────────────────────────────────────────────────────────
 
 /** Flight state machine states. `docked` / `in-flight` are the resting states;
- *  `undocking` / `redocking` are transitional hand-offs (see the ASCII above). */
-export type FlightStatus = 'docked' | 'undocking' | 'in-flight' | 'redocking';
+ *  `undocking` / `redocking` are transitional hand-offs (see the ASCII above).
+ *  🕹️ `free-flight` (issue 203): a person flies the ship by hand from the
+ *  helm; where it is lives in its own record (freeFlight.ts), and
+ *  `locationId` names the station it undocked from. */
+export type FlightStatus = 'docked' | 'undocking' | 'in-flight' | 'redocking' | 'free-flight';
 
 /** Serializable flight record — one per module. Plain JSON (no nested Y types). */
 export interface FlightRecord {
@@ -219,7 +224,7 @@ export function shipDocHandle(): { doc: Y.Doc; map: Y.Map<unknown> } | null {
 
 // ── Shape guards (values cross a trust boundary — see module header) ─────────
 
-const FLIGHT_STATUSES: readonly FlightStatus[] = ['docked', 'undocking', 'in-flight', 'redocking'];
+const FLIGHT_STATUSES: readonly FlightStatus[] = ['docked', 'undocking', 'in-flight', 'redocking', 'free-flight'];
 
 /** `locationId` and `destinationId` are compared against DESTINATIONS on read
  *  (unknown ⇒ home), so we only sanity-check bounded string shape here — a
@@ -724,7 +729,8 @@ export function isLegalFlightTransition(from: FlightStatus, to: FlightStatus): b
       // 'in-flight' without a visible undocking hand-off, the reserved SLOW
       // path pauses at 'undocking' for a future preflight-animation slice.
       // Both are downstream of canDepart at the caller (owner, fuel, chain).
-      return to === 'undocking' || to === 'in-flight';
+      // 🕹️ UNDOCK & FLY hands the ship to a person's stick.
+      return to === 'undocking' || to === 'in-flight' || to === 'free-flight';
     case 'undocking':
       // Reserved slow-path successors: continue to 'in-flight' or abort back
       // to 'docked'. No writer produces 'undocking' in the shipped SH3 code
@@ -734,6 +740,9 @@ export function isLegalFlightTransition(from: FlightStatus, to: FlightStatus): b
       return to === 'in-flight' || to === 'docked';
     case 'in-flight': return to === 'redocking';
     case 'redocking': return to === 'docked' || to === 'in-flight'; // arrive or bounced
+    // 🕹️ Flown by hand (issue 203): AUTO-DOCK goes through 'redocking', so
+    // shipArrival.completeArrival docks it like any other arrival.
+    case 'free-flight': return to === 'redocking';
   }
 }
 
@@ -757,6 +766,12 @@ export function flightWritePath(from: FlightRecord | null, to: FlightRecord): Fl
       locationId: to.locationId,
       ...(from.etaAt !== undefined ? { etaAt: from.etaAt } : {}),
     };
+    if (to.status === 'docked') return [redocking, to];
+    if (to.status === 'undocking') return [redocking, docked, to];
+  }
+  // 🕹️ Flown by hand: AUTO-DOCK's own way in, through 'redocking'.
+  if (from.status === 'free-flight') {
+    const redocking: FlightRecord = { status: 'redocking', locationId: to.locationId };
     if (to.status === 'docked') return [redocking, to];
     if (to.status === 'undocking') return [redocking, docked, to];
   }

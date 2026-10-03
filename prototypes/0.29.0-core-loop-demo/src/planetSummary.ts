@@ -41,6 +41,8 @@
 import * as Y from 'yjs';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
+import { cleanPose, isFreePose } from './freeFlight';
+import type { FreePose } from './freeFlight';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor } from './stationMove';
@@ -158,6 +160,10 @@ export interface ShipSummary {
   /** Set when the room stopped being a ship (bolted into a station, a
    *  fitting removed): a newer stamp that withdraws the entry everywhere. */
   retired?: true;
+  /** 🕹️ A ship flown by hand (status `free-flight`, issue 203): its pose as
+   *  last written, which readers coast forward (freeFlight.coastTo). An
+   *  older client drops the whole entry (it does not know the status). */
+  free?: FreePose;
   updatedAt: number;
 }
 
@@ -193,7 +199,7 @@ export const SHIP_HEARTBEAT_MS = 3600 * 1000;
  *  old, so a long hold or pause never ages off the boards (they drop a
  *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
 export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
-const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
+const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking', 'free-flight'];
 const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
 
 const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LEN;
@@ -408,6 +414,7 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
   if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
+  if (out.status === 'free-flight' && isFreePose(v.free)) out.free = cleanPose(v.free);
   return out;
 }
 
