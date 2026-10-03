@@ -121,7 +121,8 @@ import { dockLockedByMove } from "./stationMove";
 // 🚏 A4: every flight gate here reads the flight the ship is really on — a
 // running ferry route's timetable (never written) while it rules, else the
 // stored record — or a far write lands while the ferry is between stops.
-import { readResolvedFlight } from "./shipRoute";
+import { readResolvedFlight, readShipRoute } from "./shipRoute";
+import { routePortTaken, ROUTE_PORT_REFUSAL } from "./routeParts";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2009,8 +2010,9 @@ export class DoorDockingPortSystem {
     });
 
     // ⚓ #163: the dock chips — ✕ on the PORT removes this door's half
-    // (refund; refused while docked, and it closes the remembered berth), ✕ on
-    // the MATING HALF unstages it (refund).
+    // (removeDockPort: refund; refused while docked or the route's port, and
+    // it closes the remembered berth), ✕ on the MATING HALF unstages it
+    // (refund).
     document.getElementById("docking-chips")?.addEventListener("click", (e) => {
       const el = (e.target as HTMLElement).closest<HTMLElement>("[data-dock-chip]");
       if (!el) return;
@@ -2018,34 +2020,16 @@ export class DoorDockingPortSystem {
       const state = doorId ? this.doorState.get(doorId) : null;
       if (!doorId || !state || !this.canConstruct(doorId)) return;
       if (this.dockOp(doorId)?.busy) return; // a dock/undock is running
-      const record = readDoor(doorId);
       if (el.dataset.dockChip === "unstage-mate") {
         if (state.pairedSuccessfully || !isDockChain(state.segments)) return;
         this.refundWorkingChain(state);
         state.segments = undefined;
       } else if (el.dataset.dockChip === "remove-port") {
-        const port = classifyDockPort(record);
-        if (port.kind === "docked") {
-          this.showAssemblyNotice(doorId, "Docked — UNDOCK before removing the port.");
+        const refusal = this.removeDockPort(doorId);
+        if (refusal) {
+          this.showAssemblyNotice(doorId, refusal);
           return;
         }
-        // A staged mating half has nothing to mate with any more.
-        if (isDockChain(state.segments) && !state.pairedSuccessfully) {
-          this.refundWorkingChain(state);
-          state.segments = undefined;
-        }
-        if (readDoorPolicy(doorId).adapter) refundPart("adapter");
-        // Removing the port CLOSES the berth: the tombstone keeps refusing
-        // the old dock's mirror, but loses its memory, so neither this door's
-        // DOCK nor the far side's may re-make the connection (dockRules
-        // farDockPatch reads a plain tombstone naming it — or any tombstone
-        // on a door without a port — as "closed"). ONE transaction: a far
-        // room's DOCK session reading this room never sees the port gone
-        // while the old berth memory still stands.
-        transactDoorWrites(() => {
-          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
-          if (port.kind === "undocked") writeDoorTombstone(doorId, port.address);
-        });
       }
       this.assemblyNotice = null;
       this.renderAssemblyStrip(doorId);
@@ -2566,6 +2550,8 @@ export class DoorDockingPortSystem {
               ${action ? `<button type="button" data-dock-chip="${action}" title="Remove (refunds the part)" style="background:none; border:none; color:#ff8a80; font-size:9px; cursor:pointer; padding:0 1px;">✕</button>` : ""}
             </span>`;
     const hasPort = this.doorHasPort(doorId);
+    // 🚏 The running route's ship port stays on (removeDockPort refuses it).
+    const portLocked = hasPort && this.routePortLocked(doorId);
     const docked = state.pairedSuccessfully && isDockChain(segs);
     const mateStaged = !state.pairedSuccessfully && isDockChain(segs);
     const mayEdit = this.canConstruct(doorId);
@@ -2584,8 +2570,12 @@ export class DoorDockingPortSystem {
       chips.innerHTML =
         dockChip(
           "PORT · this door",
-          mayEdit && !docked ? "remove-port" : undefined,
-          docked ? "UNDOCK before removing the port" : "This door's half of the docking adapter",
+          mayEdit && !docked && !portLocked ? "remove-port" : undefined,
+          docked
+            ? "UNDOCK before removing the port"
+            : portLocked
+              ? `This door's half of the docking adapter. It stays: ${ROUTE_PORT_REFUSAL}`
+              : "This door's half of the docking adapter",
         ) +
         (docked
           ? dockChip("MATED · far door's half", undefined, "Both halves locked together — UNDOCK releases them")
@@ -2685,6 +2675,52 @@ export class DoorDockingPortSystem {
    *  construction rights — the same gate as building a connection there. */
   public canOperateDock(doorId: string): boolean {
     return this.canConstruct(doorId);
+  }
+
+  /** 🚏 Is this door the ship's route port while the route runs (a paused
+   *  route included)? routeParts.routePortTaken. */
+  private routePortLocked(doorId: string): boolean {
+    let route: ReturnType<typeof readShipRoute> = null;
+    try {
+      route = readShipRoute();
+    } catch {
+      route = null;
+    }
+    return routePortTaken(doorId, route);
+  }
+
+  /**
+   * ⚓ #163: the ✕ on a door's PORT chip — take this door's half of the
+   * docking adapter off (refunding it, and a staged mating half). Refused
+   * while docked, and (🚏) while the ship's route docks through this door, a
+   * paused route included: in flight its port is undocked, so the docked
+   * refusal alone would let it go and leave the ferry nowhere to dock at its
+   * next stop. The caller has checked the player may build here. Returns the
+   * refusal, or null once the port is off.
+   */
+  removeDockPort(doorId: string): string | null {
+    if (this.routePortLocked(doorId)) return `Can't remove the port — ${ROUTE_PORT_REFUSAL}.`;
+    const port = classifyDockPort(readDoor(doorId));
+    if (port.kind === "docked") return "Docked — UNDOCK before removing the port.";
+    // A staged mating half has nothing to mate with any more.
+    const state = this.doorState.get(doorId);
+    if (state && isDockChain(state.segments) && !state.pairedSuccessfully) {
+      this.refundWorkingChain(state);
+      state.segments = undefined;
+    }
+    if (readDoorPolicy(doorId).adapter) refundPart("adapter");
+    // Removing the port CLOSES the berth: the tombstone keeps refusing
+    // the old dock's mirror, but loses its memory, so neither this door's
+    // DOCK nor the far side's may re-make the connection (dockRules
+    // farDockPatch reads a plain tombstone naming it — or any tombstone
+    // on a door without a port — as "closed"). ONE transaction: a far
+    // room's DOCK session reading this room never sees the port gone
+    // while the old berth memory still stands.
+    transactDoorWrites(() => {
+      writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: false });
+      if (port.kind === "undocked") writeDoorTombstone(doorId, port.address);
+    });
+    return null;
   }
 
   private showAssemblyNotice(doorId: string, text: string): void {

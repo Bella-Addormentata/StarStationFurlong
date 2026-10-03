@@ -3,7 +3,8 @@
  * engine block and fuel tank aboard while the ship's route runs (a paused
  * one included): without a helm nobody could STOP, SKIP or RESUME it (the
  * route keeper would fly on regardless), and without an engine or a tank the
- * module is no ship. The route's ship port stays too (routePortTaken). And
+ * module is no ship. The route's ship port stays too, its door and the
+ * docking port on it, in edit mode and at the keypad (routePortTaken). And
  * while the timetable flies the ship, its tanks stay as they are
  * (tanksLockedByRoute). The DEV menu's PLACE, which replaces every piece in
  * the room, waits for the route to stop (templateSwapLockedByRoute). Pure;
@@ -74,11 +75,16 @@ export function templateSwapLockedByRoute(route: { startedAt?: number } | null):
   return !!route && route.startedAt !== undefined;
 }
 
+/** 🚪 Why the route's ship port can't be removed now (edit mode's door, the
+ *  keypad's PORT). */
+export const ROUTE_PORT_REFUSAL = "the ship's route docks through this door. Stop the route at the helm first";
+
 /**
- * 🚪 Would removing door `doorId` take a running route's ship port (a paused
- * route included)? The keeper docks and casts off through it at every stop,
- * and in flight it is unpaired, so edit mode's paired-door refusal would let
- * it go and leave the ferry nowhere to dock. `route`: the ship's route.
+ * 🚪 Would removing door `doorId`, or the docking port on it, take a running
+ * route's ship port (a paused route included)? The keeper docks and casts off
+ * through it at every stop, and in flight it is unpaired, so edit mode's
+ * paired-door refusal (and the keypad's docked one) would let it go and leave
+ * the ferry nowhere to dock. `route`: the ship's route.
  */
 export function routePortTaken(doorId: string, route: { shipPort: string; startedAt?: number } | null): boolean {
   return !!route && route.startedAt !== undefined && route.shipPort === doorId;
