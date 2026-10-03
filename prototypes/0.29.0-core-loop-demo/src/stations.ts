@@ -407,12 +407,28 @@ export function stationRoomCause(
   if (!roomId) return null;
   let bolted = false;
   for (const rec of doors) {
-    if (rec.paired === true && !isBerthDoor(rec)) { bolted = true; break; }
+    if (rec.paired === true && !isBerthDoor(rec) && joinsAnotherRoom(rec.connectedRoomAddress, roomId)) {
+      bolted = true;
+      break;
+    }
   }
   if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) {
     return bolted ? 'welcome-room' : 'lone-station';
   }
   return bolted ? 'bolted' : null;
+}
+
+/** Does a pairing's address name another room, as the atlas reads it? One
+ *  naming no room (a peer's junk, or one the parser throws on) or naming
+ *  `roomId` itself joins it to none. */
+function joinsAnotherRoom(address: string | undefined, roomId: string): boolean {
+  if (!address) return false;
+  try {
+    const target = roomIdFromSeed(address);
+    return target !== '' && target !== roomId;
+  } catch {
+    return false;
+  }
 }
 
 /** Is `roomId` a station's own room (stationRoomCause)? */

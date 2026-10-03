@@ -335,6 +335,15 @@ describe('stationForRoom / planetForRoom', () => {
     // is no part of it), free to fly by hand but still never to DEPART.
     expect(stationRoomCause('b1', [])).toBe('lone-station');
     expect(stationRoomCause('b1', [dock('ship')])).toBe('lone-station');
+    // A pairing whose address names no room (a peer's junk, or one the
+    // parser throws on), or names this room itself, joins it to no other
+    // room, as the atlas reads it: it bolts nothing.
+    const junk = (address: string) => ({ paired: true as const, connectedRoomAddress: address });
+    expect(stationRoomCause('ship', [junk('ssf://join#room=%')])).toBeNull();
+    expect(stationRoomCause('ship', [junk('not a pass')])).toBeNull();
+    expect(stationRoomCause('ship', [gangway('ship')])).toBeNull();
+    expect(stationRoomCause('b1', [gangway('b1'), junk('ssf://join#room=%')])).toBe('lone-station');
+    expect(stationRoomCause('ship', [junk('ssf://join#room=%'), gangway('a1')])).toBe('bolted');
   });
 
   it('finds the station a lone module is docked at from its live doors', () => {
