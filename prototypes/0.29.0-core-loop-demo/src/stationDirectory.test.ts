@@ -121,6 +121,13 @@ describe('the station record as destinations', () => {
     expect(out[3].berth).toBeUndefined();
   });
 
+  it('names every berth room, even ones this client holds no seed for', () => {
+    const gated = [{ ...records[1], berths: [{ roomId: 'mod-2', doorId: 'north', gate: 1 }, { roomId: 'mod-9', doorId: 'east', gate: 2 }] }];
+    const [out] = destinationsFromRecords(gated, (rid) => seeds[rid]);
+    expect(out.berths?.map((b) => b.address)).toEqual(['seed-mod']);
+    expect(out.berthRooms).toEqual(['mod-2', 'mod-9']);
+  });
+
   it('works as the live directory', () => {
     setStationDirectory(directoryFromStationRecords(() => records, (rid) => seeds[rid], () => 'furlong-station'));
     expect(destinationsFrom('furlong-station').map((s) => s.id)).toEqual(['station:mod-2', 'far', 'odd']);

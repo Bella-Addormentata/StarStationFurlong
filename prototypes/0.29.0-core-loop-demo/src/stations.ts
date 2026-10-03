@@ -26,7 +26,7 @@
  * planet) is the natural next step once ship travel needs it.
  */
 
-import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed } from './stationAtlas';
+import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
 import { isAcceptableDoorKey } from './doorsDoc';
@@ -74,12 +74,90 @@ export interface StationRecord {
   /** Optional door id of the berth port in the welcome room — a door key
    *  doorsDoc accepts (a record naming any other could never be docked at). */
   berthDoor?: string;
+  /** ⚓🚦 Every gate an arriving ship may dock at, in gate order. listStations
+   *  fills it from the station atlas (every dock port of the station, with its
+   *  gate number); a record keeps a list it learned (a station whose rooms
+   *  this install has not mapped), and a plain `berthDoor` reads as one
+   *  berth; an empty list means known to have none. `berthDoor` stays for older builds: listStations sets it to the
+   *  lowest gate in the welcome room when the record names none. */
+  berths?: StationBerthRecord[];
   /** Set on stations derived from an atlas component with no record. */
   derived?: true;
   /** A move to another planet that is scheduled or under way (stationMove.ts).
    *  listStations fills it from the move resolver; once the move arrives the
    *  station is listed at its new planet and slot, and this is gone. */
   move?: StationMove;
+}
+
+/** ⚓🚦 One gate of a station: a dock port an arriving ship may berth at. */
+export interface StationBerthRecord {
+  roomId: string;
+  doorId: string;
+  /** The port's gate number (doorPolicy); absent for a berth that has none
+   *  (a record's plain berthDoor, a port fitted before gates existed). */
+  gate?: number;
+  /** The atlas shows a ship docked there. Local knowledge: never stored or
+   *  shared, only listed. */
+  occupied?: boolean;
+  /** Who the station lets dock there, when not every ship (doorPolicy
+   *  gateAccess): pass holders, one reserved ship's room, or none. */
+  access?: 'pass' | 'reserved' | 'closed';
+  reservedFor?: string;
+}
+
+/** Gates a station lists at most: one per gate number. */
+export const MAX_BERTHS = 99;
+
+/** One berth, shape-checked (peer-written when it came through a summary),
+ *  without the local `occupied` flag. Null when it is not one. */
+export function cleanBerth(v: unknown): StationBerthRecord | null {
+  if (typeof v !== 'object' || v === null) return null;
+  const b = v as Record<string, unknown>;
+  if (typeof b.roomId !== 'string' || !b.roomId || b.roomId.length > MAX_ID_LENGTH) return null;
+  if (typeof b.doorId !== 'string' || !isAcceptableDoorKey(b.doorId)) return null;
+  const out: StationBerthRecord = { roomId: b.roomId, doorId: b.doorId };
+  if (typeof b.gate === 'number' && Number.isInteger(b.gate) && b.gate >= 1 && b.gate <= 99) out.gate = b.gate;
+  // Access that cannot be read closes the gate (as doorPolicy reads a port's):
+  // only none, or an explicit 'open', leaves it open.
+  if (b.access === undefined || b.access === 'open') return out;
+  if (b.access === 'pass' || b.access === 'closed') out.access = b.access;
+  else if (b.access === 'reserved' && typeof b.reservedFor === 'string'
+    && b.reservedFor.length > 0 && b.reservedFor.length <= MAX_ID_LENGTH) {
+    out.access = 'reserved';
+    out.reservedFor = b.reservedFor;
+  } else out.access = 'closed';
+  return out;
+}
+
+/** A list of berths, cleaned, deduplicated by port and capped. */
+export function cleanBerths(v: unknown): StationBerthRecord[] {
+  // A longer list than any station lists is junk, not a prefix to trust:
+  // duplicates could otherwise push a real gate past the cut.
+  if (!Array.isArray(v) || v.length > MAX_BERTHS * 4) return [];
+  const valid: StationBerthRecord[] = [];
+  const seen = new Set<string>();
+  for (const item of v) {
+    const b = cleanBerth(item);
+    if (!b) continue;
+    const key = `${b.roomId}\u0000${b.doorId}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    valid.push(b);
+  }
+  // One slot per gate number first (as cleanGates): ports repeating a number,
+  // or with none, only fill what is left, so they cannot crowd a gate out.
+  const numbers = new Set<number>();
+  const firsts: StationBerthRecord[] = [];
+  const rest: StationBerthRecord[] = [];
+  for (const b of valid) {
+    if (b.gate !== undefined && !numbers.has(b.gate)) { numbers.add(b.gate); firsts.push(b); } else rest.push(b);
+  }
+  const out = [...firsts, ...rest].slice(0, MAX_BERTHS);
+  // In gate order whatever order a peer sent (unnumbered berths last, then
+  // by room and door), so arrivals try the lowest gate first.
+  const cmp = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
+  return out.sort((x, y) => (x.gate ?? Infinity) - (y.gate ?? Infinity)
+    || cmp(x.roomId, y.roomId) || cmp(x.doorId, y.doorId));
 }
 
 /**
@@ -273,7 +351,7 @@ export function readStationRecords(): StationRecord[] {
 /** Most JSON a record's extra fields may take (a newer build's, or a peer's
  *  carried by the shared planet summary); past it they are dropped. */
 const MAX_EXTRA_JSON = 1024;
-const CORE_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'derived']);
+const CORE_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived']);
 
 /** The record's fields this build does not know, kept as they are while
  *  they are plain JSON within MAX_EXTRA_JSON, so a newer build's (or a
@@ -297,6 +375,9 @@ function clean(r: StationRecord): StationRecord {
     orbitSlot: r.orbitSlot,
     welcomeRoomId: r.welcomeRoomId,
     ...(r.berthDoor ? { berthDoor: r.berthDoor } : {}),
+    // An empty list is kept: it says the station is known to have no gates.
+    ...(Array.isArray(r.berths) && (r.berths.length === 0 || cleanBerths(r.berths).length > 0)
+      ? { berths: cleanBerths(r.berths) } : {}),
   };
 }
 
@@ -540,6 +621,57 @@ export function listStations(
     const spot = spots[i];
     if (spot) out.push(c.make(spot.planetId, spot.orbitSlot, spot.move));
   });
+  return out.map((st) => withBerths(st, atlas));
+}
+
+/**
+ * ⚓🚦 A listed station with its gates: the atlas's (every dock port of the
+ * station, free or docked) together with the gates the record learned in
+ * rooms the atlas has not harvested, else its plain berthDoor. A record
+ * naming no berthDoor gets the lowest gate in its welcome room as one, for
+ * builds that read only that; once the welcome room's gates are known, a
+ * berthDoor that is not one of them is replaced the same way, or dropped.
+ */
+function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): StationRecord {
+  const gates = stationGates(atlas, st.welcomeRoomId);
+  let berths: StationBerthRecord[];
+  let knownNone = false;
+  // A room this client's atlas has harvested with gates (even none) is
+  // known: learned gates in it are gone, not merely unseen. Only rooms it
+  // knows nothing of keep what the record learned, beside the atlas's own.
+  const unknown = (roomId: string) => atlas[roomId]?.gates === undefined;
+  const learned = (st.berths ?? []).filter((b) => unknown(b.roomId));
+  if (gates.length > 0) {
+    const seen: StationBerthRecord[] = gates.map((g) => ({
+      roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
+      ...(g.access ? { access: g.access, ...(g.reservedFor ? { reservedFor: g.reservedFor } : {}) } : {}),
+    }));
+    berths = [...seen, ...learned]
+      .map((b, i) => ({ b, i }))
+      .sort((x, y) => (x.b.gate ?? MAX_BERTHS + 1) - (y.b.gate ?? MAX_BERTHS + 1) || x.i - y.i)
+      .map((x) => x.b)
+      .slice(0, MAX_BERTHS);
+  } else {
+    berths = learned;
+    // An empty list means "known to have none" (a summary's, or this atlas's
+    // own harvest of the welcome room): only an unknown station falls back.
+    knownNone = Array.isArray(st.berths) || (!!st.welcomeRoomId && !unknown(st.welcomeRoomId));
+    if (berths.length === 0 && !knownNone && st.berthDoor && st.welcomeRoomId) {
+      berths = [{ roomId: st.welcomeRoomId, doorId: st.berthDoor }];
+    }
+  }
+  const out: StationRecord = { ...st };
+  if (berths.length > 0 || knownNone) out.berths = berths; else delete out.berths;
+  const inWelcome = berths.filter((b) => b.roomId === st.welcomeRoomId);
+  if (st.welcomeRoomId && !unknown(st.welcomeRoomId)) {
+    // The welcome room's gates are known: a berthDoor that is no longer one of
+    // them is stale, so it gives way to the lowest gate there, or to none.
+    if (!inWelcome.some((b) => b.doorId === out.berthDoor)) {
+      if (inWelcome.length > 0) out.berthDoor = inWelcome[0].doorId; else delete out.berthDoor;
+    }
+  } else if (!out.berthDoor && inWelcome.length > 0) {
+    out.berthDoor = inWelcome[0].doorId;
+  }
   return out;
 }
 

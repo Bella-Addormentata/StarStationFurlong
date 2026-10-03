@@ -25,7 +25,7 @@
  */
 
 import * as Y from 'yjs';
-import { hasDoorLayout } from './doorLayoutDoc';
+import { LEGACY_ID_WALL, doorExistsIn, hasDoorLayout } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -43,6 +43,58 @@ export interface DoorPolicyRecord {
    *  permanence, either side detaches). Owner installs/removes (consumes/
    *  refunds an ADAPTER part). */
   adapter?: boolean;
+  /** ⚓🚦 The port's GATE number (airport-style, 1..MAX_GATE), shown on
+   *  departure boards and tried in order by arriving ships. Stored, never
+   *  derived, so gates never renumber as other ports come and go: assigned
+   *  the lowest free number in the station when the port is fitted, editable
+   *  by the owner at the door panel, cleared when the port is removed. Only
+   *  meaningful while `adapter` is true. */
+  gate?: number;
+  /** ⚓🚦 Who may dock at this gate — the station owner's choice, shown to
+   *  captains and enforced by the far end of every DOCK (dockRules
+   *  farDockPatch refuses `not-allowed`). Absent = 'open'. Only meaningful
+   *  while `adapter` is true. */
+  gateAccess?: GateAccess;
+  /** With `gateAccess: 'reserved'`: the one ship (its ROOM id) that may dock
+   *  here — an airline's own gate. A room id, never a pass. */
+  reservedFor?: string;
+}
+
+/** ⚓🚦 open: any ship · pass: captains the owner granted at this door (the
+ *  door panel's request/grant) · reserved: one named ship · closed: none. */
+export type GateAccess = 'open' | 'pass' | 'reserved' | 'closed';
+export const GATE_ACCESS: readonly GateAccess[] = ['open', 'pass', 'reserved', 'closed'];
+const MAX_RESERVED_ID = 128;
+
+/** The access fields of a stored value, or none (open). Peer-written, and
+ *  read by the far end of every DOCK, so it fails closed: only no access at
+ *  all, or an explicit 'open', opens the gate; a restriction it cannot read
+ *  (an unknown value, a reservation naming no ship) closes it. */
+function cleanAccess(raw: Partial<DoorPolicyRecord> | undefined): Pick<DoorPolicyRecord, 'gateAccess' | 'reservedFor'> {
+  const a = raw?.gateAccess;
+  if (a === undefined || a === 'open') return {};
+  if (a === 'pass' || a === 'closed') return { gateAccess: a };
+  if (a === 'reserved' && typeof raw?.reservedFor === 'string'
+    && raw.reservedFor.length > 0 && raw.reservedFor.length <= MAX_RESERVED_ID) {
+    return { gateAccess: 'reserved', reservedFor: raw.reservedFor };
+  }
+  return { gateAccess: 'closed' };
+}
+
+/** Highest gate number a port may carry. */
+export const MAX_GATE = 99;
+
+/** Is `v` a gate number? */
+export function isGateNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= MAX_GATE;
+}
+
+/** The lowest gate number not in `taken` (1 when none are), or null when
+ *  every number is used. */
+export function nextFreeGate(taken: Iterable<number>): number | null {
+  const used = new Set(taken);
+  for (let g = 1; g <= MAX_GATE; g++) if (!used.has(g)) return g;
+  return null;
 }
 
 export interface DoorRightsRequest {
@@ -129,6 +181,8 @@ function sanitizePolicy(value: unknown): DoorPolicyRecord {
     ...(raw?.oneWay === 'in' || raw?.oneWay === 'out' ? { oneWay: raw.oneWay } : {}),
     construction: raw?.construction === 'request' || raw?.construction === 'public' ? raw.construction : 'owner',
     adapter: raw?.adapter === true,
+    ...(raw?.adapter === true && isGateNumber(raw?.gate) ? { gate: raw.gate } : {}),
+    ...(raw?.adapter === true ? cleanAccess(raw) : {}),
   };
 }
 
@@ -139,7 +193,68 @@ function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
     ...(policy.oneWay === 'in' || policy.oneWay === 'out' ? { oneWay: policy.oneWay } : {}),
     construction: policy.construction,
     adapter: policy.adapter === true,
+    ...(policy.adapter === true && isGateNumber(policy.gate) ? { gate: policy.gate } : {}),
+    ...(policy.adapter === true ? cleanAccess(policy) : {}),
   };
+}
+
+/** ⚓🚦 A gate's access as the atlas carries it: absent when open. */
+export interface GateAccessRecord {
+  access: Exclude<GateAccess, 'open'>;
+  reservedFor?: string;
+}
+
+function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
+  if (!p.adapter || !p.gateAccess || p.gateAccess === 'open') return null;
+  return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
+}
+
+/** ⚓🚦 The dock ports a room's layout has (doors whose policy fits an
+ *  adapter), with their policies, for the gate readers. Walking the layout
+ *  rather than the policy map means stale or junk policy keys (a removed
+ *  door's, a peer's) can never crowd a live port out of a capped scan. The
+ *  walk covers the whole layout map, as the room's own door list
+ *  (doorLayoutDoc.readAllDoorLayout) does, and only ports count toward the
+ *  cap: doors without an adapter, however many, cannot hide one. */
+function portsIn(doc: Y.Doc, policies: Y.Map<unknown>): Array<[string, DoorPolicyRecord]> {
+  const out: Array<[string, DoorPolicyRecord]> = [];
+  const take = (id: string): void => {
+    if (!doorExistsIn(doc, id)) return;
+    const p = sanitizePolicy(policies.get(id));
+    if (p.adapter) out.push([id, p]);
+  };
+  let any = false;
+  for (const id of doc.getMap('doorLayout').keys()) {
+    if (doorExistsIn(doc, id)) any = true;
+    take(id);
+    if (out.length >= 256) break;
+  }
+  // A legacy room keeps no layout records: its doors are the cardinal ones.
+  if (!any) for (const id of Object.keys(LEGACY_ID_WALL)) take(id);
+  return out;
+}
+
+/** ⚓🚦 Every non-open gate access of this room's ports, by door id. */
+export function readGateAccess(): Record<string, GateAccessRecord> {
+  const out: Record<string, GateAccessRecord> = {};
+  if (!docAlive()) return out;
+  for (const [doorId, p] of portsIn(boundDoc!, policyMap!)) {
+    const a = accessRecord(p);
+    if (a) out[doorId] = a;
+  }
+  return out;
+}
+
+/** ⚓🚦 One door's gate access in ANY doc (the far room's, during a DOCK),
+ *  with whether `pub` holds the owner's grant at that door. */
+export function gateAccessIn(
+  doc: Y.Doc, doorId: string, pub?: string,
+): { access: GateAccess; reservedFor?: string; granted: boolean } {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { access: 'open', granted: false };
+  const a: { access: GateAccess; reservedFor?: string } =
+    accessRecord(sanitizePolicy(doc.getMap('doorPolicy').get(doorId))) ?? { access: 'open' };
+  const granted = !!pub && isGrant(doc.getMap('doorGrants').get(reqKey(doorId, pub)));
+  return { ...a, granted };
 }
 
 /** ⚓ #163: does this door of ANY doc wear a docking-adapter port? (The far
@@ -156,14 +271,48 @@ export function dockPortFlagIn(doc: Y.Doc, doorId: string): boolean {
  * bound one). Its other policy fields are kept exactly as stored; the caller
  * has already checked the door exists in that room's layout.
  */
-export function fitDockPortIn(doc: Y.Doc, doorId: string): void {
+export function fitDockPortIn(doc: Y.Doc, doorId: string, gate?: number | null): void {
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return;
   const map = doc.getMap('doorPolicy');
   const current = sanitizePolicy(map.get(doorId));
   if (current.adapter) return;
   doc.transact(() => {
-    map.set(doorId, policyShape({ ...current, adapter: true }));
+    map.set(doorId, policyShape({ ...current, adapter: true, ...(isGateNumber(gate) ? { gate } : {}) }));
   });
+}
+
+/** ⚓🚦 Every gate this room's ports carry, by door id — what the atlas
+ *  harvest publishes for the station's boards and arriving ships. */
+export function readDockGates(): Record<string, number> {
+  const out: Record<string, number> = {};
+  if (!docAlive()) return out;
+  for (const [doorId, p] of portsIn(boundDoc!, policyMap!)) {
+    if (p.gate !== undefined) out[doorId] = p.gate;
+  }
+  return out;
+}
+
+/** ⚓🚦 This room's ports that carry no gate number yet (fitted before gates
+ *  existed), by door id, in id order. */
+export function readUnnumberedPorts(): string[] {
+  const out: string[] = [];
+  if (!docAlive()) return out;
+  for (const [doorId, p] of portsIn(boundDoc!, policyMap!)) {
+    if (p.gate === undefined) out.push(doorId);
+  }
+  return out.sort();
+}
+
+/** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
+export function dockGatesIn(doc: Y.Doc): Record<string, number> {
+  const out: Record<string, number> = {};
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return out;
+  // Only doors the room's layout has: a peer's policy for a door that does
+  // not exist must not use up gate numbers.
+  for (const [doorId, p] of portsIn(doc, doc.getMap('doorPolicy'))) {
+    if (p.gate !== undefined) out[doorId] = p.gate;
+  }
+  return out;
 }
 
 /** Player-facing passage label (plain language, one string everywhere). */

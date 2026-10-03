@@ -64,6 +64,7 @@ import {
   initiateChainRefusal,
   stampAfter,
   FAR_DOCK_REFUSAL,
+  gateAdmits,
   type DockPortState,
 } from "./dockRules";
 // 🛰️ Hull space: built chains register their swept boxes so exterior mounts
@@ -93,6 +94,9 @@ import {
   removeDoorGrant,
   hasDoorGrant,
   hasDoorRequest,
+  readDockGates,
+  MAX_GATE,
+  type GateAccess,
   type ConstructionMode,
   type DoorPolicyRecord,
 } from "./doorPolicy";
@@ -119,7 +123,7 @@ import {
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
-  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency,
+  readAtlas, atlasLayout, moduleOverlapAt, roomIdFromSeed, compareAtlasRecency, freeGateNumberHere, stationGates, steppedGateNumberHere,
 } from "./stationAtlas";
 
 /** Advance a scalar toward a target by at most maxStep, landing exactly. */
@@ -210,6 +214,9 @@ export type FarDockRequest =
       nearWall?: DoorWall;
       nearLateral?: number;
       dockedAt: number;
+      /** ⚓🚦 The docking captain's identity key, for a gate open to the
+       *  owner's granted captains (doorPolicy gateAccess 'pass'). */
+      requesterPub?: string;
     };
 
 export type FarDockResult =
@@ -223,6 +230,12 @@ export type FarDockResult =
         | "occupied"
         | "closed"
         | "gone"
+        /** ⚓🚦 The gate does not admit this ship (doorPolicy): closed,
+         *  reserved for another ship, or open only to granted captains. */
+        | "not-allowed"
+        /** ⚓🚦 The far door wears no port and every gate number of its
+         *  station is taken, so none is fitted. */
+        | "no-gate"
         /** The berth holds a dock of this very port with another stamp — a
          *  claim made at the same moment that the CRDT kept, or one made
          *  from the far side: it stands, this one yields (and may join it). */
@@ -1865,6 +1878,15 @@ export class DoorDockingPortSystem {
           this.showAssemblyNotice(doorId, step.reason);
           return;
         }
+        // ⚓🚦 A new port takes the lowest gate number free in the station;
+        // with every number taken it is not fitted (and no part is spent).
+        const gate = step.kind === "fit-port"
+          ? freeGateNumberHere(this.roomNow(), readDockGates())
+          : null;
+        if (step.kind === "fit-port" && gate === null) {
+          this.showAssemblyNotice(doorId, `Every gate number (1–${MAX_GATE}) is taken in this station — remove a port first.`);
+          return;
+        }
         if (!consumePart("adapter")) {
           this.renderAssemblyStrip(doorId, "no ADAPTER parts — DEV menu › PARTS");
           return;
@@ -1873,7 +1895,11 @@ export class DoorDockingPortSystem {
         if (step.kind === "fit-port") {
           // SEED-FIRST is not needed here: writeDoorPolicy refuses a door the
           // layout does not know, and every door with a pane is known.
-          writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), adapter: true });
+          writeDoorPolicy(doorId, {
+            ...readDoorPolicy(doorId),
+            adapter: true,
+            ...(gate !== null ? { gate } : {}),
+          });
         } else {
           state.segments = dockChain();
           state.dockMatePaid = true;
@@ -1985,6 +2011,49 @@ export class DoorDockingPortSystem {
       if (!doorId) return;
       if (el.dataset.dockAction === "undock") void this.undockPort(doorId);
       else if (el.dataset.dockAction === "dock") void this.redockPort(doorId);
+      else if (el.dataset.dockAction === "gate-down" || el.dataset.dockAction === "gate-up") {
+        // ⚓🚦 The owner renumbers a gate by hand, stepping over numbers other
+        // ports of the station use, so numbers stay unique and a station has
+        // at most MAX_GATE ports listed. (A duplicate that arrives some other
+        // way, such as two stations joined, is flagged in the row.) Owner
+        // only: a public build door or a granted builder may fit ports, not
+        // renumber gates.
+        if (!this.isRoomOwner()) return;
+        const policy = readDoorPolicy(doorId);
+        if (!policy.adapter) return;
+        const roomId = this.roomNow();
+        const own = readDockGates();
+        // A port fitted before gates existed gets the lowest free number first.
+        if (policy.gate === undefined) {
+          const first = freeGateNumberHere(roomId, own);
+          if (first !== null) writeDoorPolicy(doorId, { ...policy, gate: first });
+          return;
+        }
+        // The station is read as freeGateNumberHere reads it, so a room the
+        // local atlas has let go still holds its numbers.
+        const step = el.dataset.dockAction === "gate-up" ? 1 : -1;
+        const gate = steppedGateNumberHere(roomId, own, doorId, policy.gate, step);
+        if (gate === null) return; // nothing free that way
+        writeDoorPolicy(doorId, { ...policy, gate });
+      } else if (el.dataset.dockAction === "gate-access") {
+        // ⚓🚦 The owner decides who may dock here: OPEN → PASS (captains
+        // granted at this door) → RESERVED (the ship docked here now, when
+        // there is one) → CLOSED → OPEN. Owner only, like renumbering.
+        if (!this.isRoomOwner()) return;
+        const policy = readDoorPolicy(doorId);
+        if (!policy.adapter) return;
+        const port = classifyDockPort(readDoor(doorId));
+        const dockedShip = port.kind === "docked" ? port.roomId : "";
+        const order: GateAccess[] = ["open", "pass", "reserved", "closed"];
+        let next = order[(order.indexOf(policy.gateAccess ?? "open") + 1) % order.length];
+        if (next === "reserved" && !dockedShip) next = "closed";
+        const { gateAccess: _a, reservedFor: _r, ...rest } = policy;
+        writeDoorPolicy(doorId, {
+          ...rest,
+          ...(next === "open" ? {} : { gateAccess: next }),
+          ...(next === "reserved" ? { reservedFor: dockedShip } : {}),
+        });
+      }
     });
 
     (
@@ -2896,6 +2965,7 @@ export class DoorDockingPortSystem {
           nearWall: near.wall,
           nearLateral: near.lateral,
           dockedAt,
+          requesterPub: getIdentityPub() ?? undefined,
         });
       } catch (err) {
         console.warn("[dock] far dock threw:", err);
@@ -2929,10 +2999,11 @@ export class DoorDockingPortSystem {
         );
         return false;
       }
-      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone")) {
+      if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone" || far.reason === "not-allowed" || far.reason === "no-gate")) {
         // A closed or vanished berth is not coming back: drop the memory so
-        // this port stops offering it. An occupied one may free up.
-        if (far.reason !== "occupied" && unchanged()) writeDoorTombstone(doorId, port.address);
+        // this port stops offering it. An occupied one may free up, and a gate
+        // not open to us now may open later.
+        if (far.reason !== "occupied" && far.reason !== "not-allowed" && far.reason !== "no-gate" && unchanged()) writeDoorTombstone(doorId, port.address);
         this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL[far.reason], tone: "bad" }, roomId);
         return false;
       }
@@ -2945,6 +3016,15 @@ export class DoorDockingPortSystem {
           name,
         });
       }
+    }
+    // ⚓🚦 The far room could not answer, so its gate could not admit us:
+    // dock one-sided only where this client's atlas knows the gate is open
+    // (or knows nothing of it). A gate for granted captains cannot be
+    // checked from here, so it waits for the far room too.
+    const knownAccess = !far?.ok && farDoor ? readAtlas()[port.roomId]?.gateAccess?.[farDoor] : undefined;
+    if (knownAccess && !gateAdmits(knownAccess, roomId, false)) {
+      this.setDockOp(doorId, { note: FAR_DOCK_REFUSAL["not-allowed"], tone: "bad" }, roomId);
+      return false;
     }
     const next = redockRecord(port, dockedAt);
     writeDoorPairing(doorId, next.connectedRoomAddress, next);
@@ -3076,12 +3156,39 @@ export class DoorDockingPortSystem {
     }
     const toneColor =
       op?.tone === "ok" ? "#00e676" : op?.tone === "bad" ? "#ff8a80" : "#ffb300";
+    // ⚓🚦 The port's gate number, as departure boards show it. A number
+    // another port of the station also uses is flagged, not changed.
+    const gate = readDoorPolicy(doorId).gate;
+    const roomId = this.roomNow();
+    const clash = gate !== undefined && stationGates(readAtlas(), roomId)
+      .some((g) => g.gate === gate && !(g.roomId === roomId && g.doorId === doorId));
+    const gateBtn = (dir: "down" | "up", label: string) =>
+      `<button type="button" data-dock-action="gate-${dir}" title="${dir === "up" ? "Next" : "Previous"} gate number" aria-label="${dir === "up" ? "Next" : "Previous"} gate number" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${label}</button>`;
+    const policyNow = readDoorPolicy(doorId);
+    const accessLabel =
+      policyNow.gateAccess === "closed" ? "CLOSED"
+        : policyNow.gateAccess === "pass" ? "GRANTED CAPTAINS"
+          : policyNow.gateAccess === "reserved" ? `RESERVED · ${esc(this.partnerLabel(policyNow.reservedFor ?? ""))}`
+            : "OPEN";
+    const owner = this.isRoomOwner();
+    const accessBtn = owner
+      ? `<button type="button" data-dock-action="gate-access" title="Who may dock at this gate: open to all, captains you granted at this door, reserved for the ship docked here now, or closed" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${accessLabel}</button>`
+      : `<span>${accessLabel}</span>`;
+    const gateLine = readDoorPolicy(doorId).adapter
+      ? `<div style="display:flex; align-items:center; gap:6px; font-size:9.5px; color:#f2efe6; flex-wrap:wrap;">
+          <span>🚦 GATE <b>${gate ?? "—"}</b></span>
+          ${owner ? gateBtn("down", "−") + gateBtn("up", "+") : ""}
+          <span style="color:rgba(242,239,230,0.6);">DOCKING:</span> ${accessBtn}
+          ${clash ? `<span style="color:#ffb300;">⚠ another port in this station is also gate ${gate}</span>` : ""}
+        </div>`
+      : "";
     rowEl.innerHTML = `
       <div style="border:1px solid rgba(242,239,230,0.35); border-radius:8px; padding:8px 10px; background:rgba(242,239,230,0.05); display:flex; flex-direction:column; gap:6px;">
         <div style="display:flex; align-items:center; justify-content:space-between; gap:8px;">
           <span style="font-size:10.5px; color:#f2efe6; line-height:1.35;">${status}</span>
           ${action}
         </div>
+        ${gateLine}
         ${op?.note ? `<div style="font-size:9.5px; color:${op.busy ? "#ffb300" : toneColor}; line-height:1.3;">${op.busy ? "⏳ " : ""}${esc(op.note)}</div>` : ""}
         ${!may && (port.kind === "docked" || port.kind === "undocked") ? `<div style="font-size:9px; color:rgba(242,239,230,0.5);">Docking here is up to the owner — or undock from your ship's own door or helm.</div>` : ""}
       </div>`;
