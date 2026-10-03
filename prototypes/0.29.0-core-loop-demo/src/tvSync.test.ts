@@ -597,10 +597,20 @@ describe('the holder as the room\'s clock', () => {
     h.tick(); // the seek goes out and has not landed: the player still reads 0
     expect(p.position).toBe(0);
     expect(h.c.positionMs()).toBe(30_000); // a pause written now parks the room at 30 s, not at 0
+    // Two +10 s in a row before the next tick add up: the second reads the
+    // first's write (the record, newer than the target still landing), not
+    // the 30 s target both would otherwise start from.
+    h.transport({ positionMs: h.c.positionMs() + 10_000 });
+    expect(h.c.positionMs()).toBe(40_000);
+    h.transport({ positionMs: h.c.positionMs() + 10_000 });
+    expect(h.c.positionMs()).toBe(50_000);
+    h.tick(); // followed: the newest target is what is carried to
+    expect(p.log.filter((l) => l.startsWith('seek')).at(-1)).toBe('seek:50000');
+    expect(h.c.positionMs()).toBe(50_000);
     p.land();
     h.tick();
-    p.position = 31_000;
-    expect(h.c.positionMs()).toBe(31_000); // landed: the player's clock again
+    p.position = 51_000;
+    expect(h.c.positionMs()).toBe(51_000); // landed: the player's clock again
     const viewer = new FakePlayer(true);
     viewer.position = 5_000;
     const hv = harness(viewer);

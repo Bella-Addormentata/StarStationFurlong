@@ -303,6 +303,13 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   root.id = 'tv-theatre';
   root.setAttribute('role', 'dialog');
   root.setAttribute('aria-label', 'Television');
+  // Modal while it is the topmost overlay: Tab stays inside and clicks go
+  // nowhere else, and assistive technology is told the same. The phone
+  // opening above it (a hand-over pops it open on the remote) takes the
+  // top: theatreTick drops the modal claim while the phone is up, so the
+  // remote is not hidden from a screen reader behind a dialog that is no
+  // longer the one in front.
+  root.setAttribute('aria-modal', 'true');
   root.innerHTML = `
     <div class="tv-theatre-panel">
       <div class="tv-theatre-head"></div>
@@ -321,7 +328,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   const onKey = (e: KeyboardEvent) => {
     // The phone open above the theatre (a hand-over pops it open without
     // closing this) owns Tab and Escape: its handlers close it or go home.
-    if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
+    if (phoneIsUp()) return;
     if (e.key === 'Escape') {
       e.stopPropagation();
       closeTvTheatre();
@@ -382,6 +389,12 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   theatre.timer = window.setInterval(() => theatreTick(rtt), 400);
   theatreTick(rtt);
   updateTvChip([itemId]);
+}
+
+/** The SpacePhone is open above everything (a hand-over pops it open on the
+ *  remote without closing the theatre): then IT is the topmost overlay. */
+function phoneIsUp(): boolean {
+  return document.getElementById('spacephone-container')?.classList.contains('active') ?? false;
 }
 
 /** The theatre's controls in Tab order: its buttons, the volume slider and
@@ -513,6 +526,10 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
 function theatreTick(rtt: () => number): void {
   const t = theatre;
   if (!t) return;
+  // Modal only while topmost: the phone above it is what a screen reader
+  // must reach, and a modal dialog beneath would hide it (see openTvTheatre).
+  const modal = phoneIsUp() ? 'false' : 'true';
+  if (t.root.getAttribute('aria-modal') !== modal) t.root.setAttribute('aria-modal', modal);
   const rec = readTv(t.itemId);
   const on = rec.state !== 'off' && rec.state !== 'home' && rec.source !== null;
   if (!on) {

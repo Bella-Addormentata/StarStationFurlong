@@ -120,6 +120,8 @@ import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, 
 import { renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
 import { setOwnMediaOrigins } from "./tvConsent";
+import { parseNodeFingerprint } from "./nodeFingerprint";
+import type { LocalFingerprint } from "./nodeFingerprint";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc } from "./robotDoc";
@@ -589,21 +591,8 @@ let roomPassesInited = false;
 // connection exists — this is how the first node of a sovereign network
 // comes online: there is no server, only peers. Every player's node seeds
 // for the network by default; only their connection can prevent it.
-interface LocalFingerprint {
-  hex: string;
-  base64: string;
-  port: number;
-  iroh_node_id?: string;
-  iroh_relay_urls?: string[];
-  iroh_direct_addrs?: string[];
-  /** R1: live reachability classification from the node —
-   *  'port-mapped' | 'advertised' | 'cgnat' | 'local-only'.
-   *  Optional: the Tauri fallback listener's fingerprint omits it. */
-  reachability?: string;
-  /** R1: the iroh UDP port ACTUALLY bound (post random-port fallback) —
-   *  the port a router forward must target. */
-  iroh_port?: number;
-}
+// The node's /api/fingerprint answer and its contract live in
+// nodeFingerprint.ts (testable; main.ts runs the whole client on import).
 let localFingerprint: LocalFingerprint | null = null;
 const BOOTSTRAP_ADDRESS_STORAGE_KEY = "ssf-bootstrap-address";
 const LEGACY_BOOTSTRAP_ADDRESS_KEY = "ssf-host-address";
@@ -7038,18 +7027,21 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
  *  panel re-polls this on an interval — a one-shot startup snapshot would
  *  pin the row (and freshly-minted invite hints) to a stale state. */
 async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
-  let fingerprint: LocalFingerprint = { hex: "", base64: "", port: 4443 };
+  let fingerprint: LocalFingerprint | null = null;
   let nodeOrigin = "";
   // The node's HTTP origin as this page finds it: 8080, or 8081 when 8080
-  // was taken. A port that does not answer, or answers with something that
-  // is not JSON, is tried past; nothing here throws — the probe's verdict
-  // is `fingerprint.hex`, below, every round.
+  // was taken. A port is the node's only when it answers 200 with a
+  // fingerprint that meets the node's contract (nodeFingerprint.ts: 32
+  // bytes of hex, the same bytes in base64, a port); anything else on it —
+  // no answer, not JSON, `{}`, `{ hex: true }` — is a stranger, tried past
+  // to the next port rather than ending the probe. Nothing here throws.
   for (const origin of ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]) {
     try {
       const res = await fetch(`${origin}/api/fingerprint`);
-      const body: unknown = await res.json();
-      if (body && typeof body === "object") {
-        fingerprint = body as LocalFingerprint;
+      if (!res.ok) continue;
+      const parsed = parseNodeFingerprint(await res.json());
+      if (parsed) {
+        fingerprint = parsed;
         nodeOrigin = origin;
         break;
       }
@@ -7058,28 +7050,22 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
     }
   }
   // Media from the node's origin plays in the theatre without asking
-  // (tvConsent.ts) — ONLY while the node answers as ours, with a fingerprint,
-  // not merely on a loopback port. The trust is decided afresh on every
-  // probe, so a round the node does not answer withdraws it: once the node
-  // is gone, whatever next binds its port is a stranger, until a
-  // fingerprint says otherwise.
-  const ours = Boolean(fingerprint.hex) && nodeOrigin !== "";
+  // (tvConsent.ts) — ONLY while the node answers as ours, with a fingerprint
+  // that meets its contract, not merely on a loopback port. The trust is
+  // decided afresh on every probe, so a round the node does not answer
+  // withdraws it: once the node is gone, whatever next binds its port is a
+  // stranger, until a fingerprint says otherwise. (A service impersonating
+  // the node deliberately is beyond what this page can tell from here.)
   setOwnMediaOrigins(
-    ours ? [window.location.origin, nodeOrigin] : [window.location.origin],
+    fingerprint ? [window.location.origin, nodeOrigin] : [window.location.origin],
   );
-  if (!fingerprint.hex) {
+  if (!fingerprint) {
     // Node unreachable this round: keep the last-known fingerprint (if any)
     // rather than blanking live sessions; the row shows NO NODE when we have
     // never seen one.
     renderReachabilityRow(localFingerprint);
     return localFingerprint;
   }
-  fingerprint.iroh_relay_urls = normalizeStringArray(
-    fingerprint.iroh_relay_urls,
-  );
-  fingerprint.iroh_direct_addrs = normalizeStringArray(
-    fingerprint.iroh_direct_addrs,
-  );
   localFingerprint = fingerprint;
   renderReachabilityRow(fingerprint);
   return fingerprint;
