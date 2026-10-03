@@ -153,8 +153,9 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
-// ⚓ A station's public berth takes its door's pose from the atlas.
-import { setBerthPoseLookup } from "./stationDirectory";
+// ⚓ A station's public berth takes its door's pose from the atlas, and 🚀 a
+// ship under way keeps its flight's place whatever it wears.
+import { followsFlightRecord, setBerthPoseLookup } from "./stationDirectory";
 // ⚓ DEPART remembers the dock into the station it leaves.
 import { setBerthStationResolver } from "./shipArrival";
 import {
@@ -1771,8 +1772,10 @@ async function joinRoomAtEpoch(
       // A saved or built-in station's welcome room, or a module bolted into a
       // station by structure, stays put whatever it wears (a station-keeping
       // helm room wears engine, tank and helm too): only a free-flying ship
-      // follows its flight record (flightCapable, the helm's own gate).
-      return flightCapable(isShipReady()) ? readFlightRecord().locationId : null;
+      // follows its flight record (flightCapable, the helm's own gate), and
+      // one under way keeps following it should a fitting come off mid-trip.
+      const flight = readFlightRecord();
+      return followsFlightRecord(flight.status, flightCapable(isShipReady())) ? flight.locationId : null;
     });
     // 🚀 The same rule gates the helm: a station room never departs, and never
     // takes its location from the ship's flight record.

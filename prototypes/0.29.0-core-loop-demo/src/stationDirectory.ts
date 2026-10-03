@@ -18,6 +18,7 @@
 
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
+import type { FlightStatus } from './shipDoc';
 import { planTransfer } from './orbits';
 import type { StationRoomCause } from './stations';
 
@@ -171,6 +172,16 @@ export function freeFlightCapable(shipReady: boolean): boolean {
   if (!shipReady) return false;
   const why = groundedBy();
   return why === null || why === 'lone-station';
+}
+
+/** Does the current room take its place from the ship's flight record
+ *  (`status`)? A flight under way (casting off, in transit, arriving) keeps
+ *  it whatever the room wears now, since a fitting may come off mid-trip; a
+ *  docked record only while the room may fly (`capable`, flightCapable's
+ *  answer: a module that never flew reads the record's default place). A
+ *  station's own room never does. */
+export function followsFlightRecord(status: FlightStatus, capable: boolean): boolean {
+  return status === 'docked' ? capable : groundedBy() === null;
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */
