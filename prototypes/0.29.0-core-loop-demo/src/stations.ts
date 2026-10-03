@@ -386,15 +386,31 @@ export function registerStation(
   else if (records.length >= MAX_RECORDS) return false;
   else records.push(clean(record));
   // Refuse a record the list would drop (its planet has no free slot, or its
-  // welcome room already belongs to a listed station), and one that would
-  // drop a saved station instead: winning that station's slot on a full
-  // planet, or taking its place.
+  // welcome room already belongs to a listed station), one that would drop a
+  // saved station instead (winning that station's slot on a full planet, or
+  // taking its place), and one that would crowd a full planet: an arrival
+  // that loses its slot keeps its place by sharing it (placeStations), so
+  // that planet would hold more stations than slots. The list as it stands
+  // goes first, and the one with the record is only tried: an arrival is
+  // settled for good by stations that are there, never by a record that
+  // may be refused.
   const atlas = readAtlas();
-  const listed = new Set(listStations(atlas, records).map((s) => s.id));
+  const now = Date.now();
+  const before = placeStations(atlas, saved, now);
+  const after = placeStations(atlas, records, now, false);
+  const listed = new Set(after.listed.map((s) => s.id));
   if (!listed.has(record.id)) return false;
-  if (listStations(atlas, saved).some((s) => !s.derived && s.id !== record.id && !listed.has(s.id))) return false;
+  if (before.listed.some((s) => !s.derived && s.id !== record.id && !listed.has(s.id))) return false;
+  if (crowding(after, now) > crowding(before, now)) return false;
   try { localStorage.setItem(KEY, JSON.stringify(records)); } catch { return false; }
   return true;
+}
+
+/** How many stations share an orbit slot with another (listed or heard of;
+ *  one between planets holds none). */
+function crowding(placed: { listed: StationRecord[]; heard: StationRecord[] }, nowMs: number): number {
+  const holding = [...placed.listed, ...placed.heard].filter((s) => !stationInTransit(s, nowMs));
+  return holding.length - new Set(holding.map((s) => `${planetById(s.planetId).id}:${s.orbitSlot}`)).size;
 }
 
 /** Is the slot a record asks for one another station's move is bound for:
@@ -442,6 +458,9 @@ function placeStations(
   atlas: Record<string, AtlasEntry>,
   records: StationRecord[],
   nowMs: number,
+  /** False for a trial list (registerStation's): the arrivals it settles
+   *  are not stored, so a record only tried never decides one for good. */
+  persist = true,
 ): { listed: StationRecord[]; heard: StationRecord[] } {
   // Which PLACE a welcome room is: its atlas component, or the bare room when
   // the atlas does not know it. One place is one station — a second record
@@ -687,6 +706,7 @@ function placeStations(
     // Once decided here it stays decided: the others' later moves change
     // what "then" looks like from now, never where this one went.
     let outcome = outcomeOf(candidates[i], m);
+    const fresh = !outcome;
     if (!outcome) {
       const dest = planetById(m.toPlanetId).id;
       // The slots taken there at T, not the stations: two that share a slot
@@ -711,13 +731,24 @@ function placeStations(
         if (planetById(place.planetId).id === dest) taken.add(place.orbitSlot);
       });
       outcome = taken.size >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';
+    }
+    const home = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
+    if (outcome === 'bounced') at = home;
+    let slot = takeOwn(at.planetId, at.orbitSlot) ? at.orbitSlot : claim(at.planetId, at.orbitSlot);
+    if (slot === null && fresh && outcome === 'arrived') {
+      // A slot was free there at T, but none it may take: its own went to
+      // a station that did not know it was coming, and the rest are kept
+      // for arrivals still on their way. It bounced, as off a full planet,
+      // when where it left from has room.
+      const back = takeOwn(home.planetId, home.orbitSlot) ? home.orbitSlot : claim(home.planetId, home.orbitSlot);
+      if (back !== null) { outcome = 'bounced'; at = home; slot = back; }
+    }
+    if (fresh) {
       const entry: OutcomeEntry = [stationOf(candidates[i]), outcomeKeyOf(m), outcome];
       outcomes.set(entry[0], entry);
-      writeArrivalOutcome(...entry);
+      if (persist) writeArrivalOutcome(...entry);
     }
-    if (outcome === 'bounced') at = { planetId: planetById(m.fromPlanetId).id, orbitSlot: m.fromSlot };
-    const slot = takeOwn(at.planetId, at.orbitSlot) ? at.orbitSlot : claim(at.planetId, at.orbitSlot);
-    // Its planet full (it left its old slot in transit): it stays where its
+    // No slot for it there (nor, just arrived, at home): it stays where its
     // move put it, sharing that slot, rather than drop out of the list or
     // turn up at another planet no transfer took it to.
     settle(i, at.planetId, slot ?? at.orbitSlot);

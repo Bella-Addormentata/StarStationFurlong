@@ -269,6 +269,39 @@ describe('applyFarDockRequest — DOCK into a room between planets', () => {
     expect(dockAt(heardRoom('elsewhere', transit), STATION, now).wrote).toBe(true);
   });
 
+  it('refuses while the berth room holds more move records than a read covers — past them may lie a move', () => {
+    const flooded = (fill: (doc: Y.Doc) => void): Y.Doc => {
+      const doc = bookedRoom();
+      fill(doc);
+      return doc;
+    };
+    const refused = { result: { ok: false, reason: 'moving' }, wrote: false };
+    // Planet summaries past the scan.
+    const summaries = (n: number) => flooded((d) => { for (let i = 0; i < n; i++) d.getMap('stationSummaries').set(`junk-${i}`, {}); });
+    expect(dockAt(summaries(256), STATION, now).wrote).toBe(true);
+    const doc = summaries(257);
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc, STATION, now)).toEqual(refused);
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    // The move log's keys past the scan.
+    const keys = (n: number) => flooded((d) => { for (let i = 0; i < n; i++) d.getMap('stationMoves').set(`junk:${i}`, 1); });
+    expect(dockAt(keys(256), STATION, now).wrote).toBe(true);
+    expect(dockAt(keys(257), STATION, now)).toEqual(refused);
+    // Its bundles' items past what a read unpacks: entries, or settled records.
+    const done: StationMove = { ...transit, welcomeRoomId: 'elsewhere', departAt: now - 50_000, arriveAt: now - 40_000, bookedAt: now - 50_000 };
+    const bundled = (n: number, extra?: Record<string, unknown>) => flooded((d) => {
+      for (let b = 0; b < n; b++) {
+        const entries: Record<string, StationMove> = {};
+        for (let e = 0; e < 64; e++) entries[`move:${b}:${e}:elsewhere`] = { ...done, fuel: e };
+        d.getMap('stationMoves').set(`moveFold:${(b % 16).toString(16)}:${b.toString(16).padStart(16, '0')}`, { settled: {}, entries });
+      }
+      if (extra) d.getMap('stationMoves').set('moveFold:f:ffffffffffffffff', { settled: extra, entries: {} });
+    });
+    expect(dockAt(bundled(32), STATION, now).wrote).toBe(true);
+    expect(dockAt(bundled(33), STATION, now)).toEqual(refused);
+    expect(dockAt(bundled(32, { w: { n: 1, drawn: 0, floor: 0, recent: [] } }), STATION, now)).toEqual(refused);
+  });
+
   it('refuses a tug whose tow is booked or under way — not one whose station since moves on its own', () => {
     const tow: StationMove = { ...transit, mode: 'tug', tugRoomId: TUG, departAt: now, arriveAt: now + 600_000, bookedAt: now };
     expect(dockAt(bookedRoom(tow), TUG, now).result).toEqual({ ok: false, reason: 'moving' });

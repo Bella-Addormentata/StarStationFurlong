@@ -560,17 +560,20 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
 
 /** dockLockedByMove for a room whose own doc is in hand: a far room's,
  *  fetched for a DOCK (farDoorWrite). The moves booked in that room, and
- *  those its planet summaries gossip (docSummaryMoves: booked in another
- *  room of its station, or a tug's), count with every move known here, so
- *  a ship that has not heard of one yet still joins no station between
- *  planets: a tow that room is the tug of, ahead or under way, or a move of
- *  its station in transit. Its station is the one this install lists the
- *  room at, else the one whose welcome room it is, else the one its own
- *  moves name (a move is booked from a room of its station, a tow from the
- *  tug). */
+ *  those its planet summaries gossip (booked in another room of its
+ *  station, or a tug's), count with every move known here, so a ship that
+ *  has not heard of one yet still joins no station between planets: a tow
+ *  that room is the tug of, ahead or under way, or a move of its station in
+ *  transit. Its station is the one this install lists the room at, else
+ *  the one whose welcome room it is, else the one its own moves name (a
+ *  move is booked from a room of its station, a tow from the tug). A room
+ *  whose records the bounded scans cannot all read (a peer can flood
+ *  either map) is held too: what lies past them may be such a move, until
+ *  the clients there prune the flood. */
 export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
-  const there = docOwn(doc);
-  const all = [...there, ...docSummaryMoves(doc), ...roomOwn(), ...readRememberedMoves()];
+  const { own: there, heard, complete } = docMoves(doc);
+  if (!complete) return true;
+  const all = [...there, ...heard, ...roomOwn(), ...readRememberedMoves()];
   const standing = standingMoves(all, all);
   if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
   const station = roomId ? stationForRoom(roomId) : null;
@@ -585,36 +588,39 @@ export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number):
  *  those its planet summaries gossip, as the bound room's are
  *  (bindStationMoveDoc, planetSummary): this install then carries them on. */
 export function rememberMovesIn(doc: Y.Doc): void {
-  const own = [...docOwn(doc), ...docSummaryMoves(doc)];
-  for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
-}
-
-/** roomOwn for a room's doc that is not the bound one. */
-function docOwn(doc: Y.Doc): StationMove[] {
-  if ((doc as { isDestroyed?: boolean }).isDestroyed) return [];
-  const { entries, legacy, folded } = movesIn(doc.getMap('stationMoves'), doc.getMap('stationKeeping'));
-  return [...(legacy ? [legacy] : []), ...entries, ...folded];
+  const { own, heard } = docMoves(doc);
+  const all = [...own, ...heard];
+  for (const m of standingMoves(all, knownMoves(all))) rememberMove(m);
 }
 
 /** Planet summaries one read visits: planetSummary's own pull bound. */
 const SUMMARY_SCAN_MAX = 256;
 
-/** The moves a room's doc gossips in its planet summaries (planetSummary.ts:
- *  each station's latest, under its welcome room), checked as that module's
- *  pull checks them. Every client standing in a room publishes there its
- *  own station's move and every move it remembers, so a move booked in
- *  another room of the station, or in a tug's, reaches the room this way. */
-function docSummaryMoves(doc: Y.Doc): StationMove[] {
-  if ((doc as { isDestroyed?: boolean }).isDestroyed) return [];
-  const out: StationMove[] = [];
+/** What a room's doc that is not the bound one holds: the moves booked
+ *  there (roomOwn's), the moves its planet summaries gossip
+ *  (planetSummary.ts: each station's latest, under its welcome room,
+ *  checked as that module's pull checks them), and whether the bounded
+ *  scans read every record of both. Every client standing in a room
+ *  publishes there its own station's move and every move it remembers, so
+ *  a move booked in another room of the station, or in a tug's, reaches
+ *  the room that way. */
+function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; complete: boolean } {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { own: [], heard: [], complete: true };
+  const { entries, legacy, folded, complete } = movesIn(doc.getMap('stationMoves'), doc.getMap('stationKeeping'));
+  const summaries = doc.getMap('stationSummaries');
+  const heard: StationMove[] = [];
   let scanned = 0;
-  for (const [k, v] of doc.getMap('stationSummaries').entries()) {
+  for (const [k, v] of summaries.entries()) {
     if (++scanned > SUMMARY_SCAN_MAX) break;
     if (typeof v !== 'object' || v === null || (v as { welcomeRoomId?: unknown }).welcomeRoomId !== k) continue;
     const m = validMove((v as { move?: unknown }).move);
-    if (m && m.welcomeRoomId === k) out.push(m);
+    if (m && m.welcomeRoomId === k) heard.push(m);
   }
-  return out;
+  return {
+    own: [...(legacy ? [legacy] : []), ...entries, ...folded],
+    heard,
+    complete: complete && summaries.size <= SUMMARY_SCAN_MAX,
+  };
 }
 
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
@@ -1157,6 +1163,8 @@ interface RoomMoves {
   settled: Map<string, SettledMoves & { key: string | null }>;
   folded: StationMove[];
   stale: string[];
+  /** False when the bounds cut the scan short: a record may lie past them. */
+  complete: boolean;
 }
 
 /** Every move this room's doc holds (a bounded scan): its entries (with
@@ -1166,7 +1174,7 @@ interface RoomMoves {
  *  each in its place: a record as its writer's (key null: never stale, its
  *  bundle holds others), an entry once per key. */
 function roomMoves(): RoomMoves {
-  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled: new Map(), folded: [], stale: [] };
+  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled: new Map(), folded: [], stale: [], complete: true };
   return movesIn(moveMap!, keepMap!);
 }
 
@@ -1178,6 +1186,7 @@ function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
   const stale: string[] = [];
   let scanned = 0;
   let unpacked = 0;
+  let complete = true;
   // A writer's best record: the larger count, then the larger total.
   const offer = (w: string, v: SettledMoves, key: string | null) => {
     const had = settled.get(w);
@@ -1190,7 +1199,7 @@ function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
   };
   for (const [k, v] of moveLog.entries()) {
     // Every key visited counts, whatever it holds: the walk itself is bounded.
-    if (++scanned > MOVE_SCAN_MAX) break;
+    if (++scanned > MOVE_SCAN_MAX) { complete = false; break; }
     if (k.startsWith(SETTLED_PREFIX)) {
       if (isSettledMoves(v)) offer(writerOf(k, SETTLED_PREFIX), v, k);
       else stale.push(k);
@@ -1198,9 +1207,13 @@ function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
     }
     if (k.startsWith(FOLD_PREFIX)) {
       if (bucketOfKey(k) === null || !isFoldBundle(v)) { stale.push(k); continue; }
-      for (const [w, r] of Object.entries(v.settled)) if (++unpacked <= MOVE_FOLD_READ_MAX) offer(w, r, null);
+      for (const [w, r] of Object.entries(v.settled)) {
+        if (++unpacked <= MOVE_FOLD_READ_MAX) offer(w, r, null);
+        else complete = false;
+      }
       for (const [ek, m] of Object.entries(v.entries)) {
-        if (++unpacked <= MOVE_FOLD_READ_MAX && !folded.has(ek)) folded.set(ek, cleanMove(m));
+        if (++unpacked > MOVE_FOLD_READ_MAX) complete = false;
+        else if (!folded.has(ek)) folded.set(ek, cleanMove(m));
       }
       continue;
     }
@@ -1210,7 +1223,7 @@ function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
     else stale.push(k);
   }
   return {
-    entries: keyed.map((e) => e.move), keyed, legacy: validMove(keep.get(LEGACY_KEY)), settled, folded: [...folded.values()], stale,
+    entries: keyed.map((e) => e.move), keyed, legacy: validMove(keep.get(LEGACY_KEY)), settled, folded: [...folded.values()], stale, complete,
   };
 }
 

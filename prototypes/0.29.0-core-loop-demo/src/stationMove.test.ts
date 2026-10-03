@@ -538,6 +538,58 @@ describe('the station list follows a move', () => {
     expect(listStations({}, [], T + 2).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS });
   });
 
+  it('bounces an arrival with no slot to take, its own gone and the rest kept for arrivals on their way, when home has room', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = move.arriveAt;
+    // Another station bound for Aris slot 15, leaving after this one got there.
+    const inbound: StationMove = {
+      ...move, stationId: 'r', welcomeRoomId: 'r', fromPlanetId: SOV, fromSlot: 9, toSlot: 15,
+      departAt: T + 1000, arriveAt: T + 100_000, bookedAt: T + 1000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'r' ? inbound : null));
+    // Aris slots 0-14 held, slot 0 (the one this move booked) by a station
+    // that did not know it was coming; with Sovereign full too, or not.
+    const places = (homeFull: boolean, comingToo = true): KnownPlace[] => [
+      ...Array.from({ length: 15 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })),
+      ...(comingToo ? [{ welcomeRoomId: 'r', planetId: SOV, orbitSlot: 9 }] : []),
+      ...(homeFull ? Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `h${i}`, planetId: SOV, orbitSlot: i })) : []),
+    ];
+    const furlong = (t: number) => listStations({}, [], t).find((s) => s.id === DEFAULT_STATION_ID);
+    setKnownPlacesResolver(() => places(false));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    // …for good: once the other has arrived too.
+    expect(furlong(T + 200_000)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    // With no room at home either, it shares the slot its move booked.
+    store.clear();
+    setKnownPlacesResolver(() => places(true));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: ARIS, orbitSlot: 0 });
+    // One settled at Aris stays there, whatever is kept there later.
+    store.clear();
+    setKnownPlacesResolver(() => places(false, false));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: ARIS, orbitSlot: 15 });
+    setKnownPlacesResolver(() => places(false));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: ARIS });
+  });
+
+  it('refuses a record that would crowd a full planet, and leaves its arrival where it settled', () => {
+    const move = { ...moveTo(), toSlot: 15, bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    setKnownPlacesResolver(() => Array.from({ length: 15 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+    vi.useFakeTimers({ now: move.arriveAt + 60_000, toFake: ['Date'] });
+    try {
+      const newcomer: StationRecord = { id: 'newcomer', name: 'NEW', planetId: ARIS, orbitSlot: 15, welcomeRoomId: 'n-room' };
+      // Not settled yet when the record is tried, too: only the list as it
+      // stands settles it.
+      expect(registerStation(newcomer, { reservations: false })).toBe(false);
+      expect(registerStation(newcomer)).toBe(false);
+      expect(listStations().find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 15 });
+      expect(listStations().some((s) => s.id === 'newcomer')).toBe(false);
+      expect(registerStation({ ...newcomer, planetId: SOV, orbitSlot: 3 })).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('settles an arrival next to a station heard of as an install listing it does', () => {
     // Furlong books Aris slot 3; a station registered there since is listed
     // on one install and only heard of on another.

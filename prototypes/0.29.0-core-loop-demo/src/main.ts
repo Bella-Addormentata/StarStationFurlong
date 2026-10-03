@@ -1846,8 +1846,14 @@ async function joinRoomAtEpoch(
     installKnownPlacesResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
-    // 🚚 A move this room remembers goes out on the planet summary at once.
-    subscribeStationMove(() => publishPlanetSummary());
+    // 🚚 A move this room remembers goes out on the planet summary at once,
+    // and an open exterior redraws its planet: the backdrop reads where the
+    // station is only when it is built, and an arrival settling (its pin,
+    // or a bounce) can move the station to another planet.
+    subscribeStationMove(() => {
+      publishPlanetSummary();
+      refreshExteriorView();
+    });
     // A fitted or removed engine, tank or helm makes or unmakes a ship.
     subscribeFurniture(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
