@@ -251,12 +251,18 @@ countdown spreads the host's upload before T0. Honest caveat: a transfer, not
 a stream — delete-on-leave cache and private rooms keep it in the shape of
 sending a friend a file. And the record is peer-writable, so a fetch is never
 automatic beyond a cap: the source carries its declared size; a viewer's node
-fetches on its own only under a per-room ceiling the viewer sets (a FETCH
-button above it), under per-room and global cache quotas, with cancellation
-and delete-on-leave — and the declared size, being peer-written, is only a
-hint: the transfer runs under a hard byte ceiling (the viewer's cap or the
-declaration, whichever is smaller), aborts the moment received bytes exceed
-it, and a completed blob whose size differs from the declaration is rejected.
+fetches on its own only under a per-room `autoFetchCap` the viewer sets (a
+FETCH button above it), under per-room and global cache quotas, with
+cancellation and delete-on-leave — and the declared size, being peer-written,
+is only a hint, so every transfer runs under a hard byte ceiling of its own.
+Two numbers, kept apart: the cap says what fetches *without asking*; a fetch
+the viewer approved runs to the `approvedLimit` the FETCH button showed them
+(the declaration, bounded by the quota they have left), never to the cap,
+which would abort the very transfer they agreed to. An automatic fetch's
+ceiling is the cap or the declaration, whichever is smaller; an approved
+one's is its approved limit; received bytes past the ceiling abort the
+transfer, and a completed blob whose size differs from the declaration is
+rejected either way.
 Nobody in a room can spend another viewer's bandwidth or disk unasked. The same lane later carries room assets, ROMs and the
 station library (§7).
 
@@ -282,9 +288,13 @@ audio first**: it is a tenth of the work, it is #189, and it unlocks karaoke.
 knows the source's position (furniture doc) and its own, subscribes within
 `R_live`, unsubscribes beyond `R_live + 1.5 m` (hysteresis). The node keeps a
 per-source subscriber set (a `media-sub` control kind beside `graft`/`prune`)
-and forwards frames only to subscribed links; a hub subscribes upstream for
-its spokes; with no subscriber the sender's own node drops frames at the
-source AND tells its browser so, and the browser stops capturing and encoding
+and forwards frames only to subscribed links. An entry is a lease scoped to
+the link that made it — renewed by that link, removed from every set when
+the link disconnects or stops renewing, so a dead tab never pins a sender on
+and frames are never sent into a dead link; a hub subscribes upstream for
+its spokes and keeps that subscription only while a live spoke of its own
+still wants the source. With no subscriber the sender's own node drops
+frames at the source AND tells its browser so, and the browser stops capturing and encoding
 until the first subscriber returns (restarting on a keyframe) — a node-side
 drop alone would leave the dominant CPU and battery cost in place. Tiers:
 live (near, full stream + audio), glimpse (keyframes only, no second
@@ -355,8 +365,16 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   an IP to public swarms; everyone else is hidden by construction.
 - **Who may fill it:** a signature says who enqueued an item, not that the
   content is theirs to share or fit to seed. Two writer sets, stated apart.
-  `library-add` is accepted only from the station's owners (room owners, by
-  key) — the library-station operator approves each item before any fetch
+  `library-add` is accepted only from the station's owners — room owners by
+  a key the accepting node can trust: an owner key pinned in the station's
+  own config, or the `owner_ed25519_pubkey` / `cohost_ed25519_pubkeys` of
+  the room's verified authority head
+  ([chia-authority-architecture.md](chia-authority-architecture.md), whose
+  §3 verification is itself an open TODO item), and never the peer-writable
+  `roomInfo.owner → players[owner].keyB64` chain that `gamesDoc.ts` reads
+  today, which any peer can rewrite and nothing pins, so a writer set taken
+  from it would be no writer set at all — the library-station operator
+  approves each item before any fetch
   (or allowlists signers) but does not add; the fetch verifies hash and size
   against the op; storage and egress run under quotas. `library-remove` (a
   denylist honoured by every node) is accepted from the station's owners AND
