@@ -4095,7 +4095,9 @@ function harvestStationAtlas(): void {
   // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
   // 🗺️ #192: the module's owner, for the holotable's station atlas — with
   // the name they go by here when their players entry has synced.
-  const ownerId = (sync.doc.getMap("roomInfo").get("owner") as string | undefined) || "";
+  // The legacy marker names no verifiable owner: it is not carried.
+  const rawOwner = (sync.doc.getMap("roomInfo").get("owner") as string | undefined) || "";
+  const ownerId = legacyOwnerMarker(rawOwner) ? "" : rawOwner;
   const ownerEntry = ownerId
     ? (sync.doc.getMap("players").get(ownerId) as Partial<PlayerEntry> | undefined)
     : undefined;

@@ -1212,18 +1212,27 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
         const station = listStationRecords().find((st) => st.id === stationId);
         if (station) stationPlanView?.show(station);
       });
+      // An open plan follows its station's CURRENT record (a move changes its
+      // planet, so its ships), and closes when the station is gone.
+      const refreshPlan = () => {
+        const open = stationPlanView?.openStationId();
+        if (!open) return;
+        const fresh = listStationRecords().find((st) => st.id === open);
+        if (fresh) stationPlanView?.refresh(fresh);
+        else stationPlanView?.hide();
+      };
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
       mapTableMap.show();
       stopLive?.();
       const refresh = () => {
         mapTableMap?.refreshStations(undefined, holotableStation());
-        stationPlanView?.refresh();
+        refreshPlan();
       };
       const offSummary = subscribePlanetSummary(refresh);
       const offMove = subscribeStationMove(refresh);
       // A layout learned while the plan is open (a peer's harvest) redraws it.
-      const offAtlas = subscribeSharedAtlas(() => stationPlanView?.refresh());
+      const offAtlas = subscribeSharedAtlas(refreshPlan);
       const tick = window.setInterval(refresh, 60_000);
       stopLive = () => { offSummary(); offMove(); offAtlas(); window.clearInterval(tick); stopLive = null; };
     },

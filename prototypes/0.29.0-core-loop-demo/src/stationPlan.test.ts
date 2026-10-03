@@ -108,6 +108,19 @@ describe('the station plan', () => {
     expect(plan.modules.map((m) => m.here)).toEqual([false, true]);
   });
 
+  it('shows a long chain of modules whole, past any hop count', () => {
+    const n = 40;
+    for (let i = 0; i < n; i++) {
+      const doors = [];
+      if (i > 0) doors.push({ doorId: 'west', targetSeed: seed(`c${i - 1}`), wall: 'x-' as const, lateral: 0, farDoor: 'east', farWall: 'x+' as const, farLateral: 0, transient: false });
+      if (i < n - 1) doors.push({ doorId: 'east', targetSeed: seed(`c${i + 1}`), wall: 'x+' as const, lateral: 0, farDoor: 'west', farWall: 'x-' as const, farLateral: 0, transient: false });
+      harvestIntoAtlas({ roomId: `c${i}`, name: `C${i}`, doors });
+    }
+    const plan = stationPlan(readAtlas(), 'c0');
+    expect(plan.modules).toHaveLength(n);
+    expect(plan.modules.at(-1)).toMatchObject({ roomId: `c${n - 1}`, hops: n - 1 });
+  });
+
   it('is empty for a room the atlas does not know', () => {
     station();
     const plan = stationPlan(readAtlas(), 'nowhere');

@@ -24,6 +24,7 @@ import type { ShipSummary } from './planetSummary';
 import type { PlanModule, StationPlan, VisitingShip } from './stationPlan';
 import { moduleCorners, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import { TILE_SIZE } from './floorPlanDoc';
+import { legacyOwnerMarker } from './roomOwner';
 
 export interface StationPlanDeps {
   atlas: () => Record<string, AtlasEntry>;
@@ -107,6 +108,7 @@ export class StationPlanView {
   private title: HTMLElement | null = null;
   private card: HTMLElement | null = null;
   private shipList: HTMLElement | null = null;
+  private moduleList: HTMLElement | null = null;
   private station: StationRecord | null = null;
   private plan: StationPlan | null = null;
   private visiting: VisitingShip[] = [];
@@ -126,6 +128,7 @@ export class StationPlanView {
     root.id = 'station-plan-overlay';
     const area = el('div', 'flex:1; position:relative; overflow:hidden;');
     const canvas = el('canvas', 'display:block; width:100%; height:100%; cursor:pointer;');
+    canvas.setAttribute('aria-hidden', 'true'); // the module list below carries the same choices
     area.appendChild(canvas);
     const hint = el('div', `position:absolute; bottom:18px; left:18px; font-size:10px; color:${DIM}; background:rgba(4,8,22,0.85); padding:5px 10px; border-radius:6px; border:1px solid rgba(212,168,75,0.18);`,
       'CLICK a module or ship for its card');
@@ -140,7 +143,12 @@ export class StationPlanView {
     top.append(title, back);
     const card = el('div', 'display:flex; flex-direction:column;');
     const shipList = el('div', 'display:flex; flex-direction:column;');
-    side.append(top, card, shipList);
+    // The canvas is the picture; this list is the same selection as buttons,
+    // reachable by keyboard and named for screen readers.
+    const moduleList = el('div', 'display:flex; flex-direction:column;');
+    moduleList.setAttribute('role', 'group');
+    moduleList.setAttribute('aria-label', 'Modules and ships on the plan');
+    side.append(top, card, shipList, moduleList);
     root.append(area, side);
     host.appendChild(root);
 
@@ -160,6 +168,7 @@ export class StationPlanView {
     this.title = title;
     this.card = card;
     this.shipList = shipList;
+    this.moduleList = moduleList;
   }
 
   isOpen(): boolean {
@@ -190,6 +199,11 @@ export class StationPlanView {
     this.render();
   }
 
+  /** The station the plan is open on, or null when it is closed. */
+  openStationId(): string | null {
+    return this.isOpen() ? this.station?.id ?? null : null;
+  }
+
   /** The plan currently drawn (tests and console poking). */
   currentPlan(): StationPlan | null {
     return this.plan;
@@ -210,6 +224,7 @@ export class StationPlanView {
     this.drawCanvas();
     this.renderCard();
     this.renderShips();
+    this.renderModuleList();
   }
 
   private drawCanvas(): void {
@@ -342,6 +357,8 @@ export class StationPlanView {
 
   private ownerText(m: PlanModule): string {
     if (!m.owner) return 'Owner not known yet (someone must stand in it once).';
+    // The pre-S2 marker names no verifiable owner (roomOwner.ts).
+    if (legacyOwnerMarker(m.owner.id)) return 'No verified owner';
     if (m.owner.id === this.deps.playerId()) return 'You';
     return m.owner.name ?? shortId(m.owner.id);
   }
@@ -411,6 +428,27 @@ export class StationPlanView {
       btn.dataset.doorId = d.id;
       btn.addEventListener('click', () => this.deps.openDoorPanel(d.id));
       card.append(btn);
+    }
+  }
+
+  private renderModuleList(): void {
+    const list = this.moduleList;
+    if (!list || !this.plan) return;
+    list.replaceChildren();
+    const all = [...this.plan.modules, ...this.plan.ships];
+    if (all.length === 0) return;
+    list.append(heading('On the plan'));
+    for (const m of all) {
+      const selected = m.roomId === this.selected;
+      const btn = el('button', `margin-top:4px; width:100%; text-align:left; border-radius:6px; border:1px solid ${selected ? GOLD_BRIGHT : 'rgba(212,168,75,0.25)'}; background:rgba(212,168,75,${selected ? '0.16' : '0.05'}); color:${m.kind === 'ship' ? SHIP : m.here ? CYAN : GOLD}; padding:5px 8px; cursor:pointer; font-size:10px; font-family:inherit;`,
+        `${m.kind === 'ship' ? '🚀' : '▣'} ${m.name}${m.here ? ' (you are here)' : ''}`);
+      btn.setAttribute('aria-pressed', selected ? 'true' : 'false');
+      btn.dataset.roomId = m.roomId;
+      btn.addEventListener('click', () => {
+        this.selected = selected ? null : m.roomId;
+        this.render();
+      });
+      list.append(btn);
     }
   }
 

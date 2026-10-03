@@ -116,7 +116,9 @@ export function stationPlan(
   const station = atlasComponent(atlas, rootRoomId);
   const poses = atlasPoses(atlas, rootRoomId, {
     liveRoomId,
-    maxHops: 32,
+    // No depth cap: the walk is cycle-safe and the atlas holds at most
+    // MAX_ENTRIES rooms, so a long chain of modules is shown whole.
+    maxHops: Infinity,
     expand: (roomId) => station.has(roomId),
   });
   const berths = berthDoorIds(atlas);
