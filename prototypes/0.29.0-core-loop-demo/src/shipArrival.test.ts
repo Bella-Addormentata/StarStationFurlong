@@ -17,6 +17,7 @@ import {
   writeDoorTombstone,
 } from './doorsDoc';
 import {
+  berthPassFor,
   berthToRemember,
   ARRIVAL_GRACE_MS,
   castOffForDeparture,
@@ -227,6 +228,32 @@ describe('resolveRememberedBerth', () => {
     // A resolver answering with another room's pass is not trusted.
     setBerthSeedResolver(() => SEED_HIGH);
     expect(resolveRememberedBerth(rec, [])).toBeNull();
+  });
+});
+
+describe('berthPassFor (🎫 the passes the helm, a DOCK and the boards count)', () => {
+  afterEach(() => setBerthSeedResolver(null));
+
+  it("is this client's own pass for the room, else a docked or undocked port's address that names it", () => {
+    expect(berthPassFor(FURLONG_ROOM, [])).toBeUndefined();
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'east', state: FREE }])).toBeUndefined();
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }])).toBe(SEED_FURLONG);
+    expect(berthPassFor(FURLONG_ROOM, [
+      { doorId: 'east', state: dockedTo(SEED_HIGH) },
+      { doorId: 'north', state: dockedTo(SEED_FURLONG) },
+    ])).toBe(SEED_FURLONG);
+    // A port naming another room is no pass for this one.
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'east', state: dockedTo(SEED_HIGH) }])).toBeUndefined();
+    // Its own pass comes first…
+    setBerthSeedResolver((room) => (room === FURLONG_ROOM ? SEED_FURLONG_OTHER_HINTS : undefined));
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }])).toBe(SEED_FURLONG_OTHER_HINTS);
+    // …unless it names another room: then the port's.
+    setBerthSeedResolver(() => SEED_HIGH);
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }])).toBe(SEED_FURLONG);
+    expect(berthPassFor(HIGH_ROOM, [])).toBe(SEED_HIGH);
+    // No room is no room, whatever a port's address fails to name.
+    const junk = { ...undockedFrom(SEED_FURLONG), address: 'ssf://room#nothing' } as ArrivalPort['state'];
+    expect(berthPassFor('', [{ doorId: 'north', state: junk }])).toBeUndefined();
   });
 });
 
