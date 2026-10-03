@@ -217,16 +217,44 @@ function boundedJson(v: unknown, budget: { left: number }, depth: number): unkno
 }
 
 /** Field names that may carry a room's dial-in credentials (a seed, a pass,
- *  a link or invite): layout is public, admission is not. */
-const CREDENTIAL_KEY = /seed|pass(?!age)|link|invite|token|secret|cred/i;
+ *  a link or invite, a room key): layout is public, admission is not. */
+const CREDENTIAL_KEY = /seed|pass(?!age)|link|invite|token|secret|cred|key/i;
+/** A parameter named the same way, in a link or a line (ssf://room?seed=…). */
+const CREDENTIAL_PARAM = new RegExp(`(?:^|[?#&;\\s])[^=?#&;\\s]*(?:${CREDENTIAL_KEY.source})[^=?#&;\\s]*=`, 'i');
 
-/** A JSON value with every credential-named field removed, at any depth. */
+/** A string that is, or carries, a room's dial-in credentials, whatever
+ *  field it sits under: a credential-named parameter (a link's), JSON text
+ *  holding a credential, or base64 JSON, which is how a pass is written
+ *  (main.ts's encodeBootstrapSeed). */
+function isCredentialValue(s: string): boolean {
+  let text = s;
+  try { text = decodeURIComponent(s); } catch { /* not URI-encoded */ }
+  if (CREDENTIAL_PARAM.test(text)) return true;
+  try {
+    // Every string inside is shorter than this one, so this ends.
+    const parsed: unknown = JSON.parse(text);
+    if (typeof parsed === 'object' && parsed !== null
+      && JSON.stringify(stripCredentials(parsed)) !== JSON.stringify(parsed)) return true;
+  } catch { /* not JSON text */ }
+  for (const [token] of text.matchAll(/[A-Za-z0-9+/_-]{12,}={0,2}/g)) {
+    try {
+      const decoded: unknown = JSON.parse(atob(token.replace(/-/g, '+').replace(/_/g, '/')));
+      if (typeof decoded === 'object' && decoded !== null) return true;
+    } catch { /* not base64 JSON */ }
+  }
+  return false;
+}
+
+const isCredential = (v: unknown): boolean => typeof v === 'string' && isCredentialValue(v);
+
+/** A JSON value with every credential-named field and every credential
+ *  string (a value, a list item or a field name) removed, at any depth. */
 function stripCredentials(v: unknown): unknown {
-  if (Array.isArray(v)) return v.map(stripCredentials);
+  if (Array.isArray(v)) return v.filter((x) => !isCredential(x)).map(stripCredentials);
   if (typeof v !== 'object' || v === null) return v;
   const out: Record<string, unknown> = {};
   for (const [k, x] of Object.entries(v)) {
-    if (!CREDENTIAL_KEY.test(k)) out[k] = stripCredentials(x);
+    if (!CREDENTIAL_KEY.test(k) && !isCredential(k) && !isCredential(x)) out[k] = stripCredentials(x);
   }
   return out;
 }
