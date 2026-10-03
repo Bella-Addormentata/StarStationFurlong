@@ -126,6 +126,7 @@ import { clampFuelToCapacity, flightWritePath } from './shipDoc';
 import type { FlightRecord } from './shipDoc';
 import { planRecordHop } from './stationDirectory';
 import type { StationRecordLike } from './stationDirectory';
+import type { StationOrbit } from './stations';
 import type {
   CheckpointKind,
   DockCheckpoint,
@@ -1491,6 +1492,9 @@ export interface RouteFlightPlace {
   id: string;
   planetId: string;
   orbitSlot: number;
+  /** 🎚️ The stop's copied altitude orbit (RouteStop.orbit), which its legs
+   *  were priced on, when its station flew one. */
+  orbit?: StationOrbit;
 }
 
 /** 🚚 routeFlightPlaces's answer. */
@@ -1514,7 +1518,10 @@ export function routeFlightPlaces(
   if (!route || !routeRulesFlight(f)) return null;
   const place = (i: number): RouteFlightPlace | null => {
     const s = route.stops[i];
-    return s ? { id: alias(s.stationId), planetId: s.planetId, orbitSlot: s.orbitSlot } : null;
+    return s ? {
+      id: alias(s.stationId), planetId: s.planetId, orbitSlot: s.orbitSlot,
+      ...(s.orbit ? { orbit: { radiusKm: s.orbit.radiusKm, phase0: s.orbit.phase0 } } : {}),
+    } : null;
   };
   const from = place(f.stopIndex);
   if (!from) return null;

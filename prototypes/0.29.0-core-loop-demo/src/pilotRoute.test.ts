@@ -1139,6 +1139,14 @@ describe("🚚 where a ruling timetable flies the ship (the route's own copy of 
     expect(Math.abs(plan.transferMs - (on[1].arrive - on[1].depart))).toBeLessThanOrEqual(1);
   });
 
+  it("🎚️ carries a stop's copied altitude orbit, which its legs were priced on", () => {
+    const orbit = { radiusKm: 7_000, phase0: 0.5 };
+    const withOrbit = { ...r, stops: r.stops.map((st, i) => (i === 2 ? { ...st, orbit } : st)) };
+    const places = routeFlightPlaces(withOrbit, at(r, [s], on[1].depart + SEC))!;
+    expect(places.to).toEqual({ ...copyOf(2), orbit });
+    expect(places.from).toEqual(copyOf(1));
+  });
+
   it("names the stops by this install's ids", () => {
     const places = routeFlightPlaces(r, at(r, [s], on[1].depart + SEC), (id) => `here:${id}`);
     expect(places).toMatchObject({ from: { id: 'here:st-1' }, to: { id: 'here:st-2' } });
