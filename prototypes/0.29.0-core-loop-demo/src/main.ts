@@ -160,6 +160,7 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 import { roomIdFromSeed } from "./stationAtlas";
 import {
   dockedStationFor,
+  isStationRoom,
   listStations,
   registerStation,
   removeStation,
@@ -168,7 +169,7 @@ import {
   stationForRoom,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
-import { directoryFromStationRecords, setStationDirectory } from "./stationDirectory";
+import { directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1757,17 +1758,15 @@ async function joinRoomAtEpoch(
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readAllDoors().values());
       if (docked) return docked;
-      // A saved or built-in station whose welcome room this is stays put,
-      // whatever it wears: only a free-flying ship follows its flight.
-      if (listStations().some((st) => !st.derived && st.welcomeRoomId === roomId)) return null;
-      // A module bolted into a station by structure (a station-keeping helm
-      // room wears engine, tank and helm too) belongs to that station, never
-      // to its own flight record: only a free-flying ship follows the flight.
-      for (const rec of readAllDoors().values()) {
-        if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) return null;
-      }
-      return isShipReady() ? readFlightRecord().locationId : null;
+      // A saved or built-in station's welcome room, or a module bolted into a
+      // station by structure, stays put whatever it wears (a station-keeping
+      // helm room wears engine, tank and helm too): only a free-flying ship
+      // follows its flight record (flightCapable, the helm's own gate).
+      return flightCapable(isShipReady()) ? readFlightRecord().locationId : null;
     });
+    // 🚀 The same rule gates the helm: a station room never departs, and never
+    // takes its location from the ship's flight record.
+    setStationRoomCheck(() => isStationRoom(activeBootstrap?.roomId ?? "", readAllDoors().values()));
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());

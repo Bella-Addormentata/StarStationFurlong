@@ -390,6 +390,23 @@ export function dockedStationFor(
   return null;
 }
 
+/** Is `roomId` a station's own room, never a ship that flies: a saved or
+ *  built-in station's welcome room, or a module bolted into a station by
+ *  structure (a paired door that is no berth). Such a room may wear engine,
+ *  tank and helm for station keeping. */
+export function isStationRoom(
+  roomId: string,
+  doors: Iterable<DoorRecord>,
+  stations: StationRecord[] = listStations(),
+): boolean {
+  if (!roomId) return false;
+  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) return true;
+  for (const rec of doors) {
+    if (rec.paired === true && !isBerthDoor(rec)) return true;
+  }
+  return false;
+}
+
 /** The planet a room's station orbits — the default planet when unknown. */
 export function planetForRoom(roomId: string, atlas: Record<string, AtlasEntry> = readAtlas()): PlanetRecord {
   return planetById(stationForRoom(roomId, atlas)?.planetId);
@@ -402,6 +419,11 @@ let currentRoomGetter: () => string = () => '';
 /** main.ts injects the room the player is standing in (no import cycle). */
 export function setStationRoomSource(cb: () => string): void {
   currentRoomGetter = cb;
+}
+
+/** The room the player is standing in ('' before main.ts wires it). */
+export function currentRoomId(): string {
+  return currentRoomGetter();
 }
 
 /** The station the player is in now, or null before the atlas knows the room. */
