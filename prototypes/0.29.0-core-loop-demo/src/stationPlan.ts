@@ -226,8 +226,8 @@ export function stationPlan(
 export interface VisitingShip {
   roomId: string;
   name: string;
-  /** docked: at one of the station's gates. arriving: flying in.
-   *  leaving: undocking, or flying out from here. */
+  /** docked: at one of the station's gates. arriving: flying in, or arrived
+   *  and still docking. leaving: undocking, or flying out from here. */
   state: 'docked' | 'arriving' | 'leaving';
   gate?: number;
   /** Arrival (arriving) or departure (leaving) time, when known. */
@@ -272,7 +272,10 @@ export function visitingShips(
     const to = s.toRoom === welcomeRoomId;
     let state: VisitingShip['state'] | null = null;
     if (s.status === 'in-flight') state = to ? 'arriving' : at ? 'leaving' : null;
-    else if (s.status === 'redocking') state = to ? 'arriving' : at ? 'docked' : null;
+    // Redocking: arrived but still docking (perhaps waiting for a berth). Its
+    // record keeps no destination, so the summary names the station it is
+    // docking at in fromRoom; it is arriving until it says docked.
+    else if (s.status === 'redocking') state = to || at ? 'arriving' : null;
     else if (s.status === 'undocking') state = at ? 'leaving' : null;
     else if (s.status === 'docked') state = at ? 'docked' : null;
     if (!state) {

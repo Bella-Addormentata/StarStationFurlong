@@ -559,7 +559,8 @@ export class StationPlanView {
       const where = s.state === 'docked'
         ? (s.gate !== undefined ? `docked at gate ${s.gate}` : 'docked')
         : s.state === 'arriving'
-          ? `arriving${s.at !== undefined ? ` ${when(s.at, now)}` : ''}`
+          // Past its arrival time (late, or arrived and still docking): when it was due.
+          ? `arriving${s.at !== undefined ? (s.at >= now ? ` ${when(s.at, now)}` : `, due ${when(s.at, now)}`) : ''}`
           : `leaving${s.at !== undefined ? ` (${when(s.at, now)})` : ''}`;
       const item = el('div', `font-size:11px; line-height:1.5; color:${s.state === 'docked' ? SHIP : GOLD}; cursor:${s.onPlan ? 'pointer' : 'default'};`,
         `🚀 ${s.name} · ${where}${s.routeStatus ? ` · ${s.routeStatus.toUpperCase()}` : ''}`);

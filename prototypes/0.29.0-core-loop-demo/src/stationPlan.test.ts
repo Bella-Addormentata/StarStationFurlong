@@ -297,6 +297,22 @@ describe('ships at or near a station', () => {
     ]);
   });
 
+  it('lists a ship still docking here as arriving until it says docked', () => {
+    station();
+    const plan = stationPlan(readAtlas(), 'room-a');
+    // An arrived ship's record keeps no destination: the summary names the
+    // station it is docking at in fromRoom. Its berth may already be on the plan.
+    const list = visitingShips(plan, [
+      ship({ roomId: 'ship-1', name: 'SKIFF', status: 'redocking', fromRoom: 'room-a', etaAt: 3000 }),
+      ship({ roomId: 'ship-2', name: 'BARGE', status: 'redocking', toRoom: 'room-a', etaAt: 5000 }),
+      ship({ roomId: 'ship-3', name: 'TUG', status: 'redocking', fromRoom: 'far-1', etaAt: 4000 }),
+    ], 'room-a');
+    expect(list).toEqual([
+      { roomId: 'ship-1', name: 'SKIFF', state: 'arriving', gate: 2, at: 3000, onPlan: true },
+      { roomId: 'ship-2', name: 'BARGE', state: 'arriving', at: 5000, onPlan: false },
+    ]);
+  });
+
   it('drops a stale berth when the ship says it is somewhere else', () => {
     station();
     const plan = stationPlan(readAtlas(), 'room-a');
