@@ -45,7 +45,7 @@ import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
 // 🕹️ Ships flown by hand (issue 203): this one's pose, and others' coasted on.
 import type { FreePose } from './freeFlight';
-import { remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
+import { flyingFreeRooms, remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { resolveShipFlight } from './shipRoute';
@@ -348,6 +348,7 @@ function readSource(now: number): Source {
   // may sit around another planet than the ship, so it is hidden in every
   // view, not only its own planet's. Only flights are drawn, on their courses.
   const flying = new Set<string>();
+  const flyingFree = flyingFreeRooms(now);
   const known = Object.values(readStore(now).ships).filter((ship) => !ship.retired);
   for (const ship of known) flying.add(ship.roomId);
   const inFlight = known.filter((ship) => ship.status === 'in-flight');
@@ -389,8 +390,10 @@ function readSource(now: number): Source {
     // it stands in (a ship, say) is listed as.
     .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
     // A ship is listed as its own one-module station too; a flying one is
-    // drawn on its transfer instead, a docked one not at all.
-    .filter((s) => !flying.has(s.welcomeRoomId))
+    // drawn on its transfer instead, a docked one not at all. A saved or
+    // built-in station that flew by itself (Fly and park) is drawn as a
+    // ship only while it flies free; parked, it is a station again.
+    .filter((s) => !flying.has(s.welcomeRoomId) || (!s.derived && !flyingFree.has(s.welcomeRoomId)))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 

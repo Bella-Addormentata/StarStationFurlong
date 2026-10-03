@@ -552,8 +552,10 @@ export function markStationPark(pose: FreePose, move: { bookedAt?: number; depar
  * station's altitude change or PARK within MIN_ORBIT_SEPARATION_KM:
  * stations.lostAltitudeClaims) is not left on the unflown leg's orbit
  * listStations falls back to: it flies again, still, where it parked, its
- * docks closed until it parks somewhere clear. Run from the flight watch
- * (a claim can lose late, when the earlier one is heard). A newer move of
+ * docks closed until it parks somewhere clear; so too when the PARK move
+ * never became the station's latest (an older move still ranks first).
+ * Run from the flight watch (a claim can lose late, when the earlier one is
+ * heard). A newer move of
  * the station, or its flying again, retires the mark. Returns whether the
  * station flies again.
  */
@@ -568,9 +570,13 @@ export function keepStationPark(now = Date.now()): boolean {
   const station = ownStationOf();
   if (!station) return false;
   const move = latestMoveOf(station);
-  if (!move || (move.bookedAt ?? move.departAt) !== raw.bookedAt) { clear(); return false; }
-  // Still holding the orbit it claimed.
-  if (station.orbit && Math.abs(station.orbit.radiusKm - raw.toRadiusKm) < 1e-6) return false;
+  const booked = move ? move.bookedAt ?? move.departAt : -Infinity;
+  // A move booked since PARK: the station has moved on from it.
+  if (booked > raw.bookedAt) { clear(); return false; }
+  // Still holding the orbit it claimed. (An older move that still ranks
+  // first, say a cancelled move's pin at its future departure, means the
+  // PARK never stood: it flies on, as for a lost claim.)
+  if (booked === raw.bookedAt && station.orbit && Math.abs(station.orbit.radiusKm - raw.toRadiusKm) < 1e-6) return false;
   void now;
   if (!writeFreePose(raw.pose)) return false;
   if (!writeFlightRecord({ status: 'free-flight', locationId: station.id })) return false;

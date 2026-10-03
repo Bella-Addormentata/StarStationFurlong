@@ -250,6 +250,25 @@ describe('🅿️ a parked station whose orbit claim loses', () => {
     expect(readFreePose()).toEqual(parked);
     expect(doc.getMap('ship').get('freePark')).toBeUndefined();
   });
+
+  it('flies again when an older move still ranks ahead of the PARK', () => {
+    const now = ORBIT_EPOCH_MS + 7_200_000;
+    setStationRoomSource(() => ROOM);
+    const station = ownStationOf()!;
+    const mid = (orbitForSlot(DEFAULT_PLANET_ID, 0).radiusKm + orbitForSlot(DEFAULT_PLANET_ID, 1).radiusKm) / 2;
+    const parked: FreePose = { planetId: DEFAULT_PLANET_ID, at: now, radiusKm: mid, angle: 1.2, vAlong: 0, vRadial: 0, heading: 0, parked: true };
+    fly(stationUndockPose(station, now - 60_000));
+    const plan = planStationPark(station, parked, [station], 0, 0);
+    if (!plan.ok) throw new Error(plan.reason);
+    // The station's latest move is still one booked before the PARK.
+    const older = { ...plan.move, bookedAt: now - 3_600_000, departAt: now + 3_600_000, arriveAt: now + 7_200_000 };
+    setStationMoveResolver((st) => (st.welcomeRoomId === ROOM ? older : null));
+    expect(markStationPark(parked, plan.move)).toBe(true);
+    writeFlightRecord({ status: 'redocking', locationId: station.id });
+    writeFlightRecord({ status: 'docked', locationId: station.id });
+    expect(keepStationPark(now + 1000)).toBe(true);
+    expect(readFlightRecord().status).toBe('free-flight');
+  });
 });
 
 describe("🕹️ AUTO-DOCK's way back", () => {

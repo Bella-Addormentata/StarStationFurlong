@@ -4015,14 +4015,16 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         if (panel) render();
         return;
       }
-      if (!writeFreePose(parked) || !markStationPark(parked, plan.move) || !writeStationMove(plan.move)) return;
+      // The move before the mark: the room doc delivers them in this order, so
+      // no game sees the mark without the move it names.
+      if (!writeFreePose(parked) || !writeStationMove(plan.move) || !markStationPark(parked, plan.move)) return;
       if (cost > 0) writeFuelLevel(fuel - cost, capacity);
       writeFlightRecord({ status: 'redocking', locationId: station.id });
       writeFlightRecord({ status: 'docked', locationId: station.id });
       // An earlier claim on an orbit this near wins (stations.lostAltitudeClaims):
       // then it flies on from here.
       if (keepStationPark()) {
-        flashFree(`Another station claimed an orbit within ${MIN_ORBIT_SEPARATION_KM} km first: ${station.name} is still flying.`);
+        flashFree(`${station.name} could not park here (another station claimed an orbit within ${MIN_ORBIT_SEPARATION_KM} km first, or an earlier move still stands): still flying.`);
         if (panel) render();
         return;
       }
