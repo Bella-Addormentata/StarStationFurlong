@@ -454,23 +454,25 @@ function onGrid(step: number): number {
  * the same pose steps on the same grid, so a boundary acts at the same
  * moment and place for all of them, however often they sample. The result
  * is a pose to coast on from (callers cache it); `changed` when any rule
- * acted. At most COAST_MAX_STEPS steps: a pose so stale stops short (its
- * commander's game checkpoints it, so that only happens to a lost record).
+ * acted. At most COAST_MAX_STEPS steps: a pose so stale stops short there
+ * (`capped`) and is held, not carried on unchecked (its commander's game
+ * checkpoints it, so only a long-lost record ever gets so stale).
  */
-export function coastGrid(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
+export function coastGrid(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean; capped: boolean } {
   let p = pose;
   let changed = false;
-  for (let steps = 0; steps < COAST_MAX_STEPS; steps++) {
+  for (let steps = 0; ; steps++) {
     const step = coastStep(p, stations);
     const next = Number.isFinite(step) ? p.at + step : Infinity;
     if (next > ms) break;
+    if (steps >= COAST_MAX_STEPS) return { pose: p, changed, capped: true };
     const moved = propagate(p, next, stations);
     const zoned = applyZones(moved, stations);
     // A frame the propagation dropped (its station is gone) is a change too.
     if (zoned.changed || (p.near && !moved.near)) changed = true;
     p = zoned.pose;
   }
-  return { pose: p, changed };
+  return { pose: p, changed, capped: false };
 }
 
 /**
@@ -480,6 +482,9 @@ export function coastGrid(pose: FreePose, ms: number, stations: readonly FreeSta
  */
 export function coastTo(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean; grid: FreePose } {
   const g = coastGrid(pose, ms, stations);
+  // Stopped by the safety cap: held where the zones last saw it, never
+  // carried past a boundary they did not check.
+  if (g.capped) return { pose: g.pose, changed: g.changed, grid: g.pose };
   return { pose: propagate(g.pose, ms, stations), changed: g.changed, grid: g.pose };
 }
 

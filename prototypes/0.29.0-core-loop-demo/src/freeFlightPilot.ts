@@ -108,6 +108,9 @@ export function undockPoseFrom(locationId: string, now = Date.now()): FreePose |
 // ── The pilot (this game, stick taken) ───────────────────────────────────────
 
 interface Live {
+  /** The ship doc it flies (a room change rebinds the doc: the stick, its
+   *  pose and the fuel it owes are that ship's alone). */
+  doc: object;
   pose: FreePose;
   /** When this game last wrote the pose. */
   writtenAt: number;
@@ -119,9 +122,16 @@ interface Live {
 
 let live: Live | null = null;
 
+/** The live stick, if it flies the ship doc bound now; one left from
+ *  another ship is dropped (nothing of it is written to this one). */
+function liveHere(): Live | null {
+  if (live && live.doc !== shipDocHandle()?.doc) live = null;
+  return live;
+}
+
 /** Is this game flying the ship by its stick right now? */
 export function isPilotingHere(): boolean {
-  return live !== null;
+  return liveHere() !== null;
 }
 
 /** What a cached coast depends on: the record, and the stations it met
@@ -146,7 +156,7 @@ let coastCache: { key: string; pose: FreePose } | null = null;
  * not in free flight or has no pose.
  */
 export function resolvedFreePose(now = Date.now()): FreePose | null {
-  if (live) {
+  if (liveHere() && live) {
     const stations = freeStationsAround(live.pose.planetId, now);
     return now > live.pose.at ? coastTo(live.pose, now, stations).pose : live.pose;
   }
@@ -172,11 +182,13 @@ export function pilotFrame(input: StickInput, dtS: number, capacity: number, now
     live = null;
     return null;
   }
-  if (!live) {
+  if (!liveHere()) {
     const start = resolvedFreePose(now);
-    if (!start) return null;
-    live = { pose: start, writtenAt: 0, active: false, owedFuel: 0 };
+    const h = shipDocHandle();
+    if (!start || !h) return null;
+    live = { doc: h.doc, pose: start, writtenAt: 0, active: false, owedFuel: 0 };
   }
+  if (!live) return null;
   const level = readFuelLevel(capacity);
   const stations = freeStationsAround(live.pose.planetId, now);
   const step = stepPilot(live.pose, input, now, dtS, stations, Math.max(0, level - live.owedFuel));
@@ -202,7 +214,7 @@ function flushLive(capacity: number, now: number): void {
 
 /** Let go of the stick: the ship coasts on from the pose written now. */
 export function releaseStick(capacity: number, now = Date.now()): void {
-  if (!live) return;
+  if (!liveHere() || !live) return;
   if (readFlightRecord().status === 'free-flight') {
     const stations = freeStationsAround(live.pose.planetId, now);
     live.pose = stepPilot(live.pose, NO_INPUT, now, 0, stations, 0).pose;
@@ -220,7 +232,7 @@ export function releaseStick(capacity: number, now = Date.now()): void {
  * outside free flight.
  */
 export function settleFreeCoast(now = Date.now()): boolean {
-  if (live || readFlightRecord().status !== 'free-flight') return false;
+  if (liveHere() || readFlightRecord().status !== 'free-flight') return false;
   const rec = readFreePose();
   if (!rec || rec.at >= now) return false;
   const r = coastTo(rec, now, freeStationsAround(rec.planetId, now));

@@ -251,6 +251,8 @@ describe('guards', () => {
     const ship = { roomId: 'room-ship', name: 'SKIFF', planetId: SOV, status: 'free-flight', free, updatedAt: T0 };
     expect(cleanShipSummary(ship, T0)).toEqual(ship);
     expect(cleanShipSummary({ ...ship, free: { ...free, vAlong: 99 } }, T0)).toEqual({ ...ship, free: undefined });
+    // A pose at another planet than the entry's is dropped.
+    expect(cleanShipSummary({ ...ship, free: { ...free, planetId: 'planet-aris' } }, T0)).toEqual({ ...ship, free: undefined });
     // Only free flight carries one.
     expect(cleanShipSummary({ ...ship, status: 'docked' }, T0)).not.toHaveProperty('free');
   });

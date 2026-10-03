@@ -187,6 +187,17 @@ describe('speed zones', () => {
     expect(shown.near?.radial).toBeCloseTo(once.near!.radial, 6);
   });
 
+  it('a coast stopped by the safety cap is held there, not carried on unchecked', () => {
+    const st = stationAt(2);
+    // Crawling just outside the hull bubble: every step stays short.
+    const at = st.pointAt(T0);
+    const p0 = pointOff(at, HULL_KM + 0.001, 0);
+    const pose: FreePose = { planetId: SOV, at: T0, radiusKm: p0.radiusKm, angle: p0.angle, vAlong: 0.001, vRadial: 0, heading: 0, near: { room: st.room, along: HULL_KM + 0.001, radial: 0 } };
+    const r = coastTo(pose, T0 + 48 * 3_600_000, [st]);
+    expect(r.pose.at).toBe(r.grid.at);
+    expect(r.pose.at).toBeLessThan(T0 + 48 * 3_600_000);
+  });
+
   it('a long quiet coast far from every station takes few steps', () => {
     const st = stationAt(0);
     const far = poseOff(stationAt(5), T0, 0, 0);

@@ -76,6 +76,22 @@ describe('the pose record', () => {
 });
 
 describe('the pilot', () => {
+  it('drops a stick left from another ship when the ship doc is rebound', () => {
+    const t = Date.now();
+    fly(farPose(t));
+    pilotFrame({ thrust: 1, strafe: 0, yaw: 0, brake: false }, 0.1, CAP, t);
+    expect(isPilotingHere()).toBe(true);
+    const other = new Y.Doc();
+    bindShipDoc(other);
+    expect(isPilotingHere()).toBe(false);
+    // Nothing of the old ship's pose lands on this one.
+    expect(pilotFrame(NO_INPUT, 0.1, CAP, t + 50)).toBeNull();
+    expect(other.getMap('ship').get('freeFlight')).toBeUndefined();
+    bindShipDoc(doc);
+    other.destroy();
+  });
+
+
   it('writes when the stick starts, every WRITE_EVERY_MS while held, and when it stops; fuel comes off in whole units', () => {
     const t = Date.now();
     fly(farPose(t));

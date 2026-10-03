@@ -414,7 +414,10 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
   if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
-  if (out.status === 'free-flight' && isFreePose(v.free, now)) out.free = cleanPose(v.free);
+  // The pose must fly at the planet the entry is filed under, or readers
+  // would index it at one planet and draw it at another.
+  if (out.status === 'free-flight' && isFreePose(v.free, now)
+    && planetById(v.free.planetId).id === planetById(out.planetId).id) out.free = cleanPose(v.free);
   return out;
 }
 
