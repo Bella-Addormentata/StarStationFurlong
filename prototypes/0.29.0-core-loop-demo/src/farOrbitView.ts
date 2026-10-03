@@ -44,9 +44,8 @@ import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
 // 🕹️ Ships flown by hand (issue 203): this one's pose, and others' coasted on.
-import { propagate } from './freeFlight';
 import type { FreePose } from './freeFlight';
-import { freeStationsAround, resolvedFreePose } from './freeFlightPilot';
+import { remoteFreeShips, resolvedFreePose } from './freeFlightPilot';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { readResolvedFlight } from './shipRoute';
@@ -358,17 +357,14 @@ function readSource(now: number): Source {
     }
   }
 
-  // 🕹️ Ships flown by hand, where their last pose has coasted to.
-  const freeStations = freeStationsAround(planetId, now);
-  for (const ship of known) {
-    if (ship.roomId === roomId || ship.status !== 'free-flight' || !ship.free) continue;
-    if (planetById(ship.free.planetId).id !== planetId) continue;
-    const pose = ship.free;
+  // 🕹️ Ships flown by hand, where their last pose has coasted to (with the
+  // zone rules, as every other reader coasts them).
+  for (const ship of remoteFreeShips(planetId, now)) {
     ships.push({
       id: `ship:${ship.roomId}`,
       name: ship.name,
       at: (ms) => {
-        const p = propagate(pose, ms, freeStations);
+        const p = ship.at(ms);
         return { radiusKm: p.radiusKm, angle: p.angle };
       },
     });

@@ -116,7 +116,7 @@ export function findDestination(id: string): Destination {
 /** Flight state machine states. `docked` / `in-flight` are the resting states;
  *  `undocking` / `redocking` are transitional hand-offs (see the ASCII above).
  *  🕹️ `free-flight` (issue 203): a person flies the ship by hand from the
- *  helm; where it is lives in its own record (freeFlight.ts), and
+ *  helm; its position is kept in a record of its own (freeFlight.ts), and
  *  `locationId` names the station it undocked from. */
 export type FlightStatus = 'docked' | 'undocking' | 'in-flight' | 'redocking' | 'free-flight';
 

@@ -128,15 +128,20 @@ export const NO_INPUT: StickInput = { thrust: 0, strafe: 0, yaw: 0, brake: false
 export type FreeZone = 'open' | 'approach' | 'dock';
 
 const MAX_ID_LEN = 128;
+/** How far ahead of this client's clock a pose's time may be: a pilot
+ *  writes its own now, so only clock skew puts it ahead. A pose further on
+ *  would hold the ship still until then. */
+export const MAX_POSE_AHEAD_MS = 2 * 60_000;
 
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
 
-/** Shape guard: a pose is peer-written (ship doc, planet summaries). */
-export function isFreePose(v: unknown): v is FreePose {
+/** Shape guard: a pose is peer-written (ship doc, planet summaries). Its
+ *  time may be at most MAX_POSE_AHEAD_MS past `now`. */
+export function isFreePose(v: unknown, now = Date.now()): v is FreePose {
   if (typeof v !== 'object' || v === null) return false;
   const p = v as Partial<FreePose>;
   if (typeof p.planetId !== 'string' || p.planetId.length === 0 || p.planetId.length > MAX_ID_LEN) return false;
-  if (!finite(p.at) || !Number.isSafeInteger(p.at) || p.at < 0) return false;
+  if (!finite(p.at) || !Number.isSafeInteger(p.at) || p.at < 0 || p.at > now + MAX_POSE_AHEAD_MS) return false;
   if (!finite(p.radiusKm) || p.radiusKm <= 0 || p.radiusKm > 1e7) return false;
   if (!finite(p.angle) || !finite(p.heading)) return false;
   if (!finite(p.vAlong) || !finite(p.vRadial)) return false;
@@ -218,6 +223,8 @@ function radiusBounds(planetId: string): { min: number; max: number } {
  * own orbit. The result holds at `ms` (`at` rounded to whole ms).
  */
 export function propagate(pose: FreePose, ms: number, stations: readonly FreeStation[]): FreePose {
+  // Never backwards: a pose from a clock a little ahead holds until then.
+  if (!(ms > pose.at)) return pose;
   const t = orbitalSeconds(ms) - orbitalSeconds(pose.at);
   if (pose.near) {
     const st = stations.find((s) => s.room === pose.near!.room);

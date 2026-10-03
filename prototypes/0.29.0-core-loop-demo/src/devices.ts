@@ -3962,13 +3962,27 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // (chains + transient berths), docks (port states). Each clears the
       // refuel arm — a peer refuel is an obvious "cancel" for us.
       unsubs.push(subscribeFurnitureForHelm(() => { refuelArmed = false; render(); }));
-      unsubs.push(subscribeShip(() => { refuelArmed = false; render(); }));
+      // 🕹️ Flying free, a pose write (every 500 ms at the stick) is drawn in
+      // place by the frame loop: only the flight record or the fuel level
+      // redraws the panel then.
+      let shipSeen = '';
+      unsubs.push(subscribeShip(() => {
+        const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+        const seen = `${JSON.stringify(readFlightRecord())}|${readFuelLevel(capacity)}`;
+        const same = seen === shipSeen;
+        shipSeen = seen;
+        if (same && readFlightRecord().status === 'free-flight') return;
+        refuelArmed = false;
+        render();
+      }));
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
       unsubs.push(subscribeStationMove(() => render()));
       // 🪐 Destinations and their orbits learned from peers.
-      unsubs.push(subscribePlanetSummary(() => render()));
+      // (Flying free, the radar redraws every frame and redraws the panel
+      // itself when what its buttons offer changes.)
+      unsubs.push(subscribePlanetSummary(() => { if (readFlightRecord().status !== 'free-flight') render(); }));
       // 🚏 A charging dock's robot taking up 🚀 Ship pilot (the route
       // editor's pilot picker).
       unsubs.push(subscribeRobot(() => render()));

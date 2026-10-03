@@ -414,7 +414,7 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
   if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
-  if (out.status === 'free-flight' && isFreePose(v.free)) out.free = cleanPose(v.free);
+  if (out.status === 'free-flight' && isFreePose(v.free, now)) out.free = cleanPose(v.free);
   return out;
 }
 

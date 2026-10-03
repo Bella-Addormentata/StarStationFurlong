@@ -10,6 +10,7 @@ import {
   DOCK_ZONE_KM,
   FREE_FUEL_PER_KMS,
   HULL_KM,
+  MAX_POSE_AHEAD_MS,
   NO_INPUT,
   OPEN_MAX_KMS,
   UNDOCK_OFFSET_KM,
@@ -264,6 +265,14 @@ describe('the record', () => {
     expect(isFreePose({ ...ok, near: { room: '', along: 0, radial: 0 } })).toBe(false);
     expect(isFreePose({ ...ok, near: { room: 'r', along: 1e6, radial: 0 } })).toBe(false);
     expect(isFreePose({ ...ok, planetId: 'x'.repeat(200) })).toBe(false);
+  });
+
+  it('refuses a pose stamped far ahead of the clock, and never coasts backwards', () => {
+    expect(isFreePose({ ...ok, at: T0 + MAX_POSE_AHEAD_MS }, T0)).toBe(true);
+    expect(isFreePose({ ...ok, at: T0 + MAX_POSE_AHEAD_MS + 1 }, T0)).toBe(false);
+    expect(isFreePose({ ...ok, at: Date.now() + 365 * 24 * 3600_000 })).toBe(false);
+    const ahead = { ...ok, at: T0 + 5000 };
+    expect(propagate(ahead, T0, [])).toEqual(ahead);
   });
 
   it('runs on the orbital clock', () => {

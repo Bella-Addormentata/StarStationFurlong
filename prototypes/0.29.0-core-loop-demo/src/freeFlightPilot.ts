@@ -211,11 +211,67 @@ export function settleFreeCoast(now = Date.now()): boolean {
   return r.changed ? writeFreePose(r.pose) : false;
 }
 
+// ── Other ships flown by hand ────────────────────────────────────────────────
+
+export interface RemoteFreeShip {
+  roomId: string;
+  name: string;
+  /** Where it is at `ms`, coasted with the zone rules like this ship's own
+   *  record (each from where it was last asked, so a frame costs little). */
+  at: (ms: number) => FreePose;
+}
+
+/** How often the summary store is read again for other ships (it parses
+ *  localStorage, too dear for every frame). */
+const REMOTE_EVERY_MS = 1000;
+let remoteCache: { planetId: string; room: string; at: number; ships: RemoteFreeShip[] } | null = null;
+/** Each ship's last coast, by its room: kept while its summary's pose stays. */
+const remoteCoasts = new Map<string, { key: string; pose: FreePose }>();
+
+/** The other ships flown by hand around `planetId` that this client has
+ *  heard of (planet summaries), never this room's own. */
+export function remoteFreeShips(planetId: string, now = Date.now()): RemoteFreeShip[] {
+  const room = currentRoomId();
+  const planet = planetById(planetId).id;
+  if (remoteCache && remoteCache.planetId === planet && remoteCache.room === room && now - remoteCache.at < REMOTE_EVERY_MS) {
+    return remoteCache.ships;
+  }
+  const ships: RemoteFreeShip[] = [];
+  const seen = new Set<string>();
+  try {
+    for (const ship of Object.values(readStore(now).ships)) {
+      if (ship.retired || ship.roomId === room || ship.status !== 'free-flight' || !ship.free) continue;
+      if (planetById(ship.free.planetId).id !== planet) continue;
+      const rec = ship.free;
+      const key = JSON.stringify(rec);
+      seen.add(ship.roomId);
+      ships.push({
+        roomId: ship.roomId,
+        name: ship.name,
+        at: (ms) => {
+          const known = remoteCoasts.get(ship.roomId);
+          const from = known && known.key === key && known.pose.at <= ms ? known.pose : rec;
+          const pose = coastTo(from, ms, freeStationsAround(rec.planetId, ms)).pose;
+          remoteCoasts.set(ship.roomId, { key, pose });
+          return pose;
+        },
+      });
+    }
+  } catch {
+    /* the summary store is optional here */
+  }
+  for (const k of [...remoteCoasts.keys()]) if (!seen.has(k)) remoteCoasts.delete(k);
+  remoteCache = { planetId: planet, room, at: now, ships };
+  return ships;
+}
+
 /** For tests: forget the pilot and the caches. */
 export function resetFreeFlightPilot(): void {
   live = null;
   coastCache = null;
   stationCache = null;
+  remoteCache = null;
+  remoteCoasts.clear();
 }
 
 /**

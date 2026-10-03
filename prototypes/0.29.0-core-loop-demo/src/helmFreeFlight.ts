@@ -9,13 +9,11 @@ import {
   DOCK_ZONE_KM,
   HULL_KM,
   bodyOffset,
-  propagate,
   readout,
   speedCap,
 } from './freeFlight';
 import type { FreePose, FreeReadout, FreeStation, FreeZone } from './freeFlight';
-import { readStore } from './planetSummary';
-import { currentRoomId } from './stations';
+import { remoteFreeShips } from './freeFlightPilot';
 
 const ZONE_NAMES: Record<FreeZone, string> = {
   open: 'OPEN SPACE',
@@ -225,12 +223,9 @@ export function drawFreeRadar(canvas: HTMLCanvasElement, pose: FreePose, station
   }
 
   // Other ships flown by hand, as last heard of (coasted on).
-  try {
-    const own = currentRoomId();
-    for (const ship of Object.values(readStore(now).ships)) {
-      if (ship.retired || ship.roomId === own || ship.status !== 'free-flight' || !ship.free) continue;
-      if (ship.free.planetId !== pose.planetId) continue;
-      const there = propagate(ship.free, now, stations);
+  {
+    for (const ship of remoteFreeShips(pose.planetId, now)) {
+      const there = ship.at(now);
       const off = bodyOffset(pose, { radiusKm: there.radiusKm, angle: there.angle });
       if (Math.hypot(off.fwd, off.right) * scale > radius) continue;
       const p = toScreen(off.fwd, off.right);
@@ -241,8 +236,6 @@ export function drawFreeRadar(canvas: HTMLCanvasElement, pose: FreePose, station
       g.textAlign = 'left';
       g.fillText(ship.name.slice(0, 16), p.x + 6, p.y + 3);
     }
-  } catch {
-    /* the summary store is optional here */
   }
 
   // Velocity: the limit for the zone reaches the inner ring.
