@@ -228,13 +228,11 @@ import {
   freshHelmAnnouncer,
   helmAnnouncerStep,
   pilotRoutineOffered,
-  pilotViewHeld,
   readPilotView,
   routeCaptainDockId,
   shipPilotEligible,
   skipLine,
   type HelmAnnouncer,
-  type PilotEndHold,
 } from './shipPilot';
 import { rowText } from './departuresBoard';
 import type { BoardView } from './departuresBoard';
@@ -2419,9 +2417,6 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    *  this open helm (shipPilot.helmAnnouncerStep); stepped once a second. */
   let announcer: HelmAnnouncer = freshHelmAnnouncer();
   let announcedAt = 0;
-  /** 🏁 The last view read of the route's end, shown from once the route
-   *  has finished (shipPilot.pilotViewHeld). */
-  let endHold: PilotEndHold | null = null;
 
   const flashRoute = (text: string, tone: 'ok' | 'warn' = 'warn'): void => {
     routeFlash = { text, tone, until: Date.now() + 8_000 };
@@ -3855,9 +3850,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           } catch {
             view = null;
           }
-          const held = pilotViewHeld(view, endHold, now, currentRoomId());
-          endHold = held.hold;
-          const next = helmAnnouncerStep(announcer, held.view);
+          const next = helmAnnouncerStep(announcer, view);
           if (next.shown !== announcer.shown) changed = true;
           announcer = next;
         }
