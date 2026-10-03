@@ -25,6 +25,7 @@ import {
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
+import { acceptMediaOrigin, mediaConsent, mediaOrigin } from './tvConsent';
 import { escapeHtml } from './htmlEscape';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
@@ -140,8 +141,11 @@ class YouTubePlayerAdapter implements Adapter {
 
 class HtmlVideoPlayerAdapter implements Adapter {
   readonly canNudge = true;
-  readonly canSeek = true;
   readonly hasClock = true;
+  /** Only within the ranges the element can seek in: a live stream, or a
+   *  host without usable range support, has none — such a source plays
+   *  start-only, and the controller never seeks what cannot be sought. */
+  get canSeek(): boolean { return this.video.seekable.length > 0; }
   readonly video: HTMLVideoElement;
   /** The browser refused play() without a gesture: the panel shows TAP TO PLAY. */
   blocked = false;
@@ -442,10 +446,44 @@ function theatreTick(rtt: () => number): void {
       : '<div>❚❚ PAUSED</div><div class="tv-theatre-lane">archive.org\'s player has no pause: it starts from the top when the film resumes</div>');
   } else {
     const key = mountKey(rec.source!, rec.started);
-    if (t.mounted !== key && t.mounted !== `failed:${key}`) mountPlayer(t, rec.source!, key, rtt);
+    if (t.mounted !== key && t.mounted !== `failed:${key}`) {
+      // This viewer's browser fetches only what this viewer allows
+      // (tvConsent): a peer-written URL is asked about first, and one inside
+      // a private network is never fetched. Whatever was mounted before
+      // comes down meanwhile — the old programme is over either way.
+      const consent = mediaConsent(rec.source!);
+      if (consent === 'ok') {
+        mountPlayer(t, rec.source!, key, rtt);
+      } else {
+        if (t.mounted) unmountPlayer(t);
+        showConsentNotice(t, rec.source!, consent);
+      }
+    }
   }
   t.controller?.tick();
   renderTheatreChrome(t);
+}
+
+/** PLAY FROM <host>? — or NOT PLAYED HERE for a host inside a private
+ *  network, which no button can override. */
+function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refuse'): void {
+  const origin = mediaOrigin(source) ?? '';
+  let host = origin;
+  try { host = new URL(origin).host; } catch { /* shown as it is */ }
+  if (consent === 'refuse') {
+    showNotice(t, `<div>NOT PLAYED HERE</div>
+      <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is inside a private network — nobody in the room can ask your browser to fetch from there</div>`);
+    return;
+  }
+  // The button under the finger stays: the same ask every tick is one ask.
+  if (!t.notice.hidden && t.notice.querySelector('[data-tv-allow]')) return;
+  showNotice(t, `<div>PLAY FROM ${escapeHtml(host)}?</div>
+    <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — your browser would fetch this from ${escapeHtml(host)}; whoever pasted it cannot decide that for you</div>
+    <button type="button" data-tv-allow="1">▶ PLAY FROM ${escapeHtml(host)}</button>`);
+  t.notice.querySelector<HTMLButtonElement>('[data-tv-allow]')?.addEventListener('click', () => {
+    acceptMediaOrigin(origin);
+    hideNotice(t);
+  });
 }
 
 function renderTheatreChrome(t: Theatre): void {
@@ -465,7 +503,10 @@ function renderTheatreChrome(t: Theatre): void {
     t.head.querySelector<HTMLButtonElement>('[data-tv-close]')?.addEventListener('click', () => closeTvTheatre());
   }
   const startOnly = rec.source ? isStartOnly(rec.source) : false;
-  const sync = startOnly ? ' · start-time sync only' : '';
+  // A mounted player that cannot seek (a live stream, a host without usable
+  // ranges) is start-only too, whatever the source kind promised.
+  const seekable = !startOnly && (t.player ? t.player.canSeek : true);
+  const sync = startOnly || !seekable ? ' · start-time sync only' : '';
   const who = held ? `REMOTE · ${escapeHtml(remote.name || 'a clone')}` : 'REMOTE ON THE SET';
   const where = pb.state === 'scheduled' ? countdownText(pb.countdownMs)
     : pb.state === 'paused' ? `PAUSED · ${formatClock(pb.positionMs)}`
@@ -481,7 +522,7 @@ function renderTheatreChrome(t: Theatre): void {
   const controls = [
     mine && !startOnly && pb.state === 'playing' ? btn('data-tv-pause="1"', '⏸') : '',
     mine && !startOnly && pb.state === 'paused' ? btn('data-tv-resume="1"', '▶') : '',
-    mine && !startOnly && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
+    mine && seekable && (pb.state === 'playing' || pb.state === 'paused') ? btn('data-tv-back="1"', '⏪ 10s') + btn('data-tv-fwd="1"', '10s ⏩') : '',
     mine && rec.source ? btn('data-tv-stop="1"', '⏹ STOP') : '',
     `<label class="tv-theatre-volume">🔊 <input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="1" aria-label="Set volume"></label>`,
     !mine && mayPickUpRemote(t.itemId) ? btn('data-tv-pickup="1"', '🎛 PICK UP THE REMOTE') : '',

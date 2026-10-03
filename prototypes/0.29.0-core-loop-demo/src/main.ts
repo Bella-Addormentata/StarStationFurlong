@@ -119,6 +119,7 @@ import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDo
 import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, subscribeTv } from "./tvDoc";
 import { renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
+import { setOwnMediaOrigins } from "./tvConsent";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
 import { bindArcadeDoc, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
@@ -8773,6 +8774,14 @@ async function init() {
     return out;
   });
   setTvChipOpener((itemId) => openTvTheatre(itemId, tvTheatreDeps(itemId)));
+  // The theatre fetches a peer-written URL only with this viewer's consent
+  // (tvConsent.ts). The page's own origin and its node's loopback origins
+  // (8080, or 8081 when 8080 is taken — the same two the fingerprint probe
+  // tries) are this viewer's own machine serving this viewer: no asking.
+  setOwnMediaOrigins([
+    window.location.origin,
+    "http://127.0.0.1:8080", "http://127.0.0.1:8081", "http://localhost:8080", "http://localhost:8081",
+  ]);
   // A remote handed to me pops the phone open on it (plan §3.2: the
   // receiver's phone opens on the remote; no accept step). A pick-up of my
   // own is not announced — `by` names the giver.
