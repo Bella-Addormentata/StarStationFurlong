@@ -19,21 +19,28 @@
  * file nor its tests touch Three or the DOM.
  */
 
+import { isDockChain } from './adapter';
 import { stampAfter, type DockPortState } from './dockRules';
-import { readAllDoors, writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
-import { readAtlas, roomIdFromSeed } from './stationAtlas';
-import { rememberedMoveFor, stationLeftFrom } from './stationMove';
-import { listStations, planetById, stationForRoom, stationInTransit, type StationRecord } from './stations';
+import { readAllDoors, readDoor, writeDoorTombstone, type DockBerthMemory } from './doorsDoc';
+import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
+import { stationLeftFrom } from './stationMove';
+import {
+  currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
+} from './stations';
 import {
   findDestination,
   isBerthMemoryRecord,
+  MAX_REST_DOCKS,
   readBerthMemory,
   readFlightRecord,
+  readRestPlace,
   readStationBerth,
   writeFlightRecord,
+  writeRestPlace,
   writeStationBerth,
   type BerthMemoryRecord,
   type FlightRecord,
+  type RestPlace,
 } from './shipDoc';
 import { adriftAt, adriftPlace, isKnownStation, stationHere, type StationBerth, type StationDestination } from './stationDirectory';
 
@@ -185,54 +192,153 @@ export function planArrivalDock(input: {
  * - cast off, where the flight kept that its station orbited at cast-off
  *   (the origin's while it waits for its launch window or flies, the
  *   destination's once it has arrived), once the station has left that place;
- * - at rest beside its station (docked, by the record), where the station
- *   was when the ship arrived there (`arrivedAt`) or, later, let go of its
- *   last dock there (`releasedAt`: its latest UNDOCK from that station, by
- *   the dock's own stamp), once the station has left on a move since
- *   (stationMove.stationLeftFrom).
+ * - at rest (docked, by the record), where its rest record leaves it
+ *   (shipDoc.RestPlace, restingPlace), once no station it rests beside is
+ *   there. A docked ship with no rest record follows its station.
  */
 export function shipPlaceId(
   rec: FlightRecord,
   now: number = Date.now(),
-  releasedAt: (station: StationRecord) => number | null = lastReleaseFrom,
+  rest: RestPlace | null = readRestPlace(),
 ): string {
   if (adriftPlace(rec.locationId)) return rec.locationId;
-  const listed = listStations().find((s) => s.id === rec.locationId);
+  const stations = listStations(undefined, undefined, now);
+  const listed = stations.find((s) => s.id === rec.locationId);
   if (rec.status === 'docked') {
-    // A station that never moved left nothing behind.
-    if (!listed || !rememberedMoveFor(listed)) return rec.locationId;
-    const since = Math.max(rec.arrivedAt ?? -Infinity, releasedAt(listed) ?? -Infinity);
-    const left = since > -Infinity ? stationLeftFrom(listed, since, now) : null;
-    return left ? adriftAt(left.planetId, left.orbitSlot) : rec.locationId;
+    if (!rest) return rec.locationId;
+    const resting = restingPlace(rest, now, stations);
+    // A dock it names still holds it (one a capped scan of the doors missed).
+    if ('heldBy' in resting) return resting.heldBy ?? rec.locationId;
+    // Beside its own station, or the one it last let go of, while that is there.
+    const beside = [listed, resting.from].find((st) => isAt(st, resting.at, now));
+    return beside ? beside.id : resting.at;
   }
   const kept = rec.status === 'redocking' ? rec.destinationAt
     : rec.status === 'in-flight' ? rec.originAt
       : undefined;
-  const place = kept !== undefined ? adriftPlace(kept) : null;
-  if (kept === undefined || !place) return rec.locationId;
-  const there = !!listed && !stationInTransit(listed, now)
-    && planetById(listed.planetId).id === place.planetId && listed.orbitSlot === place.orbitSlot;
-  return there ? rec.locationId : kept;
+  if (kept === undefined || !adriftPlace(kept)) return rec.locationId;
+  return isAt(listed, kept, now) ? rec.locationId : kept;
+}
+
+/** Is `station` at the open-orbit place `placeId` at `now` (not between
+ *  planets)? */
+function isAt(station: StationRecord | null | undefined, placeId: string, now: number): station is StationRecord {
+  const place = adriftPlace(placeId);
+  return !!station && !!place && !stationInTransit(station, now)
+    && planetById(station.planetId).id === place.planetId && station.orbitSlot === place.orbitSlot;
+}
+
+/** Where a station orbits, as an open-orbit place. */
+function placeOf(station: StationRecord): string {
+  return adriftAt(planetById(station.planetId).id, station.orbitSlot);
+}
+
+/** The station a dock into `roomId` holds a ship at: none for another lone
+ *  module (two lone modules docked together each stay where they are, as in
+ *  stations.dockedStationFor). */
+function dockHost(roomId: string, stations: StationRecord[] = listStations()): StationRecord | null {
+  const atlas = readAtlas();
+  const st = stationForRoom(roomId, atlas, stations);
+  return st && !(st.derived && atlasComponent(atlas, st.welcomeRoomId).size <= 1) ? st : null;
 }
 
 /**
- * When the bound room last let go of a dock at `station`: its latest UNDOCK
- * from one of that station's rooms, by the dock's own stamp (the berth
- * memory its door keeps), or null.
+ * What a ship's rest record (shipDoc.RestPlace) says at `now`, from the doors
+ * it names, each read directly: a scan of the doors is capped, and a peer
+ * could push the very door out of it.
+ * - `heldBy`: a dock through one of them still holds the ship (its station,
+ *   when listed);
+ * - else, once one of them let go since the ship came to rest (the latest,
+ *   by its UNDOCK's own stamp: `releasedAt`), where that dock's station
+ *   (`from`) was then. A station lets go of no dock between planets, so that
+ *   is where it is now, unless it has moved since: then where it left from on
+ *   its first move after (stationMove.stationLeftFrom, from the moves this
+ *   install knows; keepRestPlace records the place before that can happen,
+ *   whenever anyone is aboard);
+ * - else where the ship came to rest.
  */
-export function lastReleaseFrom(station: Pick<StationRecord, 'welcomeRoomId'>): number | null {
-  if (!station.welcomeRoomId) return null;
-  const atlas = readAtlas();
-  const stations = listStations(atlas);
-  let last: number | null = null;
-  for (const [, door] of readAllDoors()) {
-    if (door.paired === true || !door.dock || !door.retiredAddress) continue;
-    let partner = '';
-    try { partner = roomIdFromSeed(door.retiredAddress); } catch { continue; }
-    if (!partner || stationForRoom(partner, atlas, stations)?.welcomeRoomId !== station.welcomeRoomId) continue;
-    if (last === null || door.dock.undockedAt > last) last = door.dock.undockedAt;
+export function restingPlace(
+  rest: RestPlace,
+  now: number = Date.now(),
+  stations: StationRecord[] = listStations(undefined, undefined, now),
+): { heldBy: string | null } | { at: string; from?: StationRecord; releasedAt?: number } {
+  let release: { at: number; room: string } | null = null;
+  for (const doorId of rest.docks ?? []) {
+    const door = readDoor(doorId);
+    if (!door) continue;
+    let room = '';
+    try {
+      room = roomIdFromSeed(door.paired === true ? door.connectedRoomAddress : door.retiredAddress);
+    } catch {
+      room = '';
+    }
+    if (!room) continue;
+    if (door.paired === true) {
+      // A gangway is structure, not a dock: that ship is no free ship.
+      if (door.transient === true || isDockChain(door.segments)) return { heldBy: dockHost(room, stations)?.id ?? null };
+      continue;
+    }
+    // A release before the ship came to rest here belongs to an earlier stay.
+    if (!door.dock || door.dock.undockedAt < rest.since) continue;
+    if (!release || door.dock.undockedAt > release.at) release = { at: door.dock.undockedAt, room };
   }
-  return last;
+  if (!release) return { at: rest.at };
+  const from = dockHost(release.room, stations);
+  if (!from) return { at: rest.at, releasedAt: release.at };
+  const left = stationLeftFrom(from, release.at, now);
+  const at = left ? adriftAt(left.planetId, left.orbitSlot) : stationInTransit(from, now) ? rest.at : placeOf(from);
+  return { at, from, releasedAt: release.at };
+}
+
+/**
+ * 🚚 Keep this ship's rest record (shipDoc.RestPlace) by what its own room
+ * sees, so where it rests never hangs on which station moves an install has
+ * heard of: while docks hold it, which doors they are and where their station
+ * is (only when they change, and never while that station is between
+ * planets); once the last of them lets go, where its station was then, when
+ * that takes no move history (the station has not moved since). For a docked
+ * ship only. Returns whether it wrote.
+ */
+export function keepRestPlace(roomId: string = currentRoomId(), now: number = Date.now()): boolean {
+  const rec = readFlightRecord();
+  if (!roomId || rec.status !== 'docked' || adriftPlace(rec.locationId)) return false;
+  const rest = readRestPlace();
+  const doors = readAllDoors();
+  const stations = listStations(undefined, undefined, now);
+  const hostId = dockedStationFor(roomId, doors.values(), readAtlas(), stations);
+  const host = hostId ? stations.find((s) => s.id === hostId) : undefined;
+  if (host) {
+    if (stationInTransit(host, now)) return false;
+    const docks: string[] = [];
+    for (const [doorId, door] of doors) {
+      if (door.paired !== true || (door.transient !== true && !isDockChain(door.segments))) continue;
+      let room = '';
+      try { room = roomIdFromSeed(door.connectedRoomAddress); } catch { room = ''; }
+      if (room && dockHost(room, stations)?.id === host.id) docks.push(doorId);
+    }
+    docks.sort();
+    const held = docks.slice(0, MAX_REST_DOCKS);
+    if (held.length === 0) return false;
+    if (rest?.docks?.length === held.length && rest.docks.every((d, i) => d === held[i])) return false;
+    return writeRestPlace({ at: placeOf(host), since: Math.floor(now), docks: held });
+  }
+  if (!rest?.docks?.length) return false;
+  const resting = restingPlace(rest, now, stations);
+  if ('heldBy' in resting || resting.from === undefined || resting.releasedAt === undefined) return false;
+  if (stationInTransit(resting.from, now) || stationLeftFrom(resting.from, resting.releasedAt, now)) return false;
+  return writeRestPlace({ at: resting.at, since: Math.floor(resting.releasedAt) });
+}
+
+/** Record that the ship came to rest beside the station `locationId` names,
+ *  docking through `docks` (none: without a dock). An open-orbit place is its
+ *  own rest, and a station this install cannot list gives none: either clears
+ *  the record, so no earlier stay's rest outlives this arrival. */
+function restBeside(locationId: string, now: number, docks: string[]): void {
+  const st = adriftPlace(locationId) ? undefined : listStations(undefined, undefined, now).find((s) => s.id === locationId);
+  const rest = st && !stationInTransit(st, now)
+    ? { at: placeOf(st), since: Math.floor(now), docks: [...docks].sort().slice(0, MAX_REST_DOCKS) }
+    : null;
+  if (!writeRestPlace(rest)) writeRestPlace(null);
 }
 
 /**
@@ -385,8 +491,9 @@ export function completeArrival(
   const settle = (outcome: ArrivalOutcome, locationId: string = rec.locationId): ArrivalOutcome | null => {
     const graceOver = rec.etaAt === undefined || now >= rec.etaAt + ARRIVAL_GRACE_MS;
     if (!opts.force && !graceOver) return null;
-    // Arrived there without a dock (an open-orbit place needs no time).
-    writeFlightRecord({ status: 'docked', locationId, ...(adriftPlace(locationId) ? {} : { arrivedAt: Math.floor(now) }) });
+    writeFlightRecord({ status: 'docked', locationId });
+    // At rest there without a dock.
+    restBeside(locationId, now, []);
     return outcome;
   };
   // A destination that left the directory mid-flight is NOT home: arrive
@@ -440,12 +547,15 @@ export function completeArrival(
     const outcome: ArrivalOutcome = { kind: 'none', stationName: station.name, reason: plan.reason };
     if (plan.reason === 'already-docked') {
       writeFlightRecord({ status: 'docked', locationId: rec.locationId });
+      restBeside(rec.locationId, now, ports.filter((p) => p.state.kind === 'docked').map((p) => p.doorId));
       return outcome;
     }
     return settle(outcome);
   }
-  // Arrived: should the berth refuse the DOCK, the ship rests here without one.
-  writeFlightRecord({ status: 'docked', locationId: rec.locationId, arrivedAt: Math.floor(now) });
+  writeFlightRecord({ status: 'docked', locationId: rec.locationId });
+  // Arrived, docking through this port: should the berth refuse the DOCK, the
+  // ship rests here without one.
+  restBeside(rec.locationId, now, [plan.doorId]);
   if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
   const settled = (ok: boolean | void): void => opts.onSettled?.(ok !== false
     ? { kind: 'docked', stationName: station.name }

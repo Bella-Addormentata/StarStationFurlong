@@ -16,7 +16,7 @@ import {
   type ConnectorSegment,
 } from './adapter';
 import {
-  bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readAllDoors,
+  bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readAllDoors, readAllDoorsIfComplete,
   readAllDoorsFrom, readDoorFrom, transactDoorWrites, writeDoorPairing, writeDoorRecordTo,
 } from './doorsDoc';
 import { bindDoorPolicy, dockPortFlagIn, readDoorPolicy, writeDoorPolicy } from './doorPolicy';
@@ -194,6 +194,21 @@ describe('dock — the wire', () => {
     const c = read.get('d:c');
     expect(c?.paired && c.dockedAt).toBeUndefined();
     expect(c?.paired && c.segments).toBeUndefined(); // an unknown kind drops the chain
+  });
+
+  it('a snapshot that could leave a door out says so, where absence is news (readAllDoorsIfComplete)', () => {
+    const doc = new Y.Doc();
+    bindDoorsDoc(doc);
+    const doors = doc.getMap('doors');
+    // Junk never counts toward the cap.
+    doors.set('not a door key', buildDoorTombstone(seedFor(STATION)));
+    doors.set('d:junk', { paired: 'maybe' });
+    for (let i = 0; i < 64; i++) doors.set(`d:${i}`, buildDoorTombstone(seedFor(STATION)));
+    expect(readAllDoorsIfComplete()?.size).toBe(64);
+    // One more valid record: the capped snapshot may now miss any of them.
+    doors.set('north', { ...buildDoorPairing(seedFor(STATION), { segments: dockChain(), transient: true, dockedAt: 7 }) });
+    expect(readAllDoors().size).toBe(64);
+    expect(readAllDoorsIfComplete()).toBeNull();
   });
 
   it('writeDoorRecordTo writes the exact shape the bound reader reads back', () => {

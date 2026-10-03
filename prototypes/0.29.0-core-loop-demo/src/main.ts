@@ -115,7 +115,7 @@ import {
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
 import { arrivalNoteHere, clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
-import { completeArrival, setBerthSeedResolver, shipPlaceId } from "./shipArrival";
+import { completeArrival, keepRestPlace, setBerthSeedResolver, shipPlaceId } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -167,6 +167,7 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readAllDoorsIfComplete,
   readDoor,
   subscribeDoors,
   transactDoorWrites,
@@ -1221,12 +1222,16 @@ function shipStationHere(roomId: string): string | null {
 
 /** Does this room hold a live dock into a room of the station whose welcome
  *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) True when
- *  it does; else when this room let go of it, by its dock tombstones (the
- *  UNDOCK's own stamp, however late this tab learns of it), the earliest
- *  release at or after `since`; else false (not docked, time unknown). */
+ *  it does, or when its door records are more than a snapshot holds (one left
+ *  out could be that dock: no proof it let go); else when this room let go of
+ *  it, by its dock tombstones (the UNDOCK's own stamp, however late this tab
+ *  learns of it), the earliest release at or after `since`; else false (not
+ *  docked, time unknown). */
 function dockedToStation(welcomeRoomId: string, since = -Infinity): boolean | number {
+  const doors = readAllDoorsIfComplete();
+  if (!doors) return true;
   let released: number | null = null;
-  for (const [, rec] of readAllDoors()) {
+  for (const [, rec] of doors) {
     const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
     if (!address) continue;
     if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
@@ -1263,10 +1268,11 @@ function planetShipStatus(): ShipStatusInput | null {
   // 🚚 Where the ship is: the station its live dock leads into (a tug docked
   // by hand at a station it has since towed to another planet, say), else
   // where its flight record leaves it, wherever its stations have moved
-  // without it (shipPlaceId).
+  // without it (shipPlaceId). It is at that station, or (in open orbit)
+  // left its record's.
   const host = dockedStationFor(roomId, readAllDoors().values());
   const at = host ?? shipPlaceId(rec);
-  const from = byId(host ?? rec.locationId);
+  const from = byId(at) ?? byId(rec.locationId);
   const to = byId(rec.destinationId);
   // The ship's own one-room stand-in sits on the default planet until its
   // stations are known: that is no placement, so the entry waits (null).
@@ -1960,6 +1966,9 @@ async function joinRoomAtEpoch(
     // or arrival never waits for the owner to come back.
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
+    // 🚚 Where the ship rests, kept by what this room sees first-hand, so it
+    // stays put once its station leaves without it.
+    if (isShipReady()) keepRestPlace(boot.roomId);
     // 🪐 Where each station's last move settled it, shared once for everyone:
     // every station this game lists, aboard or not.
     if (planetSummaryBeat % 10 === 0) pinSettledArrivals(listStations(), Date.now());

@@ -309,6 +309,24 @@ function readDoorsMap(map: Y.Map<unknown>): Map<string, DoorRecord> {
 }
 
 /**
+ * 🚚 readAllDoors, or null when the room holds more valid door records than
+ * a snapshot keeps (MAX_PAIRINGS): one that might leave out the very door. A
+ * caller that reads a dock's ABSENCE as news (a tug that let go of the
+ * station it tows) must not take a capped snapshot, which a peer could have
+ * flooded, for the whole room.
+ */
+export function readAllDoorsIfComplete(): Map<string, DoorRecord> | null {
+  if (!docAlive()) return new Map<string, DoorRecord>();
+  const out = new Map<string, DoorRecord>();
+  for (const [id, value] of doorsMap!.entries()) {
+    if (!isAcceptableDoorKey(id) || !isDoorRecord(value)) continue;
+    if (out.size >= MAX_PAIRINGS) return null;
+    out.set(id, sanitizeDoorGeometry(value));
+  }
+  return out;
+}
+
+/**
  * ⚓ #163: the same sanitized snapshot, read from ANY doc — the far-room dock
  * write (farDoorWrite.ts) holds a second, short-lived doc that is not the
  * bound one. Same guard and sanitizer, so both ends of a dock are judged by

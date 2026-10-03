@@ -75,6 +75,7 @@ import * as Y from 'yjs';
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import {
+  adriftPlace,
   DEFAULT_STATIONS,
   findStation,
   isKnownStation,
@@ -141,11 +142,6 @@ export interface FlightRecord {
    *  window or on its way stays there whatever its origin does meanwhile
    *  (shipArrival.shipPlaceId): only a live dock carries a ship along. */
   originAt?: string;
-  /** When a `docked` ship arrived at its location. Without a live dock it
-   *  stays where the station was then once the station leaves on a move,
-   *  as it does where the station was when it last let go of a dock there
-   *  (shipArrival.shipPlaceId): only a live dock carries a ship along. */
-  arrivedAt?: number;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -253,7 +249,6 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.castOffAt !== undefined && !isFlightTime(r.castOffAt)) return false;
   if (r.destinationAt !== undefined && !isBoundedString(r.destinationAt)) return false;
   if (r.originAt !== undefined && !isBoundedString(r.originAt)) return false;
-  if (r.arrivedAt !== undefined && !isFlightTime(r.arrivedAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -300,7 +295,6 @@ export function defaultFlight(): FlightRecord {
 function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
   // Station ids are per install: read another install's ids as ours.
   const out: FlightRecord = { status: r.status, locationId: localStationId(r.locationId) };
-  if (r.status === 'docked' && r.arrivedAt !== undefined) out.arrivedAt = r.arrivedAt;
   if (r.status === 'undocking' || r.status === 'in-flight') {
     if (r.destinationId !== undefined) out.destinationId = localStationId(r.destinationId);
     if (r.status === 'in-flight') {
@@ -927,6 +921,64 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
   }
   boundDoc!.transact(() => {
     shipMap!.set('berths', { ...next });
+  });
+  return true;
+}
+
+// ── Where the ship rests (station moves) ─────────────────────────────────────
+
+/**
+ * 🚚 Where this ship came to rest beside a station, for when it holds no live
+ * dock (shipArrival.shipPlaceId). Only a live dock carries a ship along, so a
+ * ship without one stays where its station was: `at`, an open-orbit place
+ * (stationDirectory.adriftAt), as of `since` (writer clock), taken when the
+ * ship arrived and whenever the docks holding it changed. `docks` names this
+ * ship's doors that held a live dock then (or, just after an arrival, were
+ * docking): once none of them does, the ship is where its station was at the
+ * last of their UNDOCKs since, read off those doors directly
+ * (shipArrival.restingPlace). Kept first-hand in this room (completeArrival,
+ * shipArrival.keepRestPlace), so every install reads the same place, whatever
+ * station moves it has heard of. A docked ship with none follows its station.
+ */
+export interface RestPlace {
+  at: string;
+  since: number;
+  docks?: string[];
+}
+
+/** Most dock doors a rest record names: a ship has a handful of ports. */
+export const MAX_REST_DOCKS = 8;
+
+export function isRestPlace(v: unknown): v is RestPlace {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const r = v as Partial<RestPlace>;
+  if (!isBoundedString(r.at) || !adriftPlace(r.at) || !isFlightTime(r.since)) return false;
+  if (r.docks === undefined) return true;
+  return Array.isArray(r.docks) && r.docks.length <= MAX_REST_DOCKS
+    && r.docks.every((d) => typeof d === 'string' && isAcceptableDoorKey(d));
+}
+
+/** Where the ship rests, or null when no rest is recorded. */
+export function readRestPlace(): RestPlace | null {
+  if (!docAlive()) return null;
+  const raw = shipMap!.get('rest');
+  if (!isRestPlace(raw)) return null;
+  const out: RestPlace = { at: raw.at, since: raw.since };
+  if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
+  return out;
+}
+
+/** Record where the ship rests (null forgets it). Returns whether the doc
+ *  now holds what was asked. */
+export function writeRestPlace(rest: RestPlace | null): boolean {
+  if (!docAlive()) return false;
+  if (rest !== null && !isRestPlace(rest)) {
+    console.warn('[ship] refused to write malformed rest place', rest);
+    return false;
+  }
+  boundDoc!.transact(() => {
+    if (rest === null) shipMap!.delete('rest');
+    else shipMap!.set('rest', { at: rest.at, since: rest.since, ...(rest.docks?.length ? { docks: [...rest.docks] } : {}) });
   });
   return true;
 }
