@@ -169,16 +169,22 @@ export function cleanBerths(v: unknown): StationBerthRecord[] {
     const held = byPort.get(key);
     if (!held || copyOrder(b, held) < 0) byPort.set(key, b);
   }
-  const valid = [...byPort.values()].sort(berthOrder);
-  // One slot per gate number first (as cleanGates): ports repeating a number,
-  // or with none, only fill what is left, so they cannot crowd a gate out.
+  return capBerths([...byPort.values()].sort(berthOrder));
+}
+
+/** At most MAX_BERTHS of `sorted`, in its order: one slot per gate number
+ *  first (as cleanGates), so ports repeating a number, or with none, only
+ *  fill what is left and cannot crowd a gate out. */
+function capBerths(sorted: readonly StationBerthRecord[]): StationBerthRecord[] {
+  if (sorted.length <= MAX_BERTHS) return [...sorted];
   const numbers = new Set<number>();
-  const firsts: StationBerthRecord[] = [];
-  const rest: StationBerthRecord[] = [];
-  for (const b of valid) {
-    if (b.gate !== undefined && !numbers.has(b.gate)) { numbers.add(b.gate); firsts.push(b); } else rest.push(b);
-  }
-  return [...firsts, ...rest].slice(0, MAX_BERTHS).sort(berthOrder);
+  const keep = sorted.map(() => false);
+  let kept = 0;
+  sorted.forEach((b, i) => {
+    if (kept < MAX_BERTHS && b.gate !== undefined && !numbers.has(b.gate)) { numbers.add(b.gate); keep[i] = true; kept++; }
+  });
+  for (let i = 0; i < sorted.length && kept < MAX_BERTHS; i++) if (!keep[i]) { keep[i] = true; kept++; }
+  return sorted.filter((_, i) => keep[i]);
 }
 
 /**
@@ -671,11 +677,10 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
       roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
       ...(g.access ? { access: g.access, ...(g.reservedFor ? { reservedFor: g.reservedFor } : {}) } : {}),
     }));
-    berths = [...seen, ...learned]
+    berths = capBerths([...seen, ...learned]
       .map((b, i) => ({ b, i }))
       .sort((x, y) => (x.b.gate ?? MAX_BERTHS + 1) - (y.b.gate ?? MAX_BERTHS + 1) || x.i - y.i)
-      .map((x) => x.b)
-      .slice(0, MAX_BERTHS);
+      .map((x) => x.b));
   } else {
     berths = learned;
     // An empty list means "known to have none" (a summary's, or this atlas's

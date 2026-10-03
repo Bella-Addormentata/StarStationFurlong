@@ -621,6 +621,23 @@ describe('the station record', () => {
     expect(Object.keys(withSharedAtlasOf(doc, readAtlas(), 'room-far')['room-far'].gates ?? {})).toHaveLength(99);
   });
 
+  it("lets no repeated low numbers crowd a station's distinct gates off its list", () => {
+    // Two stations joined by a gangway, numbered apart: room-a uses every
+    // number, and room-b's five ports repeat its first five.
+    const every: Record<string, number> = {};
+    for (let g = 1; g <= 99; g++) every[`d:a${String(g).padStart(7, '0')}`] = g;
+    const repeats: Record<string, number> = {};
+    for (let g = 1; g <= 5; g++) repeats[`d:b${String(g).padStart(7, '0')}`] = g;
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [{ doorId: 'east', targetSeed: seed('room-b'), transient: false }], gates: every });
+    harvestIntoAtlas({ roomId: 'room-b', name: 'DOCKS', doors: [{ doorId: 'west', targetSeed: seed('room-a'), transient: false }], gates: repeats });
+    registerStation({ id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 6, welcomeRoomId: 'room-a' });
+    const berths = listStations().find((s) => s.id === 'hub')!.berths!;
+    expect(berths).toHaveLength(99);
+    expect(new Set(berths.map((b) => b.gate)).size).toBe(99);
+    // Still in gate order.
+    expect(berths.map((b) => b.gate)).toEqual([...berths.map((b) => b.gate)].sort((x, y) => x! - y!));
+  });
+
   it('puts a learned gate list in gate order, whatever order a peer sent', () => {
     expect(cleanBerths([
       { roomId: 'room-b', doorId: 'west' },
