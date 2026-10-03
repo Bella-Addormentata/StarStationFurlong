@@ -147,7 +147,7 @@ import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'smartTv';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -273,6 +273,20 @@ export interface AirHockeyVisualHandle {
   flashGoal(side: 'a' | 'b'): void;
   /** Per-frame animation (goal flash, mallet hover ease). World drives this. */
   update(dt: number): void;
+}
+
+// ── 📺 Smart-TV screen handle (#186 — shared with the furniture builder) ─────
+
+/**
+ * Handle onto a smart TV's in-world CanvasTexture screen. The builder
+ * (furniture.ts) stows it in the screen mesh's userData.tvScreen; World
+ * collects it and, at ~2 Hz, hands it the view tvDoc derives from the room
+ * record (tvScreenView) — the handle redraws only when the view changed.
+ * The picture itself is not here (plan §3.4): the screen shows the home
+ * screen, the countdown and the now-playing card; the theatre plays video.
+ */
+export interface TvScreenHandle {
+  draw(view: import('./tvDoc').TvScreenView): void;
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────

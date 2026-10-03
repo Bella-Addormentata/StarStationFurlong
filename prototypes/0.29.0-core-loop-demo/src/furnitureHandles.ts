@@ -34,6 +34,7 @@ import type {
   CoinPusherVisualHandle,
   PropAnimHandle,
   AirHockeyVisualHandle,
+  TvScreenHandle,
 } from './devices';
 
 /**
@@ -65,6 +66,8 @@ export interface FurnitureHandleSinks {
    *  Both registration paths read the filed handle back and hand it, with the
    *  item's pose, to the session layer (airHockeySession.ts), which drives it. */
   airHockeyVisuals: Map<string, AirHockeyVisualHandle>;
+  /** 📺 Smart-TV screens, keyed by item id (#186 — redrawn at ~2 Hz from the room record). */
+  tvScreens: Map<string, TvScreenHandle>;
 }
 
 /**
@@ -97,4 +100,5 @@ export function registerFurnitureHandles(
   }
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
+  if (d.tvScreen) sinks.tvScreens.set(itemId, d.tvScreen as TvScreenHandle);
 }

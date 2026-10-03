@@ -114,6 +114,13 @@ import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
+// 📺 #186: the smart TV — its records, the phone remote, the theatre, the
+// room-level duties (lease renewals, the hand-back on leave).
+import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, subscribeTv } from "./tvDoc";
+import { renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
+import { openTvTheatre, setTvChipOpener } from "./tvTheatre";
+import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
+import { FURNITURE } from "./furniture";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
@@ -1391,6 +1398,11 @@ async function joinRoomAtEpoch(
   // into a party that has already happened and see the candles already out.
   bindPartyDoc(sync.doc);
 
+  // 📺 Bind the shared tv map (#186): what each set shows and who holds its
+  // remote. Same T0 seam — a joiner walks in on a movie already running and
+  // anchors its clock to the sample it finds.
+  bindTvDoc(sync.doc);
+
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the
   // whole station from space immediately. Seeds don't travel (credential
@@ -2200,6 +2212,8 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // first (bounded: a stalled transport must not hold the swap).
     leaveSlotMachineRoom();
     leaveCoinPusherRoom();
+    // 📺 #186: a remote leaves with nobody — put every one I hold back on its set.
+    leaveTvRoom(roomTvIds());
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),
@@ -4840,6 +4854,17 @@ function syncVentureLedgerFromCurrentRoom(): void {
  *  not the right to hand the module away). 🔒 #141: legacy 'Local-Clone' rooms
  *  no longer count as mine — they counted as EVERYONE's — matching
  *  `categorizeRoom`, which now files them as 'visited'. */
+// 📺 #186: the room's TVs, as the phone remote and the leave hand-back see them.
+function roomTvIds(): string[] {
+  return FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
+}
+function tvLabelFor(itemId: string): string {
+  return FURNITURE.find((i) => i.id === itemId)?.kind === "tv-stand" ? "TV ON THE STAND" : "WALL TV";
+}
+function tvTheatreDeps(itemId: string) {
+  return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
+}
+
 function currentRoomDeedIsMine(): boolean {
   // The decision lives in roomOwner.ts so it can be unit-tested; this wrapper
   // supplies the live getters, exactly as isLocalPlayerRoomOwner does.
@@ -6276,7 +6301,8 @@ function setupSpacePhoneOverlay() {
     | "treasury"
     | "settings"
     | "setnet"
-    | "setstats";
+    | "setstats"
+    | "tv";
   const phoneViewMeta: Record<
     PhoneViewId,
     { elId: string; title: string; subtitle: string }
@@ -6330,6 +6356,11 @@ function setupSpacePhoneOverlay() {
       elId: "phone-app-settings-stats",
       title: "📊 STATS",
       subtitle: "Settings · Live Readout",
+    },
+    tv: {
+      elId: "phone-app-tv",
+      title: "📺 TV REMOTE",
+      subtitle: "The set whose remote you hold",
     },
   };
   /** Sub-views return to their parent on BACK instead of jumping home. */
@@ -6461,6 +6492,24 @@ function setupSpacePhoneOverlay() {
     }
     if (id === "contacts") refreshContactsApp();
     if (id === "setstats") void refreshStorageStats(); // 📟 live disk figures
+    // 📺 #186: the remote. Repaints itself on tv-map changes while active.
+    if (id === "tv") {
+      const view = document.getElementById("phone-app-tv");
+      if (view) {
+        renderTvPhoneApp(view, {
+          tvs: () => roomTvIds().map((tvId) => ({ id: tvId, label: tvLabelFor(tvId) })),
+          myPub: () => getIdentityPub(),
+          myName: () => getPlayerName(),
+          canEdit: () => canEditRoom().ok,
+          roomPlayers: () => tvRoomPlayers(getIdentityPub()),
+          openTheatre: (tvId) => {
+            container?.classList.remove("active");
+            openTvTheatre(tvId, tvTheatreDeps(tvId));
+          },
+          resolveArchive: resolveArchiveFile,
+        });
+      }
+    }
   };
 
   // App tiles on the home screen route into their views. Delegated from the
@@ -6512,6 +6561,15 @@ function setupSpacePhoneOverlay() {
     closeMiniChat();
     container?.classList.add("active");
     showPhoneView("treasury");
+  };
+  // 📺 #186: the set's panel and a hand-over open the phone straight on the
+  // remote — same posture as __ssfOpenTreasury.
+  (
+    window as unknown as { __ssfOpenTvRemote?: () => void }
+  ).__ssfOpenTvRemote = () => {
+    closeMiniChat();
+    container?.classList.add("active");
+    showPhoneView("tv");
   };
   phoneShell.addEventListener("click", (e) => routeFrom(e.target));
   phoneShell.addEventListener("keydown", (e) => {
@@ -8672,6 +8730,41 @@ async function init() {
   // host) ask the same owner seam edit mode does.
   setPartyHostPredicate(() => canEditRoom().ok);
   setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  // 📺 #186: the same two seams for the TV (the owner holds the spare
+  // remote), the room roster for HAND TO…, and the chip that opens the
+  // theatre from anywhere in the room.
+  setTvHostPredicate(() => canEditRoom().ok);
+  setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  setTvRoomPlayersProvider(() => {
+    const out: Array<{ pub: string; name: string }> = [];
+    const map = yjsSync?.doc.getMap("players");
+    if (!map) return out;
+    for (const [, raw] of map.entries()) {
+      const p = raw as Partial<PlayerEntry> | undefined;
+      if (p && typeof p.keyB64 === "string" && p.keyB64) {
+        out.push({ pub: p.keyB64, name: typeof p.name === "string" ? p.name.slice(0, PLAYER_NAME_MAX_LENGTH) : "" });
+      }
+    }
+    return out;
+  });
+  setTvChipOpener((itemId) => openTvTheatre(itemId, tvTheatreDeps(itemId)));
+  // A remote handed to me pops the phone open on it (plan §3.2: the
+  // receiver's phone opens on the remote; no accept step). A pick-up of my
+  // own is not announced — `by` names the giver.
+  let tvHeldBefore = new Set<string>();
+  subscribeTv(() => {
+    const me = getIdentityPub();
+    const held = new Set(roomTvIds().filter((id) => iHoldRemote(id)));
+    for (const id of held) {
+      if (tvHeldBefore.has(id)) continue;
+      const rec = readRemote(id);
+      if (rec.by && rec.by !== me) {
+        showHint("📺 Someone handed you the TV remote.");
+        (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.();
+      }
+    }
+    tvHeldBefore = held;
+  });
   setRoomEditPermission(() => {
     // Leaving: the old room's doc is still bound and its writes still go out,
     // but it isn't this client's room any more (roomLeavesUnderWay).

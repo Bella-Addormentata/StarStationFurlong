@@ -44,7 +44,7 @@
 
 import * as THREE from 'three';
 import {
-  FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos,
+  FURNITURE, FURNITURE_DEFS, buildItemGroup, snapItemPos, snapInteriorWall,
   footprintAabb, itemAabb, itemOccupancyBox,
 } from './furniture';
 import type { Box, FurnitureItem, FurnitureKind, Rot } from './furniture';
@@ -116,6 +116,8 @@ const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'birthday-balloons': '🎈 BIRTHDAY BALLOONS',
   'birthday-balloons-wall': '🎈 BALLOONS (WALL-HUNG)',
   'coin-pusher': '🪙 COIN PUSHER',
+  'smart-tv': '📺 SMART TV (WALL)',
+  'tv-stand': '📺 TV ON A STAND',
   'cake-table': '🎂 CAKE TABLE',
   'gift-box': '🎁 GIFT BOX',
   'birthday-banner': '🎊 BIRTHDAY BANNER',
@@ -313,6 +315,56 @@ function clearanceOk(item: FurnitureItem, pos: { x: number; z: number }, margin:
  * space but a crowded room still fills up before rejecting. Returns null when
  * the room is genuinely full.
  */
+/**
+ * 📺 Wall-mounted kinds (the TV; the terminal has its own rescue row) hang on
+ * a wall, not the floor: probe every half-metre stop along each wall through
+ * snapInteriorWall (which derives the rot that faces the screen into the
+ * room), keep the stops the full placement gate accepts, and take the one
+ * nearest the player — the same posture as findSpawnSpot, one dimension down.
+ */
+function findWallSpot(world: World, item: FurnitureItem): { x: number; z: number; rot: Rot } | null {
+  const player = world.getPlayer();
+  const p = player.getPosition();
+  const ctx: PlacementContext = {
+    playerPositions: [{ x: p.x, z: p.z }, ...world.getRemotePlayerPositions()],
+    floodFrom: floodOrigin(player),
+    requiredReachable: collectRequiredReachable(floodOrigin(player)),
+  };
+  const { halfX, halfZ } = roomHalfExtents();
+  const seen = new Set<string>();
+  const candidates: Array<{ x: number; z: number; rot: Rot; d: number }> = [];
+  // A raw point deep against each wall snaps to that wall; walk its length.
+  const probes: Array<[number, number]> = [];
+  for (let a = -Math.max(halfX, halfZ); a <= Math.max(halfX, halfZ); a += 0.5) {
+    probes.push([a, -halfZ], [a, halfZ], [-halfX, a], [halfX, a]);
+  }
+  for (const [x, z] of probes) {
+    const s = snapInteriorWall(item.kind, x, z);
+    if (!s) continue;
+    const key = `${s.x},${s.z},${s.rot}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({ ...s, d: (s.x - p.x) ** 2 + (s.z - p.z) ** 2 });
+  }
+  candidates.sort((a, b) => a.d - b.d);
+  const reasons = new Map<string, number>();
+  for (const c of candidates) {
+    const verdict = validatePlacement(item, { x: c.x, z: c.z }, c.rot, ctx);
+    if (verdict.ok) return { x: c.x, z: c.z, rot: c.rot };
+    reasons.set(verdict.reason, (reasons.get(verdict.reason) ?? 0) + 1);
+  }
+  // Say WHY every stretch of wall refused — "room is full" hides a doorway
+  // rule or a wall-flush bookcase from whoever is trying to hang the set.
+  lastSpotReasons = [...reasons.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([r, n]) => `${r} ×${n}`)
+    .join('; ');
+  return null;
+}
+/** The refusals the last wall-spot search met, for the failure hint. */
+let lastSpotReasons = '';
+
 function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: number } | null {
   const player = world.getPlayer();
   const p = player.getPosition();
@@ -468,9 +520,11 @@ function spawnFurniture(kind: FurnitureKind): void {
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
-      : findSpawnSpot(world, item);
+      : FURNITURE_DEFS[kind].wallMount
+        ? findWallSpot(world, item) // 📺 interior wall kinds hang, they don't stand
+        : findSpawnSpot(world, item);
   if (!spot) {
-    showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (room is full).`);
+    showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (${FURNITURE_DEFS[kind].wallMount && lastSpotReasons ? lastSpotReasons : 'room is full'}).`, 5000);
     return;
   }
   item.pos = { x: spot.x, z: spot.z };
@@ -619,7 +673,9 @@ function placeFromInventory(index: number, kind: FurnitureKind): void {
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
-      : findSpawnSpot(world, item);
+      : FURNITURE_DEFS[kind].wallMount
+        ? findWallSpot(world, item) // 📺 interior wall kinds hang, they don't stand
+        : findSpawnSpot(world, item);
   if (!spot) {
     showHint(`DEV: CAN'T PLACE ${kind} — no valid spot (room is full). Kept in inventory.`);
     return;

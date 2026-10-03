@@ -139,6 +139,7 @@ import { registerFurnitureHandles } from "./furnitureHandles";
 import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
+  TvScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -170,6 +171,12 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
+// 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
+// screen view the prop draws.
+import { createSmartTvUI } from "./tvUI";
+import { openTvTheatre, updateTvChip } from "./tvTheatre";
+import { tickTvRoom, tvRoomPlayers } from "./tvSession";
+import { tvScreenView } from "./tvDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -395,6 +402,11 @@ export class World {
    *  slot-machine visuals; the userData key on the upper platform mesh carries
    *  the handle so the traversal below picks it up. */
   private coinPusherVisuals: Map<string, CoinPusherVisualHandle> = new Map();
+  /** 📺 Smart-TV screens (#186), keyed by item id — redrawn at ~2 Hz from
+   *  the room record (tvDoc.tvScreenView); the handle dedupes identical views. */
+  private tvScreens: Map<string, TvScreenHandle> = new Map();
+  /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
+  private tvTimer = 0;
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1643,6 +1655,7 @@ export class World {
       coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
+      tvScreens: this.tvScreens,
     };
   }
 
@@ -3069,6 +3082,7 @@ export class World {
     this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
+    this.tvScreens.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3881,6 +3895,21 @@ export class World {
         for (const screen of this.wallScreens.values()) {
           screen.updateStatus(status);
         }
+      }
+    }
+
+    // 📺 #186: the TVs at 2 Hz — each screen draws the view the room record
+    // implies (the handle skips unchanged views), a holder renews its remote
+    // and keeps the room's clock alive, and the HUD chip says what is on.
+    // Driven here, not by timers of their own, so a removed set stops dead.
+    this.tvTimer += deltaTime;
+    if (this.tvTimer >= 0.5) {
+      this.tvTimer = 0;
+      const tvIds = FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
+      if (tvIds.length > 0 || this.tvScreens.size > 0) {
+        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+        tickTvRoom(tvIds);
+        updateTvChip(tvIds);
       }
     }
 
@@ -5687,6 +5716,28 @@ export class World {
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 📺 #186: the set's body buttons, WATCH, and the remote. The programme
+    // itself is chosen on the remote (the phone's TV app), as on a real set.
+    if (device.kind === "smartTv") {
+      const kind = FURNITURE.find((i) => i.id === deviceId)?.kind;
+      const label = kind === "tv-stand" ? "TV ON THE STAND" : "WALL TV";
+      const ui = createSmartTvUI({
+        itemId: deviceId,
+        label,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        canEdit: () => canEditRoom().ok,
+        roomPlayers: () => tvRoomPlayers(getIdentityPub()),
+        openTheatre: () => deviceFocus.releaseThen(() => openTvTheatre(deviceId, { label })),
+        openRemote: () =>
+          deviceFocus.releaseThen(() =>
+            (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.(),
+          ),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
