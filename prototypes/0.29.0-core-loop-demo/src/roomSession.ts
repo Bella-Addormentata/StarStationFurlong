@@ -135,8 +135,12 @@ export function openRoomSession(deps: RoomSessionDeps, address: string): Promise
     return {
       roomId: boot.roomId,
       doc: s.doc,
-      confirm: (since, timeoutMs) =>
-        (closed ? Promise.resolve(false) : s.confirmOwnWrites(since, timeoutMs).catch(() => false)),
+      confirm: async (since, timeoutMs) => {
+        if (closed) return false;
+        const ok = await s.confirmOwnWrites(since, timeoutMs).catch(() => false);
+        // Hung up while it waited: closed, nothing is acknowledged.
+        return ok && !closed;
+      },
       close: hangUp,
       get closed() {
         return closed;

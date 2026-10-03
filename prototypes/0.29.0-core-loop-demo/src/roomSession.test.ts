@@ -135,6 +135,16 @@ describe('opening a room session', () => {
     expect(await s!.confirm(new Uint8Array(), 1000)).toBe(false);
   });
 
+  it('acknowledges nothing once hung up, even a confirm already waiting', async () => {
+    const s = await openRoomSession(deps(), 'x');
+    let answer: (ok: boolean) => void = () => {};
+    net.confirm = () => new Promise<boolean>((r) => { answer = r; });
+    const waiting = s!.confirm(new Uint8Array(), 1000);
+    s!.close();
+    answer(true);
+    expect(await waiting).toBe(false);
+  });
+
   it('reads a confirm that fails as not acknowledged', async () => {
     const s = await openRoomSession(deps(), 'x');
     net.confirm = () => Promise.reject(new Error('channel gone'));
