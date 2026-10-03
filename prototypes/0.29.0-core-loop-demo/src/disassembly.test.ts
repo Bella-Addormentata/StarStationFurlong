@@ -19,6 +19,7 @@ import {
   readDisassemblyJob, readDisassemblyJobs, readRobotConfig, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
 } from './robotDoc';
 import type { DoorRecord } from './doorsDoc';
+import { bindFurnitureDoc, deleteFurnitureItem, writeFurnitureItem } from './furnitureDoc';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -259,8 +260,20 @@ describe('what a room can take apart', () => {
 
 const target = { roomId: 'room-b', name: 'GARDEN', doorId: 'east', laborHours: 24 };
 
+/** The docks the tests set robots on: d1–d3 and d00–d16. */
+const DOCKS = ['d1', 'd2', 'd3', ...Array.from({ length: 17 }, (_, i) => `d${String(i).padStart(2, '0')}`)];
+
+/** A room doc with these charging docks placed in its layout (a robot works
+ *  only from a placed dock), bound as the room's layout. */
+function roomWithDocks(ids: readonly string[] = DOCKS): Y.Doc {
+  const doc = new Y.Doc();
+  bindFurnitureDoc(doc);
+  for (const id of ids) writeFurnitureItem({ id, kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+  return doc;
+}
+
 describe('the job in the robot map', () => {
-  beforeEach(() => bindRobotDoc(new Y.Doc()));
+  beforeEach(() => bindRobotDoc(roomWithDocks()));
 
   it('opens a job, and every crew change settles it first', () => {
     assignDisassembly('d1', target, 0);
@@ -328,10 +341,11 @@ describe('the job in the robot map', () => {
   });
 
   it('two robots stopped at once on two clients both leave the crew', () => {
-    const a = new Y.Doc();
+    const a = roomWithDocks();
     bindRobotDoc(a);
     assignDisassembly('d1', target, 0);
     assignDisassembly('d2', target, 0);
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(['d1', 'd2']);
     const b = new Y.Doc();
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
     // Each client stops one robot at minute 6, before hearing of the other.
@@ -352,7 +366,7 @@ describe('the job in the robot map', () => {
   });
 
   it('reads every job and its crew in one bounded walk of the map', () => {
-    const doc = new Y.Doc();
+    const doc = roomWithDocks();
     bindRobotDoc(doc);
     const lab = { ...target, roomId: 'room-c', name: 'LAB', doorId: 'west' };
     assignDisassembly('d1', target, 0);
@@ -375,6 +389,25 @@ describe('the job in the robot map', () => {
     expect(entries).toHaveBeenCalledTimes(1);
     expect(walked).toBeLessThanOrEqual(MAX_ROBOT_MAP_SCAN + 1);
     entries.mockRestore();
+  });
+
+  it('counts only robots whose docks are placed in the room\'s layout', () => {
+    const doc = roomWithDocks(['d1', 'd2']);
+    bindRobotDoc(doc);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    assignDisassembly('d3', target, 0);
+    // d3's dock isn't in the layout: no robot stands there to work.
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(['d1', 'd2']);
+    // d2's dock leaves the layout by a write that didn't release its robot
+    // (a peer's): its config stays, but it adds no labor from then on, and
+    // what it did since the last settlement goes with it.
+    deleteFurnitureItem('d2');
+    const j = readDisassemblyJob('room-b')!;
+    expect(j.crew).toEqual(['d1']);
+    expect(readRobotConfig('d2')).toMatchObject({ routine: 'disassemble', target: 'room-b' });
+    expect(workedMs(j, 10 * MIN)).toBe(10 * MIN);
+    expect(jobDueAt(j)).toBe(24 * MIN);
   });
 
   it('raises an open job costed below the module, keeping the work done', () => {

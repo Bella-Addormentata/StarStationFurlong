@@ -16,6 +16,7 @@
 import * as Y from 'yjs';
 import type { DisassemblyJob, DisassemblyJobRecord, DisassemblyTarget } from './disassembly';
 import { MAX_CREW, isDisassemblyJobRecord, jobLaborMs, settleJob } from './disassembly';
+import { placedFurnitureIn } from './furnitureDoc';
 
 /** 🚀 'pilot' (robot pilot routes, design §2a): the Ship pilot routine. It holds
  *  no route: it makes the dock's robot ELIGIBLE to be named the ship's robot
@@ -47,7 +48,8 @@ export interface RobotConfig {
   parked?: boolean;
   /** 🔧 'disassemble' (#192): the room id of the module this robot takes
    *  apart — its job is `job:<target>` in the same map (disassembly.ts), and
-   *  this config is what puts the robot in that job's crew (unless parked).
+   *  this config is what puts the robot in that job's crew (unless parked,
+   *  and while its dock is placed in the room's layout).
    *  Absent: no module picked yet, the robot waits on its dock. */
   target?: string;
 }
@@ -189,6 +191,12 @@ function indexJobs(map: Y.Map<unknown>): JobIndex {
   const records: DisassemblyJobRecord[] = [];
   const crews = new Map<string, string[]>();
   const targeted = new Set<string>();
+  // A config can outlive its dock (a layout written without releasing it):
+  // only a dock placed in this same room doc's layout has a robot, so only
+  // its config counts. A gone one adds no labor; what it did since the last
+  // settlement goes with it, so a job is never ahead of its robots.
+  const doc = map.doc;
+  const placed = (dockId: string) => doc !== null && placedFurnitureIn(doc, dockId)?.kind === 'charging-dock';
   let scanned = 0;
   for (const [key, value] of map.entries()) {
     if (++scanned > MAX_ROBOT_MAP_SCAN) break;
@@ -197,11 +205,13 @@ function indexJobs(map: Y.Map<unknown>): JobIndex {
       continue;
     }
     if (!key.startsWith('cfg:') || !isRobotConfig(value) || value.routine !== 'disassemble' || !value.target) continue;
+    const dockId = key.slice(4);
+    if (!placed(dockId)) continue;
     targeted.add(value.target);
     if (value.parked === true) continue;
     const crew = crews.get(value.target);
-    if (crew) crew.push(key.slice(4));
-    else crews.set(value.target, [key.slice(4)]);
+    if (crew) crew.push(dockId);
+    else crews.set(value.target, [dockId]);
   }
   for (const [roomId, crew] of crews) crews.set(roomId, crew.sort().slice(0, MAX_CREW));
   return { records, crews, targeted };

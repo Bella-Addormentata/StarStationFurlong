@@ -154,6 +154,24 @@ describe('the station plan', () => {
     ]);
   });
 
+  it('matches unnamed records berths first, as berthDoorIds does', () => {
+    // The hub recorded one unnamed gangway to the bar; the bar recorded an
+    // unnamed gangway and then a berth back. The berth is the hub's record
+    // (berthDoorIds pairs it so), and the bar's gangway is a second
+    // connection only the bar wrote down.
+    harvestIntoAtlas({ roomId: 'u-hub', name: 'HUB', doors: [{ doorId: 'east', targetSeed: seed('u-bar'), transient: false }] });
+    harvestIntoAtlas({ roomId: 'u-bar', name: 'BAR', doors: [
+      { doorId: 'west', targetSeed: seed('u-hub'), transient: false },
+      { doorId: 'dock', targetSeed: seed('u-hub'), transient: true },
+    ] });
+    const hub = stationPlan(readAtlas(), 'u-hub').modules.find((m) => m.roomId === 'u-hub')!;
+    expect(hub.links).toHaveLength(2);
+    expect(hub.links).toEqual(expect.arrayContaining([
+      { doorId: 'east', toRoomId: 'u-bar', berth: true },
+      { doorId: '~u-bar:west', toRoomId: 'u-bar', berth: false },
+    ]));
+  });
+
   it('docks a ship whose berth only the ship recorded', () => {
     harvestIntoAtlas({ roomId: 'q-hub', name: 'HUB', doors: [], gates: { south: 4 } });
     harvestIntoAtlas({ roomId: 'q-ship', name: 'SKIFF', doors: [{ doorId: 'north', targetSeed: seed('q-hub'), wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0, transient: true }] });

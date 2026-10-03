@@ -12,12 +12,14 @@
  * The job lives in the room doc's `robot` map beside the robots' configs
  * (robotDoc.ts), one record per module being taken apart. Its crew is not
  * stored in it: the crew is every robot whose config is set to the module
- * and not stopped, so each robot's membership rides on its own config key
- * and concurrent edits to different robots never overwrite each other. Its
- * progress is a pure function of the clock: the labor done as of `asOf`,
- * plus the crew working since then. Every change to the crew settles the
- * progress first, so the clock is never read backwards and nothing has to
- * be written while the robots simply work.
+ * and not stopped, its dock placed in the room's layout, so each robot's
+ * membership rides on its own config key and concurrent edits to different
+ * robots never overwrite each other. Its progress is a pure function of
+ * the clock: the labor done as of `asOf`, plus the crew working since then.
+ * Every crew change the game makes (a pick, STOP/START, another routine, a
+ * dock removed or dropped by a new layout) settles the progress first, so
+ * the clock is never read backwards and nothing has to be written while the
+ * robots simply work.
  *
  * Pure: no DOM, no docs. Pinned by disassembly.test.ts.
  */
@@ -71,9 +73,9 @@ export interface DisassemblyJobRecord extends DisassemblyTarget {
   outcome?: 'removed' | 'detached';
 }
 
-/** A job as read: its record, and its crew, the charging docks whose robots
- *  are set to the module and not stopped (robotDoc.ts reads it from their
- *  configs, sorted, at most MAX_CREW). */
+/** A job as read: its record, and its crew, the placed charging docks whose
+ *  robots are set to the module and not stopped (robotDoc.ts reads it from
+ *  their configs, sorted, at most MAX_CREW). */
 export interface DisassemblyJob extends DisassemblyJobRecord {
   crew: string[];
 }

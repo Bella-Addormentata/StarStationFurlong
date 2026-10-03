@@ -900,12 +900,56 @@ export function isBerthDoor(door: Pick<AtlasDoor, 'transient' | 'segments'>): bo
  * opposite first (one connection flagged at both ends), and only a berth left
  * over with one unflagged record opposite. Whatever is left over is a
  * SEPARATE connection and keeps its own flag — a permanent gangway between
- * the same two rooms still joins them.
+ * the same two rooms still joins them. (pairAtlasRecords does the matching;
+ * the station plan's links read the same.)
  */
 export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {
-  type Side = Array<{ doorId: string; door: AtlasDoor }>;
-  // Each record filed under its (unordered) pair of rooms, by which end owns it.
-  const pairs = new Map<string, { owners: [string, string]; sides: [Side, Side] }>();
+  const berths = new Map<string, Set<string>>();
+  const mark = (roomId: string, doorId: string) => {
+    if (!berths.has(roomId)) berths.set(roomId, new Set());
+    berths.get(roomId)!.add(doorId);
+  };
+  for (const { owners, sides, partners } of pairAtlasRecords(atlas)) {
+    for (const [a, b] of partners) {
+      if (isBerthDoor(a.door) || isBerthDoor(b.door)) {
+        mark(owners[0], a.doorId);
+        mark(owners[1], b.doorId);
+      }
+    }
+    // Every record flagged itself, partnered or not.
+    for (const i of [0, 1] as const) {
+      for (const r of sides[i]) if (isBerthDoor(r.door)) mark(owners[i], r.doorId);
+    }
+  }
+  return berths;
+}
+
+/** 🗺️ One room's record of a connection, as pairAtlasRecords files it. */
+interface PairEnd {
+  doorId: string;
+  door: AtlasDoor;
+}
+
+/** 🗺️ The records two rooms hold of the connections between them. */
+interface AtlasPair {
+  /** The two rooms, sorted. */
+  owners: [string, string];
+  /** Each room's records naming the other, in `owners` order. */
+  sides: [PairEnd[], PairEnd[]];
+  /** The two ends of one connection, [owners[0]'s record, owners[1]'s]. */
+  partners: Array<[PairEnd, PairEnd]>;
+}
+
+/**
+ * 🗺️ Every pairing record in the atlas, filed under its (unordered) pair of
+ * rooms, with the records that are the two ends of one connection partnered
+ * (the matching berthDoorIds describes). Unnamed records the berth rules
+ * leave over, unflagged on both sides, pair one for one: they mark no
+ * berth, but a record left unpartnered is a connection only its own room
+ * wrote down (farOnlyRecords).
+ */
+function pairAtlasRecords(atlas: Record<string, AtlasEntry>): AtlasPair[] {
+  const pairs = new Map<string, AtlasPair>();
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || !e.doors) continue;
     for (const [doorId, door] of Object.entries(e.doors)) {
@@ -915,25 +959,17 @@ export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set
         : [door.targetRoomId, e.roomId];
       const key = JSON.stringify(owners);
       let pair = pairs.get(key);
-      if (!pair) pairs.set(key, pair = { owners, sides: [[], []] });
+      if (!pair) pairs.set(key, pair = { owners, sides: [[], []], partners: [] });
       pair.sides[owners[0] === e.roomId ? 0 : 1].push({ doorId, door });
     }
   }
 
-  const berths = new Map<string, Set<string>>();
-  const mark = (roomId: string, doorId: string) => {
-    if (!berths.has(roomId)) berths.set(roomId, new Set());
-    berths.get(roomId)!.add(doorId);
-  };
-  for (const { owners, sides } of pairs.values()) {
-    const partnered = new Set<Side[number]>();
-    const partner = (i: 0 | 1, mine: Side[number], theirs: Side[number]) => {
+  for (const { sides, partners } of pairs.values()) {
+    const partnered = new Set<PairEnd>();
+    const partner = (i: 0 | 1, mine: PairEnd, theirs: PairEnd) => {
       partnered.add(mine);
       partnered.add(theirs);
-      if (isBerthDoor(mine.door) || isBerthDoor(theirs.door)) {
-        mark(owners[i], mine.doorId);
-        mark(owners[1 - i], theirs.doorId);
-      }
+      partners.push(i === 0 ? [mine, theirs] : [theirs, mine]);
     };
     // Named: `farDoor` picks out the other end exactly — the record's own
     // name first, else a record opposite naming it.
@@ -960,12 +996,37 @@ export function berthDoorIds(atlas: Record<string, AtlasEntry>): Map<string, Set
         partner(i, r, t);
       }
     }
-    // Every record flagged itself, partnered or not.
+    // The unflagged rest, one for one.
+    const [plain0, plain1] = [loose(0, false), loose(1, false)];
+    for (let k = 0; k < Math.min(plain0.length, plain1.length); k++) partner(0, plain0[k], plain1[k]);
+  }
+  return [...pairs.values()];
+}
+
+/**
+ * 🗺️ The connections only the far room wrote down: every record naming a
+ * room that no record of that room's own partners, matched the way
+ * berthDoorIds matches them (pairAtlasRecords), keyed by the room named.
+ * One pass over the atlas.
+ */
+export function farOnlyRecords(
+  atlas: Record<string, AtlasEntry>,
+): Map<string, Array<{ fromRoomId: string; doorId: string; door: AtlasDoor }>> {
+  const out = new Map<string, Array<{ fromRoomId: string; doorId: string; door: AtlasDoor }>>();
+  for (const { owners, sides, partners } of pairAtlasRecords(atlas)) {
+    if (owners[0] === owners[1]) continue;
+    const partnered = new Set<PairEnd>(partners.flat());
     for (const i of [0, 1] as const) {
-      for (const r of sides[i]) if (isBerthDoor(r.door)) mark(owners[i], r.doorId);
+      for (const r of sides[i]) {
+        if (partnered.has(r)) continue;
+        const named = owners[1 - i];
+        const list = out.get(named) ?? [];
+        list.push({ fromRoomId: owners[i], doorId: r.doorId, door: r.door });
+        out.set(named, list);
+      }
     }
   }
-  return berths;
+  return out;
 }
 
 function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<string>> {

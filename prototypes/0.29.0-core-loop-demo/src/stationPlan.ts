@@ -12,7 +12,7 @@
  */
 
 import type { AtlasEntry, AtlasOwner } from './stationAtlas';
-import { atlasComponent, atlasPoses, berthDoorIds } from './stationAtlas';
+import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords } from './stationAtlas';
 import { TILE_SIZE } from './floorPlanDoc';
 import type { ShipSummary } from './planetSummary';
 
@@ -124,6 +124,7 @@ export function stationPlan(
     reverse: true,
   });
   const berths = berthDoorIds(atlas);
+  const farOnly = farOnlyRecords(atlas);
   const byId = new Map(poses.map((p) => [p.roomId, p]));
 
   const modules: PlanModule[] = [];
@@ -141,35 +142,14 @@ export function stationPlan(
     // 🗺️ A pairing only the far room recorded (atlasPoses' reverse hop) is a
     // link here too. Two rooms may share more than one connection, so a far
     // record is matched to OUR record of the same connection the way
-    // berthDoorIds pairs them: by a farDoor naming the other end, then
-    // unnamed records one for one. Only a far record left unmatched adds a
-    // link — through the door it names, or a stand-in id no door or gate
-    // matches.
-    for (const q of poses) {
-      if (q.roomId === p.roomId) continue;
-      const ours = Object.entries(entry?.doors ?? {}).filter(([, d]) => d?.targetRoomId === q.roomId);
-      const theirs = Object.entries(atlas[q.roomId]?.doors ?? {}).filter(([, d]) => d?.targetRoomId === p.roomId);
-      if (theirs.length === 0) continue;
-      const usedOurs = new Set<string>();
-      const unmatched: typeof theirs = [];
-      for (const [farId, far] of theirs) {
-        const named = ours.find(([id, d]) => !usedOurs.has(id) && (id === far.farDoor || d.farDoor === farId));
-        if (named) usedOurs.add(named[0]);
-        else unmatched.push([farId, far]);
-      }
-      for (const [farId, far] of unmatched) {
-        // An unnamed far record pairs with one of our records that names no
-        // far door and was not matched above.
-        const loose = far.farDoor === undefined
-          ? ours.find(([id, d]) => !usedOurs.has(id) && d.farDoor === undefined)
-          : undefined;
-        if (loose) {
-          usedOurs.add(loose[0]);
-          continue;
-        }
-        const doorId = far.farDoor && !entry?.doors[far.farDoor] ? far.farDoor : `~${q.roomId}:${farId}`;
-        links.push({ doorId, toRoomId: q.roomId, berth: berths.get(q.roomId)?.has(farId) ?? false });
-      }
+    // berthDoorIds matches them (farOnlyRecords, read once for the whole
+    // plan); only a far record left unmatched adds a link — through the door
+    // it names, or a stand-in id no door or gate matches.
+    for (const far of farOnly.get(p.roomId) ?? []) {
+      if (far.fromRoomId === p.roomId || !byId.has(far.fromRoomId)) continue;
+      const named = far.door.farDoor;
+      const doorId = named && !entry?.doors[named] ? named : `~${far.fromRoomId}:${far.doorId}`;
+      links.push({ doorId, toRoomId: far.fromRoomId, berth: berths.get(far.fromRoomId)?.has(far.doorId) ?? false });
     }
     links.sort((a, b) => a.doorId.localeCompare(b.doorId));
     const gates: PlanGate[] = Object.entries(entry?.gates ?? {})
@@ -199,15 +179,17 @@ export function stationPlan(
     else ships.push(mod);
   }
 
-  // A ship's berth: the station door that leads to it.
+  // A ship's berth: the station door that leads to it (the first module's,
+  // its first such door), from one pass over the links.
+  const berthOf = new Map<string, { m: PlanModule; link: PlanLink }>();
+  for (const m of modules) {
+    for (const link of m.links) if (!berthOf.has(link.toRoomId)) berthOf.set(link.toRoomId, { m, link });
+  }
   for (const ship of ships) {
-    for (const m of modules) {
-      const link = m.links.find((l) => l.toRoomId === ship.roomId);
-      if (!link) continue;
-      const gate = m.gates.find((g) => g.doorId === link.doorId)?.gate;
-      ship.dockedAt = { roomId: m.roomId, doorId: link.doorId, ...(gate !== undefined ? { gate } : {}) };
-      break;
-    }
+    const at = berthOf.get(ship.roomId);
+    if (!at) continue;
+    const gate = at.m.gates.find((g) => g.doorId === at.link.doorId)?.gate;
+    ship.dockedAt = { roomId: at.m.roomId, doorId: at.link.doorId, ...(gate !== undefined ? { gate } : {}) };
   }
 
   const bounds = { minX: Infinity, maxX: -Infinity, minZ: Infinity, maxZ: -Infinity };

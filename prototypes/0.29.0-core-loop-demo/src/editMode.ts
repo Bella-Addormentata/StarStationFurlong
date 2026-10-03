@@ -2255,6 +2255,12 @@ class RoomEditController {
     // tank out also removes everything mounted outboard of it — each layer
     // goes to the room inventory like the item itself, no floating orphans.
     const cascade = mountDescendantsOf(itemId);
+    // 🔧 A robot taking a module apart leaves the job's crew with its dock,
+    // released while the dock is still in the layout (the crew counts placed
+    // docks only), so the job keeps the work done so far.
+    for (const d of [item, ...cascade]) {
+      if (d.kind === 'charging-dock' && readRobotConfig(d.id)?.routine === 'disassemble') clearRobotConfig(d.id);
+    }
     for (const child of cascade) {
       if (this.hoveredId === child.id) this.setHovered(null);
       const childMeshes = this.itemMeshes.get(child.id) ?? [];
@@ -2300,11 +2306,6 @@ class RoomEditController {
     // reconcileRobots never runs on THIS client (the exact mirror of the
     // commitSpawn dock fix in devMenu.ts; remote peers reconcile normally).
     if (item.kind === 'charging-dock' || cascade.some((c) => c.kind === 'charging-dock')) {
-      // 🔧 A robot taking a module apart leaves the job's crew with its dock
-      // (the job keeps the work done so far).
-      for (const d of [item, ...cascade]) {
-        if (d.kind === 'charging-dock' && readRobotConfig(d.id)?.routine === 'disassemble') clearRobotConfig(d.id);
-      }
       world.refreshRobots();
     }
 
