@@ -139,7 +139,7 @@ import {
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
-import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, pinSettledArrival, subscribeStationMove } from "./stationMove";
+import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, pinSettledArrivals, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -1958,8 +1958,9 @@ async function joinRoomAtEpoch(
     // or arrival never waits for the owner to come back.
     // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
     cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
-    // 🪐 Where this station's last move settled it, shared once for everyone.
-    if (planetSummaryBeat % 10 === 0) pinSettledArrival(stationForRoom(boot.roomId), Date.now());
+    // 🪐 Where each station's last move settled it, shared once for everyone:
+    // every station this game lists, aboard or not.
+    if (planetSummaryBeat % 10 === 0) pinSettledArrivals(listStations(), Date.now());
     if (!isLocalHelmCommander()) return;
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped

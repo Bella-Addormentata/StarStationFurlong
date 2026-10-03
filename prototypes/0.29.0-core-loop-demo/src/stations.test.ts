@@ -264,6 +264,14 @@ describe('listStations', () => {
     expect(registerStation({ ...base, id: 'yard', welcomeRoomId: 'yard-b' })).toBe(true);
   });
 
+  it('never takes an open-orbit place as a station id', () => {
+    const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2, welcomeRoomId: 'far-room' };
+    expect(registerStation({ ...base, id: 'adrift:planet-aris:3' })).toBe(false);
+    // One saved by hand before the prefix was reserved reads as invalid.
+    store.set('ssf-stations', JSON.stringify([{ ...base, id: 'adrift:planet-aris:3' }, { ...base, id: 'ok', orbitSlot: 4 }]));
+    expect(readStationRecords().map((r) => r.id)).toEqual(['ok']);
+  });
+
   it('bumps a record whose orbit slot is already taken to the next free one', () => {
     const clash: StationRecord = {
       id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'yard-a',

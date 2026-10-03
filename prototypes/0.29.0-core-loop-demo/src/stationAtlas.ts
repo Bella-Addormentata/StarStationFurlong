@@ -594,8 +594,36 @@ export function freeGateNumber(
  * and a room of this station it has let go may already hold a number.
  */
 export function freeGateNumberHere(roomId: string, own: Record<string, number>): number | null {
+  return freeGateNumber(atlasAround(roomId), roomId, own);
+}
+
+/** The local atlas, with the bound room doc's shared atlas folded in around
+ *  `roomId` when one is bound (withSharedAtlasOf). */
+function atlasAround(roomId: string): Record<string, AtlasEntry> {
   const doc = sharedDoc && (sharedDoc as { isDestroyed?: boolean }).isDestroyed !== true ? sharedDoc : null;
-  return freeGateNumber(doc ? withSharedAtlasOf(doc, readAtlas(), roomId) : readAtlas(), roomId, own);
+  return doc ? withSharedAtlasOf(doc, readAtlas(), roomId) : readAtlas();
+}
+
+/**
+ * ⚓🚦 The number a gate renumbered by hand moves to: the next one from
+ * `from` in the direction of `step` (+1 or -1) that no other port of the
+ * station holds (the station read as freeGateNumberHere reads it) and no
+ * other door of this room (`own`, keyed by door, `doorId` left out). Null
+ * when nothing is free that way.
+ */
+export function steppedGateNumberHere(
+  roomId: string,
+  own: Record<string, number>,
+  doorId: string,
+  from: number,
+  step: 1 | -1,
+): number | null {
+  const taken = new Set<number>();
+  for (const g of stationGates(atlasAround(roomId), roomId)) if (g.roomId !== roomId) taken.add(g.gate);
+  for (const [d, g] of Object.entries(own)) if (d !== doorId) taken.add(g);
+  let gate = from + step;
+  while (gate >= 1 && gate <= MAX_GATE_NUMBER && taken.has(gate)) gate += step;
+  return gate >= 1 && gate <= MAX_GATE_NUMBER ? gate : null;
 }
 
 /**
