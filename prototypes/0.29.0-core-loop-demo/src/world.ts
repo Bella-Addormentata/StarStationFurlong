@@ -91,7 +91,7 @@ import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
 import { isBoltedIntoStation } from "./stationKeeping";
 import { createStationHelmUI } from "./stationHelm";
-import { currentStation } from "./stations";
+import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
 import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
@@ -5533,7 +5533,7 @@ export class World {
       // 🛰️ A module bolted into a station by a gangway steers the STATION:
       // its helm opens the station keeping face (small trim stick) and keeps
       // the ship face one tab away for fuel and the docking computer.
-      const bolted = () => isBoltedIntoStation(readAllDoors().values());
+      const bolted = () => isBoltedIntoStation(readAllDoors(), currentRoomId());
       const ui = bolted()
         ? createStationHelmUI({ bolted, station: () => currentStation(), shipFace })
         : shipFace();

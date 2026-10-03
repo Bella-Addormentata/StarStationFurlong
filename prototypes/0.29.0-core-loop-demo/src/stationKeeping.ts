@@ -11,7 +11,8 @@
  * other module flies ITSELF: the ship helm (devices.ts createHelmUI). It is
  * the line the ship helm already draws when it says a bolted module cannot
  * fly, except that a pairing whose address names no room (none at all, or
- * one the atlas cannot read) joins nothing, as in the atlas.
+ * one the atlas cannot read) joins nothing, and a connection flagged as a
+ * berth at either end is a berth, as in the atlas.
  *
  * THE ORBIT. Stations fly perfect circles (orbits.ts, owner pick 2026-09-27):
  * a station's slot fixes its radius and its phase. Station keeping adds a
@@ -55,7 +56,11 @@
  * the fuel record keeps, beside the meter's reading, where the burns so far
  * left the trim, the fuel they drew, the keys of the burns it covered, paid
  * for or dropped, and each orbit's last burn to fire, which that orbit's
- * lockout still follows (KeepingSettlement). The replay starts from the
+ * lockout still follows (KeepingSettlement). Nothing it keeps is dated past
+ * the write by the writer's clock: a trim that a burn stamped ahead (a peer's
+ * clock running fast) dates later is re-dated to the write, on the same
+ * orbit, so the burns after the write still fire at their own times, and the
+ * lockout keeps the burn firing at the write. The replay starts from the
  * settlement, a dropped burn stays dropped whatever the next REFUEL brings,
  * and the next burn clears the entries it covered. So the log holds only the
  * burns since the last level write. A burn that reaches us after a level
@@ -91,7 +96,8 @@ import type { DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, ORBIT_TIME_SCALE, circularOrbit, orbitForSlot, orbitalSeconds, wrapAngle } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { FUEL_METER_MAX, fuelCeiling, readFuelSettlement, setFuelDrawMeter, shipVersion, subscribeShip } from './shipDoc';
-import { isBerthDoor, roomIdFromSeed } from './stationAtlas';
+import { berthDoorIds, isBerthDoor, readAtlas, roomIdFromSeed } from './stationAtlas';
+import type { AtlasDoor, AtlasEntry } from './stationAtlas';
 import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationRecord } from './stations';
 
@@ -102,28 +108,69 @@ const DEG = Math.PI / 180;
 
 /**
  * Is this module part of a station's structure? True when any of its doors is
- * paired to a room and is not a berth — the same line station grouping draws
- * (the atlas joins rooms only through an address that names a room, read by
- * stationAtlas.roomIdFromSeed, and stationAtlas.isBerthDoor calls a transient
- * guest berth or a docking-adapter chain a ship calling, not structure).
+ * paired to a room through a connection that is not a berth — the same line
+ * station grouping draws. The atlas joins rooms only through an address that
+ * names a room (stationAtlas.roomIdFromSeed), and calls a connection a berth
+ * when EITHER end says so (stationAtlas.berthDoorIds): a transient guest
+ * berth or a docking-adapter chain is a ship calling, not structure. Given
+ * the room's id, its live records are matched with what the atlas holds of
+ * the far rooms the way the atlas matches them, so a berth flagged only at
+ * the far end is a berth, and a permanent gangway between the same two rooms
+ * still joins them; pass readAllDoors' map, whose keys are the door ids a far
+ * record can name. Without the room's id, only its own flags count.
  */
-export function isBoltedIntoStation(doors: Iterable<DoorRecord>): boolean {
-  for (const rec of doors) {
+export function isBoltedIntoStation(
+  doors: Iterable<DoorRecord> | ReadonlyMap<string, DoorRecord>,
+  roomId = '',
+  atlas?: Record<string, AtlasEntry>,
+): boolean {
+  // The room's pairings that name a room, filed the way a harvest files them.
+  const live: Record<string, AtlasDoor> = Object.create(null);
+  let unnamed = 0;
+  const records: Iterable<readonly [string, DoorRecord]> = doors instanceof Map
+    ? doors
+    : [...(doors as Iterable<DoorRecord>)].map((rec) => [`#${unnamed++}`, rec] as const);
+  for (const [doorId, rec] of records) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
-    if (isBerthDoor(rec)) continue;
-    if (namesRoom(rec.connectedRoomAddress)) return true;
+    const target = namedRoom(rec.connectedRoomAddress);
+    if (!target) continue;
+    live[doorId] = {
+      targetSeed: rec.connectedRoomAddress,
+      targetRoomId: target,
+      segments: rec.segments,
+      farDoor: rec.farDoor,
+      ...(typeof rec.transient === 'boolean' ? { transient: rec.transient } : {}),
+    };
   }
-  return false;
+  const ids = Object.keys(live);
+  if (ids.length === 0) return false;
+  const berths = roomId ? berthsHere(roomId, live, atlas ?? readAtlas()) : null;
+  return ids.some((id) => !isBerthDoor(live[id]) && !berths?.has(id));
 }
 
-/** Does a pairing's address name a room, as the atlas reads it? A malformed
- *  peer-written one names none, or makes the parser throw: it joins nothing. */
-function namesRoom(address: string): boolean {
+/** The room a pairing's address names, as the atlas reads it, or '': a
+ *  malformed peer-written one names none, or makes the parser throw, and
+ *  joins nothing. */
+function namedRoom(address: string): string {
   try {
-    return roomIdFromSeed(address) !== '';
+    return roomIdFromSeed(address);
   } catch {
-    return false;
+    return '';
   }
+}
+
+/** The room's doors the atlas calls berths: its live pairings matched with
+ *  the records the atlas holds of each far room (berthDoorIds, over just
+ *  those rooms — a pairing between two rooms is matched from their records
+ *  alone). */
+function berthsHere(roomId: string, live: Record<string, AtlasDoor>, atlas: Record<string, AtlasEntry>): Set<string> {
+  const view: Record<string, AtlasEntry> = Object.create(null);
+  view[roomId] = { roomId, name: '', doors: live, lastSeen: 0 };
+  for (const door of Object.values(live)) {
+    const far = door.targetRoomId;
+    if (far !== roomId && Object.prototype.hasOwnProperty.call(atlas, far)) view[far] = atlas[far];
+  }
+  return berthDoorIds(view).get(roomId) ?? new Set();
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -209,7 +256,8 @@ export type FiredBurn = Pick<TrimBurn, 'planetId' | 'slot' | 'dir' | 'at'>;
  *  for it). Plain JSON. */
 export interface KeepingSettlement {
   /** Where every burn it covered left the trim, the record from before the
-   *  log included. */
+   *  log included, dated no later than the write: one dated ahead of the
+   *  writer's clock is re-dated to it, on the same orbit. */
   trim: OrbitTrim | null;
   /** The fuel those burns drew: the meter's reading at the write. */
   fuelDrawn: number;
@@ -217,9 +265,10 @@ export interface KeepingSettlement {
    *  because the fuel could not cover them. */
   burns: string[];
   /** The last burn to fire on each orbit a station can take here, at the
-   *  time it applied (lastFiredPerOrbit): the replay skips the burns the
-   *  settlement covers, and the stick's lockout on each orbit still follows
-   *  its own, however many burns fired on other orbits since. Left out (a
+   *  time it applied (lastFiredPerOrbit), by the write: the replay skips the
+   *  burns the settlement covers, and the stick's lockout on each orbit still
+   *  follows its own, however many burns fired on other orbits since, and
+   *  whatever burn is stamped ahead of the writer's clock. Left out (a
    *  settlement from before), the trim's last burn. */
   fired?: FiredBurn[];
 }
@@ -702,12 +751,13 @@ interface RoomReplay {
   settledKeys: string[];
   /** Burns in the log the settlement does not cover yet. */
   pending: number;
-  /** What a level write would keep now (settleLog), or undefined. */
-  settlement: KeepingSettlement | undefined;
+  /** What a level write at `now`, by its writer's clock, keeps (settleLog),
+   *  or undefined. */
+  settle: (now: number) => KeepingSettlement | undefined;
 }
 
 const NO_REPLAY: RoomReplay = {
-  trim: null, fuelDrawn: 0, fired: [], covered: new Set(), settledKeys: [], pending: 0, settlement: undefined,
+  trim: null, fuelDrawn: 0, fired: [], covered: new Set(), settledKeys: [], pending: 0, settle: () => undefined,
 };
 
 let replayed: { log: number; ship: number; replay: RoomReplay } | null = null;
@@ -867,8 +917,6 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   // room, so the next burn clears it.
   const keys = [...settledKeys, ...taken.map((p) => p.key)];
   keys.push(...junk.sorted().slice(0, MAX_SETTLED_BURNS - keys.length));
-  // The burns a settlement covers are replayed no more, so it keeps the last
-  // to fire on each orbit, for that orbit's lockout.
   const fired = [...(settled?.fired ?? (start ? [lastBurnOf(start)] : [])), ...run.fired];
   return {
     trim: run.trim,
@@ -877,14 +925,25 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
     covered,
     settledKeys,
     pending: waiting,
-    settlement: settled || keys.length > 0
-      ? {
-        trim: run.trim && cleanTrim(run.trim),
+    settle: (now) => {
+      if (!settled && keys.length === 0) return undefined;
+      // Nothing a settlement keeps is dated past its write, by the writer's
+      // clock. A trim dated ahead of it (a peer's burn stamped ahead) is
+      // re-dated to the write on the same orbit: left ahead, every burn
+      // stamped before then would apply, and fire, only then, so the stick
+      // would never wait between them.
+      const by = isBurnTime(now) ? now : Number.POSITIVE_INFINITY;
+      const trim = run.trim && cleanTrim(run.trim.at > by ? heldTrim(run.trim, run.trim.last, by)! : run.trim);
+      return {
+        trim,
         fuelDrawn: run.fuelDrawn,
-        burns: keys,
-        fired: lastFiredPerOrbit(fired),
-      }
-      : undefined,
+        burns: [...keys],
+        // The burns a settlement covers are replayed no more, so it keeps the
+        // last to fire on each orbit by the write, for that orbit's lockout:
+        // one stamped ahead would hide the burn firing now.
+        fired: lastFiredPerOrbit(fired.filter((b) => b.at <= by)),
+      };
+    },
   };
 }
 
@@ -918,17 +977,12 @@ function replayRoom(): RoomReplay {
   }
 }
 
-/** What a level write keeps of the log now: the meter's settle
- *  (KeepingSettlement). Nothing while the log has never held a burn. */
+/** What a level write keeps of the log now, by this writer's clock: the
+ *  meter's settle (KeepingSettlement). Nothing while the log has never held
+ *  a burn. */
 function settleLog(): KeepingSettlement | undefined {
   if (!docAlive()) return undefined;
-  const s = replayRoom().settlement;
-  return s && {
-    trim: s.trim && { ...s.trim },
-    fuelDrawn: s.fuelDrawn,
-    burns: [...s.burns],
-    ...(s.fired ? { fired: s.fired.map(cleanFired) } : {}),
-  };
+  return replayRoom().settle(Date.now());
 }
 
 /** The room's trim (its burns replayed), or null: none, unbound, or nothing

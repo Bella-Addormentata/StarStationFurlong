@@ -71,7 +71,8 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
 import { isBoltedIntoStation, readBurnFiring, subscribeStationKeeping } from "./stationKeeping";
-import { currentStation } from "./stations";
+import { subscribeSharedAtlas } from "./stationAtlas";
+import { currentRoomId, currentStation } from "./stations";
 import type { StationRecord } from "./stations";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
@@ -3975,11 +3976,12 @@ function buildHelmSticks(
   part(gimbal, new THREE.SphereGeometry(0.02, 12, 10), m(0xffb300, 0.4, 0.2, 0xffb300, 0.3), 0, 0.066, 0);
   attach(trimStick);
 
-  // Which hand: the room's pairings say ship or station, live.
+  // Which hand: the room's pairings (and the atlas's word on their far
+  // ends) say ship or station, live.
   let bolted = false;
   let station: StationRecord | null = null;
   const applyFace = () => {
-    bolted = isBoltedIntoStation(readAllDoors().values());
+    bolted = isBoltedIntoStation(readAllDoors(), currentRoomId());
     fighter.visible = !bolted;
     trimStick.visible = bolted;
   };
@@ -4023,6 +4025,11 @@ function buildHelmSticks(
   carrier.userData.disposeHelmFace = subscribeDoors(() => {
     applyFace();
     readStation(); // the doors can move the room to another station
+  });
+  // A far room's records arrive by gossip: one can make a door a berth.
+  carrier.userData.disposeHelmAtlas = subscribeSharedAtlas(() => {
+    applyFace();
+    readStation();
   });
   carrier.userData.disposeHelmTrim = subscribeStationKeeping(readStation);
 }
