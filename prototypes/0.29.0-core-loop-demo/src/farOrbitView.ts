@@ -237,7 +237,10 @@ function gather(now: number): Source {
         ? { id: rec.locationId, planetId: planetById(was.planetId).id, orbitSlot: was.orbitSlot }
         : placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
       const station = all.find((s) => s.id === rec.locationId);
-      if (place && (!station || planetById(station.planetId).id !== place.planetId || station.orbitSlot !== place.orbitSlot)) {
+      // A destination still in transit is listed at its origin until it arrives,
+      // so a matching slot proves nothing: the ship stays on its own orbit.
+      if (place && (!station || reallyMoving(station, now)
+        || planetById(station.planetId).id !== place.planetId || station.orbitSlot !== place.orbitSlot)) {
         adrift = place;
       }
     }
@@ -292,12 +295,14 @@ function gather(now: number): Source {
   const byRoom = (room: string | undefined, leftAt: number) =>
     placeOf(room ? all.find((s) => s.welcomeRoomId === room)?.id : undefined, all, leftAt, now);
   const ships: FarShipInput[] = [];
-  // Every ship in flight anywhere: its room is also listed as a one-module
-  // station, which may sit around another planet than its summary, so it is
-  // hidden in every view, not only its own planet's.
+  // Every known ship anywhere, flying or docked: its room is also listed as a
+  // one-module station (a dock berth leaves it its own atlas component), which
+  // may sit around another planet than the ship, so it is hidden in every
+  // view, not only its own planet's. Only flights are drawn, on their courses.
   const flying = new Set<string>();
-  const inFlight = Object.values(readStore(now).ships).filter((ship) => ship.status === 'in-flight' && !ship.retired);
-  for (const ship of inFlight) flying.add(ship.roomId);
+  const known = Object.values(readStore(now).ships).filter((ship) => !ship.retired);
+  for (const ship of known) flying.add(ship.roomId);
+  const inFlight = known.filter((ship) => ship.status === 'in-flight');
   // Each flight is placed by its own plan's planet, not the summary's
   // planetId: that follows the origin station's current record, which a
   // move since the ship left has taken to another planet.
@@ -318,8 +323,8 @@ function gather(now: number): Source {
     // Never the viewer: its own station, nor the one-module station the room
     // it stands in (a ship, say) is listed as.
     .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
-    // A ship in flight is listed as its own one-module station too; it is
-    // drawn on its transfer instead, never also on a circular orbit.
+    // A ship is listed as its own one-module station too; a flying one is
+    // drawn on its transfer instead, a docked one not at all.
     .filter((s) => !flying.has(s.welcomeRoomId))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
