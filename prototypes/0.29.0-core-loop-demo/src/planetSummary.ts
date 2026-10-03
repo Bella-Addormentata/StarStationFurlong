@@ -451,9 +451,9 @@ function roomStamps(x: Gates): Map<string, number> {
 }
 
 /** ⚓🚦 Room tombstones (rooms that list no gate any more) a summary carries
- *  beside its listed rooms' stamps: their own budget, so a station with a
- *  gate in each of MAX_BERTHS rooms still remembers its newest removals. */
-export const MAX_ROOM_TOMBSTONES = 32;
+ *  beside its listed rooms' stamps: their own budget, as large as the list's,
+ *  so every room a full list held can carry its removal. */
+export const MAX_ROOM_TOMBSTONES = MAX_BERTHS;
 /** The most room stamps one summary carries. */
 const MAX_ROOM_STAMPS = MAX_BERTHS + MAX_ROOM_TOMBSTONES;
 

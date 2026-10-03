@@ -547,6 +547,20 @@ describe('the per-planet summary', () => {
     }
   });
 
+  it('keeps the removal of every room a full list held', () => {
+    const rooms = Array.from({ length: 99 }, (_, i) => `room-${String(i).padStart(2, '0')}`);
+    const full = base({ ownerId: 'hub', berths: rooms.map((roomId, i) => ({ roomId, doorId: 'south', gate: i + 1 })), berthsAt: T0 });
+    const stamps: Record<string, number> = {};
+    for (const room of rooms) stamps[room] = T0 + 5;
+    const cleared = base({ ownerId: 'hub', berths: [], berthsAt: T0 + 5, berthRoomsAt: stamps });
+    for (const merged of [mergeStation(full, cleared) ?? full, mergeStation(cleared, full) ?? cleared]) {
+      const again = cleanStationSummary(merged, T0 + 10)!;
+      expect(again.berths).toEqual([]);
+      expect(Object.keys(again.berthRoomsAt ?? {})).toHaveLength(99);
+      expect(mergeStation(again, full) ?? again).toEqual(again);
+    }
+  });
+
   it('moves the legacy berth to the welcome room\'s lowest merged gate, or drops it', () => {
     const known = base({ berthDoor: 'south', berths: [{ roomId: 'room-b', doorId: 'south', gate: 1 }], berthsAt: T0 });
     // The welcome room renumbered: south is gone, east and west are its gates.
