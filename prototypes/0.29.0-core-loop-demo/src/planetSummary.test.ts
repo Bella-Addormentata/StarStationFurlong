@@ -105,6 +105,39 @@ describe('guards', () => {
     }
   });
 
+  it('settles a same-moment trim from a build without fuel counts on the one that has them, in either order', () => {
+    const old = summary({ trim: trim({ dRadiusKm: 2 }) });
+    const counted = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+    expect((mergeStation(old, counted) ?? old).trim?.dRadiusKm).toBe(0);
+    expect(mergeStation(counted, old)).toBeNull();
+  });
+
+  it("keeps a newer trim the standing record's own install flies on another slot", () => {
+    // A slot clash moved this station off the slot its record asks for; its
+    // own republish carries the record unchanged with the flown slot's trim.
+    const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
+    const same = { ...first, trim: trim({ slot: 3, at: T0 + 40 }) };
+    expect(mergeStation(first, same)?.trim?.slot).toBe(3);
+    // …but never a trim of another planet.
+    expect(mergeStation(first, { ...first, trim: trim({ planetId: ARIS, slot: 3, at: T0 + 40 }) })).toBeNull();
+  });
+
+  it('keeps the trim a moved station flies at its new planet', () => {
+    // First stamped around SOV; since moved to ARIS. Its own republish
+    // carries the record unchanged with the trim of the orbit it flies now.
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const first = summary({ orbitSlot: 2, move });
+    const flown = { ...first, trim: trim({ planetId: ARIS, slot: 5, at: T0 + 2000 }) };
+    expect(mergeStation(first, flown, T0 + 3000)?.trim).toMatchObject({ planetId: ARIS, slot: 5 });
+    // Before it arrived, a trim at ARIS is no trim of the station's.
+    expect(mergeStation(first, flown, T0 + 500)).toBeNull();
+    // …nor, once there, one of the planet it left.
+    expect(mergeStation(first, { ...first, trim: trim({ slot: 3, at: T0 + 2000 }) }, T0 + 3000)).toBeNull();
+  });
+
   it("keeps the standing record's trim over a newer one for another slot", () => {
     const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
     const late = summary({ orbitSlot: 1, updatedAt: T0 + 50, trim: trim({ slot: 1, at: T0 + 40 }) });
@@ -503,6 +536,38 @@ describe('sharing through the room doc', () => {
     expect(b?.orbitSlot).toBe(2);
   });
 
+  it('shares the trim of a station a slot clash moved, and every install flies it', () => {
+    // Two stations nobody owns were each first published for ARIS slot 2;
+    // room-a keeps it, so room-z flies the next free slot everywhere.
+    const doc = new Y.Doc();
+    const at = Date.now() - 1000;
+    for (const room of ['room-a', 'room-z']) {
+      doc.getMap('stationSummaries').set(room, {
+        welcomeRoomId: room, name: room.toUpperCase(), planetId: ARIS, orbitSlot: 2, updatedAt: at,
+      });
+    }
+    registerLearnedStations(ARIS, Object.values(doc.getMap('stationSummaries').toJSON() as Record<string, StationSummary>));
+    const z = listStations().find((s) => s.welcomeRoomId === 'room-z')!;
+    expect(z.orbitSlot).toBe(3);
+    // A burn in room-z trims the orbit it flies.
+    const burn = trim({ planetId: ARIS, slot: 3, at: at + 500 });
+    bindPlanetSummaryDoc(doc, install(z.id, { localTrim: () => burn, currentRoom: () => 'room-z' }));
+    expect(readStore().stations['room-z']?.orbitSlot).toBe(2);
+    expect(readStore().stations['room-z']?.trim?.slot).toBe(3);
+    // Another install learns both stations and flies room-z trimmed.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    const other = new Y.Doc();
+    sync(doc, other);
+    bindPlanetSummaryDoc(other, install(null, { ship: () => null }));
+    registerLearnedStations(ARIS, Object.values(readStore().stations));
+    refreshTrims();
+    installTrimResolver();
+    const seen = listStations().find((s) => s.welcomeRoomId === 'room-z')!;
+    expect(seen.orbitSlot).toBe(3);
+    expect(stationOrbit(seen).radiusKm).toBeCloseTo(orbitForSlot(ARIS, 3).radiusKm + 4, 6);
+  });
+
   it('places a one-room off-home station that is no ship by its shared summary', () => {
     const doc = new Y.Doc();
     doc.getMap('stationSummaries').set('room-x', {
@@ -544,6 +609,42 @@ describe('sharing through the room doc', () => {
     const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
     bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
     expect(listStations().find((s) => s.id === 'shared:room-x')?.planetId).toBe(ARIS);
+  });
+
+  it('places a fresh install by its own ship\'s summary however long the ship stood empty', () => {
+    const doc = new Y.Doc();
+    const old = Date.now() - 2 * SHIP_STALE_MS;
+    doc.getMap('stationSummaries').set('room-x', {
+      welcomeRoomId: 'room-x', name: 'ARIS DEPOT', planetId: ARIS, orbitSlot: 3, updatedAt: old,
+    });
+    doc.getMap('shipSummaries').set('room-ship', {
+      roomId: 'room-ship', name: 'FERRY', planetId: ARIS, status: 'docked', fromRoom: 'room-x', updatedAt: old,
+    });
+    doc.getMap('shipSummaries').set('room-gone', {
+      roomId: 'room-gone', name: 'HULK', planetId: ARIS, status: 'docked', updatedAt: old,
+    });
+    const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
+    expect(listStations().find((s) => s.id === 'shared:room-x')?.planetId).toBe(ARIS);
+    // The entry stays for its own room, but other ships long gone go, and
+    // neither is listed as a ship around the planet.
+    expect(doc.getMap('shipSummaries').has('room-ship')).toBe(true);
+    expect(doc.getMap('shipSummaries').has('room-gone')).toBe(false);
+    expect(shipsAroundPlanet(ARIS)).toEqual([]);
+  });
+
+  it('never publishes a ship\'s own one-room stand-in as a station', () => {
+    const doc = new Y.Doc();
+    const standIn = { id: 'station:room-ship', name: 'FERRY', planetId: SOV, orbitSlot: 0, welcomeRoomId: 'room-ship', derived: true as const };
+    bindPlanetSummaryDoc(doc, install(null, { currentStation: () => standIn, currentRoom: () => 'room-ship' }));
+    expect(doc.getMap('stationSummaries').has('room-ship')).toBe(false);
+    expect(readStore().stations['room-ship']).toBeUndefined();
+    // The same one-room place, known to be no ship, is a station.
+    unbindPlanetSummaryForTest();
+    bindPlanetSummaryDoc(doc, install(null, {
+      currentStation: () => standIn, currentRoom: () => 'room-ship', notShipRoom: () => 'room-ship',
+    }));
+    expect(doc.getMap('stationSummaries').has('room-ship')).toBe(true);
   });
 
   it('tells its own views about what it just published', () => {

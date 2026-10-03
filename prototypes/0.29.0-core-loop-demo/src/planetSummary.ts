@@ -362,7 +362,7 @@ export function readStore(now = Date.now()): Store {
     for (const [k, v] of Object.entries(raw.ships)) {
       if (n >= MAX_SHIPS) break;
       const s = cleanShipSummary(v, now);
-      if (s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS) { out.ships[k] = s; n++; }
+      if (s && s.roomId === k && shipKept(s, now)) { out.ships[k] = s; n++; }
     }
   }
   return out;
@@ -375,7 +375,7 @@ function writeStore(store: Store): void {
 /** The newer of two trims: the later last burn; between trims whose last
  *  burns share a moment (two sticks pushed in one millisecond), the one
  *  that drew more fuel has replayed more burns, so it holds the other's
- *  burns too; then tieBreak. */
+ *  burns too (a trim without the count ranks lowest); then tieBreak. */
 function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): SharedTrim | undefined {
   if (!a) return b;
   if (!b) return a;
@@ -384,9 +384,10 @@ function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): Shared
     return (b.readAt ?? 0) > (a.readAt ?? 0) ? b : a;
   }
   if (b.at !== a.at) return b.at > a.at ? b : a;
-  if (a.fuelDrawn !== undefined && b.fuelDrawn !== undefined && a.fuelDrawn !== b.fuelDrawn) {
-    return b.fuelDrawn > a.fuelDrawn ? b : a;
-  }
+  // A trim without the count (an older build's) has replayed no more burns
+  // than one with it: it ranks below every counted trim.
+  const drawn = (t: SharedTrim) => t.fuelDrawn ?? -1;
+  if (drawn(a) !== drawn(b)) return drawn(b) > drawn(a) ? b : a;
   return tieBreak(a, b);
 }
 
@@ -411,7 +412,7 @@ function newerMove(a: StationMove | undefined, b: StationMove | undefined): Stat
  *  install cannot move a station everyone already placed. Same-moment ties
  *  settle on the canonical JSON. A trim and a move each merge by their own
  *  time, whichever record stands. Returns null when nothing changes. */
-export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary): StationSummary | null {
+export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary, now: number = Date.now()): StationSummary | null {
   if (!prior) return incoming;
   const recordOf = (s: StationSummary): string =>
     JSON.stringify({ ...s, trim: undefined, move: undefined, trimGone: undefined, ownerAliases: undefined });
@@ -427,14 +428,29 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
         ? ((incoming.updatedAt > prior.updatedAt) === owned(incoming) ? incoming : prior)
         : (recordOf(incoming) > recordOf(prior) ? incoming : prior);
   // Only a trim of the orbit the standing record flies: one published for
-  // the slot that lost would be dropped by every reader anyway.
-  const fits = (t: SharedTrim | undefined) => (t && trimFor(base, t) ? t : undefined);
+  // the slot that lost would be dropped by every reader anyway. A slot clash
+  // in listStations can move the standing record off the slot it asks for
+  // (the same way on every install), so a trim of its planet also stands
+  // when it comes with the standing record itself, unchanged: that is the
+  // station's own republish, trimming the slot it flies. Its planet is the
+  // one it is at now (summaryPlanet: the later move's, over the planet its
+  // record was first stamped at), and the record compared leaves the move
+  // out (recordOf), so a station republishing after a move still counts.
+  const move = newerMove(prior.move, incoming.move);
+  const planet = summaryPlanet({ planetId: base.planetId, move }, now);
+  const standing = recordOf(canonOrder({ ...base, updatedAt: 0 }));
+  const fits = (s: StationSummary): SharedTrim | undefined => {
+    const t = s.trim;
+    if (!t) return undefined;
+    if (trimFor(base, t)) return t;
+    return planetById(t.planetId).id === planet
+      && recordOf(canonOrder({ ...s, updatedAt: 0 })) === standing ? t : undefined;
+  };
   const gone = mergeGone(prior.trimGone, incoming.trimGone);
   // A room's trim read before that room read none is taken back.
   const alive = (t: SharedTrim | undefined) =>
     (t && (t.from === undefined || (t.readAt ?? 0) >= goneAt(gone, t.from)) ? t : undefined);
-  const trim = newerTrim(alive(fits(prior.trim)), alive(fits(incoming.trim)));
-  const move = newerMove(prior.move, incoming.move);
+  const trim = newerTrim(alive(fits(prior)), alive(fits(incoming)));
   // Every owner id seen for this place but the standing one's.
   const aliases = mergeAliases(
     [...(prior.ownerAliases ?? []), ...(incoming.ownerAliases ?? []), prior.ownerId, incoming.ownerId],
@@ -588,6 +604,15 @@ function mayBeShipRoom(): string | null {
   return room && ctx?.notShipRoom?.() !== room ? room : null;
 }
 
+/** A ship summary worth keeping: heard from within SHIP_STALE_MS, or the
+ *  summary of the room this client stands in, however old. A ship left empty
+ *  for a day is still where its summary says, and a fresh install aboard has
+ *  nothing else to place it by until it republishes; shipsAroundPlanet still
+ *  lists only fresh ships. */
+function shipKept(s: ShipSummary, now: number): boolean {
+  return now - s.updatedAt <= SHIP_STALE_MS || s.roomId === mayBeShipRoom();
+}
+
 /** A ship's own one-room stand-in (derived, its welcome room the ship's
  *  room): it sits on the default planet until stations are known, so it
  *  places nothing. A one-room station known to be no ship is a place. */
@@ -671,7 +696,10 @@ export function foldOwnStation(
     : known;
   // A trim is keyed by the orbit it trims: it goes out when it names the
   // planet and slot of the record that is kept, whichever client's that is.
-  const applies = cleanTrim(trimFor(base, readTrim(known)));
+  // A learned station flies the slot listStations settled for that record,
+  // which a slot clash can move off the one the record asks for.
+  const flies = !owned && isLearnedRecord(station) ? station : base;
+  const applies = cleanTrim(trimFor(flies, readTrim(known)));
   // This room now reads no trim where the known one was read here: that
   // trim was taken back, and the reading says so.
   // This room's reading changed while another room's trim stands over it:
@@ -693,7 +721,7 @@ export function foldOwnStation(
   }
   return mergeStation(known, {
     ...rest, ...(applies ? { trim: applies } : {}), ...(gone ? { trimGone: gone } : {}), ...(move ? { move } : {}),
-  });
+  }, now);
 }
 
 // ── Learned stations → station records ───────────────────────────────────────
@@ -855,7 +883,7 @@ export function pullPlanetSummary(now = Date.now()): void {
     if (++scanned > MAX_STATIONS * 4) break;
     const s = cleanStationSummary(v, now);
     if (!s || s.welcomeRoomId !== k) continue;
-    const next = mergeStation(store.stations[k], s);
+    const next = mergeStation(store.stations[k], s, now);
     if (next) { store.stations[k] = next; changed = true; }
     if (JSON.stringify(store.stations[k]) !== JSON.stringify(s)) staleStations.set(k, s);
   }
@@ -863,7 +891,7 @@ export function pullPlanetSummary(now = Date.now()): void {
   for (const [k, v] of shipMap!.entries()) {
     if (++scanned > MAX_SHIPS * 4) break;
     const s = cleanShipSummary(v, now);
-    if (!s || s.roomId !== k || now - s.updatedAt > SHIP_STALE_MS) continue;
+    if (!s || s.roomId !== k || !shipKept(s, now)) continue;
     const next = mergeShip(store.ships[k], s);
     if (next) { store.ships[k] = next; changed = true; }
     if (JSON.stringify(store.ships[k]) !== JSON.stringify(s)) staleShips.set(k, s);
@@ -879,7 +907,7 @@ export function pullPlanetSummary(now = Date.now()): void {
     doc!.transact(() => {
       for (const [k, s] of staleStations) {
         const won = store.stations[k];
-        const next = won && mergeStation(s, won);
+        const next = won && mergeStation(s, won, now);
         if (next) stationMap!.set(k, next);
       }
       for (const [k, s] of staleShips) {
@@ -939,7 +967,11 @@ function latestRememberedMoves(): StationMove[] {
 export function publishPlanetSummary(now = Date.now()): void {
   if (!alive() || !ctx) return;
   const store = readStore(now);
-  const here = ctx.currentStation();
+  // A free ship's own one-room stand-in is no station: published, it would
+  // stand for good and peers would learn the ship as one (applyLearned
+  // skips it too).
+  const found = ctx.currentStation();
+  const here = found && !isShipStandIn(found, mayBeShipRoom()) ? found : null;
   if (here && here.welcomeRoomId && here.welcomeRoomId.length <= MAX_ID_LEN) {
     const room = ctx.currentRoom?.() || undefined;
     const local = ctx.localTrim();
@@ -952,7 +984,7 @@ export function publishPlanetSummary(now = Date.now()): void {
   for (const move of latestRememberedMoves()) {
     const k = move.welcomeRoomId!;
     const known = store.stations[k];
-    const next = known ? mergeStation(known, { ...known, move }) : null;
+    const next = known ? mergeStation(known, { ...known, move }, now) : null;
     if (next) store.stations[k] = next;
   }
   const ship = ctx.ship();
@@ -990,8 +1022,8 @@ export function publishPlanetSummary(now = Date.now()): void {
   doc!.transact(() => {
     for (const [k, s] of Object.entries(store.stations)) {
       const known = cleanStationSummary(stationMap!.get(k), now);
-      if (known && !mergeStation(known, s)) continue;
-      stationMap!.set(k, known ? mergeStation(known, s)! : s);
+      const next = known ? mergeStation(known, s, now) : s;
+      if (next) stationMap!.set(k, next);
     }
     for (const [k, s] of Object.entries(store.ships)) {
       const known = cleanShipSummary(shipMap!.get(k), now);
@@ -1008,7 +1040,7 @@ export function publishPlanetSummary(now = Date.now()): void {
       return s && s.welcomeRoomId === k ? { at: stationRecency(s, now), planetId: summaryPlanet(s, now) } : null;
     }, MAX_STATIONS, pins.stations, pins.planet) + pruneMap(shipMap!, (k, v) => {
       const s = cleanShipSummary(v, now);
-      return s && s.roomId === k && now - s.updatedAt <= SHIP_STALE_MS ? { at: s.updatedAt, planetId: s.planetId } : null;
+      return s && s.roomId === k && shipKept(s, now) ? { at: s.updatedAt, planetId: s.planetId } : null;
     }, MAX_SHIPS, pins.ships, pins.planet);
   });
   // Entries a bounded pull could not reach before the prune are reachable
@@ -1121,7 +1153,7 @@ export function portableStationId(id: string): string | null {
 export function shipsAroundPlanet(planetId: string, now = Date.now()): ShipSummary[] {
   const planet = planetById(planetId).id;
   return Object.values(readStore(now).ships)
-    .filter((s) => !s.retired && planetById(s.planetId).id === planet)
+    .filter((s) => !s.retired && now - s.updatedAt <= SHIP_STALE_MS && planetById(s.planetId).id === planet)
     .sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
