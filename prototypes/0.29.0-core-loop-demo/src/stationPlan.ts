@@ -120,6 +120,7 @@ export function stationPlan(
     // MAX_ENTRIES rooms, so a long chain of modules is shown whole.
     maxHops: Infinity,
     expand: (roomId) => station.has(roomId),
+    reverse: true,
   });
   const berths = berthDoorIds(atlas);
   const byId = new Map(poses.map((p) => [p.roomId, p]));

@@ -109,6 +109,9 @@ export class StationPlanView {
   private card: HTMLElement | null = null;
   private shipList: HTMLElement | null = null;
   private moduleList: HTMLElement | null = null;
+  /** What show() made inert, and where focus was before it. */
+  private covered: HTMLElement[] = [];
+  private returnFocus: HTMLElement | null = null;
   private station: StationRecord | null = null;
   private plan: StationPlan | null = null;
   private visiting: VisitingShip[] = [];
@@ -175,17 +178,33 @@ export class StationPlanView {
     return !!this.root && this.root.style.display !== 'none';
   }
 
-  /** Open on a station: its welcome room roots the plan. */
+  /** Open on a station: its welcome room roots the plan. The plot under
+   *  it goes inert (no tabbing onto its hidden buttons) and focus moves to
+   *  the plan's own controls, coming back where it was on hide. */
   show(station: StationRecord): void {
     if (!this.root) return;
     if (this.station?.id !== station.id) this.selected = null;
     this.station = station;
+    const opening = !this.isOpen();
     this.root.style.display = 'flex';
     this.refresh();
+    if (opening) {
+      this.returnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      this.covered = [...(this.root.parentElement?.children ?? [])]
+        .filter((c): c is HTMLElement => c !== this.root && c instanceof HTMLElement && !c.inert);
+      for (const c of this.covered) c.inert = true;
+      this.root.querySelector<HTMLElement>('#station-plan-back')?.focus();
+    }
   }
 
   hide(): void {
-    if (this.root) this.root.style.display = 'none';
+    if (!this.root || !this.isOpen()) return;
+    this.root.style.display = 'none';
+    for (const c of this.covered) c.inert = false;
+    this.covered = [];
+    const back = this.returnFocus;
+    this.returnFocus = null;
+    if (back?.isConnected) back.focus();
   }
 
   /** Re-read the atlas and the ships (the atlas or a summary changed). */

@@ -121,6 +121,22 @@ describe('the station plan', () => {
     expect(plan.modules.at(-1)).toMatchObject({ roomId: `c${n - 1}`, hops: n - 1 });
   });
 
+  it('places a module joined by a pairing only its own side recorded', () => {
+    // Forward: the hub records the gangway.
+    harvestIntoAtlas({ roomId: 'f-hub', name: 'HUB', doors: [{ doorId: 'east', targetSeed: seed('f-bar'), wall: 'x+', lateral: 0, farDoor: 'west', farWall: 'x-', farLateral: 0, transient: false }] });
+    harvestIntoAtlas({ roomId: 'f-bar', name: 'BAR', doors: [] });
+    const forward = stationPlan(readAtlas(), 'f-hub').modules.find((m) => m.roomId === 'f-bar')!;
+    // Reverse: only the bar records it.
+    harvestIntoAtlas({ roomId: 'r-hub', name: 'HUB', doors: [] });
+    harvestIntoAtlas({ roomId: 'r-bar', name: 'BAR', doors: [{ doorId: 'west', targetSeed: seed('r-hub'), wall: 'x-', lateral: 0, farDoor: 'east', farWall: 'x+', farLateral: 0, transient: false }] });
+    const plan = stationPlan(readAtlas(), 'r-hub');
+    expect(plan.modules.map((m) => m.roomId)).toEqual(['r-hub', 'r-bar']);
+    const bar = plan.modules[1];
+    expect(bar.x).toBeCloseTo(forward.x, 6);
+    expect(bar.z).toBeCloseTo(forward.z, 6);
+    expect(Math.cos(bar.rotY - forward.rotY)).toBeCloseTo(1, 6);
+  });
+
   it('is empty for a room the atlas does not know', () => {
     station();
     const plan = stationPlan(readAtlas(), 'nowhere');

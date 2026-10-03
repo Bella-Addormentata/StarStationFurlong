@@ -923,11 +923,56 @@ export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
  * the live snapshot, every other room's from its harvested wall + lateral.
  * `expand` stops the walk at a room (placed, but its doors not followed) —
  * the holotable places docked ships without walking on through them.
+ * `reverse` also follows a pairing recorded only on the far room's side.
  */
+/** 🧭 One hop's pose: the module behind `ownerId`'s door `doorId`, centre and
+ *  heading in `ownerId`'s own frame. `liveRoomId`'s doors pose from the live
+ *  snapshot; every other room's from its harvested wall + lateral. */
+function hopLocal(
+  atlas: Record<string, AtlasEntry>,
+  ownerId: string,
+  doorId: DoorId,
+  door: AtlasDoor,
+  liveRoomId: string,
+): { x: number; z: number; rotY: number } {
+  // 🔗 farDoor inference (owner's octagon-render fix, 2026-07-19): a
+  // record written by a manual INITIATE (far-door dropdown left empty)
+  // carries NO farDoor — the pose then falls back to rotY = heading,
+  // which inverts that arm's curvature in a ring walk (observed live:
+  // seven 18.6 m hops and one 78 m chasm, the scattered-boxes render).
+  // But the FAR room's own record pointing back at us NAMES the door —
+  // infer it from the graph before composing the hop.
+  const farDoorId = door.farDoor
+    ?? (Object.entries(atlas[door.targetRoomId]?.doors ?? {})
+      .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === ownerId)?.[0]);
+  // 🧭 The far door's WALL, never guessed from its id: the pairing record's
+  // farWall, else the far room's own gossiped door geometry, else unknown
+  // (⇒ the hop faces the arrival heading — no invented rotation).
+  const farWall = door.farWall
+    ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.wall : undefined)
+    ?? null;
+  const farLateral = door.farLateral
+    ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.lateral : undefined)
+    ?? 0;
+  // The hop's pose in the FROM room's local frame → compose into world.
+  // The CURRENT room's own doors use the LIVE pose (slide included); a
+  // NEIGHBOUR room's door poses from its harvested wall+lateral — this
+  // client's snapshot knows nothing about it. Old gossip without geometry
+  // falls back to the live-pose path, which is the pre-redo behaviour.
+  // 🛑📐 The far module's half-extent along its door's wall normal when its
+  // size is known: the chain meets its TRUE face, so its centre sits that
+  // far beyond the chain's end (review, round 8). Unknown ⇒ the adapter's
+  // uniform default, as before.
+  const farHalf = farWall ? halfAlongWall(atlas[door.targetRoomId]?.dims, farWall) : undefined;
+  return ownerId !== liveRoomId && door.wall !== undefined
+    ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral, farHalf)
+    : projectionPoseForDoor(doorId, door.segments, farWall, farLateral, farHalf);
+}
+
 export function atlasPoses(
   atlas: Record<string, AtlasEntry>,
   rootRoomId: string,
-  opts: { liveRoomId?: string; maxHops?: number; expand?: (roomId: string) => boolean } = {},
+  opts: { liveRoomId?: string; maxHops?: number; expand?: (roomId: string) => boolean; reverse?: boolean } = {},
 ): AtlasPose[] {
   const maxHops = opts.maxHops ?? 10;
   const currentRoomId = opts.liveRoomId ?? '';
@@ -950,38 +995,7 @@ export function atlasPoses(
     if (!entry) continue;
     for (const [doorId, door] of Object.entries(entry.doors) as Array<[DoorId, AtlasDoor]>) {
       if (!door || !door.targetRoomId || placed.has(door.targetRoomId)) continue;
-      // 🔗 farDoor inference (owner's octagon-render fix, 2026-07-19): a
-      // record written by a manual INITIATE (far-door dropdown left empty)
-      // carries NO farDoor — the pose then falls back to rotY = heading,
-      // which inverts that arm's curvature in a ring walk (observed live:
-      // seven 18.6 m hops and one 78 m chasm, the scattered-boxes render).
-      // But the FAR room's own record pointing back at us NAMES the door —
-      // infer it from the graph before composing the hop.
-      const farDoorId = door.farDoor
-        ?? (Object.entries(atlas[door.targetRoomId]?.doors ?? {})
-          .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === fromId)?.[0]);
-      // 🧭 The far door's WALL, never guessed from its id: the pairing record's
-      // farWall, else the far room's own gossiped door geometry, else unknown
-      // (⇒ the hop faces the arrival heading — no invented rotation).
-      const farWall = door.farWall
-        ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.wall : undefined)
-        ?? null;
-      const farLateral = door.farLateral
-        ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.lateral : undefined)
-        ?? 0;
-      // The hop's pose in the FROM room's local frame → compose into world.
-      // The CURRENT room's own doors use the LIVE pose (slide included); a
-      // NEIGHBOUR room's door poses from its harvested wall+lateral — this
-      // client's snapshot knows nothing about it. Old gossip without geometry
-      // falls back to the live-pose path, which is the pre-redo behaviour.
-      // 🛑📐 The far module's half-extent along its door's wall normal when its
-      // size is known: the chain meets its TRUE face, so its centre sits that
-      // far beyond the chain's end (review, round 8). Unknown ⇒ the adapter's
-      // uniform default, as before.
-      const farHalf = farWall ? halfAlongWall(atlas[door.targetRoomId]?.dims, farWall) : undefined;
-      const local = fromId !== currentRoomId && door.wall !== undefined
-        ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral, farHalf)
-        : projectionPoseForDoor(doorId, door.segments, farWall, farLateral, farHalf);
+      const local = hopLocal(atlas, fromId, doorId, door, currentRoomId);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
@@ -997,6 +1011,31 @@ export function atlasPoses(
         hops: from.hops + 1,
       });
       queue.push(door.targetRoomId);
+    }
+    // 🗺️ A pairing recorded only on the FAR side (the station grouping counts
+    // it, atlasComponent) still joins the two: pose the far room through its
+    // own record of the door and invert that hop.
+    if (!opts.reverse) continue;
+    for (const other of Object.values(atlas)) {
+      if (!other?.roomId || placed.has(other.roomId)) continue;
+      const back = (Object.entries(other.doors ?? {}) as Array<[DoorId, AtlasDoor]>)
+        .find(([, d]) => d?.targetRoomId === fromId);
+      if (!back) continue;
+      // `from` in the other room's frame: from = other + R(other.rotY)·l.
+      const l = hopLocal(atlas, other.roomId, back[0], back[1], currentRoomId);
+      const rotY = from.rotY - l.rotY;
+      const cos = Math.cos(rotY), sin = Math.sin(rotY);
+      placed.set(other.roomId, {
+        roomId: other.roomId,
+        name: other.name,
+        seed: other.seed,
+        dims: other.dims,
+        x: from.x - (l.x * cos + l.z * sin),
+        z: from.z - (-l.x * sin + l.z * cos),
+        rotY,
+        hops: from.hops + 1,
+      });
+      queue.push(other.roomId);
     }
   }
   return [...placed.values()];
