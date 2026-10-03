@@ -79,6 +79,18 @@ describe('atlas components', () => {
     expect(listStations(atlas, []).filter((s) => s.derived)).toHaveLength(1);
   });
 
+  it('counts only rooms the atlas holds an entry of its own for, whatever a door calls a room', () => {
+    // Exactly 64 known rooms (MAX_ENTRIES). The atlas inherits a value under
+    // each odd name but holds no entry for it, so those rooms must not use up
+    // the cap and split the station.
+    const odd = ['constructor', '__proto__', 'toString'];
+    const real = Array.from({ length: 62 }, (_, i) => `real-${i}`);
+    const atlas = atlasOf(room('hub', [...odd, 'spine']), room('spine', real), ...real.map((rid) => room(rid)));
+    expect(atlasComponent(atlas, 'hub').size).toBe(64 + odd.length);
+    expect(atlasComponents(atlas)).toHaveLength(1);
+    for (const rid of odd) expect(atlasComponent(atlas, rid).size).toBe(0);
+  });
+
   it('never lets a ship\'s berth join or bridge stations', () => {
     const berth = (target: string) => ({ targetSeed: '', targetRoomId: target, transient: true as const });
     const atlas = atlasOf(
@@ -110,6 +122,17 @@ describe('atlas components', () => {
     const atlas = atlasOf(room('odd'));
     (atlas.odd as unknown as { name: unknown }).name = 42;
     expect(listStations(atlas, []).find((st) => st.derived)?.name).toBe('STATION');
+  });
+
+  it('never anchors a derived station on a room the atlas holds no entry for, whatever it is called', () => {
+    for (const odd of ['constructor', '__proto__', 'toString']) {
+      const derived = listStations(atlasOf(room('yard', [odd])), []).filter((st) => st.derived);
+      expect(derived).toEqual([expect.objectContaining({ id: 'station:yard', name: 'YARD', welcomeRoomId: 'yard' })]);
+      // A room the atlas does hold under that name is a room like any other.
+      const held = atlasOf(room(odd, ['yard']), room('yard'));
+      expect(Object.prototype.hasOwnProperty.call(held, odd)).toBe(true);
+      expect(listStations(held, []).filter((st) => st.derived).map((st) => st.id)).toEqual([`station:${odd}`]);
+    }
   });
 
   it('treats a dock recorded before the berth flag existed as a berth too', () => {
