@@ -52,7 +52,9 @@ import {
   readRememberedMoves,
   readStationMove,
   rememberedMoveFor,
+  MOVE_ENTRIES_KEEP,
   MOVE_SCAN_MAX,
+  MOVE_SETTLED_KEEP,
   rememberMove,
   subscribeStationMove,
   writeStationMove,
@@ -1216,6 +1218,43 @@ describe('the move log stays bounded', () => {
     store.clear();
     bindStationMoveDoc(peer);
     expect(readStationMove()).toEqual(mine);
+  });
+
+  it('keeps every charge when a zero-fuel write caps the log', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    const zero = { ...hop(1, 0, 0), stationId: 'z', welcomeRoomId: 'z-room', bookedAt: NOW + 5 };
+    // Settled records past the cap, each with a charge of its own.
+    doc.transact(() => {
+      for (let i = 0; i < MOVE_SETTLED_KEEP + 1; i++) map.set(`moveSettled:${100 + i}:1`, { n: 1, drawn: 1, floor: 1, recent: [] });
+    });
+    expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 1);
+    writeStationMove(zero);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:')).length).toBeLessThanOrEqual(MOVE_SETTLED_KEEP);
+    expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 1);
+    // Entries past the cap, each paid for, and still under way.
+    const doc2 = new Y.Doc();
+    bindStationMoveDoc(doc2);
+    const map2 = doc2.getMap('stationMoves');
+    const n = MOVE_ENTRIES_KEEP + 2;
+    doc2.transact(() => {
+      for (let i = 0; i < n; i++) {
+        map2.set(`move:7:${i}:s${i}`, { ...hop(0, 1, 1), stationId: `s${i}`, welcomeRoomId: `s${i}-room`, bookedAt: NOW - 10_000 - i });
+      }
+    });
+    expect(readMoveFuelDrawn()).toBe(n);
+    writeStationMove(zero);
+    expect([...map2.keys()].filter((k) => k.startsWith('move:')).length).toBeLessThanOrEqual(MOVE_ENTRIES_KEEP + 1);
+    expect(readMoveFuelDrawn()).toBe(n);
+    // A peer that folds the same surplus writes the same record: no double charge.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc2));
+    store.clear();
+    bindStationMoveDoc(peer);
+    writeStationMove({ ...zero, departAt: zero.departAt + 1, arriveAt: zero.arriveAt + 1 });
+    Y.applyUpdate(doc2, Y.encodeStateAsUpdate(peer));
+    expect(readMoveFuelDrawn()).toBe(n);
   });
 
   it('keeps the meter in range when several writers\' settled totals add past it', () => {
