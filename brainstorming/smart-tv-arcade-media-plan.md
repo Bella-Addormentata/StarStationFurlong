@@ -250,16 +250,24 @@ their own webview with range support. No re-encode, every platform; the
 countdown spreads the host's upload before T0. Honest caveat: a transfer, not
 a stream — delete-on-leave cache and private rooms keep it in the shape of
 sending a friend a file. And the record is peer-writable, so a fetch is never
-automatic beyond a cap: the source carries its declared size; a viewer's node
-fetches on its own only under a per-room `autoFetchCap` the viewer sets (a
-FETCH button above it), under per-room and global cache quotas, with
-cancellation and delete-on-leave — and the declared size, being peer-written,
-is only a hint, so every transfer runs under a hard byte ceiling of its own.
-Two numbers, kept apart: the cap says what fetches *without asking*; a fetch
-the viewer approved runs to the `approvedLimit` the FETCH button showed them
-(the declaration, bounded by the quota they have left), never to the cap,
-which would abort the very transfer they agreed to. An automatic fetch's
-ceiling is the cap or the declaration, whichever is smaller; an approved
+automatic beyond a cap AND a budget: the source carries its declared size; a
+viewer's node fetches on its own only under a per-transfer `autoFetchCap`
+the viewer sets, and only while a cumulative `autoFetchBudget` — the bytes
+fetched without asking, per room and per session — has something left (a
+FETCH button above the cap or past the budget), with one automatic transfer
+in flight per room and a byte rate ceiling, under per-room and global cache
+quotas, with cancellation and delete-on-leave. The budget exists because a
+cap alone bounds one transfer: a peer rotating through fresh under-cap
+hashes would spend a viewer's bandwidth without end while cache eviction
+kept the disk quota honest; a spent budget makes every further fetch an
+explicit FETCH, and eviction never refills it. And the declared size, being
+peer-written, is only a hint, so every transfer runs under a hard byte
+ceiling of its own. Three numbers, kept apart: the cap and the budget say
+what fetches *without asking*; a fetch the viewer approved runs to the
+`approvedLimit` the FETCH button showed them (the declaration, bounded by
+the quota they have left), never to the cap, which would abort the very
+transfer they agreed to. An automatic fetch's ceiling is the cap, the
+budget's remainder or the declaration, whichever is smallest; an approved
 one's is its approved limit; received bytes past the ceiling abort the
 transfer, and a completed blob whose size differs from the declaration is
 rejected either way.
@@ -379,7 +387,13 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   against the op; storage and egress run under quotas. `library-remove` (a
   denylist honoured by every node) is accepted from the station's owners AND
   from the library-station operator, an additional remove-only authority
-  (the volunteer must be able to drop what it will not host); a removal
+  (the volunteer must be able to drop what it will not host) — whose key is
+  bound the way the owners' are, never self-asserted: pinned in the
+  station's own config, or named by the room's verified authority head (an
+  operator key the deed holder signs into it). The beacon-style opt-in says
+  a node volunteers to fetch and seed; it says nothing about whose removals
+  the rest of the station should honour, and a node that can resolve no
+  operator key honours no operator removals. A removal
   signed by anyone else is rejected before the denylist is applied, since a
   signature identifies a writer without authorizing one, and an open remove
   would let any room peer blank the whole library. Nobody can make the
