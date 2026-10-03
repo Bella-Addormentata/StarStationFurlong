@@ -170,6 +170,28 @@ describe('guards', () => {
     }
   });
 
+  it("keeps a trim of the place a pin settled the station at, whichever install's record stands", () => {
+    // Two installs saved HAB RING under their own ids. The one that stands
+    // (the smaller id) still names SOV slot 2, but the arrival pin put the
+    // station at ARIS slot 5, where the other install flies and trims it.
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const pin: StationMove = {
+      ...move, fromPlanetId: ARIS, fromSlot: 5, departAt: T0 + 1000, arriveAt: T0 + 1001, bookedAt: T0 + 1500,
+      settles: move, fuel: 0, fuelDrawn: 0,
+    };
+    const a = summary({ ownerId: 'a-hab', orbitSlot: 2, move: pin });
+    const b = summary({ ownerId: 'b-hab', planetId: ARIS, orbitSlot: 5, move: pin, trim: trim({ planetId: ARIS, slot: 5, at: T0 + 2000 }) });
+    for (const merged of [mergeStation(a, b, T0 + 3000), mergeStation(b, a, T0 + 3000)]) {
+      expect(merged?.ownerId).toBe('a-hab');
+      expect(merged?.trim).toMatchObject({ planetId: ARIS, slot: 5 });
+    }
+    // Not a trim of another slot there.
+    expect(mergeStation(a, { ...b, trim: trim({ planetId: ARIS, slot: 6, at: T0 + 2000 }) }, T0 + 3000)?.trim).toBeUndefined();
+  });
+
   it("keeps the standing record's trim over a newer one for another slot", () => {
     const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
     const late = summary({ orbitSlot: 1, updatedAt: T0 + 50, trim: trim({ slot: 1, at: T0 + 40 }) });

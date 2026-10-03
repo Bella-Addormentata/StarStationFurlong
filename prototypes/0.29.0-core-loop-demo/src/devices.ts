@@ -2134,6 +2134,11 @@ const arrivalNoteListeners = new Set<() => void>();
 
 function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
   lastArrivalNote = note;
+  redrawHelms();
+}
+
+/** Redraw every open helm (they subscribe through subscribeArrivalNote). */
+function redrawHelms(): void {
   for (const fn of arrivalNoteListeners) fn();
 }
 
@@ -2153,7 +2158,8 @@ export function clearShipArrivalNote(): void {
 let arrivalNoteRoom = 0;
 
 /** 🚚 A DEPART waiting for its docks to let go, whichever helm started it:
- *  one at a time. */
+ *  one at a time. Every open helm redraws when it ends (redrawHelms): the
+ *  one that started it may have closed meanwhile, and another opened. */
 let castingOff = false;
 
 /** The arrival-note callback for a DOCK started in this room: its answer can
@@ -2619,7 +2625,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           setArrivalNote(null);
         } finally {
           castingOff = false;
-          render();
+          redrawHelms();
         }
       })();
     });

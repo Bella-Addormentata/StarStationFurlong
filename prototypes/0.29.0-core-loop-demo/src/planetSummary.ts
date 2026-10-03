@@ -451,7 +451,10 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   // stamp), and a trim of that orbit is no trim of the station's. Until its
   // arrival is pinned, a station may have bounced home off a full planet
   // (each install decides that from the stations it knows), so the planet
-  // it left from counts too.
+  // it left from counts too. And a trim of the place a pin settled the
+  // station at stands too, whichever record stands: two installs that saved
+  // the station under their own ids each fly it there, while the standing
+  // record may still name the orbit it left.
   const move = newerMove(prior.move, incoming.move);
   // What the station follows instead of that move, as published beside it:
   // beside another move it says nothing.
@@ -462,13 +465,14 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   const planet = summaryPlanet({ planetId: base.planetId, move, stands }, now);
   const flown = stands ?? move;
   const leftFrom = flown && !flown.settles && now >= flown.arriveAt ? planetById(flown.fromPlanetId).id : null;
+  const settled = flown?.settles ? { planetId: flown.toPlanetId, orbitSlot: flown.toSlot } : null;
   const standing = recordOf(canonOrder({ ...base, updatedAt: 0 }));
   const fits = (s: StationSummary): SharedTrim | undefined => {
     const t = s.trim;
     if (!t) return undefined;
     const at = planetById(t.planetId).id;
     if (at !== planet && at !== leftFrom) return undefined;
-    if (trimFor(base, t)) return t;
+    if (trimFor(base, t) || trimFor(settled, t)) return t;
     return recordOf(canonOrder({ ...s, updatedAt: 0 })) === standing ? t : undefined;
   };
   const gone = mergeGone(prior.trimGone, incoming.trimGone);

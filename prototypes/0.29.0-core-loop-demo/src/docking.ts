@@ -2745,7 +2745,7 @@ export class DoorDockingPortSystem {
    * back), then the far room's end through the injected writer — best effort;
    * an unreachable far room is said, not hidden. A far room whose station is
    * between planets keeps its end, and this side is put back. True when this
-   * side let go.
+   * side let go and no far station's move kept its end.
    */
   public async undockPort(doorId: string): Promise<boolean> {
     if (this.dockOp(doorId)?.busy) return false;
@@ -2826,7 +2826,9 @@ export class DoorDockingPortSystem {
           : { note: `This station is moving between planets — ${name} keeps its end of the dock until it arrives, but this port changed meanwhile.`, tone: "bad" },
         roomId,
       );
-      return !back;
+      // Not released either way: the far end still holds the dock, put back
+      // here or not (a DEPART waiting on it must not leave it live).
+      return false;
     }
     this.setDockOp(
       doorId,
