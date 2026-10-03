@@ -2323,6 +2323,8 @@ async function joinRoomAtEpoch(
       // 🎫 The passes the helm's "no pass" check counts (berthPassFor): this
       // game's own, else the address a port of the ship remembers there, so
       // a rider who never stood in a stop's room still reaches its board.
+      // The publisher reads them as it takes each snapshot, while the ship's
+      // room is bound, and keeps them for that snapshot's later sends.
       seedFor: (roomId) => berthPassFor(roomId, world?.dockingSystem?.listDockPorts() ?? []),
       write: writeDepartures,
       // ⛽ Only the room's owner fits or takes off tanks (editMode's gate).

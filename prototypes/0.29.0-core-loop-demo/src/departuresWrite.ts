@@ -38,9 +38,14 @@
  * to the other stops late (its first stop was slow) neither overwrites a
  * finish offered there since nor drops that finish's retry; the
  * finish carries the run it ended (🏁 endedRun), so a board ranks it above
- * any late snapshot of that run; a room this game holds no
- * pass for is skipped (another rider may reach it, and the planet's ship
- * summaries carry the ferry to all-gates boards anyway). Never throws.
+ * any late snapshot of that run; 🎫 each stop's pass is taken with the
+ * snapshot, while the ship's room is bound, and kept with it (never in the
+ * publish) for its fan-out and retries, so a rider who leaves the ship's
+ * room, or a port retargeted meanwhile, still reaches every stop the
+ * snapshot could; a room this game held no pass for then, and holds none
+ * for when its turn comes, is skipped (another rider may reach it, and the
+ * planet's ship summaries carry the ferry to all-gates boards anyway).
+ * Never throws.
  *
  * The session is this file; the decision is departuresDoc.ts (pure over the
  * far doc, pinned by departuresDoc.test.ts); the publisher's scheduling is
@@ -195,7 +200,9 @@ export interface DeparturesPublisherDeps {
   capacity: () => number;
   route: () => ShipRoute | null;
   checkpoints: () => readonly RouteCheckpoint[];
-  /** A pass this game holds for a room, or undefined. */
+  /** A pass this game holds for a room, or undefined. 🎫 Read for every
+   *  stop as a snapshot is taken (the ship's room is bound then), and again
+   *  when a room's turn comes only if it gave none then. */
   seedFor: (roomId: string) => string | undefined;
   write: (address: string, pub: DeparturesPublish) => Promise<DeparturesWriteResult>;
   /** ⛽ Does this game edit the ship's parts (the room's owner: editMode's
@@ -229,6 +236,10 @@ interface RoomState {
   /** 🔢 Its place in the order this game took its snapshots (0: none yet).
    *  An offer of an older one is dropped. */
   latestSeq: number;
+  /** 🎫 The pass for this room taken with `latest` (`waiting` is always
+   *  `latest` or null, so it goes with whatever is sent here), or undefined
+   *  when this game held none then. */
+  pass: string | undefined;
   busy: boolean;
   /** Retries spent on the snapshot now being sent. */
   retries: number;
@@ -261,10 +272,18 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     const key = `${room}\n${ship}`;
     let st = rooms.get(key);
     if (!st) {
-      st = { room, waiting: null, latest: null, latestSeq: 0, busy: false, retries: 0, waiters: [] };
+      st = { room, waiting: null, latest: null, latestSeq: 0, pass: undefined, busy: false, retries: 0, waiters: [] };
       rooms.set(key, st);
     }
     return st;
+  };
+
+  const passFor = (room: string): string | undefined => {
+    try {
+      return d.seedFor(room) || undefined;
+    } catch {
+      return undefined;
+    }
   };
 
   /** Send what waits for this room from this ferry, and answer its offers
@@ -277,12 +296,9 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     const answered = st.waiters;
     st.waiters = [];
     const done = () => { for (const w of answered) w(); };
-    let seed: string | undefined;
-    try {
-      seed = d.seedFor(room);
-    } catch {
-      seed = undefined;
-    }
+    // 🎫 The pass taken with the snapshot, even when this game no longer
+    // holds it (the rider left the ship's room, or its port was retargeted).
+    const seed = st.pass ?? passFor(room);
     if (!seed) {
       st.retries = 0;
       done();
@@ -313,17 +329,19 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     if (st.waiting) void pump(st);
   };
 
-  /** Offer a snapshot (the `seq`th taken) to a room. Resolves once the room
-   *  has answered it (or a newer snapshot that replaced it while the room was
-   *  busy), never sooner: a busy room answers its current write first. 🔢 An
-   *  older snapshot than one already offered there goes nowhere, and resolves
-   *  at once: it would replace newer news, and drop that news's retry. */
-  const offer = (room: string, pub: DeparturesPublish, seq: number): Promise<void> => {
+  /** Offer a snapshot (the `seq`th taken) to a room, with the pass for it
+   *  taken with the snapshot. Resolves once the room has answered it (or a
+   *  newer snapshot that replaced it while the room was busy), never sooner:
+   *  a busy room answers its current write first. 🔢 An older snapshot than
+   *  one already offered there goes nowhere, and resolves at once: it would
+   *  replace newer news, and drop that news's retry. */
+  const offer = (room: string, pub: DeparturesPublish, seq: number, pass: string | undefined): Promise<void> => {
     const st = stateOf(room, pub.shipRoomId);
     if (seq <= st.latestSeq) return Promise.resolve();
     st.waiting = pub;
     st.latest = pub;
     st.latestSeq = seq;
+    st.pass = pass;
     st.retries = 0;
     const answered = new Promise<void>((resolve) => { st.waiters.push(resolve); });
     void pump(st);
@@ -354,10 +372,14 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     };
     const order = publishRoomOrder(route, p.legSeq);
     if (order.length === 0) return;
+    // 🎫 Every stop's pass now, while the ship's room (and its ports'
+    // remembered berths) is bound: the rest go on only once the first stop
+    // has answered, and a retry comes later still.
+    const passes = new Map(order.map((room) => [room, passFor(room)] as const));
     const [first, ...rest] = order;
     const seq = ++taken;
     newest.set(ship, { pub, rooms: new Set(order) });
-    void offer(first, pub, seq).then(() => {
+    void offer(first, pub, seq, passes.get(first)).then(() => {
       // A snapshot a newer one replaced at the first room, or overtook while
       // it was sent, goes on to none of the newer one's rooms: that one goes
       // there in its place (a finish still reaches the stops only its route
@@ -365,7 +387,7 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
       const n = newest.get(ship);
       for (const room of rest) {
         if (n && n.pub !== pub && n.rooms.has(room)) continue;
-        void offer(room, pub, seq);
+        void offer(room, pub, seq, passes.get(room));
       }
     });
   };
