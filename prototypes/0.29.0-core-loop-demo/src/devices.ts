@@ -4446,6 +4446,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
           routine: to,
           ...(script.length ? { script } : {}),
           ...(c?.parked ? { parked: true } : {}),
+          // 🔧 Disassemble pressed again: it stays on its module (switching
+          // to any other routine takes it off the job).
+          ...(to === 'disassemble' && c?.routine === 'disassemble' && c.target ? { target: c.target } : {}),
         });
       });
     });

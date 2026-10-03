@@ -16,7 +16,7 @@ import {
 } from './disassembly';
 import {
   assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, raiseDisassemblyLabor,
-  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, writeRobotConfig,
+  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
 } from './robotDoc';
 import type { DoorRecord } from './doorsDoc';
 
@@ -91,7 +91,14 @@ describe('labor on the orbital clock', () => {
       startedAt: 0, doneMs: 10 * MIN, asOf: 10 * MIN, ...over,
     });
     expect(isDisassemblyJobRecord(rec())).toBe(true);
-    expect(isDisassemblyJobRecord(rec({ finishedAt: 3, outcome: 'removed' }))).toBe(true);
+    // Ended: how it ended, with all its labor settled when it did.
+    const ended = { doneMs: 24 * MIN, asOf: 24 * MIN, finishedAt: 24 * MIN };
+    expect(isDisassemblyJobRecord(rec({ ...ended, outcome: 'removed' }))).toBe(true);
+    expect(isDisassemblyJobRecord(rec({ ...ended, outcome: 'detached' }))).toBe(true);
+    expect(isDisassemblyJobRecord(rec(ended))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ outcome: 'removed' }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ finishedAt: 10 * MIN, outcome: 'removed' }))).toBe(false);
+    expect(isDisassemblyJobRecord(rec({ ...ended, finishedAt: 25 * MIN, outcome: 'removed' }))).toBe(false);
     expect(isDisassemblyJobRecord(rec({ laborHours: 0 }))).toBe(false);
     expect(isDisassemblyJobRecord(rec({ laborHours: Infinity }))).toBe(false);
     expect(isDisassemblyJobRecord(rec({ doneMs: -1 }))).toBe(false);
@@ -180,6 +187,30 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
     harvestIntoAtlas({ roomId: 'room-d', name: 'SHED', doors: [{ doorId: 'w', targetSeed: seed('room-a') }], owner: { id: 'Local-Clone' } });
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
+  });
+
+  it('takes apart a module seen from inside with no doors of its own', () => {
+    const doors = hub();
+    // HUB's record is the only one of its gangway to SHED (a pairing may be
+    // recorded on one side only).
+    harvestIntoAtlas({
+      roomId: 'room-a', name: 'HUB',
+      doors: [
+        { doorId: 'east', targetSeed: seed('room-b'), transient: false },
+        { doorId: 'west', targetSeed: seed('room-c'), transient: false },
+        { doorId: 'south', targetSeed: seed('ship-1'), transient: true },
+        { doorId: 'up', targetSeed: seed('room-s'), transient: false },
+      ],
+      owner: { id: 'p-me' },
+    });
+    doors.set('up', pairing('room-s'));
+    // Named only by that door, SHED is a stub: what else it joins is unknown.
+    expect(removalBlocker(input(doors), 'room-s')).toBe("its layout isn't known yet; step inside it once");
+    // Seen from inside, it records no doors: known, and it hangs off HUB alone.
+    harvestIntoAtlas({ roomId: 'room-s', name: 'SHED', doors: [], owner: { id: 'p-me' } });
+    expect(readAtlas()['room-s']?.doors).toEqual({});
+    expect(removalBlocker(input(doors), 'room-s')).toBeNull();
+    expect(disassemblyCandidates(input(doors)).find((c) => c.roomId === 'room-s')?.blocked).toBeNull();
   });
 
   it('takes apart only a module that hangs off this room alone', () => {
@@ -318,6 +349,32 @@ describe('the job in the robot map', () => {
       expect(jobDueAt(j)).toBeNull();
       expect(workedMs(j, 60 * MIN)).toBe(workedMs(j, 7 * MIN));
     }
+  });
+
+  it('reads every job and its crew in one bounded walk of the map', () => {
+    const doc = new Y.Doc();
+    bindRobotDoc(doc);
+    const lab = { ...target, roomId: 'room-c', name: 'LAB', doorId: 'west' };
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', lab, 0);
+    assignDisassembly('d3', lab, 0);
+    // A peer's junk after them: robots set to modules no job is open on.
+    const map = doc.getMap('robot');
+    doc.transact(() => {
+      for (let i = 0; i < 3 * MAX_ROBOT_MAP_SCAN; i++) map.set(`cfg:junk-${i}`, { routine: 'disassemble', target: `junk-${i}` });
+    });
+    const walk = map.entries.bind(map);
+    let walked = 0;
+    const entries = vi.spyOn(map, 'entries').mockImplementation(function* () {
+      for (const e of walk()) {
+        walked++;
+        yield e;
+      }
+    });
+    expect(readDisassemblyJobs().map((j) => [j.roomId, j.crew])).toEqual([['room-b', ['d1']], ['room-c', ['d2', 'd3']]]);
+    expect(entries).toHaveBeenCalledTimes(1);
+    expect(walked).toBeLessThanOrEqual(MAX_ROBOT_MAP_SCAN + 1);
+    entries.mockRestore();
   });
 
   it('raises an open job costed below the module, keeping the work done', () => {

@@ -5271,7 +5271,8 @@ export class World {
    * the module leaves the atlas for every map. A blocker found then (the
    * module was joined to another meanwhile) holds it at 100% until it
    * clears. Each robot on an open job works at that job's door, side by
-   * side with its crew; any other Disassemble robot waits on its dock. Run
+   * side with its crew, saying how far along it is, until the labor is done;
+   * then, and for any other Disassemble robot, it waits on its dock. Run
    * twice a second.
    */
   private updateDisassembly(): void {
@@ -5306,14 +5307,18 @@ export class World {
       }
       const job = cfg.target ? jobs.find((j) => j.roomId === cfg.target) : undefined;
       const slot = job ? job.crew.indexOf(key) : -1;
-      const working = !!job && job.finishedAt === undefined && slot >= 0 && jobFraction(job, now) < 1;
-      bot.setWorkPost(working ? this.workPost(job.doorId, slot) : null);
-      if (!working) {
+      if (!job || job.finishedAt !== undefined || slot < 0) {
+        bot.setWorkPost(null);
         this.disassemblySaid.delete(key);
         continue;
       }
+      // In the crew: it works at the job's door while labor is left, then
+      // waits on its dock until the module comes off (a blocker, or the
+      // owner away), having said it is done.
+      const fraction = jobFraction(job, now);
+      bot.setWorkPost(fraction < 1 ? this.workPost(job.doorId, slot) : null);
       // A line on starting and at each tenth of the job, once delivered.
-      const tenth = Math.floor(jobFraction(job, now) * 10);
+      const tenth = Math.floor(fraction * 10);
       const said = this.disassemblySaid.get(key);
       if (said === tenth) continue;
       const text = said === undefined && tenth === 0

@@ -94,7 +94,9 @@ const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFi
 
 /** Shape guard: a job record crosses the room-doc trust boundary (peer
  *  writes). Its labor can't be more than a full crew could have done since
- *  it started, nor more than the job takes. */
+ *  it started, nor more than the job takes. An open job has no outcome; an
+ *  ended one says how it ended and has all its labor done, settled when it
+ *  ended (as finishDisassemblyJob writes it). */
 export function isDisassemblyJobRecord(v: unknown): v is DisassemblyJobRecord {
   if (typeof v !== 'object' || v === null) return false;
   const j = v as Partial<DisassemblyJobRecord>;
@@ -107,8 +109,12 @@ export function isDisassemblyJobRecord(v: unknown): v is DisassemblyJobRecord {
     && j.asOf >= j.startedAt
     && j.doneMs <= laborMsFor(j.laborHours)
     && j.doneMs <= MAX_CREW * (j.asOf - j.startedAt)
-    && (j.finishedAt === undefined || isTime(j.finishedAt))
-    && (j.outcome === undefined || j.outcome === 'removed' || j.outcome === 'detached');
+    && (j.finishedAt === undefined
+      ? j.outcome === undefined
+      : isTime(j.finishedAt)
+        && (j.outcome === 'removed' || j.outcome === 'detached')
+        && j.asOf === j.finishedAt
+        && j.doneMs === laborMsFor(j.laborHours));
 }
 
 /** Labor the job takes, in real ms of one robot's work. */
@@ -220,7 +226,10 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
  * is set to it and again when the labor runs out:
  *  - the station's welcome room stays (the station is known by it);
  *  - its own doors must be known (the atlas has its layout, seen from inside
- *    or gossiped): without them, what else it is joined to is unknown;
+ *    or gossiped): a stub, named only by a neighbour's door and never seen
+ *    from inside, says nothing of what else it is joined to. A module seen
+ *    from inside with no doors of its own is known: it is joined only by
+ *    doors other rooms recorded;
  *  - only its owner takes a module apart (one with no verified owner may be
  *    taken apart by this room's owner, as the console is owner-only; one
  *    this install minted, whose owner the atlas never learned, likewise);
@@ -231,7 +240,8 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   const { atlas } = input;
   if (input.welcomeRoomId && roomId === input.welcomeRoomId) return "it is the station's welcome room";
   const entry = atlas[roomId];
-  if (!entry || Object.keys(entry.doors ?? {}).length === 0) return "its layout isn't known yet; step inside it once";
+  const stub = !!entry && Object.keys(entry.doors ?? {}).length === 0 && entry.localSeenAt === undefined;
+  if (!entry || stub) return "its layout isn't known yet; step inside it once";
   const owner = entry.owner;
   if (owner === undefined) {
     if (!input.minted?.(roomId)) return "its owner isn't known yet; step inside it once";
