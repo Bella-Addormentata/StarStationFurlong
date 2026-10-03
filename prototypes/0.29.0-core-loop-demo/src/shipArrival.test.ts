@@ -177,6 +177,14 @@ describe('planArrivalDock', () => {
       ports: [{ doorId: 'north', state: dockedTo(SEED_HIGH) }, { doorId: 'east', state: FREE }],
     })).toEqual({ kind: 'none', reason: 'already-docked' });
   });
+
+  it('counts that dock as already there when this client can address no gate at all', () => {
+    expect(planArrivalDock({
+      station: { berths: [], berthRooms: [FURLONG_ROOM, HIGH_ROOM] },
+      remembered: null,
+      ports: [{ doorId: 'north', state: dockedTo(SEED_HIGH) }, { doorId: 'east', state: FREE }],
+    })).toEqual({ kind: 'none', reason: 'already-docked' });
+  });
 });
 
 describe('castOffRefusal', () => {

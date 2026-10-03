@@ -23,6 +23,7 @@ import {
   freeGateNumber,
   freeGateNumberHere,
   harvestIntoAtlas,
+  steppedGateNumberHere,
   readAtlas,
   stationGates,
   withSharedAtlasOf,
@@ -299,6 +300,24 @@ describe("a far room doc's shared atlas", () => {
     expect(freeGateNumberHere('here', {})).toBe(2);
   });
 
+  it("renumbers a gate by hand past the gates of a room only the bound doc still holds", () => {
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('here', entry('here', 5, { 'd:hall': { targetRoomId: 'hub', farDoor: 'd:in', transient: false } }));
+    shared.set('hub', entry('hub', 5, { 'd:in': { targetRoomId: 'here', farDoor: 'd:hall', transient: false } }, { 'd:p1': 2, 'd:p2': 3 }));
+    bindStationAtlasDoc(doc, { roomId: 'here', isPassagePublic: () => false });
+    const local = readAtlas();
+    delete local.hub;
+    store.set('ssf-station-atlas', JSON.stringify(local));
+    const own = { 'd:a': 1, 'd:b': 4 };
+    // Up from 1 steps over the hub's 2 and 3, and this room's 4.
+    expect(steppedGateNumberHere('here', own, 'd:a', 1, 1)).toBe(5);
+    // Down from 4 steps over 3 and 2 to 1, which only d:b's own old number frees.
+    expect(steppedGateNumberHere('here', own, 'd:b', 4, -1)).toBe(null);
+    expect(steppedGateNumberHere('here', { 'd:b': 4 }, 'd:b', 4, -1)).toBe(1);
+    expect(steppedGateNumberHere('here', own, 'd:a', 1, -1)).toBe(null);
+  });
+
   it("follows a newer doc copy's re-paired door to the far station's other rooms", () => {
     // We once saw far-dock's hall lead to a room that has since gone.
     harvestIntoAtlas({ roomId: 'far-dock', name: 'DOCK', doors: [{ doorId: 'd:hall', targetSeed: seed('old-room'), transient: false }] });
@@ -510,6 +529,35 @@ describe('the per-planet summary', () => {
     for (const merged of [mergeStation(full, gone)!, mergeStation(gone, full)!]) {
       expect(merged.berths).toHaveLength(99);
       for (const b of merged.berths!) expect(merged.berthRoomsAt?.[b.roomId] ?? merged.berthsAt).toBe(T0);
+    }
+  });
+
+  it('keeps a room\'s removal beside a full list, so an older copy cannot bring its gate back', () => {
+    const berths = Array.from({ length: 99 }, (_, i) => ({ roomId: `room-${String(i).padStart(2, '0')}`, doorId: 'south', gate: i + 1 }));
+    const full = base({ ownerId: 'hub', berths, berthsAt: T0 });
+    const gone = base({ ownerId: 'hub', berths: [], berthsAt: T0 + 5, berthRoomsAt: { 'room-zz': T0 + 5 } });
+    // An offline copy from before room-zz's gate was removed.
+    const old = base({ ownerId: 'hub', berths: [{ roomId: 'room-zz', doorId: 'north', gate: 1 }], berthsAt: T0 + 1 });
+    for (const merged of [mergeStation(full, gone)!, mergeStation(gone, full)!]) {
+      expect(merged.berthRoomsAt?.['room-zz']).toBe(T0 + 5);
+      const again = cleanStationSummary(merged, T0 + 10)!;
+      expect(again.berthRoomsAt?.['room-zz']).toBe(T0 + 5);
+      const after = mergeStation(again, old) ?? again;
+      expect(after.berths!.some((b) => b.roomId === 'room-zz')).toBe(false);
+    }
+  });
+
+  it('keeps the removal of every room a full list held', () => {
+    const rooms = Array.from({ length: 99 }, (_, i) => `room-${String(i).padStart(2, '0')}`);
+    const full = base({ ownerId: 'hub', berths: rooms.map((roomId, i) => ({ roomId, doorId: 'south', gate: i + 1 })), berthsAt: T0 });
+    const stamps: Record<string, number> = {};
+    for (const room of rooms) stamps[room] = T0 + 5;
+    const cleared = base({ ownerId: 'hub', berths: [], berthsAt: T0 + 5, berthRoomsAt: stamps });
+    for (const merged of [mergeStation(full, cleared) ?? full, mergeStation(cleared, full) ?? cleared]) {
+      const again = cleanStationSummary(merged, T0 + 10)!;
+      expect(again.berths).toEqual([]);
+      expect(Object.keys(again.berthRoomsAt ?? {})).toHaveLength(99);
+      expect(mergeStation(again, full) ?? again).toEqual(again);
     }
   });
 
