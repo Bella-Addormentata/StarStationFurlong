@@ -155,6 +155,8 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 import { roomIdFromSeed } from "./stationAtlas";
 // ⚓ A station's public berth takes its door's pose from the atlas.
 import { setBerthPoseLookup } from "./stationDirectory";
+// ⚓ DEPART remembers the dock into the station it leaves.
+import { setBerthStationResolver } from "./shipArrival";
 import {
   dockedStationFor,
   listStations,
@@ -1736,6 +1738,11 @@ async function joinRoomAtEpoch(
     };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
+    // ⚓ The station a dock leads into, as the directory's `here` reads it,
+    // so DEPART files the right dock under the station it leaves. A dock
+    // between two of the ship's own doors leads into none.
+    setBerthStationResolver((roomId) =>
+      roomId && roomId !== activeBootstrap?.roomId ? stationForRoom(roomId)?.id ?? null : null);
     // ⚓ A station's public berth: its door's own wall and lateral, as the
     // atlas last saw them from inside its room.
     setBerthPoseLookup((roomId, doorId) => {

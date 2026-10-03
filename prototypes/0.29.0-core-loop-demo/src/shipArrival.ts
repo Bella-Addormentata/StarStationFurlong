@@ -81,6 +81,27 @@ export function setBerthSeedResolver(fn: ((roomId: string) => string | undefined
   berthSeedFor = fn ?? (() => undefined);
 }
 
+let berthStationOf: ((roomId: string) => string | null) | null = null;
+
+/** main.ts points this at the station a dock's far room is part of, so
+ *  DEPART files under the station it leaves only the dock that leads into
+ *  it, never a dock into another station or ship. Null clears it. */
+export function setBerthStationResolver(fn: ((roomId: string) => string | null) | null): void {
+  berthStationOf = fn;
+}
+
+/** Does a dock into `roomId` lead into `stationId`? Yes when nothing can
+ *  tell; no when the resolver throws: a berth filed under the wrong station
+ *  would dock the trip back there. */
+function leadsInto(roomId: string, stationId: string): boolean {
+  if (!berthStationOf) return true;
+  try {
+    return berthStationOf(roomId) === stationId;
+  } catch {
+    return false;
+  }
+}
+
 function roomOf(seed: string): string {
   try {
     return roomIdFromSeed(seed);
@@ -219,13 +240,17 @@ function sameRoom(a: string, b: string): boolean {
   }
 }
 
-/** The berth to remember at the station being left: the first docked port. */
-export function berthToRemember(ports: readonly ArrivalPort[]): BerthMemoryRecord | null {
+/** The berth to remember at the station being left: the first docked port,
+ *  or, given that station's id, the first whose dock leads into it
+ *  (setBerthStationResolver): a ship docked at two places files neither
+ *  under the other. */
+export function berthToRemember(ports: readonly ArrivalPort[], stationId?: string): BerthMemoryRecord | null {
   for (const p of ports) {
     if (p.state.kind !== 'docked') continue;
     const rec = p.state.record;
     const roomId = roomOf(p.state.address);
     if (!roomId) continue; // a malformed dock: keep looking for a good one
+    if (stationId !== undefined && !leadsInto(roomId, stationId)) continue;
     const out: BerthMemoryRecord = { doorId: p.doorId, roomId };
     if (rec.farDoor) out.farDoor = rec.farDoor;
     if (rec.farWall) out.farWall = rec.farWall;
@@ -241,7 +266,7 @@ export function berthToRemember(ports: readonly ArrivalPort[]): BerthMemoryRecor
  *  stranding the return trip. True when remembered, or when there is no
  *  berth to keep. */
 export function rememberBerthHere(stationId: string, ports: readonly ArrivalPort[]): boolean {
-  const berth = berthToRemember(ports);
+  const berth = berthToRemember(ports, stationId);
   if (!berth) return true;
   // A berth the memory would refuse anyway (a malformed peer-written dock)
   // must never cost an unrelated station its remembered berth below.
