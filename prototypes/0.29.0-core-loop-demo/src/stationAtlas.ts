@@ -934,7 +934,9 @@ function pullSharedAtlas(): void {
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
-    const prior = atlas[rid];
+    // Our own entry only: what a room named `constructor` or `__proto__`
+    // inherits has no doors, and reading it as a prior entry threw.
+    const prior = hasEntry(atlas, rid) ? atlas[rid] : undefined;
     // Compared against what the value NORMALIZES to — the count of VALID
     // records, capped — never its raw key count: a stored 64 against a raw
     // 100, or a stored 1 against 100 malformed keys plus one valid, would

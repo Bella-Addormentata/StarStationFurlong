@@ -105,6 +105,18 @@ describe('door-set bound at ingest', () => {
     const raw = JSON.parse(store.get('ssf-station-atlas')!) as Record<string, { doors: object }>;
     expect(Object.keys(raw['module-old'].doors).length).toBe(64);
   });
+
+  it('takes a peer room named like an Object property without dropping the rest', () => {
+    for (const odd of ['constructor', '__proto__', 'toString']) {
+      store.clear();
+      const peer = new Y.Doc();
+      const map = peer.getMap('atlas');
+      map.set(odd, { roomId: odd, name: 'ODD', doors: { n: { targetRoomId: 'module-yard' } }, updatedAt: Date.now() });
+      map.set('module-yard', shared('module-yard', Date.now()));
+      expect(() => bindStationAtlasDoc(peer, { roomId: 'module-self', isPassagePublic: () => false })).not.toThrow();
+      expect(readAtlas()['module-yard']?.name).toBe('MODULE-YARD');
+    }
+  });
 });
 
 describe('gossip stamp bounds (#144)', () => {
