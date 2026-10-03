@@ -120,6 +120,13 @@ describe('the coast watch', () => {
     expect(readFreePose()!.at).toBe(t - 5000);
   });
 
+  it('checkpoints a quiet coast once it is a minute old', () => {
+    const t = Date.now();
+    fly(farPose(t - 61_000));
+    expect(settleFreeCoast(t)).toBe(true);
+    expect(t - readFreePose()!.at).toBeLessThan(1000);
+  });
+
   it('stands aside while this game holds the stick', () => {
     const t = Date.now();
     fly(farPose(t - 5000));

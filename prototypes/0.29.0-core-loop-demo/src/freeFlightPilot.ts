@@ -9,7 +9,8 @@
  * a zone rule acts. Every other game in the room — and the planet summary —
  * coasts that record forward (coastTo), so all of them see the same ship.
  * A commander's game with nobody at the stick writes the coast back when a
- * zone rule acts on it (settleFreeCoast, from main.ts's 1 Hz flight watch).
+ * zone rule acts on it, and at least every CHECKPOINT_MS (settleFreeCoast,
+ * from main.ts's 1 Hz flight watch).
  */
 
 import {
@@ -30,6 +31,8 @@ import { adriftPlace, currentRoomId, listStations, planetById, stationInTransit 
 const POSE_KEY = 'freeFlight';
 /** A held stick writes the pose at most this often. */
 export const WRITE_EVERY_MS = 500;
+/** A commander's game writes a quiet coast back at least this often. */
+export const CHECKPOINT_MS = 60_000;
 /** The station list is re-read this often (it walks the atlas). */
 const STATIONS_EVERY_MS = 1000;
 
@@ -121,8 +124,20 @@ export function isPilotingHere(): boolean {
   return live !== null;
 }
 
+/** What a cached coast depends on: the record, and the stations it met
+ *  (each where it was at the record's time), so a station learned, lost or
+ *  moved restarts the coast from the record, as a fresh reader would. */
+function coastKey(rec: FreePose, stations: readonly FreeStation[]): string {
+  const where = stations.map((s) => {
+    const p = s.pointAt(rec.at);
+    return `${s.room}@${p.radiusKm.toFixed(6)},${p.angle.toFixed(9)}`;
+  });
+  return `${JSON.stringify(rec)}|${where.join(';')}`;
+}
+
 /** The resolved record, cached so a reader each frame coasts on from where
- *  it was rather than from the record's own time. */
+ *  it was rather than from the record's own time (always from a grid step
+ *  of coastGrid, so every reader meets a boundary at the same moment). */
 let coastCache: { key: string; pose: FreePose } | null = null;
 
 /**
@@ -138,11 +153,12 @@ export function resolvedFreePose(now = Date.now()): FreePose | null {
   if (readFlightRecord().status !== 'free-flight') return null;
   const rec = readFreePose();
   if (!rec) return null;
-  const key = JSON.stringify(rec);
+  const stations = freeStationsAround(rec.planetId, now);
+  const key = coastKey(rec, stations);
   const from = coastCache && coastCache.key === key && coastCache.pose.at <= now ? coastCache.pose : rec;
-  const pose = coastTo(from, now, freeStationsAround(rec.planetId, now)).pose;
-  coastCache = { key, pose };
-  return pose;
+  const r = coastTo(from, now, stations);
+  coastCache = { key, pose: r.grid };
+  return r.pose;
 }
 
 /**
@@ -208,7 +224,9 @@ export function settleFreeCoast(now = Date.now()): boolean {
   const rec = readFreePose();
   if (!rec || rec.at >= now) return false;
   const r = coastTo(rec, now, freeStationsAround(rec.planetId, now));
-  return r.changed ? writeFreePose(r.pose) : false;
+  // A quiet coast is checkpointed too, so no reader coasts far from it.
+  const stale = now - rec.at >= CHECKPOINT_MS;
+  return r.changed || stale ? writeFreePose(r.pose) : false;
 }
 
 // ── Other ships flown by hand ────────────────────────────────────────────────
@@ -243,17 +261,18 @@ export function remoteFreeShips(planetId: string, now = Date.now()): RemoteFreeS
       if (ship.retired || ship.roomId === room || ship.status !== 'free-flight' || !ship.free) continue;
       if (planetById(ship.free.planetId).id !== planet) continue;
       const rec = ship.free;
-      const key = JSON.stringify(rec);
       seen.add(ship.roomId);
       ships.push({
         roomId: ship.roomId,
         name: ship.name,
         at: (ms) => {
+          const stations = freeStationsAround(rec.planetId, ms);
+          const k = coastKey(rec, stations);
           const known = remoteCoasts.get(ship.roomId);
-          const from = known && known.key === key && known.pose.at <= ms ? known.pose : rec;
-          const pose = coastTo(from, ms, freeStationsAround(rec.planetId, ms)).pose;
-          remoteCoasts.set(ship.roomId, { key, pose });
-          return pose;
+          const from = known && known.key === k && known.pose.at <= ms ? known.pose : rec;
+          const r = coastTo(from, ms, stations);
+          remoteCoasts.set(ship.roomId, { key: k, pose: r.grid });
+          return r.pose;
         },
       });
     }

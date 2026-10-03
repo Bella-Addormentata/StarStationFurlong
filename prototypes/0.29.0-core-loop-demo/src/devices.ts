@@ -2432,7 +2432,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let freeNote: { text: string; until: number } | null = null;
   let freeKey = '';
   const flashFree = (text: string): void => {
-    freeNote = { text, until: Date.now() + 8_000 };
+    const note = { text, until: Date.now() + 8_000 };
+    freeNote = note;
+    // Nothing else re-renders an idle helm, so the note clears itself.
+    setTimeout(() => {
+      if (freeNote !== note) return;
+      freeNote = null;
+      if (panel) render();
+    }, 8_050);
   };
   /** Let go of the stick (keys and pose): the ship coasts on. */
   const letGo = (): void => {

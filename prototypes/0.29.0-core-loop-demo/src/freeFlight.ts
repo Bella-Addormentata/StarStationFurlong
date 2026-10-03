@@ -27,7 +27,8 @@
  *   - DOCKING zone (DOCK_ZONE_KM): a crawl (DOCK_MAX_KMS), and AUTO-DOCK;
  *   - HULL bubble (HULL_KM): the ship stops dead at its edge, no damage.
  * A ship that coasts into a zone is slowed to its cap at the boundary, the
- * same way on every client (coastTo samples the coast in short steps).
+ * same way on every client (coastGrid steps the coast on a grid that never
+ * steps past a boundary).
  *
  * Velocities are km per ORBITAL second (orbits.ts runs the clock 60× real
  * time), so a ship and the stations around it move on one clock.
@@ -73,9 +74,9 @@ export const UNDOCK_OFFSET_KM = 0.3;
 /** coastTo's shortest step (real ms); far from every boundary it steps
  *  further, never past one (coastStep). */
 const COAST_STEP_MS = 100;
-/** A safety net: past this many steps the rest is one jump (a boundary is
- *  then always far off, since steps only stay short near one). */
-const COAST_MAX_STEPS = 100_000;
+/** A safety net on one coast's steps (each costs a pass over the
+ *  stations); see coastGrid. */
+const COAST_MAX_STEPS = 5_000;
 
 // ── Records ──────────────────────────────────────────────────────────────────
 
@@ -399,58 +400,70 @@ export function applyZones(pose: FreePose, stations: readonly FreeStation[]): { 
 const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
 
 /**
- * How far (real ms) a coast from `p` may step without passing a zone
- * boundary: half the time the boundary could at the soonest be met, never
- * under COAST_STEP_MS. In a station's frame the ship moves in a straight
- * line at its own speed; in open space the gap to the nearest approach zone
- * closes at most as fast as the ship and the fastest station move.
+ * How far (real ms, whole COAST_STEP_MS) a coast from `p` may step without
+ * passing a zone boundary: half the time the soonest one could be met, or
+ * Infinity when nothing can be met. In a station's frame the ship moves in
+ * a straight line at its own speed. In open space each station's gap to its
+ * approach zone closes no faster than their relative speed now plus both
+ * bodies' turning (v²/r) since, which bounds the cost of a long quiet coast
+ * by how near it comes to a station, not by how long it is.
  */
-function coastStep(p: FreePose, ms: number, stations: readonly FreeStation[]): number {
-  const rest = ms - p.at;
+function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
   // Parked: no zone takes it up, so nothing to catch on the way.
-  if (p.parked || rest <= COAST_STEP_MS) return rest;
+  if (p.parked) return Infinity;
   if (p.near) {
     const speed = speedOf(p);
-    if (speed === 0) return rest;
+    if (speed === 0) return Infinity;
     const d = Math.hypot(p.near.along, p.near.radial);
     const gap = Math.min(...[HULL_KM, DOCK_ZONE_KM, APPROACH_ZONE_KM * LEAVE_MARGIN].map((b) => Math.abs(d - b)));
-    return onGrid((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S, rest);
+    return onGrid((0.5 * gap / speed) * REAL_MS_PER_ORBITAL_S);
   }
-  const nearest = nearestStation(p, stations);
-  if (!nearest) return rest;
-  const gap = nearest.distanceKm - APPROACH_ZONE_KM;
-  if (gap <= 0) return Math.min(rest, COAST_STEP_MS);
-  // Speeds in km per real ms, from where each is a short step later.
-  const here: OrbitPoint = { radiusKm: p.radiusKm, angle: p.angle };
+  if (stations.length === 0) return Infinity;
   const probe = p.at + COAST_STEP_MS;
-  const ahead = propagate(p, probe, []);
-  const moved = (a: OrbitPoint, b: OrbitPoint) => { const o = offsetFrom(a, b); return Math.hypot(o.along, o.radial); };
-  let fastest = 0;
-  for (const st of stations) fastest = Math.max(fastest, moved(st.pointAt(p.at), st.pointAt(probe)));
-  const closing = (moved(here, ahead) + fastest) / COAST_STEP_MS;
-  if (closing <= 0) return rest;
-  return onGrid((0.5 * gap) / closing, rest);
+  const ship0 = toPlanetFrame({ radiusKm: p.radiusKm, angle: p.angle });
+  const ship1 = toPlanetFrame(propagate(p, probe, []));
+  const shipV = Math.hypot(ship1.x - ship0.x, ship1.z - ship0.z) / COAST_STEP_MS;
+  let best = Infinity;
+  for (const st of stations) {
+    const a = st.pointAt(p.at);
+    const s0 = toPlanetFrame(a);
+    const s1 = toPlanetFrame(st.pointAt(probe));
+    const gap = Math.hypot(s0.x - ship0.x, s0.z - ship0.z) - APPROACH_ZONE_KM;
+    if (gap <= 0) return COAST_STEP_MS;
+    const stV = Math.hypot(s1.x - s0.x, s1.z - s0.z) / COAST_STEP_MS;
+    // Relative speed now (km per real ms), and a bound on how fast it grows.
+    const v = Math.hypot((s1.x - s0.x) - (ship1.x - ship0.x), (s1.z - s0.z) - (ship1.z - ship0.z)) / COAST_STEP_MS;
+    const acc = 1.5 * (shipV ** 2 / Math.max(1, p.radiusKm) + stV ** 2 / Math.max(1, a.radiusKm));
+    // Soonest t with v·t + acc·t²/2 = gap/2.
+    const t = acc > 0 ? (Math.sqrt(v * v + acc * gap) - v) / acc : v > 0 ? gap / (2 * v) : Infinity;
+    best = Math.min(best, t);
+  }
+  return onGrid(best);
 }
 
-/** A step cut to whole COAST_STEP_MS (at least one, at most `rest`), so a
- *  boundary is met at the same moment however a coast is sampled. */
-function onGrid(step: number, rest: number): number {
-  return Math.min(rest, Math.max(1, Math.floor(step / COAST_STEP_MS)) * COAST_STEP_MS);
+/** A step cut to whole COAST_STEP_MS (at least one), so a boundary is met
+ *  at the same moment however a coast is sampled. */
+function onGrid(step: number): number {
+  if (!Number.isFinite(step)) return Infinity;
+  return Math.max(1, Math.floor(step / COAST_STEP_MS)) * COAST_STEP_MS;
 }
 
 /**
- * Coast a pose to `ms` with the zone rules applied on the way: the coast is
- * stepped no further than a zone boundary could be reached (coastStep), so
- * a ship crossing a zone's edge is slowed there however long the coast, the
- * same on every client. `changed` when any rule acted.
+ * Coast a pose with the zone rules applied, in whole steps from its own
+ * time (coastStep), up to the last step that ends by `ms`. Every reader of
+ * the same pose steps on the same grid, so a boundary acts at the same
+ * moment and place for all of them, however often they sample. The result
+ * is a pose to coast on from (callers cache it); `changed` when any rule
+ * acted. At most COAST_MAX_STEPS steps: a pose so stale stops short (its
+ * commander's game checkpoints it, so that only happens to a lost record).
  */
-export function coastTo(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
+export function coastGrid(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean } {
   let p = pose;
   let changed = false;
-  let steps = 0;
-  while (p.at < ms) {
-    const next = steps < COAST_MAX_STEPS ? Math.min(ms, p.at + coastStep(p, ms, stations)) : ms;
-    steps++;
+  for (let steps = 0; steps < COAST_MAX_STEPS; steps++) {
+    const step = coastStep(p, stations);
+    const next = Number.isFinite(step) ? p.at + step : Infinity;
+    if (next > ms) break;
     const moved = propagate(p, next, stations);
     const zoned = applyZones(moved, stations);
     // A frame the propagation dropped (its station is gone) is a change too.
@@ -458,6 +471,16 @@ export function coastTo(pose: FreePose, ms: number, stations: readonly FreeStati
     p = zoned.pose;
   }
   return { pose: p, changed };
+}
+
+/**
+ * Where a coasting pose is at `ms`: coastGrid's last step, then the part of
+ * a step left over (no boundary lies in it). `grid` is the pose to coast on
+ * from next time; `pose` is only for drawing or flying from now.
+ */
+export function coastTo(pose: FreePose, ms: number, stations: readonly FreeStation[]): { pose: FreePose; changed: boolean; grid: FreePose } {
+  const g = coastGrid(pose, ms, stations);
+  return { pose: propagate(g.pose, ms, stations), changed: g.changed, grid: g.pose };
 }
 
 // ── The stick ────────────────────────────────────────────────────────────────

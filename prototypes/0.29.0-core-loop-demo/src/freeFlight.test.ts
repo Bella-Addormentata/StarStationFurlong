@@ -18,6 +18,7 @@ import {
   applyZones,
   bodyOffset,
   cleanPose,
+  coastGrid,
   coastTo,
   isFreePose,
   nearestStation,
@@ -172,10 +173,28 @@ describe('speed zones', () => {
     const start = poseOff(st, T0, -200, 3, { vAlong: 1 });
     const once = coastTo(start, T0 + 10_000, [st]).pose;
     let stepped = start;
-    for (let ms = T0 + 100; ms <= T0 + 10_000; ms += 100) stepped = coastTo(stepped, ms, [st]).pose;
+    // Frame by frame at an odd rate, coasting on from each grid step as the
+    // readers cache it.
+    let shown = start;
+    for (let ms = T0 + 17; ms <= T0 + 10_000; ms += 17) {
+      const r = coastTo(stepped, ms, [st]);
+      stepped = r.grid;
+      shown = r.pose;
+    }
+    shown = coastTo(stepped, T0 + 10_000, [st]).pose;
     expect(once.near).toBeDefined();
-    expect(stepped.near?.along).toBeCloseTo(once.near!.along, 6);
-    expect(stepped.near?.radial).toBeCloseTo(once.near!.radial, 6);
+    expect(shown.near?.along).toBeCloseTo(once.near!.along, 6);
+    expect(shown.near?.radial).toBeCloseTo(once.near!.radial, 6);
+  });
+
+  it('a long quiet coast far from every station takes few steps', () => {
+    const st = stationAt(0);
+    const far = poseOff(stationAt(5), T0, 0, 0);
+    const t = performance.now();
+    const r = coastGrid(far, T0 + 6 * 3_600_000, [st]);
+    expect(performance.now() - t).toBeLessThan(200);
+    expect(r.changed).toBe(false);
+    expect(T0 + 6 * 3_600_000 - r.pose.at).toBeLessThan(60_000);
   });
 });
 

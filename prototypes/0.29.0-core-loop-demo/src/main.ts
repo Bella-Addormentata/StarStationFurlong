@@ -1458,7 +1458,10 @@ function planetShipStatus(): ShipStatusInput | null {
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
-  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
+  // 🕹️ Flown by hand: the pose says which planet it flies at (the station
+  // it left may have moved on, or be gone).
+  const free = rec.status === "free-flight" ? readFreePose() : null;
+  const planetId = free?.planetId ?? from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const roomName = yjsSync?.doc.getMap("roomInfo").get("name");
   // 🚏📋 A ferry on its route goes by its board name, so a newer summary can
@@ -1472,10 +1475,7 @@ function planetShipStatus(): ShipStatusInput | null {
   if (rec.departedAt !== undefined) out.departedAt = rec.departedAt;
   if (rec.etaAt !== undefined) out.etaAt = rec.etaAt;
   // 🕹️ Flown by hand: where it is, as last written (readers coast it on).
-  if (rec.status === "free-flight") {
-    const free = readFreePose();
-    if (free) out.free = free;
-  }
+  if (free) out.free = free;
   // 🚏📋 A9 item 7: a route ferry's gate, next stop, departure and status,
   // for the all-gates boards of other rooms ("as of" this summary's time).
   // 🏁 Just routeIdle for a ship with no running route. Old clients drop
