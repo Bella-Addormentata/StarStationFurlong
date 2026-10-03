@@ -10,10 +10,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
+import * as Y from 'yjs';
 import type { PropAnimHandle } from './devices';
 import { buildItemGroup } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
-import { DEFAULT_STATION_RECORD, listStations, setStationRoomSource } from './stations';
+import { bindShipDoc, writeFuelLevel } from './shipDoc';
+import { TRIM_FUEL, bindStationKeepingDoc } from './stationKeeping';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, registerStation, setStationRoomSource } from './stations';
 
 const HELM = 'helm-1';
 /** The fighter grip's red pickle button and the trim stick's amber knob. */
@@ -54,15 +57,35 @@ function buildHelm(): { group: THREE.Group; anim: PropAnimHandle; dispose: () =>
   return { group, anim, dispose: () => disposers.forEach((d) => d()) };
 }
 
-/** Is the part whose material is `color` drawn: it and everything it hangs on visible? */
-function shown(group: THREE.Group, color: number): boolean {
+/** The one part whose material is `color`. */
+function partIn(group: THREE.Group, color: number): THREE.Object3D {
   const parts: THREE.Object3D[] = [];
   group.traverse((obj) => {
     if (obj instanceof THREE.Mesh && (obj.material as THREE.MeshStandardMaterial).color?.getHex() === color) parts.push(obj);
   });
   if (parts.length !== 1) throw new Error(`${parts.length} parts in ${color.toString(16)}`);
-  for (let o: THREE.Object3D | null = parts[0]; o; o = o.parent) if (!o.visible) return false;
+  return parts[0];
+}
+
+/** Is the part whose material is `color` drawn: it and everything it hangs on visible? */
+function shown(group: THREE.Group, color: number): boolean {
+  for (let o: THREE.Object3D | null = partIn(group, color); o; o = o.parent) if (!o.visible) return false;
   return true;
+}
+
+/** Station records saved on this install live in localStorage. */
+function stubSavedRecords(): void {
+  const store = new Map<string, string>();
+  vi.stubGlobal('localStorage', {
+    getItem: (k: string) => store.get(k) ?? null,
+    setItem: (k: string, v: string) => { store.set(k, v); },
+    removeItem: (k: string) => { store.delete(k); },
+  });
+}
+
+/** Save lone room `roomId` as a station of this install's, in slot 1. */
+function saveAsStation(roomId: string): void {
+  expect(registerStation({ id: 'yard', name: 'YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 1, welcomeRoomId: roomId })).toBe(true);
 }
 
 beforeEach(() => {
@@ -99,6 +122,46 @@ describe('the helm console\'s sticks', () => {
       anim.update(0.016);
       expect(shown(group, FIGHTER)).toBe(true);
       expect(shown(group, TRIM_STICK)).toBe(false);
+    } finally {
+      dispose();
+    }
+  });
+
+  it('a lone room saved as a station shows the trim stick within a second, with no other news', () => {
+    // Copilot's review of #173: saving a station record says nothing, so the
+    // console kept the fighter grip while the dashboard opened the station helm.
+    stubSavedRecords();
+    setStationRoomSource(() => 'room-yard');
+    const { group, anim, dispose } = buildHelm();
+    try {
+      expect(shown(group, FIGHTER)).toBe(true);
+      saveAsStation('room-yard');
+      for (let i = 0; i < 4; i++) anim.update(0.25);
+      expect(shown(group, FIGHTER)).toBe(false);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+    } finally {
+      dispose();
+    }
+  });
+
+  it('a burn in a lone room saved as a station shows the trim stick and leans it at once', () => {
+    // Copilot's review of #173: a burn read only the station again, so the
+    // stick stayed hidden and still.
+    stubSavedRecords();
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    writeFuelLevel(50, 100);
+    setStationRoomSource(() => 'room-yard');
+    const { group, anim, dispose } = buildHelm();
+    try {
+      saveAsStation('room-yard');
+      const at = Date.now();
+      doc.getMap('stationKeeping').set(`burn:${doc.clientID}:${at}`, { planetId: DEFAULT_PLANET_ID, slot: 1, dir: 'raise', at, fuel: TRIM_FUEL, cap: 100 });
+      expect(shown(group, TRIM_STICK)).toBe(true);
+      anim.update(0.1);
+      // RAISE pulls the knob back toward the pilot.
+      expect(partIn(group, TRIM_STICK).parent!.rotation.x).toBeLessThan(-0.1);
     } finally {
       dispose();
     }
