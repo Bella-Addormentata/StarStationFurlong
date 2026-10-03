@@ -111,6 +111,7 @@ import {
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
+import { dockLockedByMove } from "./stationMove";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2731,6 +2732,16 @@ export class DoorDockingPortSystem {
     const roomId = this.roomNow();
     const port = classifyDockPort(readDoor(doorId));
     if (port.kind !== "docked") return false;
+    // 🚚 A tug under way holds its station by this dock, and a station
+    // between planets carries every ship docked to it: neither end lets go
+    // until it arrives.
+    if (dockLockedByMove([roomId, port.roomId], Date.now())) {
+      this.setDockOp(doorId, {
+        note: "This station is moving between planets — the dock holds until it arrives.",
+        tone: "bad",
+      });
+      return false;
+    }
     if (!this.canConstruct(doorId)) {
       this.setDockOp(doorId, {
         note: "Only this door's owner (or a builder here) can undock it.",
@@ -2805,6 +2816,14 @@ export class DoorDockingPortSystem {
     if (!flightGate.ok) {
       this.setDockOp(doorId, {
         note: `This module is ${flightGate.status.toUpperCase()} — it docks when it arrives.`,
+        tone: "bad",
+      });
+      return false;
+    }
+    // 🚚 No ship joins (or rejoins) a station between planets.
+    if (dockLockedByMove([roomId, port.roomId], Date.now())) {
+      this.setDockOp(doorId, {
+        note: "That station is moving between planets — dock when it arrives.",
         tone: "bad",
       });
       return false;
@@ -3641,6 +3660,21 @@ export class DoorDockingPortSystem {
           `[docking] refused ACCEPTED pairing on ${doorId} — ship is ${flightGate.status} (SH3 gate)`,
         );
         return; // leave pairingPending alone; the request is not consumed
+      }
+      // 🚚 Nor while either end's station is between planets (stationMove.ts):
+      // this room, and the room the request comes from.
+      // A peer's address that does not parse refuses the pairing (left
+      // pending, like the other refusals here), never throws out of ACCEPT.
+      let farRoom = '';
+      try {
+        farRoom = state.connectedRoomAddress ? roomIdFromSeed(state.connectedRoomAddress) : '';
+      } catch (err) {
+        console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — unreadable address`, err);
+        return;
+      }
+      if (dockLockedByMove([this.roomNow(), farRoom], Date.now())) {
+        console.warn(`[docking] refused ACCEPTED pairing on ${doorId} — station in transit`);
+        return;
       }
     }
 

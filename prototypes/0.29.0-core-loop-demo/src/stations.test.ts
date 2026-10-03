@@ -14,6 +14,8 @@ import {
   dockedStationFor,
   listStations,
   planetForRoom,
+  roomAdriftPlace,
+  adriftPlace,
   readStationRecords,
   registerStation,
   removeStation,
@@ -262,6 +264,14 @@ describe('listStations', () => {
     expect(registerStation({ ...base, id: 'yard', welcomeRoomId: 'yard-b' })).toBe(true);
   });
 
+  it('never takes an open-orbit place as a station id', () => {
+    const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2, welcomeRoomId: 'far-room' };
+    expect(registerStation({ ...base, id: 'adrift:planet-aris:3' })).toBe(false);
+    // One saved by hand before the prefix was reserved reads as invalid.
+    store.set('ssf-stations', JSON.stringify([{ ...base, id: 'adrift:planet-aris:3' }, { ...base, id: 'ok', orbitSlot: 4 }]));
+    expect(readStationRecords().map((r) => r.id)).toEqual(['ok']);
+  });
+
   it('bumps a record whose orbit slot is already taken to the next free one', () => {
     const clash: StationRecord = {
       id: 'l4', name: 'L4 YARD', planetId: DEFAULT_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'yard-a',
@@ -303,6 +313,13 @@ describe('stationForRoom / planetForRoom', () => {
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
       setRoomStationResolver(() => { throw new Error('no dock'); });
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      // A ship adrift is at its open orbit's planet, not its stand-in's.
+      setRoomStationResolver(() => 'adrift:planet-aris:3');
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
+      expect(roomAdriftPlace('ship')).toEqual({ planetId: 'planet-aris', orbitSlot: 3 });
+      // An unknown planet reads as the default one, as everywhere else.
+      expect(adriftPlace('adrift:planet-nowhere:3')).toEqual({ planetId: DEFAULT_PLANET_ID, orbitSlot: 3 });
     } finally {
       setRoomStationResolver(null);
       setStationRoomSource(() => '');

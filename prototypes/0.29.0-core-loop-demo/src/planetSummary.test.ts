@@ -5,7 +5,7 @@
  * sharing one room doc, the trim resolver, station-id aliases for flight
  * records, and the ship / solar-system reads.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS, orbitForSlot, setStationTrimResolver, stationOrbit } from './orbits';
 import {
@@ -16,6 +16,7 @@ import {
   cleanShipSummary,
   cleanStationSummary,
   foldOwnStation,
+  installKnownPlacesResolver,
   installTrimResolver,
   learnedRecord,
   mergeStation,
@@ -27,13 +28,17 @@ import {
   shipsAroundPlanet,
   subscribePlanetSummary,
   summaryForStation,
+  summaryPlanet,
   systemStationNames,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
 import type { OrbitTrim } from './stationKeeping';
-import { DEFAULT_PLANET_ID, listStations, readStationRecords, registerStation } from './stations';
-import type { StationRecord } from './stations';
+import {
+  DEFAULT_PLANET_ID, knownSlotsAround, listStations, readStationRecords, registerStation, setKnownPlacesResolver, setStationMoveResolver,
+} from './stations';
+import type { StationMove, StationRecord } from './stations';
+import { freeSlotAround, rememberMove } from './stationMove';
 
 // Each "install" is its own localStorage.
 let store = new Map<string, string>();
@@ -120,6 +125,22 @@ describe('guards', () => {
     expect(mergeStation(first, { ...first, trim: trim({ planetId: ARIS, slot: 3, at: T0 + 40 }) })).toBeNull();
   });
 
+  it('keeps the trim a moved station flies at its new planet', () => {
+    // First stamped around SOV; since moved to ARIS. Its own republish
+    // carries the record unchanged with the trim of the orbit it flies now.
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const first = summary({ orbitSlot: 2, move });
+    const flown = { ...first, trim: trim({ planetId: ARIS, slot: 5, at: T0 + 2000 }) };
+    expect(mergeStation(first, flown, T0 + 3000)?.trim).toMatchObject({ planetId: ARIS, slot: 5 });
+    // Before it arrived, a trim at ARIS is no trim of the station's.
+    expect(mergeStation(first, flown, T0 + 500)).toBeNull();
+    // …nor, once there, one of the planet it left.
+    expect(mergeStation(first, { ...first, trim: trim({ slot: 3, at: T0 + 2000 }) }, T0 + 3000)).toBeNull();
+  });
+
   it("keeps the standing record's trim over a newer one for another slot", () => {
     const first = summary({ orbitSlot: 2, trim: trim({ slot: 2, at: T0 }) });
     const late = summary({ orbitSlot: 1, updatedAt: T0 + 50, trim: trim({ slot: 1, at: T0 + 40 }) });
@@ -164,9 +185,11 @@ describe('guards', () => {
   });
 
   it('carries unknown record fields in ext, bounded and without known keys', () => {
-    const move = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
-    const s = cleanStationSummary({ ...summary(), ext: { move, id: 'evil', orbitSlot: 9 } }, T0);
-    expect(s?.ext).toEqual({ move });
+    // `move` is a typed field now (stationMove.ts): a newer build's field
+    // this one does not know rides ext instead.
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    const s = cleanStationSummary({ ...summary(), ext: { tow, move: tow, id: 'evil', orbitSlot: 9 } }, T0);
+    expect(s?.ext).toEqual({ tow });
     expect(cleanStationSummary({ ...summary(), ext: { big: 'x'.repeat(2000) } }, T0)?.ext).toBeUndefined();
     expect(cleanStationSummary({ ...summary(), ext: [1, 2] }, T0)?.ext).toBeUndefined();
     // An oversized value is dropped without walking all of it.
@@ -179,18 +202,18 @@ describe('guards', () => {
   });
 
   it("saves a learned station's extra fields, and does not rewrite it when they are unchanged", () => {
-    const move = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
-    const s = summary({ ext: { move } });
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    const s = summary({ ext: { tow } });
     expect(registerLearnedStations(SOV, [s])).toBe(1);
-    expect((readStationRecords().find((r) => r.welcomeRoomId === 'room-hab') as unknown as { move?: unknown }).move).toEqual(move);
+    expect((readStationRecords().find((r) => r.welcomeRoomId === 'room-hab') as unknown as { tow?: unknown }).tow).toEqual(tow);
     expect(registerLearnedStations(SOV, [s])).toBe(0);
   });
 
   it("drops a learned station's extra field once the summary no longer carries it", () => {
-    const move = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
-    registerLearnedStations(SOV, [summary({ ext: { move } })]);
+    const tow = { toPlanetId: ARIS, arriveAt: T0 + 1000 };
+    registerLearnedStations(SOV, [summary({ ext: { tow } })]);
     expect(registerLearnedStations(SOV, [summary()])).toBe(1);
-    expect(readStationRecords().find((r) => r.welcomeRoomId === 'room-hab')).not.toHaveProperty('move');
+    expect(readStationRecords().find((r) => r.welcomeRoomId === 'room-hab')).not.toHaveProperty('tow');
   });
 
   it('leaves out a berth a station record could not hold, keeping the station', () => {
@@ -376,6 +399,75 @@ describe('learned stations', () => {
     expect(readStationRecords().map((r) => r.id)).toEqual(['mine']);
   });
 
+  it('places a moved station by its move, wherever its record was first stamped', () => {
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const moved = summary({ move });
+    expect(summaryPlanet(moved, T0 + 1)).toBe(SOV);
+    expect(summaryPlanet(moved, T0 + 1000)).toBe(ARIS);
+    expect(summaryPlanet(summary({ move: { ...move, departAt: T0 + 1001, arriveAt: T0 + 1002, settles: move } }), T0)).toBe(ARIS);
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'room-hab' ? move : null));
+    try {
+      // Around its new planet it registers, and a prune there keeps it.
+      expect(registerLearnedStations(ARIS, [moved])).toBe(1);
+      expect(registerLearnedStations(ARIS, [moved], { prune: true })).toBe(0);
+      expect(listStations().find((st) => st.welcomeRoomId === 'room-hab')?.planetId).toBe(ARIS);
+      // Around its old one it does not.
+      expect(registerLearnedStations(SOV, [moved], { prune: true })).toBe(1);
+      expect(readStationRecords()).toEqual([]);
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  it('register in a slot a move here is bound for, where their own install put them', () => {
+    expect(registerStation(record({ id: 'mine', welcomeRoomId: 'room-mine', orbitSlot: 3 }))).toBe(true);
+    const move: StationMove = {
+      stationId: 'mine', welcomeRoomId: 'room-mine', fromPlanetId: SOV, fromSlot: 3, toPlanetId: ARIS, toSlot: 7,
+      departAt: T0 + 1000, arriveAt: T0 + 2000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    vi.useFakeTimers({ now: T0, toFake: ['Date'] });
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'room-mine' ? move : null));
+    try {
+      // Saved here, a record for the booked slot is refused…
+      expect(registerStation(record({ id: 'squat', welcomeRoomId: 'room-squat', planetId: ARIS, orbitSlot: 7 }))).toBe(false);
+      // …but a learned one stands where its own install put it.
+      expect(registerLearnedStations(ARIS, [summary({ planetId: ARIS, orbitSlot: 7 })])).toBe(1);
+      expect(listStations().find((s) => s.welcomeRoomId === 'room-hab')).toMatchObject({ planetId: ARIS, orbitSlot: 7 });
+    } finally {
+      setStationMoveResolver(null);
+      vi.useRealTimers();
+    }
+  });
+
+  it('tell slot picks about the stations heard of around other planets, never listing them', () => {
+    const move: StationMove = {
+      stationId: 'c', welcomeRoomId: 'room-c', fromPlanetId: SOV, fromSlot: 9, toPlanetId: ARIS, toSlot: 2,
+      departAt: T0 + 1000, arriveAt: T0 + 2000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const storeOf = (...stations: StationSummary[]) =>
+      JSON.stringify({ stations: Object.fromEntries(stations.map((st) => [st.welcomeRoomId, st])), ships: {} });
+    store.set('ssf-planet-summary', storeOf(
+      summary({ welcomeRoomId: 'room-a', planetId: ARIS, orbitSlot: 0 }),
+      summary({ welcomeRoomId: 'room-b', planetId: ARIS, orbitSlot: 1 }),
+      summary({ welcomeRoomId: 'room-c', planetId: SOV, orbitSlot: 9, move }),
+    ));
+    installKnownPlacesResolver();
+    try {
+      expect(knownSlotsAround(ARIS, [], T0)).toEqual({ taken: new Set([0, 1]), reserved: new Set([2]) });
+      const listed = listStations(undefined, undefined, T0);
+      expect(listed.some((st) => st.planetId === ARIS)).toBe(false);
+      expect(freeSlotAround(ARIS, listed, undefined, T0)).toBe(3);
+      // A change to the store is read at once.
+      store.set('ssf-planet-summary', storeOf(summary({ welcomeRoomId: 'room-a', planetId: ARIS, orbitSlot: 0 })));
+      expect(freeSlotAround(ARIS, listed, undefined, T0)).toBe(1);
+    } finally {
+      setKnownPlacesResolver(null);
+    }
+  });
+
   it('carry new record fields through to the record they register', () => {
     const move = { toPlanetId: ARIS };
     expect(learnedRecord(summary({ ext: { move } }))).toMatchObject({ move, id: 'shared:room-hab', orbitSlot: 2 });
@@ -427,6 +519,30 @@ describe('sharing through the room doc', () => {
     local = null;
     publishPlanetSummary(Date.now() + 2000);
     expect(seen()).toBeUndefined();
+  });
+
+  it('publishes a remembered move of a station this game is not aboard', () => {
+    registerStation(record());
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install('hab'));
+    expect(readStore().stations['room-hab']?.move).toBeUndefined();
+    // Now aboard a tug elsewhere, which cancels that station's tow.
+    unbindPlanetSummaryForTest();
+    bindPlanetSummaryDoc(docA, install(null));
+    const now = Date.now();
+    const tow: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: now, arriveAt: now + 86_400_000, mode: 'tug', tugRoomId: 'tug', fuel: 10, fuelDrawn: 10, bookedAt: now,
+    };
+    const cancel: StationMove = {
+      ...tow, toPlanetId: SOV, toSlot: 2, departAt: now + 1, arriveAt: now + 2, mode: 'thrusters', tugRoomId: undefined,
+      fuel: 0, fuelDrawn: 0, settles: tow,
+    };
+    expect(rememberMove(tow, now)).toBe(true);
+    expect(rememberMove(cancel, now)).toBe(true);
+    publishPlanetSummary(now + 10);
+    expect(readStore().stations['room-hab']?.move).toMatchObject({ settles: { mode: 'tug' }, toPlanetId: SOV });
+    expect((docA.getMap('stationSummaries').get('room-hab') as StationSummary).move?.settles).toBeDefined();
   });
 
   it('two installs that each saved one place fly the standing record\'s slot', () => {
@@ -738,6 +854,27 @@ describe('sharing through the room doc', () => {
     publishPlanetSummary(now);
     expect(map.has('room-near')).toBe(true);
     expect(readStore(now).stations['room-near']).toBeDefined();
+  });
+
+  it("keeps a station that moved to this planet through a flood from the one it left", () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    const now = Date.now();
+    const map = doc.getMap('stationSummaries');
+    // First stamped around ARIS, since moved here.
+    const move: StationMove = {
+      stationId: 'came', welcomeRoomId: 'room-came', fromPlanetId: ARIS, fromSlot: 3, toPlanetId: SOV, toSlot: 6,
+      departAt: now - 2 * 3_600_000, arriveAt: now - 3_600_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    map.set('room-came', summary({ welcomeRoomId: 'room-came', name: 'CAME', planetId: ARIS, orbitSlot: 3, updatedAt: now - 3 * 3_600_000, move }));
+    for (let i = 0; i < 70; i++) {
+      const id = `room-${String(i).padStart(3, '0')}`;
+      map.set(id, summary({ welcomeRoomId: id, name: `S${i}`, planetId: ARIS, orbitSlot: 3, updatedAt: now + 60 * 60 * 1000 }));
+    }
+    bindPlanetSummaryDoc(doc, install('hab'));
+    publishPlanetSummary(now);
+    expect(readStore(now).stations['room-came']).toBeDefined();
+    expect(map.has('room-came')).toBe(true);
   });
 
   it('never publishes a seed', () => {

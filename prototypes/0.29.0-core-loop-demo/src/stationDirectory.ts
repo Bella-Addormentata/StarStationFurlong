@@ -19,6 +19,8 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
+import { adriftPlace, latestMoveOf, stationInTransit } from './stations';
+import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -41,6 +43,12 @@ export interface StationDestination {
   /** Writer-clock travel time of a hop to this station, ms. */
   travelMs: number;
   berth?: StationBerth;
+  /** A move to another planet, scheduled or under way (stations.ts): while
+   *  it is in transit the station is no ship's destination. */
+  move?: StationMove;
+  /** Its latest move even once finished: arrival checks it against the
+   *  flight, so a ship never docks at a station that moved away meanwhile. */
+  lastMove?: StationMove;
 }
 
 /** The seam: whatever knows the stations. */
@@ -130,6 +138,17 @@ export function findStation(id: string): StationDestination {
   return list.find((s) => s.id === id) ?? list[0];
 }
 
+// Adrift places live in stations.ts (planetForRoom reads them too).
+export { ADRIFT_PREFIX, adriftAt, adriftPlace } from './stations';
+
+/** The planet a ship's location is at: its station's, or an adrift
+ *  location's own; null when unlisted. */
+export function locationPlanet(id: string): string | null {
+  const adrift = adriftPlace(id);
+  if (adrift) return adrift.planetId;
+  return isKnownStation(id) ? findStation(id).planetId : null;
+}
+
 /** Is `id` a station the directory knows (no home fallback)? */
 export function isKnownStation(id: string): boolean {
   return listStations().some((s) => s.id === id);
@@ -140,13 +159,14 @@ export function isKnownStation(id: string): boolean {
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
   // Both ends must be listed: findStation would quietly read an unknown
   // origin as home.
-  if (fromId === toId || !isKnownStation(fromId) || !isKnownStation(toId)) return null;
+  if (fromId === toId || !(isKnownStation(fromId) || adriftPlace(fromId)) || !isKnownStation(toId)) return null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
     return wholeMs(plan);
   }
   const dest = findStation(toId);
+  if (locationPlanet(fromId) !== dest.planetId) return null;
   return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
 }
 
@@ -169,11 +189,15 @@ export function stationHere(): string | null {
 /** The stations a ship at `fromId` may fly to: every OTHER station orbiting
  *  the same planet (and never the one its room belongs to right now). */
 export function destinationsFrom(fromId: string): StationDestination[] {
-  const from = findStation(fromId);
+  const adrift = adriftPlace(fromId);
+  const from = adrift ? { id: fromId, planetId: adrift.planetId } : findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
+  // A station between planets (stationMove.ts) is in no planet's orbits.
+  const now = Date.now();
   return listStations().filter(
-    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own,
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own
+      && !stationInTransit(s, now),
   );
 }
 
@@ -187,6 +211,8 @@ export interface StationRecordLike {
   orbitSlot: number;
   welcomeRoomId: string;
   berthDoor?: string;
+  /** A move to another planet, scheduled or under way (stations.ts). */
+  move?: StationMove;
 }
 
 /** Rough per-destination figures for a station record (what a hop from the
@@ -209,8 +235,16 @@ export function planRecordHop(
   nowMs: number,
 ): HopPlan | null {
   if (!from || !to) return null;
+  // No hop to or from a station between planets (stationMove.ts).
+  if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
+  // Nor one with a move under way (or coming) while either end must hold
+  // still: the source until the ship leaves, the destination until it
+  // arrives. A move that starts at the source after the burn is no concern of
+  // this hop; one that lands before it would leave the plan on the old orbit.
+  const movesWithin = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs;
+  if (movesWithin(from.move, t.departAt) || movesWithin(to.move, t.arriveAt)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,
@@ -237,7 +271,10 @@ export function destinationsFromRecords(
       planetId: r.planetId,
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
+      ...(r.move ? { move: r.move } : {}),
     };
+    const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
+    if (last) out.lastMove = last;
     // A public berth needs its door: DOCK only asks the far room (and so
     // only proves a port is there) when it knows the far door. Without one
     // the ship's own berth memory decides, or arrival reports no berth. A
@@ -268,8 +305,9 @@ export function directoryFromStationRecords(
     ...(portable ? { portable } : {}),
     plan: (fromId, toId, nowMs) => {
       const records = list();
+      const adrift = adriftPlace(fromId);
       return planRecordHop(
-        records.find((r) => r.id === fromId),
+        adrift ? { id: fromId, name: '', welcomeRoomId: '', ...adrift } : records.find((r) => r.id === fromId),
         records.find((r) => r.id === toId),
         nowMs,
       );

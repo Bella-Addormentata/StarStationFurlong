@@ -38,6 +38,7 @@ import {
   findDestination,
   flightArrived,
   flightProgress,
+  fuelDrawDeficit,
   readFlightRecord,
   readFuelLevel,
   subscribeShip,
@@ -45,7 +46,25 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { adriftAt, adriftPlace, destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
+import {
+  TUG_MIN_ENGINES,
+  describeMove,
+  describeTowRefusal,
+  formatLongSpan,
+  isMoveActive,
+  isTowing,
+  towHoldsDock,
+  otherPlanets,
+  planStationTow,
+  quoteTow,
+  readMoveFuelDrawn,
+  subscribeStationMove,
+  writeStationMove,
+} from './stationMove';
+import type { TowContext } from './stationMove';
+import { currentRoomId, listStations as listStationRecordsNow, planetById, stationInTransit } from './stations';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
@@ -184,6 +203,14 @@ import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
+
+/** 🚚 A flight's `destinationAt`: where the station orbits as the ship casts
+ *  off, as an open-orbit place; nothing for a station this install cannot
+ *  list. */
+function destinationAtOf(stationId: string): { destinationAt?: string } {
+  const st = listStationRecordsNow().find((r) => r.id === stationId);
+  return st ? { destinationAt: adriftAt(planetById(st.planetId).id, st.orbitSlot) } : {};
+}
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -1007,8 +1034,10 @@ let mapTableMap: SolarSystemMap | null = null;
  */
 export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
   let panel: HTMLDivElement | null = null;
-  // 🪐 Stations and trims learned while the table is open redraw it.
-  let unhearSummary: (() => void) | null = null;
+  // 🚚 While the table is open, stations follow what is learned meanwhile (a
+  // move from another player, a summary pull), and a move's "departs in …"
+  // text is re-read each minute.
+  let stopLive: (() => void) | null = null;
 
   return {
     mount(host: HTMLElement): void {
@@ -1069,14 +1098,17 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       }
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
-      unhearSummary?.();
-      unhearSummary = subscribePlanetSummary(() => mapTableMap?.refreshStations(undefined, holotableStation()));
       mapTableMap.show();
+      stopLive?.();
+      const refresh = () => mapTableMap?.refreshStations(undefined, holotableStation());
+      const offSummary = subscribePlanetSummary(refresh);
+      const offMove = subscribeStationMove(refresh);
+      const tick = window.setInterval(refresh, 60_000);
+      stopLive = () => { offSummary(); offMove(); window.clearInterval(tick); stopLive = null; };
     },
 
     unmount(): void {
-      unhearSummary?.();
-      unhearSummary = null;
+      stopLive?.();
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -2138,6 +2170,8 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
       ? `Arrived at ${outcome.stationName} — the DOCK did not go through (the berth taken or closed, no rights, no room to fit). Check the dock port's panel, and dock from it when that clears.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
+      : outcome.reason === 'in-transit'
+      ? `Arrived — but ${outcome.stationName} has left for another planet, so there is no berth in reach. Pick another destination.`
       : outcome.reason === 'unlisted-station'
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
         : outcome.reason === 'no-port'
@@ -2173,6 +2207,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let markers: Array<{ doorId: string; x: number; y: number }> = [];
   let pickerDestId: string | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let wasTowing = false;
   // Refuel confirm-arm — one click primes, second confirms. Cleared by any
   // record change (a peer refuel resets everyone's arm).
   let refuelArmed = false;
@@ -2206,9 +2241,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const progress = flightProgress(flight, now);
     // A station that dropped out of the directory is named as unlisted, never
     // passed off as home (findDestination's fallback).
-    const named = (id: string) => isKnownStation(id)
-      ? findDestination(id)
-      : { ...findDestination(id), id, name: 'an unlisted station' };
+    const named = (id: string) => {
+      if (isKnownStation(id)) return findDestination(id);
+      // Waiting in open orbit where a station left (shipArrival).
+      const adrift = adriftPlace(id);
+      return adrift
+        ? { ...findDestination(id), id, planetId: adrift.planetId, name: `open orbit around ${planetById(adrift.planetId).name}` }
+        : { ...findDestination(id), id, name: 'an unlisted station' };
+    };
     const location = named(shipLocationId(flight, hasLiveDock()));
     const destination = flight.destinationId ? named(flight.destinationId) : null;
     const choices = destinationsFrom(location.id);
@@ -2302,7 +2342,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           case 'insufficient-fuel': return `Insufficient fuel — this hop needs ${refusal.needed}, tanks hold ${refusal.have}.`;
           case 'already-here': return 'The ship is already here.';
           case 'other-planet': return 'That station orbits another planet — out of range.';
-          case 'no-transfer': return 'No transfer orbit from here to there (the two stations share an orbit).';
+          case 'no-transfer': return stationInTransit(listStationRecordsNow().find((st) => st.id === location.id) ?? {}, now)
+            ? 'This station is between planets — no ship can leave it until it arrives.'
+            : 'No transfer orbit from here to there (the two stations share an orbit).';
           case 'unlisted-location':
             return 'This station is not on your station list, so no hop from it can be planned. Dock at a listed station, or wait for this one\'s record to arrive.';
           case 'unknown-destination': return choices.length === 0
@@ -2310,7 +2352,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             : 'Unknown destination.';
         }
       })();
-      const btnEnabled = refusal.ok && pickerDest !== null;
+      // A tug towing a station holds on: it is the station's engine.
+      const towingNow = isTowing(currentRoomId(), now);
+      const btnEnabled = refusal.ok && pickerDest !== null && !towingNow;
       const btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
       const castOff = docked.length + enumerateTransientBerths().filter((id) => !docked.some((p) => p.doorId === id)).length;
       const castOffNote = castOff > 0
@@ -2328,7 +2372,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           </select>` : ''}
           <button id="helm-depart-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? 'rgba(0,230,118,0.18)' : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnLabel}</button>
           ${windowNote}
-          ${refuseCopy ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${refuseCopy}</div>` : ''}
+          ${refuseCopy || towingNow ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${towingNow ? 'Towing a station — the tug stays docked until it arrives.' : refuseCopy}</div>` : ''}
           ${castOffNote}
         </div>`;
     } else if (flight.status === 'undocking') {
@@ -2405,6 +2449,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         ${message}
       </div>` : ''}
       ${flightPanel}
+      ${flight.status === 'docked' ? renderTowPanel(engines, fuel, commander, now) : ''}
       ${docking && flight.status === 'docked' ? renderDockingComputer(ports) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
         SSF FLIGHT SYSTEMS v1 · docking + station-to-station flight
@@ -2435,6 +2480,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
       const nowFuel = clampFuelToCapacity(readFuelLevel(nowCapacity), nowCapacity);
       const nowFlight = readFlightRecord();
+      if (isTowing(currentRoomId(), Date.now())) return;
       const fromId = shipLocationId(nowFlight, hasLiveDock());
       const destId = pickerDestId ?? '';
       const nowHop = destId ? planHop(fromId, destId, Date.now()) : null;
@@ -2485,6 +2531,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         destinationId: dest.id,
         departedAt: nowHop.departAt,
         etaAt: nowHop.arriveAt,
+        // A whole ms, no later than the burn (flight times are whole ms).
+        castOffAt: Math.floor(Math.min(Date.now(), nowHop.departAt)),
+        // Where the destination orbits now: arrival compares against it.
+        ...destinationAtOf(dest.id),
       });
       if (!departed) { render(); return; }
       // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
@@ -2533,7 +2583,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         `<button type="button" data-helm-dock="${verb}" data-door="${esc(p.doorId)}" ${canAct ? '' : 'disabled'} style="width:100%; margin-top:8px; border-radius:6px; border:1px solid ${color}; background:rgba(0,0,0,0.3); color:${color}; font-size:11px; font-weight:800; padding:8px; cursor:${canAct ? 'pointer' : 'not-allowed'}; opacity:${canAct ? '1' : '0.45'}; letter-spacing:1px;">${label}</button>`;
       const who = esc(p.partnerName ?? 'the other module');
       const verb = p.state.kind === 'docked'
-        ? btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80')
+        ? (towHoldsDock([currentRoomId()], Date.now())
+          ? `<div style="margin-top:6px; color:#FFB300;">🚚 Towing — this dock holds the station until it arrives.</div>`
+          : btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80'))
         : p.state.kind === 'undocked'
           ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
           : p.state.kind === 'free'
@@ -2669,9 +2721,107 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     });
   };
 
+  /** 🚚 What a tow from this ship reads, fresh. */
+  const towContext = (engines: number, fuel: number, commander: boolean, now: number): TowContext => {
+    const stations = listStationRecordsNow();
+    const hereId = stationHere();
+    // Only a free ship tows: a module bolted on by a gangway is part of a
+    // station (whose helm shows this face on its FUEL & DOCKING tab), and a
+    // station never tows another.
+    const bolted = (docking?.connected() ?? []).some((m) => !m.dock);
+    const station = hereId && !bolted ? stations.find((st) => st.id === hereId) ?? null : null;
+    return {
+      station,
+      stations,
+      tugRoomId: currentRoomId(),
+      commander,
+      engines,
+      fuel,
+      drawn: readMoveFuelDrawn(),
+      deficit: fuelDrawDeficit('stationMove'),
+      // 0 (refused) when the station's layout is not in this install's atlas.
+      modules: station ? atlasComponent(readStationAtlas(), station.welcomeRoomId).size : 0,
+      now,
+    };
+  };
+
+  /** A tow that refused last, said under the TOW buttons for a moment. */
+  let towFlash: { text: string; until: number } | null = null;
+
+  /** 🚚 TOW STATION — only on a tug (TUG_MIN_ENGINES engine blocks) docked at
+   *  a station: each other planet's torch flight, and TOW to go now. */
+  const renderTowPanel = (engines: number, fuel: number, commander: boolean, now: number): string => {
+    const c = towContext(engines, fuel, commander, now);
+    const station = c.station;
+    const move = station?.move;
+    const towing = isTowing(c.tugRoomId, now);
+    if (!station || (engines < TUG_MIN_ENGINES && !towing)) return '';
+    let body = '';
+    if (move && isMoveActive(move, now)) {
+      body = `<div style="font-size:10px; color:#00E676; line-height:1.5;">${esc(describeMove(move, now))}</div>`;
+    } else if (c.modules < 1) {
+      // No price without the station's modules: say why, not a guess.
+      body = `<div style="font-size:10px; color:rgba(212,168,75,0.7); line-height:1.5;">${esc(describeTowRefusal('unknown-layout', null, fuel))}</div>`;
+    } else {
+      for (const planetId of otherPlanets(station)) {
+        const quote = quoteTow(station, c.stations, planetId, c.modules, now);
+        const name = esc(planetById(planetId).name);
+        if (!quote) {
+          body += `<div style="padding:4px 0; font-size:10px; color:rgba(212,168,75,0.55);">${name} · no free orbit</div>`;
+          continue;
+        }
+        const plan = planStationTow(c, planetId);
+        body += `
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; padding:5px 0; border-bottom:1px solid rgba(212,168,75,0.10); font-size:10px; line-height:1.45;">
+            <span><b style="color:#F0C060;">${name}</b> · slot ${quote.toSlot}<br>
+              <span style="color:rgba(212,168,75,0.7);">leaves now · ${formatLongSpan(quote.plan.transferMs)} under thrust · ${Math.round(quote.plan.deltaVKmS)} km/s</span><br>
+              ${quote.fuel <= fuel ? '<span style="color:#00E676;">✔</span>' : '<span style="color:#FF8A80;">✗</span>'} ${quote.fuel} fuel <span style="color:rgba(212,168,75,0.6);">(${c.modules} module${c.modules === 1 ? '' : 's'} + tug)</span></span>
+            <button type="button" data-helm-tow="${esc(planetId)}" title="${esc(plan.ok ? `Tow ${station.name} to ${planetById(planetId).name} now` : describeTowRefusal(plan.refusal, plan.quote, fuel))}" style="padding:5px 10px; border-radius:6px; border:1px solid #00E5FF; background:rgba(0,229,255,0.10); color:#00E5FF; font-family:inherit; font-size:10px; font-weight:800; opacity:${plan.ok ? '1' : '0.45'}; cursor:pointer;">TOW</button>
+          </div>`;
+      }
+    }
+    const flash = towFlash && now < towFlash.until
+      ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${esc(towFlash.text)}</div>`
+      : '';
+    return `
+      <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(0,229,255,0.25); border-radius:8px;">
+        <div style="font-size:11px; letter-spacing:0.5px; color:#00E5FF; margin-bottom:6px;">🚚 TOW ${esc(station.name.toUpperCase())} TO ANOTHER PLANET</div>
+        ${body}
+        ${flash}
+      </div>`;
+  };
+
+  /** Start a tow — the panel's only write. */
+  const startTow = (planetId: string): void => {
+    const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+    const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+    const now = Date.now();
+    const plan = planStationTow(towContext(countFunction('engine'), fuel, helmIsCommander(), now), planetId);
+    if (!plan.ok) {
+      const flash = { text: describeTowRefusal(plan.refusal, plan.quote, fuel), until: now + 5_000 };
+      towFlash = flash;
+      // Nothing else re-renders a docked ship, so the note clears itself.
+      setTimeout(() => {
+        if (towFlash !== flash) return;
+        towFlash = null;
+        if (panel) render();
+      }, 5_050);
+    } else if (readFlightRecord().status === 'docked') {
+      towFlash = null;
+      writeStationMove(plan.move);
+    }
+    render();
+  };
+
   const onClick = (e: MouseEvent): void => {
-    if (!panel || !docking) return;
+    if (!panel) return;
     const target = e.target as HTMLElement;
+    const tow = target.closest<HTMLElement>('[data-helm-tow]');
+    if (tow?.dataset.helmTow) {
+      startTow(tow.dataset.helmTow);
+      return;
+    }
+    if (!docking) return;
     const act = target.closest<HTMLElement>('[data-helm-dock]');
     if (act && !(act as HTMLButtonElement).disabled) {
       const doorId = act.dataset.door ?? '';
@@ -2710,7 +2860,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew, even if the directory no longer lists it.
-      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt, destinationAt: rec.destinationAt });
     }
     if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
   };
@@ -2741,12 +2891,17 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
+      unsubs.push(subscribeStationMove(() => render()));
       // 🪐 Destinations and their orbits learned from peers.
       unsubs.push(subscribePlanetSummary(() => render()));
       // Countdown / arrival watch — re-render only while a number moves.
       tickTimer = setInterval(() => {
         autoAdvance();
-        if (readFlightRecord().status === 'in-flight') render();
+        // A tow ends on the clock, not on a write: keep ticking while this
+        // tug tows, and once more as it arrives (DEPART and UNDOCK return).
+        const towing = isTowing(currentRoomId(), Date.now());
+        if (readFlightRecord().status === 'in-flight' || towing || wasTowing) render();
+        wasTowing = towing;
       }, HELM_TICK_MS);
       render();
     },

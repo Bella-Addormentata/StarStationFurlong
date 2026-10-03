@@ -131,6 +131,7 @@ import {
 // orbits, and flight records written on another install still resolve here.
 import {
   bindPlanetSummaryDoc,
+  installKnownPlacesResolver,
   installTrimResolver,
   LEARNED_PREFIX,
   publishPlanetSummary,
@@ -138,6 +139,7 @@ import {
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
+import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, pinSettledArrivals, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -188,7 +190,7 @@ import {
   stationForRoom,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
-import { directoryFromStationRecords, setStationDirectory } from "./stationDirectory";
+import { adriftPlace, directoryFromStationRecords, setStationDirectory } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1217,6 +1219,32 @@ function shipStationHere(roomId: string): string | null {
   return null;
 }
 
+/** Does this room hold a live dock into a room of the station whose welcome
+ *  room is `welcomeRoomId`? (A tug's tow lasts only while it does.) True when
+ *  it does; else when this room let go of it, by its dock tombstones (the
+ *  UNDOCK's own stamp, however late this tab learns of it), the earliest
+ *  release at or after `since`; else false (not docked, time unknown). */
+function dockedToStation(welcomeRoomId: string, since = -Infinity): boolean | number {
+  let released: number | null = null;
+  for (const [, rec] of readAllDoors()) {
+    const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
+    if (!address) continue;
+    if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
+    if (rec.paired !== true && !rec.dock) continue;
+    let partner = "";
+    try {
+      partner = roomIdFromSeed(address);
+    } catch {
+      continue;
+    }
+    if (!partner || stationForRoom(partner)?.welcomeRoomId !== welcomeRoomId) continue;
+    if (rec.paired === true) return true;
+    const at = rec.dock!.undockedAt;
+    if (at >= since && (released === null || at < released)) released = at;
+  }
+  return released ?? false;
+}
+
 /** The one-module station whose welcome room IS this room, straight from
  *  the list (not stationForRoom, which a ship room resolves through its dock). */
 function ownStationOf(roomId: string): string | null {
@@ -1238,7 +1266,7 @@ function planetShipStatus(): ShipStatusInput | null {
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
-  const planetId = from?.planetId ?? to?.planetId ?? placed?.planetId;
+  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const name =
     // Peer-written: only a string is a name.
@@ -1571,6 +1599,7 @@ async function joinRoomAtEpoch(
   bindShipDoc(sync.doc);
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
+  bindStationMoveDoc(sync.doc);
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1799,6 +1828,9 @@ async function joinRoomAtEpoch(
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🪐 …and the station registry's "which station am I in" (holotable).
     setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // 🚚 …and every station move this install has seen (stationMove.ts), so a
+    // moved station stays moved in every room.
+    installStationMoveResolver();
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
@@ -1829,8 +1861,12 @@ async function joinRoomAtEpoch(
     // 🪐 Stations fly their shared trims, and what changes here goes out:
     // a burn, a flight step, a station the atlas now groups differently.
     installTrimResolver();
+    // Stations heard of around other planets count where slots are picked.
+    installKnownPlacesResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
+    // 🚚 A move this room remembers goes out on the planet summary at once.
+    subscribeStationMove(() => publishPlanetSummary());
     // A fitted or removed engine, tank or helm makes or unmakes a ship.
     subscribeFurniture(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
@@ -1910,15 +1946,27 @@ async function joinRoomAtEpoch(
     // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
     // publishPlanetSummary refreshes its stamp once an hour).
     if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
-    if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
+    // Move reconciliation runs on every game in the room, commander or not:
+    // both writes follow from records everyone shares (the same cancel or
+    // pin, ranked as the move it settles), so they need no owner, and a tow
+    // or arrival never waits for the owner to come back.
+    // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
+    cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
+    // 🪐 Where each station's last move settled it, shared once for everyone:
+    // every station this game lists, aboard or not.
+    if (planetSummaryBeat % 10 === 0) pinSettledArrivals(listStations(), Date.now());
+    if (!isLocalHelmCommander()) return;
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).
       writeFlightRecord({
         status: "redocking",
         locationId: rec.destinationId ?? rec.locationId,
+        departedAt: rec.departedAt,
         etaAt: rec.etaAt,
+        castOffAt: rec.castOffAt,
+        destinationAt: rec.destinationAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.

@@ -79,6 +79,7 @@ import {
   findStation,
   isKnownStation,
   localStationId,
+  locationPlanet,
   listStations,
   portableStationId,
   type StationDestination,
@@ -127,6 +128,14 @@ export interface FlightRecord {
   /** Writer-clock epoch ms the flight will arrive. Undefined outside transit.
    *  Guard: `etaAt > departedAt` (rejected on read otherwise). */
   etaAt?: number;
+  /** Writer-clock epoch ms DEPART cast off (the booking), which can be well
+   *  before `departedAt` (the launch window it waits for). Kept through
+   *  `redocking`, so arrival can tell what changed while the ship was away. */
+  castOffAt?: number;
+  /** Where the destination orbited when DEPART cast off, as an open-orbit
+   *  place (stationDirectory.adriftAt). Kept through `redocking`, so arrival
+   *  can tell the destination moved away however many moves it made since. */
+  destinationAt?: string;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -231,6 +240,8 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.destinationId !== undefined && !isBoundedString(r.destinationId)) return false;
   if (r.departedAt !== undefined && !isFlightTime(r.departedAt)) return false;
   if (r.etaAt !== undefined && !isFlightTime(r.etaAt)) return false;
+  if (r.castOffAt !== undefined && !isFlightTime(r.castOffAt)) return false;
+  if (r.destinationAt !== undefined && !isBoundedString(r.destinationAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -282,11 +293,20 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
     if (r.status === 'in-flight') {
       if (r.departedAt !== undefined) out.departedAt = r.departedAt;
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;
+      if (r.castOffAt !== undefined && (r.departedAt === undefined || r.castOffAt <= r.departedAt)) out.castOffAt = r.castOffAt;
+      if (r.destinationAt !== undefined) out.destinationAt = r.destinationAt;
     }
   }
   // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
   // for a commander who can dock before any client settles it berthless.
   if (r.status === 'redocking' && r.etaAt !== undefined) out.etaAt = r.etaAt;
+  // … and when it left, so arrival can tell a destination that moved away
+  // mid-flight (stationMove.ts) from one that was always there.
+  if (r.status === 'redocking' && r.departedAt !== undefined && r.etaAt !== undefined && r.etaAt > r.departedAt) {
+    out.departedAt = r.departedAt;
+    if (r.castOffAt !== undefined && r.castOffAt <= r.departedAt) out.castOffAt = r.castOffAt;
+    if (r.destinationAt !== undefined) out.destinationAt = r.destinationAt;
+  }
   return out;
 }
 
@@ -706,8 +726,9 @@ export function canDepart(ctx: DepartContext): DepartRefusal {
     if (ctx.locationId === dest.id) return { ok: false, reason: 'already-here' };
     // An unlisted station reads as home here (findStation's fallback), and
     // its hops can never be planned: say so, not "a shared orbit".
-    if (!isKnownStation(ctx.locationId)) return { ok: false, reason: 'unlisted-location' };
-    if (findStation(ctx.locationId).planetId !== dest.planetId) {
+    const planet = locationPlanet(ctx.locationId);
+    if (planet === null) return { ok: false, reason: 'unlisted-location' };
+    if (planet !== dest.planetId) {
       return { ok: false, reason: 'other-planet' };
     }
   }

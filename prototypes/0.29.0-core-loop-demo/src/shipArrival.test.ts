@@ -4,6 +4,7 @@
 // near-side writes as docking.ts's UNDOCK / DOCK.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { listStations } from './stations';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
@@ -36,7 +37,9 @@ import {
   writeFlightRecord,
   writeStationBerth,
 } from './shipDoc';
-import { setStationDirectory, DEFAULT_STATIONS, type StationDestination } from './stationDirectory';
+import {
+  adriftAt, adriftPlace, destinationsFrom, locationPlanet, planHop, setStationDirectory, DEFAULT_STATIONS, type StationDestination,
+} from './stationDirectory';
 
 // Synthetic pass seeds — roomIdFromSeed reads the #room= form.
 const SEED_FURLONG = 'ssf://room#room=furlong-berth';
@@ -312,6 +315,107 @@ describe('a round trip', () => {
     expect(readStationBerth('furlong-station')?.roomId).toBe(FURLONG_ROOM);
   });
 
+  it('waits where the destination was at cast-off once it has moved on, however many moves', () => {
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    // At cast-off Furlong orbited another slot (it has since moved, and
+    // moved again: the directory keeps only its latest move, if any).
+    const then = adriftAt(home.planetId, (home.orbitSlot + 3) % 16);
+    writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    writeFlightRecord({ status: 'redocking', locationId: 'furlong-station', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    expect(readFlightRecord().destinationAt).toBe(then);
+    expect(completeArrival(fakeDocking(['north']), { now, force: true })).toMatchObject({ kind: 'none', reason: 'in-transit' });
+    expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: then });
+  });
+
+  it('stays undocked at a station that left for another planet mid-flight', () => {
+    const now = Date.now();
+    const move = {
+      stationId: 'high-orbit', welcomeRoomId: HIGH_ROOM, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 1000, arriveAt: now + 3_600_000,
+      mode: 'tug' as const, tugRoomId: 'tug', fuel: 1, fuelDrawn: 0,
+    };
+    const stations: StationDestination[] = [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth: { address: SEED_HIGH, farDoor: 'd:a3313fdd', farWall: 'x-' }, move },
+    ];
+    setStationDirectory({ stations: () => stations });
+    const docking = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', docking);
+    fly('furlong-station', 'high-orbit');
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+    // The ship waits in open orbit where the station was, a place that
+    // follows no station, and flies on from there around Sovereign.
+    const at = adriftAt('planet-sovereign', 1);
+    expect(readFlightRecord()).toMatchObject({ status: 'docked', locationId: at });
+    expect(adriftPlace(at)).toEqual({ planetId: 'planet-sovereign', orbitSlot: 1 });
+    expect(adriftPlace(adriftAt('planet-sovereign', 15))).not.toBeNull();
+    expect(adriftPlace(adriftAt('planet-sovereign', 16))).toBeNull();
+    expect(locationPlanet(at)).toBe('planet-sovereign');
+    expect(destinationsFrom(at).map((d) => d.id)).toEqual(['furlong-station']);
+    expect(planHop(at, 'furlong-station', now)).not.toBeNull();
+    // A pin of where the move arrived stands for the move: still no dock.
+    const pin = { ...move, fromPlanetId: 'planet-aris', fromSlot: 0, departAt: move.arriveAt, arriveAt: move.arriveAt + 1, settles: move };
+    const settled = [...DEFAULT_STATIONS.slice(0, 1), { ...stations[1], move: undefined, lastMove: { ...pin, departAt: now - 10, arriveAt: now - 9, settles: { ...move, arriveAt: now - 20 } } }];
+    setStationDirectory({ stations: () => settled });
+    fly('furlong-station', 'high-orbit');
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt: now - 5000, etaAt: now - 1, castOffAt: now - 5000 });
+    expect(completeArrival(docking, { now, force: true })?.kind).toBe('none');
+    expect(readFlightRecord().locationId).toBe(at);
+  });
+
+  it('stays undocked at a station that finished moving to another planet before the ship arrived', () => {
+    const now = Date.now();
+    const departedAt = now - 600_000;
+    // Left after the ship did, and already arrived: the listing has dropped
+    // `move`, and only `lastMove` remembers it.
+    const lastMove = {
+      stationId: 'high-orbit', welcomeRoomId: HIGH_ROOM, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: departedAt + 1000, arriveAt: now - 1000,
+      mode: 'tug' as const, tugRoomId: 'tug', fuel: 1, fuelDrawn: 0,
+    };
+    const berth = { address: SEED_HIGH, farDoor: 'd:a3313fdd', farWall: 'x-' as const };
+    setStationDirectory({ stations: () => [...DEFAULT_STATIONS.slice(0, 1), { ...DEFAULT_STATIONS[1], berth, lastMove }] });
+    const docking = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', docking);
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    // A move that left after the booking but before the launch window the
+    // ship waited for still happened while the ship was away.
+    const window = departedAt + 120_000;
+    setStationDirectory({ stations: () => [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth, lastMove: { ...lastMove, departAt: departedAt + 1000, arriveAt: departedAt + 60_000 } },
+    ] });
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: window, etaAt: now - 1, castOffAt: departedAt });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt: window, etaAt: now - 1, castOffAt: departedAt });
+    expect(readFlightRecord().castOffAt).toBe(departedAt);
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    // A station already on its way when the ship left, arriving before the
+    // ship does, overlaps the time away too.
+    setStationDirectory({ stations: () => [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth, lastMove: { ...lastMove, departAt: departedAt - 5000, arriveAt: departedAt + 5000 } },
+    ] });
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    expect(completeArrival(docking, { now, force: true }))
+      .toEqual({ kind: 'none', stationName: 'High Orbit', reason: 'in-transit' });
+    // A move finished before the ship left is just where the station is now.
+    setStationDirectory({ stations: () => [
+      ...DEFAULT_STATIONS.slice(0, 1),
+      { ...DEFAULT_STATIONS[1], berth, lastMove: { ...lastMove, departAt: departedAt - 5000, arriveAt: departedAt - 1000 } },
+    ] });
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    writeFlightRecord({ status: 'redocking', locationId: 'high-orbit', departedAt, etaAt: now - 1 });
+    expect(completeArrival(docking, { now, force: true })).toEqual({ kind: 'docking', stationName: 'High Orbit' });
+  });
+
   it('does nothing unless the ship is redocking, and only once', () => {
     const docking = fakeDocking(['north']);
     expect(completeArrival(docking)).toBeNull();
@@ -336,6 +440,15 @@ describe('a round trip', () => {
     // Not re-docked at Furlong's remembered berth.
     expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
     expect(docking.docks).toEqual([]);
+  });
+
+  it('waits in open orbit where an unlisted destination was at cast-off, when the flight kept it', () => {
+    const now = Date.now();
+    const then = 'adrift:planet-aris:4';
+    writeFlightRecord({ status: 'redocking', locationId: 'gone-soon', departedAt: now - 2, etaAt: now - 1, castOffAt: now - 3, destinationAt: then });
+    expect(completeArrival(fakeDocking(['north']), { force: true }))
+      .toEqual({ kind: 'none', stationName: 'gone-soon', reason: 'unlisted-station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: then });
   });
 
   it('waits out the grace for a commander who can dock, then settles berthless', () => {
