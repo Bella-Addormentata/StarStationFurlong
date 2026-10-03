@@ -5,7 +5,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
+import { atlasLayout, atlasPoses, bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
 import { moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import type { ShipSummary } from './planetSummary';
 
@@ -179,6 +179,29 @@ describe('the station plan', () => {
     expect(plan.ships.map((m) => m.roomId)).toEqual(['q-ship']);
     expect(plan.modules[0].gates).toEqual([{ doorId: 'south', gate: 4, occupied: true }]);
     expect(plan.ships[0].dockedAt).toEqual({ roomId: 'q-hub', doorId: 'south', gate: 4 });
+  });
+
+  it('walks past doors to rooms named like Object properties as unknown rooms', () => {
+    // A door to each of three names every object inherits, one naming the
+    // far room's door (read from that room's own record of it).
+    harvestIntoAtlas({
+      roomId: 'room-a', name: 'HUB',
+      doors: [
+        { doorId: 'east', targetSeed: seed('constructor'), wall: 'x+', lateral: 0, farDoor: 'west', transient: false },
+        { doorId: 'west', targetSeed: seed('__proto__'), wall: 'x-', lateral: 0, transient: false },
+        { doorId: 'north', targetSeed: seed('toString'), wall: 'y-', lateral: 0, transient: false },
+      ],
+    });
+    const atlas = readAtlas();
+    const unknown = [['__proto__', 'Module'], ['constructor', 'Module'], ['toString', 'Module']];
+    expect(atlasPoses(atlas, 'room-a', { reverse: true }).map((p) => [p.roomId, p.name]).sort())
+      .toEqual([...unknown, ['room-a', 'HUB']].sort());
+    expect(atlasLayout('room-a').map((p) => [p.roomId, p.name]).sort()).toEqual(unknown);
+    expect(stationPlan(atlas, 'room-a').modules.map((m) => [m.roomId, m.name]).sort())
+      .toEqual([...unknown, ['room-a', 'HUB']].sort());
+    // None of them is a room to start from.
+    expect(atlasPoses(atlas, 'toString')).toEqual([]);
+    expect(stationPlan(atlas, 'constructor').modules).toEqual([]);
   });
 
   it('is empty for a room the atlas does not know', () => {

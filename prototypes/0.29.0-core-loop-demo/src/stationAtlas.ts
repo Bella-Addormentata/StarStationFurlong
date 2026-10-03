@@ -1201,6 +1201,14 @@ export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
  * the holotable places docked ships without walking on through them.
  * `reverse` also follows a pairing recorded only on the far room's side.
  */
+/** 🗺️ `record[key]` when the record holds it as its own key, else undefined:
+ *  a room or door id off the wire such as `constructor`, `__proto__` or
+ *  `toString` names nothing an object merely inherits (an inherited value
+ *  read as a room has no doors, and walking them throws). */
+export function ownValue<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  return record !== undefined && Object.prototype.hasOwnProperty.call(record, key) ? record[key] : undefined;
+}
+
 /** 🧭 One hop's pose: the module behind `ownerId`'s door `doorId`, centre and
  *  heading in `ownerId`'s own frame. `liveRoomId`'s doors pose from the live
  *  snapshot; every other room's from its harvested wall + lateral. */
@@ -1218,18 +1226,16 @@ function hopLocal(
   // seven 18.6 m hops and one 78 m chasm, the scattered-boxes render).
   // But the FAR room's own record pointing back at us NAMES the door —
   // infer it from the graph before composing the hop.
+  const far = ownValue(atlas, door.targetRoomId);
   const farDoorId = door.farDoor
-    ?? (Object.entries(atlas[door.targetRoomId]?.doors ?? {})
+    ?? (Object.entries(far?.doors ?? {})
       .find(([, r]) => (r as AtlasDoor | undefined)?.targetRoomId === ownerId)?.[0]);
   // 🧭 The far door's WALL, never guessed from its id: the pairing record's
   // farWall, else the far room's own gossiped door geometry, else unknown
   // (⇒ the hop faces the arrival heading — no invented rotation).
-  const farWall = door.farWall
-    ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.wall : undefined)
-    ?? null;
-  const farLateral = door.farLateral
-    ?? (farDoorId ? atlas[door.targetRoomId]?.doors[farDoorId]?.lateral : undefined)
-    ?? 0;
+  const farRecord = farDoorId ? ownValue(far?.doors, farDoorId) : undefined;
+  const farWall = door.farWall ?? farRecord?.wall ?? null;
+  const farLateral = door.farLateral ?? farRecord?.lateral ?? 0;
   // The hop's pose in the FROM room's local frame → compose into world.
   // The CURRENT room's own doors use the LIVE pose (slide included); a
   // NEIGHBOUR room's door poses from its harvested wall+lateral — this
@@ -1239,7 +1245,7 @@ function hopLocal(
   // size is known: the chain meets its TRUE face, so its centre sits that
   // far beyond the chain's end (review, round 8). Unknown ⇒ the adapter's
   // uniform default, as before.
-  const farHalf = farWall ? halfAlongWall(atlas[door.targetRoomId]?.dims, farWall) : undefined;
+  const farHalf = farWall ? halfAlongWall(far?.dims, farWall) : undefined;
   return ownerId !== liveRoomId && door.wall !== undefined
     ? projectionPoseFromWall(door.wall, door.lateral ?? 0, door.segments, farWall, farLateral, farHalf)
     : projectionPoseForDoor(doorId, door.segments, farWall, farLateral, farHalf);
@@ -1252,13 +1258,16 @@ export function atlasPoses(
 ): AtlasPose[] {
   const maxHops = opts.maxHops ?? 10;
   const currentRoomId = opts.liveRoomId ?? '';
-  if (!atlas[rootRoomId]) return [];
+  // Rooms are looked up by their own keys only (ownValue): a door may name
+  // a room `constructor` or `__proto__`.
+  const root = ownValue(atlas, rootRoomId);
+  if (!root) return [];
   const placed = new Map<string, AtlasPose>();
   placed.set(rootRoomId, {
     roomId: rootRoomId,
-    name: atlas[rootRoomId].name,
-    seed: atlas[rootRoomId].seed,
-    dims: atlas[rootRoomId].dims,
+    name: root.name,
+    seed: root.seed,
+    dims: root.dims,
     x: 0, z: 0, rotY: 0, hops: 0,
   });
   const queue: string[] = [rootRoomId];
@@ -1267,15 +1276,15 @@ export function atlasPoses(
     const from = placed.get(fromId)!;
     if (from.hops >= maxHops) continue;
     if (opts.expand && fromId !== rootRoomId && !opts.expand(fromId)) continue;
-    const entry = atlas[fromId];
+    const entry = ownValue(atlas, fromId);
     if (!entry) continue;
-    for (const [doorId, door] of Object.entries(entry.doors) as Array<[DoorId, AtlasDoor]>) {
+    for (const [doorId, door] of Object.entries(entry.doors ?? {}) as Array<[DoorId, AtlasDoor]>) {
       if (!door || !door.targetRoomId || placed.has(door.targetRoomId)) continue;
       const local = hopLocal(atlas, fromId, doorId, door, currentRoomId);
       const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
       const wx = from.x + local.x * cos + local.z * sin;
       const wz = from.z - local.x * sin + local.z * cos;
-      const target = atlas[door.targetRoomId];
+      const target = ownValue(atlas, door.targetRoomId);
       placed.set(door.targetRoomId, {
         roomId: door.targetRoomId,
         name: target?.name ?? 'Module',

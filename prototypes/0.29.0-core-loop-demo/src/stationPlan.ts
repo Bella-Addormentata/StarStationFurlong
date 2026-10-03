@@ -12,7 +12,7 @@
  */
 
 import type { AtlasEntry, AtlasOwner } from './stationAtlas';
-import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords } from './stationAtlas';
+import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords, ownValue } from './stationAtlas';
 import { TILE_SIZE } from './floorPlanDoc';
 import type { ShipSummary } from './planetSummary';
 
@@ -113,7 +113,7 @@ export function stationPlan(
   rootRoomId: string,
   liveRoomId = '',
 ): StationPlan {
-  if (!rootRoomId || !atlas[rootRoomId]) return emptyPlan(rootRoomId);
+  if (!rootRoomId || !ownValue(atlas, rootRoomId)) return emptyPlan(rootRoomId);
   const station = atlasComponent(atlas, rootRoomId);
   const poses = atlasPoses(atlas, rootRoomId, {
     liveRoomId,
@@ -130,7 +130,7 @@ export function stationPlan(
   const modules: PlanModule[] = [];
   const ships: PlanModule[] = [];
   for (const p of poses) {
-    const entry = atlas[p.roomId];
+    const entry = ownValue(atlas, p.roomId);
     const dims = entry?.dims ?? p.dims;
     const size = dims ?? FALLBACK_DIMS;
     const roomBerths = berths.get(p.roomId);
@@ -148,7 +148,7 @@ export function stationPlan(
     for (const far of farOnly.get(p.roomId) ?? []) {
       if (far.fromRoomId === p.roomId || !byId.has(far.fromRoomId)) continue;
       const named = far.door.farDoor;
-      const doorId = named && !entry?.doors[named] ? named : `~${far.fromRoomId}:${far.doorId}`;
+      const doorId = named && !ownValue(entry?.doors, named) ? named : `~${far.fromRoomId}:${far.doorId}`;
       links.push({ doorId, toRoomId: far.fromRoomId, berth: berths.get(far.fromRoomId)?.has(far.doorId) ?? false });
     }
     links.sort((a, b) => a.doorId.localeCompare(b.doorId));

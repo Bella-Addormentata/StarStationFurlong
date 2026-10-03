@@ -14,9 +14,9 @@ import {
   type AtlasEntry,
 } from './stationAtlas';
 import {
-  disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobAnnouncement, jobDueAt, jobFraction, jobStatusText,
-  laborHoursFor, laborMsFor, removalBlocker, settleJob, workedMs,
-  type CandidateInput, type DisassemblyJob, type DisassemblyJobRecord,
+  disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, isDisassemblyWork, jobAnnouncement, jobDueAt, jobFraction,
+  jobFromWork, jobStatusText, laborHoursFor, laborMsFor, removalBlocker, startWork, stopWork, workedMs,
+  type CandidateInput, type DisassemblyJob, type DisassemblyJobRecord, type DisassemblyWork,
 } from './disassembly';
 import {
   assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, raiseDisassemblyLabor,
@@ -57,31 +57,45 @@ describe('labor on the orbital clock', () => {
     expect(laborMsFor(1)).toBe(MIN);
   });
 
-  it('runs with the crew, settles on a change, and never reads the clock backwards', () => {
-    const j = job({ crew: ['d1'] });
+  it('runs with its robots, each on its own clock, and never reads the clock backwards', () => {
+    const { crew: _crew, ...rec } = job();
+    const both = new Set(['d1', 'd2']);
+    const d1 = startWork(rec, 'd1', undefined, 0);
+    const j = jobFromWork(rec, [d1], both);
+    expect(j.crew).toEqual(['d1']);
     expect(workedMs(j, 10 * MIN)).toBe(10 * MIN);
     expect(jobDueAt(j)).toBe(24 * MIN);
     // A second robot from minute 10: the rest goes twice as fast.
-    const two = { ...settleJob(j, 10 * MIN), crew: ['d1', 'd2'] };
-    expect(two).toMatchObject({ doneMs: 10 * MIN, asOf: 10 * MIN });
-    // What a crew change writes is the record alone: the crew is the configs'.
-    expect('crew' in settleJob(j, 10 * MIN)).toBe(false);
+    const d2 = startWork(rec, 'd2', undefined, 10 * MIN);
+    const two = jobFromWork(rec, [d1, d2], both);
+    expect(two).toMatchObject({ doneMs: 10 * MIN, asOf: 10 * MIN, crew: ['d1', 'd2'] });
     expect(jobDueAt(two)).toBe(17 * MIN);
     expect(workedMs(two, 12 * MIN)).toBe(14 * MIN);
     // Never past the total.
     expect(workedMs(two, 99 * MIN)).toBe(24 * MIN);
     expect(jobFraction(two, 99 * MIN)).toBe(1);
-    // A clock behind the last writer's changes nothing.
-    const { crew: _crew, ...twoRecord } = two;
-    expect(settleJob(two, 5 * MIN)).toEqual(twoRecord);
+    // A clock behind the last record adds nothing, and stops nothing early.
     expect(workedMs(two, 5 * MIN)).toBe(10 * MIN);
-    // Nobody on it: paused, no due time.
-    expect(jobDueAt({ ...two, crew: [] })).toBeNull();
-    expect(workedMs({ ...two, crew: [] }, 50 * MIN)).toBe(10 * MIN);
+    expect(stopWork(d2, 5 * MIN)).toMatchObject({ ms: 0, asOf: 10 * MIN, working: false });
+    // A robot no longer set to it (stopped, or its dock gone) works no more.
+    expect(jobFromWork(rec, [d1, d2], new Set(['d1'])).crew).toEqual(['d1']);
+    // Both stopped at minute 12: paused, each robot's labor its own.
+    const paused = jobFromWork(rec, [stopWork(d1, 12 * MIN), stopWork(d2, 12 * MIN)], both);
+    expect(paused).toMatchObject({ doneMs: 14 * MIN, asOf: 12 * MIN, crew: [] });
+    expect(jobDueAt(paused)).toBeNull();
+    expect(workedMs(paused, 50 * MIN)).toBe(14 * MIN);
+    // One back at minute 20 picks up where it was.
+    const again = startWork(rec, 'd1', stopWork(d1, 12 * MIN), 20 * MIN);
+    expect(again).toMatchObject({ ms: 12 * MIN, asOf: 20 * MIN, working: true });
+    expect(workedMs(jobFromWork(rec, [again, stopWork(d2, 12 * MIN)], both), 21 * MIN)).toBe(15 * MIN);
     // Its labor all done when its last robot left: still due, as of then.
-    const done = { ...settleJob(two, 30 * MIN), crew: [] };
+    const done = jobFromWork(rec, [stopWork(d1, 30 * MIN), stopWork(d2, 30 * MIN)], both);
     expect(done).toMatchObject({ doneMs: 24 * MIN, asOf: 30 * MIN });
     expect(jobDueAt(done)).toBe(30 * MIN);
+    // A job opened again on the module counts none of the old one's labor.
+    const reopened = { ...rec, startedAt: 40 * MIN, asOf: 40 * MIN };
+    expect(jobFromWork(reopened, [stopWork(d1, 30 * MIN)], both).doneMs).toBe(0);
+    expect(startWork(reopened, 'd1', stopWork(d1, 30 * MIN), 41 * MIN)).toMatchObject({ ms: 0, startedAt: 40 * MIN });
   });
 
   it('says where the job stands', () => {
@@ -137,6 +151,26 @@ describe('labor on the orbital clock', () => {
     expect(isDisassemblyJobRecord(rec({ asOf: 60 * MIN, doneMs: 25 * MIN }))).toBe(false);
     expect(isDisassemblyJobRecord(rec({ asOf: 1 * MIN, doneMs: 16 * MIN }))).toBe(true);
     expect(isDisassemblyJobRecord(rec({ asOf: 1 * MIN, doneMs: 16 * MIN + 1 }))).toBe(false);
+    // Ended sooner than sixteen robots could: more were working (robots
+    // started on two clients at once), and it stands.
+    expect(isDisassemblyJobRecord(rec({ doneMs: 24 * MIN, asOf: MIN, finishedAt: MIN, outcome: 'removed' }))).toBe(true);
+  });
+
+  it("reads only well-formed robot work records", () => {
+    const work = (over: Partial<DisassemblyWork> = {}): DisassemblyWork => ({
+      roomId: 'room-b', dockId: 'd1', startedAt: 0, ms: 5 * MIN, asOf: 10 * MIN, working: true, ...over,
+    });
+    expect(isDisassemblyWork(work())).toBe(true);
+    expect(isDisassemblyWork(work({ working: false }))).toBe(true);
+    // No longer at it than the job has been open.
+    expect(isDisassemblyWork(work({ ms: 10 * MIN }))).toBe(true);
+    expect(isDisassemblyWork(work({ ms: 10 * MIN + 1 }))).toBe(false);
+    expect(isDisassemblyWork(work({ startedAt: 11 * MIN, ms: 0 }))).toBe(false);
+    expect(isDisassemblyWork(work({ ms: -1 }))).toBe(false);
+    expect(isDisassemblyWork(work({ asOf: Infinity }))).toBe(false);
+    expect(isDisassemblyWork(work({ dockId: '' }))).toBe(false);
+    expect(isDisassemblyWork(work({ working: 'yes' as never }))).toBe(false);
+    expect(isDisassemblyWork(null)).toBe(false);
   });
 });
 
@@ -211,6 +245,15 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
     harvestIntoAtlas({ roomId: 'room-d', name: 'SHED', doors: [{ doorId: 'w', targetSeed: seed('room-a') }], owner: { id: 'Local-Clone' } });
     expect(removalBlocker(input(doors), 'room-d')).toBeNull();
+  });
+
+  it('reads a neighbour named like an Object property as a module it knows nothing of', () => {
+    const doors = new Map<string, DoorRecord>([['east', pairing('constructor')], ['west', pairing('toString')]]);
+    const unknown = "its layout isn't known yet; step inside it once";
+    expect(disassemblyCandidates(input(doors)).map((c) => [c.roomId, c.name, c.blocked])).toEqual([
+      ['constructor', 'Module', unknown],
+      ['toString', 'Module', unknown],
+    ]);
   });
 
   it('takes apart a module seen from inside with no doors of its own', () => {
@@ -378,12 +421,20 @@ describe('the job in the robot map', () => {
     expect(readDisassemblyJob('room-b')?.finishedAt).toBeUndefined();
   });
 
-  it('a crew counts at most 16 robots', () => {
-    for (let i = 0; i < 17; i++) assignDisassembly(`d${String(i).padStart(2, '0')}`, target, 0);
-    expect(readDisassemblyJob('room-b')?.crew).toEqual(Array.from({ length: 16 }, (_, i) => `d${String(i).padStart(2, '0')}`));
+  it('a crew counts at most 16 robots, and one waiting starts when one stops', () => {
+    const dock = (i: number) => `d${String(i).padStart(2, '0')}`;
+    for (let i = 0; i < 17; i++) assignDisassembly(dock(i), target, 0);
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(Array.from({ length: 16 }, (_, i) => dock(i)));
+    // One stopped at minute 1: the robot waiting for room starts then,
+    // never credited for the minute it waited.
+    writeRobotConfig(dock(0), { routine: 'disassemble', target: 'room-b', parked: true }, MIN);
+    const j = readDisassemblyJob('room-b')!;
+    expect(j.crew).toEqual(Array.from({ length: 16 }, (_, i) => dock(i + 1)));
+    expect(workedMs(j, MIN)).toBe(16 * MIN);
+    expect(jobDueAt(j)).toBe(1.5 * MIN);
   });
 
-  it('two robots stopped at once on two clients both leave the crew', () => {
+  it('two robots stopped at once on two clients leave the crew, each with its own labor', () => {
     const a = roomWithDocks();
     bindRobotDoc(a);
     assignDisassembly('d1', target, 0);
@@ -391,20 +442,22 @@ describe('the job in the robot map', () => {
     expect(readDisassemblyJob('room-b')?.crew).toEqual(['d1', 'd2']);
     const b = new Y.Doc();
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
-    // Each client stops one robot at minute 6, before hearing of the other.
-    writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b', parked: true }, 6 * MIN);
+    // One client stops d1 at minute 1; the other, not having heard of it,
+    // stops d2 at minute 12, both robots still working as far as it knows.
+    writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b', parked: true }, MIN);
     bindRobotDoc(b);
-    writeRobotConfig('d2', { routine: 'disassemble', target: 'room-b', parked: true }, 6 * MIN);
+    writeRobotConfig('d2', { routine: 'disassemble', target: 'room-b', parked: true }, 12 * MIN);
     Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
     for (const doc of [a, b]) {
       bindRobotDoc(doc);
       const j = readDisassemblyJob('room-b')!;
-      // Whichever settlement won, nobody works on it any more: no stale
-      // crew keeps the labor running, and it is never due.
+      // Nobody works on it any more, and its labor is the thirteen minutes
+      // the two robots worked, never two robots for twelve: it is not due
+      // early, and it is never due without a robot back on it.
       expect(j.crew).toEqual([]);
+      expect(workedMs(j, 60 * MIN)).toBe(13 * MIN);
       expect(jobDueAt(j)).toBeNull();
-      expect(workedMs(j, 60 * MIN)).toBe(workedMs(j, 7 * MIN));
     }
   });
 
@@ -511,12 +564,13 @@ describe('the job in the robot map', () => {
       laborHours: 24, doneMs: 1 * MIN, asOf: 1 * MIN, startedAt: 0, crew: ['d1', 'd2'],
     });
     // The module grew when the end is checked: likewise.
-    raiseDisassemblyLabor('room-b', 36, 5 * MIN);
+    raiseDisassemblyLabor('room-b', 36);
     const j = readDisassemblyJob('room-b')!;
-    expect(j).toMatchObject({ laborHours: 36, doneMs: 9 * MIN, asOf: 5 * MIN });
+    expect(j.laborHours).toBe(36);
+    expect(workedMs(j, 5 * MIN)).toBe(9 * MIN);
     expect(jobDueAt(j)).toBe(5 * MIN + 13.5 * MIN);
     // Never lowered.
-    raiseDisassemblyLabor('room-b', 6, 6 * MIN);
+    raiseDisassemblyLabor('room-b', 6);
     assignDisassembly('d3', target, 6 * MIN);
     expect(readDisassemblyJob('room-b')?.laborHours).toBe(36);
   });

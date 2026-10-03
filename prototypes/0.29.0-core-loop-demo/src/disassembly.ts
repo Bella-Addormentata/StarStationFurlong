@@ -14,18 +14,21 @@
  * stored in it: the crew is every robot whose config is set to the module
  * and not stopped, its dock placed in the room's layout, so each robot's
  * membership rides on its own config key and concurrent edits to different
- * robots never overwrite each other. Its progress is a pure function of
- * the clock: the labor done as of `asOf`, plus the crew working since then.
- * Every crew change the game makes (a pick, STOP/START, another routine, a
- * dock removed or dropped by a new layout) settles the progress first, so
- * the clock is never read backwards and nothing has to be written while the
- * robots simply work.
+ * robots never overwrite each other. Nor is its progress: each robot keeps
+ * its own record of the labor it did on the job (DisassemblyWork), written
+ * when that robot starts or stops working on it, and the job's progress is
+ * the sum of them. So two clients changing two robots at once never write
+ * the same value, and neither can credit one robot with time that only the
+ * other knew it spent stopped. Progress is a pure function of the clock:
+ * each robot's labor as of its last record, plus the time the working ones
+ * have worked since, so the clock is never read backwards and nothing has
+ * to be written while the robots simply work.
  *
  * Pure: no DOM, no docs. Pinned by disassembly.test.ts.
  */
 
 import type { AtlasEntry } from './stationAtlas';
-import { berthDoorIds, isSaneDims, roomIdFromSeed } from './stationAtlas';
+import { berthDoorIds, isSaneDims, ownValue, roomIdFromSeed } from './stationAtlas';
 import type { DoorRecord } from './doorsDoc';
 import { isDockChain } from './adapter';
 import { realMsFor } from './orbits';
@@ -39,8 +42,10 @@ export const LABOR_HOURS_PER_TILE = 6;
  *  costed as the default room. */
 const FALLBACK_DIMS = { cols: 2, rows: 2 };
 
-/** Most robots one job counts (a room holds few docks; a peer's junk list
- *  must not multiply the pace). */
+/** Most robots that start work on one job (a room holds few docks): one
+ *  set to it while that many work waits on its dock until one stops
+ *  (robotDoc.ts). Nor can a job's own record claim more labor than that
+ *  many robots could have done. */
 export const MAX_CREW = 16;
 
 const MAX_ID = 128;
@@ -63,7 +68,9 @@ export interface DisassemblyTarget {
 /** A job as the room doc stores it. */
 export interface DisassemblyJobRecord extends DisassemblyTarget {
   startedAt: number;
-  /** Labor done as of `asOf`, in real ms of one robot's work. */
+  /** Labor done as of `asOf`, in real ms of one robot's work, besides its
+   *  robots' own records: none while it is open (a job opens with 0 as of
+   *  `startedAt`), all of it once it has ended. */
   doneMs: number;
   asOf: number;
   /** When the labor ran out and the job ended (absent: still open). */
@@ -73,11 +80,28 @@ export interface DisassemblyJobRecord extends DisassemblyTarget {
   outcome?: 'removed' | 'detached';
 }
 
-/** A job as read: its record, and its crew, the placed charging docks whose
- *  robots are set to the module and not stopped (robotDoc.ts reads it from
- *  their configs, sorted, at most MAX_CREW). */
+/** A job as read (jobFromWork): its record, with its robots' labor folded
+ *  into `doneMs` as of `asOf`, and its crew, the placed charging docks whose
+ *  robots are set to the module, not stopped, and working on it, sorted. */
 export interface DisassemblyJob extends DisassemblyJobRecord {
   crew: string[];
+}
+
+/** 🔧 One robot's labor on one job, as the room doc stores it (robotDoc's
+ *  `work:` keys): what it had done as of `asOf`, and whether it has been
+ *  working since. Written only when that robot starts or stops working on
+ *  the job, from its own config; a job opened again on the same module
+ *  (another `startedAt`) counts none of the old job's. */
+export interface DisassemblyWork {
+  roomId: string;
+  dockId: string;
+  /** The `startedAt` of the job it was done on. */
+  startedAt: number;
+  /** Labor done as of `asOf`, in real ms of this robot's work. */
+  ms: number;
+  asOf: number;
+  /** Working since `asOf`. */
+  working: boolean;
 }
 
 /** Labor hours to take apart a module of this size. */
@@ -95,10 +119,11 @@ const isStr = (v: unknown, max: number): v is string => typeof v === 'string' &&
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v) && v >= 0;
 
 /** Shape guard: a job record crosses the room-doc trust boundary (peer
- *  writes). Its labor can't be more than a full crew could have done since
- *  it started, nor more than the job takes. An open job has no outcome; an
- *  ended one says how it ended and has all its labor done, settled when it
- *  ended (as finishDisassemblyJob writes it). */
+ *  writes). An open job has no outcome, and no more labor of its own than a
+ *  full crew could have done since it started, nor more than the job takes;
+ *  an ended one says how it ended and has all its labor done, settled when
+ *  it ended (as finishDisassemblyJob writes it, however many robots
+ *  worked). */
 export function isDisassemblyJobRecord(v: unknown): v is DisassemblyJobRecord {
   if (typeof v !== 'object' || v === null) return false;
   const j = v as Partial<DisassemblyJobRecord>;
@@ -110,13 +135,23 @@ export function isDisassemblyJobRecord(v: unknown): v is DisassemblyJobRecord {
     && isTime(j.startedAt) && isTime(j.doneMs) && isTime(j.asOf)
     && j.asOf >= j.startedAt
     && j.doneMs <= laborMsFor(j.laborHours)
-    && j.doneMs <= MAX_CREW * (j.asOf - j.startedAt)
     && (j.finishedAt === undefined
-      ? j.outcome === undefined
+      ? j.outcome === undefined && j.doneMs <= MAX_CREW * (j.asOf - j.startedAt)
       : isTime(j.finishedAt)
         && (j.outcome === 'removed' || j.outcome === 'detached')
         && j.asOf === j.finishedAt
         && j.doneMs === laborMsFor(j.laborHours));
+}
+
+/** Shape guard for a robot's work record (peer writes, like the job's). A
+ *  robot can't have worked longer than its job has been open. */
+export function isDisassemblyWork(v: unknown): v is DisassemblyWork {
+  if (typeof v !== 'object' || v === null) return false;
+  const w = v as Partial<DisassemblyWork>;
+  return isStr(w.roomId, MAX_ID) && isStr(w.dockId, MAX_ID)
+    && isTime(w.startedAt) && isTime(w.ms) && isTime(w.asOf)
+    && w.ms <= w.asOf - w.startedAt
+    && typeof w.working === 'boolean';
 }
 
 /** Labor the job takes, in real ms of one robot's work. */
@@ -131,13 +166,57 @@ export function workedMs(job: DisassemblyJob, now: number): number {
   return Math.min(total, job.doneMs + job.crew.length * Math.max(0, now - job.asOf));
 }
 
-/** The job's record with its progress folded in at `now`, as worked by its
- *  crew until then: what a crew change writes first. A clock behind `asOf`
- *  (another writer's ran ahead) changes nothing. */
-export function settleJob(job: DisassemblyJob, now: number): DisassemblyJobRecord {
-  const { crew: _crew, ...record } = job;
-  if (now <= job.asOf) return record;
-  return { ...record, doneMs: workedMs(job, now), asOf: now };
+/** 🔧 A robot's work record once it starts (or starts again) on `record`'s
+ *  job at `now`: its labor there so far kept (none from a job opened before
+ *  on the same module), its clock running from then. A clock behind its
+ *  last record starts it at that record instead. */
+export function startWork(
+  record: Pick<DisassemblyJobRecord, 'roomId' | 'startedAt'>,
+  dockId: string,
+  prior: DisassemblyWork | undefined,
+  now: number,
+): DisassemblyWork {
+  const same = prior?.roomId === record.roomId && prior.startedAt === record.startedAt;
+  const ms = same ? prior.ms : 0;
+  return {
+    roomId: record.roomId, dockId, startedAt: record.startedAt, ms,
+    asOf: Math.max(now, record.startedAt + ms, same ? prior.asOf : 0),
+    working: true,
+  };
+}
+
+/** 🔧 A working robot's record once it stops at `now`: the time since its
+ *  last record is labor it did. A clock behind that record adds none. */
+export function stopWork(work: DisassemblyWork, now: number): DisassemblyWork {
+  const at = Math.max(now, work.asOf);
+  return { ...work, ms: work.ms + (at - work.asOf), asOf: at, working: false };
+}
+
+/** 🔧 The job as read: `record` with the labor of its robots' records folded
+ *  in as of the latest of them (or the record's own `asOf`), so workedMs and
+ *  jobDueAt read it as one crew working since then. A robot works on it
+ *  while its record says it is working and it is still set to the job (in
+ *  `active`: not stopped, its dock placed); a robot that isn't adds what
+ *  its record holds and no more. An ended job keeps its record's labor and
+ *  has no crew. */
+export function jobFromWork(
+  record: DisassemblyJobRecord,
+  work: Iterable<DisassemblyWork>,
+  active: ReadonlySet<string>,
+): DisassemblyJob {
+  if (record.finishedAt !== undefined) return { ...record, crew: [] };
+  const mine = [...work].filter((w) => w.roomId === record.roomId && w.startedAt === record.startedAt);
+  const asOf = mine.reduce((t, w) => Math.max(t, w.asOf), record.asOf);
+  let done = record.doneMs;
+  const crew: string[] = [];
+  for (const w of mine) {
+    done += w.ms;
+    if (w.working && active.has(w.dockId)) {
+      crew.push(w.dockId);
+      done += asOf - w.asOf;
+    }
+  }
+  return { ...record, doneMs: Math.min(jobLaborMs(record), done), asOf, crew: crew.sort() };
 }
 
 /** When the labor runs out at the current crew, or null (already finished,
@@ -269,7 +348,7 @@ function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId
 export function removalBlocker(input: CandidateInput, roomId: string): string | null {
   const { atlas } = input;
   if (input.welcomeRoomId && roomId === input.welcomeRoomId) return "it is the station's welcome room";
-  const entry = atlas[roomId];
+  const entry = ownValue(atlas, roomId);
   const stub = !!entry && Object.keys(entry.doors ?? {}).length === 0 && entry.localSeenAt === undefined;
   if (!entry || stub) return "its layout isn't known yet; step inside it once";
   const owner = entry.owner;
@@ -280,7 +359,7 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   // Its other connections, as the atlas knows them: its own records and any
   // record pointing at it, berths included.
   const berths = berthDoorIds(atlas);
-  const nameOf = (rid: string) => atlas[rid]?.name || 'another module';
+  const nameOf = (rid: string) => ownValue(atlas, rid)?.name || 'another module';
   for (const [doorId, door] of Object.entries(entry.doors)) {
     const other = door?.targetRoomId;
     if (!other || other === input.hereRoomId || other === roomId) continue;
@@ -301,7 +380,7 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
 export function disassemblyCandidates(input: CandidateInput): DisassemblyCandidate[] {
   const out: DisassemblyCandidate[] = [];
   for (const [roomId, doors] of structuralNeighbours(input)) {
-    const entry = input.atlas[roomId];
+    const entry = ownValue(input.atlas, roomId);
     out.push({
       roomId,
       name: (entry?.name || 'Module').slice(0, MAX_NAME),
