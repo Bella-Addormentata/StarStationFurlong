@@ -122,7 +122,7 @@ import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./
 import { setOwnMediaOrigins } from "./tvConsent";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
 // 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
-import { bindArcadeDoc, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
+import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
 import { leaveArcadeRoom } from "./arcadeSession";
 import { closeArcadeStage } from "./arcadeStage";
 import { FURNITURE } from "./furniture";
@@ -3165,6 +3165,10 @@ function resolveOwnerLabel(owner: string): string {
  *    · the room ACCESS MODE        · co-host accept/deny/revoke
  *    · the TV's spare remote (#186: taking the remote from its holder, or
  *      handing theirs on — setTvHostPredicate; the panels paint from it)
+ *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
+ *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
+ *      cabinet's CURATION (shelf, game, emulator files) stays with the
+ *      shareholder-extended gate above (setArcadeHostPredicate).
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
  *  own venture map entry, which is peer-written, shape-checked only, and tied
@@ -8786,9 +8790,15 @@ async function init() {
       ? crypto.randomUUID()
       : `page-${Math.random().toString(36).slice(2, 12)}`,
   );
-  // 🕹 #193: the owner curates the cabinet and may eject P1; the seat is
-  // held under my identity from this page.
+  // 🕹 #193: two authorities for the cabinet (#142's split, in the
+  // isLocalPlayerRoomOwner docblock). Curation — the shelf, the game, the
+  // emulator files — is the edit gate's, shareholder-extended. Unseating
+  // P1 (EJECT, sitting down over a held seat) is the DEED holder's alone:
+  // a peer-written venture record can satisfy the edit gate, and nobody is
+  // taken off the controls on the strength of one. The seat is held under
+  // my identity from this page.
   setArcadeHostPredicate(() => canEditRoom().ok);
+  setArcadeEjectPredicate(() => currentRoomDeedIsMine());
   setArcadeIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   setTvRoomPlayersProvider(() => {
     const out: Array<{ pub: string; name: string }> = [];

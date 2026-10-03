@@ -14,7 +14,7 @@
 
 import type { DeviceUI } from './devices';
 import {
-  addToShelf, cabinetKey, coreForName, coreLabel, gameLane, iAmP1, insertCoin, maySit, parseRomUrl,
+  addToShelf, cabinetKey, coreForName, coreLabel, gameLane, iAmP1, insertCoin, mayEjectP1, maySit, parseRomUrl,
   pickFromShelf, putOnCabinet, readCabinet, readSeat, removeFromShelf, seatKey, seatLapsed,
   setEmulatorData, standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_CORES, ARCADE_MAX_NAME,
   isArcadeCore,
@@ -36,7 +36,9 @@ export interface ArcadeDeviceDeps {
   itemId: string;
   myPub: () => string;
   myName: () => string;
-  /** Room-owner gate — the shelf, the game, the emulator files, EJECT. */
+  /** Room-owner gate — the shelf, the game, the emulator files (curation).
+   *  EJECT is the deed holder's and is asked of arcadeDoc (mayEjectP1), the
+   *  predicate that gates the write. */
   canEdit: () => boolean;
   /** INSERT COIN taken with a game on: open the stage (the focus releases first). */
   openStage: () => void;
@@ -162,7 +164,7 @@ function renderPanel(itemId: string, deps: ArcadeDeviceDeps): string {
     mine ? smallButton('data-arcade-standup="1"', '🪑 STAND UP') : '',
     !mine && maySit(itemId) && game ? bigButton('data-arcade-coin="1"', '🪙 INSERT COIN · PLAY', '212,168,75') : '',
     !mine && maySit(itemId) && !game && rec.shelf.length ? bigButton('data-arcade-coin="1"', '🪙 INSERT COIN · PICK FROM THE SHELF', '212,168,75') : '',
-    !mine && held && owner ? smallButton('data-arcade-eject="1"', '⏏ EJECT P1 (OWNER)') : '',
+    !mine && held && mayEjectP1() ? smallButton('data-arcade-eject="1"', '⏏ EJECT P1 (OWNER)') : '',
   ].join('');
 
   const shelf = rec.shelf.length
@@ -198,7 +200,7 @@ function renderPanel(itemId: string, deps: ArcadeDeviceDeps): string {
       ${smallButton('data-arcade-data="station"', `${rec.data === 'station' ? '✓ ' : ''}THIS STATION`, true, rec.data === 'station')} ${laneBadge('SOVEREIGN')}
       ${smallButton('data-arcade-data="cdn"', `${rec.data === 'cdn' ? '✓ ' : ''}cdn.emulatorjs.org`, true, rec.data === 'cdn')} ${laneBadge('CONVENIENCE')}
     </div>
-    <div style="font-size:9px; color:${DIM}; line-height:1.4;">This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is not sent to anyone: each P1 brings their own copy until the blob lane carries it.</div>
+    <div style="font-size:9px; color:${DIM}; line-height:1.4;">This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it) — but under the CDN the emulator's own code reads the file, so each P1 is asked before their copy goes to it; THIS STATION's files keep it on their machine.</div>
   `) : '';
 
   return `

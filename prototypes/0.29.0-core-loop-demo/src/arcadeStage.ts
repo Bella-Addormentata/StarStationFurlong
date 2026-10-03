@@ -9,25 +9,32 @@
  * WHILE THE STAGE IS OPEN THE WORLD GETS NO KEYS. The world's InputManager
  * listens on the window with no target check, so W/A/S/D typed into the
  * parent page would walk the player; a capture-phase listener on the window
- * swallows every keydown/keyup that reaches the parent while the stage is
- * up. Keys typed into the focused frame never reach the parent at all —
- * that is the normal path; the swallow covers the moments the frame has
- * not got focus (a click on the chrome). Escape, from either side, stands
- * P1 up. Because of that swallow, a stage whose seat is gone closes AT ONCE
+ * swallows every KEYDOWN that reaches the parent while the stage is up.
+ * Keys typed into the focused frame never reach the parent at all — that is
+ * the normal path; the swallow covers the moments the frame has not got
+ * focus (a click on the chrome, the notices before a game runs). KEYUP is
+ * never swallowed: a keyup starts nothing in the world, it only ends what a
+ * keydown began — and a key held when the stage opened must still be
+ * released to the InputManager, or the player walks on after the stage
+ * closes until that key is pressed again. Escape, from either side, stands
+ * P1 up. Because of the swallow, a stage whose seat is gone closes AT ONCE
  * rather than lingering behind a notice.
  *
  * What it shows before the game runs, honestly: CHECKING / LOADING /
  * STARTING, NOT PROVISIONED with the command when this station has no
  * emulator files, BRING YOUR COPY when the game is a file on its owner's
- * disk (the copy must be the same size as the shelf's), and a RETRY on any
- * fault.
+ * disk (the copy must be the same size as the shelf's), YOUR COPY WOULD
+ * RUN UNDER CDN CODE when that file would be handed to engine code from
+ * another origin (the player's consent, not a claim that it is safe), and
+ * a RETRY on any fault.
  */
 
 import { coreLabel, countPlay, gameId, gameLane, iAmP1, readCabinet, readSeat, standUp } from './arcadeDoc';
 import type { ArcadeGame, EmulatorData } from './arcadeDoc';
 import {
-  emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated, localRomFor,
-  mountEmulatorFrame, probeEmulatorData, rememberLocalRom, romAcceptList,
+  allowLocalRomExposure, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated,
+  localRomExposureAllowed, localRomFor, mountEmulatorFrame, probeEmulatorData, rememberLocalRom,
+  romAcceptList, EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
 import type { EmulatorHandle } from './arcadeEmulator';
 import { escapeHtml } from './htmlEscape';
@@ -45,13 +52,13 @@ interface Stage {
   controls: HTMLDivElement;
   frame: EmulatorHandle | null;
   /** `<gameId>@<data>` of what is mounted, 'waiting:…' for a file to bring,
-   *  'failed:…' after a fault (RETRY clears it), '' for nothing. */
+   *  'consent:…' for a file the player has not yet agreed to hand to CDN
+   *  code, 'failed:…' after a fault (RETRY clears it), '' for nothing. */
   mounted: string;
   phase: Phase;
   counted: boolean;
   timer: number;
   onKey: (e: KeyboardEvent) => void;
-  onKeyUp: (e: KeyboardEvent) => void;
   lastHead: string;
   lastStatus: string;
   lastControls: string;
@@ -96,9 +103,9 @@ export function openArcadeStage(itemId: string): void {
     }
     e.stopPropagation(); // at the controls: nothing walks the player
   };
-  const onKeyUp = (e: KeyboardEvent) => { e.stopPropagation(); };
+  // Keydown only: a keyup must still reach the InputManager, so a key held
+  // as the stage opened is let go of (see the header).
   window.addEventListener('keydown', onKey, true);
-  window.addEventListener('keyup', onKeyUp, true);
   stage = {
     root,
     itemId,
@@ -113,7 +120,6 @@ export function openArcadeStage(itemId: string): void {
     counted: false,
     timer: 0,
     onKey,
-    onKeyUp,
     lastHead: '',
     lastStatus: '',
     lastControls: '',
@@ -136,7 +142,6 @@ function teardown(t: Stage): void {
   if (stage === t) stage = null;
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
-  window.removeEventListener('keyup', t.onKeyUp, true);
   unmountFrame(t);
   t.root.remove();
 }
@@ -195,7 +200,7 @@ function stageTick(): void {
     return;
   }
   const key = `${gameId(game)}@${rec.data}`;
-  if (t.mounted !== key && t.mounted !== `failed:${key}` && t.mounted !== `waiting:${key}`) {
+  if (t.mounted !== key && t.mounted !== `failed:${key}` && t.mounted !== `waiting:${key}` && t.mounted !== `consent:${key}`) {
     void mountGame(t, game, rec.data, key);
   }
   renderStageChrome(t);
@@ -205,6 +210,22 @@ function waitingNotice(t: Stage, game: ArcadeGame): void {
   const size = game.size > 0 ? ` (${game.size.toLocaleString()} bytes)` : '';
   showNotice(t, `BRING YOUR COPY OF ${game.name.toUpperCase()}`,
     `This game is a file on its owner's disk, not a link. Pick the same file${escapeHtml(size)} from yours below — the blob lane will carry it between players later.${t.fileNote ? `<br><span style="color:#ff8a50;">${escapeHtml(t.fileNote)}</span>` : ''}`);
+}
+
+/** The player's file would be handed to engine code from another origin:
+ *  said plainly, and run only on their word. The sandbox is no answer here —
+ *  it keeps that code off this page, not off the file it is given. */
+function consentNotice(t: Stage, game: ArcadeGame, path: string): void {
+  let host = path;
+  try { host = new URL(path).host; } catch { /* shown as it is */ }
+  showNotice(t, 'YOUR COPY WOULD RUN UNDER CDN CODE',
+    `This cabinet loads its emulator from <b>${escapeHtml(host)}</b> (the CONVENIENCE lane). That code runs in an isolated frame that cannot touch this page — but it can read the file you bring, <b>${escapeHtml(game.name)}</b>, and send it anywhere. Your file stays on this machine only with THIS STATION's emulator files (the owner's call: <code>${escapeHtml(EMULATOR_FETCH_COMMAND)}</code>, then rebuild).<br>
+    <button type="button" data-arcade-expose="1">▶ RUN MY COPY UNDER ${escapeHtml(host.toUpperCase())} ANYWAY</button>`);
+  t.notice.querySelector<HTMLButtonElement>('[data-arcade-expose]')?.addEventListener('click', () => {
+    allowLocalRomExposure(game, path);
+    t.mounted = '';
+    stageTick();
+  });
 }
 
 async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: string): Promise<void> {
@@ -228,6 +249,16 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
       t.mounted = `waiting:${key}`;
       t.phase = 'waiting';
       waitingNotice(t, game);
+      renderStageChrome(t);
+      return;
+    }
+    // A file from the player's disk goes to engine code from another
+    // origin only on the player's word (arcadeEmulator: the sandbox keeps
+    // that code off this page, not off the file it is handed).
+    if (!localRomExposureAllowed(game, path)) {
+      t.mounted = `consent:${key}`;
+      t.phase = 'waiting';
+      consentNotice(t, game, path);
       renderStageChrome(t);
       return;
     }

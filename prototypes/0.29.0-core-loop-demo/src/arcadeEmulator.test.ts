@@ -6,8 +6,9 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-  arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated, localRomFor,
-  probeEmulatorData, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND,
+  allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated,
+  localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA,
+  EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
 
 const res = (status: number, type = 'application/javascript'): Response =>
@@ -76,5 +77,19 @@ describe('where the emulator files come from', () => {
     expect(romAcceptList()).toContain('.nes');
     expect(romAcceptList()).toContain('.zip');
     expect(romAcceptList().startsWith('.')).toBe(true);
+  });
+
+  it('hands the player\'s own file to engine code from another origin only on their word, per game and per engine path', () => {
+    const game = { name: 'tetris.nes', core: 'nes' as const, url: '', size: 40_976 };
+    const origin = 'http://localhost:4173';
+    // The station's own files run with the app: nothing to consent to.
+    expect(localRomExposureAllowed(game, '/emulatorjs/data/', origin)).toBe(true);
+    expect(localRomExposureAllowed(game, `${origin}/emulatorjs/data/`, origin)).toBe(true);
+    // The CDN's code is another origin's: not until the player says so.
+    expect(localRomExposureAllowed(game, EMULATOR_CDN_DATA, origin)).toBe(false);
+    allowLocalRomExposure(game, EMULATOR_CDN_DATA);
+    expect(localRomExposureAllowed(game, EMULATOR_CDN_DATA, origin)).toBe(true);
+    expect(localRomExposureAllowed({ ...game, size: 1 }, EMULATOR_CDN_DATA, origin)).toBe(false); // another file: its own ask
+    expect(localRomExposureAllowed(game, 'https://mirror.example/data/', origin)).toBe(false); // another engine origin: its own ask
   });
 });

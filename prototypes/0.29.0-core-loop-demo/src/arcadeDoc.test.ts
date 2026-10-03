@@ -8,10 +8,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   addToShelf, arcadePageId, arcadeScreenView, bindArcadeDoc, cabinetKey, coreForName, coreLabel,
-  countPlay, gameId, gameLane, iAmP1, insertCoin, maySit, parseRomUrl, pickFromShelf, putOnCabinet,
-  readCabinet, readSeat, removeFromShelf, renewSeat, sanitizeGame, seatKey, seatLapsed, seatStatus,
-  setArcadeClock, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
-  standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_SEAT_LAPSE_MS, ARCADE_SHELF_MAX,
+  countPlay, gameId, gameLane, iAmP1, insertCoin, mayEjectP1, maySit, parseRomUrl, pickFromShelf, putOnCabinet,
+  playsKey, readCabinet, readPlays, readSeat, removeFromShelf, renewSeat, sanitizeGame, seatKey, seatLapsed, seatStatus,
+  setArcadeClock, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity, setArcadePageId, setEmulatorData,
+  standUp, subscribeArcadeKey, takeOffCabinet, ARCADE_BLINK_MS, ARCADE_COUNTER_MAX, ARCADE_SEAT_LAPSE_MS, ARCADE_SHELF_MAX,
 } from './arcadeDoc';
 import type { ArcadeGame } from './arcadeDoc';
 
@@ -23,7 +23,9 @@ const TETRIS: ArcadeGame = { name: 'tetris.nes', core: 'nes', url: '', size: 40_
 
 let doc: Y.Doc;
 let now = 1_000_000;
+/** The edit gate (curation) and the deed (ejecting), registered apart. */
 let owner = false;
+let deed = false;
 const iAm = (pub: string, name = '') => setArcadeIdentity(() => ({ pub, name }));
 const tick = (ms: number) => { now += ms; };
 
@@ -31,8 +33,10 @@ beforeEach(() => {
   doc = new Y.Doc();
   now = 1_000_000;
   owner = false;
+  deed = false;
   setArcadeClock(() => now);
   setArcadeHostPredicate(() => owner);
+  setArcadeEjectPredicate(() => deed);
   setArcadePageId('tab-a');
   iAm(ALICE, 'Alice');
   bindArcadeDoc(doc);
@@ -49,17 +53,38 @@ describe('reads', () => {
       game: { name: 'x.nes', core: 'nes', url: 'javascript:alert(1)' },
       shelf: [PACMAN, { name: '', core: 'nes', url: '' }, { name: 'y.gb', core: 'commodore', url: '' }, ...Array<ArcadeGame>(20).fill(TETRIS)],
       data: 'elsewhere',
-      plays: -3,
+      plays: 99, // a tally written into the curation's key is not the tally
       seq: 'x',
     });
+    map.set(playsKey(CAB), { plays: -3 });
     const rec = readCabinet(CAB);
     expect(rec.game).toBeNull(); // a javascript: URL never reaches the frame
     expect(rec.shelf.map((g) => g.name)).toEqual(['pacman.zip', ...Array<string>(ARCADE_SHELF_MAX - 1).fill('tetris.nes')]);
     expect(rec.data).toBe('station');
     expect(rec.plays).toBe(0);
     expect(rec.seq).toBe(0);
+    map.set(playsKey(CAB), 'lots');
+    expect(readPlays(CAB)).toBe(0);
     map.set(seatKey(CAB), { holder: 42, name: 'x', page: 'p', leaseAt: 'soon' });
     expect(readSeat(CAB)).toEqual({ holder: '', name: '', page: '', leaseAt: 0, by: '' });
+  });
+
+  it('a revision counter a peer wrote past moving reads as the floor, and every write after it still moves', () => {
+    owner = true;
+    const map = doc.getMap('arcade');
+    for (const stuck of [Number.MAX_VALUE, Number.MAX_SAFE_INTEGER + 1, 1.5, -1, 'x', null]) {
+      map.set(cabinetKey(CAB), { game: null, shelf: [], data: 'station', seq: stuck });
+      expect(readCabinet(CAB).seq).toBe(0);
+      map.set(playsKey(CAB), { plays: stuck });
+      expect(readPlays(CAB)).toBe(0);
+    }
+    map.set(cabinetKey(CAB), { game: null, shelf: [], data: 'station', seq: Number.MAX_VALUE });
+    expect(putOnCabinet(CAB, PACMAN)).toEqual({ ok: true });
+    expect(readCabinet(CAB).seq).toBe(1); // the floor, then one up: moved
+    map.set(cabinetKey(CAB), { game: null, shelf: [], data: 'station', seq: ARCADE_COUNTER_MAX });
+    expect(readCabinet(CAB).seq).toBe(ARCADE_COUNTER_MAX);
+    expect(putOnCabinet(CAB, PACMAN)).toEqual({ ok: true });
+    expect(readCabinet(CAB).seq).toBe(0); // round past the ceiling: moved, which is all a revision must do
   });
 
   it('sanitizeGame keeps http(s) and own-disk games and drops the rest', () => {
@@ -195,14 +220,22 @@ describe('player one', () => {
     expect(readSeat(CAB)).toEqual(before);
   });
 
-  it('standing up frees the seat; a stranger cannot; the owner can kick', () => {
+  it('standing up frees the seat; a stranger cannot; the DEED holder can kick, and the edit gate alone cannot', () => {
     insertCoin(CAB);
     iAm(BOB, 'Bob');
     expect(standUp(CAB)).toEqual({ ok: false, error: 'Alice is at the controls.' });
+    // The shareholder-extended edit gate curates; it unseats nobody — a
+    // peer-written venture record can satisfy it.
     owner = true;
+    expect(mayEjectP1()).toBe(false);
+    expect(standUp(CAB)).toEqual({ ok: false, error: 'Alice is at the controls.' });
+    expect(readSeat(CAB).holder).toBe(ALICE);
+    deed = true;
+    expect(mayEjectP1()).toBe(true);
     expect(standUp(CAB)).toEqual({ ok: true });
     expect(readSeat(CAB)).toEqual({ holder: '', name: '', page: '', leaseAt: now, by: BOB });
     owner = false;
+    deed = false;
     expect(standUp(CAB)).toEqual({ ok: true }); // nothing to do
     iAm(ALICE, 'Alice');
     insertCoin(CAB);
@@ -210,10 +243,13 @@ describe('player one', () => {
     expect(seatStatus(CAB)).toBe('free');
   });
 
-  it('the owner may sit even while someone holds the seat', () => {
+  it('the deed holder may sit even while someone holds the seat; the edit gate may not', () => {
     insertCoin(CAB);
     iAm(BOB, 'Bob');
     owner = true;
+    expect(maySit(CAB)).toBe(false);
+    expect(insertCoin(CAB)).toEqual({ ok: false, error: 'Alice is at the controls.' });
+    deed = true;
     expect(maySit(CAB)).toBe(true);
     expect(insertCoin(CAB)).toEqual({ ok: true });
     expect(readSeat(CAB).holder).toBe(BOB);
@@ -237,13 +273,40 @@ describe('the menu and the tally', () => {
     expect(readCabinet(CAB).game).toEqual(TETRIS);
   });
 
-  it('countPlay counts only under P1', () => {
+  it('countPlay counts only under P1, in the tally\'s own key', () => {
     countPlay(CAB);
     expect(readCabinet(CAB).plays).toBe(0);
     insertCoin(CAB);
+    const curation = doc.getMap('arcade').get(cabinetKey(CAB));
     countPlay(CAB);
     countPlay(CAB);
     expect(readCabinet(CAB).plays).toBe(2);
+    expect(doc.getMap('arcade').get(playsKey(CAB))).toEqual({ plays: 2 });
+    expect(doc.getMap('arcade').get(cabinetKey(CAB))).toBe(curation); // the curation's key untouched
+  });
+
+  it('a play counted as the owner edits the shelf reverts neither the edit nor the count', () => {
+    // Alice (P1) counts a play on her doc while Bob (the owner) adds to the
+    // shelf on his, offline; synced both ways, the shelf has the game AND
+    // the tally has the play — two keys, so the two writes never met.
+    const alice = doc;
+    insertCoin(CAB);
+    const bob = new Y.Doc();
+    Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+    bindArcadeDoc(bob);
+    iAm(BOB, 'Bob');
+    owner = true;
+    expect(addToShelf(CAB, PACMAN)).toEqual({ ok: true });
+    bindArcadeDoc(alice);
+    iAm(ALICE, 'Alice');
+    owner = false;
+    countPlay(CAB);
+    Y.applyUpdate(alice, Y.encodeStateAsUpdate(bob));
+    Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+    for (const d of [alice, bob]) {
+      bindArcadeDoc(d);
+      expect(readCabinet(CAB)).toMatchObject({ shelf: [PACMAN], plays: 1 });
+    }
   });
 });
 

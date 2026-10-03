@@ -234,6 +234,26 @@ export function localRomFor(game: ArcadeGame): File | null {
   return localRoms.get(gameId(game)) ?? null;
 }
 
+/** The player's consent to hand their own file to engine code from another
+ *  origin (the CDN lane). The frame's sandbox keeps that code off this page,
+ *  its storage and its DOM — but a File posted into the frame is readable
+ *  by whatever runs there, and that code can send it anywhere. So under
+ *  the CDN lane a file from the player's disk goes into the frame only
+ *  after the player said so, per game and per engine path, for this page's
+ *  life. The station's own files run with the app and need no consent. */
+const exposedRoms = new Set<string>();
+const exposureKey = (game: ArcadeGame, pathToData: string): string => `${pathToData}|${gameId(game)}`;
+export function localRomExposureAllowed(
+  game: ArcadeGame,
+  pathToData: string,
+  origin = typeof location === 'undefined' ? '' : location.origin,
+): boolean {
+  return !emulatorIsolated(pathToData, origin) || exposedRoms.has(exposureKey(game, pathToData));
+}
+export function allowLocalRomExposure(game: ArcadeGame, pathToData: string): void {
+  exposedRoms.add(exposureKey(game, pathToData));
+}
+
 /** The accept list for a ROM file input: every extension a core here takes. */
 export function romAcceptList(): string {
   return ARCADE_CORES.flatMap((c) => c.exts.map((e) => `.${e}`)).join(',');

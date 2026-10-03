@@ -11,10 +11,14 @@
  *   - the CORES the cabinet offers (one `<core>-wasm.data` each) from the
  *     EmulatorJS CDN at the SAME version, so engine and cores match.
  *
- * Everything lands in a staging directory first and is checked — loader.js
- * present, every core file present and non-empty — and only then swapped
- * into public/emulatorjs/ in one rename. A failed or partial fetch leaves
- * whatever was installed before untouched, and says so.
+ * Everything lands in a staging directory first — under public/emulatorjs/
+ * itself, so the final move is a rename on one filesystem and not a copy
+ * that can fail halfway (the OS temp directory is often another
+ * filesystem, where rename throws EXDEV) — and is checked: loader.js
+ * present, every core file present and non-empty. Only then is it swapped
+ * into place: the old install moves aside, the new one moves in, and if
+ * that second move fails the old one is put back. A failed or partial
+ * fetch leaves whatever was installed before in place, and says so.
  *
  *   npm run fetch:emulatorjs
  *   EJS_VERSION=4.2.1 npm run fetch:emulatorjs
@@ -57,10 +61,11 @@ const DEFAULT_CORES = [
 const cores = (process.env.EJS_CORES ? process.env.EJS_CORES.split(',') : DEFAULT_CORES)
   .map((c) => c.trim()).filter(Boolean);
 const log = (s) => console.log(`[fetch-emulatorjs] ${s}`);
+/** A failure is thrown, not exited on: the cleanup below must run first
+ *  (process.exit would skip the `finally`, leaving staging behind). */
+class Failure extends Error {}
 const fail = (why) => {
-  console.error(`[fetch-emulatorjs] FAILED: ${why}`);
-  console.error('[fetch-emulatorjs] nothing under public/emulatorjs/ was changed.');
-  process.exit(1);
+  throw new Failure(why);
 };
 
 async function download(url, to) {
@@ -72,9 +77,16 @@ async function download(url, to) {
   return bytes.length;
 }
 
+// The clone may live anywhere (it is only copied from); the staging tree
+// lives beside its destination, on the same filesystem, so the swap below
+// is two renames and never a copy.
 const tmp = mkdtempSync(join(tmpdir(), 'emulatorjs-'));
 const clone = join(tmp, 'repo');
-const staging = join(tmp, 'data');
+mkdirSync(root, { recursive: true });
+const staging = mkdtempSync(join(root, '.staging-'));
+/** '' until the swap; dest once the new tree is in; 'lost' when the old
+ *  tree could not be put back after a failed swap (it is at dest.prev). */
+let installed = '';
 try {
   log(`engine: cloning ${repo} @ v${version} (shallow)…`);
   try {
@@ -107,18 +119,41 @@ try {
     if (!existsSync(p) || statSync(p).size === 0) fail(`core file missing or empty after download: ${p}`);
   }
   if (!existsSync(join(staging, 'loader.js'))) fail('loader.js missing from the staging tree');
-  // Atomic swap: the old install moves aside, the new one moves in, the old
-  // one goes — a crash between the two renames leaves `.prev` to recover.
-  mkdirSync(root, { recursive: true });
+  // The swap: the old install moves aside, the new one moves in (a rename
+  // on the same filesystem), the old one goes. A failure of the second
+  // move puts the old install back before anything is said — the station
+  // is never left with no emulator files at all; a crash between the two
+  // renames leaves `.prev` to recover by hand.
   const prev = `${dest}.prev`;
   rmSync(prev, { recursive: true, force: true });
-  if (existsSync(dest)) renameSync(dest, prev);
-  renameSync(staging, dest);
+  const had = existsSync(dest);
+  if (had) renameSync(dest, prev);
+  try {
+    renameSync(staging, dest);
+  } catch (err) {
+    let restored = !had;
+    if (had) {
+      try {
+        renameSync(prev, dest);
+        restored = true;
+      } catch (back) {
+        installed = 'lost';
+        console.error(`[fetch-emulatorjs] the previous install could not be put back either (${back.message}); it is at ${prev}`);
+      }
+    }
+    fail(`could not move the new files into place (${err.message})${restored ? '; the previous install is as it was' : ''}.`);
+  }
+  installed = dest;
   rmSync(prev, { recursive: true, force: true });
   const head = execFileSync('git', ['-C', clone, 'rev-parse', 'HEAD']).toString().trim();
   writeFileSync(join(root, 'VERSION'), `v${version} ${head}\ncores: ${cores.join(', ')}\n`);
   log(`${dest} ready: v${version} (${head.slice(0, 12)}), ${cores.length} cores, ${(total / 1_048_576).toFixed(0)} MB of cores.`);
   log('The cabinet\'s EMULATOR FILES: THIS STATION now works offline (rebuild with `npm run build`).');
+} catch (err) {
+  console.error(`[fetch-emulatorjs] FAILED: ${err instanceof Failure ? err.message : (err && err.stack) || err}`);
+  if (!installed) console.error('[fetch-emulatorjs] the install under public/emulatorjs/data is as it was.');
+  process.exitCode = 1;
 } finally {
   rmSync(tmp, { recursive: true, force: true });
+  rmSync(staging, { recursive: true, force: true }); // already gone after a successful swap
 }

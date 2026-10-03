@@ -1,13 +1,19 @@
 /**
  * 🕹 arcadeDoc — the arcade cabinet's shared records (#193).
  *
- * Two keys per cabinet in the room doc's `arcade` map, plain JSON, whole-
+ * Three keys per cabinet in the room doc's `arcade` map, plain JSON, whole-
  * value transacted writes, LWW per key (the tvDoc / partyDoc discipline):
- *   arcade:<itemId> → CabinetRecord  the shelf, the game on the cabinet, the
- *                                    emulator-files choice, the play counter
+ *   arcade:<itemId> → the curation   the shelf, the game on the cabinet, the
+ *                                    emulator-files choice (the owner's, P1's
+ *                                    pick from the shelf)
  *   seat:<itemId>   → SeatRecord     who is at the controls — PLAYER ONE — as
  *                                    a lease (the TV remote's shape)
- * Separate keys so a seat renewal never collides with a shelf edit.
+ *   plays:<itemId>  → PlaysRecord    the attract card's tally, P1's write
+ * One key per writer: a seat renewal never collides with a shelf edit, and
+ * a play counted the moment the owner edits the shelf never reverts the
+ * edit (nor the edit the count) — whole-value LWW keeps one of two writes
+ * to a key, so each thing that changes on its own has a key of its own.
+ * readCabinet joins the tally on read.
  *
  * PLAYER ONE IS THE SOURCE (plan §9, brainstorming/smart-tv-arcade-media-
  * plan.md): one player holds the cabinet's P1 panel; their emulator, running
@@ -21,7 +27,14 @@
  * page renews every ARCADE_SEAT_RENEW_MS; the seat lapses
  * ARCADE_SEAT_LAPSE_MS after the last renewal THIS page saw (never by the
  * holder's clock — the pusherCroupier.ts CLOCKS rule). Standing up, leaving
- * the room, or the room owner (the host predicate) frees it.
+ * the room, or the room's DEED holder (the eject predicate) frees it.
+ *
+ * TWO AUTHORITIES, NOT ONE (main.ts's #142 split): the HOST predicate is the
+ * shareholder-extended edit gate and curates — a peer-written venture
+ * record can satisfy it, which is acceptable reach for a shelf. The EJECT
+ * predicate is the raw deed holder and is the only one that unseats P1
+ * (EJECT, or sitting down over a held seat): nobody is taken off the
+ * controls on the strength of a record any peer could have written.
  *
  * THE OWNER CURATES: the shelf (the cabinet's menu), the game on the
  * cabinet, and where the emulator's own files come from — this station's
@@ -120,9 +133,19 @@ export interface CabinetRecord {
   /** The owner's curated shelf — the cabinet's menu. */
   shelf: ArcadeGame[];
   data: EmulatorData;
-  /** Times a game started on this cabinet (the attract card's tally). */
+  /** Times a game started on this cabinet (the attract card's tally) —
+   *  joined from its own key on read, never stored with the curation. */
   plays: number;
+  /** The curation's revision: a lookup in flight is void past it. */
   seq: number;
+}
+
+/** What the `arcade:` key holds: the record without the tally. */
+export type CabinetCuration = Omit<CabinetRecord, 'plays'>;
+
+/** The `plays:` key: P1's tally, apart from the owner's curation. */
+export interface PlaysRecord {
+  plays: number;
 }
 
 export interface SeatRecord {
@@ -142,6 +165,7 @@ export interface SeatRecord {
 
 export const CABINET_DEFAULT: CabinetRecord = { game: null, shelf: [], data: 'station', plays: 0, seq: 0 };
 export const SEAT_FREE: SeatRecord = { holder: '', name: '', page: '', leaseAt: 0, by: '' };
+export const PLAYS_DEFAULT: PlaysRecord = { plays: 0 };
 
 // ── Binding (the tvDoc shape) ────────────────────────────────────────────────
 
@@ -262,16 +286,34 @@ export function cabinetKey(itemId: string): string {
 export function seatKey(itemId: string): string {
   return `seat:${itemId}`;
 }
+export function playsKey(itemId: string): string {
+  return `plays:${itemId}`;
+}
 
-// ── Identity and host seams (registered by main.ts, never asserted by a caller) ──
+// ── Identity and authority seams (registered by main.ts, never asserted by a caller) ──
 
 let identityProvider: () => { pub: string; name: string } = () => ({ pub: '', name: '' });
 export function setArcadeIdentity(provider: () => { pub: string; name: string }): void {
   identityProvider = provider;
 }
+/** Curation: the shelf, the game, the emulator files — the room's edit
+ *  gate (shareholder-extended, see main.ts's authority split). */
 let hostPredicate: () => boolean = () => false;
 export function setArcadeHostPredicate(predicate: () => boolean): void {
   hostPredicate = predicate;
+}
+/** Unseating P1 (EJECT, sitting down over a held seat): the room's DEED
+ *  holder only — main.ts registers currentRoomDeedIsMine here, never the
+ *  edit gate, which a peer-written venture record can satisfy. */
+let ejectPredicate: () => boolean = () => false;
+export function setArcadeEjectPredicate(predicate: () => boolean): void {
+  ejectPredicate = predicate;
+}
+/** Whether this client may take P1 off the controls. The panel paints EJECT
+ *  from here — the predicate the write itself checks — so no button is
+ *  offered that standUp then refuses. */
+export function mayEjectP1(): boolean {
+  return ejectPredicate();
 }
 
 // ── Shape-checked reads ──────────────────────────────────────────────────────
@@ -279,6 +321,15 @@ export function setArcadeHostPredicate(predicate: () => boolean): void {
 const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.slice(0, max) : '');
 const num = (v: unknown, fallback = 0): number =>
   typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+/** One rule for the revision counter and the tally (the tvDoc rule): a
+ *  reader compares `seq` for change and a writer moves it by one, so it
+ *  must be a whole number that one more still moves — a peer's
+ *  `Number.MAX_VALUE` is finite, and adding one to it changes nothing. A
+ *  counter reads as a safe integer or as the floor, and the bump past the
+ *  ceiling is the floor again. */
+export const ARCADE_COUNTER_MAX = Number.MAX_SAFE_INTEGER;
+const counter = (v: unknown): number => (Number.isSafeInteger(v) && (v as number) >= 0 ? (v as number) : 0);
+const bump = (v: number): number => (v >= ARCADE_COUNTER_MAX ? 0 : v + 1);
 
 /** http(s) only, and never a URL carrying credentials: a game's link goes
  *  into the room-shared record and the shelf, where `user:password@host`
@@ -305,9 +356,10 @@ export function sanitizeGame(raw: unknown): ArcadeGame | null {
   return { name, core: r.core, url, size: Math.max(0, Math.floor(num(r.size))) };
 }
 
-export function readCabinet(itemId: string): CabinetRecord {
-  const raw = ensureMap().get(cabinetKey(itemId)) as Partial<CabinetRecord> | undefined;
-  if (!raw || typeof raw !== 'object') return { ...CABINET_DEFAULT };
+/** The `arcade:` key as a peer may have written it: the curation alone. */
+export function readCuration(itemId: string): CabinetCuration {
+  const raw = ensureMap().get(cabinetKey(itemId)) as Partial<CabinetCuration> | undefined;
+  if (!raw || typeof raw !== 'object') return { game: null, shelf: [], data: 'station', seq: 0 };
   const shelf = Array.isArray(raw.shelf)
     ? raw.shelf.map(sanitizeGame).filter((g): g is ArcadeGame => g !== null).slice(0, ARCADE_SHELF_MAX)
     : [];
@@ -315,9 +367,21 @@ export function readCabinet(itemId: string): CabinetRecord {
     game: sanitizeGame(raw.game),
     shelf,
     data: raw.data === 'cdn' ? 'cdn' : 'station',
-    plays: Math.max(0, Math.floor(num(raw.plays))),
-    seq: Math.max(0, Math.floor(num(raw.seq))),
+    seq: counter(raw.seq),
   };
+}
+
+/** The tally, from its own key. */
+export function readPlays(itemId: string): number {
+  const raw = ensureMap().get(playsKey(itemId)) as Partial<PlaysRecord> | undefined;
+  if (!raw || typeof raw !== 'object') return PLAYS_DEFAULT.plays;
+  return counter(raw.plays);
+}
+
+/** What the panel, the stage and the screen show: the curation with the
+ *  tally joined from its key. */
+export function readCabinet(itemId: string): CabinetRecord {
+  return { ...readCuration(itemId), plays: readPlays(itemId) };
 }
 
 export function readSeat(itemId: string): SeatRecord {
@@ -367,10 +431,11 @@ export function iAmP1(itemId: string): boolean {
   return seatStatus(itemId) === 'mine';
 }
 
-/** May this page take the controls now: free, lapsed, already mine, or I
- *  am the room's owner. */
+/** May this page take the controls now: free, lapsed, already mine — or
+ *  held, and I hold the room's deed (sitting down over someone unseats
+ *  them: the eject predicate, never the edit gate). */
 export function maySit(itemId: string, now = clock()): boolean {
-  return seatStatus(itemId, now) !== 'held' || hostPredicate();
+  return seatStatus(itemId, now) !== 'held' || ejectPredicate();
 }
 
 /** INSERT COIN: take P1 from this page. */
@@ -398,13 +463,14 @@ export function renewSeat(itemId: string, now = clock()): void {
   } satisfies SeatRecord);
 }
 
-/** Stand up. The holder's page may; so may the owner (a kick). */
+/** Stand up. The holder's page may; so may the room's deed holder (EJECT —
+ *  the one authority that unseats people, #142). */
 export function standUp(itemId: string, now = clock()): ArcadeAction {
   const { pub } = identityProvider();
   const rec = readSeat(itemId);
   if (!rec.holder) return { ok: true };
   const mine = rec.holder === pub && rec.page === pageId;
-  if (!mine && !hostPredicate()) {
+  if (!mine && !ejectPredicate()) {
     return { ok: false, error: `${rec.name || 'Someone'} is at the controls.` };
   }
   write(seatKey(itemId), { holder: '', name: '', page: '', leaseAt: now, by: pub } satisfies SeatRecord);
@@ -423,8 +489,8 @@ export function putOnCabinet(itemId: string, game: ArcadeGame): ArcadeAction {
   if (!gate.ok) return gate;
   const clean = sanitizeGame(game);
   if (!clean) return { ok: false, error: 'That is not a game the cabinet can run.' };
-  const rec = readCabinet(itemId);
-  write(cabinetKey(itemId), { ...rec, game: clean, seq: rec.seq + 1 } satisfies CabinetRecord);
+  const rec = readCuration(itemId);
+  write(cabinetKey(itemId), { ...rec, game: clean, seq: bump(rec.seq) } satisfies CabinetCuration);
   return { ok: true };
 }
 
@@ -432,18 +498,18 @@ export function putOnCabinet(itemId: string, game: ArcadeGame): ArcadeAction {
 export function takeOffCabinet(itemId: string): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
-  const rec = readCabinet(itemId);
-  write(cabinetKey(itemId), { ...rec, game: null, seq: rec.seq + 1 } satisfies CabinetRecord);
+  const rec = readCuration(itemId);
+  write(cabinetKey(itemId), { ...rec, game: null, seq: bump(rec.seq) } satisfies CabinetCuration);
   return { ok: true };
 }
 
 /** P1 (or the owner) puts a SHELF game on the cabinet — the menu. */
 export function pickFromShelf(itemId: string, index: number): ArcadeAction {
   if (!iAmP1(itemId) && !hostPredicate()) return { ok: false, error: 'Insert a coin first.' };
-  const rec = readCabinet(itemId);
+  const rec = readCuration(itemId);
   const game = rec.shelf[index];
   if (!game) return { ok: false, error: 'Nothing on that shelf.' };
-  write(cabinetKey(itemId), { ...rec, game, seq: rec.seq + 1 } satisfies CabinetRecord);
+  write(cabinetKey(itemId), { ...rec, game, seq: bump(rec.seq) } satisfies CabinetCuration);
   return { ok: true };
 }
 
@@ -453,21 +519,21 @@ export function addToShelf(itemId: string, game: ArcadeGame): ArcadeAction {
   if (!gate.ok) return gate;
   const clean = sanitizeGame(game);
   if (!clean) return { ok: false, error: 'That is not a game the cabinet can run.' };
-  const rec = readCabinet(itemId);
+  const rec = readCuration(itemId);
   const rest = rec.shelf.filter((g) => gameId(g) !== gameId(clean));
   if (rest.length >= ARCADE_SHELF_MAX) return { ok: false, error: `The shelf holds ${ARCADE_SHELF_MAX} games.` };
-  write(cabinetKey(itemId), { ...rec, shelf: [clean, ...rest], seq: rec.seq + 1 } satisfies CabinetRecord);
+  write(cabinetKey(itemId), { ...rec, shelf: [clean, ...rest], seq: bump(rec.seq) } satisfies CabinetCuration);
   return { ok: true };
 }
 
 export function removeFromShelf(itemId: string, index: number): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
-  const rec = readCabinet(itemId);
+  const rec = readCuration(itemId);
   if (!rec.shelf[index]) return { ok: false, error: 'Nothing on that shelf.' };
   write(cabinetKey(itemId), {
-    ...rec, shelf: rec.shelf.filter((_, i) => i !== index), seq: rec.seq + 1,
-  } satisfies CabinetRecord);
+    ...rec, shelf: rec.shelf.filter((_, i) => i !== index), seq: bump(rec.seq),
+  } satisfies CabinetCuration);
   return { ok: true };
 }
 
@@ -475,16 +541,17 @@ export function removeFromShelf(itemId: string, index: number): ArcadeAction {
 export function setEmulatorData(itemId: string, data: EmulatorData): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
-  const rec = readCabinet(itemId);
-  write(cabinetKey(itemId), { ...rec, data: data === 'cdn' ? 'cdn' : 'station', seq: rec.seq + 1 } satisfies CabinetRecord);
+  const rec = readCuration(itemId);
+  write(cabinetKey(itemId), { ...rec, data: data === 'cdn' ? 'cdn' : 'station', seq: bump(rec.seq) } satisfies CabinetCuration);
   return { ok: true };
 }
 
-/** A game started under P1: one more on the tally. */
+/** A game started under P1: one more on the tally — its own key, so a
+ *  play counted as the owner edits the shelf reverts neither the edit nor
+ *  the count. */
 export function countPlay(itemId: string): void {
   if (!iAmP1(itemId)) return;
-  const rec = readCabinet(itemId);
-  write(cabinetKey(itemId), { ...rec, plays: rec.plays + 1, seq: rec.seq + 1 } satisfies CabinetRecord);
+  write(playsKey(itemId), { plays: bump(readPlays(itemId)) } satisfies PlaysRecord);
 }
 
 // ── Games: identity, lanes, parsing (pure) ───────────────────────────────────
