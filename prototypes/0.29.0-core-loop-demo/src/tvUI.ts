@@ -14,7 +14,7 @@
 
 import type { DeviceUI } from './devices';
 import {
-  formatClock, handRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
+  formatClock, handRemote, holdsSpareRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
   putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource,
   sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
   tvResume, tvRevision, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
@@ -39,8 +39,6 @@ export interface TvDeviceDeps {
   label: string;
   myPub: () => string;
   myName: () => string;
-  /** Room-owner gate — the spare remote. */
-  canEdit: () => boolean;
   roomPlayers: () => RoomPlayer[];
   openTheatre: () => void;
   /** Open the phone on the 📺 TV app (the remote). */
@@ -192,7 +190,7 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
     const me = deps.myPub();
     const mine = iHoldRemote(deps.itemId);
     const mayPick = !mine && mayPickUpRemote(deps.itemId);
-    const owner = deps.canEdit();
+    const owner = holdsSpareRemote(); // the deed holder: the predicate the write itself checks
     const lane = rec.source ? laneBadge(sourceLane(rec.source)) : '';
     // archive.org's own player takes no volume from the set: its buttons
     // would change the room's number and not the sound.
@@ -272,7 +270,6 @@ export interface TvPhoneDeps {
   tvs: () => Array<{ id: string; label: string }>;
   myPub: () => string;
   myName: () => string;
-  canEdit: () => boolean;
   roomPlayers: () => RoomPlayer[];
   openTheatre: (itemId: string) => void;
   /** Resolve an archive.org item to a playable file + title (the metadata
@@ -382,7 +379,7 @@ function renderTvApp(deps: TvPhoneDeps): string {
 function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDeps, me: string): string {
   const rec = readTv(tv.id);
   const mine = iHoldRemote(tv.id);
-  const owner = deps.canEdit();
+  const owner = holdsSpareRemote();
   const pb = readPlayback(tv.id);
   const head = `<div class="phone-access-section">
     <div class="phone-access-header">📺 ${esc(tv.label)} — REMOTE</div>

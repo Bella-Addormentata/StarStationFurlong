@@ -3163,6 +3163,8 @@ function resolveOwnerLabel(owner: string): string {
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
  *    · the deed hand-over          · the sole-croupier election
  *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *    · the TV's spare remote (#186: taking the remote from its holder, or
+ *      handing theirs on — setTvHostPredicate; the panels paint from it)
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
  *  own venture map entry, which is peer-written, shape-checked only, and tied
@@ -6522,7 +6524,6 @@ function setupSpacePhoneOverlay() {
           tvs: () => roomTvIds().map((tvId) => ({ id: tvId, label: tvLabelFor(tvId) })),
           myPub: () => getIdentityPub(),
           myName: () => getPlayerName(),
-          canEdit: () => canEditRoom().ok,
           roomPlayers: () => tvRoomPlayers(getIdentityPub()),
           openTheatre: (tvId) => {
             container?.classList.remove("active");
@@ -8769,10 +8770,14 @@ async function init() {
   // host) ask the same owner seam edit mode does.
   setPartyHostPredicate(() => canEditRoom().ok);
   setPartyIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
-  // 📺 #186: the same two seams for the TV (the owner holds the spare
-  // remote), the room roster for HAND TO…, and the chip that opens the
-  // theatre from anywhere in the room.
-  setTvHostPredicate(() => canEditRoom().ok);
+  // 📺 #186: the TV's seams — the spare remote, the identity, the room roster
+  // for HAND TO…, and the chip that opens the theatre from anywhere in the
+  // room. 🔒 The spare remote is the DEED holder's (#142's split, in the
+  // isLocalPlayerRoomOwner docblock): taking the remote from a holder, or
+  // handing theirs on, unseats them, and the shareholder-extended edit gate
+  // can be satisfied by a peer-written venture record. The panels paint
+  // TAKE BACK from the same predicate (tvDoc.holdsSpareRemote).
+  setTvHostPredicate(() => currentRoomDeedIsMine());
   setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   // The remote is held by a PAGE, not a key: two tabs share the identity
   // (the seed is in localStorage) and must not both renew, beat and release.
