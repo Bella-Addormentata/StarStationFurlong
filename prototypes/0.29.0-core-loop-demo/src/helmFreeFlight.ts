@@ -64,6 +64,9 @@ export interface FreePanelInput {
   /** Fuel in the tanks (PARK needs parkFuel of it). */
   fuel: number;
   esc: (s: string) => string;
+  /** 🅿️ This module is a station flying by itself (its name): PARK settles
+   *  the station into a new orbit, and it docks nowhere. */
+  station?: string | null;
 }
 
 export function renderFreeFlightPanel(i: FreePanelInput): string {
@@ -91,9 +94,21 @@ export function renderFreeFlightPanel(i: FreePanelInput): string {
     ? `🅿️ PARKED · ${r.nearest && r.zone !== 'open' ? `holding beside ${i.esc(r.nearest.station.name.toUpperCase())}` : 'steady orbit'}`
     : `🅿️ PARK${parkNeed > 0 ? ` · ${parkNeed} fuel to stop` : ''}`;
   const parkBtn = `<button id="helm-free-park"${parkOk ? '' : ' disabled'} style="${btnStyle(parkOk || r.parked, '#CE93D8')} margin-top:8px;">${parkLabel}</button>`;
-  const parkNote = r.parked
+  let parkNote = r.parked
     ? 'Parked: the ship holds this orbit until you thrust again. Turning does not unpark it.'
     : !i.commander ? '' : i.fuel < parkNeed ? `PARK needs ${parkNeed} fuel to stop the ship; the tanks hold ${Math.floor(i.fuel)}. Brake by hand instead.` : '';
+  let parkButton = parkBtn;
+  let dockButton = `<button id="helm-free-dock"${dockOk ? '' : ' disabled'} style="${btnStyle(dockOk, '#00E676')} margin-top:8px;">${dockLabel}</button>`;
+  if (i.station) {
+    // A station parks into its new orbit for good: it ends the flight, opens
+    // its docks again, and the trim stick holds it from there.
+    const ok = i.commander && i.fuel >= parkNeed;
+    parkButton = `<button id="helm-free-park"${ok ? '' : ' disabled'} style="${btnStyle(ok, '#CE93D8')} margin-top:8px;">🅿️ PARK ${i.esc(i.station.toUpperCase())} HERE${parkNeed > 0 ? ` · ${parkNeed} fuel to stop` : ''}</button>`;
+    parkNote = !i.commander ? '' : i.fuel < parkNeed
+      ? `PARK needs ${parkNeed} fuel to stop the station; the tanks hold ${Math.floor(i.fuel)}. Brake by hand first.`
+      : 'PARK stops the station and settles it into the circular orbit through this point, at least 50 km from every other orbit. Its docks are closed until then.';
+    dockButton = '';
+  }
   const legend = i.stickTaken
     ? `<div style="font-size:9px; color:rgba(212,168,75,0.6); margin-top:6px; line-height:1.5;">
         W/S or ↑/↓ thrust · A/D or ←/→ turn · Q/E slide · X or SPACE brake${i.padName ? `<br>🎮 ${i.esc(i.padName.slice(0, 48))}: stick turns and thrusts, button 1 brakes` : ''}
@@ -102,7 +117,7 @@ export function renderFreeFlightPanel(i: FreePanelInput): string {
   return `
     <div style="margin-top:12px; padding:10px 12px; border:1px solid ${zoneColor}55; border-radius:8px; background:rgba(129,212,250,0.04);">
       <div style="display:flex; justify-content:space-between; font-size:11px; letter-spacing:0.5px;">
-        <span style="color:#81D4FA;">🕹️ FLYING FREE</span>
+        <span style="color:#81D4FA;">🕹️ ${i.station ? 'STATION ' : ''}FLYING FREE</span>
         <span data-free-live="zone" style="color:${zoneColor};">${f.zone}</span>
       </div>
       <canvas id="helm-free-radar" style="width:100%; height:200px; margin-top:8px; display:block; background:rgba(0,0,0,0.45); border:1px solid rgba(129,212,250,0.18); border-radius:6px;"></canvas>
@@ -113,9 +128,9 @@ export function renderFreeFlightPanel(i: FreePanelInput): string {
       </div>
       <div style="margin-top:8px;">${stickBtn}</div>
       ${legend}
-      ${parkBtn}
+      ${parkButton}
       ${parkNote ? `<div style="font-size:9px; color:rgba(212,168,75,0.6); margin-top:6px; line-height:1.5;">${parkNote}</div>` : ''}
-      <button id="helm-free-dock"${dockOk ? '' : ' disabled'} style="${btnStyle(dockOk, '#00E676')} margin-top:8px;">${dockLabel}</button>
+      ${dockButton}
       ${i.note ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${i.esc(i.note)}</div>` : ''}
       <div style="font-size:9px; color:rgba(212,168,75,0.5); margin-top:6px; line-height:1.4;">Speed limits: ${formatSpeed(speedCap('approach'))} within ${APPROACH_ZONE_KM} km of a station, ${formatSpeed(speedCap('dock'))} within ${DOCK_ZONE_KM} km. Nothing gets closer than ${Math.round(HULL_KM * 1000)} m.</div>
     </div>`;

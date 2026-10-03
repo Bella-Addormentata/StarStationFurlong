@@ -26,6 +26,7 @@ import { orbitForSlot, angleAt, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
 import { readFlightRecord, readFuelLevel, shipDocHandle, writeFuelLevel } from './shipDoc';
 import { adriftPlace, currentRoomId, listStations, planetById, stationInTransit } from './stations';
+import type { StationRecord } from './stations';
 
 /** The ship map key the pose lives under (old clients never read it). */
 const POSE_KEY = 'freeFlight';
@@ -75,16 +76,26 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
     return stationCache.list;
   }
   let ships: Set<string>;
+  let flying: Set<string>;
   try {
-    ships = new Set(Object.values(readStore(now).ships).filter((s) => !s.retired).map((s) => s.roomId));
+    const live = Object.values(readStore(now).ships).filter((s) => !s.retired);
+    ships = new Set(live.map((s) => s.roomId));
+    flying = new Set(live.filter((s) => s.status === 'free-flight').map((s) => s.roomId));
   } catch {
     ships = new Set();
+    flying = new Set();
   }
+  // 🅿️ A one-module station flying by itself is a ship until it parks: its
+  // docks are closed, and it holds no frame (this room's, or one the planet
+  // summaries say is flying free).
+  if (readFlightRecord().status === 'free-flight') flying.add(room);
   const list: FreeStation[] = listStations()
     .filter((s) => planetById(s.planetId).id === planet && !stationInTransit(s, now))
     // Only a derived one-module stand-in is a ship; a saved or built-in
-    // station keeps its zones whoever stands in it or claims its room.
-    .filter((s) => !!s.welcomeRoomId && (!s.derived || (s.welcomeRoomId !== room && !ships.has(s.welcomeRoomId))))
+    // station keeps its zones whoever stands in it or claims its room,
+    // unless it is flying free itself.
+    .filter((s) => !!s.welcomeRoomId && !flying.has(s.welcomeRoomId)
+      && (!s.derived || (s.welcomeRoomId !== room && !ships.has(s.welcomeRoomId))))
     .map((s) => ({ id: s.id, room: s.welcomeRoomId, name: s.name, pointAt: (ms: number) => stationPointAt(s, ms) }));
   stationCache = { planetId: planet, room, at: now, list };
   return list;
@@ -312,10 +323,24 @@ export function resetFreeFlightPilot(): void {
 
 /**
  * A saved or built-in station's own welcome room (not one derived from the
- * atlas, which is how a free ship's own room is listed): it is the station,
- * so it does not fly off as a ship. PR 172's stations.isStationRoom says the
- * same for DEPART once it reaches this branch.
+ * atlas, which is how a free ship's own room is listed): it is the station.
+ * It flies by itself only standing alone (🅿️ Fly and park), never on DEPART
+ * (PR 172's stations.isStationRoom).
  */
 export function isStationOwnRoom(room = currentRoomId()): boolean {
-  return !!room && listStations().some((s) => s.welcomeRoomId === room && !s.derived);
+  return ownStationOf(room) !== null;
+}
+
+/** 🅿️ The saved or built-in station whose welcome room `room` is, or null. */
+export function ownStationOf(room = currentRoomId()): StationRecord | null {
+  if (!room) return null;
+  return listStations().find((s) => s.welcomeRoomId === room && !s.derived) ?? null;
+}
+
+/** 🅿️ Where a one-module station starts flying by itself: where it is,
+ *  still, in its own open orbit (it is held by no frame: its own is the one
+ *  it leaves), nose prograde. */
+export function stationUndockPose(station: StationRecord, now = Date.now()): FreePose {
+  const p = stationPointAt(station, now);
+  return { planetId: planetById(station.planetId).id, at: Math.round(now), radiusKm: p.radiusKm, angle: p.angle, vAlong: 0, vRadial: 0, heading: 0 };
 }

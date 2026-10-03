@@ -104,8 +104,11 @@ import type { DockAnswer } from './dockRules';
 // AUTO-DOCK.
 import { parkCost, parkPose, readout as freeReadout } from './freeFlight';
 import {
-  freeStationsAround, isStationOwnRoom, pilotFrame, releaseStick, resolvedFreePose, undockPoseFrom, writeFreePose,
+  freeStationsAround, isStationOwnRoom, ownStationOf, pilotFrame, releaseStick, resolvedFreePose, stationUndockPose, undockPoseFrom,
+  writeFreePose,
 } from './freeFlightPilot';
+import { planStationPark } from './freeStation';
+import { isBoltedIntoStation } from './stationKeeping';
 import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, takeStickKeys } from './freeFlightStick';
 import { drawFreeRadar, freePanelKey, renderFreeFlightPanel, writeFreeFigures } from './helmFreeFlight';
 // #30 SH3: the helm enumerates the room's paired doors so canDepart can
@@ -2686,18 +2689,21 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 🕹️ UNDOCK & FLY (issue 203): cast off and take the stick.
       const freeBlock = !commander ? 'Only the module\'s COMMANDER may fly it.'
         : !isShipReady() ? 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.'
-          : isStationOwnRoom() ? 'This module is the station itself (its welcome room), so it stays put.'
+          : isStationOwnRoom() ? stationFlyBlock(now)
           : chained.length > 0 ? 'Chained to a permanent connector — take the gangway down first (chained modules cannot fly).'
             : towingNow ? 'Towing a station — the tug stays docked until it arrives.'
               : isRouteRunning(savedRoute) ? 'A ferry route is set to run: STOP it (ROUTE, below) to fly by hand.'
                 : fuel <= 0 ? 'No fuel to fly on.'
+                  : isStationOwnRoom() ? ''
                   : stationInTransit(listStationRecordsNow().find((st) => st.id === location.id) ?? {}, now) ? 'The station is between planets: fly by hand once it arrives.'
                   : undockPoseFrom(location.id, now) === null ? 'This station is not on your station list, so there is nowhere to fly from.'
                     : '';
       const freeNoteNow = freeNote && now < freeNote.until ? freeNote.text : '';
       const freeLaunch = `
-          <button id="helm-free-btn"${freeBlock ? ' disabled' : ''} style="width:100%; margin-top:10px; padding:8px; border-radius:6px; border:1px solid ${freeBlock ? 'rgba(212,168,75,0.25)' : '#81D4FA'}; background:${freeBlock ? 'rgba(80,80,80,0.15)' : 'rgba(129,212,250,0.14)'}; color:${freeBlock ? 'rgba(212,168,75,0.4)' : '#81D4FA'}; font-family:inherit; font-weight:800; cursor:${freeBlock ? 'not-allowed' : 'pointer'}; text-transform:uppercase;">🕹️ UNDOCK &amp; FLY BY HAND</button>
-          <div style="font-size:10px; color:${freeBlock || freeNoteNow ? '#FFB74D' : 'rgba(212,168,75,0.7)'}; margin-top:6px; line-height:1.4;">${esc(freeNoteNow || freeBlock || 'Cast off and fly with the keyboard or a joystick; AUTO-DOCK when you are close to a station.')}</div>`;
+          <button id="helm-free-btn"${freeBlock ? ' disabled' : ''} style="width:100%; margin-top:10px; padding:8px; border-radius:6px; border:1px solid ${freeBlock ? 'rgba(212,168,75,0.25)' : '#81D4FA'}; background:${freeBlock ? 'rgba(80,80,80,0.15)' : 'rgba(129,212,250,0.14)'}; color:${freeBlock ? 'rgba(212,168,75,0.4)' : '#81D4FA'}; font-family:inherit; font-weight:800; cursor:${freeBlock ? 'not-allowed' : 'pointer'}; text-transform:uppercase;">${isStationOwnRoom() ? '🕹️ FLY THE STATION BY HAND' : '🕹️ UNDOCK &amp; FLY BY HAND'}</button>
+          <div style="font-size:10px; color:${freeBlock || freeNoteNow ? '#FFB74D' : 'rgba(212,168,75,0.7)'}; margin-top:6px; line-height:1.4;">${esc(freeNoteNow || freeBlock || (isStationOwnRoom()
+            ? 'The station flies by itself with the keyboard or a joystick, its docks closed, until you PARK it in a new orbit.'
+            : 'Cast off and fly with the keyboard or a joystick; AUTO-DOCK when you are close to a station.'))}</div>`;
       const warnCopy = towingNow
         ? 'Towing a station — the tug stays docked until it arrives.'
         : routePlan ? routeBlock : refuseCopy;
@@ -2783,6 +2789,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         note: freeNote && now < freeNote.until ? freeNote.text : null,
         fuel,
         esc,
+        station: ownStationOf()?.name ?? null,
       });
     }
 
@@ -3822,14 +3829,38 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    * `docked → free-flight` and the ship's first pose just behind the station,
    * and the stick is taken. Every input is checked again at the click.
    */
+  /** 🅿️ Why this station's own room may not fly by itself now, or '' when
+   *  it may: only a station standing alone, with nothing docked, flies. */
+  function stationFlyBlock(now: number): string {
+    const station = ownStationOf();
+    if (!station) return 'This station is not on your station list.';
+    if (isBoltedIntoStation(readAllDoors().values())) return 'This is the station\'s welcome room, joined to its other modules: only a station standing alone flies.';
+    if (shipDocking?.ports().some((p) => p.state.kind === 'docked')) return 'Ships are docked here: a station flies alone, once they cast off.';
+    if (isMoveActive(station.move, now)) return 'A move or altitude change is scheduled or under way.';
+    return '';
+  }
+
+  /** 🅿️ A one-module station flies by itself: no berth to leave, its docks
+   *  close (others see it flying free), and it starts still where it is. */
+  const flyStation = (nowMs: number): void => {
+    const station = ownStationOf();
+    if (!station || stationFlyBlock(nowMs)) return;
+    if (!writeFreePose(stationUndockPose(station, nowMs))) return;
+    if (!writeFlightRecord({ status: 'free-flight', locationId: station.id })) return;
+    setArrivalNote(null);
+    freeNote = null;
+    takeStickKeys();
+  };
+
   const undockAndFly = (): void => {
     if (!helmIsCommander() || !isShipReady()) return;
     const nowMs = Date.now();
     const capacity = countFunction('fuelTank') * TANK_CAPACITY;
     const flight = readResolvedFlight(nowMs);
     if (flight.status !== 'docked' || isRouteRunning(readShipRoute())) return;
-    if (enumerateChainedDoors().length > 0 || isTowing(currentRoomId(), nowMs) || isStationOwnRoom()) return;
+    if (enumerateChainedDoors().length > 0 || isTowing(currentRoomId(), nowMs)) return;
     if (clampFuelToCapacity(readFuelLevel(capacity), capacity) <= 0) return;
+    if (isStationOwnRoom()) { flyStation(nowMs); return; }
     const fromId = shipLocationId(flight, hasLiveDock());
     const pose = undockPoseFrom(fromId, nowMs);
     if (!pose) {
@@ -3865,6 +3896,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    */
   const autoDock = (): void => {
     if (!helmIsCommander() || readFlightRecord().status !== 'free-flight') return;
+    // A station flying by itself docks nowhere: it PARKs.
+    if (isStationOwnRoom()) return;
     const now = Date.now();
     const pose = resolvedFreePose(now);
     if (!pose) return;
@@ -3941,6 +3974,25 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const cost = Math.ceil(parkCost(pose) - 1e-9);
     if (fuel < cost) {
       flashFree(`PARK needs ${cost} fuel to stop the ship; the tanks hold ${Math.floor(fuel)}.`);
+      return;
+    }
+    const station = ownStationOf();
+    if (station) {
+      // 🅿️ A station parks for good: its new orbit is kept as an altitude
+      // change's arrival orbit (freeStation.ts), and the flight ends.
+      const parked = parkPose(pose);
+      const plan = planStationPark(station, parked, listStationRecordsNow(), readMoveFuelDrawn(), fuelDrawDeficit('stationMove'));
+      if (!plan.ok) {
+        flashFree(plan.reason);
+        if (panel) render();
+        return;
+      }
+      if (!writeFreePose(parked) || !writeStationMove(plan.move)) return;
+      if (cost > 0) writeFuelLevel(fuel - cost, capacity);
+      writeFlightRecord({ status: 'redocking', locationId: station.id });
+      writeFlightRecord({ status: 'docked', locationId: station.id });
+      flashFree(`${station.name} is parked in its new orbit, its docks open again.`);
+      if (panel) render();
       return;
     }
     if (!writeFreePose(parkPose(pose))) return;

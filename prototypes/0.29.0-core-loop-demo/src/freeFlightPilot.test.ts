@@ -4,7 +4,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { NO_INPUT } from './freeFlight';
+import { NO_INPUT, speedOf } from './freeFlight';
 import type { FreePose } from './freeFlight';
 import {
   WRITE_EVERY_MS,
@@ -20,7 +20,8 @@ import {
 } from './freeFlightPilot';
 import { bindShipDoc, readFlightRecord, readFuelLevel, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { DEFAULT_STATIONS } from './stationDirectory';
-import { DEFAULT_PLANET_ID } from './stations';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, setStationRoomSource } from './stations';
+import { freeStationsAround, ownStationOf, stationUndockPose } from './freeFlightPilot';
 import { ORBIT_EPOCH_MS } from './orbits';
 
 const HOME = DEFAULT_STATIONS[0];
@@ -148,5 +149,26 @@ describe('the coast watch', () => {
     fly(farPose(t - 5000));
     pilotFrame(NO_INPUT, 0.05, CAP, t);
     expect(settleFreeCoast(t + 1000)).toBe(false);
+  });
+});
+
+const ROOM = DEFAULT_STATION_RECORD.welcomeRoomId;
+
+describe('🅿️ a station flying by itself', () => {
+  afterEach(() => setStationRoomSource(() => ''));
+
+  it('is its own station, starts still where it is, and holds no frame while it flies', () => {
+    const now = ORBIT_EPOCH_MS + 7_200_000;
+    setStationRoomSource(() => ROOM);
+    const station = ownStationOf();
+    expect(station?.id).toBe(DEFAULT_STATION_RECORD.id);
+    const pose = stationUndockPose(station!, now);
+    expect(pose.near).toBeUndefined();
+    expect(speedOf(pose)).toBe(0);
+    resetFreeFlightPilot();
+    expect(freeStationsAround(DEFAULT_PLANET_ID, now).some((s) => s.room === ROOM)).toBe(true);
+    fly(pose);
+    resetFreeFlightPilot();
+    expect(freeStationsAround(DEFAULT_PLANET_ID, now).some((s) => s.room === ROOM)).toBe(false);
   });
 });
