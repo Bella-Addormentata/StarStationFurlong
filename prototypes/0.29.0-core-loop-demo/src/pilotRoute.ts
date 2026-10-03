@@ -246,6 +246,7 @@ function stopRecord(stops: readonly RouteStop[], index: number): StationRecordLi
     name: s.name,
     planetId: s.planetId,
     orbitSlot: s.orbitSlot,
+    ...(s.orbit ? { orbit: s.orbit } : {}),
     welcomeRoomId: s.berth.roomId,
   };
 }

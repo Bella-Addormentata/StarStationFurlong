@@ -9,9 +9,9 @@
 
 import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
-import { angleAt, realMsFor, stationOrbit } from './orbits';
+import { angleAt, baseOrbit, realMsFor, slotPosition, stationOrbit } from './orbits';
 import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
-import { describeMove, moveTransitPointAt } from './stationMove';
+import { describeMove, moveTransitPointAt, orbitChangePlanOf, stationPointWithMoveAt } from './stationMove';
 import type { StationMove } from './stations';
 
 export interface MapBody {
@@ -75,7 +75,9 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
       name: s.name,
       type: 'station' as const,
       parentId: orbit.planet.id,
-      orbitRadius: STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP,
+      // 🎚️ Spaced by altitude: a slot's orbit at its slot's ring, an altitude
+      // between two slots between their rings.
+      orbitRadius: schematicRadius(baseOrbit(s).planet.id, baseOrbit(s).radiusKm),
       orbitSpeed: 0,
       angle: orbit.phase0,
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
@@ -91,10 +93,26 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
  *  (Sovereign II, at 1 AU, is drawn at 180). */
 const MAP_PER_AU = 180;
 
+/** The holotable ring of an orbit `radiusKm` from a planet's centre: slot
+ *  rings STATION_ORBIT_STEP apart, an altitude between two slots between
+ *  their rings (never inside the planet's own ring). */
+function schematicRadius(planetId: string, radiusKm: number): number {
+  return STATION_ORBIT_BASE + Math.max(-2, slotPosition(planetId, radiusKm)) * STATION_ORBIT_STEP;
+}
+
 /** Where a moving station is drawn: around its old planet until the burn,
  *  on its course around the sun (the transfer ellipse, or a tug's straight
- *  torch run), then around its new planet. */
+ *  torch run), then around its new planet. 🎚️ An altitude change stays
+ *  around its planet, sliding between the two rings on its transfer. */
 function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['placeAt']> {
+  const change = orbitChangePlanOf(move);
+  if (change) {
+    const planetId = change.from.planet.id;
+    return (nowMs: number) => {
+      const p = stationPointWithMoveAt(s, nowMs);
+      return { parentId: planetId, angle: p.angle, radius: schematicRadius(planetId, p.radiusKm) };
+    };
+  }
   // Until the burn it is the station it always was: its id keeps its trim.
   const from = stationOrbit({ id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot });
   const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });

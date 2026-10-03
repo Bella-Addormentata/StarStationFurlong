@@ -20,7 +20,7 @@ import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
 import { adriftPlace, latestMoveOf, stationInTransit } from './stations';
-import type { StationMove } from './stations';
+import type { StationMove, StationOrbit } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -247,6 +247,8 @@ export interface StationRecordLike {
   }>;
   /** A move to another planet, scheduled or under way (stations.ts). */
   move?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's. */
+  orbit?: StationOrbit;
 }
 
 /** Rough per-destination figures for a station record (what a hop from the

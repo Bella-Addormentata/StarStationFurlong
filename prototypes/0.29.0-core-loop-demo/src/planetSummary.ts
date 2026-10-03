@@ -194,7 +194,7 @@ export const SHIP_HEARTBEAT_MS = 3600 * 1000;
  *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
 export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
 const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
-const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
+const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move', 'orbit']);
 
 const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LEN;
 const isName = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_NAME_LEN;
@@ -292,7 +292,9 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
   const src = v as OrbitTrim & { from?: unknown; readAt?: unknown };
   const read = isId(src.from) && isStamp(src.readAt, now);
   return {
-    planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
+    planetId: v.planetId, slot: v.slot,
+    ...(v.base ? { base: { radiusKm: v.base.radiusKm, phase0: v.base.phase0 } } : {}),
+    dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
     ...(v.fuelDrawn !== undefined ? { fuelDrawn: v.fuelDrawn } : {}),
     ...(read ? { from: src.from as string, readAt: src.readAt as number } : {}),
   };
