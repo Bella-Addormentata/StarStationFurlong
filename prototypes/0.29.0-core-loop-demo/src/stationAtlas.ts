@@ -34,6 +34,7 @@ import type { ConnectorSegment } from './adapter';
 import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
+import { isAcceptableDoorKey } from './doorsDoc';
 import { isDockChain, projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 import { halfAlongWall } from './doorMatch';
 
@@ -468,29 +469,35 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
 /** The same ceiling doorPolicy.MAX_GATE holds (not imported: doorPolicy
  *  reads the layout doc, and this module stays free of doc bindings). */
 const MAX_GATE_NUMBER = 99;
-/** Door ids are short keys (doorsDoc.isAcceptableDoorKey allows 64). */
-const MAX_GATE_DOOR_ID = 64;
 
 function isPlainGates(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
     && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
 }
 
-/** Only door id → integer gate pairs, at most MAX_GATE_NUMBER of them. Every
- *  distinct number is taken first, so ports sharing a number (two stations
- *  joined, a peer's junk) can never push another gate out; a duplicate
- *  fills only room that is left. */
+/** Only door id → integer gate pairs, at most MAX_GATE_NUMBER of them. Only
+ *  ids a door can have (doorsDoc.isAcceptableDoorKey) count, so junk keys
+ *  cannot use up the numbers ahead of a real gate. Every distinct number is
+ *  taken first, so ports sharing a number (two stations joined, a peer's
+ *  junk) can never push another gate out; a duplicate fills only room that
+ *  is left. Pairs are taken in gate, then door order, so the same pairs in
+ *  any order keep the same ports. */
 function cleanGates(v: Record<string, unknown>): Record<string, number> {
+  const pairs: Array<[string, number]> = [];
+  for (const [doorId, gate] of Object.entries(v)) {
+    if (!isAcceptableDoorKey(doorId)) continue;
+    if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
+    pairs.push([doorId, gate]);
+  }
+  pairs.sort((x, y) => x[1] - y[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
   const out: Record<string, number> = {};
   const numbers = new Set<number>();
   const repeats: Array<[string, number]> = [];
   let kept = 0;
-  for (const [doorId, gate] of Object.entries(v)) {
+  for (const [doorId, gate] of pairs) {
     if (kept >= MAX_GATE_NUMBER) break;
-    if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
-    if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
     if (numbers.has(gate)) {
-      if (repeats.length < MAX_GATE_NUMBER) repeats.push([doorId, gate]);
+      repeats.push([doorId, gate]);
       continue;
     }
     numbers.add(gate);

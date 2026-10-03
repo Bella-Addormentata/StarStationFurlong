@@ -286,6 +286,39 @@ describe("a far room doc's shared atlas", () => {
     expect(atlas['other-000']).toBeUndefined();
   });
 
+  it('lets no junk door keys use up the gate numbers ahead of a real gate', () => {
+    const gates: Record<string, number> = {};
+    for (let i = 1; i <= 99; i++) gates[`junk-${i}`] = i;
+    gates['d:p2'] = 2;
+    const doc = new Y.Doc();
+    const shared = doc.getMap('atlas');
+    shared.set('far-dock', entry('far-dock', 5, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
+    shared.set('far-hub', entry('far-hub', 5, { 'd:in': { targetRoomId: 'far-dock', farDoor: 'd:hall', transient: false } }, gates));
+    const atlas = withSharedAtlasOf(doc, readAtlas(), 'far-dock');
+    expect(atlas['far-hub'].gates).toEqual({ 'd:p2': 2 });
+    // A port fitted in the dock still finds a number.
+    expect(freeGateNumber(atlas, 'far-dock', {})).toBe(1);
+    // Gossip reads it the same way.
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['far-hub']?.gates).toEqual({ 'd:p2': 2 });
+  });
+
+  it('keeps the same gates from the same pairs in any order', () => {
+    // 99 numbers plus a second port on 5: the same 99 stand whatever order
+    // the keys come in.
+    const pairs: Array<[string, number]> = Array.from({ length: 99 }, (_, i) => [`d:${String(i + 1).padStart(8, '0')}`, i + 1]);
+    pairs.push(['d:0000000a', 5]);
+    const read = (order: Array<[string, number]>) => {
+      const doc = new Y.Doc();
+      doc.getMap('atlas').set('far-hub', entry('far-hub', 5, {}, Object.fromEntries(order)));
+      return withSharedAtlasOf(doc, {}, 'far-hub')['far-hub'].gates;
+    };
+    const forward = read(pairs);
+    expect(Object.keys(forward ?? {})).toHaveLength(99);
+    expect(read([...pairs].reverse())).toEqual(forward);
+    expect(forward?.['d:00000005']).toBe(5);
+  });
+
   it("numbers a port fitted here past the gates of a room only the bound doc still holds", () => {
     const doc = new Y.Doc();
     const shared = doc.getMap('atlas');
