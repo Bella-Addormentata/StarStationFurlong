@@ -126,7 +126,7 @@ import {
 } from "./devices";
 import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 // 🕹️ Free flight (issue 203): the coast watch and the shared pose.
-import { readFreePose, recoverFreeDock, settleFreeCoast } from "./freeFlightPilot";
+import { keepStationPark, readFreePose, recoverFreeDock, settleFreeCoast } from "./freeFlightPilot";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
 // aside for it and copies it back into the stored records when due.
@@ -2349,6 +2349,8 @@ async function joinRoomAtEpoch(
     if (rec.status === "docked" && roomStateArrivedNow()) {
       const ds = world?.dockingSystem ?? null;
       if (ds && recoverFreeDock(ds.listDockPorts())) return;
+      // 🅿️ A parked station whose orbit claim lost flies again.
+      if (keepStationPark()) return;
     }
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped

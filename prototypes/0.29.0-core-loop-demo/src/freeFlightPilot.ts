@@ -518,6 +518,66 @@ export function ownStationOf(room = currentRoomId()): StationRecord | null {
   return listStations().find((s) => s.welcomeRoomId === room && !s.derived) ?? null;
 }
 
+/** The ship map key a parked station's claim lives under. */
+const PARK_MARK_KEY = 'freePark';
+
+/** 🅿️ A station's PARK, kept until its orbit claim is settled for good: the
+ *  pose it stopped at, and the move that claims the orbit through it. */
+interface StationParkMark {
+  pose: FreePose;
+  bookedAt: number;
+  toRadiusKm: number;
+}
+
+function isParkMark(v: unknown): v is StationParkMark {
+  if (!v || typeof v !== 'object') return false;
+  const m = v as Record<string, unknown>;
+  return typeof m.bookedAt === 'number' && Number.isFinite(m.bookedAt)
+    && typeof m.toRadiusKm === 'number' && Number.isFinite(m.toRadiusKm) && m.toRadiusKm > 0 && isFreePose(m.pose);
+}
+
+/** 🅿️ Keep a station's PARK (the parked pose and its orbit move) so a claim
+ *  that loses can put it back in flight (keepStationPark). */
+export function markStationPark(pose: FreePose, move: { bookedAt?: number; departAt: number; orbit?: { toRadiusKm: number } }): boolean {
+  const h = shipDocHandle();
+  if (!h || !move.orbit) return false;
+  const mark: StationParkMark = { pose: cleanPose(pose), bookedAt: move.bookedAt ?? move.departAt, toRadiusKm: move.orbit.toRadiusKm };
+  if (!isParkMark(mark)) return false;
+  h.doc.transact(() => h.map.set(PARK_MARK_KEY, mark));
+  return true;
+}
+
+/**
+ * 🅿️ A parked station whose orbit claim lost to an earlier one (another
+ * station's altitude change or PARK within MIN_ORBIT_SEPARATION_KM:
+ * stations.lostAltitudeClaims) is not left on the unflown leg's orbit
+ * listStations falls back to: it flies again, still, where it parked, its
+ * docks closed until it parks somewhere clear. Run from the flight watch
+ * (a claim can lose late, when the earlier one is heard). A newer move of
+ * the station, or its flying again, retires the mark. Returns whether the
+ * station flies again.
+ */
+export function keepStationPark(now = Date.now()): boolean {
+  const h = shipDocHandle();
+  if (!h) return false;
+  const raw = h.map.get(PARK_MARK_KEY);
+  if (raw === undefined) return false;
+  const clear = () => h.doc.transact(() => h.map.delete(PARK_MARK_KEY));
+  if (!isParkMark(raw)) { clear(); return false; }
+  if (readFlightRecord().status !== 'docked') { clear(); return false; }
+  const station = ownStationOf();
+  if (!station) return false;
+  const move = latestMoveOf(station);
+  if (!move || (move.bookedAt ?? move.departAt) !== raw.bookedAt) { clear(); return false; }
+  // Still holding the orbit it claimed.
+  if (station.orbit && Math.abs(station.orbit.radiusKm - raw.toRadiusKm) < 1e-6) return false;
+  void now;
+  if (!writeFreePose(raw.pose)) return false;
+  if (!writeFlightRecord({ status: 'free-flight', locationId: station.id })) return false;
+  clear();
+  return true;
+}
+
 /** 🅿️ Where a one-module station starts flying by itself: where it is,
  *  still, in its own open orbit (it is held by no frame: its own is the one
  *  it leaves), nose prograde. */

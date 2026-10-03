@@ -10,7 +10,9 @@ import {
   FREE_DOCK_SETTLE_MS,
   WRITE_EVERY_MS,
   isPilotingHere,
+  keepStationPark,
   markFreeDock,
+  markStationPark,
   recoverFreeDock,
   settleFreeDock,
   pilotFrame,
@@ -24,9 +26,10 @@ import {
 } from './freeFlightPilot';
 import { bindShipDoc, readFlightRecord, readFuelLevel, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { DEFAULT_STATIONS } from './stationDirectory';
-import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, setStationRoomSource } from './stations';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, setAltitudeHistory, setStationMoveResolver, setStationRoomSource } from './stations';
+import { planStationPark } from './freeStation';
 import { freeStationsAround, ownStationOf, stationFlyingFree, stationUndockPose } from './freeFlightPilot';
-import { ORBIT_EPOCH_MS } from './orbits';
+import { ORBIT_EPOCH_MS, orbitForSlot } from './orbits';
 
 const HOME = DEFAULT_STATIONS[0];
 const CAP = 100;
@@ -208,6 +211,44 @@ describe('🅿️ a station flying by itself', () => {
     } finally {
       g.localStorage = before;
     }
+  });
+});
+
+describe('🅿️ a parked station whose orbit claim loses', () => {
+  afterEach(() => {
+    setStationRoomSource(() => '');
+    setStationMoveResolver(null);
+    setAltitudeHistory(null);
+  });
+
+  it('flies again where it parked, its docks closed, rather than settle on the unflown leg', () => {
+    const now = ORBIT_EPOCH_MS + 7_200_000;
+    setStationRoomSource(() => ROOM);
+    const station = ownStationOf()!;
+    const r0 = orbitForSlot(DEFAULT_PLANET_ID, 0).radiusKm;
+    const r1 = orbitForSlot(DEFAULT_PLANET_ID, 1).radiusKm;
+    const mid = (r0 + r1) / 2;
+    const parked: FreePose = { planetId: DEFAULT_PLANET_ID, at: now, radiusKm: mid, angle: 1.2, vAlong: 0, vRadial: 0, heading: 0, parked: true };
+    fly(stationUndockPose(station, now - 60_000));
+    const plan = planStationPark(station, parked, [station], 0, 0);
+    if (!plan.ok) throw new Error(plan.reason);
+    setStationMoveResolver((st) => (st.welcomeRoomId === ROOM ? plan.move : null));
+    expect(markStationPark(parked, plan.move)).toBe(true);
+    writeFlightRecord({ status: 'redocking', locationId: station.id });
+    writeFlightRecord({ status: 'docked', locationId: station.id });
+    // Its claim holds: parked.
+    expect(keepStationPark(now + 1000)).toBe(false);
+    expect(readFlightRecord().status).toBe('docked');
+    // An earlier claim 10 km off is heard: this one lost.
+    const { derived: _d, ...base } = station;
+    const rival = { ...base, id: 'rival', welcomeRoomId: 'rival-room', name: 'Rival' };
+    const early = planStationPark(rival, { ...parked, at: now - 3_600_000, radiusKm: mid + 10 }, [rival], 0, 0);
+    if (!early.ok) throw new Error(early.reason);
+    setAltitudeHistory(() => [early.move]);
+    expect(keepStationPark(now + 2000)).toBe(true);
+    expect(readFlightRecord().status).toBe('free-flight');
+    expect(readFreePose()).toEqual(parked);
+    expect(doc.getMap('ship').get('freePark')).toBeUndefined();
   });
 });
 

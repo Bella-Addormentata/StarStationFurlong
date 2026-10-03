@@ -104,10 +104,11 @@ import type { DockAnswer } from './dockRules';
 // AUTO-DOCK.
 import { parkCost, parkPose, readout as freeReadout } from './freeFlight';
 import {
-  freeStationsAround, isStationOwnRoom, markFreeDock, ownStationOf, pilotFrame, recoverFreeDock, releaseStick, resolvedFreePose,
+  freeStationsAround, isStationOwnRoom, keepStationPark, markFreeDock, markStationPark, ownStationOf, pilotFrame, recoverFreeDock, releaseStick, resolvedFreePose,
   settleFreeDock, stationFlyingFree, stationUndockPose, undockPoseFrom, writeFreePose,
 } from './freeFlightPilot';
 import { planStationPark } from './freeStation';
+import { MIN_ORBIT_SEPARATION_KM } from './stations';
 import { isBoltedIntoStation } from './stationKeeping';
 import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, takeStickKeys } from './freeFlightStick';
 import { drawFreeRadar, freePanelKey, renderFreeFlightPanel, writeFreeFigures } from './helmFreeFlight';
@@ -4014,10 +4015,17 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         if (panel) render();
         return;
       }
-      if (!writeFreePose(parked) || !writeStationMove(plan.move)) return;
+      if (!writeFreePose(parked) || !markStationPark(parked, plan.move) || !writeStationMove(plan.move)) return;
       if (cost > 0) writeFuelLevel(fuel - cost, capacity);
       writeFlightRecord({ status: 'redocking', locationId: station.id });
       writeFlightRecord({ status: 'docked', locationId: station.id });
+      // An earlier claim on an orbit this near wins (stations.lostAltitudeClaims):
+      // then it flies on from here.
+      if (keepStationPark()) {
+        flashFree(`Another station claimed an orbit within ${MIN_ORBIT_SEPARATION_KM} km first: ${station.name} is still flying.`);
+        if (panel) render();
+        return;
+      }
       flashFree(`${station.name} is parked in its new orbit, its docks open again.`);
       if (panel) render();
       return;
