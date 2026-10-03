@@ -23,6 +23,7 @@ import {
   isKnownStation,
   listStations,
   setStationDirectory,
+  setBerthPoseLookup,
   stationHere,
   type StationDestination,
 } from './stationDirectory';
@@ -166,6 +167,48 @@ describe('flight capability', () => {
     setStationRoomCheck(() => null);
     expect(freeFlightCapable(true)).toBe(true);
     setStationRoomCheck(null);
+  });
+});
+
+describe("a station berth's pose", () => {
+  afterEach(() => setBerthPoseLookup(null));
+  const record = {
+    id: 'station:mod-2', name: 'MOD 2', planetId: 'planet-sovereign', orbitSlot: 1,
+    welcomeRoomId: 'mod-2', berthDoor: 'd:00000002',
+  };
+  const seedFor = (rid: string) => (rid === 'mod-2' ? 'seed-mod' : undefined);
+  const bare = { address: 'seed-mod', farDoor: 'd:00000002' };
+
+  it("gives a public berth its port's wall and lateral, so a first DOCK poses the station where the port is", () => {
+    const asked: string[] = [];
+    setBerthPoseLookup((roomId, doorId) => {
+      asked.push(`${roomId} ${doorId}`);
+      return { wall: 'x+', lateral: 1.5 };
+    });
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual({ ...bare, farWall: 'x+', farLateral: 1.5 });
+    expect(asked).toEqual(['mod-2 d:00000002']);
+    // No berth, no question: no door named, or no seed held.
+    asked.length = 0;
+    destinationsFromRecords([{ ...record, berthDoor: undefined }, { ...record, welcomeRoomId: 'far-1' }], seedFor);
+    expect(asked).toEqual([]);
+  });
+
+  it('leaves the pose unknown where the atlas knows none, or a junk one', () => {
+    const berthWith = (pose: unknown) => {
+      setBerthPoseLookup(() => pose as { wall: 'x+' });
+      return destinationsFromRecords([record], seedFor)[0].berth;
+    };
+    expect(berthWith(null)).toEqual(bare);
+    expect(berthWith(undefined)).toEqual(bare);
+    expect(berthWith({ wall: 'north', lateral: 1 })).toEqual(bare);
+    // A lateral the doors doc would not keep leaves the wall alone.
+    expect(berthWith({ wall: 'y-', lateral: 99 })).toEqual({ ...bare, farWall: 'y-' });
+    expect(berthWith({ wall: 'y-', lateral: Number.NaN })).toEqual({ ...bare, farWall: 'y-' });
+    expect(berthWith({ wall: 'y-' })).toEqual({ ...bare, farWall: 'y-' });
+    setBerthPoseLookup(() => { throw new Error('no atlas yet'); });
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual(bare);
+    setBerthPoseLookup(null);
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual(bare);
   });
 });
 

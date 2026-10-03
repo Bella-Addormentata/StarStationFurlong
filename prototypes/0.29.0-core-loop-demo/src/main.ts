@@ -153,6 +153,8 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+// ⚓ A station's public berth takes its door's pose from the atlas.
+import { setBerthPoseLookup } from "./stationDirectory";
 import {
   dockedStationFor,
   listStations,
@@ -1734,6 +1736,12 @@ async function joinRoomAtEpoch(
     };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
+    // ⚓ A station's public berth: its door's own wall and lateral, as the
+    // atlas last saw them from inside its room.
+    setBerthPoseLookup((roomId, doorId) => {
+      const door = readAtlas()[roomId]?.doors[doorId];
+      return door?.wall ? { wall: door.wall, lateral: door.lateral } : null;
+    });
     setStationDirectory(
       directoryFromStationRecords(
         () => listStations(),

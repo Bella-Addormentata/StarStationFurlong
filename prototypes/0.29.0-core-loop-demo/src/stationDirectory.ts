@@ -232,6 +232,40 @@ export function planRecordHop(
   };
 }
 
+/** A berth door's own pose in its room: its wall, and its centre along that
+ *  wall (the currency of a dock record's farWall and farLateral). */
+export interface BerthPose {
+  wall: DoorWall;
+  lateral?: number;
+}
+
+type BerthPoseLookup = (roomId: string, doorId: string) => BerthPose | null | undefined;
+
+let berthPoseLookup: BerthPoseLookup | null = null;
+
+/** main.ts points this at the atlas: a berth door's pose as a client standing
+ *  in its room last saw it. Null clears it. */
+export function setBerthPoseLookup(lookup: BerthPoseLookup | null): void {
+  berthPoseLookup = lookup;
+}
+
+const WALLS: readonly DoorWall[] = ['x+', 'x-', 'y+', 'y-'];
+
+/** The far end of a DOCK at a station's berth, where known: a first visit
+ *  then poses the station's module (and checks overlap) at its real port.
+ *  Unknown or junk is none, and the DOCK faces the arrival heading as for
+ *  any port of unknown pose; a lateral the doors doc would not keep
+ *  (|lateral| ≤ 32) leaves the wall alone. */
+function berthPose(roomId: string, doorId: string): Pick<StationBerth, 'farWall' | 'farLateral'> {
+  let pose: BerthPose | null | undefined;
+  try { pose = berthPoseLookup?.(roomId, doorId); } catch { return {}; }
+  if (!pose || !WALLS.includes(pose.wall)) return {};
+  const lateral = pose.lateral;
+  return typeof lateral === 'number' && Number.isFinite(lateral) && Math.abs(lateral) <= 32
+    ? { farWall: pose.wall, farLateral: lateral }
+    : { farWall: pose.wall };
+}
+
 /**
  * Turn station records into destinations. A station's berth is its welcome
  * room — dockable only when this client holds a seed for it (`seedFor`: the
@@ -257,7 +291,8 @@ export function destinationsFromRecords(
     // door name the doors doc would strip counts as none.
     const door = r.berthDoor && isAcceptableDoorKey(r.berthDoor) ? r.berthDoor : undefined;
     const address = r.welcomeRoomId && door ? seedFor(r.welcomeRoomId) : undefined;
-    if (address && door) out.berth = { address, farDoor: door };
+    // With its door's pose where known (setBerthPoseLookup).
+    if (address && door) out.berth = { address, farDoor: door, ...berthPose(r.welcomeRoomId, door) };
     return out;
   });
 }
