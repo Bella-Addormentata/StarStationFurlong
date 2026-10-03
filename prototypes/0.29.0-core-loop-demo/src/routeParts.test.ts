@@ -2,7 +2,7 @@
 // aboard (routeParts.lastRoutePartTaken): without a helm nobody could STOP it.
 
 import { describe, expect, it } from 'vitest';
-import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute } from './routeParts';
+import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, templateSwapLockedByRoute } from './routeParts';
 import type { FurnitureItem } from './furniture';
 
 const item = (id: string, kind: string): FurnitureItem => ({ id, kind, x: 0, z: 0, rot: 0, movable: true } as unknown as FurnitureItem);
@@ -58,5 +58,19 @@ describe('the route’s ship port', () => {
   it('may go once the route is stopped, or with no route', () => {
     expect(routePortTaken('x-', { shipPort: 'x-' })).toBe(false);
     expect(routePortTaken('x-', null)).toBe(false);
+  });
+});
+
+// 🏗️ Copilot (PR 180, 24th review): paused, the tanks may change, so the
+// DEV menu's PLACE got past the tank lock, and its template replaced the
+// last helm, engine, tank and the robot captain's dock all at once.
+describe("the DEV menu's PLACE", () => {
+  it('is refused while the route runs, paused or not', () => {
+    expect(templateSwapLockedByRoute({ startedAt: 1000 })).toBe(true);
+  });
+
+  it('may swap the room once the route is stopped, or with no route', () => {
+    expect(templateSwapLockedByRoute({})).toBe(false);
+    expect(templateSwapLockedByRoute(null)).toBe(false);
   });
 });

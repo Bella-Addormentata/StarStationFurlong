@@ -58,10 +58,10 @@ import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 import { readGame } from './games/gamesDoc';
 import {
   ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
-  findTemplate, templateItemsFor,
+  findTemplate,
 } from './roomTemplates';
-import { routeRulesFlightNow } from './shipRoute';
-import { tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
+import { readShipRoute, routeRulesFlightNow } from './shipRoute';
+import { tanksLockedByRoute, templateSwapLockedByRoute, TANKS_LOCK_REFUSAL, TEMPLATE_SWAP_REFUSAL } from './routeParts';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
@@ -273,6 +273,21 @@ function tanksLocked(after: readonly FurnitureItem[], what: string): boolean {
   }
   if (!tanksLockedByRoute(FURNITURE, after, rules)) return false;
   showHint(`DEV: CAN'T ${what} — ${TANKS_LOCK_REFUSAL}.`, 3200);
+  return true;
+}
+
+/** 🏗️ Refuse, with a hint, PLACE while the ship's route runs, a paused one
+ *  included: a template replaces every piece in the room, the route's helm,
+ *  engine, tanks and robot captain with them (routeParts.templateSwapLockedByRoute). */
+function templateSwapLocked(): boolean {
+  let route: ReturnType<typeof readShipRoute> = null;
+  try {
+    route = readShipRoute();
+  } catch {
+    route = null;
+  }
+  if (!templateSwapLockedByRoute(route)) return false;
+  showHint(`DEV: CAN'T PLACE A TEMPLATE — ${TEMPLATE_SWAP_REFUSAL}.`, 3200);
   return true;
 }
 
@@ -969,6 +984,8 @@ function buildPanel(): HTMLDivElement {
       case 'place-template': {
         const w = getWorld();
         if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        // Asked on the arming click and again on the confirming one.
+        if (templateSwapLocked()) break;
         // ⚠️ Destructive: one click REPLACES every piece in the room, and one
         // stray click has already wiped a furnished home. Two-click arm/confirm:
         // the first click arms for 3 s (red ⚠), the second click executes.
@@ -991,8 +1008,6 @@ function buildPanel(): HTMLDivElement {
         btn.dataset.armed = '';
         btn.textContent = 'PLACE'; // restore from the armed look (timeout skips executed buttons)
         btn.style.cssText = BTN_STYLE;
-        const wanted = findTemplate(btn.dataset.template ?? '');
-        if (wanted && tanksLocked(templateItemsFor(wanted), 'PLACE A TEMPLATE')) break;
         const t = applyRoomTemplate(btn.dataset.template ?? '');
         if (!t) break;
         // Furniture rebuilds via the doc subscription (replaceAllFurniture);

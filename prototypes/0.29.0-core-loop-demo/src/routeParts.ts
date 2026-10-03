@@ -5,7 +5,9 @@
  * route keeper would fly on regardless), and without an engine or a tank the
  * module is no ship. The route's ship port stays too (routePortTaken). And
  * while the timetable flies the ship, its tanks stay as they are
- * (tanksLockedByRoute). Pure; pinned by routeParts.test.ts.
+ * (tanksLockedByRoute). The DEV menu's PLACE, which replaces every piece in
+ * the room, waits for the route to stop (templateSwapLockedByRoute). Pure;
+ * pinned by routeParts.test.ts.
  */
 
 import { FURNITURE_DEFS } from './furniture';
@@ -55,6 +57,21 @@ export function tanksLockedByRoute(
   timetableRules: boolean,
 ): boolean {
   return timetableRules && before.filter(isTank).length !== after.filter(isTank).length;
+}
+
+/** 🏗️ Why the DEV menu's PLACE can't put a template in the room now. */
+export const TEMPLATE_SWAP_REFUSAL = "the ship's route is running, and a template replaces its helm, engine, tanks and robot captain. Stop the route at the helm first";
+
+/**
+ * 🏗️ May the DEV menu's PLACE not swap the room's furniture for a template?
+ * Never while the ship's route runs, a paused one included: PLACE replaces
+ * every piece in the room, so it would take the route's last helm, engine
+ * and tank (lastRoutePartTaken) and its robot captain's dock all at once,
+ * each of which edit mode refuses on its own. ADD keeps every piece, so it
+ * only answers to tanksLockedByRoute. `route`: the ship's route.
+ */
+export function templateSwapLockedByRoute(route: { startedAt?: number } | null): boolean {
+  return !!route && route.startedAt !== undefined;
 }
 
 /**

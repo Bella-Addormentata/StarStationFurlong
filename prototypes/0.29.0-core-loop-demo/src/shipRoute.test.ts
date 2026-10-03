@@ -77,6 +77,8 @@ import {
   writeShipRoute,
 } from './shipRoute';
 import type { RouteCheckpoint, RouteStop, ShipRoute, StartCheckpoint } from './shipRoute';
+import { tanksLockedByRoute, templateSwapLockedByRoute } from './routeParts';
+import type { FurnitureItem } from './furniture';
 
 // ── Fixtures ─────────────────────────────────────────────────────────────────
 
@@ -1204,6 +1206,16 @@ describe('readResolvedFlight (A4)', () => {
     expect(readRouteFlight()).toMatchObject({ paused: true });
     expect(routeRulesFlightNow()).toBe(false);
     expect(resolveShipFlight()).toEqual({ flight: home, route: null });
+  });
+
+  it("paused, the tanks may change, but the DEV menu's PLACE stays refused: the route still runs", () => {
+    const { run, route, start } = started();
+    install();
+    clock = onTime(route, start, 1)[0].arrive + 20 * SEC;
+    expect(writeRouteCheckpoint(run, pauseCheckpoint(route, 1, { at: clock }), clock)).toBe(true);
+    const tanks = [{ id: 't1', kind: 'fuel-tank', x: 0, z: 0, rot: 0, movable: true }] as unknown as FurnitureItem[];
+    expect(tanksLockedByRoute(tanks, [], routeRulesFlightNow())).toBe(false);
+    expect(templateSwapLockedByRoute(readShipRoute())).toBe(true);
   });
 
   it("reads the route's station ids as this install's", () => {

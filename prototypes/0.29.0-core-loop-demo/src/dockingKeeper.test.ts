@@ -1,7 +1,8 @@
 /**
  * 🚏 A route keeper's DOCK through the docking system (docking.ts
  * redockPortAnswer, keeper mode): the far berth is asked over an await, and
- * the rider carve-out that let the keeper ask may be gone by the answer.
+ * the rider carve-out that let the keeper ask may be gone by the answer; a
+ * far write the station never acknowledged is taken back.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -79,5 +80,42 @@ describe("a keeper's DOCK and the rider carve-out", () => {
     expect(asks.map((a) => a.kind)).toEqual(['dock', 'undock']);
     const [dock, undo] = asks;
     expect(undo).toMatchObject({ farDoor: 'south', onlyDockedAt: dock.kind === 'dock' ? dock.dockedAt : NaN });
+  });
+
+  // Copilot (PR 180, 24th review): a far write the station never
+  // acknowledged may still land, and the route may never ask here again.
+  it('takes back a far write the station never acknowledged, though this port is unchanged', async () => {
+    docking.onFarDockWrite(async (req) => {
+      asks.push(req);
+      return req.kind === 'dock'
+        ? ({ ok: false, reason: 'unreachable', unconfirmed: true } satisfies FarDockResult)
+        : ({ ok: true, detail: 'written' } satisfies FarDockResult);
+    });
+    const answer = await docking.redockPortAnswer('north', { keeper: true });
+    expect(answer).toMatchObject({ ok: false, reason: 'unreachable' });
+    const port = classifyDockPort(readDoor('north'));
+    expect(port.kind).toBe('undocked');
+    // This side keeps its berth memory, so the keeper's retry asks afresh.
+    expect(port.kind === 'undocked' && port.memory.undockedAt).toBe(1000);
+    expect(asks.map((a) => a.kind)).toEqual(['dock', 'undock']);
+    const [dock, undo] = asks;
+    expect(undo).toMatchObject({
+      farAddress: SEED_BERTH,
+      farDoor: 'south',
+      nearDoorId: 'north',
+      onlyDockedAt: dock.kind === 'dock' ? dock.dockedAt : NaN,
+    });
+    expect(undo.kind === 'undock' && dock.kind === 'dock' && undo.undockedAt > dock.dockedAt).toBe(true);
+  });
+
+  it('asks nothing back of a station that could not be reached at all', async () => {
+    docking.onFarDockWrite(async (req) => {
+      asks.push(req);
+      return { ok: false, reason: 'unreachable' } satisfies FarDockResult;
+    });
+    const answer = await docking.redockPortAnswer('north', { keeper: true });
+    expect(answer).toMatchObject({ ok: false, reason: 'unreachable' });
+    expect(classifyDockPort(readDoor('north')).kind).toBe('undocked');
+    expect(asks.map((a) => a.kind)).toEqual(['dock']);
   });
 });
