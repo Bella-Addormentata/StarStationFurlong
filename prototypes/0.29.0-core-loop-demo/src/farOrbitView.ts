@@ -45,7 +45,7 @@ import { readAllDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
-import { readResolvedFlight } from './shipRoute';
+import { resolveShipFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -233,14 +233,15 @@ function readSource(now: number): Source {
   if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
     // 🚏 A running ferry route's timetable while it rules the flight (its
     // legs write no stored `flight`), else the stored record.
-    const rec = readResolvedFlight(now);
+    const { flight: rec, places } = resolveShipFlight(now);
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
-      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => [
-        placeOf(rec.locationId, all, leftAt, now),
-        placeOf(to, all, leftAt, now),
-      ]);
+      // 🚚 The timetable's legs fly the route's own copy of each stop, which
+      // a stop's station may have left for another planet: those are its ends.
+      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => (places?.to
+        ? [places.from, places.to]
+        : [placeOf(rec.locationId, all, leftAt, now), placeOf(to, all, leftAt, now)]));
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.

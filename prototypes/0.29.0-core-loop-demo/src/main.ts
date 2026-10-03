@@ -138,6 +138,7 @@ import {
   readRouteCheckpoints,
   readRouteFlight,
   readShipRoute,
+  resolveShipFlight,
   routeRulesFlightNow,
   settleRouteFlight,
 } from "./shipRoute";
@@ -166,7 +167,7 @@ import {
 import { createDeparturesPublisher, initDeparturesWrite, writeDepartures } from "./departuresWrite";
 // 🚏🛟 A5: the route's keeper — docks and casts off a running ferry in every
 // game in the ship's room, on the timetable's moments.
-import { createRouteKeeper, sameStationReader } from "./routeKeeper";
+import { createRouteKeeper, routeRoomReady, sameStationReader } from "./routeKeeper";
 // 🚏🤖 …and a station's gate keeper: a gate set to AUTO-DOCK FERRIES docks
 // a ferry that calls with nobody aboard, through a background session to the
 // ferry's room.
@@ -251,6 +252,7 @@ import {
   currentStation,
   dockedStationFor,
   listStations,
+  planetById,
   registerStation,
   removeStation,
   setRoomStationResolver,
@@ -1327,12 +1329,20 @@ function shipRouteLiveDock(): LiveDockAt {
   return liveDockFrom(docks, sameStationReader(), routePort !== undefined ? { routePort } : {});
 }
 
-/** 🛰️ Has the active room's shared state arrived (initialRoomStateReady)?
- *  Before it has, the replica may be IndexedDB's stale copy: the route's
- *  keeper and its copy-back wait. */
+/** Is `roomId` hosted by this machine's node: our home, or a module we
+ *  minted? Its replica there is the room's own copy; any other room has a
+ *  host elsewhere. */
+function roomHostedHere(roomId: string): boolean {
+  return roomId === getDefaultRoomId() || moduleLedger().some((e) => e.roomId === roomId);
+}
+
+/** 🛰️ Has the active room's shared state arrived (routeKeeper.routeRoomReady)?
+ *  Before it has, the replica may be IndexedDB's cached copy, owner and name
+ *  included: the route's keeper and its copy-back wait. */
 function roomStateArrivedNow(): boolean {
   const sync = yjsSync;
-  return !!sync && initialRoomStateReady(sync);
+  const roomId = activeBootstrap?.roomId ?? "";
+  return !!sync && !!roomId && routeRoomReady(sync, roomHostedHere(roomId));
 }
 
 /**
@@ -1508,7 +1518,7 @@ function planetShipStatus(): ShipStatusInput | null {
   const now = Date.now();
   // 🚏 A running route's timetable, while it rules the flight (A4): the
   // stored record only catches up at the copy-back.
-  const rec = readResolvedFlight(now);
+  const { flight: rec, places } = resolveShipFlight(now);
   const stations = listStations();
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
   const from = byId(rec.locationId);
@@ -1517,7 +1527,12 @@ function planetShipStatus(): ShipStatusInput | null {
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
-  const planetId = from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
+  // 🚚 The timetable flies the route's own copy of each stop, which a stop's
+  // station may have left for another planet since: its planet, not the
+  // station list's, while it rules.
+  const planetId = places
+    ? planetById(places.from.planetId).id
+    : from?.planetId ?? adriftPlace(rec.locationId)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const roomName = yjsSync?.doc.getMap("roomInfo").get("name");
   // 🚏📋 A ferry on its route goes by its board name, so a newer summary can
@@ -3767,9 +3782,7 @@ function wireAdapterTransit(): void {
     resolve: resolveBridgeBootstrap,
     // Our home and every module we minted live on this machine's node: its
     // replica is the room's own copy. Any other room has a host elsewhere.
-    hostedHere: (roomId: string) =>
-      roomId === getDefaultRoomId() ||
-      moduleLedger().some((e) => e.roomId === roomId),
+    hostedHere: roomHostedHere,
     // A dock between two doors of the room we stand in: the bound doc.
     activeRoomDoc: (roomId: string) =>
       roomId === activeBootstrap?.roomId && yjsSync ? yjsSync.doc : null,
