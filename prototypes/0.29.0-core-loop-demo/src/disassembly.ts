@@ -183,6 +183,32 @@ export function jobStatusText(job: DisassemblyJob, now: number, blocked: string 
   return `${pct}% · ${hours} · ${robots} · about ${realMin} min at this pace`;
 }
 
+/** What a crew robot last said about its job: which job (its module, and
+ *  when it was opened), and the tenth of the labor. */
+export interface JobAnnouncement {
+  roomId: string;
+  startedAt: number;
+  tenth: number;
+}
+
+/** The line a crew robot says now, `fraction` of the way through its job,
+ *  and what it has then said; null when it has said it already. One line on
+ *  starting on a job (a robot set to another module, or to a job opened
+ *  again, starts over there) and one at each tenth of the labor. */
+export function jobAnnouncement(
+  job: Pick<DisassemblyJob, 'roomId' | 'startedAt' | 'name' | 'laborHours'>,
+  fraction: number,
+  said: JobAnnouncement | undefined,
+): { text: string; said: JobAnnouncement } | null {
+  const tenth = Math.floor(Math.min(1, Math.max(0, fraction)) * 10);
+  const onIt = said !== undefined && said.roomId === job.roomId && said.startedAt === job.startedAt;
+  if (onIt && said.tenth === tenth) return null;
+  const text = onIt
+    ? `🔧 ${job.name} is ${tenth * 10}% taken apart.`
+    : `🔧 On it: taking ${job.name} apart, ${tenth === 0 ? `${job.laborHours} labor hours` : `${tenth * 10}% done`}.`;
+  return { text, said: { roomId: job.roomId, startedAt: job.startedAt, tenth } };
+}
+
 // ── What can be taken apart ──────────────────────────────────────────────────
 
 export interface DisassemblyCandidate extends DisassemblyTarget {

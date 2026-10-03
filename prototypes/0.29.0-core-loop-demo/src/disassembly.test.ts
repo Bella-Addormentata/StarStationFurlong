@@ -13,7 +13,7 @@ import {
   readAtlas, seedAtlasDefaults, withSharedAtlasOf, MAX_ENTRIES,
 } from './stationAtlas';
 import {
-  disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobDueAt, jobFraction, jobStatusText,
+  disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, jobAnnouncement, jobDueAt, jobFraction, jobStatusText,
   laborHoursFor, laborMsFor, removalBlocker, settleJob, workedMs,
   type CandidateInput, type DisassemblyJob, type DisassemblyJobRecord,
 } from './disassembly';
@@ -22,7 +22,7 @@ import {
   readDisassemblyJob, readDisassemblyJobs, readRobotConfig, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
 } from './robotDoc';
 import type { DoorRecord } from './doorsDoc';
-import { bindFurnitureDoc, deleteFurnitureItem, writeFurnitureItem } from './furnitureDoc';
+import { bindFurnitureDoc, deleteFurnitureItem, replaceAllFurniture, writeFurnitureItem } from './furnitureDoc';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -91,6 +91,23 @@ describe('labor on the orbital clock', () => {
     expect(jobStatusText(job({ crew: ['d1'] }), 30 * MIN)).toBe("Work done; it comes off once the room's owner is here.");
     expect(jobStatusText(job({ finishedAt: 5, outcome: 'removed' }), 0)).toBe('GARDEN was taken apart and is off the station.');
     expect(jobStatusText(job({ finishedAt: 5, outcome: 'detached' }), 0)).toContain('nothing was taken apart');
+  });
+
+  it('a robot says it is on a job once, then each tenth, and starts over on another', () => {
+    const garden = job();
+    const start = jobAnnouncement(garden, 0, undefined)!;
+    expect(start.text).toBe('🔧 On it: taking GARDEN apart, 24 labor hours.');
+    expect(jobAnnouncement(garden, 0.05, start.said)).toBeNull();
+    const third = jobAnnouncement(garden, 0.31, start.said)!;
+    expect(third.text).toBe('🔧 GARDEN is 30% taken apart.');
+    expect(jobAnnouncement(garden, 0.39, third.said)).toBeNull();
+    // Set to another module at the same tenth: it starts over there, not
+    // silent because the tenth matches.
+    const lab = job({ roomId: 'room-c', name: 'LAB', laborHours: 36 });
+    expect(jobAnnouncement(lab, 0.3, third.said)?.text).toBe('🔧 On it: taking LAB apart, 30% done.');
+    // Likewise a job on the same module opened again.
+    expect(jobAnnouncement(job({ startedAt: 40 * MIN }), 0.3, third.said)?.text).toBe('🔧 On it: taking GARDEN apart, 30% done.');
+    expect(jobAnnouncement(garden, 1, third.said)?.text).toBe('🔧 GARDEN is 100% taken apart.');
   });
 
   it('reads only well-formed job records from the room doc', () => {
@@ -420,14 +437,62 @@ describe('the job in the robot map', () => {
     // d3's dock isn't in the layout: no robot stands there to work.
     expect(readDisassemblyJob('room-b')?.crew).toEqual(['d1', 'd2']);
     // d2's dock leaves the layout by a write that didn't release its robot
-    // (a peer's): its config stays, but it adds no labor from then on, and
-    // what it did since the last settlement goes with it.
+    // (an older client's, or a peer's): it adds no labor from then on, what
+    // it did since the last settlement goes with it, and its robot leaves
+    // the job for good.
     deleteFurnitureItem('d2');
     const j = readDisassemblyJob('room-b')!;
     expect(j.crew).toEqual(['d1']);
-    expect(readRobotConfig('d2')).toMatchObject({ routine: 'disassemble', target: 'room-b' });
+    expect(readRobotConfig('d2')).toBeNull();
     expect(workedMs(j, 10 * MIN)).toBe(10 * MIN);
     expect(jobDueAt(j)).toBe(24 * MIN);
+    // The same dock put back later comes back unprogrammed, instead of
+    // rejoining the crew as if it had worked all the time it was gone.
+    writeFurnitureItem({ id: 'd2', kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    const back = readDisassemblyJob('room-b')!;
+    expect(readRobotConfig('d2')).toBeNull();
+    expect(back.crew).toEqual(['d1']);
+    expect(workedMs(back, 10 * MIN)).toBe(10 * MIN);
+    expect(jobDueAt(back)).toBe(24 * MIN);
+  });
+
+  it("a dock a peer's write removes leaves its job on every client", () => {
+    const a = roomWithDocks(['d1', 'd2']);
+    bindRobotDoc(a);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    // An older client's REMOVE, which doesn't release the robot: a plain
+    // delete in its copy of the room doc, sent to this one.
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    b.getMap('furniture').delete('d2');
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    expect(readRobotConfig('d2')).toBeNull();
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(['d1']);
+    // The release reaches the older client too, so a dock it puts back
+    // there later starts unprogrammed as well.
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    expect(b.getMap('robot').has('cfg:d2')).toBe(false);
+  });
+
+  it('a dock moved, or kept by a layout written whole, stays on its job', () => {
+    const doc = roomWithDocks(['d1', 'd2']);
+    bindRobotDoc(doc);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    const d1 = { id: 'd1', kind: 'charging-dock', pos: { x: 3, z: 1 }, rot: 1, movable: true } as const;
+    const d2 = { id: 'd2', kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true } as const;
+    // Moved across the room, then kept by a layout written whole (each key
+    // deleted and set again in one write).
+    writeFurnitureItem(d1);
+    replaceAllFurniture([d1, d2]);
+    expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
+    expect(readRobotConfig('d2')).toEqual({ routine: 'disassemble', target: 'room-b' });
+    expect(readDisassemblyJob('room-b')).toMatchObject({ crew: ['d1', 'd2'], doneMs: 0, asOf: 0 });
+    // One that puts something else where a dock was takes its robot off.
+    replaceAllFurniture([d1, { ...d2, kind: 'sofa-front' }]);
+    expect(readRobotConfig('d2')).toBeNull();
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(['d1']);
   });
 
   it('raises an open job costed below the module, keeping the work done', () => {

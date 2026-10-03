@@ -48,6 +48,7 @@ import type { RobotRoutine } from "./robotDoc";
 import {
   disassemblyCandidates,
   doorsJoinedTo,
+  jobAnnouncement,
   jobDueAt,
   jobFraction,
   laborHoursFor,
@@ -55,6 +56,7 @@ import {
   type CandidateInput,
   type DisassemblyCandidate,
   type DisassemblyJob,
+  type JobAnnouncement,
 } from "./disassembly";
 // 🚀 The robot captain (robot pilot routes §2a): where a Ship pilot robot
 // stands and what it announces, from the ship's shared timetable.
@@ -313,9 +315,9 @@ export class World {
    *  countdown (s) to the next reading of the timetable. */
   private pilotSpeech = new Map<string, PilotSpeech>();
   private pilotTimer = 0;
-  /** 🔧 The last tenth of its job each Disassemble robot announced (local,
-   *  like the captain's lines). */
-  private disassemblySaid = new Map<string, number>();
+  /** 🔧 The job, and the last tenth of it, each Disassemble robot
+   *  announced (local, like the captain's lines). */
+  private disassemblySaid = new Map<string, JobAnnouncement>();
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -5318,15 +5320,12 @@ export class World {
       // deed holder away), having said it is done.
       const fraction = jobFraction(job, now);
       bot.setWorkPost(fraction < 1 ? this.workPost(job.doorId, slot) : null);
-      // A line on starting and at each tenth of the job, once delivered.
-      const tenth = Math.floor(fraction * 10);
-      const said = this.disassemblySaid.get(key);
-      if (said === tenth) continue;
-      const text = said === undefined && tenth === 0
-        ? `🔧 On it: taking ${job.name} apart, ${job.laborHours} labor hours.`
-        : `🔧 ${job.name} is ${tenth * 10}% taken apart.`;
+      // A line on starting on the job and at each tenth of it, once
+      // delivered (a robot set to another module starts over there).
+      const line = jobAnnouncement(job, fraction, this.disassemblySaid.get(key));
+      if (!line) continue;
       const p = bot.getPosition();
-      if (this.robotSay(`robotsay:${key}`, text, p.x, p.z)) this.disassemblySaid.set(key, tenth);
+      if (this.robotSay(`robotsay:${key}`, line.text, p.x, p.z)) this.disassemblySaid.set(key, line.said);
     }
   }
 

@@ -91,8 +91,12 @@ function docAlive(): boolean {
 
 export function bindRobotDoc(doc: Y.Doc): void {
   boundDoc = doc;
-  robotMap = doc.getMap('robot');
-  robotMap.observe(() => notify());
+  const map = doc.getMap('robot');
+  robotMap = map;
+  map.observe(() => notify());
+  // 🔧 A charging dock taken out of the layout ends its robot's
+  // disassembly work for good (releaseRemovedDocks).
+  doc.getMap('furniture').observe((event) => releaseRemovedDocks(map, event));
   notify();
 }
 
@@ -191,10 +195,11 @@ function indexJobs(map: Y.Map<unknown>): JobIndex {
   const records: DisassemblyJobRecord[] = [];
   const crews = new Map<string, string[]>();
   const targeted = new Set<string>();
-  // A config can outlive its dock (a layout written without releasing it):
-  // only a dock placed in this same room doc's layout has a robot, so only
-  // its config counts. A gone one adds no labor; what it did since the last
-  // settlement goes with it, so a job is never ahead of its robots.
+  // A config can outlive its dock (a layout written without releasing it,
+  // until releaseRemovedDocks drops it): only a dock placed in this same
+  // room doc's layout has a robot, so only its config counts. A gone one
+  // adds no labor; what it did since the last settlement goes with it, so a
+  // job is never ahead of its robots.
   const doc = map.doc;
   const placed = (dockId: string) => doc !== null && placedFurnitureIn(doc, dockId)?.kind === 'charging-dock';
   let scanned = 0;
@@ -248,6 +253,36 @@ function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | 
   for (const record of after.records) {
     if (record.finishedAt !== undefined && !after.targeted.has(record.roomId)) map.delete(jobKey(record.roomId));
   }
+}
+
+/**
+ * 🔧 A charging dock taken out of the room's layout by a write that didn't
+ * release its robot first (an older client's, or a peer's: this build's
+ * REMOVE and templates release it): every client in the room sees the
+ * removal and drops the dock's Disassemble config, so its robot leaves the
+ * job for good. Its labor since the last settlement goes with it (the crew
+ * counts placed docks only), and the same dock put back later comes back
+ * unprogrammed, instead of rejoining the crew as if it had worked all the
+ * time it was gone. A dock moved, or kept by a write that replaces the
+ * layout, never left: it stays on the job. (A removal and a return made
+ * while no client of this build was in the room leave the config as it was.)
+ */
+function releaseRemovedDocks(map: Y.Map<unknown>, event: Y.YMapEvent<unknown>): void {
+  const doc = map.doc;
+  if (!doc) return;
+  const gone: string[] = [];
+  event.changes.keys.forEach((change, dockId) => {
+    if (change.action === 'add') return;
+    if ((change.oldValue as { kind?: unknown } | null | undefined)?.kind !== 'charging-dock') return;
+    if (change.action === 'update' && placedFurnitureIn(doc, dockId)?.kind === 'charging-dock') return;
+    const config = map.get(`cfg:${dockId}`);
+    if (isRobotConfig(config) && config.routine === 'disassemble') gone.push(dockId);
+  });
+  if (gone.length === 0) return;
+  const now = Date.now();
+  doc.transact(() => {
+    for (const dockId of gone) setConfigIn(map, dockId, null, now);
+  });
 }
 
 /** Every disassembly job in this room, open or finished, with its crew. */
