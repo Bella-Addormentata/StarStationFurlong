@@ -121,8 +121,9 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 import type { FlightRecord } from './shipDoc';
+import { isUsableOrbit } from './orbits';
 import { localStationId } from './stationDirectory';
-import { MAX_ORBIT_SLOTS } from './stations';
+import { MAX_ORBIT_SLOTS, planetById } from './stations';
 import type { StationOrbit } from './stations';
 
 // ── Stored shapes (A1, A9.6) ─────────────────────────────────────────────────
@@ -354,6 +355,9 @@ export function routeStopFromWire(v: unknown): RouteStop | null {
     if (!(isPlainObject(o) && typeof o.radiusKm === 'number' && Number.isFinite(o.radiusKm) && o.radiusKm > 0
       && typeof o.phase0 === 'number' && Number.isFinite(o.phase0) && Math.abs(o.phase0) <= 2 * Math.PI)) return null;
     orbit = { radiusKm: o.radiusKm, phase0: o.phase0 };
+    // One the station could fly around that planet (orbits.baseOrbit): else
+    // the timetable would plan the slot's orbit and the keeper skip the stop.
+    if (!isUsableOrbit(planetById(v.planetId), orbit)) return null;
   }
   return {
     stationId: v.stationId, name: v.name, planetId: v.planetId, orbitSlot: slot, ...(orbit ? { orbit } : {}), berth, waitSecs: wait,
