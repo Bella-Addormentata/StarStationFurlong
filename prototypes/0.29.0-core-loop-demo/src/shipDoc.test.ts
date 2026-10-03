@@ -18,7 +18,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
+import { DEFAULT_STATIONS, adriftAt, setStationDirectory } from './stationDirectory';
 import {
   DESTINATIONS,
   TANK_CAPACITY,
@@ -34,10 +34,12 @@ import {
   pairingAllowedByFlight,
   readFlightRecord,
   readFuelLevel,
+  readRestPlace,
   shipDocBound,
   subscribeShip,
   writeFlightRecord,
   writeFuelLevel,
+  writeRestPlace,
 } from './shipDoc';
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────
@@ -811,6 +813,33 @@ describe('flight records written on another install', () => {
       expect(writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'l4-anchorage', departedAt: 1, etaAt: 2 })).toBe(true);
       expect(doc.getMap('ship').get('flight')).toMatchObject({ locationId: 'shared:room-high', destinationId: 'shared:room-l4' });
       expect(readFlightRecord()).toMatchObject({ locationId: 'high-orbit', destinationId: 'l4-anchorage' });
+    } finally {
+      setStationDirectory(null);
+    }
+  });
+});
+
+describe('rest records written on another install', () => {
+  it('name the station the ship rests beside by its portable id, read back as this install\'s', () => {
+    const rooms: Record<string, string> = { 'high-orbit': 'room-high', 'furlong-station': 'r'.repeat(130) };
+    const back: Record<string, string> = { 'shared:room-high': 'high-orbit' };
+    setStationDirectory({
+      stations: () => DEFAULT_STATIONS,
+      resolve: (id) => back[id] ?? null,
+      portable: (id) => (rooms[id] ? `shared:${rooms[id]}` : null),
+    });
+    try {
+      const doc = freshDoc();
+      const at = adriftAt('planet-aris', 2);
+      expect(writeRestPlace({ at, since: 5, from: 'high-orbit' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 5, from: 'shared:room-high' });
+      expect(readRestPlace()).toEqual({ at, since: 5, from: 'high-orbit' });
+      // No portable id, or one too long for the wire: the id as it is.
+      expect(writeRestPlace({ at, since: 6, from: 'l4-anchorage' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 6, from: 'l4-anchorage' });
+      expect(writeRestPlace({ at, since: 7, from: 'furlong-station' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 7, from: 'furlong-station' });
+      expect(readRestPlace()).toEqual({ at, since: 7, from: 'furlong-station' });
     } finally {
       setStationDirectory(null);
     }

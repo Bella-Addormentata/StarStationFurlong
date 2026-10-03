@@ -527,7 +527,11 @@ function placeStations(
   // that nothing here lists: each takes part in the slots below as it does
   // on an install that lists it, so both settle every slot alike, but none
   // is listed (no ship flies to a station this install cannot place). A
-  // room the atlas knows is left to the station listed for it.
+  // room the atlas knows is left to the station listed for it. Its move is
+  // the installed resolver's, as a listed station's is: that has heard the
+  // summary's move too (planetSummary remembers it), so its answer is what
+  // stands, null included (a tow outbid for its tug flies nowhere). Only
+  // with no resolver does the summary's own move stand in.
   for (const p of knownPlaces(candidates.map((c) => c.welcomeRoomId))) {
     const where = placeOf(p.welcomeRoomId);
     if (!where.startsWith('room:') || places.has(where)) continue;
@@ -538,7 +542,7 @@ function placeStations(
       id: stub.id,
       welcomeRoomId: p.welcomeRoomId,
       base: { planetId: planetById(p.planetId).id, orbitSlot: p.orbitSlot },
-      move: moveOf(stub) ?? (p.move && moveBelongsTo(p.move, stub) ? p.move : null),
+      move: moveResolver ? moveOf(stub) : p.move && moveBelongsTo(p.move, stub) ? p.move : null,
       listed: false,
       make: (planetId, orbitSlot, move) => ({
         id: stub.id, name: 'STATION', planetId, orbitSlot, welcomeRoomId: p.welcomeRoomId, ...(move ? { move } : {}),

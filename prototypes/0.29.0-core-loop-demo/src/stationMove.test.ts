@@ -1255,6 +1255,28 @@ describe('tugs: a torch tow', () => {
     expect(rememberedMoveFor({ id: a.stationId, welcomeRoomId: a.welcomeRoomId })).toBeNull();
   });
 
+  it("leaves a station heard of where it was while another station's tow by the same tug outranks its own", () => {
+    bindStationMoveDoc(new Y.Doc());
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    // The outbid tow is of a station this install only hears of.
+    const a: StationMove = { ...plan.move, stationId: 'far', welcomeRoomId: 'far-room', fromSlot: 6 };
+    const b: StationMove = { ...plan.move, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt + 1, arriveAt: a.arriveAt + 1 };
+    expect(rememberMove(a, NOW)).toBe(true);
+    expect(rememberMove(b, NOW)).toBe(true);
+    setKnownPlacesResolver(() => [{ welcomeRoomId: 'far-room', planetId: SOV, orbitSlot: 6, move: a }]);
+    const mid = (b.departAt + b.arriveAt) / 2;
+    // With no move resolver installed, its summary's move is all there is.
+    expect(knownSlotsAround(ARIS, [], mid, {}).reserved.has(a.toSlot)).toBe(true);
+    // The installed one has heard both tows and keeps the outbid one from
+    // flying, as on an install that lists the station: it holds its slot at
+    // home and books none at Aris.
+    installStationMoveResolver();
+    expect(rememberedMoveFor({ id: 'heard:far-room', welcomeRoomId: 'far-room' })).toBeNull();
+    expect(knownSlotsAround(SOV, [], mid, {}).taken.has(6)).toBe(true);
+    expect(knownSlotsAround(ARIS, [], mid, {}).reserved.has(a.toSlot)).toBe(false);
+  });
+
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
     const plan = planStationTow(towCtx(), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);

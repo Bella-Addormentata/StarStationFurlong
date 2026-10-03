@@ -937,8 +937,9 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
  * docking): once none of them does, the ship is where its station was at the
  * last of their UNDOCKs since, read off those doors directly
  * (shipArrival.restingPlace). Once that is recorded as `at`, `from` names the
- * station those docks let go of: the ship rests beside it while it is there,
- * as beside its own (the flight record's). Kept first-hand in this room
+ * station those docks let go of (shared by its portable id, like the flight
+ * record's stations): the ship rests beside it while it is there, as beside
+ * its own (the flight record's). Kept first-hand in this room
  * (completeArrival, shipArrival.keepRestPlace), so every install reads the
  * same place, whatever station moves it has heard of. A docked ship with none
  * follows its station.
@@ -970,7 +971,8 @@ export function readRestPlace(): RestPlace | null {
   if (!isRestPlace(raw)) return null;
   const out: RestPlace = { at: raw.at, since: raw.since };
   if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
-  if (raw.from !== undefined) out.from = raw.from;
+  // Station ids are per install: read another install's as ours.
+  if (raw.from !== undefined) out.from = localStationId(raw.from);
   return out;
 }
 
@@ -982,16 +984,19 @@ export function writeRestPlace(rest: RestPlace | null): boolean {
     console.warn('[ship] refused to write malformed rest place', rest);
     return false;
   }
+  const record = rest && {
+    at: rest.at,
+    since: rest.since,
+    ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
+    ...(rest.from !== undefined ? { from: rest.from } : {}),
+  };
+  // Station ids are per install: the shared record names the station it
+  // rests beside by its welcome room, as the flight record does (keeping
+  // this install's id when that would not pass the wire check).
+  const shared = record?.from !== undefined ? { ...record, from: portableStationId(record.from) } : record;
   boundDoc!.transact(() => {
-    if (rest === null) shipMap!.delete('rest');
-    else {
-      shipMap!.set('rest', {
-        at: rest.at,
-        since: rest.since,
-        ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
-        ...(rest.from !== undefined ? { from: rest.from } : {}),
-      });
-    }
+    if (record === null) shipMap!.delete('rest');
+    else shipMap!.set('rest', isRestPlace(shared) ? shared : record);
   });
   return true;
 }
