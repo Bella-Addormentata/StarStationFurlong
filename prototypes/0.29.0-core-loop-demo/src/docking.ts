@@ -3132,6 +3132,23 @@ export class DoorDockingPortSystem {
         if (!unchanged()) {
           const settled = await this.settleChangedRedock(doorId, port, far, { roomId, farDoor, dockedAt, near, name });
           if (settled) return { ok: true, dockedAt };
+        } else if (farWriteMayStand(far)) {
+          // Written, but never acknowledged: it may still land, and leave the
+          // berth docked to a port that is not — and the route may never ask
+          // here again (SKIP, STOP, its departure). Take back exactly that
+          // write, as for a port that changed; a retry asks afresh.
+          this.setDockOp(doorId, { busy: true, note: `${name} did not confirm the dock — releasing its berth…` }, roomId);
+          const undone = await this.takeBackFarDock(doorId, port, { roomId, farDoor, dockedAt, near });
+          this.setDockOp(
+            doorId,
+            undone.ok
+              ? { note: `${name} did not confirm the dock — not docked; the route will try again.`, tone: "warn" }
+              : {
+                  note: `${name} did not confirm the dock and could not be reached to let go — its side may show the dock until the route docks again.`,
+                  tone: "bad",
+                },
+            roomId,
+          );
         } else {
           this.setDockOp(
             doorId,
@@ -3221,24 +3238,7 @@ export class DoorDockingPortSystem {
       },
       ask.roomId,
     );
-    let undone: FarDockResult;
-    try {
-      undone = await this.farDockWriter({
-        kind: "undock",
-        // The room the DOCK was made from — possibly not the one we stand in.
-        nearRoomId: ask.roomId,
-        farAddress: port.address,
-        farDoor: ask.farDoor,
-        nearDoorId: doorId,
-        nearWall: ask.near.wall,
-        nearLateral: ask.near.lateral,
-        undockedAt: stampAfter(ask.dockedAt),
-        onlyDockedAt: ask.dockedAt,
-      });
-    } catch (err) {
-      console.warn("[dock] far take-back threw:", err);
-      undone = { ok: false, reason: "unreachable" };
-    }
+    const undone = await this.takeBackFarDock(doorId, port, ask);
     this.setDockOp(
       doorId,
       undone.ok
@@ -3255,6 +3255,34 @@ export class DoorDockingPortSystem {
       ask.roomId,
     );
     return false;
+  }
+
+  /** ⚓ Take back exactly the far write redockPort made with `ask.dockedAt`:
+   *  the far side undoes only a dock carrying that stamp, never anyone
+   *  else's. */
+  private async takeBackFarDock(
+    doorId: string,
+    port: Extract<DockPortState, { kind: "undocked" }>,
+    ask: { roomId: string; farDoor: string; dockedAt: number; near: { wall: DoorWall; lateral: number } },
+  ): Promise<FarDockResult> {
+    if (!this.farDockWriter) return { ok: false, reason: "unreachable" };
+    try {
+      return await this.farDockWriter({
+        kind: "undock",
+        // The room the DOCK was made from — possibly not the one we stand in.
+        nearRoomId: ask.roomId,
+        farAddress: port.address,
+        farDoor: ask.farDoor,
+        nearDoorId: doorId,
+        nearWall: ask.near.wall,
+        nearLateral: ask.near.lateral,
+        undockedAt: stampAfter(ask.dockedAt),
+        onlyDockedAt: ask.dockedAt,
+      });
+    } catch (err) {
+      console.warn("[dock] far take-back threw:", err);
+      return { ok: false, reason: "unreachable" };
+    }
   }
 
   /** ⚓ The DOCK row at the top of the pane (see its markup). */
