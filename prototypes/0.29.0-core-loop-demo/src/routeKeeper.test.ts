@@ -900,6 +900,8 @@ describe('a dock pass over the gate list', () => {
     // Back on its slot's own orbit is a change too.
     expect((await at(undefined)).verdict).toEqual({ kind: 'skip' });
     expect(d.asked).toHaveLength(0);
+    // Back at the same altitude on another phase is a change too.
+    expect((await at({ radiusKm: 8_000, phase0: 1.2 })).verdict).toEqual({ kind: 'skip' });
     // Still on the orbit the route copied: asked as before.
     expect((await at(listed(8_000).orbit)).verdict.kind).toBe('docked');
   });

@@ -580,6 +580,11 @@ describe('Copilot round 3', () => {
       // Cast off before the climb: refused. After it had arrived: fine.
       expect(altitudeChangedSince(station, NOW - 1_000, NOW + 200_000)).toBe(true);
       expect(altitudeChangedSince(station, NOW + 70_000, NOW + 200_000)).toBe(false);
+      // A late install that knows only the later move still sees the climb
+      // by when the orbit that move leaves was claimed.
+      setAltitudeHistory(() => []);
+      expect(altitudeChangedSince(station, NOW - 1_000, NOW + 200_000)).toBe(true);
+      expect(altitudeChangedSince(station, NOW + 70_000, NOW + 200_000)).toBe(false);
       // A climb another station's earlier claim aborted never happened.
       const theirs = climbOf('other', 'other-room', 1, 1_020, NOW - 10);
       setAltitudeHistory(() => [climb, theirs]);

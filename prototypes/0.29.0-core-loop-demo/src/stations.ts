@@ -326,7 +326,24 @@ export function altitudeChangesSince(station: MovingStation, sinceMs: number, no
 /** 🎚️ Has the station begun an altitude change since `sinceMs`
  *  (altitudeChangesSince)? */
 export function altitudeChangedSince(station: MovingStation, sinceMs: number, nowMs: number): boolean {
-  return altitudeChangesSince(station, sinceMs, nowMs).length > 0;
+  if (altitudeChangesSince(station, sinceMs, nowMs).length > 0) return true;
+  // A later move records when the orbit it leaves was claimed (fromOrbit /
+  // orbit.fromSince): one claimed after cast-off was flown to since, even
+  // where only that latest move is known (a planet summary carries no more).
+  let history: StationMove[] = [];
+  try { history = altitudeHistory?.() ?? []; } catch { history = []; }
+  const latest = moveOf(station);
+  const known = latest ? [latest, ...history] : history;
+  const claimedSince = known.filter((m) => {
+    if (!moveBelongsTo(m, station)) return false;
+    const src = m.settles ?? m;
+    const since = src.mode === 'orbit' ? src.orbit?.fromSince : src.fromOrbit?.since;
+    return since !== undefined && since > sinceMs && since <= nowMs;
+  });
+  if (claimedSince.length === 0) return false;
+  // Unless that orbit lost its claim (the station never kept it).
+  const lost = lostAltitudeClaims(known);
+  return claimedSince.some((m) => !lost.has(m.mode === 'orbit' ? `${altitudeMoveKey(m)}|from` : altitudeMoveKey(m)));
 }
 
 /**

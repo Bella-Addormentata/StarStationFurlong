@@ -145,6 +145,7 @@ import {
   type RouteStop,
   type ShipRoute,
 } from './shipRoute';
+import { wrapAngle } from './orbits';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import {
   isKnownStation,
@@ -819,10 +820,12 @@ export async function runKeeperPass(deps: KeeperPassDeps): Promise<{ verdict: Pa
   const planetId = deps.station?.planetId;
   // 🎚️ Likewise a stop that has changed altitude since: the route flew to
   // the orbit it copied (RouteStop.orbit; none is the slot's own).
-  const liveRadius = deps.station?.orbit?.radiusKm;
-  const copiedRadius = deps.stop.orbit?.radiusKm;
-  const climbed = planetId !== undefined && ((liveRadius === undefined) !== (copiedRadius === undefined)
-    || (liveRadius !== undefined && copiedRadius !== undefined && Math.abs(liveRadius - copiedRadius) > 1e-6));
+  // Radius and phase both: back at an altitude flown before, it is not
+  // where it was then.
+  const live = deps.station?.orbit;
+  const copied = deps.stop.orbit;
+  const climbed = planetId !== undefined && (!live !== !copied || (!!live && !!copied
+    && (Math.abs(live.radiusKm - copied.radiusKm) > 1e-6 || Math.abs(wrapAngle(live.phase0 - copied.phase0)) > 1e-9)));
   if (planetId !== undefined && (planetId !== deps.stop.planetId || climbed)) {
     const gone = (berth: StationBerth): KeeperGateResult => ({ kind: 'refused', berth, reason: 'moving', cls: 'gone' });
     const results = (berths.length > 0 ? berths : [ownStopBerth(deps.stop, remembered?.address ?? '')]).map(gone);
