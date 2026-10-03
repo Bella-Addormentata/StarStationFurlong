@@ -2068,7 +2068,9 @@ export class DoorDockingPortSystem {
           // #67 D2: EITHER side casts off a transient berth — no owner ceremony.
           // The doc delete reconciles to every client (projection torn down,
           // door re-locked) through the normal doors-doc path.
-          deleteDoorPairing(doorId);
+          // 🚚 Not while a station move holds it: a berth carries its ship
+          // between planets as a dock does (undockPort).
+          if (!this.heldByMove(doorId)) deleteDoorPairing(doorId);
         } else if (!this.isRoomOwner()) {
           return; // every action below is owner-only (UI gate, dev-phase posture)
         } else if (action === "cycle-passage") {
@@ -2175,11 +2177,14 @@ export class DoorDockingPortSystem {
     // ⚓ #163: only a LEGACY berth (a transient gangway from before docks were
     // round) — a dock has its own DOCK row with UNDOCK at the top of the pane.
     const st = this.doorState.get(doorId);
-    const detachRow =
-      st?.pairedSuccessfully && st.transient && !isDockChain(st.segments)
-        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
+    const berth = !!st?.pairedSuccessfully && !!st.transient && !isDockChain(st.segments);
+    const held = berth && this.heldByMove(doorId);
+    const detachRow = berth
+      ? held
+        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked — this station is moving between planets, the berth holds until it arrives</span></div>`
+        : `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>`
-        : "";
+      : "";
 
     // ⏏ Owner-only UNDOCK for a PERMANENT docked module (the transient berth
     // has its own everyone-visible DETACH row above). Destructive → two-click
@@ -2634,6 +2639,20 @@ export class DoorDockingPortSystem {
       this.renderAssemblyStrip(doorId);
     }
     this.notifyDockChange();
+  }
+
+  /** 🚚 Does a station move hold this door's pairing: a station between
+   *  planets, or a tug's tow, at either end? Then neither end lets go until
+   *  it arrives (undockPort). */
+  private heldByMove(doorId: string): boolean {
+    const record = readDoor(doorId);
+    let far = "";
+    try {
+      far = record?.paired ? roomIdFromSeed(record.connectedRoomAddress) : "";
+    } catch {
+      far = "";
+    }
+    return dockLockedByMove([this.roomNow(), far], Date.now());
   }
 
   /** The module on the other side, by name when the atlas knows it. */

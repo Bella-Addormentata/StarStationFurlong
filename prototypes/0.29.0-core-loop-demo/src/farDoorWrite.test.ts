@@ -277,6 +277,36 @@ describe('applyFarDockRequest — DOCK into a room between planets', () => {
     expect(dockAt(heardRoom('elsewhere', transit), STATION, now).wrote).toBe(true);
   });
 
+  it('never takes a pin written in the berth room for another station as the room\'s own station', () => {
+    const ANNEX = 'annex-room';
+    // Station A arrived at Aris long ago, and a client standing in the annex
+    // pinned that arrival there, as it pins every station it lists…
+    const arrived: StationMove = {
+      ...transit, stationId: 'a', welcomeRoomId: 'a-room', fromPlanetId: 'planet-sovereign', fromSlot: 3,
+      toPlanetId: 'planet-aris', toSlot: 4, departAt: now - 10 * 3_600_000, arriveAt: now - 9 * 3_600_000, bookedAt: now - 10 * 3_600_000,
+    };
+    const pin: StationMove = {
+      ...arrived, fromPlanetId: 'planet-aris', fromSlot: 4, departAt: arrived.arriveAt, arriveAt: arrived.arriveAt + 1,
+      bookedAt: now - 8 * 3_600_000, fuel: 0, fuelDrawn: 0, settles: arrived,
+    };
+    // …and now A flies on, as the annex's summaries say.
+    const onward: StationMove = {
+      ...transit, stationId: 'a', welcomeRoomId: 'a-room', fromPlanetId: 'planet-aris', fromSlot: 4,
+      toPlanetId: 'planet-sovereign', toSlot: 5,
+    };
+    const annex = (...booked: StationMove[]) => {
+      const doc = bookedRoom(pin, ...booked);
+      doc.getMap('stationSummaries').set('a-room', {
+        welcomeRoomId: 'a-room', name: 'A', planetId: 'planet-aris', orbitSlot: 4, updatedAt: now, move: onward,
+      });
+      return doc;
+    };
+    // A's pin says nothing of which station the annex is part of.
+    expect(dockAt(annex(), ANNEX, now).wrote).toBe(true);
+    // A move of A booked there does: the annex flies with A.
+    expect(dockAt(annex(onward), ANNEX, now).result).toEqual({ ok: false, reason: 'moving' });
+  });
+
   it('refuses while the berth room holds more move records than a read covers — past them may lie a move', () => {
     const flooded = (fill: (doc: Y.Doc) => void): Y.Doc => {
       const doc = bookedRoom();

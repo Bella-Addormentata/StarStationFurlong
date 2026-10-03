@@ -558,6 +558,40 @@ describe('the station list follows a move', () => {
     expect(listStations({}, [], T + 2).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS });
   });
 
+  it('counts a station whose pin leaves the moment an arrival gets there where the pin holds it', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = move.arriveAt;
+    // k0 got to Aris slot 0 that very moment, as its pin says; or a tow of
+    // k0 left the moment before and was cancelled, the cancel leaving at T.
+    // Either way k0 held Aris slot 0 when this station got there.
+    const came: StationMove = {
+      stationId: 'k0', welcomeRoomId: 'k0', fromPlanetId: SOV, fromSlot: 5, toPlanetId: ARIS, toSlot: 0,
+      departAt: move.departAt, arriveAt: T, mode: 'thrusters', bookedAt: move.departAt, fuel: 1, fuelDrawn: 1,
+    };
+    const pin: StationMove = {
+      ...came, fromPlanetId: ARIS, fromSlot: 0, departAt: T, arriveAt: T + 1, bookedAt: T + 10, settles: came, fuel: 0, fuelDrawn: 0,
+    };
+    const tow: StationMove = {
+      ...came, fromPlanetId: ARIS, fromSlot: 0, toPlanetId: SOV, toSlot: 5, departAt: T - 1, arriveAt: T + 100_000,
+      bookedAt: T - 1, mode: 'tug', tugRoomId: 'tug-room',
+    };
+    const cancel: StationMove = {
+      ...tow, mode: 'thrusters', tugRoomId: undefined, toPlanetId: ARIS, toSlot: 0, departAt: T, arriveAt: T + 1,
+      bookedAt: T + 10, settles: tow, fuel: 0, fuelDrawn: 0,
+    };
+    for (const k0 of [pin, cancel]) {
+      store.clear();
+      setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'k0' ? k0 : null));
+      setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+      // Aris was full: this station went home.
+      expect(listStations({}, [], T + 2).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    }
+    // Neither pin is a station between planets, even for its millisecond.
+    expect(stationInTransit({ move: pin }, T)).toBe(false);
+    expect(stationInTransit({ move: cancel }, T)).toBe(false);
+    expect(stationInTransit({ move: came }, T - 1)).toBe(true);
+  });
+
   it('bounces an arrival with no slot to take, its own gone and the rest kept for arrivals on their way, when home has room', () => {
     const move = { ...moveTo(), bookedAt: moveTo().departAt };
     const T = move.arriveAt;

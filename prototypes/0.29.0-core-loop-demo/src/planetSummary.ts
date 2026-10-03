@@ -713,8 +713,11 @@ export function foldOwnStation(
   // A trim is keyed by the orbit it trims: it goes out when it names the
   // planet and slot of the record that is kept, whichever client's that is.
   // A learned station flies the slot listStations settled for that record,
-  // which a slot clash can move off the one the record asks for.
-  const flies = !owned && isLearnedRecord(station) ? station : base;
+  // which a slot clash can move off the one the record asks for; so does a
+  // derived one this install places by a move (summaryForStation's), as
+  // every install that knows the move does, while the record that is kept
+  // still names where it was first stamped.
+  const flies = !owned && (isLearnedRecord(station) || mine.move !== undefined) ? station : base;
   const applies = cleanTrim(trimFor(flies, readTrim(known)));
   // This room now reads no trim where the known one was read here: that
   // trim was taken back, and the reading says so.

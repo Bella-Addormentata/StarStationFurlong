@@ -40,6 +40,8 @@ import {
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
 import { freeSlotAround, installStationMoveResolver, rememberMove } from './stationMove';
+import { directoryFromStationRecords, localStationId, setStationDirectory } from './stationDirectory';
+import { bindShipDoc, readFlightRecord, writeFlightRecord } from './shipDoc';
 
 // Each "install" is its own localStorage.
 let store = new Map<string, string>();
@@ -365,6 +367,29 @@ describe('this client\'s own station', () => {
     const applies = foldOwnStation(known, derived, trim({ slot: 2, at: T0 + 5 }), T0 + 10);
     expect(applies?.trim?.at).toBe(T0 + 5);
     expect(applies?.orbitSlot).toBe(2);
+  });
+
+  it('a derived station that moved publishes the trim of the orbit its move put it in', () => {
+    // First stamped around SOV slot 2; since moved to ARIS slot 5, where
+    // this install lists it and its room trims that orbit.
+    const move: StationMove = {
+      stationId: 'station:room-hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, bookedAt: T0, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const known = summary({ orbitSlot: 2, move });
+    const derived = record({ id: 'station:room-hab', planetId: ARIS, orbitSlot: 5, derived: true });
+    rememberMove(move);
+    installStationMoveResolver();
+    try {
+      const next = foldOwnStation(known, derived, trim({ planetId: ARIS, slot: 5, at: T0 + 2000 }), T0 + 3000);
+      expect(next?.trim).toMatchObject({ planetId: ARIS, slot: 5 });
+      // The record that stands is still its first stamp.
+      expect(next).toMatchObject({ planetId: SOV, orbitSlot: 2 });
+      // A trim of the orbit it left goes nowhere.
+      expect(foldOwnStation(known, derived, trim({ slot: 2, at: T0 + 2000 }), T0 + 3000)).toBeNull();
+    } finally {
+      setStationMoveResolver(null);
+    }
   });
 });
 
@@ -1049,6 +1074,32 @@ describe('station id aliases (flight records cross installs)', () => {
     registerStation(record({ id: 'mine' }));
     expect(resolveStationAlias('beta')).toBe('mine');
     expect(cleanStationSummary({ ...merged, ownerAliases: ['beta', 'alpha', 7] }, T0)?.ownerAliases).toEqual(['beta']);
+  });
+
+  it('never lets a peer summary claim an open-orbit place as one of its ids', () => {
+    // A peer publishes HAB RING with an adrift place as its owner id, or
+    // among its aliases.
+    const adrift = 'adrift:planet-aris:3';
+    registerStation(record({ id: 'mine' }));
+    setStationDirectory(directoryFromStationRecords(
+      () => listStations(), () => undefined, () => null, () => null, (id) => resolveStationAlias(id),
+    ));
+    try {
+      for (const claim of [summary({ ownerId: adrift }), summary({ ownerId: 'alpha', ownerAliases: [adrift] })]) {
+        unbindPlanetSummaryForTest();
+        const doc = new Y.Doc();
+        doc.getMap('stationSummaries').set('room-hab', claim);
+        bindPlanetSummaryDoc(doc, install(null));
+        expect(resolveStationAlias(adrift)).toBe('mine');
+        // A ship adrift there stays there: no summary moves it to a station.
+        expect(localStationId(adrift)).toBe(adrift);
+        bindShipDoc(new Y.Doc());
+        expect(writeFlightRecord({ status: 'docked', locationId: adrift })).toBe(true);
+        expect(readFlightRecord().locationId).toBe(adrift);
+      }
+    } finally {
+      setStationDirectory(null);
+    }
   });
 
   it('maps derived and learned ids to the station this install lists for that room', () => {

@@ -170,10 +170,13 @@ function placeWithMove(
 }
 
 /** Is the station between its departure and capture burns — gone from every
- *  planet's orbits, so no ship can reach it? */
+ *  planet's orbits, so no ship can reach it? Never by a move that goes
+ *  nowhere (a pin: an arrival settled, a tow cancelled), which holds its
+ *  station where it is for its one millisecond too. */
 export function stationInTransit(station: Pick<StationRecord, 'move'>, nowMs: number = Date.now()): boolean {
   const m = station.move;
-  return !!m && nowMs >= m.departAt && nowMs < m.arriveAt;
+  return !!m && nowMs >= m.departAt && nowMs < m.arriveAt
+    && (m.fromPlanetId !== m.toPlanetId || m.fromSlot !== m.toSlot);
 }
 
 // ── Stations heard of but not listed ─────────────────────────────────────────

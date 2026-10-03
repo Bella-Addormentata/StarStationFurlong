@@ -19,7 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
-import { adriftPlace, latestMoveOf, stationInTransit } from './stations';
+import { ADRIFT_PREFIX, adriftPlace, latestMoveOf, stationInTransit } from './stations';
 import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -117,8 +117,11 @@ export function listStations(): readonly StationDestination[] {
 /** This install's id for `id`: the directory's alias for it when that is
  *  listed (asked FIRST, so a portable id resolves by its welcome room even
  *  when a local record happens to share the id), else itself, which is
- *  unknown when unlisted. */
+ *  unknown when unlisted. An open-orbit place is never a station (stations.ts
+ *  reserves its prefix), so it is itself whatever alias a peer's summary
+ *  claims for it: no summary moves a ship adrift. */
 export function localStationId(id: string): string {
+  if (id.startsWith(ADRIFT_PREFIX)) return id;
   const list = listStations();
   let alias: string | null = null;
   try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }

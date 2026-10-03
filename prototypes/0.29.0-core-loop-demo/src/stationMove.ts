@@ -590,8 +590,10 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
  *  has not heard of one yet still joins no station between planets: a tow
  *  that room is the tug of, ahead or under way, or a move of its station in
  *  transit. Its station is the one this install lists the room at, else
- *  the one whose welcome room it is, else the one its own moves name (a
- *  move is booked from a room of its station, a tow from the tug). A room
+ *  the one whose welcome room it is, else the one its own bookings name (a
+ *  move is booked from a room of its station, a tow from the tug; a pin is
+ *  no booking: every game writes them for each station it lists, wherever
+ *  it stands, pinSettledArrivals). A room
  *  whose records the bounded scans cannot all read (a peer can flood
  *  either map) is held too: what lies past them may be such a move, until
  *  the clients there prune the flood. */
@@ -605,7 +607,7 @@ export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number):
   const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
   const ofRoom = (m: StationMove) => (station
     ? moveBelongsTo(m, station)
-    : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !towedBy(o) && sameStation(o, m)));
+    : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !isPinMove(o) && !towedBy(o) && sameStation(o, m)));
   return standing.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs));
 }
 
