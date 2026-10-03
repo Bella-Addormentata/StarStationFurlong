@@ -115,6 +115,7 @@ import {
   doorLateralLimitForWall,
   clearDoorSlide,
   roomHalfExtents,
+  roomCupola,
 } from "./floorPlanDoc";
 import { narrowAxisFor } from "./hullSection";
 import {
@@ -547,6 +548,8 @@ export class DoorDockingPortSystem {
     const own = buildOctagonShell(
       { halfX, halfZ },
       { opacity: 0.2, edge: 0xd4a84b },
+      {},
+      roomCupola()?.wall ?? null, // the resolved cupola (none in legacy view)
     );
     own.group.traverse((o) => {
       o.raycast = () => {};
@@ -557,6 +560,14 @@ export class DoorDockingPortSystem {
     // through removeProvisionGhost first (restore → re-apply, same values),
     // both synchronous — no frame renders between, so nothing flickers.
     this.applyPlacementFraming();
+  }
+
+  /** 🔭 Rebuild a live placement hypothesis after the room's own shape
+   *  changed (a cupola set or cleared), so its translucent room shell shows
+   *  the current hull. No-op when no hypothesis is up. */
+  refreshProvisionGhost(): void {
+    const doorId = this.provisionGhost?.userData.doorId as string | undefined;
+    if (doorId) this.updateProvisionGhost(doorId);
   }
 
   private removeProvisionGhost(): void {

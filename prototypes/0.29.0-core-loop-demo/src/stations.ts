@@ -271,8 +271,11 @@ export function listStations(
   const derived: Array<{ anchor: string; name: string }> = [];
   components.forEach((component, i) => {
     if (places.has(`component:${i}`)) return;
+    // Only a room the atlas holds an entry of its own for: a door may name a
+    // room `constructor` or `__proto__`, and what that name inherits is no entry.
     const known = [...component]
-      .filter((rid) => atlas[rid] && DERIVED_PREFIX.length + rid.length <= MAX_ID_LENGTH)
+      .filter((rid) => Object.prototype.hasOwnProperty.call(atlas, rid) && atlas[rid]
+        && DERIVED_PREFIX.length + rid.length <= MAX_ID_LENGTH)
       .sort();
     const anchor = known[0];
     if (!anchor) return;
@@ -374,7 +377,9 @@ export function dockedStationFor(
   stations: StationRecord[] = listStations(atlas),
 ): string | null {
   const own = atlasStationForRoom(roomId, atlas, stations);
-  if (own && (!own.derived || atlasComponent(atlas, roomId).size > 1)) return null;
+  // Structure stays put whether or not it is listed: a full planet lists no
+  // station for it, but its rooms still are not a lone module.
+  if ((own && !own.derived) || atlasComponent(atlas, roomId).size > 1) return null;
   const partners: string[] = [];
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
