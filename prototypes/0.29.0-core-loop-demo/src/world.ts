@@ -140,6 +140,7 @@ import type { FurnitureHandleSinks } from "./furnitureHandles";
 import type {
   WallScreenHandle,
   TvScreenHandle,
+  ArcadeScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -177,6 +178,12 @@ import { createSmartTvUI } from "./tvUI";
 import { openTvTheatre, updateTvChip } from "./tvTheatre";
 import { tickTvRoom, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
+// 🕹 #193: the arcade cabinet — its panel, the stage, the room tick, the
+// attract card the prop draws.
+import { createArcadeCabinetUI } from "./arcadeUI";
+import { openArcadeStage } from "./arcadeStage";
+import { tickArcadeRoom } from "./arcadeSession";
+import { arcadeScreenView } from "./arcadeDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
 import { getOutfitById, saveOutfitId } from "./outfits";
@@ -407,6 +414,9 @@ export class World {
   private tvScreens: Map<string, TvScreenHandle> = new Map();
   /** Accumulator for the 2 Hz TV drive (screens, lease renewals, the chip). */
   private tvTimer = 0;
+  /** 🕹 Arcade cabinet screens (#193), keyed by item id — redrawn at ~2 Hz
+   *  from the room record (arcadeDoc.arcadeScreenView), on the TV's timer. */
+  private arcadeScreens: Map<string, ArcadeScreenHandle> = new Map();
   public onFirstPersonSeat: ((faceAngle: number) => void) | null = null;
   public onRequestRoomView: ((onReady: () => void) => void) | null = null;
   /** 🧬 Boot spawn queued at morph-complete, run at the first room-level view. */
@@ -1656,6 +1666,7 @@ export class World {
       propAnims: this.propAnims,
       airHockeyVisuals: this.airHockeyVisuals,
       tvScreens: this.tvScreens,
+      arcadeScreens: this.arcadeScreens,
     };
   }
 
@@ -3083,6 +3094,7 @@ export class World {
     this.propAnims.delete(itemId);
     this.airHockeyVisuals.delete(itemId);
     this.tvScreens.delete(itemId);
+    this.arcadeScreens.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3910,6 +3922,13 @@ export class World {
         for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
         tickTvRoom(tvIds);
         updateTvChip(tvIds);
+      }
+      // 🕹 #193: the cabinets on the same beat — the attract card blinks, a
+      // P1 page renews its seat.
+      const arcadeIds = FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
+      if (arcadeIds.length > 0 || this.arcadeScreens.size > 0) {
+        for (const [id, screen] of this.arcadeScreens) screen.draw(arcadeScreenView(id));
+        tickArcadeRoom(arcadeIds);
       }
     }
 
@@ -5738,6 +5757,21 @@ export class World {
           deviceFocus.releaseThen(() =>
             (window as unknown as { __ssfOpenTvRemote?: () => void }).__ssfOpenTvRemote?.(),
           ),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    // 🕹 #193: the cabinet's panel — the owner's shelf and game, INSERT COIN
+    // for P1 — and the stage the coin opens (the emulator in a frame of our
+    // own), after the focus is released, as the TV hands off to its theatre.
+    if (device.kind === "arcade") {
+      const ui = createArcadeCabinetUI({
+        itemId: deviceId,
+        myPub: () => getIdentityPub(),
+        myName: () => getPlayerName(),
+        canEdit: () => canEditRoom().ok,
+        openStage: () => deviceFocus.releaseThen(() => openArcadeStage(deviceId)),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

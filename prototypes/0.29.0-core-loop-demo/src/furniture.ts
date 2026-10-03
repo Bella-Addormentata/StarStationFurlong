@@ -32,6 +32,7 @@ import type {
   WallComputerStatus,
   WallScreenHandle,
   TvScreenHandle,
+  ArcadeScreenHandle,
   TrunkLidHandle,
   GameTableTopHandle,
   CloneVatHandle,
@@ -72,6 +73,7 @@ import { isLocalPlayerInRoom, localPlayerXZ } from "./localPresence";
 import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // 📺 #186: the TV screen draws the view World derives from the room record.
 import type { TvScreenView } from "./tvDoc";
+import type { ArcadeScreenView } from "./arcadeDoc";
 // 🌊 The beach sea keeps a dry lane in front of every REAL door. Acyclic:
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
@@ -185,7 +187,9 @@ export type FurnitureKind =
   | "climbing-rose"
   // 📺 The smart TV (#186): on the wall like the terminal, or on a low stand.
   | "smart-tv"
-  | "tv-stand";
+  | "tv-stand"
+  // 🕹 The arcade cabinet (#193): P1 at the controls, the attract card on a canvas.
+  | "arcade-cabinet";
 
 export interface FurnitureItem {
   id: string;
@@ -1727,6 +1731,16 @@ const TV_STAND_SCREEN_Y = TV_STAND_CAB_H + 0.06 + TV_H / 2;
 /** Screen texture: 16:9, pixel-text sharp at the prop's size. */
 const TV_TEX_W = 384;
 const TV_TEX_H = 216;
+
+// 🕹 Arcade cabinet dimensions (#193) — beside the TV's for the same reason.
+/** Cabinet body: 0.7 m wide, 0.75 m deep, inside a 1×1 footprint. */
+const ARCADE_W = 0.7;
+const ARCADE_D = 0.75;
+/** The screen's centre height (the focus anchor). */
+const ARCADE_SCREEN_Y = 1.3;
+/** Screen texture: 4:3, the cabinet's own ratio. */
+const ARCADE_TEX_W = 320;
+const ARCADE_TEX_H = 240;
 
 const buildWallComputer = (ctx: BuildCtx) => {
   const { m, place } = ctx;
@@ -3924,6 +3938,22 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       faceAngle: Math.PI,
       eye: { x: 0, y: 1.3, z: 1.4 },
       anchor: { x: 0, y: TV_STAND_SCREEN_Y, z: 0.1 },
+    },
+  },
+  // 🕹 Arcade cabinet (#193): a 1×1 floor item, screen facing local +z and
+  // the player at the controls a pace back — the coin pusher's focus idiom,
+  // the TV's screen handle, and a stage panel of its own for the game.
+  "arcade-cabinet": {
+    kind: "arcade-cabinet",
+    build: buildArcadeCabinet,
+    footprint: { w: 1, d: 1 },
+    functions: ["arcade"],
+    device: {
+      kind: "arcade",
+      front: { x: 0, z: 1.0 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.45, z: 0.95 },
+      anchor: { x: 0, y: ARCADE_SCREEN_Y, z: 0.2 },
     },
   },
 };
@@ -9447,6 +9477,140 @@ function buildTvStand(ctx: BuildCtx) {
   // A small foot under the panel.
   place(new THREE.BoxGeometry(0.5, 0.06, 0.2), m(LEG, 0.55, 0.4), 0, TV_STAND_CAB_H + 0.03, 0.05);
   attachTvSet(ctx, TV_STAND_SCREEN_Y, 0.02);
+}
+
+/**
+ * 🕹 Arcade cabinet (#193): a 1×1 floor item, screen to local +z and the
+ * player at the controls a pace back. The screen is a CanvasTexture that
+ * draws arcadeDoc's view — the attract card (FURLONG ARCADE, the game, a
+ * blinking INSERT COIN, the tally) or "P1 · <name>" while someone plays —
+ * with scanlines over it (the #194 pass in its cheapest form). The game's
+ * own picture runs in P1's stage (arcadeStage.ts); the spectator lane
+ * brings it here later (plan §9). Stows the ArcadeScreenHandle on the
+ * screen mesh (userData.arcadeScreen) for registerFurnitureHandles.
+ */
+function buildArcadeCabinet(ctx: BuildCtx) {
+  const { m, place, addLight } = ctx;
+  const BODY = 0x141a2e; // deep navy cabinet
+  const TRIM = 0xd4a84b; // gold edges
+  const PANEL = 0x1a1f2a; // near-black deck and bezel
+  const SIDE = 0x00e5ff; // cyan side art
+  const w = ARCADE_W;
+  const d = ARCADE_D;
+
+  // Plinth, lower body, upper body, cap.
+  place(new THREE.BoxGeometry(w, 0.12, d), m(0x0a0d16, 0.7, 0.2), 0, 0.06, 0);
+  place(new THREE.BoxGeometry(w, 0.78, d - 0.03), m(BODY, 0.6, 0.15), 0, 0.51, 0);
+  place(new THREE.BoxGeometry(w, 0.7, d - 0.25), m(BODY, 0.6, 0.15), 0, 1.25, -0.11);
+  place(new THREE.BoxGeometry(w, 0.06, d - 0.25), m(PANEL, 0.6, 0.3), 0, 1.63, -0.11);
+  // Side art: a lit cyan stripe on each flank.
+  for (const sx of [-1, 1]) {
+    place(new THREE.BoxGeometry(0.012, 0.9, 0.08), m(SIDE, 0.4, 0.2, SIDE, 0.5), sx * (w / 2 + 0.004), 1.0, 0.05);
+  }
+  // The control deck, angled toward the player: joystick left, buttons right.
+  const deck = place(new THREE.BoxGeometry(w, 0.07, 0.3), m(PANEL, 0.55, 0.3), 0, 0.96, 0.27);
+  deck.rotation.x = -0.22;
+  place(new THREE.CylinderGeometry(0.012, 0.012, 0.09, 8), m(0x3d4a5e, 0.5, 0.6), -0.17, 1.04, 0.3);
+  place(new THREE.SphereGeometry(0.028, 10, 8), m(0xff3b3b, 0.4, 0.1), -0.17, 1.09, 0.3);
+  const buttons: ReadonlyArray<readonly [number, number]> = [[0.02, TRIM], [0.12, SIDE], [0.22, 0x2fe6a0]];
+  for (const [bx, color] of buttons) {
+    place(new THREE.CylinderGeometry(0.022, 0.022, 0.014, 12), m(color, 0.35, 0.2, color, 0.25), bx, 1.0, 0.31);
+  }
+  // Coin door with its slot.
+  place(new THREE.BoxGeometry(0.22, 0.16, 0.02), m(0x3d4a5e, 0.5, 0.5), 0, 0.5, d / 2 - 0.005);
+  place(new THREE.BoxGeometry(0.05, 0.012, 0.016), m(0x05070c, 0.8, 0.1), 0, 0.52, d / 2 + 0.003);
+  // Marquee: a lit header above the screen.
+  place(new THREE.BoxGeometry(w, 0.16, 0.22), m(PANEL, 0.6, 0.3), 0, 1.74, 0.0);
+  place(new THREE.PlaneGeometry(w - 0.08, 0.1), m(TRIM, 0.5, 0.1, TRIM, 0.6), 0, 1.74, 0.111);
+  // The screen: a bezel and the canvas plane, both tilted back a touch.
+  const bezel = place(new THREE.BoxGeometry(0.64, 0.5, 0.03), m(PANEL, 0.5, 0.3), 0, ARCADE_SCREEN_Y, 0.15);
+  bezel.rotation.x = -0.14;
+
+  const cv = document.createElement("canvas");
+  cv.width = ARCADE_TEX_W;
+  cv.height = ARCADE_TEX_H;
+  const c2d = cv.getContext("2d")!;
+  const screenTex = new THREE.CanvasTexture(cv);
+  screenTex.minFilter = THREE.LinearFilter;
+  screenTex.magFilter = THREE.LinearFilter;
+  screenTex.generateMipmaps = false;
+  screenTex.colorSpace = THREE.SRGBColorSpace;
+  const screenMat = new THREE.MeshBasicMaterial({ map: screenTex, transparent: true, opacity: 0 });
+  const screen = place(new THREE.PlaneGeometry(0.56, 0.42), screenMat, 0, ARCADE_SCREEN_Y + 0.002, 0.168);
+  screen.rotation.x = -0.14;
+  // The screen's glow on the deck and the floor: driven with the view.
+  const glow = new THREE.PointLight(0x7fd8ff, 0, 3);
+  addLight(glow, 0, ARCADE_SCREEN_Y, 0.6, 0);
+
+  const text = (s: string, x: number, y: number, font: string, color: string, align: CanvasTextAlign = "left") => {
+    c2d.font = font;
+    c2d.fillStyle = color;
+    c2d.textAlign = align;
+    c2d.textBaseline = "middle";
+    c2d.fillText(s, x, y);
+  };
+  const badge = (lane: string) => {
+    c2d.font = "bold 10px monospace";
+    const bw = c2d.measureText(lane).width + 12;
+    const color = lane === "SOVEREIGN" ? "#2fe6a0" : "#ff8a50";
+    c2d.strokeStyle = color;
+    c2d.strokeRect(ARCADE_TEX_W - bw - 12.5, 12.5, bw, 18);
+    text(lane, ARCADE_TEX_W - 12 - bw / 2, 22, "bold 10px monospace", color, "center");
+  };
+  const setGlow = (i: number) => {
+    glow.userData.targetIntensity = i;
+    glow.intensity = i;
+  };
+  const draw = (view: ArcadeScreenView): void => {
+    c2d.imageSmoothingEnabled = false;
+    const g = c2d.createLinearGradient(0, 0, 0, ARCADE_TEX_H);
+    g.addColorStop(0, "#071021");
+    g.addColorStop(1, "#030509");
+    c2d.fillStyle = g;
+    c2d.fillRect(0, 0, ARCADE_TEX_W, ARCADE_TEX_H);
+    c2d.strokeStyle = "rgba(0,229,255,0.35)";
+    c2d.strokeRect(6.5, 6.5, ARCADE_TEX_W - 13, ARCADE_TEX_H - 13);
+    text("FURLONG ARCADE", ARCADE_TEX_W / 2, 30, "bold 16px monospace", "#f0c060", "center");
+    if (view.lane) badge(view.lane);
+    const title = view.title.length > 22 ? `${view.title.slice(0, 21)}…` : view.title;
+    if (view.mode === "empty") {
+      text(title, ARCADE_TEX_W / 2, 110, "bold 20px monospace", "#8fa3b8", "center");
+      text(view.line, ARCADE_TEX_W / 2, 150, "11px monospace", "#4a5560", "center");
+      setGlow(0.25);
+    } else if (view.mode === "attract") {
+      text(title, ARCADE_TEX_W / 2, 100, "bold 20px monospace", "#00e5ff", "center");
+      // The classic: INSERT COIN blinking over the tally.
+      if (view.blink) text(view.line, ARCADE_TEX_W / 2, 150, "bold 18px monospace", "#f0c060", "center");
+      text(`PLAYS ${view.plays}`, 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#8fa3b8");
+      text("1 PLAYER", ARCADE_TEX_W - 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#8fa3b8", "right");
+      setGlow(view.blink ? 0.95 : 0.8);
+    } else {
+      text(title, ARCADE_TEX_W / 2, 100, "bold 20px monospace", "#00e5ff", "center");
+      // The picture is on P1's stage (plan §9): the prop says who is playing.
+      c2d.fillStyle = "rgba(47,230,160,0.12)";
+      c2d.fillRect(40, 124, ARCADE_TEX_W - 80, 44);
+      text(view.line, ARCADE_TEX_W / 2, 146, "bold 16px monospace", "#2fe6a0", "center");
+      text("● IN PLAY", 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#ff5252");
+      text(`PLAYS ${view.plays}`, ARCADE_TEX_W - 16, ARCADE_TEX_H - 20, "bold 11px monospace", "#8fa3b8", "right");
+      setGlow(1.0);
+    }
+    // Scanlines: the #194 CRT pass in its cheapest form.
+    c2d.fillStyle = "rgba(0,0,0,0.18)";
+    for (let y = 0; y < ARCADE_TEX_H; y += 3) c2d.fillRect(0, y, ARCADE_TEX_W, 1);
+    screenTex.needsUpdate = true;
+  };
+
+  let last = "";
+  const handle: ArcadeScreenHandle = {
+    draw: (view) => {
+      const key = JSON.stringify(view);
+      if (key === last) return;
+      last = key;
+      draw(view);
+    },
+  };
+  draw({ mode: "empty", title: "FURLONG ARCADE", line: "THE OWNER LOADS A GAME", lane: "", blink: false, plays: 0 });
+  screen.userData.arcadeScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 }
 
 /**

@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Furlong Arcade</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!--
+    🕹 The arcade cabinet's emulator frame (#193): a same-origin page of our
+    own that hosts EmulatorJS, so the cabinet can tear the whole thing down by
+    removing the frame, and so keys typed here never reach the world's input.
+
+    Protocol with the parent (src/arcadeEmulator.ts mountEmulatorFrame):
+      frame → parent  { type: 'arcade-frame-ready' }
+      parent → frame  { type: 'arcade-config', core, gameUrl, file, gameName,
+                        pathToData, volume, timeoutMs }
+      frame → parent  { type: 'arcade-ready' }     the emulator is loaded
+                      { type: 'arcade-started' }   the game runs
+                      { type: 'arcade-exit' }      Escape pressed here
+                      { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
+    EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
+    this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
+    cdn.emulatorjs.org, the owner's call per cabinet.
+  -->
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+    #game { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="game"></div>
+  <script>
+    (function () {
+      var parentWin = window.parent;
+      var parentOrigin = location.origin && location.origin !== 'null' ? location.origin : '*';
+      function post(type, extra) {
+        var msg = { type: type };
+        if (extra) for (var k in extra) msg[k] = extra[k];
+        parentWin.postMessage(msg, parentOrigin);
+      }
+      var started = false;
+      window.addEventListener('message', function (e) {
+        if (e.source !== parentWin || !e.data || e.data.type !== 'arcade-config' || started) return;
+        if (parentOrigin !== '*' && e.origin !== parentOrigin) return;
+        started = true;
+        var c = e.data;
+        // The game: a URL any P1 can fetch, or the player's own file (a blob
+        // URL of this document — gone with the frame).
+        var gameUrl = c.gameUrl;
+        if (c.file) {
+          try { gameUrl = URL.createObjectURL(c.file); } catch (err) { post('arcade-error', { why: 'game' }); return; }
+        }
+        window.EJS_player = '#game';
+        window.EJS_core = c.core;
+        window.EJS_gameUrl = gameUrl;
+        window.EJS_gameName = c.gameName;
+        window.EJS_pathtodata = c.pathToData;
+        window.EJS_startOnLoaded = true;
+        window.EJS_backgroundColor = '#000000';
+        window.EJS_color = '#d4a84b';
+        window.EJS_volume = typeof c.volume === 'number' ? c.volume : 0.7;
+        // Its netplay is WebRTC with its own signalling and TURN, marked
+        // unstable upstream: not depended on (plan §9). Hide the button.
+        window.EJS_Buttons = { netplay: false };
+        window.EJS_ready = function () { post('arcade-ready'); };
+        window.EJS_onGameStart = function () { post('arcade-started'); };
+        var s = document.createElement('script');
+        s.src = c.pathToData + 'loader.js';
+        s.onerror = function () { post('arcade-error', { why: 'loader' }); };
+        document.body.appendChild(s);
+        // A loader that never calls back (no engine behind it, a dead CDN,
+        // a game the core refuses) is a failure too.
+        var budget = typeof c.timeoutMs === 'number' ? c.timeoutMs : 45000;
+        var startedAt = Date.now();
+        var watch = setInterval(function () {
+          if (window.EJS_emulator && window.EJS_emulator.started) { clearInterval(watch); return; }
+          if (Date.now() - startedAt > budget) {
+            clearInterval(watch);
+            post('arcade-error', { why: window.EJS_emulator ? 'game' : 'timeout' });
+          }
+        }, 1000);
+      });
+      // Escape leaves the cabinet (the parent stands P1 up and closes the
+      // stage). Captured before the emulator sees it.
+      window.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); post('arcade-exit'); }
+      }, true);
+      post('arcade-frame-ready');
+    })();
+  </script>
+</body>
+</html>

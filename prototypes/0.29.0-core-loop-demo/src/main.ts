@@ -120,6 +120,9 @@ import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, 
 import { renderTvPhoneApp, resolveArchiveFile } from "./tvUI";
 import { openTvTheatre, setTvChipOpener } from "./tvTheatre";
 import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
+// 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
+import { bindArcadeDoc, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
+import { leaveArcadeRoom } from "./arcadeSession";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -1402,6 +1405,9 @@ async function joinRoomAtEpoch(
   // remote. Same T0 seam — a joiner walks in on a movie already running and
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
+  // 🕹 Bind the shared arcade map (#193): each cabinet's shelf and game, and
+  // who is at its controls. Same T0 seam.
+  bindArcadeDoc(sync.doc);
 
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the
@@ -2214,6 +2220,8 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     leaveCoinPusherRoom();
     // 📺 #186: a remote leaves with nobody — put every one I hold back on its set.
     leaveTvRoom(roomTvIds());
+    // 🕹 #193: a P1 who leaves the room stands up from the cabinet.
+    leaveArcadeRoom(roomArcadeIds());
     await Promise.race([
       sync.flush(),
       new Promise<void>((resolve) => setTimeout(resolve, LEAVE_FLUSH_MS)),
@@ -4863,6 +4871,10 @@ function tvLabelFor(itemId: string): string {
 }
 function tvTheatreDeps(itemId: string) {
   return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
+}
+// 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
+function roomArcadeIds(): string[] {
+  return FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
 }
 
 function currentRoomDeedIsMine(): boolean {
@@ -8735,6 +8747,10 @@ async function init() {
   // theatre from anywhere in the room.
   setTvHostPredicate(() => canEditRoom().ok);
   setTvIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
+  // 🕹 #193: the owner curates the cabinet and may eject P1; the seat is
+  // held under my identity from this page.
+  setArcadeHostPredicate(() => canEditRoom().ok);
+  setArcadeIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   setTvRoomPlayersProvider(() => {
     const out: Array<{ pub: string; name: string }> = [];
     const map = yjsSync?.doc.getMap("players");
