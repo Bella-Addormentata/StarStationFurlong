@@ -75,7 +75,7 @@ the sources that fail have to say so on the screen.
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
         | { kind: 'blob', hash, bytes, name }     // the host's own file (blob lane, §4)
         | null,
-  state: 'off' | 'scheduled' | 'playing' | 'paused',
+  state: 'off' | 'home' | 'scheduled' | 'playing' | 'paused',  // 'off' is the power key's doing (below); 'home': on, nothing on
   startAt: number,       // UTC ms — the countdown only
   positionMs: number,    // where the holder's player was…
   seq: number,           // …stamped with a per-write counter: a NEW seq is a new sample, which a
@@ -96,6 +96,11 @@ the sources that fail have to say so on the screen.
 // viewer turning the sound down never carries a stale programme over the holder's seek:
 // whole-value LWW keeps one writer per key, so each thing that changes on its own has one
 { volume: 0..100 }
+// key power:<itemId> — the switch, a body button anyone may press; its own key for the same
+// reason (a press must never race the holder's heartbeat in the programme's slot). Off keeps
+// the programme; on brings it back, the holder's tick parking a programme that was playing
+// where it was; `seq` voids a lookup in flight
+{ on: boolean, seq }
 ```
 
 **Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
@@ -151,7 +156,12 @@ source only when its origin is one of the product's own lanes
 (`youtube-nocookie.com`, `archive.org`), the page's own origin or its node's,
 or one this viewer accepted in this session by pressing PLAY FROM <host>; a
 loopback, link-local or private-network host that is not the viewer's own
-node is refused outright, no button offered (`tvConsent.ts` in #207). So the
+node is refused outright, no button offered (`tvConsent.ts` in #207). That is
+consent, not validation: a host the viewer accepted can redirect the request,
+or resolve, into the viewer's own network, and a browser `<video>` can see
+neither — the ask says so, and the node's media proxy (§3.4, TODO) is where
+destinations are checked after DNS and on every redirect; until it lands, a
+direct URL is the viewer's own trust decision, per origin, per session. So the
 worst a modified client can do is change what is on — never make a browser
 fetch what its owner did not agree to. When an authority boundary is needed
 it is the signed-op acceptance rule of the RoomLog (Phase 2), not more checks
@@ -243,8 +253,11 @@ sending a friend a file. And the record is peer-writable, so a fetch is never
 automatic beyond a cap: the source carries its declared size; a viewer's node
 fetches on its own only under a per-room ceiling the viewer sets (a FETCH
 button above it), under per-room and global cache quotas, with cancellation
-and delete-on-leave — nobody in a room can spend another viewer's bandwidth
-or disk unasked. The same lane later carries room assets, ROMs and the
+and delete-on-leave — and the declared size, being peer-written, is only a
+hint: the transfer runs under a hard byte ceiling (the viewer's cap or the
+declaration, whichever is smaller), aborts the moment received bytes exceed
+it, and a completed blob whose size differs from the declaration is rejected.
+Nobody in a room can spend another viewer's bandwidth or disk unasked. The same lane later carries room assets, ROMs and the
 station library (§7).
 
 **Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
