@@ -643,6 +643,22 @@ describe('the station record', () => {
     expect(listStations().find((s) => s.welcomeRoomId === 'room-far')?.berths).toEqual([]);
   });
 
+  it("takes the standing install's gates into its own record of the same place", () => {
+    // This install saved the place too, but another install's record stands
+    // (planetSummary's rival owners): its gates come with the rest of it.
+    registerStation({
+      id: 'b-far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'east', berths: [],
+    });
+    const standing: StationSummary = {
+      welcomeRoomId: 'room-far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, updatedAt: 1_000,
+      berthDoor: 'east', ownerId: 'a-far', berths: [{ roomId: 'room-far', doorId: 'east', gate: 1 }], berthsAt: 1_000,
+    };
+    expect(registerLearnedStations('planet-sovereign', [standing])).toBe(1);
+    expect(listStations().find((s) => s.id === 'b-far')?.berths).toEqual([{ roomId: 'room-far', doorId: 'east', gate: 1 }]);
+    // Nothing is left to change.
+    expect(registerLearnedStations('planet-sovereign', [standing])).toBe(0);
+  });
+
   it('never lets ports sharing a number push another gate out', () => {
     const gates: Record<string, number> = {};
     for (let i = 0; i < 120; i++) gates[`d:dup${String(i).padStart(4, '0')}`] = 1;

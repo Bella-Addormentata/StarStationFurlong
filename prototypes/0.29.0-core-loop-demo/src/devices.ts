@@ -39,14 +39,16 @@ import {
   flightArrived,
   flightProgress,
   fuelDrawDeficit,
+  isFlightRecord,
   readFlightRecord,
   readFuelLevel,
   subscribeShip,
   writeFlightRecord,
   writeFuelLevel,
+  type FlightRecord,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { adriftAt, adriftPlace, destinationsFrom, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { adriftPlace, destinationsFrom, flightCapable, isKnownStation, planHop, stationHere, type HopPlan } from './stationDirectory';
 import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
 import {
   TUG_MIN_ENGINES,
@@ -64,12 +66,15 @@ import {
   writeStationMove,
 } from './stationMove';
 import type { TowContext } from './stationMove';
-import { currentRoomId, listStations as listStationRecordsNow, planetById, stationInTransit } from './stations';
+import { currentRoomId, dockedStationFor, listStations as listStationRecordsNow, planetById, stationInTransit } from './stations';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
-  castOffForDeparture,
+  berthHeldByMove,
+  castOffPlaces,
   castOffRefusal,
+  detachBerth,
+  releaseEveryDock,
   rememberBerthHere,
   completeArrival,
   shipLocationId,
@@ -80,7 +85,6 @@ import {
 // refuse a permanent connector-chain (a chained module cannot fly, by
 // construction — plan §5.1). DEPART also detaches any transient berth.
 import {
-  deleteDoorPairing,
   readAllDoors,
   subscribeDoors,
   type DoorPairing,
@@ -203,14 +207,6 @@ import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
-
-/** 🚚 A flight's `destinationAt`: where the station orbits as the ship casts
- *  off, as an open-orbit place; nothing for a station this install cannot
- *  list. */
-function destinationAtOf(stationId: string): { destinationAt?: string } {
-  const st = listStationRecordsNow().find((r) => r.id === stationId);
-  return st ? { destinationAt: adriftAt(planetById(st.planetId).id, st.orbitSlot) } : {};
-}
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -2004,7 +2000,7 @@ const HELM_TICK_MS = 250;
  *  (docks are not station structure), so a ship reads its live dock partner
  *  first, then where its last flight left it; in flight it is at none. */
 function holotableStation(): StationRecord | null {
-  if (!isShipReady()) return currentStation();
+  if (!flightCapable(isShipReady())) return currentStation();
   const flight = readFlightRecord();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
@@ -2038,9 +2034,9 @@ function hasLiveDock(): boolean {
 }
 
 /** Enumerate the room's TRANSIENT guest-berths — a paired berth that IS a
- *  transient (#67 D2). DEPART iterates these and calls deleteDoorPairing on
- *  each so the station is "cast off" before the state advances to in-flight
- *  (plan §5.1: undock via the transient-berth detach). */
+ *  transient (#67 D2). DEPART releases each (shipArrival.detachBerth) so the
+ *  station is "cast off" before the state advances to in-flight (plan §5.1:
+ *  undock via the transient-berth detach). */
 function enumerateTransientBerths(): string[] {
   const out: string[] = [];
   for (const [id, rec] of readAllDoors()) {
@@ -2049,6 +2045,15 @@ function enumerateTransientBerths(): string[] {
     out.push(id);
   }
   return out;
+}
+
+/** 🚚 Does a station move hold any of them now, a dock or a legacy berth
+ *  (shipArrival.berthHeldByMove)? A station between planets keeps the ships
+ *  it holds, and UNDOCK and DETACH both refuse: so does DEPART. */
+function transientBerthHeld(): boolean {
+  const room = currentRoomId();
+  const now = Date.now();
+  return enumerateTransientBerths().some((id) => berthHeldByMove(room, id, now));
 }
 
 /** Derived flight capability — plan §1.4: at least one fuel tank, engine, and
@@ -2095,7 +2100,8 @@ export interface HelmDockingDeps {
   connected: () => ReturnType<DoorDockingPortSystem['connectedModules']>;
   /** Subscribe to port changes; returns the unsubscribe. */
   subscribe: (cb: () => void) => () => void;
-  undock: (doorId: string) => void;
+  /** The shipped UNDOCK; its answer (false: the dock holds) settles DEPART. */
+  undock: (doorId: string) => void | boolean | Promise<boolean | void>;
   /** The shipped DOCK; its answer (false: refused) lets an arrival try the next berth. */
   dock: (doorId: string) => void | boolean | Promise<boolean | void>;
 }
@@ -2128,6 +2134,11 @@ const arrivalNoteListeners = new Set<() => void>();
 
 function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
   lastArrivalNote = note;
+  redrawHelms();
+}
+
+/** Redraw every open helm (they subscribe through subscribeArrivalNote). */
+function redrawHelms(): void {
   for (const fn of arrivalNoteListeners) fn();
 }
 
@@ -2145,6 +2156,11 @@ export function clearShipArrivalNote(): void {
 
 /** Bumped on every room join (clearShipArrivalNote). */
 let arrivalNoteRoom = 0;
+
+/** 🚚 A DEPART waiting for its docks to let go, whichever helm started it:
+ *  one at a time. Every open helm redraws when it ends (redrawHelms): the
+ *  one that started it may have closed meanwhile, and another opened. */
+let castingOff = false;
 
 /** The arrival-note callback for a DOCK started in this room: its answer can
  *  come after the player has left, and then it is not the new room's news. */
@@ -2186,6 +2202,46 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
         ? `Arrived at ${outcome.stationName} — none of its gates is open to this ship from here (closed to it, reserved for another ship, or in a module this game holds no pass for). Ask the station's owner, or dock from a door panel.`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
   });
+}
+
+/** DEPART's checks over every input as it is now — the picker and the doc
+ *  may have moved since the render (a peer just bolted on a gangway), and
+ *  again while the docks let go (a launch window passed, a peer drew on the
+ *  tanks): the hop and the tanks that fly it, or null when any refuses. */
+function departureNow(fromId: string, destId: string): { hop: HopPlan; fuel: number; capacity: number } | null {
+  if (isTowing(currentRoomId(), Date.now())) return null;
+  const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+  const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+  const hop = destId ? planHop(fromId, destId, Date.now()) : null;
+  const refusal = canDepart({
+    flightCapable: flightCapable(isShipReady()),
+    currentStatus: readFlightRecord().status,
+    currentFuel: fuel,
+    destinationId: destId,
+    chainedDoors: enumerateChainedDoors(),
+    ownerAuthorized: helmIsCommander(),
+    locationId: fromId,
+    ...(destId ? { hop } : {}),
+  });
+  return refusal.ok && hop && fuel >= hop.fuelCost ? { hop, fuel, capacity } : null;
+}
+
+/** DEPART's flight record — the FAST path docked → in-flight. departedAt is
+ *  the transfer burn — the next launch window, which may still be ahead
+ *  (every viewer shows the hold until then). */
+function departureFlight(fromId: string, destId: string, hop: HopPlan): FlightRecord {
+  return {
+    status: 'in-flight',
+    locationId: fromId,
+    destinationId: destId,
+    departedAt: hop.departAt,
+    etaAt: hop.arriveAt,
+    // A whole ms, no later than the burn (flight times are whole ms).
+    castOffAt: Math.floor(Math.min(Date.now(), hop.departAt)),
+    // Where the ship and its destination orbit now: the ship stays at the
+    // one until it arrives, and arrival compares against the other.
+    ...castOffPlaces(fromId, destId),
+  };
 }
 
 /**
@@ -2266,7 +2322,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // still be to come), when it lands, and what it burns.
     const hop = pickerDestId ? planHop(location.id, pickerDestId, now) : null;
     const refusal = canDepart({
-      flightCapable: isShipReady(),
+      flightCapable: flightCapable(isShipReady()),
       currentStatus: flight.status,
       currentFuel: fuel,
       destinationId: pickerDestId ?? '',
@@ -2362,7 +2418,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       })();
       // A tug towing a station holds on: it is the station's engine.
       const towingNow = isTowing(currentRoomId(), now);
-      const btnEnabled = refusal.ok && pickerDest !== null && !towingNow;
+      const btnEnabled = refusal.ok && pickerDest !== null && !towingNow && !castingOff;
       const btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
       const castOff = docked.length + enumerateTransientBerths().filter((id) => !docked.some((p) => p.doorId === id)).length;
       const castOffNote = castOff > 0
@@ -2483,29 +2539,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       refuelArmed = false;
     });
     panel.querySelector<HTMLButtonElement>('#helm-depart-btn')?.addEventListener('click', () => {
-      // Re-check every input at click time — the picker + doc state may have
-      // moved between render and click (a peer just bolted on a gangway).
-      const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
-      const nowFuel = clampFuelToCapacity(readFuelLevel(nowCapacity), nowCapacity);
-      const nowFlight = readFlightRecord();
-      if (isTowing(currentRoomId(), Date.now())) return;
-      const fromId = shipLocationId(nowFlight, hasLiveDock());
+      if (castingOff) return;
+      const fromId = shipLocationId(readFlightRecord(), hasLiveDock());
       const destId = pickerDestId ?? '';
-      const nowHop = destId ? planHop(fromId, destId, Date.now()) : null;
-      const nowRefusal = canDepart({
-        flightCapable: isShipReady(),
-        currentStatus: nowFlight.status,
-        currentFuel: nowFuel,
-        destinationId: destId,
-        chainedDoors: enumerateChainedDoors(),
-        ownerAuthorized: helmIsCommander(),
-        locationId: fromId,
-        ...(destId ? { hop: nowHop } : {}),
-      });
-      if (!nowRefusal.ok) { render(); return; }
+      const first = departureNow(fromId, destId);
+      if (!first) { render(); return; }
       const dest = findDestination(destId);
-      if (!nowHop) { render(); return; }
-      if (nowFuel < nowHop.fuelCost) { render(); return; }
       // 0) Every dock must be releasable, or the flight would leave one live.
       const castOffBlock = shipDocking ? castOffRefusal(shipDocking.ports()) : null;
       if (castOffBlock) {
@@ -2514,6 +2553,16 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           text: castOffBlock === 'dock-busy'
             ? 'Cannot depart yet: a dock port is still busy. Try again in a moment.'
             : 'Cannot depart: a dock port here is one you may not undock.',
+        });
+        render();
+        return;
+      }
+      //    Nor one a station move holds, legacy berths included: they are no
+      //    dock port, so no UNDOCK would answer for them.
+      if (transientBerthHeld()) {
+        setArrivalNote({
+          tone: 'warn',
+          text: 'Cannot depart: a station moving between planets holds this ship until it arrives.',
         });
         render();
         return;
@@ -2528,32 +2577,65 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         render();
         return;
       }
-      // 1) Publish the flight record FIRST — the FAST path docked → in-flight.
-      //    A record the writer refuses (shape or transition) must not leave
-      //    the ship cast off and charged without having departed.
-      //    departedAt is the transfer burn — the next launch window, which
-      //    may still be ahead (every viewer shows the hold until then).
-      const departed = writeFlightRecord({
-        status: 'in-flight',
-        locationId: fromId,
-        destinationId: dest.id,
-        departedAt: nowHop.departAt,
-        etaAt: nowHop.arriveAt,
-        // A whole ms, no later than the burn (flight times are whole ms).
-        castOffAt: Math.floor(Math.min(Date.now(), nowHop.departAt)),
-        // Where the destination orbits now: arrival compares against it.
-        ...destinationAtOf(dest.id),
-      });
-      if (!departed) { render(); return; }
-      // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
-      //    UNDOCK — tombstone + far-room write), then detach any other
-      //    transient guest berth (#67 D2, either-side legal).
-      if (shipDocking) castOffForDeparture(fromId, shipDocking);
-      for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
-      // 3) Debit the fuel cost.
-      writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
-      setArrivalNote(null);
-      render();
+      //    A flight record the writer would refuse (shape) must not cast the
+      //    ship off at all.
+      if (!isFlightRecord(departureFlight(fromId, dest.id, first.hop))) { render(); return; }
+      // 1) Cast off FIRST, and wait for every dock to let go (shipped UNDOCK
+      //    — tombstone + far-room write). 🚚 A station between planets keeps
+      //    the ships docked to it, and the far room may know of a move this
+      //    client has not heard of: its dock then holds (docking.ts
+      //    undockPort puts this side back), so the flight and its fuel are
+      //    committed only once the ship is free.
+      const room = arrivalNoteRoom;
+      castingOff = true;
+      setArrivalNote({ tone: 'ok', text: 'Casting off — waiting for every dock to let go…' });
+      void (async () => {
+        try {
+          const free = !shipDocking || (await releaseEveryDock(shipDocking));
+          // This ship's records are written only from its own room, and the
+          // player may have walked on meanwhile.
+          if (room !== arrivalNoteRoom) return;
+          if (!free) {
+            setArrivalNote({
+              tone: 'warn',
+              text: 'Cannot depart: a dock did not let go (a station moving between planets keeps its ships; the dock port\'s panel says why). The ship stays docked.',
+            });
+            return;
+          }
+          // A move heard of meanwhile holds whatever it holds.
+          if (transientBerthHeld()) {
+            setArrivalNote({
+              tone: 'warn',
+              text: 'Did not depart: a station moving between planets holds this ship until it arrives.',
+            });
+            return;
+          }
+          // 2) Every check again, as things are once the docks have let go
+          //    (the far writes take a while: a launch window can pass, a
+          //    peer can draw on the tanks), and still free here — no dock
+          //    made again, for a flight never leaves one live behind it.
+          const go = shipDocking?.ports().some((p) => p.state.kind === 'docked')
+            ? null
+            : departureNow(fromId, destId);
+          // 3) Release every other transient guest berth (#67 D2, either-side
+          //    legal; a legacy berth is no dock port), then publish the
+          //    flight record.
+          if (go) for (const doorId of enumerateTransientBerths()) detachBerth(doorId);
+          if (!go || !writeFlightRecord(departureFlight(fromId, dest.id, go.hop))) {
+            setArrivalNote({
+              tone: 'warn',
+              text: 'Did not depart: the docks, the tanks or the route changed while the ship cast off. Check the flight plan and try again.',
+            });
+            return;
+          }
+          // 4) Debit the fuel cost.
+          writeFuelLevel(go.fuel - go.hop.fuelCost, go.capacity);
+          setArrivalNote(null);
+        } finally {
+          castingOff = false;
+          redrawHelms();
+        }
+      })();
     });
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;
@@ -2734,11 +2816,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const towContext = (engines: number, fuel: number, commander: boolean, now: number): TowContext => {
     const stations = listStationRecordsNow();
     const hereId = stationHere();
-    // Only a free ship tows: a module bolted on by a gangway is part of a
-    // station (whose helm shows this face on its FUEL & DOCKING tab), and a
-    // station never tows another.
+    // Only a free ship tows, and only the station its docks carry it along
+    // with (stations.dockedStationFor), so the tug moves with its tow: a
+    // module bolted on by a gangway is part of a station (whose helm shows
+    // this face on its FUEL & DOCKING tab), and a station's own welcome room
+    // stays put whatever it is docked to, so a station never tows another.
     const bolted = (docking?.connected() ?? []).some((m) => !m.dock);
-    const station = hereId && !bolted ? stations.find((st) => st.id === hereId) ?? null : null;
+    const carried = hereId && !bolted ? dockedStationFor(currentRoomId(), readAllDoors().values()) : null;
+    const station = carried && carried === hereId ? stations.find((st) => st.id === hereId) ?? null : null;
     return {
       station,
       stations,

@@ -19,7 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
-import { adriftPlace, latestMoveOf, stationInTransit } from './stations';
+import { ADRIFT_PREFIX, adriftPlace, latestMoveOf, stationInTransit } from './stations';
 import type { StationMove } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
@@ -146,8 +146,11 @@ export function listStations(): readonly StationDestination[] {
 /** This install's id for `id`: the directory's alias for it when that is
  *  listed (asked FIRST, so a portable id resolves by its welcome room even
  *  when a local record happens to share the id), else itself, which is
- *  unknown when unlisted. */
+ *  unknown when unlisted. An open-orbit place is never a station (stations.ts
+ *  reserves its prefix), so it is itself whatever alias a peer's summary
+ *  claims for it: no summary moves a ship adrift. */
 export function localStationId(id: string): string {
+  if (id.startsWith(ADRIFT_PREFIX)) return id;
   const list = listStations();
   let alias: string | null = null;
   try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }
@@ -184,29 +187,77 @@ export function isKnownStation(id: string): boolean {
 }
 
 /** Plan the hop from → to at `nowMs`: the directory's own planner (orbits),
- *  else a flat hop that leaves now. Null for an unknown or unreachable pair. */
+ *  else a flat hop that leaves now. Null for an unknown or unreachable pair,
+ *  and for one a station move cuts into. */
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
   // Both ends must be listed: findStation would quietly read an unknown
   // origin as home.
   if (fromId === toId || !(isKnownStation(fromId) || adriftPlace(fromId)) || !isKnownStation(toId)) return null;
+  let hop: HopPlan | null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
-    return wholeMs(plan);
+    hop = wholeMs(plan);
+  } else {
+    const dest = findStation(toId);
+    if (locationPlanet(fromId) !== dest.planetId) return null;
+    hop = wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
   }
-  const dest = findStation(toId);
-  if (locationPlanet(fromId) !== dest.planetId) return null;
-  return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
+  if (!hop) return null;
+  // 🚚 Checked by the times the flight record keeps (rounded up): a flat hop
+  // has no planner to check them, and rounding can carry a burn past the
+  // moment a station leaves.
+  const list = listStations();
+  const moveOf = (id: string) => list.find((s) => s.id === id)?.move;
+  return moveCutsHop(adriftPlace(fromId) ? undefined : moveOf(fromId), moveOf(toId), hop, nowMs) ? null : hop;
+}
+
+/** Does a station move cut into a hop planned at `nowMs`: one under way (or
+ *  coming) while either end must hold still — the source until the ship
+ *  leaves, the destination until it arrives? A move that starts at the
+ *  source after the burn is no concern of the hop; one that lands before it
+ *  would leave the plan on the old orbit. A move that goes nowhere (a pin)
+ *  holds its station where it is. */
+function moveCutsHop(
+  fromMove: StationMove | undefined,
+  toMove: StationMove | undefined,
+  hop: Pick<HopPlan, 'departAt' | 'arriveAt'>,
+  nowMs: number,
+): boolean {
+  const within = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs
+    && (m.fromPlanetId !== m.toPlanetId || m.fromSlot !== m.toSlot);
+  return within(fromMove, hop.departAt) || within(toMove, hop.arriveAt);
 }
 
 /** A hop's times as whole milliseconds, which is all a flight record stores
  *  (shipDoc isFlightRecord): orbital math gives fractions. Rounded up, so a
- *  ship never burns before its window; null when a time is no safe integer. */
+ *  ship never burns before its window; null when a time is no safe integer,
+ *  or when the hop would burn a negative amount (DEPART would add fuel). */
 function wholeMs(plan: HopPlan): HopPlan | null {
+  if (!(Number.isFinite(plan.fuelCost) && plan.fuelCost >= 0)) return null;
   const departAt = Math.ceil(plan.departAt);
   const arriveAt = Math.max(departAt + 1, Math.ceil(plan.arriveAt));
   if (!Number.isSafeInteger(departAt) || !Number.isSafeInteger(arriveAt)) return null;
   return { ...plan, departAt, arriveAt };
+}
+
+// ── Flight capability ────────────────────────────────────────────────────────
+
+let stationRoomCheck: (() => boolean) | null = null;
+
+/** Say whether the current room is a station's own (stations.isStationRoom):
+ *  wired from main.ts; null clears it. */
+export function setStationRoomCheck(check: (() => boolean) | null): void {
+  stationRoomCheck = check;
+}
+
+/** Engine, tank and helm fly a ship (`shipReady`), but a station's own room
+ *  wearing them, for station keeping, never takes off: no flight, and no
+ *  location taken from the ship's flight record. A check that throws reads
+ *  as no station room. */
+export function flightCapable(shipReady: boolean): boolean {
+  if (!shipReady) return false;
+  try { return stationRoomCheck?.() !== true; } catch { return true; }
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */
@@ -273,12 +324,8 @@ export function planRecordHop(
   if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
-  // Nor one with a move under way (or coming) while either end must hold
-  // still: the source until the ship leaves, the destination until it
-  // arrives. A move that starts at the source after the burn is no concern of
-  // this hop; one that lands before it would leave the plan on the old orbit.
-  const movesWithin = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs;
-  if (movesWithin(from.move, t.departAt) || movesWithin(to.move, t.arriveAt)) return null;
+  // Nor one a move cuts into (moveCutsHop).
+  if (moveCutsHop(from.move, to.move, t, nowMs)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,

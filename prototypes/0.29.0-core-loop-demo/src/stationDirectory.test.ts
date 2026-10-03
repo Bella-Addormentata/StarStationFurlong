@@ -16,6 +16,8 @@ import {
   HOME_PLANET_ID,
   localStationId,
   findStation,
+  flightCapable,
+  setStationRoomCheck,
   planHop,
   planRecordHop,
   isKnownStation,
@@ -26,8 +28,9 @@ import {
 } from './stationDirectory';
 import { planTransfer } from './orbits';
 import { isFlightRecord } from './shipDoc';
+import type { StationMove } from './stations';
 
-afterEach(() => setStationDirectory(null));
+afterEach(() => { setStationDirectory(null); setStationRoomCheck(null); });
 
 const station = (id: string, planetId: string, extra: Partial<StationDestination> = {}): StationDestination => ({
   id, name: id.toUpperCase(), planetId, fuelCost: 10, travelMs: TRAVEL_MS_MIN, ...extra,
@@ -135,12 +138,56 @@ describe('the station record as destinations', () => {
   });
 });
 
+describe('flight capability', () => {
+  it('flies a fitted room, but never a station room wearing the same fittings', () => {
+    expect(flightCapable(true)).toBe(true);
+    expect(flightCapable(false)).toBe(false);
+    setStationRoomCheck(() => true);
+    expect(flightCapable(true)).toBe(false);
+    setStationRoomCheck(() => { throw new Error('no doors yet'); });
+    expect(flightCapable(true)).toBe(true);
+  });
+});
+
 describe('planning a hop', () => {
   it('leaves now at the flat cost when the directory has no planner', () => {
     expect(planHop('furlong-station', 'high-orbit', 1000)).toEqual({ departAt: 1000, arriveAt: 1000 + TRAVEL_MS_MIN, fuelCost: 25 });
     expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
     expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
     expect(planHop('nowhere', 'high-orbit', 1000)).toBeNull();
+  });
+
+  it('refuses a flat hop a station move cuts into, by the times the flight record keeps', () => {
+    const now = 1000.5;
+    const move = (over: Partial<StationMove>): StationMove => ({
+      stationId: 'a', welcomeRoomId: 'ra', fromPlanetId: 'p1', fromSlot: 0, toPlanetId: 'p2', toSlot: 0,
+      departAt: 5000, arriveAt: 90_000, mode: 'thrusters', fuel: 1, fuelDrawn: 1, ...over,
+    });
+    const hop = (from: Partial<StationDestination>, to: Partial<StationDestination>) => {
+      setStationDirectory({ stations: () => [station('a', 'p1', from), station('b', 'p1', to)] });
+      return planHop('a', 'b', now);
+    };
+    // No move: a flat hop that leaves now, in whole milliseconds.
+    expect(hop({}, {})).toEqual({ departAt: 1001, arriveAt: 1001 + TRAVEL_MS_MIN, fuelCost: 10 });
+    // The source between planets, or the destination leaving before the ship gets there.
+    expect(hop({ move: move({ departAt: 0 }) }, {})).toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 30_000 }) })).toBeNull();
+    // The source leaving the very millisecond the rounded burn does.
+    expect(hop({ move: move({ departAt: 1001 }) }, {})).toBeNull();
+    // Leaving after the burn, the destination after the arrival, or a move that goes nowhere: fine.
+    expect(hop({ move: move({ departAt: 1002 }) }, {})).not.toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 1002 + TRAVEL_MS_MIN }) })).not.toBeNull();
+    expect(hop({ move: move({ toPlanetId: 'p1', departAt: 1000, arriveAt: 1001 }) }, {})).not.toBeNull();
+  });
+
+  it('refuses a hop that would burn a negative amount of fuel', () => {
+    const list = [station('a', 'planet-sovereign'), station('b', 'planet-sovereign', { fuelCost: -5 })];
+    setStationDirectory({ stations: () => list });
+    expect(planHop('a', 'b', 1000)).toBeNull();
+    setStationDirectory({ stations: () => list, plan: () => ({ departAt: 1000, arriveAt: 2000, fuelCost: -1 }) });
+    expect(planHop('b', 'a', 1000)).toBeNull();
+    setStationDirectory({ stations: () => list, plan: () => ({ departAt: 1000, arriveAt: 2000, fuelCost: 0 }) });
+    expect(planHop('b', 'a', 1000)?.fuelCost).toBe(0);
   });
 
   it('follows the circular-orbit model over station records', () => {

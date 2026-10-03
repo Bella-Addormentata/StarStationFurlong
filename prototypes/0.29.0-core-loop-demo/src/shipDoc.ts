@@ -73,8 +73,9 @@
 
 import * as Y from 'yjs';
 import type { DoorWall } from './doorLayoutDoc';
-import { isAcceptableDoorKey } from './doorsDoc';
+import { MAX_PAIRINGS, isAcceptableDoorKey } from './doorsDoc';
 import {
+  adriftPlace,
   DEFAULT_STATIONS,
   findStation,
   isKnownStation,
@@ -136,6 +137,11 @@ export interface FlightRecord {
    *  place (stationDirectory.adriftAt). Kept through `redocking`, so arrival
    *  can tell the destination moved away however many moves it made since. */
   destinationAt?: string;
+  /** Where the ship cast off from, as an open-orbit place: where its origin
+   *  orbited then. Kept through `in-flight`, so a ship waiting for its launch
+   *  window or on its way stays there whatever its origin does meanwhile
+   *  (shipArrival.shipPlaceId): only a live dock carries a ship along. */
+  originAt?: string;
 }
 
 /** Serializable fuel record. Capacity is DERIVED (tanks × TANK_CAPACITY) — never
@@ -242,6 +248,7 @@ export function isFlightRecord(v: unknown): v is FlightRecord {
   if (r.etaAt !== undefined && !isFlightTime(r.etaAt)) return false;
   if (r.castOffAt !== undefined && !isFlightTime(r.castOffAt)) return false;
   if (r.destinationAt !== undefined && !isBoundedString(r.destinationAt)) return false;
+  if (r.originAt !== undefined && !isBoundedString(r.originAt)) return false;
   // The etaAt > departedAt invariant is enforced HERE — otherwise a peer could
   // write etaAt <= departedAt and every viewer would render "arrived instantly"
   // with no way to know the record is malformed.
@@ -295,6 +302,7 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
       if (r.etaAt !== undefined) out.etaAt = r.etaAt;
       if (r.castOffAt !== undefined && (r.departedAt === undefined || r.castOffAt <= r.departedAt)) out.castOffAt = r.castOffAt;
       if (r.destinationAt !== undefined) out.destinationAt = r.destinationAt;
+      if (r.originAt !== undefined) out.originAt = r.originAt;
     }
   }
   // An arrived ship keeps WHEN it arrived: the arrival waits a short grace
@@ -345,6 +353,16 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
 // beside the meter's reading, naming what the level has paid for and what was
 // dropped. A later REFUEL that raises the ceiling brings nothing dropped back,
 // and the consumer can clear what was settled from its own records.
+//
+// A build from before the meters writes the level alone (`{ level }`), which
+// drops every reading and settlement from the record: for station keeping,
+// the only account left of burns whose entries were cleared. So each level
+// write also copies them under a key of their own (FUEL_COPY), which such a
+// build never writes, and a record that keeps none of them is read with the
+// copy's (fuelParts). That build read the level as written, so the draws
+// since the copy still come off what it wrote: rightly after its DEPART, and
+// once more after its REFUEL (never a refund), until a level write here
+// records them.
 
 /** A meter reads at most this: a running fuel total stays well inside exact
  *  integers, and a hostile reading past it counts as none. */
@@ -414,20 +432,40 @@ function firstEntries(raw: unknown): Array<[string, unknown]> | null {
   return out;
 }
 
+/** A fuel record's readings and settlements: all of it but the level. */
+type FuelParts = Omit<FuelRecord, 'level'>;
+
+/** The key where each level write keeps a copy of the record's readings and
+ *  settlements, which a build from before them never writes (see
+ *  setFuelDrawMeter). */
+const FUEL_COPY = 'fuelCopy';
+
+/** The readings and settlements fuel record `rec` is read with: its own, or,
+ *  when it keeps none (a build from before them wrote the level alone), the
+ *  copy beside it. A copy keeps `meter` only beside `meters`, so a record
+ *  read with one is never read against `meter` alone. */
+function fuelParts(rec: FuelRecord): FuelParts {
+  if (rec.meters !== undefined || rec.meter !== undefined || rec.settled !== undefined) return rec;
+  const copy = shipMap?.get(FUEL_COPY);
+  return typeof copy === 'object' && copy !== null && !Array.isArray(copy) ? (copy as FuelParts) : rec;
+}
+
 interface ParsedFuelRecord {
   recorded: Map<string, number> | null;
   settled: Map<string, unknown>;
 }
 
-/** Each fuel record's readings and settlements, parsed the first time it is
- *  read: a value in a Yjs map is replaced, never changed in place, so every
- *  gauge redraw and ceiling after that reads the same parse. */
-const parsedRecords = new WeakMap<FuelRecord, ParsedFuelRecord>();
+/** Each fuel record's readings and settlements (or its copy's: fuelParts),
+ *  parsed the first time they are read: a value in a Yjs map is replaced,
+ *  never changed in place, so every gauge redraw and ceiling after that
+ *  reads the same parse. */
+const parsedRecords = new WeakMap<FuelParts, ParsedFuelRecord>();
 
 function parseFuelRecord(rec: FuelRecord): ParsedFuelRecord {
-  let parsed = parsedRecords.get(rec);
+  const parts = fuelParts(rec);
+  let parsed = parsedRecords.get(parts);
   if (parsed) return parsed;
-  const meters = firstEntries(rec.meters);
+  const meters = firstEntries(parts.meters);
   let recorded: Map<string, number> | null = null;
   if (meters) {
     recorded = new Map();
@@ -437,11 +475,11 @@ function parseFuelRecord(rec: FuelRecord): ParsedFuelRecord {
     }
   }
   const settled = new Map<string, unknown>();
-  for (const [name, v] of firstEntries(rec.settled) ?? []) {
+  for (const [name, v] of firstEntries(parts.settled) ?? []) {
     if (METER_NAME.test(name) && v !== undefined) settled.set(name, v);
   }
   parsed = { recorded, settled };
-  parsedRecords.set(rec, parsed);
+  parsedRecords.set(parts, parsed);
   return parsed;
 }
 
@@ -562,8 +600,10 @@ export function readFlightRecord(): FlightRecord {
  *  the draws this writer has seen stay counted once (see setFuelDrawMeter),
  *  and each meter's settlement (FuelDrawMeter.settle) with it. A meter only
  *  another build draws through keeps its recorded reading and settlement.
- *  Owner-gated at the caller (helm UI). The write is idempotent: the same
- *  level twice leaves the same record. */
+ *  Both are copied under FUEL_COPY in the same write, for a build from
+ *  before them that writes the level alone. Owner-gated at the caller (helm
+ *  UI). The write is idempotent: the same level twice leaves the same
+ *  record. */
 export function writeFuelLevel(level: number, capacity: number): void {
   if (!docAlive()) return;
   const safe = clampFuelToCapacity(level, capacity);
@@ -592,10 +632,11 @@ export function writeFuelLevel(level: number, capacity: number): void {
   }
   for (const [name, reading] of before ?? []) if (!drawMeters.has(name)) record(name, reading);
   for (const [name, settlement] of settledBefore ?? []) if (!drawMeters.has(name)) keep(name, settlement);
-  const next: FuelRecord = count > 0 ? { level: safe, meters, meter: sum } : { level: safe };
-  if (settledCount > 0) next.settled = settled;
+  const parts: FuelParts = count > 0 ? { meters, meter: sum } : {};
+  if (settledCount > 0) parts.settled = settled;
   boundDoc!.transact(() => {
-    shipMap!.set('fuel', next);
+    shipMap!.set('fuel', { level: safe, ...parts });
+    shipMap!.set(FUEL_COPY, parts);
   });
 }
 
@@ -913,6 +954,84 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
   }
   boundDoc!.transact(() => {
     shipMap!.set('berths', { ...next });
+  });
+  return true;
+}
+
+// ── Where the ship rests (station moves) ─────────────────────────────────────
+
+/**
+ * 🚚 Where this ship came to rest beside a station, for when it holds no live
+ * dock (shipArrival.shipPlaceId). Only a live dock carries a ship along, so a
+ * ship without one stays where its station was: `at`, an open-orbit place
+ * (stationDirectory.adriftAt), as of `since` (writer clock), taken when the
+ * ship arrived and whenever the docks holding it changed. `docks` names this
+ * ship's doors that held a live dock then (or, just after an arrival, were
+ * docking): once none of them does, the ship is where its station was at the
+ * last of their UNDOCKs since, read off those doors directly
+ * (shipArrival.restingPlace). Once that is recorded as `at`, `from` names the
+ * station those docks let go of (shared by its portable id, like the flight
+ * record's stations): the ship rests beside it while it is there, as beside
+ * its own (the flight record's). Kept first-hand in this room
+ * (completeArrival, shipArrival.keepRestPlace), so every install reads the
+ * same place, whatever station moves it has heard of. A docked ship with none
+ * follows its station.
+ */
+export interface RestPlace {
+  at: string;
+  since: number;
+  docks?: string[];
+  from?: string;
+}
+
+/** Most dock doors a rest record names: every door record a complete
+ *  snapshot of the room holds (doorsDoc.readAllDoorsIfComplete), so none of
+ *  the docks holding the ship is ever left out. */
+export const MAX_REST_DOCKS = MAX_PAIRINGS;
+
+export function isRestPlace(v: unknown): v is RestPlace {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const r = v as Partial<RestPlace>;
+  if (!isBoundedString(r.at) || !adriftPlace(r.at) || !isFlightTime(r.since)) return false;
+  if (r.from !== undefined && !isBoundedString(r.from)) return false;
+  if (r.docks === undefined) return true;
+  return Array.isArray(r.docks) && r.docks.length <= MAX_REST_DOCKS
+    && r.docks.every((d) => typeof d === 'string' && isAcceptableDoorKey(d));
+}
+
+/** Where the ship rests, or null when no rest is recorded. */
+export function readRestPlace(): RestPlace | null {
+  if (!docAlive()) return null;
+  const raw = shipMap!.get('rest');
+  if (!isRestPlace(raw)) return null;
+  const out: RestPlace = { at: raw.at, since: raw.since };
+  if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
+  // Station ids are per install: read another install's as ours.
+  if (raw.from !== undefined) out.from = localStationId(raw.from);
+  return out;
+}
+
+/** Record where the ship rests (null forgets it). Returns whether the doc
+ *  now holds what was asked. */
+export function writeRestPlace(rest: RestPlace | null): boolean {
+  if (!docAlive()) return false;
+  if (rest !== null && !isRestPlace(rest)) {
+    console.warn('[ship] refused to write malformed rest place', rest);
+    return false;
+  }
+  const record = rest && {
+    at: rest.at,
+    since: rest.since,
+    ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
+    ...(rest.from !== undefined ? { from: rest.from } : {}),
+  };
+  // Station ids are per install: the shared record names the station it
+  // rests beside by its welcome room, as the flight record does (keeping
+  // this install's id when that would not pass the wire check).
+  const shared = record?.from !== undefined ? { ...record, from: portableStationId(record.from) } : record;
+  boundDoc!.transact(() => {
+    if (record === null) shipMap!.delete('rest');
+    else shipMap!.set('rest', isRestPlace(shared) ? shared : record);
   });
   return true;
 }

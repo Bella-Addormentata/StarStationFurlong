@@ -12,6 +12,7 @@ import {
   MAX_ORBIT_SLOTS,
   currentStation,
   dockedStationFor,
+  isStationRoom,
   listStations,
   planetForRoom,
   roomAdriftPlace,
@@ -326,6 +327,23 @@ describe('stationForRoom / planetForRoom', () => {
     }
   });
 
+  it('tells a station room that wears ship fittings from a ship', () => {
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    const seed = (roomId: string) => `ssf://join#room=${roomId}`;
+    const dock = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId), transient: true });
+    const gangway = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId) });
+    // A saved station's (or the built-in one's) welcome room, docked or not.
+    expect(isStationRoom('b1', [])).toBe(true);
+    expect(isStationRoom('b1', [dock('ship')])).toBe(true);
+    expect(isStationRoom(DEFAULT_STATION_RECORD.welcomeRoomId, [])).toBe(true);
+    // A module bolted into a station by structure.
+    expect(isStationRoom('helm-room', [gangway('a1')])).toBe(true);
+    // A lone module, free or docked, is a ship.
+    expect(isStationRoom('ship', [])).toBe(false);
+    expect(isStationRoom('ship', [dock('b1')])).toBe(false);
+    expect(isStationRoom('', [])).toBe(false);
+  });
+
   it('finds the station a lone module is docked at from its live doors', () => {
     // Station A (two rooms), a lone room with a saved record around Aris, and
     // lone modules with no record of their own.
@@ -340,6 +358,7 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [dock('pod')], atlas)).toBeNull();
     // …a station never moves to the ship visiting it…
     expect(dockedStationFor('b1', [dock('ship')], atlas)).toBeNull();
+    expect(dockedStationFor('b1', [dock('a1')], atlas)).toBeNull(); // nor to one it docks at, so it tows none
     expect(dockedStationFor('a2', [dock('ship')], atlas)).toBeNull();
     expect(dockedStationFor('a2', [dock('b1')], atlas)).toBeNull(); // the atlas holds its gangway
     // …a module bolted into structure is the atlas's to place, and undocked

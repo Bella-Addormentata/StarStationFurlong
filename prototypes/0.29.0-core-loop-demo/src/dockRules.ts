@@ -143,12 +143,14 @@ export function stampAfter(after: number | undefined, now = Date.now()): number 
   return Math.min(after + 1, Number.MAX_SAFE_INTEGER);
 }
 
-/** What an UNDOCK remembers of the berth it releases. */
-export function berthMemoryFrom(record: DoorPairing, undockedAt: number): DockBerthMemory {
+/** What an UNDOCK remembers of the berth it releases, and where the
+ *  station across it was then (`at`), when known. */
+export function berthMemoryFrom(record: DoorPairing, undockedAt: number, at?: string): DockBerthMemory {
   const memory: DockBerthMemory = { undockedAt };
   if (record.farDoor) memory.farDoor = record.farDoor;
   if (record.farWall) memory.farWall = record.farWall;
   if (record.farLateral !== undefined) memory.farLateral = record.farLateral;
+  if (at) memory.at = at;
   return memory;
 }
 
@@ -299,12 +301,14 @@ function namesAnotherNearDoor(record: DoorPairing, nearDoorId: string): boolean 
  *  after this undock (a late write from a quick undock→dock must never undo
  *  the newer dock). `onlyDockedAt` narrows it to exactly one dock: the
  *  take-back of a far DOCK this client wrote, which must never undo anyone
- *  else's. */
+ *  else's. `at` is where the near end's station was as it let go, when
+ *  known (DockBerthMemory.at). */
 export function farUndockPatch(
   farRecord: DoorRecord | undefined,
   near: NearEnd,
   undockedAt: number,
   onlyDockedAt?: number,
+  at?: string,
 ): FarUndock {
   if (!farRecord) return { action: 'skip', reason: 'absent' };
   if (!farRecord.paired) return { action: 'skip', reason: 'already' };
@@ -333,6 +337,7 @@ export function farUndockPatch(
       farWall: near.wall,
       farLateral: near.lateral,
       undockedAt,
+      ...(at ? { at } : {}),
     }),
   };
 }

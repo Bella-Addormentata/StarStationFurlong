@@ -104,7 +104,6 @@ import {
 import { getIdentityPub } from "./keypair";
 import { getPlayerName } from "./identity";
 import {
-  deleteDoorPairing,
   writeDoorTombstone,
   writeDoorPairing,
   readDoor,
@@ -117,6 +116,7 @@ import {
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
 import { dockLockedByMove } from "./stationMove";
+import { berthHeldByMove, detachBerth, releasePlaceOf } from "./shipArrival";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -201,6 +201,9 @@ export type FarDockRequest =
        *  stamp — and nothing else (redockPort's compensation when its own
        *  side changed under it). */
       onlyDockedAt?: number;
+      /** 🚚 Where THIS end's station was as it let go, when known: kept on
+       *  the far end's tombstone (DockBerthMemory.at). */
+      at?: string;
     }
   | {
       kind: "dock";
@@ -240,7 +243,10 @@ export type FarDockResult =
         /** The berth holds a dock of this very port with another stamp — a
          *  claim made at the same moment that the CRDT kept, or one made
          *  from the far side: it stands, this one yields (and may join it). */
-        | "superseded";
+        | "superseded"
+        /** 🚚 The berth's own room holds a move that has its station between
+         *  planets (or its tow under way): nothing was written there. */
+        | "moving";
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
       /** With `unreachable`: the far write WAS made, but its acknowledgment
@@ -2131,7 +2137,11 @@ export class DoorDockingPortSystem {
           // #67 D2: EITHER side casts off a transient berth — no owner ceremony.
           // The doc delete reconciles to every client (projection torn down,
           // door re-locked) through the normal doors-doc path.
-          deleteDoorPairing(doorId);
+          // 🚚 Not while a station move holds it: a berth carries its ship
+          // between planets as a dock does (undockPort). And a tombstone,
+          // as an UNDOCK leaves, recording where its station let go of the
+          // ship (shipArrival.detachBerth).
+          if (!this.heldByMove(doorId)) detachBerth(doorId);
         } else if (!this.isRoomOwner()) {
           return; // every action below is owner-only (UI gate, dev-phase posture)
         } else if (action === "cycle-passage") {
@@ -2238,11 +2248,14 @@ export class DoorDockingPortSystem {
     // ⚓ #163: only a LEGACY berth (a transient gangway from before docks were
     // round) — a dock has its own DOCK row with UNDOCK at the top of the pane.
     const st = this.doorState.get(doorId);
-    const detachRow =
-      st?.pairedSuccessfully && st.transient && !isDockChain(st.segments)
-        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
+    const berth = !!st?.pairedSuccessfully && !!st.transient && !isDockChain(st.segments);
+    const held = berth && this.heldByMove(doorId);
+    const detachRow = berth
+      ? held
+        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked — this station is moving between planets, the berth holds until it arrives</span></div>`
+        : `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>`
-        : "";
+      : "";
 
     // ⏏ Owner-only UNDOCK for a PERMANENT docked module (the transient berth
     // has its own everyone-visible DETACH row above). Destructive → two-click
@@ -2699,6 +2712,13 @@ export class DoorDockingPortSystem {
     this.notifyDockChange();
   }
 
+  /** 🚚 Does a station move hold this door's pairing: a station between
+   *  planets, or a tug's tow, at either end? Then neither end lets go until
+   *  it arrives (undockPort). */
+  private heldByMove(doorId: string): boolean {
+    return berthHeldByMove(this.roomNow(), doorId);
+  }
+
   /** The module on the other side, by name when the atlas knows it. */
   private partnerLabel(roomId: string): string {
     const name = roomId ? readAtlas()[roomId]?.name : undefined;
@@ -2793,7 +2813,9 @@ export class DoorDockingPortSystem {
    * ⏏ UNDOCK — release a dock: the module on the far side is free to fly.
    * THIS side first (the tombstone keeps the berth memory, so DOCK can come
    * back), then the far room's end through the injected writer — best effort;
-   * an unreachable far room is said, not hidden.
+   * an unreachable far room is said, not hidden. A far room whose station is
+   * between planets keeps its end, and this side is put back. True when this
+   * side let go and no far station's move kept its end.
    */
   public async undockPort(doorId: string): Promise<boolean> {
     if (this.dockOp(doorId)?.busy) return false;
@@ -2822,7 +2844,13 @@ export class DoorDockingPortSystem {
     // Causally after the dock it releases, whatever this client's clock says
     // (the far side's newer-dock guard and the mirror compare these stamps).
     const undockedAt = stampAfter(port.record.dockedAt);
-    writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt));
+    // 🚚 Each end's tombstone keeps where the OTHER end's station was as it
+    // let go: a ship released here rests there, whatever moves of that
+    // station anyone hears of later (shipArrival.restingPlace).
+    const now = Date.now();
+    const farAt = releasePlaceOf(port.roomId, now);
+    const nearAt = releasePlaceOf(roomId, now);
+    writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt, farAt));
     const name = this.partnerLabel(port.roomId);
     if (!this.farDockWriter) {
       this.setDockOp(doorId, {
@@ -2844,10 +2872,33 @@ export class DoorDockingPortSystem {
         nearWall: near.wall,
         nearLateral: near.lateral,
         undockedAt,
+        ...(nearAt ? { at: nearAt } : {}),
       });
     } catch (err) {
       console.warn("[dock] far undock threw:", err);
       result = { ok: false, reason: "unreachable" };
+    }
+    if (!result.ok && result.reason === "moving") {
+      // 🚚 The far room knew of a move this install had not heard of (the
+      // far write learns it now): that station is between planets, and its
+      // end held the dock. This side goes back to it — over the very
+      // tombstone written above, in the room it was written in, and never
+      // on a module that has cast off meanwhile; anything else changed this
+      // port since, and stays as it is.
+      const still = this.roomNow() === roomId ? classifyDockPort(readDoor(doorId)) : null;
+      const back = still?.kind === "undocked" && still.memory.undockedAt === undockedAt
+        && pairingAllowedByFlight(readFlightRecord()).ok;
+      if (back) writeDoorPairing(doorId, port.address, port.record);
+      this.setDockOp(
+        doorId,
+        back
+          ? { note: "This station is moving between planets — the dock holds until it arrives.", tone: "bad" }
+          : { note: `This station is moving between planets — ${name} keeps its end of the dock until it arrives, but this port changed meanwhile.`, tone: "bad" },
+        roomId,
+      );
+      // Not released either way: the far end still holds the dock, put back
+      // here or not (a DEPART waiting on it must not leave it live).
+      return false;
     }
     this.setDockOp(
       doorId,
@@ -2949,6 +3000,9 @@ export class DoorDockingPortSystem {
       // a module in flight takes no pairing, and the far write is taken back
       // (settleChangedRedock) exactly as for a port that changed.
       if (!pairingAllowedByFlight(readFlightRecord()).ok) return false;
+      // 🚚 So may either end's station have cast off between planets: no ship
+      // joins a station in transit, and the far write is taken back the same way.
+      if (dockLockedByMove([roomId, port.roomId], Date.now())) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
@@ -3000,6 +3054,16 @@ export class DoorDockingPortSystem {
         );
         return false;
       }
+      if (!far.ok && far.reason === "moving") {
+        // 🚚 A move this install had not heard of: the berth wrote nothing,
+        // and neither does this side.
+        this.setDockOp(
+          doorId,
+          { note: "That station is moving between planets — dock when it arrives.", tone: "bad" },
+          roomId,
+        );
+        return false;
+      }
       if (!far.ok && (far.reason === "occupied" || far.reason === "closed" || far.reason === "gone" || far.reason === "not-allowed" || far.reason === "no-gate")) {
         // A closed or vanished berth is not coming back: drop the memory so
         // this port stops offering it. An occupied one may free up, and a gate
@@ -3047,7 +3111,8 @@ export class DoorDockingPortSystem {
   /**
    * ⚓ redockPort's far berth answered, but THIS port changed while it was
    * asked (a peer docked, re-connected or stripped it — or the player left
-   * the room, so this side can no longer be written). Docked meanwhile to
+   * the room, so this side can no longer be written — or either end's station
+   * cast off between planets, which no ship joins). Docked meanwhile to
    * this very berth under OUR stamp — a crew member here joining our dock, or
    * the walk-through mirror of our far write — both sides hold one dock and
    * nothing is taken back (dockRules.holdsOurRedock). Anything else, the far
@@ -3075,17 +3140,24 @@ export class DoorDockingPortSystem {
       this.setDockOp(doorId, { note: `Docked to ${ask.name}.`, tone: "ok" }, ask.roomId);
       return true;
     }
+    // 🚚 A station that cast off meanwhile is said as such — its port may be
+    // just as it was — and the dock waits for its arrival, not a retry.
+    const moving = dockLockedByMove([ask.roomId, port.roomId], Date.now());
+    const lead = moving
+      ? "That station started moving between planets while docking"
+      : "This port changed while docking";
+    const retry = moving ? "Dock when it arrives." : "Try again.";
     // Acknowledged, or made but never acknowledged (it may still land): either
     // way the berth may hold our write, and it is taken back.
     if (!farWriteMayStand(far) || !this.farDockWriter) {
-      this.setDockOp(doorId, { note: "This port changed while docking — try again.", tone: "warn" }, ask.roomId);
+      this.setDockOp(doorId, { note: `${lead}. ${retry}`, tone: "warn" }, ask.roomId);
       return false;
     }
     this.setDockOp(
       doorId,
       {
         busy: true,
-        note: `This port changed while docking — releasing the berth at ${ask.name}…`,
+        note: `${lead} — releasing the berth at ${ask.name}…`,
       },
       ask.roomId,
     );
@@ -3111,13 +3183,13 @@ export class DoorDockingPortSystem {
       doorId,
       undone.ok
         ? {
-            note: `This port changed while docking — the berth at ${ask.name} was released again. Try again.`,
+            note: `${lead} — the berth at ${ask.name} was released again. ${retry}`,
             tone: "warn",
           }
         : {
             note: far.ok
-              ? `This port changed while docking, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`
-              : `This port changed while docking, and ${ask.name} could not be reached to let go — its side may show the dock until it undocks.`,
+              ? `${lead}, and ${ask.name} could not be told to let go — its side shows the dock until it undocks.`
+              : `${lead}, and ${ask.name} could not be reached to let go — its side may show the dock until it undocks.`,
             tone: "bad",
           },
       ask.roomId,
