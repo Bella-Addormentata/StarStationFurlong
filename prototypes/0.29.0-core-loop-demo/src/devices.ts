@@ -45,7 +45,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, flightCapable, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { destinationsFrom, flightCapable, groundedBy, isKnownStation, planHop, stationHere } from './stationDirectory';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
@@ -2274,13 +2274,23 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           }${hop.windowEveryMs ? ` Windows every ${secs(hop.windowEveryMs)}.` : ''}</div>`
         : '';
       // Refusal copy — the button is the caller's ANSWER, so name the reason.
+      const chainedCopy = (n: number) =>
+        `Chained to ${n} permanent connector${n === 1 ? '' : 's'} — take the gangway down first (chained modules cannot fly).`;
       const refuseCopy = refusal.ok ? '' : (() => {
         switch (refusal.reason) {
           case 'no-owner': return 'Only the module\'s COMMANDER may depart.';
-          case 'not-flight-capable':
+          case 'not-flight-capable': {
+            // Fitted, yet a station's own room (stationDirectory.groundedBy):
+            // name what holds it, not systems it already has.
+            const why = isShipReady() ? groundedBy() : null;
+            if (why === 'bolted') return chainedCopy(chained.length);
+            if (why === 'welcome-room') {
+              return 'This is the station\'s own room: its engine, tank and helm keep the station in orbit, and it never flies.';
+            }
             return 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.';
+          }
           case 'not-docked': return 'Ship is not at rest — cannot depart from mid-flight.';
-          case 'chained-berth': return `Chained to ${refusal.chainedDoors.length} permanent connector${refusal.chainedDoors.length === 1 ? '' : 's'} — take the gangway down first (chained modules cannot fly).`;
+          case 'chained-berth': return chainedCopy(refusal.chainedDoors.length);
           case 'insufficient-fuel': return `Insufficient fuel — this hop needs ${refusal.needed}, tanks hold ${refusal.have}.`;
           case 'already-here': return 'The ship is already here.';
           case 'other-planet': return 'That station orbits another planet — out of range.';

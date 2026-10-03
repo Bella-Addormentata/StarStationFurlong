@@ -155,13 +155,13 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 import { roomIdFromSeed } from "./stationAtlas";
 import {
   dockedStationFor,
-  isStationRoom,
   listStations,
   registerStation,
   removeStation,
   setRoomStationResolver,
   setStationRoomSource,
   stationForRoom,
+  stationRoomCause,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
 import { directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
@@ -1760,7 +1760,7 @@ async function joinRoomAtEpoch(
     });
     // 🚀 The same rule gates the helm: a station room never departs, and never
     // takes its location from the ship's flight record.
-    setStationRoomCheck(() => isStationRoom(activeBootstrap?.roomId ?? "", readAllDoors().values()));
+    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readAllDoors().values()));
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());

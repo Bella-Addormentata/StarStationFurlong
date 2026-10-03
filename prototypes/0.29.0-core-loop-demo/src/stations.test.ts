@@ -21,6 +21,7 @@ import {
   setRoomStationResolver,
   setStationRoomSource,
   stationForRoom,
+  stationRoomCause,
   stationsAroundPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
@@ -325,6 +326,11 @@ describe('stationForRoom / planetForRoom', () => {
     expect(isStationRoom('ship', [])).toBe(false);
     expect(isStationRoom('ship', [dock('b1')])).toBe(false);
     expect(isStationRoom('', [])).toBe(false);
+    // Why, for the helm: a welcome room stays one with its gangways, and a
+    // module bolted in is free once its gangway is down.
+    expect(stationRoomCause('b1', [gangway('a1')])).toBe('welcome-room');
+    expect(stationRoomCause('helm-room', [gangway('a1'), dock('ship')])).toBe('bolted');
+    expect(stationRoomCause('ship', [dock('b1')])).toBeNull();
   });
 
   it('finds the station a lone module is docked at from its live doors', () => {

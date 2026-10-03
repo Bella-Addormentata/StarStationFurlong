@@ -390,21 +390,34 @@ export function dockedStationFor(
   return null;
 }
 
-/** Is `roomId` a station's own room, never a ship that flies: a saved or
+/** Why a room is a station's own (stationRoomCause). */
+export type StationRoomCause = 'welcome-room' | 'bolted';
+
+/** Why `roomId` is a station's own room, never a ship that flies: a saved or
  *  built-in station's welcome room, or a module bolted into a station by
- *  structure (a paired door that is no berth). Such a room may wear engine,
- *  tank and helm for station keeping. */
+ *  structure (a paired door that is no berth: taking that gangway down frees
+ *  it). Null for a ship. Such a room may wear engine, tank and helm for
+ *  station keeping. */
+export function stationRoomCause(
+  roomId: string,
+  doors: Iterable<DoorRecord>,
+  stations: StationRecord[] = listStations(),
+): StationRoomCause | null {
+  if (!roomId) return null;
+  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) return 'welcome-room';
+  for (const rec of doors) {
+    if (rec.paired === true && !isBerthDoor(rec)) return 'bolted';
+  }
+  return null;
+}
+
+/** Is `roomId` a station's own room (stationRoomCause)? */
 export function isStationRoom(
   roomId: string,
   doors: Iterable<DoorRecord>,
   stations: StationRecord[] = listStations(),
 ): boolean {
-  if (!roomId) return false;
-  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) return true;
-  for (const rec of doors) {
-    if (rec.paired === true && !isBerthDoor(rec)) return true;
-  }
-  return false;
+  return stationRoomCause(roomId, doors, stations) !== null;
 }
 
 /** The planet a room's station orbits — the default planet when unknown. */

@@ -19,6 +19,7 @@
 import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import { planTransfer } from './orbits';
+import type { StationRoomCause } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -138,21 +139,26 @@ function wholeMs(plan: HopPlan): HopPlan | null {
 
 // ── Flight capability ────────────────────────────────────────────────────────
 
-let stationRoomCheck: (() => boolean) | null = null;
+let stationRoomCheck: (() => StationRoomCause | null) | null = null;
 
-/** Say whether the current room is a station's own (stations.isStationRoom):
- *  wired from main.ts; null clears it. */
-export function setStationRoomCheck(check: (() => boolean) | null): void {
+/** Say why the current room is a station's own, or null when it is not
+ *  (stations.stationRoomCause): wired from main.ts; null clears it. */
+export function setStationRoomCheck(check: (() => StationRoomCause | null) | null): void {
   stationRoomCheck = check;
+}
+
+/** Why the current room is a station's own, so engine, tank and helm do not
+ *  fly it (flightCapable), or null: what the helm names in place of missing
+ *  systems. A check that throws reads as no station room. */
+export function groundedBy(): StationRoomCause | null {
+  try { return stationRoomCheck?.() ?? null; } catch { return null; }
 }
 
 /** Engine, tank and helm fly a ship (`shipReady`), but a station's own room
  *  wearing them, for station keeping, never takes off: no flight, and no
- *  location taken from the ship's flight record. A check that throws reads
- *  as no station room. */
+ *  location taken from the ship's flight record. */
 export function flightCapable(shipReady: boolean): boolean {
-  if (!shipReady) return false;
-  try { return stationRoomCheck?.() !== true; } catch { return true; }
+  return shipReady && groundedBy() === null;
 }
 
 /** The station the ship's room belongs to right now, when the source knows. */

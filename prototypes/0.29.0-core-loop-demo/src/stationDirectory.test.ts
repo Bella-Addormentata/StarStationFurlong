@@ -15,6 +15,7 @@ import {
   FUEL_PER_KMS,
   findStation,
   flightCapable,
+  groundedBy,
   setStationRoomCheck,
   planHop,
   planRecordHop,
@@ -132,10 +133,24 @@ describe('flight capability', () => {
   it('flies a fitted room, but never a station room wearing the same fittings', () => {
     expect(flightCapable(true)).toBe(true);
     expect(flightCapable(false)).toBe(false);
-    setStationRoomCheck(() => true);
+    setStationRoomCheck(() => 'bolted');
     expect(flightCapable(true)).toBe(false);
     setStationRoomCheck(() => { throw new Error('no doors yet'); });
     expect(flightCapable(true)).toBe(true);
+  });
+
+  it("says why a fitted room never flies: bolted in by a gangway, or a station's own room", () => {
+    setStationRoomCheck(() => 'bolted');
+    expect(groundedBy()).toBe('bolted');
+    setStationRoomCheck(() => 'welcome-room');
+    expect(groundedBy()).toBe('welcome-room');
+    setStationRoomCheck(() => null);
+    expect(groundedBy()).toBeNull();
+    expect(flightCapable(true)).toBe(true);
+    setStationRoomCheck(() => { throw new Error('no doors yet'); });
+    expect(groundedBy()).toBeNull();
+    setStationRoomCheck(null);
+    expect(groundedBy()).toBeNull();
   });
 });
 
