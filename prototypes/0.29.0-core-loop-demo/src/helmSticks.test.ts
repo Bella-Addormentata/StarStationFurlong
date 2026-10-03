@@ -13,10 +13,10 @@ import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
 import * as Y from 'yjs';
 import type { DeviceUI, PropAnimHandle } from './devices';
-import { buildItemGroup } from './furniture';
+import { FURNITURE, buildItemGroup, type FurnitureItem } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
-import { createStationHelmUI } from './stationHelm';
+import { createStationHelmUI, setStationHelmCommanderCheck } from './stationHelm';
 import { TRIM_FUEL, bindStationKeepingDoc } from './stationKeeping';
 import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, registerStation, setStationRoomSource } from './stations';
 
@@ -184,6 +184,9 @@ describe('the station helm\'s on-screen stick', () => {
   });
 });
 
+/** The stand-in element holding the keyboard focus. */
+let focused: FakeElement | null = null;
+
 /** Just enough of an element for the station helm's dashboard: what it
  *  builds, reads, writes and wires up. Whatever a selector asks an element
  *  for is a stand-in of its own. */
@@ -229,7 +232,9 @@ class FakeElement {
     if (!el) this.found.set(sel, (el = new FakeElement(sel)));
     return el;
   }
-  focus(): void {}
+  focus(): void {
+    focused = this;
+  }
   getBoundingClientRect(): { left: number; top: number; width: number; height: number } {
     return { left: 0, top: 0, width: 0, height: 0 };
   }
@@ -264,10 +269,27 @@ const tabClick = (name: string) => ({
   target: { closest: (sel: string) => (sel === '[data-sk-tab]' ? { dataset: { skTab: name } } : null) },
 });
 const click = { stopPropagation: () => {} };
+/** An arrow key pressed, not held. */
+const arrowUp = { key: 'ArrowUp', repeat: false, preventDefault: () => {} };
+
+/** Is the SpacePhone open over the helm (main.ts marks its container active)? */
+let phoneOpen = false;
+/** A text field the player is typing in, holding the focus. */
+let typingIn: { tagName: string } | null = null;
 
 describe('the helm dashboard\'s faces', () => {
   beforeEach(() => {
-    vi.stubGlobal('document', { createElement: (tag: string) => new FakeElement(tag) });
+    focused = null;
+    phoneOpen = false;
+    typingIn = null;
+    const phone = { classList: { contains: (name: string) => name === 'active' && phoneOpen } };
+    vi.stubGlobal('document', {
+      createElement: (tag: string) => new FakeElement(tag),
+      getElementById: (id: string) => (id === 'spacephone-container' ? phone : null),
+      get activeElement() {
+        return typingIn ?? focused;
+      },
+    });
   });
 
   it('a helm whose module steers a station opens on station keeping', () => {
@@ -336,6 +358,67 @@ describe('the helm dashboard\'s faces', () => {
     ui.unmount();
     expect(built[1].host).toBeNull();
     expect(host.children).toHaveLength(0);
+  });
+
+  it('the stick takes the keyboard focus as station keeping opens, and again on the way back from FUEL & DOCKING', () => {
+    // Copilot's review of #173: Tab is the SpacePhone's (main.ts) and the
+    // helm opened with nothing focused, so the arrow keys needed a pointer.
+    const { shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => null, shipFace });
+    const host = new FakeElement('host');
+    ui.mount(host as unknown as HTMLElement);
+    expect(focused).toBe(keepFace(host)!.querySelector('#sk-well'));
+    keepFace(host)!.dispatch('click', tabClick('ship'));
+    focused = null; // it went with the panel
+    waysToKeeping(host)[0].dispatch('click', click);
+    expect(focused).not.toBeNull();
+    expect(focused).toBe(keepFace(host)!.querySelector('#sk-well'));
+    ui.unmount();
+  });
+
+  it('the stick leaves the focus in a text field the player is typing in', () => {
+    for (const tagName of ['INPUT', 'TEXTAREA']) {
+      typingIn = { tagName };
+      const { shipFace } = shipFaces();
+      const ui = createStationHelmUI({ bolted: () => true, station: () => null, shipFace });
+      const host = new FakeElement('host');
+      ui.mount(host as unknown as HTMLElement);
+      expect(keepFace(host)).not.toBeNull();
+      expect(focused).toBeNull();
+      ui.unmount();
+    }
+  });
+
+  it('an arrow key fires a burn, but none while the SpacePhone is open over the helm', () => {
+    // The stick holds the focus with the SpacePhone open over the helm.
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationHelmCommanderCheck(() => true);
+    const parts: FurnitureItem[] = [
+      { id: 'sk-engine', kind: 'engine-block', pos: { x: 0, z: 0 }, rot: 0, movable: true },
+      { id: 'sk-tank', kind: 'fuel-tank', pos: { x: 2, z: 0 }, rot: 0, movable: true },
+    ];
+    FURNITURE.push(...parts);
+    const { shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => DEFAULT_STATION_RECORD, shipFace });
+    const host = new FakeElement('host');
+    try {
+      writeFuelLevel(40, 100);
+      const burns = () => [...doc.getMap('stationKeeping').keys()].filter((k) => k.startsWith('burn:')).length;
+      ui.mount(host as unknown as HTMLElement);
+      const well = keepFace(host)!.querySelector('#sk-well');
+      phoneOpen = true;
+      well.dispatch('keydown', arrowUp);
+      expect(burns()).toBe(0);
+      phoneOpen = false;
+      well.dispatch('keydown', arrowUp);
+      expect(burns()).toBe(1);
+    } finally {
+      ui.unmount();
+      for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
+      setStationHelmCommanderCheck(null);
+    }
   });
 
   it('World opens every helm through the station helm, a ship\'s too', () => {

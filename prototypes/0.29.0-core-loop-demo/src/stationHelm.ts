@@ -9,9 +9,9 @@
  *   ◀ BACK / AHEAD ▶  — one burn slides the station PHASE_STEP_DEG along it.
  *
  * Flick the stick (drag the knob past its ring and let go), press a button,
- * or focus the stick and use the arrow keys. Each is ONE discrete burn
- * (stationKeeping.planTrim); everything else on the dashboard is derived
- * from the room's burns and the clock.
+ * or use the arrow keys (the stick takes the keyboard focus as the face
+ * opens). Each is ONE discrete burn (stationKeeping.planTrim); everything
+ * else on the dashboard is derived from the room's burns and the clock.
  *
  * Every helm opens through here (world.ts): one in a module that steers no
  * station opens on the ship face, which offers station keeping within half
@@ -489,6 +489,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     well.addEventListener('keydown', (e) => {
       const dir = ARROW_KEYS[e.key];
       if (!dir) return;
+      // The SpacePhone opens over the helm without taking the focus (main.ts
+      // binds Tab to it): no key pressed at the phone fires a burn.
+      if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
       e.preventDefault();
       // One press, one burn: a held key's auto-repeat is not a new press
       // (it would fire again the moment the last burn ends).
@@ -541,6 +544,13 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     unsubs.push(subscribeDoors(refresh));
     refresh();
     placeKnob(Date.now());
+    // Somewhere for the arrow keys to land: Tab cannot bring the focus here
+    // (main.ts binds it to the SpacePhone), so the stick takes it as this face
+    // opens, on the way back from FUEL & DOCKING too, unless the player is
+    // typing (the SpacePhone's chat). preventScroll: the panel sits over the
+    // canvas.
+    const typingIn = document.activeElement as HTMLElement | null;
+    if (typingIn?.tagName !== 'INPUT' && typingIn?.tagName !== 'TEXTAREA') well.focus({ preventScroll: true });
   };
 
   const unmountKeep = (): void => {
