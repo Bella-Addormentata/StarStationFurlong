@@ -81,9 +81,10 @@
  * to an auto-dock gate is taken by the gate too (a far write that never landed
  * here, the walk-through mirror's job) where the keeper could dock the ferry
  * itself (the gate admits it, and its module would overlap no other there),
- * once no station move, tow or flight of this room locks the docks; at any
- * other gate the keeper watches, the ferry's port lets go of it once it has
- * held it alone for GATE_STALE_MS (no move or tow locking the docks). A dock
+ * once this room is not in flight; at any other gate the keeper watches, the
+ * ferry's port lets go of it once it has held it alone for GATE_STALE_MS.
+ * While a station move or a tow locks the docks, nothing is fixed at either
+ * end: every ship docked rides along, and none leaves or joins. A dock
  * the gate holds that the ferry has provably let go (its port undocked after
  * it, or docked elsewhere since) or has not held for GATE_STALE_MS is let go
  * at the gate; an undock made at the gate after the ferry's dock reaches the
@@ -230,6 +231,17 @@ function roomOf(address: string | undefined): string {
     return roomIdFromSeed(address);
   } catch {
     return '';
+  }
+}
+
+/** dockRules.holdsDockTo, read as roomOf reads an address: both rooms' door
+ *  records are peer-written, and one whose address does not parse holds no
+ *  dock here, rather than throwing out of the keeper's tick. */
+function holdsDock(record: DoorRecord | undefined, near: NearEnd): boolean {
+  try {
+    return holdsDockTo(record, near);
+  } catch {
+    return false;
   }
 }
 
@@ -577,10 +589,10 @@ export function gateMove(o: {
       if (step.why === 'renew-hold') return none('renew');
       // The stay's entries are written for a dock one of this room's
       // auto-dock gates holds; a dock anywhere else is its maker's.
-      if (!o.gates.some((g) => holdsDockTo(look.port, o.near(g.doorId)))) return none('not-ours');
+      if (!o.gates.some((g) => holdsDock(look.port, o.near(g.doorId)))) return none('not-ours');
       return { kind: 'write', why: step.why, entry: step.entry };
     case 'cast-off': {
-      const gate = o.gates.find((g) => holdsDockTo(look.port, o.near(g.doorId)));
+      const gate = o.gates.find((g) => holdsDock(look.port, o.near(g.doorId)));
       if (!gate) return none('not-ours');
       if (step.why === 'departure' && f.departsAt !== null && now < f.departsAt + GATE_CAST_OFF_DEFER_MS) return none('defer');
       return { kind: 'cast-off', gate };
@@ -630,9 +642,9 @@ export type GateFix =
  * the ferry's port holds alone is taken at the gate where the keeper's own
  * dock could be made (something here names the ferry, the gate is not
  * `retired` and admits it, and its module would overlap no other there), once
- * docks are not `locked` and this room `mayPair`; elsewhere the port lets go
- * of it once it has held it GATE_STALE_MS, but not while docks are `locked`.
- * Pure.
+ * this room `mayPair`; elsewhere the port lets go of it once it has held it
+ * GATE_STALE_MS. While the docks are `locked` (a station move or a tow),
+ * nothing is fixed at either end. Pure.
  */
 export function gateFixes(o: {
   gates: readonly GateView[];
@@ -644,7 +656,8 @@ export function gateFixes(o: {
   heldFor: (doorId: string, rec: DoorPairing) => number;
   portHeldFor: (doorId: string, dockedAt: number | undefined) => number;
   /** Does a station move or a tow lock the docks between this room and the
-   *  ferry now (no DOCK or UNDOCK either side)? Default: no. */
+   *  ferry now (no DOCK or UNDOCK either side)? Then nothing is fixed.
+   *  Default: no. */
   locked?: boolean;
   /** May this room take a pairing now (its own flight)? Default: yes. */
   mayPair?: boolean;
@@ -667,9 +680,12 @@ export function gateFixes(o: {
       ...(x !== undefined ? { dockedAt: x } : {}),
     }),
   });
+  // A station move or a tow: every ship docked rides along, and none leaves
+  // or joins until it arrives, so neither end is written.
+  if (o.locked === true) return out;
   for (const g of o.gates) {
     const rec = g.record;
-    if (port?.paired === true && holdsDockTo(port, o.near(g.doorId))) {
+    if (port?.paired === true && holdsDock(port, o.near(g.doorId))) {
       const x = port.dockedAt;
       if (rec?.paired === true) {
         // The same dock under another stamp: the gate takes the ferry's.
@@ -698,12 +714,9 @@ export function gateFixes(o: {
         continue;
       }
       // The ferry's port holds the dock alone: a far write that never landed
-      // here, or one still on its way. While docks are locked, neither end
-      // is written.
-      if (o.locked === true) continue;
-      // The gate takes it, posed from its own memory of the ferry, else the
-      // room's, where the keeper's own dock could be made (this room's
-      // flight only defers it)...
+      // here, or one still on its way. The gate takes it, posed from its own
+      // memory of the ferry, else the room's, where the keeper's own dock
+      // could be made (this room's flight only defers it)...
       const mine: FerryBerthing | null =
         rec?.dock && namesPort(rec.dock.farDoor, o.shipPort) && roomOf(rec.retiredAddress) === o.shipRoomId
           ? { address: rec.retiredAddress, farWall: rec.dock.farWall, farLateral: rec.dock.farLateral }
@@ -781,7 +794,9 @@ export type StationDockResult =
          *  port (gateFixes). */
         | 'lost'
         /** The ferry's side was written but never acknowledged: it may still
-         *  land (the gate keeps the claim; gateFixes settles it). */
+         *  land (the gate keeps the claim, or withdraws the dock at both ends
+         *  when it stopped being one this keeper docks at meanwhile;
+         *  gateFixes settles what lands). */
         | 'unconfirmed'
         /** The player left the room. */
         | 'left'
@@ -838,7 +853,7 @@ export async function stationDock(o: {
   const before = gate.read();
   const port = readDoorFrom(doc, shipPort);
   if (port?.paired === true) {
-    if (!holdsDockTo(port, gate.near) || port.dockedAt === undefined) return { ok: false, reason: 'occupied' };
+    if (!holdsDock(port, gate.near) || port.dockedAt === undefined) return { ok: false, reason: 'occupied' };
     // Docked to this very gate already: the gate takes the port's stamp
     // (never over another ship's dock).
     return before?.paired === true && !held(before) ? { ok: false, reason: 'taken' } : join(port.dockedAt);
@@ -951,12 +966,18 @@ export async function stationDock(o: {
     // The ferry's port took a dock to this very gate meanwhile: join it.
     if (result.reason === 'superseded' && result.stamp !== undefined) {
       const now = readDoorFrom(doc, shipPort);
-      if (holdsDockTo(now, gate.near)) return rejoin(result.stamp);
+      if (holdsDock(now, gate.near)) return rejoin(result.stamp);
     }
     takeBack();
     return { ok: false, reason: result.reason === 'occupied' ? 'occupied' : 'refused' };
   }
   if (wrote && !(await session.confirm(since, GATE_ACK_MS))) {
+    // It may land yet. A gate that stopped being one this keeper docks at
+    // while the room was asked has the dock withdrawn now, as in step 4
+    // (stamp-scoped at the ferry's side), so a dock that landed after all is
+    // not left there; a live gate keeps its claim. Either way a fresh
+    // session reads what the ferry's room holds (gateFixes settles it).
+    if (!gate.live()) await withdraw();
     return { ok: false, reason: 'unconfirmed' };
   }
   // 3. Concurrent claims on the ferry's port get a moment; then only the claim
@@ -964,9 +985,25 @@ export async function stationDock(o: {
   // another game may have written over the gate's claim while the ferry's
   // side was asked.
   await o.wait(GATE_SETTLE_MS);
-  const lost = berthAfterSettle(doc, req, gate.near);
+  let lost: ReturnType<typeof berthAfterSettle>;
+  try {
+    lost = berthAfterSettle(doc, req, gate.near);
+  } catch (err) {
+    // The ferry's port took a record whose address does not parse: not
+    // this dock.
+    console.warn('[gate] ferry-side settle threw:', err);
+    takeBack();
+    return { ok: false, reason: 'refused' };
+  }
   if (lost) {
-    if (!lost.ok && lost.reason === 'superseded' && lost.stamp !== undefined) return rejoin(lost.stamp);
+    if (!lost.ok && lost.reason === 'superseded' && lost.stamp !== undefined) {
+      // A DOCK that crossed this one holds the ferry's port: the gate takes
+      // its stamp only while it is still one this keeper docks at. Else the
+      // claim is taken back, and that dock is its maker's (or gateFixes').
+      if (gate.live()) return rejoin(lost.stamp);
+      takeBack();
+      return { ok: false, reason: 'disabled' };
+    }
     takeBack();
     return { ok: false, reason: !lost.ok && lost.reason === 'occupied' ? 'occupied' : 'refused' };
   }
@@ -1001,7 +1038,7 @@ export function stationCastOff(o: {
   const undockedAt = stampAfter(Number.isFinite(after) ? after : undefined, o.now);
   const since = Y.encodeStateVector(o.doc);
   let wrote = false;
-  if (holdsDockTo(port, o.gate.near)) {
+  if (holdsDock(port, o.gate.near)) {
     try {
       wrote = applyFarDockRequest(
         o.doc,
@@ -1395,13 +1432,13 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const live = new Set<string>();
     const alone = new Set<string>();
     for (const g of views) {
-      if (port?.paired === true && holdsDockTo(port, near(g.doorId)) && g.record?.paired !== true) {
+      if (port?.paired === true && holdsDock(port, near(g.doorId)) && g.record?.paired !== true) {
         alone.add(stampKey(g.doorId, port.dockedAt));
       }
       if (!holdsFerry(g.record, w.ship, shipPort)) continue;
       const key = pairKey(g.doorId, g.record);
       live.add(key);
-      if (port?.paired === true && holdsDockTo(port, near(g.doorId)) && port.dockedAt === g.record.dockedAt) w.settled.add(key);
+      if (port?.paired === true && holdsDock(port, near(g.doorId)) && port.dockedAt === g.record.dockedAt) w.settled.add(key);
     }
     for (const k of [...w.pairSeen.keys()]) if (!live.has(k)) w.pairSeen.delete(k);
     for (const k of [...w.portSeen.keys()]) if (!alone.has(k)) w.portSeen.delete(k);
@@ -1409,15 +1446,16 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     // Its business at each gate (Watch.managed), as this fresh look has it:
     // a fix under way, a claim the ferry's port does not hold (yet), a dock
     // its port holds that the gate does not (taken there or let go, however
-    // long that waits), or, while AUTO-DOCK is on there, a dock both ends
-    // hold. Anything else between that gate and the ferry is settled.
+    // long that waits, a station move or a tow included), or, while
+    // AUTO-DOCK is on there, a dock both ends hold. Anything else between
+    // that gate and the ferry is settled.
     for (const g of views) {
       const fixing = fixes.some((f) => f.gate === g.doorId);
-      const portHolds = port?.paired === true && holdsDockTo(port, near(g.doorId));
-      const portAlone = portHolds && g.record?.paired !== true;
-      if (!fixing && !portAlone && !w.managed.has(g.doorId)) continue;
+      const portHolds = port?.paired === true && holdsDock(port, near(g.doorId));
       const gateHolds = holdsFerry(g.record, w.ship, shipPort);
-      if (fixing || portAlone || (gateHolds && (!portHolds || !g.retired))) w.managed.add(g.doorId);
+      const portOnly = portHolds && !gateHolds;
+      if (!fixing && !portOnly && !w.managed.has(g.doorId)) continue;
+      if (fixing || portOnly || (gateHolds && (!portHolds || !g.retired))) w.managed.add(g.doorId);
       else w.managed.delete(g.doorId);
     }
     // The ferry's port agrees with the gate (as this fresh look has it).
@@ -1690,7 +1728,9 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const berthing = ferryBerthingIn(doors, w.ship, shipPort);
     const running = ferry !== null && isRouteRunning(ferry.route);
     // Gates this ferry is any business of: holding it, or (its route
-    // running) free to take it.
+    // running) admitting it, free or not: one may free just before the
+    // ferry arrives, and a session dialled only then could open after its
+    // stay has ended (dockableGates says, as it docks, which is free).
     const holding = gates.filter((g) => holdsFerry(g.record, w.ship, shipPort));
     for (const g of holding) w.managed.add(g.doorId);
     // A gate switched off since (read whatever its setting) is settled, never
@@ -1702,7 +1742,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       if (settledAt(w, g, shipPort)) w.managed.delete(doorId);
       else retired.push(g);
     }
-    const free = running && !!berthing && gates.some((g) => g.record?.paired !== true && admitsFerry(g, w.ship));
+    const admitting = running && !!berthing && gates.some((g) => admitsFerry(g, w.ship));
     // A gate it has business at where the two ends are not known to agree:
     // a claim the ferry's port has not been seen to hold, a gate that let go
     // of the ferry or took another pairing (the port may still hold it), or
@@ -1716,7 +1756,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     // calls here.
     const unsettled = w.repair || pending || (ferry !== null && w.unpublished !== null);
     if (!ferry && !unsettled) return false;
-    if (holding.length === 0 && !free && !unsettled) {
+    if (holding.length === 0 && !admitting && !unsettled) {
       hangUp(w);
       return true;
     }
