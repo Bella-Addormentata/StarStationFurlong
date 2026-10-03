@@ -460,7 +460,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   });
   paste?.addEventListener('keyup', (e) => e.stopPropagation());
 
-  const sourceFromBox = async (): Promise<TvSource | null> => {
+  const sourceFromBox = async (id: string): Promise<TvSource | null> => {
     const text = paste?.value ?? '';
     const parsed = parseTvSource(text);
     if (!parsed) {
@@ -471,11 +471,15 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     if (parsed.kind === 'archive' && !parsed.file && deps.resolveArchive) {
       feedback('Asking archive.org which file to play…');
       const epoch = tvDocEpoch();
+      // Any programme action meanwhile — PREVIOUSLY ON, STOP or POWER from
+      // this panel, the set's panel or the theatre — bumps the record's
+      // `jump` and voids this lookup.
+      const jump = readTv(id).jump;
       let found: { file: string; title: string } | null = null;
       try {
         found = await deps.resolveArchive(parsed.identifier);
       } catch { /* fall through to the embed */ }
-      if (gen !== resolveGen || epoch !== tvDocEpoch()) return null; // overtaken, or another room
+      if (gen !== resolveGen || epoch !== tvDocEpoch() || readTv(id).jump !== jump) return null; // overtaken
       if (found) return sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed;
       feedback('No playable file found — using their embed (start-time sync only).');
     }
@@ -484,7 +488,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
 
   host.querySelector<HTMLButtonElement>('[data-tv-play]')?.addEventListener('click', () => {
     const id = host.querySelector<HTMLButtonElement>('[data-tv-play]')!.dataset.tvPlay!;
-    void sourceFromBox().then((src) => {
+    void sourceFromBox(id).then((src) => {
       if (!src) return;
       const r = tvPlay(id, src);
       feedback(r.ok ? `Now on: ${sourceLabel(src)}` : r.error);
@@ -494,7 +498,7 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
   host.querySelectorAll<HTMLButtonElement>('[data-tv-schedule]').forEach((b) => b.addEventListener('click', () => {
     const id = b.dataset.tvId!;
     const minutes = Number(b.dataset.tvSchedule);
-    void sourceFromBox().then((src) => {
+    void sourceFromBox(id).then((src) => {
       if (!src) return;
       const r = tvSchedule(id, src, Date.now() + minutes * 60_000);
       feedback(r.ok ? `Scheduled: ${sourceLabel(src)} in ${minutes} min` : r.error);
