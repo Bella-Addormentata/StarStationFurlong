@@ -771,3 +771,29 @@ describe('Copilot round 10', () => {
     expect(routeStopFromWire({ ...stop, orbit: { radiusKm: SOV_R + maxAltitudeKm(SOV) + 10, phase0: 0 } })).toBeNull();
   });
 });
+
+describe('Copilot round 10 (on PR 205)', () => {
+  it('refuses a source claim stamped after the move was booked', () => {
+    const plan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, 0), SOV_R + 3_000, NOW)!;
+    const change: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: SOV, toSlot: 0, departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt: NOW, fuel: 5, fuelDrawn: 5,
+      orbit: { fromRadiusKm: SOV_R + 1_000, fromPhase0: 0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0, fromSince: NOW },
+    };
+    expect(isStationMove(change)).toBe(true);
+    expect(isStationMove({ ...change, orbit: { ...change.orbit!, fromSince: NOW + 1 } })).toBe(false);
+    // A legacy record with no booking time is held to its departure.
+    const { bookedAt: _b, ...legacy } = change;
+    expect(isStationMove({ ...legacy, orbit: { ...change.orbit!, fromSince: plan.departAt } })).toBe(true);
+    expect(isStationMove({ ...legacy, orbit: { ...change.orbit!, fromSince: plan.departAt + 1 } })).toBe(false);
+
+    const hop = climbOf('x', 'x-room', 1, 1_000, NOW);
+    const thruster: StationMove = {
+      ...hop, mode: 'thrusters', orbit: undefined, toPlanetId: hop.fromPlanetId, toSlot: 3, bookedAt: NOW,
+      fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW - 10 },
+    };
+    delete (thruster as { orbit?: unknown }).orbit;
+    expect(isStationMove(thruster)).toBe(true);
+    expect(isStationMove({ ...thruster, fromOrbit: { ...thruster.fromOrbit!, since: NOW + 1 } })).toBe(false);
+  });
+});
