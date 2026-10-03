@@ -57,8 +57,9 @@ import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { interplanetaryPointAt, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
+import { MAX_TRIM_KM } from './stationKeeping';
 import {
-  MAX_ORBIT_SLOTS, PLANETS, altitudeChangeBeats, isOrbitChange, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom,
+  MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom,
   stationInTransit, stationLeftPlanet,
 } from './stations';
 import type { MovingStation, OrbitChange, StationMove, StationRecord } from './stations';
@@ -85,10 +86,32 @@ const isPhase = (v: unknown): v is number =>
   typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 2 * Math.PI;
 
 /** 🎚️ Shape guard for the altitude orbit a move leaves from. */
-function isStationOrbit(v: unknown): v is { radiusKm: number; phase0: number } {
+function isStationOrbit(v: unknown): v is { radiusKm: number; phase0: number; since?: number } {
   if (typeof v !== 'object' || v === null) return false;
   const o = v as Record<string, unknown>;
-  return isRadius(o.radiusKm) && isPhase(o.phase0);
+  return isRadius(o.radiusKm) && isPhase(o.phase0) && (o.since === undefined || isTime(o.since));
+}
+
+/** 🎚️ The radii an altitude orbit around `planetId` may have: the band the
+ *  ALT window offers, from MIN_ALTITUDE_KM (or the lowest slot, if lower)
+ *  to the top slot, widened by `slackKm` (a trim on the orbit a move leaves). */
+function inAltitudeBand(radiusKm: number, planetId: string, slackKm: number): boolean {
+  const planet = planetById(planetId);
+  const low = planet.radiusKm + Math.min(MIN_ALTITUDE_KM, orbitForSlot(planet.id, 0).altitudeKm) - slackKm;
+  const high = planet.radiusKm + maxAltitudeKm(planet.id) + slackKm;
+  return radiusKm >= low - 1e-6 && radiusKm <= high + 1e-6;
+}
+
+/** 🎚️ Does an altitude change fit its planet: it leaves from inside the band
+ *  (a trimmed orbit, so with the trim's slack) and ends inside it, clear of
+ *  every other slot's own orbit (which the planner always keeps clear)? */
+function orbitChangeFits(o: OrbitChange, planetId: string, slot: number): boolean {
+  if (!inAltitudeBand(o.fromRadiusKm, planetId, MAX_TRIM_KM) || !inAltitudeBand(o.toRadiusKm, planetId, 0)) return false;
+  const id = planetById(planetId).id;
+  for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
+    if (s !== slot && Math.abs(orbitForSlot(id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
+  }
+  return true;
 }
 
 /** 🎚️ Shape guard for an altitude change's two orbits. */
@@ -96,6 +119,14 @@ function isOrbitChangeRecord(v: unknown): v is OrbitChange {
   if (typeof v !== 'object' || v === null) return false;
   const o = v as Partial<Record<keyof OrbitChange, unknown>>;
   return isRadius(o.fromRadiusKm) && isPhase(o.fromPhase0) && isRadius(o.toRadiusKm) && isPhase(o.toPhase0);
+}
+
+/** 🎚️ The custom orbit a station's next move keeps until it leaves (its
+ *  fromOrbit), with when that orbit was claimed; nothing at its slot's own. */
+function heldOrbitOf(station: StationRecord): { fromOrbit?: NonNullable<StationMove['fromOrbit']> } {
+  if (!station.orbit) return {};
+  const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
+  return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, ...(isTime(since) ? { since } : {}) } };
 }
 
 /** Shape guard — a hostile peer can write anything into the map. */
@@ -110,10 +141,12 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId))
       // An altitude change stays around its planet, in its slot.
       || (r.mode === 'orbit' && r.tugRoomId === undefined && isOrbitChangeRecord(r.orbit)
-        && r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))
+        && r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot
+        && orbitChangeFits(r.orbit, r.toPlanetId as string, r.toSlot as number)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.orbit === undefined || r.mode === 'orbit')
-    && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)))
+    && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)
+      && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)))
     && (r.bookedAt === undefined || isTime(r.bookedAt))
     // One level only, checked before recursing: a hostile nest is refused
     // at the first step, never walked.
@@ -212,7 +245,12 @@ export function cleanMove(m: StationMove): StationMove {
         toRadiusKm: m.orbit.toRadiusKm, toPhase0: m.orbit.toPhase0,
       },
     } : {}),
-    ...(m.mode !== 'orbit' && m.fromOrbit ? { fromOrbit: { radiusKm: m.fromOrbit.radiusKm, phase0: m.fromOrbit.phase0 } } : {}),
+    ...(m.mode !== 'orbit' && m.fromOrbit ? {
+      fromOrbit: {
+        radiusKm: m.fromOrbit.radiusKm, phase0: m.fromOrbit.phase0,
+        ...(typeof m.fromOrbit.since === 'number' ? { since: m.fromOrbit.since } : {}),
+      },
+    } : {}),
     ...(typeof m.bookedAt === 'number' ? { bookedAt: m.bookedAt } : {}),
     ...(m.settles ? { settles: cleanMove({ ...m.settles, settles: undefined }) } : {}),
   };
@@ -358,7 +396,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
-      ...(station.orbit ? { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0 } } : {}),
+      ...heldOrbitOf(station),
       toPlanetId: quote.toPlanetId,
       toSlot: quote.toSlot,
       departAt: quote.plan.departAt,
@@ -755,7 +793,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
       welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
-      ...(station.orbit ? { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0 } } : {}),
+      ...heldOrbitOf(station),
       toPlanetId: quote.toPlanetId,
       toSlot: quote.toSlot,
       departAt: quote.plan.departAt,
@@ -1128,6 +1166,7 @@ export function rememberedMoveFor(station: MovingStation): StationMove | null {
 /** Point stations.listStations at the remembered moves. */
 export function installStationMoveResolver(): void {
   setStationMoveResolver(rememberedMoveFor);
+  setAltitudeHistory(allKnownMoves);
 }
 
 // ── The room doc ─────────────────────────────────────────────────────────────
@@ -1274,20 +1313,31 @@ function superseded(m: StationMove, known: StationMove[]): boolean {
   return beatenForStation(m, known) || outbidForTug(m, known) || outbidForAltitude(m, known);
 }
 
-/** 🎚️ Did another station's altitude change, still its station's latest
- *  move, claim the orbit this one ends in first (stations.altitudeChangeBeats)?
- *  The station list aborts the loser, so it neither flies, holds docks nor
- *  draws fuel. */
+/** 🎚️ Did this altitude change lose the orbit it ends in to an earlier claim
+ *  of another station (stations.lostAltitudeClaims)? The station list aborts
+ *  it, so it neither flies, holds docks nor draws fuel. */
 function outbidForAltitude(m: StationMove, known: StationMove[]): boolean {
   if (m.mode !== 'orbit' || m.settles) return false;
-  return known.some((o) => altitudeChangeBeats(o, m)
-    && !known.some((later) => sameStation(later, o) && compareMoves(later, o) > 0));
+  let lost = lostCache.get(known);
+  if (!lost) lostCache.set(known, lost = lostAltitudeClaims(known));
+  return lost.has(altitudeMoveKey(m));
+}
+
+/** The losing claims per list of known moves: superseded asks once per entry. */
+const lostCache = new WeakMap<StationMove[], Set<string>>();
+
+/** Every move this install knows: the bound room's log and the remembered
+ *  ones (what listStations weighs altitude claims among). */
+function allKnownMoves(): StationMove[] {
+  if (!docAlive()) return readRememberedMoves();
+  const { entries, legacy } = roomMoves();
+  return knownMoves(legacy ? [legacy, ...entries] : entries);
 }
 
 /** 🎚️ Is this an altitude change another station's claimed the orbit for
  *  first, by every move this install knows? */
 export function isAbortedAltitudeChange(m: StationMove): boolean {
-  return m.mode === 'orbit' && outbidForAltitude(m, knownMoves([...roomStanding()]));
+  return m.mode === 'orbit' && !m.settles && lostAltitudeClaims([m, ...allKnownMoves()]).has(altitudeMoveKey(m));
 }
 
 /** Did a concurrent move of the same station win over this one? Another

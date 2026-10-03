@@ -113,15 +113,26 @@ function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['
       return { parentId: planetId, angle: p.angle, radius: schematicRadius(planetId, p.radiusKm) };
     };
   }
-  // Until the burn it is the station it always was: its id keeps its trim.
-  const from = stationOrbit({ id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot });
+  // Until the burn it is the station it always was: its id keeps its trim,
+  // 🎚️ on the altitude it keeps until it leaves (fromOrbit), if any.
+  const held = (move.settles ?? move).fromOrbit;
+  // A cancelled move keeps it for good (stations.orbitAfterMove).
+  const cancelled = !!move.settles && move.departAt < move.settles.arriveAt;
+  const fromStation = {
+    id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot,
+    ...(held ? { orbit: { radiusKm: held.radiusKm, phase0: held.phase0 } } : {}),
+  };
+  const from = stationOrbit(fromStation);
+  const fromBase = baseOrbit(fromStation);
   const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });
   const slotRadius = (slot: number) => STATION_ORBIT_BASE + slot * STATION_ORBIT_STEP;
   return (nowMs: number) => {
     const p = moveTransitPointAt(move, nowMs);
     if (p) return { angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU };
-    if (nowMs >= move.arriveAt) return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
-    return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: slotRadius(s.orbitSlot) };
+    if (nowMs >= move.arriveAt && !(held && cancelled)) {
+      return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
+    }
+    return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: schematicRadius(fromBase.planet.id, fromBase.radiusKm) };
   };
 }
 

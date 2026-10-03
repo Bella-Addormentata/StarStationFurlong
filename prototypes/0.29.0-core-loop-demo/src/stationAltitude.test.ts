@@ -471,3 +471,84 @@ describe('Copilot round 1', () => {
     expect(listStations({}, [], plan.move.arriveAt + 10).find((s) => s.id === DEFAULT_STATION_ID)?.orbit).toEqual(climbed.orbit);
   });
 });
+
+describe('Copilot round 3', () => {
+  const climbOf = (id: string, room: string, slot: number, toAlt: number, bookedAt: number): StationMove => ({
+    stationId: id, welcomeRoomId: room, fromPlanetId: SOV, fromSlot: slot, toPlanetId: SOV, toSlot: slot,
+    departAt: bookedAt, arriveAt: bookedAt + 60_000, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+    orbit: { fromRadiusKm: orbitForSlot(SOV, slot).radiusKm, fromPhase0: 0, toRadiusKm: SOV_R + toAlt, toPhase0: 0 },
+  });
+  const orbitOf = (list: StationRecord[], id: string) => list.find((s) => s.id === id)?.orbit?.radiusKm;
+  const THIRD: StationRecord = { id: 'third', name: 'THIRD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'third-room' };
+
+  it('refuses altitude changes outside the planet\'s band or onto another slot\'s orbit', () => {
+    const ok = climbOf('other', 'other-room', 1, 1_000, NOW);
+    expect(isStationMove(ok)).toBe(true);
+    const withOrbit = (o: Partial<NonNullable<StationMove['orbit']>>) => ({ ...ok, orbit: { ...ok.orbit!, ...o } });
+    expect(isStationMove(withOrbit({ toRadiusKm: SOV_R + 150 }))).toBe(false);
+    expect(isStationMove(withOrbit({ toRadiusKm: SOV_R + maxAltitudeKm(SOV) + 10 }))).toBe(false);
+    expect(isStationMove(withOrbit({ fromRadiusKm: 10 }))).toBe(false);
+    // Slot 0's own orbit (400 km) belongs to slot 0, not this slot-1 station.
+    expect(isStationMove(withOrbit({ toRadiusKm: orbitForSlot(SOV, 0).radiusKm + 20 }))).toBe(false);
+    // A trimmed start is fine.
+    expect(isStationMove(withOrbit({ fromRadiusKm: orbitForSlot(SOV, 1).radiusKm + 15 }))).toBe(true);
+    const thrust: StationMove = {
+      ...ok, mode: 'thrusters', toPlanetId: 'planet-aris', orbit: undefined, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW },
+    };
+    delete thrust.orbit;
+    expect(isStationMove(thrust)).toBe(true);
+    expect(cleanMove(thrust).fromOrbit).toEqual({ radiusKm: SOV_R + 1_000, phase0: 0, since: NOW });
+    expect(isStationMove({ ...thrust, fromOrbit: { radiusKm: SOV_R + 50, phase0: 0 } })).toBe(false);
+  });
+
+  it('only an accepted claim defeats a later one', () => {
+    const a = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW);
+    const b = climbOf('other', 'other-room', 1, 1_040, NOW + 5);
+    const c = climbOf('third', 'third-room', 2, 1_080, NOW + 10);
+    const moves: Record<string, StationMove> = { [DEFAULT_STATION_ID]: a, other: b, third: c };
+    setStationMoveResolver((st) => moves[st.id] ?? null);
+    const after = listStations({}, [OTHER, THIRD], NOW + 200_000);
+    expect(orbitOf(after, DEFAULT_STATION_ID)).toBe(SOV_R + 1_000);
+    expect(orbitOf(after, 'other')).toBe(orbitForSlot(SOV, 1).radiusKm);
+    expect(orbitOf(after, 'third')).toBe(SOV_R + 1_080);
+  });
+
+  it('weighs an altitude kept by a later move, and keeps its claim time', () => {
+    // OTHER climbed to 1,000 km, then booked a move to Aris that keeps it there
+    // until it leaves; this station, offline, books 1,020 km after the climb.
+    const leave: StationMove = {
+      stationId: 'other', welcomeRoomId: 'other-room', fromPlanetId: SOV, fromSlot: 1, toPlanetId: 'planet-aris', toSlot: 0,
+      departAt: NOW + 5_000_000, arriveAt: NOW + 9_000_000, mode: 'thrusters', bookedAt: NOW + 100_000, fuel: 5, fuelDrawn: 10,
+      fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW },
+    };
+    const mine = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_020, NOW + 50_000);
+    setStationMoveResolver((st) => (st.id === 'other' ? leave : st.id === DEFAULT_STATION_ID ? mine : null));
+    const during = listStations({}, [OTHER], NOW + 200_000);
+    expect(orbitOf(during, DEFAULT_STATION_ID)).toBe(orbitForSlot(SOV, 0).radiusKm);
+    expect(orbitOf(during, 'other')).toBe(SOV_R + 1_000);
+    // A kept altitude claimed after the change it clashes with gives way.
+    const late = { ...leave, fromOrbit: { ...leave.fromOrbit!, since: NOW + 60_000 } };
+    setStationMoveResolver((st) => (st.id === 'other' ? late : st.id === DEFAULT_STATION_ID ? mine : null));
+    const swapped = listStations({}, [OTHER], NOW + 200_000);
+    expect(orbitOf(swapped, DEFAULT_STATION_ID)).toBe(SOV_R + 1_020);
+    expect(orbitOf(swapped, 'other')).toBeUndefined();
+    // The planner stamps when the kept altitude was claimed.
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, NOW) : null));
+    const climbed = listStations({}, [], NOW + 200_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    const plan = planStationMove(ctx({ station: climbed, now: NOW + 200_000 }), 'planet-aris');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(plan.move.fromOrbit).toEqual({ radiusKm: SOV_R + 1_000, phase0: 0, since: NOW });
+  });
+
+  it('draws the altitude kept until departure on the holotable', () => {
+    const leave: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: NOW + 5_000_000, arriveAt: NOW + 9_000_000, mode: 'thrusters',
+      bookedAt: NOW, fuel: 5, fuelDrawn: 5, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0 },
+    };
+    const station = { ...DEFAULT_STATION_RECORD, move: leave };
+    const body = stationBodies([station], NOW)[0];
+    const slot0 = stationBodies([DEFAULT_STATION_RECORD], NOW)[0].orbitRadius;
+    expect(body.placeAt!(NOW).radius).toBeGreaterThan(slot0);
+  });
+});

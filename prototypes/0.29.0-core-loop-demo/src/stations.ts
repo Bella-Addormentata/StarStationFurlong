@@ -213,8 +213,9 @@ export interface StationMove {
   orbit?: OrbitChange;
   /** 🎚️ On any other move: the altitude orbit the station flew when it was
    *  booked, which it keeps until it leaves (and for good if the move is
-   *  cancelled). Absent: its slot's orbit. */
-  fromOrbit?: StationOrbit;
+   *  cancelled). Absent: its slot's orbit. `since`: when that orbit was
+   *  claimed (orbitClaimedAt), which ranks it among altitude claims. */
+  fromOrbit?: StationOrbit & { since?: number };
   /** The tug's room, on a tow. */
   tugRoomId?: string;
   /** Real ms the helm booked it (departAt on records from before). A move is
@@ -271,21 +272,88 @@ export function isOrbitChange(move: Pick<StationMove, 'mode' | 'settles'> | null
   return !!move && (move.settles ?? move).mode === 'orbit';
 }
 
-/** 🎚️ Does altitude change `a` beat `b`, another station's, for the orbit
- *  they both end in? Both are altitude changes around one planet ending
- *  within MIN_ORBIT_SEPARATION_KM; the one booked first wins, then the
- *  smaller welcome room (or id), then the smaller serialized record — one
- *  order, the same on every install, whenever each was booked. */
-export function altitudeChangeBeats(a: StationMove, b: StationMove): boolean {
-  if (a.settles || b.settles || a.mode !== 'orbit' || b.mode !== 'orbit' || !a.orbit || !b.orbit) return false;
-  const ka = a.welcomeRoomId || a.stationId, kb = b.welcomeRoomId || b.stationId;
-  if (ka === kb) return false;
-  if (planetById(a.toPlanetId).id !== planetById(b.toPlanetId).id) return false;
-  if (!(Math.abs(a.orbit.toRadiusKm - b.orbit.toRadiusKm) < MIN_ORBIT_SEPARATION_KM)) return false;
-  const ba = a.bookedAt ?? a.departAt, bb = b.bookedAt ?? b.departAt;
-  if (ba !== bb) return ba < bb;
-  if (ka !== kb) return ka < kb;
-  return JSON.stringify(a) < JSON.stringify(b);
+/** 🎚️ What an altitude claim is known by: the same on every install. */
+export function altitudeMoveKey(m: StationMove): string {
+  const held = (m.settles ?? m).fromOrbit;
+  return JSON.stringify([m.welcomeRoomId || m.stationId, m.mode, m.departAt, m.arriveAt, m.bookedAt ?? null,
+    m.settles ? m.settles.departAt : null, m.orbit?.toRadiusKm ?? null, held?.radiusKm ?? null]);
+}
+
+/** 🎚️ When the orbit a station flies (`orbit`, by its latest move) was
+ *  claimed: the altitude change that took it there's booking, or what the
+ *  move keeping it carries; 0 (before any) when unknown. */
+export function orbitClaimedAt(move: StationMove | null | undefined, orbit: StationOrbit | undefined): number {
+  if (!move || !orbit) return 0;
+  const m = move.settles ?? move;
+  const same = (r: number) => Math.abs(r - orbit.radiusKm) < 1e-6;
+  if (m.mode === 'orbit' && m.orbit && same(m.orbit.toRadiusKm)) return m.bookedAt ?? m.departAt;
+  if (m.mode !== 'orbit' && m.fromOrbit && same(m.fromOrbit.radiusKm)) return m.fromOrbit.since ?? 0;
+  return 0;
+}
+
+/** 🎚️ Moves listStations weighs altitude claims among beside each station's
+ *  latest: every move this install knows (stationMove.ts installs it), so a
+ *  claim still counts after its station has booked something since. */
+let altitudeHistory: (() => StationMove[]) | null = null;
+
+export function setAltitudeHistory(source: (() => StationMove[]) | null): void {
+  altitudeHistory = source;
+}
+
+/**
+ * 🎚️ Which of `moves` lose the orbit they claim, by their altitudeMoveKey.
+ * A claim is an altitude change's destination (from its booking until its
+ * station's next move leaves) or the custom orbit a later move keeps
+ * (fromOrbit: until it leaves, or for good once cancelled). Claims are taken
+ * in the order they were made (then by station): one is accepted unless an
+ * accepted claim of another station around the same planet, still held when
+ * it was made, lies within MIN_ORBIT_SEPARATION_KM. Only accepted claims
+ * defeat later ones, so the outcome is the same on every install that knows
+ * the same moves, whenever and however offline each was booked. Every
+ * other slot's own orbit is kept clear by the move guard.
+ */
+export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
+  const byStation = new Map<string, StationMove[]>();
+  const seen = new Set<string>();
+  for (const m of moves) {
+    const key = altitudeMoveKey(m);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const station = m.welcomeRoomId || m.stationId;
+    const list = byStation.get(station);
+    if (list) list.push(m); else byStation.set(station, [m]);
+  }
+  const bookedOf = (m: StationMove) => (m.settles ?? m).bookedAt ?? (m.settles ?? m).departAt;
+  interface Claim { key: string; station: string; planet: string; radiusKm: number; at: number; until: number }
+  const claims: Claim[] = [];
+  for (const [station, list] of byStation) {
+    for (const m of list) {
+      let next = Infinity;
+      for (const o of list) if (bookedOf(o) > bookedOf(m)) next = Math.min(next, o.departAt);
+      const key = altitudeMoveKey(m);
+      if (m.mode === 'orbit' && !m.settles && m.orbit) {
+        claims.push({ key, station, planet: planetById(m.toPlanetId).id, radiusKm: m.orbit.toRadiusKm, at: bookedOf(m), until: next });
+        continue;
+      }
+      const src = m.settles ?? m;
+      if (src.mode === 'orbit' || !src.fromOrbit) continue;
+      const cancelled = !!m.settles && m.departAt < m.settles.arriveAt;
+      claims.push({
+        key, station, planet: planetById(src.fromPlanetId).id, radiusKm: src.fromOrbit.radiusKm,
+        at: src.fromOrbit.since ?? 0, until: cancelled ? next : src.departAt,
+      });
+    }
+  }
+  claims.sort((a, b) => a.at - b.at || (a.station < b.station ? -1 : a.station > b.station ? 1 : 0)
+    || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+  const accepted: Claim[] = [];
+  const lost = new Set<string>();
+  for (const c of claims) {
+    const beaten = accepted.some((a) => a.station !== c.station && a.planet === c.planet
+      && Math.abs(a.radiusKm - c.radiusKm) < MIN_ORBIT_SEPARATION_KM && a.until > c.at);
+    if (beaten) lost.add(c.key); else accepted.push(c);
+  }
+  return lost;
 }
 
 /** 🎚️ The orbit a station flies at `nowMs` by its latest move: an altitude
@@ -298,7 +366,8 @@ export function orbitAfterMove(move: StationMove | null | undefined, nowMs: numb
     // Any other move keeps the altitude it left from until it leaves, and
     // for good when a pin cancels it (it leaves before the move arrives).
     const cancelled = !!move.settles && move.departAt < move.settles.arriveAt;
-    return (cancelled || nowMs < m.departAt) && m.fromOrbit ? { ...m.fromOrbit } : undefined;
+    return (cancelled || nowMs < m.departAt) && m.fromOrbit
+      ? { radiusKm: m.fromOrbit.radiusKm, phase0: m.fromOrbit.phase0 } : undefined;
   }
   const o = m.orbit;
   if (!o) return undefined;
@@ -618,21 +687,25 @@ export function listStations(
     const at = placeWithMove(c.base, c.move, nowMs);
     return { ...at, planetId: planetById(at.planetId).id };
   });
-  // 🎚️ Two stations whose standing altitude changes end within
-  // MIN_ORBIT_SEPARATION_KM (booked unaware of each other, at once or from
-  // a tab offline): the one booked first flies (altitudeChangeBeats); the
-  // other's burn is aborted, and it stays on the orbit it left, listed with
-  // no move. stationMove.ts holds the same loser out of the dock lock and
-  // the fuel meter.
-  candidates.forEach((_, i) => {
-    const m = candidates[i].move;
-    if (!m || m.mode !== 'orbit' || !m.orbit) return;
-    const lost = candidates.some((o, j) => j !== i && !!o.move && altitudeChangeBeats(o.move, m));
-    if (lost) {
-      wantOf[i] = {
-        planetId: wantOf[i].planetId, orbitSlot: wantOf[i].orbitSlot,
-        orbit: { radiusKm: m.orbit!.fromRadiusKm, phase0: m.orbit!.fromPhase0 },
-      };
+  // 🎚️ Altitude claims (lostAltitudeClaims), weighed among every station's
+  // latest move and every move this install knows: an altitude change that
+  // lost is aborted, its station staying on the orbit it left, listed with
+  // no move; a custom orbit a later move keeps that lost gives way to the
+  // slot's own. stationMove.ts holds the same aborted change out of the dock
+  // lock and the fuel meter.
+  let history: StationMove[] = [];
+  try { history = altitudeHistory?.() ?? []; } catch { history = []; }
+  const latest = candidates.flatMap((c) => (c.move ? [c.move] : []));
+  const lostClaims = latest.some((m) => (m.settles ?? m).mode === 'orbit' || (m.settles ?? m).fromOrbit)
+    ? lostAltitudeClaims([...latest, ...history]) : new Set<string>();
+  candidates.forEach((c, i) => {
+    const m = c.move;
+    if (!m || !lostClaims.has(altitudeMoveKey(m))) return;
+    const { planetId, orbitSlot } = wantOf[i];
+    if (m.mode === 'orbit' && !m.settles && m.orbit) {
+      wantOf[i] = { planetId, orbitSlot, orbit: { radiusKm: m.orbit.fromRadiusKm, phase0: m.orbit.fromPhase0 } };
+    } else {
+      wantOf[i] = { planetId, orbitSlot, ...(wantOf[i].move ? { move: wantOf[i].move } : {}) };
     }
   });
 
