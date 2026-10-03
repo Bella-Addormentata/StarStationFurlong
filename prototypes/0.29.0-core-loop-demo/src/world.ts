@@ -90,7 +90,10 @@ import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
-import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
+import {
+  chooseArrivalDoor, doorBeingCrossed,
+  type ArrivalDoor, type CrossingDoor,
+} from "./doorMatch";
 import type { FurnitureRecord } from "./furnitureDoc";
 import { findDoor, DOORS, rebuildDoors } from "./doors";
 import type { DoorId, DoorTarget, DoorSequenceHooks } from "./doors";
@@ -4506,20 +4509,39 @@ export class World {
     }
     const p = this.player.getPosition();
     const now = performance.now();
-    let inAnyAperture = false;
+
+    // 🚪 #182: ONE door is being crossed, resolved before the loop.
+    //
+    // The aperture frame comes from the door's PHYSICAL wall, not its logical
+    // id (#91: the ids agree for the cardinals under both layouts, but every
+    // free `d:` door read as east/west, so one on the north or south wall
+    // could never trip the threshold) — and from that wall's SIDE as well as
+    // its axis (#182: without the sign each door also answered for its mirror
+    // on the opposite wall, which is both the wrong-room arrival and dorkmo's
+    // phantom doors). The test itself is pure and lives in doorMatch, beside
+    // the arrival chooser, pinned by doorMatch.test.ts.
+    //
+    // Rebuilt per frame because a door can be added, removed or slid along its
+    // wall at any time by the room's editor; DOORS is a handful of entries and
+    // this runs only while first-person with a live avatar.
+    const crossingDoors: CrossingDoor[] = DOORS.map((d) => ({
+      id: d.id,
+      wall: this.wallOfDoor(d.id),
+      front: d.front, // read-only here — no need to clone
+    }));
+    const crossing = doorBeingCrossed(
+      crossingDoors,
+      { x: p.x, z: p.z },
+      // Derived from the movement CLAMP, not from the wall: the trip point has
+      // to be the last centimetres of travel, or ordinary walking along the
+      // wall crosses it.
+      roomWalkBounds(),
+      // 🚪 #91: the crossable band is the door's actual opening, derived rather
+      // than the old 0.95 literal that was sized for the retired small door.
+      DOOR_OPENING_WIDTH,
+    );
+
     for (const door of DOORS) {
-      // Aperture frame: lateral offset along the wall vs distance INTO it.
-      // 🚪 #91: the aperture frame comes from the door's PHYSICAL wall, not its
-      // logical id. The ids happen to agree for the cardinals under both
-      // layouts, but every free `d:` door read as east/west — so one on the
-      // north or south wall could never trip the threshold and was impossible
-      // to walk through in first person.
-      const doorWall = this.wallOfDoor(door.id);
-      const northSouth = doorWall === "y-" || doorWall === "y+";
-      const lateral = Math.abs(
-        northSouth ? p.x - door.front.x : p.z - door.front.z,
-      );
-      const wallCoord = Math.abs(northSouth ? p.z : p.x);
       const approachDist = Math.hypot(p.x - door.front.x, p.z - door.front.z);
 
       const state = ds.getDockingState(door.id);
@@ -4546,23 +4568,8 @@ export class World {
 
       // Threshold: pressed into the open doorway (the manual-movement clamp
       // stops the body at the wall, so "as far in as possible" IS the cross).
-      // Derived from the CLAMP, not from the wall: the trip point has to be the
-      // last few centimetres of travel, or ordinary walking along the wall
-      // crosses it. (It was `half - 0.85` against a `half - 0.8` clamp — a 5 cm
-      // sliver you could only enter by pressing in. When the walkable box was
-      // widened to `half - WALL_CLEARANCE` that literal silently became a 35 cm
-      // strip of normal floor, so strolling past a paired door in first person
-      // fired an unrequested transit.)
-      const { boundX, boundZ } = roomWalkBounds();
-      const apThresh = (northSouth ? boundZ : boundX) - 0.05;
-      // 🚪 #91: the crossable band is the door's actual opening (half-width),
-      // derived rather than the old 0.95 literal that was sized for the
-      // retired small door — with the 2 m opening it left the edges of the
-      // doorway un-crossable.
-      const inAperture = lateral < DOOR_OPENING_WIDTH / 2 && wallCoord > apThresh;
-      if (inAperture) inAnyAperture = true;
       if (
-        inAperture &&
+        crossing?.id === door.id &&
         paired &&
         passable &&
         this.fpTransitArmed &&
@@ -4577,7 +4584,9 @@ export class World {
         this.onAdapterTransit?.(state!.connectedRoomAddress, door.id);
       }
     }
-    if (!inAnyAperture) this.fpTransitArmed = true;
+    // Step clear of EVERY doorway to re-arm — including a disabled or unpaired
+    // one, which is why doorBeingCrossed is told about those doors too.
+    if (!crossing) this.fpTransitArmed = true;
   }
 
   private updatePairedVestibules(deltaTime: number, zoomLevel: number): void {
