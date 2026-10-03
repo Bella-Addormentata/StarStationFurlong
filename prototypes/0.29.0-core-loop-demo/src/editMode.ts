@@ -118,7 +118,7 @@ import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
 import { readShipRoute, routeRulesFlightNow } from './shipRoute';
 import { isRouteRunning } from './pilotRoute';
 import { clearRobotConfig, readRobotConfig } from './robotDoc';
-import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, TANKS_LOCK_REFUSAL } from './routeParts';
+import { lastRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
 // ── Owner gate (plan §1) ──────────────────────────────────────────────────────
@@ -2359,7 +2359,7 @@ class RoomEditController {
       route = null;
     }
     if (routePortTaken(doorId, route)) {
-      showHint("CAN'T REMOVE — the ship's route docks through this door. Stop the route at the helm first.", 3200);
+      showHint(`CAN'T REMOVE — ${ROUTE_PORT_REFUSAL}.`, 3200);
       return;
     }
     if (world.dockingSystem?.isDoorPaired(doorId)) {

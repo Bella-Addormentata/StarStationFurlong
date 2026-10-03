@@ -183,11 +183,18 @@ export interface PilotDock {
   gateChange: boolean;
 }
 
+const isGateNumber = (g: unknown): g is number =>
+  typeof g === 'number' && Number.isInteger(g) && g >= 1 && g <= 99;
+
 /**
  * The route port's dock (`dock`: its far room and door, or null when not
  * docked) as the captain announces it. `atStop`: the dock is into the
- * current stop's station. The stop's own berth is its copied room and door;
- * `gateOf` finds any other gate's number (the atlas, the directory). Pure.
+ * current stop's station. The stop's own berth is its copied room and door.
+ * `gateOf` finds the dock's gate number as the station numbers it now (the
+ * atlas, the directory); only when it knows none does the own berth fall
+ * back on the number copied when the route was saved, since the station may
+ * have renumbered its gates since (the departures board reads it the same
+ * way, departuresBoard.routePortGate). Pure.
  */
 export function pilotDockAt(
   stop: RouteStop,
@@ -200,16 +207,17 @@ export function pilotDockAt(
   // reads as the own berth: nothing says otherwise.
   const own = dock.roomId === stop.berth.roomId
     && (dock.farDoor === undefined || dock.farDoor === stop.berth.farDoor);
-  let gate: number | undefined = own ? stop.berth.gate : undefined;
-  if (gate === undefined && dock.farDoor !== undefined) {
+  const door = dock.farDoor ?? (own ? stop.berth.farDoor : undefined);
+  let gate: number | undefined;
+  if (door !== undefined) {
     try {
-      gate = gateOf(dock.roomId, dock.farDoor);
+      gate = gateOf(dock.roomId, door);
     } catch {
       gate = undefined;
     }
   }
-  const ok = typeof gate === 'number' && Number.isInteger(gate) && gate >= 1 && gate <= 99;
-  return { ...(ok ? { gate } : {}), gateChange: !own };
+  if (!isGateNumber(gate) && own) gate = stop.berth.gate;
+  return { ...(isGateNumber(gate) ? { gate } : {}), gateChange: !own };
 }
 
 /** Why the flight's stay is passed without docking, for the §4 line. */

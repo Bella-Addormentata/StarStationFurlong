@@ -100,6 +100,7 @@ import {
   isRouteRunning,
   resolvedFlight,
   routeFlightAt,
+  routeFlightPlaces,
   routeLegsPlannable,
   routeRefuelStay,
   routeRulesFlight,
@@ -107,7 +108,7 @@ import {
   startCheckpoint,
   stopAt,
 } from './pilotRoute';
-import type { LiveDockAt, RouteFlight, RouteSettleAction } from './pilotRoute';
+import type { LiveDockAt, RouteFlight, RouteFlightPlaces, RouteSettleAction } from './pilotRoute';
 import {
   clampFuelToCapacity,
   raiseStoredFuelLevel,
@@ -1124,16 +1125,23 @@ export function readRouteFlight(now?: number): RouteFlight | null {
 export interface ResolvedShipFlight {
   flight: FlightRecord;
   route: RouteFlight | null;
+  /** 🚚 Where that timetable flies the ship, on the route's own copy of its
+   *  stops (pilotRoute.routeFlightPlaces), when it is the one followed: a
+   *  reader placing the ship takes these over the station list. */
+  places: RouteFlightPlaces | null;
 }
 
 /** readResolvedFlight with the timetable's own figures beside it (the helm
- *  reads both). */
+ *  reads both, and 🚚 the planet summary and far view where it flies). */
 export function resolveShipFlight(now?: number): ResolvedShipFlight {
-  const route = readRouteFlight(now);
+  // One time for both reads: which run is current depends on it.
+  const t = now ?? (flightDeps?.clock ?? Date.now)();
+  const route = readRouteFlight(t);
   const rules = routeRulesFlight(route);
   return {
     flight: resolvedFlight(readFlightRecord(), route, localStationId),
     route: rules ? route : null,
+    places: rules ? routeFlightPlaces(readShipRoute(t), route, localStationId) : null,
   };
 }
 
