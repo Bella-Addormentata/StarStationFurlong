@@ -677,7 +677,13 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
       roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
       ...(g.access ? { access: g.access, ...(g.reservedFor ? { reservedFor: g.reservedFor } : {}) } : {}),
     }));
-    berths = capBerths([...seen, ...learned]
+    // An older record names its welcome room's port by berthDoor alone: while
+    // this atlas holds no number for that room, the port stands beside the
+    // gates of the station's other rooms (as it stands alone without them).
+    const legacy: StationBerthRecord[] = !Array.isArray(st.berths) && st.berthDoor && st.welcomeRoomId
+      && (unknown(st.welcomeRoomId) || unnumbered(st.welcomeRoomId))
+      ? [{ roomId: st.welcomeRoomId, doorId: st.berthDoor }] : [];
+    berths = capBerths([...seen, ...learned, ...legacy]
       .map((b, i) => ({ b, i }))
       .sort((x, y) => (x.b.gate ?? MAX_BERTHS + 1) - (y.b.gate ?? MAX_BERTHS + 1) || x.i - y.i)
       .map((x) => x.b));

@@ -593,6 +593,35 @@ describe('the station record', () => {
     ]);
   });
 
+  it("keeps an older record's welcome berth beside gates found in the station's other rooms", () => {
+    registerStation({ id: 'old', name: 'OLD', planetId: 'planet-sovereign', orbitSlot: 5, welcomeRoomId: 'room-old', berthDoor: 'north' });
+    // This client knows the welcome room only from before gates were numbered,
+    // and has harvested a wing bolted to it whose port is gate 1.
+    harvestIntoAtlas({ roomId: 'room-old', name: 'OLD', doors: [{ doorId: 'east', targetSeed: seed('room-wing'), transient: false }] });
+    harvestIntoAtlas({
+      roomId: 'room-wing', name: 'WING',
+      doors: [{ doorId: 'west', targetSeed: seed('room-old'), transient: false }],
+      gates: { south: 1 },
+    });
+    const listed = () => listStations().find((s) => s.id === 'old')!;
+    expect(listed().berths).toEqual([
+      { roomId: 'room-wing', doorId: 'south', gate: 1 },
+      { roomId: 'room-old', doorId: 'north' },
+    ]);
+    expect(listed().berthDoor).toBe('north');
+    const [dest] = destinationsFromRecords([listed()], seed);
+    expect(dest.berths?.map((b) => b.farDoor)).toEqual(['south', 'north']);
+    // A port there not numbered yet: still only berthDoor stands for it.
+    harvestIntoAtlas({ roomId: 'room-old', name: 'OLD', doors: [{ doorId: 'east', targetSeed: seed('room-wing'), transient: false }], gates: null });
+    expect(listed().berths).toContainEqual({ roomId: 'room-old', doorId: 'north' });
+    // Once the room's gates are known, they are its berths.
+    harvestIntoAtlas({ roomId: 'room-old', name: 'OLD', doors: [{ doorId: 'east', targetSeed: seed('room-wing'), transient: false }], gates: { west: 2 } });
+    expect(listed().berths).toEqual([
+      { roomId: 'room-wing', doorId: 'south', gate: 1 },
+      { roomId: 'room-old', doorId: 'west', gate: 2 },
+    ]);
+  });
+
   it('offers no berth at all for a station known to have no gates', () => {
     const [dest] = destinationsFromRecords([{
       id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'east', berths: [],
