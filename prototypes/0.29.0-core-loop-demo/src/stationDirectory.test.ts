@@ -17,12 +17,15 @@ import {
   localStationId,
   findStation,
   flightCapable,
+  freeFlightCapable,
+  groundedBy,
   setStationRoomCheck,
   planHop,
   planRecordHop,
   isKnownStation,
   listStations,
   setStationDirectory,
+  setBerthPoseLookup,
   stationHere,
   type StationDestination,
 } from './stationDirectory';
@@ -134,10 +137,80 @@ describe('flight capability', () => {
   it('flies a fitted room, but never a station room wearing the same fittings', () => {
     expect(flightCapable(true)).toBe(true);
     expect(flightCapable(false)).toBe(false);
-    setStationRoomCheck(() => true);
+    setStationRoomCheck(() => 'bolted');
     expect(flightCapable(true)).toBe(false);
     setStationRoomCheck(() => { throw new Error('no doors yet'); });
     expect(flightCapable(true)).toBe(true);
+  });
+
+  it("says why a fitted room never flies: bolted in by a gangway, or a station's own room", () => {
+    setStationRoomCheck(() => 'bolted');
+    expect(groundedBy()).toBe('bolted');
+    setStationRoomCheck(() => 'welcome-room');
+    expect(groundedBy()).toBe('welcome-room');
+    setStationRoomCheck(() => null);
+    expect(groundedBy()).toBeNull();
+    expect(flightCapable(true)).toBe(true);
+    setStationRoomCheck(() => { throw new Error('no doors yet'); });
+    expect(groundedBy()).toBeNull();
+    setStationRoomCheck(null);
+    expect(groundedBy()).toBeNull();
+  });
+
+  it('flies a one-module station freely, though it never DEPARTs', () => {
+    setStationRoomCheck(() => 'lone-station');
+    expect(flightCapable(true)).toBe(false);
+    expect(freeFlightCapable(true)).toBe(true);
+    expect(freeFlightCapable(false)).toBe(false);
+    for (const why of ['welcome-room', 'bolted'] as const) {
+      setStationRoomCheck(() => why);
+      expect(freeFlightCapable(true)).toBe(false);
+    }
+    setStationRoomCheck(() => null);
+    expect(freeFlightCapable(true)).toBe(true);
+    setStationRoomCheck(null);
+  });
+});
+
+describe("a station berth's pose", () => {
+  afterEach(() => setBerthPoseLookup(null));
+  const record = {
+    id: 'station:mod-2', name: 'MOD 2', planetId: 'planet-sovereign', orbitSlot: 1,
+    welcomeRoomId: 'mod-2', berthDoor: 'd:00000002',
+  };
+  const seedFor = (rid: string) => (rid === 'mod-2' ? 'seed-mod' : undefined);
+  const bare = { address: 'seed-mod', farDoor: 'd:00000002' };
+
+  it("gives a public berth its port's wall and lateral, so a first DOCK poses the station where the port is", () => {
+    const asked: string[] = [];
+    setBerthPoseLookup((roomId, doorId) => {
+      asked.push(`${roomId} ${doorId}`);
+      return { wall: 'x+', lateral: 1.5 };
+    });
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual({ ...bare, farWall: 'x+', farLateral: 1.5 });
+    expect(asked).toEqual(['mod-2 d:00000002']);
+    // No berth, no question: no door named, or no seed held.
+    asked.length = 0;
+    destinationsFromRecords([{ ...record, berthDoor: undefined }, { ...record, welcomeRoomId: 'far-1' }], seedFor);
+    expect(asked).toEqual([]);
+  });
+
+  it('leaves the pose unknown where the atlas knows none, or a junk one', () => {
+    const berthWith = (pose: unknown) => {
+      setBerthPoseLookup(() => pose as { wall: 'x+' });
+      return destinationsFromRecords([record], seedFor)[0].berth;
+    };
+    expect(berthWith(null)).toEqual(bare);
+    expect(berthWith(undefined)).toEqual(bare);
+    expect(berthWith({ wall: 'north', lateral: 1 })).toEqual(bare);
+    // A lateral the doors doc would not keep leaves the wall alone.
+    expect(berthWith({ wall: 'y-', lateral: 99 })).toEqual({ ...bare, farWall: 'y-' });
+    expect(berthWith({ wall: 'y-', lateral: Number.NaN })).toEqual({ ...bare, farWall: 'y-' });
+    expect(berthWith({ wall: 'y-' })).toEqual({ ...bare, farWall: 'y-' });
+    setBerthPoseLookup(() => { throw new Error('no atlas yet'); });
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual(bare);
+    setBerthPoseLookup(null);
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual(bare);
   });
 });
 

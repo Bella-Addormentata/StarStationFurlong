@@ -22,7 +22,8 @@
  * place at the same moment, within clock skew (the plan's accepted posture).
  *
  * STATION KEEPING: a station may fly a little off its slot's orbit — a TRIM
- * (a few km of radius, a nudge of phase) left by its station-keeping burns.
+ * left by its station-keeping burns: a few km of radius, and any place along
+ * the orbit, since a burn slides it and a trimmed radius drifts it round.
  * Whoever knows the trims installs a resolver (setStationTrimResolver), and
  * stationOrbit — with everything built on it: positions, headings, the frame,
  * transfers, the holotable — flies the trimmed orbit. orbitForSlot stays the
@@ -190,6 +191,11 @@ export function stationOrbit(station: OrbitingStation): CircularOrbit {
   } catch {
     return slot;
   }
+  // Only the radius is bounded, which keeps a station nearest its own slot.
+  // Any phase is a place on the station's own orbit, and station keeping may
+  // leave it anywhere along it: a burn slides it, and a trimmed radius drifts
+  // it round at that radius's own rate. That drift is also why a trimmed
+  // phase0 (the angle at the epoch) can sit anywhere from the slot's.
   if (!trim || !Number.isFinite(trim.radiusKm) || !Number.isFinite(trim.phase0)
     || Math.abs(trim.radiusKm - slot.radiusKm) > slot.radiusKm * MAX_TRIM_FRACTION) return slot;
   return circularOrbit(slot.planet, trim.radiusKm, trim.phase0);
