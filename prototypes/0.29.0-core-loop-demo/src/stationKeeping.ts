@@ -80,7 +80,10 @@
  * records are still kept per install, so two people in the room may know the
  * station by different ids, but everyone who puts it in the same slot
  * derives the same trimmed orbit, and anyone who puts it elsewhere ignores
- * the trim rather than misapplying it. Trust: owner-writes at the UI,
+ * the trim rather than misapplying it. Each orbit keeps its own trim, through
+ * the replay and every settlement, so a burn on one never undoes another's:
+ * two tabs that place the room in different slots each keep theirs and read
+ * their own (readOrbitTrim with the station). Trust: owner-writes at the UI,
  * honest-client reads with shape guards and clamps (the shipDoc posture);
  * the replay takes at most MAX_LOG burns since the last settlement, however
  * many a peer writes, and the rest wait for the next (a peer that writes
@@ -238,8 +241,9 @@ export interface OrbitTrim {
   /** The planet the orbit goes round (a PLANETS id, as orbits.ts resolves
    *  it). */
   planetId: string;
-  /** The slot it was trimmed in. A station moved to another slot or planet
-   *  flies that slot's orbit untrimmed until its next burn. */
+  /** The slot it was trimmed in. Each slot keeps its own trim: a station
+   *  moved to another slot or planet flies that one's, untrimmed until a
+   *  burn there. */
   slot: number;
   /** Orbit radius minus the slot's, km, within ±MAX_TRIM_KM. */
   dRadiusKm: number;
@@ -283,6 +287,11 @@ export interface KeepingSettlement {
    *  log included, dated no later than the write: one dated ahead of the
    *  writer's clock is re-dated to it, on the same orbit. */
   trim: OrbitTrim | null;
+  /** The same for every orbit a station can take here, one trim each, the
+   *  latest last: the replay starts each orbit from its own, so a burn on
+   *  one never undoes another's. Left out (a settlement from before), `trim`
+   *  alone; `trim` stays for builds that read it alone. */
+  trims?: OrbitTrim[];
   /** The fuel those burns drew: the meter's reading at the write. */
   fuelDrawn: number;
   /** The log keys it covered: the burns paid for, and the ones dropped
@@ -357,9 +366,10 @@ const MAX_SETTLED_BURNS = 2 * MAX_LOG;
 /** A log key is `burn:`, a client id and a time: well under this. */
 const MAX_BURN_KEY_LEN = 64;
 
-/** A settlement keeps one fired burn per orbit, so at most PLANETS ×
- *  MAX_ORBIT_SLOTS of them. One off the wire may carry this many: room for a
- *  build that knows more planets, and still a bound on a peer-written list. */
+/** A settlement keeps one fired burn and one trim per orbit, so at most
+ *  PLANETS × MAX_ORBIT_SLOTS of each. One off the wire may carry this many:
+ *  room for a build that knows more planets, and still a bound on a
+ *  peer-written list. */
 const MAX_SETTLED_FIRED = 256;
 
 /** Shape guard for a fired burn off the wire. */
@@ -374,6 +384,8 @@ export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
   if (typeof v !== 'object' || v === null) return false;
   const r = v as Partial<Record<keyof KeepingSettlement, unknown>>;
   return (r.trim === null || isOrbitTrim(r.trim))
+    && (r.trims === undefined
+      || (Array.isArray(r.trims) && r.trims.length <= MAX_SETTLED_FIRED && r.trims.every(isOrbitTrim)))
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX
     && Array.isArray(r.burns) && r.burns.length <= MAX_SETTLED_BURNS
     && r.burns.every((k) => typeof k === 'string' && k.startsWith(BURN_KEY_PREFIX) && k.length <= MAX_BURN_KEY_LEN)
@@ -577,7 +589,12 @@ function burnOrder(a: TrimBurn, b: TrimBurn): number {
  *  that fired (in order), each at the time it applied: one stamped before
  *  the start's last burn at that burn's time. */
 export interface BurnRun {
+  /** The trim the last burn left, on whichever orbit it trimmed (or the
+   *  start's latest). */
   trim: OrbitTrim | null;
+  /** Every orbit's trim, one each, the latest last: a burn starts from its
+   *  own orbit's trim and never undoes another's. */
+  trims: OrbitTrim[];
   fuelDrawn: number;
   fired: TrimBurn[];
 }
@@ -586,14 +603,36 @@ export interface BurnRun {
  *  against (TrimBurn.cap; Infinity for one that carries none). */
 export type BurnCeiling = (capacity: number) => number;
 
-/** replayBurns over burns already in burn order. */
-function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFuel: number, ceiling: BurnCeiling): BurnRun {
-  let trim = start;
+/** The orbit a trim or a burn names, as a key: its planet and slot. */
+function orbitKey(b: Pick<OrbitTrim, 'planetId' | 'slot'>): string {
+  return `${b.planetId}:${b.slot}`;
+}
+
+/** The trims a settlement keeps: one per orbit a station can take here, the
+ *  latest last. A trim on a planet this build does not know trims no
+ *  station's orbit here and is left out, as in lastFiredPerOrbit. */
+function trimsPerOrbit(trims: readonly OrbitTrim[]): OrbitTrim[] {
+  return trims
+    .filter((t) => planetById(t.planetId).id === t.planetId)
+    .sort((a, b) => a.at - b.at)
+    .slice(-MAX_SETTLED_FIRED);
+}
+
+/** replayBurns over burns already in burn order, from each orbit's trim. */
+function runBurns(sorted: readonly TrimBurn[], start: readonly OrbitTrim[], startFuel: number, ceiling: BurnCeiling): BurnRun {
+  // Each orbit's trim, set again whenever it moves, so the latest is last.
+  const trims = new Map<string, OrbitTrim>();
+  let trim: OrbitTrim | null = null;
+  for (const t of [...start].sort((a, b) => a.at - b.at)) {
+    trims.delete(orbitKey(t));
+    trims.set(orbitKey(t), t);
+    trim = t;
+  }
   let fuelDrawn = startFuel;
   const fired: TrimBurn[] = [];
   // The burns folded into `start` cannot be replayed around a burn stamped
   // before them, so it applies at the time of their last one.
-  const frontier = start ? start.at : Number.NEGATIVE_INFINITY;
+  const frontier = trim ? trim.at : Number.NEGATIVE_INFINITY;
   for (const burn of sorted) {
     // Never past what a meter reading can hold: a reading past it counts as
     // none, which would refund every burn before it.
@@ -602,15 +641,23 @@ function runBurns(sorted: readonly TrimBurn[], start: OrbitTrim | null, startFue
     fuelDrawn += burn.fuel;
     const at = burn.at < frontier ? frontier : burn.at;
     const applied = at === burn.at ? burn : { ...burn, at };
-    // A burn that would leave the band changes nothing but still pays, and
-    // the trim still dates from it: a settlement keeps the trim's time as its
-    // frontier and its last burn as the one that fired last.
-    trim = applyBurn(trim, applied) ?? heldTrim(trim, burn.dir, at);
+    // A burn starts from its own orbit's trim. One that would leave the band
+    // changes nothing but still pays, and the trim still dates from it: a
+    // settlement keeps the trim's time as its frontier and its last burn as
+    // the one that fired last.
+    const key = orbitKey(burn);
+    const before = trims.get(key) ?? null;
+    const after = applyBurn(before, applied) ?? heldTrim(before, burn.dir, at);
+    if (after) {
+      trims.delete(key);
+      trims.set(key, after);
+      trim = after;
+    }
     // It fires when it applies, so the lockout and the stick keep the same
     // time as the orbit.
     fired.push(applied);
   }
-  return { trim, fuelDrawn, fired };
+  return { trim, trims: [...trims.values()], fuelDrawn, fired };
 }
 
 /** The orbit a trim flies, dated from a later burn that changed nothing (it
@@ -634,7 +681,9 @@ function heldTrim(trim: OrbitTrim | null, dir: TrimDirection, at: number): Orbit
  * turn. A burn that would leave the band changes nothing but still pays — its
  * fuel burned wherever it fired, and a burn that arrives late (from a tab
  * that was offline) must never make an earlier one free — and the trim is
- * dated from it all the same (heldTrim).
+ * dated from it all the same (heldTrim). Each orbit keeps its own trim
+ * (BurnRun.trims): a burn starts from its own orbit's and never undoes
+ * another's.
  */
 export function replayBurns(
   burns: readonly TrimBurn[],
@@ -642,7 +691,7 @@ export function replayBurns(
   startFuel = 0,
   ceiling: number | BurnCeiling = Number.POSITIVE_INFINITY,
 ): BurnRun {
-  return runBurns([...burns].sort(burnOrder), start, startFuel, typeof ceiling === 'number' ? () => ceiling : ceiling);
+  return runBurns([...burns].sort(burnOrder), start ? [start] : [], startFuel, typeof ceiling === 'number' ? () => ceiling : ceiling);
 }
 
 /**
@@ -764,6 +813,8 @@ let heard: string | null = null;
 /** The bound room's log, replayed. */
 interface RoomReplay {
   trim: OrbitTrim | null;
+  /** Every orbit's trim (BurnRun.trims). */
+  trims: OrbitTrim[];
   fuelDrawn: number;
   /** Every burn that fired: the ones the settlement kept (or the settled
    *  trim's last burn), then the burns since, each at the time it applied
@@ -781,7 +832,7 @@ interface RoomReplay {
 }
 
 const NO_REPLAY: RoomReplay = {
-  trim: null, fuelDrawn: 0, fired: [], covered: new Set(), settledKeys: [], pending: 0, settle: () => undefined,
+  trim: null, trims: [], fuelDrawn: 0, fired: [], covered: new Set(), settledKeys: [], pending: 0, settle: () => undefined,
 };
 
 let replayed: { log: number; ship: number; replay: RoomReplay } | null = null;
@@ -800,13 +851,13 @@ function notify(): void {
 }
 
 /** Tell subscribers the replay may have moved: always when the log changes;
- *  when the fuel record or a draw meter changes, only if that moved the trim
+ *  when the fuel record or a draw meter changes, only if that moved a trim
  *  or the fuel drawn (a burn dropped, or covered again). */
 function announce(always: boolean): void {
   let now: string | null = null;
   if (docAlive()) {
-    const { trim, fuelDrawn } = replayRoom();
-    now = JSON.stringify([trim, fuelDrawn]);
+    const { trim, trims, fuelDrawn } = replayRoom();
+    now = JSON.stringify([trim, trims, fuelDrawn]);
   }
   if (!always && now === heard) return;
   heard = now;
@@ -907,7 +958,12 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   const settled = isKeepingSettlement(raw) ? raw : null;
   const legacy = map.get(TRIM_KEY);
   const before = isOrbitTrim(legacy) ? legacy : null;
-  const start = settled ? settled.trim : before;
+  // Each orbit's trim where the settlement left it, the latest among them
+  // (one from before per-orbit trims keeps that alone), or the record from
+  // before the log.
+  const start = settled
+    ? [...(settled.trims ?? []), ...(settled.trim ? [settled.trim] : [])]
+    : before ? [before] : [];
   const startFuel = settled ? settled.fuelDrawn : before?.fuelDrawn ?? 0;
   const covered = new Set(settled?.burns ?? []);
   // The covered keys still in the log are at most the settlement's; of the
@@ -936,14 +992,15 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   // them again: so the replay takes no more burns than the settlement has
   // room for, and the rest wait for the next level write.
   const taken = pending.sorted().slice(0, MAX_SETTLED_BURNS - settledKeys.length);
-  const run = runBurns(taken.map((p) => cleanBurn(p.burn)), start && cleanTrim(start), startFuel, ceiling);
+  const run = runBurns(taken.map((p) => cleanBurn(p.burn)), start.map(cleanTrim), startFuel, ceiling);
   // Anything malformed under a burn's key is covered too while there is
   // room, so the next burn clears it.
   const keys = [...settledKeys, ...taken.map((p) => p.key)];
   keys.push(...junk.sorted().slice(0, MAX_SETTLED_BURNS - keys.length));
-  const fired = [...(settled?.fired ?? (start ? [lastBurnOf(start)] : [])), ...run.fired];
+  const fired = [...(settled?.fired ?? start.map(lastBurnOf)), ...run.fired];
   return {
     trim: run.trim,
+    trims: run.trims,
     fuelDrawn: run.fuelDrawn,
     fired,
     covered,
@@ -957,9 +1014,11 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
       // stamped before then would apply, and fire, only then, so the stick
       // would never wait between them.
       const by = isBurnTime(now) ? now : Number.POSITIVE_INFINITY;
-      const trim = run.trim && cleanTrim(run.trim.at > by ? heldTrim(run.trim, run.trim.last, by)! : run.trim);
+      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? heldTrim(t, t.last, by)! : t);
       return {
-        trim,
+        trim: run.trim && held(run.trim),
+        // Every orbit's trim too, so the next replay starts each from its own.
+        trims: trimsPerOrbit(run.trims.map(held)),
         fuelDrawn: run.fuelDrawn,
         burns: [...keys],
         // The burns a settlement covers are replayed no more, so it keeps the
@@ -1010,11 +1069,15 @@ function settleLog(): KeepingSettlement | undefined {
 }
 
 /** The room's trim (its burns replayed), or null: none, unbound, or nothing
- *  well-formed. */
-export function readOrbitTrim(): OrbitTrim | null {
+ *  well-formed. Given a station, the trim on the orbit it flies (trimFor):
+ *  each orbit keeps its own, so a burn on another one (from a tab that
+ *  places the room elsewhere) never hides it. No station, no trim; left
+ *  out, the trim the last burn left, on whichever orbit. */
+export function readOrbitTrim(station?: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null): OrbitTrim | null {
   if (!docAlive()) return null;
-  const { trim } = replayRoom();
-  return trim && { ...trim };
+  const { trim, trims } = replayRoom();
+  const own = station === undefined ? trim : trims.find((t) => trimFor(station, t)) ?? null;
+  return own && { ...own };
 }
 
 /** Fuel trim burns have drawn in this room — every burn's that fired, added

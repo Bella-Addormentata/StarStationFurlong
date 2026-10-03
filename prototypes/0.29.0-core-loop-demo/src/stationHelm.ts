@@ -318,7 +318,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     return {
       bolted: deps.bolted(),
       station,
-      trim: readOrbitTrim(),
+      trim: readOrbitTrim(station),
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),

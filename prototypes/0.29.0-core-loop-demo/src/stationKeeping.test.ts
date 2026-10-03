@@ -492,7 +492,7 @@ describe('replaying the burns', () => {
   it('is each burn in time order, and the fuel of them all', () => {
     let t: OrbitTrim | null = null;
     for (const b of run) t = applyBurn(t, b);
-    expect(replayBurns(run)).toEqual({ trim: t, fuelDrawn: run.length * TRIM_FUEL, fired: run });
+    expect(replayBurns(run)).toEqual({ trim: t, trims: [t], fuelDrawn: run.length * TRIM_FUEL, fired: run });
     expect(t).toMatchObject({ dRadiusKm: TRIM_STEP_KM, at: T0 + 2 * HOUR, last: 'lower' });
   });
 
@@ -574,13 +574,14 @@ describe('replaying the burns', () => {
     expect(replayBurns(burns, null, 0, ceiling).fired).toEqual([burns[0], burns[2]]);
   });
 
-  it('a burn on another planet or slot starts from its slot, and the next one back starts over', () => {
-    const out = replayBurns([
-      burnAt(T0, 'raise'),
-      burnAt(T0 + 1_000, 'raise', { planetId: 'planet-aris', slot: 3 }),
-      burnAt(T0 + 2_000, 'lower'),
-    ]);
-    expect(out.trim).toMatchObject({ planetId: SOV, slot: 0, dRadiusKm: -TRIM_STEP_KM });
+  it('a burn on another planet or slot starts from that orbit\'s own trim, and leaves this one\'s alone', () => {
+    // Copilot's review of #173: the room kept one trim, so a burn on another
+    // orbit (from a tab that places the room in another slot) undid this
+    // one's, while the fuel of the burns undone stayed spent.
+    const aris = burnAt(T0 + 1_000, 'raise', { planetId: 'planet-aris', slot: 3 });
+    const out = replayBurns([burnAt(T0, 'raise'), aris, burnAt(T0 + 2_000, 'lower')]);
+    expect(out.trim).toMatchObject({ planetId: SOV, slot: 0, dRadiusKm: 0, at: T0 + 2_000, last: 'lower' });
+    expect(out.trims).toEqual([applyBurn(null, aris), out.trim]);
     expect(out.fuelDrawn).toBe(3 * TRIM_FUEL);
   });
 });
@@ -1001,6 +1002,7 @@ describe('level writes settle the log', () => {
     expect(isKeepingSettlement(settled)).toBe(true);
     expect(settled).toEqual({
       trim: t,
+      trims: [t],
       fuelDrawn: 3 * TRIM_FUEL,
       burns: burns.map((b) => keyOf(doc, b)),
       fired: [firedOf(burns[2])],
@@ -1210,6 +1212,67 @@ describe('level writes settle the log', () => {
     }
   });
 
+  it('each orbit keeps its own trim through burns from two slots, a REFUEL and the cleanup after it', () => {
+    // Copilot's review of #173: with one trim for the room, two owner tabs
+    // that place it in different slots undid each other's trim burn by burn,
+    // and a REFUEL kept only the last orbit's, while every burn stayed paid.
+    const OTHER = { ...STATION, orbitSlot: 1 };
+    const a = new Y.Doc();
+    const x = new Y.Doc();
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    Y.applyUpdate(x, Y.encodeStateAsUpdate(a));
+    /** One burn from a tab, planned as its helm plans it, then a sync. */
+    const fire = (doc: Y.Doc, station: typeof STATION, dir: TrimDirection, now: number): TrimBurn => {
+      bindRoom(doc);
+      const plan = planTrim(ctx({
+        station, trim: readOrbitTrim(station), fuel: readFuelLevel(), now, firing: readBurnFiring(now, station),
+      }), dir);
+      if (!plan.ok) throw new Error(`refused: ${plan.refusal}`);
+      expect(writeTrimBurn(plan.burn)).toBe(true);
+      sync(a, x);
+      return plan.burn;
+    };
+    // This tab (slot 0) RAISEs, tab X (slot 1) slides AHEAD, and this tab
+    // slides AHEAD from its raised orbit.
+    const raise = fire(a, STATION, 'raise', T0);
+    const theirAhead = fire(x, OTHER, 'ahead', T0 + BURN_MS);
+    const ahead = fire(a, STATION, 'ahead', T0 + 2 * BURN_MS);
+    const mine = applyBurn(applyBurn(null, raise), ahead)!;
+    const theirs = applyBurn(null, theirAhead)!;
+    expect(mine).toMatchObject({ slot: 0, dRadiusKm: TRIM_STEP_KM, last: 'ahead' });
+    for (const doc of [a, x]) {
+      bindRoom(doc);
+      expect(readOrbitTrim(STATION)).toEqual(mine);
+      expect(readOrbitTrim(OTHER)).toEqual(theirs);
+      expect(readOrbitTrim(null)).toBeNull();
+      expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
+    }
+    // X REFUELs: the settlement keeps both orbits' trims.
+    bindRoom(x);
+    writeFuelLevel(readFuelLevel(), 100);
+    sync(a, x);
+    expect((readFuelSettlement(SK) as KeepingSettlement).trims).toEqual([theirs, mine]);
+    // X's next burn clears the settled entries; this tab's trim stays, here,
+    // in X and after a reload.
+    const theirBack = fire(x, OTHER, 'back', T0 + 3 * BURN_MS);
+    expect(log(a).size).toBe(1);
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(a));
+    for (const doc of [a, x, reload]) {
+      bindRoom(doc);
+      expect(readOrbitTrim(STATION)).toEqual(mine);
+      expect(readOrbitTrim(OTHER)).toEqual(applyBurn(theirs, theirBack));
+    }
+    // This tab's LOWER starts from its raised orbit, and every burn paid once.
+    const lower = fire(a, STATION, 'lower', T0 + 4 * BURN_MS);
+    bindRoom(a);
+    expect(readOrbitTrim(STATION)).toEqual(applyBurn(mine, lower));
+    expect(readOrbitTrim(STATION)).toMatchObject({ dRadiusKm: 0, last: 'lower' });
+    expect(readFuelDrawn()).toBe(5 * TRIM_FUEL);
+    expect(readFuelLevel()).toBe(50 - 5 * TRIM_FUEL);
+  });
+
   it('a level write leaves the stick on the burn it showed, even for two in the same millisecond', () => {
     const a = new Y.Doc();
     const x = new Y.Doc();
@@ -1258,6 +1321,9 @@ describe('level writes settle the log', () => {
       { trim: null, fuelDrawn: 0, burns: keys, fired: [{ planetId: SOV, slot: -1, dir: 'raise', at: T0 }] },
       // Past the 256 a settlement may carry.
       { trim: null, fuelDrawn: 0, burns: keys, fired: Array.from({ length: 257 }, () => ({ planetId: SOV, slot: 0, dir: 'raise', at: T0 })) },
+      { trim: null, fuelDrawn: 0, burns: keys, trims: 'trims' },
+      { trim: null, fuelDrawn: 0, burns: keys, trims: [{ ...trim(), dRadiusKm: MAX_TRIM_KM + 1 }] },
+      { trim: null, fuelDrawn: 0, burns: keys, trims: Array.from({ length: 257 }, () => trim()) },
     ];
     for (const value of hostile) {
       expect(isKeepingSettlement(value)).toBe(false);
@@ -1456,6 +1522,7 @@ describe('a burn stamped ahead of our clock', () => {
       // Nothing it keeps is dated past the write: the trim is re-dated on
       // the same orbit, and the burn it keeps firing is the one firing now.
       expect(settled.trim).toMatchObject({ dRadiusKm: TRIM_STEP_KM, at: T0 + 1_000, last: 'back' });
+      expect(settled.trims).toEqual([settled.trim]);
       for (const t of [T0, T0 + HOUR, T0 + 30 * HOUR]) {
         expect(signedAngle(angleAt(trimmedOrbit(base, settled.trim), t) - angleAt(trimmedOrbit(base, before), t))).toBeCloseTo(0, 9);
       }
@@ -1520,6 +1587,7 @@ describe('the fuel record: one reading per meter', () => {
       settled: {
         [SK]: {
           trim: readOrbitTrim(),
+          trims: [readOrbitTrim()],
           fuelDrawn: 2 * TRIM_FUEL,
           burns: [keyOf(doc, b1), keyOf(doc, b2)],
           fired: [firedOf(b2)],
