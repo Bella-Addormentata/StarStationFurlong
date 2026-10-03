@@ -65,7 +65,8 @@ let stationCache: { planetId: string; room: string; at: number; list: FreeStatio
 /**
  * The stations around `planetId` a free-flying ship can meet: listed, not
  * between planets, and not a ship (a ship's room is listed as its own
- * one-module station: this one's, and every ship the planet summary knows).
+ * derived one-module station: this one's, and every ship the planet summary
+ * knows).
  */
 export function freeStationsAround(planetId: string, now = Date.now()): FreeStation[] {
   const room = currentRoomId();
@@ -81,7 +82,9 @@ export function freeStationsAround(planetId: string, now = Date.now()): FreeStat
   }
   const list: FreeStation[] = listStations()
     .filter((s) => planetById(s.planetId).id === planet && !stationInTransit(s, now))
-    .filter((s) => !!s.welcomeRoomId && s.welcomeRoomId !== room && !ships.has(s.welcomeRoomId))
+    // Only a derived one-module stand-in is a ship; a saved or built-in
+    // station keeps its zones whoever stands in it or claims its room.
+    .filter((s) => !!s.welcomeRoomId && (!s.derived || (s.welcomeRoomId !== room && !ships.has(s.welcomeRoomId))))
     .map((s) => ({ id: s.id, room: s.welcomeRoomId, name: s.name, pointAt: (ms: number) => stationPointAt(s, ms) }));
   stationCache = { planetId: planet, room, at: now, list };
   return list;

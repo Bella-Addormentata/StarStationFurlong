@@ -409,6 +409,8 @@ const REAL_MS_PER_ORBITAL_S = 1000 / orbitalSeconds(ORBIT_EPOCH_PLUS_1S);
  */
 function coastStep(p: FreePose, stations: readonly FreeStation[]): number {
   // Parked: no zone takes it up, so nothing to catch on the way.
+  // A frame whose station is gone: one step lets propagate drop it now.
+  if (p.near && !stations.some((s) => s.room === p.near!.room)) return 1;
   if (p.parked) return Infinity;
   if (p.near) {
     const speed = speedOf(p);

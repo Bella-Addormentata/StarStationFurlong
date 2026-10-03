@@ -3925,6 +3925,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    */
   const parkHere = (): void => {
     if (!helmIsCommander() || readFlightRecord().status !== 'free-flight') return;
+    // The brake is the engines': a ship that lost one it flies by coasts on.
+    if (!isShipReady()) {
+      flashFree('NOT SPACEWORTHY: PARK needs a FUEL TANK, ENGINE BLOCK and HELM CONSOLE mounted.');
+      if (panel) render();
+      return;
+    }
     letGo();
     const now = Date.now();
     const pose = resolvedFreePose(now);
