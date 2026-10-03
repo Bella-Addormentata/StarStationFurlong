@@ -88,7 +88,10 @@ the sources that fail have to say so on the screen.
   // the set, and the prop's texture shows what is on (the status, the countdown, the holder).
 }
 // key remote:<itemId> — its own record so a lease renewal never collides with a playback write
-{ holder: pub | '', name, leaseAt, by }
+{ holder: pub | '', name, leaseAt, by, page }
+// page: the holder's PAGE-LOAD id, never the key — two tabs of one browser share the key (the
+// seed lives in localStorage) and must not both renew, beat the clock and release on leave; a
+// hand-over writes page '' and the first of the receiver's pages to tick claims it
 // key volume:<itemId> — the set's volume (a body button anyone may press), its own key so a
 // viewer turning the sound down never carries a stale programme over the holder's seek:
 // whole-value LWW keeps one writer per key, so each thing that changes on its own has one
@@ -133,6 +136,7 @@ sources the countdown doubles as the prefetch window.
 | You hand it to someone | HAND TO… lists the room's players (v1: everyone the players map has seen — there is no liveness until S3 presence, so a remote handed to someone who has left lapses back to the set in 8 s; arm's reach comes with the rig work); the receiver's phone opens on the remote; no accept step |
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
 | You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
+| You open a second tab | The remote stays with the tab that picked it up (`page`); the other is a viewer that may take it over — one person, one place — and closing it drops nothing |
 | The TV has buttons on its body | Anyone standing at the TV can press POWER, VOLUME and INPUT without the remote |
 | The owner has the spare | The room owner may take the remote from anyone, always |
 
@@ -267,8 +271,12 @@ knows the source's position (furniture doc) and its own, subscribes within
 per-source subscriber set (a `media-sub` control kind beside `graft`/`prune`)
 and forwards frames only to subscribed links; a hub subscribes upstream for
 its spokes; with no subscriber the sender's own node drops frames at the
-source. Tiers: live (near, full stream + audio), glimpse (keyframes only,
-no second encode), far (the attract still, zero cost). The TV's live sources
+source AND tells its browser so, and the browser stops capturing and encoding
+until the first subscriber returns (restarting on a keyframe) — a node-side
+drop alone would leave the dominant CPU and battery cost in place. Tiers:
+live (near, full stream + audio), glimpse (keyframes only, no second
+encode), far (the attract still; nothing captured, nothing encoded). The
+TV's live sources
 use the same mechanism with a larger radius; voice uses an earshot radius.
 
 ## 5. Karaoke
@@ -296,9 +304,9 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 
 | Central piece | Without it |
 |---|---|
-| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list**. |
+| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and a strict build ignores the ones embedded in a pasted magnet or `.torrent` (`tr=`, `announce`) unless the operator opts in, since shipping no list suppresses nothing the metadata carries. |
 | DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full DHT node, so a room's hub is its spokes' bootstrap), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. Strict builds turn the public list off. |
-| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. rqbit's web-seed support is unverified. |
+| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins too: off in a strict build unless the operator opts in. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
 Rules: `librqbit` inside `ssf-p2p-node` as an optional cargo feature
@@ -402,11 +410,15 @@ canvas is the picture. Spectators subscribe by distance (§4): live within
 two is **also over the video** (inputs on the tick lane's extended kind,
 P1's emulator applies them): any core, no determinism work, ~50 ms input lag
 on a LAN and ~120 ms at a 40 ms round trip between the players; the game dies
-when P1 leaves. **Prerequisite:** a lane-id → player-id binding. The tick
-lane is keyed per connection today with no binding to an identity (S3
-presence), so until that lands P1 cannot tell the P2 seat's inputs from
-anyone else's; P1 accepts kind-3 inputs only from the lane bound to the
-seat's identity. Lockstep stays the upgrade for games where lag matters.
+when P1 leaves. **Prerequisite, in two parts:** first the node's SIGNED
+lane-to-key binding — M5.5's per-epoch Ed25519 binding of `origin_lane_id`
+to a trusted pubkey, carried on the reliable lane and verified before relay;
+today the id is minted unauthenticated and relayed verbatim (the M5.5-STUB
+note in `ssf-p2p-node/src/main.rs`), so an admitted neighbour can forge any
+lane, and a lookup alone would let it drive P2 — and then the S3 mapping
+from that verified key to the player holding the seat. P1 accepts kind-3
+inputs only from a lane whose signed key is the P2 seat's identity. Lockstep
+stays the upgrade for games where lag matters.
 
 **Sources.** The archive.org embed (`archive.org/embed/<id>`) is single-player
 only (cross-origin, no input injection, no CRT). The ROM file loaded into an
