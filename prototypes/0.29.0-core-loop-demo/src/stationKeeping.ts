@@ -13,8 +13,8 @@
  * createHelmUI), which the station face keeps one tab away. "Bolted" is the
  * line the ship helm already draws when it says a bolted module cannot fly,
  * except that a pairing whose address names no room (none at all, or one the
- * atlas cannot read) joins nothing, and a connection flagged as a berth at
- * either end is a berth, as in the atlas.
+ * atlas cannot read) or names the room itself joins nothing, and a connection
+ * flagged as a berth at either end is a berth, as in the atlas.
  *
  * THE ORBIT. Stations fly perfect circles (orbits.ts, owner pick 2026-09-27):
  * a station's slot fixes its radius and its phase. Station keeping adds a
@@ -110,16 +110,19 @@ const DEG = Math.PI / 180;
 
 /**
  * Is this module part of a station's structure? True when any of its doors is
- * paired to a room through a connection that is not a berth — the same line
- * station grouping draws. The atlas joins rooms only through an address that
- * names a room (stationAtlas.roomIdFromSeed), and calls a connection a berth
- * when EITHER end says so (stationAtlas.berthDoorIds): a transient guest
- * berth or a docking-adapter chain is a ship calling, not structure. Given
- * the room's id, its live records are matched with what the atlas holds of
- * the far rooms the way the atlas matches them, so a berth flagged only at
- * the far end is a berth, and a permanent gangway between the same two rooms
- * still joins them; pass readAllDoors' map, whose keys are the door ids a far
- * record can name. Without the room's id, only its own flags count.
+ * paired to another room through a connection that is not a berth — the same
+ * line station grouping draws. The atlas joins rooms only through an address
+ * that names a room (stationAtlas.roomIdFromSeed), and calls a connection a
+ * berth when EITHER end says so (stationAtlas.berthDoorIds): a transient
+ * guest berth or a docking-adapter chain is a ship calling, not structure.
+ * Given the room's id, a pairing addressed back to the room itself joins
+ * nothing (the atlas still finds the room alone), and its live records are
+ * matched with what the atlas holds of the far rooms the way the atlas
+ * matches them, so a berth flagged only at the far end is a berth, and a
+ * permanent gangway between the same two rooms still joins them; pass
+ * readAllDoors' map, whose keys are the door ids a far record can name.
+ * Without the room's id, only its own flags count, and a pairing back to the
+ * room itself cannot be told apart.
  */
 export function isBoltedIntoStation(
   doors: Iterable<DoorRecord> | ReadonlyMap<string, DoorRecord>,
@@ -135,7 +138,8 @@ export function isBoltedIntoStation(
   for (const [doorId, rec] of records) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     const target = namedRoom(rec.connectedRoomAddress);
-    if (!target) continue;
+    // A pairing back to the room itself joins it to no other room.
+    if (!target || target === roomId) continue;
     live[doorId] = {
       targetSeed: rec.connectedRoomAddress,
       targetRoomId: target,

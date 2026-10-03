@@ -221,6 +221,18 @@ describe('which face the helm shows', () => {
     expect(isBoltedIntoStation(new Map([['west', toStation({ farDoor: 'east' })]]), here, namedAtlas)).toBe(false);
   });
 
+  it('a pairing addressed back to the room itself joins nothing', () => {
+    // Copilot's review of #173: the atlas still finds such a room alone, so
+    // its helm must not trim a station's orbit.
+    const here = 'room-ship';
+    const self = new Map<string, DoorRecord>([['west', { paired: true, connectedRoomAddress: seedFor(here) }]]);
+    expect(isBoltedIntoStation(self, here, {})).toBe(false);
+    expect(steersStation(here, self, {}, [])).toBe(false);
+    // A gangway to another room beside it still bolts the module.
+    const both = new Map<string, DoorRecord>([...self, ['north', { paired: true, connectedRoomAddress: seedFor('room-station') }]]);
+    expect(isBoltedIntoStation(both, here, {})).toBe(true);
+  });
+
   it('a station\'s own welcome room steers the station even standing alone; any other lone room flies', () => {
     // Dorkmo's "Fly and park" (free flight, #203): a one-module station
     // keeps its orbit with the trim stick too, its ship face a tab away.
