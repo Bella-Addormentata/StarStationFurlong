@@ -340,6 +340,7 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [dock('pod')], atlas)).toBeNull();
     // …a station never moves to the ship visiting it…
     expect(dockedStationFor('b1', [dock('ship')], atlas)).toBeNull();
+    expect(dockedStationFor('b1', [dock('a1')], atlas)).toBeNull(); // nor to one it docks at, so it tows none
     expect(dockedStationFor('a2', [dock('ship')], atlas)).toBeNull();
     expect(dockedStationFor('a2', [dock('b1')], atlas)).toBeNull(); // the atlas holds its gangway
     // …a module bolted into structure is the atlas's to place, and undocked

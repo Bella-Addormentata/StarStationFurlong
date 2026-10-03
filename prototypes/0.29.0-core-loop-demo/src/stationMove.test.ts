@@ -58,6 +58,8 @@ import {
   MOVE_SETTLED_KEEP,
   SWEEP_BATCH,
   rememberMove,
+  rememberMovesIn,
+  roomDocLockedByMove,
   subscribeStationMove,
   writeStationMove,
 } from './stationMove';
@@ -497,6 +499,45 @@ describe('the station list follows a move', () => {
     expect(listed.filter((s) => s.planetId === ARIS)).toHaveLength(0);
   });
 
+  it('counts each station where it was when an arrival got there, whatever pin it carries now', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = move.arriveAt;
+    // k0 held Aris slot 0 when this station got there, and left it for
+    // Sovereign only later: a late install reads its arrival pin there.
+    const left: StationMove = {
+      stationId: 'k0', welcomeRoomId: 'k0', fromPlanetId: ARIS, fromSlot: 0, toPlanetId: SOV, toSlot: 5,
+      departAt: T + 1000, arriveAt: T + 5000, mode: 'thrusters', bookedAt: T + 1000, fuel: 1, fuelDrawn: 1,
+    };
+    const pin: StationMove = {
+      ...left, fromPlanetId: SOV, fromSlot: 5, departAt: left.arriveAt, arriveAt: left.arriveAt + 1,
+      bookedAt: left.arriveAt + 10, settles: left, fuel: 0, fuelDrawn: 0,
+    };
+    // A tow of k0 leaving the moment this station got there, cancelled: k0
+    // never left.
+    const tow: StationMove = { ...left, mode: 'tug', tugRoomId: 'tug-room', departAt: T, bookedAt: T };
+    const cancel: StationMove = {
+      ...tow, mode: 'thrusters', tugRoomId: undefined, toPlanetId: ARIS, toSlot: 0, departAt: T + 1, arriveAt: T + 2,
+      bookedAt: T + 10, settles: tow, fuel: 0, fuelDrawn: 0,
+    };
+    for (const k0 of [pin, cancel]) {
+      store.clear();
+      setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'k0' ? k0 : null));
+      setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+      const listed = listStations({}, [], pin.arriveAt + 1);
+      expect(listed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    }
+    // k0 got to Aris that same moment, found it full and went home: from
+    // then on its pin says where it is, never the planet it bounced off.
+    const bounced: StationMove = { ...left, fromPlanetId: SOV, fromSlot: 5, toPlanetId: ARIS, toSlot: 0, departAt: move.departAt, arriveAt: T, bookedAt: move.departAt };
+    const home: StationMove = {
+      ...bounced, toPlanetId: SOV, toSlot: 5, departAt: T, arriveAt: T + 1, bookedAt: T + 10, settles: bounced, fuel: 0, fuelDrawn: 0,
+    };
+    store.clear();
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'k0' ? home : null));
+    setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: i ? ARIS : SOV, orbitSlot: i || 5 })));
+    expect(listStations({}, [], T + 2).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS });
+  });
+
   it('settles an arrival next to a station heard of as an install listing it does', () => {
     // Furlong books Aris slot 3; a station registered there since is listed
     // on one install and only heard of on another.
@@ -758,6 +799,33 @@ describe('moves between installs', () => {
     doc.getMap('stationSummaries').set('yard-lobby', summary);
     bindPlanetSummaryDoc(doc, { currentStation: () => null, localTrim: () => null, ship: () => null });
     expect(readRememberedMoves()).toEqual([move]);
+  });
+
+  it('holds a dock at any room of a station a far room\'s summaries say is moving, and learns that move', () => {
+    const move = yardMove();
+    rememberMove(move);
+    const summary = summaryForStation(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!, null, NOW);
+    expect(summary.move).toEqual(move);
+    store.clear();
+    // The berth's room: nothing booked there, the move only gossiped. Its
+    // station is listed here, with the second room the ship docks at.
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('yard-lobby', summary);
+    store.set('ssf-station-atlas', JSON.stringify({
+      'yard-lobby': { roomId: 'yard-lobby', name: 'LOBBY', doors: { 'x+': { targetSeed: 'ssf://room#room=yard-annex', targetRoomId: 'yard-annex' } }, lastSeen: 0 },
+      'yard-annex': { roomId: 'yard-annex', name: 'ANNEX', doors: {}, lastSeen: 0 },
+    }));
+    expect(registerStation(yard('mine-1'))).toBe(true);
+    const mid = Math.floor((move.departAt + move.arriveAt) / 2);
+    expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.departAt - 1)).toBe(false);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.arriveAt)).toBe(false);
+    expect(roomDocLockedByMove(new Y.Doc(), 'yard-annex', mid)).toBe(false);
+    // Refused there, this install remembers it, and so carries it on.
+    expect(readRememberedMoves()).toEqual([]);
+    rememberMovesIn(doc);
+    expect(readRememberedMoves()).toEqual([move]);
+    expect(roomDocLockedByMove(new Y.Doc(), 'yard-annex', mid)).toBe(true);
   });
 
   it('carries a derived station\'s move although its first record stands', () => {

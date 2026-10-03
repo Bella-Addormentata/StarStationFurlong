@@ -559,29 +559,33 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
 }
 
 /** dockLockedByMove for a room whose own doc is in hand: a far room's,
- *  fetched for a DOCK (farDoorWrite). The moves booked in that room count
- *  with every move known here, so a ship that has not heard of one yet
- *  still joins no station between planets: a tow that room is the tug of,
- *  ahead or under way, or a move of its station in transit. Its station is
- *  the one this install lists the room at, else the one its own moves name
- *  (a move is booked from a room of its station, a tow from the tug). */
+ *  fetched for a DOCK (farDoorWrite). The moves booked in that room, and
+ *  those its planet summaries gossip (docSummaryMoves: booked in another
+ *  room of its station, or a tug's), count with every move known here, so
+ *  a ship that has not heard of one yet still joins no station between
+ *  planets: a tow that room is the tug of, ahead or under way, or a move of
+ *  its station in transit. Its station is the one this install lists the
+ *  room at, else the one whose welcome room it is, else the one its own
+ *  moves name (a move is booked from a room of its station, a tow from the
+ *  tug). */
 export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
   const there = docOwn(doc);
-  const all = [...there, ...roomOwn(), ...readRememberedMoves()];
+  const all = [...there, ...docSummaryMoves(doc), ...roomOwn(), ...readRememberedMoves()];
   const standing = standingMoves(all, all);
   if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
   const station = roomId ? stationForRoom(roomId) : null;
   const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
   const ofRoom = (m: StationMove) => (station
     ? moveBelongsTo(m, station)
-    : there.some((o) => !towedBy(o) && sameStation(o, m)));
+    : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !towedBy(o) && sameStation(o, m)));
   return standing.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs));
 }
 
-/** Remember the standing moves a room's own doc holds (a far room's), as
- *  the bound room's are (bindStationMoveDoc). */
+/** Remember the standing moves a room's own doc holds (a far room's), and
+ *  those its planet summaries gossip, as the bound room's are
+ *  (bindStationMoveDoc, planetSummary): this install then carries them on. */
 export function rememberMovesIn(doc: Y.Doc): void {
-  const own = docOwn(doc);
+  const own = [...docOwn(doc), ...docSummaryMoves(doc)];
   for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
 }
 
@@ -590,6 +594,27 @@ function docOwn(doc: Y.Doc): StationMove[] {
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return [];
   const { entries, legacy, folded } = movesIn(doc.getMap('stationMoves'), doc.getMap('stationKeeping'));
   return [...(legacy ? [legacy] : []), ...entries, ...folded];
+}
+
+/** Planet summaries one read visits: planetSummary's own pull bound. */
+const SUMMARY_SCAN_MAX = 256;
+
+/** The moves a room's doc gossips in its planet summaries (planetSummary.ts:
+ *  each station's latest, under its welcome room), checked as that module's
+ *  pull checks them. Every client standing in a room publishes there its
+ *  own station's move and every move it remembers, so a move booked in
+ *  another room of the station, or in a tug's, reaches the room this way. */
+function docSummaryMoves(doc: Y.Doc): StationMove[] {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return [];
+  const out: StationMove[] = [];
+  let scanned = 0;
+  for (const [k, v] of doc.getMap('stationSummaries').entries()) {
+    if (++scanned > SUMMARY_SCAN_MAX) break;
+    if (typeof v !== 'object' || v === null || (v as { welcomeRoomId?: unknown }).welcomeRoomId !== k) continue;
+    const m = validMove((v as { move?: unknown }).move);
+    if (m && m.welcomeRoomId === k) out.push(m);
+  }
+  return out;
 }
 
 /** Is any of these rooms a tug whose tow is under way (or about to leave),

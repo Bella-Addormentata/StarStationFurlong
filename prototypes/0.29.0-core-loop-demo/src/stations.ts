@@ -694,14 +694,20 @@ function placeStations(
       const taken = new Set<number>();
       candidates.forEach((o, j) => {
         if (j === i) return;
+        // An arrival pin names only the planet its journey got to: before
+        // then, the journey says where the station was (still where it left
+        // from, or between planets). A cancel pin (it leaves before the move
+        // it settles arrives) says where its station stayed all along.
+        const pinned = o.move?.settles;
+        const om = pinned && o.move!.departAt >= pinned.arriveAt && T < pinned.arriveAt ? pinned : o.move;
         // One between planets at T held no slot anywhere: first, since one
         // still on its way now is listed where it left from.
-        if (stationInTransit({ move: o.move ?? undefined }, T)) return;
+        if (stationInTransit({ move: om ?? undefined }, T)) return;
         if (settledAt(o) <= T) {
           if (spots[j]?.planetId === dest) taken.add(spots[j]!.orbitSlot);
           return;
         }
-        const place = placeWithMove(o.base, o.move, T);
+        const place = placeWithMove(o.base, om, T);
         if (planetById(place.planetId).id === dest) taken.add(place.orbitSlot);
       });
       outcome = taken.size >= MAX_ORBIT_SLOTS ? 'bounced' : 'arrived';

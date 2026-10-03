@@ -64,7 +64,7 @@ import {
   writeStationMove,
 } from './stationMove';
 import type { TowContext } from './stationMove';
-import { currentRoomId, listStations as listStationRecordsNow, planetById, stationInTransit } from './stations';
+import { currentRoomId, dockedStationFor, listStations as listStationRecordsNow, planetById, stationInTransit } from './stations';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
@@ -2719,11 +2719,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const towContext = (engines: number, fuel: number, commander: boolean, now: number): TowContext => {
     const stations = listStationRecordsNow();
     const hereId = stationHere();
-    // Only a free ship tows: a module bolted on by a gangway is part of a
-    // station (whose helm shows this face on its FUEL & DOCKING tab), and a
-    // station never tows another.
+    // Only a free ship tows, and only the station its docks carry it along
+    // with (stations.dockedStationFor), so the tug moves with its tow: a
+    // module bolted on by a gangway is part of a station (whose helm shows
+    // this face on its FUEL & DOCKING tab), and a station's own welcome room
+    // stays put whatever it is docked to, so a station never tows another.
     const bolted = (docking?.connected() ?? []).some((m) => !m.dock);
-    const station = hereId && !bolted ? stations.find((st) => st.id === hereId) ?? null : null;
+    const carried = hereId && !bolted ? dockedStationFor(currentRoomId(), readAllDoors().values()) : null;
+    const station = carried && carried === hereId ? stations.find((st) => st.id === hereId) ?? null : null;
     return {
       station,
       stations,

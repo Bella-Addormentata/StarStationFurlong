@@ -245,6 +245,30 @@ describe('applyFarDockRequest — DOCK into a room between planets', () => {
     expect(dockAt(bookedRoom({ ...transit, welcomeRoomId: 'elsewhere' }), home, now).wrote).toBe(true);
   });
 
+  it('reads the moves its planet summaries gossip — booked in another room of its station, or in a tug', () => {
+    /** Nothing booked in the berth's room: the move only gossiped there, under `key`. */
+    const heardRoom = (key: string, move: StationMove): Y.Doc => {
+      const doc = bookedRoom();
+      doc.getMap('stationSummaries').set(key, {
+        welcomeRoomId: key, name: 'HOME', planetId: 'planet-sovereign', orbitSlot: 1, updatedAt: now, move,
+      });
+      return doc;
+    };
+    const doc = heardRoom(STATION, transit);
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc, STATION, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    const home = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const ours = { ...transit, stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: home };
+    expect(dockAt(heardRoom(home, ours), home, now).result).toEqual({ ok: false, reason: 'moving' });
+    const tow: StationMove = { ...transit, mode: 'tug', tugRoomId: TUG, departAt: now, arriveAt: now + 600_000, bookedAt: now };
+    expect(dockAt(heardRoom(STATION, tow), TUG, now).result).toEqual({ ok: false, reason: 'moving' });
+    // Another station's move, and a move filed under another station's
+    // room, hold nothing here.
+    expect(dockAt(heardRoom('elsewhere', { ...transit, welcomeRoomId: 'elsewhere' }), STATION, now).wrote).toBe(true);
+    expect(dockAt(heardRoom('elsewhere', transit), STATION, now).wrote).toBe(true);
+  });
+
   it('refuses a tug whose tow is booked or under way — not one whose station since moves on its own', () => {
     const tow: StationMove = { ...transit, mode: 'tug', tugRoomId: TUG, departAt: now, arriveAt: now + 600_000, bookedAt: now };
     expect(dockAt(bookedRoom(tow), TUG, now).result).toEqual({ ok: false, reason: 'moving' });
