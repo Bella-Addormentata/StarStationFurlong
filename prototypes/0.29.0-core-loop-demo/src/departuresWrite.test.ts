@@ -4,8 +4,9 @@
  * (one snapshot for several writes), the stop the change concerns first and
  * every other stop once it has answered, only the newest snapshot waiting
  * behind a busy room, two retries of an unreachable one, nothing for a room
- * it holds no pass for or once it has left the ship. And shipRoute tells it
- * about each of this game's own writes.
+ * it holds no pass for or once it has left the ship, and each stop's pass
+ * kept from the snapshot's taking. And shipRoute tells it about each of this
+ * game's own writes.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
@@ -312,6 +313,31 @@ describe('the departures publisher', () => {
     g.setShip('another-room');
     await g.tick();
     expect(g.calls).toHaveLength(0);
+  });
+
+  // Copilot (PR 180): a pass only the ship's ports remember is gone once the
+  // rider leaves the ship's room (or the port is retargeted), but a snapshot
+  // taken before still reaches every stop it could reach then.
+  it('🎫 a pass held as the snapshot was taken still serves its later sends once it is gone; one gained since serves a stop that had none', async () => {
+    const held = new Set(['room-0', 'room-1']);
+    const h = harness({ seedFor: (room) => (held.has(room) ? `pass:${room}` : undefined) });
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick(); // the snapshot goes to room-1 first, and stays in flight
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1']);
+    // The rider walks out of the ferry into room-2: the berths its ports
+    // remember go with it, and this game holds its own pass for room-2.
+    held.clear();
+    held.add('room-2');
+    await h.answer(0, 'unreachable'); // room-1 missed it, and so does room-0:
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-0', 'pass:room-2']);
+    await h.answer(1, 'unreachable');
+    await h.answer(2, 'written');
+    await h.tick(DEPARTURES_RETRY_MS[0]); // their retries keep the passes
+    expect(h.calls.map((c) => c.address)).toEqual([
+      'pass:room-1', 'pass:room-0', 'pass:room-2', 'pass:room-1', 'pass:room-0',
+    ]);
+    expect(h.calls.every((c) => c.pub === h.calls[0].pub)).toBe(true);
+    expect(JSON.stringify(h.calls[0].pub)).not.toContain('pass:');
   });
 
   it('⛽ a tank fitted or taken off while the route runs republishes the capacity, from the game that edits the ship', async () => {
