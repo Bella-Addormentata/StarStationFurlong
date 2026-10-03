@@ -225,4 +225,15 @@ describe('atlasForBundle', () => {
     expect(Object.keys(bundle).sort()).toEqual(['hub', 'welcome']);
     expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
   });
+
+  it('exports a room named __proto__ under its own key', () => {
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: { roomId: 'welcome', name: 'W', doors: { 'd:1': door('__proto__', 'd:2') }, lastSeen: now },
+      ['__proto__']: { roomId: '__proto__', name: 'P', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['__proto__', 'welcome']);
+    expect(parseBundledAtlas(JSON.parse(JSON.stringify(bundle))).map((e) => e.roomId).sort())
+      .toEqual(['__proto__', 'welcome']);
+  });
 });

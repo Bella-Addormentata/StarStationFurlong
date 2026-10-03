@@ -197,7 +197,8 @@ export function atlasForBundle(
   atlas: Record<string, AtlasEntry>,
   welcomeRoomId: string,
 ): Record<string, BundledAtlasEntry> {
-  const out: Record<string, BundledAtlasEntry> = {};
+  // No prototype, like readAtlas's map: a room `__proto__` is a key here too.
+  const out: Record<string, BundledAtlasEntry> = Object.create(null);
   if (!welcomeRoomId || !atlas[welcomeRoomId]) return out;
   const component = atlasComponent(atlas, welcomeRoomId);
   const berths = berthDoorIds(atlas);
