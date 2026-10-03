@@ -13,7 +13,7 @@ import {
   setTvHostPredicate, setTvIdentity, setTvPageId, sourceFileUrl, sourceLabel, subscribeTvKey, tvHeartbeat,
   tvKey, tvPause, tvPlay, tvResume, tvSchedule, tvScreenView, tvSeek, tvSetVolume, tvStop,
   tvTogglePower, TV_HEARTBEAT_MS, TV_HISTORY_MAX, TV_LEASE_LAPSE_MS, TV_RTT_LEAD_CAP_MS,
-  TV_SEEK_OVER_MS, volumeKey,
+  TV_SEEK_OVER_MS, powerKey, tvRevision, volumeKey,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 
@@ -220,8 +220,11 @@ describe('the programme', () => {
     expect(readTv(TV)).toMatchObject({ seq: 6, started: 6, jump: 5 });
     tvStop(TV);
     expect(readTv(TV).jump).toBe(6);
+    // POWER is its own key: it moves the lookup revision, never the programme.
+    const revision = tvRevision(TV);
     tvTogglePower(TV);
-    expect(readTv(TV).jump).toBe(7);
+    expect(readTv(TV).jump).toBe(6);
+    expect(tvRevision(TV)).not.toBe(revision);
   });
 
   it('schedules a start only in the future, and the countdown reads from the record alone', () => {
@@ -266,10 +269,15 @@ describe('the programme', () => {
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 60_000);
     iAm(BOB, 'Bob'); // not the holder
+    const revision = tvRevision(TV);
     expect(tvTogglePower(TV)).toBe(false);
     expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: 60_000 });
+    expect(tvRevision(TV)).not.toBe(revision); // a lookup in flight is void
+    expect(tvHeartbeat(TV, 61_000)).toEqual({ ok: false, error: 'Alice has the remote.' });
     expect(tvTogglePower(TV)).toBe(true);
-    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 60_000 });
+    // The switch is its own key: the programme comes back as it was, and the
+    // holder's tick parks it (tvSession); nothing of the programme's was written.
+    expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 60_000 });
     tvSetVolume(TV, 180);
     expect(readTv(TV).volume).toBe(100);
     tvSetVolume(TV, -3);
@@ -291,6 +299,8 @@ describe('the programme', () => {
       source: { kind: 'bogus', url: 'file:///etc/passwd' }, state: 'playing', positionMs: -9, seq: 'x',
       history: [{ source: { kind: 'url', url: 'javascript:1' } }, 7], volume: 'loud',
     });
+    expect(readTv(TV).state).toBe('off'); // the switch was never turned on
+    doc.getMap('tv').set(powerKey(TV), { on: true, seq: 1 });
     const rec = readTv(TV);
     expect(rec.source).toBeNull();
     expect(rec.state).toBe('home'); // "playing" nothing is the home screen
@@ -317,6 +327,41 @@ describe('the programme', () => {
     expect(readTv(TV).volume).toBe(70);
     doc.getMap('tv').set(volumeKey(TV), { volume: 250 });
     expect(readTv(TV).volume).toBe(100);
+  });
+
+  it('a peer\'s garbage power record reads as off', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    doc.getMap('tv').set(powerKey(TV), { on: 'yes', seq: -2 });
+    expect(readTv(TV).state).toBe('off');
+    expect(tvHeartbeat(TV, 1_000)).toEqual({ ok: false, error: 'The set is off.' });
+  });
+
+  it('a power press on one device never undoes the holder\'s heartbeat on another, nor the other way round', () => {
+    // Alice (the holder) beats on her doc while Bob switches the set off on
+    // his, offline; synced both ways, the set is off AND Alice's position
+    // stands — the switch has a key of its own, so the two never met.
+    const alice = doc;
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    const bob = new Y.Doc();
+    Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+    bindTvDoc(bob);
+    iAm(BOB, 'Bob');
+    expect(tvTogglePower(TV)).toBe(false);
+    bindTvDoc(alice);
+    iAm(ALICE, 'Alice');
+    expect(tvHeartbeat(TV, 45_000)).toEqual({ ok: true }); // from her pre-update doc
+    Y.applyUpdate(alice, Y.encodeStateAsUpdate(bob));
+    Y.applyUpdate(bob, Y.encodeStateAsUpdate(alice));
+    for (const d of [alice, bob]) {
+      bindTvDoc(d);
+      expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: 45_000, source: FILM });
+    }
+    bindTvDoc(bob);
+    iAm(BOB, 'Bob');
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 45_000 }); // back as it was
   });
 
   it('a volume press on one device never carries a stale programme over a seek on another', () => {

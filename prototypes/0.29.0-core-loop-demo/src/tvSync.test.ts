@@ -450,6 +450,24 @@ describe('the holder as the room\'s clock', () => {
     expect(h.beats).toEqual([0]); // the room follows the player
   });
 
+  it('a seek still landing is not forgotten by a pause: the paused position is re-aimed, and the old seek never lands over it', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const h = harness(p, { hold: true });
+    h.tick(); // the baseline beat, at 0
+    h.transport({ positionMs: 30_000 }); // a seek, in flight
+    h.tick();
+    h.transport({ state: 'paused', positionMs: 0, running: false }); // paused where the player still reads: 0
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:30000', 'seek:0']);
+    h.transport({ state: 'playing', positionMs: 0, running: true }); // resumed before anything landed
+    h.tick();
+    p.land(); // the newest seek is what lands
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.position).toBe(0);
+    expect(h.beats).toEqual([0, 0]);
+  });
+
   it('a player with no clock (the archive embed) is played and never beats', () => {
     const p = new FakePlayer(false, false, false);
     const h = harness(p, { hold: true });

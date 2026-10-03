@@ -47,9 +47,10 @@ interface YtNamespace {
 type WindowWithYt = Window & { YT?: YtNamespace; onYouTubeIframeAPIReady?: () => void };
 
 const YT_API_URL = 'https://www.youtube.com/iframe_api';
-/** The API script can load while the nocookie iframe never says ready
- *  (blocked, broken): a player that stays silent this long has failed. */
-const YT_READY_TIMEOUT_MS = 20_000;
+/** A player that stays silent this long has failed: the YouTube API script
+ *  can load while the nocookie iframe never says ready, and a host can
+ *  accept a media request and never deliver metadata nor an error. */
+const MEDIA_READY_TIMEOUT_MS = 20_000;
 let ytLoading: Promise<YtNamespace> | null = null;
 
 /** Load the IFrame API script once. Rejects when it cannot be reached (no
@@ -110,7 +111,7 @@ class YouTubePlayerAdapter implements Adapter {
     // notice, silence the headless beat and offer no RETRY, for good.
     this.readyTimer = window.setTimeout(() => {
       if (!this.ready) onFail("YouTube's player did not become ready");
-    }, YT_READY_TIMEOUT_MS);
+    }, MEDIA_READY_TIMEOUT_MS);
     // The `origin` guard only makes sense from an http(s) page; a custom
     // scheme (tauri://) must not send one YouTube will refuse.
     if (location.protocol === 'https:' || location.protocol === 'http:') playerVars.origin = location.origin;
@@ -163,6 +164,7 @@ class HtmlVideoPlayerAdapter implements Adapter {
   readonly video: HTMLVideoElement;
   /** The browser refused play() without a gesture: the panel shows TAP TO PLAY. */
   blocked = false;
+  private readonly readyTimer: number;
 
   constructor(host: HTMLElement, url: string, onFail: (why: string) => void, private onBlocked: () => void) {
     const v = document.createElement('video');
@@ -172,6 +174,14 @@ class HtmlVideoPlayerAdapter implements Adapter {
     v.controls = false;
     v.style.cssText = 'width:100%; height:100%; background:#000; display:block;';
     v.addEventListener('error', () => onFail('This file would not play here (format or host)'));
+    // Bounded readiness, through the attempt-scoped failure path: a host can
+    // accept the request and never deliver metadata nor an error, which
+    // would leave the theatre blank with no RETRY and the holder's headless
+    // beat silenced by an adapter that is never ready.
+    this.readyTimer = window.setTimeout(() => {
+      if (v.readyState < 1) onFail('The file did not start loading (no metadata after 20 s)');
+    }, MEDIA_READY_TIMEOUT_MS);
+    v.addEventListener('loadedmetadata', () => window.clearTimeout(this.readyTimer), { once: true });
     host.appendChild(v);
     this.video = v;
   }
@@ -198,6 +208,7 @@ class HtmlVideoPlayerAdapter implements Adapter {
   setRate(rate: number): void { this.video.playbackRate = rate; }
   setVolume(volume: number): void { this.video.volume = Math.min(1, Math.max(0, volume / 100)); }
   destroy(): void {
+    window.clearTimeout(this.readyTimer);
     this.video.pause();
     this.video.removeAttribute('src');
     this.video.load();
@@ -304,6 +315,9 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   });
   document.body.appendChild(root);
   const onKey = (e: KeyboardEvent) => {
+    // The phone open above the theatre (a hand-over pops it open without
+    // closing this) owns Tab and Escape: its handlers close it or go home.
+    if (document.getElementById('spacephone-container')?.classList.contains('active')) return;
     if (e.key === 'Escape') {
       e.stopPropagation();
       closeTvTheatre();
@@ -355,9 +369,11 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   updateTvChip([itemId]);
 }
 
-/** The theatre's controls in Tab order: its buttons and the volume slider. */
+/** The theatre's controls in Tab order: its buttons, the volume slider and
+ *  the embedded player itself (an iframe takes focus, and the archive
+ *  embed's own controls — its volume among them — live inside it). */
 function theatreFocusable(root: HTMLElement): HTMLElement[] {
-  return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled])')];
+  return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), iframe')];
 }
 
 export function closeTvTheatre(): void {
@@ -435,7 +451,12 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
     // Only a player with a clock becomes the room's clock; the archive embed
     // reports nothing, so the headless heartbeat (tvSession) keeps beating.
     // The phone's transport asks this player where it is, not the record.
-    if (player.hasClock) t.unregister = registerTvPlayerOfRecord(t.itemId, () => player.currentMs());
+    if (player.hasClock) {
+      t.unregister = registerTvPlayerOfRecord(t.itemId, {
+        positionMs: () => player.currentMs(),
+        canSeek: () => player.canSeek,
+      });
+    }
   };
   if (source.kind === 'youtube') {
     showNotice(t, `<div>REACHING YOUTUBE…</div><div class="tv-theatre-lane">CONVENIENCE LANE</div>`);
@@ -527,7 +548,7 @@ function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refus
   const asking = t.notice.hidden ? null : t.notice.querySelector<HTMLButtonElement>('[data-tv-allow]');
   if (asking && asking.dataset.tvAllow === origin) return;
   showNotice(t, `<div>PLAY FROM ${escapeHtml(host)}?</div>
-    <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — your browser would fetch this from ${escapeHtml(host)}; whoever pasted it cannot decide that for you</div>
+    <div class="tv-theatre-lane">${escapeHtml(sourceLane(source))} LANE — your browser would fetch this from ${escapeHtml(host)}, which could send it anywhere, your own network included; whoever pasted it cannot decide that for you</div>
     <button type="button" data-tv-allow="${escapeHtml(origin)}">▶ PLAY FROM ${escapeHtml(host)}</button>`);
   t.notice.querySelector<HTMLButtonElement>('[data-tv-allow]')?.addEventListener('click', () => {
     acceptMediaOrigin(origin);

@@ -17,11 +17,11 @@ import {
   formatClock, handRemote, iHoldRemote, isStartOnly, mayPickUpRemote, parseTvSource, pickUpRemote,
   putDownRemote, readPlayback, readRemote, readTv, remoteKey, remoteLapsed, sanitizeSource,
   sourceLabel, sourceLane, subscribeTv, subscribeTvKey, tvDocEpoch, tvKey, tvPause, tvPlay,
-  tvResume, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, volumeKey,
+  tvResume, tvRevision, tvSchedule, tvSeek, tvSetVolume, tvStop, tvTogglePower, powerKey, volumeKey,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
-import { tvPlayerPositionMs } from './tvSession';
+import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
 
 const GOLD = '#d4a84b';
@@ -194,13 +194,16 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
     const mayPick = !mine && mayPickUpRemote(deps.itemId);
     const owner = deps.canEdit();
     const lane = rec.source ? laneBadge(sourceLane(rec.source)) : '';
+    // archive.org's own player takes no volume from the set: its buttons
+    // would change the room's number and not the sound.
+    const volumeless = rec.source ? isStartOnly(rec.source) : false;
     const html = `
       ${title(`📺 ${esc(deps.label)}`, statusSpan(deps.itemId))}
       <div style="display:flex; gap:6px; align-items:center;">
         ${smallButton('data-tv-power="1"', rec.state === 'off' ? '⏻ POWER ON' : '⏻ POWER OFF')}
-        ${smallButton('data-tv-vol-down="1"', '🔉 −', rec.state !== 'off')}
+        ${volumeless ? `<span style="font-size:9px; color:${DIM};">volume: in archive.org's player</span>` : `${smallButton('data-tv-vol-down="1"', '🔉 −', rec.state !== 'off')}
         <span style="font-size:10px; color:${GOLD_BRIGHT}; min-width:30px; text-align:center;">${rec.volume}%</span>
-        ${smallButton('data-tv-vol-up="1"', '🔊 +', rec.state !== 'off')}
+        ${smallButton('data-tv-vol-up="1"', '🔊 +', rec.state !== 'off')}`}
         ${lane}
       </div>
       <div style="font-size:9px; color:${DIM}; line-height:1.4;">The set's own buttons — no remote needed.</div>
@@ -223,7 +226,10 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
       panel.querySelector<HTMLButtonElement>('[data-tv-vol-down]')?.addEventListener('click', () => { tvSetVolume(deps.itemId, readTv(deps.itemId).volume - 10); });
       panel.querySelector<HTMLButtonElement>('[data-tv-vol-up]')?.addEventListener('click', () => { tvSetVolume(deps.itemId, readTv(deps.itemId).volume + 10); });
       panel.querySelector<HTMLButtonElement>('[data-tv-watch]')?.addEventListener('click', () => deps.openTheatre());
-      panel.querySelector<HTMLButtonElement>('[data-tv-open-remote]')?.addEventListener('click', () => deps.openRemote());
+      panel.querySelector<HTMLButtonElement>('[data-tv-open-remote]')?.addEventListener('click', () => {
+        selectTvRemote(deps.itemId); // this set's remote, not an earlier held one
+        deps.openRemote();
+      });
       wireRemoteActions(panel, deps.itemId, note);
     }
     refreshStatus(panel);
@@ -241,6 +247,7 @@ export function createSmartTvUI(deps: TvDeviceDeps): DeviceUI {
         subscribeTvKey(tvKey(deps.itemId), render),
         subscribeTvKey(remoteKey(deps.itemId), render),
         subscribeTvKey(volumeKey(deps.itemId), render),
+        subscribeTvKey(powerKey(deps.itemId), render),
       ];
       unsubscribe = () => { for (const s of subs) s(); };
       // The clock and countdown move without a doc write.
@@ -404,13 +411,16 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
     </button>`;
   }).join('');
   const tile = TILES.find((t) => t.key === activeTile) ?? TILES[0]!;
-  // A start-only source (archive.org's own player) offers no transport.
+  // A start-only source (archive.org's own player) offers no transport, and
+  // a mounted player that cannot seek (a live stream) offers no ±10 s: a
+  // target the holder cannot apply would only be beaten back over.
   const startOnly = rec.source ? isStartOnly(rec.source) : false;
+  const seekable = !startOnly && (tvPlayerCanSeek(tv.id) ?? true);
   const transport = rec.source && rec.state !== 'off' && rec.state !== 'home'
     ? `<div style="display:flex; gap:6px; flex-wrap:wrap; align-items:center;">
         ${!startOnly && pb.state === 'playing' ? smallButton(`data-tv-pause="${esc(tv.id)}"`, '⏸') : ''}
         ${!startOnly && pb.state === 'paused' ? smallButton(`data-tv-resume="${esc(tv.id)}"`, '▶') : ''}
-        ${!startOnly && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
+        ${seekable && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
         ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
         ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" style="width:70px;"></label>`}
@@ -492,14 +502,14 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback('Asking archive.org which file to play…');
       const epoch = tvDocEpoch();
       // Any programme action meanwhile — PREVIOUSLY ON, STOP or POWER from
-      // this panel, the set's panel or the theatre — bumps the record's
-      // `jump` and voids this lookup.
-      const jump = readTv(id).jump;
+      // this panel, the set's panel or the theatre — moves the record's
+      // revision (`jump`, or the switch's `seq`) and voids this lookup.
+      const revision = tvRevision(id);
       let found: { file: string; title: string } | null = null;
       try {
         found = await deps.resolveArchive(parsed.identifier);
       } catch { /* fall through to the embed */ }
-      if (gen !== resolveGen || epoch !== tvDocEpoch() || readTv(id).jump !== jump) return null; // overtaken
+      if (gen !== resolveGen || epoch !== tvDocEpoch() || tvRevision(id) !== revision) return null; // overtaken
       if (found) return sanitizeSource({ ...parsed, file: found.file, title: found.title }) ?? parsed;
       feedback('No playable file found — using their embed (start-time sync only).');
     }

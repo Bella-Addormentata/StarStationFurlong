@@ -7,11 +7,11 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindTvDoc, handRemote, iHoldRemote, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
-  setTvIdentity, setTvPageId, tvPlay, tvSchedule, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  setTvIdentity, setTvPageId, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
-  forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvPlayerPositionMs,
-  tvRoomPlayers,
+  forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvPlayerCanSeek,
+  tvPlayerPositionMs, tvRoomPlayers,
 } from './tvSession';
 
 const TV = 'tv-stand-1';
@@ -120,12 +120,32 @@ describe('tickTvRoom', () => {
     expect(readRemote(TV)).toMatchObject({ holder: 'AAAAme', page: 'A', by: 'BBBBgiver', leaseAt: now });
   });
 
-  it('tells the phone where the live player is, and nothing when none is mounted', () => {
+  it('tells the phone where the live player is and whether it can seek, and nothing when none is mounted', () => {
     expect(tvPlayerPositionMs(TV)).toBeNull();
-    const unregister = registerTvPlayerOfRecord(TV, () => 12_345);
+    expect(tvPlayerCanSeek(TV)).toBeNull();
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 12_345, canSeek: () => false });
     expect(tvPlayerPositionMs(TV)).toBe(12_345);
+    expect(tvPlayerCanSeek(TV)).toBe(false);
     unregister();
     expect(tvPlayerPositionMs(TV)).toBeNull();
+  });
+
+  it('POWER back on parks a programme that was playing when the set went off — the holder\'s write, where it was', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now); // the baseline beat
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now); // at 3 s
+    expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: TV_HEARTBEAT_MS });
+    setTvIdentity(() => ({ pub: 'BBBBviewer', name: 'Viewer' })); // anyone may press the body button
+    expect(tvTogglePower(TV)).toBe(false);
+    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
+    now += 60_000;
+    tickTvRoom([TV], now); // off: no beat, the programme untouched
+    expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: TV_HEARTBEAT_MS });
+    tvTogglePower(TV);
+    tickTvRoom([TV], now + 500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
   });
 
   it('lists the room\'s other keyed players for HAND TO', () => {

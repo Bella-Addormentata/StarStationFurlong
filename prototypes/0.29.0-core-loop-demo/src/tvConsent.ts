@@ -17,6 +17,13 @@
  * viewer's own node is refused outright — no button can make a browser poke
  * its owner's LAN for someone else.
  *
+ * CONSENT, NOT VALIDATION: a host the viewer accepted can redirect the
+ * request, or resolve, into the viewer's own network, and a browser <video>
+ * can see neither — so the ask says so, and the node's media proxy (plan
+ * §3.4, TODO) is where destinations are checked after DNS and on every
+ * redirect. Until it lands, a direct URL is the viewer's own trust decision,
+ * made per origin, per session.
+ *
  * DOM-free: the theatre asks, this answers, and vitest covers the answers.
  */
 
