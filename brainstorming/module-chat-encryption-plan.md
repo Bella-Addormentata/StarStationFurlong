@@ -11,7 +11,7 @@ The issue asks five things. Short answers first, evidence after.
 
 | # | Question | Answer |
 |---|---|---|
-| 1 | Could we use Signal's mechanics to secure each module's chat? | **The mechanics yes; the library no.** Sender Keys is the right shape and SSF already has two of its three prerequisites. `libsignal` itself is AGPLv3 and ships as a native Node addon — a bad fit for a browser client whose whole dependency posture is two audit-sized `@noble` packages. |
+| 1 | Could we use Signal's mechanics to secure each module's chat? | **The mechanics yes; the library no.** Sender Keys is the right shape and SSF already has two of its three prerequisites. `libsignal` itself is AGPLv3 and ships as a native Node addon — a bad fit for a browser client whose entire *cryptographic* dependency surface is two audit-sized `@noble` packages (`@noble/ed25519`, `@noble/hashes` — the rest of the tree is `three`, Yjs, `y-*` and `msgpackr`). |
 | 2 | Anyone with access to the module can read the chat? | **That is the correct design target, and it is not what happens today.** Today it is *wider*: anyone who ever held the pass, plus the node operator, plus any prefetching peer. Making the target true requires rekeying on membership change — otherwise "access" never ends. |
 | 3 | Which existing room access permission details can we reuse? | **Most of them.** The `players` key directory, `coHosts`, `doorGrants`, `accessMode`, the deed, contact cards and the DM pair-doc each map onto a named part of a group-E2EE design. Inventory in §4. |
 | 4 | Is there any level of encryption already built in for chat? | **Transport only. No confidentiality, and for room chat, not even authenticity.** DMs are signed; room chat is not. Details in §1. |
@@ -163,9 +163,13 @@ That phrasing forces three consequences, and they are the whole engineering prob
    rekey-on-join they *cannot* read anything sent before they arrived unless the room deliberately
    hands them an old epoch key. Signal and MLS both default to "no history." This is the owner's
    call, not a technical given — see §7.
-3. **The node stops being a participant.** It can still relay and store ciphertext, and it must stop
-   merging chat as CRDT state it understands. This is `keyed-identity-contacts-plan.md:82`'s
-   architectural warning, and it is why §6 scopes sealing to a *lane*, not to the whole doc.
+3. **The node stops being a *reader*. It does not stop being a *merger*.** This distinction is a
+   design choice and worth making deliberately. If each `Y.Array` item carries an AEAD-sealed
+   payload, Yjs/yrs goes on merging the records exactly as today — they are simply opaque. Only
+   sealing whole ysync *updates* would break CRDT merging, and that is the option this plan
+   **rejects**. So the node keeps relaying, storing and merging; it loses the ability to read.
+   That is what `keyed-identity-contacts-plan.md:82` is warning about, and why §6 scopes sealing to
+   a *lane* — per-item, inside the doc — rather than to the doc as a whole.
 
 ---
 
@@ -173,7 +177,8 @@ That phrasing forces three consequences, and they are the whole engineering prob
 
 ### 3.1 What "Signal mechanics" actually consists of
 
-Four separable pieces, and only the first three matter here:
+Four separable pieces. Three of them matter here — X3DH, the Double Ratchet and Sender Keys;
+Sesame is the one that does not, for the reason given in its row:
 
 | Piece | What it provides | Relevance to a room chat |
 |---|---|---|
@@ -202,9 +207,14 @@ That third row is the entire gap. An ECDH key is required and SSF has only a sig
 - **Mint a second X25519 key** and publish it in the same `players` entry and contact card. Clean
   separation of signing and key-agreement; one more field to carry; the recommended route.
 - **Convert the Ed25519 key** via the Edwards↔Montgomery birational map (what libsodium's
-  `crypto_sign_ed25519_pk_to_curve25519` does; `@noble/curves` exposes `edwardsToMontgomery`). No new
-  field, but it reuses one key across two protocols — a cross-protocol-attack surface that is
-  avoidable here for the cost of 32 bytes in a map we already write.
+  `crypto_sign_ed25519_pk_to_curve25519` does). Name the API carefully: in the current
+  `@noble/curves` (v2.x) it is `ed25519.utils.toMontgomery(publicKey)` and
+  `ed25519.utils.toMontgomerySecret(secretKey)`. The v1-era free functions `edwardsToMontgomeryPub`
+  / `edwardsToMontgomeryPriv` — and the pub-only alias `edwardsToMontgomery` — were **removed** in
+  v2; upstream records the rename in its changelog. Note that this saves no dependency — X25519
+  itself comes from `@noble/curves` (§3.4), so both routes add it. The real objection: it reuses one
+  key across two protocols — a cross-protocol-attack surface that is avoidable here for the cost of
+  32 bytes in a map we already write.
 
 ### 3.2.1 The directory is not yet trustworthy — fix this before anything else
 
@@ -229,11 +239,31 @@ to the attacker. **This is the case where a forged entry gets you a key even tho
 honest** — which is why §8's forged-membership bullet is not the whole story, and why encryption
 layered on today's directory would be confidence without security.
 
-The fix is not large: **first-seen pinning (TOFU) plus key-change detection** on `players[*].keyB64`,
-surfaced in the UI the way any messenger surfaces "safety number changed". The fingerprint helper
-already exists (`fingerprintOf`, `keypair.ts:92`), and the contacts store already retains a subject's
-signature for exactly this kind of re-verification (`reconstructCard`, `contacts.ts:195-197`). It
-becomes slice **S1a**, and nothing after it is sound without it.
+**The fix is not pinning.** An earlier draft of this document said "TOFU plus key-change detection"
+and stopped there; review caught that this is insufficient, and the reason is worth stating plainly.
+Trust-on-first-use detects a key that *changes* after you first saw it. It cannot authenticate the
+*first* observation. An attacker who overwrites `players[victimId].keyB64` before any given peer has
+observed that slot simply becomes the key that peer pins — permanently, and with a green light.
+Pinning narrows the attack window; it does not close the hole.
+
+The hole is the binding itself. `players` is keyed by `getPlayerId()`, a per-install `localStorage`
+UUID (`identity.ts:11-13`: *"nothing stops a peer from claiming any id or name"*), and nothing
+authenticates the UUID→key edge. **The fix is to stop having that edge: make the Ed25519 public key
+the identity.** Key the directory by `pub`, and there is no binding left to forge — an attacker can
+add `players[attackerPub]`, but that entry is only ever *themselves*, because the self-cert proves
+possession of exactly that key. Impersonation collapses into a display-name collision, which is a UI
+problem (show the fingerprint, as every messenger does) rather than a cryptographic one.
+
+This is not a new pattern for the codebase; `players` is the outlier. `coHosts` is already keyed by
+pubkey and already revocable (`roomRoles.ts:103-124`), and `doorGrants` is already keyed by
+`${doorId}|${pub}` (`doorPolicy.ts:235-261`). Two of the three peer-facing authorization maps got
+this right.
+
+Pinning still earns its place — as the *detection* layer over the legacy UUID path during migration,
+and over the owner key. The fingerprint helper already exists (`fingerprintOf`, `keypair.ts:92`), and
+the contacts store already retains a subject's signature for exactly this kind of re-verification
+(`reconstructCard`, `contacts.ts:195-197`). Together these become slice **S1a**, and nothing after it
+is sound without it.
 
 ### 3.3 The limitation that decides room size
 
@@ -284,7 +314,7 @@ reason the work is tractable.
 | `coHosts` map (pub-keyed, owner-granted, revocable) | `src/roomRoles.ts:103-124` | **the second key-holder tier.** Already keyed by Ed25519 pubkey, already revocable, already survives leave/rejoin — structurally this is a key-distribution list that currently distributes nothing |
 | `doorGrants` / `doorRequests`, keyed `${doorId}\|${pub}` | `src/doorPolicy.ts:235-261` | **the request → grant → revoke workflow**, built and UI'd. A chat-key grant is the same record with a different scope; the generalization is already anticipated at `doorPolicy.ts:16-17` |
 | `accessMode` public / pass / keyed | `src/main.ts:7643-7670` | **the policy switch** deciding whether a module is sealed at all. `public` → unsealed by design; `keyed` → sealed. Already deed-holder-gated (`:7667`) |
-| `roomKeyB64` (32 random bytes, per room) | `generateRoomKeyB64` `src/main.ts:612-616`, stored by `getOrCreateRoomKeyB64` `:618-630` | **the epoch-key seed** — but it must gain an epoch counter and rotate on membership change, which it never does today |
+| `roomKeyB64` (32 random bytes, per room) | `generateRoomKeyB64` `src/main.ts:612-616`, stored by `getOrCreateRoomKeyB64` `:618-630` | **the epoch *identifier*, and nothing more.** It must **not** seed chat key material: `sendRoomCap` deliberately hands `roomKeyB64` to the node (`network/NetworkProvider.ts:225-250`), so anything derived from it is derived by the node too — §1.1's own finding. Chat epochs need fresh client-only secrets distributed over the pairwise channels (S2); `roomKeyB64` can name which room and which epoch, and it still needs the epoch counter and the rotate-on-membership-change it lacks today |
 | Signed contact cards + the friends tier | `src/contacts.ts:145-190` | **the out-of-band channel** for pair setup, and the trust anchor deciding who may be invited |
 | DM pair-doc (deterministic from sorted pubkeys, authenticated) | `src/directMessages.ts:71-103` | **the pairwise channel Sender Keys distributes over.** Seal it first (it is two parties, no group machinery) and the group case inherits a working transport |
 | Co-present settle requests: nonce-bound signed ask → verified answer, with a TTL | `src/copresent.ts:56-57`, `:80-93`, `SETTLE_REQ_TTL_MS` `:99` | **the precedent for an "ask for the current epoch key" exchange.** Already binds `roomId‖nonce‖playerId‖pub`, already re-verifies the name cert, already expires. Its own comment states the posture the rest of this design needs: *"the owner is taken from the SIGNED request, not from any attacker-writable players lookup"* (`:78-79`) |
@@ -338,7 +368,7 @@ second, redundant networking stack in a third language, for no capability SSF la
 
 ## 6. Recommended shape
 
-Four slices, ordered so each is useful alone and nothing is wasted if the next is deferred.
+Five slices, ordered so each is useful alone and nothing is wasted if the next is deferred.
 
 **S0 — Authenticate room chat (no crypto decisions, do this regardless).**
 Covers *both* read paths — `rebuildChatLog` (`main.ts:2010`) and the bubble observer (`:2048-2058`).
@@ -346,14 +376,22 @@ Covers *both* read paths — `rebuildChatLog` (`main.ts:2010`) and the bubble ob
 Carry `keyB64` and a signature over canonical bytes `roomId‖author‖name‖ts‖text` on chat records,
 mirroring `directMessages.ts:92-103` exactly; add the missing `isChatRecord` shape guard
 (`main.ts:2010`); drop unverifiable messages on read as `readMessages` already does (`:174-181`).
+**Scope this honestly.** A signature verified against the `keyB64` carried *in the same record*
+proves possession of that key and integrity of that text. It does **not** authenticate the claimed
+`authorId` or name — a peer can write the victim's `authorId`, supply its own key, and sign
+correctly. So S0 on its own buys *message integrity*, not *attribution*. Attribution needs the
+identity to be the key (§3.2.1), which is why S0 must also render the author from `keyB64` — name
+plus fingerprint — rather than from the UUID, and why S0 and S1a are best landed together.
+
 *Rationale: encrypting unauthenticated messages buys confidential forgeries. Today any peer can write
 a chat line attributed to anyone, because `authorId` is the UUID. Fix the forgery before the privacy.*
 
-**S1a — Pin keys on first sight (§3.2.1). Blocking for S3.**
-TOFU + key-change detection on `players[*].keyB64`, with a visible fingerprint-changed warning.
-Without it the directory Sender Keys reads from is attacker-writable, and the whole design is
-decoration. Independently valuable: it also closes the silent owner-key substitution that
-`games/gamesDoc.ts:148-157` records as open today.
+**S1a — Make the public key the identity (§3.2.1). Blocking for S0's attribution and for S3.**
+Key the directory by `pub` the way `coHosts` and `doorGrants` already are, so the unauthenticated
+UUID→key edge stops existing; carry TOFU pinning + a visible fingerprint-changed warning as the
+detection layer over the legacy path and the owner key. Without this the directory Sender Keys reads
+from is attacker-writable and the whole design is decoration. Independently valuable: it also closes
+the silent owner-key substitution that `games/gamesDoc.ts:148-157` records as open today.
 
 **S1 — Publish an X25519 key.**
 Mint alongside the Ed25519 seed, publish in the `players` entry and the contact card, carry it in the
@@ -367,12 +405,40 @@ misleading `dmRoomKeyFor` name (`directMessages.ts:77-88`) by giving the functio
 implementation. Smallest possible surface on which to get the AEAD, nonce discipline and key-rotation
 plumbing right.
 
+*What S2 does not provide, stated so it is not assumed:* ECDH between two **long-lived** keys is
+static-static. It has no forward secrecy and no post-compromise security — compromise of either
+private key recomputes every past HKDF output and decrypts any retained ciphertext. That is a
+tolerable, explicitly-scoped trade for DMs with a defined rotation policy (§7). It is **not**
+tolerable as S3's key-distribution channel, because a recorded sender-key distribution would then
+unseal the group's history on a single key compromise. The proportionate fix is cheap and does not
+require the full Double Ratchet: wrap each distribution ECIES-style — a fresh **ephemeral** X25519
+keypair per distribution, ECDH'd against the recipient's static key, ephemeral public attached. That
+buys sender-side forward secrecy for the thing that matters most. Full X3DH + Double Ratchet (§3.1)
+remains the end state for DMs; it is deferred, not dismissed.
+
 **S3 — Sender Keys for `keyed` modules.**
-Each member derives a chain key + signing key, distributes it over the S2 channels to the members
-listed in `players`, and the room's chat lane carries ciphertext. Epoch bumps on membership change,
-driven by the deed holder, with `coHosts` as the second tier. `public` and `pass` modules stay
-unsealed — the node keeps merging their chat as today, which contains the §2.2 architectural cost to
-exactly the rooms that asked for it.
+Each member derives a chain key + signing key, distributes it over the S2 channels — **not** to
+everyone listed in `players` — and the room's chat lane carries ciphertext.
+
+> **`players` is not a roster.** It is a *seen* list. The codebase says so itself: *"'SEEN', not 'IN
+> ROOM': nothing ever REMOVES a players entry in S2 (no leave hook, no liveness), so departed players
+> stay listed until S3 presence lands heartbeat/lastSeen semantics."* (`main.ts:3178-3180`) — entries
+> are upsert-only and preserve `joinedAt` (`:3074`, `:3087`). Distributing to `players` would hand
+> sender keys to every historical visitor *and* to any forged entry, which is precisely the failure
+> §3.2.1 describes.
+
+Distribute instead to an **authorized current set**: the deed holder plus `coHosts`, which is
+pub-keyed, grant-and-revoke, and whose `removeCoHost` genuinely deletes (`roomRoles.ts:103-124`) —
+the structural properties `players` lacks. `coHosts` is still only UI-gated on the write side
+(`roomRoles.ts:20`), so this is a better roster, not yet an enforced one; node-side enforcement
+remains Slice 6. The append-only signed log that would eventually carry grants and revocations is
+named in-tree as `network/RoomLog.ts`, but it is a Phase-2 **stub** today — `append` and `subscribe`
+both throw (`:13-20`) — so it is the destination, not something S3 can be blocked on.
+
+Epoch bumps on every change to that authorized set, driven by the deed holder, which is what finally
+makes eviction mean something (§2.2's first consequence). `public` and `pass` modules stay unsealed —
+the node keeps merging their chat as today, which contains the §2.2 architectural cost to exactly the
+rooms that asked for it.
 
 Deferred by name, not forgotten: MLS if modules grow large (§3.3); metadata privacy (§5.3);
 node-side enforcement, which remains Slice 6 of the existing plan and is what finally makes
@@ -413,7 +479,11 @@ Stated up front, in the spirit of `keyed-identity-contacts-plan.md` §4:
 - **Key substitution in the directory** (see §3.2.1 — the sharpest gap, and it defeats the naive
   design outright rather than merely weakening it).
 - **Forged membership.** Until node-side enforcement lands (Slice 6), a modified client still writes
-  itself into `players`. Sealed chat raises the bar — a forged entry gets you a key only if an honest
-  member distributes one to you — but the directory itself is still peer-written.
+  itself into `players`, and `coHosts` is only UI-gated too (`roomRoles.ts:20`). Sealed chat raises
+  the bar but does not clear it: per §3.2.1 a forged entry does **not** need an honest member to be
+  fooled, so "the directory is still peer-written" is the whole of the problem, not a footnote to it.
+- **Stale membership.** Nothing removes a `players` entry on leave (`main.ts:3178-3180`), so without
+  the S3 roster change above, "everyone in the room" silently means "everyone who has ever been in
+  the room".
 - **Consensus-free revocation races.** Two members rekeying concurrently, or an eviction racing a
   send, resolve eventually and not instantly. Same limit the existing plan records for `revoke`.
