@@ -44,7 +44,7 @@ import { isShipReady } from './devices';
 import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
 import { isBoltedIntoStation } from './stationKeeping';
-import { MAX_ENTRIES, atlasComponents, readAtlas } from './stationAtlas';
+import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -90,8 +90,19 @@ type Source =
       stations: Array<{ record: StationRecord; modules: number }>;
       ships: FarShipInput[];
       key: string;
+      /** See stationYaw. */
+      yaw: number;
     }
-  | { mode: 'sun'; move: StationMove; key: string };
+  | { mode: 'sun'; move: StationMove; key: string; yaw: number };
+
+/** The far frame is the station's (its welcome room's): the iso scene is
+ *  drawn in the current room's, which atlasLayout anchors at zero yaw, so a
+ *  room turned against the welcome room turns the planet with it. Zero when
+ *  the welcome room is out of reach (or is the current room). */
+function stationYaw(welcomeRoomId: string | undefined, roomId: string | undefined): number {
+  if (!welcomeRoomId || !roomId || welcomeRoomId === roomId) return 0;
+  return atlasLayout(roomId, MAX_ENTRIES).find((p) => p.roomId === welcomeRoomId)?.rotY ?? 0;
+}
 
 /** A flight's transfer rebuilt from its record: the Hohmann ellipse between
  *  the two stations' orbits, pinned to the record's own times. */
@@ -217,6 +228,19 @@ function gather(now: number): Source {
       // on the target orbit once it is there) until it docks.
     }
     if (!aboard && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    // Redocking: the ship has arrived where its destination was when it cast
+    // off (destinationAt), which a move since then has left: it stays on that
+    // orbit until the dock completes, not at the station's new place.
+    if (!aboard && !adrift && rec.status === 'redocking') {
+      const was = rec.destinationAt ? adriftPlace(rec.destinationAt) : null;
+      const place: Place | undefined = was
+        ? { id: rec.locationId, planetId: planetById(was.planetId).id, orbitSlot: was.orbitSlot }
+        : placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
+      const station = all.find((s) => s.id === rec.locationId);
+      if (place && (!station || planetById(station.planetId).id !== place.planetId || station.orbitSlot !== place.orbitSlot)) {
+        adrift = place;
+      }
+    }
   }
 
   // Not in a known station (offline, or before the first join): stand in
@@ -230,10 +254,11 @@ function gather(now: number): Source {
   // The sun view only while the move really has a course right now (a
   // malformed record, say both ends on one planet, has none): otherwise the
   // planet view below, never an empty backdrop.
+  const yaw = me ? stationYaw(me.welcomeRoomId, roomId) : 0;
   if (me && reallyMoving(me, now) && me.move) {
     const m = me.move;
     // JSON, not a joined string: ids come from peers and may hold any delimiter.
-    return { mode: 'sun', move: m, key: JSON.stringify([
+    return { mode: 'sun', move: m, yaw, key: JSON.stringify([
         'sun', m.welcomeRoomId, m.mode, m.fromPlanetId, m.fromSlot, m.toPlanetId, m.toSlot, m.departAt, m.arriveAt,
       ]) };
   }
@@ -311,7 +336,7 @@ function gather(now: number): Source {
       s.plan.from.radiusKm.toFixed(3), s.plan.from.phase0, s.plan.to.radiusKm.toFixed(3), s.plan.to.phase0,
     ]),
   ]);
-  return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key };
+  return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key, yaw };
 }
 
 /** The layout now; `withPaths` samples the courses too, which only a
@@ -534,10 +559,13 @@ function buildFrame(layout: FarLayout): void {
 }
 
 /** Move everything to where it is now. */
-function poseFrame(layout: FarLayout): void {
+function poseFrame(layout: FarLayout, yaw: number): void {
   if (!frame) return;
-  frame.position.set(layout.transform.position.x, layout.transform.position.y, layout.transform.position.z);
-  frame.rotation.set(0, layout.transform.rotationY, 0);
+  // The layout is in the station's frame; turn it (about the viewer, the
+  // origin) into the current room's, with the sun turned the same way.
+  const p = layout.transform.position;
+  frame.position.set(p.x, p.y, p.z).applyAxisAngle(UP, yaw);
+  frame.rotation.set(0, layout.transform.rotationY + yaw, 0);
   for (const b of layout.bodies) {
     const entry = bodies.get(bodyKey(b));
     if (!entry) continue;
@@ -548,12 +576,13 @@ function poseFrame(layout: FarLayout): void {
   }
   if (sunLight) {
     const d = layout.sunDirection;
-    sunLight.position.set(d.x * 1e5, d.y * 1e5, d.z * 1e5);
+    sunLight.position.set(d.x * 1e5, d.y * 1e5, d.z * 1e5).applyAxisAngle(UP, yaw);
     sunLight.target.position.set(0, 0, 0);
   }
 }
 
 const tmp = new THREE.Vector3();
+const UP = new THREE.Vector3(0, 1, 0);
 
 /** Keep every impostor at its on-screen size. */
 function sizeBodies(heightPx: number): void {
@@ -591,7 +620,7 @@ function update(renderer: THREE.WebGLRenderer, ortho: THREE.Camera): void {
       buildFrame(layout);
       builtKey = source.key;
     }
-    poseFrame(layout);
+    poseFrame(layout, source?.yaw ?? 0);
   }
 
   const cam = farCamera!;
