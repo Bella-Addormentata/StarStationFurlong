@@ -1520,6 +1520,26 @@ export function routeFlightPlaces(
   return { from, to: f.status === 'in-flight' ? place(f.nextStopIndex) : null };
 }
 
+/** 🚚 Where a ruling timetable's stay puts the ship when the station list
+ *  does not: on the route's copy of the stop (`places.from`) once the stop's
+ *  station has left it (`listed`: where the station list has that station
+ *  now, `moving` while it is between planets; null when it lists none),
+ *  unless a live dock carries the ship along with a station (`docked`:
+ *  stationMove, only a live dock does). Null in flight, when the timetable
+ *  does not rule, or while the station list places the ship. `planet` reads
+ *  a planet id as the station list does (stations.planetById). Pure. */
+export function routeStayOffList(
+  places: RouteFlightPlaces | null,
+  listed: { planetId: string; orbitSlot: number; moving: boolean } | null,
+  docked: boolean,
+  planet: (id: string) => string = (id) => id,
+): RouteFlightPlace | null {
+  if (!places || places.to || docked) return null;
+  const at = { ...places.from, planetId: planet(places.from.planetId) };
+  if (listed && !listed.moving && planet(listed.planetId) === at.planetId && listed.orbitSlot === at.orbitSlot) return null;
+  return at;
+}
+
 /** A4: the flight existing readers follow. The timetable's while the route
  *  runs unpaused (`route` is routeFlightAt's answer), else the stored one. */
 export function resolvedFlight(

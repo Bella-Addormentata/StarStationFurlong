@@ -47,7 +47,7 @@ import { readRobotConfig, subscribeRobot } from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 // 🚀 The robot captain (robot pilot routes §2a): where a Ship pilot robot
 // stands and what it announces, from the ship's shared timetable.
-import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech } from "./shipPilot";
+import { pilotLine, pilotPost, pilotSpeechAfter, pilotViewHeld, readPilotView, type PilotEndHold, type PilotSpeech } from "./shipPilot";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
@@ -299,6 +299,9 @@ export class World {
    *  like the robot: each rider's copy speaks for itself), and the
    *  countdown (s) to the next reading of the timetable. */
   private pilotSpeech = new Map<string, PilotSpeech>();
+  /** 🚀 The last view read of a route's end, said from once the route has
+   *  finished (shipPilot.pilotViewHeld). */
+  private pilotEndHold: PilotEndHold | null = null;
   private pilotTimer = 0;
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
@@ -5067,6 +5070,7 @@ export class World {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
       this.pilotSpeech.clear(); // 🚀 fresh robots, fresh announcements
+      this.pilotEndHold = null;
       this.robotsPatrol = waiterPatrol;
       // 🔇 Fresh room: hold every robot line for the first second (owner
       // request — no greeting barked mid-load/entry; the class opens its
@@ -5160,15 +5164,21 @@ export class World {
     }
     if (!any) {
       this.pilotSpeech.clear();
+      this.pilotEndHold = null;
       return;
     }
     const now = Date.now();
-    let view: ReturnType<typeof readPilotView> = null;
+    let read: ReturnType<typeof readPilotView> = null;
     try {
-      view = readPilotView(now);
+      read = readPilotView(now);
     } catch (err) {
       console.warn("[pilot] timetable read failed:", err);
     }
+    // The route's end is still said (from the berth door) once STOP or the
+    // fuel has finished the route.
+    const held = pilotViewHeld(read, this.pilotEndHold, now, World.activeRoomId());
+    this.pilotEndHold = held.hold;
+    const view = held.view;
     for (const [key, bot] of this.robots) {
       const cfg = readRobotConfig(key);
       if (cfg?.routine !== "pilot") {

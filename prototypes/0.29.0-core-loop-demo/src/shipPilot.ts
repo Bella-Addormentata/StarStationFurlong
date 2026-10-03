@@ -65,6 +65,8 @@
  * Each line is said once per stay (the memory is local, like the robot), a
  * line that went stale unsaid (the player was not in the room yet) is
  * dropped, and lines are spaced so one bubble does not replace another.
+ * The route's end is still said once the route has finished, as STOP at a
+ * docked stop does on the next tick (pilotViewHeld).
  * Lines go through world.ts robotSay, the one bubble-plus-voice seam. An
  * open helm shows the same lines as text (helmAnnouncerStep), so a route a
  * person flies with no robot captain still announces its stops aboard.
@@ -437,10 +439,11 @@ export function pilotSpeechAfter(v: PilotLineView, mem: PilotSpeech | null, line
  *  in 3 minutes"), and the status line above it carries the exact second. */
 export const HELM_LINE_SHOW_MS = 45_000;
 
-/** One open helm's announcer: what it has "said" and the line it shows. */
+/** One open helm's announcer: what it has "said" and the line it shows
+ *  (`key`: pilotLine's, so the route's end is told from the rest). */
 export interface HelmAnnouncer {
   speech: PilotSpeech | null;
-  shown: { text: string; run: number; at: number } | null;
+  shown: { key: string; text: string; run: number; at: number } | null;
 }
 
 /** A helm that has said nothing yet. */
@@ -461,13 +464,53 @@ export function helmAnnouncerStep(a: HelmAnnouncer, v: PilotLineView | null): He
   if (line) {
     return {
       speech: pilotSpeechAfter(v, a.speech, line),
-      shown: { text: line.text, run: v.route.startedAt, at: v.now },
+      shown: { key: line.key, text: line.text, run: v.route.startedAt, at: v.now },
     };
   }
   if (a.shown && (a.shown.run !== v.route.startedAt || v.f.paused || v.now - a.shown.at >= HELM_LINE_SHOW_MS)) {
     return { ...a, shown: null };
   }
   return a;
+}
+
+// ── The route's end, once the route has finished ────────────────────────────
+//
+// STOP at a stop the ferry is docked at ends the route there, and the helm
+// commander's game copies the timetable back and clears the run on its next
+// tick (pilotRoute.routeSettleAction's finish), as running out of fuel or of
+// berths does: from then on readPilotView reads no route. The end line may
+// not have been said by then (the gap after the welcome, the room's quiet
+// window), so each speaker holds the last view it read of the route's end
+// for PILOT_END_HOLD_MS and speaks (or shows) from it. Local, like speech.
+
+/** How long after its route has finished a speaker still says or shows the
+ *  route's end (as long as the helm shows any line). */
+export const PILOT_END_HOLD_MS = HELM_LINE_SHOW_MS;
+
+/** The last view a speaker read of its route's end in room `room`, kept
+ *  until `until`. */
+export interface PilotEndHold {
+  view: PilotLineView;
+  room: string;
+  until: number;
+}
+
+/**
+ * What a speaker in room `room` reads at `now` (`v`: readPilotView's
+ * answer): `v` while a route runs; once it has finished (`v` null), the held
+ * view of its end, at `now`, until the hold runs out or the speaker is in
+ * another room. Returns that view and the hold to keep for the next step.
+ * Pure.
+ */
+export function pilotViewHeld(
+  v: PilotLineView | null,
+  hold: PilotEndHold | null,
+  now: number,
+  room: string,
+): { view: PilotLineView | null; hold: PilotEndHold | null } {
+  if (v) return { view: v, hold: v.f.ended !== null ? { view: v, room, until: now + PILOT_END_HOLD_MS } : null };
+  if (!hold || hold.room !== room || now >= hold.until) return { view: null, hold: null };
+  return { view: { ...hold.view, now }, hold };
 }
 
 // ── Readers (thin, effectful) ────────────────────────────────────────────────

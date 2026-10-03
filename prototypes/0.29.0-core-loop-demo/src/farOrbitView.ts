@@ -45,10 +45,11 @@ import { readAllDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
+import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
-import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import { adriftPlace, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
@@ -247,6 +248,19 @@ function readSource(now: number): Source {
       // on the target orbit once it is there) until it docks.
     }
     if (!aboard && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    // 🚚 A timetable stay at a stop whose station has left the place the
+    // route copied (moved planets, or gone): the keeper passes that berth, so
+    // with no live dock carrying the ship along it waits on the copy's orbit,
+    // where its next leg leaves from (and where its planet summary puts it).
+    if (!aboard && !adrift && places && !places.to) {
+      const station = all.find((s) => s.id === places.from.id);
+      adrift = routeStayOffList(
+        places,
+        station ? { planetId: station.planetId, orbitSlot: station.orbitSlot, moving: reallyMoving(station, now) } : null,
+        dockedStationFor(roomId, readAllDoors().values(), atlas, all) !== null,
+        (id) => planetById(id).id,
+      );
+    }
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
