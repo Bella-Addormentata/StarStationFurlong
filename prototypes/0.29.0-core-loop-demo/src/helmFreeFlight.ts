@@ -49,9 +49,13 @@ export function freeFigures(r: FreeReadout): Record<string, string> {
   };
 }
 
-/** What a redraw of the panel's buttons depends on (the rest moves in place). */
-export function freePanelKey(r: FreeReadout | null): string {
-  return r ? `${r.zone}|${r.dockAt?.id ?? ''}|${r.parked}|${Math.ceil(r.parkFuel - 1e-9)}` : 'none';
+/** What a redraw of the panel's buttons depends on (the rest moves in place):
+ *  the zone, the dock in reach, PARK's price, and whether `fuel` pays it (the
+ *  level itself only while it falls short, when the note shows it). */
+export function freePanelKey(r: FreeReadout | null, fuel: number): string {
+  if (!r) return 'none';
+  const need = Math.ceil(r.parkFuel - 1e-9);
+  return `${r.zone}|${r.dockAt?.id ?? ''}|${r.parked}|${need}|${fuel >= need ? 'ok' : Math.floor(fuel)}`;
 }
 
 export interface FreePanelInput {

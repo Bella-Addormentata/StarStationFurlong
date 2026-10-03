@@ -7,8 +7,12 @@ import * as Y from 'yjs';
 import { NO_INPUT, speedOf } from './freeFlight';
 import type { FreePose } from './freeFlight';
 import {
+  FREE_DOCK_SETTLE_MS,
   WRITE_EVERY_MS,
   isPilotingHere,
+  markFreeDock,
+  recoverFreeDock,
+  settleFreeDock,
   pilotFrame,
   readFreePose,
   releaseStick,
@@ -174,5 +178,63 @@ describe('🅿️ a station flying by itself', () => {
     // Docking is closed while it flies: DEPART, routes and arrivals skip it.
     expect(stationFlyingFree(DEFAULT_STATION_RECORD, now)).toBe(true);
     expect(stationFlyingFree({ welcomeRoomId: 'elsewhere' }, now)).toBe(false);
+  });
+});
+
+describe("🕹️ AUTO-DOCK's way back", () => {
+  const NONE: { state: { kind: string } }[] = [];
+  const DOCKED = [{ state: { kind: 'docked' } }];
+
+  /** Fly free, then start AUTO-DOCK at HOME: the record reads docked there
+   *  before the berth answers (as completeArrival writes it). */
+  function autoDockStarted(t: number): FreePose {
+    const pose = farPose(t);
+    fly(pose);
+    expect(markFreeDock(HOME.id, HOME.id, pose, t)).toBe(true);
+    expect(writeFlightRecord({ status: 'redocking', locationId: HOME.id })).toBe(true);
+    expect(writeFlightRecord({ status: 'docked', locationId: HOME.id })).toBe(true);
+    return pose;
+  }
+
+  it('flies on when the berth refuses, and waits while the answer is due', () => {
+    const t = Date.now();
+    const pose = autoDockStarted(t);
+    // The watch leaves it alone while this game awaits the answer.
+    expect(recoverFreeDock(NONE, t + 60_000)).toBe(false);
+    expect(readFlightRecord().status).toBe('docked');
+    expect(recoverFreeDock(NONE, t + 1000, true)).toBe(true);
+    expect(readFlightRecord().status).toBe('free-flight');
+    expect(readFreePose()).toEqual(pose);
+    expect(doc.getMap('ship').get('freeDock')).toBeUndefined();
+  });
+
+  it('flies on once a game that left the room comes back, after the pairings settle', () => {
+    const t = Date.now();
+    autoDockStarted(t);
+    // The game that asked left (its doc went), and comes back to a fresh one.
+    const back = new Y.Doc();
+    Y.applyUpdate(back, Y.encodeStateAsUpdate(doc));
+    bindShipDoc(back);
+    expect(recoverFreeDock(NONE, t + 10_000)).toBe(false);
+    expect(recoverFreeDock(NONE, t + 10_000 + FREE_DOCK_SETTLE_MS - 1)).toBe(false);
+    expect(recoverFreeDock(NONE, t + 10_000 + FREE_DOCK_SETTLE_MS)).toBe(true);
+    expect(readFlightRecord().status).toBe('free-flight');
+    bindShipDoc(doc);
+    back.destroy();
+  });
+
+  it('is cleared by a docked port or a dock that took', () => {
+    const t = Date.now();
+    autoDockStarted(t);
+    const back = new Y.Doc();
+    Y.applyUpdate(back, Y.encodeStateAsUpdate(doc));
+    bindShipDoc(back);
+    expect(recoverFreeDock(DOCKED, t + 60_000)).toBe(false);
+    expect(back.getMap('ship').get('freeDock')).toBeUndefined();
+    expect(readFlightRecord().status).toBe('docked');
+    bindShipDoc(doc);
+    back.destroy();
+    settleFreeDock();
+    expect(doc.getMap('ship').get('freeDock')).toBeUndefined();
   });
 });

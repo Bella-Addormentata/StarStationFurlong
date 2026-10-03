@@ -104,8 +104,8 @@ import type { DockAnswer } from './dockRules';
 // AUTO-DOCK.
 import { parkCost, parkPose, readout as freeReadout } from './freeFlight';
 import {
-  freeStationsAround, isStationOwnRoom, ownStationOf, pilotFrame, releaseStick, resolvedFreePose, stationFlyingFree, stationUndockPose,
-  undockPoseFrom, writeFreePose,
+  freeStationsAround, isStationOwnRoom, markFreeDock, ownStationOf, pilotFrame, recoverFreeDock, releaseStick, resolvedFreePose,
+  settleFreeDock, stationFlyingFree, stationUndockPose, undockPoseFrom, writeFreePose,
 } from './freeFlightPilot';
 import { planStationPark } from './freeStation';
 import { isBoltedIntoStation } from './stationKeeping';
@@ -257,6 +257,26 @@ import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
 /** 🚚 A flight's `destinationAt`: where the station orbits as the ship casts
  *  off, as an open-orbit place; nothing for a station this install cannot
  *  list. */
+/** The helm's FUEL gauge: its figure, fill and colour. */
+function fuelGauge(fuel: number, capacity: number): { text: string; pct: number; color: string } {
+  const pct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
+  return {
+    text: capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK',
+    pct,
+    color: pct > 40 ? '#00E676' : pct > 10 ? '#FFB74D' : '#FF8A80',
+  };
+}
+
+/** 🕹️ Redraw the FUEL gauge in place (flying free, the stick draws fuel
+ *  every write, and a whole redraw would drop clicks mid-flight). */
+function writeFuelGauge(panel: HTMLElement, fuel: number, capacity: number): void {
+  const g = fuelGauge(fuel, capacity);
+  const text = panel.querySelector<HTMLElement>('[data-helm-fuel="text"]');
+  if (text) { if (text.textContent !== g.text) text.textContent = g.text; text.style.color = g.color; }
+  const bar = panel.querySelector<HTMLElement>('[data-helm-fuel="bar"]');
+  if (bar) { bar.style.width = `${g.pct}%`; bar.style.background = g.color; }
+}
+
 function destinationAtOf(stationId: string): { destinationAt?: string } {
   const st = listStationRecordsNow().find((r) => r.id === stationId);
   return st ? { destinationAt: adriftAt(planetById(st.planetId).id, st.orbitSlot) } : {};
@@ -2584,9 +2604,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const routeRow = `<span style="text-align:right; color:${routeStatus.tone === 'ok' ? '#00E676' : routeStatus.tone === 'warn' ? '#FFB74D' : 'rgba(212,168,75,0.55)'};">${esc(routeStatus.text)}</span>`;
 
     // ── Fuel gauge: level / capacity, filled bar, refuel button ────────────
-    const capFmt = capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK';
-    const barPct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
-    const barColor = barPct > 40 ? '#00E676' : barPct > 10 ? '#FFB74D' : '#FF8A80';
+    const { text: capFmt, pct: barPct, color: barColor } = fuelGauge(fuel, capacity);
     // 🚏 On a running route REFUEL sets the level at the stay the ship is
     // docked at; in flight it waits for the next stop (routeRefuelStay).
     const refuelWaits = routeFlight !== null && routeFlight.status !== 'docked';
@@ -2786,7 +2804,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 🕹️ Flown by hand: the radar, the stick and AUTO-DOCK.
       const pose = resolvedFreePose(now);
       const r = pose ? freeReadout(pose, freeStationsAround(pose.planetId, now)) : null;
-      freeKey = freePanelKey(r);
+      freeKey = freePanelKey(r, fuel);
       flightPanel = renderFreeFlightPanel({
         readout: r,
         commander,
@@ -2818,10 +2836,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       <div style="margin-top:10px;">
         <div style="display:flex; justify-content:space-between; align-items:baseline; font-size:11px;">
           <span style="color:rgba(212,168,75,0.75);">FUEL</span>
-          <span style="color:${barColor}; font-weight:700;">${capFmt}</span>
+          <span data-helm-fuel="text" style="color:${barColor}; font-weight:700;">${capFmt}</span>
         </div>
         <div style="margin-top:6px; height:10px; background:rgba(0,0,0,0.5); border-radius:5px; overflow:hidden; border:1px solid rgba(212,168,75,0.15);">
-          <div style="width:${barPct}%; height:100%; background:${barColor}; transition:width 0.25s linear;"></div>
+          <div data-helm-fuel="bar" style="width:${barPct}%; height:100%; background:${barColor}; transition:width 0.25s linear;"></div>
         </div>
         <button id="helm-refuel-btn"${refuelDisabled ? ' disabled' : ''} style="width:100%; margin-top:8px; padding:6px; border-radius:6px; border:1px solid ${refuelDisabled ? 'rgba(212,168,75,0.2)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; background:${refuelDisabled ? 'rgba(80,80,80,0.12)' : (refuelArmed ? 'rgba(255,138,128,0.18)' : 'rgba(240,192,96,0.12)')}; color:${refuelDisabled ? 'rgba(212,168,75,0.4)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; font-family:inherit; font-weight:700; cursor:${refuelDisabled ? 'not-allowed' : 'pointer'}; text-transform:uppercase; font-size:11px;">${refuelLabel}</button>
       </div>
@@ -2994,7 +3012,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     });
     panel.querySelector<HTMLButtonElement>('#helm-free-stick')?.addEventListener('click', () => {
       if (stickKeysTaken()) letGo();
-      else if (helmIsCommander() && isShipReady()) takeStickKeys();
+      else if (helmIsCommander() && !isShipReady()) flashFree('NOT SPACEWORTHY: the stick needs a FUEL TANK, ENGINE BLOCK and HELM CONSOLE mounted.');
+      else if (helmIsCommander()) takeStickKeys();
       render();
     });
     panel.querySelector<HTMLButtonElement>('#helm-free-park')?.addEventListener('click', () => {
@@ -3933,25 +3952,22 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       return;
     }
     letGo();
-    // Kept to fly on from if the far berth refuses after all (the preflight
-    // above cannot promise its answer).
+    // Kept in the ship doc to fly on from if the far berth refuses after all
+    // (the preflight above cannot promise its answer): recoverFreeDock, here
+    // on the answer, or main.ts's flight watch when this game left the room.
     const flewFrom = readFlightRecord().locationId;
     const flewAt = resolvedFreePose(Date.now()) ?? pose;
     const docking = shipDocking;
     const room = currentRoomId();
     const backToFree = (outcome: ArrivalOutcome | null): void => {
-      if (!outcome || outcome.kind !== 'none' || outcome.reason === 'already-docked') return;
-      // Only this ship, only while it still reads as docked there with no
-      // port actually docked (another commander's dock is never undone).
+      if (!outcome || outcome.kind === 'docking') return;
       if (currentRoomId() !== room) return;
-      const rec = readFlightRecord();
-      if (rec.status !== 'docked' || rec.locationId !== station.id) return;
-      if (docking.ports().some((p) => p.state.kind === 'docked')) return;
-      writeFreePose(flewAt);
-      writeFlightRecord({ status: 'free-flight', locationId: flewFrom });
+      if (outcome.kind !== 'none' || outcome.reason === 'already-docked') { settleFreeDock(); return; }
+      if (!recoverFreeDock(docking.ports(), Date.now(), true)) return;
       flashFree(`${station.name} did not take the ship: still flying free.`);
       if (panel) render();
     };
+    if (!markFreeDock(station.id, flewFrom, flewAt)) return;
     if (!writeFlightRecord({ status: 'redocking', locationId: station.id })) return;
     const note = arrivalNoteHere();
     const first = completeArrival(docking, {
@@ -4022,7 +4038,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     drawFreeRadar(canvas, pose, stations, now);
     const r = freeReadout(pose, stations);
     writeFreeFigures(panel, r);
-    if (freePanelKey(r) !== freeKey) render();
+    const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+    if (freePanelKey(r, clampFuelToCapacity(readFuelLevel(capacity), capacity)) !== freeKey) render();
   };
 
   /** Commander-driven flight advance while the helm is open (main.ts runs the
@@ -4068,13 +4085,19 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 🕹️ Flying free, a pose write (every 500 ms at the stick) is drawn in
       // place by the frame loop: only the flight record or the fuel level
       // redraws the panel then.
+      // The fuel level is drawn in place too; only REFUEL's full-tank state
+      // rides the key (PARK's affordability is the frame loop's freePanelKey).
       let shipSeen = '';
       unsubs.push(subscribeShip(() => {
         const capacity = countFunction('fuelTank') * TANK_CAPACITY;
-        const seen = `${JSON.stringify(readFlightRecord())}|${readFuelLevel(capacity)}`;
+        const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+        const seen = `${JSON.stringify(readFlightRecord())}|${fuel >= capacity}`;
         const same = seen === shipSeen;
         shipSeen = seen;
-        if (same && readFlightRecord().status === 'free-flight') return;
+        if (same && readFlightRecord().status === 'free-flight') {
+          if (panel) writeFuelGauge(panel, fuel, capacity);
+          return;
+        }
         refuelArmed = false;
         render();
       }));

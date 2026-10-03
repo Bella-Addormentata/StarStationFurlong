@@ -24,7 +24,7 @@ import {
 import type { FreePose, FreeStation, StickInput } from './freeFlight';
 import { orbitForSlot, angleAt, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
-import { readFlightRecord, readFuelLevel, shipDocHandle, writeFuelLevel } from './shipDoc';
+import { readFlightRecord, readFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { adriftPlace, currentRoomId, listStations, planetById, stationInTransit } from './stations';
 import type { StationRecord } from './stations';
 
@@ -56,6 +56,96 @@ export function writeFreePose(pose: FreePose): boolean {
     return false;
   }
   h.doc.transact(() => h.map.set(POSE_KEY, clean));
+  return true;
+}
+
+// ── AUTO-DOCK's way back ─────────────────────────────────────────────────────
+
+/** The ship map key AUTO-DOCK's way back lives under. */
+const DOCK_MARK_KEY = 'freeDock';
+/** A mark found on a freshly joined doc waits this long for the room's dock
+ *  pairings to arrive before it reads a ship with no docked port as refused. */
+export const FREE_DOCK_SETTLE_MS = 5000;
+
+/** Where AUTO-DOCK flew in from: the record is `docked` at `stationId` before
+ *  the far berth answers, so a refusal flies the ship on from here. */
+export interface FreeDockMark {
+  stationId: string;
+  /** The free flight's locationId. */
+  from: string;
+  pose: FreePose;
+  at: number;
+}
+
+function isDockMark(v: unknown): v is FreeDockMark {
+  if (!v || typeof v !== 'object') return false;
+  const m = v as Record<string, unknown>;
+  return typeof m.stationId === 'string' && m.stationId.length <= 256
+    && typeof m.from === 'string' && m.from.length <= 256
+    && typeof m.at === 'number' && Number.isFinite(m.at) && isFreePose(m.pose);
+}
+
+/** The berth answer this game is still waiting on (its doc, and the mark). */
+let dockPending: { doc: unknown; at: number } | null = null;
+/** When this game first saw the mark on the doc bound now. */
+let markSeen: { doc: unknown; at: number; seenAt: number } | null = null;
+
+/** Keep AUTO-DOCK's way back before it docks (this game now awaits the answer). */
+export function markFreeDock(stationId: string, from: string, pose: FreePose, now = Date.now()): boolean {
+  const h = shipDocHandle();
+  if (!h) return false;
+  const mark: FreeDockMark = { stationId, from, pose: cleanPose(pose), at: now };
+  if (!isDockMark(mark)) return false;
+  h.doc.transact(() => h.map.set(DOCK_MARK_KEY, mark));
+  dockPending = { doc: h.doc, at: now };
+  return true;
+}
+
+/** AUTO-DOCK docked: its way back is no longer needed. */
+export function settleFreeDock(): void {
+  dockPending = null;
+  const h = shipDocHandle();
+  if (h && h.map.get(DOCK_MARK_KEY) !== undefined) h.doc.transact(() => h.map.delete(DOCK_MARK_KEY));
+}
+
+/**
+ * Fly on from AUTO-DOCK's mark when the dock did not happen: the ship reads
+ * `docked` at the marked station with no port docked, and no answer is still
+ * due here (`answered`: this game's has just come; else the game that asked
+ * left the room, and the pairings have had FREE_DOCK_SETTLE_MS to arrive).
+ * A docked port, or a record that moved on, clears the mark. Returns whether
+ * the ship flies free again.
+ */
+export function recoverFreeDock(
+  ports: readonly { state: { kind: string } }[],
+  now = Date.now(),
+  answered = false,
+): boolean {
+  const h = shipDocHandle();
+  if (!h) return false;
+  const raw = h.map.get(DOCK_MARK_KEY);
+  if (raw === undefined) return false;
+  const clear = () => h.doc.transact(() => h.map.delete(DOCK_MARK_KEY));
+  if (!isDockMark(raw)) { clear(); return false; }
+  const rec = readFlightRecord();
+  if (rec.status === 'redocking') return false;
+  if (rec.status !== 'docked' || ports.some((p) => p.state.kind === 'docked')) { clear(); return false; }
+  // Another install names the station its own way: not ours to judge (this
+  // game's own answer settled somewhere else, say open orbit, is).
+  if (rec.locationId !== raw.stationId) { if (answered) { dockPending = null; clear(); } return false; }
+  if (answered) {
+    dockPending = null;
+  } else {
+    if (dockPending && dockPending.doc === h.doc && dockPending.at === raw.at) return false;
+    if (!markSeen || markSeen.doc !== h.doc || markSeen.at !== raw.at) {
+      markSeen = { doc: h.doc, at: raw.at, seenAt: now };
+      return false;
+    }
+    if (now - markSeen.seenAt < FREE_DOCK_SETTLE_MS) return false;
+  }
+  if (!writeFreePose(raw.pose)) return false;
+  if (!writeFlightRecord({ status: 'free-flight', locationId: raw.from })) return false;
+  clear();
   return true;
 }
 
@@ -343,6 +433,8 @@ export function resetFreeFlightPilot(): void {
   coastCache = null;
   stationCache = null;
   flyingCache = null;
+  dockPending = null;
+  markSeen = null;
   remoteCache = null;
   remoteCoasts.clear();
 }
