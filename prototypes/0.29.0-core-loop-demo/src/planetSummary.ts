@@ -436,15 +436,23 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   // one it is at now (summaryPlanet: the later move's, over the planet its
   // record was first stamped at), and the record compared leaves the move
   // out (recordOf), so a station republishing after a move still counts.
+  // 🚚 Either way the trim must be of that planet: a moved station's record
+  // can still name the orbit it left (a derived station keeps its first
+  // stamp), and a trim of that orbit is no trim of the station's. Until its
+  // arrival is pinned, a station may have bounced home off a full planet
+  // (each install decides that from the stations it knows), so the planet
+  // it left from counts too.
   const move = newerMove(prior.move, incoming.move);
   const planet = summaryPlanet({ planetId: base.planetId, move }, now);
+  const leftFrom = move && !move.settles && now >= move.arriveAt ? planetById(move.fromPlanetId).id : null;
   const standing = recordOf(canonOrder({ ...base, updatedAt: 0 }));
   const fits = (s: StationSummary): SharedTrim | undefined => {
     const t = s.trim;
     if (!t) return undefined;
+    const at = planetById(t.planetId).id;
+    if (at !== planet && at !== leftFrom) return undefined;
     if (trimFor(base, t)) return t;
-    return planetById(t.planetId).id === planet
-      && recordOf(canonOrder({ ...s, updatedAt: 0 })) === standing ? t : undefined;
+    return recordOf(canonOrder({ ...s, updatedAt: 0 })) === standing ? t : undefined;
   };
   const gone = mergeGone(prior.trimGone, incoming.trimGone);
   // A room's trim read before that room read none is taken back.

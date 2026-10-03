@@ -24,6 +24,7 @@ import {
   setBerthSeedResolver,
   castOffRefusal,
   rememberBerthHere,
+  releaseEveryDock,
   completeArrival,
   planArrivalDock,
   type ArrivalOutcome,
@@ -186,6 +187,44 @@ describe('castOffRefusal', () => {
     expect(castOffRefusal([{ doorId: 'n', state: docked, busy: true }])).toBe('dock-busy');
     expect(castOffRefusal([{ doorId: 'n', state: docked, canOperate: false }])).toBe('dock-locked');
     expect(castOffRefusal([{ doorId: 'n', state: free, busy: true, canOperate: false }])).toBeNull();
+  });
+});
+
+describe('releaseEveryDock', () => {
+  const docked = { kind: 'docked' } as unknown as ArrivalPort['state'];
+  const free = { kind: 'free' } as ArrivalPort['state'];
+  /** Ports n (docked), e (free) and s (docked); each UNDOCK answers `answer`. */
+  const stand = (answer: (doorId: string) => ReturnType<ShipDockingApi['undock']>) => {
+    const asked: string[] = [];
+    const api: ShipDockingApi = {
+      ports: () => [{ doorId: 'n', state: docked }, { doorId: 'e', state: free }, { doorId: 's', state: docked }],
+      undock: (doorId) => { asked.push(doorId); return answer(doorId); },
+      dock: () => true,
+    };
+    return { api, asked };
+  };
+
+  it('asks every docked port, and is true once each let go (no answer counts as let go)', async () => {
+    const all = stand((id) => (id === 'n' ? Promise.resolve(true) : undefined));
+    await expect(releaseEveryDock(all.api)).resolves.toBe(true);
+    expect(all.asked).toEqual(['n', 's']);
+    const none: ShipDockingApi = {
+      ports: () => [{ doorId: 'e', state: free }],
+      undock: () => { throw new Error('a free port is never undocked'); },
+      dock: () => true,
+    };
+    await expect(releaseEveryDock(none)).resolves.toBe(true);
+  });
+
+  it('is false when a dock holds (it answers false, throws or rejects), having asked them all', async () => {
+    const held = stand((id) => (id === 's' ? Promise.resolve(false) : true));
+    await expect(releaseEveryDock(held.api)).resolves.toBe(false);
+    expect(held.asked).toEqual(['n', 's']);
+    const threw = stand((id) => { if (id === 'n') throw new Error('port gone'); return true; });
+    await expect(releaseEveryDock(threw.api)).resolves.toBe(false);
+    expect(threw.asked).toEqual(['n', 's']);
+    const lost = stand(() => Promise.reject(new Error('far room lost')));
+    await expect(releaseEveryDock(lost.api)).resolves.toBe(false);
   });
 });
 

@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS, setStationTrimResolver } from './orbits';
-import { stationBodies } from './map';
+import { courseOnScreen, screenOffset, stationBodies } from './map';
 import {
   bindPlanetSummaryDoc,
   cleanStationSummary,
@@ -1317,6 +1317,23 @@ describe('tugs: a torch tow', () => {
         const there = stationBodies([{ ...DEFAULT_STATION_RECORD, planetId: ARIS, orbitSlot: move.toSlot }], NOW)[0];
         const p2 = place(move.arriveAt + 1000);
         expect(p2).toMatchObject({ parentId: ARIS, radius: there.orbitRadius });
+        // Its course is drawn from the burn to arrival, and the marker rides
+        // it: never farther from a point of it than two points are apart.
+        expect(home.course).toBeUndefined();
+        const drawn = moving.course!;
+        expect(drawn.until).toBe(move.arriveAt);
+        const xy = (p: { angle: number; radius: number }) => screenOffset(p.angle, p.radius);
+        const apart = (a: { dx: number; dy: number }, b: { dx: number; dy: number }) => Math.hypot(a.dx - b.dx, a.dy - b.dy);
+        const first = moveTransitPointAt(move, move.departAt)!;
+        expect(apart(xy(drawn.points[0]), xy({ angle: first.angle, radius: (first.radiusKm / AU_KM) * 180 }))).toBeLessThan(1e-9);
+        const gap = Math.max(...drawn.points.slice(1).map((p, i) => apart(xy(p), xy(drawn.points[i]))));
+        expect(Math.min(...drawn.points.map((p) => apart(xy(p), xy(p1))))).toBeLessThanOrEqual(gap);
+        // On screen while it is under way (or yet to leave), gone once there.
+        expect(courseOnScreen(moving, mid, 100, 100, 1)).toHaveLength(drawn.points.length);
+        expect(courseOnScreen(moving, before, 100, 100, 1)).toHaveLength(drawn.points.length);
+        expect(courseOnScreen(moving, move.arriveAt, 100, 100, 1)).toEqual([]);
+        // Built once it has arrived, it has none.
+        expect(stationBodies([{ ...DEFAULT_STATION_RECORD, move }], move.arriveAt)[0].course).toBeUndefined();
       }
     } finally {
       setStationTrimResolver(null);

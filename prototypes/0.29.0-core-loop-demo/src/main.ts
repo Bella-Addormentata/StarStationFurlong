@@ -1968,7 +1968,7 @@ async function joinRoomAtEpoch(
         ds
           ? {
               ports: () => ds.listDockPorts(),
-              undock: (doorId) => void ds.undockPort(doorId),
+              undock: (doorId) => ds.undockPort(doorId),
               dock: (doorId) => ds.redockPort(doorId),
             }
           : null,

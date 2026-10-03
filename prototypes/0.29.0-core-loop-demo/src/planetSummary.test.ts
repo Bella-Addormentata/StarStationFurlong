@@ -140,8 +140,34 @@ describe('guards', () => {
     expect(mergeStation(first, flown, T0 + 3000)?.trim).toMatchObject({ planetId: ARIS, slot: 5 });
     // Before it arrived, a trim at ARIS is no trim of the station's.
     expect(mergeStation(first, flown, T0 + 500)).toBeNull();
-    // …nor, once there, one of the planet it left.
-    expect(mergeStation(first, { ...first, trim: trim({ slot: 3, at: T0 + 2000 }) }, T0 + 3000)).toBeNull();
+    // Arrived but not pinned yet, it may have bounced home off a full
+    // planet: a newer trim of the planet it left stands, on its old slot or
+    // the next free one there.
+    for (const slot of [2, 3]) {
+      expect(mergeStation(flown, { ...first, trim: trim({ slot, at: T0 + 2500 }) }, T0 + 3000)?.trim)
+        .toMatchObject({ planetId: SOV, slot });
+    }
+  });
+
+  it("keeps a pinned arrival's trim over a newer one of the orbit its record was first stamped in", () => {
+    // A derived station first stamped at SOV slot 2, its arrival at ARIS
+    // slot 5 since pinned, flying a trim there.
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: T0, arriveAt: T0 + 1000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    const pin: StationMove = {
+      ...move, fromPlanetId: ARIS, fromSlot: 5, departAt: T0 + 1000, arriveAt: T0 + 1001, bookedAt: T0 + 1500,
+      settles: move, fuel: 0, fuelDrawn: 0,
+    };
+    const settled = summary({ orbitSlot: 2, trim: trim({ planetId: ARIS, slot: 5, at: T0 + 2000 }), move: pin });
+    // A newer trim of SOV — the very slot the record names, or another — is
+    // no trim of the station's, and the one it flies stays.
+    for (const slot of [2, 3]) {
+      expect(mergeStation(settled, { ...settled, trim: trim({ slot, at: T0 + 2500 }) }, T0 + 3000)).toBeNull();
+      const merged = mergeStation({ ...settled, trim: trim({ slot, at: T0 + 2500 }) }, settled, T0 + 3000);
+      expect(merged?.trim).toMatchObject({ planetId: ARIS, slot: 5 });
+    }
   });
 
   it("keeps the standing record's trim over a newer one for another slot", () => {

@@ -70,7 +70,11 @@ export function castOffRefusal(ports: readonly ArrivalPort[]): 'dock-busy' | 'do
 /** The docking system as departure/arrival drive it (world.ts wires it). */
 export interface ShipDockingApi {
   ports: () => ArrivalPort[];
-  undock: (doorId: string) => void;
+  /** The shipped UNDOCK. Its answer (docking.ts undockPort: false when the
+   *  dock holds — a station between planets keeps its ships, or the port
+   *  could not be operated) says whether this side let go; no answer counts
+   *  as let go. */
+  undock: (doorId: string) => void | boolean | Promise<boolean | void>;
   /** The shipped DOCK. Its answer (docking.ts redockPort: false when the far
    *  berth refused, e.g. taken) settles what the helm says; no answer counts
    *  as docked. */
@@ -502,8 +506,10 @@ export function rememberBerthHere(stationId: string, ports: readonly ArrivalPort
   return false;
 }
 
-/** DEPART's cast-off: remember the berth here, then UNDOCK every docked port.
- *  Returns whether the berth here is remembered. */
+/** A cast-off that does not wait: remember the berth here, then UNDOCK every
+ *  docked port. Returns whether the berth here is remembered. A flight
+ *  committed before its docks answer can find one that holds: the helm's
+ *  DEPART waits for them (releaseEveryDock). */
 export function castOffForDeparture(stationId: string, docking: ShipDockingApi): boolean {
   const ports = docking.ports();
   const remembered = rememberBerthHere(stationId, ports);
@@ -512,6 +518,24 @@ export function castOffForDeparture(stationId: string, docking: ShipDockingApi):
     if (p.state.kind === 'docked') docking.undock(p.doorId);
   }
   return remembered;
+}
+
+/** 🚚 UNDOCK every docked port and wait for each answer: true once every one
+ *  let go. A dock that holds keeps the ship — a station between planets
+ *  carries the ships docked to it, and the far room may know of a move this
+ *  client has not heard of (docking.ts undockPort then puts this side back)
+ *  — so DEPART commits its flight and its fuel only after this. */
+export async function releaseEveryDock(docking: ShipDockingApi): Promise<boolean> {
+  const answers = await Promise.all(docking.ports()
+    .filter((p) => p.state.kind === 'docked')
+    .map(async (p) => {
+      try {
+        return (await docking.undock(p.doorId)) !== false;
+      } catch {
+        return false;
+      }
+    }));
+  return answers.every(Boolean);
 }
 
 /** What the last arrival did — the helm shows it. */
