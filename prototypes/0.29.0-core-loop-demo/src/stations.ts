@@ -114,6 +114,9 @@ export function cleanBerth(v: unknown): StationBerthRecord | null {
   if (typeof v !== 'object' || v === null) return null;
   const b = v as Record<string, unknown>;
   if (typeof b.roomId !== 'string' || !b.roomId || b.roomId.length > MAX_ID_LENGTH) return null;
+  // Never '__proto__': each room's gates are stamped under its id in a plain
+  // object (planetSummary's berthRoomsAt), which cannot hold that key.
+  if (b.roomId === '__proto__') return null;
   if (typeof b.doorId !== 'string' || !isAcceptableDoorKey(b.doorId)) return null;
   const out: StationBerthRecord = { roomId: b.roomId, doorId: b.doorId };
   if (typeof b.gate === 'number' && Number.isInteger(b.gate) && b.gate >= 1 && b.gate <= 99) out.gate = b.gate;
@@ -658,7 +661,11 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
   // known: learned gates in it are gone, not merely unseen. Only rooms it
   // knows nothing of keep what the record learned, beside the atlas's own.
   const unknown = (roomId: string) => atlas[roomId]?.gates === undefined;
-  const learned = (st.berths ?? []).filter((b) => unknown(b.roomId));
+  // A room harvested with a port not numbered yet (gatesUnknown) lists no
+  // gate at all: what the record learned there is out of date, and only the
+  // plain berthDoor stands for its port.
+  const unnumbered = (roomId: string) => atlas[roomId]?.gatesUnknown === true;
+  const learned = (st.berths ?? []).filter((b) => unknown(b.roomId) && !unnumbered(b.roomId));
   if (gates.length > 0) {
     const seen: StationBerthRecord[] = gates.map((g) => ({
       roomId: g.roomId, doorId: g.doorId, gate: g.gate, ...(g.occupied ? { occupied: true } : {}),
@@ -672,8 +679,10 @@ function withBerths(st: StationRecord, atlas: Record<string, AtlasEntry>): Stati
   } else {
     berths = learned;
     // An empty list means "known to have none" (a summary's, or this atlas's
-    // own harvest of the welcome room): only an unknown station falls back.
-    knownNone = Array.isArray(st.berths) || (!!st.welcomeRoomId && !unknown(st.welcomeRoomId));
+    // own harvest of the welcome room): only an unknown station falls back,
+    // or one whose welcome room has a port not numbered yet.
+    knownNone = !unnumbered(st.welcomeRoomId)
+      && (Array.isArray(st.berths) || (!!st.welcomeRoomId && !unknown(st.welcomeRoomId)));
     if (berths.length === 0 && !knownNone && st.berthDoor && st.welcomeRoomId) {
       berths = [{ roomId: st.welcomeRoomId, doorId: st.berthDoor }];
     }

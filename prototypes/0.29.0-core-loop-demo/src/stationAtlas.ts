@@ -554,6 +554,16 @@ function cleanGateAccess(v: Record<string, unknown>, gates: Record<string, numbe
   return out;
 }
 
+/** ⚓🚦 Whether a doc copy of a room stamped `updatedAt` decides its gates
+ *  over our entry `prior` (pullSharedAtlas, withSharedAtlasOf): when ours is
+ *  missing, bundled, older, or never heard of gates. A copy no newer than ours
+ *  replaces nothing we know of them, our word that they are not known
+ *  included. */
+function docDecidesGates(prior: AtlasEntry | undefined, updatedAt: number): boolean {
+  return !prior || prior.bundled === true || updatedAt > prior.lastSeen
+    || (prior.gates === undefined && !prior.gatesUnknown);
+}
+
 /** One gate of a station: a dock port, its room and its number. */
 export interface StationGate {
   roomId: string;
@@ -654,8 +664,8 @@ export function steppedGateNumberHere(
  * doc crowded with other stations' entries cannot push this one's out of
  * reach. A room the local atlas lacks comes from the doc; a known room gains
  * any door pairing it lacks (a newer doc copy's pairings replace ours door by
- * door), and the doc's gates when it has none or the doc's copy is newer (as
- * pullSharedAtlas arbitrates), so the station walk
+ * door), and the doc's gates or its word that they are not known, as
+ * pullSharedAtlas arbitrates them (docDecidesGates), so the station walk
  * and the numbers taken both see what the far station has published. Peer
  * entries are shape-checked and capped as pullSharedAtlas does. Pure:
  * nothing is written.
@@ -695,7 +705,7 @@ export function withSharedAtlasOf(
           roomId: rid,
           name: value.name || 'Module',
           doors,
-          ...(gates ? { gates } : {}),
+          ...(gates ? { gates } : value.gatesUnknown === true ? { gatesUnknown: true as const } : {}),
           lastSeen: value.updatedAt,
         };
       } else {
@@ -714,7 +724,17 @@ export function withSharedAtlasOf(
           ...prior,
           doors: newer ? (whole ? withSeeds : { ...prior.doors, ...withSeeds }) : { ...doors, ...prior.doors },
         };
-        if (gates && (prior.gates === undefined || newer)) merged.gates = gates;
+        // Gates as pullSharedAtlas takes them: the doc's list, or its word
+        // that they are not known, when the doc's copy decides them.
+        if ((gates || value.gatesUnknown === true) && docDecidesGates(prior, value.updatedAt)) {
+          delete merged.gates;
+          delete merged.gateAccess;
+          delete merged.gatesUnknown;
+          if (gates) {
+            merged.gates = gates;
+            if (value.gateAccess !== undefined) merged.gateAccess = cleanGateAccess(value.gateAccess, gates);
+          } else merged.gatesUnknown = true;
+        }
         out[rid] = merged;
       }
     }
@@ -1312,8 +1332,7 @@ function pullSharedAtlas(): void {
     // than ours replaces nothing we know of them, our word that they are not
     // known included. Silence (an older client) keeps what we knew, like dims;
     // a newer copy saying they are not known drops our list.
-    const docGates = !prior || prior.bundled || value.updatedAt > prior.lastSeen
-      || (prior.gates === undefined && !prior.gatesUnknown);
+    const docGates = docDecidesGates(prior, value.updatedAt);
     const listed = docGates && value.gates !== undefined && isPlainGates(value.gates)
       ? cleanGates(value.gates)
       : undefined;

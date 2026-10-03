@@ -291,6 +291,25 @@ describe('a room with a port not numbered yet', () => {
     expect(readAtlas()['room-far']?.gatesUnknown).toBeUndefined();
   });
 
+  it('offers no gate the record learned in the room, only its legacy berth', () => {
+    // The record learned the station's gates (a summary) while room-far's
+    // ports were numbered; room-aft is a room this client never harvested.
+    registerStation({
+      id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'north',
+      berths: [{ roomId: 'room-far', doorId: 'east', gate: 1 }],
+    });
+    harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: null });
+    const far = listStations().find((s) => s.id === 'far')!;
+    expect(far.berths).toEqual([{ roomId: 'room-far', doorId: 'north' }]);
+    expect(far.berthDoor).toBe('north');
+    // What it learned in a room never harvested still stands.
+    registerStation({
+      id: 'far', name: 'FAR', planetId: 'planet-sovereign', orbitSlot: 4, welcomeRoomId: 'room-far', berthDoor: 'north',
+      berths: [{ roomId: 'room-far', doorId: 'east', gate: 1 }, { roomId: 'room-aft', doorId: 'south', gate: 2 }],
+    });
+    expect(listStations().find((s) => s.id === 'far')?.berths).toEqual([{ roomId: 'room-aft', doorId: 'south', gate: 2 }]);
+  });
+
   it("keeps the gates unknown through an older doc copy's list", () => {
     harvestIntoAtlas({ roomId: 'room-far', name: 'FAR', doors: [], gates: {} });
     const doc = new Y.Doc();
@@ -454,6 +473,34 @@ describe("a far room doc's shared atlas", () => {
     const doc = new Y.Doc();
     doc.getMap('atlas').set('far-dock', entry('far-dock', Date.now() + 60_000, { 'd:hall': { targetRoomId: 'far-hub', farDoor: 'd:in', transient: false } }));
     expect(withSharedAtlasOf(doc, readAtlas(), 'far-dock')['far-dock'].doors['d:hall'].targetSeed).toBe(seed('far-hub'));
+  });
+
+  it("follows a doc copy's word that a room's gates are not known as the gossip pull does", () => {
+    harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: { 'd:p1': 1 } });
+    const doc = new Y.Doc();
+    const unknownAt = (updatedAt: number) => ({ roomId: 'room-hub', name: 'HUB', updatedAt, doors: {}, gatesUnknown: true });
+    // A newer copy says the room has a port with no number: our list goes.
+    doc.getMap('atlas').set('room-hub', unknownAt(Date.now() + 60_000));
+    const newer = withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'];
+    expect(newer.gates).toBeUndefined();
+    expect(newer.gatesUnknown).toBe(true);
+    // An older one leaves our list alone.
+    doc.getMap('atlas').set('room-hub', unknownAt(1));
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'].gates).toEqual({ 'd:p1': 1 });
+    // Where we found the gates not known, an older copy's list does not
+    // come back; a newer one's does.
+    harvestIntoAtlas({ roomId: 'room-hub', name: 'HUB', doors: [], gates: null });
+    doc.getMap('atlas').set('room-hub', entry('room-hub', 1, {}, { 'd:p9': 9 }));
+    const older = withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'];
+    expect(older.gates).toBeUndefined();
+    expect(older.gatesUnknown).toBe(true);
+    doc.getMap('atlas').set('room-hub', entry('room-hub', Date.now() + 60_000, {}, { 'd:p2': 2 }));
+    const listed = withSharedAtlasOf(doc, readAtlas(), 'room-hub')['room-hub'];
+    expect(listed.gates).toEqual({ 'd:p2': 2 });
+    expect(listed.gatesUnknown).toBeUndefined();
+    // A room only the doc knows keeps its word too.
+    doc.getMap('atlas').set('room-new', { roomId: 'room-new', name: 'NEW', updatedAt: 1, doors: {}, gatesUnknown: true });
+    expect(withSharedAtlasOf(doc, readAtlas(), 'room-new')['room-new'].gatesUnknown).toBe(true);
   });
 
   it("takes the doc's gates for a known room when the doc's copy is newer", () => {
@@ -696,6 +743,26 @@ describe('the per-planet summary', () => {
       expect(again.berthRoomsAt?.['room-zz']).toBe(T0 + 5);
       const after = mergeStation(again, old) ?? again;
       expect(after.berths!.some((b) => b.roomId === 'room-zz')).toBe(false);
+    }
+  });
+
+  it('lists no gate in a room called __proto__, whose removal no stamp could carry', () => {
+    // Room ids are peer-written. A stamp keyed '__proto__' is lost on a plain
+    // object and on the doc's wire, so that room's removal could never stand
+    // against an older copy listing its gate.
+    expect(cleanBerths([{ roomId: '__proto__', doorId: 'north', gate: 1 }])).toEqual([]);
+    const old = cleanStationSummary({
+      ...base({ ownerId: 'hub' }), berthsAt: T0,
+      berths: [{ roomId: '__proto__', doorId: 'north', gate: 1 }, { roomId: 'room-b', doorId: 'south', gate: 2 }],
+    }, T0 + 10)!;
+    expect(old.berths).toEqual([{ roomId: 'room-b', doorId: 'south', gate: 2 }]);
+    const stamps = JSON.parse(`{"__proto__": ${T0 + 5}, "room-c": ${T0 + 5}}`) as Record<string, number>;
+    const gone = cleanStationSummary({
+      ...base({ ownerId: 'hub' }), berths: [{ roomId: 'room-b', doorId: 'south', gate: 2 }], berthsAt: T0 + 5, berthRoomsAt: stamps,
+    }, T0 + 10)!;
+    expect(Object.keys(gone.berthRoomsAt ?? {})).toEqual(['room-c']);
+    for (const merged of [mergeStation(old, gone) ?? old, mergeStation(gone, old) ?? gone]) {
+      expect(merged.berths).toEqual([{ roomId: 'room-b', doorId: 'south', gate: 2 }]);
     }
   });
 

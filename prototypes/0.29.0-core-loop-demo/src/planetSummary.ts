@@ -320,7 +320,9 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
     if (isPlainObject(v.berthRoomsAt)) {
       const rooms: Record<string, number> = {};
       for (const [room, at] of Object.entries(v.berthRoomsAt)) {
-        if (isId(room) && isStamp(at, now)) rooms[room] = at;
+        // No room called '__proto__' lists gates (cleanBerth), and this
+        // object could not hold its stamp.
+        if (isId(room) && room !== '__proto__' && isStamp(at, now)) rooms[room] = at;
       }
       const canon = canonRoomStamps(out.berths, out.berthsAt, rooms);
       if (canon) out.berthRoomsAt = canon;
@@ -471,7 +473,7 @@ function canonRoomStamps(
   const listed = new Set(berths.map((b) => b.roomId));
   const newest = (x: [string, number], y: [string, number]) => y[1] - x[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0);
   const all = (rooms instanceof Map ? [...rooms] : Object.entries(rooms))
-    .filter(([room, at]) => at !== berthsAt || !listed.has(room));
+    .filter(([room, at]) => room !== '__proto__' && (at !== berthsAt || !listed.has(room)));
   const entries = [
     ...all.filter(([room]) => listed.has(room)).sort(newest).slice(0, MAX_BERTHS),
     ...all.filter(([room]) => !listed.has(room)).sort(newest).slice(0, MAX_ROOM_TOMBSTONES),
