@@ -242,7 +242,8 @@ import {
 } from "./doorsDoc";
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
 // and the far room's end of every DOCK / UNDOCK.
-import { isDockChain } from "./adapter";
+import { dockChain, isDockChain, projectionPoseFromWall } from "./adapter";
+import { halfAlongWall } from "./doorMatch";
 import { gateAdmits, mirrorMayWrite } from "./dockRules";
 import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
@@ -346,6 +347,7 @@ import {
   harvestIntoAtlas,
   freeGateNumberHere,
   readAtlas,
+  moduleOverlapAt,
   atlasComponent,
   bindStationAtlasDoc,
   pushAtlasToDoc,
@@ -1422,6 +1424,21 @@ const gateKeeper = createGateKeeper({
   open: (address) => (roomSessionDeps ? openRoomSession(roomSessionDeps, address) : Promise.resolve(null)),
   ownAddress: resolveOwnRoomAddress,
   doorPose: (doorId) => world?.dockingSystem?.doorWallLateral(doorId) ?? null,
+  // 🛰️ As a DOCK checks (docking.ts redockPortAnswer): the ferry, docked at
+  // this gate, must not land on another module of the station.
+  overlap: (doorId, ferry) => {
+    const pose = world?.dockingSystem?.doorWallLateral(doorId);
+    if (!pose) return null;
+    const at = projectionPoseFromWall(
+      pose.wall,
+      pose.lateral,
+      dockChain(),
+      ferry.farWall ?? null,
+      ferry.farLateral ?? 0,
+      ferry.farWall ? halfAlongWall(readAtlas()[ferry.roomId]?.dims, ferry.farWall) : undefined,
+    );
+    return moduleOverlapAt(activeBootstrap?.roomId ?? "", at)?.name ?? null;
+  },
   writeDoor: (doorId, rec) => {
     if (yjsSync) writeDoorRecordTo(yjsSync.doc, doorId, rec);
   },

@@ -23,10 +23,12 @@
  *   keeperStep says       the gate keeper
  *   ───────────────       ───────────────
  *   dock                  DOCKS the ferry's route port at a free auto-dock
- *                         gate that admits it (open, or reserved for it): the
- *                         stop's own gate first, another only when the stop
- *                         allows a gate change. GATE_DOCK_DEFER_MS after the
- *                         arrival, so a rider's keeper goes first.
+ *                         gate that admits it (open, or reserved for it) and
+ *                         where its module would not overlap another of the
+ *                         station (as a DOCK checks): the stop's own gate
+ *                         first, another only when the stop allows a gate
+ *                         change. GATE_DOCK_DEFER_MS after the arrival, so a
+ *                         rider's keeper goes first.
  *   cast off              UNDOCKS the ferry from this room's gate,
  *                         GATE_CAST_OFF_DEFER_MS after the departure (inside
  *                         the keeper's CAST_OFF_LATE_MS, so the leg stands).
@@ -74,26 +76,28 @@
  *
  * The ferry's doors are what its timetable reads, so the gate follows the
  * ferry (gateFixes), checked before every step: a dock the ferry's port holds
- * to an auto-dock gate is taken by the gate too (a far write that never
- * landed here, the walk-through mirror's job); a dock the gate holds that the
- * ferry has provably let go (its port undocked after it, or docked elsewhere
- * since) or has not held for GATE_STALE_MS is let go at the gate; an undock
- * made at the gate after the ferry's dock reaches the ferry; and a gate that
- * has taken another pairing keeps it while the ferry's port lets go. A claim
- * at a gate that the keeper has not yet seen the ferry's port hold, or a gate
- * that let go of the ferry before its port was seen to, keeps a session open
- * until the two ends agree, whatever the route does (paused, ended or
- * finished). So does what the keeper left under way at a gate whose AUTO-DOCK
- * is switched off since: it is settled there, but nothing new is docked or
- * cast off at that gate. A write to the ferry's room that is never
- * acknowledged hangs its session up, so nothing is read from a doc the room
- * may never hold: a fresh session reads what the room does hold (at once,
- * then backing off while acknowledgments keep failing), and what is missing
- * is written again. The keeper watches each ferry by its route port: when the
- * entry here stops calling here by that port (a newer route leaves this room
- * out or calls by another port, or the capped departures map evicts it),
- * what it left under way is still settled, by that port and the address it
- * last dialled, before it forgets the ferry.
+ * to an auto-dock gate is taken by the gate too (a far write that never landed
+ * here, the walk-through mirror's job); a dock the gate holds that the ferry
+ * has provably let go (its port undocked after it, or docked elsewhere since)
+ * or has not held for GATE_STALE_MS is let go at the gate; an undock made at
+ * the gate after the ferry's dock reaches the ferry; and a gate that has taken
+ * another pairing, or whose port was taken off since, keeps what it holds
+ * while the ferry's port lets go. A claim at a gate that the keeper has not
+ * yet seen the ferry's port hold, or a gate that let go of the ferry before
+ * its port was seen to, keeps a session open until the two ends agree,
+ * whatever the route does (paused, ended or finished). So does what the keeper
+ * left under way at a gate whose AUTO-DOCK is switched off since: it is
+ * settled there, but nothing new is docked or cast off at that gate. A write
+ * to the ferry's room that is never acknowledged hangs its session up, so
+ * nothing is read from a doc the room may never hold: a fresh session reads
+ * what the room does hold (at once, then backing off while acknowledgments
+ * keep failing), and what is missing is written again; a checkpoint never
+ * acknowledged is told to every stop once a session reads what the room holds.
+ * The keeper watches each ferry by its route port: when the entry here stops
+ * calling here by that port (a newer route leaves this room out or calls by
+ * another port, or the capped departures map evicts it), what it left under
+ * way is still settled, by that port and the address it last dialled, before
+ * it forgets the ferry.
  *
  * ─── Limits (v1) ─────────────────────────────────────────────────────────────
  *
@@ -482,6 +486,9 @@ export function ferryLook(o: {
 
 export type GateMove =
   | { kind: 'none'; why: 'idle' | 'defer' | 'not-here' | 'claimed' | 'no-gate' | 'not-ours' | 'renew' }
+  /** Every gate the ferry may dock at would put it on top of another module
+   *  here: the first of them, and the module. */
+  | { kind: 'none'; why: 'overlap'; gate: GateView; module: string }
   /** Dock the ferry at this gate. */
   | { kind: 'dock'; gate: GateView }
   /** Cast the ferry off this gate. */
@@ -489,7 +496,7 @@ export type GateMove =
   /** Write this checkpoint into the ferry's ship map. */
   | { kind: 'write'; why: 'end-hold' | 'restart' | 'anchor'; entry: RouteCheckpoint };
 
-const none = (why: Extract<GateMove, { kind: 'none' }>['why']): GateMove => ({ kind: 'none', why });
+const none = (why: Exclude<Extract<GateMove, { kind: 'none' }>['why'], 'overlap'>): GateMove => ({ kind: 'none', why });
 
 /**
  * The gate keeper's part of a keeper step (the header's table). `near` gives
@@ -507,6 +514,9 @@ export function gateMove(o: {
   roomId: string;
   shipRoomId: string;
   near: (doorId: string) => NearEnd;
+  /** The module the ferry would overlap docked at this gate (as a DOCK
+   *  checks), or null. Default: none. */
+  overlap?: (gate: GateView) => string | null;
   now: number;
 }): GateMove {
   const { step, look, now } = o;
@@ -538,8 +548,15 @@ export function gateMove(o: {
         return none('claimed');
       }
       if (f.stayStart !== null && now < f.stayStart + GATE_DOCK_DEFER_MS) return none('defer');
-      const gate = dockableGates(o.gates, stop, o.shipRoomId)[0];
-      return gate ? { kind: 'dock', gate } : none('no-gate');
+      // The first that fits: a gate where the ferry would overlap another
+      // module of the station is passed over, as a DOCK refuses it.
+      let clash: { gate: GateView; module: string } | null = null;
+      for (const gate of dockableGates(o.gates, stop, o.shipRoomId)) {
+        const module = o.overlap?.(gate) ?? null;
+        if (module === null) return { kind: 'dock', gate };
+        clash ??= { gate, module };
+      }
+      return clash ? { kind: 'none', why: 'overlap', ...clash } : none('no-gate');
     }
   }
 }
@@ -603,9 +620,13 @@ export function gateFixes(o: {
         out.push({ kind: 'release-ferry', gate: g.doorId, undockedAt: stampAfter(x, o.now) });
         continue;
       }
-      // Nor is a plain tombstone: a port taken off since, or a gangway's
-      // end, which no dock may re-make (dockRules.farDockPatch).
-      if (rec && !rec.dock) continue;
+      // Nor is a plain tombstone (the gate's port taken off since, or a
+      // gangway's end): the keeper makes no dock over it, and the ferry's
+      // port lets go.
+      if (rec && !rec.dock) {
+        out.push({ kind: 'release-ferry', gate: g.doorId, undockedAt: stampAfter(x, o.now) });
+        continue;
+      }
       // The gate let go after the ferry's dock: the ferry lets go too.
       if (rec?.dock && x !== undefined && rec.dock.undockedAt >= x) {
         out.push({ kind: 'release-ferry', gate: g.doorId, undockedAt: rec.dock.undockedAt });
@@ -914,6 +935,11 @@ export interface GateKeeperDeps {
   ownAddress: (roomId: string) => Promise<string | null>;
   /** A gate's wall and along-wall centre in this room (docking.ts). */
   doorPose: (doorId: string) => { wall: DoorWall; lateral: number } | null;
+  /** The module of this station the ferry would overlap, docked at this
+   *  room's door `doorId` by its port posed as this room remembers it (as a
+   *  DOCK checks: stationAtlas.moduleOverlapAt over the projected pose), or
+   *  null. Default: none. */
+  overlap?: (doorId: string, ferry: { roomId: string; farWall?: DoorWall; farLateral?: number }) => string | null;
   /** Write one of this room's door records. */
   writeDoor: (doorId: string, rec: DoorRecord) => void;
   /** Is a dock between these rooms locked by a station move? */
@@ -1294,14 +1320,19 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     if (reconcile(w, session, gates, retired, w.port, berthing, now)) return;
     if (!ferry) return;
     const news = newsOf(w, now);
-    if (!news) return;
+    if (!news) {
+      // No route in the ferry's room: nothing to tell any stop.
+      w.unpublished = null;
+      return;
+    }
     // The board here learns what the ferry's doc says, once per session: a
     // finish it missed too, or its timetable would run on here, and this
     // keeper dial on it. After a write of this keeper's that was never
-    // acknowledged, every stop does (it may have landed after all).
+    // acknowledged, every stop does (it may have landed after all), even
+    // when this board has it already (another game told it).
     if (!w.refreshed) {
       w.refreshed = true;
-      if (!sameNews(news, ferry)) publish(w, ferry, w.unpublished !== null, w.unpublished);
+      if (w.unpublished !== null || !sameNews(news, ferry)) publish(w, ferry, w.unpublished !== null, w.unpublished);
       w.unpublished = null;
     }
     if (!isRouteRunning(news.route)) return;
@@ -1330,13 +1361,27 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
 
     // 2. The ferry's riders' decision, on the ferry's own doc.
     const step = keeperStep(look.view);
-    const move = gateMove({ step, look, gates, settling: retired, roomId, shipRoomId: w.ship, near, now });
+    // Where the ferry's port would put its module at each gate: a check that
+    // throws docks nothing there.
+    const overlap = (g: GateView): string | null => {
+      if (!berthing || !deps.overlap) return null;
+      try {
+        return deps.overlap(g.doorId, { roomId: w.ship, farWall: berthing.farWall, farLateral: berthing.farLateral });
+      } catch (err) {
+        console.warn('[gate] overlap check failed:', err);
+        return 'another module';
+      }
+    };
+    const move = gateMove({ step, look, gates, settling: retired, roomId, shipRoomId: w.ship, near, overlap, now });
     const dockLocked = (): boolean => safe(() => deps.dockLocked?.([roomId, w.ship], now) === true, false);
     switch (move.kind) {
       case 'none':
-        if (move.why === 'no-gate') {
+        if (move.why === 'no-gate' || move.why === 'overlap') {
           mem.nextPassAt = now + KEEPER_RETRY_MS;
           mem.verdict = 'none';
+        }
+        if (move.why === 'overlap') {
+          safe(() => deps.note?.(move.gate.doorId, `Can't dock ${ferry.name} here: it would overlap ${move.module}.`, 'bad'), undefined);
         }
         return;
       case 'write': {
@@ -1499,8 +1544,10 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const pending = watched.some((g) => !settledAt(w, g, shipPort));
     // That, or a write of its own to the ferry's side never acknowledged,
     // keeps a session whatever the route does, until the two ends agree
-    // (reconcile).
-    const unsettled = w.repair || pending;
+    // (reconcile); and so does a checkpoint never acknowledged, until every
+    // stop is told what the ferry's room holds (act), while the ferry still
+    // calls here.
+    const unsettled = w.repair || pending || (ferry !== null && w.unpublished !== null);
     if (!ferry && !unsettled) return false;
     if (holding.length === 0 && !free && !unsettled) {
       hangUp(w);
@@ -1554,8 +1601,8 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       const now = clock();
       const gates = safe(deps.gates, [] as GateView[]);
       // No auto-dock gate here, and nothing left to settle at one switched
-      // off since: nothing to watch.
-      if (gates.length === 0 && ![...watches.values()].some((w) => w.managed.size > 0 || w.repair)) {
+      // off since, or to tell the stops: nothing to watch.
+      if (gates.length === 0 && ![...watches.values()].some((w) => w.managed.size > 0 || w.repair || w.unpublished !== null)) {
         for (const w of watches.values()) hangUp(w);
         watches.clear();
         return;

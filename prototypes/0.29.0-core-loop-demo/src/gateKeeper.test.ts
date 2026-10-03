@@ -8,9 +8,11 @@
  * session: a whole call (dock on arrival, cast off at the departure), a stay
  * found docked late, a far write that never landed, a claim never taken (the
  * route running, paused or finished), a checkpoint, a cast-off or a dock never
- * acknowledged, a gate another game wrote over while a dock was asked, a
- * finish this board missed, a dock locked while its claim settled, and a
- * ferry that stops calling here by its port.
+ * acknowledged (a checkpoint told to every stop), a gate another game wrote
+ * over while a dock was asked, a gate's port taken off while a cast-off
+ * waits, a gate where the ferry would overlap another module, a finish this
+ * board missed, a dock locked while its claim settled, and a ferry that stops
+ * calling here by its port.
  */
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -300,6 +302,29 @@ describe("the ferry's own view, and what the gate does with its keeper's step", 
     expect(at(doc, t, gates(), 'room-9').move).toEqual({ kind: 'none', why: 'not-here' });
   });
 
+  // Copilot (PR 204): a DOCK refuses a berth where the module would land on
+  // another one of the station, and so does the station's keeper.
+  it('passes over a gate where the ferry would overlap another module, as a DOCK refuses it', () => {
+    const t = ARRIVE + GATE_DOCK_DEFER_MS;
+    const moveAt = (doc: Y.Doc, clashes: Record<string, string>) => {
+      const look = ferryLook({ doc, capacity: BIG, now: t, sameStation, memory: null })!;
+      return gateMove({
+        step: keeperStep(look.view), look, gates: gates(memoryOf(T0 - HOUR)), roomId: HERE, shipRoomId: FERRY, near, now: t,
+        overlap: (g) => clashes[g.doorId] ?? null,
+      });
+    };
+    const doc = ferryDoc();
+    expect(moveAt(doc, {})).toMatchObject({ kind: 'dock', gate: { doorId: 'x+' } });
+    expect(moveAt(doc, { 'x+': 'Cargo Bay' })).toMatchObject({ kind: 'dock', gate: { doorId: 'y-' } });
+    expect(moveAt(doc, { 'x+': 'Cargo Bay', 'y-': 'Hab Ring' }))
+      .toMatchObject({ kind: 'none', why: 'overlap', gate: { doorId: 'x+' }, module: 'Cargo Bay' });
+    // A stop with no gate change: its own gate or none.
+    const own = ferryDoc();
+    own.getMap('ship').set('route', routeToWire({ ...R, stops: [stop(0, 0), stop(1, 1, { berth: { roomId: HERE, farDoor: 'x+', anyGate: false } })] }));
+    expect(moveAt(own, { 'x+': 'Cargo Bay' }))
+      .toMatchObject({ kind: 'none', why: 'overlap', gate: { doorId: 'x+' }, module: 'Cargo Bay' });
+  });
+
   it('docks nowhere while one of its gates holds a claim on the ferry (a DOCK under way)', () => {
     const r = at(ferryDoc(), ARRIVE + GATE_DOCK_DEFER_MS, gates(dockOf(ARRIVE + 2 * SEC)));
     expect(r.step).toEqual({ kind: 'dock' });
@@ -365,8 +390,12 @@ describe('the gate follows the ferry', () => {
       .toEqual([{ kind: 'release-ferry', gate: 'x+', undockedAt: T0 + SEC }]);
   });
 
-  it('never touches a plain tombstone, or a gate that does not admit the ferry', () => {
-    expect(fixes([gate('x+', 1, buildDoorTombstone(seed(FERRY)))], portDockedAt(T0))).toEqual([]);
+  // Copilot (PR 204): a plain tombstone at the gate (its port taken off
+  // since) holds no dock, and none is made over it: the ferry's port lets go.
+  it('lets the ferry go from a plain tombstone at the gate, and takes no dock at a gate that does not admit it', () => {
+    const release = [{ kind: 'release-ferry', gate: 'x+', undockedAt: NOW }];
+    expect(fixes([gate('x+', 1, buildDoorTombstone(seed(FERRY)))], portDockedAt(T0))).toEqual(release);
+    expect(fixes([gate('x+', 1, buildDoorTombstone(seed('ship-2')), { retired: true })], portDockedAt(T0))).toEqual(release);
     expect(fixes([gate('x+', 1, memoryOf(T0 - HOUR), { access: 'closed' })], portDockedAt(T0))).toEqual([]);
   });
 
@@ -910,6 +939,82 @@ describe('the gate keeper over a stand-in session', () => {
     expect(h.published.map(([room]) => room)).toEqual(['here', 'room-0']);
   });
 
+  // Copilot (PR 204): a checkpoint never acknowledged is owed to every stop,
+  // even once this board has it from another game.
+  it('tells every stop a checkpoint never acknowledged, even once this board has it from another game', async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+    const keeper = createGateKeeper(deps);
+    const late = DEPART + HOUR;
+    h.ack = false;
+    await tickAt(keeper, h, late);
+    await tickAt(keeper, h, late + SEC);
+    const news = routeIn(h.ferry.getMap('ship'), late + SEC);
+    expect(news.checkpoints.some((e) => e.kind === 'dock')).toBe(true);
+    expect(h.published).toEqual([]);
+    // Another game's keeper tells this board what the ferry's room holds.
+    h.entry = { ...h.entry, route: news.route!, checkpoints: [...news.checkpoints], at: late + SEC };
+    h.ack = true;
+    await tickAt(keeper, h, late + 2 * SEC);
+    expect(h.opened).toHaveLength(2);
+    await tickAt(keeper, h, late + 3 * SEC);
+    expect(h.published.map(([room]) => room)).toEqual(['here', 'room-0']);
+  });
+
+  it("tells every stop a checkpoint never acknowledged after the room's last auto-dock gate is switched off", async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+    h.auto = new Set(['x+']);
+    const keeper = createGateKeeper(deps);
+    const late = DEPART + HOUR;
+    h.ack = false;
+    await tickAt(keeper, h, late);
+    await tickAt(keeper, h, late + SEC);
+    expect(h.published).toEqual([]);
+    expect(h.closes).toBe(1);
+    h.auto.clear();
+    h.ack = true;
+    await tickAt(keeper, h, late + 2 * SEC);
+    expect(h.opened).toHaveLength(2);
+    await tickAt(keeper, h, late + 3 * SEC);
+    expect(h.published.map(([room]) => room)).toEqual(['here', 'room-0']);
+    // Told: nothing is left to watch.
+    await tickAt(keeper, h, late + 4 * SEC);
+    await tickAt(keeper, h, late + 5 * SEC);
+    expect(keeper.sessions()).toEqual([]);
+    expect(h.closes).toBe(2);
+  });
+
+  it('forgets a checkpoint never acknowledged once the ferry stops calling here', async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+    let entries: DepartureFerry[] | null = null;
+    const keeper = createGateKeeper({ ...deps, ferries: () => entries ?? [h.entry] });
+    const late = DEPART + HOUR;
+    h.ack = false;
+    await tickAt(keeper, h, late);
+    await tickAt(keeper, h, late + SEC);
+    entries = [];
+    h.ack = true;
+    for (let i = 2; i <= 6; i++) await tickAt(keeper, h, late + i * SEC);
+    expect(h.published).toEqual([]);
+    expect(keeper.sessions()).toEqual([]);
+  });
+
+  it("forgets a checkpoint never acknowledged once the ferry's room holds no route", async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+    h.auto = new Set(['x+']);
+    const keeper = createGateKeeper(deps);
+    const late = DEPART + HOUR;
+    h.ack = false;
+    await tickAt(keeper, h, late);
+    await tickAt(keeper, h, late + SEC);
+    h.ferry.getMap('ship').delete('route');
+    h.auto.clear();
+    h.ack = true;
+    for (let i = 2; i <= 6; i++) await tickAt(keeper, h, late + i * SEC);
+    expect(h.opened).toHaveLength(2);
+    expect(h.published).toEqual([]);
+    expect(keeper.sessions()).toEqual([]);
+  });
+
   // Copilot (PR 204): a write to the ferry's side of a dock that is never
   // acknowledged is read back from a fresh session and made again.
   it("makes a cast-off the ferry's room never took again, backing off while acknowledgments fail", async () => {
@@ -1156,6 +1261,84 @@ describe('the gate keeper over a stand-in session', () => {
     await tickAt(keeper, h, t + 4 * SEC);
     expect(keeper.sessions()).toEqual([]);
     expect(h.closes).toBe(2);
+  });
+
+  // Copilot (PR 204): the gate's port taken off before the retry of a
+  // cast-off the ferry never took: the ferry's port still lets go.
+  it("lets the ferry's port go once the gate's port is taken off while a cast-off is unacknowledged", async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0), replica: true });
+    h.auto = new Set(['x+']);
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, DEPART - GATE_PRE_DIAL_MS + SEC);
+    h.ack = false;
+    const t = DEPART + GATE_CAST_OFF_DEFER_MS;
+    await tickAt(keeper, h, t);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(t));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+    // The owner takes the gate's port off (docking.ts removeDockPort): a
+    // plain tombstone, and AUTO-DOCK goes with the port.
+    h.station.getMap('doors').set('x+', buildDoorTombstone(seed(FERRY)));
+    h.auto.delete('x+');
+    h.ack = true;
+    await tickAt(keeper, h, t + SEC);
+    expect(h.opened).toHaveLength(2);
+    await tickAt(keeper, h, t + 2 * SEC);
+    expect(readDoorFrom(h.ferry, PORT))
+      .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: t + 2 * SEC }));
+    expect(readDoorFrom(h.station, 'x+')).toEqual(buildDoorTombstone(seed(FERRY)));
+    await tickAt(keeper, h, t + 3 * SEC);
+    await tickAt(keeper, h, t + 4 * SEC);
+    expect(keeper.sessions()).toEqual([]);
+    expect(h.closes).toBe(2);
+  });
+
+  // Copilot (PR 204): a DOCK refuses a berth where the module would land on
+  // another one of the station, and so does the station's keeper.
+  it('docks at the next gate when the ferry would overlap a module at its own, and says why when every gate would', async () => {
+    const { h, deps } = harness();
+    const clash = new Map<string, string>([['x+', 'Cargo Bay'], ['y-', 'Hab Ring']]);
+    const asked: Array<[string, unknown]> = [];
+    const keeper = createGateKeeper({
+      ...deps,
+      overlap: (doorId, ferry) => {
+        asked.push([doorId, ferry]);
+        return clash.get(doorId) ?? null;
+      },
+    });
+    await tickAt(keeper, h, ARRIVE + SEC);
+    await tickAt(keeper, h, D0);
+    // Posed as this room remembers the ferry's port.
+    const pose = { roomId: FERRY, farWall: 'x-', farLateral: 0 };
+    expect(asked).toEqual([['x+', pose], ['y-', pose]]);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+    expect(readDoorFrom(h.station, 'y-')).toBeUndefined();
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
+    expect(h.notes).toEqual([['x+', "Can't dock FERRY ONE here: it would overlap Cargo Bay.", 'bad']]);
+    // Gate 2 is clear now: the next pass docks there.
+    clash.delete('y-');
+    const t = D0 + KEEPER_RETRY_MS;
+    await tickAt(keeper, h, t - SEC);
+    expect(readDoorFrom(h.station, 'y-')).toBeUndefined();
+    await tickAt(keeper, h, t);
+    expect(readDoorFrom(h.station, 'y-')).toEqual(dockOf(t));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(t, 'y-'));
+    expect(h.notes.at(-1)).toEqual(['y-', 'Docked FERRY ONE automatically.', 'ok']);
+  });
+
+  it('docks nothing where the overlap check fails', async () => {
+    const { h, deps } = harness();
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      const keeper = createGateKeeper({ ...deps, overlap: () => { throw new Error('no atlas'); } });
+      await tickAt(keeper, h, ARRIVE + SEC);
+      await tickAt(keeper, h, D0);
+    } finally {
+      console.warn = warn;
+    }
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
+    expect(h.notes).toEqual([['x+', "Can't dock FERRY ONE here: it would overlap another module.", 'bad']]);
   });
 
   it('lets go of a claim the ferry never took at a gate switched off, and docks nothing more there', async () => {
