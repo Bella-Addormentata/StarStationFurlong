@@ -1,6 +1,7 @@
-// doorsDoc.readAllDoorsWithPhysical: the capped snapshot, plus each physical
-// door's own record read past the cap, so a peer's flood never hides one from
-// DEPART's cast-off. doorsDoc.readPhysicalDoors: only the room's own doors,
+// doorsDoc.readAllDoorsWithPhysical: each physical door's own record read
+// past the cap, then the rest of the capped snapshot, so a peer's flood never
+// hides one from DEPART's cast-off, nor pushes one past the atlas harvest's
+// door bound. doorsDoc.readPhysicalDoors: only the room's own doors,
 // each read past the cap, for the checks that must see every real door and
 // nothing else (DEPART's gate, where a ship is, whether a module is bolted
 // into a station).
@@ -12,7 +13,19 @@ import {
   bindDoorsDoc, buildDoorPairing, readAllDoors, readAllDoorsWithPhysical, readPhysicalDoors, writeDoorPairing,
   writeDoorRecordTo,
 } from './doorsDoc';
-import { isBoltedIntoStation } from './stationKeeping';
+import type { DoorRecord } from './doorsDoc';
+import { harvestIntoAtlas, readAtlas } from './stationAtlas';
+import { isBoltedIntoStation, planTrim } from './stationKeeping';
+import { currentStation, registerStation, setStationRoomSource, stationForRoom } from './stations';
+
+/** vitest runs in node here, so the atlas's localStorage needs a shim. */
+const store = new Map<string, string>();
+(globalThis as { localStorage?: unknown }).localStorage = {
+  getItem: (k: string) => store.get(k) ?? null,
+  setItem: (k: string, v: string) => { store.set(k, v); },
+  removeItem: (k: string) => { store.delete(k); },
+  clear: () => { store.clear(); },
+};
 
 const STATION_CORE = 'ssf://room#room=station-core';
 const JUNK = 'ssf://room#room=junk';
@@ -24,6 +37,7 @@ function flood(): void {
 }
 
 beforeEach(() => {
+  store.clear();
   doc = new Y.Doc();
   bindDoorsDoc(doc);
   bindDoorLayoutDoc(doc); // unseeded: the four default doors
@@ -45,6 +59,15 @@ describe("the room's door records past the read cap", () => {
     expect(doors.get('d:gangway')?.paired).toBe(true);
     expect(doors.has('d:flood-0')).toBe(true);
     expect(doors.size).toBe(65);
+  });
+
+  it("lists the room's own doors first, ahead of a flood written before them", () => {
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    flood();
+    writeDoorPairing('d:gangway', STATION_CORE);
+    const ids = [...readAllDoorsWithPhysical().keys()];
+    expect(ids[0]).toBe('d:gangway');
+    expect(ids.length).toBe(65);
   });
 
   it('adds no default door to a room whose owner removed every door', () => {
@@ -86,5 +109,45 @@ describe('a module bolted into a station, its doors map flooded', () => {
     writeDoorPairing('d:gangway', STATION_CORE);
     expect(isBoltedIntoStation(readAllDoors(), 'room-module', {})).toBe(false);
     expect(isBoltedIntoStation(readPhysicalDoors(), 'room-module', {})).toBe(true);
+  });
+});
+
+describe('the atlas harvest, its doors map flooded', () => {
+  /** What main.ts harvestStationAtlas files for the room it stands in: each
+   *  paired record that names a room, in the order the doors read. */
+  const harvest = (records: Map<string, DoorRecord>): void => harvestIntoAtlas({
+    roomId: 'module',
+    name: 'MODULE',
+    doors: [...records].flatMap(([doorId, r]) => (r.paired && r.connectedRoomAddress
+      ? [{ doorId, targetSeed: r.connectedRoomAddress, farDoor: r.farDoor, transient: r.transient === true }]
+      : [])),
+  });
+
+  it("keeps a module's gangway into its station, so the module flies with that station", () => {
+    // A saved station whose core this install knew from before the gangway:
+    // the module's own harvest is the only record of the join.
+    harvestIntoAtlas({ roomId: 'station-core', name: 'CORE', doors: [] });
+    registerStation({ id: 'core', name: 'CORE', planetId: 'planet-aris', orbitSlot: 3, welcomeRoomId: 'station-core' });
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    flood();
+    writeDoorPairing('d:gangway', STATION_CORE, { farDoor: 'south' });
+    // The capped snapshot alone misses the gangway: the module reads as a
+    // station of its own, and its helm would trim that one's orbit.
+    harvest(readAllDoors());
+    expect(stationForRoom('module')?.id).not.toBe('core');
+    harvest(readAllDoorsWithPhysical());
+    expect(Object.keys(readAtlas().module.doors)).toContain('d:gangway');
+    // Standing in the module, the station is the core's, and the helm's burn
+    // trims the core's orbit.
+    setStationRoomSource(() => 'module');
+    try {
+      expect(currentStation()?.id).toBe('core');
+      const plan = planTrim({
+        bolted: true, station: currentStation(), trim: null, commander: true, engines: 1, fuel: 10, now: Date.now(),
+      }, 'raise');
+      expect(plan.ok && [plan.burn.planetId, plan.burn.slot]).toEqual(['planet-aris', 3]);
+    } finally {
+      setStationRoomSource(() => '');
+    }
   });
 });

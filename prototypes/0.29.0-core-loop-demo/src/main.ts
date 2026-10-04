@@ -176,6 +176,7 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readAllDoorsWithPhysical,
   readDoor,
   readPhysicalDoors,
   subscribeDoors,
@@ -3762,7 +3763,10 @@ function harvestStationAtlas(): void {
     "Module";
   const seed =
     passSeed(roomId) ?? moduleLedger().find((e) => e.roomId === roomId)?.seed;
-  const doors = [...readAllDoors().entries()]
+  // The room's own doors first (each read past the snapshot's cap), then
+  // the rest: a flood written ahead of a gangway never pushes it past the
+  // atlas's door bound, which would leave the module a station of its own.
+  const doors = [...readAllDoorsWithPhysical().entries()]
     .flatMap(([doorId, r]) => {
       if (!r.paired || !r.connectedRoomAddress) return [];
       // 🧭 The door's LIVE physical pose rides into the atlas — its wall and
