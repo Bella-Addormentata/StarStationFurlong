@@ -17,8 +17,9 @@ import { FURNITURE, buildItemGroup, type FurnitureItem } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
 import { createStationHelmUI, setStationHelmCommanderCheck } from './stationHelm';
-import { TRIM_FUEL, bindStationKeepingDoc } from './stationKeeping';
-import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, registerStation, setStationRoomSource } from './stations';
+import { TRIM_FUEL, TRIM_STEP_KM, applyBurn, bindStationKeepingDoc, readOrbitTrim, setSharedTrimSource } from './stationKeeping';
+import type { OrbitTrim, TrimBurn } from './stationKeeping';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, planetById, registerStation, setStationRoomSource } from './stations';
 
 const HELM = 'helm-1';
 /** The fighter grip's red pickle button and the trim stick's amber knob. */
@@ -438,6 +439,52 @@ describe('the helm dashboard\'s faces', () => {
       ui.unmount();
       for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
       setStationHelmCommanderCheck(null);
+    }
+  });
+
+  it('shows the station\'s shared trim when another helm room left it newer, and a press goes on from it', () => {
+    // Copilot's review of #176: a second helm room of one station started
+    // from its own trim (none) and replaced the orbit the first one left.
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationHelmCommanderCheck(() => true);
+    const parts: FurnitureItem[] = [
+      { id: 'sk-engine', kind: 'engine-block', pos: { x: 0, z: 0 }, rot: 0, movable: true },
+      { id: 'sk-tank', kind: 'fuel-tank', pos: { x: 2, z: 0 }, rot: 0, movable: true },
+    ];
+    FURNITURE.push(...parts);
+    const st = DEFAULT_STATION_RECORD;
+    // Another helm room's burn, still firing.
+    const shared: OrbitTrim = {
+      planetId: planetById(st.planetId).id, slot: st.orbitSlot, dRadiusKm: TRIM_STEP_KM, dPhase: 0, at: Date.now() - 100, last: 'raise',
+    };
+    setSharedTrimSource((s) => (s.id === st.id ? shared : null));
+    const { shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => st, shipFace });
+    const host = new FakeElement('host');
+    const burns = () => [...doc.getMap('stationKeeping').entries()].filter(([k]) => k.startsWith('burn:')).map(([, v]) => v as TrimBurn);
+    try {
+      writeFuelLevel(40, 100);
+      ui.mount(host as unknown as HTMLElement);
+      const face = keepFace(host)!;
+      expect(face.querySelector('#sk-alt').innerHTML).toContain(`(+${TRIM_STEP_KM.toFixed(1)})`);
+      expect(face.querySelector('#sk-msg').textContent).toMatch(/^BURNING/);
+      face.querySelector('#sk-well').dispatch('keydown', arrowUp);
+      expect(burns()).toEqual([]);
+      // Once it has fired, a press goes on from it, and the burn carries it.
+      shared.at = Date.now() - 10_000;
+      face.querySelector('#sk-well').dispatch('keydown', arrowUp);
+      expect(burns()).toHaveLength(1);
+      const [burn] = burns();
+      expect(burn.from).toEqual(shared);
+      expect(readOrbitTrim(st)).toEqual(applyBurn(shared, burn));
+      expect(readOrbitTrim(st)).toMatchObject({ dRadiusKm: 2 * TRIM_STEP_KM, last: 'raise' });
+    } finally {
+      ui.unmount();
+      for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
+      setStationHelmCommanderCheck(null);
+      setSharedTrimSource(null);
     }
   });
 
