@@ -520,10 +520,20 @@ new epoch from its next frame — and from that rotation the departed can
 open nothing: there is no resuming an epoch, and a return is an ADMISSION
 like any other. Admissions are the side that is batched: a joiner is
 pending until the next admission boundary (at most 2 s away), when one
-rotation admits every pending joiner, each sealed the new key, and the
-frames a joiner receives before its sealed key lands are held for up to
-that interval and then played, never dropped. So a departure is never
-delayed, and admissions cost one rotation per interval however many join.
+rotation admits every pending joiner — with the key BEFORE the frames,
+never after. The sender seals the new epoch's key to every subscriber, old
+and new, on the reliable lane; switches its emission to the new epoch once
+the current subscribers have acknowledged the key, or 500 ms later for any
+that have not (they drop what they cannot open and catch the next
+keyframe); and the sender's node starts routing frames to a joiner only
+once that joiner's node has reported the key installed. A receiver holds
+no frame it has no key for: a frame of an unknown epoch is dropped, and an
+old-epoch frame that arrives reordered after the switch is opened with the
+old key, which is kept for the jitter window (120 ms) and then discarded —
+so a live voice stream is never a buffer stale, and the frames from before
+a joiner's admission, which it was never meant to open, it never sees. So
+a departure is never delayed, and admissions cost one rotation per interval
+however many join.
 What bounds a member who leaves and returns on purpose is the per-identity
 count the sender's node keeps: past three departures in a minute the
 identity is parked — its next admission waits out a backoff that doubles
@@ -657,13 +667,25 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
 - **Bytes:** the blob lane, content-addressed, replicated by possession, served
   to a webview by the local node.
 - **Index:** a signed `library-add { hash, title, bytes, licence, source,
-  addedBy }` op in the RoomLog, per station or venture — v002's "Chia infohash
-  registry + our seeders" with the registry in the signed log and a
-  ChiaHub-shaped record for a station's library root as the floor.
+  addedBy, provider }` op in the RoomLog, per station or venture —
+  `provider` the adding owner's node id, the first node to ask — plus a
+  signed, EXPIRING `library-seed { hash, node, expires }` announcement from
+  every node that holds the item and will serve it (a library-station
+  volunteer, an owner's node), renewed hourly and void a day after its last
+  renewal, withdrawn early by a signed `library-unseed` from the same node
+  or by the item's `library-remove`. A seeder is its node id, dialled by id
+  under §4's route rule (a connected announcer's observed route for an
+  automatic fetch; discovery only for a fetch the viewer asked for), so a
+  hash resolves, in order, to the connected `have` announcers, the
+  unexpired seeders, and the adder's own node — never to a bare hash with
+  nobody to ask. v002's "Chia infohash registry + our seeders" with the
+  registry in the signed log and a ChiaHub-shaped record for a station's
+  library root as the floor.
   **Prerequisite:** the SsfLog-backed RoomLog adapter. Today `RoomLog.append`
   and `subscribe` are contract stubs on the Phase 2 horizon; the adapter is
   an explicit gate that lands before the library, not beside it.
-- **Resolution order on the TV:** library (any member who has it) → archive /
+- **Resolution order on the TV:** library (a connected member who announces
+  it, else an unexpired seeder, else the adder's node) → archive /
   PeerTube / URL via the proxy → the item's torrent over the DHT; an
   `identifier → hash` map keeps a second viewing off archive.org.
 - **Policy:** PD/CC-marked items by default, the owner's own files behind the
