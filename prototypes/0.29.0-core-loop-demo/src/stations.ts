@@ -29,7 +29,7 @@
 import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
-import { MIN_ALTITUDE_KM, isUsableOrbit, maxAltitudeKm } from './orbits';
+import { MIN_ALTITUDE_KM, isUsableOrbit, maxAltitudeKm, orbitForSlot } from './orbits';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { DoorRecord } from './doorsDoc';
 
@@ -1422,7 +1422,8 @@ export interface AdriftPlace {
 
 export function adriftAt(planetId: string, orbitSlot: number, orbit?: StationOrbit | null): string {
   const slotPart = `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
-  if (!orbit || !isUsableOrbit(planetById(planetId), orbit)) return slotPart;
+  // The slot's own orbit is the slot: one place, one id.
+  if (!orbit || !isUsableOrbit(planetById(planetId), orbit) || isSlotOrbit(planetId, orbitSlot, orbit)) return slotPart;
   const id = `${slotPart}@${orbit.radiusKm},${orbit.phase0}`;
   // An id longer than a flight record holds keeps the slot alone.
   return id.length <= MAX_ADRIFT_ID_LEN ? id : slotPart;
@@ -1450,7 +1451,12 @@ export function adriftPlace(id: string): AdriftPlace | null {
   if (parts.length !== 2 || parts.some((p) => p.trim() === '')) return null;
   const orbit = { radiusKm: Number(parts[0]), phase0: Number(parts[1]) };
   if (!isUsableOrbit(planet, orbit)) return null;
-  return { planetId: planet.id, orbitSlot, orbit };
+  return isSlotOrbit(planet.id, orbitSlot, orbit) ? { planetId: planet.id, orbitSlot } : { planetId: planet.id, orbitSlot, orbit };
+}
+
+/** 🎚️ Is `orbit` the slot's own (the same circle)? */
+function isSlotOrbit(planetId: string, orbitSlot: number, orbit: StationOrbit): boolean {
+  return onPlaceOrbit(orbit, orbitForSlot(planetId, orbitSlot));
 }
 
 /** 🎚️ Does a station flying `flies` (its base orbit, StationRecord.orbit)

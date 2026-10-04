@@ -413,10 +413,11 @@ function isAt(station: StationRecord | null | undefined, placeId: string, now: n
 }
 
 /** 🎚️ Does `station` fly the open-orbit place's own orbit, both resolved to
- *  the circle they name (baseOrbit): a slot's orbit spelled out, or left
- *  out, is the same orbit. */
+ *  the circle they name (baseOrbit)? A place that names no orbit of its own
+ *  says nothing of the altitude: one written before places kept it may be a
+ *  custom altitude's (altitudeChangedSince weighs a change since). */
 function sameBaseOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'>, place: AdriftPlace): boolean {
-  return onPlaceOrbit(baseOrbit(station), baseOrbit(place));
+  return !place.orbit || onPlaceOrbit(baseOrbit(station), baseOrbit(place));
 }
 
 /** Does `station` fly its base orbit (its slot's, or 🎚️ its own altitude),
