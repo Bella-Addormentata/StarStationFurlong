@@ -551,6 +551,59 @@ describe('working on a module from the table', () => {
     expect(plan.ships.find((m) => m.roomId === 'ship-1')?.here).toBe(true);
     expect(editAccess(plan, 'ship-1', () => false)).toBe('here');
   });
+
+  /** DOCKS gains a north door to ANNEX, a new module: only that pairing
+   *  names it until someone walks through. */
+  const annexOffDocks = () => harvestIntoAtlas({
+    roomId: 'room-b', name: 'DOCKS',
+    doors: [
+      { doorId: 'west', targetSeed: seed('room-a'), wall: 'x-', lateral: 0, farDoor: 'east', farWall: 'x+', farLateral: 0, transient: false },
+      { doorId: 'south', targetSeed: seed('ship-1'), wall: 'y+', lateral: 0, transient: true },
+      { doorId: 'north', targetSeed: seed('room-c'), wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0, transient: false },
+    ],
+    gates: { south: 2, east: 3 },
+    owner: { id: 'p-bo' },
+  });
+
+  it('waits for the first walk-through, which pairs the door back, before beaming in', () => {
+    station();
+    annexOffDocks();
+    const before = stationPlan(readAtlas(), 'room-a', 'room-a');
+    const annex = before.modules.find((m) => m.roomId === 'room-c');
+    expect(annex?.pairedFromInside).toBe(false);
+    expect(before.modules.filter((m) => m.roomId !== 'room-c').every((m) => m.pairedFromInside)).toBe(true);
+    // Beamed in, you would stand in ANNEX with no door back to the station.
+    expect(editAccess(before, 'room-c', () => true)).toBe('walk-first');
+    expect(editAccess(before, 'room-c', () => false)).toBe('walk');
+    // The walk-through pairs ANNEX's side, and its harvest records it.
+    harvestIntoAtlas({
+      roomId: 'room-c', name: 'ANNEX',
+      doors: [{ doorId: 'south', targetSeed: seed('room-b'), wall: 'y+', lateral: 0, farDoor: 'north', farWall: 'y-', farLateral: 0, transient: false }],
+    });
+    const after = stationPlan(readAtlas(), 'room-a', 'room-a');
+    expect(after.modules.find((m) => m.roomId === 'room-c')?.pairedFromInside).toBe(true);
+    expect(editAccess(after, 'room-c', () => true)).toBe('beam');
+  });
+
+  it('counts only a door of its own paired with a module of the station', () => {
+    station();
+    annexOffDocks();
+    // Stood in, but with no door paired (or only one to a ship docked there):
+    // still no way back into the station from inside.
+    harvestIntoAtlas({ roomId: 'room-c', name: 'ANNEX', doors: [] });
+    expect(editAccess(stationPlan(readAtlas(), 'room-a', 'room-a'), 'room-c', () => true)).toBe('walk-first');
+    harvestIntoAtlas({
+      roomId: 'room-c', name: 'ANNEX',
+      doors: [{ doorId: 'east', targetSeed: seed('ship-2'), wall: 'x+', lateral: 0, transient: true }],
+    });
+    harvestIntoAtlas({
+      roomId: 'ship-2', name: 'TUG',
+      doors: [{ doorId: 'west', targetSeed: seed('room-c'), wall: 'x-', lateral: 0, transient: true }],
+    });
+    const plan = stationPlan(readAtlas(), 'room-a', 'room-a');
+    expect(plan.ships.map((m) => m.roomId)).toContain('ship-2');
+    expect(editAccess(plan, 'room-c', () => true)).toBe('walk-first');
+  });
 });
 
 describe('the pass the table beams in with', () => {
@@ -587,6 +640,7 @@ describe('BEAM INTO (source scan)', () => {
     expect(beam).toBeGreaterThan(-1);
     expect(card.indexOf('this.deps.beamTo?.(m.roomId)')).toBeGreaterThan(beam);
     expect(card.split('this.deps.beamTo?.(').length).toBe(2);
+    expect(card).toContain("access === 'walk-first'");
     const deps = between(source('devices.ts'), 'stationPlanView = new StationPlanView({', '});');
     expect(deps).toContain('canBeamTo: (roomId) => stationPlanDeps.canBeamTo?.(roomId) ?? false,');
     expect(deps).toContain('beamTo: (roomId) => stationPlanDeps.beamTo?.(roomId),');
@@ -598,7 +652,12 @@ describe('BEAM INTO (source scan)', () => {
   it("enters by the ACCESS beam with a pass this install holds, never a door's", () => {
     const main = source('main.ts');
     expect(main).toContain('world.roomPassFor = (roomId) => heldPassFor(roomId);');
-    expect(main).toContain('void enterRoomFromPass(seed, (msg) => showHint(msg, 4000));');
+    // A manual choice, like ACCESS's ENTER/JUMP: a pasted pass still warming
+    // must not carry you off once the beam lands.
+    const onBeam = between(main, 'world.onBeamInto = (seed) => {', '};');
+    const cleared = onBeam.indexOf('autoEnterRoomId = null;');
+    expect(cleared).toBeGreaterThan(-1);
+    expect(onBeam.indexOf('void enterRoomFromPass(seed, (msg) => showHint(msg, 4000));')).toBeGreaterThan(cleared);
     const held = between(main, 'function heldPassFor(roomId: string): string | undefined {', '\n}');
     expect(held).toContain('return beamPassFor(roomId, [');
     expect(held).toContain('passSeed(roomId),');

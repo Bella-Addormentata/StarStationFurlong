@@ -15,10 +15,11 @@
  * remove a vestibule, undock). Another module of the station you stand in
  * has a BEAM INTO button when this install holds a pass to it: the ACCESS
  * beam takes you in, where its own door panels do the editing (editAccess),
- * so the table reaches no room the ACCESS app couldn't. 🔧 Taking a module
- * apart is a robot job set at a charging dock (disassembly.ts): the plan
- * shows each job's progress, and a module joined to your room says what it
- * would take.
+ * so the table reaches no room the ACCESS app couldn't. A module whose door
+ * back no walk-through has paired yet waits for that first walk. 🔧 Taking
+ * a module apart is a robot job set at a charging dock (disassembly.ts): the
+ * plan shows each job's progress, and a module joined to your room says what
+ * it would take.
  *
  * All text from the atlas and the summaries is peer-written: it reaches the
  * page through textContent only.
@@ -518,9 +519,11 @@ export class StationPlanView {
       card.append(btn);
       return;
     }
-    card.append(row(access === 'walk'
-      ? 'Walk to this module to work on its doors: this install holds no pass to beam into it.'
-      : 'Edit a module from a holotable inside the station.', DIM));
+    card.append(row(access === 'walk-first'
+      ? "Walk to this module through the station's doors first: its door back is paired on the first walk-through, which a beam skips."
+      : access === 'walk'
+        ? 'Walk to this module to work on its doors: this install holds no pass to beam into it.'
+        : 'Edit a module from a holotable inside the station.', DIM));
   }
 
   /** 🔧 A module being taken apart says how far along; one joined to your

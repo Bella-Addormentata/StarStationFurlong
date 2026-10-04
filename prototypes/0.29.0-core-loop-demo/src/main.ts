@@ -3840,9 +3840,12 @@ function wireAdapterTransit(): void {
   world.isTransitBusy = () => transitInProgress;
   // 🗺️✏️ #192: the holotable's BEAM INTO another module of the station is
   // the ACCESS beam, with a pass this install holds; its word goes on a hint,
-  // as the ACCESS app's feedback line is out of sight at the table.
+  // as the ACCESS app's feedback line is out of sight at the table. It is a
+  // manual choice like ACCESS's ENTER/JUMP: a pasted pass still warming must
+  // not carry you off once this beam lands.
   world.roomPassFor = (roomId) => heldPassFor(roomId);
   world.onBeamInto = (seed) => {
+    autoEnterRoomId = null;
     void enterRoomFromPass(seed, (msg) => showHint(msg, 4000));
   };
   const provisionModuleSeed = async (

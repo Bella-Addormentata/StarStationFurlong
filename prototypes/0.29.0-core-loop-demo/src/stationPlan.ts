@@ -57,6 +57,11 @@ export interface PlanModule {
   here: boolean;
   gates: PlanGate[];
   links: PlanLink[];
+  /** ✏️ Its own record pairs one of its doors with a module of the station:
+   *  someone walked through to it, and that first walk-through paired its
+   *  side. A module known only from a neighbour's pairing (a new one, say)
+   *  has no door back yet. */
+  pairedFromInside: boolean;
   /** For a ship: the station module and door it is docked at. */
   dockedAt?: { roomId: string; doorId: string; gate?: number };
 }
@@ -140,9 +145,11 @@ export function stationPlan(
     const size = dims ?? FALLBACK_DIMS;
     const roomBerths = berths.get(p.roomId);
     const links: PlanLink[] = [];
+    let pairedFromInside = false;
     for (const [doorId, door] of Object.entries(entry?.doors ?? {})) {
       if (!door?.targetRoomId || !byId.has(door.targetRoomId)) continue;
       links.push({ doorId, toRoomId: door.targetRoomId, berth: roomBerths?.has(doorId) ?? false });
+      if (station.has(door.targetRoomId)) pairedFromInside = true;
     }
     // 🗺️ A pairing only the far room recorded (atlasPoses' reverse hop) is a
     // link here too. Two rooms may share more than one connection, so a far
@@ -179,6 +186,7 @@ export function stationPlan(
       here: p.roomId === liveRoomId,
       gates,
       links,
+      pairedFromInside,
     };
     if (mod.kind === 'module') modules.push(mod);
     else ships.push(mod);
@@ -306,6 +314,9 @@ export function visitingShips(
  *  - 'beam': another module of the station you stand in, one this install
  *    holds a pass to (`hasPass`): the ACCESS beam takes you in, where its
  *    own door panels do the editing;
+ *  - 'walk-first': one you hold a pass to whose own door back is not paired
+ *    yet (pairedFromInside): the first walk-through pairs it, and the beam
+ *    would skip that, leaving you inside with no door back to the station;
  *  - 'walk': one you hold no pass to, reached through the station's doors;
  *  - 'outside': you stand in none of the station's modules (aboard a docked
  *    ship, or at another station), or it is no module of this station. A
@@ -315,11 +326,12 @@ export function editAccess(
   plan: StationPlan,
   roomId: string,
   hasPass: (roomId: string) => boolean,
-): 'here' | 'beam' | 'walk' | 'outside' {
+): 'here' | 'beam' | 'walk-first' | 'walk' | 'outside' {
   if ([...plan.modules, ...plan.ships].some((x) => x.roomId === roomId && x.here)) return 'here';
   const m = plan.modules.find((x) => x.roomId === roomId);
   if (!m || !plan.modules.some((x) => x.here)) return 'outside';
-  return hasPass(roomId) ? 'beam' : 'walk';
+  if (!hasPass(roomId)) return 'walk';
+  return m.pairedFromInside ? 'beam' : 'walk-first';
 }
 
 /** 🎫 The first of `seeds` that reaches `roomId`, the pass the holotable
