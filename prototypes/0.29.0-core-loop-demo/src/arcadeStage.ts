@@ -18,7 +18,11 @@
  * released to the InputManager, or the player walks on after the stage
  * closes until that key is pressed again. Escape, from either side, stands
  * P1 up. Because of the swallow, a stage whose seat is gone closes AT ONCE
- * rather than lingering behind a notice.
+ * rather than lingering behind a notice. What the swallow cannot catch is
+ * the helm's flight stick, when taken: its own capture listener was
+ * registered first and swallows the flight keys before the stage's runs,
+ * so the stage asks it to stand aside while up (freeFlightStick's
+ * suspendStickKeys), as the TV theatre does.
  *
  * What it shows before the game runs, honestly: CHECKING / LOADING /
  * STARTING, NOT PROVISIONED with the command when this station has no
@@ -42,6 +46,7 @@ import type { MediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
 import { showHint } from './hud';
+import { suspendStickKeys } from './freeFlightStick';
 
 type Phase = 'checking' | 'loading' | 'starting' | 'in play' | 'waiting' | 'fault' | 'idle';
 
@@ -69,6 +74,9 @@ interface Stage {
   fileNote: string;
   /** What had focus when the stage opened: focus goes back there on close. */
   opener: HTMLElement | null;
+  /** The helm's flight stick stands aside while the stage is up
+   *  (freeFlightStick.suspendStickKeys): its release, called on teardown. */
+  releaseStick: () => void;
 }
 
 let stage: Stage | null = null;
@@ -128,7 +136,10 @@ export function openArcadeStage(itemId: string): void {
     e.stopPropagation(); // at the controls: nothing walks the player
   };
   // Keydown only: a keyup must still reach the InputManager, so a key held
-  // as the stage opened is let go of (see the header).
+  // as the stage opened is let go of (see the header). The flight stick's
+  // capture listener runs before this one when the stick is taken (INSERT
+  // COIN from the HUD while flying by hand): it stands aside until teardown.
+  const releaseStick = suspendStickKeys();
   window.addEventListener('keydown', onKey, true);
   stage = {
     root,
@@ -149,6 +160,7 @@ export function openArcadeStage(itemId: string): void {
     lastControls: '',
     fileNote: '',
     opener,
+    releaseStick,
   };
   root.focus();
   stage.timer = window.setInterval(stageTick, 500);
@@ -174,6 +186,7 @@ function teardown(t: Stage): void {
   if (stage === t) stage = null;
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
+  t.releaseStick();
   unmountFrame(t);
   t.root.remove();
   if (t.opener && t.opener.isConnected) t.opener.focus();
