@@ -247,7 +247,18 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   its per-user data dir readable by that user alone (mode 0600; a spawned
   node also takes a pairing secret from the shell's environment and writes
   the file under it), the shell's Rust side reads the file and hands the
-  token to its own webview over `invoke` — never over HTTP. `tauri://
+  token to its own webview over `invoke` — never over HTTP. In the EMBEDDED
+  mode — no sidecar found, the shell starting its own `wt_listener` and HTTP
+  API in-process (`src-tauri/src/main.rs`, `NodeMode::Unavailable`) — there
+  is no boundary to cross: the shell mints the token itself and hands it to
+  its webview over `invoke`, with no file. Whichever listener answers, the
+  gate is ONE module — the token check, the `Origin` / fetch-metadata rule,
+  the address classifier and the socket pinning in a crate both the node
+  and the embedded listener compile in, with one table of test cases — or
+  the proxy does not exist in that listener: an embedded listener without
+  the module answers `/api/media` with 404 and the theatre's consent-only
+  direct URL is what plays, so the two HTTP implementations never diverge
+  in what they let through. `tauri://
   localhost` is every Tauri app's origin and names nothing on its own, so
   possession of the token is the authority and the origin list only a
   filter. A browser page, in development, gets it from a dedicated
@@ -325,7 +336,17 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   origin — the node's HTTP origin as the frontend discovered it (8080, or
   8081 when 8080 is taken; never a fixed port) — which also makes the proxy
   same-origin but moves the app's storage origin, so it is a measured
-  decision.
+  decision — and moves Tauri's IPC boundary with it: `invoke` is what hands
+  the webview the media token, the shell's commands are registered in
+  `src-tauri/src/main.rs` (`invoke_handler`), and a page on an http(s)
+  origin reaches them only through Tauri's remote-domain IPC access, which
+  is off by default and must not be opened wide. S1 verifies that the
+  loopback origin — chosen at run time, so the capability must name the
+  node's actual origin, never a wildcard — can reach exactly the commands
+  it needs (the media-token command, the fingerprint one) and no other, and
+  that no other origin reaches any; if Tauri cannot scope it that narrowly,
+  the token travels another way (the shell injects it into the page at
+  load) and the IPC stays closed.
 - The Linux webview (WebKitGTK) is the weakest: codecs via GStreamer; WebCodecs
   from 2.44; WebRTC reportedly absent in many builds. Treat Linux as "embeds
   and mp4" until verified.
@@ -488,19 +509,27 @@ is the guarantee below that a forwarding node reconstructs no audio), on
 every departure (the departed can open nothing after it) and on a timer. A
 join and a leave each cost one rotation — a sealed key per subscriber on
 the reliable lane — which at room scale is nothing, until one member makes
-a habit of it: so membership is per IDENTITY, not per link (a second tab,
-or a re-dialled link, of a member who already holds the epoch's key is the
-same member — no rotation, the key resent to the new link), a lease that
-lapses and is renewed within its lapse window is the same membership (a
-flap, not a departure), a re-admission within a short grace of the
-identity's own departure resumes the epoch it could already open (there is
-nothing to protect from it), rotations are coalesced to at most one per
-interval (2 s) with the transitions inside it folded into one, and the
-sender's node counts each identity's transitions — past a bound (three in
-a minute) that identity's subscription is parked for a backoff and its
-transitions trigger nothing, so a flapping or malicious member interrupts
-a source once, not continuously. A genuine departure — an explicit leave,
-or a lease that lapsed and stayed lapsed — rotates at once, as before. Replay protection is a sliding window per leg,
+a habit of it; so the transitions are defined once, enforceably, and the
+two guarantees never meet. Membership is per IDENTITY, not per link: a
+second tab, or a re-dialled link, of a member who holds the epoch's key is
+the same member — no transition, the key resent to the new link. A
+DEPARTURE is a member whose last lease has been gone for the grace window
+(5 s: a lapsed lease renewed inside it was a flap, and the member never
+left) or who said leave; it rotates AT ONCE — the sender emits under the
+new epoch from its next frame — and from that rotation the departed can
+open nothing: there is no resuming an epoch, and a return is an ADMISSION
+like any other. Admissions are the side that is batched: a joiner is
+pending until the next admission boundary (at most 2 s away), when one
+rotation admits every pending joiner, each sealed the new key, and the
+frames a joiner receives before its sealed key lands are held for up to
+that interval and then played, never dropped. So a departure is never
+delayed, and admissions cost one rotation per interval however many join.
+What bounds a member who leaves and returns on purpose is the per-identity
+count the sender's node keeps: past three departures in a minute the
+identity is parked — its next admission waits out a backoff that doubles
+each time, and its leaves and returns trigger nothing meanwhile — so a
+flapping or malicious member interrupts a source three times, then not for
+a while. Replay protection is a sliding window per leg,
 the SRTP shape: a leg's counter only ever goes up within an epoch; a
 receiver keeps, per leg, the highest counter it has accepted and a bitmap
 of the last 128 below it, takes a frame above the highest (and
