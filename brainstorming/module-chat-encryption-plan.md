@@ -211,11 +211,14 @@ That third row is the entire gap. An ECDH key is required and SSF has only a sig
   `@noble/curves` (v2.x) it is `ed25519.utils.toMontgomery(publicKey)` and
   `ed25519.utils.toMontgomerySecret(secretKey)`. The v1-era free functions `edwardsToMontgomeryPub`
   / `edwardsToMontgomeryPriv` — and the pub-only alias `edwardsToMontgomery` — were **removed** in
-  v2; upstream records the rename in its changelog. Pin ≥ 2.3.0 if you take this route — the Trail
-  of Bits review corrected these very conversion helpers in that release (§3.4). Note that this
-  saves no dependency — X25519 itself comes from `@noble/curves`, so both routes add it. The real
-  objection: it reuses one key across two protocols — a cross-protocol-attack surface that is
-  avoidable here for the cost of 32 bytes in a map we already write.
+  v2; upstream records the rename in its changelog. §3.4 sets the version floor, which applies to
+  both routes rather than only to this one. Note also that converting saves no dependency — X25519
+  itself comes from `@noble/curves`, so either way it is added. The real objection is sharper than
+  "two uses of one key": `toMontgomerySecret` returns
+  `adjustScalarBytes(sha512(seed).subarray(0, 32))`, which *is* the Ed25519 signing scalar rather
+  than something derived alongside it. One secret would serve two protocols, and §3.2.1 makes that
+  same key the identity anchor — so any weakness in either protocol lands on the identity itself.
+  Avoidable for the cost of 32 bytes in a map we already write.
 
 ### 3.2.1 The directory is not yet trustworthy — fix this before anything else
 
@@ -301,21 +304,43 @@ are roughly 300 lines of `@noble` calls.
 in-browser, auditable posture `keypair.ts:11-14` chose deliberately, and keeps the browser and the
 node speaking the same cipher.
 
-**Pin `@noble/curves` at ≥ 2.3.0, and treat the floor as part of the design rather than as
-hygiene.** That release (2026-08-06) applied the Trail of Bits review, which among other things
-**corrected the Edwards→Montgomery conversion helpers** — the exact primitive the second route in
-§3.2 calls, so an implementation taking that route against anything earlier is converting keys
-with code its own auditors found wrong. The same release fixed a remote timing attack on X25519
-that leaked up to 4.036 bits of a long-term private key across many samples; upstream scopes the
-impact as fingerprinting rather than key recovery, and that bite is muted here because SSF would
-publish the X25519 *public* key in the contact card anyway — but it is a reason not to inherit an
-older pin by accident. Nothing is exposed today: `@noble/curves` is not a dependency at all —
-`package.json` lists `@noble/ed25519` and `@noble/hashes` and no other crypto — and `@noble/ed25519`
-has no ECDH surface to attack, exporting `getPublicKey`/`sign`/`verify` and their async forms,
-`Point`, `CURVE` and `utils`, with no `getSharedSecret`, no X25519 and no Montgomery conversion.
-That is the same fact §3.2 states as "no X25519 key anywhere in the codebase". The floor binds the
-commit that adds the dependency, and is worth stating now precisely because the current release
-already satisfies it — which is how a floor goes unwritten and is then met only by luck.
+**Pin both new dependencies, and treat the floors as part of the design rather than as hygiene.**
+`@noble/curves` ≥ 2.3.0 and `@noble/ciphers` ≥ 2.4.0; the current release of each is 2.4.0, so a
+tree installed today already satisfies both. What the two floors buy differs sharply, and the
+difference is worth writing down, because only one of them is load-bearing.
+
+- **`@noble/curves` 2.3.0 (2026-08-06) hardened the X25519 ladder** against a remote timing attack
+  worth up to 4.036 bits of a long-term private key across many samples; upstream scopes the impact
+  as fingerprinting rather than key recovery. This one reaches **both** routes in §3.2, because
+  both end at `x25519.getSharedSecret`. Under the recommended route it lands softly — the X25519
+  key is its own, and its public half goes in the contact card anyway. Under the conversion route
+  it does not: there the private scalar driving the ladder *is* the Ed25519 signing scalar, so what
+  leaks is bits of the identity key.
+
+- **The same release applied the Trail of Bits review, which corrected the Edwards→Montgomery
+  conversion helpers** — but scope that honestly, because it is easy to overstate. The fix replaced
+  a generic helper that inferred a curve's Montgomery form from its key length with a per-curve
+  declaration that otherwise throws; previously a 32-byte key on any other Edwards curve was
+  silently handed the Curve25519 map. **For ed25519 the output is unchanged** —
+  `Fp.div(1 + y, 1 - y)` before and after. What the floor buys on the conversion route is dispatch
+  that cannot be wrong, not different keys.
+
+- **`@noble/ciphers` has no comparable item, and its floor buys currency rather than a fix.**
+  Nothing in the 2.3.0 hardening release touches XChaCha20-Poly1305: the new `AAD not supported`
+  throw is for ciphers that *lack* AAD, and the rest is CBC/ECB padding, FF1, AES-SIV and
+  big-endian POLYVAL. `chacha.js` is byte-identical between 2.3.0 and 2.4.0. 2.4.0's one
+  ChaCha-relevant guard lives in `_arx.js`, rejecting an output buffer that partially overlaps
+  unread input, and it fires only when the caller passes an output buffer at all — an
+  implementation calling `encrypt(plaintext)` never reaches it. Pin it because it is current and
+  free, not because something here is known to bite.
+
+Nothing is exposed today: neither package is a dependency — `package.json` carries `@noble/ed25519`
+and `@noble/hashes` and no other crypto — and `@noble/ed25519` has no ECDH surface to attack: every
+export is signature machinery or a byte/math helper, with no `getSharedSecret`, no X25519 and no
+Montgomery conversion. That is why §3.2 can say there is "no X25519 key anywhere in the codebase".
+The floors bind the commit that adds the dependencies, and are worth writing down now precisely
+because the current releases already satisfy them — which is how a floor goes unwritten and is then
+met only by luck.
 
 ---
 
