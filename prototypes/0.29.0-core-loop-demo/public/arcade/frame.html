@@ -16,26 +16,33 @@
     bridge — none of which the policy below bounds: it governs what this
     page may LOAD. So this document's origin reads "null" (self.origin;
     location.origin is the URL's, which is why the policy below names it);
-    every message goes to the parent with the '*' target (there is no name
-    to match, and the parent matches what it hears to this frame's window);
+    every message goes to the PAGE with the '*' target (there is no name
+    to match, and the page matches what it hears to this frame's window)
+    — the page being the parent of this frame's parent: the frame sits
+    inside a WALL, a document of the page's own with no script in it,
+    whose one policy governs where this frame may navigate (below);
     there is no storage (EmulatorJS's databases are off) and no download
     (the sandbox allows scripts and pointer lock, nothing else: a form, a
     popup or a download is a request to any URL no policy governs), so a
     save state will leave by postMessage, the page offering the file — a
     follow-up; and the game arrives as BYTES the parent fetched itself, as
     the page, and plays from a blob: URL of this document — never as a URL
-    this frame would fetch with no origin to its name. A frame that
-    navigates itself away (the one request nothing forbids) is torn down by
-    the parent at its second load.
+    this frame would fetch with no origin to its name. The one request
+    nothing in this frame forbids — its own navigation elsewhere — is the
+    WALL's to refuse: the parent mounts this frame inside a same-origin
+    document of its own whose frame-src names this URL and nothing else
+    (src/arcadeEmulator.ts, emulatorWallPolicy), checked by the browser
+    before any request goes out; a reload of this URL, the one navigation
+    allowed, is torn down by the parent at the second load.
 
-    Protocol with the parent (src/arcadeEmulator.ts mountEmulatorFrame):
-      frame → parent  { type: 'arcade-frame-ready' }
-      parent → frame  { type: 'arcade-config', core, game (a Blob), gameName,
-                        pathToData, volume, isolated, timeoutMs }
-      frame → parent  { type: 'arcade-ready' }     the emulator is loaded
-                      { type: 'arcade-started' }   the game runs
-                      { type: 'arcade-exit' }      Escape pressed here
-                      { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
+    Protocol with the page (src/arcadeEmulator.ts mountEmulatorFrame):
+      frame → page  { type: 'arcade-frame-ready' }
+      page → frame  { type: 'arcade-config', core, game (a Blob), gameName,
+                      pathToData, volume, isolated, timeoutMs }
+      frame → page  { type: 'arcade-ready' }     the emulator is loaded
+                    { type: 'arcade-started' }   the game runs
+                    { type: 'arcade-exit' }      Escape pressed here
+                    { type: 'arcade-error', why } 'loader' | 'timeout' | 'game'
     EmulatorJS itself (GPL-3.0) is NOT in this repository: pathToData names
     this station's /emulatorjs/data/ (scripts/fetch-emulatorjs.mjs) or
     cdn.emulatorjs.org, the owner's call per cabinet — the CDN only in a
@@ -108,18 +115,21 @@
         ].join('; ');
         document.head.appendChild(meta);
       }
-      // An opaque origin has no name a target could match: '*' it is. The
-      // parent matches what it hears to this frame's window, and nothing
-      // posted from here is the page's to leak.
-      var parentWin = window.parent;
+      // The page that mounted this frame is beyond the WALL (the header):
+      // window.parent is the wall, a document of the page's own with no
+      // script in it, and the page is the wall's parent — the same window
+      // when there is no wall. An opaque origin has no name a target could
+      // match: '*' it is. The page matches what it hears to this frame's
+      // window, and nothing posted from here is the page's to leak.
+      var pageWin = window.parent.parent;
       function post(type, extra) {
         var msg = { type: type };
         if (extra) for (var k in extra) msg[k] = extra[k];
-        parentWin.postMessage(msg, '*');
+        pageWin.postMessage(msg, '*');
       }
       var started = false;
       window.addEventListener('message', function (e) {
-        if (e.source !== parentWin || !e.data || e.data.type !== 'arcade-config' || started) return;
+        if (e.source !== pageWin || !e.data || e.data.type !== 'arcade-config' || started) return;
         started = true;
         var c = e.data;
         // The game: the bytes the parent fetched, or the player's own file,

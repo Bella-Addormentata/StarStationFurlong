@@ -7,8 +7,8 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameUrl,
-  emulatorIsolated, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom, romAcceptList,
-  EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
+  emulatorIsolated, emulatorWallPolicy, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom,
+  romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
 } from './arcadeEmulator';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -49,6 +49,23 @@ describe('where the emulator files come from', () => {
   it('sandboxes the frame to scripts and pointer lock: never the same origin, and no form, popup or download — each a request no policy governs', () => {
     expect(EMULATOR_SANDBOX.split(' ').sort()).toEqual(['allow-pointer-lock', 'allow-scripts']);
     expect(emulatorErrorText('navigated', 'station').title).toContain('LEFT THE CABINET');
+    expect(emulatorErrorText('barred', 'station').title).toContain('TRIED TO LEAVE');
+    expect(emulatorErrorText('barred', 'station').hint).toContain('before any request went out');
+  });
+
+  it('walls the frame behind a policy that lets it navigate to its own URL, exactly, and nowhere else — and names nothing it cannot name as one source', () => {
+    expect(emulatorWallPolicy('/arcade/frame.html', 'http://localhost:4173/')).toBe("default-src 'none'; frame-src http://localhost:4173/arcade/frame.html");
+    // Under a base path, from any page of the app; the query is no part of a source.
+    expect(emulatorWallPolicy('/furlong/arcade/frame.html?lane=station&allow=x', 'https://station.example/furlong/room'))
+      .toBe("default-src 'none'; frame-src https://station.example/furlong/arcade/frame.html");
+    expect(emulatorWallPolicy('http://localhost:4173/arcade/frame.html', 'http://localhost:4173/')).toBe("default-src 'none'; frame-src http://localhost:4173/arcade/frame.html");
+    expect(emulatorWallPolicy('/arcade/frame.html', 'tauri://localhost/')).toBe("default-src 'none'; frame-src tauri://localhost/arcade/frame.html");
+    // A path that could end the directive or start another source names nothing; nor does a URL with no host.
+    expect(emulatorWallPolicy('/a;frame-src *', 'http://localhost/')).toBeNull();
+    expect(emulatorWallPolicy("/a'b/frame.html", 'http://localhost/')).toBeNull();
+    expect(emulatorWallPolicy('/arcade/frame.html', 'file:///tmp/index.html')).toBeNull();
+    expect(emulatorWallPolicy('http://[bad', 'http://localhost/')).toBeNull();
+    expect(emulatorWallPolicy('/arcade/frame.html', '')).toBeNull();
   });
 
   it('probes the station path for loader.js and leaves a cross-origin CDN to the loader', async () => {
