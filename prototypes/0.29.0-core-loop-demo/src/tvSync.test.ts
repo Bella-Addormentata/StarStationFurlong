@@ -319,6 +319,33 @@ describe('a replay of a clip shorter than the seek band', () => {
     expect(p.playing).toBe(true);
   });
 
+  it('a replay asked for inside the cooldown of the previous seek is not dropped: a new revision supersedes the last seek, and only its retries wait', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    p.duration = 1_000;
+    const h = harness(p);
+    h.tick();
+    p.position = 1_000; p.playing = false; p.ended = true;
+    h.set({ positionMs: 1_000 });
+    h.transport({ positionMs: 0 }); // PLAY NOW: the first replay
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']);
+    p.land(); // it lands and the clip plays again…
+    h.tick();
+    expect(p.ended).toBe(false);
+    p.position = 1_000; p.playing = false; p.ended = true; // …and ends again, a second after that seek
+    h.set({ positionMs: 1_000 });
+    h.transport({ positionMs: 0 }); // PLAY NOW once more, inside the cooldown
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0', 'seek:0']); // superseded at once, not dropped
+    h.tick(); // a retry of the same revision waits for the cooldown while the seek lands
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0', 'seek:0']);
+    p.land();
+    h.tick();
+    expect(p.ended).toBe(false);
+    expect(p.playing).toBe(true);
+  });
+
   it('a viewer whose rewind is still landing is not seeked and played again every tick', () => {
     const p = new FakePlayer(true);
     p.lazy = true;

@@ -751,10 +751,15 @@ export function tvStop(itemId: string): TvAction {
  *  used to meet there, and whichever won undid the other). Off keeps the
  *  programme, like a real TV; on brings it back: the holder's tick parks a
  *  programme that was playing where it was (tvSession), and a set with
- *  nothing on shows the home screen. Returns the new state of the switch. */
-export function tvTogglePower(itemId: string): boolean {
+ *  nothing on shows the home screen. Returns the new state of the switch.
+ *  Whoever turns the set ON has the remote placed in their hand (#186) —
+ *  when it is on the set or lapsed. A live holder keeps it: a body button
+ *  moves nothing out of a hand, and the owner's spare is not the switch's
+ *  to use (the holder turns the set on, or hands the remote over). */
+export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
   write(powerKey(itemId), { on: !power.on, seq: bump(power.seq) } satisfies PowerRecord);
+  if (!power.on && remoteStatus(itemId, now) === 'free') pickUpRemote(itemId, now);
   return !power.on;
 }
 

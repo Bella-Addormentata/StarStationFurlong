@@ -32,6 +32,7 @@ beforeEach(() => {
   setTvHostPredicate(() => false);
   setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
   bindTvDoc(new Y.Doc());
+  leaveTvRoom([]); // the room's cadences (renewals, beats, known ends) start over with the doc
   armTvDrive(true); // the room's docs are bound: World may drive its TVs
 });
 
@@ -214,6 +215,53 @@ describe('tickTvRoom', () => {
     unregister(); // the holder closes the theatre: the clock runs on headlessly, past every value ever read
     run(120_000);
     expect(readTv(TV).state).toBe('playing');
+  });
+
+  it('the end a player learned just before the theatre closed is kept: a close before the next tick still ends the programme', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const started = readTv(TV).started;
+    let end: number | null = null; // before the metadata: unknown
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, started: () => started, endMs: () => end });
+    run(1_000); // the room ticks while the player knows nothing yet
+    end = 30_000; // the metadata lands…
+    tvHeartbeat(TV, 25_000); // the theatre's beat
+    unregister(); // …and the holder closes the theatre before the next tick
+    run(3_000);
+    expect(readTv(TV).state).toBe('playing'); // 28 s
+    run(3_000);
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null }); // 31 s: over where the media ended
+  });
+
+  it('an unknown reading between finite reports forgets neither a finite end nor the unbounded marker', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/live.m3u8' });
+    const started = readTv(TV).started;
+    // An end that moved (unbounded from then on), a remount's unknown
+    // reading, then a finite value again: still unbounded.
+    const moving: Array<number | null> = [30_000, 30_500, null, 31_000, 31_000, 31_000];
+    let i = 0;
+    const unregister = registerTvPlayerOfRecord(TV, {
+      positionMs: () => 29_000, canSeek: () => false, started: () => started, endMs: () => moving[Math.min(i++, moving.length - 1)]!,
+    });
+    run(3_000);
+    unregister();
+    run(120_000);
+    expect(readTv(TV).state).toBe('playing');
+    // A finite end, an unknown reading (the same file remounting), the same
+    // finite end: the end is kept, and the close still ends the programme.
+    expect(tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' })).toEqual({ ok: true });
+    const second = readTv(TV).started;
+    const steady: Array<number | null> = [30_000, null, 30_000];
+    let j = 0;
+    const unregisterSteady = registerTvPlayerOfRecord(TV, {
+      positionMs: () => 25_000, canSeek: () => true, started: () => second, endMs: () => steady[Math.min(j++, steady.length - 1)]!,
+    });
+    run(1_500);
+    tvHeartbeat(TV, 25_000);
+    unregisterSteady();
+    run(6_000);
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
   });
 
   it('leaving disarms the drive at once: a tick during the leave\'s flush claims and beats nothing until the next room arms it', () => {
