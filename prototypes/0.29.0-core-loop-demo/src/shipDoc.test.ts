@@ -21,6 +21,7 @@ import * as Y from 'yjs';
 import { DEFAULT_STATIONS, adriftAt, setStationDirectory } from './stationDirectory';
 import {
   CAST_OFF_HOLD_MS,
+  CAST_OFF_RENEW_MS,
   DESTINATIONS,
   TANK_CAPACITY,
   bindShipDoc,
@@ -40,6 +41,7 @@ import {
   readFuelLevel,
   readRestPlace,
   releaseCastOff,
+  renewCastOff,
   shipDocBound,
   subscribeShip,
   writeFlightRecord,
@@ -915,5 +917,29 @@ describe('a DEPART under way — the shared cast-off hold', () => {
     expect(castOffHeldBy(kept === 'a' ? 'b' : 'a', NOW + 1)).toBe(false);
     docA.destroy();
     docB.destroy();
+  });
+
+  it('stays in force while its DEPART renews it, and only the hold that DEPART still has', () => {
+    freshDoc();
+    expect(CAST_OFF_RENEW_MS).toBeLessThan(CAST_OFF_HOLD_MS);
+    expect(holdCastOff('a', NOW)).toBe(true);
+    // Renewed on its beat, it outlasts CAST_OFF_HOLD_MS from when it was taken.
+    let t = NOW;
+    for (let i = 0; i < 6; i++) {
+      t += CAST_OFF_RENEW_MS;
+      expect(renewCastOff('a', t)).toBe(true);
+    }
+    expect(t).toBeGreaterThan(NOW + CAST_OFF_HOLD_MS);
+    expect(castOffHeldBy('a', t + CAST_OFF_HOLD_MS - 1)).toBe(true);
+    // Another helm's renewal takes nothing.
+    expect(renewCastOff('b', t)).toBe(false);
+    expect(castOffHeldBy('a', t)).toBe(true);
+    // One that ran out is not taken back, nor one ended.
+    expect(renewCastOff('a', t + CAST_OFF_HOLD_MS)).toBe(false);
+    expect(readCastOffHold(t + CAST_OFF_HOLD_MS)).toBeNull();
+    expect(holdCastOff('a', t + CAST_OFF_HOLD_MS)).toBe(true);
+    releaseCastOff('a');
+    expect(renewCastOff('a', t + CAST_OFF_HOLD_MS + 1)).toBe(false);
+    expect(readCastOffHold(t + CAST_OFF_HOLD_MS + 1)).toBeNull();
   });
 });

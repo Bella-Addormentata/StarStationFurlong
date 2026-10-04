@@ -3,21 +3,23 @@
 // ship + doors docs with a stand-in docking system that makes the same
 // near-side writes as docking.ts's UNDOCK / DOCK.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listStations, planetById, setStationMoveResolver, setStationRoomSource } from './stations';
-import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, writeStationMove, type StationMove } from './stationMove';
+import { MOVE_SCAN_MAX, bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, writeStationMove, type StationMove } from './stationMove';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
 import {
   bindDoorsDoc,
   buildDoorPairing,
+  MAX_PAIRINGS,
   readDoor,
   writeDoorPairing,
   writeDoorTombstone,
 } from './doorsDoc';
 import {
   berthHeldByMove,
+  berthsToCastOff,
   berthToRemember,
   detachBerth,
   ARRIVAL_GRACE_MS,
@@ -499,6 +501,32 @@ describe('a round trip', () => {
     expect(completeArrival(docking, { now, force: true })).toEqual({ kind: 'docking', stationName: 'High Orbit' });
   });
 
+  it('docks at a destination back where it orbited at cast-off, whatever moves it made meanwhile', () => {
+    const now = Date.now();
+    const docking = fakeDocking(['north']);
+    castOffForDeparture('furlong-station', docking);
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const then = placeOfStation('furlong-station');
+    // Furlong left for Aris while the ship was away, and bounced home off a
+    // full planet: it orbits where it did at cast-off.
+    const lastMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 500_000, arriveAt: now - 1000,
+      mode: 'tug' as const, tugRoomId: 'tug', fuel: 1, fuelDrawn: 0,
+    };
+    setStationDirectory({ stations: () => [{ ...DEFAULT_STATIONS[0], lastMove }, ...DEFAULT_STATIONS.slice(1)] });
+    const trip = { departedAt: now - 600_000, etaAt: now - 1, castOffAt: now - 600_000 };
+    writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', ...trip, destinationAt: then });
+    writeFlightRecord({ status: 'redocking', locationId: 'furlong-station', ...trip, destinationAt: then });
+    expect(completeArrival(docking, { now, force: true })).toEqual({ kind: 'docking', stationName: 'Furlong Station' });
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
+    // A flight that kept no such place goes by the move it made meanwhile.
+    castOffForDeparture('furlong-station', docking);
+    writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', ...trip });
+    writeFlightRecord({ status: 'redocking', locationId: 'furlong-station', ...trip });
+    expect(completeArrival(docking, { now, force: true })).toMatchObject({ kind: 'none', reason: 'in-transit' });
+  });
+
   it('does nothing unless the ship is redocking, and only once', () => {
     const docking = fakeDocking(['north']);
     expect(completeArrival(docking)).toBeNull();
@@ -766,6 +794,60 @@ describe('where a ship with no live dock is', () => {
     expect(detachBerth('east', now + 13_000)).toBe(false);
     expect(restingPlace(readRestPlace()!, now + 14_000)).toMatchObject({ at: there, releasedAt: now + 12_000, recorded: true });
     expect(shipPlaceId(readFlightRecord(), now + 14_000)).toBe('furlong-station');
+  });
+
+  it('casts off every transient berth at DEPART, unless a station move holds one or the doors cannot all be read', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    const cast = (t: number) => {
+      const r = berthsToCastOff('ship-room', t);
+      return r.ok ? [...r.berths].sort() : r.why;
+    };
+    // A dock, a legacy gangway into Furlong (no dock chain), and a
+    // permanent connector, which is no berth.
+    writeDoorPairing('north', SEED_HIGH, buildDoorPairing(SEED_HIGH, {
+      segments: dockChain(), farDoor: 'south', farWall: 'y+', transient: true, dockedAt: 1000,
+    }));
+    writeDoorPairing('east', seed, buildDoorPairing(seed, {
+      segments: [{ kind: 'flex', bendDeg: 0 }], farDoor: 'south', farWall: 'y+', transient: true,
+    }));
+    writeDoorPairing('west', 'ssf://room#room=ship-annex', buildDoorPairing('ssf://room#room=ship-annex', {
+      segments: [{ kind: 'flex', bendDeg: 0 }], farDoor: 'east', farWall: 'x+',
+    }));
+    expect(cast(now)).toEqual(['east', 'north']);
+    // Furlong leaves for Aris: the gangway holds the ship until it arrives.
+    expect(writeStationMove({
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now + 1000, arriveAt: now + 10_000,
+      mode: 'thrusters', bookedAt: now + 500, fuel: 1, fuelDrawn: 0,
+    })).toBe(true);
+    expect(cast(now + 5000)).toBe('moving');
+    expect(cast(now + 11_000)).toEqual(['east', 'north']);
+    // Nor while the room's moves cannot all be read (a flood): the one
+    // holding a berth may lie past them, until they are cleared.
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      doc.transact(() => {
+        for (let i = 0; i <= MOVE_SCAN_MAX; i++) doc.getMap('stationMoves').set(`junk:${i}`, i);
+      });
+      expect(cast(now + 11_000)).toBe('unread');
+      vi.runAllTimers();
+      expect(cast(now + 11_000)).toEqual(['east', 'north']);
+    } finally {
+      vi.useRealTimers();
+    }
+    // More door records than a snapshot keeps: a berth left out could be
+    // held, or stay attached through the flight.
+    doc.transact(() => {
+      for (let i = 0; i < MAX_PAIRINGS; i++) writeDoorTombstone(`d:${i}`, SEED_HIGH, { farDoor: 'south', undockedAt: 1000 + i });
+    });
+    expect(cast(now + 11_000)).toBe('unread');
   });
 
   it('names every dock holding the ship, so one that lets go after a move still counts', () => {

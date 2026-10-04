@@ -1094,6 +1094,20 @@ export function castOffHeldBy(by: string, now: number = Date.now()): boolean {
   return readCastOffHold(now)?.by === by;
 }
 
+/** How often a DEPART renews its hold while it casts off (renewCastOff). */
+export const CAST_OFF_RENEW_MS = CAST_OFF_HOLD_MS / 3;
+
+/** Keep the DEPART `by`'s hold in force while it still casts off: the dock
+ *  releases it waits on can outlast CAST_OFF_HOLD_MS (a far room answers one
+ *  request at a time, each under its own deadline), and a hold that ran out
+ *  would let another helm read this one's undocks, which a far refusal may
+ *  yet put back, as done. Only its own hold, still in force: one that ran
+ *  out may be another's now, and another room's doc never holds it.
+ *  Returns whether it renewed. */
+export function renewCastOff(by: string, now: number = Date.now()): boolean {
+  return castOffHeldBy(by, now) && holdCastOff(by, now);
+}
+
 /** End the DEPART `by`'s hold: only its own, so a hold another DEPART took
  *  since (this one's ran out), or another room's, is left alone. */
 export function releaseCastOff(by: string): void {

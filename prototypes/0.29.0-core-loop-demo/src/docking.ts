@@ -110,7 +110,7 @@ import {
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
 import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
-import { dockLockedByMove } from "./stationMove";
+import { dockLockedByMove, roomMovesKnown } from "./stationMove";
 import { berthHeldByMove, correctReleasePlace, detachBerth, releasePlaceOf } from "./shipArrival";
 import {
   doorLateralLimitForWall,
@@ -2213,7 +2213,7 @@ export class DoorDockingPortSystem {
       : "";
     const detachRow = berth
       ? held
-        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked — this station is moving between planets, the berth holds until it arrives</span></div>`
+        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked — ${esc(this.moveHoldNote("berth"))}</span></div>`
         : `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" ${op?.busy ? "disabled" : ""} style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>${detachNote}`
       : "";
@@ -2680,6 +2680,15 @@ export class DoorDockingPortSystem {
     return berthHeldByMove(this.roomNow(), doorId);
   }
 
+  /** 🚚 Why a move holds a dock or berth here, said: a station between
+   *  planets (or a tow under way), or a move log this room holds too long to
+   *  read whole (stationMove.roomMovesKnown), where such a move may lie. */
+  private moveHoldNote(what: "dock" | "berth"): string {
+    return roomMovesKnown()
+      ? `This station is moving between planets — the ${what} holds until it arrives.`
+      : `This room holds more move records than can be read — the ${what} holds until they are cleared.`;
+  }
+
   /**
    * 🚚 May this end let go of the legacy berth on `doorId` (a transient
    * pairing on a door that is no dock port: DETACH releases this end only)?
@@ -2727,12 +2736,13 @@ export class DoorDockingPortSystem {
     const still = this.roomNow() === roomId ? readDoor(doorId) : undefined;
     const same = still?.paired === true && still.connectedRoomAddress === asked.connectedRoomAddress
       && still.dockedAt === asked.dockedAt;
-    const done = allowed && same && detachBerth(doorId);
-    this.setDockOp(
-      doorId,
-      allowed ? {} : { note: "This station is moving between planets — the berth holds until it arrives.", tone: "bad" },
-      roomId,
-    );
+    // The far room answered for the moment it was asked, and a move it knew
+    // of (this install remembers them now: farDoorWrite) may have left since:
+    // judged again, both ends, at the stamp the tombstone takes.
+    const at = Date.now();
+    const free = allowed && !(same && berthHeldByMove(roomId, doorId, at));
+    const done = free && same && detachBerth(doorId, at);
+    this.setDockOp(doorId, free ? {} : { note: this.moveHoldNote("berth"), tone: "bad" }, roomId);
     this.refreshPolicyUI();
     return done;
   }
@@ -2846,10 +2856,7 @@ export class DoorDockingPortSystem {
     // between planets carries every ship docked to it: neither end lets go
     // until it arrives.
     if (dockLockedByMove([roomId, port.roomId], Date.now())) {
-      this.setDockOp(doorId, {
-        note: "This station is moving between planets — the dock holds until it arrives.",
-        tone: "bad",
-      });
+      this.setDockOp(doorId, { note: this.moveHoldNote("dock"), tone: "bad" });
       return false;
     }
     if (!this.canConstruct(doorId)) {
@@ -2969,7 +2976,9 @@ export class DoorDockingPortSystem {
     // 🚚 No ship joins (or rejoins) a station between planets.
     if (dockLockedByMove([roomId, port.roomId], Date.now())) {
       this.setDockOp(doorId, {
-        note: "That station is moving between planets — dock when it arrives.",
+        note: roomMovesKnown()
+          ? "That station is moving between planets — dock when it arrives."
+          : "This room holds more move records than can be read — dock once they are cleared.",
         tone: "bad",
       });
       return false;

@@ -566,6 +566,48 @@ describe('learned stations', () => {
     }
   });
 
+  it('count only the stations in their orbits against a planet\'s slots, and list every one between planets besides', () => {
+    const now = Date.now();
+    // This install's own station and a learned one, both on their way from
+    // SOV to ARIS: neither holds a slot at SOV meanwhile.
+    expect(registerStation(record({ id: 'mine', welcomeRoomId: 'room-mine', orbitSlot: 3 }))).toBe(true);
+    const away = (welcomeRoomId: string, fromSlot: number): StationMove => ({
+      stationId: welcomeRoomId, welcomeRoomId, fromPlanetId: SOV, fromSlot, toPlanetId: ARIS, toSlot: fromSlot,
+      departAt: now - 1000, arriveAt: now + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    });
+    const moves = [away('room-mine', 3), away('room-hab', 2)];
+    setStationMoveResolver((st) => moves.find((m) => m.welcomeRoomId === st.welcomeRoomId) ?? null);
+    try {
+      // Learned stations in every slot Furlong leaves free.
+      const orbiting = Array.from({ length: MAX_ORBIT_SLOTS - 1 }, (_, i) =>
+        summary({ welcomeRoomId: `room-s${String(i).padStart(2, '0')}`, name: `S${i}`, orbitSlot: i + 1 }));
+      const rooms = [...orbiting.map((o) => o.welcomeRoomId), 'room-hab'];
+      // HAB RING follows that move: a later tow of it lost its tug to
+      // another station's (the summary's `stands` beside its latest).
+      const outbid: StationMove = { ...moves[1], mode: 'tug', tugRoomId: 'tug-room', departAt: now + 3_600_000, arriveAt: now + 7_200_000 };
+      const habMove = moves[1];
+      const hab = () => summary({ move: outbid, stands: habMove });
+      expect(registerLearnedStations(SOV, [...orbiting, hab()], { prune: true })).toBe(MAX_ORBIT_SLOTS);
+      expect(readStationRecords().map((r) => r.welcomeRoomId).sort()).toEqual(['room-mine', ...rooms].sort());
+      const listed = listStations();
+      for (const room of rooms) expect(listed.find((st) => st.welcomeRoomId === room)?.planetId).toBe(SOV);
+      // Back in its orbit (its move called off), this install's own station
+      // holds a slot again, and the last learned one ranked goes.
+      moves.shift();
+      expect(registerLearnedStations(SOV, [...orbiting, hab()], { prune: true })).toBe(1);
+      expect(readStationRecords().map((r) => r.welcomeRoomId).sort())
+        .toEqual(['room-mine', ...rooms.filter((r) => r !== orbiting[orbiting.length - 1].welcomeRoomId)].sort());
+      // Where this install's list has no move for HAB RING (called off,
+      // say, before its summary heard), the list seats it: it counts
+      // against the slots as the list has it, and another learned one goes.
+      moves.length = 0;
+      expect(registerLearnedStations(SOV, [...orbiting, hab()], { prune: true })).toBe(1);
+      expect(readStationRecords().map((r) => r.welcomeRoomId)).not.toContain(orbiting[orbiting.length - 2].welcomeRoomId);
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
   it('keep this client at the planet its list settled a bounced arrival at, before the pin is shared', () => {
     const now = Date.now();
     // Learned here, around this planet: the station this client is aboard,

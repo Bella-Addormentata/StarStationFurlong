@@ -43,7 +43,7 @@ import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { setStationTrimResolver } from './orbits';
-import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver } from './stations';
+import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationInTransit } from './stations';
 import type { KnownPlace, StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
@@ -879,7 +879,11 @@ function holdsSummary(had: StationRecord & Record<string, unknown>, s: StationSu
  *  crowded planet lists the same learned stations on every install. 🚚 A
  *  summary is at the planet its move puts it at (settledPlanet: an arrival
  *  not pinned yet where this install's list settled it), and this install's
- *  own stations where its list has them (their moves applied). */
+ *  own stations where its list has them (their moves applied). A station
+ *  between planets holds no slot (stations.placeStations lists it where it
+ *  left from all the same): only those in their orbits count against the
+ *  slots, this install's own and the learned alike, and every learned one
+ *  in transit is admitted besides. */
 function admittedAt(planet: string, stations: Iterable<StationSummary>, listed: StationRecord[]): {
   admitted: Set<string>;
   displaced: Set<string>;
@@ -888,13 +892,17 @@ function admittedAt(planet: string, stations: Iterable<StationSummary>, listed: 
   const ownRooms = new Set(own.map((st) => st.welcomeRoomId));
   const now = Date.now();
   const listedAt = (room: string) => listed.find((st) => st.welcomeRoomId === room);
-  const ranked = [...stations]
-    .filter((s) => settledPlanet(s, now, listedAt) === planet && !ownRooms.has(s.welcomeRoomId))
+  const here = [...stations].filter((s) => settledPlanet(s, now, listedAt) === planet && !ownRooms.has(s.welcomeRoomId));
+  // Between planets as this install's list has it, as settledPlanet goes
+  // by the list (what it lists holds a slot or not by that), else by the
+  // move the summary's station follows (summaryPlanet's).
+  const inTransit = (s: StationSummary) => stationInTransit(listedAt(s.welcomeRoomId) ?? { move: s.stands ?? s.move }, now);
+  const ranked = here.filter((s) => !inTransit(s))
     .sort((a, b) => Number(b.ownerId !== undefined) - Number(a.ownerId !== undefined)
       || (a.welcomeRoomId < b.welcomeRoomId ? -1 : a.welcomeRoomId > b.welcomeRoomId ? 1 : 0));
-  const free = Math.max(0, MAX_ORBIT_SLOTS - own.length);
+  const free = Math.max(0, MAX_ORBIT_SLOTS - own.filter((st) => !stationInTransit(st, now)).length);
   return {
-    admitted: new Set(ranked.slice(0, free).map((s) => s.welcomeRoomId)),
+    admitted: new Set([...ranked.slice(0, free), ...here.filter(inTransit)].map((s) => s.welcomeRoomId)),
     displaced: new Set(ranked.slice(free).map((s) => s.welcomeRoomId)),
   };
 }

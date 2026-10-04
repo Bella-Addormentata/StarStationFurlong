@@ -21,12 +21,13 @@ import {
   registerStation,
   removeStation,
   setRoomStationResolver,
+  setStationMoveResolver,
   setStationRoomSource,
   stationForRoom,
   stationRoomCause,
   stationsAroundPlanet,
 } from './stations';
-import type { StationRecord } from './stations';
+import type { StationMove, StationRecord } from './stations';
 import { SolarSystemMap, screenOffset, stationBodies } from './map';
 import { DEFAULT_STATION } from './defaultStation';
 import { ORBIT_EPOCH_MS } from './orbits';
@@ -253,6 +254,33 @@ describe('listStations', () => {
     const stations = listStations({}, [at('room-b', 1), at('room-c', 2), at('room-a', 1)]);
     expect(stations.map((st) => [st.id, st.orbitSlot]))
       .toEqual([[DEFAULT_STATION_ID, 0], ['room-b', 3], ['room-c', 2], ['room-a', 1]]);
+  });
+
+  it('keeps a station waiting for its launch window in the slot its move leaves from, whatever clash turns up', () => {
+    const at = (room: string, orbitSlot: number): StationRecord =>
+      ({ id: room, name: room.toUpperCase(), planetId: DEFAULT_PLANET_ID, orbitSlot, welcomeRoomId: room });
+    const now = ORBIT_EPOCH_MS + 1_000_000;
+    const away = (room: string): StationMove => ({
+      stationId: room, welcomeRoomId: room, fromPlanetId: DEFAULT_PLANET_ID, fromSlot: 1, toPlanetId: 'planet-aris', toSlot: 0,
+      departAt: now + 3_600_000, arriveAt: now + 90_000_000, mode: 'thrusters', bookedAt: now - 1000, fuel: 1, fuelDrawn: 0,
+    });
+    const moves = new Map<string, StationMove>([['room-b', away('room-b')]]);
+    setStationMoveResolver((st) => moves.get(st.welcomeRoomId) ?? null);
+    const slots = (t: number) =>
+      Object.fromEntries(listStations({}, [at('room-b', 1), at('room-a', 1)], t).map((st) => [st.id, st.orbitSlot]));
+    try {
+      // room-b booked its move from slot 1, priced for that orbit; room-a,
+      // which would win the slot by its welcome room, turns up there before
+      // the launch window. room-b keeps it until it leaves…
+      expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 2 });
+      // …and gone, it holds none: room-a has its own.
+      expect(slots(now + 3_600_001)).toMatchObject({ 'room-a': 1 });
+      // Two waiting for one slot go by the global order, as any clash.
+      moves.set('room-a', away('room-a'));
+      expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 2, 'room-a': 1 });
+    } finally {
+      setStationMoveResolver(null);
+    }
   });
 
   it('lists a record naming an unknown planet at the default planet, in a slot free there', () => {

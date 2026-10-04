@@ -238,6 +238,7 @@ export type MoveRefusal =
   | 'no-station' // the atlas does not place this module in a station yet
   | 'not-commander' // only the module's owner moves the station
   | 'moving' // a move is already scheduled or under way
+  | 'moves-unknown' // this room's move log is too long to read whole (roomMovesKnown)
   | 'same-planet' // already there: use the trim stick
   | 'no-slot' // every orbit around the destination is taken
   | 'no-thrusters' // no engine block on this module
@@ -338,6 +339,8 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
   if (!ctx.bolted) return { ok: false, refusal: 'not-bolted', quote: null };
   if (!station) return { ok: false, refusal: 'no-station', quote: null };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  // 🚚 A move past what this room's log can be read of may be under way.
+  if (!roomMovesKnown()) return { ok: false, refusal: 'moves-unknown', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
   if (!(ctx.modules >= 1)) return { ok: false, refusal: 'unknown-layout', quote: null };
@@ -459,6 +462,7 @@ export type TowRefusal =
   | 'not-docked' // the ship is not docked at a known station
   | 'not-commander'
   | 'moving' // the station is already scheduled to move, or moving
+  | 'moves-unknown' // this room's move log is too long to read whole (roomMovesKnown)
   | 'same-planet'
   | 'no-slot'
   | 'too-weak' // fewer than TUG_MIN_ENGINES engine blocks
@@ -519,6 +523,8 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
   const { station, now } = ctx;
   if (!station) return { ok: false, refusal: 'not-docked', quote: null };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  // 🚚 A tow past what this room's log can be read of may be under way.
+  if (!roomMovesKnown()) return { ok: false, refusal: 'moves-unknown', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
   // A tow's price scales with the modules pushed: one guessed from a layout
@@ -554,6 +560,7 @@ export function describeTowRefusal(refusal: TowRefusal, quote: TowQuote | null, 
     case 'not-docked': return 'Dock at a station to tow it.';
     case 'not-commander': return 'Only the ship\'s owner can tow.';
     case 'moving': return 'That station is already scheduled to move, or moving.';
+    case 'moves-unknown': return 'This ship holds more move records than the helm can read, so a tow may be under way. TOW waits until they are cleared.';
     case 'same-planet': return 'The station already orbits that planet.';
     case 'no-slot': return 'Every orbit around that planet is taken.';
     case 'too-weak': return `A tug needs at least ${TUG_MIN_ENGINES} ENGINE BLOCKs.`;
@@ -599,7 +606,8 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
  *  the clients there prune the flood. */
 export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
   const { own: there, heard, complete } = docMoves(doc);
-  if (!complete) return true;
+  // The bound room's moves count too: all of them, or the lock holds.
+  if (!complete || !roomMovesKnown()) return true;
   const all = [...there, ...heard, ...roomOwn(), ...readRememberedMoves()];
   const standing = standingMoves(all, all);
   if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
@@ -625,8 +633,9 @@ const SUMMARY_SCAN_MAX = 256;
 
 /** What a room's doc that is not the bound one holds: the moves booked
  *  there (roomOwn's), the moves its planet summaries gossip
- *  (planetSummary.ts: each station's latest, under its welcome room,
- *  checked as that module's pull checks them), and whether the bounded
+ *  (planetSummary.ts: each station's latest, and the move it follows
+ *  beside an outbid latest, under its welcome room, checked as that
+ *  module's pull checks them), and whether the bounded
  *  scans read every record of both. Every client standing in a room
  *  publishes there its own station's move and every move it remembers, so
  *  a move booked in another room of the station, or in a tug's, reaches
@@ -641,7 +650,13 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
     if (++scanned > SUMMARY_SCAN_MAX) break;
     if (typeof v !== 'object' || v === null || (v as { welcomeRoomId?: unknown }).welcomeRoomId !== k) continue;
     const m = validMove((v as { move?: unknown }).move);
-    if (m && m.welcomeRoomId === k) heard.push(m);
+    if (!m || m.welcomeRoomId !== k) continue;
+    heard.push(m);
+    // …and the move the station follows beside an outbid latest
+    // (planetSummary's `stands`), checked as cleanStationSummary checks it:
+    // the same station's, ranking below that latest.
+    const stands = validMove((v as { stands?: unknown }).stands);
+    if (stands && stands.welcomeRoomId === k && compareMoves(stands, m) < 0) heard.push(stands);
   }
   return {
     own: [...(legacy ? [legacy] : []), ...entries, ...folded],
@@ -653,10 +668,13 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
  *  by the bound room's record or any move this install remembers? Its dock
  *  holds the station, so neither end may UNDOCK it — from the tug's docking
- *  computer or from the station's door panel. */
+ *  computer or from the station's door panel. 🚚 So does a bound room whose
+ *  move log cannot all be read (roomMovesKnown): such a tow may lie past
+ *  it, and every dock lock (dockLockedByMove) asks here first. */
 export function towHoldsDock(roomIds: string[], realMs: number): boolean {
   const ids = new Set(roomIds.filter(Boolean));
   if (ids.size === 0) return false;
+  if (!roomMovesKnown()) return true;
   return knownStanding().some((m) =>
     m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
 }
@@ -830,6 +848,7 @@ export function describeMoveRefusal(refusal: MoveRefusal, quote: MoveQuote | nul
     case 'no-station': return 'This module is not part of a known station yet.';
     case 'not-commander': return 'Only the module\'s owner can move the station.';
     case 'moving': return 'A move is already scheduled or under way.';
+    case 'moves-unknown': return 'This room holds more move records than the helm can read, so a move may be under way. MOVE waits until they are cleared.';
     case 'same-planet': return 'The station already orbits that planet: use the trim stick.';
     case 'no-slot': return 'Every orbit around that planet is taken.';
     case 'unknown-layout': return 'This helm does not know the station\'s layout yet, so the move cannot be priced.';
@@ -1276,6 +1295,26 @@ function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
 function roomOwn(): StationMove[] {
   const { entries, legacy, folded } = roomMoves();
   return [...(legacy ? [legacy] : []), ...entries, ...folded];
+}
+
+/** Did the bounded scan of the bound room's move log read every record
+ *  (roomMoves)? A peer can flood the log, and the move it pushes past the
+ *  scan may be the one under way, which this install may never have heard
+ *  of. While it is not known, everything a move would hold holds (the dock
+ *  locks, towHoldsDock and roomDocLockedByMove; DEPART's berths,
+ *  shipArrival.berthsToCastOff; booking a move or a tow), as a far room's
+ *  does (roomDocLockedByMove), and a sweep clears the flood a bounded pass
+ *  at a time (sweepLater), once per change of the log: the writes that
+ *  sweep it otherwise are held too. Cached with the room's moves. */
+let knownCache: { version: number; known: boolean } | null = null;
+
+export function roomMovesKnown(): boolean {
+  if (!docAlive()) return true;
+  if (knownCache?.version !== roomVersion) {
+    knownCache = { version: roomVersion, known: roomMoves().complete };
+    if (!knownCache.known) sweepLater();
+  }
+  return knownCache.known;
 }
 
 /** The move a record stands for: a pin's settled move, else itself. */

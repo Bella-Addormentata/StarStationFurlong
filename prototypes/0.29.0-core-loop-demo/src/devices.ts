@@ -32,6 +32,7 @@ import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc'
 // helm is the primary read/write surface for both. Owner-gated at the caller;
 // shape-guarded on read (a hostile peer could write any junk).
 import {
+  CAST_OFF_RENEW_MS,
   TANK_CAPACITY,
   canDepart,
   castOffHeldBy,
@@ -46,6 +47,7 @@ import {
   readFlightRecord,
   readFuelLevel,
   releaseCastOff,
+  renewCastOff,
   subscribeShip,
   writeFlightRecord,
   writeFuelLevel,
@@ -66,6 +68,7 @@ import {
   planStationTow,
   quoteTow,
   readMoveFuelDrawn,
+  roomMovesKnown,
   subscribeStationMove,
   writeStationMove,
 } from './stationMove';
@@ -74,7 +77,7 @@ import { currentRoomId, dockedStationFor, listStations as listStationRecordsNow,
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
-  berthHeldByMove,
+  berthsToCastOff,
   castOffPlaces,
   castOffRefusal,
   detachBerth,
@@ -2100,13 +2103,11 @@ function enumerateTransientBerths(): string[] {
   return out;
 }
 
-/** 🚚 Does a station move hold any of them now, a dock or a legacy berth
- *  (shipArrival.berthHeldByMove)? A station between planets keeps the ships
- *  it holds, and UNDOCK and DETACH both refuse: so does DEPART. */
-function transientBerthHeld(): boolean {
-  const room = currentRoomId();
-  const now = Date.now();
-  return enumerateTransientBerths().some((id) => berthHeldByMove(room, id, now));
+/** 🚚 The helm's line for a cast-off shipArrival.berthsToCastOff refuses. */
+function berthHoldText(why: 'moving' | 'unread', lead: string): string {
+  return why === 'moving'
+    ? `${lead}: a station moving between planets holds this ship until it arrives.`
+    : `${lead}: this room holds more door or move records than the helm can read, so a berth here could be held, or stay attached.`;
 }
 
 /** Derived flight capability — plan §1.4: at least one fuel tank, engine, and
@@ -2640,11 +2641,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       }
       //    Nor one a station move holds, legacy berths included: they are no
       //    dock port, so no UNDOCK would answer for them.
-      if (transientBerthHeld()) {
-        setArrivalNote({
-          tone: 'warn',
-          text: 'Cannot depart: a station moving between planets holds this ship until it arrives.',
-        });
+      const berthsNow = berthsToCastOff(currentRoomId());
+      if (!berthsNow.ok) {
+        setArrivalNote({ tone: 'warn', text: berthHoldText(berthsNow.why, 'Cannot depart') });
         render();
         return;
       }
@@ -2671,6 +2670,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       //    dock let go of here as released at once.
       const by = castOffToken();
       if (!holdCastOff(by)) { render(); return; }
+      // Kept in force until this DEPART ends, however long its docks take
+      // to answer (shipDoc.renewCastOff).
+      const renewal = setInterval(() => { renewCastOff(by); }, CAST_OFF_RENEW_MS);
       const room = arrivalNoteRoom;
       const releaseAllowed = docking?.releaseAllowed;
       castingOff = true;
@@ -2693,7 +2695,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           // lets go (docking.ts farReleaseAllowed). Best effort, as an
           // UNDOCK's far write: one that cannot ask does not hold it.
           const portIds = new Set(shipDocking?.ports().map((p) => p.doorId) ?? []);
-          const legacy = enumerateTransientBerths().filter((id) => !portIds.has(id));
+          const berthsThen = berthsToCastOff(currentRoomId());
+          if (!berthsThen.ok) {
+            setArrivalNote({ tone: 'warn', text: berthHoldText(berthsThen.why, 'Cannot depart') });
+            return;
+          }
+          const legacy = berthsThen.berths.filter((id) => !portIds.has(id));
           const allowed = releaseAllowed
             ? await Promise.all(legacy.map(async (id) => {
               try {
@@ -2722,12 +2729,12 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             });
             return;
           }
-          // A move heard of meanwhile holds whatever it holds.
-          if (transientBerthHeld()) {
-            setArrivalNote({
-              tone: 'warn',
-              text: 'Did not depart: a station moving between planets holds this ship until it arrives.',
-            });
+          // A move heard of meanwhile holds whatever it holds: judged at the
+          // stamp step 3's releases take.
+          const castAt = Date.now();
+          const berths = berthsToCastOff(currentRoomId(), castAt);
+          if (!berths.ok) {
+            setArrivalNote({ tone: 'warn', text: berthHoldText(berths.why, 'Did not depart') });
             return;
           }
           // 2) Every check again, as things are once the docks have let go
@@ -2742,7 +2749,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           // 3) Release every other transient guest berth (#67 D2, either-side
           //    legal; a legacy berth is no dock port), then publish the
           //    flight record.
-          if (go) for (const doorId of enumerateTransientBerths()) detachBerth(doorId);
+          if (go) for (const doorId of berths.berths) detachBerth(doorId, castAt);
           if (!go || !writeFlightRecord(departureFlight(fromId, dest.id, go.hop))) {
             setArrivalNote({
               tone: 'warn',
@@ -2754,6 +2761,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           writeFuelLevel(go.fuel - go.hop.fuelCost, go.capacity);
           setArrivalNote(null);
         } finally {
+          clearInterval(renewal);
           castingOff = false;
           releaseCastOff(by);
           redrawHelms();
@@ -2797,7 +2805,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const who = esc(p.partnerName ?? 'the other module');
       const verb = p.state.kind === 'docked'
         ? (towHoldsDock([currentRoomId()], Date.now())
-          ? `<div style="margin-top:6px; color:#FFB300;">🚚 Towing — this dock holds the station until it arrives.</div>`
+          ? `<div style="margin-top:6px; color:#FFB300;">${roomMovesKnown()
+            ? '🚚 Towing — this dock holds the station until it arrives.'
+            : '🚚 This ship holds more move records than the helm can read — the dock holds until they are cleared.'}</div>`
           : btn('undock', `⏏ UNDOCK — FREE TO FLY`, '#FF8A80'))
         : p.state.kind === 'undocked'
           ? btn('dock', `⚓ DOCK → ${who}`, '#00E676')
@@ -2943,12 +2953,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // module bolted on by a gangway is part of a station (whose helm shows
     // this face on its FUEL & DOCKING tab), and a station's own welcome room
     // stays put whatever it is docked to, so a station never tows another.
-    const bolted = (docking?.connected() ?? []).some((m) => !m.dock);
+    // dockedStationFor tells a gangway from a berth by the door records, a
+    // legacy berth (transient, no dock chain) counted as the berth it is.
     // Only a snapshot that holds every door: a capped one could leave out
     // the gangway bolting this module into a station (dockedStationFor then
-    // finds no free ship), which the projections may not know of either.
+    // finds no free ship).
     const doors = readAllDoorsIfComplete();
-    const carried = hereId && !bolted && doors ? dockedStationFor(currentRoomId(), doors.values()) : null;
+    const carried = hereId && doors ? dockedStationFor(currentRoomId(), doors.values()) : null;
     const station = carried && carried === hereId ? stations.find((st) => st.id === hereId) ?? null : null;
     return {
       station,

@@ -23,7 +23,7 @@ import { isDockChain } from './adapter';
 import { berthMemoryFrom, stampAfter, type DockPortState } from './dockRules';
 import { readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
-import { dockLockedByMove, stationLeftFrom } from './stationMove';
+import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
   currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
 } from './stations';
@@ -315,6 +315,29 @@ function doorPartnerRoom(record: DoorRecord | undefined): string {
 export function berthHeldByMove(roomId: string, doorId: string, now: number = Date.now()): boolean {
   const record = readDoor(doorId);
   return dockLockedByMove([roomId, record?.paired === true ? doorPartnerRoom(record) : ''], now);
+}
+
+/** 🚚 Every transient berth of `roomId` (#67 D2: a dock, or a legacy berth
+ *  with no dock chain), when DEPART may cast them all off at `now`; else why
+ *  not. A station move holds one of them (berthHeldByMove): a station
+ *  between planets keeps the ships it holds, and UNDOCK and DETACH both
+ *  refuse, so DEPART does too. Or not every record it takes can be read:
+ *  the room's doors (readAllDoorsIfComplete), where a berth left out could
+ *  be held, and a legacy one, no dock port, would stay attached through the
+ *  flight; or, with a berth to let go of, its moves (roomMovesKnown), where
+ *  the one holding it may lie. */
+export function berthsToCastOff(
+  roomId: string,
+  now: number = Date.now(),
+): { ok: true; berths: string[] } | { ok: false; why: 'moving' | 'unread' } {
+  const doors = readAllDoorsIfComplete();
+  if (!doors) return { ok: false, why: 'unread' };
+  const berths: string[] = [];
+  for (const [doorId, door] of doors) {
+    if (door.paired === true && (door.transient === true || isDockChain(door.segments))) berths.push(doorId);
+  }
+  if (berths.length > 0 && !roomMovesKnown()) return { ok: false, why: 'unread' };
+  return berths.some((doorId) => berthHeldByMove(roomId, doorId, now)) ? { ok: false, why: 'moving' } : { ok: true, berths };
 }
 
 /**
@@ -739,9 +762,14 @@ export function completeArrival(
   // many moves it made since (and only the latest is kept), it is not there.
   const castOffPlace = rec.destinationAt !== undefined ? adriftPlace(rec.destinationAt) : null;
   const listedNow = castOffPlace ? listStations().find((s) => s.id === rec.locationId) : undefined;
-  const movedAway = !!castOffPlace && !!listedNow
-    && (planetById(listedNow.planetId).id !== planetById(castOffPlace.planetId).id || listedNow.orbitSlot !== castOffPlace.orbitSlot);
-  if (stationInTransit(station, now) || movedMidFlight || movedAway) {
+  // With both places known, where it orbits now says whether it went: back
+  // where it was at cast-off (bounced home off a full planet, or there and
+  // back) its berth is in reach, whatever moves it made meanwhile. Without
+  // them, any move that overlapped the time away.
+  const movedAway = castOffPlace && listedNow
+    ? planetById(listedNow.planetId).id !== planetById(castOffPlace.planetId).id || listedNow.orbitSlot !== castOffPlace.orbitSlot
+    : movedMidFlight;
+  if (stationInTransit(station, now) || movedAway) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.

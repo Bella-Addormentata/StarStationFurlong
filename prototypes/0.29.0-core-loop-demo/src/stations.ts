@@ -664,7 +664,8 @@ function placeStations(
   // free slot on; then arrivals in the order they arrived. A clash moves only
   // the station that lost it, and a newcomer never pushes out an incumbent.
   // Derived stations follow saved records (and those heard of) among those
-  // that never moved.
+  // that never moved. A station waiting to depart goes before them all
+  // (below).
   const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   const globalOrder = (i: number, j: number) => byName(wantOf[i].planetId, wantOf[j].planetId)
     || wantOf[i].orbitSlot - wantOf[j].orbitSlot
@@ -684,7 +685,21 @@ function placeStations(
     if (slot !== null) settle(0, wantOf[0].planetId, slot);
   }
   for (const i of rest.filter(inTransit)) settle(i, wantOf[i].planetId, wantOf[i].orbitSlot);
-  for (const group of [rest.filter((i) => i < firstDerived && !inTransit(i)), rest.filter((i) => i >= firstDerived && !inTransit(i))]) {
+  // 🚚 A station waiting for its launch window keeps the slot its move
+  // leaves from: the move was priced from that orbit (its fuel, its course),
+  // and is drawn leaving it. It takes that slot before the other stayers, so
+  // a clash found meanwhile moves the other station; two waiting for one
+  // slot go by the global order, the loser with the clash losers below.
+  const waiting = (i: number) => {
+    const m = candidates[i].move;
+    return !!m && nowMs < m.departAt && reservesSlot(m, nowMs);
+  };
+  const kept = new Set<number>();
+  for (const i of rest.filter((j) => !inTransit(j) && waiting(j)).sort(globalOrder)) {
+    if (takeOwn(wantOf[i].planetId, wantOf[i].orbitSlot)) { settle(i, wantOf[i].planetId, wantOf[i].orbitSlot); kept.add(i); }
+  }
+  const stay = (i: number) => !inTransit(i) && !kept.has(i);
+  for (const group of [rest.filter((i) => i < firstDerived && stay(i)), rest.filter((i) => i >= firstDerived && stay(i))]) {
     const lost: number[] = [];
     for (const i of [...group].sort(globalOrder)) {
       const { planetId, orbitSlot } = wantOf[i];
