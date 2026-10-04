@@ -500,4 +500,16 @@ describe('ships at or near a station', () => {
     // A retired ship's berth on the plan is no visitor either.
     expect(visitingShips(plan, [ship({ roomId: 'ship-1', status: 'docked', retired: true })], 'room-a')).toEqual([]);
   });
+
+  it('lists no module taken apart, whatever an old summary of it still says', () => {
+    station();
+    const plan = stationPlan(readAtlas(), 'room-a');
+    // A module docked here as a ship before it was bolted in, whose
+    // retirement no one aboard published, then taken apart: off the plan.
+    const stale = ship({ roomId: 'mod-x', name: 'OLD SKIFF', status: 'docked', fromRoom: 'room-a', gate: 3 });
+    expect(visitingShips(plan, [stale], 'room-a').map((s) => s.roomId)).toEqual(['ship-1', 'mod-x']);
+    expect(visitingShips(plan, [stale], 'room-a', new Set(['mod-x'])).map((s) => s.roomId)).toEqual(['ship-1']);
+    // Taking a module apart drops no other ship.
+    expect(visitingShips(plan, [stale], 'room-a', new Set(['ship-9'])).map((s) => s.roomId)).toEqual(['ship-1', 'mod-x']);
+  });
 });

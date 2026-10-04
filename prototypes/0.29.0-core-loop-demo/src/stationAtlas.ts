@@ -290,6 +290,14 @@ export function isDismantled(roomId: string): boolean {
   return ownValue(readStoredAtlas(), roomId)?.dismantledAt !== undefined;
 }
 
+/** 🔧 Every room this install holds as taken apart, read in one go: the
+ *  rooms the maps leave out (visibleAtlas), for a check over many rooms. */
+export function dismantledRoomIds(): Set<string> {
+  const gone = new Set<string>();
+  for (const e of Object.values(readStoredAtlas())) if (e?.dismantledAt !== undefined) gone.add(e.roomId);
+  return gone;
+}
+
 /** 🔧 Tombstones this install made that its store could not take (full, or
  *  privacy mode: writeAtlas swallows the error). Read as if stored for the
  *  rest of the session (readStoredAtlas), so this install's maps, merges and

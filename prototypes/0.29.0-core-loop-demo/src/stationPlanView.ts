@@ -43,6 +43,9 @@ export interface StationPlanDeps {
    *  own report anywhere (another planet, retired) can contradict a berth
    *  the atlas still draws here. visitingShips picks this station's. */
   ships: () => ShipSummary[];
+  /** 🔧 The rooms taken apart (dismantledRoomIds), whose old ship summaries
+   *  list no ship here. */
+  dismantled?: () => ReadonlySet<string>;
   /** The current room's doors, for the edit buttons. */
   doors: () => Array<{ id: string; label: string }>;
   /** Step back from the table and open a door's own panel. */
@@ -228,7 +231,7 @@ export class StationPlanView {
     this.station = station;
     const here = this.deps.currentRoomId();
     this.plan = stationPlan(this.deps.atlas(), station.welcomeRoomId, here);
-    this.visiting = visitingShips(this.plan, this.deps.ships(), station.welcomeRoomId);
+    this.visiting = visitingShips(this.plan, this.deps.ships(), station.welcomeRoomId, this.deps.dismantled?.());
     const dis = this.deps.disassembly?.() ?? { jobs: [], candidates: [] };
     this.jobs = new Map(dis.jobs.filter((j) => j.finishedAt === undefined).map((j) => [j.roomId, j]));
     this.candidates = dis.candidates;

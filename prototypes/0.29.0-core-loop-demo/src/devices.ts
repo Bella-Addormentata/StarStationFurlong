@@ -73,7 +73,7 @@ import {
 } from './helmRoute';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
 import { adriftPlace, destinationsFrom, flightCapable, groundedBy, isKnownStation, localStationId, planHop, stationHere, type HopPlan } from './stationDirectory';
-import { atlasComponent, readAtlas as readStationAtlas, subscribeSharedAtlas } from './stationAtlas';
+import { atlasComponent, dismantledRoomIds, readAtlas as readStationAtlas, subscribeSharedAtlas } from './stationAtlas';
 import { StationPlanView } from './stationPlanView';
 import {
   TUG_MIN_ENGINES,
@@ -1236,6 +1236,7 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           playerId: () => stationPlanDeps.playerId?.() ?? '',
           identityPub: () => stationPlanDeps.identityPub?.() ?? '',
           ships: () => Object.values(readPlanetStore().ships),
+          dismantled: () => dismantledRoomIds(),
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
           onBack: () => stationPlanView?.hide(),

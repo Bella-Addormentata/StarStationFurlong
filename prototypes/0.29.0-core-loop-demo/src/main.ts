@@ -2009,8 +2009,12 @@ async function joinRoomAtEpoch(
     if (epoch !== sessionEpoch || yjsSync !== sync) return;
     harvestStationAtlas();
     // 🔧 A Disassemble robot whose dock left the layout before we came: only
-    // now is its absence known (a gate timeout leaves it, as the harvest).
-    if (initialRoomStateReady(sync)) releaseOrphanedDocks();
+    // once the room's state is here is its absence known. After a gate
+    // timeout that is whenever the state lands, still this visit.
+    onRoomStateReady(sync, () => {
+      if (epoch !== sessionEpoch || yjsSync !== sync) return;
+      releaseOrphanedDocks();
+    });
     refreshExteriorView();
     // #157: this harvest can rewrite the current room's own edges (hop 1 of
     // every pose) without any doc event — the shells follow it like the
@@ -3150,6 +3154,33 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
     // Guard the race between the initial ready() check and observe() attaching.
     if (ready()) finish();
   });
+}
+
+/** 🔧 Run `fn` once this room's shared state has arrived
+ *  (initialRoomStateReady): at once if it has, else when the roomInfo write
+ *  or post-link sync that brings it lands, however long after
+ *  awaitInitialRoomState's timeout gave up waiting. Captures `sync`; the
+ *  caller's `fn` checks the session is still current, as every post-await
+ *  write does. */
+function onRoomStateReady(sync: YjsSync, fn: () => void): void {
+  if (initialRoomStateReady(sync)) {
+    fn();
+    return;
+  }
+  const roomMap = sync.doc.getMap("roomInfo");
+  let done = false;
+  const check = () => {
+    if (done || !initialRoomStateReady(sync)) return;
+    done = true;
+    try {
+      roomMap.unobserve(check);
+    } catch {
+      /* doc may be destroyed */
+    }
+    fn();
+  };
+  roomMap.observe(check);
+  void sync.whenLinkedSynced.then(check);
 }
 
 /** Ease the transit curtain to fully opaque (true) or clear (false).

@@ -180,7 +180,9 @@ const MAX_JOBS = 64;
 
 /** Most entries one read of the jobs walks, whatever they hold: far more
  *  than a room's docks and jobs, so only a peer's junk reaches it. Each read
- *  is one walk (World reads the jobs twice a second). */
+ *  is one walk (World reads the jobs twice a second). Only the release of
+ *  docks gone before this client came walks the whole map, once a visit
+ *  (releaseOrphanedDocks). */
 export const MAX_ROBOT_MAP_SCAN = 1024;
 
 const jobKey = (roomId: string) => `job:${roomId}`;
@@ -342,12 +344,15 @@ function stopOwnWorkIn(map: Y.Map<unknown>, dockId: string, from: RobotConfig | 
   const was = workingOn(from);
   const next = workingOn(to);
   if (was === next) return;
-  for (const roomId of [was, next]) {
-    if (!roomId) continue;
-    const key = workKey(roomId, dockId);
-    const w = map.get(key);
-    if (isDisassemblyWork(w) && w.working && workKey(w.roomId, w.dockId) === key) map.set(key, { ...w, working: false });
-  }
+  for (const roomId of [was, next]) if (roomId) stopOwnRecordIn(map, roomId, dockId);
+}
+
+/** A robot's own record on one module stops, uncredited, if it says it
+ *  works. Read and written by its own key: no walk of the map. */
+function stopOwnRecordIn(map: Y.Map<unknown>, roomId: string, dockId: string): void {
+  const key = workKey(roomId, dockId);
+  const w = map.get(key);
+  if (isDisassemblyWork(w) && w.working && workKey(w.roomId, w.dockId) === key) map.set(key, { ...w, working: false });
 }
 
 /** One opening of a job's robot work records, by dock. */
@@ -449,29 +454,40 @@ function releaseRemovedDocks(map: Y.Map<unknown>, event: Y.YMapEvent<unknown>): 
 
 /**
  * 🔧 The room's state has arrived (main.ts calls this once a visit, when it
- * has): a Disassemble config whose dock is not in the layout lost its dock
- * while no client of this build was there to see it go, so no removal ever
- * released it. Its robot leaves the job for good now, uncredited (the crew
- * never counted it without its dock), so the same dock put back later
- * starts unprogrammed, as after a removal seen (releaseRemovedDocks),
- * instead of its old record crediting all the time it was gone.
+ * has, however late): a Disassemble config whose dock is not in the layout
+ * lost its dock while no client of this build was there to see it go, so no
+ * removal ever released it. Its robot leaves the job for good now,
+ * uncredited (the crew never counted it without its dock), so the same dock
+ * put back later starts unprogrammed, as after a removal seen
+ * (releaseRemovedDocks), instead of its old record crediting all the time
+ * it was gone. Unlike the reads MAX_ROBOT_MAP_SCAN bounds, this walks the
+ * whole map: a config behind a peer's junk would otherwise never be
+ * released. It runs once a visit, and each release is read and written by
+ * its own keys (releaseDockIn), so the walk is its whole cost.
  */
-export function releaseOrphanedDocks(now = Date.now()): void {
+export function releaseOrphanedDocks(): void {
   const map = ensureMap();
   const doc = map.doc;
   if (!doc) return;
-  const gone: string[] = [];
-  let scanned = 0;
+  const gone: Array<[string, RobotConfig]> = [];
   for (const [key, value] of map.entries()) {
-    if (++scanned > MAX_ROBOT_MAP_SCAN) break;
     if (!key.startsWith('cfg:') || !isRobotConfig(value) || value.routine !== 'disassemble') continue;
     const dockId = key.slice(4);
-    if (placedFurnitureIn(doc, dockId)?.kind !== 'charging-dock') gone.push(dockId);
+    if (placedFurnitureIn(doc, dockId)?.kind !== 'charging-dock') gone.push([dockId, value]);
   }
   if (gone.length === 0) return;
   doc.transact(() => {
-    for (const dockId of gone) setConfigIn(map, dockId, null, now);
+    for (const [dockId, config] of gone) releaseDockIn(map, dockId, config);
   });
+}
+
+/** A robot whose dock is gone leaves its job for good, inside the caller's
+ *  transaction: its config is dropped, and its record on the module it was
+ *  set to stops, uncredited (the crew never counted it without its dock, so
+ *  no other robot's place or labor changes). */
+function releaseDockIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig): void {
+  map.delete(`cfg:${dockId}`);
+  if (config.target) stopOwnRecordIn(map, config.target, dockId);
 }
 
 /** Every disassembly job in this room, open or finished, with its crew. */

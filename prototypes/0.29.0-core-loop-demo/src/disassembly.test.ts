@@ -9,9 +9,9 @@ import { fileURLToPath } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, freeGateNumber, harvestIntoAtlas, isDismantled, noteRoomSeed,
-  ownValue, pushAtlasToDoc, readAtlas, seedAtlasDefaults, stationGates, visibleAtlas, withSharedAtlasOf, MAX_DISMANTLED,
-  MAX_ENTRIES, type AtlasEntry,
+  bindStationAtlasDoc, atlasComponents, dismantleInAtlas, dismantledRoomIds, freeGateNumber, harvestIntoAtlas, isDismantled,
+  noteRoomSeed, ownValue, pushAtlasToDoc, readAtlas, seedAtlasDefaults, stationGates, visibleAtlas, withSharedAtlasOf,
+  MAX_DISMANTLED, MAX_ENTRIES, type AtlasEntry,
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, isDisassemblyWork, jobAnnouncement, jobDueAt, jobFraction,
@@ -777,7 +777,7 @@ describe('the job in the robot map', () => {
     bindRobotDoc(c);
     Y.applyUpdate(c, Y.encodeStateAsUpdate(older));
     expect(readRobotConfig('d2')).toEqual({ routine: 'disassemble', target: 'room-b' });
-    releaseOrphanedDocks(10 * MIN);
+    releaseOrphanedDocks();
     expect(readRobotConfig('d2')).toBeNull();
     expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
     // The same dock put back starts unprogrammed: none of the time it was
@@ -789,16 +789,65 @@ describe('the job in the robot map', () => {
     expect(readRobotConfig('d2')).toBeNull();
     // Only a Disassemble robot is released, and only one whose dock is gone.
     writeRobotConfig('d3', { routine: 'dance' }, 20 * MIN);
-    releaseOrphanedDocks(21 * MIN);
+    releaseOrphanedDocks();
     expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
     expect(readRobotConfig('d3')).toEqual({ routine: 'dance' });
   });
 
-  it('releases a dock left behind once the room has arrived, never before', () => {
-    // main.ts calls it after the post-sync harvest, under the same gate.
-    const join = between(source('main.ts'), 'void awaitInitialRoomState(SYNC_GATE_MS).then(() => {', '});');
+  it("a dock that left before this client came leaves its job however much junk a peer put first", () => {
+    const a = roomWithDocks(['d1', 'd2']);
+    bindRobotDoc(a);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    const older = new Y.Doc();
+    Y.applyUpdate(older, Y.encodeStateAsUpdate(a));
+    older.getMap('furniture').delete('d2');
+    // A peer's junk reaches this client ahead of the room's records, so
+    // every bounded walk stops before d2's config.
+    const junk = new Y.Doc();
+    junk.transact(() => {
+      for (let i = 0; i < MAX_ROBOT_MAP_SCAN; i++) junk.getMap('robot').set(`junk-${i}`, i);
+    });
+    const c = roomWithDocks([]);
+    bindRobotDoc(c);
+    Y.applyUpdate(c, Y.encodeStateAsUpdate(junk));
+    Y.applyUpdate(c, Y.encodeStateAsUpdate(older));
+    expect([...c.getMap('robot').keys()].indexOf('cfg:d2')).toBeGreaterThanOrEqual(MAX_ROBOT_MAP_SCAN);
+    expect(readDisassemblyJobsIfComplete()).toBeNull();
+    releaseOrphanedDocks();
+    expect(readRobotConfig('d2')).toBeNull();
+    expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
+    expect(c.getMap('robot').get(`work:${JSON.stringify(['room-b', 'd2'])}`)).toMatchObject({ working: false, ms: 0 });
+    // The junk cleared and the same dock put back: it starts unprogrammed,
+    // and none of the time it was gone is labor.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(c));
+    peer.transact(() => {
+      for (let i = 0; i < MAX_ROBOT_MAP_SCAN; i++) peer.getMap('robot').delete(`junk-${i}`);
+    });
+    Y.applyUpdate(c, Y.encodeStateAsUpdate(peer, Y.encodeStateVector(c)));
+    writeFurnitureItem({ id: 'd2', kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    const back = readDisassemblyJobsIfComplete()![0];
+    expect(back.crew).toEqual(['d1']);
+    expect(workedMs(back, 20 * MIN)).toBe(20 * MIN);
+  });
+
+  it('releases a dock left behind once the room has arrived, never before, however late', () => {
+    // main.ts calls it after the post-sync harvest, once the room's state is
+    // here: at once, or when it lands after the gate gave up waiting.
+    const main = source('main.ts');
+    const join = between(main, 'void awaitInitialRoomState(SYNC_GATE_MS).then(() => {', 'refreshExteriorView();');
     expect(join).toContain('if (epoch !== sessionEpoch || yjsSync !== sync) return;');
-    expect(join).toContain('if (initialRoomStateReady(sync)) releaseOrphanedDocks();');
+    const release = between(join, 'onRoomStateReady(sync, () => {', '});');
+    expect(release).toContain('if (epoch !== sessionEpoch || yjsSync !== sync) return;');
+    expect(release).toContain('releaseOrphanedDocks();');
+    expect(main.split('releaseOrphanedDocks()').length).toBe(2);
+    const ready = between(main, 'function onRoomStateReady(sync: YjsSync, fn: () => void): void {', '\n}\n');
+    expect(ready).toContain('if (initialRoomStateReady(sync)) {');
+    expect(ready).toContain('if (done || !initialRoomStateReady(sync)) return;');
+    expect(ready).toContain('roomMap.observe(check);');
+    expect(ready).toContain('void sync.whenLinkedSynced.then(check);');
+    expect(ready).not.toContain('setTimeout');
   });
 
   it('a dock moved, or kept by a layout written whole, stays on its job', () => {
@@ -922,6 +971,7 @@ describe('a module taken apart', () => {
       // …yet this install's maps drop it for the session,
       expect(readAtlas()['room-b']).toBeUndefined();
       expect(isDismantled('room-b')).toBe(true);
+      expect([...dismantledRoomIds()]).toEqual(['room-b']);
       // the station's other visitors get it,
       expect(doc.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: 1000, doors: {} });
       // and so does the next room doc this install joins.
@@ -1444,6 +1494,7 @@ describe('a module taken apart', () => {
     expect(readAtlas()['room-b']).toBeUndefined();
     expect(isDismantled('room-b')).toBe(true);
     expect(isDismantled('room-a')).toBe(false);
+    expect([...dismantledRoomIds()]).toEqual(['room-b']);
     // Still this install's own tombstone, kept for good.
     expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b']).toMatchObject({ dismantledAt: 5, dismantledHere: true });
   });
@@ -1664,5 +1715,14 @@ describe('where the robots work (source scan)', () => {
     expect(body).toContain('doorsJoinedTo(doorsNow, job.roomId)');
     expect(body).toContain('joined.find((d) => d.doorId === job.doorId) ?? joined[0]');
     expect(body).not.toContain('this.workPost(job.doorId');
+  });
+});
+
+describe('off the holotable too (source scan)', () => {
+  it("lists no module taken apart among the station's ships", () => {
+    const deps = between(source('devices.ts'), 'stationPlanView = new StationPlanView({', '});');
+    expect(deps).toContain('dismantled: () => dismantledRoomIds(),');
+    const refresh = between(source('stationPlanView.ts'), 'refresh(station: StationRecord | null = this.station): void {', '\n  }');
+    expect(refresh).toContain('visitingShips(this.plan, this.deps.ships(), station.welcomeRoomId, this.deps.dismantled?.())');
   });
 });

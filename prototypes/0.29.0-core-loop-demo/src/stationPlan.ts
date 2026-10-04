@@ -228,12 +228,16 @@ export interface VisitingShip {
  * Every ship at or near the station: the docked ships on the plan, merged
  * with what the planet's shared summary says about ships docked here, flying
  * in or flying out. `welcomeRoomId` is the station's welcome room, the id
- * ship summaries name a station by.
+ * ship summaries name a station by. `dismantled` holds the rooms taken apart
+ * (dismantledRoomIds): a module taken apart is no ship here, whatever an old
+ * summary of it still says (one docked here before it was bolted in, whose
+ * retirement no one aboard published).
  */
 export function visitingShips(
   plan: StationPlan,
   ships: ShipSummary[],
   welcomeRoomId: string,
+  dismantled: ReadonlySet<string> = new Set(),
 ): VisitingShip[] {
   const out = new Map<string, VisitingShip>();
   const stationRooms = new Set(plan.modules.map((m) => m.roomId));
@@ -247,7 +251,7 @@ export function visitingShips(
     });
   }
   for (const s of ships) {
-    if (stationRooms.has(s.roomId)) continue;
+    if (stationRooms.has(s.roomId) || dismantled.has(s.roomId)) continue;
     // A ship that stopped being one (bolted in, fitting removed) is no
     // visitor, whatever berth the atlas still draws.
     if (s.retired) {
