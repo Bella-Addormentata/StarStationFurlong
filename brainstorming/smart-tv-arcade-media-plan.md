@@ -824,7 +824,17 @@ travels on a stream of its own, opened with a one-byte preface naming
 the class, so its ceiling — 4 KiB per message — is known from the first
 byte and enforced on the length prefix before a byte of the body is
 allocated (the node reads into a fixed buffer and resets the stream,
-counting it, when the prefix says more); the shared reliable readers,
+counting it, when the prefix says more) — and a ceiling on bytes bounds
+no stream that sends none: a read DEADLINE runs from the stream's
+ACCEPTANCE, not its first byte — a second for the preface and the length
+prefix, the budget's share for the whole message — a stream past it
+reset and counted against the link like a frame, and the streams a link
+may hold open unclassified or unfinished are capped per link (the
+session's unidirectional-stream limit, which the receiver dictates and
+the sender cannot exceed: the media cap below plus a few for control),
+so an authenticated peer that opens every stream it is allowed and
+sends nothing, or a byte at a time, holds those slots for a second and
+then none; the shared reliable readers,
 which carry `ysync` as well — a whole Yjs baseline is one frame, and a
 room snapshot may run to 1 000 000 bytes — keep their own kinds and get a
 GLOBAL ceiling of their own, the largest frame any kind may carry (that
@@ -1085,7 +1095,9 @@ unidirectional-stream limit, which the receiver dictates and the sender
 cannot exceed; and per source inside it, a few frames' worth: the frames
 a keyframe at the ceiling spans on the wire at the tier's rate, half a
 second's, plus the tier's frame rate times the jitter window) and a
-deadline from a stream's first byte to its end derived from what an
+deadline from a stream's ACCEPTANCE — never its first byte, since a
+stream that sends nothing holds its slot as surely as one that trickles
+— to its end, derived from what an
 honest frame can take, not from one frame interval — a keyframe is many
 intervals long on the wire: the video frame-size ceiling is half a second
 of the tier's rate (187 kB on the 3 Mbps desktop tier, 50 kB on the
@@ -1636,10 +1648,14 @@ the info `"ssf-p2-session:v1\n" ‖ u16-BE length ‖ room (UTF-8) ‖ u16-BE
 length ‖ cabinet id (UTF-8) ‖ tenure nonce (16) ‖ epoch (4, big-endian) ‖
 lane id (8) ‖ P1's Ed25519 pub (32) ‖ P2's Ed25519 pub (32)`, P1 then P2
 by role, never by sort, and 32 bytes out — the key bound to {room, cabinet
-id, the seat's tenure nonce, epoch, lane id, both pubs} exactly as
-`signBytes.ts` binds an envelope: a versioned tag first, every
-variable-length field length-framed, so two correct implementations
-derive one key and an ad-hoc one cannot leave the domain out — where the
+id, the seat's tenure nonce, epoch, lane id, both pubs} under a versioned
+tag, as `signBytes.ts` binds an envelope to its room, kind and sequence —
+but by an encoding of this protocol's OWN: every variable-length field
+framed by an explicit length, where the envelope signer separates its
+newline-free fields by newlines and length-frames nothing, so an
+implementer takes the framing from here and never from there; two
+correct implementations derive one key and an ad-hoc one cannot leave
+the domain out — where the
 tenure nonce is minted fresh by P1 as it grants the seat and carried in the
 seat record, so a renewed seat or another cabinet is another key even for
 the same two identities on the same lane in the same room epoch — and each
