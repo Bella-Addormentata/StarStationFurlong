@@ -1303,6 +1303,30 @@ describe('ships and the solar system', () => {
     expect(summaryLegEnds({ ...s, toRoom: undefined })).toBeNull();
   });
 
+  it('🎚️ carries a copied stop\'s own orbit with the leg, so a remote reader flies the priced transfer', () => {
+    const slot3 = orbitForSlot(SOV, 3);
+    const custom = { radiusKm: slot3.radiusKm + 120, phase0: 0.4 };
+    const places: RouteFlightPlaces = {
+      from: { id: 'st-x', planetId: SOV, orbitSlot: 1 },
+      to: { id: 'st-y', planetId: SOV, orbitSlot: 3, orbit: custom },
+    };
+    const fields = legEndFields(places);
+    expect(fields).toEqual({ fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3, toOrbit: custom });
+    const now = Date.now();
+    const wire = { ...ship, status: 'in-flight', fromRoom: 'room-a', toRoom: 'room-b', departedAt: now - 1000, etaAt: now + 3600_000, updatedAt: now, ...fields };
+    const heard = cleanShipSummary(JSON.parse(JSON.stringify(wire)), now)!;
+    expect(heard.toOrbit).toEqual(custom);
+    expect(heard.fromOrbit).toBeUndefined();
+    const ends = summaryLegEnds(heard)!;
+    expect(ends[1].orbit).toEqual(custom);
+    // The remote plan targets the custom orbit, not the slot's.
+    expect(planTransfer(ends[0], ends[1], now)!.to.radiusKm).toBeCloseTo(custom.radiusKm, 6);
+    // A peer's orbit outside the band, or without its leg, is dropped.
+    expect(cleanShipSummary({ ...wire, toOrbit: { radiusKm: 1, phase0: 0 } }, now)!.toOrbit).toBeUndefined();
+    expect(cleanShipSummary({ ...wire, toOrbit: { radiusKm: 'x', phase0: 0 } }, now)!.toOrbit).toBeUndefined();
+    expect(cleanShipSummary({ ...wire, toSlot: undefined }, now)!.toOrbit).toBeUndefined();
+  });
+
   it('🚚 an install that first hears of a leg after its next stop moved planets places it where the route copied the stop', () => {
     // The ferry's game: its route copied ALPHA (slot 1) and BRAVO (slot 3)
     // around SOVEREIGN, and its timetable flies the leg between them.

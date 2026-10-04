@@ -44,9 +44,9 @@ import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
-import { setStationTrimResolver } from './orbits';
+import { isUsableOrbit, setStationTrimResolver } from './orbits';
 import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver } from './stations';
-import type { KnownPlace, StationBerthRecord, StationMove, StationRecord } from './stations';
+import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
@@ -157,6 +157,12 @@ export interface ShipSummary {
   fromSlot?: number;
   toPlanetId?: string;
   toSlot?: number;
+  /** 🎚️ A copied stop's own orbit, when an altitude change left its
+   *  station off its slot's: the orbit the timetable priced the leg on.
+   *  Each stands only with the four fields above, and only in the planet's
+   *  band. Additive: an older client's clean drops them (it draws the slot). */
+  fromOrbit?: StationOrbit;
+  toOrbit?: StationOrbit;
   /** 🚏📋 A ferry on a route (build notes A9 item 7), so an all-gates board
    *  in a room its riders never publish to can still show it, "as of"
    *  updatedAt: the gate it is docked at (or bound for), its next stop's
@@ -461,6 +467,11 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
     out.fromSlot = v.fromSlot;
     out.toPlanetId = v.toPlanetId;
     out.toSlot = v.toSlot;
+    const planet = planetById(v.fromPlanetId);
+    const fromOrbit = legOrbit(v.fromOrbit, planet);
+    const toOrbit = legOrbit(v.toOrbit, planet);
+    if (fromOrbit) out.fromOrbit = fromOrbit;
+    if (toOrbit) out.toOrbit = toOrbit;
   }
   // 🚏📋 The route fields each stand or drop alone: a bad one never costs
   // the ship its summary.
@@ -484,6 +495,15 @@ export interface LegEnd {
   id: string;
   planetId: string;
   orbitSlot: number;
+  /** 🎚️ The stop's own orbit, when not its slot's. */
+  orbit?: StationOrbit;
+}
+
+/** 🎚️ A peer-sent leg orbit, copied: just its two numbers, in the band. */
+function legOrbit(v: unknown, planet: ReturnType<typeof planetById>): StationOrbit | undefined {
+  if (!isPlainObject(v)) return undefined;
+  const o = { radiusKm: v.radiusKm as number, phase0: v.phase0 as number };
+  return isUsableOrbit(planet, o) ? o : undefined;
 }
 
 /** 🚚 A ferry's summary fields for the leg its ruling timetable flies: the
@@ -491,13 +511,17 @@ export interface LegEnd {
  *  answer). None outside a leg. */
 export function legEndFields(
   places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
-): Pick<ShipSummary, 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'> {
+): Pick<ShipSummary, 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot' | 'fromOrbit' | 'toOrbit'> {
   if (!places?.to) return {};
+  const { orbit: fromOrbit } = places.from;
+  const { orbit: toOrbit } = places.to;
   return {
     fromPlanetId: planetById(places.from.planetId).id,
     fromSlot: places.from.orbitSlot,
     toPlanetId: planetById(places.to.planetId).id,
     toSlot: places.to.orbitSlot,
+    ...(fromOrbit ? { fromOrbit: { radiusKm: fromOrbit.radiusKm, phase0: fromOrbit.phase0 } } : {}),
+    ...(toOrbit ? { toOrbit: { radiusKm: toOrbit.radiusKm, phase0: toOrbit.phase0 } } : {}),
   };
 }
 
@@ -508,15 +532,15 @@ export function legEndFields(
  *  itself. Null when the summary carries no copies, or names no rooms: the
  *  reader places the ends by its station list. */
 export function summaryLegEnds(
-  s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'>,
+  s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot' | 'fromOrbit' | 'toOrbit'>,
   idOf: (room: string) => string | undefined = () => undefined,
 ): [LegEnd, LegEnd] | null {
-  const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot } = s;
+  const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot, fromOrbit, toOrbit } = s;
   if (!fromRoom || !toRoom || fromPlanetId === undefined || fromSlot === undefined
     || toPlanetId === undefined || toSlot === undefined) return null;
   return [
-    { id: idOf(fromRoom) ?? fromRoom, planetId: planetById(fromPlanetId).id, orbitSlot: fromSlot },
-    { id: idOf(toRoom) ?? toRoom, planetId: planetById(toPlanetId).id, orbitSlot: toSlot },
+    { id: idOf(fromRoom) ?? fromRoom, planetId: planetById(fromPlanetId).id, orbitSlot: fromSlot, ...(fromOrbit ? { orbit: fromOrbit } : {}) },
+    { id: idOf(toRoom) ?? toRoom, planetId: planetById(toPlanetId).id, orbitSlot: toSlot, ...(toOrbit ? { orbit: toOrbit } : {}) },
   ];
 }
 
