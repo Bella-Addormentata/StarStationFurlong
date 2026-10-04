@@ -5,7 +5,7 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
-  acceptMediaOrigin, forgetMediaConsent, isPrivateHost, mediaConsent, mediaOrigin, setOwnMediaOrigins,
+  acceptMediaOrigin, forgetMediaConsent, isPrivateHost, mediaConsent, mediaOrigin, setOwnMediaOrigins, urlConsent,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 
@@ -14,6 +14,22 @@ const url = (u: string): TvSource => ({ kind: 'url', url: u });
 beforeEach(() => {
   forgetMediaConsent();
   setOwnMediaOrigins(['http://localhost:4173', 'http://127.0.0.1:8080']);
+});
+
+describe('urlConsent — the one answer for any URL the room hands this browser (the cabinet asks it too)', () => {
+  it('own origins and the product lanes without asking; a public host asks once; a private host never', () => {
+    expect(urlConsent('http://localhost:4173/roms/pacman.zip')).toBe('ok');
+    expect(urlConsent('http://127.0.0.1:8080/blob/abc')).toBe('ok'); // the identified node
+    expect(urlConsent('http://127.0.0.1:8081/blob/abc')).toBe('refuse'); // a loopback port that is not the node's
+    expect(urlConsent('https://archive.org/download/x/y.nes')).toBe('ok');
+    expect(urlConsent('https://roms.example.org/pacman.zip')).toBe('ask');
+    acceptMediaOrigin('https://roms.example.org');
+    expect(urlConsent('https://roms.example.org/pacman.zip')).toBe('ok');
+    expect(urlConsent('http://192.168.1.20/pacman.zip')).toBe('refuse');
+    expect(urlConsent('http://nas/pacman.zip')).toBe('refuse');
+    expect(urlConsent('not a url')).toBe('refuse');
+    expect(mediaConsent(url('https://roms.example.org/film.mp4'))).toBe(urlConsent('https://roms.example.org/film.mp4'));
+  });
 });
 
 describe('what a viewer\'s browser will fetch for the room\'s TV', () => {

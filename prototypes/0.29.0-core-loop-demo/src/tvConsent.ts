@@ -114,10 +114,13 @@ function isPrivateIPv6(ip: string): boolean {
   return false;
 }
 
-/** May this viewer's browser fetch `source` now: yes, ask first, or never. */
-export function mediaConsent(source: TvSource): MediaConsent {
-  if (source.kind !== 'url') return 'ok'; // the product's own lanes
-  const origin = normalizeOrigin(source.url);
+/** May this viewer's browser fetch `url` now — the one answer for any
+ *  peer-written http(s) URL the room can hand this browser (a TV source, an
+ *  arcade game's link): yes for the page's own origin, its identified node
+ *  and the product's lanes; ask first for any other public origin; never
+ *  for a host inside this viewer's own networks. */
+export function urlConsent(url: string): MediaConsent {
+  const origin = normalizeOrigin(url);
   if (!origin) return 'refuse';
   if (ownOrigins.has(origin)) return 'ok';
   let host: string;
@@ -129,4 +132,10 @@ export function mediaConsent(source: TvSource): MediaConsent {
   if (isPrivateHost(host)) return 'refuse';
   if (PRODUCT_ORIGINS.has(origin) || accepted.has(origin)) return 'ok';
   return 'ask';
+}
+
+/** May this viewer's browser fetch `source` now: yes, ask first, or never. */
+export function mediaConsent(source: TvSource): MediaConsent {
+  if (source.kind !== 'url') return 'ok'; // the product's own lanes
+  return urlConsent(source.url);
 }

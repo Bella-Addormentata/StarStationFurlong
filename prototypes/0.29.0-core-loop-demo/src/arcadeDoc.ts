@@ -361,7 +361,9 @@ export function readCuration(itemId: string): CabinetCuration {
   const raw = ensureMap().get(cabinetKey(itemId)) as Partial<CabinetCuration> | undefined;
   if (!raw || typeof raw !== 'object') return { game: null, shelf: [], data: 'station', seq: 0 };
   const shelf = Array.isArray(raw.shelf)
-    ? raw.shelf.map(sanitizeGame).filter((g): g is ArcadeGame => g !== null).slice(0, ARCADE_SHELF_MAX)
+    ? raw.shelf
+        .slice(0, ARCADE_SHELF_MAX) // bound the work before the shape check: a peer's array is not
+        .map(sanitizeGame).filter((g): g is ArcadeGame => g !== null)
     : [];
   return {
     game: sanitizeGame(raw.game),

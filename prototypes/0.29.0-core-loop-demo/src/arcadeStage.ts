@@ -37,6 +37,8 @@ import {
   romAcceptList, EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
 import type { EmulatorHandle } from './arcadeEmulator';
+import { acceptMediaOrigin, urlConsent } from './tvConsent';
+import type { MediaConsent } from './tvConsent';
 import { escapeHtml } from './htmlEscape';
 import { showHint } from './hud';
 
@@ -64,6 +66,8 @@ interface Stage {
   lastControls: string;
   /** A wrong file picked for BRING YOUR COPY: said once, under the notice. */
   fileNote: string;
+  /** What had focus when the stage opened: focus goes back there on close. */
+  opener: HTMLElement | null;
 }
 
 let stage: Stage | null = null;
@@ -79,6 +83,10 @@ export function openArcadeStage(itemId: string): void {
   root.id = 'arcade-stage';
   root.setAttribute('role', 'dialog');
   root.setAttribute('aria-label', 'Arcade cabinet');
+  // A modal, and said so: it takes focus, keeps Tab inside, and hands focus
+  // back to whatever had it when it closes (the theatre's lifecycle).
+  root.setAttribute('aria-modal', 'true');
+  root.tabIndex = -1;
   root.innerHTML = `
     <div class="arcade-stage-panel">
       <div class="arcade-stage-head"></div>
@@ -93,12 +101,27 @@ export function openArcadeStage(itemId: string): void {
     const el = e.target as HTMLElement | null;
     if (el && !el.closest('button, input, label, select')) stage?.frame?.focus();
   });
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   document.body.appendChild(root);
   const onKey = (e: KeyboardEvent) => {
     if (e.key === 'Escape') {
       e.stopPropagation();
       e.preventDefault();
       closeArcadeStage();
+      return;
+    }
+    // Tab stays inside the dialog: cycle its controls (and the frame, which
+    // takes focus itself), rather than letting focus walk the room behind.
+    if (e.key === 'Tab') {
+      const focusable = stageFocusable(root);
+      e.preventDefault();
+      e.stopPropagation();
+      if (focusable.length === 0) return;
+      const at = focusable.indexOf(document.activeElement as HTMLElement);
+      const next = e.shiftKey
+        ? focusable[(at <= 0 ? focusable.length : at) - 1]!
+        : focusable[(at + 1) % focusable.length]!;
+      next.focus();
       return;
     }
     e.stopPropagation(); // at the controls: nothing walks the player
@@ -124,9 +147,17 @@ export function openArcadeStage(itemId: string): void {
     lastStatus: '',
     lastControls: '',
     fileNote: '',
+    opener,
   };
+  root.focus();
   stage.timer = window.setInterval(stageTick, 500);
   stageTick();
+}
+
+/** The stage's controls in Tab order: its buttons, the file picker and the
+ *  emulator frame itself (it takes focus, and the game's keys go to it). */
+function stageFocusable(root: HTMLElement): HTMLElement[] {
+  return [...root.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), iframe')];
 }
 
 /** Close the stage; stand up only if this page still holds P1 (the owner
@@ -144,6 +175,7 @@ function teardown(t: Stage): void {
   window.removeEventListener('keydown', t.onKey, true);
   unmountFrame(t);
   t.root.remove();
+  if (t.opener && t.opener.isConnected) t.opener.focus();
 }
 
 function unmountFrame(t: Stage): void {
@@ -200,10 +232,45 @@ function stageTick(): void {
     return;
   }
   const key = `${gameId(game)}@${rec.data}`;
-  if (t.mounted !== key && t.mounted !== `failed:${key}` && t.mounted !== `waiting:${key}` && t.mounted !== `consent:${key}`) {
+  // A game's link is a peer-written URL this browser would fetch: asked of
+  // every tick, as the theatre asks (tvConsent) — a mounted game whose
+  // origin loses its consent (the node's origin losing its fingerprint
+  // trust) comes down, so a RETRY or reload never fetches from a stranger.
+  const consent = game.url && t.mounted === key ? urlConsent(game.url) : 'ok';
+  if (consent !== 'ok') {
+    unmountFrame(t);
+    t.mounted = `consent:${key}`;
+    t.phase = 'waiting';
+    urlConsentNotice(t, game, consent);
+  } else if (t.mounted !== key && t.mounted !== `failed:${key}` && t.mounted !== `waiting:${key}` && t.mounted !== `consent:${key}`) {
     void mountGame(t, game, rec.data, key);
   }
   renderStageChrome(t);
+}
+
+/** FETCH <game> FROM <host>? — or NOT FETCHED HERE for a host inside a
+ *  private network, which no button can override. The TV's ask, for a ROM. */
+function urlConsentNotice(t: Stage, game: ArcadeGame, consent: Exclude<MediaConsent, 'ok'>): void {
+  let host = game.url;
+  let origin = game.url;
+  try {
+    const u = new URL(game.url);
+    host = u.host;
+    origin = u.origin;
+  } catch { /* shown as it is */ }
+  if (consent === 'refuse') {
+    showNotice(t, 'NOT FETCHED HERE',
+      `<b>${escapeHtml(host || 'this link')}</b> is inside a private network — nobody in the room can ask your browser to fetch from there. The owner can put the game on a link any player can reach, or on this station's own node.`);
+    return;
+  }
+  showNotice(t, `FETCH ${game.name.toUpperCase()} FROM ${escapeHtml(host).toUpperCase()}?`,
+    `<span class="arcade-stage-lane">CONVENIENCE LANE</span> — your browser would fetch this game from <b>${escapeHtml(host)}</b>, which could send the request anywhere, your own network included; whoever put it on the cabinet cannot decide that for you.<br>
+    <button type="button" data-arcade-fetch="1">▶ FETCH FROM ${escapeHtml(host.toUpperCase())}</button>`);
+  t.notice.querySelector<HTMLButtonElement>('[data-arcade-fetch]')?.addEventListener('click', () => {
+    acceptMediaOrigin(origin);
+    t.mounted = '';
+    stageTick();
+  });
 }
 
 function waitingNotice(t: Stage, game: ArcadeGame): void {
@@ -233,6 +300,20 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
   t.mounted = key;
   t.phase = 'checking';
   t.counted = false;
+  // This viewer's browser fetches a game's link only with this viewer's
+  // consent (tvConsent, the theatre's rule): the record is peer-writable,
+  // and a link into the viewer's own network is never fetched, whatever
+  // lane the emulator's own files come from.
+  if (game.url) {
+    const consent = urlConsent(game.url);
+    if (consent !== 'ok') {
+      t.mounted = `consent:${key}`;
+      t.phase = 'waiting';
+      urlConsentNotice(t, game, consent);
+      renderStageChrome(t);
+      return;
+    }
+  }
   const path = emulatorDataPath(data);
   showNotice(t, 'CHECKING THE EMULATOR FILES…', `<span class="arcade-stage-lane">${emulatorDataLane(data)} LANE · ${escapeHtml(path)}</span>`);
   renderStageChrome(t);

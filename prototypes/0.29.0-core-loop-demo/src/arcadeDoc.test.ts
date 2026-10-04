@@ -59,7 +59,12 @@ describe('reads', () => {
     map.set(playsKey(CAB), { plays: -3 });
     const rec = readCabinet(CAB);
     expect(rec.game).toBeNull(); // a javascript: URL never reaches the frame
-    expect(rec.shelf.map((g) => g.name)).toEqual(['pacman.zip', ...Array<string>(ARCADE_SHELF_MAX - 1).fill('tetris.nes')]);
+    // Bounded BEFORE the shape check (a peer's array can be any length, and
+    // the screen reads it at 2 Hz): the first ARCADE_SHELF_MAX entries are
+    // looked at, so the two garbage entries count against the cap.
+    expect(rec.shelf.map((g) => g.name)).toEqual(['pacman.zip', ...Array<string>(ARCADE_SHELF_MAX - 3).fill('tetris.nes')]);
+    map.set(cabinetKey(CAB), { game: null, shelf: Array<ArcadeGame>(100_000).fill(PACMAN), data: 'station', seq: 0 });
+    expect(readCabinet(CAB).shelf).toHaveLength(ARCADE_SHELF_MAX);
     expect(rec.data).toBe('station');
     expect(rec.plays).toBe(0);
     expect(rec.seq).toBe(0);
