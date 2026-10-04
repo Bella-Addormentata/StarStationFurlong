@@ -551,10 +551,18 @@ construction), and each leg counts its own frames, so two legs never
 share a nonce space under one key — one key with two independent encoder
 counters would reuse a nonce, which breaks the AEAD outright. The
 associated data is the header exactly as it goes on the wire, fixed to
-the byte: version (1) ‖ source (32, the sender's Ed25519 public key) ‖
+the byte: version (1) ‖ source (32) ‖
 leg (1) ‖ key epoch (4, big-endian) ‖ counter (8, big-endian) ‖ flags (1,
 bit 0 the keyframe) — 47 bytes — and the signature below covers that
-header and the ciphertext with its tag. A leg's counter is the SENDER's for
+header and the ciphertext with its tag. The source is an INSTANCE, never
+the sender's key: one identity may publish voice, a screen share and an
+arcade feed at once, and each is its own source with its own subscriber
+set, media key, epochs and counters — `source = BLAKE3(sender key ‖ room
+‖ kind ‖ a 16-byte instance nonce)`, declared in the sender's signed
+source announcement on the control plane, which binds the id to the
+sender key, the room, the kind and the nonce; a frame's signature is
+verified against the key that announcement names, resolved once per
+source and never read from the header. A leg's counter is the SENDER's for
 the whole epoch, never the encoder's: it lives outside the encoder and
 survives every pause, restart and reconfiguration (§9 and spike #21 restart
 encoders for the first subscriber), so a restarted encoder goes on from the
@@ -616,10 +624,15 @@ source six times, not without end, and the honest spokes behind the same
 hub are not touched. The quota is enforced in layers, each parking only
 the offender: a hub applies it to each spoke's link at the hub before
 relaying anything (a spoke's departures count against that spoke, never
-the hub), the sender applies it to the origin a lease names, and a hub
-that keeps relaying a parked origin's churn is itself the offender — its
-own link is what the sender then parks, an honest hub having parked the
-spoke first; and
+the hub), the sender applies it to the origin a lease names, and the
+sender keeps a budget on the hub LINK itself regardless of the origins it
+claims — the origins a hub names are its own word, and a hub minting
+origins beside identities would keep every one under six: past one
+departure a minute per admitted subscriber behind the link, plus six, the
+link is parked and everything behind it evicted in one rotation, room an
+honest hub with many spokes never needs and a lying one cannot stay
+inside; a hub that keeps relaying a parked origin's churn is parked the
+same way, an honest hub having parked the spoke first; and
 source-wide, past thirty rotations a minute the sender batches further
 departures into one rotation every two seconds and reports the storm,
 which hands a departed member at most two seconds of frames it could still
@@ -647,18 +660,27 @@ coming) — never a reason to drop the source, since any member could inject,
 and dropping would hand each of them a way to silence any speaker. The
 replay window advances on verified frames only. Authentication bounds
 nothing by itself, so the lane has budgets enforced on the node BEFORE any
-signature is checked, per authenticated ingress link — the WebTransport
-session or iroh connection a frame arrived on, never per source, since the
-source id is what a flooder forges: a frame-size ceiling per leg from the
-source's announced tier (an Opus frame with its header and signature under
-400 bytes; a video frame fragmented into datagrams and bounded per tier),
-packet-rate and byte-rate ceilings per source per link with a short burst
-allowance, per tier and counted on the WIRE — the tier's codec rate plus
-the per-frame overhead (the 64-byte signature, the 16-byte tag and the
-header, about 90 bytes a frame, 36 kbps at 50 frames a second) plus a
-fifth: about 80 kbps for the 32 kbps voice tier, about 200 kbps for the
-128 kbps music tier, and 50 frames a second plus the batch allowance
-either way; video the same way from its tier's rate —
+signature is checked, on the authenticated ingress link FIRST — the
+WebTransport session or iroh connection a frame arrived on — in one
+aggregate bucket per link whatever source ids its frames carry, since a
+source id is what a flooder forges and a bucket per id would multiply the
+allowance: the link's packet-rate and byte-rate ceilings are the sum of
+the tiers of the sources it is admitted for (the publisher's registered
+sources on a browser link, the subscribed sources on a mesh link) plus a
+fifth, and a frame past them is dropped unverified. Inside that
+aggregate, per-source tier buckets, nested: a frame-size ceiling per leg
+from the source's announced tier (an Opus frame with its header, tag and
+signature under 400 bytes; a video frame fragmented into datagrams and
+bounded per tier), and packet-rate and byte-rate ceilings per source with
+a short burst allowance, per tier and counted on the WIRE — the tier's
+codec rate plus the per-frame overhead (the 47-byte header, the 16-byte
+tag and the 64-byte signature: 127 bytes a frame, 51 kbps at 50 frames a
+second, more than voice itself, which is why three Opus frames may ride
+one header, tag and signature) plus a fifth: about 100 kbps for the 32
+kbps voice tier and about 215 kbps for the 128 kbps music tier signed
+frame by frame, a third of the overhead when batched, and 50 frames a
+second plus the batch allowance either way; video the same way from its
+tier's rate —
 admission per link by what the link is to the source: a browser link is
 admitted for the sources it REGISTERED as their publisher (the source
 announcement bound to that link on the control plane) and for nothing
@@ -677,12 +699,14 @@ link is that hub's own doing and the member re-homes rather than keep a
 link that lies. A member or hub that floods invalid or oversized frames
 spends its own link's budget, costs verification only up to it, and takes
 no honest source down; a valid source past its tier is throttled to the
-tier on every link, the ceilings being the tier's, not an estimate's. The cost is 64 bytes a
-frame: about 26 kbps on a 20 ms Opus stream, roughly doubling voice and
-still a tenth of a video stream, and some eighty verifications a second per
-source, a few milliseconds of CPU; a sender may sign a batch of up to three
-Opus frames (60 ms) for a third of the overhead at 40 ms more latency,
-while video frames, kilobytes each, are signed one by one. Hash chains and
+tier on every link, the ceilings being the tier's, not an estimate's. The cost is 127 bytes a
+frame — the 64-byte signature, the 47-byte header and the 16-byte tag:
+about 51 kbps on a 20 ms Opus stream, more than voice itself and still a
+tenth of an arcade-resolution stream — and some eighty verifications a
+second per source, a few milliseconds of CPU; a sender may sign a batch of
+up to three Opus frames (60 ms) under one header, tag and signature for a
+third of the overhead at 40 ms more latency, while video frames, kilobytes
+each, are signed one by one. Hash chains and
 signed manifests were considered and rejected: both either make playback
 speculative — a frame heard before its proof cannot be unheard, and a
 subscriber with the group key could inject audible frames until the proof
@@ -811,13 +835,17 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   `provider` the adding owner's node id, the first node to ask — plus a
   signed `library-seed { hash, node, seq }` announcement from every node
   that holds the item and will serve it (a library-station volunteer, an
-  owner's node), renewed hourly under a per-node sequence that only rises,
-  and judged expiring by the READER: an announcement counts for a day from
-  when this node last received a renewal with a higher `seq` from that
-  node, by this node's own clock — never a stamp of the seeder's, which no
-  reader could bound and a skewed or lying seeder could set a decade out —
-  a renewal with an older or equal `seq` is a replay and ignored, and a
-  signed `library-unseed` from the same node (a higher `seq` too) or the
+  owner's node), renewed hourly under a sequence per (node, hash) that
+  only rises — one per item, never one per node across items, or a
+  renewal for one hash arriving after a higher one for another would read
+  as a replay — and judged expiring by the READER: an announcement counts
+  for a day from when this node last received a renewal with a higher
+  `seq` for that (node, hash), by this node's own clock — never a stamp of
+  the seeder's, which no reader could bound and a skewed or lying seeder
+  could set a decade out — a renewal with an older or equal `seq` for that
+  (node, hash) is a replay and ignored, the high-water mark kept per
+  (node, hash) and persisted, and a signed `library-unseed` from the same
+  node (a higher `seq` for that hash) or the
   item's `library-remove` withdraws it early. A late joiner counts its day
   from its own receipt and is wrong by at most that day about a seeder
   that has gone, and §4's route rule skips a holder that fails or stalls
@@ -876,7 +904,16 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   hash — and chains to the writer's own previous op by hash (the writer's
   first op names none), so each writer's ops form one contiguous chain
   that a gap breaks: a node holding an op whose predecessor it lacks
-  fetches the predecessor before it accepts anything after it. A node
+  fetches the predecessor before it accepts anything after it — and a
+  chain that forks (two ops from one key naming the same predecessor: two
+  devices on one key, or an equivocating writer) is resolved the same way
+  everywhere, at once, not at the next head: the branch whose first op has
+  the lower hash stands, the other is refused whole and the fork reported,
+  and a node that accepted the losing branch first switches on sight and
+  re-validates; a writer's client never signs over a tip it has not read
+  (it fetches the key's tip first), so two honest devices on one key fork
+  only in a race and lose at most the race's ops, and an anchored head's
+  committed tip is the finality that closes the question later. A node
   validates an op against THAT head's writer set, never the current one.
   Heads form one chain of their own: each is signed by the authority that
   makes it (the deed holder for a key-set change; for a transfer, the new
