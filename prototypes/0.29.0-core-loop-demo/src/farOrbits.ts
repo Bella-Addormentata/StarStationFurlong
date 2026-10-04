@@ -297,18 +297,19 @@ type CourseEnd = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
 /**
  * A flight's transfer rebuilt from its record: the Hohmann ellipse between
  * the two ends' orbits, pinned to the record's own times. `flight` names it
- * by what its record says (who flies, and the two ends as named there). Its
- * orbits are fixed once it is seen: planTransfer reads the ends through
- * today's trims, and a station-keeping burn after launch must not move a
- * transfer already flown. The ends are placed only the first time, so a
- * flight already drawn keeps its course once an end can no longer be placed
- * at all (a learned station dropped after a move, say). 🚚 A ferry leg's
- * `copies` (the route's copies of its two stops: planetSummary's
- * routeLegEnds and summaryLegEnds) are its ends when known. A course the
- * station list placed before they were known (a summary relayed by an older
- * client) gives way to theirs once they are, and theirs stays though a later
- * summary comes without them again. `seenAt` stamps the course seen. Null
- * when it cannot be placed.
+ * by what stays fixed while it flies (who flies, and for another ship the
+ * welcome rooms its summary gives as the ends; never an end id read through
+ * this install's aliases). Its orbits are fixed once it is seen:
+ * planTransfer reads the ends through today's trims, and a station-keeping
+ * burn after launch must not move a transfer already flown. The ends are
+ * placed only the first time, so a flight already drawn keeps its course
+ * once an end can no longer be placed at all (a learned station dropped
+ * after a move, say). 🚚 A ferry leg's `copies` (the route's copies of its
+ * two stops: planetSummary's routeLegEnds and summaryLegEnds) are its ends
+ * when known. A course the station list placed before they were known (a
+ * summary relayed by an older client) gives way to theirs once they are, and
+ * theirs stays though a later summary comes without them again. `seenAt`
+ * stamps the course seen. Null when it cannot be placed.
  */
 export function frozenCourse(
   courses: FrozenCourses,

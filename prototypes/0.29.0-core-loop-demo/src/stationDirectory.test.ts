@@ -85,6 +85,19 @@ describe('a swapped-in directory', () => {
     expect(destinationsFrom('a').map((s) => s.id)).toEqual(['b']);
   });
 
+  it('never offers a station any live dock leads into, the second one too', () => {
+    // Docked into two stations at once: `here` names one, and DEPART to the
+    // other would cast off from it only to fly back to it.
+    setStationDirectory({
+      stations: () => [station('a', 'p1'), station('b', 'p1'), station('c', 'p1')],
+      here: () => 'a',
+      docked: () => ['a', 'b'],
+    });
+    expect(destinationsFrom('a').map((s) => s.id)).toEqual(['c']);
+    const dir = directoryFromStationRecords(() => [], () => undefined, () => 'a', () => null, undefined, undefined, () => ['a', 'b']);
+    expect(dir.docked?.()).toEqual(['a', 'b']);
+  });
+
   it('ignores a `here` the directory does not list', () => {
     setStationDirectory({ stations: () => [station('a', 'p1')], here: () => 'ghost' });
     expect(stationHere()).toBeNull();

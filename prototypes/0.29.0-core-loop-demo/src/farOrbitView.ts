@@ -152,9 +152,11 @@ function castOffPlace(id: string, keptAt: string | undefined): Place | undefined
 }
 
 /** A flight's transfer rebuilt from its record, fixed once seen
- *  (farOrbits.frozenCourse): `flight` names it by what its record says (who
- *  flies, and the two ends as named there), and a ferry leg's `copies` of its
- *  stops place it when known. */
+ *  (farOrbits.frozenCourse). `flight` names it by what stays fixed while it
+ *  flies: who flies (and for another ship, the welcome rooms its summary
+ *  gives as the ends), never an id this install reads through its own
+ *  aliases, which can name one end differently from one read to the next. A
+ *  ferry leg's `copies` of its stops place it when known. */
 function flightPlan(
   flight: readonly string[],
   departedAt: number,
@@ -217,6 +219,16 @@ function gather(now: number): Source {
   }
 }
 
+/** Test seam: what the far pass reads at `now`. */
+export function gatherForTest(now: number): Source {
+  return gather(now);
+}
+
+/** Test seam: forget every flight already drawn. */
+export function forgetFlightsForTest(): void {
+  frozenPlans.clear();
+}
+
 function readSource(now: number): Source {
   const roomId = currentRoomId();
   const atlas = readAtlas();
@@ -247,7 +259,10 @@ function readSource(now: number): Source {
       // a stop's station may have left for another planet: those are its
       // ends, untrimmed as the timetable planned them. An ordinary flight's
       // ends go by their stations' ids, so their trims apply.
-      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, routeLegEnds(places), () => [
+      // Named by the room, not the ends: readFlightRecord reads both end ids
+      // through this install's aliases each time (a learned station listed,
+      // then dropped), and the same flight must keep the course it was drawn on.
+      aboard = flightPlan(['own', roomId], rec.departedAt, rec.etaAt, routeLegEnds(places), () => [
         castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
         castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
       ]);
@@ -739,6 +754,7 @@ export function renderWithFarPass(
   const shown = sky.map((o) => o.visible);
   const background = scene.background;
   const cameraLayers = camera.layers.mask;
+  const autoClear = renderer.autoClear;
   try {
     update(renderer, camera);
     // 1. The sky alone (clears with the scene background as usual). A room
@@ -763,6 +779,6 @@ export function renderWithFarPass(
     sky.forEach((o, i) => { o.visible = shown[i]; });
     hidden.forEach((o, i) => { o.visible = hiddenShown[i]; });
     camera.layers.mask = cameraLayers;
-    renderer.autoClear = true;
+    renderer.autoClear = autoClear;
   }
 }
