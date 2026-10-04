@@ -75,8 +75,9 @@ the sources that fail have to say so on the screen.
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
         | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id AND its
                          // dial hints — relay URLs and direct addresses, the RoomMemberHint shape of
-                         // network/protocol.ts — which is what a BlobTicket's provider is: an id alone
-                         // is nothing to dial once the importer's link is gone (blob lane, §4)
+                         // network/protocol.ts — in a descriptor the node itself SIGNED, so no peer can
+                         // put a victim's address under its id (§4); what a BlobTicket's provider is:
+                         // an id alone is nothing to dial once the importer's link is gone
         | null,
   state: 'home' | 'scheduled' | 'playing' | 'paused',  // the PROGRAMME only: 'home' is on with nothing on. Power is
                          // not here — it is its own key (below), so the set has one source of truth
@@ -253,11 +254,18 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   token is carried in the URL
   because a `<video>` cannot set a header, with the element in CORS mode
   (`crossOrigin = 'anonymous'`):
-  that is what makes a `<video>` send `Origin` at all — a plain cross-origin
-  `<video src>` sends none and would meet the 403 below — and what a
-  `VideoTexture` needs anyway, since a non-CORS video taints the canvas it is
-  drawn to; a missing or wrong token, or a missing or disallowed `Origin`,
-  is a 403 **before any DNS lookup or outbound connection**. Only then the
+  that is what makes a cross-origin `<video>` send `Origin` at all — a plain
+  cross-origin `<video src>` sends none — and what a `VideoTexture` needs
+  anyway, since a non-CORS video taints the canvas it is drawn to. A
+  SAME-origin GET sends no `Origin` even in CORS mode, and that is the very
+  deployment §3.5 proposes (the UI served from the node's own HTTP origin),
+  so the gate reads `Origin` where there is one and fetch metadata where
+  there is not: a request with no `Origin` is admitted only with
+  `Sec-Fetch-Site: same-origin` — the header every current browser sets and
+  no page can forge — and refused otherwise. A missing or wrong token, a
+  disallowed `Origin`, or no `Origin` without that same-origin metadata, is
+  a 403 **before any DNS lookup or outbound connection**; `/blob` follows
+  the same rule (§4). Only then the
   host allowlist — and, because a loopback service that fetches URLs is an
   SSRF surface, the node resolves the name ITSELF and validates every
   address the answer holds: an IPv6 address that carries an IPv4 inside is
@@ -332,8 +340,9 @@ it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
 (verified, resumable, in order, so playback can start early) and serve it to
 their own webview at `/blob/<hash>?cap=…` with range support, behind the
 same request gate as `/api/media` (§3.4): the per-launch capability token
-and an allowed `Origin`, checked before any read of the store, the element
-in CORS mode so that it sends one. The route
+and an allowed `Origin` — or `Sec-Fetch-Site: same-origin` in its place,
+the proxy's rule — checked before any read of the store, the element in
+CORS mode so that a cross-origin one sends an `Origin`. The route
 serves only what the store already holds or is fetching and never starts a
 fetch itself — CORS only governs who may read a response, a `<video src>`
 needs none to make the request, and a hash is no secret once a room record
@@ -348,19 +357,31 @@ member. So the `blob` source (§3.1) and a library op (§7) carry the hash
 with the importing node's iroh id and its dial hints in the shape the room
 already passes around for its members — `RoomMemberHint` in
 `network/protocol.ts`: `irohNodeId`, `irohRelayUrls`, `irohDirectAddrs` —
-and every node that completes the blob announces `have` for the hash on
-the room's control plane (a sibling of the `media-sub` kind) with its own
-current hints the same way — an announce that binds {hash, node id, hints}
+as a PROVIDER DESCRIPTOR the node itself signed: {node id, relay URLs,
+direct addresses, issued-at} under the node's iroh key, which the node id
+is the public half of, so a descriptor verifies against the very id it
+names and no peer can put a victim's address under another node's id. A
+peer-written record carries no hint a viewer would dial except inside such
+a descriptor; one that fails to verify, or is older than a day, leaves the
+node id alone, which is dialled by id with EMPTY hints, the route resolved
+by iroh's own discovery (the DHT, mDNS, a relay) — the reflection defence
+the node already applies to every gossip-learned peer
+(`ssf-p2p-node/src/main.rs`, the TIER_INTRODUCED dial: "the signature
+covers the payload + author, NOT the iroh_node_id / direct_addrs"). A
+viewer's node never sends a QUIC handshake to an address a room peer merely
+wrote down. Every node that completes the blob announces `have` for the
+hash on the room's control plane (a sibling of the `media-sub` kind) with
+its own descriptor the same way — an announce that binds {hash, descriptor}
 and is evidence only on the announcer's own authenticated connection,
 accepted from the link whose iroh handshake proved that node id and never
 relayed as someone else's word. The hints in the room's member records are
-dial HINTS and nothing more: `YjsSync` carries them outside the signed
-envelope (`src/network/YjsSync.ts`), so they are untrusted until a dial's
-iroh handshake proves the node id — the id is the key, so a wrong hint
-fails the handshake and costs a dial, never trust — and a library seeder's
-hints ride its signed library entry (§7). So the fall-back to a seeder
-nobody is connected to is a dial, not a guess, and holding is proven by
-serving bytes the hash verifies, never by a claim. A viewer resolves a
+the bootstrap roster's and nothing more (`YjsSync` carries them outside the
+signed envelope, `src/network/YjsSync.ts`); the blob lane dials from none
+of them. A library seeder's descriptor rides its signed library entry
+(§7). So the fall-back to a seeder nobody is connected to is a dial by a
+descriptor the seeder signed, or by id alone — never to an address a
+stranger supplied — and holding is proven by serving bytes the hash
+verifies, never by a claim. A viewer resolves a
 hash to the nodes that hold it: the ticket's provider while it is still
 here, else any announcing holder — a hub among them only when it chose to
 hold the blob, since `iroh-blobs` moves bytes from provider to requester
