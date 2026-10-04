@@ -136,8 +136,15 @@ reads once, computes, seeks.
 The shared record is still `scheduled`: the holder's own read treats the due
 schedule as running (locally, and nowhere else), and its first heartbeat
 performs the shared transition to `playing`; every viewer starts on receipt
-of that write and anchors to it, so clock skew never starts a film early or
-late. A viewer whose countdown has
+of that write and anchors to it, so skew between viewers never splits the
+room. What anchoring cannot do is make the holder's clock right: the START
+is the holder's wall clock against `startAt`, and a holder five minutes
+fast starts the room five minutes early for everyone (five minutes slow,
+late) — skew moves the start, never the sync after it. v1 states that and
+accepts it: the holder who scheduled the film sees the same countdown as
+everyone else, and a clock within a minute is the norm; a station time
+source (the node's peers, or NTP through the node) is a later item, not
+v1's. A viewer whose countdown has
 reached 0 shows STARTING… until the write lands (within a heartbeat). Only
 when nobody holds the remote does a viewer free-run from `startAt`, best
 effort, until someone picks the remote up and beats. For `blob` and torrent
@@ -359,15 +366,26 @@ gossip-learned peer by id with EMPTY hints (`ssf-p2p-node/src/main.rs`, the
 TIER_INTRODUCED dial: "the signature covers the payload + author, NOT the
 iroh_node_id / direct_addrs"). So the `blob` source (§3.1) and a library
 op (§7) carry the hash with the importing node's iroh id, and a viewer's
-node resolves that id to a route the way it resolves any peer's: the
-addresses it observed ITSELF on an earlier authenticated connection with
-that id (the importer is a connected member when the record first appears,
-and iroh keeps what it saw), and iroh's own discovery — the sovereign
-Mainline DHT the node already bootstraps from, mDNS on a LAN, the station's
-relay — all of it configured or observed, none of it peer-written. A
-viewer's node never sends a QUIC handshake to an address a room peer merely
-wrote down, however it was signed. A provider reachable by none of these
-is not reachable, and the record says who else to ask: every node that
+node resolves that id to a route in two classes, kept apart. A route it
+observed ITSELF on an authenticated connection with that id — the importer
+is a connected member when the record first appears, a `have` announcer is
+connected by definition, and iroh keeps what it saw — is the only route an
+AUTOMATIC fetch (one the viewer did not ask for: the cap and budget below)
+ever dials. A route from discovery is a peer-authored hint like any other:
+on the sovereign Mainline DHT a node publishes its OWN signed address record
+(`ssf-p2p-node/src/main.rs`, the `DhtAddressLookup`), so a holder could
+publish a victim's address under its own id as surely as it could write one
+into a room record, and mDNS and a relay are no better — so such a route is
+dialled only for a fetch the viewer asked for (the FETCH button, the
+library's explicit resolution of a seeder nobody is connected to), under a
+per-id and a global rate limit with exponential backoff, one QUIC Initial
+per attempt and no retry storm. The most a victim can be made to receive is
+a few datagrams a minute from each viewer who chose to fetch — the standing
+cost of any id-to-address lookup on a public DHT, iroh's included — which
+is bounded here and never claimed closed. A viewer's node never sends an
+automatic handshake to an address anyone merely wrote down, in a room
+record or a DHT record alike. A provider reachable by neither class is not
+reachable, and the record says who else to ask: every node that
 completes the blob announces `have` for the hash on the room's control
 plane (a sibling of the `media-sub` kind) — an announce that is evidence
 only on the announcer's own authenticated connection, accepted from the
