@@ -1540,7 +1540,10 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   root; and before any of this is consensus, one fixture of vectors held
   by the Rust node's and the page's test suites alike — the empty map's
   root, a one-writer map and a map of three writers whose keys and tips
-  are written out, each with its root and every leaf's proof as bytes —
+  are written out, each with its root and every leaf's proof as bytes, and
+  the chain of heads that builds the three-writer map from the empty one
+  (a first leaf, two more, then one tip moved: four update witnesses,
+  below, each as bytes with the root before and the root after) —
   that both must reproduce, so a Rust and a TypeScript implementation
   that disagree fail a test and never a head — so
   an insertion moves no other leaf and the tree is updated, 256 hashes a
@@ -1551,17 +1554,31 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   hundred bytes and 256 hashes each time, never carried over from an
   earlier head; a head stays a few hundred
   bytes however many holders and co-hosts the deed has had — its root, the
-  one (writer, tip) pair it commits and that pair's proof against the root
-  before it, never the map — because a head changes exactly ONE leaf: an
-  authority with several writers' tips to commit (a transfer that closes
-  the old owner's chain and opens the new one's, two co-hosts caught up at
-  once) signs one head per writer, each against the root the head before
-  it left, in one chain — a single pair and proof could never let a node
-  derive the other leaves a root had moved; a tip is
+  one (writer, tip) pair it commits, the writer's PRIOR tip under the root
+  before it (a presence byte: 0 for a writer with no leaf yet, 1 and the
+  32-byte tip otherwise) and an UPDATE WITNESS, never the map: the leaf's
+  sibling path in the proof encoding above — one path, since the writer
+  key fixes it and the head moves no other leaf — verified TWICE, with the
+  prior leaf (the leaf hash of the prior tip, or the empty leaf constant
+  where there was none) against the root the head before it left, and
+  with the new leaf against this head's own root, both walks from the
+  leaf up as above, a head that fails either refused; so the witness
+  proves the state it replaces as well as the new one — a membership
+  proof of the new pair against the root before it could never verify,
+  that root holding the old tip or an empty leaf where the new one goes —
+  and a node that holds the map checks the prior tip against its own
+  leaf besides. A head thus commits exactly ONE leaf's change and nothing
+  hidden: an authority with several writers' tips to commit (a transfer
+  that closes the old owner's chain and opens the new one's, two co-hosts
+  caught up at once) signs one head per writer, each witnessed against
+  the root the head before it left, in one chain, the first head of all
+  against the empty map's root — a single pair and witness could never
+  let a node derive the other leaves a root had moved; a tip is
   looked up by one proof, and replaying the chain costs a logarithm per op
   and never the square of the writers; the pairs themselves are state
   every node holds, rebuilt by replaying the chain from its first head
-  (each head's proof checked against the root before it, so the map a node
+  (each head's witness checked against the root before it and against the
+  head's own root, the leaf then set to the new tip, so the map a node
   rebuilds answers to the root it ends at, and a late node reconstructs it
   from the heads alone, carrying no list in any of them), and a writer
   whose tip an earlier head already committed is
