@@ -140,9 +140,17 @@ The first heartbeat the viewer can act on is at most
 the wake window is stamped from before the gap, so the first fresh one is
 the holder's next — and a viewer whose player stopped with the machine is
 then seeked once, to where the room
-is, never to where the sleep says; a headless holder beats on from its
-own extrapolation, which is the room's clock whether or not its page
-slept, and that beat is what un-stales everyone.
+is, never to where the sleep says. A HOLDER that slept rejoins the room
+where the room is and never drags it back to where it slept: its own
+anchor is stale like any other, and `readPlayback` bridges the gap on
+the WALL clock — the one use of wall time in the extrapolation, for the
+gap alone, since the monotonic clock may or may not have run through a
+sleep and the wall clock did, the error an NTP step the sleep may have
+hidden and never the sleep — so the headless beat carries the pre-sleep
+position plus the time really elapsed, a holder with the theatre open
+seeks its own player there once (the OS stopped it with the machine) and
+beats from there, no beat going out before that seek lands, and that
+beat is the fresh sample that un-stales everyone, the holder included.
 `lead` is half the round trip the viewer's `NetworkProvider` measures to the
 node it is connected to, capped at 1 s, and zero for the holder (its own
 writes land locally). That term corrects exactly one hop — the last one,
@@ -1002,7 +1010,10 @@ one header, tag and signature, framed by a count, length and duration table insi
 the plaintext) plus a fifth: about 105 kbps for the 32
 kbps voice tier and about 220 kbps for the 128 kbps music tier signed
 frame by frame, a third of the overhead when batched, and 50 frames a
-second plus the batch allowance either way; video the same way from its
+second plus the batch allowance either way — the sender's frame being
+20 ms (`frameDuration` 20 000), the one size every budget here assumes,
+a source whose chunks come faster throttled to that budget, the stated
+cost of any other size; video the same way from its
 tier's rate —
 admission per link by what the link is to the source: a browser link is
 admitted for the sources it REGISTERED as their publisher (the source
@@ -1042,8 +1053,10 @@ frame — the 64-byte signature, the 57-byte header and the 16-byte tag:
 about 55 kbps on a 20 ms Opus stream, more than voice itself and still a
 tenth of an arcade-resolution stream — and some eighty verifications a
 second per source, a few milliseconds of CPU; a sender may sign a batch of
-up to three Opus frames (60 ms) under one header, tag and signature for a
-third of the overhead at 40 ms more latency — framed inside the plaintext
+up to three chunks AND at most 60 ms of audio in all (three 20 ms frames;
+a shorter frame buys no larger batch and a longer one no 180 ms batch)
+under one header, tag and signature for a third of the overhead at 40 ms
+more latency — framed inside the plaintext
 so the receiver can cut it back into the encoder's chunks, each with its
 own timestamp and duration: a one-byte count, then per chunk a two-byte
 big-endian length and a two-byte big-endian duration in 48 kHz samples
@@ -1052,7 +1065,8 @@ take — 120, 240, 480, 960, 1 920 or 2 880 samples, 2.5 to 60 ms: the
 registration validates the setting against RFC 6716 §2.1.4's frame
 sizes, and a 120 ms Opus packet is several frames, never one chunk of
 the encoder's, so the receiver takes exactly those six and refuses a
-duration between or beyond them; the sender
+duration between or beyond them — a check of the chunk's SHAPE, beside
+the 20 ms frame the sender uses and the budgets above assume; the sender
 writes `round(duration × 48 / 1000)` from the chunk's WebCodecs
 `duration`, which is MICROSECONDS — 20 000 for a 20 ms frame, so 960 goes
 in the table, never 20 000 — and, when the chunk reports none, from the
@@ -1064,7 +1078,7 @@ several), then the chunks in order, chunk k's
 timestamp the header's plus the durations before it; the table under the
 AEAD and the signature with the rest, bit 1 of the flags byte saying a
 batch is inside, and a batch whose lengths do not add up to the payload,
-or whose durations are not among those six, dropped as malformed and
+or whose durations are not among those six or sum past 60 ms, dropped as malformed and
 charged to the source, as every failure behind a valid signature is
 (above); never
 a bare concatenation,
@@ -1356,9 +1370,13 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   ten writers is ten leaves and a few hundred real hashes, never 2²⁵⁶; a
   proof is the leaf's 256 siblings with the empty ones elided behind a
   32-byte bitmap, a few hundred bytes for the writers a deed has had — so
-  an insertion moves no other leaf, a proof made under an earlier head
-  stays valid for every branch a later head did not touch (the tree is
-  updated, 256 hashes a write, never rebuilt), a head stays a few hundred
+  an insertion moves no other leaf and the tree is updated, 256 hashes a
+  write, never rebuilt; a PROOF, though, answers to one root — any other
+  leaf's change alters a sibling on this path — so a proof is versioned by
+  the head whose root it answers to and recomputed from the pairs, which
+  every node holds, against the head an op is validated under, a few
+  hundred bytes and 256 hashes each time, never carried over from an
+  earlier head; a head stays a few hundred
   bytes however many holders and co-hosts the deed has had, a tip is
   looked up by one proof, and replaying the chain costs a logarithm per op
   and never the square of the writers; the pairs themselves travel beside
