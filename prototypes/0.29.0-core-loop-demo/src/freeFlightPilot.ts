@@ -26,6 +26,7 @@ import { orbitForSlot, angleAt, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
 import { readFlightRecord, readFuelLevel, readStoredFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { localStationId, portableStationId } from './stationDirectory';
+import { isAbortedAltitudeChange } from './stationMove';
 import { adriftPlace, currentRoomId, latestMoveOf, listStations, planetById, stationInTransit } from './stations';
 import type { StationRecord } from './stations';
 
@@ -202,7 +203,9 @@ function timedStation(s: StationRecord, planet: string): FreeStation | null {
   const base = { id: s.id, room: s.welcomeRoomId, name: s.name };
   // A pin stands for the move it settles; a cancel's pin, for none.
   const raw = latestMoveOf(s) ?? s.move ?? null;
-  const m = !raw ? null : !raw.settles ? raw : raw.departAt < raw.settles.arriveAt ? null : raw.settles;
+  // 🎚️ An altitude change that lost its orbit to an earlier claim never
+  // flies (the station list aborts it): the station stays where it is.
+  const m = !raw || isAbortedAltitudeChange(raw) ? null : !raw.settles ? raw : raw.departAt < raw.settles.arriveAt ? null : raw.settles;
   const here = planetById(s.planetId).id === planet;
   if (!m) return here ? { ...base, pointAt: (ms: number) => stationPointAt(s, ms) } : null;
   const fromHere = planetById(m.fromPlanetId).id === planet;

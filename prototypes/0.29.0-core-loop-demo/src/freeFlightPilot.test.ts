@@ -27,10 +27,12 @@ import {
 } from './freeFlightPilot';
 import { bindShipDoc, readFlightRecord, readFuelLevel, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { DEFAULT_STATIONS } from './stationDirectory';
-import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, setAltitudeHistory, setStationMoveResolver, setStationRoomSource } from './stations';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, planetById, setAltitudeHistory, setStationMoveResolver, setStationRoomSource } from './stations';
 import { planStationPark } from './freeStation';
 import { freeStationsAround, ownStationOf, stationFlyingFree, stationUndockPose } from './freeFlightPilot';
-import { ORBIT_EPOCH_MS, orbitForSlot } from './orbits';
+import { ORBIT_EPOCH_MS, orbitForSlot, planOrbitChange, stationPointAt } from './orbits';
+import { isAbortedAltitudeChange, rememberMove } from './stationMove';
+import type { StationMove } from './stationMove';
 
 const HOME = DEFAULT_STATIONS[0];
 const CAP = 100;
@@ -246,6 +248,49 @@ describe('🚚 a station booked to leave from a custom orbit', () => {
     const met = freeStationsAround(DEFAULT_PLANET_ID, now).find((s) => s.room === room);
     expect(met?.pointAt(now).radiusKm).toBeCloseTo(r, 3);
     expect(met?.presentAt?.(now + 3_700_000)).toBe(false);
+  });
+});
+
+describe('🎚️ a station whose altitude change lost its orbit', () => {
+  afterEach(() => setStationMoveResolver(null));
+
+  it('is met where it is all through the change it never flies', () => {
+    const saved = new Map<string, string>();
+    const g = globalThis as { localStorage?: unknown };
+    const before = g.localStorage;
+    g.localStorage = {
+      getItem: (k: string) => saved.get(k) ?? null,
+      setItem: (k: string, v: string) => { saved.set(k, v); },
+      removeItem: (k: string) => { saved.delete(k); },
+    };
+    try {
+      const now = ORBIT_EPOCH_MS + 7_200_000;
+      const climb = (id: string, room: string, slot: number, bookedAt: number): StationMove => {
+        const plan = planOrbitChange(orbitForSlot(DEFAULT_PLANET_ID, slot), planetById(DEFAULT_PLANET_ID).radiusKm + 1_000 + slot * 20, bookedAt)!;
+        return {
+          stationId: id, welcomeRoomId: room, fromPlanetId: DEFAULT_PLANET_ID, fromSlot: slot, toPlanetId: DEFAULT_PLANET_ID, toSlot: slot,
+          departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt, fuel: 5, fuelDrawn: 5,
+          orbit: { fromRadiusKm: plan.from.radiusKm, fromPhase0: plan.from.phase0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0 },
+        };
+      };
+      const room = DEFAULT_STATION_RECORD.welcomeRoomId;
+      const mine = climb(DEFAULT_STATION_RECORD.id, room, 0, now + 5);
+      setStationMoveResolver((st) => (st.welcomeRoomId === room ? mine : null));
+      const mid = (mine.departAt + mine.arriveAt) / 2;
+      resetFreeFlightPilot();
+      expect(freeStationsAround(DEFAULT_PLANET_ID, now).find((s) => s.room === room)?.presentAt?.(mid)).toBe(false);
+      // Another station claimed that orbit first: this change never flies.
+      expect(rememberMove(climb('other', 'other-room', 1, now), now + 10)).toBe(true);
+      expect(isAbortedAltitudeChange(mine)).toBe(true);
+      resetFreeFlightPilot();
+      const met = freeStationsAround(DEFAULT_PLANET_ID, now).find((s) => s.room === room);
+      expect(met?.presentAt?.(mid) ?? true).toBe(true);
+      // Where the station list has it, not on the change's transfer.
+      const listed = listStations().find((s) => s.welcomeRoomId === room)!;
+      expect(met?.pointAt(mid)).toEqual(stationPointAt(listed, mid));
+    } finally {
+      g.localStorage = before;
+    }
   });
 });
 
