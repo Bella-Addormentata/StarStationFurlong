@@ -3,12 +3,24 @@
  *
  * EmulatorJS (libretro cores in WASM, GPL-3.0) configures itself from
  * globals, is loaded by ITS loader script, and has no clean teardown — so
- * it runs in a same-origin IFRAME of our own (public/arcade/frame.html).
- * Closing the cabinet removes the frame: a complete teardown, every time.
- * Keys typed into the focused frame never reach the world's input (an
- * event does not cross a frame), which is how WASD stays suppressed while
- * at the controls. The frame is same-origin, so the emulator's canvas stays
- * reachable for the spectator lane later (plan §9).
+ * it runs in an IFRAME of our own (public/arcade/frame.html). Closing the
+ * cabinet removes the frame: a complete teardown, every time. Keys typed
+ * into the focused frame never reach the world's input (an event does not
+ * cross a frame), which is how WASD stays suppressed while at the controls.
+ *
+ * THE FRAME IS AN OPAQUE ORIGIN, ON EVERY LANE (sandboxed, never
+ * allow-same-origin): engine code and ROM data are external inputs — a core
+ * is a third party's build, a ROM is whatever a file or a server held, and
+ * a core bug a ROM exploits is script in the frame — and a same-origin
+ * frame would share this page's DOM, its storage and, in the desktop
+ * shells, the IPC bridge; a content-security policy bounds what the frame
+ * may LOAD, never what its scripts may reach. So nothing in the frame can
+ * name this page: only messages cross (matched to this frame's window);
+ * the ROM goes in as bytes this page fetched itself — as the page, under
+ * the consent the stage asked — never as a URL the frame would fetch with
+ * no origin to its name; and the picture will come OUT the same way for
+ * the spectator lane (plan §9: ImageBitmaps the frame posts), never by a
+ * reach into its canvas, which an opaque origin forbids.
  *
  * The emulator's own files come from one of two places, the owner's call
  * per cabinet (arcadeDoc's `data`): THIS STATION's /emulatorjs/data/ —
@@ -18,9 +30,12 @@
  * default: serverless sources only). Neither is bundled, so a fresh
  * checkout shows NOT PROVISIONED with the command, not a blank screen:
  * probeEmulatorData looks before the frame mounts. On the station lane the
- * frame is same-origin and unsandboxed, so it is handed a content-security
- * policy instead (emulatorFrameUrl → frame.html): its code reaches this
- * origin and the viewer's own node, nothing else.
+ * frame is also handed a content-security policy (emulatorFrameUrl →
+ * frame.html): its code reaches this origin and the viewer's own node,
+ * nothing else. An opaque origin's fetches carry `Origin: null`, so the
+ * station serves /emulatorjs/ with Access-Control-Allow-Origin
+ * (vite.config.ts for the dev and preview servers; a deployment the same)
+ * — the engine and its cores, public files, and nothing else needs it.
  *
  * DOM-free except mountEmulatorFrame; the path and probe maths are tested.
  */
@@ -86,23 +101,22 @@ export async function probeEmulatorData(
 
 export interface EmulatorConfig {
   core: ArcadeCore;
-  /** An http(s) URL, or '' with `file` set (the player's own disk). */
-  gameUrl: string;
-  file: File | null;
+  /** The game's bytes — this page's own fetch of the link, or the player's
+   *  file — handed to the frame as a Blob, never as a URL (the header). */
+  game: Blob;
   /** The file's name — arcade cores need the romset's name. */
   gameName: string;
   pathToData: string;
   /** 0–1. */
   volume: number;
-  /** Engine code from another origin (the CDN lane) runs in a sandboxed
-   *  frame with an OPAQUE origin: it may run scripts, but it never touches
-   *  the app's origin, its storage or the parent page. The station's own
-   *  files are trusted and keep the same origin (so the canvas stays
-   *  reachable for the spectator lane). */
+  /** Engine code from another origin (the CDN lane). The frame is an opaque
+   *  origin either way (mountEmulatorFrame); this says WHOSE code runs in
+   *  it, which is what the player's consent to hand it their own file is
+   *  about (localRomExposureAllowed), and which frame URL it gets. */
   isolated: boolean;
   /** Origins beyond the frame's own that its policy lets it fetch from —
    *  the viewer's own node (tvConsent's own media origins). Station lane
-   *  only; the isolated lane has the sandbox for a wall. */
+   *  only: the CDN lane's engine comes from the CDN's own origin. */
   allowOrigins: readonly string[];
 }
 
@@ -124,13 +138,13 @@ export function emulatorIsolated(
  *  no path, no space, quote or semicolon that could end the directive. */
 const CSP_ORIGIN = /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/;
 
-/** The frame's URL for a config. On the station lane (same origin, no
- *  sandbox) the frame is told so, with the origins its content-security
- *  policy may fetch from beyond its own — the viewer's own node — reduced
- *  to http(s) origins here (frame.html checks them again before they enter
- *  its policy). The isolated lane (the CDN, lanes on only) runs in an
- *  opaque origin and gets the plain URL: its engine comes from its own
- *  origin, and the sandbox is its wall. */
+/** The frame's URL for a config. On the station lane the frame is told so,
+ *  with the origins its content-security policy may fetch from beyond the
+ *  station's own — the viewer's own node — reduced to http(s) origins here
+ *  (frame.html checks them again before they enter its policy). The
+ *  isolated lane (the CDN, lanes on only) gets the plain URL: its engine
+ *  comes from the CDN's origin, and the sandbox, which every lane has, is
+ *  its wall. */
 export function emulatorFrameUrl(config: Pick<EmulatorConfig, 'isolated' | 'allowOrigins'>, frameUrl = arcadeFrameUrl()): string {
   if (config.isolated) return frameUrl;
   const allow = new Set<string>();
@@ -156,9 +170,14 @@ export interface EmulatorHandle {
   readonly iframe: HTMLIFrameElement;
   focus(): void;
   destroy(): void;
-  /** The emulator's canvas inside the frame (same origin), once it runs. */
-  canvas(): HTMLCanvasElement | null;
 }
+
+/** The sandbox every lane's frame runs under: scripts (the engine), forms
+ *  and pointer lock (its UI, the mouse as a trackball), popups and
+ *  downloads (a save state leaves as a file — an opaque origin has no
+ *  storage, so EmulatorJS's export is the only save there is) — and never
+ *  allow-same-origin, which is the wall (the header). */
+export const EMULATOR_SANDBOX = 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-downloads';
 
 /** The parent side of the frame protocol: the frame says hello, the parent
  *  answers with the config, the frame reports ready / started / exit /
@@ -173,16 +192,21 @@ export function mountEmulatorFrame(
   iframe.className = 'arcade-frame';
   iframe.setAttribute('allow', 'gamepad *; autoplay *; fullscreen *');
   iframe.setAttribute('title', `Furlong Arcade — ${config.gameName}`);
-  // The CDN lane: no allow-same-origin, so the frame is an opaque origin —
-  // CDN code runs, and cannot read this page, its storage or its DOM. Only
-  // messages cross (and they are matched to this frame's window below).
-  if (config.isolated) iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups');
+  // An opaque origin, every lane (the header): the code inside — the
+  // station's engine or the CDN's, and whatever a ROM makes of a core —
+  // cannot read this page, its storage or its DOM, and the desktop shells'
+  // IPC is not its to call. Only messages cross, matched to this frame's
+  // window below.
+  iframe.setAttribute('sandbox', EMULATOR_SANDBOX);
   iframe.src = emulatorFrameUrl(config, frameUrl);
   let alive = true;
   let configured = false;
-  const origin = window.location.origin;
-  // An opaque-origin frame can only be addressed with '*' (its origin reads "null").
-  const target = !config.isolated && origin && origin !== 'null' ? origin : '*';
+  // An opaque origin has no name a target could match: '*' is the only
+  // target that reaches it. What bounds who hears the config is the window
+  // it is posted to — this frame's, which the sandbox lets navigate nothing
+  // but itself — and the config carries the game's bytes, which were the
+  // frame's to have, and nothing of this page's.
+  const target = '*';
   const onMessage = (e: MessageEvent) => {
     if (!alive || e.source !== iframe.contentWindow) return;
     const d = e.data as { type?: unknown; why?: unknown } | null;
@@ -195,8 +219,7 @@ export function mountEmulatorFrame(
         iframe.contentWindow?.postMessage({
           type: 'arcade-config',
           core: config.core,
-          gameUrl: config.gameUrl,
-          file: config.file,
+          game: config.game,
           gameName: config.gameName,
           pathToData: config.pathToData,
           volume: config.volume,
@@ -229,13 +252,6 @@ export function mountEmulatorFrame(
       window.clearTimeout(hello);
       window.removeEventListener('message', onMessage);
       iframe.remove();
-    },
-    canvas() {
-      try {
-        return iframe.contentDocument?.querySelector('canvas') ?? null;
-      } catch {
-        return null;
-      }
     },
   };
 }
@@ -275,7 +291,8 @@ export function localRomFor(game: ArcadeGame): File | null {
  *  by whatever runs there, and that code can send it anywhere. So under
  *  the CDN lane a file from the player's disk goes into the frame only
  *  after the player said so, per game and per engine path, for this page's
- *  life. The station's own files run with the app and need no consent. */
+ *  life. The station's own files are the station's own code: nothing to
+ *  consent to. */
 const exposedRoms = new Set<string>();
 const exposureKey = (game: ArcadeGame, pathToData: string): string => `${pathToData}|${gameId(game)}`;
 export function localRomExposureAllowed(

@@ -38,7 +38,7 @@ describe('where the emulator files come from', () => {
     expect(emulatorDataLane('cdn')).toBe('CONVENIENCE');
   });
 
-  it('runs engine code from another origin isolated, and the station\'s own with the app', () => {
+  it('knows engine code from another origin (the CDN) for what it is, and the station\'s own for the station\'s — the frame is an opaque origin either way', () => {
     expect(emulatorIsolated('/emulatorjs/data/', 'http://localhost:4173')).toBe(false);
     expect(emulatorIsolated('http://localhost:4173/emulatorjs/data/', 'http://localhost:4173')).toBe(false);
     expect(emulatorIsolated(EMULATOR_CDN_DATA, 'http://localhost:4173')).toBe(true);
@@ -102,7 +102,7 @@ describe('where the emulator files come from', () => {
   it('hands the player\'s own file to engine code from another origin only on their word, per game and per engine path', () => {
     const game = { name: 'tetris.nes', core: 'nes' as const, url: '', size: 40_976 };
     const origin = 'http://localhost:4173';
-    // The station's own files run with the app: nothing to consent to.
+    // The station's own files are the station's own code: nothing to consent to.
     expect(localRomExposureAllowed(game, '/emulatorjs/data/', origin)).toBe(true);
     expect(localRomExposureAllowed(game, `${origin}/emulatorjs/data/`, origin)).toBe(true);
     // The CDN's code is another origin's: not until the player says so.

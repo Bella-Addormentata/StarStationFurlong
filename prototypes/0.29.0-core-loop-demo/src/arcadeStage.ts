@@ -343,9 +343,9 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     fail(t, key, emulatorErrorText(probe === 'missing' ? 'loader' : 'unreachable', data));
     return;
   }
-  let file: File | null = null;
+  let bytes: Blob;
   if (!game.url) {
-    file = localRomFor(game);
+    const file = localRomFor(game);
     if (!file) {
       t.mounted = `waiting:${key}`;
       t.phase = 'waiting';
@@ -363,13 +363,37 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
       renderStageChrome(t);
       return;
     }
+    bytes = file;
+  } else {
+    // The link is fetched HERE, by the page — same-origin, or from its own
+    // node under the node's gate, as the page — under the consent asked
+    // above, and the frame is handed the bytes: it is an opaque origin
+    // (arcadeEmulator's header), with no origin to fetch as and none a
+    // gate should admit. What the frame would have fetched, the page
+    // fetches: nothing more.
+    t.phase = 'loading';
+    showNotice(t, 'FETCHING THE GAME…', `<span class="arcade-stage-lane">${escapeHtml(game.name)}</span>`);
+    renderStageChrome(t);
+    try {
+      const res = await fetch(game.url);
+      if (stage !== t || t.mounted !== key) return;
+      if (!res.ok) {
+        fail(t, key, emulatorErrorText('game', data));
+        return;
+      }
+      bytes = await res.blob();
+    } catch {
+      if (stage !== t || t.mounted !== key) return;
+      fail(t, key, emulatorErrorText('game', data));
+      return;
+    }
+    if (stage !== t || t.mounted !== key) return;
   }
   hideNotice(t);
   t.phase = 'loading';
   t.frame = mountEmulatorFrame(t.screen, {
     core: game.core,
-    gameUrl: game.url,
-    file,
+    game: bytes,
     gameName: game.name,
     pathToData: path,
     volume: 0.7,
