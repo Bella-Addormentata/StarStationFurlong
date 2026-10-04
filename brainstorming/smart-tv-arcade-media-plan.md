@@ -632,8 +632,11 @@ the timestamp is here, authenticated with the rest: the jitter buffer
 orders by it, a pause is a gap in it rather than a slip, a screen share's
 irregular frames keep their own times, and audio meets video by
 subtraction on the shared clock (a batch carries its first chunk's
-timestamp; the rest follow at the Opus frame duration each packet's TOC
-byte states); the keyframe bit is the chunk's type; and the configuration
+timestamp in the header and each chunk's duration in its table, below —
+never inferred from a packet's TOC byte, which gives the duration of ONE
+frame while a code-3 packet carries several — so chunk k starts at the
+header's timestamp plus the durations before it); the keyframe bit is the
+chunk's type; and the configuration
 goes on the reliable lane, below, named by its generation. The source is an INSTANCE, never
 the sender's key: one identity may publish voice, a screen share and an
 arcade feed at once, and each is its own source with its own subscriber
@@ -804,7 +807,7 @@ a short burst allowance, per tier and counted on the WIRE — the tier's
 codec rate plus the per-frame overhead (the 57-byte header, the 16-byte
 tag and the 64-byte signature: 137 bytes a frame, 55 kbps at 50 frames a
 second, more than voice itself, which is why three Opus frames may ride
-one header, tag and signature, framed by a count-and-length table inside
+one header, tag and signature, framed by a count, length and duration table inside
 the plaintext) plus a fifth: about 105 kbps for the 32
 kbps voice tier and about 220 kbps for the 128 kbps music tier signed
 frame by frame, a third of the overhead when batched, and 50 frames a
@@ -835,11 +838,18 @@ tenth of an arcade-resolution stream — and some eighty verifications a
 second per source, a few milliseconds of CPU; a sender may sign a batch of
 up to three Opus frames (60 ms) under one header, tag and signature for a
 third of the overhead at 40 ms more latency — framed inside the plaintext
-so the receiver can cut it back into the encoder's chunks: a one-byte
-count, then one two-byte big-endian length per chunk, then the chunks in
-order, the table under the AEAD and the signature with the rest, bit 1 of
-the flags byte saying a batch is inside, and a batch whose lengths do not
-add up to the payload dropped as malformed; never a bare concatenation,
+so the receiver can cut it back into the encoder's chunks, each with its
+own timestamp and duration: a one-byte count, then per chunk a two-byte
+big-endian length and a two-byte big-endian duration in 48 kHz samples
+(one of Opus's frame sizes, 120 to 5760 — 2.5 to 120 ms; the chunk's
+WebCodecs `duration` is that count at 48 kHz, and a packet's TOC byte is
+never read for it, since the TOC gives the duration of ONE frame while a
+code-3 packet carries several), then the chunks in order, chunk k's
+timestamp the header's plus the durations before it; the table under the
+AEAD and the signature with the rest, bit 1 of the flags byte saying a
+batch is inside, and a batch whose lengths do not add up to the payload,
+or whose durations are not Opus frame sizes, dropped as malformed; never
+a bare concatenation,
 which Opus chunks of varying size could not be split again, and never a
 repacketised multi-frame Opus packet, which would mean rewriting the TOC
 in the page — while video frames, kilobytes
