@@ -104,8 +104,10 @@ the sources that fail have to say so on the screen.
 { volume: 0..100 }
 // key power:<itemId> — the switch, a body button anyone may press; its own key for the same
 // reason (a press must never race the holder's heartbeat in the programme's slot). Off keeps
-// the programme and writes the presser's own reading of where the room was (`parkMs`, 0 when
-// nothing was running — a position, never a time: the clocks rule below); on carries it, so
+// the programme and writes the presser's own reading of where the room was (`parkMs`: a
+// programme playing, or a schedule past its T0, which plays by the clock whoever holds — null
+// when nothing was running, a pause or a countdown still ahead, and 0 is a reading — a
+// position, never a time: the clocks rule below); on carries it, so
 // every page anchors the resumed programme there on receipt of the ON write (a sample of its
 // own, replaced by the holder's next heartbeat) and the holder's tick parks the programme
 // there as it sees the switch — with no holder present the programme resumes from where it
