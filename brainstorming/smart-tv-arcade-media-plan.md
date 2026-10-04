@@ -368,9 +368,27 @@ In code: #207 (the TV) and #208 (the cabinet).
   the new target before any lookup, then the resolve, validate and pin
   (redirects capped) — an allowed host can redirect anywhere, and a redirect
   that is not re-admitted is the end of the fetch. A size ceiling, a timeout
-  and a cap on concurrent fetches. A hostname allowlist alone closes
-  nothing, a response header gates nothing, and a check the connect does not
-  reuse protects nothing.
+  on both ends of the pipe (an upstream that stalls, a reader that stops
+  reading) and a cap on concurrent fetches. And the RESPONSE is bytes, never
+  the upstream's headers: the proxy forwards an allowlist of them only —
+  `Content-Type` (checked: a media or octet-stream type, else the fetch
+  ends), `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`,
+  `Last-Modified` — and drops everything else, `Set-Cookie`,
+  `Clear-Site-Data`, `Content-Security-Policy`,
+  `Strict-Transport-Security`, `Location` (a redirect is followed under the
+  gate above, never handed to the browser), `Link`, `Refresh`,
+  `WWW-Authenticate` and every `Access-Control-*`, `Cross-Origin-*` and
+  `Cache-Control` among them, minting its own CORS, `Cache-Control:
+  private, no-store` and `X-Content-Type-Options: nosniff`; in the
+  same-origin deployment §3.5 proposes, a forwarded cookie or
+  `Clear-Site-Data` would act on the app's own origin, and a media host
+  could set the app's cookies or wipe its storage. It answers only a
+  subresource fetch (`Sec-Fetch-Dest` of `video`, `audio` or `empty`, with
+  `Content-Security-Policy: sandbox` on the response besides), never a
+  navigation, so nothing an allowed host serves is ever rendered as a
+  document of the app's origin. A hostname allowlist alone closes nothing,
+  a response header gates nothing, and a check the connect does not reuse
+  protects nothing.
 - **v1 ships neither on the in-world plane.** The first slice draws the status,
   menu, countdown and now-playing card on the in-world `CanvasTexture` and plays
   the actual video in a **theatre panel** (DOM) that anyone in the room opens
@@ -708,7 +726,18 @@ signature under 400 bytes; a video frame one WebTransport unidirectional
 stream of its own, per the wire path above, read only up to the tier's
 frame-size ceiling and verified whole before it is forwarded — never
 fragmented into datagrams, which would need fragment ids, loss handling
-and reassembly before any hub could check the signature), and
+and reassembly before any hub could check the signature — and, since a
+stream is state the receiver holds until it ends, a cap on the streams a
+link may hold open UNFINISHED (per link, set as the session's own
+unidirectional-stream limit, which the receiver dictates and the sender
+cannot exceed; and per source inside it, a few frames' worth: the tier's
+frame rate times the jitter window) and a deadline from a stream's first
+byte to its end (one frame interval of the tier, with slack) — a stream
+past either is reset, its bytes discarded and the reset counted against
+the link's failed-verification budget below, since a publisher holding a
+thousand streams open with a byte each would spend the receiver's memory
+and stream state under every rate ceiling here; and a stream whose bytes
+pass the ceiling is reset at that byte, the frame never assembled), and
 packet-rate and byte-rate ceilings per source with
 a short burst allowance, per tier and counted on the WIRE — the tier's
 codec rate plus the per-frame overhead (the 47-byte header, the 16-byte
@@ -1208,7 +1237,7 @@ it.
    with full sync for finite, seekable media (the archive embed, a live
    stream or a host without usable ranges play start-time only, §3.3), the
    countdown, the start screen with lane badges, the theatre panel.
-   **Shipped serverless-only under the 2026‑10‑04 ruling (§3.3):** the
+   **In #207 (open), serverless-only under the 2026‑10‑04 ruling (§3.3):** the
    YouTube and archive tiles and PLAY FROM <host> are in the tree behind
    `VITE_SSF_CONVENIENCE_LANES=1`; a default build plays a file on the
    viewer's own origin or node. Spike
@@ -1224,8 +1253,9 @@ it.
    the #190 calls; media subscriptions by distance on the node.
 6. **Video lane:** screen share, arcade spectators, then P2 over video.
 7. **Arcade P1** can proceed in parallel with 1–2 (it needs only the proxy for
-   archive ROMs; local files work without it) — shipped in #208 under the
-   same ruling: the CDN opt-in and links on other servers behind the flag,
+   archive ROMs; local files work without it) — in #208 (open, stacked on
+   #207) under the same ruling: the CDN opt-in and links on other servers
+   behind the flag,
    the station lane's frame under a content-security policy (§9).
 8. **Not now:** IPv8/Tribler (stage-A spike only on request), per-viewer swarm
    fetch by default, any built-in content search.
