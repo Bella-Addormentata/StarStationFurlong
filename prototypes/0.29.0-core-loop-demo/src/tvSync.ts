@@ -138,6 +138,14 @@ export class TvSyncController {
    *  target waits (a player that cannot seek yet keeps it, bounded). */
   private pendingSeekIssued = false;
   private pendingSince = -Infinity;
+  /** Where the player read as the pending seek went out: a seek has landed
+   *  only once the player reads on the target's side of that. A lazy
+   *  player (YouTube's seekTo) reports its OLD position until the seek
+   *  completes, and the drift band alone would call a replay of a
+   *  one-second clip from 800 ms "landed" at 800 ms — the old run's
+   *  position published as the new programme's, and the old run's end
+   *  closing the new programme. */
+  private seekFrom = 0;
   /** A viewer: the transport revision it last saw, to tell a transport
    *  write (a replay, a rewind) from the record lagging its ended player. */
   private seenJump: number | null = null;
@@ -363,6 +371,7 @@ export class TvSyncController {
    *  beat goes out until it has landed. */
   private aim(p: TvPlayer, target: number, now: number): void {
     if (p.canSeek) {
+      this.seekFrom = p.currentMs();
       p.seek(target);
       this.lastSeekAt = now;
       this.pendingSeekIssued = true;
@@ -394,6 +403,7 @@ export class TvSyncController {
     if (this.pendingTarget === null) return;
     if (!this.pendingSeekIssued) {
       if (p.canSeek) {
+        this.seekFrom = p.currentMs();
         p.seek(this.pendingTarget);
         this.lastSeekAt = now;
         this.pendingSeekIssued = true;
@@ -405,7 +415,17 @@ export class TvSyncController {
     }
     const target = reachable(this.pendingTarget, p);
     const at = p.currentMs();
-    const landed = p.isEnded() ? target >= at : Math.abs(at - target) <= TV_SEEK_OVER_MS;
+    // Landed: inside the band of the target AND on the target's side of
+    // where the player read as the seek went out (seekFrom) — a backward
+    // seek once the player reads before that, a forward one once it reads
+    // past it, a seek to where it stood at once. The band alone is drift
+    // tolerance, and a lazy player still reading its old position inside
+    // the band has not moved at all. An ended player's forward seek has
+    // landed wherever the media stops; a backward one from the end has not
+    // until the player un-ends.
+    const back = target < this.seekFrom;
+    const moved = this.seekFrom === target || (back ? at < this.seekFrom : at > this.seekFrom);
+    const landed = p.isEnded() ? target >= at : Math.abs(at - target) <= TV_SEEK_OVER_MS && moved;
     if (landed || now - this.pendingSince >= TV_SEEK_WAIT_MS) this.pendingTarget = null;
   }
 
