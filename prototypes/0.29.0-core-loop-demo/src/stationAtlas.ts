@@ -1603,12 +1603,19 @@ function isSharedAtlasEntry(value: unknown): value is SharedAtlasEntry {
     // 🗺️ An owner is a small object or absent; a malformed one is refused here
     // rather than half-read (cleanAtlasOwner checks its fields).
     && (e.owner === undefined || ownerOf(e.owner) !== undefined)
-    // 🔧 A tombstone's stamp is a plain time; the record's own updatedAt is
-    // what arbitrates it, bounded above.
-    && (e.dismantledAt === undefined
-      || (typeof e.dismantledAt === 'number' && Number.isFinite(e.dismantledAt) && e.dismantledAt >= 0))
-    && (e.revives === undefined
-      || (typeof e.revives === 'number' && Number.isFinite(e.revives) && e.revives >= 0));
+    // 🔧 When the module was taken apart, and the removal a copy brought it
+    // back from: plain times, bounded above like updatedAt. Where stamps tie
+    // at that ceiling, laterTomb ranks two tombstones by dismantledAt, so
+    // one dated past it would outrank every later removal there, and a copy
+    // naming it (revives) could then bring the module back after one.
+    && (e.dismantledAt === undefined || isGossipTime(e.dismantledAt))
+    && (e.revives === undefined || isGossipTime(e.revives));
+}
+
+/** A peer-written time the atlas compares: finite, not negative, and no
+ *  further ahead of our clock than a gossip stamp may be. */
+function isGossipTime(t: unknown): t is number {
+  return typeof t === 'number' && Number.isFinite(t) && t >= 0 && t <= Date.now() + MAX_GOSSIP_SKEW_MS;
 }
 
 /** `{ owner }` when the owner is known (an owner or null), else nothing. */

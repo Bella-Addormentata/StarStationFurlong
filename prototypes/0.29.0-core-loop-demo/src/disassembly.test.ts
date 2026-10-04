@@ -1129,6 +1129,50 @@ describe('a module taken apart', () => {
     }
   });
 
+  it('lets no removal dated past the bound outrank a later one at the ceiling', () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      const T = 1_000_000;
+      const CEILING = T + 6 * 60 * 60 * 1000;
+      const FAR = CEILING + 1_000_000_000;
+      now.mockReturnValue(T);
+      hub();
+      const docWith = (value: object) => {
+        const doc = new Y.Doc();
+        doc.getMap('atlas').set('room-b', value);
+        return doc;
+      };
+      // GARDEN taken apart, tied at the ceiling.
+      bindStationAtlasDoc(docWith({ roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: T - 1000, updatedAt: CEILING }), {
+        roomId: 'room-a', isPassagePublic: () => false,
+      });
+      // A peer plants a removal dated far ahead at that same stamp, then a copy
+      // that names it as the removal it brought GARDEN back from: both refused.
+      bindStationAtlasDoc(docWith({ roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: FAR, updatedAt: CEILING }), {
+        roomId: 'room-a', isPassagePublic: () => false,
+      });
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBe(T - 1000);
+      const revived = docWith({
+        roomId: 'room-b', name: 'GARDEN', doors: { west: { targetRoomId: 'room-a' } }, revives: FAR, updatedAt: CEILING,
+      });
+      bindStationAtlasDoc(revived, { roomId: 'room-a', isPassagePublic: () => false });
+      expect(readAtlas()['room-b']).toBeUndefined();
+      expect(withSharedAtlasOf(revived, readAtlas(), 'room-b')['room-b']).toBeUndefined();
+      // Any copy naming a removal dated past the bound is refused whole.
+      revived.getMap('atlas').set('room-x', {
+        roomId: 'room-x', name: 'SHED', doors: { east: { targetRoomId: 'room-a' } }, revives: FAR, updatedAt: T,
+      });
+      expect(readAtlas()['room-x']).toBeUndefined();
+      // Dated at the bound itself, a removal is taken like any other.
+      bindStationAtlasDoc(docWith({ roomId: 'room-b', name: 'GARDEN', doors: {}, dismantledAt: CEILING, updatedAt: CEILING }), {
+        roomId: 'room-a', isPassagePublic: () => false,
+      });
+      expect(JSON.parse(store.get('ssf-station-atlas')!)['room-b'].dismantledAt).toBe(CEILING);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('keeps a later removal of its own that ties the saved one at the ceiling, when the store cannot take it', () => {
     const now = vi.spyOn(Date, 'now');
     try {
