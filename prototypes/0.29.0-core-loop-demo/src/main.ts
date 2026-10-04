@@ -3828,7 +3828,12 @@ function wireAdapterTransit(): void {
   };
   initFarDoorWrite(farWriteDeps);
   // 🚏📋 A6: the ferry's publishes to its stops' boards ride the same seams.
-  initDeparturesWrite(farWriteDeps);
+  // 🛰️ A board in the room we stand in waits for the room's shared state.
+  initDeparturesWrite({
+    ...farWriteDeps,
+    activeRoomReady: (roomId: string) =>
+      roomId === activeBootstrap?.roomId && roomStateArrivedNow(),
+  });
   world.dockingSystem?.onFarDockWrite(farDockWrite);
   // 🚏🛟 A5 "Rights": a running route lets a rider's keeper dock and undock
   // the route's own port toward the current stop, at the timetable's moments.
