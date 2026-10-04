@@ -674,17 +674,24 @@ receiver holding frames of a generation it has no configuration for waits
 the jitter window for the message and then drops them; a `media-config`
 that fails its signature is dropped and counted against the link like a
 frame — and the reliable lane that carries it is bounded BEFORE any
-signature is checked, as the datagram lane is below: a control-frame
-ceiling of 4 KiB per message, enforced on the length prefix before a byte
-of the body is allocated (the node reads into a fixed buffer and resets
-the stream, counting it, when the prefix says more — today
-`ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
-frame as it stands, around lines 1499 and 2223, which this lane's first
-change replaces, and a fix the node owes with or without media), and a
-control-message budget per link in messages and bytes a second (the
-renewals its admitted subscribers owe plus a fifth, with a floor for a
-fresh link; that count times the ceiling), a message past it dropped
-unverified and counted; and the configuration's fields are checked after
+signature is checked, as the datagram lane is below. Media control
+travels on a stream of its own, opened with a one-byte preface naming
+the class, so its ceiling — 4 KiB per message — is known from the first
+byte and enforced on the length prefix before a byte of the body is
+allocated (the node reads into a fixed buffer and resets the stream,
+counting it, when the prefix says more); the shared reliable readers,
+which carry `ysync` as well — a whole Yjs baseline is one frame, and a
+room snapshot may run to 1 000 000 bytes — keep their own kinds and get a
+GLOBAL ceiling of their own, the largest frame any kind may carry (that
+snapshot bound plus the envelope), enforced on the prefix the same way,
+since today `ssf-p2p-node/src/main.rs` allocates the declared length of a
+reliable frame as it stands (around lines 1499 and 2223), a fix the node
+owes with or without media — and never the 4 KiB class, which would
+reset a room's sync before its kind was read. A control-message budget
+per link in messages and bytes a second (the renewals its admitted
+subscribers owe plus a fifth, with a floor for a fresh link; that count
+times the ceiling) drops a message past it unverified and counted; and
+the configuration's fields are checked after
 the signature and before any decoder sees them — the codec string against
 an allowlist (`opus`; `vp8`, `vp09.*`, `av01.*` and `avc1.*` for video,
 nothing else, and never longer than 64 bytes), the coded width and height
@@ -858,8 +865,14 @@ frame came from someone holding it, and every subscriber holds it — so any
 subscriber could forge frames as the source, and with a high counter push
 genuine frames out of the window. The sender therefore signs every frame:
 an Ed25519 signature by the sender's identity key — the key the room
-already knows the source by — over the frame's header and ciphertext,
-verified before anything is decoded or played. Nothing plays
+already knows the source by — over a versioned domain tag,
+`"ssf-media-frame:v1\n"`, then the frame's header and ciphertext: the tag
+first, as `signBytes.ts` puts one before every envelope it signs, so the
+signature is this message class's and nothing else the same key signs
+(an announcement, a lease, a `media-config`, each under a tag of its own:
+`ssf-media-announce:v1`, `ssf-media-lease:v1`, `ssf-media-config:v1`) can
+be replayed as a frame, nor a frame as one of them — verified before
+anything is decoded or played. Nothing plays
 unauthenticated, a lost datagram costs only itself, and a forged frame
 fails verification and is dropped and counted (reported when it keeps
 coming) — never a reason to drop the source, since any member could inject,
@@ -1388,8 +1401,10 @@ core bug a ROM exploits is script in the frame), and a same-origin frame
 DOM, its storage and, in the desktop shells, the IPC bridge; a
 content-security policy bounds what a frame may LOAD, never what its
 scripts may reach, so it is no isolation boundary. The frame is an opaque
-origin on every lane (`sandbox` without `allow-same-origin`: scripts,
-pointer lock, forms and popups allowed, nothing else), and everything
+origin on every lane (`sandbox` without `allow-same-origin`: scripts and
+pointer lock allowed, nothing else — no forms, popups or downloads, each
+of them a request to any URL that no policy directive governs, a popup or
+a download script-initiated at that), and everything
 crosses its boundary explicitly: keys reach it by focus (a focused frame
 receives them, and the stage's capture listener keeps them from the
 world); its status and its policy report come out by `postMessage`, the
@@ -1411,14 +1426,23 @@ as a URL — the page fetches it itself, AS the page (same-origin, or from
 its node under the node's gate, which admits the page's origin and need
 admit no frame without one), under the consent the cabinet already asked,
 and hands the frame the bytes as a `Blob` it plays from a `blob:` URL of
-its own; save states leave the frame as files (EmulatorJS's export), an
-opaque origin having no storage, a station-side store being the blob
-lane's; the desktop shells' protocol handlers must answer the engine's
-fetches the same way, and the IPC bridge must be absent from the frame
-(`__TAURI_INTERNALS__` undefined inside it, else the shell's isolation
-pattern) — both verified by the fetch spike, which is also where a policy
-directive EmulatorJS needs would show, as a console refusal naming it
-(its files are never in the repository).
+its own; a save state crosses the same way — EmulatorJS's own export is a
+download, which the sandbox refuses, so the state goes to the page by
+`postMessage` and the page offers the file (a P1 follow-up), an opaque
+origin having no storage of its own and a station-side store being the
+blob lane's; the desktop shells' protocol handlers must answer the
+engine's fetches the same way, and the IPC bridge must be absent from the
+frame (`__TAURI_INTERNALS__` undefined inside it, else the shell's
+isolation pattern) — both verified by the fetch spike, which is also
+where a policy directive EmulatorJS needs would show, as a console
+refusal naming it (its files are never in the repository). What no policy
+and no sandbox flag forbids is the frame navigating ITSELF: a document
+may always leave for another URL, and the request that fetches it carries
+whatever the URL does. That navigation ends the frame — the page tears
+down a frame that loads a second document — so what can leave is one
+URL's worth, said here as the residual rather than closed; the boundary
+the policy gives is on loads, connections and workers, which is where an
+emulator's traffic is.
 
 **Display and controls.** The emulator draws to a canvas. In P1 the picture
 lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
