@@ -138,6 +138,8 @@ import {
   berthPassFor, completeArrival, dockedToStation, keepRestPlace, releasePlaceOf, restAtRouteEnd, setBerthSeedResolver,
   shipPlaceId,
 } from "./shipArrival";
+// 🕹️ Free flight (issue 203): the coast watch and the shared pose.
+import { keepStationPark, readFreePose, recoverFreeDock, settleFreeCoast } from "./freeFlightPilot";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
 // aside for it and copies it back into the stored records when due.
@@ -284,7 +286,7 @@ import {
   stationRoomCause,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
-import { adriftPlace, directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
+import { adriftPlace, directoryFromStationRecords, flightCapable, groundedBy, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1567,7 +1569,11 @@ function planetShipStatus(): ShipStatusInput | null {
   // or the ship's live dock, and then this would publish where its flight
   // record left it instead.
   const doors = readPhysicalDoors();
-  if (!roomId || !isShipReady() || isStationRoom(roomId, []) || isBoltedIntoStation(doors, roomId)) return null;
+  // 🕹️ A ship flown by hand that lost a part it flies by still coasts, so
+  // it stays on the planet's maps, and so does a one-module station's own
+  // room flown by hand (Fly and park) until it parks.
+  const flownFree = readFlightRecord().status === "free-flight" && [null, "lone-station"].includes(groundedBy());
+  if (!roomId || !(isShipReady() || flownFree) || (!flownFree && isStationRoom(roomId, [])) || isBoltedIntoStation(doors, roomId)) return null;
   const now = Date.now();
   // 🚏 A running route's timetable, while it rules the flight (A4): the
   // stored record only catches up at the copy-back.
@@ -1588,6 +1594,9 @@ function planetShipStatus(): ShipStatusInput | null {
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
+  // 🕹️ Flown by hand: the pose says which planet it flies at (the station
+  // it left may have moved on, or be gone).
+  const free = rec.status === "free-flight" ? readFreePose() : null;
   // 🚚 The timetable flies the route's own copy of each stop, which a stop's
   // station may have left for another planet since: its planet, not the
   // station list's, while it rules, unless a live dock carries the ship
@@ -1597,7 +1606,7 @@ function planetShipStatus(): ShipStatusInput | null {
     ? carriedBy.planetId
     : places
       ? planetById(places.from.planetId).id
-      : byId(at)?.planetId ?? adriftPlace(at)?.planetId ?? to?.planetId ?? placed?.planetId;
+      : free?.planetId ?? byId(at)?.planetId ?? adriftPlace(at)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const roomName = yjsSync?.doc.getMap("roomInfo").get("name");
   // 🚏📋 A ferry on its route goes by its board name, so a newer summary can
@@ -1610,6 +1619,8 @@ function planetShipStatus(): ShipStatusInput | null {
   if (to?.welcomeRoomId) out.toRoom = to.welcomeRoomId;
   if (rec.departedAt !== undefined) out.departedAt = rec.departedAt;
   if (rec.etaAt !== undefined) out.etaAt = rec.etaAt;
+  // 🕹️ Flown by hand: where it is, as last written (readers coast it on).
+  if (free) out.free = free;
   // 🚏📋 A9 item 7: a route ferry's gate, next stop, departure and status,
   // for the all-gates boards of other rooms ("as of" this summary's time).
   // 🏁 Just routeIdle for a ship with no running route. Old clients drop
@@ -2545,6 +2556,21 @@ async function joinRoomAtEpoch(
       return;
     }
     const rec = readFlightRecord();
+    // 🕹️ Flown by hand with nobody at the stick here: the coast's zone rules
+    // (a ship drifting into a station's approach zone slows at its edge) are
+    // written back for everyone.
+    if (rec.status === "free-flight") {
+      settleFreeCoast();
+      return;
+    }
+    // 🕹️ An AUTO-DOCK whose answer the game that asked never heard (it left
+    // the room): a ship docked nowhere flies on from where it came in.
+    if (rec.status === "docked" && roomStateArrivedNow()) {
+      const ds = world?.dockingSystem ?? null;
+      if (ds && recoverFreeDock(ds.listDockPorts())) return;
+      // 🅿️ A parked station whose orbit claim lost flies again.
+      if (keepStationPark()) return;
+    }
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).

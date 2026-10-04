@@ -32,6 +32,7 @@ import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove
 import {
   altitudeChangedSince, currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
 } from './stations';
+import { stationFlyingFree } from './freeFlightPilot';
 import {
   findDestination,
   isBerthMemoryRecord,
@@ -1105,7 +1106,10 @@ export function completeArrival(
   // 🎚️ An altitude change since cast-off keeps the planet and slot, so it
   // is looked for among every move known, not only the latest.
   const climbedAway = !!listedNow && leftAt !== undefined && altitudeChangedSince(listedNow, leftAt, now);
-  if (stationInTransit(station, now) || movedAway || climbedAway) {
+  // 🅿️ A station flying by itself (Fly and park) has its docks closed: the
+  // ship waits where it was, like for one between planets.
+  const flyingFree = stationFlyingFree(listedNow, now);
+  if (stationInTransit(station, now) || movedAway || climbedAway || flyingFree) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.

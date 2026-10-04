@@ -115,7 +115,11 @@ export interface FarStationInput {
 export interface FarShipInput {
   id: string;
   name: string;
-  plan: TransferPlan;
+  /** A ship on a transfer: drawn on it, with its course. */
+  plan?: TransferPlan;
+  /** 🕹️ A ship flown by hand (freeFlight.ts): where it is at a time. No
+   *  course is drawn; one with a plan uses the plan. */
+  at?: (ms: number) => OrbitPoint;
 }
 
 export interface FarBody {
@@ -223,13 +227,20 @@ export function planetLayout(input: {
 
   const paths: FarLayout['paths'] = [];
   for (const ship of input.ships) {
-    const p = transferPointAt(ship.plan, input.nowMs);
+    if (!ship.plan) {
+      if (!ship.at) continue;
+      const q = ship.at(input.nowMs);
+      bodies.push({ id: ship.id, kind: 'ship', name: ship.name, position: squash(q), angle: q.angle, modules: 1 });
+      continue;
+    }
+    const plan = ship.plan;
+    const p = transferPointAt(plan, input.nowMs);
     if (p.leg !== 'transfer') continue;
     bodies.push({ id: ship.id, kind: 'ship', name: ship.name, position: squash(p), angle: p.angle, modules: 1 });
     if (input.withPaths === false) continue;
     paths.push({
       id: ship.id,
-      points: sampleCourse((ms) => squash(transferPointAt(ship.plan, ms)), ship.plan.departAt, ship.plan.arriveAt),
+      points: sampleCourse((ms) => squash(transferPointAt(plan, ms)), plan.departAt, plan.arriveAt),
     });
   }
 
