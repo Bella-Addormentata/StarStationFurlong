@@ -25,7 +25,7 @@
  */
 
 import {
-  driftAction, iHoldRemote, readPlayback, readTv, tvHeartbeat, tvStop,
+  driftAction, iHoldRemote, readPlayback, readTv, tvHeartbeat, tvNow, tvStop,
   TV_HEARTBEAT_MS, TV_NUDGE_RATE, TV_SEEK_OVER_MS,
 } from './tvDoc';
 import type { PlaybackNow } from './tvDoc';
@@ -136,7 +136,7 @@ export class TvSyncController {
   private pendingSince = -Infinity;
 
   constructor(private readonly deps: TvSyncDeps) {
-    this.now = deps.now ?? (() => Date.now());
+    this.now = deps.now ?? tvNow; // monotonic: cadences and the receipt timeline, never a date
     this.rttMs = deps.rttMs ?? (() => 0);
     this.iHold = deps.iHold ?? (() => iHoldRemote(deps.itemId));
     this.playback = deps.playback ?? ((now, rtt) => readPlayback(deps.itemId, now, rtt));

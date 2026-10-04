@@ -455,6 +455,46 @@ describe('the sync rule: anchor on receipt, never on the holder\'s clock', () =>
     expect(readSample(TV)!.receivedAt).toBe(now - 2_000);
   });
 
+  it('a wall-clock step is not elapsed playback: receipt and drift run on the monotonic clock', () => {
+    let mono = 10_000;
+    let wall = 1_700_000_000_000;
+    setTvClock(() => mono, () => wall);
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    tvHeartbeat(TV, 30_000);
+    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 30_000, receivedAt: mono });
+    expect(readTv(TV).history[0].playedAt).toBe(wall); // the stamps that travel are dates
+    mono += 1_400;
+    expect(readPlayback(TV).positionMs).toBe(31_400);
+    // An NTP correction, a wake from sleep: the wall clock jumps a minute.
+    // Nothing seeks — the room's position moved by what the monotonic clock
+    // measured, not by what the date says.
+    wall += 60_000;
+    expect(readPlayback(TV).positionMs).toBe(31_400);
+    wall -= 120_000;
+    expect(readPlayback(TV).positionMs).toBe(31_400);
+    // Nor does a wall step lapse a live lease: that is elapsed time too.
+    expect(remoteStatus(TV)).toBe('mine');
+    mono += TV_LEASE_LAPSE_MS;
+    expect(remoteStatus(TV)).toBe('free');
+  });
+
+  it('the schedule is a date: the countdown reads the wall clock, whatever the monotonic clock does', () => {
+    let mono = 10_000;
+    let wall = 1_700_000_000_000;
+    setTvClock(() => mono, () => wall);
+    pickUpRemote(TV);
+    expect(tvSchedule(TV, FILM, wall + 60_000)).toEqual({ ok: true });
+    mono += 3_600_000; // an hour of monotonic time moves no countdown
+    expect(readPlayback(TV).countdownMs).toBe(60_000);
+    wall += 59_000;
+    expect(readPlayback(TV).countdownMs).toBe(1_000);
+    wall += 3_500;
+    renewRemote(TV);
+    // Past T0 the holder free-runs from the UTC start: a wall-clock distance.
+    expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
+  });
+
   it('a late joiner anchors the record it finds to its own now', () => {
     pickUpRemote(TV);
     tvPlay(TV, FILM);
