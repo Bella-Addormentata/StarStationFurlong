@@ -33,12 +33,13 @@ import {
   stationOrbit,
   stationPointAt,
   transferPointAt,
+  wrapAngle,
 } from './orbits';
 import type { OrbitPoint, TransferPlan } from './orbits';
 import { frozenCourse, planetLayout, transitLayout } from './farOrbits';
 import type { FarBody, FarLayout, FarShipInput, FarStationInput, FrozenCourses } from './farOrbits';
 import { readStore } from './planetSummary';
-import { isPinMove, moveTransitPointAt } from './stationMove';
+import { isPinMove, moveTransitPointAt, stationPointWithMoveAt } from './stationMove';
 import { isShipReady } from './devices';
 import { readPhysicalDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
@@ -51,8 +52,8 @@ import { routeLegEnds, routeStayPlace, summaryLegEnds } from './planetSummary';
 import { flightCapable, followsFlightRecord } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
-  adriftAt, adriftPlace, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById, planetForRoom,
-  roomAdriftPlace, stationInTransit,
+  adriftAt, adriftPlace, altitudeChangesSince, orbitChangeBase, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById,
+  planetForRoom, roomAdriftPlace, stationInTransit,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -114,7 +115,7 @@ function stationYaw(welcomeRoomId: string | undefined, roomId: string | undefine
 
 /** Where a flight record's location is: a station, or open orbit (174's
  *  adrift:<planet>:<slot>, where a ship waits once its station has left). */
-type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
+type Place = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot' | 'orbit'>;
 
 /** A flight's end as it was when the ship left (`leftAt`): a station that
  *  has moved to another planet since then is still at its old slot for the
@@ -132,7 +133,22 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
       : latest.departAt < latest.settles.arriveAt ? undefined
       : latest.settles;
     if (moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now && betweenPlanets(moved)) {
-      return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot };
+      // 🎚️ At the altitude it flew there when the ship left: the orbit an
+      // altitude change since then left, else the one this move left.
+      const climb = altitudeChangesSince(station, leftAt, now)[0]?.orbit;
+      const orbit = climb ? orbitChangeBase(climb)
+        : moved.fromOrbit ? { radiusKm: moved.fromOrbit.radiusKm, phase0: moved.fromOrbit.phase0 } : undefined;
+      return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot, ...(orbit ? { orbit } : {}) };
+    }
+    // 🎚️ Likewise an altitude change since the ship left, found among every
+    // move known (a later booking can hide it from the latest): the flight
+    // was planned to the orbit the station flew then.
+    const climbed = leftAt !== undefined ? altitudeChangesSince(station, leftAt, now)[0]?.orbit : undefined;
+    if (climbed) {
+      return {
+        id: station.id, planetId: station.planetId, orbitSlot: station.orbitSlot,
+        orbit: orbitChangeBase(climbed),
+      };
     }
     return station;
   }
@@ -146,9 +162,17 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
  *  left from or flies to. Under the station's own id, so its trim still
  *  applies while it flies that slot (a trim names the slot it is for).
  *  Undefined when the record kept none. */
-function castOffPlace(id: string, keptAt: string | undefined): Place | undefined {
+function castOffPlace(
+  id: string, keptAt: string | undefined, all: readonly StationRecord[], leftAt: number, now: number,
+): Place | undefined {
   const at = keptAt ? adriftPlace(keptAt) : null;
-  return at ? { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot } : undefined;
+  if (!at) return undefined;
+  const place: Place = { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot };
+  // 🎚️ The record keeps only the slot: the altitude the station flew there
+  // at cast-off is the one placeOf finds (its orbit then, climbs since undone).
+  const then = placeOf(id, all, leftAt, now);
+  return then?.orbit && planetById(then.planetId).id === place.planetId && then.orbitSlot === place.orbitSlot
+    ? { ...place, orbit: then.orbit } : place;
 }
 
 /** A flight's transfer rebuilt from its record, fixed once seen
@@ -263,8 +287,8 @@ function readSource(now: number): Source {
       // through this install's aliases each time (a learned station listed,
       // then dropped), and the same flight must keep the course it was drawn on.
       aboard = flightPlan(['own', roomId], rec.departedAt, rec.etaAt, routeLegEnds(places), () => [
-        castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
-        castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
+        castOffPlace(rec.locationId, rec.originAt, all, leftAt, now) ?? placeOf(rec.locationId, all, leftAt, now),
+        castOffPlace(to, rec.destinationAt, all, leftAt, now) ?? placeOf(to, all, leftAt, now),
       ]);
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
@@ -293,12 +317,18 @@ function readSource(now: number): Source {
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
     if (!aboard && !adrift && rec.status === 'redocking') {
-      const place = castOffPlace(rec.locationId, rec.destinationAt)
-        ?? placeOf(rec.locationId, all, rec.castOffAt ?? rec.departedAt, now);
+      const castOffAt = rec.castOffAt ?? rec.departedAt;
+      const place = (castOffAt !== undefined ? castOffPlace(rec.locationId, rec.destinationAt, all, castOffAt, now) : undefined)
+        ?? placeOf(rec.locationId, all, castOffAt, now);
       const station = all.find((s) => s.id === rec.locationId);
       // A destination still in transit is listed at its origin until it arrives,
       // so a matching slot proves nothing: the ship stays on its own orbit.
-      if (place && (!station || reallyMoving(station, now)
+      // 🎚️ So does an altitude change, under way or done: the ship reached
+      // the orbit it left, which the station no longer flies.
+      const sameOrbit = !!station && !station.orbit === !place?.orbit && (!station.orbit || !place?.orbit
+        || (Math.abs(station.orbit.radiusKm - place.orbit.radiusKm) < 1e-6
+          && Math.abs(wrapAngle(station.orbit.phase0 - place.orbit.phase0)) < 1e-9));
+      if (place && (!station || reallyMoving(station, now) || stationInTransit(station, now) || !sameOrbit
         || planetById(station.planetId).id !== place.planetId || station.orbitSlot !== place.orbitSlot)) {
         adrift = place;
       }
@@ -350,7 +380,8 @@ function readSource(now: number): Source {
     viewerRingRadiusKm = stationOrbit(place).radiusKm;
   } else if (me) {
     const station = me;
-    viewer = (ms) => stationPointAt(station, ms);
+    // 🎚️ On its altitude change's course while it flies one.
+    viewer = (ms) => stationPointWithMoveAt(station, ms);
     viewerRingRadiusKm = stationOrbit(me).radiusKm;
   } else {
     const orbit = orbitForSlot(planetId, 0);
@@ -427,7 +458,7 @@ function layoutFor(source: Source, now: number, withPaths: boolean): FarLayout |
   const stations: FarStationInput[] = source.stations.map(({ record, modules }) => ({
     id: record.id,
     name: record.name,
-    point: stationPointAt(record, now),
+    point: stationPointWithMoveAt(record, now),
     ringRadiusKm: stationOrbit(record).radiusKm,
     modules,
   }));

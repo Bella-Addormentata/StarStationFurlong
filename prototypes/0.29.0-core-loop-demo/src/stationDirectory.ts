@@ -21,7 +21,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { planTransfer } from './orbits';
 import { ADRIFT_PREFIX, adriftPlace, latestMoveOf, stationInTransit } from './stations';
-import type { StationMove, StationRoomCause } from './stations';
+import type { StationMove, StationOrbit, StationRoomCause } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -82,6 +82,9 @@ export interface StationDestination {
   /** Its latest move even once finished: arrival checks it against the
    *  flight, so a ship never docks at a station that moved away meanwhile. */
   lastMove?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's (the
+   *  route keeper checks it against the orbit a ferry route copied). */
+  orbit?: StationOrbit;
 }
 
 /** The seam: whatever knows the stations. */
@@ -336,6 +339,8 @@ export interface StationRecordLike {
   }>;
   /** A move to another planet, scheduled or under way (stations.ts). */
   move?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's. */
+  orbit?: StationOrbit;
 }
 
 /** Rough per-destination figures for a station record (what a hop from the
@@ -425,6 +430,7 @@ export function destinationsFromRecords(
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
       ...(r.move ? { move: r.move } : {}),
+      ...(r.orbit ? { orbit: { radiusKm: r.orbit.radiusKm, phase0: r.orbit.phase0 } } : {}),
     };
     const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
     if (last) out.lastMove = last;

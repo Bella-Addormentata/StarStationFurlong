@@ -146,6 +146,7 @@ import {
   type RouteStop,
   type ShipRoute,
 } from './shipRoute';
+import { wrapAngle } from './orbits';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import {
   isKnownStation,
@@ -772,7 +773,7 @@ export interface KeeperPassDeps {
   stop: RouteStop;
   /** The stop's station in this game's directory (🚚 `planetId`: the planet
    *  it orbits now), or null when it is not listed. */
-  station: (Pick<StationDestination, 'berth' | 'berths'> & { planetId?: string }) | null;
+  station: Pick<StationDestination, 'berth' | 'berths' | 'orbit'> & { planetId?: string } | null;
   shipRoomId: string;
   /** May this game dock the route's port toward `farRoomId` now (its own
    *  rights, or the carve-out)? */
@@ -819,7 +820,15 @@ export async function runKeeperPass(deps: KeeperPassDeps): Promise<{ verdict: Pa
   // the timetable brings the ferry to where it was, so no gate is in reach.
   // Every gate counts as that refusal, unasked, and the stop is skipped.
   const planetId = deps.station?.planetId;
-  if (planetId !== undefined && planetId !== deps.stop.planetId) {
+  // 🎚️ Likewise a stop that has changed altitude since: the route flew to
+  // the orbit it copied (RouteStop.orbit; none is the slot's own).
+  // Radius and phase both: back at an altitude flown before, it is not
+  // where it was then.
+  const live = deps.station?.orbit;
+  const copied = deps.stop.orbit;
+  const climbed = planetId !== undefined && (!live !== !copied || (!!live && !!copied
+    && (Math.abs(live.radiusKm - copied.radiusKm) > 1e-6 || Math.abs(wrapAngle(live.phase0 - copied.phase0)) > 1e-9)));
+  if (planetId !== undefined && (planetId !== deps.stop.planetId || climbed)) {
     const gone = (berth: StationBerth): KeeperGateResult => ({ kind: 'refused', berth, reason: 'moving', cls: 'gone' });
     const results = (berths.length > 0 ? berths : [ownStopBerth(deps.stop, remembered?.address ?? '')]).map(gone);
     return { verdict: passVerdict(results, own), results, own };

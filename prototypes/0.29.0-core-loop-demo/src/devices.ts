@@ -3811,7 +3811,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const waitOptions = waits.map((w) => `<option value="${w}"${w === s.waitSecs ? ' selected' : ''}>wait ${formatWait(w)}</option>`).join('');
       const warns: string[] = [];
       if (!cand) warns.push('Not on your station list any more: the route keeps its own copy of it.');
-      else if (cand.orbitSlot !== s.orbitSlot || cand.planetId !== s.planetId) warns.push('Its orbit changed since it was added: SAVE or START copies the new one.');
+      else if (cand.orbitSlot !== s.orbitSlot || cand.planetId !== s.planetId
+        || cand.orbit?.radiusKm !== s.orbit?.radiusKm || cand.orbit?.phase0 !== s.orbit?.phase0) warns.push('Its orbit changed since it was added: SAVE or START copies the new one.');
       if (!holdsPassFor(s.berth.roomId)) warns.push('You hold no pass for its berth room: another rider must dock the ferry there.');
       if (ci >= 0 && choices[ci].access === 'pass') warns.push('A granted-captains gate: it docks only with a granted rider aboard, else the ferry uses another gate.');
       const leg = draftLegAfter(d, i);

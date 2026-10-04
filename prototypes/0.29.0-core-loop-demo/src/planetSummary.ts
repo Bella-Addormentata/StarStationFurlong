@@ -51,10 +51,10 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { isNewerTrim, isOrbitTrim, setSharedTrimSource, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
-import { setStationTrimResolver } from './orbits';
-import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationInTransit } from './stations';
-import type { KnownPlace, StationBerthRecord, StationMove, StationRecord } from './stations';
+import { MAX_SUMMARY_CLAIMS, cleanMove, compareMoves, decidingClaimsOf, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
+import { isUsableOrbit, setStationTrimResolver } from './orbits';
+import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationLeftPlanet } from './stations';
+import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
@@ -117,6 +117,11 @@ export interface StationSummary {
    *  without this would place the station by its first record. Ranks below
    *  `move`. */
   stands?: StationMove;
+  /** 🎚️ The station's earlier moves some station's latest altitude claim
+   *  needs to stay lost (stationMove.decidingClaimsOf): `move` alone hides
+   *  the claim that beat it. Each ranks below `move`; at most
+   *  MAX_SUMMARY_CLAIMS. Additive: an older client's clean drops them. */
+  claims?: StationMove[];
   /** One reading per room (sorted by room, at most MAX_TRIM_GONE), so one
    *  helm room's take-back never forgets another's. */
   trimGone?: TrimGone[];
@@ -167,6 +172,12 @@ export interface ShipSummary {
   fromSlot?: number;
   toPlanetId?: string;
   toSlot?: number;
+  /** 🎚️ A copied stop's own orbit, when an altitude change left its
+   *  station off its slot's: the orbit the timetable priced the leg on.
+   *  Each stands only with the four fields above, and only in the planet's
+   *  band. Additive: an older client's clean drops them (it draws the slot). */
+  fromOrbit?: StationOrbit;
+  toOrbit?: StationOrbit;
   /** 🚏📋 A ferry on a route (build notes A9 item 7), so an all-gates board
    *  in a room its riders never publish to can still show it, "as of"
    *  updatedAt: the gate it is docked at (or bound for), its next stop's
@@ -226,7 +237,7 @@ export const SHIP_HEARTBEAT_MS = 3600 * 1000;
  *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
 export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
 const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
-const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
+const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move', 'orbit']);
 
 const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LEN;
 const isName = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_NAME_LEN;
@@ -353,7 +364,9 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
   const src = v as OrbitTrim & { from?: unknown; readAt?: unknown };
   const read = isId(src.from) && isStamp(src.readAt, now);
   return {
-    planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
+    planetId: v.planetId, slot: v.slot,
+    ...(v.base ? { base: { radiusKm: v.base.radiusKm, phase0: v.base.phase0 } } : {}),
+    dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
     ...(v.seq !== undefined ? { seq: v.seq } : {}),
     ...(v.place !== undefined ? { place: v.place } : {}),
     ...(v.seen !== undefined ? { seen: v.seen.map(([writer, place]): [number, number] => [writer, place]) } : {}),
@@ -437,6 +450,11 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // Only beside a move it ranks below: anything else says nothing more.
   if (out.move && isStationMove(v.stands) && isPlausibleMove(v.stands, now) && v.stands.welcomeRoomId === out.welcomeRoomId
     && compareMoves(v.stands, out.move) < 0) out.stands = cleanMove(v.stands);
+  const claims = out.move && Array.isArray(v.claims) && v.claims.length <= MAX_SUMMARY_CLAIMS
+    ? keptClaims(v.claims.filter((c): c is StationMove => isStationMove(c) && isPlausibleMove(c, now)
+      && c.welcomeRoomId === out.welcomeRoomId).map(cleanMove), out.move)
+    : undefined;
+  if (claims) out.claims = claims;
   const gone = cleanTrimGone(v.trimGone, now);
   if (gone) out.trimGone = gone;
   return canonOrder(out);
@@ -471,6 +489,11 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
     out.fromSlot = v.fromSlot;
     out.toPlanetId = v.toPlanetId;
     out.toSlot = v.toSlot;
+    const planet = planetById(v.fromPlanetId);
+    const fromOrbit = legOrbit(v.fromOrbit, planet);
+    const toOrbit = legOrbit(v.toOrbit, planet);
+    if (fromOrbit) out.fromOrbit = fromOrbit;
+    if (toOrbit) out.toOrbit = toOrbit;
   }
   // 🚏📋 The route fields each stand or drop alone: a bad one never costs
   // the ship its summary.
@@ -494,6 +517,15 @@ export interface LegEnd {
   id: string;
   planetId: string;
   orbitSlot: number;
+  /** 🎚️ The stop's own orbit, when not its slot's. */
+  orbit?: StationOrbit;
+}
+
+/** 🎚️ A peer-sent leg orbit, copied: just its two numbers, in the band. */
+function legOrbit(v: unknown, planet: ReturnType<typeof planetById>): StationOrbit | undefined {
+  if (!isPlainObject(v)) return undefined;
+  const o = { radiusKm: v.radiusKm as number, phase0: v.phase0 as number };
+  return isUsableOrbit(planet, o) ? o : undefined;
 }
 
 /** 🚚 A ferry's summary fields for the leg its ruling timetable flies: the
@@ -501,13 +533,17 @@ export interface LegEnd {
  *  answer). None outside a leg. */
 export function legEndFields(
   places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
-): Pick<ShipSummary, 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'> {
+): Pick<ShipSummary, 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot' | 'fromOrbit' | 'toOrbit'> {
   if (!places?.to) return {};
+  const { orbit: fromOrbit } = places.from;
+  const { orbit: toOrbit } = places.to;
   return {
     fromPlanetId: planetById(places.from.planetId).id,
     fromSlot: places.from.orbitSlot,
     toPlanetId: planetById(places.to.planetId).id,
     toSlot: places.to.orbitSlot,
+    ...(fromOrbit ? { fromOrbit: { radiusKm: fromOrbit.radiusKm, phase0: fromOrbit.phase0 } } : {}),
+    ...(toOrbit ? { toOrbit: { radiusKm: toOrbit.radiusKm, phase0: toOrbit.phase0 } } : {}),
   };
 }
 
@@ -522,9 +558,11 @@ export function routeLegEnds(
   places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
 ): [LegEnd, LegEnd] | null {
   if (!places?.to) return null;
+  // 🎚️ With a stop's own orbit, when the route copied one off its slot's.
+  const orbitOf = (o: StationOrbit | undefined) => (o ? { orbit: { radiusKm: o.radiusKm, phase0: o.phase0 } } : {});
   return [
-    { id: 'route-stop:from', planetId: planetById(places.from.planetId).id, orbitSlot: places.from.orbitSlot },
-    { id: 'route-stop:to', planetId: planetById(places.to.planetId).id, orbitSlot: places.to.orbitSlot },
+    { id: 'route-stop:from', planetId: planetById(places.from.planetId).id, orbitSlot: places.from.orbitSlot, ...orbitOf(places.from.orbit) },
+    { id: 'route-stop:to', planetId: planetById(places.to.planetId).id, orbitSlot: places.to.orbitSlot, ...orbitOf(places.to.orbit) },
   ];
 }
 
@@ -534,14 +572,14 @@ export function routeLegEnds(
  *  Null when the summary carries no copies, or names no rooms: the reader
  *  places the ends by its station list. */
 export function summaryLegEnds(
-  s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'>,
+  s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot' | 'fromOrbit' | 'toOrbit'>,
 ): [LegEnd, LegEnd] | null {
-  const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot } = s;
+  const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot, fromOrbit, toOrbit } = s;
   if (!fromRoom || !toRoom || fromPlanetId === undefined || fromSlot === undefined
     || toPlanetId === undefined || toSlot === undefined) return null;
   return routeLegEnds({
-    from: { planetId: fromPlanetId, orbitSlot: fromSlot },
-    to: { planetId: toPlanetId, orbitSlot: toSlot },
+    from: { planetId: fromPlanetId, orbitSlot: fromSlot, ...(fromOrbit ? { orbit: fromOrbit } : {}) },
+    to: { planetId: toPlanetId, orbitSlot: toSlot, ...(toOrbit ? { orbit: toOrbit } : {}) },
   });
 }
 
@@ -700,6 +738,19 @@ function newerBerths(a: StationSummary, b: StationSummary): Gates {
   return { berths: list, berthsAt, ...(rooms ? { berthRoomsAt: rooms } : {}) };
 }
 
+/** 🎚️ Deciding claims beside `move`: each ranks below it, once each,
+ *  newest first, capped (every client settles on the same list). */
+function keptClaims(list: StationMove[], move: StationMove): StationMove[] | undefined {
+  const seen = new Set<string>();
+  const out = list.filter((c) => {
+    const k = JSON.stringify(c);
+    if (seen.has(k) || compareMoves(c, move) >= 0) return false;
+    seen.add(k);
+    return true;
+  }).sort((x, y) => compareMoves(y, x) || (JSON.stringify(x) < JSON.stringify(y) ? -1 : 1)).slice(0, MAX_SUMMARY_CLAIMS);
+  return out.length > 0 ? out : undefined;
+}
+
 /** Merge an incoming station summary into a known one, and the newer trim.
  *  Which record stands: one its owner published (it carries `ownerId`) beats
  *  one nobody owns; between one install's records the newer wins, whatever
@@ -713,7 +764,7 @@ function newerBerths(a: StationSummary, b: StationSummary): Gates {
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary, now: number = Date.now()): StationSummary | null {
   if (!prior) return incoming;
   const recordOf = (s: StationSummary): string => JSON.stringify({
-    ...s, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, ownerAliases: undefined,
+    ...s, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, claims: undefined, ownerAliases: undefined,
     berths: undefined, berthsAt: undefined, berthRoomsAt: undefined,
   });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
@@ -753,6 +804,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
     (move && s.stands && JSON.stringify(s.move) === JSON.stringify(move) ? s.stands : undefined);
   const standsAt = newerMove(beside(prior), beside(incoming));
   const stands = move && standsAt && compareMoves(standsAt, move) < 0 ? standsAt : undefined;
+  const claims = move ? keptClaims([...(prior.claims ?? []), ...(incoming.claims ?? [])], move) : undefined;
   const planet = summaryPlanet({ planetId: base.planetId, move, stands }, now);
   const flown = stands ?? move;
   const leftFrom = flown && !flown.settles && now >= flown.arriveAt ? planetById(flown.fromPlanetId).id : null;
@@ -782,6 +834,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   if (aliases) next.ownerAliases = aliases; else delete next.ownerAliases;
   if (move) next.move = move; else delete next.move;
   if (stands) next.stands = stands; else delete next.stands;
+  if (claims) next.claims = claims; else delete next.claims;
   delete next.berths;
   delete next.berthsAt;
   delete next.berthRoomsAt;
@@ -805,7 +858,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
  *  compared, and settled between installs, by their JSON. */
 const SUMMARY_ORDER = [
   'welcomeRoomId', 'name', 'planetId', 'orbitSlot', 'updatedAt', 'berthDoor', 'ownerId', 'ownerAliases',
-  'berths', 'berthsAt', 'berthRoomsAt', 'ext', 'trim', 'move', 'stands', 'trimGone',
+  'berths', 'berthsAt', 'berthRoomsAt', 'ext', 'trim', 'move', 'stands', 'claims', 'trimGone',
 ] as const;
 
 function canonOrder(s: StationSummary): StationSummary {
@@ -1098,7 +1151,7 @@ export function foldOwnStation(
   // The owner id is per install: another install's identical record is the
   // same record, not news to republish over.
   const recordOnly = (a: StationSummary) => JSON.stringify({
-    ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, ownerAliases: undefined, berths: undefined, berthsAt: undefined, berthRoomsAt: undefined,
+    ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, claims: undefined, ownerAliases: undefined, berths: undefined, berthsAt: undefined, berthRoomsAt: undefined,
     updatedAt: 0, ownerId: undefined, ownerInstall: undefined,
   });
   const sameRecord = (a: StationSummary, b: StationSummary): boolean => recordOnly(a) === recordOnly(b);
@@ -1160,7 +1213,7 @@ export function foldOwnStation(
     gates = wholeList(past(0));
   }
   // (What stood beside the known move stays with it: mergeStation keeps it.)
-  const { trim: _unused, trimGone: _unusedGone, move: _unusedMove, stands: _unusedStands, berths: _b, berthsAt: _ba, berthRoomsAt: _bra, ...rest } = base;
+  const { trim: _unused, trimGone: _unusedGone, move: _unusedMove, stands: _unusedStands, claims: _unusedClaims, berths: _b, berthsAt: _ba, berthRoomsAt: _bra, ...rest } = base;
   // A new move freshens an owned summary's stamp too (an unowned record keeps
   // its first stamp; stationRecency counts its move instead), so the caps
   // never drop a station that just moved.
@@ -1244,11 +1297,12 @@ function admittedAt(planet: string, stations: Iterable<StationSummary>, listed: 
   // Between planets as this install's list has it, as settledPlanet goes
   // by the list (what it lists holds a slot or not by that), else by the
   // move the summary's station follows (summaryPlanet's).
-  const inTransit = (s: StationSummary) => stationInTransit(listedAt(s.welcomeRoomId) ?? { move: s.stands ?? s.move }, now);
+  // 🎚️ An altitude change keeps its slot: only leaving the planet frees it.
+  const inTransit = (s: StationSummary) => stationLeftPlanet(listedAt(s.welcomeRoomId) ?? { move: s.stands ?? s.move }, now);
   const ranked = here.filter((s) => !inTransit(s))
     .sort((a, b) => Number(b.ownerId !== undefined) - Number(a.ownerId !== undefined)
       || (a.welcomeRoomId < b.welcomeRoomId ? -1 : a.welcomeRoomId > b.welcomeRoomId ? 1 : 0));
-  const free = Math.max(0, MAX_ORBIT_SLOTS - own.filter((st) => !stationInTransit(st, now)).length);
+  const free = Math.max(0, MAX_ORBIT_SLOTS - own.filter((st) => !stationLeftPlanet(st, now)).length);
   return {
     admitted: new Set([...ranked.slice(0, free), ...here.filter(inTransit)].map((s) => s.welcomeRoomId)),
     displaced: new Set(ranked.slice(free).map((s) => s.welcomeRoomId)),
@@ -1553,6 +1607,10 @@ export function publishPlanetSummary(now = Date.now()): void {
     // beside it, so a reader that learns the rival still places it.
     const stands = next.move ? standingInsteadOf(next.move) : null;
     if (stands) next = mergeStation(next, { ...next, stands }, now) ?? next;
+    // 🎚️ And the earlier moves of its that keep another station's altitude
+    // claim lost, which that latest move alone hides.
+    const claims = decidingClaimsOf(k);
+    if (claims.length > 0) next = mergeStation(next, { ...next, claims }, now) ?? next;
     if (next !== known) store.stations[k] = next;
   }
   const ship = ctx.ship();
@@ -1644,6 +1702,7 @@ function applyLearned(store: Store): void {
   // Moves first: they decide which planet each station is listed at.
   for (const s of Object.values(store.stations)) {
     if (s.move) rememberMove(s.move);
+    for (const c of s.claims ?? []) rememberMove(c);
     if (!s.stands) continue;
     rememberMove(s.stands);
     // 🚚 …and that its latest did not stand where the summary was published

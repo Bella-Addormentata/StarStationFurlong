@@ -122,8 +122,10 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 import type { FlightRecord } from './shipDoc';
+import { isUsableOrbit } from './orbits';
 import { localStationId } from './stationDirectory';
-import { MAX_ORBIT_SLOTS } from './stations';
+import { MAX_ORBIT_SLOTS, planetById } from './stations';
+import type { StationOrbit } from './stations';
 
 // ── Stored shapes (A1, A9.6) ─────────────────────────────────────────────────
 
@@ -152,6 +154,9 @@ export interface RouteStop {
    *  station list. */
   planetId: string;
   orbitSlot: number;
+  /** 🎚️ Copied on save too: the station's altitude orbit, when it flies one
+   *  other than its slot's (stations.StationRecord.orbit). */
+  orbit?: StationOrbit;
   berth: RouteBerth;
   /** 30 to 600: the MINIMUM time at the berth. */
   waitSecs: number;
@@ -345,7 +350,19 @@ export function routeStopFromWire(v: unknown): RouteStop | null {
   if (!(typeof wait === 'number' && Number.isFinite(wait) && wait >= MIN_WAIT_SECS && wait <= MAX_WAIT_SECS)) return null;
   const berth = routeBerthFromWire(v.berth);
   if (!berth) return null;
-  return { stationId: v.stationId, name: v.name, planetId: v.planetId, orbitSlot: slot, berth, waitSecs: wait };
+  let orbit: StationOrbit | undefined;
+  if (v.orbit !== undefined) {
+    const o = v.orbit;
+    if (!(isPlainObject(o) && typeof o.radiusKm === 'number' && Number.isFinite(o.radiusKm) && o.radiusKm > 0
+      && typeof o.phase0 === 'number' && Number.isFinite(o.phase0) && Math.abs(o.phase0) <= 2 * Math.PI)) return null;
+    orbit = { radiusKm: o.radiusKm, phase0: o.phase0 };
+    // One the station could fly around that planet (orbits.baseOrbit): else
+    // the timetable would plan the slot's orbit and the keeper skip the stop.
+    if (!isUsableOrbit(planetById(v.planetId), orbit)) return null;
+  }
+  return {
+    stationId: v.stationId, name: v.name, planetId: v.planetId, orbitSlot: slot, ...(orbit ? { orbit } : {}), berth, waitSecs: wait,
+  };
 }
 
 /**
@@ -393,6 +410,7 @@ export function routeToWire(route: ShipRoute): Record<string, unknown> {
       name: s.name,
       planetId: s.planetId,
       orbitSlot: s.orbitSlot,
+      ...(s.orbit ? { orbit: { radiusKm: s.orbit.radiusKm, phase0: s.orbit.phase0 } } : {}),
       berth: {
         roomId: s.berth.roomId,
         farDoor: s.berth.farDoor,
