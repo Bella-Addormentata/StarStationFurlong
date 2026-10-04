@@ -81,6 +81,7 @@ import {
   subscribeDoors,
   readAllDoors,
   writeDoorPairing,
+  readPhysicalDoors,
   deleteDoorPairing,
   reapOrphanPairings,
   type DoorRecord,
@@ -89,6 +90,10 @@ import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./f
 import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
+// 🛰️ A helm bolted into a station flies the STATION (station keeping).
+import { steersStation } from "./stationKeeping";
+import { createStationHelmUI } from "./stationHelm";
+import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
 import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
@@ -5589,9 +5594,7 @@ export class World {
       // COMPUTER — the very DOCK / UNDOCK the door panel runs, so the two
       // surfaces can never disagree about a port.
       const ds = this.dockingSystem;
-      deviceFocus.beginFocus(
-        this.player,
-        device,
+      const shipFace = () =>
         createHelmUI(
           ds
             ? {
@@ -5602,8 +5605,17 @@ export class World {
                 dock: (doorId) => ds.redockPort(doorId),
               }
             : undefined,
-        ),
-      );
+        );
+      // 🛰️ A module bolted into a station by a gangway, or a station's own
+      // welcome room standing alone, steers the STATION: its helm opens the
+      // station keeping face (small trim stick) and keeps the ship face one
+      // tab away for fuel and the docking computer. Every helm opens through
+      // the station helm, so one opened on the ship face offers station
+      // keeping once its module comes to steer a station. The room's own
+      // doors count, each read past the doors' read cap, as DEPART reads them.
+      const bolted = () => steersStation(currentRoomId(), readPhysicalDoors());
+      const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

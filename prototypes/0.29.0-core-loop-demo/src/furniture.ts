@@ -73,6 +73,13 @@ import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
 import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } from "./doorLayoutDoc";
+// 🕹️ The helm's two sticks: the door pairings say ship or station, and the
+// station keeping record says when a burn leans the small one.
+import { readPhysicalDoors, subscribeDoors } from "./doorsDoc";
+import { readHelmFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
+import { subscribeSharedAtlas } from "./stationAtlas";
+import { currentRoomId, currentStation } from "./stations";
+import type { StationRecord } from "./stations";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 // 🧬 #165: the clone vat's tank dimensions live with the avatar's clearance
@@ -4069,7 +4076,7 @@ function buildEngineBlock(ctx: BuildCtx) {
   addLight(new THREE.PointLight(0xffd9a0, 0, 4), 0, 1.1, 0.9, 0.9);
 }
 
-function buildHelmConsole({ m, flat, place }: BuildCtx) {
+function buildHelmConsole({ m, flat, place, attach }: BuildCtx) {
   // Flight desk + angled dash + main screen + throttle + stick.
   place(
     new THREE.BoxGeometry(1.7, 0.1, 0.7),
@@ -4111,20 +4118,7 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
     0.2,
   );
   glowLine.rotation.x = -0.5;
-  place(
-    new THREE.CylinderGeometry(0.025, 0.025, 0.2, 8),
-    m(0xd4a84b, 0.45, 0.5),
-    -0.45,
-    0.86,
-    -0.05,
-  );
-  place(
-    new THREE.SphereGeometry(0.045, 10, 8),
-    m(0xff1744, 0.5, 0.3),
-    -0.45,
-    0.97,
-    -0.05,
-  );
+  buildHelmSticks(m, place, attach);
   place(
     new THREE.BoxGeometry(0.16, 0.05, 0.22),
     m(0x37474f, 0.5, 0.5),
@@ -4170,6 +4164,132 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
     Math.PI, // face −z, toward the pilot's stand-point
   );
   dockScreen.rotation.x = tilt;
+}
+
+/**
+ * 🕹️ The helm's sticks (owner request 2026-09-27: "ships could have more of a
+ * fighter jet style joystick, whereas the station could have a small one for
+ * fine orbital maintenance"). One console, two hands: a SHIP's helm flies with
+ * a fighter-style grip; a helm BOLTED INTO A STATION trims the orbit with a
+ * small stick instead (stationKeeping.ts). Both are built where the old thin
+ * stick stood; the room's door pairings pick which one shows, and a station
+ * burn — whoever fired it — leans the small stick the way it pushed.
+ */
+function buildHelmSticks(
+  m: BuildCtx["m"],
+  place: BuildCtx["place"],
+  attach: BuildCtx["attach"],
+): void {
+  const DESK_TOP = 0.77;
+  const STICK_X = -0.45;
+  const STICK_Z = -0.05;
+  const part = (
+    parent: THREE.Object3D,
+    geo: THREE.BufferGeometry,
+    mat: THREE.Material,
+    x: number,
+    y: number,
+    z: number,
+  ): THREE.Mesh => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    parent.add(mesh);
+    return mesh;
+  };
+
+  // Fighter grip: rubber boot, steel shaft, a grip canted away from the pilot
+  // (who stands on −z) with the trigger under the index finger on the far
+  // side, a hat switch and the red pickle button under the thumb.
+  const fighter = new THREE.Group();
+  fighter.position.set(STICK_X, DESK_TOP, STICK_Z);
+  part(fighter, new THREE.CylinderGeometry(0.05, 0.062, 0.035, 14), m(0x15191d, 0.95, 0.05), 0, 0.0175, 0);
+  part(fighter, new THREE.CylinderGeometry(0.013, 0.015, 0.07, 8), m(0x9aa4ad, 0.35, 0.8), 0, 0.07, 0);
+  const grip = new THREE.Group();
+  grip.position.set(0, 0.1, 0);
+  grip.rotation.x = 0.18;
+  fighter.add(grip);
+  part(grip, new THREE.BoxGeometry(0.048, 0.13, 0.056), m(0x263238, 0.75, 0.2), 0, 0.065, 0);
+  part(grip, new THREE.BoxGeometry(0.052, 0.022, 0.062), m(0x37474f, 0.6, 0.3), 0, 0.135, 0.004);
+  part(grip, new THREE.BoxGeometry(0.012, 0.03, 0.018), m(0x90a4ae, 0.4, 0.6), 0, 0.1, 0.035);
+  part(grip, new THREE.CylinderGeometry(0.009, 0.009, 0.012, 8), m(0xd4a84b, 0.45, 0.5), 0.012, 0.15, 0.004);
+  part(grip, new THREE.SphereGeometry(0.011, 10, 8), m(0xff1744, 0.5, 0.3, 0xff1744, 0.4), -0.013, 0.148, -0.006);
+  attach(fighter);
+
+  // Station trim stick: a short gimballed shaft with an amber knob, sunk in a
+  // gold bezel on a low base plate.
+  const trimStick = new THREE.Group();
+  trimStick.position.set(STICK_X, DESK_TOP, STICK_Z);
+  part(trimStick, new THREE.CylinderGeometry(0.06, 0.066, 0.014, 18), m(0x37474f, 0.5, 0.6), 0, 0.007, 0);
+  const bezel = part(trimStick, new THREE.TorusGeometry(0.036, 0.005, 6, 20), m(0xd4a84b, 0.45, 0.5), 0, 0.015, 0);
+  bezel.rotation.x = Math.PI / 2;
+  const gimbal = new THREE.Group();
+  gimbal.position.set(0, 0.016, 0);
+  trimStick.add(gimbal);
+  part(gimbal, new THREE.CylinderGeometry(0.006, 0.008, 0.06, 8), m(0x9aa4ad, 0.35, 0.8), 0, 0.03, 0);
+  part(gimbal, new THREE.SphereGeometry(0.02, 12, 10), m(0xffb300, 0.4, 0.2, 0xffb300, 0.3), 0, 0.066, 0);
+  attach(trimStick);
+
+  // Which hand: the room's own doors (and the atlas's word on their far
+  // ends), or its being a station's own welcome room, say ship or station.
+  // With it, the station this install places the room in: the stick leans
+  // only for a burn on its orbit (readHelmFiring), as the dashboard shows
+  // it. Both are read again on every door, atlas or station keeping change,
+  // as soon as the room changes (on the first join, main.ts names the room
+  // only after this console is built, and says nothing when it does), and
+  // once a second besides: a station record saved on this install
+  // (stations.registerStation) says nothing either.
+  const FACE_EVERY_S = 1;
+  let bolted = false;
+  let station: StationRecord | null = null;
+  let faceRoom = "";
+  let faceAge = 0;
+  const readFace = () => {
+    faceRoom = currentRoomId();
+    faceAge = 0;
+    bolted = steersStation(faceRoom, readPhysicalDoors());
+    fighter.visible = !bolted;
+    trimStick.visible = bolted;
+    station = currentStation();
+  };
+  readFace();
+
+  // A burn leans the small stick: RAISE pulls it back toward the pilot, LOWER
+  // pushes it away, AHEAD leans it to the pilot's right (−x), BACK to the left.
+  const LEAN = 0.38;
+  const lean = { x: 0, z: 0 };
+  const anim = {
+    update(dt: number): void {
+      faceAge += dt;
+      if (faceAge >= FACE_EVERY_S || currentRoomId() !== faceRoom) readFace();
+      let tx = 0;
+      let tz = 0;
+      // The burn firing now on this station's orbit, whatever order the log
+      // keeps (a peer's clock running ahead, or a newer burn on an orbit
+      // another install puts the room in, never hides this one), or another
+      // of the station's helm rooms' while the helm goes on from its trim.
+      const firing = bolted ? readHelmFiring(Date.now(), station) : null;
+      if (firing) {
+        if (firing.dir === "raise") tx = -LEAN;
+        else if (firing.dir === "lower") tx = LEAN;
+        else if (firing.dir === "ahead") tz = LEAN;
+        else tz = -LEAN;
+      }
+      const k = 1 - Math.exp(-dt * 14);
+      lean.x += (tx - lean.x) * k;
+      lean.z += (tz - lean.z) * k;
+      gimbal.rotation.set(lean.x, 0, lean.z);
+    },
+  };
+  // The cake's carrier rules: the drive handle rides a MESH (only meshes are
+  // filed), the doc subscriptions end through its dispose* hooks.
+  const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(0x1c262e, 1, 0), 0, 0.01, 0);
+  carrier.visible = false;
+  carrier.userData.propAnim = anim;
+  // The doors can move the room to another station too.
+  carrier.userData.disposeHelmFace = subscribeDoors(readFace);
+  // A far room's records arrive by gossip: one can make a door a berth.
+  carrier.userData.disposeHelmAtlas = subscribeSharedAtlas(readFace);
+  carrier.userData.disposeHelmTrim = subscribeStationKeeping(readFace);
 }
 
 /** ⚓ #163: the helm's docking-computer face — a round port glyph (the
