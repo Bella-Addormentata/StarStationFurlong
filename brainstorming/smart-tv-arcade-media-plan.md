@@ -73,7 +73,10 @@ the sources that fail have to say so on the screen.
   source: { kind: 'youtube', videoId }            // IFrame API: full sync
         | { kind: 'archive', identifier, file }   // their embed (start-time sync) or mp4 (full sync)
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
-        | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id, a BlobTicket's shape (blob lane, §4)
+        | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id AND its
+                         // dial hints — relay URLs and direct addresses, the RoomMemberHint shape of
+                         // network/protocol.ts — which is what a BlobTicket's provider is: an id alone
+                         // is nothing to dial once the importer's link is gone (blob lane, §4)
         | null,
   state: 'home' | 'scheduled' | 'playing' | 'paused',  // the PROGRAMME only: 'home' is on with nothing on. Power is
                          // not here — it is its own key (below), so the set has one source of truth
@@ -231,13 +234,22 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   is a 403 **before any DNS lookup or outbound connection**. Only then the
   host allowlist — and, because a loopback service that fetches URLs is an
   SSRF surface, the node resolves the name ITSELF and validates every
-  address the answer holds: an IPv4-mapped or IPv4-compatible IPv6 address
-  is normalized to the IPv4 it carries first, and then anything that is not
-  a global unicast address is refused — loopback, private, link-local, the
-  metadata address, unspecified, carrier-grade NAT, multicast, broadcast,
-  documentation and reserved ranges, IPv6 unique-local and link-local alike
-  (a denylist of a few classes is a list of what was remembered; the rule is
-  an allowlist of global unicast and nothing else) — and PINS the socket to
+  address the answer holds: an IPv6 address that carries an IPv4 inside is
+  normalized to that IPv4 first — IPv4-mapped and IPv4-compatible forms, and
+  any address under a NAT64 prefix: the well-known `64:ff9b::/96` and
+  `64:ff9b:1::/48`, and the network's own, learned the RFC 7050 way by
+  resolving `ipv4only.arpa` and reading the prefix off the AAAA answer
+  (`64:ff9b::a9fe:a9fe` is global unicast on paper and the metadata address
+  in fact) — and then anything that is not a global unicast address is
+  refused — loopback, private, link-local, the metadata address,
+  unspecified, carrier-grade NAT, multicast, broadcast, documentation and
+  reserved ranges, IPv6 unique-local and link-local alike (a denylist of a
+  few classes is a list of what was remembered; the rule is an allowlist of
+  global unicast and nothing else). Where the NAT64 discovery cannot run, or
+  its answer is not one the node trusts, IPv6 destinations are refused
+  outright, which costs nothing where IPv4 reaches the same host. The
+  classifier is a pure function with that table of cases as its tests — and
+  the node PINS the socket to
   a vetted address: it connects to the IP with the original name kept as
   `Host` and SNI, and the HTTP client never resolves the name again on
   connect — a rebinding resolver would answer the check with a public
@@ -299,11 +311,20 @@ carries it, so the hash alone authorizes nothing and without the gate any
 page that can reach loopback could drive reads against the viewer's node.
 A hash alone starts nothing: a fetch
 needs a provider, as an `iroh-blobs` `BlobTicket` carries one beside the
-hash and format. So the `blob` source (§3.1) and a library op (§7) carry the
-hash with the importing node's iroh id — the ticket's shape — and every node
-that completes the blob announces `have` for the hash on the room's control
-plane (a sibling of the `media-sub` kind), so a viewer resolves a hash to
-the connected nodes that hold it: the ticket's provider while it is still
+hash and format — and a provider is an ADDRESS, not a name: the ticket's
+`NodeAddr` is the node id with its relay URL and direct addresses, and an
+id alone is nothing to dial once the importer is no longer a connected
+member. So the `blob` source (§3.1) and a library op (§7) carry the hash
+with the importing node's iroh id and its dial hints in the shape the room
+already passes around for its members — `RoomMemberHint` in
+`network/protocol.ts`: `irohNodeId`, `irohRelayUrls`, `irohDirectAddrs` —
+and every node that completes the blob announces `have` for the hash on
+the room's control plane (a sibling of the `media-sub` kind) with its own
+current hints the same way; a connected member's hints are also in the
+room's member records, authenticated by the link they came over, and a
+library seeder's ride its signed library entry (§7), so the fall-back to a
+seeder nobody is connected to is a dial, not a guess. A viewer resolves a
+hash to the nodes that hold it: the ticket's provider while it is still
 here, else any announcing holder — a hub among them only when it chose to
 hold the blob, since `iroh-blobs` moves bytes from provider to requester
 directly and relaying for a spoke puts nothing in the hub's store: a hub
@@ -445,10 +466,17 @@ and forwards frames only to subscribed links. An entry is a lease scoped to
 the link that made it — renewed by that link, removed from every set when
 the link disconnects or stops renewing, so a dead tab never pins a sender on
 and frames are never sent into a dead link; a hub subscribes upstream for
-its spokes and keeps that subscription only while a live spoke of its own
-still wants the source, forwarding what it receives as the ciphertext it is
-— the media key reaches each spoke sealed from the sender, never from the
-hub (above). With no subscriber the sender's own node drops
+its spokes — ONE forwarding subscription per hub on the data plane, kept
+only while a live spoke of its own still wants the source — and relays each
+spoke's signed membership lease, and its departure, to the sender
+separately on the control plane: the aggregate says where frames go, the
+per-spoke leases say who may open them, because the sender above seals the
+key to each subscriber on admission and rotates on each departure, and a
+join or a leave behind an already-subscribed hub would otherwise reach it
+neither — the joiner waiting on a key that never comes, the leaver keeping
+one it should have lost. The hub forwards what it receives as the
+ciphertext it is — the media key reaches each spoke sealed from the sender,
+never from the hub (above). With no subscriber the sender's own node drops
 frames at the source AND tells its browser so, and the browser stops capturing and encoding
 until the first subscriber returns (restarting on a keyframe) — a node-side
 drop alone would leave the dominant CPU and battery cost in place. Tiers:
@@ -618,11 +646,18 @@ seat before any lane is mapped to a player. And every input after that is
 authenticated end to end too: the binding proves the lane was the player's
 once, and a node gone bad could emit ticks under it afterwards that P1
 could not tell from the player's. So the two pages derive a session key —
-X25519 between their identity-derived keys, bound to {room, epoch, lane
-id, both pubs} — and each kind-3 input carries a strictly increasing
-sequence number and a keyed-BLAKE3 MAC under that key; P1 drops any input
-whose MAC fails or whose sequence does not advance (thirteen bytes become
-about thirty; at 60 Hz that is nothing). Thirty bytes do not fit the tick
+X25519 between their identity-derived keys, bound by the KDF to {room,
+cabinet id, the seat's tenure nonce, epoch, lane id, both pubs}, where the
+tenure nonce is minted fresh by P1 as it grants the seat and carried in the
+seat record, so a renewed seat or another cabinet is another key even for
+the same two identities on the same lane in the same room epoch — and each
+kind-3 input carries a strictly increasing sequence number and a
+keyed-BLAKE3 MAC under that key over the whole canonical frame: sub-kind,
+sequence and payload, nothing an input says left outside it. P1 drops any
+input whose MAC fails or whose sequence does not advance, and an input
+captured in one session verifies in no other — a high sequence replayed
+from an earlier tenure cannot push a new session's inputs out (thirteen
+bytes become about thirty; at 60 Hz that is nothing). Thirty bytes do not fit the tick
 lane as it is: browser ingress takes exactly 13-byte datagrams, and the
 mesh relays only the 13-, 14- and 22-byte frames with a 13-byte tick inside
 (`ssf-p2p-node/src/main.rs`, the datagram arms) — everything else is
