@@ -951,6 +951,9 @@ export function stationGates(atlas: Record<string, AtlasEntry>, roomId: string):
  * The gate number a port newly fitted in `roomId` takes: the lowest one no
  * other gate of its station uses. The room's own live gates (`own`, from its
  * doorPolicy) stand in for its atlas entry, which may be a harvest behind.
+ * A room whose gates are not known lists none, and holds none to step over
+ * unless a flood hid some of its ports: a port fitted while its room's gates
+ * are not known stays unnumbered (doorPolicy.mayNumberNewPort).
  * Null when all MAX_GATE_NUMBER are taken.
  */
 export function freeGateNumber(
@@ -2046,11 +2049,13 @@ export function pushAtlasToDoc(): void {
         || (entry.dismantledAt !== undefined && (known.dismantledAt === undefined || laterTomb(entry, known))
           ? known.updatedAt > entry.lastSeen
           : known.updatedAt >= entry.lastSeen));
-      // ⚓🚦 A doc copy with no gates (an older client's, or a stub) gains the
-      // gates we know even when it is otherwise as new as ours: its own doors
-      // are kept, and only the gates are added. (Live copies only: a module
-      // taken apart has no gates to give or take.)
-      const onlyGates = !!known && !isOwn && entry.gates !== undefined && known.gates === undefined
+      // ⚓🚦 A doc copy with no gate state (an older client's, or a stub)
+      // gains what we know of the gates, a list or that they are not known,
+      // even when it is otherwise as new as ours: its own doors are kept, and
+      // only the gate state is added. (Live copies only: a module taken apart
+      // has no gates to give or take.)
+      const onlyGates = !!known && !isOwn && (entry.gates !== undefined || entry.gatesUnknown === true)
+        && known.gates === undefined
         && known.gatesUnknown !== true
         && entry.dismantledAt === undefined && known.dismantledAt === undefined
         && knownAsNew
