@@ -328,6 +328,17 @@ describe('guards', () => {
     expect(cleanShipSummary({ ...ship, seed: 'secret' }, T0)).not.toHaveProperty('seed');
   });
 
+  it('🕹️ keeps a ship flown by hand with its pose; a bad pose drops alone', () => {
+    const free = { planetId: SOV, at: T0, radiusKm: 7000, angle: 1, vAlong: 0.1, vRadial: 0, heading: 0.5 };
+    const ship = { roomId: 'room-ship', name: 'SKIFF', planetId: SOV, status: 'free-flight', free, updatedAt: T0 };
+    expect(cleanShipSummary(ship, T0)).toEqual(ship);
+    expect(cleanShipSummary({ ...ship, free: { ...free, vAlong: 99 } }, T0)).toEqual({ ...ship, free: undefined });
+    // A pose at another planet than the entry's is dropped.
+    expect(cleanShipSummary({ ...ship, free: { ...free, planetId: 'planet-aris' } }, T0)).toEqual({ ...ship, free: undefined });
+    // Only free flight carries one.
+    expect(cleanShipSummary({ ...ship, status: 'docked' }, T0)).not.toHaveProperty('free');
+  });
+
   it('keeps a route ferry\'s gate, next stop, departure and status; a bad one drops alone', () => {
     const ship = {
       roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'docked', fromRoom: 'a',
