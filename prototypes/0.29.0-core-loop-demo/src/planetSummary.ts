@@ -61,10 +61,10 @@ import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, Station
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
 /** A trim as it travels: the burn's orbit numbers, with how many burns its
- *  line has had, its place and its writers (OrbitTrim.seq, place and seen),
- *  so another of the station's helm rooms can go on from it
- *  (stationKeeping.readSharedTrim) and trims rank alike everywhere
- *  (newerTrim). `from` is the room
+ *  line has had, its place, its writers and their floor (OrbitTrim.seq,
+ *  place, seen and seenFloor), so another of the station's helm rooms can
+ *  go on from it (stationKeeping.readSharedTrim) and trims rank alike
+ *  everywhere (newerTrim). `from` is the room
  *  whose station-keeping log it was read from and `readAt` when a client
  *  standing there last read it: between two readings of one room the later
  *  reading wins, whatever its burn time, so a trim that room took back (a
@@ -376,6 +376,7 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
     ...(v.seq !== undefined ? { seq: v.seq } : {}),
     ...(v.place !== undefined ? { place: v.place } : {}),
     ...(v.seen !== undefined ? { seen: v.seen.map(([writer, place]): [number, number] => [writer, place]) } : {}),
+    ...(v.seenFloor !== undefined ? { seenFloor: v.seenFloor } : {}),
     ...(read ? { from: src.from as string, readAt: src.readAt as number } : {}),
   };
 }

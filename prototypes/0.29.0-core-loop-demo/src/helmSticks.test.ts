@@ -29,8 +29,9 @@ const FIGHTER = 0xff1744;
 const TRIM_STICK = 0xffb300;
 
 /** A trim's orbit, count and place, as applyBurn gives them: without the
- *  writers a room's log replay names (OrbitTrim.seen). */
-const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined } : t);
+ *  writers a room's log replay names, or their floor (OrbitTrim.seen,
+ *  seenFloor). */
+const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined, seenFloor: undefined } : t);
 
 /** A canvas whose 2-D context draws nothing: the docking screen paints through one. */
 function fakeCanvas() {
