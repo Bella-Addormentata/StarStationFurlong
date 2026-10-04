@@ -104,8 +104,9 @@ const ctx = (over: Partial<TrimContext> = {}): TrimContext => ({
 });
 
 /** A trim's orbit, count and place, as applyBurn and replayBurns give them:
- *  without the writers a room's log replay names (OrbitTrim.seen). */
-const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined } : t);
+ *  without the writers a room's log replay names, or their floor
+ *  (OrbitTrim.seen, seenFloor). */
+const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined, seenFloor: undefined } : t);
 
 /** The writers a trim's line holds (OrbitTrim.seen), as a trim lists them:
  *  each tab's client and the latest place of its burns, in client order. */
@@ -2013,7 +2014,8 @@ describe('a station with several helm rooms: the shared trim', () => {
 
   it('a trim names at most the latest sixteen writers its line holds, each well-formed', () => {
     // A carried trim already naming sixteen writers: the burn that goes on
-    // from it names its own writer, and the earliest of the sixteen goes.
+    // from it names its own writer, and the earliest of the sixteen folds
+    // into the floor.
     const many = Array.from({ length: 16 }, (_, i): [number, number] => [1000 + i, T0 - HOUR + i]);
     const shared = trim({ dRadiusKm: TRIM_STEP_KM, at: T0 - HOUR + 15, seq: 16, seen: many });
     expect(isOrbitTrim(shared)).toBe(true);
@@ -2023,12 +2025,127 @@ describe('a station with several helm rooms: the shared trim', () => {
     writeFuelLevel(10, 100);
     const next = pressShared('ahead', T0);
     expect(readOrbitTrim(STATION)?.seen).toEqual([...many.slice(1), [doc.clientID, next.at]].sort((x, y) => x[0] - y[0]));
+    expect(readOrbitTrim(STATION)?.seenFloor).toBe(T0 - HOUR);
     // The guard takes at most sixteen, each a client id and a place.
-    expect(isOrbitTrim({ ...shared, seen: [...many, [2000, T0]] })).toBe(false);
+    expect(isOrbitTrim({ ...shared, seen: [...many.slice(1), [2000, shared.at]] })).toBe(true);
+    expect(isOrbitTrim({ ...shared, seen: [...many, [2000, shared.at]] })).toBe(false);
     for (const entry of [[-1, T0], [1.5, T0], [2 ** 32, T0], [7, T0 - 100 * 365 * 24 * HOUR], [7, Number.MAX_SAFE_INTEGER], [7], [7, String(T0)], 'x']) {
       expect(isOrbitTrim({ ...shared, seen: [entry] })).toBe(false);
     }
     expect(isOrbitTrim({ ...shared, seen: 'x' })).toBe(false);
+  });
+
+  /** Copilot's order past the sixteen writers a trim names: room A's RAISE,
+   *  fifteen other rooms' AHEADs, each going on from the last, then LOWER
+   *  from a tab of room A that never got the RAISE, which REFUELs before it
+   *  does (`refuel`). Room A's other two tabs are synced up to the RAISE. */
+  function pastSixteenWriters(refuel: () => void) {
+    const a = new Y.Doc();
+    bindRoom(a);
+    writeFuelLevel(50, 100);
+    const [a2, u, v] = [new Y.Doc(), new Y.Doc(), new Y.Doc()];
+    for (const tab of [a2, u, v]) sync(a, tab);
+    const raise = pressShared('raise', T0);
+    let shared = readOrbitTrim(STATION)!;
+    setSharedTrimSource(() => shared);
+    for (let i = 1; i <= 15; i++) {
+      bindRoom(new Y.Doc());
+      writeFuelLevel(50, 100);
+      pressShared('ahead', T0 + i * BURN_MS);
+      shared = readOrbitTrim(STATION)!;
+    }
+    expect(shared.seen).toHaveLength(16);
+    expect(shared.seenFloor).toBeUndefined();
+    bindRoom(a2);
+    const lower = pressShared('lower', T0 + 16 * BURN_MS);
+    // Seventeen writers: room A's RAISE, the earliest, folds into the floor.
+    const line = readOrbitTrim(STATION)!;
+    expect(line).toMatchObject({ dRadiusKm: 0, seq: 17, seenFloor: raise.at });
+    expect(line.seen).toHaveLength(16);
+    expect(line.seen?.some(([writer]) => writer === a.clientID)).toBe(false);
+    expect(line.seen?.some(([writer]) => writer === a2.clientID)).toBe(true);
+    refuel();
+    const settled = (readFuelSettlement(SK) as KeepingSettlement).trim!;
+    expect(settled).toMatchObject({ dRadiusKm: 0, seq: 17, seenFloor: raise.at });
+    return { a, a2, u, v, raise, lower, settled };
+  }
+
+  it('a line past sixteen writers folds the ones it forgets into its floor, so a REFUEL before sync lands a burn it held once', () => {
+    // Copilot's review of #173: the burn that took a seventeenth writer onto
+    // the line forgot room A's, so once the RAISE reached the tab that had
+    // REFUELed it landed again on the settled trim: a step high, eighteen
+    // burns along, and ahead of every room's trim.
+    const { a, a2, u, v, raise, lower, settled } = pastSixteenWriters(() => writeFuelLevel(readFuelLevel(), 100));
+    expect(settled).toEqual(readOrbitTrim(STATION));
+    sync(a, a2);
+    for (const doc of [a2, a]) {
+      bindRoom(doc);
+      expect(readOrbitTrim(STATION)).toEqual(settled);
+      expect(readFuelDrawn()).toBe(2 * TRIM_FUEL);
+    }
+    // The tab that REFUELed goes on from its line: a writer it names adds
+    // nothing, and the floor stays.
+    bindRoom(a2);
+    const next = press('raise', lower.at + BURN_MS);
+    expect(readOrbitTrim(STATION)).toMatchObject({ dRadiusKm: TRIM_STEP_KM, seq: 18, seenFloor: raise.at });
+    expect(readOrbitTrim(STATION)?.seen).toHaveLength(16);
+    // Room A's two tabs offline since before the RAISE each burned since: an
+    // independent late burn placed at or before the floor pays and fires
+    // without moving the orbit, since the line cannot tell it from a
+    // forgotten writer's; one placed after it lands, at the settled line's
+    // time, ahead of the press made after the REFUEL.
+    bindRoom(u);
+    press('back', raise.at - BURN_MS);
+    bindRoom(v);
+    const back = press('back', raise.at + BURN_MS / 5);
+    sync(a2, u);
+    bindRoom(a2);
+    const kept = readOrbitTrim(STATION)!;
+    expect(kept).toMatchObject({ dRadiusKm: TRIM_STEP_KM, last: 'raise', seq: 18, at: next.at });
+    expect(orbitOf(kept)).toEqual(orbitOf({ ...applyBurn(settled, next)!, place: undefined }));
+    expect(readFuelDrawn()).toBe(4 * TRIM_FUEL);
+    sync(a2, v);
+    const landed = readOrbitTrim(STATION)!;
+    expect(landed).toMatchObject({ dRadiusKm: TRIM_STEP_KM, last: 'raise', seq: 19, at: next.at });
+    expect(landed.dPhase).toBeCloseTo(applyBurn(applyBurn(settled, { ...back, at: settled.at })!, next)!.dPhase, 12);
+    expect(landed.dPhase).not.toBeCloseTo(kept.dPhase, 6);
+    // Its writer, placed before every writer the line names, folds straight
+    // into the floor.
+    expect(landed.seenFloor).toBe(back.at);
+    expect(readFuelDrawn()).toBe(5 * TRIM_FUEL);
+  });
+
+  it('a line past sixteen writers keeps its floor through a REFUEL re-dated to the write', () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const { a, a2, raise, lower, settled } = pastSixteenWriters(() => {
+        vi.setSystemTime(T0 + 16 * BURN_MS - 1_000);
+        writeFuelLevel(readFuelLevel(), 100);
+      });
+      expect(settled).toMatchObject({ at: lower.at - 1_000, place: lower.at, seenFloor: raise.at });
+      sync(a, a2);
+      for (const doc of [a2, a]) {
+        bindRoom(doc);
+        expect(readOrbitTrim(STATION)).toEqual(settled);
+        expect(readFuelDrawn()).toBe(2 * TRIM_FUEL);
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a trim keeps its floor, and names its writers, only at or before its own place', () => {
+    const t = trim({ at: T0, seq: 17, place: T0 + 5, seen: [[7, T0 + 5]], seenFloor: T0 + 1 });
+    expect(isOrbitTrim(t)).toBe(true);
+    expect(isOrbitTrim({ ...t, seenFloor: T0 + 5 })).toBe(true);
+    for (const seenFloor of [T0 + 6, ORBIT_EPOCH_MS - 1, Number.NaN, Number.POSITIVE_INFINITY, String(T0), null]) {
+      expect(isOrbitTrim({ ...t, seenFloor })).toBe(false);
+    }
+    expect(isOrbitTrim({ ...t, seen: [[7, T0 + 6]] })).toBe(false);
+    // With no place, its time bounds both.
+    expect(isOrbitTrim({ ...t, place: undefined, seen: [[7, T0]], seenFloor: T0 })).toBe(true);
+    expect(isOrbitTrim({ ...t, place: undefined, seen: [[7, T0]], seenFloor: T0 + 1 })).toBe(false);
+    expect(isOrbitTrim({ ...t, place: undefined, seen: [[7, T0 + 1]], seenFloor: T0 })).toBe(false);
   });
 
   it('a line placed at its bound still moves for each burn of a writer it holds', () => {
