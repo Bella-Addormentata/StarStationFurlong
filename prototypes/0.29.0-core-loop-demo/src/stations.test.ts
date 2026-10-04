@@ -275,9 +275,15 @@ describe('listStations', () => {
       expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 2 });
       // …and gone, it holds none: room-a has its own.
       expect(slots(now + 3_600_001)).toMatchObject({ 'room-a': 1 });
-      // Two waiting for one slot go by the global order, as any clash.
+      // Two waiting to leave one slot (booked by installs that had not heard
+      // of each other) share it until they leave, and are listed leaving it:
+      // neither waits anywhere its move does not leave from.
       moves.set('room-a', away('room-a'));
-      expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 2, 'room-a': 1 });
+      expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 1 });
+      expect(slots(now + 3_600_001)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 1 });
+      // A station that is not leaving still gives way to them.
+      expect(Object.fromEntries(listStations({}, [at('room-b', 1), at('room-a', 1), at('room-c', 1)], now)
+        .map((st) => [st.id, st.orbitSlot]))).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 1, 'room-c': 2 });
     } finally {
       setStationMoveResolver(null);
     }

@@ -2220,12 +2220,21 @@ export function clearShipArrivalNote(): void {
 /** Bumped on every room join (clearShipArrivalNote). */
 let arrivalNoteRoom = 0;
 
-/** 🚚 A DEPART waiting for its docks to let go, whichever helm started it:
- *  one at a time. Every open helm redraws when it ends (redrawHelms): the
- *  one that started it may have closed meanwhile, and another opened. A
- *  helm in another tab or install waits for it too, by its shared hold
- *  (shipDoc.CastOffHold). */
-let castingOff = false;
+/** 🚚 A DEPART waiting for its docks to let go, whichever helm started it
+ *  (`by`: its cast-off token), and the room join it began in (`room`:
+ *  arrivalNoteRoom): one at a time. Every open helm redraws when it ends
+ *  (redrawHelms): the one that started it may have closed meanwhile, and
+ *  another opened. A helm in another tab or install waits for it too, by
+ *  its shared hold (shipDoc.CastOffHold). One the player walked away from
+ *  writes nothing more, however long its far rooms take to answer, so it
+ *  holds no helm of the room joined since (castingOffHere); and its end
+ *  clears only itself, never a DEPART begun there meanwhile. */
+let castingOff: { by: string; room: number } | null = null;
+
+/** Is a DEPART begun since the last room join still casting off? */
+function castingOffHere(): boolean {
+  return castingOff !== null && castingOff.room === arrivalNoteRoom;
+}
 
 /** How long a DEPART waits, once it has taken the cast-off hold, for a hold
  *  another helm took at the same moment to arrive: the doc keeps one of the
@@ -2498,9 +2507,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // A tug towing a station holds on: it is the station's engine.
       const towingNow = isTowing(currentRoomId(), now);
       // 🚚 Another helm casting this ship off holds DEPART until it ends
-      // (this one's own cast-off is castingOff).
-      const heldElsewhere = !castingOff && readCastOffHold(now) !== null;
-      const btnEnabled = refusal.ok && pickerDest !== null && !towingNow && !castingOff && !heldElsewhere;
+      // (this one's own cast-off is castingOffHere).
+      const castingHere = castingOffHere();
+      const heldElsewhere = !castingHere && readCastOffHold(now) !== null;
+      const btnEnabled = refusal.ok && pickerDest !== null && !towingNow && !castingHere && !heldElsewhere;
       const btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
       const castOff = docked.length + enumerateTransientBerths().filter((id) => !docked.some((p) => p.doorId === id)).length;
       const castOffNote = castOff > 0
@@ -2621,7 +2631,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       refuelArmed = false;
     });
     panel.querySelector<HTMLButtonElement>('#helm-depart-btn')?.addEventListener('click', () => {
-      if (castingOff) return;
+      if (castingOffHere()) return;
       // 🚚 Nor while another helm casts this ship off (in another tab, or
       // another install aboard): a dock it let go of may yet be put back.
       if (readCastOffHold()) { render(); return; }
@@ -2678,7 +2688,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const renewal = setInterval(() => { renewCastOff(by); }, CAST_OFF_RENEW_MS);
       const room = arrivalNoteRoom;
       const releaseAllowed = docking?.releaseAllowed;
-      castingOff = true;
+      castingOff = { by, room };
       setArrivalNote({ tone: 'ok', text: 'Casting off — waiting for every dock to let go…' });
       void (async () => {
         try {
@@ -2773,7 +2783,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           setArrivalNote(null);
         } finally {
           clearInterval(renewal);
-          castingOff = false;
+          if (castingOff?.by === by) castingOff = null;
           releaseCastOff(by);
           redrawHelms();
         }

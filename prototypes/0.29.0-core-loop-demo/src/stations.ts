@@ -687,16 +687,23 @@ function placeStations(
   for (const i of rest.filter(inTransit)) settle(i, wantOf[i].planetId, wantOf[i].orbitSlot);
   // 🚚 A station waiting for its launch window keeps the slot its move
   // leaves from: the move was priced from that orbit (its fuel, its course),
-  // and is drawn leaving it. It takes that slot before the other stayers, so
-  // a clash found meanwhile moves the other station; two waiting for one
-  // slot go by the global order, the loser with the clash losers below.
+  // and is drawn leaving it, then listed leaving it. It takes that slot
+  // before the other stayers, so a clash found meanwhile moves the other
+  // station. Two waiting to leave one slot (booked by installs that had not
+  // heard of each other) share it until each has left, as an arrival with
+  // nowhere else to go shares one: neither waits anywhere its move does not
+  // leave from.
   const waiting = (i: number) => {
     const m = candidates[i].move;
     return !!m && nowMs < m.departAt && reservesSlot(m, nowMs);
   };
   const kept = new Set<number>();
   for (const i of rest.filter((j) => !inTransit(j) && waiting(j)).sort(globalOrder)) {
-    if (takeOwn(wantOf[i].planetId, wantOf[i].orbitSlot)) { settle(i, wantOf[i].planetId, wantOf[i].orbitSlot); kept.add(i); }
+    const { planetId, orbitSlot } = wantOf[i];
+    if (!Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) continue;
+    takeOwn(planetId, orbitSlot);
+    settle(i, planetId, orbitSlot);
+    kept.add(i);
   }
   const stay = (i: number) => !inTransit(i) && !kept.has(i);
   for (const group of [rest.filter((i) => i < firstDerived && stay(i)), rest.filter((i) => i >= firstDerived && stay(i))]) {
