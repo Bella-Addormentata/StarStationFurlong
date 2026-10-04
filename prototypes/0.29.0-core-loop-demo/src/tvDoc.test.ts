@@ -565,6 +565,55 @@ describe('the programme', () => {
     bindTvDoc(doc);
   });
 
+  it('a sample from before this page slept is stale — shown, never acted on — until a fresh one lands after the wake window', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    markTvPageAwake(now); // the room tick, as World runs it
+    tvHeartbeat(TV, 10_000);
+    tick(500);
+    markTvPageAwake(now);
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 10_500 });
+    expect(readPlayback(TV).stale).toBeUndefined();
+    tick(3_600_000); // the lid closed for an hour; the monotonic clock ran on
+    markTvPageAwake(now); // the first tick back finds the gap
+    const woke = readPlayback(TV);
+    expect(woke.positionMs).toBe(10_000 + 3_600_500); // the sleep, extrapolated…
+    expect(woke.stale).toBe(true); // …and known for what it is
+    // A heartbeat the network held through the sleep — another page's: the
+    // remote lapsed from this one and was taken over — lands in the moment
+    // after waking: stamped from before the gap, stale with the rest.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const beatFrom = (positionMs: number) => {
+      const rec = readProgramme(TV);
+      other.getMap('tv').set(tvKey(TV), { ...rec, positionMs, seq: rec.seq + 1 });
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(other));
+    };
+    tick(200);
+    markTvPageAwake(now);
+    beatFrom(12_000);
+    expect(readPlayback(TV).stale).toBe(true);
+    // Past the wake window, the holder's next heartbeat is a fresh anchor.
+    tick(1_000);
+    markTvPageAwake(now);
+    beatFrom(13_000);
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 13_000 });
+    expect(readPlayback(TV).stale).toBeUndefined();
+    tick(500);
+    expect(readPlayback(TV).positionMs).toBe(13_500);
+    // This page's own write is received as it is written, whatever the
+    // marks say: a holder waking and beating is never stale to itself.
+    tick(3_600_000);
+    markTvPageAwake(now);
+    expect(readPlayback(TV).stale).toBe(true);
+    tick(100);
+    markTvPageAwake(now);
+    pickUpRemote(TV); // lapsed by this page's own watch: taken up again, like anyone
+    expect(tvHeartbeat(TV, 20_000)).toEqual({ ok: true });
+    expect(readPlayback(TV)).toMatchObject({ positionMs: 20_000 });
+    expect(readPlayback(TV).stale).toBeUndefined();
+  });
+
   it('a volume press on one device never carries a stale programme over a seek on another', () => {
     // Two pages with a doc each, syncing afterwards: Alice (the holder)
     // seeks while Bob turns the sound down. The volume has a key of its own,

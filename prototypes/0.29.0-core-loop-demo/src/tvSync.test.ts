@@ -913,3 +913,24 @@ describe('a scheduled start, for the holder', () => {
     expect(h.beats).toEqual([3_000]);
   });
 });
+
+describe('a reading from before this page slept', () => {
+  it('is never seeked or nudged to by a viewer; a fresh one is, once', () => {
+    const p = new FakePlayer(true);
+    const h = harness(p);
+    p.position = 10_000;
+    h.set({ positionMs: 10_000 });
+    h.tick();
+    expect(p.log).toEqual(['play']);
+    // Back from an hour's sleep: the record reads an hour ahead, and says so.
+    h.set({ positionMs: 10_000 + 3_600_000, stale: true });
+    h.tick(3_600_000);
+    h.tick();
+    expect(p.log).toEqual(['play']); // no seek, no nudge
+    expect(p.rate).toBe(1);
+    // The holder's next heartbeat: where the room is, fresh.
+    h.set({ positionMs: 42_000, stale: false });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log).toEqual(['play', 'seek:42000']);
+  });
+});

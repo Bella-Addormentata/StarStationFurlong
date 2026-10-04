@@ -256,10 +256,18 @@ export const TV_WAKE_WINDOW_MS = 1_000;
 let awakeAt = -Infinity;
 let preGapAwake = -Infinity;
 let wakeWindowUntil = -Infinity;
+/** When this page last found a gap in its marks (the moment it woke): a
+ *  playback sample stamped from before it is STALE (readPlayback). The
+ *  monotonic clock is no promise across a sleep — `performance.now()` may
+ *  run on through OS sleep, and on Windows does — so a sample from before
+ *  the gap extrapolates the whole sleep ahead of the room; it is shown,
+ *  never acted on, until a fresh sample lands after the wake window. */
+let lastGapAt = -Infinity;
 export function markTvPageAwake(now = clock()): void {
   if (awakeAt !== -Infinity && now - awakeAt > TV_SUSPEND_GAP_MS) {
     preGapAwake = awakeAt;
     wakeWindowUntil = now + TV_WAKE_WINDOW_MS;
+    lastGapAt = now;
   }
   awakeAt = now;
 }
@@ -300,13 +308,19 @@ function docAlive(): boolean {
  *  arrival of every remote: lease. Runs inside the observer so `receivedAt`
  *  (and a lease's `at`) is the moment the update applied HERE — a lease is
  *  "seen" when it lands, not when something first asks about it. */
-function noteSamples(keys: Iterable<string>): void {
+function noteSamples(keys: Iterable<string>, local = false): void {
   if (!tvMap) return;
   const now = clock();
+  // What this page wrote itself — its own lease, its own heartbeat — is
+  // received the moment it is written, whatever the awake marks say; what
+  // the network delivers is stamped from before the gap when it lands in
+  // the moment after waking (receiptStamp), since the network may have
+  // held it through the sleep.
+  const stamp = local ? now : receiptStamp(now);
   for (const key of keys) {
     if (key.startsWith('remote:')) {
       const itemId = key.slice(7);
-      seeLease(itemId, readRemote(itemId), receiptStamp(now));
+      seeLease(itemId, readRemote(itemId), stamp);
       continue;
     }
     if (key.startsWith('power:')) {
@@ -322,7 +336,7 @@ function noteSamples(keys: Iterable<string>): void {
       powerSeen.set(itemId, power.seq);
       const rec = readProgramme(itemId);
       if (power.on && power.parkMs > 0 && rec.state === 'playing') {
-        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: now });
+        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: stamp });
       }
       continue;
     }
@@ -331,7 +345,10 @@ function noteSamples(keys: Iterable<string>): void {
     const rec = readProgramme(itemId);
     const prev = samples.get(itemId);
     if (!prev || prev.seq !== rec.seq) {
-      samples.set(itemId, { seq: rec.seq, positionMs: rec.positionMs, receivedAt: now });
+      // A sample the network held through a sleep and delivers on waking
+      // is stamped from before the gap (`stamp`), and stale with the rest
+      // (readPlayback): not a fresh anchor this page can act on.
+      samples.set(itemId, { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp });
     }
   }
 }
@@ -346,8 +363,9 @@ export function bindTvDoc(doc: Y.Doc): void {
   awakeAt = -Infinity; // a fresh doc: the room tick marks the waking anew
   preGapAwake = -Infinity;
   wakeWindowUntil = -Infinity;
+  lastGapAt = -Infinity;
   tvMap.observe((event) => {
-    noteSamples(event.keysChanged);
+    noteSamples(event.keysChanged, event.transaction.local);
     notify(event.keysChanged);
   });
   // A fresh doc's existing records are samples too (a late joiner's first
@@ -898,6 +916,11 @@ export interface PlaybackNow {
   running: boolean;
   /** 'scheduled': ms until T0 (≥ 0). */
   countdownMs: number;
+  /** 'playing' from a sample this page received before it last slept
+   *  (markTvPageAwake): the position is the sleep ahead of the room, or
+   *  may be — shown, never seeked or nudged to, until a fresh sample
+   *  lands (the holder's next heartbeat, 3 s at most). */
+  stale?: boolean;
 }
 
 /** The sample this page anchored the holder's last position to, or null
@@ -953,6 +976,9 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
     const positionMs = sample ? expectedPositionMs(sample, now, rttMs) : rec.positionMs;
+    // A sample from before this page's last sleep (markTvPageAwake): the
+    // reading is shown and never acted on, until a fresh one lands.
+    if (sample && sample.receivedAt < lastGapAt) return { state: 'playing', positionMs, running: true, countdownMs: 0, stale: true };
     return { state: 'playing', positionMs, running: true, countdownMs: 0 };
   }
   if (rec.state === 'paused') return { state: 'paused', positionMs: rec.positionMs, running: false, countdownMs: 0 };
