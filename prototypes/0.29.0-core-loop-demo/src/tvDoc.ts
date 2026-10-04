@@ -794,8 +794,13 @@ export function readSample(itemId: string): { positionMs: number; receivedAt: nu
  *  must not drag the whole room off by seconds. */
 export const TV_RTT_LEAD_CAP_MS = 1_000;
 
-/** Position implied by a sample at `now`, plus half the measured round trip
- *  when the caller knows it (the sample is a transit old when it lands). A
+/** Position implied by a sample at `now`, plus half the round trip to this
+ *  page's own node when the caller knows it: the LAST hop of the sample's
+ *  path, the only one this page can measure (loopback on a desktop build,
+ *  worth nothing). The hops before it — the holder's page to its node, the
+ *  mesh to ours — are a standing delivery delay that anchoring at receipt
+ *  keeps in every sample: a viewer sits behind the holder by that delay,
+ *  which no heartbeat corrects and none grows. A
  *  round trip that is not a finite number adds nothing: NetworkProvider
  *  reports NaN until its first pong, and NaN here would poison every drift
  *  decision downstream. */
