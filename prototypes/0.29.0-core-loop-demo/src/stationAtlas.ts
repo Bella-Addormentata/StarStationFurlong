@@ -247,7 +247,7 @@ const MAX_RAW_DOORS_PER_ENTRY = 4 * MAX_DOORS_PER_ENTRY;
  *  clock and a browser mesh has no NTP guarantee, so this must cover honest
  *  skew — but whatever slack it allows is the head start an attacker keeps.
  *  Matches the venture-record bound in ventures.ts (#143). */
-const MAX_GOSSIP_SKEW_MS = 6 * 60 * 60 * 1000;
+export const MAX_GOSSIP_SKEW_MS = 6 * 60 * 60 * 1000;
 
 export function roomIdFromSeed(seed: string): string {
   // REAL pass format (decodeBootstrapSeed): base64(JSON{ roomId, wtUrl, … }),

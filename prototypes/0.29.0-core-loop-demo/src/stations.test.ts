@@ -4,12 +4,13 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { AtlasEntry } from './stationAtlas';
-import { atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
+import { MAX_GOSSIP_SKEW_MS, atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
 import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
   MAX_ORBIT_SLOTS,
+  MAX_ROOM_STAMPS,
   currentStation,
   dockedStationFor,
   isStationRoom,
@@ -26,6 +27,7 @@ import {
   stationForRoom,
   stationRoomCause,
   stationsAroundPlanet,
+  summaryGates,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
 import { SolarSystemMap, screenOffset, stationBodies } from './map';
@@ -490,6 +492,27 @@ describe('stationForRoom / planetForRoom', () => {
     })).toBe(true);
     expect(stationForRoom('b9', atlas)).toBeNull();
     expect(dockedStationFor('ship', [dock], atlas)).toBeNull();
+  });
+
+  it('takes a summary\'s gate list only beside a good stamp and room stamps no larger than any list carries', () => {
+    const t0 = ORBIT_EPOCH_MS + 1_000_000;
+    const gate = { roomId: 'b9', doorId: 'd:gate', gate: 2 };
+    expect(summaryGates({ berths: [gate], berthsAt: t0 }, t0)).toEqual({ berths: [gate], berthsAt: t0 });
+    // An empty list is news (the station's last gate went); one of junk is not.
+    expect(summaryGates({ berths: [], berthsAt: t0 }, t0)?.berths).toEqual([]);
+    expect(summaryGates({ berths: [{ roomId: 'b9' }], berthsAt: t0 }, t0)).toBeNull();
+    expect(summaryGates({ berths: 'b9', berthsAt: t0 }, t0)).toBeNull();
+    // No stamp, a malformed one, or one further ahead than a peer's may be.
+    for (const berthsAt of [undefined, -1, Number.NaN, String(t0), t0 + MAX_GOSSIP_SKEW_MS + 1]) {
+      expect(summaryGates({ berths: [gate], berthsAt }, t0)).toBeNull();
+    }
+    expect(summaryGates({ berths: [gate], berthsAt: t0 + MAX_GOSSIP_SKEW_MS }, t0)).not.toBeNull();
+    // Room stamps: a plain map, of no more rooms than a list and its
+    // tombstones carry.
+    const stamps = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`room-${i}`, t0]));
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS) }, t0)).not.toBeNull();
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS + 1) }, t0)).toBeNull();
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: [t0] }, t0)).toBeNull();
   });
 
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {

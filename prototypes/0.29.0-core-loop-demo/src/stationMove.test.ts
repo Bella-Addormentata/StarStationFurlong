@@ -71,6 +71,7 @@ import type { MoveContext, StationMove, TowContext } from './stationMove';
 import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
+  MAX_ROOM_STAMPS,
   knownSlotsAround,
   listStations,
   registerStation,
@@ -957,18 +958,24 @@ describe('moves between installs', () => {
     // This install has no atlas and lists no such station. The ship's berth
     // is the station's annex: nothing booked there, the move only gossiped,
     // beside the station's gates as the crews standing there published them.
-    const farDoc = (berths: StationBerthRecord[]) => {
+    const farDoc = (berths: StationBerthRecord[], over: Record<string, unknown> = {}) => {
       const doc = new Y.Doc();
-      doc.getMap('stationSummaries').set('yard-lobby', { ...summary, berths, berthsAt: NOW });
+      doc.getMap('stationSummaries').set('yard-lobby', { ...summary, berths, berthsAt: NOW, ...over });
       return doc;
     };
-    const doc = farDoc([{ roomId: 'yard-lobby', doorId: 'd:gate-1', gate: 1 }, { roomId: 'yard-annex', doorId: 'd:gate-2', gate: 2 }]);
+    const gates = [{ roomId: 'yard-lobby', doorId: 'd:gate-1', gate: 1 }, { roomId: 'yard-annex', doorId: 'd:gate-2', gate: 2 }];
+    const doc = farDoc(gates);
     const mid = Math.floor((move.departAt + move.arriveAt) / 2);
     expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
     expect(roomDocLockedByMove(doc, 'yard-annex', move.departAt - 1)).toBe(false);
     expect(roomDocLockedByMove(doc, 'yard-annex', move.arriveAt)).toBe(false);
     // A room none of the station's gates are in is not the station's by them.
     expect(roomDocLockedByMove(farDoc([{ roomId: 'yard-lobby', doorId: 'd:gate-1', gate: 1 }]), 'yard-annex', mid)).toBe(false);
+    // Nor by a list the summary pull would drop: no stamp beside it, or more
+    // room stamps than any list carries.
+    expect(roomDocLockedByMove(farDoc(gates, { berthsAt: undefined }), 'yard-annex', mid)).toBe(false);
+    const flood = Object.fromEntries(Array.from({ length: MAX_ROOM_STAMPS + 1 }, (_, i) => [`room-${i}`, NOW]));
+    expect(roomDocLockedByMove(farDoc(gates, { berthRoomsAt: flood }), 'yard-annex', mid)).toBe(false);
     // Mapped here only partly (the annex and the next module, never the
     // welcome room), the annex is a station of this install's own making:
     // the far room's list still names its real one.

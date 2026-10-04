@@ -26,7 +26,7 @@
  * planet) is the natural next step once ship travel needs it.
  */
 
-import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
+import { MAX_GOSSIP_SKEW_MS, atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
 import { MIN_ALTITUDE_KM, maxAltitudeKm } from './orbits';
@@ -226,6 +226,42 @@ function capBerths(sorted: readonly StationBerthRecord[]): StationBerthRecord[] 
   });
   for (let i = 0; i < sorted.length && kept < MAX_BERTHS; i++) if (!keep[i]) { keep[i] = true; kept++; }
   return sorted.filter((_, i) => keep[i]);
+}
+
+/** ⚓🚦 Room tombstones (rooms that list no gate any more) a summary carries
+ *  beside its listed rooms' stamps: their own budget, as large as the list's,
+ *  so every room a full list held can carry its removal. */
+export const MAX_ROOM_TOMBSTONES = MAX_BERTHS;
+/** The most room stamps one summary carries. */
+export const MAX_ROOM_STAMPS = MAX_BERTHS + MAX_ROOM_TOMBSTONES;
+
+/** ⚓🚦 A planet summary's gate list (planetSummary's StationSummary.berths)
+ *  as every reader takes it across the peer trust boundary
+ *  (cleanStationSummary, and a far room's dock lock, stationMove.ts): the
+ *  list cleaned, with its `berthsAt`, or null when there is none to keep.
+ *  An empty list is news too (the station's last gate was removed); a list
+ *  whose every entry was malformed is not. Its stamp sits no further ahead
+ *  of `now` than a gossip stamp may (stationAtlas). Its room stamps
+ *  (`berthRoomsAt`) are counted only so far: a map larger than any list
+ *  carries is junk, and so is the gate list it came with, since without its
+ *  stamps each room would pass for as fresh as the whole list. */
+export function summaryGates(
+  v: { berths?: unknown; berthsAt?: unknown; berthRoomsAt?: unknown },
+  now: number = Date.now(),
+): { berths: StationBerthRecord[]; berthsAt: number } | null {
+  if (!Array.isArray(v.berths)) return null;
+  const berths = cleanBerths(v.berths);
+  if (berths.length === 0 && v.berths.length > 0) return null;
+  const at = v.berthsAt;
+  if (typeof at !== 'number' || !Number.isFinite(at) || at < 0 || at > now + MAX_GOSSIP_SKEW_MS) return null;
+  const rooms = v.berthRoomsAt;
+  if (rooms !== undefined) {
+    if (typeof rooms !== 'object' || rooms === null || Array.isArray(rooms)
+      || Object.getPrototypeOf(rooms) !== Object.prototype) return null;
+    let count = 0;
+    for (const _k in rooms) if (++count > MAX_ROOM_STAMPS) return null;
+  }
+  return { berths, berthsAt: at };
 }
 
 /**
