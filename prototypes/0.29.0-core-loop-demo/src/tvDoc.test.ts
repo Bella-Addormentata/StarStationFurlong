@@ -597,6 +597,48 @@ describe('the programme', () => {
     expect(readPlayback(TV).positionMs).toBe(3_600);
   });
 
+  it('OFF from a page whose reading is stale carries no reading — a beat the network delivered after the wake reads ahead of the room by the sleep — unless the stale sample is its own last beat, the holder\'s clock bridged across its sleep', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    markTvPageAwake(now); // the room tick, as World runs it
+    tvHeartbeat(TV, 10_000); // this page's own beat
+    tick(500);
+    markTvPageAwake(now);
+    tick(60_000); // the lid closed for a minute; the monotonic clock ran on
+    markTvPageAwake(now); // the first tick back finds the gap
+    expect(readPlayback(TV)).toMatchObject({ positionMs: 70_500, stale: true });
+    // The holder's own beat, bridged across its own sleep, is where every
+    // awake viewer ran on to: a reading.
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV).parkMs).toBe(70_500);
+    expect(tvTogglePower(TV)).toBe(true); // lapsed by this page's own watch: picked up again with the switch
+    expect(tvHeartbeat(TV, 70_600)).toEqual({ ok: true });
+    // Another page's beat — the remote lapsed from this one and was taken
+    // over — held by the network through this page's next sleep and
+    // delivered in the moment after waking: stamped from before the gap
+    // and bridged by the whole sleep, it reads a minute AHEAD of the room.
+    // Not a reading for the room: the switch carries none.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    tick(500);
+    markTvPageAwake(now);
+    tick(60_000);
+    markTvPageAwake(now);
+    const rec = readProgramme(TV);
+    other.getMap('tv').set(tvKey(TV), { ...rec, positionMs: 71_000, seq: rec.seq + 1 });
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(other));
+    expect(readPlayback(TV).stale).toBe(true);
+    expect(readPlayback(TV).positionMs).toBeGreaterThan(71_000 + 59_000);
+    iAm(BOB, 'Bob'); // anyone may press the body button
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV)).toMatchObject({ on: false, parkMs: null });
+    // ON with no reading anchors nothing: the record as it stands, and the
+    // holder's park at its last beat (tvSession).
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readSample(TV)?.park).toBeUndefined();
+    expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 71_000 });
+  });
+
   it('a viewer\'s OFF during STARTING… (the holder\'s first beat still owed) carries the time since T0, as that beat will say; a countdown still ahead carries nothing, and ON during it starts nothing early', () => {
     pickUpRemote(TV);
     tvSchedule(TV, FILM, now + 10_000);
@@ -757,7 +799,7 @@ describe('the sync rule: anchor on receipt, never on the holder\'s clock', () =>
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 30_000);
-    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 30_000, receivedAt: now });
+    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 30_000, receivedAt: now, own: true }); // this page's own beat
     tick(1_400);
     expect(readPlayback(TV).positionMs).toBe(31_400);
     // Half the measured round trip is added when the caller knows it.
@@ -774,7 +816,7 @@ describe('the sync rule: anchor on receipt, never on the holder\'s clock', () =>
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 30_000);
-    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 30_000, receivedAt: mono });
+    expect(readSample(TV)).toEqual({ seq: 2, positionMs: 30_000, receivedAt: mono, own: true });
     expect(readTv(TV).history[0].playedAt).toBe(wall); // the stamps that travel are dates
     mono += 1_400;
     expect(readPlayback(TV).positionMs).toBe(31_400);
