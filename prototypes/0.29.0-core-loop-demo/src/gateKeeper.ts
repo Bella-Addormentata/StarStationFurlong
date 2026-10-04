@@ -110,13 +110,22 @@
  * a session has seen both ends hold it, whether or not a gate here docks
  * automatically now: a claim a keeper left at a gate switched off as it
  * settled (it reset before it could take it back: the player left) is let
- * go once held GATE_STALE_MS, and a dock both ends hold is left to people. A
+ * go once held GATE_STALE_MS, and a dock both ends hold is left to people.
+ * Any other door here that let go of such a ferry by its route port (a dock
+ * tombstone) has the ferry's doors read once too, by a fresh keeper, whether
+ * or not a gate here docks automatically now: a cast-off or a release whose
+ * keeper reset before the ferry's room acknowledged it (the gate switched off
+ * since) left its port holding the dock that door let go of, and the port
+ * lets go too; nothing else is done there. A
  * write to the ferry's room that is never acknowledged hangs its session up,
  * so nothing is read from a doc the room may never hold: a fresh session reads
  * what the room does hold (at once, then backing off while acknowledgments
  * keep failing), and what is missing is written again; a checkpoint never
  * acknowledged is told to every stop once a session reads what the room
- * holds. The keeper watches each ferry by its route port: when
+ * holds, and so is any route news a session finds this board lacks (a
+ * keeper that wrote it may have reset before it was acknowledged), while
+ * tanks only this board has wrong are told only here. The keeper watches
+ * each ferry by its route port: when
  * the entry here stops calling here by that port (a newer route leaves this
  * room out or calls by another port, or the capped departures map evicts it),
  * what it left under way is still settled, by that port and the address it
@@ -131,7 +140,9 @@
  * room in flight, docks nothing. Nor is anything done while this room's
  * gates or doors, or the ferry's doors, are more than a look reads (a peer
  * may have flooded them): a gate or a dock left out could be the one a step
- * is about.
+ * is about. A door address longer than MAX_DOOR_ADDRESS_LEN names no room
+ * (each address is decoded once), and while this room's own address is
+ * longer, no session is held.
  *
  * Pure decisions (ferryBerthingIn, dockableGates, stationLook,
  * gateSessionWanted, ferryLook, gateMove, gateFixes) over the departures
@@ -147,7 +158,6 @@ import {
   berthMemoryFrom,
   classifyDockPort,
   gateAdmits,
-  holdsDockTo,
   stampAfter,
   type DockPortState,
   type NearEnd,
@@ -240,29 +250,47 @@ export const GATE_SETTLE_MS = 1_500;
 /** How long the node may take to acknowledge a write. */
 export const GATE_ACK_MS = 5_000;
 
+/** The longest door address the keeper reads. A pass is a few kilobytes
+ *  (its member hints grow it), and door records are any peer's to write: a
+ *  longer one names no room here, rather than costing a decode every tick. */
+export const MAX_DOOR_ADDRESS_LEN = 32_768;
+/** How many decoded addresses the keeper keeps: each tick reads the same
+ *  records again, and a decode parses a URL, base64 and JSON. */
+const DECODED_ADDRESSES_KEPT = 256;
+
 /** The ship map's name in a room doc (shipDoc.ts). */
 const SHIP_MAP = 'ship';
 
 // ── What this room knows ─────────────────────────────────────────────────────
 
+const decodedAddresses = new Map<string, string>();
+
+/** The room a door record's address reaches ('' when it names none, or is
+ *  longer than MAX_DOOR_ADDRESS_LEN), each address decoded once. */
 function roomOf(address: string | undefined): string {
-  if (!address) return '';
+  if (typeof address !== 'string' || !address || address.length > MAX_DOOR_ADDRESS_LEN) return '';
+  const known = decodedAddresses.get(address);
+  if (known !== undefined) return known;
+  let roomId = '';
   try {
-    return roomIdFromSeed(address);
+    roomId = roomIdFromSeed(address);
   } catch {
-    return '';
+    roomId = '';
   }
+  if (decodedAddresses.size >= DECODED_ADDRESSES_KEPT) {
+    const oldest = decodedAddresses.keys().next();
+    if (!oldest.done) decodedAddresses.delete(oldest.value);
+  }
+  decodedAddresses.set(address, roomId);
+  return roomId;
 }
 
-/** dockRules.holdsDockTo, read as roomOf reads an address: both rooms' door
- *  records are peer-written, and one whose address does not parse holds no
- *  dock here, rather than throwing out of the keeper's tick. */
+/** dockRules.holdsDockTo's test, with the address read as roomOf reads it:
+ *  both rooms' door records are peer-written, and one whose address does not
+ *  parse, or is longer than the keeper reads, holds no dock here. */
 function holdsDock(record: DoorRecord | undefined, near: NearEnd): boolean {
-  try {
-    return holdsDockTo(record, near);
-  } catch {
-    return false;
-  }
+  return record?.paired === true && isDockChain(record.segments)
+    && record.farDoor === near.doorId && roomOf(record.connectedRoomAddress) === near.roomId;
 }
 
 /** One of this room's auto-dock gates, as the keeper reads it. */
@@ -278,6 +306,12 @@ export interface GateView {
   /** Its AUTO-DOCK is off since this keeper last had business there: only
    *  what it left under way is settled (gateFixes takes no new dock here). */
   retired?: true;
+  /** A door that let go of the ferry (a dock tombstone naming its route
+   *  port) that this keeper knows no business at: the ferry's port is only
+   *  let go there when it still holds the dock this door let go of after it
+   *  (a cast-off or a release of a keeper that reset before the ferry's room
+   *  acknowledged it). Nothing else is done there. */
+  letGo?: true;
 }
 
 /** Is `farDoor` (a record's far door, or its dock memory's) the ferry's
@@ -710,8 +744,10 @@ export type GateFix =
  * dock could be made (something here names the ferry, the gate is not
  * `retired` and admits it, and its module would overlap no other there), once
  * this room `mayPair`; elsewhere the port lets go of it once it has held it
- * GATE_STALE_MS. While the docks are `locked` (a station move or a tow),
- * nothing is fixed at either end. Pure.
+ * GATE_STALE_MS. At a door that only let go of the ferry (`letGo`), an undock
+ * there after the port's dock reaches the ferry, and nothing else is done.
+ * While the docks are `locked` (a station move or a tow), nothing is fixed at
+ * either end. Pure.
  */
 export function gateFixes(o: {
   gates: readonly GateView[];
@@ -752,6 +788,15 @@ export function gateFixes(o: {
   if (o.locked === true) return out;
   for (const g of o.gates) {
     const rec = g.record;
+    if (g.letGo) {
+      // A door that let go of the ferry after its port's dock: the ferry
+      // lets go too. Anything else there is not this keeper's.
+      const x = port?.paired === true ? port.dockedAt : undefined;
+      if (holdsDock(port, o.near(g.doorId)) && rec?.paired === false && rec.dock && x !== undefined && rec.dock.undockedAt >= x) {
+        out.push({ kind: 'release-ferry', gate: g.doorId, undockedAt: rec.dock.undockedAt });
+      }
+      continue;
+    }
     if (port?.paired === true && holdsDock(port, o.near(g.doorId))) {
       const x = port.dockedAt;
       if (rec?.paired === true) {
@@ -1423,7 +1468,10 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         session?.close();
         return;
       }
-      if (!session || !own) {
+      // An address of this room's own longer than the keeper reads would
+      // write a dock to the ferry's port that this keeper could not read
+      // back (roomOf): no session.
+      if (!session || !own || own.length > MAX_DOOR_ADDRESS_LEN) {
         session?.close();
         w.nextDialAt = clock() + w.dialBackoffMs;
         w.dialBackoffMs = Math.min(w.dialBackoffMs * 2, GATE_REDIAL_MAX_MS);
@@ -1513,7 +1561,8 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
   /**
    * The gate follows the ferry (gateFixes), whatever its route does: paused,
    * ended or finished, a claim at a gate is still settled, and so is what
-   * this keeper left under way at a gate switched off since (`retired`).
+   * this keeper left under way at a gate switched off since (`retired`), or
+   * a door that let go of the ferry after its port's dock (`letGo`).
    * Returns whether it changed anything (then the step waits for the next
    * tick).
    */
@@ -1574,9 +1623,14 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     // its port holds that the gate does not (taken there or let go, however
     // long that waits, a station move or a tow included), or, while
     // AUTO-DOCK is on there, a dock both ends hold. Anything else between
-    // that gate and the ferry is settled.
+    // that gate and the ferry is settled. A door that only let go of the
+    // ferry becomes its business by a release there alone.
     for (const g of views) {
       const fixing = fixes.some((f) => f.gate === g.doorId);
+      if (g.letGo) {
+        if (fixing) w.managed.add(g.doorId);
+        continue;
+      }
       const portHolds = port?.paired === true && holdsDock(port, near(g.doorId));
       const gateHolds = holdsFerry(g.record, w.ship, shipPort);
       const portOnly = portHolds && !gateHolds;
@@ -1667,13 +1721,18 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     }
     // The board here learns what the ferry's doc says, once per session: a
     // finish it missed too, or its timetable would run on here, and this
-    // keeper dial on it. After a write of this keeper's that was never
-    // acknowledged, every stop does (it may have landed after all), even
-    // when this board has it already (another game told it).
+    // keeper dial on it. Route news this board lacks may be missing at every
+    // stop (a checkpoint of a keeper that reset before the ferry's room
+    // acknowledged it, which nothing here remembers), so every stop is told;
+    // tanks this board has wrong are only its own. After a write of this
+    // keeper's that was never acknowledged, every stop is told too (it may
+    // have landed after all), even when this board has it already (another
+    // game told it).
     if (!w.refreshed) {
       w.refreshed = true;
-      if (w.unpublished !== null || !sameNews(news, ferry) || capacity !== ferry.capacity) {
-        publish(w, ferry, w.unpublished !== null, w.unpublished, capacity);
+      const missed = !sameNews(news, ferry);
+      if (w.unpublished !== null || missed || capacity !== ferry.capacity) {
+        publish(w, ferry, w.unpublished !== null || missed, w.unpublished, capacity);
       }
       w.unpublished = null;
     }
@@ -1891,9 +1950,18 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     // ferry's port never took is let go once held GATE_STALE_MS, and a dock
     // both ends hold is left to people. (A keeper's claim always names the
     // port: a record naming none may be a dock by another of its doors.)
+    // And any other door here that let go of the ferry by its port: a
+    // cast-off or a release whose keeper reset before the ferry's room
+    // acknowledged it (its gate's AUTO-DOCK switched off since, so nothing
+    // here remembers it) leaves the port holding a dock this room let go of.
+    // A session lets the port go too; such a door keeps none open itself.
+    const letGo: GateView[] = [];
     for (const [doorId, rec] of doors) {
       if (w.managed.has(doorId) || gates.some((g) => g.doorId === doorId)) continue;
       if (holdsFerry(rec, w.ship, shipPort) && rec.farDoor === shipPort) retired.push({ doorId, record: rec, retired: true });
+      else if (rec.paired === false && rec.dock?.farDoor === shipPort && roomOf(rec.retiredAddress) === w.ship) {
+        letGo.push({ doorId, record: rec, retired: true, letGo: true });
+      }
     }
     const admitting = running && !!berthing && gates.some((g) => admitsFerry(g, w.ship));
     // A gate it has business at where the two ends are not known to agree:
@@ -1951,7 +2019,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       w.nextDialAt = now;
       return true;
     }
-    act(w, ferry, gates, retired, berthing, now);
+    act(w, ferry, gates, [...retired, ...letGo], berthing, now);
     return true;
   };
 
@@ -1986,18 +2054,28 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       const doors = new Map(snapshot);
       for (const g of gates) if (g.record) doors.set(g.doorId, g.record);
       // The rooms docked at a door of this room that is no auto-dock gate: a
-      // ferry among them may hold a claim a keeper left there (tend).
+      // ferry among them may hold a claim a keeper left there (tend). And the
+      // ferries (by route port) such a door let go of: a keeper that reset
+      // before the ferry's room took its cast-off or release may have left
+      // the port holding that dock (tend's letGo), so a fresh keeper reads it.
       const dockedAtOthers = new Set<string>();
+      const letGoAtOthers = new Set<string>();
       for (const [doorId, rec] of doors) {
-        if (rec.paired !== true || !isDockChain(rec.segments) || gates.some((g) => g.doorId === doorId)) continue;
-        const ship = roomOf(rec.connectedRoomAddress);
-        if (ship) dockedAtOthers.add(ship);
+        if (gates.some((g) => g.doorId === doorId)) continue;
+        if (rec.paired === true) {
+          if (!isDockChain(rec.segments)) continue;
+          const ship = roomOf(rec.connectedRoomAddress);
+          if (ship) dockedAtOthers.add(ship);
+        } else if (rec.dock?.farDoor) {
+          const ship = roomOf(rec.retiredAddress);
+          if (ship) letGoAtOthers.add(watchKey(ship, rec.dock.farDoor));
+        }
       }
-      // No auto-dock gate here, no dock at another door, and nothing left to
-      // settle at a gate switched off since, or to tell the stops: nothing to
-      // watch.
+      // No auto-dock gate here, no dock at another door or one let go of,
+      // and nothing left to settle at a gate switched off since, or to tell
+      // the stops: nothing to watch.
       if (
-        gates.length === 0 && dockedAtOthers.size === 0
+        gates.length === 0 && dockedAtOthers.size === 0 && letGoAtOthers.size === 0
         && ![...watches.values()].some((w) => w.managed.size > 0 || w.repair || w.unpublished !== null)
       ) {
         for (const w of watches.values()) hangUp(w);
@@ -2011,8 +2089,9 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         if (!ferry.route.stops.some((s) => s.berth.roomId === roomId)) continue;
         const key = watchKey(ferry.shipRoomId, ferry.route.shipPort);
         // With no auto-dock gate here, a ferry is this keeper's business only
-        // while docked at another door, or while its watch has something left.
-        if (gates.length === 0 && !dockedAtOthers.has(ferry.shipRoomId) && !watches.has(key)) continue;
+        // while docked at another door, or let go of there by its port, or
+        // while its watch has something left.
+        if (gates.length === 0 && !dockedAtOthers.has(ferry.shipRoomId) && !letGoAtOthers.has(key) && !watches.has(key)) continue;
         const w = watchOf(ferry.shipRoomId, ferry.route.shipPort);
         seen.add(key);
         try {
