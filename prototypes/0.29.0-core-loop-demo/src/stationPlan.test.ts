@@ -271,6 +271,58 @@ describe('a module owner in the atlas', () => {
     expect(readAtlas()['room-a'].owner).toEqual({ id: 'p-ada', name: 'Ada' });
   });
 
+  it('keeps the name and key it knew through a harvest that read only the owner\'s id', () => {
+    const owner = { id: 'p-ada', name: 'Ada', key: 'k'.repeat(43) };
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [], owner });
+    // Read again before the room's players map synced: the owner's id alone.
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [], owner: { id: 'p-ada' } });
+    expect(readAtlas()['room-a'].owner).toEqual(owner);
+    // A new owner replaces it whole.
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors: [], owner: { id: 'p-bo' } });
+    expect(readAtlas()['room-a'].owner).toEqual({ id: 'p-bo' });
+  });
+
+  it('keeps the name and key either copy knows for the same owner, through the shared atlas', () => {
+    const owner = { id: 'p-ada', name: 'Ada', key: 'k'.repeat(43) };
+    const doors = [{ doorId: 'east', targetSeed: seed('room-b'), transient: false }];
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors, owner });
+    // A newer copy from a client that read the owner's id alone: ours keeps
+    // the name and key, and that copy, which stands, gains them.
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-a', {
+      roomId: 'room-a', name: 'HUB', doors: { east: { targetRoomId: 'room-b' } }, owner: { id: 'p-ada' }, updatedAt: Date.now() + 60_000,
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-a'].owner).toEqual(owner);
+    expect((doc.getMap('atlas').get('room-a') as { owner?: unknown }).owner).toEqual(owner);
+    // Our own newer copy read the id alone: an older copy that knows the
+    // rest fills it in, and ours goes out whole.
+    store.clear();
+    const older = new Y.Doc();
+    older.getMap('atlas').set('room-a', {
+      roomId: 'room-a', name: 'HUB', doors: { east: { targetRoomId: 'room-b' } }, owner, updatedAt: 1,
+    });
+    harvestIntoAtlas({ roomId: 'room-a', name: 'HUB', doors, owner: { id: 'p-ada' } });
+    bindStationAtlasDoc(older, { roomId: 'room-z', isPassagePublic: () => false });
+    expect(readAtlas()['room-a'].owner).toEqual(owner);
+    expect((older.getMap('atlas').get('room-a') as { owner?: unknown }).owner).toEqual(owner);
+  });
+
+  it('gives the name and key we know to a doc copy that gains our gates', () => {
+    const owner = { id: 'p-bo', name: 'Bo', key: 'k'.repeat(43) };
+    const later = Date.now() + 60_000;
+    // As new as ours once pulled, with no gates, and the owner's id alone.
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', doors: { west: { targetRoomId: 'room-a' } }, owner: { id: 'p-bo' }, updatedAt: later,
+    });
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS', doors: [{ doorId: 'west', targetSeed: seed('room-a'), transient: false }], gates: { south: 2 }, owner,
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    expect(doc.getMap('atlas').get('room-b')).toMatchObject({ gates: { south: 2 }, owner, updatedAt: later + 1 });
+  });
+
   it('is cleared by a harvest that saw the room ownerless, and that travels', () => {
     station();
     const doc = new Y.Doc();

@@ -174,6 +174,24 @@ function ownerOf(v: unknown): AtlasOwner | null | undefined {
   return v === null ? null : cleanAtlasOwner(v);
 }
 
+/** `owner`, with the name and identity key `known` holds for the SAME owner
+ *  filled in where `owner` lacks them: a harvest made before the room's
+ *  players map synced carries the owner's id alone, and must not wipe the
+ *  key ownerIsMe knows them by (or publish the owner without it). A
+ *  different owner, null or unknown is `owner` as it is. */
+function withOwnerDetails(owner: AtlasOwner | null | undefined, known: AtlasOwner | null | undefined): AtlasOwner | null | undefined {
+  if (!owner || !known || owner.id !== known.id) return owner;
+  const name = owner.name ?? known.name;
+  const key = owner.key ?? known.key;
+  return { id: owner.id, ...(name ? { name } : {}), ...(key ? { key } : {}) };
+}
+
+/** Do two owner fields say the same (both unknown, both null, or the same
+ *  id, name and key)? */
+function sameOwner(a: AtlasOwner | null | undefined, b: AtlasOwner | null | undefined): boolean {
+  return !a || !b ? a === b : a.id === b.id && a.name === b.name && a.key === b.key;
+}
+
 const KEY = 'ssf-station-atlas';
 export const MAX_ENTRIES = 64;
 /** 🔧 Tombstones of modules taken apart (AtlasEntry.dismantledAt) kept
@@ -547,9 +565,10 @@ export function harvestIntoAtlas(entry: {
       ? (entry.gateAccess ? { gateAccess: cleanGateAccess(entry.gateAccess, entryGates) } : {})
       : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
     // 🗺️ A harvest that could not read the owner (not synced yet) keeps the
-    // one we knew, like dims.
+    // one we knew, like dims, and one that read only their id keeps the name
+    // and key we knew for them (withOwnerDetails).
     // An explicit null (the synced room has no verifiable owner) clears it.
-    ...ownerSpread(ownerOf(entry.owner) !== undefined ? ownerOf(entry.owner) : prior?.owner),
+    ...ownerSpread(ownerOf(entry.owner) !== undefined ? withOwnerDetails(ownerOf(entry.owner), prior?.owner) : prior?.owner),
     ...(revives !== undefined ? { revives } : {}),
     lastSeen: tomb ? Math.min(Math.max(now, tomb.lastSeen + 1), now + MAX_GOSSIP_SKEW_MS) : now,
     // We are standing in it — the strongest possible local recency signal.
@@ -1705,9 +1724,10 @@ function pullSharedAtlas(): void {
         }
         changed = true;
       }
-      // 🗺️ Likewise an owner our copy never learned (an older build's harvest).
-      const owner = prior.owner === undefined ? ownerOf(value.owner) : undefined;
-      if (owner !== undefined) {
+      // 🗺️ Likewise an owner our copy never learned (an older build's
+      // harvest), or the name and key it lacks for the same owner.
+      const owner = prior.owner === undefined ? ownerOf(value.owner) : withOwnerDetails(prior.owner, ownerOf(value.owner));
+      if (owner !== undefined && !sameOwner(owner, prior.owner)) {
         prior.owner = owner;
         changed = true;
       }
@@ -1781,9 +1801,10 @@ function pullSharedAtlas(): void {
           ? { gateAccess: cleanGateAccess(value.gateAccess, cleanGates(value.gates)) }
           : {})
         : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
-      // 🗺️ Peer-written and checked; silence keeps what we knew.
+      // 🗺️ Peer-written and checked; silence keeps what we knew, and so does
+      // a copy naming the same owner without the name or key we knew.
       // (null: the publisher saw the room ownerless — that clears ours.)
-      ...ownerSpread(ownerOf(value.owner) !== undefined ? ownerOf(value.owner) : prior?.owner),
+      ...ownerSpread(ownerOf(value.owner) !== undefined ? withOwnerDetails(ownerOf(value.owner), prior?.owner) : prior?.owner),
       // 🔧 A newer copy saying the module was taken apart: the tombstone, and
       // no doors (a tombstone joins nothing, whatever its writer sent). Still
       // gone after this install took it apart: still its own to keep.
@@ -1884,14 +1905,17 @@ export function pushAtlasToDoc(): void {
         // onto the DOC's copy, its geometry untouched, so a client joining
         // after the ship casts off still reads the stale end as a berth.
         // 🗺️ An owner we know and that copy lacks (an older client's) goes
-        // onto it the same way. (Not onto a tombstone: no map shows its
-        // owner, and the write would only race a copy that brings it back.)
+        // onto it the same way, and so do the name and key we know for the
+        // owner it names. (Not onto a tombstone: no map shows its owner, and
+        // the write would only race a copy that brings it back.)
         const flagged = withBerthFlags(known, entry);
-        const owned = known.dismantledAt === undefined && known.owner === undefined && entry.owner !== undefined;
+        const docOwner = ownerOf(known.owner);
+        const owner = docOwner === undefined ? entry.owner : withOwnerDetails(docOwner, entry.owner);
+        const owned = known.dismantledAt === undefined && owner !== undefined && !sameOwner(owner, docOwner);
         if (flagged || owned) {
           sharedMap!.set(entry.roomId, {
             ...(flagged ?? known),
-            ...(owned ? { owner: entry.owner } : {}),
+            ...(owned ? { owner } : {}),
             updatedAt: Math.min(known.updatedAt + 1, Date.now() + MAX_GOSSIP_SKEW_MS),
           });
         }
@@ -1933,7 +1957,9 @@ export function pushAtlasToDoc(): void {
           ? { gateAccess: entry.gateAccess }
           : {}),
         // 🗺️ The owner travels with the layout (the holotable's atlas card).
-        ...ownerSpread(onlyGates && known!.owner !== undefined ? known!.owner : entry.owner),
+        // A doc copy that keeps its own gains the name and key we know for
+        // that same owner, as in the skip above.
+        ...ownerSpread(onlyGates && known!.owner !== undefined ? withOwnerDetails(ownerOf(known!.owner), entry.owner) : entry.owner),
         // 🔧 The module was taken apart: the tombstone travels like the layout.
         ...(entry.dismantledAt !== undefined ? { dismantledAt: entry.dismantledAt } : {}),
         // …and so does the one a copy brought it back from.

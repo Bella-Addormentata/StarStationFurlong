@@ -285,6 +285,14 @@ describe('what a room can take apart', () => {
       owner: { id: 'p-old', name: 'Ada', key: KEY },
     });
     expect(removalBlocker(input(doors, { identityPub: KEY }), 'room-c')).toBeNull();
+    // Read again before LAB's players map synced (the owner's id alone): the
+    // key the atlas knew still counts.
+    harvestIntoAtlas({
+      roomId: 'room-c', name: 'LAB',
+      doors: [{ doorId: 'east', targetSeed: seed('room-a'), transient: false }],
+      owner: { id: 'p-old' },
+    });
+    expect(removalBlocker(input(doors, { identityPub: KEY }), 'room-c')).toBeNull();
     // Another key, or none here: someone else's.
     expect(removalBlocker(input(doors, { identityPub: 'j'.repeat(43) }), 'room-c')).toBe('it belongs to Ada');
     expect(removalBlocker(input(doors), 'room-c')).toBe('it belongs to Ada');
