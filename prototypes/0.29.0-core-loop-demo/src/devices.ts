@@ -303,7 +303,7 @@ function stationFliesFree(stationId: string, now: number): boolean {
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
-export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv';
+export type DeviceKind = 'roomTerminal' | 'deskComputer' | 'mapTable' | 'storageTrunk' | 'gameTable' | 'helm' | 'cashier' | 'roulette' | 'craps' | 'cloneVat' | 'robotDock' | 'slotMachine' | 'coinPusher' | 'airHockey' | 'cakeTable' | 'giftBox' | 'partySpeaker' | 'departuresBoard' | 'smartTv' | 'arcade';
 
 /**
  * 🎞️ Handle onto a prop's own per-frame animation — the dance floor's light
@@ -492,6 +492,20 @@ export interface AirHockeyVisualHandle {
  */
 export interface TvScreenHandle {
   draw(view: import('./tvDoc').TvScreenView): void;
+}
+
+// ── 🕹 Arcade cabinet screen handle (#193 — shared with the furniture builder) ─
+
+/**
+ * Handle onto an arcade cabinet's in-world CanvasTexture screen: the attract
+ * card (INSERT COIN, the game's name, the tally) and "P1 · <name>" while
+ * someone is at the controls. Stowed in the screen mesh's userData.arcadeScreen
+ * by the builder; World collects it and hands it arcadeDoc.arcadeScreenView
+ * at ~2 Hz. The game's own picture plays in P1's stage panel (plan §9); the
+ * spectator lane brings it to this texture later.
+ */
+export interface ArcadeScreenHandle {
+  draw(view: import('./arcadeDoc').ArcadeScreenView): void;
 }
 
 // ── Storage-trunk lid handle (TR2 — shared with the furniture builder) ───────

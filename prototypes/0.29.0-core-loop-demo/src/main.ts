@@ -239,6 +239,10 @@ import { setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
 import { armTvDrive, leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
+// 🕹 #193: the arcade cabinet — its records, and the stand-up on leave.
+import { bindArcadeDoc, setArcadeEjectPredicate, setArcadeHostPredicate, setArcadeIdentity } from "./arcadeDoc";
+import { leaveArcadeRoom } from "./arcadeSession";
+import { closeArcadeStage } from "./arcadeStage";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -1990,6 +1994,9 @@ async function joinRoomAtEpoch(
   // remote. Same T0 seam — a joiner walks in on a movie already running and
   // anchors its clock to the sample it finds.
   bindTvDoc(sync.doc);
+  // 🕹 Bind the shared arcade map (#193): each cabinet's shelf and game, and
+  // who is at its controls. Same T0 seam.
+  bindArcadeDoc(sync.doc);
 
   // 🛰️ Bind the SHARED station atlas: the doc's `atlas` map two-way merges
   // with the local visitation atlas, so a first-time visitor renders the
@@ -3171,6 +3178,10 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
   closeTvTheatre();
   updateTvChip([]);
   leaveTvRoom(roomTvIds());
+  // 🕹 #193: the same for the cabinet — the stage (its frame, its seat
+  // renewals) is this room's; a P1 who leaves stands up before the doc goes.
+  closeArcadeStage();
+  leaveArcadeRoom(roomArcadeIds());
   // Claim the sync ref BEFORE awaiting so overlapping leaveRoom calls can't
   // double-stop (and double-count) the same session.
   const sync = yjsSync;
@@ -4219,6 +4230,10 @@ function resolveOwnerLabel(owner: string): string {
  *      a module off the station can't be put back) — setRoomDeedCheck
  *    · the TV's spare remote (#186: taking the remote from its holder, or
  *      handing theirs on — setTvHostPredicate; the panels paint from it)
+ *    · the arcade cabinet's EJECT, and sitting down over a held P1 seat
+ *      (#193 — setArcadeEjectPredicate; the panel paints from it). The
+ *      cabinet's CURATION (shelf, game, emulator files) stays with the
+ *      shareholder-extended gate above (setArcadeHostPredicate).
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
  *  own venture map entry, which is peer-written, shape-checked only, and tied
@@ -6006,6 +6021,10 @@ function tvLabelFor(itemId: string): string {
 }
 function tvTheatreDeps(itemId: string) {
   return { label: tvLabelFor(itemId), rttMs: () => networkProvider.stats().rttMs };
+}
+// 🕹 #193: the room's arcade cabinets, as the leave stand-up sees them.
+function roomArcadeIds(): string[] {
+  return FURNITURE.filter((i) => i.kind === "arcade-cabinet").map((i) => i.id);
 }
 
 function currentRoomDeedIsMine(): boolean {
@@ -9937,6 +9956,16 @@ async function init() {
       ? crypto.randomUUID()
       : `page-${Math.random().toString(36).slice(2, 12)}`,
   );
+  // 🕹 #193: two authorities for the cabinet (#142's split, in the
+  // isLocalPlayerRoomOwner docblock). Curation — the shelf, the game, the
+  // emulator files — is the edit gate's, shareholder-extended. Unseating
+  // P1 (EJECT, sitting down over a held seat) is the DEED holder's alone:
+  // a peer-written venture record can satisfy the edit gate, and nobody is
+  // taken off the controls on the strength of one. The seat is held under
+  // my identity from this page.
+  setArcadeHostPredicate(() => canEditRoom().ok);
+  setArcadeEjectPredicate(() => currentRoomDeedIsMine());
+  setArcadeIdentity(() => ({ pub: getIdentityPub(), name: getPlayerName() }));
   setTvRoomPlayersProvider(() => {
     const out: Array<{ pub: string; name: string }> = [];
     const map = yjsSync?.doc.getMap("players");

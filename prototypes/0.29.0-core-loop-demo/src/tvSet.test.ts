@@ -38,7 +38,7 @@ function sinks(): FurnitureHandleSinks {
   return {
     wallScreens: new Map(), holoSpinners: [], trunkLids: new Map(), gameTableTops: new Map(),
     cloneVats: new Map(), slotMachineVisuals: new Map(), coinPusherVisuals: new Map(),
-    propAnims: new Map(), airHockeyVisuals: new Map(), tvScreens: new Map(),
+    propAnims: new Map(), airHockeyVisuals: new Map(), tvScreens: new Map(), arcadeScreens: new Map(),
   };
 }
 

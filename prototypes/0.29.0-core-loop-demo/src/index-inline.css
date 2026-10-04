@@ -1477,6 +1477,140 @@
         font-size: 11px;
         color: #d4a84b;
       }
+
+      /* 🕹 #193: the arcade stage — P1's emulator frame in a 4:3 panel, the
+         CRT pass over it, and the notices (NOT PROVISIONED, bring your copy). */
+      #arcade-stage {
+        position: fixed;
+        inset: 0;
+        z-index: 4800;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(0, 0, 0, 0.82);
+        font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+      }
+      .arcade-stage-panel {
+        width: min(92vw, 880px);
+        max-height: 96vh;
+        background: rgba(4, 8, 22, 0.97);
+        border: 1px solid rgba(212, 168, 75, 0.28);
+        border-radius: 12px;
+        box-shadow: 0 12px 64px rgba(0, 0, 0, 0.9);
+        padding: 12px 14px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        color: #d4a84b;
+      }
+      .arcade-stage-head {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        min-width: 0;
+      }
+      .arcade-stage-title {
+        flex: 1;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 1px;
+        color: #f0c060;
+      }
+      .arcade-stage-close,
+      .arcade-stage-controls button,
+      .arcade-stage-notice button {
+        background: rgba(212, 168, 75, 0.12);
+        border: 1px solid rgba(212, 168, 75, 0.4);
+        border-radius: 6px;
+        color: #f0c060;
+        font-family: inherit;
+        font-size: 11px;
+        font-weight: 800;
+        letter-spacing: 0.5px;
+        padding: 6px 10px;
+        cursor: pointer;
+      }
+      .arcade-stage-screen {
+        position: relative;
+        aspect-ratio: 4 / 3;
+        max-height: 70vh;
+        background: #000;
+        border-radius: 6px;
+        overflow: hidden;
+      }
+      .arcade-stage-screen > iframe.arcade-frame {
+        position: absolute;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        border: 0;
+        background: #000;
+      }
+      /* The CRT pass (#194's stopgap until the texture shader): scanlines and
+         a vignette over the picture, letting every click through. */
+      .arcade-crt {
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background:
+          repeating-linear-gradient(to bottom, rgba(0, 0, 0, 0) 0 2px, rgba(0, 0, 0, 0.22) 2px 3px),
+          radial-gradient(ellipse at center, rgba(0, 0, 0, 0) 58%, rgba(0, 0, 0, 0.55) 100%);
+      }
+      .arcade-stage-notice {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        padding: 18px;
+        text-align: center;
+        font-size: 12px;
+        letter-spacing: 1px;
+        color: #f0c060;
+        background: rgba(0, 0, 0, 0.84);
+      }
+      .arcade-stage-notice[hidden] { display: none; }
+      .arcade-stage-notice .arcade-stage-hint {
+        font-size: 10px;
+        letter-spacing: 0.5px;
+        line-height: 1.5;
+        color: #8fa3b8;
+        max-width: 60ch;
+      }
+      .arcade-stage-notice code {
+        font-size: 11px;
+        color: #2fe6a0;
+      }
+      .arcade-stage-lane {
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 1px;
+        color: rgba(224, 226, 238, 0.45);
+        text-transform: uppercase;
+      }
+      .arcade-stage-status {
+        font-size: 10px;
+        letter-spacing: 1px;
+        color: #8fa3b8;
+        text-transform: uppercase;
+      }
+      .arcade-stage-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+      }
+      .arcade-stage-controls input[type="file"] {
+        font-size: 10px;
+        color: #8fa3b8;
+        max-width: 240px;
+      }
       .tv-lane-badge {
         font-size: 8px;
         letter-spacing: 1px;

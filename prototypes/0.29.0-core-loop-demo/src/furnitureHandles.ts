@@ -35,6 +35,7 @@ import type {
   PropAnimHandle,
   AirHockeyVisualHandle,
   TvScreenHandle,
+  ArcadeScreenHandle,
 } from './devices';
 
 /**
@@ -68,6 +69,8 @@ export interface FurnitureHandleSinks {
   airHockeyVisuals: Map<string, AirHockeyVisualHandle>;
   /** 📺 Smart-TV screens, keyed by item id (#186 — redrawn at ~2 Hz from the room record). */
   tvScreens: Map<string, TvScreenHandle>;
+  /** 🕹 Arcade cabinet screens, keyed by item id (#193 — the attract card, "P1 · name"). */
+  arcadeScreens: Map<string, ArcadeScreenHandle>;
 }
 
 /**
@@ -101,4 +104,5 @@ export function registerFurnitureHandles(
   if (d.propAnim) sinks.propAnims.set(itemId, d.propAnim as PropAnimHandle);
   if (d.airHockey) sinks.airHockeyVisuals.set(itemId, d.airHockey as AirHockeyVisualHandle);
   if (d.tvScreen) sinks.tvScreens.set(itemId, d.tvScreen as TvScreenHandle);
+  if (d.arcadeScreen) sinks.arcadeScreens.set(itemId, d.arcadeScreen as ArcadeScreenHandle);
 }

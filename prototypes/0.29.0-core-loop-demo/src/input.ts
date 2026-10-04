@@ -16,7 +16,11 @@ export class InputManager {
     // Listen for keyboard events
     window.addEventListener('keydown', (e) => this.onKeyDown(e));
     window.addEventListener('keyup', (e) => this.onKeyUp(e));
-    
+    // A keyup that lands elsewhere (focus moved into the arcade cabinet's
+    // emulator frame, an alt-tab) would leave its key held here forever —
+    // the player walking into a wall. Losing the window's focus lets go.
+    window.addEventListener('blur', () => this.keys.clear());
+
     console.log('✅ Input manager initialized');
   }
   
