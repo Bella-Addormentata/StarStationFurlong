@@ -61,6 +61,7 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
       'http://127.0.0.1:9999/x', 'http://localhost:8080/x', 'http://10.0.0.5/x', 'http://192.168.1.20:8000/x',
       'http://172.16.0.1/x', 'http://169.254.169.254/latest/meta-data', 'http://[::1]:8080/x', 'http://[fe80::1]/x',
       'http://nas/film.mp4', 'http://nas.local/film.mp4', 'http://100.64.0.1/x', 'http://0.0.0.0/x',
+      'http://[ff02::1]/x', 'http://[ff15::efc0:988f]:6771/x', 'http://224.0.0.1/x',
     ];
     for (const u of inside) {
       expect(mediaConsent(url(u)), u).toBe('refuse');
@@ -91,7 +92,7 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
       '127.0.0.1', '127.9.9.9', '10.1.2.3', '172.16.0.1', '172.31.255.255', '192.168.0.1', '169.254.1.1', '0.0.0.0',
       '100.64.0.1', '224.0.0.1', '255.255.255.255', 'localhost', 'foo.localhost', 'nas', 'printer.local',
       'box.internal', 'tv.lan', 'pi.home.arpa', '[::1]', '[::]', '[fe80::1]', '[fd00::1]', '[fc00::1]',
-      '[::ffff:7f00:1]', '[::ffff:c0a8:101]', '[::ffff:127.0.0.1]',
+      '[::ffff:7f00:1]', '[::ffff:c0a8:101]', '[::ffff:127.0.0.1]', '[ff02::1]', '[ff15::efc0:988f]', '[ff0e::1]',
     ];
     for (const h of inside) expect(isPrivateHost(h), h).toBe(true);
     const outside = ['example.org', 'archive.org', '8.8.8.8', '172.15.0.1', '172.32.0.1', '100.63.0.1', '[2001:db8::1]', '[::ffff:808:808]'];

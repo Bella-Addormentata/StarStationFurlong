@@ -110,6 +110,7 @@ function isPrivateIPv6(ip: string): boolean {
   if (s === '::1' || s === '::') return true;
   if (/^fe[89ab]/.test(s)) return true; // link-local fe80::/10
   if (/^f[cd]/.test(s)) return true; // unique local fc00::/7
+  if (/^ff/.test(s)) return true; // multicast ff00::/8, every scope — the LSD groups included
   const hex = s.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/); // IPv4-mapped, as the URL parser writes it
   if (hex) {
     const hi = parseInt(hex[1]!, 16);

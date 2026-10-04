@@ -395,6 +395,45 @@ describe('a replay of a clip shorter than the seek band', () => {
     expect(ended).toBe(1); // the replay's own end, once
   });
 
+  it('a lazy holder\'s replay before the end is not called landed while the player still reads the old run: no beat from the old position, no close by the old end', () => {
+    const holder = new FakePlayer(true);
+    holder.lazy = true; // YouTube's asynchronous seekTo: the old position until the seek completes
+    holder.duration = 1_000;
+    let now = 100_000;
+    let pos = 0;
+    let jump = 0;
+    let started = 1;
+    let ended = 0;
+    const beats: number[] = [];
+    const c = new TvSyncController({
+      itemId: 'tv-1', player: holder, now: () => now, iHold: () => true,
+      playback: () => ({ state: 'playing', positionMs: pos, running: true, countdownMs: 0 }),
+      jump: () => jump, started: () => started,
+      heartbeat: (p) => beats.push(p), volume: () => 50, onEnded: () => { ended++; },
+    });
+    c.tick();
+    holder.position = 800; pos = 800;
+    now += TV_HEARTBEAT_MS; c.tick();
+    expect(beats).toEqual([0, 800]);
+    pos = 0; jump += 1; started += 1; // PLAY NOW again, 200 ms before the old run ends
+    now += 500; c.tick();
+    expect(holder.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']);
+    now += TV_HEARTBEAT_MS; c.tick(); // the player still reads 800: inside the band of 0, but not moved
+    expect(beats).toEqual([0, 800]); // the old run's position is not published as the new programme's
+    holder.position = 1_000; holder.playing = false; holder.ended = true; // the old run ends while the seek is still in flight
+    now += 500; c.tick();
+    expect(ended).toBe(0); // not the new programme's end
+    holder.land(); // the seek lands: the clip starts over
+    now += 500; c.tick();
+    expect(holder.ended).toBe(false);
+    expect(holder.playing).toBe(true);
+    now += TV_HEARTBEAT_MS; c.tick();
+    expect(beats.at(-1)).toBe(0); // the beat resumes from the new programme's start
+    holder.position = 1_000; holder.playing = false; holder.ended = true; pos = 1_000;
+    now += 500; c.tick();
+    expect(ended).toBe(1); // the replay's own end, once
+  });
+
   it('a viewer whose rewind is still landing is not seeked and played again every tick', () => {
     const p = new FakePlayer(true);
     p.lazy = true;
