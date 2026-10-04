@@ -3545,10 +3545,11 @@ export class DoorDockingPortSystem {
       : `<span>${accessLabel}</span>`;
     // 🚏🤖 DOCK SCHEDULED FERRIES AUTOMATICALLY (gateKeeper.ts): an empty
     // ferry has no key, so a gate for granted captains (or a closed one)
-    // never admits it.
+    // never admits it. The button names itself and says whether it is on
+    // (its ON/OFF text alone would not, read on its own).
     const autoLabel = policyNow.autoFerry ? "ON" : "OFF";
     const autoBtn = owner
-      ? `<button type="button" data-dock-action="gate-auto-ferry" title="Dock scheduled ferries automatically: when a route ferry calls at this gate with nobody aboard, a game in this module docks it on arrival and casts it off at its departure. The ferry must have docked in this module once with someone aboard." style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:${policyNow.autoFerry ? "#00e676" : "#f2efe6"}; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${autoLabel}</button>`
+      ? `<button type="button" data-dock-action="gate-auto-ferry" title="Dock scheduled ferries automatically: when a route ferry calls at this gate with nobody aboard, a game in this module docks it on arrival and casts it off at its departure. The ferry must have docked in this module once with someone aboard." aria-label="Dock scheduled ferries automatically" aria-pressed="${policyNow.autoFerry ? "true" : "false"}" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:${policyNow.autoFerry ? "#00e676" : "#f2efe6"}; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${autoLabel}</button>`
       : `<span>${autoLabel}</span>`;
     const autoShut = policyNow.autoFerry && (policyNow.gateAccess === "pass" || policyNow.gateAccess === "closed");
     const gateLine = readDoorPolicy(doorId).adapter

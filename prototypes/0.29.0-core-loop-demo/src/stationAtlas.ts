@@ -1087,11 +1087,14 @@ function squaresOverlap(a: OrientedSquare, b: OrientedSquare, half: number): boo
  * JOINED (skipped — that's a connection, not a collision, and matches
  * detectChainContact's match); a clash is a footprint overlap with a DIFFERENT,
  * farther module, or with the current room's own hull at the origin.
+ * 🚏🤖 `joining` names the room the candidate IS (the station's gate keeper
+ * docking a known ferry: gateKeeper.ts): then that module alone is skipped,
+ * wherever the atlas has it, and every other one clashes however close.
  */
 export function moduleOverlapAt(
   currentRoomId: string,
   candidate: { x: number; z: number; rotY: number },
-  opts?: { connectDist?: number; maxHops?: number; moduleHalf?: number },
+  opts?: { connectDist?: number; maxHops?: number; moduleHalf?: number; joining?: string },
 ): { roomId: string; name: string } | null {
   if (!currentRoomId) return null;
   const connectDist = opts?.connectDist ?? MODULE_CONNECT_DIST;
@@ -1101,9 +1104,11 @@ export function moduleOverlapAt(
     { roomId: currentRoomId, name: atlas[currentRoomId]?.name ?? 'this module', x: 0, z: 0, rotY: 0 },
     ...atlasLayout(currentRoomId, opts?.maxHops ?? 8),
   ];
+  const joining = opts?.joining;
   for (const mod of modules) {
     const isCurrent = mod.roomId === currentRoomId;
-    if (!isCurrent && Math.hypot(mod.x - candidate.x, mod.z - candidate.z) <= connectDist) continue;
+    if (joining !== undefined ? mod.roomId === joining
+      : !isCurrent && Math.hypot(mod.x - candidate.x, mod.z - candidate.z) <= connectDist) continue;
     if (squaresOverlap(candidate, mod, half)) return { roomId: mod.roomId, name: mod.name };
   }
   return null;

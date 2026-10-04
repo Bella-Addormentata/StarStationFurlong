@@ -86,28 +86,33 @@
  * itself (the gate admits it, and its module would overlap no other there),
  * once this room is not in flight; at any other gate the keeper watches, the
  * ferry's port lets go of it once it has held it alone for GATE_STALE_MS.
- * While a station move or a tow locks the docks, nothing is fixed at either
- * end: every ship docked rides along, and none leaves or joins. A dock
- * the gate holds that the ferry has provably let go (its port undocked after
- * it, or docked elsewhere since) or has not held for GATE_STALE_MS is let go
- * at the gate; an undock made at the gate after the ferry's dock reaches the
- * ferry; and a gate that has taken another pairing, or whose port was taken
- * off since, keeps what it holds while the ferry's port lets go. A claim at a
- * gate that the keeper has not yet seen the ferry's port hold, a dock its port
- * holds alone, or a gate that let go of the ferry before its port was seen to,
- * keeps a session open until the two ends agree, whatever the route does
- * (paused, ended or finished). So does what the keeper left under way at a
- * gate whose AUTO-DOCK is switched off since: it is settled there, but nothing
- * new is docked or cast off at that gate. A write to the ferry's room that is
- * never acknowledged hangs its session up, so nothing is read from a doc the
- * room may never hold: a fresh session reads what the room does hold (at once,
- * then backing off while acknowledgments keep failing), and what is missing is
- * written again; a checkpoint never acknowledged is told to every stop once a
- * session reads what the room holds. The keeper watches each ferry by its
- * route port: when the entry here stops calling here by that port (a newer
- * route leaves this room out or calls by another port, or the capped
- * departures map evicts it), what it left under way is still settled, by that
- * port and the address it last dialled, before it forgets the ferry.
+ * While a station move or a tow locks the docks (one this game knows, or one
+ * the ferry's room holds that this game has not heard of yet, which it then
+ * learns), nothing is fixed at either end: every ship docked rides along, and
+ * none leaves or joins. A dock the gate holds that the ferry has provably let
+ * go (its port undocked after it, or docked elsewhere since) or has not held
+ * for GATE_STALE_MS is let go at the gate; an undock made at the gate after
+ * the ferry's dock reaches the ferry; and a gate that has taken another
+ * pairing, or whose port was taken off since, keeps what it holds while the
+ * ferry's port lets go. A claim at a gate that the keeper has not yet seen the
+ * ferry's port hold, a dock its port holds alone, or a gate that let go of the
+ * ferry before its port was seen to, keeps a session open until the two ends
+ * agree, whatever the route does (paused, ended or finished). So does what the
+ * keeper left under way at a gate whose AUTO-DOCK is switched off since: it is
+ * settled there, but nothing new is docked or cast off at that gate. A fresh
+ * keeper (a reload, or the player came in) reads once the doors of each ferry
+ * it can name whose timetable brings no session (no gate here admits it, or
+ * its route is paused, ended or finished), so a dock its port holds alone is
+ * found there too. A write to the ferry's room that is never acknowledged
+ * hangs its session up, so nothing is read from a doc the room may never hold:
+ * a fresh session reads what the room does hold (at once, then backing off
+ * while acknowledgments keep failing), and what is missing is written again; a
+ * checkpoint never acknowledged is told to every stop once a session reads
+ * what the room holds. The keeper watches each ferry by its route port: when
+ * the entry here stops calling here by that port (a newer route leaves this
+ * room out or calls by another port, or the capped departures map evicts it),
+ * what it left under way is still settled, by that port and the address it
+ * last dialled, before it forgets the ferry.
  *
  * ─── Limits (v1) ─────────────────────────────────────────────────────────────
  *
@@ -191,7 +196,7 @@ import {
 import { ROOM_SESSION_OPEN_MS } from './roomSession';
 import { TANK_CAPACITY, castOffHoldIn } from './shipDoc';
 import { roomIdFromSeed } from './stationAtlas';
-import { rememberMovesIn } from './stationMove';
+import { rememberMovesIn, roomDocLockedByMove } from './stationMove';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -460,17 +465,26 @@ export interface FerryLook {
   checkpoints: readonly RouteCheckpoint[];
 }
 
+/** Most furniture records tankCapacityIn visits in the ferry's room: the
+ *  map is peer-written, and a flood of it must not make every tick of
+ *  every session a long walk. Far above any module's furniture. */
+export const MAX_FURNITURE_SCANNED = 1_024;
+
 /** The ferry's tanks' capacity as its own room's doc has them: tanks ×
  *  TANK_CAPACITY, counted over that doc's furniture map as
  *  devices.shipFuelCapacity counts the live room's (a record that fails
- *  furnitureDoc's shape check is no tank). What its riders' timetable clamps
- *  to, whatever a board's copy says. Pure over the doc. */
+ *  furnitureDoc's shape check is no tank), over at most
+ *  MAX_FURNITURE_SCANNED records, and never more than a departures entry
+ *  may carry (departuresDoc.MAX_CAPACITY). What its riders' timetable
+ *  clamps to, whatever a board's copy says. Pure over the doc. */
 export function tankCapacityIn(doc: Y.Doc): number {
   let tanks = 0;
+  let scanned = 0;
   for (const value of doc.getMap('furniture').values()) {
+    if (++scanned > MAX_FURNITURE_SCANNED) break;
     if (isFurnitureRecord(value) && FURNITURE_DEFS[value.kind]?.functions?.includes('fuelTank') === true) tanks++;
   }
-  return tanks * TANK_CAPACITY;
+  return Math.min(tanks * TANK_CAPACITY, MAX_CAPACITY);
 }
 
 function classify(rec: DoorRecord | undefined): DockPortState {
@@ -1211,6 +1225,12 @@ interface Watch {
   /** The ferry's tanks' capacity as a session last read its doc (null
    *  before the first): what the station look plans with (lookCapacity). */
   capacityRead: number | null;
+  /** A session of this watch has read the ferry's doors. Until one has, its
+   *  port may hold a dock alone to one of this room's gates that nothing
+   *  here shows (a far write that never landed here, and the keeper that
+   *  made it gone: a reload, or the player came in), so tend reads them once
+   *  even where its timetable would bring no session. */
+  probed: boolean;
 }
 
 /** A gate pairing's key: its gate and its stamp. */
@@ -1276,6 +1296,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         managed: new Set(),
         refreshed: false,
         capacityRead: null,
+        probed: false,
       };
       watches.set(key, w);
     }
@@ -1366,11 +1387,12 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     w.ackBackoffMs = Math.min(Math.max(w.ackBackoffMs * 2, GATE_REDIAL_MS), GATE_REDIAL_MAX_MS);
   };
 
-  /** Publish the ferry as its doc has it now: here, and (after this keeper's
-   *  own checkpoint write) to every other stop's room. A finished route goes
+  /** Publish the ferry as its doc has it now, with the tanks' `capacity` act
+   *  read there this tick: here, and (after this keeper's own checkpoint
+   *  write) to every other stop's room. A finished route goes
    *  with the run it ended (🏁 endedRun), as its riders' finish does, so a
    *  board ranks it above every snapshot of that run. */
-  const publish = (w: Watch, ferry: DepartureFerry, everywhere: boolean, legSeq: number | null): void => {
+  const publish = (w: Watch, ferry: DepartureFerry, everywhere: boolean, legSeq: number | null, capacity: number): void => {
     const now = clock();
     const news = newsOf(w, now);
     if (!news || !w.session) return;
@@ -1378,7 +1400,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const pub: DeparturesPublish = {
       shipRoomId: ferry.shipRoomId,
       name: ferry.name,
-      capacity: tankCapacityIn(w.session.doc),
+      capacity,
       route: news.route,
       checkpoints: [...news.checkpoints],
       at: now,
@@ -1437,6 +1459,14 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const near = (doorId: string) => nearOf(w, doorId);
     const port = readDoorFrom(session.doc, shipPort);
     const views = [...gates, ...retired];
+    // As the keeper's own dock checks (act, GateEnd.live), and by the moves
+    // the ferry's room holds too, as its room judges a DOCK or an UNDOCK
+    // (farDoorWrite): a station move or a tow this game has not heard of yet
+    // still locks the docks, and is learned, so this game's own lock holds
+    // them from now on.
+    const farLocked = safe(() => roomDocLockedByMove(session.doc, w.ship, now), true);
+    if (farLocked) safe(() => rememberMovesIn(session.doc), undefined);
+    const locked = farLocked || safe(() => deps.dockLocked?.([roomId, w.ship], now) === true, false);
     const fixes = gateFixes({
       gates: views,
       port,
@@ -1446,8 +1476,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       near,
       heldFor: heldFor(w, now),
       portHeldFor: portHeldFor(w, now),
-      // As the keeper's own dock checks (act, GateEnd.live).
-      locked: safe(() => deps.dockLocked?.([roomId, w.ship], now) === true, false),
+      locked,
       mayPair: safe(deps.mayPair, true),
       overlap: (g, mine) => overlapAt(w, g.doorId, mine),
       now,
@@ -1485,7 +1514,11 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       else w.managed.delete(g.doorId);
     }
     // The ferry's port agrees with the gate (as this fresh look has it).
-    if (!fixes.some((f) => f.kind === 'release-ferry')) w.repair = false;
+    // Not while the docks are locked: nothing is fixed then, so a release of
+    // this keeper's never acknowledged keeps the session until the lock
+    // lifts, when the gate's tombstone (it let go after the port's dock) has
+    // the port let go too.
+    if (!locked && !fixes.some((f) => f.kind === 'release-ferry')) w.repair = false;
     if (fixes.length === 0) return false;
     for (const fix of fixes) {
       const end = gateEnd(w, fix.gate, roomId);
@@ -1544,6 +1577,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     now: number,
   ): void => {
     const session = w.session!;
+    w.probed = true;
     // The ferry's tanks as its own doc has them: what its riders' timetable
     // clamps to, whatever the entry here says (and what the station look
     // plans with from now on).
@@ -1568,7 +1602,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     if (!w.refreshed) {
       w.refreshed = true;
       if (w.unpublished !== null || !sameNews(news, ferry) || capacity !== ferry.capacity) {
-        publish(w, ferry, w.unpublished !== null, w.unpublished);
+        publish(w, ferry, w.unpublished !== null, w.unpublished, capacity);
       }
       w.unpublished = null;
     }
@@ -1637,7 +1671,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
             return;
           }
           w.ackBackoffMs = 0;
-          publish(w, ferry, true, legSeq);
+          publish(w, ferry, true, legSeq, capacity);
           if (move.why === 'restart') {
             const gate = gates.find((g) => holdsFerry(g.record, w.ship, route.shipPort));
             if (gate) safe(() => deps.note?.(gate.doorId, `${ferry.name} was still docked after its departure: its stay starts again.`, 'warn'), undefined);
@@ -1792,7 +1826,10 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     // calls here.
     const unsettled = w.repair || pending || (ferry !== null && w.unpublished !== null);
     if (!ferry && !unsettled) return false;
-    if (holding.length === 0 && !admitting && !unsettled) {
+    // A watch no session has read yet (Watch.probed), of a ferry this room
+    // can dial.
+    const unprobed = !w.probed && !!berthing;
+    if (holding.length === 0 && !admitting && !unsettled && !unprobed) {
       hangUp(w);
       return true;
     }
@@ -1801,7 +1838,13 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const look = ferry && running
       ? stationLook({ ...ferry, capacity: lookCapacity(ferry.capacity, w.capacityRead) }, room, boardDocksOf(doors, w.ship), now, w.stationCache, w.aheadCache)
       : null;
-    if (!unsettled && !(look && gateSessionWanted(look, now))) {
+    // It reads the ferry's doors at once, unless its timetable will bring a
+    // session anyway (a gate here admits it, and its route runs on, unpaused,
+    // toward a call here): with no gate here admitting it, or its route
+    // paused, ended or finished, none would, and a dock its port holds alone
+    // to one of these gates would stay (gateFixes takes it or lets it go).
+    const probing = unprobed && !(admitting && !!look?.f && !look.f.paused && look.f.ended === null);
+    if (!unsettled && !probing && !(look && gateSessionWanted(look, now))) {
       hangUp(w);
       return true;
     }

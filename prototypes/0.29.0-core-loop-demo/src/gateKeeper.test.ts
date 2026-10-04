@@ -15,9 +15,11 @@
  * another module, a board's copy of the ferry's tanks, a finish this board
  * missed, a dock locked while its claim settled, and a ferry that stops
  * calling here by its port; a session dialled before the arrival while every
- * gate is taken, a dock never acknowledged at a gate switched off meanwhile,
- * a station move or a tow holding every fix back, and a ferry port whose
- * address does not parse.
+ * gate is taken, a dock never acknowledged at a gate switched off meanwhile, a
+ * station move or a tow holding every fix back (one only the ferry's room
+ * holds included), a dock withdrawn as a lock starts, a ferry a fresh keeper
+ * reads once (its only gate closed to it, or its route paused or finished), a
+ * flooded furniture map, and a ferry port whose address does not parse.
  */
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -40,6 +42,7 @@ import {
   GATE_REDIAL_MS,
   GATE_SESSION_MAX_MS,
   GATE_STALE_MS,
+  MAX_FURNITURE_SCANNED,
   createGateKeeper,
   callClose,
   dockableGates,
@@ -208,6 +211,24 @@ const ferryMove = (at: number): StationMove => ({
 });
 function bookMoveIn(doc: Y.Doc, move: StationMove): void {
   doc.getMap('stationMoves').set(`move:1:${move.departAt}:${move.welcomeRoomId}`, move);
+}
+
+/** Run `fn` with a localStorage of its own: where this install remembers
+ *  the moves it learns (stationMove.rememberMove). */
+async function withStorage(fn: () => Promise<void>): Promise<void> {
+  const stored = new Map<string, string>();
+  const g = globalThis as { localStorage?: unknown };
+  const had = g.localStorage;
+  g.localStorage = {
+    getItem: (k: string) => stored.get(k) ?? null,
+    setItem: (k: string, v: string) => void stored.set(k, v),
+    removeItem: (k: string) => void stored.delete(k),
+  };
+  try {
+    await fn();
+  } finally {
+    g.localStorage = had;
+  }
 }
 
 // ── Which record names the ferry ─────────────────────────────────────────────
@@ -484,6 +505,20 @@ describe("the ferry's own view, and what the gate does with its keeper's step", 
     furniture.set('bent', { kind: 'fuel-tank', x: 0, z: 2, rot: 5, movable: true });
     furniture.set('odd', { kind: 'fuel-tank', x: 'far', z: 2, rot: 0, movable: true });
     expect(tankCapacityIn(doc)).toBe(3 * TANK_CAPACITY);
+  });
+
+  // Copilot (PR 204): that map is any peer's to write, and each session
+  // reads it every tick.
+  it('counts them over at most MAX_FURNITURE_SCANNED records, never past what a departures entry may carry', () => {
+    const doc = new Y.Doc();
+    const furniture = doc.getMap('furniture');
+    for (let i = 0; i < MAX_FURNITURE_SCANNED; i++) furniture.set(`junk-${i}`, { kind: 'sofa-back', x: i, z: 0, rot: 0, movable: true });
+    fitTanks(doc, 3);
+    // The tanks past the bound are never reached.
+    expect(tankCapacityIn(doc)).toBe(0);
+    const flooded = new Y.Doc();
+    fitTanks(flooded, 5 * MAX_FURNITURE_SCANNED);
+    expect(tankCapacityIn(flooded)).toBe(Math.min(MAX_FURNITURE_SCANNED * TANK_CAPACITY, MAX_CAPACITY));
   });
 });
 
@@ -1210,6 +1245,61 @@ describe('the gate keeper over a stand-in session', () => {
     expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
   });
 
+  // Copilot (PR 204): a dock the ferry's port holds alone to a gate here
+  // that no longer admits it brings no session of its timetable's, nor does
+  // a paused or finished route: a fresh keeper reads the ferry's doors once
+  // anyway.
+  it("reads the ferry's doors once though its only gate is closed to it, and lets go of the dock its port holds alone there", async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0) });
+    h.auto = new Set(['x+']);
+    h.access['x+'] = 'closed';
+    const keeper = createGateKeeper(deps);
+    const t = D0 + SEC;
+    await tickAt(keeper, h, t);
+    expect(h.opened).toEqual([seed(FERRY)]);
+    await tickAt(keeper, h, t + SEC);
+    await tickAt(keeper, h, t + SEC + GATE_STALE_MS - 1);
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+    const freed = t + SEC + GATE_STALE_MS;
+    await tickAt(keeper, h, freed);
+    expect(readDoorFrom(h.ferry, PORT))
+      .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: freed }));
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+    // Nothing is left to settle: it hangs up, and dials on it no more.
+    for (const at of [freed + SEC, freed + 2 * SEC, DEPART + HOUR]) await tickAt(keeper, h, at);
+    expect(keeper.sessions()).toEqual([]);
+    expect(h.opened).toHaveLength(1);
+  });
+
+  it("reads a paused or finished ferry's doors once, and lets its port go from a gate that let go after its dock", async () => {
+    for (const how of ['paused', 'finished'] as const) {
+      const { h, deps } = harness({
+        port: portDockedAt(D0),
+        gateRec: memoryOf(D0 + 1),
+        ...(how === 'paused' ? { ckpts: [S, pauseCheckpoint(R, 1, { at: D0 + SEC })!] } : {}),
+      });
+      if (how === 'finished') {
+        const { startedAt: _run, startStop: _from, ...saved } = R;
+        const ship = h.ferry.getMap('ship');
+        for (const k of [...ship.keys()]) if (k !== 'route') ship.delete(k);
+        ship.set('route', routeToWire(saved as ShipRoute));
+        h.entry = entry({ route: saved as ShipRoute, checkpoints: [], endedRun: T0 });
+      }
+      const keeper = createGateKeeper(deps);
+      const t = D0 + 2 * SEC;
+      await tickAt(keeper, h, t);
+      expect(h.opened).toEqual([seed(FERRY)]);
+      await tickAt(keeper, h, t + SEC);
+      expect(readDoorFrom(h.ferry, PORT))
+        .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }));
+      expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+      await tickAt(keeper, h, t + 2 * SEC);
+      await tickAt(keeper, h, t + 3 * SEC);
+      expect(keeper.sessions()).toEqual([]);
+      expect(h.opened).toHaveLength(1);
+    }
+  });
+
   it('restarts a stay found docked at its gate past the departure, publishes it, and casts off at the new departure', async () => {
     const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
     const keeper = createGateKeeper(deps);
@@ -1230,6 +1320,33 @@ describe('the gate keeper over a stand-in session', () => {
     await tickAt(keeper, h, ms(next) + GATE_CAST_OFF_DEFER_MS);
     expect(readDoorFrom(h.station, 'x+')?.paired).toBe(false);
     expect(readDoorFrom(h.ferry, PORT)?.paired).toBe(false);
+  });
+
+  // Copilot (PR 204): the ferry's tanks are read once a step, and the boards
+  // are told the tanks its checkpoint was planned on.
+  it('tells the boards the tanks a checkpoint was planned on, as its step read them', async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+    const open = deps.open;
+    deps.open = async (address) => {
+      const s = await open(address);
+      return s && {
+        doc: s.doc,
+        confirm: (since: Uint8Array, ms: number) => {
+          // Five more tanks are fitted while the ferry's room is asked.
+          fitTanks(h.ferry, TANKS + 5);
+          return s.confirm(since, ms);
+        },
+        close: () => s.close(),
+        get closed() {
+          return s.closed;
+        },
+      };
+    };
+    const keeper = createGateKeeper(deps);
+    const late = DEPART + HOUR;
+    await tickAt(keeper, h, late);
+    await tickAt(keeper, h, late + SEC);
+    expect(h.published.map(([room, pub]) => [room, pub.capacity])).toEqual([['here', CAPACITY], ['room-0', CAPACITY]]);
   });
 
   it("takes a dock the ferry's port holds to its gate when the far write never landed", async () => {
@@ -1305,19 +1422,11 @@ describe('the gate keeper over a stand-in session', () => {
       .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: t + SEC }));
   });
 
-  it("casts off neither end while the ferry's room holds a move this game never heard of, and learns it", async () => {
-    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
-    const move = ferryMove(DEPART - MIN);
-    bookMoveIn(h.ferry, move);
-    const stored = new Map<string, string>();
-    const g = globalThis as { localStorage?: unknown };
-    const had = g.localStorage;
-    g.localStorage = {
-      getItem: (k: string) => stored.get(k) ?? null,
-      setItem: (k: string, v: string) => void stored.set(k, v),
-      removeItem: (k: string) => void stored.delete(k),
-    };
-    try {
+  it("casts off neither end while the ferry's room holds a move this game never heard of, and learns it", () =>
+    withStorage(async () => {
+      const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+      const move = ferryMove(DEPART - MIN);
+      bookMoveIn(h.ferry, move);
       const keeper = createGateKeeper(deps);
       await tickAt(keeper, h, DEPART - GATE_PRE_DIAL_MS + SEC);
       const t = DEPART + GATE_CAST_OFF_DEFER_MS;
@@ -1328,10 +1437,32 @@ describe('the gate keeper over a stand-in session', () => {
       expect(h.notes).toEqual([]);
       // This install now carries that move on, as a far session's would.
       expect(readRememberedMoves()).toEqual([expect.objectContaining({ welcomeRoomId: FERRY, departAt: move.departAt })]);
-    } finally {
-      g.localStorage = had;
-    }
-  });
+    }));
+
+  // Copilot (PR 204): the gate follows the ferry by the moves its room holds
+  // too, as its room judges a DOCK or an UNDOCK: a join at the gate over a
+  // move this game never heard of would change a dock the move locks.
+  it("fixes neither end while the ferry's room holds a move this game never heard of, learns it, and fixes them once it arrives", () =>
+    withStorage(async () => {
+      const x = ARRIVE + 2 * SEC;
+      const { h, deps } = harness({ port: portDockedAt(x) });
+      const move = ferryMove(ARRIVE);
+      bookMoveIn(h.ferry, move);
+      const keeper = createGateKeeper(deps);
+      const t = ARRIVE + 3 * SEC;
+      await tickAt(keeper, h, t);
+      await tickAt(keeper, h, t + SEC);
+      await tickAt(keeper, h, t + SEC + GATE_STALE_MS);
+      expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+      expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(x));
+      expect(keeper.sessions()).toEqual([FERRY]);
+      expect(readRememberedMoves()).toEqual([expect.objectContaining({ welcomeRoomId: FERRY, departAt: move.departAt })]);
+      // It arrives: the gate takes the dock the ferry's port holds.
+      const after = move.arriveAt + SEC;
+      for (const at of [after, after + SEC, after + 2 * SEC]) await tickAt(keeper, h, at);
+      expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(x));
+      expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(x));
+    }));
 
   /** A dock the ferry's port holds alone at gate x+ (its far write never
    *  landed) where `setUp` keeps the gate from taking it: the keeper watches
@@ -1942,6 +2073,43 @@ describe('the gate keeper over a stand-in session', () => {
     await tickAt(keeper, h, D0 + 3 * SEC);
     await tickAt(keeper, h, D0 + 4 * SEC);
     expect(keeper.sessions()).toEqual([]);
+  });
+
+  // Copilot (PR 204): a dock withdrawn as it lands because a lock started,
+  // its release never acknowledged: the gate's tombstone (it let go after
+  // the port's dock) has the port let go once the lock lifts, and the gate
+  // never takes the withdrawn dock back.
+  it("lets the ferry's port go from a dock withdrawn as a lock starts, its release never acknowledged, once the lock lifts", async () => {
+    const { h, deps } = harness({ replica: true });
+    h.auto.delete('y-');
+    let locked = false;
+    deps.dockLocked = () => locked;
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, ARRIVE + SEC);
+    let n = 0;
+    h.wait = async () => {
+      if (++n !== 2) return;
+      locked = true;
+      h.ack = false;
+    };
+    await tickAt(keeper, h, D0);
+    // The gate let go at once; the ferry's room took the dock, not its release.
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+    h.ack = true;
+    h.wait = instant;
+    // While the lock holds, neither end is written, and the keeper keeps
+    // watching the ferry.
+    for (const at of [D0 + SEC, D0 + 2 * SEC, D0 + 3 * SEC]) await tickAt(keeper, h, at);
+    expect(keeper.sessions()).toEqual([FERRY]);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+    locked = false;
+    await tickAt(keeper, h, D0 + 4 * SEC);
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(
+      buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }),
+    );
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
   });
 
   // Copilot (PR 204): a gate that takes another pairing never gives it up,

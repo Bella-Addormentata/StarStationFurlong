@@ -1453,7 +1453,9 @@ const gateKeeper = createGateKeeper({
   ownAddress: resolveOwnRoomAddress,
   doorPose: (doorId) => world?.dockingSystem?.doorWallLateral(doorId) ?? null,
   // 🛰️ As a DOCK checks (docking.ts redockPortAnswer): the ferry, docked at
-  // this gate, must not land on another module of the station.
+  // this gate, must not land on another module of the station. Only the
+  // ferry's own module may sit there: the candidate is the ferry, so no
+  // module of the station near it counts as the berth being joined.
   overlap: (doorId, ferry) => {
     const pose = world?.dockingSystem?.doorWallLateral(doorId);
     if (!pose) return null;
@@ -1465,7 +1467,7 @@ const gateKeeper = createGateKeeper({
       ferry.farLateral ?? 0,
       ferry.farWall ? halfAlongWall(readAtlas()[ferry.roomId]?.dims, ferry.farWall) : undefined,
     );
-    return moduleOverlapAt(activeBootstrap?.roomId ?? "", at)?.name ?? null;
+    return moduleOverlapAt(activeBootstrap?.roomId ?? "", at, { joining: ferry.roomId })?.name ?? null;
   },
   writeDoor: (doorId, rec) => {
     if (yjsSync) writeDoorRecordTo(yjsSync.doc, doorId, rec);
