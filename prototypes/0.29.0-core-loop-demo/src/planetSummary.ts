@@ -499,23 +499,38 @@ export function legEndFields(
   };
 }
 
+/** 🚚 The two ends of a leg a ruling timetable flies (`places`, as
+ *  legEndFields reads it), as that timetable planned them: the route's
+ *  copies, under ids no station-keeping trim resolver knows (pilotRoute plans
+ *  each stop as `route-stop:<index>`). A course drawn through this client's
+ *  trims instead would part from the times the timetable worked out (a jump
+ *  at arrival), and differ between games that heard of different trims.
+ *  Null outside a leg. */
+export function routeLegEnds(
+  places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
+): [LegEnd, LegEnd] | null {
+  if (!places?.to) return null;
+  return [
+    { id: 'route-stop:from', planetId: planetById(places.from.planetId).id, orbitSlot: places.from.orbitSlot },
+    { id: 'route-stop:to', planetId: planetById(places.to.planetId).id, orbitSlot: places.to.orbitSlot },
+  ];
+}
+
 /** 🚚 A summary-backed flight's two ends where its ferry flies them: the
  *  route's copies its summary carries, though a stop's station has moved
- *  planets since. Each goes by the id `idOf` gives its room here (station
- *  ids are per install, and a trim follows the id), else by the room
- *  itself. Null when the summary carries no copies, or names no rooms: the
- *  reader places the ends by its station list. */
+ *  planets since, untrimmed as its timetable planned them (routeLegEnds).
+ *  Null when the summary carries no copies, or names no rooms: the reader
+ *  places the ends by its station list. */
 export function summaryLegEnds(
   s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'>,
-  idOf: (room: string) => string | undefined = () => undefined,
 ): [LegEnd, LegEnd] | null {
   const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot } = s;
   if (!fromRoom || !toRoom || fromPlanetId === undefined || fromSlot === undefined
     || toPlanetId === undefined || toSlot === undefined) return null;
-  return [
-    { id: idOf(fromRoom) ?? fromRoom, planetId: planetById(fromPlanetId).id, orbitSlot: fromSlot },
-    { id: idOf(toRoom) ?? toRoom, planetId: planetById(toPlanetId).id, orbitSlot: toSlot },
-  ];
+  return routeLegEnds({
+    from: { planetId: fromPlanetId, orbitSlot: fromSlot },
+    to: { planetId: toPlanetId, orbitSlot: toSlot },
+  });
 }
 
 // ── The local store (what this install has learned) ──────────────────────────
