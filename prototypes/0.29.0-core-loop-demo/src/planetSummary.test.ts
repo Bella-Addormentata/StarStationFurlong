@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { ORBIT_EPOCH_MS, orbitForSlot, setStationTrimResolver, stationOrbit } from './orbits';
+import { ORBIT_EPOCH_MS, orbitForSlot, planTransfer, setStationTrimResolver, stationOrbit } from './orbits';
 import {
   LEARNED_PREFIX,
   MAX_TRIM_GONE,
@@ -19,6 +19,7 @@ import {
   foldOwnStation,
   installTrimResolver,
   learnedRecord,
+  legEndFields,
   mergeStation,
   publishPlanetSummary,
   ROUTE_SUMMARY_REFRESH_MS,
@@ -29,11 +30,13 @@ import {
   shipsAroundPlanet,
   subscribePlanetSummary,
   summaryForStation,
+  summaryLegEnds,
   summaryPlanet,
   systemStationNames,
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
+import type { RouteFlightPlaces } from './pilotRoute';
 import type { OrbitTrim } from './stationKeeping';
 import { DEFAULT_PLANET_ID, listStations, readStationRecords, registerStation, setStationMoveResolver } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -265,6 +268,24 @@ describe('guards', () => {
     // A clock a little ahead is still a stamp.
     const ahead = { ...ship, routeRun: T0 + 60_000, routeNews: T0 + 6 * 3600_000 };
     expect(cleanShipSummary(ahead, T0)).toEqual(ahead);
+  });
+
+  it('🚚 keeps a ferry leg\'s copied ends only all four together, on one planet', () => {
+    const ship = {
+      roomId: 'room-ship', name: 'FERRY', planetId: SOV, status: 'in-flight', fromRoom: 'a', toRoom: 'b', departedAt: T0, etaAt: T0 + 60_000,
+      fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3, updatedAt: T0,
+    };
+    expect(cleanShipSummary(ship, T0)).toEqual(ship);
+    expect(cleanShipSummary({ ...ship, fromPlanetId: ARIS, toPlanetId: ARIS }, T0)).toMatchObject({ fromPlanetId: ARIS, toSlot: 3 });
+    for (const [field, bad] of [['fromPlanetId', ''], ['fromPlanetId', 7], ['fromSlot', -1], ['fromSlot', 16], ['fromSlot', 1.5],
+      ['toPlanetId', 'p'.repeat(129)], ['toSlot', '3'], ['toSlot', undefined],
+      // A leg never crosses planets.
+      ['toPlanetId', ARIS]] as const) {
+      const clean = cleanShipSummary({ ...ship, [field]: bad }, T0);
+      expect(clean).not.toBeNull();
+      for (const f of ['fromPlanetId', 'fromSlot', 'toPlanetId', 'toSlot']) expect(clean).not.toHaveProperty(f);
+      expect(clean).toMatchObject({ status: 'in-flight', fromRoom: 'a', toRoom: 'b', etaAt: T0 + 60_000 });
+    }
   });
 
   it('🏁 keeps "no run flies" only as said, and never beside a route status', () => {
@@ -972,6 +993,66 @@ describe('ships and the solar system', () => {
     expect((doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt).toBe(first);
     publishPlanetSummary(first + 3600 * 1000);
     expect((doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt).toBe(first + 3600 * 1000);
+  });
+
+  it('🚚 says a leg\'s copied ends only in flight, and reads them back under this install\'s ids', () => {
+    const places: RouteFlightPlaces = {
+      from: { id: 'st-x', planetId: SOV, orbitSlot: 1 },
+      to: { id: 'st-y', planetId: 'planet-nowhere', orbitSlot: 3 },
+    };
+    // An unknown planet reads as the default one, as the station list reads it.
+    expect(legEndFields(places)).toEqual({ fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3 });
+    expect(legEndFields({ ...places, to: null })).toEqual({});
+    expect(legEndFields(null)).toEqual({});
+    const s = { fromRoom: 'room-a', toRoom: 'room-b', ...legEndFields(places) };
+    expect(summaryLegEnds(s, (room) => (room === 'room-a' ? 'st-a' : undefined))).toEqual([
+      { id: 'st-a', planetId: SOV, orbitSlot: 1 },
+      { id: 'room-b', planetId: SOV, orbitSlot: 3 },
+    ]);
+    // An older client's relay drops the copies: the reader places the ends.
+    expect(summaryLegEnds({ fromRoom: 'room-a', toRoom: 'room-b' })).toBeNull();
+    expect(summaryLegEnds({ ...s, toRoom: undefined })).toBeNull();
+  });
+
+  it('🚚 an install that first hears of a leg after its next stop moved planets places it where the route copied the stop', () => {
+    // The ferry's game: its route copied ALPHA (slot 1) and BRAVO (slot 3)
+    // around SOVEREIGN, and its timetable flies the leg between them.
+    const now = Date.now();
+    const departedAt = now - 60_000;
+    const places: RouteFlightPlaces = {
+      from: { id: 'f-alpha', planetId: SOV, orbitSlot: 1 },
+      to: { id: 'f-bravo', planetId: SOV, orbitSlot: 3 },
+    };
+    const leg: ShipStatusInput = {
+      ...ship, status: 'in-flight', fromRoom: 'room-alpha', toRoom: 'room-bravo', departedAt, etaAt: now + 3600_000,
+      ...legEndFields(places),
+    };
+    const docA = new Y.Doc();
+    bindPlanetSummaryDoc(docA, install(null, { ship: () => leg }));
+    // Another install, which lists BRAVO at ARIS PRIME now (its move arrived
+    // before the leg left), hears of the leg for the first time.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    registerStation(record({ id: 'o-alpha', name: 'ALPHA', orbitSlot: 1, welcomeRoomId: 'room-alpha' }));
+    registerStation(record({ id: 'o-bravo', name: 'BRAVO', planetId: ARIS, orbitSlot: 0, welcomeRoomId: 'room-bravo' }));
+    const docB = new Y.Doc();
+    sync(docA, docB);
+    bindPlanetSummaryDoc(docB, install('o-alpha'));
+    const heard = readStore().ships['room-ship'];
+    expect(heard).toMatchObject({ fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3 });
+    const all = listStations();
+    const listed = (room: string) => all.find((s) => s.welcomeRoomId === room)!;
+    // Its station list gives the leg no course (its ends are on two planets)…
+    expect(planTransfer(listed('room-alpha'), listed('room-bravo'), departedAt - 1)).toBeNull();
+    // …but the copies the ferry published do, around SOVEREIGN.
+    const ends = summaryLegEnds(heard, (room) => all.find((s) => s.welcomeRoomId === room)?.id)!;
+    expect(ends).toEqual([
+      { id: 'o-alpha', planetId: SOV, orbitSlot: 1 },
+      { id: 'o-bravo', planetId: SOV, orbitSlot: 3 },
+    ]);
+    const plan = planTransfer(ends[0], ends[1], departedAt - 1);
+    expect(plan?.from.planet.id).toBe(SOV);
+    expect(plan?.to.radiusKm).toBe(orbitForSlot(SOV, 3).radiusKm);
   });
 
   it('gives the rest of the system as names only', () => {
