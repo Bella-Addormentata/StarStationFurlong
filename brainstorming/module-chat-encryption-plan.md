@@ -211,10 +211,11 @@ That third row is the entire gap. An ECDH key is required and SSF has only a sig
   `@noble/curves` (v2.x) it is `ed25519.utils.toMontgomery(publicKey)` and
   `ed25519.utils.toMontgomerySecret(secretKey)`. The v1-era free functions `edwardsToMontgomeryPub`
   / `edwardsToMontgomeryPriv` — and the pub-only alias `edwardsToMontgomery` — were **removed** in
-  v2; upstream records the rename in its changelog. Note that this saves no dependency — X25519
-  itself comes from `@noble/curves` (§3.4), so both routes add it. The real objection: it reuses one
-  key across two protocols — a cross-protocol-attack surface that is avoidable here for the cost of
-  32 bytes in a map we already write.
+  v2; upstream records the rename in its changelog. Pin ≥ 2.3.0 if you take this route — the Trail
+  of Bits review corrected these very conversion helpers in that release (§3.4). Note that this
+  saves no dependency — X25519 itself comes from `@noble/curves`, so both routes add it. The real
+  objection: it reuses one key across two protocols — a cross-protocol-attack surface that is
+  avoidable here for the cost of 32 bytes in a map we already write.
 
 ### 3.2.1 The directory is not yet trustworthy — fix this before anything else
 
@@ -299,6 +300,22 @@ are roughly 300 lines of `@noble` calls.
 (XChaCha20-Poly1305 — matching the AEAD the node already uses) keeps the dependency-free,
 in-browser, auditable posture `keypair.ts:11-14` chose deliberately, and keeps the browser and the
 node speaking the same cipher.
+
+**Pin `@noble/curves` at ≥ 2.3.0, and treat the floor as part of the design rather than as
+hygiene.** That release (2026-08-06) applied the Trail of Bits review, which among other things
+**corrected the Edwards→Montgomery conversion helpers** — the exact primitive the second route in
+§3.2 calls, so an implementation taking that route against anything earlier is converting keys
+with code its own auditors found wrong. The same release fixed a remote timing attack on X25519
+that leaked up to 4.036 bits of a long-term private key across many samples; upstream scopes the
+impact as fingerprinting rather than key recovery, and that bite is muted here because SSF would
+publish the X25519 *public* key in the contact card anyway — but it is a reason not to inherit an
+older pin by accident. Nothing is exposed today: `@noble/curves` is not a dependency at all —
+`package.json` lists `@noble/ed25519` and `@noble/hashes` and no other crypto — and `@noble/ed25519`
+has no ECDH surface to attack, exporting `getPublicKey`/`sign`/`verify` and their async forms,
+`Point`, `CURVE` and `utils`, with no `getSharedSecret`, no X25519 and no Montgomery conversion.
+That is the same fact §3.2 states as "no X25519 key anywhere in the codebase". The floor binds the
+commit that adds the dependency, and is worth stating now precisely because the current release
+already satisfies it — which is how a floor goes unwritten and is then met only by luck.
 
 ---
 
