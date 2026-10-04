@@ -5,8 +5,8 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  acceptMediaOrigin, consentRefusal, forgetMediaConsent, isPrivateHost, mediaConsent, mediaOrigin, ownMediaOrigins,
-  setOwnMediaOrigins, urlConsent, urlRefusal,
+  acceptMediaOrigin, allowMount, consentRefusal, forgetMediaConsent, isPrivateHost, mayMountNow, mediaConsent, mediaOrigin,
+  ownMediaOrigins, setOwnMediaOrigins, TV_MOUNT_BUDGET, TV_MOUNT_WINDOW_MS, urlConsent, urlRefusal,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
 import { setConvenienceLanesForTest } from './sovereignty';
@@ -146,5 +146,23 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
     ];
     for (const h of outside) expect(isPrivateHost(h), h).toBe(false);
     for (const h of ['[2002::1::]', '[2002:zz::]', '[1:2:3:4:5:6:7:8:9]']) expect(isPrivateHost(h), h).toBe(false); // not addresses: nothing inside to judge
+  });
+});
+
+describe('the mount budget: consent per origin bounds nothing cumulative', () => {
+  it('lets a set mount six sources a minute on its own, then waits for PLAY or for a mount to age out — per set, and forgotten with the consents', () => {
+    const t0 = 1_000_000;
+    for (let i = 0; i < TV_MOUNT_BUDGET; i++) expect(mayMountNow('tv-1', t0 + i * 1_000)).toBe(true);
+    expect(mayMountNow('tv-1', t0 + 7_000)).toBe(false); // a seventh programme inside the minute: PLAY, not a fetch
+    expect(mayMountNow('tv-1', t0 + 8_000)).toBe(false); // asked every tick: still no, and nothing counted
+    expect(mayMountNow('tv-2', t0 + 8_000)).toBe(true); // another set has a budget of its own
+    allowMount('tv-1'); // PLAY: the next mount is the viewer's, and the window starts over
+    expect(mayMountNow('tv-1', t0 + 9_000)).toBe(true);
+    for (let i = 1; i < TV_MOUNT_BUDGET; i++) expect(mayMountNow('tv-1', t0 + 9_000 + i)).toBe(true);
+    expect(mayMountNow('tv-1', t0 + 10_000)).toBe(false);
+    // A rate, never a lock: as the window's mounts age out the budget refills.
+    expect(mayMountNow('tv-1', t0 + 9_000 + TV_MOUNT_WINDOW_MS)).toBe(true);
+    forgetMediaConsent(); // leaving the room forgets the budget with the consents
+    expect(mayMountNow('tv-1', t0 + 9_001 + TV_MOUNT_WINDOW_MS)).toBe(true);
   });
 });
