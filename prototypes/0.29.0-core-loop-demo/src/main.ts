@@ -267,6 +267,8 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+// 🗺️✏️ #192: the holotable's BEAM INTO takes the pass this install holds.
+import { beamAfterStepBack, beamPassFor } from "./stationPlan";
 // ⚓ A station's public berth takes its door's pose from the atlas, and 🚀 a
 // ship under way keeps its flight's place whatever it wears.
 import { followsFlightRecord, setBerthPoseLookup } from "./stationDirectory";
@@ -3519,6 +3521,19 @@ async function performRoomSwap(
   }
 }
 
+/** 🗺️🎫 #192: the pass this install holds for `roomId`, for the holotable's
+ *  BEAM INTO: an ACCESS pass, or a module it minted. Never the atlas's seed
+ *  for a room, which may be a neighbour's door record (the stub a harvest
+ *  makes for each door): entering by that would pass by the door's own
+ *  passage policy and lock. One naming another room is no pass to this one
+ *  (beamPassFor). */
+function heldPassFor(roomId: string): string | undefined {
+  return beamPassFor(roomId, [
+    passSeed(roomId),
+    moduleLedger().find((e) => e.roomId === roomId)?.seed,
+  ]);
+}
+
 /**
  * An address OTHER rooms can reach `roomId` by — what a mirror record, or a
  * far room's end of a dock, must point back at. The walker's own rooms are
@@ -3958,6 +3973,21 @@ function wireAdapterTransit(): void {
   // in-flight swap falls through to the normal peek round-trip instead of
   // spawning a vestibule whose transit would silently early-return.
   world.isTransitBusy = () => transitInProgress;
+  // 🗺️✏️ #192: the holotable's BEAM INTO another module of the station is
+  // the ACCESS beam, with a pass this install holds; its word goes on a hint,
+  // as the ACCESS app's feedback line is out of sight at the table. It is a
+  // manual choice like ACCESS's ENTER/JUMP, made at the click: a pasted pass
+  // still warming is dropped then, before the table's step-back, where its
+  // READY could otherwise carry you off first (beamAfterStepBack).
+  world.roomPassFor = (roomId) => heldPassFor(roomId);
+  world.onBeamInto = (seed, afterStepBack) =>
+    beamAfterStepBack(seed, {
+      cancelPending: () => {
+        autoEnterRoomId = null;
+      },
+      afterStepBack,
+      enter: (s) => void enterRoomFromPass(s, (msg) => showHint(msg, 4000)),
+    });
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,
@@ -9293,12 +9323,14 @@ let autoEnterRoomId: string | null = null;
 
 /** Enter a room from its pass — the ACCESS beam, now fast because a READY
  *  room is already warm on the node (no minutes-long re-dial). Also the DEV
- *  "jump now" path (immediate, before READY). */
-async function enterRoomFromPass(seed: string): Promise<void> {
-  const setAccessFeedback = (msg: string) => {
+ *  "jump now" path (immediate, before READY). `say` takes its progress and
+ *  failures: the ACCESS app's feedback line unless given (the holotable's
+ *  BEAM INTO puts them on a hint, #192). */
+async function enterRoomFromPass(seed: string, say?: (msg: string) => void): Promise<void> {
+  const setAccessFeedback = say ?? ((msg: string) => {
     const el = document.getElementById("access-feedback");
     if (el) el.textContent = msg;
-  };
+  });
   if (world.getPlayer().isInAdapterTransit()) {
     setAccessFeedback(
       "Docking transit in progress — enter once you are through.",
