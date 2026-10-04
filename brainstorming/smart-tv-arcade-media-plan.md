@@ -122,7 +122,22 @@ lead` with the same monotonic `now`. The monotonic clock, never the wall
 clock: `Date.now()` steps on an NTP correction, on a wake from sleep or on
 a manual change, and a step would read as elapsed playback and seek every
 viewer at once; the wall clock serves the UTC schedule (`startAt`) and
-nothing in the sync maths.
+nothing in the sync maths. The monotonic clock is no promise of its own
+across a sleep, though: High Resolution Time lets `performance.now()` run
+on through OS sleep, and on Windows it does, so a viewer waking after an
+hour would read its last sample an hour ahead and seek there. So the
+anchor is worth nothing after a gap: the room tick marks the page awake,
+a gap in the marks longer than 2.5 s (a closed lid, a frozen tab, a
+throttled background page — `TV_SUSPEND_GAP_MS`) marks every sample from
+before it STALE, and a stale reading is shown but never acted on — no
+seek, no nudge — until a fresh sample lands after the wake window (a
+sample the network held through the sleep and delivers on waking is
+stamped from before the gap, as a lease is, and is stale with the rest).
+The holder's next heartbeat is at most 3 s away, and a viewer whose
+player stopped with the machine is then seeked once, to where the room
+is, never to where the sleep says; a headless holder beats on from its
+own extrapolation, which is the room's clock whether or not its page
+slept, and that beat is what un-stales everyone.
 `lead` is half the round trip the viewer's `NetworkProvider` measures to the
 node it is connected to, capped at 1 s, and zero for the holder (its own
 writes land locally). That term corrects exactly one hop — the last one,
@@ -350,7 +365,11 @@ In code: #207 (the TV) and #208 (the cabinet).
   host allowlist — and, because a loopback service that fetches URLs is an
   SSRF surface, the node resolves the name ITSELF and validates every
   address the answer holds: an IPv6 address that carries an IPv4 inside is
-  normalized to that IPv4 first — IPv4-mapped and IPv4-compatible forms, and
+  normalized to that IPv4 first — IPv4-mapped and IPv4-compatible forms;
+  6to4 (`2002::/16`, the IPv4 in bits 16–47) and Teredo (`2001:0::/32`,
+  the server's IPv4 in bits 32–63 and the client's in the last 32,
+  inverted — both judged by what they carry, since either reads as global
+  unicast on paper and `2002:7f00:1::` is loopback in fact); and
   any address under a NAT64 prefix: the well-known `64:ff9b::/96` and
   `64:ff9b:1::/48`, and the network's own, learned the RFC 7050 way by
   resolving `ipv4only.arpa` and reading the prefix off the AAAA answer
@@ -363,7 +382,10 @@ In code: #207 (the TV) and #208 (the cabinet).
   global unicast and nothing else). Where the NAT64 discovery cannot run, or
   its answer is not one the node trusts, IPv6 destinations are refused
   outright, which costs nothing where IPv4 reaches the same host. The
-  classifier is a pure function with that table of cases as its tests — and
+  classifier is a pure function with that table of cases as its tests —
+  loopback, private, link-local and the metadata address under every one
+  of those encodings, mapped, compatible, 6to4, Teredo and NAT64 alike —
+  and
   the node PINS the socket to
   a vetted address: it connects to the IP with the original name kept as
   `Host` and SNI, and the HTTP client never resolves the name again on
@@ -1147,7 +1169,21 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   the seeder's, which no reader could bound and a skewed or lying seeder
   could set a decade out — a renewal with an older or equal `seq` for that
   (node, hash) is a replay and ignored, the high-water mark kept per
-  (node, hash) and persisted, and a signed `library-unseed` from the same
+  (node, hash) and persisted — under BOUNDS, since a node id is free to
+  mint (§4) and a map that grew with every id a member minted would never
+  shrink: at most sixty-four seeders per item (a sixty-fifth announcement
+  is ignored until one expires; the item has holders enough), at most
+  4 096 marks per node overall, expired marks evicted first and then the
+  oldest-received, and every seed announcement carrying the seeder's
+  wall-clock `at`, which a reader refuses when more than a day older than
+  its own clock — a coarse bound, in days, on how long a signed
+  announcement stays replayable, never a comparison that moves playback —
+  so that a mark dropped a day after its seed expired fears no replay: an
+  announcement old enough to have lost its mark is too old to be accepted,
+  and a newer one would have moved the mark. Admission is by principal
+  where one exists — a library-station's seeds under its operator key, an
+  owner's node under the owner's — and first-come under the caps for the
+  rest — and a signed `library-unseed` from the same
   node (a higher `seq` for that hash) or the
   item's `library-remove` withdraws it early. A late joiner counts its day
   from its own receipt and is wrong by at most that day about a seeder
