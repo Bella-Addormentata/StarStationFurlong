@@ -367,6 +367,22 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(input(doors), 'room-b')).toBe('a ship is docked at it');
   });
 
+  it('waits while the module is docked at this room by a berth as well', () => {
+    const doors = hub();
+    // GARDEN joined by the gangway and docked at a berth of this room too:
+    // the end seals the gangway alone, so the berth would stay.
+    const docked = 'it is also docked at this room; undock it first';
+    doors.set('d:berth', pairing('room-b', { transient: true }));
+    expect(removalBlocker(input(doors), 'room-b')).toBe(docked);
+    expect(disassemblyCandidates(input(doors))[0]).toMatchObject({ roomId: 'room-b', doorIds: ['east'], blocked: docked });
+    // A DOCK is a berth whatever its flag says.
+    doors.set('d:berth', pairing('room-b', { segments: [{ kind: 'dock' }, { kind: 'dock' }] as never }));
+    expect(removalBlocker(input(doors), 'room-b')).toBe(docked);
+    // Undocked, the module hangs off the gangway alone again.
+    doors.set('d:berth', { paired: false, retiredAddress: seed('room-b') });
+    expect(removalBlocker(input(doors), 'room-b')).toBeNull();
+  });
+
   it('seals every door of this room joined to the module', () => {
     const doors = hub();
     doors.set('d:2', pairing('room-b'));

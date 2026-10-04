@@ -335,7 +335,8 @@ export function jobAnnouncement(
 // ── What can be taken apart ──────────────────────────────────────────────────
 
 export interface DisassemblyCandidate extends DisassemblyTarget {
-  /** Every door of this room joined to it (all are sealed at the end). */
+  /** Every structural door of this room joined to it (all are sealed at the
+   *  end; a berth of this room's joined to it holds the job, removalBlocker). */
   doorIds: string[];
   /** Why it can't be taken apart now, or null. */
   blocked: string | null;
@@ -357,15 +358,25 @@ export interface CandidateInput {
   welcomeRoomId?: string | null;
 }
 
+/** The room a door of this room is paired with, or '' (not paired, or an
+ *  address naming no room). */
+function pairedRoomId(rec: DoorRecord): string {
+  if (rec.paired !== true || !rec.connectedRoomAddress) return '';
+  try { return roomIdFromSeed(rec.connectedRoomAddress); } catch { return ''; }
+}
+
+/** Is this door record a visiting ship's berth (transient, or a DOCK)? */
+function isBerthRecord(rec: DoorRecord): boolean {
+  return rec.paired === true && (rec.transient === true || isDockChain(rec.segments));
+}
+
 /** This room's structural doors, grouped by the module behind them: paired,
  *  not a visiting ship's berth (transient or a DOCK). */
 function structuralNeighbours(input: CandidateInput): Map<string, Array<{ doorId: string; address: string }>> {
   const out = new Map<string, Array<{ doorId: string; address: string }>>();
   for (const [doorId, rec] of input.doors) {
-    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
-    if (rec.transient === true || isDockChain(rec.segments)) continue;
-    let roomId = '';
-    try { roomId = roomIdFromSeed(rec.connectedRoomAddress); } catch { roomId = ''; }
+    if (rec.paired !== true || !rec.connectedRoomAddress || isBerthRecord(rec)) continue;
+    const roomId = pairedRoomId(rec);
     if (!roomId || roomId === input.hereRoomId) continue;
     const list = out.get(roomId) ?? [];
     list.push({ doorId, address: rec.connectedRoomAddress });
@@ -406,7 +417,10 @@ export function ownerIsMe(owner: AtlasOwner, me: { playerId: string; identityPub
  *    inside: having minted it is no proof it is still ours, as its deed may
  *    have changed hands since;
  *  - it must hang only off this room: a module still joined to another, or
- *    with a ship docked at it, would leave that one cut off.
+ *    with a ship docked at it, would leave that one cut off;
+ *  - and only by structure: the end seals this room's structural doors to
+ *    it, so a berth of this room's joined to it as well (it docked here as a
+ *    ship too) would leave it docked here. It waits until that is undocked.
  */
 export function removalBlocker(input: CandidateInput, roomId: string): string | null {
   const { atlas } = input;
@@ -418,6 +432,11 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   if (owner === undefined) return "its owner isn't known yet; step inside it once";
   if (owner !== null && !legacyOwnerMarker(owner.id) && !ownerIsMe(owner, input)) {
     return `it belongs to ${owner.name || 'someone else'}`;
+  }
+  // Docked here as well (a berth of this room's paired with it): the end
+  // seals this room's structural doors only, and the berth would stay.
+  for (const rec of input.doors.values()) {
+    if (isBerthRecord(rec) && pairedRoomId(rec) === roomId) return 'it is also docked at this room; undock it first';
   }
   // Its other connections, as the atlas knows them: its own records and any
   // record pointing at it, berths included.
