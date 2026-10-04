@@ -255,10 +255,14 @@ plane (a sibling of the `media-sub` kind), so a viewer resolves a hash to
 the connected nodes that hold it: the ticket's provider while it is still
 here, else any announcing holder — the hub first, which has it as soon as it
 served a spoke — else the station library's seeders (§7). A provider that
-leaves mid-transfer is replaced by another holder from the next range on;
-the hash verifies every byte, so any holder is as good as the host, and the
-host leaving does not end the film for those still fetching. No re-encode,
-every platform; the countdown spreads the host's upload before T0. Honest caveat: a transfer, not
+leaves mid-transfer, stalls (no progress for 10 s, or under a floor rate
+for 30 s), fails a request or serves bytes the hash rejects is replaced by
+the next holder from the next range on — a `have` is any peer's claim, so a
+holder that lied or stalled is remembered and not tried again this session
+— and the hash verifies every byte, so any honest holder is as good as the
+host, and the host leaving does not end the film for those still fetching.
+No re-encode, every platform; the countdown spreads the host's upload
+before T0. Honest caveat: a transfer, not
 a stream — delete-on-leave cache and private rooms keep it in the shape of
 sending a friend a file. And the record is peer-writable, so a fetch is never
 automatic beyond a cap AND a budget: the source carries its declared size; a
@@ -322,16 +326,25 @@ frames that arrive out of order across streams are played once, and a
 replayed one never. Origin, not only membership: a shared key proves that a
 frame came from someone holding it, and every subscriber holds it — so any
 subscriber could forge frames as the source, and with a high counter push
-genuine frames out of the window. The sender therefore signs. Each frame's
-header carries the BLAKE3 hash of the frame before it, and the sender's
-Ed25519 identity key — the key the room already knows the source by — signs
-the chain head at every keyframe and at least every 250 ms, on the lane. A
-receiver plays a frame on arrival and confirms it when the next signature
-lands; a chain that fails confirmation drops the source (a quarter second of
-forgery at most was heard) and rekeys; and the replay window advances on
-confirmed frames only, so an unconfirmed counter pushes nothing out. One
-signature per interval, not per frame, is what keeps a 20 ms Opus stream
-from doubling in size. A subscription is signed by the subscriber's identity
+genuine frames out of the window. The sender therefore signs — not a hash
+chain, which one lost 20 ms datagram would break for everything after it
+(audio may ride unreliable datagrams), but a MANIFEST: at every keyframe
+and at least every 250 ms, the sender's Ed25519 identity key — the key the
+room already knows the source by — signs the list of (counter, truncated
+BLAKE3 digest) of every frame sent in the interval, and the manifest goes
+out on the reliable lane. A receiver plays a frame on arrival and confirms
+it when a manifest names its counter with its digest; a frame that never
+arrived costs nothing but itself; and the replay window advances on
+confirmed frames only, so an unconfirmed counter pushes nothing out. A
+frame no manifest confirms within two intervals, or whose digest disagrees
+with a manifest, is an injection: it is discarded and reported, and the
+receiver switches that source to confirm-before-play (a quarter second of
+latency) while the injection goes on — it never drops the source, since
+any member could inject, and dropping would hand each of them a way to
+silence any speaker. One signature and one manifest per interval, not per
+frame, is what keeps a 20 ms Opus stream from doubling in size: a dozen
+16-byte digests and a 64-byte signature every quarter second is about
+8 kbps. A subscription is signed by the subscriber's identity
 with proof of possession (the P2 lane binding's shape, §9), so no entry is
 forged in another's name, and a forged entry would receive only ciphertext
 it cannot open. What a hub still sees is the traffic's shape — who sends to
@@ -534,8 +547,20 @@ X25519 between their identity-derived keys, bound to {room, epoch, lane
 id, both pubs} — and each kind-3 input carries a strictly increasing
 sequence number and a keyed-BLAKE3 MAC under that key; P1 drops any input
 whose MAC fails or whose sequence does not advance (thirteen bytes become
-about thirty; at 60 Hz that is nothing). And then the S3 mapping from that
-proven key to the player holding the seat. P1 accepts kind-3 inputs only
+about thirty; at 60 Hz that is nothing). Thirty bytes do not fit the tick
+lane as it is: browser ingress takes exactly 13-byte datagrams, and the
+mesh relays only the 13-, 14- and 22-byte frames with a 13-byte tick inside
+(`ssf-p2p-node/src/main.rs`, the datagram arms) — everything else is
+dropped on the floor. So the extended datagram is a prerequisite in its own
+right, landed as one change across the four places that read a tick:
+`[TTL][8B origin lane id][kind 3 | sub-kind][len][payload ≤ 64 B]`,
+negotiated per link by a capability on the M5 control plane; ingress
+accepts it only from a browser that announced it, the relay forwards it
+only to links that did and dedups it on the origin lane id and the input's
+sequence, local delivery hands it to the page as its own message, and a
+legacy peer is never sent one and goes on dropping unknown lengths as it
+does today. And then the S3 mapping from that proven key to the player
+holding the seat. P1 accepts kind-3 inputs only
 from a lane whose proven key is the P2 seat's identity, and only inputs
 that key's session authenticates. Lockstep stays the upgrade for games
 where lag matters.
