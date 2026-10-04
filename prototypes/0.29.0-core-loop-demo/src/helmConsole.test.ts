@@ -9,7 +9,7 @@ import { FURNITURE } from './furniture';
 import type { FurnitureItem } from './furniture';
 import { dockChain } from './adapter';
 import { classifyDockPort } from './dockRules';
-import { bindDoorLayoutDoc, seedDoorLayoutSingle } from './doorLayoutDoc';
+import { bindDoorLayoutDoc, seedDoorLayoutEmpty, seedDoorLayoutSingle } from './doorLayoutDoc';
 import {
   bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readDoor, writeDoorPairing, writeDoorRecordTo,
   type DoorRecord,
@@ -151,6 +151,22 @@ describe('the helm, its doors map flooded past the read cap', () => {
     flood(buildDoorTombstone(JUNK));
     writeDoorPairing('north', VISITOR, DOCKED);
     expect(renderHelm()).toContain('LOCATION</span><span>High Orbit</span>');
+  });
+});
+
+describe('the helm, on doors the room does not have', () => {
+  it('never counts a gangway or a dock on a door the room does not have', () => {
+    // A doorless room (its owner removed every door): no record holds it.
+    seedDoorLayoutEmpty();
+    writeDoorPairing('d:ghost', STATION_CORE);
+    writeDoorPairing('north', STATION_CORE);
+    const html = renderHelm();
+    expect(departDisabled(html)).toBe(false);
+    expect(html).not.toContain('permanent link');
+    // Nor is it docked anywhere: a dock on no door leads nowhere.
+    setStationDirectory({ stations: () => DEFAULT_STATIONS, here: () => 'high-orbit' });
+    writeDoorPairing('d:ghost-dock', VISITOR, DOCKED);
+    expect(renderHelm()).not.toContain('LOCATION</span><span>High Orbit</span>');
   });
 });
 

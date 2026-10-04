@@ -518,6 +518,20 @@ describe('what the helm hears after an arrival DOCK', () => {
     }
   });
 
+  it('says nothing once the ship has left again before the berth answers', async () => {
+    let answer: (ok: boolean) => void = () => {};
+    const docking = { ...fakeDocking(['north']), dock: () => new Promise<boolean>((r) => { answer = r; }) };
+    fly('high-orbit', 'furlong-station');
+    const heard: ArrivalOutcome[] = [];
+    expect(completeArrival(docking, { onSettled: (o) => heard.push(o) })?.kind).toBe('docking');
+    // DEPART again while the berth is still answering: the late refusal is
+    // the last station's, never the note for this flight.
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: 1, etaAt: 2 });
+    answer(false);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(heard).toEqual([]);
+  });
+
   it('refused, when the berth is taken — not a green "docking" note left standing', async () => {
     expect(await arrive(false)).toEqual({ kind: 'none', stationName: 'Furlong Station', reason: 'berths-taken' });
     expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });

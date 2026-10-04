@@ -63,6 +63,7 @@ import {
 import {
   deleteDoorPairing,
   readAllDoorsWithPhysical,
+  readPhysicalDoors,
   subscribeDoors,
   type DoorPairing,
 } from './doorsDoc';
@@ -2031,10 +2032,11 @@ function isTransientBerth(rec: DoorPairing): boolean {
 
 /** Enumerate the room's PERMANENT chained doors — a paired berth that is
  *  NOT a transient guest-berth. Reads the doors doc (shared truth), so a
- *  peer's dock lands here without a helm round-trip. */
+ *  peer's dock lands here without a helm round-trip; only the room's own
+ *  doors count (a record on a door it lacks holds nothing). */
 function enumerateChainedDoors(): string[] {
   const out: string[] = [];
-  for (const [id, rec] of readAllDoorsWithPhysical()) {
+  for (const [id, rec] of readPhysicalDoors()) {
     if (rec.paired !== true) continue;
     if (isTransientBerth(rec)) continue;
     out.push(id);
@@ -2044,7 +2046,7 @@ function enumerateChainedDoors(): string[] {
 
 /** Does any door of this room hold a live connection right now? */
 function hasLiveDock(): boolean {
-  for (const [, rec] of readAllDoorsWithPhysical()) if (rec.paired === true) return true;
+  for (const [, rec] of readPhysicalDoors()) if (rec.paired === true) return true;
   return false;
 }
 

@@ -1,12 +1,15 @@
 // doorsDoc.readAllDoorsWithPhysical: the capped snapshot, plus each physical
 // door's own record read past the cap, so a peer's flood never hides one from
-// the checks that must see every real door (DEPART's gate, where a ship is).
+// DEPART's cast-off. doorsDoc.readPhysicalDoors: only the room's own doors,
+// each read past the cap, for the checks that must see every real door and
+// nothing else (DEPART's gate, where a ship is).
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, seedDoorLayoutSingle } from './doorLayoutDoc';
 import {
-  bindDoorsDoc, buildDoorPairing, readAllDoors, readAllDoorsWithPhysical, writeDoorPairing, writeDoorRecordTo,
+  bindDoorsDoc, buildDoorPairing, readAllDoors, readAllDoorsWithPhysical, readPhysicalDoors, writeDoorPairing,
+  writeDoorRecordTo,
 } from './doorsDoc';
 
 const STATION_CORE = 'ssf://room#room=station-core';
@@ -49,5 +52,25 @@ describe("the room's door records past the read cap", () => {
     flood();
     writeDoorPairing('north', STATION_CORE);
     expect(readAllDoorsWithPhysical().has('north')).toBe(false);
+  });
+});
+
+describe("the room's own doors", () => {
+  it('reads each one past the cap, and nothing a door the room lacks holds', () => {
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    flood();
+    writeDoorPairing('d:gangway', STATION_CORE);
+    writeDoorPairing('d:ghost', STATION_CORE);
+    const doors = readPhysicalDoors();
+    expect(doors.get('d:gangway')?.paired).toBe(true);
+    expect([...doors.keys()]).toEqual(['d:gangway']);
+  });
+
+  it('are the four defaults in a room from before the layout store, and none in a doorless one', () => {
+    writeDoorPairing('north', STATION_CORE);
+    writeDoorPairing('d:ghost', STATION_CORE);
+    expect([...readPhysicalDoors().keys()]).toEqual(['north']);
+    seedDoorLayoutEmpty();
+    expect(readPhysicalDoors().size).toBe(0);
   });
 });

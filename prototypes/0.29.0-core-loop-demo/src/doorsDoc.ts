@@ -339,24 +339,35 @@ export function readDoor(doorId: string): DoorRecord | undefined {
 }
 
 /**
- * The bound room's door records: readAllDoors' snapshot, which keeps only its
- * first MAX_PAIRINGS valid entries, plus each PHYSICAL door's own record,
- * read by name past that cap (readDoor). Records a peer floods the map with
- * can never hide a real door's connection from a check that must see every
- * one (the helm's DEPART gate, where a ship is docked), and they only add
- * records. The physical doors are the stored layout; else, in a room from
- * before the layout store, the four defaults; and none in a room whose owner
- * removed every door (the authoritative-empty marker), as
- * furniture.roomDoorPoints reads them.
+ * The bound room's own doors' records: each PHYSICAL door's record, read by
+ * name past readAllDoors' MAX_PAIRINGS cap (readDoor), and nothing that a
+ * door the room lacks holds. Records a peer floods the map with can never
+ * hide a real door's connection from a check that must see every one, nor
+ * pass for one (the helm's DEPART gate, where a ship is docked). The
+ * physical doors are the stored layout; else, in a room from before the
+ * layout store, the four defaults; and none in a room whose owner removed
+ * every door (the authoritative-empty marker), as furniture.roomDoorPoints
+ * reads them.
  */
-export function readAllDoorsWithPhysical(): Map<string, DoorRecord> {
-  const out = readAllDoors();
+export function readPhysicalDoors(): Map<string, DoorRecord> {
   const layout = readAllDoorLayout();
   const physical = layout.size > 0 ? layout : doorSetIsMarkedEmpty() ? new Map() : defaultDoorLayoutRecords();
+  const out = new Map<string, DoorRecord>();
   for (const id of physical.keys()) {
     const rec = readDoor(id);
     if (rec) out.set(id, rec);
   }
+  return out;
+}
+
+/**
+ * readAllDoors' snapshot plus every physical door's own record
+ * (readPhysicalDoors): what DEPART casts off, so a flood never hides a real
+ * door's dock from it, and a dock on a door the room lacks goes with the rest.
+ */
+export function readAllDoorsWithPhysical(): Map<string, DoorRecord> {
+  const out = readAllDoors();
+  for (const [id, rec] of readPhysicalDoors()) out.set(id, rec);
   return out;
 }
 

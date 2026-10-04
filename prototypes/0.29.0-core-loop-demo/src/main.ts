@@ -150,8 +150,8 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
-  readAllDoorsWithPhysical,
   readDoor,
+  readPhysicalDoors,
   subscribeDoors,
   transactDoorWrites,
 } from "./doorsDoc";
@@ -1196,8 +1196,9 @@ function shipStationHere(roomId: string): string | null {
 function shipStationsHere(roomId: string): string[] {
   const out: string[] = [];
   if (!roomId) return out;
-  // Every real door, past the snapshot's cap: a flood must not hide a dock.
-  for (const [, rec] of readAllDoorsWithPhysical()) {
+  // Every real door, past the snapshot's cap: a flood must not hide a dock,
+  // nor a record on a door the room lacks pass for one.
+  for (const [, rec] of readPhysicalDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     // Only a dock says where the ship is: a permanent gangway leads back into
     // the ship's own group (older docks carry only the two-half chain).
@@ -1813,7 +1814,7 @@ async function joinRoomAtEpoch(
     // station, so the backdrop keeps the right planet all the way.
     setRoomStationResolver((roomId) => {
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
-      const docked = dockedStationFor(roomId, readAllDoorsWithPhysical().values());
+      const docked = dockedStationFor(roomId, readPhysicalDoors().values());
       if (docked) return docked;
       // A saved or built-in station's welcome room, or a module bolted into a
       // station by structure, stays put whatever it wears (a station-keeping
@@ -1825,7 +1826,7 @@ async function joinRoomAtEpoch(
     });
     // 🚀 The same rule gates the helm: a station room never departs, and never
     // takes its location from the ship's flight record.
-    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readAllDoorsWithPhysical().values()));
+    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readPhysicalDoors().values()));
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
