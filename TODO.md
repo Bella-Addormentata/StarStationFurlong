@@ -41,7 +41,6 @@
   - the gate number above the port in the vestibule (design §5a);
   - a route that finishes with no dock ends without the captain's end-of-route line, which needs a live dock;
   - a ferry that gate-changed into another room of a stop reads NOT DOCKED on the board in the stop's berth room until a planet summary naming its gate arrives, and stays so at an unnumbered gate;
-  - the holotable's station atlas ([#201](https://github.com/Bella-Addormentata/StarStationFurlong/pull/201)) shows a ferry's status as its raw id ("ON-TIME", "NOT-DOCKED") rather than the board's words;
   - no DOM tests for the helm's ROUTE panel and editor, the board's console, or `main.ts`'s keeper, copy-back and board wiring (`helmConsole.test.ts` covers only the route's own DEPART).
 
 ## 📐 Design artifacts owed

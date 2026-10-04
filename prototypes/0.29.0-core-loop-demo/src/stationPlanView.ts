@@ -34,6 +34,7 @@ import { TILE_SIZE } from './floorPlanDoc';
 import { legacyOwnerMarker } from './roomOwner';
 import type { DisassemblyCandidate, DisassemblyJob } from './disassembly';
 import { jobFraction, jobStatusText, ownerIsMe } from './disassembly';
+import { statusFromWire } from './departuresBoard';
 
 export interface StationPlanDeps {
   atlas: () => Record<string, AtlasEntry>;
@@ -600,8 +601,9 @@ export class StationPlanView {
           // Past its arrival time (late, or arrived and still docking): when it was due.
           ? `arriving${s.at !== undefined ? (s.at >= now ? ` ${when(s.at, now)}` : `, due ${when(s.at, now)}`) : ''}`
           : `leaving${s.at !== undefined ? ` (${when(s.at, now)})` : ''}`;
+      // 🚏 A ferry's status in the departures board's words, not its wire id.
       const item = el('div', `font-size:11px; line-height:1.5; color:${s.state === 'docked' ? SHIP : GOLD}; cursor:${drawn.has(s.roomId) ? 'pointer' : 'default'};`,
-        `🚀 ${s.name} · ${where}${s.routeStatus ? ` · ${s.routeStatus.toUpperCase()}` : ''}`);
+        `🚀 ${s.name} · ${where}${s.routeStatus ? ` · ${statusFromWire(s.routeStatus)}` : ''}`);
       if (drawn.has(s.roomId)) {
         item.addEventListener('click', () => {
           this.selected = s.roomId;

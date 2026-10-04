@@ -11,6 +11,7 @@ import * as Y from 'yjs';
 import { atlasLayout, atlasPoses, bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
 import { beamAfterStepBack, beamPassFor, editAccess, moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import type { ShipSummary } from './planetSummary';
+import { statusFromWire } from './departuresBoard';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -704,5 +705,16 @@ describe('BEAM INTO (source scan)', () => {
     });
     harvestIntoAtlas({ roomId: 'room-b', name: 'DOCKS', doors: [] });
     expect(readAtlas()['room-b']?.seed).toBe(seed('room-b'));
+  });
+});
+
+describe("the plan's ship list (source scan)", () => {
+  it("shows a ferry's status in the departures board's words, not its wire id", () => {
+    const view = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'stationPlanView.ts'), 'utf8');
+    expect(view).toContain('statusFromWire(s.routeStatus)');
+    expect(view).not.toContain('routeStatus.toUpperCase()');
+    expect(statusFromWire('on-time')).toBe('ON TIME');
+    expect(statusFromWire('not-docked')).toBe('NOT DOCKED');
+    expect(statusFromWire('blocked')).toBe('ROUTE BLOCKED');
   });
 });
