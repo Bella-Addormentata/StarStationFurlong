@@ -6,6 +6,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
+  MAX_AUTO_FERRY_LAYOUT_KEYS,
   MAX_GATE,
   bindDoorPolicy,
   dockGatesIn,
@@ -13,6 +14,7 @@ import {
   gateAccessIn,
   hasDoorGrant,
   nextFreeGate,
+  readAutoFerryGates,
   readGateAccess,
   readDockGates,
   readDockGatesIfComplete,
@@ -123,6 +125,51 @@ describe('the gate on a dock port', () => {
     writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: false });
     writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: true });
     expect(readDoorPolicy('north').gate).toBeUndefined();
+  });
+
+  it('lets the owner turn on AUTO-DOCK FERRIES, kept only on a port of a door the room has', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('west', { id: 'west', wall: 'x-', lateral: 0, placed: true });
+    writeDoorPolicy('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1, autoFerry: true });
+    writeDoorPolicy('east', { passage: 'public', construction: 'owner', adapter: false, autoFerry: true });
+    doc.getMap('doorPolicy').set('west', { adapter: true, gate: 2, autoFerry: 'yes' });
+    doc.getMap('doorPolicy').set('south', { adapter: true, gate: 3, autoFerry: true }); // no such door
+    expect(readDoorPolicy('north').autoFerry).toBe(true);
+    expect(readDoorPolicy('east').autoFerry).toBeUndefined();
+    expect(readDoorPolicy('west').autoFerry).toBeUndefined();
+    expect(readAutoFerryGates()).toEqual([{ doorId: 'north', policy: readDoorPolicy('north') }]);
+    // Renumbering and the gate's access keep it; removing the port drops it.
+    writeDoorPolicy('north', { ...readDoorPolicy('north'), gate: 4, gateAccess: 'closed' });
+    expect(readDoorPolicy('north')).toMatchObject({ gate: 4, gateAccess: 'closed', autoFerry: true });
+    writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: false });
+    writeDoorPolicy('north', { ...readDoorPolicy('north'), adapter: true });
+    expect(readDoorPolicy('north').autoFerry).toBeUndefined();
+    expect(readAutoFerryGates()).toEqual([]);
+  });
+
+  // Copilot (PR 204): the gate keeper reads them once a second, and the
+  // layout is any peer's to write.
+  it('lists the AUTO-DOCK gates over a bounded walk of the layout, and says a flooded one is not known', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    const policy = { passage: 'public', construction: 'owner', adapter: true, gate: 5, autoFerry: true } as const;
+    doc.getMap('doorLayout').set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('d:live', policy);
+    for (let i = 1; i < MAX_AUTO_FERRY_LAYOUT_KEYS; i++) doc.getMap('doorLayout').set(`d:junk${String(i).padStart(4, '0')}`, { nope: true });
+    expect(readAutoFerryGates()).toEqual([{ doorId: 'd:live', policy }]);
+    // One key more, and the walk stops short of knowing them all.
+    doc.getMap('doorLayout').set('d:more', { nope: true });
+    expect(readAutoFerryGates()).toBeNull();
+    // The gates themselves are still read past it.
+    expect(readDockGates()).toEqual({ 'd:live': 5 });
+    // A legacy room, with no layout records, has the cardinal doors.
+    const legacy = new Y.Doc();
+    bindDoorPolicy(legacy);
+    legacy.getMap('doorPolicy').set('south', { passage: 'public', construction: 'owner', adapter: true, gate: 1, autoFerry: true });
+    expect(readAutoFerryGates()).toEqual([{ doorId: 'south', policy: readDoorPolicy('south') }]);
   });
 
   it('is given to a port a DOCK fits in the far room', () => {
