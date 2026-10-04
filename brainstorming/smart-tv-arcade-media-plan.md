@@ -673,9 +673,32 @@ instance and never aliases an older signed `media-config`; a
 receiver holding frames of a generation it has no configuration for waits
 the jitter window for the message and then drops them; a `media-config`
 that fails its signature is dropped and counted against the link like a
-frame; and senders use codecs whose keyframes are self-describing (VP8,
-VP9, AV1, H.264 in Annex-B form), so a keyframe and its configuration are
-all a late joiner needs. A leg's counter is the SENDER's for
+frame — and the reliable lane that carries it is bounded BEFORE any
+signature is checked, as the datagram lane is below: a control-frame
+ceiling of 4 KiB per message, enforced on the length prefix before a byte
+of the body is allocated (the node reads into a fixed buffer and resets
+the stream, counting it, when the prefix says more — today
+`ssf-p2p-node/src/main.rs` allocates the declared length of a reliable
+frame as it stands, around lines 1499 and 2223, which this lane's first
+change replaces, and a fix the node owes with or without media), and a
+control-message budget per link in messages and bytes a second (the
+renewals its admitted subscribers owe plus a fifth, with a floor for a
+fresh link; that count times the ceiling), a message past it dropped
+unverified and counted; and the configuration's fields are checked after
+the signature and before any decoder sees them — the codec string against
+an allowlist (`opus`; `vp8`, `vp09.*`, `av01.*` and `avc1.*` for video,
+nothing else, and never longer than 64 bytes), the coded width and height
+each between 16 and 4 096 and their product within the tier's pixel
+ceiling (1 280 × 720 for the desktop tier; the arcade tier is a native
+retro screen and takes no more), the `description` at most 1 KiB and
+present only where the codec takes one (an `avcC` or `av1C` record;
+Annex-B H.264, VP8 and VP9 carry none), the sample rate 48 000 and the
+channel count 1 to 8 with the Opus head present exactly when it is above
+2 — so a configuration outside these never reaches `configure()`, and a
+pathological one costs the receiver a dropped message, not a decoder; and
+senders use codecs whose keyframes are self-describing (VP8, VP9, AV1,
+H.264 in Annex-B form), so a keyframe and its configuration are all a
+late joiner needs. A leg's counter is the SENDER's for
 the whole epoch, never the encoder's: it lives outside the encoder and
 survives every pause, restart and reconfiguration (§9 and spike #21 restart
 encoders for the first subscriber), so a restarted encoder goes on from the
@@ -768,7 +791,27 @@ open — stated as the cost — rather than the sender's whole budget. A
 subscriber cap per source (sixty-four identities; the hubs' aggregation
 keeps the forwarding tree beneath it) bounds what any rotation costs: one
 sealed key per subscriber, a few milliseconds of X25519 and a few
-kilobytes at the cap. Replay protection is a sliding window per leg and
+kilobytes at the cap — and the cap is SHARED OUT, never first-come, since
+the churn budgets above count departures, and an origin or hub that
+admitted sixty-four minted identities and kept their leases alive would
+fill the source without one departure, every honest listener after it
+refused for good: at every node that admits — the sender for the links
+it holds, a hub for its spokes' links before it relays a lease — the
+slots that node may hand out are divided among the links below it that
+carry at least one subscriber, a floor of eight each, recomputed as links
+come and go, and no link is given more than its share while another is
+refused (a link at its share is told so, and its joiners wait for a slot
+THERE: an honest hub with many spokes grows into a larger share only as
+other links empty, which is the cost of fairness, stated); and an origin
+behind a link — a spoke's node, some page's origin — holds at most eight
+identities per source (a person has a few tabs, not sixty-four), the
+link's share governing instead where the origin IS the link at the node
+deciding (a station hub that is many browsers' origin and connects to
+the sender itself: its pages compete for its share, which is a fair share
+among links and never the whole source). So an origin or hub that mints
+identities fills its own share and no one else's, a minted origin is a
+new link at a hub and gets eight, and sixty-four honest listeners still
+fit. Replay protection is a sliding window per leg and
 epoch, the SRTP shape: a leg's counter only ever goes up within an epoch, a
 new epoch starts a new window, and a new instance is a new source with
 windows of its own (a reloaded sender is a new instance, above, never an old
@@ -815,10 +858,22 @@ and reassembly before any hub could check the signature — and, since a
 stream is state the receiver holds until it ends, a cap on the streams a
 link may hold open UNFINISHED (per link, set as the session's own
 unidirectional-stream limit, which the receiver dictates and the sender
-cannot exceed; and per source inside it, a few frames' worth: the tier's
-frame rate times the jitter window) and a deadline from a stream's first
-byte to its end (one frame interval of the tier, with slack) — a stream
-past either is reset, its bytes discarded and the reset counted against
+cannot exceed; and per source inside it, a few frames' worth: the frames
+a keyframe at the ceiling spans on the wire at the tier's rate, half a
+second's, plus the tier's frame rate times the jitter window) and a
+deadline from a stream's first byte to its end derived from what an
+honest frame can take, not from one frame interval — a keyframe is many
+intervals long on the wire: the video frame-size ceiling is half a second
+of the tier's rate (187 kB on the 3 Mbps desktop tier, 50 kB on the
+0.8 Mbps arcade tier, the most a keyframe at that rate is), and a 100 kB
+keyframe takes some 270 ms at 3 Mbps against a 33 ms interval at 30 fps,
+so a deadline of one interval would reset honest keyframes — the ceiling
+over the tier's rate (half a second: what an honest sender at its tier
+needs for the largest frame it may send), plus the link's measured round
+trip capped at one second as slack, and never more than two seconds
+whatever the tier, since a sender trickling a stream a byte at a time
+would otherwise hold its state for as long as the ceiling allows — a
+stream past either is reset, its bytes discarded and the reset counted against
 the link's failed-verification budget below, since a publisher holding a
 thousand streams open with a byte each would spend the receiver's memory
 and stream state under every rate ceiling here; and a stream whose bytes
@@ -1092,8 +1147,17 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   and a node that accepted the losing branch first switches on sight and
   re-validates; a writer's client never signs over a tip it has not read
   (it fetches the key's tip first), so two honest devices on one key fork
-  only in a race and lose at most the race's ops, and an anchored head's
-  committed tip is the finality that closes the question later. A node
+  only in a race — and what the race loses is the losing BRANCH, whole:
+  not the racing op alone but every descendant either device appended to
+  it before the fork was seen, which a partition can make arbitrarily
+  long, since each side keeps writing over its own tip until it sees the
+  other's. The rule bounds who wins, never how much is lost, so a client
+  expects to recover: on switching it re-signs its discarded ops, in
+  order, over the winning tip (they are its own, their content still
+  wanted, and a re-signed op is a new op at a new sequence, never the old
+  one replayed), and a node reports a fork with the count it discarded;
+  an anchored head's committed tip is the finality that closes the
+  question later. A node
   validates an op against THAT head's writer set, never the current one.
   Heads form one chain of their own: each is signed by the authority that
   makes it (the deed holder for a key-set change; for a transfer, the new
