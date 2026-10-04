@@ -73,7 +73,7 @@ the sources that fail have to say so on the screen.
   source: { kind: 'youtube', videoId }            // IFrame API: full sync
         | { kind: 'archive', identifier, file }   // their embed (start-time sync) or mp4 (full sync)
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
-        | { kind: 'blob', hash, bytes, name }     // the host's own file (blob lane, §4)
+        | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id, a BlobTicket's shape (blob lane, §4)
         | null,
   state: 'off' | 'home' | 'scheduled' | 'playing' | 'paused',  // 'off' is the power key's doing (below); 'home': on, nothing on
   startAt: number,       // UTC ms — the countdown only
@@ -246,8 +246,19 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
 node (v006 §12.1 already pins it; the `'asset'` envelope kind is reserved for
 it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
 (verified, resumable, in order, so playback can start early) and serve it to
-their own webview with range support. No re-encode, every platform; the
-countdown spreads the host's upload before T0. Honest caveat: a transfer, not
+their own webview with range support. A hash alone starts nothing: a fetch
+needs a provider, as an `iroh-blobs` `BlobTicket` carries one beside the
+hash and format. So the `blob` source (§3.1) and a library op (§7) carry the
+hash with the importing node's iroh id — the ticket's shape — and every node
+that completes the blob announces `have` for the hash on the room's control
+plane (a sibling of the `media-sub` kind), so a viewer resolves a hash to
+the connected nodes that hold it: the ticket's provider while it is still
+here, else any announcing holder — the hub first, which has it as soon as it
+served a spoke — else the station library's seeders (§7). A provider that
+leaves mid-transfer is replaced by another holder from the next range on;
+the hash verifies every byte, so any holder is as good as the host, and the
+host leaving does not end the film for those still fetching. No re-encode,
+every platform; the countdown spreads the host's upload before T0. Honest caveat: a transfer, not
 a stream — delete-on-leave cache and private rooms keep it in the shape of
 sending a friend a file. And the record is peer-writable, so a fetch is never
 automatic beyond a cap AND a budget: the source carries its declared size; a
@@ -298,10 +309,14 @@ glimpse tier (the keyframe flag) and to drop, and it gets nothing else. The
 sender mints the key, seals it to each subscriber's X25519 key (derived from
 their Ed25519 identity, the libsodium conversion) on the reliable lane when
 the subscription is accepted, and rotates to a new epoch on every departure
-(the departed can open nothing after it) and on a timer; counters are
-strictly increasing per epoch, and a receiver drops anything at or below
-what it has accepted, with a short window for frames that arrive out of
-order across streams. A subscription is signed by the subscriber's identity
+(the departed can open nothing after it) and on a timer. Replay protection
+is a sliding window, the SRTP shape: the sender's counter only ever goes up
+within an epoch; a receiver keeps the highest counter it has accepted and a
+bitmap of the last 128 below it, takes a frame above the highest (and
+slides the window up), takes a frame inside the window that the bitmap has
+not seen, and drops a duplicate or a counter older than the window — so
+frames that arrive out of order across streams are played once, and a
+replayed one never. A subscription is signed by the subscriber's identity
 with proof of possession (the P2 lane binding's shape, §9), so no entry is
 forged in another's name, and a forged entry would receive only ciphertext
 it cannot open. What a hub still sees is the traffic's shape — who sends to
@@ -566,9 +581,11 @@ it.
 
 1. **TV v1, no node changes** (this PR line): TV furniture (wall mount + stand),
    the `tv`/`remote` records, the lease remote on the phone, YouTube via the
-   IFrame API with full sync, archive.org and direct URLs via `<video>` with
-   full sync, the countdown, the start screen with lane badges, the theatre
-   panel. Spike **S1** beside it: the CSS3D hole-punch with the ortho camera
+   IFrame API with full sync, archive.org files and direct URLs via `<video>`
+   with full sync for finite, seekable media (the archive embed, a live
+   stream or a host without usable ranges play start-time only, §3.3), the
+   countdown, the start screen with lane badges, the theatre panel. Spike
+   **S1** beside it: the CSS3D hole-punch with the ortho camera
    plus the error-153 check on the three desktop shells.
 2. **Node media proxy** (`/api/media`, range + CORS, host allowlist): textures
    from archive.org files, spatial audio, the #194 CRT pass; the cabinet's ROM
