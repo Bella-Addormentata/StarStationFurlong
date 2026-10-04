@@ -118,6 +118,16 @@ export interface OrbitChange {
    *  change that loses still holds the orbit its station stays on, for
    *  installs that never saw the move before it; absent: the slot's own. */
   fromSince?: number;
+  /** The base orbit it leaves (the station's StationRecord.orbit, or its
+   *  slot's) when station keeping had trimmed it off that: the claim it
+   *  holds and the orbit it stays on if aborted, the trim riding on top.
+   *  Absent: the from orbit is the base. */
+  fromBase?: StationOrbit;
+}
+
+/** 🎚️ The base orbit an altitude change leaves (OrbitChange.fromBase). */
+export function orbitChangeBase(o: OrbitChange): StationOrbit {
+  return o.fromBase ? { radiusKm: o.fromBase.radiusKm, phase0: o.fromBase.phase0 } : { radiusKm: o.fromRadiusKm, phase0: o.fromPhase0 };
 }
 
 /** ⚓🚦 One gate of a station: a dock port an arriving ship may berth at. */
@@ -322,7 +332,7 @@ export function orbitClaimedAt(move: StationMove | null | undefined, orbit: Stat
   const m = move.settles ?? move;
   const same = (r: number) => Math.abs(r - orbit.radiusKm) < 1e-6;
   if (m.mode === 'orbit' && m.orbit && same(m.orbit.toRadiusKm)) return m.bookedAt ?? m.departAt;
-  if (m.mode === 'orbit' && m.orbit && same(m.orbit.fromRadiusKm)) return m.orbit.fromSince ?? 0;
+  if (m.mode === 'orbit' && m.orbit && same(orbitChangeBase(m.orbit).radiusKm)) return m.orbit.fromSince ?? 0;
   if (m.mode !== 'orbit' && m.fromOrbit && same(m.fromOrbit.radiusKm)) return m.fromOrbit.since ?? 0;
   return 0;
 }
@@ -368,7 +378,7 @@ export function altitudeChangedSince(station: MovingStation, sinceMs: number, no
     if (!moveBelongsTo(m, station)) return false;
     const src = m.settles ?? m;
     const since = src.mode === 'orbit' ? src.orbit?.fromSince : src.fromOrbit?.since;
-    return since !== undefined && since > sinceMs && since <= nowMs;
+    return since !== undefined && since >= sinceMs && since <= nowMs;
   });
   if (claimedSince.length === 0) return false;
   // Unless that orbit lost its claim (the station never kept it).
@@ -431,7 +441,7 @@ export function lostAltitudeClaims(moves: readonly StationMove[]): Set<string> {
         });
         if (from) {
           claims.push({
-            key: from, station, planet, radiusKm: m.orbit!.fromRadiusKm, at: Math.min(since!, booked),
+            key: from, station, planet, radiusKm: orbitChangeBase(m.orbit!).radiusKm, at: Math.min(since!, booked),
             held: (t) => !endedBy(list, booked - 1, t),
           });
         }
@@ -480,7 +490,7 @@ export function orbitAfterMove(move: StationMove | null | undefined, nowMs: numb
   if (!o) return undefined;
   return nowMs >= m.arriveAt
     ? { radiusKm: o.toRadiusKm, phase0: o.toPhase0 }
-    : { radiusKm: o.fromRadiusKm, phase0: o.fromPhase0 };
+    : orbitChangeBase(o);
 }
 
 /** Where a station is listed at `nowMs` given its latest move: the move's
@@ -568,7 +578,7 @@ export function knownSlotsAround(
   const listed = new Set(listedRooms);
   for (const st of placeStations(atlas, readStationRecords(), nowMs).heard) {
     if (listed.has(st.welcomeRoomId)) continue;
-    if (!stationInTransit(st, nowMs) && planetById(st.planetId).id === id) taken.add(st.orbitSlot);
+    if (!stationLeftPlanet(st, nowMs) && planetById(st.planetId).id === id) taken.add(st.orbitSlot);
     if (reservesSlot(st.move, nowMs) && planetById(st.move.toPlanetId).id === id) reserved.add(st.move.toSlot);
   }
   return { taken, reserved };
@@ -759,7 +769,7 @@ export function registerStation(
 /** How many stations share an orbit slot with another (listed or heard of;
  *  one between planets holds none). */
 function crowding(placed: { listed: StationRecord[]; heard: StationRecord[] }, nowMs: number): number {
-  const holding = [...placed.listed, ...placed.heard].filter((s) => !stationInTransit(s, nowMs));
+  const holding = [...placed.listed, ...placed.heard].filter((s) => !stationLeftPlanet(s, nowMs));
   return holding.length - new Set(holding.map((s) => `${planetById(s.planetId).id}:${s.orbitSlot}`)).size;
 }
 
@@ -1009,8 +1019,9 @@ function placeStations(
       const planet = planetById(planetId);
       const low = planet.radiusKm + MIN_ALTITUDE_KM;
       const high = planet.radiusKm + maxAltitudeKm(planet.id);
-      const radiusKm = Math.min(high, Math.max(low, m.orbit.fromRadiusKm));
-      wantOf[i] = { planetId, orbitSlot, orbit: { radiusKm, phase0: m.orbit.fromPhase0 } };
+      const base = orbitChangeBase(m.orbit);
+      const radiusKm = Math.min(high, Math.max(low, base.radiusKm));
+      wantOf[i] = { planetId, orbitSlot, orbit: { radiusKm, phase0: base.phase0 } };
     } else if (m.mode === 'orbit' && !m.settles && m.orbit) {
       // The orbit it left was lost too: its slot's own.
       wantOf[i] = { planetId, orbitSlot };
@@ -1045,7 +1056,8 @@ function placeStations(
   // free slot on; then arrivals in the order they arrived. A clash moves only
   // the station that lost it, and a newcomer never pushes out an incumbent.
   // Derived stations follow saved records (and those heard of) among those
-  // that never moved.
+  // that never moved. A station waiting to depart goes before them all
+  // (below).
   const byName = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
   const globalOrder = (i: number, j: number) => byName(wantOf[i].planetId, wantOf[j].planetId)
     || wantOf[i].orbitSlot - wantOf[j].orbitSlot
@@ -1065,7 +1077,28 @@ function placeStations(
     if (slot !== null) settle(0, wantOf[0].planetId, slot);
   }
   for (const i of rest.filter(inTransit)) settle(i, wantOf[i].planetId, wantOf[i].orbitSlot);
-  for (const group of [rest.filter((i) => i < firstDerived && !inTransit(i)), rest.filter((i) => i >= firstDerived && !inTransit(i))]) {
+  // 🚚 A station waiting for its launch window keeps the slot its move
+  // leaves from: the move was priced from that orbit (its fuel, its course),
+  // and is drawn leaving it, then listed leaving it. It takes that slot
+  // before the other stayers, so a clash found meanwhile moves the other
+  // station. Two waiting to leave one slot (booked by installs that had not
+  // heard of each other) share it until each has left, as an arrival with
+  // nowhere else to go shares one: neither waits anywhere its move does not
+  // leave from.
+  const waiting = (i: number) => {
+    const m = candidates[i].move;
+    return !!m && nowMs < m.departAt && reservesSlot(m, nowMs);
+  };
+  const kept = new Set<number>();
+  for (const i of rest.filter((j) => !inTransit(j) && waiting(j)).sort(globalOrder)) {
+    const { planetId, orbitSlot } = wantOf[i];
+    if (!Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) continue;
+    takeOwn(planetId, orbitSlot);
+    settle(i, planetId, orbitSlot);
+    kept.add(i);
+  }
+  const stay = (i: number) => !inTransit(i) && !kept.has(i);
+  for (const group of [rest.filter((i) => i < firstDerived && stay(i)), rest.filter((i) => i >= firstDerived && stay(i))]) {
     const lost: number[] = [];
     for (const i of [...group].sort(globalOrder)) {
       const { planetId, orbitSlot } = wantOf[i];
@@ -1112,7 +1145,7 @@ function placeStations(
         const om = pinned && o.move!.departAt >= pinned.arriveAt && T < pinned.arriveAt ? pinned : o.move;
         // One between planets at T held no slot anywhere: first, since one
         // still on its way now is listed where it left from.
-        if (stationInTransit({ move: om ?? undefined }, T)) return;
+        if (stationLeftPlanet({ move: om ?? undefined }, T)) return;
         if (settledAt(o) <= T) {
           if (spots[j]?.planetId === dest) taken.add(spots[j]!.orbitSlot);
           return;

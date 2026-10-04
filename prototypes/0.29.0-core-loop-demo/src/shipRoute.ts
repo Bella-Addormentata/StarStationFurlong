@@ -108,7 +108,7 @@ import {
   startCheckpoint,
   stopAt,
 } from './pilotRoute';
-import type { LiveDockAt, RouteFlight, RouteFlightPlaces, RouteSettleAction } from './pilotRoute';
+import type { LiveDockAt, RouteFlight, RouteFlightPlace, RouteFlightPlaces, RouteSettleAction } from './pilotRoute';
 import {
   clampFuelToCapacity,
   raiseStoredFuelLevel,
@@ -844,8 +844,9 @@ export function writeShipRoute(route: ShipRoute | null): boolean {
 // routes, in its own transaction. Advisory only: no client refuses on it
 // yet, it is never lowered, and a room with no route never gets it.
 
-/** The first release that reads ferry routes (the one after v0.37.0). */
-export const ROUTE_MIN_CLIENT = '0.38.0';
+/** The first release that reads ferry routes: v0.38.0 shipped (2026-09-27)
+ *  without them, so the one after it. */
+export const ROUTE_MIN_CLIENT = '0.39.0';
 
 function versionParts(v: unknown): [number, number, number] | null {
   if (typeof v !== 'string' || v.length > 32) return null;
@@ -965,6 +966,57 @@ export function writeRouteCheckpoint(run: number, entry: RouteCheckpoint, now = 
   return true;
 }
 
+// 🚏🤖 The same reading and writing for ANY ship map: a ferry room a
+// station's gate keeper holds a background session to (gateKeeper.ts), which
+// is never the bound ship.
+
+/**
+ * The route and the running run's checkpoints of any ship map, read exactly
+ * as readShipRoute and readRouteCheckpoints read the bound ship's (the latest
+ * run not stamped past RUN_AHEAD_MS, 🏁 laterRuns; shape-checked, capped by
+ * stay), with no cache. Pure over the map.
+ */
+export function routeIn(map: Y.Map<unknown>, now = Date.now()): { route: ShipRoute | null; checkpoints: readonly RouteCheckpoint[] } {
+  const stored = shipRouteFromWire(map.get('route'));
+  if (!isRouteRunning(stored)) return { route: stored, checkpoints: [] };
+  const scan = scanCheckpoints(map, stored.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED);
+  const route = [...laterRuns(stored, scan.laterStarts, map), stored].find((r) => !runTooFarAhead(r, now));
+  if (!route || !isRouteRunning(route)) return { route: routeWithoutRun(stored), checkpoints: [] };
+  const checkpoints = route.startedAt === stored.startedAt
+    ? scan.entries
+    : scanCheckpoints(map, route.startedAt, MAX_CHECKPOINT_KEYS_SCANNED, MAX_SHIP_KEYS_VISITED).entries;
+  return { route, checkpoints };
+}
+
+/** 🏁 readEndedRun for any ship map: the run the last finish ended, while no
+ *  run flies there (as routeIn reads it). Pure over the map. */
+export function endedRunIn(map: Y.Map<unknown>, now = Date.now()): number | undefined {
+  return isRouteRunning(routeIn(map, now).route) ? undefined : newestRunStartIn(map, now);
+}
+
+/**
+ * writeRouteCheckpoint for any ship doc: the same checks (the run is still
+ * the route's, the entry well formed and at its stay's stop), the same key
+ * and the same pruning, in one transaction of that doc. No write notice: the
+ * departures publisher publishes the bound ship only, and the gate keeper
+ * publishes its own writes. Returns whether it wrote.
+ */
+export function writeRouteCheckpointIn(doc: Y.Doc, map: Y.Map<unknown>, run: number, entry: RouteCheckpoint, now = Date.now()): boolean {
+  const route = routeIn(map, now).route;
+  if (!isRouteRunning(route) || route.startedAt !== run) return false;
+  const wire = checkpointToWire(entry);
+  const clean = checkpointFromWire(entry.kind, entry.legSeq, wire);
+  if (!clean || clean.stationId !== route.stops[stopAt(route, clean.legSeq)].stationId) {
+    console.warn('[route] refused to write a malformed checkpoint', entry);
+    return false;
+  }
+  doc.transact(() => {
+    map.set(checkpointKey(run, clean.legSeq, clean.kind), wire);
+    pruneIn(map, route, now);
+  });
+  return true;
+}
+
 /** Prune on its own (a writer tidying up): returns how many keys went. */
 export function pruneRouteCheckpoints(now = Date.now()): number {
   const h = shipDocHandle();
@@ -1014,8 +1066,14 @@ export function finishShipRoute(apply?: () => void): boolean {
 export function readEndedRun(now = Date.now()): number | undefined {
   const h = shipDocHandle();
   if (!h || isRouteRunning(readShipRoute(now))) return undefined;
+  return newestRunStartIn(h.map, now);
+}
+
+/** The newest run whose start key a ship map holds, not stamped past
+ *  RUN_AHEAD_MS: while no run flies there, the run the last finish ended. */
+function newestRunStartIn(map: Y.Map<unknown>, now: number): number | undefined {
   let run: number | undefined;
-  for (const key of scanCheckpoints(h.map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns) {
+  for (const key of scanCheckpoints(map, null, Number.POSITIVE_INFINITY, MAX_PRUNE_KEYS_VISITED).otherRuns) {
     const p = parseCheckpointKey(key);
     if (p?.kind !== 'start' || p.run > now + RUN_AHEAD_MS) continue;
     if (run === undefined || p.run > run) run = p.run;
@@ -1243,6 +1301,12 @@ export interface RouteSettleOptions {
    *  ferry, nothing will, and the route finishes as soon as the ship is at
    *  its end stop, berthless if nobody docked it (dock by hand from there). */
   dockAnswered?: (f: RouteFlight) => boolean;
+  /** 🚚 Called once a finish has cleared the run, with where the timetable
+   *  left the ship: the route's copy of its end stop (pilotRoute's
+   *  routeFlightPlaces, read with the finish's own flight), which that stop's
+   *  station may have left since (null: none derivable). A ship no dock
+   *  carries rests there (shipArrival.restAtRouteEnd). */
+  finished?: (end: RouteFlightPlace | null) => void;
 }
 
 /**
@@ -1251,7 +1315,7 @@ export interface RouteSettleOptions {
  *    has answered: in ONE transaction, clear the run and its checkpoints
  *    (finishShipRoute: the route meter reads 0 from here), then write the
  *    derived flight (through `redocking` when the stored one is `in-flight`)
- *    and the derived fuel level;
+ *    and the derived fuel level; then hand `finished` the end stop's copy;
  *  - mid-route, when a person's `in-flight` has been landed by the
  *    timetable: walk the stored flight to `docked` there, one transaction.
  * Returns which it did, or null.
@@ -1269,6 +1333,8 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
   });
   if (!action) return null;
   if (action.kind === 'finish') {
+    // 🚚 Read before the finish clears the run it is read from.
+    const end = routeFlightPlaces(readShipRoute(now), route, localStationId)?.from ?? null;
     const capacity = d.capacity();
     // ⛽ What the tank reads now, with the route's meter still on: the
     // route's level less any other consumer's draw since the level was
@@ -1278,7 +1344,9 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
       for (const rec of action.writes) writeFlightRecord(rec);
       writeFuelLevel(level, capacity);
     });
-    return finished ? 'finish' : null;
+    if (!finished) return null;
+    o.finished?.(end);
+    return 'finish';
   }
   h.doc.transact(() => {
     for (const rec of action.writes) writeFlightRecord(rec);

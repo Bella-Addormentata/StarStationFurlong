@@ -28,6 +28,8 @@ import {
   refreshTrims,
   registerLearnedStations,
   resolveStationAlias,
+  routeLegEnds,
+  routeStayPlace,
   shipsAroundPlanet,
   subscribePlanetSummary,
   summaryForStation,
@@ -37,14 +39,16 @@ import {
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
+import { routeStayOffList } from './pilotRoute';
 import type { RouteFlightPlaces } from './pilotRoute';
+import { readSharedTrim } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import {
   DEFAULT_PLANET_ID, MAX_ORBIT_SLOTS, knownSlotsAround, listStations, readStationRecords, registerStation, setKnownPlacesResolver,
   setStationMoveResolver,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
-import { freeSlotAround, installStationMoveResolver, rememberMove, rememberedMoveFor } from './stationMove';
+import { freeSlotAround, installStationMoveResolver, rejectionOf, rememberMove, rememberedMoveFor } from './stationMove';
 import { directoryFromStationRecords, localStationId, setStationDirectory } from './stationDirectory';
 import { bindShipDoc, readFlightRecord, writeFlightRecord } from './shipDoc';
 
@@ -101,14 +105,17 @@ afterEach(() => {
 
 describe('guards', () => {
   it('accepts a well-formed station summary and copies only known fields', () => {
-    const s = cleanStationSummary({ ...summary(), trim: { ...trim(), fuelDrawn: 7, junk: 2 }, junk: 1 }, T0);
-    expect(s).toEqual({ ...summary(), trim: { ...trim(), fuelDrawn: 7 } });
+    const line = { seq: 3, place: T0 + 5, seen: [[7, T0 + 5]] as [number, number][] };
+    const s = cleanStationSummary({ ...summary(), trim: { ...trim(), ...line, fuelDrawn: 7, junk: 2 }, junk: 1 }, T0);
+    // A trim's count of burns, place and writers travel (the helm rooms go
+    // on from it); the room's fuel draw does not.
+    expect(s).toEqual({ ...summary(), trim: { ...trim(), ...line } });
   });
 
   it('settles trims whose last burns share a moment on the one with more burns, in either order', () => {
-    const lower = summary({ trim: trim({ dRadiusKm: -2, fuelDrawn: 1 }) });
-    const raise = summary({ trim: trim({ dRadiusKm: 2, fuelDrawn: 1 }) });
-    const both = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+    const lower = summary({ trim: trim({ dRadiusKm: -2, seq: 1 }) });
+    const raise = summary({ trim: trim({ dRadiusKm: 2, seq: 1 }) });
+    const both = summary({ trim: trim({ dRadiusKm: 0, seq: 2 }) });
     for (const [a, b] of [[lower, raise], [raise, lower]]) {
       const partial = mergeStation(a, b) ?? a;
       expect(mergeStation(partial, both)?.trim?.dRadiusKm).toBe(0);
@@ -116,11 +123,27 @@ describe('guards', () => {
     }
   });
 
-  it('settles a same-moment trim from a build without fuel counts on the one that has them, in either order', () => {
-    const old = summary({ trim: trim({ dRadiusKm: 2 }) });
-    const counted = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+  it('settles on the trim further along its line, whatever clock stamped the other, in either order', () => {
+    // Another helm room went on from this trim twice; a room whose clock runs
+    // ahead burned once from none.
+    const along = summary({ trim: { ...trim({ dRadiusKm: 0, seq: 3 }), from: 'room-a', readAt: T0 + 10 } });
+    const ahead = summary({ trim: { ...trim({ dRadiusKm: 6, seq: 1, at: T0 + 60_000 }), from: 'room-b', readAt: T0 + 20 } });
+    expect((mergeStation(ahead, along) ?? ahead).trim?.dRadiusKm).toBe(0);
+    expect(mergeStation(along, ahead)).toBeNull();
+    // A trim without the count (from before it) has had no burns along a line.
+    const old = summary({ trim: trim({ dRadiusKm: 2, at: T0 + 60_000 }) });
+    const counted = summary({ trim: trim({ dRadiusKm: 0, seq: 1 }) });
     expect((mergeStation(old, counted) ?? old).trim?.dRadiusKm).toBe(0);
     expect(mergeStation(counted, old)).toBeNull();
+  });
+
+  it('takes the later reading of one room over its earlier one, however far along that was', () => {
+    // The room took its trim back (a stale level write won): its later
+    // reading stands, though the earlier one had more burns.
+    const earlier = summary({ trim: { ...trim({ dRadiusKm: 4, seq: 5 }), from: 'room-a', readAt: T0 + 10 } });
+    const later = summary({ trim: { ...trim({ dRadiusKm: 2, seq: 3 }), from: 'room-a', readAt: T0 + 20 } });
+    expect((mergeStation(earlier, later) ?? earlier).trim?.dRadiusKm).toBe(2);
+    expect(mergeStation(later, earlier)).toBeNull();
   });
 
   it("keeps a newer trim the standing record's own install flies on another slot", () => {
@@ -628,6 +651,48 @@ describe('learned stations', () => {
     }
   });
 
+  it('count only the stations in their orbits against a planet\'s slots, and list every one between planets besides', () => {
+    const now = Date.now();
+    // This install's own station and a learned one, both on their way from
+    // SOV to ARIS: neither holds a slot at SOV meanwhile.
+    expect(registerStation(record({ id: 'mine', welcomeRoomId: 'room-mine', orbitSlot: 3 }))).toBe(true);
+    const away = (welcomeRoomId: string, fromSlot: number): StationMove => ({
+      stationId: welcomeRoomId, welcomeRoomId, fromPlanetId: SOV, fromSlot, toPlanetId: ARIS, toSlot: fromSlot,
+      departAt: now - 1000, arriveAt: now + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    });
+    const moves = [away('room-mine', 3), away('room-hab', 2)];
+    setStationMoveResolver((st) => moves.find((m) => m.welcomeRoomId === st.welcomeRoomId) ?? null);
+    try {
+      // Learned stations in every slot Furlong leaves free.
+      const orbiting = Array.from({ length: MAX_ORBIT_SLOTS - 1 }, (_, i) =>
+        summary({ welcomeRoomId: `room-s${String(i).padStart(2, '0')}`, name: `S${i}`, orbitSlot: i + 1 }));
+      const rooms = [...orbiting.map((o) => o.welcomeRoomId), 'room-hab'];
+      // HAB RING follows that move: a later tow of it lost its tug to
+      // another station's (the summary's `stands` beside its latest).
+      const outbid: StationMove = { ...moves[1], mode: 'tug', tugRoomId: 'tug-room', departAt: now + 3_600_000, arriveAt: now + 7_200_000 };
+      const habMove = moves[1];
+      const hab = () => summary({ move: outbid, stands: habMove });
+      expect(registerLearnedStations(SOV, [...orbiting, hab()], { prune: true })).toBe(MAX_ORBIT_SLOTS);
+      expect(readStationRecords().map((r) => r.welcomeRoomId).sort()).toEqual(['room-mine', ...rooms].sort());
+      const listed = listStations();
+      for (const room of rooms) expect(listed.find((st) => st.welcomeRoomId === room)?.planetId).toBe(SOV);
+      // Back in its orbit (its move called off), this install's own station
+      // holds a slot again, and the last learned one ranked goes.
+      moves.shift();
+      expect(registerLearnedStations(SOV, [...orbiting, hab()], { prune: true })).toBe(1);
+      expect(readStationRecords().map((r) => r.welcomeRoomId).sort())
+        .toEqual(['room-mine', ...rooms.filter((r) => r !== orbiting[orbiting.length - 1].welcomeRoomId)].sort());
+      // Where this install's list has no move for HAB RING (called off,
+      // say, before its summary heard), the list seats it: it counts
+      // against the slots as the list has it, and another learned one goes.
+      moves.length = 0;
+      expect(registerLearnedStations(SOV, [...orbiting, hab()], { prune: true })).toBe(1);
+      expect(readStationRecords().map((r) => r.welcomeRoomId)).not.toContain(orbiting[orbiting.length - 2].welcomeRoomId);
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
   it('keep this client at the planet its list settled a bounced arrival at, before the pin is shared', () => {
     const now = Date.now();
     // Learned here, around this planet: the station this client is aboard,
@@ -702,6 +767,38 @@ describe('learned stations', () => {
       // A change to the store is read at once.
       store.set('ssf-planet-summary', storeOf(summary({ welcomeRoomId: 'room-a', planetId: ARIS, orbitSlot: 0 })));
       expect(freeSlotAround(ARIS, listed, undefined, T0)).toBe(1);
+    } finally {
+      setKnownPlacesResolver(null);
+    }
+  });
+
+  it('read the stations heard of without asking which ship entries stay, so listing stations never re-enters itself', () => {
+    const now = Date.now();
+    let depth = 0;
+    let deepest = 0;
+    bindPlanetSummaryDoc(new Y.Doc(), install(null, {
+      currentRoom: () => 'room-ship',
+      // As main.ts's: whether this room is a station's is read off the station list.
+      notShipRoom: () => {
+        depth++;
+        deepest = Math.max(deepest, depth);
+        try { listStations(); } finally { depth--; }
+        return null;
+      },
+    }));
+    installKnownPlacesResolver();
+    try {
+      // This room's own ship entry, long quiet (kept only for the room it
+      // stands in), beside a station heard of around Aris.
+      store.set('ssf-planet-summary', JSON.stringify({
+        stations: { 'room-c': summary({ welcomeRoomId: 'room-c', name: 'C', planetId: ARIS, orbitSlot: 4, updatedAt: now - 1000 }) },
+        ships: { 'room-ship': { roomId: 'room-ship', name: 'FERRY', planetId: ARIS, status: 'docked', updatedAt: now - 2 * SHIP_STALE_MS } },
+      }));
+      deepest = 0;
+      expect(knownSlotsAround(ARIS, [], now).taken.has(4)).toBe(true);
+      expect(deepest).toBe(0);
+      // The store still keeps that entry for the room it stands in.
+      expect(readStore(now).ships['room-ship']).toBeDefined();
     } finally {
       setKnownPlacesResolver(null);
     }
@@ -821,6 +918,53 @@ describe('sharing through the room doc', () => {
       docC.getMap('stationSummaries').set('room-yard', docA.getMap('stationSummaries').get('room-yard'));
       bindPlanetSummaryDoc(docC, install(null));
       expect(habAt()).toBeNull();
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  it('keeps the tow another outbid cancelled on a fresh install, once the rival is no longer gossiped', () => {
+    const now = Date.now();
+    const { moved, pin, tow, rival } = outbidTow(now);
+    // The yard has moved on since its tow (a move booked once that one had
+    // arrived): its summary carries that move, and the rival no more.
+    const yardNext: StationMove = {
+      stationId: 'yard', welcomeRoomId: 'room-yard', fromPlanetId: ARIS, fromSlot: 6, toPlanetId: SOV, toSlot: 7,
+      departAt: rival.arriveAt + 2000, arriveAt: rival.arriveAt + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+      bookedAt: rival.arriveAt + 1000,
+    };
+    const docA = new Y.Doc();
+    docA.getMap('stationSummaries').set('room-hab', summary({ updatedAt: now }));
+    docA.getMap('stationSummaries').set('room-yard', summary({ welcomeRoomId: 'room-yard', name: 'YARD', orbitSlot: 4, updatedAt: now }));
+    bindPlanetSummaryDoc(docA, install(null));
+    for (const m of [moved, pin, tow, rival, yardNext]) expect(rememberMove(m, now)).toBe(true);
+    publishPlanetSummary(now + 10);
+    const hab = docA.getMap('stationSummaries').get('room-hab') as StationSummary;
+    expect(hab.move).toEqual(tow);
+    expect(hab.stands).toEqual(pin);
+    expect((docA.getMap('stationSummaries').get('room-yard') as StationSummary).move).toEqual(yardNext);
+    // A fresh install learns both summaries, and so never the rival.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    registerStation(record({ id: 'c-home', name: 'C HOME', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'room-c' }));
+    const docC = new Y.Doc();
+    sync(docA, docC);
+    installStationMoveResolver();
+    const habAt = () => rememberedMoveFor({ id: `${LEARNED_PREFIX}room-hab`, welcomeRoomId: 'room-hab' });
+    const listed = (at: number) => listStations(undefined, undefined, at).find((st) => st.welcomeRoomId === 'room-hab');
+    try {
+      bindPlanetSummaryDoc(docC, install('c-home'));
+      // HAB RING follows the tow's cancel (rejectionOf): where the summary
+      // places it, before the tow would have left and after it would have
+      // arrived, and its slot at Sovereign is no one's.
+      expect(habAt()).toEqual(rejectionOf(tow));
+      expect(summaryPlanet(hab, tow.arriveAt + 1)).toBe(ARIS);
+      expect(listed(now)).toMatchObject({ planetId: ARIS, orbitSlot: 5 });
+      expect(listed(tow.arriveAt + 1)).toMatchObject({ planetId: ARIS, orbitSlot: 5 });
+      // Kept for good: the tow heard of again on its own never flies here.
+      unbindPlanetSummaryForTest();
+      rememberMove(tow, now);
+      expect(habAt()).toEqual(rejectionOf(tow));
     } finally {
       setStationMoveResolver(null);
     }
@@ -1044,6 +1188,27 @@ describe('sharing through the room doc', () => {
     sync(peer, doc);
     const hab = listStations().find((s) => s.id === 'hab')!;
     expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm - 6, 6);
+  });
+
+  it("shares each station's newest trim with its helm rooms, and none once unbound", () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    // This room's own trim: one burn.
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim({ seq: 1 }), currentRoom: () => 'room-hab' }));
+    installTrimResolver();
+    const hab = listStations().find((s) => s.id === 'hab')!;
+    expect(readSharedTrim(hab)).toEqual(trim({ seq: 1 }));
+    // Another helm room of the station went on from it twice, on a clock
+    // behind this one's: its trim, with its place and writers, is the
+    // station's now.
+    const along = trim({ dRadiusKm: 8, seq: 3, at: T0 - 5_000, place: T0 + 2, seen: [[42, T0 + 2]] });
+    const peer = new Y.Doc();
+    sync(doc, peer);
+    peer.getMap('stationSummaries').set('room-hab', { ...summary(), trim: { ...along, from: 'room-b', readAt: T0 } });
+    sync(peer, doc);
+    expect(readSharedTrim(hab)).toEqual(along);
+    unbindPlanetSummaryForTest();
+    expect(readSharedTrim(hab)).toBeNull();
   });
 
   it('writes the winner back when a peer\'s value loses the merge', () => {
@@ -1295,7 +1460,7 @@ describe('ships and the solar system', () => {
     expect((doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt).toBe(first + 3600 * 1000);
   });
 
-  it('🚚 says a leg\'s copied ends only in flight, and reads them back under this install\'s ids', () => {
+  it('🚚 says a leg\'s copied ends only in flight, and reads them back as the timetable planned them', () => {
     const places: RouteFlightPlaces = {
       from: { id: 'st-x', planetId: SOV, orbitSlot: 1 },
       to: { id: 'st-y', planetId: 'planet-nowhere', orbitSlot: 3 },
@@ -1304,14 +1469,135 @@ describe('ships and the solar system', () => {
     expect(legEndFields(places)).toEqual({ fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3 });
     expect(legEndFields({ ...places, to: null })).toEqual({});
     expect(legEndFields(null)).toEqual({});
+    // Under ids no trim resolver knows, aboard and in a summary alike.
+    const untrimmed = [
+      { id: 'route-stop:from', planetId: SOV, orbitSlot: 1 },
+      { id: 'route-stop:to', planetId: SOV, orbitSlot: 3 },
+    ];
+    expect(routeLegEnds(places)).toEqual(untrimmed);
+    expect(routeLegEnds({ ...places, to: null })).toBeNull();
+    expect(routeLegEnds(null)).toBeNull();
     const s = { fromRoom: 'room-a', toRoom: 'room-b', ...legEndFields(places) };
-    expect(summaryLegEnds(s, (room) => (room === 'room-a' ? 'st-a' : undefined))).toEqual([
-      { id: 'st-a', planetId: SOV, orbitSlot: 1 },
-      { id: 'room-b', planetId: SOV, orbitSlot: 3 },
-    ]);
+    expect(summaryLegEnds(s)).toEqual(untrimmed);
     // An older client's relay drops the copies: the reader places the ends.
     expect(summaryLegEnds({ fromRoom: 'room-a', toRoom: 'room-b' })).toBeNull();
     expect(summaryLegEnds({ ...s, toRoom: undefined })).toBeNull();
+  });
+
+  it('🎚️ carries a copied stop\'s own orbit with the leg, so a remote reader flies the priced transfer', () => {
+    const slot3 = orbitForSlot(SOV, 3);
+    const custom = { radiusKm: slot3.radiusKm + 120, phase0: 0.4 };
+    const places: RouteFlightPlaces = {
+      from: { id: 'st-x', planetId: SOV, orbitSlot: 1 },
+      to: { id: 'st-y', planetId: SOV, orbitSlot: 3, orbit: custom },
+    };
+    const fields = legEndFields(places);
+    expect(fields).toEqual({ fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3, toOrbit: custom });
+    const now = Date.now();
+    const wire = { ...ship, status: 'in-flight', fromRoom: 'room-a', toRoom: 'room-b', departedAt: now - 1000, etaAt: now + 3600_000, updatedAt: now, ...fields };
+    const heard = cleanShipSummary(JSON.parse(JSON.stringify(wire)), now)!;
+    expect(heard.toOrbit).toEqual(custom);
+    expect(heard.fromOrbit).toBeUndefined();
+    const ends = summaryLegEnds(heard)!;
+    expect(ends[1].orbit).toEqual(custom);
+    // The remote plan targets the custom orbit, not the slot's.
+    expect(planTransfer(ends[0], ends[1], now)!.to.radiusKm).toBeCloseTo(custom.radiusKm, 6);
+    // A peer's orbit outside the band, or without its leg, is dropped.
+    expect(cleanShipSummary({ ...wire, toOrbit: { radiusKm: 1, phase0: 0 } }, now)!.toOrbit).toBeUndefined();
+    expect(cleanShipSummary({ ...wire, toOrbit: { radiusKm: 'x', phase0: 0 } }, now)!.toOrbit).toBeUndefined();
+    expect(cleanShipSummary({ ...wire, toSlot: undefined }, now)!.toOrbit).toBeUndefined();
+  });
+
+  // Copilot (PR 180): the timetable plans its legs untrimmed (pilotRoute's
+  // route-stop ids), so a leg drawn through a trim this game has heard of
+  // would part from the times it flies by, and differ between games.
+  it('🚚 draws a ferry\'s leg as its timetable planned it, though the station it flies to is trimmed', () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim() }));
+    installTrimResolver();
+    const hab = listStations().find((s) => s.id === 'hab')!;
+    expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+    // The ferry's leg to HAB: aboard, its route's places name HAB by its id here.
+    const places: RouteFlightPlaces = {
+      from: { id: 'yard', planetId: SOV, orbitSlot: 1 },
+      to: { id: 'hab', planetId: SOV, orbitSlot: 2 },
+    };
+    const planned = planTransfer(
+      { id: 'route-stop:0', planetId: SOV, orbitSlot: 1 },
+      { id: 'route-stop:1', planetId: SOV, orbitSlot: 2 },
+      T0,
+    )!;
+    const heard = { fromRoom: 'room-yard', toRoom: 'room-hab', ...legEndFields(places) };
+    for (const ends of [routeLegEnds(places)!, summaryLegEnds(heard)!]) {
+      const plan = planTransfer(ends[0], ends[1], T0)!;
+      expect(plan.to).toEqual(orbitForSlot(SOV, 2));
+      expect(plan.transferMs).toBe(planned.transferMs);
+      expect(plan.departAt).toBe(planned.departAt);
+    }
+    // An ordinary flight's ends go by its stations' ids: HAB's trim applies.
+    expect(planTransfer(places.from, places.to!, T0)!.to.radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+  });
+
+  // Copilot (PR 180): a stay on the route's copy of a stop whose station is
+  // between planets. This install keeps that station's trim for the slot it
+  // left, which the copy names, but the legs either side of the stay fly
+  // untrimmed (routeLegEnds), so the stay must too.
+  it('🚚 draws a ferry\'s stay at a stop whose station is between planets untrimmed, as the legs either side of it', () => {
+    const now = Date.now();
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: now - 1000, arriveAt: now + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'room-hab' ? move : null));
+    try {
+      registerStation(record());
+      const doc = new Y.Doc();
+      bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim() }));
+      installTrimResolver();
+      // Listed where it left from until it arrives, its trim with it.
+      const hab = listStations().find((s) => s.id === 'hab')!;
+      expect(hab).toMatchObject({ planetId: SOV, orbitSlot: 2 });
+      expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+      // The ferry's stay at HAB, with no live dock to carry it along: on the
+      // route's copy of the stop, which names HAB by its id here.
+      const places: RouteFlightPlaces = { from: { id: 'hab', planetId: SOV, orbitSlot: 2 }, to: null };
+      const stay = routeStayOffList(places, false)!;
+      expect(stay).toEqual(places.from);
+      expect(stationOrbit(stay).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6); // what it was drawn on
+      const drawn = routeStayPlace(stay);
+      expect(drawn).toEqual({ id: 'route-stop:from', planetId: SOV, orbitSlot: 2 });
+      expect(stationOrbit(drawn)).toEqual(orbitForSlot(SOV, 2));
+      // The orbit the leg in ends on and the leg out leaves from.
+      const yard = { id: 'yard', planetId: SOV, orbitSlot: 1 };
+      const legIn = routeLegEnds({ from: yard, to: places.from })!;
+      const legOut = routeLegEnds({ from: places.from, to: yard })!;
+      expect(planTransfer(legIn[0], legIn[1], T0)!.to).toEqual(stationOrbit(drawn));
+      expect(planTransfer(legOut[0], legOut[1], T0)!.from).toEqual(stationOrbit(drawn));
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  // Copilot (PR 180): a stay at a stop whose station is still there, trimmed,
+  // with no live dock (waiting for a berth, say), was drawn on the station's
+  // trimmed orbit between the untrimmed legs in and out.
+  it('🚚 draws a ferry\'s stay at a trimmed stop it is not docked at untrimmed, as the legs either side of it', () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim() }));
+    installTrimResolver();
+    const hab = listStations().find((s) => s.id === 'hab')!;
+    expect(hab).toMatchObject({ planetId: SOV, orbitSlot: 2 });
+    expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+    const places: RouteFlightPlaces = { from: { id: 'hab', planetId: SOV, orbitSlot: 2 }, to: null };
+    const drawn = routeStayPlace(routeStayOffList(places, false)!);
+    expect(drawn).toEqual({ id: 'route-stop:from', planetId: SOV, orbitSlot: 2 });
+    const yard = { id: 'yard', planetId: SOV, orbitSlot: 1 };
+    expect(planTransfer(...routeLegEnds({ from: yard, to: places.from })!, T0)!.to).toEqual(stationOrbit(drawn));
+    expect(planTransfer(...routeLegEnds({ from: places.from, to: yard })!, T0)!.from).toEqual(stationOrbit(drawn));
+    // Docked there, the station carries it, on its own orbit.
+    expect(routeStayOffList(places, true)).toBeNull();
   });
 
   it('🚚 an install that first hears of a leg after its next stop moved planets places it where the route copied the stop', () => {
@@ -1345,10 +1631,10 @@ describe('ships and the solar system', () => {
     // Its station list gives the leg no course (its ends are on two planets)…
     expect(planTransfer(listed('room-alpha'), listed('room-bravo'), departedAt - 1)).toBeNull();
     // …but the copies the ferry published do, around SOVEREIGN.
-    const ends = summaryLegEnds(heard, (room) => all.find((s) => s.welcomeRoomId === room)?.id)!;
+    const ends = summaryLegEnds(heard)!;
     expect(ends).toEqual([
-      { id: 'o-alpha', planetId: SOV, orbitSlot: 1 },
-      { id: 'o-bravo', planetId: SOV, orbitSlot: 3 },
+      { id: 'route-stop:from', planetId: SOV, orbitSlot: 1 },
+      { id: 'route-stop:to', planetId: SOV, orbitSlot: 3 },
     ]);
     const plan = planTransfer(ends[0], ends[1], departedAt - 1);
     expect(plan?.from.planet.id).toBe(SOV);

@@ -122,6 +122,7 @@ import { readRouteCaptainDockId, CAPTAIN_LOCK_REFUSAL } from './shipPilot';
 // 🚏 …and so do a helm, engine and fuel tank, the same ones in every game.
 import { readShipRoute, routeRulesFlightNow } from './shipRoute';
 import { isRouteRunning } from './pilotRoute';
+import { clearRobotConfig, readRobotConfig } from './robotDoc';
 import { keptRoutePartTaken, routePortTaken, tanksLockedByRoute, ROUTE_PORT_REFUSAL, TANKS_LOCK_REFUSAL } from './routeParts';
 import type { World } from './world';
 
@@ -146,6 +147,24 @@ export function setRoomEditPermission(predicate: () => RoomEditPermission): void
 /** May the local player edit this room? (Consumed by the wall-computer UI.) */
 export function canEditRoom(): RoomEditPermission {
   return ownerPredicate();
+}
+
+/**
+ * 🔒 The narrower gate of main.ts's authority split: does the local player
+ * hold this room's DEED (the raw owner, never a venture's shareholders)?
+ * What can't be undone takes it: 🔧 #192, a module taken off the station.
+ * main.ts registers the raw deed check (currentRoomDeedIsMine), as it does
+ * for the sole-croupier election. Default: permissive (offline = your room).
+ */
+let deedPredicate: () => boolean = () => true;
+
+export function setRoomDeedCheck(predicate: () => boolean): void {
+  deedPredicate = predicate;
+}
+
+/** Does the local player hold this room's deed? */
+export function holdsRoomDeed(): boolean {
+  return deedPredicate();
 }
 
 /**
@@ -2399,6 +2418,12 @@ class RoomEditController {
     // tank out also removes everything mounted outboard of it — each layer
     // goes to the room inventory like the item itself, no floating orphans.
     const cascade = mountDescendantsOf(itemId);
+    // 🔧 A robot taking a module apart leaves the job's crew with its dock,
+    // released while the dock is still in the layout (the crew counts placed
+    // docks only), so the job keeps the work done so far.
+    for (const d of [item, ...cascade]) {
+      if (d.kind === 'charging-dock' && readRobotConfig(d.id)?.routine === 'disassemble') clearRobotConfig(d.id);
+    }
     for (const child of cascade) {
       if (this.hoveredId === child.id) this.setHovered(null);
       const childMeshes = this.itemMeshes.get(child.id) ?? [];

@@ -13,17 +13,24 @@ import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
 import * as Y from 'yjs';
 import type { DeviceUI, PropAnimHandle } from './devices';
+import { bindDoorLayoutDoc, seedDoorLayoutSingle } from './doorLayoutDoc';
+import { bindDoorsDoc, buildDoorPairing, readAllDoors, writeDoorPairing, writeDoorRecordTo } from './doorsDoc';
 import { FURNITURE, buildItemGroup, type FurnitureItem } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
 import { createStationHelmUI, setStationHelmCommanderCheck } from './stationHelm';
-import { TRIM_FUEL, bindStationKeepingDoc } from './stationKeeping';
-import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, registerStation, setStationRoomSource } from './stations';
+import { TRIM_FUEL, TRIM_STEP_KM, applyBurn, bindStationKeepingDoc, readOrbitTrim, setSharedTrimSource, writeTrimBurn } from './stationKeeping';
+import type { OrbitTrim, TrimBurn } from './stationKeeping';
+import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, planetById, registerStation, setStationRoomSource } from './stations';
 
 const HELM = 'helm-1';
 /** The fighter grip's red pickle button and the trim stick's amber knob. */
 const FIGHTER = 0xff1744;
 const TRIM_STICK = 0xffb300;
+
+/** A trim's orbit, count and place, as applyBurn gives them: without the
+ *  writers a room's log replay names (OrbitTrim.seen). */
+const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined } : t);
 
 /** A canvas whose 2-D context draws nothing: the docking screen paints through one. */
 function fakeCanvas() {
@@ -31,6 +38,18 @@ function fakeCanvas() {
     get: (target, key) => (key in target ? target[key] : () => undefined),
   });
   return { width: 0, height: 0, getContext: () => ctx };
+}
+
+/** A 2-D context that draws nothing and keeps each fill style it is given. */
+function fillsInto(fills: string[]) {
+  return new Proxy({} as Record<PropertyKey, unknown>, {
+    get: (target, key) => (key in target ? target[key] : () => undefined),
+    set: (target, key, value) => {
+      if (key === 'fillStyle') fills.push(String(value));
+      target[key] = value;
+      return true;
+    },
+  });
 }
 
 /** The console, built and filed as World.registerFurnitureGroup does it. */
@@ -167,6 +186,86 @@ describe('the helm console\'s sticks', () => {
       expect(partIn(group, TRIM_STICK).parent!.rotation.x).toBeLessThan(-0.1);
     } finally {
       dispose();
+    }
+  });
+
+  it('leans for another helm room\'s burn while the station flies the shared trim it left', () => {
+    // Copilot's review of #173: the stick read this room's burns alone, so it
+    // stood upright while the dashboard said another room's burn was firing.
+    stubSavedRecords();
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationRoomSource(() => 'room-yard');
+    let shared: OrbitTrim | null = null;
+    setSharedTrimSource((st) => (st.id === 'yard' ? shared : null));
+    const { group, anim, dispose } = buildHelm();
+    try {
+      saveAsStation('room-yard');
+      for (let i = 0; i < 4; i++) anim.update(0.25);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+      const gimbal = partIn(group, TRIM_STICK).parent!;
+      expect(Math.abs(gimbal.rotation.z)).toBeLessThan(0.01);
+      shared = { planetId: planetById(DEFAULT_PLANET_ID).id, slot: 1, dRadiusKm: 0, dPhase: 0, at: Date.now(), last: 'ahead', seq: 1 };
+      anim.update(0.1);
+      // AHEAD leans it to the pilot's right.
+      expect(gimbal.rotation.z).toBeGreaterThan(0.1);
+    } finally {
+      dispose();
+      setSharedTrimSource(null);
+    }
+  });
+
+  it('leans for the shared trim\'s burn when this room\'s fired in the same millisecond', () => {
+    // Copilot's review of #173: on a tie the stick leaned for this room's
+    // burn, though the station flies the shared trim that beat it.
+    stubSavedRecords();
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationRoomSource(() => 'room-yard');
+    const planetId = planetById(DEFAULT_PLANET_ID).id;
+    const now = Date.now();
+    setSharedTrimSource((st) => (st.id === 'yard'
+      ? { planetId, slot: 1, dRadiusKm: 0, dPhase: 0, at: now, last: 'ahead', seq: 3 }
+      : null));
+    const { group, anim, dispose } = buildHelm();
+    try {
+      saveAsStation('room-yard');
+      writeFuelLevel(40, 100);
+      expect(writeTrimBurn({ planetId, slot: 1, dir: 'back', at: now, fuel: TRIM_FUEL })).toBe(true);
+      for (let i = 0; i < 4; i++) anim.update(0.25);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+      // AHEAD, the shared trim's, leans it to the pilot's right; BACK would lean it left.
+      expect(partIn(group, TRIM_STICK).parent!.rotation.z).toBeGreaterThan(0.1);
+    } finally {
+      dispose();
+      setSharedTrimSource(null);
+    }
+  });
+  it('a gangway on one of the room\'s own doors shows the trim stick, past a flood of other records', () => {
+    // Copilot's review of #173: the console read the doors' capped snapshot,
+    // so 64 records written ahead of a real gangway hid it, and the console
+    // showed the fighter grip in a module bolted into a station.
+    const doors = new Y.Doc();
+    bindDoorsDoc(doors);
+    bindDoorLayoutDoc(doors);
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    for (let i = 0; i < 64; i++) {
+      writeDoorRecordTo(doors, `d:flood-${i}`, buildDoorPairing('ssf://room#room=junk', { transient: true }));
+    }
+    writeDoorPairing('d:gangway', 'ssf://room#room=station-core');
+    expect(readAllDoors().has('d:gangway')).toBe(false);
+    setStationRoomSource(() => 'room-module');
+    const { group, anim, dispose } = buildHelm();
+    try {
+      anim.update(0.016);
+      expect(shown(group, FIGHTER)).toBe(false);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+    } finally {
+      dispose();
+      bindDoorsDoc(new Y.Doc());
+      bindDoorLayoutDoc(new Y.Doc());
     }
   });
 });
@@ -441,6 +540,97 @@ describe('the helm dashboard\'s faces', () => {
     }
   });
 
+  it('shows the station\'s shared trim when another helm room left it newer, and a press goes on from it', () => {
+    // Copilot's review of #176: a second helm room of one station started
+    // from its own trim (none) and replaced the orbit the first one left.
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationHelmCommanderCheck(() => true);
+    const parts: FurnitureItem[] = [
+      { id: 'sk-engine', kind: 'engine-block', pos: { x: 0, z: 0 }, rot: 0, movable: true },
+      { id: 'sk-tank', kind: 'fuel-tank', pos: { x: 2, z: 0 }, rot: 0, movable: true },
+    ];
+    FURNITURE.push(...parts);
+    const st = DEFAULT_STATION_RECORD;
+    // Another helm room's burn, still firing.
+    const shared: OrbitTrim = {
+      planetId: planetById(st.planetId).id, slot: st.orbitSlot, dRadiusKm: TRIM_STEP_KM, dPhase: 0, at: Date.now() - 100, last: 'raise',
+    };
+    setSharedTrimSource((s) => (s.id === st.id ? shared : null));
+    const { shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => st, shipFace });
+    const host = new FakeElement('host');
+    const burns = () => [...doc.getMap('stationKeeping').entries()].filter(([k]) => k.startsWith('burn:')).map(([, v]) => v as TrimBurn);
+    try {
+      writeFuelLevel(40, 100);
+      ui.mount(host as unknown as HTMLElement);
+      const face = keepFace(host)!;
+      expect(face.querySelector('#sk-alt').innerHTML).toContain(`(+${TRIM_STEP_KM.toFixed(1)})`);
+      expect(face.querySelector('#sk-msg').textContent).toMatch(/^BURNING/);
+      // The knob leans for it, and the box draws its exhaust (Copilot's
+      // review of #173: they read this room's burns alone).
+      const fills: string[] = [];
+      Object.assign(face.querySelector('#sk-box'), { getContext: () => fillsInto(fills) });
+      ui.update(1 / 60);
+      expect(face.querySelector('#sk-knob').style.transform).toMatch(/^translate\(0px, -[\d.]+px\)$/);
+      expect(fills.some((f) => f.startsWith('rgba(255,138,64'))).toBe(true);
+      face.querySelector('#sk-well').dispatch('keydown', arrowUp);
+      expect(burns()).toEqual([]);
+      // Once it has fired, a press goes on from it, and the burn carries it.
+      shared.at = Date.now() - 10_000;
+      face.querySelector('#sk-well').dispatch('keydown', arrowUp);
+      expect(burns()).toHaveLength(1);
+      const [burn] = burns();
+      expect(burn.from).toEqual(shared);
+      expect(orbitOf(readOrbitTrim(st))).toEqual(applyBurn(shared, burn));
+      expect(readOrbitTrim(st)).toMatchObject({ dRadiusKm: 2 * TRIM_STEP_KM, last: 'raise' });
+    } finally {
+      ui.unmount();
+      for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
+      setStationHelmCommanderCheck(null);
+      setSharedTrimSource(null);
+    }
+  });
+
+  it('shows the shared trim\'s burn when this room\'s fired in the same millisecond', () => {
+    // Copilot's review of #173: on a tie the status line and the knob showed
+    // this room's burn, though the helm flies the shared trim that beat it.
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationHelmCommanderCheck(() => true);
+    const parts: FurnitureItem[] = [
+      { id: 'sk-engine', kind: 'engine-block', pos: { x: 0, z: 0 }, rot: 0, movable: true },
+      { id: 'sk-tank', kind: 'fuel-tank', pos: { x: 2, z: 0 }, rot: 0, movable: true },
+    ];
+    FURNITURE.push(...parts);
+    const st = DEFAULT_STATION_RECORD;
+    const planetId = planetById(st.planetId).id;
+    const now = Date.now();
+    setSharedTrimSource((s) => (s.id === st.id
+      ? { planetId, slot: st.orbitSlot, dRadiusKm: TRIM_STEP_KM, dPhase: 0, at: now, last: 'raise', seq: 3 }
+      : null));
+    const { shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => st, shipFace });
+    const host = new FakeElement('host');
+    try {
+      writeFuelLevel(40, 100);
+      expect(writeTrimBurn({ planetId, slot: st.orbitSlot, dir: 'lower', at: now, fuel: TRIM_FUEL })).toBe(true);
+      ui.mount(host as unknown as HTMLElement);
+      const face = keepFace(host)!;
+      expect(face.querySelector('#sk-msg').textContent).toBe(`BURNING: raising the orbit ${TRIM_STEP_KM} km.`);
+      ui.update(1 / 60);
+      // RAISE pushes the knob up; LOWER would push it down.
+      expect(face.querySelector('#sk-knob').style.transform).toMatch(/^translate\(0px, -[\d.]+px\)$/);
+    } finally {
+      ui.unmount();
+      for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
+      setStationHelmCommanderCheck(null);
+      setSharedTrimSource(null);
+    }
+  });
+
   it('F opens FUEL & DOCKING and K comes back to station keeping, from the keyboard alone', () => {
     // Copilot's review of #173: with Tab the SpacePhone's and the arrows the
     // stick's, a keyboard player could not switch faces either way.
@@ -515,5 +705,8 @@ describe('the helm dashboard\'s faces', () => {
     const block = from.slice(0, from.indexOf('\n      return;'));
     expect(block).toContain('const ui = createStationHelmUI(');
     expect(block).toContain('deviceFocus.beginFocus(this.player, device, ui);');
+    // Its face follows the room's own doors, each read past the doors' read
+    // cap, so a flood of records never hides a gangway (Copilot's review of #173).
+    expect(block).toContain('const bolted = () => steersStation(currentRoomId(), readPhysicalDoors());');
   });
 });

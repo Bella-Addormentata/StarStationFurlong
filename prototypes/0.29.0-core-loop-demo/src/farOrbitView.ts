@@ -30,19 +30,18 @@ import * as THREE from 'three';
 import {
   angleAt,
   orbitForSlot,
-  planTransfer,
   stationOrbit,
   stationPointAt,
   transferPointAt,
   wrapAngle,
 } from './orbits';
 import type { OrbitPoint, TransferPlan } from './orbits';
-import { planetLayout, transitLayout } from './farOrbits';
-import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
+import { frozenCourse, planetLayout, transitLayout } from './farOrbits';
+import type { FarBody, FarLayout, FarShipInput, FarStationInput, FrozenCourses } from './farOrbits';
 import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt, stationPointWithMoveAt } from './stationMove';
 import { isShipReady } from './devices';
-import { readAllDoors } from './doorsDoc';
+import { readPhysicalDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
 // 🕹️ Ships flown by hand (issue 203): this one's pose, and others' coasted on.
 import type { FreePose } from './freeFlight';
@@ -52,11 +51,11 @@ import { remoteFreeShips, resolvedFreePose, stationFlyingFree } from './freeFlig
 import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
 // 🚚 Another ferry's leg, where its summary says the route copied its stops.
-import { summaryLegEnds } from './planetSummary';
+import { routeLegEnds, routeStayPlace, summaryLegEnds } from './planetSummary';
 import { flightCapable, followsFlightRecord, groundedBy } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
-  adriftAt, adriftPlace, altitudeChangesSince, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById,
+  adriftAt, adriftPlace, altitudeChangesSince, orbitChangeBase, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById,
   planetForRoom, roomAdriftPlace, stationInTransit,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -140,7 +139,7 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
       // 🎚️ At the altitude it flew there when the ship left: the orbit an
       // altitude change since then left, else the one this move left.
       const climb = altitudeChangesSince(station, leftAt, now)[0]?.orbit;
-      const orbit = climb ? { radiusKm: climb.fromRadiusKm, phase0: climb.fromPhase0 }
+      const orbit = climb ? orbitChangeBase(climb)
         : moved.fromOrbit ? { radiusKm: moved.fromOrbit.radiusKm, phase0: moved.fromOrbit.phase0 } : undefined;
       return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot, ...(orbit ? { orbit } : {}) };
     }
@@ -151,7 +150,7 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
     if (climbed) {
       return {
         id: station.id, planetId: station.planetId, orbitSlot: station.orbitSlot,
-        orbit: { radiusKm: climbed.fromRadiusKm, phase0: climbed.fromPhase0 },
+        orbit: orbitChangeBase(climbed),
       };
     }
     return station;
@@ -179,37 +178,24 @@ function castOffPlace(
     ? { ...place, orbit: then.orbit } : place;
 }
 
-/** A flight's transfer rebuilt from its record: the Hohmann ellipse between
- *  the two ends' orbits, pinned to the record's own times. `flight` names it
- *  by what its record says (who flies, and the two ends as named there). */
+/** A flight's transfer rebuilt from its record, fixed once seen
+ *  (farOrbits.frozenCourse). `flight` names it by what stays fixed while it
+ *  flies: who flies (and for another ship, the welcome rooms its summary
+ *  gives as the ends), never an id this install reads through its own
+ *  aliases, which can name one end differently from one read to the next. A
+ *  ferry leg's `copies` of its stops place it when known. */
 function flightPlan(
   flight: readonly string[],
   departedAt: number,
   etaAt: number,
+  copies: readonly [Place, Place] | null,
   ends: () => readonly [Place | undefined, Place | undefined],
 ): TransferPlan | null {
-  if (!(etaAt > departedAt)) return null;
-  // A flight's orbits are fixed once it is seen: planTransfer reads the ends
-  // through today's trims, and a station-keeping burn after launch must not
-  // move a transfer already flown. The ends are placed only the first time,
-  // so a flight already drawn keeps its course once an end can no longer be
-  // placed at all (a learned station dropped after a move, say).
-  const key = JSON.stringify([...flight, departedAt, etaAt]);
-  const known = frozenPlans.get(key);
-  if (known) {
-    known.seenAt = gatherNow;
-    return known.plan;
-  }
-  const [from, to] = ends();
-  if (!from || !to) return null;
-  const planned = planTransfer(from, to, departedAt - 1);
-  const plan = planned ? { ...planned, departAt: departedAt, arriveAt: etaAt } : null;
-  if (plan) frozenPlans.set(key, { plan, seenAt: gatherNow });
-  return plan;
+  return frozenCourse(frozenPlans, flight, departedAt, etaAt, copies, ends, gatherNow);
 }
 
 /** Flight plans already drawn, by flight; one not seen for a while is dropped. */
-const frozenPlans = new Map<string, { plan: TransferPlan; seenAt: number }>();
+const frozenPlans: FrozenCourses = new Map();
 const FROZEN_PLAN_TTL_MS = 60_000;
 const MAX_FROZEN_PLANS = 256;
 let gatherNow = 0;
@@ -260,6 +246,16 @@ function gather(now: number): Source {
   }
 }
 
+/** Test seam: what the far pass reads at `now`. */
+export function gatherForTest(now: number): Source {
+  return gather(now);
+}
+
+/** Test seam: forget every flight already drawn. */
+export function forgetFlightsForTest(): void {
+  frozenPlans.clear();
+}
+
 function readSource(now: number): Source {
   const roomId = currentRoomId();
   const atlas = readAtlas();
@@ -292,13 +288,16 @@ function readSource(now: number): Source {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
       // 🚚 The timetable's legs fly the route's own copy of each stop, which
-      // a stop's station may have left for another planet: those are its ends.
-      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => (places?.to
-        ? [places.from, places.to]
-        : [
-          castOffPlace(rec.locationId, rec.originAt, all, leftAt, now) ?? placeOf(rec.locationId, all, leftAt, now),
-          castOffPlace(to, rec.destinationAt, all, leftAt, now) ?? placeOf(to, all, leftAt, now),
-        ]));
+      // a stop's station may have left for another planet: those are its
+      // ends, untrimmed as the timetable planned them. An ordinary flight's
+      // ends go by their stations' ids, so their trims apply.
+      // Named by the room, not the ends: readFlightRecord reads both end ids
+      // through this install's aliases each time (a learned station listed,
+      // then dropped), and the same flight must keep the course it was drawn on.
+      aboard = flightPlan(['own', roomId], rec.departedAt, rec.etaAt, routeLegEnds(places), () => [
+        castOffPlace(rec.locationId, rec.originAt, all, leftAt, now) ?? placeOf(rec.locationId, all, leftAt, now),
+        castOffPlace(to, rec.destinationAt, all, leftAt, now) ?? placeOf(to, all, leftAt, now),
+      ]);
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
@@ -308,18 +307,20 @@ function readSource(now: number): Source {
     // hand from there: its live dock, or where it rests, says where it is
     // (the room resolver, below).
     if (!aboard && !free && rec.status !== 'docked' && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
-    // 🚚 A timetable stay at a stop whose station has left the place the
-    // route copied (moved planets, or gone): the keeper passes that berth, so
-    // with no live dock carrying the ship along it waits on the copy's orbit,
-    // where its next leg leaves from (and where its planet summary puts it).
+    // 🚚 A timetable stay with no live dock carrying the ship along with a
+    // station: it waits on the route's copy of the stop, where its leg in
+    // ended and its next leg leaves from, untrimmed as they are, whether or
+    // not the stop's station is still there (the keeper passes a berth its
+    // station has left). Only a live dock puts it on the station's orbit:
+    // one on the room's own doors, each read past the snapshot's cap, as the
+    // room resolver reads it (doorsDoc.readPhysicalDoors).
     if (!aboard && !adrift && !free && places && !places.to) {
-      const station = all.find((s) => s.id === places.from.id);
-      adrift = routeStayOffList(
+      const stay = routeStayOffList(
         places,
-        station ? { planetId: station.planetId, orbitSlot: station.orbitSlot, moving: reallyMoving(station, now), ...(station.orbit ? { orbit: station.orbit } : {}) } : null,
-        dockedStationFor(roomId, readAllDoors().values(), atlas, all) !== null,
+        dockedStationFor(roomId, readPhysicalDoors().values(), atlas, all) !== null,
         (id) => planetById(id).id,
       );
+      adrift = stay && routeStayPlace(stay);
     }
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that
@@ -428,8 +429,10 @@ function readSource(now: number): Source {
     if (!fromRoom || !toRoom || departedAt === undefined || ship.etaAt === undefined) continue;
     // 🚚 A ferry's leg flies the route's copy of its two stops, which its
     // summary carries: a stop's station may have moved planets since, where
-    // the station list would place it.
-    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => summaryLegEnds(ship, idOf) ?? [
+    // the station list would place it (untrimmed, as its timetable planned
+    // them). A summary without them (relayed by an older client) is drawn
+    // by the station list until one with them comes.
+    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, summaryLegEnds(ship), () => [
       byRoom(fromRoom, departedAt),
       byRoom(toRoom, departedAt),
     ]);
@@ -820,6 +823,7 @@ export function renderWithFarPass(
   const shown = sky.map((o) => o.visible);
   const background = scene.background;
   const cameraLayers = camera.layers.mask;
+  const autoClear = renderer.autoClear;
   try {
     update(renderer, camera);
     // 1. The sky alone (clears with the scene background as usual). A room
@@ -844,6 +848,6 @@ export function renderWithFarPass(
     sky.forEach((o, i) => { o.visible = shown[i]; });
     hidden.forEach((o, i) => { o.visible = hiddenShown[i]; });
     camera.layers.mask = cameraLayers;
-    renderer.autoClear = true;
+    renderer.autoClear = autoClear;
   }
 }

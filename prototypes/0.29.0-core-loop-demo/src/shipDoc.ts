@@ -995,7 +995,10 @@ export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const r = v as Partial<BerthMemoryRecord>;
   if (!isBoundedString(r.doorId)) return false;
-  if (!isBoundedString(r.roomId)) return false;
+  // A room id is any non-empty string, as decodeBootstrapSeed, the station
+  // records and the atlas take one: the station-id bound would refuse a real
+  // berth, and with it DEPART (rememberBerthHere).
+  if (typeof r.roomId !== 'string' || r.roomId.length === 0) return false;
   // A pass never rides here (see BerthMemoryRecord).
   if ((r as { address?: unknown }).address !== undefined) return false;
   // The door-key rule doorsDoc reads with: a farDoor it would strip would
@@ -1087,13 +1090,18 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
  * its own (the flight record's). Kept first-hand in this room
  * (completeArrival, shipArrival.keepRestPlace), so every install reads the
  * same place, whatever station moves it has heard of. A docked ship with none
- * follows its station.
+ * follows its station. 🚏 `open`: where a ferry route's timetable left the
+ * ship with no dock (shipArrival.restAtRouteEnd), on the route's untrimmed
+ * copy of its end stop, in open orbit until a dock carries it: beside a
+ * station there only while no trim moves that station off the place's own
+ * orbit (shipArrival.shipPlaceId).
  */
 export interface RestPlace {
   at: string;
   since: number;
   docks?: string[];
   from?: string;
+  open?: true;
 }
 
 /** Most dock doors a rest record names: every door record a complete
@@ -1106,6 +1114,7 @@ export function isRestPlace(v: unknown): v is RestPlace {
   const r = v as Partial<RestPlace>;
   if (!isBoundedString(r.at) || !adriftPlace(r.at) || !isFlightTime(r.since)) return false;
   if (r.from !== undefined && !isBoundedString(r.from)) return false;
+  if (r.open !== undefined && r.open !== true) return false;
   if (r.docks === undefined) return true;
   return Array.isArray(r.docks) && r.docks.length <= MAX_REST_DOCKS
     && r.docks.every((d) => typeof d === 'string' && isAcceptableDoorKey(d));
@@ -1120,6 +1129,7 @@ export function readRestPlace(): RestPlace | null {
   if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
   // Station ids are per install: read another install's as ours.
   if (raw.from !== undefined) out.from = localStationId(raw.from);
+  if (raw.open === true) out.open = true;
   return out;
 }
 
@@ -1136,6 +1146,7 @@ export function writeRestPlace(rest: RestPlace | null): boolean {
     since: rest.since,
     ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
     ...(rest.from !== undefined ? { from: rest.from } : {}),
+    ...(rest.open === true ? { open: true as const } : {}),
   };
   // Station ids are per install: the shared record names the station it
   // rests beside by its welcome room, as the flight record does (keeping
@@ -1178,8 +1189,14 @@ function isCastOffHold(v: unknown): v is CastOffHold {
 /** The cast-off hold in force at `now`, or null. One stamped further ahead
  *  than CAST_OFF_HOLD_MS is none: no peer's clock holds a ship longer. */
 export function readCastOffHold(now: number = Date.now()): CastOffHold | null {
-  if (!docAlive()) return null;
-  const raw = shipMap!.get('castOff');
+  return docAlive() ? castOffHoldIn(shipMap!, now) : null;
+}
+
+/** 🚏🤖 The cast-off hold in force at `now` in a ship map this client is
+ *  not bound to (a ferry's, read through a background session:
+ *  gateKeeper.ts), by readCastOffHold's rule. */
+export function castOffHoldIn(ship: Y.Map<unknown>, now: number = Date.now()): CastOffHold | null {
+  const raw = ship.get('castOff');
   if (!isCastOffHold(raw)) return null;
   return now < raw.at + CAST_OFF_HOLD_MS && raw.at <= now + CAST_OFF_HOLD_MS ? { by: raw.by, at: raw.at } : null;
 }
@@ -1206,6 +1223,20 @@ export function castOffHeldBy(by: string, now: number = Date.now()): boolean {
   return readCastOffHold(now)?.by === by;
 }
 
+/** How often a DEPART renews its hold while it casts off (renewCastOff). */
+export const CAST_OFF_RENEW_MS = CAST_OFF_HOLD_MS / 3;
+
+/** Keep the DEPART `by`'s hold in force while it still casts off: the dock
+ *  releases it waits on can outlast CAST_OFF_HOLD_MS (a far room answers one
+ *  request at a time, each under its own deadline), and a hold that ran out
+ *  would let another helm read this one's undocks, which a far refusal may
+ *  yet put back, as done. Only its own hold, still in force: one that ran
+ *  out may be another's now, and another room's doc never holds it.
+ *  Returns whether it renewed. */
+export function renewCastOff(by: string, now: number = Date.now()): boolean {
+  return castOffHeldBy(by, now) && holdCastOff(by, now);
+}
+
 /** End the DEPART `by`'s hold: only its own, so a hold another DEPART took
  *  since (this one's ran out), or another room's, is left alone. */
 export function releaseCastOff(by: string): void {
@@ -1214,5 +1245,87 @@ export function releaseCastOff(by: string): void {
   if (!isCastOffHold(raw) || raw.by !== by) return;
   boundDoc!.transact(() => {
     shipMap!.delete('castOff');
+  });
+}
+
+// ── An UNDOCK under way (station moves) ──────────────────────────────────────
+
+/**
+ * 🚚 An UNDOCK under way: it wrote this end's tombstone (docking.ts
+ * undockPort) and waits for the far room's answer, which puts the dock back
+ * when a station move the far room knows of holds it. Shared, so every
+ * helm reads that dock as still holding a tow meanwhile
+ * (shipArrival.dockedToStation): a tow cancelled for a release a refusal
+ * then takes back would stay cancelled. Keyed by the door, it names the
+ * release by its tombstone's stamp (`undockedAt`); `at` is when it was taken
+ * or last renewed (writer clock). It lasts until that UNDOCK has its answer
+ * (endUndockHold), or UNDOCK_HOLD_MS past its last renewal, should its helm
+ * go away mid-way: then the release stands, as one whose far room cannot be
+ * reached does.
+ */
+export interface UndockHold {
+  undockedAt: number;
+  at: number;
+}
+
+/** How long an UNDOCK's hold lasts past its last renewal: a far room's whole
+ *  session (farDoorWrite's deadline, a minute), with room to spare. */
+export const UNDOCK_HOLD_MS = 90_000;
+
+/** How often an UNDOCK renews its hold while it waits (renewUndockHold): the
+ *  far writer answers one request at a time, each under its own deadline. */
+export const UNDOCK_RENEW_MS = UNDOCK_HOLD_MS / 3;
+
+function undockKey(doorId: string): string {
+  return `undock:${doorId}`;
+}
+
+function isUndockHold(v: unknown): v is UndockHold {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const h = v as Partial<UndockHold>;
+  return typeof h.undockedAt === 'number' && Number.isFinite(h.undockedAt)
+    && typeof h.at === 'number' && Number.isFinite(h.at);
+}
+
+/** Does the UNDOCK that released `doorId` at `undockedAt` still wait on its
+ *  far room at `now`? One stamped further ahead than UNDOCK_HOLD_MS holds
+ *  nothing: no peer's clock holds a release longer. */
+export function undockHeld(doorId: string, undockedAt: number, now: number = Date.now()): boolean {
+  if (!docAlive() || !isBoundedString(doorId)) return false;
+  const raw = shipMap!.get(undockKey(doorId));
+  return isUndockHold(raw) && raw.undockedAt === undockedAt
+    && now < raw.at + UNDOCK_HOLD_MS && raw.at <= now + UNDOCK_HOLD_MS;
+}
+
+/** Take the hold for the UNDOCK that releases `doorId` at `undockedAt`, before
+ *  its tombstone (so no peer sees the one without the other). Returns
+ *  whether the doc now holds it. */
+export function holdUndock(doorId: string, undockedAt: number, now: number = Date.now()): boolean {
+  if (!docAlive() || !isBoundedString(doorId)) return false;
+  const hold: UndockHold = { undockedAt, at: Math.floor(now) };
+  if (!isUndockHold(hold)) return false;
+  boundDoc!.transact(() => {
+    shipMap!.set(undockKey(doorId), hold);
+  });
+  return true;
+}
+
+/** Keep that hold in force while its UNDOCK still waits: only one still in
+ *  force (one that ran out let the release stand), and never in another
+ *  room's doc, which holds no hold of that release. Returns whether it
+ *  renewed. */
+export function renewUndockHold(doorId: string, undockedAt: number, now: number = Date.now()): boolean {
+  return undockHeld(doorId, undockedAt, now) && holdUndock(doorId, undockedAt, now);
+}
+
+/** End that hold once its UNDOCK has its answer (the dock put back, or the
+ *  release stands): only its own, so a later UNDOCK's on the same door is
+ *  left alone. */
+export function endUndockHold(doorId: string, undockedAt: number): void {
+  if (!docAlive() || !isBoundedString(doorId)) return;
+  const raw = shipMap!.get(undockKey(doorId));
+  if (!isUndockHold(raw) || raw.undockedAt !== undockedAt) return;
+  boundDoc!.transact(() => {
+    shipMap!.delete(undockKey(doorId));
   });
 }
