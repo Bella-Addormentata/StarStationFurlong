@@ -60,7 +60,7 @@ import { FUEL_PER_KMS } from './stationDirectory';
 import { MAX_TRIM_KM } from './stationKeeping';
 import {
   MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, orbitChangeBase, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
-  planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet,
+  planetById, isSummaryHead, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet, summaryGates,
 } from './stations';
 import type { AdriftPlace, MovingStation, OrbitChange, StationMove, StationOrbit, StationRecord } from './stations';
 
@@ -962,7 +962,10 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
  *  room at, else the one whose welcome room it is, else the one its own
  *  bookings name (a move is booked from a room of its station, a tow from
  *  the tug; a pin is no booking: every game writes them for each station it
- *  lists, wherever it stands, pinSettledArrivals). A room whose records the
+ *  lists, wherever it stands, pinSettledArrivals); and, for a room this
+ *  install places at no listed station or only at one of its own making (a
+ *  module it has not mapped), any station whose summaries there list a gate
+ *  in it (stationsListingGateIn). A room whose records the
  *  bounded scans cannot all read (a peer can flood either map) is held too:
  *  what lies past them may be such a move, until the clients there prune
  *  the flood. */
@@ -982,8 +985,13 @@ export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number):
   };
   if (roomId && all.some((m) => flew(m, (f) => f.mode === 'tug' && f.tugRoomId === roomId && isMoveActive(f, realMs)))) return true;
   const station = roomId ? stationForRoom(roomId) : null;
+  // ⚓🚦 A room this install places at no station, or only at one of its own
+  // making (an atlas component no record claims): the stations whose
+  // summaries in that room's own doc list a gate there, as the crews
+  // standing in it published them, are its station too.
+  const gatesOf = roomId && (!station || station.derived) ? stationsListingGateIn(doc, roomId) : null;
   const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
-  const ofRoom = (m: StationMove) => (station
+  const ofRoom = (m: StationMove) => !!gatesOf?.has(m.welcomeRoomId) || (station
     ? moveBelongsTo(m, station)
     : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !isPinMove(o) && !towedBy(o) && sameStation(o, m)));
   return all.some((m) => flew(m, (f) => ofRoom(f) && stationInTransit({ move: f }, realMs)));
@@ -1038,6 +1046,23 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
     heard,
     complete: complete && summaries.size <= SUMMARY_SCAN_MAX,
   };
+}
+
+/** ⚓🚦 The welcome rooms of the stations whose planet summaries in a room's
+ *  own doc (a far room's) list a gate in `roomId` (StationSummary.berths,
+ *  of a summary taken as cleanStationSummary takes one: isSummaryHead and
+ *  summaryGates, on this install's clock), in the same bounded scan as
+ *  docMoves: what that room's own doc says of whose module it is. */
+function stationsListingGateIn(doc: Y.Doc, roomId: string): Set<string> {
+  const out = new Set<string>();
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return out;
+  let scanned = 0;
+  for (const [k, v] of doc.getMap('stationSummaries').entries()) {
+    if (++scanned > SUMMARY_SCAN_MAX) break;
+    if (!isSummaryHead(v) || v.welcomeRoomId !== k) continue;
+    if (summaryGates(v)?.berths.some((b) => b.roomId === roomId)) out.add(k);
+  }
+  return out;
 }
 
 /** Is any of these rooms a tug whose tow is under way (or about to leave),

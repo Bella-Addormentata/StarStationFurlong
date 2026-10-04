@@ -55,7 +55,7 @@ import { isNewerTrim, isOrbitTrim, setSharedTrimSource, trimFor, trimmedOrbit } 
 import type { OrbitTrim } from './stationKeeping';
 import { MAX_SUMMARY_CLAIMS, cleanMove, compareMoves, decidingClaimsOf, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { isUsableOrbit, setStationTrimResolver } from './orbits';
-import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationLeftPlanet } from './stations';
+import { MAX_BERTHS, MAX_ORBIT_SLOTS, MAX_ROOM_TOMBSTONES, cleanBerths, currentRoomId, isSummaryHead, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationLeftPlanet, summaryGates } from './stations';
 import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
@@ -404,16 +404,13 @@ function cleanTrimGone(v: unknown, now: number): TrimGone[] | undefined {
 
 /** Shape guard + copy: a summary crosses the peer trust boundary. */
 export function cleanStationSummary(v: unknown, now = Date.now()): StationSummary | null {
-  if (!isPlainObject(v)) return null;
-  if (!isId(v.welcomeRoomId) || !isName(v.name) || !isId(v.planetId)) return null;
-  if (!Number.isInteger(v.orbitSlot) || (v.orbitSlot as number) < 0 || (v.orbitSlot as number) >= MAX_ORBIT_SLOTS) return null;
-  if (v.ownerId !== undefined && !isId(v.ownerId)) return null;
-  if (!isStamp(v.updatedAt, now)) return null;
+  // Its station, place and stamp, as every reader of a summary takes them.
+  if (!isSummaryHead(v, now)) return null;
   const out: StationSummary = {
     welcomeRoomId: v.welcomeRoomId,
     name: v.name,
     planetId: v.planetId,
-    orbitSlot: v.orbitSlot as number,
+    orbitSlot: v.orbitSlot,
     updatedAt: v.updatedAt,
   };
   // An optional berth a station record could not hold (not a door key) is
@@ -426,18 +423,12 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
     const aliases = mergeAliases(v.ownerAliases.filter(isId), [], out.ownerId);
     if (aliases) out.ownerAliases = aliases;
   }
-  // An empty list is news too (the station's last gate was removed); a list
-  // whose every entry was malformed is not.
-  const berths = cleanBerths(v.berths);
-  // Peer-written room stamps: a map larger than any list carries is junk
-  // (counting stops early), and so is the gate list it came with, since
-  // without its stamps each room would pass for as fresh as the whole list.
-  let roomCount = 0;
-  if (isPlainObject(v.berthRoomsAt)) for (const _k in v.berthRoomsAt) if (++roomCount > MAX_ROOM_STAMPS) break;
-  const roomsOk = v.berthRoomsAt === undefined || (isPlainObject(v.berthRoomsAt) && roomCount <= MAX_ROOM_STAMPS);
-  if (Array.isArray(v.berths) && (berths.length > 0 || v.berths.length === 0) && isStamp(v.berthsAt, now) && roomsOk) {
-    out.berths = berths;
-    out.berthsAt = v.berthsAt;
+  // The gate list, as every reader of a summary takes it (summaryGates: an
+  // empty list is news, junk room stamps sink the list they came with).
+  const gates = summaryGates(v, now);
+  if (gates) {
+    out.berths = gates.berths;
+    out.berthsAt = gates.berthsAt;
     if (isPlainObject(v.berthRoomsAt)) {
       const rooms: Record<string, number> = {};
       for (const [room, at] of Object.entries(v.berthRoomsAt)) {
@@ -688,13 +679,6 @@ function roomStamps(x: Gates): Map<string, number> {
   for (const [room, at] of Object.entries(x.berthRoomsAt ?? {})) out.set(room, at);
   return out;
 }
-
-/** ⚓🚦 Room tombstones (rooms that list no gate any more) a summary carries
- *  beside its listed rooms' stamps: their own budget, as large as the list's,
- *  so every room a full list held can carry its removal. */
-export const MAX_ROOM_TOMBSTONES = MAX_BERTHS;
-/** The most room stamps one summary carries. */
-const MAX_ROOM_STAMPS = MAX_BERTHS + MAX_ROOM_TOMBSTONES;
 
 /** The per-room stamps worth carrying (sorted, bounded): a room read at
  *  another time than `berthsAt`, or one that lists no berth any more. Every

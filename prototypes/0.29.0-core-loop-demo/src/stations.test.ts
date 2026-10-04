@@ -4,12 +4,13 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { AtlasEntry } from './stationAtlas';
-import { atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
+import { MAX_GOSSIP_SKEW_MS, atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
 import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
   MAX_ORBIT_SLOTS,
+  MAX_ROOM_STAMPS,
   currentStation,
   dockedStationFor,
   isStationRoom,
@@ -26,6 +27,8 @@ import {
   stationForRoom,
   stationRoomCause,
   stationsAroundPlanet,
+  isSummaryHead,
+  summaryGates,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
 import { SolarSystemMap, screenOffset, stationBodies } from './map';
@@ -463,6 +466,68 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [junk('ssf://join#room=%'), dock], atlas)).toBe('aris-yard');
     expect(dockedStationFor('ship', [{ ...junk('ssf://join#room=%'), transient: true }, dock], atlas)).toBe('aris-yard');
     expect(dockedStationFor('ship', [junk('ssf://join#room=ship'), dock], atlas)).toBe('aris-yard');
+  });
+
+  it('places a module the atlas has not mapped at the one station that lists a gate there', () => {
+    // Aris Yard's welcome room is mapped here; its gate module b9 is not, but
+    // the station's gates (learned from its record, or a summary) name it.
+    const atlas = atlasOf(room('b1'), room('ship'));
+    expect(registerStation({
+      id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1',
+      berths: [{ roomId: 'b9', doorId: 'd:gate', gate: 2 }],
+    })).toBe(true);
+    expect(stationForRoom('b9', atlas)?.id).toBe('aris-yard');
+    expect(planetForRoom('b9', atlas).id).toBe('planet-aris');
+    // A lone module docked there is at that station.
+    const dock = { paired: true as const, connectedRoomAddress: 'ssf://join#room=b9', transient: true };
+    expect(dockedStationFor('ship', [dock], atlas)).toBe('aris-yard');
+    // Where the atlas places the room, the atlas wins.
+    const mapped = atlasOf(room('b1'), room('ship'), room('b9', ['x1']), room('x1'));
+    expect(stationForRoom('b9', mapped)?.derived).toBe(true);
+    // A room no station lists a gate in is still no station's, and one two
+    // stations list (a stale list: which is right is not known) neither's.
+    expect(stationForRoom('b8', atlas)).toBeNull();
+    expect(registerStation({
+      id: 'kestrel', name: 'KESTREL', planetId: DEFAULT_PLANET_ID, orbitSlot: 5, welcomeRoomId: 'k1',
+      berths: [{ roomId: 'b9', doorId: 'd:old-gate', gate: 1 }],
+    })).toBe(true);
+    expect(stationForRoom('b9', atlas)).toBeNull();
+    expect(dockedStationFor('ship', [dock], atlas)).toBeNull();
+  });
+
+  it('takes a summary\'s gate list only beside a good stamp and room stamps no larger than any list carries', () => {
+    const t0 = ORBIT_EPOCH_MS + 1_000_000;
+    const gate = { roomId: 'b9', doorId: 'd:gate', gate: 2 };
+    expect(summaryGates({ berths: [gate], berthsAt: t0 }, t0)).toEqual({ berths: [gate], berthsAt: t0 });
+    // An empty list is news (the station's last gate went); one of junk is not.
+    expect(summaryGates({ berths: [], berthsAt: t0 }, t0)?.berths).toEqual([]);
+    expect(summaryGates({ berths: [{ roomId: 'b9' }], berthsAt: t0 }, t0)).toBeNull();
+    expect(summaryGates({ berths: 'b9', berthsAt: t0 }, t0)).toBeNull();
+    // No stamp, a malformed one, or one further ahead than a peer's may be.
+    for (const berthsAt of [undefined, -1, Number.NaN, String(t0), t0 + MAX_GOSSIP_SKEW_MS + 1]) {
+      expect(summaryGates({ berths: [gate], berthsAt }, t0)).toBeNull();
+    }
+    expect(summaryGates({ berths: [gate], berthsAt: t0 + MAX_GOSSIP_SKEW_MS }, t0)).not.toBeNull();
+    // Room stamps: a plain map, of no more rooms than a list and its
+    // tombstones carry.
+    const stamps = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`room-${i}`, t0]));
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS) }, t0)).not.toBeNull();
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS + 1) }, t0)).toBeNull();
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: [t0] }, t0)).toBeNull();
+  });
+
+  it('takes a summary only with its station, place and a good stamp', () => {
+    const t0 = ORBIT_EPOCH_MS + 1_000_000;
+    const head = { welcomeRoomId: 'b1', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, updatedAt: t0 };
+    expect(isSummaryHead(head, t0)).toBe(true);
+    expect(isSummaryHead({ ...head, ownerId: 'owner-1', berths: 'junk' }, t0)).toBe(true);
+    for (const bad of [
+      { welcomeRoomId: 'b1', berths: [], berthsAt: t0 }, { ...head, name: '' }, { ...head, planetId: 7 },
+      { ...head, orbitSlot: MAX_ORBIT_SLOTS }, { ...head, orbitSlot: 1.5 }, { ...head, ownerId: '' },
+      { ...head, updatedAt: undefined }, { ...head, updatedAt: t0 + MAX_GOSSIP_SKEW_MS + 1 },
+    ]) expect(isSummaryHead(bad, t0)).toBe(false);
+    expect(isSummaryHead([head], t0)).toBe(false);
+    expect(isSummaryHead(null, t0)).toBe(false);
   });
 
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
