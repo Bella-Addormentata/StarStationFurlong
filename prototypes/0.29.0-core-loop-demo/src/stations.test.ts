@@ -465,6 +465,33 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [junk('ssf://join#room=ship'), dock], atlas)).toBe('aris-yard');
   });
 
+  it('places a module the atlas has not mapped at the one station that lists a gate there', () => {
+    // Aris Yard's welcome room is mapped here; its gate module b9 is not, but
+    // the station's gates (learned from its record, or a summary) name it.
+    const atlas = atlasOf(room('b1'), room('ship'));
+    expect(registerStation({
+      id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1',
+      berths: [{ roomId: 'b9', doorId: 'd:gate', gate: 2 }],
+    })).toBe(true);
+    expect(stationForRoom('b9', atlas)?.id).toBe('aris-yard');
+    expect(planetForRoom('b9', atlas).id).toBe('planet-aris');
+    // A lone module docked there is at that station.
+    const dock = { paired: true as const, connectedRoomAddress: 'ssf://join#room=b9', transient: true };
+    expect(dockedStationFor('ship', [dock], atlas)).toBe('aris-yard');
+    // Where the atlas places the room, the atlas wins.
+    const mapped = atlasOf(room('b1'), room('ship'), room('b9', ['x1']), room('x1'));
+    expect(stationForRoom('b9', mapped)?.derived).toBe(true);
+    // A room no station lists a gate in is still no station's, and one two
+    // stations list (a stale list: which is right is not known) neither's.
+    expect(stationForRoom('b8', atlas)).toBeNull();
+    expect(registerStation({
+      id: 'kestrel', name: 'KESTREL', planetId: DEFAULT_PLANET_ID, orbitSlot: 5, welcomeRoomId: 'k1',
+      berths: [{ roomId: 'b9', doorId: 'd:old-gate', gate: 1 }],
+    })).toBe(true);
+    expect(stationForRoom('b9', atlas)).toBeNull();
+    expect(dockedStationFor('ship', [dock], atlas)).toBeNull();
+  });
+
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
     const atlas = twoStations();
     expect(planetForRoom('nowhere', atlas).id).toBe(DEFAULT_PLANET_ID);

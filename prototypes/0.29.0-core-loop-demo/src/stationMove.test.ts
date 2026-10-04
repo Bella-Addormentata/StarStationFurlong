@@ -76,9 +76,10 @@ import {
   registerStation,
   setKnownPlacesResolver,
   setStationMoveResolver,
+  stationForRoom,
   stationInTransit,
 } from './stations';
-import type { KnownPlace, StationRecord } from './stations';
+import type { KnownPlace, StationBerthRecord, StationRecord } from './stations';
 import type { AtlasEntry } from './stationAtlas';
 
 const store = new Map<string, string>();
@@ -946,6 +947,54 @@ describe('moves between installs', () => {
     rememberMovesIn(doc);
     expect(readRememberedMoves()).toEqual([move]);
     expect(roomDocLockedByMove(new Y.Doc(), 'yard-annex', mid)).toBe(true);
+  });
+
+  it('holds a dock at a module this install has not mapped, by the gates the far room\'s summaries list there', () => {
+    const move = yardMove();
+    rememberMove(move);
+    const summary = summaryForStation(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!, null, NOW);
+    store.clear();
+    // This install has no atlas and lists no such station. The ship's berth
+    // is the station's annex: nothing booked there, the move only gossiped,
+    // beside the station's gates as the crews standing there published them.
+    const farDoc = (berths: StationBerthRecord[]) => {
+      const doc = new Y.Doc();
+      doc.getMap('stationSummaries').set('yard-lobby', { ...summary, berths, berthsAt: NOW });
+      return doc;
+    };
+    const doc = farDoc([{ roomId: 'yard-lobby', doorId: 'd:gate-1', gate: 1 }, { roomId: 'yard-annex', doorId: 'd:gate-2', gate: 2 }]);
+    const mid = Math.floor((move.departAt + move.arriveAt) / 2);
+    expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.departAt - 1)).toBe(false);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.arriveAt)).toBe(false);
+    // A room none of the station's gates are in is not the station's by them.
+    expect(roomDocLockedByMove(farDoc([{ roomId: 'yard-lobby', doorId: 'd:gate-1', gate: 1 }]), 'yard-annex', mid)).toBe(false);
+    // Mapped here only partly (the annex and the next module, never the
+    // welcome room), the annex is a station of this install's own making:
+    // the far room's list still names its real one.
+    store.set('ssf-station-atlas', JSON.stringify({
+      'yard-annex': { roomId: 'yard-annex', name: 'ANNEX', doors: { 'x+': { targetSeed: 'ssf://room#room=yard-shed', targetRoomId: 'yard-shed' } }, lastSeen: 0 },
+    }));
+    expect(stationForRoom('yard-annex')?.derived).toBe(true);
+    expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.arriveAt)).toBe(false);
+  });
+
+  it('holds every dock at a module this install has not mapped, by the gates its station lists there', () => {
+    const move = yardMove();
+    // No atlas here: the station's record names a gate in its annex, and
+    // this install knows its move.
+    expect(registerStation({ ...yard('mine-1'), berths: [{ roomId: 'yard-annex', doorId: 'd:gate-2', gate: 2 }] })).toBe(true);
+    rememberMove(move);
+    installStationMoveResolver();
+    const mid = Math.floor((move.departAt + move.arriveAt) / 2);
+    expect(dockLockedByMove(['ship-room', 'yard-annex'], mid)).toBe(true);
+    expect(dockLockedByMove(['ship-room', 'yard-annex'], move.departAt - 1)).toBe(false);
+    expect(dockLockedByMove(['ship-room', 'yard-annex'], move.arriveAt)).toBe(false);
+    // …and so does the far room's check, whatever that room's doc holds.
+    expect(roomDocLockedByMove(new Y.Doc(), 'yard-annex', mid)).toBe(true);
+    // A room the station lists no gate in is still no station's.
+    expect(dockLockedByMove(['ship-room', 'yard-shed'], mid)).toBe(false);
   });
 
   it('holds a dock by the move a far room\'s summary says its station follows beside an outbid tow', () => {

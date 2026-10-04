@@ -1273,8 +1273,9 @@ export function setRoomStationResolver(resolver: ((roomId: string) => string | n
 }
 
 /** The station a room belongs to: the one the room-station resolver names,
- *  else the one whose welcome room shares the room's atlas component, or null
- *  when neither knows the room. */
+ *  else the one whose welcome room shares the room's atlas component, else
+ *  the one station listing a gate in it (gateStationForRoom), or null when
+ *  none of them knows the room. */
 export function stationForRoom(
   roomId: string,
   atlas: Record<string, AtlasEntry> = readAtlas(),
@@ -1294,7 +1295,24 @@ export function stationForRoom(
     const placed = id ? stations.find((s) => s.id === id) : undefined;
     if (placed) return placed;
   }
-  return atlasStationForRoom(roomId, atlas, stations);
+  return atlasStationForRoom(roomId, atlas, stations) ?? gateStationForRoom(roomId, stations);
+}
+
+/** ⚓🚦 A room the atlas cannot place (a station's module this game has not
+ *  walked through), by the gates the stations list (StationRecord.berths:
+ *  their atlas's own, and those learned from records and summaries in rooms
+ *  this atlas knows nothing of): the one station listing a gate there. None
+ *  when no station does, or when more than one does (a stale list, and which
+ *  is right is not known here). */
+function gateStationForRoom(roomId: string, stations: StationRecord[]): StationRecord | null {
+  if (!roomId) return null;
+  let found: StationRecord | null = null;
+  for (const st of stations) {
+    if (!st.berths?.some((b) => b.roomId === roomId)) continue;
+    if (found && found.id !== st.id) return null;
+    found = st;
+  }
+  return found;
 }
 
 /** What the atlas alone says: the station whose welcome room shares the
@@ -1317,10 +1335,11 @@ function atlasStationForRoom(
  * main.ts installs as the room-station resolver for the room the player is in.
  * Only a lone module moves: no structural (non-berth) pairing, live or in the
  * atlas, and no station of its own beyond the one derived from it. It is at
- * the station on the far side of one of its docks, when that side is a real
- * station — a saved or built-in record, or structure of more than one room —
- * so two lone modules docked together stay where they are, and a station
- * never moves to the ship visiting it. null: the atlas places the room.
+ * the station on the far side of one of its docks (by the atlas, or by the
+ * gates a station lists in a room the atlas has not mapped), when that side
+ * is a real station — a saved or built-in record, or structure of more than
+ * one room — so two lone modules docked together stay where they are, and a
+ * station never moves to the ship visiting it. null: the atlas places the room.
  */
 export function dockedStationFor(
   roomId: string,
@@ -1345,7 +1364,7 @@ export function dockedStationFor(
     partners.push(partner);
   }
   for (const partner of partners) {
-    const there = atlasStationForRoom(partner, atlas, stations);
+    const there = atlasStationForRoom(partner, atlas, stations) ?? gateStationForRoom(partner, stations);
     if (!there || there.id === own?.id) continue;
     if (!there.derived || atlasComponent(atlas, there.welcomeRoomId).size > 1) return there.id;
   }
@@ -1463,7 +1482,8 @@ export function currentRoomId(): string {
   return currentRoomGetter();
 }
 
-/** The station the player is in now, or null before the atlas knows the room. */
+/** The station the player is in now, or null before the atlas (or any
+ *  station's gates) places the room. */
 export function currentStation(): StationRecord | null {
   return stationForRoom(currentRoomGetter());
 }
