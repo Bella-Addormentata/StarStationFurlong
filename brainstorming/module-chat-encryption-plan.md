@@ -33,10 +33,9 @@ nothing from the node itself.
 
 The browser even hands the node the room key deliberately: `sendRoomCap`
 (`src/network/NetworkProvider.ts:231-250`) ships `roomKeyB64` over a one-shot `cap` stream, with the
-doc comment at `:225-230` saying the
-comment *"it holds the room's plaintext doc already, so this is loopback-only and exposes nothing
-new."* That comment is accurate today and is exactly the sentence that stops being true the moment
-chat is sealed.
+doc comment at `:225-230` saying *"it holds the room's plaintext doc already, so this is
+loopback-only and exposes nothing new."* That comment is accurate today and is exactly the
+sentence that stops being true the moment chat is sealed.
 
 ### 1.2 Authenticity: real, end-to-end, and applied unevenly
 
@@ -109,13 +108,13 @@ predicate. Chat applies neither.
 
 To be precise about the convention, since this is a criticism: five modules define a true
 `is*Record` guard (`doorLayoutDoc.ts:331`, `doorsDoc.ts:145`, `furnitureDoc.ts:81`,
-`wallpaperLayoutDoc.ts:71`, `windowLayoutDoc.ts:84`), and `doorPolicy`/`roomRoles` use `isGrant`
-/`isRequest` (`doorPolicy.ts:228`, `roomRoles.ts:72`). But the codebase is **inconsistent, not
-uniformly guarded** — `roomInfo` fields are read through bare `as` casts in a dozen places
-(`main.ts:2805`, `:3321`, `:7709`, `:1301`, `:3012`, `:8682`, among others). Chat is the weakest of
-these, not a lone outlier. Rendering is
-via `textContent`/`createTextNode` (`:2026`, `:2028`), so this is **not** an XSS: it is a robustness and
-consistency gap, and it is the natural place a `isChatRecord` guard would go when chat records gain
+`wallpaperLayoutDoc.ts:71`, `windowLayoutDoc.ts:84`), and `doorPolicy`/`roomRoles` use
+`isGrant`/`isRequest` (`doorPolicy.ts:191`, `:228`; `roomRoles.ts:67`, `:72`). But the codebase is
+**inconsistent, not uniformly guarded** — `roomInfo` fields are read through bare `as` casts in a
+dozen places (`main.ts:2805`, `:3321`, `:7709`, `:1301`, `:3012`, `:8682`, among others). Chat is
+the weakest of these, not a lone outlier. Rendering is via `textContent`/`createTextNode`
+(`:2026`, `:2028`), so this is **not** an XSS: it is a robustness and consistency gap, and it is
+the natural place a `isChatRecord` guard would go when chat records gain
 a signature. Worth its own small issue regardless of whether encryption ships.
 
 ---
@@ -199,7 +198,7 @@ Sender Keys needs three things. SSF has two of them already built and tested:
 | Prerequisite | Status in SSF |
 |---|---|
 | **A per-identity signing key** | ✅ Ed25519, `src/keypair.ts` |
-| **A key directory — who is in the room, and which key is theirs** | ⚠️ **partly.** The `players` map carries `keyB64` + a self-signed name↔key cert (`src/main.ts:3057-3068`, written at `:3085-3095`), and the mesh-harvest path does verify it (`:7978-7991`) — but every other consumer takes a bare `typeof` check (`games/gamesDoc.ts:202-209`, `main.ts:4905-4908`, `:5615-5622`), and the cert is a **self**-signature, so it does not bind a key to a *slot*. See §3.2.1 — this must be fixed before Sender Keys is safe |
+| **A key directory — who is in the room, and which key is theirs** | ⚠️ **partly.** The `players` map carries `keyB64` + a self-signed name↔key cert (`src/main.ts:3057-3068`, written at `:3085-3095`). Two paths verify it: the mesh harvest (`:7978-7991`), and the roster friend-add, which routes through `addContactFromRoomEntry` and refuses on a bad cert (`main.ts:3241-3247` → `contacts.ts:240-252`). The remaining consumers check shape or equality and never the signature — `games/gamesDoc.ts:202-209`, `main.ts:4905-4908`, `:5615-5622` test only `typeof`, while `offers.ts:318-319`, `:443-444` and `roomPasses.ts:211-212` compare the stored `keyB64` against an expected value, which inherits whatever the writer put there. And the cert is a **self**-signature, so it does not bind a key to a *slot*. See §3.2.1 — this must be fixed before Sender Keys is safe |
 | **A pairwise confidential channel to distribute sender keys over** | ❌ the *doc* exists — the DM pair-doc (`src/directMessages.ts`) — but it is authenticated only, and there is **no X25519 key anywhere in the codebase** |
 
 That third row is the entire gap. An ECDH key is required and SSF has only a signing key. Two routes:
@@ -316,13 +315,19 @@ second case the changelog actively misleads.
   points, closing a remote timing attack that could learn up to 4.036 bits of a long-term private
   key across many samples. Upstream scopes the impact as *primarily* fingerprinting, not key
   recovery. Attribute the mechanism carefully, because the release reads as one change and is
-  three, of which only the ladder is on this path: the blinding and the fixed-window multiply are
-  `ScalarMultiplier` methods in `abstract/curve.js`, reached through Edwards and Weierstrass
-  *point* multiplication, while `abstract/montgomery.js` — the module `x25519` is built from —
-  imports exactly one name from that file, `createKeygen`. The rewrite this floor actually buys is
-  inside `montgomery.js` itself: 163 lines added and 30 removed, 177 becoming 311. This floor
-  reaches **both** routes in §3.2, because both end at `x25519.getSharedSecret`, which
-  is that ladder. What differs is the blast radius. Under the recommended route the X25519 key is
+  three, and the three land on different calls. `getSharedSecret` is the rebuilt ladder, and that
+  rewrite is what this floor mainly buys: inside `montgomery.js`, 163 lines added and 30 removed,
+  178 becoming 311. `getPublicKey`/`keygen` stopped being the ladder here — 2.3.0 hands `x25519` a
+  fixed-base `scalarMultBase` hook (`ed25519.js:227-237`) that multiplies on the birationally
+  equivalent Edwards curve, so keygen now picks up the secret-scalar blinding of
+  `ScalarMultiplier.mulCTBlinded` (`abstract/curve.js:466-469`, via `mulSecret`); `montgomery.js`
+  says as much at `:225` — "the ladder is skipped". Only the fixed-window multiply for
+  unprecomputed points stays off this path, the base point being precomputed. Settle this by
+  reading imports and you get it backwards: `montgomery.js` imports exactly one name from
+  `curve.js`, `createKeygen`, and the blinding runs anyway — reached through a callback the curve
+  passes in, not an edge the import graph shows. This floor reaches **both** routes in §3.2,
+  because both end at `x25519.getSharedSecret`, which is that ladder. What differs is the blast
+  radius. Under the recommended route the X25519 key is
   its own, so what leaks is bits of a key that signs nothing and anchors no identity — and the
   fingerprinting framing is moot there in any case, since the public half is already in the contact
   card. Under the conversion route the scalar driving the ladder is the identity key's, so the leak
@@ -346,16 +351,25 @@ second case the changelog actively misleads.
   of six bullets under *Hardening*, so no exhaustive negative is derivable from them at all. Only
   measurement settles it, and it does: the AEAD with and without AAD, `chacha20poly1305`, and the
   raw `xchacha20` stream are byte-identical across 2.2.0, 2.3.0 and 2.4.0, and ciphertext written
-  by 2.2.0 decrypts unchanged on 2.4.0. So nothing here is known to bite. Two smaller things still
-  argue for the floor: 2.3.0 turned *silently ignoring* AAD into a throw for ciphers that lack it,
+  by 2.2.0 decrypts unchanged on 2.4.0 — measured over a fixed 257-byte plaintext (four blocks
+  plus an unaligned tail) under a fixed 32-byte key, 24- and 12-byte nonces, and `roomId‖epoch`
+  as AAD, with a flipped-key negative control to show the comparator can see a difference. State
+  the parameters so the next reader can re-run it rather than take this on the same faith the
+  changelog asks for. So nothing here is known to bite. Two smaller things still argue for the
+  floor: 2.3.0 turned *silently ignoring* AAD into a throw for ciphers that lack it,
   which is a real guard if this design ever wraps or substitutes a non-AAD primitive while still
   passing `roomId‖epoch`; and 2.4.0 makes a cleaned PRG fail closed instead of continuing from a
   zeroed key, which matters if §6 draws nonces from the `rngChacha20` this package also exports.
   2.4.0's other item does **not** apply: the raw-stream entry points gained an overlap check, and
-  the AEAD drives the stream with a single view as both input and output (`chacha.js:350`), so it
-  runs that check on every call and can never trip it — the guard throws only when the two views
-  share a buffer *and* the output starts later. Only a direct
-  `xchacha20(key, nonce, data, output)` with a caller-supplied, later-starting view trips it.
+  the AEAD drives the stream with a single view as both input and output (`@noble/ciphers@2.4.0`,
+  `chacha.js:350` — pinned, because the package is proposed here rather than installed, so a bare
+  line number would rot), so it runs that check on every call and can never trip it. The guard
+  throws only when the two views
+  genuinely *overlap* inside one buffer *and* the output starts later, and `overlapBytes` reads
+  "overlap" strictly: same buffer, both non-empty, ranges actually intersecting. A single view
+  passed twice has equal offsets, so it fails the second test however the first comes out. Only a
+  direct `xchacha20(key, nonce, data, output)` with a caller-supplied, later-starting view trips
+  it.
 
 Nothing is exposed today: neither package is a dependency —
 `prototypes/0.29.0-core-loop-demo/package.json` carries `@noble/ed25519` and `@noble/hashes` and no
@@ -387,10 +401,10 @@ reason the work is tractable.
 | `coHosts` map (pub-keyed, owner-granted, revocable) | `src/roomRoles.ts:103-124` | **the seed for the second key-holder tier.** Already keyed by Ed25519 pubkey, already revocable, already survives leave/rejoin — structurally a key-distribution list that currently distributes nothing. Not sufficient by itself: its write side is UI-gated only, so S3 consumes it as a deed-holder-**signed** `chatGrants` set rather than reading the map directly (§6 S3) |
 | `doorGrants` / `doorRequests`, keyed `${doorId}\|${pub}` | `src/doorPolicy.ts:235-261` | **the request → grant → revoke workflow**, built and UI'd. A chat-key grant is the same record with a different scope; the generalization is already anticipated at `doorPolicy.ts:16-17` |
 | `accessMode` public / pass / keyed | `src/main.ts:7643-7670` | **the policy switch** deciding whether a module is sealed at all. `public` → unsealed by design; `keyed` → sealed. Already deed-holder-gated (`:7667`) |
-| `roomKeyB64` (32 random bytes, per room) | `generateRoomKeyB64` `src/main.ts:612-616`, stored by `getOrCreateRoomKeyB64` `:618-630` | **nothing that chat may reuse — and establishing that is the finding.** It must **not** seed chat key material: `sendRoomCap` deliberately hands `roomKeyB64` to the node (`network/NetworkProvider.ts:225-250`), so anything derived from it is derived by the node too — §1.1's own finding. Chat epochs need fresh client-only secrets distributed over the pairwise channels (S2). Nor may the raw key serve as the public epoch *label*: it travels in the bootstrap blob (`main.ts:7029-7030`, `:8509-8511`) and the node seals presence records under `derive_enc_key(room_key)` (`ssf-p2p-node/src/chia_lane.rs:59`), so printing it beside every ciphertext would hand presence decryption to every passive reader of the doc — a secret spent as an identifier. Label epochs with a **non-invertible tag** instead: `blake3("ssf-chat-epoch:v1" ‖ roomId ‖ epochCounter)`, truncated. That needs no secret at all, and the room still needs the epoch counter and the rotate-on-membership-change it lacks today |
-| Signed contact cards + the friends tier | `src/contacts.ts:145-190` | **the out-of-band channel** for pair setup, and the trust anchor deciding who may be invited |
+| `roomKeyB64` (32 random bytes, per room) | `generateRoomKeyB64` `src/main.ts:612-616`, stored by `getOrCreateRoomKeyB64` `:618-631` | **nothing that chat may reuse — and establishing that is the finding.** It must **not** seed chat key material: `sendRoomCap` deliberately hands `roomKeyB64` to the node (`network/NetworkProvider.ts:225-250`), so anything derived from it is derived by the node too — §1.1's own finding. Chat epochs need fresh client-only secrets distributed over the pairwise channels (S2). Nor may the raw key serve as the public epoch *label*: it travels in the bootstrap blob (`main.ts:7029-7030`, `:8509-8511`) and the node seals presence records under `derive_enc_key(room_key)` (`ssf-p2p-node/src/chia_lane.rs:59`), so printing it beside every ciphertext would hand presence decryption to every passive reader of the doc — a secret spent as an identifier. Label epochs with a **non-invertible tag** instead: `blake3("ssf-chat-epoch:v1" ‖ roomId ‖ epochCounter)`, truncated. That needs no secret at all, and the room still needs the epoch counter and the rotate-on-membership-change it lacks today |
+| Signed contact cards + the friends tier | cards `src/contacts.ts:145-190`; friends tier `:43`, `listFriends` `:128`, `setFriend` `:266-270` | **the out-of-band channel** for pair setup, and the trust anchor deciding who may be invited |
 | DM pair-doc (deterministic from sorted pubkeys, authenticated) | `src/directMessages.ts:71-103` | **the pairwise channel Sender Keys distributes over.** Seal it first (it is two parties, no group machinery) and the group case inherits a working transport |
-| Co-present settle requests: nonce-bound signed ask → verified answer, with a TTL | `src/copresent.ts:56-57`, `:80-93`, `SETTLE_REQ_TTL_MS` `:99` | **the precedent for an "ask for the current epoch key" exchange.** Already binds `roomId‖nonce‖playerId‖pub`, already re-verifies the name cert, already expires. Its own comment states the posture the rest of this design needs: *"the owner is taken from the SIGNED request, not from any attacker-writable players lookup"* (`:78-79`) |
+| Co-present settle requests: nonce-bound signed ask → verified answer, with a TTL | `src/copresent.ts:56-57`, `:80-93`, `SETTLE_REQ_TTL_MS` `:99` | **the precedent for an "ask for the current epoch key" exchange.** Already binds `roomId‖nonce‖playerId‖pub`, already re-verifies the name cert, already expires. Its own comment states the posture the rest of this design needs: *"the owner is taken from the SIGNED request, not from any attacker-writable players lookup"* (`:77-78`) |
 | The ysync sign/verify seam | `src/network/YjsSync.ts:302-317`, `signBytes.ts:19-31` | **where a ciphertext envelope rides.** Already domain-separated by `roomId`, so a sealed payload cannot be replayed into another module |
 | `chia_lane::seal/open`, XChaCha20-Poly1305 | node-side, per `keyed-identity-contacts-plan.md:29`, `:82` | **the AEAD**, already written and tested; match it in the browser rather than picking a different cipher |
 
@@ -448,7 +462,8 @@ Covers *both* read paths — `rebuildChatLog` (`main.ts:2010`) and the bubble ob
 
 Carry `keyB64` and a signature over canonical bytes `roomId‖author‖name‖ts‖text` on chat records,
 mirroring `directMessages.ts:92-103` exactly; add the missing `isChatRecord` shape guard
-(`main.ts:2010`); drop unverifiable messages on read as `readMessages` already does (`:174-181`).
+(`main.ts:2010`); drop unverifiable messages on read as `readMessages` already does
+(`directMessages.ts:174-181` — spelled out, since the inherited path here would be `main.ts`).
 **Scope this honestly.** A signature verified against the `keyB64` carried *in the same record*
 proves possession of that key and integrity of that text. It does **not** authenticate the claimed
 `authorId` or name — a peer can write the victim's `authorId`, supply its own key, and sign
@@ -536,7 +551,7 @@ with matching signed revocations. The doc staying peer-writable then stops matte
 purpose: a reader verifies every grant against the deed holder's key and drops what does not
 verify, which is precisely what `verifiedRequestOwner` already does for settle requests — *"the
 owner is taken from the SIGNED request, not from any attacker-writable players lookup"*
-(`copresent.ts:78-79`). That is a real cryptographic gate, client-side, available **today** with no
+(`copresent.ts:77-78`). That is a real cryptographic gate, client-side, available **today** with no
 node change. It is why S3 is blocked on signing the grant set rather than on Slice 6. `coHosts`
 seeds the initial set and stays the UI for editing it; what changes is that the deed holder signs
 the result and readers check the signature.
@@ -553,7 +568,7 @@ makes eviction mean something (§2.2's first consequence). `public` and `pass` m
 the node keeps merging their chat as today, which contains the §2.2 architectural cost to exactly the
 rooms that asked for it.
 
-Deferred by name, not forgotten: MLS if modules grow large (§3.3); metadata privacy (§5.3);
+Deferred by name, not forgotten: MLS if modules grow large (§3.3); metadata privacy (§5, point 3);
 node-side enforcement, which remains Slice 6 of the existing plan and is what finally makes
 `roomOwner.ts:26-32` untrue.
 
@@ -580,9 +595,10 @@ node-side enforcement, which remains Slice 6 of the existing plan and is what fi
    prekey monthly and replenish one-time prekeys on every connect, with rotation silent in the UI* —
    a prompt here trains people to click through the one dialog that should mean something. The
    fingerprint-changed warning of S1a stays loud, because that one is not routine.
-7. **Is metadata in scope?** *Rec: explicitly out, and say so in the UI copy.* §5.3. The project has a
-   good habit of honest labels — `accessMode`'s own string already admits *"enforced once keyed
-   identity ships"* (`main.ts:7648`) — and sealed chat should not claim more than it does.
+7. **Is metadata in scope?** *Rec: explicitly out, and say so in the UI copy.* §5, point 3. The
+   project has a good habit of honest labels — `accessMode`'s own string already admits
+   *"enforced once keyed identity ships"* (`main.ts:7648`) — and sealed chat should not claim
+   more than it does.
 
 ---
 
@@ -596,7 +612,7 @@ Stated up front, in the spirit of `keyed-identity-contacts-plan.md` §4:
   `escapeHtml` discipline that `airHockeyXss.test.ts` pins.
 - **A member who leaks.** Nothing stops someone in the room from screenshotting it. E2EE bounds the
   set of people who *can* read; it cannot bound what they do next.
-- **Metadata.** §5.3. Membership, timing and volume stay visible to the node.
+- **Metadata.** §5, point 3. Membership, timing and volume stay visible to the node.
 - **Key substitution in the directory** (see §3.2.1 — the sharpest gap, and it defeats the naive
   design outright rather than merely weakening it).
 - **Forged membership — on the write side.** Until node-side enforcement lands (Slice 6), a modified
@@ -606,7 +622,7 @@ Stated up front, in the spirit of `keyed-identity-contacts-plan.md` §4:
   closes the attack §3.2.1 describes — the one where a forged entry needs no honest member to be
   fooled — without waiting for the node. It does not stop the junk being written, so the directory
   still fills with entries nobody authorized, and anything that reads it *without* checking a
-  signature (every consumer listed in §3.2) is still wrong today.
+  signature (the unverified consumers listed in §3.2) is still wrong today.
 - **Stale membership.** Nothing removes a `players` entry on leave (`main.ts:3178-3180`), so without
   the S3 roster change above, "everyone in the room" silently means "everyone who has ever been in
   the room".
