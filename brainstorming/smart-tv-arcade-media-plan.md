@@ -248,14 +248,14 @@ convenience code stays in the tree behind one build flag,
 build time the way the treasury's network pin is), for the day it is wanted
 again. The file, karaoke, screen and torrent tiles are the sovereign lanes
 and land on their own schedule (§11). The table below describes every lane
-as designed; the Convenience rows exist only in a build with the flag on.
-In code: #207 (the TV) and #208 (the cabinet).
+as designed; the Convenience rows, PeerTube among them, exist only in a
+build with the flag on. In code: #207 (the TV) and #208 (the cabinet).
 
 | Tile | Who fetches the bytes | Reaches the screen as | Sync | Class | Posture |
 |---|---|---|---|---|---|
 | ▶️ YouTube | each viewer, from YouTube | iframe, IFrame API | full | Convenience, single vendor | allowed, labelled, greyed out when unreachable; `youtube-nocookie.com`; no other feature may require it; on the desktop shells gated on §3.5's error-153 check — until it passes, the tile may fail from `tauri://localhost`, which v1's theatre reports as a lane failure with RETRY (browsers are unaffected) |
 | 🏛️ archive.org | each viewer (direct `<video>`, or via the node proxy for a texture) | `<video>` / `VideoTexture`, or their embed | full (a chosen file) / start-time (their embed) | Convenience host, sovereign backup exists | later, not v1: the item's `licenseurl` shown and a marked-PD shelf (v1's resolver accepts any identifier and reads only the file list and the title); every fetch offered to the station library |
-| 📺 PeerTube | the instance named; a station can run its own | iframe, embed API (`play`/`pause`/`seek`) | full | Convenience, or player-run | add it: the player-run answer to "YouTube-shaped" content |
+| 📺 PeerTube | the instance named; a station can run its own | iframe, embed API (`play`/`pause`/`seek`) | full | Convenience, or player-run | behind `VITE_SSF_CONVENIENCE_LANES=1` in every case (§12): an instance is a server whoever runs it, and the default build plays serverless sources only; with the flag on, add it as the player-run answer to "YouTube-shaped" content |
 | 🔗 URL | the host named | `<video>` | full for finite, seekable media (a host with range support); start-only for a live stream or a host without usable ranges — the element's `seekable` decides, and the controller never seeks what cannot be sought | Convenience | whoever pastes it is responsible for it; each viewer's browser fetches it only after PLAY FROM <host> (§3.2), and never from a private-network host |
 | 📁 File (host's own) | host node → blob lane → viewers' nodes | `VideoTexture` from the local node | full | Pure P2P | private rooms, delete-on-leave cache |
 | 🧲 Magnet / `.torrent` | the host node from the public swarm, then the blob lane (§6) | `VideoTexture` from the local node | full | Public swarm for the fetch, pure P2P for the room | paste only, no search, no tracker list, seeding notice |
@@ -1119,8 +1119,10 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 
 ## 5. Karaoke
 
-- **Tier 1 (TV v1 only):** YouTube karaoke/lyric videos, synced; everyone sings
-  alone. A toy.
+- **Tier 1 (TV v1 only):** a karaoke or lyric video on the TV, synced; everyone
+  sings alone. A toy. In the default build that is a file on the viewer's own
+  origin or node (the library's, once §7 exists); YouTube karaoke videos only
+  with the convenience lanes on (§12, the 2026‑10‑04 ruling).
 - **Tier 2 (audio lane):** a microphone prop; whoever holds it is the live
   source. Either everyone plays the backing track locally and listeners delay
   it by the measured transit (the voice-chat shape), or the singer's client
@@ -1180,16 +1182,22 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
 - **Index:** a signed `library-add { hash, title, bytes, licence, source,
   addedBy, provider }` op in the RoomLog, per station or venture —
   `provider` the adding owner's node id, the first node to ask — plus a
-  signed `library-seed { hash, node, seq }` announcement from every node
-  that holds the item and will serve it (a library-station volunteer, an
-  owner's node), renewed hourly under a sequence per (node, hash) that
-  only rises — one per item, never one per node across items, or a
-  renewal for one hash arriving after a higher one for another would read
-  as a replay — and judged expiring by the READER: an announcement counts
-  for a day from when this node last received a renewal with a higher
-  `seq` for that (node, hash), by this node's own clock — never a stamp of
-  the seeder's, which no reader could bound and a skewed or lying seeder
-  could set a decade out — a renewal with an older or equal `seq` for that
+  signed `library-seed { hash, node, seq, at }` announcement from every
+  node that holds the item and will serve it (a library-station volunteer,
+  an owner's node) — `at` the seeder's wall-clock stamp, under the
+  signature with the rest — renewed hourly under a sequence per (node,
+  hash) that only rises — one per item, never one per node across items,
+  or a renewal for one hash arriving after a higher one for another would
+  read as a replay — and judged expiring by the READER, on the floor
+  below, two lifetimes on that one clock: a seed is LISTED — its node
+  counted among the item's holders — for a day from the floor's reading
+  when this node last received a renewal with a higher `seq` for that
+  (node, hash), never from a stamp of the seeder's, which no reader could
+  bound and a skewed or lying seeder could set a decade out; and its MARK,
+  the replay guard, is kept for a day past the later of that same receipt
+  and the newest `at` it accepted, so the mark always outlives the
+  listing (a guard that fell before its seed could be re-admitted would
+  be no guard) — a renewal with an older or equal `seq` for that
   (node, hash) is a replay and ignored, the high-water mark kept per
   (node, hash) and persisted — under BOUNDS that hold against minting,
   since a node id is free to mint (§4), a map that grew with every id a
@@ -1204,14 +1212,14 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   the far future would never grow too old — a coarse bound, in days, on
   how long a signed announcement stays replayable, never a comparison that
   moves playback; a mark lives for the whole window — until the floor
-  stands a day past the newest `at` it accepted, when every announcement
-  it could refuse is refused by age under every later correction — and is
-  never dropped sooner, so a replay fails on the mark or on its age and on
-  nothing else (the cost of a clock stepped a long way forward and back is
-  that honest seeds read as too old until true time catches the floor up,
-  said on the library pane as the clock standing behind the floor —
-  bounded by the step, and the smaller cost beside a withdrawal undone;
-  the seed's own day above runs on the same floor); what the mark guards is
+  stands a day past the later of its receipt and the newest `at` it
+  accepted, as above, when every announcement it could refuse is refused
+  by age under every later correction — and is never dropped sooner, so a
+  replay fails on the mark or on its age and on nothing else (the cost of
+  a clock stepped a long way forward and back is that honest seeds read
+  as too old until true time catches the floor up, said on the library
+  pane as the clock standing behind the floor — bounded by the step, and
+  the smaller cost beside a withdrawal undone); what the mark guards is
   an honest seeder's withdrawal (the `library-unseed` below), which an old
   seed replayed after it would undo — a seeder that lies about `at` or
   signs anew guards nothing by replaying, since it can announce afresh at
