@@ -34,6 +34,7 @@ import {
   stationOrbit,
   stationPointAt,
   transferPointAt,
+  wrapAngle,
 } from './orbits';
 import type { OrbitPoint, TransferPlan } from './orbits';
 import { planetLayout, transitLayout } from './farOrbits';
@@ -304,7 +305,12 @@ function readSource(now: number): Source {
       const station = all.find((s) => s.id === rec.locationId);
       // A destination still in transit is listed at its origin until it arrives,
       // so a matching slot proves nothing: the ship stays on its own orbit.
-      if (place && (!station || reallyMoving(station, now)
+      // 🎚️ So does an altitude change, under way or done: the ship reached
+      // the orbit it left, which the station no longer flies.
+      const sameOrbit = !!station && !station.orbit === !place?.orbit && (!station.orbit || !place?.orbit
+        || (Math.abs(station.orbit.radiusKm - place.orbit.radiusKm) < 1e-6
+          && Math.abs(wrapAngle(station.orbit.phase0 - place.orbit.phase0)) < 1e-9));
+      if (place && (!station || reallyMoving(station, now) || stationInTransit(station, now) || !sameOrbit
         || planetById(station.planetId).id !== place.planetId || station.orbitSlot !== place.orbitSlot)) {
         adrift = place;
       }

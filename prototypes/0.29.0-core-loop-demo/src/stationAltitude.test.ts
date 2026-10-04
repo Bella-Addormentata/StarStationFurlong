@@ -879,3 +879,50 @@ describe('Copilot round 13', () => {
     expect(isStationMove({ ...plan.move, fromOrbit: { radiusKm: slotR + 10, phase0: 0 } })).toBe(true);
   });
 });
+
+describe('Copilot round 14', () => {
+  it('keeps the evidence a held orbit that lost still needs, pins included', () => {
+    store.clear();
+    // A holds 1,000 km; B, booking a move while flying 1,020 km it says it
+    // held since after A's claim, loses that held orbit.
+    const aHold = climbOf('a', 'a-room', 0, 1_000, NOW);
+    const nextAt = aHold.arriveAt + 1_000;
+    const nextPlan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, aHold.orbit!.toPhase0), SOV_R + 3_000, nextAt)!;
+    const aNext: StationMove = {
+      ...aHold, departAt: nextPlan.departAt, arriveAt: nextPlan.arriveAt, bookedAt: nextAt,
+      orbit: {
+        fromRadiusKm: nextPlan.from.radiusKm, fromPhase0: nextPlan.from.phase0, toRadiusKm: nextPlan.to.radiusKm,
+        toPhase0: nextPlan.to.phase0, fromSince: NOW,
+      },
+    };
+    const next2At = aNext.arriveAt + 1_000;
+    const next2Plan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 3_000, nextPlan.to.phase0), SOV_R + 2_000, next2At)!;
+    const aNext2: StationMove = {
+      ...aHold, departAt: next2Plan.departAt, arriveAt: next2Plan.arriveAt, bookedAt: next2At,
+      orbit: {
+        fromRadiusKm: next2Plan.from.radiusKm, fromPhase0: next2Plan.from.phase0, toRadiusKm: next2Plan.to.radiusKm,
+        toPhase0: next2Plan.to.phase0, fromSince: nextAt,
+      },
+    };
+    const bMove: StationMove = {
+      stationId: 'b', welcomeRoomId: 'b-room', fromPlanetId: SOV, fromSlot: 1, toPlanetId: 'planet-aris', toSlot: 0,
+      departAt: aHold.arriveAt + 3_000_000, arriveAt: aHold.arriveAt + 9_000_000, mode: 'thrusters', bookedAt: aHold.arriveAt + 600,
+      fuel: 5, fuelDrawn: 5, fromOrbit: { radiusKm: SOV_R + 1_020, phase0: 0, since: aHold.arriveAt + 500 },
+    };
+    // Cancelled: a pin keeps the held orbit for good.
+    const bPin: StationMove = {
+      ...bMove, fromOrbit: undefined, toPlanetId: SOV, toSlot: 1, departAt: bMove.departAt + 1, arriveAt: bMove.departAt + 2,
+      settles: bMove, fuel: 0, fuelDrawn: 0, bookedAt: bMove.departAt,
+    };
+    delete bPin.fromOrbit;
+    expect(isStationMove(bPin)).toBe(true);
+    expect(lostAltitudeClaims([aHold, aNext, aNext2, bPin]).has(altitudeMoveKey(bPin))).toBe(true);
+    expect(lostAltitudeClaims([aNext2, bPin]).has(altitudeMoveKey(bPin))).toBe(false);
+    const soon = aNext2.arriveAt + 1_000;
+    for (const m of [aHold, aNext, aNext2, bPin]) rememberMove(m, soon);
+    const late = Math.max(aNext2.arriveAt, bPin.arriveAt) + MOVE_LOG_KEEP_MS + MOVE_FINAL_MS + 10_000_000;
+    rememberMove(climbOf('c', 'c-room', 3, 6_000, late), late);
+    expect(lostAltitudeClaims(readRememberedMoves()).has(altitudeMoveKey(bPin))).toBe(true);
+    store.clear();
+  });
+});

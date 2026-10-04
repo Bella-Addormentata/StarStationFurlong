@@ -1177,16 +1177,19 @@ function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
 }
 
 /** 🎚️ Of the moves history would drop (too old, or past a station's cap),
- *  those an altitude change that is still some station's best move needs to
- *  stay lost: a claim that beat it ages out of history only by being kept
+ *  those an altitude claim of some station's best move needs to stay lost: a claim that beat it ages out of history only by being kept
  *  here, or the loser would be accepted later, unflown and unpaid. Each is
  *  tried without, oldest first, and kept only if the losses change. */
 function altitudeEvidence(bests: StationMove[], history: StationMove[], dropped: StationMove[]): StationMove[] {
+  // Every claim a best move makes: an altitude change's destination and the
+  // orbit it leaves, or the custom orbit any other move (a pin too) holds.
+  const claimsOf = (b: StationMove) => [altitudeMoveKey(b), `${altitudeMoveKey(b)}|from`];
+  const claims = (b: StationMove) => (b.mode === 'orbit' && !b.settles) || !!(b.settles ?? b).fromOrbit;
   const losers = (moves: StationMove[]) => {
     const lost = lostAltitudeClaims(flownAmong(moves));
-    return bests.filter((b) => b.mode === 'orbit' && !b.settles && lost.has(altitudeMoveKey(b))).map(altitudeMoveKey).join('\n');
+    return bests.filter(claims).flatMap(claimsOf).filter((k) => lost.has(k)).join('\n');
   };
-  if (dropped.length === 0 || !bests.some((b) => b.mode === 'orbit' && !b.settles)) return [];
+  if (dropped.length === 0 || !bests.some(claims)) return [];
   let kept = [...dropped];
   const want = losers([...bests, ...history, ...kept]);
   if (!want) return [];
