@@ -951,6 +951,9 @@ export function stationGates(atlas: Record<string, AtlasEntry>, roomId: string):
  * The gate number a port newly fitted in `roomId` takes: the lowest one no
  * other gate of its station uses. The room's own live gates (`own`, from its
  * doorPolicy) stand in for its atlas entry, which may be a harvest behind.
+ * A room whose gates are not known lists none, and holds none to step over
+ * unless a flood hid some of its ports: a port fitted while its room's gates
+ * are not known stays unnumbered (doorPolicy.mayNumberNewPort).
  * Null when all MAX_GATE_NUMBER are taken.
  */
 export function freeGateNumber(

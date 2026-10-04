@@ -387,23 +387,41 @@ export function readUnnumberedPorts(): string[] {
  *  it short, or more ports than a gate read lists). The numbers it saw are
  *  taken either way; a number it did not see might be a hidden port's. */
 export function readGatesInUse(): GatesInUse {
-  return docAlive() ? gatesInUseIn(boundDoc!) : { gates: {}, complete: false };
+  return docAlive() ? gatesInUseIn(boundDoc!) : { gates: {}, complete: false, unnumbered: false };
 }
 
 /** ⚓🚦 readGatesInUse for ANY doc (the far room's, during a DOCK). */
 export function gatesInUseIn(doc: Y.Doc): GatesInUse {
-  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { gates: {}, complete: false };
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { gates: {}, complete: false, unnumbered: false };
   const { ports, complete } = scanPorts(doc, doc.getMap('doorPolicy'));
   const gates: Record<string, number> = {};
-  for (const [doorId, p] of ports) if (p.gate !== undefined) gates[doorId] = p.gate;
-  return { gates, complete };
+  let unnumbered = false;
+  for (const [doorId, p] of ports) {
+    if (p.gate !== undefined) gates[doorId] = p.gate;
+    else unnumbered = true;
+  }
+  return { gates, complete, unnumbered };
 }
 
-/** ⚓🚦 What readGatesInUse read: the gates by door id, and whether that is
- *  every port of the room. */
+/** ⚓🚦 What readGatesInUse read: the gates by door id, whether that is
+ *  every port of the room, and whether a port it saw has no number yet. */
 export interface GatesInUse {
   gates: Record<string, number>;
   complete: boolean;
+  unnumbered: boolean;
+}
+
+/** ⚓🚦 Whether a port fitted now may take a number: only while the room's
+ *  gates are known, every port seen and numbered (the list its harvest
+ *  publishes). Otherwise the harvest says the room's gates are not known, and
+ *  the rest of the station could not see a number given here, so another new
+ *  port there could take it too. The port is fitted unnumbered instead, and
+ *  numbered with the room's other ports once the module's owner or a
+ *  shareholder is in it. This is also why the station's rooms whose gates are
+ *  not known hold no numbers to step over (freeGateNumber), apart from ports a
+ *  flood hides. */
+export function mayNumberNewPort(inUse: GatesInUse): boolean {
+  return inUse.complete && !inUse.unnumbered;
 }
 
 /** 🚏🤖 Most layout keys readAutoFerryGates looks at, junk included: the

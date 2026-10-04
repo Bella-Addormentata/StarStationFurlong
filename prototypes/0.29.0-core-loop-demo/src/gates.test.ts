@@ -14,6 +14,7 @@ import {
   gateAccessIn,
   gatesInUseIn,
   hasDoorGrant,
+  mayNumberNewPort,
   nextFreeGate,
   readAutoFerryGates,
   readGateAccess,
@@ -314,9 +315,15 @@ describe('the gate on a dock port', () => {
     doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
     doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
     doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    expect(readGatesInUse()).toEqual({ gates: { north: 1 }, complete: true, unnumbered: false });
+    expect(mayNumberNewPort(readGatesInUse())).toBe(true);
+    // A port with no number yet: the room's gates are not known, so a new
+    // port waits for its number too.
     doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
-    expect(readGatesInUse()).toEqual({ gates: { north: 1 }, complete: true });
-    expect(gatesInUseIn(doc)).toEqual({ gates: { north: 1 }, complete: true });
+    expect(readGatesInUse()).toEqual({ gates: { north: 1 }, complete: true, unnumbered: true });
+    expect(gatesInUseIn(doc)).toEqual({ gates: { north: 1 }, complete: true, unnumbered: true });
+    expect(mayNumberNewPort(readGatesInUse())).toBe(false);
+    doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true, gate: 2 });
     // Past a flood of both maps the scan cannot tell whether it missed a port:
     // the gates it saw are taken, but a free-looking number may not be.
     for (let i = 0; i < 1100; i++) {
@@ -324,8 +331,9 @@ describe('the gate on a dock port', () => {
       doc.getMap('doorLayout').set(id, { nope: true });
       doc.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner' });
     }
-    expect(readGatesInUse()).toEqual({ gates: { north: 1 }, complete: false });
-    expect(gatesInUseIn(doc)).toEqual({ gates: { north: 1 }, complete: false });
+    expect(readGatesInUse()).toEqual({ gates: { north: 1, east: 2 }, complete: false, unnumbered: false });
+    expect(gatesInUseIn(doc)).toEqual({ gates: { north: 1, east: 2 }, complete: false, unnumbered: false });
+    expect(mayNumberNewPort(readGatesInUse())).toBe(false);
   });
 
   it('takes the lowest number free in the station', () => {

@@ -32,7 +32,7 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
-import { dockPortFlagIn, fitDockPortIn, gateAccessIn, gatesInUseIn } from './doorPolicy';
+import { dockPortFlagIn, fitDockPortIn, gateAccessIn, gatesInUseIn, mayNumberNewPort } from './doorPolicy';
 import { freeGateNumber, readAtlas, roomIdFromSeed, withSharedAtlasOf } from './stationAtlas';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
@@ -122,9 +122,10 @@ export function applyFarDockRequest(
   // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate; with
   // every number taken, neither record is written. The far doc's shared atlas
   // is read too: on a first visit this client's own atlas may not know the far
-  // station's other rooms or the gates they already use. While a flood hides
-  // some of the far room's ports from the gate read, the port is fitted
-  // unnumbered: a free-looking number might be a hidden port's.
+  // station's other rooms or the gates they already use. While the far room's
+  // gates are not known (a flood hides some of its ports from the gate read,
+  // or a port has no number yet), the port is fitted unnumbered
+  // (mayNumberNewPort).
   const newPort = !dockPortFlagIn(doc, req.farDoor);
   const inUse = newPort ? gatesInUseIn(doc) : null;
   const free = inUse
@@ -135,7 +136,7 @@ export function applyFarDockRequest(
   if (newPort && free === null) {
     return { result: { ok: false, reason: 'no-gate' }, wrote: false };
   }
-  const gate = inUse?.complete ? free : null;
+  const gate = inUse && mayNumberNewPort(inUse) ? free : null;
   // One transaction: the berth's record and its port land together, so no
   // peer ever sees a dock on a door without its half.
   doc.transact(() => {

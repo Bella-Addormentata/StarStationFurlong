@@ -304,6 +304,7 @@ import {
   readDockGates,
   readDockGatesIfComplete,
   readGatesInUse,
+  mayNumberNewPort,
   readUnnumberedPorts,
   readDoorPolicy,
   writeDoorPolicy,
@@ -2663,7 +2664,7 @@ async function joinRoomAtEpoch(
         // ⚓🚦 …numbered like every port (the new room's own gate list; the
         // atlas groups it with its station once harvested).
         const inUse = readGatesInUse();
-        const gate = inUse.complete ? freeGateNumberHere(boot.roomId, inUse.gates) : null;
+        const gate = mayNumberNewPort(inUse) ? freeGateNumberHere(boot.roomId, inUse.gates) : null;
         writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
@@ -3852,13 +3853,13 @@ async function transitTo(
     // re-fit the port below.
     // ⚓🚦 A dock that fits a new port here needs a free gate number; with
     // every number taken, the dock is not completed (as the far DOCK refuses).
-    // While a flood hides some of this room's ports from the gate read, the
-    // port is fitted unnumbered: a free-looking number might be a hidden
-    // port's.
+    // While this room's gates are not known (a flood hides some of its ports
+    // from the gate read, or a port has no number yet), the port is fitted
+    // unnumbered (mayNumberNewPort).
     const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
     const inUse = needsPort ? readGatesInUse() : null;
     const freeGate = inUse ? freeGateNumberHere(activeBootstrap?.roomId ?? "", inUse.gates) : null;
-    const newGate = inUse?.complete ? freeGate : null;
+    const newGate = inUse && mayNumberNewPort(inUse) ? freeGate : null;
     if (
       depRoomId &&
       !(needsPort && freeGate === null) &&
@@ -3901,7 +3902,7 @@ async function transitTo(
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
         if (needsPort) {
           // ⚓🚦 …numbered, like every new port of the station (unnumbered
-          // while a flood hides some of this room's ports, above).
+          // while this room's gates are not known, above).
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
@@ -4405,10 +4406,15 @@ function harvestStationAtlas(): void {
           : {}),
       }];
     });
-  // ⚓🚦 A port fitted before gates existed has no number: the owner numbers
-  // it here, once. Until then (anyone else here) the room's gates are not
-  // known, and the harvest says so (null): an older list, even one of none,
-  // would hide that port as a legacy berth.
+  // ⚓🚦 A port fitted before gates existed, or while the room's gates were
+  // not known (mayNumberNewPort), has no number: the owner numbers it here,
+  // once. Until then (anyone else here) the room's gates are not known, and
+  // the harvest says so (null): an older list, even one of none, would hide
+  // that port as a legacy berth.
+  // The station's other rooms whose gates are not known are read as holding
+  // no numbers (they hold none, apart from ports a flood hides), not waited
+  // for: two rooms that each have a port with no number, as rooms with ports
+  // fitted before gates do, would wait on each other for good.
   const unnumbered = readUnnumberedPorts();
   if (unnumbered.length > 0 && isLocalHelmCommander() && yjsSync) {
     // One transaction: the policy observer (which harvests again) runs only

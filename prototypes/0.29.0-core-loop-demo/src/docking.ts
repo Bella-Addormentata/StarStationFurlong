@@ -98,6 +98,7 @@ import {
   hasDoorGrant,
   hasDoorRequest,
   readGatesInUse,
+  mayNumberNewPort,
   MAX_GATE,
   type GateAccess,
   type ConstructionMode,
@@ -1963,12 +1964,13 @@ export class DoorDockingPortSystem {
         }
         // ⚓🚦 A new port takes the lowest gate number free in the station;
         // with every number taken it is not fitted (and no part is spent).
-        // While a flood hides some of this room's ports from the gate read,
-        // it is fitted unnumbered, since a free-looking number might be a
-        // hidden port's; the harvest numbers it once the read sees every port.
+        // While the room's gates are not known (a flood hides some of its
+        // ports from the gate read, or a port has no number yet) it is fitted
+        // unnumbered (mayNumberNewPort), and numbered with the others once
+        // the owner or a shareholder is here and the read sees every port.
         const inUse = step.kind === "fit-port" ? readGatesInUse() : null;
         const free = inUse ? freeGateNumberHere(this.roomNow(), inUse.gates) : null;
-        const gate = inUse?.complete ? free : null;
+        const gate = inUse && mayNumberNewPort(inUse) ? free : null;
         if (inUse && free === null) {
           this.showAssemblyNotice(doorId, `Every gate number (1–${MAX_GATE}) is taken in this station — remove a port first.`);
           return;
