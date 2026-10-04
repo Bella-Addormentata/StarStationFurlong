@@ -270,12 +270,28 @@ torrent tile as library-only, since §6 compiles the torrent client out there.
   (`OpenOptions::mode(0o600)` with `create_new`); on Windows, where a mode
   means nothing, a security descriptor set at creation whose DACL is
   protected — it inherits nothing from the directory — and grants the
-  owning user's SID alone. The file is written under a temporary name in
-  the same directory and renamed into place, so no reader sees a
-  half-written token and the previous launch's file is replaced by the
-  rename, never left behind, and it is removed on a clean exit; a shell
-  that finds the file wider than owner-only, or in a directory it does not
-  own, refuses it and reports, and the proxy is unavailable. In the EMBEDDED
+  owning user's SID alone. The directory it lives in is owner-only the same
+  way — mode 0700 on Unix, a protected DACL granting the owning SID alone
+  on Windows — created so and verified so by writer and reader alike
+  before any token is written or read, since ownership alone says nothing
+  about who else may rename into, replace or delete from a directory. The
+  file is written under a temporary name in the same directory and renamed
+  into place with the platform's atomic replacement — `rename(2)` on Unix;
+  on Windows `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`, or
+  `SetFileInformationByHandle` with `FileRenameInfoEx` and the
+  replace-if-exists and POSIX-semantics flags, which is what Rust's
+  `std::fs::rename` wraps there, verified on the target toolchain by the
+  spike and failing closed (no token, no proxy) where it cannot replace an
+  existing file — so no reader sees a half-written token and the previous
+  launch's file is replaced by the rename, never left behind, and it is
+  removed on a clean exit. The reader opens the final path without
+  following links (`O_NOFOLLOW`; on Windows `FILE_FLAG_OPEN_REPARSE_POINT`
+  with any reparse point refused) and checks the open handle, not the
+  path: a regular file, owned by the user, with the mode or DACL above,
+  and on Unix the inode the directory entry names, so a swapped, linked or
+  stale file is refused; a shell that finds the file or its directory
+  wider than owner-only refuses it and reports, and the proxy is
+  unavailable. In the EMBEDDED
   mode — no sidecar found, the shell starting its own `wt_listener` and HTTP
   API in-process (`src-tauri/src/main.rs`, `NodeMode::Unavailable`) — there
   is no boundary to cross: the shell mints the token itself and hands it to
@@ -504,7 +520,13 @@ WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → **end-to-end encryption in
 the sender's page** → WebTransport unidirectional streams (one per frame or
 keyframe group; 20 ms Opus frames may use datagrams) → node → iroh fan-out as
 a `media` lane the node and every hub forward without being able to read →
-viewers' `VideoDecoder` → three.js `VideoFrameTexture`, and viewers'
+viewers' `VideoDecoder` → three.js `VideoFrameTexture` — added upstream in
+early 2025, after the r167 the prototype pins (`three` 0.167.1), so the
+video lane carries a three.js upgrade with a regression pass of the
+renderer (the hole-punch spike touches the same file), or, until it lands,
+an equivalent uploader on r167: each decoded `VideoFrame` drawn into an
+`OffscreenCanvas` behind a `CanvasTexture`, one copy a frame, enough at
+arcade resolution — and viewers'
 `AudioDecoder` (Opus) → a 60–120 ms jitter buffer → the Web Audio graph,
 spatialised at the source's position. A keyframe every ~2 s plus
 keyframe-on-request.
@@ -604,7 +626,14 @@ header, about 90 bytes a frame, 36 kbps at 50 frames a second) plus a
 fifth: about 80 kbps for the 32 kbps voice tier, about 200 kbps for the
 128 kbps music tier, and 50 frames a second plus the batch allowance
 either way; video the same way from its tier's rate —
-frames for a source the link holds no subscription for dropped at ingress,
+admission per link by what the link is to the source: a browser link is
+admitted for the sources it REGISTERED as their publisher (the source
+announcement bound to that link on the control plane) and for nothing
+else, a mesh link for the sources this node subscribed to upstream through
+it and for nothing else, and a frame for any other source is dropped at
+ingress (a publisher's own link subscribes to nothing — its subscribers
+are downstream — so one rule for both would drop every frame at the
+originating node);
 a cap on the sources one link may carry, and a failed-verification budget
 per link — past a handful of failures a second the LINK is muted for a
 doubling backoff and the event reported, while the source stays up on
@@ -708,7 +737,7 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 
 | Central piece | Without it |
 |---|---|
-| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
+| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. And the same classifier stands on every PEER dial, setting or no setting: the endpoints a tracker response, the DHT or PEX hand back are as untrusted as the metadata, so every outgoing BitTorrent connection and every uTP or DHT packet goes to a global-unicast address or nowhere — loopback, private, link-local and the metadata ranges refused, a LAN peer reachable only through the operator's explicit allowlist, which is also the only door LSD (a LAN-discovery protocol by design) ever opens — the check sitting in the client's connector, which the node forks if `librqbit` offers no hook there, rather than shipping without it. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
 | DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node, so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no DHT client, no PEX, no LSD, no tracker or web-seed code to reach anything with — the only isolation that holds, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
 | Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build, under the trackers row's destination gate when on (a web-seed URL comes from the same untrusted metadata, and a crafted one would otherwise point the node at loopback, the LAN or a metadata service); never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
