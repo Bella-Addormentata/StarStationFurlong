@@ -176,7 +176,7 @@ sources the countdown doubles as the prefetch window.
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
 | You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
 | You open a second tab | The remote stays with the tab that picked it up (`page`); the other is a viewer that may take it over — one person, one place — and closing it drops nothing |
-| The TV has buttons on its body | Anyone standing at the TV can press POWER, VOLUME and INPUT without the remote |
+| The TV has buttons on its body | Anyone standing at the TV can press POWER, VOLUME and INPUT without the remote — and whoever turns the set ON has the remote placed in their hand (#186's rule) when it is on the set or lapsed; a live holder keeps it, since a body button moves nothing out of a hand and the owner's spare is not the switch's to use: the holder turns the set on themselves, or hands the remote over |
 | The owner has the spare | The room owner may take the remote from anyone, always |
 
 The holder gate is client-side and best effort — the dev-phase posture of
@@ -286,10 +286,10 @@ torrent tile as library-only, since §6 compiles the torrent client out there.
   the proxy does not exist in that listener: an embedded listener without
   the module answers `/api/media` with 404 and the theatre's consent-only
   direct URL is what plays, so the two HTTP implementations never diverge
-  in what they let through. `tauri://
-  localhost` is every Tauri app's origin and names nothing on its own, so
-  possession of the token is the authority and the origin list only a
-  filter. A browser page, in development, gets it from a dedicated
+  in what they let through. `tauri://localhost` on macOS and Linux, and
+  `http://tauri.localhost` on Windows (§2), is every Tauri app's origin on
+  that platform and names nothing on its own, so possession of the token
+  is the authority and the origin list only a filter. A browser page, in development, gets it from a dedicated
   `/api/media-cap` endpoint whose allowlist is the EXACT origins named in
   `SSF_ALLOWED_ORIGINS`, never a loopback wildcard. Where no such channel
   exists — a node whose data dir the shell cannot read, a page on an origin
@@ -598,7 +598,12 @@ source id is what a flooder forges: a frame-size ceiling per leg from the
 source's announced tier (an Opus frame with its header and signature under
 400 bytes; a video frame fragmented into datagrams and bounded per tier),
 packet-rate and byte-rate ceilings per source per link with a short burst
-allowance (audio: 50 frames and 48 kbps plus a fifth; video: the tier's),
+allowance, per tier and counted on the WIRE — the tier's codec rate plus
+the per-frame overhead (the 64-byte signature, the 16-byte tag and the
+header, about 90 bytes a frame, 36 kbps at 50 frames a second) plus a
+fifth: about 80 kbps for the 32 kbps voice tier, about 200 kbps for the
+128 kbps music tier, and 50 frames a second plus the batch allowance
+either way; video the same way from its tier's rate —
 frames for a source the link holds no subscription for dropped at ingress,
 a cap on the sources one link may carry, and a failed-verification budget
 per link — past a handful of failures a second the LINK is muted for a
@@ -644,7 +649,9 @@ Safari 16.4+, WebKitGTK 2.44+) and `AudioEncoder` (absent on Safari
 16.4–18.x and WebKitGTK 2.44). Only true screen capture (`getDisplayMedia`)
 is Chromium-first. Budget per
 viewer: ~24–32 kbps voice, ~96–128 kbps music, ~0.3–0.8 Mbps for a
-native-resolution arcade screen, ~1.5–3 Mbps for a 720p desktop. **Build
+native-resolution arcade screen, ~1.5–3 Mbps for a 720p desktop — codec
+rates; the wire adds the per-frame overhead, and §4's ceilings count the
+wire. **Build
 audio first**: it is a tenth of the work, it is #189, and it unlocks karaoke.
 
 **Subscriptions by distance.** The viewer decides, not the sender: every client
@@ -793,21 +800,30 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
 - **Under which authority:** owners' keys rotate and a deed transfers, so
   every `library-add`, `library-remove` and operator-key op names the
   authority head it was signed under — the head's sequence number and
-  hash — and the writer's own sequence under it, and a node validates the
-  op against THAT head's writer set, never the current one. Heads form one
-  chain: each is signed by the authority that makes it (the deed holder
-  for a key-set change; for a transfer, the new holder, citing the chain
-  spend that made it so), numbers in sequence, names its predecessor by
-  hash, and carries a cutoff — every earlier writer's last accepted
-  sequence number — so an op under a superseded head is accepted only up
-  to the cutoff its successor recorded for its writer. Historical
-  validation is then the same rule on every node, whenever it syncs: walk
-  the head chain, accept each op under its own head's set up to the next
-  head's cutoff, and refuse a former owner's later signatures everywhere
-  at once; the new holder sets the cutoff and so may drop ops still in
-  flight at the transfer, which is the new holder's prerogative over the
-  new holder's library. A pinned owner key in a station's config is head
-  zero of a chain of one.
+  hash — and chains to the writer's own previous op by hash (the writer's
+  first op names none), so each writer's ops form one contiguous chain
+  that a gap breaks: a node holding an op whose predecessor it lacks
+  fetches the predecessor before it accepts anything after it. A node
+  validates an op against THAT head's writer set, never the current one.
+  Heads form one chain of their own: each is signed by the authority that
+  makes it (the deed holder for a key-set change; for a transfer, the new
+  holder, citing the chain spend that made it so), numbers in sequence,
+  names its predecessor by hash, and COMMITS the history it inherits — for
+  every earlier writer, the hash of that writer's terminal accepted op —
+  so an op under a superseded head is accepted only if it lies on the
+  chain that ends at the committed tip. A newly signed op with an old
+  sequence is off that chain, and so is a second op at a sequence the
+  chain already holds, whoever signs them and whenever a node syncs; a
+  sequence number alone would commit nothing, since a former owner could
+  mint a backdated op below it, or two at one number, and a late node
+  could not tell them from the history the successor accepted.
+  Historical validation is then the same rule on every node: walk the
+  head chain, accept each writer's ops along its hash chain up to the tip
+  the next head committed, and refuse the rest everywhere at once; the
+  new holder chooses the tips and so may drop ops still in flight at the
+  transfer, which is the new holder's prerogative over the new holder's
+  library. A pinned owner key in a station's config is head zero of a
+  chain of one.
 
 ## 8. Tribler / IPv8, evaluated seriously
 
