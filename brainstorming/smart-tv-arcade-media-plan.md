@@ -233,7 +233,7 @@ sources the countdown doubles as the prefetch window.
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
 | You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
 | You open a second tab | The remote stays with the tab that picked it up (`page`); the other is a viewer that may take it over — one person, one place — and closing it drops nothing |
-| The TV has buttons on its body | Anyone standing at the TV can press POWER and VOLUME without the remote — each its own key (§3.1), so no body press writes the programme record the holder rewrites every three seconds, and an INPUT button, if one comes, gets a key of its own the same way, never a second writer of `tv:<id>` — and whoever turns the set ON has the remote placed in their hand (#186's rule) when it is on the set or lapsed; a live holder keeps it, since a body button moves nothing out of a hand and the owner's spare is not the switch's to use: the holder turns the set on themselves, or hands the remote over |
+| The TV has buttons on its body | Anyone standing at the TV can press POWER and VOLUME without the remote — each its own key (§3.1), so no body press writes the programme record the holder rewrites every three seconds, and an INPUT button, if one comes, gets a key of its own the same way, never a second writer of `tv:<id>` — and whoever turns the set ON has the remote placed in their hand (#186's rule) when it is on the set or lapsed; a live holder keeps it, since a body button moves nothing out of a hand and the owner's spare is not the switch's to use: the holder turns the set on themselves, or hands the remote over. That last clause is a REFINEMENT of #186's wording and is recorded as one (the options table, §10): the issue says whoever turns the set on holds the remote and says nothing of a remote already in a live hand, so v1 applies the issue's rule whenever the remote is not in one — the common case, the set being off — and keeps a live holder's possession across a body press; the owner may overrule it, in which case ON hands the remote over on every OFF→ON transition, a one-line change in `tvDoc.ts` (#207) |
 | The owner has the spare | The room owner may take the remote from anyone, always |
 
 The holder gate is client-side and best effort — the dev-phase posture of
@@ -1394,7 +1394,23 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   signature with the rest — renewed hourly under a sequence per (node,
   hash) that only rises — one per item, never one per node across items,
   or a renewal for one hash arriving after a higher one for another would
-  read as a replay — and judged expiring by the READER, on two clocks of
+  read as a replay — a sequence the seeder keeps DURABLY, since a reader
+  that holds a mark refuses every value at or below it for a day and a
+  seeder that kept its key but reset its counter would be unlistable for
+  that day: the next `seq` is the greater of the wall clock in whole
+  seconds and the last value persisted plus one, written beside the node
+  key (the directory `iroh_node_id.key` lives in) BEFORE the announcement
+  goes out and reserved in blocks of 64, so a crash between the
+  reservation and the send costs a gap and never a reuse, and resumed
+  from the reservation at start — so across a restart the sequence
+  continues, and a seeder whose counter is gone (the file lost, the
+  directory copied without it) recovers on the clock, which stands above
+  anything it emitted unless the clock has been set back: the one case
+  that leaves it unlistable, for as long as its clock stands behind its
+  last emission and at most the day a mark lives, bounded by the step and
+  said on the library pane, a seeder that would rather not wait minting a
+  new node id, a (node, hash) no mark names — and judged expiring by the
+  READER, on two clocks of
   its own (below), one lifetime each: a seed is LISTED — its node
   counted among the item's holders — for a day, on the AGE clock, from
   its reading when this node last received a renewal with a higher `seq`
@@ -1958,6 +1974,7 @@ it.
 | EmulatorJS netplay | Not depended on | WebRTC + its own signaling/TURN, marked unstable |
 | Spectators run the emulator themselves | Possible later | CPU per spectator and a save-state transfer; the video lane is cheaper at retro resolutions |
 | Sender-side distance gating | Rejected | The node is content-blind and tick positions are untrusted; viewer-pull matches the mesh's IWANT philosophy |
+| POWER ON takes the remote from a live holder | Refined, pending the owner's word | #186 says whoever turns the set on holds the remote and says nothing of a remote already in a live hand; v1 applies the issue's rule whenever the remote is on the set or lapsed and keeps a live holder's possession across a body press (§3.2), a refinement recorded here rather than claimed as the issue's — overruled, ON hands over on every OFF→ON, a one-line change in `tvDoc.ts` (#207) |
 
 ## 11. Final recommendations and sequence
 
