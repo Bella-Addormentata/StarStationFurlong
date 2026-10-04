@@ -548,7 +548,10 @@ export function isBerthMemoryRecord(v: unknown): v is BerthMemoryRecord {
   if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
   const r = v as Partial<BerthMemoryRecord>;
   if (!isBoundedString(r.doorId)) return false;
-  if (!isBoundedString(r.roomId)) return false;
+  // A room id is any non-empty string, as decodeBootstrapSeed, the station
+  // records and the atlas take one: the station-id bound would refuse a real
+  // berth, and with it DEPART (rememberBerthHere).
+  if (typeof r.roomId !== 'string' || r.roomId.length === 0) return false;
   // A pass never rides here (see BerthMemoryRecord).
   if ((r as { address?: unknown }).address !== undefined) return false;
   // The door-key rule doorsDoc reads with: a farDoor it would strip would

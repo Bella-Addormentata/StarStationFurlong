@@ -62,11 +62,9 @@ import {
 // construction — plan §5.1). DEPART also detaches any transient berth.
 import {
   deleteDoorPairing,
-  readAllDoors,
-  readDoor,
+  readAllDoorsWithPhysical,
   subscribeDoors,
   type DoorPairing,
-  type DoorRecord,
 } from './doorsDoc';
 import { isDockChain } from './adapter';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
@@ -2031,28 +2029,12 @@ function isTransientBerth(rec: DoorPairing): boolean {
   return rec.transient === true || isDockChain(rec.segments);
 }
 
-/** The room's door records: the doors doc's snapshot, which keeps only its
- *  first MAX_PAIRINGS valid entries, plus each PHYSICAL door's own record,
- *  read by name past that cap (readDoor). So records a peer floods the map
- *  with can never hide a real door's connection from the checks below, and
- *  a flood alone never refuses DEPART. The physical doors are the stored
- *  layout, else the four defaults (as livePortView draws them). */
-function helmDoorRecords(): Map<string, DoorRecord> {
-  const out = readAllDoors();
-  const layout = readAllDoorLayout();
-  for (const id of (layout.size ? layout : defaultDoorLayoutRecords()).keys()) {
-    const rec = readDoor(id);
-    if (rec) out.set(id, rec);
-  }
-  return out;
-}
-
 /** Enumerate the room's PERMANENT chained doors — a paired berth that is
  *  NOT a transient guest-berth. Reads the doors doc (shared truth), so a
  *  peer's dock lands here without a helm round-trip. */
 function enumerateChainedDoors(): string[] {
   const out: string[] = [];
-  for (const [id, rec] of helmDoorRecords()) {
+  for (const [id, rec] of readAllDoorsWithPhysical()) {
     if (rec.paired !== true) continue;
     if (isTransientBerth(rec)) continue;
     out.push(id);
@@ -2062,7 +2044,7 @@ function enumerateChainedDoors(): string[] {
 
 /** Does any door of this room hold a live connection right now? */
 function hasLiveDock(): boolean {
-  for (const [, rec] of helmDoorRecords()) if (rec.paired === true) return true;
+  for (const [, rec] of readAllDoorsWithPhysical()) if (rec.paired === true) return true;
   return false;
 }
 
@@ -2072,7 +2054,7 @@ function hasLiveDock(): boolean {
  *  (plan §5.1: undock via the transient-berth detach). */
 function enumerateTransientBerths(): string[] {
   const out: string[] = [];
-  for (const [id, rec] of helmDoorRecords()) {
+  for (const [id, rec] of readAllDoorsWithPhysical()) {
     if (rec.paired !== true) continue;
     if (!isTransientBerth(rec)) continue;
     out.push(id);

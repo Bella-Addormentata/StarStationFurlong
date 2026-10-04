@@ -49,9 +49,10 @@ export interface StationDestination {
 export interface StationDirectory {
   /** Every known station. The FIRST is home — where an unknown id resolves. */
   stations(): readonly StationDestination[];
-  /** The station the ship's room belongs to right now — the one its docks
-   *  lead into, or (floating free) the ship's own one-module "station" — or
-   *  null when that is not known. Never a destination. */
+  /** The station the ship's room is docked at right now: the one its live
+   *  docks lead into. Null with no live dock (floating free, the ship's own
+   *  one-module station is `own`, never `here`) or when that is not known.
+   *  Never a destination. */
   here?(): string | null;
   /** The ship's OWN one-module station, when its room is listed as one (a
    *  module docked only by transient docks is its own atlas group) — never a

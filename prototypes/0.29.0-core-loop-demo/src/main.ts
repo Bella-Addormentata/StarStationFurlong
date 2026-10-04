@@ -150,6 +150,7 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readAllDoorsWithPhysical,
   readDoor,
   subscribeDoors,
   transactDoorWrites,
@@ -1181,13 +1182,14 @@ async function joinRoom(
  * 🛰️ #30 SH3: the station a ship's room belongs to right now, from its LIVE
  * docks — the room a dock leads into — never from the atlas alone: atlas
  * edges outlive a cast-off, so the component around the ship's own room can
- * still hold the station it left. Floating free, the ship counts only as its
- * own one-module station (what the directory must never offer as a
- * destination); anything else the atlas says about it is stale.
+ * still hold the station it left. Floating free there is none: the ship's
+ * own one-module station (never a destination) reaches the directory as
+ * `own`, and anything else the atlas says about it is stale.
  */
 function shipStationHere(roomId: string): string | null {
   if (!roomId) return null;
-  for (const [, rec] of readAllDoors()) {
+  // Every real door, past the snapshot's cap: a flood must not hide a dock.
+  for (const [, rec] of readAllDoorsWithPhysical()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     // Only a dock says where the ship is: a permanent gangway leads back into
     // the ship's own group (older docks carry only the two-half chain).
@@ -1802,7 +1804,7 @@ async function joinRoomAtEpoch(
     // station, so the backdrop keeps the right planet all the way.
     setRoomStationResolver((roomId) => {
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
-      const docked = dockedStationFor(roomId, readAllDoors().values());
+      const docked = dockedStationFor(roomId, readAllDoorsWithPhysical().values());
       if (docked) return docked;
       // A saved or built-in station's welcome room, or a module bolted into a
       // station by structure, stays put whatever it wears (a station-keeping
@@ -1814,7 +1816,7 @@ async function joinRoomAtEpoch(
     });
     // 🚀 The same rule gates the helm: a station room never departs, and never
     // takes its location from the ship's flight record.
-    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readAllDoors().values()));
+    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readAllDoorsWithPhysical().values()));
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());

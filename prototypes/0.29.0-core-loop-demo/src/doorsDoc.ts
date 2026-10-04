@@ -22,7 +22,7 @@ import {
   clampExtBays, clampFlexBendFine, clampFlexStretch, clampExtStretch, type ConnectorSegment,
 } from './adapter';
 import type { DoorWall } from './doorLayoutDoc';
-import { normalizeWall } from './doorLayoutDoc';
+import { defaultDoorLayoutRecords, normalizeWall, readAllDoorLayout } from './doorLayoutDoc';
 
 /**
  * Serializable pairing record — one per door id. Plain JSON (no nested Y
@@ -336,6 +336,25 @@ export function readDoorFrom(doc: Y.Doc, doorId: string): DoorRecord | undefined
 /** ⚓ #163: readDoorFrom on the bound room doc. */
 export function readDoor(doorId: string): DoorRecord | undefined {
   return docAlive() ? readDoorFrom(boundDoc!, doorId) : undefined;
+}
+
+/**
+ * The bound room's door records: readAllDoors' snapshot, which keeps only its
+ * first MAX_PAIRINGS valid entries, plus each PHYSICAL door's own record,
+ * read by name past that cap (readDoor). Records a peer floods the map with
+ * can never hide a real door's connection from a check that must see every
+ * one (the helm's DEPART gate, where a ship is docked), and they only add
+ * records. The physical doors are the stored layout, else the four defaults
+ * (as the helm's port view draws them).
+ */
+export function readAllDoorsWithPhysical(): Map<string, DoorRecord> {
+  const out = readAllDoors();
+  const layout = readAllDoorLayout();
+  for (const id of (layout.size ? layout : defaultDoorLayoutRecords()).keys()) {
+    const rec = readDoor(id);
+    if (rec) out.set(id, rec);
+  }
+  return out;
 }
 
 /** ⚓ #163: write one door record into ANY doc (see readAllDoorsFrom) — the
