@@ -579,14 +579,18 @@ export function isTowing(roomId: string, realMs: number): boolean {
 /** Does a move hold this dock still? A tug's tow under way (either end), or
  *  either end belonging to a station between planets: every ship docked to
  *  it rides along, and none may leave or join it until it arrives. Before a
- *  thruster move leaves, and after any move arrives, docks work as usual. */
+ *  thruster move leaves, and after any move arrives, docks work as usual.
+ *  A latest move that is an arrival's pin is judged by the journey it
+ *  settles (flightOf): at an earlier moment (a release's own stamp), that
+ *  journey may have been under way. */
 export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
   if (towHoldsDock(roomIds, realMs)) return true;
   return roomIds.some((id) => {
     if (!id) return false;
     const station = stationForRoom(id);
-    const move = station ? latestMoveOf(station) : null;
-    return !!move && stationInTransit({ move }, realMs);
+    const latest = station ? latestMoveOf(station) : null;
+    const flight = latest ? flightOf(latest) : null;
+    return !!flight && stationInTransit({ move: flight }, realMs);
   });
 }
 
@@ -595,8 +599,9 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
  *  those its planet summaries gossip (booked in another room of its
  *  station, or a tug's), count with every move known here, so a ship that
  *  has not heard of one yet still joins no station between planets: a tow
- *  that room is the tug of, ahead or under way, or a flight of its station
- *  under way at `realMs`. Its station is the one this install lists the
+ *  that room is the tug of, ahead or under way at `realMs`, or a flight of
+ *  its station under way then (an arrival's pin stands for the journey it
+ *  settles: flightOf). Its station is the one this install lists the
  *  room at, else the one whose welcome room it is, else the one its own
  *  bookings name (a move is booked from a room of its station, a tow from
  *  the tug; a pin is no booking: every game writes them for each station it
@@ -609,18 +614,22 @@ export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number):
   // The bound room's moves count too: all of them, or the lock holds.
   if (!complete || !roomMovesKnown()) return true;
   const all = [...there, ...heard, ...roomOwn(), ...readRememberedMoves()];
-  const standing = standingMoves(all, all);
-  if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
+  // Every flight known counts, not only each station's latest: a release is
+  // judged at its own stamp, and an arrival's pin (it carries the journey it
+  // settles: flightOf), a tow's cancel (rejectionOf) or a later move since
+  // leaves the station, and its tug, on the flight it was on then. A cancel,
+  // or a move beaten or outbid, never flew (superseded).
+  const flew = (m: StationMove, holds: (flight: StationMove) => boolean): boolean => {
+    const flight = flightOf(m);
+    return !!flight && holds(flight) && !superseded(m, all);
+  };
+  if (roomId && all.some((m) => flew(m, (f) => f.mode === 'tug' && f.tugRoomId === roomId && isMoveActive(f, realMs)))) return true;
   const station = roomId ? stationForRoom(roomId) : null;
   const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
   const ofRoom = (m: StationMove) => (station
     ? moveBelongsTo(m, station)
     : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !isPinMove(o) && !towedBy(o) && sameStation(o, m)));
-  // Every flight of its station counts, not only its latest: a release is
-  // judged at its own stamp, and an arrival's pin or a tow's cancel since
-  // (rejectionOf) leaves the station on the flight it was on then. A move
-  // beaten or outbid never flew (superseded).
-  return all.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs) && !superseded(m, all));
+  return all.some((m) => flew(m, (f) => ofRoom(f) && stationInTransit({ move: f }, realMs)));
 }
 
 /** Remember the standing moves a room's own doc holds (a far room's), and
@@ -684,8 +693,12 @@ export function towHoldsDock(roomIds: string[], realMs: number): boolean {
   const ids = new Set(roomIds.filter(Boolean));
   if (ids.size === 0) return false;
   if (!roomMovesKnown()) return true;
-  return knownStanding().some((m) =>
-    m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
+  // A standing arrival's pin stands for the tow it settles (flightOf), which
+  // a moment before that arrival still holds; a cancel holds nothing.
+  return knownStanding().some((m) => {
+    const flight = flightOf(m);
+    return !!flight && flight.mode === 'tug' && !!flight.tugRoomId && ids.has(flight.tugRoomId) && isMoveActive(flight, realMs);
+  });
 }
 
 /** Each station's standing move among everything known here: the bound
@@ -1351,6 +1364,14 @@ export function roomMovesKnown(): boolean {
 /** The move a record stands for: a pin's settled move, else itself. */
 function flownOf(m: StationMove): StationMove {
   return m.settles ?? m;
+}
+
+/** The flight a record says its station made (or will): a move itself, or
+ *  the journey an arrival's pin settles (the pin carries it, so a pin
+ *  written since never hides that flight from a check judged at an earlier
+ *  moment); null for a cancel, whose tow never flew. */
+function flightOf(m: StationMove): StationMove | null {
+  return isCancelPin(m) ? null : flownOf(m);
 }
 
 /** Is this move out of the running: beaten by a concurrent move of its

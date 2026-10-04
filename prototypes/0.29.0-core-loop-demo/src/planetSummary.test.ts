@@ -687,6 +687,38 @@ describe('learned stations', () => {
     }
   });
 
+  it('read the stations heard of without asking which ship entries stay, so listing stations never re-enters itself', () => {
+    const now = Date.now();
+    let depth = 0;
+    let deepest = 0;
+    bindPlanetSummaryDoc(new Y.Doc(), install(null, {
+      currentRoom: () => 'room-ship',
+      // As main.ts's: whether this room is a station's is read off the station list.
+      notShipRoom: () => {
+        depth++;
+        deepest = Math.max(deepest, depth);
+        try { listStations(); } finally { depth--; }
+        return null;
+      },
+    }));
+    installKnownPlacesResolver();
+    try {
+      // This room's own ship entry, long quiet (kept only for the room it
+      // stands in), beside a station heard of around Aris.
+      store.set('ssf-planet-summary', JSON.stringify({
+        stations: { 'room-c': summary({ welcomeRoomId: 'room-c', name: 'C', planetId: ARIS, orbitSlot: 4, updatedAt: now - 1000 }) },
+        ships: { 'room-ship': { roomId: 'room-ship', name: 'FERRY', planetId: ARIS, status: 'docked', updatedAt: now - 2 * SHIP_STALE_MS } },
+      }));
+      deepest = 0;
+      expect(knownSlotsAround(ARIS, [], now).taken.has(4)).toBe(true);
+      expect(deepest).toBe(0);
+      // The store still keeps that entry for the room it stands in.
+      expect(readStore(now).ships['room-ship']).toBeDefined();
+    } finally {
+      setKnownPlacesResolver(null);
+    }
+  });
+
   it('carry new record fields through to the record they register', () => {
     const move = { toPlanetId: ARIS };
     expect(learnedRecord(summary({ ext: { move } }))).toMatchObject({ move, id: 'shared:room-hab', orbitSlot: 2 });

@@ -1331,17 +1331,35 @@ export function refreshTrims(store: Store = readStore()): void {
 
 let knownPlacesCache: { text: string | null; places: KnownPlace[] } | null = null;
 
+/** The stored station summaries alone (readStore's station half), junk
+ *  dropped, capped. Reading them asks nothing of which ship entries are kept
+ *  (shipKept), whose callbacks may list stations themselves (main.ts
+ *  notShipRoom reads isStationRoom): the station list reads the stations
+ *  heard of through here, so it never re-enters itself. */
+function readStoredStations(text: string | null, now = Date.now()): StationSummary[] {
+  let raw: unknown;
+  try { raw = text ? JSON.parse(text) : null; } catch { return []; }
+  if (!isPlainObject(raw) || !isPlainObject(raw.stations)) return [];
+  const out: StationSummary[] = [];
+  for (const [k, v] of Object.entries(raw.stations)) {
+    if (out.length >= MAX_STATIONS) break;
+    const s = cleanStationSummary(v, now);
+    if (s && s.welcomeRoomId === k) out.push(s);
+  }
+  return out;
+}
+
 /** Install the resolver stations.ts reads the stations heard of from: every
  *  stored summary's place and latest move, around every planet (most are
  *  never listed here, as only this planet's register), so slot picks and
  *  arrivals count the slots they hold or are bound for. Read again only
- *  when the store changes. */
+ *  when the store changes, and only the stations (readStoredStations). */
 export function installKnownPlacesResolver(): void {
   setKnownPlacesResolver(() => {
     let text: string | null;
     try { text = localStorage.getItem(STORE_KEY); } catch { return []; }
     if (knownPlacesCache?.text === text) return knownPlacesCache.places;
-    const places = Object.values(readStore().stations).map((s): KnownPlace => ({
+    const places = readStoredStations(text).map((s): KnownPlace => ({
       welcomeRoomId: s.welcomeRoomId,
       planetId: s.planetId,
       orbitSlot: s.orbitSlot,

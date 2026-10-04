@@ -755,6 +755,16 @@ describe('the station list follows a move', () => {
     expect(dockLockedByMove(['ship-room'], mid)).toBe(false);
     expect(dockLockedByMove([room], move.arriveAt)).toBe(false);
   });
+
+  it('judges a dock at a moment during a journey by that journey, though the station\'s latest is the pin of its arrival', () => {
+    const move = moveTo();
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? pinOf(move) : null));
+    const room = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const mid = (move.departAt + move.arriveAt) / 2;
+    expect(dockLockedByMove([room], mid)).toBe(true);
+    expect(dockLockedByMove([room], move.departAt - 1)).toBe(false);
+    expect(dockLockedByMove([room], move.arriveAt)).toBe(false);
+  });
 });
 
 describe('the record in the room doc and on this install', () => {
@@ -1020,15 +1030,19 @@ describe('moves between installs', () => {
     rememberMove(tow);
     expect(roomDocLockedByMove(farDoc({ ...summary, move: tow }), 'yard-annex', midTow)).toBe(false);
     // An arrival's pin since leaves a station on the flight it was on: a
-    // release made then is judged by that flight, not by the pin.
+    // release made then is judged by that flight, which the pin carries,
+    // whether this install ever learned the flight itself or not.
     store.delete('ssf-station-moves');
-    rememberMove(first);
     const pin: StationMove = {
       ...first, fromPlanetId: first.toPlanetId, fromSlot: first.toSlot, departAt: first.arriveAt, arriveAt: first.arriveAt + 1,
       fuel: 0, fuelDrawn: 0, bookedAt: first.arriveAt + 5, settles: first,
     };
     expect(isStationMove(pin)).toBe(true);
     const pinned = farDoc({ ...summary, move: pin });
+    expect(roomDocLockedByMove(pinned, 'yard-annex', mid)).toBe(true);
+    expect(roomDocLockedByMove(pinned, 'yard-annex', first.departAt - 1)).toBe(false);
+    expect(roomDocLockedByMove(pinned, 'yard-annex', first.arriveAt + 10)).toBe(false);
+    rememberMove(first);
     expect(roomDocLockedByMove(pinned, 'yard-annex', mid)).toBe(true);
     expect(roomDocLockedByMove(pinned, 'yard-annex', first.arriveAt + 10)).toBe(false);
   });
@@ -1686,6 +1700,22 @@ describe('tugs: a torch tow', () => {
     expect(towHoldsDock(['station-room', 'tug-room'], NOW + 1)).toBe(true);
     expect(towHoldsDock(['station-room', 'other-room'], NOW + 1)).toBe(false);
     expect(towHoldsDock(['tug-room'], plan.move.arriveAt)).toBe(false);
+  });
+
+  it('holds the tow\'s dock at a moment during it by the tow its arrival\'s pin settles, never by its cancel', () => {
+    const plan = planStationTow(towCtx(), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    const midTow = Math.floor((tow.departAt + tow.arriveAt) / 2);
+    bindStationMoveDoc(new Y.Doc());
+    // Only the pin is known here: it carries the tow.
+    expect(rememberMove(pinOf(tow), tow.arriveAt + 1)).toBe(true);
+    expect(towHoldsDock(['station-room', 'tug-room'], midTow)).toBe(true);
+    expect(towHoldsDock(['tug-room'], tow.arriveAt)).toBe(false);
+    // The tow's cancel: it never flew, so it held nothing.
+    store.delete('ssf-station-moves');
+    expect(rememberMove(rejectionOf(tow)!, midTow)).toBe(true);
+    expect(towHoldsDock(['tug-room'], midTow)).toBe(false);
   });
 
   it('refuses to price a tow of a station whose layout this ship cannot see', () => {

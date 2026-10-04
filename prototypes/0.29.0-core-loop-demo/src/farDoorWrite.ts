@@ -48,7 +48,8 @@ import { rememberMovesIn, roomDocLockedByMove } from './stationMove';
  * release (read only). Returns what to tell the player and whether anything
  * was written (only a write needs an ack). `farRoomId` is the room the doc
  * is (by default, the one its address names), and `nowMs` the moment a DOCK
- * is judged at (an UNDOCK or a release goes by its own stamp).
+ * is judged at (an UNDOCK or a release goes by its own stamp, never later
+ * than `nowMs`: releaseMoment).
  */
 export function applyFarDockRequest(
   doc: Y.Doc,
@@ -60,9 +61,8 @@ export function applyFarDockRequest(
   if (req.kind === 'release') {
     // 🚚 A legacy berth's far end is not this end's to change (DETACH lets
     // go of this end only), but its room may know of a move the asking
-    // install has not heard of: judged as an UNDOCK is, at the release's
-    // own stamp.
-    return roomDocLockedByMove(doc, farRoomId, req.undockedAt)
+    // install has not heard of: judged as an UNDOCK is (releaseMoment).
+    return roomDocLockedByMove(doc, farRoomId, releaseMoment(req.undockedAt, nowMs))
       ? { result: { ok: false, reason: 'moving' }, wrote: false }
       : { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
   }
@@ -79,10 +79,10 @@ export function applyFarDockRequest(
     // 🚚 Nor does a station between planets let go of a ship, by the moves
     // booked in this room too (as for a DOCK below): one the asking install
     // has not heard of yet would set the ship loose mid-transfer. Judged at
-    // the release's own stamp, so one made before its station left still
-    // lands however late it gets here; a take-back of a DOCK this client
-    // never completed (onlyDockedAt) is never held.
-    if (req.onlyDockedAt === undefined && roomDocLockedByMove(doc, farRoomId, req.undockedAt)) {
+    // the release's own moment (releaseMoment), so one made before its
+    // station left still lands however late it gets here; a take-back of a
+    // DOCK this client never completed (onlyDockedAt) is never held.
+    if (req.onlyDockedAt === undefined && roomDocLockedByMove(doc, farRoomId, releaseMoment(req.undockedAt, nowMs))) {
       return { result: { ok: false, reason: 'moving' }, wrote: false };
     }
     writeDoorRecordTo(doc, farDoor, patch.record);
@@ -118,6 +118,16 @@ export function applyFarDockRequest(
     fitDockPortIn(doc, req.farDoor);
   });
   return { result: { ok: true, detail: 'written' }, wrote: true };
+}
+
+/** 🚚 The moment a release (an UNDOCK, or a legacy berth's) is judged at:
+ *  its own stamp, so one made before its station left still lands however
+ *  late it gets here, but never later than `nowMs`. A stamp ahead of now (a
+ *  door stamp is any positive time, and stampAfter keeps a dock's stamped
+ *  ahead) is judged as it lands: a station between planets now holds it,
+ *  whenever it says it arrives. Its record keeps its own stamp. */
+function releaseMoment(undockedAt: number, nowMs: number): number {
+  return Math.min(undockedAt, nowMs);
 }
 
 /** What farDockPatch needs to know about the far door besides its record. */
