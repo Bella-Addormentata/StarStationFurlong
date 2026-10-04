@@ -537,11 +537,20 @@ publish a victim's address under its own id as surely as it could write one
 into a room record, and mDNS and a relay are no better — so such a route is
 dialled only for a fetch the viewer asked for (the FETCH button, the
 library's explicit resolution of a seeder nobody is connected to), under a
-per-id and a global rate limit with exponential backoff, one QUIC Initial
-per attempt and no retry storm. The most a victim can be made to receive is
-a few datagrams a minute from each viewer who chose to fetch — the standing
-cost of any id-to-address lookup on a public DHT, iroh's included — which
-is bounded here and never claimed closed. A viewer's node never sends an
+per-id, a per-address and a global rate limit with exponential backoff and
+no retry storm — and the bound is on BYTES SENT, never on attempts
+counted: a QUIC connect is not one datagram, since loss recovery
+retransmits the Initial on every probe timeout until the handshake gives
+up, so the node budgets what actually leaves its socket per destination
+address — a handshake lifetime of three seconds (the dial abandoned at
+that deadline, not at the transport's own idle timeout), at most four
+handshake datagrams of 1 200 bytes within it (the Initial and its
+probe-timeout retransmissions, counted at the socket, the dial cut at the
+fourth), and at most two attempts a minute per address. The most a
+victim's address can be made to receive is eight datagrams, under 10 KB,
+a minute from each viewer who chose to fetch, whatever the handshake's
+timers do — the standing cost of any id-to-address lookup on a public
+DHT, iroh's included — which is bounded here and never claimed closed. A viewer's node never sends an
 automatic handshake to an address anyone merely wrote down, in a room
 record or a DHT record alike. A provider reachable by neither class is not
 reachable, and the record says who else to ask: every node that
@@ -922,10 +931,16 @@ from the source's announced tier (an audio frame's ceiling is its tier's
 payload bound — the tier's bitrate over 20 ms with twofold VBR headroom:
 160 bytes for the 32 kbps voice tier, 640 for the 128 kbps music tier —
 plus the 137-byte overhead, so 297 and 777 bytes; each chunk of a batch is
-held to the same bound, and the sender packs a batch only as far as the
-datagram size the session negotiated allows (`maxDatagramSize`, about
-1 200 bytes on a typical path): three voice frames always, music frames
-as they fit; a video frame one WebTransport unidirectional
+held to the same bound, and the sender packs a batch to a ceiling the whole
+PATH carries, never to the size its own session negotiated
+(`maxDatagramSize` speaks for the browser's hop alone, and a hub forwards
+ciphertext as it is, unable to re-batch what it cannot open, so a batch
+that fitted the first hop would be dropped at a smaller one): 1 100 bytes
+of datagram payload, the protocol's fixed ceiling, under the 1 200-byte
+UDP payload every QUIC path must carry (RFC 9000 §14.1) less the packet's
+own headers and the node's envelope at any hop — three voice frames (630
+bytes with the overhead) always, a music frame (777) alone; a video frame
+one WebTransport unidirectional
 stream of its own, per the wire path above, read only up to the tier's
 frame-size ceiling and verified whole before it is forwarded — never
 fragmented into datagrams, which would need fragment ids, loss handling
@@ -1180,15 +1195,23 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   since a node id is free to mint (§4), a map that grew with every id a
   member minted would never shrink, and a bound per id would bound
   nothing: every seed announcement carries the seeder's wall-clock `at`,
-  and a reader accepts it only inside a WINDOW on its own clock — refused
-  when more than a day older than the reader's clock, and refused when
-  more than five minutes ahead of it, since an announcement dated the far
-  future would never grow too old — a coarse bound, in days, on how long a
-  signed announcement stays replayable, never a comparison that moves
-  playback; a mark lives for the whole window — until a day past the
-  newest `at` it accepted, when every announcement it could refuse is
-  refused by age anyway — and is never dropped sooner, so a replay fails
-  on the mark or on its age and on nothing else; what the mark guards is
+  and a reader accepts it only inside a WINDOW on a clock of its own that
+  ONLY RISES — the FLOOR: the highest wall-clock reading the reader has
+  persisted, raised as the clock advances and never lowered, so a clock
+  stepped forward by mistake and corrected back expires nothing twice —
+  refused when more than a day older than the floor, and refused when
+  more than five minutes ahead of the clock, since an announcement dated
+  the far future would never grow too old — a coarse bound, in days, on
+  how long a signed announcement stays replayable, never a comparison that
+  moves playback; a mark lives for the whole window — until the floor
+  stands a day past the newest `at` it accepted, when every announcement
+  it could refuse is refused by age under every later correction — and is
+  never dropped sooner, so a replay fails on the mark or on its age and on
+  nothing else (the cost of a clock stepped a long way forward and back is
+  that honest seeds read as too old until true time catches the floor up,
+  said on the library pane as the clock standing behind the floor —
+  bounded by the step, and the smaller cost beside a withdrawal undone;
+  the seed's own day above runs on the same floor); what the mark guards is
   an honest seeder's withdrawal (the `library-unseed` below), which an old
   seed replayed after it would undo — a seeder that lies about `at` or
   signs anew guards nothing by replaying, since it can announce afresh at
@@ -1288,10 +1311,17 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   Heads form one chain of their own: each is signed by the authority that
   makes it (the deed holder for a key-set change; for a transfer, the new
   holder, citing the chain spend that made it so), numbers in sequence,
-  names its predecessor by hash, and COMMITS the history it inherits — for
-  every earlier writer, the hash of that writer's terminal accepted op —
-  so an op under a superseded head is accepted only if it lies on the
-  chain that ends at the committed tip. A newly signed op with an old
+  names its predecessor by hash, and COMMITS the history it inherits — the
+  terminal accepted op of every earlier writer, as ONE hash: the root of a
+  Merkle tree over the (writer key → tip hash) pairs, sorted by key, the
+  pairs themselves travelling beside the head and any one of them provable
+  against the root by its path, so a head stays a few hundred bytes
+  however many holders and co-hosts the deed has had, a tip is looked up
+  by one proof, and replaying the chain costs a logarithm per op and never
+  the square of the writers; a writer whose tip an earlier head already
+  committed is carried forward unchanged, the tree updated and never
+  rebuilt — so an op under a superseded head is accepted only if it lies
+  on the chain that ends at the committed tip. A newly signed op with an old
   sequence is off that chain, and so is a second op at a sequence the
   chain already holds, whoever signs them and whenever a node syncs; a
   sequence number alone would commit nothing, since a former owner could
@@ -1323,7 +1353,9 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
 IPv8 is a UDP overlay of communities keyed by public key, bootstrapped by
 introduction. py-ipv8's shipped `configuration.py` loads `DiscoveryCommunity`,
 `HiddenTunnelCommunity` and `DHTDiscoveryCommunity` by default; bootstrap is
-13 raw IP:port entries at TU Delft plus `dispersy1–4.tribler.org`; tunnel
+13 raw IP:port entries at TU Delft plus seven DNS names,
+`dispersy1–4.tribler.org` and `dispersy1–3.st.tudelft.nl` (ports 6421–6424
+by number); tunnel
 defaults are `max_circuits: 1`, `max_joined_circuits: 100` (every default node
 relays strangers' circuits), `max_time: 600`, `max_time_inactive: 20`,
 `max_traffic: 250 MiB`. No Rust implementation exists: `ipv8-rust-tunnels` is
