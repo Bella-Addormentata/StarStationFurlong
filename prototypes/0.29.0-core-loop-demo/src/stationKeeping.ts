@@ -100,9 +100,10 @@
  * (isNewerTrim). A burn replays after every burn its writer knew of, in
  * its room's log or along the trim it went on from, even one stamped ahead
  * of the writer's clock (TrimBurn.order, OrbitTrim.place), and each trim
- * knows whose burns its line holds (OrbitTrim.seen), so no burn lands twice
- * through a trim carried past it, whenever that burn reaches the log, even
- * after a REFUEL settled that trim: it pays and fires, and the orbit stays.
+ * knows whose burns its line holds (OrbitTrim.seen, and past its last
+ * sixteen writers OrbitTrim.seenFloor), so no burn lands twice through a
+ * trim carried past it, whenever that burn reaches the log, even after a
+ * REFUEL settled that trim: it pays and fires, and the orbit stays.
  *
  * Pure except for the doc binding. Pinned by stationKeeping.test.ts.
  */
@@ -288,11 +289,17 @@ export interface OrbitTrim {
   place?: number;
   /** Whose burns that line holds, and how far: for each writer (the client a
    *  burn's log key names), the latest place of its burns along the line,
-   *  in writer order, the MAX_SEEN latest. A burn its room's log gets only
-   *  after a trim that holds it (one carried back into the room, or one a
-   *  REFUEL settled first) pays and fires, but moves the orbit no further.
-   *  Left out, none. */
+   *  in writer order, the MAX_SEEN latest (the rest fold into `seenFloor`).
+   *  A burn its room's log gets only after a trim that holds it (one
+   *  carried back into the room, or one a REFUEL settled first) pays and
+   *  fires, but moves the orbit no further. Left out, none. */
   seen?: [number, number][];
+  /** The latest place of the burns that line holds from writers `seen` no
+   *  longer names: a burn placed at or before it counts as held, whichever
+   *  writer its log key names, so a forgotten writer's burn never lands
+   *  twice, and an independent one placed there that reaches the log that
+   *  late pays and fires without moving the orbit. Left out, none. */
+  seenFloor?: number;
 }
 
 /** One burn of the stick, as the log keeps it. Plain JSON. */
@@ -382,7 +389,8 @@ const MAX_TRIM_SEQ = 2 ** 40;
 const MAX_ORDER = MAX_AT_MS + 2 * MAX_LOG;
 
 /** A trim names at most this many writers whose burns its line holds
- *  (OrbitTrim.seen): the latest. */
+ *  (OrbitTrim.seen): the latest. The rest fold into its floor
+ *  (OrbitTrim.seenFloor). */
 const MAX_SEEN = 16;
 /** A writer is a Yjs client id: a uint32. */
 const MAX_CLIENT = 2 ** 32 - 1;
@@ -423,6 +431,13 @@ export function sameBase(a: StationOrbit | undefined, b: StationOrbit | undefine
   return a.radiusKm === b.radiusKm && a.phase0 === b.phase0;
 }
 
+/** Is `t` a trim on the orbit a burn names (its planet, slot and base), so
+ *  the line the burn goes on from? One on the slot at another altitude is
+ *  another orbit's line. */
+function onOrbit(t: OrbitTrim | null, b: Pick<TrimBurn, 'planetId' | 'slot' | 'base'>): t is OrbitTrim {
+  return t !== null && t.planetId === b.planetId && t.slot === b.slot && sameBase(t.base, b.base);
+}
+
 /** The untrimmed orbit a basis names. */
 function basisOrbit(b: { planetId: string; slot: number; base?: StationOrbit }): CircularOrbit {
   return baseOrbit({ planetId: b.planetId, orbitSlot: b.slot, orbit: b.base });
@@ -455,14 +470,22 @@ export function isOrbitTrim(v: unknown): v is OrbitTrim {
     && (r.seq === undefined || (typeof r.seq === 'number' && Number.isInteger(r.seq) && r.seq >= 0 && r.seq <= MAX_TRIM_SEQ))
     && (r.place === undefined
       || (typeof r.place === 'number' && r.place > (r.at as number) && r.place <= MAX_ORDER))
-    && (r.seen === undefined || isSeenList(r.seen));
+    && (r.seen === undefined || isSeenList(r.seen, (r.place ?? r.at) as number))
+    && (r.seenFloor === undefined || isLinePlace(r.seenFloor, (r.place ?? r.at) as number));
 }
 
-/** Shape guard for the writers a trim's line holds (OrbitTrim.seen). */
-function isSeenList(v: unknown): boolean {
+/** Shape guard for the writers a trim's line holds (OrbitTrim.seen), each
+ *  placed no later than the line itself. */
+function isSeenList(v: unknown, linePlace: number): boolean {
   return Array.isArray(v) && v.length <= MAX_SEEN && v.every((e: unknown) => Array.isArray(e) && e.length === 2
     && Number.isInteger(e[0]) && e[0] >= 0 && e[0] <= MAX_CLIENT
-    && typeof e[1] === 'number' && e[1] >= ORBIT_EPOCH_MS && e[1] <= MAX_ORDER);
+    && isLinePlace(e[1], linePlace));
+}
+
+/** A place along a line: a number from the orbits' epoch to the line's own
+ *  place (OrbitTrim.place, else its time). */
+function isLinePlace(v: unknown, linePlace: number): boolean {
+  return typeof v === 'number' && v >= ORBIT_EPOCH_MS && v <= linePlace;
 }
 
 /** Shape guard for a burn off the wire. */
@@ -512,32 +535,42 @@ export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
       || (Array.isArray(r.fired) && r.fired.length <= MAX_SETTLED_FIRED && r.fired.every(isFiredBurn)));
 }
 
-/** A trim's orbit fields, its count of burns, its place and its writers
- *  only (a record from before the log also carries its fuel, which the
- *  meter reads apart). */
+/** A trim's orbit fields, its count of burns, its place, its writers and
+ *  their floor only (a record from before the log also carries its fuel,
+ *  which the meter reads apart). */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
   const out: OrbitTrim = { ...basisFields(t), dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
   if (t.seq !== undefined) out.seq = t.seq;
   if (t.place !== undefined) out.place = t.place;
-  if (t.seen !== undefined) out.seen = lineWriters(t.seen);
+  if (t.seen !== undefined || t.seenFloor !== undefined) {
+    const line = lineWriters(t.seen ?? [], t.seenFloor);
+    if (t.seen !== undefined) out.seen = line.seen;
+    if (line.floor !== undefined) out.seenFloor = line.floor;
+  }
   return out;
 }
 
 /** A line's writers (OrbitTrim.seen) as a trim keeps them: one entry per
- *  writer at its latest place, the MAX_SEEN latest, in writer order. */
-function lineWriters(entries: Iterable<readonly [number, number]>): [number, number][] {
+ *  writer at its latest place, the MAX_SEEN latest, in writer order; and
+ *  their floor (OrbitTrim.seenFloor), raised to the latest place of any it
+ *  leaves out. */
+function lineWriters(
+  entries: Iterable<readonly [number, number]>,
+  floor?: number,
+): { seen: [number, number][]; floor?: number } {
   const latest = new Map<number, number>();
   for (const [writer, place] of entries) latest.set(writer, Math.max(place, latest.get(writer) ?? place));
-  return [...latest]
-    .sort((a, b) => b[1] - a[1] || a[0] - b[0])
-    .slice(0, MAX_SEEN)
-    .sort((a, b) => a[0] - b[0]);
+  const byPlace = [...latest].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+  for (const [, place] of byPlace.slice(MAX_SEEN)) floor = Math.max(place, floor ?? place);
+  return { seen: byPlace.slice(0, MAX_SEEN).sort((a, b) => a[0] - b[0]), ...(floor === undefined ? {} : { floor }) };
 }
 
-/** How far a trim's line holds a writer's burns (OrbitTrim.seen), or
- *  -Infinity. */
+/** How far a trim's line holds a writer's burns: its place among the
+ *  writers (OrbitTrim.seen), or the floor of those the line no longer names
+ *  (OrbitTrim.seenFloor) when that is later, or -Infinity. */
 function seenAt(trim: OrbitTrim, writer: number): number {
-  return trim.seen?.find(([client]) => client === writer)?.[1] ?? Number.NEGATIVE_INFINITY;
+  const named = trim.seen?.find(([client]) => client === writer)?.[1] ?? Number.NEGATIVE_INFINITY;
+  return Math.max(named, trim.seenFloor ?? Number.NEGATIVE_INFINITY);
 }
 
 /** Only the fields a fired burn has — what a settlement keeps. */
@@ -707,8 +740,7 @@ export type TrimPlan = { ok: true; burn: TrimBurn; trim: OrbitTrim } | { ok: fal
  * its line than the trim it found (OrbitTrim.seq).
  */
 export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planetId' | 'slot' | 'base' | 'dir' | 'at'>): OrbitTrim | null {
-  const current = before && before.planetId === burn.planetId && before.slot === burn.slot
-    && sameBase(before.base, burn.base) ? before : null;
+  const current = onOrbit(before, burn) ? before : null;
   const base = basisOrbit(burn);
   const radius = current?.dRadiusKm ?? 0;
   const offset = slotOffsetAt(base, current, burn.at);
@@ -833,9 +865,10 @@ function runBurns(
     const place = placeOf(burn);
     // One the orbit's line already holds (a trim carried back into the room,
     // or a REFUEL's, got it before this log did) has paid and fired, but
-    // moves the orbit no further (OrbitTrim.seen). Places at their bound
-    // tell no burns apart, so one placed there always moves it.
-    if (own && writer !== undefined && place < MAX_ORDER && seenAt(own, writer) >= place) {
+    // moves the orbit no further (OrbitTrim.seen, seenFloor). The trim kept
+    // for the slot at another altitude holds none of its burns. Places at
+    // their bound tell no burns apart, so one placed there always moves it.
+    if (onOrbit(own, burn) && writer !== undefined && place < MAX_ORDER && seenAt(own, writer) >= place) {
       fired.push(applied);
       continue;
     }
@@ -848,9 +881,16 @@ function runBurns(
       // and this burn's: a burn that goes on from it replays after them all.
       const linePlace = Math.max(trimPlace(before), place);
       if (linePlace > after.at) after.place = linePlace;
-      // And it holds every burn that one held, and this one.
-      const seen = lineWriters([...(before?.seen ?? []), ...(writer === undefined ? [] : [[writer, place] as const])]);
-      if (seen.length > 0) after.seen = seen;
+      // And it holds every burn that one held, and this one: past the last
+      // MAX_SEEN writers, under their floor. A line applyBurn started afresh
+      // (that one was another orbit's) holds this burn alone.
+      const prior = onOrbit(before, burn) ? before : null;
+      const line = lineWriters(
+        [...(prior?.seen ?? []), ...(writer === undefined ? [] : [[writer, place] as const])],
+        prior?.seenFloor,
+      );
+      if (line.seen.length > 0) after.seen = line.seen;
+      if (line.floor !== undefined) after.seenFloor = line.floor;
       trims.delete(key);
       trims.set(key, after);
       trim = after;
@@ -1288,7 +1328,7 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
       // stamped before then would apply, and fire, only then, so the stick
       // would never wait between them.
       const by = isBurnTime(now) ? now : Number.POSITIVE_INFINITY;
-      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? { ...heldTrim(t, t.last, by)!, seq: t.seq, place: trimPlace(t), seen: t.seen } : t);
+      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? { ...heldTrim(t, t.last, by)!, seq: t.seq, place: trimPlace(t), seen: t.seen, seenFloor: t.seenFloor } : t);
       return {
         trim: run.trim && held(run.trim),
         // Every orbit's trim too, so the next replay starts each from its own.
