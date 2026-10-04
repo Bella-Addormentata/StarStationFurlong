@@ -80,7 +80,8 @@ the sources that fail have to say so on the screen.
 // room doc, map 'tv', key tv:<itemId> — whole-value transacted writes, shape-checked reads
 {
   source: { kind: 'youtube', videoId }            // IFrame API: full sync
-        | { kind: 'archive', identifier, file }   // their embed (start-time sync) or mp4 (full sync)
+        | { kind: 'archive', identifier, file: '' | name }  // '' is their embed, the no-file case (start-time sync;
+                         // tvDoc isStartOnly); a name is that mp4 of the item (full sync) — one shape, read unambiguously
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
         | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id — the id
                          // ALONE, never dial hints: a viewer's node resolves the id to a route itself
@@ -652,14 +653,21 @@ explicit FETCH, and eviction never refills it. And the declared size, being
 peer-written, is only a hint, so every transfer runs under a hard byte
 ceiling of its own. Three numbers, kept apart: the cap and the budget say
 what fetches *without asking*; a fetch the viewer approved runs to the
-`approvedLimit` the FETCH button showed them (the declaration, bounded by
-the quota they have left), never to the cap, which would abort the very
-transfer they agreed to. An automatic fetch's ceiling is its declaration,
+`approvedLimit` the FETCH button showed them — the declaration itself,
+and the button is offered only when the declaration FITS the quota they
+have left, that whole amount reserved against the quota at the press and
+released if the transfer fails — never to the cap, which would abort the
+very transfer they agreed to, and never to a limit below the declaration,
+which would be a transfer that cannot succeed (bytes past the limit abort
+it, and a blob ending under it fails the size check below); a declaration
+larger than the remaining quota gets no FETCH button but the reason, NOT
+ENOUGH QUOTA with the two sizes, and nothing starts. An automatic fetch's
+ceiling is its declaration,
 already fitted under the cap and the remainder by the rule that let it
 start, so the ceiling never cuts short a transfer it began; an approved
-one's is its approved limit; received bytes past the ceiling abort the
-transfer, and a completed blob whose size differs from the declaration is
-rejected either way.
+one's is its declaration, reserved; received bytes past the ceiling abort
+the transfer, and a completed blob whose size differs from the
+declaration is rejected either way.
 Nobody in a room can spend another viewer's bandwidth or disk unasked. The same lane later carries room assets, ROMs and the
 station library (§7).
 
