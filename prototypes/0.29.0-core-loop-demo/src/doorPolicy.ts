@@ -138,9 +138,11 @@ let policyMap: Y.Map<unknown> | null = null;
 let requestsMap: Y.Map<unknown> | null = null;
 let grantsMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+/** ⚓🚦 Listeners to the policy records alone (subscribeDoorPolicyRecords). */
+const recordListeners = new Set<() => void>();
 
-function notify(): void {
-  for (const l of [...listeners]) {
+function notify(to: Set<() => void> = listeners): void {
+  for (const l of [...to]) {
     try { l(); } catch (e) { console.error('[doorPolicy] listener threw:', e); }
   }
 }
@@ -150,15 +152,26 @@ export function bindDoorPolicy(doc: Y.Doc): void {
   policyMap = doc.getMap('doorPolicy');
   requestsMap = doc.getMap('doorRequests');
   grantsMap = doc.getMap('doorGrants');
-  policyMap.observe(() => notify());
+  // The records' own listeners first: what they derive (the station's gates)
+  // is current by the time the rest repaint.
+  policyMap.observe(() => { notify(recordListeners); notify(); });
   requestsMap.observe(() => notify());
   grantsMap.observe(() => notify());
+  notify(recordListeners);
   notify();
 }
 
 export function subscribeDoorPolicy(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** ⚓🚦 A listener to the policy records alone (a port fitted, removed or
+ *  renumbered, a gate's access) and to a room being bound. A rights request
+ *  or grant changes no gate, so it never calls this one. */
+export function subscribeDoorPolicyRecords(listener: () => void): () => void {
+  recordListeners.add(listener);
+  return () => recordListeners.delete(listener);
 }
 
 function docAlive(): boolean {

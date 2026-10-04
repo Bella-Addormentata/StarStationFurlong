@@ -220,6 +220,7 @@ import {
 import {
   bindDoorPolicy,
   subscribeDoorPolicy,
+  subscribeDoorPolicyRecords,
   gateAccessIn,
   readDockGates,
   readUnnumberedPorts,
@@ -1797,10 +1798,11 @@ async function joinRoomAtEpoch(
     // draws the port itself; the exterior's atlas links follow the doors doc).
     subscribeDoorPolicy(() => {
       world?.dockingSystem?.refreshPolicyUI();
-      // ⚓🚦 A port fitted, removed or renumbered changes the station's gates.
-      harvestStationAtlas();
       refreshExteriorView();
     });
+    // ⚓🚦 A port fitted, removed or renumbered changes the station's gates; a
+    // rights request or grant changes none, so it harvests nothing.
+    subscribeDoorPolicyRecords(() => harvestStationAtlas());
     // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
     // appearing while the owner has the app open, an accept while the
     // volunteer watches).

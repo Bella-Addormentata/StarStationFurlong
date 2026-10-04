@@ -17,8 +17,12 @@ import {
   readDockGates,
   readUnnumberedPorts,
   readDoorPolicy,
+  removeDoorGrant,
+  subscribeDoorPolicy,
+  subscribeDoorPolicyRecords,
   writeDoorGrant,
   writeDoorPolicy,
+  writeDoorRequest,
 } from './doorPolicy';
 import {
   bindStationAtlasDoc,
@@ -67,6 +71,34 @@ function twoRoomStation(): void {
     gates: { south: 2, east: 3 },
   });
 }
+
+describe("who hears a change to the room's door policy", () => {
+  it('tells a policy-record listener of a port change, never of a rights request or grant', () => {
+    // The station's gates come from the policy records alone: a request or
+    // a grant must not set off a harvest of the whole room.
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    let records = 0;
+    let any = 0;
+    const offRecords = subscribeDoorPolicyRecords(() => { records++; });
+    const offAny = subscribeDoorPolicy(() => { any++; });
+    try {
+      writeDoorRequest('north', 'pub-a', 'Ada');
+      writeDoorGrant('north', 'pub-a', 'Ada');
+      removeDoorGrant('north', 'pub-a');
+      expect(records).toBe(0);
+      // The keypad still repaints for each of them.
+      expect(any).toBeGreaterThanOrEqual(3);
+      const before = any;
+      writeDoorPolicy('north', { passage: 'public', construction: 'owner', adapter: true, gate: 4 });
+      expect(records).toBe(1);
+      expect(any).toBe(before + 1);
+    } finally {
+      offRecords();
+      offAny();
+    }
+  });
+});
 
 describe('the gate on a dock port', () => {
   it('is kept only on a port, and only as a whole number in range', () => {
