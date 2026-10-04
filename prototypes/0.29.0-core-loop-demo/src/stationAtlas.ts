@@ -1441,10 +1441,12 @@ export function pushAtlasToDoc(): void {
       if (entry.bundled) continue;
       const existing = sharedMap!.get(entry.roomId);
       const known = isSharedAtlasEntry(existing) ? existing : null;
-      // ⚓🚦 A doc copy with no gates (an older client's, or a stub) gains the
-      // gates we know even when it is otherwise as new as ours: its own doors
-      // are kept, and only the gates are added.
-      const onlyGates = !!known && !isOwn && entry.gates !== undefined && known.gates === undefined
+      // ⚓🚦 A doc copy with no gate state (an older client's, or a stub)
+      // gains what we know of the gates, a list or that they are not known,
+      // even when it is otherwise as new as ours: its own doors are kept, and
+      // only the gate state is added.
+      const onlyGates = !!known && !isOwn && (entry.gates !== undefined || entry.gatesUnknown === true)
+        && known.gates === undefined
         && known.gatesUnknown !== true
         && known.updatedAt >= entry.lastSeen
         && Object.keys(known.doors).length >= doorIds.length;

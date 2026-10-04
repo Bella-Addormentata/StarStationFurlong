@@ -374,6 +374,24 @@ export function readUnnumberedPorts(): string[] {
   return out.sort();
 }
 
+/** ⚓🚦 The gates this room's ports hold, for picking a number no other port
+ *  has: readDockGates, or null when the port scan may have left a port out
+ *  (a flood of both peer-written maps cut it short, or more ports than a
+ *  gate read lists), whose number a pick could then repeat. */
+export function readGatesInUse(): Record<string, number> | null {
+  return docAlive() ? gatesInUseIn(boundDoc!) : null;
+}
+
+/** ⚓🚦 readGatesInUse for ANY doc (the far room's, during a DOCK). */
+export function gatesInUseIn(doc: Y.Doc): Record<string, number> | null {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return null;
+  const { ports, complete } = scanPorts(doc, doc.getMap('doorPolicy'));
+  if (!complete) return null;
+  const out: Record<string, number> = {};
+  for (const [doorId, p] of ports) if (p.gate !== undefined) out[doorId] = p.gate;
+  return out;
+}
+
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
 export function dockGatesIn(doc: Y.Doc): Record<string, number> {
   const out: Record<string, number> = {};

@@ -11,11 +11,13 @@ import {
   dockGatesIn,
   fitDockPortIn,
   gateAccessIn,
+  gatesInUseIn,
   hasDoorGrant,
   nextFreeGate,
   readGateAccess,
   readDockGates,
   readDockGatesIfComplete,
+  readGatesInUse,
   readUnnumberedPorts,
   readDoorPolicy,
   removeDoorGrant,
@@ -259,6 +261,27 @@ describe('the gate on a dock port', () => {
     expect(readDockGatesIfComplete()).toBeNull();
   });
 
+  it('reads the gates in use, unnumbered ports aside, only while it sees every port', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
+    expect(readGatesInUse()).toEqual({ north: 1 });
+    expect(gatesInUseIn(doc)).toEqual({ north: 1 });
+    // Past a flood of both maps the scan cannot tell whether it missed a port,
+    // so no list stands for a new number to be picked against.
+    for (let i = 0; i < 1100; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      doc.getMap('doorLayout').set(id, { nope: true });
+      doc.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner' });
+    }
+    expect(readDockGates()).toEqual({ north: 1 });
+    expect(readGatesInUse()).toBeNull();
+    expect(gatesInUseIn(doc)).toBeNull();
+  });
+
   it('takes the lowest number free in the station', () => {
     expect(nextFreeGate([])).toBe(1);
     expect(nextFreeGate([1, 2, 4])).toBe(3);
@@ -362,6 +385,30 @@ describe('gate gossip that doors alone would skip', () => {
     });
     bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
     expect(readAtlas()['room-b']?.gateAccess).toEqual({ south: { access: 'closed' } });
+  });
+
+  it("tells an equally new doc copy with no gate state that the gates are not known, keeping its doors", () => {
+    // Our record of room-b: a port there has no number yet.
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS',
+      doors: [
+        { doorId: 'west', targetSeed: seed('room-a'), transient: false },
+        { doorId: 'south', targetSeed: seed('ship-1'), transient: true },
+      ],
+      gates: null,
+    });
+    const doc = new Y.Doc();
+    // An older client's copy of room-b: as new as ours, as many doors, no gate state.
+    const door = { targetRoomId: 'room-a', farDoor: 'east', transient: false };
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: readAtlas()['room-b']!.lastSeen,
+      doors: { west: door, south: { targetRoomId: 'ship-1', transient: true } },
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    const b = doc.getMap('atlas').get('room-b') as { gates?: unknown; gatesUnknown?: unknown; doors: Record<string, unknown> };
+    expect(b.gatesUnknown).toBe(true);
+    expect(b.gates).toBeUndefined();
+    expect(b.doors.west).toEqual(door);
   });
 
   it("adds our gates to an equally new doc copy that has none, keeping its doors and size", () => {

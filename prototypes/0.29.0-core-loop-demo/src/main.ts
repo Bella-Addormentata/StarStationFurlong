@@ -222,8 +222,8 @@ import {
   subscribeDoorPolicy,
   subscribeDoorPolicyRecords,
   gateAccessIn,
-  readDockGates,
   readDockGatesIfComplete,
+  readGatesInUse,
   readUnnumberedPorts,
   readDoorPolicy,
   writeDoorPolicy,
@@ -2122,7 +2122,8 @@ async function joinRoomAtEpoch(
         const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
         // ⚓🚦 …numbered like every port (the new room's own gate list; the
         // atlas groups it with its station once harvested).
-        const gate = freeGateNumberHere(boot.roomId, readDockGates());
+        const inUse = readGatesInUse();
+        const gate = inUse ? freeGateNumberHere(boot.roomId, inUse) : null;
         writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
@@ -3268,11 +3269,14 @@ async function transitTo(
     // re-fit the port below.
     // ⚓🚦 A dock that fits a new port here needs a free gate number; with
     // every number taken, the dock is not completed (as the far DOCK refuses).
+    // While a flood hides some of this room's ports from the gate read, the
+    // port is fitted unnumbered: any number might be a hidden port's.
     const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
-    const newGate = needsPort ? freeGateNumberHere(activeBootstrap?.roomId ?? "", readDockGates()) : null;
+    const inUse = needsPort ? readGatesInUse() : null;
+    const newGate = inUse ? freeGateNumberHere(activeBootstrap?.roomId ?? "", inUse) : null;
     if (
       depRoomId &&
-      !(needsPort && newGate === null) &&
+      !(needsPort && inUse && newGate === null) &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
       }) &&
@@ -3310,12 +3314,13 @@ async function transitTo(
         // ⚓ A dock has a half on BOTH doors: the arrival door wears the
         // mating half the connection brought (staged on the far side, or the
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
-        if (needsPort && newGate !== null) {
-          // ⚓🚦 …numbered, like every new port of the station.
+        if (needsPort) {
+          // ⚓🚦 …numbered, like every new port of the station (unnumbered
+          // while a flood hides some of this room's ports, above).
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
-            gate: newGate,
+            ...(newGate !== null ? { gate: newGate } : {}),
           });
         }
       });
@@ -3811,7 +3816,10 @@ function harvestStationAtlas(): void {
     yjsSync.doc.transact(() => {
       for (const doorId of unnumbered) {
         if (readDoorPolicy(doorId).gate !== undefined) continue;
-        const gate = freeGateNumberHere(roomId, readDockGates());
+        // Only from a gate read that sees every port: past a flood, a number
+        // might be a hidden port's.
+        const inUse = readGatesInUse();
+        const gate = inUse ? freeGateNumberHere(roomId, inUse) : null;
         if (gate === null) break;
         writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
       }
