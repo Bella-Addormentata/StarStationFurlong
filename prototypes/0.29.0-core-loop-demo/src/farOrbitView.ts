@@ -147,7 +147,10 @@ function castOffPlace(id: string, keptAt: string | undefined): Place | undefined
 
 /** A flight's transfer rebuilt from its record: the Hohmann ellipse between
  *  the two ends' orbits, pinned to the record's own times. `flight` names it
- *  by what its record says (who flies, and the two ends as named there). */
+ *  by what stays fixed while it flies: who flies (and for another ship, the
+ *  welcome rooms its summary gives as the ends), never an id this install
+ *  reads through its own aliases, which can name one end differently from
+ *  one read to the next. */
 function flightPlan(
   flight: readonly string[],
   departedAt: number,
@@ -226,6 +229,16 @@ function gather(now: number): Source {
   }
 }
 
+/** Test seam: what the far pass reads at `now`. */
+export function gatherForTest(now: number): Source {
+  return gather(now);
+}
+
+/** Test seam: forget every flight already drawn. */
+export function forgetFlightsForTest(): void {
+  frozenPlans.clear();
+}
+
 function readSource(now: number): Source {
   const roomId = currentRoomId();
   const atlas = readAtlas();
@@ -248,7 +261,10 @@ function readSource(now: number): Source {
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
-      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => [
+      // Named by the room, not the ends: readFlightRecord reads both end ids
+      // through this install's aliases each time (a learned station listed,
+      // then dropped), and the same flight must keep the course it was drawn on.
+      aboard = flightPlan(['own', roomId], rec.departedAt, rec.etaAt, () => [
         castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
         castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
       ]);
