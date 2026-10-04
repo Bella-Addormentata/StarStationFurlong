@@ -119,17 +119,18 @@ export function applyFarDockRequest(
   // is read too: on a first visit this client's own atlas may not know the far
   // station's other rooms or the gates they already use. While a flood hides
   // some of the far room's ports from the gate read, the port is fitted
-  // unnumbered: any number might be a hidden port's.
+  // unnumbered: a free-looking number might be a hidden port's.
   const newPort = !dockPortFlagIn(doc, req.farDoor);
   const inUse = newPort ? gatesInUseIn(doc) : null;
-  const gate = inUse
+  const free = inUse
     ? freeGateNumber(
-      withSharedAtlasOf(doc, readAtlas(), farRoomOf(req.farAddress)), farRoomOf(req.farAddress), inUse,
+      withSharedAtlasOf(doc, readAtlas(), farRoomOf(req.farAddress)), farRoomOf(req.farAddress), inUse.gates,
     )
     : null;
-  if (newPort && inUse && gate === null) {
+  if (newPort && free === null) {
     return { result: { ok: false, reason: 'no-gate' }, wrote: false };
   }
+  const gate = inUse?.complete ? free : null;
   // One transaction: the berth's record and its port land together, so no
   // peer ever sees a dock on a door without its half.
   doc.transact(() => {

@@ -374,22 +374,29 @@ export function readUnnumberedPorts(): string[] {
   return out.sort();
 }
 
-/** ⚓🚦 The gates this room's ports hold, for picking a number no other port
- *  has: readDockGates, or null when the port scan may have left a port out
- *  (a flood of both peer-written maps cut it short, or more ports than a
- *  gate read lists), whose number a pick could then repeat. */
-export function readGatesInUse(): Record<string, number> | null {
-  return docAlive() ? gatesInUseIn(boundDoc!) : null;
+/** ⚓🚦 The gates this room's ports hold (readDockGates), for picking a
+ *  number no other port has, and whether the read saw every port: not when
+ *  the port scan may have left one out (a flood of both peer-written maps cut
+ *  it short, or more ports than a gate read lists). The numbers it saw are
+ *  taken either way; a number it did not see might be a hidden port's. */
+export function readGatesInUse(): GatesInUse {
+  return docAlive() ? gatesInUseIn(boundDoc!) : { gates: {}, complete: false };
 }
 
 /** ⚓🚦 readGatesInUse for ANY doc (the far room's, during a DOCK). */
-export function gatesInUseIn(doc: Y.Doc): Record<string, number> | null {
-  if ((doc as { isDestroyed?: boolean }).isDestroyed) return null;
+export function gatesInUseIn(doc: Y.Doc): GatesInUse {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { gates: {}, complete: false };
   const { ports, complete } = scanPorts(doc, doc.getMap('doorPolicy'));
-  if (!complete) return null;
-  const out: Record<string, number> = {};
-  for (const [doorId, p] of ports) if (p.gate !== undefined) out[doorId] = p.gate;
-  return out;
+  const gates: Record<string, number> = {};
+  for (const [doorId, p] of ports) if (p.gate !== undefined) gates[doorId] = p.gate;
+  return { gates, complete };
+}
+
+/** ⚓🚦 What readGatesInUse read: the gates by door id, and whether that is
+ *  every port of the room. */
+export interface GatesInUse {
+  gates: Record<string, number>;
+  complete: boolean;
 }
 
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */

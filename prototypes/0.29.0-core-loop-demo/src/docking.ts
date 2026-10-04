@@ -1913,11 +1913,12 @@ export class DoorDockingPortSystem {
         // ⚓🚦 A new port takes the lowest gate number free in the station;
         // with every number taken it is not fitted (and no part is spent).
         // While a flood hides some of this room's ports from the gate read,
-        // it is fitted unnumbered, since any number might be a hidden port's;
-        // the harvest numbers it once the read sees every port.
-        const own = step.kind === "fit-port" ? readGatesInUse() : null;
-        const gate = own ? freeGateNumberHere(this.roomNow(), own) : null;
-        if (step.kind === "fit-port" && own && gate === null) {
+        // it is fitted unnumbered, since a free-looking number might be a
+        // hidden port's; the harvest numbers it once the read sees every port.
+        const inUse = step.kind === "fit-port" ? readGatesInUse() : null;
+        const free = inUse ? freeGateNumberHere(this.roomNow(), inUse.gates) : null;
+        const gate = inUse?.complete ? free : null;
+        if (inUse && free === null) {
           this.showAssemblyNotice(doorId, `Every gate number (1–${MAX_GATE}) is taken in this station — remove a port first.`);
           return;
         }
@@ -2058,8 +2059,9 @@ export class DoorDockingPortSystem {
         const roomId = this.roomNow();
         // Not while a flood hides some of this room's ports from the gate
         // read: the step could land on a hidden port's number.
-        const own = readGatesInUse();
-        if (!own) return;
+        const inUse = readGatesInUse();
+        if (!inUse.complete) return;
+        const own = inUse.gates;
         // A port fitted before gates existed gets the lowest free number first.
         if (policy.gate === undefined) {
           const first = freeGateNumberHere(roomId, own);

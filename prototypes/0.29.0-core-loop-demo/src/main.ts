@@ -2123,7 +2123,7 @@ async function joinRoomAtEpoch(
         // ⚓🚦 …numbered like every port (the new room's own gate list; the
         // atlas groups it with its station once harvested).
         const inUse = readGatesInUse();
-        const gate = inUse ? freeGateNumberHere(boot.roomId, inUse) : null;
+        const gate = inUse.complete ? freeGateNumberHere(boot.roomId, inUse.gates) : null;
         writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
@@ -3270,13 +3270,15 @@ async function transitTo(
     // ⚓🚦 A dock that fits a new port here needs a free gate number; with
     // every number taken, the dock is not completed (as the far DOCK refuses).
     // While a flood hides some of this room's ports from the gate read, the
-    // port is fitted unnumbered: any number might be a hidden port's.
+    // port is fitted unnumbered: a free-looking number might be a hidden
+    // port's.
     const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
     const inUse = needsPort ? readGatesInUse() : null;
-    const newGate = inUse ? freeGateNumberHere(activeBootstrap?.roomId ?? "", inUse) : null;
+    const freeGate = inUse ? freeGateNumberHere(activeBootstrap?.roomId ?? "", inUse.gates) : null;
+    const newGate = inUse?.complete ? freeGate : null;
     if (
       depRoomId &&
-      !(needsPort && inUse && newGate === null) &&
+      !(needsPort && freeGate === null) &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
       }) &&
@@ -3819,7 +3821,7 @@ function harvestStationAtlas(): void {
         // Only from a gate read that sees every port: past a flood, a number
         // might be a hidden port's.
         const inUse = readGatesInUse();
-        const gate = inUse ? freeGateNumberHere(roomId, inUse) : null;
+        const gate = inUse.complete ? freeGateNumberHere(roomId, inUse.gates) : null;
         if (gate === null) break;
         writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
       }

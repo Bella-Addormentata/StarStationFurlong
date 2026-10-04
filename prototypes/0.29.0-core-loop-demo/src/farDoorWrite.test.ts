@@ -143,6 +143,26 @@ describe('applyFarDockRequest — DOCK', () => {
     expect(bay.gate).toBeUndefined();
   });
 
+  it('⚓🚦 refuses a new far port in a station whose seen gates take every number, though a flood hides others', () => {
+    const doc = new Y.Doc();
+    const layout = doc.getMap('doorLayout');
+    const policies = doc.getMap('doorPolicy');
+    for (let g = 1; g <= 99; g++) {
+      const id = `d:${String(g).padStart(8, '0')}`;
+      layout.set(id, { id, wall: 'y+', lateral: 0, placed: true });
+      policies.set(id, { passage: 'public', construction: 'owner', adapter: true, gate: g });
+    }
+    for (let i = 0; i < 1100; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      layout.set(id, { nope: true });
+      policies.set(id, { passage: 'public', construction: 'owner' });
+    }
+    layout.set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc)).toEqual({ result: { ok: false, reason: 'no-gate' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+
   it("⚓🚦 numbers a new far port past gates the far doc's shared atlas knows, even unvisited rooms", () => {
     const doc = new Y.Doc();
     doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });

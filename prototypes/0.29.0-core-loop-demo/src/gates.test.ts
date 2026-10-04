@@ -261,25 +261,24 @@ describe('the gate on a dock port', () => {
     expect(readDockGatesIfComplete()).toBeNull();
   });
 
-  it('reads the gates in use, unnumbered ports aside, only while it sees every port', () => {
+  it('reads the gates in use, unnumbered ports aside, and whether it saw every port', () => {
     const doc = new Y.Doc();
     bindDoorPolicy(doc);
     doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
     doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
     doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
     doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
-    expect(readGatesInUse()).toEqual({ north: 1 });
-    expect(gatesInUseIn(doc)).toEqual({ north: 1 });
-    // Past a flood of both maps the scan cannot tell whether it missed a port,
-    // so no list stands for a new number to be picked against.
+    expect(readGatesInUse()).toEqual({ gates: { north: 1 }, complete: true });
+    expect(gatesInUseIn(doc)).toEqual({ gates: { north: 1 }, complete: true });
+    // Past a flood of both maps the scan cannot tell whether it missed a port:
+    // the gates it saw are taken, but a free-looking number may not be.
     for (let i = 0; i < 1100; i++) {
       const id = `d:junk${String(i).padStart(4, '0')}`;
       doc.getMap('doorLayout').set(id, { nope: true });
       doc.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner' });
     }
-    expect(readDockGates()).toEqual({ north: 1 });
-    expect(readGatesInUse()).toBeNull();
-    expect(gatesInUseIn(doc)).toBeNull();
+    expect(readGatesInUse()).toEqual({ gates: { north: 1 }, complete: false });
+    expect(gatesInUseIn(doc)).toEqual({ gates: { north: 1 }, complete: false });
   });
 
   it('takes the lowest number free in the station', () => {
