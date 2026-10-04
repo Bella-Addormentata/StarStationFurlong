@@ -31,6 +31,7 @@ import {
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
+import { readSharedTrim } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { DEFAULT_PLANET_ID, listStations, readStationRecords, registerStation } from './stations';
 import type { StationRecord } from './stations';
@@ -88,14 +89,17 @@ afterEach(() => {
 
 describe('guards', () => {
   it('accepts a well-formed station summary and copies only known fields', () => {
-    const s = cleanStationSummary({ ...summary(), trim: { ...trim(), fuelDrawn: 7, junk: 2 }, junk: 1 }, T0);
-    expect(s).toEqual({ ...summary(), trim: { ...trim(), fuelDrawn: 7 } });
+    const line = { seq: 3, place: T0 + 5, seen: [[7, T0 + 5]] as [number, number][] };
+    const s = cleanStationSummary({ ...summary(), trim: { ...trim(), ...line, fuelDrawn: 7, junk: 2 }, junk: 1 }, T0);
+    // A trim's count of burns, place and writers travel (the helm rooms go
+    // on from it); the room's fuel draw does not.
+    expect(s).toEqual({ ...summary(), trim: { ...trim(), ...line } });
   });
 
   it('settles trims whose last burns share a moment on the one with more burns, in either order', () => {
-    const lower = summary({ trim: trim({ dRadiusKm: -2, fuelDrawn: 1 }) });
-    const raise = summary({ trim: trim({ dRadiusKm: 2, fuelDrawn: 1 }) });
-    const both = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+    const lower = summary({ trim: trim({ dRadiusKm: -2, seq: 1 }) });
+    const raise = summary({ trim: trim({ dRadiusKm: 2, seq: 1 }) });
+    const both = summary({ trim: trim({ dRadiusKm: 0, seq: 2 }) });
     for (const [a, b] of [[lower, raise], [raise, lower]]) {
       const partial = mergeStation(a, b) ?? a;
       expect(mergeStation(partial, both)?.trim?.dRadiusKm).toBe(0);
@@ -103,11 +107,27 @@ describe('guards', () => {
     }
   });
 
-  it('settles a same-moment trim from a build without fuel counts on the one that has them, in either order', () => {
-    const old = summary({ trim: trim({ dRadiusKm: 2 }) });
-    const counted = summary({ trim: trim({ dRadiusKm: 0, fuelDrawn: 2 }) });
+  it('settles on the trim further along its line, whatever clock stamped the other, in either order', () => {
+    // Another helm room went on from this trim twice; a room whose clock runs
+    // ahead burned once from none.
+    const along = summary({ trim: { ...trim({ dRadiusKm: 0, seq: 3 }), from: 'room-a', readAt: T0 + 10 } });
+    const ahead = summary({ trim: { ...trim({ dRadiusKm: 6, seq: 1, at: T0 + 60_000 }), from: 'room-b', readAt: T0 + 20 } });
+    expect((mergeStation(ahead, along) ?? ahead).trim?.dRadiusKm).toBe(0);
+    expect(mergeStation(along, ahead)).toBeNull();
+    // A trim without the count (from before it) has had no burns along a line.
+    const old = summary({ trim: trim({ dRadiusKm: 2, at: T0 + 60_000 }) });
+    const counted = summary({ trim: trim({ dRadiusKm: 0, seq: 1 }) });
     expect((mergeStation(old, counted) ?? old).trim?.dRadiusKm).toBe(0);
     expect(mergeStation(counted, old)).toBeNull();
+  });
+
+  it('takes the later reading of one room over its earlier one, however far along that was', () => {
+    // The room took its trim back (a stale level write won): its later
+    // reading stands, though the earlier one had more burns.
+    const earlier = summary({ trim: { ...trim({ dRadiusKm: 4, seq: 5 }), from: 'room-a', readAt: T0 + 10 } });
+    const later = summary({ trim: { ...trim({ dRadiusKm: 2, seq: 3 }), from: 'room-a', readAt: T0 + 20 } });
+    expect((mergeStation(earlier, later) ?? earlier).trim?.dRadiusKm).toBe(2);
+    expect(mergeStation(later, earlier)).toBeNull();
   });
 
   it("keeps a newer trim the standing record's own install flies on another slot", () => {
@@ -649,6 +669,27 @@ describe('sharing through the room doc', () => {
     sync(peer, doc);
     const hab = listStations().find((s) => s.id === 'hab')!;
     expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm - 6, 6);
+  });
+
+  it("shares each station's newest trim with its helm rooms, and none once unbound", () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    // This room's own trim: one burn.
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim({ seq: 1 }), currentRoom: () => 'room-hab' }));
+    installTrimResolver();
+    const hab = listStations().find((s) => s.id === 'hab')!;
+    expect(readSharedTrim(hab)).toEqual(trim({ seq: 1 }));
+    // Another helm room of the station went on from it twice, on a clock
+    // behind this one's: its trim, with its place and writers, is the
+    // station's now.
+    const along = trim({ dRadiusKm: 8, seq: 3, at: T0 - 5_000, place: T0 + 2, seen: [[42, T0 + 2]] });
+    const peer = new Y.Doc();
+    sync(doc, peer);
+    peer.getMap('stationSummaries').set('room-hab', { ...summary(), trim: { ...along, from: 'room-b', readAt: T0 } });
+    sync(peer, doc);
+    expect(readSharedTrim(hab)).toEqual(along);
+    unbindPlanetSummaryForTest();
+    expect(readSharedTrim(hab)).toBeNull();
   });
 
   it('writes the winner back when a peer\'s value loses the merge', () => {

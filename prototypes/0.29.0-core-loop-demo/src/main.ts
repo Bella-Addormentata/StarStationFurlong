@@ -131,7 +131,6 @@ import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 import {
   bindStationKeepingDoc,
   isBoltedIntoStation,
-  readFuelDrawn,
   readOrbitTrim,
   subscribeStationKeeping,
 } from "./stationKeeping";
@@ -1627,12 +1626,9 @@ async function joinRoomAtEpoch(
     // The stations this install saved go out under its own id, which tells
     // two installs' records of one place apart.
     installId: getStationOwnerId,
-    // The fuel its burns drew rides along: between trims whose last burns
-    // share a moment, it tells the one holding more burns.
-    localTrim: () => {
-      const trim = readOrbitTrim();
-      return trim && { ...trim, fuelDrawn: readFuelDrawn() };
-    },
+    // The trim on the orbit its station flies: a burn on another slot (a
+    // tab that places the room elsewhere) never stands in for it.
+    localTrim: () => readOrbitTrim(currentStation()),
     ship: planetShipStatus,
     // Only a room known to be no ship withdraws its entry: a ship whose
     // planet is not placed yet also reads null from planetShipStatus.
