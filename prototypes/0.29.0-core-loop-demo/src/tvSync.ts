@@ -170,7 +170,11 @@ export class TvSyncController {
    *  played puts a one-second clip's player at 800 ms "within the band" of
    *  the new start, and left there it runs to its end and closes the new
    *  programme as ended. Null until the first tick: joining mid-programme
-   *  is not a restart. */
+   *  is not a restart. Consumed once the restart is aimed (the holder's
+   *  pending target), issued (a viewer's seek) or owed (a viewer's ended
+   *  player, replayDue) — never before, so a revision seen while PAUSED,
+   *  or by a player that cannot seek yet, still restarts the player on the
+   *  tick it can. */
   private seenStarted: number | null = null;
   /** The transport revision of a countdown this controller parked for
    *  (tvDoc `jump`, as SCHEDULE wrote it): the holder's first playing tick
@@ -265,13 +269,14 @@ export class TvSyncController {
       // (tickViewer): a stale reading leaves them pending.
       return this.tickViewer(p, pb, now, newProgramme, started);
     }
-    this.seenStarted = started;
 
     // Not playing: whatever transport revision brought us here is followed
     // by the state itself (a later resume is a new revision to follow) —
     // except the holder's own transport while paused, which is a target of
     // its own below, and a schedule's, which the first tick past T0 follows
-    // (further below).
+    // (further below). A new programme's revision (seenStarted) is consumed
+    // once its rewind is aimed, or seen to be beyond this player: PAUSED,
+    // below, is the one state here with a player to rewind.
     const jump = this.jump();
 
     if (pb.state === 'paused') {
@@ -285,29 +290,48 @@ export class TvSyncController {
         // up instead of asking for the same 20 s twice; the newest target
         // always replaces one still landing, with the same bounded wait. A
         // pause within the band of where the player reads, with nothing
-        // landing, is a pause where it played: nothing to follow.
+        // landing, is a pause where it played: nothing to follow — unless
+        // it is a NEW PROGRAMME paused before this player left the last one
+        // (PLAY NOW, then PAUSE before the next tick: the record paused at
+        // the new start, the player 800 ms into the old run of a one-second
+        // clip, inside the band), which is a seek whatever the band says:
+        // the player is nowhere in this programme, and left where it reads
+        // a RESUME would run the old run on, beat it, and close the new
+        // programme at the old run's end. Its target is kept until it lands
+        // (settlePending), as any jump's, and the revision is consumed here
+        // with the aim — or with nothing to aim for a player that can
+        // neither seek nor ever will (a start-only embed).
         if (jump !== this.appliedJump || this.pendingTarget !== null) {
           const target = reachable(pb.positionMs, p);
           const landing = this.pendingTarget !== null;
           if (this.pendingTarget !== target
-            && (landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS)
+            && (landing || newProgramme || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS)
             && (p.canSeek || p.hasClock)) {
             this.aim(p, target, now);
           }
         }
         this.appliedJump = jump;
         this.settlePending(p, now);
+        this.seenStarted = started;
       } else {
         this.appliedJump = jump;
         this.pendingTarget = null;
-        if (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
-          && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
+        // A viewer's new programme while paused is a seek whatever the band
+        // says, for the same reason, and the revision is consumed with it: a
+        // player that cannot seek YET (an HTML video before its ranges)
+        // keeps it for the first tick it can, paused or resumed
+        // (tickViewer); one that never can (no clock) has nothing to rewind.
+        const rewind = newProgramme && p.canSeek;
+        if (rewind || (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
+          && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
           p.seek(pb.positionMs);
           this.lastSeekAt = now;
         }
+        if (!newProgramme || rewind || !p.hasClock) this.seenStarted = started;
       }
       return pb;
     }
+    this.seenStarted = started;
 
     // Scheduled, home or off: the programme is not running; a target from
     // before is void, and the revision that brought us here is followed by
@@ -506,8 +530,10 @@ export class TvSyncController {
       return pb;
     }
     this.seenJump = jump;
-    this.seenStarted = started;
     if (p.isEnded()) {
+      // The new programme's revision is consumed here: a replay owed from
+      // here on (replayDue) carries it until the player un-ends.
+      this.seenStarted = started;
       // A player at its end is never play()ed as it stands (it would start
       // over). A record well BEFORE the end is a rewind or a replay: seek
       // there — which un-ends the player — and go; so is a record anywhere
@@ -539,13 +565,21 @@ export class TvSyncController {
     if (!p.isPlaying()) p.play();
     // A new programme on a player still running the last one (a replay of
     // a short clip before its end): go where the record says — band, nudge
-    // and cooldown are for drift within ONE programme.
-    if (newProgramme && p.canSeek) {
+    // and cooldown are for drift within ONE programme. The revision is
+    // consumed with the seek: a player that cannot seek YET (an HTML video
+    // before its ranges) keeps it for the first tick it can — a rewind
+    // asked while paused and resumed before the ranges arrived included;
+    // one that never can (a start-only embed, no clock) is simply played,
+    // as any programme.
+    if (newProgramme && (p.canSeek || p.hasClock)) {
+      if (!p.canSeek) return pb;
       p.seek(reachable(pb.positionMs, p));
       this.lastSeekAt = now;
       this.setRate(1);
+      this.seenStarted = started;
       return pb;
     }
+    this.seenStarted = started;
     const action = driftAction(p.currentMs(), pb.positionMs, p.canNudge);
     if (action === 'seek') {
       if (p.canSeek && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {

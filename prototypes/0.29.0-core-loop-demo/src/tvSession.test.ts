@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, putDownRemote, readPower, readRemote, readSample, readTv, setTvClock,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
   TV_LEASE_RENEW_MS,
 } from './tvDoc';
@@ -220,6 +220,34 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 0 });
     run(500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 0 });
+  });
+
+  it('POWER back on parks a schedule past T0 where it was switched off — playing by the clock, its record never flipped — not at the time since T0 with the minute off counted; a schedule that started while the set was off carries no reading and plays from the clock', () => {
+    const clip = { kind: 'url' as const, url: 'https://example.org/a.mp4' };
+    pickUpRemote(TV);
+    tvSchedule(TV, clip, now + 10_000);
+    putDownRemote(TV); // the scheduler leaves: past T0 the room free-runs from the UTC start, the record never flipped
+    run(12_000);
+    expect(readTv(TV).state).toBe('scheduled');
+    expect(readPlayback(TV, now)).toMatchObject({ state: 'playing', positionMs: 2_000 });
+    expect(tvTogglePower(TV)).toBe(false); // the room read 2 s
+    expect(readPower(TV).parkMs).toBe(2_000);
+    run(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true); // the free remote is the presser's, and so is the park
+    expect(readTv(TV)).toMatchObject({ state: 'paused', startAt: 0, positionMs: 2_000 }); // where it was switched off, not 62 s in
+    run(500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 2_000 });
+    // A countdown switched off and on: nothing to carry, nothing parked — a
+    // schedule that started meanwhile plays from the clock's reading at the
+    // holder's first tick past T0, as a room whose remote lapsed does.
+    expect(tvSchedule(TV, clip, now + 10_000)).toEqual({ ok: true });
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV).parkMs).toBeNull();
+    run(12_000); // T0 passes while the set is off
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readTv(TV).state).toBe('scheduled'); // nothing to park at
+    run(500); // the holder's headless beat flips it, at the time since T0
+    expect(readTv(TV)).toMatchObject({ state: 'playing', startAt: 0, positionMs: 2_500 });
   });
 
   it('POWER back on with a free remote: the presser takes the remote and parks the programme where it was; a flip nobody could park waits for the first holder', () => {

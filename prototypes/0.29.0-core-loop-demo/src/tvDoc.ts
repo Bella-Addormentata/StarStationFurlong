@@ -166,9 +166,11 @@ export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by:
  *  own key, like the volume, so a press never races the holder's heartbeat
  *  in the programme's LWW slot. Off keeps the programme, like a real TV,
  *  and writes where the room WAS as it went off — `parkMs`, the presser's
- *  own reading of the room (readPlayback at the press; null when nothing
- *  was running, and a reading of 0 is a reading: a programme switched off
- *  at its start): a position, never a time, the clocks rule — and on carries
+ *  own reading of the room (readPlayback at the press: a programme playing,
+ *  or a schedule past its T0, which plays by the clock; null when nothing
+ *  was running — a pause, a countdown still ahead — and a reading of 0 is a
+ *  reading: a programme switched off at its start): a position, never a
+ *  time, the clocks rule — and on carries
  *  it, so every page anchors the resumed programme there on receipt of the
  *  ON write (noteSamples: a sample of its own, replaced by the holder's
  *  next heartbeat) and the holder's tick parks the programme there
@@ -219,11 +221,16 @@ export function tvWallNow(): number {
 }
 
 /** Playback samples as THIS page received them: the record's seq, its
- *  positionMs, and OUR clock when it landed. Keyed by TV item id. */
+ *  positionMs, and OUR clock when it landed. Keyed by TV item id. `park`
+ *  marks the switch's reading, anchored as the set comes back ON
+ *  (noteSamples): the one sample a schedule past its T0 — playing by the
+ *  clock, its record not yet flipped — reads from, where it otherwise reads
+ *  the time since T0. */
 interface Sample {
   seq: number;
   positionMs: number;
   receivedAt: number;
+  park?: true;
 }
 const samples = new Map<string, Sample>();
 /** The switch's revision this page last answered, per TV: the ON write
@@ -360,14 +367,19 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       // holder's next heartbeat (a new programme seq) replaces it as any
       // sample is replaced, and its park (tvSession) pauses there. A
       // reading of 0 is a reading (switched off at the start); only null
-      // is no reading.
+      // is no reading. A schedule past its T0 is a running programme too
+      // — playing by the clock, its record not yet flipped
+      // (scheduleStarted) — and readPlayback reads it from this anchor
+      // (`park`), not from T0 with the time switched off counted as
+      // playback; a countdown still ahead was switched off with no
+      // reading (tvTogglePower) and starts at T0 as scheduled.
       const itemId = key.slice(6);
       const power = readPower(itemId);
       if (powerSeen.get(itemId) === power.seq) continue;
       powerSeen.set(itemId, power.seq);
       const rec = readProgramme(itemId);
-      if (power.on && power.parkMs !== null && rec.state === 'playing') {
-        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: stamp });
+      if (power.on && power.parkMs !== null && (rec.state === 'playing' || scheduleStarted(rec))) {
+        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: stamp, park: true });
       }
       continue;
     }
@@ -837,14 +849,20 @@ export function tvHeartbeat(itemId: string, positionMs: number): TvAction {
   return { ok: true };
 }
 
-export function tvPause(itemId: string, positionMs: number): TvAction {
+/** PAUSE, where the room is (tvSync positionMs) — and the holder's park as
+ *  the set comes back ON, where it went off (tvSession). A schedule past
+ *  its T0 is playing by the clock (readPlayback), its record not yet
+ *  flipped by the holder's first beat: paused like any programme, the
+ *  schedule spent (startAt 0); a countdown still ahead is nothing to pause. */
+export function tvPause(itemId: string, positionMs: number, now = wallClock()): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
-  if (rec.state !== 'playing') return { ok: false, error: 'Nothing is playing.' };
+  if (rec.state !== 'playing' && !scheduleStarted(rec, now)) return { ok: false, error: 'Nothing is playing.' };
   write(tvKey(itemId), {
     ...rec,
     state: 'paused',
+    startAt: 0,
     positionMs: Math.max(0, Math.floor(positionMs)),
     seq: bump(rec.seq),
     jump: bump(rec.jump),
@@ -918,16 +936,38 @@ export function tvStop(itemId: string): TvAction {
 export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
   if (!power.on && remoteStatus(itemId, now) === 'free') pickUpRemote(itemId, now);
-  // Going off: where the room is, by this page's own reading, carried by
-  // the switch for the park and the resume (PowerRecord). Coming on: the
+  // Going off: where the room is, by this page's own reading
+  // (roomPositionMs: a programme playing, or a schedule past its T0 —
+  // playing by the clock, its record not yet flipped), carried by the
+  // switch for the park and the resume (PowerRecord). Coming on: the
   // reading the OFF press left, carried on so every page sees it with the
-  // ON write; a set switched off with nothing running carries no reading
-  // (null) — a programme switched off at its start carries 0, a reading.
-  const parkMs = power.on
-    ? (readTv(itemId).state === 'playing' ? Math.max(0, Math.floor(readPlayback(itemId, now).positionMs)) : null)
-    : power.parkMs;
+  // ON write; a set switched off with nothing running — a pause, a
+  // countdown still ahead, the home screen — carries no reading (null); a
+  // programme switched off at its start carries 0, a reading.
+  const parkMs = power.on ? roomPositionMs(itemId, now) : power.parkMs;
   write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord);
   return !power.on;
+}
+
+/** A schedule past its T0: playing by the clock (readPlayback), whoever
+ *  holds the remote, until the holder's first beat flips the record. */
+export function scheduleStarted(rec: Pick<TvProgramme, 'state' | 'startAt'>, wall = wallClock()): boolean {
+  return rec.state === 'scheduled' && rec.startAt <= wall;
+}
+
+/** Where the room is by this page's own reading, for the switch to carry
+ *  as the set goes off: a programme playing (readPlayback: a sample run on,
+ *  bridged across a sleep), or a schedule past its T0, which plays by the
+ *  clock whoever holds — a viewer waiting on the holder's first beat
+ *  (readPlayback's STARTING…) reads the time since T0, as that beat will
+ *  say; null for nothing running: a pause, a countdown still ahead, the
+ *  home screen. */
+function roomPositionMs(itemId: string, now: number): number | null {
+  const rec = readTv(itemId);
+  if (rec.state !== 'playing' && !scheduleStarted(rec)) return null;
+  const pb = readPlayback(itemId, now);
+  const positionMs = pb.state === 'playing' ? pb.positionMs : wallClock() - rec.startAt;
+  return Math.max(0, Math.floor(positionMs));
 }
 
 /** The remote's PLAY and SCHEDULE turn the set on, like a real remote — on
@@ -968,7 +1008,7 @@ export interface PlaybackNow {
 
 /** The sample this page anchored the holder's last position to, or null
  *  before any sample landed for the TV. */
-export function readSample(itemId: string): { positionMs: number; receivedAt: number; seq: number } | null {
+export function readSample(itemId: string): { positionMs: number; receivedAt: number; seq: number; park?: true } | null {
   const s = samples.get(itemId);
   return s ? { ...s } : null;
 }
@@ -1012,26 +1052,37 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
     // Only with nobody holding the remote does a viewer free-run from the
     // UTC start, best effort, until someone picks the remote up and beats.
     if (iHoldRemote(itemId) || remoteLapsed(itemId, now)) {
+      // Switched off past T0 and back on: the switch carried where the room
+      // was (noteSamples, `park`), and the room resumes there — the time
+      // switched off is not playback — until the holder's first beat flips
+      // the record and replaces the anchor as any sample is replaced.
+      const park = samples.get(itemId);
+      if (park?.park && park.seq === rec.seq) return fromSample(park, now, rttMs);
       return { state: 'playing', positionMs: wall - rec.startAt, running: true, countdownMs: 0 };
     }
     return { state: 'scheduled', positionMs: 0, running: false, countdownMs: 0 };
   }
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
-    const positionMs = sample ? expectedPositionMs(sample, now, rttMs) : rec.positionMs;
-    // A sample from before this page's last sleep (markTvPageAwake): read
-    // with the gap bridged on the wall clock — where the room is, as near
-    // as this page can tell — and stale: shown by a viewer, never acted on
-    // until a fresh one lands; rejoined by the holder, whose beat from
-    // here is that fresh sample.
-    if (sample && sample.receivedAt < lastGapAt) {
-      const bridged = Math.max(0, positionMs + gapCorrectionSince(sample.receivedAt));
-      return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true };
-    }
-    return { state: 'playing', positionMs, running: true, countdownMs: 0 };
+    return sample ? fromSample(sample, now, rttMs) : { state: 'playing', positionMs: rec.positionMs, running: true, countdownMs: 0 };
   }
   if (rec.state === 'paused') return { state: 'paused', positionMs: rec.positionMs, running: false, countdownMs: 0 };
   return { state: rec.state, positionMs: 0, running: false, countdownMs: 0 };
+}
+
+/** Playing, from a sample: its position run on to `now` (expectedPositionMs)
+ *  — or, for a sample from before this page's last sleep (markTvPageAwake),
+ *  read with the gap bridged on the wall clock — where the room is, as near
+ *  as this page can tell — and stale: shown by a viewer, never acted on
+ *  until a fresh one lands; rejoined by the holder, whose beat from there is
+ *  that fresh sample. */
+function fromSample(sample: Sample, now: number, rttMs: number): PlaybackNow {
+  const positionMs = expectedPositionMs(sample, now, rttMs);
+  if (sample.receivedAt < lastGapAt) {
+    const bridged = Math.max(0, positionMs + gapCorrectionSince(sample.receivedAt));
+    return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true };
+  }
+  return { state: 'playing', positionMs, running: true, countdownMs: 0 };
 }
 
 export type DriftAction = 'none' | 'seek' | 'speed-up' | 'slow-down';
