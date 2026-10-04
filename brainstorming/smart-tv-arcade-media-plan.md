@@ -233,12 +233,24 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   that a dev server or another app's local UI could read a token served
   there; that loopback-wide rule stays for the fingerprint, and for
   development builds, and gates nothing of the proxy's. In the desktop shell
-  the token goes from the sidecar to the webview over the app's own IPC
-  (Tauri `invoke`), never over HTTP; a browser page gets it from a dedicated
-  `/api/media-cap` endpoint whose allowlist is EXACT origins — the app's own
-  (`tauri://localhost`, `http(s)://tauri.localhost`) and the origins named
-  in `SSF_ALLOWED_ORIGINS`, never a loopback wildcard — and the proxy's own
-  `Origin` check is that same exact list. The token is carried in the URL
+  the node is another PROCESS — spawned by the shell, or already running
+  (`src-tauri/src/main.rs`, `acquire_p2p_node`), the shell holding only an
+  HTTP placeholder for it — so the hand-off crosses that boundary where the
+  OS already authenticates: the node writes the token at launch to a file in
+  its per-user data dir readable by that user alone (mode 0600; a spawned
+  node also takes a pairing secret from the shell's environment and writes
+  the file under it), the shell's Rust side reads the file and hands the
+  token to its own webview over `invoke` — never over HTTP. `tauri://
+  localhost` is every Tauri app's origin and names nothing on its own, so
+  possession of the token is the authority and the origin list only a
+  filter. A browser page, in development, gets it from a dedicated
+  `/api/media-cap` endpoint whose allowlist is the EXACT origins named in
+  `SSF_ALLOWED_ORIGINS`, never a loopback wildcard. Where no such channel
+  exists — a node whose data dir the shell cannot read, a page on an origin
+  the list does not name — the proxy is simply unavailable and the
+  theatre's consent-only direct URL is what plays. The proxy's own
+  `Origin` check is that same exact list, a filter behind the token. The
+  token is carried in the URL
   because a `<video>` cannot set a header, with the element in CORS mode
   (`crossOrigin = 'anonymous'`):
   that is what makes a `<video>` send `Origin` at all — a plain cross-origin
@@ -338,10 +350,17 @@ already passes around for its members — `RoomMemberHint` in
 `network/protocol.ts`: `irohNodeId`, `irohRelayUrls`, `irohDirectAddrs` —
 and every node that completes the blob announces `have` for the hash on
 the room's control plane (a sibling of the `media-sub` kind) with its own
-current hints the same way; a connected member's hints are also in the
-room's member records, authenticated by the link they came over, and a
-library seeder's ride its signed library entry (§7), so the fall-back to a
-seeder nobody is connected to is a dial, not a guess. A viewer resolves a
+current hints the same way — an announce that binds {hash, node id, hints}
+and is evidence only on the announcer's own authenticated connection,
+accepted from the link whose iroh handshake proved that node id and never
+relayed as someone else's word. The hints in the room's member records are
+dial HINTS and nothing more: `YjsSync` carries them outside the signed
+envelope (`src/network/YjsSync.ts`), so they are untrusted until a dial's
+iroh handshake proves the node id — the id is the key, so a wrong hint
+fails the handshake and costs a dial, never trust — and a library seeder's
+hints ride its signed library entry (§7). So the fall-back to a seeder
+nobody is connected to is a dial, not a guess, and holding is proven by
+serving bytes the hash verifies, never by a claim. A viewer resolves a
 hash to the nodes that hold it: the ticket's provider while it is still
 here, else any announcing holder — a hub among them only when it chose to
 hold the blob, since `iroh-blobs` moves bytes from provider to requester
@@ -431,7 +450,20 @@ a joiner, or a hub that later joins as a member, had already logged — which
 is the guarantee below that a forwarding node reconstructs no audio), on
 every departure (the departed can open nothing after it) and on a timer. A
 join and a leave each cost one rotation — a sealed key per subscriber on
-the reliable lane — which at room scale is nothing. Replay protection is a sliding window per leg,
+the reliable lane — which at room scale is nothing, until one member makes
+a habit of it: so membership is per IDENTITY, not per link (a second tab,
+or a re-dialled link, of a member who already holds the epoch's key is the
+same member — no rotation, the key resent to the new link), a lease that
+lapses and is renewed within its lapse window is the same membership (a
+flap, not a departure), a re-admission within a short grace of the
+identity's own departure resumes the epoch it could already open (there is
+nothing to protect from it), rotations are coalesced to at most one per
+interval (2 s) with the transitions inside it folded into one, and the
+sender's node counts each identity's transitions — past a bound (three in
+a minute) that identity's subscription is parked for a backoff and its
+transitions trigger nothing, so a flapping or malicious member interrupts
+a source once, not continuously. A genuine departure — an explicit leave,
+or a lease that lapsed and stayed lapsed — rotates at once, as before. Replay protection is a sliding window per leg,
 the SRTP shape: a leg's counter only ever goes up within an epoch; a
 receiver keeps, per leg, the highest counter it has accepted and a bitmap
 of the last 128 below it, takes a frame above the highest (and
@@ -465,6 +497,15 @@ it cannot open. What a hub still sees is the traffic's shape — who sends to
 whom, how often, how much — as with v006's SFU-lite. The lane supersedes
 the WebRTC mesh (#10) only once this layer is in and a forwarding node that
 logs every frame is shown to reconstruct no audio.
+Audio needs a step video does not: `AudioEncoder` takes `AudioData`, never
+a `MediaStream` or a Web Audio node. A microphone track goes through an
+audio `MediaStreamTrackProcessor` where the browser has one (Chromium),
+else through an `AudioWorklet` tapping the track's
+`MediaStreamAudioSourceNode` and building `AudioData` from its PCM frames —
+the universal path, since the worklet is everywhere the lane runs, and the
+one the karaoke mix takes regardless, tapped off the mix bus; both are
+feature-detected with the worklet as the fallback, and a browser with
+neither `AudioEncoder` nor a worklet sends no audio and says so.
 A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
 three CAPABILITIES the lane rests on are feature-detected separately, and a
 sender advertises only the ones it has (they are not legs — the lane has
@@ -530,7 +571,7 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 | Central piece | Without it |
 |---|---|
 | Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and a strict build ignores the ones embedded in a pasted magnet or `.torrent` (`tr=`, `announce`) unless the operator opts in, since shipping no list suppresses nothing the metadata carries. |
-| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full DHT node, so a room's hub is its spokes' bootstrap), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. Strict builds turn the public list off. |
+| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full DHT node, so a room's hub is its spokes' bootstrap), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. Strict builds have no public swarm at all: the public-DHT side is compiled out, PEX and LSD are off, and the routing table and peer store live under a strict-only path a non-strict run never writes — a persisted table may already hold public nodes, and one full-DHT peer or one PEX exchange would repopulate them, so turning a list off isolates nothing. A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
 | Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins too: off in a strict build unless the operator opts in. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
