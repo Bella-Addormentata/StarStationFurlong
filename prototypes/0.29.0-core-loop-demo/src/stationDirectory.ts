@@ -308,6 +308,30 @@ export function destinationsFromRecords(
   });
 }
 
+/** While withStationSnapshot runs: each source's one read, by source. */
+let snapshot: Map<() => unknown, unknown> | null = null;
+
+/** `read()` once per withStationSnapshot, else on every call. */
+function snapshotted<T>(read: () => T): T {
+  if (!snapshot) return read();
+  if (!snapshot.has(read)) snapshot.set(read, read());
+  return snapshot.get(read) as T;
+}
+
+/** Run `fn` with every lookup in it sharing ONE read of the station record:
+ *  the helm plans a hop to each destination on every render, and the live
+ *  list rebuilds the whole station list (atlas and all) on each read.
+ *  Nothing in `fn` may change the stations; a nested call shares the read. */
+export function withStationSnapshot<T>(fn: () => T): T {
+  if (snapshot) return fn();
+  snapshot = new Map();
+  try {
+    return fn();
+  } finally {
+    snapshot = null;
+  }
+}
+
 /** A directory over the station record: `list` is stations.listStations,
  *  `hereId` the ship room's station (null when floating free); hops follow
  *  the circular-orbit model (orbits.ts). */
@@ -317,12 +341,15 @@ export function directoryFromStationRecords(
   hereId: () => string | null,
   ownId: () => string | null = () => null,
 ): StationDirectory {
+  // Read once per withStationSnapshot: the list, and the destinations
+  // (each looks its seed up in the atlas).
+  const destinations = () => destinationsFromRecords(snapshotted(list), seedFor);
   return {
-    stations: () => destinationsFromRecords(list(), seedFor),
+    stations: () => snapshotted(destinations),
     here: hereId,
     own: ownId,
     plan: (fromId, toId, nowMs) => {
-      const records = list();
+      const records = snapshotted(list);
       return planRecordHop(
         records.find((r) => r.id === fromId),
         records.find((r) => r.id === toId),

@@ -45,7 +45,7 @@ import {
   writeFuelLevel,
 } from './shipDoc';
 // 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
-import { destinationsFrom, flightCapable, followsFlightRecord, groundedBy, isKnownStation, planHop, stationHere } from './stationDirectory';
+import { destinationsFrom, flightCapable, followsFlightRecord, groundedBy, isKnownStation, planHop, stationHere, withStationSnapshot } from './stationDirectory';
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
@@ -63,8 +63,10 @@ import {
 import {
   deleteDoorPairing,
   readAllDoors,
+  readDoor,
   subscribeDoors,
   type DoorPairing,
+  type DoorRecord,
 } from './doorsDoc';
 import { isDockChain } from './adapter';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
@@ -2029,12 +2031,28 @@ function isTransientBerth(rec: DoorPairing): boolean {
   return rec.transient === true || isDockChain(rec.segments);
 }
 
+/** The room's door records: the doors doc's snapshot, which keeps only its
+ *  first MAX_PAIRINGS valid entries, plus each PHYSICAL door's own record,
+ *  read by name past that cap (readDoor). So records a peer floods the map
+ *  with can never hide a real door's connection from the checks below, and
+ *  a flood alone never refuses DEPART. The physical doors are the stored
+ *  layout, else the four defaults (as livePortView draws them). */
+function helmDoorRecords(): Map<string, DoorRecord> {
+  const out = readAllDoors();
+  const layout = readAllDoorLayout();
+  for (const id of (layout.size ? layout : defaultDoorLayoutRecords()).keys()) {
+    const rec = readDoor(id);
+    if (rec) out.set(id, rec);
+  }
+  return out;
+}
+
 /** Enumerate the room's PERMANENT chained doors — a paired berth that is
  *  NOT a transient guest-berth. Reads the doors doc (shared truth), so a
  *  peer's dock lands here without a helm round-trip. */
 function enumerateChainedDoors(): string[] {
   const out: string[] = [];
-  for (const [id, rec] of readAllDoors()) {
+  for (const [id, rec] of helmDoorRecords()) {
     if (rec.paired !== true) continue;
     if (isTransientBerth(rec)) continue;
     out.push(id);
@@ -2044,7 +2062,7 @@ function enumerateChainedDoors(): string[] {
 
 /** Does any door of this room hold a live connection right now? */
 function hasLiveDock(): boolean {
-  for (const [, rec] of readAllDoors()) if (rec.paired === true) return true;
+  for (const [, rec] of helmDoorRecords()) if (rec.paired === true) return true;
   return false;
 }
 
@@ -2054,7 +2072,7 @@ function hasLiveDock(): boolean {
  *  (plan §5.1: undock via the transient-berth detach). */
 function enumerateTransientBerths(): string[] {
   const out: string[] = [];
-  for (const [id, rec] of readAllDoors()) {
+  for (const [id, rec] of helmDoorRecords()) {
     if (rec.paired !== true) continue;
     if (!isTransientBerth(rec)) continue;
     out.push(id);
@@ -2173,7 +2191,7 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
       : outcome.reason === 'unlisted-station'
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
         : outcome.reason === 'no-port'
-        ? `Arrived at ${outcome.stationName} — no free dock port to dock with. Fit one at a door (door panel › +DOCK).`
+        ? `Arrived at ${outcome.stationName} — no dock port could dock (none fitted, or each one docked, busy, or not yours to dock). Fit one at a door (door panel › +DOCK), or check the dock ports' panels, and dock from one when that clears.`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
   });
 }
@@ -2215,7 +2233,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   const esc = (s: string) =>
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
-  const render = (): void => {
+  // One read of the station list per render, however many hops it plans.
+  const render = (): void => withStationSnapshot(() => {
     if (!panel) return;
     // Every render swaps the whole panel (a dock landing re-renders it too):
     // remember which control had keyboard focus, and give it back.
@@ -2281,10 +2300,20 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // A GANGWAY holds a module as surely as a dock does — it is structure,
     // and UNDOCK does not release it. "Free" means neither.
     const bolted = [...new Set((docking?.connected() ?? []).filter((m) => !m.dock).map((m) => m.name))];
+    // A station's own room never DEPARTs (stationDirectory.groundedBy): its
+    // status says why in the DEPART line's words, never how to depart.
+    const grounded = groundedBy();
+    const stationRoomCopy = 'the station\'s own room: its engine, tank and helm keep the station in orbit, and a station never DEPARTs like a ship.';
     const message = !ready
       ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
+      : grounded !== null && grounded !== 'bolted'
+      ? `ALL SYSTEMS FITTED — but this is ${stationRoomCopy}`
       : bolted.length
         ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
+        // A chain the docking computer does not list (past its read cap, or
+        // on a door the layout has dropped) refuses DEPART all the same.
+        : chained.length
+        ? `ALL SYSTEMS FITTED — but this module is chained to ${chained.length} permanent connector${chained.length === 1 ? '' : 's'}: take the gangway down first (chained modules cannot fly).`
         : docked.length
           ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
           : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
@@ -2335,7 +2364,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             const why = isShipReady() ? groundedBy() : null;
             if (why === 'bolted') return chainedCopy(chained.length);
             if (why !== null) {
-              return 'This is the station\'s own room: its engine, tank and helm keep the station in orbit, and a station never DEPARTs like a ship.';
+              return `This is ${stationRoomCopy}`;
             }
             return 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.';
           }
@@ -2555,7 +2584,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             : null;
       target?.focus();
     }
-  };
+  });
 
   /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
    *  atlas + a port list for several. */
