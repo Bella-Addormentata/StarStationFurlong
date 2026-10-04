@@ -73,11 +73,10 @@ the sources that fail have to say so on the screen.
   source: { kind: 'youtube', videoId }            // IFrame API: full sync
         | { kind: 'archive', identifier, file }   // their embed (start-time sync) or mp4 (full sync)
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
-        | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id AND its
-                         // dial hints — relay URLs and direct addresses, the RoomMemberHint shape of
-                         // network/protocol.ts — in a descriptor the node itself SIGNED, so no peer can
-                         // put a victim's address under its id (§4); what a BlobTicket's provider is:
-                         // an id alone is nothing to dial once the importer's link is gone
+        | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id — the id
+                         // ALONE, never dial hints: a viewer's node resolves the id to a route itself
+                         // (what it observed on an earlier authenticated connection, iroh discovery),
+                         // since an address a peer wrote, signed or not, is a reflection surface (§4)
         | null,
   state: 'home' | 'scheduled' | 'playing' | 'paused',  // the PROGRAMME only: 'home' is on with nothing on. Power is
                          // not here — it is its own key (below), so the set has one source of truth
@@ -350,38 +349,37 @@ carries it, so the hash alone authorizes nothing and without the gate any
 page that can reach loopback could drive reads against the viewer's node.
 A hash alone starts nothing: a fetch
 needs a provider, as an `iroh-blobs` `BlobTicket` carries one beside the
-hash and format — and a provider is an ADDRESS, not a name: the ticket's
-`NodeAddr` is the node id with its relay URL and direct addresses, and an
-id alone is nothing to dial once the importer is no longer a connected
-member. So the `blob` source (§3.1) and a library op (§7) carry the hash
-with the importing node's iroh id and its dial hints in the shape the room
-already passes around for its members — `RoomMemberHint` in
-`network/protocol.ts`: `irohNodeId`, `irohRelayUrls`, `irohDirectAddrs` —
-as a PROVIDER DESCRIPTOR the node itself signed: {node id, relay URLs,
-direct addresses, issued-at} under the node's iroh key, which the node id
-is the public half of, so a descriptor verifies against the very id it
-names and no peer can put a victim's address under another node's id. A
-peer-written record carries no hint a viewer would dial except inside such
-a descriptor; one that fails to verify, or is older than a day, leaves the
-node id alone, which is dialled by id with EMPTY hints, the route resolved
-by iroh's own discovery (the DHT, mDNS, a relay) — the reflection defence
-the node already applies to every gossip-learned peer
-(`ssf-p2p-node/src/main.rs`, the TIER_INTRODUCED dial: "the signature
-covers the payload + author, NOT the iroh_node_id / direct_addrs"). A
+hash and format. The ticket's `NodeAddr` bundles a relay URL and direct
+addresses with the node id for convenience; here the id is ALL that
+travels — no dial hints, signed or not. A signature binds a claim to its
+signer and proves nothing about who answers at an address: a member could
+sign {its own id, a victim's address} and have every automatic viewer send
+a QUIC handshake there, which is exactly why the node already dials every
+gossip-learned peer by id with EMPTY hints (`ssf-p2p-node/src/main.rs`, the
+TIER_INTRODUCED dial: "the signature covers the payload + author, NOT the
+iroh_node_id / direct_addrs"). So the `blob` source (§3.1) and a library
+op (§7) carry the hash with the importing node's iroh id, and a viewer's
+node resolves that id to a route the way it resolves any peer's: the
+addresses it observed ITSELF on an earlier authenticated connection with
+that id (the importer is a connected member when the record first appears,
+and iroh keeps what it saw), and iroh's own discovery — the sovereign
+Mainline DHT the node already bootstraps from, mDNS on a LAN, the station's
+relay — all of it configured or observed, none of it peer-written. A
 viewer's node never sends a QUIC handshake to an address a room peer merely
-wrote down. Every node that completes the blob announces `have` for the
-hash on the room's control plane (a sibling of the `media-sub` kind) with
-its own descriptor the same way — an announce that binds {hash, descriptor}
-and is evidence only on the announcer's own authenticated connection,
-accepted from the link whose iroh handshake proved that node id and never
-relayed as someone else's word. The hints in the room's member records are
-the bootstrap roster's and nothing more (`YjsSync` carries them outside the
-signed envelope, `src/network/YjsSync.ts`); the blob lane dials from none
-of them. A library seeder's descriptor rides its signed library entry
-(§7). So the fall-back to a seeder nobody is connected to is a dial by a
-descriptor the seeder signed, or by id alone — never to an address a
-stranger supplied — and holding is proven by serving bytes the hash
-verifies, never by a claim. A viewer resolves a
+wrote down, however it was signed. A provider reachable by none of these
+is not reachable, and the record says who else to ask: every node that
+completes the blob announces `have` for the hash on the room's control
+plane (a sibling of the `media-sub` kind) — an announce that is evidence
+only on the announcer's own authenticated connection, accepted from the
+link whose iroh handshake proved its node id, never relayed as someone
+else's word, and dialled, again, by that id. The hints in the room's
+member records are the bootstrap roster's and nothing more (`YjsSync`
+carries them outside the signed envelope, `src/network/YjsSync.ts`); the
+blob lane dials from none of them. A library seeder's signed entry (§7)
+names its node id, dialled the same way. So the fall-back to a seeder
+nobody is connected to is a dial by id through discovery — never to an
+address a stranger supplied — and holding is proven by serving bytes the
+hash verifies, never by a claim. A viewer resolves a
 hash to the nodes that hold it: the ticket's provider while it is still
 here, else any announcing holder — a hub among them only when it chose to
 hold the blob, since `iroh-blobs` moves bytes from provider to requester
@@ -591,9 +589,9 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 
 | Central piece | Without it |
 |---|---|
-| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and a strict build ignores the ones embedded in a pasted magnet or `.torrent` (`tr=`, `announce`) unless the operator opts in, since shipping no list suppresses nothing the metadata carries. |
+| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
 | DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full DHT node, so a room's hub is its spokes' bootstrap), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. Strict builds have no public swarm at all: the public-DHT side is compiled out, PEX and LSD are off, and the routing table and peer store live under a strict-only path a non-strict run never writes — a persisted table may already hold public nodes, and one full-DHT peer or one PEX exchange would repopulate them, so turning a list off isolates nothing. A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
-| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins too: off in a strict build unless the operator opts in. rqbit's web-seed support is unverified. |
+| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build; never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
 Rules: `librqbit` inside `ssf-p2p-node` as an optional cargo feature
