@@ -137,12 +137,22 @@ describe('the helm, its doors map flooded past the read cap', () => {
     expect(departDisabled(html)).toBe(true);
   });
 
-  it("releases a real door's dock at DEPART", () => {
-    flood(buildDoorPairing(JUNK, { transient: true }));
-    writeDoorPairing('north', VISITOR, DOCKED);
-    withHelm((p) => p.click('#helm-depart-btn'));
-    expect(readFlightRecord().status).toBe('in-flight');
-    expect(readDoor('north')).toBeUndefined();
+  it("releases a real door's dock at DEPART", async () => {
+    vi.useFakeTimers();
+    try {
+      flood(buildDoorPairing(JUNK, { transient: true }));
+      writeDoorPairing('north', VISITOR, DOCKED);
+      withHelm((p) => p.click('#helm-depart-btn'));
+      // DEPART casts off first, under the shared cast-off hold, and departs
+      // once every berth has let go (each a tombstone of its release).
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(readFlightRecord().status).toBe('in-flight');
+      expect(readDoor('north')).toMatchObject({ paired: false, retiredAddress: VISITOR });
+      // The flood's pairings, on doors the room lacks, went with it.
+      expect(readDoor('d:flood-0')).toMatchObject({ paired: false, retiredAddress: JUNK });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('still sees a live dock on a real door, and so where the ship is', () => {

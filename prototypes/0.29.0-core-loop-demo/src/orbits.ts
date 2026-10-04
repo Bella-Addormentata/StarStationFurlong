@@ -335,7 +335,7 @@ export function planTransfer(
 }
 
 /** Eccentric anomaly for a mean anomaly (Kepler's equation, Newton's method). */
-function solveKepler(meanAnomaly: number, e: number): number {
+export function solveKepler(meanAnomaly: number, e: number): number {
   let E = e > 0.8 ? Math.PI : meanAnomaly;
   for (let i = 0; i < 30; i++) {
     const step = (E - e * Math.sin(E) - meanAnomaly) / (1 - e * Math.cos(E));

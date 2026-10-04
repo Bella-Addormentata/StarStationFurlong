@@ -9,15 +9,17 @@
  *    waits for before it hangs up — driven against an in-memory node that
  *    answers SyncStep1 from its own replica, exactly as the real one does.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom, readDoorFrom } from './doorsDoc';
 import {
-  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, underWriteDeadline, writeFarDock,
+  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, underWriteDeadline, writeAndSettle, writeFarDock,
 } from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
 import { classifyDockPort, holdsOurRedock, type NearEnd } from './dockRules';
+import { bindStationMoveDoc, dockLockedByMove, installStationMoveResolver, readRememberedMoves } from './stationMove';
+import { DEFAULT_STATION_RECORD, setStationMoveResolver, type StationMove } from './stations';
 
 const seedFor = (roomId: string): string => btoa(JSON.stringify({ roomId }));
 const SHIP = 'module-ship';
@@ -55,6 +57,14 @@ describe('applyFarDockRequest — UNDOCK', () => {
     const rec = readAllDoorsFrom(doc).get('d:bay');
     expect(rec?.paired).toBe(false);
     expect(rec && !rec.paired && rec.dock).toEqual({ farDoor: near.doorId, farWall: 'x-', farLateral: 0, undockedAt: 200 });
+  });
+
+  it('keeps on the far tombstone where our end\'s station let go, when the request says', () => {
+    const doc = stationDoc();
+    const at = 'adrift:planet-aris:3';
+    applyFarDockRequest(doc, { kind: 'undock', farAddress: seedFor(STATION), nearDoorId: near.doorId, undockedAt: 200, at }, near);
+    const rec = readAllDoorsFrom(doc).get('d:bay');
+    expect(rec && !rec.paired && rec.dock).toEqual({ farDoor: near.doorId, farWall: 'x-', farLateral: 0, undockedAt: 200, at });
   });
 
   it('writes nothing when the far side no longer holds our dock', () => {
@@ -197,6 +207,304 @@ describe('applyFarDockRequest — DOCK', () => {
     );
     expect(gone).toEqual({ result: { ok: false, reason: 'gone' }, wrote: false });
     expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+});
+
+describe('applyFarDockRequest — DOCK into a room between planets', () => {
+  const now = Date.now();
+  const TUG = 'tug-room';
+  /** Under way from Sovereign to Aris, booked from the berth's own room. */
+  const transit: StationMove = {
+    stationId: 'home', welcomeRoomId: STATION, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+    toPlanetId: 'planet-aris', toSlot: 2, departAt: now - 1000, arriveAt: now + 3_600_000,
+    mode: 'thrusters', bookedAt: now - 2000, fuel: 1, fuelDrawn: 1,
+  };
+  /** The berth's room: its port free (our dock released) and these moves booked from it. */
+  function bookedRoom(...moves: StationMove[]): Y.Doc {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    for (const m of moves) doc.getMap('stationMoves').set(`move:1:${m.departAt}:${m.welcomeRoomId}`, m);
+    return doc;
+  }
+  const dockAt = (doc: Y.Doc, room: string, at: number) => applyFarDockRequest(
+    doc,
+    { kind: 'dock', farAddress: seedFor(room), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 },
+    near,
+    room,
+    at,
+  );
+
+  it('refuses while the berth\'s own room has its station in transit — a move this install never heard of — and writes nothing', () => {
+    const doc = bookedRoom(transit);
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc, STATION, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    // Before it leaves, and once it has arrived, the berth docks as usual.
+    expect(dockAt(bookedRoom(transit), STATION, transit.departAt - 1).wrote).toBe(true);
+    expect(dockAt(bookedRoom(transit), STATION, transit.arriveAt).wrote).toBe(true);
+  });
+
+  it('goes by the station this install lists the room at, whatever else its doc holds', () => {
+    const home = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const ours = { ...transit, stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: home };
+    expect(dockAt(bookedRoom(ours), home, now).result).toEqual({ ok: false, reason: 'moving' });
+    // Another station's move in that room's doc (booked before the room was
+    // part of this one) moves nothing here.
+    expect(dockAt(bookedRoom({ ...transit, welcomeRoomId: 'elsewhere' }), home, now).wrote).toBe(true);
+  });
+
+  it('reads the moves its planet summaries gossip — booked in another room of its station, or in a tug', () => {
+    /** Nothing booked in the berth's room: the move only gossiped there, under `key`. */
+    const heardRoom = (key: string, move: StationMove): Y.Doc => {
+      const doc = bookedRoom();
+      doc.getMap('stationSummaries').set(key, {
+        welcomeRoomId: key, name: 'HOME', planetId: 'planet-sovereign', orbitSlot: 1, updatedAt: now, move,
+      });
+      return doc;
+    };
+    const doc = heardRoom(STATION, transit);
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc, STATION, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    const home = DEFAULT_STATION_RECORD.welcomeRoomId;
+    const ours = { ...transit, stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: home };
+    expect(dockAt(heardRoom(home, ours), home, now).result).toEqual({ ok: false, reason: 'moving' });
+    const tow: StationMove = { ...transit, mode: 'tug', tugRoomId: TUG, departAt: now, arriveAt: now + 600_000, bookedAt: now };
+    expect(dockAt(heardRoom(STATION, tow), TUG, now).result).toEqual({ ok: false, reason: 'moving' });
+    // Another station's move, and a move filed under another station's
+    // room, hold nothing here.
+    expect(dockAt(heardRoom('elsewhere', { ...transit, welcomeRoomId: 'elsewhere' }), STATION, now).wrote).toBe(true);
+    expect(dockAt(heardRoom('elsewhere', transit), STATION, now).wrote).toBe(true);
+  });
+
+  it('never takes a pin written in the berth room for another station as the room\'s own station', () => {
+    const ANNEX = 'annex-room';
+    // Station A arrived at Aris long ago, and a client standing in the annex
+    // pinned that arrival there, as it pins every station it lists…
+    const arrived: StationMove = {
+      ...transit, stationId: 'a', welcomeRoomId: 'a-room', fromPlanetId: 'planet-sovereign', fromSlot: 3,
+      toPlanetId: 'planet-aris', toSlot: 4, departAt: now - 10 * 3_600_000, arriveAt: now - 9 * 3_600_000, bookedAt: now - 10 * 3_600_000,
+    };
+    const pin: StationMove = {
+      ...arrived, fromPlanetId: 'planet-aris', fromSlot: 4, departAt: arrived.arriveAt, arriveAt: arrived.arriveAt + 1,
+      bookedAt: now - 8 * 3_600_000, fuel: 0, fuelDrawn: 0, settles: arrived,
+    };
+    // …and now A flies on, as the annex's summaries say.
+    const onward: StationMove = {
+      ...transit, stationId: 'a', welcomeRoomId: 'a-room', fromPlanetId: 'planet-aris', fromSlot: 4,
+      toPlanetId: 'planet-sovereign', toSlot: 5,
+    };
+    const annex = (...booked: StationMove[]) => {
+      const doc = bookedRoom(pin, ...booked);
+      doc.getMap('stationSummaries').set('a-room', {
+        welcomeRoomId: 'a-room', name: 'A', planetId: 'planet-aris', orbitSlot: 4, updatedAt: now, move: onward,
+      });
+      return doc;
+    };
+    // A's pin says nothing of which station the annex is part of.
+    expect(dockAt(annex(), ANNEX, now).wrote).toBe(true);
+    // A move of A booked there does: the annex flies with A.
+    expect(dockAt(annex(onward), ANNEX, now).result).toEqual({ ok: false, reason: 'moving' });
+  });
+
+  it('refuses while the berth room holds more move records than a read covers — past them may lie a move', () => {
+    const flooded = (fill: (doc: Y.Doc) => void): Y.Doc => {
+      const doc = bookedRoom();
+      fill(doc);
+      return doc;
+    };
+    const refused = { result: { ok: false, reason: 'moving' }, wrote: false };
+    // Planet summaries past the scan.
+    const summaries = (n: number) => flooded((d) => { for (let i = 0; i < n; i++) d.getMap('stationSummaries').set(`junk-${i}`, {}); });
+    expect(dockAt(summaries(256), STATION, now).wrote).toBe(true);
+    const doc = summaries(257);
+    const before = Y.encodeStateVector(doc);
+    expect(dockAt(doc, STATION, now)).toEqual(refused);
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    // The move log's keys past the scan.
+    const keys = (n: number) => flooded((d) => { for (let i = 0; i < n; i++) d.getMap('stationMoves').set(`junk:${i}`, 1); });
+    expect(dockAt(keys(256), STATION, now).wrote).toBe(true);
+    expect(dockAt(keys(257), STATION, now)).toEqual(refused);
+    // Its bundles' items past what a read unpacks: entries, or settled records.
+    const done: StationMove = { ...transit, welcomeRoomId: 'elsewhere', departAt: now - 50_000, arriveAt: now - 40_000, bookedAt: now - 50_000 };
+    const bundled = (n: number, extra?: Record<string, unknown>) => flooded((d) => {
+      for (let b = 0; b < n; b++) {
+        const entries: Record<string, StationMove> = {};
+        for (let e = 0; e < 64; e++) entries[`move:${b}:${e}:elsewhere`] = { ...done, fuel: e };
+        d.getMap('stationMoves').set(`moveFold:${(b % 16).toString(16)}:${b.toString(16).padStart(16, '0')}`, { settled: {}, entries });
+      }
+      if (extra) d.getMap('stationMoves').set('moveFold:f:ffffffffffffffff', { settled: extra, entries: {} });
+    });
+    expect(dockAt(bundled(32), STATION, now).wrote).toBe(true);
+    expect(dockAt(bundled(33), STATION, now)).toEqual(refused);
+    expect(dockAt(bundled(32, { w: { n: 1, drawn: 0, floor: 0, recent: [] } }), STATION, now)).toEqual(refused);
+  });
+
+  it('refuses a tug whose tow is booked or under way — not one whose station since moves on its own', () => {
+    const tow: StationMove = { ...transit, mode: 'tug', tugRoomId: TUG, departAt: now, arriveAt: now + 600_000, bookedAt: now };
+    expect(dockAt(bookedRoom(tow), TUG, now).result).toEqual({ ok: false, reason: 'moving' });
+    // Long towed: the station now flies under its own thrusters (known here),
+    // and the tug that once towed it stays where it is.
+    const towed: StationMove = { ...tow, departAt: now - 50_000, arriveAt: now - 40_000, bookedAt: now - 50_000 };
+    const known = new Y.Doc();
+    known.getMap('stationMoves').set(`move:2:${transit.departAt}:${STATION}`, transit);
+    bindStationMoveDoc(known);
+    try {
+      expect(dockAt(bookedRoom(towed), TUG, now).wrote).toBe(true);
+    } finally {
+      bindStationMoveDoc(new Y.Doc());
+    }
+  });
+});
+
+describe('applyFarDockRequest — UNDOCK from a room between planets', () => {
+  const now = Date.now();
+  /** Under way from Sovereign to Aris, booked from the berth's own room. */
+  const transit: StationMove = {
+    stationId: 'home', welcomeRoomId: STATION, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+    toPlanetId: 'planet-aris', toSlot: 2, departAt: now - 1000, arriveAt: now + 3_600_000,
+    mode: 'thrusters', bookedAt: now - 2000, fuel: 1, fuelDrawn: 1,
+  };
+  /** The berth's room: d:bay docked to the ship at 100, and the move booked there. */
+  const movingRoom = (): Y.Doc => {
+    const doc = stationDoc();
+    doc.getMap('stationMoves').set(`move:1:${transit.departAt}:${STATION}`, transit);
+    return doc;
+  };
+  const undockAt = (doc: Y.Doc, undockedAt: number, onlyDockedAt?: number, at = now, room = STATION) => applyFarDockRequest(
+    doc,
+    {
+      kind: 'undock', farAddress: seedFor(room), farDoor: 'd:bay', nearDoorId: near.doorId, undockedAt,
+      ...(onlyDockedAt !== undefined ? { onlyDockedAt } : {}),
+    },
+    near,
+    room,
+    at,
+  );
+  /** A journey that arrived an hour ago, and the pin its arrival wrote. */
+  const journey: StationMove = { ...transit, departAt: now - 7_200_000, arriveAt: now - 3_600_000, bookedAt: now - 7_300_000 };
+  const pinOf = (m: StationMove): StationMove => ({
+    ...m, fromPlanetId: m.toPlanetId, fromSlot: m.toSlot, departAt: m.arriveAt, arriveAt: m.arriveAt + 1,
+    mode: 'thrusters', tugRoomId: undefined, bookedAt: m.arriveAt + 5, settles: m, fuel: 0, fuelDrawn: 0,
+  });
+  /** The berth's room: d:bay docked to the ship at 100, and only these moves' records there. */
+  const roomWith = (...moves: StationMove[]): Y.Doc => {
+    const doc = stationDoc();
+    for (const m of moves) doc.getMap('stationMoves').set(`move:1:${m.departAt}:${m.welcomeRoomId}`, m);
+    return doc;
+  };
+
+  it('holds the dock while the berth\'s own room has its station in transit — a move this install never heard of — and writes nothing', () => {
+    const doc = movingRoom();
+    const before = Y.encodeStateVector(doc);
+    expect(undockAt(doc, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
+  });
+
+  it('judges a release by its own stamp: one made before the station left still lands, however late', () => {
+    expect(undockAt(movingRoom(), transit.departAt - 1).wrote).toBe(true);
+    expect(undockAt(movingRoom(), transit.arriveAt, undefined, transit.arriveAt).wrote).toBe(true);
+  });
+
+  it('never judges a release later than it lands: one stamped past the arrival is held while the station is between planets', () => {
+    const stamp = transit.arriveAt + 60_000;
+    const doc = movingRoom();
+    const before = Y.encodeStateVector(doc);
+    expect(undockAt(doc, stamp)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    // Landing once the station has arrived, it goes, and keeps its own stamp.
+    const arrived = movingRoom();
+    expect(undockAt(arrived, stamp, undefined, transit.arriveAt).wrote).toBe(true);
+    const rec = readAllDoorsFrom(arrived).get('d:bay');
+    expect(rec && !rec.paired && rec.dock?.undockedAt).toBe(stamp);
+  });
+
+  it('judges a release made during a journey by that journey when its room holds only the arrival\'s pin', () => {
+    const mid = Math.floor((journey.departAt + journey.arriveAt) / 2);
+    const doc = roomWith(pinOf(journey));
+    const before = Y.encodeStateVector(doc);
+    expect(undockAt(doc, mid)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    expect(undockAt(roomWith(pinOf(journey)), journey.departAt - 1).wrote).toBe(true);
+    expect(undockAt(roomWith(pinOf(journey)), journey.arriveAt).wrote).toBe(true);
+    // A tug's room by the pin of the tow it flew: its docks were held all
+    // the tow long…
+    const TUG = 'tug-room';
+    const tow: StationMove = { ...journey, mode: 'tug', tugRoomId: TUG };
+    expect(undockAt(roomWith(pinOf(tow)), mid, undefined, now, TUG).result).toEqual({ ok: false, reason: 'moving' });
+    expect(undockAt(roomWith(pinOf(tow)), tow.arriveAt, undefined, now, TUG).wrote).toBe(true);
+    // …but a tow's cancel says it never flew.
+    const cancel: StationMove = {
+      ...tow, toPlanetId: tow.fromPlanetId, toSlot: tow.fromSlot, departAt: tow.departAt + 1, arriveAt: tow.departAt + 2,
+      mode: 'thrusters', tugRoomId: undefined, fuel: 0, fuelDrawn: 0, settles: tow,
+    };
+    expect(undockAt(roomWith(cancel), mid, undefined, now, TUG).wrote).toBe(true);
+    expect(undockAt(roomWith(cancel), mid).wrote).toBe(true);
+  });
+
+  it('never holds the take-back of a DOCK this client did not complete', () => {
+    const doc = movingRoom();
+    expect(undockAt(doc, now, 100).wrote).toBe(true);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(false);
+  });
+});
+
+describe('applyFarDockRequest — a legacy berth\'s release', () => {
+  const now = Date.now();
+  /** Under way from Sovereign to Aris, booked from the berth's own room. */
+  const transit: StationMove = {
+    stationId: 'home', welcomeRoomId: STATION, fromPlanetId: 'planet-sovereign', fromSlot: 1,
+    toPlanetId: 'planet-aris', toSlot: 2, departAt: now - 1000, arriveAt: now + 3_600_000,
+    mode: 'thrusters', bookedAt: now - 2000, fuel: 1, fuelDrawn: 1,
+  };
+  /** The berth's room: d:bay paired to the ship, and these moves booked there. */
+  const room = (...moves: StationMove[]): Y.Doc => {
+    const doc = stationDoc();
+    for (const m of moves) doc.getMap('stationMoves').set(`move:1:${m.departAt}:${STATION}`, m);
+    return doc;
+  };
+  const releaseAt = (doc: Y.Doc, undockedAt: number, at = now) => applyFarDockRequest(
+    doc,
+    { kind: 'release', farAddress: seedFor(STATION), nearDoorId: near.doorId, undockedAt },
+    near,
+    STATION,
+    at,
+  );
+
+  it('answers moving while the berth\'s own room has its station between planets — a move this install never heard of — and writes nothing', () => {
+    const doc = room(transit);
+    const before = Y.encodeStateVector(doc);
+    expect(releaseAt(doc, now)).toEqual({ result: { ok: false, reason: 'moving' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+  });
+
+  it('lets this end go otherwise, and writes nothing: the far end is not its to change', () => {
+    const doc = room();
+    const before = Y.encodeStateVector(doc);
+    expect(releaseAt(doc, now)).toEqual({ result: { ok: true, detail: 'nothing-to-undo' }, wrote: false });
+    expect(Y.encodeStateVector(doc)).toEqual(before);
+    expect(readAllDoorsFrom(doc).get('d:bay')?.paired).toBe(true);
+  });
+
+  it('judges a release by its own stamp, as an UNDOCK, never later than it lands', () => {
+    expect(releaseAt(room(transit), transit.departAt - 1).result.ok).toBe(true);
+    expect(releaseAt(room(transit), transit.arriveAt, transit.arriveAt).result.ok).toBe(true);
+    // Stamped past the arrival, it is held while the station is still between planets.
+    expect(releaseAt(room(transit), transit.arriveAt + 60_000).result).toEqual({ ok: false, reason: 'moving' });
+    expect(releaseAt(room(transit), transit.arriveAt + 60_000, transit.arriveAt).result.ok).toBe(true);
+  });
+
+  it('judges a release made during a journey by that journey when its room holds only the arrival\'s pin', () => {
+    const journey: StationMove = { ...transit, departAt: now - 7_200_000, arriveAt: now - 3_600_000, bookedAt: now - 7_300_000 };
+    const pin: StationMove = {
+      ...journey, fromPlanetId: journey.toPlanetId, fromSlot: journey.toSlot, departAt: journey.arriveAt, arriveAt: journey.arriveAt + 1,
+      bookedAt: journey.arriveAt + 5, settles: journey, fuel: 0, fuelDrawn: 0,
+    };
+    const mid = Math.floor((journey.departAt + journey.arriveAt) / 2);
+    expect(releaseAt(room(pin), mid).result).toEqual({ ok: false, reason: 'moving' });
+    expect(releaseAt(room(pin), journey.departAt - 1).result.ok).toBe(true);
+    expect(releaseAt(room(pin), journey.arriveAt).result.ok).toBe(true);
   });
 });
 
@@ -411,6 +719,83 @@ describe('writeFarDock — a dock between two doors of ONE module', () => {
       ),
     ).toEqual({ ok: false, reason: 'unreachable' });
     expect(Y.encodeStateVector(ship)).toEqual(before);
+  });
+});
+
+describe('writeAndSettle — a move the far room books while the write waits', () => {
+  const home = DEFAULT_STATION_RECORD.welcomeRoomId;
+  const g = globalThis as { localStorage?: unknown };
+  let before: unknown;
+  beforeEach(() => {
+    // Moves are remembered per install, in its localStorage.
+    before = g.localStorage;
+    const store = new Map<string, string>();
+    g.localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+      removeItem: (k: string) => { store.delete(k); },
+    };
+    bindStationMoveDoc(new Y.Doc());
+    installStationMoveResolver();
+  });
+  afterEach(() => {
+    setStationMoveResolver(null);
+    if (before === undefined) delete g.localStorage;
+    else g.localStorage = before;
+  });
+
+  /** Home's berth room: its port free, our dock released. */
+  function berthRoom(): Y.Doc {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    return doc;
+  }
+  const dock = { kind: 'dock' as const, farAddress: seedFor(home), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 };
+  /** A tug taking Home away from now, booked in its room. */
+  function bookTow(doc: Y.Doc): StationMove {
+    const now = Date.now();
+    const tow: StationMove = {
+      stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: home,
+      fromPlanetId: DEFAULT_STATION_RECORD.planetId, fromSlot: DEFAULT_STATION_RECORD.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 2, departAt: now, arriveAt: now + 600_000,
+      mode: 'tug', tugRoomId: 'tug-room', bookedAt: now, fuel: 1, fuelDrawn: 1,
+    };
+    doc.getMap('stationMoves').set(`move:1:${tow.departAt}:${home}`, tow);
+    return tow;
+  }
+  const learned = (tow: StationMove) => readRememberedMoves()
+    .some((m) => m.welcomeRoomId === home && m.departAt === tow.departAt && m.tugRoomId === tow.tugRoomId);
+
+  it('learns one booked while the node acknowledges the write, though it never does', async () => {
+    const doc = berthRoom();
+    let tow: StationMove | null = null;
+    const out = await writeAndSettle(doc, dock, near, home, async () => {
+      tow = bookTow(doc);
+      return false;
+    });
+    expect(out).toEqual({ ok: false, reason: 'unreachable', unconfirmed: true });
+    expect(tow && learned(tow)).toBe(true);
+    // The caller's own check (docking.ts redockPort) then holds the dock.
+    expect(dockLockedByMove([home], Date.now())).toBe(true);
+  });
+
+  it('learns one booked while rival claims settle, before the dock is handed back', async () => {
+    vi.useFakeTimers();
+    try {
+      const doc = berthRoom();
+      let written = false;
+      const out = writeAndSettle(doc, dock, near, home, async () => true, () => { written = true; });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(written).toBe(true);
+      expect(dockLockedByMove([home], Date.now())).toBe(false);
+      const tow = bookTow(doc);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await out).toEqual({ ok: true, detail: 'written' });
+      expect(learned(tow)).toBe(true);
+      expect(dockLockedByMove([home], Date.now())).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

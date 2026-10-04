@@ -124,7 +124,7 @@ import {
 // gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
 // funnels the current-room owner predicate into the device UI.
 import { arrivalNoteHere, clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
-import { completeArrival, setBerthSeedResolver } from "./shipArrival";
+import { completeArrival, dockedToStation, keepRestPlace, setBerthSeedResolver, shipPlaceId } from "./shipArrival";
 // 🛰️ Station keeping: a helm bolted into a station trims the station's orbit.
 // Its trim record rides the room doc (bound beside the ship doc) and its
 // burns are owner-gated with the helm's own commander predicate.
@@ -139,6 +139,7 @@ import {
 // orbits, and flight records written on another install still resolve here.
 import {
   bindPlanetSummaryDoc,
+  installKnownPlacesResolver,
   installTrimResolver,
   LEARNED_PREFIX,
   publishPlanetSummary,
@@ -146,6 +147,7 @@ import {
   resolveStationAlias,
   type ShipStatusInput,
 } from "./planetSummary";
+import { bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, pinSettledArrivals, subscribeStationMove } from "./stationMove";
 import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
@@ -205,7 +207,7 @@ import {
   stationRoomCause,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
-import { directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
+import { adriftPlace, directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -1262,17 +1264,29 @@ function ownStationOf(roomId: string): string | null {
  *  wearing engine, tank and helm keeps its orbit, it never flies). */
 function planetShipStatus(): ShipStatusInput | null {
   const roomId = activeBootstrap?.roomId ?? "";
-  if (!roomId || !isShipReady() || isStationRoom(roomId, []) || isBoltedIntoStation(readPhysicalDoors(), roomId)) return null;
+  // 🚚 The room's own doors, each read past the snapshot's cap: a capped
+  // snapshot could leave out the gangway bolting this module into a station,
+  // or the ship's live dock, and then this would publish where its flight
+  // record left it instead.
+  const doors = readPhysicalDoors();
+  if (!roomId || !isShipReady() || isStationRoom(roomId, []) || isBoltedIntoStation(doors, roomId)) return null;
   const rec = readFlightRecord();
   const stations = listStations();
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
-  const from = byId(rec.locationId);
+  // 🚚 Where the ship is: the station its live dock leads into (a tug docked
+  // by hand at a station it has since towed to another planet, say), else
+  // where its flight record leaves it, wherever its stations have moved
+  // without it (shipPlaceId). It is at that station, or (in open orbit)
+  // left its record's.
+  const host = dockedStationFor(roomId, doors.values());
+  const at = host ?? shipPlaceId(rec);
+  const from = byId(at) ?? byId(rec.locationId);
   const to = byId(rec.destinationId);
   // The ship's own one-room stand-in sits on the default planet until its
   // stations are known: that is no placement, so the entry waits (null).
   const here = currentStation();
   const placed = here && !(here.derived && here.welcomeRoomId === roomId) ? here : null;
-  const planetId = from?.planetId ?? to?.planetId ?? placed?.planetId;
+  const planetId = byId(at)?.planetId ?? adriftPlace(at)?.planetId ?? to?.planetId ?? placed?.planetId;
   if (!planetId) return null;
   const name =
     // Peer-written: only a string is a name.
@@ -1606,6 +1620,7 @@ async function joinRoomAtEpoch(
   bindShipDoc(sync.doc);
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
+  bindStationMoveDoc(sync.doc);
 
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
@@ -1855,6 +1870,9 @@ async function joinRoomAtEpoch(
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🪐 …and the station registry's "which station am I in" (holotable).
     setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // 🚚 …and every station move this install has seen (stationMove.ts), so a
+    // moved station stays moved in every room.
+    installStationMoveResolver();
     // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
     // station's berth is its welcome room, dockable when this client holds a
     // seed for it — the atlas's, or the build's own pass for the default one.
@@ -1897,8 +1915,18 @@ async function joinRoomAtEpoch(
     // 🪐 Stations fly their shared trims, and what changes here goes out:
     // a burn, a flight step, a station the atlas now groups differently.
     installTrimResolver();
+    // Stations heard of around other planets count where slots are picked.
+    installKnownPlacesResolver();
     subscribeStationKeeping(() => publishPlanetSummary());
     subscribeShip(() => publishPlanetSummary());
+    // 🚚 A move this room remembers goes out on the planet summary at once,
+    // and an open exterior redraws its planet: the backdrop reads where the
+    // station is only when it is built, and an arrival settling (its pin,
+    // or a bounce) can move the station to another planet.
+    subscribeStationMove(() => {
+      publishPlanetSummary();
+      refreshExteriorView();
+    });
     // A fitted or removed engine, tank or helm makes or unmakes a ship.
     subscribeFurniture(() => publishPlanetSummary());
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
@@ -1906,7 +1934,8 @@ async function joinRoomAtEpoch(
     // it (the holotable's "you are here", the exterior's planet).
     // 🚀 A ship with no live dock is where its flight record says (cast off,
     // holding, in transit, or arrived berthless), not its own one-room
-    // station, so the backdrop keeps the right planet all the way.
+    // station, so the backdrop keeps the right planet all the way. 🚚 Cast
+    // off, that is where it left, whatever its origin did since (shipPlaceId).
     setRoomStationResolver((roomId) => {
       if (!roomId || roomId !== activeBootstrap?.roomId) return null;
       const docked = dockedStationFor(roomId, readPhysicalDoors().values());
@@ -1917,7 +1946,7 @@ async function joinRoomAtEpoch(
       // follows its flight record (flightCapable, the helm's own gate), and
       // one under way keeps following it should a fitting come off mid-trip.
       const flight = readFlightRecord();
-      return followsFlightRecord(flight.status, flightCapable(isShipReady())) ? flight.locationId : null;
+      return followsFlightRecord(flight.status, flightCapable(isShipReady())) ? shipPlaceId(flight) : null;
     });
     // 🚀 The same rule gates the helm: a station room never departs, and never
     // takes its location from the ship's flight record.
@@ -1978,15 +2007,30 @@ async function joinRoomAtEpoch(
     // 🪐 A ship that sits unchanged still says it is here (a heartbeat:
     // publishPlanetSummary refreshes its stamp once an hour).
     if (++planetSummaryBeat % 600 === 0) publishPlanetSummary();
-    if (!isLocalHelmCommander()) return;
     const rec = readFlightRecord();
+    // Move reconciliation runs on every game in the room, commander or not:
+    // both writes follow from records everyone shares (the same cancel or
+    // pin, ranked as the move it settles), so they need no owner, and a tow
+    // or arrival never waits for the owner to come back.
+    // 🚚 A DEPART that raced a TOW took the tug away: the tow is cancelled.
+    cancelTowLeftBehind(boot.roomId, rec, Date.now(), dockedToStation);
+    // 🚚 Where the ship rests, kept by what this room sees first-hand, so it
+    // stays put once its station leaves without it.
+    if (isShipReady()) keepRestPlace(boot.roomId);
+    // 🪐 Where each station's last move settled it, shared once for everyone:
+    // every station this game lists, aboard or not.
+    if (planetSummaryBeat % 10 === 0) pinSettledArrivals(listStations(), Date.now());
+    if (!isLocalHelmCommander()) return;
     if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
       // Arrive where the ship flew — even if that station has since dropped
       // out of the directory (never silently home).
       writeFlightRecord({
         status: "redocking",
         locationId: rec.destinationId ?? rec.locationId,
+        departedAt: rec.departedAt,
         etaAt: rec.etaAt,
+        castOffAt: rec.castOffAt,
+        destinationAt: rec.destinationAt,
       });
     }
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
@@ -1997,7 +2041,7 @@ async function joinRoomAtEpoch(
         ds
           ? {
               ports: () => ds.listDockPorts(),
-              undock: (doorId) => void ds.undockPort(doorId),
+              undock: (doorId) => ds.undockPort(doorId),
               dock: (doorId) => ds.redockPort(doorId),
             }
           : null,
