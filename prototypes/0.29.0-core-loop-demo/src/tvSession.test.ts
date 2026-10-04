@@ -7,11 +7,12 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindTvDoc, handRemote, iHoldRemote, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
-  setTvIdentity, setTvPageId, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS, TV_LEASE_RENEW_MS,
+  setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
+  TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
-  forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvPlayerCanSeek,
-  tvPlayerPositionMs, tvRoomPlayers,
+  armTvDrive, forgetTv, leaveTvRoom, registerTvPlayerOfRecord, setTvRoomPlayersProvider, tickTvRoom, tvDriveArmed,
+  tvPlayerCanSeek, tvPlayerPositionMs, tvRoomPlayers,
 } from './tvSession';
 
 const TV = 'tv-stand-1';
@@ -31,6 +32,7 @@ beforeEach(() => {
   setTvHostPredicate(() => false);
   setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
   bindTvDoc(new Y.Doc());
+  armTvDrive(true); // the room's docs are bound: World may drive its TVs
 });
 
 describe('tickTvRoom', () => {
@@ -139,7 +141,7 @@ describe('tickTvRoom', () => {
     expect(tvPlayerPositionMs(TV)).toBeNull();
   });
 
-  it('POWER back on parks a programme that was playing when the set went off — the holder\'s write, where it was', () => {
+  it('POWER back on parks a programme that was playing when the set went off — the holder\'s write, where it was, as the switch is seen', () => {
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
     tickTvRoom([TV], now); // the baseline beat
@@ -152,8 +154,49 @@ describe('tickTvRoom', () => {
     run(60_000); // off for a minute, the holder still here: no beat, the programme untouched
     expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: TV_HEARTBEAT_MS });
     tvTogglePower(TV);
+    // Parked on the holder's page as the switch's write lands — before the
+    // theatre's controller (400 ms on its own) or this room tick (500 ms)
+    // could seek to a sample extrapolated across the minute off and beat
+    // that over the saved position: such a beat is refused from here on.
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+    expect(tvHeartbeat(TV, TV_HEARTBEAT_MS + 60_000)).toEqual({ ok: false, error: 'Nothing is playing.' });
     tickTvRoom([TV], now + 500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+  });
+
+  it('a holder who closes the theatre still ends a finite programme where the media ends: the headless beat remembers the end', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, endMs: () => 30_000 });
+    tickTvRoom([TV], now); // the theatre's player is the room's clock: where its media ends is noted
+    tvHeartbeat(TV, 25_000); // the theatre's beat
+    unregister(); // the holder closes the theatre at 25 s; the record runs on headlessly
+    run(3_000);
+    expect(readTv(TV).state).toBe('playing'); // 28 s: not over yet
+    run(3_000);
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null }); // 31 s: over, once, as the controller would have ended it
+    expect(readTv(TV).history).toHaveLength(1); // the film kept in PREVIOUSLY ON
+    // A live stream has no end to remember: it runs on.
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/live.m3u8' });
+    const unregisterLive = registerTvPlayerOfRecord(TV, { positionMs: () => 0, canSeek: () => false, endMs: () => null });
+    tickTvRoom([TV], now);
+    unregisterLive();
+    run(60_000);
+    expect(readTv(TV).state).toBe('playing');
+  });
+
+  it('leaving disarms the drive at once: a tick during the leave\'s flush claims and beats nothing until the next room arms it', () => {
+    setTvIdentity(() => ({ pub: 'BBBBgiver', name: 'Giver' }));
+    pickUpRemote(TV);
+    handRemote(TV, 'AAAAme', 'Me');
+    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
+    leaveTvRoom([TV]);
+    expect(tvDriveArmed()).toBe(false);
+    tickTvRoom([TV], now); // World keeps ticking through the awaited flush
+    expect(iHoldRemote(TV)).toBe(false); // the hand-over is not claimed into a room being left
+    armTvDrive(true); // the next room's docs are bound
+    tickTvRoom([TV], now);
+    expect(iHoldRemote(TV)).toBe(true);
   });
 
   it('a holder tab suspended past the lapse does not renew on waking: the room tick finds no remote of its own', () => {

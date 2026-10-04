@@ -305,31 +305,102 @@ let activeTile = 'youtube';
 let phoneClockTimer = 0;
 let phoneHtml = '';
 
+/** The controls ↑/↓ step through, and that focus lands on. */
+const NAV_STOPS = 'button:not([disabled]), input, select';
+
+/** A control's identity across repaints: its tag and data-tv-* attributes
+ *  (a tile's key, a button's set id, the paste box). '' for anything else. */
+function focusKeyOf(el: HTMLElement | null): string {
+  if (!el) return '';
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(el.dataset)) {
+    if (!k.startsWith('tv') || v === undefined) continue;
+    const attr = k.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
+    parts.push(`[data-${attr}="${v.replace(/["\\]/g, '\\$&')}"]`);
+  }
+  return parts.length ? `${el.tagName.toLowerCase()}${parts.join('')}` : '';
+}
+
+/** Whether the app is in front of the player: its view active, the phone
+ *  up. The phone only slides offscreen, so a control left focused in it
+ *  still receives keys — and moving focus between controls nobody can see
+ *  is worse than useless (the treasury view's rule). */
+function tvAppOnScreen(host: HTMLElement): boolean {
+  if (!host.classList.contains('active')) return false;
+  const phone = host.closest<HTMLElement>('#spacephone-container');
+  return !phone || phone.classList.contains('active');
+}
+
+/** The remote by keyboard. Tab is the phone's own open/close toggle (main.ts
+ *  preventDefaults every press), so this view carries its own movement
+ *  between controls, the treasury view's pattern: ↑/↓ step through the
+ *  visible controls, wrapping; Enter and Space press a button natively. A
+ *  slider and a select keep the arrows for their own values, and a text box
+ *  its caret keys (←/→, Home, End) — only ↑/↓ leave it. Wired once per host,
+ *  in the capture phase: the paste box stops its own keys from bubbling
+ *  (typing must not walk the fox), and ↑/↓ must still move out of it. */
+function wireTvNav(host: HTMLElement): void {
+  if (host.dataset.tvNav) return;
+  host.dataset.tvNav = '1';
+  host.setAttribute('tabindex', '-1'); // focusable by script, never a tab stop
+  host.addEventListener('keydown', (e) => {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+    if (!tvAppOnScreen(host)) return;
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    if (target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === 'range')) return;
+    const stops = [...host.querySelectorAll<HTMLElement>(NAV_STOPS)].filter((el) => el.offsetParent !== null);
+    if (stops.length === 0) return;
+    e.preventDefault();
+    e.stopPropagation(); // a move inside the remote is not a key for the world
+    const here = target ? stops.indexOf(target.closest<HTMLElement>(NAV_STOPS) as HTMLElement) : -1;
+    const step = e.key === 'ArrowDown' ? 1 : -1;
+    stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus({ preventScroll: true });
+  }, true);
+}
+
+/** Land keyboard focus in the app as it opens (main.ts): Tab cannot reach
+ *  it, so the paste box when the remote is held, else the first control,
+ *  takes focus here — or the view itself when there is none to take it. */
+export function focusTvApp(host: HTMLElement): void {
+  wireTvNav(host);
+  const visible = [...host.querySelectorAll<HTMLElement>(NAV_STOPS)].filter((el) => el.offsetParent !== null);
+  const first = visible.find((el) => el.matches('[data-tv-paste]')) ?? visible[0];
+  (first ?? host).focus({ preventScroll: true });
+}
+
 /** Render (and keep rendering) the TV app into its phone view. Called by
  *  main.ts when the view opens; the subscription repaints it while it is the
  *  active view. */
 export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
+  wireTvNav(host);
   const paint = () => {
     if (!host.classList.contains('active')) return;
     const html = renderTvApp(deps);
     // Rebuild only when something other than the clock changed (the status
     // spans tick in place); the clocks move on the timer without a write.
     if (html !== phoneHtml || host.childElementCount === 0) {
-      // Keep what the player is TYPING across a peer-driven repaint — the
-      // paste box only (a focused volume slider is an input too, and its
-      // number must not land in the box).
-      const active = document.activeElement as HTMLInputElement | null;
-      const draft = active && active.matches('input[data-tv-paste]') && host.contains(active)
-        ? { value: active.value, start: active.selectionStart, end: active.selectionEnd }
+      // Keep the player's place across a peer-driven repaint: the control
+      // they had focus on, by its data-tv-* identity (a keyboard player
+      // stepping through the remote must not be thrown out of it on every
+      // heartbeat — and when that control is gone, the view itself keeps
+      // the focus, so ↑/↓ still work), and what they are TYPING — the paste
+      // box only (a focused volume slider is an input too, and its number
+      // must not land in the box).
+      const active = document.activeElement;
+      const inside = active instanceof HTMLElement && host.contains(active) ? active : null;
+      const focusKey = focusKeyOf(inside);
+      const draft = inside instanceof HTMLInputElement && inside.matches('input[data-tv-paste]')
+        ? { value: inside.value, start: inside.selectionStart, end: inside.selectionEnd }
         : null;
       host.innerHTML = html;
       phoneHtml = html;
       wireTvApp(host, deps);
-      if (draft) {
-        const again = host.querySelector<HTMLInputElement>('[data-tv-paste]');
-        if (again) {
+      if (inside) {
+        const again = focusKey ? host.querySelector<HTMLElement>(focusKey) : null;
+        (again ?? host).focus({ preventScroll: true });
+        if (draft && again instanceof HTMLInputElement) {
           again.value = draft.value;
-          again.focus();
           try { again.setSelectionRange(draft.start, draft.end); } catch { /* not selectable */ }
         }
       }

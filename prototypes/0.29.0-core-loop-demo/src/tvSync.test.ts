@@ -554,6 +554,37 @@ describe('the holder as the room\'s clock', () => {
     expect(h.beats).toEqual([0, 0]);
   });
 
+  it('a holder\'s seek while paused is a pending target: a second +10 s before it lands adds up, and the paused room never beats', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true; // YouTube's asynchronous seekTo
+    const h = harness(p, { hold: true });
+    p.position = 10_000;
+    h.set({ positionMs: 10_000 });
+    h.tick(); // playing at 10 s: the baseline beat
+    h.transport({ state: 'paused', positionMs: 10_000, running: false }); // paused where it played
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]); // within the band: nothing to follow
+    expect(h.c.positionMs()).toBe(10_000);
+    h.transport({ positionMs: h.c.positionMs() + 10_000 }); // the phone's +10 s, from where the room is
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:20000']);
+    expect(h.c.positionMs()).toBe(20_000); // the target, while the seek is still landing — not the stale 10 s
+    h.transport({ positionMs: h.c.positionMs() + 10_000 }); // another +10 s before it lands: 30 s, not 20 s again
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:20000', 'seek:30000']);
+    p.land();
+    h.tick();
+    expect(p.position).toBe(30_000);
+    expect(h.c.positionMs()).toBe(30_000); // landed: the player's own clock again
+    expect(h.beats).toEqual([10_000]); // paused: no beat went out
+    // A seek that never lands while paused is given up after the wait, like any.
+    h.transport({ positionMs: 40_000 });
+    h.tick();
+    expect(h.c.positionMs()).toBe(40_000);
+    h.tick(TV_SEEK_WAIT_MS);
+    expect(h.c.positionMs()).toBe(30_000); // the target dropped: the player, wherever it is
+  });
+
   it('a hand-over while a seek is still landing leaves nothing behind: picked up again, the page follows the room once and beats from there', () => {
     const p = new FakePlayer(true);
     p.lazy = true;

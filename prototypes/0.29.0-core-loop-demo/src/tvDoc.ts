@@ -569,11 +569,17 @@ export function renewRemote(itemId: string, now = clock()): void {
 /** A remote handed to my identity is nobody's page yet: the first of my
  *  pages to see it takes it (two tabs, one key — the loser of the race sees
  *  another page on it and stays a viewer). False when there is nothing to
- *  claim. The giver stays in `by`, so the phone still pops open on receipt. */
-export function claimRemote(itemId: string): boolean {
+ *  claim, or when the hand-over has lapsed by this page's own watch. The
+ *  giver stays in `by`, so the phone still pops open on receipt. */
+export function claimRemote(itemId: string, now = clock()): boolean {
   const { pub, name } = identityProvider();
   const rec = readRemote(itemId);
   if (!pub || rec.holder !== pub || rec.page !== '') return false;
+  // A hand-over this page slept through: by its own watch the lease has
+  // lapsed, and the room counts the remote as free — someone else's pick-up
+  // may be in flight or landed. Claiming it now would revive a hold the room
+  // has let go of; the receiver picks the remote up again, like anyone.
+  if (remoteLapsed(itemId, now)) return false;
   write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: rec.by, page: pageId } satisfies RemoteRecord);
   return true;
 }

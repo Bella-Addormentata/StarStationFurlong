@@ -249,6 +249,17 @@ class ArchiveEmbedAdapter implements Adapter {
   destroy(): void { this.iframe.remove(); }
 }
 
+/** Where a finite media ends, in ms, for the holder's headless beat to close
+ *  the programme there once this theatre is gone (tvSession): a file's whole
+ *  range, from 0. Null for a live stream — an HTML video with no finite
+ *  duration, or a window that does not start at 0 — and for a player that
+ *  does not know yet (YouTube before its metadata reports no range). */
+function mediaEndMs(player: Adapter): number | null {
+  if (player instanceof HtmlVideoPlayerAdapter && !Number.isFinite(player.video.duration)) return null;
+  const range = player.seekableRange();
+  return range && range.startMs === 0 && range.endMs > 0 ? range.endMs : null;
+}
+
 // ── The theatre ──────────────────────────────────────────────────────────────
 
 interface Theatre {
@@ -487,6 +498,7 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       t.unregister = registerTvPlayerOfRecord(t.itemId, {
         positionMs: () => controller.positionMs(),
         canSeek: () => player.canSeek,
+        endMs: () => mediaEndMs(player),
       });
     }
   };

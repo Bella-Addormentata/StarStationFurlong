@@ -16,8 +16,8 @@
  */
 
 import {
-  claimRemote, iHoldRemote, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote,
-  tvDocEpoch, tvHeartbeat, tvNow, tvPause, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  claimRemote, iHoldRemote, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote, subscribeTv,
+  tvDocEpoch, tvHeartbeat, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
 export interface RoomPlayer {
@@ -40,6 +40,12 @@ export function tvRoomPlayers(myPub: string): RoomPlayer[] {
 export interface LivePlayer {
   positionMs: () => number;
   canSeek: () => boolean;
+  /** Where the media ends, in ms, once the player knows it is finite (a
+   *  file's length); null for a live stream, and before the player knows.
+   *  Remembered here while the player is registered, so the holder's
+   *  headless beat still ends the programme where the media does after the
+   *  theatre is closed (a viewer's player ending stops nothing, by design). */
+  endMs?: () => number | null;
 }
 
 /** TVs whose playback clock a live player (the theatre) is driving. */
@@ -83,43 +89,90 @@ function seePower(id: string): SeenPower | undefined {
   return was && was.epoch === seen.epoch ? was : undefined;
 }
 
+/** POWER back on with the programme still 'playing' from before the set
+ *  went off, and untouched since (its `jump` where it was — PLAY NOW turns
+ *  the set on too, and that is a new programme): the holder parks it where
+ *  it was. The body button lives in its own key and never touches the
+ *  programme's slot — that write is the holder's, here. Run from the doc's
+ *  own notify as the switch's write lands (below), not only from the tick:
+ *  the theatre's controller runs every 400 ms on its own, and between the
+ *  write and this page's next tick it would seek to a sample extrapolated
+ *  across the whole off interval and beat that position over the saved one
+ *  — a minute off would have parked at 63 s, not 3 s. */
+function parkIfPowerReturned(id: string): void {
+  const was = seePower(id);
+  if (!was || was.on || !readPower(id).on || !iHoldRemote(id)) return;
+  const programme = readProgramme(id);
+  if (programme.jump === was.jump && programme.state === 'playing') tvPause(id, programme.positionMs);
+}
+
+/** The end of the media as the last player of record reported it, per set,
+ *  with the programme it belonged to (`started`): the headless beat closes
+ *  the programme there instead of counting past it for good. */
+interface KnownEnd {
+  started: number;
+  endMs: number;
+}
+const knownEnds = new Map<string, KnownEnd>();
+
+/** Whether this page drives its room's TVs at all. Cleared SYNCHRONOUSLY as
+ *  a room is left (leaveTvRoom, from main.ts leaveRoomNow) and armed again
+ *  only once the next room's docs and layout are bound (main.ts joinRoom):
+ *  World keeps ticking through the leave's awaited flush, with the old
+ *  furniture and the old TV doc still here, and a tick in that window would
+ *  claim a hand-over into a room being left, beat its clock, or put the
+ *  departed room's WATCH chip back up with its theatre a click away. */
+let driveArmed = true;
+export function armTvDrive(on: boolean): void {
+  driveArmed = on;
+}
+export function tvDriveArmed(): boolean {
+  return driveArmed;
+}
+
+/** The sets the last tick drove: what the doc listener below parks for. */
+let liveIds: readonly string[] = [];
+subscribeTv(() => {
+  if (!driveArmed) return;
+  for (const id of liveIds) parkIfPowerReturned(id);
+});
+
 /** Drive every TV in the room (ids of the smart-tv / tv-stand items). */
 export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
+  if (!driveArmed) return;
+  liveIds = itemIds;
   const live = new Set(itemIds);
   for (const id of [...lastRenew.keys()]) if (!live.has(id)) lastRenew.delete(id);
   for (const id of [...lastHeadlessBeat.keys()]) if (!live.has(id)) lastHeadlessBeat.delete(id);
   for (const id of [...lastPower.keys()]) if (!live.has(id)) lastPower.delete(id);
+  for (const id of [...knownEnds.keys()]) if (!live.has(id)) knownEnds.delete(id);
   for (const id of itemIds) {
     // A remote handed to my identity is nobody's page yet: this page takes
     // it (two tabs, one key — the first to tick wins, the other stays a
     // viewer). The claim refreshes the lease, so it is this tick's renewal
     // too, and `by` stays the giver until the next one: the phone's cue.
-    if (claimRemote(id)) lastRenew.set(id, now);
+    if (claimRemote(id, now)) lastRenew.set(id, now);
+    // The switch, for a flip the doc listener did not see (this page's
+    // first tick on the set; a listener call before the tick named it).
+    parkIfPowerReturned(id);
     if (!iHoldRemote(id)) {
       lastRenew.delete(id);
       lastHeadlessBeat.delete(id);
-      seePower(id);
       continue;
-    }
-    // POWER back on with the programme still 'playing' from before the set
-    // went off, and untouched since (its `jump` where it was — PLAY NOW
-    // turns the set on too, and that is a new programme): the holder parks
-    // it where it was. The body button lives in its own key and never
-    // touches the programme's slot — that write is the holder's, here.
-    const was = seePower(id);
-    const programme = readProgramme(id);
-    if (was && !was.on && readPower(id).on && programme.jump === was.jump && programme.state === 'playing') {
-      tvPause(id, programme.positionMs);
     }
     if (now - (lastRenew.get(id) ?? -Infinity) >= TV_LEASE_RENEW_MS) {
       renewRemote(id, now);
       lastRenew.set(id, now);
     }
+    const rec = readTv(id);
     if (playersOfRecord.has(id)) {
       lastHeadlessBeat.delete(id);
+      // Where the media ends, while a player can say: the headless beat
+      // below closes the programme there once the theatre is gone.
+      const end = playersOfRecord.get(id)?.endMs?.();
+      if (typeof end === 'number' && Number.isFinite(end) && end > 0) knownEnds.set(id, { started: rec.started, endMs: end });
       continue;
     }
-    const rec = readTv(id);
     // Headless: free-run the clock so the room keeps a sample to anchor to.
     // A scheduled programme flips to playing at T0 the same way the theatre
     // would: readPlayback reports 'playing' past T0 to the HOLDER, and this
@@ -127,6 +180,17 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     const pb = readPlayback(id, now);
     if (pb.state !== 'playing' || !rec.source) {
       lastHeadlessBeat.delete(id);
+      continue;
+    }
+    // The media ran out while nobody here was watching: over, once — as
+    // the theatre's controller ends it when the holder's player ends. A
+    // viewer's player ending stops nothing; without this the room would
+    // read "playing" for good after the holder closed the theatre.
+    const known = knownEnds.get(id);
+    if (known && known.started === rec.started && pb.positionMs >= known.endMs) {
+      tvStop(id);
+      lastHeadlessBeat.delete(id);
+      knownEnds.delete(id);
       continue;
     }
     if (now - (lastHeadlessBeat.get(id) ?? -Infinity) >= TV_HEARTBEAT_MS) {
@@ -139,12 +203,15 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
 /** Put down every remote this client holds — called as the room is left,
  *  before its doc goes (main.ts leaveRoomNow). */
 export function leaveTvRoom(itemIds: readonly string[]): void {
+  driveArmed = false; // synchronously: the next tick, mid-leave, does nothing
+  liveIds = [];
   for (const id of itemIds) {
     if (iHoldRemote(id)) putDownRemote(id);
   }
   lastRenew.clear();
   lastHeadlessBeat.clear();
   lastPower.clear();
+  knownEnds.clear();
 }
 
 /** A set removed from the room: this client lets go of its remote and of the
@@ -155,4 +222,5 @@ export function forgetTv(itemId: string): void {
   lastRenew.delete(itemId);
   lastHeadlessBeat.delete(itemId);
   lastPower.delete(itemId);
+  knownEnds.delete(itemId);
 }
