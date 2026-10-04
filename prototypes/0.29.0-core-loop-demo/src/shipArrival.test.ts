@@ -672,9 +672,44 @@ describe('where a ship with no live dock is', () => {
     const arrived: FlightRecord = { status: 'redocking', locationId: 'furlong-station', departedAt: now - 2, etaAt: now - 1, destinationAt: then };
     expect(shipPlaceId(arrived, now)).toBe(then);
     expect(shipPlaceId({ ...arrived, destinationAt: adriftAt('planet-aris', 0) }, now)).toBe('furlong-station');
-    // A flight that kept no place, and a ship at rest, go by the record.
+    // A flight that kept no place, with no move known since it cast off, and
+    // a ship at rest, go by the record.
     expect(shipPlaceId({ ...flight, originAt: undefined }, now)).toBe('furlong-station');
     expect(shipPlaceId({ status: 'docked', locationId: 'furlong-station', originAt: left }, now)).toBe('furlong-station');
+  });
+
+  it('keeps a ship whose flight kept no place where its station was at cast-off, by the moves known here', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const left = placeOfStation('furlong-station');
+    // Flights from before flights kept where their stations orbited: cast
+    // off from Furlong (waiting for its window, or on the way), and arrived
+    // at it.
+    const leftAt = now - 120_000;
+    const flying: FlightRecord = {
+      status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: leftAt, etaAt: now + 60_000, castOffAt: leftAt,
+    };
+    const arrived: FlightRecord = { status: 'redocking', locationId: 'furlong-station', departedAt: leftAt, etaAt: now - 1 };
+    expect(shipPlaceId(flying, now)).toBe('furlong-station');
+    expect(shipPlaceId(arrived, now)).toBe('furlong-station');
+    // Furlong left for Aris after the ship cast off: neither went with it.
+    const transfer: StationMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 100_000, arriveAt: now - 60_000,
+      mode: 'thrusters', bookedAt: now - 110_000, fuel: 1, fuelDrawn: 0,
+    };
+    expect(writeStationMove(transfer)).toBe(true);
+    expect(listStations().find((st) => st.id === 'furlong-station')!.planetId).toBe('planet-aris');
+    expect(shipPlaceId(flying, now)).toBe(left);
+    expect(shipPlaceId(arrived, now)).toBe(left);
+    // Cast off once Furlong was at Aris: there with it, by the record.
+    expect(shipPlaceId({ ...flying, departedAt: now - 50_000, castOffAt: now - 50_000 }, now)).toBe('furlong-station');
+    expect(shipPlaceId({ ...arrived, departedAt: now - 50_000 }, now)).toBe('furlong-station');
   });
 
   it('keeps a ship at rest where it came to rest, however its station moves and whatever moves are known', () => {
@@ -1530,7 +1565,7 @@ describe('what the helm hears after an arrival DOCK', () => {
     // Furlong's berth is its welcome room, and the port's tombstone names
     // another pass to it: the arrival re-points it, under a stamp after the
     // ship came to rest (which, still named by the rest, reads as Furlong
-    // letting go of it wherever Furlong is).
+    // letting go of it where the ship arrived).
     const seed = `ssf://room#room=${home.welcomeRoomId}`;
     setStationDirectory({ stations: () => [{ ...DEFAULT_STATIONS[0], berth: { address: seed, farDoor: 'south' } }, DEFAULT_STATIONS[1]] });
     writeDoorTombstone('north', `ssf://room?x=1#room=${home.welcomeRoomId}`, { farDoor: 'south', undockedAt: 2000 });
@@ -1556,6 +1591,49 @@ describe('what the helm hears after an arrival DOCK', () => {
       expect(outcome).toEqual({ kind: 'none', stationName: 'Furlong Station', reason: 'in-transit' });
       // Held by no dock: where it arrived, not carried to Aris.
       expect(readRestPlace()).toEqual({ at: then, since: expect.any(Number) });
+      expect(shipPlaceId(readFlightRecord())).toBe(then);
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  it('left where it arrived while the DOCK still waits, through the rest upkeep, once the far room told of a move', async () => {
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const then = placeOfStation('furlong-station');
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    setStationDirectory({ stations: () => [{ ...DEFAULT_STATIONS[0], berth: { address: seed, farDoor: 'south' } }, DEFAULT_STATIONS[1]] });
+    writeDoorTombstone('north', `ssf://room?x=1#room=${home.welcomeRoomId}`, { farDoor: 'south', undockedAt: 2000 });
+    let answer: (ok: boolean) => void = () => {};
+    const docking = {
+      ...fakeDocking(['north']),
+      // The far lookup learns Furlong had already gone to Aris, and the
+      // answer waits on the far write's ack and settle.
+      dock: () => {
+        setStationMoveResolver((st) => (st.id === 'furlong-station' ? {
+          stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+          toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 50_000, arriveAt: now - 10_000,
+          mode: 'thrusters', bookedAt: now - 55_000, fuel: 1, fuelDrawn: 0,
+        } : null));
+        return new Promise<boolean>((r) => { answer = r; });
+      },
+    };
+    fly('high-orbit', 'furlong-station');
+    try {
+      const heard: ArrivalOutcome[] = [];
+      expect(completeArrival(docking, { onSettled: (o) => heard.push(o) })?.kind).toBe('docking');
+      // The re-pointed port, named by the rest, reads as a release where the
+      // ship arrived: never as one of Furlong at Aris, while the DOCK waits
+      // or once the flight watch's upkeep (main.ts, each second) has kept it.
+      expect(shipPlaceId(readFlightRecord())).toBe(then);
+      keepRestPlace('ship-room');
+      expect(readRestPlace()?.at).toBe(then);
+      expect(shipPlaceId(readFlightRecord())).toBe(then);
+      answer(false);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(heard).toEqual([{ kind: 'none', stationName: 'Furlong Station', reason: 'in-transit' }]);
+      expect(readRestPlace()?.at).toBe(then);
+      expect(readRestPlace()?.docks).toBeUndefined();
       expect(shipPlaceId(readFlightRecord())).toBe(then);
     } finally {
       setStationMoveResolver(null);

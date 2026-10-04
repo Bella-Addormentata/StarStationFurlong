@@ -261,9 +261,17 @@ export function shipPlaceId(
     const beside = [listed, resting.from].find((st) => isAt(st, resting.at, now));
     return beside ? beside.id : resting.at;
   }
-  const kept = rec.status === 'redocking' ? rec.destinationAt
+  const keptAt = rec.status === 'redocking' ? rec.destinationAt
     : rec.status === 'in-flight' ? rec.originAt
       : undefined;
+  // A flight that kept none (written before flights did, or cast off for a
+  // station not listed then): where the station left from on its first move
+  // since the ship cast off, among the moves known here, which is where it
+  // was then (as completeArrival reads it).
+  const leftAt = rec.castOffAt ?? rec.departedAt;
+  const left = keptAt === undefined && (rec.status === 'redocking' || rec.status === 'in-flight') && listed && leftAt !== undefined
+    ? stationLeftFrom(listed, leftAt, now) : null;
+  const kept = keptAt ?? (left ? adriftAt(left.planetId, left.orbitSlot) : undefined);
   if (kept === undefined || !adriftPlace(kept)) return rec.locationId;
   return isAt(listed, kept, now) ? rec.locationId : kept;
 }
@@ -629,6 +637,16 @@ function restBeside(locationId: string, now: number, docks: string[]): void {
   if (!writeRestPlace(rest)) writeRestPlace(null);
 }
 
+/** 🚚 What an arrival re-points its port with before the DOCK (`memory`,
+ *  planArrivalDock's retarget): where the ship arrived (`arrived`, the rest
+ *  restBeside wrote) as the place the tombstone lets go at. The rest names
+ *  that port until the DOCK answers, so its tombstone reads as a release
+ *  (restingPlace), and the ship never went where the station turns out to be
+ *  by moves heard meanwhile (the far room's, as the DOCK asks it). */
+function retargetAt(memory: DockBerthMemory, arrived: RestPlace | null): DockBerthMemory {
+  return arrived ? { ...memory, at: arrived.at } : memory;
+}
+
 /** 🚚 An arrival's DOCK refused: the rest it wrote (`arrived`, restBeside)
  *  names no dock any more, so the ship rests where it arrived, never where
  *  the station is now (the port's tombstone, re-pointed at the berth as the
@@ -904,12 +922,12 @@ export function completeArrival(
   // Arrived, docking through this port: should the berth refuse the DOCK, the
   // ship rests here without one.
   restBeside(rec.locationId, now, [plan.doorId]);
-  if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
+  const arrived = readRestPlace();
+  if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, retargetAt(plan.retarget, arrived));
   // The answer belongs to the ship's room and to this arrival: once the
   // player has joined another room (whose helm is the one shown now), or the
   // ship has left again before the berth answered, it is not heard.
   const shipRoom = currentRoomId();
-  const arrived = readRestPlace();
   const settled = (ok: boolean | void): void => {
     if (currentRoomId() !== shipRoom) return;
     const flight = readFlightRecord();
