@@ -97,7 +97,9 @@
  * goes on from the shared one and carries it (TrimBurn.from). Each trim
  * counts the burns along its line (OrbitTrim.seq), so burns from any of the
  * station's helm rooms continue one orbit, whatever their clocks
- * (isNewerTrim).
+ * (isNewerTrim). A burn replays after every burn its room's log held when it
+ * was written, even one stamped ahead of the writer's clock (TrimBurn.order),
+ * so no burn lands twice through a trim carried past it.
  *
  * Pure except for the doc binding. Pinned by stationKeeping.test.ts.
  */
@@ -292,6 +294,12 @@ export interface TrimBurn {
    *  orbit from it at this burn, unless this room's own trim there is newer
    *  by then. */
   from?: OrbitTrim;
+  /** Where the replay takes it, when that is after `at`: just past the last
+   *  burn its room's log held when it was written (writeTrimBurn). So a burn
+   *  pressed after one stamped ahead of this clock (a tab running fast)
+   *  still replays after it, as its writer saw them, and a trim it carries
+   *  never meets that burn again. Left out, `at`. */
+  order?: number;
 }
 
 /** A burn that fired, as the stick and the dashboard show it. */
@@ -342,6 +350,10 @@ const MAX_AT_MS = ORBIT_EPOCH_MS + 100 * 365.25 * 24 * 3600 * 1000;
  *  exact. */
 const MAX_TRIM_SEQ = 2 ** 40;
 
+/** A burn's place in the replay (TrimBurn.order) is at most this: past the
+ *  latest time a burn may carry by one per burn a log can hold, twice over. */
+const MAX_ORDER = MAX_AT_MS + 2 * MAX_LOG;
+
 /** A burn takes at most this much fuel: a bound on a peer-written entry, far
  *  above TRIM_FUEL. */
 const MAX_BURN_FUEL = 1_000;
@@ -382,7 +394,9 @@ export function isTrimBurn(v: unknown): v is TrimBurn {
     && isBurnTime(r.at)
     && typeof r.fuel === 'number' && r.fuel > 0 && r.fuel <= MAX_BURN_FUEL
     && (r.cap === undefined || (typeof r.cap === 'number' && r.cap >= 0 && r.cap <= FUEL_METER_MAX))
-    && (r.from === undefined || (isOrbitTrim(r.from) && r.from.planetId === r.planetId && r.from.slot === r.slot));
+    && (r.from === undefined || (isOrbitTrim(r.from) && r.from.planetId === r.planetId && r.from.slot === r.slot))
+    && (r.order === undefined
+      || (typeof r.order === 'number' && r.order > (r.at as number) && r.order <= MAX_ORDER));
 }
 
 /** A settlement names at most this many log keys: every burn since the last
@@ -452,6 +466,7 @@ function cleanBurn(b: TrimBurn): TrimBurn {
   const out: TrimBurn = { planetId: b.planetId, slot: b.slot, dir: b.dir, at: b.at, fuel: b.fuel };
   if (b.cap !== undefined) out.cap = b.cap;
   if (b.from !== undefined) out.from = cleanTrim(b.from);
+  if (b.order !== undefined) out.order = b.order;
   return out;
 }
 
@@ -605,10 +620,13 @@ export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planet
   return { planetId: burn.planetId, slot: burn.slot, dRadiusKm, dPhase: signedAngle(dPhase), at: burn.at, last: burn.dir, seq: nextSeq(current) };
 }
 
-/** Burn order: by time, then by every other field, so all clients replay
- *  the same burns in the same order (plain code-unit order: never the
- *  locale's). */
+/** Burn order: by place (placeOf), then by time, then by every other field,
+ *  so all clients replay the same burns in the same order (plain code-unit
+ *  order: never the locale's). */
 function burnOrder(a: TrimBurn, b: TrimBurn): number {
+  const placeA = placeOf(a);
+  const placeB = placeOf(b);
+  if (placeA !== placeB) return placeA - placeB;
   if (a.at !== b.at) return a.at - b.at;
   if (a.dir !== b.dir) return a.dir < b.dir ? -1 : 1;
   if (a.planetId !== b.planetId) return a.planetId < b.planetId ? -1 : 1;
@@ -620,6 +638,11 @@ function burnOrder(a: TrimBurn, b: TrimBurn): number {
   const fromA = a.from ? JSON.stringify(cleanTrim(a.from)) : '';
   const fromB = b.from ? JSON.stringify(cleanTrim(b.from)) : '';
   return fromA === fromB ? 0 : fromA < fromB ? -1 : 1;
+}
+
+/** Where the replay takes a burn: its place (TrimBurn.order), else its time. */
+function placeOf(b: Pick<TrimBurn, 'at' | 'order'>): number {
+  return b.order ?? b.at;
 }
 
 /** Where a run of burns leaves the trim, the fuel they drew, and the burns
@@ -724,7 +747,8 @@ function heldBurn(trim: OrbitTrim | null, dir: TrimDirection, at: number): Orbit
 
 /**
  * Where a run of burns leaves the trim, and the fuel they drew: each burn in
- * time order, from the trim and fuel before them. A burn stamped before
+ * burn order (by its place, TrimBurn.order, else its time), from the trim and
+ * fuel before them. A burn stamped before
  * `start`'s last burn (one that reached us after a level write settled the
  * burns `start` sums up) applies at that burn's time. A burn the fuel cannot
  * cover, one that would take the fuel drawn past `ceiling`
@@ -912,13 +936,17 @@ interface RoomReplay {
   settledKeys: string[];
   /** Burns in the log the settlement does not cover yet. */
   pending: number;
+  /** The place of the last of them in burn order (placeOf), or -Infinity: a
+   *  burn written now replays after it (TrimBurn.order). */
+  place: number;
   /** What a level write at `now`, by its writer's clock, keeps (settleLog),
    *  or undefined. */
   settle: (now: number) => KeepingSettlement | undefined;
 }
 
 const NO_REPLAY: RoomReplay = {
-  trim: null, trims: [], fuelDrawn: 0, fired: [], covered: new Set(), settledKeys: [], pending: 0, settle: () => undefined,
+  trim: null, trims: [], fuelDrawn: 0, fired: [], covered: new Set(), settledKeys: [], pending: 0,
+  place: Number.NEGATIVE_INFINITY, settle: () => undefined,
 };
 
 let replayed: { log: number; ship: number; replay: RoomReplay } | null = null;
@@ -1077,7 +1105,8 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
   // write covered that is still in the log, or the next replay would count
   // them again: so the replay takes no more burns than the settlement has
   // room for, and the rest wait for the next level write.
-  const taken = pending.sorted().slice(0, MAX_SETTLED_BURNS - settledKeys.length);
+  const inOrder = pending.sorted();
+  const taken = inOrder.slice(0, MAX_SETTLED_BURNS - settledKeys.length);
   const run = runBurns(taken.map((p) => cleanBurn(p.burn)), start.map(cleanTrim), startFuel, ceiling);
   // Anything malformed under a burn's key is covered too while there is
   // room, so the next burn clears it.
@@ -1092,6 +1121,7 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
     covered,
     settledKeys,
     pending: waiting,
+    place: inOrder.length ? placeOf(inOrder[inOrder.length - 1].burn) : Number.NEGATIVE_INFINITY,
     settle: (now) => {
       if (!settled && keys.length === 0) return undefined;
       // Nothing a settlement keeps is dated past its write, by the writer's
@@ -1229,7 +1259,8 @@ export function readBurnFiring(
 /** The burn firing at `realMs` as the station's helm shows it (its status
  *  line, knob and box, and the console's trim stick): the shared trim's last
  *  one while the helm flies from that trim (helmTrim), or this room's own on
- *  the station's orbit (readBurnFiring), whichever fired later. The stick
+ *  the station's orbit (readBurnFiring), whichever fired later (the shared
+ *  trim's in the same millisecond: it is the one the helm flies). The stick
  *  waits for either (planTrim). */
 export function readHelmFiring(
   realMs: number,
@@ -1240,7 +1271,7 @@ export function readHelmFiring(
   const theirs = shared && helmTrim(station, readOrbitTrim(station), shared) === shared && isFiring(shared, realMs)
     ? lastBurnOf(shared)
     : null;
-  return theirs && (!own || theirs.at > own.at) ? theirs : own;
+  return theirs && (!own || theirs.at >= own.at) ? theirs : own;
 }
 
 /** Does the log hold MAX_LOG burns since the last level write settled it?
@@ -1257,7 +1288,9 @@ export function isBurnLogFull(): boolean {
  * never see one without the other, and the meter it adds to only grows. The
  * burn never writes the fuel level itself, so a REFUEL or DEPART fired at
  * the same moment keeps its cost too (see shipDoc.setFuelDrawMeter). The
- * same write clears the entries the last level write settled. Owner-gated
+ * same write clears the entries the last level write settled. The burn
+ * replays after every burn the log holds as it is written (TrimBurn.order),
+ * so the trim it went on from is the trim it applies to. Owner-gated
  * at the caller. Returns whether it wrote: a malformed burn, a second one
  * from this client in the same millisecond, or one past a full log
  * (isBurnLogFull), is refused.
@@ -1270,8 +1303,11 @@ export function writeTrimBurn(burn: TrimBurn): boolean {
     return false;
   }
   const key = `${BURN_KEY_PREFIX}${boundDoc!.clientID}:${clean.at}`;
-  const { covered, settledKeys, pending } = replayRoom();
+  const { covered, settledKeys, pending, place } = replayRoom();
   if (keepMap!.has(key) || covered.has(key) || pending >= MAX_LOG) return false;
+  // It replays after every burn the log holds, as we saw them, even one
+  // stamped ahead of our clock (TrimBurn.order).
+  if (place >= placeOf(clean)) clean.order = Math.min(MAX_ORDER, place + 1);
   boundDoc!.transact(() => {
     for (const settledKey of settledKeys) keepMap!.delete(settledKey);
     keepMap!.set(key, clean);

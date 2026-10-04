@@ -17,7 +17,7 @@ import { FURNITURE, buildItemGroup, type FurnitureItem } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
 import { createStationHelmUI, setStationHelmCommanderCheck } from './stationHelm';
-import { TRIM_FUEL, TRIM_STEP_KM, applyBurn, bindStationKeepingDoc, readOrbitTrim, setSharedTrimSource } from './stationKeeping';
+import { TRIM_FUEL, TRIM_STEP_KM, applyBurn, bindStationKeepingDoc, readOrbitTrim, setSharedTrimSource, writeTrimBurn } from './stationKeeping';
 import type { OrbitTrim, TrimBurn } from './stationKeeping';
 import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, planetById, registerStation, setStationRoomSource } from './stations';
 
@@ -204,6 +204,34 @@ describe('the helm console\'s sticks', () => {
       anim.update(0.1);
       // AHEAD leans it to the pilot's right.
       expect(gimbal.rotation.z).toBeGreaterThan(0.1);
+    } finally {
+      dispose();
+      setSharedTrimSource(null);
+    }
+  });
+
+  it('leans for the shared trim\'s burn when this room\'s fired in the same millisecond', () => {
+    // Copilot's review of #173: on a tie the stick leaned for this room's
+    // burn, though the station flies the shared trim that beat it.
+    stubSavedRecords();
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationRoomSource(() => 'room-yard');
+    const planetId = planetById(DEFAULT_PLANET_ID).id;
+    const now = Date.now();
+    setSharedTrimSource((st) => (st.id === 'yard'
+      ? { planetId, slot: 1, dRadiusKm: 0, dPhase: 0, at: now, last: 'ahead', seq: 3 }
+      : null));
+    const { group, anim, dispose } = buildHelm();
+    try {
+      saveAsStation('room-yard');
+      writeFuelLevel(40, 100);
+      expect(writeTrimBurn({ planetId, slot: 1, dir: 'back', at: now, fuel: TRIM_FUEL })).toBe(true);
+      for (let i = 0; i < 4; i++) anim.update(0.25);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+      // AHEAD, the shared trim's, leans it to the pilot's right; BACK would lean it left.
+      expect(partIn(group, TRIM_STICK).parent!.rotation.z).toBeGreaterThan(0.1);
     } finally {
       dispose();
       setSharedTrimSource(null);
@@ -526,6 +554,44 @@ describe('the helm dashboard\'s faces', () => {
       expect(burn.from).toEqual(shared);
       expect(readOrbitTrim(st)).toEqual(applyBurn(shared, burn));
       expect(readOrbitTrim(st)).toMatchObject({ dRadiusKm: 2 * TRIM_STEP_KM, last: 'raise' });
+    } finally {
+      ui.unmount();
+      for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
+      setStationHelmCommanderCheck(null);
+      setSharedTrimSource(null);
+    }
+  });
+
+  it('shows the shared trim\'s burn when this room\'s fired in the same millisecond', () => {
+    // Copilot's review of #173: on a tie the status line and the knob showed
+    // this room's burn, though the helm flies the shared trim that beat it.
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationHelmCommanderCheck(() => true);
+    const parts: FurnitureItem[] = [
+      { id: 'sk-engine', kind: 'engine-block', pos: { x: 0, z: 0 }, rot: 0, movable: true },
+      { id: 'sk-tank', kind: 'fuel-tank', pos: { x: 2, z: 0 }, rot: 0, movable: true },
+    ];
+    FURNITURE.push(...parts);
+    const st = DEFAULT_STATION_RECORD;
+    const planetId = planetById(st.planetId).id;
+    const now = Date.now();
+    setSharedTrimSource((s) => (s.id === st.id
+      ? { planetId, slot: st.orbitSlot, dRadiusKm: TRIM_STEP_KM, dPhase: 0, at: now, last: 'raise', seq: 3 }
+      : null));
+    const { shipFace } = shipFaces();
+    const ui = createStationHelmUI({ bolted: () => true, station: () => st, shipFace });
+    const host = new FakeElement('host');
+    try {
+      writeFuelLevel(40, 100);
+      expect(writeTrimBurn({ planetId, slot: st.orbitSlot, dir: 'lower', at: now, fuel: TRIM_FUEL })).toBe(true);
+      ui.mount(host as unknown as HTMLElement);
+      const face = keepFace(host)!;
+      expect(face.querySelector('#sk-msg').textContent).toBe(`BURNING: raising the orbit ${TRIM_STEP_KM} km.`);
+      ui.update(1 / 60);
+      // RAISE pushes the knob up; LOWER would push it down.
+      expect(face.querySelector('#sk-knob').style.transform).toMatch(/^translate\(0px, -[\d.]+px\)$/);
     } finally {
       ui.unmount();
       for (const part of parts) FURNITURE.splice(FURNITURE.indexOf(part), 1);
