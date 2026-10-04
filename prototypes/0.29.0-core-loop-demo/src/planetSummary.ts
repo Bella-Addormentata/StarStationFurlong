@@ -43,7 +43,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
+import { MAX_SUMMARY_CLAIMS, cleanMove, compareMoves, decidingClaimsOf, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { isUsableOrbit, setStationTrimResolver } from './orbits';
 import { MAX_BERTHS, MAX_ORBIT_SLOTS, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver } from './stations';
 import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, StationRecord } from './stations';
@@ -107,6 +107,11 @@ export interface StationSummary {
    *  without this would place the station by its first record. Ranks below
    *  `move`. */
   stands?: StationMove;
+  /** 🎚️ The station's earlier moves some station's latest altitude claim
+   *  needs to stay lost (stationMove.decidingClaimsOf): `move` alone hides
+   *  the claim that beat it. Each ranks below `move`; at most
+   *  MAX_SUMMARY_CLAIMS. Additive: an older client's clean drops them. */
+  claims?: StationMove[];
   /** One reading per room (sorted by room, at most MAX_TRIM_GONE), so one
    *  helm room's take-back never forgets another's. */
   trimGone?: TrimGone[];
@@ -433,6 +438,11 @@ export function cleanStationSummary(v: unknown, now = Date.now()): StationSummar
   // Only beside a move it ranks below: anything else says nothing more.
   if (out.move && isStationMove(v.stands) && isPlausibleMove(v.stands, now) && v.stands.welcomeRoomId === out.welcomeRoomId
     && compareMoves(v.stands, out.move) < 0) out.stands = cleanMove(v.stands);
+  const claims = out.move && Array.isArray(v.claims) && v.claims.length <= MAX_SUMMARY_CLAIMS
+    ? keptClaims(v.claims.filter((c): c is StationMove => isStationMove(c) && isPlausibleMove(c, now)
+      && c.welcomeRoomId === out.welcomeRoomId).map(cleanMove), out.move)
+    : undefined;
+  if (claims) out.claims = claims;
   const gone = cleanTrimGone(v.trimGone, now);
   if (gone) out.trimGone = gone;
   return canonOrder(out);
@@ -694,6 +704,19 @@ function newerBerths(a: StationSummary, b: StationSummary): Gates {
   return { berths: list, berthsAt, ...(rooms ? { berthRoomsAt: rooms } : {}) };
 }
 
+/** 🎚️ Deciding claims beside `move`: each ranks below it, once each,
+ *  newest first, capped (every client settles on the same list). */
+function keptClaims(list: StationMove[], move: StationMove): StationMove[] | undefined {
+  const seen = new Set<string>();
+  const out = list.filter((c) => {
+    const k = JSON.stringify(c);
+    if (seen.has(k) || compareMoves(c, move) >= 0) return false;
+    seen.add(k);
+    return true;
+  }).sort((x, y) => compareMoves(y, x) || (JSON.stringify(x) < JSON.stringify(y) ? -1 : 1)).slice(0, MAX_SUMMARY_CLAIMS);
+  return out.length > 0 ? out : undefined;
+}
+
 /** Merge an incoming station summary into a known one, and the newer trim.
  *  Which record stands: one its owner published (it carries `ownerId`) beats
  *  one nobody owns; between one install's records the newer wins, whatever
@@ -707,7 +730,7 @@ function newerBerths(a: StationSummary, b: StationSummary): Gates {
 export function mergeStation(prior: StationSummary | undefined, incoming: StationSummary, now: number = Date.now()): StationSummary | null {
   if (!prior) return incoming;
   const recordOf = (s: StationSummary): string => JSON.stringify({
-    ...s, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, ownerAliases: undefined,
+    ...s, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, claims: undefined, ownerAliases: undefined,
     berths: undefined, berthsAt: undefined, berthRoomsAt: undefined,
   });
   const owned = (s: StationSummary) => s.ownerId !== undefined;
@@ -747,6 +770,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
     (move && s.stands && JSON.stringify(s.move) === JSON.stringify(move) ? s.stands : undefined);
   const standsAt = newerMove(beside(prior), beside(incoming));
   const stands = move && standsAt && compareMoves(standsAt, move) < 0 ? standsAt : undefined;
+  const claims = move ? keptClaims([...(prior.claims ?? []), ...(incoming.claims ?? [])], move) : undefined;
   const planet = summaryPlanet({ planetId: base.planetId, move, stands }, now);
   const flown = stands ?? move;
   const leftFrom = flown && !flown.settles && now >= flown.arriveAt ? planetById(flown.fromPlanetId).id : null;
@@ -776,6 +800,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
   if (aliases) next.ownerAliases = aliases; else delete next.ownerAliases;
   if (move) next.move = move; else delete next.move;
   if (stands) next.stands = stands; else delete next.stands;
+  if (claims) next.claims = claims; else delete next.claims;
   delete next.berths;
   delete next.berthsAt;
   delete next.berthRoomsAt;
@@ -799,7 +824,7 @@ export function mergeStation(prior: StationSummary | undefined, incoming: Statio
  *  compared, and settled between installs, by their JSON. */
 const SUMMARY_ORDER = [
   'welcomeRoomId', 'name', 'planetId', 'orbitSlot', 'updatedAt', 'berthDoor', 'ownerId', 'ownerAliases',
-  'berths', 'berthsAt', 'berthRoomsAt', 'ext', 'trim', 'move', 'stands', 'trimGone',
+  'berths', 'berthsAt', 'berthRoomsAt', 'ext', 'trim', 'move', 'stands', 'claims', 'trimGone',
 ] as const;
 
 function canonOrder(s: StationSummary): StationSummary {
@@ -1092,7 +1117,7 @@ export function foldOwnStation(
   // The owner id is per install: another install's identical record is the
   // same record, not news to republish over.
   const recordOnly = (a: StationSummary) => JSON.stringify({
-    ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, ownerAliases: undefined, berths: undefined, berthsAt: undefined, berthRoomsAt: undefined,
+    ...a, trim: undefined, trimGone: undefined, move: undefined, stands: undefined, claims: undefined, ownerAliases: undefined, berths: undefined, berthsAt: undefined, berthRoomsAt: undefined,
     updatedAt: 0, ownerId: undefined, ownerInstall: undefined,
   });
   const sameRecord = (a: StationSummary, b: StationSummary): boolean => recordOnly(a) === recordOnly(b);
@@ -1154,7 +1179,7 @@ export function foldOwnStation(
     gates = wholeList(past(0));
   }
   // (What stood beside the known move stays with it: mergeStation keeps it.)
-  const { trim: _unused, trimGone: _unusedGone, move: _unusedMove, stands: _unusedStands, berths: _b, berthsAt: _ba, berthRoomsAt: _bra, ...rest } = base;
+  const { trim: _unused, trimGone: _unusedGone, move: _unusedMove, stands: _unusedStands, claims: _unusedClaims, berths: _b, berthsAt: _ba, berthRoomsAt: _bra, ...rest } = base;
   // A new move freshens an owned summary's stamp too (an unowned record keeps
   // its first stamp; stationRecency counts its move instead), so the caps
   // never drop a station that just moved.
@@ -1539,6 +1564,10 @@ export function publishPlanetSummary(now = Date.now()): void {
     // beside it, so a reader that learns the rival still places it.
     const stands = next.move ? standingInsteadOf(next.move) : null;
     if (stands) next = mergeStation(next, { ...next, stands }, now) ?? next;
+    // 🎚️ And the earlier moves of its that keep another station's altitude
+    // claim lost, which that latest move alone hides.
+    const claims = decidingClaimsOf(k);
+    if (claims.length > 0) next = mergeStation(next, { ...next, claims }, now) ?? next;
     if (next !== known) store.stations[k] = next;
   }
   const ship = ctx.ship();
@@ -1631,6 +1660,7 @@ function applyLearned(store: Store): void {
   for (const s of Object.values(store.stations)) {
     if (s.move) rememberMove(s.move);
     if (s.stands) rememberMove(s.stands);
+    for (const c of s.claims ?? []) rememberMove(c);
   }
   const room = mayBeShipRoom();
   const found = ctx?.currentStation() ?? null;

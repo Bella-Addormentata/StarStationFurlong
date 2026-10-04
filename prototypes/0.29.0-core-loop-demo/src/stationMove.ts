@@ -1353,6 +1353,37 @@ function altitudeEvidence(bests: StationMove[], history: StationMove[], dropped:
   return kept;
 }
 
+/** 🎚️ At most this many deciding claims ride beside a station's summary. */
+export const MAX_SUMMARY_CLAIMS = 4;
+
+/** 🎚️ A station's earlier moves that some station's latest altitude claim
+ *  needs to stay lost (as altitudeEvidence finds them among what this
+ *  install remembers), newest first. Its summary carries them beside its
+ *  latest move: that alone hides the claim that beat the loser, and an
+ *  install that never saw it would accept the loser, unflown and unpaid. */
+export function decidingClaimsOf(welcomeRoomId: string): StationMove[] {
+  const list = readRememberedMoves();
+  const mine = list.filter((m) => m.welcomeRoomId === welcomeRoomId).sort((x, y) => compareMoves(y, x));
+  if (mine.length < 2) return [];
+  const bests: StationMove[] = [mine[0]];
+  const history: StationMove[] = [];
+  const byStation = new Map<string, StationMove[]>();
+  for (const m of list) {
+    if (m.welcomeRoomId === welcomeRoomId) continue;
+    const k = m.welcomeRoomId ? `w:${m.welcomeRoomId}` : `s:${m.stationId}`;
+    const g = byStation.get(k);
+    if (g) g.push(m); else byStation.set(k, [m]);
+  }
+  for (const g of byStation.values()) {
+    g.sort((x, y) => compareMoves(y, x));
+    bests.push(g[0]);
+    history.push(...g.slice(1));
+  }
+  return altitudeEvidence(bests, history, mine.slice(1))
+    .sort((x, y) => compareMoves(y, x))
+    .slice(0, MAX_SUMMARY_CLAIMS);
+}
+
 let notifyQueued = false;
 
 /** notify(), after the current task: coalesced, and never inside the

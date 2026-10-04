@@ -378,7 +378,7 @@ export function altitudeChangedSince(station: MovingStation, sinceMs: number, no
     if (!moveBelongsTo(m, station)) return false;
     const src = m.settles ?? m;
     const since = src.mode === 'orbit' ? src.orbit?.fromSince : src.fromOrbit?.since;
-    return since !== undefined && since > sinceMs && since <= nowMs;
+    return since !== undefined && since >= sinceMs && since <= nowMs;
   });
   if (claimedSince.length === 0) return false;
   // Unless that orbit lost its claim (the station never kept it).

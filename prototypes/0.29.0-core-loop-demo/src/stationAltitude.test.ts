@@ -23,7 +23,8 @@ import {
   setStationTrimResolver as setStationTrimResolverForTest,
 } from './orbits';
 import { stationBodies } from './map';
-import { cleanStationSummary, summaryForStation, unbindPlanetSummaryForTest } from './planetSummary';
+import { cleanStationSummary, mergeStation, summaryForStation, unbindPlanetSummaryForTest } from './planetSummary';
+import type { StationSummary } from './planetSummary';
 import { FUEL_PER_KMS } from './stationDirectory';
 import { applyBurn, planTrim, trimFor } from './stationKeeping';
 import type { OrbitTrim, TrimContext } from './stationKeeping';
@@ -32,6 +33,7 @@ import {
   bindStationMoveDoc,
   cleanMove,
   compareMoves,
+  decidingClaimsOf,
   describeAltitudeRefusal,
   describeMove,
   dockLockedByMove,
@@ -976,5 +978,71 @@ describe('Copilot round 15', () => {
     const B: StationRecord = { id: 'b', name: 'B', planetId: SOV, orbitSlot: 1, welcomeRoomId: 'b-room' };
     const me = listStations({}, [B, THIRD], NOW + 10_000_000).find((s) => s.id === DEFAULT_STATION_ID)!;
     expect(me.orbit).toEqual({ radiusKm: SOV_R + 1_050, phase0: 0.1 });
+  });
+});
+
+describe('Copilot round 16', () => {
+  it('carries the claims that keep another station\'s altitude change lost beside the latest move', () => {
+    store.clear();
+    // A climbs to 1,000 km, then on to 3,000 and back to 2,000; B's later
+    // climb to 1,020 km loses to A's first claim, which A's latest hides.
+    const aHold = climbOf('a', 'a-room', 0, 1_000, NOW);
+    const nextAt = aHold.arriveAt + 1_000;
+    const nextPlan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_000, aHold.orbit!.toPhase0), SOV_R + 3_000, nextAt)!;
+    const aNext: StationMove = {
+      ...aHold, departAt: nextPlan.departAt, arriveAt: nextPlan.arriveAt, bookedAt: nextAt,
+      orbit: {
+        fromRadiusKm: nextPlan.from.radiusKm, fromPhase0: nextPlan.from.phase0, toRadiusKm: nextPlan.to.radiusKm,
+        toPhase0: nextPlan.to.phase0, fromSince: NOW,
+      },
+    };
+    const next2At = aNext.arriveAt + 1_000;
+    const next2Plan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 3_000, nextPlan.to.phase0), SOV_R + 2_000, next2At)!;
+    const aNext2: StationMove = {
+      ...aHold, departAt: next2Plan.departAt, arriveAt: next2Plan.arriveAt, bookedAt: next2At,
+      orbit: {
+        fromRadiusKm: next2Plan.from.radiusKm, fromPhase0: next2Plan.from.phase0, toRadiusKm: next2Plan.to.radiusKm,
+        toPhase0: next2Plan.to.phase0, fromSince: nextAt,
+      },
+    };
+    const bLose = climbOf('b', 'b-room', 1, 1_020, aHold.arriveAt + 500);
+    const soon = aNext2.arriveAt + 1_000;
+    for (const m of [aHold, aNext, aNext2, bLose]) rememberMove(m, soon);
+    const claims = decidingClaimsOf('a-room');
+    expect(claims.length).toBeGreaterThan(0);
+    expect(claims.every((c) => compareMoves(c, aNext2) < 0)).toBe(true);
+    expect(decidingClaimsOf('b-room')).toEqual([]);
+    // They ride A's summary, and a fresh install that learns only the two
+    // summaries still finds B's climb lost.
+    const summary: StationSummary = { welcomeRoomId: 'a-room', name: 'A', planetId: SOV, orbitSlot: 0, updatedAt: soon, move: aNext2, claims };
+    const heard = cleanStationSummary(JSON.parse(JSON.stringify(summary)), soon)!;
+    expect(heard.claims).toEqual(claims);
+    store.clear();
+    rememberMove(bLose, soon);
+    rememberMove(heard.move!, soon);
+    expect(lostAltitudeClaims(readRememberedMoves()).has(altitudeMoveKey(bLose))).toBe(false);
+    for (const c of heard.claims!) rememberMove(c, soon);
+    expect(lostAltitudeClaims(readRememberedMoves()).has(altitudeMoveKey(bLose))).toBe(true);
+    // A claim that does not rank below the move, or another station's, is dropped.
+    expect(cleanStationSummary({ ...summary, move: aNext, claims: [aNext2] }, soon)!.claims).toBeUndefined();
+    expect(cleanStationSummary({ ...summary, claims: [bLose] }, soon)!.claims).toBeUndefined();
+    expect(cleanStationSummary({ ...summary, claims: [{ ...aHold, orbit: undefined }] }, soon)!.claims).toBeUndefined();
+    // Merging keeps both sides' claims, once each.
+    const merged = mergeStation({ ...summary, claims: [aNext] }, { ...summary, claims: [aHold, aNext] }, soon)!;
+    expect(merged.claims).toEqual([aNext, aHold]);
+    store.clear();
+  });
+
+  it('counts a held orbit claimed in the very millisecond of cast-off', () => {
+    const leave: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: NOW + 5_000_000, arriveAt: NOW + 9_000_000, mode: 'thrusters',
+      bookedAt: NOW + 100_000, fuel: 5, fuelDrawn: 10, fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW },
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? leave : null));
+    setAltitudeHistory(() => []);
+    const station = { id: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId };
+    expect(altitudeChangedSince(station, NOW, NOW + 200_000)).toBe(true);
+    expect(altitudeChangedSince(station, NOW + 1, NOW + 200_000)).toBe(false);
   });
 });
