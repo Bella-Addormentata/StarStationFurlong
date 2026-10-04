@@ -119,17 +119,29 @@ viewer at once; the wall clock serves the UTC schedule (`startAt`) and
 nothing in the sync maths.
 `lead` is half the round trip the viewer's `NetworkProvider` measures to the
 node it is connected to, capped at 1 s, and zero for the holder (its own
-writes land locally). That term is an approximation of the one-way transit,
-not a measurement of it — the measured round trip is to the viewer's own
-node, which on a desktop build is loopback — so the honest bound is "one
-delivery lag, corrected within a heartbeat", never clock skew: no device
+writes land locally). That term corrects exactly one hop — the last one,
+from the viewer's own node to its page, which on a desktop build is
+loopback and worth nothing — and no other: the sample's path runs from the
+holder's page through its node and the mesh to the viewer's node before
+that hop, and anchoring at receipt keeps every millisecond of that
+delivery delay in the viewer's position. The honest guarantee is therefore
+the weaker one: each viewer sits BEHIND the holder by its own delivery
+delay, a standing offset that no heartbeat corrects (the next sample
+arrives with the same delay) and that never grows (a heartbeat replaces,
+it does not accumulate, so a one-off spike lasts one heartbeat); two
+viewers differ by the difference of their delays, typically tens of
+milliseconds over a hop or two and inside the seek band; and none of it is
+clock skew: no device
 compares its clock with another's (the `pusherCroupier.ts` rule —
 `leaseLapsesAt` counts a lease term from when THIS page first saw the
 record, never `Date.now()` against a stamp another device wrote — and the
 air-hockey staleness clocks, local receipt time against the local clock;
 NOT `croupier.ts`, whose `isCroupierLive` takes `Date.now() − beat` across
-devices and is the precedent this rule exists to avoid). An end-to-end probe correlated with the current
-holder could replace the term later. Drift correction: `<video>` elements
+devices and is the precedent this rule exists to avoid). An end-to-end
+probe — a viewer's mark echoed by the holder through the record and timed
+on the viewer's own clock — is what would measure the whole path and take
+the offset out; it is a later item, and until it lands the term stays the
+one hop it is. Drift correction: `<video>` elements
 nudge `playbackRate` ±3 % under 1 s of drift and seek beyond 1.5 s; the
 YouTube player only seeks (its rate steps are coarse), with a 1.5 s dead band
 so we never fight its own buffering. Pause is a record write. A late joiner
@@ -249,10 +261,21 @@ torrent tile as library-only, since §6 compiles the torrent client out there.
   (`src-tauri/src/main.rs`, `acquire_p2p_node`), the shell holding only an
   HTTP placeholder for it — so the hand-off crosses that boundary where the
   OS already authenticates: the node writes the token at launch to a file in
-  its per-user data dir readable by that user alone (mode 0600; a spawned
-  node also takes a pairing secret from the shell's environment and writes
-  the file under it), the shell's Rust side reads the file and hands the
-  token to its own webview over `invoke` — never over HTTP. In the EMBEDDED
+  its per-user data dir readable by that user alone (a spawned node also
+  takes a pairing secret from the shell's environment and writes the file
+  under it), the shell's Rust side reads the file and hands the token to
+  its own webview over `invoke` — never over HTTP. "Readable by that user
+  alone" is a creation property, never a tightening after the fact, and it
+  is defined per platform: on Unix, mode 0600 at creation
+  (`OpenOptions::mode(0o600)` with `create_new`); on Windows, where a mode
+  means nothing, a security descriptor set at creation whose DACL is
+  protected — it inherits nothing from the directory — and grants the
+  owning user's SID alone. The file is written under a temporary name in
+  the same directory and renamed into place, so no reader sees a
+  half-written token and the previous launch's file is replaced by the
+  rename, never left behind, and it is removed on a clean exit; a shell
+  that finds the file wider than owner-only, or in a directory it does not
+  own, refuses it and reports, and the proxy is unavailable. In the EMBEDDED
   mode — no sidecar found, the shell starting its own `wt_listener` and HTTP
   API in-process (`src-tauri/src/main.rs`, `NodeMode::Unavailable`) — there
   is no boundary to cross: the shell mints the token itself and hands it to
@@ -567,7 +590,27 @@ unauthenticated, a lost datagram costs only itself, and a forged frame
 fails verification and is dropped and counted (reported when it keeps
 coming) — never a reason to drop the source, since any member could inject,
 and dropping would hand each of them a way to silence any speaker. The
-replay window advances on verified frames only. The cost is 64 bytes a
+replay window advances on verified frames only. Authentication bounds
+nothing by itself, so the lane has budgets enforced on the node BEFORE any
+signature is checked, per authenticated ingress link — the WebTransport
+session or iroh connection a frame arrived on, never per source, since the
+source id is what a flooder forges: a frame-size ceiling per leg from the
+source's announced tier (an Opus frame with its header and signature under
+400 bytes; a video frame fragmented into datagrams and bounded per tier),
+packet-rate and byte-rate ceilings per source per link with a short burst
+allowance (audio: 50 frames and 48 kbps plus a fifth; video: the tier's),
+frames for a source the link holds no subscription for dropped at ingress,
+a cap on the sources one link may carry, and a failed-verification budget
+per link — past a handful of failures a second the LINK is muted for a
+doubling backoff and the event reported, while the source stays up on
+every other path. A hub verifies before it forwards (the signature is
+public-key), so a forged frame dies at its first hop and its sender's link
+pays; an honest hub forwards no forgery, so a failure arriving over a hub
+link is that hub's own doing and the member re-homes rather than keep a
+link that lies. A member or hub that floods invalid or oversized frames
+spends its own link's budget, costs verification only up to it, and takes
+no honest source down; a valid source past its tier is throttled to the
+tier on every link, the ceilings being the tier's, not an estimate's. The cost is 64 bytes a
 frame: about 26 kbps on a 20 ms Opus stream, roughly doubling voice and
 still a tenth of a video stream, and some eighty verifications a second per
 source, a few milliseconds of CPU; a sender may sign a batch of up to three
@@ -665,11 +708,25 @@ Rules: `librqbit` inside `ssf-p2p-node` as an optional cargo feature
 (`torrent`, gated like `chia-lane`), never a second process, and not
 compiled into a strict build at all (the DHT row above). The **host's node
 is the room's one swarm participant**; the file reaches the room over the blob
-lane; viewers join the swarm only by opt-in. Paste only, no search, no
+lane; viewers join the swarm only by opt-in. And the client starts from a
+LOCAL command only, never from the room record: the TV record is
+peer-writable, so a node that reacted to a `torrent` source in it would let
+any member put this node's IP in a public swarm and spend its disk and
+bandwidth. A page starts a torrent on its own node through the node's
+local channel under §3.4's capability token — the paste on the holder's
+page is that command for the holder's node, JOIN SWARM on a viewer's page
+is it for theirs — a node reading a magnet in shared state fetches nothing
+and joins nothing, and the record carries the hash and the host node's
+progress for the screen: it reports a transfer a node already approved
+locally and starts none. The torrent side keeps its own limits beside
+§4's blob-lane caps, viewer-set with defaults: a size cap per torrent and
+a disk quota for torrent data, download and upload rate ceilings, a
+seeding budget — *seed while the TV plays, stop after* by default, else up
+to a ratio or a number of hours — and a count of concurrent torrents.
+Paste only, no search, no
 catalogue. A `fetching` state with the host node's progress on the screen; the
 🕒 schedule is how a torrent is meant to be used. One-line notice that
-BitTorrent uploads as it downloads; owner setting defaults to *seed while the
-TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
+BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews will not play
 `mkv`. A station that passes its library around as torrents runs its own
 `aquatic` tracker and marks them private (BEP 27).
 
@@ -733,6 +790,24 @@ TV plays, stop after*. Prefer `mp4`/`webm` files; most webviews will not play
   would let any room peer blank the whole library. Nobody can make the
   volunteer fetch and seed arbitrary or oversized content, or drop what it
   holds, by writing an op.
+- **Under which authority:** owners' keys rotate and a deed transfers, so
+  every `library-add`, `library-remove` and operator-key op names the
+  authority head it was signed under — the head's sequence number and
+  hash — and the writer's own sequence under it, and a node validates the
+  op against THAT head's writer set, never the current one. Heads form one
+  chain: each is signed by the authority that makes it (the deed holder
+  for a key-set change; for a transfer, the new holder, citing the chain
+  spend that made it so), numbers in sequence, names its predecessor by
+  hash, and carries a cutoff — every earlier writer's last accepted
+  sequence number — so an op under a superseded head is accepted only up
+  to the cutoff its successor recorded for its writer. Historical
+  validation is then the same rule on every node, whenever it syncs: walk
+  the head chain, accept each op under its own head's set up to the next
+  head's cutoff, and refuse a former owner's later signatures everywhere
+  at once; the new holder sets the cutoff and so may drop ops still in
+  flight at the transfer, which is the new holder's prerogative over the
+  new holder's library. A pinned owner key in a station's config is head
+  zero of a chain of one.
 
 ## 8. Tribler / IPv8, evaluated seriously
 
