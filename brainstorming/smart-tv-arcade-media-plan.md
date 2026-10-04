@@ -766,13 +766,36 @@ only when the origin signed it (its page gone, reported by the node that
 saw it go), and a LAPSE — renewals that stopped arriving — is charged to
 the link that carried them, the hub's, since a hub that withheld an
 honest origin's renewals would otherwise park the honest origin; a
-principal a fresh key cannot change and a shared hub connection is not:
+principal a shared hub connection is not — but NOT one a fresh key cannot
+change: a node's id is a key the node mints for itself, and mints again
+wherever it finds no `iroh_node_id.key` (`ssf-p2p-node/src/main.rs`,
+`load_or_create_secret_key`: a new working directory is a new node), so a
+holder of the room key mints origins as cheaply as identities, and the
+per-identity and per-origin budgets catch honest churn and the careless
+flooder, never a minting member — stated as that. What holds against one
+is counted where a key is not the principal: per LINK, at the node that
+holds it — a link is a connection that node admitted, and its connection
+admission (a cap on the links it holds, a rate on new ones: the control
+plane's to enforce, #21) bounds how many minted links arrive and how fast
+— and per SOURCE, below: the sixty-four cap, the batched rotations, the
+storm report. Such a member can fill a source and make it rotate at the
+batched rate, stated as the cost; it cannot take the source down, make a
+rotation cost more than the cap, or open a frame it was not sealed to. A
+principal a fresh key cannot change — the one these budgets and the slot
+sharing below bind to by right — is a MEMBERSHIP CREDENTIAL the room's
+authority issues: the owner or co-host keys of the room's verified
+authority head signing a member's identity key with an expiry
+([chia-authority-architecture.md](chia-authority-architecture.md), once its
+§3 verification is executable), presented with each lease and checked by
+every node that admits; named here as what those rules move to the day
+it exists, identity and origin being the heuristics they bind to until
+then:
 past six departures a minute
 across every identity behind one origin, that origin is parked — its
 identities evicted in ONE rotation, their re-admissions waiting out the
 doubling backoff together — so a client minting identities interrupts a
-source six times, not without end, and the honest spokes behind the same
-hub are not touched. The quota is enforced in layers, each parking only
+source six times before it must mint an origin too, and the honest spokes
+behind the same hub are not touched. The quota is enforced in layers, each parking only
 the offender: a hub applies it to each spoke's link at the hub before
 relaying anything (a spoke's departures count against that spoke, never
 the hub), the sender applies it to the origin a lease names, and the
@@ -791,34 +814,36 @@ open — stated as the cost — rather than the sender's whole budget. A
 subscriber cap per source (sixty-four identities; the hubs' aggregation
 keeps the forwarding tree beneath it) bounds what any rotation costs: one
 sealed key per subscriber, a few milliseconds of X25519 and a few
-kilobytes at the cap — and the cap is SHARED OUT, never first-come, since
-the churn budgets above count departures, and an origin or hub that
-admitted sixty-four minted identities and kept their leases alive would
-fill the source without one departure, every honest listener after it
-refused for good. The sharing is incremental and stays inside the cap (a
-fixed share per link cannot: sixty-four slots hold no floor of eight for
-a ninth link): at every node that admits — the sender for the links it
-holds, a hub for its spokes' links within the slots the sender granted it
-— a link's FIRST identity takes a reserved slot: a free one when there is
-one, else the newest admission of the link holding the most, which is
-evicted (told the source is full at its link, free to ask again as a
-joiner) — one eviction per arriving link, never more, and none when every
-link holds one alone, since then the source is full and the newcomer
-waits for a departure; a link's further identities take free slots in the
-order asked and are never made room for; a freed slot goes first to a
-link waiting for its first, the longest wait first, then to the
-identities asking in order; and an origin behind a link — a spoke's node,
-some page's origin — holds at most eight identities per source (a person
-has a few tabs, not sixty-four), the reserved-and-free rule alone
-governing where the origin IS the link at the node deciding (a station
-hub that is many browsers' origin and connects to the sender itself). So
-one origin or hub may hold many slots only while nobody else asks, gives
-one back to each newcomer that finds the source full (the cost of
-fairness for an honest hub with many spokes: one spoke per such newcomer,
-stated), and never keeps a newcomer out: a minted origin is a new link at
-a hub whose first identity displaces the minter's own newest, and
-sixty-four honest listeners at sixty-four links each hold their one.
-Replay protection is a sliding window per leg and
+kilobytes at the cap — and the cap is SHARED OUT among MEMBERS, never
+first-come, once a member is a principal a fresh key cannot mint (the
+membership credential above), since the churn budgets count departures,
+and a holder of the room key who admitted sixty-four minted identities
+and kept their leases alive would fill the source without one departure,
+every honest listener after it refused for good. The sharing is
+incremental and stays inside the cap (a fixed share per member cannot:
+sixty-four slots hold no floor of eight for a ninth): at every node that
+admits — the sender for the links it holds, a hub for its spokes' within
+the slots the sender granted it — a member's FIRST identity takes a
+reserved slot: a free one when there is one, else the newest admission of
+the member holding the most, which is evicted (told the source is full
+for it, free to ask again as a joiner) — one eviction per arriving
+member, never more, and none when every member holds one alone, since
+then the source is full and the newcomer waits for a departure; a
+member's further identities (its tabs) take free slots in the order asked
+and are never made room for; a freed slot goes first to a member waiting
+for its first, the longest wait first, then to the identities asking in
+order. So one member may hold many slots only while nobody else asks,
+gives one back to each newcomer that finds the source full, and never
+keeps a newcomer out: sixty-four members each hold their one. The
+eviction is keyed to the credential and to nothing a member can mint — on
+a link or an identity it would be the attack it answers, a member minting
+links to displace an honest hub's spokes one per link — so UNTIL the
+credential exists the eviction is off: slots are first-come under the
+cap, a freed slot goes to the longest-waiting joiner, a room-key holder
+can fill a source (the cost stated above), and the enforceable bounds are
+the per-link and per-source ones, the heuristics of eight identities per
+origin and three departures a minute per identity still catching the
+careless. Replay protection is a sliding window per leg and
 epoch, the SRTP shape: a leg's counter only ever goes up within an epoch, a
 new epoch starts a new window, and a new instance is a new source with
 windows of its own (a reloaded sender is a new instance, above, never an old
@@ -1355,15 +1380,45 @@ an opt-in labelled CONVENIENCE that exists only in a build with the
 convenience lanes on (`VITE_SSF_CONVENIENCE_LANES=1`: the 2026‑10‑04 ruling,
 §3.3 — a record that says CDN reads as the station's files in a default
 build, and a link on another server is refused at PUT ON with the reason).
-The station's own files run in a same-origin frame (the canvas must stay
-reachable for the spectator lane), so that frame runs under a
-content-security policy set before its loader is fetched: this origin,
-`blob:`, `data:` and the viewer's own node, nothing else — no update check,
-no netplay signalling, no third party of any kind; `'unsafe-eval'` and
-`'wasm-unsafe-eval'` for the cores. The CDN lane keeps its sandbox (an
-opaque origin) for a wall instead. EmulatorJS has not yet run under the
-policy (its files are never in the repository): the fetch spike is where a
-directive it needs would show, as a console refusal naming it.
+The emulator never runs in the page's own origin, whichever lane its files
+come from: engine code and ROM data are external inputs (a core is a
+third party's build, a ROM is whatever a file or a server held, and a
+core bug a ROM exploits is script in the frame), and a same-origin frame
+— sandboxed with `allow-same-origin`, or not at all — shares the page's
+DOM, its storage and, in the desktop shells, the IPC bridge; a
+content-security policy bounds what a frame may LOAD, never what its
+scripts may reach, so it is no isolation boundary. The frame is an opaque
+origin on every lane (`sandbox` without `allow-same-origin`: scripts,
+pointer lock, forms and popups allowed, nothing else), and everything
+crosses its boundary explicitly: keys reach it by focus (a focused frame
+receives them, and the stage's capture listener keeps them from the
+world); its status and its policy report come out by `postMessage`, the
+page checking the event's source against the frame it mounted and the
+frame posting to `'*'`, since its origin reads null; and the picture,
+when the spectator lane comes, comes out the same way — `ImageBitmap`s
+(or `VideoFrame`s) the frame makes from its own canvas and transfers at
+the lane's rate — never a reach into the frame's canvas, which an opaque
+origin forbids by design and an earlier draft of this paragraph relied
+on. The frame still runs under a content-security policy set before its
+loader is fetched: the station's origin, `blob:`, `data:` and the viewer's
+own node, nothing else — no update check, no netplay signalling, no third
+party of any kind; `'unsafe-eval'` and `'wasm-unsafe-eval'` for the
+cores. An opaque origin's fetches carry `Origin: null`, so the station's
+engine files answer them with `Access-Control-Allow-Origin` (the engine
+and its cores: public files, readable by any page that can reach the
+station anyway, and nothing else of the station's); the ROM never crosses
+as a URL — the page fetches it itself, AS the page (same-origin, or from
+its node under the node's gate, which admits the page's origin and need
+admit no frame without one), under the consent the cabinet already asked,
+and hands the frame the bytes as a `Blob` it plays from a `blob:` URL of
+its own; save states leave the frame as files (EmulatorJS's export), an
+opaque origin having no storage, a station-side store being the blob
+lane's; the desktop shells' protocol handlers must answer the engine's
+fetches the same way, and the IPC bridge must be absent from the frame
+(`__TAURI_INTERNALS__` undefined inside it, else the shell's isolation
+pattern) — both verified by the fetch spike, which is also where a policy
+directive EmulatorJS needs would show, as a console refusal naming it
+(its files are never in the repository).
 
 **Display and controls.** The emulator draws to a canvas. In P1 the picture
 lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
@@ -1377,10 +1432,11 @@ Gamepad API, mouse under pointer lock as a trackball, the virtual gamepad on
 Android.
 
 **Phasing.** P1 cabinet + single player (attract mode, owner-set game or menu,
-EmulatorJS in our origin under the policy above — the CDN lane, with the
-lanes on, sandboxed — P1 focus and controls, the
+EmulatorJS in an opaque-origin frame under the policy above on every lane,
+P1 focus and controls, the
 CSS CRT pass on the stage) → the media lane with subscriptions (shared with
-the TV's screen share and karaoke), which brings the picture and the texture
+the TV's screen share and karaoke), which brings the picture — bridged out
+of the frame as above — and the texture
 CRT pass to the prop → P2 over video → lockstep only for the games that need
 it.
 
