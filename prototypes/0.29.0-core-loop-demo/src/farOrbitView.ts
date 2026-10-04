@@ -41,13 +41,12 @@ import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrb
 import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
-import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
-import { isBoltedIntoStation } from './stationKeeping';
+import { flightCapable, followsFlightRecord } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
-  adriftAt, adriftPlace, currentRoomId, currentStation, isStationRoom, latestMoveOf, listStations, planetById, planetForRoom,
-  roomAdriftPlace, stationInTransit,
+  adriftAt, adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, roomAdriftPlace,
+  stationInTransit,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -234,17 +233,18 @@ function readSource(now: number): Source {
   const components = atlasComponents(atlas);
 
   // Aboard a ship in flight: see the planet from the transfer.
-  // Every room binds a ship doc, so a flight record alone proves nothing: only
-  // a ready ship that is neither a station's own room nor bolted into one
-  // follows its flight (main.ts's planet publisher's test).
+  // Every room binds a ship doc, so a flight record alone proves nothing: the
+  // room follows its record only as main.ts's room resolver has it
+  // (followsFlightRecord: never a station's own room, a docked record only
+  // while the room may fly, and a flight under way whatever fitting comes off
+  // mid-trip).
   let aboard: TransferPlan | null = null;
   // Aboard a ship in open orbit (waiting where its destination station left,
   // or resting there): see the planet from that orbit, not from the ship's
   // own one-room station.
   let adrift: Place | null = null;
-  if (shipDocBound() && isShipReady() && !isStationRoom(roomId, [], all)
-    && !isBoltedIntoStation(readAllDoors(), roomId, atlas)) {
-    const rec = readFlightRecord();
+  const rec = shipDocBound() ? readFlightRecord() : null;
+  if (rec && followsFlightRecord(rec.status, flightCapable(isShipReady()))) {
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
@@ -256,7 +256,10 @@ function readSource(now: number): Source {
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
     }
-    if (!aboard && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    // A docked record's location can still name open orbit after a dock by
+    // hand from there: its live dock, or where it rests, says where it is
+    // (the room resolver, below).
+    if (!aboard && rec.status !== 'docked' && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
