@@ -107,8 +107,13 @@ the sources that fail have to say so on the screen.
 ```
 
 **Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
-every 3 s. Every other client records `receivedAt = Date.now()` when a new
-`seq` lands and computes `expected = positionMs + (now − receivedAt) + lead`.
+every 3 s. Every other client records `receivedAt = performance.now()` when
+a new `seq` lands and computes `expected = positionMs + (now − receivedAt) +
+lead` with the same monotonic `now`. The monotonic clock, never the wall
+clock: `Date.now()` steps on an NTP correction, on a wake from sleep or on
+a manual change, and a step would read as elapsed playback and seek every
+viewer at once; the wall clock serves the UTC schedule (`startAt`) and
+nothing in the sync maths.
 `lead` is half the round trip the viewer's `NetworkProvider` measures to the
 node it is connected to, capped at 1 s, and zero for the holder (its own
 writes land locally). That term is an approximation of the one-way transit,
@@ -221,11 +226,17 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   set a header; a missing or wrong token, or a missing or disallowed
   `Origin`, is a 403 **before any DNS lookup or outbound connection**. Only
   then the host allowlist — and, because a loopback service that fetches
-  URLs is an SSRF surface, the destination is validated AFTER DNS resolution
-  and on EVERY redirect (loopback, private, link-local and metadata addresses
-  refused; redirects capped), with a size ceiling, a timeout and a cap on
-  concurrent fetches. A hostname allowlist alone closes nothing, and a
-  response header gates nothing.
+  URLs is an SSRF surface, the node resolves the name ITSELF, validates every
+  address the answer holds (loopback, private, link-local and metadata
+  addresses refused) and PINS the socket to a vetted address: it connects to
+  the IP with the original name kept as `Host` and SNI, and the HTTP client
+  never resolves the name again on connect — a rebinding resolver would
+  answer the check with a public address and the connect with a private one,
+  so "validated after DNS" alone checks one answer and connects on another.
+  The same resolve, validate and pin runs on EVERY redirect and every retry
+  (redirects capped), with a size ceiling, a timeout and a cap on concurrent
+  fetches. A hostname allowlist alone closes nothing, a response header gates
+  nothing, and a check the connect does not reuse protects nothing.
 - **v1 ships neither on the in-world plane.** The first slice draws the status,
   menu, countdown and now-playing card on the in-world `CanvasTexture` and plays
   the actual video in a **theatre panel** (DOM) that anyone in the room opens
@@ -264,7 +275,15 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
 node (v006 §12.1 already pins it; the `'asset'` envelope kind is reserved for
 it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
 (verified, resumable, in order, so playback can start early) and serve it to
-their own webview with range support. A hash alone starts nothing: a fetch
+their own webview at `/blob/<hash>?cap=…` with range support, behind the
+same request gate as `/api/media` (§3.4): the per-launch capability token
+and an allowed `Origin`, checked before any read of the store. The route
+serves only what the store already holds or is fetching and never starts a
+fetch itself — CORS only governs who may read a response, a `<video src>`
+needs none to make the request, and a hash is no secret once a room record
+carries it, so the hash alone authorizes nothing and without the gate any
+page that can reach loopback could drive reads against the viewer's node.
+A hash alone starts nothing: a fetch
 needs a provider, as an `iroh-blobs` `BlobTicket` carries one beside the
 hash and format. So the `blob` source (§3.1) and a library op (§7) carry the
 hash with the importing node's iroh id — the ticket's shape — and every node
@@ -334,17 +353,24 @@ relays. v006 §9's rule for forwarded voice stands: forwarders see only
 ciphertext (the WebRTC path met it with Encoded Transform; here the sender
 does the same by hand on WebCodecs output — the SFrame shape, RFC 9605).
 Each frame is sealed with an AEAD (XChaCha20-Poly1305 or AES-256-GCM) under
-a per-source media key, the frame counter as the nonce and the routing
-header — source id, key epoch, counter, keyframe flag — as associated data;
-the header is all the node needs to route (the subscriber set), to serve the
-glimpse tier (the keyframe flag) and to drop, and it gets nothing else. The
-sender mints the key, seals it to each subscriber's X25519 key (derived from
-their Ed25519 identity, the libsodium conversion) on the reliable lane when
-the subscription is accepted, and rotates to a new epoch on every departure
-(the departed can open nothing after it) and on a timer. Replay protection
-is a sliding window, the SRTP shape: the sender's counter only ever goes up
-within an epoch; a receiver keeps the highest counter it has accepted and a
-bitmap of the last 128 below it, takes a frame above the highest (and
+a per-LEG key: a source has an audio leg and a video leg, each leg's key is
+derived from the per-source media key with the leg as the label (HKDF), and
+each leg counts its own frames, so two legs never share a nonce space under
+one key — one key with two independent encoder counters would reuse a
+nonce, which breaks the AEAD outright. The frame counter is the nonce, and
+the routing header — source id, leg, key epoch, counter, keyframe flag — is
+the associated data and is under the sender's signature below, so a hub can
+relabel nothing: a frame moved to another leg or another counter neither
+opens nor verifies. The header is all the node needs to route (the
+subscriber set), to serve the glimpse tier (the keyframe flag) and to drop,
+and it gets nothing else. The sender mints the source key, seals it to each
+subscriber's X25519 key (derived from their Ed25519 identity, the libsodium
+conversion) on the reliable lane when the subscription is accepted, and
+rotates to a new epoch on every departure (the departed can open nothing
+after it) and on a timer. Replay protection is a sliding window per leg,
+the SRTP shape: a leg's counter only ever goes up within an epoch; a
+receiver keeps, per leg, the highest counter it has accepted and a bitmap
+of the last 128 below it, takes a frame above the highest (and
 slides the window up), takes a frame inside the window that the bitmap has
 not seen, and drops a duplicate or a counter older than the window — so
 frames that arrive out of order across streams are played once, and a
@@ -585,9 +611,16 @@ sub-kind][len][payload]`, so a browser never chooses routing or authorship
 metadata, and ingress rejects a frame that carries any. Negotiated per link
 by a capability on the M5 control plane; ingress accepts it only from a
 browser that announced it, the relay forwards it only to links that did
-and dedups it on the origin lane id and the input's sequence, local
-delivery hands it to the page as its own message, and a legacy peer is
-never sent one and goes on dropping unknown lengths as it does today. And then the S3 mapping from that proven key to the player
+and dedups it as it dedups the tick today — on `blake3(origin lane id ‖
+the whole extended datagram)`, payload included (`tick_seen_key` in
+`ssf-p2p-node/src/main.rs`, the M5.2 rule the build plan states as "never
+on (origin, seq) alone") — because a dedup keyed on the sequence would let
+a forwarding hub race a doctored copy under a genuine sequence into every
+cache on the way, and the honest copy arriving by another path would be
+dropped before P1 ever saw its MAC fail; loop suppression keys on the
+bytes, and the sequence is enforced by P1 alone, after the MAC verifies.
+Local delivery hands it to the page as its own message, and a legacy peer
+is never sent one and goes on dropping unknown lengths as it does today. And then the S3 mapping from that proven key to the player
 holding the seat. P1 accepts kind-3 inputs only
 from a lane whose proven key is the P2 seat's identity, and only inputs
 that key's session authenticates. Lockstep stays the upgrade for games
