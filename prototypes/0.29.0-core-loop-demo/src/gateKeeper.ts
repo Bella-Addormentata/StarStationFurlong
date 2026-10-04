@@ -56,7 +56,8 @@
  * while its claim settles, or a station move, a tow or this room's flight
  * that starts meanwhile, or this station found gone from where it orbited as
  * the dock began (by the moves the ferry's room holds, learned as a far write
- * learns them); once the ferry's side has docked too, such a gate has the
+ * learns them), or a DEPART begun at the ferry's helm meanwhile (its shared
+ * cast-off hold); once the ferry's side has docked too, such a gate has the
  * dock withdrawn at both ends. The gate is read again before the
  * dock counts, or before it takes a crossing DOCK's stamp: another game may
  * have written over the claim while the ferry's side was asked, and then the
@@ -67,7 +68,8 @@
  * Nothing is written to the gate once the keeper has reset (the player left,
  * even if they came straight back). While a DEPART casts the ferry off under
  * the shared hold (shipDoc.ts readCastOffHold), the keeper takes no step of
- * its own: that DEPART has the docks until it ends.
+ * its own, and a dock of its own under way gives way as above: that DEPART
+ * has the docks until it ends.
  *
  * The gate's record needs the ferry's address and its port's pose (the far
  * wall and lateral): both come from a record in this room that names the
@@ -920,8 +922,9 @@ export type StationDockResult =
          *  or its dock settled (AUTO-DOCK switched off, it no longer admits
          *  the ferry, a station move, a tow or this room's flight locks it,
          *  its station was found gone from where it orbited as the dock
-         *  began, or the keeper reset): the claim is taken back, or a dock
-         *  both ends held is withdrawn at both, where it may be. */
+         *  began, a DEPART began at the ferry's helm, or the keeper reset):
+         *  the claim is taken back, or a dock both ends held is withdrawn at
+         *  both, where it may be. */
         | 'disabled';
       /** A withdrawn dock's release was written to the ferry's room but
        *  never acknowledged: its port may still hold the gate, which has let
@@ -937,11 +940,12 @@ export type StationDockResult =
  * joined; a claim on the ferry the gate already holds is left to land. A dock
  * counts only while both ends hold its stamp, and nothing is written over a
  * gate record another game wrote meanwhile. A gate no longer live (GateEnd),
- * or whose station is found gone from where it orbited as the dock began,
- * once the dock has landed has it withdrawn at both ends. The request
- * carries no requester key: nobody aboard docks it, so a ferry port open only
- * to granted captains refuses it, whoever stands in the station. Never
- * throws.
+ * or whose station is found gone from where it orbited as the dock began, or
+ * a ferry whose helm began a DEPART meanwhile (its shared cast-off hold), has
+ * the claim taken back, or the dock withdrawn at both ends once it has
+ * landed. The request carries no requester key: nobody aboard docks it, so a
+ * ferry port open only to granted captains refuses it, whoever stands in the
+ * station. Never throws.
  */
 export async function stationDock(o: {
   session: FerryDocSession;
@@ -956,20 +960,33 @@ export async function stationDock(o: {
   const doc = session.doc;
   // 🚚 Where this station orbits as the dock begins (none for a lone module).
   const berthAt = gate.place?.();
+  /** Has a DEPART at the ferry's helm taken the shared cast-off hold
+   *  (shipDoc.ts) since the keeper looked (act)? That DEPART has the
+   *  ferry's docks until it ends: a dock landed meanwhile would see the
+   *  ferry fly off from a gate still holding it. A hold that cannot be read
+   *  counts as one. */
+  const departing = (): boolean => {
+    try {
+      return castOffHoldIn(doc.getMap(SHIP_MAP), o.now()) !== null;
+    } catch {
+      return true;
+    }
+  };
   /** Is the gate still one this keeper docks at, its station still where it
-   *  orbited as the dock began? The moves the ferry's room holds are learned
-   *  first, as a far write learns its room's (farDoorWrite.writeAndSettle):
-   *  a station found gone since (left for another planet, on a list here
-   *  that had not heard) is out of the ferry's reach, and a dock to it would
-   *  carry the ferry across without a transfer (as docking.ts redockPort
-   *  rechecks shipArrival.berthStillThere). */
+   *  orbited as the dock began, and no DEPART under way at the ferry's helm?
+   *  The moves the ferry's room holds are learned first, as a far write
+   *  learns its room's (farDoorWrite.writeAndSettle): a station found gone
+   *  since (left for another planet, on a list here that had not heard) is
+   *  out of the ferry's reach, and a dock to it would carry the ferry across
+   *  without a transfer (as docking.ts redockPort rechecks
+   *  shipArrival.berthStillThere). Checked after every wait. */
   const stillLive = (): boolean => {
     try {
       rememberMovesIn(doc);
     } catch (err) {
       console.warn('[gate] reading the moves in the ferry room failed:', err);
     }
-    return gate.live() && gate.place?.() === berthAt;
+    return gate.live() && gate.place?.() === berthAt && !departing();
   };
   const held = (rec: DoorRecord | undefined): rec is DoorPairing => holdsFerry(rec, shipRoomId, shipPort);
   const pairingAt = (dockedAt: number): DoorPairing =>

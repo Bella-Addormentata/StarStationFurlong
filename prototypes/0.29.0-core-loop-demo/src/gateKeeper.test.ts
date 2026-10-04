@@ -75,7 +75,7 @@ import type { GateAccess } from './doorPolicy';
 import { ROOM_SESSION_OPEN_MS } from './roomSession';
 import { GUARD_BAND_MS, legWindowAfter, pauseCheckpoint, skipCheckpoint, startCheckpoint } from './pilotRoute';
 import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep, type KeeperStep } from './routeKeeper';
-import { TANK_CAPACITY } from './shipDoc';
+import { CAST_OFF_HOLD_MS, TANK_CAPACITY } from './shipDoc';
 import { readRememberedMoves, type StationMove } from './stationMove';
 import {
   MIN_WAIT_SECS,
@@ -1043,6 +1043,79 @@ describe('docking from the station side', () => {
     });
     expect(r).toEqual({ ok: false, reason: 'refused' });
     expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+  });
+
+  // Copilot (PR 204, after merge): a DEPART begun at the ferry's helm while
+  // the dock is under way has the ferry's docks until it ends (its shared
+  // cast-off hold), as the keeper's look stands aside for one: the claim is
+  // taken back before the ferry's side is asked, or a dock that landed
+  // meanwhile is withdrawn at both ends, so the ferry never flies off from a
+  // gate still holding it.
+  describe("a DEPART begun at the ferry's helm meanwhile", () => {
+    const depart = (ferry: Y.Doc, at = D0 - SEC) => { ferry.getMap('ship').set('castOff', { by: 'depart-1', at }); };
+    const released = () =>
+      buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 });
+
+    it('takes the claim back, asking nothing of the ferry, when it begins while the claim settles', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      const r = await dock(station, ferry, { wait: async () => { depart(ferry); } });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(leftStop0());
+    });
+
+    it('withdraws the dock at both ends when it begins while the dock settles', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let n = 0;
+      const r = await dock(station, ferry, { wait: async () => { if (++n === 2) depart(ferry); } });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(released());
+    });
+
+    it("withdraws the dock at both ends when it begins while the ferry's side goes unacknowledged", async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      const r = await stationDock({
+        session: { doc: ferry, confirm: async () => { depart(ferry); return false; } },
+        gate: gateEndOn(station),
+        shipRoomId: FERRY,
+        shipPort: PORT,
+        berthing: BERTHING,
+        now: () => D0,
+        wait: instant,
+      });
+      expect(r).toEqual({ ok: false, reason: 'unconfirmed' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(released());
+    });
+
+    it("takes the claim back, leaving a crossing DOCK's stamp to its maker", async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let n = 0;
+      const r = await dock(station, ferry, {
+        wait: async () => {
+          if (++n !== 2) return;
+          ferry.getMap('doors').set(PORT, portDockedAt(D0 - 5));
+          depart(ferry);
+        },
+      });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0 - 5));
+    });
+
+    it('docks as before under a hold that has lapsed (its helm went away mid-way)', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      depart(ferry, D0 - CAST_OFF_HOLD_MS);
+      expect(await dock(station, ferry)).toEqual({ ok: true, dockedAt: D0 });
+      expect(readDoorFrom(station, 'x+')).toEqual(dockOf(D0));
+      expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0));
+    });
   });
 
   // 🚚 As a ship's DOCK rechecks where its berth's station orbits once the
