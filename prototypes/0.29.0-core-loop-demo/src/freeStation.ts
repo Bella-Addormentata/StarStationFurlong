@@ -77,6 +77,10 @@ export function planStationPark(
     orbit: {
       fromRadiusKm: plan.from.radiusKm,
       fromPhase0: plan.from.phase0,
+      // The unflown leg's orbit is no slot's, so it carries a claim stamp
+      // (stationMove.orbitChangeFits): the PARK's own time, so it never
+      // ranks ahead of a claim made before the station parked.
+      fromSince: pose.at,
       toRadiusKm: plan.to.radiusKm,
       toPhase0: plan.to.phase0,
     },

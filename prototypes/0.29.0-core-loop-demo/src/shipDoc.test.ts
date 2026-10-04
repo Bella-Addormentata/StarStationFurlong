@@ -18,27 +18,34 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
+import { DEFAULT_STATIONS, adriftAt, setStationDirectory } from './stationDirectory';
 import {
+  CAST_OFF_HOLD_MS,
   DESTINATIONS,
   TANK_CAPACITY,
   bindShipDoc,
   canDepart,
+  castOffHeldBy,
   clampFuelToCapacity,
   defaultFlight,
   findDestination,
   flightArrived,
   flightProgress,
   flightWritePath,
+  holdCastOff,
   isFlightRecord,
   isLegalFlightTransition,
   pairingAllowedByFlight,
+  readCastOffHold,
   readFlightRecord,
   readFuelLevel,
+  readRestPlace,
+  releaseCastOff,
   shipDocBound,
   subscribeShip,
   writeFlightRecord,
   writeFuelLevel,
+  writeRestPlace,
 } from './shipDoc';
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────
@@ -826,6 +833,33 @@ describe('flight records written on another install', () => {
   });
 });
 
+describe('rest records written on another install', () => {
+  it('name the station the ship rests beside by its portable id, read back as this install\'s', () => {
+    const rooms: Record<string, string> = { 'high-orbit': 'room-high', 'furlong-station': 'r'.repeat(130) };
+    const back: Record<string, string> = { 'shared:room-high': 'high-orbit' };
+    setStationDirectory({
+      stations: () => DEFAULT_STATIONS,
+      resolve: (id) => back[id] ?? null,
+      portable: (id) => (rooms[id] ? `shared:${rooms[id]}` : null),
+    });
+    try {
+      const doc = freshDoc();
+      const at = adriftAt('planet-aris', 2);
+      expect(writeRestPlace({ at, since: 5, from: 'high-orbit' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 5, from: 'shared:room-high' });
+      expect(readRestPlace()).toEqual({ at, since: 5, from: 'high-orbit' });
+      // No portable id, or one too long for the wire: the id as it is.
+      expect(writeRestPlace({ at, since: 6, from: 'l4-anchorage' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 6, from: 'l4-anchorage' });
+      expect(writeRestPlace({ at, since: 7, from: 'furlong-station' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 7, from: 'furlong-station' });
+      expect(readRestPlace()).toEqual({ at, since: 7, from: 'furlong-station' });
+    } finally {
+      setStationDirectory(null);
+    }
+  });
+});
+
 describe('flight times a peer wrote', () => {
   it('refuses unsafe, far-future or endless flights', () => {
     const now = Date.now();
@@ -912,5 +946,61 @@ describe('flightWritePath — copying a derived flight back along legal edges', 
       });
       expect(readFlightRecord()).toEqual(docked);
     }
+  });
+});
+
+describe('a DEPART under way — the shared cast-off hold', () => {
+  const NOW = 1_000_000;
+
+  it('holds DEPART for every helm but the one that took it, until that one ends it', () => {
+    freshDoc();
+    expect(readCastOffHold(NOW)).toBeNull();
+    expect(holdCastOff('a', NOW)).toBe(true);
+    expect(readCastOffHold(NOW + 1)).toEqual({ by: 'a', at: NOW });
+    // Another helm cannot take it, and its end leaves this one alone.
+    expect(holdCastOff('b', NOW + 1)).toBe(false);
+    releaseCastOff('b');
+    expect(castOffHeldBy('a', NOW + 1)).toBe(true);
+    expect(castOffHeldBy('b', NOW + 1)).toBe(false);
+    releaseCastOff('a');
+    expect(readCastOffHold(NOW + 2)).toBeNull();
+    expect(holdCastOff('b', NOW + 2)).toBe(true);
+  });
+
+  it('runs out CAST_OFF_HOLD_MS after it was taken, and no peer stamps one that lasts longer', () => {
+    const doc = freshDoc();
+    expect(holdCastOff('a', NOW)).toBe(true);
+    expect(castOffHeldBy('a', NOW + CAST_OFF_HOLD_MS - 1)).toBe(true);
+    expect(readCastOffHold(NOW + CAST_OFF_HOLD_MS)).toBeNull();
+    expect(holdCastOff('b', NOW + CAST_OFF_HOLD_MS)).toBe(true);
+    // Its own end leaves the hold taken since alone.
+    releaseCastOff('a');
+    expect(castOffHeldBy('b', NOW + CAST_OFF_HOLD_MS)).toBe(true);
+    // Stamped further ahead than a hold lasts (a skewed clock, a hostile
+    // peer): none.
+    doc.getMap('ship').set('castOff', { by: 'x', at: NOW + 2 * CAST_OFF_HOLD_MS });
+    expect(readCastOffHold(NOW)).toBeNull();
+    for (const junk of [null, 'a', { by: '', at: NOW }, { by: 'x'.repeat(200), at: NOW }, { by: 'x', at: Number.NaN }]) {
+      doc.getMap('ship').set('castOff', junk as any);
+      expect(readCastOffHold(NOW)).toBeNull();
+    }
+  });
+
+  it('of two helms taking it at once, keeps one on both: only that DEPART still holds it', () => {
+    const docA = new Y.Doc();
+    const docB = new Y.Doc();
+    bindShipDoc(docA);
+    expect(holdCastOff('a', NOW)).toBe(true);
+    bindShipDoc(docB);
+    expect(holdCastOff('b', NOW)).toBe(true);
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB));
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA));
+    const kept = readCastOffHold(NOW + 1)?.by;
+    expect(['a', 'b']).toContain(kept);
+    bindShipDoc(docA);
+    expect(readCastOffHold(NOW + 1)?.by).toBe(kept);
+    expect(castOffHeldBy(kept === 'a' ? 'b' : 'a', NOW + 1)).toBe(false);
+    docA.destroy();
+    docB.destroy();
   });
 });

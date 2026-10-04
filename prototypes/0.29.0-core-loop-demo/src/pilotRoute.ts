@@ -126,6 +126,8 @@ import { clampFuelToCapacity, flightWritePath } from './shipDoc';
 import type { FlightRecord } from './shipDoc';
 import { planRecordHop } from './stationDirectory';
 import type { StationRecordLike } from './stationDirectory';
+import type { StationOrbit } from './stations';
+import { wrapAngle } from './orbits';
 import type {
   CheckpointKind,
   DockCheckpoint,
@@ -1491,6 +1493,9 @@ export interface RouteFlightPlace {
   id: string;
   planetId: string;
   orbitSlot: number;
+  /** 🎚️ The stop's copied altitude orbit (RouteStop.orbit), which its legs
+   *  were priced on, when its station flew one. */
+  orbit?: StationOrbit;
 }
 
 /** 🚚 routeFlightPlaces's answer. */
@@ -1514,7 +1519,10 @@ export function routeFlightPlaces(
   if (!route || !routeRulesFlight(f)) return null;
   const place = (i: number): RouteFlightPlace | null => {
     const s = route.stops[i];
-    return s ? { id: alias(s.stationId), planetId: s.planetId, orbitSlot: s.orbitSlot } : null;
+    return s ? {
+      id: alias(s.stationId), planetId: s.planetId, orbitSlot: s.orbitSlot,
+      ...(s.orbit ? { orbit: { radiusKm: s.orbit.radiusKm, phase0: s.orbit.phase0 } } : {}),
+    } : null;
   };
   const from = place(f.stopIndex);
   if (!from) return null;
@@ -1531,13 +1539,18 @@ export function routeFlightPlaces(
  *  a planet id as the station list does (stations.planetById). Pure. */
 export function routeStayOffList(
   places: RouteFlightPlaces | null,
-  listed: { planetId: string; orbitSlot: number; moving: boolean } | null,
+  listed: { planetId: string; orbitSlot: number; moving: boolean; orbit?: StationOrbit } | null,
   docked: boolean,
   planet: (id: string) => string = (id) => id,
 ): RouteFlightPlace | null {
   if (!places || places.to || docked) return null;
   const at = { ...places.from, planetId: planet(places.from.planetId) };
-  if (listed && !listed.moving && planet(listed.planetId) === at.planetId && listed.orbitSlot === at.orbitSlot) return null;
+  // 🎚️ On the copy's altitude too: a station that changed altitude since
+  // has left it as surely as one that changed slot (the keeper skips it).
+  const sameOrbit = !listed?.orbit === !at.orbit && (!listed?.orbit || !at.orbit
+    || (Math.abs(listed.orbit.radiusKm - at.orbit.radiusKm) < 1e-6
+      && Math.abs(wrapAngle(listed.orbit.phase0 - at.orbit.phase0)) < 1e-9));
+  if (listed && !listed.moving && planet(listed.planetId) === at.planetId && listed.orbitSlot === at.orbitSlot && sameOrbit) return null;
   return at;
 }
 

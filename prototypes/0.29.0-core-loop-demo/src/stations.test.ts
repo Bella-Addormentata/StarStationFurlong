@@ -12,6 +12,7 @@ import {
   MAX_ORBIT_SLOTS,
   currentStation,
   dockedStationFor,
+  isStationRoom,
   listStations,
   planetForRoom,
   roomAdriftPlace,
@@ -22,6 +23,7 @@ import {
   setRoomStationResolver,
   setStationRoomSource,
   stationForRoom,
+  stationRoomCause,
   stationsAroundPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
@@ -81,6 +83,18 @@ describe('atlas components', () => {
     expect(listStations(atlas, []).filter((s) => s.derived)).toHaveLength(1);
   });
 
+  it('counts only rooms the atlas holds an entry of its own for, whatever a door calls a room', () => {
+    // Exactly 64 known rooms (MAX_ENTRIES). The atlas inherits a value under
+    // each odd name but holds no entry for it, so those rooms must not use up
+    // the cap and split the station.
+    const odd = ['constructor', '__proto__', 'toString'];
+    const real = Array.from({ length: 62 }, (_, i) => `real-${i}`);
+    const atlas = atlasOf(room('hub', [...odd, 'spine']), room('spine', real), ...real.map((rid) => room(rid)));
+    expect(atlasComponent(atlas, 'hub').size).toBe(64 + odd.length);
+    expect(atlasComponents(atlas)).toHaveLength(1);
+    for (const rid of odd) expect(atlasComponent(atlas, rid).size).toBe(0);
+  });
+
   it('never lets a ship\'s berth join or bridge stations', () => {
     const berth = (target: string) => ({ targetSeed: '', targetRoomId: target, transient: true as const });
     const atlas = atlasOf(
@@ -112,6 +126,17 @@ describe('atlas components', () => {
     const atlas = atlasOf(room('odd'));
     (atlas.odd as unknown as { name: unknown }).name = 42;
     expect(listStations(atlas, []).find((st) => st.derived)?.name).toBe('STATION');
+  });
+
+  it('never anchors a derived station on a room the atlas holds no entry for, whatever it is called', () => {
+    for (const odd of ['constructor', '__proto__', 'toString']) {
+      const derived = listStations(atlasOf(room('yard', [odd])), []).filter((st) => st.derived);
+      expect(derived).toEqual([expect.objectContaining({ id: 'station:yard', name: 'YARD', welcomeRoomId: 'yard' })]);
+      // A room the atlas does hold under that name is a room like any other.
+      const held = atlasOf(room(odd, ['yard']), room('yard'));
+      expect(Object.prototype.hasOwnProperty.call(held, odd)).toBe(true);
+      expect(listStations(held, []).filter((st) => st.derived).map((st) => st.id)).toEqual([`station:${odd}`]);
+    }
   });
 
   it('treats a dock recorded before the berth flag existed as a berth too', () => {
@@ -326,6 +351,41 @@ describe('stationForRoom / planetForRoom', () => {
     }
   });
 
+  it('tells a station room that wears ship fittings from a ship', () => {
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    const seed = (roomId: string) => `ssf://join#room=${roomId}`;
+    const dock = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId), transient: true });
+    const gangway = (roomId: string) => ({ paired: true as const, connectedRoomAddress: seed(roomId) });
+    // A saved station's (or the built-in one's) welcome room, docked or not.
+    expect(isStationRoom('b1', [])).toBe(true);
+    expect(isStationRoom('b1', [dock('ship')])).toBe(true);
+    expect(isStationRoom(DEFAULT_STATION_RECORD.welcomeRoomId, [])).toBe(true);
+    // A module bolted into a station by structure.
+    expect(isStationRoom('helm-room', [gangway('a1')])).toBe(true);
+    // A lone module, free or docked, is a ship.
+    expect(isStationRoom('ship', [])).toBe(false);
+    expect(isStationRoom('ship', [dock('b1')])).toBe(false);
+    expect(isStationRoom('', [])).toBe(false);
+    // Why, for the helm: a welcome room stays one with its gangways, and a
+    // module bolted in is free once its gangway is down.
+    expect(stationRoomCause('b1', [gangway('a1')])).toBe('welcome-room');
+    expect(stationRoomCause('helm-room', [gangway('a1'), dock('ship')])).toBe('bolted');
+    expect(stationRoomCause('ship', [dock('b1')])).toBeNull();
+    // A one-module station: its welcome room with no gangway (a docked ship
+    // is no part of it), free to fly by hand but still never to DEPART.
+    expect(stationRoomCause('b1', [])).toBe('lone-station');
+    expect(stationRoomCause('b1', [dock('ship')])).toBe('lone-station');
+    // A pairing whose address names no room (a peer's junk, or one the
+    // parser throws on), or names this room itself, joins it to no other
+    // room, as the atlas reads it: it bolts nothing.
+    const junk = (address: string) => ({ paired: true as const, connectedRoomAddress: address });
+    expect(stationRoomCause('ship', [junk('ssf://join#room=%')])).toBeNull();
+    expect(stationRoomCause('ship', [junk('not a pass')])).toBeNull();
+    expect(stationRoomCause('ship', [gangway('ship')])).toBeNull();
+    expect(stationRoomCause('b1', [gangway('b1'), junk('ssf://join#room=%')])).toBe('lone-station');
+    expect(stationRoomCause('ship', [junk('ssf://join#room=%'), gangway('a1')])).toBe('bolted');
+  });
+
   it('finds the station a lone module is docked at from its live doors', () => {
     // Station A (two rooms), a lone room with a saved record around Aris, and
     // lone modules with no record of their own.
@@ -340,6 +400,7 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [dock('pod')], atlas)).toBeNull();
     // …a station never moves to the ship visiting it…
     expect(dockedStationFor('b1', [dock('ship')], atlas)).toBeNull();
+    expect(dockedStationFor('b1', [dock('a1')], atlas)).toBeNull(); // nor to one it docks at, so it tows none
     expect(dockedStationFor('a2', [dock('ship')], atlas)).toBeNull();
     expect(dockedStationFor('a2', [dock('b1')], atlas)).toBeNull(); // the atlas holds its gangway
     // …a module bolted into structure is the atlas's to place, and undocked
@@ -358,12 +419,37 @@ describe('stationForRoom / planetForRoom', () => {
     }
   });
 
+  it('finds a docked ship past pairings that name no other room', () => {
+    // Peer-written: an address the parser throws on, or a pairing back to the
+    // module itself, bolts it into nothing and hides no real dock.
+    const atlas = atlasOf(room('b1'), room('ship'));
+    expect(registerStation({ id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1' })).toBe(true);
+    const dock = { paired: true as const, connectedRoomAddress: 'ssf://join#room=b1', transient: true };
+    const junk = (address: string) => ({ paired: true as const, connectedRoomAddress: address });
+    expect(dockedStationFor('ship', [junk('ssf://join#room=%'), dock], atlas)).toBe('aris-yard');
+    expect(dockedStationFor('ship', [{ ...junk('ssf://join#room=%'), transient: true }, dock], atlas)).toBe('aris-yard');
+    expect(dockedStationFor('ship', [junk('ssf://join#room=ship'), dock], atlas)).toBe('aris-yard');
+  });
+
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
     const atlas = twoStations();
     expect(planetForRoom('nowhere', atlas).id).toBe(DEFAULT_PLANET_ID);
     registerStation({ id: 'aris-forge', name: 'ARIS FORGE', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'yard-a' });
     expect(planetForRoom('yard-b', atlas).id).toBe('planet-aris');
     expect(planetForRoom('lounge', atlas).id).toBe(DEFAULT_PLANET_ID);
+  });
+
+  it('keeps structure in place when a full planet lists no station for it', () => {
+    // Furlong and fifteen lone stations fill Sovereign, so neither the
+    // two-room yard nor the lone pod (anchored last) is listed. The yard's
+    // pairing is recorded on z2 alone, so z1's live doors show only its dock.
+    const lone = Array.from({ length: MAX_ORBIT_SLOTS - 1 }, (_, i) => room(`a${String(i).padStart(2, '0')}`));
+    const atlas = atlasOf(...lone, room('z1'), room('z2', ['z1']), room('zz'));
+    expect(listStations(atlas, []).filter((s) => ['z1', 'z2', 'zz'].includes(s.welcomeRoomId))).toEqual([]);
+    const dock = { paired: true as const, connectedRoomAddress: `ssf://join#room=${WELCOME}`, transient: true };
+    expect(dockedStationFor('z1', [dock], atlas)).toBeNull();
+    // A lone module the full planet left out still moves to its host.
+    expect(dockedStationFor('zz', [dock], atlas)).toBe(DEFAULT_STATION_ID);
   });
 });
 

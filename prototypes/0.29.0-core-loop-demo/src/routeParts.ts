@@ -1,14 +1,14 @@
 /**
- * 🚏 A running ferry route's flight parts. Edit mode keeps the last helm,
- * engine block and fuel tank aboard while the ship's route runs (a paused
- * one included): without a helm nobody could STOP, SKIP or RESUME it (the
- * route keeper would fly on regardless), and without an engine or a tank the
- * module is no ship. The route's ship port stays too, its door and the
- * docking port on it, in edit mode and at the keypad (routePortTaken). And
- * while the timetable flies the ship, its tanks stay as they are
- * (tanksLockedByRoute). The DEV menu's PLACE, which replaces every piece in
- * the room, waits for the route to stop (templateSwapLockedByRoute). Pure;
- * pinned by routeParts.test.ts.
+ * 🚏 A running ferry route's flight parts. Edit mode keeps a helm, engine block
+ * and fuel tank aboard while the ship's route runs (a paused one included),
+ * the same one of each in every game (routeKeptParts): without a helm nobody
+ * could STOP, SKIP or RESUME it (the route keeper would fly on regardless),
+ * and without an engine or a tank the module is no ship. The route's ship port
+ * stays too, its door and the docking port on it, in edit mode and at the
+ * keypad (routePortTaken). And while the timetable flies the ship, its tanks
+ * stay as they are (tanksLockedByRoute). The DEV menu's PLACE, which replaces
+ * every piece in the room, waits for the route to stop
+ * (templateSwapLockedByRoute). Pure; pinned by routeParts.test.ts.
  */
 
 import { FURNITURE_DEFS } from './furniture';
@@ -20,23 +20,48 @@ const ROUTE_PARTS: ReadonlyArray<{ fn: string; name: string }> = [
   { fn: 'fuelTank', name: 'fuel tank' },
 ];
 
+const isPart = (i: FurnitureItem, fn: string): boolean => FURNITURE_DEFS[i.kind]?.functions?.includes(fn) === true;
+
+/**
+ * The flight parts a running route keeps aboard: of each kind (helm, engine
+ * block, fuel tank), the one with the smallest item id. Every game reads the
+ * same ids, so every game keeps the same one, and removals made at once in
+ * two games (each seeing the other's part still aboard) never take the last
+ * of a kind: a kept part is only removed by a game that sees a smaller id
+ * aboard, and none sees one smaller than the smallest there has been. Part
+ * name → the kept item's id.
+ */
+export function routeKeptParts(items: readonly FurnitureItem[]): Map<string, string> {
+  const out = new Map<string, string>();
+  for (const part of ROUTE_PARTS) {
+    let kept: string | null = null;
+    for (const i of items) if (isPart(i, part.fn) && (kept === null || i.id < kept)) kept = i.id;
+    if (kept !== null) out.set(part.name, kept);
+  }
+  return out;
+}
+
 /** Would removing `itemId` (with `going`: it and what is mounted on it) take
- *  the last of a running route's parts? Its name, or null. */
-export function lastRoutePartTaken(
+ *  a part a running route keeps aboard (routeKeptParts)? Its name, and
+ *  whether another of that kind would stay aboard (which may go instead);
+ *  or null. */
+export function keptRoutePartTaken(
   itemId: string,
   items: readonly FurnitureItem[],
   going: ReadonlySet<string>,
   routeRuns: boolean,
-): string | null {
+): { name: string; others: boolean } | null {
   if (!routeRuns || !going.has(itemId)) return null;
+  const kept = routeKeptParts(items);
   for (const part of ROUTE_PARTS) {
-    const is = (i: FurnitureItem) => FURNITURE_DEFS[i.kind]?.functions?.includes(part.fn) === true;
-    if (items.some((i) => going.has(i.id) && is(i)) && !items.some((i) => !going.has(i.id) && is(i))) return part.name;
+    const id = kept.get(part.name);
+    if (id === undefined || !going.has(id)) continue;
+    return { name: part.name, others: items.some((i) => !going.has(i.id) && isPart(i, part.fn)) };
   }
   return null;
 }
 
-const isTank = (i: FurnitureItem) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank') === true;
+const isTank = (i: FurnitureItem) => isPart(i, 'fuelTank');
 
 /** ⛽ Why a tank can't be fitted or taken off (edit mode and the DEV menu). */
 export const TANKS_LOCK_REFUSAL = "the ship's route is flying on these tanks. Pause the route at the helm first";
@@ -66,8 +91,8 @@ export const TEMPLATE_SWAP_REFUSAL = "the ship's route is running, and a templat
 /**
  * 🏗️ May the DEV menu's PLACE not swap the room's furniture for a template?
  * Never while the ship's route runs, a paused one included: PLACE replaces
- * every piece in the room, so it would take the route's last helm, engine
- * and tank (lastRoutePartTaken) and its robot captain's dock all at once,
+ * every piece in the room, so it would take the helm, engine and tank the
+ * route keeps (keptRoutePartTaken) and its robot captain's dock all at once,
  * each of which edit mode refuses on its own. ADD keeps every piece, so it
  * only answers to tanksLockedByRoute. `route`: the ship's route.
  */

@@ -59,8 +59,8 @@ import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
 import { MAX_TRIM_KM } from './stationKeeping';
 import {
-  MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom,
-  stationInTransit, stationLeftPlanet,
+  MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
+  planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet,
 } from './stations';
 import type { MovingStation, OrbitChange, StationMove, StationRecord } from './stations';
 
@@ -110,6 +110,11 @@ function inAltitudeBand(radiusKm: number, planetId: string, slackKm: number): bo
 function orbitChangeFits(o: OrbitChange, planetId: string, slot: number, departAt: number, arriveAt: number): boolean {
   if (!inAltitudeBand(o.fromRadiusKm, planetId, MAX_TRIM_KM) || !inAltitudeBand(o.toRadiusKm, planetId, 0)) return false;
   const planet = planetById(planetId);
+  // Only a change from the slot's own orbit (trimmed, perhaps) goes without a
+  // claim stamp: a custom orbit it leaves is always stamped (sourceClaimOf),
+  // so an unstamped one could never be weighed against other claims.
+  if (o.fromSince === undefined
+    && Math.abs(o.fromRadiusKm - orbitForSlot(planet.id, slot).radiusKm) > MAX_TRIM_KM + 1e-6) return false;
   for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
     if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
   }
@@ -139,7 +144,7 @@ function sourceClaimOf(station: StationRecord): { fromSince?: number } {
 function heldOrbitOf(station: StationRecord): { fromOrbit?: NonNullable<StationMove['fromOrbit']> } {
   if (!station.orbit) return {};
   const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
-  return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, ...(isTime(since) ? { since } : {}) } };
+  return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, since: isTime(since) ? since : ORBIT_EPOCH_MS } };
 }
 
 function claimedByBooking(since: number | undefined, bookedAt: number): boolean {
@@ -154,6 +159,11 @@ export function isStationMove(v: unknown): v is StationMove {
     && typeof r.welcomeRoomId === 'string' && r.welcomeRoomId.length <= MAX_ID_LENGTH
     && isId(r.fromPlanetId) && isSlot(r.fromSlot)
     && isId(r.toPlanetId) && isSlot(r.toSlot)
+    // Within one planet only by going nowhere, written as such (both
+    // planners refuse a same-planet move): an unknown planet reads as the
+    // default one, so it is compared as read.
+    && (planetById(r.fromPlanetId as string).id !== planetById(r.toPlanetId as string).id
+      || (r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
     && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId))
       // An altitude change stays around its planet, in its slot.
@@ -163,8 +173,17 @@ export function isStationMove(v: unknown): v is StationMove {
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
     && (r.orbit === undefined || r.mode === 'orbit')
     && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)
-      && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)))
-    && (r.bookedAt === undefined || isTime(r.bookedAt))
+      && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)
+      // Unstamped, it could never be weighed against other claims: only
+      // the slot's own orbit (trimmed, perhaps) goes without (orbitChangeFits).
+      && ((r.fromOrbit as { since?: number }).since !== undefined
+        || Math.abs(r.fromOrbit.radiusKm - orbitForSlot(r.fromPlanetId as string, r.fromSlot as number).radiusKm) <= MAX_TRIM_KM + 1e-6)))
+    // Booked no later than it leaves: one stamped after a rival arrived
+    // would read as booked after it (concurrentMoves) and escape it. Only a
+    // move that goes nowhere may be later: a pin is written once what it
+    // records is over.
+    && (r.bookedAt === undefined || (isTime(r.bookedAt) && ((r.bookedAt as number) <= (r.departAt as number)
+      || (r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))))
     // 🎚️ The orbit it leaves was claimed by the time it was booked: claims
     // are weighed in time order, so a later stamp would jump the queue.
     && claimedByBooking(r.mode === 'orbit' ? (r.orbit as { fromSince?: number } | undefined)?.fromSince : (r.fromOrbit as { since?: number } | undefined)?.since,
@@ -175,9 +194,29 @@ export function isStationMove(v: unknown): v is StationMove {
       && (r.settles as { settles?: unknown }).settles === undefined
       // 🎚️ An altitude change is never pinned (stations.isPinMove).
       && (r.settles as { mode?: unknown }).mode !== 'orbit'
-      && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId))
+      && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId
+      && isPinOf(r as StationMove, r.settles)))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
     && typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX;
+}
+
+/** Is `p` a pin of `of` in the form one is written (pinSettledArrival,
+ *  writeCancelOf)? It holds its station where it is for a millisecond and
+ *  draws no fuel. An arrival pin leaves the moment that move arrived, at
+ *  either end of it (home after a bounce; any slot there, as the list may
+ *  have moved it on); a cancel undoes a tow the moment after it left, where
+ *  it left from. Anything else would rank as that move (compareMoves) and
+ *  place its station early, or somewhere it never went. */
+function isPinOf(p: StationMove, of: StationMove): boolean {
+  const planet = planetById(p.fromPlanetId).id;
+  if (p.toPlanetId !== p.fromPlanetId || p.toSlot !== p.fromSlot || p.arriveAt !== p.departAt + 1
+    || p.mode !== 'thrusters' || p.fuel !== 0 || p.fuelDrawn !== 0) return false;
+  if (p.departAt < of.arriveAt) {
+    return of.mode === 'tug' && p.departAt === of.departAt + 1
+      && planet === planetById(of.fromPlanetId).id && p.fromSlot === of.fromSlot;
+  }
+  return p.departAt === of.arriveAt
+    && (planet === planetById(of.toPlanetId).id || planet === planetById(of.fromPlanetId).id);
 }
 
 /** How far ahead a real move can be: the longest wait for a launch window
@@ -349,10 +388,12 @@ export type MovePlanResult =
   | { ok: true; move: StationMove; quote: MoveQuote }
   | { ok: false; refusal: MoveRefusal; quote: MoveQuote | null };
 
-/** The lowest orbit slot around `planetId` no listed station holds at
- *  `nowMs` or is on its way to: a station between planets (stationInTransit)
- *  holds none where it left, as in stations.listStations, but keeps the slot
- *  its move is bound for. */
+/** The lowest orbit slot around `planetId` no station holds at `nowMs` or
+ *  is on its way to — a listed one, or one heard of from a planet summary
+ *  (stations.knownSlotsAround; most around other planets are never listed
+ *  here): a station between planets (stationInTransit) holds none where it
+ *  left, as in stations.listStations, but keeps the slot its move is bound
+ *  for. */
 export function freeSlotAround(planetId: string, stations: StationRecord[], exceptId?: string, nowMs: number = Date.now()): number | null {
   const id = planetById(planetId).id;
   const others = stations.filter((s) => s.id !== exceptId);
@@ -364,6 +405,8 @@ export function freeSlotAround(planetId: string, stations: StationRecord[], exce
     const m = s.move;
     if (m && !isPinMove(m) && m.arriveAt > nowMs && planetById(m.toPlanetId).id === id) used.add(m.toSlot);
   }
+  const known = knownSlotsAround(id, stations.map((s) => s.welcomeRoomId), nowMs);
+  for (const slot of [...known.taken, ...known.reserved]) used.add(slot);
   for (let slot = 0; slot < MAX_ORBIT_SLOTS; slot++) if (!used.has(slot)) return slot;
   return null;
 }
@@ -869,6 +912,73 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
   });
 }
 
+/** dockLockedByMove for a room whose own doc is in hand: a far room's,
+ *  fetched for a DOCK (farDoorWrite). The moves booked in that room, and
+ *  those its planet summaries gossip (booked in another room of its
+ *  station, or a tug's), count with every move known here, so a ship that
+ *  has not heard of one yet still joins no station between planets: a tow
+ *  that room is the tug of, ahead or under way, or a move of its station in
+ *  transit. Its station is the one this install lists the room at, else
+ *  the one whose welcome room it is, else the one its own bookings name (a
+ *  move is booked from a room of its station, a tow from the tug; a pin is
+ *  no booking: every game writes them for each station it lists, wherever
+ *  it stands, pinSettledArrivals). A room
+ *  whose records the bounded scans cannot all read (a peer can flood
+ *  either map) is held too: what lies past them may be such a move, until
+ *  the clients there prune the flood. */
+export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
+  const { own: there, heard, complete } = docMoves(doc);
+  if (!complete) return true;
+  const all = [...there, ...heard, ...roomOwn(), ...readRememberedMoves()];
+  const standing = standingMoves(all, all);
+  if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
+  const station = roomId ? stationForRoom(roomId) : null;
+  const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
+  const ofRoom = (m: StationMove) => (station
+    ? moveBelongsTo(m, station)
+    : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !isPinMove(o) && !towedBy(o) && sameStation(o, m)));
+  return standing.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs));
+}
+
+/** Remember the standing moves a room's own doc holds (a far room's), and
+ *  those its planet summaries gossip, as the bound room's are
+ *  (bindStationMoveDoc, planetSummary): this install then carries them on. */
+export function rememberMovesIn(doc: Y.Doc): void {
+  const { own, heard } = docMoves(doc);
+  const all = [...own, ...heard];
+  for (const m of standingMoves(all, knownMoves(all))) rememberMove(m);
+}
+
+/** Planet summaries one read visits: planetSummary's own pull bound. */
+const SUMMARY_SCAN_MAX = 256;
+
+/** What a room's doc that is not the bound one holds: the moves booked
+ *  there (roomOwn's), the moves its planet summaries gossip
+ *  (planetSummary.ts: each station's latest, under its welcome room,
+ *  checked as that module's pull checks them), and whether the bounded
+ *  scans read every record of both. Every client standing in a room
+ *  publishes there its own station's move and every move it remembers, so
+ *  a move booked in another room of the station, or in a tug's, reaches
+ *  the room that way. */
+function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; complete: boolean } {
+  if ((doc as { isDestroyed?: boolean }).isDestroyed) return { own: [], heard: [], complete: true };
+  const { entries, legacy, folded, complete } = movesIn(doc.getMap('stationMoves'), doc.getMap('stationKeeping'));
+  const summaries = doc.getMap('stationSummaries');
+  const heard: StationMove[] = [];
+  let scanned = 0;
+  for (const [k, v] of summaries.entries()) {
+    if (++scanned > SUMMARY_SCAN_MAX) break;
+    if (typeof v !== 'object' || v === null || (v as { welcomeRoomId?: unknown }).welcomeRoomId !== k) continue;
+    const m = validMove((v as { move?: unknown }).move);
+    if (m && m.welcomeRoomId === k) heard.push(m);
+  }
+  return {
+    own: [...(legacy ? [legacy] : []), ...entries, ...folded],
+    heard,
+    complete: complete && summaries.size <= SUMMARY_SCAN_MAX,
+  };
+}
+
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
  *  by the bound room's record or any move this install remembers? Its dock
  *  holds the station, so neither end may UNDOCK it — from the tug's docking
@@ -916,8 +1026,9 @@ export function cancelTowLeftBehind(
   realMs: number,
   /** Is this room still docked to a room of that station, right now? A
    *  manual UNDOCK leaves the flight record 'docked', so the live dock is
-   *  what says the tug let go: true while docked, else when it let go (the
-   *  earliest release at or after `since`, the tow's booking), else false
+   *  what says the tug let go: true while any dock holds, else when it let
+   *  go (the last of its docks into that station to let go, at or after
+   *  `since`, the tow's booking: shipArrival.dockedToStation), else false
    *  (let go, time unknown). Leave it out when it is not known. */
   dockedTo?: (welcomeRoomId: string, since: number) => boolean | number,
 ): boolean {
@@ -952,8 +1063,8 @@ export function cancelTowLeftBehind(
  *  loss spreads as a cancel like any other. */
 function outbidTows(roomId: string): StationMove[] {
   if (!docAlive()) return [];
-  const { entries, legacy } = roomMoves();
-  const own = legacy ? [legacy, ...entries] : entries;
+  // Bundled tows too: placement and the meter read them.
+  const own = roomOwn();
   const known = knownMoves(own);
   const seen = new Set<string>();
   return own.filter((m) => {
@@ -1104,15 +1215,31 @@ const MAX_REMEMBERED = 256;
  *  as the latest. */
 const HISTORY_PER_STATION = 8;
 
-export function readRememberedMoves(): StationMove[] {
+/** The remembered list as last parsed, with each move's id: parsed again
+ *  only when the stored text changes (the station list, and every move a
+ *  room's doc holds, ask for it often). A move stored here was plausible
+ *  when it was stored, so it stays plausible. */
+let rememberedCache: { raw: string; moves: StationMove[]; ids: Set<string> } | null = null;
+
+function rememberedState(): { moves: StationMove[]; ids: Set<string> } {
+  let raw: string | null = null;
+  try { raw = localStorage.getItem(KEY); } catch { /* none stored */ }
+  if (!raw) return { moves: [], ids: new Set() };
+  if (rememberedCache?.raw === raw) return rememberedCache;
+  let moves: StationMove[] = [];
   try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return [];
     const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return [];
     const now = Date.now();
-    return arr.filter((m): m is StationMove => isStationMove(m) && isPlausibleMove(m, now)).slice(0, MAX_REMEMBERED).map(cleanMove);
-  } catch { return []; }
+    if (Array.isArray(arr)) {
+      moves = arr.filter((m): m is StationMove => isStationMove(m) && isPlausibleMove(m, now)).slice(0, MAX_REMEMBERED).map(cleanMove);
+    }
+  } catch { /* corrupt: none */ }
+  rememberedCache = { raw, moves, ids: new Set(moves.map(moveId)) };
+  return rememberedCache;
+}
+
+export function readRememberedMoves(): StationMove[] {
+  return rememberedState().moves.slice();
 }
 
 /** Two moves of the same station: by welcome room, or by id without one. */
@@ -1128,10 +1255,10 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
   if (!isStationMove(move) || !isPlausibleMove(move, nowMs)) return false;
   const clean = cleanMove(move);
   const id = moveId(clean);
-  const before = readRememberedMoves();
-  if (before.some((m) => moveId(m) === id)) return false;
+  const { moves: before, ids } = rememberedState();
+  if (ids.has(id)) return false;
   const list = trimRemembered([...before, clean], nowMs);
-  if (!list.some((m) => moveId(m) === id)) return false;
+  if (!list.includes(clean)) return false;
   try { localStorage.setItem(KEY, JSON.stringify(list)); } catch { return false; }
   // A new winner learned here (a planet summary, another room) can change
   // this room's standing move and so its 'stationMove' meter: tell the
@@ -1140,27 +1267,65 @@ export function rememberMove(move: StationMove, nowMs: number = Date.now()): boo
   return true;
 }
 
-/** Each station's best move, then its recent history, within the caps:
- *  history goes first when full (longest finished first), then the bests
- *  that finished longest ago. */
+/** Each station's best move (and its best standing one, when that one is
+ *  beaten or outbid), then its recent history, within the caps: history goes
+ *  first when full (longest finished first), then the bests that finished
+ *  longest ago. */
 function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
   const since = nowMs - MOVE_LOG_KEEP_MS - MOVE_FINAL_MS;
-  const groups: StationMove[][] = [];
+  // By station, as sameStation: its welcome room, or its id without one.
+  const byStation = new Map<string, StationMove[]>();
   for (const m of list) {
-    const g = groups.find((x) => sameStation(x[0], m));
-    if (g) g.push(m); else groups.push([m]);
+    const k = m.welcomeRoomId ? `w:${m.welcomeRoomId}` : `s:${m.stationId}`;
+    const g = byStation.get(k);
+    if (g) g.push(m); else byStation.set(k, [m]);
   }
+  const groups = [...byStation.values()];
   const bests: StationMove[] = [];
   const history: StationMove[] = [];
+  const dropped: StationMove[] = [];
   for (const g of groups) {
     g.sort((x, y) => compareMoves(y, x));
     bests.push(g[0]);
-    history.push(...g.slice(1).filter((m) => m.arriveAt >= since).slice(0, HISTORY_PER_STATION));
+    // When another station's tow by the same tug outbids that one (nothing
+    // of its own station ranks above it to beat it), the best that stands
+    // is what the station follows (rememberedMoveFor): kept too, however old.
+    const stands = flownOf(g[0]).mode === 'tug' && outbidForTug(g[0], list)
+      ? g.find((m) => !superseded(m, list)) : undefined;
+    if (stands) bests.push(stands);
+    const recent = g.slice(1).filter((m) => m !== stands && m.arriveAt >= since).slice(0, HISTORY_PER_STATION);
+    history.push(...recent);
+    dropped.push(...g.slice(1).filter((m) => m !== stands && !recent.includes(m)));
   }
   const byFinish = (x: StationMove, y: StationMove) => y.arriveAt - x.arriveAt;
   const keptBests = bests.sort(byFinish).slice(0, MAX_REMEMBERED);
-  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length);
-  return [...keptBests, ...keptHistory];
+  const evidence = altitudeEvidence(keptBests, history, dropped).slice(0, MAX_REMEMBERED - keptBests.length);
+  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length - evidence.length);
+  return [...keptBests, ...evidence, ...keptHistory];
+}
+
+/** 🎚️ Of the moves history would drop (too old, or past a station's cap),
+ *  those an altitude claim of some station's best move needs to stay lost: a claim that beat it ages out of history only by being kept
+ *  here, or the loser would be accepted later, unflown and unpaid. Each is
+ *  tried without, oldest first, and kept only if the losses change. */
+function altitudeEvidence(bests: StationMove[], history: StationMove[], dropped: StationMove[]): StationMove[] {
+  // Every claim a best move makes: an altitude change's destination and the
+  // orbit it leaves, or the custom orbit any other move (a pin too) holds.
+  const claimsOf = (b: StationMove) => [altitudeMoveKey(b), `${altitudeMoveKey(b)}|from`];
+  const claims = (b: StationMove) => (b.mode === 'orbit' && !b.settles) || !!(b.settles ?? b).fromOrbit;
+  const losers = (moves: StationMove[]) => {
+    const lost = lostAltitudeClaims(flownAmong(moves));
+    return bests.filter(claims).flatMap(claimsOf).filter((k) => lost.has(k)).join('\n');
+  };
+  if (dropped.length === 0 || !bests.some(claims)) return [];
+  let kept = [...dropped];
+  const want = losers([...bests, ...history, ...kept]);
+  if (!want) return [];
+  for (const m of [...dropped].sort((x, y) => x.arriveAt - y.arriveAt)) {
+    const without = kept.filter((k) => k !== m);
+    if (losers([...bests, ...history, ...without]) === want) kept = without;
+  }
+  return kept;
 }
 
 let notifyQueued = false;
@@ -1173,19 +1338,57 @@ function notifySoon(): void {
   queueMicrotask(() => { notifyQueued = false; notify(); });
 }
 
-/** The latest move this install knows for a station, matched by its welcome
- *  room (stations.moveBelongsTo), so a move another install wrote under its
- *  own id for the station still applies here. */
+/** The move a station follows: its standing move among everything this
+ *  install knows (knownStanding: the bound room's, so a move written here
+ *  applies even when this install cannot store it, and every remembered
+ *  one), matched by its welcome room (stations.moveBelongsTo), so a move
+ *  another install wrote under its own id for the station still applies
+ *  here. A move beaten by a concurrent one of its station, or outbid by
+ *  another station's tow by the same tug, never flies: the station follows
+ *  the best of its moves that stands, as the fuel meter and the dock locks
+ *  do. */
 export function rememberedMoveFor(station: MovingStation): StationMove | null {
-  let remembered: StationMove | null = null;
-  for (const m of readRememberedMoves()) {
-    if (moveBelongsTo(m, station) && (!remembered || compareMoves(m, remembered) > 0)) remembered = m;
+  return knownStanding().find((m) => moveBelongsTo(m, station)) ?? null;
+}
+
+/** 🚚 The move a station follows instead of `latest` (the latest move known
+ *  for it), when that one does not stand here: a tow outbid by another
+ *  station's on the same tug, or a move beaten by a concurrent one of its
+ *  station (superseded). Null when it stands, or when nothing of the
+ *  station's ranking below it does. A planet summary carries it beside
+ *  `latest` (planetSummary.ts `stands`): a reader that learns the rival
+ *  rejects `latest`, and without this would place the station by its first
+ *  record. */
+export function standingInsteadOf(latest: StationMove): StationMove | null {
+  if (!superseded(latest, [...roomStanding(), ...readRememberedMoves()])) return null;
+  const stands = knownStanding().find((m) => sameStation(m, latest));
+  return stands && compareMoves(stands, latest) < 0 ? stands : null;
+}
+
+/** Where a station left from on the first of its moves to depart between
+ *  `sinceMs` and `nowMs`: where it was at `sinceMs`, once it has left since
+ *  (null: it has not). Among the moves this install knows (the bound room's
+ *  and every remembered one): a move beaten, outbid or cancelled never flew,
+ *  and an arrival's pin stands for the move it settles. */
+export function stationLeftFrom(
+  station: MovingStation,
+  sinceMs: number,
+  nowMs: number = Date.now(),
+): { planetId: string; orbitSlot: number } | null {
+  // Its standing move is the last it made (rememberedMoveFor): when even
+  // that left before `sinceMs`, none did since.
+  const latest = rememberedMoveFor(station);
+  if (!latest || flownOf(latest).departAt < sinceMs) return null;
+  const all = [...roomOwn(), ...readRememberedMoves()];
+  let first: StationMove | null = null;
+  for (const rec of all) {
+    if (!moveBelongsTo(rec, station) || isCancelPin(rec)) continue;
+    const m = flownOf(rec);
+    if (m.departAt < sinceMs || m.departAt > nowMs || isPinMove(m)) continue;
+    if (first && m.departAt >= first.departAt) continue;
+    if (!superseded(m, all)) first = m;
   }
-  // The bound room's own standing move too, so a move written here applies
-  // even when this install cannot store it (localStorage full or blocked).
-  const here = roomStanding().find((m) => moveBelongsTo(m, station)) ?? null;
-  if (!here) return remembered;
-  return !remembered || compareMoves(here, remembered) > 0 ? here : remembered;
+  return first ? { planetId: planetById(first.fromPlanetId).id, orbitSlot: first.fromSlot } : null;
 }
 
 /** Point stations.listStations at the remembered moves. */
@@ -1271,9 +1474,92 @@ function moveId(m: StationMove): string {
 function isSettledMoves(v: unknown): v is SettledMoves {
   const r = v as SettledMoves;
   const meter = (x: unknown) => typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= FUEL_METER_MAX;
+  // `recent` is always written (perhaps empty); only `done` may be missing.
   return !!r && typeof r === 'object' && Number.isSafeInteger(r.n) && r.n > 0 && meter(r.drawn) && meter(r.floor)
+    && Array.isArray(r.recent)
     && [r.recent, r.done].every((list) => list === undefined || (Array.isArray(list) && list.length <= SETTLED_RECENT_MAX
       && list.every((m) => validMove(m) !== null)));
+}
+
+/** Prefix of a bundle (`moveFold:<bucket>:<hash>`): settled records and
+ *  entries moved out of the top level past the caps (sweepLog), each kept
+ *  whole under its own identity — a record under its writer, an entry under
+ *  its key — so readers unpack them into the same places and a record or
+ *  entry two bundles hold is still one. Each item goes to one of
+ *  FOLD_BUCKETS buckets by its identity, so a fold rewrites only the
+ *  buckets it adds to; the hash names the bundle's content, so replicas
+ *  packing the same items write the same key. */
+const FOLD_PREFIX = 'moveFold:';
+const FOLD_BUCKETS = 16;
+/** Items one bundle holds at most. */
+export const FOLD_ITEMS_MAX = 64;
+/** Bundle items a read unpacks at most: every bucket full, and as many
+ *  again for versions of a bucket two replicas wrote at once, until the next
+ *  sweep joins them. */
+const MOVE_FOLD_READ_MAX = 2 * FOLD_BUCKETS * FOLD_ITEMS_MAX;
+
+interface FoldBundle { settled: Record<string, SettledMoves>; entries: Record<string, StationMove> }
+
+/** A writer id or entry key a bundle may hold: as long as writeStationMove
+ *  makes one — the prefix, a client id (a uint32: 10 digits), a departure
+ *  time (13 digits and up to 4 decimals within isTime's bounds) and a
+ *  welcome room or station id, with the two colons between them. */
+const FOLD_ID_MAX = ENTRY_PREFIX.length + 10 + 1 + 18 + 1 + MAX_ID_LENGTH;
+
+/** Bundle values already checked, and found sound (or too big ever to be):
+ *  a doc value is replaced, never changed in place, so each is checked once.
+ *  A sound one stays sound (a move only grows more plausible with time). */
+const foldVerdicts = new WeakMap<object, boolean>();
+
+/** A bundle off the wire: at most FOLD_ITEMS_MAX well-formed items, counted
+ *  as they are met, so an oversized one is refused at its first item past
+ *  the cap without copying it. */
+function isFoldBundle(v: unknown): v is FoldBundle {
+  if (!v || typeof v !== 'object') return false;
+  const known = foldVerdicts.get(v);
+  if (known !== undefined) return known;
+  const b = v as FoldBundle;
+  if (!b.settled || typeof b.settled !== 'object' || Array.isArray(b.settled)
+    || !b.entries || typeof b.entries !== 'object' || Array.isArray(b.entries)) return false;
+  const own = Object.prototype.hasOwnProperty;
+  let items = 0;
+  let sound = true;
+  for (const part of [b.settled, b.entries] as Array<Record<string, unknown>>) {
+    for (const k in part) {
+      if (!own.call(part, k)) continue;
+      if (++items > FOLD_ITEMS_MAX) {
+        foldVerdicts.set(v, false);
+        return false;
+      }
+      if (!sound) continue;
+      sound = part === b.settled
+        ? k.length > 0 && k.length <= FOLD_ID_MAX && isSettledMoves(part[k])
+        : k.startsWith(ENTRY_PREFIX) && k.length <= FOLD_ID_MAX && validMove(part[k]) !== null;
+    }
+  }
+  if (sound) foldVerdicts.set(v, true);
+  return sound;
+}
+
+/** The bucket a bundle key names (one hex digit), or null. */
+function bucketOfKey(key: string): string | null {
+  const rest = key.slice(FOLD_PREFIX.length);
+  return /^[0-9a-f]:[0-9a-f]{16}$/.test(rest) ? rest[0] : null;
+}
+
+/** A short, stable hash of a string (FNV-1a, twice over), as 16 hex digits. */
+function contentHash(text: string): string {
+  let a = 0x811c9dc5, b = 0x01000193;
+  for (let i = 0; i < text.length; i++) {
+    a = Math.imul(a ^ text.charCodeAt(i), 0x01000193) >>> 0;
+    b = Math.imul(b ^ text.charCodeAt(i), 0x811c9dc5) >>> 0;
+  }
+  return a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0');
+}
+
+/** The bucket an item belongs to, by its identity (`s:<writer>`, `e:<key>`). */
+function bucketOfItem(id: string): string {
+  return (parseInt(contentHash(id).slice(-2), 16) % FOLD_BUCKETS).toString(16);
 }
 
 function validMove(raw: unknown): StationMove | null {
@@ -1288,43 +1574,83 @@ function writerOf(key: string, prefix: string): string {
   return cut > 0 ? rest.slice(0, cut) : rest;
 }
 
-/** Every move this room's doc holds (a bounded scan): its entries (with
- *  their keys), a legacy record, each writer's best settled record, and the
- *  keys that hold junk or a settled record another covers. */
-function roomMoves(): {
+/** What a room's doc holds of the move log (roomMoves). */
+interface RoomMoves {
   entries: StationMove[];
   keyed: Array<{ key: string; move: StationMove }>;
   legacy: StationMove | null;
-  settled: Map<string, SettledMoves & { key: string }>;
+  settled: Map<string, SettledMoves & { key: string | null }>;
+  folded: StationMove[];
   stale: string[];
-} {
-  const settled = new Map<string, SettledMoves & { key: string }>();
-  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled, stale: [] };
+  /** False when the bounds cut the scan short: a record may lie past them. */
+  complete: boolean;
+}
+
+/** Every move this room's doc holds (a bounded scan): its entries (with
+ *  their keys), a legacy record, each writer's best settled record, the
+ *  entries bundled past the caps, and the keys that hold junk or a settled
+ *  record another covers. A bundle's items unpack within their own budget,
+ *  each in its place: a record as its writer's (key null: never stale, its
+ *  bundle holds others), an entry once per key. */
+function roomMoves(): RoomMoves {
+  if (!docAlive()) return { entries: [], keyed: [], legacy: null, settled: new Map(), folded: [], stale: [], complete: true };
+  return movesIn(moveMap!, keepMap!);
+}
+
+/** roomMoves over any room's maps: its 'stationMoves' and 'stationKeeping'. */
+function movesIn(moveLog: Y.Map<unknown>, keep: Y.Map<unknown>): RoomMoves {
+  const settled = new Map<string, SettledMoves & { key: string | null }>();
   const keyed: Array<{ key: string; move: StationMove }> = [];
+  const folded = new Map<string, StationMove>();
   const stale: string[] = [];
   let scanned = 0;
-  for (const [k, v] of moveMap!.entries()) {
+  let unpacked = 0;
+  let complete = true;
+  // A writer's best record: the larger count, then the larger total.
+  const offer = (w: string, v: SettledMoves, key: string | null) => {
+    const had = settled.get(w);
+    if (!had || v.n > had.n || (v.n === had.n && v.drawn > had.drawn)) {
+      if (had?.key) stale.push(had.key);
+      settled.set(w, {
+        n: v.n, drawn: v.drawn, floor: v.floor, recent: v.recent.map(cleanMove), done: (v.done ?? []).map(cleanMove), key,
+      });
+    } else if (key) stale.push(key);
+  };
+  for (const [k, v] of moveLog.entries()) {
     // Every key visited counts, whatever it holds: the walk itself is bounded.
-    if (++scanned > MOVE_SCAN_MAX) break;
-    const isSettled = k.startsWith(SETTLED_PREFIX);
-    if (!isSettled && !k.startsWith(ENTRY_PREFIX)) { stale.push(k); continue; }
-    if (isSettled) {
-      if (!isSettledMoves(v)) { stale.push(k); continue; }
-      const w = writerOf(k, SETTLED_PREFIX);
-      const had = settled.get(w);
-      if (!had || v.n > had.n || (v.n === had.n && v.drawn > had.drawn)) {
-        if (had) stale.push(had.key);
-        settled.set(w, {
-          n: v.n, drawn: v.drawn, floor: v.floor, recent: (v.recent ?? []).map(cleanMove), done: (v.done ?? []).map(cleanMove), key: k,
-        });
-      } else stale.push(k);
+    if (++scanned > MOVE_SCAN_MAX) { complete = false; break; }
+    if (k.startsWith(SETTLED_PREFIX)) {
+      if (isSettledMoves(v)) offer(writerOf(k, SETTLED_PREFIX), v, k);
+      else stale.push(k);
       continue;
     }
+    if (k.startsWith(FOLD_PREFIX)) {
+      if (bucketOfKey(k) === null || !isFoldBundle(v)) { stale.push(k); continue; }
+      for (const [w, r] of Object.entries(v.settled)) {
+        if (++unpacked <= MOVE_FOLD_READ_MAX) offer(w, r, null);
+        else complete = false;
+      }
+      for (const [ek, m] of Object.entries(v.entries)) {
+        if (++unpacked > MOVE_FOLD_READ_MAX) complete = false;
+        else if (!folded.has(ek)) folded.set(ek, cleanMove(m));
+      }
+      continue;
+    }
+    if (!k.startsWith(ENTRY_PREFIX)) { stale.push(k); continue; }
     const m = validMove(v);
     if (m) keyed.push({ key: k, move: m });
     else stale.push(k);
   }
-  return { entries: keyed.map((e) => e.move), keyed, legacy: validMove(keepMap!.get(LEGACY_KEY)), settled, stale };
+  return {
+    entries: keyed.map((e) => e.move), keyed, legacy: validMove(keep.get(LEGACY_KEY)), settled, folded: [...folded.values()], stale, complete,
+  };
+}
+
+/** The moves this room's doc holds for deciding where stations are: its
+ *  legacy record, its entries, and the entries bundled past the caps. */
+function roomOwn(): StationMove[] {
+  const { entries, legacy, folded } = roomMoves();
+  return [...(legacy ? [legacy] : []), ...entries, ...folded];
 }
 
 /** The move a record stands for: a pin's settled move, else itself. */
@@ -1452,8 +1778,7 @@ function roomStanding(): StationMove[] {
   try { stored = localStorage.getItem(KEY); } catch { /* none stored */ }
   const version = `${roomVersion}|${stored ?? ''}`;
   if (standingCache?.version === version) return standingCache.moves;
-  const { entries, legacy } = roomMoves();
-  const own = legacy ? [legacy, ...entries] : entries;
+  const own = roomOwn();
   const moves = standingMoves(own, knownMoves(own));
   standingCache = { version, moves };
   return moves;
@@ -1462,8 +1787,7 @@ function roomStanding(): StationMove[] {
 /** The room's latest move that is not beaten by a concurrent one, or null
  *  (none, unbound, or malformed). */
 export function readStationMove(): StationMove | null {
-  const { entries, legacy } = roomMoves();
-  const own = legacy ? [legacy, ...entries] : entries;
+  const own = roomOwn();
   let best: StationMove | null = null;
   for (const m of standingMoves(own, knownMoves(own))) {
     if (!best || compareMoves(m, best) > 0) best = m;
@@ -1497,14 +1821,15 @@ function meterParts(entries: StationMove[], known: StationMove[], base: number):
  *  booking, so a move booked after a loser dropped out of the sum still
  *  pays. */
 export function readMoveFuelDrawn(): number {
-  const { entries, legacy, settled } = roomMoves();
-  const recent = recentMoves(settled);
+  const { entries, legacy, settled, folded } = roomMoves();
+  const recent = [...recentMoves(settled), ...folded];
   const known = knownMoves([...(legacy ? [legacy] : []), ...entries, ...recent]);
   let base = legacy?.fuelDrawn ?? 0;
   let settledFloor = 0;
   for (const r of settled.values()) { base += r.drawn; settledFloor = Math.max(settledFloor, r.floor); }
-  // Recently pruned moves count like live ones: paid unless beaten, and
-  // unless a copy was already made final (and so counted in a drawn total).
+  // Recently pruned moves, and bundled entries, count like live ones: paid
+  // unless beaten, and unless a copy was already made final (and so counted
+  // in a drawn total).
   const done = doneIds(settled);
   const { sum, floor } = meterParts([...entries, ...recent].filter((m) => !done.has(moveId(m))), known, base);
   // Each record is capped, their sum is not: a reading past the meter's range
@@ -1531,10 +1856,10 @@ function recentMoves(settled: Map<string, SettledMoves>): StationMove[] {
  *  records go too. Keeps the log, and every read's superseded checks,
  *  bounded by the moves of about a day. */
 function pruneMoveLog(now: number): void {
-  const { entries, keyed, legacy, settled, stale } = roomMoves();
+  const { entries, keyed, legacy, settled, folded, stale } = roomMoves();
   for (const k of stale) moveMap!.delete(k);
   const own = legacy ? [legacy, ...entries] : entries;
-  const known = knownMoves([...own, ...recentMoves(settled)]);
+  const known = knownMoves([...own, ...recentMoves(settled), ...folded]);
   const through = now - MOVE_LOG_KEEP_MS;
   const standing = new Set(standingMoves(entries, known));
   type Entry = { key: string; move: StationMove };
@@ -1596,7 +1921,8 @@ function pruneMoveLog(now: number): void {
       done.push(m);
     }
     const n = (had?.n ?? 0) + gone.length;
-    if (had) moveMap!.delete(had.key);
+    // A bundled record stays in its bundle: this one's larger count covers it.
+    if (had?.key) moveMap!.delete(had.key);
     moveMap!.set(`${SETTLED_PREFIX}${w}:${n}`, {
       n,
       drawn: Math.min(FUEL_METER_MAX, drawn),
@@ -1620,8 +1946,7 @@ export function bindStationMoveDoc(doc: Y.Doc): void {
   roomVersion++;
   const onChange = () => {
     roomVersion++;
-    const { entries, legacy } = roomMoves();
-    const own = legacy ? [legacy, ...entries] : entries;
+    const own = roomOwn();
     for (const m of standingMoves(own, knownMoves(own))) rememberMove(m);
     notify();
   };
@@ -1640,27 +1965,41 @@ export function subscribeStationMove(listener: () => void): () => void {
   return () => listeners.delete(listener);
 }
 
-/** At most this many move entries and settled records stay after a write's
- *  sweep: an honest log (pruned to about a day) is far below either, and
- *  together they leave the entry the write adds inside MOVE_SCAN_MAX. */
+/** At most this many move entries and settled records stay at the top level
+ *  after a sweep: an honest log (pruned to about a day) is far below either,
+ *  and with the bundles (FOLD_BUCKETS) they leave the entry a write adds
+ *  inside MOVE_SCAN_MAX. */
 export const MOVE_ENTRIES_KEEP = MOVE_SCAN_MAX / 2;
 export const MOVE_SETTLED_KEEP = MOVE_SCAN_MAX / 4;
 
-/** Clear every key in the move log that is not a well-formed entry or
- *  settled record, however many a peer wrote, and any settled record its
- *  writer's later one covers. Past the caps above, the surplus leaves by one
- *  order every replica shares: entries still under way stay first, then the
- *  ones booked latest (then by key); settled records that drew most stay
- *  (then by key). What leaves is never lost from the meter: its charges are
- *  folded into one settled record (foldSurplus). A write walks the whole
- *  map once (writes are rare: a helm press, an arrival pin, a cancel; reads
- *  stay bounded), so the entry it adds sits within the readers' scan at
- *  once, never behind a flood. */
-function sweepJunk(now: number = Date.now()): void {
+/** At most this many keys one sweep pass walks. A log longer than that (a
+ *  flood) is cleared over the passes that follow (sweepLater), each as
+ *  bounded, so no write stalls on it. */
+export const SWEEP_BATCH = 4 * MOVE_SCAN_MAX;
+
+/**
+ * One bounded pass over the move log, inside a write's transaction: it
+ * walks at most SWEEP_BATCH keys, clears every one that is not a
+ * well-formed entry, settled record or bundle, and any settled record its
+ * writer's later one covers. The entries past the cap among those it met
+ * move into bundles (entries still under way stay first, then the ones
+ * booked latest), and so do the settled records past theirs (those that
+ * drew most stay) — or every settled record it met, when it saw only part
+ * of the log (more keys than one pass walks: a flood). Bundling keeps each
+ * item whole (repack), and readers unpack bundles into the same places, so
+ * the meter, where each station is, and every move that decides another
+ * read the same. Returns whether it saw the whole log, and whether it
+ * changed anything.
+ */
+function sweepLog(now: number): { complete: boolean; progress: boolean } {
   const junk: string[] = [];
   const entries: Array<{ key: string; move: StationMove }> = [];
   const best = new Map<string, { key: string; record: SettledMoves }>();
+  const bundles: Array<{ key: string; bucket: string; bundle: FoldBundle }> = [];
+  let walked = 0;
+  let complete = true;
   for (const [k, v] of moveMap!.entries()) {
+    if (++walked > SWEEP_BATCH) { complete = false; break; }
     if (k.startsWith(SETTLED_PREFIX)) {
       if (!isSettledMoves(v)) { junk.push(k); continue; }
       // Each writer's largest record covers its others (roomMoves).
@@ -1672,87 +2011,159 @@ function sweepJunk(now: number = Date.now()): void {
       } else junk.push(k);
       continue;
     }
+    if (k.startsWith(FOLD_PREFIX)) {
+      const bucket = bucketOfKey(k);
+      if (bucket !== null && isFoldBundle(v)) bundles.push({ key: k, bucket, bundle: v });
+      else junk.push(k);
+      continue;
+    }
     const m = k.startsWith(ENTRY_PREFIX) ? validMove(v) : null;
     if (m) entries.push({ key: k, move: m });
     else junk.push(k);
   }
+  for (const k of junk) moveMap!.delete(k);
+  const settled = [...best.values()];
   const byKey = (x: { key: string }, y: { key: string }) => (x.key < y.key ? -1 : x.key > y.key ? 1 : 0);
   const active = (m: StationMove) => (m.arriveAt > now ? 1 : 0);
+  // The entries keep one order and cap whether or not the pass saw the
+  // whole log, so a flood of moves still under way is bundled a pass at a
+  // time like any other; past the cap only the settled records differ.
   entries.sort((x, y) => active(y.move) - active(x.move) || bookedOf(y.move) - bookedOf(x.move) || byKey(x, y));
-  const settled = [...best.values()].sort((x, y) => y.record.drawn - x.record.drawn || byKey(x, y));
-  const extraEntries = entries.slice(MOVE_ENTRIES_KEEP);
-  // The folded record takes one of the settled places, so a sweep leaves
-  // the caps as they are and the next one has nothing to fold.
-  const extraSettled = settled.length > MOVE_SETTLED_KEEP || (extraEntries.length > 0 && settled.length >= MOVE_SETTLED_KEEP)
-    ? settled.slice(MOVE_SETTLED_KEEP - 1) : [];
-  for (const k of junk) moveMap!.delete(k);
-  if (extraEntries.length === 0 && extraSettled.length === 0) return;
-  foldSurplus(extraEntries, extraSettled, entries.slice(0, MOVE_ENTRIES_KEEP), settled.slice(0, settled.length - extraSettled.length));
-}
-
-/** A short, stable name for a set of keys (FNV-1a, twice over). */
-function keysHash(keys: string[]): string {
-  let a = 0x811c9dc5, b = 0x01000193;
-  for (const k of [...keys].sort()) {
-    for (let i = 0; i < k.length; i++) {
-      a = Math.imul(a ^ k.charCodeAt(i), 0x01000193) >>> 0;
-      b = Math.imul(b ^ k.charCodeAt(i), 0x811c9dc5) >>> 0;
-    }
-    a = Math.imul(a ^ 0x2c, 0x01000193) >>> 0;
+  const foldEntries = entries.slice(MOVE_ENTRIES_KEEP);
+  let foldSettled = settled;
+  let liveSettled: Array<{ key: string; record: SettledMoves }> = [];
+  if (complete) {
+    settled.sort((x, y) => y.record.drawn - x.record.drawn || byKey(x, y));
+    foldSettled = settled.slice(MOVE_SETTLED_KEEP);
+    liveSettled = settled.slice(0, MOVE_SETTLED_KEEP);
   }
-  return a.toString(16).padStart(8, '0') + b.toString(16).padStart(8, '0');
+  // The move each station follows among those this pass sees, worked out
+  // only when a bundle overflows: those stay first.
+  let stands: Set<string> | null = null;
+  const standingIds = (): Set<string> => {
+    if (!stands) {
+      const seen = [...entries.map((e) => e.move), ...bundles.flatMap((b) => Object.values(b.bundle.entries))];
+      stands = new Set(standingMoves(seen, knownMoves(seen)).map(moveId));
+    }
+    return stands;
+  };
+  const repacked = repack(bundles, foldSettled, foldEntries, liveSettled, standingIds);
+  return { complete, progress: junk.length > 0 || repacked };
 }
 
 /**
- * Fold the entries and settled records past the caps into one settled
- * record, so the meter reads at least what it read before: each folded
- * entry's fuel and every folded record's reversible move are made final
- * (paid unless beaten by a move known now, and unless a copy is still kept
- * or already final), its total and floor carried whole. The record's key
- * names the set it folds: two replicas that fold the same surplus write one
- * identical record. Two that fold overlapping sets at once count the overlap
- * twice, charging more than was drawn, never less.
+ * Move settled records and entries out of the top level into bundles, each
+ * whole under its identity, bucket by bucket: a bucket that gains items, or
+ * that holds more than one bundle (two replicas packed it at once) or items
+ * of another bucket, is rewritten as one bundle of everything it holds; the
+ * others stay as they are. Within a bucket a writer keeps its best record
+ * (dropped when a record of its own still at the top level covers it, or
+ * when it holds nothing to pay or decide: no total, no running total, no
+ * move still reversible), and an entry its key. Past FOLD_ITEMS_MAX in one
+ * bucket (a flood of well-formed records, never an honest log) the items
+ * worth least go, after every move a station follows (`standingIds`).
+ * Returns whether the map changed.
  */
-function foldSurplus(
-  extraEntries: Array<{ key: string; move: StationMove }>,
-  extraSettled: Array<{ key: string; record: SettledMoves }>,
-  keptEntries: Array<{ key: string; move: StationMove }>,
-  keptSettled: Array<{ key: string; record: SettledMoves }>,
-): void {
-  const folded = [...extraEntries.map((e) => e.key), ...extraSettled.map((e) => e.key)];
-  const known = knownMoves([
-    ...keptEntries.map((e) => e.move), ...extraEntries.map((e) => e.move),
-    ...[...keptSettled, ...extraSettled].flatMap((e) => e.record.recent),
-  ]);
-  const kept = new Set(keptEntries.map((e) => moveId(e.move)));
-  const done = new Set(keptSettled.flatMap((e) => [...(e.record.done ?? []), ...e.record.recent].map(moveId)));
-  let drawn = 0;
-  let floor = 0;
-  const finals: StationMove[] = [];
-  for (const { record } of extraSettled) {
-    drawn += record.drawn;
-    floor = Math.max(floor, record.floor);
-    for (const m of record.done ?? []) done.add(moveId(m));
-  }
-  const pay = (m: StationMove) => {
-    const id = moveId(m);
-    if (kept.has(id) || done.has(id) || (m.fuel === 0 && m.fuelDrawn === 0) || superseded(m, known)) return;
-    done.add(id);
-    drawn += m.fuel;
-    floor = Math.max(floor, m.fuelDrawn);
-    finals.push(m);
+function repack(
+  bundles: Array<{ key: string; bucket: string; bundle: FoldBundle }>,
+  foldSettled: Array<{ key: string; record: SettledMoves }>,
+  foldEntries: Array<{ key: string; move: StationMove }>,
+  liveSettled: Array<{ key: string; record: SettledMoves }>,
+  standingIds: () => Set<string>,
+): boolean {
+  type Bucket = { keys: string[]; settled: Map<string, SettledMoves>; entries: Map<string, StationMove>; dirty: boolean };
+  const buckets = new Map<string, Bucket>();
+  const bucket = (b: string): Bucket => {
+    let at = buckets.get(b);
+    if (!at) buckets.set(b, at = { keys: [], settled: new Map(), entries: new Map(), dirty: false });
+    return at;
   };
-  for (const { record } of extraSettled) record.recent.forEach(pay);
-  for (const { move } of extraEntries) pay(move);
-  for (const k of folded) moveMap!.delete(k);
-  const doneList = [...extraSettled.flatMap((e) => e.record.done ?? []), ...finals].slice(-SETTLED_RECENT_MAX);
-  moveMap!.set(`${SETTLED_PREFIX}cap-${keysHash(folded)}:1`, {
-    n: 1,
-    drawn: Math.min(FUEL_METER_MAX, drawn),
-    floor: Math.min(FUEL_METER_MAX, floor),
-    recent: [],
-    done: doneList.map(cleanMove),
-  });
+  const offer = (w: string, r: SettledMoves): boolean => {
+    const at = bucket(bucketOfItem(`s:${w}`));
+    const had = at.settled.get(w);
+    if (had && !(r.n > had.n || (r.n === had.n && r.drawn > had.drawn))) return false;
+    at.settled.set(w, r);
+    return true;
+  };
+  for (const { key, bucket: b, bundle } of bundles) {
+    const own = bucket(b);
+    own.keys.push(key);
+    if (own.keys.length > 1) own.dirty = true;
+    for (const [w, r] of Object.entries(bundle.settled)) {
+      offer(w, r);
+      if (bucketOfItem(`s:${w}`) !== b) { own.dirty = true; bucket(bucketOfItem(`s:${w}`)).dirty = true; }
+    }
+    for (const [k, m] of Object.entries(bundle.entries)) {
+      const at = bucket(bucketOfItem(`e:${k}`));
+      if (!at.entries.has(k)) at.entries.set(k, m);
+      if (bucketOfItem(`e:${k}`) !== b) { own.dirty = true; at.dirty = true; }
+    }
+  }
+  for (const { key, record } of foldSettled) {
+    const w = writerOf(key, SETTLED_PREFIX);
+    offer(w, record);
+    bucket(bucketOfItem(`s:${w}`)).dirty = true;
+  }
+  for (const { key, move } of foldEntries) {
+    const at = bucket(bucketOfItem(`e:${key}`));
+    at.entries.set(key, move);
+    at.dirty = true;
+  }
+  const live = new Map(liveSettled.map(({ key, record }) => [writerOf(key, SETTLED_PREFIX), record]));
+  const covered = (w: string, r: SettledMoves): boolean => {
+    const l = live.get(w);
+    return !!l && (l.n > r.n || (l.n === r.n && l.drawn >= r.drawn));
+  };
+  const idle = (r: SettledMoves) => r.drawn === 0 && r.floor === 0 && r.recent.length === 0;
+  let changed = false;
+  for (const k of [...foldSettled, ...foldEntries].map((e) => e.key)) { moveMap!.delete(k); changed = true; }
+  for (const [b, at] of buckets) {
+    if (!at.dirty) continue;
+    type Item = { id: string; value: number; move?: StationMove; rank: number; put: (into: FoldBundle) => void };
+    const items: Item[] = [];
+    for (const [w, r] of at.settled) {
+      if (bucketOfItem(`s:${w}`) !== b || covered(w, r) || idle(r)) continue;
+      items.push({
+        id: `s:${w}`, value: r.drawn + r.recent.reduce((sum, m) => sum + m.fuel, 0), rank: 1, put: (into) => { into.settled[w] = r; },
+      });
+    }
+    for (const [k, m] of at.entries) {
+      if (bucketOfItem(`e:${k}`) !== b) continue;
+      items.push({ id: `e:${k}`, value: m.fuel, move: m, rank: 1, put: (into) => { into.entries[k] = m; } });
+    }
+    // Overflowing (a flood): the move each station follows stays first.
+    if (items.length > FOLD_ITEMS_MAX) {
+      const stands = standingIds();
+      for (const it of items) if (it.move && stands.has(moveId(it.move))) it.rank = 0;
+    }
+    const byId = (x: Item, y: Item) => (x.id < y.id ? -1 : x.id > y.id ? 1 : 0);
+    items.sort((x, y) => x.rank - y.rank || y.value - x.value || byId(x, y));
+    const kept = items.slice(0, FOLD_ITEMS_MAX).sort(byId);
+    const next: FoldBundle = { settled: {}, entries: {} };
+    for (const it of kept) it.put(next);
+    const key = kept.length > 0 ? `${FOLD_PREFIX}${b}:${contentHash(JSON.stringify(next))}` : null;
+    for (const old of at.keys) if (old !== key) { moveMap!.delete(old); changed = true; }
+    if (key && !at.keys.includes(key)) { moveMap!.set(key, next); changed = true; }
+  }
+  return changed;
+}
+
+let sweepQueued = false;
+
+/** Carry a sweep that met more keys than one pass walks over the turns that
+ *  follow, a bounded pass at a time, so a flood never stalls the write that
+ *  met it. It stops once a pass sees the whole log, or can clear nothing
+ *  more. */
+function sweepLater(): void {
+  if (sweepQueued) return;
+  sweepQueued = true;
+  setTimeout(() => {
+    sweepQueued = false;
+    if (!docAlive()) return;
+    let pass = { complete: true, progress: false };
+    boundDoc!.transact(() => { pass = sweepLog(Date.now()); });
+    if (!pass.complete && pass.progress) sweepLater();
+  }, 0);
 }
 
 /** Publish a move (owner-gated at the caller). Returns whether it wrote. */
@@ -1763,12 +2174,14 @@ export function writeStationMove(move: StationMove): boolean {
     console.warn('[station move] refused to write a malformed move', move);
     return false;
   }
+  let sweep = { complete: true, progress: false };
   boundDoc!.transact(() => {
-    sweepJunk();
+    sweep = sweepLog(Date.now());
     pruneMoveLog(Date.now());
     // One key per move: a writer's moves of two stations can leave at once.
     moveMap!.set(`${ENTRY_PREFIX}${boundDoc!.clientID}:${clean.departAt}:${clean.welcomeRoomId || clean.stationId}`, clean);
   });
+  if (!sweep.complete && sweep.progress) sweepLater();
   rememberMove(clean);
   return true;
 }
