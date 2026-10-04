@@ -431,6 +431,13 @@ export function sameBase(a: StationOrbit | undefined, b: StationOrbit | undefine
   return a.radiusKm === b.radiusKm && a.phase0 === b.phase0;
 }
 
+/** Is `t` a trim on the orbit a burn names (its planet, slot and base), so
+ *  the line the burn goes on from? One on the slot at another altitude is
+ *  another orbit's line. */
+function onOrbit(t: OrbitTrim | null, b: Pick<TrimBurn, 'planetId' | 'slot' | 'base'>): t is OrbitTrim {
+  return t !== null && t.planetId === b.planetId && t.slot === b.slot && sameBase(t.base, b.base);
+}
+
 /** The untrimmed orbit a basis names. */
 function basisOrbit(b: { planetId: string; slot: number; base?: StationOrbit }): CircularOrbit {
   return baseOrbit({ planetId: b.planetId, orbitSlot: b.slot, orbit: b.base });
@@ -733,8 +740,7 @@ export type TrimPlan = { ok: true; burn: TrimBurn; trim: OrbitTrim } | { ok: fal
  * its line than the trim it found (OrbitTrim.seq).
  */
 export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planetId' | 'slot' | 'base' | 'dir' | 'at'>): OrbitTrim | null {
-  const current = before && before.planetId === burn.planetId && before.slot === burn.slot
-    && sameBase(before.base, burn.base) ? before : null;
+  const current = onOrbit(before, burn) ? before : null;
   const base = basisOrbit(burn);
   const radius = current?.dRadiusKm ?? 0;
   const offset = slotOffsetAt(base, current, burn.at);
@@ -859,9 +865,10 @@ function runBurns(
     const place = placeOf(burn);
     // One the orbit's line already holds (a trim carried back into the room,
     // or a REFUEL's, got it before this log did) has paid and fired, but
-    // moves the orbit no further (OrbitTrim.seen, seenFloor). Places at
+    // moves the orbit no further (OrbitTrim.seen, seenFloor). The trim kept
+    // for the slot at another altitude holds none of its burns. Places at
     // their bound tell no burns apart, so one placed there always moves it.
-    if (own && writer !== undefined && place < MAX_ORDER && seenAt(own, writer) >= place) {
+    if (onOrbit(own, burn) && writer !== undefined && place < MAX_ORDER && seenAt(own, writer) >= place) {
       fired.push(applied);
       continue;
     }
@@ -875,10 +882,12 @@ function runBurns(
       const linePlace = Math.max(trimPlace(before), place);
       if (linePlace > after.at) after.place = linePlace;
       // And it holds every burn that one held, and this one: past the last
-      // MAX_SEEN writers, under their floor.
+      // MAX_SEEN writers, under their floor. A line applyBurn started afresh
+      // (that one was another orbit's) holds this burn alone.
+      const prior = onOrbit(before, burn) ? before : null;
       const line = lineWriters(
-        [...(before?.seen ?? []), ...(writer === undefined ? [] : [[writer, place] as const])],
-        before?.seenFloor,
+        [...(prior?.seen ?? []), ...(writer === undefined ? [] : [[writer, place] as const])],
+        prior?.seenFloor,
       );
       if (line.seen.length > 0) after.seen = line.seen;
       if (line.floor !== undefined) after.seenFloor = line.floor;

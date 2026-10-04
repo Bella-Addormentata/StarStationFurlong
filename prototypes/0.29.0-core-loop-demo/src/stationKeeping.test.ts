@@ -2134,6 +2134,52 @@ describe('a station with several helm rooms: the shared trim', () => {
     }
   });
 
+  /** The station after an altitude change: the same planet and slot, on an
+   *  orbit of its own (StationRecord.orbit, OrbitTrim.base). */
+  const CLIMBED = { ...STATION, orbit: { radiusKm: orbitForSlot(SOV, 0).radiusKm + 600, phase0: 0.5 } };
+
+  /** pressShared, for the station on its new orbit. */
+  function pressClimbed(dir: TrimDirection, now: number): TrimBurn {
+    const plan = planTrim(ctx({
+      station: CLIMBED, trim: readOrbitTrim(CLIMBED), shared: readSharedTrim(CLIMBED), fuel: readFuelLevel(), now,
+      firing: readBurnFiring(now, CLIMBED),
+    }), dir);
+    if (!plan.ok) throw new Error(`refused: ${plan.refusal}`);
+    expect(writeTrimBurn(plan.burn)).toBe(true);
+    return plan.burn;
+  }
+
+  it('a line past sixteen writers holds no burn on the station\'s next orbit, however early it is placed', () => {
+    // Copilot's review of #209: the replay keeps one trim per planet and
+    // slot, so after an altitude change the room's trim was still the slot
+    // orbit's line, and its floor held a burn on the new orbit placed at or
+    // before it: the burn paid and fired, and the new orbit stayed untrimmed.
+    const { a2, u, raise, settled } = pastSixteenWriters(() => writeFuelLevel(readFuelLevel(), 100));
+    // Room A's tab offline since before the RAISE, its clock behind, burns
+    // on the new orbit, placed before the floor.
+    bindRoom(u);
+    const back = pressClimbed('back', raise.at - BURN_MS);
+    sync(a2, u);
+    bindRoom(a2);
+    const landed = readOrbitTrim(CLIMBED)!;
+    expect(landed).toMatchObject({ base: CLIMBED.orbit, dRadiusKm: 0, last: 'back', seq: 1, at: settled.at });
+    expect(orbitOf(landed)).toEqual(orbitOf(applyBurn(null, { ...back, at: settled.at })));
+    expect(landed.seen).toEqual(writers([u, back.at]));
+    expect(landed.seenFloor).toBeUndefined();
+    expect(readFuelDrawn()).toBe(2 * TRIM_FUEL);
+  });
+
+  it('the first line on the station\'s next orbit takes none of the slot line\'s writers or floor', () => {
+    // The same review: a burn on the new orbit starts its line afresh, yet
+    // it took on the writers and floor of the slot orbit's line.
+    const { a2, lower } = pastSixteenWriters(() => writeFuelLevel(readFuelLevel(), 100));
+    const rise = pressClimbed('raise', lower.at + BURN_MS);
+    const first = readOrbitTrim(CLIMBED)!;
+    expect(first).toMatchObject({ base: CLIMBED.orbit, dRadiusKm: TRIM_STEP_KM, last: 'raise', seq: 1, at: rise.at });
+    expect(first.seen).toEqual(writers([a2, rise.at]));
+    expect(first.seenFloor).toBeUndefined();
+  });
+
   it('a trim keeps its floor, and names its writers, only at or before its own place', () => {
     const t = trim({ at: T0, seq: 17, place: T0 + 5, seen: [[7, T0 + 5]], seenFloor: T0 + 1 });
     expect(isOrbitTrim(t)).toBe(true);
