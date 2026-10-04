@@ -48,6 +48,7 @@ import {
   movePhase,
   moveFuelCost,
   quoteMove,
+  planStationAltitude,
   planStationMove,
   readMoveFuelDrawn,
   readRememberedMoves,
@@ -2121,6 +2122,7 @@ describe('the move log stays bounded', () => {
       expect(roomDocLockedByMove(new Y.Doc(), 'far-room', NOW)).toBe(true);
       expect(planStationMove(ctx(), ARIS)).toMatchObject({ ok: false, refusal: 'moves-unknown' });
       expect(planStationTow(tow(), ARIS)).toMatchObject({ ok: false, refusal: 'moves-unknown' });
+      expect(planStationAltitude(ctx(), 5_000)).toMatchObject({ ok: false, refusal: 'moves-unknown' });
       // Asking queued a sweep: the flood goes, the move stays, and nothing
       // holds that the move itself does not.
       vi.runAllTimers();

@@ -30,7 +30,7 @@ import { orbitForSlot, stationOrbit } from './orbits';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
-  currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
+  altitudeChangedSince, currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
 } from './stations';
 import {
   findDestination,
@@ -1081,7 +1081,9 @@ export function completeArrival(
   const leftAt = rec.castOffAt ?? rec.departedAt;
   // Any move that was still under way (or not yet begun) when the ship left
   // and has begun by now overlaps its time away.
-  const movedMidFlight = !!moved && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
+  // 🎚️ Not an altitude change: one that lost its claim never flew, and
+  // climbedAway below weighs those that did.
+  const movedMidFlight = !!moved && moved.mode !== 'orbit' && leftAt !== undefined && moved.arriveAt > leftAt && moved.departAt <= now;
   // Where the station orbited at cast-off, when the flight kept it: however
   // many moves it made since (and only the latest is kept), it is not there.
   const castOffPlace = rec.destinationAt !== undefined ? adriftPlace(rec.destinationAt) : null;
@@ -1100,7 +1102,10 @@ export function completeArrival(
   const movedAway = wasAt && listedNow
     ? planetById(listedNow.planetId).id !== planetById(wasAt.planetId).id || listedNow.orbitSlot !== wasAt.orbitSlot
     : movedMidFlight;
-  if (stationInTransit(station, now) || movedAway) {
+  // 🎚️ An altitude change since cast-off keeps the planet and slot, so it
+  // is looked for among every move known, not only the latest.
+  const climbedAway = !!listedNow && leftAt !== undefined && altitudeChangedSince(listedNow, leftAt, now);
+  if (stationInTransit(station, now) || movedAway || climbedAway) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.

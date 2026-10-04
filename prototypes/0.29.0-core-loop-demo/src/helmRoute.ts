@@ -148,7 +148,7 @@ import type {
 import { castOffPlaces } from './shipArrival';
 import { localStationId } from './stationDirectory';
 import { stationInTransit } from './stations';
-import type { StationBerthRecord, StationMove } from './stations';
+import type { StationBerthRecord, StationMove, StationOrbit } from './stations';
 
 // ── Constants (§2b, §5) ──────────────────────────────────────────────────────
 
@@ -245,6 +245,8 @@ export interface RouteStationLike {
   /** 🚚 PR 174's move, if any: between its burns the station orbits
    *  nowhere (still listed where it left, a slot another may hold now). */
   move?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's. */
+  orbit?: StationOrbit;
 }
 
 /** Where a berth choice came from: a gate the station lists (with or
@@ -274,6 +276,8 @@ export interface RouteStopCandidate {
   name: string;
   planetId: string;
   orbitSlot: number;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's. */
+  orbit?: StationOrbit;
   /** Empty when no berth door is known there (fly there once and dock by
    *  hand: the ship then remembers the berth). */
   choices: RouteGateChoice[];
@@ -388,7 +392,9 @@ export function routeStopCandidates(input: RouteCandidateInput): RouteStopCandid
         choices.unshift(mine);
       }
     }
-    out.push({ stationId: st.id, name: st.name, planetId: st.planetId, orbitSlot: st.orbitSlot, choices });
+    out.push({
+      stationId: st.id, name: st.name, planetId: st.planetId, orbitSlot: st.orbitSlot, ...(st.orbit ? { orbit: st.orbit } : {}), choices,
+    });
   }
   return out;
 }
@@ -467,6 +473,7 @@ export function addDraftStop(d: RouteDraft, cand: RouteStopCandidate, choice = 0
     name: cand.name,
     planetId: cand.planetId,
     orbitSlot: cand.orbitSlot,
+    ...(cand.orbit ? { orbit: { ...cand.orbit } } : {}),
     berth: { ...c.berth, anyGate: true },
     waitSecs: DEFAULT_WAIT_SECS,
   };
@@ -530,6 +537,7 @@ export function refreshDraftStops(
     if (stationInTransit(st, now)) return out;
     out.planetId = st.planetId;
     out.orbitSlot = st.orbitSlot;
+    if (st.orbit) out.orbit = { ...st.orbit }; else delete out.orbit;
     const listed = (st.berths ?? []).find((b) => b.roomId === s.berth.roomId && b.doorId === s.berth.farDoor);
     if (listed?.gate !== undefined) out.berth.gate = listed.gate;
     return out;

@@ -52,6 +52,7 @@ import {
   checkpointFromWire,
   checkpointKey,
   checkpointToWire,
+  endedRunIn,
   finishShipRoute,
   installRouteFlight,
   installRouteFuelMeter,
@@ -71,6 +72,7 @@ import {
   routeBerthFromWire,
   routeFlightNow,
   routeFuelDebt,
+  routeIn,
   routeRulesFlightNow,
   routeToWire,
   routeWithoutRun,
@@ -79,6 +81,7 @@ import {
   startShipRoute,
   stopShipRoute,
   writeRouteCheckpoint,
+  writeRouteCheckpointIn,
   writeShipRoute,
 } from './shipRoute';
 import type { RouteCheckpoint, RouteStop, ShipRoute, StartCheckpoint } from './shipRoute';
@@ -469,6 +472,8 @@ describe('startShipRoute', () => {
     startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 50, capacity: CAP });
     expect(updates.n).toBe(1);
     expect(info.get('minClient')).toBe(ROUTE_MIN_CLIENT);
+    // v0.38.0 shipped without ferry routes: a client of it is asked to update.
+    expect(raisedMinClient('0.38.0', ROUTE_MIN_CLIENT)).toBe(ROUTE_MIN_CLIENT);
 
     bindShipDoc(new Y.Doc());
     const later = shipDocHandle()!.doc.getMap('roomInfo');
@@ -1591,5 +1596,98 @@ describe('REFUEL on a running route (A2 fuel, through the route)', () => {
     expect(updates.n).toBe(0);
     finishShipRoute();
     expect(refuelShipRoute(CAP)).toBe(false);
+  });
+});
+
+// ── 🚏🤖 Any ship map (a station gate keeper's session to the ferry) ─────────
+
+describe('any ship map, read and written as the bound one is', () => {
+  /** A copy of the bound doc that is never bound. */
+  const copyOf = (d: Y.Doc): Y.Doc => {
+    const c = new Y.Doc();
+    Y.applyUpdate(c, Y.encodeStateAsUpdate(d));
+    return c;
+  };
+
+  it('reads the route and the running run\'s checkpoints the bound readers read', () => {
+    const { run, route, start } = started();
+    const on = onTime(route, start, 2);
+    const hold = holdCheckpoint(route, 1, { at: on[0].arrive + 5 * SEC });
+    expect(writeRouteCheckpoint(run, hold, on[0].arrive + 6 * SEC)).toBe(true);
+    const t = on[0].arrive + 10 * SEC;
+    const read = routeIn(copyOf(doc).getMap('ship'), t);
+    expect(read.route).toEqual(readShipRoute(t));
+    expect(read.checkpoints).toEqual(readRouteCheckpoints(t));
+    expect(read.checkpoints.map((e) => e.kind)).toEqual(['start', 'hold']);
+    // A saved route that is not running has no checkpoints.
+    const idle = new Y.Doc();
+    idle.getMap('ship').set('route', routeToWire(saved()));
+    expect(routeIn(idle.getMap('ship'), t)).toEqual({ route: saved(), checkpoints: [] });
+    expect(routeIn(new Y.Doc().getMap('ship'), t)).toEqual({ route: null, checkpoints: [] });
+  });
+
+  it('follows a later START, and leaves a run stamped too far ahead, as the bound readers do', () => {
+    const { route } = started();
+    const far = T0 + RUN_AHEAD_MS + 1;
+    const ghost: ShipRoute = { ...saved(), startedAt: far, startStop: 1 };
+    map().set(checkpointKey(far, 0, 'start'), checkpointToWire(startCheckpoint(ghost, { at: far, pilot: 'person', fuel: 70 })!));
+    const copy = copyOf(doc).getMap('ship');
+    expect(routeIn(copy, T0).route).toEqual(route);
+    expect(routeIn(copy, T0).checkpoints).toEqual(readRouteCheckpoints(T0));
+    expect(routeIn(copy, T0 + 1).route).toEqual(readShipRoute(T0 + 1));
+    expect(routeIn(copy, T0 + 1).route).toMatchObject({ startedAt: far, startStop: 1 });
+    expect(routeIn(copy, T0 + 1).checkpoints).toEqual(readRouteCheckpoints(T0 + 1));
+  });
+
+  it('reads the run a finish ended, as readEndedRun does', () => {
+    const { run } = started();
+    const t = T0 + 10 * SEC;
+    expect(endedRunIn(copyOf(doc).getMap('ship'), t)).toBeUndefined(); // a run still flies
+    expect(stopShipRoute(T0 + SEC)).toBe(true);
+    expect(finishShipRoute()).toBe(true);
+    expect(endedRunIn(copyOf(doc).getMap('ship'), t)).toBe(run);
+    expect(readEndedRun(t)).toBe(run);
+    // A saved route that never ran ended none, and a start key stamped past
+    // RUN_AHEAD_MS is no run.
+    const idle = new Y.Doc();
+    idle.getMap('ship').set('route', routeToWire(saved()));
+    expect(endedRunIn(idle.getMap('ship'), t)).toBeUndefined();
+    idle.getMap('ship').set(checkpointKey(t + RUN_AHEAD_MS + 1, 0, 'start'), {});
+    expect(endedRunIn(idle.getMap('ship'), t)).toBeUndefined();
+  });
+
+  it('writes the key the bound writer writes, prunes alike, and announces nothing', () => {
+    const { run, route, start } = started(saved([0, 1], { homeRefuel: true }));
+    const on = onTime(route, start, 6);
+    const hold = holdCheckpoint(route, 1, { at: on[0].arrive + 5 * SEC });
+    expect(writeRouteCheckpoint(run, hold, on[0].arrive + 6 * SEC)).toBe(true);
+    const ferry = copyOf(doc);
+    const skip = skipCheckpoint(route, 4, { at: on[3].arrive + 5 * SEC, pilot: 'robot' })!;
+    const heard: unknown[] = [];
+    const off = onRouteWritten((n) => heard.push(n));
+    const updates = countUpdates(ferry);
+    expect(writeRouteCheckpointIn(ferry, ferry.getMap('ship'), run, skip, on[3].arrive + 6 * SEC)).toBe(true);
+    expect(writeRouteCheckpoint(run, skip, on[3].arrive + 6 * SEC)).toBe(true);
+    off();
+    expect(heard).toEqual([{ kind: 'checkpoint', legSeq: 4 }]); // the bound write's alone
+    expect(updates.n).toBe(1);
+    const keys = (m: Y.Map<unknown>) => [...m.keys()].filter((k) => k.startsWith('ckpt:')).sort();
+    expect(keys(ferry.getMap('ship'))).toEqual(keys(map()));
+    expect(keys(map())).toEqual([`ckpt:${run}:0:start`, `ckpt:${run}:4:skip`].sort());
+    expect(ferry.getMap('ship').get(checkpointKey(run, 4, 'skip'))).toEqual(checkpointToWire(skip));
+  });
+
+  it("drops a stale run's write, a malformed entry, and one naming the wrong stop", () => {
+    const { run, route, start } = started();
+    const on = onTime(route, start, 2);
+    const ferry = copyOf(doc);
+    const m = ferry.getMap('ship');
+    const hold = holdCheckpoint(route, 1, { at: on[0].arrive + 5 * SEC });
+    expect(writeRouteCheckpointIn(ferry, m, run + 1, hold, on[0].arrive + 6 * SEC)).toBe(false);
+    expect(writeRouteCheckpointIn(ferry, m, run, { ...hold, stationId: 'st-0' }, on[0].arrive + 6 * SEC)).toBe(false);
+    expect(writeRouteCheckpointIn(ferry, m, run, { ...hold, seenAt: Number.NaN }, on[0].arrive + 6 * SEC)).toBe(false);
+    expect([...m.keys()].filter((k) => k.startsWith('ckpt:'))).toEqual([`ckpt:${run}:0:start`]);
+    expect(writeRouteCheckpointIn(ferry, m, run, hold, on[0].arrive + 6 * SEC)).toBe(true);
+    expect(routeIn(m, on[0].arrive + 7 * SEC).checkpoints.map((e) => e.kind)).toEqual(['start', 'hold']);
   });
 });

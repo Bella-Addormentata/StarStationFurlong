@@ -2119,6 +2119,14 @@ export class DoorDockingPortSystem {
           ...(next === "open" ? {} : { gateAccess: next }),
           ...(next === "reserved" ? { reservedFor: dockedShip } : {}),
         });
+      } else if (el.dataset.dockAction === "gate-auto-ferry") {
+        // 🚏🤖 The owner lets this gate dock scheduled ferries with nobody
+        // aboard (gateKeeper.ts): ON ⇄ OFF. Owner only, like the access.
+        if (!this.isRoomOwner()) return;
+        const policy = readDoorPolicy(doorId);
+        if (!policy.adapter) return;
+        const { autoFerry: _f, ...rest } = policy;
+        writeDoorPolicy(doorId, policy.autoFerry ? rest : { ...rest, autoFerry: true });
       }
     });
 
@@ -2913,6 +2921,19 @@ export class DoorDockingPortSystem {
     return { wall: pose.wall, lateral: pose.tangent === "x" ? pose.x : pose.z };
   }
 
+  /** 🚏🤖 doorLateral for the station's gate keeper (gateKeeper.ts), which
+   *  writes a gate's end of a dock as a DOCK here would. */
+  public doorWallLateral(doorId: string): { wall: DoorWall; lateral: number } {
+    return this.doorLateral(doorId);
+  }
+
+  /** 🚏🤖 Show what the station's gate keeper did at a gate in its DOCK row,
+   *  like an operation's outcome, never over one still in flight. */
+  public noteDockOp(doorId: string, note: string, tone: "ok" | "warn" | "bad"): void {
+    if (this.dockOp(doorId)?.busy) return;
+    this.setDockOp(doorId, { note, tone });
+  }
+
   /** Every dock port of the room, in door order — the helm's list and map. */
   public listDockPorts(): DockPortView[] {
     // An AUTHORITATIVE door set is the whole truth, even when it is empty
@@ -3560,12 +3581,23 @@ export class DoorDockingPortSystem {
     const accessBtn = owner
       ? `<button type="button" data-dock-action="gate-access" title="Who may dock at this gate: open to all, captains you granted at this door, reserved for the ship docked here now, or closed" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:#f2efe6; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${accessLabel}</button>`
       : `<span>${accessLabel}</span>`;
+    // 🚏🤖 DOCK SCHEDULED FERRIES AUTOMATICALLY (gateKeeper.ts): an empty
+    // ferry has no key, so a gate for granted captains (or a closed one)
+    // never admits it. The button names itself and says whether it is on
+    // (its ON/OFF text alone would not, read on its own).
+    const autoLabel = policyNow.autoFerry ? "ON" : "OFF";
+    const autoBtn = owner
+      ? `<button type="button" data-dock-action="gate-auto-ferry" title="Dock scheduled ferries automatically: when a route ferry calls at this gate with nobody aboard, a game in this module docks it on arrival and casts it off at its departure. The ferry must have docked in this module once with someone aboard." aria-label="Dock scheduled ferries automatically" aria-pressed="${policyNow.autoFerry ? "true" : "false"}" style="border-radius:4px; border:1px solid rgba(242,239,230,0.35); background:rgba(0,0,0,0.25); color:${policyNow.autoFerry ? "#00e676" : "#f2efe6"}; font-size:9px; font-weight:800; padding:1px 6px; cursor:pointer;">${autoLabel}</button>`
+      : `<span>${autoLabel}</span>`;
+    const autoShut = policyNow.autoFerry && (policyNow.gateAccess === "pass" || policyNow.gateAccess === "closed");
     const gateLine = readDoorPolicy(doorId).adapter
       ? `<div style="display:flex; align-items:center; gap:6px; font-size:9.5px; color:#f2efe6; flex-wrap:wrap;">
           <span>🚦 GATE <b>${gate ?? "—"}</b></span>
           ${owner ? gateBtn("down", "−") + gateBtn("up", "+") : ""}
           <span style="color:rgba(242,239,230,0.6);">DOCKING:</span> ${accessBtn}
+          <span style="color:rgba(242,239,230,0.6);">AUTO-DOCK FERRIES:</span> ${autoBtn}
           ${clash ? `<span style="color:#ffb300;">⚠ another port in this station is also gate ${gate}</span>` : ""}
+          ${autoShut ? `<span style="color:#ffb300;">⚠ an empty ferry docks only at a gate open to all or reserved for it</span>` : ""}
         </div>`
       : "";
     rowEl.innerHTML = `

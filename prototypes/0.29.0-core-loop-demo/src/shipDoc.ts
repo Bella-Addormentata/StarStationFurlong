@@ -1174,8 +1174,14 @@ function isCastOffHold(v: unknown): v is CastOffHold {
 /** The cast-off hold in force at `now`, or null. One stamped further ahead
  *  than CAST_OFF_HOLD_MS is none: no peer's clock holds a ship longer. */
 export function readCastOffHold(now: number = Date.now()): CastOffHold | null {
-  if (!docAlive()) return null;
-  const raw = shipMap!.get('castOff');
+  return docAlive() ? castOffHoldIn(shipMap!, now) : null;
+}
+
+/** 🚏🤖 The cast-off hold in force at `now` in a ship map this client is
+ *  not bound to (a ferry's, read through a background session:
+ *  gateKeeper.ts), by readCastOffHold's rule. */
+export function castOffHoldIn(ship: Y.Map<unknown>, now: number = Date.now()): CastOffHold | null {
+  const raw = ship.get('castOff');
   if (!isCastOffHold(raw)) return null;
   return now < raw.at + CAST_OFF_HOLD_MS && raw.at <= now + CAST_OFF_HOLD_MS ? { by: raw.by, at: raw.at } : null;
 }
