@@ -237,7 +237,9 @@ let flyingCache: { room: string; at: number; status: string; since: Map<string, 
 /** This game's memory of the rooms it has heard flying free (room → the
  *  newest such summary's time: its pose's own time when that is earlier), kept past the planet summaries' expiry and
  *  cap: a station's docks stay closed here until it is heard otherwise. */
-const FLYING_KEY = 'ssf.freeFlight.flyingRooms.v1';
+// v2: times by the flying room's pose clock. v1 kept summary stamps, which
+// a fast clock could set hours ahead of the PARK that ends them: dropped.
+const FLYING_KEY = 'ssf.freeFlight.flyingRooms.v2';
 const MAX_FLYING_ROOMS = 64;
 /** How long a room heard flying free is remembered once nothing more is
  *  heard of it. The summaries are peer-written (the dev-phase trust of the
@@ -297,7 +299,9 @@ function flyingSince(now: number): Map<string, number> {
         // flying room's clock, the one its PARK move is booked by
         // (stationFlyingFree), where the summary's stamp may run hours ahead.
         const heard = s.free ? Math.min(s.updatedAt, s.free.at) : s.updatedAt;
-        if (known === undefined || heard > known) { since.set(s.roomId, heard); dirty = true; }
+        // The summary on hand is the latest word on the room: it replaces a
+        // later time remembered from a clock that ran ahead.
+        if (known !== heard) { since.set(s.roomId, heard); dirty = true; }
       } else if (known !== undefined && s.updatedAt > known) {
         since.delete(s.roomId);
         dirty = true;
@@ -308,9 +312,12 @@ function flyingSince(now: number): Map<string, number> {
   }
   // This room's own record is first-hand.
   if (room && status === 'free-flight') {
-    // Kept fresh (hourly) while it flies, so it never lapses first-hand.
+    // Kept fresh (hourly) while it flies, so it never lapses first-hand: as
+    // of its pose's time, by the clock that books its PARK, never later
+    // than this game's.
     const known = since.get(room);
-    if (known === undefined || now - known > 3600_000) { since.set(room, now); dirty = true; }
+    const at = Math.min(now, readFreePose()?.at ?? now);
+    if (known === undefined || at < known || at - known > 3600_000) { since.set(room, at); dirty = true; }
   } else if (room && since.delete(room)) {
     dirty = true;
   }
