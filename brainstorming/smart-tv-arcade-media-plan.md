@@ -644,10 +644,16 @@ chunk's type; and the configuration
 goes on the reliable lane, below, named by its generation. The source is an INSTANCE, never
 the sender's key: one identity may publish voice, a screen share and an
 arcade feed at once, and each is its own source with its own subscriber
-set, media key, epochs and counters — `source = BLAKE3(sender key ‖ room
-‖ kind ‖ a 16-byte instance nonce)`, declared in the sender's signed
-source announcement on the control plane, which binds the id to the
-sender key, the room, the kind and the nonce; a frame's signature is
+set, media key, epochs and counters — `source = BLAKE3("ssf-media-src:v1\n"
+‖ sender key (32) ‖ u16-BE length ‖ room (UTF-8) ‖ u16-BE length ‖ kind
+(UTF-8) ‖ a 16-byte instance nonce)`: a versioned domain tag first, as
+`signBytes.ts` puts one before every envelope it signs, so the digest is
+this protocol's and no other's, and the two variable-length strings
+length-framed, so Rust and TypeScript hash the same bytes and no pair of
+room and kind can collide with another (both are newline-free tokens, but
+a length is cheaper to get right than a rule) — declared in the sender's
+signed source announcement on the control plane, which binds the id to
+the sender key, the room, the kind and the nonce; a frame's signature is
 verified against the key that announcement names, resolved once per
 source and never read from the header. The DECODER CONFIGURATION travels
 the same way, not in the frame: a signed `media-config` message per
@@ -1193,8 +1199,18 @@ seat before any lane is mapped to a player. And every input after that is
 authenticated end to end too: the binding proves the lane was the player's
 once, and a node gone bad could emit ticks under it afterwards that P1
 could not tell from the player's. So the two pages derive a session key —
-X25519 between their identity-derived keys, bound by the KDF to {room,
-cabinet id, the seat's tenure nonce, epoch, lane id, both pubs}, where the
+X25519 between their identity-derived keys (the libsodium Ed25519→X25519
+conversion each side already has; a shared secret that comes out all
+zeros, a low-order point's, is refused and the seat not taken), then
+HKDF-SHA-256 over that secret: the salt the seat's 16-byte tenure nonce,
+the info `"ssf-p2-session:v1\n" ‖ u16-BE length ‖ room (UTF-8) ‖ u16-BE
+length ‖ cabinet id (UTF-8) ‖ tenure nonce (16) ‖ epoch (4, big-endian) ‖
+lane id (8) ‖ P1's Ed25519 pub (32) ‖ P2's Ed25519 pub (32)`, P1 then P2
+by role, never by sort, and 32 bytes out — the key bound to {room, cabinet
+id, the seat's tenure nonce, epoch, lane id, both pubs} exactly as
+`signBytes.ts` binds an envelope: a versioned tag first, every
+variable-length field length-framed, so two correct implementations
+derive one key and an ad-hoc one cannot leave the domain out — where the
 tenure nonce is minted fresh by P1 as it grants the seat and carried in the
 seat record, so a renewed seat or another cabinet is another key even for
 the same two identities on the same lane in the same room epoch — and each
