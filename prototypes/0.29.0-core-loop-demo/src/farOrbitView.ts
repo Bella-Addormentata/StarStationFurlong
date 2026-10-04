@@ -45,7 +45,10 @@ import { readAllDoors } from './doorsDoc';
 import { readFlightRecord, shipDocBound } from './shipDoc';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
-import { adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
+import {
+  adriftAt, adriftPlace, currentRoomId, currentStation, isStationRoom, latestMoveOf, listStations, planetById, planetForRoom,
+  roomAdriftPlace, stationInTransit,
+} from './stations';
 import type { StationMove, StationRecord } from './stations';
 
 /** The main scene's sky objects also live on this layer, so pass 1 can draw
@@ -132,13 +135,14 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
   return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
 }
 
-/** A flight's destination where it orbited at cast-off (the record's
- *  destinationAt, as shipArrival.ts reads it): however many moves the station
- *  made since (only the latest is remembered), that is where the ship flies.
- *  Under the station's own id, so its trim still applies while it flies that
- *  slot (a trim names the slot it is for). Undefined when the record kept none. */
-function castOffPlace(id: string, destinationAt: string | undefined): Place | undefined {
-  const at = destinationAt ? adriftPlace(destinationAt) : null;
+/** A flight's end where it orbited at cast-off (the record's originAt or
+ *  destinationAt, as shipArrival.ts reads them): however many moves the
+ *  station made since (only the latest is remembered), that is where the ship
+ *  left from or flies to. Under the station's own id, so its trim still
+ *  applies while it flies that slot (a trim names the slot it is for).
+ *  Undefined when the record kept none. */
+function castOffPlace(id: string, keptAt: string | undefined): Place | undefined {
+  const at = keptAt ? adriftPlace(keptAt) : null;
   return at ? { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot } : undefined;
 }
 
@@ -231,19 +235,21 @@ function readSource(now: number): Source {
 
   // Aboard a ship in flight: see the planet from the transfer.
   // Every room binds a ship doc, so a flight record alone proves nothing: only
-  // a ready ship that is not bolted into a station follows its flight (the
-  // same test main.ts's planet publisher and station resolver use).
+  // a ready ship that is neither a station's own room nor bolted into one
+  // follows its flight (main.ts's planet publisher's test).
   let aboard: TransferPlan | null = null;
-  // Aboard a ship waiting in open orbit (its destination station left): see
-  // the planet from that orbit, not from the ship's own one-room station.
+  // Aboard a ship in open orbit (waiting where its destination station left,
+  // or resting there): see the planet from that orbit, not from the ship's
+  // own one-room station.
   let adrift: Place | null = null;
-  if (shipDocBound() && isShipReady() && !isBoltedIntoStation(readAllDoors().values())) {
+  if (shipDocBound() && isShipReady() && !isStationRoom(roomId, [], all)
+    && !isBoltedIntoStation(readAllDoors(), roomId, atlas)) {
     const rec = readFlightRecord();
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
       aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => [
-        placeOf(rec.locationId, all, leftAt, now),
+        castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
         castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
       ]);
       // Kept through every leg: a ship casts off before its launch window,
@@ -265,6 +271,13 @@ function readSource(now: number): Source {
         adrift = place;
       }
     }
+  }
+  // Anywhere else the room resolver puts this room in open orbit (main.ts's,
+  // through shipArrival.shipPlaceId): a ship resting there after letting go of
+  // its dock, say. Its own one-room stand-in is no place to see it from.
+  if (!aboard && !adrift) {
+    const open = roomAdriftPlace(roomId);
+    if (open) adrift = { id: adriftAt(open.planetId, open.orbitSlot), ...open };
   }
 
   // Not in a known station (offline, or before the first join): stand in
