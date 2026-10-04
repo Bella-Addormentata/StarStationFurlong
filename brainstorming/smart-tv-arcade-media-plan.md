@@ -52,7 +52,7 @@ the sources that fail have to say so on the screen.
 | Need | What exists | Where |
 |---|---|---|
 | Shared switch state | Whole-value LWW records per item, shape-checked reads, per-key subscribe, owner-predicate seam | `partyDoc.ts` (`speaker:<itemId>`, `setPartyHostPredicate`) |
-| Single-writer clocks | The operator stamps absolute deadlines; others render `deadline − localNow`; heartbeat 3 s, stale at 9 s | `croupier.ts` |
+| Single-writer clocks | The operator stamps absolute deadlines; others render `deadline − localNow`; heartbeat 3 s, stale at 9 s — wall clocks compared across devices, so a precedent for the schedule's absolute `startAt` (§3.1 accepts that skew) and NOT for liveness, which §3.1 takes from the pusher row below | `croupier.ts` (`isCroupierLive`) |
 | A renewable lease, liveness judged by the renewals a page saw | Operator lease: renew every 3 s, lapse after 8 s. Its CLAIM policy is the pusher's own — owner-only, and a 60 s split window before another device takes over — and is NOT what the TV reuses: the remote's claim policy is distinct (§3.2): anyone takes a free or lapsed remote, at once, no owner gate | `pusherCroupier.ts` |
 | Per-frame unreliable lane | 13-byte datagrams, relayed content-blind to every room member; 2-bit lane kind, one kind (3) still free | `network/protocol.ts`; `ssf-p2p-node/src/main.rs` accepts only `datagram.len() == 13` from the browser |
 | Reliable lane | JSON envelopes with base64 payloads (`ysync`); `'asset'` kind declared, unimplemented; no `iroh-blobs` in the node | `network/YjsSync.ts`, `protocol.ts` |
@@ -123,8 +123,12 @@ writes land locally). That term is an approximation of the one-way transit,
 not a measurement of it — the measured round trip is to the viewer's own
 node, which on a desktop build is loopback — so the honest bound is "one
 delivery lag, corrected within a heartbeat", never clock skew: no device
-compares its clock with another's (the `croupier.ts` rule, and the
-air-hockey staleness clocks). An end-to-end probe correlated with the current
+compares its clock with another's (the `pusherCroupier.ts` rule —
+`leaseLapsesAt` counts a lease term from when THIS page first saw the
+record, never `Date.now()` against a stamp another device wrote — and the
+air-hockey staleness clocks, local receipt time against the local clock;
+NOT `croupier.ts`, whose `isCroupierLive` takes `Date.now() − beat` across
+devices and is the precedent this rule exists to avoid). An end-to-end probe correlated with the current
 holder could replace the term later. Drift correction: `<video>` elements
 nudge `playbackRate` ±3 % under 1 s of drift and seek beyond 1.5 s; the
 YouTube player only seeks (its rate steps are coarse), with a 1.5 s dead band
@@ -195,7 +199,8 @@ the set; everyone watching the holder navigate the start screen on the prop
 (a cursor in the record, the `ui` field) is a later slice. The phone's remote
 app is the buttons; the TV is the display. Every tile wears its
 lane badge (**SOVEREIGN** / **PLAYER-RUN** / **PUBLIC SWARM** / **CONVENIENCE**),
-and strict-sovereign builds grey out the convenience tiles and the public DHT.
+and a strict-sovereign build greys out the convenience tiles and shows the
+torrent tile as library-only, since §6 compiles the torrent client out there.
 
 | Tile | Who fetches the bytes | Reaches the screen as | Sync | Class | Posture |
 |---|---|---|---|---|---|
@@ -369,7 +374,12 @@ their own webview at `/blob/<hash>?cap=…` with range support, behind the
 same request gate as `/api/media` (§3.4): the per-launch capability token
 and an allowed `Origin` — or `Sec-Fetch-Site: same-origin` in its place,
 the proxy's rule — checked before any read of the store, the element in
-CORS mode so that a cross-origin one sends an `Origin`. The route
+CORS mode so that a cross-origin one sends an `Origin`. Every `/blob`
+response carries `Cache-Control: private, no-store` (the proxy's responses
+the same): a webview's HTTP cache keeps the ranges it was served, and
+without the header delete-on-leave and eviction would remove the store's
+copy while a second, unquotaed one lived on in the cache — the node's store
+is the only copy, under the quotas. The route
 serves only what the store already holds or is fetching and never starts a
 fetch itself — CORS only governs who may read a response, a `<video src>`
 needs none to make the request, and a hash is no secret once a room record
@@ -647,12 +657,13 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 | Central piece | Without it |
 |---|---|
 | Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
-| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full DHT node, so a room's hub is its spokes' bootstrap), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. Strict builds have no public swarm at all: the public-DHT side is compiled out, PEX and LSD are off, and the routing table and peer store live under a strict-only path a non-strict run never writes — a persisted table may already hold public nodes, and one full-DHT peer or one PEX exchange would repopulate them, so turning a list off isolates nothing. A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
+| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node, so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no DHT client, no PEX, no LSD, no tracker or web-seed code to reach anything with — the only isolation that holds, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
 | Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build; never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
 Rules: `librqbit` inside `ssf-p2p-node` as an optional cargo feature
-(`torrent`, gated like `chia-lane`), never a second process. The **host's node
+(`torrent`, gated like `chia-lane`), never a second process, and not
+compiled into a strict build at all (the DHT row above). The **host's node
 is the room's one swarm participant**; the file reaches the room over the blob
 lane; viewers join the swarm only by opt-in. Paste only, no search, no
 catalogue. A `fetching` state with the host node's progress on the screen; the
@@ -801,11 +812,24 @@ seat record, so a renewed seat or another cabinet is another key even for
 the same two identities on the same lane in the same room epoch — and each
 kind-3 input carries a strictly increasing sequence number and a
 keyed-BLAKE3 MAC under that key over the whole canonical frame: sub-kind,
-sequence and payload, nothing an input says left outside it. P1 drops any
+sequence and payload, nothing an input says left outside it. The frame is
+fixed to the byte: `[kind 3 | sub-kind: 1 B][len: 1 B, counting the
+tag][seq: 4 B unsigned little-endian][input: 13 B]` (the sequence in the
+tick codec's byte order, `protocol.ts`); the MAC is `blake3::keyed_hash` under the
+32-byte session key over exactly those nineteen bytes, truncated to its
+first 16 bytes and appended — a 128-bit tag (BLAKE3's output is a PRF, so
+a prefix is a MAC of its own length's strength; 2⁻¹²⁸ per forged frame is
+the claim, and the full 32 bytes would buy nothing a 60 Hz lane could use)
+— and P1 takes the tag as the payload's last 16 bytes. The node's wrapper
+(the TTL, the origin lane id) stays outside the MAC: the TTL changes per
+hop, and the lane id is already bound into the key. The sequence starts at
+zero under each session key and never wraps: 2³² frames is two years at
+60 Hz, and a sender at the ceiling stops and takes a new seat (a new tenure
+nonce, a new key, a new zero). P1 drops any
 input whose MAC fails or whose sequence does not advance, and an input
 captured in one session verifies in no other — a high sequence replayed
 from an earlier tenure cannot push a new session's inputs out (thirteen
-bytes become about thirty; at 60 Hz that is nothing). Thirty bytes do not fit the tick
+bytes become thirty-five; at 60 Hz that is 17 kbps, nothing). Thirty-five bytes do not fit the tick
 lane as it is: browser ingress takes exactly 13-byte datagrams, and the
 mesh relays only the 13-, 14- and 22-byte frames with a 13-byte tick inside
 (`ssf-p2p-node/src/main.rs`, the datagram arms) — everything else is
