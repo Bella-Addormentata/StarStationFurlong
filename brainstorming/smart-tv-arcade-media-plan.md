@@ -589,12 +589,24 @@ so a live voice stream is never a buffer stale, and the frames from before
 a joiner's admission, which it was never meant to open, it never sees. So
 a departure is never delayed, and admissions cost one rotation per interval
 however many join.
-What bounds a member who leaves and returns on purpose is the per-identity
-count the sender's node keeps: past three departures in a minute the
-identity is parked — its next admission waits out a backoff that doubles
-each time, and its leaves and returns trigger nothing meanwhile — so a
-flapping or malicious member interrupts a source three times, then not for
-a while. Replay protection is a sliding window per leg,
+What bounds a member who leaves and returns on purpose is counted at three
+scopes, since an identity is free to mint: per identity, past three
+departures in a minute it is parked — its next admission waits out a
+backoff that doubles each time, and its leaves and returns trigger nothing
+meanwhile; per authenticated ingress link (the WebTransport session or iroh
+connection the identities arrived by, which a fresh key cannot change),
+past six departures a minute across every identity behind it the LINK is
+parked — every identity behind it evicted in ONE rotation, their
+re-admissions waiting out the doubling backoff together — so a client
+minting identities interrupts a source six times, not without end; and
+source-wide, past thirty rotations a minute the sender batches further
+departures into one rotation every two seconds and reports the storm,
+which hands a departed member at most two seconds of frames it could still
+open — stated as the cost — rather than the sender's whole budget. A
+subscriber cap per source (sixty-four identities; the hubs' aggregation
+keeps the forwarding tree beneath it) bounds what any rotation costs: one
+sealed key per subscriber, a few milliseconds of X25519 and a few
+kilobytes at the cap. Replay protection is a sliding window per leg,
 the SRTP shape: a leg's counter only ever goes up within an epoch; a
 receiver keeps, per leg, the highest counter it has accepted and a bitmap
 of the last 128 below it, takes a frame above the highest (and
@@ -675,8 +687,9 @@ A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
 three CAPABILITIES the lane rests on are feature-detected separately, and a
 sender advertises only the ones it has (they are not legs — the lane has
 two, audio and video, keyed as above): `WebTransport` (Safari 26.4 is the floor per
-`docs/TDD/BrowserSupportMatrix.md`), `VideoEncoder` (Chromium, Firefox 130+,
-Safari 16.4+, WebKitGTK 2.44+) and `AudioEncoder` (absent on Safari
+`docs/TDD/BrowserSupportMatrix.md`), `VideoEncoder` (Chromium; Firefox
+desktop 130+ and NOT Firefox Android, per the matrix, so an Android Firefox
+advertises no media leg; Safari 16.4+; WebKitGTK 2.44+) and `AudioEncoder` (absent on Safari
 16.4–18.x and WebKitGTK 2.44). Only true screen capture (`getDisplayMedia`)
 is Chromium-first. Budget per
 viewer: ~24–32 kbps voice, ~96–128 kbps music, ~0.3–0.8 Mbps for a
@@ -855,7 +868,20 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   chain already holds, whoever signs them and whenever a node syncs; a
   sequence number alone would commit nothing, since a former owner could
   mint a backdated op below it, or two at one number, and a late node
-  could not tell them from the history the successor accepted.
+  could not tell them from the history the successor accepted. A chain of
+  signatures detects a fork and chooses none: the authority itself could
+  sign two heads on one predecessor committing different tips, and two
+  readers could accept two histories. So a head counts only once it is
+  ANCHORED — its hash carried in a spend of the deed's own singleton on
+  chain, the channel the authority architecture already gives the deed,
+  whose lineage is linear by construction: one chain of coins, one chain
+  of heads — and an unanchored head authorizes nothing yet; ops under it
+  wait. Until the anchor lands (the §3 verification the authority
+  architecture still owes), the deterministic rule is the lowest hash: of
+  two heads on one predecessor from one authority, every node takes the
+  one whose hash sorts first, switches to it on sight and re-validates
+  what it accepted under the other, and an authority seen to equivocate is
+  reported — convergent, and a stopgap, never finality.
   Historical validation is then the same rule on every node: walk the
   head chain, accept each writer's ops along its hash chain up to the tip
   the next head committed, and refuse the rest everywhere at once; the
