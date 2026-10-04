@@ -74,7 +74,7 @@ import {
 import type { GateAccess } from './doorPolicy';
 import { ROOM_SESSION_OPEN_MS } from './roomSession';
 import { GUARD_BAND_MS, legWindowAfter, pauseCheckpoint, skipCheckpoint, startCheckpoint } from './pilotRoute';
-import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep, type KeeperStep } from './routeKeeper';
+import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep, type KeeperPassDeps, type KeeperStep } from './routeKeeper';
 import { CAST_OFF_HOLD_MS, TANK_CAPACITY } from './shipDoc';
 import { readRememberedMoves, type StationMove } from './stationMove';
 import {
@@ -468,6 +468,24 @@ describe("the ferry's own view, and what the gate does with its keeper's step", 
     own.getMap('ship').set('route', routeToWire({ ...R, stops: [stop(0, 0), stop(1, 1, { berth: { roomId: HERE, farDoor: 'x+', anyGate: false } })] }));
     expect(moveAt(own, { 'x+': 'Cargo Bay' }))
       .toMatchObject({ kind: 'none', why: 'overlap', gate: { doorId: 'x+' }, module: 'Cargo Bay' });
+  });
+
+  // 🚚🎚️ Riders' keepers skip a stop whose station has left the orbit the
+  // route copied of it (another planet, or another altitude since:
+  // routeKeeper.stopStationMoved), and the station's keeper docks nothing
+  // there either.
+  it('docks nowhere at a stop whose station has left the orbit the route copied of it', () => {
+    const t = ARRIVE + GATE_DOCK_DEFER_MS;
+    const look = ferryLook({ doc: ferryDoc(), capacity: BIG, now: t, sameStation, memory: null })!;
+    const step = keeperStep(look.view);
+    const moveIf = (moved?: boolean) => gateMove({
+      step, look, gates: gates(memoryOf(T0 - HOUR)), roomId: HERE, shipRoomId: FERRY, near, now: t,
+      ...(moved !== undefined ? { moved } : {}),
+    });
+    expect(step).toEqual({ kind: 'dock' });
+    expect(moveIf()).toMatchObject({ kind: 'dock', gate: { doorId: 'x+' } });
+    expect(moveIf(false)).toMatchObject({ kind: 'dock', gate: { doorId: 'x+' } });
+    expect(moveIf(true)).toEqual({ kind: 'none', why: 'moved' });
   });
 
   it('docks nowhere while one of its gates holds a claim on the ferry (a DOCK under way)', () => {
@@ -1636,6 +1654,31 @@ describe('the gate keeper over a stand-in session', () => {
     expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(t + SEC));
     expect(readDoorFrom(h.ferry, PORT))
       .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: t + SEC }));
+  });
+
+  // 🚚🎚️ A dock at a stop whose station has left the orbit the route copied
+  // of it would carry the ferry across without a transfer: riders' keepers
+  // skip that stop (routeKeeper.runKeeperPass), and the station's keeper,
+  // reading the station from this game's directory as they do, docks nothing.
+  it('docks no ferry at a stop whose station has moved or changed altitude since its route was saved', async () => {
+    const listedAs = (where: { planetId?: string; orbit?: { radiusKm: number; phase0: number } }) =>
+      () => where as KeeperPassDeps['station'];
+    for (const where of [{ planetId: 'planet-aris' }, { planetId: SOV, orbit: { radiusKm: 7_400, phase0: 0.5 } }]) {
+      const { h, deps } = harness();
+      const keeper = createGateKeeper({ ...deps, station: listedAs(where) });
+      await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+      await tickAt(keeper, h, D0);
+      await tickAt(keeper, h, D0 + KEEPER_RETRY_MS);
+      expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+      expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
+    }
+    // Still where the route copied it: docked as before.
+    const { h, deps } = harness();
+    const keeper = createGateKeeper({ ...deps, station: listedAs({ planetId: SOV }) });
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    await tickAt(keeper, h, D0);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(D0));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
   });
 
   it("casts off neither end while the ferry's room holds a move this game never heard of, and learns it", () =>

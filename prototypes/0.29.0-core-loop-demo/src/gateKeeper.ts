@@ -28,7 +28,9 @@
  *                         station (as a DOCK checks): the stop's own gate
  *                         first, another only when the stop allows a gate
  *                         change. GATE_DOCK_DEFER_MS after the arrival, so a
- *                         rider's keeper goes first.
+ *                         rider's keeper goes first. Nothing at a stop whose
+ *                         station has left the orbit the route copied of it
+ *                         (routeKeeper.stopStationMoved): riders skip it.
  *   cast off              UNDOCKS the ferry from this room's gate,
  *                         GATE_CAST_OFF_DEFER_MS after the departure (inside
  *                         the keeper's CAST_OFF_LATE_MS, so the leg stands).
@@ -194,14 +196,17 @@ import {
 import {
   KEEPER_RETRY_MAX_MS,
   KEEPER_RETRY_MS,
+  directoryStationFor,
   keeperMemoryAt,
   keeperStep,
   newestTimedStay,
   standingHold,
   stayHasDock,
   stayResumed,
+  stopStationMoved,
   type KeeperDocks,
   type KeeperMemory,
+  type KeeperPassDeps,
   type KeeperPort,
   type KeeperStep,
   type KeeperView,
@@ -647,7 +652,7 @@ export function ferryLook(o: {
 // ── What the gate keeper does with a step ────────────────────────────────────
 
 export type GateMove =
-  | { kind: 'none'; why: 'idle' | 'defer' | 'not-here' | 'claimed' | 'no-gate' | 'not-ours' | 'renew' }
+  | { kind: 'none'; why: 'idle' | 'defer' | 'not-here' | 'moved' | 'claimed' | 'no-gate' | 'not-ours' | 'renew' }
   /** Every gate the ferry may dock at would put it on top of another module
    *  here: the first of them, and the module. */
   | { kind: 'none'; why: 'overlap'; gate: GateView; module: string }
@@ -679,6 +684,9 @@ export function gateMove(o: {
   /** The module the ferry would overlap docked at this gate (as a DOCK
    *  checks), or null. Default: none. */
   overlap?: (gate: GateView) => string | null;
+  /** 🚚🎚️ Has the current stop's station left the orbit the route copied of
+   *  it (routeKeeper.stopStationMoved)? Default: no. */
+  moved?: boolean;
   now: number;
 }): GateMove {
   const { step, look, now } = o;
@@ -703,6 +711,11 @@ export function gateMove(o: {
     case 'dock': {
       const stop = look.view.route.stops[f.stopIndex];
       if (!stop || stop.berth.roomId !== o.roomId) return none('not-here');
+      // 🚚🎚️ The station has left the orbit the route copied of it: the
+      // timetable brought the ferry to where it was, out of every gate's
+      // reach, and riders' keepers skip the stop (routeKeeper.runKeeperPass).
+      // A dock here would carry the ferry across without a transfer.
+      if (o.moved === true) return none('moved');
       // A gate's claim on the ferry its port does not hold is a DOCK under
       // way (a rider's, or this keeper's own unacknowledged one): it lands,
       // or the gate lets it go (gateFixes). Never a second dock beside it.
@@ -1273,6 +1286,11 @@ export interface GateKeeperDeps {
   /** A fresh "is this room part of the stop's station?" per read
    *  (routeKeeper.sameStationReader). Default: the stop's berth room only. */
   sameStation?: () => (stop: RouteStop, roomId: string) => boolean;
+  /** 🚚🎚️ The stop's station in this game's directory, as riders' keepers
+   *  read it (RouteKeeperDeps.station): one that has left the orbit the
+   *  route copied of it is docked nowhere (routeKeeper.stopStationMoved).
+   *  Default: routeKeeper.directoryStationFor. */
+  station?: (stop: RouteStop) => KeeperPassDeps['station'];
   /** Is this ship towing a station? Default: no. */
   towing?: (shipRoomId: string, now: number) => boolean;
   /** Publish a ferry snapshot to this room's departures map. */
@@ -1786,11 +1804,16 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     const step = keeperStep(look.view);
     // Where the ferry's port would put its module at each gate.
     const overlap = (g: GateView): string | null => (berthing ? overlapAt(w, g.doorId, berthing) : null);
-    const move = gateMove({ step, look, gates, settling: retired, roomId, shipRoomId: w.ship, near, overlap, now });
+    // 🚚🎚️ Is the current stop's station still where the route copied it,
+    // by this game's directory (as riders' keepers judge it)?
+    const stop = route.stops[look.view.flight.stopIndex];
+    const moved = !!stop && step.kind === 'dock'
+      && safe(() => stopStationMoved(stop, (deps.station ?? directoryStationFor)(stop)), false);
+    const move = gateMove({ step, look, gates, settling: retired, roomId, shipRoomId: w.ship, near, overlap, moved, now });
     const dockLocked = (): boolean => safe(() => deps.dockLocked?.([roomId, w.ship], now) === true, false);
     switch (move.kind) {
       case 'none':
-        if (move.why === 'no-gate' || move.why === 'overlap') {
+        if (move.why === 'no-gate' || move.why === 'overlap' || move.why === 'moved') {
           mem.nextPassAt = now + KEEPER_RETRY_MS;
           mem.verdict = 'none';
         }

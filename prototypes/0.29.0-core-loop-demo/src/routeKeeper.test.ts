@@ -64,6 +64,7 @@ import {
   standingHold,
   stayHasDock,
   stayResumed,
+  stopStationMoved,
 } from './routeKeeper';
 import type { KeeperGateResult, KeeperMemory, KeeperView } from './routeKeeper';
 import { YjsSync } from './network/YjsSync';
@@ -908,6 +909,29 @@ describe('a dock pass over the gate list', () => {
     expect((await at({ radiusKm: 8_000, phase0: 1.2 })).verdict).toEqual({ kind: 'skip' });
     // Still on the orbit the route copied: asked as before.
     expect((await at(listed(8_000).orbit)).verdict.kind).toBe('docked');
+  });
+
+  // The rule runKeeperPass skips a stop by, which a station's gate keeper
+  // shares (gateKeeper.ts docks nothing at such a stop).
+  it('tells a stop whose station has left the orbit the route copied of it', () => {
+    const copied = { radiusKm: 8_000, phase0: 0.2 };
+    const onSlot = { planetId: SOV };
+    const custom = { planetId: SOV, orbit: copied };
+    // Not listed, or listed with no planet: nothing to tell.
+    expect(stopStationMoved(onSlot, null)).toBe(false);
+    expect(stopStationMoved(onSlot, undefined)).toBe(false);
+    expect(stopStationMoved(onSlot, {})).toBe(false);
+    // 🚚 Another planet.
+    expect(stopStationMoved(onSlot, { planetId: 'planet-aris' })).toBe(true);
+    expect(stopStationMoved(onSlot, { planetId: SOV })).toBe(false);
+    // 🎚️ A custom orbit on either side only, another radius or another phase.
+    expect(stopStationMoved(onSlot, { planetId: SOV, orbit: copied })).toBe(true);
+    expect(stopStationMoved(custom, { planetId: SOV })).toBe(true);
+    expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied, radiusKm: 8_050 } })).toBe(true);
+    expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied, phase0: 1.2 } })).toBe(true);
+    // The same orbit, its phase a whole turn on.
+    expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied } })).toBe(false);
+    expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied, phase0: copied.phase0 + 2 * Math.PI } })).toBe(false);
   });
 
   it('never re-points a port this rider may not dock', async () => {
