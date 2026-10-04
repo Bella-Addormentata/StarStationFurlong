@@ -137,6 +137,17 @@ export class TvSyncController {
   /** A viewer: the transport revision it last saw, to tell a transport
    *  write (a replay, a rewind) from the record lagging its ended player. */
   private seenJump: number | null = null;
+  /** A replay a transport write asked of this viewer's ended player (the
+   *  record before the player's end), owed until the player un-ends: the
+   *  revision that asked, and the revision a seek last went out for. A new
+   *  revision supersedes the last seek at once; the cooldown is for retries
+   *  of the same one while an asynchronous player still reports ended at
+   *  its old position. Otherwise a PLAY NOW inside the cooldown of the seek
+   *  that landed the previous replay was dropped for good: the write
+   *  already seen, the rewind inside the band, a clip shorter than the band
+   *  left at its end. */
+  private replayDue: number | null = null;
+  private replayIssuedFor: number | null = null;
 
   constructor(private readonly deps: TvSyncDeps) {
     this.now = deps.now ?? tvNow; // monotonic: cadences and the receipt timeline, never a date
@@ -390,22 +401,30 @@ export class TvSyncController {
       // over). A record well BEFORE the end is a rewind or a replay: seek
       // there — which un-ends the player — and go; so is a record anywhere
       // before the end on a transport write (a replay of a clip shorter
-      // than the band, which sample lag alone could never explain). Under
-      // the same cooldown as any viewer seek: an asynchronous player keeps
-      // reporting ended at its old position until the seek lands, and a
-      // seek and a play() every tick meanwhile would only interrupt its
-      // buffering. Otherwise hold until the record moves on (the holder
-      // ends the programme).
+      // than the band, which sample lag alone could never explain) — owed
+      // from then on, until the player un-ends. A seek for a NEW revision
+      // goes out at once; retries of the same one, and a rewind no write
+      // asked for, wait out the cooldown of any viewer seek: an asynchronous
+      // player keeps reporting ended at its old position until the seek
+      // lands, and a seek and a play() every tick meanwhile would only
+      // interrupt its buffering. Otherwise hold until the record moves on
+      // (the holder ends the programme).
       const before = pb.positionMs < p.currentMs();
-      const replay = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS || (transport && before);
-      if (p.canSeek && replay && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
+      if (transport && before) this.replayDue = jump;
+      const far = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS;
+      const owed = this.replayDue !== null;
+      const fresh = owed && this.replayDue !== this.replayIssuedFor;
+      if (p.canSeek && (far || owed) && (fresh || now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS)) {
         p.seek(pb.positionMs);
         this.lastSeekAt = now;
+        this.replayIssuedFor = this.replayDue;
         this.setRate(1);
         p.play();
       }
       return pb;
     }
+    this.replayDue = null;
+    this.replayIssuedFor = null;
     if (!p.isPlaying()) p.play();
     const action = driftAction(p.currentMs(), pb.positionMs, p.canNudge);
     if (action === 'seek') {

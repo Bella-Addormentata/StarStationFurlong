@@ -61,8 +61,17 @@ export interface LivePlayer {
 /** TVs whose playback clock a live player (the theatre) is driving. */
 const playersOfRecord = new Map<string, LivePlayer | null>();
 export function registerTvPlayerOfRecord(itemId: string, live?: LivePlayer): () => void {
-  playersOfRecord.set(itemId, live ?? null);
-  return () => { playersOfRecord.delete(itemId); };
+  const stored = live ?? null;
+  playersOfRecord.set(itemId, stored);
+  return () => {
+    if (playersOfRecord.get(itemId) !== stored) return; // a later registration owns the slot
+    // The player's last word on where its media ends, taken as it goes: a
+    // theatre closed between the metadata's arrival and the next room tick
+    // would otherwise take the only duration report with it, and the
+    // headless beat would run the programme past its end for good.
+    if (driveArmed && stored) noteKnownEnd(itemId, stored, readTv(itemId));
+    playersOfRecord.delete(itemId);
+  };
 }
 export function hasTvPlayerOfRecord(itemId: string): boolean {
   return playersOfRecord.has(itemId);
@@ -123,12 +132,38 @@ function parkIfPowerReturned(id: string): void {
  *  between polls before it grows. And should a reported end still move
  *  within one programme, the programme is unbounded from then on (`endMs:
  *  null`, sticky until the programme changes): the headless beat stops
- *  nothing on a value that was true once. */
+ *  nothing on a value that was true once. An UNKNOWN reading changes
+ *  nothing known of the programme — a player before its metadata, a
+ *  remount of the same source, a stream — neither a finite end (the same
+ *  file's) nor the unbounded marker (a decision, not a reading: a finite
+ *  value after it would otherwise pass as the end again); only a new
+ *  programme, or a player mounted for another one, clears the slate. */
 interface KnownEnd {
   started: number;
   endMs: number | null;
+  /** The doc it was read in: `started` counts from zero in every doc, so a
+   *  rebind (another room) must never find an old end under a new number. */
+  epoch: number;
 }
 const knownEnds = new Map<string, KnownEnd>();
+
+/** The known end for THIS programme in THIS doc, or undefined. */
+function knownEndFor(id: string, started: number): KnownEnd | undefined {
+  const known = knownEnds.get(id);
+  return known !== undefined && known.epoch === tvDocEpoch() && known.started === started ? known : undefined;
+}
+
+/** File what a live player says about where the current programme ends. */
+function noteKnownEnd(id: string, live: LivePlayer, rec: { started: number }): void {
+  const prev = knownEndFor(id, rec.started);
+  if (!prev) knownEnds.delete(id); // another programme's end is never carried over
+  if (live.started && live.started() !== rec.started) return; // mounted for a programme that has moved on
+  const end = live.endMs?.();
+  if (typeof end === 'number' && Number.isFinite(end) && end > 0) {
+    const moved = prev !== undefined && prev.endMs !== end;
+    knownEnds.set(id, { started: rec.started, endMs: moved ? null : end, epoch: tvDocEpoch() });
+  }
+}
 
 /** Whether this page drives its room's TVs at all. Cleared SYNCHRONOUSLY as
  *  a room is left (leaveTvRoom, from main.ts leaveRoomNow) and armed again
@@ -185,19 +220,11 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
       // Where the media ends, while a player can say: the headless beat
       // below closes the programme there once the theatre is gone. Only
       // from a player mounted for THIS programme, only an end the player
-      // knows to be finite, and never one that moved within the programme;
-      // anything else forgets what was known, so a doubt never stops a
-      // programme.
+      // knows to be finite, and never one that moved within the programme
+      // (noteKnownEnd; the player's unregistration files its last word too).
       const live = playersOfRecord.get(id);
-      const end = live?.endMs?.();
-      const forThis = !live?.started || live.started() === rec.started;
-      if (forThis && typeof end === 'number' && Number.isFinite(end) && end > 0) {
-        const prev = knownEnds.get(id);
-        const moved = prev !== undefined && prev.started === rec.started && prev.endMs !== end;
-        knownEnds.set(id, { started: rec.started, endMs: moved ? null : end });
-      } else {
-        knownEnds.delete(id);
-      }
+      if (live) noteKnownEnd(id, live, rec);
+      else if (!knownEndFor(id, rec.started)) knownEnds.delete(id);
       continue;
     }
     // Headless: free-run the clock so the room keeps a sample to anchor to.
@@ -213,8 +240,8 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // the theatre's controller ends it when the holder's player ends. A
     // viewer's player ending stops nothing; without this the room would
     // read "playing" for good after the holder closed the theatre.
-    const known = knownEnds.get(id);
-    if (known && known.endMs !== null && known.started === rec.started && pb.positionMs >= known.endMs) {
+    const known = knownEndFor(id, rec.started);
+    if (known && known.endMs !== null && pb.positionMs >= known.endMs) {
       tvStop(id);
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);
