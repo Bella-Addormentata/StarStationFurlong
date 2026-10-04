@@ -283,6 +283,31 @@ describe('gate gossip that doors alone would skip', () => {
     expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
   });
 
+  it("takes an older doc copy's word that the gates are not known when our newer copy has none", () => {
+    // Ours, from a build before gates: more doors, and no word on gates.
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS',
+      doors: [
+        { doorId: 'west', targetSeed: seed('room-a'), transient: false },
+        { doorId: 'north', targetSeed: seed('room-c'), transient: false },
+      ],
+    });
+    expect(readAtlas()['room-b']?.gatesUnknown).toBeUndefined();
+    // The room has a port with no number yet: its gates are not known.
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: 1,
+      doors: { west: { targetRoomId: 'room-a', farDoor: 'east', transient: false } },
+      gatesUnknown: true,
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    const b = readAtlas()['room-b']!;
+    expect(b.gatesUnknown).toBe(true);
+    expect(b.gates).toBeUndefined();
+    expect(b.gateAccess).toBeUndefined();
+    expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
+  });
+
   it('keeps a real gate\'s access when a doc copy carries access for many other doors', () => {
     twoRoomStation();
     const doc = new Y.Doc();

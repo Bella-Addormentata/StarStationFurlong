@@ -1284,14 +1284,22 @@ function pullSharedAtlas(): void {
       && Object.keys(prior.doors).length >= incoming) {
       // ⚓🚦 Our copy stands, but one harvested by an older build carries no
       // gates: take the doc's, and the access that rides with them, on their
-      // own, so gate numbering sees them. Not when ours says the room's gates
-      // are not known: the doc's older list is what that drops.
-      if (prior.gates === undefined && !prior.gatesUnknown && value.gates !== undefined && isPlainGates(value.gates)) {
-        prior.gates = cleanGates(value.gates);
-        if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
-          prior.gateAccess = cleanGateAccess(value.gateAccess, prior.gates);
+      // own, so gate numbering sees them; or the doc's word that they are not
+      // known (a port with no number yet), as docDecidesGates would. Not when
+      // ours says the room's gates are not known: the doc's older list is
+      // what that drops.
+      if (prior.gates === undefined && !prior.gatesUnknown) {
+        if (value.gates !== undefined && isPlainGates(value.gates)) {
+          prior.gates = cleanGates(value.gates);
+          if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
+            prior.gateAccess = cleanGateAccess(value.gateAccess, prior.gates);
+          }
+          changed = true;
+        } else if (value.gatesUnknown === true) {
+          prior.gatesUnknown = true;
+          delete prior.gateAccess;
+          changed = true;
         }
-        changed = true;
       }
       continue;
     }
