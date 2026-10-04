@@ -985,7 +985,7 @@ over a hub link is that hub's own doing and the member re-homes rather
 than keep a link that lies. What a hub CANNOT check it is never blamed
 for: it holds no media key, so a frame whose signature is valid but whose
 AEAD tag fails, or whose plaintext is malformed (a batch table that does
-not add up, a duration that is not an Opus frame size, a generation with
+not add up, a duration that is none of the six Opus frame durations, a generation with
 no configuration), passes every honest hub and fails only at a subscriber
 — and only the source could have signed it. Such a failure is charged to
 the SOURCE, by its key: past a handful a second the subscriber mutes that
@@ -1007,7 +1007,12 @@ third of the overhead at 40 ms more latency — framed inside the plaintext
 so the receiver can cut it back into the encoder's chunks, each with its
 own timestamp and duration: a one-byte count, then per chunk a two-byte
 big-endian length and a two-byte big-endian duration in 48 kHz samples
-(one of Opus's frame sizes, 120 to 5760 — 2.5 to 120 ms: the sender
+(one of the six durations a WebCodecs Opus encoder's `frameDuration` may
+take — 120, 240, 480, 960, 1 920 or 2 880 samples, 2.5 to 60 ms: the
+registration validates the setting against RFC 6716 §2.1.4's frame
+sizes, and a 120 ms Opus packet is several frames, never one chunk of
+the encoder's, so the receiver takes exactly those six and refuses a
+duration between or beyond them; the sender
 writes `round(duration × 48 / 1000)` from the chunk's WebCodecs
 `duration`, which is MICROSECONDS — 20 000 for a 20 ms frame, so 960 goes
 in the table, never 20 000 — and, when the chunk reports none, from the
@@ -1019,7 +1024,7 @@ several), then the chunks in order, chunk k's
 timestamp the header's plus the durations before it; the table under the
 AEAD and the signature with the rest, bit 1 of the flags byte saying a
 batch is inside, and a batch whose lengths do not add up to the payload,
-or whose durations are not Opus frame sizes, dropped as malformed and
+or whose durations are not among those six, dropped as malformed and
 charged to the source, as every failure behind a valid signature is
 (above); never
 a bare concatenation,
@@ -1171,23 +1176,38 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   the seeder's, which no reader could bound and a skewed or lying seeder
   could set a decade out — a renewal with an older or equal `seq` for that
   (node, hash) is a replay and ignored, the high-water mark kept per
-  (node, hash) and persisted — under BOUNDS, since a node id is free to
-  mint (§4) and a map that grew with every id a member minted would never
-  shrink: at most sixty-four seeders per item (a sixty-fifth announcement
-  is ignored until one expires; the item has holders enough), at most
-  4 096 marks per node overall, expired marks evicted first and then the
-  oldest-received, and every seed announcement carrying the seeder's
-  wall-clock `at`, which a reader refuses when more than a day older than
-  its own clock — a coarse bound, in days, on how long a signed
-  announcement stays replayable, never a comparison that moves playback —
-  so that a mark dropped a day after its seed expired fears no replay: an
-  announcement old enough to have lost its mark is too old to be accepted,
-  and a newer one would have moved the mark. Admission is by principal
-  where one exists — a library-station's seeds under its operator key, an
-  owner's node under the owner's — and first-come under the caps for the
-  rest — and a signed `library-unseed` from the same
-  node (a higher `seq` for that hash) or the
-  item's `library-remove` withdraws it early. A late joiner counts its day
+  (node, hash) and persisted — under BOUNDS that hold against minting,
+  since a node id is free to mint (§4), a map that grew with every id a
+  member minted would never shrink, and a bound per id would bound
+  nothing: every seed announcement carries the seeder's wall-clock `at`,
+  and a reader accepts it only inside a WINDOW on its own clock — refused
+  when more than a day older than the reader's clock, and refused when
+  more than five minutes ahead of it, since an announcement dated the far
+  future would never grow too old — a coarse bound, in days, on how long a
+  signed announcement stays replayable, never a comparison that moves
+  playback; a mark lives for the whole window — until a day past the
+  newest `at` it accepted, when every announcement it could refuse is
+  refused by age anyway — and is never dropped sooner, so a replay fails
+  on the mark or on its age and on nothing else; what the mark guards is
+  an honest seeder's withdrawal (the `library-unseed` below), which an old
+  seed replayed after it would undo — a seeder that lies about `at` or
+  signs anew guards nothing by replaying, since it can announce afresh at
+  will under the same caps; and the marks are capped PER READER, in all,
+  whatever ids they name: at most sixty-four seeders per item (a
+  sixty-fifth announcement is ignored until one expires; the item has
+  holders enough) and at most 4 096 marks in the reader's whole map,
+  expired marks dropped first, and at capacity with none expired the
+  newcomer refused — ignored, no mark written — rather than a live mark
+  evicted into a replay; so a flood of minted ids fills the pool for a day
+  and never more, and the pool is the first-come seeders' alone: a seed
+  under a principal — a library-station's under its operator key, an
+  owner's node under the owner's — counts against that principal's own
+  allowance (sixty-four per item, the same) and never against the pool,
+  so the station's own seeders are neither displaced nor shut out by it.
+  Admission is by principal where one exists and first-come under the
+  caps for the rest — and a signed `library-unseed` from the same node (a
+  higher `seq` for that hash) or the item's `library-remove` withdraws it
+  early. A late joiner counts its day
   from its own receipt and is wrong by at most that day about a seeder
   that has gone, and §4's route rule skips a holder that fails or stalls
   for the rest of the session either way. A seeder is its node id, dialled by id
@@ -1497,13 +1517,31 @@ frame (`__TAURI_INTERNALS__` undefined inside it, else the shell's
 isolation pattern) — both verified by the fetch spike, which is also
 where a policy directive EmulatorJS needs would show, as a console
 refusal naming it (its files are never in the repository). What no policy
-and no sandbox flag forbids is the frame navigating ITSELF: a document
-may always leave for another URL, and the request that fetches it carries
-whatever the URL does. That navigation ends the frame — the page tears
-down a frame that loads a second document — so what can leave is one
-URL's worth, said here as the residual rather than closed; the boundary
-the policy gives is on loads, connections and workers, which is where an
-emulator's traffic is.
+of the frame's own and no sandbox flag forbids is the frame navigating
+ITSELF: a document may always leave for another URL — and once it has
+left, the policy it left under governs nothing of what arrives, which
+runs its scripts and sends its requests before the page hears of it, or
+holds its `load` off for good; a teardown at the frame's second load is
+therefore a belt and never the barrier. The barrier is the EMBEDDER's
+`frame-src`, which the browser checks on every navigation of the frames a
+document embeds, whoever starts it, before the request is dispatched: so
+the page mounts the frame inside a WALL — a same-origin `srcdoc` document
+of its own whose one policy is `default-src 'none'; frame-src <the
+frame's URL, exactly>` (`arcadeEmulator.ts`, `emulatorWallPolicy`;
+nothing else loads in the wall, and the frame, an opaque origin, is
+nobody to it) — and a frame that tries to leave sends nothing: the wall
+hears the violation (`securitypolicyviolation`, `frame-src`) and the page
+tears the frame down with the reason. The one navigation the policy
+allows, to the frame's own URL, is the frame reloading itself, caught by
+the second `load` and torn down the same way (Chromium also puts a blank
+page of its own into a frame whose navigation it refused, whose load
+reaches the page before the report of the refusal: the page waits a
+moment for the report before it calls a second load a reload). The
+cabinet's smoke verifies in Chromium that an escape attempt reaches no
+network route and comes down as a refusal, that the reload comes down,
+and that the keyboard reaches the frame through the wall; the fetch
+spike confirms the enforcement on each shell's engine. The boundary the frame's own policy gives is on
+loads, connections and workers, which is where an emulator's traffic is.
 
 **Display and controls.** The emulator draws to a canvas. In P1 the picture
 lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
