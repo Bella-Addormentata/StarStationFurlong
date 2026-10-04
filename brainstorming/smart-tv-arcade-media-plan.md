@@ -132,7 +132,9 @@ throttled background page — `TV_SUSPEND_GAP_MS`) marks every sample from
 before it STALE, and a stale reading is shown but never acted on — no
 seek, no nudge — until a fresh sample lands after the wake window (a
 sample the network held through the sleep and delivers on waking is
-stamped from before the gap, as a lease is, and is stale with the rest).
+stamped from before the gap, as a lease is, and is stale with the rest;
+what the page wrote itself is received as it is written, whatever the
+marks say — a holder waking and beating is never stale to itself).
 The holder's next heartbeat is at most 3 s away, and a viewer whose
 player stopped with the machine is then seeked once, to where the room
 is, never to where the sleep says; a headless holder beats on from its
