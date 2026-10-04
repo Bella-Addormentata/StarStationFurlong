@@ -3,17 +3,44 @@
  * product's lanes and the viewer's own machine without asking, a public host
  * after PLAY FROM <host>, a private-network host never.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-  acceptMediaOrigin, forgetMediaConsent, isPrivateHost, mediaConsent, mediaOrigin, setOwnMediaOrigins,
+  acceptMediaOrigin, consentRefusal, forgetMediaConsent, isPrivateHost, mediaConsent, mediaOrigin, setOwnMediaOrigins,
 } from './tvConsent';
 import type { TvSource } from './tvDoc';
+import { setConvenienceLanesForTest } from './sovereignty';
 
 const url = (u: string): TvSource => ({ kind: 'url', url: u });
 
 beforeEach(() => {
   forgetMediaConsent();
   setOwnMediaOrigins(['http://localhost:4173', 'http://127.0.0.1:8080']);
+  setConvenienceLanesForTest(true); // the full gate; the serverless-only default is its own block below
+});
+afterEach(() => { setConvenienceLanesForTest(null); });
+
+describe('serverless only — the build default (sovereignty.ts)', () => {
+  beforeEach(() => { setConvenienceLanesForTest(false); });
+
+  it('refuses the product\'s own lanes, and says which reason', () => {
+    expect(mediaConsent({ kind: 'youtube', videoId: 'uPwPecwX2zs' })).toBe('refuse');
+    expect(consentRefusal({ kind: 'youtube', videoId: 'uPwPecwX2zs' })).toBe('lane-off');
+    expect(mediaConsent({ kind: 'archive', identifier: 'metropolis', file: 'a film.mp4' })).toBe('refuse');
+    expect(mediaConsent(url('https://archive.org/download/metropolis/a%20film.mp4'))).toBe('refuse');
+    expect(consentRefusal(url('https://archive.org/download/metropolis/a%20film.mp4'))).toBe('server-off');
+  });
+
+  it('refuses any other server, accepted or not, and keeps the viewer\'s own origins', () => {
+    expect(mediaConsent(url('https://example.org/a.mp4'))).toBe('refuse');
+    expect(consentRefusal(url('https://example.org/a.mp4'))).toBe('server-off');
+    acceptMediaOrigin('https://example.org');
+    expect(mediaConsent(url('https://example.org/a.mp4'))).toBe('refuse');
+    expect(mediaConsent(url('http://localhost:4173/film.mp4'))).toBe('ok');
+    expect(mediaConsent(url('http://127.0.0.1:8080/blob/abc'))).toBe('ok');
+    expect(mediaConsent(url('http://192.168.1.20/x'))).toBe('refuse');
+    expect(consentRefusal(url('http://192.168.1.20/x'))).toBe('private');
+    expect(consentRefusal(url('not a url'))).toBe('bad');
+  });
 });
 
 describe('what a viewer\'s browser will fetch for the room\'s TV', () => {

@@ -28,8 +28,15 @@
  */
 
 import type { TvSource } from './tvDoc';
+import { convenienceLanesEnabled, sourceKindAllowed } from './sovereignty';
 
 export type MediaConsent = 'ok' | 'ask' | 'refuse';
+
+/** Why a 'refuse' is a refuse, for the words on the screen: the lane is
+ *  off in this build; the link is on another server and this build plays
+ *  serverless sources only; the host is inside a private network; or the
+ *  link is not a URL at all. */
+export type ConsentRefusal = 'lane-off' | 'server-off' | 'private' | 'bad';
 
 /** The product's own lanes: where the start screen's tiles fetch from. */
 const PRODUCT_ORIGINS: ReadonlySet<string> = new Set([
@@ -114,9 +121,12 @@ function isPrivateIPv6(ip: string): boolean {
   return false;
 }
 
-/** May this viewer's browser fetch `source` now: yes, ask first, or never. */
+/** May this viewer's browser fetch `source` now: yes, ask first, or never.
+ *  The product's own lanes (YouTube, the archive embed) are fetched from
+ *  their own origins by their own players: yes with the convenience lanes
+ *  on, never with them off (sovereignty.ts). */
 export function mediaConsent(source: TvSource): MediaConsent {
-  if (source.kind !== 'url') return 'ok'; // the product's own lanes
+  if (source.kind !== 'url') return sourceKindAllowed(source.kind) ? 'ok' : 'refuse';
   const origin = normalizeOrigin(source.url);
   if (!origin) return 'refuse';
   if (ownOrigins.has(origin)) return 'ok';
@@ -127,6 +137,26 @@ export function mediaConsent(source: TvSource): MediaConsent {
     return 'refuse';
   }
   if (isPrivateHost(host)) return 'refuse';
+  // Serverless only: a third-party server is a server, whoever runs it.
+  // The product's origins and PLAY FROM <host> exist only with the
+  // convenience lanes on.
+  if (!convenienceLanesEnabled()) return 'refuse';
   if (PRODUCT_ORIGINS.has(origin) || accepted.has(origin)) return 'ok';
   return 'ask';
+}
+
+/** The reason behind a 'refuse' from mediaConsent, for the words on the
+ *  screen. */
+export function consentRefusal(source: TvSource): ConsentRefusal {
+  if (source.kind !== 'url') return 'lane-off';
+  const origin = normalizeOrigin(source.url);
+  if (!origin) return 'bad';
+  let host: string;
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    return 'bad';
+  }
+  if (isPrivateHost(host)) return 'private';
+  return convenienceLanesEnabled() ? 'bad' : 'server-off';
 }
