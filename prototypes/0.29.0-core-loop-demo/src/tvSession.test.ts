@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, setTvClock,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, powerKey, putDownRemote, readPlayback, readPower, readRemote, readSample, readTv, setTvClock,
   setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
   TV_LEASE_RENEW_MS,
 } from './tvDoc';
@@ -220,6 +220,30 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 0 });
     run(500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 0 });
+  });
+
+  it('a switch that carries no reading — the presser\'s was stale (tvDoc) — parks the programme at the record\'s last beat: behind the room by a beat at most, never ahead', () => {
+    const doc = new Y.Doc();
+    bindTvDoc(doc);
+    leaveTvRoom([]);
+    armTvDrive(true);
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now); // the baseline beat, at 0
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now); // at 3 s
+    now += 1_000; // the room at 4 s
+    // Another page's OFF, carrying no reading: its own was stale.
+    const other = new Y.Doc();
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    other.getMap('tv').set(powerKey(TV), { on: false, seq: readPower(TV).seq + 1, parkMs: null });
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(other));
+    expect(readTv(TV).state).toBe('off');
+    run(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true); // the holder, this page, switches on
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS }); // the last beat: 3 s, not 64 s
+    run(500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
   });
 
   it('POWER back on parks a schedule past T0 where it was switched off — playing by the clock, its record never flipped — not at the time since T0 with the minute off counted; a schedule that started while the set was off carries no reading and plays from the clock', () => {

@@ -231,6 +231,10 @@ interface Sample {
   positionMs: number;
   receivedAt: number;
   park?: true;
+  /** This page's own write (the holder's beat): stamped as written, and
+   *  the one stale sample whose bridged reading the switch may carry
+   *  (roomPositionMs). */
+  own?: true;
 }
 const samples = new Map<string, Sample>();
 /** The switch's revision this page last answered, per TV: the ON write
@@ -391,7 +395,9 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       // A sample the network held through a sleep and delivers on waking
       // is stamped from before the gap (`stamp`), and stale with the rest
       // (readPlayback): not a fresh anchor this page can act on.
-      samples.set(itemId, { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp });
+      samples.set(itemId, local
+        ? { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp, own: true }
+        : { seq: rec.seq, positionMs: rec.positionMs, receivedAt: stamp });
     }
   }
 }
@@ -966,6 +972,19 @@ function roomPositionMs(itemId: string, now: number): number | null {
   const rec = readTv(itemId);
   if (rec.state !== 'playing' && !scheduleStarted(rec)) return null;
   const pb = readPlayback(itemId, now);
+  // A reading this page may not act on is none it may publish for the
+  // room: a STALE reading (a sample from before this page's own sleep,
+  // bridged across the gap on the assumption the room ran on — and AHEAD
+  // of the room by the whole sleep when the sample is a beat the network
+  // delivered in the moment after waking, stamped from before the gap like
+  // the rest) carries nothing, unless the sample is this page's OWN last
+  // beat: the holder's clock bridged across its own sleep, the estimate
+  // it rejoins the room with (tvSync) and the one every awake viewer ran
+  // on to meanwhile. A switch with no reading anchors nothing, and the
+  // holder parks at the record's last heartbeat (tvSession) — behind the
+  // room by a beat at most while the holder is awake, never ahead. A
+  // schedule past its T0 is read from the wall clock, never stale.
+  if (pb.stale && !samples.get(itemId)?.own) return null;
   const positionMs = pb.state === 'playing' ? pb.positionMs : wallClock() - rec.startAt;
   return Math.max(0, Math.floor(positionMs));
 }
