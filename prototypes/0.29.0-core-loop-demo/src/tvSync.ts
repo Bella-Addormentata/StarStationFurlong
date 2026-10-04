@@ -467,6 +467,16 @@ export class TvSyncController {
     const jump = this.jump();
     const transport = this.seenJump !== null && jump !== this.seenJump;
     this.seenJump = jump;
+    // The record's anchor is from before this page slept (readPlayback
+    // `stale`: a gap in the room tick's awake marks — the monotonic clock
+    // may have run on through an OS sleep, so the reading is the sleep
+    // ahead of the room, or may be): shown, never seeked or nudged to. The
+    // holder's next heartbeat, 3 s at most, lands a fresh sample, and the
+    // player is then seeked once, to where the room is.
+    if (pb.stale) {
+      if (!p.isPlaying() && !p.isEnded()) p.play();
+      return pb;
+    }
     if (p.isEnded()) {
       // A player at its end is never play()ed as it stands (it would start
       // over). A record well BEFORE the end is a rewind or a replay: seek

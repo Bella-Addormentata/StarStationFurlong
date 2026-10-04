@@ -93,9 +93,16 @@ describe('what a viewer\'s browser will fetch for the room\'s TV', () => {
       '100.64.0.1', '224.0.0.1', '255.255.255.255', 'localhost', 'foo.localhost', 'nas', 'printer.local',
       'box.internal', 'tv.lan', 'pi.home.arpa', '[::1]', '[::]', '[fe80::1]', '[fd00::1]', '[fc00::1]',
       '[::ffff:7f00:1]', '[::ffff:c0a8:101]', '[::ffff:127.0.0.1]', '[ff02::1]', '[ff15::efc0:988f]', '[ff0e::1]',
+      '[::7f00:1]', // IPv4-compatible 127.0.0.1
+      '[2002:7f00:1::]', '[2002:c0a8:101::1]', '[2002:a9fe:a9fe::]', '[2002:a00:1:1:2:3:4:5]', // 6to4: loopback, private, the metadata address, 10/8
+      '[2001:0:c0a8:101::]', '[2001:0:808:808::3f57:fffe]', '[2001::a9fe:a9fe:0:0:0:0]', // Teredo: a private server, a private client (inverted), the metadata server
     ];
     for (const h of inside) expect(isPrivateHost(h), h).toBe(true);
-    const outside = ['example.org', 'archive.org', '8.8.8.8', '172.15.0.1', '172.32.0.1', '100.63.0.1', '[2001:db8::1]', '[::ffff:808:808]'];
+    const outside = [
+      'example.org', 'archive.org', '8.8.8.8', '172.15.0.1', '172.32.0.1', '100.63.0.1', '[2001:db8::1]', '[::ffff:808:808]',
+      '[2002:808:808::]', '[2001:0:808:808::f7f7:f7f7]', '[2001:4860:4860::8888]', '[::808:808]', '[2002:808:808::1:2:3]',
+    ];
     for (const h of outside) expect(isPrivateHost(h), h).toBe(false);
+    for (const h of ['[2002::1::]', '[2002:zz::]', '[1:2:3:4:5:6:7:8:9]']) expect(isPrivateHost(h), h).toBe(false); // not addresses: nothing inside to judge
   });
 });

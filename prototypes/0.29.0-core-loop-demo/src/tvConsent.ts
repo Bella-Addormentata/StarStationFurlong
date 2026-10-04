@@ -111,15 +111,40 @@ function isPrivateIPv6(ip: string): boolean {
   if (/^fe[89ab]/.test(s)) return true; // link-local fe80::/10
   if (/^f[cd]/.test(s)) return true; // unique local fc00::/7
   if (/^ff/.test(s)) return true; // multicast ff00::/8, every scope — the LSD groups included
-  const hex = s.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/); // IPv4-mapped, as the URL parser writes it
-  if (hex) {
-    const hi = parseInt(hex[1]!, 16);
-    const lo = parseInt(hex[2]!, 16);
-    return isPrivateHost(`${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`);
-  }
-  const dotted = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/);
+  const dotted = s.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/); // IPv4-mapped with the quad spelt out
   if (dotted) return isPrivateHost(dotted[1]!);
+  // An IPv6 address that carries an IPv4 inside is judged by the IPv4:
+  // IPv4-mapped (::ffff:a.b.c.d, which the URL parser writes as hex) and
+  // IPv4-compatible (::a.b.c.d), 6to4 (2002::/16, the IPv4 in bits 16–47)
+  // and Teredo (2001:0::/32, the server's IPv4 in bits 32–63 and the
+  // client's in the last 32, inverted) — the last two read as global
+  // unicast on paper, and 2002:7f00:1:: is loopback in fact.
+  const g = expandIPv6(s);
+  if (!g) return false;
+  const quad = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
+  const zeroTo = (n: number) => g.slice(0, n).every((x) => x === 0);
+  if (zeroTo(5) && g[5] === 0xffff) return isPrivateHost(quad(g[6]!, g[7]!)); // mapped
+  if (zeroTo(6)) return isPrivateHost(quad(g[6]!, g[7]!)); // compatible (deprecated, still parsed)
+  if (g[0] === 0x2002) return isPrivateHost(quad(g[1]!, g[2]!)); // 6to4
+  if (g[0] === 0x2001 && g[1] === 0) { // Teredo
+    return isPrivateHost(quad(g[2]!, g[3]!)) || isPrivateHost(quad(g[6]! ^ 0xffff, g[7]! ^ 0xffff));
+  }
   return false;
+}
+
+/** The eight 16-bit groups of an IPv6 address, `::` expanded; null for
+ *  anything that is not one (the URL parser hands us canonical forms, but
+ *  the check must not trust its caller). */
+function expandIPv6(ip: string): number[] | null {
+  const halves = ip.split('::');
+  if (halves.length > 2) return null;
+  const groups = (part: string): number[] => (part === '' ? [] : part.split(':').map((h) => (/^[0-9a-f]{1,4}$/.test(h) ? parseInt(h, 16) : NaN)));
+  const head = groups(halves[0]!);
+  const tail = halves.length === 2 ? groups(halves[1]!) : [];
+  if (head.some(Number.isNaN) || tail.some(Number.isNaN)) return null;
+  const missing = 8 - head.length - tail.length;
+  if (missing < 0 || (halves.length === 1 && missing !== 0)) return null;
+  return [...head, ...new Array<number>(missing).fill(0), ...tail];
 }
 
 /** May this viewer's browser fetch `source` now: yes, ask first, or never.
