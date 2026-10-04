@@ -806,7 +806,11 @@ export function stopStationMoved(
   const live = station?.orbit;
   const copied = stop.orbit;
   if (!live || !copied) return !live !== !copied;
-  return Math.abs(live.radiusKm - copied.radiusKm) > 1e-6 || Math.abs(wrapAngle(live.phase0 - copied.phase0)) > 1e-9;
+  // The phases' shortest way round the circle: a rounding either side of
+  // the copy is the same place (wrapAngle alone reads a hair below it as a
+  // whole turn away).
+  const turn = wrapAngle(live.phase0 - copied.phase0);
+  return Math.abs(live.radiusKm - copied.radiusKm) > 1e-6 || Math.min(turn, 2 * Math.PI - turn) > 1e-9;
 }
 
 /** The route's port, as planArrivalDock reads it (the only port a keeper

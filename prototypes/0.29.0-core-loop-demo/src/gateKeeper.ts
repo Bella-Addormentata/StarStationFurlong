@@ -59,7 +59,8 @@
  * that starts meanwhile, or this station found gone from where it orbited as
  * the dock began (by the moves the ferry's room holds, learned as a far write
  * learns them), or a DEPART begun at the ferry's helm meanwhile (its shared
- * cast-off hold); once the ferry's side has docked too, such a gate has the
+ * cast-off hold, or once that has ended, the route it paused or the stay it
+ * left); once the ferry's side has docked too, such a gate has the
  * dock withdrawn at both ends. The gate is read again before the
  * dock counts, or before it takes a crossing DOCK's stamp: another game may
  * have written over the claim while the ferry's side was asked, and then the
@@ -935,7 +936,8 @@ export type StationDockResult =
          *  or its dock settled (AUTO-DOCK switched off, it no longer admits
          *  the ferry, a station move, a tow or this room's flight locks it,
          *  its station was found gone from where it orbited as the dock
-         *  began, a DEPART began at the ferry's helm, or the keeper reset):
+         *  began, a DEPART began at the ferry's helm or the ferry left the
+         *  stay the dock was for, or the keeper reset):
          *  the claim is taken back, or a dock both ends held is withdrawn at
          *  both, where it may be. */
         | 'disabled';
@@ -954,7 +956,8 @@ export type StationDockResult =
  * counts only while both ends hold its stamp, and nothing is written over a
  * gate record another game wrote meanwhile. A gate no longer live (GateEnd),
  * or whose station is found gone from where it orbited as the dock began, or
- * a ferry whose helm began a DEPART meanwhile (its shared cast-off hold), has
+ * a ferry whose helm began a DEPART meanwhile (its shared cast-off hold), or
+ * that is no longer in the stay the dock is for (`inStay`), has
  * the claim taken back, or the dock withdrawn at both ends once it has
  * landed. The request carries no requester key: nobody aboard docks it, so a
  * ferry port open only to granted captains refuses it, whoever stands in the
@@ -968,6 +971,11 @@ export async function stationDock(o: {
   berthing: FerryBerthing;
   now: () => number;
   wait: (ms: number) => Promise<void>;
+  /** Is the ferry still in the stay this dock is for, by the route in its
+   *  own doc? A DEPART can begin and end while the dock waits, and its hold
+   *  goes with it, but not what it wrote: a hand DEPART pauses the route
+   *  (helmRoute.pauseRouteFromHelm). Default: yes. */
+  inStay?: () => boolean;
 }): Promise<StationDockResult> {
   const { session, gate, shipRoomId, shipPort, berthing } = o;
   const doc = session.doc;
@@ -986,7 +994,8 @@ export async function stationDock(o: {
     }
   };
   /** Is the gate still one this keeper docks at, its station still where it
-   *  orbited as the dock began, and no DEPART under way at the ferry's helm?
+   *  orbited as the dock began, no DEPART under way at the ferry's helm, and
+   *  the ferry still in the stay the dock is for (a DEPART that ended)?
    *  The moves the ferry's room holds are learned first, as a far write
    *  learns its room's (farDoorWrite.writeAndSettle): a station found gone
    *  since (left for another planet, on a list here that had not heard) is
@@ -999,7 +1008,13 @@ export async function stationDock(o: {
     } catch (err) {
       console.warn('[gate] reading the moves in the ferry room failed:', err);
     }
-    return gate.live() && gate.place?.() === berthAt && !departing();
+    let staying = false;
+    try {
+      staying = o.inStay?.() ?? true;
+    } catch (err) {
+      console.warn("[gate] reading the ferry's stay failed:", err);
+    }
+    return gate.live() && gate.place?.() === berthAt && !departing() && staying;
   };
   const held = (rec: DoorRecord | undefined): rec is DoorPairing => holdsFerry(rec, shipRoomId, shipPort);
   const pairingAt = (dockedAt: number): DoorPairing =>
@@ -1890,6 +1905,15 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         const gen = generation;
         const legSeq = look.view.flight.legSeq;
         const run = route.startedAt;
+        const stopIndex = look.view.flight.stopIndex;
+        // The stay the ferry's route still rules, as this look found it: a
+        // hand DEPART that began and ended meanwhile paused the route.
+        const inStay = (): boolean => {
+          const again = ferryLook({ doc: session.doc, capacity, now: clock(), sameStation, memory: null });
+          const f = again?.view.flight;
+          return !!f && again!.view.route.startedAt === run && f.legSeq === legSeq && f.stopIndex === stopIndex
+            && f.status === 'docked';
+        };
         void stationDock({
           session,
           gate: gateEnd(w, move.gate.doorId, roomId),
@@ -1898,6 +1922,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
           berthing,
           now: clock,
           wait,
+          inStay,
         }).then((r) => {
           if (gen !== generation) return;
           w.busy = false;

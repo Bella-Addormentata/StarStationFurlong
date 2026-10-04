@@ -932,6 +932,12 @@ describe('a dock pass over the gate list', () => {
     // The same orbit, its phase a whole turn on.
     expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied } })).toBe(false);
     expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied, phase0: copied.phase0 + 2 * Math.PI } })).toBe(false);
+    // A rounding either side of the copy is the same place, whichever way
+    // round (Copilot, PR 212); a millionth of a radian is not.
+    for (const hair of [-1e-12, 1e-12, -2 * Math.PI - 1e-12, 2 * Math.PI - 1e-12]) {
+      expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied, phase0: copied.phase0 + hair } })).toBe(false);
+    }
+    expect(stopStationMoved(custom, { planetId: SOV, orbit: { ...copied, phase0: copied.phase0 - 1e-6 } })).toBe(true);
   });
 
   it('never re-points a port this rider may not dock', async () => {
