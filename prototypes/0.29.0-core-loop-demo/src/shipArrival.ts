@@ -385,7 +385,7 @@ export function shipPlaceId(
     // place's own orbit: beside a station there only while no trim moves it
     // off that orbit, or the far view would draw the ship on the trimmed one.
     const beside = [listed, resting.from]
-      .find((st) => isAt(st, resting.at, now) && (rest.open !== true || onUntrimmedOrbit(st)));
+      .find((st) => isAt(st, resting.at, now) && (rest.open !== true || (onUntrimmedOrbit(st) && onRestOrbit(st, resting.at))));
     return beside ? beside.id : resting.at;
   }
   const keptAt = rec.status === 'redocking' ? rec.destinationAt
@@ -418,6 +418,14 @@ function isAt(station: StationRecord | null | undefined, placeId: string, now: n
  *  custom altitude's (altitudeChangedSince weighs a change since). */
 function sameBaseOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'>, place: AdriftPlace): boolean {
   return !place.orbit || onPlaceOrbit(baseOrbit(station), baseOrbit(place));
+}
+
+/** 🎚️ A ferry route's open rest is on the route's own copy of the stop, its
+ *  orbit always written (the slot's when the id names none): the station is
+ *  there only on that same base orbit, not on an altitude it climbed to since. */
+function onRestOrbit(station: StationRecord, placeId: string): boolean {
+  const place = adriftPlace(placeId);
+  return !!place && onPlaceOrbit(baseOrbit(station), baseOrbit(place));
 }
 
 /** Does `station` fly its base orbit (its slot's, or 🎚️ its own altitude),

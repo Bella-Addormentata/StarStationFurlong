@@ -1112,6 +1112,16 @@ describe('open-orbit places at a station\'s own altitude', () => {
     expect(shipPlaceId(rec, Date.now(), null)).toBe(DEFAULT_STATION_ID);
   });
 
+  it('a ferry resting on a route\'s copy of the slot stays there when its station climbs', () => {
+    const at = Date.now() - 10 * 86_400_000;
+    const rest = { at: adriftAt(SOV, 0), since: at, open: true as const };
+    const rec = { status: 'docked' as const, locationId: DEFAULT_STATION_ID };
+    expect(shipPlaceId(rec, Date.now(), rest)).toBe(DEFAULT_STATION_ID);
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, at + 1_000);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climb : null));
+    expect(shipPlaceId(rec, Date.now(), rest)).toBe(rest.at);
+  });
+
   it('a place kept before places named an altitude says nothing of it', () => {
     // Cast off for a station flying 1,000 km, under the old id (slot only):
     // it has not moved, so the ship is beside it, not left at the slot.
