@@ -209,7 +209,12 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   the screen plane so avatars occlude it. Works with the orthographic camera.
   Costs: `renderer.ts` sets an opaque `scene.background` that must move to the
   CSS layer; no lighting or CRT shader on the iframe; its audio cannot enter
-  the Web Audio graph; the iframe swallows pointer events.
+  the Web Audio graph; the iframe swallows pointer events. And the canvas
+  itself is opaque today: `renderer.ts` builds its `WebGLRenderer` without
+  `alpha: true` (line 74), so moving the background alone would leave the
+  drawing buffer opaque and the hole hidden — the spike recreates the
+  renderer with alpha enabled and clears with alpha 0, and only then moves
+  `scene.background` into the CSS layer.
 - **Path B — a `<video>` into a `VideoTexture`** (node-proxied mp4, local file,
   blob, torrent). Lit, occluded, shader-able (the #194 CRT pass only works
   here), audio through the `partyAudio.ts` graph with distance falloff. Needs
@@ -221,12 +226,21 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   no-CORS request from any page that can reach loopback would still make the
   node download whatever the URL names, bandwidth and CPU spent on a response
   the page can never read. So the proxy requires a **node-scoped capability
-  token**: minted by the node at launch (random, per launch, never persisted),
-  handed to its own webview and to the page that probes `/api/fingerprint`
-  alongside the fingerprint — a CORS-readable response, so only a page on an
-  allowed origin can ever learn it, which is what turns the header allowlist
-  into a gate for the proxy — carried in the URL because a `<video>` cannot
-  set a header, with the element in CORS mode (`crossOrigin = 'anonymous'`):
+  token**: minted by the node at launch (random, per launch, never
+  persisted) and delivered over a channel only the app's own page can read
+  — NOT `/api/fingerprint`, whose allowlist (`origin_allowed` in
+  `ssf-p2p-node/src/main.rs`) admits any loopback origin on any port, so
+  that a dev server or another app's local UI could read a token served
+  there; that loopback-wide rule stays for the fingerprint, and for
+  development builds, and gates nothing of the proxy's. In the desktop shell
+  the token goes from the sidecar to the webview over the app's own IPC
+  (Tauri `invoke`), never over HTTP; a browser page gets it from a dedicated
+  `/api/media-cap` endpoint whose allowlist is EXACT origins — the app's own
+  (`tauri://localhost`, `http(s)://tauri.localhost`) and the origins named
+  in `SSF_ALLOWED_ORIGINS`, never a loopback wildcard — and the proxy's own
+  `Origin` check is that same exact list. The token is carried in the URL
+  because a `<video>` cannot set a header, with the element in CORS mode
+  (`crossOrigin = 'anonymous'`):
   that is what makes a `<video>` send `Origin` at all — a plain cross-origin
   `<video src>` sends none and would meet the 403 below — and what a
   `VideoTexture` needs anyway, since a non-CORS video taints the canvas it is
@@ -276,12 +290,16 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   those shells, not only the in-world iframe: v1's theatre is itself an IFrame
   API embed from the same origin. Until the three-shell check passes, v1's
   defined state on a shell that fails is the lane-failure notice with RETRY
-  and nothing else depending on it (browsers are unaffected). Try
-  `referrerpolicy="strict-origin-when-cross-origin"` and `youtube-nocookie.com`
-  first; the fallback is serving the UI from an http(s) loopback origin — the
-  node's HTTP origin as the frontend discovered it (8080, or 8081 when 8080 is
-  taken; never a fixed port) — which also makes the proxy same-origin but
-  moves the app's storage origin, so it is a measured decision.
+  and nothing else depending on it (browsers are unaffected). No
+  `referrerpolicy` is a remedy: a document loaded from `tauri://` has no
+  HTTP(S) referrer to send whatever the policy says — Tauri's own tracker
+  confirms that even `unsafe-url` produces none for the custom protocol — so
+  the spike does not spend itself there. `youtube-nocookie.com` stays, for
+  privacy. The remedy to measure is serving the UI from an http(s) loopback
+  origin — the node's HTTP origin as the frontend discovered it (8080, or
+  8081 when 8080 is taken; never a fixed port) — which also makes the proxy
+  same-origin but moves the app's storage origin, so it is a measured
+  decision.
 - The Linux webview (WebKitGTK) is the weakest: codecs via GStreamer; WebCodecs
   from 2.44; WebRTC reportedly absent in many builds. Treat Linux as "embeds
   and mp4" until verified.
@@ -448,8 +466,9 @@ whom, how often, how much — as with v006's SFU-lite. The lane supersedes
 the WebRTC mesh (#10) only once this layer is in and a forwarding node that
 logs every frame is shown to reconstruct no audio.
 A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
-three legs are detected separately and a sender advertises only the legs it
-has: `WebTransport` (Safari 26.4 is the floor per
+three CAPABILITIES the lane rests on are feature-detected separately, and a
+sender advertises only the ones it has (they are not legs — the lane has
+two, audio and video, keyed as above): `WebTransport` (Safari 26.4 is the floor per
 `docs/TDD/BrowserSupportMatrix.md`), `VideoEncoder` (Chromium, Firefox 130+,
 Safari 16.4+, WebKitGTK 2.44+) and `AudioEncoder` (absent on Safari
 16.4–18.x and WebKitGTK 2.44). Only true screen capture (`getDisplayMedia`)
