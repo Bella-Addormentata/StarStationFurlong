@@ -527,11 +527,17 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
     : '';
   const history = rec.history.length
     ? `<div class="phone-access-header" style="margin-top:4px;">PREVIOUSLY ON</div>
-       ${rec.history.slice(0, 8).map((h, i) => `<div class="phone-access-room-row">
+       ${rec.history.slice(0, 8).map((h, i) => {
+         // An entry this build would refuse (playRefusal) is marked; its ▶
+         // still answers, with the reason, as the paste box does.
+         const off = playRefusal(h.source);
+         return `<div class="phone-access-room-row">
          <span style="color:${GOLD_BRIGHT}; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1;">${esc(h.title)}</span>
          ${laneBadge(sourceLane(h.source))}
+         ${off ? `<span style="font-size:7px; color:${DIM}; font-weight:800;" title="${esc(off)}">OFF HERE</span>` : ''}
          ${smallButton(`data-tv-history="${i}" data-tv-id="${esc(tv.id)}"`, '▶')}
-       </div>`).join('')}`
+       </div>`;
+       }).join('')}`
     : '';
   return `${head}
     <div class="phone-access-section">
@@ -551,6 +557,26 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div class="phone-access-header">HAND THE REMOTE TO…</div>
       ${handToBlock(deps, tv.id)}
     </div>`;
+}
+
+/** Why THIS build would refuse to play `source` — the words for the feedback
+ *  line — or null when it may play here. Asked before any write from the
+ *  remote (PLAY NOW, a schedule, PREVIOUSLY ON alike): a source a peer wrote
+ *  into the history, or a build with the convenience lanes on did, is not
+ *  written back as the programme for every viewer's theatre to refuse — the
+ *  programme on stays as it is. Serverless only (sovereignty.ts): a lane
+ *  this build does not offer, a link on another server, a host inside a
+ *  private network, a non-link. A public host with the lanes on is not
+ *  refused here: the theatre asks the viewer (tvConsent). */
+export function playRefusal(source: TvSource): string | null {
+  if (!sourceKindAllowed(source.kind)) return `${source.kind === 'youtube' ? 'YouTube' : 'archive.org'} is off here — ${SERVERLESS_ONLY}.`;
+  if (source.kind !== 'url' || mediaConsent(source) !== 'refuse') return null;
+  const why = consentRefusal(source);
+  return why === 'server-off'
+    ? `That link is on another server — ${SERVERLESS_ONLY}: a link on this station's node or your own origin plays here.`
+    : why === 'private'
+      ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
+      : 'That is not a link the TV can play.';
 }
 
 /** The archive metadata lookups in flight: a result is applied only when it
@@ -596,20 +622,12 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
       feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a link first.');
       return null;
     }
-    // Serverless only (sovereignty.ts): a lane this build does not offer,
-    // or a link on another server, is refused here with the reason, not
-    // written into the room for every viewer's theatre to refuse.
-    if (!sourceKindAllowed(parsed.kind)) {
-      feedback(`${parsed.kind === 'youtube' ? 'YouTube' : 'archive.org'} is off here — ${SERVERLESS_ONLY}.`);
-      return null;
-    }
-    if (parsed.kind === 'url' && mediaConsent(parsed) === 'refuse') {
-      const why = consentRefusal(parsed);
-      feedback(why === 'server-off'
-        ? `That link is on another server — ${SERVERLESS_ONLY}: a link on this station's node or your own origin plays here.`
-        : why === 'private'
-          ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
-          : 'That is not a link the TV can play.');
+    // What this build would refuse to play is refused here, with the
+    // reason, not written into the room for every viewer's theatre to
+    // refuse (playRefusal).
+    const refused = playRefusal(parsed);
+    if (refused) {
+      feedback(refused);
       return null;
     }
     const gen = ++resolveGen;
@@ -653,6 +671,14 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     const id = b.dataset.tvId!;
     const entry = readTv(id).history[Number(b.dataset.tvHistory)];
     if (!entry) return;
+    // The paste box's gate: the history is written by peers and by builds
+    // with the convenience lanes on, and an entry this build would refuse
+    // to play is said no to here — the programme on stays as it is.
+    const refused = playRefusal(entry.source);
+    if (refused) {
+      feedback(refused);
+      return;
+    }
     const r = tvPlay(id, entry.source);
     feedback(r.ok ? `Now on: ${entry.title}` : r.error);
   }));

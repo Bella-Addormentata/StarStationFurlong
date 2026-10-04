@@ -20,8 +20,12 @@
  *    heartbeats: a holder whose player buffers publishes the stalled
  *    position, and the room follows IT. Every TV_HEARTBEAT_MS it writes its
  *    own player's position — once any transport jump has landed, never the
- *    position a jump is still leaving behind — and the scheduled
- *    countdown's T0 is the holder's first heartbeat after it.
+ *    position a jump is still leaving behind. A scheduled countdown's T0
+ *    is followed like any transport write: the holder's first tick past it
+ *    goes where its own clock says the programme is (the time since T0 —
+ *    the parked 0 when the tick is on time, a seek to the elapsed when a
+ *    throttled tab's tick comes late), and its first heartbeat from there
+ *    is the write the room starts on.
  */
 
 import {
@@ -168,6 +172,11 @@ export class TvSyncController {
    *  programme as ended. Null until the first tick: joining mid-programme
    *  is not a restart. */
   private seenStarted: number | null = null;
+  /** The transport revision of a countdown this controller parked for
+   *  (tvDoc `jump`, as SCHEDULE wrote it): the holder's first playing tick
+   *  past T0 follows it like any jump — to the time since T0 — and forgets
+   *  it. Null outside a countdown, and once followed. */
+  private countdownJump: number | null = null;
 
   constructor(private readonly deps: TvSyncDeps) {
     this.now = deps.now ?? tvNow; // monotonic: cadences and the receipt timeline, never a date
@@ -205,7 +214,8 @@ export class TvSyncController {
    *  is. */
   positionMs(): number {
     if (!this.iHold()) return this.deps.player.currentMs();
-    if (this.jump() !== this.appliedJump) return this.current().positionMs;
+    const jump = this.jump();
+    if (jump !== this.appliedJump || jump === this.countdownJump) return this.current().positionMs;
     if (this.pendingTarget !== null) return this.pendingTarget;
     return this.deps.player.currentMs();
   }
@@ -244,13 +254,15 @@ export class TvSyncController {
       this.pendingTarget = null;
       this.pendingSeekIssued = false;
       this.appliedJump = null;
+      this.countdownJump = null;
       return this.tickViewer(p, pb, now, newProgramme);
     }
 
     // Not playing: whatever transport revision brought us here is followed
     // by the state itself (a later resume is a new revision to follow) —
     // except the holder's own transport while paused, which is a target of
-    // its own below.
+    // its own below, and a schedule's, which the first tick past T0 follows
+    // (further below).
     const jump = this.jump();
 
     if (pb.state === 'paused') {
@@ -288,12 +300,27 @@ export class TvSyncController {
       return pb;
     }
 
-    this.appliedJump = jump;
     // Scheduled, home or off: the programme is not running; a target from
-    // before is void.
+    // before is void, and the revision that brought us here is followed by
+    // the state itself — a schedule's once more at T0, below.
+    this.appliedJump = jump;
     this.pendingTarget = null;
 
     if (pb.state === 'scheduled') {
+      // The countdown parks the player at 0, once — and the holder's first
+      // tick past T0 follows the schedule's revision like any jump
+      // (countdownJump), to where its clock says the programme is: the time
+      // since T0 (plan §3.1 — the start is the holder's wall clock against
+      // startAt). A tick on time finds that inside the band of the parked 0
+      // and starts from the top; one that comes late (a throttled
+      // background tab, seconds or a minute past T0) seeks to the elapsed
+      // and beats from there — where the headless beat, and a room whose
+      // remote lapsed, already run from. Without this, that late tick
+      // started the parked player at 0 and published 0: the schedule's
+      // start moved to whenever the holder got round to it, and anyone
+      // running from T0 was yanked back. Noted on every scheduled tick, so
+      // a set switched off and on during the countdown still follows at T0.
+      this.countdownJump = jump;
       if (p.isPlaying()) p.pause();
       if (!this.parked && p.canSeek) {
         p.seek(0);
@@ -312,12 +339,15 @@ export class TvSyncController {
    *  position otherwise, end the programme when the player ends. */
   private tickHolder(p: TvPlayer, pb: PlaybackNow, now: number, newProgramme: boolean): PlaybackNow {
     const jump = this.jump();
-    if (jump !== this.appliedJump) {
-      // PLAY NOW, a remote seek, a resume: go where the write says, now
-      // (no cooldown — this is the one time the record drives the holder).
-      // Within the seek band nothing moves: a player that is already there
-      // (PLAY NOW from the top, a resume where it paused) stays put.
+    if (jump !== this.appliedJump || jump === this.countdownJump) {
+      // PLAY NOW, a remote seek, a resume — or a countdown's T0, whose
+      // position is the time since it (countdownJump): go where the write
+      // says, now (no cooldown — this is the one time the record drives the
+      // holder). Within the seek band nothing moves: a player that is
+      // already there (PLAY NOW from the top, a resume where it paused, a
+      // countdown's parked 0 at a tick on time) stays put.
       this.appliedJump = jump;
+      this.countdownJump = null;
       this.endedHandled = false;
       // A target the player cannot reach (+10 s with five left; a rewind
       // out of a live window) is clamped where the player would clamp the
