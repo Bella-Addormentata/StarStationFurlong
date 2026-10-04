@@ -620,6 +620,8 @@ export function planStationAltitude(ctx: MoveContext, altitudeKm: number): Altit
   if (!ctx.bolted) return { ok: false, refusal: 'not-bolted', quote: null };
   if (!station) return { ok: false, refusal: 'no-station', quote: null };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  // 🚚 A move past what this room's log can be read of may be under way.
+  if (!roomMovesKnown()) return { ok: false, refusal: 'moves-unknown', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   const planet = planetById(station.planetId);
   if (!Number.isFinite(altitudeKm) || altitudeKm < MIN_ALTITUDE_KM) return { ok: false, refusal: 'too-low', quote: null };
@@ -680,6 +682,7 @@ export function describeAltitudeRefusal(
       return `Too close to ${whose}${alt ? ` at ${alt}` : ''}: keep ${MIN_ORBIT_SEPARATION_KM} km clear.`;
     }
     case 'moving': return 'A move or altitude change is already scheduled or under way.';
+    case 'moves-unknown': return 'This room holds more move records than the helm can read, so a move may be under way. ENGAGE waits until they are cleared.';
     case 'no-thrusters': return 'Fit an ENGINE BLOCK to this module to change the station\'s altitude.';
     case 'no-fuel': return `Needs ${quote?.fuel ?? '?'} fuel for both burns; ${Math.floor(fuel)} aboard. Fit more FUEL TANKs and refuel.`;
     default: return describeMoveRefusal(refusal, null, fuel);
@@ -1417,7 +1420,7 @@ function altitudeEvidence(bests: StationMove[], history: StationMove[], dropped:
 }
 
 /** 🎚️ At most this many deciding claims ride beside a station's summary. */
-export const MAX_SUMMARY_CLAIMS = 4;
+export const MAX_SUMMARY_CLAIMS = 16;
 
 /** 🎚️ A station's earlier moves that some station's latest altitude claim
  *  needs to stay lost (as altitudeEvidence finds them among what this
