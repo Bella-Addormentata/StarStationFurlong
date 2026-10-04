@@ -302,9 +302,10 @@ export function harvestIntoAtlas(entry: {
     wall?: DoorWall; lateral?: number; transient?: boolean;
   }>;
   /** ⚓🚦 The room's dock ports by door id → gate number (doorPolicy).
-   *  Null when a port here has no number yet: the room's gates are not
-   *  known, and its older list is dropped rather than kept, since that list
-   *  would hide the unnumbered port. Absent says nothing: what we knew stands. */
+   *  Null when the room's gates are not known (a port here has no number
+   *  yet, or a flood cut the port scan short): its older list is dropped
+   *  rather than kept, since that list could hide the port. Absent says
+   *  nothing: what we knew stands. */
   gates?: Record<string, number> | null;
   /** ⚓🚦 Non-open gate access by door id (doorPolicy readGateAccess). */
   gateAccess?: Record<string, AtlasGateAccess>;
@@ -316,7 +317,14 @@ export function harvestIntoAtlas(entry: {
   markInferredBerths(atlas);
   const prior = atlas[entry.roomId];
   const doors: Record<string, AtlasDoor> = {};
+  // 🚪 The first MAX_DOORS_PER_ENTRY in the order given (the room's own doors
+  // come first, doorsDoc.readAllDoorsWithPhysical): however many records a
+  // peer floods the room with, the entry, its write, its gossip and the stubs
+  // it mints stay bounded.
+  let kept = 0;
   for (const d of entry.doors) {
+    if (kept >= MAX_DOORS_PER_ENTRY) break;
+    kept++;
     doors[d.doorId] = {
       targetSeed: d.targetSeed,
       targetRoomId: roomIdFromSeed(d.targetSeed),
@@ -360,14 +368,15 @@ export function harvestIntoAtlas(entry: {
       seed: d.targetSeed,
       doors: {},
       lastSeen: Date.now(),
-      // NO local stamp. These targets come from `readAllDoors()`, whose room-doc
-      // map is explicitly untrusted ("any value READ is untrusted — a peer could
-      // write junk", doorsDoc.ts:16-17) and accepts up to MAX_PAIRINGS = 64
-      // pairings — exactly MAX_ENTRIES. Stamping them first-hand would let one
-      // peer write 64 fake pairings, have us mint 64 tier-1 stubs on join, and
-      // evict every room we had actually visited: the precise attack this
-      // tiering exists to stop. A door we can see is still only a peer's claim
-      // that it leads somewhere, so the stub stays gossip-tier until we go.
+      // NO local stamp. These targets come from the room doc's doors map, which
+      // is explicitly untrusted ("any value READ is untrusted — a peer could
+      // write junk", doorsDoc.ts:16-17), and the entry keeps up to
+      // MAX_DOORS_PER_ENTRY = 64 of them — exactly MAX_ENTRIES. Stamping them
+      // first-hand would let one peer write 64 fake pairings, have us mint 64
+      // tier-1 stubs on join, and evict every room we had actually visited:
+      // the precise attack this tiering exists to stop. A door we can see is
+      // still only a peer's claim that it leads somewhere, so the stub stays
+      // gossip-tier until we go.
     };
   }
   writeAtlas(atlas);
@@ -1284,14 +1293,22 @@ function pullSharedAtlas(): void {
       && Object.keys(prior.doors).length >= incoming) {
       // ⚓🚦 Our copy stands, but one harvested by an older build carries no
       // gates: take the doc's, and the access that rides with them, on their
-      // own, so gate numbering sees them. Not when ours says the room's gates
-      // are not known: the doc's older list is what that drops.
-      if (prior.gates === undefined && !prior.gatesUnknown && value.gates !== undefined && isPlainGates(value.gates)) {
-        prior.gates = cleanGates(value.gates);
-        if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
-          prior.gateAccess = cleanGateAccess(value.gateAccess, prior.gates);
+      // own, so gate numbering sees them; or the doc's word that they are not
+      // known (a port with no number yet), as docDecidesGates would. Not when
+      // ours says the room's gates are not known: the doc's older list is
+      // what that drops.
+      if (prior.gates === undefined && !prior.gatesUnknown) {
+        if (value.gates !== undefined && isPlainGates(value.gates)) {
+          prior.gates = cleanGates(value.gates);
+          if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
+            prior.gateAccess = cleanGateAccess(value.gateAccess, prior.gates);
+          }
+          changed = true;
+        } else if (value.gatesUnknown === true) {
+          prior.gatesUnknown = true;
+          delete prior.gateAccess;
+          changed = true;
         }
-        changed = true;
       }
       continue;
     }

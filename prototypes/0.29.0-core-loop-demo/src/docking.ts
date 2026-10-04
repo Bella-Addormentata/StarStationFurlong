@@ -114,9 +114,9 @@ import {
 // would leave the station side pointing at a moving target — the plan's
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
-import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
-import { dockLockedByMove } from "./stationMove";
-import { berthHeldByMove, correctReleasePlace, detachBerth, releasePlaceOf } from "./shipArrival";
+import { UNDOCK_RENEW_MS, endUndockHold, holdUndock, pairingAllowedByFlight, readFlightRecord, renewUndockHold } from "./shipDoc";
+import { dockLockedByMove, roomMovesKnown } from "./stationMove";
+import { berthHeldByMove, berthStillThere, correctReleasePlace, detachLegacyBerthAt, releasePlaceOf } from "./shipArrival";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2283,7 +2283,7 @@ export class DoorDockingPortSystem {
       : "";
     const detachRow = berth
       ? held
-        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked — this station is moving between planets, the berth holds until it arrives</span></div>`
+        ? `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked — ${esc(this.moveHoldNote("berth"))}</span></div>`
         : `<div style="${row}"><span style="color:#80d8ff;">⛴ TRANSIENT BERTH · ship docked</span>
            <button type="button" data-policy-action="detach-berth" ${op?.busy ? "disabled" : ""} style="${pill} background:rgba(255,23,68,0.10); border-color:rgba(255,23,68,0.35); color:#ff8a80;">⏏ DETACH</button></div>${detachNote}`
       : "";
@@ -2750,17 +2750,27 @@ export class DoorDockingPortSystem {
     return berthHeldByMove(this.roomNow(), doorId);
   }
 
+  /** 🚚 Why a move holds a dock or berth here, said: a station between
+   *  planets (or a tow under way), or a move log this room holds too long to
+   *  read whole (stationMove.roomMovesKnown), where such a move may lie. */
+  private moveHoldNote(what: "dock" | "berth"): string {
+    return roomMovesKnown()
+      ? `This station is moving between planets — the ${what} holds until it arrives.`
+      : `This room holds more move records than can be read — the ${what} holds until they are cleared.`;
+  }
+
   /**
    * 🚚 May this end let go of the legacy berth on `doorId` (a transient
-   * pairing on a door that is no dock port: DETACH releases this end only)?
-   * Not while a move this install knows holds it (heldByMove), nor one only
-   * the far room knows, asked through the far writer as an UNDOCK asks
-   * (FarDockRequest `release`): best effort, so a far room that cannot be
-   * reached does not hold it.
+   * pairing on a door that is no dock port: DETACH releases this end only)
+   * in a release made at `now`? Not while a move this install knows holds
+   * it then, nor one only the far room knows, asked through the far writer
+   * as an UNDOCK asks (FarDockRequest `release`), at the stamp the release
+   * takes (shipArrival.detachBerth stamps its tombstone the same way): best
+   * effort, so a far room that cannot be reached does not hold it.
    */
-  public async farReleaseAllowed(doorId: string): Promise<boolean> {
+  public async farReleaseAllowed(doorId: string, now: number = Date.now()): Promise<boolean> {
     const roomId = this.roomNow();
-    if (this.heldByMove(doorId)) return false;
+    if (berthHeldByMove(roomId, doorId, now)) return false;
     const record = readDoor(doorId);
     if (record?.paired !== true || !this.farDockWriter) return true;
     let result: FarDockResult;
@@ -2770,7 +2780,7 @@ export class DoorDockingPortSystem {
         nearRoomId: roomId,
         farAddress: record.connectedRoomAddress,
         nearDoorId: doorId,
-        undockedAt: stampAfter(record.dockedAt),
+        undockedAt: stampAfter(record.dockedAt, now),
       });
     } catch (err) {
       console.warn("[dock] far release check threw:", err);
@@ -2780,31 +2790,29 @@ export class DoorDockingPortSystem {
   }
 
   /**
-   * ⏏ #67 D2: DETACH the legacy berth on `doorId` (shipArrival.detachBerth)
-   * once no station move holds it, by the moves its far room knows too
-   * (farReleaseAllowed): a station between planets carries the ship a berth
-   * holds, as a dock's. Only the berth it asked about, in the room it asked
-   * from, and its row says why when one holds it. True when it let go.
+   * ⏏ #67 D2: DETACH the legacy berth on `doorId` once no station move holds
+   * it, by the moves its far room knows too (farReleaseAllowed): a station
+   * between planets carries the ship a berth holds, as a dock's. One release
+   * at one stamp, the far room's answer and this end's tombstone alike
+   * (shipArrival.detachLegacyBerthAt). Only the berth it asked about, in the
+   * room it asked from, and its row says why when one holds it. True when
+   * it let go.
    */
   public async detachLegacyBerth(doorId: string): Promise<boolean> {
     if (this.dockOp(doorId)?.busy) return false;
     const roomId = this.roomNow();
-    const asked = readDoor(doorId);
-    if (asked?.paired !== true) return false;
+    if (readDoor(doorId)?.paired !== true) return false;
     this.setDockOp(doorId, { busy: true, note: "Asking the berth's station…" }, roomId);
     this.refreshPolicyUI();
-    const allowed = await this.farReleaseAllowed(doorId);
-    const still = this.roomNow() === roomId ? readDoor(doorId) : undefined;
-    const same = still?.paired === true && still.connectedRoomAddress === asked.connectedRoomAddress
-      && still.dockedAt === asked.dockedAt;
-    const done = allowed && same && detachBerth(doorId);
-    this.setDockOp(
-      doorId,
-      allowed ? {} : { note: "This station is moving between planets — the berth holds until it arrives.", tone: "bad" },
+    const outcome = await detachLegacyBerthAt(
       roomId,
+      doorId,
+      (now) => this.farReleaseAllowed(doorId, now),
+      () => this.roomNow(),
     );
+    this.setDockOp(doorId, outcome === "held" ? { note: this.moveHoldNote("berth"), tone: "bad" } : {}, roomId);
     this.refreshPolicyUI();
-    return done;
+    return outcome === "released";
   }
 
   /** The module on the other side, by name when the atlas knows it. */
@@ -2916,10 +2924,7 @@ export class DoorDockingPortSystem {
     // between planets carries every ship docked to it: neither end lets go
     // until it arrives.
     if (dockLockedByMove([roomId, port.roomId], Date.now())) {
-      this.setDockOp(doorId, {
-        note: "This station is moving between planets — the dock holds until it arrives.",
-        tone: "bad",
-      });
+      this.setDockOp(doorId, { note: this.moveHoldNote("dock"), tone: "bad" });
       return false;
     }
     if (!this.canConstruct(doorId)) {
@@ -2938,6 +2943,12 @@ export class DoorDockingPortSystem {
     const now = Date.now();
     const farAt = releasePlaceOf(port.roomId, now);
     const nearAt = releasePlaceOf(roomId, now);
+    // 🚚 Until the far room answers, this release may yet be taken back (a
+    // move it knows of holds the dock): every helm reads the dock as still
+    // holding a tow meanwhile (shipDoc.UndockHold), however long the answer
+    // takes. Taken before the tombstone, so no peer sees the one without
+    // the other; ended once answered, in the room it was taken in.
+    const held = !!this.farDockWriter && holdUndock(doorId, undockedAt, now);
     writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt, farAt));
     const name = this.partnerLabel(port.roomId);
     if (!this.farDockWriter) {
@@ -2949,6 +2960,10 @@ export class DoorDockingPortSystem {
     }
     this.setDockOp(doorId, { busy: true, note: `Undocked — telling ${name}…` }, roomId);
     const near = this.doorLateral(doorId);
+    const renewal = held ? setInterval(() => { renewUndockHold(doorId, undockedAt); }, UNDOCK_RENEW_MS) : null;
+    const answered = () => {
+      if (held && this.roomNow() === roomId) endUndockHold(doorId, undockedAt);
+    };
     let result: FarDockResult;
     try {
       result = await this.farDockWriter({
@@ -2965,6 +2980,8 @@ export class DoorDockingPortSystem {
     } catch (err) {
       console.warn("[dock] far undock threw:", err);
       result = { ok: false, reason: "unreachable" };
+    } finally {
+      if (renewal !== null) clearInterval(renewal);
     }
     if (!result.ok && result.reason === "moving") {
       // 🚚 The far room knew of a move this install had not heard of (the
@@ -2977,6 +2994,7 @@ export class DoorDockingPortSystem {
       const back = still?.kind === "undocked" && still.memory.undockedAt === undockedAt
         && pairingAllowedByFlight(readFlightRecord()).ok;
       if (back) writeDoorPairing(doorId, port.address, port.record);
+      answered();
       this.setDockOp(
         doorId,
         back
@@ -2991,10 +3009,12 @@ export class DoorDockingPortSystem {
     // 🚚 The far room's moves are learned now (farDoorWrite): where its
     // station was as it let go may be news here (arrived at another planet
     // since this install last heard, say). This end's tombstone says where
-    // it really was, as does the rest a ship took from it meanwhile.
+    // it really was, as does the rest a ship took from it meanwhile. Then
+    // the release stands.
     if (result.ok && this.roomNow() === roomId) {
       correctReleasePlace(doorId, undockedAt, farAt, releasePlaceOf(port.roomId, now));
     }
+    answered();
     this.setDockOp(
       doorId,
       result.ok
@@ -3039,7 +3059,9 @@ export class DoorDockingPortSystem {
     // 🚚 No ship joins (or rejoins) a station between planets.
     if (dockLockedByMove([roomId, port.roomId], Date.now())) {
       this.setDockOp(doorId, {
-        note: "That station is moving between planets — dock when it arrives.",
+        note: roomMovesKnown()
+          ? "That station is moving between planets — dock when it arrives."
+          : "This room holds more move records than can be read — dock once they are cleared.",
         tone: "bad",
       });
       return false;
@@ -3085,6 +3107,10 @@ export class DoorDockingPortSystem {
     // re-dock as a stale berth (dockRules.mirrorMayWrite) and never heal it.
     const dockedAt = stampAfter(port.memory.undockedAt);
     const near = this.doorLateral(doorId);
+    // 🚚 Where the berth's station orbits as this DOCK is asked (none for a
+    // lone module): the far write learns that room's moves, and a station
+    // found gone from there since is out of this ship's reach.
+    const berthAt = releasePlaceOf(port.roomId);
     // The far berth is asked over an await, and a peer may dock, re-connect or
     // strip this port meanwhile — or the player may walk into another room,
     // whose doc is the bound one now: this side is only ever written over the
@@ -3098,6 +3124,10 @@ export class DoorDockingPortSystem {
       // 🚚 So may either end's station have cast off between planets: no ship
       // joins a station in transit, and the far write is taken back the same way.
       if (dockLockedByMove([roomId, port.roomId], Date.now())) return false;
+      // …or be found gone to another planet by the moves the far write
+      // learned (a ship that arrived on a list that had not heard): a dock
+      // to it would carry the ship across without a transfer.
+      if (!berthStillThere(port.roomId, berthAt)) return false;
       const now = classifyDockPort(readDoor(doorId));
       return now.kind === "undocked" && now.memory.undockedAt === port.memory.undockedAt;
     };
@@ -3174,6 +3204,7 @@ export class DoorDockingPortSystem {
           dockedAt,
           near,
           name,
+          berthAt,
         });
       }
     }
@@ -3207,7 +3238,8 @@ export class DoorDockingPortSystem {
    * ⚓ redockPort's far berth answered, but THIS port changed while it was
    * asked (a peer docked, re-connected or stripped it — or the player left
    * the room, so this side can no longer be written — or either end's station
-   * cast off between planets, which no ship joins). Docked meanwhile to
+   * cast off between planets, which no ship joins, or the berth's station
+   * was found gone from where it was: berthStillThere). Docked meanwhile to
    * this very berth under OUR stamp — a crew member here joining our dock, or
    * the walk-through mirror of our far write — both sides hold one dock and
    * nothing is taken back (dockRules.holdsOurRedock). Anything else, the far
@@ -3226,6 +3258,8 @@ export class DoorDockingPortSystem {
       dockedAt: number;
       near: { wall: DoorWall; lateral: number };
       name: string;
+      /** Where the berth's station orbited as the DOCK was asked. */
+      berthAt?: string;
     },
   ): Promise<boolean> {
     // Only the room this DOCK started in can say what its port holds now.
@@ -3236,12 +3270,16 @@ export class DoorDockingPortSystem {
       return true;
     }
     // 🚚 A station that cast off meanwhile is said as such — its port may be
-    // just as it was — and the dock waits for its arrival, not a retry.
+    // just as it was — and the dock waits for its arrival, not a retry; one
+    // found gone from where it was is out of reach until the ship flies there.
     const moving = dockLockedByMove([ask.roomId, port.roomId], Date.now());
+    const gone = !moving && !berthStillThere(port.roomId, ask.berthAt);
     const lead = moving
       ? "That station started moving between planets while docking"
-      : "This port changed while docking";
-    const retry = moving ? "Dock when it arrives." : "Try again.";
+      : gone
+        ? "That station is no longer where this ship is"
+        : "This port changed while docking";
+    const retry = moving ? "Dock when it arrives." : gone ? "Fly to it to dock there." : "Try again.";
     // Acknowledged, or made but never acknowledged (it may still land): either
     // way the berth may hold our write, and it is taken back.
     if (!farWriteMayStand(far) || !this.farDockWriter) {
