@@ -48,7 +48,7 @@ import { shipDocBound } from './shipDoc';
 import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
 // 🚚 Another ferry's leg, where its summary says the route copied its stops.
-import { summaryLegEnds } from './planetSummary';
+import { routeLegEnds, summaryLegEnds } from './planetSummary';
 import { flightCapable, followsFlightRecord } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
@@ -260,13 +260,13 @@ function readSource(now: number): Source {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
       // 🚚 The timetable's legs fly the route's own copy of each stop, which
-      // a stop's station may have left for another planet: those are its ends.
-      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => (places?.to
-        ? [places.from, places.to]
-        : [
-          castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
-          castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
-        ]));
+      // a stop's station may have left for another planet: those are its
+      // ends, untrimmed as the timetable planned them. An ordinary flight's
+      // ends go by their stations' ids, so their trims apply.
+      aboard = flightPlan(['own', rec.locationId, to], rec.departedAt, rec.etaAt, () => routeLegEnds(places) ?? [
+        castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
+        castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
+      ]);
       // Kept through every leg: a ship casts off before its launch window,
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
@@ -378,8 +378,9 @@ function readSource(now: number): Source {
     if (!fromRoom || !toRoom || departedAt === undefined || ship.etaAt === undefined) continue;
     // 🚚 A ferry's leg flies the route's copy of its two stops, which its
     // summary carries: a stop's station may have moved planets since, where
-    // the station list would place it.
-    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => summaryLegEnds(ship, idOf) ?? [
+    // the station list would place it (untrimmed, as its timetable planned
+    // them).
+    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => summaryLegEnds(ship) ?? [
       byRoom(fromRoom, departedAt),
       byRoom(toRoom, departedAt),
     ]);

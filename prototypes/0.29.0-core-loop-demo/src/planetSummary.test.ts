@@ -28,6 +28,7 @@ import {
   refreshTrims,
   registerLearnedStations,
   resolveStationAlias,
+  routeLegEnds,
   shipsAroundPlanet,
   subscribePlanetSummary,
   summaryForStation,
@@ -1284,7 +1285,7 @@ describe('ships and the solar system', () => {
     expect((doc.getMap('shipSummaries').get('room-ship') as { updatedAt: number }).updatedAt).toBe(first + 3600 * 1000);
   });
 
-  it('🚚 says a leg\'s copied ends only in flight, and reads them back under this install\'s ids', () => {
+  it('🚚 says a leg\'s copied ends only in flight, and reads them back as the timetable planned them', () => {
     const places: RouteFlightPlaces = {
       from: { id: 'st-x', planetId: SOV, orbitSlot: 1 },
       to: { id: 'st-y', planetId: 'planet-nowhere', orbitSlot: 3 },
@@ -1293,14 +1294,50 @@ describe('ships and the solar system', () => {
     expect(legEndFields(places)).toEqual({ fromPlanetId: SOV, fromSlot: 1, toPlanetId: SOV, toSlot: 3 });
     expect(legEndFields({ ...places, to: null })).toEqual({});
     expect(legEndFields(null)).toEqual({});
+    // Under ids no trim resolver knows, aboard and in a summary alike.
+    const untrimmed = [
+      { id: 'route-stop:from', planetId: SOV, orbitSlot: 1 },
+      { id: 'route-stop:to', planetId: SOV, orbitSlot: 3 },
+    ];
+    expect(routeLegEnds(places)).toEqual(untrimmed);
+    expect(routeLegEnds({ ...places, to: null })).toBeNull();
+    expect(routeLegEnds(null)).toBeNull();
     const s = { fromRoom: 'room-a', toRoom: 'room-b', ...legEndFields(places) };
-    expect(summaryLegEnds(s, (room) => (room === 'room-a' ? 'st-a' : undefined))).toEqual([
-      { id: 'st-a', planetId: SOV, orbitSlot: 1 },
-      { id: 'room-b', planetId: SOV, orbitSlot: 3 },
-    ]);
+    expect(summaryLegEnds(s)).toEqual(untrimmed);
     // An older client's relay drops the copies: the reader places the ends.
     expect(summaryLegEnds({ fromRoom: 'room-a', toRoom: 'room-b' })).toBeNull();
     expect(summaryLegEnds({ ...s, toRoom: undefined })).toBeNull();
+  });
+
+  // Copilot (PR 180): the timetable plans its legs untrimmed (pilotRoute's
+  // route-stop ids), so a leg drawn through a trim this game has heard of
+  // would part from the times it flies by, and differ between games.
+  it('🚚 draws a ferry\'s leg as its timetable planned it, though the station it flies to is trimmed', () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim() }));
+    installTrimResolver();
+    const hab = listStations().find((s) => s.id === 'hab')!;
+    expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+    // The ferry's leg to HAB: aboard, its route's places name HAB by its id here.
+    const places: RouteFlightPlaces = {
+      from: { id: 'yard', planetId: SOV, orbitSlot: 1 },
+      to: { id: 'hab', planetId: SOV, orbitSlot: 2 },
+    };
+    const planned = planTransfer(
+      { id: 'route-stop:0', planetId: SOV, orbitSlot: 1 },
+      { id: 'route-stop:1', planetId: SOV, orbitSlot: 2 },
+      T0,
+    )!;
+    const heard = { fromRoom: 'room-yard', toRoom: 'room-hab', ...legEndFields(places) };
+    for (const ends of [routeLegEnds(places)!, summaryLegEnds(heard)!]) {
+      const plan = planTransfer(ends[0], ends[1], T0)!;
+      expect(plan.to).toEqual(orbitForSlot(SOV, 2));
+      expect(plan.transferMs).toBe(planned.transferMs);
+      expect(plan.departAt).toBe(planned.departAt);
+    }
+    // An ordinary flight's ends go by its stations' ids: HAB's trim applies.
+    expect(planTransfer(places.from, places.to!, T0)!.to.radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
   });
 
   it('🚚 an install that first hears of a leg after its next stop moved planets places it where the route copied the stop', () => {
@@ -1334,10 +1371,10 @@ describe('ships and the solar system', () => {
     // Its station list gives the leg no course (its ends are on two planets)…
     expect(planTransfer(listed('room-alpha'), listed('room-bravo'), departedAt - 1)).toBeNull();
     // …but the copies the ferry published do, around SOVEREIGN.
-    const ends = summaryLegEnds(heard, (room) => all.find((s) => s.welcomeRoomId === room)?.id)!;
+    const ends = summaryLegEnds(heard)!;
     expect(ends).toEqual([
-      { id: 'o-alpha', planetId: SOV, orbitSlot: 1 },
-      { id: 'o-bravo', planetId: SOV, orbitSlot: 3 },
+      { id: 'route-stop:from', planetId: SOV, orbitSlot: 1 },
+      { id: 'route-stop:to', planetId: SOV, orbitSlot: 3 },
     ]);
     const plan = planTransfer(ends[0], ends[1], departedAt - 1);
     expect(plan?.from.planet.id).toBe(SOV);
