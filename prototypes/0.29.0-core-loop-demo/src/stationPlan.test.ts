@@ -9,7 +9,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
 import { atlasLayout, atlasPoses, bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
-import { beamPassFor, editAccess, moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { beamAfterStepBack, beamPassFor, editAccess, moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import type { ShipSummary } from './planetSummary';
 
 const store = new Map<string, string>();
@@ -606,6 +606,31 @@ describe('working on a module from the table', () => {
   });
 });
 
+describe('the BEAM INTO click', () => {
+  it('drops a pending auto-enter at once, so a READY during the step-back beams no one', () => {
+    let pending: string | null = 'room-old';
+    const entered: string[] = [];
+    const later: Array<() => void> = [];
+    // The ACCESS app's auto-enter, as it runs on each pass change.
+    const passChanged = () => {
+      if (!pending) return;
+      entered.push(seed(pending));
+      pending = null;
+    };
+    beamAfterStepBack(seed('room-b'), {
+      cancelPending: () => { pending = null; },
+      afterStepBack: (go) => { later.push(go); },
+      enter: (s) => { entered.push(s); },
+    });
+    // The pasted pass turns READY while the table is still stepping back.
+    passChanged();
+    expect(entered).toEqual([]);
+    expect(later).toHaveLength(1);
+    later[0]();
+    expect(entered).toEqual([seed('room-b')]);
+  });
+});
+
 describe('the pass the table beams in with', () => {
   it('is the first seed that reaches the room', () => {
     const real = btoa(JSON.stringify({ roomId: 'room-b' }));
@@ -646,18 +671,21 @@ describe('BEAM INTO (source scan)', () => {
     expect(deps).toContain('beamTo: (roomId) => stationPlanDeps.beamTo?.(roomId),');
     const table = between(source('world.ts'), 'if (device.kind === "mapTable") {', 'deviceFocus.beginFocus(this.player, device, ui);');
     expect(table).toContain('canBeamTo: (roomId) => !!this.onBeamInto && !!this.roomPassFor?.(roomId),');
-    expect(table).toContain('deviceFocus.releaseThen(() => beam(seed));');
+    // The hook runs at the click; only the beam waits for the step-back.
+    expect(table).toContain('beam(seed, (go) => deviceFocus.releaseThen(go));');
+    expect(table).not.toContain('releaseThen(() => beam(');
   });
 
   it("enters by the ACCESS beam with a pass this install holds, never a door's", () => {
     const main = source('main.ts');
     expect(main).toContain('world.roomPassFor = (roomId) => heldPassFor(roomId);');
-    // A manual choice, like ACCESS's ENTER/JUMP: a pasted pass still warming
-    // must not carry you off once the beam lands.
-    const onBeam = between(main, 'world.onBeamInto = (seed) => {', '};');
-    const cleared = onBeam.indexOf('autoEnterRoomId = null;');
-    expect(cleared).toBeGreaterThan(-1);
-    expect(onBeam.indexOf('void enterRoomFromPass(seed, (msg) => showHint(msg, 4000));')).toBeGreaterThan(cleared);
+    // A manual choice, like ACCESS's ENTER/JUMP, made at the click: a pasted
+    // pass still warming must not carry you off (beamAfterStepBack).
+    const onBeam = between(main, 'world.onBeamInto = (seed, afterStepBack) =>', '});');
+    expect(onBeam).toContain('beamAfterStepBack(seed, {');
+    expect(between(onBeam, 'cancelPending: () => {', '},')).toContain('autoEnterRoomId = null;');
+    expect(onBeam).toContain('afterStepBack,');
+    expect(onBeam).toContain('enter: (s) => void enterRoomFromPass(s, (msg) => showHint(msg, 4000)),');
     const held = between(main, 'function heldPassFor(roomId: string): string | undefined {', '\n}');
     expect(held).toContain('return beamPassFor(roomId, [');
     expect(held).toContain('passSeed(roomId),');

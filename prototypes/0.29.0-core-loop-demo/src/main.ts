@@ -253,7 +253,7 @@ import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
 // 🗺️✏️ #192: the holotable's BEAM INTO takes the pass this install holds.
-import { beamPassFor } from "./stationPlan";
+import { beamAfterStepBack, beamPassFor } from "./stationPlan";
 // ⚓ A station's public berth takes its door's pose from the atlas, and 🚀 a
 // ship under way keeps its flight's place whatever it wears.
 import { followsFlightRecord, setBerthPoseLookup } from "./stationDirectory";
@@ -3841,13 +3841,18 @@ function wireAdapterTransit(): void {
   // 🗺️✏️ #192: the holotable's BEAM INTO another module of the station is
   // the ACCESS beam, with a pass this install holds; its word goes on a hint,
   // as the ACCESS app's feedback line is out of sight at the table. It is a
-  // manual choice like ACCESS's ENTER/JUMP: a pasted pass still warming must
-  // not carry you off once this beam lands.
+  // manual choice like ACCESS's ENTER/JUMP, made at the click: a pasted pass
+  // still warming is dropped then, before the table's step-back, where its
+  // READY could otherwise carry you off first (beamAfterStepBack).
   world.roomPassFor = (roomId) => heldPassFor(roomId);
-  world.onBeamInto = (seed) => {
-    autoEnterRoomId = null;
-    void enterRoomFromPass(seed, (msg) => showHint(msg, 4000));
-  };
+  world.onBeamInto = (seed, afterStepBack) =>
+    beamAfterStepBack(seed, {
+      cancelPending: () => {
+        autoEnterRoomId = null;
+      },
+      afterStepBack,
+      enter: (s) => void enterRoomFromPass(s, (msg) => showHint(msg, 4000)),
+    });
   const provisionModuleSeed = async (
     templateId = "empty",
     parentDoorId?: string,

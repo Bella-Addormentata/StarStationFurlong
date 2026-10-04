@@ -10,7 +10,8 @@
  * Pure: the atlas and the planet's ship summaries come in, a plan comes out.
  * stationPlanView.ts draws it and wires the clicks. ✏️ editAccess says how
  * the table lets you work on a module's doors: from the table in the room
- * you stand in, else by the ACCESS beam with a pass you hold (beamPassFor).
+ * you stand in, else by the ACCESS beam with a pass you hold (beamPassFor,
+ * beamAfterStepBack).
  */
 
 import type { AtlasEntry, AtlasOwner } from './stationAtlas';
@@ -332,6 +333,22 @@ export function editAccess(
   if (!m || !plan.modules.some((x) => x.here)) return 'outside';
   if (!hasPass(roomId)) return 'walk';
   return m.pairedFromInside ? 'beam' : 'walk-first';
+}
+
+/** ✏️ BEAM INTO's click: the click is the choice, so it drops a pending
+ *  auto-enter at once (`cancelPending`), as the ACCESS app's ENTER does;
+ *  a pass turning READY during the table's step-back would otherwise beam
+ *  you off first. The beam itself waits for the step-back. */
+export function beamAfterStepBack(
+  seed: string,
+  hooks: {
+    cancelPending: () => void;
+    afterStepBack: (go: () => void) => void;
+    enter: (seed: string) => void;
+  },
+): void {
+  hooks.cancelPending();
+  hooks.afterStepBack(() => hooks.enter(seed));
 }
 
 /** 🎫 The first of `seeds` that reaches `roomId`, the pass the holotable
