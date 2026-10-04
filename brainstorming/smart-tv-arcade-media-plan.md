@@ -382,8 +382,12 @@ In code: #207 (the TV) and #208 (the cabinet).
   body breaks the byte offsets `Content-Length` and `Content-Range`
   promise. And the RESPONSE is bytes, never
   the upstream's headers: the proxy forwards an allowlist of them only —
-  `Content-Type` (checked: a media or octet-stream type, else the fetch
-  ends), `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`,
+  `Content-Type` (checked against an allowlist: `video/*`, `audio/*`,
+  `application/octet-stream`, and `application/zip` with
+  `application/x-zip-compressed` for the cabinet's ROM sets, §9 — a text,
+  HTML, script or image type ends the fetch, since nothing the proxy
+  serves is ever a document), `Content-Length`, `Content-Range`,
+  `Accept-Ranges`, `ETag`,
   `Last-Modified` — and drops everything else, `Set-Cookie`,
   `Clear-Site-Data`, `Content-Security-Policy`,
   `Strict-Transport-Security`, `Location` (a redirect is followed under the
@@ -841,10 +845,15 @@ third of the overhead at 40 ms more latency — framed inside the plaintext
 so the receiver can cut it back into the encoder's chunks, each with its
 own timestamp and duration: a one-byte count, then per chunk a two-byte
 big-endian length and a two-byte big-endian duration in 48 kHz samples
-(one of Opus's frame sizes, 120 to 5760 — 2.5 to 120 ms; the chunk's
-WebCodecs `duration` is that count at 48 kHz, and a packet's TOC byte is
-never read for it, since the TOC gives the duration of ONE frame while a
-code-3 packet carries several), then the chunks in order, chunk k's
+(one of Opus's frame sizes, 120 to 5760 — 2.5 to 120 ms: the sender
+writes `round(duration × 48 / 1000)` from the chunk's WebCodecs
+`duration`, which is MICROSECONDS — 20 000 for a 20 ms frame, so 960 goes
+in the table, never 20 000 — and, when the chunk reports none, from the
+`opus.frameDuration` it configured the encoder with, the same conversion;
+the receiver hands its `EncodedAudioChunk` `samples × 1000 / 48`
+microseconds back; a packet's TOC byte is never read for it, since the
+TOC gives the duration of ONE frame while a code-3 packet carries
+several), then the chunks in order, chunk k's
 timestamp the header's plus the durations before it; the table under the
 AEAD and the signature with the rest, bit 1 of the flags byte saying a
 batch is inside, and a batch whose lengths do not add up to the payload,
