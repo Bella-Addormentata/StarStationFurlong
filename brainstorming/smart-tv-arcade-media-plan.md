@@ -223,20 +223,33 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
   alongside the fingerprint — a CORS-readable response, so only a page on an
   allowed origin can ever learn it, which is what turns the header allowlist
   into a gate for the proxy — carried in the URL because a `<video>` cannot
-  set a header; a missing or wrong token, or a missing or disallowed
-  `Origin`, is a 403 **before any DNS lookup or outbound connection**. Only
-  then the host allowlist — and, because a loopback service that fetches
-  URLs is an SSRF surface, the node resolves the name ITSELF, validates every
-  address the answer holds (loopback, private, link-local and metadata
-  addresses refused) and PINS the socket to a vetted address: it connects to
-  the IP with the original name kept as `Host` and SNI, and the HTTP client
-  never resolves the name again on connect — a rebinding resolver would
-  answer the check with a public address and the connect with a private one,
-  so "validated after DNS" alone checks one answer and connects on another.
-  The same resolve, validate and pin runs on EVERY redirect and every retry
-  (redirects capped), with a size ceiling, a timeout and a cap on concurrent
-  fetches. A hostname allowlist alone closes nothing, a response header gates
-  nothing, and a check the connect does not reuse protects nothing.
+  set a header, with the element in CORS mode (`crossOrigin = 'anonymous'`):
+  that is what makes a `<video>` send `Origin` at all — a plain cross-origin
+  `<video src>` sends none and would meet the 403 below — and what a
+  `VideoTexture` needs anyway, since a non-CORS video taints the canvas it is
+  drawn to; a missing or wrong token, or a missing or disallowed `Origin`,
+  is a 403 **before any DNS lookup or outbound connection**. Only then the
+  host allowlist — and, because a loopback service that fetches URLs is an
+  SSRF surface, the node resolves the name ITSELF and validates every
+  address the answer holds: an IPv4-mapped or IPv4-compatible IPv6 address
+  is normalized to the IPv4 it carries first, and then anything that is not
+  a global unicast address is refused — loopback, private, link-local, the
+  metadata address, unspecified, carrier-grade NAT, multicast, broadcast,
+  documentation and reserved ranges, IPv6 unique-local and link-local alike
+  (a denylist of a few classes is a list of what was remembered; the rule is
+  an allowlist of global unicast and nothing else) — and PINS the socket to
+  a vetted address: it connects to the IP with the original name kept as
+  `Host` and SNI, and the HTTP client never resolves the name again on
+  connect — a rebinding resolver would answer the check with a public
+  address and the connect with a private one, so "validated after DNS"
+  alone checks one answer and connects on another. On EVERY redirect and
+  every retry the whole gate runs again from the top: the host allowlist on
+  the new target before any lookup, then the resolve, validate and pin
+  (redirects capped) — an allowed host can redirect anywhere, and a redirect
+  that is not re-admitted is the end of the fetch. A size ceiling, a timeout
+  and a cap on concurrent fetches. A hostname allowlist alone closes
+  nothing, a response header gates nothing, and a check the connect does not
+  reuse protects nothing.
 - **v1 ships neither on the in-world plane.** The first slice draws the status,
   menu, countdown and now-playing card on the in-world `CanvasTexture` and plays
   the actual video in a **theatre panel** (DOM) that anyone in the room opens
@@ -277,7 +290,8 @@ it). The host's node imports a file as a BLAKE3 blob; viewers' nodes fetch it
 (verified, resumable, in order, so playback can start early) and serve it to
 their own webview at `/blob/<hash>?cap=…` with range support, behind the
 same request gate as `/api/media` (§3.4): the per-launch capability token
-and an allowed `Origin`, checked before any read of the store. The route
+and an allowed `Origin`, checked before any read of the store, the element
+in CORS mode so that it sends one. The route
 serves only what the store already holds or is fetching and never starts a
 fetch itself — CORS only governs who may read a response, a `<video src>`
 needs none to make the request, and a hash is no secret once a room record
@@ -357,7 +371,13 @@ a per-LEG key: a source has an audio leg and a video leg, each leg's key is
 derived from the per-source media key with the leg as the label (HKDF), and
 each leg counts its own frames, so two legs never share a nonce space under
 one key — one key with two independent encoder counters would reuse a
-nonce, which breaks the AEAD outright. The frame counter is the nonce, and
+nonce, which breaks the AEAD outright. A leg's counter is the SENDER's for
+the whole epoch, never the encoder's: it lives outside the encoder and
+survives every pause, restart and reconfiguration (§9 and spike #21 restart
+encoders for the first subscriber), so a restarted encoder goes on from the
+counter it left; and a counter about to wrap, or a sender that has lost its
+counter (a page reload), takes a new key epoch before it sends another
+frame. A nonce is never reused under one key. The frame counter is the nonce, and
 the routing header — source id, leg, key epoch, counter, keyframe flag — is
 the associated data and is under the sender's signature below, so a hub can
 relabel nothing: a frame moved to another leg or another counter neither
@@ -366,8 +386,13 @@ subscriber set), to serve the glimpse tier (the keyframe flag) and to drop,
 and it gets nothing else. The sender mints the source key, seals it to each
 subscriber's X25519 key (derived from their Ed25519 identity, the libsodium
 conversion) on the reliable lane when the subscription is accepted, and
-rotates to a new epoch on every departure (the departed can open nothing
-after it) and on a timer. Replay protection is a sliding window per leg,
+rotates to a new epoch before every admission (the admitted can open
+nothing from before it: a key handed out mid-epoch would open the ciphertext
+a joiner, or a hub that later joins as a member, had already logged — which
+is the guarantee below that a forwarding node reconstructs no audio), on
+every departure (the departed can open nothing after it) and on a timer. A
+join and a leave each cost one rotation — a sealed key per subscriber on
+the reliable lane — which at room scale is nothing. Replay protection is a sliding window per leg,
 the SRTP shape: a leg's counter only ever goes up within an epoch; a
 receiver keeps, per leg, the highest counter it has accepted and a bitmap
 of the last 128 below it, takes a frame above the highest (and
