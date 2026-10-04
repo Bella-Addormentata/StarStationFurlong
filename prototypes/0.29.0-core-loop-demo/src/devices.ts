@@ -78,7 +78,8 @@ import {
   adriftPlace, destinationsFrom, flightCapable, followsFlightRecord, groundedBy, isKnownStation, localStationId, planHop,
   stationHere, withStationSnapshot, type HopPlan,
 } from './stationDirectory';
-import { atlasComponent, readAtlas as readStationAtlas } from './stationAtlas';
+import { atlasComponent, dismantledRoomIds, readAtlas as readStationAtlas, subscribeSharedAtlas } from './stationAtlas';
+import { StationPlanView } from './stationPlanView';
 import {
   TUG_MIN_ENGINES,
   describeMove,
@@ -235,8 +236,11 @@ import { rollAndSettleCraps, openCrapsBetting } from './crapsCroupier';
 import {
   readRobotConfig, writeRobotConfig, subscribeRobot,
   ROBOT_ROUTINES, ROUTINE_LABELS, MAX_SCRIPT_STEPS,
+  assignDisassembly, readDisassemblyJobs, startResumesDisassembly,
 } from './robotDoc';
-import type { RobotRoutine, RobotStep } from './robotDoc';
+// 🔧 #192: the Disassemble job's labor and progress.
+import { jobFraction, jobStatusText, type DisassemblyCandidate } from './disassembly';
+import type { RobotConfig, RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
 import {
@@ -253,7 +257,7 @@ import {
 import { rowText } from './departuresBoard';
 import type { BoardView } from './departuresBoard';
 import { readBoardSetting, subscribeDepartures, writeBoardSetting } from './departuresDoc';
-import { subscribePlanetSummary } from './planetSummary';
+import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1134,6 +1138,16 @@ export function createRoomTerminalUI(deps: RoomTerminalDeps): DeviceUI {
 export interface MapTableDeps {
   /** Ask the focus controller to step back (wired to the map's CLOSE button). */
   requestRelease?: () => void;
+  /** 🗺️ #192: the current room's doors, for the station atlas's edit buttons. */
+  currentDoors?: () => Array<{ id: string; label: string }>;
+  /** 🗺️ Step back from the table and open a door's own panel. */
+  openDoorPanel?: (doorId: string) => void;
+  /** 🗺️ The local player's id, so a module's owner can read "You". */
+  playerId?: () => string;
+  /** 🗺️ The local identity key: "You" still, back on a fresh player id. */
+  identityPub?: () => string;
+  /** 🔧 The modules this room's robots could take apart (#192). */
+  disassemblyCandidates?: () => DisassemblyCandidate[];
 }
 
 /**
@@ -1145,6 +1159,10 @@ export interface MapTableDeps {
  * whole lifetime.
  */
 let mapTableMap: SolarSystemMap | null = null;
+/** 🗺️ #192: the station atlas over the plot — one, like the map. Its deps
+ *  are re-pointed at each focus session's. */
+let stationPlanView: StationPlanView | null = null;
+let stationPlanDeps: MapTableDeps = {};
 
 /**
  * The map table's focused DOM UI (plan §2 M4): a gold-framed panel hosting
@@ -1217,19 +1235,67 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       } else {
         mapTableMap.mount(body); // re-parents the existing container
       }
+      // 🗺️ #192: VIEW STATION ATLAS covers the plot with that station's plan.
+      stationPlanDeps = deps;
+      if (!stationPlanView) {
+        stationPlanView = new StationPlanView({
+          atlas: () => readStationAtlas(),
+          currentRoomId: () => currentRoomId(),
+          playerId: () => stationPlanDeps.playerId?.() ?? '',
+          identityPub: () => stationPlanDeps.identityPub?.() ?? '',
+          ships: () => Object.values(readPlanetStore().ships),
+          dismantled: () => dismantledRoomIds(),
+          doors: () => stationPlanDeps.currentDoors?.() ?? [],
+          openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
+          onBack: () => stationPlanView?.hide(),
+          disassembly: () => ({
+            jobs: readDisassemblyJobs(),
+            candidates: stationPlanDeps.disassemblyCandidates?.() ?? [],
+          }),
+        });
+      }
+      stationPlanView.mount(body);
+      mapTableMap.onStationAtlas((stationId) => {
+        const station = listStationRecords().find((st) => st.id === stationId);
+        if (station) stationPlanView?.show(station);
+      });
+      // An open plan follows its station's CURRENT record (a move changes its
+      // planet, so its ships), and closes when the station is gone.
+      const refreshPlan = () => {
+        const open = stationPlanView?.openStationId();
+        if (!open) return;
+        const fresh = listStationRecords().find((st) => st.id === open);
+        if (fresh) stationPlanView?.refresh(fresh);
+        else stationPlanView?.hide();
+      };
       // Every station around each planet, "you are here" on the current one.
       mapTableMap.refreshStations(undefined, holotableStation());
       mapTableMap.show();
       stopLive?.();
-      const refresh = () => mapTableMap?.refreshStations(undefined, holotableStation());
+      const refresh = () => {
+        mapTableMap?.refreshStations(undefined, holotableStation());
+        refreshPlan();
+      };
       const offSummary = subscribePlanetSummary(refresh);
       const offMove = subscribeStationMove(refresh);
+      // A layout learned while the plan is open (a peer's harvest) redraws it.
+      const offAtlas = subscribeSharedAtlas(refreshPlan);
+      // 🔧 A robot set to (or taken off) a module, and the job's own clock.
+      const offRobot = subscribeRobot(refreshPlan);
+      const jobTick = window.setInterval(() => {
+        if (readDisassemblyJobs().some((j) => j.finishedAt === undefined)) refreshPlan();
+      }, DISASSEMBLY_REDRAW_MS);
       const tick = window.setInterval(refresh, 60_000);
-      stopLive = () => { offSummary(); offMove(); window.clearInterval(tick); stopLive = null; };
+      stopLive = () => {
+        offSummary(); offMove(); offAtlas(); offRobot();
+        window.clearInterval(tick); window.clearInterval(jobTick);
+        stopLive = null;
+      };
     },
 
     unmount(): void {
       stopLive?.();
+      stationPlanView?.hide();
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -4500,7 +4566,16 @@ export interface RobotDockUIDeps {
   itemId: string;
   /** Owner gate — only the room owner may program the robot. */
   canEdit: () => boolean;
+  /** 🔧 The narrower gate (#192): only the room's deed holder, never a
+   *  venture's shareholders, sets a robot to take a module apart, as only
+   *  their game ends the job (world.ts). */
+  holdsDeed?: () => boolean;
+  /** 🔧 The modules this room's robots could take apart (#192). */
+  disassemblyCandidates?: () => DisassemblyCandidate[];
 }
+
+/** 🔧 How often an open Disassemble console redraws its progress. */
+const DISASSEMBLY_REDRAW_MS = 5_000;
 
 /** HTML-attribute escape for owner-authored 'say' text (rendered in the editor
  *  on every client's owner view — never trust the value even from a peer). */
@@ -4524,6 +4599,123 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
    *  (the ship map re-renders the console only when that flips, so a script
    *  edit in progress is not redrawn under the owner's cursor). */
   let drawnCaptain = false;
+  /** 🔧 Redraws an open Disassemble console's job as its clock runs. */
+  let redraw: ReturnType<typeof setInterval> | null = null;
+  /** 🔧 What the Disassemble section last drew, so the clock's redraw
+   *  replaces only a part that changed (a click in progress survives it). */
+  let drawnDis = { picks: '', status: '' };
+
+  /** 🔧 May this player set a robot to take a module apart: the room's deed
+   *  (the console's owner gate where it has no deed check). The deed alone:
+   *  an owner back on a fresh player id holds it (isDeedHolder knows their
+   *  identity key), where the owner gate knows only the player id. */
+  const mayTakeApart = (): boolean => (deps.holdsDeed ? deps.holdsDeed() : deps.canEdit());
+  /** 🔧 May this player switch the robot to routine `to`: the owner gate, or
+   *  the deed for Disassemble (setting a robot to take a module apart). */
+  const mayRoutine = (to: RobotRoutine): boolean => deps.canEdit() || (to === 'disassemble' && mayTakeApart());
+  /** 🔧 May this player press STOP/START on this config: the owner gate, or
+   *  the deed on a Disassemble robot. START putting a robot back on its
+   *  module's job takes the deed alone, like the pick (STOP only pauses it). */
+  const mayPark = (cfg: RobotConfig | null | undefined): boolean =>
+    startResumesDisassembly(cfg)
+      ? mayTakeApart()
+      : deps.canEdit() || (cfg?.routine === 'disassemble' && mayTakeApart());
+
+  /** 🔧 The Disassemble routine's section: which joined module to take
+   *  apart (each with its labor hours, or what stops it), and how the job on
+   *  this robot's module stands. Names are peer-written: escaped. */
+  const disassemblyParts = (target: string | undefined, parked: boolean): { picks: string; status: string } => {
+    const now = Date.now();
+    const jobs = readDisassemblyJobs();
+    const candidates = deps.disassemblyCandidates?.() ?? [];
+    const may = mayTakeApart();
+    const pick = (c: DisassemblyCandidate): string => {
+      const open = jobs.find((j) => j.roomId === c.roomId && j.finishedAt === undefined);
+      // On it while its job is open: a module re-joined after the robot's
+      // job on it ended is picked again, for a fresh job (assignDisassembly).
+      const on = c.roomId === target && open !== undefined;
+      const usable = may && !on && c.blocked === null;
+      const done = open ? ` · ${Math.floor(jobFraction(open, now) * 100)}% done` : '';
+      return `<button data-dis-target="${escAttr(c.roomId)}" ${usable ? '' : 'disabled'} style="
+        display:flex; justify-content:space-between; align-items:center; gap:8px;
+        padding:8px 12px; text-align:left;
+        background:${on ? 'rgba(47,230,160,0.14)' : 'rgba(212,168,75,0.06)'};
+        border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
+        border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
+        font-family:inherit; font-size:10.5px; font-weight:800;
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !may ? 1 : 0.5};
+      "><span>${escAttr(c.name)} · ${c.laborHours} labor h${done}</span><span>${on ? '● ON' : ''}</span></button>${
+        c.blocked ? `<div style="font-size:9px; color:${CH_DIM}; margin:-4px 0 0 12px;">⚠ Can't: ${escAttr(c.blocked)}.</div>` : ''}`;
+    };
+    const job = target ? jobs.find((j) => j.roomId === target) ?? null : null;
+    let status: string;
+    if (job) {
+      const pct = Math.floor(jobFraction(job, now) * 100);
+      const blocked = candidates.find((c) => c.roomId === job.roomId)?.blocked ?? null;
+      status = `<div style="height:6px; border-radius:3px; background:rgba(212,168,75,0.15); overflow:hidden;">
+          <div style="height:100%; width:${pct}%; background:#2fe6a0;"></div></div>
+        <div style="font-size:9.5px; line-height:1.45; color:#2fe6a0;">🔧 ${escAttr(job.name)}: ${escAttr(jobStatusText(job, now, blocked))}</div>${
+        parked && job.finishedAt === undefined
+          ? `<div style="font-size:9.5px; color:#ff8a50;">⏸ This robot is parked: ${may ? '' : 'the deed holder&apos;s '}▶ START puts it back on the job.</div>`
+          : ''}`;
+    } else {
+      status = `<div style="font-size:9.5px; line-height:1.45; color:#2fe6a0;">🔧 ${
+        candidates.length === 0
+          ? 'No module is joined to this room. A robot takes apart a module joined to the room its dock is in.'
+          : 'Pick the module to take apart. The robot works at the door to it, more robots finish sooner, and when the labor hours are done the module comes off the station and leaves every map.'}</div>`;
+    }
+    // A venture's shareholders program its robots, but the deed is one person's.
+    if (!may && deps.canEdit()) {
+      status += `<div style="font-size:9.5px; line-height:1.45; color:${CH_DIM};">🔒 Only this room's deed holder can set a robot to take a module apart.</div>`;
+    }
+    return { picks: candidates.map(pick).join(''), status };
+  };
+
+  /** 🔧 The section as render() draws it. */
+  const disassemblyBlock = (target: string | undefined, parked: boolean): string => {
+    drawnDis = disassemblyParts(target, parked);
+    return `<div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">MODULE TO TAKE APART</div>
+      <div data-dis-picks style="display:flex; flex-direction:column; gap:6px;">${drawnDis.picks}</div>
+      <div data-dis-status style="display:flex; flex-direction:column; gap:6px;">${drawnDis.status}</div>`;
+  };
+
+  /** 🔧 Set this robot to take a joined module apart (the gate and the
+   *  module re-checked at the click: either may have changed since the draw). */
+  const wireDisassemblyPicks = (): void => {
+    if (!panel || !mayTakeApart()) return;
+    panel.querySelectorAll<HTMLButtonElement>('[data-dis-target]').forEach((b) => {
+      b.addEventListener('click', () => {
+        const c = mayTakeApart()
+          ? (deps.disassemblyCandidates?.() ?? []).find((x) => x.roomId === b.dataset.disTarget)
+          : undefined;
+        if (!c || c.blocked !== null) {
+          render();
+          return;
+        }
+        assignDisassembly(deps.itemId, {
+          roomId: c.roomId, name: c.name, doorId: c.doorId, laborHours: c.laborHours,
+        });
+      });
+    });
+  };
+
+  /** 🔧 The job's clock moved: redraw the parts of the section it changed. */
+  const redrawDisassembly = (): void => {
+    const cfg = readRobotConfig(deps.itemId);
+    const picksEl = panel?.querySelector<HTMLElement>('[data-dis-picks]');
+    const statusEl = panel?.querySelector<HTMLElement>('[data-dis-status]');
+    if (cfg?.routine !== 'disassemble' || !picksEl || !statusEl) return;
+    const next = disassemblyParts(cfg.target, cfg.parked === true);
+    if (next.picks !== drawnDis.picks) {
+      picksEl.innerHTML = next.picks;
+      drawnDis.picks = next.picks;
+      wireDisassemblyPicks();
+    }
+    if (next.status !== drawnDis.status) {
+      statusEl.innerHTML = next.status;
+      drawnDis.status = next.status;
+    }
+  };
 
   const writeScript = (routine: RobotRoutine, script: RobotStep[]): void => {
     writeRobotConfig(deps.itemId, { routine, script });
@@ -4535,6 +4727,10 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const cfg = readRobotConfig(deps.itemId);
     const current = cfg?.routine ?? 'serve';
     const owner = deps.canEdit();
+    // 🔧 The deed: the Disassemble routine, its pick and its STOP/START are
+    // the deed holder's even where the owner gate doesn't know them (back
+    // on a fresh player id: mayRoutine, mayPark).
+    const deed = mayTakeApart();
     // 🚀 The captain's lock (design §2a): while a running route names this
     // dock as its robot captain, its routine can't change (and edit mode
     // won't remove the dock). Ship pilot itself is offered only aboard a
@@ -4544,7 +4740,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const flightCapable = isShipReady();
     const routineBtn = (r: RobotRoutine): string => {
       const on = r === current;
-      const usable = owner && (on || !captain);
+      const usable = mayRoutine(r) && (on || !captain);
       return `<button data-routine="${r}" ${usable ? '' : 'disabled'} style="
         display:flex; justify-content:space-between; align-items:center; gap:8px;
         padding:9px 12px; text-align:left;
@@ -4552,7 +4748,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
         border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
         font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
-        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !owner ? 1 : 0.45};
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !(owner || deed) ? 1 : 0.45};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
     const routines = ROBOT_ROUTINES.filter((r) => r !== 'pilot' || pilotRoutineOffered({ flightCapable, current }));
@@ -4589,14 +4785,17 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const script = curScript();
     // 🤖 STOP/START (owner request): a big toggle to park the robot on its dock.
     const parked = cfg?.parked === true;
-    const parkBtn = `<button data-park="1" ${owner ? '' : 'disabled'} style="
+    // 🔧 START on a stopped Disassemble robot puts it back on its module's
+    // job: the deed holder's, like the pick (STOP only pauses the job).
+    const parkUsable = mayPark(cfg);
+    const parkBtn = `<button data-park="1" ${parkUsable ? '' : 'disabled'} style="
       display:flex; justify-content:center; align-items:center;
       padding:10px 12px; width:100%;
       background:${parked ? 'rgba(47,230,160,0.16)' : 'rgba(255,138,80,0.12)'};
       border:1px solid ${parked ? '#2fe6a0' : '#ff8a50'};
       border-radius:7px; color:${parked ? '#2fe6a0' : '#ff8a50'};
       font-family:inherit; font-size:12px; font-weight:800; letter-spacing:0.5px;
-      cursor:${owner ? 'pointer' : 'default'};
+      cursor:${parkUsable ? 'pointer' : 'default'}; opacity:${parkUsable || !(owner || deed) ? 1 : 0.5};
     ">${parked ? '▶ START · resume routine' : '⏸ STOP · park at dock'}</button>`;
     const addBtn = (kind: string, label: string): string =>
       `<button data-add="${kind}" style="flex:1; padding:6px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,0.35); border-radius:6px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; font-weight:800; cursor:pointer;">${label}</button>`;
@@ -4637,13 +4836,16 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         ${routines.map(routineBtn).join('')}
       </div>
       ${pilotBlock}
+      ${current === 'disassemble' ? disassemblyBlock(cfg?.target, parked) : ''}
       <div style="font-size:10px; color:${CH_DIM}; letter-spacing:1.5px;">VOICE</div>
       ${voiceBtn}
       ${editor}
       <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
         ${owner
           ? 'Program this dock&apos;s robot. Custom = a step loop it walks and speaks.'
-          : 'Only the room owner can program this robot.'}
+          : deed
+            ? 'Your deed lets you set this robot to take a module apart. Its other routines need edit rights in this room.'
+            : 'Only the room owner can program this robot.'}
       </div>
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
         SSF ROBOT CONSOLE v1 · one robot per dock · syncs to everyone in the room
@@ -4656,21 +4858,38 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       setRobotVoiceEnabled(!isRobotVoiceEnabled());
       render();
     });
-    if (!owner) return;
-    // 🤖 STOP/START: toggle parked, preserving routine + script.
+    // 🔧 The deed holder's controls (above) are wired for them too; the
+    // script below stays the owner gate's.
+    if (!owner && !deed) return;
+    // 🤖 STOP/START: toggle parked, preserving routine + script (and the
+    // 🔧 module a Disassemble robot is on: parked, it leaves the crew, and
+    // START puts it back).
     panel.querySelector<HTMLButtonElement>('[data-park]')?.addEventListener('click', () => {
       const c = readRobotConfig(deps.itemId);
+      // 🔧 Re-checked at the click, like the pick: the gate or the robot's
+      // config may have changed since the draw.
+      if (!mayPark(c)) {
+        render();
+        return;
+      }
       writeRobotConfig(deps.itemId, {
         routine: c?.routine ?? 'serve',
         ...(c?.script?.length ? { script: c.script } : {}),
+        ...(c?.target ? { target: c.target } : {}),
         parked: !(c?.parked === true),
       });
     });
+    wireDisassemblyPicks();
     panel.querySelectorAll<HTMLButtonElement>('[data-routine]').forEach((b) => {
       b.addEventListener('click', () => {
         // Keep any authored script AND the parked state when switching routines.
         const c = readRobotConfig(deps.itemId);
         const to = b.dataset.routine as RobotRoutine;
+        // 🔧 Re-checked at the click: the gates may have changed since the draw.
+        if (!mayRoutine(to)) {
+          render();
+          return;
+        }
         // 🚀 Re-checked at the click: the route may have started since the
         // render ("Captain of this ship's route: stop the route first").
         const refused = consoleRoutineRefusal({
@@ -4686,9 +4905,14 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
           routine: to,
           ...(script.length ? { script } : {}),
           ...(c?.parked ? { parked: true } : {}),
+          // 🔧 Disassemble pressed again: it stays on its module (switching
+          // to any other routine takes it off the job).
+          ...(to === 'disassemble' && c?.routine === 'disassemble' && c.target ? { target: c.target } : {}),
         });
       });
     });
+    // The script is the owner gate's alone.
+    if (!owner) return;
     panel.querySelectorAll<HTMLButtonElement>('[data-add]').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.add;
@@ -4743,11 +4967,15 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         if ((routeCaptainDockId(readShipRoute()) === deps.itemId) !== drawnCaptain) render();
       });
       unsubscribe = () => { offRobot(); offShip(); };
+      // 🔧 The job's clock runs with no doc write: redraw its progress.
+      redraw = setInterval(redrawDisassembly, DISASSEMBLY_REDRAW_MS);
       render();
     },
     unmount(): void {
       unsubscribe?.();
       unsubscribe = null;
+      if (redraw) clearInterval(redraw);
+      redraw = null;
       flash = null;
       panel?.remove();
       panel = null;

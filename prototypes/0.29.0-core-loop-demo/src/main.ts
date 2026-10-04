@@ -108,7 +108,7 @@ import {
   voteTallyView,
   windowsView,
 } from "./treasuryView";
-import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom, settleCupolaConflicts } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom, settleCupolaConflicts, setRoomDeedCheck } from "./editMode";
 // 🚀 #30 SH2 + SH3: the ship's own doc (fuel truth + flight state machine).
 // Rebinds at the T0 seam alongside furniture / doors / games — see the
 // bindShipDoc call below for the rebind rationale. flightArrived + findDest
@@ -218,7 +218,7 @@ import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
-import { bindRobotDoc } from "./robotDoc";
+import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
   bindFurnitureDoc,
@@ -356,6 +356,7 @@ import {
 } from "./exteriorView";
 import {
   harvestIntoAtlas,
+  cleanAtlasOwner,
   freeGateNumberHere,
   readAtlas,
   atlasComponent,
@@ -2023,6 +2024,13 @@ async function joinRoomAtEpoch(
   void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
     if (epoch !== sessionEpoch || yjsSync !== sync) return;
     harvestStationAtlas();
+    // 🔧 A Disassemble robot whose dock left the layout before we came: only
+    // once the room's state is here is its absence known. After a gate
+    // timeout that is whenever the state lands, still this visit.
+    onRoomStateReady(sync, () => {
+      if (epoch !== sessionEpoch || yjsSync !== sync) return;
+      releaseOrphanedDocks();
+    });
     refreshExteriorView();
     // #157: this harvest can rewrite the current room's own edges (hop 1 of
     // every pose) without any doc event — the shells follow it like the
@@ -2755,6 +2763,8 @@ async function joinRoomAtEpoch(
     // 🪐 A ship's shared summary carries the room's name: one that syncs in
     // (or is changed) replaces the "SHIP" stand-in now, not at the heartbeat.
     if (_event.keysChanged.has("name")) publishPlanetSummary();
+    // 🗺️ #192: the atlas carries the room's name and owner to the holotable.
+    if (_event.keysChanged.has("name") || _event.keysChanged.has("owner")) harvestStationAtlas();
     // 🏦 The treasury screen's funding verdict rests on WHO the room's owner
     // is, read live from this map and the players map — so an owner change
     // must repaint it, or a demoted binding keeps its badge until some
@@ -2784,6 +2794,10 @@ async function joinRoomAtEpoch(
     // 🏦 The owner's identity key lives in THIS map (players[owner].keyB64)
     // and can land after roomInfo — the OWNER UNKNOWN → OWNER-SIGNED flip.
     queueTreasuryRepaint();
+    // 🗺️ #192: the owner's display name rides into the atlas once their
+    // entry lands or changes (only theirs: the rest of the roster is noise).
+    const owner = sync.doc.getMap("roomInfo").get("owner");
+    if (typeof owner === "string" && owner && _event.keysChanged.has(owner)) harvestStationAtlas();
   });
 
   // Register/refresh our own entry now that the doc is bound (fires the
@@ -3162,6 +3176,33 @@ function awaitInitialRoomState(timeoutMs: number): Promise<void> {
     // Guard the race between the initial ready() check and observe() attaching.
     if (ready()) finish();
   });
+}
+
+/** 🔧 Run `fn` once this room's shared state has arrived
+ *  (initialRoomStateReady): at once if it has, else when the roomInfo write
+ *  or post-link sync that brings it lands, however long after
+ *  awaitInitialRoomState's timeout gave up waiting. Captures `sync`; the
+ *  caller's `fn` checks the session is still current, as every post-await
+ *  write does. */
+function onRoomStateReady(sync: YjsSync, fn: () => void): void {
+  if (initialRoomStateReady(sync)) {
+    fn();
+    return;
+  }
+  const roomMap = sync.doc.getMap("roomInfo");
+  let done = false;
+  const check = () => {
+    if (done || !initialRoomStateReady(sync)) return;
+    done = true;
+    try {
+      roomMap.unobserve(check);
+    } catch {
+      /* doc may be destroyed */
+    }
+    fn();
+  };
+  roomMap.observe(check);
+  void sync.whenLinkedSynced.then(check);
 }
 
 /** Ease the transit curtain to fully opaque (true) or clear (false).
@@ -3993,6 +4034,8 @@ function resolveOwnerLabel(owner: string): string {
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
  *    · the deed hand-over          · the sole-croupier election
  *    · the room ACCESS MODE        · co-host accept/deny/revoke
+ *    · 🔧 #192 taking a module apart (a Disassemble job's pick and its end:
+ *      a module off the station can't be put back) — setRoomDeedCheck
  *
  *  The reason for the split: `isVentureShareholder` reads the current room's
  *  own venture map entry, which is peer-written, shape-checked only, and tied
@@ -4247,9 +4290,29 @@ function harvestStationAtlas(): void {
   // not known (null) while a port is unnumbered, or when a flood cut the
   // port scan short: a list missing a port would drop its gate.
   const gates = readDockGatesIfComplete();
+  // 🗺️ #192: the module's owner, for the holotable's station atlas — with
+  // the name they go by here and their identity key (which still names them
+  // back on a fresh player id, as the deed check reads it) when their
+  // players entry has synced.
+  // The legacy marker names no verifiable owner: it is not carried, nor
+  // ever looked up in the players map (#141).
+  // roomInfo is peer-written: anything but a string names no owner.
+  const ownerValue: unknown = sync.doc.getMap("roomInfo").get("owner");
+  const rawOwner = typeof ownerValue === "string" ? ownerValue : "";
+  const ownerId = legacyOwnerMarker(rawOwner) ? "" : rawOwner;
+  const ownerEntry = ownerId
+    ? (sync.doc.getMap("players").get(ownerId) as Partial<PlayerEntry> | undefined)
+    : undefined;
+  const ownerName = typeof ownerEntry?.name === "string" && ownerEntry.name ? ownerEntry.name : undefined;
+  const ownerKey = typeof ownerEntry?.keyB64 === "string" && ownerEntry.keyB64 ? ownerEntry.keyB64 : undefined;
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
     ...(gates ?? { gates: null }),
+    // null: this synced room has no verifiable owner (clears a stale one),
+    // and neither has one whose id the atlas can't carry (cleanAtlasOwner
+    // refuses it): left out, the owner would read as unread, keeping a
+    // former owner for the card and for taking the module apart.
+    owner: ownerId ? cleanAtlasOwner({ id: ownerId, name: ownerName, key: ownerKey }) ?? null : null,
   });
   // Before the push below, whose write publishes the planet summary again.
   gatesReadIn = roomId;
@@ -9602,6 +9665,14 @@ async function init() {
     if (!yjsSync) return true;
     const owner = yjsSync.doc.getMap("roomInfo").get("owner");
     if (owner === "Local-Clone") return false;
+    return currentRoomDeedIsMine();
+  });
+
+  // 🔧 #192: the same one deed holder takes a module apart (its Disassemble
+  // job's pick and its end), since a module off the station can't be put back.
+  setRoomDeedCheck(() => {
+    if (roomLeavesUnderWay > 0) return false; // leaving: see the edit gate above
+    if (!yjsSync) return true;
     return currentRoomDeedIsMine();
   });
 
