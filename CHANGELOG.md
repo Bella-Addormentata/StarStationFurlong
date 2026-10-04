@@ -13,6 +13,52 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
 
 - **CHANGELOG backfill owed:** v0.33.0 (fox character update, parallel effort) through v0.33.5 (#79 P4 resume-at-last-location) shipped as tagged releases without prose entries here — recoverable from the git tags + merge commits if a curated backfill is wanted.
 
+## v0.38.0 — 2026-09-27
+
+- **🏒 A two-player air hockey table, free to play ([#116](https://github.com/Bella-Addormentata/StarStationFurlong/pull/116), part of [#115](https://github.com/Bella-Addormentata/StarStationFurlong/issues/115)).** A new 2×3 game table with a stand at each end, spawnable from the DEV menu's FURNITURE list (🏒 AIR HOCKEY TABLE). Walk up to an end and the camera locks into a first-person view over your goal. Pointer lock steers your mallet: hold the mouse button to press it onto the table, and let go to lift it (a lifted mallet passes over the puck). First to 7 wins. A pole-mounted scoreboard, readable from both ends, and goal lamps follow the match. Serves run on a countdown, **PRACTICE** plays solo against both goals, and an opponent silent for 10 s forfeits. Esc or WASD steps back.
+  - **Over the network.** Mallet and puck positions ride the 13-byte tick datagram as two new lane kinds (mallet at 30 Hz, puck at 20 Hz), with u16 serials and echo drops; movement ticks are unchanged. Score and match state sync through the shared `games` map with the same shape-guarded writes as chess and checkers. One client runs the puck's physics, and everyone else smooths.
+  - **One page plays each end.** A player id is shared by every tab and device of that player, so the table records which page plays each claimed end. Another page of the same player shows **PLAY HERE**, which moves the end to it.
+  - **Stalls and clocks.** When the page running the puck stalls (a hidden tab gets no frames), the other end's page takes the puck over. When the stalled page's frames resume, it adopts that puck, with its mallet at rest, rather than carry on from before the stall. Serves fall due on each page's own clock, at most 1.6 s after it first sees one scheduled, so a peer's clock can't hold a serve.
+  - **Recovery.** **RESET TABLE** lets the players and the room owner clear the table before a match ends, freeing an end whose player left. The focused panel reads and writes only the room it opened in. Opponent names are cut to 24 characters and escaped in the HUD. An air-hockey record under a classic game table's key shows an **UNRECOGNISED TABLE STATE** strip anyone may reset, rather than wedging that table.
+  - **Free to play.** The owner-set entry fee was taken out before merge. Its escrow rewrote whole-value balances from several clients at once: the race the slot machines and the coin pusher closed with one operator per room. It returns, optional for the owner, on a shared casino operator.
+
+  **Testing, stated honestly:**
+  - `tsc` clean, build clean, and 951 tests on main after the merge, 62 of them air hockey's: 34 engine, 15 session, 11 XSS and 2 table tests.
+  - Driven headlessly in Chromium against the real build: spawn, focus, claim, serve, goal, forfeit, reset, leave and removal.
+  - Not tested: pointer-lock feel with a real mouse, and a live match between two browsers over the node. Both are on TODO as the hands-on acceptance pass.
+  - The last fix (`d9a6602`: a goal and a walkover in the same frame) merged before Copilot re-reviewed it.
+
+  **Deferred, documented:**
+  - The physics runs as floats on wall-clock time, on one client, so a result can't be replayed. Before anything rides on a match, the sim must be made deterministic, or both players must co-sign the score.
+  - Mallet and puck ticks are unauthenticated, so any peer can strike the puck from either half. Per-tick authorship (M5.5) closes this.
+  - PLAY HERE rewrites the table's state, so it can race a goal written at the same moment.
+  - An end left by a room swap stays claimed until RESET TABLE or the opponent's forfeit clock clears it.
+
+- **🎰 One slot operator per room, so a player's balance has one slot writer ([#167](https://github.com/Bella-Addormentata/StarStationFurlong/pull/167)).** Slot machines took an operator lease per machine, so two sessions of the room's deed holder (two tabs, or two devices) could each operate a different machine. Every settle rewrites the player's whole `bal:`, so one player spinning both machines at once could lose a debit or a payout in the merge. The room now has one slot operator (`slot-operator`, `slotCroupier.ts`), as the coin pusher does. The deed holder's session operates every machine whose bankroll its player owns. In a venture room, a room owner still starts machines by hand (**RUN MANUAL CROUPIER**), which is refused while another session operates the room's slots.
+  - **The lease** keeps the coin pusher's rules: a 2 s settling wait after each take, and a renewal every 3 s. Another device's lease is judged by the renewals seen: it lapses 8 s after the last one, and is taken over only after a further 60 s split window. Tabs on one device take over as soon as it lapses.
+  - **Each take is its own term.** An accept, settle or refund paused at an `await` writes nothing once its take has ended, even when the same page has taken the lease again. The round stays on its machine for the next operator.
+  - **One transaction per step.** A round's stake and its spin go out together, and so does every terminal write: a settle or refund with the machine's settled state and the reveal's removal. A spin left with no stake locked (an earlier build can still leave one) is ended without moving chips.
+  - **Removed machines.** One holding chips (a round's stake, or its own bankroll) is paid out only by the room's operator, past its settling wait: the refund, the bankroll's return to its owner and the key removal go out in one transaction. One holding none is cleared at once. One whose chips can't all be accounted for (a stake with no round to refund it by, or a bankroll whose owner can't be credited) keeps its keys, chips included.
+  - **Earlier builds** took a lease per machine. While one of those is being renewed, this build operates nothing in the room. It never writes one, and a session that could operate deletes them once they lapse.
+  - **Leaving a room** hands back the slot lease along with the coin pusher's, before the room's doc goes.
+
+  **Testing, stated honestly:**
+  - `tsc` clean, build clean, and 889 tests at merge, 84 of them new in `slotCroupier.test.ts`, against a real Yjs casino map.
+  - Thirteen Copilot review rounds. Every finding was fixed except the split limit below, which is documented. 137 mutations of the guards each fail a test; four more survive, all harmless.
+  - In Chromium against a local node, with the deed holder on two devices and one player spinning two machines in the same instant: on the previous code each device operated one machine, two writers of the balance. With this change one session operated both, and 6 of 6 trials left both devices' balances exact.
+  - A removed machine holding chips was paid out after the operator's settling wait, and nothing moved while another session held the lease.
+  - The last round's fixes (`3dd170e`) merged before Copilot re-reviewed them.
+
+  **Deferred, documented:**
+  - The coin pusher still elects its own operator, so a slot settle and a pusher settle for the same player at the same instant can still lose one write. One casino operator for both is on TODO.
+  - Machines funded by different players (another shareholder, or another install of the deed holder) no longer run side by side: only the lease holder's run.
+  - A split between two of the deed holder's devices, longer than the window or begun before either saw the other's lease, can still put two operators in one room. Closing that needs an authoritative ledger.
+  - After a crash, another device waits the lapse plus the split window (68 s) before it operates.
+  - A removed machine's chips need an operator present to pay them out. If every session that may manage the room leaves first, they stay in its records.
+  - A peer that keeps writing earlier-build lease records keeps the room's slots closed: past 64 of them, this build fails closed rather than risk two writers.
+
+- **🔒 vitest 4.1.11: Dependabot's two moderate alerts closed ([GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9)).** A path traversal in `@vitest/mocker` let a client that could reach a vitest dev server read files the server process can read; 3.x gets no fix. Nothing here was exposed: `npm test` and CI run `vitest run`, which opens no listening socket, and no build ships vitest. 4.1.11 keeps vite 6 and CI's Node 20, and all 951 tests pass on it unchanged.
+
 ## v0.37.0 — 2026-09-27
 
 - **🎂 The beach birthday party room ([#169](https://github.com/Bella-Addormentata/StarStationFurlong/pull/169)).** A room built to be given away: the **Beach Birthday Party** set (`party-2`) fits itself to whatever room it is added to — white sand, a flat sea in the front corner with a raft, a tiki bar in the far corner, loungers under parasols, a hedge along the back walls, and the party on top: a four-tier floral **cake** under a lettered **banner**, **gift boxes** that each carry a wish on their tag, a lit **dance floor**, a **speaker**, and the dancer's **charging dock**. New kinds: the narrow, winding **infinity pool** (a room feature: terraced water on the room's front edge, the floor cut to its staircase outline) and the wall-hung **climbing rose** (**ROSE WALLS** in the dev menu hangs them shoulder to shoulder along the two most open walls).
@@ -24,6 +70,30 @@ frozen under their original version prefix (e.g. the pre-0.5.0 game is preserved
   **Fixes found on the way.** The device approach wedge (a device's front inside a neighbour's inflated box left the fox 0.2 m short forever); edit-mode picking through a doorway's invisible click box; sRGB vertex colours (lit water no longer washes to pastel); the legacy hull keeping the sand floor; gift wishes written before the tag became its own record are read again and carried over before a box is opened.
 
   **Testing, stated honestly:** `tsc` clean, 560 tests (the party suites: `infinityPool`, `partyAudio` + its voice state machine on a fake clock, `partyDoc`, `roomTemplates` fitting). Twenty-five Copilot review rounds; every finding fixed and pinned by a test. Driven headlessly in a private test module: canvas clicks open the speaker and cake panels, the recording plays on entry and switches tracks, the robot walks to the floor and dances, the gift flow (write → sealed for others → read on open) works with the app's own module instances. The room was then furnished and gifted live: eight wishes on eight boxes, the deed handed over by transfer offer.
+
+- **🪙 An arcade coin pusher: time a chip drop against the sweep, and win what falls off the front ([#137](https://github.com/Bella-Addormentata/StarStationFurlong/pull/137), fixes [#135](https://github.com/Bella-Addormentata/StarStationFurlong/issues/135)).** A new casino cabinet, spawnable from the DEV menu's FURNITURE list (🪙 COIN PUSHER).
+  - A player picks one of three drop holes and times the drop against the sweeping pusher. The chip falls through a peg field onto the upper platform, the pusher shoves the piles forward, and chips cascade onto the lower platform.
+  - Only chips that fall off the front of the last platform are paid, to that drop's player. Everything else stays in the machine until its owner opens the door and takes the chips inside back to their rack.
+  - The engine (`games/coinPusher.ts`) is pure: a peer with a drop's seed reproduces its path. The sweep is a free-running clock that every client draws from its own wall clock, and a drop keeps the phase the player saw.
+
+  **One operator for the room.** Every chip moves through one session of the room's deed holder (`pusher-operator`, `pusherCroupier.ts`). A player's `bal:` is a whole value, so two sessions settling at once would each rewrite it and the merge would keep only one write.
+  - **The lease.** The operator waits 2 s after taking the lease and renews it every 3 s. Another device's lease is judged by the renewals seen, never by the expiry it claims: it lapses 8 s after the last renewal and is taken over only after a further 60 s split window. Tabs on one device take over at once.
+  - **Drops.** DROP waits until the operator is past its settling wait. A settle moves the machine, the balance and the player's answer in one transaction. A request is refused, with nothing moved, when it is stale, the player has no chip, the machine is full, or the payout couldn't be credited.
+  - **Leaving a room** hands the lease back before the room's doc goes. The edit and croupier gates stay shut while the old room can still send (`roomLeavesUnderWay`, `main.ts`).
+  - **Removal.** Only the operator, past its settling wait, drains a removed cabinet, so a previous holder's last settle can never pay the same chips twice. Its per-player keys are swept a batch a frame.
+
+  **Testing, stated honestly:**
+  - `tsc` clean and 764 tests at merge: 80 engine, 47 `casinoDoc`, 67 `pusherCroupier`, 2 fallback and 5 cabinet tests. They include two-doc Yjs merges: a settle against the player's cancel, against a removal, and against a previous holder's last settle.
+  - Twenty-eight Copilot review rounds.
+  - In Chromium against a local node:
+    - 45 drops left the balance exact;
+    - late and forged requests fell where the pusher was or were refused;
+    - the door returned the chips inside;
+    - with the deed holder on two devices, one session operated both cabinets, and 6 of 6 same-instant trials kept both debits.
+
+  **Deferred, documented:**
+  - A split between two of the deed holder's devices, longer than the window or begun before either saw the other's lease, can still put two operators in one room. Closing that needs an authoritative ledger.
+  - Any room peer can write casino keys, so a request can be forged in another player's name. Per-key write rules are a new TODO.
 
 - **🧬 A 2×2 clone vat the clone squeezes out of: drained before the door opens, sealed before it refills, and a pale clone that regains its colour ([#166](https://github.com/Bella-Addormentata/StarStationFurlong/pull/166), fixes [#165](https://github.com/Bella-Addormentata/StarStationFurlong/issues/165)).** The vat is now a 2×2 tank centred on the NW corner's 2×2 square at (−5, −5): a 0.8 m glass radius, 2.7 m of glass, and a 140° door with a fixed transom above it. The corner cherry tree moves to the west wall. The fox is far bigger than any tank, so during the ceremony it is scaled every frame to an hourglass-shaped hard limit (`vatGauge.ts`), fitted to the rig's measured silhouette. The limit runs from the round tank, through the doorway between the door rails and under the transom, to a cone opening into the room. The tank drains and is held visibly empty before the door spins. The door shuts once the clone's tail is clear, and only then does the tank refill. A fresh clone decants almost-white grey and regains its own colours over 30 s.
 

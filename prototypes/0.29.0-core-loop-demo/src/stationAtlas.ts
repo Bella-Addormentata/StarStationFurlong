@@ -34,6 +34,7 @@ import type { ConnectorSegment } from './adapter';
 import { ROOM_TILE_MIN, ROOM_TILE_MAX } from './floorPlanDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { normalizeWall } from './doorLayoutDoc';
+import { isAcceptableDoorKey } from './doorsDoc';
 import { isDockChain, projectionPoseForDoor, projectionPoseFromWall } from './adapter';
 import { halfAlongWall } from './doorMatch';
 
@@ -84,11 +85,17 @@ export interface AtlasEntry {
   /** ⚓🚦 The room's DOCK PORTS with their gate numbers, by door id — free
    *  or docked (a free port has no door record, so `doors` cannot say). Layout,
    *  not admission: public like the rest (credential rule above). Absent when
-   *  unknown (an older client's gossip, or a room never harvested). */
+   *  unknown (an older client's gossip, a room never harvested, or one with
+   *  a port not numbered yet: gatesUnknown). */
   gates?: Record<string, number>;
   /** ⚓🚦 Who may dock at each gate, by door id — only gates not open to all
    *  (closed, pass holders, or reserved for one ship's room). */
   gateAccess?: Record<string, AtlasGateAccess>;
+  /** ⚓🚦 The room has a dock port with no gate number yet (fitted before
+   *  gates), so its gates are not known: `gates` is absent, and neither an
+   *  older copy's list nor a peer's silence brings one back. Cleared by the
+   *  next harvest or newer copy that lists them. */
+  gatesUnknown?: true;
   /** GOSSIP freshness — derived from peers (`SharedAtlasEntry.updatedAt`).
    *  Use it to arbitrate MERGES and nothing else. It is peer-settable, so any
    *  ranking that decides what the player KEEPS or SEES must not read it:
@@ -161,10 +168,13 @@ export function roomIdFromSeed(seed: string): string {
 export function readAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return {};
+    if (!raw) return Object.create(null);
     const obj = JSON.parse(raw);
-    if (typeof obj !== 'object' || obj === null) return {};
-    const atlas = obj as Record<string, AtlasEntry>;
+    if (typeof obj !== 'object' || obj === null) return Object.create(null);
+    // No prototype: a room id such as `__proto__` or `constructor` is an own
+    // key like any other, never an inherited value, and writing one never
+    // sets the map's prototype (writeAtlas defines each key outright).
+    const atlas: Record<string, AtlasEntry> = Object.assign(Object.create(null), obj);
     // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
     // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
     // — and it does not just sit there: pushAtlasToDoc republishes it as
@@ -198,7 +208,7 @@ export function readAtlas(): Record<string, AtlasEntry> {
     }
     if (repaired) writeAtlas(atlas);
     return atlas;
-  } catch { return {}; }
+  } catch { return Object.create(null); }
 }
 
 /**
@@ -271,7 +281,11 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     // visited/gossip distinction for old entries rather than mis-ranking them.
     const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
-    for (const e of entries) out[e.roomId] = e;
+    // Defined, not assigned: assigning a room id `__proto__` would set the
+    // object's prototype, and the room would be left out of the store.
+    for (const e of entries) {
+      Object.defineProperty(out, e.roomId, { value: e, enumerable: true, writable: true, configurable: true });
+    }
     localStorage.setItem(KEY, JSON.stringify(out));
   } catch { /* privacy mode — the atlas degrades to the current room */ }
 }
@@ -287,8 +301,11 @@ export function harvestIntoAtlas(entry: {
     farDoor?: string; farWall?: DoorWall; farLateral?: number; farYawDeg?: 0 | 45;
     wall?: DoorWall; lateral?: number; transient?: boolean;
   }>;
-  /** ⚓🚦 The room's dock ports by door id → gate number (doorPolicy). */
-  gates?: Record<string, number>;
+  /** ⚓🚦 The room's dock ports by door id → gate number (doorPolicy).
+   *  Null when a port here has no number yet: the room's gates are not
+   *  known, and its older list is dropped rather than kept, since that list
+   *  would hide the unnumbered port. Absent says nothing: what we knew stands. */
+  gates?: Record<string, number> | null;
   /** ⚓🚦 Non-open gate access by door id (doorPolicy readGateAccess). */
   gateAccess?: Record<string, AtlasGateAccess>;
 }): void {
@@ -317,16 +334,18 @@ export function harvestIntoAtlas(entry: {
     };
   }
   const entryGates = entry.gates ? cleanGates(entry.gates) : undefined;
+  const gatesUnknown = entry.gates === null || (entry.gates === undefined && prior?.gatesUnknown === true);
   atlas[entry.roomId] = {
     roomId: entry.roomId,
     name: entry.name || prior?.name || 'Module',
     seed: entry.seed ?? prior?.seed,
     dims: entry.dims ?? prior?.dims,
     doors,
-    ...(entryGates ? { gates: entryGates } : prior?.gates ? { gates: prior.gates } : {}),
+    ...(entryGates ? { gates: entryGates } : !gatesUnknown && prior?.gates ? { gates: prior.gates } : {}),
     ...(entryGates
       ? (entry.gateAccess ? { gateAccess: cleanGateAccess(entry.gateAccess, entryGates) } : {})
-      : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
+      : !gatesUnknown && prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
+    ...(gatesUnknown ? { gatesUnknown: true as const } : {}),
     lastSeen: Date.now(),
     // We are standing in it — the strongest possible local recency signal.
     localSeenAt: Date.now(),
@@ -468,29 +487,35 @@ export function seedAtlasDefaults(bundle: BundledAtlasEntry[]): number {
 /** The same ceiling doorPolicy.MAX_GATE holds (not imported: doorPolicy
  *  reads the layout doc, and this module stays free of doc bindings). */
 const MAX_GATE_NUMBER = 99;
-/** Door ids are short keys (doorsDoc.isAcceptableDoorKey allows 64). */
-const MAX_GATE_DOOR_ID = 64;
 
 function isPlainGates(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
     && !ownKeysExceed(v, MAX_RAW_DOORS_PER_ENTRY);
 }
 
-/** Only door id → integer gate pairs, at most MAX_GATE_NUMBER of them. Every
- *  distinct number is taken first, so ports sharing a number (two stations
- *  joined, a peer's junk) can never push another gate out; a duplicate
- *  fills only room that is left. */
+/** Only door id → integer gate pairs, at most MAX_GATE_NUMBER of them. Only
+ *  ids a door can have (doorsDoc.isAcceptableDoorKey) count, so junk keys
+ *  cannot use up the numbers ahead of a real gate. Every distinct number is
+ *  taken first, so ports sharing a number (two stations joined, a peer's
+ *  junk) can never push another gate out; a duplicate fills only room that
+ *  is left. Pairs are taken in gate, then door order, so the same pairs in
+ *  any order keep the same ports. */
 function cleanGates(v: Record<string, unknown>): Record<string, number> {
+  const pairs: Array<[string, number]> = [];
+  for (const [doorId, gate] of Object.entries(v)) {
+    if (!isAcceptableDoorKey(doorId)) continue;
+    if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
+    pairs.push([doorId, gate]);
+  }
+  pairs.sort((x, y) => x[1] - y[1] || (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
   const out: Record<string, number> = {};
   const numbers = new Set<number>();
   const repeats: Array<[string, number]> = [];
   let kept = 0;
-  for (const [doorId, gate] of Object.entries(v)) {
+  for (const [doorId, gate] of pairs) {
     if (kept >= MAX_GATE_NUMBER) break;
-    if (!doorId || doorId.length > MAX_GATE_DOOR_ID || doorId === '__proto__') continue;
-    if (typeof gate !== 'number' || !Number.isInteger(gate) || gate < 1 || gate > MAX_GATE_NUMBER) continue;
     if (numbers.has(gate)) {
-      if (repeats.length < MAX_GATE_NUMBER) repeats.push([doorId, gate]);
+      repeats.push([doorId, gate]);
       continue;
     }
     numbers.add(gate);
@@ -515,23 +540,35 @@ export interface AtlasGateAccess {
 
 /** Door id → access pairs a peer may send, cleaned and capped (one per gate
  *  number). Only doors of the cleaned `gates` count, so entries for other
- *  doors cannot crowd out a real gate's policy. */
+ *  doors cannot crowd out a real gate's policy. A gate's access that cannot
+ *  be read closes it (as doorPolicy reads a port's): only an explicit 'open'
+ *  leaves it open. */
 function cleanGateAccess(v: Record<string, unknown>, gates: Record<string, number>): Record<string, AtlasGateAccess> {
   const out: Record<string, AtlasGateAccess> = {};
   let kept = 0;
   for (const [doorId, raw] of Object.entries(v)) {
     if (kept >= MAX_GATE_NUMBER) break;
     if (!Object.prototype.hasOwnProperty.call(gates, doorId)) continue;
-    if (typeof raw !== 'object' || raw === null) continue;
-    const r = raw as { access?: unknown; reservedFor?: unknown };
-    if (r.access === 'pass' || r.access === 'closed') out[doorId] = { access: r.access };
+    const r = (typeof raw === 'object' && raw !== null ? raw : {}) as { access?: unknown; reservedFor?: unknown };
+    if (r.access === 'open') continue;
+    if (r.access === 'pass') out[doorId] = { access: 'pass' };
     else if (r.access === 'reserved' && typeof r.reservedFor === 'string'
       && r.reservedFor.length > 0 && r.reservedFor.length <= 128) {
       out[doorId] = { access: 'reserved', reservedFor: r.reservedFor };
-    } else continue;
+    } else out[doorId] = { access: 'closed' };
     kept++;
   }
   return out;
+}
+
+/** ⚓🚦 Whether a doc copy of a room stamped `updatedAt` decides its gates
+ *  over our entry `prior` (pullSharedAtlas, withSharedAtlasOf): when ours is
+ *  missing, bundled, older, or never heard of gates. A copy no newer than ours
+ *  replaces nothing we know of them, our word that they are not known
+ *  included. */
+function docDecidesGates(prior: AtlasEntry | undefined, updatedAt: number): boolean {
+  return !prior || prior.bundled === true || updatedAt > prior.lastSeen
+    || (prior.gates === undefined && !prior.gatesUnknown);
 }
 
 /** One gate of a station: a dock port, its room and its number. */
@@ -634,8 +671,8 @@ export function steppedGateNumberHere(
  * doc crowded with other stations' entries cannot push this one's out of
  * reach. A room the local atlas lacks comes from the doc; a known room gains
  * any door pairing it lacks (a newer doc copy's pairings replace ours door by
- * door), and the doc's gates when it has none or the doc's copy is newer (as
- * pullSharedAtlas arbitrates), so the station walk
+ * door), and the doc's gates or its word that they are not known, as
+ * pullSharedAtlas arbitrates them (docDecidesGates), so the station walk
  * and the numbers taken both see what the far station has published. Peer
  * entries are shape-checked and capped as pullSharedAtlas does. Pure:
  * nothing is written.
@@ -645,7 +682,9 @@ export function withSharedAtlasOf(
   atlas: Record<string, AtlasEntry>,
   roomId: string,
 ): Record<string, AtlasEntry> {
-  const out: Record<string, AtlasEntry> = { ...atlas };
+  // No prototype: a room id off the wire such as `constructor` or `__proto__`
+  // is a room like any other, never an inherited value read as its entry.
+  const out: Record<string, AtlasEntry> = Object.assign(Object.create(null), atlas);
   const shared = doc.getMap('atlas');
   const queued = new Set<string>([roomId]);
   const queue: string[] = [roomId];
@@ -675,7 +714,7 @@ export function withSharedAtlasOf(
           roomId: rid,
           name: value.name || 'Module',
           doors,
-          ...(gates ? { gates } : {}),
+          ...(gates ? { gates } : value.gatesUnknown === true ? { gatesUnknown: true as const } : {}),
           lastSeen: value.updatedAt,
         };
       } else {
@@ -694,7 +733,17 @@ export function withSharedAtlasOf(
           ...prior,
           doors: newer ? (whole ? withSeeds : { ...prior.doors, ...withSeeds }) : { ...doors, ...prior.doors },
         };
-        if (gates && (prior.gates === undefined || newer)) merged.gates = gates;
+        // Gates as pullSharedAtlas takes them: the doc's list, or its word
+        // that they are not known, when the doc's copy decides them.
+        if ((gates || value.gatesUnknown === true) && docDecidesGates(prior, value.updatedAt)) {
+          delete merged.gates;
+          delete merged.gateAccess;
+          delete merged.gatesUnknown;
+          if (gates) {
+            merged.gates = gates;
+            if (value.gateAccess !== undefined) merged.gateAccess = cleanGateAccess(value.gateAccess, gates);
+          } else merged.gatesUnknown = true;
+        }
         out[rid] = merged;
       }
     }
@@ -834,6 +883,13 @@ function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<stri
   return adjacent;
 }
 
+/** Does the atlas hold an entry of its own for this room? A door can name a
+ *  room `constructor` or `__proto__`, and what such a name inherits is no
+ *  entry. */
+function hasEntry(atlas: Record<string, AtlasEntry>, roomId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(atlas, roomId) && !!atlas[roomId];
+}
+
 /** The cap counts rooms the atlas holds an entry for; unknown door targets
  *  are still walked (they are bounded by the per-entry door cap), so a room
  *  listing many unknown neighbours cannot crowd a real one out of its
@@ -844,13 +900,13 @@ function walkComponent(
   start: string,
 ): Set<string> {
   const component = new Set<string>([start]);
-  let known = atlas[start] ? 1 : 0;
+  let known = hasEntry(atlas, start) ? 1 : 0;
   const queue = [start];
   while (queue.length > 0) {
     const rid = queue.shift()!;
     for (const next of adjacent.get(rid) ?? []) {
       if (component.has(next)) continue;
-      if (atlas[next]) {
+      if (hasEntry(atlas, next)) {
         if (known >= MAX_ENTRIES) continue;
         known++;
       }
@@ -865,7 +921,7 @@ function walkComponent(
  *  known rooms.
  *  Empty when the atlas holds no entry for the room. */
 export function atlasComponent(atlas: Record<string, AtlasEntry>, roomId: string): Set<string> {
-  if (!roomId || !atlas[roomId]) return new Set();
+  if (!roomId || !hasEntry(atlas, roomId)) return new Set();
   return walkComponent(atlas, atlasAdjacency(atlas), roomId);
 }
 
@@ -1085,6 +1141,10 @@ interface SharedAtlasEntry {
   /** ⚓🚦 Non-open gate access (AtlasEntry.gateAccess). Public: a captain
    *  must know which gates admit them. */
   gateAccess?: Record<string, AtlasGateAccess>;
+  /** ⚓🚦 Sent without `gates` when the room's gates are not known
+   *  (AtlasEntry.gatesUnknown): a newer copy saying so drops ours. Anything
+   *  but true is silence. */
+  gatesUnknown?: true;
   /** The dial-in credential. Rides only while a door that ACTUALLY EXISTS is
    *  set to public passage — this is the access restriction, and it is
    *  deliberately NOT the same question as "may you see this module". */
@@ -1199,7 +1259,9 @@ function pullSharedAtlas(): void {
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
-    const prior = atlas[rid];
+    // Our own entry only: what a room named `constructor` or `__proto__`
+    // inherits has no doors, and reading it as a prior entry threw.
+    const prior = hasEntry(atlas, rid) ? atlas[rid] : undefined;
     // Compared against what the value NORMALIZES to — the count of VALID
     // records, capped — never its raw key count: a stored 64 against a raw
     // 100, or a stored 1 against 100 malformed keys plus one valid, would
@@ -1222,8 +1284,9 @@ function pullSharedAtlas(): void {
       && Object.keys(prior.doors).length >= incoming) {
       // ⚓🚦 Our copy stands, but one harvested by an older build carries no
       // gates: take the doc's, and the access that rides with them, on their
-      // own, so gate numbering sees them.
-      if (prior.gates === undefined && value.gates !== undefined && isPlainGates(value.gates)) {
+      // own, so gate numbering sees them. Not when ours says the room's gates
+      // are not known: the doc's older list is what that drops.
+      if (prior.gates === undefined && !prior.gatesUnknown && value.gates !== undefined && isPlainGates(value.gates)) {
         prior.gates = cleanGates(value.gates);
         if (value.gateAccess !== undefined && isPlainGates(value.gateAccess)) {
           prior.gateAccess = cleanGateAccess(value.gateAccess, prior.gates);
@@ -1282,24 +1345,31 @@ function pullSharedAtlas(): void {
     // a size learned by actually visiting a room was wiped the moment any peer
     // gossiped an entry for it. Prefer the incoming value, fall back to what we
     // already knew, and never regress to undefined.
+    // ⚓🚦 Gates are peer-written: cleaned and capped. They follow recency, not
+    // the door count that may have let an older copy in here: a copy no newer
+    // than ours replaces nothing we know of them, our word that they are not
+    // known included. Silence (an older client) keeps what we knew, like dims;
+    // a newer copy saying they are not known drops our list.
+    const docGates = docDecidesGates(prior, value.updatedAt);
+    const listed = docGates && value.gates !== undefined && isPlainGates(value.gates)
+      ? cleanGates(value.gates)
+      : undefined;
+    const gatesUnknown = !listed && ((docGates && value.gatesUnknown === true) || prior?.gatesUnknown === true);
     atlas[rid] = {
       roomId: rid,
       name: value.name || prior?.name || 'Module',
       seed: value.seed ?? prior?.seed,
       dims: value.dims ?? prior?.dims,
       doors,
-      // ⚓🚦 Peer-written: cleaned and capped. Silence (an older client) keeps
-      // what we knew, like dims.
-      ...(value.gates !== undefined && isPlainGates(value.gates)
-        ? { gates: cleanGates(value.gates) }
-        : prior?.gates ? { gates: prior.gates } : {}),
+      ...(listed ? { gates: listed } : !gatesUnknown && prior?.gates ? { gates: prior.gates } : {}),
       // Access rides with the gates it belongs to: a publisher that sent
       // gates sent every non-open access, so absent here means all open.
-      ...(value.gates !== undefined && isPlainGates(value.gates)
+      ...(listed
         ? (value.gateAccess !== undefined && isPlainGates(value.gateAccess)
-          ? { gateAccess: cleanGateAccess(value.gateAccess, cleanGates(value.gates)) }
+          ? { gateAccess: cleanGateAccess(value.gateAccess, listed) }
           : {})
-        : prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
+        : !gatesUnknown && prior?.gateAccess ? { gateAccess: prior.gateAccess } : {}),
+      ...(gatesUnknown ? { gatesUnknown: true as const } : {}),
       lastSeen: Math.max(value.updatedAt, prior?.lastSeen ?? 0),
       // Gossip is SECOND-hand and must never mint local recency: stamping it
       // here would let one peer's station sweep outrank every room the player
@@ -1343,7 +1413,7 @@ export function pushAtlasToDoc(): void {
       const doorIds = Object.keys(entry.doors) as DoorId[];
       // Stubs add no geometry; ⚓🚦 one that knows a room's gates still has
       // something to carry.
-      if (!isOwn && doorIds.length === 0 && entry.gates === undefined) continue;
+      if (!isOwn && doorIds.length === 0 && entry.gates === undefined && !entry.gatesUnknown) continue;
       // 🛰️ Never publish what this install never observed: an entry the
       // build's bundled default station wrote (seedAtlasDefaults) would reach
       // every room we join as if we had seen it. The room we are standing in
@@ -1358,6 +1428,7 @@ export function pushAtlasToDoc(): void {
       // gates we know even when it is otherwise as new as ours: its own doors
       // are kept, and only the gates are added.
       const onlyGates = !!known && !isOwn && entry.gates !== undefined && known.gates === undefined
+        && known.gatesUnknown !== true
         && known.updatedAt >= entry.lastSeen
         && Object.keys(known.doors).length >= doorIds.length;
       if (known && !isOwn && !onlyGates
@@ -1408,7 +1479,7 @@ export function pushAtlasToDoc(): void {
         ...(!onlyGates && entry.dims ? { dims: entry.dims } : {}),
         // ⚓🚦 Gates travel with the layout, so a board or an arriving ship in
         // any room of the station knows every gate.
-        ...(entry.gates ? { gates: entry.gates } : {}),
+        ...(entry.gates ? { gates: entry.gates } : entry.gatesUnknown ? { gatesUnknown: true as const } : {}),
         ...(entry.gates && entry.gateAccess && Object.keys(entry.gateAccess).length > 0
           ? { gateAccess: entry.gateAccess }
           : {}),
