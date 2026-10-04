@@ -172,6 +172,21 @@ describe('the remote as possession', () => {
     expect(claimRemote(TV)).toBe(false); // claimed already
     expect(iHoldRemote(TV)).toBe(false);
   });
+
+  it('a hand-over the receiver\'s page slept through is not claimed on waking: lapsed by its own watch, the remote is free again', () => {
+    pickUpRemote(TV);
+    handRemote(TV, BOB, 'Bob');
+    const handed = readRemote(TV);
+    iAm(BOB, 'Bob');
+    setTvPageId('B1');
+    tick(TV_LEASE_LAPSE_MS); // a closed lid between the hand-over landing and the first tick
+    expect(claimRemote(TV)).toBe(false);
+    expect(readRemote(TV)).toEqual(handed); // nothing written: no lease revived under Bob's name
+    expect(iHoldRemote(TV)).toBe(false);
+    expect(remoteStatus(TV)).toBe('free'); // Bob picks it up again, like anyone — unless someone else did first
+    expect(pickUpRemote(TV)).toEqual({ ok: true });
+    expect(iHoldRemote(TV)).toBe(true);
+  });
 });
 
 describe('the programme', () => {

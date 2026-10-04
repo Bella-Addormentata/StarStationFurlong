@@ -117,12 +117,12 @@ import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDo
 // 📺 #186: the smart TV — its records, the phone remote, the theatre, the
 // room-level duties (lease renewals, the hand-back on leave).
 import { bindTvDoc, iHoldRemote, readRemote, setTvHostPredicate, setTvIdentity, setTvPageId, subscribeTv } from "./tvDoc";
-import { renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
+import { focusTvApp, renderTvPhoneApp, resolveArchiveFile, selectTvRemote } from "./tvUI";
 import { closeTvTheatre, openTvTheatre, setTvChipOpener, updateTvChip } from "./tvTheatre";
 import { setOwnMediaOrigins } from "./tvConsent";
 import { parseNodeFingerprint } from "./nodeFingerprint";
 import type { LocalFingerprint } from "./nodeFingerprint";
-import { leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
+import { armTvDrive, leaveTvRoom, setTvRoomPlayersProvider, tvRoomPlayers } from "./tvSession";
 import { FURNITURE } from "./furniture";
 import { bindRobotDoc } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
@@ -1467,6 +1467,10 @@ async function joinRoomAtEpoch(
   // the same room.
   setAtlasHarvestArmed(true);
   harvestStationAtlas();
+  // 📺 #186: the TVs are driven again — every doc the drive reads (tv,
+  // furniture) is bound above; leaveRoomNow disarmed it synchronously so no
+  // tick during the leave's flush touched the departed room.
+  armTvDrive(true);
   // 🛑🛰️ #157: the first-person shells are laid out AROUND THE CURRENT ROOM, so
   // they are re-posed the moment that room changes — not only when a door or
   // shared-atlas event happens to follow. On the first join of a launch neither
@@ -6505,6 +6509,10 @@ function setupSpacePhoneOverlay() {
           },
           resolveArchive: resolveArchiveFile,
         });
+        // Land focus in the view (the treasury's rule): Tab is the phone's
+        // toggle, not a tab stop, so the remote's controls are reached by
+        // ↑/↓ from here, and a keyboard-only player can paste and PLAY.
+        focusTvApp(view);
       }
     }
   };
@@ -7026,19 +7034,34 @@ async function fetchLocalFingerprint(): Promise<LocalFingerprint | null> {
  *  change minutes after node startup (echo loop, portmapper mapping), so the
  *  panel re-polls this on an interval — a one-shot startup snapshot would
  *  pin the row (and freshly-minted invite hints) to a stale state. */
+/** How long one fingerprint probe may take, its body included: a service on
+ *  the port that accepts the request and never finishes answering would
+ *  otherwise hold the probe for good — no fall-through to the next port,
+ *  and no later round to withdraw the trust an earlier fingerprint earned. */
+const FINGERPRINT_PROBE_MS = 3_000;
+/** The newest probe: an older one still in flight when a newer one has
+ *  decided must not restore the trust the newer one withdrew. */
+let fingerprintProbeGen = 0;
+
 async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
+  const gen = ++fingerprintProbeGen;
   let fingerprint: LocalFingerprint | null = null;
   let nodeOrigin = "";
   // The node's HTTP origin as this page finds it: 8080, or 8081 when 8080
   // was taken. A port is the node's only when it answers 200 with a
   // fingerprint that meets the node's contract (nodeFingerprint.ts: 32
   // bytes of hex, the same bytes in base64, a port); anything else on it —
-  // no answer, not JSON, `{}`, `{ hex: true }` — is a stranger, tried past
-  // to the next port rather than ending the probe. Nothing here throws.
+  // no answer, not JSON, `{}`, `{ hex: true }`, or an answer that never
+  // completes within the deadline — is a stranger, tried past to the next
+  // port rather than ending the probe. Nothing here throws.
   for (const origin of ["http://127.0.0.1:8080", "http://127.0.0.1:8081"]) {
+    const ctl = new AbortController();
+    const deadline = window.setTimeout(() => ctl.abort(), FINGERPRINT_PROBE_MS);
     try {
-      const res = await fetch(`${origin}/api/fingerprint`);
+      const res = await fetch(`${origin}/api/fingerprint`, { signal: ctl.signal });
       if (!res.ok) continue;
+      // The body read runs under the same signal: a port that answers the
+      // headers and then trickles is cut off at the deadline too.
       const parsed = parseNodeFingerprint(await res.json());
       if (parsed) {
         fingerprint = parsed;
@@ -7046,9 +7069,15 @@ async function refreshLocalFingerprint(): Promise<LocalFingerprint | null> {
         break;
       }
     } catch {
-      // unreachable, or not JSON: the next port
+      // unreachable, timed out, or not JSON: the next port
+    } finally {
+      window.clearTimeout(deadline);
     }
   }
+  // A newer probe decided meanwhile (the panel's interval, a startup retry):
+  // its verdict stands, and this older one changes nothing — least of all
+  // the trust the newer one withdrew.
+  if (gen !== fingerprintProbeGen) return localFingerprint;
   // Media from the node's origin plays in the theatre without asking
   // (tvConsent.ts) — ONLY while the node answers as ours, with a fingerprint
   // that meets its contract, not merely on a loopback port. The trust is

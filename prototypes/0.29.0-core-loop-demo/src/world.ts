@@ -175,7 +175,7 @@ import { listContacts, getContact } from "./contacts";
 // screen view the prop draws.
 import { createSmartTvUI } from "./tvUI";
 import { closeTvTheatre, isTvTheatreOpen, openTvTheatre, updateTvChip } from "./tvTheatre";
-import { forgetTv, tickTvRoom, tvRoomPlayers } from "./tvSession";
+import { forgetTv, tickTvRoom, tvDriveArmed, tvRoomPlayers } from "./tvSession";
 import { tvScreenView } from "./tvDoc";
 import { DoorDockingPortSystem } from "./docking";
 import { VoxelCharacter, OUTLINE_MAT, snapTo8Ways } from "./voxelCharacter";
@@ -3910,12 +3910,20 @@ export class World {
     this.tvTimer += deltaTime;
     if (this.tvTimer >= 0.5) {
       this.tvTimer = 0;
-      // Unconditionally: with the last set gone, an empty list is what takes
-      // the stale WATCH chip down and clears the session's bookkeeping.
-      const tvIds = FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
-      for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
-      tickTvRoom(tvIds);
-      updateTvChip(tvIds);
+      // Nothing while a room is being left (tvSession's drive flag, cleared
+      // synchronously by leaveRoomNow and armed again once the next room's
+      // docs and layout are bound): this loop keeps running through the
+      // leave's awaited flush, with the old furniture and the old TV doc
+      // still here — a tick then would put the departed room's WATCH chip
+      // back up, with its theatre a click away. Otherwise unconditionally:
+      // with the last set gone, an empty list is what takes a stale chip
+      // down and clears the session's bookkeeping.
+      if (tvDriveArmed()) {
+        const tvIds = FURNITURE.filter((i) => i.kind === "smart-tv" || i.kind === "tv-stand").map((i) => i.id);
+        for (const [id, screen] of this.tvScreens) screen.draw(tvScreenView(id));
+        tickTvRoom(tvIds);
+        updateTvChip(tvIds);
+      }
     }
 
     // Float dust motes upward, reset at ceiling

@@ -206,27 +206,47 @@ export class TvSyncController {
     }
 
     // Not playing: whatever transport revision brought us here is followed
-    // by the state itself; a later resume is a new revision to follow.
-    this.appliedJump = this.jump();
+    // by the state itself (a later resume is a new revision to follow) —
+    // except the holder's own transport while paused, which is a target of
+    // its own below.
+    const jump = this.jump();
 
     if (pb.state === 'paused') {
       if (p.isPlaying()) p.pause();
       this.setRate(1);
-      if (hold && this.pendingTarget !== null) {
-        // The holder, with a seek still landing from before the pause: the
-        // paused position is the newer target, re-aimed, or the old seek
-        // would land later and be heartbeated over it on resume.
-        const target = reachable(pb.positionMs, p);
-        if (this.pendingTarget !== target) this.aim(p, target, now);
+      if (hold) {
+        // The holder's transport while paused — ±10 s, or a pause written
+        // over a seek still landing — is aimed and settled like any jump:
+        // the paused position becomes the pending target, so positionMs()
+        // names it until the seek lands and a second +10 s before then adds
+        // up instead of asking for the same 20 s twice; the newest target
+        // always replaces one still landing, with the same bounded wait. A
+        // pause within the band of where the player reads, with nothing
+        // landing, is a pause where it played: nothing to follow.
+        if (jump !== this.appliedJump || this.pendingTarget !== null) {
+          const target = reachable(pb.positionMs, p);
+          const landing = this.pendingTarget !== null;
+          if (this.pendingTarget !== target
+            && (landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS)
+            && (p.canSeek || p.hasClock)) {
+            this.aim(p, target, now);
+          }
+        }
+        this.appliedJump = jump;
         this.settlePending(p, now);
-      } else if (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
-        && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
-        p.seek(pb.positionMs);
-        this.lastSeekAt = now;
+      } else {
+        this.appliedJump = jump;
+        this.pendingTarget = null;
+        if (p.canSeek && Math.abs(p.currentMs() - pb.positionMs) > TV_SEEK_OVER_MS
+          && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
+          p.seek(pb.positionMs);
+          this.lastSeekAt = now;
+        }
       }
       return pb;
     }
 
+    this.appliedJump = jump;
     // Scheduled, home or off: the programme is not running; a target from
     // before is void.
     this.pendingTarget = null;
