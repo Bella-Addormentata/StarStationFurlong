@@ -385,8 +385,10 @@ function reconcileCrews(map: Y.Map<unknown>): void {
  * counts placed docks only), and the same dock put back later comes back
  * unprogrammed, instead of rejoining the crew as if it had worked all the
  * time it was gone. A dock moved, or kept by a write that replaces the
- * layout, never left: it stays on the job. (A removal and a return made
- * while no client of this build was in the room leave the config as it was.)
+ * layout, never left: it stays on the job. A removal no client of this
+ * build saw is caught when one next comes into the room
+ * (releaseOrphanedDocks). (A removal and a return made while no client of
+ * this build was in the room leave the config as it was.)
  */
 function releaseRemovedDocks(map: Y.Map<unknown>, event: Y.YMapEvent<unknown>): void {
   const doc = map.doc;
@@ -401,6 +403,33 @@ function releaseRemovedDocks(map: Y.Map<unknown>, event: Y.YMapEvent<unknown>): 
   });
   if (gone.length === 0) return;
   const now = Date.now();
+  doc.transact(() => {
+    for (const dockId of gone) setConfigIn(map, dockId, null, now);
+  });
+}
+
+/**
+ * 🔧 The room's state has arrived (main.ts calls this once a visit, when it
+ * has): a Disassemble config whose dock is not in the layout lost its dock
+ * while no client of this build was there to see it go, so no removal ever
+ * released it. Its robot leaves the job for good now, uncredited (the crew
+ * never counted it without its dock), so the same dock put back later
+ * starts unprogrammed, as after a removal seen (releaseRemovedDocks),
+ * instead of its old record crediting all the time it was gone.
+ */
+export function releaseOrphanedDocks(now = Date.now()): void {
+  const map = ensureMap();
+  const doc = map.doc;
+  if (!doc) return;
+  const gone: string[] = [];
+  let scanned = 0;
+  for (const [key, value] of map.entries()) {
+    if (++scanned > MAX_ROBOT_MAP_SCAN) break;
+    if (!key.startsWith('cfg:') || !isRobotConfig(value) || value.routine !== 'disassemble') continue;
+    const dockId = key.slice(4);
+    if (placedFurnitureIn(doc, dockId)?.kind !== 'charging-dock') gone.push(dockId);
+  }
+  if (gone.length === 0) return;
   doc.transact(() => {
     for (const dockId of gone) setConfigIn(map, dockId, null, now);
   });

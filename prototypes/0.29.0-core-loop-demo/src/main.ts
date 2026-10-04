@@ -205,7 +205,7 @@ import { bindCasinoDoc, readChips } from "./casinoDoc";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
-import { bindRobotDoc } from "./robotDoc";
+import { bindRobotDoc, releaseOrphanedDocks } from "./robotDoc";
 import { chipDotsHtml } from "./chipDisplay";
 import {
   bindFurnitureDoc,
@@ -1980,6 +1980,9 @@ async function joinRoomAtEpoch(
   void awaitInitialRoomState(SYNC_GATE_MS).then(() => {
     if (epoch !== sessionEpoch || yjsSync !== sync) return;
     harvestStationAtlas();
+    // 🔧 A Disassemble robot whose dock left the layout before we came: only
+    // now is its absence known (a gate timeout leaves it, as the harvest).
+    if (initialRoomStateReady(sync)) releaseOrphanedDocks();
     refreshExteriorView();
     // #157: this harvest can rewrite the current room's own edges (hop 1 of
     // every pose) without any doc event — the shells follow it like the

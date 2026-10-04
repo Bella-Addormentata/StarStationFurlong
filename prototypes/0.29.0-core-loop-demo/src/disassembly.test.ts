@@ -20,7 +20,8 @@ import {
 } from './disassembly';
 import {
   assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, raiseDisassemblyLabor,
-  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, startResumesDisassembly, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
+  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, releaseOrphanedDocks, startResumesDisassembly, writeRobotConfig,
+  MAX_ROBOT_MAP_SCAN,
 } from './robotDoc';
 import type { DoorRecord } from './doorsDoc';
 import { bindFurnitureDoc, deleteFurnitureItem, replaceAllFurniture, writeFurnitureItem } from './furnitureDoc';
@@ -657,6 +658,46 @@ describe('the job in the robot map', () => {
     // there later starts unprogrammed as well.
     Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
     expect(b.getMap('robot').has('cfg:d2')).toBe(false);
+  });
+
+  it('a dock that left before this client came leaves its job once the room has arrived', () => {
+    const a = roomWithDocks(['d1', 'd2']);
+    bindRobotDoc(a);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    // An older client's REMOVE while no client of this build was in the room:
+    // nothing released d2's robot.
+    const older = new Y.Doc();
+    Y.applyUpdate(older, Y.encodeStateAsUpdate(a));
+    older.getMap('furniture').delete('d2');
+    // This client comes in afterwards: the room arrives with d2's config and
+    // working record, and no dock, so no removal is ever seen here.
+    const c = roomWithDocks([]);
+    bindRobotDoc(c);
+    Y.applyUpdate(c, Y.encodeStateAsUpdate(older));
+    expect(readRobotConfig('d2')).toEqual({ routine: 'disassemble', target: 'room-b' });
+    releaseOrphanedDocks(10 * MIN);
+    expect(readRobotConfig('d2')).toBeNull();
+    expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
+    // The same dock put back starts unprogrammed: none of the time it was
+    // gone is labor.
+    writeFurnitureItem({ id: 'd2', kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    const back = readDisassemblyJob('room-b')!;
+    expect(back.crew).toEqual(['d1']);
+    expect(workedMs(back, 20 * MIN)).toBe(20 * MIN);
+    expect(readRobotConfig('d2')).toBeNull();
+    // Only a Disassemble robot is released, and only one whose dock is gone.
+    writeRobotConfig('d3', { routine: 'dance' }, 20 * MIN);
+    releaseOrphanedDocks(21 * MIN);
+    expect(readRobotConfig('d1')).toEqual({ routine: 'disassemble', target: 'room-b' });
+    expect(readRobotConfig('d3')).toEqual({ routine: 'dance' });
+  });
+
+  it('releases a dock left behind once the room has arrived, never before', () => {
+    // main.ts calls it after the post-sync harvest, under the same gate.
+    const join = between(source('main.ts'), 'void awaitInitialRoomState(SYNC_GATE_MS).then(() => {', '});');
+    expect(join).toContain('if (epoch !== sessionEpoch || yjsSync !== sync) return;');
+    expect(join).toContain('if (initialRoomStateReady(sync)) releaseOrphanedDocks();');
   });
 
   it('a dock moved, or kept by a layout written whole, stays on its job', () => {
