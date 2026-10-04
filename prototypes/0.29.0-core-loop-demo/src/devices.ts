@@ -2968,13 +2968,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // 🕹️ UNDOCK & FLY (issue 203): cast off and take the stick.
       const freeBlock = !commander ? 'Only the module\'s COMMANDER may fly it.'
         : !isShipReady() ? 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.'
-          : isStationOwnRoom() ? stationFlyBlock(now)
           : chained.length > 0 ? 'Chained to a permanent connector — take the gangway down first (chained modules cannot fly).'
             : towingNow ? 'Towing a station — the tug stays docked until it arrives.'
               : castingHere || heldElsewhere ? 'Casting off — waiting for every dock to let go.'
               : isRouteRunning(savedRoute) ? 'A ferry route is set to run: STOP it (ROUTE, below) to fly by hand.'
                 : fuel <= 0 ? 'No fuel to fly on.'
-                  : isStationOwnRoom() ? ''
+                  // The checks above hold for a station flying by itself
+                  // too (undockAndFly makes them first); then its own.
+                  : isStationOwnRoom() ? stationFlyBlock(now)
                   : stationInTransit(listStationRecordsNow().find((st) => st.id === location.id) ?? {}, now) ? 'The station is between planets: fly by hand once it arrives.'
                   : undockPoseFrom(location.id, now) === null ? 'This station is not on your station list, so there is nowhere to fly from.'
                     : '';
@@ -4416,6 +4417,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         // Every check again, as things are once the docks have let go.
         const at = Date.now();
         const still = !shipDocking?.ports().some((p) => p.state.kind === 'docked') && castOffHeldBy(by)
+          && helmIsCommander() && isShipReady() && enumerateChainedDoors().length === 0 && !isTowing(currentRoomId(), at)
           && readResolvedFlight(at).status === 'docked' && !isRouteRunning(readShipRoute())
           && clampFuelToCapacity(readFuelLevel(capacity), capacity) > 0;
         const freePose = still ? undockPoseFrom(fromId, at) : null;
