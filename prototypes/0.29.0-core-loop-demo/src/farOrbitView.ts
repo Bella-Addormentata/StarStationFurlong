@@ -43,13 +43,16 @@ import { isPinMove, moveTransitPointAt, stationPointWithMoveAt } from './station
 import { isShipReady } from './devices';
 import { readPhysicalDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
+// 🕹️ Ships flown by hand (issue 203): this one's pose, and others' coasted on.
+import type { FreePose } from './freeFlight';
+import { remoteFreeShips, resolvedFreePose, stationFlyingFree } from './freeFlightPilot';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
 // 🚚 Another ferry's leg, where its summary says the route copied its stops.
 import { routeLegEnds, routeStayPlace, summaryLegEnds } from './planetSummary';
-import { flightCapable, followsFlightRecord } from './stationDirectory';
+import { flightCapable, followsFlightRecord, groundedBy } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
   adriftAt, adriftPlace, altitudeChangesSince, orbitChangeBase, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById,
@@ -270,12 +273,17 @@ function readSource(now: number): Source {
   // or resting there): see the planet from that orbit, not from the ship's
   // own one-room station.
   let adrift: Place | null = null;
+  // Aboard a ship flown by hand: see the planet from where it flies.
+  let free: FreePose | null = null;
   // 🚏 A running ferry route's timetable while it rules the flight (its legs
   // write no stored `flight`), else the stored record.
   const resolved = shipDocBound() ? resolveShipFlight(now) : null;
   const rec = resolved?.flight ?? null;
   const places = resolved?.places ?? null;
-  if (rec && followsFlightRecord(rec.status, flightCapable(isShipReady()))) {
+  // 🕹️ Flown by hand, a one-module station's own room follows its pose too
+  // (freeFlightCapable), and a ship that lost a part it flies by still coasts.
+  const flownFree = rec?.status === 'free-flight' && [null, 'lone-station'].includes(groundedBy());
+  if (rec && (flownFree || followsFlightRecord(rec.status, flightCapable(isShipReady())))) {
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
@@ -294,10 +302,11 @@ function readSource(now: number): Source {
       // and transferPointAt holds it on the source orbit while it waits (and
       // on the target orbit once it is there) until it docks.
     }
+    if (rec.status === 'free-flight') free = resolvedFreePose(now);
     // A docked record's location can still name open orbit after a dock by
     // hand from there: its live dock, or where it rests, says where it is
     // (the room resolver, below).
-    if (!aboard && rec.status !== 'docked' && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    if (!aboard && !free && rec.status !== 'docked' && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
     // 🚚 A timetable stay with no live dock carrying the ship along with a
     // station: it waits on the route's copy of the stop, where its leg in
     // ended and its next leg leaves from, untrimmed as they are, whether or
@@ -305,7 +314,7 @@ function readSource(now: number): Source {
     // station has left). Only a live dock puts it on the station's orbit:
     // one on the room's own doors, each read past the snapshot's cap, as the
     // room resolver reads it (doorsDoc.readPhysicalDoors).
-    if (!aboard && !adrift && places && !places.to) {
+    if (!aboard && !adrift && !free && places && !places.to) {
       const stay = routeStayOffList(
         places,
         dockedStationFor(roomId, readPhysicalDoors().values(), atlas, all) !== null,
@@ -316,7 +325,7 @@ function readSource(now: number): Source {
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
-    if (!aboard && !adrift && rec.status === 'redocking') {
+    if (!aboard && !adrift && !free && rec.status === 'redocking') {
       const castOffAt = rec.castOffAt ?? rec.departedAt;
       const place = (castOffAt !== undefined ? castOffPlace(rec.locationId, rec.destinationAt, all, castOffAt, now) : undefined)
         ?? placeOf(rec.locationId, all, castOffAt, now);
@@ -337,7 +346,7 @@ function readSource(now: number): Source {
   // Anywhere else the room resolver puts this room in open orbit (main.ts's,
   // through shipArrival.shipPlaceId): a ship resting there after letting go of
   // its dock, say. Its own one-room stand-in is no place to see it from.
-  if (!aboard && !adrift) {
+  if (!aboard && !adrift && !free) {
     const open = roomAdriftPlace(roomId);
     if (open) adrift = { id: adriftAt(open.planetId, open.orbitSlot), ...open };
   }
@@ -345,7 +354,7 @@ function readSource(now: number): Source {
   // Not in a known station (offline, or before the first join): stand in
   // for the planet's slot-0 station, so it is not drawn as a neighbour on
   // top of the viewer.
-  const me = aboard || adrift
+  const me = aboard || adrift || free
     ? null
     : currentStation() ??
       all.find((s) => planetById(s.planetId).id === planetForRoom(roomId, atlas).id && s.orbitSlot === 0 && !reallyMoving(s, now)) ??
@@ -364,6 +373,8 @@ function readSource(now: number): Source {
 
   const planetId = aboard
     ? aboard.from.planet.id
+    : free
+      ? planetById(free.planetId).id
     : adrift
       ? adrift.planetId
       : me
@@ -374,6 +385,14 @@ function readSource(now: number): Source {
   if (aboard) {
     const plan = aboard;
     viewer = (ms) => transferPointAt(plan, ms);
+  } else if (free) {
+    // The pose is read again each frame: the stick moves it between gathers.
+    let last: OrbitPoint = { radiusKm: free.radiusKm, angle: free.angle };
+    viewer = (ms) => {
+      const p = resolvedFreePose(ms);
+      if (p) last = { radiusKm: p.radiusKm, angle: p.angle };
+      return last;
+    };
   } else if (adrift) {
     const place = adrift;
     viewer = (ms) => stationPointAt(place, ms);
@@ -426,13 +445,30 @@ function readSource(now: number): Source {
     }
   }
 
+  // 🕹️ Ships flown by hand, where their last pose has coasted to (with the
+  // zone rules, as every other reader coasts them).
+  for (const ship of remoteFreeShips(planetId, now)) {
+    ships.push({
+      id: `ship:${ship.roomId}`,
+      name: ship.name,
+      at: (ms) => {
+        const p = ship.at(ms);
+        return { radiusKm: p.radiusKm, angle: p.angle };
+      },
+    });
+  }
+
   const stations = all
     // Never the viewer: its own station, nor the one-module station the room
     // it stands in (a ship, say) is listed as.
     .filter((s) => s.id !== me?.id && !(roomId && s.welcomeRoomId === roomId))
     // A ship is listed as its own one-module station too; a flying one is
-    // drawn on its transfer instead, a docked one not at all.
-    .filter((s) => !flying.has(s.welcomeRoomId))
+    // drawn on its transfer instead, a docked one not at all. A saved or
+    // built-in station that flew by itself (Fly and park) is no station
+    // while it flies free (remembered past its summary, until a move of its
+    // own is booked: stationFlyingFree), drawn as a ship while its summary
+    // lasts; parked, it is one again.
+    .filter((s) => !stationFlyingFree(s, now) && (!flying.has(s.welcomeRoomId) || !s.derived))
     .filter((s) => planetById(s.planetId).id === planetId && !reallyMoving(s, now))
     .map((record) => ({ record, modules: modulesOf(record, components, atlas) }));
 
@@ -443,10 +479,10 @@ function readSource(now: number): Source {
     // Everything buildFrame draws once: ring radii (a trim moves a ring
     // without changing its slot), names, module counts and each course.
     ...stations.map((s) => [s.record.id, stationOrbit(s.record).radiusKm.toFixed(3), s.modules, s.record.name]),
-    ...ships.map((s) => [
+    ...ships.map((s) => s.plan ? [
       s.id, s.name, s.plan.departAt, s.plan.arriveAt,
       s.plan.from.radiusKm.toFixed(3), s.plan.from.phase0, s.plan.to.radiusKm.toFixed(3), s.plan.to.phase0,
-    ]),
+    ] : [s.id, s.name, 'free']),
   ]);
   return { mode: 'planet', planetId, viewer, viewerRingRadiusKm, stations, ships, key, yaw };
 }

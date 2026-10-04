@@ -17,7 +17,7 @@ import { bindDoorLayoutDoc, seedDoorLayoutSingle } from './doorLayoutDoc';
 import { bindDoorsDoc, buildDoorPairing, readAllDoors, writeDoorPairing, writeDoorRecordTo } from './doorsDoc';
 import { FURNITURE, buildItemGroup, type FurnitureItem } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
-import { bindShipDoc, writeFuelLevel } from './shipDoc';
+import { bindShipDoc, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { createStationHelmUI, setStationHelmCommanderCheck } from './stationHelm';
 import { TRIM_FUEL, TRIM_STEP_KM, applyBurn, bindStationKeepingDoc, readOrbitTrim, setSharedTrimSource, writeTrimBurn } from './stationKeeping';
 import type { OrbitTrim, TrimBurn } from './stationKeeping';
@@ -29,8 +29,9 @@ const FIGHTER = 0xff1744;
 const TRIM_STICK = 0xffb300;
 
 /** A trim's orbit, count and place, as applyBurn gives them: without the
- *  writers a room's log replay names (OrbitTrim.seen). */
-const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined } : t);
+ *  writers a room's log replay names, or their floor (OrbitTrim.seen,
+ *  seenFloor). */
+const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined, seenFloor: undefined } : t);
 
 /** A canvas whose 2-D context draws nothing: the docking screen paints through one. */
 function fakeCanvas() {
@@ -420,6 +421,34 @@ describe('the helm dashboard\'s faces', () => {
     expect(built).toHaveLength(0);
     ui.unmount();
     expect(host.children).toHaveLength(0);
+  });
+
+  it('🅿️ a station flying by itself opens on the ship face, with no way to station keeping, until it parks', () => {
+    // Copilot's merge-time review of #205: trim, MOVE and ALTITUDE while the
+    // station flies free would book a move others read as its PARK.
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    try {
+      writeFlightRecord({ status: 'docked', locationId: DEFAULT_STATION_RECORD.id });
+      doc.getMap('ship').set('flight', { status: 'free-flight', locationId: DEFAULT_STATION_RECORD.id });
+      const { built, shipFace } = shipFaces();
+      const ui = createStationHelmUI({ bolted: () => true, station: () => null, shipFace });
+      const host = new FakeElement('host');
+      ui.mount(host as unknown as HTMLElement);
+      expect(keepFace(host)).toBeNull();
+      expect(built).toHaveLength(1);
+      for (let i = 0; i < 4; i++) ui.update(0.25);
+      expect(waysToKeeping(host)).toHaveLength(0);
+      ui.unmount();
+      // Parked (docked again): station keeping is back.
+      doc.getMap('ship').set('flight', { status: 'docked', locationId: DEFAULT_STATION_RECORD.id });
+      const again = createStationHelmUI({ bolted: () => true, station: () => null, shipFace });
+      again.mount(host as unknown as HTMLElement);
+      expect(keepFace(host)).not.toBeNull();
+      again.unmount();
+    } finally {
+      doc.destroy();
+    }
   });
 
   it('a helm opened on the ship face offers station keeping once its module steers a station, and stays where the pilot is', () => {

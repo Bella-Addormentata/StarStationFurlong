@@ -8,11 +8,14 @@
  * never walked through, and listed apart from the station's own modules.
  *
  * Pure: the atlas and the planet's ship summaries come in, a plan comes out.
- * stationPlanView.ts draws it and wires the clicks.
+ * stationPlanView.ts draws it and wires the clicks. ✏️ editAccess says how
+ * the table lets you work on a module's doors: from the table in the room
+ * you stand in, else by the ACCESS beam with a pass you hold (beamPassFor,
+ * beamAfterStepBack).
  */
 
 import type { AtlasEntry, AtlasOwner } from './stationAtlas';
-import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords, ownValue } from './stationAtlas';
+import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords, ownValue, roomIdFromSeed } from './stationAtlas';
 import { TILE_SIZE } from './floorPlanDoc';
 import type { ShipSummary } from './planetSummary';
 
@@ -55,6 +58,12 @@ export interface PlanModule {
   here: boolean;
   gates: PlanGate[];
   links: PlanLink[];
+  /** ✏️ Its own record pairs one of its doors with another module of the
+   *  station: someone walked through to it, and that first walk-through
+   *  paired its side. A module known only from a neighbour's pairing (a new
+   *  one, say) has no door back yet, nor does one whose only pairing is a
+   *  dock between two of its own doors. */
+  pairedFromInside: boolean;
   /** For a ship: the station module and door it is docked at. */
   dockedAt?: { roomId: string; doorId: string; gate?: number };
 }
@@ -138,9 +147,12 @@ export function stationPlan(
     const size = dims ?? FALLBACK_DIMS;
     const roomBerths = berths.get(p.roomId);
     const links: PlanLink[] = [];
+    let pairedFromInside = false;
     for (const [doorId, door] of Object.entries(entry?.doors ?? {})) {
       if (!door?.targetRoomId || !byId.has(door.targetRoomId)) continue;
       links.push({ doorId, toRoomId: door.targetRoomId, berth: roomBerths?.has(doorId) ?? false });
+      // A door docked to another door of this same module leads nowhere else.
+      if (door.targetRoomId !== p.roomId && station.has(door.targetRoomId)) pairedFromInside = true;
     }
     // 🗺️ A pairing only the far room recorded (atlasPoses' reverse hop) is a
     // link here too. Two rooms may share more than one connection, so a far
@@ -177,6 +189,7 @@ export function stationPlan(
       here: p.roomId === liveRoomId,
       gates,
       links,
+      pairedFromInside,
     };
     if (mod.kind === 'module') modules.push(mod);
     else ships.push(mod);
@@ -295,4 +308,54 @@ export function visitingShips(
     rank[a.state] - rank[b.state]
     || (a.gate ?? Infinity) - (b.gate ?? Infinity)
     || a.name.localeCompare(b.name));
+}
+
+/**
+ * ✏️ How the holotable lets you work on a module's doors (#192):
+ *  - 'here': you stand in it (a module, or the docked ship you are aboard),
+ *    and its door panels open from the table;
+ *  - 'beam': another module of the station you stand in, one this install
+ *    holds a pass to (`hasPass`): the ACCESS beam takes you in, where its
+ *    own door panels do the editing;
+ *  - 'walk-first': one you hold a pass to whose own door back is not paired
+ *    yet (pairedFromInside): the first walk-through pairs it, and the beam
+ *    would skip that, leaving you inside with no door back to the station;
+ *  - 'walk': one you hold no pass to, reached through the station's doors;
+ *  - 'outside': you stand in none of the station's modules (aboard a docked
+ *    ship, or at another station), or it is no module of this station. A
+ *    docked ship is another vessel, never one of the modules you beam into.
+ */
+export function editAccess(
+  plan: StationPlan,
+  roomId: string,
+  hasPass: (roomId: string) => boolean,
+): 'here' | 'beam' | 'walk-first' | 'walk' | 'outside' {
+  if ([...plan.modules, ...plan.ships].some((x) => x.roomId === roomId && x.here)) return 'here';
+  const m = plan.modules.find((x) => x.roomId === roomId);
+  if (!m || !plan.modules.some((x) => x.here)) return 'outside';
+  if (!hasPass(roomId)) return 'walk';
+  return m.pairedFromInside ? 'beam' : 'walk-first';
+}
+
+/** ✏️ BEAM INTO's click: the click is the choice, so it drops a pending
+ *  auto-enter at once (`cancelPending`), as the ACCESS app's ENTER does;
+ *  a pass turning READY during the table's step-back would otherwise beam
+ *  you off first. The beam itself waits for the step-back. */
+export function beamAfterStepBack(
+  seed: string,
+  hooks: {
+    cancelPending: () => void;
+    afterStepBack: (go: () => void) => void;
+    enter: (seed: string) => void;
+  },
+): void {
+  hooks.cancelPending();
+  hooks.afterStepBack(() => hooks.enter(seed));
+}
+
+/** 🎫 The first of `seeds` that reaches `roomId`, the pass the holotable
+ *  beams in with: a seed naming another room would take you there instead. */
+export function beamPassFor(roomId: string, seeds: ReadonlyArray<string | null | undefined>): string | undefined {
+  if (!roomId) return undefined;
+  return seeds.find((s): s is string => !!s && roomIdFromSeed(s) === roomId);
 }

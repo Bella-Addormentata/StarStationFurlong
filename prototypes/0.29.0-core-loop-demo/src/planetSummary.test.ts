@@ -105,10 +105,10 @@ afterEach(() => {
 
 describe('guards', () => {
   it('accepts a well-formed station summary and copies only known fields', () => {
-    const line = { seq: 3, place: T0 + 5, seen: [[7, T0 + 5]] as [number, number][] };
+    const line = { seq: 3, place: T0 + 5, seen: [[7, T0 + 5]] as [number, number][], seenFloor: T0 + 1 };
     const s = cleanStationSummary({ ...summary(), trim: { ...trim(), ...line, fuelDrawn: 7, junk: 2 }, junk: 1 }, T0);
-    // A trim's count of burns, place and writers travel (the helm rooms go
-    // on from it); the room's fuel draw does not.
+    // A trim's count of burns, place, writers and their floor travel (the
+    // helm rooms go on from it); the room's fuel draw does not.
     expect(s).toEqual({ ...summary(), trim: { ...trim(), ...line } });
   });
 
@@ -326,6 +326,17 @@ describe('guards', () => {
     expect(cleanShipSummary({ ...ship, status: 'warp' }, T0)).toBeNull();
     expect(cleanShipSummary({ ...ship, etaAt: Infinity }, T0)).toBeNull();
     expect(cleanShipSummary({ ...ship, seed: 'secret' }, T0)).not.toHaveProperty('seed');
+  });
+
+  it('🕹️ keeps a ship flown by hand with its pose; a bad pose drops alone', () => {
+    const free = { planetId: SOV, at: T0, radiusKm: 7000, angle: 1, vAlong: 0.1, vRadial: 0, heading: 0.5 };
+    const ship = { roomId: 'room-ship', name: 'SKIFF', planetId: SOV, status: 'free-flight', free, updatedAt: T0 };
+    expect(cleanShipSummary(ship, T0)).toEqual(ship);
+    expect(cleanShipSummary({ ...ship, free: { ...free, vAlong: 99 } }, T0)).toEqual({ ...ship, free: undefined });
+    // A pose at another planet than the entry's is dropped.
+    expect(cleanShipSummary({ ...ship, free: { ...free, planetId: 'planet-aris' } }, T0)).toEqual({ ...ship, free: undefined });
+    // Only free flight carries one.
+    expect(cleanShipSummary({ ...ship, status: 'docked' }, T0)).not.toHaveProperty('free');
   });
 
   it('keeps a route ferry\'s gate, next stop, departure and status; a bad one drops alone', () => {
@@ -1188,9 +1199,9 @@ describe('sharing through the room doc', () => {
     const hab = listStations().find((s) => s.id === 'hab')!;
     expect(readSharedTrim(hab)).toEqual(trim({ seq: 1 }));
     // Another helm room of the station went on from it twice, on a clock
-    // behind this one's: its trim, with its place and writers, is the
-    // station's now.
-    const along = trim({ dRadiusKm: 8, seq: 3, at: T0 - 5_000, place: T0 + 2, seen: [[42, T0 + 2]] });
+    // behind this one's: its trim, with its place, writers and their floor,
+    // is the station's now.
+    const along = trim({ dRadiusKm: 8, seq: 3, at: T0 - 5_000, place: T0 + 2, seen: [[42, T0 + 2]], seenFloor: T0 + 1 });
     const peer = new Y.Doc();
     sync(doc, peer);
     peer.getMap('stationSummaries').set('room-hab', { ...summary(), trim: { ...along, from: 'room-b', readAt: T0 } });

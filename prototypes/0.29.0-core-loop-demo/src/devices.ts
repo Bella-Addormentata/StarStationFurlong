@@ -109,12 +109,25 @@ import {
   releaseEveryDock,
   rememberBerthHere,
   completeArrival,
+  planArrivalDock,
   resolveRememberedBerth,
   shipLocationId,
   type ArrivalOutcome,
   type ShipDockingApi,
 } from './shipArrival';
 import type { DockAnswer } from './dockRules';
+// 🕹️ Free flight (issue 203): a person flies the ship by hand and docks with
+// AUTO-DOCK.
+import { parkCost, parkPose, readout as freeReadout } from './freeFlight';
+import {
+  freeStationsAround, isStationOwnRoom, keepStationPark, markFreeDock, markStationPark, ownStationOf, pilotFrame, recoverFreeDock, releaseStick, resolvedFreePose,
+  settleFreeDock, stationFlyingFree, stationUndockPose, undockPoseFrom, writeFreePose,
+} from './freeFlightPilot';
+import { planStationPark } from './freeStation';
+import { MIN_ORBIT_SEPARATION_KM } from './stations';
+import { isBoltedIntoStation } from './stationKeeping';
+import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, takeStickKeys } from './freeFlightStick';
+import { drawFreeRadar, freePanelKey, renderFreeFlightPanel, writeFreeFigures } from './helmFreeFlight';
 // #30 SH3: the helm enumerates the room's paired doors so canDepart can
 // refuse a permanent connector-chain (a chained module cannot fly, by
 // construction — plan §5.1). DEPART also detaches any transient berth.
@@ -261,6 +274,32 @@ import { readStore as readPlanetStore, subscribePlanetSummary } from './planetSu
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
+
+/** The helm's FUEL gauge: its figure, fill and colour. */
+function fuelGauge(fuel: number, capacity: number): { text: string; pct: number; color: string } {
+  const pct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
+  return {
+    text: capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK',
+    pct,
+    color: pct > 40 ? '#00E676' : pct > 10 ? '#FFB74D' : '#FF8A80',
+  };
+}
+
+/** 🕹️ Redraw the FUEL gauge in place (flying free, the stick draws fuel
+ *  every write, and a whole redraw would drop clicks mid-flight). */
+function writeFuelGauge(panel: HTMLElement, fuel: number, capacity: number): void {
+  const g = fuelGauge(fuel, capacity);
+  const text = panel.querySelector<HTMLElement>('[data-helm-fuel="text"]');
+  if (text) { if (text.textContent !== g.text) text.textContent = g.text; text.style.color = g.color; }
+  const bar = panel.querySelector<HTMLElement>('[data-helm-fuel="bar"]');
+  if (bar) { bar.style.width = `${g.pct}%`; bar.style.background = g.color; }
+}
+
+/** 🕹️ Is this station's own module flying by hand ("Fly and park")? Docking
+ *  is closed meanwhile, so no DEPART or route stop names it. */
+function stationFliesFree(stationId: string, now: number): boolean {
+  return stationFlyingFree(listStationRecordsNow().find((r) => r.id === stationId), now);
+}
 
 // ── Core interfaces (plan §D0.2) ──────────────────────────────────────────────
 
@@ -1142,6 +1181,11 @@ export interface MapTableDeps {
   currentDoors?: () => Array<{ id: string; label: string }>;
   /** 🗺️ Step back from the table and open a door's own panel. */
   openDoorPanel?: (doorId: string) => void;
+  /** ✏️ #192: does this install hold a pass to that module (the atlas's
+   *  BEAM INTO for another module of the station)? */
+  canBeamTo?: (roomId: string) => boolean;
+  /** ✏️ Step back from the table and beam into that module. */
+  beamTo?: (roomId: string) => void;
   /** 🗺️ The local player's id, so a module's owner can read "You". */
   playerId?: () => string;
   /** 🗺️ The local identity key: "You" still, back on a fresh player id. */
@@ -1247,6 +1291,8 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           dismantled: () => dismantledRoomIds(),
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
+          canBeamTo: (roomId) => stationPlanDeps.canBeamTo?.(roomId) ?? false,
+          beamTo: (roomId) => stationPlanDeps.beamTo?.(roomId),
           onBack: () => stationPlanView?.hide(),
           disassembly: () => ({
             jobs: readDisassemblyJobs(),
@@ -2561,7 +2607,8 @@ function departureNow(fromId: string, destId: string): { hop: HopPlan; fuel: num
     // anchors yet holds the ship.
     routeRunning: isRouteRunning(readShipRoute()) && readRouteFlight(now) === null,
   });
-  return refusal.ok && hop && fuel >= hop.fuelCost ? { hop, fuel, capacity } : null;
+  // 🕹️ A station flying by hand takes no ships until it parks.
+  return refusal.ok && hop && fuel >= hop.fuelCost && !stationFliesFree(destId, now) ? { hop, fuel, capacity } : null;
 }
 
 /** DEPART's flight record — the FAST path docked → in-flight. departedAt is
@@ -2638,6 +2685,26 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
    *  this open helm (shipPilot.helmAnnouncerStep); stepped once a second. */
   let announcer: HelmAnnouncer = freshHelmAnnouncer();
   let announcedAt = 0;
+  /** 🕹️ Free flight: why AUTO-DOCK or UNDOCK & FLY could not go, shown
+   *  under its button for a moment; and what the panel's buttons were last
+   *  drawn for (freePanelKey), so a zone change redraws them. */
+  let freeNote: { text: string; until: number } | null = null;
+  let freeKey = '';
+  const flashFree = (text: string): void => {
+    const note = { text, until: Date.now() + 8_000 };
+    freeNote = note;
+    // Nothing else re-renders an idle helm, so the note clears itself.
+    setTimeout(() => {
+      if (freeNote !== note) return;
+      freeNote = null;
+      if (panel) render();
+    }, 8_050);
+  };
+  /** Let go of the stick (keys and pose): the ship coasts on. */
+  const letGo = (): void => {
+    releaseStickKeys();
+    releaseStick(countFunction('fuelTank') * TANK_CAPACITY);
+  };
 
   const flashRoute = (text: string, tone: 'ok' | 'warn' = 'warn'): void => {
     routeFlash = { text, tone, until: Date.now() + 8_000 };
@@ -2696,7 +2763,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         ?? shipLocationId(flight, hasLiveDock()),
     );
     const destination = flight.destinationId ? named(flight.destinationId) : null;
-    const choices = destinationsFrom(location.id);
+    const choices = destinationsFrom(location.id).filter((d) => !stationFliesFree(d.id, now));
     // 🚏 The ship's route: saved, running (a paused one included: routeRun),
     // and — while its timetable rules the flight — the next stop, which the
     // picker starts on at each stay (§2b). The route DEPART flies there from
@@ -2785,9 +2852,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const routeRow = `<span style="text-align:right; color:${routeStatus.tone === 'ok' ? '#00E676' : routeStatus.tone === 'warn' ? '#FFB74D' : 'rgba(212,168,75,0.55)'};">${esc(routeStatus.text)}</span>`;
 
     // ── Fuel gauge: level / capacity, filled bar, refuel button ────────────
-    const capFmt = capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK';
-    const barPct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
-    const barColor = barPct > 40 ? '#00E676' : barPct > 10 ? '#FFB74D' : '#FF8A80';
+    const { text: capFmt, pct: barPct, color: barColor } = fuelGauge(fuel, capacity);
     // 🚏 On a running route REFUEL sets the level at the stay the ship is
     // docked at; in flight it waits for the next stop (routeRefuelStay).
     const refuelWaits = routeFlight !== null && routeFlight.status !== 'docked';
@@ -2907,6 +2972,26 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         btnEnabled = refusal.ok && pickerDest !== null && !towingNow && !castingHere && !heldElsewhere;
         btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
       }
+      // 🕹️ UNDOCK & FLY (issue 203): cast off and take the stick.
+      const freeBlock = !commander ? 'Only the module\'s COMMANDER may fly it.'
+        : !isShipReady() ? 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.'
+          : chained.length > 0 ? 'Chained to a permanent connector — take the gangway down first (chained modules cannot fly).'
+            : towingNow ? 'Towing a station — the tug stays docked until it arrives.'
+              : castingHere || heldElsewhere ? 'Casting off — waiting for every dock to let go.'
+              : isRouteRunning(savedRoute) ? 'A ferry route is set to run: STOP it (ROUTE, below) to fly by hand.'
+                : fuel <= 0 ? 'No fuel to fly on.'
+                  // The checks above hold for a station flying by itself
+                  // too (undockAndFly makes them first); then its own.
+                  : isStationOwnRoom() ? stationFlyBlock(now)
+                  : stationInTransit(listStationRecordsNow().find((st) => st.id === location.id) ?? {}, now) ? 'The station is between planets: fly by hand once it arrives.'
+                  : undockPoseFrom(location.id, now) === null ? 'This station is not on your station list, so there is nowhere to fly from.'
+                    : '';
+      const freeNoteNow = freeNote && now < freeNote.until ? freeNote.text : '';
+      const freeLaunch = `
+          <button id="helm-free-btn"${freeBlock ? ' disabled' : ''} style="width:100%; margin-top:10px; padding:8px; border-radius:6px; border:1px solid ${freeBlock ? 'rgba(212,168,75,0.25)' : '#81D4FA'}; background:${freeBlock ? 'rgba(80,80,80,0.15)' : 'rgba(129,212,250,0.14)'}; color:${freeBlock ? 'rgba(212,168,75,0.4)' : '#81D4FA'}; font-family:inherit; font-weight:800; cursor:${freeBlock ? 'not-allowed' : 'pointer'}; text-transform:uppercase;">${isStationOwnRoom() ? '🕹️ FLY THE STATION BY HAND' : '🕹️ UNDOCK &amp; FLY BY HAND'}</button>
+          <div style="font-size:10px; color:${freeBlock || freeNoteNow ? '#FFB74D' : 'rgba(212,168,75,0.7)'}; margin-top:6px; line-height:1.4;">${esc(freeNoteNow || freeBlock || (isStationOwnRoom()
+            ? 'The station flies by itself with the keyboard or a joystick, its docks closed, until you PARK it in a new orbit.'
+            : 'Cast off and fly with the keyboard or a joystick; AUTO-DOCK when you are close to a station.'))}</div>`;
       const warnCopy = towingNow
         ? 'Towing a station — the tug stays docked until it arrives.'
         : heldElsewhere ? 'Another helm is casting this ship off — DEPART waits until it is done.'
@@ -2934,6 +3019,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           ${planNote ? `<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px; line-height:1.4;">${esc(planNote)}</div>` : ''}
           ${warnCopy ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${esc(warnCopy)}</div>` : ''}
           ${castOffNote}
+          ${freeLaunch}
         </div>`;
     } else if (flight.status === 'undocking') {
       // Reserved slow-path beat — no writer produces it in SH3, but a stale
@@ -2979,6 +3065,21 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">The commander's helm docks at the station's berth. If no commander is aboard, one can finish it here.</div>
           <button id="helm-redock-btn"${commander ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${commander ? '#64B5F6' : 'rgba(212,168,75,0.25)'}; background:${commander ? 'rgba(100,181,246,0.18)' : 'rgba(80,80,80,0.15)'}; color:${commander ? '#64B5F6' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${commander ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${commander ? 'DOCK NOW' : 'COMMANDER ONLY'}</button>
         </div>`;
+    } else if (flight.status === 'free-flight') {
+      // 🕹️ Flown by hand: the radar, the stick and AUTO-DOCK.
+      const pose = resolvedFreePose(now);
+      const r = pose ? freeReadout(pose, freeStationsAround(pose.planetId, now)) : null;
+      freeKey = freePanelKey(r, fuel);
+      flightPanel = renderFreeFlightPanel({
+        readout: r,
+        commander,
+        stickTaken: stickKeysTaken(),
+        padName: stickPadName(),
+        note: freeNote && now < freeNote.until ? freeNote.text : null,
+        fuel,
+        esc,
+        station: ownStationOf()?.name ?? null,
+      });
     }
 
     panel.innerHTML = `
@@ -2986,7 +3087,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — ${flight.status === 'docked' ? 'SHIP STATUS' : flight.status.toUpperCase()}</span>
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
-      ${row('LOCATION', esc(flight.status === 'in-flight' ? `leaving ${location.name}` : location.name))}
+      ${row('LOCATION', esc(flight.status === 'in-flight' ? `leaving ${location.name}`
+        : flight.status === 'free-flight' ? `flying free, undocked from ${location.name}` : location.name))}
       ${row('ENGINES', `${check(engines >= 1)} ${engines} mounted`)}
       ${row('FUEL TANKS', `${check(tanks >= 1)} ${tanks} × ${TANK_CAPACITY}${tanks > 0 ? '' : ' — install a fuel tank'}`)}
       ${row('HELM', `${check(helms >= 1)} ${helms} online`)}
@@ -2999,10 +3101,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       <div style="margin-top:10px;">
         <div style="display:flex; justify-content:space-between; align-items:baseline; font-size:11px;">
           <span style="color:rgba(212,168,75,0.75);">FUEL</span>
-          <span style="color:${barColor}; font-weight:700;">${capFmt}</span>
+          <span data-helm-fuel="text" style="color:${barColor}; font-weight:700;">${capFmt}</span>
         </div>
         <div style="margin-top:6px; height:10px; background:rgba(0,0,0,0.5); border-radius:5px; overflow:hidden; border:1px solid rgba(212,168,75,0.15);">
-          <div style="width:${barPct}%; height:100%; background:${barColor}; transition:width 0.25s linear;"></div>
+          <div data-helm-fuel="bar" style="width:${barPct}%; height:100%; background:${barColor}; transition:width 0.25s linear;"></div>
         </div>
         <button id="helm-refuel-btn"${refuelDisabled ? ' disabled' : ''} style="width:100%; margin-top:8px; padding:6px; border-radius:6px; border:1px solid ${refuelDisabled ? 'rgba(212,168,75,0.2)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; background:${refuelDisabled ? 'rgba(80,80,80,0.12)' : (refuelArmed ? 'rgba(255,138,128,0.18)' : 'rgba(240,192,96,0.12)')}; color:${refuelDisabled ? 'rgba(212,168,75,0.4)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; font-family:inherit; font-weight:700; cursor:${refuelDisabled ? 'not-allowed' : 'pointer'}; text-transform:uppercase; font-size:11px;">${refuelLabel}</button>
       </div>
@@ -3019,6 +3121,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     `;
     const canvas = panel.querySelector<HTMLCanvasElement>('#helm-ship-atlas');
     if (canvas && docking) drawShipAtlas(canvas, ports, docking.connected());
+    drawFreePanel(now);
 
     // ── Wire the freshly-rendered flight controls ───────────────────────────
     const picker = panel.querySelector<HTMLSelectElement>('#helm-dest-picker');
@@ -3067,7 +3170,13 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const fromId = shipLocationId(nowResolved.flight, hasLiveDock());
       const destId = pickerDestId && pickerDestId !== ROUTE_NEXT ? pickerDestId : '';
       const first = departureNow(fromId, destId);
-      if (!first) { render(); return; }
+      if (!first) {
+        if (destId && stationFliesFree(destId, nowMs)) {
+          setArrivalNote({ tone: 'warn', text: `Cannot depart: ${findDestination(destId).name} is flying by hand and takes no ships until it parks.` });
+        }
+        render();
+        return;
+      }
       const dest = findDestination(destId);
       // 0) Every dock must be releasable, or the flight would leave one live.
       const castOffBlock = shipDocking ? castOffRefusal(shipDocking.ports()) : null;
@@ -3251,6 +3360,25 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       const note = arrivalNoteHere();
       noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: note, onProgress: note }));
     });
+    // 🕹️ Free flight (issue 203).
+    panel.querySelector<HTMLButtonElement>('#helm-free-btn')?.addEventListener('click', () => {
+      undockAndFly();
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-free-stick')?.addEventListener('click', () => {
+      if (stickKeysTaken()) letGo();
+      else if (helmIsCommander() && !isShipReady()) flashFree('NOT SPACEWORTHY: the stick needs a FUEL TANK, ENGINE BLOCK and HELM CONSOLE mounted.');
+      else if (helmIsCommander()) takeStickKeys();
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-free-park')?.addEventListener('click', () => {
+      parkHere();
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-free-dock')?.addEventListener('click', () => {
+      autoDock();
+      render();
+    });
 
     if (refocus) {
       const target = refocus.pick !== undefined
@@ -3277,7 +3405,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const shipRoom = currentRoomId();
     const atlas = readStationAtlas();
     // Never the ship's own one-module station, nor one between planets.
-    const stations = stationsAroundPlanet(planetId, records).filter((st) => !stationInTransit(st, now)
+    const stations = stationsAroundPlanet(planetId, records).filter((st) => !stationInTransit(st, now) && !stationFlyingFree(st, now)
       && !(st.welcomeRoomId && (st.welcomeRoomId === shipRoom || atlasComponent(atlas, st.welcomeRoomId).has(shipRoom))));
     // 🧭 The dock the draft's route port is in (else any): the editor's
     // default berth at the station the ship is docked at.
@@ -3308,7 +3436,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const records = listStationRecordsNow();
     return (id: string): boolean => {
       const st = records.find((r) => r.id === localStationId(id)) ?? records.find((r) => r.id === id);
-      return !!st && stationInTransit(st, now);
+      return !!st && (stationInTransit(st, now) || stationFlyingFree(st, now));
     };
   };
 
@@ -4190,6 +4318,269 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     }
   };
 
+  /**
+   * 🕹️ UNDOCK & FLY (issue 203): the same cast-off as DEPART (every dock
+   * releasable, the berth here remembered, then UNDOCK and detach), then
+   * `docked → free-flight` and the ship's first pose just behind the station,
+   * and the stick is taken. Every input is checked again at the click.
+   */
+  /** 🅿️ Why this station's own room may not fly by itself now, or '' when
+   *  it may: only a station standing alone, with nothing docked, flies. */
+  function stationFlyBlock(now: number): string {
+    const station = ownStationOf();
+    if (!station) return 'This station is not on your station list.';
+    if (isBoltedIntoStation(readPhysicalDoors().values())) return 'This is the station\'s welcome room, joined to its other modules: only a station standing alone flies.';
+    if (shipDocking?.ports().some((p) => p.state.kind === 'docked')) return 'Ships are docked here: a station flies alone, once they cast off.';
+    if (isMoveActive(station.move, now)) return 'A move or altitude change is scheduled or under way.';
+    return '';
+  }
+
+  /** 🅿️ A one-module station flies by itself: no berth to leave, its docks
+   *  close (others see it flying free), and it starts still where it is. */
+  const flyStation = (nowMs: number): void => {
+    const station = ownStationOf();
+    if (!station || stationFlyBlock(nowMs)) return;
+    if (!writeFreePose(stationUndockPose(station, nowMs))) return;
+    if (!writeFlightRecord({ status: 'free-flight', locationId: station.id })) return;
+    setArrivalNote(null);
+    freeNote = null;
+    takeStickKeys();
+  };
+
+  const undockAndFly = (): void => {
+    if (!helmIsCommander() || !isShipReady()) return;
+    const nowMs = Date.now();
+    const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+    const flight = readResolvedFlight(nowMs);
+    if (flight.status !== 'docked' || isRouteRunning(readShipRoute())) return;
+    if (enumerateChainedDoors().length > 0 || isTowing(currentRoomId(), nowMs)) return;
+    if (clampFuelToCapacity(readFuelLevel(capacity), capacity) <= 0) return;
+    if (isStationOwnRoom()) { flyStation(nowMs); return; }
+    const fromId = shipLocationId(flight, hasLiveDock());
+    const pose = undockPoseFrom(fromId, nowMs);
+    if (!pose) {
+      flashFree('This station is not on your station list, so there is nowhere to fly from.');
+      return;
+    }
+    const castOffBlock = shipDocking ? castOffRefusal(shipDocking.ports()) : null;
+    if (castOffBlock) {
+      flashFree(castOffBlock === 'dock-busy'
+        ? 'Cannot undock yet: a dock port is still busy. Try again in a moment.'
+        : 'Cannot undock: a dock port here is one you may not undock.');
+      return;
+    }
+    const berthsNow = berthsToCastOff(currentRoomId());
+    if (!berthsNow.ok) {
+      flashFree(berthHoldText(berthsNow.why, 'Cannot undock'));
+      return;
+    }
+    if (shipDocking && !rememberBerthHere(fromId, shipDocking.ports())) {
+      flashFree(`Cannot undock: the ship could not remember its berth at ${findDestination(fromId).name}.`);
+      return;
+    }
+    // Cast off as DEPART does (PR 174): under the shared cast-off hold, every
+    // dock lets go first, legacy berths asked of their far room, and the pose
+    // and the free-flight record are written only once the ship is free (a
+    // station between planets keeps the ships docked to it).
+    if (castingOffHere()) return;
+    if (readCastOffHold()) { flashFree('Cannot undock yet: another helm is casting this ship off.'); return; }
+    const by = castOffToken();
+    if (!holdCastOff(by)) return;
+    const renewal = setInterval(() => { renewCastOff(by); }, CAST_OFF_RENEW_MS);
+    const room = arrivalNoteRoom;
+    const releaseAllowed = docking?.releaseAllowed;
+    castingOff = { by, room };
+    setArrivalNote({ tone: 'ok', text: 'Casting off — waiting for every dock to let go…' });
+    void (async () => {
+      try {
+        await new Promise((r) => setTimeout(r, CAST_OFF_SETTLE_MS));
+        if (room !== arrivalNoteRoom) return;
+        const fail = (text: string): void => { setArrivalNote(null); flashFree(text); };
+        if (!castOffHeldBy(by)) { fail('Did not undock: another helm began casting this ship off at the same moment.'); return; }
+        // One moment for every release, as DEPART's (the far rooms judge
+        // each at it, and the tombstones take it).
+        const releaseAt = Date.now();
+        const docks = new Set(shipDocking?.ports().filter((p) => p.state.kind === 'docked').map((p) => p.doorId) ?? []);
+        const berthsThen = berthsToCastOff(currentRoomId(), releaseAt);
+        if (!berthsThen.ok) { fail(berthHoldText(berthsThen.why, 'Cannot undock')); return; }
+        const legacy = berthsThen.berths.filter((id) => !docks.has(id));
+        const asked = berthPairings(legacy);
+        const allowed = releaseAllowed
+          ? await Promise.all(legacy.map(async (id) => {
+            try {
+              return await releaseAllowed(id, releaseAt);
+            } catch {
+              return true;
+            }
+          }))
+          : [];
+        if (room !== arrivalNoteRoom) return;
+        if (!allowed.every(Boolean)) { fail('Cannot undock: a station moving between planets holds this ship until it arrives.'); return; }
+        const released = !shipDocking || (await releaseEveryDock(shipDocking));
+        if (room !== arrivalNoteRoom) return;
+        if (!released) { fail('Cannot undock: a dock did not let go (the dock port\'s panel says why). The ship stays docked.'); return; }
+        const berths = berthsToCastOff(currentRoomId(), releaseAt, asked);
+        if (!berths.ok) { fail(berthHoldText(berths.why, 'Did not undock')); return; }
+        // Every check again, as things are once the docks have let go.
+        const at = Date.now();
+        const still = !shipDocking?.ports().some((p) => p.state.kind === 'docked') && castOffHeldBy(by)
+          && helmIsCommander() && isShipReady() && enumerateChainedDoors().length === 0 && !isTowing(currentRoomId(), at)
+          && readResolvedFlight(at).status === 'docked' && !isRouteRunning(readShipRoute())
+          && clampFuelToCapacity(readFuelLevel(capacity), capacity) > 0;
+        const freePose = still ? undockPoseFrom(fromId, at) : null;
+        if (!freePose) { fail('Did not undock: the docks, the tanks or the station changed while the ship cast off. Try again.'); return; }
+        for (const doorId of berths.berths) detachBerth(doorId, releaseAt);
+        for (const doorId of enumerateTransientBerths()) detachBerth(doorId, releaseAt);
+        // The pose first, so the record never names free flight with no pose.
+        if (!writeFreePose(freePose) || !writeFlightRecord({ status: 'free-flight', locationId: fromId })) {
+          fail('Did not undock: the flight record was refused.');
+          return;
+        }
+        setArrivalNote(null);
+        freeNote = null;
+        takeStickKeys();
+      } finally {
+        clearInterval(renewal);
+        if (castingOff?.by === by) castingOff = null;
+        releaseCastOff(by);
+        redrawHelms();
+      }
+    })();
+  };
+
+  /**
+   * 🕹️ AUTO-DOCK: close to a station, fly the ship in. The arrival is the
+   * ordinary one (free-flight → redocking, then shipArrival.completeArrival
+   * picks the gate and DOCKs, with gate change), checked first so a ship with
+   * no berth or no free port there stays in free flight and is told why.
+   */
+  const autoDock = (): void => {
+    if (!helmIsCommander() || readFlightRecord().status !== 'free-flight') return;
+    // A station flying by itself docks nowhere: it PARKs.
+    if (isStationOwnRoom()) return;
+    const now = Date.now();
+    const pose = resolvedFreePose(now);
+    if (!pose) return;
+    const target = freeReadout(pose, freeStationsAround(pose.planetId, now)).dockAt;
+    if (!target) return;
+    const station = isKnownStation(target.id) ? findDestination(target.id) : null;
+    if (!station || !shipDocking) {
+      flashFree(`${target.name} cannot take the ship from here: no dock port on this module.`);
+      return;
+    }
+    const ports = shipDocking.ports();
+    const plan = planArrivalDock({
+      station,
+      remembered: resolveRememberedBerth(readStationBerth(station.id), ports),
+      ports,
+      shipRoomId: currentRoomId(),
+    });
+    if (plan.kind === 'none' && plan.reason !== 'already-docked') {
+      flashFree(plan.reason === 'no-port'
+        ? 'No free dock port on this module to dock with.'
+        : `${station.name} has no gate this ship can dock at. Fit one at a door (door panel › +DOCK) or ask its owner.`);
+      return;
+    }
+    letGo();
+    // Kept in the ship doc to fly on from if the far berth refuses after all
+    // (the preflight above cannot promise its answer): recoverFreeDock, here
+    // on the answer, or main.ts's flight watch when this game left the room.
+    const flewFrom = readFlightRecord().locationId;
+    const flewAt = resolvedFreePose(Date.now()) ?? pose;
+    const docking = shipDocking;
+    const room = currentRoomId();
+    const backToFree = (outcome: ArrivalOutcome | null): void => {
+      if (!outcome || outcome.kind === 'docking') return;
+      if (currentRoomId() !== room) return;
+      if (outcome.kind !== 'none' || outcome.reason === 'already-docked') { settleFreeDock(); return; }
+      if (!recoverFreeDock(docking.ports(), Date.now(), true)) return;
+      flashFree(`${station.name} did not take the ship: still flying free.`);
+      if (panel) render();
+    };
+    if (!markFreeDock(station.id, flewFrom, flewAt)) return;
+    if (!writeFlightRecord({ status: 'redocking', locationId: station.id })) return;
+    const note = arrivalNoteHere();
+    const first = completeArrival(docking, {
+      force: true,
+      onSettled: (outcome) => { note(outcome); backToFree(outcome); },
+    });
+    noteShipArrival(first);
+    backToFree(first);
+  };
+
+  /**
+   * 🅿️ PARK: stop the ship dead where it is, paying the fuel a brake would,
+   * and hold it there in a steady orbit (freeFlight.parkPose) until the
+   * pilot thrusts again. The stick is let go first, so its last pose is the
+   * one parked.
+   */
+  const parkHere = (): void => {
+    if (!helmIsCommander() || readFlightRecord().status !== 'free-flight') return;
+    // The brake is the engines': a ship that lost one it flies by coasts on.
+    if (!isShipReady()) {
+      flashFree('NOT SPACEWORTHY: PARK needs a FUEL TANK, ENGINE BLOCK and HELM CONSOLE mounted.');
+      if (panel) render();
+      return;
+    }
+    letGo();
+    const now = Date.now();
+    const pose = resolvedFreePose(now);
+    if (!pose || pose.parked) return;
+    const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+    const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+    const cost = Math.ceil(parkCost(pose) - 1e-9);
+    if (fuel < cost) {
+      flashFree(`PARK needs ${cost} fuel to stop the ship; the tanks hold ${Math.floor(fuel)}.`);
+      return;
+    }
+    const station = ownStationOf();
+    if (station) {
+      // 🅿️ A station parks for good: its new orbit is kept as an altitude
+      // change's arrival orbit (freeStation.ts), and the flight ends.
+      const parked = parkPose(pose);
+      const plan = planStationPark(station, parked, listStationRecordsNow(), readMoveFuelDrawn(), fuelDrawDeficit('stationMove'));
+      if (!plan.ok) {
+        flashFree(plan.reason);
+        if (panel) render();
+        return;
+      }
+      // The move before the mark: the room doc delivers them in this order, so
+      // no game sees the mark without the move it names.
+      if (!writeFreePose(parked) || !writeStationMove(plan.move) || !markStationPark(parked, plan.move)) return;
+      if (cost > 0) writeFuelLevel(fuel - cost, capacity);
+      writeFlightRecord({ status: 'redocking', locationId: station.id });
+      writeFlightRecord({ status: 'docked', locationId: station.id });
+      // An earlier claim on an orbit this near wins (stations.lostAltitudeClaims):
+      // then it flies on from here.
+      if (keepStationPark()) {
+        flashFree(`${station.name} could not park here (another station claimed an orbit within ${MIN_ORBIT_SEPARATION_KM} km first, or an earlier move still stands): still flying.`);
+        if (panel) render();
+        return;
+      }
+      flashFree(`${station.name} is parked in its new orbit, its docks open again.`);
+      if (panel) render();
+      return;
+    }
+    if (!writeFreePose(parkPose(pose))) return;
+    if (cost > 0) writeFuelLevel(fuel - cost, capacity);
+  };
+
+  /** 🕹️ The radar and the moving figures, every frame while flying free; a
+   *  zone change (AUTO-DOCK comes in reach, say) redraws the buttons. */
+  const drawFreePanel = (now: number): void => {
+    if (!panel) return;
+    const canvas = panel.querySelector<HTMLCanvasElement>('#helm-free-radar');
+    if (!canvas) return;
+    const pose = resolvedFreePose(now);
+    if (!pose) return;
+    const stations = freeStationsAround(pose.planetId, now);
+    drawFreeRadar(canvas, pose, stations, now);
+    const r = freeReadout(pose, stations);
+    writeFreeFigures(panel, r);
+    const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+    if (freePanelKey(r, clampFuelToCapacity(readFuelLevel(capacity), capacity)) !== freeKey) render();
+  };
+
   /** Commander-driven flight advance while the helm is open (main.ts runs the
    *  same watch at 1 Hz for a closed helm). in-flight → redocking once etaAt
    *  passes, then completeArrival docks at the destination's berth. Benign
@@ -4233,13 +4624,33 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // (chains + transient berths), docks (port states). Each clears the
       // refuel arm — a peer refuel is an obvious "cancel" for us.
       unsubs.push(subscribeFurnitureForHelm(() => { refuelArmed = false; render(); }));
-      unsubs.push(subscribeShip(() => { refuelArmed = false; render(); }));
+      // 🕹️ Flying free, a pose write (every 500 ms at the stick) is drawn in
+      // place by the frame loop: only the flight record or the fuel level
+      // redraws the panel then.
+      // The fuel level is drawn in place too; only REFUEL's full-tank state
+      // rides the key (PARK's affordability is the frame loop's freePanelKey).
+      let shipSeen = '';
+      unsubs.push(subscribeShip(() => {
+        const capacity = countFunction('fuelTank') * TANK_CAPACITY;
+        const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+        const seen = `${JSON.stringify(readFlightRecord())}|${fuel >= capacity}`;
+        const same = seen === shipSeen;
+        shipSeen = seen;
+        if (same && readFlightRecord().status === 'free-flight') {
+          if (panel) writeFuelGauge(panel, fuel, capacity);
+          return;
+        }
+        refuelArmed = false;
+        render();
+      }));
       unsubs.push(subscribeDoors(() => render()));
       if (docking) unsubs.push(docking.subscribe(() => render()));
       unsubs.push(subscribeArrivalNote(() => render()));
       unsubs.push(subscribeStationMove(() => render()));
       // 🪐 Destinations and their orbits learned from peers.
-      unsubs.push(subscribePlanetSummary(() => render()));
+      // (Flying free, the radar redraws every frame and redraws the panel
+      // itself when what its buttons offer changes.)
+      unsubs.push(subscribePlanetSummary(() => { if (readFlightRecord().status !== 'free-flight') render(); }));
       // 🚏 A charging dock's robot taking up 🚀 Ship pilot (the route
       // editor's pilot picker).
       unsubs.push(subscribeRobot(() => render()));
@@ -4329,6 +4740,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       });
     },
     unmount(): void {
+      // 🕹️ Stepping back from the helm lets go of the stick: the ship coasts.
+      letGo();
       for (const off of unsubs) off();
       unsubs.length = 0;
       if (tickTimer !== null) { clearInterval(tickTimer); tickTimer = null; }
@@ -4338,7 +4751,21 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       refuelArmed = false;
     },
 
-    update(): void { /* status is observer- and interval-driven */ },
+    /** Status is observer- and interval-driven; 🕹️ free flight steps the
+     *  stick and redraws the radar every frame. */
+    update(dt: number): void {
+      if (!panel || readFlightRecord().status !== 'free-flight') {
+        if (stickKeysTaken()) { letGo(); render(); }
+        return;
+      }
+      const now = Date.now();
+      if (stickKeysTaken()) {
+        // No longer the commander, or a part it flies by was taken off.
+        if (!helmIsCommander() || !isShipReady()) { letGo(); render(); return; }
+        pilotFrame(readStick(), dt, countFunction('fuelTank') * TANK_CAPACITY, now);
+      }
+      drawFreePanel(now);
+    },
   };
 }
 
