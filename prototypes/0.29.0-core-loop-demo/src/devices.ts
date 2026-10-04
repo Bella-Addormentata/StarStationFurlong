@@ -2259,10 +2259,14 @@ const HELM_TICK_MS = 250;
  *  (docks are not station structure), so a ship reads its live dock partner
  *  first, then where its last flight left it; in flight it is at none, even
  *  should a fitting come off mid-trip (the room still follows its flight:
- *  followsFlightRecord, as main.ts places it). Exported for tests. */
+ *  followsFlightRecord, as main.ts places it), nor while flown by hand.
+ *  Exported for tests. */
 export function holotableStation(): StationRecord | null {
   // 🚏 A running route's timetable, when it rules the flight (A4).
   const flight = readResolvedFlight();
+  // 🕹️ Flown by hand (issue 203), a ship or a one-module station flying by
+  // itself is at no station: not even its own, which has left its orbit.
+  if (flight.status === 'free-flight') return null;
   if (!followsFlightRecord(flight.status, flightCapable(isShipReady()))) return currentStation();
   if (flight.status !== 'docked') return null;
   const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
@@ -4332,6 +4336,9 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     if (isBoltedIntoStation(readPhysicalDoors().values())) return 'This is the station\'s welcome room, joined to its other modules: only a station standing alone flies.';
     if (shipDocking?.ports().some((p) => p.state.kind === 'docked')) return 'Ships are docked here: a station flies alone, once they cast off.';
     if (isMoveActive(station.move, now)) return 'A move or altitude change is scheduled or under way.';
+    // A move this room's log is too long to read whole may be the one under
+    // way (stationMove.roomMovesKnown), as the station planners refuse.
+    if (!roomMovesKnown()) return 'This station holds more move records than the helm can read: it flies once they are cleared.';
     return '';
   }
 
@@ -4534,6 +4541,11 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       return;
     }
     const station = ownStationOf();
+    if (station && !roomMovesKnown()) {
+      flashFree('Cannot park yet: this station holds more move records than the helm can read. It parks once they are cleared.');
+      if (panel) render();
+      return;
+    }
     if (station) {
       // 🅿️ A station parks for good: its new orbit is kept as an altitude
       // change's arrival orbit (freeStation.ts), and the flight ends.
