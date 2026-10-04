@@ -176,7 +176,7 @@ sources the countdown doubles as the prefetch window.
 | You put it down | PUT DOWN → back at the TV. Leaving the room puts it down too |
 | You fall asleep holding it | The holder renews every 3 s; after 8 s of silence anyone may take it |
 | You open a second tab | The remote stays with the tab that picked it up (`page`); the other is a viewer that may take it over — one person, one place — and closing it drops nothing |
-| The TV has buttons on its body | Anyone standing at the TV can press POWER, VOLUME and INPUT without the remote — and whoever turns the set ON has the remote placed in their hand (#186's rule) when it is on the set or lapsed; a live holder keeps it, since a body button moves nothing out of a hand and the owner's spare is not the switch's to use: the holder turns the set on themselves, or hands the remote over |
+| The TV has buttons on its body | Anyone standing at the TV can press POWER and VOLUME without the remote — each its own key (§3.1), so no body press writes the programme record the holder rewrites every three seconds, and an INPUT button, if one comes, gets a key of its own the same way, never a second writer of `tv:<id>` — and whoever turns the set ON has the remote placed in their hand (#186's rule) when it is on the set or lapsed; a live holder keeps it, since a body button moves nothing out of a hand and the owner's spare is not the switch's to use: the holder turns the set on themselves, or hands the remote over |
 | The owner has the spare | The room owner may take the remote from anyone, always |
 
 The holder gate is client-side and best effort — the dev-phase posture of
@@ -638,8 +638,10 @@ else through an `AudioWorklet` tapping the track's
 `MediaStreamAudioSourceNode` and building `AudioData` from its PCM frames —
 the universal path, since the worklet is everywhere the lane runs, and the
 one the karaoke mix takes regardless, tapped off the mix bus; both are
-feature-detected with the worklet as the fallback, and a browser with
-neither `AudioEncoder` nor a worklet sends no audio and says so.
+feature-detected with the worklet as the fallback for the PCM step only —
+a worklet supplies PCM and encodes nothing — and a browser without
+`AudioEncoder` sends no audio and says so, whatever worklets it has
+(Safari 16.4–18.x and WebKitGTK 2.44, below).
 A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
 three CAPABILITIES the lane rests on are feature-detected separately, and a
 sender advertises only the ones it has (they are not legs — the lane has
@@ -706,9 +708,9 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 
 | Central piece | Without it |
 |---|---|
-| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
+| Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
 | DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node, so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no DHT client, no PEX, no LSD, no tracker or web-seed code to reach anything with — the only isolation that holds, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
-| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build; never on a strict one. rqbit's web-seed support is unverified. |
+| Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build, under the trackers row's destination gate when on (a web-seed URL comes from the same untrusted metadata, and a crafted one would otherwise point the node at loopback, the LAN or a metadata service); never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
 Rules: `librqbit` inside `ssf-p2p-node` as an optional cargo feature
@@ -744,11 +746,19 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
 - **Index:** a signed `library-add { hash, title, bytes, licence, source,
   addedBy, provider }` op in the RoomLog, per station or venture —
   `provider` the adding owner's node id, the first node to ask — plus a
-  signed, EXPIRING `library-seed { hash, node, expires }` announcement from
-  every node that holds the item and will serve it (a library-station
-  volunteer, an owner's node), renewed hourly and void a day after its last
-  renewal, withdrawn early by a signed `library-unseed` from the same node
-  or by the item's `library-remove`. A seeder is its node id, dialled by id
+  signed `library-seed { hash, node, seq }` announcement from every node
+  that holds the item and will serve it (a library-station volunteer, an
+  owner's node), renewed hourly under a per-node sequence that only rises,
+  and judged expiring by the READER: an announcement counts for a day from
+  when this node last received a renewal with a higher `seq` from that
+  node, by this node's own clock — never a stamp of the seeder's, which no
+  reader could bound and a skewed or lying seeder could set a decade out —
+  a renewal with an older or equal `seq` is a replay and ignored, and a
+  signed `library-unseed` from the same node (a higher `seq` too) or the
+  item's `library-remove` withdraws it early. A late joiner counts its day
+  from its own receipt and is wrong by at most that day about a seeder
+  that has gone, and §4's route rule skips a holder that fails or stalls
+  for the rest of the session either way. A seeder is its node id, dialled by id
   under §4's route rule (a connected announcer's observed route for an
   automatic fetch; discovery only for a fetch the viewer asked for), so a
   hash resolves, in order, to the connected `have` announcers, the
