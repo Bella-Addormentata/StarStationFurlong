@@ -214,6 +214,20 @@ lane badge (**SOVEREIGN** / **PLAYER-RUN** / **PUBLIC SWARM** / **CONVENIENCE**)
 and a strict-sovereign build greys out the convenience tiles and shows the
 torrent tile as library-only, since §6 compiles the torrent client out there.
 
+**Ruling (2026‑10‑04): serverless sources only, by default.** The owner's
+call after the torrent-only assessment: a default build offers no
+convenience lane at all — the YouTube and archive.org tiles are not shown,
+a pasted URL plays only from the viewer's own origin or their node (any
+other server is refused with the reason; PLAY FROM <host> does not exist
+there), and the cabinet's CDN opt-in (§9) is not offered — while the
+convenience code stays in the tree behind one build flag,
+`VITE_SSF_CONVENIENCE_LANES=1` (`src/sovereignty.ts`, read literally at
+build time the way the treasury's network pin is), for the day it is wanted
+again. The file, karaoke, screen and torrent tiles are the sovereign lanes
+and land on their own schedule (§11). The table below describes every lane
+as designed; the Convenience rows exist only in a build with the flag on.
+In code: #207 (the TV) and #208 (the cabinet).
+
 | Tile | Who fetches the bytes | Reaches the screen as | Sync | Class | Posture |
 |---|---|---|---|---|---|
 | ▶️ YouTube | each viewer, from YouTube | iframe, IFrame API | full | Convenience, single vendor | allowed, labelled, greyed out when unreachable; `youtube-nocookie.com`; no other feature may require it; on the desktop shells gated on §3.5's error-153 check — until it passes, the tile may fail from `tauri://localhost`, which v1's theatre reports as a lane failure with RETRY (browsers are unaffected) |
@@ -568,9 +582,16 @@ source and never read from the header. A leg's counter is the SENDER's for
 the whole epoch, never the encoder's: it lives outside the encoder and
 survives every pause, restart and reconfiguration (§9 and spike #21 restart
 encoders for the first subscriber), so a restarted encoder goes on from the
-counter it left; and a counter about to wrap, or a sender that has lost its
-counter (a page reload), takes a new key epoch before it sends another
-frame. A nonce is never reused under one key. The frame counter is the nonce, and
+counter it left. Epochs and counters live together in the sender's page
+state, and the epoch only rises within an instance; a counter about to wrap
+takes a new epoch — a fresh media key, sealed again, as any rotation —
+before the next frame. A sender that has LOST that state (a page reload, a
+crash) has lost the instance: it cannot know which epochs or counters the
+old source used, so it never continues it under any epoch — it announces a
+NEW source instance (a fresh 16-byte instance nonce, hence a new source id
+and a new media key, every subscriber subscribing afresh), and the old
+source ends as a departure does. A nonce is never reused under one key,
+because no key outlives the state that counts under it. The frame counter is the nonce, and
 the routing header — source id, leg, key epoch, counter, keyframe flag — is
 the associated data and is under the sender's signature below, so a hub can
 relabel nothing: a frame moved to another leg or another counter neither
@@ -650,9 +671,12 @@ open — stated as the cost — rather than the sender's whole budget. A
 subscriber cap per source (sixty-four identities; the hubs' aggregation
 keeps the forwarding tree beneath it) bounds what any rotation costs: one
 sealed key per subscriber, a few milliseconds of X25519 and a few
-kilobytes at the cap. Replay protection is a sliding window per leg,
-the SRTP shape: a leg's counter only ever goes up within an epoch; a
-receiver keeps, per leg, the highest counter it has accepted and a bitmap
+kilobytes at the cap. Replay protection is a sliding window per leg and
+epoch, the SRTP shape: a leg's counter only ever goes up within an epoch, a
+new epoch starts a new window, and a new instance is a new source with
+windows of its own (a reloaded sender is a new instance, above, never an old
+source resumed); a receiver keeps, per leg, the highest counter it has
+accepted and a bitmap
 of the last 128 below it, takes a frame above the highest (and
 slides the window up), takes a frame inside the window that the bitmap has
 not seen, and drops a duplicate or a counter older than the window — so
@@ -750,16 +774,21 @@ the universal path, since the worklet is everywhere the lane runs, and the
 one the karaoke mix takes regardless, tapped off the mix bus; both are
 feature-detected with the worklet as the fallback for the PCM step only —
 a worklet supplies PCM and encodes nothing — and a browser without
-`AudioEncoder` sends no audio and says so, whatever worklets it has
-(Safari 16.4–18.x and WebKitGTK 2.44, below).
+`AudioEncoder`, or whose `AudioEncoder` cannot do Opus, sends no audio and
+says so, whatever worklets it has (Safari 16.4–18.x; on WebKitGTK the API
+is there from 2.44 and the codec is a GStreamer plugin, below).
 A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
 three CAPABILITIES the lane rests on are feature-detected separately, and a
 sender advertises only the ones it has (they are not legs — the lane has
 two, audio and video, keyed as above): `WebTransport` (Safari 26.4 is the floor per
 `docs/TDD/BrowserSupportMatrix.md`), `VideoEncoder` (Chromium; Firefox
 desktop 130+ and NOT Firefox Android, per the matrix, so an Android Firefox
-advertises no media leg; Safari 16.4+; WebKitGTK 2.44+) and `AudioEncoder` (absent on Safari
-16.4–18.x and WebKitGTK 2.44). Only true screen capture (`getDisplayMedia`)
+advertises no media leg; Safari 16.4+; WebKitGTK 2.44+) and `AudioEncoder`
+(absent on Safari 16.4–18.x; present on WebKitGTK from 2.44, where WebCodecs
+sits on GStreamer and a codec is whatever plugin the system has — Opus from
+`opusenc` in gst-plugins-base — so the page asks
+`AudioEncoder.isConfigSupported({ codec: 'opus', … })` rather than reading
+a version, and advertises the audio leg only on a yes). Only true screen capture (`getDisplayMedia`)
 is Chromium-first. Budget per
 viewer: ~24–32 kbps voice, ~96–128 kbps music, ~0.3–0.8 Mbps for a
 native-resolution arcade screen, ~1.5–3 Mbps for a 720p desktop — codec
@@ -1114,8 +1143,20 @@ Lockstep needs a libretro core driven per frame (a thin harness, the P2
 spike). Licences to review before bundling: EmulatorJS GPL-3.0, FBNeo
 non-commercial clause, MAME a GPL-2.0/BSD-3 mix. The emulator data files are
 **not** vendored into the repository (size); they are fetched into
-`public/emulatorjs/` by a script for sovereign builds, and the CDN is an
-opt-in labelled CONVENIENCE.
+`public/emulatorjs/` by a script (`npm run fetch:emulatorjs`), and the CDN is
+an opt-in labelled CONVENIENCE that exists only in a build with the
+convenience lanes on (`VITE_SSF_CONVENIENCE_LANES=1`: the 2026‑10‑04 ruling,
+§3.3 — a record that says CDN reads as the station's files in a default
+build, and a link on another server is refused at PUT ON with the reason).
+The station's own files run in a same-origin frame (the canvas must stay
+reachable for the spectator lane), so that frame runs under a
+content-security policy set before its loader is fetched: this origin,
+`blob:`, `data:` and the viewer's own node, nothing else — no update check,
+no netplay signalling, no third party of any kind; `'unsafe-eval'` and
+`'wasm-unsafe-eval'` for the cores. The CDN lane keeps its sandbox (an
+opaque origin) for a wall instead. EmulatorJS has not yet run under the
+policy (its files are never in the repository): the fetch spike is where a
+directive it needs would show, as a console refusal naming it.
 
 **Display and controls.** The emulator draws to a canvas. In P1 the picture
 lives in P1's stage panel (DOM) with a CSS scanline-and-vignette pass, and the
@@ -1129,7 +1170,8 @@ Gamepad API, mouse under pointer lock as a trackball, the virtual gamepad on
 Android.
 
 **Phasing.** P1 cabinet + single player (attract mode, owner-set game or menu,
-EmulatorJS in our origin — the CDN lane sandboxed — P1 focus and controls, the
+EmulatorJS in our origin under the policy above — the CDN lane, with the
+lanes on, sandboxed — P1 focus and controls, the
 CSS CRT pass on the stage) → the media lane with subscriptions (shared with
 the TV's screen share and karaoke), which brings the picture and the texture
 CRT pass to the prop → P2 over video → lockstep only for the games that need
@@ -1165,7 +1207,11 @@ it.
    IFrame API with full sync, archive.org files and direct URLs via `<video>`
    with full sync for finite, seekable media (the archive embed, a live
    stream or a host without usable ranges play start-time only, §3.3), the
-   countdown, the start screen with lane badges, the theatre panel. Spike
+   countdown, the start screen with lane badges, the theatre panel.
+   **Shipped serverless-only under the 2026‑10‑04 ruling (§3.3):** the
+   YouTube and archive tiles and PLAY FROM <host> are in the tree behind
+   `VITE_SSF_CONVENIENCE_LANES=1`; a default build plays a file on the
+   viewer's own origin or node. Spike
    **S1** beside it: the CSS3D hole-punch with the ortho camera
    plus the error-153 check on the three desktop shells.
 2. **Node media proxy** (`/api/media`, range + CORS, host allowlist): textures
@@ -1178,14 +1224,23 @@ it.
    the #190 calls; media subscriptions by distance on the node.
 6. **Video lane:** screen share, arcade spectators, then P2 over video.
 7. **Arcade P1** can proceed in parallel with 1–2 (it needs only the proxy for
-   archive ROMs; local files work without it).
+   archive ROMs; local files work without it) — shipped in #208 under the
+   same ruling: the CDN opt-in and links on other servers behind the flag,
+   the station lane's frame under a content-security policy (§9).
 8. **Not now:** IPv8/Tribler (stage-A spike only on request), per-viewer swarm
    fetch by default, any built-in content search.
 
 ## 12. Open decisions for the owner
 
-- v1 sources: YouTube + archive.org + direct URL (recommended), PeerTube next.
+- ~~v1 sources: YouTube + archive.org + direct URL (recommended), PeerTube next.~~
+  **Decided 2026‑10‑04:** serverless sources only by default — a URL on the
+  viewer's own origin or node now, the file, torrent, karaoke and screen
+  tiles as they land; YouTube, archive.org and PLAY FROM <host> kept in the
+  tree behind `VITE_SSF_CONVENIENCE_LANES=1` (§3.3). PeerTube, when it
+  comes, behind the same flag.
 - Whether a station runs a library-station node, and who.
 - Whether the IPv8 stage-A spike is wanted at all after the library lands.
-- The arcade shelf's default contents (homebrew/freeware first) and whether
-  the CDN opt-in for emulator files is acceptable for non-sovereign builds.
+- The arcade shelf's default contents (homebrew/freeware first). ~~Whether
+  the CDN opt-in for emulator files is acceptable for non-sovereign builds.~~
+  **Decided 2026‑10‑04:** not offered by default; behind
+  `VITE_SSF_CONVENIENCE_LANES=1` with the rest (§9).
