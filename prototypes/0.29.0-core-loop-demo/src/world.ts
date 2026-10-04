@@ -81,6 +81,7 @@ import {
   subscribeDoors,
   readAllDoors,
   writeDoorPairing,
+  readPhysicalDoors,
   deleteDoorPairing,
   reapOrphanPairings,
   type DoorRecord,
@@ -5610,8 +5611,9 @@ export class World {
       // station keeping face (small trim stick) and keeps the ship face one
       // tab away for fuel and the docking computer. Every helm opens through
       // the station helm, so one opened on the ship face offers station
-      // keeping once its module comes to steer a station.
-      const bolted = () => steersStation(currentRoomId(), readAllDoors());
+      // keeping once its module comes to steer a station. The room's own
+      // doors count, each read past the doors' read cap, as DEPART reads them.
+      const bolted = () => steersStation(currentRoomId(), readPhysicalDoors());
       const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

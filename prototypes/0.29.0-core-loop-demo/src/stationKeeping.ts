@@ -97,9 +97,10 @@
  * goes on from the shared one and carries it (TrimBurn.from). Each trim
  * counts the burns along its line (OrbitTrim.seq), so burns from any of the
  * station's helm rooms continue one orbit, whatever their clocks
- * (isNewerTrim). A burn replays after every burn its room's log held when it
- * was written, even one stamped ahead of the writer's clock (TrimBurn.order),
- * so no burn lands twice through a trim carried past it.
+ * (isNewerTrim). A burn replays after every burn its writer knew of, in
+ * its room's log or along the trim it went on from, even one stamped ahead
+ * of the writer's clock (TrimBurn.order, OrbitTrim.place), so no burn lands
+ * twice through a trim carried past it, whenever that burn reaches the log.
  *
  * Pure except for the doc binding. Pinned by stationKeeping.test.ts.
  */
@@ -131,7 +132,8 @@ const DEG = Math.PI / 180;
  * matched with what the atlas holds of the far rooms the way the atlas
  * matches them, so a berth flagged only at the far end is a berth, and a
  * permanent gangway between the same two rooms still joins them; pass
- * readAllDoors' map, whose keys are the door ids a far record can name.
+ * readPhysicalDoors' map: the room's own doors, each read past readAllDoors'
+ * cap, keyed by the door ids a far record can name.
  * Without the room's id, only its own flags count, and a pairing back to the
  * room itself cannot be told apart.
  */
@@ -271,6 +273,12 @@ export interface OrbitTrim {
    *  orbit the one further along is the newer, whatever clocks stamped them
    *  (isNewerTrim). Left out (a trim from before), none. */
   seq?: number;
+  /** The latest place in the replay (TrimBurn.order, else the time) of the
+   *  burns along that line, when it is after `at`: a burn that goes on from
+   *  this trim replays after every one of them, in whichever room's log
+   *  they reach (writeTrimBurn), so none of them lands twice. Left out,
+   *  `at`. */
+  place?: number;
 }
 
 /** One burn of the stick, as the log keeps it. Plain JSON. */
@@ -294,11 +302,13 @@ export interface TrimBurn {
    *  orbit from it at this burn, unless this room's own trim there is newer
    *  by then. */
   from?: OrbitTrim;
-  /** Where the replay takes it, when that is after `at`: just past the last
-   *  burn its room's log held when it was written (writeTrimBurn). So a burn
-   *  pressed after one stamped ahead of this clock (a tab running fast)
-   *  still replays after it, as its writer saw them, and a trim it carries
-   *  never meets that burn again. Left out, `at`. */
+  /** Where the replay takes it, when that is after `at`: just past the
+   *  latest burn its writer knew of, in its room's log or along the trims
+   *  it went on from (OrbitTrim.place), when it was written
+   *  (writeTrimBurn). So a burn pressed after one stamped ahead of this
+   *  clock (a tab running fast) still replays after it, as its writer saw
+   *  them, even in a log that gets that burn only later, and a trim it
+   *  carries never meets that burn again. Left out, `at`. */
   order?: number;
 }
 
@@ -350,8 +360,9 @@ const MAX_AT_MS = ORBIT_EPOCH_MS + 100 * 365.25 * 24 * 3600 * 1000;
  *  exact. */
 const MAX_TRIM_SEQ = 2 ** 40;
 
-/** A burn's place in the replay (TrimBurn.order) is at most this: past the
- *  latest time a burn may carry by one per burn a log can hold, twice over. */
+/** A place in the replay (TrimBurn.order, OrbitTrim.place) is at most this:
+ *  past the latest time a burn may carry by one per burn a log can hold,
+ *  twice over. */
 const MAX_ORDER = MAX_AT_MS + 2 * MAX_LOG;
 
 /** A burn takes at most this much fuel: a bound on a peer-written entry, far
@@ -382,7 +393,9 @@ export function isOrbitTrim(v: unknown): v is OrbitTrim {
     && isDirection(r.last)
     && (r.fuelDrawn === undefined
       || (typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX))
-    && (r.seq === undefined || (typeof r.seq === 'number' && Number.isInteger(r.seq) && r.seq >= 0 && r.seq <= MAX_TRIM_SEQ));
+    && (r.seq === undefined || (typeof r.seq === 'number' && Number.isInteger(r.seq) && r.seq >= 0 && r.seq <= MAX_TRIM_SEQ))
+    && (r.place === undefined
+      || (typeof r.place === 'number' && r.place > (r.at as number) && r.place <= MAX_ORDER));
 }
 
 /** Shape guard for a burn off the wire. */
@@ -432,11 +445,12 @@ export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
       || (Array.isArray(r.fired) && r.fired.length <= MAX_SETTLED_FIRED && r.fired.every(isFiredBurn)));
 }
 
-/** A trim's orbit fields and its count of burns only (a record from before
- *  the log also carries its fuel, which the meter reads apart). */
+/** A trim's orbit fields, its count of burns and its place only (a record
+ *  from before the log also carries its fuel, which the meter reads apart). */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
   const out: OrbitTrim = { planetId: t.planetId, slot: t.slot, dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
   if (t.seq !== undefined) out.seq = t.seq;
+  if (t.place !== undefined) out.place = t.place;
   return out;
 }
 
@@ -645,6 +659,12 @@ function placeOf(b: Pick<TrimBurn, 'at' | 'order'>): number {
   return b.order ?? b.at;
 }
 
+/** The latest place along a trim's line (OrbitTrim.place), else its time;
+ *  -Infinity for none. */
+function trimPlace(t: OrbitTrim | null): number {
+  return t ? t.place ?? t.at : Number.NEGATIVE_INFINITY;
+}
+
 /** Where a run of burns leaves the trim, the fuel they drew, and the burns
  *  that fired (in order), each at the time it applied: one stamped before
  *  the start's last burn at that burn's time. */
@@ -712,6 +732,10 @@ function runBurns(sorted: readonly TrimBurn[], start: readonly OrbitTrim[], star
     const before = burn.from && (!own || isNewerTrim(burn.from, own)) ? burn.from : own;
     const after = applyBurn(before, applied) ?? heldBurn(before, burn.dir, at);
     if (after) {
+      // Its line has been through every place the one it went on from had,
+      // and this burn's: a burn that goes on from it replays after them all.
+      const place = Math.max(trimPlace(before), placeOf(burn));
+      if (place > after.at) after.place = place;
       trims.delete(key);
       trims.set(key, after);
       trim = after;
@@ -936,8 +960,9 @@ interface RoomReplay {
   settledKeys: string[];
   /** Burns in the log the settlement does not cover yet. */
   pending: number;
-  /** The place of the last of them in burn order (placeOf), or -Infinity: a
-   *  burn written now replays after it (TrimBurn.order). */
+  /** The latest place among them (placeOf) and along the trims the replay
+   *  leaves (OrbitTrim.place), or -Infinity: a burn written now replays
+   *  after it (TrimBurn.order). */
   place: number;
   /** What a level write at `now`, by its writer's clock, keeps (settleLog),
    *  or undefined. */
@@ -1121,7 +1146,10 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
     covered,
     settledKeys,
     pending: waiting,
-    place: inOrder.length ? placeOf(inOrder[inOrder.length - 1].burn) : Number.NEGATIVE_INFINITY,
+    place: Math.max(
+      inOrder.length ? placeOf(inOrder[inOrder.length - 1].burn) : Number.NEGATIVE_INFINITY,
+      ...run.trims.map(trimPlace),
+    ),
     settle: (now) => {
       if (!settled && keys.length === 0) return undefined;
       // Nothing a settlement keeps is dated past its write, by the writer's
@@ -1130,7 +1158,7 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
       // stamped before then would apply, and fire, only then, so the stick
       // would never wait between them.
       const by = isBurnTime(now) ? now : Number.POSITIVE_INFINITY;
-      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? { ...heldTrim(t, t.last, by)!, seq: t.seq } : t);
+      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? { ...heldTrim(t, t.last, by)!, seq: t.seq, place: trimPlace(t) } : t);
       return {
         trim: run.trim && held(run.trim),
         // Every orbit's trim too, so the next replay starts each from its own.
@@ -1289,8 +1317,9 @@ export function isBurnLogFull(): boolean {
  * burn never writes the fuel level itself, so a REFUEL or DEPART fired at
  * the same moment keeps its cost too (see shipDoc.setFuelDrawMeter). The
  * same write clears the entries the last level write settled. The burn
- * replays after every burn the log holds as it is written (TrimBurn.order),
- * so the trim it went on from is the trim it applies to. Owner-gated
+ * replays after every burn the log holds as it is written, and every burn
+ * along the trim it carries (TrimBurn.order, OrbitTrim.place), so the trim
+ * it went on from is the trim it applies to. Owner-gated
  * at the caller. Returns whether it wrote: a malformed burn, a second one
  * from this client in the same millisecond, or one past a full log
  * (isBurnLogFull), is refused.
@@ -1306,8 +1335,10 @@ export function writeTrimBurn(burn: TrimBurn): boolean {
   const { covered, settledKeys, pending, place } = replayRoom();
   if (keepMap!.has(key) || covered.has(key) || pending >= MAX_LOG) return false;
   // It replays after every burn the log holds, as we saw them, even one
-  // stamped ahead of our clock (TrimBurn.order).
-  if (place >= placeOf(clean)) clean.order = Math.min(MAX_ORDER, place + 1);
+  // stamped ahead of our clock, and every burn along the trim it carries,
+  // wherever that burn was written (TrimBurn.order, OrbitTrim.place).
+  const seen = Math.max(place, trimPlace(clean.from ?? null));
+  if (seen >= placeOf(clean)) clean.order = Math.min(MAX_ORDER, seen + 1);
   boundDoc!.transact(() => {
     for (const settledKey of settledKeys) keepMap!.delete(settledKey);
     keepMap!.set(key, clean);

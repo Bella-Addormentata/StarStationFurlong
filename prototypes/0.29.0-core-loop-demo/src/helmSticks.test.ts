@@ -13,6 +13,8 @@ import { readFileSync } from 'node:fs';
 import * as THREE from 'three';
 import * as Y from 'yjs';
 import type { DeviceUI, PropAnimHandle } from './devices';
+import { bindDoorLayoutDoc, seedDoorLayoutSingle } from './doorLayoutDoc';
+import { bindDoorsDoc, buildDoorPairing, readAllDoors, writeDoorPairing, writeDoorRecordTo } from './doorsDoc';
 import { FURNITURE, buildItemGroup, type FurnitureItem } from './furniture';
 import { registerFurnitureHandles, type FurnitureHandleSinks } from './furnitureHandles';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
@@ -235,6 +237,31 @@ describe('the helm console\'s sticks', () => {
     } finally {
       dispose();
       setSharedTrimSource(null);
+    }
+  });
+  it('a gangway on one of the room\'s own doors shows the trim stick, past a flood of other records', () => {
+    // Copilot's review of #173: the console read the doors' capped snapshot,
+    // so 64 records written ahead of a real gangway hid it, and the console
+    // showed the fighter grip in a module bolted into a station.
+    const doors = new Y.Doc();
+    bindDoorsDoc(doors);
+    bindDoorLayoutDoc(doors);
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    for (let i = 0; i < 64; i++) {
+      writeDoorRecordTo(doors, `d:flood-${i}`, buildDoorPairing('ssf://room#room=junk', { transient: true }));
+    }
+    writeDoorPairing('d:gangway', 'ssf://room#room=station-core');
+    expect(readAllDoors().has('d:gangway')).toBe(false);
+    setStationRoomSource(() => 'room-module');
+    const { group, anim, dispose } = buildHelm();
+    try {
+      anim.update(0.016);
+      expect(shown(group, FIGHTER)).toBe(false);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+    } finally {
+      dispose();
+      bindDoorsDoc(new Y.Doc());
+      bindDoorLayoutDoc(new Y.Doc());
     }
   });
 });
@@ -674,5 +701,8 @@ describe('the helm dashboard\'s faces', () => {
     const block = from.slice(0, from.indexOf('\n      return;'));
     expect(block).toContain('const ui = createStationHelmUI(');
     expect(block).toContain('deviceFocus.beginFocus(this.player, device, ui);');
+    // Its face follows the room's own doors, each read past the doors' read
+    // cap, so a flood of records never hides a gangway (Copilot's review of #173).
+    expect(block).toContain('const bolted = () => steersStation(currentRoomId(), readPhysicalDoors());');
   });
 });
