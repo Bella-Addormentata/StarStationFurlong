@@ -8,7 +8,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameUrl,
   emulatorIsolated, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom, romAcceptList,
-  EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND,
+  EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
 } from './arcadeEmulator';
 import { setConvenienceLanesForTest } from './sovereignty';
 
@@ -44,6 +44,11 @@ describe('where the emulator files come from', () => {
     expect(emulatorIsolated(EMULATOR_CDN_DATA, 'http://localhost:4173')).toBe(true);
     expect(emulatorIsolated(EMULATOR_CDN_DATA, 'tauri://localhost')).toBe(true);
     expect(emulatorIsolated('http://[bad', 'http://localhost')).toBe(true);
+  });
+
+  it('sandboxes the frame to scripts and pointer lock: never the same origin, and no form, popup or download — each a request no policy governs', () => {
+    expect(EMULATOR_SANDBOX.split(' ').sort()).toEqual(['allow-pointer-lock', 'allow-scripts']);
+    expect(emulatorErrorText('navigated', 'station').title).toContain('LEFT THE CABINET');
   });
 
   it('probes the station path for loader.js and leaves a cross-origin CDN to the loader', async () => {

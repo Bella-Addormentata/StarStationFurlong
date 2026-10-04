@@ -20,7 +20,8 @@
  * the consent the stage asked — never as a URL the frame would fetch with
  * no origin to its name; and the picture will come OUT the same way for
  * the spectator lane (plan §9: ImageBitmaps the frame posts), never by a
- * reach into its canvas, which an opaque origin forbids.
+ * reach into its canvas, which an opaque origin forbids. The sandbox
+ * allows scripts and pointer lock and nothing else (EMULATOR_SANDBOX).
  *
  * The emulator's own files come from one of two places, the owner's call
  * per cabinet (arcadeDoc's `data`): THIS STATION's /emulatorjs/data/ —
@@ -172,12 +173,18 @@ export interface EmulatorHandle {
   destroy(): void;
 }
 
-/** The sandbox every lane's frame runs under: scripts (the engine), forms
- *  and pointer lock (its UI, the mouse as a trackball), popups and
- *  downloads (a save state leaves as a file — an opaque origin has no
- *  storage, so EmulatorJS's export is the only save there is) — and never
- *  allow-same-origin, which is the wall (the header). */
-export const EMULATOR_SANDBOX = 'allow-scripts allow-forms allow-pointer-lock allow-popups allow-downloads';
+/** The sandbox every lane's frame runs under: scripts (the engine) and
+ *  pointer lock (the mouse as a trackball), nothing else — never
+ *  allow-same-origin, which is the wall (the header), and no forms, popups
+ *  or downloads either: each is a request to any URL that no policy
+ *  directive governs, a popup or a download script-initiated at that, and
+ *  the policy's "nothing else" would be hollow with them. (A save state
+ *  therefore leaves by postMessage, the page offering the file — a
+ *  follow-up; EmulatorJS's own export is a download the sandbox refuses,
+ *  and an opaque origin has no storage to keep one in.) What no flag
+ *  forbids is the frame navigating ITSELF: mountEmulatorFrame tears it
+ *  down at its second load, so one URL's worth is the residual. */
+export const EMULATOR_SANDBOX = 'allow-scripts allow-pointer-lock';
 
 /** The parent side of the frame protocol: the frame says hello, the parent
  *  answers with the config, the frame reports ready / started / exit /
@@ -235,6 +242,17 @@ export function mountEmulatorFrame(
     }
   };
   window.addEventListener('message', onMessage);
+  // A frame that loads a SECOND document has navigated itself away — the
+  // one request no sandbox flag forbids (EMULATOR_SANDBOX) — and comes
+  // down. The first load is frame.html's own: with src set before the
+  // frame is inserted, no load event is fired for the initial about:blank
+  // (the HTML standard's iframe load steps), so the count is the test.
+  let loads = 0;
+  const onLoad = () => {
+    loads += 1;
+    if (alive && loads > 1) onEvent({ type: 'error', why: 'navigated' });
+  };
+  iframe.addEventListener('load', onLoad);
   const hello = window.setTimeout(() => {
     if (alive && !configured) onEvent({ type: 'error', why: 'frame' });
   }, EMULATOR_HELLO_TIMEOUT_MS);
@@ -251,6 +269,7 @@ export function mountEmulatorFrame(
       alive = false;
       window.clearTimeout(hello);
       window.removeEventListener('message', onMessage);
+      iframe.removeEventListener('load', onLoad);
       iframe.remove();
     },
   };
@@ -266,6 +285,7 @@ export function emulatorErrorText(why: string, data: EmulatorData): { title: str
   }
   if (why === 'unreachable') return { title: 'THE EMULATOR FILES ARE UNREACHABLE', hint: 'The station answered with an error. Try again in a moment.' };
   if (why === 'frame') return { title: 'THE ARCADE FRAME DID NOT LOAD', hint: 'public/arcade/frame.html is missing from this build.' };
+  if (why === 'navigated') return { title: 'THE EMULATOR FRAME LEFT THE CABINET', hint: 'The frame navigated away from the emulator, so it was torn down. RETRY reloads it.' };
   if (why === 'game') return { title: 'THE GAME DID NOT LOAD', hint: 'The link may be blocked by CORS, the file may not be for this core, or the romset name may not match.' };
   return { title: 'THE CABINET FAULTED', hint: why };
 }

@@ -18,11 +18,15 @@
     location.origin is the URL's, which is why the policy below names it);
     every message goes to the parent with the '*' target (there is no name
     to match, and the parent matches what it hears to this frame's window);
-    there is no
-    storage (EmulatorJS's databases are off; a save state leaves as a file,
-    its export); and the game arrives as BYTES the parent fetched itself, as
+    there is no storage (EmulatorJS's databases are off) and no download
+    (the sandbox allows scripts and pointer lock, nothing else: a form, a
+    popup or a download is a request to any URL no policy governs), so a
+    save state will leave by postMessage, the page offering the file — a
+    follow-up; and the game arrives as BYTES the parent fetched itself, as
     the page, and plays from a blob: URL of this document — never as a URL
-    this frame would fetch with no origin to its name.
+    this frame would fetch with no origin to its name. A frame that
+    navigates itself away (the one request nothing forbids) is torn down by
+    the parent at its second load.
 
     Protocol with the parent (src/arcadeEmulator.ts mountEmulatorFrame):
       frame → parent  { type: 'arcade-frame-ready' }
@@ -134,8 +138,9 @@
         // Its netplay is WebRTC with its own signalling and TURN, marked
         // unstable upstream: not depended on (plan §9). Hide the button.
         window.EJS_Buttons = { netplay: false };
-        // An opaque origin has no storage of its own: save states have
-        // nowhere to go but out, as files (EmulatorJS's export); a
+        // An opaque origin has no storage of its own, and the sandbox
+        // refuses downloads (EmulatorJS's export): a save state will leave
+        // by postMessage, the page offering the file — a follow-up; a
         // station-side store comes with the blob lane.
         window.EJS_disableDatabases = true;
         window.EJS_ready = function () { post('arcade-ready'); };
