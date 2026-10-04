@@ -22,6 +22,7 @@ import {
   AIR_HOCKEY_DISTINCT_PAIRS,
   AIR_HOCKEY_MIN_CONTRAST,
   AIR_HOCKEY_MIN_DELTA_E,
+  AIR_HOCKEY_SEVERITY_SWEEP,
   AIR_HOCKEY_THEMES,
   AIR_HOCKEY_THEME_LABELS,
   AIR_HOCKEY_THEME_SPECS,
@@ -31,10 +32,17 @@ import {
   airHockeyThemeConfusionIssues,
   airHockeyThemeContrastIssues,
   contrastRatio,
+  contrastRatioOf,
+  deltaE2000,
+  deltaE76,
   hexCss,
   isAirHockeyThemeId,
+  labOf,
+  perceptualDistance,
   relativeLuminance,
   simulateDichromacy,
+  simulateDichromacyLinear,
+  toLinearRgb,
   type AirHockeyThemeId,
   type AirHockeyThemeSpec,
 } from './airHockeyTheme';
@@ -258,7 +266,10 @@ describe('air-hockey theme palette', () => {
   it('formats colours for the canvas painters', () => {
     expect(hexCss(0x000000)).toBe('#000000');
     expect(hexCss(0xeef4fa)).toBe('#eef4fa');
-    expect(hexCss(0x0b6b82)).toBe('#0b6b82'); // leading zero kept
+    // Two leading zeros, and a colour actually in the palette: arctic's
+    // mallet A. A naive toString(16) emits '4563' here and the canvas
+    // silently paints the wrong thing.
+    expect(hexCss(0x004563)).toBe('#004563');
   });
 });
 
@@ -402,9 +413,18 @@ function buildTable(id: string): THREE.Group {
 // ── Observers other than the standard one ────────────────────────────
 
 /**
- * CIE76 ΔE, written out here independently of the module's own copy. The
- * duplication is the point: a transcription error in either one shows up as
- * a disagreement rather than as two matching wrong answers.
+ * CIE76 ΔE from a 0xRRGGBB pair, written out here independently of the
+ * module's own sRGB → L*a*b* → distance chain.
+ *
+ * What this is worth, stated honestly: it is a TRANSCRIPTION check, not an
+ * independent implementation. Both copies came from the same definition, so
+ * a shared misreading of CIE 15:2004 would show up in neither; what it
+ * catches is a typo'd matrix coefficient or a dropped term in one of them.
+ * That is worth having — the module's chain is now three functions deep and
+ * this one is flat — but it is not an oracle.
+ *
+ * The oracle is SHARMA_CIEDE2000_VECTORS below, which is a published
+ * known-answer set this file could not have produced for itself.
  */
 function deltaE(a: number, b: number): number {
   const lab = (c: number) => {
@@ -423,6 +443,62 @@ function deltaE(a: number, b: number): number {
   const [l2, a2, b2] = lab(b);
   return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
 }
+
+/**
+ * The CIEDE2000 known-answer set: Sharma, Wu & Dalal (2005), "The CIEDE2000
+ * Color-Difference Formula: Implementation Notes, Supplementary Test Data,
+ * and Mathematical Observations", Color Research & Application 30(1), 21–30.
+ *
+ * Columns: L1 a1 b1 L2 a2 b2 ΔE00, the published values to four decimals.
+ *
+ * These 34 pairs are not a random sample. The authors chose them to sit on
+ * the discontinuities implementations get wrong — pairs straddling the
+ * 0°/360° hue wrap, pairs with one neutral colour where hue is undefined,
+ * and pairs in the blue region where the rotation term bites. An
+ * implementation can be wrong in exactly those places and still look right
+ * on ordinary colours, which is why a hand-rolled CIEDE2000 needs this and
+ * not a round-trip test.
+ *
+ * Source: the authors' own ciede2000testdata.txt. The live copy at
+ * www2.ece.rochester.edu/~gsharma/ciede2000/dataNprograms/ now 404s; this is
+ * the Internet Archive capture 20211016000323 of that URL.
+ */
+const SHARMA_CIEDE2000_VECTORS: readonly (readonly number[])[] = [
+  [50.0000, 2.6772, -79.7751, 50.0000, 0.0000, -82.7485, 2.0425],
+  [50.0000, 3.1571, -77.2803, 50.0000, 0.0000, -82.7485, 2.8615],
+  [50.0000, 2.8361, -74.0200, 50.0000, 0.0000, -82.7485, 3.4412],
+  [50.0000, -1.3802, -84.2814, 50.0000, 0.0000, -82.7485, 1.0000],
+  [50.0000, -1.1848, -84.8006, 50.0000, 0.0000, -82.7485, 1.0000],
+  [50.0000, -0.9009, -85.5211, 50.0000, 0.0000, -82.7485, 1.0000],
+  [50.0000, 0.0000, 0.0000, 50.0000, -1.0000, 2.0000, 2.3669],
+  [50.0000, -1.0000, 2.0000, 50.0000, 0.0000, 0.0000, 2.3669],
+  [50.0000, 2.4900, -0.0010, 50.0000, -2.4900, 0.0009, 7.1792],
+  [50.0000, 2.4900, -0.0010, 50.0000, -2.4900, 0.0010, 7.1792],
+  [50.0000, 2.4900, -0.0010, 50.0000, -2.4900, 0.0011, 7.2195],
+  [50.0000, 2.4900, -0.0010, 50.0000, -2.4900, 0.0012, 7.2195],
+  [50.0000, -0.0010, 2.4900, 50.0000, 0.0009, -2.4900, 4.8045],
+  [50.0000, -0.0010, 2.4900, 50.0000, 0.0010, -2.4900, 4.8045],
+  [50.0000, -0.0010, 2.4900, 50.0000, 0.0011, -2.4900, 4.7461],
+  [50.0000, 2.5000, 0.0000, 50.0000, 0.0000, -2.5000, 4.3065],
+  [50.0000, 2.5000, 0.0000, 73.0000, 25.0000, -18.0000, 27.1492],
+  [50.0000, 2.5000, 0.0000, 61.0000, -5.0000, 29.0000, 22.8977],
+  [50.0000, 2.5000, 0.0000, 56.0000, -27.0000, -3.0000, 31.9030],
+  [50.0000, 2.5000, 0.0000, 58.0000, 24.0000, 15.0000, 19.4535],
+  [50.0000, 2.5000, 0.0000, 50.0000, 3.1736, 0.5854, 1.0000],
+  [50.0000, 2.5000, 0.0000, 50.0000, 3.2972, 0.0000, 1.0000],
+  [50.0000, 2.5000, 0.0000, 50.0000, 1.8634, 0.5757, 1.0000],
+  [50.0000, 2.5000, 0.0000, 50.0000, 3.2592, 0.3350, 1.0000],
+  [60.2574, -34.0099, 36.2677, 60.4626, -34.1751, 39.4387, 1.2644],
+  [63.0109, -31.0961, -5.8663, 62.8187, -29.7946, -4.0864, 1.2630],
+  [61.2901, 3.7196, -5.3901, 61.4292, 2.2480, -4.9620, 1.8731],
+  [35.0831, -44.1164, 3.7933, 35.0232, -40.0716, 1.5901, 1.8645],
+  [22.7233, 20.0904, -46.6940, 23.0331, 14.9730, -42.5619, 2.0373],
+  [36.4612, 47.8580, 18.3852, 36.2715, 50.5065, 21.2231, 1.4146],
+  [90.8027, -2.0831, 1.4410, 91.1528, -1.6435, 0.0447, 1.4441],
+  [90.9257, -0.5406, -0.9208, 88.6381, -0.8985, -0.7239, 1.5381],
+  [6.7747, -0.2908, -2.4247, 5.8714, -0.0985, -2.2286, 0.6377],
+  [2.0776, 0.0795, -1.1350, 0.9033, -0.0636, -0.5514, 0.9082],
+];
 
 describe('air-hockey theme palette, to a colour-blind player', () => {
   it('simulates the two anchors the maths has to get right', () => {
@@ -461,16 +537,109 @@ describe('air-hockey theme palette, to a colour-blind player', () => {
     }
   });
 
+  it('matches the published CIEDE2000 answers, including the awkward ones', () => {
+    // deltaE2000 is forty lines of trigonometry with three documented traps
+    // in it, hand-written in this repo. Nothing else here can tell whether
+    // it is right: every other test in this file consumes it, so they all
+    // move together if it is wrong. This is the one check with an outside
+    // answer, and the authors chose these pairs to land on the traps.
+    let worst = 0;
+    for (const [l1, a1, b1, l2, a2, b2, published] of SHARMA_CIEDE2000_VECTORS) {
+      const got = deltaE2000([l1, a1, b1], [l2, a2, b2]);
+      worst = Math.max(worst, Math.abs(got - published));
+      expect(got, `CIEDE2000 (${l1},${a1},${b1}) -> (${l2},${a2},${b2})`)
+        .toBeCloseTo(published, 3);
+      // ΔE is a metric, so it cannot depend on which colour is named first.
+      // The hue-wrap branch is exactly where a sloppy implementation stops
+      // being symmetric, and four of these pairs straddle it. Today this
+      // holds to the last bit, but it is asserted loosely on purpose: a
+      // real wrap bug is asymmetric by order 1, not by an ULP, and pinning
+      // bit-equality would fire on a refactor that changed nothing.
+      expect(deltaE2000([l2, a2, b2], [l1, a1, b1]), 'asymmetric').toBeCloseTo(got, 10);
+    }
+    // The published values are quoted to four decimals, so agreement can
+    // only be asserted to about 5e-5; pinning the figure keeps a future
+    // "harmless" refactor of the formula from quietly costing accuracy.
+    expect(worst, 'worst deviation from the published answers').toBeLessThan(5e-5);
+    expect(SHARMA_CIEDE2000_VECTORS, 'the published set is 34 pairs').toHaveLength(34);
+    // And the degenerate case the test data does not cover: a colour is at
+    // no distance from itself, under either formula.
+    for (const id of AIR_HOCKEY_THEMES) {
+      const lab = labOf(toLinearRgb(AIR_HOCKEY_THEME_SPECS[id].puck));
+      expect(deltaE2000(lab, lab)).toBe(0);
+      expect(deltaE76(lab, lab)).toBe(0);
+    }
+  });
+
+  it('gates on whichever of the two formulae is less generous', () => {
+    // perceptualDistance takes the MINIMUM of CIE76 and CIEDE2000 rather
+    // than picking one. The reason is that neither is authoritative here:
+    // CIEDE2000 was fitted on pairs below ΔE 5 and this gate's floor is 15,
+    // while CIE76 overstates differences between saturated colours — which
+    // is precisely what CIEDE2000's S_C and S_H chroma weighting was added
+    // to correct. Taking the smaller means a colour has to satisfy the
+    // stricter reading, whichever that turns out to be.
+    for (const id of AIR_HOCKEY_THEMES) {
+      const spec = AIR_HOCKEY_THEME_SPECS[id];
+      for (const [label, a, b] of AIR_HOCKEY_DISTINCT_PAIRS) {
+        const p = toLinearRgb(spec[a]);
+        const q = toLinearRgb(spec[b]);
+        const both = [deltaE76(labOf(p), labOf(q)), deltaE2000(labOf(p), labOf(q))];
+        const got = perceptualDistance(p, q);
+        expect(got, `${id}: ${label} is not the smaller reading`).toBe(Math.min(...both));
+      }
+    }
+    // On the palette as it stands CIEDE2000 is the binding one in all 10836
+    // readings the ΔE gate takes, so the min currently resolves to it every
+    // time. That is an observation about these colours, not a property of
+    // the formulae, and it is deliberately not asserted: a future palette
+    // may well reach a region where CIE76 is the stricter of the two, and
+    // that is the case the min is here to cover.
+  });
+
   it('clears the floor for protanopia and deuteranopia, every pair, every preset', () => {
     // The gate the goal reds were actually chosen against. Not required by
     // WCAG 2.1 §1.4.11, which is specified for the standard observer — this
-    // module goes further, and the margin is thin enough (3.01 : 1 at worst)
-    // that it has to be enforced rather than remembered.
+    // module goes further, and the margin is thin enough (3.035 : 1 at
+    // worst, on midnight's rink markings against its felt under
+    // deuteranopia) that it has to be enforced rather than remembered.
     const issues = AIR_HOCKEY_THEMES.flatMap((id) => [
       ...airHockeyThemeContrastIssues(id, 'protanopia'),
       ...airHockeyThemeContrastIssues(id, 'deuteranopia'),
     ]);
     expect(issues).toEqual([]);
+  });
+
+  it('needs no severity sweep for contrast, and proves it rather than assuming', () => {
+    // The asymmetry between the two gates: ΔE is swept across the severities
+    // between the standard observer and the dichromat, contrast is not. That
+    // is not an oversight and not a performance trade — contrast PROVABLY
+    // has no interior minimum to find. The LMS blend is linear in severity
+    // and luminance is linear in linear light, so each simulated luminance
+    // is affine in severity and the ratio (La + 0.05) / (Lb + 0.05) is a
+    // Möbius function of it, which is monotone. Gamut clipping is the only
+    // escape and it is piecewise-linear, so it cannot manufacture one either.
+    //
+    // A proof that is only in a comment is a proof nobody re-runs. This
+    // sweeps anyway and asserts the sweep finds nothing the ends did not:
+    // if someone later makes the simulation non-linear in severity, this
+    // fails and the comment above stops being a lie.
+    for (const vision of ['protanopia', 'deuteranopia'] as const) {
+      for (const id of AIR_HOCKEY_THEMES) {
+        const spec = AIR_HOCKEY_THEME_SPECS[id];
+        for (const [label, a, b] of AIR_HOCKEY_CONTRAST_PAIRS) {
+          const at = (s: number) => contrastRatioOf(
+            simulateDichromacyLinear(spec[a], vision, s),
+            simulateDichromacyLinear(spec[b], vision, s),
+          );
+          const swept = Math.min(...AIR_HOCKEY_SEVERITY_SWEEP.map(at));
+          // Exact equality, not toBeCloseTo: the minimum is AT an endpoint,
+          // so the swept value is the very same float, not a near one.
+          expect(swept, `${id}: ${label} under ${vision} dips between its ends`)
+            .toBe(Math.min(at(0), at(1)));
+        }
+      }
+    }
   });
 
   it('never loses the puck itself, to any observer this module can measure', () => {
@@ -493,15 +662,32 @@ describe('air-hockey theme palette, to a colour-blind player', () => {
   });
 
   it('keeps the marks on the table apart, not just visible', () => {
-    // The gate AIR_HOCKEY_MIN_DELTA_E exists for, run the same shape as the
-    // contrast gate and for the same reason: the margin is thin enough
-    // (ΔE 16.7 at worst) that it has to be enforced rather than remembered.
+    // The gate AIR_HOCKEY_MIN_DELTA_E exists for, run at the observers.
+    // Thinner than the contrast gate: ΔE 15.65 against a floor of 15, on
+    // midnight's goal line against its orange mallet under deuteranopia.
     const issues = AIR_HOCKEY_VISIONS.flatMap((vision) =>
       AIR_HOCKEY_THEMES.flatMap((id) => airHockeyThemeConfusionIssues(id, vision)));
     expect(issues).toEqual([]);
 
+    // And across every severity between them, which the contrast gate does
+    // not need and this one does: 45 of the 56 ΔE curves have a strictly
+    // interior minimum, the deepest of them 8.3 below both of its ends.
+    // Checking only the ends would therefore pass a palette that fails in
+    // the middle — and most real red-green deficiency IS in the middle,
+    // anomalous trichromacy being roughly two and a half times as common
+    // as the full dichromacy the endpoints model.
+    const swept = AIR_HOCKEY_VISIONS.flatMap((vision) =>
+      AIR_HOCKEY_THEMES.flatMap((id) =>
+        AIR_HOCKEY_SEVERITY_SWEEP.flatMap((s) => airHockeyThemeConfusionIssues(id, vision, s))));
+    expect(swept).toEqual([]);
+
     // And the same question asked with the ΔE written out above, so the two
-    // implementations have to agree rather than just the one being run twice.
+    // implementations have to agree rather than just the one being run
+    // twice. This one reads the QUANTISED simulation on purpose: it is the
+    // old measurement path, kept as a second opinion, and the floor it
+    // clears is lower (19.6, on arctic's mallet A against the rink markings
+    // under protanopia) because CIE76 and 8-bit rounding both move the
+    // numbers. It is a cross-check on the maths, not a second gate.
     for (const vision of AIR_HOCKEY_VISIONS) {
       for (const id of AIR_HOCKEY_THEMES) {
         const spec = AIR_HOCKEY_THEME_SPECS[id];
@@ -517,21 +703,93 @@ describe('air-hockey theme palette, to a colour-blind player', () => {
     }
   });
 
+  it('measures in linear light, and does not round the answer to 8 bits', () => {
+    // Both gates run on simulateDichromacyLinear, not on the packed
+    // 24-bit simulateDichromacy, and that is a correctness requirement
+    // rather than a preference. Rounding a simulated colour back to 8 bits
+    // models nothing — the eye is not quantised — and it moved a contrast
+    // ratio by up to 0.103 where the tightest row clears its floor by
+    // 0.035. The old gate reported a midnight goal red dipping below the
+    // floor between its ends; that dip was entirely the rounding.
+    const partial = simulateDichromacyLinear(0xd2535c, 'deuteranopia', 0.5);
+    const encoded = partial.map((v) => (v <= 0.0031308 ? v * 12.92 : 1.055 * v ** (1 / 2.4) - 0.055) * 255);
+    for (const channel of encoded) {
+      expect(Math.abs(channel - Math.round(channel)), 'landed on the 8-bit grid')
+        .toBeGreaterThan(0.01);
+    }
+
+    // And colours outside sRGB are kept rather than clamped. A dichromat
+    // simulation routinely lands outside the display gamut; clamping would
+    // compress exactly the extremes the gates are measuring, flattering
+    // the palette. labOf uses Math.cbrt rather than ** (1/3) so these stay
+    // real numbers instead of becoming NaN on a negative channel.
+    const beyond = simulateDichromacyLinear(AIR_HOCKEY_THEME_SPECS.midnight.puck, 'deuteranopia');
+    expect(beyond.some((v) => v > 1 || v < 0), 'the gamut escape was clamped away').toBe(true);
+    for (const component of labOf(beyond)) expect(Number.isFinite(component)).toBe(true);
+
+    // The packing wrapper is the one place that may round, because a
+    // THREE.Color needs 24 bits — but it must agree with the linear core
+    // it wraps, or the two paths have drifted.
+    for (const id of AIR_HOCKEY_THEMES) {
+      const spec = AIR_HOCKEY_THEME_SPECS[id];
+      for (const vision of AIR_HOCKEY_VISIONS) {
+        const packed = simulateDichromacy(spec.playerA, vision);
+        const direct = simulateDichromacyLinear(spec.playerA, vision);
+        // Written the way channelFromLinear is written, including where it
+        // clamps: the floor is inside the power (a negative base would be
+        // NaN) and the 0..255 clamp is applied after rounding, not before
+        // the transfer function. Clamping in the wrong place is a one-bit
+        // difference at the gamut edge, which is where the escapes live.
+        const expected = direct.map((v) => Math.max(0, Math.min(255, Math.round(
+          (v <= 0.0031308 ? v * 12.92 : 1.055 * Math.max(v, 0) ** (1 / 2.4) - 0.055) * 255,
+        ))));
+        expect([(packed >> 16) & 0xff, (packed >> 8) & 0xff, packed & 0xff],
+          `${id} mallet A under ${vision}: packed and linear disagree`).toEqual(expected);
+      }
+    }
+  });
+
   it('measures what the contrast rows cannot, and says so about the mallets', () => {
     // Why this is a second gate and not a redundant one, shown on the real
     // palette. The mallets are cyan and orange — the standard colourblind-safe
     // pair — which makes them unmistakable as COLOURS and all but identical in
-    // BRIGHTNESS. Both halves hold across every preset and every observer.
+    // BRIGHTNESS. Both halves hold at every severity, not just at the ends.
+    //
+    // 30 and not 50. An earlier revision asserted ΔE > 50, which passes —
+    // but only because it read CIE76 on the quantised output at three
+    // discrete observers, where the worst reading is 50.46. Measured the
+    // way the gate measures, swept and on the stricter of the two
+    // formulae, the mallets come within 33.2 of each other (sandstone
+    // under protanopia, around severity 0.69). The old number was never
+    // wrong; it was describing a different and more flattering
+    // measurement, and it cleared by 0.46, which is luck rather than
+    // margin. This asserts the same claim about the same palette with
+    // room that reflects what was actually measured.
     for (const vision of AIR_HOCKEY_VISIONS) {
       for (const id of AIR_HOCKEY_THEMES) {
         const spec = AIR_HOCKEY_THEME_SPECS[id];
-        const a = simulateDichromacy(spec.playerA, vision);
-        const b = simulateDichromacy(spec.playerB, vision);
-        expect(deltaE(a, b), `${id} mallets under ${vision}`).toBeGreaterThan(50);
-        expect(contrastRatio(a, b), `${id} mallets under ${vision}`)
-          .toBeLessThan(AIR_HOCKEY_MIN_CONTRAST);
+        for (const severity of AIR_HOCKEY_SEVERITY_SWEEP) {
+          const a = simulateDichromacyLinear(spec.playerA, vision, severity);
+          const b = simulateDichromacyLinear(spec.playerB, vision, severity);
+          const where = `${id} mallets under ${vision} at severity ${severity.toFixed(3)}`;
+          expect(perceptualDistance(a, b), where).toBeGreaterThan(30);
+          expect(contrastRatioOf(a, b), where).toBeLessThan(AIR_HOCKEY_MIN_CONTRAST);
+        }
       }
     }
+    // The second half of that is the whole point, so pin how little room
+    // it has: the mallets reach 1.81 : 1 at their most separated, barely
+    // past half the 3 : 1 a contrast row would demand. There is no paint
+    // that fixes this — two colours a dichromat can tell apart by hue are
+    // by construction close in luminance — so the gate has to be ΔE.
+    const brightest = Math.max(...AIR_HOCKEY_THEMES.flatMap((id) =>
+      AIR_HOCKEY_VISIONS.flatMap((vision) => AIR_HOCKEY_SEVERITY_SWEEP.map((severity) =>
+        contrastRatioOf(
+          simulateDichromacyLinear(AIR_HOCKEY_THEME_SPECS[id].playerA, vision, severity),
+          simulateDichromacyLinear(AIR_HOCKEY_THEME_SPECS[id].playerB, vision, severity),
+        )))));
+    expect(brightest, 'the mallets got far enough apart to pass a contrast gate')
+      .toBeLessThan(2);
     // So a contrast row for the mallets would fail permanently while being
     // wrong about them, which is why there is not one. Asserted rather than
     // left to a comment, because the gap looks like an oversight.
