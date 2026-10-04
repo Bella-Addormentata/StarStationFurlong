@@ -115,6 +115,7 @@ export function stationPlan(
 ): StationPlan {
   if (!rootRoomId || !ownValue(atlas, rootRoomId)) return emptyPlan(rootRoomId);
   const station = atlasComponent(atlas, rootRoomId);
+  const berths = berthDoorIds(atlas);
   const poses = atlasPoses(atlas, rootRoomId, {
     liveRoomId,
     // No depth cap: the walk is cycle-safe and the atlas holds at most
@@ -122,8 +123,10 @@ export function stationPlan(
     maxHops: Infinity,
     expand: (roomId) => station.has(roomId),
     reverse: true,
+    // Each module where the pairings that join it to the station put it
+    // (the ones atlasComponent walks), and only a ship where its berth does.
+    berths,
   });
-  const berths = berthDoorIds(atlas);
   const farOnly = farOnlyRecords(atlas);
   const byId = new Map(poses.map((p) => [p.roomId, p]));
 

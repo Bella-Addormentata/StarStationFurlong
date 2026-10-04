@@ -408,6 +408,28 @@ describe('a layout replacing the room', () => {
     expect(readRobotConfig('d1')).toBeNull();
     expect(readRobotConfig('d2')).toBeNull();
   });
+
+  it('takes a dock\'s robot off the job when the layout gives its id to a piece of another kind, its work kept', () => {
+    const MIN = 60_000;
+    const doc = new Y.Doc();
+    bindRobotDoc(doc);
+    bindFurnitureDoc(doc);
+    // The set's terminal takes the id this dock has.
+    const id = templateItemsFor(party).find((i) => i.kind === 'wall-computer')!.id;
+    writeFurnitureItem({ id, kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    assignDisassembly(id, { roomId: 'room-b', name: 'GARDEN', doorId: 'east', laborHours: 24 }, 0);
+    vi.useFakeTimers();
+    vi.setSystemTime(10 * MIN);
+    try {
+      applyRoomTemplate('party-2');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(readAllFurniture().get(id)?.kind).toBe('wall-computer');
+    // It worked ten minutes before its dock went, and that work is kept.
+    expect(readDisassemblyJob('room-b')).toMatchObject({ doneMs: 10 * MIN, asOf: 10 * MIN, crew: [] });
+    expect(readRobotConfig(id)).toBeNull();
+  });
 });
 
 describe('a race is a matter of seconds', () => {

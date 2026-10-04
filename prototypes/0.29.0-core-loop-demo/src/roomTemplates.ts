@@ -822,9 +822,10 @@ function configureTemplateDocks(t: RoomTemplate, items: readonly FurnitureItem[]
 /** 🔧 A layout about to replace the room's drops every charging dock it
  *  doesn't keep: a robot of one taking a module apart leaves the job first,
  *  while its dock is still placed, so the work it did is kept (editMode's
- *  REMOVE does the same for one dock). */
+ *  REMOVE does the same for one dock). A dock is kept only by a dock of the
+ *  same id: an id the layout gives a piece of another kind drops it too. */
 function releaseDroppedDocks(next: readonly FurnitureItem[]): void {
-  const kept = new Set(next.map((i) => i.id));
+  const kept = new Set(next.filter((i) => i.kind === "charging-dock").map((i) => i.id));
   for (const [id, rec] of readAllFurniture()) {
     if (rec.kind === "charging-dock" && !kept.has(id) && readRobotConfig(id)?.routine === "disassemble") clearRobotConfig(id);
   }

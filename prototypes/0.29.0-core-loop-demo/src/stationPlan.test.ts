@@ -172,6 +172,46 @@ describe('the station plan', () => {
     ]));
   });
 
+  it('poses a module through the pairing that joins it, not a berth that also names it', () => {
+    // The hub's unnamed south door names the bar, which recorded a berth
+    // back (so the hub's record is that berth, as berthDoorIds pairs them)
+    // and a gangway from its west door to the hub's east one: the bar is a
+    // module of the station, east of the hub.
+    harvestIntoAtlas({ roomId: 's-hub', name: 'HUB', doors: [{ doorId: 'south', targetSeed: seed('s-bar'), wall: 'y+', lateral: 0, transient: false }] });
+    harvestIntoAtlas({ roomId: 's-bar', name: 'BAR', doors: [
+      { doorId: 'dock', targetSeed: seed('s-hub'), wall: 'y-', lateral: 0, transient: true },
+      { doorId: 'west', targetSeed: seed('s-hub'), wall: 'x-', lateral: 0, farDoor: 'east', farWall: 'x+', farLateral: 0, transient: false },
+    ] });
+    const plan = stationPlan(readAtlas(), 's-hub');
+    expect(plan.modules.map((m) => m.roomId)).toEqual(['s-hub', 's-bar']);
+    expect(plan.ships).toEqual([]);
+    const [hub, bar] = plan.modules;
+    expect(bar.x).toBeGreaterThan(hub.halfX);
+    expect(Math.abs(bar.z)).toBeLessThan(1e-6);
+    expect(Math.cos(bar.rotY)).toBeCloseTo(1, 6);
+  });
+
+  it('places a ship docked past the root at its berth, once every module is placed', () => {
+    harvestIntoAtlas({ roomId: 'k-hub', name: 'HUB', doors: [
+      { doorId: 'east', targetSeed: seed('k-bar'), wall: 'x+', lateral: 0, farDoor: 'west', farWall: 'x-', farLateral: 0, transient: false },
+    ] });
+    harvestIntoAtlas({ roomId: 'k-bar', name: 'BAR', doors: [
+      { doorId: 'west', targetSeed: seed('k-hub'), wall: 'x-', lateral: 0, farDoor: 'east', farWall: 'x+', farLateral: 0, transient: false },
+      { doorId: 'south', targetSeed: seed('k-ship'), wall: 'y+', lateral: 0, farDoor: 'north', farWall: 'y-', farLateral: 0, transient: true },
+    ] });
+    harvestIntoAtlas({ roomId: 'k-ship', name: 'SKIFF', doors: [
+      { doorId: 'north', targetSeed: seed('k-bar'), wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0, transient: true },
+    ] });
+    const plan = stationPlan(readAtlas(), 'k-hub');
+    expect(plan.modules.map((m) => m.roomId)).toEqual(['k-hub', 'k-bar']);
+    expect(plan.ships.map((m) => [m.roomId, m.hops])).toEqual([['k-ship', 2]]);
+    const [, bar] = plan.modules;
+    const ship = plan.ships[0];
+    expect(ship.x).toBeCloseTo(bar.x, 6);
+    expect(Math.abs(ship.z - bar.z)).toBeGreaterThan(bar.halfZ);
+    expect(ship.dockedAt).toMatchObject({ roomId: 'k-bar', doorId: 'south' });
+  });
+
   it('docks a ship whose berth only the ship recorded', () => {
     harvestIntoAtlas({ roomId: 'q-hub', name: 'HUB', doors: [], gates: { south: 4 } });
     harvestIntoAtlas({ roomId: 'q-ship', name: 'SKIFF', doors: [{ doorId: 'north', targetSeed: seed('q-hub'), wall: 'y-', lateral: 0, farDoor: 'south', farWall: 'y+', farLateral: 0, transient: true }] });

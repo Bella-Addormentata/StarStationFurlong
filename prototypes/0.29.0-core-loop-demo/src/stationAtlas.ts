@@ -1303,6 +1303,10 @@ export function atlasLayout(currentRoomId: string, maxHops = 10): AtlasPose[] {
  * `expand` stops the walk at a room (placed, but its doors not followed) —
  * the holotable places docked ships without walking on through them.
  * `reverse` also follows a pairing recorded only on the far room's side.
+ * `berths` (berthDoorIds) are followed only from the rooms every other
+ * record reaches, once that walk is done: a module the station's structure
+ * joins is posed through it, never through a berth that also names it, and
+ * a docked ship through its berth.
  */
 /** 🗺️ `record[key]` when the record holds it as its own key, else undefined:
  *  a room or door id off the wire such as `constructor`, `__proto__` or
@@ -1357,7 +1361,13 @@ function hopLocal(
 export function atlasPoses(
   atlas: Record<string, AtlasEntry>,
   rootRoomId: string,
-  opts: { liveRoomId?: string; maxHops?: number; expand?: (roomId: string) => boolean; reverse?: boolean } = {},
+  opts: {
+    liveRoomId?: string;
+    maxHops?: number;
+    expand?: (roomId: string) => boolean;
+    reverse?: boolean;
+    berths?: ReadonlyMap<string, ReadonlySet<string>>;
+  } = {},
 ): AtlasPose[] {
   const maxHops = opts.maxHops ?? 10;
   const currentRoomId = opts.liveRoomId ?? '';
@@ -1373,59 +1383,67 @@ export function atlasPoses(
     dims: root.dims,
     x: 0, z: 0, rotY: 0, hops: 0,
   });
-  const queue: string[] = [rootRoomId];
-  while (queue.length > 0) {
-    const fromId = queue.shift()!;
-    const from = placed.get(fromId)!;
-    if (from.hops >= maxHops) continue;
-    if (opts.expand && fromId !== rootRoomId && !opts.expand(fromId)) continue;
-    const entry = ownValue(atlas, fromId);
-    if (!entry) continue;
-    for (const [doorId, door] of Object.entries(entry.doors ?? {}) as Array<[DoorId, AtlasDoor]>) {
-      if (!door || !door.targetRoomId || placed.has(door.targetRoomId)) continue;
-      const local = hopLocal(atlas, fromId, doorId, door, currentRoomId);
-      const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
-      const wx = from.x + local.x * cos + local.z * sin;
-      const wz = from.z - local.x * sin + local.z * cos;
-      const target = ownValue(atlas, door.targetRoomId);
-      placed.set(door.targetRoomId, {
-        roomId: door.targetRoomId,
-        name: target?.name ?? 'Module',
-        seed: target?.seed ?? door.targetSeed,
-        dims: target?.dims,
-        x: wx,
-        z: wz,
-        rotY: from.rotY + local.rotY,
-        hops: from.hops + 1,
-      });
-      queue.push(door.targetRoomId);
+  const berths = opts.berths;
+  const isBerth = (roomId: string, doorId: string) => berths?.get(roomId)?.has(doorId) === true;
+  // One BFS from `queue`; `viaBerths` false leaves every berth record out.
+  const walk = (queue: string[], viaBerths: boolean) => {
+    while (queue.length > 0) {
+      const fromId = queue.shift()!;
+      const from = placed.get(fromId)!;
+      if (from.hops >= maxHops) continue;
+      if (opts.expand && fromId !== rootRoomId && !opts.expand(fromId)) continue;
+      const entry = ownValue(atlas, fromId);
+      if (!entry) continue;
+      for (const [doorId, door] of Object.entries(entry.doors ?? {}) as Array<[DoorId, AtlasDoor]>) {
+        if (!door || !door.targetRoomId || placed.has(door.targetRoomId)) continue;
+        if (!viaBerths && isBerth(fromId, doorId)) continue;
+        const local = hopLocal(atlas, fromId, doorId, door, currentRoomId);
+        const cos = Math.cos(from.rotY), sin = Math.sin(from.rotY);
+        const wx = from.x + local.x * cos + local.z * sin;
+        const wz = from.z - local.x * sin + local.z * cos;
+        const target = ownValue(atlas, door.targetRoomId);
+        placed.set(door.targetRoomId, {
+          roomId: door.targetRoomId,
+          name: target?.name ?? 'Module',
+          seed: target?.seed ?? door.targetSeed,
+          dims: target?.dims,
+          x: wx,
+          z: wz,
+          rotY: from.rotY + local.rotY,
+          hops: from.hops + 1,
+        });
+        queue.push(door.targetRoomId);
+      }
+      // 🗺️ A pairing recorded only on the FAR side (the station grouping counts
+      // it, atlasComponent) still joins the two: pose the far room through its
+      // own record of the door and invert that hop.
+      if (!opts.reverse) continue;
+      for (const other of Object.values(atlas)) {
+        if (!other?.roomId || placed.has(other.roomId)) continue;
+        const back = (Object.entries(other.doors ?? {}) as Array<[DoorId, AtlasDoor]>)
+          .find(([doorId, d]) => d?.targetRoomId === fromId && (viaBerths || !isBerth(other.roomId, doorId)));
+        if (!back) continue;
+        // `from` in the other room's frame: from = other + R(other.rotY)·l.
+        const l = hopLocal(atlas, other.roomId, back[0], back[1], currentRoomId);
+        const rotY = from.rotY - l.rotY;
+        const cos = Math.cos(rotY), sin = Math.sin(rotY);
+        placed.set(other.roomId, {
+          roomId: other.roomId,
+          name: other.name,
+          seed: other.seed,
+          dims: other.dims,
+          x: from.x - (l.x * cos + l.z * sin),
+          z: from.z - (-l.x * sin + l.z * cos),
+          rotY,
+          hops: from.hops + 1,
+        });
+        queue.push(other.roomId);
+      }
     }
-    // 🗺️ A pairing recorded only on the FAR side (the station grouping counts
-    // it, atlasComponent) still joins the two: pose the far room through its
-    // own record of the door and invert that hop.
-    if (!opts.reverse) continue;
-    for (const other of Object.values(atlas)) {
-      if (!other?.roomId || placed.has(other.roomId)) continue;
-      const back = (Object.entries(other.doors ?? {}) as Array<[DoorId, AtlasDoor]>)
-        .find(([, d]) => d?.targetRoomId === fromId);
-      if (!back) continue;
-      // `from` in the other room's frame: from = other + R(other.rotY)·l.
-      const l = hopLocal(atlas, other.roomId, back[0], back[1], currentRoomId);
-      const rotY = from.rotY - l.rotY;
-      const cos = Math.cos(rotY), sin = Math.sin(rotY);
-      placed.set(other.roomId, {
-        roomId: other.roomId,
-        name: other.name,
-        seed: other.seed,
-        dims: other.dims,
-        x: from.x - (l.x * cos + l.z * sin),
-        z: from.z - (-l.x * sin + l.z * cos),
-        rotY,
-        hops: from.hops + 1,
-      });
-      queue.push(other.roomId);
-    }
-  }
+  };
+  walk([rootRoomId], berths === undefined);
+  // ⚓ Then the berths, from every room placed so far, in the order placed.
+  if (berths) walk([...placed.keys()], true);
   return [...placed.values()];
 }
 
