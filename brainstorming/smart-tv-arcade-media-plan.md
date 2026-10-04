@@ -135,8 +135,11 @@ sample the network held through the sleep and delivers on waking is
 stamped from before the gap, as a lease is, and is stale with the rest;
 what the page wrote itself is received as it is written, whatever the
 marks say — a holder waking and beating is never stale to itself).
-The holder's next heartbeat is at most 3 s away, and a viewer whose
-player stopped with the machine is then seeked once, to where the room
+The first heartbeat the viewer can act on is at most
+`TV_WAKE_WINDOW_MS + TV_HEARTBEAT_MS` away — 4 s: a beat delivered inside
+the wake window is stamped from before the gap, so the first fresh one is
+the holder's next — and a viewer whose player stopped with the machine is
+then seeked once, to where the room
 is, never to where the sleep says; a headless holder beats on from its
 own extrapolation, which is the room's clock whether or not its page
 slept, and that beat is what un-stales everyone.
@@ -763,9 +766,28 @@ the associated data and is under the sender's signature below, so a hub can
 relabel nothing: a frame moved to another leg or another counter neither
 opens nor verifies. The header is all the node needs to route (the
 subscriber set), to serve the glimpse tier (the keyframe flag) and to drop,
-and it gets nothing else. The sender mints the source key, seals it to each
-subscriber's X25519 key (derived from their Ed25519 identity, the libsodium
-conversion) on the reliable lane when the subscription is accepted, and
+and it gets nothing else. The sender mints the source key and seals it to
+each subscriber on the reliable lane when the subscription is accepted —
+one construction, pinned, so Rust and TypeScript derive the same bytes and
+a key message can be substituted for no other: HPKE as RFC 9180 defines
+it, base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and
+ChaCha20-Poly1305, a single-shot `Seal` of the 32-byte media key to the
+subscriber's static X25519 key, derived from their Ed25519 identity by
+the libsodium conversion (`crypto_sign_ed25519_pk_to_curve25519`;
+`@noble/curves`'s `edwardsToMontgomery` on the page), the KEM's own
+all-zero check refusing a low-order point, with `info = "ssf-media-key:v1\n"
+‖ source id (32) ‖ epoch (4, big-endian) ‖ recipient identity key (32)` and
+the same bytes as the AEAD's associated data, so a sealed key opens only
+for the recipient, source and epoch it names; on the wire `media-key {
+source, epoch, recipient, enc (32, the encapsulated key), ct (48) }`,
+signed by the sender's identity key under the domain tag
+`ssf-media-key:v1` as every envelope `signBytes.ts` signs is, so a hub can
+neither forge one nor move one between recipients or epochs, a message
+whose signature or opening fails dropped and charged to the link; the
+`hpke` crate on the node, and on the page `@hpke/core` with its X25519 KEM
+or the RFC's four steps over `@noble/curves`, `@noble/hashes` and
+`@noble/ciphers`, both held to one fixture of test vectors (RFC 9180's for
+the suite, ours for the envelope) — and
 rotates to a new epoch before every admission (the admitted can open
 nothing from before it: a key handed out mid-epoch would open the ciphertext
 a joiner, or a hub that later joins as a member, had already logged — which
@@ -1145,7 +1167,7 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 | Central piece | Without it |
 |---|---|
 | Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. And the same classifier stands on every PEER dial, setting or no setting: the endpoints a tracker response, the DHT or PEX hand back are as untrusted as the metadata, so every outgoing BitTorrent connection and every uTP or DHT packet goes to a global-unicast address or nowhere — loopback, private, link-local and the metadata ranges refused, a LAN peer reachable only through the operator's explicit allowlist — the check sitting in the client's connector, which the node forks if `librqbit` offers no hook there, rather than shipping without it. LSD (BEP 14) is the ONE exception to global unicast, and it is off until that allowlist exists: its announcements go to multicast groups (`239.192.152.143:6771` and `[ff15::efc0:988f]:6771`), so with an allowlist set the node admits exactly those two destinations on that port, sent only out of the interface(s) that carry an allowlisted subnet, with a hop limit of 1, and takes an announcement only from a source address inside the allowlist (any other is dropped unread), dialling the peers it names only through the same unicast allowlist; with no allowlist there is no LSD socket at all. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
-| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node, so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no BEP‑5 infohash DHT client, no PEX, no LSD, no tracker or web-seed code to reach a swarm with — the only isolation that holds for the swarm, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. What this feature neither adds nor removes is the node's OWN address lookup over Mainline — `DhtAddressLookup` in `ssf-p2p-node/src/main.rs`, on by default today and off with `SSF_NO_DHT=1`, which publishes and resolves node ids, never infohashes: node discovery's lane-5 question (§1) — and a STRICT build answers it the way §1 does: the lookup is not compiled in there — `DhtAddressLookup` sits behind a cargo feature (`mainline-lookup`, on by default) that a strict build leaves out, as it leaves the `torrent` feature out — so there is no switch for an operator to flip and the promise is the build's, not a default's: discovery falls back to signed local config, tickets and connected peers, and "strict" promises no public DHT traffic of any kind, torrent or address. `SSF_NO_DHT=1` stays the runtime switch of a NON-strict build. A build that merely leaves the `torrent` feature out while keeping the address lookup is TORRENT-FREE, the narrower promise, and is called that — never strict, whatever its switches say. |
+| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node — one that ANSWERS queries only under a no-amplification rule, since a KRPC query's source address is anyone's to forge and a node that answered freely would reflect onto whoever it named: a reply to an address that has not proven reachability (none of the node's own queries answered from it) carries no more bytes than the query it answers, the node list trimmed to fit as BEP 5 allows, so a spoofed query reflects at most its own size, and every address, proven or not, is under a response budget counted at the socket (a reply a second and 2 KB a second per address, 64 KB a second across all, the rest dropped unanswered); `librqbit` enqueues `get_peers` and `find_node` replies directly and its limiter wraps only the queries it makes, so until the node's fork carries the rule the DHT runs client-only, lookups made and no query answered, at the cost of the bootstrap role alone — so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no BEP‑5 infohash DHT client, no PEX, no LSD, no tracker or web-seed code to reach a swarm with — the only isolation that holds for the swarm, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. What this feature neither adds nor removes is the node's OWN address lookup over Mainline — `DhtAddressLookup` in `ssf-p2p-node/src/main.rs`, on by default today and off with `SSF_NO_DHT=1`, which publishes and resolves node ids, never infohashes: node discovery's lane-5 question (§1) — and a STRICT build answers it the way §1 does: the lookup is not compiled in there — `DhtAddressLookup` sits behind a cargo feature (`mainline-lookup`, on by default) that a strict build leaves out, as it leaves the `torrent` feature out — so there is no switch for an operator to flip and the promise is the build's, not a default's: discovery falls back to signed local config, tickets and connected peers, and "strict" promises no public DHT traffic of any kind, torrent or address. `SSF_NO_DHT=1` stays the runtime switch of a NON-strict build. A build that merely leaves the `torrent` feature out while keeping the address lookup is TORRENT-FREE, the narrower promise, and is called that — never strict, whatever its switches say. |
 | Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build, under the trackers row's destination gate when on (a web-seed URL comes from the same untrusted metadata, and a crafted one would otherwise point the node at loopback, the LAN or a metadata service); never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
@@ -1321,14 +1343,24 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   holder, citing the chain spend that made it so), numbers in sequence,
   names its predecessor by hash, and COMMITS the history it inherits — the
   terminal accepted op of every earlier writer, as ONE hash: the root of a
-  Merkle tree over the (writer key → tip hash) pairs, sorted by key, the
-  pairs themselves travelling beside the head and any one of them provable
-  against the root by its path, so a head stays a few hundred bytes
-  however many holders and co-hosts the deed has had, a tip is looked up
-  by one proof, and replaying the chain costs a logarithm per op and never
-  the square of the writers; a writer whose tip an earlier head already
-  committed is carried forward unchanged, the tree updated and never
-  rebuilt — so an op under a superseded head is accepted only if it lies
+  SPARSE MERKLE MAP of fixed depth, canonical to the byte so every node
+  derives the same root and the same proofs — a writer's leaf sits at the
+  path `BLAKE3("ssf-library-writer:v1\n" ‖ writer key)`, 256 bits read from
+  the top, its value `BLAKE3("ssf-library-leaf:v1\n" ‖ writer key (32) ‖
+  tip hash (32))`; an internal node is `BLAKE3("ssf-library-node:v1\n" ‖
+  left ‖ right)`; an empty subtree is a fixed constant per depth, 32 zero
+  bytes at the leaf and the node hash of two empties above it, so a map of
+  ten writers is ten leaves and a few hundred real hashes, never 2²⁵⁶; a
+  proof is the leaf's 256 siblings with the empty ones elided behind a
+  32-byte bitmap, a few hundred bytes for the writers a deed has had — so
+  an insertion moves no other leaf, a proof made under an earlier head
+  stays valid for every branch a later head did not touch (the tree is
+  updated, 256 hashes a write, never rebuilt), a head stays a few hundred
+  bytes however many holders and co-hosts the deed has had, a tip is
+  looked up by one proof, and replaying the chain costs a logarithm per op
+  and never the square of the writers; the pairs themselves travel beside
+  the head, and a writer whose tip an earlier head already committed is
+  carried forward unchanged — so an op under a superseded head is accepted only if it lies
   on the chain that ends at the committed tip. A newly signed op with an old
   sequence is off that chain, and so is a second op at a sequence the
   chain already holds, whoever signs them and whenever a node syncs; a
