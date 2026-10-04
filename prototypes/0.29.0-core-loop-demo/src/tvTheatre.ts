@@ -549,18 +549,22 @@ function theatreTick(rtt: () => number): void {
       : '<div>❚❚ PAUSED</div><div class="tv-theatre-lane">archive.org\'s player has no pause: it starts from the top when the film resumes</div>');
   } else {
     const key = mountKey(rec.source!, rec.started);
-    if (t.mounted !== key && t.mounted !== `failed:${key}`) {
-      // This viewer's browser fetches only what this viewer allows
-      // (tvConsent): a peer-written URL is asked about first, and one inside
-      // a private network is never fetched. Whatever was mounted before
-      // comes down meanwhile — the old programme is over either way.
-      const consent = mediaConsent(rec.source!);
-      if (consent === 'ok') {
-        mountPlayer(t, rec.source!, key, rtt);
-      } else {
-        if (t.mounted) unmountPlayer(t);
-        showConsentNotice(t, rec.source!, consent);
-      }
+    // This viewer's browser fetches only what this viewer allows
+    // (tvConsent): a peer-written URL is asked about first, and one inside
+    // a private network is never fetched. Asked of EVERY tick, not only at
+    // the mount: the node's origin is trusted only while the node answers
+    // as ours (main.ts's fingerprint probe), and a player left mounted
+    // after that trust is withdrawn would keep a `src` on a loopback port
+    // that whatever binds it next may answer — its later range and
+    // reconnection requests would go to a stranger. A source that lost its
+    // consent comes down and is asked about again. Whatever was mounted
+    // before comes down meanwhile — the old programme is over either way.
+    const consent = mediaConsent(rec.source!);
+    if (consent !== 'ok') {
+      if (t.mounted) unmountPlayer(t);
+      showConsentNotice(t, rec.source!, consent);
+    } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
+      mountPlayer(t, rec.source!, key, rtt);
     }
   }
   t.controller?.tick();
