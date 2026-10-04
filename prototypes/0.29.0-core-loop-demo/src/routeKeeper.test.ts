@@ -66,7 +66,7 @@ import {
 import type { KeeperGateResult, KeeperMemory, KeeperView } from './routeKeeper';
 import { YjsSync } from './network/YjsSync';
 import { arrivalRefusal, setBerthSeedResolver, type ShipDockingApi } from './shipArrival';
-import { bindShipDoc, readStationBerth, writeFuelLevel } from './shipDoc';
+import { bindShipDoc, holdCastOff, readStationBerth, releaseCastOff, writeFuelLevel } from './shipDoc';
 import {
   installRouteFlight,
   readRouteCheckpoints,
@@ -1145,6 +1145,32 @@ describe('the keeper over a running ferry', () => {
     now = ms(start().departAt + 2 * SEC);
     keeper.tick();
     expect(portRoom()).toBe('room-0');
+  });
+
+  it('🚚 neither casts off nor docks while a DEPART casts the ship off under the shared hold', async () => {
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d);
+    const s = start();
+    // A helm aboard took the hold (its DEPART waits for the docks to let go).
+    now = ms(s.departAt + 2 * SEC);
+    expect(holdCastOff('helm-1', now)).toBe(true);
+    keeper.tick();
+    expect(portRoom()).toBe('room-0');
+    expect(d.undocks).toEqual([]);
+    // Once it ends, the keeper casts off as the timetable says.
+    releaseCastOff('helm-1');
+    keeper.tick();
+    expect(portRoom()).toBeNull();
+    // Nor does it dock at the next stop while another hold stands.
+    now = ms(s.arriveAt + SEC);
+    expect(holdCastOff('helm-2', now)).toBe(true);
+    keeper.tick();
+    await flush();
+    expect(d.asked).toEqual([]);
+    releaseCastOff('helm-2');
+    keeper.tick();
+    await flush();
+    expect(portRoom()).toBe('room-1');
   });
 
   it('🛟 a port nobody aboard may release holds the ferry, DELAYED, until someone lets it go', () => {

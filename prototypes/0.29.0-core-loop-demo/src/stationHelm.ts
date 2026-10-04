@@ -1,17 +1,23 @@
 /**
  * 🛰️ The helm's STATION KEEPING face (owner request, 2026-09-27) — what a
- * helm console shows in a module bolted into a station
- * (stationKeeping.isBoltedIntoStation). A ship's helm flies the ship; this
- * one flies the station, with a small TRIM STICK for fine orbital
- * maintenance:
+ * helm console shows in a module bolted into a station, or in a station's
+ * own welcome room standing alone (stationKeeping.steersStation). A ship's
+ * helm flies the ship; this one flies the station, with a small TRIM STICK
+ * for fine orbital maintenance:
  *
  *   ▲ RAISE / ▼ LOWER — one burn moves the orbit TRIM_STEP_KM,
  *   ◀ BACK / AHEAD ▶  — one burn slides the station PHASE_STEP_DEG along it.
  *
  * Flick the stick (drag the knob past its ring and let go), press a button,
- * or focus the stick and use the arrow keys. Each is ONE discrete burn
- * (stationKeeping.planTrim); everything else on the dashboard is derived
- * from the room's burns and the clock.
+ * or use the arrow keys (the stick takes the keyboard focus as the face
+ * opens). Each is ONE discrete burn (stationKeeping.planTrim); everything
+ * else on the dashboard is derived from the room's burns and the clock. Tab
+ * is the SpacePhone's (main.ts), so F opens FUEL & DOCKING and K comes back.
+ *
+ * Every helm opens through here (world.ts): one in a module that steers no
+ * station opens on the ship face, which offers station keeping within half
+ * a second of the module coming to steer one (a gangway paired, or the room
+ * saved as a station, while the helm is open).
  *
  * The STATION KEEPING BOX draws the station against its slot: the crosshair
  * is where the slot's orbit puts it, across is along the orbit (behind /
@@ -93,6 +99,20 @@ export function setStationHelmCommanderCheck(cb: (() => boolean) | null): void {
 
 function isCommander(): boolean {
   return commanderCheck?.() === true;
+}
+
+/** Is the SpacePhone open over the helm (main.ts marks its container
+ *  active)? It opens without taking the focus, so keys pressed at it still
+ *  reach the helm. */
+function phoneOpen(): boolean {
+  return document.getElementById('spacephone-container')?.classList.contains('active') === true;
+}
+
+/** Does `el` take keys of its own (a text field the player is typing in, or
+ *  a select): none of them is a helm command. */
+function takesKeys(el: Element | null): boolean {
+  const tag = el?.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || (el as HTMLElement | null)?.isContentEditable === true;
 }
 
 function countFunction(tag: string): number {
@@ -253,13 +273,15 @@ function drawKeepingBox(
 // ── The face ─────────────────────────────────────────────────────────────────
 
 export interface StationHelmDeps {
-  /** Is the module still bolted into a station — read at every refresh and
+  /** Does the module still steer a station — read at every refresh and
    *  every burn, since a peer can take the gangway down while this is open
-   *  (stationKeeping.isBoltedIntoStation over the live door records). */
+   *  (stationKeeping.steersStation over the live door records), and on the
+   *  ship face every TEXT_REFRESH_S, to offer station keeping once it does. */
   bolted: () => boolean;
   /** The station this module belongs to (stations.currentStation). */
   station: () => StationRecord | null;
-  /** The ship helm face, mounted by the FUEL & DOCKING tab. */
+  /** The ship helm face: where a helm that steers no station opens, and
+   *  what the FUEL & DOCKING tab mounts. */
   shipFace: () => DeviceUI;
 }
 
@@ -292,6 +314,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   let face: 'keep' | 'ship' = 'keep';
   let ship: DeviceUI | null = null;
   let back: HTMLButtonElement | null = null;
+  let sinceBack = 0;
   const unsubs: Array<() => void> = [];
 
   // What the dashboard last read (refresh), and what the box draws each frame.
@@ -531,8 +554,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
       <div style="display:flex; gap:6px; margin:8px 0 4px;">
-        <button type="button" data-sk-tab="keep" aria-pressed="true" style="${tabStyle(true)}">STATION KEEPING</button>
-        <button type="button" data-sk-tab="ship" aria-pressed="false" style="${tabStyle(false)}">FUEL &amp; DOCKING</button>
+        <button type="button" data-sk-tab="keep" aria-pressed="true" aria-keyshortcuts="K" style="${tabStyle(true)}">STATION KEEPING [K]</button>
+        <button type="button" data-sk-tab="ship" aria-pressed="false" aria-keyshortcuts="F" style="${tabStyle(false)}">FUEL &amp; DOCKING [F]</button>
       </div>
       ${row('STATION', 'sk-station')}
       ${row('ORBIT', 'sk-orbit')}
@@ -588,6 +611,8 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     well.addEventListener('keydown', (e) => {
       const dir = ARROW_KEYS[e.key];
       if (!dir) return;
+      // No key pressed at the SpacePhone fires a burn.
+      if (phoneOpen()) return;
       e.preventDefault();
       // One press, one burn: a held key's auto-repeat is not a new press
       // (it would fire again the moment the last burn ends).
@@ -597,6 +622,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     well.addEventListener('pointerdown', (e) => {
       e.preventDefault();
       e.stopPropagation();
+      // That also keeps the press from focusing the stick: focus it here, so
+      // the arrow keys steer it next.
+      well.focus({ preventScroll: true });
       const r = well.getBoundingClientRect();
       drag = { id: e.pointerId, cx: r.left + r.width / 2, cy: r.top + r.height / 2, dx: 0, dy: 0 };
       well.setPointerCapture?.(e.pointerId);
@@ -640,6 +668,12 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     unsubs.push(subscribePlanetSummary(refresh));
     refresh();
     placeKnob(Date.now());
+    // Somewhere for the arrow keys to land: Tab cannot bring the focus here
+    // (main.ts binds it to the SpacePhone), so the stick takes it as this face
+    // opens, on the way back from FUEL & DOCKING too, unless the player is
+    // typing (the SpacePhone's chat). preventScroll: the panel sits over the
+    // canvas.
+    if (!takesKeys(document.activeElement)) well.focus({ preventScroll: true });
   };
 
   const unmountKeep = (): void => {
@@ -649,21 +683,42 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     panel = null;
   };
 
+  /** On the ship face, the way back to station keeping: offered while the
+   *  module steers a station, so a helm opened as a ship's offers it once a
+   *  gangway is paired or the room is saved as a station. Never switches
+   *  faces itself: the pilot may be at the ship face's REFUEL or DOCK. */
+  const placeBack = (): void => {
+    sinceBack = 0;
+    if (!host || face !== 'ship') return;
+    const steers = deps.bolted();
+    if (steers && !back) {
+      back = document.createElement('button');
+      back.type = 'button';
+      back.textContent = '◂ STATION KEEPING [K]';
+      back.setAttribute('aria-keyshortcuts', 'K');
+      back.style.cssText = `position:absolute; top:14px; left:50%; transform:translateX(-50%); pointer-events:auto; padding:7px 14px; border-radius:8px; border:1px solid ${AMBER}; background:rgba(4,8,22,0.94); color:${AMBER}; font-family:'SF Mono','Monaco','Consolas',monospace; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer; box-shadow:0 6px 24px rgba(0,0,0,0.8);`;
+      back.addEventListener('click', (e) => {
+        e.stopPropagation();
+        showKeep();
+      });
+      host.appendChild(back);
+    } else if (!steers && back) {
+      back.remove();
+      back = null;
+    }
+  };
+
+  const mountShip = (h: HTMLElement): void => {
+    face = 'ship';
+    ship = deps.shipFace();
+    ship.mount(h);
+    placeBack();
+  };
+
   const showShip = (): void => {
     if (!host || face === 'ship') return;
     unmountKeep();
-    face = 'ship';
-    ship = deps.shipFace();
-    ship.mount(host);
-    back = document.createElement('button');
-    back.type = 'button';
-    back.textContent = '◂ STATION KEEPING';
-    back.style.cssText = `position:absolute; top:14px; left:50%; transform:translateX(-50%); pointer-events:auto; padding:7px 14px; border-radius:8px; border:1px solid ${AMBER}; background:rgba(4,8,22,0.94); color:${AMBER}; font-family:'SF Mono','Monaco','Consolas',monospace; font-size:11px; font-weight:800; letter-spacing:1px; cursor:pointer; box-shadow:0 6px 24px rgba(0,0,0,0.8);`;
-    back.addEventListener('click', (e) => {
-      e.stopPropagation();
-      showKeep();
-    });
-    host.appendChild(back);
+    mountShip(host);
   };
 
   const showKeep = (): void => {
@@ -676,13 +731,36 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     mountKeep(host);
   };
 
+  /** The faces' keys, since Tab is the SpacePhone's and the stick keeps the
+   *  arrows: F opens FUEL & DOCKING, and K comes back to station keeping
+   *  while the ship face offers it. Never while typing, at the SpacePhone, or
+   *  with a modifier held (the browser's own shortcuts). */
+  const onKey = (e: KeyboardEvent): void => {
+    if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+    if (takesKeys(e.target as Element | null) || phoneOpen()) return;
+    const key = e.key.toLowerCase();
+    if (key === 'f' && face === 'keep') {
+      e.preventDefault();
+      showShip();
+    } else if (key === 'k' && face === 'ship' && back) {
+      e.preventDefault();
+      showKeep();
+    }
+  };
+
   return {
     mount(h: HTMLElement): void {
       host = h;
-      face = 'keep';
-      mountKeep(h);
+      window.addEventListener('keydown', onKey);
+      if (deps.bolted()) {
+        face = 'keep';
+        mountKeep(h);
+      } else {
+        mountShip(h);
+      }
     },
     unmount(): void {
+      window.removeEventListener('keydown', onKey);
       if (face === 'ship') {
         ship?.unmount();
         ship = null;
@@ -700,6 +778,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     update(dt: number): void {
       if (face === 'ship') {
         ship?.update(dt);
+        if ((sinceBack += dt) >= TEXT_REFRESH_S) placeBack();
         return;
       }
       if (!panel) return;

@@ -71,15 +71,19 @@ export type GateAccess = 'open' | 'pass' | 'reserved' | 'closed';
 export const GATE_ACCESS: readonly GateAccess[] = ['open', 'pass', 'reserved', 'closed'];
 const MAX_RESERVED_ID = 128;
 
-/** The access fields of a stored value, or none (open). Peer-written. */
+/** The access fields of a stored value, or none (open). Peer-written, and
+ *  read by the far end of every DOCK, so it fails closed: only no access at
+ *  all, or an explicit 'open', opens the gate; a restriction it cannot read
+ *  (an unknown value, a reservation naming no ship) closes it. */
 function cleanAccess(raw: Partial<DoorPolicyRecord> | undefined): Pick<DoorPolicyRecord, 'gateAccess' | 'reservedFor'> {
   const a = raw?.gateAccess;
+  if (a === undefined || a === 'open') return {};
   if (a === 'pass' || a === 'closed') return { gateAccess: a };
   if (a === 'reserved' && typeof raw?.reservedFor === 'string'
     && raw.reservedFor.length > 0 && raw.reservedFor.length <= MAX_RESERVED_ID) {
     return { gateAccess: 'reserved', reservedFor: raw.reservedFor };
   }
-  return {};
+  return { gateAccess: 'closed' };
 }
 
 /** Highest gate number a port may carry. */

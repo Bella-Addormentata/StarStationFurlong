@@ -728,6 +728,22 @@ describe('the helm writers', () => {
     });
   });
 
+  it("…and where the stop it leaves orbits (PR 174's originAt)", () => {
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const r = saved([0, 1], { robotDockId: undefined });
+    r.stops[0] = { ...r.stops[0], stationId: 'furlong-station' };
+    const { departAt } = start(r);
+    expect(departRouteFromHelm({ now: departAt - 10 * SEC })).not.toBeNull();
+    const rec = readFlightRecord();
+    expect(rec).toMatchObject({
+      status: 'in-flight',
+      locationId: 'furlong-station',
+      originAt: adriftAt(planetById(home.planetId).id, home.orbitSlot),
+    });
+    // A stop this install cannot list keeps no place.
+    expect(rec.destinationAt).toBeUndefined();
+  });
+
   it('a route DEPART pressed late takes the next window', () => {
     const { departAt } = start(saved([0, 1], { robotDockId: undefined }));
     const now = departAt + 2 * SEC;

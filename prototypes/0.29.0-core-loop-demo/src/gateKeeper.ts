@@ -60,9 +60,12 @@
  * have written over the claim while the ferry's side was asked, and then the
  * gate keeps what it holds and the keeper's next look settles the ferry's
  * port. A cast-off writes both ends in the same tick: the ferry's port
- * remembers the gate, and the gate remembers the ferry. Nothing is written to
- * the gate once the keeper has reset (the player left, even if they came
- * straight back).
+ * remembers the gate, and the gate remembers the ferry (unless a move the
+ * ferry's room holds keeps its port docked: then the gate keeps its end too).
+ * Nothing is written to the gate once the keeper has reset (the player left,
+ * even if they came straight back). While a DEPART casts the ferry off under
+ * the shared hold (shipDoc.ts readCastOffHold), the keeper takes no step of
+ * its own: that DEPART has the docks until it ends.
  *
  * The gate's record needs the ferry's address and its port's pose (the far
  * wall and lateral): both come from a record in this room that names the
@@ -186,8 +189,9 @@ import {
   type ShipRoute,
 } from './shipRoute';
 import { ROOM_SESSION_OPEN_MS } from './roomSession';
-import { TANK_CAPACITY } from './shipDoc';
+import { TANK_CAPACITY, castOffHoldIn } from './shipDoc';
 import { roomIdFromSeed } from './stationAtlas';
+import { rememberMovesIn } from './stationMove';
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -1030,7 +1034,8 @@ export async function stationDock(o: {
  * Cast the ferry off this gate, from the station side: the ferry's port
  * remembers the gate (farDoorWrite's UNDOCK decision), and the gate remembers
  * the ferry, written in one tick. Returns whether the ferry's doc was written
- * and the state vector to confirm it from.
+ * and the state vector to confirm it from, and whether a move the ferry's
+ * room holds kept both ends docked (`moving`).
  */
 export function stationCastOff(o: {
   doc: Y.Doc;
@@ -1040,7 +1045,7 @@ export function stationCastOff(o: {
   shipRoomId: string;
   shipPort: string;
   now: number;
-}): { wrote: boolean; since: Uint8Array; undockedAt: number } {
+}): { wrote: boolean; since: Uint8Array; undockedAt: number; moving: boolean } {
   const port = readDoorFrom(o.doc, o.shipPort);
   const rec = o.gate.read();
   const portStamp = port?.paired === true ? port.dockedAt : undefined;
@@ -1049,9 +1054,10 @@ export function stationCastOff(o: {
   const undockedAt = stampAfter(Number.isFinite(after) ? after : undefined, o.now);
   const since = Y.encodeStateVector(o.doc);
   let wrote = false;
+  let moving = false;
   if (holdsDock(port, o.gate.near)) {
     try {
-      wrote = applyFarDockRequest(
+      const r = applyFarDockRequest(
         o.doc,
         {
           kind: 'undock',
@@ -1064,15 +1070,20 @@ export function stationCastOff(o: {
           undockedAt,
         },
         o.gate.near,
-      ).wrote;
+      );
+      wrote = r.wrote;
+      moving = !r.result.ok && r.result.reason === 'moving';
     } catch (err) {
       console.warn('[gate] ferry-side undock threw:', err);
     }
   }
-  if (holdsFerry(rec, o.shipRoomId, o.shipPort)) {
+  // 🚚 A move the ferry's room holds (one this install has not heard of)
+  // keeps its port docked: the gate keeps its end too, as a DEPART puts its
+  // own end back when a far room answers so (docking.ts undockPort).
+  if (!moving && holdsFerry(rec, o.shipRoomId, o.shipPort)) {
     o.gate.write(buildDoorTombstone(rec.connectedRoomAddress, berthMemoryFrom(rec, undockedAt)));
   }
-  return { wrote, since, undockedAt };
+  return { wrote, since, undockedAt, moving };
 }
 
 // ── The loop (effectful, thin) ───────────────────────────────────────────────
@@ -1567,6 +1578,11 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     // berthing and the gates' claims are this watch's port's, so nothing is
     // done by it.
     if (news.route.shipPort !== w.port) return;
+    // 🚚 A DEPART casting the ferry off under the shared hold (shipDoc.ts)
+    // has its docks until it ends: this keeper neither docks it back nor
+    // casts it off, nor writes its stay, meanwhile (as a rider's keeper
+    // stands aside: routeKeeper.ts). The gate still follows its port (1.).
+    if (castOffHoldIn(session.doc.getMap(SHIP_MAP), now)) return;
     const sameStation = safe(deps.sameStation, null)
       ?? ((stop: RouteStop, roomId: string) => roomId === stop.berth.roomId);
     const look = ferryLook({
@@ -1634,9 +1650,12 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         mem.castOff = true;
         w.managed.add(move.gate.doorId);
         const end = gateEnd(w, move.gate.doorId, roomId);
-        const { wrote, since } = stationCastOff({
+        const { wrote, since, moving } = stationCastOff({
           doc: session.doc, address: w.address, gate: end, shipRoomId: w.ship, shipPort: route.shipPort, now,
         });
+        // 🚚 Learn the move that held it, as a far session does (farDoorWrite):
+        // this game's own lock then holds the gate too, until it arrives.
+        if (moving) rememberMovesIn(session.doc);
         if (!wrote) return;
         w.busy = true;
         const gen = generation;

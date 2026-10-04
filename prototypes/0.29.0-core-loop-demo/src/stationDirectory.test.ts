@@ -16,18 +16,24 @@ import {
   HOME_PLANET_ID,
   localStationId,
   findStation,
+  flightCapable,
+  freeFlightCapable,
+  groundedBy,
+  setStationRoomCheck,
   planHop,
   planRecordHop,
   isKnownStation,
   listStations,
   setStationDirectory,
+  setBerthPoseLookup,
   stationHere,
   type StationDestination,
 } from './stationDirectory';
 import { planTransfer } from './orbits';
 import { isFlightRecord } from './shipDoc';
+import type { StationMove } from './stations';
 
-afterEach(() => setStationDirectory(null));
+afterEach(() => { setStationDirectory(null); setStationRoomCheck(null); });
 
 const station = (id: string, planetId: string, extra: Partial<StationDestination> = {}): StationDestination => ({
   id, name: id.toUpperCase(), planetId, fuelCost: 10, travelMs: TRAVEL_MS_MIN, ...extra,
@@ -135,12 +141,126 @@ describe('the station record as destinations', () => {
   });
 });
 
+describe('flight capability', () => {
+  it('flies a fitted room, but never a station room wearing the same fittings', () => {
+    expect(flightCapable(true)).toBe(true);
+    expect(flightCapable(false)).toBe(false);
+    setStationRoomCheck(() => 'bolted');
+    expect(flightCapable(true)).toBe(false);
+    setStationRoomCheck(() => { throw new Error('no doors yet'); });
+    expect(flightCapable(true)).toBe(true);
+  });
+
+  it("says why a fitted room never flies: bolted in by a gangway, or a station's own room", () => {
+    setStationRoomCheck(() => 'bolted');
+    expect(groundedBy()).toBe('bolted');
+    setStationRoomCheck(() => 'welcome-room');
+    expect(groundedBy()).toBe('welcome-room');
+    setStationRoomCheck(() => null);
+    expect(groundedBy()).toBeNull();
+    expect(flightCapable(true)).toBe(true);
+    setStationRoomCheck(() => { throw new Error('no doors yet'); });
+    expect(groundedBy()).toBeNull();
+    setStationRoomCheck(null);
+    expect(groundedBy()).toBeNull();
+  });
+
+  it('flies a one-module station freely, though it never DEPARTs', () => {
+    setStationRoomCheck(() => 'lone-station');
+    expect(flightCapable(true)).toBe(false);
+    expect(freeFlightCapable(true)).toBe(true);
+    expect(freeFlightCapable(false)).toBe(false);
+    for (const why of ['welcome-room', 'bolted'] as const) {
+      setStationRoomCheck(() => why);
+      expect(freeFlightCapable(true)).toBe(false);
+    }
+    setStationRoomCheck(() => null);
+    expect(freeFlightCapable(true)).toBe(true);
+    setStationRoomCheck(null);
+  });
+});
+
+describe("a station berth's pose", () => {
+  afterEach(() => setBerthPoseLookup(null));
+  const record = {
+    id: 'station:mod-2', name: 'MOD 2', planetId: 'planet-sovereign', orbitSlot: 1,
+    welcomeRoomId: 'mod-2', berthDoor: 'd:00000002',
+  };
+  const seedFor = (rid: string) => (rid === 'mod-2' ? 'seed-mod' : undefined);
+  const bare = { address: 'seed-mod', farDoor: 'd:00000002' };
+
+  it("gives a public berth its port's wall and lateral, so a first DOCK poses the station where the port is", () => {
+    const asked: string[] = [];
+    setBerthPoseLookup((roomId, doorId) => {
+      asked.push(`${roomId} ${doorId}`);
+      return { wall: 'x+', lateral: 1.5 };
+    });
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual({ ...bare, farWall: 'x+', farLateral: 1.5 });
+    expect(asked).toEqual(['mod-2 d:00000002']);
+    // No berth, no question: no door named, or no seed held.
+    asked.length = 0;
+    destinationsFromRecords([{ ...record, berthDoor: undefined }, { ...record, welcomeRoomId: 'far-1' }], seedFor);
+    expect(asked).toEqual([]);
+  });
+
+  it('leaves the pose unknown where the atlas knows none, or a junk one', () => {
+    const berthWith = (pose: unknown) => {
+      setBerthPoseLookup(() => pose as { wall: 'x+' });
+      return destinationsFromRecords([record], seedFor)[0].berth;
+    };
+    expect(berthWith(null)).toEqual(bare);
+    expect(berthWith(undefined)).toEqual(bare);
+    expect(berthWith({ wall: 'north', lateral: 1 })).toEqual(bare);
+    // A lateral the doors doc would not keep leaves the wall alone.
+    expect(berthWith({ wall: 'y-', lateral: 99 })).toEqual({ ...bare, farWall: 'y-' });
+    expect(berthWith({ wall: 'y-', lateral: Number.NaN })).toEqual({ ...bare, farWall: 'y-' });
+    expect(berthWith({ wall: 'y-' })).toEqual({ ...bare, farWall: 'y-' });
+    setBerthPoseLookup(() => { throw new Error('no atlas yet'); });
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual(bare);
+    setBerthPoseLookup(null);
+    expect(destinationsFromRecords([record], seedFor)[0].berth).toEqual(bare);
+  });
+});
+
 describe('planning a hop', () => {
   it('leaves now at the flat cost when the directory has no planner', () => {
     expect(planHop('furlong-station', 'high-orbit', 1000)).toEqual({ departAt: 1000, arriveAt: 1000 + TRAVEL_MS_MIN, fuelCost: 25 });
     expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
     expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
     expect(planHop('nowhere', 'high-orbit', 1000)).toBeNull();
+  });
+
+  it('refuses a flat hop a station move cuts into, by the times the flight record keeps', () => {
+    const now = 1000.5;
+    const move = (over: Partial<StationMove>): StationMove => ({
+      stationId: 'a', welcomeRoomId: 'ra', fromPlanetId: 'p1', fromSlot: 0, toPlanetId: 'p2', toSlot: 0,
+      departAt: 5000, arriveAt: 90_000, mode: 'thrusters', fuel: 1, fuelDrawn: 1, ...over,
+    });
+    const hop = (from: Partial<StationDestination>, to: Partial<StationDestination>) => {
+      setStationDirectory({ stations: () => [station('a', 'p1', from), station('b', 'p1', to)] });
+      return planHop('a', 'b', now);
+    };
+    // No move: a flat hop that leaves now, in whole milliseconds.
+    expect(hop({}, {})).toEqual({ departAt: 1001, arriveAt: 1001 + TRAVEL_MS_MIN, fuelCost: 10 });
+    // The source between planets, or the destination leaving before the ship gets there.
+    expect(hop({ move: move({ departAt: 0 }) }, {})).toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 30_000 }) })).toBeNull();
+    // The source leaving the very millisecond the rounded burn does.
+    expect(hop({ move: move({ departAt: 1001 }) }, {})).toBeNull();
+    // Leaving after the burn, the destination after the arrival, or a move that goes nowhere: fine.
+    expect(hop({ move: move({ departAt: 1002 }) }, {})).not.toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 1002 + TRAVEL_MS_MIN }) })).not.toBeNull();
+    expect(hop({ move: move({ toPlanetId: 'p1', departAt: 1000, arriveAt: 1001 }) }, {})).not.toBeNull();
+  });
+
+  it('refuses a hop that would burn a negative amount of fuel', () => {
+    const list = [station('a', 'planet-sovereign'), station('b', 'planet-sovereign', { fuelCost: -5 })];
+    setStationDirectory({ stations: () => list });
+    expect(planHop('a', 'b', 1000)).toBeNull();
+    setStationDirectory({ stations: () => list, plan: () => ({ departAt: 1000, arriveAt: 2000, fuelCost: -1 }) });
+    expect(planHop('b', 'a', 1000)).toBeNull();
+    setStationDirectory({ stations: () => list, plan: () => ({ departAt: 1000, arriveAt: 2000, fuelCost: 0 }) });
+    expect(planHop('b', 'a', 1000)?.fuelCost).toBe(0);
   });
 
   it('follows the circular-orbit model over station records', () => {

@@ -64,6 +64,7 @@ import { ROOM_SESSION_OPEN_MS } from './roomSession';
 import { GUARD_BAND_MS, legWindowAfter, pauseCheckpoint, skipCheckpoint, startCheckpoint } from './pilotRoute';
 import { CAST_OFF_LATE_MS, KEEPER_RETRY_MS, keeperStep, type KeeperStep } from './routeKeeper';
 import { TANK_CAPACITY } from './shipDoc';
+import { readRememberedMoves, type StationMove } from './stationMove';
 import {
   MIN_WAIT_SECS,
   checkpointKey,
@@ -197,6 +198,17 @@ const entry = (over: Partial<DepartureFerry> = {}): DepartureFerry => ({
 });
 
 const sameStation = (s: RouteStop, roomId: string) => roomId === s.berth.roomId;
+
+/** 🚚 The ferry's own station between planets from `at`, booked in its room:
+ *  a move this install never heard of. */
+const ferryMove = (at: number): StationMove => ({
+  stationId: 'ferry-station', welcomeRoomId: FERRY, fromPlanetId: SOV, fromSlot: 1,
+  toPlanetId: 'planet-aris', toSlot: 2, departAt: at, arriveAt: at + HOUR,
+  mode: 'thrusters', bookedAt: at - SEC, fuel: 1, fuelDrawn: 1,
+});
+function bookMoveIn(doc: Y.Doc, move: StationMove): void {
+  doc.getMap('stationMoves').set(`move:1:${move.departAt}:${move.welcomeRoomId}`, move);
+}
 
 // ── Which record names the ferry ─────────────────────────────────────────────
 
@@ -951,6 +963,28 @@ describe('casting off from the station side', () => {
     expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0, 'y-'));
     expect(readDoorFrom(station, 'x+')?.paired).toBe(false);
   });
+
+  // 🚚 The ferry's room refuses the release (farDoorWrite's 'moving'): a
+  // gate let go alone would leave the ferry docked to a gate that is not.
+  it("keeps the gate's end while a move the ferry's room holds keeps its port docked", () => {
+    const station = new Y.Doc();
+    station.getMap('doors').set('x+', dockOf(D0));
+    const ferry = ferryDoc(portDockedAt(D0));
+    const t = DEPART + GATE_CAST_OFF_DEFER_MS;
+    bookMoveIn(ferry, ferryMove(t - MIN));
+    const before = Y.encodeStateVector(ferry);
+    const r = stationCastOff({ doc: ferry, address: seed(FERRY), gate: gateEndOn(station), shipRoomId: FERRY, shipPort: PORT, now: t });
+    expect(r).toMatchObject({ wrote: false, moving: true });
+    expect(Y.encodeStateVector(ferry)).toEqual(before);
+    expect(readDoorFrom(station, 'x+')).toEqual(dockOf(D0));
+    expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0));
+    // Before that move leaves, both ends let go as usual.
+    const early = stationCastOff({
+      doc: ferryDoc(portDockedAt(D0)), address: seed(FERRY), gate: gateEndOn(station), shipRoomId: FERRY, shipPort: PORT, now: t,
+    });
+    expect(early).toMatchObject({ wrote: true, moving: false });
+    expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(t));
+  });
 });
 
 // ── The loop ─────────────────────────────────────────────────────────────────
@@ -1236,6 +1270,67 @@ describe('the gate keeper over a stand-in session', () => {
     await tickAt(keeper, h, t + 3 * SEC + GATE_STALE_MS);
     expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(x));
     expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(x));
+  });
+
+  // 🚚 A DEPART at the ferry's helm lets go of every dock before it flies,
+  // under the hold its room shares (shipDoc.ts): a dock made meanwhile would
+  // see the ferry fly off from a gate still holding it.
+  it('neither docks nor casts off a ferry while a DEPART casts it off under the shared hold', async () => {
+    const { h, deps } = harness();
+    const keeper = createGateKeeper(deps);
+    const ship = h.ferry.getMap('ship');
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    ship.set('castOff', { by: 'depart-1', at: D0 - SEC });
+    await tickAt(keeper, h, D0);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
+    // The DEPART ends (here, without flying): the keeper docks the ferry.
+    ship.delete('castOff');
+    const docked = D0 + SEC;
+    await tickAt(keeper, h, docked);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(docked));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(docked));
+    // At the departure, the same.
+    await tickAt(keeper, h, docked + SEC);
+    await tickAt(keeper, h, DEPART - GATE_PRE_DIAL_MS + SEC);
+    const t = DEPART + GATE_CAST_OFF_DEFER_MS;
+    ship.set('castOff', { by: 'depart-2', at: t - SEC });
+    await tickAt(keeper, h, t);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(docked));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(docked));
+    ship.delete('castOff');
+    await tickAt(keeper, h, t + SEC);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(t + SEC));
+    expect(readDoorFrom(h.ferry, PORT))
+      .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: t + SEC }));
+  });
+
+  it("casts off neither end while the ferry's room holds a move this game never heard of, and learns it", async () => {
+    const { h, deps } = harness({ port: portDockedAt(D0), gateRec: dockOf(D0) });
+    const move = ferryMove(DEPART - MIN);
+    bookMoveIn(h.ferry, move);
+    const stored = new Map<string, string>();
+    const g = globalThis as { localStorage?: unknown };
+    const had = g.localStorage;
+    g.localStorage = {
+      getItem: (k: string) => stored.get(k) ?? null,
+      setItem: (k: string, v: string) => void stored.set(k, v),
+      removeItem: (k: string) => void stored.delete(k),
+    };
+    try {
+      const keeper = createGateKeeper(deps);
+      await tickAt(keeper, h, DEPART - GATE_PRE_DIAL_MS + SEC);
+      const t = DEPART + GATE_CAST_OFF_DEFER_MS;
+      await tickAt(keeper, h, t);
+      await tickAt(keeper, h, t + SEC);
+      expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(D0));
+      expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+      expect(h.notes).toEqual([]);
+      // This install now carries that move on, as a far session's would.
+      expect(readRememberedMoves()).toEqual([expect.objectContaining({ welcomeRoomId: FERRY, departAt: move.departAt })]);
+    } finally {
+      g.localStorage = had;
+    }
   });
 
   /** A dock the ferry's port holds alone at gate x+ (its far write never
