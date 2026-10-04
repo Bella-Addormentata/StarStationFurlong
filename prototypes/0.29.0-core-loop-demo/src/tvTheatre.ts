@@ -28,6 +28,7 @@ import { registerTvPlayerOfRecord } from './tvSession';
 import { acceptMediaOrigin, consentRefusal, mediaConsent, mediaOrigin } from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
+import { suspendStickKeys } from './freeFlightStick';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
 
@@ -325,6 +326,9 @@ interface Theatre {
   onKey: (e: KeyboardEvent) => void;
   /** What had focus when the theatre opened: focus goes back there on close. */
   opener: HTMLElement | null;
+  /** The helm's flight stick stands aside while the theatre is up
+   *  (freeFlightStick.suspendStickKeys): its release, called on close. */
+  releaseStick: () => void;
 }
 
 let theatre: Theatre | null = null;
@@ -415,6 +419,15 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     // open is still released to the world.
     e.stopPropagation();
   };
+  // What the capture listener above cannot block: the helm's flight stick,
+  // when taken (WATCH from the HUD chip while flying the ship by hand). Its
+  // own capture listener was registered before this one and swallows the
+  // flight keys — WASD, the arrows, Space, Q, E, X — before this one runs,
+  // so the ship would fly on behind the theatre, and Space or an arrow on a
+  // focused control here (the volume slider) would never reach it. The
+  // stick stands aside for as long as the theatre is up, keys held as it
+  // opened let go, and is itself again on close.
+  const releaseStick = suspendStickKeys();
   window.addEventListener('keydown', onKey, true);
   theatre = {
     root,
@@ -438,6 +451,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     onKey,
     opener: document.activeElement instanceof HTMLElement ? document.activeElement : null,
     playerFor: -1,
+    releaseStick,
   };
   // The dialog takes focus (Tab then reaches its controls); it goes back on close.
   root.tabIndex = -1;
@@ -467,6 +481,7 @@ export function closeTvTheatre(): void {
   theatre = null;
   window.clearInterval(t.timer);
   window.removeEventListener('keydown', t.onKey, true);
+  t.releaseStick();
   unmountPlayer(t);
   t.root.remove();
   if (t.opener && t.opener.isConnected) t.opener.focus();

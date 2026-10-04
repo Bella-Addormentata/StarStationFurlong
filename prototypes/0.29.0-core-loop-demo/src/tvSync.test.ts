@@ -850,3 +850,66 @@ describe('the holder as the room\'s clock', () => {
     expect(h.beats).toEqual([]); // the headless beat keeps the room's clock for it
   });
 });
+
+describe('a scheduled start, for the holder', () => {
+  it('parks at 0 during the countdown and starts from the top at T0 when its tick is on time: the clock\'s reading is inside the band of the parked 0', () => {
+    const p = new FakePlayer(true);
+    p.position = 4_000;
+    p.playing = true;
+    const h = harness(p, { hold: true });
+    h.transport({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 2_000 }); // SCHEDULE: a transport write
+    h.tick();
+    h.tick();
+    expect(p.log).toEqual(['pause', 'seek:0']); // parked once
+    expect(h.beats).toEqual([]);
+    h.set({ state: 'playing', positionMs: 300, running: true, countdownMs: 0 }); // T0 was 300 ms ago by this page's clock
+    h.tick();
+    expect(p.log).toEqual(['pause', 'seek:0', 'play']); // inside the band of the parked 0: from the top
+    expect(h.beats).toEqual([0]); // the write everyone starts on
+  });
+
+  it('a tick that comes late past T0 (a throttled tab) follows the clock\'s reading like any transport write, and beats from there', () => {
+    const p = new FakePlayer(true);
+    const h = harness(p, { hold: true });
+    h.transport({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 2_000 });
+    h.tick();
+    expect(p.log).toEqual(['seek:0']);
+    h.set({ state: 'playing', positionMs: 3_000, running: true, countdownMs: 0 }); // T0 was 3 s ago: past the seek band
+    h.tick(5_000);
+    expect(p.log).toEqual(['seek:0', 'seek:3000', 'play']); // not started at 0 with the room behind it
+    expect(p.position).toBe(3_000);
+    expect(h.beats).toEqual([3_000]); // the programme is 3 s in, as the headless beat would say
+  });
+
+  it('a set switched off and on during the countdown changes nothing: the first tick past T0 still follows the clock\'s reading', () => {
+    const p = new FakePlayer(true);
+    const h = harness(p, { hold: true });
+    h.transport({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 5_000 });
+    h.tick();
+    h.set({ state: 'off', positionMs: 0, running: false, countdownMs: 0 }); // the body's POWER: the switch, not a transport write
+    h.tick();
+    h.set({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 3_000 }); // and on again, the countdown still running
+    h.tick();
+    expect(p.log).toEqual(['seek:0']); // parked once, and still parked
+    h.set({ state: 'playing', positionMs: 3_000, running: true, countdownMs: 0 });
+    h.tick(5_000);
+    expect(p.log).toEqual(['seek:0', 'seek:3000', 'play']);
+    expect(h.beats).toEqual([3_000]);
+  });
+
+  it('a lazy player\'s late start beats only once its seek to the elapsed has landed', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true; // YouTube's asynchronous seekTo
+    const h = harness(p, { hold: true });
+    h.transport({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 2_000 });
+    h.tick();
+    p.land(); // parked
+    h.set({ state: 'playing', positionMs: 3_000, running: true, countdownMs: 0 });
+    h.tick(5_000);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0', 'seek:3000']);
+    expect(h.beats).toEqual([]); // 0 published now would start the room at 0
+    p.land();
+    h.tick();
+    expect(h.beats).toEqual([3_000]);
+  });
+});

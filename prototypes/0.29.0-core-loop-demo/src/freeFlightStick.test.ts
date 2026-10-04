@@ -2,7 +2,7 @@
  * 🕹️ freeFlightStick — the flight keys and a gamepad or joystick (issue 203).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, takeStickKeys } from './freeFlightStick';
+import { readStick, releaseStickKeys, stickKeysTaken, stickPadName, suspendStickKeys, takeStickKeys } from './freeFlightStick';
 
 type Listener = (e: unknown) => void;
 const listeners = new Map<string, Set<Listener>>();
@@ -69,6 +69,30 @@ describe('the flight keys', () => {
     expect(readStick()).toMatchObject({ thrust: 1, yaw: 1 });
     for (const fn of listeners.get('blur') ?? []) fn({});
     expect(readStick()).toMatchObject({ thrust: 0, yaw: 0 });
+  });
+
+  it('stand aside while an overlay that takes the keyboard is up — keys held then let go — and are the stick\'s again once every overlay has released', () => {
+    takeStickKeys();
+    key('keydown', 'KeyW');
+    expect(readStick().thrust).toBe(1);
+    const theatre = suspendStickKeys(); // the TV theatre opens over the helm
+    expect(readStick().thrust).toBe(0); // the W held as it opened is let go
+    expect(key('keydown', 'KeyW')).toBe(false); // the theatre's own listener sees it: nothing flies the ship
+    expect(readStick().thrust).toBe(0);
+    const phone = suspendStickKeys(); // the phone, above the theatre
+    theatre(); // the theatre closes first…
+    expect(key('keydown', 'KeyA')).toBe(false); // …the phone is still up
+    theatre(); // a second release of the same overlay counts for nothing
+    phone();
+    expect(key('keydown', 'KeyA')).toBe(true);
+    expect(readStick().yaw).toBe(-1);
+    // An overlay up before the stick is taken stands it aside the same.
+    releaseStickKeys();
+    const stage = suspendStickKeys();
+    takeStickKeys();
+    expect(key('keydown', 'KeyW')).toBe(false);
+    stage();
+    expect(key('keydown', 'KeyW')).toBe(true);
   });
 });
 
