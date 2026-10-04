@@ -178,4 +178,73 @@ describe('atlasForBundle', () => {
     expect(Object.keys(atlasForBundle(atlas, 'elsewhere')).sort()).toEqual(['elsewhere', 'elsewhere-2']);
     expect(atlasForBundle(atlas, 'nowhere')).toEqual({});
   });
+
+  it('leaves out a visiting ship and the berth it docked at', () => {
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: {
+        roomId: 'welcome', name: 'W', lastSeen: now,
+        doors: {
+          'd:1': door('hub', 'd:2'),
+          'd:dock': { targetSeed: '', targetRoomId: 'ship', transient: true },
+        },
+      },
+      hub: { roomId: 'hub', name: 'H', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+      ship: { roomId: 'ship', name: 'SHIP', doors: { 'd:dock': { targetSeed: '', targetRoomId: 'welcome', transient: true } }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['hub', 'welcome']);
+    expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
+  });
+
+  it('leaves out a berth whose station end carries no flag when the ship\'s end does', () => {
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: {
+        roomId: 'welcome', name: 'W', lastSeen: now,
+        // An older client recorded the station's end: no flag, no dock chain.
+        doors: { 'd:1': door('hub', 'd:2'), 'd:port': { targetSeed: '', targetRoomId: 'ship' } },
+      },
+      hub: { roomId: 'hub', name: 'H', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+      ship: { roomId: 'ship', name: 'SHIP', doors: { 'd:dock': { targetSeed: '', targetRoomId: 'welcome', transient: true } }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['hub', 'welcome']);
+    expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
+  });
+
+  it('leaves out a dock recorded before the berth flag existed', () => {
+    const dock = [{ kind: 'dock' as const }, { kind: 'dock' as const }];
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: {
+        roomId: 'welcome', name: 'W', lastSeen: now,
+        doors: { 'd:1': door('hub', 'd:2'), 'd:dock': { targetSeed: '', targetRoomId: 'ship', segments: dock } },
+      },
+      hub: { roomId: 'hub', name: 'H', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+      ship: { roomId: 'ship', name: 'SHIP', doors: { 'd:dock': { targetSeed: '', targetRoomId: 'welcome', segments: dock } }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['hub', 'welcome']);
+    expect(Object.keys(bundle.welcome.doors)).toEqual(['d:1']);
+  });
+
+  it('exports a room named __proto__ under its own key', () => {
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: { roomId: 'welcome', name: 'W', doors: { 'd:1': door('__proto__', 'd:2') }, lastSeen: now },
+      ['__proto__']: { roomId: '__proto__', name: 'P', doors: { 'd:2': door('welcome', 'd:1') }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(Object.keys(bundle).sort()).toEqual(['__proto__', 'welcome']);
+    expect(parseBundledAtlas(JSON.parse(JSON.stringify(bundle))).map((e) => e.roomId).sort())
+      .toEqual(['__proto__', 'welcome']);
+  });
+
+  it('keeps a one-room welcome station whose only door is a visiting ship\'s berth', () => {
+    const berth = (target: string) => ({ targetSeed: '', targetRoomId: target, transient: true });
+    const atlas: Record<string, AtlasEntry> = {
+      welcome: { roomId: 'welcome', name: 'W', dims: { cols: 2, rows: 2 }, doors: { 'd:port': berth('ship') }, lastSeen: now },
+      ship: { roomId: 'ship', name: 'SHIP', doors: { 'd:dock': berth('welcome') }, lastSeen: now },
+    };
+    const bundle = atlasForBundle(atlas, 'welcome');
+    expect(bundle).toEqual({ welcome: { roomId: 'welcome', name: 'W', dims: { cols: 2, rows: 2 }, doors: {} } });
+    expect(parseBundledAtlas(JSON.parse(JSON.stringify(bundle))).map((e) => e.roomId)).toEqual(['welcome']);
+  });
 });

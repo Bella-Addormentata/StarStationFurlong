@@ -81,13 +81,19 @@ import {
   subscribeDoors,
   readAllDoors,
   writeDoorPairing,
+  readPhysicalDoors,
   deleteDoorPairing,
   reapOrphanPairings,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./floorPlanDoc";
+import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
+// 🛰️ A helm bolted into a station flies the STATION (station keeping).
+import { steersStation } from "./stationKeeping";
+import { createStationHelmUI } from "./stationHelm";
+import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
 import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
@@ -320,6 +326,8 @@ export class World {
   /** 🚪 #159: what the live hull's door apertures were cut from (see
    *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
   private octagonHullDoorSig = "";
+  /** 🔭 cupolaSignature() when reconcileCupola last re-cut the room. */
+  private cupolaSig = "";
   /** 🚪 #159: the apertures may be stale — the docking system said a frame
    *  moved or vanished, or a door began to open or finished closing
    *  (onDoorApertureChange). Settled once per frame in update(), so a join
@@ -1104,6 +1112,7 @@ export class World {
       collectWindowOpenings(),
       this.collectWallpaper(),
       doorOpenings,
+      readCupolaWall(),
     );
     this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
@@ -1445,6 +1454,32 @@ export class World {
     this.addOctagonHull();
   }
 
+  /** 🔭 What the cupola rendering depends on: the stored wall and the room
+   *  size it is resolved against. */
+  private cupolaSignature(): string {
+    return JSON.stringify([roomHalfExtents(), readCupolaWall()]);
+  }
+
+  /**
+   * 🔭 Follow the floorPlan `cupola` setting: a change (the owner set or
+   * cleared it, here or on another client) re-cuts the hull, the floor's
+   * corners and the walkable grid. Called on every floorPlan change, so it
+   * bails when the cupola signature is unchanged.
+   */
+  public reconcileCupola(): void {
+    const sig = this.cupolaSignature();
+    if (sig === this.cupolaSig) return;
+    this.cupolaSig = sig;
+    rebakeWalkableGrid();
+    this.player.onWalkShapeChanged(); // out of a glass corner; replan the walk
+    if (this.platformFloor) {
+      const old = this.platformFloor.geometry;
+      this.platformFloor.geometry = this.makeFloorGeometry();
+      old.dispose();
+    }
+    if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
+  }
+
   /**
    * 🖼️ #80 S6: rebuild the octagon hull when the shared wall-covering set
    * changes (paint / clear) — mirrors reconcileWindowLayout. The rebuild
@@ -1466,14 +1501,21 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     const w = 2 * halfX,
       d = 2 * halfZ;
-    if (this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+    // 🔭 a cupola end wall cuts the floor's two corners at that end at 45°.
+    const cupola = OCTAGON_HULL ? roomCupola() : null;
+    if (!cupola && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
       return new THREE.PlaneGeometry(w, d);
     }
     const shape = new THREE.Shape();
-    shape.moveTo(-halfX, -halfZ);
-    shape.lineTo(halfX, -halfZ);
-    shape.lineTo(halfX, halfZ);
-    shape.lineTo(-halfX, halfZ);
+    if (cupola) {
+      const outline = cupolaFloorOutline(cupola);
+      outline.forEach((p, i) => (i === 0 ? shape.moveTo(p.x, -p.z) : shape.lineTo(p.x, -p.z)));
+    } else {
+      shape.moveTo(-halfX, -halfZ);
+      shape.lineTo(halfX, -halfZ);
+      shape.lineTo(halfX, halfZ);
+      shape.lineTo(-halfX, halfZ);
+    }
     shape.closePath();
     for (const h of this.floorHoles) {
       const path = new THREE.Path();
@@ -5602,9 +5644,7 @@ export class World {
       // COMPUTER — the very DOCK / UNDOCK the door panel runs, so the two
       // surfaces can never disagree about a port.
       const ds = this.dockingSystem;
-      deviceFocus.beginFocus(
-        this.player,
-        device,
+      const shipFace = () =>
         createHelmUI(
           ds
             ? {
@@ -5612,11 +5652,20 @@ export class World {
                 connected: () => ds.connectedModules(),
                 subscribe: (cb) => ds.onDockChange(cb),
                 undock: (doorId) => void ds.undockPort(doorId),
-                dock: (doorId) => void ds.redockPort(doorId),
+                dock: (doorId) => ds.redockPort(doorId),
               }
             : undefined,
-        ),
-      );
+        );
+      // 🛰️ A module bolted into a station by a gangway, or a station's own
+      // welcome room standing alone, steers the STATION: its helm opens the
+      // station keeping face (small trim stick) and keeps the ship face one
+      // tab away for fuel and the docking computer. Every helm opens through
+      // the station helm, so one opened on the ship face offers station
+      // keeping once its module comes to steer a station. The room's own
+      // doors count, each read past the doors' read cap, as DEPART reads them.
+      const bolted = () => steersStation(currentRoomId(), readPhysicalDoors());
+      const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
+      deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
 

@@ -28,6 +28,46 @@ import { FURNITURE, FURNITURE_DEFS, buildDeviceList, itemAabb } from './furnitur
 // 🚀 #30 SH1: the helm re-renders its checklist when the furniture doc moves
 // (an engine landing while someone reads the status flips the row live).
 import { subscribeFurniture as subscribeFurnitureForHelm } from './furnitureDoc';
+// 🚀 #30 SH2 + SH3: fuel level + flight state come from the ship doc; the
+// helm is the primary read/write surface for both. Owner-gated at the caller;
+// shape-guarded on read (a hostile peer could write any junk).
+import {
+  TANK_CAPACITY,
+  canDepart,
+  clampFuelToCapacity,
+  findDestination,
+  flightArrived,
+  flightProgress,
+  readFlightRecord,
+  readFuelLevel,
+  subscribeShip,
+  writeFlightRecord,
+  writeFuelLevel,
+} from './shipDoc';
+// 🛰️ #30 SH3: destinations are the other stations orbiting this planet.
+import { destinationsFrom, flightCapable, followsFlightRecord, groundedBy, isKnownStation, planHop, stationHere, withStationSnapshot } from './stationDirectory';
+import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
+// 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
+import {
+  castOffForDeparture,
+  castOffRefusal,
+  rememberBerthHere,
+  completeArrival,
+  shipLocationId,
+  type ArrivalOutcome,
+  type ShipDockingApi,
+} from './shipArrival';
+// #30 SH3: the helm enumerates the room's paired doors so canDepart can
+// refuse a permanent connector-chain (a chained module cannot fly, by
+// construction — plan §5.1). DEPART also detaches any transient berth.
+import {
+  deleteDoorPairing,
+  readAllDoorsWithPhysical,
+  readPhysicalDoors,
+  subscribeDoors,
+  type DoorPairing,
+} from './doorsDoc';
+import { isDockChain } from './adapter';
 import { GRID_SIZE, walkable, worldToCol, worldToRow } from './pathfinding';
 import { SolarSystemMap } from './map';
 import type { DoorDockingPortSystem, DockingState, DockPortView } from './docking';
@@ -141,6 +181,7 @@ import {
 } from './robotDoc';
 import type { RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
+import { subscribePlanetSummary } from './planetSummary';
 // 🪙 Physical chips (owner request): outside the cashier, balances render as
 // countable chip stacks — never as a number. One renderer enforces the rule.
 import { chipsFor, drawChips, drawFeltStack, groupChips } from './chipDisplay';
@@ -1007,6 +1048,8 @@ let mapTableMap: SolarSystemMap | null = null;
  */
 export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
   let panel: HTMLDivElement | null = null;
+  // 🪐 Stations and trims learned while the table is open redraw it.
+  let unhearSummary: (() => void) | null = null;
 
   return {
     mount(host: HTMLElement): void {
@@ -1065,10 +1108,16 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
       } else {
         mapTableMap.mount(body); // re-parents the existing container
       }
+      // Every station around each planet, "you are here" on the current one.
+      mapTableMap.refreshStations(undefined, holotableStation());
+      unhearSummary?.();
+      unhearSummary = subscribePlanetSummary(() => mapTableMap?.refreshStations(undefined, holotableStation()));
       mapTableMap.show();
     },
 
     unmount(): void {
+      unhearSummary?.();
+      unhearSummary = null;
       mapTableMap?.hide();
       panel?.remove();
       panel = null;
@@ -1952,7 +2001,121 @@ export function createGameTableUI(deps: GameTableUIDeps): DeviceUI {
   };
 }
 
-// ── 🚀 #30 SH1: the HELM console — ship status + ⚓ #163 docking computer ────
+// ── 🚀 #30 SH1–SH3: the HELM console — status, fuel, flight + ⚓ #163 docking ──
+
+/**
+ * Owner gate for helm writes (REFUEL / DEPART / REDOCK). The helm is the
+ * single writer for the ship's fuel + flight records, so the write path is
+ * owner-gated at the CALLER (dev-phase honest-client posture — same as edit
+ * mode / access mode / co-host controls). A missing setter (headless tests,
+ * dev bootstrapping) treats the local player as authorized so the standalone
+ * demo keeps working. Wired from main.ts after yjsSync mounts. */
+let helmOwnerCheck: (() => boolean) | null = null;
+export function setHelmOwnerCheck(cb: (() => boolean) | null): void {
+  helmOwnerCheck = cb;
+}
+function helmIsCommander(): boolean {
+  return helmOwnerCheck ? helmOwnerCheck() === true : true;
+}
+
+/** Poll cadence for the in-flight countdown + arrival watch (ms). Writer-clock
+ *  interpolation is deterministic given (departedAt, etaAt); the tick only
+ *  refreshes the DOM, and drives the arrival transition when etaAt passes
+ *  under the open panel (a client that never opened the helm still sees the
+ *  transition — the state advance is a broadcast owner-write, and everyone's
+ *  helm reads the same record). Idempotent under contention: whichever owner
+ *  writes first, the second's writeFlightRecord reads the just-published
+ *  'redocking' current record and its 'redocking → redocking' self-transition
+ *  lands as a no-op republish (writeFlightRecord's isLegalFlightTransition
+ *  gate treats self-transitions as legal). */
+const HELM_TICK_MS = 250;
+
+/** The station the holotable marks "you are here". A station room is its
+ *  own atlas station. A ship is its own one-module station in the atlas
+ *  (docks are not station structure), so a ship reads its live dock partner
+ *  first, then where its last flight left it; in flight it is at none, even
+ *  should a fitting come off mid-trip (the room still follows its flight:
+ *  followsFlightRecord, as main.ts places it). Exported for tests. */
+export function holotableStation(): StationRecord | null {
+  const flight = readFlightRecord();
+  if (!followsFlightRecord(flight.status, flightCapable(isShipReady()))) return currentStation();
+  if (flight.status !== 'docked') return null;
+  const id = stationHere() ?? shipLocationId(flight, hasLiveDock());
+  return listStationRecords().find((st) => st.id === id) ?? null;
+}
+
+/** A paired door that is a guest berth, not station structure: flagged
+ *  transient, or a DOCK chain (a dock is always transient — records from
+ *  before the flag carry only the two-half chain). */
+function isTransientBerth(rec: DoorPairing): boolean {
+  return rec.transient === true || isDockChain(rec.segments);
+}
+
+/** Enumerate the room's PERMANENT chained doors — a paired berth that is
+ *  NOT a transient guest-berth. Reads the doors doc (shared truth), so a
+ *  peer's dock lands here without a helm round-trip; only the room's own
+ *  doors count (a record on a door it lacks holds nothing). */
+function enumerateChainedDoors(): string[] {
+  const out: string[] = [];
+  for (const [id, rec] of readPhysicalDoors()) {
+    if (rec.paired !== true) continue;
+    if (isTransientBerth(rec)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/** Does any door of this room hold a live connection right now? */
+function hasLiveDock(): boolean {
+  for (const [, rec] of readPhysicalDoors()) if (rec.paired === true) return true;
+  return false;
+}
+
+/** Enumerate the room's TRANSIENT guest-berths — a paired berth that IS a
+ *  transient (#67 D2). DEPART iterates these and calls deleteDoorPairing on
+ *  each so the station is "cast off" before the state advances to in-flight
+ *  (plan §5.1: undock via the transient-berth detach). */
+function enumerateTransientBerths(): string[] {
+  const out: string[] = [];
+  for (const [id, rec] of readAllDoorsWithPhysical()) {
+    if (rec.paired !== true) continue;
+    if (!isTransientBerth(rec)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/** Derived flight capability — plan §1.4: at least one fuel tank, engine, and
+ *  helm mounted. Ship-ness is DERIVED from furniture (never stored); this is
+ *  the read side of that ruling.
+ *
+ *  PR #134 audit MINOR (dorkmo speed note, verified in-source 2026‑08‑21):
+ *  confirmed this walk is NOT per-frame. Callers of countFunction are the
+ *  render() closure in createHelmUI (below) and isShipReady (below); render()
+ *  is invoked ONLY from (a) the helm's doc observers (furniture / ship /
+ *  doors — event-driven, not per-frame), (b) discrete user gestures (picker
+ *  change, refuel arm, depart / redock click), (c) the mount()-side initial
+ *  paint, and (d) a 4 Hz HELM_TICK_MS setInterval that re-renders ONLY while
+ *  `readFlightRecord().status === 'in-flight'`. World.update / animate() /
+ *  requestAnimationFrame never call render() (grep-verified). No cache added:
+ *  the walk is FURNITURE.filter over a bounded compile-time array — 3 tag
+ *  lookups per render — and caching by furniture-map-change would add a
+ *  subscribeFurniture layer whose only savings are already covered by the
+ *  observer-driven render cadence. Documented rather than optimized so a
+ *  future move (e.g. adding countFunction to a per-frame status readout)
+ *  requires a deliberate cache decision, not a silent regression. */
+function countFunction(fnTag: string): number {
+  return FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes(fnTag)).length;
+}
+
+/** Public-facing capability check (also used by the exterior-view flight
+ *  branch and the tests-side wiring). Exported so exterior/atlas code can
+ *  render the ship-ness affordance without duplicating the tag lookup. */
+export function isShipReady(): boolean {
+  return countFunction('engine') >= 1
+      && countFunction('fuelTank') >= 1
+      && countFunction('helm') >= 1;
+}
 
 /**
  * ⚓ #163: what the helm's DOCKING COMPUTER reads and does. world.ts wires it
@@ -1967,7 +2130,8 @@ export interface HelmDockingDeps {
   /** Subscribe to port changes; returns the unsubscribe. */
   subscribe: (cb: () => void) => () => void;
   undock: (doorId: string) => void;
-  dock: (doorId: string) => void;
+  /** The shipped DOCK; its answer (false: refused) settles the arrival note. */
+  dock: (doorId: string) => void | boolean | Promise<boolean | void>;
 }
 
 /** Port marker colours on the ship atlas (and the status words beside them). */
@@ -1988,37 +2152,156 @@ function portStatusText(p: DockPortView): string {
   }
 }
 
+/** What the last arrival did, in the helm's words — set by whichever path
+ *  finished the flight (the open helm's tick, or main.ts's 1 Hz watch), shown
+ *  on the next docked render. Cleared at DEPART. */
+let lastArrivalNote: { text: string; tone: 'ok' | 'warn' } | null = null;
+/** Open helms re-render when the note changes — an arrival finished by
+ *  main.ts's watch writes no doc value the helm observes. */
+const arrivalNoteListeners = new Set<() => void>();
+
+function setArrivalNote(note: { text: string; tone: 'ok' | 'warn' } | null): void {
+  lastArrivalNote = note;
+  for (const fn of arrivalNoteListeners) fn();
+}
+
+function subscribeArrivalNote(fn: () => void): () => void {
+  arrivalNoteListeners.add(fn);
+  return () => { arrivalNoteListeners.delete(fn); };
+}
+
+/** Forget the last arrival — main.ts calls it on every room join, so one
+ *  ship's arrival never shows on another ship's helm. */
+export function clearShipArrivalNote(): void {
+  arrivalNoteRoom++;
+  setArrivalNote(null);
+}
+
+/** Bumped on every room join (clearShipArrivalNote). */
+let arrivalNoteRoom = 0;
+
+/** The arrival-note callback for a DOCK started in this room: its answer can
+ *  come after the player has left, and then it is not the new room's news. */
+export function arrivalNoteHere(): (outcome: ArrivalOutcome | null) => void {
+  const room = arrivalNoteRoom;
+  return (outcome) => { if (room === arrivalNoteRoom) noteShipArrival(outcome); };
+}
+
+/** Record an arrival outcome for the helm (shipArrival.completeArrival). */
+export function noteShipArrival(outcome: ArrivalOutcome | null): void {
+  if (!outcome) return;
+  if (outcome.kind === 'docking') {
+    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at the berth…`, tone: 'ok' });
+    return;
+  }
+  if (outcome.kind === 'docked') {
+    setArrivalNote({ text: `Docked at ${outcome.stationName}.`, tone: 'ok' });
+    return;
+  }
+  setArrivalNote({
+    tone: 'warn',
+    text: outcome.reason === 'berths-taken'
+      ? `Arrived at ${outcome.stationName} — the DOCK did not go through (the berth taken or closed, no rights, no room to fit). Check the dock port's panel, and dock from it when that clears.`
+      : outcome.reason === 'already-docked'
+      ? `Arrived at ${outcome.stationName} — already docked there.`
+      : outcome.reason === 'unlisted-station'
+        ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
+        : outcome.reason === 'no-port'
+        ? `Arrived at ${outcome.stationName} — no dock port could dock (none fitted, or each one docked, busy, or not yours to dock). Fit one at a door (door panel › +DOCK), or check the dock ports' panels, and dock from one when that clears.`
+        : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
+  });
+}
+
 /**
- * The helm's focused UI: a SHIP STATUS checklist derived LIVE from the room's
- * furniture (the fittings ARE the requirements — #62's physical-item ruling
- * applied to ships), and — ⚓ #163 — a DOCKING COMPUTER: DOCK / UNDOCK for
- * the module's docking-adapter ports. One port gets a plain button; several
- * get the SHIP ATLAS, a top-down map of this module, its ports and what they
- * are docked to, to choose from. Flight itself (destinations, travel) still
- * arrives with the flight slices (spaceship-conversion-plan.md SH3).
+ * The helm's focused UI (SH1 + SH2 + SH3): a SHIP STATUS checklist derived
+ * LIVE from the room's furniture (the fittings ARE the requirements — #62's
+ * physical-item ruling applied to ships); the fuel gauge (ship doc truth,
+ * capacity derived from mounted tanks) with REFUEL; the FLIGHT PLAN —
+ * DESTINATION picker over the other stations orbiting this planet
+ * (stationDirectory.ts) and DEPART funneled through canDepart so the refusal
+ * reason is SHOWN; a live countdown while in flight; and — ⚓ #163 — the
+ * DOCKING COMPUTER (DOCK / UNDOCK per port, the SHIP ATLAS for several).
+ *
+ * DEPART remembers the berth being left, UNDOCKs every docked port with the
+ * shipped UNDOCK, debits fuel and writes `docked → in-flight`. Arrival is
+ * READ-side (plan §2): once now ≥ etaAt every viewer draws it; the commander's
+ * tick writes `in-flight → redocking`, then shipArrival.completeArrival writes
+ * `docked` at the destination and DOCKs at the station's berth with the
+ * shipped DOCK. Every flight write passes writeFlightRecord's shape +
+ * legal-transition gate (shipDoc.ts).
  */
 export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
   let panel: HTMLDivElement | null = null;
-  let unsubscribe: (() => void) | null = null;
-  let unsubscribeDocks: (() => void) | null = null;
+  const unsubs: Array<() => void> = [];
   /** The port the docking computer acts on (several ports ⇒ picked on the map). */
   let selected: string | null = null;
   /** Port marker hit areas on the atlas canvas, CSS px — rebuilt every draw. */
   let markers: Array<{ doorId: string; x: number; y: number }> = [];
+  let pickerDestId: string | null = null;
+  let tickTimer: ReturnType<typeof setInterval> | null = null;
+  // Refuel confirm-arm — one click primes, second confirms. Cleared by any
+  // record change (a peer refuel resets everyone's arm).
+  let refuelArmed = false;
+  const shipDocking: ShipDockingApi | null = docking
+    ? { ports: docking.ports, undock: docking.undock, dock: docking.dock }
+    : null;
 
   const esc = (s: string) =>
     s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
 
-  const render = (): void => {
+  // One read of the station list per render, however many hops it plans.
+  const render = (): void => withStationSnapshot(() => {
     if (!panel) return;
     // Every render swaps the whole panel (a dock landing re-renders it too):
-    // remember which docking control had keyboard focus, and give it back.
+    // remember which control had keyboard focus, and give it back.
     const focused = document.activeElement as HTMLElement | null;
     const refocus = focused && panel.contains(focused)
-      ? { pick: focused.dataset.helmPick, dock: focused.dataset.helmDock !== undefined }
+      ? { pick: focused.dataset.helmPick, dock: focused.dataset.helmDock !== undefined, id: focused.id }
       : null;
-    const engines = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('engine')).length;
-    const tanks = FURNITURE.filter((i) => FURNITURE_DEFS[i.kind]?.functions?.includes('fuelTank')).length;
+
+    // ── Derived + doc reads (all shape-guarded / defaults on failure) ───────
+    const tanks = countFunction('fuelTank');
+    const engines = countFunction('engine');
+    const helms = countFunction('helm');
+    const capacity = tanks * TANK_CAPACITY;
+    const fuel = clampFuelToCapacity(readFuelLevel(capacity), capacity);
+    const flight = readFlightRecord();
+    const commander = helmIsCommander();
+    const chained = enumerateChainedDoors();
+    const now = Date.now();
+    const arrived = flightArrived(flight, now);
+    const progress = flightProgress(flight, now);
+    // A station that dropped out of the directory is named as unlisted, never
+    // passed off as home (findDestination's fallback).
+    const named = (id: string) => isKnownStation(id)
+      ? findDestination(id)
+      : { ...findDestination(id), id, name: 'an unlisted station' };
+    // A room that does not follow its flight record (a station's own room,
+    // or one that cannot fly) is where its station is, as the holotable and
+    // the room resolver place it; its record may be an empty doc's default.
+    const capable = flightCapable(isShipReady());
+    const location = named(
+      (followsFlightRecord(flight.status, capable) ? null : currentStation()?.id)
+        ?? shipLocationId(flight, hasLiveDock()),
+    );
+    const destination = flight.destinationId ? named(flight.destinationId) : null;
+    const choices = destinationsFrom(location.id);
+    if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
+    const pickerDest = pickerDestId ? findDestination(pickerDestId) : null;
+    // The next hop to the picked station: when it leaves (a launch window may
+    // still be to come), when it lands, and what it burns.
+    const hop = pickerDestId ? planHop(location.id, pickerDestId, now) : null;
+    const refusal = canDepart({
+      flightCapable: capable,
+      currentStatus: flight.status,
+      currentFuel: fuel,
+      destinationId: pickerDestId ?? '',
+      chainedDoors: chained,
+      ownerAuthorized: commander,
+      locationId: location.id,
+      ...(pickerDestId ? { hop } : {}),
+    });
+
     const check = (ok: boolean) => ok
       ? '<span style="color:#00E676;">✔</span>'
       : '<span style="color:#FF8A80;">✗</span>';
@@ -2040,43 +2323,291 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // A GANGWAY holds a module as surely as a dock does — it is structure,
     // and UNDOCK does not release it. "Free" means neither.
     const bolted = [...new Set((docking?.connected() ?? []).filter((m) => !m.dock).map((m) => m.name))];
+    // A station's own room never DEPARTs (stationDirectory.groundedBy): its
+    // status says why in the DEPART line's words, never how to depart.
+    const grounded = groundedBy();
+    const stationRoomCopy = 'the station\'s own room: its engine, tank and helm keep the station in orbit, and a station never DEPARTs like a ship.';
     const message = !ready
       ? 'NOT SPACEWORTHY YET — mount at least one ENGINE BLOCK and one FUEL TANK (edit mode places them; DEV menu stocks them for now).'
+      : grounded !== null && grounded !== 'bolted'
+      ? `ALL SYSTEMS FITTED — but this is ${stationRoomCopy}`
       : bolted.length
         ? `ALL SYSTEMS FITTED — but this module is bolted to ${esc(bolted.join(', '))} by a gangway: structure, not a dock, and it holds the module until it is taken down at its door.${docked.length ? ' UNDOCK releases the docks only.' : ''}`
+        // A chain the docking computer does not list (past its read cap, or
+        // on a door the layout has dropped) refuses DEPART all the same.
+        : chained.length
+        ? `ALL SYSTEMS FITTED — but this module is chained to ${chained.length} permanent connector${chained.length === 1 ? '' : 's'}: take the gangway down first (chained modules cannot fly).`
         : docked.length
-          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. UNDOCK below and it is free to fly away; flight itself (destinations, travel) arrives with the flight update.'
-          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Flight itself arrives with the flight update; DOCK brings it back to a berth.';
+          ? 'ALL SYSTEMS FITTED — this module is spaceworthy. DEPART undocks it and flies; UNDOCK below just lets it drift free.'
+          : 'ALL SYSTEMS FITTED — the module is free: nothing holds it. Pick a destination and DEPART, or DOCK back to a berth.';
+
+    // ── Fuel gauge: level / capacity, filled bar, refuel button ────────────
+    const capFmt = capacity > 0 ? `${fuel} / ${capacity}` : '— NO TANK';
+    const barPct = capacity > 0 ? Math.max(0, Math.min(100, Math.round((fuel / capacity) * 100))) : 0;
+    const barColor = barPct > 40 ? '#00E676' : barPct > 10 ? '#FFB74D' : '#FF8A80';
+    const refuelDisabled = !commander || capacity === 0 || fuel >= capacity;
+    const refuelLabel = !commander
+      ? 'COMMANDER ONLY'
+      : capacity === 0
+        ? 'INSTALL A TANK'
+        : fuel >= capacity
+          ? 'TANKS FULL'
+          : refuelArmed ? 'CONFIRM REFUEL' : 'REFUEL';
+
+    // ── Flight panel (status-driven) ────────────────────────────────────────
+    let flightPanel = '';
+    if (flight.status === 'docked') {
+      const secs = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
+      const options = choices.map((d) => {
+        const h = planHop(location.id, d.id, now);
+        const label = h
+          ? `${h.fuelCost} fuel · ${secs(h.arriveAt - h.departAt)} flight`
+          : 'no transfer from here';
+        return `
+        <option value="${esc(d.id)}"${d.id === pickerDestId ? ' selected' : ''}>
+          ${esc(d.name)} — ${label}
+        </option>`;
+      }).join('');
+      const windowNote = hop && refusal.ok
+        ? `<div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px; line-height:1.4;">${
+            hop.departAt - now > 1000
+              ? `Next launch window in ${secs(hop.departAt - now)} — DEPART casts off now and burns at the window.`
+              : 'Launch window open now.'
+          }${hop.windowEveryMs ? ` Windows every ${secs(hop.windowEveryMs)}.` : ''}</div>`
+        : '';
+      // Refusal copy — the button is the caller's ANSWER, so name the reason.
+      const chainedCopy = (n: number) =>
+        `Chained to ${n} permanent connector${n === 1 ? '' : 's'} — take the gangway down first (chained modules cannot fly).`;
+      const refuseCopy = refusal.ok ? '' : (() => {
+        switch (refusal.reason) {
+          case 'no-owner': return 'Only the module\'s COMMANDER may depart.';
+          case 'not-flight-capable': {
+            // Fitted, yet a station's own room (stationDirectory.groundedBy):
+            // name what holds it, not systems it already has.
+            const why = isShipReady() ? groundedBy() : null;
+            if (why === 'bolted') return chainedCopy(chained.length);
+            if (why !== null) {
+              return `This is ${stationRoomCopy}`;
+            }
+            return 'NOT SPACEWORTHY — mount at least one FUEL TANK, ENGINE BLOCK, and HELM CONSOLE.';
+          }
+          case 'not-docked': return 'Ship is not at rest — cannot depart from mid-flight.';
+          case 'chained-berth': return chainedCopy(refusal.chainedDoors.length);
+          case 'insufficient-fuel': return `Insufficient fuel — this hop needs ${refusal.needed}, tanks hold ${refusal.have}.`;
+          case 'already-here': return 'The ship is already here.';
+          case 'other-planet': return 'That station orbits another planet — out of range.';
+          case 'no-transfer': return 'No transfer orbit from here to there (the two stations share an orbit).';
+          case 'unlisted-location':
+            return 'This station is not on your station list, so no hop from it can be planned. Dock at a listed station, or wait for this one\'s record to arrive.';
+          case 'unknown-destination': return choices.length === 0
+            ? 'No other station orbits this planet yet.'
+            : 'Unknown destination.';
+        }
+      })();
+      const btnEnabled = refusal.ok && pickerDest !== null;
+      const btnLabel = refusal.ok && pickerDest ? `DEPART FOR ${esc(pickerDest.name.toUpperCase())}` : 'DEPART';
+      const castOff = docked.length + enumerateTransientBerths().filter((id) => !docked.some((p) => p.doorId === id)).length;
+      const castOffNote = castOff > 0
+        ? `<div style="font-size:9px; color:rgba(212,168,75,0.55); margin-top:6px;">⏏ ${castOff} dock${castOff === 1 ? '' : 's'} will be released at depart — the ship remembers this berth</div>`
+        : '';
+      const arrivalNote = lastArrivalNote
+        ? `<div style="font-size:10px; color:${lastArrivalNote.tone === 'ok' ? '#00E676' : '#FFB74D'}; margin-bottom:8px; line-height:1.4;">${esc(lastArrivalNote.text)}</div>`
+        : '';
+      flightPanel = `
+        <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(212,168,75,0.18); border-radius:8px;">
+          <div style="font-size:11px; letter-spacing:0.5px; color:rgba(212,168,75,0.8); margin-bottom:6px;">FLIGHT PLAN</div>
+          ${arrivalNote}
+          ${choices.length > 0 ? `<select id="helm-dest-picker" style="width:100%; background:rgba(4,8,22,0.9); color:#d4a84b; border:1px solid rgba(212,168,75,0.25); padding:6px; font-family:inherit; font-size:11px; border-radius:6px;">
+            ${options}
+          </select>` : ''}
+          <button id="helm-depart-btn"${btnEnabled ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.25)'}; background:${btnEnabled ? 'rgba(0,230,118,0.18)' : 'rgba(80,80,80,0.15)'}; color:${btnEnabled ? '#00E676' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${btnEnabled ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${btnLabel}</button>
+          ${windowNote}
+          ${refuseCopy ? `<div style="font-size:10px; color:#FFB74D; margin-top:6px; line-height:1.4;">${refuseCopy}</div>` : ''}
+          ${castOffNote}
+        </div>`;
+    } else if (flight.status === 'undocking') {
+      // Reserved slow-path beat — no writer produces it in SH3, but a stale
+      // record can leave us here after a client reload.
+      flightPanel = `
+        <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,235,59,0.25); border-radius:8px; background:rgba(255,235,59,0.05);">
+          <div style="font-size:11px; color:#FFEB3B; letter-spacing:0.5px;">🚀 UNDOCKING …</div>
+          <div style="font-size:10px; color:rgba(212,168,75,0.7); margin-top:6px;">Cast-off in progress. The next transaction advances to in-flight.</div>
+        </div>`;
+    } else if (flight.status === 'in-flight') {
+      const remaining = Math.ceil((flight.etaAt !== undefined ? Math.max(0, flight.etaAt - now) : 0) / 1000);
+      const destName = esc((destination?.name ?? 'UNKNOWN').toUpperCase());
+      if (flight.departedAt !== undefined && now < flight.departedAt) {
+        const wait = Math.ceil((flight.departedAt - now) / 1000);
+        flightPanel = `
+          <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(255,235,59,0.3); border-radius:8px; background:rgba(255,235,59,0.05);">
+            <div style="font-size:11px; color:#FFEB3B; letter-spacing:0.5px;">⏳ HOLDING FOR LAUNCH WINDOW → ${destName}</div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Transfer burn in ${wait}s · arrival ETA ${remaining}s</div>
+          </div>`;
+      } else if (arrived) {
+        flightPanel = `
+          <div style="margin-top:12px; padding:10px 12px; border:1px solid #00E676; border-radius:8px; background:rgba(0,230,118,0.10);">
+            <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">✅ ARRIVED AT ${destName}</div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">Docking at the berth follows on the commander's next tick.</div>
+          </div>`;
+      } else {
+        const pctFmt = Math.round(progress * 100);
+        flightPanel = `
+          <div style="margin-top:12px; padding:10px 12px; border:1px solid rgba(129,199,132,0.35); border-radius:8px; background:rgba(0,230,118,0.06);">
+            <div style="font-size:11px; color:#00E676; letter-spacing:0.5px;">🚀 IN FLIGHT → ${destName}</div>
+            <div style="margin-top:8px; height:6px; background:rgba(0,0,0,0.5); border-radius:3px; overflow:hidden;">
+              <div style="width:${pctFmt}%; height:100%; background:#00E676; transition:width 0.25s linear;"></div>
+            </div>
+            <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px; display:flex; justify-content:space-between;">
+              <span>ETA ${remaining}s</span><span>${pctFmt}%</span>
+            </div>
+          </div>`;
+      }
+    } else if (flight.status === 'redocking') {
+      flightPanel = `
+        <div style="margin-top:12px; padding:10px 12px; border:1px solid #64B5F6; border-radius:8px; background:rgba(100,181,246,0.08);">
+          <div style="font-size:11px; color:#64B5F6; letter-spacing:0.5px;">🛬 DOCKING AT ${esc(location.name.toUpperCase())}</div>
+          <div style="font-size:10px; color:rgba(212,168,75,0.75); margin-top:6px;">The commander's helm docks at the station's berth. If no commander is aboard, one can finish it here.</div>
+          <button id="helm-redock-btn"${commander ? '' : ' disabled'} style="width:100%; margin-top:8px; padding:8px; border-radius:6px; border:1px solid ${commander ? '#64B5F6' : 'rgba(212,168,75,0.25)'}; background:${commander ? 'rgba(100,181,246,0.18)' : 'rgba(80,80,80,0.15)'}; color:${commander ? '#64B5F6' : 'rgba(212,168,75,0.4)'}; font-family:inherit; font-weight:800; cursor:${commander ? 'pointer' : 'not-allowed'}; text-transform:uppercase;">${commander ? 'DOCK NOW' : 'COMMANDER ONLY'}</button>
+        </div>`;
+    }
+
     panel.innerHTML = `
       <div style="display:flex; justify-content:space-between; align-items:baseline; border-bottom:1px solid rgba(212,168,75,0.18); padding-bottom:8px;">
-        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — SHIP STATUS</span>
+        <span style="font-size:12px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚀 HELM — ${flight.status === 'docked' ? 'SHIP STATUS' : flight.status.toUpperCase()}</span>
         <span style="font-size:9px; color:rgba(212,168,75,0.5);">ESC / WASD / CLICK AWAY TO STEP BACK</span>
       </div>
+      ${row('LOCATION', esc(flight.status === 'in-flight' ? `leaving ${location.name}` : location.name))}
       ${row('ENGINES', `${check(engines >= 1)} ${engines} mounted`)}
-      ${row('FUEL', `${check(tanks >= 1)} ${tanks} tank${tanks === 1 ? '' : 's'}${tanks > 0 ? ' · FULL' : ' — install a fuel tank'}`)}
-      ${row('HELM', `${check(true)} online`)}
+      ${row('FUEL TANKS', `${check(tanks >= 1)} ${tanks} × ${TANK_CAPACITY}${tanks > 0 ? '' : ' — install a fuel tank'}`)}
+      ${row('HELM', `${check(helms >= 1)} ${helms} online`)}
       ${row('DOCKING', dockingRow)}
+      ${row('CHAINED', chained.length === 0
+        ? `${check(true)} <span style="color:#00E676;">clear</span>`
+        : `${check(false)} ${chained.length} permanent link${chained.length === 1 ? '' : 's'} — cannot fly`)}
       ${row('PROVISIONS', '— <span style="color:rgba(212,168,75,0.45);">galley update coming</span>')}
-      ${row('HULL', `${check(true)} sealed`)}
-      <div style="margin-top:10px; padding:10px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.6; color:${ready ? '#00E676' : 'rgba(212,168,75,0.7)'};">
-        ${message}
+      <div style="margin-top:10px;">
+        <div style="display:flex; justify-content:space-between; align-items:baseline; font-size:11px;">
+          <span style="color:rgba(212,168,75,0.75);">FUEL</span>
+          <span style="color:${barColor}; font-weight:700;">${capFmt}</span>
+        </div>
+        <div style="margin-top:6px; height:10px; background:rgba(0,0,0,0.5); border-radius:5px; overflow:hidden; border:1px solid rgba(212,168,75,0.15);">
+          <div style="width:${barPct}%; height:100%; background:${barColor}; transition:width 0.25s linear;"></div>
+        </div>
+        <button id="helm-refuel-btn"${refuelDisabled ? ' disabled' : ''} style="width:100%; margin-top:8px; padding:6px; border-radius:6px; border:1px solid ${refuelDisabled ? 'rgba(212,168,75,0.2)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; background:${refuelDisabled ? 'rgba(80,80,80,0.12)' : (refuelArmed ? 'rgba(255,138,128,0.18)' : 'rgba(240,192,96,0.12)')}; color:${refuelDisabled ? 'rgba(212,168,75,0.4)' : (refuelArmed ? '#FF8A80' : '#F0C060')}; font-family:inherit; font-weight:700; cursor:${refuelDisabled ? 'not-allowed' : 'pointer'}; text-transform:uppercase; font-size:11px;">${refuelLabel}</button>
       </div>
-      ${docking ? renderDockingComputer(ports) : ''}
+      ${flight.status === 'docked' ? `<div style="margin-top:10px; padding:10px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.6; color:${ready ? '#00E676' : 'rgba(212,168,75,0.7)'};">
+        ${message}
+      </div>` : ''}
+      ${flightPanel}
+      ${docking && flight.status === 'docked' ? renderDockingComputer(ports) : ''}
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px; margin-top:10px;">
-        SSF FLIGHT SYSTEMS v0 · docking live — flight controls arrive with the flight update
+        SSF FLIGHT SYSTEMS v1 · docking + station-to-station flight
       </div>
     `;
     const canvas = panel.querySelector<HTMLCanvasElement>('#helm-ship-atlas');
     if (canvas && docking) drawShipAtlas(canvas, ports, docking.connected());
+
+    // ── Wire the freshly-rendered flight controls ───────────────────────────
+    const picker = panel.querySelector<HTMLSelectElement>('#helm-dest-picker');
+    picker?.addEventListener('change', () => {
+      pickerDestId = picker.value;
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-refuel-btn')?.addEventListener('click', () => {
+      if (!helmIsCommander()) return;              // dev-phase owner gate
+      if (capacity === 0) return;
+      if (!refuelArmed) { refuelArmed = true; render(); return; }
+      // Dev-phase full-fill: real parts-economy metering is a later slice.
+      // writeFuelLevel clamps to CURRENT capacity, so removing a tank between
+      // arm + confirm cannot over-fill.
+      writeFuelLevel(capacity, capacity);
+      refuelArmed = false;
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-depart-btn')?.addEventListener('click', () => {
+      // Re-check every input at click time — the picker + doc state may have
+      // moved between render and click (a peer just bolted on a gangway).
+      const nowCapacity = countFunction('fuelTank') * TANK_CAPACITY;
+      const nowFuel = clampFuelToCapacity(readFuelLevel(nowCapacity), nowCapacity);
+      const nowFlight = readFlightRecord();
+      const fromId = shipLocationId(nowFlight, hasLiveDock());
+      const destId = pickerDestId ?? '';
+      const nowHop = destId ? planHop(fromId, destId, Date.now()) : null;
+      const nowRefusal = canDepart({
+        flightCapable: flightCapable(isShipReady()),
+        currentStatus: nowFlight.status,
+        currentFuel: nowFuel,
+        destinationId: destId,
+        chainedDoors: enumerateChainedDoors(),
+        ownerAuthorized: helmIsCommander(),
+        locationId: fromId,
+        ...(destId ? { hop: nowHop } : {}),
+      });
+      if (!nowRefusal.ok) { render(); return; }
+      const dest = findDestination(destId);
+      if (!nowHop) { render(); return; }
+      if (nowFuel < nowHop.fuelCost) { render(); return; }
+      // 0) Every dock must be releasable, or the flight would leave one live.
+      const castOffBlock = shipDocking ? castOffRefusal(shipDocking.ports()) : null;
+      if (castOffBlock) {
+        setArrivalNote({
+          tone: 'warn',
+          text: castOffBlock === 'dock-busy'
+            ? 'Cannot depart yet: a dock port is still busy. Try again in a moment.'
+            : 'Cannot depart: a dock port here is one you may not undock.',
+        });
+        render();
+        return;
+      }
+      //    Keep the berth here first: a ship that cannot remember where it
+      //    docked must not leave (the return trip would have nowhere to go).
+      if (shipDocking && !rememberBerthHere(fromId, shipDocking.ports())) {
+        setArrivalNote({
+          tone: 'warn',
+          text: `Cannot depart: the ship could not remember its berth at ${findDestination(fromId).name}.`,
+        });
+        render();
+        return;
+      }
+      // 1) Publish the flight record FIRST — the FAST path docked → in-flight.
+      //    A record the writer refuses (shape or transition) must not leave
+      //    the ship cast off and charged without having departed.
+      //    departedAt is the transfer burn — the next launch window, which
+      //    may still be ahead (every viewer shows the hold until then).
+      const departed = writeFlightRecord({
+        status: 'in-flight',
+        locationId: fromId,
+        destinationId: dest.id,
+        departedAt: nowHop.departAt,
+        etaAt: nowHop.arriveAt,
+      });
+      if (!departed) { render(); return; }
+      // 2) Cast off: remember this berth, UNDOCK every docked port (shipped
+      //    UNDOCK — tombstone + far-room write), then detach any other
+      //    transient guest berth (#67 D2, either-side legal).
+      if (shipDocking) castOffForDeparture(fromId, shipDocking);
+      for (const doorId of enumerateTransientBerths()) deleteDoorPairing(doorId);
+      // 3) Debit the fuel cost.
+      writeFuelLevel(nowFuel - nowHop.fuelCost, nowCapacity);
+      setArrivalNote(null);
+      render();
+    });
+    panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
+      if (!helmIsCommander()) return;
+      // DOCK NOW is the commander's call: settle the arrival here and now.
+      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
+    });
+
     if (refocus) {
       const target = refocus.pick !== undefined
         ? [...panel.querySelectorAll<HTMLElement>('[data-helm-pick]')].find((b) => b.dataset.helmPick === refocus.pick)
         : refocus.dock
           ? panel.querySelector<HTMLElement>('[data-helm-dock]')
-          : null;
+          : refocus.id
+            ? panel.querySelector<HTMLElement>(`#${refocus.id}`)
+            : null;
       target?.focus();
     }
-  };
+  });
 
   /** ⚓ The DOCKING COMPUTER screen: a plain button for one port, the ship
    *  atlas + a port list for several. */
@@ -2263,13 +2794,28 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     }
   };
 
+  /** Commander-driven flight advance while the helm is open (main.ts runs the
+   *  same watch at 1 Hz for a closed helm). in-flight → redocking once etaAt
+   *  passes, then completeArrival docks at the destination's berth. Benign
+   *  under contention: writeFlightRecord's transition gate makes a second
+   *  commander's write a no-op, and completeArrival returns null once docked. */
+  const autoAdvance = (): void => {
+    if (!panel || !helmIsCommander()) return;
+    const rec = readFlightRecord();
+    if (rec.status === 'in-flight' && flightArrived(rec, Date.now())) {
+      // Arrive where the ship flew, even if the directory no longer lists it.
+      writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, etaAt: rec.etaAt });
+    }
+    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
+  };
+
   return {
     mount(host: HTMLElement): void {
       panel = document.createElement('div');
       panel.id = 'device-helm-pane';
       panel.style.cssText = `
         position: absolute; top: 46%; left: 50%; transform: translate(-50%, -50%);
-        width: 380px; max-height: 88vh; overflow-y: auto;
+        width: 400px; max-height: 88vh; overflow-y: auto;
         background: rgba(4, 8, 22, 0.94); border: 1px solid rgba(212, 168, 75, 0.28);
         border-radius: 12px; box-shadow: 0 12px 64px rgba(0,0,0,0.9);
         padding: 18px; display: flex; flex-direction: column;
@@ -2281,21 +2827,34 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
         onClick(e);
       });
       host.appendChild(panel);
-      unsubscribe = subscribeFurnitureForHelm(() => render());
-      unsubscribeDocks = docking?.subscribe(() => render()) ?? null;
+      // Doc observers: furniture (fittings), ship (fuel + flight), doors
+      // (chains + transient berths), docks (port states). Each clears the
+      // refuel arm — a peer refuel is an obvious "cancel" for us.
+      unsubs.push(subscribeFurnitureForHelm(() => { refuelArmed = false; render(); }));
+      unsubs.push(subscribeShip(() => { refuelArmed = false; render(); }));
+      unsubs.push(subscribeDoors(() => render()));
+      if (docking) unsubs.push(docking.subscribe(() => render()));
+      unsubs.push(subscribeArrivalNote(() => render()));
+      // 🪐 Destinations and their orbits learned from peers.
+      unsubs.push(subscribePlanetSummary(() => render()));
+      // Countdown / arrival watch — re-render only while a number moves.
+      tickTimer = setInterval(() => {
+        autoAdvance();
+        if (readFlightRecord().status === 'in-flight') render();
+      }, HELM_TICK_MS);
       render();
     },
     unmount(): void {
-      unsubscribe?.();
-      unsubscribe = null;
-      unsubscribeDocks?.();
-      unsubscribeDocks = null;
+      for (const off of unsubs) off();
+      unsubs.length = 0;
+      if (tickTimer !== null) { clearInterval(tickTimer); tickTimer = null; }
       panel?.remove();
       panel = null;
       markers = [];
+      refuelArmed = false;
     },
 
-    update(): void { /* status is observer-driven; nothing per-frame */ },
+    update(): void { /* status is observer- and interval-driven */ },
   };
 }
 

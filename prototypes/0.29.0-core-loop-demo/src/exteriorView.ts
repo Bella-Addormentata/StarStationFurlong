@@ -32,6 +32,7 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
+import { planetForRoom } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 import {
   buildConnectorChain,
@@ -41,7 +42,7 @@ import {
 import type { VestibuleDoorId } from "./adapter";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
-import { roomHalfExtents } from "./floorPlanDoc";
+import { roomHalfExtents, roomCupola } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
  *  (the new cross-section) instead of the flat box. Now the DEFAULT — disable
@@ -172,7 +173,8 @@ function buildGroup(): THREE.Group {
     // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
     // exterior barrel (neighbour shells below stay windowless — other modules'
     // windows aren't loaded here, by design).
-    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings()).group);
+    // 🔭 …and an end wall made a cupola shows as its framed glass.
+    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings(), roomCupola()?.wall ?? null).group);
   } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
@@ -437,14 +439,16 @@ function buildGroup(): THREE.Group {
     }
   }
 
-  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.
+  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell — the
+  // planet the CURRENT station orbits (stations.ts; Sovereign when unknown).
+  const orbited = planetForRoom(currentRoomId);
   const planet = new THREE.Mesh(
     new THREE.SphereGeometry(42, 48, 32),
     new THREE.MeshStandardMaterial({
-      color: 0x2a5a8f,
+      color: orbited.color,
       roughness: 0.9,
       metalness: 0.05,
-      emissive: 0x0c2038,
+      emissive: orbited.emissive,
       emissiveIntensity: 0.5,
     }),
   );
@@ -453,7 +457,7 @@ function buildGroup(): THREE.Group {
   const atmo = new THREE.Mesh(
     new THREE.SphereGeometry(43.6, 48, 32),
     new THREE.MeshBasicMaterial({
-      color: 0x7fb8ff,
+      color: orbited.atmosphere,
       transparent: true,
       opacity: 0.1,
       side: THREE.BackSide,
