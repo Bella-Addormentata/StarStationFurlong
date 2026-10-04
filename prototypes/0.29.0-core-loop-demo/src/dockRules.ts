@@ -203,6 +203,14 @@ export function farWriteMayStand(far: FarDockResult): boolean {
   return far.ok ? far.detail === 'written' : far.reason === 'unreachable' && far.unconfirmed === true;
 }
 
+/** ⚓🚦 Did the far gate admit this DOCK? When the far room said so, and when
+ *  it wrote its half but the answer was lost (farWriteMayStand): it writes
+ *  only past its gate, and that half may stand, so this side matches it
+ *  rather than fall back on what this client's atlas holds of the gate. */
+export function farGateAdmitted(far: FarDockResult | null): boolean {
+  return far !== null && (far.ok || farWriteMayStand(far));
+}
+
 // ── The transit mirror ───────────────────────────────────────────────────────
 
 /**
@@ -350,7 +358,7 @@ export type FarDock =
   | { action: 'write'; record: DoorPairing }
   | {
       action: 'refuse';
-      reason: 'gone' | 'occupied' | 'closed' | 'superseded';
+      reason: 'gone' | 'occupied' | 'closed' | 'superseded' | 'not-allowed' | 'no-gate';
       /** With `superseded`: the stamp of the dock of this port the berth holds. */
       stamp?: number;
     };
@@ -361,7 +369,25 @@ export const FAR_DOCK_REFUSAL: Record<Extract<FarDock, { action: 'refuse' }>['re
   occupied: 'That berth is occupied by another module now.',
   closed: 'That berth was closed — its dock port was removed.',
   superseded: 'A newer DOCK of this port already holds that berth.',
+  'no-gate': 'That station has used every gate number — no new dock port can be fitted there.',
+  'not-allowed': 'That gate does not admit this ship — the station has closed it, reserved it for another ship, or opened it only to captains granted at its door.',
 };
+
+/** ⚓🚦 Who the far gate admits (doorPolicy gateAccessIn): absent = open. */
+export interface FarGateAccess {
+  access: 'open' | 'pass' | 'reserved' | 'closed';
+  reservedFor?: string;
+  /** The docking captain holds the owner's grant at that door. */
+  granted?: boolean;
+}
+
+/** Does the gate admit the ship whose room is `shipRoomId`? */
+export function gateAdmits(gate: FarGateAccess | undefined, shipRoomId: string, granted = gate?.granted === true): boolean {
+  if (!gate || gate.access === 'open') return true;
+  if (gate.access === 'closed') return false;
+  if (gate.access === 'reserved') return !!gate.reservedFor && gate.reservedFor === shipRoomId;
+  return granted;
+}
 
 /**
  * DOCK's far end: the berth must still exist and be free.
@@ -390,8 +416,13 @@ export function farDockPatch(
   near: NearEnd,
   dockedAt: number,
   replacesUndockedAt?: number,
+  gate?: FarGateAccess,
 ): FarDock {
   if (!far.exists) return { action: 'refuse', reason: 'gone' };
+  // ⚓🚦 The station decides who docks here. A dock this ship already holds
+  // stands (re-affirming it is not a new arrival).
+  const heldByUs = !!farRecord?.paired && roomIdFromSeed(farRecord.connectedRoomAddress) === near.roomId;
+  if (!heldByUs && !gateAdmits(gate, near.roomId)) return { action: 'refuse', reason: 'not-allowed' };
   if (farRecord?.paired) {
     if (
       roomIdFromSeed(farRecord.connectedRoomAddress) !== near.roomId ||

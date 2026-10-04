@@ -396,13 +396,15 @@ export function readPhysicalDoors(): Map<string, DoorRecord> {
 }
 
 /**
- * readAllDoors' snapshot plus every physical door's own record
- * (readPhysicalDoors): what DEPART casts off, so a flood never hides a real
- * door's dock from it, and a dock on a door the room lacks goes with the rest.
+ * Every physical door's own record (readPhysicalDoors), then the rest of
+ * readAllDoors' snapshot: what DEPART casts off, so a flood never hides a real
+ * door's dock from it, and a dock on a door the room lacks goes with the rest;
+ * and what the atlas harvest files, whose door bound (MAX_DOORS_PER_ENTRY)
+ * keeps the first records, so a flood never pushes a real door past it.
  */
 export function readAllDoorsWithPhysical(): Map<string, DoorRecord> {
-  const out = readAllDoors();
-  for (const [id, rec] of readPhysicalDoors()) out.set(id, rec);
+  const out = readPhysicalDoors();
+  for (const [id, rec] of readAllDoors()) if (!out.has(id)) out.set(id, rec);
   return out;
 }
 

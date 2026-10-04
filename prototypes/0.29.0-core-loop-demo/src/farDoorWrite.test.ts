@@ -103,6 +103,45 @@ describe('applyFarDockRequest — DOCK', () => {
     near,
   );
 
+  it('⚓🚦 fits a new far port with a gate, and refuses when every gate number is taken', () => {
+    const fresh = () => {
+      const doc = new Y.Doc();
+      doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+      return doc;
+    };
+    const open = fresh();
+    expect(dockAt(open).wrote).toBe(true);
+    expect(open.getMap('doorPolicy').toJSON()['d:bay']).toMatchObject({ adapter: true, gate: 1 });
+
+    const full = fresh();
+    for (let g = 1; g <= 99; g++) {
+      const id = `d:${String(g).padStart(8, '0')}`;
+      full.getMap('doorLayout').set(id, { id, wall: 'y+', lateral: 0, placed: true });
+      full.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner', adapter: true, gate: g });
+    }
+    const before = Y.encodeStateVector(full);
+    expect(dockAt(full)).toEqual({ result: { ok: false, reason: 'no-gate' }, wrote: false });
+    expect(Y.encodeStateVector(full)).toEqual(before);
+  });
+
+  it("⚓🚦 numbers a new far port past gates the far doc's shared atlas knows, even unvisited rooms", () => {
+    const doc = new Y.Doc();
+    doc.getMap('doorLayout').set('d:bay', { id: 'd:bay', wall: 'y+', lateral: 0, placed: true });
+    // The far room's own entry pairs it with a hub this client never visited,
+    // whose published gates already use 1 and 2.
+    doc.getMap('atlas').set(STATION, {
+      roomId: STATION, name: 'Dock', updatedAt: 5,
+      doors: { 'd:hall': { targetRoomId: 'hub-room', farDoor: 'd:in', transient: false } },
+    });
+    doc.getMap('atlas').set('hub-room', {
+      roomId: 'hub-room', name: 'Hub', updatedAt: 5,
+      doors: { 'd:in': { targetRoomId: STATION, farDoor: 'd:hall', transient: false } },
+      gates: { 'd:p1': 1, 'd:p2': 2 },
+    });
+    expect(dockAt(doc).wrote).toBe(true);
+    expect(doc.getMap('doorPolicy').toJSON()['d:bay']).toMatchObject({ adapter: true, gate: 3 });
+  });
+
   it('a berth already docked to this port by a newer DOCK is not overwritten — its stamp comes back', () => {
     const doc = stationDoc(); // d:bay docked to this very port, stamped 100
     const before = Y.encodeStateVector(doc);

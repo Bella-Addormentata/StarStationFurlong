@@ -2166,7 +2166,7 @@ export interface HelmDockingDeps {
   subscribe: (cb: () => void) => () => void;
   /** The shipped UNDOCK; its answer (false: the dock holds) settles DEPART. */
   undock: (doorId: string) => void | boolean | Promise<boolean | void>;
-  /** The shipped DOCK; its answer (false: refused) settles the arrival note. */
+  /** The shipped DOCK; its answer (false: refused) lets an arrival try the next berth. */
   dock: (doorId: string) => void | boolean | Promise<boolean | void>;
   /** 🚚 May the legacy berth on this door (a transient pairing on a door
    *  that is no dock port) let go in a release made at `now`, by the moves
@@ -2264,18 +2264,24 @@ export function arrivalNoteHere(): (outcome: ArrivalOutcome | null) => void {
 /** Record an arrival outcome for the helm (shipArrival.completeArrival). */
 export function noteShipArrival(outcome: ArrivalOutcome | null): void {
   if (!outcome) return;
+  const gate = (g: number | undefined) => (g !== undefined ? `gate ${g}` : 'the berth');
   if (outcome.kind === 'docking') {
-    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at the berth…`, tone: 'ok' });
+    setArrivalNote({ text: `Arrived at ${outcome.stationName} — docking at ${gate(outcome.gate)}…`, tone: 'ok' });
     return;
   }
   if (outcome.kind === 'docked') {
-    setArrivalNote({ text: `Docked at ${outcome.stationName}.`, tone: 'ok' });
+    setArrivalNote({
+      text: outcome.gate !== undefined
+        ? `Docked at ${outcome.stationName}, gate ${outcome.gate}.`
+        : `Docked at ${outcome.stationName}.`,
+      tone: 'ok',
+    });
     return;
   }
   setArrivalNote({
     tone: 'warn',
     text: outcome.reason === 'berths-taken'
-      ? `Arrived at ${outcome.stationName} — the DOCK did not go through (the berth taken or closed, no rights, no room to fit). Check the dock port's panel, and dock from it when that clears.`
+      ? `Arrived at ${outcome.stationName} — every berth the ship tried refused it (taken, closed, out of reach, not open to this ship, or no rights or room at the port). Check the dock port's panel, dock from it when that clears, or ask the station's owner for a grant at a gate that admits only granted captains.`
       : outcome.reason === 'already-docked'
       ? `Arrived at ${outcome.stationName} — already docked there.`
       : outcome.reason === 'in-transit'
@@ -2284,6 +2290,8 @@ export function noteShipArrival(outcome: ArrivalOutcome | null): void {
         ? `Arrived — but that station is no longer on the station list, so there is no berth to dock at. Dock from a door panel, or pick another destination.`
         : outcome.reason === 'no-port'
         ? `Arrived at ${outcome.stationName} — no dock port could dock (none fitted, or each one docked, busy, or not yours to dock). Fit one at a door (door panel › +DOCK), or check the dock ports' panels, and dock from one when that clears.`
+        : outcome.barred
+        ? `Arrived at ${outcome.stationName} — none of its gates is open to this ship from here (closed to it, reserved for another ship, or in a module this game holds no pass for). Ask the station's owner, or dock from a door panel.`
         : `Arrived at ${outcome.stationName} — no berth on record there. Dock from a door panel (pick a module, INITIATE); the ship remembers it for next time.`,
   });
 }
@@ -2824,7 +2832,8 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     panel.querySelector<HTMLButtonElement>('#helm-redock-btn')?.addEventListener('click', () => {
       if (!helmIsCommander()) return;
       // DOCK NOW is the commander's call: settle the arrival here and now.
-      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: arrivalNoteHere() }));
+      const note = arrivalNoteHere();
+      noteShipArrival(completeArrival(shipDocking, { force: true, onSettled: note, onProgress: note }));
     });
 
     if (refocus) {
@@ -3146,7 +3155,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
       // Arrive where the ship flew, even if the directory no longer lists it.
       writeFlightRecord({ status: 'redocking', locationId: rec.destinationId ?? rec.locationId, departedAt: rec.departedAt, etaAt: rec.etaAt, castOffAt: rec.castOffAt, destinationAt: rec.destinationAt });
     }
-    if (readFlightRecord().status === 'redocking') noteShipArrival(completeArrival(shipDocking, { onSettled: arrivalNoteHere() }));
+    if (readFlightRecord().status === 'redocking') {
+      const note = arrivalNoteHere();
+      noteShipArrival(completeArrival(shipDocking, { onSettled: note, onProgress: note }));
+    }
   };
 
   return {

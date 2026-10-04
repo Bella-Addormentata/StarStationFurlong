@@ -32,13 +32,13 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
-import { dockPortFlagIn, fitDockPortIn } from './doorPolicy';
+import { dockGatesIn, dockPortFlagIn, fitDockPortIn, gateAccessIn } from './doorPolicy';
+import { freeGateNumber, readAtlas, roomIdFromSeed, withSharedAtlasOf } from './stationAtlas';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
   farDockPatch, farUndockPatch, findFarDoor, holdsDockTo, type NearEnd,
 } from './dockRules';
 import type { FarDockRequest, FarDockResult } from './docking';
-import { roomIdFromSeed } from './stationAtlas';
 import { rememberMovesIn, roomDocLockedByMove } from './stationMove';
 
 // ── The decision (pure over a doc) ───────────────────────────────────────────
@@ -100,6 +100,9 @@ export function applyFarDockRequest(
     near,
     req.dockedAt,
     req.replacesUndockedAt,
+    // The requester's key is its own claim, as every door write is in the
+    // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
+    gateAccessIn(doc, req.farDoor, req.requesterPub),
   );
   if (patch.action === 'refuse') {
     return {
@@ -111,13 +114,31 @@ export function applyFarDockRequest(
       wrote: false,
     };
   }
+  // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate; with
+  // every number taken, neither record is written. The far doc's shared atlas
+  // is read too: on a first visit this client's own atlas may not know the far
+  // station's other rooms or the gates they already use.
+  const newPort = !dockPortFlagIn(doc, req.farDoor);
+  const gate = newPort
+    ? freeGateNumber(
+      withSharedAtlasOf(doc, readAtlas(), farRoomOf(req.farAddress)), farRoomOf(req.farAddress), dockGatesIn(doc),
+    )
+    : null;
+  if (newPort && gate === null) {
+    return { result: { ok: false, reason: 'no-gate' }, wrote: false };
+  }
   // One transaction: the berth's record and its port land together, so no
   // peer ever sees a dock on a door without its half.
   doc.transact(() => {
     writeDoorRecordTo(doc, req.farDoor, patch.record);
-    fitDockPortIn(doc, req.farDoor);
+    if (newPort) fitDockPortIn(doc, req.farDoor, gate);
   });
   return { result: { ok: true, detail: 'written' }, wrote: true };
+}
+
+/** The far room's id from its address ('' when it names none). */
+function farRoomOf(address: string): string {
+  try { return roomIdFromSeed(address); } catch { return ''; }
 }
 
 /** 🚚 The moment a release (an UNDOCK, or a legacy berth's) is judged at:

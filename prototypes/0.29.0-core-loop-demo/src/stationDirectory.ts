@@ -31,6 +31,28 @@ export interface StationBerth {
   farDoor?: string;
   farWall?: DoorWall;
   farLateral?: number;
+  /** ⚓🚦 The berth's gate number, when its port has one. */
+  gate?: number;
+  /** The station's atlas shows a ship docked there already. */
+  occupied?: boolean;
+  /** ⚓🚦 Who the station lets dock there, when not every ship. */
+  access?: 'pass' | 'reserved' | 'closed';
+  /** With 'reserved': the one ship's room id. */
+  reservedFor?: string;
+}
+
+/** ⚓🚦 A gate this client cannot address: its room, door and policy. */
+export interface UnaddressedGate {
+  roomId: string;
+  farDoor: string;
+  /** Its door's pose, where known (setBerthPoseLookup). */
+  farWall?: DoorWall;
+  farLateral?: number;
+  gate?: number;
+  access?: StationBerth['access'];
+  reservedFor?: string;
+  /** A ship is docked there (the atlas shows a pairing). */
+  occupied?: true;
 }
 
 /** One station a ship can fly to. */
@@ -44,6 +66,16 @@ export interface StationDestination {
   /** Writer-clock travel time of a hop to this station, ms. */
   travelMs: number;
   berth?: StationBerth;
+  /** ⚓🚦 Every gate an arriving ship may try, in gate order. */
+  berths?: StationBerth[];
+  /** ⚓🚦 The rooms of all the station's berths (and its welcome room),
+   *  whether or not this client can dock there: a dock another commander
+   *  made at a gate this client holds no pass for is still at this station. */
+  berthRooms?: string[];
+  /** ⚓🚦 The station's gates this client holds no pass for (room ids, no
+   *  address): not askable as they are, but a ship's own memory of one of
+   *  them can supply the address (shipArrival.arrivalBerths). */
+  unaddressed?: UnaddressedGate[];
   /** A move to another planet, scheduled or under way (stations.ts): while
    *  it is in transit the station is no ship's destination. */
   move?: StationMove;
@@ -297,6 +329,11 @@ export interface StationRecordLike {
   orbitSlot: number;
   welcomeRoomId: string;
   berthDoor?: string;
+  /** ⚓🚦 Every gate of the station, in gate order (stations.ts). */
+  berths?: ReadonlyArray<{
+    roomId: string; doorId: string; gate?: number; occupied?: boolean;
+    access?: 'pass' | 'reserved' | 'closed'; reservedFor?: string;
+  }>;
   /** A move to another planet, scheduled or under way (stations.ts). */
   move?: StationMove;
 }
@@ -399,6 +436,47 @@ export function destinationsFromRecords(
     const address = r.welcomeRoomId && door ? seedFor(r.welcomeRoomId) : undefined;
     // With its door's pose where known (setBerthPoseLookup).
     if (address && door) out.berth = { address, farDoor: door, ...berthPose(r.welcomeRoomId, door) };
+    // ⚓🚦 Every gate this client can dock at: a port whose room it holds a
+    // pass for, posed as the public berth is. Gate order, as the station
+    // lists them.
+    const gates: StationBerth[] = [];
+    const unaddressed: UnaddressedGate[] = [];
+    for (const b of r.berths ?? []) {
+      if (!b.roomId || !isAcceptableDoorKey(b.doorId)) continue;
+      const seed = seedFor(b.roomId);
+      if (!seed) {
+        unaddressed.push({
+          roomId: b.roomId,
+          farDoor: b.doorId,
+          ...berthPose(b.roomId, b.doorId),
+          ...(b.gate !== undefined ? { gate: b.gate } : {}),
+          ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
+          ...(b.occupied ? { occupied: true as const } : {}),
+        });
+        continue;
+      }
+      gates.push({
+        address: seed,
+        farDoor: b.doorId,
+        ...berthPose(b.roomId, b.doorId),
+        ...(b.gate !== undefined ? { gate: b.gate } : {}),
+        ...(b.occupied ? { occupied: true } : {}),
+        ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
+      });
+    }
+    const rooms = new Set<string>();
+    if (r.welcomeRoomId) rooms.add(r.welcomeRoomId);
+    for (const b of r.berths ?? []) if (b.roomId) rooms.add(b.roomId);
+    if (rooms.size > 0) out.berthRooms = [...rooms];
+    if (unaddressed.length > 0) out.unaddressed = unaddressed;
+    if (Array.isArray(r.berths)) {
+      // ⚓🚦 The record knows its gates: these are the berths (none, when its
+      // last port was removed or this client holds no pass for any), and the
+      // old public berth stands only as one of them, naming its gate.
+      out.berths = gates;
+      const same = out.berth && gates.find((g) => g.farDoor === out.berth!.farDoor && g.address === out.berth!.address);
+      if (same) out.berth = same; else delete out.berth;
+    }
     return out;
   });
 }

@@ -176,6 +176,7 @@ import {
   bindDoorsDoc,
   writeDoorPairing,
   readAllDoors,
+  readAllDoorsWithPhysical,
   readDoor,
   readPhysicalDoors,
   subscribeDoors,
@@ -184,7 +185,7 @@ import {
 // ⚓ #163: the two-part docking adapter — dock facts for the transit mirror,
 // and the far room's end of every DOCK / UNDOCK.
 import { isDockChain } from "./adapter";
-import { mirrorMayWrite } from "./dockRules";
+import { gateAdmits, mirrorMayWrite } from "./dockRules";
 import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
@@ -219,6 +220,11 @@ import {
 import {
   bindDoorPolicy,
   subscribeDoorPolicy,
+  subscribeDoorPolicyRecords,
+  gateAccessIn,
+  readDockGates,
+  readDockGatesIfComplete,
+  readUnnumberedPorts,
   readDoorPolicy,
   writeDoorPolicy,
 } from "./doorPolicy";
@@ -287,6 +293,7 @@ import {
 } from "./exteriorView";
 import {
   harvestIntoAtlas,
+  freeGateNumberHere,
   readAtlas,
   atlasComponent,
   bindStationAtlasDoc,
@@ -1649,6 +1656,8 @@ async function joinRoomAtEpoch(
     // planet is not placed yet also reads null from planetShipStatus.
     // Its trim (localTrim) is read here, so a trim this room takes back spreads.
     currentRoom: () => activeBootstrap?.roomId || null,
+    // ⚓🚦 Its gates are news only once this visit's harvest has read them.
+    gatesReadHere: () => gatesReadIn !== null && gatesReadIn === activeBootstrap?.roomId,
     notShipRoom: () => {
       const roomId = activeBootstrap?.roomId ?? "";
       if (!roomId) return null;
@@ -1798,6 +1807,9 @@ async function joinRoomAtEpoch(
       world?.dockingSystem?.refreshPolicyUI();
       refreshExteriorView();
     });
+    // ⚓🚦 A port fitted, removed or renumbered changes the station's gates; a
+    // rights request or grant changes none, so it harvests nothing.
+    subscribeDoorPolicyRecords(() => harvestStationAtlas());
     // 🤝 C1: co-host changes repaint the ACCESS section live (a volunteer
     // appearing while the owner has the app open, an accept while the
     // volunteer watches).
@@ -2036,6 +2048,8 @@ async function joinRoomAtEpoch(
     // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
     if (readFlightRecord().status !== "redocking") return;
     const ds = world?.dockingSystem ?? null;
+    // ⚓🚦 One note for this room: each gate a retry moves on to, then the end.
+    const note = arrivalNoteHere();
     noteShipArrival(
       completeArrival(
         ds
@@ -2045,7 +2059,7 @@ async function joinRoomAtEpoch(
               dock: (doorId) => ds.redockPort(doorId),
             }
           : null,
-        { onSettled: arrivalNoteHere() },
+        { onSettled: note, onProgress: note },
       ),
     );
   }, 1_000);
@@ -2106,7 +2120,10 @@ async function joinRoomAtEpoch(
       // defaults to the wall label exactly as seedDoorLayoutSingle's does.)
       if (mintedHere.birthPort) {
         const birthId = mintedHere.birthDoorId ?? mintedHere.birthWall;
-        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true });
+        // ⚓🚦 …numbered like every port (the new room's own gate list; the
+        // atlas groups it with its station once harvested).
+        const gate = freeGateNumberHere(boot.roomId, readDockGates());
+        writeDoorPolicy(birthId, { ...readDoorPolicy(birthId), adapter: true, ...(gate !== null ? { gate } : {}) });
       }
       // 🚪 The record seedDoorLayoutSingle writes is AUTHORITATIVE (`placed`),
       // so the door sits centred on `birthWall` whatever the room is called.
@@ -3249,11 +3266,22 @@ async function transitTo(
     // re-dock the mirror completes, while an older one is a stale berth. A
     // DOCK never lands on a tombstoned door whose port was removed: it would
     // re-fit the port below.
+    // ⚓🚦 A dock that fits a new port here needs a free gate number; with
+    // every number taken, the dock is not completed (as the far DOCK refuses).
+    const needsPort = depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter;
+    const newGate = needsPort ? freeGateNumberHere(activeBootstrap?.roomId ?? "", readDockGates()) : null;
     if (
       depRoomId &&
+      !(needsPort && newGate === null) &&
       mirrorMayWrite(existing, depRoomId, depDock, {
         portFlag: readDoorPolicy(arrivalDoorId).adapter === true,
-      })
+      }) &&
+      // ⚓🚦 A dock this gate does not admit is not completed here either
+      // (one the door already holds for that ship stands).
+      (!depDock.isDock ||
+        (existing?.paired === true && roomIdFromSeed(existing.connectedRoomAddress) === depRoomId) ||
+        !yjsSync ||
+        gateAdmits(gateAccessIn(yjsSync.doc, arrivalDoorId, getIdentityPub() ?? undefined), depRoomId))
     ) {
       // ⚓ ONE transaction for the pairing and, for a dock, its port: were the
       // pairing to land alone (a session cut between two updates), the port
@@ -3282,10 +3310,12 @@ async function transitTo(
         // ⚓ A dock has a half on BOTH doors: the arrival door wears the
         // mating half the connection brought (staged on the far side, or the
         // visiting ship's own), so it can UNDOCK and DOCK from this side too.
-        if (depDock.isDock && !readDoorPolicy(arrivalDoorId).adapter) {
+        if (needsPort && newGate !== null) {
+          // ⚓🚦 …numbered, like every new port of the station.
           writeDoorPolicy(arrivalDoorId, {
             ...readDoorPolicy(arrivalDoorId),
             adapter: true,
+            gate: newGate,
           });
         }
       });
@@ -3707,7 +3737,12 @@ function renderPhonePlayersList(): void {
 let atlasHarvestArmed = false;
 export function setAtlasHarvestArmed(on: boolean): void {
   atlasHarvestArmed = on;
+  if (!on) gatesReadIn = null;
 }
+/** ⚓🚦 The room whose gates this visit has read (its harvest, once the
+ *  room's state landed): until then the planet summary does not take the
+ *  atlas's copy of them, which may be an earlier visit's, as news. */
+let gatesReadIn: string | null = null;
 
 function harvestStationAtlas(): void {
   if (!atlasHarvestArmed) return;
@@ -3728,7 +3763,10 @@ function harvestStationAtlas(): void {
     "Module";
   const seed =
     passSeed(roomId) ?? moduleLedger().find((e) => e.roomId === roomId)?.seed;
-  const doors = [...readAllDoors().entries()]
+  // The room's own doors first (each read past the snapshot's cap), then
+  // the rest: a flood written ahead of a gangway never pushes it past the
+  // atlas's door bound, which would leave the module a station of its own.
+  const doors = [...readAllDoorsWithPhysical().entries()]
     .flatMap(([doorId, r]) => {
       if (!r.paired || !r.connectedRoomAddress) return [];
       // 🧭 The door's LIVE physical pose rides into the atlas — its wall and
@@ -3762,7 +3800,33 @@ function harvestStationAtlas(): void {
           : {}),
       }];
     });
-  harvestIntoAtlas({ roomId, name, seed, dims: readRoomDims(), doors });
+  // ⚓🚦 A port fitted before gates existed has no number: the owner numbers
+  // it here, once. Until then (anyone else here) the room's gates are not
+  // known, and the harvest says so (null): an older list, even one of none,
+  // would hide that port as a legacy berth.
+  const unnumbered = readUnnumberedPorts();
+  if (unnumbered.length > 0 && isLocalHelmCommander() && yjsSync) {
+    // One transaction: the policy observer (which harvests again) runs only
+    // once every port has its number, so none is numbered twice.
+    yjsSync.doc.transact(() => {
+      for (const doorId of unnumbered) {
+        if (readDoorPolicy(doorId).gate !== undefined) continue;
+        const gate = freeGateNumberHere(roomId, readDockGates());
+        if (gate === null) break;
+        writeDoorPolicy(doorId, { ...readDoorPolicy(doorId), gate });
+      }
+    });
+  }
+  // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals;
+  // not known (null) while a port is unnumbered, or when a flood cut the
+  // port scan short: a list missing a port would drop its gate.
+  const gates = readDockGatesIfComplete();
+  harvestIntoAtlas({
+    roomId, name, seed, dims: readRoomDims(), doors,
+    ...(gates ?? { gates: null }),
+  });
+  // Before the push below, whose write publishes the planet summary again.
+  gatesReadIn = roomId;
   // 🛰️ Every harvest also publishes what we now know into the room doc's
   // shared atlas (geometry + names; seed rules live in stationAtlas.ts).
   pushAtlasToDoc();
