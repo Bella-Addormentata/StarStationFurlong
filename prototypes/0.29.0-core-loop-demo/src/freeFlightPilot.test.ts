@@ -26,7 +26,7 @@ import {
   writeFreePose,
 } from './freeFlightPilot';
 import { bindShipDoc, readFlightRecord, readFuelLevel, writeFlightRecord, writeFuelLevel } from './shipDoc';
-import { DEFAULT_STATIONS } from './stationDirectory';
+import { DEFAULT_STATIONS, adriftAt } from './stationDirectory';
 import { DEFAULT_PLANET_ID, DEFAULT_STATION_RECORD, listStations, planetById, setAltitudeHistory, setStationMoveResolver, setStationRoomSource } from './stations';
 import { planStationPark } from './freeStation';
 import { freeStationsAround, ownStationOf, stationFlyingFree, stationUndockPose } from './freeFlightPilot';
@@ -393,6 +393,21 @@ describe("🕹️ AUTO-DOCK's way back", () => {
     // The watch leaves it alone while this game awaits the answer.
     expect(recoverFreeDock(NONE, t + 60_000)).toBe(false);
     expect(readFlightRecord().status).toBe('docked');
+    expect(recoverFreeDock(NONE, t + 1000, true)).toBe(true);
+    expect(readFlightRecord().status).toBe('free-flight');
+    expect(readFreePose()).toEqual(pose);
+    expect(doc.getMap('ship').get('freeDock')).toBeUndefined();
+  });
+
+  it('flies on when the station moved off mid-arrival and the ship settled in open orbit', () => {
+    const t = Date.now();
+    const pose = farPose(t);
+    fly(pose);
+    expect(markFreeDock(HOME.id, HOME.id, pose, t)).toBe(true);
+    expect(writeFlightRecord({ status: 'redocking', locationId: HOME.id })).toBe(true);
+    // completeArrival's fallback: the station was gone, the ship waits where it was.
+    const adrift = adriftAt(DEFAULT_PLANET_ID, 0);
+    expect(writeFlightRecord({ status: 'docked', locationId: adrift })).toBe(true);
     expect(recoverFreeDock(NONE, t + 1000, true)).toBe(true);
     expect(readFlightRecord().status).toBe('free-flight');
     expect(readFreePose()).toEqual(pose);
