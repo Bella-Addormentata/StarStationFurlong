@@ -1499,7 +1499,12 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   earlier head; a head stays a few hundred
   bytes however many holders and co-hosts the deed has had — its root, the
   one (writer, tip) pair it commits and that pair's proof against the root
-  before it, never the map — a tip is
+  before it, never the map — because a head changes exactly ONE leaf: an
+  authority with several writers' tips to commit (a transfer that closes
+  the old owner's chain and opens the new one's, two co-hosts caught up at
+  once) signs one head per writer, each against the root the head before
+  it left, in one chain — a single pair and proof could never let a node
+  derive the other leaves a root had moved; a tip is
   looked up by one proof, and replaying the chain costs a logarithm per op
   and never the square of the writers; the pairs themselves are state
   every node holds, rebuilt by replaying the chain from its first head
@@ -1756,7 +1761,15 @@ frame's path, exactly>` (`arcadeEmulator.ts`, `emulatorWallPolicy`;
 nothing else loads in the wall, and the frame, an opaque origin, is
 nobody to it) — one immutable path with nothing in a query, since
 `frame-src` ignores a query and a mode chosen by one would be a mode the
-frame's code could choose — and a frame that tries to leave sends
+frame's code could choose, and a path that never REDIRECTS, for any
+query or path variant, on every deployment: a content-security policy
+drops a source expression's path once a request has redirected, so an
+allowed navigation to the frame's path that a server answered with a
+redirect would land anywhere on the origin — the station serves the path
+as a static file that answers 200 or 404 and never a 3xx, the cabinet's
+smoke fetches a query variant and checks that nothing redirected, and a
+deployment that cannot promise it puts the frame on an origin of its own,
+where an origin-wide allowance is then safe — and a frame that tries to leave sends
 nothing: the wall hears the violation (`securitypolicyviolation`,
 `frame-src`) and the page tears the frame down with the reason. The one
 navigation the policy allows, to the frame's own path, is the frame
