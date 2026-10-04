@@ -809,9 +809,12 @@ export interface BurnRun {
  *  against (TrimBurn.cap; Infinity for one that carries none). */
 export type BurnCeiling = (capacity: number) => number;
 
-/** The orbit a trim or a burn names, as a key: its planet and slot. */
-function orbitKey(b: Pick<OrbitTrim, 'planetId' | 'slot'>): string {
-  return `${b.planetId}:${b.slot}`;
+/** The orbit a trim or a burn names, as a key: its planet and slot, and
+ *  🎚️ the altitude base it trims (OrbitTrim.base), as lastFiredPerOrbit keys
+ *  them: a late burn from the orbit a station left never replaces, or starts
+ *  a line over, the trim of the one it flies now. */
+function orbitKey(b: Pick<OrbitTrim, 'planetId' | 'slot' | 'base'>): string {
+  return `${b.planetId}:${b.slot}${b.base ? `:${b.base.radiusKm}:${b.base.phase0}` : ''}`;
 }
 
 /** The trims a settlement keeps: one per orbit a station can take here, the

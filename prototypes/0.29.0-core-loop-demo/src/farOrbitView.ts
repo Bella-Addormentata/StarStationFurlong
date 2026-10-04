@@ -156,7 +156,7 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
     return station;
   }
   const adrift = adriftPlace(id);
-  return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot } : undefined;
+  return adrift ? { id, planetId: planetById(adrift.planetId).id, orbitSlot: adrift.orbitSlot, ...(adrift.orbit ? { orbit: adrift.orbit } : {}) } : undefined;
 }
 
 /** A flight's end where it orbited at cast-off (the record's originAt or
@@ -171,8 +171,10 @@ function castOffPlace(
   const at = keptAt ? adriftPlace(keptAt) : null;
   if (!at) return undefined;
   const place: Place = { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot };
-  // 🎚️ The record keeps only the slot: the altitude the station flew there
+  // 🎚️ At the altitude the record kept with it. A record from before
+  // places kept one keeps only the slot: the altitude the station flew there
   // at cast-off is the one placeOf finds (its orbit then, climbs since undone).
+  if (at.orbit) return { ...place, orbit: at.orbit };
   const then = placeOf(id, all, leftAt, now);
   return then?.orbit && planetById(then.planetId).id === place.planetId && then.orbitSlot === place.orbitSlot
     ? { ...place, orbit: then.orbit } : place;
@@ -348,7 +350,7 @@ function readSource(now: number): Source {
   // its dock, say. Its own one-room stand-in is no place to see it from.
   if (!aboard && !adrift && !free) {
     const open = roomAdriftPlace(roomId);
-    if (open) adrift = { id: adriftAt(open.planetId, open.orbitSlot), ...open };
+    if (open) adrift = { id: adriftAt(open.planetId, open.orbitSlot, open.orbit), ...open };
   }
 
   // Not in a known station (offline, or before the first join): stand in

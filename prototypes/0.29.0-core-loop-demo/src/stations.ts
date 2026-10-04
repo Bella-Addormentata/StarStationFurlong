@@ -29,7 +29,7 @@
 import { atlasComponent, atlasComponents, isBerthDoor, readAtlas, roomIdFromSeed, stationGates } from './stationAtlas';
 import type { AtlasEntry } from './stationAtlas';
 import { DEFAULT_STATION } from './defaultStation';
-import { MIN_ALTITUDE_KM, maxAltitudeKm } from './orbits';
+import { MIN_ALTITUDE_KM, isUsableOrbit, maxAltitudeKm } from './orbits';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { DoorRecord } from './doorsDoc';
 
@@ -1404,31 +1404,67 @@ export function isStationRoom(
 
 /** The planet a room's station orbits — the default planet when unknown. */
 /** Where a ship that missed a departed station waits: open orbit at the
- *  planet and slot that station left (`adrift:<planetId>:<slot>`). A place,
- *  never a station, so it follows no station anywhere; hops leave from it to
- *  the stations around that planet like from any orbit. */
+ *  planet and slot that station left (`adrift:<planetId>:<slot>`), and 🎚️ at
+ *  the altitude it flew there when that was its own, not the slot's
+ *  (`adrift:<planetId>:<slot>@<radiusKm>,<phase0>`, the station's base
+ *  orbit, untrimmed). A place, never a station, so it follows no station
+ *  anywhere; hops leave from it to the stations around that planet like
+ *  from any orbit. */
 export const ADRIFT_PREFIX = 'adrift:';
 
-export function adriftAt(planetId: string, orbitSlot: number): string {
-  return `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
+/** An open-orbit place: a planet's slot, on the station's own orbit there
+ *  when it flew one. */
+export interface AdriftPlace {
+  planetId: string;
+  orbitSlot: number;
+  orbit?: StationOrbit;
 }
 
-/** The planet and slot an adrift location names, or null for anything else. */
-export function adriftPlace(id: string): { planetId: string; orbitSlot: number } | null {
+export function adriftAt(planetId: string, orbitSlot: number, orbit?: StationOrbit | null): string {
+  const slotPart = `${ADRIFT_PREFIX}${planetId}:${orbitSlot}`;
+  if (!orbit || !isUsableOrbit(planetById(planetId), orbit)) return slotPart;
+  const id = `${slotPart}@${orbit.radiusKm},${orbit.phase0}`;
+  // An id longer than a flight record holds keeps the slot alone.
+  return id.length <= MAX_ADRIFT_ID_LEN ? id : slotPart;
+}
+
+/** = shipDoc's location-id bound. */
+const MAX_ADRIFT_ID_LEN = 128;
+
+/** The planet, slot and own orbit an adrift location names, or null for
+ *  anything else (an orbit its planet's stations can't fly too). */
+export function adriftPlace(id: string): AdriftPlace | null {
   if (typeof id !== 'string' || !id.startsWith(ADRIFT_PREFIX)) return null;
-  const rest = id.slice(ADRIFT_PREFIX.length);
+  const body = id.slice(ADRIFT_PREFIX.length);
+  const at = body.indexOf('@');
+  const rest = at < 0 ? body : body.slice(0, at);
   const cut = rest.lastIndexOf(':');
   const planetId = rest.slice(0, cut);
   const orbitSlot = Number(rest.slice(cut + 1));
   if (cut <= 0 || !Number.isInteger(orbitSlot) || orbitSlot < 0 || orbitSlot >= MAX_ORBIT_SLOTS) return null;
   // The planet as every other reader names it (an unknown one reads as the
   // default planet, as in listStations), so destinations around it match.
-  return { planetId: planetById(planetId).id, orbitSlot };
+  const planet = planetById(planetId);
+  if (at < 0) return { planetId: planet.id, orbitSlot };
+  const parts = body.slice(at + 1).split(',');
+  if (parts.length !== 2 || parts.some((p) => p.trim() === '')) return null;
+  const orbit = { radiusKm: Number(parts[0]), phase0: Number(parts[1]) };
+  if (!isUsableOrbit(planet, orbit)) return null;
+  return { planetId: planet.id, orbitSlot, orbit };
+}
+
+/** 🎚️ Does a station flying `flies` (its base orbit, StationRecord.orbit)
+ *  fly the open-orbit place's own orbit `at`: both its slot's, or the same
+ *  circle? */
+export function onPlaceOrbit(flies: StationOrbit | undefined, at: StationOrbit | undefined): boolean {
+  if (!flies || !at) return !flies && !at;
+  return Math.abs(flies.radiusKm - at.radiusKm) < 1e-6
+    && Math.abs(Math.atan2(Math.sin(flies.phase0 - at.phase0), Math.cos(flies.phase0 - at.phase0))) < 1e-9;
 }
 
 /** Where the room resolver puts a room when that is open orbit (a ship
  *  adrift: its flight record's location), or null — a station, or unknown. */
-export function roomAdriftPlace(roomId: string): { planetId: string; orbitSlot: number } | null {
+export function roomAdriftPlace(roomId: string): AdriftPlace | null {
   if (!roomId || !roomStationResolver || resolvingRoom) return null;
   resolvingRoom = true;
   try {

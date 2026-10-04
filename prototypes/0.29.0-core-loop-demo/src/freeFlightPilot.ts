@@ -22,7 +22,7 @@ import {
   undockPose,
 } from './freeFlight';
 import type { FreePose, FreeStation, StickInput } from './freeFlight';
-import { orbitForSlot, angleAt, stationPointAt } from './orbits';
+import { angleAt, baseOrbit, stationPointAt } from './orbits';
 import { readStore } from './planetSummary';
 import { readFlightRecord, readFuelLevel, readStoredFuelLevel, shipDocHandle, writeFlightRecord, writeFuelLevel } from './shipDoc';
 import { localStationId, portableStationId } from './stationDirectory';
@@ -344,7 +344,8 @@ export function undockPoseFrom(locationId: string, now = Date.now()): FreePose |
   const adrift = adriftPlace(locationId);
   if (!adrift) return null;
   const planetId = planetById(adrift.planetId).id;
-  const orbit = orbitForSlot(planetId, adrift.orbitSlot);
+  // 🎚️ On the place's own orbit, when it names one.
+  const orbit = baseOrbit({ planetId, orbitSlot: adrift.orbitSlot, ...(adrift.orbit ? { orbit: adrift.orbit } : {}) });
   return undockPose(planetId, now, { radiusKm: orbit.radiusKm, angle: angleAt(orbit, now) });
 }
 

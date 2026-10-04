@@ -26,11 +26,12 @@ import {
 import {
   readAllDoorsIfComplete, readDoor, readPhysicalDoors, writeDoorTombstone, type DockBerthMemory, type DoorRecord,
 } from './doorsDoc';
-import { orbitForSlot, stationOrbit } from './orbits';
+import { baseOrbit, stationOrbit } from './orbits';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
-  altitudeChangedSince, currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
+  altitudeChangedSince, currentRoomId, dockedStationFor, listStations, onPlaceOrbit, orbitChangeBase, planetById, stationForRoom, stationInTransit,
+  type StationOrbit, type StationRecord,
 } from './stations';
 import { stationFlyingFree } from './freeFlightPilot';
 import {
@@ -384,7 +385,7 @@ export function shipPlaceId(
     // place's own orbit: beside a station there only while no trim moves it
     // off that orbit, or the far view would draw the ship on the trimmed one.
     const beside = [listed, resting.from]
-      .find((st) => isAt(st, resting.at, now) && (rest.open !== true || onSlotOrbit(st)));
+      .find((st) => isAt(st, resting.at, now) && (rest.open !== true || onUntrimmedOrbit(st)));
     return beside ? beside.id : resting.at;
   }
   const keptAt = rec.status === 'redocking' ? rec.destinationAt
@@ -407,20 +408,21 @@ export function shipPlaceId(
 function isAt(station: StationRecord | null | undefined, placeId: string, now: number): station is StationRecord {
   const place = adriftPlace(placeId);
   return !!station && !!place && !stationInTransit(station, now)
-    && planetById(station.planetId).id === place.planetId && station.orbitSlot === place.orbitSlot;
+    && planetById(station.planetId).id === place.planetId && station.orbitSlot === place.orbitSlot
+    && onPlaceOrbit(station.orbit, place.orbit);
 }
 
-/** Does `station` fly its slot's own orbit, with no trim moving it off it
- *  (orbits.stationOrbit)? */
-function onSlotOrbit(station: StationRecord): boolean {
+/** Does `station` fly its base orbit (its slot's, or 🎚️ its own altitude),
+ *  with no trim moving it off it (orbits.stationOrbit)? */
+function onUntrimmedOrbit(station: StationRecord): boolean {
   const flown = stationOrbit(station);
-  const slot = orbitForSlot(station.planetId, station.orbitSlot);
-  return flown.radiusKm === slot.radiusKm && flown.phase0 === slot.phase0;
+  const base = baseOrbit(station);
+  return flown.radiusKm === base.radiusKm && flown.phase0 === base.phase0;
 }
 
 /** Where a station orbits, as an open-orbit place. */
 function placeOf(station: StationRecord): string {
-  return adriftAt(planetById(station.planetId).id, station.orbitSlot);
+  return adriftAt(planetById(station.planetId).id, station.orbitSlot, station.orbit);
 }
 
 /** The station a dock into `roomId` holds a ship at: none for another lone
@@ -658,12 +660,12 @@ export function restingPlace(
   const from = dockHost(release.room, stations);
   const told = release.place === undefined ? null : adriftPlace(release.place);
   if (told) {
-    const at = adriftAt(told.planetId, told.orbitSlot);
+    const at = adriftAt(told.planetId, told.orbitSlot, told.orbit);
     return from ? { at, from, releasedAt: release.at, recorded: true } : { at, releasedAt: release.at, recorded: true };
   }
   if (!from) return { at: rest.at, releasedAt: release.at };
   const left = stationLeftFrom(from, release.at, now);
-  const at = left ? adriftAt(left.planetId, left.orbitSlot) : stationInTransit(from, now) ? rest.at : placeOf(from);
+  const at = left ? adriftAt(left.planetId, left.orbitSlot, left.orbit) : stationInTransit(from, now) ? rest.at : placeOf(from);
   return { at, from, releasedAt: release.at };
 }
 
@@ -785,7 +787,7 @@ export function restBeside(locationId: string, now: number, docks: string[]): vo
  *  no trim (shipPlaceId). No copy: as restBeside. */
 export function restAtRouteEnd(
   locationId: string,
-  end: { planetId: string; orbitSlot: number } | null,
+  end: { planetId: string; orbitSlot: number; orbit?: StationOrbit } | null,
   now: number,
   docks: string[],
 ): void {
@@ -793,7 +795,7 @@ export function restAtRouteEnd(
     restBeside(locationId, now, docks);
     return;
   }
-  const rest = { at: adriftAt(planetById(end.planetId).id, end.orbitSlot), since: Math.floor(now), open: true as const };
+  const rest = { at: adriftAt(planetById(end.planetId).id, end.orbitSlot, end.orbit), since: Math.floor(now), open: true as const };
   if (!writeRestPlace(rest)) writeRestPlace(null);
 }
 
@@ -834,7 +836,7 @@ export function castOffPlaces(fromId: string, destinationId: string): Pick<Fligh
   const placeOf = (id: string): string | undefined => {
     if (adriftPlace(id)) return id;
     const st = records.find((r) => r.id === id);
-    return st ? adriftAt(planetById(st.planetId).id, st.orbitSlot) : undefined;
+    return st ? adriftAt(planetById(st.planetId).id, st.orbitSlot, st.orbit) : undefined;
   };
   const originAt = placeOf(fromId);
   const destinationAt = placeOf(destinationId);
@@ -1114,8 +1116,9 @@ export function completeArrival(
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.
     const from = moved ?? station.move;
-    const at = wasAt ? adriftAt(wasAt.planetId, wasAt.orbitSlot)
-      : from ? adriftAt(from.fromPlanetId, from.fromSlot) : adriftAt(station.planetId, 0);
+    const fromOrbit = from?.mode === 'orbit' && from.orbit ? orbitChangeBase(from.orbit) : from?.fromOrbit;
+    const at = wasAt ? adriftAt(wasAt.planetId, wasAt.orbitSlot, wasAt.orbit)
+      : from ? adriftAt(from.fromPlanetId, from.fromSlot, fromOrbit) : adriftAt(station.planetId, 0);
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' }, at);
   }
   if (!docking) return settle({ kind: 'none', stationName: station.name, reason: 'no-port' });

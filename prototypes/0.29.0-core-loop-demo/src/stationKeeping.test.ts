@@ -2753,3 +2753,19 @@ describe('with a trim resolver installed (orbits.setStationTrimResolver)', () =>
     expect(plan()).toEqual(without);
   });
 });
+
+describe('🎚️ trims per altitude base in the replay', () => {
+  it('a late burn from the orbit a station left neither replaces nor restarts the new orbit\'s trim', () => {
+    const base = { radiusKm: orbitForSlot(SOV, 0).radiusKm + 1_000, phase0: 0.3 };
+    const burn = (at: number, onBase: boolean): TrimBurn => ({
+      planetId: SOV, slot: 0, ...(onBase ? { base } : {}), dir: 'raise', at, fuel: 1,
+    });
+    // Two burns on the altitude orbit, then one stamped later from the slot's
+    // orbit the station left (a tab that was offline), then one more up there.
+    const run = replayBurns([burn(T0 + HOUR, true), burn(T0 + 2 * HOUR, true), burn(T0 + 3 * HOUR, false), burn(T0 + 4 * HOUR, true)]);
+    const up = run.trims.find((t) => t.base !== undefined);
+    expect(up).toMatchObject({ dRadiusKm: 3 * TRIM_STEP_KM, base });
+    expect(run.trims.find((t) => t.base === undefined)).toMatchObject({ dRadiusKm: TRIM_STEP_KM });
+    expect(run.trims).toHaveLength(2);
+  });
+});
