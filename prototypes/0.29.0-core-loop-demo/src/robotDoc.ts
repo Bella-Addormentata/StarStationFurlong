@@ -203,6 +203,10 @@ interface JobIndex {
   targeted: Set<string>;
   /** The well-formed robot work records, by module. */
   work: Map<string, DisassemblyWork[]>;
+  /** The walk stopped short of the map's end (MAX_ROBOT_MAP_SCAN): a peer's
+   *  junk ahead of them could hide any record, so nothing is written from
+   *  this index, and no job is opened or ended on it. */
+  partial: boolean;
 }
 
 const NO_DOCKS: ReadonlySet<string> = new Set();
@@ -220,8 +224,12 @@ function indexJobs(map: Y.Map<unknown>): JobIndex {
   const doc = map.doc;
   const placed = (dockId: string) => doc !== null && placedFurnitureIn(doc, dockId)?.kind === 'charging-dock';
   let scanned = 0;
+  let partial = false;
   for (const [key, value] of map.entries()) {
-    if (++scanned > MAX_ROBOT_MAP_SCAN) break;
+    if (++scanned > MAX_ROBOT_MAP_SCAN) {
+      partial = true;
+      break;
+    }
     if (key.startsWith('job:')) {
       if (records.length < MAX_JOBS && isDisassemblyJobRecord(value) && jobKey(value.roomId) === key) records.push(value);
       continue;
@@ -242,7 +250,7 @@ function indexJobs(map: Y.Map<unknown>): JobIndex {
     if (docks) docks.add(dockId);
     else active.set(value.target, new Set([dockId]));
   }
-  return { records, active, targeted, work };
+  return { records, active, targeted, work, partial };
 }
 
 /** A stored record as a job: its robots' labor folded in, and its crew
@@ -273,10 +281,19 @@ function readJobIn(map: Y.Map<unknown>, roomId: string): DisassemblyJob | null {
  *  dropped, and so are the work records no open job counts; an open one
  *  stays, its robots' labor kept for later. */
 function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | null, now: number): void {
+  const prior = map.get(`cfg:${dockId}`);
   const before = indexJobs(map);
   if (config) map.set(`cfg:${dockId}`, config);
   else map.delete(`cfg:${dockId}`);
   const after = indexJobs(map);
+  if (before.partial || after.partial) {
+    // The walks may have missed any record: none is written from them. Only
+    // this robot's own record on a job it leaves or joins stops, uncredited
+    // (whether it was in the crew can't be told), so its clock never runs on
+    // from a start before. It starts again once the map reads whole.
+    stopOwnWorkIn(map, dockId, isRobotConfig(prior) ? prior : null, config);
+    return;
+  }
   // What no robot needs any more goes first: a finished job no robot is set
   // to, and the work records of a job that ended, is gone or was opened
   // again since.
@@ -309,6 +326,27 @@ function setConfigIn(map: Y.Map<unknown>, dockId: string, config: RobotConfig | 
       work.set(dockId, stopped);
     }
     fillCrewIn(map, record, work, active, now);
+  }
+}
+
+/** The module a config puts its robot to work on, or null (another
+ *  routine, none picked yet, or stopped). */
+function workingOn(config: RobotConfig | null): string | null {
+  return config?.routine === 'disassemble' && config.target && config.parked !== true ? config.target : null;
+}
+
+/** On a map that can't be read whole (setConfigIn): the robot's own record
+ *  on each job it leaves or joins stops, uncredited, if it says it works.
+ *  Read and written by its own key: no other record is touched. */
+function stopOwnWorkIn(map: Y.Map<unknown>, dockId: string, from: RobotConfig | null, to: RobotConfig | null): void {
+  const was = workingOn(from);
+  const next = workingOn(to);
+  if (was === next) return;
+  for (const roomId of [was, next]) {
+    if (!roomId) continue;
+    const key = workKey(roomId, dockId);
+    const w = map.get(key);
+    if (isDisassemblyWork(w) && w.working && workKey(w.roomId, w.dockId) === key) map.set(key, { ...w, working: false });
   }
 }
 
@@ -366,6 +404,7 @@ function reconcileCrews(map: Y.Map<unknown>): void {
   const doc = map.doc;
   if (!doc) return;
   const index = indexJobs(map);
+  if (index.partial) return;
   const open = index.records.filter((r) => r.finishedAt === undefined);
   if (open.length === 0) return;
   const now = Date.now();
@@ -441,6 +480,15 @@ export function readDisassemblyJobs(): DisassemblyJob[] {
   return index.records.map((r) => asJob(index, r));
 }
 
+/** 🔧 readDisassemblyJobs, or null when one walk can't read the whole map
+ *  (more entries than MAX_ROBOT_MAP_SCAN, which a peer could have flooded):
+ *  any job or robot record could be among those left out, so none is
+ *  opened or ended until it reads whole. */
+export function readDisassemblyJobsIfComplete(): DisassemblyJob[] | null {
+  const index = indexJobs(ensureMap());
+  return index.partial ? null : index.records.map((r) => asJob(index, r));
+}
+
 /** The job on one module, with its crew, or null. */
 export function readDisassemblyJob(roomId: string): DisassemblyJob | null {
   return readJobIn(ensureMap(), roomId);
@@ -457,9 +505,13 @@ export function startResumesDisassembly(config: RobotConfig | null | undefined):
 /** 🔧 Set a dock's robot to take `target` apart. The job is opened if it has
  *  none (or only a finished one); an open one costed below `target`'s labor
  *  is raised to it (raiseJobLaborIn). The robot joins its crew unless it is
- *  parked. Its script and STOP/START state are kept. */
+ *  parked. Its script and STOP/START state are kept. Nothing is written
+ *  while the map can't be read whole (readDisassemblyJobsIfComplete). */
 export function assignDisassembly(dockId: string, target: DisassemblyTarget, now = Date.now()): void {
   const map = ensureMap();
+  // A job opened on a map that can't be read whole could be one no walk
+  // finds (the console holds the pick then: removalBlocker).
+  if (indexJobs(map).partial) return;
   boundDoc!.transact(() => {
     const open = readRecordIn(map, target.roomId);
     if (!open || open.finishedAt !== undefined) {
@@ -493,6 +545,7 @@ export function assignDisassembly(dockId: string, target: DisassemblyTarget, now
 function raiseJobLaborIn(map: Y.Map<unknown>, record: DisassemblyJobRecord, laborHours: number, now: number): void {
   if (record.finishedAt !== undefined || record.laborHours >= laborHours) return;
   const index = indexJobs(map);
+  if (index.partial) return;
   const work = workOf(index, record);
   const active = index.active.get(record.roomId) ?? NO_DOCKS;
   for (const w of workRanOut(record, work.values(), active, now)) {

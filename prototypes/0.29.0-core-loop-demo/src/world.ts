@@ -43,7 +43,9 @@ import {
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
-import { finishDisassemblyJob, raiseDisassemblyLabor, readDisassemblyJobs, readRobotConfig, subscribeRobot } from "./robotDoc";
+import {
+  finishDisassemblyJob, raiseDisassemblyLabor, readDisassemblyJobs, readDisassemblyJobsIfComplete, readRobotConfig, subscribeRobot,
+} from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
 import {
   disassemblyCandidates,
@@ -5333,6 +5335,7 @@ export class World {
       hereRoomId: World.activeRoomId(),
       doors: whole ?? readAllDoors(),
       ...(whole ? {} : { doorsPartial: true }),
+      ...(readDisassemblyJobsIfComplete() ? {} : { jobsPartial: true }),
       playerId: getPlayerId(),
       identityPub: getIdentityPub(),
       welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
@@ -5426,8 +5429,9 @@ export class World {
   private finishDisassembly(job: DisassemblyJob, due: number): boolean {
     const input = this.disassemblyInput();
     // Nothing is decided on a capped read of the doors, not even that none
-    // joins the module now: the job holds until they read whole.
-    if (input.doorsPartial) return false;
+    // joins the module now, nor of the robot records: the job holds until
+    // they read whole.
+    if (input.doorsPartial || input.jobsPartial) return false;
     const joined = doorsJoinedTo(input, job.roomId);
     if (joined.length === 0) {
       // Disconnected some other way first: nothing here to take off. (Or it
@@ -5444,12 +5448,15 @@ export class World {
       return true;
     }
     if (removalBlocker(input, job.roomId)) return false;
-    // One transaction: the doors sealed and the job done land together.
+    // One transaction of the room doc: the doors sealed, the job done and the
+    // module's tombstone in the shared atlas land together (dismantleInAtlas
+    // publishes it there, and writes our own atlas in the same step), so no
+    // reload or visitor ever finds the job ended and the module still mapped.
     transactDoorWrites(() => {
       for (const d of joined) writeDoorTombstone(d.doorId, d.address);
       finishDisassemblyJob(job.roomId, due, "removed");
+      dismantleInAtlas(job.roomId, due);
     });
-    dismantleInAtlas(job.roomId, due);
     const speaker = job.crew.map((k) => this.robots.get(k)).find((b) => b);
     if (speaker) {
       const p = speaker.getPosition();

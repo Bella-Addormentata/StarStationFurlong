@@ -20,10 +20,10 @@ import {
 } from './disassembly';
 import {
   assignDisassembly, bindRobotDoc, clearRobotConfig, finishDisassemblyJob, raiseDisassemblyLabor,
-  readDisassemblyJob, readDisassemblyJobs, readRobotConfig, releaseOrphanedDocks, startResumesDisassembly, writeRobotConfig,
-  MAX_ROBOT_MAP_SCAN,
+  readDisassemblyJob, readDisassemblyJobs, readDisassemblyJobsIfComplete, readRobotConfig, releaseOrphanedDocks,
+  startResumesDisassembly, writeRobotConfig, MAX_ROBOT_MAP_SCAN,
 } from './robotDoc';
-import type { DoorRecord } from './doorsDoc';
+import { bindDoorsDoc, transactDoorWrites, writeDoorTombstone, type DoorRecord } from './doorsDoc';
 import { bindFurnitureDoc, deleteFurnitureItem, replaceAllFurniture, writeFurnitureItem } from './furnitureDoc';
 
 const store = new Map<string, string>();
@@ -396,6 +396,9 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(partial, 'room-c')).toBe('it belongs to Sam');
     // Read whole, it can come off.
     expect(removalBlocker(input(doors, { doorsPartial: false }), 'room-b')).toBeNull();
+    // So with the room's robot records: what a job has done can't be told.
+    expect(removalBlocker(input(doors, { jobsPartial: true }), 'room-b'))
+      .toBe("this room's robot records can't all be read; it has too many");
   });
 
   it('seals every door of this room joined to the module', () => {
@@ -644,6 +647,73 @@ describe('the job in the robot map', () => {
     entries.mockRestore();
   });
 
+  it("opens, raises and ends nothing while one walk can't read the whole map", () => {
+    const doc = roomWithDocks();
+    bindRobotDoc(doc);
+    assignDisassembly('d1', target, 0);
+    assignDisassembly('d2', target, 0);
+    expect(readDisassemblyJobsIfComplete()?.map((j) => j.crew)).toEqual([['d1', 'd2']]);
+    // A peer floods the map: any record could sit past what a walk reads
+    // (on a fresh load, a peer's entries can come first).
+    const map = doc.getMap('robot');
+    doc.transact(() => {
+      for (let i = 0; i < MAX_ROBOT_MAP_SCAN; i++) map.set(`junk-${i}`, i);
+    });
+    expect(readDisassemblyJobsIfComplete()).toBeNull();
+    // What the walk read still shows (the console's progress)…
+    expect(readDisassemblyJobs().map((j) => j.crew)).toEqual([['d1', 'd2']]);
+    // …but no job opens on it, and none is raised.
+    assignDisassembly('d3', { ...target, roomId: 'room-c', name: 'LAB', doorId: 'west' }, 5 * MIN);
+    expect(map.get('job:room-c')).toBeUndefined();
+    expect(readRobotConfig('d3')).toBeNull();
+    raiseDisassemblyLabor('room-b', 48, 5 * MIN);
+    expect(readDisassemblyJob('room-b')?.laborHours).toBe(24);
+    // A robot stopped then writes its config and its own record alone: the
+    // record stops, uncredited (whether it was in the crew can't be told).
+    const others = () => JSON.stringify([...map.entries()]
+      .filter(([k]) => k !== 'cfg:d1' && !k.includes('"d1"') && !k.startsWith('junk-')));
+    const untouched = others();
+    writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b', parked: true }, 5 * MIN);
+    expect(map.get(`work:${JSON.stringify(['room-b', 'd1'])}`)).toMatchObject({ working: false, ms: 0, asOf: 0 });
+    expect(others()).toBe(untouched);
+    // Started again, it doesn't work yet: its clock never runs on from the
+    // start it had before.
+    writeRobotConfig('d1', { routine: 'disassemble', target: 'room-b' }, 6 * MIN);
+    expect(readDisassemblyJob('room-b')?.crew).toEqual(['d2']);
+    expect(others()).toBe(untouched);
+    // A robot whose config is written as it stood keeps working,
+    writeRobotConfig('d2', { routine: 'disassemble', target: 'room-b' }, 6 * MIN);
+    expect(map.get(`work:${JSON.stringify(['room-b', 'd2'])}`)).toMatchObject({ working: true });
+    const now = vi.spyOn(Date, 'now').mockReturnValue(6 * MIN + 30_000);
+    try {
+      // and edits arriving from elsewhere hold no crew while the map can't
+      // be read whole (more junk, here).
+      const more = new Y.Doc();
+      Y.applyUpdate(more, Y.encodeStateAsUpdate(doc));
+      more.getMap('robot').set('junk-more', 1);
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(more, Y.encodeStateVector(doc)));
+      expect(readDisassemblyJob('room-b')?.crew).toEqual(['d2']);
+      expect(others()).toBe(untouched);
+      // Once the junk is gone (a peer clears it), the crew is held to the
+      // records again: d1, set to the job and not stopped, starts afresh.
+      now.mockReturnValue(7 * MIN);
+      const peer = new Y.Doc();
+      Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+      peer.transact(() => {
+        for (let i = 0; i < MAX_ROBOT_MAP_SCAN; i++) peer.getMap('robot').delete(`junk-${i}`);
+        peer.getMap('robot').delete('junk-more');
+      });
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, Y.encodeStateVector(doc)));
+      const j = readDisassemblyJobsIfComplete()?.[0];
+      expect(j?.crew).toEqual(['d1', 'd2']);
+      // d2's seven minutes, and none of d1's time stopped or waiting.
+      expect(map.get(`work:${JSON.stringify(['room-b', 'd1'])}`)).toMatchObject({ working: true, ms: 0, asOf: 7 * MIN });
+      expect(workedMs(j!, 7 * MIN)).toBe(7 * MIN);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
   it('counts only robots whose docks are placed in the room\'s layout', () => {
     const doc = roomWithDocks(['d1', 'd2']);
     bindRobotDoc(doc);
@@ -795,6 +865,35 @@ describe('the job in the robot map', () => {
 // ── Off the station and out of every map ─────────────────────────────────────
 
 describe('a module taken apart', () => {
+  it("lands the sealed door, the job's end and the tombstone in one update of the room doc", () => {
+    hub();
+    const doc = roomWithDocks();
+    bindRobotDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    assignDisassembly('d1', target, 0);
+    const before = Y.encodeStateAsUpdate(doc);
+    const updates: Uint8Array[] = [];
+    doc.on('update', (u: Uint8Array) => updates.push(u));
+    // As world.ts ends a job (finishDisassembly).
+    transactDoorWrites(() => {
+      writeDoorTombstone('east', seed('room-b'));
+      finishDisassemblyJob('room-b', 24 * MIN, 'removed');
+      dismantleInAtlas('room-b', 24 * MIN);
+    });
+    expect(updates).toHaveLength(1);
+    // A reload, or a visitor, that has that update has all three; one that
+    // hasn't has none of them.
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, before);
+    expect(peer.getMap('robot').get('job:room-b')).not.toHaveProperty('outcome');
+    expect(peer.getMap('atlas').get('room-b')).not.toHaveProperty('dismantledAt');
+    Y.applyUpdate(peer, updates[0]);
+    expect(peer.getMap('doors').get('east')).toMatchObject({ paired: false });
+    expect(peer.getMap('robot').get('job:room-b')).toMatchObject({ outcome: 'removed' });
+    expect(peer.getMap('atlas').get('room-b')).toMatchObject({ dismantledAt: 24 * MIN, doors: {} });
+  });
+
   it('leaves the maps, its doors with it, and the station shrinks', () => {
     hub();
     expect(atlasComponents(readAtlas()).find((c) => c.has('room-a'))?.has('room-b')).toBe(true);
@@ -1545,10 +1644,19 @@ describe('where the robots work (source scan)', () => {
     expect(input).toContain('const whole = readAllDoorsIfComplete();');
     expect(input).toContain('doors: whole ?? readAllDoors(),');
     expect(input).toContain('...(whole ? {} : { doorsPartial: true }),');
+    expect(input).toContain('...(readDisassemblyJobsIfComplete() ? {} : { jobsPartial: true }),');
     const finish = between(source('world.ts'), 'private finishDisassembly(', 'private workPost(');
-    const held = finish.indexOf('if (input.doorsPartial) return false;');
+    const held = finish.indexOf('if (input.doorsPartial || input.jobsPartial) return false;');
     expect(held).toBeGreaterThan(-1);
     expect(held).toBeLessThan(finish.indexOf('doorsJoinedTo('));
+  });
+
+  it("publishes the module's tombstone in the transaction that seals its doors", () => {
+    const finish = between(source('world.ts'), 'private finishDisassembly(', 'private workPost(');
+    const end = between(finish, 'transactDoorWrites(() => {', '\n    });');
+    expect(end).toContain('finishDisassemblyJob(job.roomId, due, "removed");');
+    expect(end).toContain('dismantleInAtlas(job.roomId, due);');
+    expect(finish.split('dismantleInAtlas(').length).toBe(2);
   });
 
   it("works at a door that still joins the module, the job's own first", () => {

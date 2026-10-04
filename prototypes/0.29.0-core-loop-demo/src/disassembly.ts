@@ -354,6 +354,10 @@ export interface CandidateInput {
    *  a peer could have flooded. A door to the module could be among those
    *  left out, so nothing comes off until the doors read whole. */
   doorsPartial?: boolean;
+  /** True when the room's robot records can't all be read in one walk
+   *  (robotDoc readDisassemblyJobsIfComplete read null): no job is opened
+   *  or ended on what was read. */
+  jobsPartial?: boolean;
   /** The local player's id (roomInfo.owner's vocabulary). */
   playerId: string;
   /** The local identity key (keypair getIdentityPub), which still names an
@@ -427,7 +431,9 @@ export function ownerIsMe(owner: AtlasOwner, me: { playerId: string; identityPub
  *    it, so a berth of this room's joined to it as well (it docked here as a
  *    ship too) would leave it docked here. It waits until that is undocked;
  *  - all of this room's doors must be read to know that, and to seal every
- *    one joined to it: a capped read (doorsPartial) holds it.
+ *    one joined to it: a capped read (doorsPartial) holds it, and so does
+ *    one of the room's robot records (jobsPartial), whose jobs and labor
+ *    can't be told then.
  */
 export function removalBlocker(input: CandidateInput, roomId: string): string | null {
   const { atlas } = input;
@@ -443,6 +449,7 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   // A door to it left out of a capped read would stay unsealed, and a berth
   // to it unseen.
   if (input.doorsPartial) return "this room's doors can't all be read; it has too many door records";
+  if (input.jobsPartial) return "this room's robot records can't all be read; it has too many";
   // Docked here as well (a berth of this room's paired with it): the end
   // seals this room's structural doors only, and the berth would stay.
   for (const rec of input.doors.values()) {
