@@ -6,7 +6,7 @@
  */
 import { afterEach, describe, expect, it } from 'vitest';
 import {
-  allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameUrl,
+  allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameOrigins,
   emulatorIsolated, emulatorWallPolicy, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom,
   romAcceptList, EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND, EMULATOR_SANDBOX,
 } from './arcadeEmulator';
@@ -95,17 +95,19 @@ describe('where the emulator files come from', () => {
     expect(emulatorErrorText('something odd', 'station')).toEqual({ title: 'THE CABINET FAULTED', hint: 'something odd' });
   });
 
-  it('tells the frame its lane and, on the station lane, the origins its policy may reach — http(s) origins only', () => {
-    expect(emulatorFrameUrl({ isolated: true, allowOrigins: ['http://127.0.0.1:8080'] }, '/arcade/frame.html')).toBe('/arcade/frame.html');
-    expect(emulatorFrameUrl({ isolated: false, allowOrigins: [] }, '/arcade/frame.html')).toBe('/arcade/frame.html?lane=station&allow=');
-    expect(emulatorFrameUrl({ isolated: false, allowOrigins: [] }, '/f.html?x=1')).toBe('/f.html?x=1&lane=station&allow=');
+  it('hands the frame the origins its policy may reach beyond its own — the engine\'s where that is another, and the viewer\'s node — http(s) origins only, in the config and never in the URL', () => {
+    const origin = 'http://localhost:4173';
+    // The station lane: the engine is this page's own files; nothing beyond the node.
+    expect(emulatorFrameOrigins({ pathToData: '/emulatorjs/data/', allowOrigins: [] }, origin)).toEqual([]);
+    expect(emulatorFrameOrigins({ pathToData: `${origin}/emulatorjs/data/`, allowOrigins: [origin] }, origin)).toEqual([]);
+    expect(emulatorFrameOrigins({ pathToData: '/emulatorjs/data/', allowOrigins: ['http://127.0.0.1:8080'] }, origin)).toEqual(['http://127.0.0.1:8080']);
+    // The CDN lane: the engine's origin, and nothing else of the CDN's.
+    expect(emulatorFrameOrigins({ pathToData: EMULATOR_CDN_DATA, allowOrigins: [] }, origin)).toEqual(['https://cdn.emulatorjs.org']);
     const offered = [
       'http://localhost:4173', 'http://127.0.0.1:8080/blob/x', 'http://127.0.0.1:8080', 'tauri://localhost',
       'javascript:alert(1)', 'not an origin', "http://evil;script-src 'unsafe-inline'", 'http://evil;x', 'ws://x',
     ];
-    const u = new URL(emulatorFrameUrl({ isolated: false, allowOrigins: offered }, 'http://localhost:4173/arcade/frame.html'));
-    expect(u.searchParams.get('lane')).toBe('station');
-    expect(u.searchParams.get('allow')).toBe('http://localhost:4173 http://127.0.0.1:8080');
+    expect(emulatorFrameOrigins({ pathToData: EMULATOR_CDN_DATA, allowOrigins: offered }, origin)).toEqual(['https://cdn.emulatorjs.org', 'http://127.0.0.1:8080']);
   });
 
   it('remembers the player\'s own files by game, and lists every extension a core takes', () => {

@@ -38,7 +38,7 @@
     Protocol with the page (src/arcadeEmulator.ts mountEmulatorFrame):
       frame → page  { type: 'arcade-frame-ready' }
       page → frame  { type: 'arcade-config', core, game (a Blob), gameName,
-                      pathToData, volume, isolated, timeoutMs }
+                      pathToData, allow (origins), volume, isolated, timeoutMs }
       frame → page  { type: 'arcade-ready' }     the emulator is loaded
                     { type: 'arcade-started' }   the game runs
                     { type: 'arcade-exit' }      Escape pressed here
@@ -51,23 +51,30 @@
     another origin's code, which is what the player's consent to hand it
     their own file is about.
 
-    On the station lane the parent opens this page as
-    ?lane=station&allow=<origins> (emulatorFrameUrl) and the script below
-    sets a content-security policy before anything loads: the engine, its
-    cores and the game come from the station's origin, blob: and data:, plus
-    the allowed origins (the viewer's own node, http(s) origins the parent
-    already reduced and this page checks again) — and nothing else: no
-    update check, no netplay server, no third party of any kind. Every
-    directive names the station's origin outright, beside 'self', since
-    'self' is whatever the browser makes of an opaque origin. Scripts keep
-    'unsafe-eval' and 'wasm-unsafe-eval' for the cores. An opaque origin's
-    fetches carry `Origin: null`, so the station serves /emulatorjs/ with
-    Access-Control-Allow-Origin (vite.config.ts for dev and preview; a
-    deployment the same) — the engine and its cores, public files, and
-    nothing else needs it: the game never crosses as a URL. A policy in a
-    meta element governs every fetch after its insertion; the cabinet's
-    smoke checks that a fetch to another server is refused under it, that
-    the origin here reads null, and that the parent is out of reach.
+    This page is opened at ONE path with nothing in a query, on every lane
+    (frame-src, which the wall enforces, ignores a query — a policy chosen
+    by one could be swapped by a self-navigation to the same path), and it
+    sets its content-security policy itself, on receipt of the page's
+    config and before the loader is fetched: the engine, its cores and the
+    game come from this page's own origin, blob: and data:, plus the origins
+    the config names (`allow`: the engine's origin where it is another —
+    the CDN lane — and the viewer's own node; http(s) origins the page
+    already reduced, emulatorFrameOrigins, and this page checks again) —
+    and nothing else: no update check, no netplay server, no other third
+    party. Every directive names this page's origin outright, beside
+    'self', since 'self' is whatever the browser makes of an opaque origin.
+    Scripts keep 'unsafe-eval' and 'wasm-unsafe-eval' for the cores. A
+    document that arrives here by a self-navigation runs this script alone,
+    receives no config (the page configures a frame once), sets no policy
+    and loads nothing, and is torn down at the second load. An opaque
+    origin's fetches carry `Origin: null`, so the station serves
+    /emulatorjs/ with Access-Control-Allow-Origin (vite.config.ts for dev
+    and preview; a deployment the same) — the engine and its cores, public
+    files, and nothing else needs it: the game never crosses as a URL. A
+    policy in a meta element governs every fetch after its insertion; the
+    cabinet's smoke checks that a fetch to another server is refused under
+    it, that the origin here reads null, and that the parent is out of
+    reach.
     EmulatorJS itself has not run under this policy in this repository (its
     files are never here): the spike that fetches them is where a directive
     it needs would show, as a console refusal naming it.
@@ -81,15 +88,16 @@
   <div id="game"></div>
   <script>
     (function () {
-      // The station lane's policy, first: before the loader, before the game.
-      // Every directive names the station's origin outright — this page's
-      // own URL's origin, and the parent's allow-list — beside 'self': this
-      // document's origin is opaque, and 'self' is whatever the browser
-      // makes of that.
-      var params = new URLSearchParams(location.search);
-      var isOrigin = function (o) { return /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/.test(o); };
-      if (params.get('lane') === 'station') {
-        var origins = (params.get('allow') || '').split(' ').filter(isOrigin);
+      // The policy, set on receipt of the page's config and before the
+      // loader is fetched — on every lane. Every directive names this page's
+      // own origin outright, beside 'self' (this document's origin is
+      // opaque, and 'self' is whatever the browser makes of that), and the
+      // origins the config names: the engine's where it is another (the
+      // CDN lane) and the viewer's own node, checked again here. Nothing
+      // comes from this page's URL (the header).
+      var isOrigin = function (o) { return typeof o === 'string' && /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/.test(o); };
+      function setPolicy(allowed) {
+        var origins = (Array.isArray(allowed) ? allowed : []).filter(isOrigin);
         try {
           var here = new URL(location.href).origin;
           if (isOrigin(here) && origins.indexOf(here) < 0) origins.push(here);
@@ -132,6 +140,8 @@
         if (e.source !== pageWin || !e.data || e.data.type !== 'arcade-config' || started) return;
         started = true;
         var c = e.data;
+        // The policy first: before the game's blob: URL, before the loader.
+        setPolicy(c.allow);
         // The game: the bytes the parent fetched, or the player's own file,
         // as a blob: URL of this document — gone with the frame.
         var gameUrl;

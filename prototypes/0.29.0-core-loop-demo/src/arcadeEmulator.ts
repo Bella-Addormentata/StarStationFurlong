@@ -34,10 +34,13 @@
  * whoever starts it, BEFORE the request is dispatched: a frame that tries
  * to leave sends nothing, the wall hears the violation and the frame comes
  * down with the reason. The one navigation the policy allows, to the
- * frame's own URL, is caught by its second load and torn down the same way
- * — a teardown after a navigation is the belt, never the barrier. The wall
- * carries no script: the frame and this page talk past it, the frame
- * posting to the wall's parent and this page to the frame's window.
+ * frame's own path, is caught by its second load and torn down the same
+ * way — and the document that arrives runs this page's script alone,
+ * receives no config (a frame is configured once), sets no policy and
+ * loads nothing; a teardown after a navigation is the belt, never the
+ * barrier. The wall carries no script: the frame and this page talk past
+ * it, the frame posting to the wall's parent and this page to the frame's
+ * window.
  *
  * The emulator's own files come from one of two places, the owner's call
  * per cabinet (arcadeDoc's `data`): THIS STATION's /emulatorjs/data/ —
@@ -46,13 +49,18 @@
  * build offers only with the convenience lanes on (sovereignty.ts; off by
  * default: serverless sources only). Neither is bundled, so a fresh
  * checkout shows NOT PROVISIONED with the command, not a blank screen:
- * probeEmulatorData looks before the frame mounts. On the station lane the
- * frame is also handed a content-security policy (emulatorFrameUrl →
- * frame.html): its code reaches this origin and the viewer's own node,
- * nothing else. An opaque origin's fetches carry `Origin: null`, so the
- * station serves /emulatorjs/ with Access-Control-Allow-Origin
- * (vite.config.ts for the dev and preview servers; a deployment the same)
- * — the engine and its cores, public files, and nothing else needs it.
+ * probeEmulatorData looks before the frame mounts. The frame sets its own
+ * content-security policy on EVERY lane, on receipt of this page's config
+ * and before its loader is fetched (emulatorFrameOrigins → frame.html):
+ * its own origin, the engine's origin where that is another (the CDN
+ * lane) and the viewer's own node, nothing else. Nothing travels in the
+ * frame's URL, which is one immutable path the wall names exactly: a
+ * query is ignored by frame-src, so a policy chosen by one could be
+ * swapped by a self-navigation to the same path. An opaque origin's
+ * fetches carry `Origin: null`, so the station serves /emulatorjs/ with
+ * Access-Control-Allow-Origin (vite.config.ts for the dev and preview
+ * servers; a deployment the same) — the engine and its cores, public
+ * files, and nothing else needs it.
  *
  * DOM-free except mountEmulatorFrame; the path and probe maths are tested.
  */
@@ -135,11 +143,12 @@ export interface EmulatorConfig {
   /** Engine code from another origin (the CDN lane). The frame is an opaque
    *  origin either way (mountEmulatorFrame); this says WHOSE code runs in
    *  it, which is what the player's consent to hand it their own file is
-   *  about (localRomExposureAllowed), and which frame URL it gets. */
+   *  about (localRomExposureAllowed); the frame's URL is the same path on
+   *  every lane, its policy set from the config (emulatorFrameOrigins). */
   isolated: boolean;
   /** Origins beyond the frame's own that its policy lets it fetch from —
-   *  the viewer's own node (tvConsent's own media origins). Station lane
-   *  only: the CDN lane's engine comes from the CDN's own origin. */
+   *  the viewer's own node (tvConsent's own media origins); the engine's
+   *  own origin is added for the CDN lane (emulatorFrameOrigins). */
   allowOrigins: readonly string[];
 }
 
@@ -161,25 +170,28 @@ export function emulatorIsolated(
  *  no path, no space, quote or semicolon that could end the directive. */
 const CSP_ORIGIN = /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/;
 
-/** The frame's URL for a config. On the station lane the frame is told so,
- *  with the origins its content-security policy may fetch from beyond the
- *  station's own — the viewer's own node — reduced to http(s) origins here
- *  (frame.html checks them again before they enter its policy). The
- *  isolated lane (the CDN, lanes on only) gets the plain URL: its engine
- *  comes from the CDN's origin, and the sandbox, which every lane has, is
- *  its wall. */
-export function emulatorFrameUrl(config: Pick<EmulatorConfig, 'isolated' | 'allowOrigins'>, frameUrl = arcadeFrameUrl()): string {
-  if (config.isolated) return frameUrl;
+/** The http(s) origins the frame's policy admits beyond its own, carried in
+ *  the config (frame.html composes the policy from them, on every lane,
+ *  before its loader loads): the engine's origin where it is another than
+ *  this page's (the CDN lane; the station lane's engine is this page's own
+ *  files) and the viewer's own node — reduced to origins here, and checked
+ *  again by the frame before they enter its policy. Never this page's own
+ *  origin, which the frame names for itself. */
+export function emulatorFrameOrigins(
+  config: Pick<EmulatorConfig, 'pathToData' | 'allowOrigins'>,
+  origin = typeof location === 'undefined' ? '' : location.origin,
+): string[] {
   const allow = new Set<string>();
-  for (const o of config.allowOrigins) {
-    let origin = '';
+  const add = (candidate: string) => {
+    let value = '';
     try {
-      origin = new URL(o).origin;
+      value = new URL(candidate).origin;
     } catch { /* not a URL: not an origin */ }
-    if (CSP_ORIGIN.test(origin)) allow.add(origin);
-  }
-  const sep = frameUrl.includes('?') ? '&' : '?';
-  return `${frameUrl}${sep}lane=station&allow=${encodeURIComponent([...allow].join(' '))}`;
+    if (CSP_ORIGIN.test(value) && value !== origin) allow.add(value);
+  };
+  if (/^https?:\/\//i.test(config.pathToData)) add(config.pathToData);
+  for (const o of config.allowOrigins) add(o);
+  return [...allow];
 }
 
 export type EmulatorEvent =
@@ -276,6 +288,9 @@ export function mountEmulatorFrame(
           game: config.game,
           gameName: config.gameName,
           pathToData: config.pathToData,
+          // The origins the frame's policy admits beyond its own — set by
+          // the frame on receipt, before its loader loads, on every lane.
+          allow: emulatorFrameOrigins(config),
           volume: config.volume,
           isolated: config.isolated,
           timeoutMs: EMULATOR_LOAD_TIMEOUT_MS,
@@ -337,7 +352,10 @@ export function mountEmulatorFrame(
     f.style.height = '100%';
     f.style.border = '0';
     f.style.background = '#000';
-    f.src = emulatorFrameUrl(config, frameUrl);
+    // One immutable path, no query: the lane and the origins its policy
+    // admits reach the frame in the config (frame-src ignores a query, so
+    // a policy chosen by one could be swapped by a self-navigation).
+    f.src = frameUrl;
     f.addEventListener('load', onLoad);
     doc.addEventListener('securitypolicyviolation', onViolation);
     // Focus that lands on the wall (Tab from the stage's controls) goes on
