@@ -586,11 +586,18 @@ an authenticated connection where one exists (the hub's, or the
 connection the envelope arrived on when its peer is the origin), and
 otherwise through discovery under exactly the per-id, per-address and
 global dial budget below — bytes counted at the socket, backoff, a cap on
-automatic dials in flight — so that a reflection costs its victim at most
-the budget's few datagrams a minute from each member and never a
-handshake storm; until the node dials so, the invariant below (an
-automatic fetch never dials a peer-authored address) does not hold for
-the mesh either, and the fetcher's gate alone is not the whole fix. So
+automatic dials in flight. That dial is the ONE automatic handshake this
+design lets discovery place, and it is a decision, not an oversight: a
+member who joins a room consents to its mesh — the dial reaches the ids
+the room's own signed envelopes name, and spends nothing a fetch would
+spend, no bandwidth on content and no disk — and what the budget bounds
+is the reflection, a victim's address receiving at most the budget's few
+datagrams a minute from each member and never a handshake storm; a rate
+limit makes nothing consensual, which is why the FETCH lane's rule below
+is the stricter one and stands apart: a fetch places no automatic
+handshake through discovery at all. Until the node dials so, neither
+rule holds for the mesh, and the fetcher's gate alone is not the whole
+fix. So
 the `blob` source (§3.1) and a library
 op (§7) carry the hash with the importing node's iroh id, and a viewer's
 node resolves that id to a route in two classes, kept apart. A route it
@@ -631,8 +638,10 @@ victim's address can be made to receive is eight datagrams, under 10 KB,
 a minute from each viewer who chose to fetch, whatever the handshake's
 timers do — the standing cost of any id-to-address lookup on a public
 DHT, iroh's included — which is bounded here and never claimed closed. A viewer's node never sends an
-automatic handshake to an address anyone merely wrote down, in a room
-record or a DHT record alike. A provider reachable by neither class is not
+automatic handshake FOR A FETCH to an address anyone merely wrote down,
+in a room record or a DHT record alike; the one automatic handshake
+discovery ever places is the mesh-upgrade dial of a room member's id
+(above), under the same budget, and a fetch adds none to it. A provider reachable by neither class is not
 reachable, and the record says who else to ask: every node that
 completes the blob announces `have` for the hash on the room's control
 plane (a sibling of the `media-sub` kind) — an announce that is evidence
@@ -881,10 +890,16 @@ signed by the sender's identity key under the domain tag
 `ssf-media-key:v1` as every envelope `signBytes.ts` signs is, so a hub can
 neither forge one nor move one between recipients or epochs, a message
 whose signature or opening fails dropped and charged to the link; the
-`hpke` crate on the node, and on the page `@hpke/core` with its X25519 KEM
-or the RFC's four steps over `@noble/curves`, `@noble/hashes` and
-`@noble/ciphers`, both held to one fixture of test vectors (RFC 9180's for
-the suite, ours for the envelope) — and
+HPKE runtime is the PAGE's alone — `@hpke/core` with its X25519 KEM, or
+the RFC's four steps over `@noble/curves`, `@noble/hashes` and
+`@noble/ciphers` — since the media key is minted and sealed in the
+sender's page and a recipient's identity secret never leaves its browser
+(`keypair.ts`): a node carries the sealed message as it carries the
+ciphertext, and could neither seal nor open one without key material it
+is not meant to have; the Rust `hpke` crate appears only in a test-vector
+harness, never as a runtime dependency of the node, and the page's
+implementation and that harness are held to one fixture of test vectors
+(RFC 9180's for the suite, ours for the envelope) — and
 rotates to a new epoch before every admission (the admitted can open
 nothing from before it: a key handed out mid-epoch would open the ciphertext
 a joiner, or a hub that later joins as a member, had already logged — which
