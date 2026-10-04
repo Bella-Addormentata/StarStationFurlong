@@ -137,11 +137,15 @@ the sources that fail have to say so on the screen.
 **Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
 every 3 s. Every other client records `receivedAt = performance.now()` when
 a new `seq` lands and computes `expected = positionMs + (now − receivedAt) +
-lead` with the same monotonic `now`. The monotonic clock, never the wall
-clock: `Date.now()` steps on an NTP correction, on a wake from sleep or on
-a manual change, and a step would read as elapsed playback and seek every
-viewer at once; the wall clock serves the UTC schedule (`startAt`) and
-nothing in the sync maths. The monotonic clock is no promise of its own
+lead` with the same monotonic `now`. In steady-state playback the
+monotonic clock, never the wall clock: `Date.now()` steps on an NTP
+correction, on a wake from sleep or on a manual change, and a step would
+read as elapsed playback and seek every viewer at once; the wall clock
+serves the UTC schedule (`startAt`) and, in the sync maths, exactly one
+thing — a DETECTED sleep gap, below, which the wall clock ran through
+and the monotonic clock may not have, bridged on wall time for the gap
+alone and never for the elapsed time of a page that stayed awake. The
+monotonic clock is no promise of its own
 across a sleep, though: High Resolution Time lets `performance.now()` run
 on through OS sleep, and on Windows it does, so a viewer waking after an
 hour would read its last sample an hour ahead and seek there. So the
@@ -1510,13 +1514,35 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   SPARSE MERKLE MAP of fixed depth, canonical to the byte so every node
   derives the same root and the same proofs — a writer's leaf sits at the
   path `BLAKE3("ssf-library-writer:v1\n" ‖ writer key)`, 256 bits read from
-  the top, its value `BLAKE3("ssf-library-leaf:v1\n" ‖ writer key (32) ‖
+  the top: bit d of the path, for the edge leaving depth d (the root is
+  depth 0, the leaf depth 256), is bit 7 − (d mod 8) of byte ⌊d / 8⌋ —
+  the first byte's most significant bit first — 0 going left and 1
+  right; its value `BLAKE3("ssf-library-leaf:v1\n" ‖ writer key (32) ‖
   tip hash (32))`; an internal node is `BLAKE3("ssf-library-node:v1\n" ‖
   left ‖ right)`; an empty subtree is a fixed constant per depth, 32 zero
   bytes at the leaf and the node hash of two empties above it, so a map of
   ten writers is ten leaves and a few hundred real hashes, never 2²⁵⁶; a
   proof is the leaf's 256 siblings with the empty ones elided behind a
-  32-byte bitmap, a few hundred bytes for the writers a deed has had — so
+  32-byte bitmap, a few hundred bytes for the writers a deed has had — on
+  the wire, and in the hash of a head, ONE encoding and no other: the
+  bitmap first, bit d (numbered as the path's bits are, byte ⌊d / 8⌋, bit
+  7 − (d mod 8)) set exactly when the sibling of the path's node at depth
+  d + 1 is not its depth's empty constant, then those siblings and no
+  others, 32 bytes each, root to leaf in rising d — so a proof is
+  32 + 32 × popcount(bitmap) bytes, a verifier that finds any other
+  length, or a listed sibling equal to its depth's empty constant, refuses
+  it unread, and two implementations that derive different bytes have
+  derived different proofs, never one proof twice — verified from the leaf
+  up: h starts as the leaf's value, and for d from 255 down to 0, h
+  becomes node(h, sibling) where path bit d is 0 and node(sibling, h)
+  where it is 1, the sibling the listed one or the empty constant for
+  depth d + 1 as the bitmap says, and the h left at d = 0 must equal the
+  root; and before any of this is consensus, one fixture of vectors held
+  by the Rust node's and the page's test suites alike — the empty map's
+  root, a one-writer map and a map of three writers whose keys and tips
+  are written out, each with its root and every leaf's proof as bytes —
+  that both must reproduce, so a Rust and a TypeScript implementation
+  that disagree fail a test and never a head — so
   an insertion moves no other leaf and the tree is updated, 256 hashes a
   write, never rebuilt; a PROOF, though, answers to one root — any other
   leaf's change alters a sibling on this path — so a proof is versioned by
