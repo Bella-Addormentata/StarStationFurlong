@@ -223,8 +223,8 @@ import {
   subscribeDoorPolicyRecords,
   gateAccessIn,
   readDockGates,
+  readDockGatesIfComplete,
   readUnnumberedPorts,
-  readGateAccess,
   readDoorPolicy,
   writeDoorPolicy,
 } from "./doorPolicy";
@@ -3817,11 +3817,13 @@ function harvestStationAtlas(): void {
       }
     });
   }
-  const gatesKnown = readUnnumberedPorts().length === 0;
-  // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals.
+  // ⚓🚦 Every dock port's gate, free or docked, for boards and arrivals;
+  // not known (null) while a port is unnumbered, or when a flood cut the
+  // port scan short: a list missing a port would drop its gate.
+  const gates = readDockGatesIfComplete();
   harvestIntoAtlas({
     roomId, name, seed, dims: readRoomDims(), doors,
-    ...(gatesKnown ? { gates: readDockGates(), gateAccess: readGateAccess() } : { gates: null }),
+    ...(gates ?? { gates: null }),
   });
   // Before the push below, whose write publishes the planet summary again.
   gatesReadIn = roomId;

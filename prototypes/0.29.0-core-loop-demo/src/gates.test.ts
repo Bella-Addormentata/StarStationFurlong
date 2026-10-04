@@ -15,6 +15,7 @@ import {
   nextFreeGate,
   readGateAccess,
   readDockGates,
+  readDockGatesIfComplete,
   readUnnumberedPorts,
   readDoorPolicy,
   removeDoorGrant,
@@ -216,6 +217,46 @@ describe('the gate on a dock port', () => {
     read = 0;
     expect(dockGatesIn(doc)).toEqual({});
     expect(read).toBeLessThan(3000);
+  });
+
+  it("lists the room's gates and their access from one read, and none while a port has no number", () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('south', { id: 'south', wall: 'y-', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    doc.getMap('doorPolicy').set('south', { passage: 'public', construction: 'owner', adapter: true, gate: 2, gateAccess: 'closed' });
+    expect(readDockGatesIfComplete()).toEqual({ gates: { north: 1, south: 2 }, gateAccess: { south: { access: 'closed' } } });
+    doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
+    expect(readDockGatesIfComplete()).toBeNull();
+  });
+
+  it('lists no gates as the room\'s when a flood of both maps hides a port, or the room has more ports than a read lists', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    const layout = doc.getMap('doorLayout');
+    const policies = doc.getMap('doorPolicy');
+    for (let i = 0; i < 1100; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      layout.set(id, { nope: true });
+      policies.set(id, { passage: 'public', construction: 'owner' });
+    }
+    layout.set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    policies.set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
+    // Past both scans, the port is on no list: an empty one is not the room's.
+    expect(readDockGates()).toEqual({});
+    expect(readDockGatesIfComplete()).toBeNull();
+
+    const many = new Y.Doc();
+    bindDoorPolicy(many);
+    for (let i = 0; i < 257; i++) {
+      const id = `d:port${String(i).padStart(4, '0')}`;
+      many.getMap('doorLayout').set(id, { id, wall: 'y+', lateral: 0, placed: true });
+      many.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner', adapter: true, gate: 1 + (i % MAX_GATE) });
+    }
+    expect(Object.keys(readDockGates())).toHaveLength(256);
+    expect(readDockGatesIfComplete()).toBeNull();
   });
 
   it('takes the lowest number free in the station', () => {

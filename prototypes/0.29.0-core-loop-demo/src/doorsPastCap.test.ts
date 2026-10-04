@@ -14,7 +14,7 @@ import {
   writeDoorRecordTo,
 } from './doorsDoc';
 import type { DoorRecord } from './doorsDoc';
-import { harvestIntoAtlas, readAtlas } from './stationAtlas';
+import { MAX_DOORS_PER_ENTRY, harvestIntoAtlas, readAtlas } from './stationAtlas';
 import { isBoltedIntoStation, planTrim } from './stationKeeping';
 import { currentStation, registerStation, setStationRoomSource, stationForRoom } from './stations';
 
@@ -149,5 +149,16 @@ describe('the atlas harvest, its doors map flooded', () => {
     } finally {
       setStationRoomSource(() => '');
     }
+  });
+
+  it("files no more doors than an atlas entry keeps, the room's own first", () => {
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    flood();
+    writeDoorPairing('d:gangway', STATION_CORE, { farDoor: 'south' });
+    harvest(readAllDoorsWithPhysical());
+    // What the harvest wrote, before any read of the atlas trims it.
+    const filed = Object.keys(JSON.parse(store.get('ssf-station-atlas') ?? '{}').module.doors);
+    expect(filed).toHaveLength(MAX_DOORS_PER_ENTRY);
+    expect(filed[0]).toBe('d:gangway');
   });
 });

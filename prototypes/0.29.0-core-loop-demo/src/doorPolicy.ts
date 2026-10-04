@@ -240,12 +240,20 @@ const MAX_SCANNED_PORT_KEYS = 4 * MAX_PORTS;
  *  never off a DOCK at that door, which reads its own policy (gateAccessIn,
  *  dockPortFlagIn). */
 function portsIn(doc: Y.Doc, policies: Y.Map<unknown>): Array<[string, DoorPolicyRecord]> {
+  return scanPorts(doc, policies).ports;
+}
+
+/** portsIn, and whether it saw every port: not when a flood of both maps cut
+ *  the scan short, nor when the room has more ports than the port cap. */
+function scanPorts(doc: Y.Doc, policies: Y.Map<unknown>): { ports: Array<[string, DoorPolicyRecord]>; complete: boolean } {
   const layout = doc.getMap('doorLayout');
   const out = new Map<string, DoorPolicyRecord>();
+  let full = false;
   const take = (id: string): void => {
-    if (out.size >= MAX_PORTS) return;
     const p = sanitizePolicy(policies.get(id));
-    if (p.adapter) out.set(id, p);
+    if (!p.adapter) return;
+    if (out.size >= MAX_PORTS) full = true;
+    else out.set(id, p);
   };
   // A door is a valid record under its own id (doorExistsIn), which junk is
   // not: told apart here before doorExistsIn counts the whole map for it.
@@ -260,17 +268,20 @@ function portsIn(doc: Y.Doc, policies: Y.Map<unknown>): Array<[string, DoorPolic
     if (++scanned > MAX_SCANNED_PORT_KEYS) { cut = true; break; }
     if (isDoor(id)) { any = true; take(id); }
   }
+  // Every port has a policy key: a policy walk that ends finds the ports the
+  // layout walk was cut short of.
+  let complete = true;
   if (cut) {
     scanned = 0;
     for (const id of policies.keys()) {
-      if (++scanned > MAX_SCANNED_PORT_KEYS) break;
+      if (++scanned > MAX_SCANNED_PORT_KEYS) { complete = false; break; }
       if (!out.has(id) && isDoor(id)) take(id);
     }
   } else if (!any) {
     // A legacy room keeps no layout records: its doors are the cardinal ones.
     for (const id of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, id)) take(id);
   }
-  return [...out];
+  return { ports: [...out], complete: complete && !full };
 }
 
 /** ⚓🚦 Every non-open gate access of this room's ports, by door id. */
@@ -329,6 +340,27 @@ export function readDockGates(): Record<string, number> {
     if (p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;
+}
+
+/** ⚓🚦 readDockGates and readGateAccess from one port scan, or null when the
+ *  room's gates are not known: a port has no number yet (fitted before gates
+ *  existed), or the scan may have left a port out (a flood of both
+ *  peer-written maps cut it short, or more ports than a gate read lists). A
+ *  list missing a port is no list of the room's gates: the atlas harvest
+ *  would drop that gate for everyone. */
+export function readDockGatesIfComplete(): { gates: Record<string, number>; gateAccess: Record<string, GateAccessRecord> } | null {
+  if (!docAlive()) return null;
+  const { ports, complete } = scanPorts(boundDoc!, policyMap!);
+  if (!complete) return null;
+  const gates: Record<string, number> = {};
+  const gateAccess: Record<string, GateAccessRecord> = {};
+  for (const [doorId, p] of ports) {
+    if (p.gate === undefined) return null;
+    gates[doorId] = p.gate;
+    const a = accessRecord(p);
+    if (a) gateAccess[doorId] = a;
+  }
+  return { gates, gateAccess };
 }
 
 /** ⚓🚦 This room's ports that carry no gate number yet (fitted before gates
