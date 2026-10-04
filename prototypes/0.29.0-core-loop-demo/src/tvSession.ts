@@ -119,7 +119,8 @@ const lastPower = new Map<string, SeenPower>();
  *  across the whole off interval and beat that position over the saved one
  *  — a minute off would have parked at 63 s, not 3 s. */
 function parkIfPowerReturned(id: string): void {
-  const on = readPower(id).on;
+  const power = readPower(id);
+  const on = power.on;
   const epoch = tvDocEpoch();
   const was = lastPower.get(id);
   const same = was !== undefined && was.epoch === epoch;
@@ -129,7 +130,12 @@ function parkIfPowerReturned(id: string): void {
   if (owed !== null && (!on || programme.state !== 'playing' || programme.jump !== owed)) owed = null;
   if (owed !== null && iHoldRemote(id)) {
     lastPower.set(id, { on, epoch, owed: null }); // before the write: its notify re-enters here
-    tvPause(id, programme.positionMs);
+    // Where the room WAS switched off: the presser's own reading, carried
+    // by the switch (tvDoc `parkMs`) — not this page's last heartbeat,
+    // which a holder asleep before the press would have left minutes
+    // behind the room. The heartbeat is the fallback for a switch that
+    // carried no reading (a record from before the field).
+    tvPause(id, power.parkMs > 0 ? power.parkMs : programme.positionMs);
     return;
   }
   lastPower.set(id, { on, epoch, owed });
