@@ -186,7 +186,10 @@ class HtmlVideoPlayerAdapter implements Adapter {
   blocked = false;
   private readonly readyTimer: number;
 
-  constructor(host: HTMLElement, url: string, onFail: (why: string) => void, private onBlocked: () => void) {
+  constructor(
+    host: HTMLElement, url: string, onFail: (why: string) => void,
+    private onBlocked: () => void, private onUnblocked: () => void = () => undefined,
+  ) {
     const v = document.createElement('video');
     v.src = url;
     v.playsInline = true;
@@ -202,16 +205,30 @@ class HtmlVideoPlayerAdapter implements Adapter {
       if (v.readyState < 1) onFail('The file did not start loading (no metadata after 20 s)');
     }, MEDIA_READY_TIMEOUT_MS);
     v.addEventListener('loadedmetadata', () => window.clearTimeout(this.readyTimer), { once: true });
+    // Sound got through after all (a tap anywhere on the page, the next
+    // play()): the TAP TO PLAY notice has nothing left to say.
+    v.addEventListener('playing', () => this.unblock());
     host.appendChild(v);
     this.video = v;
   }
   isReady(): boolean { return this.video.readyState >= 1; }
   isPlaying(): boolean { return !this.video.paused && !this.video.ended; }
   isEnded(): boolean { return this.video.ended; }
+  private unblock(): void {
+    if (!this.blocked) return;
+    this.blocked = false;
+    this.onUnblocked();
+  }
   play(): void {
     const p = this.video.play();
     if (p && typeof p.catch === 'function') {
-      p.then(() => { this.blocked = false; }).catch(() => {
+      p.then(() => this.unblock()).catch((err: unknown) => {
+        // Only a refusal for want of a gesture is "blocked". A play() the
+        // controller itself interrupted — a pause() while the element was
+        // still buffering — rejects with AbortError, and that is no
+        // refusal: TAP TO PLAY over a programme deliberately paused would
+        // be wrong, and would stay over the picture after the next play.
+        if ((err as { name?: unknown } | null)?.name !== 'NotAllowedError') return;
         this.blocked = true;
         this.onBlocked();
       });
@@ -329,7 +346,13 @@ export function tvTheatreItemId(): string | null {
 
 export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
   if (theatre && theatre.itemId !== itemId) closeTvTheatre();
-  if (theatre) return;
+  if (theatre) {
+    // Already up on this set — the phone's WATCH after a hand-over put the
+    // phone above it and is hiding the phone again: take focus back, or it
+    // stays on the phone's offscreen control and answers Enter there.
+    theatre.root.focus();
+    return;
+  }
   const root = document.createElement('div');
   root.id = 'tv-theatre';
   root.setAttribute('role', 'dialog');
@@ -551,6 +574,9 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
         hideNotice(t);
         t.player?.play();
       });
+    }, () => {
+      // The browser let the sound through after all: the notice comes down.
+      if (live() && !t.notice.hidden && t.notice.querySelector('[data-tv-tap]')) hideNotice(t);
     }));
     return;
   }

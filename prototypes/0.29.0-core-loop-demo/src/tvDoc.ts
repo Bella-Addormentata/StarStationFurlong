@@ -110,6 +110,13 @@ export interface TvProgramme {
    *  publishes where its own player is; a lookup started under an older
    *  revision is void. */
   jump: number;
+  /** Where the media ends, in ms, as the holder's player reported it for
+   *  THIS programme (tvNoteEnd) — 0 until a player knows, and for a live
+   *  stream. It travels with the record so that a holder handed the remote
+   *  with no theatre open (a page that never watched the file) still ends
+   *  the programme where the media does (tvSession's headless beat). Never
+   *  a sample: writing it bumps neither `seq` nor `jump`. */
+  endMs: number;
   /** The holder's name on the sample, for the screen's "with <name>" line. */
   history: TvHistoryEntry[];
 }
@@ -147,6 +154,7 @@ export const TV_DEFAULT_PROGRAMME: TvProgramme = {
   seq: 0,
   started: 0,
   jump: 0,
+  endMs: 0,
   history: [],
 };
 
@@ -217,6 +225,39 @@ interface SeenLease {
 }
 const seenLeases = new Map<string, SeenLease>();
 
+/** This page's own waking, as the room tick marks it (tvSession, every
+ *  tick). A gap in the marks is a suspension — a closed lid, a frozen tab,
+ *  a throttled background page — and nothing that applied in it was SEEN
+ *  in it: an update the network held for the whole sleep lands on waking
+ *  stamped "now", and a lapse judged from that stamp would give a hand-over
+ *  handed an hour ago a fresh eight seconds, claimed on waking over whoever
+ *  took the remote meanwhile. So a lease that lands after a gap, or in the
+ *  moment after it (the queued updates may apply before or after the first
+ *  tick back), is stamped with the last mark BEFORE the gap: the latest
+ *  moment this page can vouch it was awake to receive anything. A page
+ *  that never marks (no room tick running) stamps every lease on arrival,
+ *  as before. */
+export const TV_SUSPEND_GAP_MS = 2_500;
+export const TV_WAKE_WINDOW_MS = 1_000;
+let awakeAt = -Infinity;
+let preGapAwake = -Infinity;
+let wakeWindowUntil = -Infinity;
+export function markTvPageAwake(now = clock()): void {
+  if (awakeAt !== -Infinity && now - awakeAt > TV_SUSPEND_GAP_MS) {
+    preGapAwake = awakeAt;
+    wakeWindowUntil = now + TV_WAKE_WINDOW_MS;
+  }
+  awakeAt = now;
+}
+/** The moment a lease landing now counts as seen: now, unless this page
+ *  was not awake to see it — then the last moment it provably was. */
+function receiptStamp(now: number): number {
+  if (awakeAt === -Infinity) return now;
+  if (now - awakeAt > TV_SUSPEND_GAP_MS) return awakeAt;
+  if (now <= wakeWindowUntil) return preGapAwake;
+  return now;
+}
+
 function notify(changedKeys?: Set<string>): void {
   for (const listener of [...listeners]) {
     try {
@@ -251,7 +292,7 @@ function noteSamples(keys: Iterable<string>): void {
   for (const key of keys) {
     if (key.startsWith('remote:')) {
       const itemId = key.slice(7);
-      seeLease(itemId, readRemote(itemId), now);
+      seeLease(itemId, readRemote(itemId), receiptStamp(now));
       continue;
     }
     if (!key.startsWith('tv:')) continue;
@@ -270,6 +311,9 @@ export function bindTvDoc(doc: Y.Doc): void {
   tvMap = doc.getMap('tv');
   samples.clear();
   seenLeases.clear();
+  awakeAt = -Infinity; // a fresh doc: the room tick marks the waking anew
+  preGapAwake = -Infinity;
+  wakeWindowUntil = -Infinity;
   tvMap.observe((event) => {
     noteSamples(event.keysChanged);
     notify(event.keysChanged);
@@ -445,6 +489,7 @@ export function readProgramme(itemId: string): TvProgramme {
     seq: counter(raw.seq),
     started: counter(raw.started),
     jump: counter(raw.jump),
+    endMs: Math.max(0, Math.floor(num(raw.endMs))),
     history,
   };
 }
@@ -512,7 +557,7 @@ function seeLease(itemId: string, rec: RemoteRecord, now: number): SeenLease {
 export function remoteLapsed(itemId: string, now = clock()): boolean {
   const rec = readRemote(itemId);
   if (!rec.holder) return true;
-  const seen = seeLease(itemId, rec, now);
+  const seen = seeLease(itemId, rec, receiptStamp(now));
   return now - seen.at >= TV_LEASE_LAPSE_MS;
 }
 
@@ -651,6 +696,7 @@ export function tvPlay(itemId: string, source: TvSource, now = wallClock()): TvA
     seq: bump(rec.seq),
     started: bump(rec.seq),
     jump: bump(rec.jump),
+    endMs: 0, // a new programme: its player says where it ends
     history: withHistory(rec, clean, now),
   } satisfies TvProgramme);
   return { ok: true };
@@ -675,6 +721,7 @@ export function tvSchedule(itemId: string, source: TvSource, startAt: number, no
     seq: bump(rec.seq),
     started: bump(rec.seq),
     jump: bump(rec.jump),
+    endMs: 0,
     history: withHistory(rec, clean, now),
   } satisfies TvProgramme);
   return { ok: true };
@@ -733,13 +780,30 @@ export function tvSeek(itemId: string, positionMs: number): TvAction {
   return { ok: true };
 }
 
+/** Where the media ends, as the holder's player found out (tvSession files
+ *  it once a player of record knows): kept with the programme so a later
+ *  holder with no player of its own — handed the remote with no theatre
+ *  open — still closes the programme where the media ends. `null` is the
+ *  unbounded marker (an end that moved: a live event): 0 on the wire. Not
+ *  a sample and not a transport action: `seq` and `jump` stay. */
+export function tvNoteEnd(itemId: string, endMs: number | null): TvAction {
+  const gate = mayControl(itemId);
+  if (!gate.ok) return gate;
+  const rec = readProgramme(itemId);
+  if ((rec.state !== 'playing' && rec.state !== 'paused') || !rec.source) return { ok: false, error: 'Nothing is playing.' };
+  const wire = endMs === null || !Number.isFinite(endMs) ? 0 : Math.max(0, Math.floor(endMs));
+  if (rec.endMs === wire) return { ok: true };
+  write(tvKey(itemId), { ...rec, endMs: wire } satisfies TvProgramme);
+  return { ok: true };
+}
+
 /** Back to the home screen (the programme stays in history). */
 export function tvStop(itemId: string): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const rec = readProgramme(itemId);
   write(tvKey(itemId), {
-    ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: bump(rec.seq), jump: bump(rec.jump),
+    ...rec, source: null, state: 'home', startAt: 0, positionMs: 0, seq: bump(rec.seq), jump: bump(rec.jump), endMs: 0,
   } satisfies TvProgramme);
   return { ok: true };
 }

@@ -300,6 +300,32 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'home', source: null });
   });
 
+  it('the end the holder\'s player learned travels with the remote: handed to a page that never watched, with no theatre open, the new holder still ends the programme where the media does', () => {
+    setTvPageId('A');
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    const started = readTv(TV).started;
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, started: () => started, endMs: () => 30_000 });
+    run(1_000); // the end is noted here, and filed in the record for whoever holds the remote next
+    expect(readTv(TV).endMs).toBe(30_000);
+    tvHeartbeat(TV, 25_000);
+    unregister();
+    handRemote(TV, 'BBBBbob', 'Bob');
+    // Bob's page: another identity, another page, no player of record, and
+    // nothing remembered of this film — forgetTv clears what this test's
+    // shared module memory knows for the set, as a fresh page knows nothing.
+    setTvIdentity(() => ({ pub: 'BBBBbob', name: 'Bob' }));
+    setTvPageId('B');
+    forgetTv(TV);
+    run(500); // Bob's first tick claims the hand-over and beats headlessly
+    expect(iHoldRemote(TV)).toBe(true);
+    expect(readTv(TV).state).toBe('playing'); // 25.5 s
+    run(3_000);
+    expect(readTv(TV).state).toBe('playing'); // 28.5 s
+    run(3_000);
+    expect(readTv(TV)).toMatchObject({ state: 'home', source: null }); // past 30 s: over, from the end the record carried
+  });
+
   it('leaving disarms the drive at once: a tick during the leave\'s flush claims and beats nothing until the next room arms it', () => {
     setTvIdentity(() => ({ pub: 'BBBBgiver', name: 'Giver' }));
     pickUpRemote(TV);
