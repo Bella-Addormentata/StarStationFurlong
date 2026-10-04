@@ -472,6 +472,8 @@ describe('startShipRoute', () => {
     startShipRoute({ now: T0, startStop: 0, pilot: 'robot', fuel: 50, capacity: CAP });
     expect(updates.n).toBe(1);
     expect(info.get('minClient')).toBe(ROUTE_MIN_CLIENT);
+    // v0.38.0 shipped without ferry routes: a client of it is asked to update.
+    expect(raisedMinClient('0.38.0', ROUTE_MIN_CLIENT)).toBe(ROUTE_MIN_CLIENT);
 
     bindShipDoc(new Y.Doc());
     const later = shipDocHandle()!.doc.getMap('roomInfo');

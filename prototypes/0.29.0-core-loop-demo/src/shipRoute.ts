@@ -844,8 +844,9 @@ export function writeShipRoute(route: ShipRoute | null): boolean {
 // routes, in its own transaction. Advisory only: no client refuses on it
 // yet, it is never lowered, and a room with no route never gets it.
 
-/** The first release that reads ferry routes (the one after v0.37.0). */
-export const ROUTE_MIN_CLIENT = '0.38.0';
+/** The first release that reads ferry routes: v0.38.0 shipped (2026-09-27)
+ *  without them, so the one after it. */
+export const ROUTE_MIN_CLIENT = '0.39.0';
 
 function versionParts(v: unknown): [number, number, number] | null {
   if (typeof v !== 'string' || v.length > 32) return null;
