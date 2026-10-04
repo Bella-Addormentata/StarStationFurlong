@@ -6,6 +6,7 @@
 import * as THREE from "three";
 import "./style.css";
 import { updateDebugHUD, showHint } from "./hud";
+import { renderWithFarPass } from "./farOrbitView";
 import type { World } from "./world";
 import type { DoorId } from "./doors";
 import type { InputManager } from "./input";
@@ -9970,8 +9971,10 @@ function animate() {
     }
   }
 
-  // Render — camera stays locked except for the rig's 45° view detents
-  renderer.render(scene, camera);
+  // Render — camera stays locked except for the rig's 45° view detents. In
+  // space the far pass draws the planet and distant traffic behind the
+  // station (farOrbitView.ts); elsewhere this is one plain render.
+  renderWithFarPass(renderer, scene, camera);
 }
 
 /**

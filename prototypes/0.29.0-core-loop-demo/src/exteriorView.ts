@@ -32,7 +32,7 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
-import { planetForRoom } from "./stations";
+import { refreshFarPass, setFarPassActive } from "./farOrbitView";
 import type { AtlasDoor } from "./stationAtlas";
 import {
   buildConnectorChain,
@@ -439,32 +439,9 @@ function buildGroup(): THREE.Group {
     }
   }
 
-  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell — the
-  // planet the CURRENT station orbits (stations.ts; Sovereign when unknown).
-  const orbited = planetForRoom(currentRoomId);
-  const planet = new THREE.Mesh(
-    new THREE.SphereGeometry(42, 48, 32),
-    new THREE.MeshStandardMaterial({
-      color: orbited.color,
-      roughness: 0.9,
-      metalness: 0.05,
-      emissive: orbited.emissive,
-      emissiveIntensity: 0.5,
-    }),
-  );
-  planet.position.set(6, -62, 26);
-  g.add(planet);
-  const atmo = new THREE.Mesh(
-    new THREE.SphereGeometry(43.6, 48, 32),
-    new THREE.MeshBasicMaterial({
-      color: orbited.atmosphere,
-      transparent: true,
-      opacity: 0.1,
-      side: THREE.BackSide,
-    }),
-  );
-  atmo.position.copy(planet.position);
-  g.add(atmo);
+  // 🌍 The planet is no longer hung below the station here: it sits off the
+  // station's −X, level with the floor (orbits.ts's planet frame), drawn by
+  // the far pass (farOrbitView.ts) with the other stations and ships.
 
   return g;
 }
@@ -754,6 +731,7 @@ export function refreshExteriorView(): void {
   }
   group = buildGroup();
   scene?.add(group);
+  refreshFarPass();
   renderToolbar();
   applyExteriorZoom(); // the known station may have grown — reframe
 }
@@ -774,6 +752,7 @@ export function tickExterior(_dt: number): void {
 export function setExteriorActive(on: boolean): void {
   if (on === active) return;
   active = on;
+  setFarPassActive(on);
   // 🧹 First descent from space ⇒ the player is IN the room: reveals the
   // room-only HUD (the SpacePhone tip's body.in-room gate). Sticky by
   // design — later trips to space re-hide via body.exterior-active.
