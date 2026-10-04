@@ -2768,4 +2768,14 @@ describe('🎚️ trims per altitude base in the replay', () => {
     expect(run.trims.find((t) => t.base === undefined)).toMatchObject({ dRadiusKm: TRIM_STEP_KM });
     expect(run.trims).toHaveLength(2);
   });
+
+  it('a burn whose planet id spells out another orbit never stands in for that orbit\'s trim', () => {
+    const base = { radiusKm: 8000, phase0: 0 };
+    const on = (at: number): TrimBurn => ({ planetId: SOV, slot: 0, base, dir: 'raise', at, fuel: 1 });
+    // `${SOV}:0:8000`, slot 0, no base once read as the same orbit as SOV,
+    // slot 0, on base 8000/0, and its burn replaced that trim.
+    const odd: TrimBurn = { planetId: `${SOV}:0:8000`, slot: 0, dir: 'raise', at: T0 + 3 * HOUR, fuel: 1 };
+    const run = replayBurns([on(T0 + HOUR), on(T0 + 2 * HOUR), odd, on(T0 + 4 * HOUR)]);
+    expect(run.trims.find((t) => t.planetId === SOV)).toMatchObject({ dRadiusKm: 3 * TRIM_STEP_KM, base });
+  });
 });

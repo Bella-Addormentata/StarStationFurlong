@@ -586,7 +586,7 @@ function lastFiredPerOrbit(fired: readonly FiredBurn[]): FiredBurn[] {
   const last = new Map<string, FiredBurn>();
   for (const b of fired) {
     if (planetById(b.planetId).id !== b.planetId) continue;
-    const orbit = `${b.planetId}:${b.slot}${b.base ? `:${b.base.radiusKm}:${b.base.phase0}` : ''}`;
+    const orbit = orbitKey(b);
     const kept = last.get(orbit);
     // Of two at the same time, the first: the one readBurnFiring picks.
     if (!kept || b.at > kept.at) last.set(orbit, b);
@@ -814,7 +814,8 @@ export type BurnCeiling = (capacity: number) => number;
  *  them: a late burn from the orbit a station left never replaces, or starts
  *  a line over, the trim of the one it flies now. */
 function orbitKey(b: Pick<OrbitTrim, 'planetId' | 'slot' | 'base'>): string {
-  return `${b.planetId}:${b.slot}${b.base ? `:${b.base.radiusKm}:${b.base.phase0}` : ''}`;
+  // A tuple, so no planet id (which may hold ':') reads as another orbit.
+  return JSON.stringify(b.base ? [b.planetId, b.slot, b.base.radiusKm, b.base.phase0] : [b.planetId, b.slot]);
 }
 
 /** The trims a settlement keeps: one per orbit a station can take here, the
