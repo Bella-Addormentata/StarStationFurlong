@@ -31,7 +31,7 @@ import {
   seaCorner, roomDoorPoints, itemOccupancyBox, itemAabb,
 } from "./furniture";
 import { replaceAllFurniture, readAllFurniture, addFurniture, deleteFurnitureItems, peerIdTag } from "./furnitureDoc";
-import { writeRobotConfig, type RobotRoutine } from "./robotDoc";
+import { clearRobotConfig, readRobotConfig, writeRobotConfig, type RobotRoutine } from "./robotDoc";
 import { roomHalfExtents } from "./floorPlanDoc";
 import { doorSetIsAuthoritative } from "./doorLayoutDoc";
 import { PLAYER_R } from "./player";
@@ -819,10 +819,23 @@ function configureTemplateDocks(t: RoomTemplate, items: readonly FurnitureItem[]
   });
 }
 
+/** 🔧 A layout about to replace the room's drops every charging dock it
+ *  doesn't keep: a robot of one taking a module apart leaves the job first,
+ *  while its dock is still placed, so the work it did is kept (editMode's
+ *  REMOVE does the same for one dock). A dock is kept only by a dock of the
+ *  same id: an id the layout gives a piece of another kind drops it too. */
+function releaseDroppedDocks(next: readonly FurnitureItem[]): void {
+  const kept = new Set(next.filter((i) => i.kind === "charging-dock").map((i) => i.id));
+  for (const [id, rec] of readAllFurniture()) {
+    if (rec.kind === "charging-dock" && !kept.has(id) && readRobotConfig(id)?.routine === "disassemble") clearRobotConfig(id);
+  }
+}
+
 export function applyRoomTemplate(id: string): RoomTemplate | null {
   const t = findTemplate(id);
   if (!t) return null;
   const items = templateItemsFor(t);
+  releaseDroppedDocks(items);
   replaceAllFurniture(items);
   configureTemplateDocks(t, items, items.map((i) => i.id));
   // 🌌 …and the room IS this now: stamping the theme makes the change
@@ -946,6 +959,7 @@ export function seedRoomTemplate(id: string): boolean {
   const t = findTemplate(id);
   if (!t) return false;
   const items = templateItemsFor(t);
+  releaseDroppedDocks(items);
   replaceAllFurniture(items);
   configureTemplateDocks(t, items, items.map((i) => i.id));
   return true;

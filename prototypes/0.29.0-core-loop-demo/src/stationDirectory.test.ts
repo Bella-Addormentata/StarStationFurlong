@@ -31,6 +31,7 @@ import {
 } from './stationDirectory';
 import { planTransfer } from './orbits';
 import { isFlightRecord } from './shipDoc';
+import type { StationMove } from './stations';
 
 afterEach(() => { setStationDirectory(null); setStationRoomCheck(null); });
 
@@ -139,6 +140,13 @@ describe('the station record as destinations', () => {
     expect(out[3].berth).toBeUndefined();
   });
 
+  it('names every berth room, even ones this client holds no seed for', () => {
+    const gated = [{ ...records[1], berths: [{ roomId: 'mod-2', doorId: 'north', gate: 1 }, { roomId: 'mod-9', doorId: 'east', gate: 2 }] }];
+    const [out] = destinationsFromRecords(gated, (rid) => seeds[rid]);
+    expect(out.berths?.map((b) => b.address)).toEqual(['seed-mod']);
+    expect(out.berthRooms).toEqual(['mod-2', 'mod-9']);
+  });
+
   it('works as the live directory', () => {
     setStationDirectory(directoryFromStationRecords(() => records, (rid) => seeds[rid], () => 'furlong-station'));
     expect(destinationsFrom('furlong-station').map((s) => s.id)).toEqual(['station:mod-2', 'far', 'odd']);
@@ -233,6 +241,29 @@ describe('planning a hop', () => {
     expect(planHop('furlong-station', 'furlong-station', 1000)).toBeNull();
     expect(planHop('furlong-station', 'nowhere', 1000)).toBeNull();
     expect(planHop('nowhere', 'high-orbit', 1000)).toBeNull();
+  });
+
+  it('refuses a flat hop a station move cuts into, by the times the flight record keeps', () => {
+    const now = 1000.5;
+    const move = (over: Partial<StationMove>): StationMove => ({
+      stationId: 'a', welcomeRoomId: 'ra', fromPlanetId: 'p1', fromSlot: 0, toPlanetId: 'p2', toSlot: 0,
+      departAt: 5000, arriveAt: 90_000, mode: 'thrusters', fuel: 1, fuelDrawn: 1, ...over,
+    });
+    const hop = (from: Partial<StationDestination>, to: Partial<StationDestination>) => {
+      setStationDirectory({ stations: () => [station('a', 'p1', from), station('b', 'p1', to)] });
+      return planHop('a', 'b', now);
+    };
+    // No move: a flat hop that leaves now, in whole milliseconds.
+    expect(hop({}, {})).toEqual({ departAt: 1001, arriveAt: 1001 + TRAVEL_MS_MIN, fuelCost: 10 });
+    // The source between planets, or the destination leaving before the ship gets there.
+    expect(hop({ move: move({ departAt: 0 }) }, {})).toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 30_000 }) })).toBeNull();
+    // The source leaving the very millisecond the rounded burn does.
+    expect(hop({ move: move({ departAt: 1001 }) }, {})).toBeNull();
+    // Leaving after the burn, the destination after the arrival, or a move that goes nowhere: fine.
+    expect(hop({ move: move({ departAt: 1002 }) }, {})).not.toBeNull();
+    expect(hop({}, { move: move({ stationId: 'b', welcomeRoomId: 'rb', departAt: 1002 + TRAVEL_MS_MIN }) })).not.toBeNull();
+    expect(hop({ move: move({ toPlanetId: 'p1', departAt: 1000, arriveAt: 1001 }) }, {})).not.toBeNull();
   });
 
   it('refuses a hop that would burn a negative amount of fuel', () => {

@@ -6,7 +6,7 @@
 
 import * as THREE from "three";
 // 🚪↦ One-way door policy reads (hint flavor + the arrival turnstile).
-import { readDoorPolicy } from "./doorPolicy";
+import { readDockGates, readDoorPolicy } from "./doorPolicy";
 import { setLocalPresence } from "./localPresence";
 import {
   physicalDoorPose, physicalDoorPoseOrNull, setDoorRecords, isCardinalDoorId, poseFromWall,
@@ -43,8 +43,26 @@ import {
 } from "./crapsCroupier";
 import { spawnFixedBubble } from "./chatBubbles";
 import { speakRobotLine } from "./robotVoice";
-import { readRobotConfig, subscribeRobot } from "./robotDoc";
+import {
+  finishDisassemblyJob, raiseDisassemblyLabor, readDisassemblyJobs, readDisassemblyJobsIfComplete, readRobotConfig, subscribeRobot,
+} from "./robotDoc";
 import type { RobotRoutine } from "./robotDoc";
+import {
+  disassemblyCandidates,
+  doorsJoinedTo,
+  jobAnnouncement,
+  jobDueAt,
+  jobFraction,
+  laborHoursFor,
+  removalBlocker,
+  type CandidateInput,
+  type DisassemblyCandidate,
+  type DisassemblyJob,
+  type JobAnnouncement,
+} from "./disassembly";
+// 🚀 The robot captain (robot pilot routes §2a): where a Ship pilot robot
+// stands and what it announces, from the ship's shared timetable.
+import { pilotLine, pilotPost, pilotSpeechAfter, readPilotView, type PilotSpeech } from "./shipPilot";
 import type { StandSlot } from "./furniture";
 import { getDefaultRoomId } from "./identity";
 import {
@@ -80,16 +98,19 @@ import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
+  readAllDoorsIfComplete,
   writeDoorPairing,
   readPhysicalDoors,
   deleteDoorPairing,
   reapOrphanPairings,
+  transactDoorWrites,
+  writeDoorTombstone,
   type DoorRecord,
 } from "./doorsDoc";
 import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./floorPlanDoc";
 import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
-import { roomIdFromSeed, atlasLayout, readAtlas } from "./stationAtlas";
+import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled, sharedRoomsNaming } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
 import { steersStation } from "./stationKeeping";
 import { createStationHelmUI } from "./stationHelm";
@@ -132,8 +153,11 @@ import {
   createCoinPusherUI,
   createRobotDockUI,
   createCloneVatUI,
+  createDeparturesBoardUI,
+  readDepartureScreen,
   readLiveRoomStatus,
 } from "./devices";
+import { boardGate } from "./departuresDoc";
 import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
@@ -168,7 +192,7 @@ import {
   registerAirHockeyVisual,
 } from "./airHockeySession";
 import { deviceFocus } from "./deviceFocus";
-import { roomEdit, canEditRoom } from "./editMode";
+import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
 import { showHint } from "./hud";
 // 🎉 Party props: the focused panels and the doc the moment lives in.
 import {
@@ -176,7 +200,7 @@ import {
   type PartyDeviceDeps,
 } from "./partyUI";
 import { getIdentityPub } from "./keypair";
-import { getPlayerName } from "./identity";
+import { getPlayerId, getPlayerName } from "./identity";
 import { listContacts, getContact } from "./contacts";
 // 📺 #186: the smart TV — its focused panel, the theatre, the room tick, the
 // screen view the prop draws.
@@ -309,6 +333,14 @@ export class World {
   private robotQuietUntil = 0;
   /** Edge detector for the player-entered-the-room moment (see above). */
   private hadActivePlayer = false;
+  /** 🚀 The robot captain's lines said, per charging-dock robot (local,
+   *  like the robot: each rider's copy speaks for itself), and the
+   *  countdown (s) to the next reading of the timetable. */
+  private pilotSpeech = new Map<string, PilotSpeech>();
+  private pilotTimer = 0;
+  /** 🔧 The job, and the last tenth of it, each Disassemble robot
+   *  announced (local, like the captain's lines). */
+  private disassemblySaid = new Map<string, JobAnnouncement>();
   /** 🤖 #77B croupier: wall-clock ms of the last operator heartbeat write, and
    *  the last narration beat spoken per table (edge-detect one bubble per beat). */
   private croupierLastBeatAt = 0;
@@ -372,6 +404,17 @@ export class World {
    * completed, never failed, never disposed).
    */
   public isTransitBusy: (() => boolean) | null = null;
+  /**
+   * 🗺️ #192: the holotable's BEAM INTO, wired by main.ts like
+   * onAdapterTransit. `roomPassFor` names the pass this install holds for a
+   * room (none: no beam); `onBeamInto` enters a room by its pass, the ACCESS
+   * beam, so the table reaches no room the ACCESS app couldn't. It runs at
+   * the click, with `afterStepBack` to beam once the table has let you go.
+   */
+  public roomPassFor: ((roomId: string) => string | undefined) | null = null;
+  public onBeamInto:
+    | ((seed: string, afterStepBack: (go: () => void) => void) => void)
+    | null = null;
   /**
    * Persistent gangway vestibules, one per PAIRED door (#51). Spawned the
    * frame a door's pairing completes, resting lightly translucent and
@@ -873,6 +916,7 @@ export class World {
           side: THREE.BackSide,
         }),
       );
+      glow.name = "ambientPlanetGlow";
       glow.position.copy(ambient.position);
       this.platformGroup.add(glow);
     }
@@ -3931,6 +3975,14 @@ export class World {
       this.robotQuietUntil = performance.now() + 1000;
     }
     this.hadActivePlayer = !!activePlayer;
+    // 🚀 Ship pilot robots: re-read the ship's timetable twice a second
+    // (where the captain stands, what it says) — never per frame.
+    this.pilotTimer -= deltaTime;
+    if (this.pilotTimer <= 0) {
+      this.pilotTimer = World.PILOT_TICK_SECS;
+      this.updateShipPilots();
+      this.updateDisassembly();
+    }
     for (const bot of this.robots.values()) bot.update(deltaTime, activePlayer);
 
     this.updateCoachFollow(deltaTime, activePlayer, zoomLevel === 1);
@@ -3963,8 +4015,12 @@ export class World {
       if (this.screenStatusTimer >= 1.0) {
         this.screenStatusTimer = 0;
         const status = readLiveRoomStatus();
-        for (const screen of this.wallScreens.values()) {
-          screen.updateStatus(status);
+        for (const [itemId, screen] of this.wallScreens) {
+          // 🚏📋 A departures board adds its own rows (its gate setting is
+          // its own); the plain terminal's status carries none.
+          screen.updateStatus(
+            screen.departures ? { ...status, departures: readDepartureScreen(itemId) } : status,
+          );
         }
       }
     }
@@ -5187,6 +5243,8 @@ export class World {
     if (this.robotsPatrol !== waiterPatrol) {
       for (const bot of this.robots.values()) bot.dispose();
       this.robots.clear();
+      this.pilotSpeech.clear(); // 🚀 fresh robots, fresh announcements
+      this.disassemblySaid.clear();
       this.robotsPatrol = waiterPatrol;
       // 🔇 Fresh room: hold every robot line for the first second (owner
       // request — no greeting barked mid-load/entry; the class opens its
@@ -5251,6 +5309,261 @@ export class World {
     spawnFixedBubble(anchorId, text, x, z, ROBOT_BUBBLE_Y);
     speakRobotLine(text, x, z);
     return true;
+  }
+
+  /** 🚀 How often (s) the Ship pilot robots re-read the timetable. */
+  private static readonly PILOT_TICK_SECS = 0.5;
+  /** 🚀 How far inside the berth door the captain stands to announce. */
+  private static readonly PILOT_DOOR_STANDOFF = 1.8;
+  /** 🚀 How far to the side of the helm's stand the captain stands. */
+  private static readonly PILOT_HELM_SIDESTEP = 0.8;
+
+  /**
+   * 🚀 The robot captain (robot pilot routes, design §2a; shipPilot.ts).
+   * Every 'pilot' robot is pointed at its post: the running route's captain
+   * (route.robotDockId) goes to the helm or the berth door as the ship's
+   * timetable says (shipPilot.pilotPost); any other pilot robot waits on its
+   * dock. The captain's announcements (shipPilot.pilotLine) go through
+   * robotSay like every robot line, and are marked said only once
+   * delivered. A parked captain stays on its dock and says nothing (the
+   * ferry keeps its timetable). Local to this game, never synced.
+   */
+  private updateShipPilots(): void {
+    let any = false;
+    for (const key of this.robots.keys()) {
+      if (readRobotConfig(key)?.routine === "pilot") {
+        any = true;
+        break;
+      }
+    }
+    if (!any) {
+      this.pilotSpeech.clear();
+      return;
+    }
+    const now = Date.now();
+    // The route's end is still read (and said from the berth door) for a
+    // while once STOP or the fuel has finished the route.
+    let view: ReturnType<typeof readPilotView> = null;
+    try {
+      view = readPilotView(now);
+    } catch (err) {
+      console.warn("[pilot] timetable read failed:", err);
+    }
+    for (const [key, bot] of this.robots) {
+      const cfg = readRobotConfig(key);
+      if (cfg?.routine !== "pilot") {
+        bot.setPilotPost(null);
+        this.pilotSpeech.delete(key);
+        continue;
+      }
+      const captain = view && view.route.robotDockId === key ? view : null;
+      // A parked pilot's post is its dock (PoolWaiter.update also parks it
+      // before the pilot branch), so none is handed over.
+      const post = cfg.parked === true ? null : pilotPost(captain?.f ?? null, now);
+      const door = captain ? this.pilotDoorPost(captain.route.shipPort) : null;
+      bot.setPilotPost(
+        post === "helm" ? (this.pilotHelmPost() ?? door) : post === "door" ? door : null,
+      );
+      if (!captain || cfg.parked === true) continue;
+      const mem = this.pilotSpeech.get(key) ?? null;
+      const line = pilotLine(captain, mem);
+      if (!line) continue;
+      const p = bot.getPosition();
+      if (this.robotSay(`robotsay:${key}`, line.text, p.x, p.z)) {
+        this.pilotSpeech.set(key, pilotSpeechAfter(captain, mem, line));
+      }
+    }
+  }
+
+  /** 🚀 The captain's helm post: beside the first helm console's device
+   *  stand (a step to its side, so a player can still walk up and use the
+   *  helm), facing the console. */
+  private pilotHelmPost(): { x: number; z: number; faceAngle: number } | null {
+    const helm = FURNITURE.find((i) => FURNITURE_DEFS[i.kind]?.functions?.includes("helm"));
+    const d = helm ? findDevice(helm.id) : null;
+    if (!d) return null;
+    const side = World.PILOT_HELM_SIDESTEP;
+    const want = {
+      x: d.front.x + Math.cos(d.faceAngle) * side,
+      z: d.front.z - Math.sin(d.faceAngle) * side,
+    };
+    const cell = nearestWalkableCell(want.x, want.z, 2) ?? d.front;
+    return { x: cell.x, z: cell.z, faceAngle: d.faceAngle };
+  }
+
+  /** 🚀 The captain's berth-door post: just inside the route's dock-port
+   *  door (toward the room's middle, on walkable floor), facing the door. */
+  private pilotDoorPost(doorId: string): { x: number; z: number; faceAngle: number } | null {
+    const g = this.dockingSystem?.getDoorGroups().get(doorId);
+    if (!g) return null;
+    const dx = g.position.x;
+    const dz = g.position.z;
+    const len = Math.hypot(dx, dz);
+    const k = len > 0.01 ? Math.max(0, len - World.PILOT_DOOR_STANDOFF) / len : 0;
+    const want = { x: dx * k, z: dz * k };
+    const cell = nearestWalkableCell(want.x, want.z, 3) ?? want;
+    return { x: cell.x, z: cell.z, faceAngle: Math.atan2(dx - cell.x, dz - cell.z) };
+  }
+
+  /** 🔧 How far apart robots on the same job stand at its door. */
+  private static readonly WORK_SPACING = 0.9;
+
+  /** 🔧 What every disassembly check reads, as of now (disassembly.ts). */
+  private disassemblyInput(): CandidateInput {
+    // The room's doors read whole, or a capped read flagged as partial: a
+    // door to the module it left out would stay unsealed (removalBlocker
+    // holds the job).
+    const whole = readAllDoorsIfComplete();
+    return {
+      atlas: readAtlas(),
+      hereRoomId: World.activeRoomId(),
+      doors: whole ?? readAllDoors(),
+      ...(whole ? {} : { doorsPartial: true }),
+      ...(readDisassemblyJobsIfComplete() ? {} : { jobsPartial: true }),
+      playerId: getPlayerId(),
+      identityPub: getIdentityPub(),
+      welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
+      // What this room's visitors published of the rooms naming a module,
+      // past the ones the atlas keeps.
+      namedBy: (roomId) => sharedRoomsNaming(roomId),
+    };
+  }
+
+  /** 🔧 The modules this room's robots could take apart (the dock console). */
+  public disassemblyCandidates(): DisassemblyCandidate[] {
+    return disassemblyCandidates(this.disassemblyInput());
+  }
+
+  /**
+   * 🔧 The Disassemble robots (#192, disassembly.ts). A job whose labor has
+   * run out ends here, on the deed holder's client while they are in the
+   * room (their two tabs would write the same thing): the room's doors to
+   * the module are sealed as UNDOCK seals them, the job is marked done, and
+   * the module leaves the atlas for every map. A blocker found then (the
+   * module was joined to another meanwhile) holds it at 100% until it
+   * clears. Each robot on an open job works at that job's door, side by
+   * side with its crew, saying how far along it is, until the labor is done;
+   * then, and for any other Disassemble robot, it waits on its dock. The
+   * job's door is the one it was opened at while that still joins the
+   * module, else another door of this room that does (the first was
+   * undocked since); while none does, its robots wait on their docks, and
+   * the job ends detached when its labor is due. Run twice a second.
+   */
+  private updateDisassembly(): void {
+    const now = Date.now();
+    let jobs = readDisassemblyJobs();
+    if (jobs.length === 0) {
+      for (const [key, bot] of this.robots) {
+        if (readRobotConfig(key)?.routine === "disassemble") bot.setWorkPost(null);
+      }
+      this.disassemblySaid.clear();
+      return;
+    }
+    // Only the deed holder's client, standing in the room, ends a job: a
+    // module off the station can't be put back, so it is the deed's, not
+    // every venture shareholder's (main.ts's authority split), and the deed
+    // holder is who sets robots to a module. Their copy of the doors and the
+    // atlas is the room as it is. (The job record is peer-written, like all
+    // of the room doc: this decides what this client does, roomOwner.ts.)
+    if (this.hadActivePlayer && holdsRoomDeed()) {
+      let ended = false;
+      for (const job of jobs) {
+        const due = jobDueAt(job);
+        if (due !== null && due <= now) ended = this.finishDisassembly(job, due) || ended;
+      }
+      if (ended) jobs = readDisassemblyJobs();
+    }
+    let doorsNow: Pick<CandidateInput, "doors" | "hereRoomId"> | null = null;
+    const workDoors = new Map<string, string | null>();
+    const workDoor = (job: DisassemblyJob): string | null => {
+      if (!workDoors.has(job.roomId)) {
+        doorsNow ??= { doors: readAllDoors(), hereRoomId: World.activeRoomId() };
+        const joined = doorsJoinedTo(doorsNow, job.roomId);
+        workDoors.set(job.roomId, (joined.find((d) => d.doorId === job.doorId) ?? joined[0])?.doorId ?? null);
+      }
+      return workDoors.get(job.roomId) ?? null;
+    };
+    for (const [key, bot] of this.robots) {
+      const cfg = readRobotConfig(key);
+      if (cfg?.routine !== "disassemble") {
+        bot.setWorkPost(null);
+        this.disassemblySaid.delete(key);
+        continue;
+      }
+      const job = cfg.target ? jobs.find((j) => j.roomId === cfg.target) : undefined;
+      const slot = job ? job.crew.indexOf(key) : -1;
+      if (!job || job.finishedAt !== undefined || slot < 0) {
+        bot.setWorkPost(null);
+        this.disassemblySaid.delete(key);
+        continue;
+      }
+      // In the crew: it works at the job's door while labor is left, then
+      // waits on its dock until the module comes off (a blocker, or the
+      // deed holder away), having said it is done.
+      const fraction = jobFraction(job, now);
+      const door = fraction < 1 ? workDoor(job) : null;
+      bot.setWorkPost(door ? this.workPost(door, slot) : null);
+      // A line on starting on the job and at each tenth of it, once
+      // delivered (a robot set to another module starts over there).
+      const line = jobAnnouncement(job, fraction, this.disassemblySaid.get(key));
+      if (!line) continue;
+      const p = bot.getPosition();
+      if (this.robotSay(`robotsay:${key}`, line.text, p.x, p.z)) this.disassemblySaid.set(key, line.said);
+    }
+  }
+
+  /** 🔧 End a job whose labor ran out at `due`. True when the job changed. */
+  private finishDisassembly(job: DisassemblyJob, due: number): boolean {
+    const input = this.disassemblyInput();
+    // Nothing is decided on a capped read of the doors, not even that none
+    // joins the module now, nor of the robot records: the job holds until
+    // they read whole.
+    if (input.doorsPartial || input.jobsPartial) return false;
+    const joined = doorsJoinedTo(input, job.roomId);
+    if (joined.length === 0) {
+      // Disconnected some other way first: nothing here to take off. (Or it
+      // already came off, and a write that crossed the end reopened the job.)
+      finishDisassemblyJob(job.roomId, due, isDismantled(job.roomId) ? "removed" : "detached");
+      return true;
+    }
+    // The labor is worked out here, from the module's size, not taken from
+    // the record: a job costed below it (the module grew, or the record was
+    // written short) is raised to it and carries on.
+    const labor = laborHoursFor(input.atlas[job.roomId]?.dims);
+    if (job.laborHours < labor) {
+      raiseDisassemblyLabor(job.roomId, labor);
+      return true;
+    }
+    if (removalBlocker(input, job.roomId)) return false;
+    // One transaction of the room doc: the doors sealed, the job done and the
+    // module's tombstone in the shared atlas land together (dismantleInAtlas
+    // publishes it there, and writes our own atlas in the same step), so no
+    // reload or visitor ever finds the job ended and the module still mapped.
+    transactDoorWrites(() => {
+      for (const d of joined) writeDoorTombstone(d.doorId, d.address);
+      finishDisassemblyJob(job.roomId, due, "removed");
+      dismantleInAtlas(job.roomId, due);
+    });
+    const speaker = job.crew.map((k) => this.robots.get(k)).find((b) => b);
+    if (speaker) {
+      const p = speaker.getPosition();
+      this.robotSay(`robotsay:${job.crew[0]}`, `✅ ${job.name} is off the station.`, p.x, p.z);
+    }
+    return true;
+  }
+
+  /** 🔧 Where the `slot`th robot of a job stands: inside the job's door like
+   *  the captain's berth post, then side by side along the wall. */
+  private workPost(doorId: string, slot: number): { x: number; z: number; faceAngle: number } | null {
+    const base = this.pilotDoorPost(doorId);
+    if (!base || slot <= 0) return base;
+    const step = Math.ceil(slot / 2) * (slot % 2 === 1 ? 1 : -1) * World.WORK_SPACING;
+    const want = {
+      x: base.x + Math.cos(base.faceAngle) * step,
+      z: base.z - Math.sin(base.faceAngle) * step,
+    };
+    const cell = nearestWalkableCell(want.x, want.z, 2) ?? base;
+    return { x: cell.x, z: cell.z, faceAngle: base.faceAngle };
   }
 
   /** 🤖 #77C s3: push each dock's owner-programmed routine to its robot (an
@@ -5437,6 +5750,8 @@ export class World {
       routineOf(k) !== "custom" &&
       routineOf(k) !== "coach" && // a coach runs its class, never a table
       routineOf(k) !== "dance" && // 🎉 a dancer is on the floor, never at a table
+      routineOf(k) !== "pilot" && // 🚀 a ship pilot keeps to the helm and the berth door
+      routineOf(k) !== "disassemble" && // 🔧 a robot taking a module apart stays on the job
       (!hasDedicated || routineOf(k) === "croupier");
     const operatorPost = (
       tableId: string,
@@ -5620,6 +5935,26 @@ export class World {
       // M4: the solar map, diegetic — mounted inside the focus overlay.
       const ui = createMapTableUI({
         requestRelease: () => deviceFocus.release(),
+        // 🗺️ #192: the station atlas edits through the room's own door panels.
+        currentDoors: () =>
+          [...(this.dockingSystem?.getDoorGroups().keys() ?? [])].map((id) => ({
+            id,
+            label: doorDisplayName(id),
+          })),
+        openDoorPanel: (doorId) =>
+          deviceFocus.releaseThen(() => this.dockingSystem?.handlePanelRaycast(doorId)),
+        // ✏️ Another module of the station: the ACCESS beam takes you in,
+        // where its own door panels do the editing.
+        canBeamTo: (roomId) => !!this.onBeamInto && !!this.roomPassFor?.(roomId),
+        beamTo: (roomId) => {
+          const seed = this.roomPassFor?.(roomId);
+          const beam = this.onBeamInto;
+          if (!seed || !beam) return;
+          beam(seed, (go) => deviceFocus.releaseThen(go));
+        },
+        playerId: () => getPlayerId(),
+        identityPub: () => getIdentityPub(),
+        disassemblyCandidates: () => this.disassemblyCandidates(),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
@@ -5673,8 +6008,10 @@ export class World {
                 ports: () => ds.listDockPorts(),
                 connected: () => ds.connectedModules(),
                 subscribe: (cb) => ds.onDockChange(cb),
-                undock: (doorId) => void ds.undockPort(doorId),
-                dock: (doorId) => ds.redockPort(doorId),
+                undock: (doorId) => ds.undockPort(doorId),
+                // 🚏 A5: the DOCK's answer (docked, or why not) reaches the helm.
+                dock: (doorId) => ds.redockPortAnswer(doorId),
+                releaseAllowed: (doorId, now) => ds.farReleaseAllowed(doorId, now),
               }
             : undefined,
         );
@@ -5808,6 +6145,28 @@ export class World {
       const ui = createRobotDockUI({
         itemId: deviceId,
         canEdit: () => canEditRoom().ok,
+        holdsDeed: () => holdsRoomDeed(),
+        disassemblyCandidates: () => this.disassemblyCandidates(),
+      });
+      deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "departuresBoard") {
+      // 🚏📋 The board's console: what it shows (all gates, or one gate's
+      // ferries) and its rows now. Owner-gated like the robot console.
+      const screen = this.wallScreens.get(deviceId) ?? null;
+      const roomGates = () => Object.values(readDockGates());
+      const ui = createDeparturesBoardUI({
+        itemId: deviceId,
+        canEdit: () => canEditRoom().ok,
+        gateChoices: () => [
+          ...roomGates(),
+          ...(currentStation()?.berths ?? []).flatMap((b) => (b.gate !== undefined ? [b.gate] : [])),
+        ],
+        defaultGate: () => boardGate(null, roomGates()),
+        // Dim the in-world screen while focused, as the terminal does (D0.4).
+        onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
       deviceFocus.beginFocus(this.player, device, ui);
       return;

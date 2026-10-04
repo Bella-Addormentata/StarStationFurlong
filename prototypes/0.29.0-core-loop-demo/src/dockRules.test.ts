@@ -16,7 +16,7 @@ import {
   type ConnectorSegment,
 } from './adapter';
 import {
-  bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readAllDoors,
+  bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readAllDoors, readAllDoorsIfComplete,
   readAllDoorsFrom, readDoorFrom, transactDoorWrites, writeDoorPairing, writeDoorRecordTo,
 } from './doorsDoc';
 import { bindDoorPolicy, dockPortFlagIn, readDoorPolicy, writeDoorPolicy } from './doorPolicy';
@@ -194,6 +194,32 @@ describe('dock — the wire', () => {
     const c = read.get('d:c');
     expect(c?.paired && c.dockedAt).toBeUndefined();
     expect(c?.paired && c.segments).toBeUndefined(); // an unknown kind drops the chain
+  });
+
+  it('a snapshot that could leave a door out says so, where absence is news (readAllDoorsIfComplete)', () => {
+    const doc = new Y.Doc();
+    bindDoorsDoc(doc);
+    const doors = doc.getMap('doors');
+    // Junk never counts toward the cap.
+    doors.set('not a door key', buildDoorTombstone(seedFor(STATION)));
+    doors.set('d:junk', { paired: 'maybe' });
+    for (let i = 0; i < 64; i++) doors.set(`d:${i}`, buildDoorTombstone(seedFor(STATION)));
+    expect(readAllDoorsIfComplete()?.size).toBe(64);
+    // One more valid record: the capped snapshot may now miss any of them.
+    doors.set('north', { ...buildDoorPairing(seedFor(STATION), { segments: dockChain(), transient: true, dockedAt: 7 }) });
+    expect(readAllDoors().size).toBe(64);
+    expect(readAllDoorsIfComplete()).toBeNull();
+    // Junk costs a bounded scan: past four snapshots' worth of keys of any
+    // kind the reader stops, and cannot say that it saw every door.
+    const flooded = new Y.Doc();
+    bindDoorsDoc(flooded);
+    const map = flooded.getMap('doors');
+    map.set('north', buildDoorTombstone(seedFor(STATION)));
+    for (let i = 0; i < 255; i++) map.set(`junk ${i}`, i);
+    expect(readAllDoorsIfComplete()?.size).toBe(1);
+    map.set('junk 255', 255);
+    expect(readAllDoorsIfComplete()).toBeNull();
+    expect(readAllDoors().size).toBe(1);
   });
 
   it('writeDoorRecordTo writes the exact shape the bound reader reads back', () => {
@@ -490,6 +516,29 @@ describe('dockRules — the far end', () => {
     // A quick undock→dock: the late undock write must not undo the newer dock.
     const newer = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), dockedAt: 30 });
     expect(farUndockPatch(newer, near, 20)).toEqual({ action: 'skip', reason: 'newer-dock' });
+  });
+
+  it('UNDOCK keeps where the station across it let go, on both ends, and the wire keeps it', () => {
+    const at = 'adrift:planet-aris:3';
+    const live = buildDoorPairing(seedFor(STATION), { segments: dockChain(), farDoor: 'd:bay', dockedAt: 10 });
+    expect(berthMemoryFrom(live, 20, at)).toEqual({ farDoor: 'd:bay', undockedAt: 20, at });
+    expect(berthMemoryFrom(live, 20)).toEqual({ farDoor: 'd:bay', undockedAt: 20 });
+    const ours = buildDoorPairing(seedFor(SHIP), { segments: dockChain(), dockedAt: 10 });
+    const w = farUndockPatch(ours, near, 20, undefined, at);
+    expect(w.action === 'write' && w.record).toEqual({
+      paired: false,
+      retiredAddress: near.address,
+      dock: { farDoor: near.doorId, farWall: near.wall, farLateral: near.lateral, undockedAt: 20, at },
+    });
+    // Off the wire: a bounded string is kept as written; anything else drops,
+    // the berth memory with it intact.
+    const doc = new Y.Doc();
+    writeDoorRecordTo(doc, 'd:1', buildDoorTombstone(seedFor(STATION), { undockedAt: 20, at }));
+    expect(readDoorFrom(doc, 'd:1')).toEqual({ paired: false, retiredAddress: seedFor(STATION), dock: { undockedAt: 20, at } });
+    for (const junk of [7, '', 'x'.repeat(161)]) {
+      doc.getMap('doors').set('d:2', { paired: false, retiredAddress: seedFor(STATION), dock: { undockedAt: 20, at: junk } });
+      expect(readDoorFrom(doc, 'd:2')).toEqual({ paired: false, retiredAddress: seedFor(STATION), dock: { undockedAt: 20 } });
+    }
   });
 
   it('UNDOCK leaves the OTHER connection between the same two modules alone', () => {
