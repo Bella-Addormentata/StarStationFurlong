@@ -59,10 +59,10 @@ import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
 import { MAX_TRIM_KM } from './stationKeeping';
 import {
-  MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
+  MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, orbitChangeBase, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
   planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet,
 } from './stations';
-import type { MovingStation, OrbitChange, StationMove, StationRecord } from './stations';
+import type { MovingStation, OrbitChange, StationMove, StationOrbit, StationRecord } from './stations';
 
 export type { StationMove } from './stations';
 
@@ -110,11 +110,15 @@ function inAltitudeBand(radiusKm: number, planetId: string, slackKm: number): bo
 function orbitChangeFits(o: OrbitChange, planetId: string, slot: number, departAt: number, arriveAt: number): boolean {
   if (!inAltitudeBand(o.fromRadiusKm, planetId, MAX_TRIM_KM) || !inAltitudeBand(o.toRadiusKm, planetId, 0)) return false;
   const planet = planetById(planetId);
+  // The base it leaves: in the band, a trim away from the orbit it flies from.
+  const base = orbitChangeBase(o);
+  if (o.fromBase && (!inAltitudeBand(base.radiusKm, planetId, 0)
+    || Math.abs(base.radiusKm - o.fromRadiusKm) > MAX_TRIM_KM + 1e-6)) return false;
   // Only a change from the slot's own orbit (trimmed, perhaps) goes without a
   // claim stamp: a custom orbit it leaves is always stamped (sourceClaimOf),
   // so an unstamped one could never be weighed against other claims.
   if (o.fromSince === undefined
-    && Math.abs(o.fromRadiusKm - orbitForSlot(planet.id, slot).radiusKm) > MAX_TRIM_KM + 1e-6) return false;
+    && Math.abs(base.radiusKm - orbitForSlot(planet.id, slot).radiusKm) > MAX_TRIM_KM + 1e-6) return false;
   for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
     if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
   }
@@ -128,7 +132,8 @@ function isOrbitChangeRecord(v: unknown): v is OrbitChange {
   if (typeof v !== 'object' || v === null) return false;
   const o = v as Partial<Record<keyof OrbitChange, unknown>>;
   return isRadius(o.fromRadiusKm) && isPhase(o.fromPhase0) && isRadius(o.toRadiusKm) && isPhase(o.toPhase0)
-    && (o.fromSince === undefined || isTime(o.fromSince));
+    && (o.fromSince === undefined || isTime(o.fromSince))
+    && (o.fromBase === undefined || isStationOrbit(o.fromBase));
 }
 
 /** 🎚️ When the custom orbit an altitude change leaves was claimed (the
@@ -139,12 +144,28 @@ function sourceClaimOf(station: StationRecord): { fromSince?: number } {
   return { fromSince: isTime(since) ? since : ORBIT_EPOCH_MS };
 }
 
+/** 🎚️ The base orbit an altitude change leaves, when the trimmed orbit it
+ *  flies from (`from`) is not it (OrbitChange.fromBase). */
+function baseLeftOf(station: StationRecord, from: Pick<CircularOrbit, 'radiusKm' | 'phase0'>): { fromBase?: StationOrbit } {
+  const base = baseOrbit(station);
+  return Math.abs(base.radiusKm - from.radiusKm) < 1e-9 && Math.abs(wrapAngle(base.phase0 - from.phase0)) < 1e-12
+    ? {} : { fromBase: { radiusKm: base.radiusKm, phase0: base.phase0 } };
+}
+
 /** 🎚️ The custom orbit a station's next move keeps until it leaves (its
  *  fromOrbit), with when that orbit was claimed; nothing at its slot's own. */
 function heldOrbitOf(station: StationRecord): { fromOrbit?: NonNullable<StationMove['fromOrbit']> } {
   if (!station.orbit) return {};
   const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
   return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, since: isTime(since) ? since : ORBIT_EPOCH_MS } };
+}
+
+function clearOfOtherSlots(radiusKm: number, planetId: string, slot: number): boolean {
+  const planet = planetById(planetId);
+  for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
+    if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - radiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
+  }
+  return true;
 }
 
 function claimedByBooking(since: number | undefined, bookedAt: number): boolean {
@@ -177,7 +198,9 @@ export function isStationMove(v: unknown): v is StationMove {
       // Unstamped, it could never be weighed against other claims: only
       // the slot's own orbit (trimmed, perhaps) goes without (orbitChangeFits).
       && ((r.fromOrbit as { since?: number }).since !== undefined
-        || Math.abs(r.fromOrbit.radiusKm - orbitForSlot(r.fromPlanetId as string, r.fromSlot as number).radiusKm) <= MAX_TRIM_KM + 1e-6)))
+        || Math.abs(r.fromOrbit.radiusKm - orbitForSlot(r.fromPlanetId as string, r.fromSlot as number).radiusKm) <= MAX_TRIM_KM + 1e-6)
+      // Clear of every other slot's own orbit, as an altitude change ends.
+      && clearOfOtherSlots(r.fromOrbit.radiusKm, r.fromPlanetId as string, r.fromSlot as number)))
     // Booked no later than it leaves: one stamped after a rival arrived
     // would read as booked after it (concurrentMoves) and escape it. Only a
     // move that goes nowhere may be later: a pin is written once what it
@@ -306,6 +329,7 @@ export function cleanMove(m: StationMove): StationMove {
         fromRadiusKm: m.orbit.fromRadiusKm, fromPhase0: m.orbit.fromPhase0,
         toRadiusKm: m.orbit.toRadiusKm, toPhase0: m.orbit.toPhase0,
         ...(typeof m.orbit.fromSince === 'number' ? { fromSince: m.orbit.fromSince } : {}),
+        ...(m.orbit.fromBase ? { fromBase: { radiusKm: m.orbit.fromBase.radiusKm, phase0: m.orbit.fromBase.phase0 } } : {}),
       },
     } : {}),
     ...(m.mode !== 'orbit' && m.fromOrbit ? {
@@ -626,6 +650,7 @@ export function planStationAltitude(ctx: MoveContext, altitudeKm: number): Altit
         toRadiusKm: plan.to.radiusKm,
         toPhase0: plan.to.phase0,
         ...sourceClaimOf(station),
+        ...baseLeftOf(station, plan.from),
       },
       bookedAt: now,
       fuel: quote.fuel,

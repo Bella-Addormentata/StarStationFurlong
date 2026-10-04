@@ -53,7 +53,7 @@ import { summaryLegEnds } from './planetSummary';
 import { flightCapable, followsFlightRecord } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
-  adriftAt, adriftPlace, altitudeChangesSince, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById,
+  adriftAt, adriftPlace, altitudeChangesSince, orbitChangeBase, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById,
   planetForRoom, roomAdriftPlace, stationInTransit,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -137,7 +137,7 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
       // 🎚️ At the altitude it flew there when the ship left: the orbit an
       // altitude change since then left, else the one this move left.
       const climb = altitudeChangesSince(station, leftAt, now)[0]?.orbit;
-      const orbit = climb ? { radiusKm: climb.fromRadiusKm, phase0: climb.fromPhase0 }
+      const orbit = climb ? orbitChangeBase(climb)
         : moved.fromOrbit ? { radiusKm: moved.fromOrbit.radiusKm, phase0: moved.fromOrbit.phase0 } : undefined;
       return { id: station.id, planetId: planetById(moved.fromPlanetId).id, orbitSlot: moved.fromSlot, ...(orbit ? { orbit } : {}) };
     }
@@ -148,7 +148,7 @@ function placeOf(id: string | undefined, all: readonly StationRecord[], leftAt?:
     if (climbed) {
       return {
         id: station.id, planetId: station.planetId, orbitSlot: station.orbitSlot,
-        orbit: { radiusKm: climbed.fromRadiusKm, phase0: climbed.fromPhase0 },
+        orbit: orbitChangeBase(climbed),
       };
     }
     return station;

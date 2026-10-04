@@ -87,7 +87,7 @@ const NOW = ORBIT_EPOCH_MS + 5_000_000_000;
 const SOV_R = planetById(SOV).radiusKm;
 
 beforeEach(() => store.clear());
-afterEach(() => { setStationMoveResolver(null); unbindPlanetSummaryForTest(); });
+afterEach(() => { setStationMoveResolver(null); setAltitudeHistory(null); unbindPlanetSummaryForTest(); });
 
 const OTHER: StationRecord = { id: 'other', name: 'OTHER', planetId: SOV, orbitSlot: 1, welcomeRoomId: 'other-room' };
 
@@ -927,5 +927,54 @@ describe('Copilot round 14', () => {
     rememberMove(climbOf('c', 'c-room', 3, 6_000, late), late);
     expect(lostAltitudeClaims(readRememberedMoves()).has(altitudeMoveKey(bPin))).toBe(true);
     store.clear();
+  });
+});
+
+describe('Copilot round 15', () => {
+  it('refuses a held orbit within 50 km of another slot\'s own', () => {
+    const climbed = { ...ctx().station!, orbit: { radiusKm: SOV_R + 1_000, phase0: 0.5 } };
+    const plan = planStationMove(ctx({ station: climbed }), 'planet-aris');
+    if (!plan.ok) throw new Error(plan.refusal);
+    const slot1 = orbitForSlot(SOV, 1).radiusKm;
+    expect(isStationMove({ ...plan.move, fromOrbit: { ...plan.move.fromOrbit!, radiusKm: slot1 + 30 } })).toBe(false);
+    expect(isStationMove({ ...plan.move, fromOrbit: { ...plan.move.fromOrbit!, radiusKm: slot1 + 60 } })).toBe(true);
+  });
+
+  it('weighs and restores the base orbit a trimmed altitude change leaves, not the trim', () => {
+    setStationTrimResolverForTest((s, slot) => (s.id === DEFAULT_STATION_ID ? { radiusKm: slot.radiusKm + 10, phase0: slot.phase0 } : null));
+    try {
+      const move = climbTo(3_000);
+      const slot0 = orbitForSlot(SOV, 0);
+      expect(move.orbit!.fromRadiusKm).toBeCloseTo(slot0.radiusKm + 10, 6);
+      expect(move.orbit!.fromBase).toEqual({ radiusKm: slot0.radiusKm, phase0: slot0.phase0 });
+      expect(isStationMove(move)).toBe(true);
+      expect(cleanMove(move).orbit?.fromBase).toEqual(move.orbit!.fromBase);
+      // A base more than a trim from where it flies from is refused.
+      expect(isStationMove({ ...move, orbit: { ...move.orbit!, fromBase: { radiusKm: slot0.radiusKm + 40, phase0: 0 } } })).toBe(false);
+    } finally {
+      setStationTrimResolverForTest(null);
+    }
+    // B holds 1,000 km; A's base is 1,050 km, trimmed to 1,040 km: its
+    // source claim is clear (50 km), though the trimmed orbit is not.
+    const bHold = climbOf('b', 'b-room', 1, 1_000, NOW);
+    const plan = planOrbitChange(circularOrbit(planetById(SOV), SOV_R + 1_040, 0), SOV_R + 3_000, NOW + 100_000)!;
+    const aTry: StationMove = {
+      stationId: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId, fromPlanetId: SOV, fromSlot: 0,
+      toPlanetId: SOV, toSlot: 0, departAt: plan.departAt, arriveAt: plan.arriveAt, mode: 'orbit', bookedAt: NOW + 100_000, fuel: 5, fuelDrawn: 5,
+      orbit: {
+        fromRadiusKm: SOV_R + 1_040, fromPhase0: 0, toRadiusKm: plan.to.radiusKm, toPhase0: plan.to.phase0, fromSince: NOW + 50,
+        fromBase: { radiusKm: SOV_R + 1_050, phase0: 0.1 },
+      },
+    };
+    expect(isStationMove(aTry)).toBe(true);
+    expect(lostAltitudeClaims([bHold, aTry]).has(`${altitudeMoveKey(aTry)}|from`)).toBe(false);
+    // Aborted by a claim on its destination: back on its base, untrimmed.
+    const third = climbOf('third', 'third-room', 2, 3_020, NOW);
+    const moves: Record<string, StationMove> = { [DEFAULT_STATION_ID]: aTry, b: bHold, third };
+    setStationMoveResolver((st) => moves[st.id] ?? null);
+    const THIRD: StationRecord = { id: 'third', name: 'THIRD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'third-room' };
+    const B: StationRecord = { id: 'b', name: 'B', planetId: SOV, orbitSlot: 1, welcomeRoomId: 'b-room' };
+    const me = listStations({}, [B, THIRD], NOW + 10_000_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(me.orbit).toEqual({ radiusKm: SOV_R + 1_050, phase0: 0.1 });
   });
 });
