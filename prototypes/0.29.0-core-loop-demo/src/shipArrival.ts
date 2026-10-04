@@ -23,9 +23,12 @@ import { isDockChain } from './adapter';
 import {
   berthMemoryFrom, dockAnswerOf, stampAfter, type DockAnswer, type DockOpOptions, type DockPortState, type DockRefusal,
 } from './dockRules';
-import { readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
+import {
+  readAllDoorsIfComplete, readDoor, readPhysicalDoors, writeDoorTombstone, type DockBerthMemory, type DoorRecord,
+} from './doorsDoc';
+import { orbitForSlot, stationOrbit } from './orbits';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
-import { dockLockedByMove, stationLeftFrom } from './stationMove';
+import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
   currentRoomId, dockedStationFor, listStations, planetById, stationForRoom, stationInTransit, type StationRecord,
 } from './stations';
@@ -37,6 +40,7 @@ import {
   readFlightRecord,
   readRestPlace,
   readStationBerth,
+  undockHeld,
   writeFlightRecord,
   writeRestPlace,
   writeStationBerth,
@@ -241,8 +245,14 @@ export function arrivalBerths(input: {
   const remembered = recalled && (roomListed
     ? gates.some((b) => sameRoom(b.address, recalled.address) && (!b.farDoor || b.farDoor === recalled.farDoor))
     : true) ? recalled : null;
+  // Within a rank, gate order: the gates the memory reaches join the list
+  // after the station's own, and their numbers put them back in place (one
+  // with no number after the numbered ones, in list order).
+  const gateOrder = (b: StationBerth) => b.gate ?? Number.POSITIVE_INFINITY;
   const listed: StationBerth[] = (station.berths ?? []).length > 0
-    ? gates.map((b, i) => ({ b, i })).sort((x, y) => rank(x.b) - rank(y.b) || x.i - y.i).map((x) => x.b)
+    ? gates.map((b, i) => ({ b, i }))
+      .sort((x, y) => rank(x.b) - rank(y.b) || gateOrder(x.b) - gateOrder(y.b) || x.i - y.i)
+      .map((x) => x.b)
     : station.berth && isRoomSeed(station.berth.address) ? [station.berth] : [];
   const out: StationBerth[] = [];
   const add = (b: StationBerth) => { if (!out.some((o) => same(o, b))) out.push(b); };
@@ -349,7 +359,9 @@ function gateOf(berth: StationBerth): { gate?: number } {
  *   destination's once it has arrived), once the station has left that place;
  * - at rest (docked, by the record), where its rest record leaves it
  *   (shipDoc.RestPlace, restingPlace), once no station it rests beside is
- *   there. A docked ship with no rest record follows its station.
+ *   there (🚏 one a ferry route left in open orbit, `open`: once none is
+ *   there on that place's own orbit, untrimmed). A docked ship with no rest
+ *   record follows its station.
  * A ship in open orbit by its record is there, unless a dock has held it
  * since (docked by hand: its rest record), wherever that took it.
  */
@@ -366,13 +378,25 @@ export function shipPlaceId(
     const resting = restingPlace(rest, now, stations);
     // A dock it names still holds it (one a capped scan of the doors missed).
     if ('heldBy' in resting) return resting.heldBy ?? rec.locationId;
-    // Beside its own station, or the one it last let go of, while that is there.
-    const beside = [listed, resting.from].find((st) => isAt(st, resting.at, now));
+    // Beside its own station, or the one it last let go of, while that is
+    // there. 🚏 Left in open orbit by a ferry route, the ship is on that
+    // place's own orbit: beside a station there only while no trim moves it
+    // off that orbit, or the far view would draw the ship on the trimmed one.
+    const beside = [listed, resting.from]
+      .find((st) => isAt(st, resting.at, now) && (rest.open !== true || onSlotOrbit(st)));
     return beside ? beside.id : resting.at;
   }
-  const kept = rec.status === 'redocking' ? rec.destinationAt
+  const keptAt = rec.status === 'redocking' ? rec.destinationAt
     : rec.status === 'in-flight' ? rec.originAt
       : undefined;
+  // A flight that kept none (written before flights did, or cast off for a
+  // station not listed then): where the station left from on its first move
+  // since the ship cast off, among the moves known here, which is where it
+  // was then (as completeArrival reads it).
+  const leftAt = rec.castOffAt ?? rec.departedAt;
+  const left = keptAt === undefined && (rec.status === 'redocking' || rec.status === 'in-flight') && listed && leftAt !== undefined
+    ? stationLeftFrom(listed, leftAt, now) : null;
+  const kept = keptAt ?? (left ? adriftAt(left.planetId, left.orbitSlot) : undefined);
   if (kept === undefined || !adriftPlace(kept)) return rec.locationId;
   return isAt(listed, kept, now) ? rec.locationId : kept;
 }
@@ -385,6 +409,14 @@ function isAt(station: StationRecord | null | undefined, placeId: string, now: n
     && planetById(station.planetId).id === place.planetId && station.orbitSlot === place.orbitSlot;
 }
 
+/** Does `station` fly its slot's own orbit, with no trim moving it off it
+ *  (orbits.stationOrbit)? */
+function onSlotOrbit(station: StationRecord): boolean {
+  const flown = stationOrbit(station);
+  const slot = orbitForSlot(station.planetId, station.orbitSlot);
+  return flown.radiusKm === slot.radiusKm && flown.phase0 === slot.phase0;
+}
+
 /** Where a station orbits, as an open-orbit place. */
 function placeOf(station: StationRecord): string {
   return adriftAt(planetById(station.planetId).id, station.orbitSlot);
@@ -394,9 +426,18 @@ function placeOf(station: StationRecord): string {
  *  module (two lone modules docked together each stay where they are, as in
  *  stations.dockedStationFor). */
 function dockHost(roomId: string, stations: StationRecord[] = listStations()): StationRecord | null {
+  const partner = dockPartner(roomId, stations);
+  return partner === 'lone' ? null : partner;
+}
+
+/** dockHost, telling another lone module the atlas knows ('lone': a dock
+ *  into it holds the ship nowhere) from a room no listed station holds
+ *  (null: where that dock holds the ship is unknown here). */
+function dockPartner(roomId: string, stations: StationRecord[]): StationRecord | 'lone' | null {
   const atlas = readAtlas();
   const st = stationForRoom(roomId, atlas, stations);
-  return st && !(st.derived && atlasComponent(atlas, st.welcomeRoomId).size <= 1) ? st : null;
+  if (!st) return null;
+  return st.derived && atlasComponent(atlas, st.welcomeRoomId).size <= 1 ? 'lone' : st;
 }
 
 /** 🚚 Where the station a dock into `roomId` holds a ship at is as that dock
@@ -408,6 +449,16 @@ export function releasePlaceOf(roomId: string, now: number = Date.now()): string
   const stations = listStations(undefined, undefined, now);
   const host = dockHost(roomId, stations);
   return host && !stationInTransit(host, now) ? placeOf(host) : undefined;
+}
+
+/** 🚚 Is the station a DOCK into `roomId` was asked of still where it was
+ *  then (`at`: releasePlaceOf as the DOCK was asked)? The far write learns
+ *  its room's moves (farDoorWrite): one found gone since (left for another
+ *  planet while a ship flew to it, on a list that had not heard) is out of
+ *  the ship's reach, and a dock to it would carry the ship across without a
+ *  transfer (docking.ts redockPort takes its far write back). */
+export function berthStillThere(roomId: string, at: string | undefined, now: number = Date.now()): boolean {
+  return releasePlaceOf(roomId, now) === at;
 }
 
 /** The room a door's record leads to (paired) or last led to (a tombstone);
@@ -427,6 +478,80 @@ function doorPartnerRoom(record: DoorRecord | undefined): string {
 export function berthHeldByMove(roomId: string, doorId: string, now: number = Date.now()): boolean {
   const record = readDoor(doorId);
   return dockLockedByMove([roomId, record?.paired === true ? doorPartnerRoom(record) : ''], now);
+}
+
+/** 🚚 Every transient berth of `roomId` (#67 D2: a dock, or a legacy berth
+ *  with no dock chain), when DEPART may cast them all off at `now`; else why
+ *  not. Only the room's own doors, each read past the snapshot's cap
+ *  (doorsDoc.readPhysicalDoors): records a peer floods the map with can
+ *  neither hide a berth from it nor hold the ship (a dock on a door the room
+ *  lacks leads nowhere). A station move holds one of them (berthHeldByMove):
+ *  a station between planets keeps the ships it holds, and UNDOCK and
+ *  DETACH both refuse, so DEPART does too. Or, with a berth to let go of,
+ *  not every move of the room can be read (roomMovesKnown), where the one
+ *  holding it may lie. With `asked` (berthPairings: what DEPART asked the
+ *  far rooms about, at `now`), only those berths, each still the pairing it
+ *  was: any other was never judged at that moment ('changed'). */
+export function berthsToCastOff(
+  roomId: string,
+  now: number = Date.now(),
+  asked?: ReadonlyMap<string, DoorRecord | undefined>,
+): { ok: true; berths: string[] } | { ok: false; why: 'moving' | 'unread' | 'changed' } {
+  const doors = readPhysicalDoors();
+  const berths: string[] = [];
+  for (const [doorId, door] of doors) {
+    if (door.paired === true && (door.transient === true || isDockChain(door.segments))) berths.push(doorId);
+  }
+  if (berths.length > 0 && !roomMovesKnown()) return { ok: false, why: 'unread' };
+  if (berths.some((doorId) => berthHeldByMove(roomId, doorId, now))) return { ok: false, why: 'moving' };
+  if (asked && berths.some((doorId) => !samePairing(asked.get(doorId), doors.get(doorId)))) return { ok: false, why: 'changed' };
+  return { ok: true, berths };
+}
+
+/** The pairings on these doors as they are now: what a release asks the
+ *  far rooms about (berthsToCastOff's `asked`). */
+export function berthPairings(doorIds: readonly string[]): Map<string, DoorRecord | undefined> {
+  return new Map(doorIds.map((doorId) => [doorId, readDoor(doorId)]));
+}
+
+/** The same pairing, the one a release asked about: to the same room, made
+ *  at the same moment. */
+function samePairing(asked: DoorRecord | undefined, now: DoorRecord | undefined): boolean {
+  return asked?.paired === true && now?.paired === true
+    && asked.connectedRoomAddress === now.connectedRoomAddress && asked.dockedAt === now.dockedAt;
+}
+
+/**
+ * ⏏ #67 D2: DETACH the legacy berth on `doorId` of `roomId` (a transient
+ * pairing on a door that is no dock port: no UNDOCK asks its far room), as
+ * one release made at `now`: its far room judges it at the stamp it takes
+ * then (`ask`: FarDockRequest `release`, docking.ts farReleaseAllowed), this
+ * end judges it again at that moment once the answer is in, by every move
+ * it knows by then (the far room's among them: farDoorWrite), and the
+ * tombstone takes that stamp (detachBerth). A move booked there after the
+ * answer then leaves after the release, however long the answer took: the
+ * ship stays where the station was. Only the pairing asked about, while
+ * `roomNow()` is still the room it was asked from. 'held': a move holds
+ * it; 'changed': the pairing, or the room, changed meanwhile.
+ */
+export async function detachLegacyBerthAt(
+  roomId: string,
+  doorId: string,
+  ask: (now: number) => Promise<boolean>,
+  roomNow: () => string = currentRoomId,
+  now: number = Date.now(),
+): Promise<'released' | 'held' | 'changed'> {
+  const asked = berthPairings([doorId]);
+  if (asked.get(doorId)?.paired !== true) return 'changed';
+  let allowed = true;
+  try {
+    allowed = await ask(now);
+  } catch {
+    // Best effort, as an UNDOCK's far write: one that cannot ask does not hold it.
+  }
+  const same = roomNow() === roomId && samePairing(asked.get(doorId), readDoor(doorId));
+  if (!allowed || (same && berthHeldByMove(roomId, doorId, now))) return 'held';
+  return same && detachBerth(doorId, now) ? 'released' : 'changed';
 }
 
 /**
@@ -480,7 +605,7 @@ export function correctReleasePlace(
  * it names, each read directly: a scan of the doors is capped, and a peer
  * could push the very door out of it.
  * - `heldBy`: a dock through one of them still holds the ship (its station,
- *   when listed);
+ *   when listed; a dock into another lone module holds it nowhere);
  * - else, once one of them let go since the ship came to rest (the latest,
  *   by its UNDOCK's own stamp: `releasedAt`), where that dock's station
  *   (`from`) was then: where its UNDOCK recorded it (DockBerthMemory.at,
@@ -511,8 +636,14 @@ export function restingPlace(
     }
     if (!room) continue;
     if (door.paired === true) {
-      // A gangway is structure, not a dock: that ship is no free ship.
-      if (door.transient === true || isDockChain(door.segments)) return { heldBy: dockHost(room, stations)?.id ?? null };
+      // A gangway is structure, not a dock: that ship is no free ship. A
+      // dock into another lone module (a door the rest still names, docked
+      // there since) holds it nowhere: where it rests stands. One into a room
+      // no listed station holds leaves where unknown: the record's station.
+      if (door.transient === true || isDockChain(door.segments)) {
+        const partner = dockPartner(room, stations);
+        if (partner !== 'lone') return { heldBy: partner?.id ?? null };
+      }
       continue;
     }
     // A release before the ship came to rest here belongs to an earlier stay.
@@ -595,16 +726,19 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
  * (each UNDOCK's own stamp, however late this tab learns of it), the moment
  * the LAST of those docks let go, at or after `since` (the tow's booking): a
  * station held through two ports stays in tow until both have let go; else
- * false (not docked, time unknown).
+ * false (not docked, time unknown). A release whose UNDOCK still waits on
+ * its far room at `now` (shipDoc.UndockHold) is no release yet: a far
+ * refusal puts that dock back.
  */
 export function dockedToStation(
   welcomeRoomId: string,
   since = -Infinity,
   doors: ReadonlyMap<string, DoorRecord> | null = readAllDoorsIfComplete(),
+  now: number = Date.now(),
 ): boolean | number {
   if (!doors) return true;
   let released: number | null = null;
-  for (const [, rec] of doors) {
+  for (const [doorId, rec] of doors) {
     const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
     if (!address) continue;
     if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
@@ -618,6 +752,7 @@ export function dockedToStation(
     if (!partner || stationForRoom(partner)?.welcomeRoomId !== welcomeRoomId) continue;
     if (rec.paired === true) return true;
     const at = rec.dock!.undockedAt;
+    if (undockHeld(doorId, at, now)) return true;
     if (at >= since && (released === null || at > released)) released = at;
   }
   return released ?? false;
@@ -627,13 +762,64 @@ export function dockedToStation(
  *  docking through `docks` (none: without a dock). An open-orbit place is its
  *  own rest, and a station this install cannot list gives none: either clears
  *  the record, so no earlier stay's rest outlives this arrival. (🚏 A ferry
- *  route's copy-back records its end stop the same way: main.ts.) */
+ *  route's copy-back records its end stop the same way while docked there:
+ *  restAtRouteEnd.) */
 export function restBeside(locationId: string, now: number, docks: string[]): void {
   const st = adriftPlace(locationId) ? undefined : listStations(undefined, undefined, now).find((s) => s.id === locationId);
   const rest = st && !stationInTransit(st, now)
     ? { at: placeOf(st), since: Math.floor(now), docks: [...docks].sort().slice(0, MAX_REST_DOCKS) }
     : null;
   if (!writeRestPlace(rest)) writeRestPlace(null);
+}
+
+/** 🚏🚚 Record where a ferry route's copy-back (main.ts, after STOP) leaves
+ *  the ship at its end stop `locationId`. Docked there through `docks`, it
+ *  rests beside the station its dock carries it with (restBeside). With no
+ *  dock, it is where the timetable left it: on the route's copy of the stop
+ *  (`end`, shipRoute.settleRouteFlight's), which the stop's station may have
+ *  left for another planet or slot (the keeper passes that berth). So it
+ *  rests there, not at the station's new place, in open orbit (`open`) as
+ *  the timetable's stay had it (untrimmed, until a dock carries it): beside
+ *  the station only while that is on that place's own orbit, its slot's with
+ *  no trim (shipPlaceId). No copy: as restBeside. */
+export function restAtRouteEnd(
+  locationId: string,
+  end: { planetId: string; orbitSlot: number } | null,
+  now: number,
+  docks: string[],
+): void {
+  if (docks.length > 0 || !end) {
+    restBeside(locationId, now, docks);
+    return;
+  }
+  const rest = { at: adriftAt(planetById(end.planetId).id, end.orbitSlot), since: Math.floor(now), open: true as const };
+  if (!writeRestPlace(rest)) writeRestPlace(null);
+}
+
+/** 🚚 What an arrival re-points its port with before the DOCK (`memory`,
+ *  planArrivalDock's retarget): where the ship arrived (`arrived`, the rest
+ *  restBeside wrote) as the place the tombstone lets go at. The rest names
+ *  that port until the DOCK answers, so its tombstone reads as a release
+ *  (restingPlace), and the ship never went where the station turns out to be
+ *  by moves heard meanwhile (the far room's, as the DOCK asks it). */
+function retargetAt(memory: DockBerthMemory, arrived: RestPlace | null): DockBerthMemory {
+  return arrived ? { ...memory, at: arrived.at } : memory;
+}
+
+/** 🚚 An arrival's DOCK refused: the rest it wrote (`arrived`, restBeside)
+ *  names no dock any more, so the ship rests where it arrived, never where
+ *  the station is now (the port's tombstone, re-pointed at the berth as the
+ *  DOCK was asked, would read as a release of it). Whether that station has
+ *  since gone from there (between planets, or orbiting elsewhere: what the
+ *  far room knew, redockPort's berthStillThere). */
+function restUndocked(arrived: RestPlace | null, stationId: string, now: number = Date.now()): boolean {
+  if (!arrived) return false;
+  const rest = readRestPlace();
+  if (rest && rest.at === arrived.at && rest.since === arrived.since && rest.docks?.length) {
+    writeRestPlace({ at: arrived.at, since: arrived.since });
+  }
+  const st = listStations(undefined, undefined, now).find((s) => s.id === stationId);
+  return !!st && (stationInTransit(st, now) || placeOf(st) !== arrived.at);
 }
 
 /**
@@ -899,15 +1085,27 @@ export function completeArrival(
   // Where the station orbited at cast-off, when the flight kept it: however
   // many moves it made since (and only the latest is kept), it is not there.
   const castOffPlace = rec.destinationAt !== undefined ? adriftPlace(rec.destinationAt) : null;
-  const listedNow = castOffPlace ? listStations().find((s) => s.id === rec.locationId) : undefined;
-  const movedAway = !!castOffPlace && !!listedNow
-    && (planetById(listedNow.planetId).id !== planetById(castOffPlace.planetId).id || listedNow.orbitSlot !== castOffPlace.orbitSlot);
-  if (stationInTransit(station, now) || movedMidFlight || movedAway) {
+  const listedNow = listStations().find((s) => s.id === rec.locationId);
+  // A flight that kept none (written before flights did, or cast off for a
+  // station not listed then): where the station left from on its first move
+  // since the ship cast off, among the moves known here, which is where it
+  // was then. Its latest alone cannot say: a tow cancelled after a transfer
+  // that took it away stands for no journey.
+  const wasAt = castOffPlace
+    ?? (listedNow && leftAt !== undefined ? stationLeftFrom(listedNow, leftAt, now) : null);
+  // With both places known, where it orbits now says whether it went: back
+  // where it was at cast-off (bounced home off a full planet, or there and
+  // back) its berth is in reach, whatever moves it made meanwhile. Without
+  // them, any move that overlapped the time away.
+  const movedAway = wasAt && listedNow
+    ? planetById(listedNow.planetId).id !== planetById(wasAt.planetId).id || listedNow.orbitSlot !== wasAt.orbitSlot
+    : movedMidFlight;
+  if (stationInTransit(station, now) || movedAway) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.
     const from = moved ?? station.move;
-    const at = castOffPlace ? adriftAt(castOffPlace.planetId, castOffPlace.orbitSlot)
+    const at = wasAt ? adriftAt(wasAt.planetId, wasAt.orbitSlot)
       : from ? adriftAt(from.fromPlanetId, from.fromSlot) : adriftAt(station.planetId, 0);
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' }, at);
   }
@@ -931,8 +1129,17 @@ export function completeArrival(
   const candidates = arrivalBerths({ station, remembered, gate: opts.gate, shipRoomId });
   // Arrived, docking through each port in turn: should every berth refuse
   // the DOCK, the ship rests here without one.
-  const rest = (doorId: string) => restBeside(rec.locationId, now, [doorId]);
-  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled, shipRoomId, opts.onProgress, rest);
+  let arrived: RestPlace | null = null;
+  const rest = (doorId: string): RestPlace | null => {
+    restBeside(rec.locationId, now, [doorId]);
+    return (arrived = readRestPlace());
+  };
+  // 🚚 Refused, the ship rests where it arrived, held by no dock (a port's
+  // re-pointed tombstone is no release of it); and its far room may have
+  // known the station had left for another planet (redockPort:
+  // berthStillThere), which the helm says as such.
+  const refused = (): boolean => restUndocked(arrived, rec.locationId);
+  void dockThroughBerths(docking, station, remembered, candidates, plan, opts.onSettled, shipRoomId, opts.onProgress, rest, refused);
   return { kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) };
 }
 
@@ -970,8 +1177,12 @@ async function dockThroughBerths(
   /** Told the gate each retry docks at, before its DOCK. */
   onProgress?: (outcome: Extract<ArrivalOutcome, { kind: 'docking' }>) => void,
   /** Records where the ship rests, docking through this port (restBeside),
-   *  before each DOCK. */
-  rest?: (doorId: string) => void,
+   *  before each DOCK; returns that rest, the place a re-pointed port lets
+   *  go at (retargetAt). */
+  rest?: (doorId: string) => RestPlace | null,
+  /** When the berths have refused: the ship rests undocked where it arrived,
+   *  and true when its station has gone from there since (restUndocked). */
+  refused?: () => boolean,
 ): Promise<void> {
   // `first` was planned for candidates[0] (planArrivalDock's own pick).
   const reasons: DockRefusal[] = [];
@@ -990,12 +1201,12 @@ async function dockThroughBerths(
         const gate = dockedGate(docking.ports(), candidates);
         onSettled?.({ kind: 'docked', stationName: station.name, ...(gate !== undefined ? { gate } : {}) });
       } else {
-        onSettled?.({ kind: 'none', stationName: station.name, reason: plan.reason });
+        onSettled?.({ kind: 'none', stationName: station.name, reason: refused?.() ? 'in-transit' : plan.reason });
       }
       return;
     }
-    rest?.(plan.doorId);
-    if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
+    const arrived = rest?.(plan.doorId) ?? null;
+    if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, retargetAt(plan.retarget, arrived));
     // A gate change: say which gate the ship docks at now, before asking it.
     if (i > 0) onProgress?.({ kind: 'docking', stationName: station.name, ...(plan.gate !== undefined ? { gate: plan.gate } : {}) });
     let answer: DockAnswer = { ok: false, reason: 'refused' };
@@ -1004,6 +1215,11 @@ async function dockThroughBerths(
     } catch (err) {
       console.warn('[ship] arrival DOCK threw:', err);
     }
+    // A ship that left again while the berth answered (a DEPART) docks at no
+    // further gate of the station it left, and the answer is not this
+    // flight's: say nothing.
+    const flight = readFlightRecord();
+    if (flight.status !== 'docked' || flight.locationId !== station.id) return;
     // The await may have outlived the ship's room: the answer belongs to a
     // room no longer shown, so say nothing.
     if (shipRoomId !== undefined && currentRoomId() !== shipRoomId) return;
@@ -1024,5 +1240,5 @@ async function dockThroughBerths(
   }
   // 🚏 A5: say why, when every berth said why (the helm's note no longer
   // shows a refused berth as green, nor one reason for all).
-  onSettled?.({ kind: 'none', stationName: station.name, reason: arrivalRefusal(reasons) });
+  onSettled?.({ kind: 'none', stationName: station.name, reason: refused?.() ? 'in-transit' : arrivalRefusal(reasons) });
 }

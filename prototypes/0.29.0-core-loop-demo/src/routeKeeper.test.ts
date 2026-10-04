@@ -15,11 +15,12 @@ import * as Y from 'yjs';
 import { berthMemoryFrom, classifyDockPort, dockAnswerOf, redockRecord, stampAfter } from './dockRules';
 import type { DockAnswer } from './dockRules';
 import { dockChain } from './adapter';
+import { bindDoorLayoutDoc, seedDoorLayoutSingle, writeDoorLayout } from './doorLayoutDoc';
 import {
   bindDoorsDoc,
   buildDoorPairing,
-  readAllDoors,
   readDoor,
+  readPhysicalDoors,
   writeDoorPairing,
   writeDoorTombstone,
 } from './doorsDoc';
@@ -778,10 +779,11 @@ function fakeDocking(clock: () => number, answer: (roomId: string, farDoor: stri
 }
 
 /** The ship's live docks as main.ts reads them (same berth room only; 🛟
- *  a dock on any door but the route's port holds the stay). */
+ *  a dock on any door but the route's port holds the stay; only the room's
+ *  own doors). */
 function testLiveDock(): LiveDockAt {
   const docks: Array<{ roomId: string; dockedAt: number; doorId: string }> = [];
-  for (const [doorId, rec] of readAllDoors()) {
+  for (const [doorId, rec] of readPhysicalDoors()) {
     if (rec.paired !== true) continue;
     const st = classifyDockPort(rec);
     if (st.kind !== 'docked') continue;
@@ -898,6 +900,11 @@ describe('the keeper over a running ferry', () => {
     const doc = new Y.Doc();
     bindShipDoc(doc);
     bindDoorsDoc(doc);
+    // The ferry's own doors: the route's port and a second port. Only a
+    // pairing on one of them is a dock (doorsDoc.readPhysicalDoors).
+    bindDoorLayoutDoc(doc);
+    seedDoorLayoutSingle('x-');
+    writeDoorLayout({ id: 'y+', wall: 'y+', lateral: 0, size: 'large', enabled: true, placed: true });
     setBerthSeedResolver((room) => seed(room));
     uninstall = installRouteFlight({ capacity: () => CAP, liveDock: testLiveDock, clock });
     // Docked at stop 0's berth, then START.
@@ -1198,6 +1205,24 @@ describe('the keeper over a running ferry', () => {
     now = ms(readRouteFlight(now)!.departsAt! + SEC);
     keeper.tick();
     expect(portRoom()).toBeNull();
+  });
+
+  it('🚪 never counts a pairing a peer floods onto a door the ferry lacks as a dock', () => {
+    // A snapshot's worth of them (doorsDoc.MAX_PAIRINGS), none of which a
+    // rider may let go of: read as docks, they would hold the ferry for good.
+    for (let i = 0; i < 64; i++) {
+      writeDoorPairing(`d:flood-${i}`, seed('room-9'), buildDoorPairing(seed('room-9'), {
+        segments: dockChain(), farDoor: 'x+', transient: true, dockedAt: T0 - MIN,
+      }));
+    }
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d, [], { mayRelease: (id) => !id.startsWith('d:flood-') });
+    const s = start();
+    now = ms(s.departAt + 2 * SEC);
+    keeper.tick();
+    expect(portRoom()).toBeNull();
+    expect(d.undocks).toEqual(['x- (keeper)']);
+    expect(readRouteFlight(now)?.status).toBe('in-flight');
   });
 
   it('casting off in flight remembers no berth (the stop it left is not where the dock is)', () => {

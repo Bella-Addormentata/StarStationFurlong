@@ -22,7 +22,7 @@ import {
   clampExtBays, clampFlexBendFine, clampFlexStretch, clampExtStretch, type ConnectorSegment,
 } from './adapter';
 import type { DoorWall } from './doorLayoutDoc';
-import { normalizeWall } from './doorLayoutDoc';
+import { defaultDoorLayoutRecords, doorSetIsMarkedEmpty, normalizeWall, readAllDoorLayout } from './doorLayoutDoc';
 
 /**
  * Serializable pairing record — one per door id. Plain JSON (no nested Y
@@ -371,6 +371,41 @@ export function readDoorFrom(doc: Y.Doc, doorId: string): DoorRecord | undefined
 /** ⚓ #163: readDoorFrom on the bound room doc. */
 export function readDoor(doorId: string): DoorRecord | undefined {
   return docAlive() ? readDoorFrom(boundDoc!, doorId) : undefined;
+}
+
+/**
+ * The bound room's own doors' records: each PHYSICAL door's record, read by
+ * name past readAllDoors' MAX_PAIRINGS cap (readDoor), and nothing that a
+ * door the room lacks holds. Records a peer floods the map with can never
+ * hide a real door's connection from a check that must see every one, nor
+ * pass for one (the helm's DEPART gate, where a ship is docked). The
+ * physical doors are the stored layout; else, in a room from before the
+ * layout store, the four defaults; and none in a room whose owner removed
+ * every door (the authoritative-empty marker), as furniture.roomDoorPoints
+ * reads them.
+ */
+export function readPhysicalDoors(): Map<string, DoorRecord> {
+  const layout = readAllDoorLayout();
+  const physical = layout.size > 0 ? layout : doorSetIsMarkedEmpty() ? new Map() : defaultDoorLayoutRecords();
+  const out = new Map<string, DoorRecord>();
+  for (const id of physical.keys()) {
+    const rec = readDoor(id);
+    if (rec) out.set(id, rec);
+  }
+  return out;
+}
+
+/**
+ * Every physical door's own record (readPhysicalDoors), then the rest of
+ * readAllDoors' snapshot: what DEPART casts off, so a flood never hides a real
+ * door's dock from it, and a dock on a door the room lacks goes with the rest;
+ * and what the atlas harvest files, whose door bound (MAX_DOORS_PER_ENTRY)
+ * keeps the first records, so a flood never pushes a real door past it.
+ */
+export function readAllDoorsWithPhysical(): Map<string, DoorRecord> {
+  const out = readPhysicalDoors();
+  for (const [id, rec] of readAllDoors()) if (!out.has(id)) out.set(id, rec);
+  return out;
 }
 
 /** ⚓ #163: write one door record into ANY doc (see readAllDoorsFrom) — the
