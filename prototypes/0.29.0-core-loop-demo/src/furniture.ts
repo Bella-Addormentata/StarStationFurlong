@@ -27,6 +27,7 @@
 import * as THREE from "three";
 import type { Seat } from "./seats";
 import type {
+  DepartureScreen,
   DeviceTarget,
   DeviceTemplate,
   WallComputerStatus,
@@ -76,6 +77,13 @@ import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 // doorLayoutDoc → doors → doorLayout → floorPlanDoc, none of which import
 // this module.
 import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } from "./doorLayoutDoc";
+// 🕹️ The helm's two sticks: the door pairings say ship or station, and the
+// station keeping record says when a burn leans the small one.
+import { readPhysicalDoors, subscribeDoors } from "./doorsDoc";
+import { readHelmFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
+import { subscribeSharedAtlas } from "./stationAtlas";
+import { currentRoomId, currentStation } from "./stations";
+import type { StationRecord } from "./stations";
 import { poseFromWall } from "./doorLayout";
 import type { DoorWall } from "./doorLayoutDoc";
 // 🧬 #165: the clone vat's tank dimensions live with the avatar's clearance
@@ -122,6 +130,7 @@ export type FurnitureKind =
   | "birthday-balloons"
   | "birthday-balloons-wall"
   | "wall-computer"
+  | "departures-board"
   | "map-table"
   | "storage-trunk"
   | "game-table"
@@ -1851,6 +1860,160 @@ const buildWallComputer = (ctx: BuildCtx) => {
   };
   // Boot frame so the prop is never a black rectangle before the first tick.
   drawStatus(lastStatus);
+  screen.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
+};
+
+// ── 🚏📋 Departures board (robot pilot routes, design §5 + §5a) ─────────────
+// The wall computer's WIDE variant: the same slate housing, bezel and gold
+// strip, twice as wide, with the same live CanvasTexture screen path (a
+// WallScreenHandle on userData.wallScreen, redrawn only by World's ~1 Hz
+// loop). The handle says `departures: true`, so World adds this board's rows
+// (devices.readDepartureScreen) to the status it pushes; a plain terminal's
+// status carries none. It is a DISPLAY, not a terminal: its device is the
+// board's own console (what it shows: all gates, or one), never the EDIT
+// ROOM entry, so it is removable like any furniture.
+const DB_W = 1.8; // housing width
+const DB_H = 0.7; // housing height (the wall computer's)
+const DB_D = 0.12;
+const DB_Y = 1.6; // mount height (the wall computer's)
+const DB_CW = 512; // canvas px
+const DB_CH = 160;
+/** Row pitch and first baseline on the board canvas: six rows sit between
+ *  the column heads and the notes footer. */
+const DB_ROW_PITCH = 15;
+const DB_ROW_TOP = 56;
+/** Rows the screen draws: every row a board can hold (departuresBoard
+ *  MAX_BOARD_ROWS, pinned by departuresBoard.test.ts). */
+export const DB_SCREEN_ROWS = 6;
+
+const buildDeparturesBoard = (ctx: BuildCtx) => {
+  const { m, place } = ctx;
+  const HOUSING = 0x2a3444;
+  const BEZEL = 0x3d4a5e;
+  const ACCENT = 0xd4a84b;
+  place(new THREE.BoxGeometry(DB_W, DB_H, DB_D - 0.04), m(HOUSING, 0.6, 0.5), 0, DB_Y, -0.02); // housing
+  place(new THREE.BoxGeometry(DB_W - 0.08, 0.6, 0.03), m(BEZEL, 0.55, 0.45), 0, DB_Y + 0.02, DB_D / 2 - 0.015); // bezel
+  place(new THREE.BoxGeometry(DB_W, 0.05, 0.03), m(ACCENT, 0.4, 0.5), 0, DB_Y - DB_H / 2 + 0.025, DB_D / 2 - 0.015); // gold strip
+  place(new THREE.BoxGeometry(0.3, 0.06, 0.02), m(HOUSING, 0.6, 0.5), 0, DB_Y - DB_H / 2 + 0.025, DB_D / 2 + 0.001); // badge
+
+  const cv = document.createElement("canvas");
+  cv.width = DB_CW;
+  cv.height = DB_CH;
+  const c2d = cv.getContext("2d")!;
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+  const screen = place(new THREE.PlaneGeometry(DB_W - 0.18, 0.5), mat, 0, DB_Y + 0.02, DB_D / 2 + 0.002);
+
+  const tone = (status: string): string =>
+    status === "BOARDING" || status === "ON TIME" ? "#00E676" : status === "ROUTE BLOCKED" ? "#FF1744" : "#FFB300";
+  const clip = (text: string, n: number): string => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
+
+  const draw = (board: DepartureScreen | undefined) => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = "#0A1018";
+    c2d.fillRect(0, 0, DB_CW, DB_CH);
+    c2d.strokeStyle = "#1E2A38";
+    c2d.strokeRect(3.5, 3.5, DB_CW - 7, DB_CH - 7);
+    c2d.textBaseline = "alphabetic";
+    // Header: the board's title (amber) and the local clock (the boards and
+    // the helm show the exact second, design §5).
+    c2d.font = "bold 13px monospace";
+    c2d.textAlign = "left";
+    c2d.fillStyle = "#D4A84B";
+    c2d.fillText(clip((board?.title ?? "DEPARTURES").toUpperCase(), 40), 12, 21);
+    const now = new Date();
+    c2d.textAlign = "right";
+    c2d.fillText(
+      [now.getHours(), now.getMinutes(), now.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":"),
+      DB_CW - 12,
+      21,
+    );
+    c2d.strokeStyle = "#D4A84B";
+    c2d.beginPath();
+    c2d.moveTo(12, 28);
+    c2d.lineTo(DB_CW - 12, 28);
+    c2d.stroke();
+    // Column heads.
+    c2d.textAlign = "left";
+    c2d.font = "9px monospace";
+    c2d.fillStyle = "#4A5560";
+    const COL = { ferry: 12, place: 128, gate: 262, time: 300, status: 372 };
+    c2d.fillText("FERRY", COL.ferry, 41);
+    c2d.fillText("TO / FROM", COL.place, 41);
+    c2d.fillText("GATE", COL.gate, 41);
+    c2d.fillText("TIME", COL.time, 41);
+    c2d.fillText("STATUS", COL.status, 41);
+    const rows = board?.rows ?? [];
+    if (rows.length === 0) {
+      c2d.font = "bold 12px monospace";
+      c2d.fillStyle = "#4A5560";
+      c2d.fillText(board?.empty ?? "NO DEPARTURES NEWS", 12, 72);
+    }
+    const shown = rows.slice(0, DB_SCREEN_ROWS);
+    shown.forEach((r, i) => {
+      const y = DB_ROW_TOP + i * DB_ROW_PITCH;
+      c2d.font = "bold 11px monospace";
+      c2d.fillStyle = "#F0C060";
+      c2d.fillText(clip(r.ferry, 16), COL.ferry, y);
+      c2d.font = "11px monospace";
+      c2d.fillStyle = "#D4A84B";
+      c2d.fillText(clip(r.place, 18), COL.place, y);
+      c2d.fillStyle = "#00E5FF";
+      c2d.fillText(r.gate, COL.gate, y);
+      c2d.fillStyle = "#8FA3B8";
+      c2d.fillText(r.time, COL.time, y);
+      c2d.font = "bold 11px monospace";
+      c2d.fillStyle = tone(r.status);
+      c2d.fillText(r.status, COL.status, y);
+    });
+    // Footer: the rows' notes in turn ("since 14:03:10 · leaves at least
+    // 1 min after it docks", "now 14:11:11", "as of 14:02").
+    const notes = shown.filter((r) => r.note).map((r) => `${r.ferry}: ${r.note}`);
+    c2d.font = "9px monospace";
+    c2d.fillStyle = "#8FA3B8";
+    if (notes.length > 0) {
+      c2d.fillText(clip(notes[Math.floor(Date.now() / 4000) % notes.length].toUpperCase(), 82), 12, DB_CH - 12);
+    } else {
+      c2d.fillStyle = "#33404E";
+      c2d.fillText("SSF DEPARTURES v1", 12, DB_CH - 12);
+    }
+    tex.needsUpdate = true;
+  };
+
+  const drawInUse = () => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = "#060A10";
+    c2d.fillRect(0, 0, DB_CW, DB_CH);
+    c2d.strokeStyle = "#1E2A38";
+    c2d.strokeRect(3.5, 3.5, DB_CW - 7, DB_CH - 7);
+    c2d.font = "bold 14px monospace";
+    c2d.textAlign = "center";
+    c2d.textBaseline = "middle";
+    c2d.fillStyle = "rgba(212, 168, 75, 0.45)";
+    c2d.fillText("BOARD IN USE", DB_CW / 2, DB_CH / 2);
+    tex.needsUpdate = true;
+  };
+
+  let engaged = false;
+  let last: DepartureScreen | undefined;
+  const handle: WallScreenHandle = {
+    departures: true,
+    updateStatus: (status) => {
+      last = status.departures;
+      if (engaged) drawInUse();
+      else draw(last);
+    },
+    setEngaged: (value) => {
+      engaged = value;
+      if (engaged) drawInUse();
+      else draw(last);
+    },
+  };
+  draw(undefined);
   screen.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 };
 
@@ -3713,6 +3876,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       anchor: { x: 0, y: 1.62, z: 0.06 },
     },
   },
+  // 🚏📋 Departures board (robot pilot routes, §5a): the wall computer's wide
+  // variant. Wall-mounted, never an obstacle; its device is the board's own
+  // console (All gates / Gate N), not a room terminal, so it can be removed.
+  "departures-board": {
+    kind: "departures-board",
+    build: buildDeparturesBoard,
+    footprint: null,
+    wallMount: { halfW: DB_W / 2 },
+    functions: ["departuresBoard"],
+    device: {
+      kind: "departuresBoard",
+      front: { x: 0, z: 1.3 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.5, z: 1.25 },
+      anchor: { x: 0, y: 1.62, z: 0.06 },
+    },
+  },
   // Holographic map table (M4 of #33): footprint 2×2 — a REAL obstacle (both
   // collision and pathfinding derive from it). Device template in the local
   // rot-0 frame:
@@ -4168,7 +4348,7 @@ function buildEngineBlock(ctx: BuildCtx) {
   addLight(new THREE.PointLight(0xffd9a0, 0, 4), 0, 1.1, 0.9, 0.9);
 }
 
-function buildHelmConsole({ m, flat, place }: BuildCtx) {
+function buildHelmConsole({ m, flat, place, attach }: BuildCtx) {
   // Flight desk + angled dash + main screen + throttle + stick.
   place(
     new THREE.BoxGeometry(1.7, 0.1, 0.7),
@@ -4210,20 +4390,7 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
     0.2,
   );
   glowLine.rotation.x = -0.5;
-  place(
-    new THREE.CylinderGeometry(0.025, 0.025, 0.2, 8),
-    m(0xd4a84b, 0.45, 0.5),
-    -0.45,
-    0.86,
-    -0.05,
-  );
-  place(
-    new THREE.SphereGeometry(0.045, 10, 8),
-    m(0xff1744, 0.5, 0.3),
-    -0.45,
-    0.97,
-    -0.05,
-  );
+  buildHelmSticks(m, place, attach);
   place(
     new THREE.BoxGeometry(0.16, 0.05, 0.22),
     m(0x37474f, 0.5, 0.5),
@@ -4269,6 +4436,132 @@ function buildHelmConsole({ m, flat, place }: BuildCtx) {
     Math.PI, // face −z, toward the pilot's stand-point
   );
   dockScreen.rotation.x = tilt;
+}
+
+/**
+ * 🕹️ The helm's sticks (owner request 2026-09-27: "ships could have more of a
+ * fighter jet style joystick, whereas the station could have a small one for
+ * fine orbital maintenance"). One console, two hands: a SHIP's helm flies with
+ * a fighter-style grip; a helm BOLTED INTO A STATION trims the orbit with a
+ * small stick instead (stationKeeping.ts). Both are built where the old thin
+ * stick stood; the room's door pairings pick which one shows, and a station
+ * burn — whoever fired it — leans the small stick the way it pushed.
+ */
+function buildHelmSticks(
+  m: BuildCtx["m"],
+  place: BuildCtx["place"],
+  attach: BuildCtx["attach"],
+): void {
+  const DESK_TOP = 0.77;
+  const STICK_X = -0.45;
+  const STICK_Z = -0.05;
+  const part = (
+    parent: THREE.Object3D,
+    geo: THREE.BufferGeometry,
+    mat: THREE.Material,
+    x: number,
+    y: number,
+    z: number,
+  ): THREE.Mesh => {
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.position.set(x, y, z);
+    parent.add(mesh);
+    return mesh;
+  };
+
+  // Fighter grip: rubber boot, steel shaft, a grip canted away from the pilot
+  // (who stands on −z) with the trigger under the index finger on the far
+  // side, a hat switch and the red pickle button under the thumb.
+  const fighter = new THREE.Group();
+  fighter.position.set(STICK_X, DESK_TOP, STICK_Z);
+  part(fighter, new THREE.CylinderGeometry(0.05, 0.062, 0.035, 14), m(0x15191d, 0.95, 0.05), 0, 0.0175, 0);
+  part(fighter, new THREE.CylinderGeometry(0.013, 0.015, 0.07, 8), m(0x9aa4ad, 0.35, 0.8), 0, 0.07, 0);
+  const grip = new THREE.Group();
+  grip.position.set(0, 0.1, 0);
+  grip.rotation.x = 0.18;
+  fighter.add(grip);
+  part(grip, new THREE.BoxGeometry(0.048, 0.13, 0.056), m(0x263238, 0.75, 0.2), 0, 0.065, 0);
+  part(grip, new THREE.BoxGeometry(0.052, 0.022, 0.062), m(0x37474f, 0.6, 0.3), 0, 0.135, 0.004);
+  part(grip, new THREE.BoxGeometry(0.012, 0.03, 0.018), m(0x90a4ae, 0.4, 0.6), 0, 0.1, 0.035);
+  part(grip, new THREE.CylinderGeometry(0.009, 0.009, 0.012, 8), m(0xd4a84b, 0.45, 0.5), 0.012, 0.15, 0.004);
+  part(grip, new THREE.SphereGeometry(0.011, 10, 8), m(0xff1744, 0.5, 0.3, 0xff1744, 0.4), -0.013, 0.148, -0.006);
+  attach(fighter);
+
+  // Station trim stick: a short gimballed shaft with an amber knob, sunk in a
+  // gold bezel on a low base plate.
+  const trimStick = new THREE.Group();
+  trimStick.position.set(STICK_X, DESK_TOP, STICK_Z);
+  part(trimStick, new THREE.CylinderGeometry(0.06, 0.066, 0.014, 18), m(0x37474f, 0.5, 0.6), 0, 0.007, 0);
+  const bezel = part(trimStick, new THREE.TorusGeometry(0.036, 0.005, 6, 20), m(0xd4a84b, 0.45, 0.5), 0, 0.015, 0);
+  bezel.rotation.x = Math.PI / 2;
+  const gimbal = new THREE.Group();
+  gimbal.position.set(0, 0.016, 0);
+  trimStick.add(gimbal);
+  part(gimbal, new THREE.CylinderGeometry(0.006, 0.008, 0.06, 8), m(0x9aa4ad, 0.35, 0.8), 0, 0.03, 0);
+  part(gimbal, new THREE.SphereGeometry(0.02, 12, 10), m(0xffb300, 0.4, 0.2, 0xffb300, 0.3), 0, 0.066, 0);
+  attach(trimStick);
+
+  // Which hand: the room's own doors (and the atlas's word on their far
+  // ends), or its being a station's own welcome room, say ship or station.
+  // With it, the station this install places the room in: the stick leans
+  // only for a burn on its orbit (readHelmFiring), as the dashboard shows
+  // it. Both are read again on every door, atlas or station keeping change,
+  // as soon as the room changes (on the first join, main.ts names the room
+  // only after this console is built, and says nothing when it does), and
+  // once a second besides: a station record saved on this install
+  // (stations.registerStation) says nothing either.
+  const FACE_EVERY_S = 1;
+  let bolted = false;
+  let station: StationRecord | null = null;
+  let faceRoom = "";
+  let faceAge = 0;
+  const readFace = () => {
+    faceRoom = currentRoomId();
+    faceAge = 0;
+    bolted = steersStation(faceRoom, readPhysicalDoors());
+    fighter.visible = !bolted;
+    trimStick.visible = bolted;
+    station = currentStation();
+  };
+  readFace();
+
+  // A burn leans the small stick: RAISE pulls it back toward the pilot, LOWER
+  // pushes it away, AHEAD leans it to the pilot's right (−x), BACK to the left.
+  const LEAN = 0.38;
+  const lean = { x: 0, z: 0 };
+  const anim = {
+    update(dt: number): void {
+      faceAge += dt;
+      if (faceAge >= FACE_EVERY_S || currentRoomId() !== faceRoom) readFace();
+      let tx = 0;
+      let tz = 0;
+      // The burn firing now on this station's orbit, whatever order the log
+      // keeps (a peer's clock running ahead, or a newer burn on an orbit
+      // another install puts the room in, never hides this one), or another
+      // of the station's helm rooms' while the helm goes on from its trim.
+      const firing = bolted ? readHelmFiring(Date.now(), station) : null;
+      if (firing) {
+        if (firing.dir === "raise") tx = -LEAN;
+        else if (firing.dir === "lower") tx = LEAN;
+        else if (firing.dir === "ahead") tz = LEAN;
+        else tz = -LEAN;
+      }
+      const k = 1 - Math.exp(-dt * 14);
+      lean.x += (tx - lean.x) * k;
+      lean.z += (tz - lean.z) * k;
+      gimbal.rotation.set(lean.x, 0, lean.z);
+    },
+  };
+  // The cake's carrier rules: the drive handle rides a MESH (only meshes are
+  // filed), the doc subscriptions end through its dispose* hooks.
+  const carrier = place(new THREE.BoxGeometry(0.001, 0.001, 0.001), m(0x1c262e, 1, 0), 0, 0.01, 0);
+  carrier.visible = false;
+  carrier.userData.propAnim = anim;
+  // The doors can move the room to another station too.
+  carrier.userData.disposeHelmFace = subscribeDoors(readFace);
+  // A far room's records arrive by gossip: one can make a door a berth.
+  carrier.userData.disposeHelmAtlas = subscribeSharedAtlas(readFace);
+  carrier.userData.disposeHelmTrim = subscribeStationKeeping(readFace);
 }
 
 /** ⚓ #163: the helm's docking-computer face — a round port glyph (the

@@ -22,7 +22,7 @@ import {
   clampExtBays, clampFlexBendFine, clampFlexStretch, clampExtStretch, type ConnectorSegment,
 } from './adapter';
 import type { DoorWall } from './doorLayoutDoc';
-import { normalizeWall } from './doorLayoutDoc';
+import { defaultDoorLayoutRecords, doorSetIsMarkedEmpty, normalizeWall, readAllDoorLayout } from './doorLayoutDoc';
 
 /**
  * Serializable pairing record — one per door id. Plain JSON (no nested Y
@@ -84,7 +84,16 @@ export interface DockBerthMemory {
   farLateral?: number;
   /** When the dock was released (writer clock, epoch ms). */
   undockedAt: number;
+  /** 🚚 Where the station across the dock was as it let go, when its writer
+   *  knew: an open-orbit place (stations.adriftAt), read where it is used
+   *  (shipArrival.restingPlace). A ship released while nobody aboard saw it
+   *  rests there, whatever moves of that station an install hears of later. */
+  at?: string;
 }
+
+/** A recorded release place no longer than this is kept (a planet id and a
+ *  slot, with their prefix, are far shorter). */
+const MAX_PLACE_LEN = 160;
 
 /** ⏏ An UNDOCK leaves this rather than deleting the entry: only one room doc
  *  is bound at a time, so an undock can never reach the far room's mirror
@@ -247,6 +256,7 @@ function sanitizeBerthMemory(v: unknown): DockBerthMemory | undefined {
       && Math.abs(m.farLateral) <= 32) {
     out.farLateral = m.farLateral;
   }
+  if (typeof m.at === 'string' && m.at.length > 0 && m.at.length <= MAX_PLACE_LEN) out.at = m.at;
   return out;
 }
 
@@ -256,7 +266,7 @@ function sanitizeBerthMemory(v: unknown): DockBerthMemory | undefined {
  *  main.ts binds it BEFORE bindDoorLayoutDoc, so a cross-doc lookup here is
  *  false on every join and would silently drop every free-door pairing, with
  *  no recovery (reconcileDoorLayout never re-runs reconcileDoors). */
-function isAcceptableDoorKey(id: string): boolean {
+export function isAcceptableDoorKey(id: string): boolean {
   if (id.length > MAX_KEY_LEN) return false;
   return (
     (DOOR_IDS as readonly string[]).includes(id) ||
@@ -278,7 +288,11 @@ const AXIS_IDS = ['x+', 'x-', 'y+', 'y-'] as const;
  *  before, whatever a peer wrote we read exactly four entries. Mirrors the
  *  station atlas's MAX_ENTRIES discipline. */
 const MAX_KEY_LEN = 64;
-const MAX_PAIRINGS = 64;
+export const MAX_PAIRINGS = 64;
+/** Most keys readAllDoorsIfComplete looks at, junk included: a peer can write
+ *  any number of keys no reader keeps, and a room's own doors fit well inside
+ *  (as stationAtlas bounds the raw door list it ingests). */
+const MAX_SCANNED_DOOR_KEYS = 4 * MAX_PAIRINGS;
 
 /**
  * Snapshot every valid door pairing as id → SANITIZED record (malformed
@@ -304,6 +318,27 @@ function readDoorsMap(map: Y.Map<unknown>): Map<string, DoorRecord> {
     if (out.size >= MAX_PAIRINGS) break;
     if (!isAcceptableDoorKey(id)) continue;
     if (isDoorRecord(value)) out.set(id, sanitizeDoorGeometry(value));
+  }
+  return out;
+}
+
+/**
+ * 🚚 readAllDoors, or null when the room holds more valid door records than
+ * a snapshot keeps (MAX_PAIRINGS), or more keys of any kind than this looks
+ * at (MAX_SCANNED_DOOR_KEYS): either snapshot might leave out the very door.
+ * A caller that reads a dock's ABSENCE as news (a tug that let go of the
+ * station it tows) must not take a capped snapshot, which a peer could have
+ * flooded, for the whole room; and a flood of junk costs it a bounded scan.
+ */
+export function readAllDoorsIfComplete(): Map<string, DoorRecord> | null {
+  if (!docAlive()) return new Map<string, DoorRecord>();
+  const out = new Map<string, DoorRecord>();
+  let scanned = 0;
+  for (const [id, value] of doorsMap!.entries()) {
+    if (++scanned > MAX_SCANNED_DOOR_KEYS) return null;
+    if (!isAcceptableDoorKey(id) || !isDoorRecord(value)) continue;
+    if (out.size >= MAX_PAIRINGS) return null;
+    out.set(id, sanitizeDoorGeometry(value));
   }
   return out;
 }
@@ -336,6 +371,41 @@ export function readDoorFrom(doc: Y.Doc, doorId: string): DoorRecord | undefined
 /** ⚓ #163: readDoorFrom on the bound room doc. */
 export function readDoor(doorId: string): DoorRecord | undefined {
   return docAlive() ? readDoorFrom(boundDoc!, doorId) : undefined;
+}
+
+/**
+ * The bound room's own doors' records: each PHYSICAL door's record, read by
+ * name past readAllDoors' MAX_PAIRINGS cap (readDoor), and nothing that a
+ * door the room lacks holds. Records a peer floods the map with can never
+ * hide a real door's connection from a check that must see every one, nor
+ * pass for one (the helm's DEPART gate, where a ship is docked). The
+ * physical doors are the stored layout; else, in a room from before the
+ * layout store, the four defaults; and none in a room whose owner removed
+ * every door (the authoritative-empty marker), as furniture.roomDoorPoints
+ * reads them.
+ */
+export function readPhysicalDoors(): Map<string, DoorRecord> {
+  const layout = readAllDoorLayout();
+  const physical = layout.size > 0 ? layout : doorSetIsMarkedEmpty() ? new Map() : defaultDoorLayoutRecords();
+  const out = new Map<string, DoorRecord>();
+  for (const id of physical.keys()) {
+    const rec = readDoor(id);
+    if (rec) out.set(id, rec);
+  }
+  return out;
+}
+
+/**
+ * Every physical door's own record (readPhysicalDoors), then the rest of
+ * readAllDoors' snapshot: what DEPART casts off, so a flood never hides a real
+ * door's dock from it, and a dock on a door the room lacks goes with the rest;
+ * and what the atlas harvest files, whose door bound (MAX_DOORS_PER_ENTRY)
+ * keeps the first records, so a flood never pushes a real door past it.
+ */
+export function readAllDoorsWithPhysical(): Map<string, DoorRecord> {
+  const out = readPhysicalDoors();
+  for (const [id, rec] of readAllDoors()) if (!out.has(id)) out.set(id, rec);
+  return out;
 }
 
 /** ⚓ #163: write one door record into ANY doc (see readAllDoorsFrom) — the
@@ -479,6 +549,7 @@ export function buildDoorTombstone(retiredAddress: string, dock?: DockBerthMemor
     if (dock.farDoor) memory.farDoor = dock.farDoor;
     if (dock.farWall) memory.farWall = dock.farWall;
     if (dock.farLateral !== undefined) memory.farLateral = dock.farLateral;
+    if (dock.at) memory.at = dock.at;
     record.dock = memory;
   }
   return record;

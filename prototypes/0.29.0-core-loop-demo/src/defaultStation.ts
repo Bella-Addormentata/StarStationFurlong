@@ -44,7 +44,7 @@
 
 import { normalizeWall } from './doorLayoutDoc';
 import type { ConnectorSegment } from './adapter';
-import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, isSaneDims, roomIdFromSeed } from './stationAtlas';
+import { MAX_DOORS_PER_ENTRY, MAX_ENTRIES, atlasComponent, berthDoorIds, isSaneDims, roomIdFromSeed } from './stationAtlas';
 import type { AtlasEntry, BundledAtlasEntry } from './stationAtlas';
 import bundledAtlasJson from './defaultStation.atlas.json';
 
@@ -187,46 +187,31 @@ export function defaultStationAtlas(): BundledAtlasEntry[] {
  * What a client exports for the bundle (the devtools helper in the header):
  * the CONNECTED COMPONENT of `welcomeRoomId` in its local atlas — the station,
  * not every module this install ever visited (review of #156) — minus
- * everything personal: seeds, door seeds and both recency stamps. Edges are
+ * everything personal: seeds, door seeds and both recency stamps — and every
+ * transient berth (a visiting ship is not the station). Edges are
  * walked both ways (a pairing recorded on either side joins the two rooms),
  * the component is capped at the atlas's own size, and doorless stubs add no
- * geometry so they are left out. Empty when the room is unknown.
+ * geometry so they are left out. The welcome room itself always stays, doors
+ * or not: the welcome link must name a room the bundle knows, and a one-room
+ * station hosting a ship has no doors left once the berth goes. Empty when
+ * the room is unknown.
  */
 export function atlasForBundle(
   atlas: Record<string, AtlasEntry>,
   welcomeRoomId: string,
 ): Record<string, BundledAtlasEntry> {
-  const out: Record<string, BundledAtlasEntry> = {};
+  // No prototype, like readAtlas's map: a room `__proto__` is a key here too.
+  const out: Record<string, BundledAtlasEntry> = Object.create(null);
   if (!welcomeRoomId || !atlas[welcomeRoomId]) return out;
-  const adjacent = new Map<string, Set<string>>();
-  const link = (a: string, b: string) => {
-    if (!adjacent.has(a)) adjacent.set(a, new Set());
-    adjacent.get(a)!.add(b);
-  };
-  for (const e of Object.values(atlas)) {
-    if (!e?.roomId || !e.doors) continue;
-    for (const d of Object.values(e.doors)) {
-      if (!d?.targetRoomId) continue;
-      link(e.roomId, d.targetRoomId);
-      link(d.targetRoomId, e.roomId);
-    }
-  }
-  const component = new Set<string>([welcomeRoomId]);
-  const queue = [welcomeRoomId];
-  while (queue.length > 0) {
-    const rid = queue.shift()!;
-    for (const next of adjacent.get(rid) ?? []) {
-      if (component.has(next) || component.size >= MAX_ENTRIES) continue;
-      component.add(next);
-      queue.push(next);
-    }
-  }
+  const component = atlasComponent(atlas, welcomeRoomId);
+  const berths = berthDoorIds(atlas);
   for (const rid of component) {
     const e = atlas[rid];
     if (!e?.doors) continue;
     const doors: BundledAtlasEntry['doors'] = {};
     for (const [id, d] of Object.entries(e.doors)) {
-      if (!d?.targetRoomId) continue;
+      // ⚓ A visiting ship's berth is not the station's layout.
+      if (!d?.targetRoomId || berths.get(e.roomId)?.has(id)) continue;
       doors[id] = {
         targetRoomId: d.targetRoomId,
         ...(d.wall !== undefined ? { wall: d.wall } : {}),
@@ -238,7 +223,7 @@ export function atlasForBundle(
         ...(d.segments !== undefined ? { segments: d.segments } : {}),
       };
     }
-    if (Object.keys(doors).length === 0) continue;
+    if (Object.keys(doors).length === 0 && rid !== welcomeRoomId) continue;
     out[rid] = {
       roomId: rid,
       name: e.name,

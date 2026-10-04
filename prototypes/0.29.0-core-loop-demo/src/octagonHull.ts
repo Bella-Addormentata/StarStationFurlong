@@ -32,11 +32,13 @@ import {
   type HullSectionOpts,
   type OctagonProfile,
   type SectionEdge,
+  type SectionPoint,
   type NarrowAxis,
   type StripEdge,
   type HullSurface,
 } from './hullSection';
 import { resolveWallpaper, type WallpaperPresetId, type WallpaperSpec } from './wallpaper';
+import { cupolaPlan, cupolaStripRun, cupolaTipOutline, type CupolaPlan, type CupolaWall } from './cupola';
 
 const HULL_COLOR = { wall: 0x2f4256, roof: 0x9bd4e8, basement: 0x24313f };
 /** First-person resting opacities (you're INSIDE — see everything). The roof is
@@ -123,8 +125,12 @@ export function buildOctagonHull(
   windows: HullWindows = {},
   wallpapers: HullWallpapers = {},
   doors: HullDoorOpening[] = [],
+  cupolaWall: CupolaWall | null = null,
 ): OctagonHull {
   const profile = computeOctagonProfile(opts);
+  // 🔭 an end wall made a cupola (cupola.ts): the strips stop where it tapers.
+  const cupola = cupolaPlan(opts, cupolaWall);
+  const [bLo, bHi] = stripRun(profile, cupola);
   const {
     narrowAxis,
     longHalf,
@@ -166,8 +172,15 @@ export function buildOctagonHull(
   };
 
   // 🚪 Door apertures per vertical face (the two side-wall strips, the two
-  // end-cap wall bands) — clamped to the face and merged ONCE, here.
+  // end-cap wall bands) — clamped to the face and merged ONCE, here. A cupola
+  // shortens the side walls and takes no doors itself (the editor refuses
+  // both; this only keeps a stray peer record from breaking the outline).
   const doorNotches = doorNotchesByFace(profile, doors);
+  if (cupola) {
+    doorNotches[cupola.cap] = [];
+    doorNotches['wall-neg'] = clipNotches(doorNotches['wall-neg'], bLo, bHi);
+    doorNotches['wall-pos'] = clipNotches(doorNotches['wall-pos'], bLo, bHi);
+  }
 
   // ── The 8 extruded strips (one per octagon edge), sorted into wall / roof /
   //    basement so the cutaway can treat each region differently. Every strip
@@ -186,10 +199,10 @@ export function buildOctagonHull(
     // that would run into a door aperture is dropped with its pane — the two
     // cannot share wall, and a hole crossing the notched outline breaks the
     // triangulation the same way an out-of-bounds one does (see clampOpening).
-    const openings = clampedOpenings(windows[surface], strip, longHalf).filter(
+    const openings = clampedOpenings(windows[surface], strip, bLo, bHi).filter(
       (o) => !openingHitsNotch(o, notches),
     );
-    const geo = stripGeometry(narrowAxis, strip, longHalf, openings, notches);
+    const geo = stripGeometry(narrowAxis, strip, bLo, bHi, openings, notches);
     geometries.push(geo);
 
     // 🪟 translucent glass filling each opening (barely-there blue — the view
@@ -234,6 +247,7 @@ export function buildOctagonHull(
   // ── The 2 octagon END CAPS (gable ends) — split into wall band / roof gable /
   //    basement gable so each obeys the same cutaway rule as the strips. ──────
   for (const sign of [-1, 1] as const) {
+    if (cupola && cupola.sign === sign) continue; // 🔭 built as glass below
     const b = sign * longHalf;
     const normal = verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg');
     const capQuad = (
@@ -303,6 +317,35 @@ export function buildOctagonHull(
       mesh.name = 'octagon-cap-basement';
       group.add(mesh);
       basementMeshes.push({ mesh, material: mat });
+    }
+  }
+
+  // ── 🔭 The cupola: 8 framed glass faces tapering to the framed tip window.
+  //    Each piece joins the cutaway group of the hull region it continues. ──
+  if (cupola) {
+    for (const piece of cupolaPieces(cupola)) {
+      const color =
+        piece.region === 'wall' ? HULL_COLOR.wall : piece.region === 'roof' ? HULL_COLOR.roof : HULL_COLOR.basement;
+      const pane = framedPane(piece.corners, CUPOLA_FRAME);
+      if (!pane) continue;
+      geometries.push(pane.frame);
+      const mat = mkMat(color);
+      const mesh = new THREE.Mesh(pane.frame, mat);
+      mesh.name = 'cupola-frame';
+      group.add(mesh);
+      const glass: THREE.Mesh[] = [];
+      if (pane.glass) {
+        geometries.push(pane.glass);
+        const gMat = newGlassMaterial();
+        materials.push(gMat);
+        const gMesh = new THREE.Mesh(pane.glass, gMat);
+        gMesh.name = 'cupola-glass';
+        group.add(gMesh);
+        glass.push(gMesh);
+      }
+      if (piece.region === 'wall') wallFaces.push({ mesh, material: mat, normal: piece.normal, glass });
+      else if (piece.region === 'roof') roofMeshes.push({ mesh, material: mat, glass });
+      else basementMeshes.push({ mesh, material: mat, glass });
     }
   }
 
@@ -386,9 +429,12 @@ export function buildOctagonShell(
   opts: HullSectionOpts,
   style: OctagonShellStyle = {},
   windows: HullWindows = {},
+  cupolaWall: CupolaWall | null = null,
 ): OctagonShell {
   const profile = computeOctagonProfile(opts);
   const { narrowAxis, longHalf, outline, edges } = profile;
+  const cupola = cupolaPlan(opts, cupolaWall);
+  const [bLo, bHi] = stripRun(profile, cupola);
   const hull = style.hull ?? 0x3a4556;
   const roofC = style.roof ?? 0x2f3a4c;
   const baseC = style.basement ?? 0x27303d;
@@ -419,8 +465,8 @@ export function buildOctagonShell(
   edges.forEach((edge, edgeIndex) => {
     const surface = SURFACE_BY_EDGE[edgeIndex];
     const strip = surfaceEdge(profile, surface);
-    const openings = clampedOpenings(windows[surface], strip, longHalf);
-    const geo = stripGeometry(narrowAxis, strip, longHalf, openings);
+    const openings = clampedOpenings(windows[surface], strip, bLo, bHi);
+    const geo = stripGeometry(narrowAxis, strip, bLo, bHi, openings);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(faceColor(edge.kind)));
     mesh.name = `octagon-shell-${edge.kind}`;
@@ -438,11 +484,32 @@ export function buildOctagonShell(
     }
   });
   for (const sign of [-1, 1] as const) {
+    if (cupola && cupola.sign === sign) continue; // 🔭 the cupola closes this end
     const geo = capGeometry(profile, sign * longHalf);
     geometries.push(geo);
     const mesh = new THREE.Mesh(geo, mk(hull));
     mesh.name = 'octagon-shell-cap';
     group.add(mesh);
+  }
+
+  // 🔭 the cupola's framed glass, seen from outside.
+  if (cupola) {
+    for (const piece of cupolaPieces(cupola)) {
+      const pane = framedPane(piece.corners, CUPOLA_FRAME);
+      if (!pane) continue;
+      geometries.push(pane.frame);
+      const mesh = new THREE.Mesh(pane.frame, mk(hull));
+      mesh.name = 'octagon-shell-cupola-frame';
+      group.add(mesh);
+      if (pane.glass) {
+        geometries.push(pane.glass);
+        const gMat = newGlassMaterial();
+        materials.push(gMat);
+        const gMesh = new THREE.Mesh(pane.glass, gMat);
+        gMesh.name = 'octagon-shell-cupola-glass';
+        group.add(gMesh);
+      }
+    }
   }
 
   // Seam outline (both octagon rings + longitudinal connectors) — depth-tested,
@@ -452,12 +519,21 @@ export function buildOctagonShell(
     const push = (a: { x: number; y: number; z: number }, b: { x: number; y: number; z: number }) =>
       pts.push(a.x, a.y, a.z, b.x, b.y, b.z);
     const n = outline.length;
+    // 🔭 with a cupola the barrel's rings stand at the strip ends (bLo/bHi)
+    // and the tip octagon is ringed and joined to the base.
+    const tip = cupola ? cupolaTipOutline(profile, cupola.depth) : null;
     for (let i = 0; i < n; i++) {
       const p = outline[i];
       const q = outline[(i + 1) % n];
-      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, q.a, q.y, -longHalf));
-      push(sectionToWorld(narrowAxis, p.a, p.y, longHalf), sectionToWorld(narrowAxis, q.a, q.y, longHalf));
-      push(sectionToWorld(narrowAxis, p.a, p.y, -longHalf), sectionToWorld(narrowAxis, p.a, p.y, longHalf));
+      push(sectionToWorld(narrowAxis, p.a, p.y, bLo), sectionToWorld(narrowAxis, q.a, q.y, bLo));
+      push(sectionToWorld(narrowAxis, p.a, p.y, bHi), sectionToWorld(narrowAxis, q.a, q.y, bHi));
+      push(sectionToWorld(narrowAxis, p.a, p.y, bLo), sectionToWorld(narrowAxis, p.a, p.y, bHi));
+      if (tip && cupola) {
+        const tp = tip[i];
+        const tq = tip[(i + 1) % n];
+        push(sectionToWorld(narrowAxis, tp.a, tp.y, cupola.tipB), sectionToWorld(narrowAxis, tq.a, tq.y, cupola.tipB));
+        push(sectionToWorld(narrowAxis, p.a, p.y, cupola.b0), sectionToWorld(narrowAxis, tp.a, tp.y, cupola.tipB));
+      }
     }
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3));
@@ -570,9 +646,9 @@ const WINDOW_INSET = 0.05;
  * than emit a broken pane. The hole and its glass both consume this result, so
  * they can never diverge.
  */
-function clampOpening(strip: StripEdge, longHalf: number, o: WindowOpening): WindowOpening | null {
-  if (o.w > 2 * longHalf - 2 * WINDOW_INSET || o.h > strip.edgeLen - 2 * WINDOW_INSET) return null;
-  const along = Math.max(-longHalf + o.w / 2 + WINDOW_INSET, Math.min(longHalf - o.w / 2 - WINDOW_INSET, o.along));
+function clampOpening(strip: StripEdge, bLo: number, bHi: number, o: WindowOpening): WindowOpening | null {
+  if (o.w > bHi - bLo - 2 * WINDOW_INSET || o.h > strip.edgeLen - 2 * WINDOW_INSET) return null;
+  const along = Math.max(bLo + o.w / 2 + WINDOW_INSET, Math.min(bHi - o.w / 2 - WINDOW_INSET, o.along));
   const across = Math.max(o.h / 2 + WINDOW_INSET, Math.min(strip.edgeLen - o.h / 2 - WINDOW_INSET, o.across));
   return { ...o, along, across };
 }
@@ -581,12 +657,13 @@ function clampOpening(strip: StripEdge, longHalf: number, o: WindowOpening): Win
 function clampedOpenings(
   raw: WindowOpening[] | undefined,
   strip: StripEdge,
-  longHalf: number,
+  bLo: number,
+  bHi: number,
 ): WindowOpening[] {
   const out: WindowOpening[] = [];
   if (raw) {
     for (const o of raw) {
-      const c = clampOpening(strip, longHalf, o);
+      const c = clampOpening(strip, bLo, bHi, o);
       if (c) out.push(c);
     }
   }
@@ -594,7 +671,8 @@ function clampedOpenings(
 }
 
 /**
- * 🪟 A hull STRIP face, spanning the extrude axis [−longHalf, longHalf] × across
+ * 🪟 A hull STRIP face, spanning the extrude axis [bLo, bHi] (the whole
+ * [−longHalf, longHalf] unless a cupola shortens it) × across
  * [0, edgeLen]. No openings ⇒ a plain quad (the same 4 world corners as the
  * legacy per-edge quad); with openings ⇒ a ShapeGeometry (strip rect minus
  * rounded-rect window holes), triangulated in strip-local (u=along, v=across)
@@ -608,7 +686,8 @@ function clampedOpenings(
 function stripGeometry(
   narrowAxis: NarrowAxis,
   strip: StripEdge,
-  longHalf: number,
+  bLo: number,
+  bHi: number,
   openings: WindowOpening[],
   notches: readonly DoorNotch[] = [],
 ): THREE.BufferGeometry {
@@ -618,19 +697,19 @@ function stripGeometry(
     // tiles at a fixed per-metre scale — matching the ShapeGeometry path below,
     // whose UVs are the shape's own (along, across) coords.
     return quadGeometry(
-      stripToWorld(narrowAxis, strip, -longHalf, 0),
-      stripToWorld(narrowAxis, strip, -longHalf, edgeLen),
-      stripToWorld(narrowAxis, strip, longHalf, edgeLen),
-      stripToWorld(narrowAxis, strip, longHalf, 0),
+      stripToWorld(narrowAxis, strip, bLo, 0),
+      stripToWorld(narrowAxis, strip, bLo, edgeLen),
+      stripToWorld(narrowAxis, strip, bHi, edgeLen),
+      stripToWorld(narrowAxis, strip, bHi, 0),
       [
-        { u: -longHalf, v: 0 },
-        { u: -longHalf, v: edgeLen },
-        { u: longHalf, v: edgeLen },
-        { u: longHalf, v: 0 },
+        { u: bLo, v: 0 },
+        { u: bLo, v: edgeLen },
+        { u: bHi, v: edgeLen },
+        { u: bHi, v: 0 },
       ],
     );
   }
-  const shape = faceShape(notchedFaceOutline(-longHalf, longHalf, edgeLen, notches));
+  const shape = faceShape(notchedFaceOutline(bLo, bHi, edgeLen, notches));
   for (const o of openings) {
     shape.holes.push(roundedRectPath(o.along, o.across, o.w, o.h, o.r));
   }
@@ -887,4 +966,192 @@ function capGeometry(profile: OctagonProfile, b: number): THREE.BufferGeometry {
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
   geo.computeVertexNormals();
   return geo;
+}
+
+// ── 🔭 Cupola end wall (cupola.ts) ──────────────────────────────────────────
+
+/** Width (m) of the frame round each cupola pane. */
+const CUPOLA_FRAME = 0.14;
+
+/** The extrude-axis run the barrel strips cover (cupola.cupolaStripRun — the
+ *  window editor clamps to the same run). */
+function stripRun(profile: OctagonProfile, cupola: CupolaPlan | null): [number, number] {
+  return cupolaStripRun(cupola, profile.longHalf);
+}
+
+/** Door notches trimmed to a shortened side wall (DOOR_FACE_INSET kept at its
+ *  ends, as doorNotchesByFace does for the full wall). */
+function clipNotches(notches: readonly DoorNotch[], lo: number, hi: number): DoorNotch[] {
+  const out: DoorNotch[] = [];
+  for (const n of notches) {
+    const clipped = { lo: Math.max(n.lo, lo + DOOR_FACE_INSET), hi: Math.min(n.hi, hi - DOOR_FACE_INSET), top: n.top };
+    if (clipped.hi - clipped.lo >= MIN_NOTCH) out.push(clipped);
+  }
+  return out;
+}
+
+type V3 = { x: number; y: number; z: number };
+
+/** One flat piece of the cupola: a frustum face or a band of the tip window. */
+export interface CupolaPiece {
+  /** The hull region it continues — decides its colour and its cutaway. */
+  region: 'wall' | 'roof' | 'basement';
+  /** Corners in world space, in order round the (planar, convex) piece. */
+  corners: V3[];
+  /** Outward plan normal (the cutaway's near/far test; walls only matter). */
+  normal: { x: number; z: number };
+}
+
+/**
+ * The cupola as flat pieces: the 8 frustum faces (face i joins base-octagon
+ * edge i at `b0` to tip-octagon edge i at the end plane) and the tip window
+ * cut into the same three bands as an end cap — wall band, roof gable,
+ * basement gable — so each band follows its region's cutaway. Degenerate
+ * pieces (a basement-less room's lower faces) are left out.
+ */
+export function cupolaPieces(plan: CupolaPlan): CupolaPiece[] {
+  const { profile, sign, b0, tipB, depth } = plan;
+  const { narrowAxis, outline, edges } = profile;
+  const tip = cupolaTipOutline(profile, depth);
+  const w = (p: SectionPoint, b: number) => sectionToWorld(narrowAxis, p.a, p.y, b);
+  const regionOf = (kind: SectionEdge['kind']): CupolaPiece['region'] =>
+    kind === 'wall' ? 'wall' : kind.startsWith('roof') ? 'roof' : 'basement';
+  const pieces: CupolaPiece[] = [];
+  const capNormal = verticalFaceNormal(narrowAxis, sign > 0 ? 'cap-pos' : 'cap-neg');
+
+  for (const edge of edges) {
+    const corners = [w(outline[edge.from], b0), w(outline[edge.to], b0), w(tip[edge.to], tipB), w(tip[edge.from], tipB)];
+    // Plan normal: the face leans out along the extrude axis and, for the two
+    // wall faces, out to its side too (a 45° cut corner).
+    const side = edge.kind === 'wall' ? Math.sign(outline[edge.from].a) : 0;
+    const n = side === 0 ? capNormal : planNormal(narrowAxis, side, sign);
+    pieces.push({ region: regionOf(edge.kind), corners, normal: n });
+  }
+  // Tip window bands: vertices 0,1,4,5 are the wall band; 1-4 the roof
+  // gable; 5,6,7,0 the basement gable (same indices as the outline).
+  const band = (idx: number[]) => idx.map((i) => w(tip[i], tipB));
+  pieces.push({ region: 'wall', corners: band([0, 1, 4, 5]), normal: capNormal });
+  pieces.push({ region: 'roof', corners: band([1, 2, 3, 4]), normal: capNormal });
+  pieces.push({ region: 'basement', corners: band([5, 6, 7, 0]), normal: capNormal });
+  return pieces.filter((p) => polygonArea3(p.corners) > 1e-4);
+}
+
+/** Unit plan normal leaning `side` along the narrow axis and `sign` along the
+ *  extrude axis (a 45° diagonal). */
+function planNormal(narrowAxis: NarrowAxis, side: number, sign: number): { x: number; z: number } {
+  const s = Math.SQRT1_2;
+  return narrowAxis === 'x' ? { x: side * s, z: sign * s } : { x: sign * s, z: side * s };
+}
+
+function sub(a: V3, b: V3): V3 {
+  return { x: a.x - b.x, y: a.y - b.y, z: a.z - b.z };
+}
+function cross(a: V3, b: V3): V3 {
+  return { x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x };
+}
+function dot(a: V3, b: V3): number {
+  return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+function norm(a: V3): V3 {
+  const l = Math.hypot(a.x, a.y, a.z) || 1;
+  return { x: a.x / l, y: a.y / l, z: a.z / l };
+}
+
+/** Area of a planar 3-D polygon (Newell). */
+function polygonArea3(pts: V3[]): number {
+  let n: V3 = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i < pts.length; i++) {
+    const c = cross(pts[i], pts[(i + 1) % pts.length]);
+    n = { x: n.x + c.x, y: n.y + c.y, z: n.z + c.z };
+  }
+  return Math.hypot(n.x, n.y, n.z) / 2;
+}
+
+/** Inset a convex CCW 2-D polygon by `d` (each edge moved inward, adjacent
+ *  lines intersected). Null when the inset would turn it inside out. Edges
+ *  shorter than a hair are dropped first so a near-triangle insets cleanly. */
+function insetConvex(pts: Array<{ u: number; v: number }>, d: number): Array<{ u: number; v: number }> | null {
+  const poly = pts.filter((p, i) => {
+    const q = pts[(i + 1) % pts.length];
+    return Math.hypot(q.u - p.u, q.v - p.v) > 1e-6;
+  });
+  const n = poly.length;
+  if (n < 3) return null;
+  const lines = poly.map((p, i) => {
+    const q = poly[(i + 1) % n];
+    const len = Math.hypot(q.u - p.u, q.v - p.v);
+    const du = (q.u - p.u) / len;
+    const dv = (q.v - p.v) / len;
+    // CCW ⇒ the interior is to the LEFT: inward normal (−dv, du).
+    return { pu: p.u - dv * d, pv: p.v + du * d, du, dv };
+  });
+  const out: Array<{ u: number; v: number }> = [];
+  for (let i = 0; i < n; i++) {
+    const l1 = lines[(i + n - 1) % n];
+    const l2 = lines[i];
+    const den = l1.du * l2.dv - l1.dv * l2.du;
+    if (Math.abs(den) < 1e-9) return null;
+    const t = ((l2.pu - l1.pu) * l2.dv - (l2.pv - l1.pv) * l2.du) / den;
+    out.push({ u: l1.pu + l1.du * t, v: l1.pv + l1.dv * t });
+  }
+  // Inside out? Every inset edge must still run the way its source edge did.
+  for (let i = 0; i < n; i++) {
+    const a = out[i];
+    const b = out[(i + 1) % n];
+    if ((b.u - a.u) * lines[i].du + (b.v - a.v) * lines[i].dv <= 1e-4) return null;
+  }
+  return out;
+}
+
+/**
+ * A framed pane on a planar convex 3-D polygon: the `frame`-wide border as
+ * one geometry and the glass inside it as another. A piece too small to hold
+ * a pane is all frame (glass null). Null only for a degenerate polygon.
+ */
+function framedPane(corners: V3[], frame: number): { frame: THREE.BufferGeometry; glass: THREE.BufferGeometry | null } | null {
+  if (corners.length < 3 || polygonArea3(corners) < 1e-6) return null;
+  const o = corners[0];
+  // Face basis: u along the first non-degenerate edge, v in-plane, CCW order.
+  let e = sub(corners[1], o);
+  if (Math.hypot(e.x, e.y, e.z) < 1e-6) e = sub(corners[2], o);
+  const u = norm(e);
+  let nrm: V3 = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i < corners.length; i++) {
+    const c = cross(corners[i], corners[(i + 1) % corners.length]);
+    nrm = { x: nrm.x + c.x, y: nrm.y + c.y, z: nrm.z + c.z };
+  }
+  nrm = norm(nrm);
+  const v = cross(nrm, u); // with Newell's normal the corners run CCW in (u, v)
+  const flat = corners.map((p) => {
+    const r = sub(p, o);
+    return { u: dot(r, u), v: dot(r, v) };
+  });
+  const toWorld = (geo: THREE.BufferGeometry): THREE.BufferGeometry => {
+    const pos = geo.attributes.position;
+    const out = new Float32Array(pos.count * 3);
+    for (let i = 0; i < pos.count; i++) {
+      const a = pos.getX(i);
+      const b = pos.getY(i);
+      out[i * 3] = o.x + u.x * a + v.x * b;
+      out[i * 3 + 1] = o.y + u.y * a + v.y * b;
+      out[i * 3 + 2] = o.z + u.z * a + v.z * b;
+    }
+    geo.setAttribute('position', new THREE.BufferAttribute(out, 3));
+    geo.computeVertexNormals();
+    return geo;
+  };
+  const shapeOf = (pts: Array<{ u: number; v: number }>, P: typeof THREE.Shape | typeof THREE.Path) => {
+    const s = new P();
+    pts.forEach((p, i) => (i === 0 ? s.moveTo(p.u, p.v) : s.lineTo(p.u, p.v)));
+    s.closePath();
+    return s;
+  };
+  const inner = insetConvex(flat, frame);
+  const outer = shapeOf(flat, THREE.Shape) as THREE.Shape;
+  if (!inner) return { frame: toWorld(new THREE.ShapeGeometry(outer)), glass: null };
+  outer.holes.push(shapeOf(inner, THREE.Path));
+  return {
+    frame: toWorld(new THREE.ShapeGeometry(outer)),
+    glass: toWorld(new THREE.ShapeGeometry(shapeOf(inner, THREE.Shape) as THREE.Shape)),
+  };
 }

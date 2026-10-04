@@ -32,43 +32,78 @@ import { YjsSync } from './network/YjsSync';
 import type { RoomBootstrap } from './network/protocol';
 import { ysyncSigner } from './keypair';
 import { readAllDoorsFrom, readDoorFrom, writeDoorRecordTo } from './doorsDoc';
-import { dockPortFlagIn, fitDockPortIn } from './doorPolicy';
+import { dockGatesIn, dockPortFlagIn, fitDockPortIn, gateAccessIn } from './doorPolicy';
+import { freeGateNumber, readAtlas, roomIdFromSeed, withSharedAtlasOf } from './stationAtlas';
 import { doorExistsIn } from './doorLayoutDoc';
 import {
   farDockPatch, farUndockPatch, findFarDoor, holdsDockTo, type NearEnd,
 } from './dockRules';
 import type { FarDockRequest, FarDockResult } from './docking';
+import { rememberMovesIn, roomDocLockedByMove } from './stationMove';
 
 // ── The decision (pure over a doc) ───────────────────────────────────────────
 
 /**
- * Apply one DOCK / UNDOCK to the far room's doc. Returns what to tell the
- * player and whether anything was written (only a write needs an ack).
+ * Apply one DOCK / UNDOCK to the far room's doc, or answer a legacy berth's
+ * release (read only). Returns what to tell the player and whether anything
+ * was written (only a write needs an ack). `farRoomId` is the room the doc
+ * is (by default, the one its address names), and `nowMs` the moment a DOCK
+ * is judged at (an UNDOCK or a release goes by its own stamp, never later
+ * than `nowMs`: releaseMoment).
  */
 export function applyFarDockRequest(
   doc: Y.Doc,
   req: FarDockRequest,
   near: NearEnd,
+  farRoomId: string = roomIdFromSeed(req.farAddress),
+  nowMs: number = Date.now(),
 ): { result: FarDockResult; wrote: boolean } {
+  if (req.kind === 'release') {
+    // 🚚 A legacy berth's far end is not this end's to change (DETACH lets
+    // go of this end only), but its room may know of a move the asking
+    // install has not heard of: judged as an UNDOCK is (releaseMoment).
+    return roomDocLockedByMove(doc, farRoomId, releaseMoment(req.undockedAt, nowMs))
+      ? { result: { ok: false, reason: 'moving' }, wrote: false }
+      : { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
+  }
   if (req.kind === 'undock') {
     // A named door is read on its own (readDoorFrom — the capped snapshot
     // could hide it); the snapshot only serves the scan when none is named.
     const farDoor =
       req.farDoor || findFarDoor(readAllDoorsFrom(doc), near.roomId, near.doorId);
     if (!farDoor) return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
-    const patch = farUndockPatch(readDoorFrom(doc, farDoor), near, req.undockedAt, req.onlyDockedAt);
+    const patch = farUndockPatch(readDoorFrom(doc, farDoor), near, req.undockedAt, req.onlyDockedAt, req.at);
     if (patch.action === 'skip') {
       return { result: { ok: true, detail: 'nothing-to-undo' }, wrote: false };
+    }
+    // 🚚 Nor does a station between planets let go of a ship, by the moves
+    // booked in this room too (as for a DOCK below): one the asking install
+    // has not heard of yet would set the ship loose mid-transfer. Judged at
+    // the release's own moment (releaseMoment), so one made before its
+    // station left still lands however late it gets here; a take-back of a
+    // DOCK this client never completed (onlyDockedAt) is never held.
+    if (req.onlyDockedAt === undefined && roomDocLockedByMove(doc, farRoomId, releaseMoment(req.undockedAt, nowMs))) {
+      return { result: { ok: false, reason: 'moving' }, wrote: false };
     }
     writeDoorRecordTo(doc, farDoor, patch.record);
     return { result: { ok: true, detail: 'written' }, wrote: true };
   }
+  // 🚚 No ship joins a station between planets, by the moves booked in the
+  // berth's own room too: one this install has not heard of yet would let
+  // both sides pair with a station already gone.
+  if (roomDocLockedByMove(doc, farRoomId, nowMs)) {
+    return { result: { ok: false, reason: 'moving' }, wrote: false };
+  }
+  // The requester's key is its own claim, as every door write is in the
+  // dev phase (doorPolicy's enforcement posture): signed records are #67 D3.
+  const access = gateAccessIn(doc, req.farDoor, req.requesterPub);
   const patch = farDockPatch(
     readDoorFrom(doc, req.farDoor),
     farBerth(doc, req.farDoor),
     near,
     req.dockedAt,
     req.replacesUndockedAt,
+    access,
   );
   if (patch.action === 'refuse') {
     return {
@@ -76,17 +111,49 @@ export function applyFarDockRequest(
         ok: false,
         reason: patch.reason,
         ...(patch.stamp !== undefined ? { stamp: patch.stamp } : {}),
+        // 🚏⚓🚦 Which setting refused: a route's keeper tells a gate open
+        // only to granted captains (this rider's key) from one shut to the
+        // ship. Additive; the refusal itself is farDockPatch's, unchanged.
+        ...(patch.reason === 'not-allowed' && access.access !== 'open' ? { gateAccess: access.access } : {}),
       },
       wrote: false,
     };
+  }
+  // ⚓🚦 A port born of a DOCK takes the far station's lowest free gate; with
+  // every number taken, neither record is written. The far doc's shared atlas
+  // is read too: on a first visit this client's own atlas may not know the far
+  // station's other rooms or the gates they already use.
+  const newPort = !dockPortFlagIn(doc, req.farDoor);
+  const gate = newPort
+    ? freeGateNumber(
+      withSharedAtlasOf(doc, readAtlas(), farRoomOf(req.farAddress)), farRoomOf(req.farAddress), dockGatesIn(doc),
+    )
+    : null;
+  if (newPort && gate === null) {
+    return { result: { ok: false, reason: 'no-gate' }, wrote: false };
   }
   // One transaction: the berth's record and its port land together, so no
   // peer ever sees a dock on a door without its half.
   doc.transact(() => {
     writeDoorRecordTo(doc, req.farDoor, patch.record);
-    fitDockPortIn(doc, req.farDoor);
+    if (newPort) fitDockPortIn(doc, req.farDoor, gate);
   });
   return { result: { ok: true, detail: 'written' }, wrote: true };
+}
+
+/** The far room's id from its address ('' when it names none). */
+function farRoomOf(address: string): string {
+  try { return roomIdFromSeed(address); } catch { return ''; }
+}
+
+/** 🚚 The moment a release (an UNDOCK, or a legacy berth's) is judged at:
+ *  its own stamp, so one made before its station left still lands however
+ *  late it gets here, but never later than `nowMs`. A stamp ahead of now (a
+ *  door stamp is any positive time, and stampAfter keeps a dock's stamped
+ *  ahead) is judged as it lands: a station between planets now holds it,
+ *  whenever it says it arrives. Its record keeps its own stamp. */
+function releaseMoment(undockedAt: number, nowMs: number): number {
+  return Math.min(undockedAt, nowMs);
 }
 
 /** What farDockPatch needs to know about the far door besides its record. */
@@ -219,7 +286,7 @@ async function sameRoomWrite(
 ): Promise<FarDockResult> {
   const doc = d.activeRoomDoc(near.roomId);
   if (!doc) return { ok: false, reason: 'unreachable' };
-  const { result, wrote } = applyFarDockRequest(doc, req, near);
+  const { result, wrote } = applyFarDockRequest(doc, req, near, near.roomId);
   if (!wrote || req.kind !== 'dock') return result;
   await new Promise((r) => setTimeout(r, SETTLE_MS));
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return result;
@@ -351,33 +418,14 @@ async function session(
     // it must not now find a write it was never told about. Otherwise the
     // write begins, and its outcome is this session's to report.
     if (!mayWrite()) return { ok: false, reason: 'unreachable' };
-    // Read-before-write: the decision sees the far room's real state, so the
-    // write is causally AFTER the record it replaces and wins everywhere.
-    const since = Y.encodeStateVector(s.doc);
-    const { result, wrote } = applyFarDockRequest(s.doc, req, near);
-    written = wrote;
-    if (wrote && !(await s.confirmOwnWrites(since, ACK_TIMEOUT_MS))) {
-      console.warn(`[farDoorWrite] ${boot.roomId}: the node did not acknowledge the write`);
-      // Unacknowledged is not unwritten: the write may still land.
-      return { ok: false, reason: 'unreachable', unconfirmed: true };
-    }
-    if (wrote && req.kind === 'dock') {
-      // Concurrent claims on the same berth get a moment to arrive (they are
-      // applied to this doc as they do); then only the claim the CRDT kept
-      // has docked.
-      await new Promise((r) => setTimeout(r, SETTLE_MS));
-      const lost = berthAfterSettle(s.doc, req, near);
-      if (lost) {
-        console.warn(
-          `[farDoorWrite] ${boot.roomId}: another claim on ${req.farDoor} won the berth (${lost.ok ? '' : lost.reason})`,
-        );
-        return lost;
-      }
-    }
-    console.log(
-      `⚓ Far dock write → ${boot.roomId}: ${req.kind} ${result.ok ? result.detail : result.reason}`,
+    return await writeAndSettle(
+      s.doc,
+      req,
+      near,
+      boot.roomId,
+      (since) => s.confirmOwnWrites(since, ACK_TIMEOUT_MS),
+      () => { written = true; },
     );
-    return result;
   } catch (err) {
     console.warn('[farDoorWrite] far room session failed:', err);
     return { ok: false, reason: 'unreachable', ...(written ? { unconfirmed: true } : {}) };
@@ -394,11 +442,72 @@ async function session(
   }
 }
 
+/**
+ * The far write over the far room's doc, once its state has arrived, and
+ * what follows it (exported for its test): the node's acknowledgment
+ * (`confirm`, given the state vector from before the write) and, for a DOCK,
+ * the settle among rival claims (berthAfterSettle). `onWritten` hears that
+ * the write was made, before either wait. 🚚 The moves the far room holds are
+ * learned as the write is decided, and again once those waits are over,
+ * whatever they decided: a move booked there meanwhile (a tow, say) holds as
+ * much as one booked before, and the caller judges what it does next by the
+ * moves known here (docking.ts redockPort: dockLockedByMove, berthStillThere).
+ */
+export async function writeAndSettle(
+  doc: Y.Doc,
+  req: FarDockRequest,
+  near: NearEnd,
+  farRoomId: string,
+  confirm: (since: Uint8Array) => Promise<boolean>,
+  onWritten: () => void = () => {},
+): Promise<FarDockResult> {
+  // Read-before-write: the decision sees the far room's real state, so the
+  // write is causally AFTER the record it replaces and wins everywhere.
+  const since = Y.encodeStateVector(doc);
+  const { result, wrote } = applyFarDockRequest(doc, req, near, farRoomId);
+  if (wrote) onWritten();
+  // 🚚 Learn the moves the far room holds, whatever it decided: one this
+  // install had not heard of refused the request (the station list then
+  // shows that station between planets too), or moved its station since
+  // this install last heard (an UNDOCK then records where it really let
+  // go: docking.ts undockPort).
+  rememberMovesIn(doc);
+  if (wrote) {
+    try {
+      if (!(await confirm(since))) {
+        console.warn(`[farDoorWrite] ${farRoomId}: the node did not acknowledge the write`);
+        // Unacknowledged is not unwritten: the write may still land.
+        return { ok: false, reason: 'unreachable', unconfirmed: true };
+      }
+      if (req.kind === 'dock') {
+        // Concurrent claims on the same berth get a moment to arrive (they are
+        // applied to this doc as they do); then only the claim the CRDT kept
+        // has docked.
+        await new Promise((r) => setTimeout(r, SETTLE_MS));
+        const lost = berthAfterSettle(doc, req, near);
+        if (lost) {
+          console.warn(
+            `[farDoorWrite] ${farRoomId}: another claim on ${req.farDoor} won the berth (${lost.ok ? '' : lost.reason})`,
+          );
+          return lost;
+        }
+      }
+    } finally {
+      rememberMovesIn(doc);
+    }
+  }
+  console.log(
+    `⚓ Far dock write → ${farRoomId}: ${req.kind} ${result.ok ? result.detail : result.reason}`,
+  );
+  return result;
+}
+
 /** Wait for roomStateReady on a doc that is not the active one. Until it
  *  holds, the replica is EMPTY (or, for a room hosted elsewhere, possibly
  *  STALE), and neither is knowledge about the room — a decision made on it
- *  could overwrite a record it simply had not received yet. */
-function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean): Promise<boolean> {
+ *  could overwrite a record it simply had not received yet. (🚏📋 Exported
+ *  for departuresWrite.ts, whose sessions wait the same way.) */
+export function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean): Promise<boolean> {
   const roomMap = sync.doc.getMap('roomInfo');
   const ready = () =>
     roomStateReady({
@@ -441,7 +550,7 @@ function roomStateArrived(sync: YjsSync, timeoutMs: number, hostedHere: boolean)
   });
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+export function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${what} timed out after ${ms} ms`)), ms);
     p.then(

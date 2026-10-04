@@ -7,7 +7,9 @@
  * other five came to be missed. The fix routed all eight through one helper,
  * and this is the test that keeps the ninth from slipping past: it fails if a
  * method that calls a room-doc writer is not itself gated and is not reached
- * only from methods that are.
+ * only from methods that are. Since #184 that covers the file's module-scope
+ * functions too — `settleCupolaConflicts` writes the floor plan from outside
+ * the class, and a class-only model could only say it had never looked.
  *
  * ⚠️ Like roomOwner.test.ts's #142 block, this SCANS THE SOURCE. editMode.ts
  * cannot be imported here — it touches `window` and THREE at module scope, and
@@ -24,8 +26,10 @@
  * knows only the writers in WRITERS below, so a write reached indirectly
  * through another module (`world.removeFurnitureVisuals`, say) is invisible
  * to it; the import-surface test is the thing that makes a new name get
- * noticed. And it resolves `this.foo()` by name alone, so it would conflate
- * two same-named members and cannot follow a call through a variable.
+ * noticed. It keys the call graph on each declaration's offset, so two units
+ * sharing a name stay apart — `isEditModeActive` is both a method and a
+ * module-scope function here — but it still matches call sites textually and
+ * so cannot follow a call made through a variable.
  *
  * It is also worth saying plainly what the gate is NOT. Nothing authorises a
  * room-doc write today — roomOwner.ts says so outright — so a modified client
@@ -52,6 +56,7 @@ const WRITERS = [
   'writeAirHockeyTheme', // airHockeyThemeDoc
   'addToRoomInventory', // roomInventory
   'clearDoorSlide', // floorPlanDoc — planMap.delete inside a transact
+  'writeCupolaWall', // floorPlanDoc — planMap.set/delete inside a transact
 ] as const;
 
 /** Both forms of gate: the shared helper, and the raw predicate it wraps. */
@@ -98,18 +103,56 @@ const LISTENER_RE = /^ {4}[\w.?]+\.addEventListener\(\s*'([\w-]+)'/gm;
 
 const lineAt = (index: number): number => SRC.slice(0, index).split('\n').length;
 
+/**
+ * The class body as a half-open [classAt, classEnd) range over SRC.
+ *
+ * Both ends earn their keep. Cutting members out of the whole file would let
+ * a two-space `private` in some module-scope declaration pass for a method;
+ * and `cut` runs its last slice to the end of whatever it is handed, so a
+ * final member measured against the file would also own everything written
+ * after the closing brace — today the `roomEdit` singleton and
+ * `isEditModeActive`, whose calls are not that member's to answer for.
+ */
+const classAt = SRC.indexOf('\nclass RoomEditController {');
+const classEnd = SRC.indexOf('\n}', classAt);
+
+/**
+ * A named region of source the scan can look inside. `kind` is not
+ * decoration: it decides how the unit is CALLED, and therefore how the call
+ * graph below finds its callers — `this.foo(` for a member, bare `foo(` for a
+ * module-scope function.
+ */
+type Unit = {
+  name: string; body: string; callBody: string;
+  start: number; end: number; kind: 'member' | 'function';
+};
+
+/**
+ * A declaration is not a call, and the two look identical to a text scan:
+ * `public enter(` reads as a bare `enter(`, which would make that member a
+ * caller of any module-scope function also named `enter` — and so lend it
+ * the member's gate. Every unit opens with its own declaration, so blank
+ * that span for call-graph purposes. Blanked, not cut, so offsets still
+ * line up, and only on the copy the graph reads: writes and gates are still
+ * matched against the untouched body, because a false positive there fails
+ * loudly while a false caller edge quietly manufactures coverage.
+ */
+const blankDecl = (body: string, decl: string): string =>
+  (decl.length > 0 ? ' '.repeat(decl.length) + body.slice(decl.length) : body);
+
 /** [start, end) slices of the source, named for whatever declared them. */
 const cut = (text: string, offset: number, re: RegExp, name: (m: RegExpMatchArray) => string) => {
   const hits = [...text.matchAll(re)];
   return hits.map((h, i) => ({
     name: name(h),
+    raw: h[0],
     start: offset + (h.index ?? 0),
     end: offset + (i + 1 < hits.length ? (hits[i + 1].index ?? text.length) : text.length),
   }));
 };
 
-const members: { name: string; body: string; start: number; end: number }[] = [];
-for (const m of cut(SRC, 0, MEMBER_RE, (h) => h[1] ?? h[2])) {
+const members: Unit[] = [];
+for (const m of cut(SRC.slice(classAt, classEnd), classAt, MEMBER_RE, (h) => h[1] ?? h[2])) {
   // The constructor is replaced by its prologue plus one slice per listener,
   // named for the event and the line so a failure says which handler.
   const listeners = m.name === 'constructor'
@@ -122,9 +165,68 @@ for (const m of cut(SRC, 0, MEMBER_RE, (h) => h[1] ?? h[2])) {
     const name = p.name.endsWith('listener')
       ? `constructor's ${p.name} at line ${lineAt(p.start)}`
       : p.name;
-    members.push({ ...p, name, body: stripComments(SRC.slice(p.start, p.end)) });
+    const body = stripComments(SRC.slice(p.start, p.end));
+    // A listener slice opens at its addEventListener line — code, not a
+    // declaration, and often carrying a real call — so nothing is blanked.
+    const decl = p.name.endsWith('listener') ? '' : p.raw;
+    members.push({ ...p, name, kind: 'member', body, callBody: blankDecl(body, decl) });
   }
 }
+
+/**
+ * Module-scope functions, sliced the same way and held to the same rule.
+ *
+ * Until #184 there were no room-doc writes outside the class, and this file
+ * modelled the class alone. `settleCupolaConflicts` ended that: it is a
+ * top-level `export function` that clears a cupola two players conflicted
+ * over, so it writes the floor plan, and a member-based scan could only
+ * report it as a write it had never looked at — which is exactly what the
+ * homeless check below did say when the cupola work merged. Exempting it
+ * would have been the wrong repair. main.ts calls it after every floor-plan,
+ * door, window and furniture change and once on join, which is the shape of
+ * entry point this file exists to check; so the model grew to cover it, and
+ * the gate it carries is now asserted rather than remembered.
+ *
+ * Unlike members these are brace-matched rather than cut to the next
+ * declaration: a top-level `function` opens at column 0 and closes at column
+ * 0, so the slice is the body and nothing else. That deliberately leaves the
+ * consts and types written between two functions inside neither of them —
+ * module scope is not inside anything, and a write there must stay homeless.
+ */
+const FREE_RE = /^(?:export )?(?:async )?function ([A-Za-z_$][\w$]*)/gm;
+
+const functions: Unit[] = [...SRC.matchAll(FREE_RE)].map((h) => {
+  const start = h.index ?? 0;
+  const close = SRC.indexOf('\n}', start);
+  const end = close < 0 ? SRC.length : close + 2;
+  const body = stripComments(SRC.slice(start, end));
+  return {
+    name: h[1], start, end, kind: 'function' as const, body, callBody: blankDecl(body, h[0]),
+  };
+});
+
+/** Everything the scan can see inside. Anything else is module scope. */
+const units: Unit[] = [...members, ...functions];
+
+/**
+ * A unit's identity, which is NOT its name. `isEditModeActive` is both a
+ * method and the module-scope function main.ts calls to reach it, and the
+ * two must be separate nodes in the graph below: keyed by name, a gate on
+ * either would vouch for the other. Members can collide with each other the
+ * same way, which this file used to list as a limitation and no longer has
+ * to. The declaration offset is what makes the key unique.
+ */
+const idOf = (u: Unit): string => `${u.kind}:${u.name}@${u.start}`;
+
+/**
+ * How a unit is reached from inside this file: `this.foo(` for a member, a
+ * bare `foo(` for a module-scope function. The lookbehind carries the whole
+ * distinction — without it `roomEdit.isEditModeActive()` and
+ * `this.isEditModeActive()` would both read as calls to the free function.
+ */
+const callPattern = (u: Unit): RegExp => (u.kind === 'member'
+  ? new RegExp(`\\bthis\\.${u.name}\\s*\\(`)
+  : new RegExp(`(?<![.\\w$])${u.name}\\s*\\(`));
 
 const bodyOf = (name: string): string =>
   members.filter((m) => m.name === name).map((m) => m.body).join('\n');
@@ -149,9 +251,9 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // a declaration must be the start of a slice. `#private` fields and bare
     // `name() {}` methods are the two forms that would slip through MEMBER_RE
     // today; this says so out loud rather than waiting to find out.
-    const classAt = SRC.indexOf('\nclass RoomEditController {');
     expect(classAt, 'class RoomEditController not found').toBeGreaterThan(0);
-    const classEnd = SRC.indexOf('\n}', classAt);
+    expect(classEnd, 'class RoomEditController never closes at column 0')
+      .toBeGreaterThan(classAt);
     const starts = new Set(members.map((m) => m.start));
     const unmatched: string[] = [];
     for (const m of SRC.slice(classAt, classEnd).matchAll(/^ {2}[A-Za-z_$#][^\n]*/gm)) {
@@ -176,6 +278,77 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       'the constructor was not split into its listeners').toBeGreaterThan(5);
   });
 
+  it('finds every module-scope function, and slices each one to its own body', () => {
+    // The free half's equivalent of 'finds EVERY member', and it matters for
+    // the same reason: a slice that ran long would lend its gate to whatever
+    // followed, and a function the regex missed would have its writes come
+    // back as homeless rather than as a leak — a quieter failure than it
+    // sounds, because homeless is a list nobody expects to be non-empty.
+    expect(functions.length, 'no module-scope functions found').toBeGreaterThan(15);
+    for (const n of ['canEditRoom', 'settleCupolaConflicts', 'isEditModeActive']) {
+      expect(functions.some((f) => f.name === n), `${n} not sliced`).toBe(true);
+    }
+
+    const bad: string[] = [];
+    for (const f of functions) {
+      // One slice, one function: it closes at the first column-0 brace, so a
+      // second column-0 declaration inside it means the first one never
+      // closed and the slice ran on.
+      if (/\n(?:export )?(?:async )?function /.test(f.body)) {
+        bad.push(`${f.name} (line ${lineAt(f.start)}) swallowed a later declaration`);
+      }
+      if (!f.body.trimEnd().endsWith('}')) {
+        bad.push(`${f.name} (line ${lineAt(f.start)}) has no closing brace at column 0`);
+      }
+      // Nothing at module scope may reach into the class, or a method's gate
+      // and a free function's write would land in the same slice.
+      if (f.start < classEnd && f.end > classAt) {
+        bad.push(`${f.name} (line ${lineAt(f.start)}) overlaps the class body`);
+      }
+    }
+    for (let i = 1; i < functions.length; i += 1) {
+      if (functions[i].start < functions[i - 1].end) {
+        bad.push(`${functions[i - 1].name} runs into ${functions[i].name}`);
+      }
+    }
+    expect(bad, bad.join('\n')).toEqual([]);
+
+    // Identity, not name. The first run of this test found the collision it
+    // was written to worry about: `isEditModeActive` is a method AND the
+    // module-scope function main.ts calls to reach it. Keyed by name those
+    // are one node, and a gate on either would vouch for the other. Keyed by
+    // declaration offset they are two.
+    const ids = units.map(idOf);
+    expect(new Set(ids).size, 'two units share an id, so one will stand in for the other')
+      .toBe(ids.length);
+    const shared = functions.filter((f) => members.some((m) => m.name === f.name));
+    expect(shared.map((f) => f.name), 'the collision this model is built to survive')
+      .toContain('isEditModeActive');
+
+    // And the thing that keeps those two apart is one lookbehind, so test it
+    // against the real call sites rather than trusting it. A free function's
+    // pattern must match its bare call and neither dotted form.
+    for (const f of shared) {
+      const re = callPattern(f);
+      expect(re.test(`${f.name}()`), `${f.name}: bare call not matched`).toBe(true);
+      expect(re.test(`this.${f.name}()`), `${f.name}: this. call wrongly matched`).toBe(false);
+      expect(re.test(`roomEdit.${f.name}()`), `${f.name}: obj. call wrongly matched`).toBe(false);
+
+      // The other half, and the one a lookbehind does not solve: the
+      // member's own declaration, `public isEditModeActive(…)`, is a bare
+      // `isEditModeActive(` too. Read as a call it would make the member a
+      // caller of the free function and hand over its gate, so a gated
+      // method would silently cover an ungated module-scope writer of the
+      // same name. `blankDecl` is what stops that; this is the assertion
+      // that says so.
+      for (const m of members.filter((x) => x.name === f.name)) {
+        expect(re.test(m.callBody),
+          `${f.name}: the member's declaration is being read as a call to the free function`)
+          .toBe(false);
+      }
+    }
+  });
+
   it('gates every method that writes, or that is reached only from gated ones', () => {
     const calls = (body: string, fn: string): boolean =>
       new RegExp(`\\b${fn}\\s*\\(`).test(body);
@@ -192,21 +365,26 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // already been mutated, which is not a check; it would also accept one
     // in an unrelated branch, which this still cannot tell apart — see the
     // limits noted at the top of this file.
-    const gated = new Set(members.filter((m) => {
-      const gate = firstAt(m.body, GATE_RE);
+    const gated = new Set(units.filter((u) => {
+      const gate = firstAt(u.body, GATE_RE);
       if (gate < 0) return false;
-      const write = firstAt(m.body, WRITER_RE);
+      const write = firstAt(u.body, WRITER_RE);
       return write < 0 || gate < write;
-    }).map((m) => m.name));
+    }).map(idOf));
 
-    // Who calls whom, within the class. A method with no in-file caller is an
-    // entry point (main.ts drives it), so it can only be covered by gating.
+    // Who calls whom, by identity rather than by name — see `idOf`. A unit
+    // with no in-file caller is an entry point: main.ts drives it, and for
+    // the module-scope functions that is the only way in, so gating is the
+    // only thing that can cover them.
+    const pattern = new Map(units.map((u) => [idOf(u), callPattern(u)] as const));
     const callersOf = new Map<string, Set<string>>();
-    for (const m of members) {
-      for (const other of new Set(members.map((x) => x.name))) {
-        if (other === m.name) continue;
-        if (calls(m.body, `this\\.${other}`)) {
-          (callersOf.get(other) ?? callersOf.set(other, new Set()).get(other)!).add(m.name);
+    for (const u of units) {
+      const from = idOf(u);
+      for (const callee of units) {
+        const to = idOf(callee);
+        if (to === from) continue;
+        if (pattern.get(to)!.test(u.callBody)) {
+          (callersOf.get(to) ?? callersOf.set(to, new Set()).get(to)!).add(from);
         }
       }
     }
@@ -216,20 +394,23 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     const covered = new Set(gated);
     for (let changed = true; changed; ) {
       changed = false;
-      for (const m of members) {
-        if (covered.has(m.name)) continue;
-        const cs = callersOf.get(m.name);
+      for (const u of units) {
+        const id = idOf(u);
+        if (covered.has(id)) continue;
+        const cs = callersOf.get(id);
         if (cs && cs.size > 0 && [...cs].every((c) => covered.has(c))) {
-          covered.add(m.name);
+          covered.add(id);
           changed = true;
         }
       }
     }
 
-    const leaks = members
-      .map((m) => ({ name: m.name, writers: WRITERS.filter((w) => calls(m.body, w)) }))
-      .filter((m) => m.writers.length > 0 && !covered.has(m.name))
-      .map((m) => `${m.name}() calls ${m.writers.join(', ')} with no owner check on any path`);
+    const leaks = units
+      .filter((u) => !covered.has(idOf(u)))
+      .map((u) => ({ u, writers: WRITERS.filter((w) => calls(u.body, w)) }))
+      .filter(({ writers }) => writers.length > 0)
+      .map(({ u, writers }) => `${u.name}() at line ${lineAt(u.start)} calls ${
+        writers.join(', ')} with no owner check on any path`);
 
     expect(leaks, leaks.join('\n')).toEqual([]);
   });
@@ -242,17 +423,20 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       WRITERS.filter((w) => !found.includes(w)).join(', ')}`).toBe(WRITERS.length);
 
     // And every one of those calls has to land inside a slice, or the scan
-    // never looked at it. A write in module scope, in a nested helper
-    // function, or past the end of the class is invisible to a member-based
-    // model — it would not appear as a leak, it would appear as nothing.
-    // There are none today; the point is to hear about the first one.
+    // never looked at it — it would not appear as a leak, it would appear as
+    // nothing. This fired for real once: #184 merged `settleCupolaConflicts`,
+    // a module-scope writer, into a file whose model knew only class members.
+    // The answer was to teach the model about module-scope functions, not to
+    // wave the call through, so what is left over here is now a shorter list
+    // — a write in bare module scope, or in a helper nested inside something
+    // else, where neither a member slice nor a function slice can see it.
     const bare = stripComments(SRC);
     const homeless: string[] = [];
     for (const w of WRITERS) {
       for (const hit of bare.matchAll(new RegExp(`\\b${w}\\s*\\(`, 'g'))) {
         const at = hit.index ?? 0;
-        if (!members.some((m) => m.start <= at && at < m.end)) {
-          homeless.push(`line ${lineAt(at)}: ${w}() is outside every member slice`);
+        if (!units.some((u) => u.start <= at && at < u.end)) {
+          homeless.push(`line ${lineAt(at)}: ${w}() is outside every member and function slice`);
         }
       }
     }
@@ -272,8 +456,8 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       './airHockeyThemeDoc': ['readAirHockeyTheme', 'writeAirHockeyTheme'],
       './furnitureDoc': ['deleteFurnitureItem', 'writeFurnitureItem'],
       './roomInventory': ['activeRoomId', 'addToRoomInventory'],
-      './floorPlanDoc': ['clearDoorSlide', 'doorLateralLimitForWall', 'roomHalfExtents',
-        'roomPlaceBounds'],
+      './floorPlanDoc': ['clearDoorSlide', 'doorLateralLimitForWall', 'readCupolaWall',
+        'roomCupola', 'roomHalfExtents', 'roomPlaceBounds', 'writeCupolaWall'],
     };
     for (const [mod, names] of Object.entries(EXPECTED)) {
       // Value imports only — `import type { … }` can't be called.
@@ -301,6 +485,42 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     expect(body).toContain('this.hideContextMenu()');
     // The reason must be hinted AFTER the teardown, or exit()'s own hints win.
     expect(body.indexOf('showHint(perm.reason)')).toBeGreaterThan(body.indexOf('this.exit()'));
+  });
+
+  it('re-asks before the 🔭 button writes, not once when the session opened', () => {
+    // cycleCupola arrived with #184's merge writing the floor plan with no
+    // check of its own. The 🔭 button is only rendered inside an edit
+    // session, so the write was authorised by the check made when the
+    // session opened — but the button then stays on screen, and a share
+    // revoked while it is up would let every later click through. That is
+    // the same defect class as the five writers this file was written for,
+    // and the generic scan above catches it; this names it, so the failure
+    // says which button rather than which method.
+    const body = bodyOf('cycleCupola');
+    expect(body, 'cycleCupola not found').not.toBe('');
+    const gate = body.indexOf('this.mayWriteRoomDoc()');
+    expect(gate, 'the 🔭 button writes the floor plan with no owner check')
+      .toBeGreaterThanOrEqual(0);
+    expect(gate, 'the owner check must come before the first write, not after')
+      .toBeLessThan(body.search(/\bwriteCupolaWall\s*\(/));
+  });
+
+  it('gates the conflict settler, the one room-doc write outside the class', () => {
+    // settleCupolaConflicts clears a cupola when two players' edits merged
+    // into a floor plan that cannot hold both. It runs on every floor-plan
+    // change and once on join, from main.ts — so it is an entry point, and
+    // the only in-file caller it has is none. Gating is the only thing that
+    // can cover it, and `canEditRoom()` rather than the class's helper,
+    // because there is no session here to end.
+    const f = functions.find((x) => x.name === 'settleCupolaConflicts');
+    expect(f, 'settleCupolaConflicts not found').toBeDefined();
+    const gate = f!.body.indexOf('canEditRoom()');
+    const write = f!.body.search(/\bwriteCupolaWall\s*\(/);
+    expect(write, 'settleCupolaConflicts no longer writes — is this test still earning its place?')
+      .toBeGreaterThanOrEqual(0);
+    expect(gate, 'settleCupolaConflicts writes the floor plan with no owner check')
+      .toBeGreaterThanOrEqual(0);
+    expect(gate, 'the owner check must come before the write, not after').toBeLessThan(write);
   });
 
   it('keeps the two cancel paths speaking the same word', () => {

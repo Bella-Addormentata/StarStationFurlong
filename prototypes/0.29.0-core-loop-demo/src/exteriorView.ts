@@ -32,6 +32,7 @@ import { FURNITURE, buildItemGroup } from "./furniture";
 // hull-equipment block below) instead of the retired fittings dress.
 import { isExteriorItem } from "./hull";
 import { atlasLayout, readAtlas } from "./stationAtlas";
+import { refreshFarPass, setFarPassActive } from "./farOrbitView";
 import type { AtlasDoor } from "./stationAtlas";
 import {
   buildConnectorChain,
@@ -41,7 +42,7 @@ import {
 import type { VestibuleDoorId } from "./adapter";
 import { buildOctagonShell } from "./octagonHull";
 import { collectWindowOpenings } from "./windowLayout";
-import { roomHalfExtents } from "./floorPlanDoc";
+import { roomHalfExtents, roomCupola } from "./floorPlanDoc";
 
 /** 🛑📐 #80 S1: draw every module in the level-3 atlas view as an OCTAGON shell
  *  (the new cross-section) instead of the flat box. Now the DEFAULT — disable
@@ -172,7 +173,8 @@ function buildGroup(): THREE.Group {
     // 🪟 #80 S4: the CURRENT room's windows show as holes + glass on its solid
     // exterior barrel (neighbour shells below stay windowless — other modules'
     // windows aren't loaded here, by design).
-    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings()).group);
+    // 🔭 …and an end wall made a cupola shows as its framed glass.
+    g.add(buildOctagonShell({ halfX, halfZ }, {}, collectWindowOpenings(), roomCupola()?.wall ?? null).group);
   } else {
   // Hull roof: plating over the 11.8 room at wall-top height, seams + trim +
   // amber corner clamps — the module reads as SEALED from above.
@@ -437,30 +439,9 @@ function buildGroup(): THREE.Group {
     }
   }
 
-  // 🌍 Planet backdrop (the concept art's vantage) + atmosphere shell.
-  const planet = new THREE.Mesh(
-    new THREE.SphereGeometry(42, 48, 32),
-    new THREE.MeshStandardMaterial({
-      color: 0x2a5a8f,
-      roughness: 0.9,
-      metalness: 0.05,
-      emissive: 0x0c2038,
-      emissiveIntensity: 0.5,
-    }),
-  );
-  planet.position.set(6, -62, 26);
-  g.add(planet);
-  const atmo = new THREE.Mesh(
-    new THREE.SphereGeometry(43.6, 48, 32),
-    new THREE.MeshBasicMaterial({
-      color: 0x7fb8ff,
-      transparent: true,
-      opacity: 0.1,
-      side: THREE.BackSide,
-    }),
-  );
-  atmo.position.copy(planet.position);
-  g.add(atmo);
+  // 🌍 The planet is no longer hung below the station here: it sits off the
+  // station's −X, level with the floor (orbits.ts's planet frame), drawn by
+  // the far pass (farOrbitView.ts) with the other stations and ships.
 
   return g;
 }
@@ -750,6 +731,7 @@ export function refreshExteriorView(): void {
   }
   group = buildGroup();
   scene?.add(group);
+  refreshFarPass();
   renderToolbar();
   applyExteriorZoom(); // the known station may have grown — reframe
 }
@@ -770,6 +752,7 @@ export function tickExterior(_dt: number): void {
 export function setExteriorActive(on: boolean): void {
   if (on === active) return;
   active = on;
+  setFarPassActive(on);
   // 🧹 First descent from space ⇒ the player is IN the room: reveals the
   // room-only HUD (the SpacePhone tip's body.in-room gate). Sticky by
   // design — later trips to space re-hide via body.exterior-active.
