@@ -542,15 +542,29 @@ describe('the programme', () => {
     expect(readPlayback(TV).positionMs).toBe(32_000);
   });
 
+  it('a park at the start is a reading: switched off at 0, ON anchors at 0 and the minute off is not playback', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    tvHeartbeat(TV, 0); // rewound to the top: the holder's beat at 0
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV)).toMatchObject({ on: false, parkMs: 0 });
+    tick(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readPower(TV)).toMatchObject({ on: true, parkMs: 0 }); // carried on, a reading
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 0 }); // anchored at 0, not a minute in
+    tick(1_000);
+    expect(readPlayback(TV).positionMs).toBe(1_000);
+  });
+
   it('a switch with no reading, or a peer\'s garbage one, anchors nothing; a late joiner anchors to the record, never to an earlier ON', () => {
     pickUpRemote(TV);
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 10_000);
     doc.getMap('tv').set(powerKey(TV), { on: true, seq: 7, parkMs: 'soon' });
-    expect(readPower(TV)).toEqual({ on: true, seq: 7, parkMs: 0 });
+    expect(readPower(TV)).toEqual({ on: true, seq: 7, parkMs: null });
     expect(readPlayback(TV).positionMs).toBe(10_000);
     doc.getMap('tv').set(powerKey(TV), { on: true, seq: 8, parkMs: -5 });
-    expect(readPower(TV).parkMs).toBe(0);
+    expect(readPower(TV).parkMs).toBeNull();
     expect(readPlayback(TV).positionMs).toBe(10_000);
     // An OFF and ON a while ago, heartbeats since: a page joining now reads
     // the record as it stands, not the reading the ON carried.

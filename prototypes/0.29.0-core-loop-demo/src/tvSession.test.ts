@@ -209,6 +209,19 @@ describe('tickTvRoom', () => {
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: off });
   });
 
+  it('a park at the start is honoured: switched off at 0, the holder parks at 0 and not at a minute in', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now); // the baseline beat, at 0
+    expect(tvTogglePower(TV)).toBe(false); // the same instant: the room reads 0, a reading
+    expect(readPower(TV).parkMs).toBe(0);
+    run(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 0 });
+    run(500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: 0 });
+  });
+
   it('POWER back on with a free remote: the presser takes the remote and parks the programme where it was; a flip nobody could park waits for the first holder', () => {
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
