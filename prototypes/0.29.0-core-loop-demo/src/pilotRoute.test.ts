@@ -1160,39 +1160,27 @@ describe("🚚 where a ruling timetable flies the ship (the route's own copy of 
   });
 
   // Copilot (PR 180): the station list placed a ferry at its stay where the
-  // stop's station had moved since, until the next departure.
-  it("keeps a stay at a stop its station has left on the stop's copy, unless a live dock carries the ship along", () => {
+  // stop's station had moved since, until the next departure; and where it
+  // had not, on that station's trimmed orbit between two untrimmed legs.
+  it("keeps a stay on the stop's copy, wherever its station is, unless a live dock carries the ship along", () => {
     const stay = routeFlightPlaces(r, at(r, [s], on[0].arrive + SEC));
-    const listed = (over: Partial<{ planetId: string; orbitSlot: number; moving: boolean }> = {}) =>
-      ({ planetId: SOV, orbitSlot: 1, moving: false, ...over });
-    // Moved planets, moved slots, between planets now, or listed nowhere.
-    expect(routeStayOffList(stay, listed({ planetId: 'planet-aris' }), false)).toEqual(copyOf(1));
-    expect(routeStayOffList(stay, listed({ orbitSlot: 3 }), false)).toEqual(copyOf(1));
-    expect(routeStayOffList(stay, listed({ moving: true }), false)).toEqual(copyOf(1));
-    expect(routeStayOffList(stay, null, false)).toEqual(copyOf(1));
-    // Still where the route copied it: the station list places the ship.
-    expect(routeStayOffList(stay, listed(), false)).toBeNull();
+    expect(routeStayOffList(stay, false)).toEqual(copyOf(1));
     // Planet ids read as the station list reads them.
-    const planet = (id: string) => (id === 'planet-old-name' ? SOV : id);
-    expect(routeStayOffList(stay, listed({ planetId: 'planet-old-name' }), false, planet)).toBeNull();
-    // Docked: the station it is docked at carries it, wherever that went.
-    expect(routeStayOffList(stay, listed({ planetId: 'planet-aris' }), true)).toBeNull();
+    const planet = (id: string) => (id === SOV ? 'planet-new-name' : id);
+    expect(routeStayOffList(stay, false, planet)).toEqual({ ...copyOf(1), planetId: 'planet-new-name' });
+    // Docked: the station it is docked at carries it, wherever that is.
+    expect(routeStayOffList(stay, true)).toBeNull();
     // In flight, or with no ruling timetable, the leg's own ends place it.
-    expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[1].depart + SEC)), null, false)).toBeNull();
-    expect(routeStayOffList(null, null, false)).toBeNull();
+    expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[1].depart + SEC)), false)).toBeNull();
+    expect(routeStayOffList(null, false)).toBeNull();
   });
 
-  it('🎚️ counts a station that changed altitude at the same slot as gone from the copy', () => {
+  it('🎚️ keeps a stay on the stop\'s copy at the altitude the route copied', () => {
     const orbit = { radiusKm: 7_000, phase0: 0.5 };
     const withOrbit = { ...r, stops: r.stops.map((st, i) => (i === 1 ? { ...st, orbit } : st)) };
     const stay = routeFlightPlaces(withOrbit, at(r, [s], on[0].arrive + SEC));
-    const here = { planetId: SOV, orbitSlot: 1, moving: false };
-    expect(routeStayOffList(stay, { ...here, orbit }, false)).toBeNull();
-    expect(routeStayOffList(stay, { ...here, orbit: { ...orbit, phase0: orbit.phase0 + 2 * Math.PI } }, false)).toBeNull();
-    expect(routeStayOffList(stay, { ...here, orbit: { ...orbit, radiusKm: 7_200 } }, false)).toEqual({ ...copyOf(1), orbit });
-    expect(routeStayOffList(stay, here, false)).toEqual({ ...copyOf(1), orbit });
-    // A copy on the slot's orbit, a station since on an altitude of its own.
-    expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[0].arrive + SEC)), { ...here, orbit }, false)).toEqual(copyOf(1));
+    expect(routeStayOffList(stay, false)).toEqual({ ...copyOf(1), orbit });
+    expect(routeStayOffList(stay, true)).toBeNull();
   });
 });
 

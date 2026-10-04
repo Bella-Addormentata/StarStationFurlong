@@ -31,13 +31,17 @@ import {
   fuelDrawDeficit,
   readFlightRecord,
   readFuelLevel,
+  readRestPlace,
   readStoredFuelLevel,
   setFuelDrawMeter,
   shipDocHandle,
   writeFlightRecord,
   writeFuelLevel,
 } from './shipDoc';
-import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
+import { DEFAULT_STATIONS, adriftAt, setStationDirectory } from './stationDirectory';
+import { listStations, setStationMoveResolver, type StationMove } from './stations';
+import { setStationTrimResolver } from './orbits';
+import { restAtRouteEnd, shipPlaceId } from './shipArrival';
 import {
   CHECKPOINT_KINDS,
   MAX_CHECKPOINT_KEYS_SCANNED,
@@ -78,6 +82,7 @@ import {
   writeShipRoute,
 } from './shipRoute';
 import type { RouteCheckpoint, RouteStop, ShipRoute, StartCheckpoint } from './shipRoute';
+import type { RouteFlightPlace } from './pilotRoute';
 import { tanksLockedByRoute, templateSwapLockedByRoute } from './routeParts';
 import type { FurnitureItem } from './furniture';
 
@@ -1323,6 +1328,101 @@ describe('the copy-back after STOP (A4)', () => {
     expect(seen).toEqual(['docked']); // one transaction: observers see only where it ends
     expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'st-1' });
     expect(readShipRoute()!.startedAt).toBeUndefined();
+  });
+
+  // Copilot (PR 180): a STOP toward a stop that has moved planets since the
+  // route copied it ends berthless (the keeper passes that berth), on the
+  // route's copy of the stop, so that is where the ship rests, not at the
+  // station's new place.
+  it('🚚 hands a finish the end stop\'s copy, where a ship no dock carries rests though its station moved', () => {
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    expect(home.planetId).toBe(SOV);
+    const copy = adriftAt(SOV, home.orbitSlot);
+    const r = saved([(home.orbitSlot + 1) % 16, home.orbitSlot]);
+    r.stops[1] = { ...r.stops[1], stationId: 'furlong-station' };
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const { route, start } = started(r, 70);
+    install();
+    const on = onTime(route, start, 2);
+    stopShipRoute(on[0].depart + 20 * SEC); // in flight: ends at the next stop, Furlong
+    // Furlong leaves for ARIS PRIME as the ferry flies, and is there by its arrival.
+    const moved: StationMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: SOV, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: on[0].depart + MIN, arriveAt: on[0].arrive - MIN,
+      mode: 'thrusters', bookedAt: on[0].depart, fuel: 1, fuelDrawn: 0,
+    };
+    setStationMoveResolver((st) => (st.id === 'furlong-station' ? moved : null));
+    try {
+      const ends: (RouteFlightPlace | null)[] = [];
+      const finished = (end: RouteFlightPlace | null) => {
+        ends.push(end);
+        restAtRouteEnd(readFlightRecord().locationId, end, clock, []);
+      };
+      clock = on[0].arrive - SEC;
+      expect(settleRouteFlight({ finished })).toBeNull();
+      expect(ends).toEqual([]);
+      clock = on[0].arrive + 2 * MIN;
+      expect(listStations(undefined, undefined, clock).find((st) => st.id === 'furlong-station')?.planetId).toBe('planet-aris');
+      expect(settleRouteFlight({ finished })).toBe('finish');
+      // Told once the run has gone, with the stop as the route copied it.
+      expect(ends).toEqual([{ id: 'furlong-station', planetId: SOV, orbitSlot: home.orbitSlot }]);
+      expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
+      expect(readRestPlace()).toEqual({ at: copy, since: clock, open: true });
+      expect(shipPlaceId(readFlightRecord(), clock)).toBe(copy);
+      // Back on that orbit, the station has it beside it again.
+      setStationMoveResolver(null);
+      expect(shipPlaceId(readFlightRecord(), clock)).toBe('furlong-station');
+      // A dock there would have carried it along with the station.
+      setStationMoveResolver((st) => (st.id === 'furlong-station' ? moved : null));
+      restAtRouteEnd('furlong-station', ends[0], clock, ['x-']);
+      expect(readRestPlace()).toEqual({ at: adriftAt('planet-aris', 0), since: clock, docks: ['x-'] });
+      expect(shipPlaceId(readFlightRecord(), clock)).toBe('furlong-station');
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  // Copilot (PR 180): with no dock, the timetable's stay had the ferry on the
+  // route's copy of its stop, untrimmed, and a finish there leaves it so. A
+  // station trimmed off that orbit has it beside it only once a dock carries
+  // it, or the far view would move it onto the trimmed orbit, undocked.
+  it('🚏 leaves a berthless finish in open orbit beside a trimmed station, until a dock carries it', () => {
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const copy = adriftAt(SOV, home.orbitSlot);
+    const r = saved([(home.orbitSlot + 1) % 16, home.orbitSlot]);
+    r.stops[1] = { ...r.stops[1], stationId: 'furlong-station' };
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const { route, start } = started(r, 70);
+    install();
+    const on = onTime(route, start, 2);
+    stopShipRoute(on[0].depart + 20 * SEC); // in flight: ends at the next stop, Furlong
+    const ends: (RouteFlightPlace | null)[] = [];
+    clock = on[0].arrive + 2 * MIN;
+    expect(settleRouteFlight({
+      finished: (end) => {
+        ends.push(end);
+        restAtRouteEnd(readFlightRecord().locationId, end, clock, []);
+      },
+    })).toBe('finish');
+    expect(readFlightRecord()).toEqual({ status: 'docked', locationId: 'furlong-station' });
+    expect(readRestPlace()).toEqual({ at: copy, since: clock, open: true });
+    // Station keeping has trimmed Furlong off its slot's orbit: the ship
+    // stays in open orbit where the route left it.
+    const trim = (st: { id: string }, slot: { radiusKm: number; phase0: number }) =>
+      (st.id === 'furlong-station' ? { radiusKm: slot.radiusKm * 1.02, phase0: slot.phase0 } : null);
+    setStationTrimResolver(trim);
+    try {
+      expect(shipPlaceId(readFlightRecord(), clock)).toBe(copy);
+      // Untrimmed, Furlong flies that very orbit: the ship is beside it.
+      setStationTrimResolver(null);
+      expect(shipPlaceId(readFlightRecord(), clock)).toBe('furlong-station');
+      // A dock carries it along with the station, trim and all.
+      setStationTrimResolver(trim);
+      restAtRouteEnd('furlong-station', ends[0], clock, ['x-']);
+      expect(shipPlaceId(readFlightRecord(), clock)).toBe('furlong-station');
+    } finally {
+      setStationTrimResolver(null);
+    }
   });
 
   it('waits for the dock at the end stop to answer', () => {
