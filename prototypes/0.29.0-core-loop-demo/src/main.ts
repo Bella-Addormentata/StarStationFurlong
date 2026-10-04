@@ -16,12 +16,20 @@ import {
   packTick,
   unpackTick,
   unpackAddressedTick,
+  tickKind,
+  TICK_KIND_MOVEMENT,
   ADDRESSED_TICK_BYTES,
   TICK_BYTES,
   type MovementTick,
   type RoomBootstrap,
   type RoomMemberHint,
 } from "./network/protocol";
+// 🏒 #115: air-hockey game traffic shares the movement datagram lane,
+// discriminated by flags bits 6–7 — see the onTick dispatch + sender wiring.
+import {
+  routeAirHockeyTick,
+  setAirHockeySender,
+} from "./airHockeySession";
 import { MultiScaleZoomView } from "./zoom";
 import { initCameraRig, updateCameraRig } from "./cameraRig";
 import { getOutfitById, loadSavedOutfitId, saveOutfitId } from "./outfits";
@@ -99,7 +107,7 @@ import {
   voteTallyView,
   windowsView,
 } from "./treasuryView";
-import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom } from "./editMode";
+import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom, settleCupolaConflicts } from "./editMode";
 // 🚀 #30 SH2 + SH3: the ship's own doc (fuel truth + flight state machine).
 // Rebinds at the T0 seam alongside furniture / doors / games — see the
 // bindShipDoc call below for the rebind rationale. flightArrived + findDest
@@ -145,6 +153,7 @@ import { setStationHelmCommanderCheck } from "./stationHelm";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
+import { leaveSlotMachineRoom } from "./slotCroupier";
 import { leaveCoinPusherRoom } from "./pusherCroupier";
 // 🎉 The party map — the birthday role plus per-prop candle/lid/music state.
 import { bindPartyDoc, setPartyHostPredicate, setPartyIdentity } from "./partyDoc";
@@ -181,6 +190,11 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+// ⚓ A station's public berth takes its door's pose from the atlas, and 🚀 a
+// ship under way keeps its flight's place whatever it wears.
+import { followsFlightRecord, setBerthPoseLookup } from "./stationDirectory";
+// ⚓ DEPART remembers the dock into the station it leaves.
+import { setBerthStationResolver } from "./shipArrival";
 import {
   currentStation,
   dockedStationFor,
@@ -191,6 +205,7 @@ import {
   setRoomStationResolver,
   setStationRoomSource,
   stationForRoom,
+  stationRoomCause,
 } from "./stations";
 // 🛰️ #30 SH3: ship destinations read the station record through this seam.
 import { adriftPlace, directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
@@ -226,6 +241,7 @@ import {
   doorSetIsMarkedEmpty,
   seedDoorLayoutEmpty,
   seedDoorLayoutDefaults,
+  subscribeDoorLayout,
 } from "./doorLayoutDoc";
 import type { DoorWall, LegacyLayoutKind } from "./doorLayoutDoc";
 import { isLegacyDoorLayoutKind } from "./doorLayoutDoc";
@@ -455,6 +471,10 @@ const mouse = new THREE.Vector2();
 // Sovereign real-time networking state (Sprint 3)
 const networkProvider = new NetworkProvider();
 (window as any).networkProvider = networkProvider;
+// 🏒 #115: give the air-hockey session its outbound datagram seam. The
+// provider is a boot-time singleton and sendTick self-gates on connection
+// state (clean no-op offline), so one wiring here covers every room join.
+setAirHockeySender((buf) => networkProvider.sendTick(buf));
 // Publish the per-install default room id early so pre-join readers of
 // __ssfRoomId (world / roomInventory / devMenu local-state keys) get the unique
 // home id rather than a shared literal (dev-stage collision fix). Overwritten
@@ -1589,9 +1609,10 @@ async function joinRoomAtEpoch(
   // the stale doc would refuse legal advances). Fuel-tank capacity is DERIVED
   // from furniture, so the two docs are consumed together in the helm UI;
   // binding shipDoc right after furniture guarantees both observers are
-  // installed before the first reconcile. (A future exterior-view flight
-  // branch will read this same doc — plan §7 SH4 — but no exterior code
-  // consumes shipDoc in the shipped SH3 slice.)
+  // installed before the first reconcile. The exterior view reads it too,
+  // indirectly: its planet backdrop comes from planetForRoom, whose
+  // room-station resolver (set below) places a free-flying ship by its
+  // flight record.
   bindShipDoc(sync.doc);
   clearShipArrivalNote(); // the last ship's arrival is not this room's
   bindStationKeepingDoc(sync.doc);
@@ -1646,6 +1667,7 @@ async function joinRoomAtEpoch(
   // door anchors from the fresh doc immediately (joiners see slid doors).
   bindFloorPlan(sync.doc);
   world?.reconcileDoorPlacements();
+  world?.reconcileCupola(); // 🔭 a warm doc may already carry a cupola
 
   // 🚪↔🛰️ #28 S4: the door-LAYOUT map (WHICH doors the room has) rides the doc,
   // separate from the pairing map + floor-plan position. Binding re-notifies →
@@ -1798,12 +1820,32 @@ async function joinRoomAtEpoch(
     // 📤 An offer mark landing remotely (someone redeemed/revoked while we
     // look at the app) repaints the OFFERS OUT rows and transfer history live.
     subscribeOffers(() => renderVenturesApp());
+    // ⚖️ A cupola that raced a door, window or furniture write ends once the
+    // merged docs show the clash — after this tick's reconciles have run, so
+    // the furniture list it checks matches the doc.
+    let cupolaSettleQueued = false;
+    const queueCupolaSettle = () => {
+      if (cupolaSettleQueued) return;
+      cupolaSettleQueued = true;
+      setTimeout(() => {
+        cupolaSettleQueued = false;
+        settleCupolaConflicts();
+      }, 0);
+    };
+    subscribeFurniture(queueCupolaSettle);
+    subscribeWindowLayout(queueCupolaSettle);
+    subscribeDoorLayout(queueCupolaSettle);
+    queueCupolaSettle(); // …and a clash already in the docs on join
     // 🧱 #66 S1: door placements re-derive every anchor live (both tabs see
     // the door slide), refresh an open keypad's POSITION row, and re-dress
     // the exterior (a slid door carries its vestibule and dock port along).
     subscribeFloorPlan(() => {
+      queueCupolaSettle();
       world?.reconcileDoorPlacements();
+      world?.reconcileCupola(); // 🔭 a cupola end wall set / cleared
+      roomEdit.onFloorPlanChanged(); // …and an open edit session's 🔭 label
       world?.dockingSystem?.refreshPolicyUI();
+      world?.dockingSystem?.refreshProvisionGhost(); // its room shell shows the cupola
       refreshExteriorView();
     });
     // 🚀 #30 SH1: furniture changes re-dress the hull (engine bells / saddle
@@ -1851,6 +1893,17 @@ async function joinRoomAtEpoch(
     };
     // A remembered berth names its room only; the pass comes from here.
     setBerthSeedResolver(localSeedFor);
+    // ⚓ The station a dock leads into, as the directory's `here` reads it,
+    // so DEPART files the right dock under the station it leaves. A dock
+    // between two of the ship's own doors leads into none.
+    setBerthStationResolver((roomId) =>
+      roomId && roomId !== activeBootstrap?.roomId ? stationForRoom(roomId)?.id ?? null : null);
+    // ⚓ A station's public berth: its door's own wall and lateral, as the
+    // atlas last saw them from inside its room.
+    setBerthPoseLookup((roomId, doorId) => {
+      const door = readAtlas()[roomId]?.doors[doorId];
+      return door?.wall ? { wall: door.wall, lateral: door.lateral } : null;
+    });
     setStationDirectory(
       directoryFromStationRecords(
         () => listStations(),
@@ -1892,12 +1945,14 @@ async function joinRoomAtEpoch(
       // A saved or built-in station's welcome room, or a module bolted into a
       // station by structure, stays put whatever it wears (a station-keeping
       // helm room wears engine, tank and helm too): only a free-flying ship
-      // follows its flight record (flightCapable, the helm's own gate).
-      return flightCapable(isShipReady()) ? shipPlaceId(readFlightRecord()) : null;
+      // follows its flight record (flightCapable, the helm's own gate), and
+      // one under way keeps following it should a fitting come off mid-trip.
+      const flight = readFlightRecord();
+      return followsFlightRecord(flight.status, flightCapable(isShipReady())) ? shipPlaceId(flight) : null;
     });
     // 🚀 The same rule gates the helm: a station room never departs, and never
     // takes its location from the ship's flight record.
-    setStationRoomCheck(() => isStationRoom(activeBootstrap?.roomId ?? "", readAllDoors().values()));
+    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readAllDoors().values()));
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -2443,6 +2498,18 @@ async function joinRoomAtEpoch(
       } else {
         return; // unknown datagram framing — ignore
       }
+      // 🏒 #115: flags bits 6–7 select the tick lane. Mallet/puck ticks are
+      // game traffic for the air-hockey session, NOT avatar movement —
+      // dispatched BEFORE the avatar bookkeeping so a game tick can never
+      // mint a phantom avatar at the table. It still refreshes peer liveness
+      // (the sender is demonstrably alive; their avatar stands at the table).
+      if (tickKind(tick.flags) !== TICK_KIND_MOVEMENT) {
+        seenPeers.add(peerId);
+        receivedTicks++;
+        remoteLastSeen.set(peerId, performance.now());
+        routeAirHockeyTick(peerId, tick);
+        return;
+      }
       seenPeers.add(peerId);
       receivedTicks++;
       remoteLastSeen.set(peerId, performance.now());
@@ -2531,14 +2598,16 @@ async function leaveRoomNow(closed: () => void): Promise<void> {
     // this leave must leave alone.
     const cache = roomCacheHandle;
     roomCacheHandle = null;
-    // 🪙 Hand back this session's coin-pusher leases while the room's doc is
-    // still the bound casino doc, and send the release before the doc goes:
-    // another of the deed holder's devices then takes over at once instead
+    // 🎰🪙 Hand back this session's slot and coin-pusher operator leases
+    // while the room's doc is still the bound casino doc, and send the
+    // releases before the doc goes: another of the operator's devices then
+    // takes over at once instead
     // of waiting out the lapse and the split window. Frames keep running
     // meanwhile, but nothing is operated or edited in this room while it can
     // still send: the gates refuse until its sync is closed to new writes
     // (roomLeavesUnderWay). stop() doesn't wait for sends in flight, so flush
     // first (bounded: a stalled transport must not hold the swap).
+    leaveSlotMachineRoom();
     leaveCoinPusherRoom();
     await Promise.race([
       sync.flush(),

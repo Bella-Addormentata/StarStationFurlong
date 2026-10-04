@@ -32,7 +32,7 @@ import { cleanBerths, listStations, registerStation } from './stations';
 import type { StationBerthRecord } from './stations';
 import { cleanStationSummary, foldOwnStation, mergeStation, registerLearnedStations, summaryForStation } from './planetSummary';
 import type { StationSummary } from './planetSummary';
-import { destinationsFromRecords } from './stationDirectory';
+import { destinationsFromRecords, setBerthPoseLookup } from './stationDirectory';
 import { farDockPatch, farGateAdmitted } from './dockRules';
 import { arrivalBerths, planArrivalDock } from './shipArrival';
 
@@ -1033,6 +1033,24 @@ describe('ship destinations', () => {
     }], (room) => (room === 'room-c' ? undefined : seed(room)));
     expect(dest.berths).toEqual([]);
     expect(dest.berth).toBeUndefined();
+  });
+
+  it('pose every gate as the public berth is, a gate reached through the memory too', () => {
+    setBerthPoseLookup((_room, doorId) => (doorId === 'north' ? { wall: 'y-', lateral: 2 } : doorId === 'east' ? { wall: 'x+' } : null));
+    try {
+      const [dest] = destinationsFromRecords([{
+        id: 'hub', name: 'HUB', planetId: 'planet-sovereign', orbitSlot: 3, welcomeRoomId: 'room-a', berthDoor: 'north',
+        berths: [{ roomId: 'room-a', doorId: 'north', gate: 1 }, { roomId: 'room-c', doorId: 'east', gate: 3 }],
+      }], (room) => (room === 'room-c' ? undefined : seed(room)));
+      expect(dest.berths).toEqual([{ address: seed('room-a'), farDoor: 'north', farWall: 'y-', farLateral: 2, gate: 1 }]);
+      expect(dest.berth).toEqual(dest.berths![0]);
+      expect(dest.unaddressed).toEqual([{ roomId: 'room-c', farDoor: 'east', farWall: 'x+', gate: 3 }]);
+      const remembered = { address: seed('room-c'), farDoor: 'east' } as Parameters<typeof arrivalBerths>[0]['remembered'];
+      expect(arrivalBerths({ station: dest, remembered }).find((b) => b.farDoor === 'east'))
+        .toEqual({ address: seed('room-c'), farDoor: 'east', farWall: 'x+', gate: 3 });
+    } finally {
+      setBerthPoseLookup(null);
+    }
   });
 });
 

@@ -34,6 +34,7 @@ import {
   shipLocationId,
   shipPlaceId,
   castOffPlaces,
+  correctReleasePlace,
   dockedToStation,
   keepRestPlace,
   restingPlace,
@@ -915,6 +916,46 @@ describe('where a ship with no live dock is', () => {
     expect(keepRestPlace('ship-room', now)).toBe(true);
     expect(readRestPlace()).toEqual({ at: homeAt, since: now - 40_000, from: 'furlong-station' });
     expect(shipPlaceId(readFlightRecord(), now)).toBe(homeAt);
+  });
+
+  it('takes where the far room had its station as it let go, once the UNDOCK has learned the far room\'s moves', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    const was = adriftAt(home.planetId, home.orbitSlot);
+    const there = adriftAt('planet-aris', 3);
+    writeFlightRecord({ status: 'docked', locationId: 'furlong-station' });
+    writeDoorPairing('east', seed, buildDoorPairing(seed, {
+      segments: dockChain(), farDoor: 'south', farWall: 'y+', transient: true, dockedAt: now - 60_000,
+    }));
+    expect(keepRestPlace('ship-room', now - 50_000)).toBe(true);
+    // UNDOCK from the ship: it records Furlong where this install last heard
+    // of it, and the flight watch keeps the ship there before the far room
+    // answers.
+    const undockedAt = now - 40_000;
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt, at: was });
+    expect(keepRestPlace('ship-room', now - 39_000)).toBe(true);
+    expect(readRestPlace()).toEqual({ at: was, since: undockedAt, from: 'furlong-station' });
+    // The far room had Furlong at Aris by then: both say so now.
+    expect(correctReleasePlace('east', undockedAt, was, there)).toBe(true);
+    expect(readDoor('east')).toMatchObject({ paired: false, dock: { farDoor: 'south', undockedAt, at: there } });
+    expect(readRestPlace()).toEqual({ at: there, since: undockedAt, from: 'furlong-station' });
+    expect(shipPlaceId(readFlightRecord(), now)).toBe(there);
+    // No news, no place, or a tombstone another release has written since:
+    // left as it is.
+    expect(correctReleasePlace('east', undockedAt, there, there)).toBe(false);
+    expect(correctReleasePlace('east', undockedAt, there, undefined)).toBe(false);
+    expect(correctReleasePlace('east', undockedAt - 1, there, was)).toBe(false);
+    expect(readDoor('east')).toMatchObject({ dock: { at: there } });
+    // A rest taken from another release stays too, at the same place or not.
+    expect(writeRestPlace({ at: there, since: undockedAt - 5, from: 'furlong-station' })).toBe(true);
+    expect(correctReleasePlace('east', undockedAt, there, was)).toBe(true);
+    expect(readRestPlace()).toEqual({ at: there, since: undockedAt - 5, from: 'furlong-station' });
   });
 
   it('reads a rest record off the wire only when it is well formed', () => {

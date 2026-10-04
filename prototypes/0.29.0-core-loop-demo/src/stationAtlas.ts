@@ -168,10 +168,13 @@ export function roomIdFromSeed(seed: string): string {
 export function readAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return {};
+    if (!raw) return Object.create(null);
     const obj = JSON.parse(raw);
-    if (typeof obj !== 'object' || obj === null) return {};
-    const atlas = obj as Record<string, AtlasEntry>;
+    if (typeof obj !== 'object' || obj === null) return Object.create(null);
+    // No prototype: a room id such as `__proto__` or `constructor` is an own
+    // key like any other, never an inherited value, and writing one never
+    // sets the map's prototype (writeAtlas defines each key outright).
+    const atlas: Record<string, AtlasEntry> = Object.assign(Object.create(null), obj);
     // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
     // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
     // — and it does not just sit there: pushAtlasToDoc republishes it as
@@ -205,7 +208,7 @@ export function readAtlas(): Record<string, AtlasEntry> {
     }
     if (repaired) writeAtlas(atlas);
     return atlas;
-  } catch { return {}; }
+  } catch { return Object.create(null); }
 }
 
 /**
@@ -278,7 +281,11 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
     // visited/gossip distinction for old entries rather than mis-ranking them.
     const entries = Object.values(atlas).sort(compareAtlasRecency).slice(0, MAX_ENTRIES);
     const out: Record<string, AtlasEntry> = {};
-    for (const e of entries) out[e.roomId] = e;
+    // Defined, not assigned: assigning a room id `__proto__` would set the
+    // object's prototype, and the room would be left out of the store.
+    for (const e of entries) {
+      Object.defineProperty(out, e.roomId, { value: e, enumerable: true, writable: true, configurable: true });
+    }
     localStorage.setItem(KEY, JSON.stringify(out));
   } catch { /* privacy mode — the atlas degrades to the current room */ }
 }
@@ -876,6 +883,13 @@ function atlasAdjacency(atlas: Record<string, AtlasEntry>): Map<string, Set<stri
   return adjacent;
 }
 
+/** Does the atlas hold an entry of its own for this room? A door can name a
+ *  room `constructor` or `__proto__`, and what such a name inherits is no
+ *  entry. */
+function hasEntry(atlas: Record<string, AtlasEntry>, roomId: string): boolean {
+  return Object.prototype.hasOwnProperty.call(atlas, roomId) && !!atlas[roomId];
+}
+
 /** The cap counts rooms the atlas holds an entry for; unknown door targets
  *  are still walked (they are bounded by the per-entry door cap), so a room
  *  listing many unknown neighbours cannot crowd a real one out of its
@@ -886,13 +900,13 @@ function walkComponent(
   start: string,
 ): Set<string> {
   const component = new Set<string>([start]);
-  let known = atlas[start] ? 1 : 0;
+  let known = hasEntry(atlas, start) ? 1 : 0;
   const queue = [start];
   while (queue.length > 0) {
     const rid = queue.shift()!;
     for (const next of adjacent.get(rid) ?? []) {
       if (component.has(next)) continue;
-      if (atlas[next]) {
+      if (hasEntry(atlas, next)) {
         if (known >= MAX_ENTRIES) continue;
         known++;
       }
@@ -907,7 +921,7 @@ function walkComponent(
  *  known rooms.
  *  Empty when the atlas holds no entry for the room. */
 export function atlasComponent(atlas: Record<string, AtlasEntry>, roomId: string): Set<string> {
-  if (!roomId || !atlas[roomId]) return new Set();
+  if (!roomId || !hasEntry(atlas, roomId)) return new Set();
   return walkComponent(atlas, atlasAdjacency(atlas), roomId);
 }
 
@@ -1245,7 +1259,9 @@ function pullSharedAtlas(): void {
   let changed = false;
   for (const [rid, value] of sharedMap!.entries()) {
     if (!isSharedAtlasEntry(value) || value.roomId !== rid) continue;
-    const prior = atlas[rid];
+    // Our own entry only: what a room named `constructor` or `__proto__`
+    // inherits has no doors, and reading it as a prior entry threw.
+    const prior = hasEntry(atlas, rid) ? atlas[rid] : undefined;
     // Compared against what the value NORMALIZES to — the count of VALID
     // records, capped — never its raw key count: a stored 64 against a raw
     // 100, or a stored 1 against 100 malformed keys plus one valid, would
