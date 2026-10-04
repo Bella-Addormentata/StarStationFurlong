@@ -275,12 +275,39 @@ Nobody in a room can spend another viewer's bandwidth or disk unasked. The same 
 station library (§7).
 
 **Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
-WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → WebTransport unidirectional
-streams (one per frame or keyframe group; 20 ms Opus frames may use datagrams)
-→ node → iroh fan-out as an opaque `media` lane → viewers' `VideoDecoder` →
-three.js `VideoFrameTexture`, and viewers' `AudioDecoder` (Opus) → a 60–120 ms
-jitter buffer → the Web Audio graph, spatialised at the source's position. A
-keyframe every ~2 s plus keyframe-on-request.
+WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → **end-to-end encryption in
+the sender's page** → WebTransport unidirectional streams (one per frame or
+keyframe group; 20 ms Opus frames may use datagrams) → node → iroh fan-out as
+a `media` lane the node and every hub forward without being able to read →
+viewers' `VideoDecoder` → three.js `VideoFrameTexture`, and viewers'
+`AudioDecoder` (Opus) → a 60–120 ms jitter buffer → the Web Audio graph,
+spatialised at the source's position. A keyframe every ~2 s plus
+keyframe-on-request.
+
+**Encrypted end to end, not hop by hop.** WebTransport and iroh encrypt each
+hop, and a forwarding hub terminates one hop and opens the next, so "opaque"
+framing alone would let a hub read every Opus frame and video chunk it
+relays. v006 §9's rule for forwarded voice stands: forwarders see only
+ciphertext (the WebRTC path met it with Encoded Transform; here the sender
+does the same by hand on WebCodecs output — the SFrame shape, RFC 9605).
+Each frame is sealed with an AEAD (XChaCha20-Poly1305 or AES-256-GCM) under
+a per-source media key, the frame counter as the nonce and the routing
+header — source id, key epoch, counter, keyframe flag — as associated data;
+the header is all the node needs to route (the subscriber set), to serve the
+glimpse tier (the keyframe flag) and to drop, and it gets nothing else. The
+sender mints the key, seals it to each subscriber's X25519 key (derived from
+their Ed25519 identity, the libsodium conversion) on the reliable lane when
+the subscription is accepted, and rotates to a new epoch on every departure
+(the departed can open nothing after it) and on a timer; counters are
+strictly increasing per epoch, and a receiver drops anything at or below
+what it has accepted, with a short window for frames that arrive out of
+order across streams. A subscription is signed by the subscriber's identity
+with proof of possession (the P2 lane binding's shape, §9), so no entry is
+forged in another's name, and a forged entry would receive only ciphertext
+it cannot open. What a hub still sees is the traffic's shape — who sends to
+whom, how often, how much — as with v006's SFU-lite. The lane supersedes
+the WebRTC mesh (#10) only once this layer is in and a forwarding node that
+logs every frame is shown to reconstruct no audio.
 A canvas or `<video>` source needs no `MediaStreamTrackProcessor`, but the
 three legs are detected separately and a sender advertises only the legs it
 has: `WebTransport` (Safari 26.4 is the floor per
@@ -301,7 +328,9 @@ the link that made it — renewed by that link, removed from every set when
 the link disconnects or stops renewing, so a dead tab never pins a sender on
 and frames are never sent into a dead link; a hub subscribes upstream for
 its spokes and keeps that subscription only while a live spoke of its own
-still wants the source. With no subscriber the sender's own node drops
+still wants the source, forwarding what it receives as the ciphertext it is
+— the media key reaches each spoke sealed from the sender, never from the
+hub (above). With no subscriber the sender's own node drops
 frames at the source AND tells its browser so, and the browser stops capturing and encoding
 until the first subscriber returns (restarting on a keyframe) — a node-side
 drop alone would leave the dominant CPU and battery cost in place. Tiers:
