@@ -75,7 +75,10 @@ the sources that fail have to say so on the screen.
         | { kind: 'url', url }                    // any mp4 / webm a <video> can play
         | { kind: 'blob', hash, bytes, name, provider }  // the host's own file: the hash with the importing node's iroh id, a BlobTicket's shape (blob lane, §4)
         | null,
-  state: 'off' | 'home' | 'scheduled' | 'playing' | 'paused',  // 'off' is the power key's doing (below); 'home': on, nothing on
+  state: 'home' | 'scheduled' | 'playing' | 'paused',  // the PROGRAMME only: 'home' is on with nothing on. Power is
+                         // not here — it is its own key (below), so the set has one source of truth
+                         // for being off; a reader derives the 'off' it shows from `power.on`,
+                         // and a programme value of 'off' (legacy or garbage) is read as 'home'
   startAt: number,       // UTC ms — the countdown only
   positionMs: number,    // where the holder's player was…
   seq: number,           // …stamped with a per-write counter: a NEW seq is a new sample, which a
@@ -202,12 +205,27 @@ and strict-sovereign builds grey out the convenience tiles and the public DHT.
 - **Path B — a `<video>` into a `VideoTexture`** (node-proxied mp4, local file,
   blob, torrent). Lit, occluded, shader-able (the #194 CRT pass only works
   here), audio through the `partyAudio.ts` graph with distance falloff. Needs
-  CORS-clean bytes: a `/api/media` range pipe on the node, behind its CORS
-  allowlist and a host allowlist — and, because a loopback service that
-  fetches URLs is an SSRF surface, the destination is validated AFTER DNS
-  resolution and on EVERY redirect (loopback, private, link-local and
-  metadata addresses refused; redirects capped), with a size ceiling and a
-  timeout. A hostname allowlist alone closes nothing.
+  CORS-clean bytes: a `/api/media?url=…&cap=…` range pipe on the node. The
+  pipe is a **request gate, not a response header**: the listener's existing
+  origin allowlist (`wt_listener.rs`, `origin_allowed`) only decides whether
+  `Access-Control-Allow-Origin` is emitted and serves the GET regardless —
+  right for a fingerprint, wrong for a fetcher, because a `<video src>` or a
+  no-CORS request from any page that can reach loopback would still make the
+  node download whatever the URL names, bandwidth and CPU spent on a response
+  the page can never read. So the proxy requires a **node-scoped capability
+  token**: minted by the node at launch (random, per launch, never persisted),
+  handed to its own webview and to the page that probes `/api/fingerprint`
+  alongside the fingerprint — a CORS-readable response, so only a page on an
+  allowed origin can ever learn it, which is what turns the header allowlist
+  into a gate for the proxy — carried in the URL because a `<video>` cannot
+  set a header; a missing or wrong token, or a missing or disallowed
+  `Origin`, is a 403 **before any DNS lookup or outbound connection**. Only
+  then the host allowlist — and, because a loopback service that fetches
+  URLs is an SSRF surface, the destination is validated AFTER DNS resolution
+  and on EVERY redirect (loopback, private, link-local and metadata addresses
+  refused; redirects capped), with a size ceiling, a timeout and a cap on
+  concurrent fetches. A hostname allowlist alone closes nothing, and a
+  response header gates nothing.
 - **v1 ships neither on the in-world plane.** The first slice draws the status,
   menu, countdown and now-playing card on the in-world `CanvasTexture` and plays
   the actual video in a **theatre panel** (DOM) that anyone in the room opens
@@ -253,8 +271,12 @@ hash with the importing node's iroh id — the ticket's shape — and every node
 that completes the blob announces `have` for the hash on the room's control
 plane (a sibling of the `media-sub` kind), so a viewer resolves a hash to
 the connected nodes that hold it: the ticket's provider while it is still
-here, else any announcing holder — the hub first, which has it as soon as it
-served a spoke — else the station library's seeders (§7). A provider that
+here, else any announcing holder — a hub among them only when it chose to
+hold the blob, since `iroh-blobs` moves bytes from provider to requester
+directly and relaying for a spoke puts nothing in the hub's store: a hub
+prefetches what its spokes play as an explicit step under its own cap and
+budget, and announces `have` only once it holds the whole blob — else the
+station library's seeders (§7). A provider that
 leaves mid-transfer, stalls (no progress for 10 s, or under a floor rate
 for 30 s), fails a request or serves bytes the hash rejects is replaced by
 the next holder from the next range on — a `have` is any peer's claim, so a
@@ -271,9 +293,12 @@ per-transfer `autoFetchCap` the viewer sets AND what is left of a cumulative
 `autoFetchBudget` — the bytes fetched without asking, per room and per
 session (a FETCH button otherwise: a declaration larger than the remainder
 would download partially and abort, spending the remainder for nothing),
-with one automatic transfer in flight per room and a byte rate ceiling,
-under per-room and global cache quotas, with cancellation and
-delete-on-leave. The budget exists because a
+with one automatic transfer in flight per room, a byte rate ceiling, and —
+since a byte budget bounds no number of requests — an automatic-transfer
+count per room and per session, a minimum charge per transfer against the
+byte budget (a thousand empty blobs still cost what verifying and indexing
+them costs), and a cache-entry count limit per room and global, under
+per-room and global cache quotas, with cancellation and delete-on-leave. The budget exists because a
 cap alone bounds one transfer: a peer rotating through fresh under-cap
 hashes would spend a viewer's bandwidth without end while cache eviction
 kept the disk quota honest; a spent budget makes every further fetch an
@@ -326,25 +351,24 @@ frames that arrive out of order across streams are played once, and a
 replayed one never. Origin, not only membership: a shared key proves that a
 frame came from someone holding it, and every subscriber holds it — so any
 subscriber could forge frames as the source, and with a high counter push
-genuine frames out of the window. The sender therefore signs — not a hash
-chain, which one lost 20 ms datagram would break for everything after it
-(audio may ride unreliable datagrams), but a MANIFEST: at every keyframe
-and at least every 250 ms, the sender's Ed25519 identity key — the key the
-room already knows the source by — signs the list of (counter, truncated
-BLAKE3 digest) of every frame sent in the interval, and the manifest goes
-out on the reliable lane. A receiver plays a frame on arrival and confirms
-it when a manifest names its counter with its digest; a frame that never
-arrived costs nothing but itself; and the replay window advances on
-confirmed frames only, so an unconfirmed counter pushes nothing out. A
-frame no manifest confirms within two intervals, or whose digest disagrees
-with a manifest, is an injection: it is discarded and reported, and the
-receiver switches that source to confirm-before-play (a quarter second of
-latency) while the injection goes on — it never drops the source, since
-any member could inject, and dropping would hand each of them a way to
-silence any speaker. One signature and one manifest per interval, not per
-frame, is what keeps a 20 ms Opus stream from doubling in size: a dozen
-16-byte digests and a 64-byte signature every quarter second is about
-8 kbps. A subscription is signed by the subscriber's identity
+genuine frames out of the window. The sender therefore signs every frame:
+an Ed25519 signature by the sender's identity key — the key the room
+already knows the source by — over the frame's header and ciphertext,
+verified before anything is decoded or played. Nothing plays
+unauthenticated, a lost datagram costs only itself, and a forged frame
+fails verification and is dropped and counted (reported when it keeps
+coming) — never a reason to drop the source, since any member could inject,
+and dropping would hand each of them a way to silence any speaker. The
+replay window advances on verified frames only. The cost is 64 bytes a
+frame: about 26 kbps on a 20 ms Opus stream, roughly doubling voice and
+still a tenth of a video stream, and some eighty verifications a second per
+source, a few milliseconds of CPU; a sender may sign a batch of up to three
+Opus frames (60 ms) for a third of the overhead at 40 ms more latency,
+while video frames, kilobytes each, are signed one by one. Hash chains and
+signed manifests were considered and rejected: both either make playback
+speculative — a frame heard before its proof cannot be unheard, and a
+subscriber with the group key could inject audible frames until the proof
+was due — or add their interval to the latency. A subscription is signed by the subscriber's identity
 with proof of possession (the P2 lane binding's shape, §9), so no entry is
 forged in another's name, and a forged entry would receive only ciphertext
 it cannot open. What a hub still sees is the traffic's shape — who sends to
@@ -552,14 +576,18 @@ lane as it is: browser ingress takes exactly 13-byte datagrams, and the
 mesh relays only the 13-, 14- and 22-byte frames with a 13-byte tick inside
 (`ssf-p2p-node/src/main.rs`, the datagram arms) — everything else is
 dropped on the floor. So the extended datagram is a prerequisite in its own
-right, landed as one change across the four places that read a tick:
-`[TTL][8B origin lane id][kind 3 | sub-kind][len][payload ≤ 64 B]`,
-negotiated per link by a capability on the M5 control plane; ingress
-accepts it only from a browser that announced it, the relay forwards it
-only to links that did and dedups it on the origin lane id and the input's
-sequence, local delivery hands it to the page as its own message, and a
-legacy peer is never sent one and goes on dropping unknown lengths as it
-does today. And then the S3 mapping from that proven key to the player
+right, landed as one change across the four places that read a tick, in
+two shapes as today's tick already has: the browser sends its node a bare
+`[kind 3 | sub-kind][len][payload ≤ 64 B]` and nothing else, and the node —
+as it does for the 13-byte tick — mints the lane id from the connection and
+the TTL itself and wraps the mesh frame `[TTL][8B origin lane id][kind 3 |
+sub-kind][len][payload]`, so a browser never chooses routing or authorship
+metadata, and ingress rejects a frame that carries any. Negotiated per link
+by a capability on the M5 control plane; ingress accepts it only from a
+browser that announced it, the relay forwards it only to links that did
+and dedups it on the origin lane id and the input's sequence, local
+delivery hands it to the page as its own message, and a legacy peer is
+never sent one and goes on dropping unknown lengths as it does today. And then the S3 mapping from that proven key to the player
 holding the seat. P1 accepts kind-3 inputs only
 from a lane whose proven key is the P2 seat's identity, and only inputs
 that key's session authenticates. Lockstep stays the upgrade for games
