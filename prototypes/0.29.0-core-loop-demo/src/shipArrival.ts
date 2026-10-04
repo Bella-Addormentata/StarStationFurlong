@@ -21,7 +21,9 @@
 
 import { isDockChain } from './adapter';
 import { berthMemoryFrom, stampAfter, type DockPortState } from './dockRules';
-import { readAllDoorsIfComplete, readDoor, writeDoorTombstone, type DockBerthMemory, type DoorRecord } from './doorsDoc';
+import {
+  readAllDoorsIfComplete, readDoor, readPhysicalDoors, writeDoorTombstone, type DockBerthMemory, type DoorRecord,
+} from './doorsDoc';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
@@ -339,22 +341,22 @@ export function berthHeldByMove(roomId: string, doorId: string, now: number = Da
 
 /** 🚚 Every transient berth of `roomId` (#67 D2: a dock, or a legacy berth
  *  with no dock chain), when DEPART may cast them all off at `now`; else why
- *  not. A station move holds one of them (berthHeldByMove): a station
- *  between planets keeps the ships it holds, and UNDOCK and DETACH both
- *  refuse, so DEPART does too. Or not every record it takes can be read:
- *  the room's doors (readAllDoorsIfComplete), where a berth left out could
- *  be held, and a legacy one, no dock port, would stay attached through the
- *  flight; or, with a berth to let go of, its moves (roomMovesKnown), where
- *  the one holding it may lie. With `asked` (berthPairings: what DEPART
- *  asked the far rooms about, at `now`), only those berths, each still the
- *  pairing it was: any other was never judged at that moment ('changed'). */
+ *  not. Only the room's own doors, each read past the snapshot's cap
+ *  (doorsDoc.readPhysicalDoors): records a peer floods the map with can
+ *  neither hide a berth from it nor hold the ship (a dock on a door the room
+ *  lacks leads nowhere). A station move holds one of them (berthHeldByMove):
+ *  a station between planets keeps the ships it holds, and UNDOCK and
+ *  DETACH both refuse, so DEPART does too. Or, with a berth to let go of,
+ *  not every move of the room can be read (roomMovesKnown), where the one
+ *  holding it may lie. With `asked` (berthPairings: what DEPART asked the
+ *  far rooms about, at `now`), only those berths, each still the pairing it
+ *  was: any other was never judged at that moment ('changed'). */
 export function berthsToCastOff(
   roomId: string,
   now: number = Date.now(),
   asked?: ReadonlyMap<string, DoorRecord | undefined>,
 ): { ok: true; berths: string[] } | { ok: false; why: 'moving' | 'unread' | 'changed' } {
-  const doors = readAllDoorsIfComplete();
-  if (!doors) return { ok: false, why: 'unread' };
+  const doors = readPhysicalDoors();
   const berths: string[] = [];
   for (const [doorId, door] of doors) {
     if (door.paired === true && (door.transient === true || isDockChain(door.segments))) berths.push(doorId);
@@ -903,12 +905,15 @@ export function completeArrival(
   // ship rests here without one.
   restBeside(rec.locationId, now, [plan.doorId]);
   if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
-  // The answer belongs to the ship's room: once the player has joined another
-  // room, whose helm is the one shown now, it is not heard.
+  // The answer belongs to the ship's room and to this arrival: once the
+  // player has joined another room (whose helm is the one shown now), or the
+  // ship has left again before the berth answered, it is not heard.
   const shipRoom = currentRoomId();
   const arrived = readRestPlace();
   const settled = (ok: boolean | void): void => {
     if (currentRoomId() !== shipRoom) return;
+    const flight = readFlightRecord();
+    if (flight.status !== 'docked' || flight.locationId !== rec.locationId) return;
     // 🚚 Refused, the ship rests where it arrived, held by no dock (the
     // port's re-pointed tombstone is no release of it); and its far room may
     // have known the station had left for another planet (redockPort:

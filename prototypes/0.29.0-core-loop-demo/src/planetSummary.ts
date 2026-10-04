@@ -39,7 +39,7 @@
 import * as Y from 'yjs';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
-import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
+import { isNewerTrim, isOrbitTrim, setSharedTrimSource, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { setStationTrimResolver } from './orbits';
@@ -48,9 +48,11 @@ import type { KnownPlace, StationMove, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
-/** A trim as it travels: the burn's orbit numbers, and the fuel the room's
- *  burns have drawn in all (optional; older builds send none), which orders
- *  trims whose last burns share a moment (newerTrim). `from` is the room
+/** A trim as it travels: the burn's orbit numbers, with how many burns its
+ *  line has had, its place and its writers (OrbitTrim.seq, place and seen),
+ *  so another of the station's helm rooms can go on from it
+ *  (stationKeeping.readSharedTrim) and trims rank alike everywhere
+ *  (newerTrim). `from` is the room
  *  whose station-keeping log it was read from and `readAt` when a client
  *  standing there last read it: between two readings of one room the later
  *  reading wins, whatever its burn time, so a trim that room took back (a
@@ -286,7 +288,9 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
   const read = isId(src.from) && isStamp(src.readAt, now);
   return {
     planetId: v.planetId, slot: v.slot, dRadiusKm: v.dRadiusKm, dPhase: v.dPhase, at: v.at, last: v.last,
-    ...(v.fuelDrawn !== undefined ? { fuelDrawn: v.fuelDrawn } : {}),
+    ...(v.seq !== undefined ? { seq: v.seq } : {}),
+    ...(v.place !== undefined ? { place: v.place } : {}),
+    ...(v.seen !== undefined ? { seen: v.seen.map(([writer, place]): [number, number] => [writer, place]) } : {}),
     ...(read ? { from: src.from as string, readAt: src.readAt as number } : {}),
   };
 }
@@ -417,10 +421,10 @@ function writeStore(store: Store): void {
   try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); } catch { /* quota */ }
 }
 
-/** The newer of two trims: the later last burn; between trims whose last
- *  burns share a moment (two sticks pushed in one millisecond), the one
- *  that drew more fuel has replayed more burns, so it holds the other's
- *  burns too (a trim without the count ranks lowest); then tieBreak. */
+/** The newer of two trims: between two readings of one room, the later;
+ *  otherwise the one further along its line, then the later, as the helm
+ *  rooms rank them (stationKeeping.isNewerTrim, whatever clocks stamped
+ *  them); then tieBreak. */
 function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): SharedTrim | undefined {
   if (!a) return b;
   if (!b) return a;
@@ -428,12 +432,7 @@ function newerTrim(a: SharedTrim | undefined, b: SharedTrim | undefined): Shared
   if (a.from !== undefined && a.from === b.from && a.readAt !== b.readAt) {
     return (b.readAt ?? 0) > (a.readAt ?? 0) ? b : a;
   }
-  if (b.at !== a.at) return b.at > a.at ? b : a;
-  // A trim without the count (an older build's) has replayed no more burns
-  // than one with it: it ranks below every counted trim.
-  const drawn = (t: SharedTrim) => t.fuelDrawn ?? -1;
-  if (drawn(a) !== drawn(b)) return drawn(b) > drawn(a) ? b : a;
-  return tieBreak(a, b);
+  return isNewerTrim(b, a) ? b : isNewerTrim(a, b) ? a : tieBreak(a, b);
 }
 
 /** Two values stamped the same moment: every client keeps the same one (the
@@ -1378,6 +1377,9 @@ export function installTrimResolver(): void {
     const applies = trimFor(station, trim);
     return applies ? trimmedOrbit(slot, applies) : null;
   });
+  // The same trims are the station helm's shared trim: every helm room of a
+  // station goes on from its newest (stationKeeping.readSharedTrim).
+  setSharedTrimSource((station) => trimsByStationId.get(station.id) ?? null);
 }
 
 /**
@@ -1449,4 +1451,5 @@ export function unbindPlanetSummaryForTest(): void {
   shipMap = null;
   ctx = null;
   trimsByStationId = new Map();
+  setSharedTrimSource(null);
 }
