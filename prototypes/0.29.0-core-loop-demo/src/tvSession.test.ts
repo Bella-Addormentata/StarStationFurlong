@@ -6,8 +6,8 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, putDownRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
-  setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, putDownRemote, readPower, readRemote, readSample, readTv, setTvClock,
+  setTvHostPredicate, setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
   TV_LEASE_RENEW_MS,
 } from './tvDoc';
 import {
@@ -163,6 +163,26 @@ describe('tickTvRoom', () => {
     expect(tvHeartbeat(TV, TV_HEARTBEAT_MS + 60_000)).toEqual({ ok: false, error: 'Nothing is playing.' });
     tickTvRoom([TV], now + 500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+  });
+
+  it('the park lands where the room was switched off by the presser\'s reading, not at a heartbeat the holder\'s sleep left behind', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now); // the baseline beat, at 0
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now); // at 3 s
+    now += 20_000; // the holder's page sleeps: no tick, no beat, while the film plays on for everyone
+    setTvIdentity(() => ({ pub: 'BBBBviewer', name: 'Viewer' }));
+    run(1_000); // a viewer's page, awake and ticking (it holds nothing: no beat)
+    expect(tvTogglePower(TV)).toBe(false); // the viewer switches off: the room read 24 s
+    const off = TV_HEARTBEAT_MS + 21_000;
+    expect(readPower(TV).parkMs).toBe(off);
+    expect(readTv(TV).positionMs).toBe(TV_HEARTBEAT_MS); // the record itself still says 3 s
+    run(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true); // the viewer switches on: the lapsed remote is theirs, and so is the park
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: off }); // where it was switched off, not 3 s
+    run(500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: off });
   });
 
   it('POWER back on with a free remote: the presser takes the remote and parks the programme where it was; a flip nobody could park waits for the first holder', () => {

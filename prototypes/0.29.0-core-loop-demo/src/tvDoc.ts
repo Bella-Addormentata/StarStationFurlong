@@ -164,16 +164,25 @@ export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by:
 
 /** The `power:` key: the set's switch, a body button anyone may press. Its
  *  own key, like the volume, so a press never races the holder's heartbeat
- *  in the programme's LWW slot. Off keeps the programme, like a real TV; on
- *  brings it back — the holder's tick parks a programme that was playing
- *  where it was (tvSession), and a set with nothing on shows the home
+ *  in the programme's LWW slot. Off keeps the programme, like a real TV,
+ *  and writes where the room WAS as it went off — `parkMs`, the presser's
+ *  own reading of the room (readPlayback at the press; 0 when nothing was
+ *  running): a position, never a time, the clocks rule — and on carries
+ *  it, so every page anchors the resumed programme there on receipt of the
+ *  ON write (noteSamples: a sample of its own, replaced by the holder's
+ *  next heartbeat) and the holder's tick parks the programme there
+ *  (tvSession). With no holder present the programme resumes from where
+ *  it was switched off and runs, best effort, until someone picks the
+ *  remote up and beats — never from a stale heartbeat with the time
+ *  switched off counted as playback. A set with nothing on shows the home
  *  screen. `seq` is a revision: a lookup in flight is void past it. */
 export interface PowerRecord {
   on: boolean;
   seq: number;
+  parkMs: number;
 }
 
-export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0 };
+export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0, parkMs: 0 };
 
 // ── Binding (the partyDoc shape) ─────────────────────────────────────────────
 
@@ -214,6 +223,11 @@ interface Sample {
   receivedAt: number;
 }
 const samples = new Map<string, Sample>();
+/** The switch's revision this page last answered, per TV: the ON write
+ *  anchors the resumed programme once (noteSamples), and a late joiner, or
+ *  a later change to any other key, must not anchor the room at a reading
+ *  the switch took long ago. */
+const powerSeen = new Map<string, number>();
 
 /** Remote leases as THIS page saw them: the record's holder/leaseAt and OUR
  *  clock when that pair first appeared (the pusherCroupier `seeLease` idea). */
@@ -295,6 +309,23 @@ function noteSamples(keys: Iterable<string>): void {
       seeLease(itemId, readRemote(itemId), receiptStamp(now));
       continue;
     }
+    if (key.startsWith('power:')) {
+      // The switch back ON carries where the room was switched off
+      // (`parkMs`): anchor the resumed programme there, as a sample of this
+      // page's own receipt — once per switch revision — so nobody runs the
+      // programme on from a heartbeat the time switched off has aged. The
+      // holder's next heartbeat (a new programme seq) replaces it as any
+      // sample is replaced, and its park (tvSession) pauses there.
+      const itemId = key.slice(6);
+      const power = readPower(itemId);
+      if (powerSeen.get(itemId) === power.seq) continue;
+      powerSeen.set(itemId, power.seq);
+      const rec = readProgramme(itemId);
+      if (power.on && power.parkMs > 0 && rec.state === 'playing') {
+        samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: now });
+      }
+      continue;
+    }
     if (!key.startsWith('tv:')) continue;
     const itemId = key.slice(3);
     const rec = readProgramme(itemId);
@@ -310,6 +341,7 @@ export function bindTvDoc(doc: Y.Doc): void {
   boundDoc = doc;
   tvMap = doc.getMap('tv');
   samples.clear();
+  powerSeen.clear();
   seenLeases.clear();
   awakeAt = -Infinity; // a fresh doc: the room tick marks the waking anew
   preGapAwake = -Infinity;
@@ -320,7 +352,13 @@ export function bindTvDoc(doc: Y.Doc): void {
   });
   // A fresh doc's existing records are samples too (a late joiner's first
   // read anchors to NOW: it cannot know how old the holder's position is,
-  // which is why the holder's next heartbeat corrects it within 3 s).
+  // which is why the holder's next heartbeat corrects it within 3 s) — but
+  // never a switch flipped before it arrived: the power revisions are
+  // noted as seen first, so the programme anchors to its record as it
+  // stands, not to the reading an earlier ON carried.
+  for (const key of tvMap.keys()) {
+    if (key.startsWith('power:')) powerSeen.set(key.slice(6), readPower(key.slice(6)).seq);
+  }
   noteSamples([...tvMap.keys()]);
   notify();
 }
@@ -506,7 +544,7 @@ export function readVolume(itemId: string): number {
 export function readPower(itemId: string): PowerRecord {
   const raw = ensureMap().get(powerKey(itemId)) as Partial<PowerRecord> | undefined;
   if (!raw || typeof raw !== 'object') return { ...POWER_DEFAULT };
-  return { on: raw.on === true, seq: counter(raw.seq) };
+  return { on: raw.on === true, seq: counter(raw.seq), parkMs: Math.max(0, Math.floor(num(raw.parkMs))) };
 }
 
 /** What a screen, a phone or the theatre shows: the programme, the switch
@@ -825,14 +863,22 @@ export function tvStop(itemId: string): TvAction {
 export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
   if (!power.on && remoteStatus(itemId, now) === 'free') pickUpRemote(itemId, now);
-  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq) } satisfies PowerRecord);
+  // Going off: where the room is, by this page's own reading, carried by
+  // the switch for the park and the resume (PowerRecord). Coming on: the
+  // reading the OFF press left, carried on so every page sees it with the
+  // ON write; a set switched off with nothing running carries 0.
+  const parkMs = power.on
+    ? (readTv(itemId).state === 'playing' ? Math.max(0, Math.floor(readPlayback(itemId, now).positionMs)) : 0)
+    : power.parkMs;
+  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord);
   return !power.on;
 }
 
-/** The remote's PLAY and SCHEDULE turn the set on, like a real remote. */
+/** The remote's PLAY and SCHEDULE turn the set on, like a real remote — on
+ *  a new programme, so the switch carries no reading to resume from. */
 function switchOn(itemId: string): void {
   const power = readPower(itemId);
-  if (!power.on) write(powerKey(itemId), { on: true, seq: bump(power.seq) } satisfies PowerRecord);
+  if (!power.on) write(powerKey(itemId), { on: true, seq: bump(power.seq), parkMs: 0 } satisfies PowerRecord);
 }
 
 /** VOLUME on the set: its own key, so a press here never carries a stale

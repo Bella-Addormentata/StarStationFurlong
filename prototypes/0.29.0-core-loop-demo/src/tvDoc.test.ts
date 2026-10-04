@@ -483,7 +483,7 @@ describe('the programme', () => {
     const revision = tvRevision(TV);
     expect(tvTogglePower(TV)).toBe(false);
     expect(tvRevision(TV)).not.toBe(revision);
-    expect(readPower(TV)).toEqual({ on: false, seq: 1 });
+    expect(readPower(TV)).toMatchObject({ on: false, seq: 1 });
   });
 
   it('a power press on one device never undoes the holder\'s heartbeat on another, nor the other way round', () => {
@@ -511,6 +511,58 @@ describe('the programme', () => {
     iAm(BOB, 'Bob');
     expect(tvTogglePower(TV)).toBe(true);
     expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: 45_000 }); // back as it was
+  });
+
+  it('OFF carries where the room was by the presser\'s reading, ON anchors every page there, and the holder\'s next heartbeat takes over', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    tvHeartbeat(TV, 10_000);
+    tick(20_000);
+    expect(readPlayback(TV).positionMs).toBe(30_000);
+    // Anyone may press the body button: Bob, a viewer, by his own reading.
+    iAm(BOB, 'Bob');
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV)).toMatchObject({ on: false, parkMs: 30_000 });
+    expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: 10_000 }); // the programme untouched
+    tick(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readPower(TV)).toMatchObject({ on: true, parkMs: 30_000 }); // carried on
+    // Resumed where it was switched off, not a minute further on.
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 30_000 });
+    tick(1_000);
+    expect(readPlayback(TV).positionMs).toBe(31_000);
+    // A change to any other key does not anchor the room at the reading again.
+    tvSetVolume(TV, 40);
+    expect(readPlayback(TV).positionMs).toBe(31_000);
+    // The holder's next heartbeat replaces the anchor as any sample is
+    // replaced (Bob holds: the ON put the lapsed remote in his hand).
+    expect(tvHeartbeat(TV, 31_500)).toEqual({ ok: true });
+    expect(readPlayback(TV).positionMs).toBe(31_500);
+    tick(500);
+    expect(readPlayback(TV).positionMs).toBe(32_000);
+  });
+
+  it('a switch with no reading, or a peer\'s garbage one, anchors nothing; a late joiner anchors to the record, never to an earlier ON', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    tvHeartbeat(TV, 10_000);
+    doc.getMap('tv').set(powerKey(TV), { on: true, seq: 7, parkMs: 'soon' });
+    expect(readPower(TV)).toEqual({ on: true, seq: 7, parkMs: 0 });
+    expect(readPlayback(TV).positionMs).toBe(10_000);
+    doc.getMap('tv').set(powerKey(TV), { on: true, seq: 8, parkMs: -5 });
+    expect(readPower(TV).parkMs).toBe(0);
+    expect(readPlayback(TV).positionMs).toBe(10_000);
+    // An OFF and ON a while ago, heartbeats since: a page joining now reads
+    // the record as it stands, not the reading the ON carried.
+    tvTogglePower(TV); // off, the room at 10 s
+    tvTogglePower(TV); // on: 10 s carried
+    tvHeartbeat(TV, 50_000);
+    const joiner = new Y.Doc();
+    Y.applyUpdate(joiner, Y.encodeStateAsUpdate(doc));
+    bindTvDoc(joiner);
+    expect(readPower(TV).parkMs).toBe(10_000);
+    expect(readPlayback(TV).positionMs).toBe(50_000);
+    bindTvDoc(doc);
   });
 
   it('a volume press on one device never carries a stale programme over a seek on another', () => {
