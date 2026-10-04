@@ -383,9 +383,14 @@ export function dockedStationFor(
   const partners: string[] = [];
   for (const rec of doors) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only an address that names another room is a pairing (as
+    // stationRoomCause reads it): peer-written junk, or a pairing back to
+    // this room, neither bolts the room in nor hides a real dock.
+    let partner = '';
+    try { partner = roomIdFromSeed(rec.connectedRoomAddress); } catch { partner = ''; }
+    if (!partner || partner === roomId) continue;
     if (!isBerthDoor(rec)) return null; // bolted into a station: the atlas places it
-    const partner = roomIdFromSeed(rec.connectedRoomAddress);
-    if (partner && partner !== roomId) partners.push(partner);
+    partners.push(partner);
   }
   for (const partner of partners) {
     const there = atlasStationForRoom(partner, atlas, stations);
@@ -393,6 +398,56 @@ export function dockedStationFor(
     if (!there.derived || atlasComponent(atlas, there.welcomeRoomId).size > 1) return there.id;
   }
   return null;
+}
+
+/** Why a room is a station's own (stationRoomCause). */
+export type StationRoomCause = 'welcome-room' | 'lone-station' | 'bolted';
+
+/** Why `roomId` is a station's own room, never a ship that DEPARTs: a saved
+ *  or built-in station's welcome room ('lone-station' when no gangway joins
+ *  it to another module: a one-module station, which may still fly by hand
+ *  and PARK), or a module bolted into a station by structure (a paired door
+ *  that is no berth: taking that gangway down frees it). Null for a ship.
+ *  Such a room may wear engine, tank and helm for station keeping. */
+export function stationRoomCause(
+  roomId: string,
+  doors: Iterable<DoorRecord>,
+  stations: StationRecord[] = listStations(),
+): StationRoomCause | null {
+  if (!roomId) return null;
+  let bolted = false;
+  for (const rec of doors) {
+    if (rec.paired === true && !isBerthDoor(rec) && joinsAnotherRoom(rec.connectedRoomAddress, roomId)) {
+      bolted = true;
+      break;
+    }
+  }
+  if (stations.some((st) => !st.derived && st.welcomeRoomId === roomId)) {
+    return bolted ? 'welcome-room' : 'lone-station';
+  }
+  return bolted ? 'bolted' : null;
+}
+
+/** Does a pairing's address name another room, as the atlas reads it? One
+ *  naming no room (a peer's junk, or one the parser throws on) or naming
+ *  `roomId` itself joins it to none. */
+function joinsAnotherRoom(address: string | undefined, roomId: string): boolean {
+  if (!address) return false;
+  try {
+    const target = roomIdFromSeed(address);
+    return target !== '' && target !== roomId;
+  } catch {
+    return false;
+  }
+}
+
+/** Is `roomId` a station's own room (stationRoomCause)? */
+export function isStationRoom(
+  roomId: string,
+  doors: Iterable<DoorRecord>,
+  stations: StationRecord[] = listStations(),
+): boolean {
+  return stationRoomCause(roomId, doors, stations) !== null;
 }
 
 /** The planet a room's station orbits — the default planet when unknown. */
@@ -407,6 +462,11 @@ let currentRoomGetter: () => string = () => '';
 /** main.ts injects the room the player is standing in (no import cycle). */
 export function setStationRoomSource(cb: () => string): void {
   currentRoomGetter = cb;
+}
+
+/** The room the player is standing in ('' before main.ts wires it). */
+export function currentRoomId(): string {
+  return currentRoomGetter();
 }
 
 /** The station the player is in now, or null before the atlas knows the room. */

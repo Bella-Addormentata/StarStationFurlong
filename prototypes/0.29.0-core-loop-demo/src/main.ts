@@ -107,6 +107,22 @@ import {
   windowsView,
 } from "./treasuryView";
 import { roomEdit, setRoomEditPermission, setEditWorldProvider, canEditRoom, settleCupolaConflicts } from "./editMode";
+// 🚀 #30 SH2 + SH3: the ship's own doc (fuel truth + flight state machine).
+// Rebinds at the T0 seam alongside furniture / doors / games — see the
+// bindShipDoc call below for the rebind rationale. flightArrived + findDest
+// power the commander-side auto-advance (in-flight → redocking) that runs
+// once/sec so a flight completes even if no one has the helm panel open.
+import {
+  bindShipDoc,
+  flightArrived,
+  readFlightRecord,
+  writeFlightRecord,
+} from "./shipDoc";
+// 🚀 #30 SH2 + SH3: the helm's REFUEL / DEPART / REDOCK writes are owner-
+// gated at the UI (dev-phase posture, same as edit mode). setHelmOwnerCheck
+// funnels the current-room owner predicate into the device UI.
+import { clearShipArrivalNote, isShipReady, noteShipArrival, setHelmOwnerCheck } from "./devices";
+import { completeArrival, setBerthSeedResolver } from "./shipArrival";
 import { setSoleCroupierPredicate } from "./croupier";
 import { bindGamesDoc, readRoomOwnerKey } from "./games/gamesDoc";
 import { bindCasinoDoc, readChips } from "./casinoDoc";
@@ -135,6 +151,7 @@ import {
   writeDoorPairing,
   readAllDoors,
   readDoor,
+  readPhysicalDoors,
   subscribeDoors,
   transactDoorWrites,
 } from "./doorsDoc";
@@ -146,6 +163,11 @@ import { initFarDoorWrite, writeFarDock } from "./farDoorWrite";
 import type { FarDockRequest, FarDockResult } from "./docking";
 // 🚪🩹 The far-door correction compares a record's target room by id.
 import { roomIdFromSeed } from "./stationAtlas";
+// ⚓ A station's public berth takes its door's pose from the atlas, and 🚀 a
+// ship under way keeps its flight's place whatever it wears.
+import { followsFlightRecord, setBerthPoseLookup } from "./stationDirectory";
+// ⚓ DEPART remembers the dock into the station it leaves.
+import { setBerthStationResolver } from "./shipArrival";
 import {
   dockedStationFor,
   listStations,
@@ -153,7 +175,11 @@ import {
   removeStation,
   setRoomStationResolver,
   setStationRoomSource,
+  stationForRoom,
+  stationRoomCause,
 } from "./stations";
+// 🛰️ #30 SH3: ship destinations read the station record through this seam.
+import { directoryFromStationRecords, flightCapable, setStationDirectory, setStationRoomCheck } from "./stationDirectory";
 import type { RoomTheme } from "./furniture";
 import {
   addToLedger,
@@ -234,6 +260,7 @@ import {
 import {
   harvestIntoAtlas,
   readAtlas,
+  atlasComponent,
   bindStationAtlasDoc,
   pushAtlasToDoc,
   subscribeSharedAtlas,
@@ -1151,6 +1178,65 @@ async function joinRoom(
  *  re-checks the epoch and unwinds whatever it created if superseded.
  *  `claimRoomDefaults`: true only on the own-room default-bootstrap path —
  *  gates the roomInfo owner/name default writes (see below). */
+/**
+ * 🛰️ #30 SH3: the station a ship's room belongs to right now, from its LIVE
+ * docks — the room a dock leads into — never from the atlas alone: atlas
+ * edges outlive a cast-off, so the component around the ship's own room can
+ * still hold the station it left. Floating free there is none: the ship's
+ * own one-module station (never a destination) reaches the directory as
+ * `own`, and anything else the atlas says about it is stale.
+ */
+function shipStationHere(roomId: string): string | null {
+  return shipStationsHere(roomId)[0] ?? null;
+}
+
+/** Every station the ship's live docks lead into, in door order (two when a
+ *  ship is docked into two stations at once): shipStationHere's first is
+ *  where it is, and none of them is a destination. */
+function shipStationsHere(roomId: string): string[] {
+  const out: string[] = [];
+  if (!roomId) return out;
+  // Every real door, past the snapshot's cap: a flood must not hide a dock,
+  // nor a record on a door the room lacks pass for one.
+  for (const [, rec] of readPhysicalDoors()) {
+    if (rec.paired !== true || !rec.connectedRoomAddress) continue;
+    // Only a dock says where the ship is: a permanent gangway leads back into
+    // the ship's own group (older docks carry only the two-half chain).
+    if (rec.transient !== true && !isDockChain(rec.segments)) continue;
+    let partner = "";
+    try {
+      partner = roomIdFromSeed(rec.connectedRoomAddress);
+    } catch {
+      continue;
+    }
+    const st = partner ? stationForRoom(partner) : null;
+    // Another lone module's one-room station is no host: two lone modules
+    // docked together each stay where they are (stations.dockedStationFor).
+    if (st && st.derived && atlasComponent(readAtlas(), st.welcomeRoomId).size <= 1) continue;
+    if (st && !out.includes(st.id)) out.push(st.id);
+  }
+  // No host station: not the ship's own one-room station (the directory
+  // hears about that through `own`), so callers fall back to the flight.
+  return out;
+}
+
+/** The one-module station whose welcome room IS this room, straight from
+ *  the list (not stationForRoom, which a ship room resolves through its dock). */
+function ownStationOf(roomId: string): string | null {
+  if (!roomId) return null;
+  return listStations().find((st) => st.welcomeRoomId === roomId)?.id ?? null;
+}
+
+/** 🚀 #30 SH3: does this player command the current room's ship? */
+function isLocalHelmCommander(): boolean {
+  const ownerVal =
+    (yjsSync?.doc.getMap("roomInfo").get("owner") as string | undefined) ?? "";
+  return isLocalPlayerRoomOwner(ownerVal);
+}
+
+/** 🚀 #30 SH3: the commander's 1 Hz flight watch (set per join, cleared on leave). */
+let shipFlightWatch: number | null = null;
+
 async function joinRoomAtEpoch(
   boot: RoomBootstrap,
   epoch: number,
@@ -1446,6 +1532,21 @@ async function joinRoomAtEpoch(
   // like players/games/roomInfo (T0 seam).
   bindFurnitureDoc(sync.doc);
 
+  // 🚀 #30 SH2 + SH3: the ship's own doc (fuel level + flight state machine)
+  // rides the room doc too. Rebinds per join RIGHT AFTER furniture — a helm
+  // that reads fuel truth must see the fresh doc BEFORE its subscribe fires
+  // (the helm's REFUEL/DEPART/REDOCK writers all read the CURRENT record
+  // through writeFlightRecord's transition gate, so a subscribe firing against
+  // the stale doc would refuse legal advances). Fuel-tank capacity is DERIVED
+  // from furniture, so the two docs are consumed together in the helm UI;
+  // binding shipDoc right after furniture guarantees both observers are
+  // installed before the first reconcile. The exterior view reads it too,
+  // indirectly: its planet backdrop comes from planetForRoom, whose
+  // room-station resolver (set below) places a free-flying ship by its
+  // flight record.
+  bindShipDoc(sync.doc);
+  clearShipArrivalNote(); // the last ship's arrival is not this room's
+
   // Bind the shared door-pairing map (issue #64): keyed by door id, drives
   // world.reconcileDoors so a module another user docks to a door becomes visible
   // + enterable for everyone. Rebinds per join like furniture/games (T0 seam).
@@ -1668,14 +1769,64 @@ async function joinRoomAtEpoch(
     setExteriorRoomId(() => activeBootstrap?.roomId ?? "");
     // 🪐 …and the station registry's "which station am I in" (holotable).
     setStationRoomSource(() => activeBootstrap?.roomId ?? "");
+    // 🛰️ #30 SH3: the helm flies between the stations the record lists. A
+    // station's berth is its welcome room, dockable when this client holds a
+    // seed for it — the atlas's, or the build's own pass for the default one.
+    // A seed is only this room's when it names this room (atlas entries can
+    // come from peers): one naming another room would dock elsewhere.
+    const seedNames = (seed: string | undefined, roomId: string): seed is string => {
+      if (!seed) return false;
+      try { return roomIdFromSeed(seed) === roomId; } catch { return false; }
+    };
+    const localSeedFor = (roomId: string): string | undefined => {
+      const atlasSeed = readAtlas()[roomId]?.seed;
+      if (seedNames(atlasSeed, roomId)) return atlasSeed;
+      // The build's own pass for the default station is trusted as shipped.
+      return roomId === DEFAULT_STATION.welcomeRoomId ? DEFAULT_STATION.welcomeRoomLink || undefined : undefined;
+    };
+    // A remembered berth names its room only; the pass comes from here.
+    setBerthSeedResolver(localSeedFor);
+    // ⚓ The station a dock leads into, as the directory's `here` reads it,
+    // so DEPART files the right dock under the station it leaves. A dock
+    // between two of the ship's own doors leads into none.
+    setBerthStationResolver((roomId) =>
+      roomId && roomId !== activeBootstrap?.roomId ? stationForRoom(roomId)?.id ?? null : null);
+    // ⚓ A station's public berth: its door's own wall and lateral, as the
+    // atlas last saw them from inside its room.
+    setBerthPoseLookup((roomId, doorId) => {
+      const door = readAtlas()[roomId]?.doors[doorId];
+      return door?.wall ? { wall: door.wall, lateral: door.lateral } : null;
+    });
+    setStationDirectory(
+      directoryFromStationRecords(
+        () => listStations(),
+        localSeedFor,
+        () => shipStationHere(activeBootstrap?.roomId ?? ""),
+        () => ownStationOf(activeBootstrap?.roomId ?? ""),
+        () => shipStationsHere(activeBootstrap?.roomId ?? ""),
+      ),
+    );
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart
     // from the station it is docked at: the current room's live docks place
     // it (the holotable's "you are here", the exterior's planet).
-    setRoomStationResolver((roomId) =>
-      roomId && roomId === activeBootstrap?.roomId
-        ? dockedStationFor(roomId, readAllDoors().values())
-        : null,
-    );
+    // 🚀 A ship with no live dock is where its flight record says (cast off,
+    // holding, in transit, or arrived berthless), not its own one-room
+    // station, so the backdrop keeps the right planet all the way.
+    setRoomStationResolver((roomId) => {
+      if (!roomId || roomId !== activeBootstrap?.roomId) return null;
+      const docked = dockedStationFor(roomId, readPhysicalDoors().values());
+      if (docked) return docked;
+      // A saved or built-in station's welcome room, or a module bolted into a
+      // station by structure, stays put whatever it wears (a station-keeping
+      // helm room wears engine, tank and helm too): only a free-flying ship
+      // follows its flight record (flightCapable, the helm's own gate), and
+      // one under way keeps following it should a fitting come off mid-trip.
+      const flight = readFlightRecord();
+      return followsFlightRecord(flight.status, flightCapable(isShipReady())) ? flight.locationId : null;
+    });
+    // 🚀 The same rule gates the helm: a station room never departs, and never
+    // takes its location from the ship's flight record.
+    setStationRoomCheck(() => stationRoomCause(activeBootstrap?.roomId ?? "", readPhysicalDoors().values()));
     // 🛰️ #65: solar-panel changes (any client) rebuild an ACTIVE exterior view,
     // and the toolbar's ADD button follows ownership of the current room.
     subscribeExterior(() => refreshExteriorView());
@@ -1703,7 +1854,52 @@ async function joinRoomAtEpoch(
         "";
       return isLocalPlayerRoomOwner(ownerVal);
     });
+    // 🚀 #30 SH2/SH3: the helm's writes are owner-gated at the UI. Same seam
+    // as the exterior owner check — dev-phase honest-client posture (signed
+    // enforcement lives in a later slice, plan §7 SH5).
+    setHelmOwnerCheck(isLocalHelmCommander);
   }
+  // 🚀 #30 SH3: commander-side flight auto-advance. The helm panel already
+  // ticks the countdown while open, but a flight must complete even if no
+  // one has the panel up — otherwise a `in-flight` record with a past
+  // `etaAt` would strand the ship (canDepart refuses because status !==
+  // 'docked'). Idempotent under contention: whichever commander writes
+  // first wins; the second's next tick reads `redocking` and skips. Non-
+  // commanders don't advance (owner-writes posture). Runs at 1 Hz — an
+  // arrival-latency ceiling of ~1 second is imperceptible next to the
+  // 60–90 s minimum travel time.
+  // Installed on EVERY join (not in the one-time hook block above): each
+  // join replaces the last room's watch and leaveRoomNow clears it, so room
+  // hops neither stack callbacks nor leave a flight without its watch.
+  if (shipFlightWatch !== null) window.clearInterval(shipFlightWatch);
+  shipFlightWatch = window.setInterval(() => {
+    if (!isLocalHelmCommander()) return;
+    const rec = readFlightRecord();
+    if (rec.status === "in-flight" && flightArrived(rec, Date.now())) {
+      // Arrive where the ship flew — even if that station has since dropped
+      // out of the directory (never silently home).
+      writeFlightRecord({
+        status: "redocking",
+        locationId: rec.destinationId ?? rec.locationId,
+        etaAt: rec.etaAt,
+      });
+    }
+    // 🛬 Arrived: dock at the destination's berth with the shipped DOCK.
+    if (readFlightRecord().status !== "redocking") return;
+    const ds = world?.dockingSystem ?? null;
+    noteShipArrival(
+      completeArrival(
+        ds
+          ? {
+              ports: () => ds.listDockPorts(),
+              undock: (doorId) => void ds.undockPort(doorId),
+              dock: (doorId) => ds.redockPort(doorId),
+            }
+          : null,
+        { onSettled: noteShipArrival },
+      ),
+    );
+  }, 1_000);
   setActivePassRoom(boot.roomId);
 
   // Bind shared room info map updates (Task: Room Name & Room Owner)
@@ -2204,6 +2400,10 @@ async function leaveRoom(): Promise<void> {
 }
 
 async function leaveRoomNow(closed: () => void): Promise<void> {
+  if (shipFlightWatch !== null) {
+    window.clearInterval(shipFlightWatch);
+    shipFlightWatch = null;
+  }
   // Invalidate any in-flight joinRoom (see the sessionEpoch declaration).
   const epoch = ++sessionEpoch;
   // 🚪 The docking pane (and its placement hypothesis — ghost, room shell,
@@ -3173,6 +3373,8 @@ function resolveOwnerLabel(owner: string): string {
  *    · docking + door policy .. dockingSystem.onOwnerCheck
  *    · the room-NAME editor ... the roomInfo 'name' write
  *    · the exterior view ...... setExteriorOwnerCheck
+ *    · the ship's helm ........ setHelmOwnerCheck (REFUEL / DEPART / arrival —
+ *      "if you could rearrange the furniture, you can fly the ship", plan §6)
  *    · the room-cache `owned` flag (keeps a snapshot from being LRU-evicted)
  *
  *  🔒 #142 — RAW DEED HOLDER ONLY, via `currentRoomDeedIsMine()`:
