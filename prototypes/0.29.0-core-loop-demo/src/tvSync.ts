@@ -177,6 +177,10 @@ export class TvSyncController {
    *  past T0 follows it like any jump — to the time since T0 — and forgets
    *  it. Null outside a countdown, and once followed. */
   private countdownJump: number | null = null;
+  /** The holder, back from a sleep: whether its player has been sent to
+   *  where the room is (readPlayback's bridged, stale reading) — once per
+   *  stale spell, the beat from there being what ends it. */
+  private rejoining = false;
 
   constructor(private readonly deps: TvSyncDeps) {
     this.now = deps.now ?? tvNow; // monotonic: cadences and the receipt timeline, never a date
@@ -370,7 +374,20 @@ export class TvSyncController {
       if ((landing || newProgramme || p.isEnded() || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) && (p.canSeek || p.hasClock)) {
         this.aim(p, target, now);
       }
+    } else if (pb.stale && !this.rejoining) {
+      // The record's anchor is from before this page slept (readPlayback
+      // `stale`): the room ran on while the OS stopped this player with the
+      // machine, so the holder REJOINS the room where the room is — the
+      // reading bridged across the gap on the wall clock — and never drags
+      // it back to where it slept: one seek, as for a jump, and no beat
+      // until it lands (pendingTarget), so a pre-sleep position is never
+      // published; the beat from there is the fresh sample that un-stales
+      // everyone, this page included.
+      this.rejoining = true;
+      const target = reachable(pb.positionMs, p);
+      if (Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS && (p.canSeek || p.hasClock)) this.aim(p, target, now);
     }
+    if (!pb.stale) this.rejoining = false;
     this.settlePending(p, now);
     this.setRate(1);
     if (p.isEnded()) {
@@ -469,10 +486,11 @@ export class TvSyncController {
     this.seenJump = jump;
     // The record's anchor is from before this page slept (readPlayback
     // `stale`: a gap in the room tick's awake marks — the monotonic clock
-    // may have run on through an OS sleep, so the reading is the sleep
-    // ahead of the room, or may be): shown, never seeked or nudged to. The
-    // holder's next heartbeat, 3 s at most, lands a fresh sample, and the
-    // player is then seeked once, to where the room is.
+    // may or may not have run on through an OS sleep; the reading is
+    // bridged on the wall clock, an estimate): shown, never seeked or
+    // nudged to. The holder's next heartbeat past the wake window —
+    // TV_WAKE_WINDOW_MS + TV_HEARTBEAT_MS at most — lands a fresh sample,
+    // and the player is then seeked once, to where the room is.
     if (pb.stale) {
       if (!p.isPlaying() && !p.isEnded()) p.play();
       return pb;
