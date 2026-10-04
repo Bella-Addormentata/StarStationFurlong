@@ -145,8 +145,9 @@ import type {
   RouteStop,
   ShipRoute,
 } from './shipRoute';
-import { adriftAt, localStationId } from './stationDirectory';
-import { listStations, planetById, stationInTransit } from './stations';
+import { castOffPlaces } from './shipArrival';
+import { localStationId } from './stationDirectory';
+import { stationInTransit } from './stations';
 import type { StationBerthRecord, StationMove } from './stations';
 
 // ── Constants (§2b, §5) ──────────────────────────────────────────────────────
@@ -1012,17 +1013,18 @@ export function departRouteFromHelm(o: { now: number }): GoCheckpoint | null {
   if (!routeRulesFlight(f) || routeDepartState(f, o.now).kind !== 'open') return null;
   const go = goCheckpoint(route, f.legSeq, { at: o.now, stayStart: Math.min(o.now, f.stayStart ?? o.now) });
   if (!go || !writable(route, go)) return null;
+  const locationId = localStationId(route.stops[f.stopIndex].stationId);
   const destinationId = localStationId(route.stops[f.nextStopIndex].stationId);
-  // 🚚 Where that stop orbits now (PR 174's DEPART does the same), so a
-  // client that lands this record can tell the station moved away since.
-  const dest = listStations().find((st) => st.id === destinationId);
   const rec: FlightRecord = {
     status: 'in-flight',
-    locationId: localStationId(route.stops[f.stopIndex].stationId),
+    locationId,
     destinationId,
     departedAt: go.departAt,
     etaAt: go.arriveAt,
-    ...(dest ? { destinationAt: adriftAt(planetById(dest.planetId).id, dest.orbitSlot) } : {}),
+    // 🚚 Where both stops orbit now, as PR 174's DEPART keeps them
+    // (shipArrival.castOffPlaces), so a client that lands this record can
+    // tell a station moved away since.
+    ...castOffPlaces(locationId, destinationId),
   };
   let wrote = false;
   h.doc.transact(() => {

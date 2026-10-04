@@ -6,9 +6,9 @@
  * from another tab or another consumer's draw, the burns the tanks cannot
  * cover dropped the same way everywhere, and level writes settling the log.
  */
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import type { DoorRecord } from './doorsDoc';
+import type { DoorPairing, DoorRecord } from './doorsDoc';
 import { ORBIT_EPOCH_MS, angleAt, orbitForSlot, setStationTrimResolver, stationOrbit, wrapAngle } from './orbits';
 import {
   FUEL_METER_MAX,
@@ -24,7 +24,9 @@ import {
 } from './shipDoc';
 import type { FuelRecord } from './shipDoc';
 import { roomIdFromSeed } from './stationAtlas';
+import type { AtlasDoor, AtlasEntry } from './stationAtlas';
 import { DEFAULT_PLANET_ID } from './stations';
+import type { StationRecord } from './stations';
 import {
   BURN_MS,
   MAX_LOG,
@@ -51,6 +53,7 @@ import {
   slotDriftPerHour,
   slotOffsetAt,
   slotOrbit,
+  steersStation,
   subscribeStationKeeping,
   trimFor,
   trimmedOrbit,
@@ -181,6 +184,70 @@ describe('which face the helm shows', () => {
       expect(roomIdFromSeed(address)).toBe('room-a');
       expect(isBoltedIntoStation([{ paired: true, connectedRoomAddress: address }])).toBe(true);
     }
+  });
+
+  it('a berth flagged only at the far end is a berth, and a gangway beside it still bolts the module', () => {
+    // Copilot's review of #173: the atlas calls a connection a berth when
+    // either end says so, and the module still opened the station helm on
+    // the strength of its own unflagged record.
+    const here = 'room-ship';
+    const there = 'room-station';
+    const atlasWith = (doors: Record<string, Partial<AtlasDoor>>): Record<string, AtlasEntry> => ({
+      [there]: {
+        roomId: there,
+        name: 'Station',
+        lastSeen: 0,
+        doors: Object.fromEntries(Object.entries(doors).map(([id, d]) => [id, { targetSeed: seedFor(here), targetRoomId: here, ...d }])),
+      },
+    });
+    const toStation = (over: Partial<DoorPairing> = {}): DoorRecord => ({ paired: true, connectedRoomAddress: seedFor(there), ...over });
+    // The station's record is a guest berth; the module's own (an older
+    // client's) carries no flag.
+    const lone = new Map([['west', toStation()]]);
+    expect(isBoltedIntoStation(lone, here, atlasWith({ east: { transient: true } }))).toBe(false);
+    // Without the room's id only its own flags count, and so they do when
+    // the atlas holds nothing of the far room.
+    expect(isBoltedIntoStation(lone.values())).toBe(true);
+    expect(isBoltedIntoStation(lone, here, {})).toBe(true);
+    // A gangway between the same two rooms, beside the berth, still joins
+    // them: matched by flag...
+    const both = new Map([['west', toStation()], ['north', toStation({ transient: false })]]);
+    expect(isBoltedIntoStation(both, here, atlasWith({ east: { transient: true }, south: { transient: false } }))).toBe(true);
+    // ...or by the far doors the records name.
+    const named = new Map([['west', toStation({ farDoor: 'east' })], ['north', toStation({ farDoor: 'south' })]]);
+    const namedAtlas = atlasWith({ east: { transient: true, farDoor: 'west' }, south: { farDoor: 'north' } });
+    expect(isBoltedIntoStation(named, here, namedAtlas)).toBe(true);
+    // Take the gangway down, and the berth alone joins nothing.
+    expect(isBoltedIntoStation(new Map([['west', toStation({ farDoor: 'east' })]]), here, namedAtlas)).toBe(false);
+  });
+
+  it('a pairing addressed back to the room itself joins nothing', () => {
+    // Copilot's review of #173: the atlas still finds such a room alone, so
+    // its helm must not trim a station's orbit.
+    const here = 'room-ship';
+    const self = new Map<string, DoorRecord>([['west', { paired: true, connectedRoomAddress: seedFor(here) }]]);
+    expect(isBoltedIntoStation(self, here, {})).toBe(false);
+    expect(steersStation(here, self, {}, [])).toBe(false);
+    // A gangway to another room beside it still bolts the module.
+    const both = new Map<string, DoorRecord>([...self, ['north', { paired: true, connectedRoomAddress: seedFor('room-station') }]]);
+    expect(isBoltedIntoStation(both, here, {})).toBe(true);
+  });
+
+  it('a station\'s own welcome room steers the station even standing alone; any other lone room flies', () => {
+    // Dorkmo's "Fly and park" (free flight, #203): a one-module station
+    // keeps its orbit with the trim stick too, its ship face a tab away.
+    const stations: StationRecord[] = [
+      { id: 'my-station', name: 'Mine', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'room-w' },
+      { id: 'station:room-x', name: 'Module', planetId: SOV, orbitSlot: 3, welcomeRoomId: 'room-x', derived: true },
+    ];
+    expect(steersStation('room-w', new Map(), {}, stations)).toBe(true);
+    // A module the list only derives a station from is a ship.
+    expect(steersStation('room-x', new Map(), {}, stations)).toBe(false);
+    expect(steersStation('room-y', new Map(), {}, stations)).toBe(false);
+    expect(steersStation('', new Map(), {}, stations)).toBe(false);
+    // Bolted in, any room steers its station.
+    expect(steersStation('room-y', new Map([['north', gangway]]), {}, stations)).toBe(true);
+    expect(steersStation('room-y', new Map([['north', guestBerth]]), {}, stations)).toBe(false);
   });
 });
 
@@ -1368,6 +1435,52 @@ describe('a burn stamped ahead of our clock', () => {
     press('lower', T0 + BURN_MS);
   });
 
+  it('a REFUEL keeps the burn firing now, and the next press fires at its own time', () => {
+    // Copilot's review of #173: a REFUEL that settled a peer burn stamped an
+    // hour ahead dated the trim then and kept only that burn's firing. The
+    // burn firing now lost its lockout, and every press after the REFUEL
+    // applied, and fired, an hour on, so the stick never waited.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const doc = new Y.Doc();
+      bindRoom(doc);
+      writeFuelLevel(50, 100);
+      const ahead = burnAt(T0 + HOUR, 'back');
+      doc.getMap('stationKeeping').set('burn:peer:1', ahead);
+      const mine = press('raise', T0);
+      const base = slotOrbit(STATION);
+      const before = readOrbitTrim();
+      vi.setSystemTime(T0 + 1_000);
+      writeFuelLevel(readFuelLevel(), 100);
+      const settled = readFuelSettlement(SK) as KeepingSettlement;
+      // Nothing it keeps is dated past the write: the trim is re-dated on
+      // the same orbit, and the burn it keeps firing is the one firing now.
+      expect(settled.trim).toMatchObject({ dRadiusKm: TRIM_STEP_KM, at: T0 + 1_000, last: 'back' });
+      for (const t of [T0, T0 + HOUR, T0 + 30 * HOUR]) {
+        expect(signedAngle(angleAt(trimmedOrbit(base, settled.trim), t) - angleAt(trimmedOrbit(base, before), t))).toBeCloseTo(0, 9);
+      }
+      expect(settled.fired).toEqual([firedOf(mine)]);
+      const reload = new Y.Doc();
+      Y.applyUpdate(reload, Y.encodeStateAsUpdate(doc));
+      for (const d of [doc, reload]) {
+        bindRoom(d);
+        expect(readBurnFiring(T0 + 1_000, STATION)).toEqual(firedOf(mine));
+        expect(() => press('lower', T0 + 1_000)).toThrow('refused: burning');
+      }
+      // The next press fires at its own time, and holds the stick in turn.
+      bindRoom(doc);
+      const next = press('lower', T0 + BURN_MS);
+      expect(readOrbitTrim()).toMatchObject({ at: next.at, last: 'lower' });
+      expect(readBurnFiring(T0 + BURN_MS + 10, STATION)).toEqual(firedOf(next));
+      expect(() => press('ahead', T0 + BURN_MS + 10)).toThrow('refused: burning');
+      // Every burn applied once and paid once.
+      expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
+      expect(readFuelLevel()).toBe(50 - 3 * TRIM_FUEL);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('a dropped burn never fires', () => {
     const doc = new Y.Doc();
     bindRoom(doc);
@@ -1551,6 +1664,88 @@ describe('the fuel record: one reading per meter', () => {
       expect(readFuelLevel()).toBe(gauge);
     } finally {
       for (const name of names) setFuelDrawMeter(name, null);
+    }
+  });
+
+  it('a level write from a build from before the meters charges no draw twice', () => {
+    // Copilot's review of #173: such a build writes the level alone, which
+    // dropped the readings the level was written against.
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    press('raise', T0);
+    press('ahead', T0 + BURN_MS);
+    writeFuelLevel(readFuelLevel(), 100);
+    const { level, ...parts } = fuelRecord(doc);
+    expect(doc.getMap('ship').get('fuelCopy')).toEqual(parts);
+    const settled = readFuelSettlement(SK);
+    // Its DEPART takes a 10-unit trip off the level as written.
+    doc.getMap('ship').set('fuel', { level: level - 10 });
+    expect(readFuelLevel()).toBe(level - 10);
+    expect(readFuelSettlement(SK)).toEqual(settled);
+    expect(fuelCeiling(SK)).toBe(2 * TRIM_FUEL + level - 10);
+  });
+
+  it('keeps the settled orbit and every draw through level writes from a build from before the meters', () => {
+    // Copilot's review of #173: once the next burn had cleared the burns a
+    // level write settled, the settlement was their only account, and such
+    // a write dropped it.
+    const doc = new Y.Doc();
+    const old = new Y.Doc(); // a tab on that build, fully synced
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    press('raise', T0);
+    press('ahead', T0 + BURN_MS);
+    writeFuelLevel(readFuelLevel(), 100);
+    press('lower', T0 + 2 * BURN_MS);
+    expect(doc.getMap('stationKeeping').size).toBe(1);
+    const t = readOrbitTrim();
+    const { level } = fuelRecord(doc);
+    expect(readFuelLevel()).toBe(level - TRIM_FUEL);
+    // That tab DEPARTs on a 10-unit trip, off the level as written...
+    sync(doc, old);
+    old.getMap('ship').set('fuel', { level: (old.getMap('ship').get('fuel') as FuelRecord).level - 10 });
+    sync(doc, old);
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
+    expect(readFuelLevel()).toBe(level - 10 - TRIM_FUEL);
+    // ...and REFUELs: the burn since the last level write here comes off the
+    // full tanks too (never a refund)...
+    old.getMap('ship').set('fuel', { level: 100 });
+    sync(doc, old);
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelLevel()).toBe(100 - TRIM_FUEL);
+    // ...until a level write here records it, and keeps the readings again.
+    writeFuelLevel(readFuelLevel(), 100);
+    expect(fuelRecord(doc)).toMatchObject({ level: 100 - TRIM_FUEL, meters: { [SK]: 3 * TRIM_FUEL }, meter: 3 * TRIM_FUEL });
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelLevel()).toBe(100 - TRIM_FUEL);
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(doc));
+    bindRoom(reload);
+    expect(readOrbitTrim()).toEqual(t);
+    expect(readFuelDrawn()).toBe(3 * TRIM_FUEL);
+    expect(readFuelLevel()).toBe(100 - TRIM_FUEL);
+  });
+
+  it('reads a record that keeps readings of its own with them, and a copy that is no object as none', () => {
+    const doc = new Y.Doc();
+    bindRoom(doc);
+    writeFuelLevel(50, 100);
+    press('raise', T0);
+    writeFuelLevel(readFuelLevel(), 100);
+    // Another build's meter only: station keeping's whole reading comes off.
+    doc.getMap('ship').set('fuel', { level: 30, meters: { stationMove: 4 } });
+    expect(readFuelLevel()).toBe(30 - TRIM_FUEL);
+    expect(readFuelSettlement(SK)).toBeUndefined();
+    // A record from before per-meter readings is read against its sum.
+    doc.getMap('ship').set('fuel', { level: 30, meter: TRIM_FUEL / 2 });
+    expect(readFuelLevel()).toBe(30 - TRIM_FUEL / 2);
+    for (const copy of ['x', [1], null, 5]) {
+      doc.getMap('ship').set('fuelCopy', copy);
+      doc.getMap('ship').set('fuel', { level: 30 });
+      expect(readFuelLevel()).toBe(30 - TRIM_FUEL);
+      expect(readFuelSettlement(SK)).toBeUndefined();
     }
   });
 });

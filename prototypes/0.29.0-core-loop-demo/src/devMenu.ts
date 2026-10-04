@@ -73,6 +73,9 @@ import { SEATS, rebuildSeats } from './seats';
 import { DEVICES, rebuildDevices } from './devices';
 import { registerFurnitureHandles } from './furnitureHandles';
 import type { FurnitureHandleSinks } from './furnitureHandles';
+// 🏒 #115: a DEV-spawned air-hockey table must register with the session layer
+// (the doc-echo reconcile no-ops on this local add, so World never sees it).
+import { registerAirHockeyVisual } from './airHockeySession';
 import { DOORS } from './doors';
 import {
   ITEM_DEFS, getItemDef, loadTrunkState, saveTrunkState,
@@ -109,6 +112,7 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
   'departures-board': '🚏 DEPARTURES BOARD',
+  'air-hockey-table': '🏒 AIR HOCKEY TABLE',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
   'rose-bouquet': '🌹 ROSE BOUQUET',
   'purple-bouquet': '💜 PURPLE BOUQUET',
@@ -425,6 +429,9 @@ function registerSpawnedGroup(world: World, item: FurnitureItem): void {
       // World call site on why this side must not keep its own key list.
       const spawnedTop = sinks.gameTableTops.get(item.id);
       if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+      // 🏒 #115 — mirrors World.registerFurnitureGroup's hand-off.
+      const hockey = sinks.airHockeyVisuals.get(item.id);
+      if (hockey) registerAirHockeyVisual(item.id, hockey, { x: item.pos.x, z: item.pos.z, rot: item.rot });
       const mat = obj.material as THREE.Material & { opacity: number };
       if ('opacity' in mat) {
         mat.opacity = (mat.userData.baseOpacity as number | undefined) ?? 1;

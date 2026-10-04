@@ -103,13 +103,14 @@ import {
   writeDoorTombstone,
   type DoorRecord,
 } from "./doorsDoc";
-import { roomHalfExtents, roomWalkBounds } from "./floorPlanDoc";
+import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./floorPlanDoc";
+import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
 import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
-import { isBoltedIntoStation } from "./stationKeeping";
+import { steersStation } from "./stationKeeping";
 import { createStationHelmUI } from "./stationHelm";
-import { currentStation } from "./stations";
+import { currentRoomId, currentStation } from "./stations";
 import type { AtlasDoor } from "./stationAtlas";
 // 🚪 The arrival-door choice is pure and tested (doorMatch.test.ts).
 import { chooseArrivalDoor, type ArrivalDoor } from "./doorMatch";
@@ -153,12 +154,7 @@ import {
   readLiveRoomStatus,
 } from "./devices";
 import { boardGate } from "./departuresDoc";
-import {
-  closeSlotMachine,
-  stopAutoSlotMachine,
-  tickAutoSlotMachine,
-  tickManualSlotMachine,
-} from "./slotCroupier";
+import { closeSlotMachine, tickSlotMachineRoom } from "./slotCroupier";
 import {
   closeCoinPusher,
   tickCoinPusherRoom,
@@ -176,10 +172,19 @@ import type {
   PropAnimHandle,
   SlotMachineCabinetControl,
   CoinPusherVisualHandle,
+  AirHockeyVisualHandle,
   DeviceUI,
   DeviceTarget,
 } from "./devices";
-import { subscribeGames, readGame } from "./games/gamesDoc";
+import { subscribeGames, readGame, clearTable } from "./games/gamesDoc";
+// 🏒 #115: the air-hockey live layer — World feeds it built table handles +
+// frame time; it owns the per-table registry (sim, ticks, smoothing, HUD).
+import {
+  airHockeyFrame,
+  closeAirHockeyTable,
+  createAirHockeyUI,
+  registerAirHockeyVisual,
+} from "./airHockeySession";
 import { deviceFocus } from "./deviceFocus";
 import { roomEdit, canEditRoom, holdsRoomDeed } from "./editMode";
 import { showHint } from "./hud";
@@ -342,6 +347,8 @@ export class World {
   /** 🚪 #159: what the live hull's door apertures were cut from (see
    *  hullDoorSignature) — lets a refresh skip an identical rebuild. */
   private octagonHullDoorSig = "";
+  /** 🔭 cupolaSignature() when reconcileCupola last re-cut the room. */
+  private cupolaSig = "";
   /** 🚪 #159: the apertures may be stale — the docking system said a frame
    *  moved or vanished, or a door began to open or finished closing
    *  (onDoorApertureChange). Settled once per frame in update(), so a join
@@ -445,6 +452,9 @@ export class World {
   private gameTableTops: Map<string, GameTableTopHandle> = new Map();
   /** 💃 Dance-floor light waves, keyed by item id (driven every frame). */
   private propAnims: Map<string, PropAnimHandle> = new Map();
+  /** 🏒 Air-hockey table visuals, keyed by item id — filed here, then handed
+   *  to the session layer, which drives them (airHockeyFrame). */
+  private airHockeyVisuals: Map<string, AirHockeyVisualHandle> = new Map();
   /** Unsubscribe for the #45 board-mirror games listener — held so a
    *  createPlatform re-run (morph restart) swaps the listener instead of
    *  stacking a duplicate. */
@@ -1119,6 +1129,7 @@ export class World {
       collectWindowOpenings(),
       this.collectWallpaper(),
       doorOpenings,
+      readCupolaWall(),
     );
     this.octagonHullDoorSig = this.hullDoorSignature(doorOpenings);
     this.platformGroup.add(this.octagonHull.group);
@@ -1460,6 +1471,32 @@ export class World {
     this.addOctagonHull();
   }
 
+  /** 🔭 What the cupola rendering depends on: the stored wall and the room
+   *  size it is resolved against. */
+  private cupolaSignature(): string {
+    return JSON.stringify([roomHalfExtents(), readCupolaWall()]);
+  }
+
+  /**
+   * 🔭 Follow the floorPlan `cupola` setting: a change (the owner set or
+   * cleared it, here or on another client) re-cuts the hull, the floor's
+   * corners and the walkable grid. Called on every floorPlan change, so it
+   * bails when the cupola signature is unchanged.
+   */
+  public reconcileCupola(): void {
+    const sig = this.cupolaSignature();
+    if (sig === this.cupolaSig) return;
+    this.cupolaSig = sig;
+    rebakeWalkableGrid();
+    this.player.onWalkShapeChanged(); // out of a glass corner; replan the walk
+    if (this.platformFloor) {
+      const old = this.platformFloor.geometry;
+      this.platformFloor.geometry = this.makeFloorGeometry();
+      old.dispose();
+    }
+    if (OCTAGON_HULL && this.octagonHull) this.addOctagonHull();
+  }
+
   /**
    * 🖼️ #80 S6: rebuild the octagon hull when the shared wall-covering set
    * changes (paint / clear) — mirrors reconcileWindowLayout. The rebuild
@@ -1481,14 +1518,21 @@ export class World {
     const { halfX, halfZ } = roomHalfExtents();
     const w = 2 * halfX,
       d = 2 * halfZ;
-    if (this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
+    // 🔭 a cupola end wall cuts the floor's two corners at that end at 45°.
+    const cupola = OCTAGON_HULL ? roomCupola() : null;
+    if (!cupola && this.floorHoles.length === 0 && this.floorHoleOutlines.length === 0) {
       return new THREE.PlaneGeometry(w, d);
     }
     const shape = new THREE.Shape();
-    shape.moveTo(-halfX, -halfZ);
-    shape.lineTo(halfX, -halfZ);
-    shape.lineTo(halfX, halfZ);
-    shape.lineTo(-halfX, halfZ);
+    if (cupola) {
+      const outline = cupolaFloorOutline(cupola);
+      outline.forEach((p, i) => (i === 0 ? shape.moveTo(p.x, -p.z) : shape.lineTo(p.x, -p.z)));
+    } else {
+      shape.moveTo(-halfX, -halfZ);
+      shape.lineTo(halfX, -halfZ);
+      shape.lineTo(halfX, halfZ);
+      shape.lineTo(-halfX, halfZ);
+    }
     shape.closePath();
     for (const h of this.floorHoles) {
       const path = new THREE.Path();
@@ -1614,6 +1658,18 @@ export class World {
         // the paint no-ops rather than driving a handle nothing tracks.
         const spawnedTop = sinks.gameTableTops.get(item.id);
         if (spawnedTop) spawnedTop.setBoard(readGame(item.id)?.board ?? null);
+        // 🏒 #115: hand the filed air-hockey handle to the session layer,
+        // which drives it every frame (airHockeyFrame) and converts its LOCAL
+        // coords to the world-space tick wire — read back from the sink for
+        // the same reason as the table top above.
+        const hockey = sinks.airHockeyVisuals.get(item.id);
+        if (hockey) {
+          registerAirHockeyVisual(item.id, hockey, {
+            x: item.pos.x,
+            z: item.pos.z,
+            rot: item.rot,
+          });
+        }
         if (reveal) {
           const mat = obj.material as THREE.Material & {
             opacity: number;
@@ -1657,6 +1713,7 @@ export class World {
       slotMachineVisuals: this.slotMachineVisuals,
       coinPusherVisuals: this.coinPusherVisuals,
       propAnims: this.propAnims,
+      airHockeyVisuals: this.airHockeyVisuals,
     };
   }
 
@@ -3082,6 +3139,7 @@ export class World {
     this.coinPusherVisuals.get(itemId)?.dispose();
     this.coinPusherVisuals.delete(itemId);
     this.propAnims.delete(itemId);
+    this.airHockeyVisuals.delete(itemId);
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the
@@ -3099,6 +3157,14 @@ export class World {
       // 🪙 Stop operating it here. The deed holder's session that operates it
       // pays the chips still inside to the deed holder and wipes its keys.
       closeCoinPusher(itemId);
+    } else if (removedKind === "air-hockey-table") {
+      // 🏒 #115: drop the runtime session (stops the frame drive + tick
+      // routing to the freed handle) and wipe the table's doc state. Moves
+      // never pass here (the reconcile re-poses the existing group), so this
+      // only fires on true removals; the delete is idempotent, safe for every
+      // observing client to run.
+      closeAirHockeyTable(itemId);
+      clearTable(itemId);
     }
     // 🧬 A vat removed mid-spawn-cycle must also end the ceremony, because
     // its onOpen would otherwise never fire (only the HOLD watchdog would).
@@ -3829,6 +3895,11 @@ export class World {
     // speaker is off — the handle reads that itself).
     for (const pulse of this.propAnims.values()) pulse.update(deltaTime);
     this.updateSeatedSlotSession();
+
+    // 🏒 #115: advance every air-hockey table — operator puck sim + doc
+    // writes, 30/20 Hz tick sends, remote smoothing, scoreboard/goal lamps.
+    // The session module owns the registry; this is its only clock.
+    airHockeyFrame(deltaTime);
 
     // 🤖 Service/croupier robots: each patrols/serves/docks; local ambience.
     // To the robots a player is "there" only INSIDE the room (iso room view
@@ -5520,7 +5591,7 @@ export class World {
     // Throttle the heartbeat off wall-clock (not a dt accumulator — a single NaN
     // dt would wedge an accumulator forever while tickAutoCroupier kept running).
     const autoCroupier = canRunCroupier();
-    if ((tables.length || slotMachines.length) && autoCroupier) {
+    if (tables.length && autoCroupier) {
       const now = Date.now();
       const beatNow = now - this.croupierLastBeatAt >= HEARTBEAT_MS;
       if (beatNow) this.croupierLastBeatAt = now;
@@ -5529,14 +5600,18 @@ export class World {
         if (t.kind === "craps-table") tickAutoStickman(t.id);
         else tickAutoCroupier(t.id);
       }
-      for (const machine of slotMachines) tickAutoSlotMachine(machine.id);
-    } else {
-      const authorized = canEditRoom().ok;
-      for (const machine of slotMachines) {
-        stopAutoSlotMachine(machine.id);
-        tickManualSlotMachine(machine.id, authorized);
-      }
     }
+
+    // 🎰 Slot machines: ONE session operates every machine in the room (one
+    // lease, slotCroupier.ts), so a player's balance has a single slot
+    // writer: the deed holder's, or in a venture room (nobody runs the
+    // croupier) the owner who started machines by hand. Every client ticks
+    // the room: it watches the lease's renewals, and a client that may not
+    // operate stops operating there.
+    tickSlotMachineRoom(
+      slotMachines.map((machine) => machine.id),
+      !autoCroupier && canEditRoom().ok,
+    );
 
     // 🪙 Coin pushers: ONE of the deed holder's sessions operates every
     // cabinet in the room (one lease, pusherCroupier.ts), so a player's
@@ -5821,19 +5896,21 @@ export class World {
                 ports: () => ds.listDockPorts(),
                 connected: () => ds.connectedModules(),
                 subscribe: (cb) => ds.onDockChange(cb),
-                undock: (doorId) => void ds.undockPort(doorId),
+                undock: (doorId) => ds.undockPort(doorId),
                 // 🚏 A5: the DOCK's answer (docked, or why not) reaches the helm.
                 dock: (doorId) => ds.redockPortAnswer(doorId),
+                releaseAllowed: (doorId) => ds.farReleaseAllowed(doorId),
               }
             : undefined,
         );
-      // 🛰️ A module bolted into a station by a gangway steers the STATION:
-      // its helm opens the station keeping face (small trim stick) and keeps
-      // the ship face one tab away for fuel and the docking computer.
-      const bolted = () => isBoltedIntoStation(readAllDoors().values());
-      const ui = bolted()
-        ? createStationHelmUI({ bolted, station: () => currentStation(), shipFace })
-        : shipFace();
+      // 🛰️ A module bolted into a station by a gangway, or a station's own
+      // welcome room standing alone, steers the STATION: its helm opens the
+      // station keeping face (small trim stick) and keeps the ship face one
+      // tab away for fuel and the docking computer. Every helm opens through
+      // the station helm, so one opened on the ship face offers station
+      // keeping once its module comes to steer a station.
+      const bolted = () => steersStation(currentRoomId(), readAllDoors());
+      const ui = createStationHelmUI({ bolted, station: () => currentStation(), shipFace });
       deviceFocus.beginFocus(this.player, device, ui);
       return;
     }
@@ -5979,6 +6056,36 @@ export class World {
         onEngagedChange: (engaged) => screen?.setEngaged(engaged),
       });
       deviceFocus.beginFocus(this.player, device, ui);
+      return;
+    }
+
+    if (device.kind === "airHockey") {
+      // 🏒 #115: walk to a FREE end and play first-person from it. Stand slot
+      // s0 is the cyan/a end (local −z), s1 the orange/b end (local +z) — the
+      // template INDEX is the side, read from the `${itemId}:s${n}` slot id.
+      // Every slot taken (or unreachable) falls back to the a end, matching
+      // standTarget's fallback-to-device-front behavior.
+      const stand = this.pickFreeStand(deviceId);
+      const standIdx = stand
+        ? Number(stand.id.slice(stand.id.lastIndexOf(":s") + 2))
+        : 0;
+      const side = standIdx === 1 ? ("b" as const) : ("a" as const);
+      // The def bakes side a's eye; side b's is its point reflection through
+      // the table centre (anchor) — one def entry serves both ends, and the
+      // focus camera still eases eye → look-at-anchor exactly as baked.
+      const eye =
+        side === "a"
+          ? device.eye
+          : new THREE.Vector3(
+              2 * device.anchor.x - device.eye.x,
+              device.eye.y,
+              2 * device.anchor.z - device.eye.z,
+            );
+      const target: DeviceTarget = stand
+        ? { ...device, front: stand.front, faceAngle: stand.faceAngle, eye }
+        : { ...device, eye };
+      const ui = createAirHockeyUI({ itemId: deviceId, side });
+      deviceFocus.beginFocus(this.player, target, ui);
       return;
     }
 
