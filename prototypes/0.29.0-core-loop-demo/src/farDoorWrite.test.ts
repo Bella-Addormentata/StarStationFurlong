@@ -9,17 +9,17 @@
  *    waits for before it hangs up — driven against an in-memory node that
  *    answers SyncStep1 from its own replica, exactly as the real one does.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import { buildDoorPairing, buildDoorTombstone, readAllDoorsFrom, readDoorFrom } from './doorsDoc';
 import {
-  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, underWriteDeadline, writeFarDock,
+  applyFarDockRequest, berthAfterSettle, initFarDoorWrite, roomStateReady, underWriteDeadline, writeAndSettle, writeFarDock,
 } from './farDoorWrite';
 import { YjsSync } from './network/YjsSync';
 import { classifyDockPort, holdsOurRedock, type NearEnd } from './dockRules';
-import { bindStationMoveDoc } from './stationMove';
-import { DEFAULT_STATION_RECORD, type StationMove } from './stations';
+import { bindStationMoveDoc, dockLockedByMove, installStationMoveResolver, readRememberedMoves } from './stationMove';
+import { DEFAULT_STATION_RECORD, setStationMoveResolver, type StationMove } from './stations';
 
 const seedFor = (roomId: string): string => btoa(JSON.stringify({ roomId }));
 const SHIP = 'module-ship';
@@ -719,6 +719,83 @@ describe('writeFarDock — a dock between two doors of ONE module', () => {
       ),
     ).toEqual({ ok: false, reason: 'unreachable' });
     expect(Y.encodeStateVector(ship)).toEqual(before);
+  });
+});
+
+describe('writeAndSettle — a move the far room books while the write waits', () => {
+  const home = DEFAULT_STATION_RECORD.welcomeRoomId;
+  const g = globalThis as { localStorage?: unknown };
+  let before: unknown;
+  beforeEach(() => {
+    // Moves are remembered per install, in its localStorage.
+    before = g.localStorage;
+    const store = new Map<string, string>();
+    g.localStorage = {
+      getItem: (k: string) => store.get(k) ?? null,
+      setItem: (k: string, v: string) => { store.set(k, v); },
+      removeItem: (k: string) => { store.delete(k); },
+    };
+    bindStationMoveDoc(new Y.Doc());
+    installStationMoveResolver();
+  });
+  afterEach(() => {
+    setStationMoveResolver(null);
+    if (before === undefined) delete g.localStorage;
+    else g.localStorage = before;
+  });
+
+  /** Home's berth room: its port free, our dock released. */
+  function berthRoom(): Y.Doc {
+    const doc = stationDoc();
+    doc.getMap('doors').set('d:bay', buildDoorTombstone(seedFor(SHIP), { undockedAt: 200 }));
+    return doc;
+  }
+  const dock = { kind: 'dock' as const, farAddress: seedFor(home), farDoor: 'd:bay', nearDoorId: near.doorId, dockedAt: 300 };
+  /** A tug taking Home away from now, booked in its room. */
+  function bookTow(doc: Y.Doc): StationMove {
+    const now = Date.now();
+    const tow: StationMove = {
+      stationId: DEFAULT_STATION_RECORD.id, welcomeRoomId: home,
+      fromPlanetId: DEFAULT_STATION_RECORD.planetId, fromSlot: DEFAULT_STATION_RECORD.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 2, departAt: now, arriveAt: now + 600_000,
+      mode: 'tug', tugRoomId: 'tug-room', bookedAt: now, fuel: 1, fuelDrawn: 1,
+    };
+    doc.getMap('stationMoves').set(`move:1:${tow.departAt}:${home}`, tow);
+    return tow;
+  }
+  const learned = (tow: StationMove) => readRememberedMoves()
+    .some((m) => m.welcomeRoomId === home && m.departAt === tow.departAt && m.tugRoomId === tow.tugRoomId);
+
+  it('learns one booked while the node acknowledges the write, though it never does', async () => {
+    const doc = berthRoom();
+    let tow: StationMove | null = null;
+    const out = await writeAndSettle(doc, dock, near, home, async () => {
+      tow = bookTow(doc);
+      return false;
+    });
+    expect(out).toEqual({ ok: false, reason: 'unreachable', unconfirmed: true });
+    expect(tow && learned(tow)).toBe(true);
+    // The caller's own check (docking.ts redockPort) then holds the dock.
+    expect(dockLockedByMove([home], Date.now())).toBe(true);
+  });
+
+  it('learns one booked while rival claims settle, before the dock is handed back', async () => {
+    vi.useFakeTimers();
+    try {
+      const doc = berthRoom();
+      let written = false;
+      const out = writeAndSettle(doc, dock, near, home, async () => true, () => { written = true; });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(written).toBe(true);
+      expect(dockLockedByMove([home], Date.now())).toBe(false);
+      const tow = bookTow(doc);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(await out).toEqual({ ok: true, detail: 'written' });
+      expect(learned(tow)).toBe(true);
+      expect(dockLockedByMove([home], Date.now())).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

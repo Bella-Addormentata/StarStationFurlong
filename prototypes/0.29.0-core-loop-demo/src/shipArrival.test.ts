@@ -6,7 +6,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listStations, planetById, setStationMoveResolver, setStationRoomSource } from './stations';
 import {
-  MOVE_SCAN_MAX, bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, readStationMove, writeStationMove, type StationMove,
+  MOVE_SCAN_MAX, bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, readStationMove, rejectionOf, writeStationMove,
+  type StationMove,
 } from './stationMove';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
@@ -65,7 +66,8 @@ import {
   type FlightRecord,
 } from './shipDoc';
 import {
-  adriftAt, adriftPlace, destinationsFrom, locationPlanet, planHop, setStationDirectory, DEFAULT_STATIONS, type StationDestination,
+  adriftAt, adriftPlace, destinationsFrom, destinationsFromRecords, locationPlanet, planHop, setStationDirectory, DEFAULT_STATIONS,
+  type StationDestination,
 } from './stationDirectory';
 
 // Synthetic pass seeds — roomIdFromSeed reads the #room= form.
@@ -762,6 +764,51 @@ describe('where a ship with no live dock is', () => {
     } finally {
       if (before === undefined) delete g.localStorage;
       else g.localStorage = before;
+    }
+  });
+
+  it('arrives where its station was at cast-off, kept by no flight of old, through a transfer and a tow cancelled after it', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const then = placeOfStation('furlong-station');
+    // A flight that kept no place for its destination (from before flights did).
+    const leftAt = now - 120_000;
+    expect(writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', departedAt: leftAt, etaAt: now - 1 })).toBe(true);
+    expect(writeFlightRecord({ status: 'redocking', locationId: 'furlong-station', departedAt: leftAt, etaAt: now - 1 })).toBe(true);
+    // Meanwhile Furlong went to Aris, and a tow on from there was cancelled:
+    // that cancel, its latest, stands for no journey.
+    const transfer: StationMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 100_000, arriveAt: now - 60_000,
+      mode: 'thrusters', bookedAt: now - 110_000, fuel: 1, fuelDrawn: 0,
+    };
+    const tow: StationMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: 'planet-aris', fromSlot: 0,
+      toPlanetId: home.planetId, toSlot: (home.orbitSlot + 3) % 16, departAt: now - 30_000, arriveAt: now + 3_600_000,
+      mode: 'tug', tugRoomId: 'tug-room', bookedAt: now - 40_000, fuel: 1, fuelDrawn: 0,
+    };
+    expect(writeStationMove(transfer)).toBe(true);
+    expect(writeStationMove(tow)).toBe(true);
+    expect(writeStationMove(rejectionOf(tow)!)).toBe(true);
+    // The directory lists the stations as the station list does, each with
+    // its latest move.
+    setStationDirectory({ stations: () => destinationsFromRecords(listStations(), () => undefined) });
+    try {
+      expect(listStations().find((st) => st.id === 'furlong-station')!.planetId).toBe('planet-aris');
+      const dest = destinationsFromRecords(listStations(), () => undefined).find((d) => d.id === 'furlong-station')!;
+      expect(dest.lastMove?.settles).toMatchObject({ mode: 'tug', departAt: tow.departAt });
+      // Not docked on Aris: it waits where Furlong was as it cast off.
+      expect(completeArrival(null, { now, force: true }))
+        .toEqual({ kind: 'none', stationName: dest.name, reason: 'in-transit' });
+      expect(readFlightRecord()).toEqual({ status: 'docked', locationId: then });
+      expect(shipPlaceId(readFlightRecord(), now)).toBe(then);
+    } finally {
+      setStationDirectory(null);
     }
   });
 

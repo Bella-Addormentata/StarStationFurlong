@@ -858,20 +858,27 @@ export function completeArrival(
   // Where the station orbited at cast-off, when the flight kept it: however
   // many moves it made since (and only the latest is kept), it is not there.
   const castOffPlace = rec.destinationAt !== undefined ? adriftPlace(rec.destinationAt) : null;
-  const listedNow = castOffPlace ? listStations().find((s) => s.id === rec.locationId) : undefined;
+  const listedNow = listStations().find((s) => s.id === rec.locationId);
+  // A flight that kept none (written before flights did, or cast off for a
+  // station not listed then): where the station left from on its first move
+  // since the ship cast off, among the moves known here, which is where it
+  // was then. Its latest alone cannot say: a tow cancelled after a transfer
+  // that took it away stands for no journey.
+  const wasAt = castOffPlace
+    ?? (listedNow && leftAt !== undefined ? stationLeftFrom(listedNow, leftAt, now) : null);
   // With both places known, where it orbits now says whether it went: back
   // where it was at cast-off (bounced home off a full planet, or there and
   // back) its berth is in reach, whatever moves it made meanwhile. Without
   // them, any move that overlapped the time away.
-  const movedAway = castOffPlace && listedNow
-    ? planetById(listedNow.planetId).id !== planetById(castOffPlace.planetId).id || listedNow.orbitSlot !== castOffPlace.orbitSlot
+  const movedAway = wasAt && listedNow
+    ? planetById(listedNow.planetId).id !== planetById(wasAt.planetId).id || listedNow.orbitSlot !== wasAt.orbitSlot
     : movedMidFlight;
   if (stationInTransit(station, now) || movedAway) {
     // The ship waits in open orbit where the station was, a place of its own
     // (stationDirectory.adriftAt) that follows no station; it flies on from
     // there to any station around that planet.
     const from = moved ?? station.move;
-    const at = castOffPlace ? adriftAt(castOffPlace.planetId, castOffPlace.orbitSlot)
+    const at = wasAt ? adriftAt(wasAt.planetId, wasAt.orbitSlot)
       : from ? adriftAt(from.fromPlanetId, from.fromSlot) : adriftAt(station.planetId, 0);
     return settle({ kind: 'none', stationName: station.name, reason: 'in-transit' }, at);
   }
