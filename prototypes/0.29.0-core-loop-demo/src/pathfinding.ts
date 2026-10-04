@@ -15,7 +15,7 @@
 
 import { OBSTACLES } from './obstacles';
 import type { Box } from './obstacles';
-import { roomWalkBounds, ROOM_TILE_MAX, TILE_SIZE } from './floorPlanDoc';
+import { insideRoomWalk, ROOM_TILE_MAX, TILE_SIZE } from './floorPlanDoc';
 
 // ── Grid constants ────────────────────────────────────────────────────────────
 /** World-space size of each grid cell (metres) */
@@ -60,7 +60,6 @@ export function rebakeWalkableGrid(): void {
   // the shared source the player/npc clamps and the placement gate also read).
   // Default 2×2 room: half=6 ⇒ ±5.5, so the outermost cell centres (±5.25)
   // are walkable and the floor's outer ring is no longer dead space.
-  const { boundX, boundZ } = roomWalkBounds();
   for (let row = 0; row < GRID_SIZE; row++) {
     const cells = walkable[row] ?? (walkable[row] = []);
     for (let col = 0; col < GRID_SIZE; col++) {
@@ -73,8 +72,9 @@ export function rebakeWalkableGrid(): void {
           break;
         }
       }
-      // Also mark cells outside the walkable room boundary as blocked
-      if (Math.abs(wx) > boundX || Math.abs(wz) > boundZ) blocked = true;
+      // Also mark cells outside the walkable room boundary as blocked — the
+      // box, and (🔭) a cupola's cut corners (floorPlanDoc.insideRoomWalk).
+      if (!insideRoomWalk(wx, wz)) blocked = true;
       cells[col] = !blocked;
     }
   }
@@ -295,7 +295,7 @@ export function findPath(
  * candidate furniture layout can be probed without committing it.
  *
  * The scratch bake uses the exact rebakeWalkableGrid() rules (cell-centre
- * containment + the roomWalkBounds() boundary) and the flood fill expands with the
+ * containment + the insideRoomWalk() boundary) and the flood fill expands with the
  * same 8-directional + corner-cut rule as findPath (a diagonal step requires
  * both flanking cardinal cells to be walkable), so "reachable" here means
  * precisely "A* could route there".
@@ -310,7 +310,6 @@ export function computeReachable(
   startZ: number,
 ): boolean[][] {
   // Bake the scratch walkable grid (same rules as rebakeWalkableGrid).
-  const { boundX, boundZ } = roomWalkBounds();
   const scratch: boolean[][] = [];
   for (let row = 0; row < GRID_SIZE; row++) {
     const cells: boolean[] = [];
@@ -324,7 +323,7 @@ export function computeReachable(
           break;
         }
       }
-      if (Math.abs(wx) > boundX || Math.abs(wz) > boundZ) blocked = true;
+      if (!insideRoomWalk(wx, wz)) blocked = true;
       cells.push(!blocked);
     }
     scratch.push(cells);

@@ -149,8 +149,10 @@ export class TvSyncController {
     this.onEnded = deps.onEnded ?? (() => { tvStop(deps.itemId); });
   }
 
-  /** The transit lead for this page: half the round trip for a viewer, none
-   *  for the holder, whose own writes land here without crossing a wire. */
+  /** The lead for this page: half the round trip to its own node for a
+   *  viewer (the last hop only; the delivery delay before it stays — see
+   *  expectedPositionMs), none for the holder, whose own writes land here
+   *  without crossing a wire. */
   private lead(): number {
     return this.iHold() ? 0 : this.rttMs();
   }
