@@ -104,9 +104,15 @@ the sources that fail have to say so on the screen.
 { volume: 0..100 }
 // key power:<itemId> — the switch, a body button anyone may press; its own key for the same
 // reason (a press must never race the holder's heartbeat in the programme's slot). Off keeps
-// the programme; on brings it back, the holder's tick parking a programme that was playing
-// where it was; `seq` voids a lookup in flight
-{ on: boolean, seq }
+// the programme and writes the presser's own reading of where the room was (`parkMs`, 0 when
+// nothing was running — a position, never a time: the clocks rule below); on carries it, so
+// every page anchors the resumed programme there on receipt of the ON write (a sample of its
+// own, replaced by the holder's next heartbeat) and the holder's tick parks the programme
+// there as it sees the switch — with no holder present the programme resumes from where it
+// was switched off and runs, best effort, until someone picks the remote up and beats, never
+// from a stale heartbeat with the time switched off counted as playback; `seq` voids a
+// lookup in flight
+{ on: boolean, seq, parkMs }
 ```
 
 **Sync rule.** While playing, the holder's client writes `{positionMs, seq}`
@@ -945,14 +951,29 @@ originating node);
 a cap on the sources one link may carry, and a failed-verification budget
 per link — past a handful of failures a second the LINK is muted for a
 doubling backoff and the event reported, while the source stays up on
-every other path. A hub verifies before it forwards (the signature is
+every other path. What that budget counts is what a LINK can be blamed
+for: a frame whose signature fails, a frame past the ceilings, a stream
+reset — everything decided before decryption, which a hub decides the
+same way, since a hub verifies before it forwards (the signature is
 public-key), so a forged frame dies at its first hop and its sender's link
-pays; an honest hub forwards no forgery, so a failure arriving over a hub
-link is that hub's own doing and the member re-homes rather than keep a
-link that lies. A member or hub that floods invalid or oversized frames
-spends its own link's budget, costs verification only up to it, and takes
-no honest source down; a valid source past its tier is throttled to the
-tier on every link, the ceilings being the tier's, not an estimate's. The cost is 137 bytes a
+pays; an honest hub forwards no forgery, so a signature failure arriving
+over a hub link is that hub's own doing and the member re-homes rather
+than keep a link that lies. What a hub CANNOT check it is never blamed
+for: it holds no media key, so a frame whose signature is valid but whose
+AEAD tag fails, or whose plaintext is malformed (a batch table that does
+not add up, a duration that is not an Opus frame size, a generation with
+no configuration), passes every honest hub and fails only at a subscriber
+— and only the source could have signed it. Such a failure is charged to
+the SOURCE, by its key: past a handful a second the subscriber mutes that
+source alone, for a doubling backoff, and reports it, while every other
+source on the same link plays on; the link's budget is untouched, or a
+publisher signing garbage would have every subscriber mute the honest
+hub between them and take unrelated sources down with it. A member or
+hub that floods invalid or oversized frames spends its own link's budget,
+costs verification only up to it, and takes no honest source down; a
+source that signs what cannot be opened silences itself and nobody else;
+a valid source past its tier is throttled to the tier on every link, the
+ceilings being the tier's, not an estimate's. The cost is 137 bytes a
 frame — the 64-byte signature, the 57-byte header and the 16-byte tag:
 about 55 kbps on a 20 ms Opus stream, more than voice itself and still a
 tenth of an arcade-resolution stream — and some eighty verifications a
@@ -974,7 +995,9 @@ several), then the chunks in order, chunk k's
 timestamp the header's plus the durations before it; the table under the
 AEAD and the signature with the rest, bit 1 of the flags byte saying a
 batch is inside, and a batch whose lengths do not add up to the payload,
-or whose durations are not Opus frame sizes, dropped as malformed; never
+or whose durations are not Opus frame sizes, dropped as malformed and
+charged to the source, as every failure behind a valid signature is
+(above); never
 a bare concatenation,
 which Opus chunks of varying size could not be split again, and never a
 repacketised multi-frame Opus packet, which would mean rewriting the TOC
