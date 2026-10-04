@@ -58,7 +58,10 @@ import { addFurniture, writeFurnitureItem } from './furnitureDoc';
 import { readGame } from './games/gamesDoc';
 import {
   ROOM_TEMPLATES, applyRoomTemplate, addRoomTemplateItems, exportCurrentRoomAsTemplate,
+  findTemplate,
 } from './roomTemplates';
+import { readShipRoute, routeRulesFlightNow } from './shipRoute';
+import { tanksLockedByRoute, templateSwapLockedByRoute, TANKS_LOCK_REFUSAL, TEMPLATE_SWAP_REFUSAL } from './routeParts';
 import { getDefaultRoomId } from './identity';
 import { isDeviceFocusActive } from './deviceFocus';
 import { OBSTACLES, rebuildObstacles } from './obstacles';
@@ -108,6 +111,7 @@ const NON_SPAWNABLE: ReadonlySet<FurnitureKind> = new Set<FurnitureKind>([
  *  (world.reconcileRobots), so label it so it's findable. */
 const KIND_LABELS: Partial<Record<FurnitureKind, string>> = {
   'charging-dock': '🤖 ROBOT DOCK',
+  'departures-board': '🚏 DEPARTURES BOARD',
   'air-hockey-table': '🏒 AIR HOCKEY TABLE',
   'smiley-bouquet': '😊 SMILEY BOUQUET',
   'rose-bouquet': '🌹 ROSE BOUQUET',
@@ -263,6 +267,36 @@ function equipOutfit(outfitId: string): void {
     : `DEV: could not equip '${outfitId}'.`);
 }
 
+/** ⛽ Refuse, with a hint, a spawn or template that would change the ship's
+ *  tanks while its route's timetable flies it (routeParts.tanksLockedByRoute;
+ *  edit mode's REMOVE asks the same). */
+function tanksLocked(after: readonly FurnitureItem[], what: string): boolean {
+  let rules = false;
+  try {
+    rules = routeRulesFlightNow();
+  } catch {
+    rules = false;
+  }
+  if (!tanksLockedByRoute(FURNITURE, after, rules)) return false;
+  showHint(`DEV: CAN'T ${what} — ${TANKS_LOCK_REFUSAL}.`, 3200);
+  return true;
+}
+
+/** 🏗️ Refuse, with a hint, PLACE while the ship's route runs, a paused one
+ *  included: a template replaces every piece in the room, the route's helm,
+ *  engine, tanks and robot captain with them (routeParts.templateSwapLockedByRoute). */
+function templateSwapLocked(): boolean {
+  let route: ReturnType<typeof readShipRoute> = null;
+  try {
+    route = readShipRoute();
+  } catch {
+    route = null;
+  }
+  if (!templateSwapLockedByRoute(route)) return false;
+  showHint(`DEV: CAN'T PLACE A TEMPLATE — ${TEMPLATE_SWAP_REFUSAL}.`, 3200);
+  return true;
+}
+
 // ── FURNITURE: spawn a new registry item at the nearest valid snapped spot ───
 
 function uniqueSpawnId(kind: FurnitureKind, prefix = 'dev'): string {
@@ -314,58 +348,14 @@ function clearanceOk(item: FurnitureItem, pos: { x: number; z: number }, margin:
  * see clearanceOk — then 0.5 m, then flush) so the common spawn lands in open
  * space but a crowded room still fills up before rejecting. Returns null when
  * the room is genuinely full.
+ *
+ * 🚏 A WALL-MOUNTED kind (the departures board, a climbing rose) is hung on
+ * the wall nearest each probe point instead — on its flush plane, facing
+ * into the room, exactly as edit mode's drag snaps it (snapInteriorWall) —
+ * and the spot carries that wall's rot. The floor lattice alone could only
+ * put such a piece about half a metre out from the north wall, in mid-air.
  */
-/**
- * 📺 Wall-mounted kinds (the TV; the terminal has its own rescue row) hang on
- * a wall, not the floor: probe every half-metre stop along each wall through
- * snapInteriorWall (which derives the rot that faces the screen into the
- * room), keep the stops the full placement gate accepts, and take the one
- * nearest the player — the same posture as findSpawnSpot, one dimension down.
- */
-function findWallSpot(world: World, item: FurnitureItem): { x: number; z: number; rot: Rot } | null {
-  const player = world.getPlayer();
-  const p = player.getPosition();
-  const ctx: PlacementContext = {
-    playerPositions: [{ x: p.x, z: p.z }, ...world.getRemotePlayerPositions()],
-    floodFrom: floodOrigin(player),
-    requiredReachable: collectRequiredReachable(floodOrigin(player)),
-  };
-  const { halfX, halfZ } = roomHalfExtents();
-  const seen = new Set<string>();
-  const candidates: Array<{ x: number; z: number; rot: Rot; d: number }> = [];
-  // A raw point deep against each wall snaps to that wall; walk its length.
-  const probes: Array<[number, number]> = [];
-  for (let a = -Math.max(halfX, halfZ); a <= Math.max(halfX, halfZ); a += 0.5) {
-    probes.push([a, -halfZ], [a, halfZ], [-halfX, a], [halfX, a]);
-  }
-  for (const [x, z] of probes) {
-    const s = snapInteriorWall(item.kind, x, z);
-    if (!s) continue;
-    const key = `${s.x},${s.z},${s.rot}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    candidates.push({ ...s, d: (s.x - p.x) ** 2 + (s.z - p.z) ** 2 });
-  }
-  candidates.sort((a, b) => a.d - b.d);
-  const reasons = new Map<string, number>();
-  for (const c of candidates) {
-    const verdict = validatePlacement(item, { x: c.x, z: c.z }, c.rot, ctx);
-    if (verdict.ok) return { x: c.x, z: c.z, rot: c.rot };
-    reasons.set(verdict.reason, (reasons.get(verdict.reason) ?? 0) + 1);
-  }
-  // Say WHY every stretch of wall refused — "room is full" hides a doorway
-  // rule or a wall-flush bookcase from whoever is trying to hang the set.
-  lastSpotReasons = [...reasons.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 3)
-    .map(([r, n]) => `${r} ×${n}`)
-    .join('; ');
-  return null;
-}
-/** The refusals the last wall-spot search met, for the failure hint. */
-let lastSpotReasons = '';
-
-function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: number } | null {
+function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: number; rot?: Rot } | null {
   const player = world.getPlayer();
   const p = player.getPosition();
   const ctx: PlacementContext = {
@@ -382,9 +372,19 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
   const probeX = Math.ceil(2 * halfX), probeZ = Math.ceil(2 * halfZ);
   const bX = halfX - 0.5, bZ = halfZ - 0.5;
   const seen = new Set<string>();
-  const candidates: Array<{ x: number; z: number; d: number }> = [];
+  const candidates: Array<{ x: number; z: number; rot?: Rot; d: number }> = [];
+  const wallMounted = !!FURNITURE_DEFS[item.kind].wallMount;
   for (let dx = -probeX; dx <= probeX; dx += 0.5) {
     for (let dz = -probeZ; dz <= probeZ; dz += 0.5) {
+      if (wallMounted) {
+        const w = snapInteriorWall(item.kind, p.x + dx, p.z + dz);
+        if (!w) continue;
+        const key = `${w.x},${w.z},${w.rot}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        candidates.push({ x: w.x, z: w.z, rot: w.rot, d: (w.x - p.x) ** 2 + (w.z - p.z) ** 2 });
+        continue;
+      }
       const s = snapItemPos(item.kind, item.rot, p.x + dx, p.z + dz);
       if (s.x < -bX || s.x > bX || s.z < -bZ || s.z > bZ) continue;
       const key = `${s.x},${s.z}`;
@@ -396,9 +396,10 @@ function findSpawnSpot(world: World, item: FurnitureItem): { x: number; z: numbe
   candidates.sort((a, b) => a.d - b.d);
   for (const margin of [1.0, 0.5, 0]) {
     for (const c of candidates) {
-      if (!clearanceOk(item, { x: c.x, z: c.z }, margin)) continue;
-      if (validatePlacement(item, { x: c.x, z: c.z }, item.rot, ctx).ok) {
-        return { x: c.x, z: c.z };
+      const probe = c.rot === undefined ? item : { ...item, rot: c.rot };
+      if (!clearanceOk(probe, { x: c.x, z: c.z }, margin)) continue;
+      if (validatePlacement(probe, { x: c.x, z: c.z }, probe.rot, ctx).ok) {
+        return c.rot === undefined ? { x: c.x, z: c.z } : { x: c.x, z: c.z, rot: c.rot };
       }
     }
   }
@@ -514,17 +515,16 @@ function spawnFurniture(kind: FurnitureKind): void {
     rot: 0,
     movable: true,
   };
+  if (tanksLocked([...FURNITURE, item], `SPAWN ${kind}`)) return;
   // 🚀 Exterior-wall fittings mount on the hull, not the floor: hull.ts
   // searches the walls' outer lattices AND stackable faces (🛰️ a DEV-spawned
   // engine lands on the nearest free wall spot or tank stack automatically).
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
-      : FURNITURE_DEFS[kind].wallMount
-        ? findWallSpot(world, item) // 📺 interior wall kinds hang, they don't stand
-        : findSpawnSpot(world, item);
+      : findSpawnSpot(world, item); // 📺 interior wall kinds (the TV) hang on the wall it finds
   if (!spot) {
-    showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (${FURNITURE_DEFS[kind].wallMount && lastSpotReasons ? lastSpotReasons : 'room is full'}).`, 5000);
+    showHint(`DEV: CAN'T SPAWN ${kind} — no valid spot (room is full).`);
     return;
   }
   item.pos = { x: spot.x, z: spot.z };
@@ -669,13 +669,12 @@ function placeFromInventory(index: number, kind: FurnitureKind): void {
     rot: 0,
     movable: true,
   };
+  if (tanksLocked([...FURNITURE, item], `PLACE ${kind}`)) return;
   // 🚀 Exterior-wall fittings re-mount on the hull (same routing as spawn).
   const spot: { x: number; z: number; rot?: Rot; mountParent?: string } | null =
     FURNITURE_DEFS[kind].mount === 'exterior-wall'
       ? findFreeExteriorSpot(kind, item, world.getPlayer().getPosition())
-      : FURNITURE_DEFS[kind].wallMount
-        ? findWallSpot(world, item) // 📺 interior wall kinds hang, they don't stand
-        : findSpawnSpot(world, item);
+      : findSpawnSpot(world, item);
   if (!spot) {
     showHint(`DEV: CAN'T PLACE ${kind} — no valid spot (room is full). Kept in inventory.`);
     return;
@@ -994,6 +993,8 @@ function buildPanel(): HTMLDivElement {
       case 'place-template': {
         const w = getWorld();
         if (!w || !w.isPlayerActive()) { showHint('DEV: enter the room first.'); break; }
+        // Asked on the arming click and again on the confirming one.
+        if (templateSwapLocked()) break;
         // ⚠️ Destructive: one click REPLACES every piece in the room, and one
         // stray click has already wiped a furnished home. Two-click arm/confirm:
         // the first click arms for 3 s (red ⚠), the second click executes.
@@ -1042,6 +1043,8 @@ function buildPanel(): HTMLDivElement {
           ...[{ x: me.x, z: me.z }, ...w.getRemotePlayerPositions()].map((p) => around(p, PLAYER_R + 0.1)),
           ...collectRequiredReachable(floodOrigin(w.getPlayer())).map((p) => around(p, PLAYER_R + 0.06)),
         ];
+        const adding = findTemplate(btn.dataset.template ?? '');
+        if (adding?.layout && tanksLocked([...FURNITURE, ...adding.layout(roomHalfExtents())], 'ADD A TEMPLATE')) break;
         const r = addRoomTemplateItems(btn.dataset.template ?? '', keepClear);
         if (!r) break;
         w.reconcileDoorPlacements();

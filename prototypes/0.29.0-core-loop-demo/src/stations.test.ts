@@ -4,27 +4,33 @@
  */
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { AtlasEntry } from './stationAtlas';
-import { atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
+import { MAX_GOSSIP_SKEW_MS, atlasComponent, atlasComponents, berthDoorIds } from './stationAtlas';
 import {
   DEFAULT_PLANET_ID,
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
   MAX_ORBIT_SLOTS,
+  MAX_ROOM_STAMPS,
   currentStation,
   dockedStationFor,
   isStationRoom,
   listStations,
   planetForRoom,
+  roomAdriftPlace,
+  adriftPlace,
   readStationRecords,
   registerStation,
   removeStation,
   setRoomStationResolver,
+  setStationMoveResolver,
   setStationRoomSource,
   stationForRoom,
   stationRoomCause,
   stationsAroundPlanet,
+  isSummaryHead,
+  summaryGates,
 } from './stations';
-import type { StationRecord } from './stations';
+import type { StationMove, StationRecord } from './stations';
 import { SolarSystemMap, screenOffset, stationBodies } from './map';
 import { DEFAULT_STATION } from './defaultStation';
 import { ORBIT_EPOCH_MS } from './orbits';
@@ -253,6 +259,39 @@ describe('listStations', () => {
       .toEqual([[DEFAULT_STATION_ID, 0], ['room-b', 3], ['room-c', 2], ['room-a', 1]]);
   });
 
+  it('keeps a station waiting for its launch window in the slot its move leaves from, whatever clash turns up', () => {
+    const at = (room: string, orbitSlot: number): StationRecord =>
+      ({ id: room, name: room.toUpperCase(), planetId: DEFAULT_PLANET_ID, orbitSlot, welcomeRoomId: room });
+    const now = ORBIT_EPOCH_MS + 1_000_000;
+    const away = (room: string): StationMove => ({
+      stationId: room, welcomeRoomId: room, fromPlanetId: DEFAULT_PLANET_ID, fromSlot: 1, toPlanetId: 'planet-aris', toSlot: 0,
+      departAt: now + 3_600_000, arriveAt: now + 90_000_000, mode: 'thrusters', bookedAt: now - 1000, fuel: 1, fuelDrawn: 0,
+    });
+    const moves = new Map<string, StationMove>([['room-b', away('room-b')]]);
+    setStationMoveResolver((st) => moves.get(st.welcomeRoomId) ?? null);
+    const slots = (t: number) =>
+      Object.fromEntries(listStations({}, [at('room-b', 1), at('room-a', 1)], t).map((st) => [st.id, st.orbitSlot]));
+    try {
+      // room-b booked its move from slot 1, priced for that orbit; room-a,
+      // which would win the slot by its welcome room, turns up there before
+      // the launch window. room-b keeps it until it leaves…
+      expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 2 });
+      // …and gone, it holds none: room-a has its own.
+      expect(slots(now + 3_600_001)).toMatchObject({ 'room-a': 1 });
+      // Two waiting to leave one slot (booked by installs that had not heard
+      // of each other) share it until they leave, and are listed leaving it:
+      // neither waits anywhere its move does not leave from.
+      moves.set('room-a', away('room-a'));
+      expect(slots(now)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 1 });
+      expect(slots(now + 3_600_001)).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 1 });
+      // A station that is not leaving still gives way to them.
+      expect(Object.fromEntries(listStations({}, [at('room-b', 1), at('room-a', 1), at('room-c', 1)], now)
+        .map((st) => [st.id, st.orbitSlot]))).toEqual({ [DEFAULT_STATION_ID]: 0, 'room-b': 1, 'room-a': 1, 'room-c': 2 });
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
   it('lists a record naming an unknown planet at the default planet, in a slot free there', () => {
     const lost: StationRecord = {
       id: 'lost', name: 'LOST', planetId: 'planet-nope', orbitSlot: 0, welcomeRoomId: 'far-room',
@@ -285,6 +324,14 @@ describe('listStations', () => {
     const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2 };
     expect(registerStation({ ...base, id: 'dup', welcomeRoomId: 'lounge' })).toBe(false);
     expect(registerStation({ ...base, id: 'yard', welcomeRoomId: 'yard-b' })).toBe(true);
+  });
+
+  it('never takes an open-orbit place as a station id', () => {
+    const base = { name: 'X', planetId: DEFAULT_PLANET_ID, orbitSlot: 2, welcomeRoomId: 'far-room' };
+    expect(registerStation({ ...base, id: 'adrift:planet-aris:3' })).toBe(false);
+    // One saved by hand before the prefix was reserved reads as invalid.
+    store.set('ssf-stations', JSON.stringify([{ ...base, id: 'adrift:planet-aris:3' }, { ...base, id: 'ok', orbitSlot: 4 }]));
+    expect(readStationRecords().map((r) => r.id)).toEqual(['ok']);
   });
 
   it('bumps a record whose orbit slot is already taken to the next free one', () => {
@@ -328,6 +375,13 @@ describe('stationForRoom / planetForRoom', () => {
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
       setRoomStationResolver(() => { throw new Error('no dock'); });
       expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      // A ship adrift is at its open orbit's planet, not its stand-in's.
+      setRoomStationResolver(() => 'adrift:planet-aris:3');
+      expect(stationForRoom('ship', atlas)?.id).toBe('station:ship');
+      expect(planetForRoom('ship', atlas).id).toBe('planet-aris');
+      expect(roomAdriftPlace('ship')).toEqual({ planetId: 'planet-aris', orbitSlot: 3 });
+      // An unknown planet reads as the default one, as everywhere else.
+      expect(adriftPlace('adrift:planet-nowhere:3')).toEqual({ planetId: DEFAULT_PLANET_ID, orbitSlot: 3 });
     } finally {
       setRoomStationResolver(null);
       setStationRoomSource(() => '');
@@ -383,6 +437,7 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [dock('pod')], atlas)).toBeNull();
     // …a station never moves to the ship visiting it…
     expect(dockedStationFor('b1', [dock('ship')], atlas)).toBeNull();
+    expect(dockedStationFor('b1', [dock('a1')], atlas)).toBeNull(); // nor to one it docks at, so it tows none
     expect(dockedStationFor('a2', [dock('ship')], atlas)).toBeNull();
     expect(dockedStationFor('a2', [dock('b1')], atlas)).toBeNull(); // the atlas holds its gangway
     // …a module bolted into structure is the atlas's to place, and undocked
@@ -411,6 +466,68 @@ describe('stationForRoom / planetForRoom', () => {
     expect(dockedStationFor('ship', [junk('ssf://join#room=%'), dock], atlas)).toBe('aris-yard');
     expect(dockedStationFor('ship', [{ ...junk('ssf://join#room=%'), transient: true }, dock], atlas)).toBe('aris-yard');
     expect(dockedStationFor('ship', [junk('ssf://join#room=ship'), dock], atlas)).toBe('aris-yard');
+  });
+
+  it('places a module the atlas has not mapped at the one station that lists a gate there', () => {
+    // Aris Yard's welcome room is mapped here; its gate module b9 is not, but
+    // the station's gates (learned from its record, or a summary) name it.
+    const atlas = atlasOf(room('b1'), room('ship'));
+    expect(registerStation({
+      id: 'aris-yard', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, welcomeRoomId: 'b1',
+      berths: [{ roomId: 'b9', doorId: 'd:gate', gate: 2 }],
+    })).toBe(true);
+    expect(stationForRoom('b9', atlas)?.id).toBe('aris-yard');
+    expect(planetForRoom('b9', atlas).id).toBe('planet-aris');
+    // A lone module docked there is at that station.
+    const dock = { paired: true as const, connectedRoomAddress: 'ssf://join#room=b9', transient: true };
+    expect(dockedStationFor('ship', [dock], atlas)).toBe('aris-yard');
+    // Where the atlas places the room, the atlas wins.
+    const mapped = atlasOf(room('b1'), room('ship'), room('b9', ['x1']), room('x1'));
+    expect(stationForRoom('b9', mapped)?.derived).toBe(true);
+    // A room no station lists a gate in is still no station's, and one two
+    // stations list (a stale list: which is right is not known) neither's.
+    expect(stationForRoom('b8', atlas)).toBeNull();
+    expect(registerStation({
+      id: 'kestrel', name: 'KESTREL', planetId: DEFAULT_PLANET_ID, orbitSlot: 5, welcomeRoomId: 'k1',
+      berths: [{ roomId: 'b9', doorId: 'd:old-gate', gate: 1 }],
+    })).toBe(true);
+    expect(stationForRoom('b9', atlas)).toBeNull();
+    expect(dockedStationFor('ship', [dock], atlas)).toBeNull();
+  });
+
+  it('takes a summary\'s gate list only beside a good stamp and room stamps no larger than any list carries', () => {
+    const t0 = ORBIT_EPOCH_MS + 1_000_000;
+    const gate = { roomId: 'b9', doorId: 'd:gate', gate: 2 };
+    expect(summaryGates({ berths: [gate], berthsAt: t0 }, t0)).toEqual({ berths: [gate], berthsAt: t0 });
+    // An empty list is news (the station's last gate went); one of junk is not.
+    expect(summaryGates({ berths: [], berthsAt: t0 }, t0)?.berths).toEqual([]);
+    expect(summaryGates({ berths: [{ roomId: 'b9' }], berthsAt: t0 }, t0)).toBeNull();
+    expect(summaryGates({ berths: 'b9', berthsAt: t0 }, t0)).toBeNull();
+    // No stamp, a malformed one, or one further ahead than a peer's may be.
+    for (const berthsAt of [undefined, -1, Number.NaN, String(t0), t0 + MAX_GOSSIP_SKEW_MS + 1]) {
+      expect(summaryGates({ berths: [gate], berthsAt }, t0)).toBeNull();
+    }
+    expect(summaryGates({ berths: [gate], berthsAt: t0 + MAX_GOSSIP_SKEW_MS }, t0)).not.toBeNull();
+    // Room stamps: a plain map, of no more rooms than a list and its
+    // tombstones carry.
+    const stamps = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [`room-${i}`, t0]));
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS) }, t0)).not.toBeNull();
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS + 1) }, t0)).toBeNull();
+    expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: [t0] }, t0)).toBeNull();
+  });
+
+  it('takes a summary only with its station, place and a good stamp', () => {
+    const t0 = ORBIT_EPOCH_MS + 1_000_000;
+    const head = { welcomeRoomId: 'b1', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, updatedAt: t0 };
+    expect(isSummaryHead(head, t0)).toBe(true);
+    expect(isSummaryHead({ ...head, ownerId: 'owner-1', berths: 'junk' }, t0)).toBe(true);
+    for (const bad of [
+      { welcomeRoomId: 'b1', berths: [], berthsAt: t0 }, { ...head, name: '' }, { ...head, planetId: 7 },
+      { ...head, orbitSlot: MAX_ORBIT_SLOTS }, { ...head, orbitSlot: 1.5 }, { ...head, ownerId: '' },
+      { ...head, updatedAt: undefined }, { ...head, updatedAt: t0 + MAX_GOSSIP_SKEW_MS + 1 },
+    ]) expect(isSummaryHead(bad, t0)).toBe(false);
+    expect(isSummaryHead([head], t0)).toBe(false);
+    expect(isSummaryHead(null, t0)).toBe(false);
   });
 
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {

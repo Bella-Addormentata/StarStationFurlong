@@ -20,7 +20,8 @@ import type { DoorWall } from './doorLayoutDoc';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { planTransfer } from './orbits';
-import type { StationRoomCause } from './stations';
+import { ADRIFT_PREFIX, adriftPlace, latestMoveOf, stationInTransit } from './stations';
+import type { StationMove, StationOrbit, StationRoomCause } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -30,6 +31,28 @@ export interface StationBerth {
   farDoor?: string;
   farWall?: DoorWall;
   farLateral?: number;
+  /** ⚓🚦 The berth's gate number, when its port has one. */
+  gate?: number;
+  /** The station's atlas shows a ship docked there already. */
+  occupied?: boolean;
+  /** ⚓🚦 Who the station lets dock there, when not every ship. */
+  access?: 'pass' | 'reserved' | 'closed';
+  /** With 'reserved': the one ship's room id. */
+  reservedFor?: string;
+}
+
+/** ⚓🚦 A gate this client cannot address: its room, door and policy. */
+export interface UnaddressedGate {
+  roomId: string;
+  farDoor: string;
+  /** Its door's pose, where known (setBerthPoseLookup). */
+  farWall?: DoorWall;
+  farLateral?: number;
+  gate?: number;
+  access?: StationBerth['access'];
+  reservedFor?: string;
+  /** A ship is docked there (the atlas shows a pairing). */
+  occupied?: true;
 }
 
 /** One station a ship can fly to. */
@@ -43,6 +66,25 @@ export interface StationDestination {
   /** Writer-clock travel time of a hop to this station, ms. */
   travelMs: number;
   berth?: StationBerth;
+  /** ⚓🚦 Every gate an arriving ship may try, in gate order. */
+  berths?: StationBerth[];
+  /** ⚓🚦 The rooms of all the station's berths (and its welcome room),
+   *  whether or not this client can dock there: a dock another commander
+   *  made at a gate this client holds no pass for is still at this station. */
+  berthRooms?: string[];
+  /** ⚓🚦 The station's gates this client holds no pass for (room ids, no
+   *  address): not askable as they are, but a ship's own memory of one of
+   *  them can supply the address (shipArrival.arrivalBerths). */
+  unaddressed?: UnaddressedGate[];
+  /** A move to another planet, scheduled or under way (stations.ts): while
+   *  it is in transit the station is no ship's destination. */
+  move?: StationMove;
+  /** Its latest move even once finished: arrival checks it against the
+   *  flight, so a ship never docks at a station that moved away meanwhile. */
+  lastMove?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's (the
+   *  route keeper checks it against the orbit a ferry route copied). */
+  orbit?: StationOrbit;
 }
 
 /** The seam: whatever knows the stations. */
@@ -116,8 +158,11 @@ export function listStations(): readonly StationDestination[] {
 /** This install's id for `id`: the directory's alias for it when that is
  *  listed (asked FIRST, so a portable id resolves by its welcome room even
  *  when a local record happens to share the id), else itself, which is
- *  unknown when unlisted. */
+ *  unknown when unlisted. An open-orbit place is never a station (stations.ts
+ *  reserves its prefix), so it is itself whatever alias a peer's summary
+ *  claims for it: no summary moves a ship adrift. */
 export function localStationId(id: string): string {
+  if (id.startsWith(ADRIFT_PREFIX)) return id;
   const list = listStations();
   let alias: string | null = null;
   try { alias = directory.resolve?.(id) ?? null; } catch { alias = null; }
@@ -137,24 +182,63 @@ export function findStation(id: string): StationDestination {
   return list.find((s) => s.id === id) ?? list[0];
 }
 
+// Adrift places live in stations.ts (planetForRoom reads them too).
+export { ADRIFT_PREFIX, adriftAt, adriftPlace } from './stations';
+
+/** The planet a ship's location is at: its station's, or an adrift
+ *  location's own; null when unlisted. */
+export function locationPlanet(id: string): string | null {
+  const adrift = adriftPlace(id);
+  if (adrift) return adrift.planetId;
+  return isKnownStation(id) ? findStation(id).planetId : null;
+}
+
 /** Is `id` a station the directory knows (no home fallback)? */
 export function isKnownStation(id: string): boolean {
   return listStations().some((s) => s.id === id);
 }
 
 /** Plan the hop from → to at `nowMs`: the directory's own planner (orbits),
- *  else a flat hop that leaves now. Null for an unknown or unreachable pair. */
+ *  else a flat hop that leaves now. Null for an unknown or unreachable pair,
+ *  and for one a station move cuts into. */
 export function planHop(fromId: string, toId: string, nowMs: number): HopPlan | null {
   // Both ends must be listed: findStation would quietly read an unknown
   // origin as home.
-  if (fromId === toId || !isKnownStation(fromId) || !isKnownStation(toId)) return null;
+  if (fromId === toId || !(isKnownStation(fromId) || adriftPlace(fromId)) || !isKnownStation(toId)) return null;
+  let hop: HopPlan | null;
   if (directory.plan) {
     const plan = directory.plan(fromId, toId, nowMs);
     if (!plan || !(plan.arriveAt > plan.departAt) || !Number.isFinite(plan.fuelCost)) return null;
-    return wholeMs(plan);
+    hop = wholeMs(plan);
+  } else {
+    const dest = findStation(toId);
+    if (locationPlanet(fromId) !== dest.planetId) return null;
+    hop = wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
   }
-  const dest = findStation(toId);
-  return wholeMs({ departAt: nowMs, arriveAt: nowMs + Math.max(1, dest.travelMs), fuelCost: dest.fuelCost });
+  if (!hop) return null;
+  // 🚚 Checked by the times the flight record keeps (rounded up): a flat hop
+  // has no planner to check them, and rounding can carry a burn past the
+  // moment a station leaves.
+  const list = listStations();
+  const moveOf = (id: string) => list.find((s) => s.id === id)?.move;
+  return moveCutsHop(adriftPlace(fromId) ? undefined : moveOf(fromId), moveOf(toId), hop, nowMs) ? null : hop;
+}
+
+/** Does a station move cut into a hop planned at `nowMs`: one under way (or
+ *  coming) while either end must hold still — the source until the ship
+ *  leaves, the destination until it arrives? A move that starts at the
+ *  source after the burn is no concern of the hop; one that lands before it
+ *  would leave the plan on the old orbit. A move that goes nowhere (a pin)
+ *  holds its station where it is. */
+function moveCutsHop(
+  fromMove: StationMove | undefined,
+  toMove: StationMove | undefined,
+  hop: Pick<HopPlan, 'departAt' | 'arriveAt'>,
+  nowMs: number,
+): boolean {
+  const within = (m: StationMove | undefined, until: number) => !!m && m.departAt <= until && m.arriveAt > nowMs
+    && (m.fromPlanetId !== m.toPlanetId || m.fromSlot !== m.toSlot);
+  return within(fromMove, hop.departAt) || within(toMove, hop.arriveAt);
 }
 
 /** A hop's times as whole milliseconds, which is all a flight record stores
@@ -225,12 +309,16 @@ export function stationHere(): string | null {
  *  the same planet (and never one its room belongs to right now, nor any
  *  its live docks lead into). */
 export function destinationsFrom(fromId: string): StationDestination[] {
-  const from = findStation(fromId);
+  const adrift = adriftPlace(fromId);
+  const from = adrift ? { id: fromId, planetId: adrift.planetId } : findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
   const docked = new Set(directory.docked?.() ?? []);
+  // A station between planets (stationMove.ts) is in no planet's orbits.
+  const now = Date.now();
   return listStations().filter(
-    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own && !docked.has(s.id),
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own && !docked.has(s.id)
+      && !stationInTransit(s, now),
   );
 }
 
@@ -244,6 +332,15 @@ export interface StationRecordLike {
   orbitSlot: number;
   welcomeRoomId: string;
   berthDoor?: string;
+  /** ⚓🚦 Every gate of the station, in gate order (stations.ts). */
+  berths?: ReadonlyArray<{
+    roomId: string; doorId: string; gate?: number; occupied?: boolean;
+    access?: 'pass' | 'reserved' | 'closed'; reservedFor?: string;
+  }>;
+  /** A move to another planet, scheduled or under way (stations.ts). */
+  move?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's. */
+  orbit?: StationOrbit;
 }
 
 /** Rough per-destination figures for a station record (what a hop from the
@@ -266,8 +363,12 @@ export function planRecordHop(
   nowMs: number,
 ): HopPlan | null {
   if (!from || !to) return null;
+  // No hop to or from a station between planets (stationMove.ts).
+  if (stationInTransit(from, nowMs) || stationInTransit(to, nowMs)) return null;
   const t = planTransfer(from, to, nowMs);
   if (!t) return null;
+  // Nor one a move cuts into (moveCutsHop).
+  if (moveCutsHop(from.move, to.move, t, nowMs)) return null;
   return {
     departAt: t.departAt,
     arriveAt: t.arriveAt,
@@ -328,7 +429,11 @@ export function destinationsFromRecords(
       planetId: r.planetId,
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
+      ...(r.move ? { move: r.move } : {}),
+      ...(r.orbit ? { orbit: { radiusKm: r.orbit.radiusKm, phase0: r.orbit.phase0 } } : {}),
     };
+    const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
+    if (last) out.lastMove = last;
     // A public berth needs its door: DOCK only asks the far room (and so
     // only proves a port is there) when it knows the far door. Without one
     // the ship's own berth memory decides, or arrival reports no berth. A
@@ -337,6 +442,47 @@ export function destinationsFromRecords(
     const address = r.welcomeRoomId && door ? seedFor(r.welcomeRoomId) : undefined;
     // With its door's pose where known (setBerthPoseLookup).
     if (address && door) out.berth = { address, farDoor: door, ...berthPose(r.welcomeRoomId, door) };
+    // ⚓🚦 Every gate this client can dock at: a port whose room it holds a
+    // pass for, posed as the public berth is. Gate order, as the station
+    // lists them.
+    const gates: StationBerth[] = [];
+    const unaddressed: UnaddressedGate[] = [];
+    for (const b of r.berths ?? []) {
+      if (!b.roomId || !isAcceptableDoorKey(b.doorId)) continue;
+      const seed = seedFor(b.roomId);
+      if (!seed) {
+        unaddressed.push({
+          roomId: b.roomId,
+          farDoor: b.doorId,
+          ...berthPose(b.roomId, b.doorId),
+          ...(b.gate !== undefined ? { gate: b.gate } : {}),
+          ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
+          ...(b.occupied ? { occupied: true as const } : {}),
+        });
+        continue;
+      }
+      gates.push({
+        address: seed,
+        farDoor: b.doorId,
+        ...berthPose(b.roomId, b.doorId),
+        ...(b.gate !== undefined ? { gate: b.gate } : {}),
+        ...(b.occupied ? { occupied: true } : {}),
+        ...(b.access ? { access: b.access, ...(b.reservedFor ? { reservedFor: b.reservedFor } : {}) } : {}),
+      });
+    }
+    const rooms = new Set<string>();
+    if (r.welcomeRoomId) rooms.add(r.welcomeRoomId);
+    for (const b of r.berths ?? []) if (b.roomId) rooms.add(b.roomId);
+    if (rooms.size > 0) out.berthRooms = [...rooms];
+    if (unaddressed.length > 0) out.unaddressed = unaddressed;
+    if (Array.isArray(r.berths)) {
+      // ⚓🚦 The record knows its gates: these are the berths (none, when its
+      // last port was removed or this client holds no pass for any), and the
+      // old public berth stands only as one of them, naming its gate.
+      out.berths = gates;
+      const same = out.berth && gates.find((g) => g.farDoor === out.berth!.farDoor && g.address === out.berth!.address);
+      if (same) out.berth = same; else delete out.berth;
+    }
     return out;
   });
 }
@@ -390,8 +536,9 @@ export function directoryFromStationRecords(
     ...(portable ? { portable } : {}),
     plan: (fromId, toId, nowMs) => {
       const records = snapshotted(list);
+      const adrift = adriftPlace(fromId);
       return planRecordHop(
-        records.find((r) => r.id === fromId),
+        adrift ? { id: fromId, name: '', welcomeRoomId: '', ...adrift } : records.find((r) => r.id === fromId),
         records.find((r) => r.id === toId),
         nowMs,
       );
