@@ -215,9 +215,10 @@ That third row is the entire gap. An ECDH key is required and SSF has only a sig
   both routes rather than only to this one. Note also that converting saves no dependency — X25519
   itself comes from `@noble/curves`, so either way it is added. The real objection is sharper than
   "two uses of one key": `toMontgomerySecret` returns
-  `adjustScalarBytes(sha512(seed).subarray(0, 32))`, which *is* the Ed25519 signing scalar rather
-  than something derived alongside it. One secret would serve two protocols, and §3.2.1 makes that
-  same key the identity anchor — so any weakness in either protocol lands on the identity itself.
+  `adjustScalarBytes(sha512(seed)).subarray(0, 32)`, the clamped hash head that Ed25519 signing
+  then reduces mod L into its private scalar. That is the same secret one step earlier, not
+  something derived alongside it. One secret would serve two protocols, and §3.2.1 makes that same
+  key the identity anchor — so any weakness in either protocol lands on the identity itself.
   Avoidable for the cost of 32 bytes in a map we already write.
 
 ### 3.2.1 The directory is not yet trustworthy — fix this before anything else
@@ -300,47 +301,65 @@ the single largest dependency and licence decision in the project's history, to 
 are roughly 300 lines of `@noble` calls.
 
 **Build the mechanics, not the import.** Adding `@noble/curves` (X25519) and `@noble/ciphers`
-(XChaCha20-Poly1305 — matching the AEAD the node already uses) keeps the dependency-free,
+(XChaCha20-Poly1305 — matching the AEAD the node already uses) keeps the thin-dependency,
 in-browser, auditable posture `keypair.ts:11-14` chose deliberately, and keeps the browser and the
 node speaking the same cipher.
 
-**Pin both new dependencies, and treat the floors as part of the design rather than as hygiene.**
-`@noble/curves` ≥ 2.3.0 and `@noble/ciphers` ≥ 2.4.0; the current release of each is 2.4.0, so a
-tree installed today already satisfies both. What the two floors buy differs sharply, and the
-difference is worth writing down, because only one of them is load-bearing.
+**Pin both new dependencies, and say what each floor buys — one is part of the design, the other is
+hygiene.** `@noble/curves` ≥ 2.3.0 and `@noble/ciphers` ≥ 2.4.0; a fresh install resolves to 2.4.0
+for both today. The difference between the two floors is the point of this paragraph, and in the
+second case the changelog actively misleads.
 
-- **`@noble/curves` 2.3.0 (2026-08-06) hardened the X25519 ladder** against a remote timing attack
-  worth up to 4.036 bits of a long-term private key across many samples; upstream scopes the impact
-  as fingerprinting rather than key recovery. This one reaches **both** routes in §3.2, because
-  both end at `x25519.getSharedSecret`. Under the recommended route it lands softly — the X25519
-  key is its own, and its public half goes in the contact card anyway. Under the conversion route
-  it does not: there the private scalar driving the ladder *is* the Ed25519 signing scalar, so what
-  leaks is bits of the identity key.
+- **`@noble/curves` 2.3.0 (2026-08-06) hardened X25519 scalar multiplication** — secret-scalar
+  blinding, a constant-time fixed-window multiply for unprecomputed points, and a rebuilt ladder —
+  closing a remote timing attack that could learn up to 4.036 bits of a long-term private key
+  across many samples. Upstream scopes the impact as *primarily* fingerprinting, not key recovery.
+  This floor reaches **both** routes in §3.2, because both end at `x25519.getSharedSecret`, which
+  is that ladder. What differs is the blast radius. Under the recommended route the X25519 key is
+  its own, so what leaks is bits of a key that signs nothing and anchors no identity — and the
+  fingerprinting framing is moot there in any case, since the public half is already in the contact
+  card. Under the conversion route the scalar driving the ladder is the identity key's, so the leak
+  comes out of the thing §3.2.1 makes the room's anchor.
 
 - **The same release applied the Trail of Bits review, which corrected the Edwards→Montgomery
-  conversion helpers** — but scope that honestly, because it is easy to overstate. The fix replaced
-  a generic helper that inferred a curve's Montgomery form from its key length with a per-curve
-  declaration that otherwise throws; previously a 32-byte key on any other Edwards curve was
-  silently handed the Curve25519 map. **For ed25519 the output is unchanged** —
-  `Fp.div(1 + y, 1 - y)` before and after. What the floor buys on the conversion route is dispatch
-  that cannot be wrong, not different keys.
+  conversion** — scope that precisely, because it is easy to overstate. In 2.2.0 the public-key
+  helper chose the Montgomery form from `lengths.publicKey`, the *curve's* declared key size rather
+  than anything about the key passed in, so any Edwards curve with 32-byte public keys was handed
+  the Curve25519 map whatever it should have used, and every other curve threw
+  `only defined for 25519 and 448`. 2.3.0 moved the map into each curve's own declaration and made
+  the generic wrapper throw `Montgomery conversion is not supported for this curve` when a curve
+  supplies none. **For ed25519 nothing changed** — `Fp.div(1 + y, 1 - y)` before and after, same
+  encoding, same validation. The floor buys dispatch that cannot be wrong, not different keys.
 
-- **`@noble/ciphers` has no comparable item, and its floor buys currency rather than a fix.**
-  Nothing in the 2.3.0 hardening release touches XChaCha20-Poly1305: the new `AAD not supported`
-  throw is for ciphers that *lack* AAD, and the rest is CBC/ECB padding, FF1, AES-SIV and
-  big-endian POLYVAL. `chacha.js` is byte-identical between 2.3.0 and 2.4.0. 2.4.0's one
-  ChaCha-relevant guard lives in `_arx.js`, rejecting an output buffer that partially overlaps
-  unread input, and it fires only when the caller passes an output buffer at all — an
-  implementation calling `encrypt(plaintext)` never reaches it. Pin it because it is current and
-  free, not because something here is known to bite.
+- **`@noble/ciphers` has no equivalent fix, and its changelog cannot be read for one.** 2.3.0 does
+  touch XChaCha20-Poly1305 — the cipher gained a `withAAD: true` parameter so it keeps accepting
+  AAD under the new strictness rule, and `hchacha`, the X in XChaCha, was reimplemented on top of
+  the shared `chachaCore` — and the release notes end in "Other minor corrections", so no
+  exhaustive negative is derivable from them at all. Only measurement settles it, and it does: the
+  AEAD with and without AAD, `chacha20poly1305`, and the raw `xchacha20` stream are byte-identical
+  across 2.2.0, 2.3.0 and 2.4.0, and ciphertext written by 2.2.0 decrypts unchanged on 2.4.0. So
+  nothing here is known to bite. Two smaller things still argue for the floor: 2.3.0 turned
+  *silently ignoring* AAD into a throw for ciphers that lack it, which is a real guard if this
+  design ever wraps or substitutes a non-AAD primitive while still passing `roomId‖epoch`; and
+  2.4.0 makes a cleaned PRG fail closed instead of continuing from a zeroed key, which matters if
+  §6 draws nonces from the `rngChacha20` this package also exports. 2.4.0's other item does **not**
+  apply: the AEAD encrypts in place, so it always runs the new overlap guard and can never trip it.
+  Only a direct `xchacha20(key, nonce, data, output)` with a caller-supplied, later-starting view
+  throws.
 
-Nothing is exposed today: neither package is a dependency — `package.json` carries `@noble/ed25519`
-and `@noble/hashes` and no other crypto — and `@noble/ed25519` has no ECDH surface to attack: every
-export is signature machinery or a byte/math helper, with no `getSharedSecret`, no X25519 and no
-Montgomery conversion. That is why §3.2 can say there is "no X25519 key anywhere in the codebase".
-The floors bind the commit that adds the dependencies, and are worth writing down now precisely
-because the current releases already satisfy them — which is how a floor goes unwritten and is then
-met only by luck.
+Nothing is exposed today: neither package is a dependency —
+`prototypes/0.29.0-core-loop-demo/package.json` carries `@noble/ed25519` and `@noble/hashes` and no
+other crypto — and `@noble/ed25519` ships no ECDH: no `getSharedSecret`, no X25519 and no
+Montgomery conversion in any 2.x inside the declared `^2.1.0` range. (Its point type does export
+`multiply`, so Edwards-form ECDH is hand-rollable; nothing in SSF does it.) That is why §3.2 can
+say there is "no X25519 key anywhere in the codebase". Count the real cost before committing,
+though: `@noble/curves` pins `@noble/hashes` to an *exact* version — 2.4.0 for curves 2.4.0 — while
+the tree asks for `^1.5.0`, so the install carries the same hash library twice at different majors
+until that top-level pin is raised. `@noble/ciphers` has no dependencies at all. The floors bind
+the commit that adds these packages, and are worth writing down now precisely because a fresh
+install already satisfies them — which is how a floor goes unwritten and is then met only by luck.
+The two pins already in the tree are the cautionary case: `@noble/ed25519` sits at `^2.1.0` against
+a current 3.2.0, and `@noble/hashes` at `^1.5.0` against a current 2.4.0.
 
 ---
 
