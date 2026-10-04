@@ -190,6 +190,7 @@ import {
   bindPlanetSummaryDoc,
   installTrimResolver,
   LEARNED_PREFIX,
+  legEndFields,
   publishPlanetSummary,
   ROUTE_SUMMARY_REFRESH_MS,
   portableStationId,
@@ -1574,6 +1575,10 @@ function planetShipStatus(): ShipStatusInput | null {
     out,
     routeSummaryFields(readShipRoute(), readRouteFlight(now), readRouteCheckpoints(), shipRoutePortDock(now), now, readEndedRun(now)),
   );
+  // 🚚 A timetable leg flies the route's copy of its two stops, which a
+  // stop's station may have left for another planet since: said, so a
+  // reader without the route draws the leg where it flies (farOrbitView).
+  Object.assign(out, legEndFields(places));
   return out;
 }
 

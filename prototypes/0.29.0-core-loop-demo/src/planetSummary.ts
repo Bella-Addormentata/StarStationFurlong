@@ -135,6 +135,15 @@ export interface ShipSummary {
   toRoom?: string;
   departedAt?: number;
   etaAt?: number;
+  /** 🚚 A ferry's leg as its route copied the two stops: the planet and slot
+   *  it flies from and to (pilotRoute.routeFlightPlaces). A stop's station
+   *  may have moved planets since, so a reader placing the leg by its
+   *  station list would find no course. Kept only all four together, on one
+   *  planet. Additive, as the route fields below. */
+  fromPlanetId?: string;
+  fromSlot?: number;
+  toPlanetId?: string;
+  toSlot?: number;
   /** 🚏📋 A ferry on a route (build notes A9 item 7), so an all-gates board
    *  in a room its riders never publish to can still show it, "as of"
    *  updatedAt: the gate it is docked at (or bound for), its next stop's
@@ -204,6 +213,7 @@ const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFi
 /** 🚏 A route's run or news time: a whole ms stamp past 0. */
 const isRouteStamp = (v: unknown, now: number): v is number =>
   Number.isSafeInteger(v) && (v as number) > 0 && isStamp(v, now);
+const isSlot = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0 && (v as number) < MAX_ORBIT_SLOTS;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -394,6 +404,15 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.toRoom !== undefined) out.toRoom = v.toRoom as string;
   if (v.departedAt !== undefined) out.departedAt = v.departedAt as number;
   if (v.etaAt !== undefined) out.etaAt = v.etaAt as number;
+  // 🚚 A leg's two ends stand or drop together, and never across planets (a
+  // leg flies within one): a bad one never costs the ship its summary.
+  if (isId(v.fromPlanetId) && isSlot(v.fromSlot) && isId(v.toPlanetId) && isSlot(v.toSlot)
+    && planetById(v.fromPlanetId).id === planetById(v.toPlanetId).id) {
+    out.fromPlanetId = v.fromPlanetId;
+    out.fromSlot = v.fromSlot;
+    out.toPlanetId = v.toPlanetId;
+    out.toSlot = v.toSlot;
+  }
   // 🚏📋 The route fields each stand or drop alone: a bad one never costs
   // the ship its summary.
   if (Number.isInteger(v.gate) && (v.gate as number) >= 1 && (v.gate as number) <= 99) out.gate = v.gate as number;
@@ -409,6 +428,47 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
   return out;
+}
+
+/** 🚚 One end of a ferry's leg, placed as orbits.planTransfer reads it. */
+export interface LegEnd {
+  id: string;
+  planetId: string;
+  orbitSlot: number;
+}
+
+/** 🚚 A ferry's summary fields for the leg its ruling timetable flies: the
+ *  route's copy of the two stops (`places`, pilotRoute.routeFlightPlaces's
+ *  answer). None outside a leg. */
+export function legEndFields(
+  places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
+): Pick<ShipSummary, 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'> {
+  if (!places?.to) return {};
+  return {
+    fromPlanetId: planetById(places.from.planetId).id,
+    fromSlot: places.from.orbitSlot,
+    toPlanetId: planetById(places.to.planetId).id,
+    toSlot: places.to.orbitSlot,
+  };
+}
+
+/** 🚚 A summary-backed flight's two ends where its ferry flies them: the
+ *  route's copies its summary carries, though a stop's station has moved
+ *  planets since. Each goes by the id `idOf` gives its room here (station
+ *  ids are per install, and a trim follows the id), else by the room
+ *  itself. Null when the summary carries no copies, or names no rooms: the
+ *  reader places the ends by its station list. */
+export function summaryLegEnds(
+  s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'>,
+  idOf: (room: string) => string | undefined = () => undefined,
+): [LegEnd, LegEnd] | null {
+  const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot } = s;
+  if (!fromRoom || !toRoom || fromPlanetId === undefined || fromSlot === undefined
+    || toPlanetId === undefined || toSlot === undefined) return null;
+  return [
+    { id: idOf(fromRoom) ?? fromRoom, planetId: planetById(fromPlanetId).id, orbitSlot: fromSlot },
+    { id: idOf(toRoom) ?? toRoom, planetId: planetById(toPlanetId).id, orbitSlot: toSlot },
+  ];
 }
 
 // ── The local store (what this install has learned) ──────────────────────────

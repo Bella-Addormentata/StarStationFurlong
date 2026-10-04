@@ -47,6 +47,8 @@ import { shipDocBound } from './shipDoc';
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
 import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
+// 🚚 Another ferry's leg, where its summary says the route copied its stops.
+import { summaryLegEnds } from './planetSummary';
 import { isBoltedIntoStation } from './stationKeeping';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import { adriftPlace, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById, planetForRoom, stationInTransit } from './stations';
@@ -333,8 +335,9 @@ function readSource(now: number): Source {
     viewerRingRadiusKm = orbit.radiusKm;
   }
 
+  const idOf = (room: string) => all.find((s) => s.welcomeRoomId === room)?.id;
   const byRoom = (room: string | undefined, leftAt: number) =>
-    placeOf(room ? all.find((s) => s.welcomeRoomId === room)?.id : undefined, all, leftAt, now);
+    placeOf(room ? idOf(room) : undefined, all, leftAt, now);
   const ships: FarShipInput[] = [];
   // Every known ship anywhere, flying or docked: its room is also listed as a
   // one-module station (a dock berth leaves it its own atlas component), which
@@ -351,7 +354,10 @@ function readSource(now: number): Source {
     if (ship.roomId === roomId) continue;
     const { fromRoom, toRoom, departedAt } = ship;
     if (!fromRoom || !toRoom || departedAt === undefined || ship.etaAt === undefined) continue;
-    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => [
+    // 🚚 A ferry's leg flies the route's copy of its two stops, which its
+    // summary carries: a stop's station may have moved planets since, where
+    // the station list would place it.
+    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => summaryLegEnds(ship, idOf) ?? [
       byRoom(fromRoom, departedAt),
       byRoom(toRoom, departedAt),
     ]);
