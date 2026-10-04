@@ -7732,6 +7732,14 @@ function setupSpacePhoneOverlay() {
   (
     window as unknown as { __ssfOpenTvRemote?: () => void }
   ).__ssfOpenTvRemote = () => {
+    // Who gets focus back when the phone closes (releasePhoneOpener): the
+    // theatre when it is up (a hand-over pops the phone open above it; the
+    // dialog root is the stable target, and it refocuses its own control),
+    // else whatever outside the phone had focus — the set's panel. A
+    // control inside the phone is no opener: it is about to be hidden.
+    const active = document.activeElement as HTMLElement | null;
+    const theatreRoot = document.getElementById("tv-theatre");
+    phoneOpener = theatreRoot ?? (active && !phoneShell.contains(active) ? active : null);
     closeMiniChat();
     container?.classList.add("active");
     showPhoneView("tv");

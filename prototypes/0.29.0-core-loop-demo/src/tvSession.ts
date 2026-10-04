@@ -16,8 +16,8 @@
  */
 
 import {
-  claimRemote, iHoldRemote, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote, subscribeTv,
-  tvDocEpoch, tvHeartbeat, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  claimRemote, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote,
+  subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
 export interface RoomPlayer {
@@ -175,6 +175,17 @@ function noteKnownEnd(id: string, live: LivePlayer, rec: { started: number }): v
   }
 }
 
+/** The end this page knows for the programme, filed in the record for the
+ *  next holder (tvNoteEnd): a remote handed to a page with no theatre open,
+ *  one that never watched the file, would otherwise beat on past the
+ *  media's end for good, with nobody left who could close the programme.
+ *  Idempotent: written when the record does not carry it yet. */
+function publishEnd(id: string, rec: { started: number; endMs: number }): void {
+  const known = knownEndFor(id, rec.started);
+  if (!known) return;
+  if (rec.endMs !== (known.endMs ?? 0)) tvNoteEnd(id, known.endMs);
+}
+
 /** Whether this page drives its room's TVs at all. Cleared SYNCHRONOUSLY as
  *  a room is left (leaveTvRoom, from main.ts leaveRoomNow) and armed again
  *  only once the next room's docs and layout are bound (main.ts joinRoom):
@@ -199,6 +210,11 @@ subscribeTv(() => {
 
 /** Drive every TV in the room (ids of the smart-tv / tv-stand items). */
 export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
+  // This page is awake: a lease landing now is seen now. A gap in these
+  // marks is a sleep, and what lands on waking is stamped from before it
+  // (tvDoc markTvPageAwake) — a hand-over the network held through a closed
+  // lid is not claimed on waking as if it had just been written.
+  markTvPageAwake(now);
   if (!driveArmed) return;
   liveIds = itemIds;
   const live = new Set(itemIds);
@@ -235,6 +251,7 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
       const live = playersOfRecord.get(id);
       if (live) noteKnownEnd(id, live, rec);
       else if (!knownEndFor(id, rec.started)) knownEnds.delete(id);
+      publishEnd(id, rec); // for whoever holds the remote next
       continue;
     }
     // Headless: free-run the clock so the room keeps a sample to anchor to.
@@ -251,7 +268,14 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // viewer's player ending stops nothing; without this the room would
     // read "playing" for good after the holder closed the theatre.
     const known = knownEndFor(id, rec.started);
-    if (known && known.endMs !== null && pb.positionMs >= known.endMs) {
+    publishEnd(id, rec); // an end learned just before the theatre closed, not yet filed
+    // What this page's own player said, else what the record carries: the
+    // previous holder's player said where this programme ends, and this
+    // page — handed the remote with no theatre open, never having watched
+    // the file — has no player to ask. This page's own word wins, the
+    // unbounded marker included.
+    const end = known ? known.endMs : rec.endMs > 0 ? rec.endMs : null;
+    if (end !== null && pb.positionMs >= end) {
       tvStop(id);
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);

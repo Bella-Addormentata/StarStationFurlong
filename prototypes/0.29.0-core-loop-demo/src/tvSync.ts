@@ -88,6 +88,9 @@ export interface TvSyncDeps {
   playback?: (now: number, rttMs: number) => PlaybackNow;
   /** The record's programme-action revision (tvDoc `jump`). */
   jump?: () => number;
+  /** The record's programme revision (tvDoc `started`): a new one is a new
+   *  programme, a replay of the same source included. */
+  started?: () => number;
   heartbeat?: (positionMs: number) => void;
   volume?: () => number;
   /** The holder's player reached the end: the programme is over. Default:
@@ -115,6 +118,7 @@ export class TvSyncController {
   private readonly iHold: () => boolean;
   private readonly playback: (now: number, rttMs: number) => PlaybackNow;
   private readonly jump: () => number;
+  private readonly started: () => number;
   private readonly heartbeat: (positionMs: number) => void;
   private readonly volume: () => number;
   private readonly onEnded: () => void;
@@ -148,6 +152,14 @@ export class TvSyncController {
    *  left at its end. */
   private replayDue: number | null = null;
   private replayIssuedFor: number | null = null;
+  /** The programme revision this controller last saw (tvDoc `started`):
+   *  a change is a NEW PROGRAMME, which restarts either role's player
+   *  whatever the drift band says — PLAY NOW again while the last run still
+   *  played puts a one-second clip's player at 800 ms "within the band" of
+   *  the new start, and left there it runs to its end and closes the new
+   *  programme as ended. Null until the first tick: joining mid-programme
+   *  is not a restart. */
+  private seenStarted: number | null = null;
 
   constructor(private readonly deps: TvSyncDeps) {
     this.now = deps.now ?? tvNow; // monotonic: cadences and the receipt timeline, never a date
@@ -155,6 +167,7 @@ export class TvSyncController {
     this.iHold = deps.iHold ?? (() => iHoldRemote(deps.itemId));
     this.playback = deps.playback ?? ((now, rtt) => readPlayback(deps.itemId, now, rtt));
     this.jump = deps.jump ?? (() => readTv(deps.itemId).jump);
+    this.started = deps.started ?? (() => readTv(deps.itemId).started);
     this.heartbeat = deps.heartbeat ?? ((p) => { tvHeartbeat(deps.itemId, p); });
     this.volume = deps.volume ?? (() => readTv(deps.itemId).volume);
     this.onEnded = deps.onEnded ?? (() => { tvStop(deps.itemId); });
@@ -205,10 +218,15 @@ export class TvSyncController {
       p.setVolume(vol);
       this.appliedVolume = vol;
     }
+    // A new programme since the last tick (see seenStarted): a restart for
+    // either role below, band or no band.
+    const started = this.started();
+    const newProgramme = this.seenStarted !== null && started !== this.seenStarted;
+    this.seenStarted = started;
 
     if (pb.state === 'playing') {
       this.parked = false;
-      if (hold) return this.tickHolder(p, pb, now);
+      if (hold) return this.tickHolder(p, pb, now, newProgramme);
       // A viewer has no target of its own: whatever this page was carrying
       // its player to as the holder is the new holder's affair now, and
       // picking the remote up again later is a first acquisition — the
@@ -218,7 +236,7 @@ export class TvSyncController {
       this.pendingTarget = null;
       this.pendingSeekIssued = false;
       this.appliedJump = null;
-      return this.tickViewer(p, pb, now);
+      return this.tickViewer(p, pb, now, newProgramme);
     }
 
     // Not playing: whatever transport revision brought us here is followed
@@ -284,7 +302,7 @@ export class TvSyncController {
 
   /** The holder: follow a transport write once, publish the player's own
    *  position otherwise, end the programme when the player ends. */
-  private tickHolder(p: TvPlayer, pb: PlaybackNow, now: number): PlaybackNow {
+  private tickHolder(p: TvPlayer, pb: PlaybackNow, now: number, newProgramme: boolean): PlaybackNow {
     const jump = this.jump();
     if (jump !== this.appliedJump) {
       // PLAY NOW, a remote seek, a resume: go where the write says, now
@@ -308,7 +326,10 @@ export class TvSyncController {
       // seeked, and closed again as ended on the very next line.
       // A player that cannot seek YET (hasClock, !canSeek) keeps the target
       // too, and the beat waits with it; a start-only embed keeps nothing.
-      if ((landing || p.isEnded() || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) && (p.canSeek || p.hasClock)) {
+      // And a NEW PROGRAMME is always a seek (seenStarted): the band is for
+      // a player already where this programme's write says, and a player
+      // still running the last programme is nowhere in this one.
+      if ((landing || newProgramme || p.isEnded() || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) && (p.canSeek || p.hasClock)) {
         this.aim(p, target, now);
       }
     }
@@ -389,7 +410,7 @@ export class TvSyncController {
   }
 
   /** A viewer: converge on the record (seek when far, nudge when near). */
-  private tickViewer(p: TvPlayer, pb: PlaybackNow, now: number): PlaybackNow {
+  private tickViewer(p: TvPlayer, pb: PlaybackNow, now: number, newProgramme: boolean): PlaybackNow {
     // A transport write since this viewer's last tick (PLAY NOW again, a
     // rewind): told apart from the record merely lagging the player, which
     // is every tick near the end of a film.
@@ -410,7 +431,7 @@ export class TvSyncController {
       // interrupt its buffering. Otherwise hold until the record moves on
       // (the holder ends the programme).
       const before = pb.positionMs < p.currentMs();
-      if (transport && before) this.replayDue = jump;
+      if ((transport && before) || newProgramme) this.replayDue = jump;
       const far = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS;
       const owed = this.replayDue !== null;
       const fresh = owed && this.replayDue !== this.replayIssuedFor;
@@ -426,6 +447,15 @@ export class TvSyncController {
     this.replayDue = null;
     this.replayIssuedFor = null;
     if (!p.isPlaying()) p.play();
+    // A new programme on a player still running the last one (a replay of
+    // a short clip before its end): go where the record says — band, nudge
+    // and cooldown are for drift within ONE programme.
+    if (newProgramme && p.canSeek) {
+      p.seek(reachable(pb.positionMs, p));
+      this.lastSeekAt = now;
+      this.setRate(1);
+      return pb;
+    }
     const action = driftAction(p.currentMs(), pb.positionMs, p.canNudge);
     if (action === 'seek') {
       if (p.canSeek && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {

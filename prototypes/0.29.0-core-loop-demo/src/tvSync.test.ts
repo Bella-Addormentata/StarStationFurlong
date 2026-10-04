@@ -71,6 +71,7 @@ function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded
   let now = 100_000;
   let pb: PlaybackNow = { state: 'playing', positionMs: 0, running: true, countdownMs: 0 };
   let jump = 0;
+  let started = 1;
   const beats: number[] = [];
   const c = new TvSyncController({
     itemId: 'tv-1',
@@ -80,6 +81,7 @@ function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded
     iHold: () => opts.hold ?? false,
     playback: () => pb,
     jump: () => jump,
+    started: () => started,
     heartbeat: (p) => beats.push(p),
     volume: () => 55,
     onEnded: opts.onEnded,
@@ -89,6 +91,8 @@ function harness(player: TvPlayer, opts: { hold?: boolean; rtt?: number; onEnded
     set: (next: Partial<PlaybackNow>) => { pb = { ...pb, ...next }; },
     /** A transport write (a seek, PLAY NOW, a resume): the record's `jump` moves. */
     transport: (next: Partial<PlaybackNow>) => { pb = { ...pb, ...next }; jump += 1; },
+    /** PLAY NOW: a new programme — the record's `started` moves with `jump`. */
+    replay: (next: Partial<PlaybackNow>) => { pb = { ...pb, ...next }; jump += 1; started += 1; },
     tick: (ms = 500) => { now += ms; return c.tick(); },
   };
 }
@@ -344,6 +348,51 @@ describe('a replay of a clip shorter than the seek band', () => {
     h.tick();
     expect(p.ended).toBe(false);
     expect(p.playing).toBe(true);
+  });
+
+  it('a new programme restarts a viewer whose player still runs the last one: a replay before the end is not left inside the band', () => {
+    const p = new FakePlayer(true);
+    p.duration = 1_000;
+    const h = harness(p);
+    h.tick();
+    p.position = 800; // 200 ms of the clip left
+    h.set({ positionMs: 800 });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]); // in step: nothing to do
+    h.replay({ positionMs: 0 }); // PLAY NOW again before the player ended: 800 ms off, inside the band
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // restarted all the same
+    expect(p.position).toBe(0);
+    expect(p.ended).toBe(false);
+    expect(p.playing).toBe(true);
+  });
+
+  it('the holder restarts its own player on a new programme before the last run ended, and the old run\'s end never closes the new programme', () => {
+    const holder = new FakePlayer(true);
+    holder.duration = 1_000;
+    let now = 100_000;
+    let pos = 0;
+    let jump = 0;
+    let started = 1;
+    let ended = 0;
+    const c = new TvSyncController({
+      itemId: 'tv-1', player: holder, now: () => now, iHold: () => true,
+      playback: () => ({ state: 'playing', positionMs: pos, running: true, countdownMs: 0 }),
+      jump: () => jump, started: () => started,
+      heartbeat: () => undefined, volume: () => 50, onEnded: () => { ended++; },
+    });
+    c.tick();
+    holder.position = 800; pos = 800;
+    now += 500; c.tick();
+    expect(holder.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    pos = 0; jump += 1; started += 1; // PLAY NOW again at 800 ms: inside the band of the new start
+    now += 500; c.tick();
+    expect(holder.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']);
+    expect(holder.position).toBe(0);
+    expect(ended).toBe(0); // the old run never reached its end: the new programme stands
+    holder.position = 1_000; holder.playing = false; holder.ended = true; pos = 1_000;
+    now += 500; c.tick();
+    expect(ended).toBe(1); // the replay's own end, once
   });
 
   it('a viewer whose rewind is still landing is not seeked and played again every tick', () => {
