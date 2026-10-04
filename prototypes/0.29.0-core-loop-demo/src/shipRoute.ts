@@ -108,7 +108,7 @@ import {
   startCheckpoint,
   stopAt,
 } from './pilotRoute';
-import type { LiveDockAt, RouteFlight, RouteFlightPlaces, RouteSettleAction } from './pilotRoute';
+import type { LiveDockAt, RouteFlight, RouteFlightPlace, RouteFlightPlaces, RouteSettleAction } from './pilotRoute';
 import {
   clampFuelToCapacity,
   raiseStoredFuelLevel,
@@ -1282,6 +1282,12 @@ export interface RouteSettleOptions {
    *  ferry, nothing will, and the route finishes as soon as the ship is at
    *  its end stop, berthless if nobody docked it (dock by hand from there). */
   dockAnswered?: (f: RouteFlight) => boolean;
+  /** 🚚 Called once a finish has cleared the run, with where the timetable
+   *  left the ship: the route's copy of its end stop (pilotRoute's
+   *  routeFlightPlaces, read with the finish's own flight), which that stop's
+   *  station may have left since (null: none derivable). A ship no dock
+   *  carries rests there (shipArrival.restAtRouteEnd). */
+  finished?: (end: RouteFlightPlace | null) => void;
 }
 
 /**
@@ -1290,7 +1296,7 @@ export interface RouteSettleOptions {
  *    has answered: in ONE transaction, clear the run and its checkpoints
  *    (finishShipRoute: the route meter reads 0 from here), then write the
  *    derived flight (through `redocking` when the stored one is `in-flight`)
- *    and the derived fuel level;
+ *    and the derived fuel level; then hand `finished` the end stop's copy;
  *  - mid-route, when a person's `in-flight` has been landed by the
  *    timetable: walk the stored flight to `docked` there, one transaction.
  * Returns which it did, or null.
@@ -1308,6 +1314,8 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
   });
   if (!action) return null;
   if (action.kind === 'finish') {
+    // 🚚 Read before the finish clears the run it is read from.
+    const end = routeFlightPlaces(readShipRoute(now), route, localStationId)?.from ?? null;
     const capacity = d.capacity();
     // ⛽ What the tank reads now, with the route's meter still on: the
     // route's level less any other consumer's draw since the level was
@@ -1317,7 +1325,9 @@ export function settleRouteFlight(o: RouteSettleOptions = {}): RouteSettleAction
       for (const rec of action.writes) writeFlightRecord(rec);
       writeFuelLevel(level, capacity);
     });
-    return finished ? 'finish' : null;
+    if (!finished) return null;
+    o.finished?.(end);
+    return 'finish';
   }
   h.doc.transact(() => {
     for (const rec of action.writes) writeFlightRecord(rec);
