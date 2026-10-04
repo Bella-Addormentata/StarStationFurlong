@@ -586,12 +586,6 @@ function theatreTick(rtt: () => number): void {
       : '<div>❚❚ PAUSED</div><div class="tv-theatre-lane">archive.org\'s player has no pause: it starts from the top when the film resumes</div>');
   } else {
     const key = mountKey(rec.source!, rec.started);
-    // The programme the player is (or is about to be) mounted for — noted
-    // here, on the theatre's own tick, so between a source change and this
-    // tick the registration still names the OLD programme and tvSession
-    // files nothing new under it (a replay of the same source keeps the
-    // player and moves it on to the new programme).
-    t.playerFor = rec.started;
     // This viewer's browser fetches only what this viewer allows
     // (tvConsent): a peer-written URL is asked about first, and one inside
     // a private network is never fetched. Asked of EVERY tick, not only at
@@ -603,8 +597,21 @@ function theatreTick(rtt: () => number): void {
     // consent comes down and is asked about again. Whatever was mounted
     // before comes down meanwhile — the old programme is over either way.
     const consent = mediaConsent(rec.source!);
+    // A mount that is over — another source, a start-only embed's new
+    // start, a consent withdrawn — comes down FIRST, while its registration
+    // still names the programme it was mounted for: the unregistration
+    // files the player's last end report (tvSession), and filed under the
+    // next programme's number a short film's length would stop the live
+    // stream that followed it once the theatre closed.
+    const stale = t.mounted !== '' && (consent !== 'ok' || (t.mounted !== key && t.mounted !== `failed:${key}`));
+    if (stale) unmountPlayer(t);
+    // The programme the player is (or is about to be) mounted for — noted
+    // here, on the theatre's own tick, so between a source change and this
+    // tick the registration still names the OLD programme and tvSession
+    // files nothing new under it (a replay of the same seekable source
+    // keeps the player and moves it on to the new programme).
+    t.playerFor = rec.started;
     if (consent !== 'ok') {
-      if (t.mounted) unmountPlayer(t);
       showConsentNotice(t, rec.source!, consent);
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
       mountPlayer(t, rec.source!, key, rtt);

@@ -97,16 +97,16 @@ const lastHeadlessBeat = new Map<string, number>();
  *  (another room, another doc) forgets it all. */
 interface SeenPower {
   on: boolean;
-  jump: number;
   epoch: number;
+  /** An off→on flip still owed its park: the programme's `jump` as the
+   *  switch came back, kept until a holder parks it or the programme moves
+   *  on. The page that sees the flip may not hold the remote yet (a
+   *  presser's pickup lands beside the switch's write, a set may be turned
+   *  on with nobody holding), and a flip seen once and let go would leave
+   *  the programme running across the whole off interval. */
+  owed: number | null;
 }
 const lastPower = new Map<string, SeenPower>();
-function seePower(id: string): SeenPower | undefined {
-  const seen = { on: readPower(id).on, jump: readProgramme(id).jump, epoch: tvDocEpoch() };
-  const was = lastPower.get(id);
-  lastPower.set(id, seen);
-  return was && was.epoch === seen.epoch ? was : undefined;
-}
 
 /** POWER back on with the programme still 'playing' from before the set
  *  went off, and untouched since (its `jump` where it was — PLAY NOW turns
@@ -119,10 +119,20 @@ function seePower(id: string): SeenPower | undefined {
  *  across the whole off interval and beat that position over the saved one
  *  — a minute off would have parked at 63 s, not 3 s. */
 function parkIfPowerReturned(id: string): void {
-  const was = seePower(id);
-  if (!was || was.on || !readPower(id).on || !iHoldRemote(id)) return;
+  const on = readPower(id).on;
+  const epoch = tvDocEpoch();
+  const was = lastPower.get(id);
+  const same = was !== undefined && was.epoch === epoch;
   const programme = readProgramme(id);
-  if (programme.jump === was.jump && programme.state === 'playing') tvPause(id, programme.positionMs);
+  let owed = same ? was.owed : null;
+  if (same && !was.on && on && programme.state === 'playing') owed = programme.jump;
+  if (owed !== null && (!on || programme.state !== 'playing' || programme.jump !== owed)) owed = null;
+  if (owed !== null && iHoldRemote(id)) {
+    lastPower.set(id, { on, epoch, owed: null }); // before the write: its notify re-enters here
+    tvPause(id, programme.positionMs);
+    return;
+  }
+  lastPower.set(id, { on, epoch, owed });
 }
 
 /** The end of the media as the player of record reported it, per set, with
