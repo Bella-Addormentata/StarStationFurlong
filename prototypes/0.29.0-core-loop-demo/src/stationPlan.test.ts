@@ -605,6 +605,26 @@ describe('working on a module from the table', () => {
     expect(plan.ships.map((m) => m.roomId)).toContain('ship-2');
     expect(editAccess(plan, 'room-c', () => true)).toBe('walk-first');
   });
+
+  it('counts no door docked to another door of the same module', () => {
+    station();
+    annexOffDocks();
+    // ANNEX's own record pairs its east door with its west door (a dock
+    // between two doors of one module, farDoorWrite's sameRoomWrite) and
+    // nothing else: from inside, still no door back to DOCKS.
+    harvestIntoAtlas({
+      roomId: 'room-c', name: 'ANNEX',
+      doors: [
+        { doorId: 'east', targetSeed: seed('room-c'), wall: 'x+', lateral: 0, farDoor: 'west', farWall: 'x-', farLateral: 0, transient: true },
+        { doorId: 'west', targetSeed: seed('room-c'), wall: 'x-', lateral: 0, farDoor: 'east', farWall: 'x+', farLateral: 0, transient: true },
+      ],
+    });
+    const plan = stationPlan(readAtlas(), 'room-a', 'room-a');
+    const annex = plan.modules.find((m) => m.roomId === 'room-c');
+    expect(annex?.kind).toBe('module');
+    expect(annex?.pairedFromInside).toBe(false);
+    expect(editAccess(plan, 'room-c', () => true)).toBe('walk-first');
+  });
 });
 
 describe('the BEAM INTO click', () => {

@@ -58,10 +58,11 @@ export interface PlanModule {
   here: boolean;
   gates: PlanGate[];
   links: PlanLink[];
-  /** ✏️ Its own record pairs one of its doors with a module of the station:
-   *  someone walked through to it, and that first walk-through paired its
-   *  side. A module known only from a neighbour's pairing (a new one, say)
-   *  has no door back yet. */
+  /** ✏️ Its own record pairs one of its doors with another module of the
+   *  station: someone walked through to it, and that first walk-through
+   *  paired its side. A module known only from a neighbour's pairing (a new
+   *  one, say) has no door back yet, nor does one whose only pairing is a
+   *  dock between two of its own doors. */
   pairedFromInside: boolean;
   /** For a ship: the station module and door it is docked at. */
   dockedAt?: { roomId: string; doorId: string; gate?: number };
@@ -150,7 +151,8 @@ export function stationPlan(
     for (const [doorId, door] of Object.entries(entry?.doors ?? {})) {
       if (!door?.targetRoomId || !byId.has(door.targetRoomId)) continue;
       links.push({ doorId, toRoomId: door.targetRoomId, berth: roomBerths?.has(doorId) ?? false });
-      if (station.has(door.targetRoomId)) pairedFromInside = true;
+      // A door docked to another door of this same module leads nowhere else.
+      if (door.targetRoomId !== p.roomId && station.has(door.targetRoomId)) pairedFromInside = true;
     }
     // 🗺️ A pairing only the far room recorded (atlasPoses' reverse hop) is a
     // link here too. Two rooms may share more than one connection, so a far
