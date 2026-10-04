@@ -19,17 +19,22 @@ import * as THREE from 'three';
 import * as Y from 'yjs';
 import {
   AIR_HOCKEY_CONTRAST_PAIRS,
+  AIR_HOCKEY_DISTINCT_PAIRS,
   AIR_HOCKEY_MIN_CONTRAST,
+  AIR_HOCKEY_MIN_DELTA_E,
+  AIR_HOCKEY_THEMES,
   AIR_HOCKEY_THEME_LABELS,
   AIR_HOCKEY_THEME_SPECS,
-  AIR_HOCKEY_THEMES,
+  AIR_HOCKEY_VISIONS,
   DEFAULT_AIR_HOCKEY_THEME,
   airHockeyTheme,
+  airHockeyThemeConfusionIssues,
   airHockeyThemeContrastIssues,
   contrastRatio,
   hexCss,
   isAirHockeyThemeId,
   relativeLuminance,
+  simulateDichromacy,
   type AirHockeyThemeId,
   type AirHockeyThemeSpec,
 } from './airHockeyTheme';
@@ -53,15 +58,50 @@ import {
  */
 const paint: string[] = [];
 
+/**
+ * Every path call, tagged with the canvas it landed on and the lineWidth that
+ * was live when it was made — enough to reconstruct the BAND each stroke
+ * covers rather than just its centre line.
+ *
+ * Geometry, not pixels. The Proxy below answers every context call, so
+ * drawFelt() really runs and its coordinates really are readable here; what
+ * stays invisible is what the result LOOKS like, which is why the contrast
+ * tests above work on the palette instead of on the texture.
+ */
+const strokes: Array<{
+  op: string;
+  args: number[];
+  lineWidth: number;
+  w: number;
+  h: number;
+}> = [];
+
+/** The calls worth recording. `arc`'s trailing anticlockwise flag arrives as
+ *  0 / 1 through Number(), which is all the test needs from it. */
+const PATH_OPS = ['moveTo', 'lineTo', 'arc', 'strokeRect'];
+
 /** A canvas that draws nothing but remembers what it was asked to draw
  *  (the airHockeyTable.test.ts stub, with a recorder on the two calls that
  *  carry the skin). */
 function fakeCanvas() {
+  const cv = { width: 0, height: 0, getContext: () => ctx };
   const ctx = new Proxy({} as Record<PropertyKey, unknown>, {
     get: (target, key) => {
       if (key in target) return target[key];
       if (key === 'fillText' || key === 'strokeText') {
         return (text: unknown) => { paint.push(`${String(key)}:${String(text)}`); };
+      }
+      if (PATH_OPS.includes(String(key))) {
+        return (...args: unknown[]) => {
+          strokes.push({
+            op: String(key),
+            args: args.map(Number),
+            // Set before the path is built, so this is the width it gets.
+            lineWidth: typeof target.lineWidth === 'number' ? target.lineWidth : 1,
+            w: cv.width,
+            h: cv.height,
+          });
+        };
       }
       return () => undefined;
     },
@@ -73,7 +113,7 @@ function fakeCanvas() {
       return true;
     },
   });
-  return { width: 0, height: 0, getContext: () => ctx };
+  return cv;
 }
 
 // furniture.ts reads the page's query string when it loads.
@@ -116,7 +156,8 @@ describe('air-hockey theme palette', () => {
 
   it('keeps the dark table available, but not the dark-on-dark puck', () => {
     // Shipping the old look as a choosable preset would make the bug opt-in.
-    // `midnight` is the original table with ONE colour changed.
+    // `midnight` is the original table with TWO colours changed — the puck,
+    // and the goal mouth that the lightened puck then collided with.
     const midnight = AIR_HOCKEY_THEME_SPECS.midnight;
     expect(midnight.feltBase).toBe(0x0d1622); // original felt
     expect(midnight.cabinet).toBe(0x24303e); // original cabinet
@@ -162,6 +203,20 @@ describe('air-hockey theme palette', () => {
     }
     // The issue's own pairing must be among them.
     expect(AIR_HOCKEY_CONTRAST_PAIRS.some(([, a, b]) => a === 'puck' && b === 'feltBase')).toBe(true);
+    // The goal-mouth pairing was missing from the first cut of this contract
+    // and every preset failed it at 1.01-1.15 : 1. Pinned so it stays.
+    expect(AIR_HOCKEY_CONTRAST_PAIRS.some(([, a, b]) => a === 'puck' && b === 'feltMouth')).toBe(true);
+  });
+
+  it('keeps each goal lamp the same red as the line it hangs over', () => {
+    // The lamp has no floor of its own — it is an emissive mesh, not a mark on
+    // the felt — so nothing else would catch it drifting off `feltMouth`,
+    // which IS floored. Pinned because the two are one signal to a player: a
+    // retune of the lamp alone would quietly split them.
+    for (const id of AIR_HOCKEY_THEMES) {
+      const spec = AIR_HOCKEY_THEME_SPECS[id];
+      expect(spec.goalLamp, id).toBe(spec.feltMouth);
+    }
   });
 
   it('exempts the air-hole texture on purpose', () => {
@@ -344,6 +399,152 @@ function buildTable(id: string): THREE.Group {
   return buildItemGroup({ id, kind: 'air-hockey-table', pos: { x: 0, z: 0 }, rot: 0, movable: true });
 }
 
+// ── Observers other than the standard one ────────────────────────────
+
+/**
+ * CIE76 ΔE, written out here independently of the module's own copy. The
+ * duplication is the point: a transcription error in either one shows up as
+ * a disagreement rather than as two matching wrong answers.
+ */
+function deltaE(a: number, b: number): number {
+  const lab = (c: number) => {
+    const ch = (v: number) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4);
+    const r = ch(((c >> 16) & 0xff) / 255);
+    const g = ch(((c >> 8) & 0xff) / 255);
+    const bl = ch((c & 0xff) / 255);
+    const t = [
+      (0.4124564 * r + 0.3575761 * g + 0.1804375 * bl) * 100 / 95.047,
+      (0.2126729 * r + 0.7151522 * g + 0.0721750 * bl) * 100 / 100,
+      (0.0193339 * r + 0.1191920 * g + 0.9503041 * bl) * 100 / 108.883,
+    ].map((v) => (v > 216 / 24389 ? Math.cbrt(v) : (841 / 108) * v + 4 / 29));
+    return [116 * t[1] - 16, 500 * (t[0] - t[1]), 200 * (t[1] - t[2])];
+  };
+  const [l1, a1, b1] = lab(a);
+  const [l2, a2, b2] = lab(b);
+  return Math.hypot(l1 - l2, a1 - a2, b1 - b2);
+}
+
+describe('air-hockey theme palette, to a colour-blind player', () => {
+  it('simulates the two anchors the maths has to get right', () => {
+    // A wrong matrix still returns plausible-looking colours, so check the
+    // two values whose answers are known from outside this file.
+    for (const vision of AIR_HOCKEY_VISIONS) {
+      // Dichromacy is a loss of hue discrimination, not of lightness: a
+      // neutral has no hue to lose and must come back untouched.
+      for (const grey of [0x000000, 0x808080, 0xffffff]) {
+        expect(simulateDichromacy(grey, vision), `${vision} moved a neutral`).toBe(grey);
+      }
+    }
+    // What red-green blindness MEANS: red stops being distinguishable from
+    // green, so it lands on the axis between them — the yellow axis, R
+    // channel equal to G. This is the assertion the circulating tritanopia
+    // matrix also passes, which is how it was caught: tritanopes keep their
+    // L and M cones and discriminate red from green normally, so a tritan
+    // simulation that did this to red would be wrong. Hence no tritanopia
+    // in AIR_HOCKEY_VISIONS at all (VISION_PLANES explains the rest).
+    for (const vision of ['protanopia', 'deuteranopia'] as const) {
+      const seen = simulateDichromacy(0xff0000, vision);
+      expect((seen >> 16) & 0xff, `${vision} left red off the neutral axis`)
+        .toBe((seen >> 8) & 0xff);
+    }
+    // And the asymmetry between the two, which is real and not a rounding
+    // artefact: the L cone carries most of the luminous efficiency at long
+    // wavelengths, so protanopes lose brightness on red where deuteranopes
+    // essentially do not. 0.2126 is pure red's share of white by definition.
+    expect(relativeLuminance(0xff0000)).toBeCloseTo(0.2126, 4);
+    expect(relativeLuminance(simulateDichromacy(0xff0000, 'protanopia'))).toBeCloseTo(0.1041, 3);
+    expect(relativeLuminance(simulateDichromacy(0xff0000, 'deuteranopia'))).toBeCloseTo(0.2707, 3);
+    // And the standard observer is a no-op, not a round trip that quantises.
+    for (const id of AIR_HOCKEY_THEMES) {
+      const spec = AIR_HOCKEY_THEME_SPECS[id];
+      expect(simulateDichromacy(spec.feltMouth, 'normal')).toBe(spec.feltMouth);
+    }
+  });
+
+  it('clears the floor for protanopia and deuteranopia, every pair, every preset', () => {
+    // The gate the goal reds were actually chosen against. Not required by
+    // WCAG 2.1 §1.4.11, which is specified for the standard observer — this
+    // module goes further, and the margin is thin enough (3.01 : 1 at worst)
+    // that it has to be enforced rather than remembered.
+    const issues = AIR_HOCKEY_THEMES.flatMap((id) => [
+      ...airHockeyThemeContrastIssues(id, 'protanopia'),
+      ...airHockeyThemeContrastIssues(id, 'deuteranopia'),
+    ]);
+    expect(issues).toEqual([]);
+  });
+
+  it('never loses the puck itself, to any observer this module can measure', () => {
+    // The actual subject of #184, as opposed to the markings around it. The
+    // pair above covers it too, but only as one row among eleven; it is
+    // called out here because it is the one that must never come back, and a
+    // failure named 'puck vs felt' says that where a list of issues does
+    // not.
+    for (const id of AIR_HOCKEY_THEMES) {
+      const spec = AIR_HOCKEY_THEME_SPECS[id];
+      for (const vision of AIR_HOCKEY_VISIONS) {
+        const ratio = contrastRatio(
+          simulateDichromacy(spec.puck, vision),
+          simulateDichromacy(spec.feltBase, vision),
+        );
+        expect(ratio, `${id}: puck vs felt under ${vision}`)
+          .toBeGreaterThanOrEqual(AIR_HOCKEY_MIN_CONTRAST);
+      }
+    }
+  });
+
+  it('keeps the marks on the table apart, not just visible', () => {
+    // The gate AIR_HOCKEY_MIN_DELTA_E exists for, run the same shape as the
+    // contrast gate and for the same reason: the margin is thin enough
+    // (ΔE 16.7 at worst) that it has to be enforced rather than remembered.
+    const issues = AIR_HOCKEY_VISIONS.flatMap((vision) =>
+      AIR_HOCKEY_THEMES.flatMap((id) => airHockeyThemeConfusionIssues(id, vision)));
+    expect(issues).toEqual([]);
+
+    // And the same question asked with the ΔE written out above, so the two
+    // implementations have to agree rather than just the one being run twice.
+    for (const vision of AIR_HOCKEY_VISIONS) {
+      for (const id of AIR_HOCKEY_THEMES) {
+        const spec = AIR_HOCKEY_THEME_SPECS[id];
+        for (const [label, a, b] of AIR_HOCKEY_DISTINCT_PAIRS) {
+          const seen = deltaE(
+            simulateDichromacy(spec[a], vision),
+            simulateDichromacy(spec[b], vision),
+          );
+          expect(seen, `${id}: ${label} under ${vision}`)
+            .toBeGreaterThanOrEqual(AIR_HOCKEY_MIN_DELTA_E);
+        }
+      }
+    }
+  });
+
+  it('measures what the contrast rows cannot, and says so about the mallets', () => {
+    // Why this is a second gate and not a redundant one, shown on the real
+    // palette. The mallets are cyan and orange — the standard colourblind-safe
+    // pair — which makes them unmistakable as COLOURS and all but identical in
+    // BRIGHTNESS. Both halves hold across every preset and every observer.
+    for (const vision of AIR_HOCKEY_VISIONS) {
+      for (const id of AIR_HOCKEY_THEMES) {
+        const spec = AIR_HOCKEY_THEME_SPECS[id];
+        const a = simulateDichromacy(spec.playerA, vision);
+        const b = simulateDichromacy(spec.playerB, vision);
+        expect(deltaE(a, b), `${id} mallets under ${vision}`).toBeGreaterThan(50);
+        expect(contrastRatio(a, b), `${id} mallets under ${vision}`)
+          .toBeLessThan(AIR_HOCKEY_MIN_CONTRAST);
+      }
+    }
+    // So a contrast row for the mallets would fail permanently while being
+    // wrong about them, which is why there is not one. Asserted rather than
+    // left to a comment, because the gap looks like an oversight.
+    expect(
+      AIR_HOCKEY_CONTRAST_PAIRS.some(
+        ([, a, b]) => (a === 'playerA' && b === 'playerB') || (a === 'playerB' && b === 'playerA'),
+      ),
+      'the mallets are a \u0394E pair, not a contrast pair — see AIR_HOCKEY_MIN_DELTA_E',
+    ).toBe(false);
+  });
+
+});
+
 describe('the built table wears its skin', () => {
   beforeEach(() => {
     bindAirHockeyThemeDoc(new Y.Doc());
@@ -384,6 +585,71 @@ describe('the built table wears its skin', () => {
 
       expect(colourFingerprint(repainted), `repaint to ${id}`).toEqual(colourFingerprint(fresh));
     }
+  });
+
+  it('paints the goal line clear of the boundary and inside its own crease', () => {
+    // The GEOMETRIC half of the #184 fix, which until now had nothing
+    // watching it. The mouth cannot clear feltLines on any hue — clearing
+    // the puck floors its luminance, clearing the felt caps it, and every
+    // preset's feltLines sits between the two (the arithmetic is in
+    // airHockeyTheme.ts) — so the two marks are told apart by a strip of
+    // bare felt instead of by colour. Repaint them colinear and every other
+    // test in this file stays green, which is exactly the regression this
+    // one exists to catch.
+    //
+    // Bands, not centre lines: a 6 px stroke centred on y covers y +- 3, so
+    // two marks touch once their centres are closer than half their widths
+    // summed. Units are texture px on the 512 x 848 felt, where 1 px is
+    // about 0.297 cm of table.
+    strokes.length = 0;
+    buildTable('table-geometry');
+
+    // 512 x 848 is the air-hockey playfield and no other canvas in
+    // furniture.ts, so this picks out the felt without naming a draw order.
+    const felt = strokes.filter((s) => s.w === 512 && s.h === 848);
+    const rect = felt.find((s) => s.op === 'strokeRect');
+    const creases = felt.filter((s) => s.op === 'arc' && s.args[2] === 120);
+    const starts = felt.filter((s) => s.op === 'moveTo' && s.lineWidth === 8);
+    const ends = felt.filter((s) => s.op === 'lineTo' && s.lineWidth === 8);
+
+    expect(rect, 'the felt has no boundary stroke to measure against').toBeDefined();
+    expect(creases, 'expected one crease arc per end').toHaveLength(2);
+    expect(starts, 'the goal line is the only 8 px stroke, one per end').toHaveLength(2);
+    expect(ends).toHaveLength(2);
+
+    const [, rectY, , rectH] = rect!.args;
+    const rails = [rectY, rectY + rectH]; // boundary centre lines, near and far
+    const halfRail = rect!.lineWidth / 2;
+
+    for (const end of [0, 1]) {
+      const [ax, goalY] = starts[end].args;
+      const [bx, endY] = ends[end].args;
+      const halfMouth = starts[end].lineWidth / 2;
+      expect(endY, `end ${end}: the goal line should be horizontal`).toBe(goalY);
+
+      // 1. It no longer touches the rail it used to be painted on top of.
+      const rail = rails.reduce((m, r) => (Math.abs(r - goalY) < Math.abs(m - goalY) ? r : m));
+      const bareFelt = Math.abs(goalY - rail) - halfMouth - halfRail;
+      expect(bareFelt, `end ${end}: goal line touches the boundary`).toBeGreaterThan(0);
+
+      // 2. ...and it moved INBOARD to get there, not out past the rail.
+      expect(goalY, `end ${end}: goal line left the playfield`).toBeGreaterThan(rails[0]);
+      expect(goalY, `end ${end}: goal line left the playfield`).toBeLessThan(rails[1]);
+
+      // 3. ...and the whole stroke still fits inside its crease, so the inset
+      //    did not push the mark out through the semicircle at the corners.
+      //    Worst point is a corner of the butt-capped band.
+      const [cx, cy, radius] = creases[end].args;
+      const reach = Math.hypot(
+        Math.max(Math.abs(ax - cx), Math.abs(bx - cx)),
+        Math.abs(goalY - cy) + halfMouth,
+      );
+      expect(reach, `end ${end}: goal line pokes through the crease arc`)
+        .toBeLessThan(radius - creases[end].lineWidth / 2);
+    }
+
+    // Both ends inset by the same amount, so one cannot drift on its own.
+    expect(starts[0].args[1] + starts[1].args[1], 'the two ends are not symmetric').toBe(848);
   });
 
   it('leaves the morph fade alone when it repaints', () => {

@@ -3133,6 +3133,32 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   feltCv.height = 848; // ≈ the playfield's 1.52 : 2.52 aspect
   const c2d = feltCv.getContext("2d")!;
   const mouthPx = (AH_GOAL_HALF_W / AH_HALF_W) * 256; // goal creases + lines
+  // 🥅 The goal line is drawn INSET into the playfield instead of on top of
+  // the boundary stroke it used to overpaint. Not a cosmetic preference: the
+  // mouth has to be light enough to clear a near-black puck and dark enough to
+  // clear a near-white felt, and every preset's feltLines luminance falls
+  // inside that window, so NO colour of any hue clears 3 : 1 against puck,
+  // felt and markings at once (airHockeyTheme.ts carries the arithmetic).
+  // Painted colinear the two strokes meet at 1.00-1.67 : 1 — on midnight
+  // under protanopia they are the same luminance to within half a percent —
+  // so they were left to be told apart by hue alone, which three
+  // skin/observer pairs do not survive: ΔE 4.6 on sandstone under
+  // protanopia and 11.2 under deuteranopia (its markings are a brown,
+  // against this red), and 10.5 on mint under protanopia. All three sit
+  // under the ΔE 15 the palette is held to everywhere else. Arctic and
+  // midnight clear it (27.9 and 31.6 protan), but the geometry has to
+  // survive the worst skin, not the average one. Split by a strip of felt,
+  // each mark is read against the felt instead, where the worst of the 24
+  // preset × observer combinations is 3.03 : 1 — above the floor for
+  // everyone, everywhere.
+  //
+  // The cost, stated: this paints the mouth ~5.3 cm INBOARD of the plane that
+  // actually scores (AH_PUCK_R is 0.055, so roughly one puck radius). The
+  // texture is decoration — goals are judged from the constants in
+  // games/airHockey.ts, never from these pixels — so nothing is mis-scored,
+  // but a player sighting down the paint is sighting a hair short of the line.
+  // Worth it to keep the mark legible at all; not worth hiding.
+  const goalLineInset = 18; // px on the 512 x 848 felt ≈ 5.3 cm, inside the crease
   /** Paint the playfield in the CURRENT skin. Re-run by setTheme. */
   const drawFelt = (): void => {
     c2d.fillStyle = hexCss(theme.feltBase);
@@ -3158,8 +3184,9 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
       c2d.strokeStyle = hexCss(theme.feltMouth);
       c2d.lineWidth = 8;
       c2d.beginPath();
-      c2d.moveTo(256 - mouthPx, cy);
-      c2d.lineTo(256 + mouthPx, cy);
+      const goalY = cy + sweep * goalLineInset; // sweep already points inboard
+      c2d.moveTo(256 - mouthPx, goalY);
+      c2d.lineTo(256 + mouthPx, goalY);
       c2d.stroke();
       c2d.strokeStyle = hexCss(theme.feltLines);
       c2d.lineWidth = 6;
