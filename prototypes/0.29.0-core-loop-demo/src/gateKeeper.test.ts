@@ -23,7 +23,7 @@ import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
 import type { BoardDock } from './departuresBoard';
-import { departureRouteNewer, type DepartureFerry, type DeparturesPublish } from './departuresDoc';
+import { MAX_CAPACITY, departureRouteNewer, type DepartureFerry, type DeparturesPublish } from './departuresDoc';
 import type { NearEnd } from './dockRules';
 import {
   buildDoorPairing,
@@ -48,6 +48,7 @@ import {
   gateFixes,
   gateMove,
   gateSessionWanted,
+  lookCapacity,
   stationCastOff,
   stationDock,
   stationLook,
@@ -315,6 +316,23 @@ describe('when the station opens a session to the ferry', () => {
     expect(gateSessionWanted(stationLook(entry(), 'room-9', [], ARRIVE + SEC), ARRIVE + SEC)).toBe(false);
     const paused = pauseCheckpoint(R, 1, { at: ARRIVE + SEC })!;
     expect(wanted(ARRIVE + 2 * SEC, [], entry({ checkpoints: [S, paused] }))).toBe(false);
+  });
+
+  // Copilot (PR 204): the board's copy of the ferry's tanks is any peer's to
+  // write; planned on a low one, the route ends before here, and no session
+  // would ever read the tanks the ferry's room holds.
+  it("plans on tanks the ferry may really hold: an entry's most until a session reads them", () => {
+    // Too few to leave stop 0, as a board's copy may say.
+    const dry = entry({ capacity: 0 });
+    expect(look(ARRIVE - GATE_PRE_DIAL_MS, [], dry).f).toMatchObject({ stopIndex: 0, ended: 'fuel' });
+    expect(wanted(ARRIVE - GATE_PRE_DIAL_MS, [], dry)).toBe(false);
+    // Nothing read yet: the most a departures entry may carry.
+    expect(lookCapacity(0, null)).toBe(MAX_CAPACITY);
+    expect(wanted(ARRIVE - GATE_PRE_DIAL_MS, [], entry({ capacity: lookCapacity(0, null) }))).toBe(true);
+    // Read: what the ferry's room holds, or the board's copy when it says more.
+    expect(lookCapacity(0, CAPACITY)).toBe(CAPACITY);
+    expect(lookCapacity(2 * CAPACITY, CAPACITY)).toBe(2 * CAPACITY);
+    expect(wanted(ARRIVE - GATE_PRE_DIAL_MS, [], entry({ capacity: lookCapacity(0, 0) }))).toBe(false);
   });
 
   // Copilot (PR 204): a session may take its whole open deadline, and the
@@ -1337,6 +1355,42 @@ describe('the gate keeper over a stand-in session', () => {
     expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
     expect(h.published.map(([room, pub]) => [room, pub.capacity])).toEqual([['here', 0]]);
     expect(keeper.sessions()).toEqual([]);
+  });
+
+  // Copilot (PR 204): planned on the board's copy, a stale or forged low one
+  // ended the route before this stop, so no session opened to read the
+  // tanks the ferry's room holds.
+  it('dials a ferry whose board copy of its tanks runs dry before here, and docks it on the tanks its room holds', async () => {
+    const { h, deps } = harness();
+    h.entry = { ...h.entry, capacity: 0 };
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    expect(h.opened).toEqual([seed(FERRY)]);
+    // The session tells the board what the tanks hold…
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS + SEC);
+    expect(h.published.map(([room, pub]) => [room, pub.capacity])).toEqual([['here', CAPACITY]]);
+    // …and the ferry docks on its arrival.
+    await tickAt(keeper, h, D0);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(D0));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(D0));
+  });
+
+  it('reads a ferry whose tanks really run dry before here once, then dials on it no more', async () => {
+    const { h, deps } = harness({ tanks: 0 });
+    h.entry = { ...h.entry, capacity: 0 };
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    expect(h.opened).toEqual([seed(FERRY)]);
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS + SEC);
+    // Its room holds what the board said: planned on that now, nothing calls
+    // for a session.
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS + 2 * SEC);
+    expect(keeper.sessions()).toEqual([]);
+    for (const t of [D0, DEPART - GATE_PRE_DIAL_MS, DEPART + SEC, DEPART + HOUR]) await tickAt(keeper, h, t);
+    expect(h.opened).toHaveLength(1);
+    expect(h.published).toEqual([]);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(T0 - HOUR));
+    expect(readDoorFrom(h.ferry, PORT)).toEqual(leftStop0());
   });
 
   it('watches a claim the ferry never took at once, lets it go after GATE_STALE_MS, then docks the ferry', async () => {

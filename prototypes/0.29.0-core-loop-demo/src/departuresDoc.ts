@@ -92,7 +92,7 @@ const MAX_WRITE_KEYS_VISITED = 8192;
 const MAX_ID_LEN = 128;
 const MAX_NAME_LEN = 64;
 /** A capacity no ship can carry (TANK_CAPACITY 100 a tank): rejected. */
-const MAX_CAPACITY = 1e6;
+export const MAX_CAPACITY = 1e6;
 /** How far ahead of the writer's clock a publish stamp may sit. */
 const MAX_PUBLISH_SKEW_MS = 6 * 3600 * 1000;
 

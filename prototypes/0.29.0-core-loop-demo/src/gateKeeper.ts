@@ -134,7 +134,7 @@ import {
   type NearEnd,
 } from './dockRules';
 import { ferryDocksHere, type BoardDock } from './departuresBoard';
-import { publishRoomOrder, type DepartureFerry, type DeparturesPublish } from './departuresDoc';
+import { MAX_CAPACITY, publishRoomOrder, type DepartureFerry, type DeparturesPublish } from './departuresDoc';
 import type { DoorWall } from './doorLayoutDoc';
 import { dockPortFlagIn, type GateAccess } from './doorPolicy';
 import {
@@ -398,6 +398,17 @@ export function stationLook(
     if (a && a.status === 'docked' && isHere(route.stops[a.stopIndex])) inbound = a;
   }
   return { f, dockedAt: at, atHere: !!f && f.status === 'docked' && isHere(route.stops[f.stopIndex]), inbound };
+}
+
+/** The tanks' capacity a station look plans the ferry's timetable with, to
+ *  decide only when a session is wanted (each action reads the ferry's own
+ *  doc): what a session last read there (`read`), or the board's copy when
+ *  that is more (tanks fitted since). Before any session has read it, the
+ *  most a departures entry may carry: a board's copy that is stale or
+ *  forged low would end the route for fuel ahead of a call here, and no
+ *  session would ever open to read the tanks its room holds. Pure. */
+export function lookCapacity(board: number, read: number | null): number {
+  return read === null ? MAX_CAPACITY : Math.max(board, read);
 }
 
 /**
@@ -1186,6 +1197,9 @@ interface Watch {
   managed: Set<string>;
   /** The departures entry was refreshed from this session already. */
   refreshed: boolean;
+  /** The ferry's tanks' capacity as a session last read its doc (null
+   *  before the first): what the station look plans with (lookCapacity). */
+  capacityRead: number | null;
 }
 
 /** A gate pairing's key: its gate and its stamp. */
@@ -1250,6 +1264,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         repair: false,
         managed: new Set(),
         refreshed: false,
+        capacityRead: null,
       };
       watches.set(key, w);
     }
@@ -1518,6 +1533,11 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
     now: number,
   ): void => {
     const session = w.session!;
+    // The ferry's tanks as its own doc has them: what its riders' timetable
+    // clamps to, whatever the entry here says (and what the station look
+    // plans with from now on).
+    const capacity = tankCapacityIn(session.doc);
+    w.capacityRead = capacity;
 
     // 1. The gate follows the ferry (by the watch's port, which the
     // departures entry here names).
@@ -1529,9 +1549,6 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       w.unpublished = null;
       return;
     }
-    // The ferry's tanks as its own doc has them: what its riders' timetable
-    // clamps to, whatever the entry here says.
-    const capacity = tankCapacityIn(session.doc);
     // The board here learns what the ferry's doc says, once per session: a
     // finish it missed too, or its timetable would run on here, and this
     // keeper dial on it. After a write of this keeper's that was never
@@ -1760,7 +1777,11 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
       hangUp(w);
       return true;
     }
-    const look = ferry && running ? stationLook(ferry, room, boardDocksOf(doors, w.ship), now, w.stationCache, w.aheadCache) : null;
+    // Planned on tanks the ferry may really hold (lookCapacity), never fewer:
+    // a session is what reads them.
+    const look = ferry && running
+      ? stationLook({ ...ferry, capacity: lookCapacity(ferry.capacity, w.capacityRead) }, room, boardDocksOf(doors, w.ship), now, w.stationCache, w.aheadCache)
+      : null;
     if (!unsettled && !(look && gateSessionWanted(look, now))) {
       hangUp(w);
       return true;
