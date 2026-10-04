@@ -237,8 +237,9 @@ interface RoomState {
    *  An offer of an older one is dropped. */
   latestSeq: number;
   /** 🎫 The pass for this room taken with `latest` (`waiting` is always
-   *  `latest` or null, so it goes with whatever is sent here), or undefined
-   *  when this game held none then. */
+   *  `latest` or null, so it goes with whatever is sent here), else the one
+   *  this game found for it when it was first sent (kept for its retries),
+   *  or undefined while this game has held none. */
   pass: string | undefined;
   busy: boolean;
   /** Retries spent on the snapshot now being sent. */
@@ -298,12 +299,15 @@ export function createDeparturesPublisher(d: DeparturesPublisherDeps): Departure
     const done = () => { for (const w of answered) w(); };
     // 🎫 The pass taken with the snapshot, even when this game no longer
     // holds it (the rider left the ship's room, or its port was retargeted).
+    // One this game gained only since serves it too, and is kept for its
+    // retries the same way.
     const seed = st.pass ?? passFor(room);
     if (!seed) {
       st.retries = 0;
       done();
       return;
     }
+    st.pass = seed;
     st.busy = true;
     let result: DeparturesWriteResult = 'unreachable';
     try {

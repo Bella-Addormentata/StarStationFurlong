@@ -17,11 +17,13 @@ import {
   compressAltitudeKm,
   compressPlanetPoint,
   compressRadiusKm,
+  frozenCourse,
   planetLayout,
   sampleCourse,
   sunDirectionAround,
   transitLayout,
   viewerFrameTransform,
+  type FrozenCourses,
 } from './farOrbits';
 import { planTow } from './stationMove';
 import { DEFAULT_PLANET_ID, MAX_ORBIT_SLOTS, planetById } from './stations';
@@ -198,5 +200,44 @@ describe('transitLayout', () => {
     const sun = applyFrameTransform(layout.transform, { x: 0, y: 0, z: 0 });
     expect(sun.x).toBeLessThan(0);
     expect(sun.z).toBeCloseTo(0, 6);
+  });
+});
+
+describe('courses already drawn', () => {
+  const HOUR = 3600 * 1000;
+  const flight = ['ship', 'ferry-1', 'room-a', 'room-b'];
+  const copies = [
+    { id: 'route-stop:from', planetId: SOV, orbitSlot: 1 },
+    { id: 'route-stop:to', planetId: SOV, orbitSlot: 3 },
+  ] as const;
+
+  it("keeps a flight's course once drawn, though its ends move since", () => {
+    const courses: FrozenCourses = new Map();
+    const first = frozenCourse(courses, flight, T, T + HOUR, null, () => [station(1), station(3)], T)!;
+    expect(first.to).toEqual(orbitForSlot(SOV, 3));
+    expect(frozenCourse(courses, flight, T, T + HOUR, null, () => [station(1), station(4)], T + 1)).toBe(first);
+    expect(frozenCourse(courses, flight, T, T + HOUR, null, () => [undefined, undefined], T + 2)).toBe(first);
+    expect([...courses.values()].map((c) => c.seenAt)).toEqual([T + 2]);
+  });
+
+  // Copilot (PR 180): a summary relayed without the route's copies of a
+  // ferry leg's stops, then one carrying them, kept the course the station
+  // list placed (by its moved or trimmed stations) for the whole leg.
+  it("draws a ferry leg on its stops' copies once they are known, after a course the station list placed", () => {
+    const courses: FrozenCourses = new Map();
+    // The station list has the leg's end station at another slot by now.
+    const listed = frozenCourse(courses, flight, T, T + HOUR, null, () => [station(1), station(4)], T)!;
+    expect(listed.to).toEqual(orbitForSlot(SOV, 4));
+    const copied = frozenCourse(courses, flight, T, T + HOUR, copies, () => [station(1), station(4)], T + 1)!;
+    expect(copied.to).toEqual(orbitForSlot(SOV, 3));
+    expect(copied).toMatchObject({ departAt: T, arriveAt: T + HOUR });
+    expect(frozenCourse(courses, flight, T, T + HOUR, copies, () => [undefined, undefined], T + 2)).toBe(copied);
+  });
+
+  it('draws nothing for a flight with no time aloft, or ends it cannot place', () => {
+    const courses: FrozenCourses = new Map();
+    expect(frozenCourse(courses, flight, T, T, copies, () => [station(1), station(3)], T)).toBeNull();
+    expect(frozenCourse(courses, flight, T, T + HOUR, null, () => [station(1), undefined], T)).toBeNull();
+    expect(courses.size).toBe(0);
   });
 });

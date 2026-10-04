@@ -1365,7 +1365,7 @@ describe('ships and the solar system', () => {
       // The ferry's stay at HAB, with no live dock to carry it along: on the
       // route's copy of the stop, which names HAB by its id here.
       const places: RouteFlightPlaces = { from: { id: 'hab', planetId: SOV, orbitSlot: 2 }, to: null };
-      const stay = routeStayOffList(places, { planetId: hab.planetId, orbitSlot: hab.orbitSlot, moving: true }, false)!;
+      const stay = routeStayOffList(places, false)!;
       expect(stay).toEqual(places.from);
       expect(stationOrbit(stay).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6); // what it was drawn on
       const drawn = routeStayPlace(stay);
@@ -1380,6 +1380,27 @@ describe('ships and the solar system', () => {
     } finally {
       setStationMoveResolver(null);
     }
+  });
+
+  // Copilot (PR 180): a stay at a stop whose station is still there, trimmed,
+  // with no live dock (waiting for a berth, say), was drawn on the station's
+  // trimmed orbit between the untrimmed legs in and out.
+  it('🚚 draws a ferry\'s stay at a trimmed stop it is not docked at untrimmed, as the legs either side of it', () => {
+    registerStation(record());
+    const doc = new Y.Doc();
+    bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim() }));
+    installTrimResolver();
+    const hab = listStations().find((s) => s.id === 'hab')!;
+    expect(hab).toMatchObject({ planetId: SOV, orbitSlot: 2 });
+    expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+    const places: RouteFlightPlaces = { from: { id: 'hab', planetId: SOV, orbitSlot: 2 }, to: null };
+    const drawn = routeStayPlace(routeStayOffList(places, false)!);
+    expect(drawn).toEqual({ id: 'route-stop:from', planetId: SOV, orbitSlot: 2 });
+    const yard = { id: 'yard', planetId: SOV, orbitSlot: 1 };
+    expect(planTransfer(...routeLegEnds({ from: yard, to: places.from })!, T0)!.to).toEqual(stationOrbit(drawn));
+    expect(planTransfer(...routeLegEnds({ from: places.from, to: yard })!, T0)!.from).toEqual(stationOrbit(drawn));
+    // Docked there, the station carries it, on its own orbit.
+    expect(routeStayOffList(places, true)).toBeNull();
   });
 
   it('🚚 an install that first hears of a leg after its next stop moved planets places it where the route copied the stop', () => {

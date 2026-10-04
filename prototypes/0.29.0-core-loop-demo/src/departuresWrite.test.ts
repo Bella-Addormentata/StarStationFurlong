@@ -340,6 +340,27 @@ describe('the departures publisher', () => {
     expect(JSON.stringify(h.calls[0].pub)).not.toContain('pass:');
   });
 
+  // Copilot (PR 180): a pass gained only after the snapshot was taken served
+  // its first send, then was gone for the retry (the rider left the ferry, or
+  // its port was retargeted), and the stop never heard of it.
+  it('🎫 a pass gained since the snapshot was taken still serves its retries once it is gone', async () => {
+    const held = new Set(['room-0', 'room-1']);
+    const h = harness({ seedFor: (room) => (held.has(room) ? `pass:${room}` : undefined) });
+    h.p.routeWritten({ kind: 'checkpoint', legSeq: 1 });
+    await h.tick();
+    // This game gains a pass for room-2 before the snapshot is sent there…
+    held.add('room-2');
+    await h.answer(0, 'written');
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-0', 'pass:room-2']);
+    await h.answer(1, 'written');
+    // …which misses it, and the pass is gone before the retry.
+    held.clear();
+    await h.answer(2, 'unreachable');
+    await h.tick(DEPARTURES_RETRY_MS[0]);
+    expect(h.calls.map((c) => c.address)).toEqual(['pass:room-1', 'pass:room-0', 'pass:room-2', 'pass:room-2']);
+    expect(h.calls[3].pub).toBe(h.calls[2].pub);
+  });
+
   it('⛽ a tank fitted or taken off while the route runs republishes the capacity, from the game that edits the ship', async () => {
     let cap = 100;
     let editor = true;
