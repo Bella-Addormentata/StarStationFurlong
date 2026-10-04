@@ -17,6 +17,7 @@
 
 import {
   claimRemote, iHoldRemote, markTvPageAwake, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote,
+  scheduleStarted,
   subscribeTv, tvDocEpoch, tvHeartbeat, tvNoteEnd, tvNow, tvPause, tvStop, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
@@ -125,9 +126,17 @@ function parkIfPowerReturned(id: string): void {
   const was = lastPower.get(id);
   const same = was !== undefined && was.epoch === epoch;
   const programme = readProgramme(id);
+  // Running as the set went off: playing, or a schedule past its T0 —
+  // playing by the clock, its record never flipped (tvDoc scheduleStarted)
+  // — where the switch carries a reading of it: a schedule that STARTED
+  // while the set was off carries none (a countdown still ahead is nothing
+  // to read) and is not parked, playing from the clock's reading at the
+  // holder's first tick past T0 as it did, and as a room whose remote
+  // lapsed does.
+  const running = programme.state === 'playing' || (scheduleStarted(programme) && power.parkMs !== null);
   let owed = same ? was.owed : null;
-  if (same && !was.on && on && programme.state === 'playing') owed = programme.jump;
-  if (owed !== null && (!on || programme.state !== 'playing' || programme.jump !== owed)) owed = null;
+  if (same && !was.on && on && running) owed = programme.jump;
+  if (owed !== null && (!on || !running || programme.jump !== owed)) owed = null;
   if (owed !== null && iHoldRemote(id)) {
     lastPower.set(id, { on, epoch, owed: null }); // before the write: its notify re-enters here
     // Where the room WAS switched off: the presser's own reading, carried

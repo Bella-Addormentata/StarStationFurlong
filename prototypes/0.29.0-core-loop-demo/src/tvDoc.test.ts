@@ -362,6 +362,21 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
   });
 
+  it('the holder may pause a schedule past T0 before its first beat flips the record — it is playing by the clock — and never a countdown still ahead', () => {
+    pickUpRemote(TV);
+    tvSchedule(TV, FILM, now + 10_000);
+    expect(tvPause(TV, 0)).toEqual({ ok: false, error: 'Nothing is playing.' });
+    tick(7_000);
+    renewRemote(TV);
+    tick(5_500);
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_500 });
+    expect(tvPause(TV, 2_500)).toEqual({ ok: true });
+    expect(readTv(TV)).toMatchObject({ state: 'paused', startAt: 0, positionMs: 2_500 }); // the schedule spent
+    expect(readPlayback(TV)).toEqual({ state: 'paused', positionMs: 2_500, running: false, countdownMs: 0 });
+    expect(tvResume(TV)).toEqual({ ok: true });
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_500 });
+  });
+
   it('whoever turns the set on has the remote placed in their hand; a live holder keeps it (#186)', () => {
     putDownRemote(TV);
     expect(remoteStatus(TV)).toBe('free');
@@ -554,6 +569,57 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 0 }); // anchored at 0, not a minute in
     tick(1_000);
     expect(readPlayback(TV).positionMs).toBe(1_000);
+  });
+
+  it('OFF during a schedule past T0 carries the time since T0 — a schedule plays by the clock whoever holds — ON anchors there, and the time off is not playback', () => {
+    pickUpRemote(TV);
+    tvSchedule(TV, FILM, now + 10_000);
+    putDownRemote(TV); // nobody holds: past T0 everyone free-runs from the UTC start
+    iAm(BOB, 'Bob');
+    tick(12_500);
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_500 });
+    expect(readTv(TV).state).toBe('scheduled'); // the record never flipped: no holder to beat
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV)).toMatchObject({ on: false, parkMs: 2_500 });
+    expect(readTv(TV).state).toBe('off');
+    tick(60_000); // off for a minute
+    expect(tvTogglePower(TV)).toBe(true); // the free remote is the presser's
+    expect(readPower(TV)).toMatchObject({ on: true, parkMs: 2_500 });
+    expect(readTv(TV).state).toBe('scheduled'); // the switch never touches the programme's slot
+    expect(readSample(TV)).toMatchObject({ positionMs: 2_500, receivedAt: now, park: true });
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_500 }); // where it was switched off, not 62.5 s in
+    tick(1_000);
+    expect(readPlayback(TV).positionMs).toBe(3_500);
+    // The holder's first beat flips the record and replaces the anchor as
+    // any sample is replaced.
+    expect(tvHeartbeat(TV, 3_600)).toEqual({ ok: true });
+    expect(readTv(TV)).toMatchObject({ state: 'playing', startAt: 0, positionMs: 3_600 });
+    expect(readPlayback(TV).positionMs).toBe(3_600);
+  });
+
+  it('a viewer\'s OFF during STARTING… (the holder\'s first beat still owed) carries the time since T0, as that beat will say; a countdown still ahead carries nothing, and ON during it starts nothing early', () => {
+    pickUpRemote(TV);
+    tvSchedule(TV, FILM, now + 10_000);
+    tick(7_000);
+    renewRemote(TV); // the holder's tick keeps the lease live through the countdown
+    tick(5_000);
+    iAm(BOB, 'Bob');
+    expect(readPlayback(TV)).toMatchObject({ state: 'scheduled', countdownMs: 0 }); // STARTING…: Bob waits for Alice's write
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV).parkMs).toBe(2_000);
+    iAm(ALICE, 'Alice');
+    expect(tvTogglePower(TV)).toBe(true); // Alice's hold is live: the remote stays hers
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 2_000 }); // the holder reads the anchor, not the time since T0
+    // A countdown still ahead: nothing running, no reading to carry, and
+    // the start stays at T0.
+    expect(tvSchedule(TV, CLIP, now + 30_000)).toEqual({ ok: true });
+    expect(tvTogglePower(TV)).toBe(false);
+    expect(readPower(TV).parkMs).toBeNull();
+    tick(5_000);
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readPlayback(TV)).toEqual({ state: 'scheduled', positionMs: 0, running: false, countdownMs: 25_000 });
+    tick(25_000);
+    expect(readPlayback(TV)).toMatchObject({ state: 'playing', positionMs: 0 }); // T0: from the top
   });
 
   it('a switch with no reading, or a peer\'s garbage one, anchors nothing; a late joiner anchors to the record, never to an earlier ON', () => {

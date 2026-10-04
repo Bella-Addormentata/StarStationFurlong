@@ -453,6 +453,82 @@ describe('a replay of a clip shorter than the seek band', () => {
     expect(p.position).toBe(10_000);
     expect(p.ended).toBe(false);
   });
+
+  it('a new programme paused before the last run ended is rewound whatever the band says: the holder seeks, keeps the target until it lands, and on RESUME beats from the top — the old run never ends the replay', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true; // YouTube's asynchronous seekTo
+    p.duration = 1_000;
+    let ended = 0;
+    const h = harness(p, { hold: true, onEnded: () => { ended++; } });
+    h.tick(); // the baseline beat, at 0
+    p.position = 800;
+    h.set({ positionMs: 800 });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    // PLAY NOW, then PAUSE before the next tick: the record is paused at the
+    // new programme's start, the player 800 ms into the old run — inside the band.
+    h.replay({ state: 'paused', positionMs: 0, running: false });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // rewound all the same
+    expect(p.playing).toBe(false);
+    expect(h.c.positionMs()).toBe(0); // the target, while the seek lands — not the old run's 800 ms
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // once
+    h.transport({ state: 'playing', positionMs: 0, running: true }); // RESUME
+    h.tick(TV_HEARTBEAT_MS);
+    expect(h.beats).toEqual([0]); // no beat from the old run while the seek still lands
+    p.land();
+    h.tick(TV_HEARTBEAT_MS);
+    expect(p.position).toBe(0);
+    expect(p.playing).toBe(true);
+    expect(h.beats).toEqual([0, 0]); // from the top
+    expect(ended).toBe(0);
+    p.position = 1_000; p.playing = false; p.ended = true;
+    h.set({ positionMs: 1_000 });
+    h.tick();
+    expect(ended).toBe(1); // the replay's own end, once
+  });
+
+  it('a viewer paused on a new programme is rewound inside the band — once, the revision consumed with the seek — and one whose player cannot seek yet keeps the revision until it can, resumed or not', () => {
+    const p = new FakePlayer(true);
+    p.duration = 1_000;
+    const h = harness(p);
+    h.tick();
+    p.position = 800;
+    h.set({ positionMs: 800 });
+    h.tick();
+    h.replay({ state: 'paused', positionMs: 0, running: false }); // PLAY NOW, then PAUSE between ticks
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']);
+    expect(p.position).toBe(0);
+    expect(p.playing).toBe(false);
+    h.tick();
+    h.transport({ state: 'playing', positionMs: 0, running: true }); // RESUME
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // once: in step since
+    expect(p.playing).toBe(true);
+    // An HTML video before its ranges: the rewind waits, the revision with
+    // it, and goes out on the first tick the player can seek — here after RESUME.
+    const q = new FakePlayer(true, false);
+    q.duration = 1_000;
+    const g = harness(q);
+    g.tick();
+    q.position = 800;
+    g.set({ positionMs: 800 });
+    g.tick();
+    g.replay({ state: 'paused', positionMs: 0, running: false });
+    g.tick();
+    expect(q.log.filter((l) => l.startsWith('seek'))).toEqual([]); // cannot yet
+    g.transport({ state: 'playing', positionMs: 0, running: true }); // RESUME before the ranges arrived
+    g.tick();
+    expect(q.log.filter((l) => l.startsWith('seek'))).toEqual([]); // still cannot: the revision waits
+    q.canSeek = true;
+    g.tick();
+    expect(q.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // the new programme, not forgotten inside the band
+    expect(q.position).toBe(0);
+    g.tick();
+    expect(q.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // consumed
+  });
 });
 
 describe('an ended programme', () => {
