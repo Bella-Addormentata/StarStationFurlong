@@ -40,6 +40,13 @@ export function tvRoomPlayers(myPub: string): RoomPlayer[] {
 export interface LivePlayer {
   positionMs: () => number;
   canSeek: () => boolean;
+  /** The programme this player is mounted for (the record's `started`): an
+   *  end it reports is that programme's alone. The theatre remounts on its
+   *  own timer after a source change, and a tick between the record's change
+   *  and the remount must not file the old player's length under the new
+   *  programme — a live stream after a short film would otherwise be stopped
+   *  at the film's length once the theatre closed. */
+  started?: () => number;
   /** Where the media ends, in ms, once the player knows it is finite (a
    *  file's length); null for a live stream, and before the player knows.
    *  Remembered here while the player is registered, so the holder's
@@ -106,12 +113,16 @@ function parkIfPowerReturned(id: string): void {
   if (programme.jump === was.jump && programme.state === 'playing') tvPause(id, programme.positionMs);
 }
 
-/** The end of the media as the last player of record reported it, per set,
- *  with the programme it belonged to (`started`): the headless beat closes
- *  the programme there instead of counting past it for good. */
+/** The end of the media as the player of record reported it, per set, with
+ *  the programme it belongs to (`started`), and whether the same end has
+ *  been reported on two consecutive ticks: a file's length is constant, a
+ *  live event's apparent length grows between ticks (YouTube's getDuration
+ *  on a live stream is the time since it began), so only a confirmed end
+ *  closes a programme — the headless beat stops nothing on a guess. */
 interface KnownEnd {
   started: number;
   endMs: number;
+  confirmed: boolean;
 }
 const knownEnds = new Map<string, KnownEnd>();
 
@@ -168,9 +179,20 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     if (playersOfRecord.has(id)) {
       lastHeadlessBeat.delete(id);
       // Where the media ends, while a player can say: the headless beat
-      // below closes the programme there once the theatre is gone.
-      const end = playersOfRecord.get(id)?.endMs?.();
-      if (typeof end === 'number' && Number.isFinite(end) && end > 0) knownEnds.set(id, { started: rec.started, endMs: end });
+      // below closes the programme there once the theatre is gone. Only
+      // from a player mounted for THIS programme, and only once the same
+      // end has been reported twice in a row; anything else forgets what
+      // was known, so a doubt never stops a programme.
+      const live = playersOfRecord.get(id);
+      const end = live?.endMs?.();
+      const forThis = !live?.started || live.started() === rec.started;
+      if (forThis && typeof end === 'number' && Number.isFinite(end) && end > 0) {
+        const prev = knownEnds.get(id);
+        const confirmed = prev !== undefined && prev.started === rec.started && prev.endMs === end;
+        knownEnds.set(id, { started: rec.started, endMs: end, confirmed });
+      } else {
+        knownEnds.delete(id);
+      }
       continue;
     }
     // Headless: free-run the clock so the room keeps a sample to anchor to.
@@ -187,7 +209,7 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // viewer's player ending stops nothing; without this the room would
     // read "playing" for good after the holder closed the theatre.
     const known = knownEnds.get(id);
-    if (known && known.started === rec.started && pb.positionMs >= known.endMs) {
+    if (known && known.confirmed && known.started === rec.started && pb.positionMs >= known.endMs) {
       tvStop(id);
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);

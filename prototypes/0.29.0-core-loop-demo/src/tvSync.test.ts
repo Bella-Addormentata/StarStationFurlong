@@ -264,6 +264,82 @@ describe('a viewer following the room', () => {
   });
 });
 
+describe('a replay of a clip shorter than the seek band', () => {
+  it('the holder seeks an ended player on a transport write however short the clip, and waits for the seek to land before calling it ended', () => {
+    const holder = new FakePlayer(true);
+    holder.lazy = true; // YouTube's asynchronous seekTo
+    holder.duration = 1_000; // a one-second clip
+    let now = 100_000;
+    let pos = 0;
+    let jump = 0;
+    let ended = 0;
+    const c = new TvSyncController({
+      itemId: 'tv-1', player: holder, now: () => now, iHold: () => true,
+      playback: () => ({ state: 'playing', positionMs: pos, running: true, countdownMs: 0 }),
+      jump: () => jump,
+      heartbeat: () => undefined, volume: () => 50, onEnded: () => { ended++; },
+    });
+    c.tick();
+    holder.position = 1_000; holder.playing = false; holder.ended = true; pos = 1_000;
+    now += 500; c.tick();
+    expect(ended).toBe(1);
+    pos = 0; jump += 1; // PLAY NOW again: from the top, 1 s from where the player ended — inside the band
+    now += 500; c.tick();
+    expect(holder.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']); // seeked all the same: an ended player is nowhere
+    now += 500; c.tick(); // the seek has not landed: the player still reads ended at 1 s
+    expect(ended).toBe(1); // not closed again on the old ended position
+    holder.land();
+    now += 500; c.tick();
+    expect(holder.ended).toBe(false);
+    expect(holder.playing).toBe(true);
+    holder.position = 1_000; holder.playing = false; holder.ended = true; pos = 1_000;
+    now += 500; c.tick();
+    expect(ended).toBe(2); // the replay ran and ended, once
+  });
+
+  it('a viewer replays the clip on a transport write, not on the record merely lagging its ended player, and under the seek cooldown', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    p.duration = 1_000;
+    const h = harness(p);
+    h.tick();
+    p.position = 1_000; p.playing = false; p.ended = true;
+    h.set({ positionMs: 800 }); // the record lags the player's end by a sample: not a replay
+    h.tick();
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    h.transport({ positionMs: 0 }); // PLAY NOW again
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']);
+    h.tick(); // still ended at 1 s while the seek lands: no second seek inside the cooldown
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:0']);
+    p.land();
+    h.tick();
+    expect(p.ended).toBe(false);
+    expect(p.playing).toBe(true);
+  });
+
+  it('a viewer whose rewind is still landing is not seeked and played again every tick', () => {
+    const p = new FakePlayer(true);
+    p.lazy = true;
+    const h = harness(p);
+    h.tick();
+    p.position = 60_000; p.playing = false; p.ended = true;
+    h.set({ positionMs: 10_000 }); // the holder rewound
+    h.tick();
+    expect(p.log.filter((l) => l === 'play' || l.startsWith('seek'))).toEqual(['play', 'seek:10000', 'play']);
+    h.tick();
+    h.tick(); // 1 s on: the seek has not landed, the player still reads ended at 60 s
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:10000']);
+    h.tick(TV_SEEK_COOLDOWN_MS); // past the cooldown: once more, at most
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:10000', 'seek:10000']);
+    p.land();
+    h.tick();
+    expect(p.position).toBe(10_000);
+    expect(p.ended).toBe(false);
+  });
+});
+
 describe('an ended programme', () => {
   it('is never played again by a viewer, and is closed once by the holder', () => {
     const viewer = new FakePlayer(true);

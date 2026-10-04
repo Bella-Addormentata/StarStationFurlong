@@ -3100,6 +3100,14 @@ export class World {
     // whose set is gone (no-ops for every other kind).
     if (isTvTheatreOpen(itemId)) closeTvTheatre();
     forgetTv(itemId);
+    // And its WATCH chip, now, not at the next half-second tick: a chip
+    // left clickable in that gap would reopen the removed set's theatre,
+    // which later ticks would never close. Runs pre-splice, so the removed
+    // id is excluded by hand; under the same drive flag as the tick, so a
+    // teardown cannot put a departed room's chip back up.
+    if (tvDriveArmed()) {
+      updateTvChip(FURNITURE.filter((i) => (i.kind === "smart-tv" || i.kind === "tv-stand") && i.id !== itemId).map((i) => i.id));
+    }
     // 🕹 #193: likewise a removed cabinet takes its stage (which swallows
     // the world's keys while it is up) and this page's seat with it.
     if (isArcadeStageOpen(itemId)) closeArcadeStage();

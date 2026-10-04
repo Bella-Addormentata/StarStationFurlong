@@ -134,6 +134,9 @@ export class TvSyncController {
    *  target waits (a player that cannot seek yet keeps it, bounded). */
   private pendingSeekIssued = false;
   private pendingSince = -Infinity;
+  /** A viewer: the transport revision it last saw, to tell a transport
+   *  write (a replay, a rewind) from the record lagging its ended player. */
+  private seenJump: number | null = null;
 
   constructor(private readonly deps: TvSyncDeps) {
     this.now = deps.now ?? tvNow; // monotonic: cadences and the receipt timeline, never a date
@@ -285,9 +288,14 @@ export class TvSyncController {
       // reissued — even inside the band of where the player still reads —
       // or the old seek would land later and be heartbeated over this one.
       const landing = this.pendingTarget !== null;
+      // And a transport write to a player that has ENDED is always a seek:
+      // the band is for a player already where the write says (a resume
+      // where it paused), but an ended player is nowhere — a replay of a
+      // clip shorter than the band would otherwise be "within it", never
+      // seeked, and closed again as ended on the very next line.
       // A player that cannot seek YET (hasClock, !canSeek) keeps the target
       // too, and the beat waits with it; a start-only embed keeps nothing.
-      if ((landing || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) && (p.canSeek || p.hasClock)) {
+      if ((landing || p.isEnded() || Math.abs(p.currentMs() - target) > TV_SEEK_OVER_MS) && (p.canSeek || p.hasClock)) {
         this.aim(p, target, now);
       }
     }
@@ -340,11 +348,14 @@ export class TvSyncController {
    *  have known at the jump (YouTube's length arrives with its metadata; a
    *  live window slides); and a FORWARD seek that ended the player has
    *  landed wherever the media stops, whether or not it ever said how long
-   *  it was — a backward one from the end has not. A seek that went out and
-   *  has not landed TV_SEEK_WAIT_MS later never will (swallowed, or a host
-   *  that stopped answering): the target is dropped, so the beat resumes
-   *  from wherever the player is — a room with a clock a jump behind, over
-   *  one with no clock at all. */
+   *  it was — a backward one from the end has not, however short, until
+   *  the player un-ends (an asynchronous player keeps reporting its old
+   *  ended position meanwhile, and a replay of a clip shorter than the band
+   *  would otherwise read as landed and be closed again as ended). A seek
+   *  that went out and has not landed TV_SEEK_WAIT_MS later never will
+   *  (swallowed, or a host that stopped answering): the target is dropped,
+   *  so the beat resumes from wherever the player is — a room with a clock
+   *  a jump behind, over one with no clock at all. */
   private settlePending(p: TvPlayer, now: number): void {
     if (this.pendingTarget === null) return;
     if (!this.pendingSeekIssued) {
@@ -360,19 +371,32 @@ export class TvSyncController {
     }
     const target = reachable(this.pendingTarget, p);
     const at = p.currentMs();
-    const landed = Math.abs(at - target) <= TV_SEEK_OVER_MS
-      || (p.isEnded() && target >= at - TV_SEEK_OVER_MS);
+    const landed = p.isEnded() ? target >= at : Math.abs(at - target) <= TV_SEEK_OVER_MS;
     if (landed || now - this.pendingSince >= TV_SEEK_WAIT_MS) this.pendingTarget = null;
   }
 
   /** A viewer: converge on the record (seek when far, nudge when near). */
   private tickViewer(p: TvPlayer, pb: PlaybackNow, now: number): PlaybackNow {
+    // A transport write since this viewer's last tick (PLAY NOW again, a
+    // rewind): told apart from the record merely lagging the player, which
+    // is every tick near the end of a film.
+    const jump = this.jump();
+    const transport = this.seenJump !== null && jump !== this.seenJump;
+    this.seenJump = jump;
     if (p.isEnded()) {
       // A player at its end is never play()ed as it stands (it would start
       // over). A record well BEFORE the end is a rewind or a replay: seek
-      // there — which un-ends the player — and go. Otherwise hold until the
-      // record moves on (the holder ends the programme).
-      if (p.canSeek && pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS) {
+      // there — which un-ends the player — and go; so is a record anywhere
+      // before the end on a transport write (a replay of a clip shorter
+      // than the band, which sample lag alone could never explain). Under
+      // the same cooldown as any viewer seek: an asynchronous player keeps
+      // reporting ended at its old position until the seek lands, and a
+      // seek and a play() every tick meanwhile would only interrupt its
+      // buffering. Otherwise hold until the record moves on (the holder
+      // ends the programme).
+      const before = pb.positionMs < p.currentMs();
+      const replay = pb.positionMs < p.currentMs() - TV_SEEK_OVER_MS || (transport && before);
+      if (p.canSeek && replay && now - this.lastSeekAt >= TV_SEEK_COOLDOWN_MS) {
         p.seek(pb.positionMs);
         this.lastSeekAt = now;
         this.setRate(1);
