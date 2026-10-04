@@ -541,20 +541,33 @@ addresses with the node id for convenience; here the id is ALL that
 travels — no dial hints, signed or not. A signature binds a claim to its
 signer and proves nothing about who answers at an address: a member could
 sign {its own id, a victim's address} and have every automatic viewer send
-a QUIC handshake there, which is exactly why the node already dials every
-gossip-learned peer by id with EMPTY hints (`ssf-p2p-node/src/main.rs`, the
-TIER_INTRODUCED dial: "the signature covers the payload + author, NOT the
-iroh_node_id / direct_addrs") — which closes the RELAYED hint and not the
-reflection: with empty hints iroh resolves the id through the Mainline
-DHT, where the id's OWNER publishes its own signed address record (the
-node's `DhtAddressLookup`, `AddrFilter::unfiltered`), so a member that
-signs a room envelope under an id it owns, having published a victim's
-address under that id, still has every node that hears the envelope send
-its QUIC handshake there — automatically, on the envelope alone, before
-any consent. That dial is therefore a PREREQUISITE of this section, not a
-given: the mesh-upgrade dial of a gossip-learned id goes to a route
-observed on an authenticated connection where one exists (the hub's, or
-the connection the envelope arrived on when its peer is the origin), and
+a QUIC handshake there, which is exactly why the node's inline
+mesh-upgrade dial takes a gossip-learned peer by id with EMPTY hints
+(`ssf-p2p-node/src/main.rs`, the TIER_INTRODUCED dial: "the signature
+covers the payload + author, NOT the iroh_node_id / direct_addrs") — and
+why that is not yet the rule: the node's OTHER automatic dial keeps the
+hints. A signed `roster`, `px` or `mesh-join` payload carries
+`relay_urls` and `direct_addrs` per member, `dispatch_control` records
+each as a graft candidate WITH those hints, and the mesh loop's GRAFT
+dials the candidate with them as given (`dial_peer_with_retry`), so an
+admitted member's claim about another member's address — or about its
+own — aims a handshake wherever it likes, automatically. And the empty
+hints close the RELAYED hint and not the reflection: with empty hints
+iroh resolves the id through the Mainline DHT, where the id's OWNER
+publishes its own signed address record (the node's `DhtAddressLookup`,
+`AddrFilter::unfiltered`), so a member that signs a room envelope under
+an id it owns, having published a victim's address under that id, still
+has every node that hears the envelope send its QUIC handshake there —
+automatically, on the envelope alone, before any consent. Both dials are
+therefore a PREREQUISITE of this section, not a given: an AUTOMATIC dial
+carries no peer-supplied hint at all — a candidate learned from a
+roster, px or mesh-join is dialled by id, the payload's addresses
+discarded (a member's self-reported address is a claim like any other:
+the signature proves it is theirs, not that they answer there), a hinted
+dial kept for what the viewer asked for, under the budget below — and
+the mesh-upgrade dial of a gossip-learned id goes to a route observed on
+an authenticated connection where one exists (the hub's, or the
+connection the envelope arrived on when its peer is the origin), and
 otherwise through discovery under exactly the per-id, per-address and
 global dial budget below — bytes counted at the socket, backoff, a cap on
 automatic dials in flight — so that a reflection costs its victim at most
@@ -612,7 +625,9 @@ link whose iroh handshake proved its node id, never relayed as someone
 else's word, and dialled, again, by that id. The hints in the room's
 member records are the bootstrap roster's and nothing more (`YjsSync`
 carries them outside the signed envelope, `src/network/YjsSync.ts`); the
-blob lane dials from none of them. A library seeder's signed entry (§7)
+blob lane dials from none of them, and the mesh's graft dial, which today
+still dials a roster, px or mesh-join candidate from the hints it came
+with, is the prerequisite above. A library seeder's signed entry (§7)
 names its node id, dialled the same way. So the fall-back to a seeder
 nobody is connected to is a dial by id through discovery — never to an
 address a stranger supplied — and holding is proven by serving bytes the
@@ -836,8 +851,11 @@ a key message can be substituted for no other: HPKE as RFC 9180 defines
 it, base mode, DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and
 ChaCha20-Poly1305, a single-shot `Seal` of the 32-byte media key to the
 subscriber's static X25519 key, derived from their Ed25519 identity by
-the libsodium conversion (`crypto_sign_ed25519_pk_to_curve25519`;
-`@noble/curves`'s `edwardsToMontgomery` on the page), the KEM's own
+the libsodium conversion (`crypto_sign_ed25519_pk_to_curve25519`; on the
+page `@noble/curves`'s `edwardsToMontgomeryPub` for the recipient's public
+key on the sender's side and `edwardsToMontgomeryPriv` for the recipient's
+own private key when it opens — the library has no `edwardsToMontgomery`),
+the KEM's own
 all-zero check refusing a low-order point, with `info = "ssf-media-key:v1\n"
 ‖ source id (32) ‖ epoch (4, big-endian) ‖ recipient identity key (32)` and
 the same bytes as the AEAD's associated data, so a sealed key opens only
