@@ -49,6 +49,8 @@
 import * as Y from 'yjs';
 import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
+import { cleanPose, isFreePose } from './freeFlight';
+import type { FreePose } from './freeFlight';
 import { isNewerTrim, isOrbitTrim, setSharedTrimSource, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
 import { MAX_SUMMARY_CLAIMS, cleanMove, compareMoves, decidingClaimsOf, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
@@ -59,10 +61,10 @@ import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, Station
 // ── Shapes ───────────────────────────────────────────────────────────────────
 
 /** A trim as it travels: the burn's orbit numbers, with how many burns its
- *  line has had, its place and its writers (OrbitTrim.seq, place and seen),
- *  so another of the station's helm rooms can go on from it
- *  (stationKeeping.readSharedTrim) and trims rank alike everywhere
- *  (newerTrim). `from` is the room
+ *  line has had, its place, its writers and their floor (OrbitTrim.seq,
+ *  place, seen and seenFloor), so another of the station's helm rooms can
+ *  go on from it (stationKeeping.readSharedTrim) and trims rank alike
+ *  everywhere (newerTrim). `from` is the room
  *  whose station-keeping log it was read from and `readAt` when a client
  *  standing there last read it: between two readings of one room the later
  *  reading wins, whatever its burn time, so a trim that room took back (a
@@ -201,6 +203,10 @@ export interface ShipSummary {
   /** Set when the room stopped being a ship (bolted into a station, a
    *  fitting removed): a newer stamp that withdraws the entry everywhere. */
   retired?: true;
+  /** 🕹️ A ship flown by hand (status `free-flight`, issue 203): its pose as
+   *  last written, which readers coast forward (freeFlight.coastTo). An
+   *  older client drops the whole entry (it does not know the status). */
+  free?: FreePose;
   updatedAt: number;
 }
 
@@ -236,7 +242,7 @@ export const SHIP_HEARTBEAT_MS = 3600 * 1000;
  *  old, so a long hold or pause never ages off the boards (they drop a
  *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
 export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
-const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
+const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking', 'free-flight'];
 const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move', 'orbit']);
 
 const isId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LEN;
@@ -370,6 +376,7 @@ function cleanTrim(v: unknown, now = Date.now()): SharedTrim | undefined {
     ...(v.seq !== undefined ? { seq: v.seq } : {}),
     ...(v.place !== undefined ? { place: v.place } : {}),
     ...(v.seen !== undefined ? { seen: v.seen.map(([writer, place]): [number, number] => [writer, place]) } : {}),
+    ...(v.seenFloor !== undefined ? { seenFloor: v.seenFloor } : {}),
     ...(read ? { from: src.from as string, readAt: src.readAt as number } : {}),
   };
 }
@@ -509,6 +516,10 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
   if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
+  // The pose must fly at the planet the entry is filed under, or readers
+  // would index it at one planet and draw it at another.
+  if (out.status === 'free-flight' && isFreePose(v.free, now)
+    && planetById(v.free.planetId).id === planetById(out.planetId).id) out.free = cleanPose(v.free);
   return out;
 }
 

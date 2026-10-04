@@ -50,7 +50,7 @@ import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
 import { MIN_ALTITUDE_KM, MIN_ORBIT_SEPARATION_KM, maxAltitudeKm, realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
-import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFuelLevel, subscribeShip } from './shipDoc';
+import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFlightRecord, readFuelLevel, subscribeShip } from './shipDoc';
 import { subscribePlanetSummary } from './planetSummary';
 import type { StationRecord } from './stations';
 import {
@@ -357,6 +357,11 @@ const LED = '#FFB300';
 const LED_GLOW = '0 0 6px rgba(255,179,0,0.85), 0 0 14px rgba(255,120,0,0.35)';
 
 export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
+  /** Does this helm steer the station now? Not while a one-module station
+   *  flies by itself (🅿️ Fly and park): it keeps no orbit to trim or move
+   *  from until it PARKs, the only move it books meanwhile (others read a
+   *  move booked since as its PARK). */
+  const steering = (): boolean => deps.bolted() && readFlightRecord().status !== 'free-flight';
   let host: HTMLElement | null = null;
   let panel: HTMLDivElement | null = null;
   let face: 'keep' | 'ship' = 'keep';
@@ -393,7 +398,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     const now = Date.now();
     const station = deps.station();
     return {
-      bolted: deps.bolted(),
+      bolted: steering(),
       station,
       trim: readOrbitTrim(station),
       commander: isCommander(),
@@ -965,7 +970,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   const placeBack = (): void => {
     sinceBack = 0;
     if (!host || face !== 'ship') return;
-    const steers = deps.bolted();
+    const steers = steering();
     if (steers && !back) {
       back = document.createElement('button');
       back.type = 'button';
@@ -1027,7 +1032,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     mount(h: HTMLElement): void {
       host = h;
       window.addEventListener('keydown', onKey);
-      if (deps.bolted()) {
+      if (steering()) {
         face = 'keep';
         mountKeep(h);
       } else {
@@ -1061,6 +1066,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       }
       if (!panel) return;
       sinceText += dt;
+      // No longer steering the station (a gangway taken down, or 🅿️ the
+      // station flying by itself): the ship face, as a fresh mount opens.
+      if (sinceText >= TEXT_REFRESH_S && !steering()) { showShip(); return; }
       if (sinceText >= TEXT_REFRESH_S || (flash && Date.now() >= flash.until)) {
         if (flash && Date.now() >= flash.until) flash = null;
         if (moveFlash && Date.now() >= moveFlash.until) moveFlash = null;
