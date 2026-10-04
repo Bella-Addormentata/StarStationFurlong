@@ -55,15 +55,17 @@ import {
   describeOffset,
   describeRefusal,
   describeTrimStatus,
+  helmTrim,
   isBurnLogFull,
   planTrim,
   readBurnFiring,
+  readHelmFiring,
   readOrbitTrim,
+  readSharedTrim,
   slotDriftPerHour,
   slotOffsetAt,
   slotOrbit,
   subscribeStationKeeping,
-  trimFor,
   trimmedOrbit,
   writeTrimBurn,
 } from './stationKeeping';
@@ -340,13 +342,14 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     return {
       bolted: deps.bolted(),
       station,
-      trim: readOrbitTrim(),
+      trim: readOrbitTrim(station),
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
       now,
       firing: readBurnFiring(now, station),
       logFull: isBurnLogFull(),
+      shared: readSharedTrim(station),
       tanks,
       capacity,
     };
@@ -424,14 +427,16 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   };
 
   /** The room's burn firing now, on the orbit the dashboard shows. */
-  const firingNow = (now: number): FiredBurn | null => (view ? readBurnFiring(now, view.station) : null);
+  const firingNow = (now: number): FiredBurn | null =>
+    // Or the shared trim's last one, while the helm goes on from that trim.
+    (view ? readHelmFiring(now, view.station) : null);
 
   const refresh = (): void => {
     if (!panel) return;
     sinceText = 0;
     const c = readContext();
     const station = c.station;
-    const trim = trimFor(station, c.trim);
+    const trim = helmTrim(station, c.trim, c.shared);
     const base = station ? slotOrbit(station) : null;
     view = station && base ? { station, base, trim, planet: base.planet.name } : null;
 
@@ -484,7 +489,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         text = flash.text;
         tone = WARN;
       } else if (view) {
-        text = describeTrimStatus(view.base, trim, c.now, trimFor(station, c.firing ?? null));
+        text = describeTrimStatus(view.base, trim, c.now, firingNow(c.now));
         tone = text.startsWith('ON STATION') ? GREEN : text.startsWith('BURNING') ? AMBER : GOLD;
       } else {
         text = describeRefusal('no-station', c.tanks);
@@ -506,7 +511,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     }
     const plan = planTrim(c, dir);
     if (!plan.ok) {
-      flash = { text: describeRefusal(plan.refusal, c.tanks, trimFor(c.station, c.trim)?.dRadiusKm ?? 0), until: c.now + FLASH_MS };
+      flash = { text: describeRefusal(plan.refusal, c.tanks, helmTrim(c.station, c.trim, c.shared)?.dRadiusKm ?? 0), until: c.now + FLASH_MS };
       refresh();
       return;
     }

@@ -75,8 +75,8 @@ import { createSpeakerVoice, isSpeakerPlaying } from "./partyAudio";
 import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } from "./doorLayoutDoc";
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
-import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { readBurnFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
+import { readPhysicalDoors, subscribeDoors } from "./doorsDoc";
+import { readHelmFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
 import { subscribeSharedAtlas } from "./stationAtlas";
 import { currentRoomId, currentStation } from "./stations";
 import type { StationRecord } from "./stations";
@@ -4229,10 +4229,10 @@ function buildHelmSticks(
   part(gimbal, new THREE.SphereGeometry(0.02, 12, 10), m(0xffb300, 0.4, 0.2, 0xffb300, 0.3), 0, 0.066, 0);
   attach(trimStick);
 
-  // Which hand: the room's pairings (and the atlas's word on their far
+  // Which hand: the room's own doors (and the atlas's word on their far
   // ends), or its being a station's own welcome room, say ship or station.
   // With it, the station this install places the room in: the stick leans
-  // only for a burn on its orbit (readBurnFiring), as the dashboard shows
+  // only for a burn on its orbit (readHelmFiring), as the dashboard shows
   // it. Both are read again on every door, atlas or station keeping change,
   // as soon as the room changes (on the first join, main.ts names the room
   // only after this console is built, and says nothing when it does), and
@@ -4246,7 +4246,7 @@ function buildHelmSticks(
   const readFace = () => {
     faceRoom = currentRoomId();
     faceAge = 0;
-    bolted = steersStation(faceRoom, readAllDoors());
+    bolted = steersStation(faceRoom, readPhysicalDoors());
     fighter.visible = !bolted;
     trimStick.visible = bolted;
     station = currentStation();
@@ -4265,8 +4265,9 @@ function buildHelmSticks(
       let tz = 0;
       // The burn firing now on this station's orbit, whatever order the log
       // keeps (a peer's clock running ahead, or a newer burn on an orbit
-      // another install puts the room in, never hides this one).
-      const firing = bolted ? readBurnFiring(Date.now(), station) : null;
+      // another install puts the room in, never hides this one), or another
+      // of the station's helm rooms' while the helm goes on from its trim.
+      const firing = bolted ? readHelmFiring(Date.now(), station) : null;
       if (firing) {
         if (firing.dir === "raise") tx = -LEAN;
         else if (firing.dir === "lower") tx = LEAN;
