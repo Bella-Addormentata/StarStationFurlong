@@ -934,6 +934,29 @@ describe('a reading from before this page slept', () => {
     expect(p.log).toEqual(['play', 'seek:42000']);
   });
 
+  it('a replay written while this page\'s reading was stale is not forgotten: the first fresh sample replays it, inside the band or not', () => {
+    const p = new FakePlayer(true);
+    p.duration = 1_000; // a one-second clip
+    const h = harness(p);
+    h.tick();
+    p.position = 1_000; p.playing = false; p.ended = true;
+    h.set({ positionMs: 1_000 }); // the clip ran out; the record lags its end by nothing
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    // This page sleeps an hour. Meanwhile the holder pressed PLAY NOW again
+    // (the record's jump moved); back, the reading is stale: nothing acted on.
+    h.transport({ positionMs: 3_600_000, stale: true });
+    h.tick(3_600_000);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([]);
+    // The holder's fresh beat: the replay is 200 ms in — within the band of
+    // where the ended player reads (1 s), which sample lag alone could never
+    // explain only because the write was SEEN to move.
+    h.set({ positionMs: 200, stale: false });
+    h.tick(TV_SEEK_COOLDOWN_MS);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual(['seek:200']);
+    expect(p.playing).toBe(true);
+  });
+
   it('the holder rejoins the room where the room is: one seek to the bridged reading, the beat from there and never from where it slept', () => {
     const p = new FakePlayer(true);
     const h = harness(p, { hold: true });

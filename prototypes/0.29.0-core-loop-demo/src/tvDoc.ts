@@ -166,8 +166,9 @@ export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by:
  *  own key, like the volume, so a press never races the holder's heartbeat
  *  in the programme's LWW slot. Off keeps the programme, like a real TV,
  *  and writes where the room WAS as it went off — `parkMs`, the presser's
- *  own reading of the room (readPlayback at the press; 0 when nothing was
- *  running): a position, never a time, the clocks rule — and on carries
+ *  own reading of the room (readPlayback at the press; null when nothing
+ *  was running, and a reading of 0 is a reading: a programme switched off
+ *  at its start): a position, never a time, the clocks rule — and on carries
  *  it, so every page anchors the resumed programme there on receipt of the
  *  ON write (noteSamples: a sample of its own, replaced by the holder's
  *  next heartbeat) and the holder's tick parks the programme there
@@ -179,10 +180,12 @@ export const REMOTE_FREE: RemoteRecord = { holder: '', name: '', leaseAt: 0, by:
 export interface PowerRecord {
   on: boolean;
   seq: number;
-  parkMs: number;
+  /** Where the room was switched off, or null for no reading (nothing
+   *  running, a record from before the field, a peer's garbage). */
+  parkMs: number | null;
 }
 
-export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0, parkMs: 0 };
+export const POWER_DEFAULT: PowerRecord = { on: false, seq: 0, parkMs: null };
 
 // ── Binding (the partyDoc shape) ─────────────────────────────────────────────
 
@@ -355,13 +358,15 @@ function noteSamples(keys: Iterable<string>, local = false): void {
       // page's own receipt — once per switch revision — so nobody runs the
       // programme on from a heartbeat the time switched off has aged. The
       // holder's next heartbeat (a new programme seq) replaces it as any
-      // sample is replaced, and its park (tvSession) pauses there.
+      // sample is replaced, and its park (tvSession) pauses there. A
+      // reading of 0 is a reading (switched off at the start); only null
+      // is no reading.
       const itemId = key.slice(6);
       const power = readPower(itemId);
       if (powerSeen.get(itemId) === power.seq) continue;
       powerSeen.set(itemId, power.seq);
       const rec = readProgramme(itemId);
-      if (power.on && power.parkMs > 0 && rec.state === 'playing') {
+      if (power.on && power.parkMs !== null && rec.state === 'playing') {
         samples.set(itemId, { seq: rec.seq, positionMs: power.parkMs, receivedAt: stamp });
       }
       continue;
@@ -590,7 +595,11 @@ export function readVolume(itemId: string): number {
 export function readPower(itemId: string): PowerRecord {
   const raw = ensureMap().get(powerKey(itemId)) as Partial<PowerRecord> | undefined;
   if (!raw || typeof raw !== 'object') return { ...POWER_DEFAULT };
-  return { on: raw.on === true, seq: counter(raw.seq), parkMs: Math.max(0, Math.floor(num(raw.parkMs))) };
+  // A reading is a finite, non-negative number — 0 included; anything else
+  // (absent, a peer's garbage, a record from before the field) is none.
+  const park = raw.parkMs;
+  const parkMs = typeof park === 'number' && Number.isFinite(park) && park >= 0 ? Math.floor(park) : null;
+  return { on: raw.on === true, seq: counter(raw.seq), parkMs };
 }
 
 /** What a screen, a phone or the theatre shows: the programme, the switch
@@ -912,9 +921,10 @@ export function tvTogglePower(itemId: string, now = clock()): boolean {
   // Going off: where the room is, by this page's own reading, carried by
   // the switch for the park and the resume (PowerRecord). Coming on: the
   // reading the OFF press left, carried on so every page sees it with the
-  // ON write; a set switched off with nothing running carries 0.
+  // ON write; a set switched off with nothing running carries no reading
+  // (null) — a programme switched off at its start carries 0, a reading.
   const parkMs = power.on
-    ? (readTv(itemId).state === 'playing' ? Math.max(0, Math.floor(readPlayback(itemId, now).positionMs)) : 0)
+    ? (readTv(itemId).state === 'playing' ? Math.max(0, Math.floor(readPlayback(itemId, now).positionMs)) : null)
     : power.parkMs;
   write(powerKey(itemId), { on: !power.on, seq: bump(power.seq), parkMs } satisfies PowerRecord);
   return !power.on;
@@ -924,7 +934,7 @@ export function tvTogglePower(itemId: string, now = clock()): boolean {
  *  a new programme, so the switch carries no reading to resume from. */
 function switchOn(itemId: string): void {
   const power = readPower(itemId);
-  if (!power.on) write(powerKey(itemId), { on: true, seq: bump(power.seq), parkMs: 0 } satisfies PowerRecord);
+  if (!power.on) write(powerKey(itemId), { on: true, seq: bump(power.seq), parkMs: null } satisfies PowerRecord);
 }
 
 /** VOLUME on the set: its own key, so a press here never carries a stale

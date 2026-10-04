@@ -131,11 +131,12 @@ function parkIfPowerReturned(id: string): void {
   if (owed !== null && iHoldRemote(id)) {
     lastPower.set(id, { on, epoch, owed: null }); // before the write: its notify re-enters here
     // Where the room WAS switched off: the presser's own reading, carried
-    // by the switch (tvDoc `parkMs`) — not this page's last heartbeat,
-    // which a holder asleep before the press would have left minutes
-    // behind the room. The heartbeat is the fallback for a switch that
-    // carried no reading (a record from before the field).
-    tvPause(id, power.parkMs > 0 ? power.parkMs : programme.positionMs);
+    // by the switch (tvDoc `parkMs`; a reading of 0 is a reading) — not
+    // this page's last heartbeat, which a holder asleep before the press
+    // would have left minutes behind the room. The heartbeat is the
+    // fallback for a switch that carried no reading (null: a record from
+    // before the field, nothing running when it went off).
+    tvPause(id, power.parkMs ?? programme.positionMs);
     return;
   }
   lastPower.set(id, { on, epoch, owed });

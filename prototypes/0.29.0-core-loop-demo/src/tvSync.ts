@@ -244,11 +244,13 @@ export class TvSyncController {
     // either role below, band or no band.
     const started = this.started();
     const newProgramme = this.seenStarted !== null && started !== this.seenStarted;
-    this.seenStarted = started;
 
     if (pb.state === 'playing') {
       this.parked = false;
-      if (hold) return this.tickHolder(p, pb, now, newProgramme);
+      if (hold) {
+        this.seenStarted = started;
+        return this.tickHolder(p, pb, now, newProgramme);
+      }
       // A viewer has no target of its own: whatever this page was carrying
       // its player to as the holder is the new holder's affair now, and
       // picking the remote up again later is a first acquisition — the
@@ -259,8 +261,11 @@ export class TvSyncController {
       this.pendingSeekIssued = false;
       this.appliedJump = null;
       this.countdownJump = null;
-      return this.tickViewer(p, pb, now, newProgramme);
+      // The viewer commits the revisions it has seen for itself
+      // (tickViewer): a stale reading leaves them pending.
+      return this.tickViewer(p, pb, now, newProgramme, started);
     }
+    this.seenStarted = started;
 
     // Not playing: whatever transport revision brought us here is followed
     // by the state itself (a later resume is a new revision to follow) —
@@ -477,24 +482,31 @@ export class TvSyncController {
   }
 
   /** A viewer: converge on the record (seek when far, nudge when near). */
-  private tickViewer(p: TvPlayer, pb: PlaybackNow, now: number, newProgramme: boolean): PlaybackNow {
+  private tickViewer(p: TvPlayer, pb: PlaybackNow, now: number, newProgramme: boolean, started: number): PlaybackNow {
     // A transport write since this viewer's last tick (PLAY NOW again, a
     // rewind): told apart from the record merely lagging the player, which
     // is every tick near the end of a film.
     const jump = this.jump();
     const transport = this.seenJump !== null && jump !== this.seenJump;
-    this.seenJump = jump;
     // The record's anchor is from before this page slept (readPlayback
     // `stale`: a gap in the room tick's awake marks — the monotonic clock
     // may or may not have run on through an OS sleep; the reading is
     // bridged on the wall clock, an estimate): shown, never seeked or
     // nudged to. The holder's next heartbeat past the wake window —
     // TV_WAKE_WINDOW_MS + TV_HEARTBEAT_MS at most — lands a fresh sample,
-    // and the player is then seeked once, to where the room is.
+    // and the player is then seeked once, to where the room is. The
+    // revisions stay PENDING meanwhile — seenJump and seenStarted are
+    // committed below, past this return — so a transport write or a new
+    // programme that landed while the reading was stale is still seen to
+    // move on the first fresh tick: a replay of an ended short clip, with
+    // the fresh sample near zero and inside the band of the player's end,
+    // would otherwise read as drift and never be replayed.
     if (pb.stale) {
       if (!p.isPlaying() && !p.isEnded()) p.play();
       return pb;
     }
+    this.seenJump = jump;
+    this.seenStarted = started;
     if (p.isEnded()) {
       // A player at its end is never play()ed as it stands (it would start
       // over). A record well BEFORE the end is a rewind or a replay: seek
