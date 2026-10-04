@@ -287,8 +287,9 @@ export function transitLayout(move: StationMove, nowMs: number, withPaths = true
 // ── Courses already drawn ────────────────────────────────────────────────────
 
 /** Transfers drawn so far, by flight, each with when it was last seen (the
- *  view drops one not seen for a while). */
-export type FrozenCourses = Map<string, { plan: TransferPlan; seenAt: number }>;
+ *  view drops one not seen for a while), and whether it was drawn on a ferry
+ *  leg's copies of its stops. */
+export type FrozenCourses = Map<string, { plan: TransferPlan; seenAt: number; copied: boolean }>;
 
 /** A flight's end, as planTransfer places it. */
 type CourseEnd = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
@@ -303,10 +304,11 @@ type CourseEnd = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
  * flight already drawn keeps its course once an end can no longer be placed
  * at all (a learned station dropped after a move, say). 🚚 A ferry leg's
  * `copies` (the route's copies of its two stops: planetSummary's
- * routeLegEnds and summaryLegEnds) are its ends when known, and name its
- * course too: one placed by the station list before they were known (a
- * summary relayed by an older client) is not the one drawn once they are.
- * `seenAt` stamps the course seen. Null when it cannot be placed.
+ * routeLegEnds and summaryLegEnds) are its ends when known. A course the
+ * station list placed before they were known (a summary relayed by an older
+ * client) gives way to theirs once they are, and theirs stays though a later
+ * summary comes without them again. `seenAt` stamps the course seen. Null
+ * when it cannot be placed.
  */
 export function frozenCourse(
   courses: FrozenCourses,
@@ -319,16 +321,14 @@ export function frozenCourse(
 ): TransferPlan | null {
   if (!(etaAt > departedAt)) return null;
   // JSON, not a joined string: ids come from peers and may hold any delimiter.
-  const key = JSON.stringify([...flight, departedAt, etaAt, copies]);
+  const key = JSON.stringify([...flight, departedAt, etaAt]);
   const known = courses.get(key);
-  if (known) {
-    known.seenAt = seenAt;
-    return known.plan;
-  }
+  if (known) known.seenAt = seenAt;
+  if (known && (known.copied || !copies)) return known.plan;
   const [from, to] = copies ?? ends();
-  if (!from || !to) return null;
-  const planned = planTransfer(from, to, departedAt - 1);
-  const plan = planned ? { ...planned, departAt: departedAt, arriveAt: etaAt } : null;
-  if (plan) courses.set(key, { plan, seenAt });
+  const planned = from && to ? planTransfer(from, to, departedAt - 1) : null;
+  if (!planned) return known?.plan ?? null;
+  const plan = { ...planned, departAt: departedAt, arriveAt: etaAt };
+  courses.set(key, { plan, seenAt, copied: copies !== null });
   return plan;
 }
