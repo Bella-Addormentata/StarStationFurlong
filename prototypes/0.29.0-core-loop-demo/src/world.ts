@@ -109,7 +109,7 @@ import {
 import { roomHalfExtents, roomWalkBounds, roomCupola, readCupolaWall } from "./floorPlanDoc";
 import { cupolaFloorOutline } from "./cupola";
 import { reposeDoorTargets } from "./doors";
-import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled } from "./stationAtlas";
+import { roomIdFromSeed, atlasLayout, readAtlas, dismantleInAtlas, isDismantled, sharedRoomsNaming } from "./stationAtlas";
 // 🛰️ A helm bolted into a station flies the STATION (station keeping).
 import { steersStation } from "./stationKeeping";
 import { createStationHelmUI } from "./stationHelm";
@@ -5339,6 +5339,9 @@ export class World {
       playerId: getPlayerId(),
       identityPub: getIdentityPub(),
       welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
+      // What this room's visitors published of the rooms naming a module,
+      // past the ones the atlas keeps.
+      namedBy: (roomId) => sharedRoomsNaming(roomId),
     };
   }
 

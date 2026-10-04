@@ -10,8 +10,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindStationAtlasDoc, atlasComponents, dismantleInAtlas, dismantledRoomIds, freeGateNumber, harvestIntoAtlas, isDismantled,
-  noteRoomSeed, ownValue, pushAtlasToDoc, readAtlas, seedAtlasDefaults, stationGates, visibleAtlas, withSharedAtlasOf,
-  MAX_DISMANTLED, MAX_ENTRIES, type AtlasEntry,
+  noteRoomSeed, ownValue, pushAtlasToDoc, readAtlas, seedAtlasDefaults, sharedRoomsNaming, stationGates, visibleAtlas,
+  withSharedAtlasOf, MAX_DISMANTLED, MAX_DOORS_PER_ENTRY, MAX_ENTRIES, type AtlasEntry,
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, isDisassemblyWork, jobAnnouncement, jobDueAt, jobFraction,
@@ -367,6 +367,74 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(input(doors), 'room-b')).toBe('a ship is docked at it');
   });
 
+  it("reads a joint the atlas let go of from this room doc's shared atlas", () => {
+    const now = vi.spyOn(Date, 'now');
+    try {
+      // More rooms seen first-hand than the atlas keeps, then this station.
+      for (let i = 0; i < MAX_ENTRIES; i++) {
+        now.mockReturnValue(1_000_000 + i);
+        harvestIntoAtlas({ roomId: `walk-${i}`, name: `W${i}`, doors: [] });
+      }
+      now.mockReturnValue(2_000_000);
+      const doors = hub();
+      // POOL's record is the only one of its gangway to GARDEN, published
+      // in this room's doc by a visitor who came through POOL.
+      const doc = new Y.Doc();
+      const shared = doc.getMap('atlas');
+      shared.set('room-p', {
+        roomId: 'room-p', name: 'POOL', doors: { s: { targetRoomId: 'room-b', transient: false } }, updatedAt: 1_500_000,
+      });
+      bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+      // The atlas heard of it there, and let it go among the rooms seen
+      // first-hand: by the atlas alone GARDEN hangs off HUB.
+      expect(readAtlas()['room-p']).toBeUndefined();
+      expect(removalBlocker(input(doors), 'room-b')).toBeNull();
+      // The room doc still has it (HUB's own record, published there too,
+      // is the joint the end seals).
+      expect(sharedRoomsNaming('room-b')?.filter((n) => n.roomId !== 'room-a'))
+        .toEqual([{ roomId: 'room-p', name: 'POOL', berth: false }]);
+      const withShared = input(doors, { namedBy: sharedRoomsNaming });
+      expect(removalBlocker(withShared, 'room-b')).toBe('it is still joined to POOL');
+      expect(disassemblyCandidates(withShared).find((c) => c.roomId === 'room-b')?.blocked).toBe('it is still joined to POOL');
+      // A record of ours newer than that copy, read whole, says what POOL's
+      // doors are now (its gangway leads elsewhere): that copy is passed over.
+      now.mockReturnValue(2_000_100);
+      harvestIntoAtlas({ roomId: 'room-p', name: 'POOL', doors: [{ doorId: 's', targetSeed: seed('room-q'), transient: false }] });
+      expect(removalBlocker(withShared, 'room-b')).toBeNull();
+      // A ship's berth there is a ship docked at it (heard of, and let go
+      // of at once among the rooms seen first-hand).
+      shared.set('ship-9', {
+        roomId: 'ship-9', name: 'SKIFF', doors: { port: { targetRoomId: 'room-b', transient: true } }, updatedAt: 1_900_000,
+      });
+      expect(readAtlas()['ship-9']).toBeUndefined();
+      expect(removalBlocker(input(doors, { namedBy: sharedRoomsNaming }), 'room-b')).toBe('a ship is docked at it');
+      // More records than one read walks (a peer's junk) could hide one.
+      doc.transact(() => {
+        for (let i = 0; i < 4096; i++) shared.set(`junk-${i}`, i);
+      });
+      expect(sharedRoomsNaming('room-b')).toBeNull();
+      expect(removalBlocker(input(doors, { namedBy: sharedRoomsNaming }), 'room-b'))
+        .toBe("this room's shared atlas can't all be read; it has too many records");
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("waits while the module's own record may have left a joint out", () => {
+    const doors = hub();
+    const gangways = (n: number) => Array.from({ length: n }, (_, i) => ({
+      doorId: `g${i}`, targetSeed: seed('room-a'), transient: false,
+    }));
+    // GARDEN's record holds as many doors as the atlas keeps of a room's:
+    // one to another room could be among those left out.
+    harvestIntoAtlas({ roomId: 'room-b', name: 'GARDEN', doors: gangways(MAX_DOORS_PER_ENTRY + 1), owner: { id: 'p-me' } });
+    expect(Object.keys(readAtlas()['room-b'].doors)).toHaveLength(MAX_DOORS_PER_ENTRY);
+    expect(removalBlocker(input(doors), 'room-b')).toBe("its doors can't all be read; it has too many");
+    // One fewer, and it is read whole.
+    harvestIntoAtlas({ roomId: 'room-b', name: 'GARDEN', doors: gangways(MAX_DOORS_PER_ENTRY - 1), owner: { id: 'p-me' } });
+    expect(removalBlocker(input(doors), 'room-b')).toBeNull();
+  });
+
   it('waits while the module is docked at this room by a berth as well', () => {
     const doors = hub();
     // GARDEN joined by the gangway and docked at a berth of this room too:
@@ -712,6 +780,26 @@ describe('the job in the robot map', () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it('holds every job while the map holds more job records than one read keeps', () => {
+    const doc = roomWithDocks();
+    bindRobotDoc(doc);
+    assignDisassembly('d1', target, 0);
+    const map = doc.getMap('robot');
+    // A peer's well-formed records of jobs on other modules: up to the 64
+    // one read keeps, the map still reads whole…
+    const fake = (i: number) => ({ ...target, roomId: `fake-${i}`, startedAt: 0, doneMs: 0, asOf: 0 });
+    doc.transact(() => {
+      for (let i = 0; i < 63; i++) map.set(`job:fake-${i}`, fake(i));
+    });
+    expect(readDisassemblyJobsIfComplete()).toHaveLength(64);
+    // …and one more could hide any job, ours included: none opens or ends.
+    map.set('job:fake-63', fake(63));
+    expect(readDisassemblyJobsIfComplete()).toBeNull();
+    assignDisassembly('d2', { ...target, roomId: 'room-c', name: 'LAB', doorId: 'west' }, MIN);
+    expect(map.get('job:room-c')).toBeUndefined();
+    expect(readRobotConfig('d2')).toBeNull();
   });
 
   it('counts only robots whose docks are placed in the room\'s layout', () => {
@@ -1692,6 +1780,7 @@ describe('the deed takes a module apart (source scan)', () => {
 describe('where the robots work (source scan)', () => {
   it('reads the doors whole, and ends nothing on a capped read', () => {
     const input = between(source('world.ts'), 'private disassemblyInput(', '\n  }');
+    expect(input).toContain('namedBy: (roomId) => sharedRoomsNaming(roomId),');
     expect(input).toContain('const whole = readAllDoorsIfComplete();');
     expect(input).toContain('doors: whole ?? readAllDoors(),');
     expect(input).toContain('...(whole ? {} : { doorsPartial: true }),');

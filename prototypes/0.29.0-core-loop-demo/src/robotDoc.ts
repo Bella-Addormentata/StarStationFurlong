@@ -175,7 +175,8 @@ export function clearRobotConfig(dockId: string, now = Date.now()): void {
 // ── 🔧 Disassembly jobs (#192) ───────────────────────────────────────────────
 
 /** Most job records read from one room's map (a peer's junk must not make
- *  every read walk an unbounded list). */
+ *  every read walk an unbounded list). A map holding more is read as
+ *  partial, as one past MAX_ROBOT_MAP_SCAN: the job left out could be any. */
 const MAX_JOBS = 64;
 
 /** Most entries one read of the jobs walks, whatever they hold: far more
@@ -205,9 +206,10 @@ interface JobIndex {
   targeted: Set<string>;
   /** The well-formed robot work records, by module. */
   work: Map<string, DisassemblyWork[]>;
-  /** The walk stopped short of the map's end (MAX_ROBOT_MAP_SCAN): a peer's
-   *  junk ahead of them could hide any record, so nothing is written from
-   *  this index, and no job is opened or ended on it. */
+  /** The walk stopped short of the map's end (MAX_ROBOT_MAP_SCAN), or found
+   *  more job records than it keeps (MAX_JOBS): a peer's junk could hide any
+   *  record, so nothing is written from this index, and no job is opened or
+   *  ended on it. */
   partial: boolean;
 }
 
@@ -233,7 +235,9 @@ function indexJobs(map: Y.Map<unknown>): JobIndex {
       break;
     }
     if (key.startsWith('job:')) {
-      if (records.length < MAX_JOBS && isDisassemblyJobRecord(value) && jobKey(value.roomId) === key) records.push(value);
+      if (!isDisassemblyJobRecord(value) || jobKey(value.roomId) !== key) continue;
+      if (records.length < MAX_JOBS) records.push(value);
+      else partial = true;
       continue;
     }
     if (key.startsWith('work:')) {
@@ -497,7 +501,8 @@ export function readDisassemblyJobs(): DisassemblyJob[] {
 }
 
 /** 🔧 readDisassemblyJobs, or null when one walk can't read the whole map
- *  (more entries than MAX_ROBOT_MAP_SCAN, which a peer could have flooded):
+ *  (more entries than MAX_ROBOT_MAP_SCAN, or more job records than MAX_JOBS,
+ *  which a peer could have flooded):
  *  any job or robot record could be among those left out, so none is
  *  opened or ended until it reads whole. */
 export function readDisassemblyJobsIfComplete(): DisassemblyJob[] | null {

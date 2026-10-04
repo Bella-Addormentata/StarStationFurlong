@@ -28,8 +28,8 @@
  * Pure: no DOM, no docs. Pinned by disassembly.test.ts.
  */
 
-import type { AtlasEntry, AtlasOwner } from './stationAtlas';
-import { berthDoorIds, isSaneDims, ownValue, roomIdFromSeed } from './stationAtlas';
+import type { AtlasEntry, AtlasOwner, NamingRoom } from './stationAtlas';
+import { MAX_DOORS_PER_ENTRY, berthDoorIds, isSaneDims, ownValue, roomIdFromSeed } from './stationAtlas';
 import type { DoorRecord } from './doorsDoc';
 import { isDockChain } from './adapter';
 import { realMsFor } from './orbits';
@@ -365,6 +365,11 @@ export interface CandidateInput {
   identityPub?: string;
   /** The station's welcome room: its front door, never taken apart. */
   welcomeRoomId?: string | null;
+  /** The rooms whose records in this room doc's shared atlas name a module
+   *  by a door (stationAtlas sharedRoomsNaming): the atlas keeps only so
+   *  many rooms, and one it let go of may hold the module's other joint.
+   *  Null when they can't all be read. Absent: none besides the atlas's. */
+  namedBy?: (roomId: string) => NamingRoom[] | null;
 }
 
 /** The room a door of this room is paired with, or '' (not paired, or an
@@ -426,7 +431,11 @@ export function ownerIsMe(owner: AtlasOwner, me: { playerId: string; identityPub
  *    inside: having minted it is no proof it is still ours, as its deed may
  *    have changed hands since;
  *  - it must hang only off this room: a module still joined to another, or
- *    with a ship docked at it, would leave that one cut off;
+ *    with a ship docked at it, would leave that one cut off. That is read
+ *    from its own record and every record naming it, in the atlas and in
+ *    this room doc's shared atlas (namedBy), which keeps rooms the atlas
+ *    let go of; a record of its own that fills the doors the atlas keeps
+ *    (MAX_DOORS_PER_ENTRY) may have left one out, and holds it;
  *  - and only by structure: the end seals this room's structural doors to
  *    it, so a berth of this room's joined to it as well (it docked here as a
  *    ship too) would leave it docked here. It waits until that is undocked;
@@ -464,12 +473,23 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
     if (!other || other === input.hereRoomId || other === roomId) continue;
     return berths.get(roomId)?.has(doorId) ? 'a ship is docked at it' : `it is still joined to ${nameOf(other)}`;
   }
+  // Its own record holds as many doors as the atlas keeps of a room's: a
+  // joint to another room could be among those left out.
+  if (Object.keys(entry.doors).length >= MAX_DOORS_PER_ENTRY) return "its doors can't all be read; it has too many";
   for (const e of Object.values(atlas)) {
     if (!e?.roomId || e.roomId === roomId || e.roomId === input.hereRoomId) continue;
     for (const [doorId, door] of Object.entries(e.doors ?? {})) {
       if (door?.targetRoomId !== roomId) continue;
       return berths.get(e.roomId)?.has(doorId) ? 'a ship is docked at it' : `it is still joined to ${nameOf(e.roomId)}`;
     }
+  }
+  // …and as this room's visitors published them: the record of a room the
+  // atlas let go of may be the only one of its other joint.
+  const named = input.namedBy ? input.namedBy(roomId) : [];
+  if (named === null) return "this room's shared atlas can't all be read; it has too many records";
+  for (const n of named) {
+    if (n.roomId === input.hereRoomId || n.roomId === roomId) continue;
+    return n.berth ? 'a ship is docked at it' : `it is still joined to ${(n.name || 'another module').slice(0, MAX_NAME)}`;
   }
   return null;
 }

@@ -298,6 +298,49 @@ export function dismantledRoomIds(): Set<string> {
   return gone;
 }
 
+/** 🔧 A room whose record names a module by one of its doors. */
+export interface NamingRoom {
+  roomId: string;
+  name: string;
+  /** That door is a visiting ship's berth (isBerthDoor). */
+  berth: boolean;
+}
+
+/** 🔧 Most shared-atlas entries one read of the rooms naming a module walks
+ *  (sharedRoomsNaming): far more than the rooms a room's visitors know, so
+ *  only a peer's junk reaches it. */
+const MAX_NAMING_SCAN = 4096;
+
+/**
+ * 🔧 The rooms whose records in the bound room doc's shared atlas name
+ * `roomId` by a door. The local atlas keeps only MAX_ENTRIES rooms (and
+ * MAX_DOORS_PER_ENTRY doors of each), and a room it let go of may hold the
+ * only record of a module's joint to it; the room doc keeps what every
+ * visitor of the room published. A copy no newer than a whole record we
+ * hold of the same room is passed over (ours says what its doors are, and
+ * the maps already read it), as is a room taken apart. Null when one walk
+ * can't read the whole map: a peer's junk could hide one.
+ */
+export function sharedRoomsNaming(roomId: string): NamingRoom[] | null {
+  if (!sharedAlive()) return [];
+  const stored = readStoredAtlas();
+  const out: NamingRoom[] = [];
+  let scanned = 0;
+  for (const [rid, value] of sharedMap!.entries()) {
+    if (++scanned > MAX_NAMING_SCAN) return null;
+    if (rid === roomId || !isSharedAtlasEntry(value) || value.roomId !== rid || value.dismantledAt !== undefined) continue;
+    const held = ownValue(stored, rid);
+    if (held && held.lastSeen >= value.updatedAt
+      && (held.dismantledAt !== undefined || Object.keys(held.doors ?? {}).length < MAX_DOORS_PER_ENTRY)) continue;
+    for (const door of Object.values(value.doors)) {
+      if (!door || door.targetRoomId !== roomId) continue;
+      out.push({ roomId: rid, name: value.name, berth: isBerthDoor(door) });
+      break;
+    }
+  }
+  return out;
+}
+
 /** 🔧 Tombstones this install made that its store could not take (full, or
  *  privacy mode: writeAtlas swallows the error). Read as if stored for the
  *  rest of the session (readStoredAtlas), so this install's maps, merges and
