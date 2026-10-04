@@ -177,6 +177,8 @@ export function isFreePose(v: unknown, now = Date.now()): v is FreePose {
   // A parked pose is still (parkPose): zones skip it, so one that moved
   // would coast through a station unchecked.
   if (p.parked !== undefined && (p.parked !== true || p.vAlong !== 0 || p.vRadial !== 0)) return false;
+  // Nor inside the held station's hull: zones would never push it out.
+  if (p.parked && p.near && Math.hypot(p.near.along, p.near.radial) < HULL_KM * (1 - 1e-9)) return false;
   return true;
 }
 
@@ -249,12 +251,22 @@ export function propagate(pose: FreePose, ms: number, stations: readonly FreeSta
   if (!(ms > pose.at)) return pose;
   const t = orbitalSeconds(ms) - orbitalSeconds(pose.at);
   if (pose.near) {
-    const st = presentStations(stations, ms).find((s) => s.room === pose.near!.room);
+    // Held by a station there at the start: carried in its frame all the
+    // way to `ms` (coastGrid never steps past an edge), even onto the edge
+    // where it leaves (a move's departure), and let go of there.
+    const st = presentStations(stations, pose.at).find((s) => s.room === pose.near!.room);
     if (st) {
       const along = pose.near.along + pose.vAlong * t;
       const radial = pose.near.radial + pose.vRadial * t;
       const here = pointOff(st.pointAt(ms), along, radial);
-      return { ...pose, at: Math.round(ms), radiusKm: here.radiusKm, angle: here.angle, near: { room: pose.near.room, along, radial } };
+      const moved = { ...pose, at: Math.round(ms), radiusKm: here.radiusKm, angle: here.angle };
+      if (presentStations([st], ms).length > 0) return { ...moved, near: { room: pose.near.room, along, radial } };
+      // Gone at the edge: its speed along, from the station's frame (its
+      // turn just before the edge) to the ship's own orbit's, as applyZones
+      // leaves a frame.
+      const { near: _gone, ...open } = moved;
+      const vAlong = (turnRate(st, ms - 1000) + pose.vAlong / st.pointAt(ms).radiusKm - circularRate(pose.planetId, here.radiusKm)) * here.radiusKm;
+      return { ...open, vAlong };
     }
   }
   const { near: _gone, ...open } = pose;

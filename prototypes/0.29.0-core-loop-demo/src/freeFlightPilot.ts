@@ -219,7 +219,9 @@ function timedStation(s: StationRecord, planet: string): FreeStation | null {
   const before: StationRecord = { ...s, planetId: m.fromPlanetId, orbitSlot: m.fromSlot, orbit: fromOrbit };
   return {
     ...base,
-    pointAt: (ms: number) => stationPointAt(ms < m.departAt ? before : s, ms),
+    // On the orbit it left up to and at its departure (the edge a coast
+    // steps onto, carrying a held ship there before letting go).
+    pointAt: (ms: number) => stationPointAt(ms <= m.departAt ? before : s, ms),
     presentAt: (ms: number) => (ms < m.departAt ? fromHere : ms >= m.arriveAt ? toHere : false),
     edges: [m.departAt, m.arriveAt],
   };

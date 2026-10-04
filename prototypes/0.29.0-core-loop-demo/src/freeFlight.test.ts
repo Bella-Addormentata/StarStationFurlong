@@ -346,6 +346,9 @@ describe('the record', () => {
     expect(isFreePose({ ...ok, vAlong: 0, parked: true })).toBe(true);
     expect(isFreePose({ ...ok, parked: true })).toBe(false);
     expect(isFreePose({ ...ok, vAlong: 0, vRadial: 0.01, parked: true })).toBe(false);
+    // Nor parked inside a station's hull, where no zone would push it out.
+    expect(isFreePose({ ...ok, vAlong: 0, parked: true, near: { room: 'r', along: 0, radial: HULL_KM / 2 } })).toBe(false);
+    expect(isFreePose({ ...ok, vAlong: 0, parked: true, near: { room: 'r', along: 0, radial: HULL_KM } })).toBe(true);
   });
 
   it('refuses a pose stamped far ahead of the clock, and never coasts backwards', () => {
@@ -462,5 +465,18 @@ describe('a station that comes and goes', () => {
     const after = coastTo(pose, T0 + 20_000, [late]);
     expect(after.pose.near?.room).toBe(A.room);
     expect(after.changed).toBe(true);
+  });
+
+  it('carries a ship it holds up to its departure, and lets go of it there', () => {
+    const A = stationAt(2);
+    const departs = T0 + 3 * 3_600_000;
+    const leaving: FreeStation = { ...A, presentAt: (ms) => ms < departs, edges: [departs] };
+    // Stopped 5 km above it, in its frame.
+    const pose: FreePose = { ...poseOff(A, T0, 0, 5), near: { room: A.room, along: 0, radial: 5 } };
+    const { pose: at } = coastTo(pose, departs, [leaving]);
+    expect(at.near).toBeUndefined();
+    const beside = pointOff(A.pointAt(departs), 0, 5);
+    expect(at.radiusKm).toBeCloseTo(beside.radiusKm, 6);
+    expect(at.angle).toBeCloseTo(beside.angle, 9);
   });
 });
