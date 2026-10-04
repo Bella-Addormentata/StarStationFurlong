@@ -389,6 +389,9 @@ describe('stationForRoom / planetForRoom', () => {
     // ports (tombstones) count for nothing.
     expect(dockedStationFor('ship', [gangway('pod'), dock('a1')], atlas)).toBeNull();
     expect(dockedStationFor('ship', [{ paired: false as const, retiredAddress: seed('a1') }], atlas)).toBeNull();
+    // A pairing whose address names no room (peer-written junk) is no
+    // structure: the real dock beside it still places the ship.
+    expect(dockedStationFor('ship', [{ paired: true as const, connectedRoomAddress: 'not a room' }, dock('b1')], atlas)).toBe('aris-yard');
     // Installed as the room-station resolver, it gives a docked ship its host's planet.
     try {
       setRoomStationResolver((roomId) => (roomId === 'ship' ? dockedStationFor(roomId, [dock('b1')], atlas) : null));

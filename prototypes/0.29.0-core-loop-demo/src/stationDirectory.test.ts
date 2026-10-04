@@ -13,6 +13,8 @@ import {
   destinationsFromRecords,
   directoryFromStationRecords,
   FUEL_PER_KMS,
+  HOME_PLANET_ID,
+  localStationId,
   findStation,
   flightCapable,
   freeFlightCapable,
@@ -91,7 +93,7 @@ describe('a swapped-in directory', () => {
       docked: () => ['a', 'b'],
     });
     expect(destinationsFrom('a').map((s) => s.id)).toEqual(['c']);
-    const dir = directoryFromStationRecords(() => [], () => undefined, () => 'a', () => null, () => ['a', 'b']);
+    const dir = directoryFromStationRecords(() => [], () => undefined, () => 'a', () => null, undefined, undefined, () => ['a', 'b']);
     expect(dir.docked?.()).toEqual(['a', 'b']);
   });
 
@@ -286,5 +288,36 @@ describe('planning a hop', () => {
     const cost = planRecordHop(low, next, now)!.fuelCost;
     expect(cost).toBeGreaterThan(0);
     expect(cost).toBeLessThanOrEqual(50);
+  });
+});
+
+describe('station ids written on another install', () => {
+  const records = [
+    { id: 'furlong-station', name: 'FURLONG', planetId: HOME_PLANET_ID, orbitSlot: 0, welcomeRoomId: 'room-home' },
+    { id: 'shared:room-hab', name: 'HAB', planetId: HOME_PLANET_ID, orbitSlot: 2, welcomeRoomId: 'room-hab' },
+  ];
+  const aliases: Record<string, string> = { 'station:room-hab': 'shared:room-hab', 'their-hab': 'shared:room-hab', ghost: 'nowhere' };
+
+  it('read as this install\'s id through the directory\'s resolver', () => {
+    setStationDirectory(directoryFromStationRecords(() => records, () => undefined, () => null, () => null, (id) => aliases[id] ?? null));
+    expect(localStationId('furlong-station')).toBe('furlong-station');
+    expect(localStationId('station:room-hab')).toBe('shared:room-hab');
+    expect(localStationId('their-hab')).toBe('shared:room-hab');
+    // An alias to nothing listed, or no alias at all: left as written.
+    expect(localStationId('ghost')).toBe('ghost');
+    expect(localStationId('unknown')).toBe('unknown');
+  });
+
+  it('ask the resolver before taking a listed id as written', () => {
+    // A local record whose id collides with a portable id for another room.
+    const clash = [...records, { id: 'shared:room-odd', name: 'ODD', planetId: HOME_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'room-x' }];
+    const byRoom: Record<string, string> = { 'shared:room-odd': 'shared:room-hab' };
+    setStationDirectory(directoryFromStationRecords(() => clash, () => undefined, () => null, () => null, (id) => byRoom[id] ?? null));
+    expect(localStationId('shared:room-odd')).toBe('shared:room-hab');
+  });
+
+  it('are taken as written without a resolver', () => {
+    setStationDirectory(directoryFromStationRecords(() => records, () => undefined, () => null));
+    expect(localStationId('station:room-hab')).toBe('station:room-hab');
   });
 });

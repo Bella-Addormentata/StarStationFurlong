@@ -2,7 +2,8 @@
 // door's own record read past the cap, so a peer's flood never hides one from
 // DEPART's cast-off. doorsDoc.readPhysicalDoors: only the room's own doors,
 // each read past the cap, for the checks that must see every real door and
-// nothing else (DEPART's gate, where a ship is).
+// nothing else (DEPART's gate, where a ship is, whether a module is bolted
+// into a station).
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -11,6 +12,7 @@ import {
   bindDoorsDoc, buildDoorPairing, readAllDoors, readAllDoorsWithPhysical, readPhysicalDoors, writeDoorPairing,
   writeDoorRecordTo,
 } from './doorsDoc';
+import { isBoltedIntoStation } from './stationKeeping';
 
 const STATION_CORE = 'ssf://room#room=station-core';
 const JUNK = 'ssf://room#room=junk';
@@ -72,5 +74,17 @@ describe("the room's own doors", () => {
     expect([...readPhysicalDoors().keys()]).toEqual(['north']);
     seedDoorLayoutEmpty();
     expect(readPhysicalDoors().size).toBe(0);
+  });
+});
+
+describe('a module bolted into a station, its doors map flooded', () => {
+  it("is still bolted over the room's own doors, where the snapshot misses its gangway", () => {
+    // What the planet summary asks before it publishes the room as a ship
+    // (main.ts planetShipStatus and notShipRoom).
+    seedDoorLayoutSingle('x+', 0, 'd:gangway');
+    flood();
+    writeDoorPairing('d:gangway', STATION_CORE);
+    expect(isBoltedIntoStation(readAllDoors(), 'room-module', {})).toBe(false);
+    expect(isBoltedIntoStation(readPhysicalDoors(), 'room-module', {})).toBe(true);
   });
 });
