@@ -259,17 +259,43 @@ let wakeWindowUntil = -Infinity;
 /** When this page last found a gap in its marks (the moment it woke): a
  *  playback sample stamped from before it is STALE (readPlayback). The
  *  monotonic clock is no promise across a sleep — `performance.now()` may
- *  run on through OS sleep, and on Windows does — so a sample from before
- *  the gap extrapolates the whole sleep ahead of the room; it is shown,
- *  never acted on, until a fresh sample lands after the wake window. */
+ *  run on through OS sleep, and on Windows does, or stand still — so a
+ *  sample from before the gap would read the sleep as playback, or not at
+ *  all, by the platform; it is read with the gap bridged on the wall clock
+ *  (gapBridges) and shown, and a viewer never acts on it until a fresh
+ *  sample lands after the wake window. */
 let lastGapAt = -Infinity;
-export function markTvPageAwake(now = clock()): void {
+/** What a gap really took, as the WALL clock measured it, against the
+ *  monotonic clock's own account of it — the one use of wall time in the
+ *  extrapolation, for the gap alone: `performance.now()` may or may not
+ *  have run through a sleep, `Date.now()` did, so a sample from before the
+ *  gap is read as its position plus the time really elapsed (readPlayback),
+ *  the error an NTP step the sleep hid and never the sleep itself. About
+ *  zero where the monotonic clock ran on, the sleep where it stood still.
+ *  The last few gaps are kept, for a sample older than one. */
+interface GapBridge { at: number; correctionMs: number }
+const gapBridges: GapBridge[] = [];
+const GAP_BRIDGES_KEPT = 16;
+let awakeWallAt = NaN;
+export function markTvPageAwake(now = clock(), wall = wallClock()): void {
   if (awakeAt !== -Infinity && now - awakeAt > TV_SUSPEND_GAP_MS) {
     preGapAwake = awakeAt;
     wakeWindowUntil = now + TV_WAKE_WINDOW_MS;
     lastGapAt = now;
+    const monotonic = now - awakeAt;
+    const real = Number.isFinite(awakeWallAt) ? Math.max(0, wall - awakeWallAt) : monotonic;
+    gapBridges.push({ at: now, correctionMs: real - monotonic });
+    if (gapBridges.length > GAP_BRIDGES_KEPT) gapBridges.shift();
   }
   awakeAt = now;
+  awakeWallAt = wall;
+}
+/** What a sample received at `receivedAt` is owed for every gap since: the
+ *  wall clock's measure of each in place of the monotonic clock's. */
+function gapCorrectionSince(receivedAt: number): number {
+  let sum = 0;
+  for (const g of gapBridges) if (g.at > receivedAt) sum += g.correctionMs;
+  return sum;
 }
 /** The moment a lease landing now counts as seen: now, unless this page
  *  was not awake to see it — then the last moment it provably was. */
@@ -364,6 +390,8 @@ export function bindTvDoc(doc: Y.Doc): void {
   preGapAwake = -Infinity;
   wakeWindowUntil = -Infinity;
   lastGapAt = -Infinity;
+  gapBridges.length = 0;
+  awakeWallAt = NaN;
   tvMap.observe((event) => {
     noteSamples(event.keysChanged, event.transaction.local);
     notify(event.keysChanged);
@@ -917,9 +945,14 @@ export interface PlaybackNow {
   /** 'scheduled': ms until T0 (≥ 0). */
   countdownMs: number;
   /** 'playing' from a sample this page received before it last slept
-   *  (markTvPageAwake): the position is the sleep ahead of the room, or
-   *  may be — shown, never seeked or nudged to, until a fresh sample
-   *  lands (the holder's next heartbeat, 3 s at most). */
+   *  (markTvPageAwake). The position is the best estimate of where the
+   *  room is — the gap bridged on the wall clock (gapBridges), since the
+   *  monotonic clock may or may not have run through it — and still no
+   *  anchor a viewer acts on: shown, never seeked or nudged to, until a
+   *  fresh sample lands (the holder's next heartbeat past the wake
+   *  window). The HOLDER rejoins the room there — its headless beat
+   *  carries it, its theatre seeks its own player there once (tvSync) —
+   *  and never drags the room back to where it slept. */
   stale?: boolean;
 }
 
@@ -976,9 +1009,15 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
   if (rec.state === 'playing') {
     const sample = samples.get(itemId);
     const positionMs = sample ? expectedPositionMs(sample, now, rttMs) : rec.positionMs;
-    // A sample from before this page's last sleep (markTvPageAwake): the
-    // reading is shown and never acted on, until a fresh one lands.
-    if (sample && sample.receivedAt < lastGapAt) return { state: 'playing', positionMs, running: true, countdownMs: 0, stale: true };
+    // A sample from before this page's last sleep (markTvPageAwake): read
+    // with the gap bridged on the wall clock — where the room is, as near
+    // as this page can tell — and stale: shown by a viewer, never acted on
+    // until a fresh one lands; rejoined by the holder, whose beat from
+    // here is that fresh sample.
+    if (sample && sample.receivedAt < lastGapAt) {
+      const bridged = Math.max(0, positionMs + gapCorrectionSince(sample.receivedAt));
+      return { state: 'playing', positionMs: bridged, running: true, countdownMs: 0, stale: true };
+    }
     return { state: 'playing', positionMs, running: true, countdownMs: 0 };
   }
   if (rec.state === 'paused') return { state: 'paused', positionMs: rec.positionMs, running: false, countdownMs: 0 };

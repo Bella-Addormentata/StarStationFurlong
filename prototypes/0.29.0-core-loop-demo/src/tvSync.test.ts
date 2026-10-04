@@ -933,4 +933,23 @@ describe('a reading from before this page slept', () => {
     h.tick(TV_SEEK_COOLDOWN_MS);
     expect(p.log).toEqual(['play', 'seek:42000']);
   });
+
+  it('the holder rejoins the room where the room is: one seek to the bridged reading, the beat from there and never from where it slept', () => {
+    const p = new FakePlayer(true);
+    const h = harness(p, { hold: true });
+    p.position = 10_000;
+    h.set({ positionMs: 10_000 });
+    h.tick();
+    expect(h.beats).toEqual([10_000]);
+    // Back from an hour's sleep: the player stood at 10 s with the machine;
+    // the record, bridged on the wall clock, reads where the room is.
+    h.set({ positionMs: 10_000 + 3_600_000, stale: true });
+    h.tick(3_600_000);
+    expect(p.log.filter((l) => l.startsWith('seek'))).toEqual([`seek:${10_000 + 3_600_000}`]);
+    expect(h.beats).toEqual([10_000, 10_000 + 3_600_000]); // landed at once, so the beat is from there — 10 s was never published
+    // The beat un-stales the record; nothing more is seeked.
+    h.set({ positionMs: 10_000 + 3_600_000 + 500, stale: false });
+    h.tick();
+    expect(p.log.filter((l) => l.startsWith('seek'))).toHaveLength(1);
+  });
 });

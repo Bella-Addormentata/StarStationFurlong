@@ -614,6 +614,40 @@ describe('the programme', () => {
     expect(readPlayback(TV).stale).toBeUndefined();
   });
 
+  it('a stale reading is bridged on the wall clock: the sleep counts as elapsed whether or not the monotonic clock ran through it', () => {
+    let wall = 1_700_000_000_000;
+    setTvClock(() => now, () => wall);
+    pickUpRemote(TV);
+    tvPlay(TV, FILM);
+    markTvPageAwake(now);
+    tvHeartbeat(TV, 10_000);
+    tick(500);
+    wall += 500;
+    markTvPageAwake(now);
+    // The lid closed for an hour and the monotonic clock STOOD STILL (macOS,
+    // Linux): the tick back finds a 2.6 s gap by that clock and an hour by
+    // the wall clock, and the reading is the hour — where the room is.
+    tick(2_600);
+    wall += 3_600_000;
+    markTvPageAwake(now);
+    const woke = readPlayback(TV);
+    expect(woke.stale).toBe(true);
+    expect(woke.positionMs).toBe(10_000 + 500 + 3_600_000);
+    // The holder's own beat from there is fresh, and runs on from it.
+    expect(tvHeartbeat(TV, woke.positionMs)).toEqual({ ok: true });
+    expect(readPlayback(TV).stale).toBeUndefined();
+    tick(500);
+    wall += 500;
+    markTvPageAwake(now);
+    expect(readPlayback(TV).positionMs).toBe(10_000 + 500 + 3_600_000 + 500);
+    // Where the monotonic clock ran on through the sleep (Windows), the
+    // wall clock says the same hour: nothing to add, the same reading.
+    tick(3_600_000);
+    wall += 3_600_000;
+    markTvPageAwake(now);
+    expect(readPlayback(TV)).toMatchObject({ stale: true, positionMs: 10_000 + 500 + 3_600_000 + 500 + 3_600_000 });
+  });
+
   it('a volume press on one device never carries a stale programme over a seek on another', () => {
     // Two pages with a doc each, syncing afterwards: Alice (the holder)
     // seeks while Bob turns the sound down. The volume has a key of its own,

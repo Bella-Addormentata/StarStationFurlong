@@ -65,6 +65,30 @@ describe('tickTvRoom', () => {
     expect(readSample(TV)).toMatchObject({ positionMs: TV_HEARTBEAT_MS, receivedAt: now });
   });
 
+  it('a holder that slept beats on from where the room is: the sleep bridged on the wall clock, never the pre-sleep position', () => {
+    let wall = 1_700_000_000_000;
+    setTvClock(() => now, () => wall);
+    const runBoth = (ms: number) => {
+      for (let t = 0; t < ms; t += 500) {
+        now += 500;
+        wall += 500;
+        tickTvRoom([TV], now);
+      }
+    };
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    runBoth(1_000); // ticking, beating headlessly
+    const before = readTv(TV).positionMs;
+    // The lid closes for an hour: the monotonic clock stands still (a 2.6 s
+    // gap in the marks), the wall clock does not.
+    now += 2_600;
+    wall += 3_600_000;
+    tickTvRoom([TV], now);
+    runBoth(TV_HEARTBEAT_MS);
+    expect(readTv(TV).positionMs).toBeGreaterThanOrEqual(before + 3_600_000);
+    expect(readTv(TV).positionMs).toBeLessThan(before + 3_600_000 + 10_000);
+  });
+
   it('flips a scheduled programme to playing at T0 the way the theatre would', () => {
     pickUpRemote(TV);
     tvSchedule(TV, { kind: 'url', url: 'https://example.org/a.mp4' }, now + 60_000);
