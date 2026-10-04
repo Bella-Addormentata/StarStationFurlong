@@ -262,12 +262,14 @@ every platform; the countdown spreads the host's upload before T0. Honest caveat
 a stream — delete-on-leave cache and private rooms keep it in the shape of
 sending a friend a file. And the record is peer-writable, so a fetch is never
 automatic beyond a cap AND a budget: the source carries its declared size; a
-viewer's node fetches on its own only under a per-transfer `autoFetchCap`
-the viewer sets, and only while a cumulative `autoFetchBudget` — the bytes
-fetched without asking, per room and per session — has something left (a
-FETCH button above the cap or past the budget), with one automatic transfer
-in flight per room and a byte rate ceiling, under per-room and global cache
-quotas, with cancellation and delete-on-leave. The budget exists because a
+viewer's node fetches on its own only when the declared size fits a
+per-transfer `autoFetchCap` the viewer sets AND what is left of a cumulative
+`autoFetchBudget` — the bytes fetched without asking, per room and per
+session (a FETCH button otherwise: a declaration larger than the remainder
+would download partially and abort, spending the remainder for nothing),
+with one automatic transfer in flight per room and a byte rate ceiling,
+under per-room and global cache quotas, with cancellation and
+delete-on-leave. The budget exists because a
 cap alone bounds one transfer: a peer rotating through fresh under-cap
 hashes would spend a viewer's bandwidth without end while cache eviction
 kept the disk quota honest; a spent budget makes every further fetch an
@@ -277,8 +279,9 @@ ceiling of its own. Three numbers, kept apart: the cap and the budget say
 what fetches *without asking*; a fetch the viewer approved runs to the
 `approvedLimit` the FETCH button showed them (the declaration, bounded by
 the quota they have left), never to the cap, which would abort the very
-transfer they agreed to. An automatic fetch's ceiling is the cap, the
-budget's remainder or the declaration, whichever is smallest; an approved
+transfer they agreed to. An automatic fetch's ceiling is its declaration,
+already fitted under the cap and the remainder by the rule that let it
+start, so the ceiling never cuts short a transfer it began; an approved
 one's is its approved limit; received bytes past the ceiling abort the
 transfer, and a completed blob whose size differs from the declaration is
 rejected either way.
@@ -316,7 +319,19 @@ bitmap of the last 128 below it, takes a frame above the highest (and
 slides the window up), takes a frame inside the window that the bitmap has
 not seen, and drops a duplicate or a counter older than the window — so
 frames that arrive out of order across streams are played once, and a
-replayed one never. A subscription is signed by the subscriber's identity
+replayed one never. Origin, not only membership: a shared key proves that a
+frame came from someone holding it, and every subscriber holds it — so any
+subscriber could forge frames as the source, and with a high counter push
+genuine frames out of the window. The sender therefore signs. Each frame's
+header carries the BLAKE3 hash of the frame before it, and the sender's
+Ed25519 identity key — the key the room already knows the source by — signs
+the chain head at every keyframe and at least every 250 ms, on the lane. A
+receiver plays a frame on arrival and confirms it when the next signature
+lands; a chain that fails confirmation drops the source (a quarter second of
+forgery at most was heard) and rekeys; and the replay window advances on
+confirmed frames only, so an unconfirmed counter pushes nothing out. One
+signature per interval, not per frame, is what keeps a 20 ms Opus stream
+from doubling in size. A subscription is signed by the subscriber's identity
 with proof of possession (the P2 lane binding's shape, §9), so no entry is
 forged in another's name, and a forged entry would receive only ciphertext
 it cannot open. What a hub still sees is the traffic's shape — who sends to
@@ -511,10 +526,19 @@ lane as the P2 occupant's key and sail through the lookup. So the page
 identity signs a fresh binding over {room, origin node key, epoch, lane id};
 the originating node verifies it on the connection that owns the lane and
 relays that proof with its own attestation; P1 verifies both against the
-seat before any lane is mapped to a player. And then the S3 mapping from
-that proven key to the player holding the seat. P1 accepts kind-3 inputs
-only from a lane whose proven key is the P2 seat's identity. Lockstep stays
-the upgrade for games where lag matters.
+seat before any lane is mapped to a player. And every input after that is
+authenticated end to end too: the binding proves the lane was the player's
+once, and a node gone bad could emit ticks under it afterwards that P1
+could not tell from the player's. So the two pages derive a session key —
+X25519 between their identity-derived keys, bound to {room, epoch, lane
+id, both pubs} — and each kind-3 input carries a strictly increasing
+sequence number and a keyed-BLAKE3 MAC under that key; P1 drops any input
+whose MAC fails or whose sequence does not advance (thirteen bytes become
+about thirty; at 60 Hz that is nothing). And then the S3 mapping from that
+proven key to the player holding the seat. P1 accepts kind-3 inputs only
+from a lane whose proven key is the P2 seat's identity, and only inputs
+that key's session authenticates. Lockstep stays the upgrade for games
+where lag matters.
 
 **Sources.** The archive.org embed (`archive.org/embed/<id>`) is single-player
 only (cross-origin, no input injection, no CRT). The ROM file loaded into an
