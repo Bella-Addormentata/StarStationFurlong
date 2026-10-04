@@ -301,6 +301,27 @@ describe('the programme', () => {
     expect(readPlayback(TV)).toEqual({ state: 'playing', positionMs: 2_500, running: true, countdownMs: 0 });
   });
 
+  it('whoever turns the set on has the remote placed in their hand; a live holder keeps it (#186)', () => {
+    putDownRemote(TV);
+    expect(remoteStatus(TV)).toBe('free');
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readRemote(TV)).toMatchObject({ holder: ALICE, page: 'A' }); // on the set → the presser's
+    expect(tvTogglePower(TV)).toBe(false); // off: the remote stays in hand
+    expect(readRemote(TV).holder).toBe(ALICE);
+    iAm(BOB, 'Bob');
+    expect(tvTogglePower(TV)).toBe(true); // Alice's hold is live: she keeps it
+    expect(readRemote(TV).holder).toBe(ALICE);
+    setTvHostPredicate(() => true); // the owner's spare is not the switch's to use
+    tvTogglePower(TV);
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readRemote(TV).holder).toBe(ALICE);
+    setTvHostPredicate(() => false);
+    tvTogglePower(TV);
+    tick(TV_LEASE_LAPSE_MS); // Alice went quiet
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readRemote(TV)).toMatchObject({ holder: BOB, page: 'A' }); // lapsed → the presser's
+  });
+
   it('the body buttons need no remote: power keeps the programme, volume is the set\'s', () => {
     tvPlay(TV, FILM);
     tvHeartbeat(TV, 60_000);
@@ -608,8 +629,10 @@ describe('sources', () => {
 describe('the in-world screen', () => {
   it('derives its view from the records alone', () => {
     expect(tvScreenView(TV)).toMatchObject({ state: 'off', title: '' });
-    tvTogglePower(TV);
-    expect(tvScreenView(TV)).toMatchObject({ state: 'home', title: 'FURLONG TV', detail: 'REMOTE ON THE SET' });
+    tvTogglePower(TV); // turning the set on puts the remote in Alice's hand (#186)
+    expect(tvScreenView(TV)).toMatchObject({ state: 'home', title: 'FURLONG TV', detail: 'REMOTE · Alice' });
+    putDownRemote(TV);
+    expect(tvScreenView(TV).detail).toBe('REMOTE ON THE SET');
     pickUpRemote(TV);
     expect(tvScreenView(TV).detail).toBe('REMOTE · Alice');
     tvPlay(TV, FILM);
