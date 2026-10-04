@@ -785,6 +785,34 @@ export interface KeeperPassDeps {
   now: () => number;
 }
 
+/**
+ * Has the stop's station left the orbit the route copied of it? 🚚 Moved to
+ * another planet since (PR 174; a move under way answers DOCK 'moving'
+ * itself), or 🎚️ changed altitude since: the route flew to the orbit it
+ * copied (RouteStop.orbit; none is the slot's own), radius and phase both,
+ * since back at an altitude flown before it is not where it was then. Then
+ * the timetable brings the ferry to where the station was, and none of its
+ * gates is in reach: riders' games skip the stop (runKeeperPass), and a
+ * station's gate keeper docks nothing there (gateKeeper.ts). False for a
+ * station this game does not list, or one listed with no planet. Pure.
+ */
+export function stopStationMoved(
+  stop: Pick<RouteStop, 'planetId' | 'orbit'>,
+  station: { planetId?: string; orbit?: StationDestination['orbit'] } | null | undefined,
+): boolean {
+  const planetId = station?.planetId;
+  if (planetId === undefined) return false;
+  if (planetId !== stop.planetId) return true;
+  const live = station?.orbit;
+  const copied = stop.orbit;
+  if (!live || !copied) return !live !== !copied;
+  // The phases' shortest way round the circle: a rounding either side of
+  // the copy is the same place (wrapAngle alone reads a hair below it as a
+  // whole turn away).
+  const turn = wrapAngle(live.phase0 - copied.phase0);
+  return Math.abs(live.radiusKm - copied.radiusKm) > 1e-6 || Math.min(turn, 2 * Math.PI - turn) > 1e-9;
+}
+
 /** The route's port, as planArrivalDock reads it (the only port a keeper
  *  docks with), operable when this game may dock it toward `farRoomId`. */
 function routePortFor(deps: KeeperPassDeps, farRoomId: string): ArrivalPort[] {
@@ -815,20 +843,10 @@ export async function runKeeperPass(deps: KeeperPassDeps): Promise<{ verdict: Pa
   );
   const own = remembered ? ownStopBerth(deps.stop, remembered.address) : null;
   const berths = keeperBerths({ stop: deps.stop, own, station: deps.station, shipRoomId: deps.shipRoomId });
-  // 🚚 The stop's station has moved to another planet since the route copied
-  // where it orbits (PR 174; a move under way answers DOCK 'moving' itself):
-  // the timetable brings the ferry to where it was, so no gate is in reach.
-  // Every gate counts as that refusal, unasked, and the stop is skipped.
-  const planetId = deps.station?.planetId;
-  // 🎚️ Likewise a stop that has changed altitude since: the route flew to
-  // the orbit it copied (RouteStop.orbit; none is the slot's own).
-  // Radius and phase both: back at an altitude flown before, it is not
-  // where it was then.
-  const live = deps.station?.orbit;
-  const copied = deps.stop.orbit;
-  const climbed = planetId !== undefined && (!live !== !copied || (!!live && !!copied
-    && (Math.abs(live.radiusKm - copied.radiusKm) > 1e-6 || Math.abs(wrapAngle(live.phase0 - copied.phase0)) > 1e-9)));
-  if (planetId !== undefined && (planetId !== deps.stop.planetId || climbed)) {
+  // 🚚🎚️ The stop's station has left the orbit the route copied
+  // (stopStationMoved): no gate is in reach. Every gate counts as that
+  // refusal, unasked, and the stop is skipped.
+  if (stopStationMoved(deps.stop, deps.station)) {
     const gone = (berth: StationBerth): KeeperGateResult => ({ kind: 'refused', berth, reason: 'moving', cls: 'gone' });
     const results = (berths.length > 0 ? berths : [ownStopBerth(deps.stop, remembered?.address ?? '')]).map(gone);
     return { verdict: passVerdict(results, own), results, own };

@@ -448,6 +448,25 @@ describe('a station in the next orbit', () => {
     });
   }
 
+  for (const parked of [false, true]) {
+    it(`keeps a ${parked ? 'parked' : 'stopped'} ship with the nearer of two stations both within its docking zone`, () => {
+      const near = { room: A.room, along: 0, radial: 1 };
+      const at = pointOff(A.pointAt(T0), 0, 1);
+      const pose: FreePose = { planetId: SOV, at: T0, radiusKm: at.radiusKm, angle: at.angle, vAlong: 0, vRadial: 0, heading: 0, near, ...(parked ? { parked: true as const } : {}) };
+      // C sits 1.5 km from the ship: inside its docking zone, but farther than A.
+      const cAt = pointOff(A.pointAt(T0), 0, 2.5);
+      const C: FreeStation = { id: 'c', room: 'room-c', name: 'C', pointAt: () => cAt };
+      const once = applyZones(pose, [A, C]);
+      expect(once.changed).toBe(false);
+      expect(once.pose.near?.room).toBe('room-a');
+      // Nearer than A (0.5 km off), C takes it.
+      const cClose = pointOff(A.pointAt(T0), 0, 1.5);
+      const taken = applyZones(pose, [A, { ...C, pointAt: () => cClose }]);
+      expect(taken.pose.near?.room).toBe('room-c');
+      expect(taken.pose.parked).toBeUndefined();
+    });
+  }
+
   it('keeps a stopped ship in A\'s frame while B is far off', () => {
     const { pose } = coastTo(held(false), T0 + 60_000, [A, B]);
     expect(pose.near?.room).toBe('room-a');
