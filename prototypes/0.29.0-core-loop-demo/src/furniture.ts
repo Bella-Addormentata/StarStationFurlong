@@ -27,6 +27,7 @@
 import * as THREE from "three";
 import type { Seat } from "./seats";
 import type {
+  DepartureScreen,
   DeviceTarget,
   DeviceTemplate,
   WallComputerStatus,
@@ -126,6 +127,7 @@ export type FurnitureKind =
   | "birthday-balloons"
   | "birthday-balloons-wall"
   | "wall-computer"
+  | "departures-board"
   | "map-table"
   | "storage-trunk"
   | "game-table"
@@ -1855,6 +1857,160 @@ const buildWallComputer = (ctx: BuildCtx) => {
   };
   // Boot frame so the prop is never a black rectangle before the first tick.
   drawStatus(lastStatus);
+  screen.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
+};
+
+// ── 🚏📋 Departures board (robot pilot routes, design §5 + §5a) ─────────────
+// The wall computer's WIDE variant: the same slate housing, bezel and gold
+// strip, twice as wide, with the same live CanvasTexture screen path (a
+// WallScreenHandle on userData.wallScreen, redrawn only by World's ~1 Hz
+// loop). The handle says `departures: true`, so World adds this board's rows
+// (devices.readDepartureScreen) to the status it pushes; a plain terminal's
+// status carries none. It is a DISPLAY, not a terminal: its device is the
+// board's own console (what it shows: all gates, or one), never the EDIT
+// ROOM entry, so it is removable like any furniture.
+const DB_W = 1.8; // housing width
+const DB_H = 0.7; // housing height (the wall computer's)
+const DB_D = 0.12;
+const DB_Y = 1.6; // mount height (the wall computer's)
+const DB_CW = 512; // canvas px
+const DB_CH = 160;
+/** Row pitch and first baseline on the board canvas: six rows sit between
+ *  the column heads and the notes footer. */
+const DB_ROW_PITCH = 15;
+const DB_ROW_TOP = 56;
+/** Rows the screen draws: every row a board can hold (departuresBoard
+ *  MAX_BOARD_ROWS, pinned by departuresBoard.test.ts). */
+export const DB_SCREEN_ROWS = 6;
+
+const buildDeparturesBoard = (ctx: BuildCtx) => {
+  const { m, place } = ctx;
+  const HOUSING = 0x2a3444;
+  const BEZEL = 0x3d4a5e;
+  const ACCENT = 0xd4a84b;
+  place(new THREE.BoxGeometry(DB_W, DB_H, DB_D - 0.04), m(HOUSING, 0.6, 0.5), 0, DB_Y, -0.02); // housing
+  place(new THREE.BoxGeometry(DB_W - 0.08, 0.6, 0.03), m(BEZEL, 0.55, 0.45), 0, DB_Y + 0.02, DB_D / 2 - 0.015); // bezel
+  place(new THREE.BoxGeometry(DB_W, 0.05, 0.03), m(ACCENT, 0.4, 0.5), 0, DB_Y - DB_H / 2 + 0.025, DB_D / 2 - 0.015); // gold strip
+  place(new THREE.BoxGeometry(0.3, 0.06, 0.02), m(HOUSING, 0.6, 0.5), 0, DB_Y - DB_H / 2 + 0.025, DB_D / 2 + 0.001); // badge
+
+  const cv = document.createElement("canvas");
+  cv.width = DB_CW;
+  cv.height = DB_CH;
+  const c2d = cv.getContext("2d")!;
+  const tex = new THREE.CanvasTexture(cv);
+  tex.minFilter = THREE.NearestFilter;
+  tex.magFilter = THREE.NearestFilter;
+  tex.generateMipmaps = false;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 0 });
+  const screen = place(new THREE.PlaneGeometry(DB_W - 0.18, 0.5), mat, 0, DB_Y + 0.02, DB_D / 2 + 0.002);
+
+  const tone = (status: string): string =>
+    status === "BOARDING" || status === "ON TIME" ? "#00E676" : status === "ROUTE BLOCKED" ? "#FF1744" : "#FFB300";
+  const clip = (text: string, n: number): string => (text.length > n ? `${text.slice(0, n - 1)}…` : text);
+
+  const draw = (board: DepartureScreen | undefined) => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = "#0A1018";
+    c2d.fillRect(0, 0, DB_CW, DB_CH);
+    c2d.strokeStyle = "#1E2A38";
+    c2d.strokeRect(3.5, 3.5, DB_CW - 7, DB_CH - 7);
+    c2d.textBaseline = "alphabetic";
+    // Header: the board's title (amber) and the local clock (the boards and
+    // the helm show the exact second, design §5).
+    c2d.font = "bold 13px monospace";
+    c2d.textAlign = "left";
+    c2d.fillStyle = "#D4A84B";
+    c2d.fillText(clip((board?.title ?? "DEPARTURES").toUpperCase(), 40), 12, 21);
+    const now = new Date();
+    c2d.textAlign = "right";
+    c2d.fillText(
+      [now.getHours(), now.getMinutes(), now.getSeconds()].map((n) => String(n).padStart(2, "0")).join(":"),
+      DB_CW - 12,
+      21,
+    );
+    c2d.strokeStyle = "#D4A84B";
+    c2d.beginPath();
+    c2d.moveTo(12, 28);
+    c2d.lineTo(DB_CW - 12, 28);
+    c2d.stroke();
+    // Column heads.
+    c2d.textAlign = "left";
+    c2d.font = "9px monospace";
+    c2d.fillStyle = "#4A5560";
+    const COL = { ferry: 12, place: 128, gate: 262, time: 300, status: 372 };
+    c2d.fillText("FERRY", COL.ferry, 41);
+    c2d.fillText("TO / FROM", COL.place, 41);
+    c2d.fillText("GATE", COL.gate, 41);
+    c2d.fillText("TIME", COL.time, 41);
+    c2d.fillText("STATUS", COL.status, 41);
+    const rows = board?.rows ?? [];
+    if (rows.length === 0) {
+      c2d.font = "bold 12px monospace";
+      c2d.fillStyle = "#4A5560";
+      c2d.fillText(board?.empty ?? "NO DEPARTURES NEWS", 12, 72);
+    }
+    const shown = rows.slice(0, DB_SCREEN_ROWS);
+    shown.forEach((r, i) => {
+      const y = DB_ROW_TOP + i * DB_ROW_PITCH;
+      c2d.font = "bold 11px monospace";
+      c2d.fillStyle = "#F0C060";
+      c2d.fillText(clip(r.ferry, 16), COL.ferry, y);
+      c2d.font = "11px monospace";
+      c2d.fillStyle = "#D4A84B";
+      c2d.fillText(clip(r.place, 18), COL.place, y);
+      c2d.fillStyle = "#00E5FF";
+      c2d.fillText(r.gate, COL.gate, y);
+      c2d.fillStyle = "#8FA3B8";
+      c2d.fillText(r.time, COL.time, y);
+      c2d.font = "bold 11px monospace";
+      c2d.fillStyle = tone(r.status);
+      c2d.fillText(r.status, COL.status, y);
+    });
+    // Footer: the rows' notes in turn ("since 14:03:10 · leaves at least
+    // 1 min after it docks", "now 14:11:11", "as of 14:02").
+    const notes = shown.filter((r) => r.note).map((r) => `${r.ferry}: ${r.note}`);
+    c2d.font = "9px monospace";
+    c2d.fillStyle = "#8FA3B8";
+    if (notes.length > 0) {
+      c2d.fillText(clip(notes[Math.floor(Date.now() / 4000) % notes.length].toUpperCase(), 82), 12, DB_CH - 12);
+    } else {
+      c2d.fillStyle = "#33404E";
+      c2d.fillText("SSF DEPARTURES v1", 12, DB_CH - 12);
+    }
+    tex.needsUpdate = true;
+  };
+
+  const drawInUse = () => {
+    c2d.imageSmoothingEnabled = false;
+    c2d.fillStyle = "#060A10";
+    c2d.fillRect(0, 0, DB_CW, DB_CH);
+    c2d.strokeStyle = "#1E2A38";
+    c2d.strokeRect(3.5, 3.5, DB_CW - 7, DB_CH - 7);
+    c2d.font = "bold 14px monospace";
+    c2d.textAlign = "center";
+    c2d.textBaseline = "middle";
+    c2d.fillStyle = "rgba(212, 168, 75, 0.45)";
+    c2d.fillText("BOARD IN USE", DB_CW / 2, DB_CH / 2);
+    tex.needsUpdate = true;
+  };
+
+  let engaged = false;
+  let last: DepartureScreen | undefined;
+  const handle: WallScreenHandle = {
+    departures: true,
+    updateStatus: (status) => {
+      last = status.departures;
+      if (engaged) drawInUse();
+      else draw(last);
+    },
+    setEngaged: (value) => {
+      engaged = value;
+      if (engaged) drawInUse();
+      else draw(last);
+    },
+  };
+  draw(undefined);
   screen.userData.wallScreen = handle; // collected by registerFurnitureHandles (furnitureHandles.ts)
 };
 
@@ -3618,6 +3774,23 @@ export const FURNITURE_DEFS: Record<FurnitureKind, FurnitureDef> = {
       front: { x: 0, z: 1.0 },
       faceAngle: Math.PI,
       eye: { x: 0, y: 1.45, z: 0.85 },
+      anchor: { x: 0, y: 1.62, z: 0.06 },
+    },
+  },
+  // 🚏📋 Departures board (robot pilot routes, §5a): the wall computer's wide
+  // variant. Wall-mounted, never an obstacle; its device is the board's own
+  // console (All gates / Gate N), not a room terminal, so it can be removed.
+  "departures-board": {
+    kind: "departures-board",
+    build: buildDeparturesBoard,
+    footprint: null,
+    wallMount: { halfW: DB_W / 2 },
+    functions: ["departuresBoard"],
+    device: {
+      kind: "departuresBoard",
+      front: { x: 0, z: 1.3 },
+      faceAngle: Math.PI,
+      eye: { x: 0, y: 1.5, z: 1.25 },
       anchor: { x: 0, y: 1.62, z: 0.06 },
     },
   },

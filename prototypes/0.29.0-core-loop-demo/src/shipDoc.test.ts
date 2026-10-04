@@ -18,26 +18,42 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { DEFAULT_STATIONS, setStationDirectory } from './stationDirectory';
+import { DEFAULT_STATIONS, adriftAt, setStationDirectory } from './stationDirectory';
 import {
+  CAST_OFF_HOLD_MS,
+  CAST_OFF_RENEW_MS,
   DESTINATIONS,
   TANK_CAPACITY,
+  UNDOCK_HOLD_MS,
+  UNDOCK_RENEW_MS,
   bindShipDoc,
   canDepart,
+  castOffHeldBy,
   clampFuelToCapacity,
   defaultFlight,
+  endUndockHold,
   findDestination,
   flightArrived,
   flightProgress,
+  flightWritePath,
+  holdCastOff,
+  holdUndock,
   isFlightRecord,
   isLegalFlightTransition,
   pairingAllowedByFlight,
+  readCastOffHold,
   readFlightRecord,
   readFuelLevel,
+  readRestPlace,
+  releaseCastOff,
+  renewCastOff,
+  renewUndockHold,
   shipDocBound,
   subscribeShip,
+  undockHeld,
   writeFlightRecord,
   writeFuelLevel,
+  writeRestPlace,
 } from './shipDoc';
 
 // ── Fixture helpers ──────────────────────────────────────────────────────────
@@ -339,8 +355,16 @@ describe('shipDoc flight record', () => {
     expect(isLegalFlightTransition('redocking', 'docked')).toBe(true);
     expect(isLegalFlightTransition('redocking', 'in-flight')).toBe(true);
     expect(isLegalFlightTransition('redocking', 'undocking')).toBe(false);
+    // 🕹️ Flown by hand (issue 203): in from docked, out only through
+    // redocking (AUTO-DOCK).
+    expect(isLegalFlightTransition('docked', 'free-flight')).toBe(true);
+    expect(isLegalFlightTransition('free-flight', 'redocking')).toBe(true);
+    expect(isLegalFlightTransition('free-flight', 'docked')).toBe(false);
+    expect(isLegalFlightTransition('free-flight', 'in-flight')).toBe(false);
+    expect(isLegalFlightTransition('in-flight', 'free-flight')).toBe(false);
+    expect(isLegalFlightTransition('redocking', 'free-flight')).toBe(false);
     // Idempotent self-transitions always legal (an owner republish).
-    for (const s of ['docked', 'undocking', 'in-flight', 'redocking'] as const) {
+    for (const s of ['docked', 'undocking', 'in-flight', 'redocking', 'free-flight'] as const) {
       expect(isLegalFlightTransition(s, s)).toBe(true);
     }
   });
@@ -817,6 +841,33 @@ describe('flight records written on another install', () => {
   });
 });
 
+describe('rest records written on another install', () => {
+  it('name the station the ship rests beside by its portable id, read back as this install\'s', () => {
+    const rooms: Record<string, string> = { 'high-orbit': 'room-high', 'furlong-station': 'r'.repeat(130) };
+    const back: Record<string, string> = { 'shared:room-high': 'high-orbit' };
+    setStationDirectory({
+      stations: () => DEFAULT_STATIONS,
+      resolve: (id) => back[id] ?? null,
+      portable: (id) => (rooms[id] ? `shared:${rooms[id]}` : null),
+    });
+    try {
+      const doc = freshDoc();
+      const at = adriftAt('planet-aris', 2);
+      expect(writeRestPlace({ at, since: 5, from: 'high-orbit' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 5, from: 'shared:room-high' });
+      expect(readRestPlace()).toEqual({ at, since: 5, from: 'high-orbit' });
+      // No portable id, or one too long for the wire: the id as it is.
+      expect(writeRestPlace({ at, since: 6, from: 'l4-anchorage' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 6, from: 'l4-anchorage' });
+      expect(writeRestPlace({ at, since: 7, from: 'furlong-station' })).toBe(true);
+      expect(doc.getMap('ship').get('rest')).toEqual({ at, since: 7, from: 'furlong-station' });
+      expect(readRestPlace()).toEqual({ at, since: 7, from: 'furlong-station' });
+    } finally {
+      setStationDirectory(null);
+    }
+  });
+});
+
 describe('flight times a peer wrote', () => {
   it('refuses unsafe, far-future or endless flights', () => {
     const now = Date.now();
@@ -825,5 +876,214 @@ describe('flight times a peer wrote', () => {
     expect(isFlightRecord({ ...rec, departedAt: 1, etaAt: Number.MAX_VALUE })).toBe(false);
     expect(isFlightRecord({ ...rec, departedAt: now, etaAt: now + 3 * 24 * 3600 * 1000 })).toBe(false);
     expect(isFlightRecord({ ...rec, departedAt: 0.5, etaAt: 2 })).toBe(false);
+  });
+});
+
+// ── 🚏 Ferry routes (build notes A4) ─────────────────────────────────────────
+
+describe('canDepart — a running ferry route', () => {
+  const base = {
+    flightCapable: true,
+    currentStatus: 'docked' as const,
+    currentFuel: 100,
+    destinationId: HIGH_ORBIT.id,
+    chainedDoors: [] as readonly string[],
+    ownerAuthorized: true,
+  };
+
+  it('refuses a hand DEPART while the timetable flies the ship, after the owner and fittings checks', () => {
+    expect(canDepart({ ...base, routeRunning: true })).toEqual({ ok: false, reason: 'route-running' });
+    expect(canDepart({ ...base, routeRunning: true, currentStatus: 'in-flight' })).toEqual({ ok: false, reason: 'route-running' });
+    expect(canDepart({ ...base, routeRunning: true, ownerAuthorized: false })).toEqual({ ok: false, reason: 'no-owner' });
+    expect(canDepart({ ...base, routeRunning: false })).toEqual({ ok: true });
+  });
+});
+
+describe('flightWritePath — copying a derived flight back along legal edges', () => {
+  const docked = { status: 'docked' as const, locationId: HIGH_ORBIT.id };
+  const inFlight = { status: 'in-flight' as const, locationId: HOME.id, destinationId: HIGH_ORBIT.id, departedAt: 1_000, etaAt: 56_000 };
+
+  it('one record when the edge is legal, or nothing is stored', () => {
+    expect(flightWritePath(null, docked)).toEqual([docked]);
+    expect(flightWritePath({ status: 'docked', locationId: HOME.id }, docked)).toEqual([docked]);
+    expect(flightWritePath({ status: 'redocking', locationId: HIGH_ORBIT.id }, docked)).toEqual([docked]);
+    expect(flightWritePath({ status: 'undocking', locationId: HOME.id, destinationId: L4.id }, docked)).toEqual([docked]);
+    expect(flightWritePath({ status: 'docked', locationId: HOME.id }, inFlight)).toEqual([inFlight]);
+  });
+
+  it('🕹️ free flight reaches docked through redocking', () => {
+    const free = { status: 'free-flight' as const, locationId: HOME.id };
+    expect(flightWritePath(free, docked)).toEqual([{ status: 'redocking', locationId: HIGH_ORBIT.id }, docked]);
+    expect(isFlightRecord(free)).toBe(true);
+    // Free flight names no destination and keeps no flight times.
+    const doc = freshDoc();
+    writeFlightRecord({ status: 'docked', locationId: HOME.id });
+    expect(writeFlightRecord({ ...free, destinationId: L4.id, departedAt: 1_000, etaAt: 2_000 })).toBe(true);
+    expect(readFlightRecord()).toEqual(free);
+    expect(pairingAllowedByFlight(readFlightRecord()).ok).toBe(false);
+    doc.destroy();
+  });
+
+  it('in-flight reaches docked only through redocking, arrived where the target is', () => {
+    expect(flightWritePath(inFlight, docked)).toEqual([
+      { status: 'redocking', locationId: HIGH_ORBIT.id, etaAt: 56_000 },
+      docked,
+    ]);
+    const undocking = { status: 'undocking' as const, locationId: HIGH_ORBIT.id, destinationId: L4.id };
+    expect(flightWritePath(inFlight, undocking).map((r) => r.status)).toEqual(['redocking', 'docked', 'undocking']);
+  });
+
+  it('no path that would need an in-flight record the target does not carry', () => {
+    expect(flightWritePath({ status: 'docked', locationId: HOME.id }, { status: 'redocking', locationId: HIGH_ORBIT.id })).toEqual([]);
+  });
+
+  it('every path writes through writeFlightRecord\'s transition gate, from every stored status', () => {
+    const stored = [
+      { status: 'docked' as const, locationId: HOME.id },
+      { status: 'undocking' as const, locationId: HOME.id, destinationId: L4.id },
+      inFlight,
+      { status: 'redocking' as const, locationId: HIGH_ORBIT.id, etaAt: 56_000 },
+    ];
+    for (const from of stored) {
+      const doc = freshDoc();
+      hostileSetFlight(doc, from);
+      const path = flightWritePath(readFlightRecord(), docked);
+      expect(path.length).toBeGreaterThan(0);
+      doc.transact(() => {
+        for (const rec of path) expect(writeFlightRecord(rec)).toBe(true);
+      });
+      expect(readFlightRecord()).toEqual(docked);
+    }
+  });
+});
+
+describe('a DEPART under way — the shared cast-off hold', () => {
+  const NOW = 1_000_000;
+
+  it('holds DEPART for every helm but the one that took it, until that one ends it', () => {
+    freshDoc();
+    expect(readCastOffHold(NOW)).toBeNull();
+    expect(holdCastOff('a', NOW)).toBe(true);
+    expect(readCastOffHold(NOW + 1)).toEqual({ by: 'a', at: NOW });
+    // Another helm cannot take it, and its end leaves this one alone.
+    expect(holdCastOff('b', NOW + 1)).toBe(false);
+    releaseCastOff('b');
+    expect(castOffHeldBy('a', NOW + 1)).toBe(true);
+    expect(castOffHeldBy('b', NOW + 1)).toBe(false);
+    releaseCastOff('a');
+    expect(readCastOffHold(NOW + 2)).toBeNull();
+    expect(holdCastOff('b', NOW + 2)).toBe(true);
+  });
+
+  it('runs out CAST_OFF_HOLD_MS after it was taken, and no peer stamps one that lasts longer', () => {
+    const doc = freshDoc();
+    expect(holdCastOff('a', NOW)).toBe(true);
+    expect(castOffHeldBy('a', NOW + CAST_OFF_HOLD_MS - 1)).toBe(true);
+    expect(readCastOffHold(NOW + CAST_OFF_HOLD_MS)).toBeNull();
+    expect(holdCastOff('b', NOW + CAST_OFF_HOLD_MS)).toBe(true);
+    // Its own end leaves the hold taken since alone.
+    releaseCastOff('a');
+    expect(castOffHeldBy('b', NOW + CAST_OFF_HOLD_MS)).toBe(true);
+    // Stamped further ahead than a hold lasts (a skewed clock, a hostile
+    // peer): none.
+    doc.getMap('ship').set('castOff', { by: 'x', at: NOW + 2 * CAST_OFF_HOLD_MS });
+    expect(readCastOffHold(NOW)).toBeNull();
+    for (const junk of [null, 'a', { by: '', at: NOW }, { by: 'x'.repeat(200), at: NOW }, { by: 'x', at: Number.NaN }]) {
+      doc.getMap('ship').set('castOff', junk as any);
+      expect(readCastOffHold(NOW)).toBeNull();
+    }
+  });
+
+  it('of two helms taking it at once, keeps one on both: only that DEPART still holds it', () => {
+    const docA = new Y.Doc();
+    const docB = new Y.Doc();
+    bindShipDoc(docA);
+    expect(holdCastOff('a', NOW)).toBe(true);
+    bindShipDoc(docB);
+    expect(holdCastOff('b', NOW)).toBe(true);
+    Y.applyUpdate(docA, Y.encodeStateAsUpdate(docB));
+    Y.applyUpdate(docB, Y.encodeStateAsUpdate(docA));
+    const kept = readCastOffHold(NOW + 1)?.by;
+    expect(['a', 'b']).toContain(kept);
+    bindShipDoc(docA);
+    expect(readCastOffHold(NOW + 1)?.by).toBe(kept);
+    expect(castOffHeldBy(kept === 'a' ? 'b' : 'a', NOW + 1)).toBe(false);
+    docA.destroy();
+    docB.destroy();
+  });
+
+  it('stays in force while its DEPART renews it, and only the hold that DEPART still has', () => {
+    freshDoc();
+    expect(CAST_OFF_RENEW_MS).toBeLessThan(CAST_OFF_HOLD_MS);
+    expect(holdCastOff('a', NOW)).toBe(true);
+    // Renewed on its beat, it outlasts CAST_OFF_HOLD_MS from when it was taken.
+    let t = NOW;
+    for (let i = 0; i < 6; i++) {
+      t += CAST_OFF_RENEW_MS;
+      expect(renewCastOff('a', t)).toBe(true);
+    }
+    expect(t).toBeGreaterThan(NOW + CAST_OFF_HOLD_MS);
+    expect(castOffHeldBy('a', t + CAST_OFF_HOLD_MS - 1)).toBe(true);
+    // Another helm's renewal takes nothing.
+    expect(renewCastOff('b', t)).toBe(false);
+    expect(castOffHeldBy('a', t)).toBe(true);
+    // One that ran out is not taken back, nor one ended.
+    expect(renewCastOff('a', t + CAST_OFF_HOLD_MS)).toBe(false);
+    expect(readCastOffHold(t + CAST_OFF_HOLD_MS)).toBeNull();
+    expect(holdCastOff('a', t + CAST_OFF_HOLD_MS)).toBe(true);
+    releaseCastOff('a');
+    expect(renewCastOff('a', t + CAST_OFF_HOLD_MS + 1)).toBe(false);
+    expect(readCastOffHold(t + CAST_OFF_HOLD_MS + 1)).toBeNull();
+  });
+});
+
+describe('an UNDOCK under way — the shared hold on its release', () => {
+  const NOW = 1_000_000;
+
+  it('holds the release it names until that UNDOCK has its answer, or runs out', () => {
+    const doc = freshDoc();
+    expect(undockHeld('east', NOW, NOW)).toBe(false);
+    expect(holdUndock('east', NOW, NOW)).toBe(true);
+    expect(undockHeld('east', NOW, NOW + 1)).toBe(true);
+    // Only that release, on that door.
+    expect(undockHeld('east', NOW - 1, NOW + 1)).toBe(false);
+    expect(undockHeld('west', NOW, NOW + 1)).toBe(false);
+    // Another release's end leaves it alone; its own ends it.
+    endUndockHold('east', NOW - 1);
+    expect(undockHeld('east', NOW, NOW + 1)).toBe(true);
+    endUndockHold('east', NOW);
+    expect(undockHeld('east', NOW, NOW + 1)).toBe(false);
+    // Not renewed, it runs out UNDOCK_HOLD_MS after it was taken.
+    expect(holdUndock('east', NOW, NOW)).toBe(true);
+    expect(undockHeld('east', NOW, NOW + UNDOCK_HOLD_MS - 1)).toBe(true);
+    expect(undockHeld('east', NOW, NOW + UNDOCK_HOLD_MS)).toBe(false);
+    // Stamped further ahead than a hold lasts, or junk: none.
+    doc.getMap('ship').set('undock:east', { undockedAt: NOW, at: NOW + 2 * UNDOCK_HOLD_MS });
+    expect(undockHeld('east', NOW, NOW)).toBe(false);
+    for (const junk of [null, 'a', { undockedAt: NOW }, { undockedAt: 'x', at: NOW }, { undockedAt: NOW, at: Number.NaN }]) {
+      doc.getMap('ship').set('undock:east', junk as any);
+      expect(undockHeld('east', NOW, NOW)).toBe(false);
+    }
+  });
+
+  it('stays in force while its UNDOCK renews it, and only a hold still in force', () => {
+    freshDoc();
+    expect(UNDOCK_RENEW_MS).toBeLessThan(UNDOCK_HOLD_MS);
+    expect(holdUndock('east', NOW, NOW)).toBe(true);
+    let t = NOW;
+    for (let i = 0; i < 6; i++) {
+      t += UNDOCK_RENEW_MS;
+      expect(renewUndockHold('east', NOW, t)).toBe(true);
+    }
+    expect(t).toBeGreaterThan(NOW + UNDOCK_HOLD_MS);
+    expect(undockHeld('east', NOW, t + UNDOCK_HOLD_MS - 1)).toBe(true);
+    // Another release's renewal takes nothing; one that ran out stays out.
+    expect(renewUndockHold('east', NOW + 1, t)).toBe(false);
+    expect(renewUndockHold('east', NOW, t + UNDOCK_HOLD_MS)).toBe(false);
+    expect(undockHeld('east', NOW, t + UNDOCK_HOLD_MS)).toBe(false);
+    // Nor does another room's doc take one up.
+    freshDoc();
+    expect(renewUndockHold('east', NOW, t)).toBe(false);
+    expect(undockHeld('east', NOW, t)).toBe(false);
   });
 });

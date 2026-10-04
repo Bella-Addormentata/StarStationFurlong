@@ -9,7 +9,10 @@
 
 import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
-import { angleAt, stationOrbit } from './orbits';
+import { angleAt, baseOrbit, realMsFor, slotPosition, stationOrbit } from './orbits';
+import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
+import { describeMove, moveTransitPointAt, orbitChangePlanOf, stationPointWithMoveAt } from './stationMove';
+import type { StationMove } from './stations';
 
 export interface MapBody {
   id: string;
@@ -24,6 +27,14 @@ export interface MapBody {
   /** 🪐 When set, the body's true angle at a real time (orbits.ts) — replaces
    *  angle + orbitSpeed·tick, so every client draws it in the same place. */
   angleAt?: (nowMs: number) => number;
+  /** 🚚 When set, the body's whole place at a real time — which body it goes
+   *  round (none: the sun) and where. A station moving between planets
+   *  (stationMove.ts) leaves its planet for the sun and joins another. */
+  placeAt?: (nowMs: number) => { parentId?: string; angle: number; radius: number };
+  /** 🚚 A moving station's course around the sun, burn to arrival: points
+   *  where placeAt puts it on the way (sun-centred, like placeAt's), drawn
+   *  until `until` (its arrival). */
+  course?: { until: number; points: Array<{ angle: number; radius: number }> };
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
@@ -57,25 +68,126 @@ function formatSpan(ms: number): string {
  * from the shared orbital clock; slot 0 starts where the single hard-coded
  * Furlong body always stood.
  */
-export function stationBodies(stations: StationRecord[]): MapBody[] {
+export function stationBodies(stations: StationRecord[], nowMs: number = Date.now()): MapBody[] {
   return stations.map((s) => {
     const orbit = stationOrbit(s);
     const readout = `${Math.round(orbit.altitudeKm).toLocaleString('en-US')} km up · ${orbit.speedKmS.toFixed(2)} km/s · `
       + `one orbit every ${formatSpan((orbit.periodS / 60) * 1000)}.`;
+    const moving = s.move ? ` ${describeMove(s.move, nowMs)}` : '';
     return {
       id: s.id,
       name: s.name,
       type: 'station' as const,
       parentId: orbit.planet.id,
-      orbitRadius: STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP,
+      // 🎚️ Spaced by altitude: a slot's orbit at its slot's ring, an altitude
+      // between two slots between their rings.
+      orbitRadius: schematicRadius(baseOrbit(s).planet.id, baseOrbit(s).radiusKm),
       orbitSpeed: 0,
       angle: orbit.phase0,
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
-      description: s.id === DEFAULT_STATION_ID
+      ...(s.move ? { placeAt: movingPlace(s, s.move) } : {}),
+      ...(s.move && nowMs < s.move.arriveAt ? moveCourse(s.move) : {}),
+      description: (s.id === DEFAULT_STATION_ID
         ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
-        : `Station around ${orbit.planet.name}: ${readout}`,
+        : `Station around ${orbit.planet.name}: ${readout}`) + moving,
     };
   });
+}
+
+/** Holotable radius of a sun-centred distance: the planets' schematic scale
+ *  (Sovereign II, at 1 AU, is drawn at 180). */
+const MAP_PER_AU = 180;
+
+/** The holotable ring of an orbit `radiusKm` from a planet's centre: slot
+ *  rings STATION_ORBIT_STEP apart, an altitude between two slots between
+ *  their rings (never inside the planet's own ring). */
+function schematicRadius(planetId: string, radiusKm: number): number {
+  return STATION_ORBIT_BASE + Math.max(-2, slotPosition(planetId, radiusKm)) * STATION_ORBIT_STEP;
+}
+
+/** Where a moving station is drawn: around its old planet until the burn,
+ *  on its course around the sun (the transfer ellipse, or a tug's straight
+ *  torch run), then around its new planet. 🎚️ An altitude change stays
+ *  around its planet, sliding between the two rings on its transfer. */
+function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['placeAt']> {
+  const change = orbitChangePlanOf(move);
+  if (change) {
+    const planetId = change.from.planet.id;
+    return (nowMs: number) => {
+      const p = stationPointWithMoveAt(s, nowMs);
+      return { parentId: planetId, angle: p.angle, radius: schematicRadius(planetId, p.radiusKm) };
+    };
+  }
+  // Until the burn it is the station it always was: its id keeps its trim,
+  // 🎚️ on the altitude the list says it keeps until it leaves (the move's
+  // fromOrbit, unless another station's claim beat it), if any.
+  const held = s.orbit;
+  // A cancelled move keeps it for good (stations.orbitAfterMove).
+  const cancelled = !!move.settles && move.departAt < move.settles.arriveAt;
+  const fromStation = {
+    id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot,
+    ...(held ? { orbit: { radiusKm: held.radiusKm, phase0: held.phase0 } } : {}),
+  };
+  const from = stationOrbit(fromStation);
+  const fromBase = baseOrbit(fromStation);
+  const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });
+  const slotRadius = (slot: number) => STATION_ORBIT_BASE + slot * STATION_ORBIT_STEP;
+  return (nowMs: number) => {
+    const p = moveTransitPointAt(move, nowMs);
+    if (p) return { angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU };
+    if (nowMs >= move.arriveAt && !(held && cancelled)) {
+      return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
+    }
+    return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: schematicRadius(fromBase.planet.id, fromBase.radiusKm) };
+  };
+}
+
+/** Points along a drawn course: enough that a transfer ellipse reads as a
+ *  curve at any zoom the holotable allows. */
+const COURSE_SAMPLES = 64;
+
+/** A move's course, sampled where the marker flies (moveTransitPointAt, at
+ *  the planets' map scale), burn to arrival; nothing for a move that crosses
+ *  no space (a pin, or one planet under two ids). */
+function moveCourse(move: StationMove): Pick<MapBody, 'course'> {
+  const points: Array<{ angle: number; radius: number }> = [];
+  const span = move.arriveAt - move.departAt;
+  for (let i = 0; i <= COURSE_SAMPLES; i++) {
+    // The last point is the last moment in transit: arrival is a planet's.
+    const p = moveTransitPointAt(move, Math.min(move.arriveAt - 1, move.departAt + (span * i) / COURSE_SAMPLES));
+    if (p) points.push({ angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU });
+  }
+  return points.length > 1 ? { course: { until: move.arriveAt, points } } : {};
+}
+
+/** Where a body's course runs on screen (the sun at the centre given, at the
+ *  map's scale): none once it has arrived, nor for a body with no course. */
+export function courseOnScreen(
+  body: MapBody,
+  nowMs: number,
+  centerX: number,
+  centerY: number,
+  scale: number,
+): Array<{ x: number; y: number }> {
+  if (!body.course || nowMs >= body.course.until) return [];
+  return body.course.points.map((p) => {
+    const { dx, dy } = screenOffset(p.angle, p.radius * scale);
+    return { x: centerX + dx, y: centerY + dy };
+  });
+}
+
+/** ☀️ A planet's true angle around the sun on the shared clock
+ *  (solarOrbits.ts). The holotable keeps its schematic distances. */
+function planetAngleAt(planetId: string): (nowMs: number) => number {
+  const orbit = planetSunOrbit(planetId);
+  return (nowMs: number) => sunAngleAt(orbit, nowMs);
+}
+
+/** "One year every 6d 02h" — a planet's real-time year for the readout. */
+function yearReadout(planetId: string): string {
+  const ms = realMsFor(planetSunOrbit(planetId).periodS);
+  const h = Math.round(ms / 3_600_000);
+  return `One year every ${Math.floor(h / 24)}d ${String(h % 24).padStart(2, '0')}h.`;
 }
 
 export class SolarSystemMap {
@@ -107,12 +219,14 @@ export class SolarSystemMap {
   
   // Callbacks
   private onTravelCompleteCallback: ((destinationId: string) => void) | null = null;
+  private onStationAtlasCallback: ((stationId: string) => void) | null = null;
 
   constructor() {
     this.initializeBodies();
   }
 
   private initializeBodies() {
+    const sovereignAngle = planetAngleAt('planet-sovereign');
     this.bodies = [
       {
         id: 'star-sol',
@@ -128,9 +242,10 @@ export class SolarSystemMap {
         name: 'ARIS PRIME',
         type: 'planet',
         orbitRadius: 100,
-        orbitSpeed: 0.002,
+        orbitSpeed: 0,
         angle: 0.5,
-        description: 'Lava-rich dense inner planet. Rich in heavy iron ore pockets.',
+        angleAt: planetAngleAt('planet-aris'),
+        description: `Lava-rich dense inner planet. Rich in heavy iron ore pockets. ${yearReadout('planet-aris')}`,
         resources: [{ type: 'Iron Ore', yield: 800 }],
       },
       {
@@ -138,11 +253,10 @@ export class SolarSystemMap {
         name: 'SOVEREIGN II',
         type: 'planet',
         orbitRadius: 180,
-        orbitSpeed: 0.0012,
-        semiMajorAxis: 180,
-        eccentricity: 0.15, // Elliptical Orbit
+        orbitSpeed: 0,
         angle: 1.2,
-        description: 'Carbon-silica rich terra planet holding Furlong System main station.',
+        angleAt: sovereignAngle,
+        description: `Carbon-silica rich terra planet holding Furlong System main station. ${yearReadout('planet-sovereign')}`,
         resources: [{ type: 'Silica', yield: 1200 }],
       },
       ...stationBodies(listStations()),
@@ -150,10 +264,10 @@ export class SolarSystemMap {
         id: 'lagrange-l4',
         name: 'SOVEREIGN L4 APEX',
         type: 'lagrange',
-        parentId: 'planet-sovereign',
-        orbitRadius: 180,
-        orbitSpeed: 0.0012, // Co-orbital with parent
+        orbitRadius: 180, // On Sovereign's orbit around the sun
+        orbitSpeed: 0,
         angle: 1.2 + (Math.PI / 3.0), // 60 degrees ahead (stable Lagrange L4)
+        angleAt: (nowMs: number) => sovereignAngle(nowMs) + Math.PI / 3,
         lagrangePoint: 'L4',
         description: 'Gravitationally stable Lagrange co-orbital pocket. Ideal for modular outposts.',
       },
@@ -161,10 +275,10 @@ export class SolarSystemMap {
         id: 'lagrange-l5',
         name: 'SOVEREIGN L5 REFUGE',
         type: 'lagrange',
-        parentId: 'planet-sovereign',
-        orbitRadius: 180,
-        orbitSpeed: 0.0012, // Co-orbital
+        orbitRadius: 180, // On Sovereign's orbit around the sun
+        orbitSpeed: 0,
         angle: 1.2 - (Math.PI / 3.0), // 60 degrees behind (stable Lagrange L5)
+        angleAt: (nowMs: number) => sovereignAngle(nowMs) - Math.PI / 3,
         lagrangePoint: 'L5',
         description: 'Stable Lagrange refuge pocket. Uncharted asteroid debris.',
         resources: [{ type: 'Rare Mineral', yield: 250 }],
@@ -292,6 +406,9 @@ export class SolarSystemMap {
             <div id="map-selected-resources-list" style="font-size: 11px; display:flex; flex-direction:column; gap:3px;"></div>
           </div>
           
+          <!-- 🗺️ #192: a station's layout from its atlas -->
+          <button id="map-atlas-btn" style="display:none; width: 100%; border-radius: 8px; border: 1px solid rgba(212,168,75,0.5); background: rgba(212,168,75,0.10); color: #F0C060; font-weight: bold; padding: 10px; cursor: pointer; text-transform: uppercase; font-size:11px;">🗺 View station atlas</button>
+
           <!-- Launch Travel Trigger -->
           <button id="map-travel-btn" style="width: 100%; border-radius: 8px; border: 1px solid #1e88e5; background: rgba(30,136,229,0.15); color: #90caf9; font-weight: bold; padding: 10px; cursor: pointer; text-transform: uppercase; font-size:11px; transition: background 0.2s;">Initiate Travel</button>
         </div>
@@ -361,6 +478,14 @@ export class SolarSystemMap {
       closeBtn.addEventListener('click', () => this.hide());
     }
 
+    // 🗺️ Station atlas button (#192): the holotable opens the station plan.
+    const atlasBtn = document.getElementById('map-atlas-btn');
+    if (atlasBtn) {
+      atlasBtn.addEventListener('click', () => {
+        if (this.selectedBody?.type === 'station') this.onStationAtlasCallback?.(this.selectedBody.id);
+      });
+    }
+
     // Travel Button trigger
     const travelBtn = document.getElementById('map-travel-btn');
     if (travelBtn) {
@@ -412,12 +537,21 @@ export class SolarSystemMap {
       return { x: centerX, y: centerY };
     }
 
+    if (body.placeAt) {
+      const place = body.placeAt(this.clock());
+      const parent = place.parentId ? this.bodies.find((b) => b.id === place.parentId) : undefined;
+      const origin = parent ? this.getBodyCoordinates(parent, centerX, centerY) : { x: centerX, y: centerY };
+      const { dx, dy } = screenOffset(place.angle, place.radius * this.scale);
+      return { x: origin.x + dx, y: origin.y + dy };
+    }
+
     // Base orbit positions (derive-don't-tick, v006 §8.2 / Kepler orbits)
     let radius = body.orbitRadius * this.scale;
     let angle = body.angle;
 
     // Simulate orbital movement as a function of the simulation clock tick —
-    // or, for stations, the true angle on the shared orbital clock.
+    // or, for planets, stations and Lagrange points, the true angle on the
+    // shared orbital clock.
     angle = body.angleAt ? body.angleAt(this.clock()) : angle + body.orbitSpeed * this.simTick;
 
     if (body.parentId) {
@@ -473,6 +607,9 @@ export class SolarSystemMap {
       } else {
         resBox.style.display = 'none';
       }
+
+      const atlasBtn = document.getElementById('map-atlas-btn');
+      if (atlasBtn) atlasBtn.style.display = body.type === 'station' && this.onStationAtlasCallback ? 'block' : 'none';
 
       // Configure Travel actions
       if (body.id === this.playerLocationId) {
@@ -601,7 +738,8 @@ export class SolarSystemMap {
 
     // 1. Draw Kepler orbits
     for (const body of this.bodies) {
-      if (body.type === 'star' || body.parentId) continue;
+      // Lagrange points ride Sovereign's own orbit: no ring of their own.
+      if (body.type === 'star' || body.type === 'lagrange' || body.parentId) continue;
 
       ctx.beginPath();
       ctx.strokeStyle = body.id === 'belt-ring' ? 'rgba(212, 168, 75, 0.1)' : 'rgba(212, 168, 75, 0.08)';
@@ -636,6 +774,22 @@ export class SolarSystemMap {
         ctx.stroke();
         ctx.setLineDash([]);
       }
+    }
+
+    // 🚚 A station on its way to another planet: its course, which its
+    // marker rides from the burn to arrival.
+    const now = this.clock();
+    for (const body of this.bodies) {
+      const course = courseOnScreen(body, now, centerX, centerY, this.scale);
+      if (course.length < 2) continue;
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(0, 212, 255, 0.4)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.moveTo(course[0].x, course[0].y);
+      for (const p of course.slice(1)) ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
 
     // 2. Render astronomical bodies
@@ -765,6 +919,11 @@ export class SolarSystemMap {
     if (this.container) {
       this.container.style.display = 'none';
     }
+  }
+
+  /** 🗺️ #192: called with a station's id when VIEW STATION ATLAS is pressed. */
+  public onStationAtlas(cb: (stationId: string) => void) {
+    this.onStationAtlasCallback = cb;
   }
 
   public onTravelComplete(cb: (destinationId: string) => void) {
