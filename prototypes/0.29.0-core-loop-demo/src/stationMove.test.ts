@@ -36,6 +36,7 @@ import {
   freeSlotAround,
   isTowing,
   moveTransitPointAt,
+  describeTowRefusal,
   planStationTow,
   planTow,
   quoteTow,
@@ -1140,6 +1141,12 @@ describe('tugs: a torch tow', () => {
     expect(planStationTow(towCtx(), SOV)).toMatchObject({ ok: false, refusal: 'same-planet' });
     const busy = { ...towCtx().station!, move: moveTo() };
     expect(planStationTow(towCtx({ station: busy }), ARIS)).toMatchObject({ ok: false, refusal: 'moving' });
+  });
+
+  it('🚏 refuses while a ferry route runs on the tug (STOP it first)', () => {
+    expect(planStationTow(towCtx({ routeRunning: true }), ARIS)).toMatchObject({ ok: false, refusal: 'route-running' });
+    expect(planStationTow(towCtx({ routeRunning: false }), ARIS).ok).toBe(true);
+    expect(describeTowRefusal('route-running', null, 0)).toMatch(/Stop the ferry route/);
   });
 
   it('keeps the tug\'s room on the record and holds that tug while it tows', () => {

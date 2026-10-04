@@ -11,7 +11,7 @@ import {
 } from './stationMove';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
-import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter, type NearEnd } from './dockRules';
+import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter, type DockAnswer, type NearEnd } from './dockRules';
 import { applyFarDockRequest } from './farDoorWrite';
 import {
   bindDoorsDoc,
@@ -22,6 +22,7 @@ import {
   writeDoorTombstone,
 } from './doorsDoc';
 import {
+  berthPassFor,
   berthHeldByMove,
   berthPairings,
   berthStillThere,
@@ -47,6 +48,7 @@ import {
   releasePlaceOf,
   dockedToStation,
   keepRestPlace,
+  restBeside,
   restingPlace,
   type ArrivalPort,
   type ShipDockingApi,
@@ -312,6 +314,32 @@ describe('resolveRememberedBerth', () => {
     // A resolver answering with another room's pass is not trusted.
     setBerthSeedResolver(() => SEED_HIGH);
     expect(resolveRememberedBerth(rec, [])).toBeNull();
+  });
+});
+
+describe('berthPassFor (🎫 the passes the helm, a DOCK and the boards count)', () => {
+  afterEach(() => setBerthSeedResolver(null));
+
+  it("is this client's own pass for the room, else a docked or undocked port's address that names it", () => {
+    expect(berthPassFor(FURLONG_ROOM, [])).toBeUndefined();
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'east', state: FREE }])).toBeUndefined();
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }])).toBe(SEED_FURLONG);
+    expect(berthPassFor(FURLONG_ROOM, [
+      { doorId: 'east', state: dockedTo(SEED_HIGH) },
+      { doorId: 'north', state: dockedTo(SEED_FURLONG) },
+    ])).toBe(SEED_FURLONG);
+    // A port naming another room is no pass for this one.
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'east', state: dockedTo(SEED_HIGH) }])).toBeUndefined();
+    // Its own pass comes first…
+    setBerthSeedResolver((room) => (room === FURLONG_ROOM ? SEED_FURLONG_OTHER_HINTS : undefined));
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }])).toBe(SEED_FURLONG_OTHER_HINTS);
+    // …unless it names another room: then the port's.
+    setBerthSeedResolver(() => SEED_HIGH);
+    expect(berthPassFor(FURLONG_ROOM, [{ doorId: 'north', state: undockedFrom(SEED_FURLONG) }])).toBe(SEED_FURLONG);
+    expect(berthPassFor(HIGH_ROOM, [])).toBe(SEED_HIGH);
+    // No room is no room, whatever a port's address fails to name.
+    const junk = { ...undockedFrom(SEED_FURLONG), address: 'ssf://room#nothing' } as ArrivalPort['state'];
+    expect(berthPassFor('', [{ doorId: 'north', state: junk }])).toBeUndefined();
   });
 });
 
@@ -695,6 +723,19 @@ describe('where a ship with no live dock is', () => {
     // a ship at rest, go by the record.
     expect(shipPlaceId({ ...flight, originAt: undefined }, now)).toBe('furlong-station');
     expect(shipPlaceId({ status: 'docked', locationId: 'furlong-station', originAt: left }, now)).toBe('furlong-station');
+  });
+
+  it('🚏 rests a ferry handed back at its end stop beside that stop, whatever rest an earlier stop left', () => {
+    const now = Date.now();
+    const elsewhere = adriftAt('planet-sovereign', 9);
+    // The rest an earlier stop's release left, beside a station elsewhere.
+    expect(writeRestPlace({ at: elsewhere, since: now - 60_000 })).toBe(true);
+    const handedBack: FlightRecord = { status: 'docked', locationId: 'furlong-station' };
+    expect(shipPlaceId(handedBack, now)).toBe(elsewhere);
+    // The route's copy-back records where it left the ship (main.ts).
+    restBeside('furlong-station', now, []);
+    expect(readRestPlace()).toEqual({ at: placeOfStation('furlong-station'), since: Math.floor(now) });
+    expect(shipPlaceId(handedBack, now)).toBe('furlong-station');
   });
 
   it('keeps a ship whose flight kept no place where its station was at cast-off, by the moves known here', () => {
@@ -1322,6 +1363,10 @@ describe('where a ship with no live dock is', () => {
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 'furlong-station' })).toBe(true);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 7 })).toBe(false);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 'x'.repeat(129) })).toBe(false);
+    // 🚏 In open orbit where a ferry route left it: only ever `true`.
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, open: true })).toBe(true);
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, open: false })).toBe(false);
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, open: 'yes' })).toBe(false);
   });
 
   it('keeps where DEPART casts off from and flies to, through the flight only', () => {
@@ -1804,6 +1849,21 @@ describe('what the helm hears after an arrival DOCK', () => {
     // it stays.
     expect(readRestPlace()).toEqual({ at: placeOfStation('furlong-station'), since: expect.any(Number) });
     expect(shipPlaceId(readFlightRecord())).toBe('furlong-station');
+  });
+
+  // 🚏 A5: docking.ts redockPortAnswer says why, and the helm says so too.
+  const answer = (a: DockAnswer) => {
+    const docking = { ...fakeDocking(['north']), dock: async () => a };
+    fly('high-orbit', 'furlong-station');
+    return new Promise<ArrivalOutcome>((resolve) => { completeArrival(docking, { onSettled: resolve }); });
+  };
+
+  it('occupied, unreachable or gone, when the berth said which', async () => {
+    expect(await answer({ ok: true, dockedAt: 5 })).toEqual({ kind: 'docked', stationName: 'Furlong Station' });
+    expect(await answer({ ok: false, reason: 'occupied' })).toMatchObject({ kind: 'none', reason: 'occupied' });
+    expect(await answer({ ok: false, reason: 'not-allowed', gateAccess: 'closed' })).toMatchObject({ reason: 'occupied' });
+    expect(await answer({ ok: false, reason: 'unreachable' })).toMatchObject({ reason: 'unreachable' });
+    expect(await answer({ ok: false, reason: 'gone' })).toMatchObject({ reason: 'berth-gone' });
   });
 
   it('refused, once the far room knew the station had gone: said as gone, the ship left where it arrived', async () => {

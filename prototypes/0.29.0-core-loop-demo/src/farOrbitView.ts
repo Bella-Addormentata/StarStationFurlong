@@ -30,23 +30,29 @@ import * as THREE from 'three';
 import {
   angleAt,
   orbitForSlot,
-  planTransfer,
   stationOrbit,
   stationPointAt,
   transferPointAt,
 } from './orbits';
 import type { OrbitPoint, TransferPlan } from './orbits';
-import { planetLayout, transitLayout } from './farOrbits';
-import type { FarBody, FarLayout, FarShipInput, FarStationInput } from './farOrbits';
+import { frozenCourse, planetLayout, transitLayout } from './farOrbits';
+import type { FarBody, FarLayout, FarShipInput, FarStationInput, FrozenCourses } from './farOrbits';
 import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
-import { readFlightRecord, shipDocBound } from './shipDoc';
+import { readPhysicalDoors } from './doorsDoc';
+import { shipDocBound } from './shipDoc';
+// 🚏 A ferry route's leg is flown by its timetable, never written to the
+// stored flight (robot pilot routes, build notes A4): the resolved flight.
+import { routeStayOffList } from './pilotRoute';
+import { resolveShipFlight } from './shipRoute';
+// 🚚 Another ferry's leg, where its summary says the route copied its stops.
+import { routeLegEnds, routeStayPlace, summaryLegEnds } from './planetSummary';
 import { flightCapable, followsFlightRecord } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
-  adriftAt, adriftPlace, currentRoomId, currentStation, latestMoveOf, listStations, planetById, planetForRoom, roomAdriftPlace,
-  stationInTransit,
+  adriftAt, adriftPlace, currentRoomId, currentStation, dockedStationFor, latestMoveOf, listStations, planetById, planetForRoom,
+  roomAdriftPlace, stationInTransit,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
 
@@ -145,40 +151,24 @@ function castOffPlace(id: string, keptAt: string | undefined): Place | undefined
   return at ? { id, planetId: planetById(at.planetId).id, orbitSlot: at.orbitSlot } : undefined;
 }
 
-/** A flight's transfer rebuilt from its record: the Hohmann ellipse between
- *  the two ends' orbits, pinned to the record's own times. `flight` names it
- *  by what stays fixed while it flies: who flies (and for another ship, the
- *  welcome rooms its summary gives as the ends), never an id this install
- *  reads through its own aliases, which can name one end differently from
- *  one read to the next. */
+/** A flight's transfer rebuilt from its record, fixed once seen
+ *  (farOrbits.frozenCourse). `flight` names it by what stays fixed while it
+ *  flies: who flies (and for another ship, the welcome rooms its summary
+ *  gives as the ends), never an id this install reads through its own
+ *  aliases, which can name one end differently from one read to the next. A
+ *  ferry leg's `copies` of its stops place it when known. */
 function flightPlan(
   flight: readonly string[],
   departedAt: number,
   etaAt: number,
+  copies: readonly [Place, Place] | null,
   ends: () => readonly [Place | undefined, Place | undefined],
 ): TransferPlan | null {
-  if (!(etaAt > departedAt)) return null;
-  // A flight's orbits are fixed once it is seen: planTransfer reads the ends
-  // through today's trims, and a station-keeping burn after launch must not
-  // move a transfer already flown. The ends are placed only the first time,
-  // so a flight already drawn keeps its course once an end can no longer be
-  // placed at all (a learned station dropped after a move, say).
-  const key = JSON.stringify([...flight, departedAt, etaAt]);
-  const known = frozenPlans.get(key);
-  if (known) {
-    known.seenAt = gatherNow;
-    return known.plan;
-  }
-  const [from, to] = ends();
-  if (!from || !to) return null;
-  const planned = planTransfer(from, to, departedAt - 1);
-  const plan = planned ? { ...planned, departAt: departedAt, arriveAt: etaAt } : null;
-  if (plan) frozenPlans.set(key, { plan, seenAt: gatherNow });
-  return plan;
+  return frozenCourse(frozenPlans, flight, departedAt, etaAt, copies, ends, gatherNow);
 }
 
 /** Flight plans already drawn, by flight; one not seen for a while is dropped. */
-const frozenPlans = new Map<string, { plan: TransferPlan; seenAt: number }>();
+const frozenPlans: FrozenCourses = new Map();
 const FROZEN_PLAN_TTL_MS = 60_000;
 const MAX_FROZEN_PLANS = 256;
 let gatherNow = 0;
@@ -256,15 +246,23 @@ function readSource(now: number): Source {
   // or resting there): see the planet from that orbit, not from the ship's
   // own one-room station.
   let adrift: Place | null = null;
-  const rec = shipDocBound() ? readFlightRecord() : null;
+  // 🚏 A running ferry route's timetable while it rules the flight (its legs
+  // write no stored `flight`), else the stored record.
+  const resolved = shipDocBound() ? resolveShipFlight(now) : null;
+  const rec = resolved?.flight ?? null;
+  const places = resolved?.places ?? null;
   if (rec && followsFlightRecord(rec.status, flightCapable(isShipReady()))) {
     if (rec.status === 'in-flight' && rec.destinationId && rec.departedAt !== undefined && rec.etaAt !== undefined) {
       const leftAt = rec.castOffAt ?? rec.departedAt;
       const to = rec.destinationId;
+      // 🚚 The timetable's legs fly the route's own copy of each stop, which
+      // a stop's station may have left for another planet: those are its
+      // ends, untrimmed as the timetable planned them. An ordinary flight's
+      // ends go by their stations' ids, so their trims apply.
       // Named by the room, not the ends: readFlightRecord reads both end ids
       // through this install's aliases each time (a learned station listed,
       // then dropped), and the same flight must keep the course it was drawn on.
-      aboard = flightPlan(['own', roomId], rec.departedAt, rec.etaAt, () => [
+      aboard = flightPlan(['own', roomId], rec.departedAt, rec.etaAt, routeLegEnds(places), () => [
         castOffPlace(rec.locationId, rec.originAt) ?? placeOf(rec.locationId, all, leftAt, now),
         castOffPlace(to, rec.destinationAt) ?? placeOf(to, all, leftAt, now),
       ]);
@@ -276,6 +274,21 @@ function readSource(now: number): Source {
     // hand from there: its live dock, or where it rests, says where it is
     // (the room resolver, below).
     if (!aboard && rec.status !== 'docked' && adriftPlace(rec.locationId)) adrift = placeOf(rec.locationId, all) ?? null;
+    // 🚚 A timetable stay with no live dock carrying the ship along with a
+    // station: it waits on the route's copy of the stop, where its leg in
+    // ended and its next leg leaves from, untrimmed as they are, whether or
+    // not the stop's station is still there (the keeper passes a berth its
+    // station has left). Only a live dock puts it on the station's orbit:
+    // one on the room's own doors, each read past the snapshot's cap, as the
+    // room resolver reads it (doorsDoc.readPhysicalDoors).
+    if (!aboard && !adrift && places && !places.to) {
+      const stay = routeStayOffList(
+        places,
+        dockedStationFor(roomId, readPhysicalDoors().values(), atlas, all) !== null,
+        (id) => planetById(id).id,
+      );
+      adrift = stay && routeStayPlace(stay);
+    }
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that
     // orbit until the dock completes, not at the station's new place.
@@ -345,8 +358,9 @@ function readSource(now: number): Source {
     viewerRingRadiusKm = orbit.radiusKm;
   }
 
+  const idOf = (room: string) => all.find((s) => s.welcomeRoomId === room)?.id;
   const byRoom = (room: string | undefined, leftAt: number) =>
-    placeOf(room ? all.find((s) => s.welcomeRoomId === room)?.id : undefined, all, leftAt, now);
+    placeOf(room ? idOf(room) : undefined, all, leftAt, now);
   const ships: FarShipInput[] = [];
   // Every known ship anywhere, flying or docked: its room is also listed as a
   // one-module station (a dock berth leaves it its own atlas component), which
@@ -363,7 +377,12 @@ function readSource(now: number): Source {
     if (ship.roomId === roomId) continue;
     const { fromRoom, toRoom, departedAt } = ship;
     if (!fromRoom || !toRoom || departedAt === undefined || ship.etaAt === undefined) continue;
-    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, () => [
+    // 🚚 A ferry's leg flies the route's copy of its two stops, which its
+    // summary carries: a stop's station may have moved planets since, where
+    // the station list would place it (untrimmed, as its timetable planned
+    // them). A summary without them (relayed by an older client) is drawn
+    // by the station list until one with them comes.
+    const plan = flightPlan(['ship', ship.roomId, fromRoom, toRoom], departedAt, ship.etaAt, summaryLegEnds(ship), () => [
       byRoom(fromRoom, departedAt),
       byRoom(toRoom, departedAt),
     ]);

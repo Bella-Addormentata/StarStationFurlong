@@ -12,7 +12,9 @@
  *   - per station: its record (name, planet, slot, berth door, and any fields
  *     a newer build adds, carried through untouched), its gates, its latest
  *     trim and its latest move to another planet;
- *   - per ship: its name, planet and flight (status, from, to, times).
+ *   - per ship: its name, planet and flight (status, from, to, times), and
+ *     for a ferry on a route its gate, next stop, departure and status word
+ *     (departures boards in rooms its riders never publish to read these).
  *
  * Three levels, not full-atlas gossip:
  *   - your own station: its full atlas, as before (stationAtlas);
@@ -136,6 +138,14 @@ export interface StationSummary {
 
 export const MAX_OWNER_ALIASES = 8;
 
+/** 🚏📋 A route ferry's status, as departures boards show it
+ *  (departuresBoard.ts: BOARDING, ON TIME, HOLDING FOR BERTH, DELAYED,
+ *  NOT DOCKED, PAUSED, ROUTE BLOCKED). */
+export type ShipRouteStatus = 'boarding' | 'on-time' | 'holding' | 'delayed' | 'not-docked' | 'paused' | 'blocked';
+export const SHIP_ROUTE_STATUSES: readonly ShipRouteStatus[] = [
+  'boarding', 'on-time', 'holding', 'delayed', 'not-docked', 'paused', 'blocked',
+];
+
 export interface ShipSummary {
   /** The ship's room id. */
   roomId: string;
@@ -148,6 +158,35 @@ export interface ShipSummary {
   toRoom?: string;
   departedAt?: number;
   etaAt?: number;
+  /** 🚚 A ferry's leg as its route copied the two stops: the planet and slot
+   *  it flies from and to (pilotRoute.routeFlightPlaces). A stop's station
+   *  may have moved planets since, so a reader placing the leg by its
+   *  station list would find no course. Kept only all four together, on one
+   *  planet. Additive, as the route fields below. */
+  fromPlanetId?: string;
+  fromSlot?: number;
+  toPlanetId?: string;
+  toSlot?: number;
+  /** 🚏📋 A ferry on a route (build notes A9 item 7), so an all-gates board
+   *  in a room its riders never publish to can still show it, "as of"
+   *  updatedAt: the gate it is docked at (or bound for), its next stop's
+   *  berth room, its departure from here, and its status word. Additive: an
+   *  older client's clean drops them, and its relay passes the rest. */
+  gate?: number;
+  nextStopRoom?: string;
+  departAt?: number;
+  routeStatus?: ShipRouteStatus;
+  /** 🚏 The run it flies (the route's startedAt), so a board can tell a
+   *  replacement route from a later stop of the one it holds. */
+  routeRun?: number;
+  /** 🚏 The newest checkpoint of that run (its event time: a hold's newest
+   *  sighting, a skip, a pause, a person's departure…), so a board can tell
+   *  that its own copy of the timetable missed one. */
+  routeNews?: number;
+  /** 🏁 No route run flies (none set, not started, or ended). Said outright
+   *  because an older client's relay drops every route field: a summary
+   *  with none of them says nothing about a route. */
+  routeIdle?: true;
   /** Set when the room stopped being a ship (bolted into a station, a
    *  fitting removed): a newer stamp that withdraws the entry everywhere. */
   retired?: true;
@@ -182,6 +221,10 @@ export const SHIP_STALE_MS = 24 * 3600 * 1000;
 /** An unchanged ship's stamp is refreshed this often, so it never goes stale
  *  while its players are aboard. */
 export const SHIP_HEARTBEAT_MS = 3600 * 1000;
+/** 🚏 A ferry on its route re-stamps an unchanged summary once it is this
+ *  old, so a long hold or pause never ages off the boards (they drop a
+ *  route row an hour old: departuresBoard SUMMARY_ROW_MAX_AGE_MS). */
+export const ROUTE_SUMMARY_REFRESH_MS = 15 * 60_000;
 const FLIGHT_STATUSES: readonly string[] = ['docked', 'undocking', 'in-flight', 'redocking'];
 const KNOWN_FIELDS = new Set(['id', 'name', 'planetId', 'orbitSlot', 'welcomeRoomId', 'berthDoor', 'berths', 'derived', 'move']);
 
@@ -190,6 +233,10 @@ const isName = (v: unknown): v is string => typeof v === 'string' && v.length > 
 const isStamp = (v: unknown, now: number): v is number =>
   typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= now + MAX_SKEW_MS;
 const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+/** 🚏 A route's run or news time: a whole ms stamp past 0. */
+const isRouteStamp = (v: unknown, now: number): v is number =>
+  Number.isSafeInteger(v) && (v as number) > 0 && isStamp(v, now);
+const isSlot = (v: unknown): v is number => Number.isInteger(v) && (v as number) >= 0 && (v as number) < MAX_ORBIT_SLOTS;
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v)
@@ -416,8 +463,96 @@ export function cleanShipSummary(v: unknown, now = Date.now()): ShipSummary | nu
   if (v.toRoom !== undefined) out.toRoom = v.toRoom as string;
   if (v.departedAt !== undefined) out.departedAt = v.departedAt as number;
   if (v.etaAt !== undefined) out.etaAt = v.etaAt as number;
+  // 🚚 A leg's two ends stand or drop together, and never across planets (a
+  // leg flies within one): a bad one never costs the ship its summary.
+  if (isId(v.fromPlanetId) && isSlot(v.fromSlot) && isId(v.toPlanetId) && isSlot(v.toSlot)
+    && planetById(v.fromPlanetId).id === planetById(v.toPlanetId).id) {
+    out.fromPlanetId = v.fromPlanetId;
+    out.fromSlot = v.fromSlot;
+    out.toPlanetId = v.toPlanetId;
+    out.toSlot = v.toSlot;
+  }
+  // 🚏📋 The route fields each stand or drop alone: a bad one never costs
+  // the ship its summary.
+  if (Number.isInteger(v.gate) && (v.gate as number) >= 1 && (v.gate as number) <= 99) out.gate = v.gate as number;
+  if (isId(v.nextStopRoom)) out.nextStopRoom = v.nextStopRoom;
+  if (isTime(v.departAt)) out.departAt = v.departAt;
+  if (typeof v.routeStatus === 'string' && (SHIP_ROUTE_STATUSES as readonly string[]).includes(v.routeStatus)) {
+    out.routeStatus = v.routeStatus as ShipRouteStatus;
+  }
+  // Ordering stamps a board compares against its own copy: skew-bounded
+  // like updatedAt, or one far-future value would outrank it for good.
+  if (isRouteStamp(v.routeRun, now)) out.routeRun = v.routeRun;
+  if (isRouteStamp(v.routeNews, now)) out.routeNews = v.routeNews;
+  if (v.routeIdle === true && out.routeStatus === undefined) out.routeIdle = true;
   if (v.retired === true) out.retired = true;
   return out;
+}
+
+/** 🚚 One end of a ferry's leg, placed as orbits.planTransfer reads it. */
+export interface LegEnd {
+  id: string;
+  planetId: string;
+  orbitSlot: number;
+}
+
+/** 🚚 A ferry's summary fields for the leg its ruling timetable flies: the
+ *  route's copy of the two stops (`places`, pilotRoute.routeFlightPlaces's
+ *  answer). None outside a leg. */
+export function legEndFields(
+  places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
+): Pick<ShipSummary, 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'> {
+  if (!places?.to) return {};
+  return {
+    fromPlanetId: planetById(places.from.planetId).id,
+    fromSlot: places.from.orbitSlot,
+    toPlanetId: planetById(places.to.planetId).id,
+    toSlot: places.to.orbitSlot,
+  };
+}
+
+/** 🚚 The two ends of a leg a ruling timetable flies (`places`, as
+ *  legEndFields reads it), as that timetable planned them: the route's
+ *  copies, under ids no station-keeping trim resolver knows (pilotRoute plans
+ *  each stop as `route-stop:<index>`). A course drawn through this client's
+ *  trims instead would part from the times the timetable worked out (a jump
+ *  at arrival), and differ between games that heard of different trims.
+ *  Null outside a leg. */
+export function routeLegEnds(
+  places: { from: Omit<LegEnd, 'id'>; to: Omit<LegEnd, 'id'> | null } | null,
+): [LegEnd, LegEnd] | null {
+  if (!places?.to) return null;
+  return [
+    { id: 'route-stop:from', planetId: planetById(places.from.planetId).id, orbitSlot: places.from.orbitSlot },
+    { id: 'route-stop:to', planetId: planetById(places.to.planetId).id, orbitSlot: places.to.orbitSlot },
+  ];
+}
+
+/** 🚚 A summary-backed flight's two ends where its ferry flies them: the
+ *  route's copies its summary carries, though a stop's station has moved
+ *  planets since, untrimmed as its timetable planned them (routeLegEnds).
+ *  Null when the summary carries no copies, or names no rooms: the reader
+ *  places the ends by its station list. */
+export function summaryLegEnds(
+  s: Pick<ShipSummary, 'fromRoom' | 'toRoom' | 'fromPlanetId' | 'fromSlot' | 'toPlanetId' | 'toSlot'>,
+): [LegEnd, LegEnd] | null {
+  const { fromRoom, toRoom, fromPlanetId, fromSlot, toPlanetId, toSlot } = s;
+  if (!fromRoom || !toRoom || fromPlanetId === undefined || fromSlot === undefined
+    || toPlanetId === undefined || toSlot === undefined) return null;
+  return routeLegEnds({
+    from: { planetId: fromPlanetId, orbitSlot: fromSlot },
+    to: { planetId: toPlanetId, orbitSlot: toSlot },
+  });
+}
+
+/** 🚚 A ruling timetable's stay on the route's copy of its stop
+ *  (pilotRoute.routeStayOffList), untrimmed as the legs either side of it
+ *  (routeLegEnds). The copy names the stop's station, whose trim this
+ *  install keeps for that slot, there or while the station is between
+ *  planets: drawn by it, the ship would hop onto the trimmed orbit for the
+ *  stay and back at its departure. */
+export function routeStayPlace<T extends { id: string }>(stay: T): T {
+  return { ...stay, id: 'route-stop:from' };
 }
 
 // ── The local store (what this install has learned) ──────────────────────────
@@ -1433,7 +1568,9 @@ export function publishPlanetSummary(now = Date.now()): void {
   if (ship) {
     const s = cleanShipSummary({ ...ship, updatedAt: now }, now);
     const prior = s ? store.ships[s.roomId] : undefined;
-    const same = prior && s && now - prior.updatedAt < SHIP_HEARTBEAT_MS
+    // 🚏 A ferry on its route keeps a shorter heartbeat than other ships.
+    const beat = s?.routeStatus !== undefined ? ROUTE_SUMMARY_REFRESH_MS : SHIP_HEARTBEAT_MS;
+    const same = prior && s && now - prior.updatedAt < beat
       && JSON.stringify({ ...prior, updatedAt: 0 }) === JSON.stringify({ ...s, updatedAt: 0 });
     if (s && !same) store.ships[s.roomId] = { ...s, updatedAt: stampPast(s.roomId) };
   } else {
