@@ -227,8 +227,14 @@ export function arrivalBerths(input: {
   const remembered = recalled && (roomListed
     ? gates.some((b) => sameRoom(b.address, recalled.address) && (!b.farDoor || b.farDoor === recalled.farDoor))
     : true) ? recalled : null;
+  // Within a rank, gate order: the gates the memory reaches join the list
+  // after the station's own, and their numbers put them back in place (one
+  // with no number after the numbered ones, in list order).
+  const gateOrder = (b: StationBerth) => b.gate ?? Number.POSITIVE_INFINITY;
   const listed: StationBerth[] = (station.berths ?? []).length > 0
-    ? gates.map((b, i) => ({ b, i })).sort((x, y) => rank(x.b) - rank(y.b) || x.i - y.i).map((x) => x.b)
+    ? gates.map((b, i) => ({ b, i }))
+      .sort((x, y) => rank(x.b) - rank(y.b) || gateOrder(x.b) - gateOrder(y.b) || x.i - y.i)
+      .map((x) => x.b)
     : station.berth && isRoomSeed(station.berth.address) ? [station.berth] : [];
   const out: StationBerth[] = [];
   const add = (b: StationBerth) => { if (!out.some((o) => same(o, b))) out.push(b); };
