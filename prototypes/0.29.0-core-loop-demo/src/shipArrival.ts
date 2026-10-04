@@ -950,6 +950,11 @@ async function dockThroughBerths(
     } catch (err) {
       console.warn('[ship] arrival DOCK threw:', err);
     }
+    // A ship that left again while the berth answered (a DEPART) docks at no
+    // further gate of the station it left, and the answer is not this
+    // flight's: say nothing.
+    const flight = readFlightRecord();
+    if (flight.status !== 'docked' || flight.locationId !== station.id) return;
     // The await may have outlived the ship's room: the answer belongs to a
     // room no longer shown, so say nothing.
     if (shipRoomId !== undefined && currentRoomId() !== shipRoomId) return;

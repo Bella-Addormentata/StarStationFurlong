@@ -1254,6 +1254,25 @@ describe('arrival gates', () => {
       expect(heard).toBeNull();
     });
 
+    it('stops trying gates once the ship has left again', async () => {
+      arriveAtGates([gate(1, 'east'), gate(2, 'west')]);
+      const base = gatedDocking(['east', 'west']);
+      // DEPART again while gate 1 is still answering.
+      const docking = {
+        ...base,
+        dock: async (doorId: string) => {
+          writeFlightRecord({ status: 'in-flight', locationId: 'high-orbit', destinationId: 'furlong-station', departedAt: 1, etaAt: 2 });
+          return base.dock(doorId);
+        },
+      };
+      let heard: ArrivalOutcome | null = null;
+      completeArrival(docking, { onSettled: (o) => { heard = o; } });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(base.tried).toEqual(['east']);
+      expect(heard).toBeNull();
+      expect(readFlightRecord().status).toBe('in-flight');
+    });
+
     it('reports a dock another commander made while the last gate refused', async () => {
       arriveAtGates([gate(1, 'east')]);
       const base = fakeDocking(['north']);
