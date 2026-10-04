@@ -1089,13 +1089,13 @@ class RoomEditController {
       // E3: a live carry consumes the first Esc (cancel back to origin);
       // a second Esc then exits edit mode as before.
       if (this.carrying) {
-        this.cancelCarry(true);
+        this.cancelCarry('user');
         return;
       }
       // 🚪 #28 S6c: a live door drag consumes the first Esc the same way
       // (cancel back to the origin lateral).
       if (this.doorDrag) {
-        this.cancelDoorDrag(true);
+        this.cancelDoorDrag('user');
         return;
       }
       // 🚪 #28 S6b: an armed add-door sub-mode consumes the first Esc too.
@@ -1123,8 +1123,8 @@ class RoomEditController {
     window.addEventListener('contextmenu', (e) => {
       if (this.active && (this.carrying || this.doorDrag)) {
         e.preventDefault();
-        if (this.carrying) this.cancelCarry(true);
-        else this.cancelDoorDrag(true);
+        if (this.carrying) this.cancelCarry('user');
+        else this.cancelDoorDrag('user');
         return;
       }
       this.hideContextMenu();
@@ -1321,8 +1321,8 @@ class RoomEditController {
     if (!this.active) return;
     this.autoEntered = false; // 🖱️ any explicit exit ends a context-menu session
     this.hideContextMenu();
-    this.cancelCarry(false); // E3: never exit with an item in hand
-    this.cancelDoorDrag(false); // 🚪 #28 S6c: nor with a door in hand
+    this.cancelCarry('teardown'); // E3: never exit with an item in hand
+    this.cancelDoorDrag('teardown'); // 🚪 #28 S6c: nor with a door in hand
     this.setAddDoorMode(false); // 🚪 #28 S6b: drop any armed add-door sub-mode
     this.setAddWindowMode(false); // 🪟 #80 S4: drop any armed add-window sub-mode
     this.setWallpaperMode(false); // 🖼️ #80 S6: drop any armed wallpaper sub-mode
@@ -1366,7 +1366,7 @@ class RoomEditController {
    * obstacle never left OBSTACLES, so this is a pure visual restore).
    */
   public forceExit(): void {
-    this.cancelCarry(false);
+    this.cancelCarry('teardown');
     this.exit();
   }
 
@@ -1764,11 +1764,12 @@ class RoomEditController {
     const hdr = `font-size:9px; letter-spacing:1px; color:rgba(212,168,75,0.55); padding:2px 4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;`;
 
     // 🎨 #184: an air-hockey table can be recoloured from here — the "table's
-    // menu settings" the issue asked for. Owner-only by inheritance: the
-    // right-click gate above refuses to open this menu at all unless
-    // canEditRoom() passes, and writeAirHockeyTheme is a doc write like any
-    // other edit. The kind is compared against the FurnitureKind union, so a
-    // rename breaks the build rather than silently dropping the entry.
+    // menu settings" the issue asked for. Owner-gated twice: the right-click
+    // gate above refuses to OPEN this menu unless canEditRoom() passes, and
+    // the click handler below re-reads it before ACTING, because this menu
+    // stays open across theme writes and the open-time answer expires. The
+    // kind is compared against the FurnitureKind union, so a rename breaks
+    // the build rather than silently dropping the entry.
     const themeBtn = item.kind === 'air-hockey-table'
       ? `<button type="button" data-ctx-action="theme-open" style="${btn}">🎨 COLOUR…</button>`
       : '';
@@ -1819,6 +1820,26 @@ class RoomEditController {
       const el = (ev.target as HTMLElement).closest<HTMLElement>('[data-ctx-action]');
       if (!el) return;
       const action = el.dataset.ctxAction;
+      // 🔒 Re-read permission on EVERY action, not just when the menu opened.
+      // The colour view below deliberately keeps the menu open so presets can
+      // be compared against the puck, so the open-time answer can go stale
+      // while the menu is still on screen. What can change it (the predicate
+      // passed to setRoomEditPermission, in main.ts): a leave starting
+      // (roomLeavesUnderWay), a peer writing roomInfo.owner, a change in the
+      // venture's shareholder set, and the sync object going away on teardown
+      // — that last one answers 'yes, offline rooms are yours'. So this can
+      // swing either way, not just expire. NOT a co-host grant, though —
+      // co-hosts never pass this gate in the first place (roomRoles.ts).
+      //
+      // What this covers: DELETE and the theme writes, which commit here and
+      // now. MOVE is only STARTED here — ctxMove puts the item in hand and the
+      // doc write happens later in commitCarry(), which re-reads the predicate
+      // itself at the drop for exactly that reason.
+      //
+      // The shared helper carries the rest of the reasoning, including why
+      // a refusal here also ends any live edit session, and why none of this
+      // is enforcement.
+      if (!this.mayWriteRoomDoc()) return;
       // 🎨 The two navigation actions swap the body and KEEP the menu open;
       // everything below commits and closes it.
       if (action === 'theme-open') return render(themeView());
@@ -2114,6 +2135,22 @@ class RoomEditController {
     const world = this.world;
     if (!c || !world) return;
 
+    // 🔒 Re-authorise at the DROP, not at the pick-up. Only one of the two
+    // entry points is checked anywhere near the pick-up: the context menu's
+    // MOVE dispatches a few lines under the re-read in the menu's click
+    // handler, so its answer is microseconds old. Edit mode's own grab is not
+    // — beginCarry has no gate of its own and handleClick reaches it on the
+    // strength of enter(), which may have run a whole session ago. The item
+    // can then sit in hand for as long as the player likes while the deed
+    // transfers or a leave begins, so this — the line that writes to the doc —
+    // is where the question has to be asked again.
+    //
+    // The refusal cannot leave the item in hand: a player who has just lost
+    // edit rights can no longer satisfy any placement verdict, so the carry
+    // would never end. mayWriteRoomDoc() ends the session, and exit()'s
+    // cancelCarry('teardown') puts the item back at its origin on the way out.
+    if (!this.mayWriteRoomDoc()) return;
+
     const verdict = this.currentCarryVerdict();
     if (!verdict.ok) {
       c.valid = false;
@@ -2168,10 +2205,64 @@ class RoomEditController {
   }
 
   /**
+   * 🔒 The gate in front of every room-doc write in this class. Returns true
+   * when the write may go ahead; on a refusal it closes the context menu,
+   * ENDS the edit session and hints the reason, then returns false.
+   *
+   * WHY RE-READ AT ALL. `this.active` is set in exactly one place — enter(),
+   * behind its own canEditRoom() — and cleared on exit, so it means "the
+   * check passed once this session", not "it still passes". The predicate
+   * main.ts installs (setRoomEditPermission) can change underneath a live
+   * session: a leave starting (roomLeavesUnderWay), a peer writing
+   * roomInfo.owner, the venture's shareholder set changing, or the sync
+   * object going away on teardown — that last one answers "yes, an offline
+   * room is yours", so this can swing either way, not only expire. An item
+   * can sit in hand, or a wallpaper panel stay open, for as long as the
+   * player likes while any of that happens.
+   *
+   * WHY IT ENDS THE SESSION rather than just refusing the one write. If the
+   * answer is no, it is no for everything else the session offers too — the X
+   * button, ＋ DOOR, ＋ WINDOW, 🖼 WALLPAPER and the next pick-up (beginCarry
+   * has no gate of its own; handleClick reaches it on the strength of
+   * enter()). Refusing one write and leaving the rest on screen invites the
+   * player to find that out one button at a time. exit() is also the complete
+   * teardown for whatever was in flight: its cancelCarry('teardown') puts a
+   * carried item back at its origin and its cancelDoorDrag('teardown') does
+   * the same for a dragged door, both without a hint of their own, so the
+   * reason shown below is the one the player reads. Re-entry is not blocked —
+   * enter() asks the same question, so permission coming back is enough.
+   *
+   * It no-ops outside edit mode (exit() returns early when inactive), which is
+   * the context menu's case: that menu works in the plain room view too.
+   *
+   * AND IT IS UI CORRECTNESS, NOT ENFORCEMENT. Nothing authorises a room-doc
+   * write today — roomOwner.ts says so outright — so a modified client
+   * ignores this entirely. What it buys is that an HONEST client stops
+   * writing the moment its permission ends, by whichever key, button or menu
+   * entry the player happens to reach for. editMode.test.ts holds the sweep
+   * closed: it fails if a new writer appears in a method that does not come
+   * through here.
+   */
+  private mayWriteRoomDoc(): boolean {
+    const perm = canEditRoom();
+    if (perm.ok) return true;
+    this.hideContextMenu();
+    this.exit(); // no-op when inactive; restores a carry / door drag when not
+    showHint(perm.reason); // last, so the reason outlives any teardown hint
+    return false;
+  }
+
+  /**
    * Cancel back to the exact origin. The registry item and OBSTACLES were
    * never touched during the carry, so this is a pure visual restore.
+   *
+   * `cause` is not a verbosity flag: 'user' means the player asked for the
+   * cancel (Esc, right-click, DONE EDITING), which both says so and ends an
+   * edit session a context-menu MOVE auto-entered; 'teardown' means we are
+   * already on our way out (exit / forceExit / a refused write), where a hint
+   * would be noise and re-entering exit() would recurse.
    */
-  private cancelCarry(announce: boolean): void {
+  private cancelCarry(cause: 'user' | 'teardown'): void {
     const c = this.carrying;
     if (!c) return;
     c.group.position.set(c.originPos.x, 0, c.originPos.z);
@@ -2187,13 +2278,13 @@ class RoomEditController {
     }
     this.syncRemoveButton(); // #53: selection persists → button returns
     this.setCanvasCursor('');
-    if (announce) showHint('Move cancelled.', 1400);
+    if (cause === 'user') showHint('Move cancelled.', 1400);
 
-    // 🖱️ USER-cancelled a context-menu MOVE (Esc / right-click) → also leave
-    // the auto-entered edit session. announce distinguishes a user cancel
-    // from the teardown paths (exit/forceExit call with false — they are
-    // already exiting, and exit()'s own cancelCarry(false) must not recurse).
-    if (announce && this.autoEntered) {
+    // 🖱️ USER-cancelled a context-menu MOVE (Esc / right-click / DONE
+    // EDITING) → also leave the auto-entered edit session. The teardown
+    // callers are excluded because they are already exiting: exit()'s own
+    // cancelCarry('teardown') must not recurse back into exit().
+    if (cause === 'user' && this.autoEntered) {
       this.autoEntered = false;
       this.exit();
     }
@@ -2244,6 +2335,15 @@ class RoomEditController {
     const world = this.world;
     const itemId = this.selectedId;
     if (!world || !itemId || this.carrying || this.doorDrag) return;
+
+    // 🔒 Gated HERE rather than at the three call sites, because this is the
+    // method that writes. Three paths reach it — the X / Delete keydown, the
+    // context menu's DELETE, and the REMOVE button — and two of them arrive on
+    // an answer that may be arbitrarily old (they test only `this.active`).
+    // The menu's DELETE is already behind the gate in the menu click handler
+    // and is re-asked here anyway, because "the method that writes" is the
+    // property worth gating on rather than the caller's good manners.
+    if (!this.mayWriteRoomDoc()) return;
 
     // 🚪 #28 S6b: a DOOR removal is its own, much shorter path — drop the layout
     // record (the reconcile removes the 3D group + walk target); NO
@@ -2420,6 +2520,7 @@ class RoomEditController {
    * spot.
    */
   private tryPlaceDoorAt(clientX: number, clientY: number): void {
+    if (!this.mayWriteRoomDoc()) return; // 🔒 writeDoorLayout below
     // Re-derive the ghost pose at the click point (see method doc), then commit
     // from the stashed snapped wall/lateral so the door lands where it showed.
     this.updateDoorGhostFromPointer(clientX, clientY);
@@ -2693,6 +2794,11 @@ class RoomEditController {
     const d = this.doorDrag;
     const world = this.world;
     if (!d || !world) return;
+    // 🔒 Re-authorise at the DROP, for the same reason commitCarry does: the
+    // drag may have been held open across a deed transfer or the start of a
+    // leave. The refusal cannot strand the door either — exit()'s
+    // cancelDoorDrag('teardown') re-poses it at its origin lateral.
+    if (!this.mayWriteRoomDoc()) return;
 
     const verdict = validateDoorPlacement(d.wall, d.candidateLateral, d.doorId);
     if (!verdict.ok) {
@@ -2736,9 +2842,12 @@ class RoomEditController {
   /**
    * Cancel back to the exact origin lateral (Esc / right-click / exit).
    * Nothing was written during the drag, so this is a pure visual re-pose —
-   * the mirror of cancelCarry.
+   * the mirror of cancelCarry, and `cause` carries the same meaning there:
+   * 'user' announces, 'teardown' is silent. A door drag has no auto-entered
+   * session to end (the context menu is furniture-only), so that is the whole
+   * difference here — the word is shared so the two mirrors cannot drift.
    */
-  private cancelDoorDrag(announce: boolean): void {
+  private cancelDoorDrag(cause: 'user' | 'teardown'): void {
     const d = this.doorDrag;
     if (!d) return;
     const pose = this.doorDragPose(d, d.originLateral);
@@ -2752,7 +2861,7 @@ class RoomEditController {
     }
     this.syncRemoveButton();
     this.setCanvasCursor('');
-    if (announce) showHint('Move cancelled.', 1400);
+    if (cause === 'user') showHint('Move cancelled.', 1400);
   }
 
   /**
@@ -2829,6 +2938,7 @@ class RoomEditController {
    * armed, keeping the red ghost so the owner can nudge to a clearer spot.
    */
   private tryPlaceWindowAt(clientX: number, clientY: number): void {
+    if (!this.mayWriteRoomDoc()) return; // 🔒 writeWindowLayout below
     this.updateWindowGhostFromPointer(clientX, clientY);
     const ghost = this.ghostWindow;
     if (!ghost) return; // pointer wasn't over the surface plane
@@ -2944,6 +3054,9 @@ class RoomEditController {
   private resizeSelectedWindow(dw: number, dh: number, auto: boolean): void {
     const id = this.selectedId;
     if (!id || !this.windowIds.has(id)) return;
+    // 🔒 writeWindowLayout below. Gated after the cheap selection test so a
+    // keypress with no window selected stays a no-op rather than a refusal.
+    if (!this.mayWriteRoomDoc()) return;
     const rec = readAllWindowLayout().get(id);
     if (!rec) return;
     let w: number;
@@ -3388,8 +3501,8 @@ class RoomEditController {
         (e.currentTarget as HTMLButtonElement).blur();
         // Mirror the Esc two-stage semantics: a click WHILE carrying cancels the
         // move back to origin first; the next click then leaves edit mode.
-        if (this.carrying) { this.cancelCarry(true); return; }
-        if (this.doorDrag) { this.cancelDoorDrag(true); return; } // 🚪 #28 S6c
+        if (this.carrying) { this.cancelCarry('user'); return; }
+        if (this.doorDrag) { this.cancelDoorDrag('user'); return; } // 🚪 #28 S6c
         this.exit();
       });
       document.body.appendChild(this.exitBtnEl);
@@ -3867,6 +3980,12 @@ class RoomEditController {
 
   /** Cycle the active surface's covering (wraps) and APPLY it live to the hull. */
   private cycleWallpaperPreset(delta: number): void {
+    // 🔒 writeWallpaper below. Unlike the other sub-modes this one writes on
+    // every ◀ ▶ press — the covering applies live — so the panel can sit open
+    // across a permission change and keep writing. Gated before the cycle so a
+    // refusal leaves the stored covering alone; mayWriteRoomDoc's exit() then
+    // closes the panel, which is why nothing below needs to re-sync it.
+    if (!this.mayWriteRoomDoc()) return;
     const cur = this.currentWallpaperPreset();
     const i = WALLPAPER_PRESETS.indexOf(cur);
     const next = WALLPAPER_PRESETS[(i + delta + WALLPAPER_PRESETS.length) % WALLPAPER_PRESETS.length];
