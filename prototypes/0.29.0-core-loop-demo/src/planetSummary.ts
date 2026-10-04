@@ -55,7 +55,7 @@ import { isNewerTrim, isOrbitTrim, setSharedTrimSource, trimFor, trimmedOrbit } 
 import type { OrbitTrim } from './stationKeeping';
 import { MAX_SUMMARY_CLAIMS, cleanMove, compareMoves, decidingClaimsOf, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { isUsableOrbit, setStationTrimResolver } from './orbits';
-import { MAX_BERTHS, MAX_ORBIT_SLOTS, MAX_ROOM_TOMBSTONES, cleanBerths, currentRoomId, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationLeftPlanet, summaryGates } from './stations';
+import { MAX_BERTHS, MAX_ORBIT_SLOTS, MAX_ROOM_TOMBSTONES, cleanBerths, currentRoomId, isSummaryHead, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationLeftPlanet, summaryGates } from './stations';
 import type { KnownPlace, StationBerthRecord, StationMove, StationOrbit, StationRecord } from './stations';
 
 // ── Shapes ───────────────────────────────────────────────────────────────────
@@ -404,16 +404,13 @@ function cleanTrimGone(v: unknown, now: number): TrimGone[] | undefined {
 
 /** Shape guard + copy: a summary crosses the peer trust boundary. */
 export function cleanStationSummary(v: unknown, now = Date.now()): StationSummary | null {
-  if (!isPlainObject(v)) return null;
-  if (!isId(v.welcomeRoomId) || !isName(v.name) || !isId(v.planetId)) return null;
-  if (!Number.isInteger(v.orbitSlot) || (v.orbitSlot as number) < 0 || (v.orbitSlot as number) >= MAX_ORBIT_SLOTS) return null;
-  if (v.ownerId !== undefined && !isId(v.ownerId)) return null;
-  if (!isStamp(v.updatedAt, now)) return null;
+  // Its station, place and stamp, as every reader of a summary takes them.
+  if (!isSummaryHead(v, now)) return null;
   const out: StationSummary = {
     welcomeRoomId: v.welcomeRoomId,
     name: v.name,
     planetId: v.planetId,
-    orbitSlot: v.orbitSlot as number,
+    orbitSlot: v.orbitSlot,
     updatedAt: v.updatedAt,
   };
   // An optional berth a station record could not hold (not a door key) is

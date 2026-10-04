@@ -60,7 +60,7 @@ import { FUEL_PER_KMS } from './stationDirectory';
 import { MAX_TRIM_KM } from './stationKeeping';
 import {
   MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, orbitChangeBase, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
-  planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet, summaryGates,
+  planetById, isSummaryHead, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet, summaryGates,
 } from './stations';
 import type { MovingStation, OrbitChange, StationMove, StationOrbit, StationRecord } from './stations';
 
@@ -1050,17 +1050,17 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
 
 /** ⚓🚦 The welcome rooms of the stations whose planet summaries in a room's
  *  own doc (a far room's) list a gate in `roomId` (StationSummary.berths,
- *  taken as cleanStationSummary takes them: summaryGates, on this install's
- *  clock), in the same bounded scan as docMoves: what that room's own doc
- *  says of whose module it is. */
+ *  of a summary taken as cleanStationSummary takes one: isSummaryHead and
+ *  summaryGates, on this install's clock), in the same bounded scan as
+ *  docMoves: what that room's own doc says of whose module it is. */
 function stationsListingGateIn(doc: Y.Doc, roomId: string): Set<string> {
   const out = new Set<string>();
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return out;
   let scanned = 0;
   for (const [k, v] of doc.getMap('stationSummaries').entries()) {
     if (++scanned > SUMMARY_SCAN_MAX) break;
-    if (typeof v !== 'object' || v === null || (v as { welcomeRoomId?: unknown }).welcomeRoomId !== k) continue;
-    if (summaryGates(v as Record<string, unknown>)?.berths.some((b) => b.roomId === roomId)) out.add(k);
+    if (!isSummaryHead(v) || v.welcomeRoomId !== k) continue;
+    if (summaryGates(v)?.berths.some((b) => b.roomId === roomId)) out.add(k);
   }
   return out;
 }

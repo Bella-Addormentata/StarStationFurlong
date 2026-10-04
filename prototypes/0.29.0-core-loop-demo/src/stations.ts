@@ -235,29 +235,54 @@ export const MAX_ROOM_TOMBSTONES = MAX_BERTHS;
 /** The most room stamps one summary carries. */
 export const MAX_ROOM_STAMPS = MAX_BERTHS + MAX_ROOM_TOMBSTONES;
 
-/** ⚓🚦 A planet summary's gate list (planetSummary's StationSummary.berths)
- *  as every reader takes it across the peer trust boundary
- *  (cleanStationSummary, and a far room's dock lock, stationMove.ts): the
- *  list cleaned, with its `berthsAt`, or null when there is none to keep.
- *  An empty list is news too (the station's last gate was removed); a list
- *  whose every entry was malformed is not. Its stamp sits no further ahead
- *  of `now` than a gossip stamp may (stationAtlas). Its room stamps
- *  (`berthRoomsAt`) are counted only so far: a map larger than any list
- *  carries is junk, and so is the gate list it came with, since without its
- *  stamps each room would pass for as fresh as the whole list. */
+const isPlainRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === 'object' && v !== null && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype;
+/** A peer's stamp: finite, not negative, and no further ahead of `now` than
+ *  a gossip stamp may sit (stationAtlas). */
+const isPeerStamp = (v: unknown, now: number): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= now + MAX_GOSSIP_SKEW_MS;
+const isSummaryId = (v: unknown): v is string => typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LENGTH;
+
+/** What isSummaryHead vouches for in a planet summary. */
+export type SummaryHead = Record<string, unknown> & {
+  welcomeRoomId: string; name: string; planetId: string; orbitSlot: number; updatedAt: number;
+};
+
+/** ⚓🚦 Is `v` a planet summary (planetSummary's StationSummary) as every
+ *  reader takes one across the peer trust boundary (cleanStationSummary, and
+ *  a far room's dock lock, stationMove.ts): a plain object naming its
+ *  station's welcome room, name, planet and slot, and any owner, with a good
+ *  stamp? A summary without all of them is junk entire; each of its other
+ *  fields is taken or left out on its own (summaryGates its gate list). */
+export function isSummaryHead(v: unknown, now: number = Date.now()): v is SummaryHead {
+  return isPlainRecord(v) && isSummaryId(v.welcomeRoomId)
+    && typeof v.name === 'string' && v.name.length > 0 && v.name.length <= MAX_NAME_LENGTH
+    && isSummaryId(v.planetId)
+    && Number.isInteger(v.orbitSlot) && (v.orbitSlot as number) >= 0 && (v.orbitSlot as number) < MAX_ORBIT_SLOTS
+    && (v.ownerId === undefined || isSummaryId(v.ownerId))
+    && isPeerStamp(v.updatedAt, now);
+}
+
+/** ⚓🚦 A planet summary's gate list (StationSummary.berths) as every reader
+ *  takes it (isSummaryHead's readers): the list cleaned, with its
+ *  `berthsAt` (a good stamp), or null when there is none to keep. An empty
+ *  list is news too (the station's last gate was removed); a list whose
+ *  every entry was malformed is not. Its room stamps (`berthRoomsAt`) are
+ *  counted only so far: a map larger than any list carries is junk, and so
+ *  is the gate list it came with, since without its stamps each room would
+ *  pass for as fresh as the whole list. */
 export function summaryGates(
-  v: { berths?: unknown; berthsAt?: unknown; berthRoomsAt?: unknown },
+  v: Record<string, unknown>,
   now: number = Date.now(),
 ): { berths: StationBerthRecord[]; berthsAt: number } | null {
   if (!Array.isArray(v.berths)) return null;
   const berths = cleanBerths(v.berths);
   if (berths.length === 0 && v.berths.length > 0) return null;
   const at = v.berthsAt;
-  if (typeof at !== 'number' || !Number.isFinite(at) || at < 0 || at > now + MAX_GOSSIP_SKEW_MS) return null;
+  if (!isPeerStamp(at, now)) return null;
   const rooms = v.berthRoomsAt;
   if (rooms !== undefined) {
-    if (typeof rooms !== 'object' || rooms === null || Array.isArray(rooms)
-      || Object.getPrototypeOf(rooms) !== Object.prototype) return null;
+    if (!isPlainRecord(rooms)) return null;
     let count = 0;
     for (const _k in rooms) if (++count > MAX_ROOM_STAMPS) return null;
   }

@@ -27,6 +27,7 @@ import {
   stationForRoom,
   stationRoomCause,
   stationsAroundPlanet,
+  isSummaryHead,
   summaryGates,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
@@ -513,6 +514,20 @@ describe('stationForRoom / planetForRoom', () => {
     expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS) }, t0)).not.toBeNull();
     expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: stamps(MAX_ROOM_STAMPS + 1) }, t0)).toBeNull();
     expect(summaryGates({ berths: [gate], berthsAt: t0, berthRoomsAt: [t0] }, t0)).toBeNull();
+  });
+
+  it('takes a summary only with its station, place and a good stamp', () => {
+    const t0 = ORBIT_EPOCH_MS + 1_000_000;
+    const head = { welcomeRoomId: 'b1', name: 'ARIS YARD', planetId: 'planet-aris', orbitSlot: 0, updatedAt: t0 };
+    expect(isSummaryHead(head, t0)).toBe(true);
+    expect(isSummaryHead({ ...head, ownerId: 'owner-1', berths: 'junk' }, t0)).toBe(true);
+    for (const bad of [
+      { welcomeRoomId: 'b1', berths: [], berthsAt: t0 }, { ...head, name: '' }, { ...head, planetId: 7 },
+      { ...head, orbitSlot: MAX_ORBIT_SLOTS }, { ...head, orbitSlot: 1.5 }, { ...head, ownerId: '' },
+      { ...head, updatedAt: undefined }, { ...head, updatedAt: t0 + MAX_GOSSIP_SKEW_MS + 1 },
+    ]) expect(isSummaryHead(bad, t0)).toBe(false);
+    expect(isSummaryHead([head], t0)).toBe(false);
+    expect(isSummaryHead(null, t0)).toBe(false);
   });
 
   it('picks the planet backdrop from the station, Sovereign when unknown', () => {
