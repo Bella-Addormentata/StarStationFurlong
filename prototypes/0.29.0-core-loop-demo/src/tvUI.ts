@@ -25,6 +25,7 @@ import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
 import { consentRefusal, mediaConsent } from './tvConsent';
 import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
+import { suspendStickKeys } from './freeFlightStick';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -388,6 +389,37 @@ function wireTvNav(host: HTMLElement): void {
   }, true);
 }
 
+/** The helm's flight stick stands aside while the app is on screen
+ *  (freeFlightStick.suspendStickKeys): when the stick is taken, its capture
+ *  listener runs before this view's and swallows the arrows that step
+ *  through the remote and the Space that presses its buttons — the ship
+ *  turned or braked instead. Held exactly while tvAppOnScreen says so and
+ *  released the moment it does not: the phone closes by many paths (Tab,
+ *  Escape, WATCH, a pass's auto-enter) and the view changes through
+ *  showPhoneView, so visibility is WATCHED — the container's class and the
+ *  view's — rather than hooked at each, and the paint timer checks it too.
+ *  Its own hold, apart from the theatre's: the phone can stay up while the
+ *  theatre closes beneath it, and the other way round. */
+let stickRelease: (() => void) | null = null;
+function syncTvStick(host: HTMLElement): void {
+  const on = tvAppOnScreen(host);
+  if (on && !stickRelease) {
+    stickRelease = suspendStickKeys();
+  } else if (!on && stickRelease) {
+    stickRelease();
+    stickRelease = null;
+  }
+}
+function watchTvStick(host: HTMLElement): void {
+  if (host.dataset.tvStick) return;
+  host.dataset.tvStick = '1';
+  const observer = new MutationObserver(() => syncTvStick(host));
+  observer.observe(host, { attributes: true, attributeFilter: ['class'] });
+  const phone = host.closest<HTMLElement>('#spacephone-container');
+  if (phone) observer.observe(phone, { attributes: true, attributeFilter: ['class'] });
+  syncTvStick(host);
+}
+
 /** Land keyboard focus in the app as it opens (main.ts): Tab cannot reach
  *  it, so the paste box when the remote is held, else the first control,
  *  takes focus here — or the view itself when there is none to take it. */
@@ -403,7 +435,9 @@ export function focusTvApp(host: HTMLElement): void {
  *  active view. */
 export function renderTvPhoneApp(host: HTMLElement, deps: TvPhoneDeps): void {
   wireTvNav(host);
+  watchTvStick(host);
   const paint = () => {
+    syncTvStick(host); // every second, whatever path hid or showed the view
     if (!host.classList.contains('active')) return;
     const html = renderTvApp(deps);
     // Rebuild only when something other than the clock changed (the status
