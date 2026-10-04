@@ -135,6 +135,7 @@ import {
   type ArrivalPort,
   type ShipDockingApi,
 } from './shipArrival';
+import { readCastOffHold } from './shipDoc';
 import {
   readRouteCheckpoints,
   readRouteFlight,
@@ -777,8 +778,9 @@ export interface KeeperPassDeps {
   /** May this game dock the route's port toward `farRoomId` now (its own
    *  rights, or the carve-out)? */
   mayDock: (farRoomId: string) => boolean;
-  /** Is the pass still wanted (same stay, not in the guard band)? Asked
-   *  before each gate: a pass can take a minute per gate. */
+  /** Is the pass still wanted (same stay, not in the guard band, 🚚 no
+   *  DEPART casting off under the hold)? Asked before each gate: a pass can
+   *  take a minute per gate. */
   stillWanted: () => boolean;
   now: () => number;
 }
@@ -909,6 +911,11 @@ export interface RouteKeeperDeps {
   mayRelease?: (doorId: string) => boolean;
   /** 🚚 Is this ship towing a station (stationMove.isTowing)? Default: no. */
   towing?: () => boolean;
+  /** 🚚 Is a DEPART casting this ship off under the shared hold
+   *  (shipDoc.CastOffHold, a person's at any helm aboard)? Its docks are
+   *  that DEPART's until it ends: the keeper docks and casts off nothing
+   *  meanwhile. Default: the bound ship doc's hold. */
+  castOffHeld?: () => boolean;
   clock?: () => number;
 }
 
@@ -1026,6 +1033,13 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       return false;
     }
   };
+  const castOffHeld = (): boolean => {
+    try {
+      return deps.castOffHeld ? deps.castOffHeld() : readCastOffHold(clock()) !== null;
+    } catch {
+      return true;
+    }
+  };
 
   const flightNow = (now: number): { route: ShipRoute & { startedAt: number }; f: RouteFlight } | null => {
     const route = readShipRoute();
@@ -1123,7 +1137,7 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       console.warn('[route] keeper station read failed:', err);
     }
     const stillWanted = (): boolean => {
-      if (gen !== generation) return false;
+      if (gen !== generation || castOffHeld()) return false;
       const r = flightNow(clock());
       return !!r && r.route.startedAt === run && r.f.status === 'docked' && r.f.legSeq === legSeq
         && !r.f.skipped && !inGuardBand(r.f, clock());
@@ -1179,6 +1193,8 @@ export function createRouteKeeper(deps: RouteKeeperDeps): RouteKeeper {
       if (!isRouteRunning(readShipRoute())) { memory = null; return; }
       const docking = deps.docking();
       if (!docking) return;
+      // 🚚 A DEPART casting off under the hold has the docks until it ends.
+      if (castOffHeld()) return;
       let v: KeeperView | null = null;
       try {
         v = viewNow(now, docking);

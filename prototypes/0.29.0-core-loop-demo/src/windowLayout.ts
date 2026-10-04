@@ -16,7 +16,8 @@
 import * as THREE from 'three';
 import { computeOctagonProfile, sectionToWorld, surfaceEdge } from './hullSection';
 import type { HullSurface } from './hullSection';
-import { roomHalfExtents } from './floorPlanDoc';
+import { roomHalfExtents, roomCupola } from './floorPlanDoc';
+import { cupolaStripRun } from './cupola';
 import { readAllWindowLayout, WINDOW_DEFAULT } from './windowLayoutDoc';
 import type { HullWindows, WindowOpening } from './octagonHull';
 
@@ -67,6 +68,12 @@ export function surfaceBasis(surface: HullSurface): {
   return { uDir, vDir, normal };
 }
 
+/** 🔭 The along-axis run a window may use: the strip's, which a cupola end
+ *  wall shortens (the same run octagonHull cuts the strips to). */
+function windowRun(): [number, number] {
+  return cupolaStripRun(roomCupola(), profile().longHalf);
+}
+
 /** Snap an along/across coordinate to the 1 m lattice (windows sit on metre
  *  lines, the same feel as the pool's 1 m floor-hole cells). */
 export function snapWindowAlong(value: number): number {
@@ -76,9 +83,11 @@ export function snapWindowAlong(value: number): number {
 /** Clamp `along` so a `w`-wide opening stays within the strip run, off the ends
  *  (mirrors octagonHull.stripGeometry's own clamp so the ghost matches the hole). */
 export function clampWindowAlong(along: number, w: number): number {
-  const limit = profile().longHalf - w / 2 - WALL_INSET;
-  if (limit <= 0) return 0;
-  return Math.max(-limit, Math.min(limit, along));
+  const [lo, hi] = windowRun();
+  const min = lo + w / 2 + WALL_INSET;
+  const max = hi - w / 2 - WALL_INSET;
+  if (max <= min) return (lo + hi) / 2;
+  return Math.max(min, Math.min(max, along));
 }
 
 /** Clamp `across` so an `h`-tall opening stays within the surface's edge span
@@ -101,14 +110,16 @@ export function surfaceEdgeLen(surface: HullSurface): number {
  *  octagonHull drops it too). Matches octagonHull.clampOpening's fit test. */
 export function windowFitsSurface(surface: HullSurface, w: number, h: number): boolean {
   const p = profile();
-  return w <= 2 * p.longHalf - 0.1 && h <= surfaceEdge(p, surface).edgeLen - 0.1;
+  const [lo, hi] = windowRun();
+  return w <= hi - lo - 0.1 && h <= surfaceEdge(p, surface).edgeLen - 0.1;
 }
 
 /** The largest w×h a window can be on `surface` before it can't be cut (matches
  *  windowFitsSurface / octagonHull.clampOpening). The manual resize clamps here. */
 export function windowSizeLimits(surface: HullSurface): { maxW: number; maxH: number } {
   const p = profile();
-  return { maxW: 2 * p.longHalf - 0.1, maxH: surfaceEdge(p, surface).edgeLen - 0.1 };
+  const [lo, hi] = windowRun();
+  return { maxW: hi - lo - 0.1, maxH: surfaceEdge(p, surface).edgeLen - 0.1 };
 }
 
 /** Border kept between an auto-fit roof skylight and the panel seams (per side). */

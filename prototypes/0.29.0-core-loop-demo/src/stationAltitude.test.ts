@@ -459,8 +459,10 @@ describe('Copilot round 1', () => {
     expect(isAbortedAltitudeChange(mine)).toBe(true);
     expect(readMoveFuelDrawn()).toBe(0);
     expect(dockLockedByMove([DEFAULT_STATION_RECORD.welcomeRoomId], NOW + 30_000)).toBe(false);
-    expect(listStations({}, [OTHER], NOW + 120_000).find((s) => s.id === DEFAULT_STATION_ID)?.orbit?.radiusKm)
-      .toBe(orbitForSlot(SOV, 0).radiusKm);
+    // Back on the orbit it left: here its slot's own (no orbit of its own).
+    const me = listStations({}, [OTHER], NOW + 120_000).find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(me.move).toBeUndefined();
+    expect(me.orbit?.radiusKm ?? orbitForSlot(SOV, 0).radiusKm).toBe(orbitForSlot(SOV, 0).radiusKm);
   });
 
   it('keeps the altitude flown until a later move leaves, and for good when it is cancelled', () => {
@@ -792,7 +794,7 @@ describe('Copilot round 10 (on PR 205)', () => {
 
     const hop = climbOf('x', 'x-room', 1, 1_000, NOW);
     const thruster: StationMove = {
-      ...hop, mode: 'thrusters', orbit: undefined, toPlanetId: hop.fromPlanetId, toSlot: 3, bookedAt: NOW,
+      ...hop, mode: 'thrusters', orbit: undefined, toPlanetId: 'planet-aris', toSlot: 3, bookedAt: NOW,
       fromOrbit: { radiusKm: SOV_R + 1_000, phase0: 0, since: NOW - 10 },
     };
     delete (thruster as { orbit?: unknown }).orbit;
@@ -906,15 +908,16 @@ describe('Copilot round 14', () => {
     };
     const bMove: StationMove = {
       stationId: 'b', welcomeRoomId: 'b-room', fromPlanetId: SOV, fromSlot: 1, toPlanetId: 'planet-aris', toSlot: 0,
-      departAt: aHold.arriveAt + 3_000_000, arriveAt: aHold.arriveAt + 9_000_000, mode: 'thrusters', bookedAt: aHold.arriveAt + 600,
+      departAt: aHold.arriveAt + 3_000_000, arriveAt: aHold.arriveAt + 9_000_000, mode: 'tug', tugRoomId: 'tug-room', bookedAt: aHold.arriveAt + 600,
       fuel: 5, fuelDrawn: 5, fromOrbit: { radiusKm: SOV_R + 1_020, phase0: 0, since: aHold.arriveAt + 500 },
     };
     // Cancelled: a pin keeps the held orbit for good.
     const bPin: StationMove = {
-      ...bMove, fromOrbit: undefined, toPlanetId: SOV, toSlot: 1, departAt: bMove.departAt + 1, arriveAt: bMove.departAt + 2,
-      settles: bMove, fuel: 0, fuelDrawn: 0, bookedAt: bMove.departAt,
+      ...bMove, fromOrbit: undefined, mode: 'thrusters', tugRoomId: undefined, toPlanetId: SOV, toSlot: 1,
+      departAt: bMove.departAt + 1, arriveAt: bMove.departAt + 2, settles: bMove, fuel: 0, fuelDrawn: 0, bookedAt: bMove.departAt,
     };
     delete bPin.fromOrbit;
+    delete bPin.tugRoomId;
     expect(isStationMove(bPin)).toBe(true);
     expect(lostAltitudeClaims([aHold, aNext, aNext2, bPin]).has(altitudeMoveKey(bPin))).toBe(true);
     expect(lostAltitudeClaims([aNext2, bPin]).has(altitudeMoveKey(bPin))).toBe(false);
