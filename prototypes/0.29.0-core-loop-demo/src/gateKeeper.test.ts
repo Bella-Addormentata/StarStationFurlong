@@ -1002,6 +1002,80 @@ describe('docking from the station side', () => {
     expect(r).toEqual({ ok: false, reason: 'refused' });
     expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
   });
+
+  // 🚚 As a ship's DOCK rechecks where its berth's station orbits once the
+  // far room's moves are learned (docking.ts redockPort, shipArrival.
+  // berthStillThere): a station found gone to another planet since the dock
+  // began is out of the ferry's reach.
+  describe('where this station orbits', () => {
+    const SOV_1 = 'adrift:planet-sovereign:1';
+    const ARIS_2 = 'adrift:planet-aris:2';
+    const dockWhere = (station: Y.Doc, ferry: Y.Doc, place: () => string | undefined, wait: (ms: number) => Promise<void> = instant) =>
+      stationDock({
+        session: sessionOn(ferry),
+        gate: { ...gateEndOn(station), place },
+        shipRoomId: FERRY,
+        shipPort: PORT,
+        berthing: BERTHING,
+        now: () => D0,
+        wait,
+      });
+
+    it('docks while the station stays where it orbited as the dock began', async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      expect(await dockWhere(station, ferry, () => SOV_1)).toEqual({ ok: true, dockedAt: D0 });
+      expect(readDoorFrom(station, 'x+')).toEqual(dockOf(D0));
+      expect(readDoorFrom(ferry, PORT)).toEqual(portDockedAt(D0));
+    });
+
+    it("takes its claim back, asking nothing of the ferry, when the station is found gone while the claim settles", async () => {
+      const station = stationWith(memoryOf(T0 - HOUR));
+      const ferry = ferryDoc();
+      let at = SOV_1;
+      const r = await dockWhere(station, ferry, () => at, async () => { at = ARIS_2; });
+      expect(r).toEqual({ ok: false, reason: 'disabled' });
+      expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+      expect(readDoorFrom(ferry, PORT)).toEqual(leftStop0());
+    });
+
+    it("withdraws the dock at both ends when the station is found gone once the ferry's side has landed", async () => {
+      // Between planets now, or arrived at another: either way not where
+      // the dock began.
+      for (const found of [undefined, ARIS_2]) {
+        const station = stationWith(memoryOf(T0 - HOUR));
+        const ferry = ferryDoc();
+        let at: string | undefined = SOV_1;
+        let n = 0;
+        const r = await dockWhere(station, ferry, () => at, async () => { if (++n === 2) at = found; });
+        expect(r).toEqual({ ok: false, reason: 'disabled' });
+        expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+        expect(readDoorFrom(ferry, PORT)).toEqual(
+          buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }),
+        );
+      }
+      // A lone module (no station to place) has nothing to recheck.
+      expect(await dockWhere(stationWith(memoryOf(T0 - HOUR)), ferryDoc(), () => undefined)).toEqual({ ok: true, dockedAt: D0 });
+    });
+
+    it("learns the moves the ferry's room holds before judging where the station orbits", () =>
+      withStorage(async () => {
+        const station = stationWith(memoryOf(T0 - HOUR));
+        const ferry = ferryDoc();
+        // This station left for another planet, booked in another of its
+        // rooms: this game never heard of it, but the ferry's room gossips it
+        // (planetSummary.ts).
+        const move: StationMove = { ...ferryMove(D0 - 2 * HOUR), stationId: 'st-1', welcomeRoomId: HERE };
+        ferry.getMap('stationSummaries').set(HERE, { welcomeRoomId: HERE, move });
+        const heard = () => readRememberedMoves().some((m) => m.welcomeRoomId === HERE);
+        expect(heard()).toBe(false);
+        const r = await dockWhere(station, ferry, () => (heard() ? ARIS_2 : SOV_1));
+        expect(r).toEqual({ ok: false, reason: 'disabled' });
+        expect(heard()).toBe(true);
+        expect(readDoorFrom(station, 'x+')).toEqual(memoryOf(D0 + 1));
+        expect(readDoorFrom(ferry, PORT)).toEqual(leftStop0());
+      }));
+  });
 });
 
 describe('casting off from the station side', () => {
@@ -1490,6 +1564,29 @@ describe('the gate keeper over a stand-in session', () => {
       expect(readDoorFrom(h.station, 'x+')).toEqual(dockOf(x));
       expect(readDoorFrom(h.ferry, PORT)).toEqual(portDockedAt(x));
     }));
+
+  // 🚚 The gate's end reads where this room's station orbits (main.ts:
+  // shipArrival.releasePlaceOf), and a dock counts only while it stays put.
+  it('withdraws a dock at both ends when this station is found gone from where it orbited as the dock began', async () => {
+    const { h, deps } = harness();
+    let at = 'adrift:planet-sovereign:1';
+    const asked = new Set<string>();
+    deps.stationPlace = (roomId) => {
+      asked.add(roomId);
+      return at;
+    };
+    let n = 0;
+    h.wait = async () => { if (++n === 2) at = 'adrift:planet-aris:2'; };
+    const keeper = createGateKeeper(deps);
+    await tickAt(keeper, h, ARRIVE - GATE_PRE_DIAL_MS);
+    await tickAt(keeper, h, ARRIVE + SEC);
+    await tickAt(keeper, h, D0);
+    expect([...asked]).toEqual([HERE]);
+    expect(readDoorFrom(h.station, 'x+')).toEqual(memoryOf(D0 + 1));
+    expect(readDoorFrom(h.ferry, PORT))
+      .toEqual(buildDoorTombstone(seed(HERE), { farDoor: 'x+', farWall: 'x+', farLateral: 0, undockedAt: D0 + 1 }));
+    expect(h.notes).toEqual([]);
+  });
 
   /** A dock the ferry's port holds alone at gate x+ (its far write never
    *  landed) where `setUp` keeps the gate from taking it: the keeper watches

@@ -54,8 +54,10 @@
  * hold one stamp. A refused or lost ferry side takes the claim back, as does
  * a gate whose AUTO-DOCK is switched off (or that stops admitting the ferry)
  * while its claim settles, or a station move, a tow or this room's flight
- * that starts meanwhile; once the ferry's side has docked too, such a gate
- * has the dock withdrawn at both ends. The gate is read again before the
+ * that starts meanwhile, or this station found gone from where it orbited as
+ * the dock began (by the moves the ferry's room holds, learned as a far write
+ * learns them); once the ferry's side has docked too, such a gate has the
+ * dock withdrawn at both ends. The gate is read again before the
  * dock counts, or before it takes a crossing DOCK's stamp: another game may
  * have written over the claim while the ferry's side was asked, and then the
  * gate keeps what it holds and the keeper's next look settles the ferry's
@@ -836,6 +838,10 @@ export interface GateEnd {
    *  AUTO-DOCK still on, admitting the ferry, and may this room dock now (no
    *  station move or tow locks it, and the room is not in flight)? */
   live: () => boolean;
+  /** 🚚 Where this room's station orbits now, by the moves this game knows
+   *  (shipArrival.releasePlaceOf): none for a lone module, or for a station
+   *  between planets. Default: none. */
+  place?: () => string | undefined;
 }
 
 export type StationDockResult =
@@ -868,8 +874,9 @@ export type StationDockResult =
         /** The gate stopped being one this keeper docks at while its claim
          *  or its dock settled (AUTO-DOCK switched off, it no longer admits
          *  the ferry, a station move, a tow or this room's flight locks it,
-         *  or the keeper reset): the claim is taken back, or a dock both ends
-         *  held is withdrawn at both, where it may be. */
+         *  its station was found gone from where it orbited as the dock
+         *  began, or the keeper reset): the claim is taken back, or a dock
+         *  both ends held is withdrawn at both, where it may be. */
         | 'disabled';
       /** A withdrawn dock's release was written to the ferry's room but
        *  never acknowledged: its port may still hold the gate, which has let
@@ -884,7 +891,8 @@ export type StationDockResult =
  * lost ferry side takes the claim back. A port already docked to this gate is
  * joined; a claim on the ferry the gate already holds is left to land. A dock
  * counts only while both ends hold its stamp, and nothing is written over a
- * gate record another game wrote meanwhile. A gate no longer live (GateEnd)
+ * gate record another game wrote meanwhile. A gate no longer live (GateEnd),
+ * or whose station is found gone from where it orbited as the dock began,
  * once the dock has landed has it withdrawn at both ends. The request
  * carries no requester key: nobody aboard docks it, so a ferry port open only
  * to granted captains refuses it, whoever stands in the station. Never
@@ -901,6 +909,23 @@ export async function stationDock(o: {
 }): Promise<StationDockResult> {
   const { session, gate, shipRoomId, shipPort, berthing } = o;
   const doc = session.doc;
+  // 🚚 Where this station orbits as the dock begins (none for a lone module).
+  const berthAt = gate.place?.();
+  /** Is the gate still one this keeper docks at, its station still where it
+   *  orbited as the dock began? The moves the ferry's room holds are learned
+   *  first, as a far write learns its room's (farDoorWrite.writeAndSettle):
+   *  a station found gone since (left for another planet, on a list here
+   *  that had not heard) is out of the ferry's reach, and a dock to it would
+   *  carry the ferry across without a transfer (as docking.ts redockPort
+   *  rechecks shipArrival.berthStillThere). */
+  const stillLive = (): boolean => {
+    try {
+      rememberMovesIn(doc);
+    } catch (err) {
+      console.warn('[gate] reading the moves in the ferry room failed:', err);
+    }
+    return gate.live() && gate.place?.() === berthAt;
+  };
   const held = (rec: DoorRecord | undefined): rec is DoorPairing => holdsFerry(rec, shipRoomId, shipPort);
   const pairingAt = (dockedAt: number): DoorPairing =>
     buildDoorPairing(berthing.address, {
@@ -1000,7 +1025,7 @@ export async function stationDock(o: {
   }
   // No keeper settles a claim at a gate that is no longer auto-dock: it is
   // taken back before the ferry's side is asked.
-  if (!gate.live()) {
+  if (!stillLive()) {
     takeBack();
     return { ok: false, reason: 'disabled' };
   }
@@ -1042,7 +1067,7 @@ export async function stationDock(o: {
     // (stamp-scoped at the ferry's side), so a dock that landed after all is
     // not left there; a live gate keeps its claim. Either way a fresh
     // session reads what the ferry's room holds (gateFixes settles it).
-    if (!gate.live()) await withdraw();
+    if (!stillLive()) await withdraw();
     return { ok: false, reason: 'unconfirmed' };
   }
   // 3. Concurrent claims on the ferry's port get a moment; then only the claim
@@ -1065,7 +1090,7 @@ export async function stationDock(o: {
       // A DOCK that crossed this one holds the ferry's port: the gate takes
       // its stamp only while it is still one this keeper docks at. Else the
       // claim is taken back, and that dock is its maker's (or gateFixes').
-      if (gate.live()) return rejoin(lost.stamp);
+      if (stillLive()) return rejoin(lost.stamp);
       takeBack();
       return { ok: false, reason: 'disabled' };
     }
@@ -1077,7 +1102,7 @@ export async function stationDock(o: {
   // docks at while the ferry's side was asked and settled has it withdrawn,
   // as its claim would have been taken back before the ferry's side was
   // asked (and as a ship's DOCK takes back its far write once it departed).
-  return gate.live() ? { ok: true, dockedAt } : withdraw();
+  return stillLive() ? { ok: true, dockedAt } : withdraw();
 }
 
 /**
@@ -1177,6 +1202,10 @@ export interface GateKeeperDeps {
   writeDoor: (doorId: string, rec: DoorRecord) => void;
   /** Is a dock between these rooms locked by a station move? */
   dockLocked?: (roomIds: string[], now: number) => boolean;
+  /** 🚚 Where the station the room `roomId` belongs to orbits
+   *  (shipArrival.releasePlaceOf): none for a lone module, or for a station
+   *  between planets. Default: none. */
+  stationPlace?: (roomId: string, now: number) => string | undefined;
   /** May this room take a pairing now (its own flight)? Default: yes. */
   mayPair?: () => boolean;
   /** A fresh "is this room part of the stop's station?" per read
@@ -1376,6 +1405,7 @@ export function createGateKeeper(deps: GateKeeperDeps): GateKeeper {
         && safe(() => (deps.gates() ?? []).some((g) => g.doorId === doorId && admitsFerry(g, w.ship)), false)
         && !safe(() => deps.dockLocked?.([roomId, w.ship], clock()) === true, false)
         && safe(deps.mayPair, true),
+      place: () => safe(() => deps.stationPlace?.(roomId, clock()), undefined),
     };
   };
 

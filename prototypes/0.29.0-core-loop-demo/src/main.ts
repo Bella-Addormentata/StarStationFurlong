@@ -135,7 +135,8 @@ import {
   shipFuelCapacity,
 } from "./devices";
 import {
-  berthPassFor, completeArrival, dockedToStation, keepRestPlace, restAtRouteEnd, setBerthSeedResolver, shipPlaceId,
+  berthPassFor, completeArrival, dockedToStation, keepRestPlace, releasePlaceOf, restAtRouteEnd, setBerthSeedResolver,
+  shipPlaceId,
 } from "./shipArrival";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
@@ -1493,6 +1494,9 @@ const gateKeeper = createGateKeeper({
   },
   // 🚚 A station between planets, or a tug's tow, holds its docks.
   dockLocked: dockLockedByMove,
+  // 🚚 …and a dock made over the ferry's room rechecks where this station
+  // orbits once that room's moves are learned (gateKeeper.stationDock).
+  stationPlace: releasePlaceOf,
   mayPair: () => pairingAllowedByFlight(readResolvedFlight()).ok,
   sameStation: sameStationReader,
   towing: (shipRoomId, now) => towHoldsDock([shipRoomId], now),
