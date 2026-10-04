@@ -369,7 +369,18 @@ In code: #207 (the TV) and #208 (the cabinet).
   (redirects capped) — an allowed host can redirect anywhere, and a redirect
   that is not re-admitted is the end of the fetch. A size ceiling, a timeout
   on both ends of the pipe (an upstream that stalls, a reader that stops
-  reading) and a cap on concurrent fetches. And the RESPONSE is bytes, never
+  reading) and a cap on concurrent fetches. The REQUEST upstream is built
+  from nothing, never copied from the browser's: in the same-origin
+  deployment the browser's request carries the app's own cookies and
+  whatever `Authorization` it holds, so the proxy sends an allowlist of its
+  own making — GET or HEAD, `Host`, `Range` (with `If-Range`,
+  `If-None-Match` and `If-Modified-Since` as validators), a fixed
+  `User-Agent`, `Accept: */*` and `Accept-Encoding: identity` — and nothing
+  else: no `Cookie`, `Authorization`, `Origin`, `Referer` or fetch-metadata
+  header reaches a media host. Identity encoding is forced, and an upstream
+  answer that carries `Content-Encoding` anyway is refused, since an encoded
+  body breaks the byte offsets `Content-Length` and `Content-Range`
+  promise. And the RESPONSE is bytes, never
   the upstream's headers: the proxy forwards an allowlist of them only —
   `Content-Type` (checked: a media or octet-stream type, else the fetch
   ends), `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`,
@@ -570,7 +581,8 @@ frame, each carrying one signed frame and verified whole; 20 ms Opus frames
 → node → iroh fan-out as
 a `media` lane the node and every hub forward without being able to read →
 viewers' `VideoDecoder` → three.js `VideoFrameTexture` — added upstream in
-early 2025, after the r167 the prototype pins (`three` 0.167.1), so the
+r173 (January 2025, `src/textures/VideoFrameTexture.js`), after the r167
+the prototype pins (`three` 0.167.1), so the
 video lane carries a three.js upgrade with a regression pass of the
 renderer (the hole-punch spike touches the same file), or, until it lands,
 an equivalent uploader on r167: each decoded `VideoFrame` drawn into an
