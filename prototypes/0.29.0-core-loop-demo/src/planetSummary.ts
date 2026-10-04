@@ -1163,9 +1163,7 @@ export function refreshTrims(store: Store = readStore()): void {
   trimsByStationId = next;
 }
 
-/** Install the orbit trim resolver over what this install knows, and the
- *  same trims as the station helm's shared trim, so every helm room of a
- *  station goes on from its newest. */
+/** Install the orbit trim resolver over what this install knows. */
 export function installTrimResolver(): void {
   setStationTrimResolver((station, slot) => {
     const trim = trimsByStationId.get(station.id);
@@ -1173,6 +1171,8 @@ export function installTrimResolver(): void {
     const applies = trimFor(station, trim);
     return applies ? trimmedOrbit(slot, applies) : null;
   });
+  // The same trims are the station helm's shared trim: every helm room of a
+  // station goes on from its newest (stationKeeping.readSharedTrim).
   setSharedTrimSource((station) => trimsByStationId.get(station.id) ?? null);
 }
 

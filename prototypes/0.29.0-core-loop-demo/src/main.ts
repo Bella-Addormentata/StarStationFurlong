@@ -1262,7 +1262,7 @@ function ownStationOf(roomId: string): string | null {
  *  wearing engine, tank and helm keeps its orbit, it never flies). */
 function planetShipStatus(): ShipStatusInput | null {
   const roomId = activeBootstrap?.roomId ?? "";
-  if (!roomId || !isShipReady() || isStationRoom(roomId, []) || isBoltedIntoStation(readAllDoors(), roomId)) return null;
+  if (!roomId || !isShipReady() || isStationRoom(roomId, []) || isBoltedIntoStation(readPhysicalDoors(), roomId)) return null;
   const rec = readFlightRecord();
   const stations = listStations();
   const byId = (id: string | undefined) => (id ? stations.find((st) => st.id === id) : undefined);
@@ -1637,7 +1637,7 @@ async function joinRoomAtEpoch(
     notShipRoom: () => {
       const roomId = activeBootstrap?.roomId ?? "";
       if (!roomId) return null;
-      return isShipReady() && !isStationRoom(roomId, []) && !isBoltedIntoStation(readAllDoors(), roomId) ? null : roomId;
+      return isShipReady() && !isStationRoom(roomId, []) && !isBoltedIntoStation(readPhysicalDoors(), roomId) ? null : roomId;
     },
   });
 
