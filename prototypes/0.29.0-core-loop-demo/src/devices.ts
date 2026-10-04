@@ -1181,6 +1181,11 @@ export interface MapTableDeps {
   currentDoors?: () => Array<{ id: string; label: string }>;
   /** 🗺️ Step back from the table and open a door's own panel. */
   openDoorPanel?: (doorId: string) => void;
+  /** ✏️ #192: does this install hold a pass to that module (the atlas's
+   *  BEAM INTO for another module of the station)? */
+  canBeamTo?: (roomId: string) => boolean;
+  /** ✏️ Step back from the table and beam into that module. */
+  beamTo?: (roomId: string) => void;
   /** 🗺️ The local player's id, so a module's owner can read "You". */
   playerId?: () => string;
   /** 🗺️ The local identity key: "You" still, back on a fresh player id. */
@@ -1286,6 +1291,8 @@ export function createMapTableUI(deps: MapTableDeps = {}): DeviceUI {
           dismantled: () => dismantledRoomIds(),
           doors: () => stationPlanDeps.currentDoors?.() ?? [],
           openDoorPanel: (doorId) => stationPlanDeps.openDoorPanel?.(doorId),
+          canBeamTo: (roomId) => stationPlanDeps.canBeamTo?.(roomId) ?? false,
+          beamTo: (roomId) => stationPlanDeps.beamTo?.(roomId),
           onBack: () => stationPlanView?.hide(),
           disassembly: () => ({
             jobs: readDisassemblyJobs(),
