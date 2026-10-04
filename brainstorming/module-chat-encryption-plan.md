@@ -296,9 +296,10 @@ and group encrypt/decrypt, but is explicitly not a drop-in for the upstream pack
 
 Against that, SSF's stated posture is `keyed-identity-contacts-plan.md:108-110` — *"no servers, PKI,
 CA, key-directory"*, with runtime dependencies today of exactly `@noble/ed25519`, `@noble/hashes`,
-`msgpackr`, `three`, `yjs` and the `y-*` family (`package.json`). Adding an AGPLv3 WASM blob would be
-the single largest dependency and licence decision in the project's history, to obtain mechanics that
-are roughly 300 lines of `@noble` calls.
+`msgpackr`, `three`, `yjs` and the `y-*` family (`prototypes/0.29.0-core-loop-demo/package.json` —
+there is no root manifest carrying dependencies). Adding an AGPLv3 WASM blob would be the single
+largest dependency and licence decision in the project's history, to obtain mechanics that are
+roughly 300 lines of `@noble` calls.
 
 **Build the mechanics, not the import.** Adding `@noble/curves` (X25519) and `@noble/ciphers`
 (XChaCha20-Poly1305 — matching the AEAD the node already uses) keeps the thin-dependency,
@@ -310,11 +311,17 @@ hygiene.** `@noble/curves` ≥ 2.3.0 and `@noble/ciphers` ≥ 2.4.0; a fresh ins
 for both today. The difference between the two floors is the point of this paragraph, and in the
 second case the changelog actively misleads.
 
-- **`@noble/curves` 2.3.0 (2026-08-06) hardened X25519 scalar multiplication** — secret-scalar
-  blinding, a constant-time fixed-window multiply for unprecomputed points, and a rebuilt ladder —
-  closing a remote timing attack that could learn up to 4.036 bits of a long-term private key
-  across many samples. Upstream scopes the impact as *primarily* fingerprinting, not key recovery.
-  This floor reaches **both** routes in §3.2, because both end at `x25519.getSharedSecret`, which
+- **`@noble/curves` 2.3.0 (2026-08-06) rebuilt the X25519 ladder**, inside a wider constant-time
+  pass that also brought secret-scalar blinding and a fixed-window multiply for unprecomputed
+  points, closing a remote timing attack that could learn up to 4.036 bits of a long-term private
+  key across many samples. Upstream scopes the impact as *primarily* fingerprinting, not key
+  recovery. Attribute the mechanism carefully, because the release reads as one change and is
+  three, of which only the ladder is on this path: the blinding and the fixed-window multiply are
+  `ScalarMultiplier` methods in `abstract/curve.js`, reached through Edwards and Weierstrass
+  *point* multiplication, while `abstract/montgomery.js` — the module `x25519` is built from —
+  imports exactly one name from that file, `createKeygen`. The rewrite this floor actually buys is
+  inside `montgomery.js` itself: 163 lines added and 30 removed, 177 becoming 311. This floor
+  reaches **both** routes in §3.2, because both end at `x25519.getSharedSecret`, which
   is that ladder. What differs is the blast radius. Under the recommended route the X25519 key is
   its own, so what leaks is bits of a key that signs nothing and anchors no identity — and the
   fingerprinting framing is moot there in any case, since the public half is already in the contact
@@ -324,8 +331,9 @@ second case the changelog actively misleads.
 - **The same release applied the Trail of Bits review, which corrected the Edwards→Montgomery
   conversion** — scope that precisely, because it is easy to overstate. In 2.2.0 the public-key
   helper chose the Montgomery form from `lengths.publicKey`, the *curve's* declared key size rather
-  than anything about the key passed in, so any Edwards curve with 32-byte public keys was handed
-  the Curve25519 map whatever it should have used, and every other curve threw
+  than anything about the key passed in, and that dispatch had two wrong branches rather than one:
+  a 32-byte declared key size was handed the Curve25519 map and a 57-byte one the ed448 map, each
+  whatever the curve should actually have used, and only a size that was neither threw
   `only defined for 25519 and 448`. 2.3.0 moved the map into each curve's own declaration and made
   the generic wrapper throw `Montgomery conversion is not supported for this curve` when a curve
   supplies none. **For ed25519 nothing changed** — `Fp.div(1 + y, 1 - y)` before and after, same
@@ -334,18 +342,20 @@ second case the changelog actively misleads.
 - **`@noble/ciphers` has no equivalent fix, and its changelog cannot be read for one.** 2.3.0 does
   touch XChaCha20-Poly1305 — the cipher gained a `withAAD: true` parameter so it keeps accepting
   AAD under the new strictness rule, and `hchacha`, the X in XChaCha, was reimplemented on top of
-  the shared `chachaCore` — and the release notes end in "Other minor corrections", so no
-  exhaustive negative is derivable from them at all. Only measurement settles it, and it does: the
-  AEAD with and without AAD, `chacha20poly1305`, and the raw `xchacha20` stream are byte-identical
-  across 2.2.0, 2.3.0 and 2.4.0, and ciphertext written by 2.2.0 decrypts unchanged on 2.4.0. So
-  nothing here is known to bite. Two smaller things still argue for the floor: 2.3.0 turned
-  *silently ignoring* AAD into a throw for ciphers that lack it, which is a real guard if this
-  design ever wraps or substitutes a non-AAD primitive while still passing `roomId‖epoch`; and
-  2.4.0 makes a cleaned PRG fail closed instead of continuing from a zeroed key, which matters if
-  §6 draws nonces from the `rngChacha20` this package also exports. 2.4.0's other item does **not**
-  apply: the AEAD encrypts in place, so it always runs the new overlap guard and can never trip it.
-  Only a direct `xchacha20(key, nonce, data, output)` with a caller-supplied, later-starting view
-  throws.
+  the shared `chachaCore` — and the notes carry a catch-all, "Other minor corrections", the fifth
+  of six bullets under *Hardening*, so no exhaustive negative is derivable from them at all. Only
+  measurement settles it, and it does: the AEAD with and without AAD, `chacha20poly1305`, and the
+  raw `xchacha20` stream are byte-identical across 2.2.0, 2.3.0 and 2.4.0, and ciphertext written
+  by 2.2.0 decrypts unchanged on 2.4.0. So nothing here is known to bite. Two smaller things still
+  argue for the floor: 2.3.0 turned *silently ignoring* AAD into a throw for ciphers that lack it,
+  which is a real guard if this design ever wraps or substitutes a non-AAD primitive while still
+  passing `roomId‖epoch`; and 2.4.0 makes a cleaned PRG fail closed instead of continuing from a
+  zeroed key, which matters if §6 draws nonces from the `rngChacha20` this package also exports.
+  2.4.0's other item does **not** apply: the raw-stream entry points gained an overlap check, and
+  the AEAD drives the stream with a single view as both input and output (`chacha.js:350`), so it
+  runs that check on every call and can never trip it — the guard throws only when the two views
+  share a buffer *and* the output starts later. Only a direct
+  `xchacha20(key, nonce, data, output)` with a caller-supplied, later-starting view trips it.
 
 Nothing is exposed today: neither package is a dependency —
 `prototypes/0.29.0-core-loop-demo/package.json` carries `@noble/ed25519` and `@noble/hashes` and no
@@ -355,7 +365,9 @@ Montgomery conversion in any 2.x inside the declared `^2.1.0` range. (Its point 
 say there is "no X25519 key anywhere in the codebase". Count the real cost before committing,
 though: `@noble/curves` pins `@noble/hashes` to an *exact* version — 2.4.0 for curves 2.4.0 — while
 the tree asks for `^1.5.0`, so the install carries the same hash library twice at different majors
-until that top-level pin is raised. `@noble/ciphers` has no dependencies at all. The floors bind
+until that top-level pin is raised. `@noble/ciphers` has no dependencies at all. Both packages
+also declare `engines: node >= 20.19.0`; CI clears that today, but only implicitly, since
+`ci.yml:36` asks for `node-version: 20` and takes whatever 20.x that resolves to. The floors bind
 the commit that adds these packages, and are worth writing down now precisely because a fresh
 install already satisfies them — which is how a floor goes unwritten and is then met only by luck.
 The two pins already in the tree are the cautionary case: `@noble/ed25519` sits at `^2.1.0` against
