@@ -10,16 +10,18 @@
  * whole pass, what a pass writes, the helm's lines — and whole ferry trips
  * over real ship + doors docs with a stand-in docking system.
  */
+import { destinationsFromRecords } from './stationDirectory';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { berthMemoryFrom, classifyDockPort, dockAnswerOf, redockRecord, stampAfter } from './dockRules';
 import type { DockAnswer } from './dockRules';
 import { dockChain } from './adapter';
+import { bindDoorLayoutDoc, seedDoorLayoutSingle, writeDoorLayout } from './doorLayoutDoc';
 import {
   bindDoorsDoc,
   buildDoorPairing,
-  readAllDoors,
   readDoor,
+  readPhysicalDoors,
   writeDoorPairing,
   writeDoorTombstone,
 } from './doorsDoc';
@@ -778,10 +780,11 @@ function fakeDocking(clock: () => number, answer: (roomId: string, farDoor: stri
 }
 
 /** The ship's live docks as main.ts reads them (same berth room only; 🛟
- *  a dock on any door but the route's port holds the stay). */
+ *  a dock on any door but the route's port holds the stay; only the room's
+ *  own doors). */
 function testLiveDock(): LiveDockAt {
   const docks: Array<{ roomId: string; dockedAt: number; doorId: string }> = [];
-  for (const [doorId, rec] of readAllDoors()) {
+  for (const [doorId, rec] of readPhysicalDoors()) {
     if (rec.paired !== true) continue;
     const st = classifyDockPort(rec);
     if (st.kind !== 'docked') continue;
@@ -876,6 +879,37 @@ describe('a dock pass over the gate list', () => {
     expect((await at(route.stops[1].planetId)).verdict.kind).toBe('docked');
   });
 
+  it('🎚️ a stop whose station has changed altitude since the route copied it is skipped as gone', async () => {
+    const d = fakeDocking(clock);
+    const stop = { ...route.stops[1], orbit: { radiusKm: 8_000, phase0: 0.2 } };
+    // The station as the game's directory lists it, orbit and all.
+    const listed = (radiusKm: number) => destinationsFromRecords([{
+      id: 'st', name: 'ST', planetId: stop.planetId, orbitSlot: stop.orbitSlot, welcomeRoomId: stop.berth.roomId,
+      orbit: { radiusKm, phase0: 0.2 },
+    }], () => undefined)[0];
+    expect(listed(8_000).orbit).toEqual({ radiusKm: 8_000, phase0: 0.2 });
+    const at = (orbit: { radiusKm: number; phase0: number } | undefined) => runKeeperPass({
+      docking: d.api,
+      route,
+      stop,
+      station: { ...station, planetId: stop.planetId, ...(orbit ? { orbit } : {}) },
+      shipRoomId: 'ship-1',
+      mayDock: () => true,
+      stillWanted: () => true,
+      now: clock,
+    });
+    const climbed = await at(listed(9_000).orbit);
+    expect(climbed.verdict).toEqual({ kind: 'skip' });
+    expect(skipWhyOf(climbed.results)).toBe('gone');
+    // Back on its slot's own orbit is a change too.
+    expect((await at(undefined)).verdict).toEqual({ kind: 'skip' });
+    expect(d.asked).toHaveLength(0);
+    // Back at the same altitude on another phase is a change too.
+    expect((await at({ radiusKm: 8_000, phase0: 1.2 })).verdict).toEqual({ kind: 'skip' });
+    // Still on the orbit the route copied: asked as before.
+    expect((await at(listed(8_000).orbit)).verdict.kind).toBe('docked');
+  });
+
   it('never re-points a port this rider may not dock', async () => {
     const d = fakeDocking(clock);
     const locked: ShipDockingApi = { ...d.api, ports: () => d.api.ports().map((p) => ({ ...p, canOperate: false })) };
@@ -898,6 +932,11 @@ describe('the keeper over a running ferry', () => {
     const doc = new Y.Doc();
     bindShipDoc(doc);
     bindDoorsDoc(doc);
+    // The ferry's own doors: the route's port and a second port. Only a
+    // pairing on one of them is a dock (doorsDoc.readPhysicalDoors).
+    bindDoorLayoutDoc(doc);
+    seedDoorLayoutSingle('x-');
+    writeDoorLayout({ id: 'y+', wall: 'y+', lateral: 0, size: 'large', enabled: true, placed: true });
     setBerthSeedResolver((room) => seed(room));
     uninstall = installRouteFlight({ capacity: () => CAP, liveDock: testLiveDock, clock });
     // Docked at stop 0's berth, then START.
@@ -1198,6 +1237,24 @@ describe('the keeper over a running ferry', () => {
     now = ms(readRouteFlight(now)!.departsAt! + SEC);
     keeper.tick();
     expect(portRoom()).toBeNull();
+  });
+
+  it('🚪 never counts a pairing a peer floods onto a door the ferry lacks as a dock', () => {
+    // A snapshot's worth of them (doorsDoc.MAX_PAIRINGS), none of which a
+    // rider may let go of: read as docks, they would hold the ferry for good.
+    for (let i = 0; i < 64; i++) {
+      writeDoorPairing(`d:flood-${i}`, seed('room-9'), buildDoorPairing(seed('room-9'), {
+        segments: dockChain(), farDoor: 'x+', transient: true, dockedAt: T0 - MIN,
+      }));
+    }
+    const d = fakeDocking(clock);
+    const keeper = keeperWith(d, [], { mayRelease: (id) => !id.startsWith('d:flood-') });
+    const s = start();
+    now = ms(s.departAt + 2 * SEC);
+    keeper.tick();
+    expect(portRoom()).toBeNull();
+    expect(d.undocks).toEqual(['x- (keeper)']);
+    expect(readRouteFlight(now)?.status).toBe('in-flight');
   });
 
   it('casting off in flight remembers no berth (the stop it left is not where the dock is)', () => {

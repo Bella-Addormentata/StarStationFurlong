@@ -9,12 +9,12 @@
  * none for an authoritative-empty one), the sea/raft coupling, and the
  * keep-clear ground + ADD passes for players and stand-points.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { bindFloorPlan, writeRoomDims } from './floorPlanDoc';
-import { bindRobotDoc, readRobotConfig } from './robotDoc';
+import { assignDisassembly, bindRobotDoc, readDisassemblyJob, readRobotConfig } from './robotDoc';
 import { bindDoorLayoutDoc, seedDoorLayoutEmpty, doorSetIsMarkedEmpty } from './doorLayoutDoc';
-import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag } from './furnitureDoc';
+import { bindFurnitureDoc, subscribeFurniture, readAllFurniture, peerIdTag, writeFurnitureItem } from './furnitureDoc';
 import { ROOM_TEMPLATES, placeFitting, templateItemsFor, overlayEnvelopeBoxes, roomOccupancy, addRoomTemplateItems, applyRoomTemplate, reconcileConcurrentAdds, type PlacementSpec } from './roomTemplates';
 import { FURNITURE, buildObstacleList, roomDoorPoints, itemOccupancyBox, wallMountHungOver, poolWaterContains, poolBasinAt, type Box, type FurnitureItem } from './furniture';
 
@@ -382,6 +382,53 @@ describe('the dancer', () => {
     expect(addedDocks).toHaveLength(1);
     expect(addedDocks[0]).not.toBe(placedDocks[0]);
     expect(readRobotConfig(addedDocks[0])?.routine).toBe('dance');
+  });
+});
+
+describe('a layout replacing the room', () => {
+  it('takes a dropped dock\'s robot off the module it was taking apart, its work kept', () => {
+    const MIN = 60_000;
+    const doc = new Y.Doc();
+    bindRobotDoc(doc);
+    bindFurnitureDoc(doc);
+    for (const id of ['d1', 'd2']) writeFurnitureItem({ id, kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    const garden = { roomId: 'room-b', name: 'GARDEN', doorId: 'east', laborHours: 24 };
+    assignDisassembly('d1', garden, 0);
+    assignDisassembly('d2', garden, 0);
+    vi.useFakeTimers();
+    vi.setSystemTime(10 * MIN);
+    try {
+      applyRoomTemplate('party-2');
+    } finally {
+      vi.useRealTimers();
+    }
+    // Both robots worked ten minutes before their docks went: twenty
+    // labor-minutes kept, and nobody on the job any more.
+    expect(readDisassemblyJob('room-b')).toMatchObject({ doneMs: 20 * MIN, asOf: 10 * MIN, crew: [] });
+    expect(readRobotConfig('d1')).toBeNull();
+    expect(readRobotConfig('d2')).toBeNull();
+  });
+
+  it('takes a dock\'s robot off the job when the layout gives its id to a piece of another kind, its work kept', () => {
+    const MIN = 60_000;
+    const doc = new Y.Doc();
+    bindRobotDoc(doc);
+    bindFurnitureDoc(doc);
+    // The set's terminal takes the id this dock has.
+    const id = templateItemsFor(party).find((i) => i.kind === 'wall-computer')!.id;
+    writeFurnitureItem({ id, kind: 'charging-dock', pos: { x: 0, z: 0 }, rot: 0, movable: true });
+    assignDisassembly(id, { roomId: 'room-b', name: 'GARDEN', doorId: 'east', laborHours: 24 }, 0);
+    vi.useFakeTimers();
+    vi.setSystemTime(10 * MIN);
+    try {
+      applyRoomTemplate('party-2');
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(readAllFurniture().get(id)?.kind).toBe('wall-computer');
+    // It worked ten minutes before its dock went, and that work is kept.
+    expect(readDisassemblyJob('room-b')).toMatchObject({ doneMs: 10 * MIN, asOf: 10 * MIN, crew: [] });
+    expect(readRobotConfig(id)).toBeNull();
   });
 });
 

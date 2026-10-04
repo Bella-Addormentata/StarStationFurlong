@@ -21,7 +21,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { planTransfer } from './orbits';
 import { ADRIFT_PREFIX, adriftPlace, latestMoveOf, stationInTransit } from './stations';
-import type { StationMove, StationRoomCause } from './stations';
+import type { StationMove, StationOrbit, StationRoomCause } from './stations';
 
 /** Where an arriving ship docks at a station: one dock port of one room. */
 export interface StationBerth {
@@ -82,16 +82,24 @@ export interface StationDestination {
   /** Its latest move even once finished: arrival checks it against the
    *  flight, so a ship never docks at a station that moved away meanwhile. */
   lastMove?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's (the
+   *  route keeper checks it against the orbit a ferry route copied). */
+  orbit?: StationOrbit;
 }
 
 /** The seam: whatever knows the stations. */
 export interface StationDirectory {
   /** Every known station. The FIRST is home — where an unknown id resolves. */
   stations(): readonly StationDestination[];
-  /** The station the ship's room belongs to right now — the one its docks
-   *  lead into, or (floating free) the ship's own one-module "station" — or
-   *  null when that is not known. Never a destination. */
+  /** The station the ship's room is docked at right now: the one its live
+   *  docks lead into. Null with no live dock (floating free, the ship's own
+   *  one-module station is `own`, never `here`) or when that is not known.
+   *  Never a destination. */
   here?(): string | null;
+  /** Every station the ship's live docks lead into (`here` is one of them):
+   *  a ship docked into two stations at once is at both. Never a
+   *  destination. */
+  docked?(): readonly string[];
   /** The ship's OWN one-module station, when its room is listed as one (a
    *  module docked only by transient docks is its own atlas group) — never a
    *  destination. */
@@ -298,16 +306,18 @@ export function stationHere(): string | null {
 }
 
 /** The stations a ship at `fromId` may fly to: every OTHER station orbiting
- *  the same planet (and never the one its room belongs to right now). */
+ *  the same planet (and never one its room belongs to right now, nor any
+ *  its live docks lead into). */
 export function destinationsFrom(fromId: string): StationDestination[] {
   const adrift = adriftPlace(fromId);
   const from = adrift ? { id: fromId, planetId: adrift.planetId } : findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
+  const docked = new Set(directory.docked?.() ?? []);
   // A station between planets (stationMove.ts) is in no planet's orbits.
   const now = Date.now();
   return listStations().filter(
-    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own && !docked.has(s.id)
       && !stationInTransit(s, now),
   );
 }
@@ -329,6 +339,8 @@ export interface StationRecordLike {
   }>;
   /** A move to another planet, scheduled or under way (stations.ts). */
   move?: StationMove;
+  /** 🎚️ Its altitude orbit, when it flies one other than its slot's. */
+  orbit?: StationOrbit;
 }
 
 /** Rough per-destination figures for a station record (what a hop from the
@@ -418,6 +430,7 @@ export function destinationsFromRecords(
       fuelCost: FUEL_BASE + FUEL_PER_SLOT * slot,
       travelMs: Math.min(TRAVEL_MS_MAX, TRAVEL_MS_MIN + TRAVEL_MS_PER_SLOT * slot),
       ...(r.move ? { move: r.move } : {}),
+      ...(r.orbit ? { orbit: { radiusKm: r.orbit.radiusKm, phase0: r.orbit.phase0 } } : {}),
     };
     const last = r.welcomeRoomId ? latestMoveOf({ id: r.id, welcomeRoomId: r.welcomeRoomId }) ?? r.move : r.move;
     if (last) out.lastMove = last;
@@ -474,9 +487,34 @@ export function destinationsFromRecords(
   });
 }
 
+/** While withStationSnapshot runs: each source's one read, by source. */
+let snapshot: Map<() => unknown, unknown> | null = null;
+
+/** `read()` once per withStationSnapshot, else on every call. */
+function snapshotted<T>(read: () => T): T {
+  if (!snapshot) return read();
+  if (!snapshot.has(read)) snapshot.set(read, read());
+  return snapshot.get(read) as T;
+}
+
+/** Run `fn` with every lookup in it sharing ONE read of the station record:
+ *  the helm plans a hop to each destination on every render, and the live
+ *  list rebuilds the whole station list (atlas and all) on each read.
+ *  Nothing in `fn` may change the stations; a nested call shares the read. */
+export function withStationSnapshot<T>(fn: () => T): T {
+  if (snapshot) return fn();
+  snapshot = new Map();
+  try {
+    return fn();
+  } finally {
+    snapshot = null;
+  }
+}
+
 /** A directory over the station record: `list` is stations.listStations,
- *  `hereId` the ship room's station (null when floating free); hops follow
- *  the circular-orbit model (orbits.ts). */
+ *  `hereId` the ship room's station (null when floating free), `dockedIds`
+ *  every station its live docks lead into; hops follow the circular-orbit
+ *  model (orbits.ts). */
 export function directoryFromStationRecords(
   list: () => readonly StationRecordLike[],
   seedFor: (roomId: string) => string | undefined,
@@ -484,15 +522,20 @@ export function directoryFromStationRecords(
   ownId: () => string | null = () => null,
   resolve?: (id: string) => string | null,
   portable?: (id: string) => string | null,
+  dockedIds: () => readonly string[] = () => [],
 ): StationDirectory {
+  // Read once per withStationSnapshot: the list, and the destinations
+  // (each looks its seed up in the atlas).
+  const destinations = () => destinationsFromRecords(snapshotted(list), seedFor);
   return {
-    stations: () => destinationsFromRecords(list(), seedFor),
+    stations: () => snapshotted(destinations),
     here: hereId,
+    docked: dockedIds,
     own: ownId,
     ...(resolve ? { resolve } : {}),
     ...(portable ? { portable } : {}),
     plan: (fromId, toId, nowMs) => {
-      const records = list();
+      const records = snapshotted(list);
       const adrift = adriftPlace(fromId);
       return planRecordHop(
         adrift ? { id: fromId, name: '', welcomeRoomId: '', ...adrift } : records.find((r) => r.id === fromId),

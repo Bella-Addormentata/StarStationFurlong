@@ -48,14 +48,21 @@
  */
 
 import * as Y from 'yjs';
-import { ORBIT_EPOCH_MS, orbitalSeconds, realMsFor, wrapAngle } from './orbits';
-import type { OrbitPoint } from './orbits';
+import {
+  MIN_ALTITUDE_KM, MIN_ORBIT_SEPARATION_KM, ORBIT_EPOCH_MS, baseOrbit, circularOrbit, maxAltitudeKm, orbitForSlot,
+  orbitChangePointAt, orbitalSeconds, planOrbitChange, realMsFor, stationOrbit, stationPointAt, wrapAngle,
+} from './orbits';
+import type { CircularOrbit, OrbitChangePlan, OrbitPoint } from './orbits';
 import { FUEL_METER_MAX, setFuelDrawMeter } from './shipDoc';
 import { interplanetaryPointAt, planPlanetTransfer, planetSunPointAt } from './solarOrbits';
 import type { InterplanetaryPlan } from './solarOrbits';
 import { FUEL_PER_KMS } from './stationDirectory';
-import { MAX_ORBIT_SLOTS, PLANETS, knownSlotsAround, moveBelongsTo, planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit } from './stations';
-import type { MovingStation, StationMove, StationRecord } from './stations';
+import { MAX_TRIM_KM } from './stationKeeping';
+import {
+  MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, orbitChangeBase, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
+  planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet,
+} from './stations';
+import type { MovingStation, OrbitChange, StationMove, StationOrbit, StationRecord } from './stations';
 
 export type { StationMove } from './stations';
 
@@ -71,6 +78,99 @@ const isSlot = (v: unknown): v is number =>
   Number.isInteger(v) && (v as number) >= 0 && (v as number) < MAX_ORBIT_SLOTS;
 const isId = (v: unknown): v is string =>
   typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LENGTH;
+/** An orbit radius: finite, positive, and inside the farthest slot's by a
+ *  wide margin (the altitude band itself is checked where it is flown). */
+const isRadius = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && v > 0 && v < 1e7;
+const isPhase = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isFinite(v) && Math.abs(v) <= 2 * Math.PI;
+
+/** 🎚️ Shape guard for the altitude orbit a move leaves from. */
+function isStationOrbit(v: unknown): v is { radiusKm: number; phase0: number; since?: number } {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Record<string, unknown>;
+  return isRadius(o.radiusKm) && isPhase(o.phase0) && (o.since === undefined || isTime(o.since));
+}
+
+/** 🎚️ The radii an altitude orbit around `planetId` may have: the band the
+ *  ALT window offers, from MIN_ALTITUDE_KM (or the lowest slot, if lower)
+ *  to the top slot, widened by `slackKm` (a trim on the orbit a move leaves). */
+function inAltitudeBand(radiusKm: number, planetId: string, slackKm: number): boolean {
+  const planet = planetById(planetId);
+  const low = planet.radiusKm + Math.min(MIN_ALTITUDE_KM, orbitForSlot(planet.id, 0).altitudeKm) - slackKm;
+  const high = planet.radiusKm + maxAltitudeKm(planet.id) + slackKm;
+  return radiusKm >= low - 1e-6 && radiusKm <= high + 1e-6;
+}
+
+/** 🎚️ Does an altitude change fit its planet: it leaves from inside the band
+ *  (a trimmed orbit, so with the trim's slack) and ends inside it, clear of
+ *  every other slot's own orbit (which the planner always keeps clear), and
+ *  its times and new orbit are the Hohmann transfer its two orbits make from
+ *  its departure (planOrbitChange), so it is flown the way it is drawn? */
+function orbitChangeFits(o: OrbitChange, planetId: string, slot: number, departAt: number, arriveAt: number): boolean {
+  if (!inAltitudeBand(o.fromRadiusKm, planetId, MAX_TRIM_KM) || !inAltitudeBand(o.toRadiusKm, planetId, 0)) return false;
+  const planet = planetById(planetId);
+  // The base it leaves: in the band, a trim away from the orbit it flies from.
+  const base = orbitChangeBase(o);
+  if (o.fromBase && (!inAltitudeBand(base.radiusKm, planetId, 0)
+    || Math.abs(base.radiusKm - o.fromRadiusKm) > MAX_TRIM_KM + 1e-6)) return false;
+  // Only a change from the slot's own orbit (trimmed, perhaps) goes without a
+  // claim stamp: a custom orbit it leaves is always stamped (sourceClaimOf),
+  // so an unstamped one could never be weighed against other claims.
+  if (o.fromSince === undefined
+    && Math.abs(base.radiusKm - orbitForSlot(planet.id, slot).radiusKm) > MAX_TRIM_KM + 1e-6) return false;
+  for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
+    if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - o.toRadiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
+  }
+  const plan = planOrbitChange(circularOrbit(planet, o.fromRadiusKm, o.fromPhase0), o.toRadiusKm, departAt);
+  return !!plan && plan.departAt === departAt && plan.arriveAt === arriveAt
+    && Math.abs(wrapAngle(plan.to.phase0 - o.toPhase0)) < 1e-6;
+}
+
+/** 🎚️ Shape guard for an altitude change's two orbits. */
+function isOrbitChangeRecord(v: unknown): v is OrbitChange {
+  if (typeof v !== 'object' || v === null) return false;
+  const o = v as Partial<Record<keyof OrbitChange, unknown>>;
+  return isRadius(o.fromRadiusKm) && isPhase(o.fromPhase0) && isRadius(o.toRadiusKm) && isPhase(o.toPhase0)
+    && (o.fromSince === undefined || isTime(o.fromSince))
+    && (o.fromBase === undefined || isStationOrbit(o.fromBase));
+}
+
+/** 🎚️ When the custom orbit an altitude change leaves was claimed (the
+ *  epoch when unknown); nothing when the station flies its slot's own. */
+function sourceClaimOf(station: StationRecord): { fromSince?: number } {
+  if (!station.orbit) return {};
+  const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
+  return { fromSince: isTime(since) ? since : ORBIT_EPOCH_MS };
+}
+
+/** 🎚️ The base orbit an altitude change leaves, when the trimmed orbit it
+ *  flies from (`from`) is not it (OrbitChange.fromBase). */
+function baseLeftOf(station: StationRecord, from: Pick<CircularOrbit, 'radiusKm' | 'phase0'>): { fromBase?: StationOrbit } {
+  const base = baseOrbit(station);
+  return Math.abs(base.radiusKm - from.radiusKm) < 1e-9 && Math.abs(wrapAngle(base.phase0 - from.phase0)) < 1e-12
+    ? {} : { fromBase: { radiusKm: base.radiusKm, phase0: base.phase0 } };
+}
+
+/** 🎚️ The custom orbit a station's next move keeps until it leaves (its
+ *  fromOrbit), with when that orbit was claimed; nothing at its slot's own. */
+function heldOrbitOf(station: StationRecord): { fromOrbit?: NonNullable<StationMove['fromOrbit']> } {
+  if (!station.orbit) return {};
+  const since = orbitClaimedAt(latestMoveOf(station) ?? station.move, station.orbit);
+  return { fromOrbit: { radiusKm: station.orbit.radiusKm, phase0: station.orbit.phase0, since: isTime(since) ? since : ORBIT_EPOCH_MS } };
+}
+
+function clearOfOtherSlots(radiusKm: number, planetId: string, slot: number): boolean {
+  const planet = planetById(planetId);
+  for (let s = 0; s < MAX_ORBIT_SLOTS; s++) {
+    if (s !== slot && Math.abs(orbitForSlot(planet.id, s).radiusKm - radiusKm) < MIN_ORBIT_SEPARATION_KM) return false;
+  }
+  return true;
+}
+
+function claimedByBooking(since: number | undefined, bookedAt: number): boolean {
+  return since === undefined || since <= bookedAt;
+}
 
 /** Shape guard — a hostile peer can write anything into the map. */
 export function isStationMove(v: unknown): v is StationMove {
@@ -86,18 +186,37 @@ export function isStationMove(v: unknown): v is StationMove {
     && (planetById(r.fromPlanetId as string).id !== planetById(r.toPlanetId as string).id
       || (r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))
     && isTime(r.departAt) && isTime(r.arriveAt) && (r.arriveAt as number) > (r.departAt as number)
-    && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId)))
+    && (r.mode === 'thrusters' || (r.mode === 'tug' && isId(r.tugRoomId))
+      // An altitude change stays around its planet, in its slot.
+      || (r.mode === 'orbit' && r.tugRoomId === undefined && isOrbitChangeRecord(r.orbit)
+        && r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot
+        && orbitChangeFits(r.orbit, r.toPlanetId as string, r.toSlot as number, r.departAt as number, r.arriveAt as number)))
     && (r.tugRoomId === undefined || isId(r.tugRoomId))
+    && (r.orbit === undefined || r.mode === 'orbit')
+    && (r.fromOrbit === undefined || (r.mode !== 'orbit' && isStationOrbit(r.fromOrbit)
+      && inAltitudeBand(r.fromOrbit.radiusKm, r.fromPlanetId as string, MAX_TRIM_KM)
+      // Unstamped, it could never be weighed against other claims: only
+      // the slot's own orbit (trimmed, perhaps) goes without (orbitChangeFits).
+      && ((r.fromOrbit as { since?: number }).since !== undefined
+        || Math.abs(r.fromOrbit.radiusKm - orbitForSlot(r.fromPlanetId as string, r.fromSlot as number).radiusKm) <= MAX_TRIM_KM + 1e-6)
+      // Clear of every other slot's own orbit, as an altitude change ends.
+      && clearOfOtherSlots(r.fromOrbit.radiusKm, r.fromPlanetId as string, r.fromSlot as number)))
     // Booked no later than it leaves: one stamped after a rival arrived
     // would read as booked after it (concurrentMoves) and escape it. Only a
     // move that goes nowhere may be later: a pin is written once what it
     // records is over.
     && (r.bookedAt === undefined || (isTime(r.bookedAt) && ((r.bookedAt as number) <= (r.departAt as number)
       || (r.fromPlanetId === r.toPlanetId && r.fromSlot === r.toSlot))))
+    // 🎚️ The orbit it leaves was claimed by the time it was booked: claims
+    // are weighed in time order, so a later stamp would jump the queue.
+    && claimedByBooking(r.mode === 'orbit' ? (r.orbit as { fromSince?: number } | undefined)?.fromSince : (r.fromOrbit as { since?: number } | undefined)?.since,
+      (r.bookedAt ?? r.departAt) as number)
     // One level only, checked before recursing: a hostile nest is refused
     // at the first step, never walked.
     && (r.settles === undefined || (typeof r.settles === 'object' && r.settles !== null
       && (r.settles as { settles?: unknown }).settles === undefined
+      // 🎚️ An altitude change is never pinned (stations.isPinMove).
+      && (r.settles as { mode?: unknown }).mode !== 'orbit'
       && isStationMove(r.settles) && r.settles.welcomeRoomId === r.welcomeRoomId
       && isPinOf(r as StationMove, r.settles)))
     && typeof r.fuel === 'number' && Number.isInteger(r.fuel) && r.fuel >= 0 && r.fuel <= FUEL_METER_MAX
@@ -155,9 +274,10 @@ export function concurrentMoves(a: StationMove, b: StationMove): boolean {
 }
 
 /** A move that goes nowhere: it holds a station where it is (a cancelled
- *  tow, or where an arrival settled). */
+ *  tow, or where an arrival settled). An altitude change keeps its planet
+ *  and slot too, but flies: it is no pin. */
 export function isPinMove(m: StationMove): boolean {
-  return !!m.settles || (m.fromPlanetId === m.toPlanetId && m.fromSlot === m.toSlot);
+  return !!m.settles || (m.mode !== 'orbit' && m.fromPlanetId === m.toPlanetId && m.fromSlot === m.toSlot);
 }
 
 function compareFlown(a: StationMove, b: StationMove): number {
@@ -204,6 +324,20 @@ export function cleanMove(m: StationMove): StationMove {
     fuel: m.fuel,
     fuelDrawn: m.fuelDrawn,
     ...(m.mode === 'tug' && m.tugRoomId ? { tugRoomId: m.tugRoomId } : {}),
+    ...(m.mode === 'orbit' && m.orbit ? {
+      orbit: {
+        fromRadiusKm: m.orbit.fromRadiusKm, fromPhase0: m.orbit.fromPhase0,
+        toRadiusKm: m.orbit.toRadiusKm, toPhase0: m.orbit.toPhase0,
+        ...(typeof m.orbit.fromSince === 'number' ? { fromSince: m.orbit.fromSince } : {}),
+        ...(m.orbit.fromBase ? { fromBase: { radiusKm: m.orbit.fromBase.radiusKm, phase0: m.orbit.fromBase.phase0 } } : {}),
+      },
+    } : {}),
+    ...(m.mode !== 'orbit' && m.fromOrbit ? {
+      fromOrbit: {
+        radiusKm: m.fromOrbit.radiusKm, phase0: m.fromOrbit.phase0,
+        ...(typeof m.fromOrbit.since === 'number' ? { since: m.fromOrbit.since } : {}),
+      },
+    } : {}),
     ...(typeof m.bookedAt === 'number' ? { bookedAt: m.bookedAt } : {}),
     ...(m.settles ? { settles: cleanMove({ ...m.settles, settles: undefined }) } : {}),
   };
@@ -238,6 +372,7 @@ export type MoveRefusal =
   | 'no-station' // the atlas does not place this module in a station yet
   | 'not-commander' // only the module's owner moves the station
   | 'moving' // a move is already scheduled or under way
+  | 'moves-unknown' // this room's move log is too long to read whole (roomMovesKnown)
   | 'same-planet' // already there: use the trim stick
   | 'no-slot' // every orbit around the destination is taken
   | 'no-thrusters' // no engine block on this module
@@ -287,7 +422,7 @@ export type MovePlanResult =
 export function freeSlotAround(planetId: string, stations: StationRecord[], exceptId?: string, nowMs: number = Date.now()): number | null {
   const id = planetById(planetId).id;
   const others = stations.filter((s) => s.id !== exceptId);
-  const used = new Set(others.filter((s) => planetById(s.planetId).id === id && !stationInTransit(s, nowMs))
+  const used = new Set(others.filter((s) => planetById(s.planetId).id === id && !stationLeftPlanet(s, nowMs))
     .map((s) => s.orbitSlot));
   // A station on its way here (or booked to come) has its slot paid for:
   // it is not offered again, so the move that follows never clashes there.
@@ -338,6 +473,8 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
   if (!ctx.bolted) return { ok: false, refusal: 'not-bolted', quote: null };
   if (!station) return { ok: false, refusal: 'no-station', quote: null };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  // 🚚 A move past what this room's log can be read of may be under way.
+  if (!roomMovesKnown()) return { ok: false, refusal: 'moves-unknown', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
   if (!(ctx.modules >= 1)) return { ok: false, refusal: 'unknown-layout', quote: null };
@@ -353,6 +490,7 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
+      ...heldOrbitOf(station),
       toPlanetId: quote.toPlanetId,
       toSlot: quote.toSlot,
       departAt: quote.plan.departAt,
@@ -363,6 +501,217 @@ export function planStationMove(ctx: MoveContext, toPlanetId: string): MovePlanR
       fuelDrawn: Math.min(FUEL_METER_MAX, ctx.drawn + ctx.deficit + quote.fuel),
     },
   };
+}
+
+// ── 🎚️ Altitude changes (issue 191) ──────────────────────────────────────────
+//
+// The station helm's ALT window picks an altitude around the planet the
+// station orbits; ENGAGE flies there at once on a Hohmann transfer
+// (orbits.planOrbitChange) under the station's own thrusters, priced like a
+// move (delta-v times the modules pushed). It is written as a StationMove
+// with mode 'orbit' — same planet, same slot, the two orbits in `orbit` — so
+// it rides everything a move has: the room's move log and its fuel meter,
+// the remembered list, the planet summary, compareMoves, and the dock lock
+// while it flies (no ship docks with, leaves or reaches a station between
+// two orbits). Once it arrives, stations.listStations lists the station
+// with the new orbit (StationRecord.orbit), and its trim starts over there.
+
+/** Why an altitude change will not go, in the order the helm checks. */
+export type AltitudeRefusal =
+  | Exclude<MoveRefusal, 'same-planet' | 'no-slot'>
+  | 'same-altitude' // the station already flies that altitude
+  | 'too-low' // below MIN_ALTITUDE_KM
+  | 'too-high' // above the top slot's altitude
+  | 'too-close'; // within MIN_ORBIT_SEPARATION_KM of another orbit
+
+/** What an altitude change would take, before the checks that only gate the
+ *  button (fuel, thrusters, owner). */
+export interface AltitudeQuote {
+  altitudeKm: number;
+  plan: OrbitChangePlan;
+  fuel: number;
+}
+
+export type AltitudePlanResult =
+  | { ok: true; move: StationMove; quote: AltitudeQuote }
+  | { ok: false; refusal: AltitudeRefusal; quote: AltitudeQuote | null; near?: OrbitNeighbour };
+
+/** An orbit an altitude would come too close to: a station's (by name), or
+ *  another slot's own orbit, kept clear for whoever settles there. */
+export interface OrbitNeighbour {
+  radiusKm: number;
+  /** The station's name; absent for a slot's own orbit. */
+  name?: string;
+}
+
+/** The altitude a station flies now, km (its trimmed orbit's). */
+export function stationAltitudeKm(station: StationRecord): number {
+  return stationOrbit(station).altitudeKm;
+}
+
+/** "1,250 km" — an altitude for the dashboard. */
+export function formatAltitude(km: number): string {
+  return `${Math.round(km).toLocaleString('en-US')} km`;
+}
+
+/**
+ * The orbits around `station`'s planet an altitude change must keep clear of:
+ * every other station there (its BASE orbit, so both keep their whole trim
+ * band, and where an altitude change of its own is taking it), and every
+ * other slot's own orbit — open now or held by a station flying an altitude
+ * of its own, which may come back to it or leave the slot to the next
+ * station to arrive or be built. A station between planets holds none.
+ */
+export function orbitsToKeepClear(station: StationRecord, stations: StationRecord[], nowMs: number): OrbitNeighbour[] {
+  const planet = planetById(station.planetId);
+  const out: OrbitNeighbour[] = [];
+  for (const s of stations) {
+    if (s.id === station.id || (station.welcomeRoomId && s.welcomeRoomId === station.welcomeRoomId)) continue;
+    if (planetById(s.planetId).id !== planet.id || stationLeftPlanet(s, nowMs)) continue;
+    out.push({ radiusKm: baseOrbit(s).radiusKm, name: s.name });
+    const m = s.move;
+    if (m && isOrbitChange(m) && m.orbit && nowMs < m.arriveAt) out.push({ radiusKm: m.orbit.toRadiusKm, name: s.name });
+  }
+  // The station's own slot is its own to come back to; every other slot's
+  // orbit is kept clear, held or not.
+  for (let slot = 0; slot < MAX_ORBIT_SLOTS; slot++) {
+    if (slot !== station.orbitSlot) out.push({ radiusKm: orbitForSlot(planet.id, slot).radiusKm });
+  }
+  return out;
+}
+
+/** The nearest orbit an altitude comes within MIN_ORBIT_SEPARATION_KM of,
+ *  or null when it is clear of them all. */
+export function altitudeConflict(radiusKm: number, clear: OrbitNeighbour[]): OrbitNeighbour | null {
+  let near: OrbitNeighbour | null = null;
+  for (const o of clear) {
+    const gap = Math.abs(o.radiusKm - radiusKm);
+    if (gap < MIN_ORBIT_SEPARATION_KM && (!near || gap < Math.abs(near.radiusKm - radiusKm))) near = o;
+  }
+  return near;
+}
+
+/** What flying the station to `altitudeKm` would take — or null when there
+ *  is no station, or no change to plan (the same altitude, or a layout this
+ *  install cannot price). The altitude band and the separation are the
+ *  planner's checks, not the quote's, so the helm can still show a price. */
+export function quoteAltitude(
+  station: StationRecord | null,
+  altitudeKm: number,
+  modules: number,
+  now: number,
+): AltitudeQuote | null {
+  if (!station || !(modules >= 1) || !Number.isFinite(altitudeKm)) return null;
+  const from = stationOrbit(station);
+  const plan = planOrbitChange(from, from.planet.radiusKm + altitudeKm, now);
+  if (!plan) return null;
+  return { altitudeKm, plan, fuel: moveFuelCost(plan.deltaVKmS, modules) };
+}
+
+/** Round an altitude to the whole km the ALT window shows. */
+export function wholeAltitude(km: number): number {
+  return Math.round(km);
+}
+
+/** Schedule an altitude change to `altitudeKm` (whole km): the move record to
+ *  write, or why not. */
+export function planStationAltitude(ctx: MoveContext, altitudeKm: number): AltitudePlanResult {
+  const { station, now } = ctx;
+  if (!ctx.bolted) return { ok: false, refusal: 'not-bolted', quote: null };
+  if (!station) return { ok: false, refusal: 'no-station', quote: null };
+  if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
+  // 🚚 A move past what this room's log can be read of may be under way.
+  if (!roomMovesKnown()) return { ok: false, refusal: 'moves-unknown', quote: null };
+  if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
+  const planet = planetById(station.planetId);
+  if (!Number.isFinite(altitudeKm) || altitudeKm < MIN_ALTITUDE_KM) return { ok: false, refusal: 'too-low', quote: null };
+  if (altitudeKm > maxAltitudeKm(planet.id)) return { ok: false, refusal: 'too-high', quote: null };
+  if (wholeAltitude(stationAltitudeKm(station)) === wholeAltitude(altitudeKm)) return { ok: false, refusal: 'same-altitude', quote: null };
+  if (!(ctx.modules >= 1)) return { ok: false, refusal: 'unknown-layout', quote: null };
+  const quote = quoteAltitude(station, altitudeKm, ctx.modules, now);
+  if (!quote) return { ok: false, refusal: 'same-altitude', quote: null };
+  const near = altitudeConflict(quote.plan.to.radiusKm, orbitsToKeepClear(station, ctx.stations, now));
+  if (near) return { ok: false, refusal: 'too-close', quote, near };
+  if (ctx.engines < 1) return { ok: false, refusal: 'no-thrusters', quote };
+  if (!(ctx.fuel >= quote.fuel)) return { ok: false, refusal: 'no-fuel', quote };
+  const { plan } = quote;
+  const planetId = planet.id;
+  return {
+    ok: true,
+    quote,
+    move: {
+      stationId: station.id,
+      welcomeRoomId: station.welcomeRoomId,
+      fromPlanetId: planetId,
+      fromSlot: station.orbitSlot,
+      toPlanetId: planetId,
+      toSlot: station.orbitSlot,
+      departAt: plan.departAt,
+      arriveAt: plan.arriveAt,
+      mode: 'orbit',
+      orbit: {
+        fromRadiusKm: plan.from.radiusKm,
+        fromPhase0: plan.from.phase0,
+        toRadiusKm: plan.to.radiusKm,
+        toPhase0: plan.to.phase0,
+        ...sourceClaimOf(station),
+        ...baseLeftOf(station, plan.from),
+      },
+      bookedAt: now,
+      fuel: quote.fuel,
+      fuelDrawn: Math.min(FUEL_METER_MAX, ctx.drawn + ctx.deficit + quote.fuel),
+    },
+  };
+}
+
+export function describeAltitudeRefusal(
+  refusal: AltitudeRefusal,
+  quote: AltitudeQuote | null,
+  fuel: number,
+  station: StationRecord | null = null,
+  near: OrbitNeighbour | null = null,
+): string {
+  const planet = planetById(station?.planetId);
+  switch (refusal) {
+    case 'same-altitude': return 'The station already flies that altitude.';
+    case 'too-low': return `Too low: ${formatAltitude(MIN_ALTITUDE_KM)} is the lowest orbit clear of the atmosphere.`;
+    case 'too-high': return `Too high: ${formatAltitude(maxAltitudeKm(planet.id))} is the highest orbit around ${planet.name}.`;
+    case 'too-close': {
+      const alt = near ? formatAltitude(near.radiusKm - planet.radiusKm) : '';
+      const whose = near?.name ? `${near.name}'s orbit` : 'another slot\'s orbit, kept clear for the station it is kept for';
+      return `Too close to ${whose}${alt ? ` at ${alt}` : ''}: keep ${MIN_ORBIT_SEPARATION_KM} km clear.`;
+    }
+    case 'moving': return 'A move or altitude change is already scheduled or under way.';
+    case 'moves-unknown': return 'This room holds more move records than the helm can read, so a move may be under way. ENGAGE waits until they are cleared.';
+    case 'no-thrusters': return 'Fit an ENGINE BLOCK to this module to change the station\'s altitude.';
+    case 'no-fuel': return `Needs ${quote?.fuel ?? '?'} fuel for both burns; ${Math.floor(fuel)} aboard. Fit more FUEL TANKs and refuel.`;
+    default: return describeMoveRefusal(refusal, null, fuel);
+  }
+}
+
+/** Where a station changing altitude is between its burns, planet-centred;
+ *  null for any other move, or outside the transit. */
+export function orbitChangeTransitPointAt(move: StationMove, realMs: number): OrbitPoint | null {
+  if (move.mode !== 'orbit' || !move.orbit || movePhase(move, realMs) !== 'transit') return null;
+  const plan = orbitChangePlanOf(move);
+  return plan ? orbitChangePointAt(plan, realMs) : null;
+}
+
+/** Where a listed station is at a real time, planet-centred: on its altitude
+ *  change's course while one is listed (before, between and after its burns:
+ *  the listing catches up at its next read), else on the orbit it flies. */
+export function stationPointWithMoveAt(station: StationRecord, realMs: number): OrbitPoint {
+  const plan = station.move ? orbitChangePlanOf(station.move) : null;
+  return plan ? orbitChangePointAt(plan, realMs) : stationPointAt(station, realMs);
+}
+
+/** The two orbits and burns of an altitude change, rebuilt from its record. */
+export function orbitChangePlanOf(move: StationMove): Pick<OrbitChangePlan, 'from' | 'to' | 'departAt' | 'arriveAt'> | null {
+  if (move.mode !== 'orbit' || !move.orbit) return null;
+  const planet = planetById(move.fromPlanetId);
+  const from: CircularOrbit = circularOrbit(planet, move.orbit.fromRadiusKm, move.orbit.fromPhase0);
+  const to: CircularOrbit = circularOrbit(planet, move.orbit.toRadiusKm, move.orbit.toPhase0);
+  return { from, to, departAt: move.departAt, arriveAt: move.arriveAt };
 }
 
 // ── Tugs: a torch flight ─────────────────────────────────────────────────────
@@ -462,6 +811,7 @@ export type TowRefusal =
    *  station mid-tow (and a tow pins the ship the route moves). */
   | 'route-running'
   | 'moving' // the station is already scheduled to move, or moving
+  | 'moves-unknown' // this room's move log is too long to read whole (roomMovesKnown)
   | 'same-planet'
   | 'no-slot'
   | 'too-weak' // fewer than TUG_MIN_ENGINES engine blocks
@@ -526,6 +876,8 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
   if (!station) return { ok: false, refusal: 'not-docked', quote: null };
   if (!ctx.commander) return { ok: false, refusal: 'not-commander', quote: null };
   if (ctx.routeRunning === true) return { ok: false, refusal: 'route-running', quote: null };
+  // 🚚 A tow past what this room's log can be read of may be under way.
+  if (!roomMovesKnown()) return { ok: false, refusal: 'moves-unknown', quote: null };
   if (isMoveActive(station.move, now)) return { ok: false, refusal: 'moving', quote: null };
   if (planetById(toPlanetId).id === planetById(station.planetId).id) return { ok: false, refusal: 'same-planet', quote: null };
   // A tow's price scales with the modules pushed: one guessed from a layout
@@ -543,6 +895,7 @@ export function planStationTow(ctx: TowContext, toPlanetId: string): TowPlanResu
       welcomeRoomId: station.welcomeRoomId,
       fromPlanetId: planetById(station.planetId).id,
       fromSlot: station.orbitSlot,
+      ...heldOrbitOf(station),
       toPlanetId: quote.toPlanetId,
       toSlot: quote.toSlot,
       departAt: quote.plan.departAt,
@@ -562,6 +915,7 @@ export function describeTowRefusal(refusal: TowRefusal, quote: TowQuote | null, 
     case 'not-commander': return 'Only the ship\'s owner can tow.';
     case 'route-running': return 'Stop the ferry route to tow: its timetable would cast the tug off mid-tow.';
     case 'moving': return 'That station is already scheduled to move, or moving.';
+    case 'moves-unknown': return 'This ship holds more move records than the helm can read, so a tow may be under way. TOW waits until they are cleared.';
     case 'same-planet': return 'The station already orbits that planet.';
     case 'no-slot': return 'Every orbit around that planet is taken.';
     case 'too-weak': return `A tug needs at least ${TUG_MIN_ENGINES} ENGINE BLOCKs.`;
@@ -580,14 +934,20 @@ export function isTowing(roomId: string, realMs: number): boolean {
 /** Does a move hold this dock still? A tug's tow under way (either end), or
  *  either end belonging to a station between planets: every ship docked to
  *  it rides along, and none may leave or join it until it arrives. Before a
- *  thruster move leaves, and after any move arrives, docks work as usual. */
+ *  thruster move leaves, and after any move arrives, docks work as usual.
+ *  A latest move that is an arrival's pin is judged by the journey it
+ *  settles (flightOf): at an earlier moment (a release's own stamp), that
+ *  journey may have been under way. */
 export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
   if (towHoldsDock(roomIds, realMs)) return true;
   return roomIds.some((id) => {
     if (!id) return false;
     const station = stationForRoom(id);
-    const move = station ? latestMoveOf(station) : null;
-    return !!move && stationInTransit({ move }, realMs);
+    const latest = station ? latestMoveOf(station) : null;
+    const flight = latest ? flightOf(latest) : null;
+    // An aborted altitude change (another station claimed its orbit first)
+    // never flew: it holds nothing.
+    return !!flight && stationInTransit({ move: flight }, realMs) && !isAbortedAltitudeChange(flight);
   });
 }
 
@@ -596,27 +956,37 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
  *  those its planet summaries gossip (booked in another room of its
  *  station, or a tug's), count with every move known here, so a ship that
  *  has not heard of one yet still joins no station between planets: a tow
- *  that room is the tug of, ahead or under way, or a move of its station in
- *  transit. Its station is the one this install lists the room at, else
- *  the one whose welcome room it is, else the one its own bookings name (a
- *  move is booked from a room of its station, a tow from the tug; a pin is
- *  no booking: every game writes them for each station it lists, wherever
- *  it stands, pinSettledArrivals). A room
- *  whose records the bounded scans cannot all read (a peer can flood
- *  either map) is held too: what lies past them may be such a move, until
- *  the clients there prune the flood. */
+ *  that room is the tug of, ahead or under way at `realMs`, or a flight of
+ *  its station under way then (an arrival's pin stands for the journey it
+ *  settles: flightOf). Its station is the one this install lists the
+ *  room at, else the one whose welcome room it is, else the one its own
+ *  bookings name (a move is booked from a room of its station, a tow from
+ *  the tug; a pin is no booking: every game writes them for each station it
+ *  lists, wherever it stands, pinSettledArrivals). A room whose records the
+ *  bounded scans cannot all read (a peer can flood either map) is held too:
+ *  what lies past them may be such a move, until the clients there prune
+ *  the flood. */
 export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
   const { own: there, heard, complete } = docMoves(doc);
-  if (!complete) return true;
+  // The bound room's moves count too: all of them, or the lock holds.
+  if (!complete || !roomMovesKnown()) return true;
   const all = [...there, ...heard, ...roomOwn(), ...readRememberedMoves()];
-  const standing = standingMoves(all, all);
-  if (standing.some((m) => m.mode === 'tug' && !!roomId && m.tugRoomId === roomId && isMoveActive(m, realMs))) return true;
+  // Every flight known counts, not only each station's latest: a release is
+  // judged at its own stamp, and an arrival's pin (it carries the journey it
+  // settles: flightOf), a tow's cancel (rejectionOf) or a later move since
+  // leaves the station, and its tug, on the flight it was on then. A cancel,
+  // or a move beaten or outbid, never flew (superseded).
+  const flew = (m: StationMove, holds: (flight: StationMove) => boolean): boolean => {
+    const flight = flightOf(m);
+    return !!flight && holds(flight) && !superseded(m, all);
+  };
+  if (roomId && all.some((m) => flew(m, (f) => f.mode === 'tug' && f.tugRoomId === roomId && isMoveActive(f, realMs)))) return true;
   const station = roomId ? stationForRoom(roomId) : null;
   const towedBy = (m: StationMove) => flownOf(m).mode === 'tug' && flownOf(m).tugRoomId === roomId;
   const ofRoom = (m: StationMove) => (station
     ? moveBelongsTo(m, station)
     : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !isPinMove(o) && !towedBy(o) && sameStation(o, m)));
-  return standing.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs));
+  return all.some((m) => flew(m, (f) => ofRoom(f) && stationInTransit({ move: f }, realMs)));
 }
 
 /** Remember the standing moves a room's own doc holds (a far room's), and
@@ -633,8 +1003,9 @@ const SUMMARY_SCAN_MAX = 256;
 
 /** What a room's doc that is not the bound one holds: the moves booked
  *  there (roomOwn's), the moves its planet summaries gossip
- *  (planetSummary.ts: each station's latest, under its welcome room,
- *  checked as that module's pull checks them), and whether the bounded
+ *  (planetSummary.ts: each station's latest, and the move it follows
+ *  beside an outbid latest with that latest's cancel, under its welcome
+ *  room, checked as that module's pull checks them), and whether the bounded
  *  scans read every record of both. Every client standing in a room
  *  publishes there its own station's move and every move it remembers, so
  *  a move booked in another room of the station, or in a tug's, reaches
@@ -649,7 +1020,18 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
     if (++scanned > SUMMARY_SCAN_MAX) break;
     if (typeof v !== 'object' || v === null || (v as { welcomeRoomId?: unknown }).welcomeRoomId !== k) continue;
     const m = validMove((v as { move?: unknown }).move);
-    if (m && m.welcomeRoomId === k) heard.push(m);
+    if (!m || m.welcomeRoomId !== k) continue;
+    heard.push(m);
+    // …and the move the station follows beside an outbid latest
+    // (planetSummary's `stands`), checked as cleanStationSummary checks it:
+    // the same station's, ranking below that latest. That latest never
+    // flies, rival known here or not: its cancel says so (rejectionOf).
+    const stands = validMove((v as { stands?: unknown }).stands);
+    if (stands && stands.welcomeRoomId === k && compareMoves(stands, m) < 0) {
+      heard.push(stands);
+      const rejected = rejectionOf(m);
+      if (rejected) heard.push(rejected);
+    }
   }
   return {
     own: [...(legacy ? [legacy] : []), ...entries, ...folded],
@@ -661,12 +1043,19 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
 /** Is any of these rooms a tug whose tow is under way (or about to leave),
  *  by the bound room's record or any move this install remembers? Its dock
  *  holds the station, so neither end may UNDOCK it — from the tug's docking
- *  computer or from the station's door panel. */
+ *  computer or from the station's door panel. 🚚 So does a bound room whose
+ *  move log cannot all be read (roomMovesKnown): such a tow may lie past
+ *  it, and every dock lock (dockLockedByMove) asks here first. */
 export function towHoldsDock(roomIds: string[], realMs: number): boolean {
   const ids = new Set(roomIds.filter(Boolean));
   if (ids.size === 0) return false;
-  return knownStanding().some((m) =>
-    m.mode === 'tug' && !!m.tugRoomId && ids.has(m.tugRoomId) && isMoveActive(m, realMs));
+  if (!roomMovesKnown()) return true;
+  // A standing arrival's pin stands for the tow it settles (flightOf), which
+  // a moment before that arrival still holds; a cancel holds nothing.
+  return knownStanding().some((m) => {
+    const flight = flightOf(m);
+    return !!flight && flight.mode === 'tug' && !!flight.tugRoomId && ids.has(flight.tugRoomId) && isMoveActive(flight, realMs);
+  });
 }
 
 /** Each station's standing move among everything known here: the bound
@@ -756,11 +1145,12 @@ function outbidTows(roomId: string): StationMove[] {
   });
 }
 
-/** Cancel a tow: a move that leaves its station where it was, settling the
- *  tow and ranking just after it everywhere. */
-function writeCancelOf(tow: StationMove, realMs: number): boolean {
+/** A tow's cancel: a move that leaves its station where it was, settling
+ *  the tow and ranking just after it everywhere, in the one form a cancel
+ *  is written in (isPinOf), booked at `bookedAt`. */
+function cancelOf(tow: StationMove, bookedAt: number): StationMove {
   const departAt = tow.departAt + 1;
-  return writeStationMove({
+  return {
     stationId: tow.stationId,
     welcomeRoomId: tow.welcomeRoomId,
     fromPlanetId: tow.fromPlanetId,
@@ -770,11 +1160,32 @@ function writeCancelOf(tow: StationMove, realMs: number): boolean {
     departAt,
     arriveAt: departAt + 1,
     mode: 'thrusters',
-    bookedAt: Math.floor(realMs),
+    bookedAt: Math.floor(bookedAt),
     settles: tow,
     fuel: 0,
     fuelDrawn: 0,
-  });
+  };
+}
+
+/** Cancel a tow (cancelOf), booked now. */
+function writeCancelOf(tow: StationMove, realMs: number): boolean {
+  return writeStationMove(cancelOf(tow, realMs));
+}
+
+/** 🚚 What says for good that `latest` does not stand, where a planet
+ *  summary carries the move its station follows beside it (planetSummary
+ *  `stands`: a tow another station's outbid on the same tug): that tow's
+ *  cancel, as the tug's room writes it (cancelTowLeftBehind). Every install
+ *  ranks it over the tow (beatenForStation) without the rival that outbid
+ *  it, so one that never learns the rival, or no longer can, still never
+ *  flies that tow, whatever path the tow reaches it by. Booked as it leaves,
+ *  so every install that reads the summary derives the same record. Null
+ *  for anything but a tow (or one of its pins), and for a cancel. */
+export function rejectionOf(latest: StationMove): StationMove | null {
+  const tow = flownOf(latest);
+  if (tow.mode !== 'tug' || isCancelPin(latest)) return null;
+  const cancel = cancelOf(tow, tow.departAt + 1);
+  return isStationMove(cancel) ? cancel : null;
 }
 
 /**
@@ -792,7 +1203,8 @@ function writeCancelOf(tow: StationMove, realMs: number): boolean {
 export function pinSettledArrival(station: StationRecord | null, realMs: number): boolean {
   if (!station) return false;
   const move = latestMoveOf(station);
-  if (!move || realMs < move.arriveAt || isPinMove(move)) return false;
+  // An altitude change keeps its slot: there is no clash to settle.
+  if (!move || realMs < move.arriveAt || isPinMove(move) || isOrbitChange(move)) return false;
   const planetId = planetById(station.planetId).id;
   return writeStationMove({
     stationId: station.id,
@@ -823,6 +1235,14 @@ export function pinSettledArrivals(stations: StationRecord[], realMs: number): n
 
 // ── What the dashboard says ──────────────────────────────────────────────────
 
+/** "1m 05s" under an hour, else formatLongSpan — an altitude change's span,
+ *  which low down takes a minute or two. */
+export function formatTransferSpan(ms: number): string {
+  if (ms >= 3_600_000) return formatLongSpan(ms);
+  const sec = Math.max(0, Math.round(ms / 1000));
+  return `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s`;
+}
+
 /** "2d 03h" / "5h 12m" / "4m" — a real-time span. */
 export function formatLongSpan(ms: number): string {
   const m = Math.max(0, Math.round(ms / 60_000));
@@ -838,6 +1258,7 @@ export function describeMoveRefusal(refusal: MoveRefusal, quote: MoveQuote | nul
     case 'no-station': return 'This module is not part of a known station yet.';
     case 'not-commander': return 'Only the module\'s owner can move the station.';
     case 'moving': return 'A move is already scheduled or under way.';
+    case 'moves-unknown': return 'This room holds more move records than the helm can read, so a move may be under way. MOVE waits until they are cleared.';
     case 'same-planet': return 'The station already orbits that planet: use the trim stick.';
     case 'no-slot': return 'Every orbit around that planet is taken.';
     case 'unknown-layout': return 'This helm does not know the station\'s layout yet, so the move cannot be priced.';
@@ -848,6 +1269,14 @@ export function describeMoveRefusal(refusal: MoveRefusal, quote: MoveQuote | nul
 
 /** The status line for a move in progress. */
 export function describeMove(move: StationMove, realMs: number): string {
+  if (move.mode === 'orbit' && move.orbit) {
+    const alt = formatAltitude(move.orbit.toRadiusKm - planetById(move.toPlanetId).radiusKm);
+    switch (movePhase(move, realMs)) {
+      case 'scheduled': return `Burning for ${alt} in ${formatTransferSpan(move.departAt - realMs)}.`;
+      case 'transit': return `Changing orbit to ${alt}: arriving in ${formatTransferSpan(move.arriveAt - realMs)}.`;
+      case 'arrived': return `Orbiting at ${alt}.`;
+    }
+  }
   const to = planetById(move.toPlanetId).name;
   switch (movePhase(move, realMs)) {
     case 'scheduled': return `Leaving for ${to} at the launch window in ${formatLongSpan(move.departAt - realMs)}.`;
@@ -945,6 +1374,7 @@ function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
   const groups = [...byStation.values()];
   const bests: StationMove[] = [];
   const history: StationMove[] = [];
+  const dropped: StationMove[] = [];
   for (const g of groups) {
     g.sort((x, y) => compareMoves(y, x));
     bests.push(g[0]);
@@ -954,12 +1384,70 @@ function trimRemembered(list: StationMove[], nowMs: number): StationMove[] {
     const stands = flownOf(g[0]).mode === 'tug' && outbidForTug(g[0], list)
       ? g.find((m) => !superseded(m, list)) : undefined;
     if (stands) bests.push(stands);
-    history.push(...g.slice(1).filter((m) => m !== stands && m.arriveAt >= since).slice(0, HISTORY_PER_STATION));
+    const recent = g.slice(1).filter((m) => m !== stands && m.arriveAt >= since).slice(0, HISTORY_PER_STATION);
+    history.push(...recent);
+    dropped.push(...g.slice(1).filter((m) => m !== stands && !recent.includes(m)));
   }
   const byFinish = (x: StationMove, y: StationMove) => y.arriveAt - x.arriveAt;
   const keptBests = bests.sort(byFinish).slice(0, MAX_REMEMBERED);
-  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length);
-  return [...keptBests, ...keptHistory];
+  const evidence = altitudeEvidence(keptBests, history, dropped).slice(0, MAX_REMEMBERED - keptBests.length);
+  const keptHistory = history.sort(byFinish).slice(0, MAX_REMEMBERED - keptBests.length - evidence.length);
+  return [...keptBests, ...evidence, ...keptHistory];
+}
+
+/** 🎚️ Of the moves history would drop (too old, or past a station's cap),
+ *  those an altitude claim of some station's best move needs to stay lost: a claim that beat it ages out of history only by being kept
+ *  here, or the loser would be accepted later, unflown and unpaid. Each is
+ *  tried without, oldest first, and kept only if the losses change. */
+function altitudeEvidence(bests: StationMove[], history: StationMove[], dropped: StationMove[]): StationMove[] {
+  // Every claim a best move makes: an altitude change's destination and the
+  // orbit it leaves, or the custom orbit any other move (a pin too) holds.
+  const claimsOf = (b: StationMove) => [altitudeMoveKey(b), `${altitudeMoveKey(b)}|from`];
+  const claims = (b: StationMove) => (b.mode === 'orbit' && !b.settles) || !!(b.settles ?? b).fromOrbit;
+  const losers = (moves: StationMove[]) => {
+    const lost = lostAltitudeClaims(flownAmong(moves));
+    return bests.filter(claims).flatMap(claimsOf).filter((k) => lost.has(k)).join('\n');
+  };
+  if (dropped.length === 0 || !bests.some(claims)) return [];
+  let kept = [...dropped];
+  const want = losers([...bests, ...history, ...kept]);
+  if (!want) return [];
+  for (const m of [...dropped].sort((x, y) => x.arriveAt - y.arriveAt)) {
+    const without = kept.filter((k) => k !== m);
+    if (losers([...bests, ...history, ...without]) === want) kept = without;
+  }
+  return kept;
+}
+
+/** 🎚️ At most this many deciding claims ride beside a station's summary. */
+export const MAX_SUMMARY_CLAIMS = 16;
+
+/** 🎚️ A station's earlier moves that some station's latest altitude claim
+ *  needs to stay lost (as altitudeEvidence finds them among what this
+ *  install remembers), newest first. Its summary carries them beside its
+ *  latest move: that alone hides the claim that beat the loser, and an
+ *  install that never saw it would accept the loser, unflown and unpaid. */
+export function decidingClaimsOf(welcomeRoomId: string): StationMove[] {
+  const list = readRememberedMoves();
+  const mine = list.filter((m) => m.welcomeRoomId === welcomeRoomId).sort((x, y) => compareMoves(y, x));
+  if (mine.length < 2) return [];
+  const bests: StationMove[] = [mine[0]];
+  const history: StationMove[] = [];
+  const byStation = new Map<string, StationMove[]>();
+  for (const m of list) {
+    if (m.welcomeRoomId === welcomeRoomId) continue;
+    const k = m.welcomeRoomId ? `w:${m.welcomeRoomId}` : `s:${m.stationId}`;
+    const g = byStation.get(k);
+    if (g) g.push(m); else byStation.set(k, [m]);
+  }
+  for (const g of byStation.values()) {
+    g.sort((x, y) => compareMoves(y, x));
+    bests.push(g[0]);
+    history.push(...g.slice(1));
+  }
+  return altitudeEvidence(bests, history, mine.slice(1))
+    .sort((x, y) => compareMoves(y, x))
+    .slice(0, MAX_SUMMARY_CLAIMS);
 }
 
 let notifyQueued = false;
@@ -1028,6 +1516,7 @@ export function stationLeftFrom(
 /** Point stations.listStations at the remembered moves. */
 export function installStationMoveResolver(): void {
   setStationMoveResolver(rememberedMoveFor);
+  setAltitudeHistory(flownKnownMoves);
 }
 
 // ── The room doc ─────────────────────────────────────────────────────────────
@@ -1286,15 +1775,82 @@ function roomOwn(): StationMove[] {
   return [...(legacy ? [legacy] : []), ...entries, ...folded];
 }
 
+/** Did the bounded scan of the bound room's move log read every record
+ *  (roomMoves)? A peer can flood the log, and the move it pushes past the
+ *  scan may be the one under way, which this install may never have heard
+ *  of. While it is not known, everything a move would hold holds (the dock
+ *  locks, towHoldsDock and roomDocLockedByMove; DEPART's berths,
+ *  shipArrival.berthsToCastOff; booking a move or a tow), as a far room's
+ *  does (roomDocLockedByMove), and a sweep clears the flood a bounded pass
+ *  at a time (sweepLater), once per change of the log: the writes that
+ *  sweep it otherwise are held too. Cached with the room's moves. */
+let knownCache: { version: number; known: boolean } | null = null;
+
+export function roomMovesKnown(): boolean {
+  if (!docAlive()) return true;
+  if (knownCache?.version !== roomVersion) {
+    knownCache = { version: roomVersion, known: roomMoves().complete };
+    if (!knownCache.known) sweepLater();
+  }
+  return knownCache.known;
+}
+
 /** The move a record stands for: a pin's settled move, else itself. */
 function flownOf(m: StationMove): StationMove {
   return m.settles ?? m;
 }
 
+/** The flight a record says its station made (or will): a move itself, or
+ *  the journey an arrival's pin settles (the pin carries it, so a pin
+ *  written since never hides that flight from a check judged at an earlier
+ *  moment); null for a cancel, whose tow never flew. */
+function flightOf(m: StationMove): StationMove | null {
+  return isCancelPin(m) ? null : flownOf(m);
+}
+
 /** Is this move out of the running: beaten by a concurrent move of its
  *  station, or outbid by another tow of the same tug? */
 function superseded(m: StationMove, known: StationMove[]): boolean {
-  return beatenForStation(m, known) || outbidForTug(m, known);
+  return beatenForStation(m, known) || outbidForTug(m, known) || outbidForAltitude(m, known);
+}
+
+/** 🎚️ Did this altitude change lose the orbit it ends in to an earlier claim
+ *  of another station (stations.lostAltitudeClaims)? The station list aborts
+ *  it, so it neither flies, holds docks nor draws fuel. */
+function outbidForAltitude(m: StationMove, known: StationMove[]): boolean {
+  if (m.mode !== 'orbit' || m.settles) return false;
+  let lost = lostCache.get(known);
+  if (!lost) lostCache.set(known, lost = lostAltitudeClaims(flownAmong(known)));
+  return lost.has(altitudeMoveKey(m));
+}
+
+/** The losing claims per list of known moves: superseded asks once per entry. */
+const lostCache = new WeakMap<StationMove[], Set<string>>();
+
+/** 🎚️ The known moves that flew: a concurrent move its own station (or tug)
+ *  preferred never did, so it claims no orbit. */
+function flownAmong(known: StationMove[]): StationMove[] {
+  return known.filter((m) => !beatenForStation(m, known) && !outbidForTug(m, known));
+}
+
+/** Every move this install knows: the bound room's log and the remembered
+ *  ones. */
+function allKnownMoves(): StationMove[] {
+  if (!docAlive()) return readRememberedMoves();
+  const { entries, legacy } = roomMoves();
+  return knownMoves(legacy ? [legacy, ...entries] : entries);
+}
+
+/** 🎚️ The moves listStations weighs altitude claims among: every known one
+ *  that flew. */
+function flownKnownMoves(): StationMove[] {
+  return flownAmong(allKnownMoves());
+}
+
+/** 🎚️ Is this an altitude change another station's claimed the orbit for
+ *  first, by every move this install knows? */
+export function isAbortedAltitudeChange(m: StationMove): boolean {
+  return m.mode === 'orbit' && !m.settles && lostAltitudeClaims([m, ...flownKnownMoves()]).has(altitudeMoveKey(m));
 }
 
 /** Did a concurrent move of the same station win over this one? Another

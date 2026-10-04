@@ -12,13 +12,20 @@ import {
   dockGatesIn,
   fitDockPortIn,
   gateAccessIn,
+  hasDoorGrant,
   nextFreeGate,
   readAutoFerryGates,
   readGateAccess,
   readDockGates,
+  readDockGatesIfComplete,
   readUnnumberedPorts,
   readDoorPolicy,
+  removeDoorGrant,
+  subscribeDoorPolicy,
+  subscribeDoorPolicyRecords,
+  writeDoorGrant,
   writeDoorPolicy,
+  writeDoorRequest,
 } from './doorPolicy';
 import {
   bindStationAtlasDoc,
@@ -67,6 +74,34 @@ function twoRoomStation(): void {
     gates: { south: 2, east: 3 },
   });
 }
+
+describe("who hears a change to the room's door policy", () => {
+  it('tells a policy-record listener of a port change, never of a rights request or grant', () => {
+    // The station's gates come from the policy records alone: a request or
+    // a grant must not set off a harvest of the whole room.
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    let records = 0;
+    let any = 0;
+    const offRecords = subscribeDoorPolicyRecords(() => { records++; });
+    const offAny = subscribeDoorPolicy(() => { any++; });
+    try {
+      writeDoorRequest('north', 'pub-a', 'Ada');
+      writeDoorGrant('north', 'pub-a', 'Ada');
+      removeDoorGrant('north', 'pub-a');
+      expect(records).toBe(0);
+      // The keypad still repaints for each of them.
+      expect(any).toBeGreaterThanOrEqual(3);
+      const before = any;
+      writeDoorPolicy('north', { passage: 'public', construction: 'owner', adapter: true, gate: 4 });
+      expect(records).toBe(1);
+      expect(any).toBe(before + 1);
+    } finally {
+      offRecords();
+      offAny();
+    }
+  });
+});
 
 describe('the gate on a dock port', () => {
   it('is kept only on a port, and only as a whole number in range', () => {
@@ -202,6 +237,75 @@ describe('the gate on a dock port', () => {
     expect(dockGatesIn(doc)).toEqual({ 'd:live': 5 });
   });
 
+  it('reads a bounded number of keys however large a peer makes both maps', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    const layout = doc.getMap('doorLayout');
+    const policies = doc.getMap('doorPolicy');
+    for (let i = 0; i < 3000; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      layout.set(id, { nope: true });
+      policies.set(id, { passage: 'public', construction: 'owner' });
+    }
+    // Count every key the readers walk, and the whole-map walk each size takes.
+    let read = 0;
+    for (const map of [layout, policies]) {
+      const keys = map.keys.bind(map);
+      const entries = map.entries.bind(map);
+      const counted = <T>(it: IterableIterator<T>): IterableIterator<T> => ({
+        [Symbol.iterator]() { return this; },
+        next() { const r = it.next(); if (!r.done) read++; return r; },
+      });
+      Object.assign(map, { keys: () => counted(keys()), entries: () => counted(entries()) });
+      Object.defineProperty(map, 'size', { get: () => { const n = [...keys()].length; read += n; return n; } });
+    }
+    expect(readDockGates()).toEqual({});
+    expect(read).toBeLessThan(3000);
+    read = 0;
+    expect(dockGatesIn(doc)).toEqual({});
+    expect(read).toBeLessThan(3000);
+  });
+
+  it("lists the room's gates and their access from one read, and none while a port has no number", () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    doc.getMap('doorLayout').set('north', { id: 'north', wall: 'y+', lateral: 0, placed: true });
+    doc.getMap('doorLayout').set('south', { id: 'south', wall: 'y-', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('north', { passage: 'public', construction: 'owner', adapter: true, gate: 1 });
+    doc.getMap('doorPolicy').set('south', { passage: 'public', construction: 'owner', adapter: true, gate: 2, gateAccess: 'closed' });
+    expect(readDockGatesIfComplete()).toEqual({ gates: { north: 1, south: 2 }, gateAccess: { south: { access: 'closed' } } });
+    doc.getMap('doorLayout').set('east', { id: 'east', wall: 'x+', lateral: 0, placed: true });
+    doc.getMap('doorPolicy').set('east', { passage: 'public', construction: 'owner', adapter: true });
+    expect(readDockGatesIfComplete()).toBeNull();
+  });
+
+  it('lists no gates as the room\'s when a flood of both maps hides a port, or the room has more ports than a read lists', () => {
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    const layout = doc.getMap('doorLayout');
+    const policies = doc.getMap('doorPolicy');
+    for (let i = 0; i < 1100; i++) {
+      const id = `d:junk${String(i).padStart(4, '0')}`;
+      layout.set(id, { nope: true });
+      policies.set(id, { passage: 'public', construction: 'owner' });
+    }
+    layout.set('d:live', { id: 'd:live', wall: 'y+', lateral: 0, placed: true });
+    policies.set('d:live', { passage: 'public', construction: 'owner', adapter: true, gate: 5 });
+    // Past both scans, the port is on no list: an empty one is not the room's.
+    expect(readDockGates()).toEqual({});
+    expect(readDockGatesIfComplete()).toBeNull();
+
+    const many = new Y.Doc();
+    bindDoorPolicy(many);
+    for (let i = 0; i < 257; i++) {
+      const id = `d:port${String(i).padStart(4, '0')}`;
+      many.getMap('doorLayout').set(id, { id, wall: 'y+', lateral: 0, placed: true });
+      many.getMap('doorPolicy').set(id, { passage: 'public', construction: 'owner', adapter: true, gate: 1 + (i % MAX_GATE) });
+    }
+    expect(Object.keys(readDockGates())).toHaveLength(256);
+    expect(readDockGatesIfComplete()).toBeNull();
+  });
+
   it('takes the lowest number free in the station', () => {
     expect(nextFreeGate([])).toBe(1);
     expect(nextFreeGate([1, 2, 4])).toBe(3);
@@ -264,6 +368,31 @@ describe('gate gossip that doors alone would skip', () => {
     const b = readAtlas()['room-b']!;
     expect(b.gates).toEqual({ south: 2 });
     expect(b.gateAccess).toEqual({ south: { access: 'closed' } });
+    expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
+  });
+
+  it("takes an older doc copy's word that the gates are not known when our newer copy has none", () => {
+    // Ours, from a build before gates: more doors, and no word on gates.
+    harvestIntoAtlas({
+      roomId: 'room-b', name: 'DOCKS',
+      doors: [
+        { doorId: 'west', targetSeed: seed('room-a'), transient: false },
+        { doorId: 'north', targetSeed: seed('room-c'), transient: false },
+      ],
+    });
+    expect(readAtlas()['room-b']?.gatesUnknown).toBeUndefined();
+    // The room has a port with no number yet: its gates are not known.
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('room-b', {
+      roomId: 'room-b', name: 'DOCKS', updatedAt: 1,
+      doors: { west: { targetRoomId: 'room-a', farDoor: 'east', transient: false } },
+      gatesUnknown: true,
+    });
+    bindStationAtlasDoc(doc, { roomId: 'room-z', isPassagePublic: () => false });
+    const b = readAtlas()['room-b']!;
+    expect(b.gatesUnknown).toBe(true);
+    expect(b.gates).toBeUndefined();
+    expect(b.gateAccess).toBeUndefined();
     expect(Object.keys(b.doors).sort()).toEqual(['north', 'west']);
   });
 
@@ -1204,6 +1333,25 @@ describe('who may dock at a gate', () => {
     expect(gateAccessIn(far, 'south', 'pub-a')).toEqual({ access: 'pass', granted: true });
     expect(gateAccessIn(far, 'south', 'pub-b')).toEqual({ access: 'pass', granted: false });
     expect(gateAccessIn(far, 'north')).toEqual({ access: 'open', granted: false });
+  });
+
+  it('counts a grant only filed under its own door and captain', () => {
+    const far = new Y.Doc();
+    far.getMap('doorPolicy').set('south', { adapter: true, gate: 2, gateAccess: 'pass' });
+    const grants = far.getMap('doorGrants');
+    // The owner's grant list reads the door and captain from the record, so
+    // neither record is a grant it shows for pub-a at this gate.
+    grants.set('south|pub-a', { doorId: 'north', pub: 'pub-a', name: 'A', grantedAt: 1 });
+    expect(gateAccessIn(far, 'south', 'pub-a').granted).toBe(false);
+    grants.set('south|pub-a', { doorId: 'south', pub: 'pub-b', name: 'B', grantedAt: 1 });
+    expect(gateAccessIn(far, 'south', 'pub-a').granted).toBe(false);
+    // The door panel's own check reads a grant the same way.
+    const doc = new Y.Doc();
+    bindDoorPolicy(doc);
+    doc.getMap('doorGrants').set('north|pub-a', { doorId: 'east', pub: 'pub-a', name: 'A', grantedAt: 1 });
+    expect(hasDoorGrant('north', 'pub-a')).toBe(false);
+    writeDoorGrant('north', 'pub-a', 'A');
+    expect(hasDoorGrant('north', 'pub-a')).toBe(true);
   });
 
   it('refuses a DOCK at a gate whose stored access cannot be read', () => {

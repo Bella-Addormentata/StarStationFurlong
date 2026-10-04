@@ -276,6 +276,10 @@ export class PoolWaiter {
    *  timetable (shipPilot.pilotPost) and pushes it here; the walk itself is
    *  local to this game, like every robot's. */
   private pilotPost: { x: number; z: number; faceAngle: number } | null = null;
+  /** 🔧 Disassemble routine (#192): where the robot works — inside the door
+   *  to the module its job takes apart — or null for its charging dock. The
+   *  WORLD hands it over while the job is open (world.updateDisassembly). */
+  private workPost: { x: number; z: number; faceAngle: number } | null = null;
   private activity: "PATROL" | "DOCK" | "CROUPIER" = "PATROL";
   private idleTimer = 0;
   /** 🤖 #77C s3: owner-programmed routine (the dock's console writes it, synced).
@@ -665,6 +669,14 @@ export class PoolWaiter {
     if (this.routine === "pilot") {
       this.tray.visible = false;
       this.updatePilot(dt);
+      return;
+    }
+
+    // 🔧 A 'disassemble' robot works at the door to the module its job takes
+    // apart, and otherwise waits on its dock. Never serves or croupiers.
+    if (this.routine === "disassemble") {
+      this.tray.visible = false;
+      this.updateWork(dt);
       return;
     }
 
@@ -1337,6 +1349,40 @@ export class PoolWaiter {
       this.legR.rotation.x = 0;
       this.body.position.y = Math.sin(this.time * 2.0) * 0.015;
     }
+  }
+
+  /** 🔧 Point the Disassemble robot at its work spot (world pos + facing
+   *  the door), or null to send it back to its dock. Re-sent about twice a
+   *  second, like the captain's post. */
+  public setWorkPost(post: { x: number; z: number; faceAngle: number } | null): void {
+    this.workPost = post;
+  }
+
+  /** 🔧 Walk to the work spot and take the module apart: face the door, the
+   *  left arm braced on the hatch, the right working a wrench in short
+   *  strokes. With no spot, wait on the dock, arms down. */
+  private updateWork(dt: number): void {
+    const post = this.workPost;
+    if (!post || !this.walkTo(dt, post.x, post.z, 0.15)) {
+      this.armL.rotation.set(0, 0, 0);
+      this.armR.rotation.set(0, 0, 0);
+      if (!post) {
+        this.activity = "DOCK";
+        if (this.dockTarget) this.updateDock(dt);
+        else this.idlePose();
+      } else {
+        this.activity = "PATROL";
+      }
+      return;
+    }
+    this.activity = "PATROL";
+    this.turnToward(post.faceAngle, dt);
+    this.legL.rotation.x = 0;
+    this.legR.rotation.x = 0;
+    const stroke = Math.sin(this.time * 7);
+    this.armL.rotation.set(-1.5, 0, -0.1);
+    this.armR.rotation.set(-1.9 + 0.35 * stroke, 0, 0.12);
+    this.body.position.y = 0.012 * Math.abs(stroke);
   }
 
   /** 🎰 Walk to the wheel-head, then stand it: face the wheel with a small

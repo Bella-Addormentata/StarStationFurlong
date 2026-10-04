@@ -1139,6 +1139,14 @@ describe("🚚 where a ruling timetable flies the ship (the route's own copy of 
     expect(Math.abs(plan.transferMs - (on[1].arrive - on[1].depart))).toBeLessThanOrEqual(1);
   });
 
+  it("🎚️ carries a stop's copied altitude orbit, which its legs were priced on", () => {
+    const orbit = { radiusKm: 7_000, phase0: 0.5 };
+    const withOrbit = { ...r, stops: r.stops.map((st, i) => (i === 2 ? { ...st, orbit } : st)) };
+    const places = routeFlightPlaces(withOrbit, at(r, [s], on[1].depart + SEC))!;
+    expect(places.to).toEqual({ ...copyOf(2), orbit });
+    expect(places.from).toEqual(copyOf(1));
+  });
+
   it("names the stops by this install's ids", () => {
     const places = routeFlightPlaces(r, at(r, [s], on[1].depart + SEC), (id) => `here:${id}`);
     expect(places).toMatchObject({ from: { id: 'here:st-1' }, to: { id: 'here:st-2' } });
@@ -1165,6 +1173,14 @@ describe("🚚 where a ruling timetable flies the ship (the route's own copy of 
     // In flight, or with no ruling timetable, the leg's own ends place it.
     expect(routeStayOffList(routeFlightPlaces(r, at(r, [s], on[1].depart + SEC)), false)).toBeNull();
     expect(routeStayOffList(null, false)).toBeNull();
+  });
+
+  it('🎚️ keeps a stay on the stop\'s copy at the altitude the route copied', () => {
+    const orbit = { radiusKm: 7_000, phase0: 0.5 };
+    const withOrbit = { ...r, stops: r.stops.map((st, i) => (i === 1 ? { ...st, orbit } : st)) };
+    const stay = routeFlightPlaces(withOrbit, at(r, [s], on[0].arrive + SEC));
+    expect(routeStayOffList(stay, false)).toEqual({ ...copyOf(1), orbit });
+    expect(routeStayOffList(stay, true)).toBeNull();
   });
 });
 

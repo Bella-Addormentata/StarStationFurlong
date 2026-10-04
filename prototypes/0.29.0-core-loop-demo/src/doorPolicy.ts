@@ -143,9 +143,11 @@ let policyMap: Y.Map<unknown> | null = null;
 let requestsMap: Y.Map<unknown> | null = null;
 let grantsMap: Y.Map<unknown> | null = null;
 const listeners = new Set<() => void>();
+/** ⚓🚦 Listeners to the policy records alone (subscribeDoorPolicyRecords). */
+const recordListeners = new Set<() => void>();
 
-function notify(): void {
-  for (const l of [...listeners]) {
+function notify(to: Set<() => void> = listeners): void {
+  for (const l of [...to]) {
     try { l(); } catch (e) { console.error('[doorPolicy] listener threw:', e); }
   }
 }
@@ -155,15 +157,26 @@ export function bindDoorPolicy(doc: Y.Doc): void {
   policyMap = doc.getMap('doorPolicy');
   requestsMap = doc.getMap('doorRequests');
   grantsMap = doc.getMap('doorGrants');
-  policyMap.observe(() => notify());
+  // The records' own listeners first: what they derive (the station's gates)
+  // is current by the time the rest repaint.
+  policyMap.observe(() => { notify(recordListeners); notify(); });
   requestsMap.observe(() => notify());
   grantsMap.observe(() => notify());
+  notify(recordListeners);
   notify();
 }
 
 export function subscribeDoorPolicy(listener: () => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
+}
+
+/** ⚓🚦 A listener to the policy records alone (a port fitted, removed or
+ *  renumbered, a gate's access) and to a room being bound. A rights request
+ *  or grant changes no gate, so it never calls this one. */
+export function subscribeDoorPolicyRecords(listener: () => void): () => void {
+  recordListeners.add(listener);
+  return () => recordListeners.delete(listener);
 }
 
 function docAlive(): boolean {
@@ -216,29 +229,66 @@ function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
   return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
 }
 
+/** Most ports a gate read lists: more than a station has gate numbers. */
+const MAX_PORTS = 256;
+/** Most keys of each peer-written map a port scan looks at, junk included:
+ *  a room's own doors, and the policies they leave, fit well inside (as
+ *  doorsDoc bounds its pairing scan). */
+const MAX_SCANNED_PORT_KEYS = 4 * MAX_PORTS;
+
 /** ⚓🚦 The dock ports a room's layout has (doors whose policy fits an
- *  adapter), with their policies, for the gate readers. Walking the layout
- *  rather than the policy map means stale or junk policy keys (a removed
- *  door's, a peer's) can never crowd a live port out of a capped scan. The
- *  walk covers the whole layout map, as the room's own door list
- *  (doorLayoutDoc.readAllDoorLayout) does, and only ports count toward the
- *  cap: doors without an adapter, however many, cannot hide one. */
+ *  adapter), with their policies, for the gate readers. A port has a key in
+ *  both peer-written maps, its door's layout record and its policy, and the
+ *  scan reads a bounded number of keys from each. It walks the layout first,
+ *  so stale or junk policy keys (a removed door's, a peer's) cannot crowd a
+ *  live port out, and the policy map only when a flood cuts the layout walk
+ *  short, so junk doors cannot either; doors without an adapter never count
+ *  toward the port cap. A flood of both maps can keep a port off these lists,
+ *  never off a DOCK at that door, which reads its own policy (gateAccessIn,
+ *  dockPortFlagIn). */
 function portsIn(doc: Y.Doc, policies: Y.Map<unknown>): Array<[string, DoorPolicyRecord]> {
-  const out: Array<[string, DoorPolicyRecord]> = [];
+  return scanPorts(doc, policies).ports;
+}
+
+/** portsIn, and whether it saw every port: not when a flood of both maps cut
+ *  the scan short, nor when the room has more ports than the port cap. */
+function scanPorts(doc: Y.Doc, policies: Y.Map<unknown>): { ports: Array<[string, DoorPolicyRecord]>; complete: boolean } {
+  const layout = doc.getMap('doorLayout');
+  const out = new Map<string, DoorPolicyRecord>();
+  let full = false;
   const take = (id: string): void => {
-    if (!doorExistsIn(doc, id)) return;
     const p = sanitizePolicy(policies.get(id));
-    if (p.adapter) out.push([id, p]);
+    if (!p.adapter) return;
+    if (out.size >= MAX_PORTS) full = true;
+    else out.set(id, p);
+  };
+  // A door is a valid record under its own id (doorExistsIn), which junk is
+  // not: told apart here before doorExistsIn counts the whole map for it.
+  const isDoor = (id: string): boolean => {
+    const rec = layout.get(id);
+    return isDoorLayoutRecord(rec) && rec.id === id && doorExistsIn(doc, id);
   };
   let any = false;
-  for (const id of doc.getMap('doorLayout').keys()) {
-    if (doorExistsIn(doc, id)) any = true;
-    take(id);
-    if (out.length >= 256) break;
+  let cut = false;
+  let scanned = 0;
+  for (const id of layout.keys()) {
+    if (++scanned > MAX_SCANNED_PORT_KEYS) { cut = true; break; }
+    if (isDoor(id)) { any = true; take(id); }
   }
-  // A legacy room keeps no layout records: its doors are the cardinal ones.
-  if (!any) for (const id of Object.keys(LEGACY_ID_WALL)) take(id);
-  return out;
+  // Every port has a policy key: a policy walk that ends finds the ports the
+  // layout walk was cut short of.
+  let complete = true;
+  if (cut) {
+    scanned = 0;
+    for (const id of policies.keys()) {
+      if (++scanned > MAX_SCANNED_PORT_KEYS) { complete = false; break; }
+      if (!out.has(id) && isDoor(id)) take(id);
+    }
+  } else if (!any) {
+    // A legacy room keeps no layout records: its doors are the cardinal ones.
+    for (const id of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, id)) take(id);
+  }
+  return { ports: [...out], complete: complete && !full };
 }
 
 /** ⚓🚦 Every non-open gate access of this room's ports, by door id. */
@@ -260,7 +310,7 @@ export function gateAccessIn(
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return { access: 'open', granted: false };
   const a: { access: GateAccess; reservedFor?: string } =
     accessRecord(sanitizePolicy(doc.getMap('doorPolicy').get(doorId))) ?? { access: 'open' };
-  const granted = !!pub && isGrant(doc.getMap('doorGrants').get(reqKey(doorId, pub)));
+  const granted = !!pub && isGrantFor(doc.getMap('doorGrants').get(reqKey(doorId, pub)), doorId, pub);
   return { ...a, granted };
 }
 
@@ -297,6 +347,27 @@ export function readDockGates(): Record<string, number> {
     if (p.gate !== undefined) out[doorId] = p.gate;
   }
   return out;
+}
+
+/** ⚓🚦 readDockGates and readGateAccess from one port scan, or null when the
+ *  room's gates are not known: a port has no number yet (fitted before gates
+ *  existed), or the scan may have left a port out (a flood of both
+ *  peer-written maps cut it short, or more ports than a gate read lists). A
+ *  list missing a port is no list of the room's gates: the atlas harvest
+ *  would drop that gate for everyone. */
+export function readDockGatesIfComplete(): { gates: Record<string, number>; gateAccess: Record<string, GateAccessRecord> } | null {
+  if (!docAlive()) return null;
+  const { ports, complete } = scanPorts(boundDoc!, policyMap!);
+  if (!complete) return null;
+  const gates: Record<string, number> = {};
+  const gateAccess: Record<string, GateAccessRecord> = {};
+  for (const [doorId, p] of ports) {
+    if (p.gate === undefined) return null;
+    gates[doorId] = p.gate;
+    const a = accessRecord(p);
+    if (a) gateAccess[doorId] = a;
+  }
+  return { gates, gateAccess };
 }
 
 /** ⚓🚦 This room's ports that carry no gate number yet (fitted before gates
@@ -420,6 +491,14 @@ function isGrant(v: unknown): v is DoorRightsGrant {
     && typeof g.name === 'string' && typeof g.grantedAt === 'number';
 }
 
+/** The value stored under `reqKey(doorId, pub)` grants that door to that
+ *  captain only when the record names both itself: the owner's list
+ *  (readDoorGrants) reads the door and the captain's key from the record, so
+ *  a record naming others admits nobody here. */
+function isGrantFor(v: unknown, doorId: string, pub: string): v is DoorRightsGrant {
+  return isGrant(v) && v.doorId === doorId && v.pub === pub;
+}
+
 /** Owner ACCEPT: standing, revocable grant; clears the matching request. */
 export function writeDoorGrant(doorId: string, pub: string, name: string): void {
   if (!docAlive() || !pub) return;
@@ -447,5 +526,5 @@ export function readDoorGrants(doorId?: string): DoorRightsGrant[] {
 }
 
 export function hasDoorGrant(doorId: string, pub: string): boolean {
-  return docAlive() ? isGrant(grantsMap!.get(reqKey(doorId, pub))) : false;
+  return docAlive() ? isGrantFor(grantsMap!.get(reqKey(doorId, pub)), doorId, pub) : false;
 }

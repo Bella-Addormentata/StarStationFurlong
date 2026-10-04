@@ -34,13 +34,21 @@
  * planet, the next launch window, the flight time and the propellant both
  * burns take; MOVE schedules the whole transfer in one write. While a move is
  * scheduled or under way the stick holds still.
+ *
+ * 🎚️ ORBIT ALTITUDE (issue 191) sits between the two: an autopilot-style ALT
+ * window of amber LED digits in km. Each digit is a thumbwheel: scroll the
+ * mouse wheel over it (or click its ▲ ▼, or focus the window and use the
+ * arrow keys) to dial the target altitude; SYNC sets it back to the altitude
+ * flown. ENGAGE flies the station there at once on a two-burn transfer
+ * (stationMove.planStationAltitude), clear of every other orbit around the
+ * planet; the stick and MOVE hold until it arrives.
  */
 
 import type { DeviceUI } from './devices';
 import { subscribeDoors } from './doorsDoc';
 import { FURNITURE, FURNITURE_DEFS } from './furniture';
 import { subscribeFurniture } from './furnitureDoc';
-import { realMsFor } from './orbits';
+import { MIN_ALTITUDE_KM, MIN_ORBIT_SEPARATION_KM, maxAltitudeKm, realMsFor } from './orbits';
 import type { CircularOrbit } from './orbits';
 import { TANK_CAPACITY, clampFuelToCapacity, fuelDrawDeficit, readFuelLevel, subscribeShip } from './shipDoc';
 import { subscribePlanetSummary } from './planetSummary';
@@ -55,34 +63,43 @@ import {
   describeOffset,
   describeRefusal,
   describeTrimStatus,
+  helmTrim,
   isBurnLogFull,
   planTrim,
   readBurnFiring,
+  readHelmFiring,
   readOrbitTrim,
+  readSharedTrim,
   slotDriftPerHour,
   slotOffsetAt,
   slotOrbit,
   subscribeStationKeeping,
-  trimFor,
   trimmedOrbit,
   writeTrimBurn,
 } from './stationKeeping';
 import type { FiredBurn, OrbitTrim, TrimContext, TrimDirection, TrimRefusal } from './stationKeeping';
 import { atlasComponent, readAtlas } from './stationAtlas';
 import {
+  describeAltitudeRefusal,
   describeMove,
   describeMoveRefusal,
+  formatAltitude,
   formatLongSpan,
+  formatTransferSpan,
   isMoveActive,
   otherPlanets,
+  planStationAltitude,
   planStationMove,
   quoteMove,
   readMoveFuelDrawn,
+  stationAltitudeKm,
+  stationPointWithMoveAt,
   subscribeStationMove,
+  wholeAltitude,
   writeStationMove,
 } from './stationMove';
 import type { MoveContext } from './stationMove';
-import { listStations, planetById } from './stations';
+import { isOrbitChange, listStations, planetById } from './stations';
 
 const DEG = Math.PI / 180;
 
@@ -308,6 +325,37 @@ function flickDirection(dx: number, dy: number): TrimDirection | null {
   return dy < 0 ? 'raise' : 'lower';
 }
 
+// ── 🎚️ The ALT window ────────────────────────────────────────────────────────
+
+/** Digits in the ALT window: up to 999,999 km, past the top orbit anywhere. */
+export const ALT_DIGITS = 6;
+const ALT_MAX = 10 ** ALT_DIGITS - 1;
+
+/** The target altitude after turning digit `place` (0 = units) by `steps`:
+ *  a thumbwheel carries into the digits above, and the window holds 0 to
+ *  999,999 km. */
+export function turnAltitudeDigit(target: number, place: number, steps: number): number {
+  const p = Math.max(0, Math.min(ALT_DIGITS - 1, Math.floor(place)));
+  const next = Math.round(target) + Math.sign(steps) * Math.min(Math.abs(Math.trunc(steps)), 9) * 10 ** p;
+  return Math.max(0, Math.min(ALT_MAX, next));
+}
+
+/** The ALT window's digits, most significant first, and how many of them are
+ *  leading zeros (drawn unlit). */
+export function altitudeDigits(target: number): { digits: number[]; leading: number } {
+  const v = Math.max(0, Math.min(ALT_MAX, Math.round(target)));
+  const digits = String(v).padStart(ALT_DIGITS, '0').split('').map(Number);
+  let leading = 0;
+  while (leading < ALT_DIGITS - 1 && digits[leading] === 0) leading++;
+  return { digits, leading };
+}
+
+/** Wheel travel (CSS px) that turns an ALT digit one step: one notch. */
+const WHEEL_NOTCH_PX = 100;
+
+const LED = '#FFB300';
+const LED_GLOW = '0 0 6px rgba(255,179,0,0.85), 0 0 14px rgba(255,120,0,0.35)';
+
 export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   let host: HTMLElement | null = null;
   let panel: HTMLDivElement | null = null;
@@ -321,6 +369,13 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   let view: { station: StationRecord; base: CircularOrbit; trim: OrbitTrim | null; planet: string } | null = null;
   let flash: { text: string; until: number } | null = null;
   let moveFlash: { text: string; until: number } | null = null;
+  /** 🎚️ The ALT window: the altitude dialled (whole km), whether the hand has
+   *  turned it since it last followed the altitude flown, the digit the
+   *  arrow keys turn (0 = units), and a refusal ENGAGE just met. */
+  let altTarget: number | null = null;
+  let altEdited = false;
+  let altPlace = 2;
+  let altFlash: { text: string; until: number } | null = null;
   let sinceText = 0;
   let drag: { id: number; cx: number; cy: number; dx: number; dy: number } | null = null;
 
@@ -340,13 +395,14 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     return {
       bolted: deps.bolted(),
       station,
-      trim: readOrbitTrim(),
+      trim: readOrbitTrim(station),
       commander: isCommander(),
       engines: countFunction('engine'),
       fuel: clampFuelToCapacity(readFuelLevel(capacity), capacity),
       now,
       firing: readBurnFiring(now, station),
       logFull: isBurnLogFull(),
+      shared: readSharedTrim(station),
       tanks,
       capacity,
     };
@@ -423,24 +479,154 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
     refresh();
   };
 
+  /** 🎚️ The ALT window: the digits, the band, and the quote or the change
+   *  under way. Until the hand turns a wheel the window shows the altitude
+   *  flown. */
+  const refreshAltitude = (c: ReturnType<typeof readContext>): void => {
+    const mc = readMoveContext(c);
+    const station = mc.station;
+    const move = station?.move;
+    const active = !!move && isMoveActive(move, mc.now);
+    const flown = station ? wholeAltitude(stationAltitudeKm(station)) : null;
+    if (!altEdited || altTarget === null) altTarget = flown ?? 0;
+    if (active) altEdited = false;
+    // While an altitude change flies, the window holds where it is going.
+    if (active && move?.mode === 'orbit' && move.orbit) {
+      altTarget = wholeAltitude(move.orbit.toRadiusKm - planetById(move.toPlanetId).radiusKm);
+    }
+    const target = altTarget;
+    const { digits, leading } = altitudeDigits(target);
+    let cells = '';
+    digits.forEach((d, i) => {
+      const place = ALT_DIGITS - 1 - i;
+      const lit = i >= leading;
+      const sel = place === altPlace;
+      const roll = (n: number) => (n + 10) % 10;
+      cells += `
+        <div data-alt-place="${place}" title="Scroll to turn the ${place === 0 ? 'units' : `${(10 ** place).toLocaleString('en-US')}s`} wheel" style="display:flex; flex-direction:column; align-items:center; width:26px; cursor:ns-resize; user-select:none;">
+          <button type="button" tabindex="-1" data-alt-step="${place}:1" aria-label="Up ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:3px 3px 0 0; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▲</button>
+          <div style="position:relative; width:24px; height:46px; overflow:hidden; background:linear-gradient(#000 0%, #1a0d00 22%, #120800 50%, #1a0d00 78%, #000 100%); border:1px solid ${sel ? 'rgba(255,179,0,0.85)' : 'rgba(255,179,0,0.25)'}; border-radius:3px; box-shadow:inset 0 0 6px rgba(0,0,0,0.95);">
+            <div style="position:absolute; left:0; right:0; top:-3px; text-align:center; font-size:11px; color:rgba(255,179,0,0.18);">${roll(d + 1)}</div>
+            <div style="position:absolute; left:0; right:0; top:10px; text-align:center; font-size:22px; font-weight:800; color:rgba(255,179,0,0.07);">8</div>
+            <div style="position:absolute; left:0; right:0; top:10px; text-align:center; font-size:22px; font-weight:800; color:${lit ? LED : 'rgba(255,179,0,0.22)'}; text-shadow:${lit ? LED_GLOW : 'none'};">${d}</div>
+            <div style="position:absolute; left:0; right:0; bottom:-3px; text-align:center; font-size:11px; color:rgba(255,179,0,0.18);">${roll(d - 1)}</div>
+          </div>
+          <button type="button" tabindex="-1" data-alt-step="${place}:-1" aria-label="Down ${10 ** place} km" style="width:22px; height:13px; padding:0; border:none; border-radius:0 0 3px 3px; background:rgba(255,179,0,0.12); color:${AMBER}; font-size:8px; line-height:13px; cursor:pointer;">▼</button>
+        </div>`;
+      // A thin gap marks the thousands, as the window's "1,250" would.
+      if (place === 3) cells += '<div style="width:4px;"></div>';
+    });
+    setText('#sk-alt-digits', cells);
+    const spin = q<HTMLElement>('#sk-alt-digits');
+    const spoken = `${formatAltitude(target)}, turning the ${(10 ** altPlace).toLocaleString('en-US')}s digit`;
+    if (spin && spin.getAttribute('aria-valuetext') !== spoken) {
+      spin.setAttribute('aria-valuenow', String(target));
+      spin.setAttribute('aria-valuetext', spoken);
+    }
+
+    const planet = station ? planetById(station.planetId) : null;
+    setText('#sk-alt-band', planet
+      ? `${formatAltitude(MIN_ALTITUDE_KM)} – ${formatAltitude(maxAltitudeKm(planet.id))} · ${MIN_ORBIT_SEPARATION_KM} km clear of other orbits · flying ${formatAltitude(flown ?? 0)}`
+      : '');
+
+    let note = '';
+    let tone = GOLD;
+    let ready = false;
+    if (!station) {
+      note = esc(describeAltitudeRefusal('no-station', null, mc.fuel));
+      tone = WARN;
+    } else if (active && move) {
+      note = esc(describeMove(move, mc.now));
+      tone = GREEN;
+    } else if (target === flown) {
+      note = 'Scroll a digit to dial a new altitude, then ENGAGE.';
+    } else {
+      const plan = planStationAltitude(mc, target);
+      ready = plan.ok;
+      const quote = plan.quote;
+      const route = quote
+        ? `→ ${formatAltitude(target)} · ${formatTransferSpan(quote.plan.arriveAt - quote.plan.departAt)} transfer · ${quote.plan.deltaVKmS.toFixed(2)} km/s · ${check(mc.fuel >= quote.fuel)} ${quote.fuel} fuel`
+        : '';
+      if (plan.ok) note = route;
+      else {
+        const why = describeAltitudeRefusal(plan.refusal, plan.quote, mc.fuel, station, plan.near ?? null);
+        note = route ? `${route}<br>${esc(why)}` : esc(why);
+        tone = WARN;
+      }
+    }
+    const flashing = altFlash && mc.now < altFlash.until;
+    setText('#sk-alt-msg', flashing ? esc(altFlash!.text) : note);
+    const msg = q<HTMLElement>('#sk-alt-msg');
+    if (msg) msg.style.color = flashing ? WARN : tone;
+    const engage = q<HTMLButtonElement>('#sk-alt-engage');
+    if (engage) {
+      engage.style.opacity = ready ? '1' : '0.45';
+      engage.style.boxShadow = ready ? '0 0 10px rgba(0,230,118,0.45)' : 'none';
+    }
+  };
+
+  /** Turn one ALT wheel. */
+  const turnAltitude = (place: number, steps: number): void => {
+    if (altTarget === null || steps === 0) return;
+    altTarget = turnAltitudeDigit(altTarget, place, steps);
+    altPlace = Math.max(0, Math.min(ALT_DIGITS - 1, place));
+    altEdited = true;
+    altFlash = null;
+    refresh();
+  };
+
+  /** ENGAGE: fly the station to the altitude dialled — the window's only
+   *  write. */
+  const engageAltitude = (): void => {
+    const c = readContext();
+    const target = altTarget;
+    if (target === null) return;
+    const station = c.station;
+    if (station && target === wholeAltitude(stationAltitudeKm(station))) {
+      altFlash = { text: describeAltitudeRefusal('same-altitude', null, c.fuel), until: c.now + FLASH_MS * 2 };
+    } else {
+      const plan = planStationAltitude(readMoveContext(c), target);
+      if (!plan.ok) {
+        altFlash = {
+          text: describeAltitudeRefusal(plan.refusal, plan.quote, c.fuel, station, plan.near ?? null),
+          until: c.now + FLASH_MS * 2,
+        };
+      } else if (writeStationMove(plan.move)) {
+        altFlash = null;
+        altEdited = false;
+      } else {
+        altFlash = { text: 'The burn did not go through. Try ENGAGE again.', until: c.now + FLASH_MS * 2 };
+      }
+    }
+    refresh();
+  };
+
   /** The room's burn firing now, on the orbit the dashboard shows. */
-  const firingNow = (now: number): FiredBurn | null => (view ? readBurnFiring(now, view.station) : null);
+  const firingNow = (now: number): FiredBurn | null =>
+    // Or the shared trim's last one, while the helm goes on from that trim.
+    (view ? readHelmFiring(now, view.station) : null);
 
   const refresh = (): void => {
     if (!panel) return;
     sinceText = 0;
     const c = readContext();
     const station = c.station;
-    const trim = trimFor(station, c.trim);
+    const trim = helmTrim(station, c.trim, c.shared);
     const base = station ? slotOrbit(station) : null;
     view = station && base ? { station, base, trim, planet: base.planet.name } : null;
 
+    // 🎚️ An altitude change under way: the station is on its transfer.
+    const changing = station?.move && isOrbitChange(station.move) && isMoveActive(station.move, c.now) ? station.move : null;
     if (view && base) {
       const orbit = trimmedOrbit(base, trim);
       const dR = trim?.dRadiusKm ?? 0;
       setText('#sk-station', esc(view.station.name));
       setText('#sk-orbit', `${esc(view.planet)} · slot ${view.station.orbitSlot}`);
-      setText('#sk-alt', `${orbit.altitudeKm.toFixed(1)} km <span style="color:${GOLD_DIM};">· slot ${base.altitudeKm.toFixed(1)} km${
+      if (changing?.orbit) {
+        const live = stationPointWithMoveAt(view.station, c.now).radiusKm - base.planet.radiusKm;
+        const to = changing.orbit.toRadiusKm - base.planet.radiusKm;
+        setText('#sk-alt', `${live.toFixed(1)} km <span style="color:${GOLD_DIM};">· ${to > live ? 'climbing' : 'descending'} to ${esc(formatAltitude(to))}</span>`);
+      } else setText('#sk-alt', `${orbit.altitudeKm.toFixed(1)} km <span style="color:${GOLD_DIM};">· ${view.station.orbit ? 'set' : 'slot'} ${base.altitudeKm.toFixed(1)} km${
         Math.abs(dR) > 1e-9 ? ` (${dR > 0 ? '+' : '−'}${Math.abs(dR).toFixed(1)})` : ''}</span>`);
       setText('#sk-speed', `${orbit.speedKmS.toFixed(3)} km/s <span style="color:${GOLD_DIM};">· ${formatSpan(realMsFor(orbit.periodS))} per orbit</span>`);
       setText('#sk-pos', describeOffset(slotOffsetAt(base, trim, c.now)));
@@ -483,8 +669,11 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       } else if (flash && c.now < flash.until) {
         text = flash.text;
         tone = WARN;
+      } else if (changing) {
+        text = describeMove(changing, c.now);
+        tone = AMBER;
       } else if (view) {
-        text = describeTrimStatus(view.base, trim, c.now, trimFor(station, c.firing ?? null));
+        text = describeTrimStatus(view.base, trim, c.now, firingNow(c.now));
         tone = text.startsWith('ON STATION') ? GREEN : text.startsWith('BURNING') ? AMBER : GOLD;
       } else {
         text = describeRefusal('no-station', c.tanks);
@@ -493,6 +682,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       if (msg.textContent !== text) msg.textContent = text;
       msg.style.color = tone;
     }
+    refreshAltitude(c);
     refreshMove(c);
   };
 
@@ -500,13 +690,18 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   const fire = (dir: TrimDirection): void => {
     const c = readContext();
     if (isMoveActive(c.station?.move, c.now)) {
-      flash = { text: 'The station is moving to another planet: the stick holds until it arrives.', until: c.now + FLASH_MS };
+      flash = {
+        text: isOrbitChange(c.station?.move)
+          ? 'The station is changing altitude: the stick holds until it arrives.'
+          : 'The station is moving to another planet: the stick holds until it arrives.',
+        until: c.now + FLASH_MS,
+      };
       refresh();
       return;
     }
     const plan = planTrim(c, dir);
     if (!plan.ok) {
-      flash = { text: describeRefusal(plan.refusal, c.tanks, trimFor(c.station, c.trim)?.dRadiusKm ?? 0), until: c.now + FLASH_MS };
+      flash = { text: describeRefusal(plan.refusal, c.tanks, helmTrim(c.station, c.trim, c.shared)?.dRadiusKm ?? 0), until: c.now + FLASH_MS };
       refresh();
       return;
     }
@@ -580,6 +775,20 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         </div>
       </div>
       <div id="sk-msg" role="status" style="margin-top:10px; padding:9px 12px; border:1px solid rgba(212,168,75,0.2); border-radius:8px; font-size:10px; line-height:1.55;"></div>
+      <div style="margin-top:12px; font-size:10px; font-weight:800; color:#F0C060; letter-spacing:1px;">🎚️ ORBIT ALTITUDE</div>
+      <div style="display:flex; align-items:center; gap:10px; margin-top:6px; padding:8px 10px; border-radius:8px; background:linear-gradient(#1b1f26, #0d1015); border:1px solid rgba(212,168,75,0.28); box-shadow:inset 0 1px 0 rgba(255,255,255,0.06), 0 2px 8px rgba(0,0,0,0.6);">
+        <div style="display:flex; flex-direction:column; align-items:center; gap:2px;">
+          <span style="font-size:10px; font-weight:800; color:#e8e2d0; letter-spacing:2px;">ALT</span>
+          <span style="font-size:8px; color:${GOLD_DIM};">KM</span>
+        </div>
+        <div id="sk-alt-digits" tabindex="0" role="spinbutton" aria-valuemin="0" aria-valuemax="${ALT_MAX}" aria-label="Target orbit altitude in km. Scroll a digit to turn it, or use the arrow keys: up and down turn the selected digit, left and right pick the digit." style="display:flex; gap:3px; padding:3px 5px; border-radius:5px; background:#050302; border:1px solid rgba(0,0,0,0.9); outline-offset:2px;"></div>
+        <div style="display:flex; flex-direction:column; gap:5px; margin-left:auto;">
+          <button type="button" id="sk-alt-engage" title="Fly the station to the altitude dialled (two burns)" style="padding:6px 10px; border-radius:6px; border:1px solid rgba(0,230,118,0.6); background:rgba(0,230,118,0.10); color:${GREEN}; font-family:inherit; font-size:10px; font-weight:800; letter-spacing:1px; cursor:pointer;">ENGAGE</button>
+          <button type="button" id="sk-alt-sync" title="Set the window back to the altitude flown" style="padding:4px 10px; border-radius:6px; border:1px solid rgba(255,179,0,0.45); background:rgba(255,179,0,0.08); color:${AMBER}; font-family:inherit; font-size:9px; font-weight:800; letter-spacing:1px; cursor:pointer;">SYNC</button>
+        </div>
+      </div>
+      <div id="sk-alt-band" style="margin-top:5px; font-size:9px; color:${GOLD_DIM}; line-height:1.5;"></div>
+      <div id="sk-alt-msg" role="status" style="margin-top:4px; font-size:10px; line-height:1.55;"></div>
       <div style="margin-top:12px; font-size:10px; font-weight:800; color:#F0C060; letter-spacing:1px;">🚚 MOVE TO ANOTHER PLANET</div>
       <div id="sk-move"></div>
       <div id="sk-move-msg" role="status" style="margin-top:6px; font-size:10px; line-height:1.55;"></div>
@@ -598,6 +807,29 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         fire(dirBtn.dataset.skDir as TrimDirection);
         return;
       }
+      const step = target.closest<HTMLElement>('[data-alt-step]');
+      if (step?.dataset.altStep) {
+        const [place, dir] = step.dataset.altStep.split(':').map(Number);
+        turnAltitude(place, dir);
+        return;
+      }
+      if (target.closest('#sk-alt-engage')) {
+        engageAltitude();
+        return;
+      }
+      if (target.closest('#sk-alt-sync')) {
+        altEdited = false;
+        altFlash = null;
+        refresh();
+        return;
+      }
+      const wheelCell = target.closest<HTMLElement>('[data-alt-place]');
+      if (wheelCell?.dataset.altPlace) {
+        altPlace = Number(wheelCell.dataset.altPlace);
+        q<HTMLElement>('#sk-alt-digits')?.focus();
+        refresh();
+        return;
+      }
       const moveBtn = target.closest<HTMLButtonElement>('[data-sk-move]');
       if (moveBtn?.dataset.skMove) {
         startMove(moveBtn.dataset.skMove);
@@ -605,6 +837,49 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       }
       const tab = target.closest<HTMLElement>('[data-sk-tab]');
       if (tab?.dataset.skTab === 'ship') showShip();
+    });
+
+    // 🎚️ The ALT wheels: the mouse wheel turns the digit under the pointer.
+    // Not passive, so the panel does not scroll and the game camera does not
+    // zoom while a wheel turns.
+    const altWindow = panel.querySelector<HTMLElement>('#sk-alt-digits')!;
+    let wheelRest = 0;
+    let wheelPlace = -1;
+    altWindow.addEventListener('wheel', (e) => {
+      const cell = (e.target as HTMLElement).closest<HTMLElement>('[data-alt-place]');
+      if (!cell?.dataset.altPlace) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // A part-turn on one wheel never carries over to the next one.
+      const place = Number(cell.dataset.altPlace);
+      if (place !== wheelPlace) {
+        wheelPlace = place;
+        wheelRest = 0;
+      }
+      // A notched wheel sends about 100 px (or 3 lines) per notch; a
+      // touchpad sends many small deltas, gathered here into notches.
+      wheelRest += e.deltaMode === 0 ? e.deltaY : e.deltaMode === 1 ? e.deltaY * (WHEEL_NOTCH_PX / 3) : e.deltaY * WHEEL_NOTCH_PX;
+      const notches = Math.trunc(wheelRest / WHEEL_NOTCH_PX);
+      if (notches === 0) return;
+      wheelRest -= notches * WHEEL_NOTCH_PX;
+      turnAltitude(place, -notches);
+    }, { passive: false });
+    altWindow.addEventListener('keydown', (e) => {
+      // The window's own keys only: the digit buttons inside it are for the
+      // pointer (out of the tab order, as each refresh redraws them), and a
+      // key on one never engages.
+      if (e.target !== altWindow) return;
+      if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        turnAltitude(altPlace, e.key === 'ArrowUp' ? 1 : -1);
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+        e.preventDefault();
+        altPlace = Math.max(0, Math.min(ALT_DIGITS - 1, altPlace + (e.key === 'ArrowLeft' ? 1 : -1)));
+        refresh();
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        engageAltitude();
+      }
     });
 
     const well = panel.querySelector<HTMLElement>('#sk-well')!;
@@ -774,6 +1049,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       view = null;
       flash = null;
       moveFlash = null;
+      altTarget = null;
+      altEdited = false;
+      altFlash = null;
     },
     update(dt: number): void {
       if (face === 'ship') {
@@ -786,6 +1064,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
       if (sinceText >= TEXT_REFRESH_S || (flash && Date.now() >= flash.until)) {
         if (flash && Date.now() >= flash.until) flash = null;
         if (moveFlash && Date.now() >= moveFlash.until) moveFlash = null;
+        if (altFlash && Date.now() >= altFlash.until) altFlash = null;
         refresh();
       }
       const now = Date.now();
