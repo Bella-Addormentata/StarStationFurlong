@@ -10,8 +10,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
   bindStationAtlasDoc, atlasComponents, dismantleInAtlas, freeGateNumber, harvestIntoAtlas, isDismantled, noteRoomSeed,
-  pushAtlasToDoc, readAtlas, seedAtlasDefaults, stationGates, visibleAtlas, withSharedAtlasOf, MAX_DISMANTLED, MAX_ENTRIES,
-  type AtlasEntry,
+  ownValue, pushAtlasToDoc, readAtlas, seedAtlasDefaults, stationGates, visibleAtlas, withSharedAtlasOf, MAX_DISMANTLED,
+  MAX_ENTRIES, type AtlasEntry,
 } from './stationAtlas';
 import {
   disassemblyCandidates, doorsJoinedTo, isDisassemblyJobRecord, isDisassemblyWork, jobAnnouncement, jobDueAt, jobFraction,
@@ -773,6 +773,68 @@ describe('a module taken apart', () => {
     expect(Object.keys(seen['room-y'].doors)).toEqual(['__proto__']);
     expect(seen['room-y'].doors['__proto__'].targetRoomId).toBe('__proto__');
     expect(atlasComponents(seen).find((c) => c.has('room-y'))?.has('__proto__')).toBe(true);
+  });
+
+  /** HUB (here) joined by a gangway (east) to a module whose room id is `__proto__`. */
+  function protoHub(): void {
+    harvestIntoAtlas({
+      roomId: 'room-a', name: 'HUB', doors: [{ doorId: 'east', targetSeed: seed('__proto__'), transient: false }], owner: { id: 'p-me' },
+    });
+    harvestIntoAtlas({
+      roomId: '__proto__', name: 'PROTO', doors: [{ doorId: 'west', targetSeed: seed('room-a'), transient: false }], owner: { id: 'p-me' },
+    });
+  }
+  const stored = () => JSON.parse(store.get('ssf-station-atlas')!) as Record<string, AtlasEntry>;
+
+  it('saves a module named like an Object property, and its tombstone, as ordinary entries', () => {
+    protoHub();
+    expect(Object.keys(stored())).toContain('__proto__');
+    expect(atlasComponents(readAtlas()).find((c) => c.has('room-a'))?.has('__proto__')).toBe(true);
+    // Taken apart: the tombstone is saved, not only held for the session.
+    dismantleInAtlas('__proto__', 1000);
+    expect(Object.keys(stored())).toContain('__proto__');
+    expect(ownValue(stored(), '__proto__')).toMatchObject({ dismantledAt: 1000, dismantledHere: true });
+    expect(isDismantled('__proto__')).toBe(true);
+    expect(Object.keys(readAtlas())).not.toContain('__proto__');
+    expect(Object.values(readAtlas()['room-a'].doors).map((d) => d.targetRoomId)).not.toContain('__proto__');
+  });
+
+  it('keeps a tombstone heard of for a module named like an Object property', () => {
+    hub();
+    const doc = new Y.Doc();
+    doc.getMap('atlas').set('__proto__', { roomId: '__proto__', name: 'PROTO', doors: {}, dismantledAt: 5, updatedAt: 10 });
+    bindStationAtlasDoc(doc, { roomId: 'room-a', isPassagePublic: () => false });
+    expect(isDismantled('__proto__')).toBe(true);
+    expect(ownValue(stored(), '__proto__')).toMatchObject({ dismantledAt: 5 });
+    // Older gossip of the module, doors and all, does not bring it back.
+    const old = new Y.Doc();
+    old.getMap('atlas').set('__proto__', {
+      roomId: '__proto__', name: 'PROTO', doors: { west: { targetRoomId: 'room-a' } }, updatedAt: 8,
+    });
+    bindStationAtlasDoc(old, { roomId: 'room-a', isPassagePublic: () => false });
+    expect(Object.keys(readAtlas())).not.toContain('__proto__');
+  });
+
+  it('reads a module named like an Object property as gone in a far room doc read for its gates', () => {
+    protoHub();
+    dismantleInAtlas('__proto__', 5);
+    // A far doc still holding HUB's door to it, and the module with a gate.
+    const far = new Y.Doc();
+    far.getMap('atlas').set('room-a', { roomId: 'room-a', name: 'HUB', doors: { east: { targetRoomId: '__proto__' } }, updatedAt: 1 });
+    far.getMap('atlas').set('__proto__', {
+      roomId: '__proto__', name: 'PROTO', doors: { west: { targetRoomId: 'room-a' } }, gates: { south: 1 }, updatedAt: 1,
+    });
+    const merged = withSharedAtlasOf(far, readAtlas(), 'room-a');
+    expect(Object.keys(merged)).not.toContain('__proto__');
+    expect(Object.values(merged['room-a'].doors).map((d) => d.targetRoomId)).not.toContain('__proto__');
+    expect(stationGates(merged, 'room-a')).toEqual([]);
+    // A copy written after the job ended (someone stood inside it since)
+    // brings it back.
+    far.getMap('atlas').set('__proto__', {
+      roomId: '__proto__', name: 'PROTO', doors: { west: { targetRoomId: 'room-a' } }, updatedAt: Date.now() + 1000,
+    });
+    expect(ownValue(withSharedAtlasOf(far, readAtlas(), 'room-a'), '__proto__')?.doors)
+      .toMatchObject({ west: { targetRoomId: 'room-a' } });
   });
 
   it('travels through the shared atlas, and older gossip cannot bring it back', () => {

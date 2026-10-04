@@ -336,10 +336,14 @@ export function visibleAtlas(atlas: Record<string, AtlasEntry>): Record<string, 
 function readSavedAtlas(): Record<string, AtlasEntry> {
   try {
     const raw = localStorage.getItem(KEY);
-    if (!raw) return {};
+    if (!raw) return Object.create(null);
     const obj = JSON.parse(raw);
-    if (typeof obj !== 'object' || obj === null) return {};
-    const atlas = obj as Record<string, AtlasEntry>;
+    if (typeof obj !== 'object' || obj === null) return Object.create(null);
+    // No prototype: a room named `__proto__` stays an ordinary key when the
+    // harvest, the pull or a dismantling writes it into what this returns
+    // (the prototype setter would drop the entry), and one named
+    // `constructor` or `toString` reads as absent, not as an inherited value.
+    const atlas: Record<string, AtlasEntry> = Object.assign(Object.create(null), obj);
     // 🕒 Repair a store poisoned BEFORE the ingest bound shipped. `lastSeen`
     // persists in localStorage, so the isSharedAtlasEntry guard cannot reach it
     // — and it does not just sit there: pushAtlasToDoc republishes it as
@@ -373,7 +377,7 @@ function readSavedAtlas(): Record<string, AtlasEntry> {
     }
     if (repaired) writeAtlas(atlas);
     return atlas;
-  } catch { return {}; }
+  } catch { return Object.create(null); }
 }
 
 /**
@@ -459,7 +463,9 @@ function writeAtlas(atlas: Record<string, AtlasEntry>): void {
       ...tombs.filter((e) => e.dismantledHere === true),
       ...tombs.filter((e) => e.dismantledHere !== true).sort(compareAtlasRecency).slice(0, MAX_DISMANTLED),
     ];
-    const out: Record<string, AtlasEntry> = {};
+    // No prototype: every room id, `__proto__` included, is an own key that
+    // JSON.stringify writes out.
+    const out: Record<string, AtlasEntry> = Object.create(null);
     for (const e of entries) out[e.roomId] = e;
     localStorage.setItem(KEY, JSON.stringify(out));
   } catch { /* privacy mode — the atlas degrades to the current room */ }
@@ -906,7 +912,10 @@ export function withSharedAtlasOf(
   atlas: Record<string, AtlasEntry>,
   roomId: string,
 ): Record<string, AtlasEntry> {
-  const out: Record<string, AtlasEntry> = { ...atlas };
+  // No prototype: a room named `__proto__` is an ordinary key here too, so
+  // its tombstone stands in `out` and a lookup of a room `out` lacks finds
+  // nothing.
+  const out: Record<string, AtlasEntry> = Object.assign(Object.create(null), atlas);
   const shared = doc.getMap('atlas');
   // 🔧 Rooms known to be taken apart — in the atlas given, or in our stored
   // one (readAtlas leaves them out) — stand as tombstones unless the copy
