@@ -36,7 +36,16 @@ idea of decentralisation:
 - **The lane classes** (Cabal plan §4.5): *pure P2P*, *community-owned*, and
   *decentralised third party — optional, off in strict sovereign builds, never
   a dependency*. The Mainline DHT is already in that last class for address
-  lookup; a public torrent swarm is the same shape.
+  lookup — in class, not yet in posture: the node builds its
+  `DhtAddressLookup` with the crate's default bootstrap whenever
+  `SSF_NO_DHT` is unset (`ssf-p2p-node/src/main.rs`; `n0-mainline` 0.5.0's
+  `DEFAULT_BOOTSTRAP_NODES`, four public DNS names, `router.bittorrent.com`
+  among them), which the DNS-free rules above forbid as a default. That is
+  an UNMET PREREQUISITE of every DHT use in this plan (§4's address lookup,
+  §7's seeds): the bootstrap list comes from signed local config or a
+  signed ticket — the station's own nodes, py-ipv8's names only as the dev
+  mode the rules allow — and with none configured the lookup is OFF, never
+  defaulted to the public names; a public torrent swarm is the same shape.
 - **P‑3**: never default public relays. **v007 F2/F5**: status must reach the
   player, and every feature says which rung it is using.
 - **The ChiaHub floor** (rung 6): the chain as the discovery that keeps working
@@ -1231,7 +1240,7 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 | Central piece | Without it |
 |---|---|
 | Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. And the same classifier stands on every PEER dial, setting or no setting: the endpoints a tracker response, the DHT or PEX hand back are as untrusted as the metadata, so every outgoing BitTorrent connection and every uTP or DHT packet goes to a global-unicast address or nowhere — loopback, private, link-local and the metadata ranges refused, a LAN peer reachable only through the operator's explicit allowlist — the check sitting in the client's connector, which the node forks if `librqbit` offers no hook there, rather than shipping without it. LSD (BEP 14) is the ONE exception to global unicast, and it is off until that allowlist exists: its announcements go to multicast groups (`239.192.152.143:6771` and `[ff15::efc0:988f]:6771`), so with an allowlist set the node admits exactly those two destinations on that port, sent only out of the interface(s) that carry an allowlisted subnet, with a hop limit of 1, and takes an announcement only from a source address inside the allowlist (any other is dropped unread), dialling the peers it names only through the same unicast allowlist; with no allowlist there is no LSD socket at all. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
-| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node — one that ANSWERS queries only under a no-amplification rule, since a KRPC query's source address is anyone's to forge and a node that answered freely would reflect onto whoever it named: EVERY reply carries no more bytes than the query it answers, whoever sent it — the node and value lists trimmed to fit, as BEP 5 allows, and a reply that cannot fit (a `get_peers` answer whose token alone outweighs a tiny query) withheld — because an address's past answers authenticate nothing about a later query under its name, so there is no proven-reachable exception to replay: a spoofed query reflects at most its own size and buys the attacker nothing over sending the bytes itself (a reflector at one to one hides a source and multiplies nothing, the standing cost of any UDP service); and every address is besides under a response budget counted at the socket (a reply a second and 2 KB a second per address, 64 KB a second across all, the rest dropped unanswered), a bound on the node's own outgoing bytes and never the amplification argument, which the size rule carries alone; `librqbit` enqueues `get_peers` and `find_node` replies directly and its limiter wraps only the queries it makes, so until the node's fork carries the rule the DHT runs client-only, lookups made and no query answered, at the cost of the bootstrap role alone — so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no BEP‑5 infohash DHT client, no PEX, no LSD, no tracker or web-seed code to reach a swarm with — the only isolation that holds for the swarm, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. What this feature neither adds nor removes is the node's OWN address lookup over Mainline — `DhtAddressLookup` in `ssf-p2p-node/src/main.rs`, on by default today and off with `SSF_NO_DHT=1`, which publishes and resolves node ids, never infohashes: node discovery's lane-5 question (§1) — and a STRICT build answers it the way §1 does: the lookup is not compiled in there — `DhtAddressLookup` sits behind a cargo feature (`mainline-lookup`, on by default) that a strict build leaves out, as it leaves the `torrent` feature out — so there is no switch for an operator to flip and the promise is the build's, not a default's: discovery falls back to signed local config, tickets and connected peers, and "strict" promises no public DHT traffic of any kind, torrent or address. `SSF_NO_DHT=1` stays the runtime switch of a NON-strict build. A build that merely leaves the `torrent` feature out while keeping the address lookup is TORRENT-FREE, the narrower promise, and is called that — never strict, whatever its switches say. |
+| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node — one that ANSWERS queries only under a no-amplification rule, since a KRPC query's source address is anyone's to forge and a node that answered freely would reflect onto whoever it named: EVERY reply carries no more bytes than the query it answers, whoever sent it — the node and value lists trimmed to fit, as BEP 5 allows, and a reply that cannot fit (a `get_peers` answer whose token alone outweighs a tiny query) withheld — because an address's past answers authenticate nothing about a later query under its name, so there is no proven-reachable exception to replay: a spoofed query reflects at most its own size and buys the attacker nothing over sending the bytes itself (a reflector at one to one hides a source and multiplies nothing, the standing cost of any UDP service); and every address is besides under a response budget counted at the socket (a reply a second and 2 KB a second per address, 64 KB a second across all, the rest dropped unanswered), a bound on the node's own outgoing bytes and never the amplification argument, which the size rule carries alone; `librqbit` enqueues `get_peers` and `find_node` replies directly and its limiter wraps only the queries it makes, so until the node's fork carries the rule the DHT runs client-only, lookups made and no query answered, at the cost of the bootstrap role alone — so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no BEP‑5 infohash DHT client, no PEX, no LSD, no tracker or web-seed code to reach a swarm with — the only isolation that holds for the swarm, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. What this feature neither adds nor removes is the node's OWN address lookup over Mainline — `DhtAddressLookup` in `ssf-p2p-node/src/main.rs`, on by default today and off with `SSF_NO_DHT=1` — and, until its bootstrap list comes from signed local config or a ticket, bootstrapped from the crate's four public DNS names, §1's unmet prerequisite, the lookup to be off with none configured — which publishes and resolves node ids, never infohashes: node discovery's lane-5 question (§1) — and a STRICT build answers it the way §1 does: the lookup is not compiled in there — `DhtAddressLookup` sits behind a cargo feature (`mainline-lookup`, on by default) that a strict build leaves out, as it leaves the `torrent` feature out — so there is no switch for an operator to flip and the promise is the build's, not a default's: discovery falls back to signed local config, tickets and connected peers, and "strict" promises no public DHT traffic of any kind, torrent or address. `SSF_NO_DHT=1` stays the runtime switch of a NON-strict build. A build that merely leaves the `torrent` feature out while keeping the address lookup is TORRENT-FREE, the narrower promise, and is called that — never strict, whatever its switches say. |
 | Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build, under the trackers row's destination gate when on (a web-seed URL comes from the same untrusted metadata, and a crafted one would otherwise point the node at loopback, the LAN or a metadata service); never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
@@ -1274,16 +1283,17 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   signature with the rest — renewed hourly under a sequence per (node,
   hash) that only rises — one per item, never one per node across items,
   or a renewal for one hash arriving after a higher one for another would
-  read as a replay — and judged expiring by the READER, on the floor
-  below, two lifetimes on that one clock: a seed is LISTED — its node
-  counted among the item's holders — for a day from the floor's reading
-  when this node last received a renewal with a higher `seq` for that
-  (node, hash), never from a stamp of the seeder's, which no reader could
-  bound and a skewed or lying seeder could set a decade out; and its MARK,
-  the replay guard, is kept for a day past the later of that same receipt
-  and the newest `at` it accepted, so the mark always outlives the
-  listing (a guard that fell before its seed could be re-admitted would
-  be no guard) — a renewal with an older or equal `seq` for that
+  read as a replay — and judged expiring by the READER, on two clocks of
+  its own (below), one lifetime each: a seed is LISTED — its node
+  counted among the item's holders — for a day, on the AGE clock, from
+  its reading when this node last received a renewal with a higher `seq`
+  for that (node, hash), never from a stamp of the seeder's, which no
+  reader could bound and a skewed or lying seeder could set a decade out;
+  and its MARK, the replay guard, is kept, on the FLOOR, for a day past
+  the later of that same receipt and the newest `at` it accepted, so the
+  mark always outlives the listing (a guard that fell before its seed
+  could be re-admitted would be no guard; the floor never runs ahead of
+  the age clock, below) — a renewal with an older or equal `seq` for that
   (node, hash) is a replay and ignored, the high-water mark kept per
   (node, hash) and persisted — under BOUNDS that hold against minting,
   since a node id is free to mint (§4), a map that grew with every id a
@@ -1301,11 +1311,29 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   stands a day past the later of its receipt and the newest `at` it
   accepted, as above, when every announcement it could refuse is refused
   by age under every later correction — and is never dropped sooner, so a
-  replay fails on the mark or on its age and on nothing else (the cost of
-  a clock stepped a long way forward and back is that honest seeds read
-  as too old until true time catches the floor up, said on the library
-  pane as the clock standing behind the floor — bounded by the step, and
-  the smaller cost beside a withdrawal undone); what the mark guards is
+  replay fails on the mark or on its age and on nothing else. The floor
+  may STAND STILL — corrected back after a step forward, it waits for
+  true time to catch it up — which is right for the replay bound and
+  wrong for a listing: a seeder listed at the stepped reading would stay
+  listed for as long as the step, a day never passing on a clock that
+  does not move. So listings age on the AGE clock, which only rises and
+  never stands still: the later of the wall clock and the reading last
+  persisted plus the monotonic time elapsed since, persisted with every
+  mark written and on shutdown, and resumed from the persisted reading
+  at start — the time the node was down counting only as far as the wall
+  clock has moved past that reading, never on a clock that may have been
+  stepped meanwhile — so a listing accepted while the clock stood
+  stepped forward is delisted a day of real time later; and the age
+  clock, never below the floor (both take the wall clock's maximum, and
+  only one of them runs on), is never the one a mark is measured on, or
+  marks would fall before the announcements they guard were refused by
+  age. (The cost of a clock stepped a long way forward and back is that
+  honest seeds read as too old until true time catches the floor up, and
+  the few marks accepted meanwhile — only announcements dated near the
+  stepped reading earn one then — stand until it does, said on the
+  library pane as the clock standing behind the floor — bounded by the
+  step, and the smaller cost beside a withdrawal undone.) What the mark
+  guards is
   an honest seeder's withdrawal (the `library-unseed` below), which an old
   seed replayed after it would undo — a seeder that lies about `at` or
   signs anew guards nothing by replaying, since it can announce afresh at
