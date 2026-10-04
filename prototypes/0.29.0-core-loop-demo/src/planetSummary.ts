@@ -41,7 +41,7 @@ import { isAcceptableDoorKey } from './doorsDoc';
 import type { FlightStatus } from './shipDoc';
 import { isOrbitTrim, trimFor, trimmedOrbit } from './stationKeeping';
 import type { OrbitTrim } from './stationKeeping';
-import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
+import { cleanMove, compareMoves, isPlausibleMove, isStationMove, readRememberedMoves, rejectionOf, rememberMove, rememberedMoveFor, standingInsteadOf } from './stationMove';
 import { setStationTrimResolver } from './orbits';
 import { MAX_ORBIT_SLOTS, listStations, planetById, readStationRecords, registerStation, removeStation, roomAdriftPlace, setKnownPlacesResolver, stationInTransit } from './stations';
 import type { KnownPlace, StationMove, StationRecord } from './stations';
@@ -1284,7 +1284,14 @@ function applyLearned(store: Store): void {
   // Moves first: they decide which planet each station is listed at.
   for (const s of Object.values(store.stations)) {
     if (s.move) rememberMove(s.move);
-    if (s.stands) rememberMove(s.stands);
+    if (!s.stands) continue;
+    rememberMove(s.stands);
+    // 🚚 …and that its latest did not stand where the summary was published
+    // (a tow another station's outbid on the same tug), kept for good as
+    // that tow's cancel (stationMove.rejectionOf): the station follows here
+    // what the summary places it by, rival gossiped or not.
+    const rejected = s.move ? rejectionOf(s.move) : null;
+    if (rejected) rememberMove(rejected);
   }
   const room = mayBeShipRoom();
   const found = ctx?.currentStation() ?? null;

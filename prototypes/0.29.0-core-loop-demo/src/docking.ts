@@ -109,9 +109,9 @@ import {
 // would leave the station side pointing at a moving target — the plan's
 // "the module IS the room; passengers travel with it" invariant relies on
 // the ship being at rest before a station lane latches on.
-import { readFlightRecord, pairingAllowedByFlight } from "./shipDoc";
+import { UNDOCK_RENEW_MS, endUndockHold, holdUndock, pairingAllowedByFlight, readFlightRecord, renewUndockHold } from "./shipDoc";
 import { dockLockedByMove, roomMovesKnown } from "./stationMove";
-import { berthHeldByMove, correctReleasePlace, detachBerth, releasePlaceOf } from "./shipArrival";
+import { berthHeldByMove, correctReleasePlace, detachLegacyBerthAt, releasePlaceOf } from "./shipArrival";
 import {
   doorLateralLimitForWall,
   clearDoorSlide,
@@ -2691,15 +2691,16 @@ export class DoorDockingPortSystem {
 
   /**
    * 🚚 May this end let go of the legacy berth on `doorId` (a transient
-   * pairing on a door that is no dock port: DETACH releases this end only)?
-   * Not while a move this install knows holds it (heldByMove), nor one only
-   * the far room knows, asked through the far writer as an UNDOCK asks
-   * (FarDockRequest `release`): best effort, so a far room that cannot be
-   * reached does not hold it.
+   * pairing on a door that is no dock port: DETACH releases this end only)
+   * in a release made at `now`? Not while a move this install knows holds
+   * it then, nor one only the far room knows, asked through the far writer
+   * as an UNDOCK asks (FarDockRequest `release`), at the stamp the release
+   * takes (shipArrival.detachBerth stamps its tombstone the same way): best
+   * effort, so a far room that cannot be reached does not hold it.
    */
-  public async farReleaseAllowed(doorId: string): Promise<boolean> {
+  public async farReleaseAllowed(doorId: string, now: number = Date.now()): Promise<boolean> {
     const roomId = this.roomNow();
-    if (this.heldByMove(doorId)) return false;
+    if (berthHeldByMove(roomId, doorId, now)) return false;
     const record = readDoor(doorId);
     if (record?.paired !== true || !this.farDockWriter) return true;
     let result: FarDockResult;
@@ -2709,7 +2710,7 @@ export class DoorDockingPortSystem {
         nearRoomId: roomId,
         farAddress: record.connectedRoomAddress,
         nearDoorId: doorId,
-        undockedAt: stampAfter(record.dockedAt),
+        undockedAt: stampAfter(record.dockedAt, now),
       });
     } catch (err) {
       console.warn("[dock] far release check threw:", err);
@@ -2719,32 +2720,29 @@ export class DoorDockingPortSystem {
   }
 
   /**
-   * ⏏ #67 D2: DETACH the legacy berth on `doorId` (shipArrival.detachBerth)
-   * once no station move holds it, by the moves its far room knows too
-   * (farReleaseAllowed): a station between planets carries the ship a berth
-   * holds, as a dock's. Only the berth it asked about, in the room it asked
-   * from, and its row says why when one holds it. True when it let go.
+   * ⏏ #67 D2: DETACH the legacy berth on `doorId` once no station move holds
+   * it, by the moves its far room knows too (farReleaseAllowed): a station
+   * between planets carries the ship a berth holds, as a dock's. One release
+   * at one stamp, the far room's answer and this end's tombstone alike
+   * (shipArrival.detachLegacyBerthAt). Only the berth it asked about, in the
+   * room it asked from, and its row says why when one holds it. True when
+   * it let go.
    */
   public async detachLegacyBerth(doorId: string): Promise<boolean> {
     if (this.dockOp(doorId)?.busy) return false;
     const roomId = this.roomNow();
-    const asked = readDoor(doorId);
-    if (asked?.paired !== true) return false;
+    if (readDoor(doorId)?.paired !== true) return false;
     this.setDockOp(doorId, { busy: true, note: "Asking the berth's station…" }, roomId);
     this.refreshPolicyUI();
-    const allowed = await this.farReleaseAllowed(doorId);
-    const still = this.roomNow() === roomId ? readDoor(doorId) : undefined;
-    const same = still?.paired === true && still.connectedRoomAddress === asked.connectedRoomAddress
-      && still.dockedAt === asked.dockedAt;
-    // The far room answered for the moment it was asked, and a move it knew
-    // of (this install remembers them now: farDoorWrite) may have left since:
-    // judged again, both ends, at the stamp the tombstone takes.
-    const at = Date.now();
-    const free = allowed && !(same && berthHeldByMove(roomId, doorId, at));
-    const done = free && same && detachBerth(doorId, at);
-    this.setDockOp(doorId, free ? {} : { note: this.moveHoldNote("berth"), tone: "bad" }, roomId);
+    const outcome = await detachLegacyBerthAt(
+      roomId,
+      doorId,
+      (now) => this.farReleaseAllowed(doorId, now),
+      () => this.roomNow(),
+    );
+    this.setDockOp(doorId, outcome === "held" ? { note: this.moveHoldNote("berth"), tone: "bad" } : {}, roomId);
     this.refreshPolicyUI();
-    return done;
+    return outcome === "released";
   }
 
   /** The module on the other side, by name when the atlas knows it. */
@@ -2875,6 +2873,12 @@ export class DoorDockingPortSystem {
     const now = Date.now();
     const farAt = releasePlaceOf(port.roomId, now);
     const nearAt = releasePlaceOf(roomId, now);
+    // 🚚 Until the far room answers, this release may yet be taken back (a
+    // move it knows of holds the dock): every helm reads the dock as still
+    // holding a tow meanwhile (shipDoc.UndockHold), however long the answer
+    // takes. Taken before the tombstone, so no peer sees the one without
+    // the other; ended once answered, in the room it was taken in.
+    const held = !!this.farDockWriter && holdUndock(doorId, undockedAt, now);
     writeDoorTombstone(doorId, port.address, berthMemoryFrom(port.record, undockedAt, farAt));
     const name = this.partnerLabel(port.roomId);
     if (!this.farDockWriter) {
@@ -2886,6 +2890,10 @@ export class DoorDockingPortSystem {
     }
     this.setDockOp(doorId, { busy: true, note: `Undocked — telling ${name}…` }, roomId);
     const near = this.doorLateral(doorId);
+    const renewal = held ? setInterval(() => { renewUndockHold(doorId, undockedAt); }, UNDOCK_RENEW_MS) : null;
+    const answered = () => {
+      if (held && this.roomNow() === roomId) endUndockHold(doorId, undockedAt);
+    };
     let result: FarDockResult;
     try {
       result = await this.farDockWriter({
@@ -2902,6 +2910,8 @@ export class DoorDockingPortSystem {
     } catch (err) {
       console.warn("[dock] far undock threw:", err);
       result = { ok: false, reason: "unreachable" };
+    } finally {
+      if (renewal !== null) clearInterval(renewal);
     }
     if (!result.ok && result.reason === "moving") {
       // 🚚 The far room knew of a move this install had not heard of (the
@@ -2914,6 +2924,7 @@ export class DoorDockingPortSystem {
       const back = still?.kind === "undocked" && still.memory.undockedAt === undockedAt
         && pairingAllowedByFlight(readFlightRecord()).ok;
       if (back) writeDoorPairing(doorId, port.address, port.record);
+      answered();
       this.setDockOp(
         doorId,
         back
@@ -2928,10 +2939,12 @@ export class DoorDockingPortSystem {
     // 🚚 The far room's moves are learned now (farDoorWrite): where its
     // station was as it let go may be news here (arrived at another planet
     // since this install last heard, say). This end's tombstone says where
-    // it really was, as does the rest a ship took from it meanwhile.
+    // it really was, as does the rest a ship took from it meanwhile. Then
+    // the release stands.
     if (result.ok && this.roomNow() === roomId) {
       correctReleasePlace(doorId, undockedAt, farAt, releasePlaceOf(port.roomId, now));
     }
+    answered();
     this.setDockOp(
       doorId,
       result.ok

@@ -595,15 +595,15 @@ export function dockLockedByMove(roomIds: string[], realMs: number): boolean {
  *  those its planet summaries gossip (booked in another room of its
  *  station, or a tug's), count with every move known here, so a ship that
  *  has not heard of one yet still joins no station between planets: a tow
- *  that room is the tug of, ahead or under way, or a move of its station in
- *  transit. Its station is the one this install lists the room at, else
- *  the one whose welcome room it is, else the one its own bookings name (a
- *  move is booked from a room of its station, a tow from the tug; a pin is
- *  no booking: every game writes them for each station it lists, wherever
- *  it stands, pinSettledArrivals). A room
- *  whose records the bounded scans cannot all read (a peer can flood
- *  either map) is held too: what lies past them may be such a move, until
- *  the clients there prune the flood. */
+ *  that room is the tug of, ahead or under way, or a flight of its station
+ *  under way at `realMs`. Its station is the one this install lists the
+ *  room at, else the one whose welcome room it is, else the one its own
+ *  bookings name (a move is booked from a room of its station, a tow from
+ *  the tug; a pin is no booking: every game writes them for each station it
+ *  lists, wherever it stands, pinSettledArrivals). A room whose records the
+ *  bounded scans cannot all read (a peer can flood either map) is held too:
+ *  what lies past them may be such a move, until the clients there prune
+ *  the flood. */
 export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number): boolean {
   const { own: there, heard, complete } = docMoves(doc);
   // The bound room's moves count too: all of them, or the lock holds.
@@ -616,7 +616,11 @@ export function roomDocLockedByMove(doc: Y.Doc, roomId: string, realMs: number):
   const ofRoom = (m: StationMove) => (station
     ? moveBelongsTo(m, station)
     : (!!roomId && m.welcomeRoomId === roomId) || there.some((o) => !isPinMove(o) && !towedBy(o) && sameStation(o, m)));
-  return standing.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs));
+  // Every flight of its station counts, not only its latest: a release is
+  // judged at its own stamp, and an arrival's pin or a tow's cancel since
+  // (rejectionOf) leaves the station on the flight it was on then. A move
+  // beaten or outbid never flew (superseded).
+  return all.some((m) => ofRoom(m) && stationInTransit({ move: m }, realMs) && !superseded(m, all));
 }
 
 /** Remember the standing moves a room's own doc holds (a far room's), and
@@ -634,8 +638,8 @@ const SUMMARY_SCAN_MAX = 256;
 /** What a room's doc that is not the bound one holds: the moves booked
  *  there (roomOwn's), the moves its planet summaries gossip
  *  (planetSummary.ts: each station's latest, and the move it follows
- *  beside an outbid latest, under its welcome room, checked as that
- *  module's pull checks them), and whether the bounded
+ *  beside an outbid latest with that latest's cancel, under its welcome
+ *  room, checked as that module's pull checks them), and whether the bounded
  *  scans read every record of both. Every client standing in a room
  *  publishes there its own station's move and every move it remembers, so
  *  a move booked in another room of the station, or in a tug's, reaches
@@ -654,9 +658,14 @@ function docMoves(doc: Y.Doc): { own: StationMove[]; heard: StationMove[]; compl
     heard.push(m);
     // …and the move the station follows beside an outbid latest
     // (planetSummary's `stands`), checked as cleanStationSummary checks it:
-    // the same station's, ranking below that latest.
+    // the same station's, ranking below that latest. That latest never
+    // flies, rival known here or not: its cancel says so (rejectionOf).
     const stands = validMove((v as { stands?: unknown }).stands);
-    if (stands && stands.welcomeRoomId === k && compareMoves(stands, m) < 0) heard.push(stands);
+    if (stands && stands.welcomeRoomId === k && compareMoves(stands, m) < 0) {
+      heard.push(stands);
+      const rejected = rejectionOf(m);
+      if (rejected) heard.push(rejected);
+    }
   }
   return {
     own: [...(legacy ? [legacy] : []), ...entries, ...folded],
@@ -766,11 +775,12 @@ function outbidTows(roomId: string): StationMove[] {
   });
 }
 
-/** Cancel a tow: a move that leaves its station where it was, settling the
- *  tow and ranking just after it everywhere. */
-function writeCancelOf(tow: StationMove, realMs: number): boolean {
+/** A tow's cancel: a move that leaves its station where it was, settling
+ *  the tow and ranking just after it everywhere, in the one form a cancel
+ *  is written in (isPinOf), booked at `bookedAt`. */
+function cancelOf(tow: StationMove, bookedAt: number): StationMove {
   const departAt = tow.departAt + 1;
-  return writeStationMove({
+  return {
     stationId: tow.stationId,
     welcomeRoomId: tow.welcomeRoomId,
     fromPlanetId: tow.fromPlanetId,
@@ -780,11 +790,32 @@ function writeCancelOf(tow: StationMove, realMs: number): boolean {
     departAt,
     arriveAt: departAt + 1,
     mode: 'thrusters',
-    bookedAt: Math.floor(realMs),
+    bookedAt: Math.floor(bookedAt),
     settles: tow,
     fuel: 0,
     fuelDrawn: 0,
-  });
+  };
+}
+
+/** Cancel a tow (cancelOf), booked now. */
+function writeCancelOf(tow: StationMove, realMs: number): boolean {
+  return writeStationMove(cancelOf(tow, realMs));
+}
+
+/** 🚚 What says for good that `latest` does not stand, where a planet
+ *  summary carries the move its station follows beside it (planetSummary
+ *  `stands`: a tow another station's outbid on the same tug): that tow's
+ *  cancel, as the tug's room writes it (cancelTowLeftBehind). Every install
+ *  ranks it over the tow (beatenForStation) without the rival that outbid
+ *  it, so one that never learns the rival, or no longer can, still never
+ *  flies that tow, whatever path the tow reaches it by. Booked as it leaves,
+ *  so every install that reads the summary derives the same record. Null
+ *  for anything but a tow (or one of its pins), and for a cancel. */
+export function rejectionOf(latest: StationMove): StationMove | null {
+  const tow = flownOf(latest);
+  if (tow.mode !== 'tug' || isCancelPin(latest)) return null;
+  const cancel = cancelOf(tow, tow.departAt + 1);
+  return isStationMove(cancel) ? cancel : null;
 }
 
 /**

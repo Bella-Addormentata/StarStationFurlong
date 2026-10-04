@@ -77,6 +77,7 @@ import { currentRoomId, dockedStationFor, listStations as listStationRecordsNow,
 import { currentStation, listStations as listStationRecords, type StationRecord } from './stations';
 // 🛬 #30 SH3: DEPART casts off (remembering the berth); arrival re-docks.
 import {
+  berthPairings,
   berthsToCastOff,
   castOffPlaces,
   castOffRefusal,
@@ -2104,10 +2105,12 @@ function enumerateTransientBerths(): string[] {
 }
 
 /** 🚚 The helm's line for a cast-off shipArrival.berthsToCastOff refuses. */
-function berthHoldText(why: 'moving' | 'unread', lead: string): string {
-  return why === 'moving'
-    ? `${lead}: a station moving between planets holds this ship until it arrives.`
-    : `${lead}: this room holds more door or move records than the helm can read, so a berth here could be held, or stay attached.`;
+function berthHoldText(why: 'moving' | 'unread' | 'changed', lead: string): string {
+  switch (why) {
+    case 'moving': return `${lead}: a station moving between planets holds this ship until it arrives.`;
+    case 'unread': return `${lead}: this room holds more door or move records than the helm can read, so a berth here could be held, or stay attached.`;
+    case 'changed': return `${lead}: a berth here changed while the ship cast off. Try again.`;
+  }
 }
 
 /** Derived flight capability — plan §1.4: at least one fuel tank, engine, and
@@ -2159,11 +2162,11 @@ export interface HelmDockingDeps {
   /** The shipped DOCK; its answer (false: refused) settles the arrival note. */
   dock: (doorId: string) => void | boolean | Promise<boolean | void>;
   /** 🚚 May the legacy berth on this door (a transient pairing on a door
-   *  that is no dock port) let go, by the moves its far room knows too
-   *  (docking.ts farReleaseAllowed)? DEPART asks before it lets go of
-   *  anything. Optional: without it, only the moves this install knows
-   *  hold one. */
-  releaseAllowed?: (doorId: string) => Promise<boolean>;
+   *  that is no dock port) let go in a release made at `now`, by the moves
+   *  its far room knows too (docking.ts farReleaseAllowed)? DEPART asks
+   *  before it lets go of anything. Optional: without it, only the moves
+   *  this install knows hold one. */
+  releaseAllowed?: (doorId: string, now: number) => Promise<boolean>;
 }
 
 /** Port marker colours on the ship atlas (and the status words beside them). */
@@ -2690,21 +2693,29 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             });
             return;
           }
-          // A legacy berth is no dock port, so no UNDOCK asks its far room
-          // whether a station move holds it: DEPART asks, before anything
-          // lets go (docking.ts farReleaseAllowed). Best effort, as an
-          // UNDOCK's far write: one that cannot ask does not hold it.
-          const portIds = new Set(shipDocking?.ports().map((p) => p.doorId) ?? []);
-          const berthsThen = berthsToCastOff(currentRoomId());
+          // A legacy berth is no dock (no dock chain, or on a door that is no
+          // dock port), so no UNDOCK asks its far room whether a station
+          // move holds it: DEPART asks, before anything lets go (docking.ts
+          // farReleaseAllowed). Best effort, as an UNDOCK's far write: one
+          // that cannot ask does not hold it. One moment for every such
+          // release: the far rooms judge it at the stamp each then takes,
+          // the last check below judges it again here, and the tombstones
+          // take those stamps (shipArrival detachBerth), so a move booked
+          // there after the answers leaves after the releases, however long
+          // the docks take to let go.
+          const releaseAt = Date.now();
+          const docks = new Set(shipDocking?.ports().filter((p) => p.state.kind === 'docked').map((p) => p.doorId) ?? []);
+          const berthsThen = berthsToCastOff(currentRoomId(), releaseAt);
           if (!berthsThen.ok) {
             setArrivalNote({ tone: 'warn', text: berthHoldText(berthsThen.why, 'Cannot depart') });
             return;
           }
-          const legacy = berthsThen.berths.filter((id) => !portIds.has(id));
+          const legacy = berthsThen.berths.filter((id) => !docks.has(id));
+          const asked = berthPairings(legacy);
           const allowed = releaseAllowed
             ? await Promise.all(legacy.map(async (id) => {
               try {
-                return await releaseAllowed(id);
+                return await releaseAllowed(id, releaseAt);
               } catch {
                 return true;
               }
@@ -2729,10 +2740,10 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
             });
             return;
           }
-          // A move heard of meanwhile holds whatever it holds: judged at the
-          // stamp step 3's releases take.
-          const castAt = Date.now();
-          const berths = berthsToCastOff(currentRoomId(), castAt);
+          // A move heard of meanwhile holds whatever it holds, judged at the
+          // releases' moment; and only the berths the far rooms were asked
+          // about go, each still the pairing it was.
+          const berths = berthsToCastOff(currentRoomId(), releaseAt, asked);
           if (!berths.ok) {
             setArrivalNote({ tone: 'warn', text: berthHoldText(berths.why, 'Did not depart') });
             return;
@@ -2749,7 +2760,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
           // 3) Release every other transient guest berth (#67 D2, either-side
           //    legal; a legacy berth is no dock port), then publish the
           //    flight record.
-          if (go) for (const doorId of berths.berths) detachBerth(doorId, castAt);
+          if (go) for (const doorId of berths.berths) detachBerth(doorId, releaseAt);
           if (!go || !writeFlightRecord(departureFlight(fromId, dest.id, go.hop))) {
             setArrivalNote({
               tone: 'warn',

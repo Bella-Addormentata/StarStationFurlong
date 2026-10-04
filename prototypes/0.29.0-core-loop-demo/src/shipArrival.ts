@@ -35,6 +35,7 @@ import {
   readFlightRecord,
   readRestPlace,
   readStationBerth,
+  undockHeld,
   writeFlightRecord,
   writeRestPlace,
   writeStationBerth,
@@ -325,11 +326,14 @@ export function berthHeldByMove(roomId: string, doorId: string, now: number = Da
  *  the room's doors (readAllDoorsIfComplete), where a berth left out could
  *  be held, and a legacy one, no dock port, would stay attached through the
  *  flight; or, with a berth to let go of, its moves (roomMovesKnown), where
- *  the one holding it may lie. */
+ *  the one holding it may lie. With `asked` (berthPairings: what DEPART
+ *  asked the far rooms about, at `now`), only those berths, each still the
+ *  pairing it was: any other was never judged at that moment ('changed'). */
 export function berthsToCastOff(
   roomId: string,
   now: number = Date.now(),
-): { ok: true; berths: string[] } | { ok: false; why: 'moving' | 'unread' } {
+  asked?: ReadonlyMap<string, DoorRecord | undefined>,
+): { ok: true; berths: string[] } | { ok: false; why: 'moving' | 'unread' | 'changed' } {
   const doors = readAllDoorsIfComplete();
   if (!doors) return { ok: false, why: 'unread' };
   const berths: string[] = [];
@@ -337,7 +341,55 @@ export function berthsToCastOff(
     if (door.paired === true && (door.transient === true || isDockChain(door.segments))) berths.push(doorId);
   }
   if (berths.length > 0 && !roomMovesKnown()) return { ok: false, why: 'unread' };
-  return berths.some((doorId) => berthHeldByMove(roomId, doorId, now)) ? { ok: false, why: 'moving' } : { ok: true, berths };
+  if (berths.some((doorId) => berthHeldByMove(roomId, doorId, now))) return { ok: false, why: 'moving' };
+  if (asked && berths.some((doorId) => !samePairing(asked.get(doorId), doors.get(doorId)))) return { ok: false, why: 'changed' };
+  return { ok: true, berths };
+}
+
+/** The pairings on these doors as they are now: what a release asks the
+ *  far rooms about (berthsToCastOff's `asked`). */
+export function berthPairings(doorIds: readonly string[]): Map<string, DoorRecord | undefined> {
+  return new Map(doorIds.map((doorId) => [doorId, readDoor(doorId)]));
+}
+
+/** The same pairing, the one a release asked about: to the same room, made
+ *  at the same moment. */
+function samePairing(asked: DoorRecord | undefined, now: DoorRecord | undefined): boolean {
+  return asked?.paired === true && now?.paired === true
+    && asked.connectedRoomAddress === now.connectedRoomAddress && asked.dockedAt === now.dockedAt;
+}
+
+/**
+ * ⏏ #67 D2: DETACH the legacy berth on `doorId` of `roomId` (a transient
+ * pairing on a door that is no dock port: no UNDOCK asks its far room), as
+ * one release made at `now`: its far room judges it at the stamp it takes
+ * then (`ask`: FarDockRequest `release`, docking.ts farReleaseAllowed), this
+ * end judges it again at that moment once the answer is in, by every move
+ * it knows by then (the far room's among them: farDoorWrite), and the
+ * tombstone takes that stamp (detachBerth). A move booked there after the
+ * answer then leaves after the release, however long the answer took: the
+ * ship stays where the station was. Only the pairing asked about, while
+ * `roomNow()` is still the room it was asked from. 'held': a move holds
+ * it; 'changed': the pairing, or the room, changed meanwhile.
+ */
+export async function detachLegacyBerthAt(
+  roomId: string,
+  doorId: string,
+  ask: (now: number) => Promise<boolean>,
+  roomNow: () => string = currentRoomId,
+  now: number = Date.now(),
+): Promise<'released' | 'held' | 'changed'> {
+  const asked = berthPairings([doorId]);
+  if (asked.get(doorId)?.paired !== true) return 'changed';
+  let allowed = true;
+  try {
+    allowed = await ask(now);
+  } catch {
+    // Best effort, as an UNDOCK's far write: one that cannot ask does not hold it.
+  }
+  const same = roomNow() === roomId && samePairing(asked.get(doorId), readDoor(doorId));
+  if (!allowed || (same && berthHeldByMove(roomId, doorId, now))) return 'held';
+  return same && detachBerth(doorId, now) ? 'released' : 'changed';
 }
 
 /**
@@ -506,16 +558,19 @@ export function keepRestPlace(roomId: string = currentRoomId(), now: number = Da
  * (each UNDOCK's own stamp, however late this tab learns of it), the moment
  * the LAST of those docks let go, at or after `since` (the tow's booking): a
  * station held through two ports stays in tow until both have let go; else
- * false (not docked, time unknown).
+ * false (not docked, time unknown). A release whose UNDOCK still waits on
+ * its far room at `now` (shipDoc.UndockHold) is no release yet: a far
+ * refusal puts that dock back.
  */
 export function dockedToStation(
   welcomeRoomId: string,
   since = -Infinity,
   doors: ReadonlyMap<string, DoorRecord> | null = readAllDoorsIfComplete(),
+  now: number = Date.now(),
 ): boolean | number {
   if (!doors) return true;
   let released: number | null = null;
-  for (const [, rec] of doors) {
+  for (const [doorId, rec] of doors) {
     const address = rec.paired === true ? rec.connectedRoomAddress : rec.retiredAddress;
     if (!address) continue;
     if (rec.paired === true && rec.transient !== true && !isDockChain(rec.segments)) continue;
@@ -529,6 +584,7 @@ export function dockedToStation(
     if (!partner || stationForRoom(partner)?.welcomeRoomId !== welcomeRoomId) continue;
     if (rec.paired === true) return true;
     const at = rec.dock!.undockedAt;
+    if (undockHeld(doorId, at, now)) return true;
     if (at >= since && (released === null || at > released)) released = at;
   }
   return released ?? false;

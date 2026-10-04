@@ -51,6 +51,7 @@ import {
   readMoveFuelDrawn,
   readRememberedMoves,
   readStationMove,
+  rejectionOf,
   rememberedMoveFor,
   FOLD_ITEMS_MAX,
   MOVE_ENTRIES_KEEP,
@@ -965,14 +966,71 @@ describe('moves between installs', () => {
     const doc = farDoc(first);
     expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
     expect(roomDocLockedByMove(doc, 'yard-annex', first.arriveAt)).toBe(false);
+    // What it remembers is the tow's cancel, which places the station where
+    // that move left it for good (rejectionOf), never the tow.
     rememberMovesIn(doc);
-    expect(readRememberedMoves()).toContainEqual(first);
+    expect(readRememberedMoves()).toContainEqual(rejectionOf(tow));
+    expect(readRememberedMoves()).not.toContainEqual(tow);
+    expect(rememberedMoveFor(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!))
+      .toMatchObject({ toPlanetId: first.toPlanetId, toSlot: first.toSlot });
     store.delete('ssf-station-moves');
     // Another station's move, or one ranking above the latest, is not what
     // a summary's station follows.
     expect(roomDocLockedByMove(farDoc({ ...first, welcomeRoomId: 'third-lobby' }), 'third-lobby', mid)).toBe(false);
     const late = { ...first, bookedAt: tow.departAt + 10, departAt: tow.departAt + 10, arriveAt: tow.departAt + 10 + first.arriveAt - first.departAt };
     expect(roomDocLockedByMove(farDoc(late), 'yard-annex', Math.floor((late.departAt + late.arriveAt) / 2))).toBe(false);
+  });
+
+  it('never flies a tow a far room\'s summary says was outbid, rival gossiped or not, and judges each flight at its own stamp', () => {
+    const first = yardMove();
+    rememberMove(first);
+    const summary = summaryForStation(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!, null, NOW);
+    const booked = first.arriveAt + 1000;
+    const tow: StationMove = {
+      ...first, fromPlanetId: first.toPlanetId, fromSlot: first.toSlot, toPlanetId: SOV, toSlot: 2, mode: 'tug', tugRoomId: 'tug-room',
+      bookedAt: booked, departAt: booked, arriveAt: booked + 40_000_000,
+    };
+    store.clear();
+    store.set('ssf-station-atlas', JSON.stringify({
+      'yard-lobby': { roomId: 'yard-lobby', name: 'LOBBY', doors: { 'x+': { targetSeed: 'ssf://room#room=yard-annex', targetRoomId: 'yard-annex' } }, lastSeen: 0 },
+      'yard-annex': { roomId: 'yard-annex', name: 'ANNEX', doors: {}, lastSeen: 0 },
+    }));
+    expect(registerStation(yard('mine-1'))).toBe(true);
+    const farDoc = (s: Record<string, unknown>) => {
+      const doc = new Y.Doc();
+      doc.getMap('stationSummaries').set('yard-lobby', s);
+      return doc;
+    };
+    // The station's summary alone: the rival tow that outbid its latest is
+    // gossiped there no more (that station has moved on since).
+    const midTow = Math.floor((tow.departAt + tow.arriveAt) / 2);
+    const mid = Math.floor((first.departAt + first.arriveAt) / 2);
+    const doc = farDoc({ ...summary, move: tow, stands: first });
+    // The tow never flies, so a release made mid-tow is no release from a
+    // station between planets…
+    expect(roomDocLockedByMove(doc, 'yard-annex', midTow)).toBe(false);
+    // …while one made during the flight the station did make is.
+    expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
+    // Nothing beside it, the same tow would hold the station mid-tow.
+    expect(roomDocLockedByMove(farDoc({ ...summary, move: tow }), 'yard-annex', midTow)).toBe(true);
+    // What it carries on is the tow's cancel, kept for good: the tow, heard
+    // of again on its own, never flies here.
+    rememberMovesIn(doc);
+    expect(readRememberedMoves()).toContainEqual(rejectionOf(tow));
+    rememberMove(tow);
+    expect(roomDocLockedByMove(farDoc({ ...summary, move: tow }), 'yard-annex', midTow)).toBe(false);
+    // An arrival's pin since leaves a station on the flight it was on: a
+    // release made then is judged by that flight, not by the pin.
+    store.delete('ssf-station-moves');
+    rememberMove(first);
+    const pin: StationMove = {
+      ...first, fromPlanetId: first.toPlanetId, fromSlot: first.toSlot, departAt: first.arriveAt, arriveAt: first.arriveAt + 1,
+      fuel: 0, fuelDrawn: 0, bookedAt: first.arriveAt + 5, settles: first,
+    };
+    expect(isStationMove(pin)).toBe(true);
+    const pinned = farDoc({ ...summary, move: pin });
+    expect(roomDocLockedByMove(pinned, 'yard-annex', mid)).toBe(true);
+    expect(roomDocLockedByMove(pinned, 'yard-annex', first.arriveAt + 10)).toBe(false);
   });
 
   it('carries a derived station\'s move although its first record stands', () => {

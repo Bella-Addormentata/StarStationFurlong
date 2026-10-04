@@ -24,15 +24,19 @@ import {
   CAST_OFF_RENEW_MS,
   DESTINATIONS,
   TANK_CAPACITY,
+  UNDOCK_HOLD_MS,
+  UNDOCK_RENEW_MS,
   bindShipDoc,
   canDepart,
   castOffHeldBy,
   clampFuelToCapacity,
   defaultFlight,
+  endUndockHold,
   findDestination,
   flightArrived,
   flightProgress,
   holdCastOff,
+  holdUndock,
   isFlightRecord,
   isLegalFlightTransition,
   pairingAllowedByFlight,
@@ -42,8 +46,10 @@ import {
   readRestPlace,
   releaseCastOff,
   renewCastOff,
+  renewUndockHold,
   shipDocBound,
   subscribeShip,
+  undockHeld,
   writeFlightRecord,
   writeFuelLevel,
   writeRestPlace,
@@ -941,5 +947,56 @@ describe('a DEPART under way — the shared cast-off hold', () => {
     releaseCastOff('a');
     expect(renewCastOff('a', t + CAST_OFF_HOLD_MS + 1)).toBe(false);
     expect(readCastOffHold(t + CAST_OFF_HOLD_MS + 1)).toBeNull();
+  });
+});
+
+describe('an UNDOCK under way — the shared hold on its release', () => {
+  const NOW = 1_000_000;
+
+  it('holds the release it names until that UNDOCK has its answer, or runs out', () => {
+    const doc = freshDoc();
+    expect(undockHeld('east', NOW, NOW)).toBe(false);
+    expect(holdUndock('east', NOW, NOW)).toBe(true);
+    expect(undockHeld('east', NOW, NOW + 1)).toBe(true);
+    // Only that release, on that door.
+    expect(undockHeld('east', NOW - 1, NOW + 1)).toBe(false);
+    expect(undockHeld('west', NOW, NOW + 1)).toBe(false);
+    // Another release's end leaves it alone; its own ends it.
+    endUndockHold('east', NOW - 1);
+    expect(undockHeld('east', NOW, NOW + 1)).toBe(true);
+    endUndockHold('east', NOW);
+    expect(undockHeld('east', NOW, NOW + 1)).toBe(false);
+    // Not renewed, it runs out UNDOCK_HOLD_MS after it was taken.
+    expect(holdUndock('east', NOW, NOW)).toBe(true);
+    expect(undockHeld('east', NOW, NOW + UNDOCK_HOLD_MS - 1)).toBe(true);
+    expect(undockHeld('east', NOW, NOW + UNDOCK_HOLD_MS)).toBe(false);
+    // Stamped further ahead than a hold lasts, or junk: none.
+    doc.getMap('ship').set('undock:east', { undockedAt: NOW, at: NOW + 2 * UNDOCK_HOLD_MS });
+    expect(undockHeld('east', NOW, NOW)).toBe(false);
+    for (const junk of [null, 'a', { undockedAt: NOW }, { undockedAt: 'x', at: NOW }, { undockedAt: NOW, at: Number.NaN }]) {
+      doc.getMap('ship').set('undock:east', junk as any);
+      expect(undockHeld('east', NOW, NOW)).toBe(false);
+    }
+  });
+
+  it('stays in force while its UNDOCK renews it, and only a hold still in force', () => {
+    freshDoc();
+    expect(UNDOCK_RENEW_MS).toBeLessThan(UNDOCK_HOLD_MS);
+    expect(holdUndock('east', NOW, NOW)).toBe(true);
+    let t = NOW;
+    for (let i = 0; i < 6; i++) {
+      t += UNDOCK_RENEW_MS;
+      expect(renewUndockHold('east', NOW, t)).toBe(true);
+    }
+    expect(t).toBeGreaterThan(NOW + UNDOCK_HOLD_MS);
+    expect(undockHeld('east', NOW, t + UNDOCK_HOLD_MS - 1)).toBe(true);
+    // Another release's renewal takes nothing; one that ran out stays out.
+    expect(renewUndockHold('east', NOW + 1, t)).toBe(false);
+    expect(renewUndockHold('east', NOW, t + UNDOCK_HOLD_MS)).toBe(false);
+    expect(undockHeld('east', NOW, t + UNDOCK_HOLD_MS)).toBe(false);
+    // Nor does another room's doc take one up.
+    freshDoc();
+    expect(renewUndockHold('east', NOW, t)).toBe(false);
+    expect(undockHeld('east', NOW, t)).toBe(false);
   });
 });

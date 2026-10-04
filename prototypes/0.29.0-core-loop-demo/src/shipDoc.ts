@@ -1118,3 +1118,85 @@ export function releaseCastOff(by: string): void {
     shipMap!.delete('castOff');
   });
 }
+
+// ── An UNDOCK under way (station moves) ──────────────────────────────────────
+
+/**
+ * 🚚 An UNDOCK under way: it wrote this end's tombstone (docking.ts
+ * undockPort) and waits for the far room's answer, which puts the dock back
+ * when a station move the far room knows of holds it. Shared, so every
+ * helm reads that dock as still holding a tow meanwhile
+ * (shipArrival.dockedToStation): a tow cancelled for a release a refusal
+ * then takes back would stay cancelled. Keyed by the door, it names the
+ * release by its tombstone's stamp (`undockedAt`); `at` is when it was taken
+ * or last renewed (writer clock). It lasts until that UNDOCK has its answer
+ * (endUndockHold), or UNDOCK_HOLD_MS past its last renewal, should its helm
+ * go away mid-way: then the release stands, as one whose far room cannot be
+ * reached does.
+ */
+export interface UndockHold {
+  undockedAt: number;
+  at: number;
+}
+
+/** How long an UNDOCK's hold lasts past its last renewal: a far room's whole
+ *  session (farDoorWrite's deadline, a minute), with room to spare. */
+export const UNDOCK_HOLD_MS = 90_000;
+
+/** How often an UNDOCK renews its hold while it waits (renewUndockHold): the
+ *  far writer answers one request at a time, each under its own deadline. */
+export const UNDOCK_RENEW_MS = UNDOCK_HOLD_MS / 3;
+
+function undockKey(doorId: string): string {
+  return `undock:${doorId}`;
+}
+
+function isUndockHold(v: unknown): v is UndockHold {
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return false;
+  const h = v as Partial<UndockHold>;
+  return typeof h.undockedAt === 'number' && Number.isFinite(h.undockedAt)
+    && typeof h.at === 'number' && Number.isFinite(h.at);
+}
+
+/** Does the UNDOCK that released `doorId` at `undockedAt` still wait on its
+ *  far room at `now`? One stamped further ahead than UNDOCK_HOLD_MS holds
+ *  nothing: no peer's clock holds a release longer. */
+export function undockHeld(doorId: string, undockedAt: number, now: number = Date.now()): boolean {
+  if (!docAlive() || !isBoundedString(doorId)) return false;
+  const raw = shipMap!.get(undockKey(doorId));
+  return isUndockHold(raw) && raw.undockedAt === undockedAt
+    && now < raw.at + UNDOCK_HOLD_MS && raw.at <= now + UNDOCK_HOLD_MS;
+}
+
+/** Take the hold for the UNDOCK that releases `doorId` at `undockedAt`, before
+ *  its tombstone (so no peer sees the one without the other). Returns
+ *  whether the doc now holds it. */
+export function holdUndock(doorId: string, undockedAt: number, now: number = Date.now()): boolean {
+  if (!docAlive() || !isBoundedString(doorId)) return false;
+  const hold: UndockHold = { undockedAt, at: Math.floor(now) };
+  if (!isUndockHold(hold)) return false;
+  boundDoc!.transact(() => {
+    shipMap!.set(undockKey(doorId), hold);
+  });
+  return true;
+}
+
+/** Keep that hold in force while its UNDOCK still waits: only one still in
+ *  force (one that ran out let the release stand), and never in another
+ *  room's doc, which holds no hold of that release. Returns whether it
+ *  renewed. */
+export function renewUndockHold(doorId: string, undockedAt: number, now: number = Date.now()): boolean {
+  return undockHeld(doorId, undockedAt, now) && holdUndock(doorId, undockedAt, now);
+}
+
+/** End that hold once its UNDOCK has its answer (the dock put back, or the
+ *  release stands): only its own, so a later UNDOCK's on the same door is
+ *  left alone. */
+export function endUndockHold(doorId: string, undockedAt: number): void {
+  if (!docAlive() || !isBoundedString(doorId)) return;
+  const raw = shipMap!.get(undockKey(doorId));
+  if (!isUndockHold(raw) || raw.undockedAt !== undockedAt) return;
+  boundDoc!.transact(() => {
+    shipMap!.delete(undockKey(doorId));
+  });
+}

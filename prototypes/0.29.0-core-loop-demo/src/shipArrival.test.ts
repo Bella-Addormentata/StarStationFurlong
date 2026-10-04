@@ -5,10 +5,13 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { listStations, planetById, setStationMoveResolver, setStationRoomSource } from './stations';
-import { MOVE_SCAN_MAX, bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, writeStationMove, type StationMove } from './stationMove';
+import {
+  MOVE_SCAN_MAX, bindStationMoveDoc, cancelTowLeftBehind, installStationMoveResolver, readStationMove, writeStationMove, type StationMove,
+} from './stationMove';
 import * as Y from 'yjs';
 import { dockChain } from './adapter';
-import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter } from './dockRules';
+import { berthMemoryFrom, classifyDockPort, redockRecord, stampAfter, type NearEnd } from './dockRules';
+import { applyFarDockRequest } from './farDoorWrite';
 import {
   bindDoorsDoc,
   buildDoorPairing,
@@ -19,9 +22,11 @@ import {
 } from './doorsDoc';
 import {
   berthHeldByMove,
+  berthPairings,
   berthsToCastOff,
   berthToRemember,
   detachBerth,
+  detachLegacyBerthAt,
   ARRIVAL_GRACE_MS,
   castOffForDeparture,
   resolveRememberedBerth,
@@ -44,8 +49,11 @@ import {
 } from './shipArrival';
 import {
   bindShipDoc,
+  endUndockHold,
+  holdUndock,
   isRestPlace,
   MAX_REST_DOCKS,
+  UNDOCK_HOLD_MS,
   readFlightRecord,
   readRestPlace,
   readStationBerth,
@@ -850,6 +858,103 @@ describe('where a ship with no live dock is', () => {
     expect(cast(now + 11_000)).toBe('unread');
   });
 
+  it('casts off at DEPART only the berths its far rooms were asked about, each the pairing it was', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    const gangway = (dockedAt: number) => buildDoorPairing(seed, {
+      segments: [{ kind: 'flex', bendDeg: 0 }], farDoor: 'south', farWall: 'y+', transient: true, dockedAt,
+    });
+    writeDoorPairing('east', seed, gangway(1000));
+    const asked = berthPairings(['east']);
+    expect(berthsToCastOff('ship-room', now, asked)).toEqual({ ok: true, berths: ['east'] });
+    // Made again meanwhile: that pairing was never judged at this moment.
+    writeDoorPairing('east', seed, gangway(2000));
+    expect(berthsToCastOff('ship-room', now, asked)).toEqual({ ok: false, why: 'changed' });
+    expect(berthsToCastOff('ship-room', now)).toEqual({ ok: true, berths: ['east'] });
+    // Nor one that turned up meanwhile.
+    writeDoorPairing('east', seed, gangway(1000));
+    writeDoorPairing('west', seed, gangway(3000));
+    expect(berthsToCastOff('ship-room', now, asked)).toEqual({ ok: false, why: 'changed' });
+    // One let go meanwhile is just not there to cast off.
+    writeDoorTombstone('west', seed, { farDoor: 'south', undockedAt: 4000 });
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt: 4000 });
+    expect(berthsToCastOff('ship-room', now, asked)).toEqual({ ok: true, berths: [] });
+  });
+
+  it('lets a legacy berth go at the stamp its far room judged, so a tow booked there meanwhile leaves after it', async () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      const now = Date.now();
+      const home = listStations().find((st) => st.id === 'furlong-station')!;
+      const homeAt = adriftAt(planetById(home.planetId).id, home.orbitSlot);
+      const seed = `ssf://room#room=${home.welcomeRoomId}`;
+      const gangway = (dockedAt: number) => buildDoorPairing(seed, {
+        segments: [{ kind: 'flex', bendDeg: 0 }], farDoor: 'south', farWall: 'y+', transient: true, dockedAt,
+      });
+      const near: NearEnd = { roomId: 'ship-room', address: 'ssf://room#room=ship-room', doorId: 'east' };
+      const releaseAsk = (undockedAt: number) => ({ kind: 'release' as const, nearRoomId: 'ship-room', farAddress: seed, nearDoorId: 'east', undockedAt });
+      // Furlong's own room, where a tug books a tow, leaving at once, while
+      // the far room's answer is on its way back: this install never hears.
+      const farDoc = new Y.Doc();
+      const tow: StationMove = {
+        stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+        toPlanetId: 'planet-aris', toSlot: 0, departAt: now + 2000, arriveAt: now + 600_000,
+        mode: 'tug', tugRoomId: 'tug-room', bookedAt: now + 2000, fuel: 1, fuelDrawn: 0,
+      };
+      writeDoorPairing('east', seed, gangway(now - 60_000));
+      let judged = Number.NaN;
+      const ask = async (at: number) => {
+        judged = stampAfter(now - 60_000, at);
+        const { result } = applyFarDockRequest(farDoc, releaseAsk(judged), near, home.welcomeRoomId);
+        farDoc.getMap('stationMoves').set(`move:1:${tow.departAt}:${home.welcomeRoomId}`, tow);
+        vi.setSystemTime(now + 5000);
+        return result.ok || result.reason !== 'moving';
+      };
+      expect(await detachLegacyBerthAt('ship-room', 'east', ask, () => 'ship-room')).toBe('released');
+      // The tombstone takes the stamp the far room judged, before the tow
+      // left: the ship stays where Furlong was then.
+      expect(judged).toBe(now);
+      expect(readDoor('east')).toMatchObject({ paired: false, dock: { undockedAt: now, at: homeAt } });
+      // Judged as the answer came back, the far room would have held it.
+      expect(applyFarDockRequest(farDoc, releaseAsk(Date.now()), near, home.welcomeRoomId).result).toEqual({ ok: false, reason: 'moving' });
+      // A pairing made again while the far room answered is left as it is…
+      writeDoorPairing('east', seed, gangway(Date.now() - 1000));
+      const remade = gangway(Date.now());
+      expect(await detachLegacyBerthAt('ship-room', 'east', async () => {
+        writeDoorPairing('east', seed, remade);
+        return true;
+      }, () => 'ship-room')).toBe('changed');
+      expect(readDoor('east')).toMatchObject({ paired: true, dockedAt: remade.dockedAt });
+      // …and so is one in a room the player has left.
+      expect(await detachLegacyBerthAt('ship-room', 'east', async () => true, () => 'elsewhere')).toBe('changed');
+      expect(readDoor('east')).toMatchObject({ paired: true, dockedAt: remade.dockedAt });
+      // A move this install knows holds the berth at that moment: held,
+      // whatever the far room said.
+      const moving = Date.now();
+      expect(writeStationMove({
+        stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+        toPlanetId: 'planet-aris', toSlot: 0, departAt: moving - 1000, arriveAt: moving + 600_000,
+        mode: 'thrusters', bookedAt: moving - 2000, fuel: 1, fuelDrawn: 0,
+      })).toBe(true);
+      expect(await detachLegacyBerthAt('ship-room', 'east', async () => true, () => 'ship-room')).toBe('held');
+      expect(await detachLegacyBerthAt('ship-room', 'east', async () => false, () => 'ship-room')).toBe('held');
+      expect(readDoor('east')).toMatchObject({ paired: true, dockedAt: remade.dockedAt });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('names every dock holding the ship, so one that lets go after a move still counts', () => {
     const doc = new Y.Doc();
     bindShipDoc(doc);
@@ -1097,6 +1202,68 @@ describe("a tug's hold on the station it tows", () => {
     expect(dockedToStation(home.welcomeRoomId, tow.departAt + 10_000)).toBe(false);
     expect(dockedToStation('another-station-room', tow.bookedAt)).toBe(false);
     expect(dockedToStation(home.welcomeRoomId, tow.bookedAt, null)).toBe(true);
+  });
+
+  it('holds while an UNDOCK still waits on its far room, so a refusal that puts the dock back leaves the tow standing', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    bindStationMoveDoc(doc);
+    installStationMoveResolver();
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    const dock = buildDoorPairing(seed, { segments: dockChain(), farDoor: 'south', farWall: 'y+', transient: true, dockedAt: now - 60_000 });
+    // A tow under way, which this tab heard of only after an UNDOCK began.
+    const tow: StationMove = {
+      stationId: 'furlong-station', welcomeRoomId: home.welcomeRoomId, fromPlanetId: home.planetId, fromSlot: home.orbitSlot,
+      toPlanetId: 'planet-aris', toSlot: 0, departAt: now - 10_000, arriveAt: now + 600_000,
+      mode: 'tug', tugRoomId: 'tug-room', bookedAt: now - 20_000, fuel: 1, fuelDrawn: 0,
+    };
+    expect(writeStationMove(tow)).toBe(true);
+    const docked = { status: 'docked' };
+    writeDoorPairing('east', seed, dock);
+    // The UNDOCK writes its tombstone under a hold, and asks the far room.
+    const undockedAt = now - 5000;
+    expect(holdUndock('east', undockedAt, now - 5000)).toBe(true);
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt });
+    // A reconciliation tick before the answer: the dock still holds the tow.
+    expect(dockedToStation(home.welcomeRoomId, tow.bookedAt)).toBe(true);
+    expect(cancelTowLeftBehind('tug-room', docked, now, dockedToStation)).toBe(false);
+    // The far room refuses (its station is between planets): the dock is put
+    // back, then the hold ends, and the tow stands.
+    writeDoorPairing('east', seed, dock);
+    endUndockHold('east', undockedAt);
+    expect(cancelTowLeftBehind('tug-room', docked, now + 1000, dockedToStation)).toBe(false);
+    expect(readStationMove()).toEqual(tow);
+    // A hold covers its own release only: another one's tombstone on that
+    // door is a release already.
+    expect(holdUndock('east', now + 2000, now + 2000)).toBe(true);
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt: now + 1500 });
+    expect(dockedToStation(home.welcomeRoomId, tow.bookedAt, undefined, now + 2500)).toBe(now + 1500);
+    // A release the far room let through stands once answered: the tug left
+    // the station behind.
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt: now + 2000 });
+    expect(dockedToStation(home.welcomeRoomId, tow.bookedAt, undefined, now + 2500)).toBe(true);
+    expect(cancelTowLeftBehind('tug-room', docked, now + 2500, dockedToStation)).toBe(false);
+    endUndockHold('east', now + 2000);
+    expect(dockedToStation(home.welcomeRoomId, tow.bookedAt, undefined, now + 3000)).toBe(now + 2000);
+    expect(cancelTowLeftBehind('tug-room', docked, now + 3000, dockedToStation)).toBe(true);
+  });
+
+  it('lets a release stand once the UNDOCK that held it has gone quiet past its hold', () => {
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindDoorsDoc(doc);
+    const now = Date.now();
+    const home = listStations().find((st) => st.id === 'furlong-station')!;
+    const seed = `ssf://room#room=${home.welcomeRoomId}`;
+    expect(holdUndock('east', now, now)).toBe(true);
+    writeDoorTombstone('east', seed, { farDoor: 'south', undockedAt: now });
+    expect(dockedToStation(home.welcomeRoomId, now - 1, undefined, now + UNDOCK_HOLD_MS - 1)).toBe(true);
+    // Its helm went away mid-way: the release stands, as one whose far room
+    // cannot be reached does.
+    expect(dockedToStation(home.welcomeRoomId, now - 1, undefined, now + UNDOCK_HOLD_MS)).toBe(now);
   });
 });
 

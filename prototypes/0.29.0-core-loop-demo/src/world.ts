@@ -5602,7 +5602,7 @@ export class World {
                 subscribe: (cb) => ds.onDockChange(cb),
                 undock: (doorId) => ds.undockPort(doorId),
                 dock: (doorId) => ds.redockPort(doorId),
-                releaseAllowed: (doorId) => ds.farReleaseAllowed(doorId),
+                releaseAllowed: (doorId, now) => ds.farReleaseAllowed(doorId, now),
               }
             : undefined,
         );

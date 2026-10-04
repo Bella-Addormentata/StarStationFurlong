@@ -39,7 +39,7 @@ import {
   setStationMoveResolver,
 } from './stations';
 import type { StationMove, StationRecord } from './stations';
-import { freeSlotAround, installStationMoveResolver, rememberMove, rememberedMoveFor } from './stationMove';
+import { freeSlotAround, installStationMoveResolver, rejectionOf, rememberMove, rememberedMoveFor } from './stationMove';
 import { directoryFromStationRecords, localStationId, setStationDirectory } from './stationDirectory';
 import { bindShipDoc, readFlightRecord, writeFlightRecord } from './shipDoc';
 
@@ -801,6 +801,53 @@ describe('sharing through the room doc', () => {
       docC.getMap('stationSummaries').set('room-yard', docA.getMap('stationSummaries').get('room-yard'));
       bindPlanetSummaryDoc(docC, install(null));
       expect(habAt()).toBeNull();
+    } finally {
+      setStationMoveResolver(null);
+    }
+  });
+
+  it('keeps the tow another outbid cancelled on a fresh install, once the rival is no longer gossiped', () => {
+    const now = Date.now();
+    const { moved, pin, tow, rival } = outbidTow(now);
+    // The yard has moved on since its tow (a move booked once that one had
+    // arrived): its summary carries that move, and the rival no more.
+    const yardNext: StationMove = {
+      stationId: 'yard', welcomeRoomId: 'room-yard', fromPlanetId: ARIS, fromSlot: 6, toPlanetId: SOV, toSlot: 7,
+      departAt: rival.arriveAt + 2000, arriveAt: rival.arriveAt + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+      bookedAt: rival.arriveAt + 1000,
+    };
+    const docA = new Y.Doc();
+    docA.getMap('stationSummaries').set('room-hab', summary({ updatedAt: now }));
+    docA.getMap('stationSummaries').set('room-yard', summary({ welcomeRoomId: 'room-yard', name: 'YARD', orbitSlot: 4, updatedAt: now }));
+    bindPlanetSummaryDoc(docA, install(null));
+    for (const m of [moved, pin, tow, rival, yardNext]) expect(rememberMove(m, now)).toBe(true);
+    publishPlanetSummary(now + 10);
+    const hab = docA.getMap('stationSummaries').get('room-hab') as StationSummary;
+    expect(hab.move).toEqual(tow);
+    expect(hab.stands).toEqual(pin);
+    expect((docA.getMap('stationSummaries').get('room-yard') as StationSummary).move).toEqual(yardNext);
+    // A fresh install learns both summaries, and so never the rival.
+    unbindPlanetSummaryForTest();
+    store = new Map();
+    registerStation(record({ id: 'c-home', name: 'C HOME', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'room-c' }));
+    const docC = new Y.Doc();
+    sync(docA, docC);
+    installStationMoveResolver();
+    const habAt = () => rememberedMoveFor({ id: `${LEARNED_PREFIX}room-hab`, welcomeRoomId: 'room-hab' });
+    const listed = (at: number) => listStations(undefined, undefined, at).find((st) => st.welcomeRoomId === 'room-hab');
+    try {
+      bindPlanetSummaryDoc(docC, install('c-home'));
+      // HAB RING follows the tow's cancel (rejectionOf): where the summary
+      // places it, before the tow would have left and after it would have
+      // arrived, and its slot at Sovereign is no one's.
+      expect(habAt()).toEqual(rejectionOf(tow));
+      expect(summaryPlanet(hab, tow.arriveAt + 1)).toBe(ARIS);
+      expect(listed(now)).toMatchObject({ planetId: ARIS, orbitSlot: 5 });
+      expect(listed(tow.arriveAt + 1)).toMatchObject({ planetId: ARIS, orbitSlot: 5 });
+      // Kept for good: the tow heard of again on its own never flies here.
+      unbindPlanetSummaryForTest();
+      rememberMove(tow, now);
+      expect(habAt()).toEqual(rejectionOf(tow));
     } finally {
       setStationMoveResolver(null);
     }
