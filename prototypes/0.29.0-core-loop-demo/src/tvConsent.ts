@@ -155,20 +155,23 @@ function isPrivateIPv6(ip: string): boolean {
   if (dotted) return isPrivateHost(dotted[1]!);
   // An IPv6 address that carries an IPv4 inside is judged by the IPv4:
   // IPv4-mapped (::ffff:a.b.c.d, which the URL parser writes as hex) and
-  // IPv4-compatible (::a.b.c.d), 6to4 (2002::/16, the IPv4 in bits 16–47)
-  // and Teredo (2001:0::/32, the server's IPv4 in bits 32–63 and the
-  // client's in the last 32, inverted) — the last two read as global
-  // unicast on paper, and 2002:7f00:1:: is loopback in fact.
+  // IPv4-compatible (::a.b.c.d), 6to4 (2002::/16, the IPv4 in bits 16–47),
+  // Teredo (2001:0::/32, the server's IPv4 in bits 32–63 and the client's
+  // in the last 32, inverted) and ISATAP (RFC 5214: under ANY prefix, an
+  // interface identifier of 0:5efe or 200:5efe in bits 64–95 and the IPv4
+  // in the last 32) — the last three read as global unicast on paper, and
+  // 2002:7f00:1:: is loopback in fact. Every IPv4 an address carries is
+  // judged: a 6to4 or Teredo prefix over an ISATAP identifier names two.
   const g = expandIPv6(s);
   if (!g) return false;
   const quad = (hi: number, lo: number) => `${hi >> 8}.${hi & 255}.${lo >> 8}.${lo & 255}`;
   const zeroTo = (n: number) => g.slice(0, n).every((x) => x === 0);
   if (zeroTo(5) && g[5] === 0xffff) return isPrivateHost(quad(g[6]!, g[7]!)); // mapped
   if (zeroTo(6)) return isPrivateHost(quad(g[6]!, g[7]!)); // compatible (deprecated, still parsed)
-  if (g[0] === 0x2002) return isPrivateHost(quad(g[1]!, g[2]!)); // 6to4
-  if (g[0] === 0x2001 && g[1] === 0) { // Teredo
-    return isPrivateHost(quad(g[2]!, g[3]!)) || isPrivateHost(quad(g[6]! ^ 0xffff, g[7]! ^ 0xffff));
-  }
+  if (g[0] === 0x2002 && isPrivateHost(quad(g[1]!, g[2]!))) return true; // 6to4
+  if (g[0] === 0x2001 && g[1] === 0 // Teredo
+    && (isPrivateHost(quad(g[2]!, g[3]!)) || isPrivateHost(quad(g[6]! ^ 0xffff, g[7]! ^ 0xffff)))) return true;
+  if ((g[4] === 0 || g[4] === 0x0200) && g[5] === 0x5efe) return isPrivateHost(quad(g[6]!, g[7]!)); // ISATAP
   return false;
 }
 
