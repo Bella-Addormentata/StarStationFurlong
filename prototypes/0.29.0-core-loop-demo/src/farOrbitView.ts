@@ -721,6 +721,7 @@ export function renderWithFarPass(
   const shown = sky.map((o) => o.visible);
   const background = scene.background;
   const cameraLayers = camera.layers.mask;
+  const autoClear = renderer.autoClear;
   try {
     update(renderer, camera);
     // 1. The sky alone (clears with the scene background as usual). A room
@@ -745,6 +746,6 @@ export function renderWithFarPass(
     sky.forEach((o, i) => { o.visible = shown[i]; });
     hidden.forEach((o, i) => { o.visible = hiddenShown[i]; });
     camera.layers.mask = cameraLayers;
-    renderer.autoClear = true;
+    renderer.autoClear = autoClear;
   }
 }
