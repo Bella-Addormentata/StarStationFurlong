@@ -536,9 +536,9 @@ export function summaryLegEnds(
 /** 🚚 A ruling timetable's stay on the route's copy of its stop
  *  (pilotRoute.routeStayOffList), untrimmed as the legs either side of it
  *  (routeLegEnds). The copy names the stop's station, whose trim this
- *  install keeps for the slot that station left while it is between planets:
- *  drawn by it, the ship would hop onto the trimmed orbit for the stay and
- *  back at its departure. */
+ *  install keeps for that slot, there or while the station is between
+ *  planets: drawn by it, the ship would hop onto the trimmed orbit for the
+ *  stay and back at its departure. */
 export function routeStayPlace<T extends { id: string }>(stay: T): T {
   return { ...stay, id: 'route-stop:from' };
 }

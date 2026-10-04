@@ -30,12 +30,12 @@
  * angles and the station's course between them.
  */
 
-import { toPlanetFrame } from './orbits';
+import { planTransfer, toPlanetFrame } from './orbits';
 import type { FramePoint, OrbitPoint, TransferPlan } from './orbits';
 import { transferPointAt } from './orbits';
 import { AU_KM, planetSunPointAt } from './solarOrbits';
 import { PLANETS, planetById } from './stations';
-import type { PlanetRecord, StationMove } from './stations';
+import type { PlanetRecord, StationMove, StationRecord } from './stations';
 import { moveTransitPointAt } from './stationMove';
 
 // ── Compression ──────────────────────────────────────────────────────────────
@@ -282,4 +282,53 @@ export function transitLayout(move: StationMove, nowMs: number, withPaths = true
     paths: course.length > 0 ? [{ id: 'course', points: course }] : [],
     sunDirection: { x: -1, y: 0, z: 0 },
   };
+}
+
+// ── Courses already drawn ────────────────────────────────────────────────────
+
+/** Transfers drawn so far, by flight, each with when it was last seen (the
+ *  view drops one not seen for a while). */
+export type FrozenCourses = Map<string, { plan: TransferPlan; seenAt: number }>;
+
+/** A flight's end, as planTransfer places it. */
+type CourseEnd = Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>;
+
+/**
+ * A flight's transfer rebuilt from its record: the Hohmann ellipse between
+ * the two ends' orbits, pinned to the record's own times. `flight` names it
+ * by what its record says (who flies, and the two ends as named there). Its
+ * orbits are fixed once it is seen: planTransfer reads the ends through
+ * today's trims, and a station-keeping burn after launch must not move a
+ * transfer already flown. The ends are placed only the first time, so a
+ * flight already drawn keeps its course once an end can no longer be placed
+ * at all (a learned station dropped after a move, say). 🚚 A ferry leg's
+ * `copies` (the route's copies of its two stops: planetSummary's
+ * routeLegEnds and summaryLegEnds) are its ends when known, and name its
+ * course too: one placed by the station list before they were known (a
+ * summary relayed by an older client) is not the one drawn once they are.
+ * `seenAt` stamps the course seen. Null when it cannot be placed.
+ */
+export function frozenCourse(
+  courses: FrozenCourses,
+  flight: readonly string[],
+  departedAt: number,
+  etaAt: number,
+  copies: readonly [CourseEnd, CourseEnd] | null,
+  ends: () => readonly [CourseEnd | undefined, CourseEnd | undefined],
+  seenAt: number,
+): TransferPlan | null {
+  if (!(etaAt > departedAt)) return null;
+  // JSON, not a joined string: ids come from peers and may hold any delimiter.
+  const key = JSON.stringify([...flight, departedAt, etaAt, copies]);
+  const known = courses.get(key);
+  if (known) {
+    known.seenAt = seenAt;
+    return known.plan;
+  }
+  const [from, to] = copies ?? ends();
+  if (!from || !to) return null;
+  const planned = planTransfer(from, to, departedAt - 1);
+  const plan = planned ? { ...planned, departAt: departedAt, arriveAt: etaAt } : null;
+  if (plan) courses.set(key, { plan, seenAt });
+  return plan;
 }
