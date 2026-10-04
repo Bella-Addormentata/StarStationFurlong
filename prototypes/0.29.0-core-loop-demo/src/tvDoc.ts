@@ -755,11 +755,13 @@ export function tvStop(itemId: string): TvAction {
  *  Whoever turns the set ON has the remote placed in their hand (#186) —
  *  when it is on the set or lapsed. A live holder keeps it: a body button
  *  moves nothing out of a hand, and the owner's spare is not the switch's
- *  to use (the holder turns the set on, or hands the remote over). */
+ *  to use (the holder turns the set on, or hands the remote over). The
+ *  pickup lands BEFORE the switch's write, so the page that parks the
+ *  programme as the switch is seen (tvSession) is already the holder. */
 export function tvTogglePower(itemId: string, now = clock()): boolean {
   const power = readPower(itemId);
-  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq) } satisfies PowerRecord);
   if (!power.on && remoteStatus(itemId, now) === 'free') pickUpRemote(itemId, now);
+  write(powerKey(itemId), { on: !power.on, seq: bump(power.seq) } satisfies PowerRecord);
   return !power.on;
 }
 

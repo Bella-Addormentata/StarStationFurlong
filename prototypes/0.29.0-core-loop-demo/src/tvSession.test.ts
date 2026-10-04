@@ -6,7 +6,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import {
-  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
+  bindTvDoc, handRemote, iHoldRemote, pickUpRemote, putDownRemote, readRemote, readSample, readTv, setTvClock, setTvHostPredicate,
   setTvIdentity, setTvPageId, tvHeartbeat, tvPlay, tvSchedule, tvTogglePower, TV_HEARTBEAT_MS, TV_LEASE_LAPSE_MS,
   TV_LEASE_RENEW_MS,
 } from './tvDoc';
@@ -163,6 +163,42 @@ describe('tickTvRoom', () => {
     expect(tvHeartbeat(TV, TV_HEARTBEAT_MS + 60_000)).toEqual({ ok: false, error: 'Nothing is playing.' });
     tickTvRoom([TV], now + 500);
     expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+  });
+
+  it('POWER back on with a free remote: the presser takes the remote and parks the programme where it was; a flip nobody could park waits for the first holder', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
+    tickTvRoom([TV], now);
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now); // at 3 s
+    putDownRemote(TV); // the holder leaves the remote on the set
+    expect(tvTogglePower(TV)).toBe(false);
+    run(60_000); // off for a minute, nobody holding
+    expect(readTv(TV)).toMatchObject({ state: 'off', positionMs: TV_HEARTBEAT_MS });
+    setTvIdentity(() => ({ pub: 'BBBBviewer', name: 'Viewer' }));
+    expect(tvTogglePower(TV)).toBe(true); // the viewer turns it on: the remote is theirs, and so is the park
+    expect(readRemote(TV)).toMatchObject({ holder: 'BBBBviewer' });
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+    tickTvRoom([TV], now + 500);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: TV_HEARTBEAT_MS });
+    // A flip seen before anyone holds the remote is owed until someone does.
+    now += 1_000;
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/b.mp4' }); // the viewer, holding, plays on
+    tickTvRoom([TV], now);
+    now += TV_HEARTBEAT_MS;
+    tickTvRoom([TV], now);
+    const at = readTv(TV).positionMs; // where the second film stands as the set goes off
+    putDownRemote(TV);
+    tvTogglePower(TV); // off
+    run(60_000);
+    setTvIdentity(() => ({ pub: '', name: '' })); // a page with no identity yet picks nothing up
+    expect(tvTogglePower(TV)).toBe(true);
+    expect(readRemote(TV).holder).toBe('');
+    expect(readTv(TV)).toMatchObject({ state: 'playing', positionMs: at }); // nobody to park it yet
+    setTvIdentity(() => ({ pub: 'AAAAme', name: 'Me' }));
+    pickUpRemote(TV); // the first to pick it up parks it where it stood…
+    tickTvRoom([TV], now + 1_000);
+    expect(readTv(TV)).toMatchObject({ state: 'paused', positionMs: at }); // …not where a minute's extrapolation would put it
   });
 
   it('a holder who closes the theatre still ends a finite programme where the media ends: the headless beat remembers the end', () => {
