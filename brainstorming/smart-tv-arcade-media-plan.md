@@ -537,12 +537,24 @@ framing alone would let a hub read every Opus frame and video chunk it
 relays. v006 §9's rule for forwarded voice stands: forwarders see only
 ciphertext (the WebRTC path met it with Encoded Transform; here the sender
 does the same by hand on WebCodecs output — the SFrame shape, RFC 9605).
-Each frame is sealed with an AEAD (XChaCha20-Poly1305 or AES-256-GCM) under
-a per-LEG key: a source has an audio leg and a video leg, each leg's key is
-derived from the per-source media key with the leg as the label (HKDF), and
-each leg counts its own frames, so two legs never share a nonce space under
-one key — one key with two independent encoder counters would reuse a
-nonce, which breaks the AEAD outright. A leg's counter is the SENDER's for
+Each frame is sealed with ONE suite, pinned rather than negotiated —
+AES‑256‑GCM through WebCrypto, the one AEAD every browser's `crypto.subtle`
+has and hardware-backed; a version byte in the header names the suite, v1
+is this, and a receiver that lacks a version drops the frame and reports —
+under a per-LEG key: a source has an audio leg and a video leg, and each
+leg's key and nonce salt are derived by HKDF‑SHA‑256 from the 32-byte
+per-source media key with the key epoch (4 bytes, big-endian) as the salt
+and `"ssf-media-v1" ‖ leg (1 byte) ‖ "key"` or `‖ "salt"` as the info, 32
+and 12 bytes out; the 96-bit nonce is the leg's 12-byte salt XOR the
+64-bit frame counter, big-endian in the low 8 bytes (the SFrame
+construction), and each leg counts its own frames, so two legs never
+share a nonce space under one key — one key with two independent encoder
+counters would reuse a nonce, which breaks the AEAD outright. The
+associated data is the header exactly as it goes on the wire, fixed to
+the byte: version (1) ‖ source (32, the sender's Ed25519 public key) ‖
+leg (1) ‖ key epoch (4, big-endian) ‖ counter (8, big-endian) ‖ flags (1,
+bit 0 the keyframe) — 47 bytes — and the signature below covers that
+header and the ciphertext with its tag. A leg's counter is the SENDER's for
 the whole epoch, never the encoder's: it lives outside the encoder and
 survives every pause, restart and reconfiguration (§9 and spike #21 restart
 encoders for the first subscriber), so a restarted encoder goes on from the
@@ -593,12 +605,21 @@ What bounds a member who leaves and returns on purpose is counted at three
 scopes, since an identity is free to mint: per identity, past three
 departures in a minute it is parked — its next admission waits out a
 backoff that doubles each time, and its leaves and returns trigger nothing
-meanwhile; per authenticated ingress link (the WebTransport session or iroh
-connection the identities arrived by, which a fresh key cannot change),
-past six departures a minute across every identity behind it the LINK is
-parked — every identity behind it evicted in ONE rotation, their
-re-admissions waiting out the doubling backoff together — so a client
-minting identities interrupts a source six times, not without end; and
+meanwhile; per ORIGIN NODE — the node a subscriber's page is connected
+to, which every per-spoke lease a hub relays names under the hub's own
+attestation (the control plane of #21), a principal a fresh key cannot
+change and a shared hub connection is not: past six departures a minute
+across every identity behind one origin, that origin is parked — its
+identities evicted in ONE rotation, their re-admissions waiting out the
+doubling backoff together — so a client minting identities interrupts a
+source six times, not without end, and the honest spokes behind the same
+hub are not touched. The quota is enforced in layers, each parking only
+the offender: a hub applies it to each spoke's link at the hub before
+relaying anything (a spoke's departures count against that spoke, never
+the hub), the sender applies it to the origin a lease names, and a hub
+that keeps relaying a parked origin's churn is itself the offender — its
+own link is what the sender then parks, an honest hub having parked the
+spoke first; and
 source-wide, past thirty rotations a minute the sender batches further
 departures into one rotation every two seconds and reports the storm,
 which hands a departed member at most two seconds of frames it could still
@@ -751,7 +772,7 @@ use the same mechanism with a larger radius; voice uses an earshot radius.
 | Central piece | Without it |
 |---|---|
 | Trackers (`tr=`, `announce`) | DHT (BEP 5) + PEX (BEP 11) + LSD (BEP 14). rqbit does DHT and PEX; verify LSD. Trackers in a magnet are used opportunistically, never required; the node ships **no tracker list** — and since shipping no list suppresses nothing the metadata carries, whether a pasted magnet's or `.torrent`'s embedded trackers (`tr=`, `announce`) are contacted is an operator setting, default off, on a non-strict build — and when it is on, every tracker announce and every web-seed request (next rows) goes through §3.4's destination gate, the one crate the media proxy uses: the node resolves each tracker and web-seed name itself, admits global unicast only (loopback, private, link-local and the cloud metadata ranges refused; an explicit allowlist for a tracker the operator runs on the station's own LAN), pins the socket to the address it checked, and re-runs the whole gate on every redirect of a web seed. `librqbit` inherits none of that on its own, so the node filters the metadata's `tr=` and `url-list` entries before the client sees them, hands it pinned addresses where its API allows, runs its HTTP under a redirect policy that re-checks each hop, and where the client cannot be made to check every hop the setting stays off and says why. And the same classifier stands on every PEER dial, setting or no setting: the endpoints a tracker response, the DHT or PEX hand back are as untrusted as the metadata, so every outgoing BitTorrent connection and every uTP or DHT packet goes to a global-unicast address or nowhere — loopback, private, link-local and the metadata ranges refused, a LAN peer reachable only through the operator's explicit allowlist, which is also the only door LSD (a LAN-discovery protocol by design) ever opens — the check sitting in the client's connector, which the node forks if `librqbit` offers no hook there, rather than shipping without it. A strict build has no swarm at all (next row), so there the question never arises: "strict" is a build-time guarantee, not a runtime default, and nothing in a strict build opts into any of this. |
-| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node, so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no DHT client, no PEX, no LSD, no tracker or web-seed code to reach anything with — the only isolation that holds, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. |
+| DHT bootstrap nodes | A persisted routing table (rqbit's `DhtConfig` takes `routing_table` and `peer_store`), **our own nodes as bootstrap** (`bootstrap_addrs`; every node with the `torrent` feature runs a full Mainline DHT node, so a room's hub is its spokes' bootstrap — a way into the public DHT without a vendor's list, never an isolation boundary: an owned bootstrap is a Mainline participant and hands out public contacts on the first lookup, so a client bootstrapped from it IS in the public swarm, and a separate routing-table file changes nothing), a player-run tracker in the registry (`aquatic_udp`, Rust, in the bridge kit), and a ChiaHub record for our own content. A strict build has no torrent client at all: the `torrent` feature is not compiled in, so there is no BEP‑5 infohash DHT client, no PEX, no LSD, no tracker or web-seed code to reach a swarm with — the only isolation that holds for the swarm, since any Mainline client joins Mainline whatever it bootstraps from, and a second, private DHT would only duplicate what the blob lane and the library already are (an overlay of id-authenticated station nodes). A strict station takes its torrents through the blob lane and the library, fetched by a non-strict node of the station's. What this feature neither adds nor removes is the node's OWN address lookup over Mainline — `DhtAddressLookup` in `ssf-p2p-node/src/main.rs`, on by default today and off with `SSF_NO_DHT=1`, which publishes and resolves node ids, never infohashes: node discovery's lane-5 question (§1), governed by that switch and the strict posture the Cabal plan sets for it, so "strict" here promises no swarm, never no DHT traffic. |
 | Web seeds (BEP 19) | Fine as convenience; archive torrents are mostly this, which is why the proxy serves them better. Third-party HTTP origins: an operator setting, default off, on a non-strict build, under the trackers row's destination gate when on (a web-seed URL comes from the same untrusted metadata, and a crafted one would otherwise point the node at loopback, the LAN or a metadata service); never on a strict one. rqbit's web-seed support is unverified. |
 | Metadata for a magnet (BEP 9) | From any peer; a `.torrent` file skips the step. |
 
