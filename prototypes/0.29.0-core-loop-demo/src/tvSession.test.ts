@@ -199,16 +199,19 @@ describe('tickTvRoom', () => {
     expect(readTv(TV).state).toBe('playing'); // never stopped at the short film's length
   });
 
-  it('an end that grows between ticks (a live event\'s elapsed time) is never taken for an end', () => {
+  it('an end that moves within one programme — a live event\'s elapsed time, repeating between polls before it grows — unbounds the programme for good', () => {
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/live.m3u8' });
     const started = readTv(TV).started;
-    let elapsed = 30_000;
+    // What a player that cannot tell live from finite might report: the
+    // same value twice (an asynchronously updated reading), then more.
+    const readings = [30_000, 30_000, 30_500, 30_500, 31_000, 31_000];
+    let i = 0;
     const unregister = registerTvPlayerOfRecord(TV, {
-      positionMs: () => elapsed, canSeek: () => false, started: () => started, endMs: () => { elapsed += 500; return elapsed; },
+      positionMs: () => 29_000, canSeek: () => false, started: () => started, endMs: () => readings[Math.min(i++, readings.length - 1)]!,
     });
     run(3_000);
-    unregister();
+    unregister(); // the holder closes the theatre: the clock runs on headlessly, past every value ever read
     run(120_000);
     expect(readTv(TV).state).toBe('playing');
   });

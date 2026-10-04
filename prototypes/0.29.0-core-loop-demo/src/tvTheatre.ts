@@ -86,12 +86,14 @@ export function loadYouTubeApi(timeoutMs = 12_000): Promise<YtNamespace> {
 
 interface Adapter extends TvPlayer {
   destroy(): void;
-  /** The media's length in ms when the player knows it is finite, else
-   *  null: the end the holder's headless beat closes the programme at once
-   *  this theatre is gone (tvSession). Not the seekable range's end — for a
-   *  progressive download from a host without range support that covers
-   *  only the buffered prefix, and the room would be stopped before the
-   *  file ended. */
+  /** The media's length in ms ONLY when the player knows the media to be
+   *  finite, else null: the end the holder's headless beat closes the
+   *  programme at once this theatre is gone (tvSession). Not the seekable
+   *  range's end — for a progressive download from a host without range
+   *  support that covers only the buffered prefix, and the room would be
+   *  stopped before the file ended — and not a reading from a player that
+   *  cannot tell a live stream from a file: a live event's elapsed time
+   *  reported as a length would stop the broadcast for everyone. */
   durationMs(): number | null;
 }
 
@@ -146,20 +148,22 @@ class YouTubePlayerAdapter implements Adapter {
   currentMs(): number {
     try { return (this.player?.getCurrentTime() ?? 0) * 1000; } catch { return 0; }
   }
-  /** The whole video, once its metadata has said how long it is. */
+  /** The whole video, once its metadata has said how long it is — for
+   *  clamping seeks; on a live event getDuration is the time since it
+   *  began, which is also where such a stream can be sought within. */
   seekableRange(): SeekableRange | null {
-    const ms = this.durationMs();
-    return ms === null ? null : { startMs: 0, endMs: ms };
-  }
-  /** getDuration: the video's length — or, on a live event, the time since
-   *  it began, which grows; tvSession takes an end only once it has read
-   *  the same value twice, so a live stream never gets one. */
-  durationMs(): number | null {
     try {
       const seconds = this.player?.getDuration() ?? 0;
-      return seconds > 0 ? seconds * 1000 : null;
+      return seconds > 0 ? { startMs: 0, endMs: seconds * 1000 } : null;
     } catch { return null; }
   }
+  /** Never an end from here: the IFrame API does not say whether a video
+   *  is live, and getDuration on a live event is elapsed time — a value
+   *  that can repeat between polls before it grows, so no number of equal
+   *  readings proves a length. A YouTube programme ends through the
+   *  holder's open theatre (the controller sees the ENDED state) or by a
+   *  transport action, never by the headless beat. */
+  durationMs(): null { return null; }
   setRate(): void { /* YouTube's rate steps are coarse: the controller only seeks */ }
   setVolume(volume: number): void { try { this.player?.setVolume(volume); } catch { /* not ready */ } }
   destroy(): void {
