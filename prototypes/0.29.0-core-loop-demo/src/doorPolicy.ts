@@ -25,7 +25,7 @@
  */
 
 import * as Y from 'yjs';
-import { LEGACY_ID_WALL, doorExistsIn, hasDoorLayout } from './doorLayoutDoc';
+import { LEGACY_ID_WALL, doorExistsIn, hasDoorLayout, isDoorLayoutRecord } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -209,29 +209,55 @@ function accessRecord(p: DoorPolicyRecord): GateAccessRecord | null {
   return { access: p.gateAccess, ...(p.reservedFor ? { reservedFor: p.reservedFor } : {}) };
 }
 
+/** Most ports a gate read lists: more than a station has gate numbers. */
+const MAX_PORTS = 256;
+/** Most keys of each peer-written map a port scan looks at, junk included:
+ *  a room's own doors, and the policies they leave, fit well inside (as
+ *  doorsDoc bounds its pairing scan). */
+const MAX_SCANNED_PORT_KEYS = 4 * MAX_PORTS;
+
 /** ⚓🚦 The dock ports a room's layout has (doors whose policy fits an
- *  adapter), with their policies, for the gate readers. Walking the layout
- *  rather than the policy map means stale or junk policy keys (a removed
- *  door's, a peer's) can never crowd a live port out of a capped scan. The
- *  walk covers the whole layout map, as the room's own door list
- *  (doorLayoutDoc.readAllDoorLayout) does, and only ports count toward the
- *  cap: doors without an adapter, however many, cannot hide one. */
+ *  adapter), with their policies, for the gate readers. A port has a key in
+ *  both peer-written maps, its door's layout record and its policy, and the
+ *  scan reads a bounded number of keys from each. It walks the layout first,
+ *  so stale or junk policy keys (a removed door's, a peer's) cannot crowd a
+ *  live port out, and the policy map only when a flood cuts the layout walk
+ *  short, so junk doors cannot either; doors without an adapter never count
+ *  toward the port cap. A flood of both maps can keep a port off these lists,
+ *  never off a DOCK at that door, which reads its own policy (gateAccessIn,
+ *  dockPortFlagIn). */
 function portsIn(doc: Y.Doc, policies: Y.Map<unknown>): Array<[string, DoorPolicyRecord]> {
-  const out: Array<[string, DoorPolicyRecord]> = [];
+  const layout = doc.getMap('doorLayout');
+  const out = new Map<string, DoorPolicyRecord>();
   const take = (id: string): void => {
-    if (!doorExistsIn(doc, id)) return;
+    if (out.size >= MAX_PORTS) return;
     const p = sanitizePolicy(policies.get(id));
-    if (p.adapter) out.push([id, p]);
+    if (p.adapter) out.set(id, p);
+  };
+  // A door is a valid record under its own id (doorExistsIn), which junk is
+  // not: told apart here before doorExistsIn counts the whole map for it.
+  const isDoor = (id: string): boolean => {
+    const rec = layout.get(id);
+    return isDoorLayoutRecord(rec) && rec.id === id && doorExistsIn(doc, id);
   };
   let any = false;
-  for (const id of doc.getMap('doorLayout').keys()) {
-    if (doorExistsIn(doc, id)) any = true;
-    take(id);
-    if (out.length >= 256) break;
+  let cut = false;
+  let scanned = 0;
+  for (const id of layout.keys()) {
+    if (++scanned > MAX_SCANNED_PORT_KEYS) { cut = true; break; }
+    if (isDoor(id)) { any = true; take(id); }
   }
-  // A legacy room keeps no layout records: its doors are the cardinal ones.
-  if (!any) for (const id of Object.keys(LEGACY_ID_WALL)) take(id);
-  return out;
+  if (cut) {
+    scanned = 0;
+    for (const id of policies.keys()) {
+      if (++scanned > MAX_SCANNED_PORT_KEYS) break;
+      if (!out.has(id) && isDoor(id)) take(id);
+    }
+  } else if (!any) {
+    // A legacy room keeps no layout records: its doors are the cardinal ones.
+    for (const id of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, id)) take(id);
+  }
+  return [...out];
 }
 
 /** ⚓🚦 Every non-open gate access of this room's ports, by door id. */
@@ -253,7 +279,7 @@ export function gateAccessIn(
   if ((doc as { isDestroyed?: boolean }).isDestroyed) return { access: 'open', granted: false };
   const a: { access: GateAccess; reservedFor?: string } =
     accessRecord(sanitizePolicy(doc.getMap('doorPolicy').get(doorId))) ?? { access: 'open' };
-  const granted = !!pub && isGrant(doc.getMap('doorGrants').get(reqKey(doorId, pub)));
+  const granted = !!pub && isGrantFor(doc.getMap('doorGrants').get(reqKey(doorId, pub)), doorId, pub);
   return { ...a, granted };
 }
 
@@ -380,6 +406,14 @@ function isGrant(v: unknown): v is DoorRightsGrant {
     && typeof g.name === 'string' && typeof g.grantedAt === 'number';
 }
 
+/** The value stored under `reqKey(doorId, pub)` grants that door to that
+ *  captain only when the record names both itself: the owner's list
+ *  (readDoorGrants) reads the door and the captain's key from the record, so
+ *  a record naming others admits nobody here. */
+function isGrantFor(v: unknown, doorId: string, pub: string): v is DoorRightsGrant {
+  return isGrant(v) && v.doorId === doorId && v.pub === pub;
+}
+
 /** Owner ACCEPT: standing, revocable grant; clears the matching request. */
 export function writeDoorGrant(doorId: string, pub: string, name: string): void {
   if (!docAlive() || !pub) return;
@@ -407,5 +441,5 @@ export function readDoorGrants(doorId?: string): DoorRightsGrant[] {
 }
 
 export function hasDoorGrant(doorId: string, pub: string): boolean {
-  return docAlive() ? isGrant(grantsMap!.get(reqKey(doorId, pub))) : false;
+  return docAlive() ? isGrantFor(grantsMap!.get(reqKey(doorId, pub)), doorId, pub) : false;
 }
