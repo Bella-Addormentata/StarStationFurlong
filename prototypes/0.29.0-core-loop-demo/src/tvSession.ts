@@ -17,7 +17,7 @@
 
 import {
   claimRemote, iHoldRemote, putDownRemote, readPlayback, readPower, readProgramme, readTv, renewRemote,
-  tvDocEpoch, tvHeartbeat, tvPause, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
+  tvDocEpoch, tvHeartbeat, tvNow, tvPause, TV_HEARTBEAT_MS, TV_LEASE_RENEW_MS,
 } from './tvDoc';
 
 export interface RoomPlayer {
@@ -84,7 +84,7 @@ function seePower(id: string): SeenPower | undefined {
 }
 
 /** Drive every TV in the room (ids of the smart-tv / tv-stand items). */
-export function tickTvRoom(itemIds: readonly string[], now = Date.now()): void {
+export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
   const live = new Set(itemIds);
   for (const id of [...lastRenew.keys()]) if (!live.has(id)) lastRenew.delete(id);
   for (const id of [...lastHeadlessBeat.keys()]) if (!live.has(id)) lastHeadlessBeat.delete(id);
@@ -94,7 +94,7 @@ export function tickTvRoom(itemIds: readonly string[], now = Date.now()): void {
     // it (two tabs, one key — the first to tick wins, the other stays a
     // viewer). The claim refreshes the lease, so it is this tick's renewal
     // too, and `by` stays the giver until the next one: the phone's cue.
-    if (claimRemote(id, now)) lastRenew.set(id, now);
+    if (claimRemote(id)) lastRenew.set(id, now);
     if (!iHoldRemote(id)) {
       lastRenew.delete(id);
       lastHeadlessBeat.delete(id);

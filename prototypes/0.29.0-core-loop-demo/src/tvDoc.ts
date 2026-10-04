@@ -19,9 +19,13 @@
  * the holder writes `{positionMs, seq}` every TV_HEARTBEAT_MS while playing.
  * A receiver notes its OWN clock when a new `seq` lands (`readSample`) and
  * extrapolates from that — `expected = positionMs + (now − receivedAt)`. No
- * device ever compares its clock with another's (the croupier.ts rule).
- * `startAt` (UTC) drives only the countdown display and the first second
- * after T0, until the holder's first heartbeat lands.
+ * device ever compares its clock with another's (the croupier.ts rule), and
+ * that clock is the MONOTONIC one (performance.now): the wall clock steps
+ * on an NTP correction, a wake from sleep or a manual change, and a step
+ * would read as elapsed playback and seek every viewer at once. The wall
+ * clock serves only what is UTC by nature: `startAt` drives the countdown
+ * display and the first second after T0, until the holder's first
+ * heartbeat lands; the lease and history stamps are wall time too.
  *
  * THE REMOTE IS POSSESSION, NOT A ROLE (owner ruling 2026-10-03): whoever
  * holds it controls the TV. Anyone may pick a free remote up, hand it to
@@ -171,14 +175,27 @@ let bindingEpoch = 0;
 const listeners = new Set<() => void>();
 const keyListeners = new Map<string, Set<() => void>>();
 
-/** The receipt clock — injectable so the sync maths can be tested against a
- *  fake clock. Production: Date.now. */
-let clock: () => number = () => Date.now();
-export function setTvClock(fn: () => number): void {
+/** Two clocks. The receipt clock is MONOTONIC (performance.now): it anchors
+ *  samples and leases as they land here and measures everything elapsed —
+ *  a wall-clock step (an NTP correction, a wake from sleep, a manual change)
+ *  must never read as elapsed playback and seek every viewer at once, nor
+ *  lapse a live lease. The wall clock (Date.now) serves only what is UTC by
+ *  nature: the schedule's `startAt`, and the lease and history stamps that
+ *  travel in the records. Both injectable so the sync maths can be tested
+ *  against a fake; one fake drives both unless a test needs them apart. */
+let clock: () => number = () => performance.now();
+let wallClock: () => number = () => Date.now();
+export function setTvClock(fn: () => number, wall: () => number = fn): void {
   clock = fn;
+  wallClock = wall;
 }
+/** The monotonic receipt clock: elapsed time, never a date. */
 export function tvNow(): number {
   return clock();
+}
+/** The wall clock: UTC ms, for the schedule and the stamps that travel. */
+export function tvWallNow(): number {
+  return wallClock();
 }
 
 /** Playback samples as THIS page received them: the record's seq, its
@@ -535,7 +552,7 @@ export function pickUpRemote(itemId: string, now = clock()): TvAction {
   if (!mayPickUpRemote(itemId, now)) {
     return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
   }
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: pageId } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
   return { ok: true };
 }
 
@@ -546,30 +563,30 @@ export function pickUpRemote(itemId: string, now = clock()): TvAction {
 export function renewRemote(itemId: string, now = clock()): void {
   const { pub, name } = identityProvider();
   if (!pub || remoteStatus(itemId, now) !== 'mine') return;
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: pageId } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: pageId } satisfies RemoteRecord);
 }
 
 /** A remote handed to my identity is nobody's page yet: the first of my
  *  pages to see it takes it (two tabs, one key — the loser of the race sees
  *  another page on it and stays a viewer). False when there is nothing to
  *  claim. The giver stays in `by`, so the phone still pops open on receipt. */
-export function claimRemote(itemId: string, now = clock()): boolean {
+export function claimRemote(itemId: string): boolean {
   const { pub, name } = identityProvider();
   const rec = readRemote(itemId);
   if (!pub || rec.holder !== pub || rec.page !== '') return false;
-  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: now, by: rec.by, page: pageId } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: pub, name: name.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: rec.by, page: pageId } satisfies RemoteRecord);
   return true;
 }
 
 /** Put it back on the TV. The holder may; so may the owner (taking it away). */
-export function putDownRemote(itemId: string, now = clock()): TvAction {
+export function putDownRemote(itemId: string): TvAction {
   const { pub } = identityProvider();
   const rec = readRemote(itemId);
   if (!rec.holder) return { ok: true };
   if (rec.holder !== pub && !hostPredicate()) {
     return { ok: false, error: `${rec.name || 'Someone'} is holding the remote.` };
   }
-  write(remoteKey(itemId), { holder: '', name: '', leaseAt: now, by: pub, page: '' } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: '', name: '', leaseAt: wallClock(), by: pub, page: '' } satisfies RemoteRecord);
   return { ok: true };
 }
 
@@ -581,7 +598,7 @@ export function handRemote(itemId: string, toPub: string, toName: string, now = 
   if (remoteStatus(itemId, now) !== 'mine' && !hostPredicate()) {
     return { ok: false, error: 'You are not holding the remote.' };
   }
-  write(remoteKey(itemId), { holder: toPub, name: toName.slice(0, TV_MAX_NAME), leaseAt: now, by: pub, page: '' } satisfies RemoteRecord);
+  write(remoteKey(itemId), { holder: toPub, name: toName.slice(0, TV_MAX_NAME), leaseAt: wallClock(), by: pub, page: '' } satisfies RemoteRecord);
   return { ok: true };
 }
 
@@ -611,8 +628,8 @@ function withHistory(rec: TvProgramme, source: TvSource, now: number): TvHistory
   return [{ source, title: titleOf(source), playedAt: now }, ...rest].slice(0, TV_HISTORY_MAX);
 }
 
-/** Play `source` now, from the top. */
-export function tvPlay(itemId: string, source: TvSource, now = clock()): TvAction {
+/** Play `source` now, from the top. `now` is wall time: the history stamp. */
+export function tvPlay(itemId: string, source: TvSource, now = wallClock()): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
@@ -633,8 +650,9 @@ export function tvPlay(itemId: string, source: TvSource, now = clock()): TvActio
   return { ok: true };
 }
 
-/** Schedule `source` for a UTC start — the countdown everyone sees. */
-export function tvSchedule(itemId: string, source: TvSource, startAt: number, now = clock()): TvAction {
+/** Schedule `source` for a UTC start — the countdown everyone sees. `now`
+ *  is wall time, as `startAt` is. */
+export function tvSchedule(itemId: string, source: TvSource, startAt: number, now = wallClock()): TvAction {
   const gate = mayControl(itemId);
   if (!gate.ok) return gate;
   const clean = sanitizeSource(source);
@@ -784,11 +802,14 @@ export function expectedPositionMs(
   return Math.max(0, sample.positionMs + (now - sample.receivedAt) + lead);
 }
 
-/** What the room should be showing right now. */
+/** What the room should be showing right now. `now` is the monotonic clock
+ *  (the receipt timeline); the schedule is read against the wall clock,
+ *  which is the only thing here that is a date. */
 export function readPlayback(itemId: string, now = clock(), rttMs = 0): PlaybackNow {
   const rec = readTv(itemId); // the composed state: a set that is off is off
   if (rec.state === 'scheduled') {
-    const countdownMs = Math.max(0, rec.startAt - now);
+    const wall = wallClock();
+    const countdownMs = Math.max(0, rec.startAt - wall);
     if (countdownMs > 0) return { state: 'scheduled', positionMs: 0, running: false, countdownMs };
     // Past T0. The HOLDER's clock says go: it reads playing, and its first
     // heartbeat (the theatre's or the headless one, within 3 s) flips the
@@ -797,7 +818,7 @@ export function readPlayback(itemId: string, now = clock(), rttMs = 0): Playback
     // Only with nobody holding the remote does a viewer free-run from the
     // UTC start, best effort, until someone picks the remote up and beats.
     if (iHoldRemote(itemId) || remoteLapsed(itemId, now)) {
-      return { state: 'playing', positionMs: now - rec.startAt, running: true, countdownMs: 0 };
+      return { state: 'playing', positionMs: wall - rec.startAt, running: true, countdownMs: 0 };
     }
     return { state: 'scheduled', positionMs: 0, running: false, countdownMs: 0 };
   }
