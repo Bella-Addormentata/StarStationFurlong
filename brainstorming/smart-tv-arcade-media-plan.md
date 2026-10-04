@@ -692,7 +692,12 @@ subtraction on the shared clock (a batch carries its first chunk's
 timestamp in the header and each chunk's duration in its table, below —
 never inferred from a packet's TOC byte, which gives the duration of ONE
 frame while a code-3 packet carries several — so chunk k starts at the
-header's timestamp plus the durations before it); the keyframe bit is the
+header's timestamp plus the durations before it, and so a batch holds
+only CONTIGUOUS chunks of one generation: the sender flushes it before a
+chunk whose timestamp is not the last chunk's plus its duration — a
+pause, a dropped capture — and before a reconfiguration, so a gap is
+never closed into adjacency and no chunk is labelled with another
+generation's configuration); the keyframe bit is the
 chunk's type; and the configuration
 goes on the reliable lane, below, named by its generation. The source is an INSTANCE, never
 the sender's key: one identity may publish voice, a screen share and an
@@ -1595,11 +1600,17 @@ when the spectator lane comes, comes out the same way — `ImageBitmap`s
 (or `VideoFrame`s) the frame makes from its own canvas and transfers at
 the lane's rate — never a reach into the frame's canvas, which an opaque
 origin forbids by design and an earlier draft of this paragraph relied
-on. The frame still runs under a content-security policy set before its
-loader is fetched: the station's origin, `blob:`, `data:` and the viewer's
-own node, nothing else — no update check, no netplay signalling, no third
-party of any kind; `'unsafe-eval'` and `'wasm-unsafe-eval'` for the
-cores. An opaque origin's fetches carry `Origin: null`, so the station's
+on. The frame still runs under a content-security policy on EVERY lane,
+set by the frame itself on receipt of the page's config and before its
+loader is fetched: its own origin, `blob:`, `data:`, the viewer's own node
+and — on the CDN lane alone, in a build with the lanes on —
+`cdn.emulatorjs.org`, the engine's origin, and nothing else: no update
+check, no netplay signalling, no other third party; `'unsafe-eval'` and
+`'wasm-unsafe-eval'` for the cores. The origins travel in the config
+message (`emulatorFrameOrigins`), never in the frame's URL, which is one
+immutable path with no query: `frame-src` ignores a query, so a policy
+chosen by one could be swapped by a self-navigation to the same path. An
+opaque origin's fetches carry `Origin: null`, so the station's
 engine files answer them with `Access-Control-Allow-Origin` (the engine
 and its cores: public files, readable by any page that can reach the
 station anyway, and nothing else of the station's); the ROM never crosses
@@ -1627,13 +1638,18 @@ therefore a belt and never the barrier. The barrier is the EMBEDDER's
 document embeds, whoever starts it, before the request is dispatched: so
 the page mounts the frame inside a WALL — a same-origin `srcdoc` document
 of its own whose one policy is `default-src 'none'; frame-src <the
-frame's URL, exactly>` (`arcadeEmulator.ts`, `emulatorWallPolicy`;
+frame's path, exactly>` (`arcadeEmulator.ts`, `emulatorWallPolicy`;
 nothing else loads in the wall, and the frame, an opaque origin, is
-nobody to it) — and a frame that tries to leave sends nothing: the wall
-hears the violation (`securitypolicyviolation`, `frame-src`) and the page
-tears the frame down with the reason. The one navigation the policy
-allows, to the frame's own URL, is the frame reloading itself, caught by
-the second `load` and torn down the same way (Chromium also puts a blank
+nobody to it) — one immutable path with nothing in a query, since
+`frame-src` ignores a query and a mode chosen by one would be a mode the
+frame's code could choose — and a frame that tries to leave sends
+nothing: the wall hears the violation (`securitypolicyviolation`,
+`frame-src`) and the page tears the frame down with the reason. The one
+navigation the policy allows, to the frame's own path, is the frame
+reloading itself: the document that arrives runs the page's script alone,
+receives no config (the page configures a frame once), sets no policy and
+loads nothing, and is caught by the second `load` and torn down the same
+way (Chromium also puts a blank
 page of its own into a frame whose navigation it refused, whose load
 reaches the page before the report of the refusal: the page waits a
 moment for the report before it calls a second load a reload). The
