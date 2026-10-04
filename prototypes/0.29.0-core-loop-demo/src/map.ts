@@ -31,6 +31,10 @@ export interface MapBody {
    *  round (none: the sun) and where. A station moving between planets
    *  (stationMove.ts) leaves its planet for the sun and joins another. */
   placeAt?: (nowMs: number) => { parentId?: string; angle: number; radius: number };
+  /** 🚚 A moving station's course around the sun, burn to arrival: points
+   *  where placeAt puts it on the way (sun-centred, like placeAt's), drawn
+   *  until `until` (its arrival). */
+  course?: { until: number; points: Array<{ angle: number; radius: number }> };
   description: string;
   resources?: { type: string; yield: number }[];
   lagrangePoint?: 'L1' | 'L2' | 'L3' | 'L4' | 'L5';
@@ -80,6 +84,7 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
       angle: orbit.phase0,
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
       ...(s.move ? { placeAt: movingPlace(s, s.move) } : {}),
+      ...(s.move && nowMs < s.move.arriveAt ? moveCourse(s.move) : {}),
       description: (s.id === DEFAULT_STATION_ID
         ? `Sovereign-serverless terminal, lounge, and trade hub for all clones. ${readout}`
         : `Station around ${orbit.planet.name}: ${readout}`) + moving,
@@ -105,6 +110,40 @@ function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['
     if (nowMs >= move.arriveAt) return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
     return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: slotRadius(s.orbitSlot) };
   };
+}
+
+/** Points along a drawn course: enough that a transfer ellipse reads as a
+ *  curve at any zoom the holotable allows. */
+const COURSE_SAMPLES = 64;
+
+/** A move's course, sampled where the marker flies (moveTransitPointAt, at
+ *  the planets' map scale), burn to arrival; nothing for a move that crosses
+ *  no space (a pin, or one planet under two ids). */
+function moveCourse(move: StationMove): Pick<MapBody, 'course'> {
+  const points: Array<{ angle: number; radius: number }> = [];
+  const span = move.arriveAt - move.departAt;
+  for (let i = 0; i <= COURSE_SAMPLES; i++) {
+    // The last point is the last moment in transit: arrival is a planet's.
+    const p = moveTransitPointAt(move, Math.min(move.arriveAt - 1, move.departAt + (span * i) / COURSE_SAMPLES));
+    if (p) points.push({ angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU });
+  }
+  return points.length > 1 ? { course: { until: move.arriveAt, points } } : {};
+}
+
+/** Where a body's course runs on screen (the sun at the centre given, at the
+ *  map's scale): none once it has arrived, nor for a body with no course. */
+export function courseOnScreen(
+  body: MapBody,
+  nowMs: number,
+  centerX: number,
+  centerY: number,
+  scale: number,
+): Array<{ x: number; y: number }> {
+  if (!body.course || nowMs >= body.course.until) return [];
+  return body.course.points.map((p) => {
+    const { dx, dy } = screenOffset(p.angle, p.radius * scale);
+    return { x: centerX + dx, y: centerY + dy };
+  });
 }
 
 /** ☀️ A planet's true angle around the sun on the shared clock
@@ -690,6 +729,22 @@ export class SolarSystemMap {
         ctx.stroke();
         ctx.setLineDash([]);
       }
+    }
+
+    // 🚚 A station on its way to another planet: its course, which its
+    // marker rides from the burn to arrival.
+    const now = this.clock();
+    for (const body of this.bodies) {
+      const course = courseOnScreen(body, now, centerX, centerY, this.scale);
+      if (course.length < 2) continue;
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(0, 212, 255, 0.4)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 4]);
+      ctx.moveTo(course[0].x, course[0].y);
+      for (const p of course.slice(1)) ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
     }
 
     // 2. Render astronomical bodies

@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import { ORBIT_EPOCH_MS, setStationTrimResolver } from './orbits';
-import { stationBodies } from './map';
+import { courseOnScreen, screenOffset, stationBodies } from './map';
 import {
   bindPlanetSummaryDoc,
   cleanStationSummary,
@@ -52,10 +52,14 @@ import {
   readRememberedMoves,
   readStationMove,
   rememberedMoveFor,
+  FOLD_ITEMS_MAX,
   MOVE_ENTRIES_KEEP,
   MOVE_SCAN_MAX,
   MOVE_SETTLED_KEEP,
+  SWEEP_BATCH,
   rememberMove,
+  rememberMovesIn,
+  roomDocLockedByMove,
   subscribeStationMove,
   writeStationMove,
 } from './stationMove';
@@ -63,11 +67,15 @@ import type { MoveContext, StationMove, TowContext } from './stationMove';
 import {
   DEFAULT_STATION_ID,
   DEFAULT_STATION_RECORD,
+  knownSlotsAround,
   listStations,
+  registerStation,
+  setKnownPlacesResolver,
   setStationMoveResolver,
   stationInTransit,
 } from './stations';
-import type { StationRecord } from './stations';
+import type { KnownPlace, StationRecord } from './stations';
+import type { AtlasEntry } from './stationAtlas';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -82,7 +90,7 @@ const ARIS = 'planet-aris';
 const NOW = ORBIT_EPOCH_MS + 5_000_000_000;
 
 beforeEach(() => store.clear());
-afterEach(() => { setStationMoveResolver(null); unbindPlanetSummaryForTest(); });
+afterEach(() => { setStationMoveResolver(null); setKnownPlacesResolver(null); unbindPlanetSummaryForTest(); });
 
 const ctx = (over: Partial<MoveContext> = {}): MoveContext => {
   const stations = listStations({}, [], NOW);
@@ -106,6 +114,12 @@ const moveTo = (to = ARIS): StationMove => {
   if (!plan.ok) throw new Error(plan.refusal);
   return plan.move;
 };
+
+/** The pin pinSettledArrival writes once `m` has arrived where it was bound. */
+const pinOf = (m: StationMove): StationMove => ({
+  ...m, fromPlanetId: m.toPlanetId, fromSlot: m.toSlot, departAt: m.arriveAt, arriveAt: m.arriveAt + 1,
+  mode: 'thrusters', tugRoomId: undefined, bookedAt: m.arriveAt, settles: m, fuel: 0, fuelDrawn: 0,
+});
 
 describe('planning a thruster move', () => {
   it('leaves at the next launch window and takes the Hohmann transfer time', () => {
@@ -338,6 +352,342 @@ describe('the station list follows a move', () => {
       .toMatchObject({ planetId: ARIS });
   });
 
+  it('lets an arrival into the slot a station still on its way out has left', () => {
+    const inbound = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = inbound.arriveAt;
+    // Fifteen stations stay at Aris; the sixteenth left before T and is
+    // still between planets now.
+    const residents: StationRecord[] = Array.from({ length: 15 }, (_, i) => (
+      { id: `aris-${i}`, name: `A${i}`, planetId: ARIS, orbitSlot: i, welcomeRoomId: `a${i}` }));
+    const leaver: StationRecord = { id: 'leaver', name: 'L', planetId: ARIS, orbitSlot: 15, welcomeRoomId: 'l-room' };
+    const outbound: StationMove = {
+      stationId: 'leaver', welcomeRoomId: 'l-room', fromPlanetId: ARIS, fromSlot: 15, toPlanetId: SOV, toSlot: 5,
+      departAt: T - 1000, arriveAt: T + 10 * 86_400_000, mode: 'thrusters', fuel: 1, fuelDrawn: 1, bookedAt: T - 2000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? inbound : st.welcomeRoomId === 'l-room' ? outbound : null));
+    const listed = listStations({}, [...residents, leaver], T + 5);
+    expect(listed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 15 });
+    expect(stationInTransit(listed.find((s) => s.id === 'leaver')!, T + 5)).toBe(true);
+  });
+
+  it('keeps a booked slot for its arrival from clash losers, derived stations and new records', () => {
+    // Furlong books Aris slot 2; two records there clash for slot 1.
+    const move = { ...moveTo(), toSlot: 2, bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    const winner: StationRecord = { id: 'aris-a', name: 'A', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'a' };
+    const loser: StationRecord = { id: 'aris-b', name: 'B', planetId: ARIS, orbitSlot: 1, welcomeRoomId: 'b' };
+    const mid = (move.departAt + move.arriveAt) / 2;
+    for (const t of [move.departAt - 1, mid]) {
+      expect(listStations({}, [winner, loser], t).find((s) => s.id === 'aris-b')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
+    }
+    const landed = listStations({}, [winner, loser], move.arriveAt + 1);
+    expect(landed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 2 });
+    expect(landed.find((s) => s.id === 'aris-b')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
+
+    // A record saved here for that slot is refused while the move is booked
+    // (one mirrored from a peer stands where its own install put it).
+    vi.useFakeTimers({ now: mid, toFake: ['Date'] });
+    try {
+      const squatter: StationRecord = { id: 'squat', name: 'SQUAT', planetId: ARIS, orbitSlot: 2, welcomeRoomId: 'sq' };
+      expect(registerStation(squatter)).toBe(false);
+      expect(registerStation({ ...squatter, orbitSlot: 4 })).toBe(true);
+      expect(registerStation(squatter, { reservations: false })).toBe(true);
+      // Saved there, it keeps its slot through a rename.
+      expect(registerStation({ ...squatter, name: 'SQUATTER' })).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // With Furlong gone, Aris station A books Sovereign slot 0: a derived
+    // station, which takes the lowest free slot there, passes over it, and
+    // A finds it on arrival.
+    const away = move;
+    const inbound: StationMove = {
+      ...away, stationId: 'aris-a', welcomeRoomId: 'a', fromPlanetId: ARIS, fromSlot: 1, toPlanetId: SOV, toSlot: 0,
+      departAt: away.departAt + 1, arriveAt: away.arriveAt + 1000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? away : st.welcomeRoomId === 'a' ? inbound : null));
+    const atlas = { 'd-room': { roomId: 'd-room', name: 'DERIVED', doors: {}, lastSeen: 0 } };
+    const derivedAt = (t: number) => listStations(atlas, [winner], t).find((s) => s.derived);
+    expect(derivedAt(away.departAt - 1)).toMatchObject({ planetId: SOV, orbitSlot: 1 });
+    expect(derivedAt((away.departAt + away.arriveAt) / 2)).toMatchObject({ planetId: SOV, orbitSlot: 1 });
+    const home = listStations(atlas, [winner], inbound.arriveAt + 1);
+    expect(home.find((s) => s.id === 'aris-a')).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(home.find((s) => s.derived)).toMatchObject({ planetId: SOV, orbitSlot: 1 });
+  });
+
+  it('counts the stations heard of around another planet where it picks a slot there', () => {
+    const pending: StationMove = {
+      ...moveTo(), stationId: 'k2', welcomeRoomId: 'k2', fromPlanetId: SOV, fromSlot: 5, toPlanetId: ARIS, toSlot: 2,
+    };
+    // Two Aris residents and a station on its way there, none listed here.
+    const known: KnownPlace[] = [
+      { welcomeRoomId: 'k0', planetId: ARIS, orbitSlot: 0 },
+      { welcomeRoomId: 'k1', planetId: ARIS, orbitSlot: 1 },
+      { welcomeRoomId: 'k2', planetId: SOV, orbitSlot: 5, move: pending },
+    ];
+    setKnownPlacesResolver(() => known);
+    const listed = listStations({}, [], NOW);
+    expect(listed.some((s) => s.planetId === ARIS)).toBe(false);
+    expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(3);
+    const plan = planStationMove(ctx(), ARIS);
+    expect(plan.ok && plan.move.toSlot).toBe(3);
+    // One listed here counts where the list has it, not twice.
+    const k0: StationRecord = { id: 'k0-rec', name: 'K0', planetId: ARIS, orbitSlot: 4, welcomeRoomId: 'k0' };
+    expect(freeSlotAround(ARIS, listStations({}, [k0], NOW), undefined, NOW)).toBe(0);
+    // A clash there settles with them as on an install that lists them: k0
+    // keeps slot 0 by the global order, and the losers pass over the slot
+    // k2 is booked into.
+    const clash: StationRecord[] = [
+      { id: 'x', name: 'X', planetId: ARIS, orbitSlot: 0, welcomeRoomId: 'x' },
+      { id: 'y', name: 'Y', planetId: ARIS, orbitSlot: 0, welcomeRoomId: 'y' },
+    ];
+    const clashed = listStations({}, clash, NOW);
+    expect(clashed.find((s) => s.id === 'x')).toMatchObject({ planetId: ARIS, orbitSlot: 3 });
+    expect(clashed.find((s) => s.id === 'y')).toMatchObject({ planetId: ARIS, orbitSlot: 4 });
+  });
+
+  it('counts two stations heard of in one slot where the list settles them, in two', () => {
+    setKnownPlacesResolver(() => [
+      { welcomeRoomId: 'k0', planetId: ARIS, orbitSlot: 0 },
+      { welcomeRoomId: 'k1', planetId: ARIS, orbitSlot: 0 },
+    ]);
+    const listed = listStations({}, [], NOW);
+    expect(listed.some((s) => s.planetId === ARIS)).toBe(false);
+    expect(knownSlotsAround(ARIS, listed.map((s) => s.welcomeRoomId), NOW)).toEqual({ taken: new Set([0, 1]), reserved: new Set() });
+    expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(2);
+  });
+
+  it('places a station whose rooms no record claims where its summary has it, by its welcome room', () => {
+    // A learned station dropped once this install was at another planet: its
+    // rooms are still in the atlas, and its summary says where it is. Its
+    // welcome room is the room the atlas would derive it from, and then not.
+    for (const [w, v] of [['a-room', 'b-room'], ['w-room', 'v-room']]) {
+      const atlas: Record<string, AtlasEntry> = {
+        [w]: { roomId: w, name: 'HUB', doors: { 'x+': { targetSeed: `ssf://room#room=${v}`, targetRoomId: v } }, lastSeen: 0 },
+        [v]: { roomId: v, name: 'ANNEX', doors: {}, lastSeen: 0 },
+      };
+      const ofIt = (list: StationRecord[]) => list.filter((s) => s.welcomeRoomId === w || s.welcomeRoomId === v);
+      // Never moved, around Aris: listed there once, its slot taken.
+      setKnownPlacesResolver(() => [{ welcomeRoomId: w, planetId: ARIS, orbitSlot: 0 }]);
+      let listed = listStations(atlas, [], NOW);
+      expect(ofIt(listed)).toEqual([{ id: `station:${w}`, name: 'HUB', planetId: ARIS, orbitSlot: 0, welcomeRoomId: w, derived: true }]);
+      expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(1);
+      // On its way there from Sovereign: the slot it is bound for stays booked.
+      const inbound: StationMove = {
+        ...moveTo(), stationId: 'hub', welcomeRoomId: w, fromPlanetId: SOV, fromSlot: 6, toPlanetId: ARIS, toSlot: 0,
+      };
+      setKnownPlacesResolver(() => [{ welcomeRoomId: w, planetId: SOV, orbitSlot: 6, move: inbound }]);
+      setStationMoveResolver((st) => (st.welcomeRoomId === w ? inbound : null));
+      listed = listStations(atlas, [], NOW);
+      expect(ofIt(listed)).toEqual([expect.objectContaining({ id: `station:${w}`, planetId: SOV, orbitSlot: 6, move: inbound })]);
+      expect(freeSlotAround(ARIS, listed, undefined, NOW)).toBe(1);
+      setStationMoveResolver(null);
+      // Two summaries naming its rooms, in either order: one station, the
+      // same one everywhere (the first welcome room).
+      const both: KnownPlace[] = [{ welcomeRoomId: v, planetId: ARIS, orbitSlot: 5 }, { welcomeRoomId: w, planetId: ARIS, orbitSlot: 0 }];
+      const first = w < v ? both[1] : both[0];
+      for (const order of [both, [...both].reverse()]) {
+        setKnownPlacesResolver(() => order);
+        expect(ofIt(listStations(atlas, [], NOW))).toEqual([expect.objectContaining({
+          welcomeRoomId: first.welcomeRoomId, planetId: ARIS, orbitSlot: first.orbitSlot,
+        })]);
+      }
+    }
+  });
+
+  it('holds the slot of a station heard of whose rooms it knows, by a welcome room too long to anchor one', () => {
+    const w = 'w'.repeat(125);
+    const atlas: Record<string, AtlasEntry> = {
+      [w]: { roomId: w, name: 'HUB', doors: { 'x+': { targetSeed: 'ssf://room#room=v-room', targetRoomId: 'v-room' } }, lastSeen: 0 },
+      'v-room': { roomId: 'v-room', name: 'ANNEX', doors: {}, lastSeen: 0 },
+    };
+    setKnownPlacesResolver(() => [{ welcomeRoomId: w, planetId: ARIS, orbitSlot: 0 }]);
+    // `station:` and that room run past an id's length: heard of only, never
+    // listed by it, and its slot still taken.
+    const listed = listStations(atlas, [], NOW);
+    expect(listed.some((s) => s.welcomeRoomId === w || s.planetId === ARIS)).toBe(false);
+    expect(knownSlotsAround(ARIS, listed.map((s) => s.welcomeRoomId), NOW, atlas)).toEqual({ taken: new Set([0]), reserved: new Set() });
+  });
+
+  it('bounces an arrival off a planet it only knows is full from the summaries', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+    const listed = listStations({}, [], move.arriveAt + 1);
+    expect(listed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(listed.filter((s) => s.planetId === ARIS)).toHaveLength(0);
+  });
+
+  it('counts each station where it was when an arrival got there, whatever pin it carries now', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = move.arriveAt;
+    // k0 held Aris slot 0 when this station got there, and left it for
+    // Sovereign only later: a late install reads its arrival pin there.
+    const left: StationMove = {
+      stationId: 'k0', welcomeRoomId: 'k0', fromPlanetId: ARIS, fromSlot: 0, toPlanetId: SOV, toSlot: 5,
+      departAt: T + 1000, arriveAt: T + 5000, mode: 'thrusters', bookedAt: T + 1000, fuel: 1, fuelDrawn: 1,
+    };
+    const pin: StationMove = {
+      ...left, fromPlanetId: SOV, fromSlot: 5, departAt: left.arriveAt, arriveAt: left.arriveAt + 1,
+      bookedAt: left.arriveAt + 10, settles: left, fuel: 0, fuelDrawn: 0,
+    };
+    // A tow of k0 leaving the moment this station got there, cancelled: k0
+    // never left.
+    const tow: StationMove = { ...left, mode: 'tug', tugRoomId: 'tug-room', departAt: T, bookedAt: T };
+    const cancel: StationMove = {
+      ...tow, mode: 'thrusters', tugRoomId: undefined, toPlanetId: ARIS, toSlot: 0, departAt: T + 1, arriveAt: T + 2,
+      bookedAt: T + 10, settles: tow, fuel: 0, fuelDrawn: 0,
+    };
+    for (const k0 of [pin, cancel]) {
+      store.clear();
+      setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'k0' ? k0 : null));
+      setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+      const listed = listStations({}, [], pin.arriveAt + 1);
+      expect(listed.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    }
+    // k0 got to Aris that same moment, found it full and went home: from
+    // then on its pin says where it is, never the planet it bounced off.
+    const bounced: StationMove = { ...left, fromPlanetId: SOV, fromSlot: 5, toPlanetId: ARIS, toSlot: 0, departAt: move.departAt, arriveAt: T, bookedAt: move.departAt };
+    const home: StationMove = {
+      ...bounced, toPlanetId: SOV, toSlot: 5, departAt: T, arriveAt: T + 1, bookedAt: T + 10, settles: bounced, fuel: 0, fuelDrawn: 0,
+    };
+    store.clear();
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'k0' ? home : null));
+    setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: i ? ARIS : SOV, orbitSlot: i || 5 })));
+    expect(listStations({}, [], T + 2).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS });
+  });
+
+  it('counts a station whose pin leaves the moment an arrival gets there where the pin holds it', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = move.arriveAt;
+    // k0 got to Aris slot 0 that very moment, as its pin says; or a tow of
+    // k0 left the moment before and was cancelled, the cancel leaving at T.
+    // Either way k0 held Aris slot 0 when this station got there.
+    const came: StationMove = {
+      stationId: 'k0', welcomeRoomId: 'k0', fromPlanetId: SOV, fromSlot: 5, toPlanetId: ARIS, toSlot: 0,
+      departAt: move.departAt, arriveAt: T, mode: 'thrusters', bookedAt: move.departAt, fuel: 1, fuelDrawn: 1,
+    };
+    const pin: StationMove = {
+      ...came, fromPlanetId: ARIS, fromSlot: 0, departAt: T, arriveAt: T + 1, bookedAt: T + 10, settles: came, fuel: 0, fuelDrawn: 0,
+    };
+    const tow: StationMove = {
+      ...came, fromPlanetId: ARIS, fromSlot: 0, toPlanetId: SOV, toSlot: 5, departAt: T - 1, arriveAt: T + 100_000,
+      bookedAt: T - 1, mode: 'tug', tugRoomId: 'tug-room',
+    };
+    const cancel: StationMove = {
+      ...tow, mode: 'thrusters', tugRoomId: undefined, toPlanetId: ARIS, toSlot: 0, departAt: T, arriveAt: T + 1,
+      bookedAt: T + 10, settles: tow, fuel: 0, fuelDrawn: 0,
+    };
+    for (const k0 of [pin, cancel]) {
+      store.clear();
+      setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'k0' ? k0 : null));
+      setKnownPlacesResolver(() => Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+      // Aris was full: this station went home.
+      expect(listStations({}, [], T + 2).find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    }
+    // Neither pin is a station between planets, even for its millisecond.
+    expect(stationInTransit({ move: pin }, T)).toBe(false);
+    expect(stationInTransit({ move: cancel }, T)).toBe(false);
+    expect(stationInTransit({ move: came }, T - 1)).toBe(true);
+  });
+
+  it('bounces an arrival with no slot to take, its own gone and the rest kept for arrivals on their way, when home has room', () => {
+    const move = { ...moveTo(), bookedAt: moveTo().departAt };
+    const T = move.arriveAt;
+    // Another station bound for Aris slot 15, leaving after this one got there.
+    const inbound: StationMove = {
+      ...move, stationId: 'r', welcomeRoomId: 'r', fromPlanetId: SOV, fromSlot: 9, toSlot: 15,
+      departAt: T + 1000, arriveAt: T + 100_000, bookedAt: T + 1000,
+    };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : st.welcomeRoomId === 'r' ? inbound : null));
+    // Aris slots 0-14 held, slot 0 (the one this move booked) by a station
+    // that did not know it was coming; with Sovereign full too, or not.
+    const places = (homeFull: boolean, comingToo = true): KnownPlace[] => [
+      ...Array.from({ length: 15 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })),
+      ...(comingToo ? [{ welcomeRoomId: 'r', planetId: SOV, orbitSlot: 9 }] : []),
+      ...(homeFull ? Array.from({ length: 16 }, (_, i) => ({ welcomeRoomId: `h${i}`, planetId: SOV, orbitSlot: i })) : []),
+    ];
+    const furlong = (t: number) => listStations({}, [], t).find((s) => s.id === DEFAULT_STATION_ID);
+    setKnownPlacesResolver(() => places(false));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    // …for good: once the other has arrived too.
+    expect(furlong(T + 200_000)).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    // With no room at home either, it shares the slot its move booked.
+    store.clear();
+    setKnownPlacesResolver(() => places(true));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: ARIS, orbitSlot: 0 });
+    // One settled at Aris stays there, whatever is kept there later.
+    store.clear();
+    setKnownPlacesResolver(() => places(false, false));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: ARIS, orbitSlot: 15 });
+    setKnownPlacesResolver(() => places(false));
+    expect(furlong(T + 50_000)).toMatchObject({ planetId: ARIS });
+  });
+
+  it('refuses a record that would crowd a full planet, and leaves its arrival where it settled', () => {
+    const move = { ...moveTo(), toSlot: 15, bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    setKnownPlacesResolver(() => Array.from({ length: 15 }, (_, i) => ({ welcomeRoomId: `k${i}`, planetId: ARIS, orbitSlot: i })));
+    vi.useFakeTimers({ now: move.arriveAt + 60_000, toFake: ['Date'] });
+    try {
+      const newcomer: StationRecord = { id: 'newcomer', name: 'NEW', planetId: ARIS, orbitSlot: 15, welcomeRoomId: 'n-room' };
+      // Not settled yet when the record is tried, too: only the list as it
+      // stands settles it.
+      expect(registerStation(newcomer, { reservations: false })).toBe(false);
+      expect(registerStation(newcomer)).toBe(false);
+      expect(listStations().find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 15 });
+      expect(listStations().some((s) => s.id === 'newcomer')).toBe(false);
+      expect(registerStation({ ...newcomer, planetId: SOV, orbitSlot: 3 })).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('settles an arrival next to a station heard of as an install listing it does', () => {
+    // Furlong books Aris slot 3; a station registered there since is listed
+    // on one install and only heard of on another.
+    const move = { ...moveTo(), toSlot: 3, bookedAt: moveTo().departAt };
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? move : null));
+    const resident: StationRecord = { id: 'res', name: 'RES', planetId: ARIS, orbitSlot: 3, welcomeRoomId: 'res-room' };
+    const after = move.arriveAt + 1;
+    const listing = listStations({}, [resident, { ...resident, id: 'two', orbitSlot: 1, welcomeRoomId: 'two-room' }], after);
+    expect(listing.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 4 });
+    store.clear();
+    setKnownPlacesResolver(() => [
+      { welcomeRoomId: 'res-room', planetId: ARIS, orbitSlot: 3 },
+      { welcomeRoomId: 'two-room', planetId: ARIS, orbitSlot: 1 },
+    ]);
+    const heard = listStations({}, [], after);
+    expect(heard.find((s) => s.id === DEFAULT_STATION_ID)).toMatchObject({ planetId: ARIS, orbitSlot: 4 });
+    expect(heard.some((s) => s.welcomeRoomId === 'res-room' || s.welcomeRoomId === 'two-room')).toBe(false);
+  });
+
+  it('keeps the last free slot for the station booked into it, over a clash loser and a derived station', () => {
+    // Fourteen stations beside Furlong leave Sovereign slot 15 free, and a
+    // station at Aris books it.
+    const residents: StationRecord[] = Array.from({ length: 14 }, (_, i) => (
+      { id: `sov-${i + 1}`, name: `S${i + 1}`, planetId: SOV, orbitSlot: i + 1, welcomeRoomId: `s${i + 1}` }));
+    const aris: StationRecord = { id: 'aris-a', name: 'A', planetId: ARIS, orbitSlot: 0, welcomeRoomId: 'a' };
+    const inbound: StationMove = {
+      ...moveTo(), stationId: 'aris-a', welcomeRoomId: 'a', fromPlanetId: ARIS, fromSlot: 0, toPlanetId: SOV, toSlot: 15,
+    };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'a' ? inbound : null));
+    const atlas = { 'd-room': { roomId: 'd-room', name: 'DERIVED', doors: {}, lastSeen: 0 } };
+    const late: StationRecord = { id: 'late', name: 'LATE', planetId: SOV, orbitSlot: 1, welcomeRoomId: 'z-late' };
+    // While it is on its way, neither a derived station nor a record that
+    // loses a clash takes it: they go unlisted.
+    for (const t of [inbound.departAt - 1, (inbound.departAt + inbound.arriveAt) / 2]) {
+      const list = listStations(atlas, [...residents, aris, late], t);
+      expect(list.some((s) => s.derived || s.id === 'late')).toBe(false);
+      expect(list.filter((s) => s.planetId === SOV && s.orbitSlot === 15)).toEqual([]);
+    }
+    // It lands there.
+    const landed = listStations(atlas, [...residents, aris, late], inbound.arriveAt + 1);
+    expect(landed.find((s) => s.id === 'aris-a')).toMatchObject({ planetId: SOV, orbitSlot: 15 });
+    expect(landed.some((s) => s.derived || s.id === 'late')).toBe(false);
+  });
+
   it('shares where an arrival settled, so installs that judged it differently agree', () => {
     const move = { ...moveTo(), bookedAt: moveTo().departAt };
     const full: StationRecord[] = Array.from({ length: 16 }, (_, i) => (
@@ -555,6 +905,33 @@ describe('moves between installs', () => {
     doc.getMap('stationSummaries').set('yard-lobby', summary);
     bindPlanetSummaryDoc(doc, { currentStation: () => null, localTrim: () => null, ship: () => null });
     expect(readRememberedMoves()).toEqual([move]);
+  });
+
+  it('holds a dock at any room of a station a far room\'s summaries say is moving, and learns that move', () => {
+    const move = yardMove();
+    rememberMove(move);
+    const summary = summaryForStation(listStations({}, [yard('mine-1')], NOW).find((s) => s.id === 'mine-1')!, null, NOW);
+    expect(summary.move).toEqual(move);
+    store.clear();
+    // The berth's room: nothing booked there, the move only gossiped. Its
+    // station is listed here, with the second room the ship docks at.
+    const doc = new Y.Doc();
+    doc.getMap('stationSummaries').set('yard-lobby', summary);
+    store.set('ssf-station-atlas', JSON.stringify({
+      'yard-lobby': { roomId: 'yard-lobby', name: 'LOBBY', doors: { 'x+': { targetSeed: 'ssf://room#room=yard-annex', targetRoomId: 'yard-annex' } }, lastSeen: 0 },
+      'yard-annex': { roomId: 'yard-annex', name: 'ANNEX', doors: {}, lastSeen: 0 },
+    }));
+    expect(registerStation(yard('mine-1'))).toBe(true);
+    const mid = Math.floor((move.departAt + move.arriveAt) / 2);
+    expect(roomDocLockedByMove(doc, 'yard-annex', mid)).toBe(true);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.departAt - 1)).toBe(false);
+    expect(roomDocLockedByMove(doc, 'yard-annex', move.arriveAt)).toBe(false);
+    expect(roomDocLockedByMove(new Y.Doc(), 'yard-annex', mid)).toBe(false);
+    // Refused there, this install remembers it, and so carries it on.
+    expect(readRememberedMoves()).toEqual([]);
+    rememberMovesIn(doc);
+    expect(readRememberedMoves()).toEqual([move]);
+    expect(roomDocLockedByMove(new Y.Doc(), 'yard-annex', mid)).toBe(true);
   });
 
   it('carries a derived station\'s move although its first record stands', () => {
@@ -940,6 +1317,23 @@ describe('tugs: a torch tow', () => {
         const there = stationBodies([{ ...DEFAULT_STATION_RECORD, planetId: ARIS, orbitSlot: move.toSlot }], NOW)[0];
         const p2 = place(move.arriveAt + 1000);
         expect(p2).toMatchObject({ parentId: ARIS, radius: there.orbitRadius });
+        // Its course is drawn from the burn to arrival, and the marker rides
+        // it: never farther from a point of it than two points are apart.
+        expect(home.course).toBeUndefined();
+        const drawn = moving.course!;
+        expect(drawn.until).toBe(move.arriveAt);
+        const xy = (p: { angle: number; radius: number }) => screenOffset(p.angle, p.radius);
+        const apart = (a: { dx: number; dy: number }, b: { dx: number; dy: number }) => Math.hypot(a.dx - b.dx, a.dy - b.dy);
+        const first = moveTransitPointAt(move, move.departAt)!;
+        expect(apart(xy(drawn.points[0]), xy({ angle: first.angle, radius: (first.radiusKm / AU_KM) * 180 }))).toBeLessThan(1e-9);
+        const gap = Math.max(...drawn.points.slice(1).map((p, i) => apart(xy(p), xy(drawn.points[i]))));
+        expect(Math.min(...drawn.points.map((p) => apart(xy(p), xy(p1))))).toBeLessThanOrEqual(gap);
+        // On screen while it is under way (or yet to leave), gone once there.
+        expect(courseOnScreen(moving, mid, 100, 100, 1)).toHaveLength(drawn.points.length);
+        expect(courseOnScreen(moving, before, 100, 100, 1)).toHaveLength(drawn.points.length);
+        expect(courseOnScreen(moving, move.arriveAt, 100, 100, 1)).toEqual([]);
+        // Built once it has arrived, it has none.
+        expect(stationBodies([{ ...DEFAULT_STATION_RECORD, move }], move.arriveAt)[0].course).toBeUndefined();
       }
     } finally {
       setStationTrimResolver(null);
@@ -985,7 +1379,76 @@ describe('tugs: a torch tow', () => {
     let nest: Record<string, unknown> = { ...base };
     for (let k = 0; k < 100_000; k++) nest = { ...base, settles: nest };
     expect(isStationMove(nest)).toBe(false);
-    expect(isStationMove({ ...base, settles: { ...base } })).toBe(true);
+    expect(isStationMove({ ...pinOf(base), settles: { ...base } })).toBe(true);
+  });
+
+  it('refuses a move between two slots of one planet, an unknown planet read as the default one', () => {
+    const base = moveTo();
+    expect(base.fromPlanetId).toBe(SOV);
+    expect(isStationMove({ ...base, toPlanetId: SOV, toSlot: base.fromSlot + 1 })).toBe(false);
+    expect(isStationMove({ ...base, toPlanetId: 'planet-nowhere', toSlot: base.fromSlot + 1 })).toBe(false);
+    expect(isStationMove({ ...base, toPlanetId: 'planet-nowhere', toSlot: base.fromSlot })).toBe(false);
+    // Going nowhere, written as such, still reads.
+    expect(isStationMove({ ...base, toPlanetId: SOV, toSlot: base.fromSlot })).toBe(true);
+  });
+
+  it('takes a pin only in the form one is written: an arrival as the move got there, a cancel of a tow as it left', () => {
+    const move = moveTo();
+    const arrived = pinOf(move);
+    expect(isStationMove(arrived)).toBe(true);
+    // At either end (home after a bounce), in any slot the list put it in.
+    const home = { ...arrived, fromPlanetId: SOV, toPlanetId: SOV, fromSlot: 7, toSlot: 7 };
+    expect(isStationMove(home)).toBe(true);
+    // Never before the move got there, nor anywhere else, nor anything but
+    // a zero-fuel millisecond in one place.
+    expect(isStationMove({ ...arrived, departAt: move.arriveAt - 60_000, arriveAt: move.arriveAt - 59_999 })).toBe(false);
+    expect(isStationMove({ ...arrived, departAt: move.arriveAt + 1, arriveAt: move.arriveAt + 2 })).toBe(false);
+    const stay: StationMove = { ...move, toPlanetId: SOV, toSlot: move.fromSlot };
+    expect(isStationMove(stay)).toBe(true);
+    expect(isStationMove({ ...pinOf(stay), fromPlanetId: ARIS, toPlanetId: ARIS })).toBe(false);
+    expect(isStationMove({ ...arrived, arriveAt: arrived.arriveAt + 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, fuel: 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, fuelDrawn: 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, toSlot: arrived.toSlot + 1 })).toBe(false);
+    expect(isStationMove({ ...arrived, mode: 'tug', tugRoomId: 'tug-room' })).toBe(false);
+    // A cancel: a tow's, the millisecond after it left, where it left from.
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    const cancel: StationMove = {
+      ...tow, toPlanetId: tow.fromPlanetId, toSlot: tow.fromSlot, departAt: tow.departAt + 1, arriveAt: tow.departAt + 2,
+      mode: 'thrusters', tugRoomId: undefined, bookedAt: tow.departAt + 10, settles: tow, fuel: 0, fuelDrawn: 0,
+    };
+    expect(isCancelPin(cancel)).toBe(true);
+    expect(isStationMove(cancel)).toBe(true);
+    expect(isStationMove({ ...cancel, settles: { ...tow, mode: 'thrusters', tugRoomId: undefined } })).toBe(false);
+    expect(isStationMove({ ...cancel, departAt: tow.departAt + 2, arriveAt: tow.departAt + 3 })).toBe(false);
+    expect(isStationMove({ ...cancel, fromPlanetId: tow.toPlanetId, toPlanetId: tow.toPlanetId })).toBe(false);
+    expect(isStationMove({ ...cancel, fromSlot: tow.fromSlot + 1, toSlot: tow.fromSlot + 1 })).toBe(false);
+  });
+
+  it('refuses a move booked after it leaves: only a pin is written once what it records is over', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const tow = plan.move;
+    // A peer's rival of that tow, leaving beside it but stamped as booked
+    // once it landed: it would read as booked after it (concurrentMoves), so
+    // neither would beat the other and both would be paid for.
+    const rival: StationMove = {
+      ...tow, toSlot: tow.toSlot + 1, tugRoomId: 'other-tug',
+      departAt: tow.departAt + 1, arriveAt: tow.arriveAt + 1, bookedAt: tow.arriveAt + 1,
+    };
+    expect(concurrentMoves(tow, rival)).toBe(false);
+    expect(isStationMove(rival)).toBe(false);
+    expect(isStationMove({ ...rival, bookedAt: rival.departAt })).toBe(true);
+    // One that goes nowhere (a pin) may be stamped later.
+    expect(isStationMove({ ...rival, toPlanetId: rival.fromPlanetId, toSlot: rival.fromSlot })).toBe(true);
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    writeStationMove(tow);
+    doc.getMap('stationMoves').set(`move:9:${rival.departAt}:${rival.welcomeRoomId}`, rival);
+    expect(readMoveFuelDrawn()).toBe(tow.fuel);
+    expect(readStationMove()).toEqual(cleanMove(tow));
   });
 
   it('cancels every tow a tug left behind, not only the latest', () => {
@@ -994,7 +1457,9 @@ describe('tugs: a torch tow', () => {
     const a = plan.move;
     // Two offline tabs of one tug each towed another station (the second
     // booked first, so the first outranks it).
-    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt - 1 };
+    const b: StationMove = {
+      ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt - 1, bookedAt: a.departAt - 1,
+    };
     const d1 = new Y.Doc(); d1.clientID = 1;
     const d2 = new Y.Doc(); d2.clientID = 2;
     bindStationMoveDoc(d1);
@@ -1053,6 +1518,66 @@ describe('tugs: a torch tow', () => {
     expect(isTowing('tug-room', NOW + 2)).toBe(true);
   });
 
+  it('cancels an outbid tow the log has bundled past its cap', () => {
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt + 1, arriveAt: a.arriveAt + 1 };
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    writeStationMove(b);
+    // A sweep has moved the losing tow into a bundle.
+    doc.getMap('stationMoves').set('moveFold:0:0000000000000000', { settled: {}, entries: { [`move:7:${a.departAt}:${a.stationId}`]: a } });
+    store.clear();
+    expect(readMoveFuelDrawn()).toBe(b.fuel);
+    expect(cancelTowLeftBehind('tug-room', { status: 'docked' }, NOW + 1)).toBe(true);
+    const cancel = rememberedMoveFor({ id: a.stationId, welcomeRoomId: a.welcomeRoomId });
+    expect(cancel && isCancelPin(cancel)).toBe(true);
+    expect(cancelTowLeftBehind('tug-room', { status: 'docked' }, NOW + 2)).toBe(false);
+  });
+
+  it('lists a station where it was while another station\'s tow by the same tug outranks its own', () => {
+    bindStationMoveDoc(new Y.Doc());
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    const a = plan.move;
+    const b: StationMove = { ...a, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt + 1, arriveAt: a.arriveAt + 1 };
+    // Heard of both (planet summaries, say), and of no cancel yet.
+    expect(rememberMove(a, NOW)).toBe(true);
+    expect(rememberMove(b, NOW)).toBe(true);
+    installStationMoveResolver();
+    const mid = (b.departAt + b.arriveAt) / 2;
+    const yard: StationRecord = { id: 'yard', name: 'YARD', planetId: SOV, orbitSlot: 2, welcomeRoomId: 'yard-room' };
+    const list = listStations({}, [yard], mid);
+    expect(stationInTransit(list.find((s) => s.id === 'yard')!, mid)).toBe(true);
+    const home = list.find((s) => s.id === DEFAULT_STATION_ID)!;
+    expect(home).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(stationInTransit(home, mid)).toBe(false);
+    expect(rememberedMoveFor({ id: a.stationId, welcomeRoomId: a.welcomeRoomId })).toBeNull();
+  });
+
+  it("leaves a station heard of where it was while another station's tow by the same tug outranks its own", () => {
+    bindStationMoveDoc(new Y.Doc());
+    const plan = planStationTow(towCtx({ drawn: 0 }), ARIS);
+    if (!plan.ok) throw new Error(plan.refusal);
+    // The outbid tow is of a station this install only hears of.
+    const a: StationMove = { ...plan.move, stationId: 'far', welcomeRoomId: 'far-room', fromSlot: 6 };
+    const b: StationMove = { ...plan.move, stationId: 'yard', welcomeRoomId: 'yard-room', toSlot: a.toSlot + 1, departAt: a.departAt + 1, arriveAt: a.arriveAt + 1 };
+    expect(rememberMove(a, NOW)).toBe(true);
+    expect(rememberMove(b, NOW)).toBe(true);
+    setKnownPlacesResolver(() => [{ welcomeRoomId: 'far-room', planetId: SOV, orbitSlot: 6, move: a }]);
+    const mid = (b.departAt + b.arriveAt) / 2;
+    // With no move resolver installed, its summary's move is all there is.
+    expect(knownSlotsAround(ARIS, [], mid, {}).reserved.has(a.toSlot)).toBe(true);
+    // The installed one has heard both tows and keeps the outbid one from
+    // flying, as on an install that lists the station: it holds its slot at
+    // home and books none at Aris.
+    installStationMoveResolver();
+    expect(rememberedMoveFor({ id: 'heard:far-room', welcomeRoomId: 'far-room' })).toBeNull();
+    expect(knownSlotsAround(SOV, [], mid, {}).taken.has(6)).toBe(true);
+    expect(knownSlotsAround(ARIS, [], mid, {}).reserved.has(a.toSlot)).toBe(false);
+  });
+
   it('holds the tow\'s dock from either end, by the room record or a remembered move', () => {
     const plan = planStationTow(towCtx(), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
@@ -1094,7 +1619,10 @@ describe('tugs: a torch tow', () => {
     expect(readStationMove()).toBeNull();
     expect(readMoveFuelDrawn()).toBe(0);
     // A cancel of the winner beats the winner's arrival pin, too.
-    const cancel: StationMove = { ...pin, departAt: winner.departAt + 1, arriveAt: winner.departAt + 2, bookedAt: NOW + 5 };
+    const cancel: StationMove = {
+      ...pin, fromPlanetId: winner.fromPlanetId, fromSlot: winner.fromSlot, toPlanetId: winner.fromPlanetId, toSlot: winner.fromSlot,
+      departAt: winner.departAt + 1, arriveAt: winner.departAt + 2, bookedAt: NOW + 5,
+    };
     expect(isCancelPin(cancel)).toBe(true);
     store.clear();
     bindStationMoveDoc(new Y.Doc());
@@ -1255,6 +1783,177 @@ describe('the move log stays bounded', () => {
     writeStationMove({ ...zero, departAt: zero.departAt + 1, arriveAt: zero.arriveAt + 1 });
     Y.applyUpdate(doc2, Y.encodeStateAsUpdate(peer));
     expect(readMoveFuelDrawn()).toBe(n);
+  });
+
+  it('counts a record two replicas bundle at once only once', () => {
+    const base = new Y.Doc();
+    const baseMap = base.getMap('stationMoves');
+    base.transact(() => {
+      for (let i = 0; i < MOVE_SETTLED_KEEP + 2; i++) baseMap.set(`moveSettled:${100 + i}:1`, { n: 1, drawn: 1, floor: 1, recent: [] });
+    });
+    const zero = { ...hop(1, 0, 0), stationId: 'z', welcomeRoomId: 'z-room', bookedAt: NOW + 5 };
+    // A bundles the two records past the cap; B, which also holds one more,
+    // bundles three at the same time, two of them the same as A's.
+    const a = new Y.Doc();
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(base));
+    bindStationMoveDoc(a);
+    writeStationMove(zero);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(base));
+    b.getMap('stationMoves').set('moveSettled:099:1', { n: 1, drawn: 1, floor: 1, recent: [] });
+    store.clear();
+    bindStationMoveDoc(b);
+    writeStationMove({ ...zero, departAt: zero.departAt + 1, arriveAt: zero.arriveAt + 1 });
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b));
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    for (const d of [a, b]) {
+      store.clear();
+      bindStationMoveDoc(d);
+      expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 3);
+    }
+    // The next sweep joins the two replicas' bundles; nothing is lost or doubled.
+    writeStationMove({ ...zero, departAt: zero.departAt + 2, arriveAt: zero.arriveAt + 2 });
+    expect(readMoveFuelDrawn()).toBe(MOVE_SETTLED_KEEP + 3);
+  });
+
+  it('reads a bundle up to its cap and refuses one past it, however often it is read', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    const entries = (n: number, from: number) => Object.fromEntries(Array.from({ length: n }, (_, i) => [
+      `move:9:${i}:b${from + i}`, { ...hop(0, 1, 1), stationId: `b${from + i}`, welcomeRoomId: `b${from + i}-room` },
+    ]));
+    map.set('moveFold:1:0000000000000001', { settled: {}, entries: entries(FOLD_ITEMS_MAX, 0) });
+    map.set('moveFold:2:0000000000000002', { settled: {}, entries: entries(FOLD_ITEMS_MAX + 1, 100) });
+    for (let pass = 0; pass < 2; pass++) {
+      store.clear();
+      bindStationMoveDoc(doc);
+      expect(rememberedMoveFor({ id: 'b0', welcomeRoomId: 'b0-room' })).not.toBeNull();
+      expect(rememberedMoveFor({ id: 'b100', welcomeRoomId: 'b100-room' })).toBeNull();
+    }
+    // The next write clears the one past the cap.
+    writeStationMove(hop(1, 1, 1));
+    expect(map.has('moveFold:2:0000000000000002')).toBe(false);
+  });
+
+  it('bundles entries under the longest keys a write makes, and still counts them', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    // The largest client id, a departure with four decimals, and a welcome
+    // room as long as an id may be.
+    const departAt = NOW + 0.2725;
+    const n = MOVE_ENTRIES_KEEP + 2;
+    const keys: string[] = [];
+    doc.transact(() => {
+      for (let i = 0; i < n; i++) {
+        const room = `${i}-`.padEnd(128, 'r');
+        const key = `move:4294967295:${departAt}:${room}`;
+        keys.push(key);
+        map.set(key, { ...hop(0, 1, 1), stationId: `s${i}`, welcomeRoomId: room, departAt, bookedAt: NOW - 10_000 - i });
+      }
+    });
+    expect(keys[0].length).toBeGreaterThan(160);
+    expect(readMoveFuelDrawn()).toBe(n);
+    writeStationMove({ ...hop(1, 0, 0), stationId: 'z', welcomeRoomId: 'z-room', bookedAt: NOW + 5 });
+    expect([...map.keys()].some((k) => k.startsWith('moveFold:'))).toBe(true);
+    expect(keys.filter((k) => map.has(k)).length).toBeLessThan(n);
+    for (let pass = 0; pass < 2; pass++) {
+      store.clear();
+      bindStationMoveDoc(doc);
+      expect(readMoveFuelDrawn()).toBe(n);
+    }
+  });
+
+  it('clears a settled record without its recent list instead of failing a write', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    doc.transact(() => {
+      for (let i = 0; i < MOVE_SETTLED_KEEP + 1; i++) map.set(`moveSettled:${100 + i}:1`, { n: 1, drawn: 0, floor: 0 });
+    });
+    expect(readMoveFuelDrawn()).toBe(0);
+    expect(writeStationMove(hop(0, 10, 10))).toBe(true);
+    expect([...map.keys()].filter((k) => k.startsWith('moveSettled:'))).toEqual([]);
+    expect(readMoveFuelDrawn()).toBe(10);
+  });
+
+  it('finds a station\'s move in a bundle once the log outgrows its cap', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date'] });
+    try {
+      const doc = new Y.Doc();
+      bindStationMoveDoc(doc);
+      const map = doc.getMap('stationMoves');
+      // The yard's move, booked first; then more moves still under way than
+      // the log keeps at its top level, each of another station.
+      const yard = { ...hop(0, 5, 5), bookedAt: NOW - 1_000_000 };
+      writeStationMove(yard);
+      doc.transact(() => {
+        for (let i = 0; i < MOVE_ENTRIES_KEEP + 8; i++) {
+          map.set(`move:666:${i}:o${i}`, { ...hop(0, 1, 1), stationId: `o${i}`, welcomeRoomId: `o${i}-room`, bookedAt: NOW - 1000 + i });
+        }
+      });
+      // The next write's sweep bundles the yard's move.
+      writeStationMove({ ...hop(0, 0, 0), stationId: 'other', welcomeRoomId: 'other-room', bookedAt: NOW });
+      expect([...map.values()].some((v) => (v as StationMove).welcomeRoomId === 'yard-room')).toBe(false);
+      // A fresh install reading this room still places the yard by it.
+      const peer = new Y.Doc();
+      Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+      store.clear();
+      bindStationMoveDoc(peer);
+      expect(rememberedMoveFor({ id: 'yard', welcomeRoomId: 'yard-room' })).toEqual(yard);
+      expect(readRememberedMoves().some((m) => m.welcomeRoomId === 'yard-room')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears a flood of moves still under way, so a fresh install finds the move written after it', () => {
+    vi.useFakeTimers({ now: NOW, toFake: ['Date', 'setTimeout'] });
+    try {
+      const doc = new Y.Doc();
+      bindStationMoveDoc(doc);
+      const map = doc.getMap('stationMoves');
+      doc.transact(() => {
+        for (let i = 0; i < 3 * SWEEP_BATCH; i++) {
+          map.set(`move:666:${i}:f${i}`, { ...hop(0, 1, 1), stationId: `f${i}`, welcomeRoomId: `f${i}-room`, bookedAt: NOW - 10_000 - i });
+        }
+      });
+      const mine = { ...hop(0, 9, 9), departAt: NOW + 3_600_000, arriveAt: NOW + 25 * 3_600_000, bookedAt: NOW + 5 };
+      expect(writeStationMove(mine)).toBe(true);
+      vi.runAllTimers();
+      expect(map.size).toBeLessThanOrEqual(MOVE_SCAN_MAX);
+      const peer = new Y.Doc();
+      Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+      store.clear();
+      bindStationMoveDoc(peer);
+      expect(readStationMove()).toEqual(mine);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears a flood bigger than one sweep over the turns that follow', () => {
+    const doc = new Y.Doc();
+    bindStationMoveDoc(doc);
+    const map = doc.getMap('stationMoves');
+    doc.transact(() => {
+      for (let i = 0; i < 3 * SWEEP_BATCH; i++) map.set(`junk:${i}`, i);
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      writeStationMove(hop(0, 10, 10));
+      // The write itself walked one pass's worth (and its prune one scan).
+      const left = [...map.keys()].filter((k) => k.startsWith('junk:')).length;
+      expect(left).toBeGreaterThanOrEqual(2 * SWEEP_BATCH - MOVE_SCAN_MAX);
+      expect(left).toBeLessThanOrEqual(2 * SWEEP_BATCH);
+      vi.runAllTimers();
+      expect([...map.keys()].filter((k) => k.startsWith('junk:'))).toEqual([]);
+      expect(readMoveFuelDrawn()).toBe(10);
+      expect(readStationMove()?.fuel).toBe(10);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('keeps the meter in range when several writers\' settled totals add past it', () => {

@@ -265,4 +265,16 @@ describe('station keeping: the trim seam', () => {
     setStationTrimResolver(() => { throw new Error('bad trim'); });
     expect(stationOrbit(station(1))).toEqual(slot);
   });
+
+  it('honours a trim anywhere along the orbit: only the radius is bounded', () => {
+    const slot = orbitForSlot(SOV, 1);
+    // Slid or drifted half an orbit from the slot, or a phase0 carrying a long
+    // drift since the epoch: each is a place on the station's own orbit.
+    for (const phase0 of [slot.phase0 + Math.PI, slot.phase0 - 3, 1e7]) {
+      setStationTrimResolver(() => ({ radiusKm: slot.radiusKm + 10, phase0 }));
+      const o = stationOrbit(station(1));
+      expect(o.radiusKm).toBeCloseTo(slot.radiusKm + 10, 9);
+      expect(o.phase0).toBeCloseTo(wrapAngle(phase0), 9);
+    }
+  });
 });
