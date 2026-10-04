@@ -517,8 +517,10 @@ station library (§7).
 
 **Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
 WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → **end-to-end encryption in
-the sender's page** → WebTransport unidirectional streams (one per frame or
-keyframe group; 20 ms Opus frames may use datagrams) → node → iroh fan-out as
+the sender's page** → WebTransport unidirectional streams, one per video
+frame, each carrying one signed frame and verified whole; 20 ms Opus frames
+(or a batch of three) as datagrams, one signed frame or batch per datagram
+→ node → iroh fan-out as
 a `media` lane the node and every hub forward without being able to read →
 viewers' `VideoDecoder` → three.js `VideoFrameTexture` — added upstream in
 early 2025, after the r167 the prototype pins (`three` 0.167.1), so the
@@ -614,9 +616,17 @@ scopes, since an identity is free to mint: per identity, past three
 departures in a minute it is parked — its next admission waits out a
 backoff that doubles each time, and its leaves and returns trigger nothing
 meanwhile; per ORIGIN NODE — the node a subscriber's page is connected
-to, which every per-spoke lease a hub relays names under the hub's own
-attestation (the control plane of #21), a principal a fresh key cannot
-change and a shared hub connection is not: past six departures a minute
+to, which signs every lease it forwards with its own iroh key
+({subscriber identity, origin node id, lease epoch, sequence}, end to end
+to the sender under the hub's relay; the control plane of #21), so the
+origin is never the hub's word: a lease without a valid origin signature
+is charged to the hub link alone, a departure counts against an origin
+only when the origin signed it (its page gone, reported by the node that
+saw it go), and a LAPSE — renewals that stopped arriving — is charged to
+the link that carried them, the hub's, since a hub that withheld an
+honest origin's renewals would otherwise park the honest origin; a
+principal a fresh key cannot change and a shared hub connection is not:
+past six departures a minute
 across every identity behind one origin, that origin is parked — its
 identities evicted in ONE rotation, their re-admissions waiting out the
 doubling backoff together — so a client minting identities interrupts a
@@ -625,9 +635,9 @@ hub are not touched. The quota is enforced in layers, each parking only
 the offender: a hub applies it to each spoke's link at the hub before
 relaying anything (a spoke's departures count against that spoke, never
 the hub), the sender applies it to the origin a lease names, and the
-sender keeps a budget on the hub LINK itself regardless of the origins it
-claims — the origins a hub names are its own word, and a hub minting
-origins beside identities would keep every one under six: past one
+sender keeps a budget on the hub LINK itself regardless of the origins
+behind it — a hub minting origins beside identities, each a fresh key
+that signs its own leases, would keep every one under six: past one
 departure a minute per admitted subscriber behind the link, plus six, the
 link is parked and everything behind it evicted in one rotation, room an
 honest hub with many spokes never needs and a lying one cannot stay
@@ -670,13 +680,18 @@ sources on a browser link, the subscribed sources on a mesh link) plus a
 fifth, and a frame past them is dropped unverified. Inside that
 aggregate, per-source tier buckets, nested: a frame-size ceiling per leg
 from the source's announced tier (an Opus frame with its header, tag and
-signature under 400 bytes; a video frame fragmented into datagrams and
-bounded per tier), and packet-rate and byte-rate ceilings per source with
+signature under 400 bytes; a video frame one WebTransport unidirectional
+stream of its own, per the wire path above, read only up to the tier's
+frame-size ceiling and verified whole before it is forwarded — never
+fragmented into datagrams, which would need fragment ids, loss handling
+and reassembly before any hub could check the signature), and
+packet-rate and byte-rate ceilings per source with
 a short burst allowance, per tier and counted on the WIRE — the tier's
 codec rate plus the per-frame overhead (the 47-byte header, the 16-byte
 tag and the 64-byte signature: 127 bytes a frame, 51 kbps at 50 frames a
 second, more than voice itself, which is why three Opus frames may ride
-one header, tag and signature) plus a fifth: about 100 kbps for the 32
+one header, tag and signature, framed by a count-and-length table inside
+the plaintext) plus a fifth: about 100 kbps for the 32
 kbps voice tier and about 215 kbps for the 128 kbps music tier signed
 frame by frame, a third of the overhead when batched, and 50 frames a
 second plus the batch allowance either way; video the same way from its
@@ -705,14 +720,23 @@ about 51 kbps on a 20 ms Opus stream, more than voice itself and still a
 tenth of an arcade-resolution stream — and some eighty verifications a
 second per source, a few milliseconds of CPU; a sender may sign a batch of
 up to three Opus frames (60 ms) under one header, tag and signature for a
-third of the overhead at 40 ms more latency, while video frames, kilobytes
+third of the overhead at 40 ms more latency — framed inside the plaintext
+so the receiver can cut it back into the encoder's chunks: a one-byte
+count, then one two-byte big-endian length per chunk, then the chunks in
+order, the table under the AEAD and the signature with the rest, bit 1 of
+the flags byte saying a batch is inside, and a batch whose lengths do not
+add up to the payload dropped as malformed; never a bare concatenation,
+which Opus chunks of varying size could not be split again, and never a
+repacketised multi-frame Opus packet, which would mean rewriting the TOC
+in the page — while video frames, kilobytes
 each, are signed one by one. Hash chains and
 signed manifests were considered and rejected: both either make playback
 speculative — a frame heard before its proof cannot be unheard, and a
 subscriber with the group key could inject audible frames until the proof
 was due — or add their interval to the latency. A subscription is signed by the subscriber's identity
-with proof of possession (the P2 lane binding's shape, §9), so no entry is
-forged in another's name, and a forged entry would receive only ciphertext
+with proof of possession (the P2 lane binding's shape, §9) and
+countersigned by the origin node that forwards it, so no entry is forged
+in another's name and no origin in another node's, and a forged entry would receive only ciphertext
 it cannot open. What a hub still sees is the traffic's shape — who sends to
 whom, how often, how much — as with v006's SFU-lite. The lane supersedes
 the WebRTC mesh (#10) only once this layer is in and a forwarding node that
@@ -753,7 +777,8 @@ the link disconnects or stops renewing, so a dead tab never pins a sender on
 and frames are never sent into a dead link; a hub subscribes upstream for
 its spokes — ONE forwarding subscription per hub on the data plane, kept
 only while a live spoke of its own still wants the source — and relays each
-spoke's signed membership lease, and its departure, to the sender
+spoke's signed membership lease, countersigned by the spoke's own node as
+its origin, and its departure, to the sender
 separately on the control plane: the aggregate says where frames go, the
 per-spoke leases say who may open them, because the sender above seals the
 key to each subscriber on admission and rotates on each departure, and a
