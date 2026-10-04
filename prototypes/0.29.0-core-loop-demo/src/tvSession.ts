@@ -47,11 +47,14 @@ export interface LivePlayer {
    *  programme — a live stream after a short film would otherwise be stopped
    *  at the film's length once the theatre closed. */
   started?: () => number;
-  /** Where the media ends, in ms, once the player knows it is finite (a
-   *  file's length); null for a live stream, and before the player knows.
-   *  Remembered here while the player is registered, so the holder's
-   *  headless beat still ends the programme where the media does after the
-   *  theatre is closed (a viewer's player ending stops nothing, by design). */
+  /** Where the media ends, in ms — ONLY when the player knows the media to
+   *  be finite (an HTML element's finite `duration`); null for a live
+   *  stream, before the player knows, and from a player that cannot tell
+   *  (YouTube's API never says whether a video is live, and its duration on
+   *  a live event is elapsed time). Remembered here while the player is
+   *  registered, so the holder's headless beat still ends the programme
+   *  where the media does after the theatre is closed (a viewer's player
+   *  ending stops nothing, by design); never inferred from readings. */
   endMs?: () => number | null;
 }
 
@@ -114,15 +117,16 @@ function parkIfPowerReturned(id: string): void {
 }
 
 /** The end of the media as the player of record reported it, per set, with
- *  the programme it belongs to (`started`), and whether the same end has
- *  been reported on two consecutive ticks: a file's length is constant, a
- *  live event's apparent length grows between ticks (YouTube's getDuration
- *  on a live stream is the time since it began), so only a confirmed end
- *  closes a programme — the headless beat stops nothing on a guess. */
+ *  the programme it belongs to (`started`). Only an end the player KNOWS to
+ *  be finite is ever reported (LivePlayer.endMs) — finiteness is never
+ *  inferred from readings, since a live event's elapsed time can repeat
+ *  between polls before it grows. And should a reported end still move
+ *  within one programme, the programme is unbounded from then on (`endMs:
+ *  null`, sticky until the programme changes): the headless beat stops
+ *  nothing on a value that was true once. */
 interface KnownEnd {
   started: number;
-  endMs: number;
-  confirmed: boolean;
+  endMs: number | null;
 }
 const knownEnds = new Map<string, KnownEnd>();
 
@@ -180,16 +184,17 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
       lastHeadlessBeat.delete(id);
       // Where the media ends, while a player can say: the headless beat
       // below closes the programme there once the theatre is gone. Only
-      // from a player mounted for THIS programme, and only once the same
-      // end has been reported twice in a row; anything else forgets what
-      // was known, so a doubt never stops a programme.
+      // from a player mounted for THIS programme, only an end the player
+      // knows to be finite, and never one that moved within the programme;
+      // anything else forgets what was known, so a doubt never stops a
+      // programme.
       const live = playersOfRecord.get(id);
       const end = live?.endMs?.();
       const forThis = !live?.started || live.started() === rec.started;
       if (forThis && typeof end === 'number' && Number.isFinite(end) && end > 0) {
         const prev = knownEnds.get(id);
-        const confirmed = prev !== undefined && prev.started === rec.started && prev.endMs === end;
-        knownEnds.set(id, { started: rec.started, endMs: end, confirmed });
+        const moved = prev !== undefined && prev.started === rec.started && prev.endMs !== end;
+        knownEnds.set(id, { started: rec.started, endMs: moved ? null : end });
       } else {
         knownEnds.delete(id);
       }
@@ -209,7 +214,7 @@ export function tickTvRoom(itemIds: readonly string[], now = tvNow()): void {
     // viewer's player ending stops nothing; without this the room would
     // read "playing" for good after the holder closed the theatre.
     const known = knownEnds.get(id);
-    if (known && known.confirmed && known.started === rec.started && pb.positionMs >= known.endMs) {
+    if (known && known.endMs !== null && known.started === rec.started && pb.positionMs >= known.endMs) {
       tvStop(id);
       lastHeadlessBeat.delete(id);
       knownEnds.delete(id);
