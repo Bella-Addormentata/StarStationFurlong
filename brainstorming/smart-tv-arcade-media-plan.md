@@ -943,7 +943,29 @@ DEPARTURE is a member whose last lease has been gone for the grace window
 left) or who said leave; it rotates AT ONCE — the sender emits under the
 new epoch from its next frame — and from that rotation the departed can
 open nothing: there is no resuming an epoch, and a return is an ADMISSION
-like any other. Admissions are the side that is batched: a joiner is
+like any other. A lease is renewed against the SENDER'S clock, never a
+clock of its own, or a hub between them could stockpile a live
+subscriber's renewals — each valid on its signature and its rising
+sequence alone — and release one a lease period after the subscriber had
+gone, the sender seeing no lapse and rotating never, the departed
+decrypting on: so the sender emits a signed BEAT every 2 s on the
+reliable lane (`media-beat { source, epoch, beat, nonce }`, the beat
+number rising, the nonce 16 fresh random bytes, under
+`ssf-media-beat:v1`, forwarded by hubs as a `media-config` is), a
+renewal is the subscriber's signature over the LATEST beat's nonce
+besides the rest of its tuple (and the origin node's countersignature
+over the same, below), and the sender accepts a renewal only for its
+current beat or the one before it — a renewal in flight across a beat
+boundary is honest, an older one a lapse in progress — and at most ONCE
+per subscriber and beat, a second under the same beat dropped as the
+replay it is. A stockpile is then worth at most the two beats a hub
+already holds, each usable once, so a departed subscriber's lease lapses
+within one beat interval past the grace — 9 s at the outside against 5
+— and never later; a hub that withholds the beats lapses every spoke
+behind it and is charged for the lapses as below; and the beat runs
+through a paused source as through a playing one, since it is a message
+of its own and never inferred from the frames. Admissions are the side
+that is batched: a joiner is
 pending until the next admission boundary (at most 2 s away), when one
 rotation admits every pending joiner — with the key BEFORE the frames,
 never after. The sender seals the new epoch's key to every subscriber, old
@@ -965,8 +987,9 @@ departures in a minute it is parked — its next admission waits out a
 backoff that doubles each time, and its leaves and returns trigger nothing
 meanwhile; per ORIGIN NODE — the node a subscriber's page is connected
 to, which signs every lease it forwards with its own iroh key
-({subscriber identity, origin node id, lease epoch, sequence}, end to end
-to the sender under the hub's relay; the control plane of #21), so the
+({subscriber identity, origin node id, lease epoch, sequence, the beat
+nonce the renewal answers}, end to end to the sender under the hub's
+relay; the control plane of #21), so the
 origin is never the hub's word: a lease without a valid origin signature
 is charged to the hub link alone, a departure counts against an origin
 only when the origin signed it (its page gone, reported by the node that
@@ -1069,8 +1092,9 @@ already knows the source by — over a versioned domain tag,
 `"ssf-media-frame:v1\n"`, then the frame's header and ciphertext: the tag
 first, as `signBytes.ts` puts one before every envelope it signs, so the
 signature is this message class's and nothing else the same key signs
-(an announcement, a lease, a `media-config`, each under a tag of its own:
-`ssf-media-announce:v1`, `ssf-media-lease:v1`, `ssf-media-config:v1`) can
+(an announcement, a lease, a beat, a `media-config`, each under a tag of
+its own: `ssf-media-announce:v1`, `ssf-media-lease:v1`,
+`ssf-media-beat:v1`, `ssf-media-config:v1`) can
 be replayed as a frame, nor a frame as one of them — verified before
 anything is decoded or played. Nothing plays
 unauthenticated, a lost datagram costs only itself, and a forged frame
@@ -1280,8 +1304,9 @@ the link disconnects or stops renewing, so a dead tab never pins a sender on
 and frames are never sent into a dead link; a hub subscribes upstream for
 its spokes — ONE forwarding subscription per hub on the data plane, kept
 only while a live spoke of its own still wants the source — and relays each
-spoke's signed membership lease, countersigned by the spoke's own node as
-its origin, and its departure, to the sender
+spoke's signed membership lease — each renewal answering the sender's
+latest beat, countersigned by the spoke's own node as its origin — and
+its departure, to the sender
 separately on the control plane: the aggregate says where frames go, the
 per-spoke leases say who may open them, because the sender above seals the
 key to each subscriber on admission and rotates on each departure, and a
