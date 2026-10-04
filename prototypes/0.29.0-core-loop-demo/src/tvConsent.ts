@@ -71,6 +71,46 @@ export function acceptMediaOrigin(origin: string): void {
 
 export function forgetMediaConsent(): void {
   accepted.clear();
+  forgetMountBudget();
+}
+
+/** Automatic mounts the theatre may make on its own, per set, within the
+ *  window: consent per origin bounds nothing cumulative — a modified client
+ *  could rotate shape-valid sources on the viewer's own node, or a product
+ *  lane, and have every open theatre fetch each in turn without end, and no
+ *  cap on one request bounds that. Six in a minute is a holder flipping
+ *  through films, never a script: past it the theatre mounts nothing more
+ *  by itself, shows what is on with PLAY, and the press is the consent that
+ *  mounts it and opens the next window (allowMount). The window refills as
+ *  its mounts age out, so the budget is a rate and never a lock. */
+export const TV_MOUNT_BUDGET = 6;
+export const TV_MOUNT_WINDOW_MS = 60_000;
+
+/** Per set: the monotonic times of the automatic mounts inside the window. */
+const mounts = new Map<string, number[]>();
+
+/** May the theatre mount a new source for `itemId` on its own at `now`? A
+ *  yes is counted; a no counts nothing, so asking again every tick changes
+ *  nothing until a mount ages out of the window or the viewer presses PLAY. */
+export function mayMountNow(itemId: string, now: number): boolean {
+  const recent = (mounts.get(itemId) ?? []).filter((t) => now - t < TV_MOUNT_WINDOW_MS);
+  if (recent.length >= TV_MOUNT_BUDGET) {
+    mounts.set(itemId, recent);
+    return false;
+  }
+  recent.push(now);
+  mounts.set(itemId, recent);
+  return true;
+}
+
+/** The viewer pressed PLAY on a set past its budget: the next mount is
+ *  theirs, and the window starts over. */
+export function allowMount(itemId: string): void {
+  mounts.delete(itemId);
+}
+
+export function forgetMountBudget(): void {
+  mounts.clear();
 }
 
 /** The origin a source's bytes come from. */

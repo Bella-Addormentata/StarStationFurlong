@@ -21,11 +21,13 @@ import type { SeekableRange, TvPlayer } from './tvSync';
 import {
   countdownText, formatClock, iHoldRemote, isStartOnly, mayPickUpRemote, pickUpRemote,
   readPlayback, readRemote, readTv, remoteLapsed, sourceFileUrl, sourceId, sourceLabel,
-  sourceLane, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
+  sourceLane, tvNow, tvPause, tvResume, tvSeek, tvSetVolume, tvStop,
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
-import { acceptMediaOrigin, consentRefusal, mediaConsent, mediaOrigin } from './tvConsent';
+import {
+  acceptMediaOrigin, allowMount, consentRefusal, mayMountNow, mediaConsent, mediaOrigin, TV_MOUNT_BUDGET,
+} from './tvConsent';
 import { SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
 import { suspendStickKeys } from './freeFlightStick';
@@ -656,11 +658,34 @@ function theatreTick(rtt: () => number): void {
     if (consent !== 'ok') {
       showConsentNotice(t, rec.source!, consent);
     } else if (t.mounted !== key && t.mounted !== `failed:${key}`) {
-      mountPlayer(t, rec.source!, key, rtt);
+      // Consent per origin bounds nothing cumulative: a modified client
+      // could rotate shape-valid sources on this viewer's own node and have
+      // every open theatre fetch each in turn without end. So a mount this
+      // theatre makes on its own is counted per set (tvConsent
+      // mayMountNow), and past the budget what is on is shown with PLAY —
+      // the press is the consent that mounts it.
+      if (mayMountNow(t.itemId, tvNow())) mountPlayer(t, rec.source!, key, rtt);
+      else showMountNotice(t, rec.source!, key);
     }
   }
   t.controller?.tick();
   renderTheatreChrome(t);
+}
+
+/** PLAY? — the set's automatic mounts for the minute are spent
+ *  (tvConsent mayMountNow): what is on is shown, and the press mounts it. */
+function showMountNotice(t: Theatre, source: TvSource, key: string): void {
+  // The button under the finger stays — the same ask every tick is one ask —
+  // but only for the SAME programme: the next source gets its own.
+  const asking = t.notice.hidden ? null : t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]');
+  if (asking && asking.dataset.tvMount === key) return;
+  showNotice(t, `<div>▶ PLAY ${escapeHtml(sourceLabel(source))}?</div>
+    <div class="tv-theatre-lane">the programme changed more than ${TV_MOUNT_BUDGET} times in a minute — your browser fetches no more on its own until you say so; whoever holds the remote cannot decide that for you</div>
+    <button type="button" data-tv-mount="${escapeHtml(key)}">▶ PLAY</button>`);
+  t.notice.querySelector<HTMLButtonElement>('[data-tv-mount]')?.addEventListener('click', () => {
+    allowMount(t.itemId);
+    hideNotice(t);
+  });
 }
 
 /** PLAY FROM <host>? — or NOT PLAYED HERE for a host inside a private
