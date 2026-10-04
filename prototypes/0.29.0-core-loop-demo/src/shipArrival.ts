@@ -384,11 +384,14 @@ export function completeArrival(
   }
   writeFlightRecord({ status: 'docked', locationId: rec.locationId });
   if (plan.retarget) writeDoorTombstone(plan.doorId, plan.address, plan.retarget);
-  // The answer belongs to the ship's room: once the player has joined another
-  // room, whose helm is the one shown now, it is not heard.
+  // The answer belongs to the ship's room and to this arrival: once the
+  // player has joined another room (whose helm is the one shown now), or the
+  // ship has left again before the berth answered, it is not heard.
   const shipRoom = currentRoomId();
   const settled = (ok: boolean | void): void => {
     if (currentRoomId() !== shipRoom) return;
+    const flight = readFlightRecord();
+    if (flight.status !== 'docked' || flight.locationId !== rec.locationId) return;
     opts.onSettled?.(ok !== false
       ? { kind: 'docked', stationName: station.name }
       : { kind: 'none', stationName: station.name, reason: 'berths-taken' });

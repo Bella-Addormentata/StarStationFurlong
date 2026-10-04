@@ -49,10 +49,15 @@ export interface StationDestination {
 export interface StationDirectory {
   /** Every known station. The FIRST is home — where an unknown id resolves. */
   stations(): readonly StationDestination[];
-  /** The station the ship's room belongs to right now — the one its docks
-   *  lead into, or (floating free) the ship's own one-module "station" — or
-   *  null when that is not known. Never a destination. */
+  /** The station the ship's room is docked at right now: the one its live
+   *  docks lead into. Null with no live dock (floating free, the ship's own
+   *  one-module station is `own`, never `here`) or when that is not known.
+   *  Never a destination. */
   here?(): string | null;
+  /** Every station the ship's live docks lead into (`here` is one of them):
+   *  a ship docked into two stations at once is at both. Never a
+   *  destination. */
+  docked?(): readonly string[];
   /** The ship's OWN one-module station, when its room is listed as one (a
    *  module docked only by transient docks is its own atlas group) — never a
    *  destination. */
@@ -191,13 +196,15 @@ export function stationHere(): string | null {
 }
 
 /** The stations a ship at `fromId` may fly to: every OTHER station orbiting
- *  the same planet (and never the one its room belongs to right now). */
+ *  the same planet (and never one its room belongs to right now, nor any
+ *  its live docks lead into). */
 export function destinationsFrom(fromId: string): StationDestination[] {
   const from = findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
+  const docked = new Set(directory.docked?.() ?? []);
   return listStations().filter(
-    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own,
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own && !docked.has(s.id),
   );
 }
 
@@ -308,21 +315,51 @@ export function destinationsFromRecords(
   });
 }
 
+/** While withStationSnapshot runs: each source's one read, by source. */
+let snapshot: Map<() => unknown, unknown> | null = null;
+
+/** `read()` once per withStationSnapshot, else on every call. */
+function snapshotted<T>(read: () => T): T {
+  if (!snapshot) return read();
+  if (!snapshot.has(read)) snapshot.set(read, read());
+  return snapshot.get(read) as T;
+}
+
+/** Run `fn` with every lookup in it sharing ONE read of the station record:
+ *  the helm plans a hop to each destination on every render, and the live
+ *  list rebuilds the whole station list (atlas and all) on each read.
+ *  Nothing in `fn` may change the stations; a nested call shares the read. */
+export function withStationSnapshot<T>(fn: () => T): T {
+  if (snapshot) return fn();
+  snapshot = new Map();
+  try {
+    return fn();
+  } finally {
+    snapshot = null;
+  }
+}
+
 /** A directory over the station record: `list` is stations.listStations,
- *  `hereId` the ship room's station (null when floating free); hops follow
- *  the circular-orbit model (orbits.ts). */
+ *  `hereId` the ship room's station (null when floating free), `dockedIds`
+ *  every station its live docks lead into; hops follow the circular-orbit
+ *  model (orbits.ts). */
 export function directoryFromStationRecords(
   list: () => readonly StationRecordLike[],
   seedFor: (roomId: string) => string | undefined,
   hereId: () => string | null,
   ownId: () => string | null = () => null,
+  dockedIds: () => readonly string[] = () => [],
 ): StationDirectory {
+  // Read once per withStationSnapshot: the list, and the destinations
+  // (each looks its seed up in the atlas).
+  const destinations = () => destinationsFromRecords(snapshotted(list), seedFor);
   return {
-    stations: () => destinationsFromRecords(list(), seedFor),
+    stations: () => snapshotted(destinations),
     here: hereId,
+    docked: dockedIds,
     own: ownId,
     plan: (fromId, toId, nowMs) => {
-      const records = list();
+      const records = snapshotted(list);
       return planRecordHop(
         records.find((r) => r.id === fromId),
         records.find((r) => r.id === toId),
