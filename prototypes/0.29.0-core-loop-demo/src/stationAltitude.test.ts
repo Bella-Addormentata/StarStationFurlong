@@ -1086,4 +1086,26 @@ describe('open-orbit places at a station\'s own altitude', () => {
     setStationMoveResolver(null);
     expect(shipPlaceId(rec, Date.now(), null)).toBe(destinationAt);
   });
+
+  it('a flight record from before kept places still finds the altitude its station left', () => {
+    store.clear();
+    const climbed = { ...ctx().station!, orbit: { radiusKm: SOV_R + 1_000, phase0: 0.5 } };
+    const plan = planStationMove(ctx({ station: climbed }), 'planet-aris');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(rememberMove(plan.move, NOW)).toBe(true);
+    const leftAt = plan.move.departAt - 1_000;
+    const rec = { status: 'redocking' as const, locationId: DEFAULT_STATION_ID, departedAt: leftAt, etaAt: leftAt + 1, castOffAt: leftAt };
+    const place = adriftPlace(shipPlaceId(rec, plan.move.departAt + 1, null));
+    expect(place).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(place?.orbit?.radiusKm).toBeCloseTo(SOV_R + 1_000, 6);
+    store.clear();
+  });
+
+  it('a slot orbit spelled out in the place is the slot\'s own', () => {
+    const at = Date.now() - 10 * 86_400_000;
+    const slot = orbitForSlot(SOV, 0);
+    const destinationAt = adriftAt(SOV, 0, { radiusKm: slot.radiusKm, phase0: slot.phase0 });
+    const rec = { status: 'redocking' as const, locationId: DEFAULT_STATION_ID, departedAt: at, etaAt: at + 1, destinationAt };
+    expect(shipPlaceId(rec, Date.now(), null)).toBe(DEFAULT_STATION_ID);
+  });
 });

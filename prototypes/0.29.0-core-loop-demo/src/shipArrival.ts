@@ -31,7 +31,7 @@ import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
   altitudeChangedSince, currentRoomId, dockedStationFor, listStations, onPlaceOrbit, orbitChangeBase, planetById, stationForRoom, stationInTransit,
-  type StationOrbit, type StationRecord,
+  type AdriftPlace, type StationOrbit, type StationRecord,
 } from './stations';
 import { stationFlyingFree } from './freeFlightPilot';
 import {
@@ -398,7 +398,7 @@ export function shipPlaceId(
   const leftAt = rec.castOffAt ?? rec.departedAt;
   const left = keptAt === undefined && (rec.status === 'redocking' || rec.status === 'in-flight') && listed && leftAt !== undefined
     ? stationLeftFrom(listed, leftAt, now) : null;
-  const kept = keptAt ?? (left ? adriftAt(left.planetId, left.orbitSlot) : undefined);
+  const kept = keptAt ?? (left ? adriftAt(left.planetId, left.orbitSlot, left.orbit) : undefined);
   if (kept === undefined || !adriftPlace(kept)) return rec.locationId;
   return isAt(listed, kept, now) ? rec.locationId : kept;
 }
@@ -409,7 +409,14 @@ function isAt(station: StationRecord | null | undefined, placeId: string, now: n
   const place = adriftPlace(placeId);
   return !!station && !!place && !stationInTransit(station, now)
     && planetById(station.planetId).id === place.planetId && station.orbitSlot === place.orbitSlot
-    && onPlaceOrbit(station.orbit, place.orbit);
+    && sameBaseOrbit(station, place);
+}
+
+/** 🎚️ Does `station` fly the open-orbit place's own orbit, both resolved to
+ *  the circle they name (baseOrbit): a slot's orbit spelled out, or left
+ *  out, is the same orbit. */
+function sameBaseOrbit(station: Pick<StationRecord, 'planetId' | 'orbitSlot' | 'orbit'>, place: AdriftPlace): boolean {
+  return onPlaceOrbit(baseOrbit(station), baseOrbit(place));
 }
 
 /** Does `station` fly its base orbit (its slot's, or 🎚️ its own altitude),
@@ -1104,6 +1111,8 @@ export function completeArrival(
   // them, any move that overlapped the time away.
   const movedAway = wasAt && listedNow
     ? planetById(listedNow.planetId).id !== planetById(wasAt.planetId).id || listedNow.orbitSlot !== wasAt.orbitSlot
+      // 🎚️ Or on another altitude there than the one it flew then.
+      || !sameBaseOrbit(listedNow, wasAt)
     : movedMidFlight;
   // 🎚️ An altitude change since cast-off keeps the planet and slot, so it
   // is looked for among every move known, not only the latest.
