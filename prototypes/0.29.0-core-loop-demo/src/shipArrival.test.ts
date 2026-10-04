@@ -299,10 +299,25 @@ describe('a round trip', () => {
 
   it('never evicts a remembered station for a berth the memory would refuse', () => {
     for (let i = 0; i < 32; i++) writeStationBerth(`s${i}`, { doorId: 'north', roomId: HIGH_ROOM });
-    // An overlong peer-written address: berth memory refuses it.
-    const bad = [{ doorId: 'north', state: { ...dockedTo(SEED_FURLONG), address: `${SEED_FURLONG}${'x'.repeat(5000)}` } as ArrivalPort['state'] }];
+    // A peer-written far lateral past the bound door records keep: berth
+    // memory refuses it.
+    const bad = [{ doorId: 'north', state: classifyDockPort(buildDoorPairing(SEED_FURLONG, {
+      segments: dockChain(), farDoor: 'south', farWall: 'y+', farLateral: 99, transient: true, dockedAt: 1000,
+    })) }];
     expect(rememberBerthHere('furlong-station', bad)).toBe(false);
     expect(readStationBerth('s0')).not.toBeNull();
+  });
+
+  it('remembers a berth in a room whose id is longer than a station id, so DEPART can go', () => {
+    // A room id is any non-empty string, as decodeBootstrapSeed, the station
+    // records and the atlas take one; only station ids stop at 128.
+    const room = `furlong-${'r'.repeat(200)}`;
+    const seed = `ssf://room#room=${room}`;
+    writeDoorPairing('north', seed, buildDoorPairing(seed, {
+      segments: dockChain(), farDoor: 'south', farWall: 'y+', transient: true, dockedAt: 1000,
+    }));
+    expect(rememberBerthHere('furlong-station', fakeDocking(['north']).ports())).toBe(true);
+    expect(readStationBerth('furlong-station')?.roomId).toBe(room);
   });
 
   it('forgets the oldest other station to remember this berth when memory is full', () => {
@@ -501,6 +516,20 @@ describe('what the helm hears after an arrival DOCK', () => {
     } finally {
       setStationRoomSource(() => '');
     }
+  });
+
+  it('says nothing once the ship has left again before the berth answers', async () => {
+    let answer: (ok: boolean) => void = () => {};
+    const docking = { ...fakeDocking(['north']), dock: () => new Promise<boolean>((r) => { answer = r; }) };
+    fly('high-orbit', 'furlong-station');
+    const heard: ArrivalOutcome[] = [];
+    expect(completeArrival(docking, { onSettled: (o) => heard.push(o) })?.kind).toBe('docking');
+    // DEPART again while the berth is still answering: the late refusal is
+    // the last station's, never the note for this flight.
+    writeFlightRecord({ status: 'in-flight', locationId: 'furlong-station', destinationId: 'high-orbit', departedAt: 1, etaAt: 2 });
+    answer(false);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(heard).toEqual([]);
   });
 
   it('refused, when the berth is taken — not a green "docking" note left standing', async () => {
