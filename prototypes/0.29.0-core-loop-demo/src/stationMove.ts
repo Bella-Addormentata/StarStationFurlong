@@ -62,7 +62,7 @@ import {
   MAX_ORBIT_SLOTS, PLANETS, altitudeMoveKey, isOrbitChange, knownSlotsAround, orbitChangeBase, lostAltitudeClaims, orbitClaimedAt, setAltitudeHistory, moveBelongsTo,
   planetById, latestMoveOf, setStationMoveResolver, stationForRoom, stationInTransit, stationLeftPlanet,
 } from './stations';
-import type { MovingStation, OrbitChange, StationMove, StationOrbit, StationRecord } from './stations';
+import type { AdriftPlace, MovingStation, OrbitChange, StationMove, StationOrbit, StationRecord } from './stations';
 
 export type { StationMove } from './stations';
 
@@ -1496,7 +1496,7 @@ export function stationLeftFrom(
   station: MovingStation,
   sinceMs: number,
   nowMs: number = Date.now(),
-): { planetId: string; orbitSlot: number } | null {
+): AdriftPlace | null {
   // Its standing move is the last it made (rememberedMoveFor): when even
   // that left before `sinceMs`, none did since.
   const latest = rememberedMoveFor(station);
@@ -1510,7 +1510,14 @@ export function stationLeftFrom(
     if (first && m.departAt >= first.departAt) continue;
     if (!superseded(m, all)) first = m;
   }
-  return first ? { planetId: planetById(first.fromPlanetId).id, orbitSlot: first.fromSlot } : null;
+  if (!first) return null;
+  // 🎚️ On the orbit it flew there: an altitude change's base, else the
+  // custom orbit the move left (its fromOrbit).
+  const from = first.mode === 'orbit' && first.orbit ? orbitChangeBase(first.orbit) : first.fromOrbit;
+  return {
+    planetId: planetById(first.fromPlanetId).id, orbitSlot: first.fromSlot,
+    ...(from ? { orbit: { radiusKm: from.radiusKm, phase0: from.phase0 } } : {}),
+  };
 }
 
 /** Point stations.listStations at the remembered moves. */

@@ -74,7 +74,8 @@ import {
   stationLeftPlanet,
 } from './stations';
 import type { StationRecord } from './stations';
-import { altitudeChangedSince, altitudeChangesSince, altitudeMoveKey, lostAltitudeClaims, setAltitudeHistory } from './stations';
+import { adriftAt, adriftPlace, altitudeChangedSince, altitudeChangesSince, altitudeMoveKey, lostAltitudeClaims, onPlaceOrbit, setAltitudeHistory } from './stations';
+import { castOffPlaces, shipPlaceId } from './shipArrival';
 
 const store = new Map<string, string>();
 (globalThis as { localStorage?: unknown }).localStorage = {
@@ -1044,5 +1045,90 @@ describe('Copilot round 16', () => {
     const station = { id: DEFAULT_STATION_ID, welcomeRoomId: DEFAULT_STATION_RECORD.welcomeRoomId };
     expect(altitudeChangedSince(station, NOW, NOW + 200_000)).toBe(true);
     expect(altitudeChangedSince(station, NOW + 1, NOW + 200_000)).toBe(false);
+  });
+});
+
+describe('open-orbit places at a station\'s own altitude', () => {
+  it('names the altitude in the adrift id, and reads it back only when its planet\'s stations can fly it', () => {
+    const orbit = { radiusKm: SOV_R + 1_234.5, phase0: 0.75 };
+    const id = adriftAt(SOV, 2, orbit);
+    expect(id).toBe(`adrift:${SOV}:2@${orbit.radiusKm},${orbit.phase0}`);
+    expect(adriftPlace(id)).toEqual({ planetId: SOV, orbitSlot: 2, orbit });
+    // The slot's own orbit, or none it could fly: the slot alone.
+    expect(adriftAt(SOV, 2)).toBe(`adrift:${SOV}:2`);
+    expect(adriftAt(SOV, 2, { radiusKm: 1, phase0: 0 })).toBe(`adrift:${SOV}:2`);
+    expect(adriftPlace(`adrift:${SOV}:2`)).toEqual({ planetId: SOV, orbitSlot: 2 });
+    // Malformed or out of band: no place.
+    for (const bad of [`adrift:${SOV}:2@`, `adrift:${SOV}:2@1,`, `adrift:${SOV}:2@x,0`, `adrift:${SOV}:2@1,2,3`, `adrift:${SOV}:2@10,0`]) {
+      expect(adriftPlace(bad)).toBeNull();
+    }
+    expect(onPlaceOrbit(orbit, { ...orbit, phase0: orbit.phase0 + 2 * Math.PI })).toBe(true);
+    expect(onPlaceOrbit(orbit, undefined)).toBe(false);
+    expect(onPlaceOrbit(undefined, undefined)).toBe(true);
+  });
+
+  it('keeps the altitude a destination flew at cast-off in the flight record', () => {
+    const at = Date.now() - 10 * 86_400_000;
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, at);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climb : null));
+    const { destinationAt } = castOffPlaces(adriftAt(SOV, 3), DEFAULT_STATION_ID);
+    expect(adriftPlace(destinationAt!)).toMatchObject({ planetId: SOV, orbitSlot: 0, orbit: { radiusKm: SOV_R + 1_000 } });
+  });
+
+  it('a redocking ship waits at the kept altitude until its station flies it again', () => {
+    const at = Date.now() - 10 * 86_400_000;
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, at);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climb : null));
+    const destinationAt = castOffPlaces(adriftAt(SOV, 3), DEFAULT_STATION_ID).destinationAt!;
+    const rec = { status: 'redocking' as const, locationId: DEFAULT_STATION_ID, departedAt: at, etaAt: at + 1, destinationAt };
+    expect(shipPlaceId(rec, Date.now(), null)).toBe(DEFAULT_STATION_ID);
+    // Back on its slot's orbit since: the same slot, but not that place.
+    setStationMoveResolver(null);
+    expect(shipPlaceId(rec, Date.now(), null)).toBe(destinationAt);
+  });
+
+  it('a flight record from before kept places still finds the altitude its station left', () => {
+    store.clear();
+    const climbed = { ...ctx().station!, orbit: { radiusKm: SOV_R + 1_000, phase0: 0.5 } };
+    const plan = planStationMove(ctx({ station: climbed }), 'planet-aris');
+    if (!plan.ok) throw new Error(plan.refusal);
+    expect(rememberMove(plan.move, NOW)).toBe(true);
+    const leftAt = plan.move.departAt - 1_000;
+    const rec = { status: 'redocking' as const, locationId: DEFAULT_STATION_ID, departedAt: leftAt, etaAt: leftAt + 1, castOffAt: leftAt };
+    const place = adriftPlace(shipPlaceId(rec, plan.move.departAt + 1, null));
+    expect(place).toMatchObject({ planetId: SOV, orbitSlot: 0 });
+    expect(place?.orbit?.radiusKm).toBeCloseTo(SOV_R + 1_000, 6);
+    store.clear();
+  });
+
+  it('a slot orbit spelled out in the place is the slot\'s own', () => {
+    const at = Date.now() - 10 * 86_400_000;
+    const slot = orbitForSlot(SOV, 0);
+    const destinationAt = adriftAt(SOV, 0, { radiusKm: slot.radiusKm, phase0: slot.phase0 });
+    // One place, one id: the slot's orbit is never spelled out, nor read back.
+    expect(destinationAt).toBe(adriftAt(SOV, 0));
+    expect(adriftPlace(`adrift:${SOV}:0@${slot.radiusKm},${slot.phase0 + 2 * Math.PI}`)).toEqual({ planetId: SOV, orbitSlot: 0 });
+    const rec = { status: 'redocking' as const, locationId: DEFAULT_STATION_ID, departedAt: at, etaAt: at + 1, destinationAt };
+    expect(shipPlaceId(rec, Date.now(), null)).toBe(DEFAULT_STATION_ID);
+  });
+
+  it('a ferry resting on a route\'s copy of the slot stays there when its station climbs', () => {
+    const at = Date.now() - 10 * 86_400_000;
+    const rest = { at: adriftAt(SOV, 0), since: at, open: true as const };
+    const rec = { status: 'docked' as const, locationId: DEFAULT_STATION_ID };
+    expect(shipPlaceId(rec, Date.now(), rest)).toBe(DEFAULT_STATION_ID);
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, at + 1_000);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climb : null));
+    expect(shipPlaceId(rec, Date.now(), rest)).toBe(rest.at);
+  });
+
+  it('a place kept before places named an altitude says nothing of it', () => {
+    // Cast off for a station flying 1,000 km, under the old id (slot only):
+    // it has not moved, so the ship is beside it, not left at the slot.
+    const at = Date.now() - 10 * 86_400_000;
+    const climb = climbOf(DEFAULT_STATION_ID, DEFAULT_STATION_RECORD.welcomeRoomId, 0, 1_000, at);
+    setStationMoveResolver((st) => (st.id === DEFAULT_STATION_ID ? climb : null));
+    const rec = { status: 'redocking' as const, locationId: DEFAULT_STATION_ID, departedAt: at + 86_400_000, etaAt: at + 86_400_001, destinationAt: adriftAt(SOV, 0) };
+    expect(shipPlaceId(rec, Date.now(), null)).toBe(DEFAULT_STATION_ID);
   });
 });
