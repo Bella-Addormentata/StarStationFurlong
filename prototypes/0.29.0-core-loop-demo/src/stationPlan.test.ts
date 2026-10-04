@@ -4,9 +4,12 @@
  * the station from the planet's shared summary.
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import * as Y from 'yjs';
 import { atlasLayout, atlasPoses, bindStationAtlasDoc, cleanAtlasOwner, harvestIntoAtlas, readAtlas } from './stationAtlas';
-import { moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
+import { beamPassFor, editAccess, moduleContains, planModuleAt, stationPlan, visitingShips } from './stationPlan';
 import type { ShipSummary } from './planetSummary';
 
 const store = new Map<string, string>();
@@ -511,5 +514,108 @@ describe('ships at or near a station', () => {
     expect(visitingShips(plan, [stale], 'room-a', new Set(['mod-x'])).map((s) => s.roomId)).toEqual(['ship-1']);
     // Taking a module apart drops no other ship.
     expect(visitingShips(plan, [stale], 'room-a', new Set(['ship-9'])).map((s) => s.roomId)).toEqual(['ship-1', 'mod-x']);
+  });
+});
+
+describe('working on a module from the table', () => {
+  it("opens the door panels where you stand, and beams into the station's other modules you hold a pass to", () => {
+    station();
+    const plan = stationPlan(readAtlas(), 'room-a', 'room-a');
+    const held = (id: string) => id === 'room-b';
+    expect(editAccess(plan, 'room-a', held)).toBe('here');
+    expect(editAccess(plan, 'room-b', held)).toBe('beam');
+    // No pass to it: walk there through the station's doors.
+    expect(editAccess(plan, 'room-b', () => false)).toBe('walk');
+    // A docked ship is another vessel, and another station's module or an
+    // unknown room is none of this station's: never beamed into from here.
+    for (const other of ['ship-1', 'far-1', 'nowhere']) expect(editAccess(plan, other, () => true)).toBe('outside');
+  });
+
+  it('beams from nowhere outside the station', () => {
+    station();
+    // Aboard the ship docked at it, at another station, or in a room the
+    // atlas doesn't know: none of the station's modules is where you stand.
+    for (const live of ['ship-1', 'far-1', 'nowhere']) {
+      const plan = stationPlan(readAtlas(), 'room-a', live);
+      expect(editAccess(plan, 'room-b', () => true)).toBe('outside');
+      expect(editAccess(plan, 'room-a', () => true)).toBe('outside');
+    }
+    for (const live of ['far-1', 'nowhere']) {
+      expect(editAccess(stationPlan(readAtlas(), 'room-a', live), 'ship-1', () => true)).toBe('outside');
+    }
+  });
+
+  it('opens the door panels of the docked ship you are aboard', () => {
+    station();
+    const plan = stationPlan(readAtlas(), 'room-a', 'ship-1');
+    expect(plan.ships.find((m) => m.roomId === 'ship-1')?.here).toBe(true);
+    expect(editAccess(plan, 'ship-1', () => false)).toBe('here');
+  });
+});
+
+describe('the pass the table beams in with', () => {
+  it('is the first seed that reaches the room', () => {
+    const real = btoa(JSON.stringify({ roomId: 'room-b' }));
+    expect(beamPassFor('room-b', [null, undefined, '', seed('room-b')])).toBe(seed('room-b'));
+    expect(beamPassFor('room-b', [real, seed('room-b')])).toBe(real);
+    expect(beamPassFor('room-b', [seed('room-c'), real])).toBe(real);
+  });
+
+  it('is never a seed naming another room, an unreadable one, or one for no room', () => {
+    expect(beamPassFor('room-b', [seed('room-c'), 'junk', btoa('{}')])).toBeUndefined();
+    expect(beamPassFor('room-b', [])).toBeUndefined();
+    expect(beamPassFor('', ['junk', seed('room-b')])).toBeUndefined();
+  });
+});
+
+/** The beam's wiring lives in world.ts, devices.ts and main.ts, which these
+ *  tests cannot run, so they read the source. */
+describe('BEAM INTO (source scan)', () => {
+  const source = (file: string) => readFileSync(join(dirname(fileURLToPath(import.meta.url)), file), 'utf8');
+  const between = (text: string, from: string, to: string): string => {
+    const start = text.indexOf(from);
+    expect(start, `${from} not found`).toBeGreaterThan(-1);
+    const end = text.indexOf(to, start + from.length);
+    expect(end, `${to} not found after ${from}`).toBeGreaterThan(start);
+    return text.slice(start, end);
+  };
+
+  it('is offered for the modules editAccess beams into, and only with a pass', () => {
+    const card = between(source('stationPlanView.ts'), 'private renderCard(): void {', 'private renderDisassembly(');
+    expect(card).toContain("const access = editAccess(this.plan, m.roomId, (id) => this.deps.canBeamTo?.(id) ?? false);");
+    const beam = card.indexOf("if (access === 'beam') {");
+    expect(beam).toBeGreaterThan(-1);
+    expect(card.indexOf('this.deps.beamTo?.(m.roomId)')).toBeGreaterThan(beam);
+    expect(card.split('this.deps.beamTo?.(').length).toBe(2);
+    const deps = between(source('devices.ts'), 'stationPlanView = new StationPlanView({', '});');
+    expect(deps).toContain('canBeamTo: (roomId) => stationPlanDeps.canBeamTo?.(roomId) ?? false,');
+    expect(deps).toContain('beamTo: (roomId) => stationPlanDeps.beamTo?.(roomId),');
+    const table = between(source('world.ts'), 'if (device.kind === "mapTable") {', 'deviceFocus.beginFocus(this.player, device, ui);');
+    expect(table).toContain('canBeamTo: (roomId) => !!this.onBeamInto && !!this.roomPassFor?.(roomId),');
+    expect(table).toContain('deviceFocus.releaseThen(() => beam(seed));');
+  });
+
+  it("enters by the ACCESS beam with a pass this install holds, never a door's", () => {
+    const main = source('main.ts');
+    expect(main).toContain('world.roomPassFor = (roomId) => heldPassFor(roomId);');
+    expect(main).toContain('void enterRoomFromPass(seed, (msg) => showHint(msg, 4000));');
+    const held = between(main, 'function heldPassFor(roomId: string): string | undefined {', '\n}');
+    expect(held).toContain('return beamPassFor(roomId, [');
+    expect(held).toContain('passSeed(roomId),');
+    expect(held).toContain('moduleLedger().find((e) => e.roomId === roomId)?.seed,');
+    // A door's seed would pass by its passage policy and lock, and the
+    // atlas's seed for a room may be one (the stub a harvest makes per door).
+    expect(held).not.toContain('targetSeed');
+    expect(held).not.toContain('readAtlas');
+    expect(held).not.toContain('doors');
+  });
+
+  it("holds a neighbour's door seed in the atlas, which is why the beam never reads it", () => {
+    harvestIntoAtlas({
+      roomId: 'room-a', name: 'HUB',
+      doors: [{ doorId: 'east', targetSeed: seed('room-b'), wall: 'x+', lateral: 0, farDoor: 'west', farWall: 'x-', farLateral: 0, transient: false }],
+    });
+    harvestIntoAtlas({ roomId: 'room-b', name: 'DOCKS', doors: [] });
+    expect(readAtlas()['room-b']?.seed).toBe(seed('room-b'));
   });
 });

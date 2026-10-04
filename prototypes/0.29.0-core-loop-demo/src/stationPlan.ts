@@ -8,11 +8,13 @@
  * never walked through, and listed apart from the station's own modules.
  *
  * Pure: the atlas and the planet's ship summaries come in, a plan comes out.
- * stationPlanView.ts draws it and wires the clicks.
+ * stationPlanView.ts draws it and wires the clicks. ✏️ editAccess says how
+ * the table lets you work on a module's doors: from the table in the room
+ * you stand in, else by the ACCESS beam with a pass you hold (beamPassFor).
  */
 
 import type { AtlasEntry, AtlasOwner } from './stationAtlas';
-import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords, ownValue } from './stationAtlas';
+import { atlasComponent, atlasPoses, berthDoorIds, farOnlyRecords, ownValue, roomIdFromSeed } from './stationAtlas';
 import { TILE_SIZE } from './floorPlanDoc';
 import type { ShipSummary } from './planetSummary';
 
@@ -295,4 +297,34 @@ export function visitingShips(
     rank[a.state] - rank[b.state]
     || (a.gate ?? Infinity) - (b.gate ?? Infinity)
     || a.name.localeCompare(b.name));
+}
+
+/**
+ * ✏️ How the holotable lets you work on a module's doors (#192):
+ *  - 'here': you stand in it (a module, or the docked ship you are aboard),
+ *    and its door panels open from the table;
+ *  - 'beam': another module of the station you stand in, one this install
+ *    holds a pass to (`hasPass`): the ACCESS beam takes you in, where its
+ *    own door panels do the editing;
+ *  - 'walk': one you hold no pass to, reached through the station's doors;
+ *  - 'outside': you stand in none of the station's modules (aboard a docked
+ *    ship, or at another station), or it is no module of this station. A
+ *    docked ship is another vessel, never one of the modules you beam into.
+ */
+export function editAccess(
+  plan: StationPlan,
+  roomId: string,
+  hasPass: (roomId: string) => boolean,
+): 'here' | 'beam' | 'walk' | 'outside' {
+  if ([...plan.modules, ...plan.ships].some((x) => x.roomId === roomId && x.here)) return 'here';
+  const m = plan.modules.find((x) => x.roomId === roomId);
+  if (!m || !plan.modules.some((x) => x.here)) return 'outside';
+  return hasPass(roomId) ? 'beam' : 'walk';
+}
+
+/** 🎫 The first of `seeds` that reaches `roomId`, the pass the holotable
+ *  beams in with: a seed naming another room would take you there instead. */
+export function beamPassFor(roomId: string, seeds: ReadonlyArray<string | null | undefined>): string | undefined {
+  if (!roomId) return undefined;
+  return seeds.find((s): s is string => !!s && roomIdFromSeed(s) === roomId);
 }

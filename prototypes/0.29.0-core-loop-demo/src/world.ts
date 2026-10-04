@@ -391,6 +391,14 @@ export class World {
    */
   public isTransitBusy: (() => boolean) | null = null;
   /**
+   * 🗺️ #192: the holotable's BEAM INTO, wired by main.ts like
+   * onAdapterTransit. `roomPassFor` names the pass this install holds for a
+   * room (none: no beam); `onBeamInto` enters a room by its pass, the ACCESS
+   * beam, so the table reaches no room the ACCESS app couldn't.
+   */
+  public roomPassFor: ((roomId: string) => string | undefined) | null = null;
+  public onBeamInto: ((seed: string) => void) | null = null;
+  /**
    * Persistent gangway vestibules, one per PAIRED door (#51). Spawned the
    * frame a door's pairing completes, resting lightly translucent and
    * solidifying as the player approaches; disposed on unpair / morph restart.
@@ -5860,6 +5868,15 @@ export class World {
           })),
         openDoorPanel: (doorId) =>
           deviceFocus.releaseThen(() => this.dockingSystem?.handlePanelRaycast(doorId)),
+        // ✏️ Another module of the station: the ACCESS beam takes you in,
+        // where its own door panels do the editing.
+        canBeamTo: (roomId) => !!this.onBeamInto && !!this.roomPassFor?.(roomId),
+        beamTo: (roomId) => {
+          const seed = this.roomPassFor?.(roomId);
+          const beam = this.onBeamInto;
+          if (!seed || !beam) return;
+          deviceFocus.releaseThen(() => beam(seed));
+        },
         playerId: () => getPlayerId(),
         identityPub: () => getIdentityPub(),
         disassemblyCandidates: () => this.disassemblyCandidates(),
