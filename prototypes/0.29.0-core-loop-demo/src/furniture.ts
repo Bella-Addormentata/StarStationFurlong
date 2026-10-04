@@ -76,7 +76,7 @@ import { readAllDoorLayout, defaultDoorLayoutRecords, doorSetIsMarkedEmpty } fro
 // 🕹️ The helm's two sticks: the door pairings say ship or station, and the
 // station keeping record says when a burn leans the small one.
 import { readAllDoors, subscribeDoors } from "./doorsDoc";
-import { readBurnFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
+import { readHelmFiring, steersStation, subscribeStationKeeping } from "./stationKeeping";
 import { subscribeSharedAtlas } from "./stationAtlas";
 import { currentRoomId, currentStation } from "./stations";
 import type { StationRecord } from "./stations";
@@ -4232,7 +4232,7 @@ function buildHelmSticks(
   // Which hand: the room's pairings (and the atlas's word on their far
   // ends), or its being a station's own welcome room, say ship or station.
   // With it, the station this install places the room in: the stick leans
-  // only for a burn on its orbit (readBurnFiring), as the dashboard shows
+  // only for a burn on its orbit (readHelmFiring), as the dashboard shows
   // it. Both are read again on every door, atlas or station keeping change,
   // as soon as the room changes (on the first join, main.ts names the room
   // only after this console is built, and says nothing when it does), and
@@ -4265,8 +4265,9 @@ function buildHelmSticks(
       let tz = 0;
       // The burn firing now on this station's orbit, whatever order the log
       // keeps (a peer's clock running ahead, or a newer burn on an orbit
-      // another install puts the room in, never hides this one).
-      const firing = bolted ? readBurnFiring(Date.now(), station) : null;
+      // another install puts the room in, never hides this one), or another
+      // of the station's helm rooms' while the helm goes on from its trim.
+      const firing = bolted ? readHelmFiring(Date.now(), station) : null;
       if (firing) {
         if (firing.dir === "raise") tx = -LEAN;
         else if (firing.dir === "lower") tx = LEAN;

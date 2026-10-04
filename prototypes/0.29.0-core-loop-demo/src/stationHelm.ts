@@ -53,13 +53,13 @@ import {
   isBurnLogFull,
   planTrim,
   readBurnFiring,
+  readHelmFiring,
   readOrbitTrim,
   readSharedTrim,
   slotDriftPerHour,
   slotOffsetAt,
   slotOrbit,
   subscribeStationKeeping,
-  trimFor,
   trimmedOrbit,
   writeTrimBurn,
 } from './stationKeeping';
@@ -334,7 +334,9 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
   };
 
   /** The room's burn firing now, on the orbit the dashboard shows. */
-  const firingNow = (now: number): FiredBurn | null => (view ? readBurnFiring(now, view.station) : null);
+  const firingNow = (now: number): FiredBurn | null =>
+    // Or the shared trim's last one, while the helm goes on from that trim.
+    (view ? readHelmFiring(now, view.station) : null);
 
   const refresh = (): void => {
     if (!panel) return;
@@ -394,10 +396,7 @@ export function createStationHelmUI(deps: StationHelmDeps): DeviceUI {
         text = flash.text;
         tone = WARN;
       } else if (view) {
-        // The burn firing on the station's orbit: this room's, or the shared
-        // trim's last one while the helm goes on from it (left out, that).
-        const firing = trim === trimFor(station, c.trim) ? trimFor(station, c.firing ?? null) : undefined;
-        text = describeTrimStatus(view.base, trim, c.now, firing);
+        text = describeTrimStatus(view.base, trim, c.now, firingNow(c.now));
         tone = text.startsWith('ON STATION') ? GREEN : text.startsWith('BURNING') ? AMBER : GOLD;
       } else {
         text = describeRefusal('no-station', c.tanks);

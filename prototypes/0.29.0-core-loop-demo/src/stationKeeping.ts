@@ -93,9 +93,11 @@
  * per-planet summary); until then the holotable and ship transfers keep
  * using the slot's orbit. Every room bolted into a station steers it, and
  * each keeps its own log: once the summary shares the station's trim
- * (setSharedTrimSource), a burn from a room whose own trim is older goes on
- * from the shared one and carries it (TrimBurn.from), so burns from any of
- * the station's helm rooms continue one orbit.
+ * (setSharedTrimSource), a burn from a room whose own trim is not the newer
+ * goes on from the shared one and carries it (TrimBurn.from). Each trim
+ * counts the burns along its line (OrbitTrim.seq), so burns from any of the
+ * station's helm rooms continue one orbit, whatever their clocks
+ * (isNewerTrim).
  *
  * Pure except for the doc binding. Pinned by stationKeeping.test.ts.
  */
@@ -261,6 +263,12 @@ export interface OrbitTrim {
   /** Only on the 'trim' record kept before the burn log: the fuel its burns
    *  had drawn. The log's burns add theirs on top. */
   fuelDrawn?: number;
+  /** How many burns its orbit has had along the line this trim continues:
+   *  each burn adds one to the trim it starts from, in whichever of the
+   *  station's helm rooms it fired (TrimBurn.from), so of two trims on one
+   *  orbit the one further along is the newer, whatever clocks stamped them
+   *  (isNewerTrim). Left out (a trim from before), none. */
+  seq?: number;
 }
 
 /** One burn of the stick, as the log keeps it. Plain JSON. */
@@ -280,8 +288,9 @@ export interface TrimBurn {
   cap?: number;
   /** The station's shared trim this burn went on from, on the same orbit,
    *  when it was newer than this room's own (another of the station's helm
-   *  rooms burned since: readSharedTrim). The replay starts the orbit from
-   *  it at this burn, unless this room's own trim there is newer by then. */
+   *  rooms burned since: readSharedTrim, isNewerTrim). The replay starts the
+   *  orbit from it at this burn, unless this room's own trim there is newer
+   *  by then. */
   from?: OrbitTrim;
 }
 
@@ -328,6 +337,11 @@ const MAX_PLANET_ID_LEN = 128;
  *  continuous either side of `at`). */
 const MAX_AT_MS = ORBIT_EPOCH_MS + 100 * 365.25 * 24 * 3600 * 1000;
 
+/** A trim counts at most this many burns along its line (OrbitTrim.seq): a
+ *  bound on a peer-written count, far below where adding one stops being
+ *  exact. */
+const MAX_TRIM_SEQ = 2 ** 40;
+
 /** A burn takes at most this much fuel: a bound on a peer-written entry, far
  *  above TRIM_FUEL. */
 const MAX_BURN_FUEL = 1_000;
@@ -355,7 +369,8 @@ export function isOrbitTrim(v: unknown): v is OrbitTrim {
     && isBurnTime(r.at)
     && isDirection(r.last)
     && (r.fuelDrawn === undefined
-      || (typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX));
+      || (typeof r.fuelDrawn === 'number' && r.fuelDrawn >= 0 && r.fuelDrawn <= FUEL_METER_MAX))
+    && (r.seq === undefined || (typeof r.seq === 'number' && Number.isInteger(r.seq) && r.seq >= 0 && r.seq <= MAX_TRIM_SEQ));
 }
 
 /** Shape guard for a burn off the wire. */
@@ -403,10 +418,12 @@ export function isKeepingSettlement(v: unknown): v is KeepingSettlement {
       || (Array.isArray(r.fired) && r.fired.length <= MAX_SETTLED_FIRED && r.fired.every(isFiredBurn)));
 }
 
-/** A trim's orbit fields only (a record from before the log also carries
- *  its fuel, which the meter reads apart). */
+/** A trim's orbit fields and its count of burns only (a record from before
+ *  the log also carries its fuel, which the meter reads apart). */
 function cleanTrim(t: OrbitTrim): OrbitTrim {
-  return { planetId: t.planetId, slot: t.slot, dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
+  const out: OrbitTrim = { planetId: t.planetId, slot: t.slot, dRadiusKm: t.dRadiusKm, dPhase: t.dPhase, at: t.at, last: t.last };
+  if (t.seq !== undefined) out.seq = t.seq;
+  return out;
 }
 
 /** Only the fields a fired burn has — what a settlement keeps. */
@@ -567,7 +584,8 @@ export type TrimPlan = { ok: true; burn: TrimBurn; trim: OrbitTrim } | { ok: fal
  * carry over: the burn starts from its slot's own orbit. RAISE / LOWER move
  * the radius a step and keep the station where it is at the burn (its offset
  * from the slot carries across, so nothing jumps); AHEAD / BACK slide it a
- * step along the orbit and keep the radius.
+ * step along the orbit and keep the radius. It counts one burn more along
+ * its line than the trim it found (OrbitTrim.seq).
  */
 export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planetId' | 'slot' | 'dir' | 'at'>): OrbitTrim | null {
   const current = before && before.planetId === burn.planetId && before.slot === burn.slot ? before : null;
@@ -584,7 +602,7 @@ export function applyBurn(before: OrbitTrim | null, burn: Pick<TrimBurn, 'planet
   // peer-written radius that was not a whole step.
   dRadiusKm = Math.round(dRadiusKm * 1000) / 1000;
   if (Math.abs(dRadiusKm) > MAX_TRIM_KM) return null;
-  return { planetId: burn.planetId, slot: burn.slot, dRadiusKm, dPhase: signedAngle(dPhase), at: burn.at, last: burn.dir };
+  return { planetId: burn.planetId, slot: burn.slot, dRadiusKm, dPhase: signedAngle(dPhase), at: burn.at, last: burn.dir, seq: nextSeq(current) };
 }
 
 /** Burn order: by time, then by every other field, so all clients replay
@@ -606,8 +624,7 @@ function burnOrder(a: TrimBurn, b: TrimBurn): number {
 
 /** Where a run of burns leaves the trim, the fuel they drew, and the burns
  *  that fired (in order), each at the time it applied: one stamped before
- *  the start's last burn at that burn's time, and one stamped before the
- *  trim it starts from at that trim's. */
+ *  the start's last burn at that burn's time. */
 export interface BurnRun {
   /** The trim the last burn left, on whichever orbit it trimmed (or the
    *  start's latest). */
@@ -659,6 +676,8 @@ function runBurns(sorted: readonly TrimBurn[], start: readonly OrbitTrim[], star
     const limit = Math.min(FUEL_METER_MAX, ceiling(burn.cap ?? Number.POSITIVE_INFINITY));
     if (fuelDrawn + burn.fuel > limit) continue;
     fuelDrawn += burn.fuel;
+    const at = burn.at < frontier ? frontier : burn.at;
+    const applied = at === burn.at ? burn : { ...burn, at };
     // A burn starts from its own orbit's trim. One that would leave the band
     // changes nothing but still pays, and the trim still dates from it: a
     // settlement keeps the trim's time as its frontier and its last burn as
@@ -666,14 +685,9 @@ function runBurns(sorted: readonly TrimBurn[], start: readonly OrbitTrim[], star
     const key = orbitKey(burn);
     const own = trims.get(key) ?? null;
     // One that went on from the station's shared trim starts there, unless
-    // this room's own trim on the orbit is newer by then.
-    const before = burn.from && (!own || burn.from.at > own.at) ? burn.from : own;
-    // Never before the trim it starts from: one stamped ahead of this room's
-    // clock (a shared trim from a peer running fast) would stay the newer and
-    // hide it.
-    const at = Math.max(burn.at, frontier, before?.at ?? frontier);
-    const applied = at === burn.at ? burn : { ...burn, at };
-    const after = applyBurn(before, applied) ?? heldTrim(before, burn.dir, at);
+    // this room's own trim on the orbit is newer by then (isNewerTrim).
+    const before = burn.from && (!own || isNewerTrim(burn.from, own)) ? burn.from : own;
+    const after = applyBurn(before, applied) ?? heldBurn(before, burn.dir, at);
     if (after) {
       trims.delete(key);
       trims.set(key, after);
@@ -695,6 +709,19 @@ function heldTrim(trim: OrbitTrim | null, dir: TrimDirection, at: number): Orbit
   return { planetId: trim.planetId, slot: trim.slot, dRadiusKm: trim.dRadiusKm, dPhase: slotOffsetAt(base, trim, at), at, last: dir };
 }
 
+/** The count of burns along a line, one burn on from `trim`'s
+ *  (OrbitTrim.seq). */
+function nextSeq(trim: OrbitTrim | null): number {
+  return Math.min(MAX_TRIM_SEQ, (trim?.seq ?? 0) + 1);
+}
+
+/** heldTrim for a burn at the band's edge: it counts along the line all the
+ *  same (OrbitTrim.seq). */
+function heldBurn(trim: OrbitTrim | null, dir: TrimDirection, at: number): OrbitTrim | null {
+  const held = heldTrim(trim, dir, at);
+  return held && { ...held, seq: nextSeq(trim) };
+}
+
 /**
  * Where a run of burns leaves the trim, and the fuel they drew: each burn in
  * time order, from the trim and fuel before them. A burn stamped before
@@ -710,7 +737,7 @@ function heldTrim(trim: OrbitTrim | null, dir: TrimDirection, at: number): Orbit
  * dated from it all the same (heldTrim). Each orbit keeps its own trim
  * (BurnRun.trims): a burn starts from its own orbit's and never undoes
  * another's, or from the shared trim it carries while that is the newer
- * (TrimBurn.from), and never before the trim it starts from.
+ * (TrimBurn.from, isNewerTrim).
  */
 export function replayBurns(
   burns: readonly TrimBurn[],
@@ -721,9 +748,22 @@ export function replayBurns(
   return runBurns([...burns].sort(burnOrder), start ? [start] : [], startFuel, typeof ceiling === 'number' ? () => ceiling : ceiling);
 }
 
+/** Is `a` the newer of two trims on one orbit? The one further along its
+ *  line (OrbitTrim.seq: a burn that went on from a trim stamped ahead of its
+ *  own clock is still the newer), then the later, then the greater by
+ *  content. The same on every client, so the station's helm rooms, and
+ *  whoever shares their trims (setSharedTrimSource), settle on one. */
+export function isNewerTrim(a: OrbitTrim, b: OrbitTrim): boolean {
+  const seqA = a.seq ?? 0;
+  const seqB = b.seq ?? 0;
+  if (seqA !== seqB) return seqA > seqB;
+  if (a.at !== b.at) return a.at > b.at;
+  return JSON.stringify(cleanTrim(a)) > JSON.stringify(cleanTrim(b));
+}
+
 /** The trim a station's helm flies from: the room's own on the station's
- *  orbit, or the station's shared one (readSharedTrim) when that is newer,
- *  left by another of the station's helm rooms. */
+ *  orbit, or the station's shared one (readSharedTrim) when that is newer
+ *  (isNewerTrim), left by another of the station's helm rooms. */
 export function helmTrim(
   station: Pick<StationRecord, 'planetId' | 'orbitSlot'> | null,
   own: OrbitTrim | null,
@@ -731,7 +771,7 @@ export function helmTrim(
 ): OrbitTrim | null {
   const mine = trimFor(station, own);
   const theirs = trimFor(station, shared);
-  return theirs && (!mine || theirs.at > mine.at) ? theirs : mine;
+  return theirs && (!mine || isNewerTrim(theirs, mine)) ? theirs : mine;
 }
 
 /**
@@ -1060,7 +1100,7 @@ function replayLog(ceiling: BurnCeiling): RoomReplay {
       // stamped before then would apply, and fire, only then, so the stick
       // would never wait between them.
       const by = isBurnTime(now) ? now : Number.POSITIVE_INFINITY;
-      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? heldTrim(t, t.last, by)! : t);
+      const held = (t: OrbitTrim): OrbitTrim => cleanTrim(t.at > by ? { ...heldTrim(t, t.last, by)!, seq: t.seq } : t);
       return {
         trim: run.trim && held(run.trim),
         // Every orbit's trim too, so the next replay starts each from its own.
@@ -1128,7 +1168,8 @@ export function readOrbitTrim(station?: Pick<StationRecord, 'planetId' | 'orbitS
 
 /** Where the station's trim comes from beyond this room: its other helm
  *  rooms and other installs, as whoever shares trims between them (the
- *  per-planet summary) knows it. */
+ *  per-planet summary) knows it, each station's newest by isNewerTrim, with
+ *  its count of burns (OrbitTrim.seq). */
 export type SharedTrimSource = (station: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'>) => OrbitTrim | null;
 
 let sharedTrimSource: SharedTrimSource | null = null;
@@ -1183,6 +1224,23 @@ export function readBurnFiring(
   return latest && isFiring(latest, realMs)
     ? { planetId: latest.planetId, slot: latest.slot, dir: latest.dir, at: latest.at }
     : null;
+}
+
+/** The burn firing at `realMs` as the station's helm shows it (its status
+ *  line, knob and box, and the console's trim stick): the shared trim's last
+ *  one while the helm flies from that trim (helmTrim), or this room's own on
+ *  the station's orbit (readBurnFiring), whichever fired later. The stick
+ *  waits for either (planTrim). */
+export function readHelmFiring(
+  realMs: number,
+  station: Pick<StationRecord, 'id' | 'planetId' | 'orbitSlot'> | null,
+): FiredBurn | null {
+  const own = readBurnFiring(realMs, station);
+  const shared = readSharedTrim(station);
+  const theirs = shared && helmTrim(station, readOrbitTrim(station), shared) === shared && isFiring(shared, realMs)
+    ? lastBurnOf(shared)
+    : null;
+  return theirs && (!own || theirs.at > own.at) ? theirs : own;
 }
 
 /** Does the log hold MAX_LOG burns since the last level write settled it?

@@ -34,6 +34,18 @@ function fakeCanvas() {
   return { width: 0, height: 0, getContext: () => ctx };
 }
 
+/** A 2-D context that draws nothing and keeps each fill style it is given. */
+function fillsInto(fills: string[]) {
+  return new Proxy({} as Record<PropertyKey, unknown>, {
+    get: (target, key) => (key in target ? target[key] : () => undefined),
+    set: (target, key, value) => {
+      if (key === 'fillStyle') fills.push(String(value));
+      target[key] = value;
+      return true;
+    },
+  });
+}
+
 /** The console, built and filed as World.registerFurnitureGroup does it. */
 function buildHelm(): { group: THREE.Group; anim: PropAnimHandle; dispose: () => void } {
   const group = buildItemGroup({ id: HELM, kind: 'helm-console', pos: { x: 0, z: 0 }, rot: 0, movable: true });
@@ -168,6 +180,33 @@ describe('the helm console\'s sticks', () => {
       expect(partIn(group, TRIM_STICK).parent!.rotation.x).toBeLessThan(-0.1);
     } finally {
       dispose();
+    }
+  });
+
+  it('leans for another helm room\'s burn while the station flies the shared trim it left', () => {
+    // Copilot's review of #173: the stick read this room's burns alone, so it
+    // stood upright while the dashboard said another room's burn was firing.
+    stubSavedRecords();
+    const doc = new Y.Doc();
+    bindShipDoc(doc);
+    bindStationKeepingDoc(doc);
+    setStationRoomSource(() => 'room-yard');
+    let shared: OrbitTrim | null = null;
+    setSharedTrimSource((st) => (st.id === 'yard' ? shared : null));
+    const { group, anim, dispose } = buildHelm();
+    try {
+      saveAsStation('room-yard');
+      for (let i = 0; i < 4; i++) anim.update(0.25);
+      expect(shown(group, TRIM_STICK)).toBe(true);
+      const gimbal = partIn(group, TRIM_STICK).parent!;
+      expect(Math.abs(gimbal.rotation.z)).toBeLessThan(0.01);
+      shared = { planetId: planetById(DEFAULT_PLANET_ID).id, slot: 1, dRadiusKm: 0, dPhase: 0, at: Date.now(), last: 'ahead', seq: 1 };
+      anim.update(0.1);
+      // AHEAD leans it to the pilot's right.
+      expect(gimbal.rotation.z).toBeGreaterThan(0.1);
+    } finally {
+      dispose();
+      setSharedTrimSource(null);
     }
   });
 });
@@ -470,6 +509,13 @@ describe('the helm dashboard\'s faces', () => {
       const face = keepFace(host)!;
       expect(face.querySelector('#sk-alt').innerHTML).toContain(`(+${TRIM_STEP_KM.toFixed(1)})`);
       expect(face.querySelector('#sk-msg').textContent).toMatch(/^BURNING/);
+      // The knob leans for it, and the box draws its exhaust (Copilot's
+      // review of #173: they read this room's burns alone).
+      const fills: string[] = [];
+      Object.assign(face.querySelector('#sk-box'), { getContext: () => fillsInto(fills) });
+      ui.update(1 / 60);
+      expect(face.querySelector('#sk-knob').style.transform).toMatch(/^translate\(0px, -[\d.]+px\)$/);
+      expect(fills.some((f) => f.startsWith('rgba(255,138,64'))).toBe(true);
       face.querySelector('#sk-well').dispatch('keydown', arrowUp);
       expect(burns()).toEqual([]);
       // Once it has fired, a press goes on from it, and the burn carries it.
