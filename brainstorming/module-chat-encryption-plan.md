@@ -82,7 +82,7 @@ codebase; anyone skim-reading it would reasonably assume DMs are encrypted. They
 ### 1.4 The AEAD already exists — on the node, for something else
 
 The Rust node is **in this repo**, at `prototypes/0.29.0-core-loop-demo/ssf-p2p-node/`, so this is
-directly checkable rather than taken on trust: `seal` at `src/ssf-p2p-node/src/chia_lane.rs:115-127`
+directly checkable rather than taken on trust: `seal` at `ssf-p2p-node/src/chia_lane.rs:115-127`
 and `open` at `:129-138` are XChaCha20-Poly1305 (`:26`) under `derive_enc_key(room_key)` (`:59`),
 with a `record_roundtrip_sign_seal_open_verify` test at `:183` and `chacha20poly1305 = "0.10"` pinned
 at `ssf-p2p-node/Cargo.toml:29`. It is used today for sealed presence records, not chat. The plan
@@ -311,10 +311,10 @@ reason the work is tractable.
 |---|---|---|
 | Ed25519 identity + self-signed name cert | `src/keypair.ts`; `players[id].keyB64/keySig` (`main.ts:3057-3068`, `:3085-3095`), verified on the harvest path at `main.ts:7978-7991` | **the key directory** — the in-room answer to "who is here and what is their key". Reusable, but **not yet trustworthy**: needs first-seen pinning (§3.2.1) |
 | `roomInfo.owner` + the deed | `src/roomOwner.ts`, `src/deeds.ts`, `currentRoomDeedIsMine()` | **the group administrator** — who may rekey and evict. #142 already narrowed the lock-out surfaces to the raw deed holder, which is the correct authority for key management too |
-| `coHosts` map (pub-keyed, owner-granted, revocable) | `src/roomRoles.ts:103-124` | **the second key-holder tier.** Already keyed by Ed25519 pubkey, already revocable, already survives leave/rejoin — structurally this is a key-distribution list that currently distributes nothing |
+| `coHosts` map (pub-keyed, owner-granted, revocable) | `src/roomRoles.ts:103-124` | **the seed for the second key-holder tier.** Already keyed by Ed25519 pubkey, already revocable, already survives leave/rejoin — structurally a key-distribution list that currently distributes nothing. Not sufficient by itself: its write side is UI-gated only, so S3 consumes it as a deed-holder-**signed** `chatGrants` set rather than reading the map directly (§6 S3) |
 | `doorGrants` / `doorRequests`, keyed `${doorId}\|${pub}` | `src/doorPolicy.ts:235-261` | **the request → grant → revoke workflow**, built and UI'd. A chat-key grant is the same record with a different scope; the generalization is already anticipated at `doorPolicy.ts:16-17` |
 | `accessMode` public / pass / keyed | `src/main.ts:7643-7670` | **the policy switch** deciding whether a module is sealed at all. `public` → unsealed by design; `keyed` → sealed. Already deed-holder-gated (`:7667`) |
-| `roomKeyB64` (32 random bytes, per room) | `generateRoomKeyB64` `src/main.ts:612-616`, stored by `getOrCreateRoomKeyB64` `:618-630` | **the epoch *identifier*, and nothing more.** It must **not** seed chat key material: `sendRoomCap` deliberately hands `roomKeyB64` to the node (`network/NetworkProvider.ts:225-250`), so anything derived from it is derived by the node too — §1.1's own finding. Chat epochs need fresh client-only secrets distributed over the pairwise channels (S2); `roomKeyB64` can name which room and which epoch, and it still needs the epoch counter and the rotate-on-membership-change it lacks today |
+| `roomKeyB64` (32 random bytes, per room) | `generateRoomKeyB64` `src/main.ts:612-616`, stored by `getOrCreateRoomKeyB64` `:618-630` | **nothing that chat may reuse — and establishing that is the finding.** It must **not** seed chat key material: `sendRoomCap` deliberately hands `roomKeyB64` to the node (`network/NetworkProvider.ts:225-250`), so anything derived from it is derived by the node too — §1.1's own finding. Chat epochs need fresh client-only secrets distributed over the pairwise channels (S2). Nor may the raw key serve as the public epoch *label*: it travels in the bootstrap blob (`main.ts:7029-7030`, `:8509-8511`) and the node seals presence records under `derive_enc_key(room_key)` (`ssf-p2p-node/src/chia_lane.rs:59`), so printing it beside every ciphertext would hand presence decryption to every passive reader of the doc — a secret spent as an identifier. Label epochs with a **non-invertible tag** instead: `blake3("ssf-chat-epoch:v1" ‖ roomId ‖ epochCounter)`, truncated. That needs no secret at all, and the room still needs the epoch counter and the rotate-on-membership-change it lacks today |
 | Signed contact cards + the friends tier | `src/contacts.ts:145-190` | **the out-of-band channel** for pair setup, and the trust anchor deciding who may be invited |
 | DM pair-doc (deterministic from sorted pubkeys, authenticated) | `src/directMessages.ts:71-103` | **the pairwise channel Sender Keys distributes over.** Seal it first (it is two parties, no group machinery) and the group case inherits a working transport |
 | Co-present settle requests: nonce-bound signed ask → verified answer, with a TTL | `src/copresent.ts:56-57`, `:80-93`, `SETTLE_REQ_TTL_MS` `:99` | **the precedent for an "ask for the current epoch key" exchange.** Already binds `roomId‖nonce‖playerId‖pub`, already re-verifies the name cert, already expires. Its own comment states the posture the rest of this design needs: *"the owner is taken from the SIGNED request, not from any attacker-writable players lookup"* (`:78-79`) |
@@ -383,8 +383,10 @@ correctly. So S0 on its own buys *message integrity*, not *attribution*. Attribu
 identity to be the key (§3.2.1), which is why S0 must also render the author from `keyB64` — name
 plus fingerprint — rather than from the UUID, and why S0 and S1a are best landed together.
 
-*Rationale: encrypting unauthenticated messages buys confidential forgeries. Today any peer can write
-a chat line attributed to anyone, because `authorId` is the UUID. Fix the forgery before the privacy.*
+*Rationale: encrypting unauthenticated messages buys confidential forgeries, so authentication
+comes first. Note precisely what "first" buys, though — S0 on its own does **not** end the
+forgery, because the `authorId` it signs over is still the UUID. S0 **+ S1a** ends it. The rule
+being applied here is "authenticate before you encrypt", not "S0 closes the forgery".*
 
 **S1a — Make the public key the identity (§3.2.1). Blocking for S0's attribution and for S3.**
 Key the directory by `pub` the way `coHosts` and `doorGrants` already are, so the unauthenticated
@@ -394,8 +396,10 @@ from is attacker-writable and the whole design is decoration. Independently valu
 the silent owner-key substitution that `games/gamesDoc.ts:148-157` records as open today.
 
 **S1 — Publish an X25519 key.**
-Mint alongside the Ed25519 seed, publish in the `players` entry and the contact card, carry it in the
-same self-cert. Additive, no wire break, no behaviour change — it just makes S2 possible.
+Mint alongside the Ed25519 seed, publish in the directory entry and the contact card, carry it in the
+same self-cert. Additive, no wire break, no behaviour change — it just makes S2 possible. This entry
+is also where S3's signed prekey and one-time prekeys will sit, so give it room for them now rather
+than reshaping the record twice.
 
 **S2 — Seal DMs (two parties, no group machinery).**
 X25519 ECDH between the pair → HKDF → XChaCha20-Poly1305 over the message payload, riding the
@@ -410,11 +414,30 @@ static-static. It has no forward secrecy and no post-compromise security — com
 private key recomputes every past HKDF output and decrypts any retained ciphertext. That is a
 tolerable, explicitly-scoped trade for DMs with a defined rotation policy (§7). It is **not**
 tolerable as S3's key-distribution channel, because a recorded sender-key distribution would then
-unseal the group's history on a single key compromise. The proportionate fix is cheap and does not
-require the full Double Ratchet: wrap each distribution ECIES-style — a fresh **ephemeral** X25519
-keypair per distribution, ECDH'd against the recipient's static key, ephemeral public attached. That
-buys sender-side forward secrecy for the thing that matters most. Full X3DH + Double Ratchet (§3.1)
-remains the end state for DMs; it is deferred, not dismissed.
+unseal the group's history on a single key compromise.
+
+The proportionate fix does not need the full Double Ratchet, but it does need the **recipient** to
+contribute freshness — and this is where an earlier draft of this document was wrong, in a way
+worth leaving visible. It proposed wrapping each distribution ECIES-style: a fresh ephemeral X25519
+keypair per distribution, ECDH'd against the recipient's static key. That defends against
+compromise of the **sender's** key and nothing else. The threat named one sentence earlier is a
+single key compromise unsealing recorded distributions, and the recipient's static key is exactly
+such a key — so ephemeral-static leaves open the hole it was written to close.
+
+What closes it is the recipient publishing **prekeys**, which is the cheap half of X3DH and needs
+no ratchet: a signed prekey (medium-lived, rotated, signed under the Ed25519 identity key) plus a
+set of one-time prekeys, carried in the same directory entry as the X25519 key S1 adds. A sender
+claims one one-time prekey, ECDHs ephemeral×one-time and ephemeral×signed-prekey, and HKDFs the
+pair; the recipient **deletes the one-time private on use**. After that deletion no key still in
+existence decrypts that distribution — which is the property S3 actually needs. When one-time
+prekeys run out the fallback is signed-prekey-only, which degrades to the rotation interval rather
+than to "forever"; that interval is an owner-facing number and belongs in §7. Note that in a
+peer-writable doc the set can be *drained* as well as honestly exhausted — anyone can claim every
+one-time prekey and force the whole room onto the fallback — so the published set has to be
+replenished on a schedule rather than minted once (§7), which makes draining a treadmill instead
+of a one-shot. It is a downgrade attack, not a break: the floor it downgrades to is the floor S2
+already accepts for DMs. Full X3DH + Double
+Ratchet (§3.1) remains the end state for DMs; it is deferred, not dismissed.
 
 **S3 — Sender Keys for `keyed` modules.**
 Each member derives a chain key + signing key, distributes it over the S2 channels — **not** to
@@ -427,13 +450,30 @@ everyone listed in `players` — and the room's chat lane carries ciphertext.
 > sender keys to every historical visitor *and* to any forged entry, which is precisely the failure
 > §3.2.1 describes.
 
-Distribute instead to an **authorized current set**: the deed holder plus `coHosts`, which is
-pub-keyed, grant-and-revoke, and whose `removeCoHost` genuinely deletes (`roomRoles.ts:103-124`) —
-the structural properties `players` lacks. `coHosts` is still only UI-gated on the write side
-(`roomRoles.ts:20`), so this is a better roster, not yet an enforced one; node-side enforcement
-remains Slice 6. The append-only signed log that would eventually carry grants and revocations is
-named in-tree as `network/RoomLog.ts`, but it is a Phase-2 **stub** today — `append` and `subscribe`
-both throw (`:13-20`) — so it is the destination, not something S3 can be blocked on.
+Distribute instead to an authorized current set that is **signed, not merely written**. That
+distinction is the whole of it, and `coHosts` on its own does not meet it. It is pub-keyed and
+genuinely revocable — `removeCoHost` really deletes (`roomRoles.ts:103-124`), the structural
+property `players` lacks — but its write side is only UI-gated (`roomRoles.ts:20`), so a modified
+client adds itself and an honest member dutifully hands it a sender key. A better roster that is
+still unauthenticated fails the same way `players` does, just less often.
+
+Define a **`chatGrants`** set in the shape `doorGrants` already uses — keyed `${roomId}|${pub}`,
+each record **signed by the deed holder** over canonical bytes binding `roomId‖pub‖epoch‖notBefore`,
+with matching signed revocations. The doc staying peer-writable then stops mattering for this
+purpose: a reader verifies every grant against the deed holder's key and drops what does not
+verify, which is precisely what `verifiedRequestOwner` already does for settle requests — *"the
+owner is taken from the SIGNED request, not from any attacker-writable players lookup"*
+(`copresent.ts:78-79`). That is a real cryptographic gate, client-side, available **today** with no
+node change. It is why S3 is blocked on signing the grant set rather than on Slice 6. `coHosts`
+seeds the initial set and stays the UI for editing it; what changes is that the deed holder signs
+the result and readers check the signature.
+
+Node-side enforcement (Slice 6) is still worth having — it stops forged records being *written*
+rather than merely ignored on read, and it is what makes `roomOwner.ts:26-32` untrue. The
+append-only signed log that should eventually carry these grants is named in-tree as
+`network/RoomLog.ts`, but that file is a Phase-2 **stub** whose `append` and `subscribe` both throw
+(`:13-20`). So it is the destination, not a dependency: the signature discipline above is what
+makes the roster sound in the meantime.
 
 Epoch bumps on every change to that authorized set, driven by the deed holder, which is what finally
 makes eviction mean something (§2.2's first consequence). `public` and `pass` modules stay unsealed —
@@ -454,12 +494,20 @@ node-side enforcement, which remains Slice 6 of the existing plan and is what fi
    leaving.
 2. **Which modules seal.** *Rec: `keyed` only.* Sealing a public town square costs the node's ability
    to merge that state and buys nothing — nobody there expected privacy.
-3. **Who holds the key.** Deed holder alone, or deed holder + `coHosts`? *Rec: + co-hosts* — they
+3. **Who holds the key.** Deed holder alone, or deed holder + co-hosts? *Rec: + co-hosts* — they
    already exist to keep a room alive while the owner is away, and a room whose key dies with its
-   owner has a durability problem (`room-durability-plan.md`).
+   owner has a durability problem (`room-durability-plan.md`). Either way the holder set is
+   distributed as a deed-holder-signed `chatGrants` set, not read from the `coHosts` map directly
+   (§6 S3); the question here is who goes *in* it.
 4. **Library vs. mechanics.** *Rec: mechanics, via `@noble/curves` + `@noble/ciphers`.* §3.4.
 5. **Sender Keys vs. MLS.** *Rec: Sender Keys now, MLS named as end-state.* §3.3.
-6. **Is metadata in scope?** *Rec: explicitly out, and say so in the UI copy.* §5.3. The project has a
+6. **How often do keys rotate, and who notices?** S2's static-static DM channel has no forward
+   secrecy, so its exposure window *is* the rotation interval (§6 S2), and S3's signed prekey sets
+   the same bound whenever a sender exhausts a recipient's one-time prekeys. *Rec: rotate the signed
+   prekey monthly and replenish one-time prekeys on every connect, with rotation silent in the UI* —
+   a prompt here trains people to click through the one dialog that should mean something. The
+   fingerprint-changed warning of S1a stays loud, because that one is not routine.
+7. **Is metadata in scope?** *Rec: explicitly out, and say so in the UI copy.* §5.3. The project has a
    good habit of honest labels — `accessMode`'s own string already admits *"enforced once keyed
    identity ships"* (`main.ts:7648`) — and sealed chat should not claim more than it does.
 
@@ -478,10 +526,14 @@ Stated up front, in the spirit of `keyed-identity-contacts-plan.md` §4:
 - **Metadata.** §5.3. Membership, timing and volume stay visible to the node.
 - **Key substitution in the directory** (see §3.2.1 — the sharpest gap, and it defeats the naive
   design outright rather than merely weakening it).
-- **Forged membership.** Until node-side enforcement lands (Slice 6), a modified client still writes
-  itself into `players`, and `coHosts` is only UI-gated too (`roomRoles.ts:20`). Sealed chat raises
-  the bar but does not clear it: per §3.2.1 a forged entry does **not** need an honest member to be
-  fooled, so "the directory is still peer-written" is the whole of the problem, not a footnote to it.
+- **Forged membership — on the write side.** Until node-side enforcement lands (Slice 6), a modified
+  client still writes itself into `players`, and into `coHosts` too (`roomRoles.ts:20`). What S1a and
+  the signed `chatGrants` set of §6 S3 change is the *read* side: a forged entry no longer earns a
+  sender key, because a reader checks the deed holder's signature before distributing to it. That
+  closes the attack §3.2.1 describes — the one where a forged entry needs no honest member to be
+  fooled — without waiting for the node. It does not stop the junk being written, so the directory
+  still fills with entries nobody authorized, and anything that reads it *without* checking a
+  signature (every consumer listed in §3.2) is still wrong today.
 - **Stale membership.** Nothing removes a `players` entry on leave (`main.ts:3178-3180`), so without
   the S3 roster change above, "everyone in the room" silently means "everyone who has ever been in
   the room".
