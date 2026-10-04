@@ -167,8 +167,9 @@ describe('tickTvRoom', () => {
   it('a holder who closes the theatre still ends a finite programme where the media ends: the headless beat remembers the end', () => {
     pickUpRemote(TV);
     tvPlay(TV, { kind: 'url', url: 'https://example.org/a.mp4' });
-    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, endMs: () => 30_000 });
-    tickTvRoom([TV], now); // the theatre's player is the room's clock: where its media ends is noted
+    const started = readTv(TV).started;
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 25_000, canSeek: () => true, started: () => started, endMs: () => 30_000 });
+    run(1_000); // the theatre's player is the room's clock: where its media ends is noted, and confirmed on the second tick
     tvHeartbeat(TV, 25_000); // the theatre's beat
     unregister(); // the holder closes the theatre at 25 s; the record runs on headlessly
     run(3_000);
@@ -179,9 +180,36 @@ describe('tickTvRoom', () => {
     // A live stream has no end to remember: it runs on.
     tvPlay(TV, { kind: 'url', url: 'https://example.org/live.m3u8' });
     const unregisterLive = registerTvPlayerOfRecord(TV, { positionMs: () => 0, canSeek: () => false, endMs: () => null });
-    tickTvRoom([TV], now);
+    run(1_000);
     unregisterLive();
     run(60_000);
+    expect(readTv(TV).state).toBe('playing');
+  });
+
+  it('an end reported by a player mounted for a programme that has moved on is not filed under the new one', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/short.mp4' });
+    const first = readTv(TV).started;
+    const unregister = registerTvPlayerOfRecord(TV, { positionMs: () => 1_000, canSeek: () => true, started: () => first, endMs: () => 30_000 });
+    run(1_000); // the short film's end, confirmed
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/live.m3u8' }); // the record moves on; the theatre has not remounted yet
+    run(1_000); // room ticks in that gap: the old player's length is not the new programme's
+    unregister(); // the theatre tears the old player down, and the holder closes it
+    run(120_000);
+    expect(readTv(TV).state).toBe('playing'); // never stopped at the short film's length
+  });
+
+  it('an end that grows between ticks (a live event\'s elapsed time) is never taken for an end', () => {
+    pickUpRemote(TV);
+    tvPlay(TV, { kind: 'url', url: 'https://example.org/live.m3u8' });
+    const started = readTv(TV).started;
+    let elapsed = 30_000;
+    const unregister = registerTvPlayerOfRecord(TV, {
+      positionMs: () => elapsed, canSeek: () => false, started: () => started, endMs: () => { elapsed += 500; return elapsed; },
+    });
+    run(3_000);
+    unregister();
+    run(120_000);
     expect(readTv(TV).state).toBe('playing');
   });
 

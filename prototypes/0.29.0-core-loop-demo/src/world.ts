@@ -3088,6 +3088,14 @@ export class World {
     // whose set is gone (no-ops for every other kind).
     if (isTvTheatreOpen(itemId)) closeTvTheatre();
     forgetTv(itemId);
+    // And its WATCH chip, now, not at the next half-second tick: a chip
+    // left clickable in that gap would reopen the removed set's theatre,
+    // which later ticks would never close. Runs pre-splice, so the removed
+    // id is excluded by hand; under the same drive flag as the tick, so a
+    // teardown cannot put a departed room's chip back up.
+    if (tvDriveArmed()) {
+      updateTvChip(FURNITURE.filter((i) => (i.kind === "smart-tv" || i.kind === "tv-stand") && i.id !== itemId).map((i) => i.id));
+    }
     // 🎰🤖 #77B: reclaim the croupier narration edge-detect entry for this table.
     this.croupierNarrated.delete(itemId);
     // 🎰 A roulette table removed mid-round must refund outstanding stakes (the

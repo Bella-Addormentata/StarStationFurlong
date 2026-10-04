@@ -134,7 +134,7 @@ function handToBlock(deps: { myPub: () => string; roomPlayers: () => RoomPlayer[
     .map((p) => `<option value="${esc(p.pub)}">${esc(p.name || p.pub.slice(0, 8))}</option>`)
     .join('');
   return `<div style="display:flex; gap:6px; align-items:center;">
-    <select data-tv-hand-to="${esc(itemId)}" aria-label="Hand the remote to" style="flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:5px 6px;">${options}</select>
+    <select data-tv-hand-to="${esc(itemId)}" aria-label="Hand the remote to" title="↑/↓ choose · Tab moves on to HAND TO · Escape leaves the list" style="flex:1; min-width:0; background:rgba(0,0,0,0.35); border:1px solid rgba(212,168,75,0.3); border-radius:5px; color:${GOLD_BRIGHT}; font-family:inherit; font-size:10px; padding:5px 6px;">${options}</select>
     ${smallButton(`data-tv-hand="${esc(itemId)}"`, '🤝 HAND TO')}
   </div>
   <div style="font-size:9px; color:${DIM}; line-height:1.4;">Everyone this room has seen. A remote handed to someone who has left comes back to the set on its own after 8 s.</div>`;
@@ -335,27 +335,44 @@ function tvAppOnScreen(host: HTMLElement): boolean {
  *  preventDefaults every press), so this view carries its own movement
  *  between controls, the treasury view's pattern: ↑/↓ step through the
  *  visible controls, wrapping; Enter and Space press a button natively. A
- *  slider and a select keep the arrows for their own values, and a text box
- *  its caret keys (←/→, Home, End) — only ↑/↓ leave it. Wired once per host,
- *  in the capture phase: the paste box stops its own keys from bubbling
- *  (typing must not walk the fox), and ↑/↓ must still move out of it. */
+ *  slider and a select keep the arrows for their own values, so from those
+ *  two the way out is Tab / Shift+Tab (next / previous control — the one
+ *  place in the phone where Tab is not its toggle, said on the widget's
+ *  title) or Escape, which leaves the widget for the view so the next
+ *  Escape is the phone's again (the phone's own Escape ignores an INPUT). A
+ *  text box keeps its caret keys (←/→, Home, End) — only ↑/↓ leave it.
+ *  Wired once per host, in the capture phase: the paste box stops its own
+ *  keys from bubbling (typing must not walk the fox), and ↑/↓ must still
+ *  move out of it. */
 function wireTvNav(host: HTMLElement): void {
   if (host.dataset.tvNav) return;
   host.dataset.tvNav = '1';
   host.setAttribute('tabindex', '-1'); // focusable by script, never a tab stop
-  host.addEventListener('keydown', (e) => {
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-    if (e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
-    if (!tvAppOnScreen(host)) return;
-    const target = e.target instanceof HTMLElement ? e.target : null;
-    if (target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === 'range')) return;
+  const move = (e: KeyboardEvent, from: HTMLElement | null, step: number) => {
     const stops = [...host.querySelectorAll<HTMLElement>(NAV_STOPS)].filter((el) => el.offsetParent !== null);
     if (stops.length === 0) return;
     e.preventDefault();
-    e.stopPropagation(); // a move inside the remote is not a key for the world
-    const here = target ? stops.indexOf(target.closest<HTMLElement>(NAV_STOPS) as HTMLElement) : -1;
-    const step = e.key === 'ArrowDown' ? 1 : -1;
+    e.stopPropagation(); // a move inside the remote is not a key for the world, nor the phone's Tab
+    const here = from ? stops.indexOf(from.closest<HTMLElement>(NAV_STOPS) as HTMLElement) : -1;
     stops[here < 0 ? 0 : (here + step + stops.length) % stops.length]!.focus({ preventScroll: true });
+  };
+  host.addEventListener('keydown', (e) => {
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
+    if (!tvAppOnScreen(host)) return;
+    const target = e.target instanceof HTMLElement ? e.target : null;
+    const widget = target instanceof HTMLSelectElement || (target instanceof HTMLInputElement && target.type === 'range');
+    if (widget && e.key === 'Tab') {
+      move(e, target, e.shiftKey ? -1 : 1);
+      return;
+    }
+    if (widget && e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      host.focus({ preventScroll: true });
+      return;
+    }
+    if (e.shiftKey || widget || (e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
+    move(e, target, e.key === 'ArrowDown' ? 1 : -1);
   }, true);
 }
 
@@ -491,7 +508,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
         ${seekable && (pb.state === 'playing' || pb.state === 'paused') ? smallButton(`data-tv-back="${esc(tv.id)}"`, '⏪ 10s') + smallButton(`data-tv-fwd="${esc(tv.id)}"`, '10s ⏩') : ''}
         ${startOnly ? `<span style="font-size:9px; color:${DIM};">start-time sync only — their player has no pause, seek or volume from here</span>` : ''}
         ${smallButton(`data-tv-stop="${esc(tv.id)}"`, '⏹ STOP')}
-        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" style="width:70px;"></label>`}
+        ${startOnly ? '' : `<label style="display:flex; align-items:center; gap:4px; font-size:10px; color:${GOLD};">🔊<input type="range" min="0" max="100" value="${rec.volume}" data-tv-volume="${esc(tv.id)}" aria-label="Set volume" title="↑/↓ or ←/→ set the volume · Tab moves on · Escape leaves the slider" style="width:70px;"></label>`}
       </div>`
     : '';
   const history = rec.history.length

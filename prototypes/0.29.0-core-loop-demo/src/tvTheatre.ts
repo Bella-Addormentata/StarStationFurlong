@@ -86,6 +86,13 @@ export function loadYouTubeApi(timeoutMs = 12_000): Promise<YtNamespace> {
 
 interface Adapter extends TvPlayer {
   destroy(): void;
+  /** The media's length in ms when the player knows it is finite, else
+   *  null: the end the holder's headless beat closes the programme at once
+   *  this theatre is gone (tvSession). Not the seekable range's end — for a
+   *  progressive download from a host without range support that covers
+   *  only the buffered prefix, and the room would be stopped before the
+   *  file ended. */
+  durationMs(): number | null;
 }
 
 class YouTubePlayerAdapter implements Adapter {
@@ -141,9 +148,16 @@ class YouTubePlayerAdapter implements Adapter {
   }
   /** The whole video, once its metadata has said how long it is. */
   seekableRange(): SeekableRange | null {
+    const ms = this.durationMs();
+    return ms === null ? null : { startMs: 0, endMs: ms };
+  }
+  /** getDuration: the video's length — or, on a live event, the time since
+   *  it began, which grows; tvSession takes an end only once it has read
+   *  the same value twice, so a live stream never gets one. */
+  durationMs(): number | null {
     try {
       const seconds = this.player?.getDuration() ?? 0;
-      return seconds > 0 ? { startMs: 0, endMs: seconds * 1000 } : null;
+      return seconds > 0 ? seconds * 1000 : null;
     } catch { return null; }
   }
   setRate(): void { /* YouTube's rate steps are coarse: the controller only seeks */ }
@@ -209,6 +223,12 @@ class HtmlVideoPlayerAdapter implements Adapter {
     if (ranges.length === 0) return null;
     return { startMs: ranges.start(0) * 1000, endMs: ranges.end(ranges.length - 1) * 1000 };
   }
+  /** The element's own `duration`: a file's length, Infinity for a live
+   *  stream (null here), NaN before the metadata (null). */
+  durationMs(): number | null {
+    const seconds = this.video.duration;
+    return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
+  }
   setRate(rate: number): void { this.video.playbackRate = rate; }
   setVolume(volume: number): void { this.video.volume = Math.min(1, Math.max(0, volume / 100)); }
   destroy(): void {
@@ -244,20 +264,10 @@ class ArchiveEmbedAdapter implements Adapter {
   seek(): void { /* no API */ }
   currentMs(): number { return 0; }
   seekableRange(): null { return null; }
+  durationMs(): null { return null; }
   setRate(): void { /* no API */ }
   setVolume(): void { /* no API */ }
   destroy(): void { this.iframe.remove(); }
-}
-
-/** Where a finite media ends, in ms, for the holder's headless beat to close
- *  the programme there once this theatre is gone (tvSession): a file's whole
- *  range, from 0. Null for a live stream — an HTML video with no finite
- *  duration, or a window that does not start at 0 — and for a player that
- *  does not know yet (YouTube before its metadata reports no range). */
-function mediaEndMs(player: Adapter): number | null {
-  if (player instanceof HtmlVideoPlayerAdapter && !Number.isFinite(player.video.duration)) return null;
-  const range = player.seekableRange();
-  return range && range.startMs === 0 && range.endMs > 0 ? range.endMs : null;
 }
 
 // ── The theatre ──────────────────────────────────────────────────────────────
@@ -273,6 +283,11 @@ interface Theatre {
   head: HTMLDivElement;
   player: Adapter | null;
   controller: TvSyncController | null;
+  /** The programme (the record's `started`) the mounted player is for, as
+   *  of this theatre's last tick: tvSession files the player's end under
+   *  that programme alone, so a room tick between a source change and the
+   *  remount cannot put the old player's length on the new programme. */
+  playerFor: number;
   /** The mount key of what the adapter was built for ('' = nothing mounted):
    *  the sourceId, plus the programme's `started` for a start-only embed. */
   mounted: string;
@@ -359,16 +374,18 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
       next.focus();
       return;
     }
-    // Every other key pressed in the dialog stays in it, like its clicks:
-    // the world listens on window, and Enter on a focused button would also
-    // open the quick chat, WASD walk the clone behind the overlay, Space
-    // and E wake whatever the player stands at. The key's own action (the
-    // button's click, the slider's step) is untouched, and keyup is never
-    // held back, so a key held across the open is still released to the
-    // world. A key with nothing focused (the body) is the dialog's too — it
-    // is the one thing open.
-    const target = e.target;
-    if (target === document.body || (target instanceof Node && root.contains(target))) e.stopPropagation();
+    // Every other key pressed while the theatre is topmost stays in it, like
+    // its clicks — WHATEVER has focus: the world listens on window, and
+    // Enter on a focused button would also open the quick chat, WASD walk
+    // the clone behind the overlay, Space and E wake whatever the player
+    // stands at. Focus is not always in the dialog: nothing (the body), or a
+    // button on the phone a hand-over opened above this and Tab then closed
+    // — the phone only slides offscreen and leaves its button focused, and
+    // a key on that hidden button is still a key pressed over this dialog.
+    // The key's own action (the button's click, the slider's step) is
+    // untouched, and keyup is never held back, so a key held across the
+    // open is still released to the world.
+    e.stopPropagation();
   };
   window.addEventListener('keydown', onKey, true);
   theatre = {
@@ -392,6 +409,7 @@ export function openTvTheatre(itemId: string, deps: TheatreDeps = {}): void {
     lastNotice: '',
     onKey,
     opener: document.activeElement instanceof HTMLElement ? document.activeElement : null,
+    playerFor: -1,
   };
   // The dialog takes focus (Tab then reaches its controls); it goes back on close.
   root.tabIndex = -1;
@@ -498,7 +516,10 @@ function mountPlayer(t: Theatre, source: TvSource, key: string, rtt: () => numbe
       t.unregister = registerTvPlayerOfRecord(t.itemId, {
         positionMs: () => controller.positionMs(),
         canSeek: () => player.canSeek,
-        endMs: () => mediaEndMs(player),
+        // The programme this player is for, as this theatre last saw it:
+        // an end it reports belongs to that programme and no later one.
+        started: () => t.playerFor,
+        endMs: () => player.durationMs(),
       });
     }
   };
@@ -561,6 +582,12 @@ function theatreTick(rtt: () => number): void {
       : '<div>❚❚ PAUSED</div><div class="tv-theatre-lane">archive.org\'s player has no pause: it starts from the top when the film resumes</div>');
   } else {
     const key = mountKey(rec.source!, rec.started);
+    // The programme the player is (or is about to be) mounted for — noted
+    // here, on the theatre's own tick, so between a source change and this
+    // tick the registration still names the OLD programme and tvSession
+    // files nothing new under it (a replay of the same source keeps the
+    // player and moves it on to the new programme).
+    t.playerFor = rec.started;
     // This viewer's browser fetches only what this viewer allows
     // (tvConsent): a peer-written URL is asked about first, and one inside
     // a private network is never fetched. Asked of EVERY tick, not only at
