@@ -48,7 +48,7 @@ import { shipDocBound } from './shipDoc';
 import { routeStayOffList } from './pilotRoute';
 import { resolveShipFlight } from './shipRoute';
 // 🚚 Another ferry's leg, where its summary says the route copied its stops.
-import { routeLegEnds, summaryLegEnds } from './planetSummary';
+import { routeLegEnds, routeStayPlace, summaryLegEnds } from './planetSummary';
 import { flightCapable, followsFlightRecord } from './stationDirectory';
 import { MAX_ENTRIES, atlasComponents, atlasLayout, readAtlas } from './stationAtlas';
 import {
@@ -278,15 +278,17 @@ function readSource(now: number): Source {
     // 🚚 A timetable stay at a stop whose station has left the place the
     // route copied (moved planets, or gone): the keeper passes that berth, so
     // with no live dock carrying the ship along it waits on the copy's orbit,
-    // where its next leg leaves from (and where its planet summary puts it).
+    // where its next leg leaves from (and where its planet summary puts it),
+    // untrimmed as that leg.
     if (!aboard && !adrift && places && !places.to) {
       const station = all.find((s) => s.id === places.from.id);
-      adrift = routeStayOffList(
+      const stay = routeStayOffList(
         places,
         station ? { planetId: station.planetId, orbitSlot: station.orbitSlot, moving: reallyMoving(station, now) } : null,
         dockedStationFor(roomId, readAllDoors().values(), atlas, all) !== null,
         (id) => planetById(id).id,
       );
+      adrift = stay && routeStayPlace(stay);
     }
     // Redocking: the ship has arrived where its destination was when it cast
     // off (destinationAt), which a move since then has left: it stays on that

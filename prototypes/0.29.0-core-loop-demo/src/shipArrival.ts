@@ -627,13 +627,36 @@ export function dockedToStation(
  *  docking through `docks` (none: without a dock). An open-orbit place is its
  *  own rest, and a station this install cannot list gives none: either clears
  *  the record, so no earlier stay's rest outlives this arrival. (🚏 A ferry
- *  route's copy-back records its end stop the same way: main.ts.) */
+ *  route's copy-back records its end stop the same way while docked there:
+ *  restAtRouteEnd.) */
 export function restBeside(locationId: string, now: number, docks: string[]): void {
   const st = adriftPlace(locationId) ? undefined : listStations(undefined, undefined, now).find((s) => s.id === locationId);
   const rest = st && !stationInTransit(st, now)
     ? { at: placeOf(st), since: Math.floor(now), docks: [...docks].sort().slice(0, MAX_REST_DOCKS) }
     : null;
   if (!writeRestPlace(rest)) writeRestPlace(null);
+}
+
+/** 🚏🚚 Record where a ferry route's copy-back (main.ts, after STOP) leaves
+ *  the ship at its end stop `locationId`. Docked there through `docks`, it
+ *  rests beside the station its dock carries it with (restBeside). With no
+ *  dock, it is where the timetable left it: on the route's copy of the stop
+ *  (`end`, shipRoute.settleRouteFlight's), which the stop's station may have
+ *  left for another planet or slot (the keeper passes that berth). So it
+ *  rests there, not at the station's new place, and is beside the station
+ *  again only while that is back on that orbit (shipPlaceId). No copy: as
+ *  restBeside. */
+export function restAtRouteEnd(
+  locationId: string,
+  end: { planetId: string; orbitSlot: number } | null,
+  now: number,
+  docks: string[],
+): void {
+  if (docks.length > 0 || !end) {
+    restBeside(locationId, now, docks);
+    return;
+  }
+  if (!writeRestPlace({ at: adriftAt(planetById(end.planetId).id, end.orbitSlot), since: Math.floor(now) })) writeRestPlace(null);
 }
 
 /**

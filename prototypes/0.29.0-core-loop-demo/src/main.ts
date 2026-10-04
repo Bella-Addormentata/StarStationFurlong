@@ -134,7 +134,7 @@ import {
   shipFuelCapacity,
 } from "./devices";
 import {
-  berthPassFor, completeArrival, dockedToStation, keepRestPlace, restBeside, setBerthSeedResolver, shipPlaceId,
+  berthPassFor, completeArrival, dockedToStation, keepRestPlace, restAtRouteEnd, setBerthSeedResolver, shipPlaceId,
 } from "./shipArrival";
 // 🚏 Ferry routes (build notes A4): while a route runs unpaused its timetable
 // is the ship's flight — the resolver below reads it, the 1 Hz watch stands
@@ -2406,13 +2406,17 @@ async function joinRoomAtEpoch(
         raiseRouteFuelCeiling(shipFuelCapacity());
         // 🚚 Handed back to its stored record at its end stop, the ship rests
         // there, docked or not, as an arrival's settle records it: a rest
-        // kept from an earlier stop never outlives the route.
-        if (settleRouteFlight({ dockAnswered: (f) => routeKeeper.dockAnswered(f) }) === "finish") {
-          const docks = (world?.dockingSystem?.listDockPorts() ?? [])
-            .filter((p) => p.state.kind === "docked")
-            .map((p) => p.doorId);
-          restBeside(readFlightRecord().locationId, Date.now(), docks);
-        }
+        // kept from an earlier stop never outlives the route. With no dock,
+        // on the route's copy of that stop, where the timetable left it.
+        settleRouteFlight({
+          dockAnswered: (f) => routeKeeper.dockAnswered(f),
+          finished: (end) => {
+            const docks = (world?.dockingSystem?.listDockPorts() ?? [])
+              .filter((p) => p.state.kind === "docked")
+              .map((p) => p.doorId);
+            restAtRouteEnd(readFlightRecord().locationId, end, Date.now(), docks);
+          },
+        });
       }
       return;
     }

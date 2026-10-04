@@ -29,6 +29,7 @@ import {
   registerLearnedStations,
   resolveStationAlias,
   routeLegEnds,
+  routeStayPlace,
   shipsAroundPlanet,
   subscribePlanetSummary,
   summaryForStation,
@@ -38,6 +39,7 @@ import {
   unbindPlanetSummaryForTest,
 } from './planetSummary';
 import type { PlanetSummaryContext, ShipStatusInput, StationSummary } from './planetSummary';
+import { routeStayOffList } from './pilotRoute';
 import type { RouteFlightPlaces } from './pilotRoute';
 import type { OrbitTrim } from './stationKeeping';
 import {
@@ -1338,6 +1340,46 @@ describe('ships and the solar system', () => {
     }
     // An ordinary flight's ends go by its stations' ids: HAB's trim applies.
     expect(planTransfer(places.from, places.to!, T0)!.to.radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+  });
+
+  // Copilot (PR 180): a stay on the route's copy of a stop whose station is
+  // between planets. This install keeps that station's trim for the slot it
+  // left, which the copy names, but the legs either side of the stay fly
+  // untrimmed (routeLegEnds), so the stay must too.
+  it('🚚 draws a ferry\'s stay at a stop whose station is between planets untrimmed, as the legs either side of it', () => {
+    const now = Date.now();
+    const move: StationMove = {
+      stationId: 'hab', welcomeRoomId: 'room-hab', fromPlanetId: SOV, fromSlot: 2, toPlanetId: ARIS, toSlot: 5,
+      departAt: now - 1000, arriveAt: now + 86_400_000, mode: 'thrusters', fuel: 10, fuelDrawn: 10,
+    };
+    setStationMoveResolver((st) => (st.welcomeRoomId === 'room-hab' ? move : null));
+    try {
+      registerStation(record());
+      const doc = new Y.Doc();
+      bindPlanetSummaryDoc(doc, install('hab', { localTrim: () => trim() }));
+      installTrimResolver();
+      // Listed where it left from until it arrives, its trim with it.
+      const hab = listStations().find((s) => s.id === 'hab')!;
+      expect(hab).toMatchObject({ planetId: SOV, orbitSlot: 2 });
+      expect(stationOrbit(hab).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6);
+      // The ferry's stay at HAB, with no live dock to carry it along: on the
+      // route's copy of the stop, which names HAB by its id here.
+      const places: RouteFlightPlaces = { from: { id: 'hab', planetId: SOV, orbitSlot: 2 }, to: null };
+      const stay = routeStayOffList(places, { planetId: hab.planetId, orbitSlot: hab.orbitSlot, moving: true }, false)!;
+      expect(stay).toEqual(places.from);
+      expect(stationOrbit(stay).radiusKm).toBeCloseTo(orbitForSlot(SOV, 2).radiusKm + 4, 6); // what it was drawn on
+      const drawn = routeStayPlace(stay);
+      expect(drawn).toEqual({ id: 'route-stop:from', planetId: SOV, orbitSlot: 2 });
+      expect(stationOrbit(drawn)).toEqual(orbitForSlot(SOV, 2));
+      // The orbit the leg in ends on and the leg out leaves from.
+      const yard = { id: 'yard', planetId: SOV, orbitSlot: 1 };
+      const legIn = routeLegEnds({ from: yard, to: places.from })!;
+      const legOut = routeLegEnds({ from: places.from, to: yard })!;
+      expect(planTransfer(legIn[0], legIn[1], T0)!.to).toEqual(stationOrbit(drawn));
+      expect(planTransfer(legOut[0], legOut[1], T0)!.from).toEqual(stationOrbit(drawn));
+    } finally {
+      setStationMoveResolver(null);
+    }
   });
 
   it('🚚 an install that first hears of a leg after its next stop moved planets places it where the route copied the stop', () => {
