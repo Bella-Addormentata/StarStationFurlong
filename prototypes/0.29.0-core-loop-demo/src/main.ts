@@ -1438,15 +1438,17 @@ const gateKeeper = createGateKeeper({
   roomId: () => activeBootstrap?.roomId ?? "",
   // 🛰️ Never on a stale replica.
   ready: roomStateArrivedNow,
+  // 🚏🤖 Bounded reads of peer-written maps, null when a peer flooded one:
+  // the keeper then does nothing.
   gates: () =>
-    readAutoFerryGates().map(({ doorId, policy }) => ({
+    readAutoFerryGates()?.map(({ doorId, policy }) => ({
       doorId,
       ...(policy.gate !== undefined ? { gate: policy.gate } : {}),
       ...(policy.gateAccess ? { access: policy.gateAccess } : {}),
       ...(policy.reservedFor ? { reservedFor: policy.reservedFor } : {}),
       record: readDoor(doorId),
-    })),
-  doors: readAllDoors,
+    })) ?? null,
+  doors: readAllDoorsIfComplete,
   door: readDoor,
   ferries: readDepartureFerries,
   open: (address) => (roomSessionDeps ? openRoomSession(roomSessionDeps, address) : Promise.resolve(null)),

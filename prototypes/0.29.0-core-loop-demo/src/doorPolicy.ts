@@ -25,7 +25,7 @@
  */
 
 import * as Y from 'yjs';
-import { LEGACY_ID_WALL, doorExistsIn, hasDoorLayout } from './doorLayoutDoc';
+import { LEGACY_ID_WALL, doorExistsIn, hasDoorLayout, isDoorLayoutRecord } from './doorLayoutDoc';
 
 export type PassageMode = 'public' | 'owner';
 export type ConstructionMode = 'owner' | 'request' | 'public';
@@ -310,14 +310,37 @@ export function readUnnumberedPorts(): string[] {
   return out.sort();
 }
 
+/** 🚏🤖 Most layout keys readAutoFerryGates looks at, junk included: the
+ *  gate keeper reads it once a second, and the map is any peer's to write.
+ *  A room's own doors fit well inside. */
+export const MAX_AUTO_FERRY_LAYOUT_KEYS = 256;
+
 /** 🚏🤖 This room's ports whose owner lets them dock scheduled ferries
- *  automatically (`autoFerry`), with their policies, in door id order. */
-export function readAutoFerryGates(): Array<{ doorId: string; policy: DoorPolicyRecord }> {
+ *  automatically (`autoFerry`), with their policies, in door id order: the
+ *  doors portsIn reads, over a walk of at most MAX_AUTO_FERRY_LAYOUT_KEYS
+ *  layout keys. Null when the layout holds more: the list might leave a gate
+ *  out, and the gate keeper then does nothing. */
+export function readAutoFerryGates(): Array<{ doorId: string; policy: DoorPolicyRecord }> | null {
   if (!docAlive()) return [];
-  return portsIn(boundDoc!, policyMap!)
-    .filter(([, p]) => p.autoFerry === true)
-    .map(([doorId, policy]) => ({ doorId, policy }))
-    .sort((a, b) => (a.doorId < b.doorId ? -1 : a.doorId > b.doorId ? 1 : 0));
+  const doc = boundDoc!;
+  const out: Array<{ doorId: string; policy: DoorPolicyRecord }> = [];
+  const take = (doorId: string): void => {
+    const policy = sanitizePolicy(policyMap!.get(doorId));
+    if (policy.adapter && policy.autoFerry === true) out.push({ doorId, policy });
+  };
+  let scanned = 0;
+  let any = false;
+  for (const [doorId, value] of doc.getMap('doorLayout').entries()) {
+    if (++scanned > MAX_AUTO_FERRY_LAYOUT_KEYS) return null;
+    // doorExistsIn, asked only of a well-formed record: of anything else it
+    // would count the whole map.
+    if (!isDoorLayoutRecord(value) || value.id !== doorId || !doorExistsIn(doc, doorId)) continue;
+    any = true;
+    take(doorId);
+  }
+  // A legacy room keeps no layout records: its doors are the cardinal ones.
+  if (!any) for (const doorId of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, doorId)) take(doorId);
+  return out.sort((a, b) => (a.doorId < b.doorId ? -1 : a.doorId > b.doorId ? 1 : 0));
 }
 
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */
