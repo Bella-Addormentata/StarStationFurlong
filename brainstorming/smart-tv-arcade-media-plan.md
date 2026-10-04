@@ -795,23 +795,30 @@ kilobytes at the cap — and the cap is SHARED OUT, never first-come, since
 the churn budgets above count departures, and an origin or hub that
 admitted sixty-four minted identities and kept their leases alive would
 fill the source without one departure, every honest listener after it
-refused for good: at every node that admits — the sender for the links
-it holds, a hub for its spokes' links before it relays a lease — the
-slots that node may hand out are divided among the links below it that
-carry at least one subscriber, a floor of eight each, recomputed as links
-come and go, and no link is given more than its share while another is
-refused (a link at its share is told so, and its joiners wait for a slot
-THERE: an honest hub with many spokes grows into a larger share only as
-other links empty, which is the cost of fairness, stated); and an origin
-behind a link — a spoke's node, some page's origin — holds at most eight
-identities per source (a person has a few tabs, not sixty-four), the
-link's share governing instead where the origin IS the link at the node
-deciding (a station hub that is many browsers' origin and connects to
-the sender itself: its pages compete for its share, which is a fair share
-among links and never the whole source). So an origin or hub that mints
-identities fills its own share and no one else's, a minted origin is a
-new link at a hub and gets eight, and sixty-four honest listeners still
-fit. Replay protection is a sliding window per leg and
+refused for good. The sharing is incremental and stays inside the cap (a
+fixed share per link cannot: sixty-four slots hold no floor of eight for
+a ninth link): at every node that admits — the sender for the links it
+holds, a hub for its spokes' links within the slots the sender granted it
+— a link's FIRST identity takes a reserved slot: a free one when there is
+one, else the newest admission of the link holding the most, which is
+evicted (told the source is full at its link, free to ask again as a
+joiner) — one eviction per arriving link, never more, and none when every
+link holds one alone, since then the source is full and the newcomer
+waits for a departure; a link's further identities take free slots in the
+order asked and are never made room for; a freed slot goes first to a
+link waiting for its first, the longest wait first, then to the
+identities asking in order; and an origin behind a link — a spoke's node,
+some page's origin — holds at most eight identities per source (a person
+has a few tabs, not sixty-four), the reserved-and-free rule alone
+governing where the origin IS the link at the node deciding (a station
+hub that is many browsers' origin and connects to the sender itself). So
+one origin or hub may hold many slots only while nobody else asks, gives
+one back to each newcomer that finds the source full (the cost of
+fairness for an honest hub with many spokes: one spoke per such newcomer,
+stated), and never keeps a newcomer out: a minted origin is a new link at
+a hub whose first identity displaces the minter's own newest, and
+sixty-four honest listeners at sixty-four links each hold their one.
+Replay protection is a sliding window per leg and
 epoch, the SRTP shape: a leg's counter only ever goes up within an epoch, a
 new epoch starts a new window, and a new instance is a new source with
 windows of its own (a reloaded sender is a new instance, above, never an old
