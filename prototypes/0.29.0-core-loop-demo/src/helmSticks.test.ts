@@ -28,6 +28,10 @@ const HELM = 'helm-1';
 const FIGHTER = 0xff1744;
 const TRIM_STICK = 0xffb300;
 
+/** A trim's orbit, count and place, as applyBurn gives them: without the
+ *  writers a room's log replay names (OrbitTrim.seen). */
+const orbitOf = (t: OrbitTrim | null | undefined) => (t ? { ...t, seen: undefined } : t);
+
 /** A canvas whose 2-D context draws nothing: the docking screen paints through one. */
 function fakeCanvas() {
   const ctx = new Proxy({} as Record<PropertyKey, unknown>, {
@@ -579,7 +583,7 @@ describe('the helm dashboard\'s faces', () => {
       expect(burns()).toHaveLength(1);
       const [burn] = burns();
       expect(burn.from).toEqual(shared);
-      expect(readOrbitTrim(st)).toEqual(applyBurn(shared, burn));
+      expect(orbitOf(readOrbitTrim(st))).toEqual(applyBurn(shared, burn));
       expect(readOrbitTrim(st)).toMatchObject({ dRadiusKm: 2 * TRIM_STEP_KM, last: 'raise' });
     } finally {
       ui.unmount();
