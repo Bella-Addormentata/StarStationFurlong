@@ -12,7 +12,12 @@
  * (departuresDoc.applyDeparturesPublish: the ferry's route entry and its
  * checkpoints, one key per event), waits for the node's acknowledgment, and
  * hangs up. It needs a pass for the berth room, as the keeper's DOCK does,
- * and never writes one: the publish carries room and door ids only.
+ * and never writes one: the publish carries room and door ids only. 🛰️ A
+ * board in the room this game stands in takes the publish in the bound doc
+ * instead, once that room's shared state has arrived (the route keeper's
+ * rule, routeKeeper.routeRoomReady): a join binds the doc before its cached
+ * copy is restored and before the host answers, and a merge into that copy
+ * would not see the board's newer entries.
  *
  * WHEN (createDeparturesPublisher). The game that WRITES a route change
  * publishes it: START, each checkpoint (a hold, its renewal, the dock that
@@ -68,12 +73,17 @@ import type { RouteCheckpoint, RouteWriteNotice, ShipRoute } from './shipRoute';
 /** What a publish to one room came to. */
 export type DeparturesWriteResult = 'written' | 'unchanged' | 'unreachable' | 'no-address';
 
-/** The same seams farDoorWrite.ts is given (main.ts wires both alike). */
+/** The same seams farDoorWrite.ts is given (main.ts wires both alike), and
+ *  whether the room this game stands in has its shared state. */
 export interface DeparturesWriteDeps {
   decode: (seed: string) => RoomBootstrap | null;
   resolve: (boot: RoomBootstrap) => Promise<RoomBootstrap>;
   hostedHere: (roomId: string) => boolean;
   activeRoomDoc: (roomId: string) => Y.Doc | null;
+  /** 🛰️ Has the shared state of the room this game stands in arrived
+   *  (main.ts's roomStateArrivedNow, by routeKeeper.routeRoomReady)? Until
+   *  it has, its bound doc may hold only the room's cached copy. */
+  activeRoomReady: (roomId: string) => boolean;
 }
 
 let deps: DeparturesWriteDeps | null = null;
@@ -86,6 +96,7 @@ const READY_TIMEOUT_MS = 10_000;
 const HOST_READY_TIMEOUT_MS = 20_000;
 const ACK_TIMEOUT_MS = 5_000;
 const SESSION_DEADLINE_MS = 60_000;
+const READY_POLL_MS = 250;
 
 const queues = new Map<string, Promise<unknown>>();
 
@@ -99,10 +110,18 @@ export function writeDepartures(address: string, pub: DeparturesPublish): Promis
   const imported = d.decode(address);
   if (!imported) return Promise.resolve('no-address');
   const key = imported.roomId;
-  const write = () => {
-    // The board's room is the one this game stands in: its bound doc.
-    const here = d.activeRoomDoc(imported.roomId);
-    if (here) return Promise.resolve(applyDeparturesPublish(here, pub).wrote ? 'written' as const : 'unchanged' as const);
+  const write = async (): Promise<DeparturesWriteResult> => {
+    // The board's room is the one this game stands in: its bound doc, once
+    // the room's shared state has arrived. Before then the doc may hold only
+    // a cached copy, and a merge there would not see a hold renewed since:
+    // the renewal sits at the same key, and the CRDT need not keep the newer
+    // sighting over this write.
+    if (d.activeRoomDoc(key)) {
+      const here = await boundRoomState(d, key);
+      if (here) return applyDeparturesPublish(here, pub).wrote ? 'written' : 'unchanged';
+      // Still joining past the wait: a retry comes. Left meanwhile: a session.
+      if (d.activeRoomDoc(key)) return 'unreachable';
+    }
     return underWriteDeadline<DeparturesWriteResult>(
       (mayWrite) => session(d, imported, pub, mayWrite),
       SESSION_DEADLINE_MS,
@@ -117,6 +136,28 @@ export function writeDepartures(address: string, pub: DeparturesPublish): Promis
     if (queues.get(key) === tail) queues.delete(key);
   });
   return run.catch(() => 'unreachable' as const);
+}
+
+/** The bound doc of the room this game stands in, once that room's shared
+ *  state has arrived. Null if it has not within a session's wait (longer for
+ *  a room hosted elsewhere), or once this game has left the room. */
+function boundRoomState(d: DeparturesWriteDeps, roomId: string): Promise<Y.Doc | null> {
+  const within = d.hostedHere(roomId) ? READY_TIMEOUT_MS : HOST_READY_TIMEOUT_MS;
+  const started = Date.now();
+  return new Promise((resolve) => {
+    const look = () => {
+      try {
+        const doc = d.activeRoomDoc(roomId);
+        if (!doc) return resolve(null);
+        if (d.activeRoomReady(roomId)) return resolve(doc);
+        if (Date.now() - started >= within) return resolve(null);
+        setTimeout(look, READY_POLL_MS);
+      } catch {
+        resolve(null);
+      }
+    };
+    look();
+  });
 }
 
 async function session(

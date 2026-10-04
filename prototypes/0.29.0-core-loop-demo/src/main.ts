@@ -3921,7 +3921,12 @@ function wireAdapterTransit(): void {
   };
   initFarDoorWrite(farWriteDeps);
   // 🚏📋 A6: the ferry's publishes to its stops' boards ride the same seams.
-  initDeparturesWrite(farWriteDeps);
+  // 🛰️ A board in the room we stand in waits for the room's shared state.
+  initDeparturesWrite({
+    ...farWriteDeps,
+    activeRoomReady: (roomId: string) =>
+      roomId === activeBootstrap?.roomId && roomStateArrivedNow(),
+  });
   // 🚏🤖 …and so do the gate keeper's sessions to ferries.
   roomSessionDeps = farWriteDeps;
   world.dockingSystem?.onFarDockWrite(farDockWrite);

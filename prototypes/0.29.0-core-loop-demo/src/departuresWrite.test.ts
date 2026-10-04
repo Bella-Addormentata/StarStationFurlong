@@ -6,14 +6,17 @@
  * behind a busy room, two retries of an unreachable one, nothing for a room
  * it holds no pass for or once it has left the ship, and each stop's pass
  * kept from the snapshot's taking. And shipRoute tells it about each of this
- * game's own writes.
+ * game's own writes, and a board in the room this game stands in takes a
+ * publish only once that room's shared state has arrived.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
-import { DEPARTURES_RETRY_MS, createDeparturesPublisher } from './departuresWrite';
-import type { DeparturesPublisherDeps, DeparturesWriteResult } from './departuresWrite';
+import { DEPARTURES_RETRY_MS, createDeparturesPublisher, initDeparturesWrite, writeDepartures } from './departuresWrite';
+import type { DeparturesPublisherDeps, DeparturesWriteDeps, DeparturesWriteResult } from './departuresWrite';
+import { DEPARTURES_MAP, applyDeparturesPublish, departureFerriesIn } from './departuresDoc';
 import type { DeparturesPublish } from './departuresDoc';
-import { holdCheckpoint, startCheckpoint } from './pilotRoute';
+import type { RoomBootstrap } from './network/protocol';
+import { holdCheckpoint, renewedHold, startCheckpoint } from './pilotRoute';
 import { bindShipDoc, writeFuelLevel } from './shipDoc';
 import {
   finishShipRoute,
@@ -470,5 +473,96 @@ describe('shipRoute tells the publisher about this game’s own writes', () => {
       { kind: 'stop' },
       { kind: 'finish', run },
     ]);
+  });
+});
+
+describe('a board in the room this game stands in', () => {
+  const SEC = 1000;
+  const MIN = 60 * SEC;
+  const route = running();
+  const s = startCheckpoint(route, { at: T0, pilot: 'robot', fuel: 100 })!;
+  const hold = holdCheckpoint(route, 1, { at: s.arriveAt + SEC });
+  const NOW = hold.at + 4 * MIN;
+  const pub = (seenAt: number, at: number): DeparturesPublish => ({
+    shipRoomId: SHIP, name: 'Ferry One', capacity: 100, route, checkpoints: [s, renewedHold(hold, seenAt)], at,
+  });
+  const holdIn = (doc: Y.Doc) =>
+    departureFerriesIn(doc.getMap(DEPARTURES_MAP), NOW)[0]?.checkpoints.find((e) => e.kind === 'hold');
+  const boot = (roomId: string): RoomBootstrap => ({ roomId, wtUrl: 'https://node.test/ssf', certHashesB64: [] });
+  let bound: Y.Doc | null = null;
+  let ready = false;
+  const wire = (over: Partial<DeparturesWriteDeps> = {}) => initDeparturesWrite({
+    decode: (seed) => (seed.startsWith('pass:') ? boot(seed.slice('pass:'.length)) : null),
+    resolve: async (b) => b,
+    hostedHere: () => false,
+    activeRoomDoc: (roomId) => (roomId === 'room-1' ? bound : null),
+    activeRoomReady: (roomId) => roomId === 'room-1' && ready,
+    ...over,
+  });
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(NOW);
+    bound = new Y.Doc();
+    ready = false;
+    warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  });
+  afterEach(() => { vi.useRealTimers(); warn.mockRestore(); });
+
+  // Copilot (PR 180): a join binds the room's doc before its cached copy is
+  // restored and before the host answers. A late publish merged there saw
+  // only the cached hold, and wrote its older sighting at the key the host's
+  // renewal sits at: of two writes neither saw, the CRDT kept the older.
+  it("🛰️ waits for the room's shared state, so a hold renewed meanwhile keeps its newer sighting", async () => {
+    // The board as its host holds it: the hold this game cached on its last
+    // visit, renewed since.
+    const host = new Y.Doc();
+    host.clientID = 1;
+    applyDeparturesPublish(host, pub(hold.at, T0 + MIN), NOW);
+    const cached = Y.encodeStateAsUpdate(host);
+    applyDeparturesPublish(host, pub(hold.at + 3 * MIN, T0 + 3 * MIN), NOW);
+    // This game joins the room: until the host answers, it holds the cache.
+    const doc = new Y.Doc();
+    doc.clientID = 2; // of two writes to one key neither saw, the higher client's stays
+    Y.applyUpdate(doc, cached);
+    bound = doc;
+    wire();
+    // A publish that saw the hold between the two sightings arrives meanwhile.
+    const result = writeDepartures('pass:room-1', pub(hold.at + MIN, T0 + 2 * MIN));
+    await vi.advanceTimersByTimeAsync(5 * SEC);
+    expect(holdIn(doc)).toMatchObject({ seenAt: hold.at });
+    // The host's state arrives.
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(host));
+    ready = true;
+    await vi.advanceTimersByTimeAsync(SEC);
+    expect(await result).toBe('unchanged');
+    Y.applyUpdate(host, Y.encodeStateAsUpdate(doc));
+    for (const d of [doc, host]) expect(holdIn(d)).toMatchObject({ seenAt: hold.at + 3 * MIN });
+    // Once it has, newer news is written there at once.
+    expect(await writeDepartures('pass:room-1', pub(NOW, T0 + 4 * MIN))).toBe('written');
+    expect(holdIn(doc)).toMatchObject({ seenAt: NOW });
+  });
+
+  it("🛰️ calls a room whose state never arrives unreachable (a retry comes), and writes nothing there", async () => {
+    wire({ hostedHere: () => true }); // a session's wait for a room hosted here: 10 s
+    let result: DeparturesWriteResult | null = null;
+    void writeDepartures('pass:room-1', pub(hold.at + MIN, T0 + 2 * MIN)).then((r) => { result = r; });
+    await vi.advanceTimersByTimeAsync(9 * SEC);
+    expect(result).toBeNull();
+    await vi.advanceTimersByTimeAsync(2 * SEC);
+    expect(result).toBe('unreachable');
+    expect(bound!.getMap(DEPARTURES_MAP).size).toBe(0);
+  });
+
+  it('🛰️ sends to a room this game leaves while it waits by a session of its own', async () => {
+    const resolve = vi.fn(async (_b: RoomBootstrap): Promise<RoomBootstrap> => { throw new Error('no node here'); });
+    wire({ resolve });
+    const result = writeDepartures('pass:room-1', pub(hold.at + MIN, T0 + 2 * MIN));
+    await vi.advanceTimersByTimeAsync(SEC);
+    expect(resolve).not.toHaveBeenCalled();
+    bound = null; // the player walks out
+    await vi.advanceTimersByTimeAsync(SEC);
+    expect(await result).toBe('unreachable');
+    expect(resolve).toHaveBeenCalledWith(boot('room-1'));
   });
 });
