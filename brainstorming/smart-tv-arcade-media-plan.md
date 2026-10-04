@@ -1101,11 +1101,15 @@ Audio needs a step video does not: `AudioEncoder` takes `AudioData`, never
 a `MediaStream` or a Web Audio node. A microphone track goes through an
 audio `MediaStreamTrackProcessor` where the browser has one (Chromium),
 else through an `AudioWorklet` tapping the track's
-`MediaStreamAudioSourceNode` and building `AudioData` from its PCM frames —
-the universal path, since the worklet is everywhere the lane runs, and the
-one the karaoke mix takes regardless, tapped off the mix bus; both are
-feature-detected with the worklet as the fallback for the PCM step only —
-a worklet supplies PCM and encodes nothing — and a browser without
+`MediaStreamAudioSourceNode` and posting its PCM frames over the worklet's
+`MessagePort` (transferred buffers, 20 ms at a time) to the page or a
+dedicated worker, where `AudioData` is built and `AudioEncoder` runs —
+`AudioData` is not exposed in `AudioWorkletGlobalScope`, so a worklet
+supplies PCM and builds nothing — the universal path, since the worklet is
+everywhere the lane runs, and the one the karaoke mix takes regardless,
+tapped off the mix bus; both are feature-detected with the worklet as the
+fallback for the PCM step only — a worklet supplies PCM and encodes
+nothing — and a browser without
 `AudioEncoder`, or whose `AudioEncoder` cannot do Opus, sends no audio and
 says so, whatever worklets it has (Safari 16.4–18.x; on WebKitGTK the API
 is there from 2.44 and the codec is a GStreamer plugin, below).
@@ -1263,17 +1267,20 @@ BitTorrent uploads as it downloads. Prefer `mp4`/`webm` files; most webviews wil
   seed replayed after it would undo — a seeder that lies about `at` or
   signs anew guards nothing by replaying, since it can announce afresh at
   will under the same caps; and the marks are capped PER READER, in all,
-  whatever ids they name: at most sixty-four seeders per item (a
-  sixty-fifth announcement is ignored until one expires; the item has
-  holders enough) and at most 4 096 marks in the reader's whole map,
-  expired marks dropped first, and at capacity with none expired the
-  newcomer refused — ignored, no mark written — rather than a live mark
-  evicted into a replay; so a flood of minted ids fills the pool for a day
-  and never more, and the pool is the first-come seeders' alone: a seed
-  under a principal — a library-station's under its operator key, an
-  owner's node under the owner's — counts against that principal's own
-  allowance (sixty-four per item, the same) and never against the pool,
-  so the station's own seeders are neither displaced nor shut out by it.
+  whatever ids they name, in TWO pools with one maximum each: the
+  first-come pool — at most sixty-four seeders per item (a sixty-fifth
+  announcement is ignored until one expires; the item has holders enough)
+  and at most 4 096 marks in all — and the principal pool, which only a
+  seed under a principal enters (a library-station's under its operator
+  key, an owner's node under the owner's) — at most eight seeders per
+  item, the station's owners and its operator being fewer, and at most
+  4 096 marks in all — so a reader holds at most 8 192 marks and an item
+  lists at most seventy-two seeders, whatever the ids; in either pool
+  expired marks are dropped first, and at capacity with none expired the
+  newcomer is refused — ignored, no mark written — rather than a live mark
+  evicted into a replay; so a flood of minted ids fills the first-come
+  pool for a day and never more, and neither displaces nor shuts out the
+  station's own seeders, whose pool it cannot enter.
   Admission is by principal where one exists and first-come under the
   caps for the rest — and a signed `library-unseed` from the same node (a
   higher `seq` for that hash) or the item's `library-remove` withdraws it
