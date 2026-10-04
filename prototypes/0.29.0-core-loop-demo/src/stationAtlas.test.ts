@@ -9,8 +9,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as Y from 'yjs';
 import {
-  atlasComponent, atlasLayout, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, pushAtlasToDoc, readAtlas,
-  seedAtlasDefaults,
+  atlasComponent, atlasLayout, bindStationAtlasDoc, compareAtlasRecency, harvestIntoAtlas, moduleOverlapAt, pushAtlasToDoc,
+  readAtlas, seedAtlasDefaults,
 } from './stationAtlas';
 import type { BundledAtlasEntry } from './stationAtlas';
 
@@ -159,6 +159,28 @@ describe('rooms named like Object properties', () => {
     }));
     expect(atlasLayout('module-self').map((p) => [p.roomId, p.name]))
       .toEqual([['constructor', 'Module'], ['toString', 'Module']]);
+  });
+});
+
+describe('a module placed at a pose', () => {
+  // Copilot (PR 204): the station's gate keeper docks a known ferry, so a
+  // module of the station already at its pose is a clash, not the berth.
+  it('skips the berth being joined near it, or with `joining` that module alone', () => {
+    store.set('ssf-station-atlas', JSON.stringify({
+      'module-self': {
+        roomId: 'module-self', name: 'SELF', lastSeen: 1,
+        doors: { north: { targetSeed: '', targetRoomId: 'module-nbr' } },
+      },
+      'module-nbr': { roomId: 'module-nbr', name: 'NBR', lastSeen: 1, doors: {} },
+    }));
+    const nbr = atlasLayout('module-self').find((p) => p.roomId === 'module-nbr')!;
+    const at = { x: nbr.x, z: nbr.z, rotY: nbr.rotY };
+    expect(moduleOverlapAt('module-self', at)).toBeNull();
+    expect(moduleOverlapAt('module-self', at, { joining: 'ferry-1' })).toEqual({ roomId: 'module-nbr', name: 'NBR' });
+    expect(moduleOverlapAt('module-self', at, { joining: 'module-nbr' })).toBeNull();
+    // This module's own hull still clashes.
+    expect(moduleOverlapAt('module-self', { x: 0, z: 0, rotY: 0 }, { joining: 'module-nbr' }))
+      .toEqual({ roomId: 'module-self', name: 'SELF' });
   });
 });
 

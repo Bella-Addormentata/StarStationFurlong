@@ -36,6 +36,7 @@ import {
   freeSlotAround,
   isTowing,
   moveTransitPointAt,
+  describeTowRefusal,
   planStationTow,
   planTow,
   quoteTow,
@@ -47,6 +48,7 @@ import {
   movePhase,
   moveFuelCost,
   quoteMove,
+  planStationAltitude,
   planStationMove,
   readMoveFuelDrawn,
   readRememberedMoves,
@@ -1142,6 +1144,12 @@ describe('tugs: a torch tow', () => {
     expect(planStationTow(towCtx({ station: busy }), ARIS)).toMatchObject({ ok: false, refusal: 'moving' });
   });
 
+  it('🚏 refuses while a ferry route runs on the tug (STOP it first)', () => {
+    expect(planStationTow(towCtx({ routeRunning: true }), ARIS)).toMatchObject({ ok: false, refusal: 'route-running' });
+    expect(planStationTow(towCtx({ routeRunning: false }), ARIS).ok).toBe(true);
+    expect(describeTowRefusal('route-running', null, 0)).toMatch(/Stop the ferry route/);
+  });
+
   it('keeps the tug\'s room on the record and holds that tug while it tows', () => {
     const plan = planStationTow(towCtx(), ARIS);
     if (!plan.ok) throw new Error(plan.refusal);
@@ -2114,6 +2122,7 @@ describe('the move log stays bounded', () => {
       expect(roomDocLockedByMove(new Y.Doc(), 'far-room', NOW)).toBe(true);
       expect(planStationMove(ctx(), ARIS)).toMatchObject({ ok: false, refusal: 'moves-unknown' });
       expect(planStationTow(tow(), ARIS)).toMatchObject({ ok: false, refusal: 'moves-unknown' });
+      expect(planStationAltitude(ctx(), 5_000)).toMatchObject({ ok: false, refusal: 'moves-unknown' });
       // Asking queued a sweep: the flood goes, the move stays, and nothing
       // holds that the move itself does not.
       vi.runAllTimers();

@@ -457,3 +457,88 @@ export function farDockPatch(
     }),
   };
 }
+
+// ── 🚏 What a DOCK answered (robot pilot routes, build notes A5) ─────────────
+
+/**
+ * Why a DOCK (docking.ts redockPortAnswer) did not dock. The far berth's own
+ * refusals keep their FarDockResult names; the rest are this side's:
+ *   busy         a dock or undock is already running on this port
+ *   no-port      the door wears no port, or it remembers no berth to dock to
+ *   in-flight    the module is flying (the flight gate)
+ *   no-rights    the local player may not dock here (construction rights,
+ *                and not the route keeper's carve-out)
+ *   overlap      the module would land on another one
+ *   no-writer    KEEPER MODE: no far-room writer is wired, so the station
+ *                cannot be asked (a plain DOCK docks this side alone)
+ *   changed      this port changed while the berth was asked
+ *   refused      a bare `false` from an older docking API (no reason given)
+ *   moving       this station or the berth's is moving between planets
+ *                (stationMove.dockLockedByMove, PR 174)
+ * `occupied` is also this side's own answer when the local atlas shows the
+ * berth taken (a plain DOCK only; keeper mode asks the station instead).
+ */
+export type DockRefusal =
+  | 'busy'
+  | 'no-port'
+  | 'in-flight'
+  | 'no-rights'
+  | 'overlap'
+  | 'no-writer'
+  | 'changed'
+  | 'refused'
+  | 'moving'
+  | 'unreachable'
+  | 'no-address'
+  | 'no-far-door'
+  | 'occupied'
+  | 'closed'
+  | 'gone'
+  | 'not-allowed'
+  | 'superseded'
+  /** ⚓🚦 The far door wears no port and every gate number of its station
+   *  is taken (PR 177), so none could be fitted. */
+  | 'no-gate';
+
+/** A DOCK's answer: docked (with the dock's own stamp), or why not. */
+export type DockAnswer =
+  | {
+      ok: true;
+      /** The dock's stamp (its DoorPairing.dockedAt): this DOCK's own, or the
+       *  one it joined. Absent from an older docking API. */
+      dockedAt?: number;
+      /** It joined a dock of this very port already at the berth. */
+      joined?: boolean;
+      /** Docked on this side alone (the station was not told). Never in
+       *  keeper mode. */
+      oneSided?: boolean;
+    }
+  | {
+      ok: false;
+      reason: DockRefusal;
+      /** With `not-allowed`: the gate setting that refused, when known. */
+      gateAccess?: 'pass' | 'reserved' | 'closed';
+    };
+
+/** Options for a DOCK or UNDOCK run by a route's keeper (routeKeeper.ts). */
+export interface DockOpOptions {
+  /**
+   * KEEPER MODE (A5): skip the local atlas's "taken" check (a stale atlas can
+   * say taken long after the berth frees) and count only the station's
+   * answer, so an unreachable station (or one that cannot be asked) leaves
+   * the port undocked instead of docking one side alone. Also lets the
+   * route's own port through the rider carve-out (docking.ts
+   * onRouteDockRight) at the timetable's moments.
+   */
+  keeper?: boolean;
+}
+
+/** Read whatever a docking API answered as a DockAnswer: no answer counts as
+ *  docked (PR 172's contract), a bare boolean as docked or `refused`. */
+export function dockAnswerOf(v: unknown): DockAnswer {
+  if (v === undefined || v === true) return { ok: true };
+  if (v === false || v === null || typeof v !== 'object') return { ok: false, reason: 'refused' };
+  const a = v as { ok?: unknown; reason?: unknown };
+  if (a.ok === true) return v as DockAnswer;
+  return typeof a.reason === 'string' ? (v as DockAnswer) : { ok: false, reason: 'refused' };
+}

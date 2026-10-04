@@ -9,9 +9,9 @@
 
 import { DEFAULT_STATION_ID, currentStation, listStations } from './stations';
 import type { StationRecord } from './stations';
-import { angleAt, realMsFor, stationOrbit } from './orbits';
+import { angleAt, baseOrbit, realMsFor, slotPosition, stationOrbit } from './orbits';
 import { AU_KM, planetSunOrbit, sunAngleAt } from './solarOrbits';
-import { describeMove, moveTransitPointAt } from './stationMove';
+import { describeMove, moveTransitPointAt, orbitChangePlanOf, stationPointWithMoveAt } from './stationMove';
 import type { StationMove } from './stations';
 
 export interface MapBody {
@@ -79,7 +79,9 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
       name: s.name,
       type: 'station' as const,
       parentId: orbit.planet.id,
-      orbitRadius: STATION_ORBIT_BASE + s.orbitSlot * STATION_ORBIT_STEP,
+      // 🎚️ Spaced by altitude: a slot's orbit at its slot's ring, an altitude
+      // between two slots between their rings.
+      orbitRadius: schematicRadius(baseOrbit(s).planet.id, baseOrbit(s).radiusKm),
       orbitSpeed: 0,
       angle: orbit.phase0,
       angleAt: (nowMs: number) => angleAt(orbit, nowMs),
@@ -96,19 +98,47 @@ export function stationBodies(stations: StationRecord[], nowMs: number = Date.no
  *  (Sovereign II, at 1 AU, is drawn at 180). */
 const MAP_PER_AU = 180;
 
+/** The holotable ring of an orbit `radiusKm` from a planet's centre: slot
+ *  rings STATION_ORBIT_STEP apart, an altitude between two slots between
+ *  their rings (never inside the planet's own ring). */
+function schematicRadius(planetId: string, radiusKm: number): number {
+  return STATION_ORBIT_BASE + Math.max(-2, slotPosition(planetId, radiusKm)) * STATION_ORBIT_STEP;
+}
+
 /** Where a moving station is drawn: around its old planet until the burn,
  *  on its course around the sun (the transfer ellipse, or a tug's straight
- *  torch run), then around its new planet. */
+ *  torch run), then around its new planet. 🎚️ An altitude change stays
+ *  around its planet, sliding between the two rings on its transfer. */
 function movingPlace(s: StationRecord, move: StationMove): NonNullable<MapBody['placeAt']> {
-  // Until the burn it is the station it always was: its id keeps its trim.
-  const from = stationOrbit({ id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot });
+  const change = orbitChangePlanOf(move);
+  if (change) {
+    const planetId = change.from.planet.id;
+    return (nowMs: number) => {
+      const p = stationPointWithMoveAt(s, nowMs);
+      return { parentId: planetId, angle: p.angle, radius: schematicRadius(planetId, p.radiusKm) };
+    };
+  }
+  // Until the burn it is the station it always was: its id keeps its trim,
+  // 🎚️ on the altitude the list says it keeps until it leaves (the move's
+  // fromOrbit, unless another station's claim beat it), if any.
+  const held = s.orbit;
+  // A cancelled move keeps it for good (stations.orbitAfterMove).
+  const cancelled = !!move.settles && move.departAt < move.settles.arriveAt;
+  const fromStation = {
+    id: s.id, planetId: move.fromPlanetId, orbitSlot: s.orbitSlot,
+    ...(held ? { orbit: { radiusKm: held.radiusKm, phase0: held.phase0 } } : {}),
+  };
+  const from = stationOrbit(fromStation);
+  const fromBase = baseOrbit(fromStation);
   const to = stationOrbit({ planetId: move.toPlanetId, orbitSlot: move.toSlot });
   const slotRadius = (slot: number) => STATION_ORBIT_BASE + slot * STATION_ORBIT_STEP;
   return (nowMs: number) => {
     const p = moveTransitPointAt(move, nowMs);
     if (p) return { angle: p.angle, radius: (p.radiusKm / AU_KM) * MAP_PER_AU };
-    if (nowMs >= move.arriveAt) return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
-    return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: slotRadius(s.orbitSlot) };
+    if (nowMs >= move.arriveAt && !(held && cancelled)) {
+      return { parentId: to.planet.id, angle: angleAt(to, nowMs), radius: slotRadius(move.toSlot) };
+    }
+    return { parentId: from.planet.id, angle: angleAt(from, nowMs), radius: schematicRadius(fromBase.planet.id, fromBase.radiusKm) };
   };
 }
 
@@ -189,6 +219,7 @@ export class SolarSystemMap {
   
   // Callbacks
   private onTravelCompleteCallback: ((destinationId: string) => void) | null = null;
+  private onStationAtlasCallback: ((stationId: string) => void) | null = null;
 
   constructor() {
     this.initializeBodies();
@@ -375,6 +406,9 @@ export class SolarSystemMap {
             <div id="map-selected-resources-list" style="font-size: 11px; display:flex; flex-direction:column; gap:3px;"></div>
           </div>
           
+          <!-- 🗺️ #192: a station's layout from its atlas -->
+          <button id="map-atlas-btn" style="display:none; width: 100%; border-radius: 8px; border: 1px solid rgba(212,168,75,0.5); background: rgba(212,168,75,0.10); color: #F0C060; font-weight: bold; padding: 10px; cursor: pointer; text-transform: uppercase; font-size:11px;">🗺 View station atlas</button>
+
           <!-- Launch Travel Trigger -->
           <button id="map-travel-btn" style="width: 100%; border-radius: 8px; border: 1px solid #1e88e5; background: rgba(30,136,229,0.15); color: #90caf9; font-weight: bold; padding: 10px; cursor: pointer; text-transform: uppercase; font-size:11px; transition: background 0.2s;">Initiate Travel</button>
         </div>
@@ -442,6 +476,14 @@ export class SolarSystemMap {
     const closeBtn = document.getElementById('solarmap-close-btn');
     if (closeBtn) {
       closeBtn.addEventListener('click', () => this.hide());
+    }
+
+    // 🗺️ Station atlas button (#192): the holotable opens the station plan.
+    const atlasBtn = document.getElementById('map-atlas-btn');
+    if (atlasBtn) {
+      atlasBtn.addEventListener('click', () => {
+        if (this.selectedBody?.type === 'station') this.onStationAtlasCallback?.(this.selectedBody.id);
+      });
     }
 
     // Travel Button trigger
@@ -565,6 +607,9 @@ export class SolarSystemMap {
       } else {
         resBox.style.display = 'none';
       }
+
+      const atlasBtn = document.getElementById('map-atlas-btn');
+      if (atlasBtn) atlasBtn.style.display = body.type === 'station' && this.onStationAtlasCallback ? 'block' : 'none';
 
       // Configure Travel actions
       if (body.id === this.playerLocationId) {
@@ -874,6 +919,11 @@ export class SolarSystemMap {
     if (this.container) {
       this.container.style.display = 'none';
     }
+  }
+
+  /** 🗺️ #192: called with a station's id when VIEW STATION ATLAS is pressed. */
+  public onStationAtlas(cb: (stationId: string) => void) {
+    this.onStationAtlasCallback = cb;
   }
 
   public onTravelComplete(cb: (destinationId: string) => void) {

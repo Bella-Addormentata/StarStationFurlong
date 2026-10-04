@@ -58,6 +58,11 @@ export interface DoorPolicyRecord {
   /** With `gateAccess: 'reserved'`: the one ship (its ROOM id) that may dock
    *  here — an airline's own gate. A room id, never a pass. */
   reservedFor?: string;
+  /** 🚏🤖 The owner lets this gate DOCK SCHEDULED FERRIES AUTOMATICALLY: a
+   *  game in this room docks a route ferry the gate admits when it arrives
+   *  and casts it off at its departure, with nobody aboard (gateKeeper.ts).
+   *  Absent = off. Only meaningful while `adapter` is true. */
+  autoFerry?: boolean;
 }
 
 /** ⚓🚦 open: any ship · pass: captains the owner granted at this door (the
@@ -196,6 +201,7 @@ function sanitizePolicy(value: unknown): DoorPolicyRecord {
     adapter: raw?.adapter === true,
     ...(raw?.adapter === true && isGateNumber(raw?.gate) ? { gate: raw.gate } : {}),
     ...(raw?.adapter === true ? cleanAccess(raw) : {}),
+    ...(raw?.adapter === true && raw?.autoFerry === true ? { autoFerry: true } : {}),
   };
 }
 
@@ -208,6 +214,7 @@ function policyShape(policy: DoorPolicyRecord): DoorPolicyRecord {
     adapter: policy.adapter === true,
     ...(policy.adapter === true && isGateNumber(policy.gate) ? { gate: policy.gate } : {}),
     ...(policy.adapter === true ? cleanAccess(policy) : {}),
+    ...(policy.adapter === true && policy.autoFerry === true ? { autoFerry: true } : {}),
   };
 }
 
@@ -397,6 +404,39 @@ export function gatesInUseIn(doc: Y.Doc): GatesInUse {
 export interface GatesInUse {
   gates: Record<string, number>;
   complete: boolean;
+}
+
+/** 🚏🤖 Most layout keys readAutoFerryGates looks at, junk included: the
+ *  gate keeper reads it once a second, and the map is any peer's to write.
+ *  A room's own doors fit well inside. */
+export const MAX_AUTO_FERRY_LAYOUT_KEYS = 256;
+
+/** 🚏🤖 This room's ports whose owner lets them dock scheduled ferries
+ *  automatically (`autoFerry`), with their policies, in door id order: the
+ *  doors portsIn reads, over a walk of at most MAX_AUTO_FERRY_LAYOUT_KEYS
+ *  layout keys. Null when the layout holds more: the list might leave a gate
+ *  out, and the gate keeper then does nothing. */
+export function readAutoFerryGates(): Array<{ doorId: string; policy: DoorPolicyRecord }> | null {
+  if (!docAlive()) return [];
+  const doc = boundDoc!;
+  const out: Array<{ doorId: string; policy: DoorPolicyRecord }> = [];
+  const take = (doorId: string): void => {
+    const policy = sanitizePolicy(policyMap!.get(doorId));
+    if (policy.adapter && policy.autoFerry === true) out.push({ doorId, policy });
+  };
+  let scanned = 0;
+  let any = false;
+  for (const [doorId, value] of doc.getMap('doorLayout').entries()) {
+    if (++scanned > MAX_AUTO_FERRY_LAYOUT_KEYS) return null;
+    // doorExistsIn, asked only of a well-formed record: of anything else it
+    // would count the whole map.
+    if (!isDoorLayoutRecord(value) || value.id !== doorId || !doorExistsIn(doc, doorId)) continue;
+    any = true;
+    take(doorId);
+  }
+  // A legacy room keeps no layout records: its doors are the cardinal ones.
+  if (!any) for (const doorId of Object.keys(LEGACY_ID_WALL)) if (doorExistsIn(doc, doorId)) take(doorId);
+  return out.sort((a, b) => (a.doorId < b.doorId ? -1 : a.doorId > b.doorId ? 1 : 0));
 }
 
 /** ⚓🚦 The gates of ANY doc's ports (the far room's, during a DOCK). */

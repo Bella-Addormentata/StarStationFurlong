@@ -43,6 +43,8 @@
  *     in-flight    ▶  redocking   commander tick, once now ≥ etaAt
  *     redocking    ▶  docked      COMPLETE REDOCK (helm button)
  *     redocking    ▶  in-flight   reserved bounce-back
+ *     docked       ▶  free-flight 🕹️ UNDOCK & FLY: a person takes the stick
+ *     free-flight  ▶  redocking   🕹️ AUTO-DOCK close to a station
  *     <any>        ▶  <same>      idempotent self-republish (commander race)
  *
  * Two legal DEPART paths — the state machine (isLegalFlightTransition) accepts
@@ -113,8 +115,11 @@ export function findDestination(id: string): Destination {
 // ── Records (plan §2) ────────────────────────────────────────────────────────
 
 /** Flight state machine states. `docked` / `in-flight` are the resting states;
- *  `undocking` / `redocking` are transitional hand-offs (see the ASCII above). */
-export type FlightStatus = 'docked' | 'undocking' | 'in-flight' | 'redocking';
+ *  `undocking` / `redocking` are transitional hand-offs (see the ASCII above).
+ *  🕹️ `free-flight` (issue 203): a person flies the ship by hand from the
+ *  helm; its position is kept in a record of its own (freeFlight.ts), and
+ *  `locationId` names the station it undocked from. */
+export type FlightStatus = 'docked' | 'undocking' | 'in-flight' | 'redocking' | 'free-flight';
 
 /** Serializable flight record — one per module. Plain JSON (no nested Y types). */
 export interface FlightRecord {
@@ -215,9 +220,17 @@ export function shipDocBound(): boolean {
   return docAlive();
 }
 
+/** 🚏 The bound doc and its `ship` map, for the ship's other records kept in
+ *  this map under their own keys (shipRoute.ts: the route and its
+ *  checkpoints), or null while unbound. Old clients only ever `get` fuel,
+ *  flight and berths, so new keys here are invisible to them. */
+export function shipDocHandle(): { doc: Y.Doc; map: Y.Map<unknown> } | null {
+  return docAlive() ? { doc: boundDoc!, map: shipMap! } : null;
+}
+
 // ── Shape guards (values cross a trust boundary — see module header) ─────────
 
-const FLIGHT_STATUSES: readonly FlightStatus[] = ['docked', 'undocking', 'in-flight', 'redocking'];
+const FLIGHT_STATUSES: readonly FlightStatus[] = ['docked', 'undocking', 'in-flight', 'redocking', 'free-flight'];
 
 /** `locationId` and `destinationId` are compared against DESTINATIONS on read
  *  (unknown ⇒ home), so we only sanity-check bounded string shape here — a
@@ -343,6 +356,16 @@ function sanitizeFlightRecord(r: FlightRecord): FlightRecord {
 // reading — each burn is its own entry (stationKeeping.writeTrimBurn), and
 // the replay starts from what the last level write settled.
 //
+// 🚏⛽ One meter is not a running total: the ferry route's (shipRoute.ts,
+// 'route'). Its level is worked out from the clock, like its position, and
+// the home refill (choice 4 b) fills the tanks again on each arrival at the
+// route's first stop with no write, so what it reads is a DEBT against the
+// stored level: how far below it the route has taken the tank, back to 0 at
+// each refill. A debt that goes back is the refill, not a merge, so no level
+// write records it (the next refill would read as a refund below the
+// recorded reading, and the route's next burns would be swallowed): an
+// `owed` meter comes off the level in full, every time.
+//
 // Two draws that each fit the gauge can still overdraw it together: two tabs
 // spending the last unit at once, or a draw beside a DEPART that takes the
 // rest. A consumer that can drop a draw after the fact (a trim burn only
@@ -382,6 +405,11 @@ const MAX_METERS = 16;
 export interface FuelDrawMeter {
   read(): number;
   subscribe(listener: () => void): () => void;
+  /** 🚏 A debt against the STORED level rather than a running total (the
+   *  ferry route's: it falls back to 0 at each home refill). It comes off
+   *  the level in full, and no level write records its reading (see
+   *  above). */
+  owed?: boolean;
   settle?(): unknown;
 }
 
@@ -410,11 +438,18 @@ function meterValue(v: unknown): number {
   return typeof v === 'number' && v > 0 && v <= FUEL_METER_MAX ? v : 0;
 }
 
-/** Every meter's reading, added up: what a record from before per-meter
- *  readings was written against. */
+/** Every running total, added up (owed meters apart: owedReading): what a
+ *  record from before per-meter readings was written against. */
 function meterReading(): number {
   let total = 0;
-  for (const { meter } of drawMeters.values()) total += meterValue(meter.read());
+  for (const { meter } of drawMeters.values()) if (!meter.owed) total += meterValue(meter.read());
+  return total;
+}
+
+/** 🚏 What the owed meters take off the level now (the ferry route's debt). */
+function owedReading(): number {
+  let total = 0;
+  for (const { meter } of drawMeters.values()) if (meter.owed) total += meterValue(meter.read());
   return total;
 }
 
@@ -498,7 +533,7 @@ function drawnSince(rec: FuelRecord): number {
   if (!recorded) return Math.max(0, meterReading() - meterValue(rec.meter));
   let drawn = 0;
   for (const [name, { meter }] of drawMeters) {
-    drawn += Math.max(0, meterValue(meter.read()) - (recorded.get(name) ?? 0));
+    if (!meter.owed) drawn += Math.max(0, meterValue(meter.read()) - (recorded.get(name) ?? 0));
   }
   return drawn;
 }
@@ -536,7 +571,8 @@ export function fuelCeiling(name: string, capacity = Number.POSITIVE_INFINITY): 
   for (const [other, { meter }] of drawMeters) {
     if (other === name) continue;
     const reading = meterValue(meter.read());
-    others += recorded ? Math.max(0, reading - (recorded.get(other) ?? 0)) : reading;
+    // 🚏 An owed meter (the route's debt) comes off the level in full.
+    others += recorded && !meter.owed ? Math.max(0, reading - (recorded.get(other) ?? 0)) : reading;
   }
   if (!recorded) return Math.max(0, meterValue(raw.meter) + held - others);
   return (recorded.get(name) ?? 0) + Math.max(0, held - others);
@@ -572,7 +608,38 @@ export function readFuelLevel(capacity = Number.POSITIVE_INFINITY): number {
   // Negative-fuel guard belongs here too — a peer could write -Infinity and
   // every reader would fail-open otherwise. Clamp to [0, +∞) at the boundary;
   // capacity clamp is a caller responsibility (see clampFuelToCapacity).
-  return Math.max(0, held - drawnSince(raw));
+  // 🚏 An owed meter (the route's debt) comes off on top, never through a
+  // reading the level was written against.
+  return Math.max(0, held - drawnSince(raw) - owedReading());
+}
+
+/** 🚏 The level the fuel record stores, before any draw meter comes off (0
+ *  when there is none or it is malformed). A meter whose consumer derives
+ *  its own level (shipRoute.ts's route meter) reads how far below this the
+ *  tank should stand; everything else reads readFuelLevel. */
+export function readStoredFuelLevel(): number {
+  if (!docAlive()) return 0;
+  const raw = shipMap!.get('fuel');
+  return isFuelRecord(raw) ? Math.max(0, raw.level) : 0;
+}
+
+/** 🚏 Raise the stored level to `level` (clamped to `capacity`), keeping
+ *  every meter's recorded reading and settlement as they are, so a draw
+ *  already made still comes off. Never lowers it; no record, no raise. On
+ *  its own this would add fuel: it is for the ferry route's CEILING
+ *  (shipRoute.raiseRouteFuelCeiling), where the route's owed meter, a debt
+ *  against this level, takes the raise back until the route's own level
+ *  climbs. Returns whether it wrote. */
+export function raiseStoredFuelLevel(level: number, capacity: number): boolean {
+  if (!docAlive()) return false;
+  const raw = shipMap!.get('fuel');
+  if (!isFuelRecord(raw)) return false;
+  const safe = clampFuelToCapacity(level, capacity);
+  if (!(safe > raw.level)) return false;
+  boundDoc!.transact(() => {
+    shipMap!.set('fuel', { ...raw, level: safe });
+  });
+  return true;
 }
 
 /** Fuel level clamped against the CURRENT derived capacity (tanks removed
@@ -627,7 +694,7 @@ export function writeFuelLevel(level: number, capacity: number): void {
     settledCount += 1;
   };
   for (const [name, { meter }] of drawMeters) {
-    record(name, Math.max(meterValue(meter.read()), before?.get(name) ?? 0));
+    if (!meter.owed) record(name, Math.max(meterValue(meter.read()), before?.get(name) ?? 0));
     keep(name, meter.settle?.() ?? settledBefore?.get(name));
   }
   for (const [name, reading] of before ?? []) if (!drawMeters.has(name)) record(name, reading);
@@ -703,7 +770,8 @@ export function isLegalFlightTransition(from: FlightStatus, to: FlightStatus): b
       // 'in-flight' without a visible undocking hand-off, the reserved SLOW
       // path pauses at 'undocking' for a future preflight-animation slice.
       // Both are downstream of canDepart at the caller (owner, fuel, chain).
-      return to === 'undocking' || to === 'in-flight';
+      // 🕹️ UNDOCK & FLY hands the ship to a person's stick.
+      return to === 'undocking' || to === 'in-flight' || to === 'free-flight';
     case 'undocking':
       // Reserved slow-path successors: continue to 'in-flight' or abort back
       // to 'docked'. No writer produces 'undocking' in the shipped SH3 code
@@ -713,7 +781,44 @@ export function isLegalFlightTransition(from: FlightStatus, to: FlightStatus): b
       return to === 'in-flight' || to === 'docked';
     case 'in-flight': return to === 'redocking';
     case 'redocking': return to === 'docked' || to === 'in-flight'; // arrive or bounced
+    // 🕹️ Flown by hand (issue 203): AUTO-DOCK goes through 'redocking', so
+    // shipArrival.completeArrival docks it like any other arrival.
+    case 'free-flight': return to === 'redocking';
   }
+}
+
+/**
+ * 🚏 The records to write, in order, to take the stored flight `from` to
+ * `to` along legal edges only (robot pilot routes, build notes A4). A route's
+ * timetable moves the ship without writing the stored flight, so when a game
+ * copies the timetable back (after STOP, or following a person's route
+ * DEPART that wrote `in-flight`) the stored record may be several edges
+ * behind: `in-flight` reaches `docked` only through `redocking`, arrived
+ * where the timetable has the ship, with no dock of its own. One record when
+ * the edge is legal (or nothing is stored); empty when no path needs no
+ * flight fields the target lacks (the route never asks for those). Pure.
+ */
+export function flightWritePath(from: FlightRecord | null, to: FlightRecord): FlightRecord[] {
+  if (!from || isLegalFlightTransition(from.status, to.status)) return [to];
+  const docked: FlightRecord = { status: 'docked', locationId: to.locationId };
+  if (from.status === 'in-flight') {
+    const redocking: FlightRecord = {
+      status: 'redocking',
+      locationId: to.locationId,
+      ...(from.etaAt !== undefined ? { etaAt: from.etaAt } : {}),
+    };
+    if (to.status === 'docked') return [redocking, to];
+    if (to.status === 'undocking') return [redocking, docked, to];
+  }
+  // 🕹️ Flown by hand: AUTO-DOCK's own way in, through 'redocking'.
+  if (from.status === 'free-flight') {
+    const redocking: FlightRecord = { status: 'redocking', locationId: to.locationId };
+    if (to.status === 'docked') return [redocking, to];
+    if (to.status === 'undocking') return [redocking, docked, to];
+  }
+  if (from.status === 'redocking' && to.status === 'undocking') return [docked, to];
+  // docked or undocking → redocking would need an in-flight record first.
+  return [];
 }
 
 /** Reasons a DEPART is refused. Surface these in the helm UI verbatim — the
@@ -730,6 +835,9 @@ export type DepartRefusal =
   | { ok: false; reason: 'no-transfer' }
   /** The ship's station is not on this client's list: nothing to plan from. */
   | { ok: false; reason: 'unlisted-location' }
+  /** 🚏 A route's timetable flies the ship (shipRoute.routeRulesFlightNow):
+   *  a hand DEPART would write a flight nobody follows. */
+  | { ok: false; reason: 'route-running' }
   | { ok: false; reason: 'no-owner' };
 
 /** Inputs the caller assembles from the live docs — kept as a plain struct so
@@ -753,6 +861,9 @@ export interface DepartContext {
    *  replaces the destination's flat one, and null means no transfer exists
    *  (a shared orbit, say). */
   hop?: { fuelCost: number } | null;
+  /** 🚏 True while a route's timetable rules the flight (running, not
+   *  paused): the helm's own route controls fly it then. Absent = false. */
+  routeRunning?: boolean;
 }
 
 /** Predicate the DEPART button funnels through. Returns the refusal reason so
@@ -760,6 +871,7 @@ export interface DepartContext {
 export function canDepart(ctx: DepartContext): DepartRefusal {
   if (!ctx.ownerAuthorized) return { ok: false, reason: 'no-owner' };
   if (!ctx.flightCapable) return { ok: false, reason: 'not-flight-capable' };
+  if (ctx.routeRunning === true) return { ok: false, reason: 'route-running' };
   if (ctx.currentStatus !== 'docked') return { ok: false, reason: 'not-docked' };
   if (!isKnownStation(ctx.destinationId)) return { ok: false, reason: 'unknown-destination' };
   const dest = findStation(ctx.destinationId);
@@ -978,13 +1090,18 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
  * its own (the flight record's). Kept first-hand in this room
  * (completeArrival, shipArrival.keepRestPlace), so every install reads the
  * same place, whatever station moves it has heard of. A docked ship with none
- * follows its station.
+ * follows its station. 🚏 `open`: where a ferry route's timetable left the
+ * ship with no dock (shipArrival.restAtRouteEnd), on the route's untrimmed
+ * copy of its end stop, in open orbit until a dock carries it: beside a
+ * station there only while no trim moves that station off the place's own
+ * orbit (shipArrival.shipPlaceId).
  */
 export interface RestPlace {
   at: string;
   since: number;
   docks?: string[];
   from?: string;
+  open?: true;
 }
 
 /** Most dock doors a rest record names: every door record a complete
@@ -997,6 +1114,7 @@ export function isRestPlace(v: unknown): v is RestPlace {
   const r = v as Partial<RestPlace>;
   if (!isBoundedString(r.at) || !adriftPlace(r.at) || !isFlightTime(r.since)) return false;
   if (r.from !== undefined && !isBoundedString(r.from)) return false;
+  if (r.open !== undefined && r.open !== true) return false;
   if (r.docks === undefined) return true;
   return Array.isArray(r.docks) && r.docks.length <= MAX_REST_DOCKS
     && r.docks.every((d) => typeof d === 'string' && isAcceptableDoorKey(d));
@@ -1011,6 +1129,7 @@ export function readRestPlace(): RestPlace | null {
   if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
   // Station ids are per install: read another install's as ours.
   if (raw.from !== undefined) out.from = localStationId(raw.from);
+  if (raw.open === true) out.open = true;
   return out;
 }
 
@@ -1027,6 +1146,7 @@ export function writeRestPlace(rest: RestPlace | null): boolean {
     since: rest.since,
     ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
     ...(rest.from !== undefined ? { from: rest.from } : {}),
+    ...(rest.open === true ? { open: true as const } : {}),
   };
   // Station ids are per install: the shared record names the station it
   // rests beside by its welcome room, as the flight record does (keeping
@@ -1069,8 +1189,14 @@ function isCastOffHold(v: unknown): v is CastOffHold {
 /** The cast-off hold in force at `now`, or null. One stamped further ahead
  *  than CAST_OFF_HOLD_MS is none: no peer's clock holds a ship longer. */
 export function readCastOffHold(now: number = Date.now()): CastOffHold | null {
-  if (!docAlive()) return null;
-  const raw = shipMap!.get('castOff');
+  return docAlive() ? castOffHoldIn(shipMap!, now) : null;
+}
+
+/** 🚏🤖 The cast-off hold in force at `now` in a ship map this client is
+ *  not bound to (a ferry's, read through a background session:
+ *  gateKeeper.ts), by readCastOffHold's rule. */
+export function castOffHoldIn(ship: Y.Map<unknown>, now: number = Date.now()): CastOffHold | null {
+  const raw = ship.get('castOff');
   if (!isCastOffHold(raw)) return null;
   return now < raw.at + CAST_OFF_HOLD_MS && raw.at <= now + CAST_OFF_HOLD_MS ? { by: raw.by, at: raw.at } : null;
 }

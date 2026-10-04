@@ -14,7 +14,9 @@ import {
   bindDoorsDoc, buildDoorPairing, buildDoorTombstone, readDoor, writeDoorPairing, writeDoorRecordTo,
   type DoorRecord,
 } from './doorsDoc';
-import { bindShipDoc, readFlightRecord, writeFuelLevel } from './shipDoc';
+import { CAST_OFF_HOLD_MS, bindShipDoc, readCastOffHold, readFlightRecord, writeFlightRecord, writeFuelLevel } from './shipDoc';
+import { installRouteFlight, readRouteCheckpoints, type RouteStop } from './shipRoute';
+import { startRouteFromHelm } from './helmRoute';
 import {
   DEFAULT_STATIONS, TRAVEL_MS_MIN, directoryFromStationRecords, setStationDirectory, setStationRoomCheck,
 } from './stationDirectory';
@@ -248,5 +250,59 @@ describe("a fitted station room's helm", () => {
         expect(html).toContain('This is the station\'s own room');
       }
     }
+  });
+});
+
+describe("the route's own DEPART", () => {
+  let off: (() => void) | null = null;
+  afterEach(() => {
+    off?.();
+    off = null;
+    vi.useRealTimers();
+  });
+
+  it('🚏 keeps its cast-off hold while a far room is slow to let a berth go, then flies the leg', async () => {
+    vi.useFakeTimers();
+    const t0 = Date.UTC(2026, 8, 27, 14, 0, 0);
+    vi.setSystemTime(t0);
+    off = installRouteFlight({ capacity: () => 100, clock: () => Date.now() });
+    // A route people fly between two stops, started docked at the first.
+    const stop = (i: number): RouteStop => ({
+      stationId: `st-${i}`, name: `Stop ${i}`, planetId: 'planet-sovereign', orbitSlot: i,
+      berth: { roomId: `room-${i}`, farDoor: 'x+', anyGate: true }, waitSecs: 60,
+    });
+    writeFlightRecord({ status: 'docked', locationId: 'st-0' });
+    const route = { stops: [stop(0), stop(1)], shape: 'backAndForth' as const, shipPort: 'x-', homeRefuel: true };
+    expect(startRouteFromHelm({ route, now: t0, startStop: 0, fuel: 100, capacity: 100 })).not.toBeNull();
+    const start = readRouteCheckpoints().find((e) => e.kind === 'start') as { departAt: number };
+    vi.setSystemTime(start.departAt - 10_000);
+    // A legacy berth (a guest dock on a door that is no dock port) whose far
+    // room answers only after the hold would have run out unrenewed.
+    writeDoorPairing('north', VISITOR, DOCKED);
+    const asked: Array<[string, number]> = [];
+    const docking: HelmDockingDeps = {
+      ports: () => [],
+      connected: () => [],
+      subscribe: () => () => {},
+      undock: () => true,
+      dock: () => true,
+      releaseAllowed: (doorId, at) => {
+        asked.push([doorId, at]);
+        return new Promise((resolve) => setTimeout(() => resolve(true), CAST_OFF_HOLD_MS + 10_000));
+      },
+    };
+    withHelm((p) => {
+      // DEPART on the picker's route stop is the route's own.
+      expect(p.innerHTML).toContain('DEPART FOR STOP 1');
+      p.click('#helm-depart-btn');
+    }, docking);
+    await vi.advanceTimersByTimeAsync(CAST_OFF_HOLD_MS + 15_000);
+    // Asked once, at the one release moment the berth's tombstone takes too.
+    expect(asked).toEqual([['north', expect.any(Number)]]);
+    expect(readDoor('north')).toMatchObject({ paired: false, retiredAddress: VISITOR, dock: { undockedAt: asked[0][1] } });
+    expect(readFlightRecord()).toMatchObject({ status: 'in-flight', locationId: 'st-0', destinationId: 'st-1' });
+    expect(readRouteCheckpoints().some((e) => e.kind === 'go')).toBe(true);
+    // Its hold is let go once it has flown.
+    expect(readCastOffHold()).toBeNull();
   });
 });
