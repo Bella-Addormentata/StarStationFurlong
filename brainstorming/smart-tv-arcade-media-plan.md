@@ -107,7 +107,14 @@ the sources that fail have to say so on the screen.
 // the programme and writes the presser's own reading of where the room was (`parkMs`: a
 // programme playing, or a schedule past its T0, which plays by the clock whoever holds — null
 // when nothing was running, a pause or a countdown still ahead, and 0 is a reading — a
-// position, never a time: the clocks rule below); on carries it, so
+// position, never a time: the clocks rule below; and null too from a page whose reading is
+// STALE, bridged across its own sleep — ahead of the room by the whole sleep when the sample
+// was a beat the network delivered in the moment after waking, stamped from before the gap
+// like the rest — unless that sample is the page's own last beat, the holder's clock bridged
+// across its own sleep, which every awake viewer ran on to: a reading a page may not act on
+// is none it may publish for the room, and a switch with no reading anchors nothing, the
+// holder parking at the record's last heartbeat, behind the room by a beat at most while the
+// holder is awake and never ahead); on carries it, so
 // every page anchors the resumed programme there on receipt of the ON write (a sample of its
 // own, replaced by the holder's next heartbeat) and the holder's tick parks the programme
 // there as it sees the switch — with no holder present the programme resumes from where it
@@ -527,7 +534,25 @@ sign {its own id, a victim's address} and have every automatic viewer send
 a QUIC handshake there, which is exactly why the node already dials every
 gossip-learned peer by id with EMPTY hints (`ssf-p2p-node/src/main.rs`, the
 TIER_INTRODUCED dial: "the signature covers the payload + author, NOT the
-iroh_node_id / direct_addrs"). So the `blob` source (§3.1) and a library
+iroh_node_id / direct_addrs") — which closes the RELAYED hint and not the
+reflection: with empty hints iroh resolves the id through the Mainline
+DHT, where the id's OWNER publishes its own signed address record (the
+node's `DhtAddressLookup`, `AddrFilter::unfiltered`), so a member that
+signs a room envelope under an id it owns, having published a victim's
+address under that id, still has every node that hears the envelope send
+its QUIC handshake there — automatically, on the envelope alone, before
+any consent. That dial is therefore a PREREQUISITE of this section, not a
+given: the mesh-upgrade dial of a gossip-learned id goes to a route
+observed on an authenticated connection where one exists (the hub's, or
+the connection the envelope arrived on when its peer is the origin), and
+otherwise through discovery under exactly the per-id, per-address and
+global dial budget below — bytes counted at the socket, backoff, a cap on
+automatic dials in flight — so that a reflection costs its victim at most
+the budget's few datagrams a minute from each member and never a
+handshake storm; until the node dials so, the invariant below (an
+automatic fetch never dials a peer-authored address) does not hold for
+the mesh either, and the fetcher's gate alone is not the whole fix. So
+the `blob` source (§3.1) and a library
 op (§7) carry the hash with the importing node's iroh id, and a viewer's
 node resolves that id to a route in two classes, kept apart. A route it
 observed ITSELF on an authenticated connection with that id — the importer
@@ -723,9 +748,12 @@ string, the coded width and height and, where the codec wants one, the
 and the Opus head beyond two channels — signed by the sender's identity
 key like the announcement, forwarded verbatim by every hub, naming the
 counter of the first frame it governs; the generation rises on every
-reconfiguration (a resolution change, a codec change), which always begins
-at a keyframe, so a decoder is reset on a frame it can start from, and it
-never wraps: a sender whose next reconfiguration would pass 65 535
+reconfiguration (a resolution change, a codec change) — for video always
+at a keyframe, so the decoder is reset on a frame it can start from; for
+audio at the first chunk after the new configuration, Opus having no
+keyframes (there is no chunk type to wait for), the receiver resetting
+its decoder there and muting the 80 ms of pre-roll RFC 7845 names before
+its output is clean — and it never wraps: a sender whose next reconfiguration would pass 65 535
 announces a new source instance first (a fresh nonce, id and key — as a
 counter about to wrap takes a new epoch, and §9's input sequence takes a
 new seat), so a generation names one configuration for the life of the
@@ -1043,14 +1071,22 @@ over a hub link is that hub's own doing and the member re-homes rather
 than keep a link that lies. What a hub CANNOT check it is never blamed
 for: it holds no media key, so a frame whose signature is valid but whose
 AEAD tag fails, or whose plaintext is malformed (a batch table that does
-not add up, a duration that is none of the six Opus frame durations, a generation with
-no configuration), passes every honest hub and fails only at a subscriber
+not add up, a duration that is none of the six Opus frame durations),
+passes every honest hub and fails only at a subscriber
 — and only the source could have signed it. Such a failure is charged to
 the SOURCE, by its key: past a handful a second the subscriber mutes that
 source alone, for a doubling backoff, and reports it, while every other
 source on the same link plays on; the link's budget is untouched, or a
 publisher signing garbage would have every subscriber mute the honest
-hub between them and take unrelated sources down with it. A member or
+hub between them and take unrelated sources down with it. A frame of a
+generation the subscriber holds no configuration for is NONE of these:
+the reliable `media-config` and the datagrams it governs travel different
+lanes and arrive in either order, so such a frame waits the jitter window
+and is then dropped (§4 above), charged to nobody — a source penalty is
+for what only the source's own output explains, a tag that fails or a
+plaintext that is malformed, never for a configuration that has not
+arrived yet, or an ordinary reconfiguration would mute a valid source
+at its own threshold. A member or
 hub that floods invalid or oversized frames spends its own link's budget,
 costs verification only up to it, and takes no honest source down; a
 source that signs what cannot be opened silences itself and nobody else;
