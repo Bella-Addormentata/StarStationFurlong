@@ -35,7 +35,7 @@
  * room-doc write today — roomOwner.ts says so outright — so a modified client
  * ignores every check counted here. This is UI correctness for honest clients.
  */
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
@@ -57,6 +57,7 @@ const WRITERS = [
   'addToRoomInventory', // roomInventory
   'clearDoorSlide', // floorPlanDoc — planMap.delete inside a transact
   'writeCupolaWall', // floorPlanDoc — planMap.set/delete inside a transact
+  'clearRobotConfig', // robotDoc — setConfigIn inside a transact on the room doc
 ] as const;
 
 /** Both forms of gate: the shared helper, and the raw predicate it wraps. */
@@ -69,10 +70,71 @@ const GATES = ['this.mayWriteRoomDoc()', 'canEditRoom()'];
  * an offset into the original. Two things here depend on that: slice bounds
  * are measured on SRC and compared against matches found in stripped text,
  * and `lineAt` has to keep reporting the line a reader can go and look at.
+ *
+ * One left-to-right pass rather than two regexes, because the categories
+ * nest and only reading order can say which opened first: `'http://x'` is a
+ * string holding what looks like a comment, and `// don't` is a comment
+ * holding what looks like a quote. Neither exists in editMode.ts today, and
+ * the pass is here so that the first one to arrive cannot blank a span that
+ * carries a gate.
+ *
+ * `strings` asks for string and template TEXT to be blanked as well, which
+ * the gate scan needs and nothing else does — see `gateBody`. A template's
+ * `${…}` holds real code and is left alone, so `{` and `}` stay balanced
+ * either way and the listener brace-matcher can count on this output.
  */
-const stripComments = (s: string): string => s
-  .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
-  .replace(/\/\/[^\n]*/g, (m) => ' '.repeat(m.length));
+const blankOut = (s: string, strings: boolean): string => {
+  // split(''), not [...s]: code units, so an index here is an index in `s`
+  // even where editMode.ts uses an astral character (the 🔭 button label).
+  const out = s.split('');
+  const wipe = (from: number, to: number): void => {
+    for (let k = from; k < to; k += 1) if (out[k] !== '\n') out[k] = ' ';
+  };
+  const resume: number[] = []; // brace depth each open template waits to see
+  let lit = -1; // start of the template text run being read, or -1 for code
+  let depth = 0;
+  let i = 0;
+  while (i < s.length) {
+    if (lit >= 0) { // inside a template literal's text
+      if (s[i] === '\\') { i += 2; } else if (s[i] === '`') {
+        if (strings) wipe(lit, i + 1);
+        lit = -1; resume.pop(); i += 1;
+      } else if (s.startsWith('${', i)) {
+        if (strings) wipe(lit, i); // the substitution is code: keep it
+        lit = -1; depth += 1; i += 2;
+      } else { i += 1; }
+      continue;
+    }
+    const c = s[i];
+    if (s.startsWith('//', i)) {
+      const nl = s.indexOf('\n', i);
+      const stop = nl < 0 ? s.length : nl;
+      wipe(i, stop); i = stop;
+    } else if (s.startsWith('/*', i)) {
+      const close = s.indexOf('*/', i + 2);
+      const stop = close < 0 ? s.length : close + 2;
+      wipe(i, stop); i = stop;
+    } else if (c === "'" || c === '"') {
+      let j = i + 1;
+      while (j < s.length && s[j] !== c && s[j] !== '\n') j += s[j] === '\\' ? 2 : 1;
+      const stop = Math.min(j + 1, s.length);
+      if (strings) wipe(i, stop);
+      i = stop;
+    } else if (c === '`') {
+      resume.push(depth); lit = i; i += 1;
+    } else {
+      if (c === '{') depth += 1;
+      else if (c === '}') depth -= 1;
+      i += 1;
+      // Back to the depth this template's `${` was opened from: its text
+      // resumes at the character after the brace that closed the hole.
+      if (c === '}' && resume.length > 0 && depth === resume[resume.length - 1]) lit = i;
+    }
+  }
+  return out.join('');
+};
+
+const stripComments = (s: string): string => blankOut(s, false);
 
 /**
  * Every member of RoomEditController, sliced from its declaration to the next
@@ -90,16 +152,32 @@ const MEMBER_RE =
   /^ {2}(?:(?:public|private|protected) (?:static )?(?:readonly )?(?:async )?([A-Za-z_$][\w$]*)|(constructor)\b)/gm;
 
 /**
- * Where the constructor registers a listener. Each of these is a separate
- * path from user input into the class, reached at an arbitrary later time, so
- * each is sliced out as its own entry point rather than sharing the
- * constructor's. Sharing is not a technicality: a gate in one handler would
- * otherwise be credited to every other handler, and the constructor's own
- * `canEditRoom()` — which belongs to the right-click handler — would vouch
- * for all ten of them. Only the constructor is cut this way; listeners
- * registered inside a method already belong to a method the scan can see.
+ * Where a listener is registered with its callback written inline. Each one
+ * is a separate path from user input into the class, reached at an arbitrary
+ * later time, so each is sliced out as its own entry point rather than
+ * sharing the body it was written in. Sharing is not a technicality: a gate
+ * in one handler would otherwise be credited to every other handler, and the
+ * constructor's own `canEditRoom()` — which belongs to the right-click
+ * handler — would vouch for all six of them.
+ *
+ * This used to apply to the constructor alone, on the reasoning that a
+ * listener registered inside a method "already belongs to a method the scan
+ * can see". That was the wrong half of the argument. The method is seen, but
+ * what the method DOES when called is register a callback; what the callback
+ * does happens later, on every click, under whatever permissions hold then.
+ * A gate the method ran once at build time was being credited to a write
+ * that fires indefinitely afterwards — the exact defect #198 was opened to
+ * close, and thirteen of this file's nineteen registrations are in methods,
+ * including the two buttons this branch is about (`wallpaperBtnEl` and the
+ * cupola `btn`).
+ *
+ * Only inline callbacks are cut. `window.addEventListener('mousemove',
+ * this.onMouseMove)` hands over a member the scan already models as its own
+ * unit with no in-file caller, so it is already held to its own gate; there
+ * is nothing to carve and carving it would lose the member's real body.
  */
-const LISTENER_RE = /^ {4}[\w.?]+\.addEventListener\(\s*'([\w-]+)'/gm;
+const LISTENER_RE =
+  /\.addEventListener\(\s*(?:'([\w-]+)'|([A-Za-z_$][\w$]*))\s*,\s*(?:async\s+)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{/g;
 
 const lineAt = (index: number): number => SRC.slice(0, index).split('\n').length;
 
@@ -121,9 +199,18 @@ const classEnd = SRC.indexOf('\n}', classAt);
  * decoration: it decides how the unit is CALLED, and therefore how the call
  * graph below finds its callers — `this.foo(` for a member, bare `foo(` for a
  * module-scope function.
+ *
+ * Three views of the same span, each matched against by exactly one thing.
+ * `body` is the text with comments blanked, and writes are found in it.
+ * `callBody` additionally blanks the unit's own declaration, so the call
+ * graph cannot read a declaration as a call. `gateBody` additionally blanks
+ * string and template text, so an owner check cannot be counted because its
+ * name appears inside a message. They are blanked, never cut, so an offset
+ * is the same offset in all three and a gate's position stays comparable
+ * with a write's.
  */
 type Unit = {
-  name: string; body: string; callBody: string;
+  name: string; body: string; callBody: string; gateBody: string;
   start: number; end: number; kind: 'member' | 'function';
 };
 
@@ -151,25 +238,62 @@ const cut = (text: string, offset: number, re: RegExp, name: (m: RegExpMatchArra
   }));
 };
 
+/**
+ * The inline listener callbacks inside one member, as absolute [start, end)
+ * spans of SRC.
+ *
+ * Brace-matched rather than cut to the next registration, because a method
+ * is not a list of handlers the way the constructor nearly is: there is real
+ * code before and after each one, and it belongs to the method. Counting is
+ * done on string- and comment-blanked text so that a brace inside a message
+ * — `showHint(\`… {…}\`)` — is not read as structure.
+ */
+const carveListeners = (m: { start: number; end: number }) => {
+  const text = SRC.slice(m.start, m.end);
+  const code = blankOut(text, true);
+  const spans: { event: string; start: number; end: number }[] = [];
+  for (const h of text.matchAll(LISTENER_RE)) {
+    // The pattern ends on the `{` that opens the callback, so start there.
+    let j = (h.index ?? 0) + h[0].length - 1;
+    for (let depth = 0; j < code.length; j += 1) {
+      if (code[j] === '{') depth += 1;
+      else if (code[j] === '}' && (depth -= 1) === 0) { j += 1; break; }
+    }
+    spans.push({ event: h[1] ?? h[2], start: m.start + (h.index ?? 0), end: m.start + j });
+  }
+  return spans;
+};
+
+/** Blank a span of `text` in place, keeping its length and its newlines. */
+const blankSpan = (text: string, from: number, to: number): string => text.slice(0, from)
+  + text.slice(from, to).replace(/[^\n]/g, ' ') + text.slice(to);
+
 const members: Unit[] = [];
 for (const m of cut(SRC.slice(classAt, classEnd), classAt, MEMBER_RE, (h) => h[1] ?? h[2])) {
-  // The constructor is replaced by its prologue plus one slice per listener,
-  // named for the event and the line so a failure says which handler.
-  const listeners = m.name === 'constructor'
-    ? cut(SRC.slice(m.start, m.end), m.start, LISTENER_RE, (h) => `'${h[1]}' listener`)
-    : [];
-  const parts = listeners.length > 0
-    ? [{ ...m, end: listeners[0].start }, ...listeners]
-    : [m];
-  for (const p of parts) {
-    const name = p.name.endsWith('listener')
-      ? `constructor's ${p.name} at line ${lineAt(p.start)}`
-      : p.name;
-    const body = stripComments(SRC.slice(p.start, p.end));
+  // Each member is replaced by itself-minus-its-handlers plus one unit per
+  // handler, named for the member, the event and the line, so a failure says
+  // which one. The member keeps what it does when CALLED; blanking the
+  // callbacks out of it is the whole point, since what they do happens later
+  // and must answer for itself.
+  const listeners = carveListeners(m);
+  let own = SRC.slice(m.start, m.end);
+  for (const l of listeners) own = blankSpan(own, l.start - m.start, l.end - m.start);
+
+  const parts = [
+    { name: m.name, decl: m.raw, start: m.start, end: m.end, text: own },
     // A listener slice opens at its addEventListener line — code, not a
     // declaration, and often carrying a real call — so nothing is blanked.
-    const decl = p.name.endsWith('listener') ? '' : p.raw;
-    members.push({ ...p, name, kind: 'member', body, callBody: blankDecl(body, decl) });
+    ...listeners.map((l) => ({
+      name: `${m.name}'s '${l.event}' listener at line ${lineAt(l.start)}`,
+      decl: '', start: l.start, end: l.end, text: SRC.slice(l.start, l.end),
+    })),
+  ];
+  for (const p of parts) {
+    const body = stripComments(p.text);
+    members.push({
+      name: p.name, start: p.start, end: p.end, kind: 'member',
+      body, callBody: blankDecl(body, p.decl), gateBody: blankOut(body, true),
+    });
   }
 }
 
@@ -201,7 +325,8 @@ const functions: Unit[] = [...SRC.matchAll(FREE_RE)].map((h) => {
   const end = close < 0 ? SRC.length : close + 2;
   const body = stripComments(SRC.slice(start, end));
   return {
-    name: h[1], start, end, kind: 'function' as const, body, callBody: blankDecl(body, h[0]),
+    name: h[1], start, end, kind: 'function' as const, body,
+    callBody: blankDecl(body, h[0]), gateBody: blankOut(body, true),
   };
 });
 
@@ -272,10 +397,91 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       .map((m) => `${m.name} (line ${lineAt(m.start)}) contains another member's declaration`);
     expect(swallowed, swallowed.join('\n')).toEqual([]);
 
-    // And the constructor really was broken out into its handlers. Ten of
-    // them today; the count is not pinned, only that the split happened.
-    expect(members.filter((m) => m.name.startsWith("constructor's")).length,
+    // And the handlers really were broken out — from methods as well as
+    // from the constructor, which is the half this scan used to skip. The
+    // counts are floors, not pins: what is asserted is that the split
+    // happened on both sides, since a regex that quietly stopped matching
+    // would fold every callback back into the body that registers it and
+    // hand each one a gate that ran once, at build time.
+    const handlers = members.filter((m) => m.name.includes("' listener at line "));
+    expect(handlers.filter((m) => m.name.startsWith("constructor's")).length,
       'the constructor was not split into its listeners').toBeGreaterThan(5);
+    expect(handlers.filter((m) => !m.name.startsWith("constructor's")).length,
+      'no method-registered listener was carved out, so each is still '
+      + "credited to the gate of whatever method registered it").toBeGreaterThan(5);
+    // The two buttons #198 is about, named rather than counted: both are
+    // registered inside a method, and both reach a room-doc write.
+    for (const n of ["showCupolaButton's 'click'", "showWallpaperButton's 'click'"]) {
+      expect(handlers.some((m) => m.name.startsWith(n)), `${n} listener not carved out`)
+        .toBe(true);
+    }
+
+    // Each carved span must be a whole callback inside the member that
+    // registered it. A brace-matcher that ran off the end would swallow the
+    // rest of the class — and swallow it SILENTLY, since the extra text
+    // would arrive carrying gates.
+    const ill: string[] = [];
+    for (const h of handlers) {
+      const text = blankOut(SRC.slice(h.start, h.end), true);
+      let depth = 0;
+      for (const ch of text) {
+        if (ch === '{') depth += 1;
+        else if (ch === '}') depth -= 1;
+      }
+      if (depth !== 0) ill.push(`${h.name}: braces unbalanced by ${depth}`);
+      if (!text.trimEnd().endsWith('}')) ill.push(`${h.name}: does not end on its closing brace`);
+      const owner = members.find((m) => !m.name.includes("' listener at line ")
+        && m.start <= h.start && m.end >= h.end);
+      if (!owner) ill.push(`${h.name}: not contained in any member`);
+    }
+    expect(ill, ill.join('\n')).toEqual([]);
+  });
+
+  it('reads strings as strings, so neither a gate nor a brace can hide in one', () => {
+    // `blankOut` is the one piece of this file that is a parser rather than a
+    // regex, and both halves of the scan now rest on it: gates are matched
+    // against text it blanked, and listener callbacks are brace-matched on
+    // it. So test it directly, on the shapes that break the naive version,
+    // rather than inferring it worked from the scan having passed.
+    const cases: [string, string, string][] = [
+      // [source, comments blanked, comments and strings blanked]
+      ["a; // canEditRoom()", 'a;                 ', 'a;                 '],
+      ['a; /* canEditRoom() */ b;', 'a;                     b;', 'a;                     b;'],
+      // A comment marker inside a string is not a comment: blanking from it
+      // would wipe the rest of the line, including a gate standing after it.
+      ["x('http://h'); canEditRoom();", "x('http://h'); canEditRoom();", 'x(          ); canEditRoom();'],
+      // A quote inside a comment does not open a string.
+      ["// don't\ncanEditRoom();", '        \ncanEditRoom();', '        \ncanEditRoom();'],
+      // The case this test exists for: a gate that is only a message.
+      ["showHint('canEditRoom() first');", "showHint('canEditRoom() first');", 'showHint(                     );'],
+      // Templates: the text goes, the `${…}` is code and stays — so braces
+      // stay balanced and the brace-matcher can count on the output.
+      ['`a ${f({ x: 1 })} b`;', '`a ${f({ x: 1 })} b`;', '   ${f({ x: 1 })}   ;'],
+      // Nested templates, which a non-nesting scanner reads inside out and
+      // gets wrong from the first inner backtick onwards. editMode.ts has
+      // one, at the 'Removed …' hint.
+      ['`a${c ? `-${d}-` : ""}b`;', '`a${c ? `-${d}-` : ""}b`;', '  ${c ?   ${d}   :   }  ;'],
+      // An escaped quote does not end the string.
+      ["'it\\'s'; canEditRoom();", "'it\\'s'; canEditRoom();", '       ; canEditRoom();'],
+    ];
+    for (const [src, noComments, noStrings] of cases) {
+      expect(blankOut(src, false), `comments: ${JSON.stringify(src)}`).toBe(noComments);
+      expect(blankOut(src, true), `strings: ${JSON.stringify(src)}`).toBe(noStrings);
+      // Length and newlines are load-bearing: every offset in the output is
+      // the same offset in the input, which is what lets a gate's position
+      // be compared with a write's.
+      expect(blankOut(src, true).length, 'length changed').toBe(src.length);
+    }
+
+    // And on the real file, not just fixtures: blanking must leave the class
+    // body's braces balanced, since that is what the carver counts.
+    const cls = blankOut(SRC.slice(classAt, classEnd + 2), true);
+    let depth = 0;
+    for (const ch of cls) {
+      if (ch === '{') depth += 1;
+      else if (ch === '}') depth -= 1;
+    }
+    expect(depth, 'the class body does not brace-balance once blanked').toBe(0);
   });
 
   it('finds every module-scope function, and slices each one to its own body', () => {
@@ -365,8 +571,16 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // already been mutated, which is not a check; it would also accept one
     // in an unrelated branch, which this still cannot tell apart — see the
     // limits noted at the top of this file.
+    //
+    // Gates are looked for in `gateBody` and writes in `body` — the same
+    // span, blanked differently, so the two offsets stay comparable. Only
+    // the gate side hides string text, and deliberately so: a write found
+    // inside a message is a false positive that fails loudly and gets
+    // fixed, while a gate found inside a message is a false negative that
+    // quietly manufactures coverage. `showHint('ask canEditRoom() first')`
+    // is not an owner check, and before this it counted as one.
     const gated = new Set(units.filter((u) => {
-      const gate = firstAt(u.body, GATE_RE);
+      const gate = firstAt(u.gateBody, GATE_RE);
       if (gate < 0) return false;
       const write = firstAt(u.body, WRITER_RE);
       return write < 0 || gate < write;
@@ -447,6 +661,11 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
     // The WRITERS list above is only as good as someone remembering to extend
     // it. This makes forgetting fail: add an import from one of these modules
     // and this test asks you which side of the line the new name is on.
+    //
+    // The list below is still hand-written, but it is no longer the only
+    // thing standing between a new writer and a silent pass — see the
+    // check after it, which derives the set of modules that MUST appear
+    // here rather than trusting that someone added them.
     const EXPECTED: Record<string, string[]> = {
       './doorLayoutDoc': ['defaultDoorLayoutRecords', 'deleteDoorLayout', 'doorDisplayName',
         'doorSetIsAuthoritative', 'readAllDoorLayout', 'seedDoorLayoutDefaults', 'writeDoorLayout'],
@@ -458,6 +677,12 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       './roomInventory': ['activeRoomId', 'addToRoomInventory'],
       './floorPlanDoc': ['clearDoorSlide', 'doorLateralLimitForWall', 'readCupolaWall',
         'roomCupola', 'roomHalfExtents', 'roomPlaceBounds', 'writeCupolaWall'],
+      './robotDoc': ['clearRobotConfig', 'readRobotConfig'],
+      // shipRoute transacts in ten places, but neither name editMode takes
+      // is one of them: readShipRoute resolves a cached snapshot, and
+      // routeRulesFlightNow is a type guard over it (pilotRoute.ts). Pinned
+      // so that importing one of the ten would have to be argued for.
+      './shipRoute': ['readShipRoute', 'routeRulesFlightNow'],
     };
     for (const [mod, names] of Object.entries(EXPECTED)) {
       // Value imports only — `import type { … }` can't be called.
@@ -467,6 +692,38 @@ describe('edit mode: no room-doc write without a live owner check (source scan)'
       expect(got, `${mod}: is any new name here a room-doc writer? If so add it to WRITERS`)
         .toEqual(names);
     }
+
+    // The half the list above cannot do for itself.
+    //
+    // A pinned allowlist only guards the modules somebody already thought
+    // of. `./robotDoc` proved it: it arrived in editMode.ts with #184's
+    // merge, bringing `clearRobotConfig` — a real room-doc write, since
+    // robotDoc is bound to the same Y.Doc as furniture and the floor plan
+    // (`main.ts` bindRobotDoc(sync.doc)) — and because no key named it,
+    // nothing above so much as looked. Neither list was wrong; the set of
+    // lists was incomplete, which is the failure a hand-maintained
+    // allowlist is always one import away from.
+    //
+    // So derive the obligation instead of trusting it: every relative
+    // module editMode.ts imports VALUES from is read off disk, and any one
+    // that transacts on a Yjs doc has to appear above. A new doc module
+    // then cannot arrive unclassified — the test names it and asks.
+    const dir = dirname(fileURLToPath(import.meta.url));
+    const unwatched: string[] = [];
+    for (const m of SRC.matchAll(/^import\s+\{([^}]*)\}\s*from\s*'(\.[^']+)'/gm)) {
+      const mod = m[2];
+      if (mod in EXPECTED) continue;
+      const file = join(dir, `${mod.slice(2)}.ts`);
+      if (!existsSync(file)) continue; // a directory or non-.ts module: nothing to read
+      // `.transact(` is how every writer in this codebase commits; a module
+      // without one cannot mutate a shared doc, whatever it is called.
+      if (/\.transact\s*\(/.test(stripComments(readFileSync(file, 'utf8')))) {
+        unwatched.push(`${mod} (imports ${m[1].trim()})`);
+      }
+    }
+    expect(unwatched, `these modules write to a shared doc and are not pinned above.\n${
+      'Add each to EXPECTED, and put any name that writes into WRITERS:\n'}${
+      unwatched.join('\n')}`).toEqual([]);
   });
 
   it('starts a session behind the same gate, so a write is never the first check', () => {
