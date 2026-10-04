@@ -1187,7 +1187,15 @@ async function joinRoom(
  * `own`, and anything else the atlas says about it is stale.
  */
 function shipStationHere(roomId: string): string | null {
-  if (!roomId) return null;
+  return shipStationsHere(roomId)[0] ?? null;
+}
+
+/** Every station the ship's live docks lead into, in door order (two when a
+ *  ship is docked into two stations at once): shipStationHere's first is
+ *  where it is, and none of them is a destination. */
+function shipStationsHere(roomId: string): string[] {
+  const out: string[] = [];
+  if (!roomId) return out;
   // Every real door, past the snapshot's cap: a flood must not hide a dock.
   for (const [, rec] of readAllDoorsWithPhysical()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
@@ -1204,11 +1212,11 @@ function shipStationHere(roomId: string): string | null {
     // Another lone module's one-room station is no host: two lone modules
     // docked together each stay where they are (stations.dockedStationFor).
     if (st && st.derived && atlasComponent(readAtlas(), st.welcomeRoomId).size <= 1) continue;
-    if (st) return st.id;
+    if (st && !out.includes(st.id)) out.push(st.id);
   }
   // No host station: not the ship's own one-room station (the directory
   // hears about that through `own`), so callers fall back to the flight.
-  return null;
+  return out;
 }
 
 /** The one-module station whose welcome room IS this room, straight from
@@ -1794,6 +1802,7 @@ async function joinRoomAtEpoch(
         localSeedFor,
         () => shipStationHere(activeBootstrap?.roomId ?? ""),
         () => ownStationOf(activeBootstrap?.roomId ?? ""),
+        () => shipStationsHere(activeBootstrap?.roomId ?? ""),
       ),
     );
     // ⚓ A docked module's berth is not structure, so the atlas keeps it apart

@@ -16,8 +16,9 @@ import {
 } from './doorsDoc';
 import { bindShipDoc, readFlightRecord, writeFuelLevel } from './shipDoc';
 import {
-  DEFAULT_STATIONS, directoryFromStationRecords, setStationDirectory, setStationRoomCheck,
+  DEFAULT_STATIONS, TRAVEL_MS_MIN, directoryFromStationRecords, setStationDirectory, setStationRoomCheck,
 } from './stationDirectory';
+import { DEFAULT_PLANET_ID, registerStation, setStationRoomSource } from './stations';
 import type { HelmDockingDeps } from './devices';
 
 // devices.ts hangs debug handles on window as it loads.
@@ -78,6 +79,15 @@ const fitting = (kind: string): FurnitureItem =>
 let saved: FurnitureItem[] = [];
 let doc: Y.Doc;
 
+// Saved station records live in localStorage.
+let store = new Map<string, string>();
+(globalThis as { localStorage?: unknown }).localStorage = {
+  getItem: (k: string) => store.get(k) ?? null,
+  setItem: (k: string, v: string) => { store.set(k, v); },
+  removeItem: (k: string) => { store.delete(k); },
+  clear: () => { store.clear(); },
+};
+
 /** A peer's flood: READ_CAP valid records, written ahead of anything real. */
 function flood(record: DoorRecord): void {
   for (let i = 0; i < READ_CAP; i++) writeDoorRecordTo(doc, `d:flood-${i}`, record);
@@ -99,6 +109,8 @@ afterEach(() => {
   FURNITURE.splice(0, FURNITURE.length, ...saved);
   setStationDirectory(null);
   setStationRoomCheck(null);
+  setStationRoomSource(() => '');
+  store = new Map();
   clearShipArrivalNote();
 });
 
@@ -183,6 +195,20 @@ describe("a fitted station room's helm", () => {
     undock: () => {},
     dock: () => {},
   };
+
+  it("is placed at its own station, never at an empty ship record's default", () => {
+    // A one-module station wearing ship fittings: its room is its station's,
+    // as the holotable and the room resolver place it (followsFlightRecord).
+    registerStation({ id: 'aris', name: 'ARIS', planetId: DEFAULT_PLANET_ID, orbitSlot: 3, welcomeRoomId: 'room-aris' });
+    setStationRoomSource(() => 'room-aris');
+    setStationDirectory({
+      stations: () => [...DEFAULT_STATIONS, { id: 'aris', name: 'ARIS', planetId: DEFAULT_PLANET_ID, fuelCost: 0, travelMs: TRAVEL_MS_MIN }],
+    });
+    setStationRoomCheck(() => 'lone-station');
+    const html = renderHelm();
+    expect(html).toContain('LOCATION</span><span>ARIS</span>');
+    expect(html).not.toContain('LOCATION</span><span>Furlong Station</span>');
+  });
 
   it('says why it stays, as its DEPART line does, and never how to depart', () => {
     for (const why of ['lone-station', 'welcome-room'] as const) {

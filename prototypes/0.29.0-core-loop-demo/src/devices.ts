@@ -2242,7 +2242,14 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     const named = (id: string) => isKnownStation(id)
       ? findDestination(id)
       : { ...findDestination(id), id, name: 'an unlisted station' };
-    const location = named(shipLocationId(flight, hasLiveDock()));
+    // A room that does not follow its flight record (a station's own room,
+    // or one that cannot fly) is where its station is, as the holotable and
+    // the room resolver place it; its record may be an empty doc's default.
+    const capable = flightCapable(isShipReady());
+    const location = named(
+      (followsFlightRecord(flight.status, capable) ? null : currentStation()?.id)
+        ?? shipLocationId(flight, hasLiveDock()),
+    );
     const destination = flight.destinationId ? named(flight.destinationId) : null;
     const choices = destinationsFrom(location.id);
     if (!choices.some((d) => d.id === pickerDestId)) pickerDestId = choices[0]?.id ?? null;
@@ -2251,7 +2258,7 @@ export function createHelmUI(docking?: HelmDockingDeps): DeviceUI {
     // still be to come), when it lands, and what it burns.
     const hop = pickerDestId ? planHop(location.id, pickerDestId, now) : null;
     const refusal = canDepart({
-      flightCapable: flightCapable(isShipReady()),
+      flightCapable: capable,
       currentStatus: flight.status,
       currentFuel: fuel,
       destinationId: pickerDestId ?? '',

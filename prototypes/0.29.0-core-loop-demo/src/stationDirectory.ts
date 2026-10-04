@@ -54,6 +54,10 @@ export interface StationDirectory {
    *  one-module station is `own`, never `here`) or when that is not known.
    *  Never a destination. */
   here?(): string | null;
+  /** Every station the ship's live docks lead into (`here` is one of them):
+   *  a ship docked into two stations at once is at both. Never a
+   *  destination. */
+  docked?(): readonly string[];
   /** The ship's OWN one-module station, when its room is listed as one (a
    *  module docked only by transient docks is its own atlas group) — never a
    *  destination. */
@@ -192,13 +196,15 @@ export function stationHere(): string | null {
 }
 
 /** The stations a ship at `fromId` may fly to: every OTHER station orbiting
- *  the same planet (and never the one its room belongs to right now). */
+ *  the same planet (and never one its room belongs to right now, nor any
+ *  its live docks lead into). */
 export function destinationsFrom(fromId: string): StationDestination[] {
   const from = findStation(fromId);
   const here = stationHere();
   const own = directory.own?.() ?? null;
+  const docked = new Set(directory.docked?.() ?? []);
   return listStations().filter(
-    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own,
+    (s) => s.planetId === from.planetId && s.id !== from.id && s.id !== here && s.id !== own && !docked.has(s.id),
   );
 }
 
@@ -334,13 +340,15 @@ export function withStationSnapshot<T>(fn: () => T): T {
 }
 
 /** A directory over the station record: `list` is stations.listStations,
- *  `hereId` the ship room's station (null when floating free); hops follow
- *  the circular-orbit model (orbits.ts). */
+ *  `hereId` the ship room's station (null when floating free), `dockedIds`
+ *  every station its live docks lead into; hops follow the circular-orbit
+ *  model (orbits.ts). */
 export function directoryFromStationRecords(
   list: () => readonly StationRecordLike[],
   seedFor: (roomId: string) => string | undefined,
   hereId: () => string | null,
   ownId: () => string | null = () => null,
+  dockedIds: () => readonly string[] = () => [],
 ): StationDirectory {
   // Read once per withStationSnapshot: the list, and the destinations
   // (each looks its seed up in the atlas).
@@ -348,6 +356,7 @@ export function directoryFromStationRecords(
   return {
     stations: () => snapshotted(destinations),
     here: hereId,
+    docked: dockedIds,
     own: ownId,
     plan: (fromId, toId, nowMs) => {
       const records = snapshotted(list);

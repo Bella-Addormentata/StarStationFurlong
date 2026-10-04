@@ -4,7 +4,7 @@
 
 import { beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { bindDoorLayoutDoc, seedDoorLayoutSingle } from './doorLayoutDoc';
+import { bindDoorLayoutDoc, seedDoorLayoutEmpty, seedDoorLayoutSingle } from './doorLayoutDoc';
 import {
   bindDoorsDoc, buildDoorPairing, readAllDoors, readAllDoorsWithPhysical, writeDoorPairing, writeDoorRecordTo,
 } from './doorsDoc';
@@ -40,5 +40,14 @@ describe("the room's door records past the read cap", () => {
     expect(doors.get('d:gangway')?.paired).toBe(true);
     expect(doors.has('d:flood-0')).toBe(true);
     expect(doors.size).toBe(65);
+  });
+
+  it('adds no default door to a room whose owner removed every door', () => {
+    // The authoritative-empty marker: a doorless room, not one from before
+    // the layout store, so a record on a cardinal id is no real door's.
+    seedDoorLayoutEmpty();
+    flood();
+    writeDoorPairing('north', STATION_CORE);
+    expect(readAllDoorsWithPhysical().has('north')).toBe(false);
   });
 });
