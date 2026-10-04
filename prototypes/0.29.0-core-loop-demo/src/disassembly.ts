@@ -349,6 +349,11 @@ export interface CandidateInput {
   hereRoomId: string;
   /** That room's door records (doorsDoc readAllDoors). */
   doors: ReadonlyMap<string, DoorRecord>;
+  /** True when `doors` may leave a door out: the room holds more records
+   *  than a snapshot keeps (doorsDoc readAllDoorsIfComplete read null), which
+   *  a peer could have flooded. A door to the module could be among those
+   *  left out, so nothing comes off until the doors read whole. */
+  doorsPartial?: boolean;
   /** The local player's id (roomInfo.owner's vocabulary). */
   playerId: string;
   /** The local identity key (keypair getIdentityPub), which still names an
@@ -420,7 +425,9 @@ export function ownerIsMe(owner: AtlasOwner, me: { playerId: string; identityPub
  *    with a ship docked at it, would leave that one cut off;
  *  - and only by structure: the end seals this room's structural doors to
  *    it, so a berth of this room's joined to it as well (it docked here as a
- *    ship too) would leave it docked here. It waits until that is undocked.
+ *    ship too) would leave it docked here. It waits until that is undocked;
+ *  - all of this room's doors must be read to know that, and to seal every
+ *    one joined to it: a capped read (doorsPartial) holds it.
  */
 export function removalBlocker(input: CandidateInput, roomId: string): string | null {
   const { atlas } = input;
@@ -433,6 +440,9 @@ export function removalBlocker(input: CandidateInput, roomId: string): string | 
   if (owner !== null && !legacyOwnerMarker(owner.id) && !ownerIsMe(owner, input)) {
     return `it belongs to ${owner.name || 'someone else'}`;
   }
+  // A door to it left out of a capped read would stay unsealed, and a berth
+  // to it unseen.
+  if (input.doorsPartial) return "this room's doors can't all be read; it has too many door records";
   // Docked here as well (a berth of this room's paired with it): the end
   // seals this room's structural doors only, and the berth would stay.
   for (const rec of input.doors.values()) {

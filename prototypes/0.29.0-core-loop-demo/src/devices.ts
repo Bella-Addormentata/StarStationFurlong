@@ -232,7 +232,7 @@ import {
 } from './robotDoc';
 // 🔧 #192: the Disassemble job's labor and progress.
 import { jobFraction, jobStatusText, type DisassemblyCandidate } from './disassembly';
-import type { RobotRoutine, RobotStep } from './robotDoc';
+import type { RobotConfig, RobotRoutine, RobotStep } from './robotDoc';
 import { isRobotVoiceEnabled, setRobotVoiceEnabled } from './robotVoice';
 // 🚀 The robot captain (slice 5): who may be named, and the captain's lock.
 import {
@@ -4517,9 +4517,21 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
    *  replaces only a part that changed (a click in progress survives it). */
   let drawnDis = { picks: '', status: '' };
 
-  /** 🔧 May this player set a robot to take a module apart: the console's
-   *  owner gate, and the room's deed. */
-  const mayTakeApart = (): boolean => deps.canEdit() && (deps.holdsDeed?.() ?? true);
+  /** 🔧 May this player set a robot to take a module apart: the room's deed
+   *  (the console's owner gate where it has no deed check). The deed alone:
+   *  an owner back on a fresh player id holds it (isDeedHolder knows their
+   *  identity key), where the owner gate knows only the player id. */
+  const mayTakeApart = (): boolean => (deps.holdsDeed ? deps.holdsDeed() : deps.canEdit());
+  /** 🔧 May this player switch the robot to routine `to`: the owner gate, or
+   *  the deed for Disassemble (setting a robot to take a module apart). */
+  const mayRoutine = (to: RobotRoutine): boolean => deps.canEdit() || (to === 'disassemble' && mayTakeApart());
+  /** 🔧 May this player press STOP/START on this config: the owner gate, or
+   *  the deed on a Disassemble robot. START putting a robot back on its
+   *  module's job takes the deed alone, like the pick (STOP only pauses it). */
+  const mayPark = (cfg: RobotConfig | null | undefined): boolean =>
+    startResumesDisassembly(cfg)
+      ? mayTakeApart()
+      : deps.canEdit() || (cfg?.routine === 'disassemble' && mayTakeApart());
 
   /** 🔧 The Disassemble routine's section: which joined module to take
    *  apart (each with its labor hours, or what stops it), and how the job on
@@ -4627,6 +4639,10 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const cfg = readRobotConfig(deps.itemId);
     const current = cfg?.routine ?? 'serve';
     const owner = deps.canEdit();
+    // 🔧 The deed: the Disassemble routine, its pick and its STOP/START are
+    // the deed holder's even where the owner gate doesn't know them (back
+    // on a fresh player id: mayRoutine, mayPark).
+    const deed = mayTakeApart();
     // 🚀 The captain's lock (design §2a): while a running route names this
     // dock as its robot captain, its routine can't change (and edit mode
     // won't remove the dock). Ship pilot itself is offered only aboard a
@@ -4636,7 +4652,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const flightCapable = isShipReady();
     const routineBtn = (r: RobotRoutine): string => {
       const on = r === current;
-      const usable = owner && (on || !captain);
+      const usable = mayRoutine(r) && (on || !captain);
       return `<button data-routine="${r}" ${usable ? '' : 'disabled'} style="
         display:flex; justify-content:space-between; align-items:center; gap:8px;
         padding:9px 12px; text-align:left;
@@ -4644,7 +4660,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         border:1px solid ${on ? '#2fe6a0' : 'rgba(212,168,75,0.35)'};
         border-radius:7px; color:${on ? '#2fe6a0' : CH_GOLD};
         font-family:inherit; font-size:11px; font-weight:800; letter-spacing:0.5px;
-        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !owner ? 1 : 0.45};
+        cursor:${usable ? 'pointer' : 'default'}; opacity:${usable || on || !(owner || deed) ? 1 : 0.45};
       "><span>${ROUTINE_LABELS[r]}</span><span>${on ? '● ON' : ''}</span></button>`;
     };
     const routines = ROBOT_ROUTINES.filter((r) => r !== 'pilot' || pilotRoutineOffered({ flightCapable, current }));
@@ -4683,7 +4699,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
     const parked = cfg?.parked === true;
     // 🔧 START on a stopped Disassemble robot puts it back on its module's
     // job: the deed holder's, like the pick (STOP only pauses the job).
-    const parkUsable = owner && (!startResumesDisassembly(cfg) || mayTakeApart());
+    const parkUsable = mayPark(cfg);
     const parkBtn = `<button data-park="1" ${parkUsable ? '' : 'disabled'} style="
       display:flex; justify-content:center; align-items:center;
       padding:10px 12px; width:100%;
@@ -4691,7 +4707,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       border:1px solid ${parked ? '#2fe6a0' : '#ff8a50'};
       border-radius:7px; color:${parked ? '#2fe6a0' : '#ff8a50'};
       font-family:inherit; font-size:12px; font-weight:800; letter-spacing:0.5px;
-      cursor:${parkUsable ? 'pointer' : 'default'}; opacity:${parkUsable || !owner ? 1 : 0.5};
+      cursor:${parkUsable ? 'pointer' : 'default'}; opacity:${parkUsable || !(owner || deed) ? 1 : 0.5};
     ">${parked ? '▶ START · resume routine' : '⏸ STOP · park at dock'}</button>`;
     const addBtn = (kind: string, label: string): string =>
       `<button data-add="${kind}" style="flex:1; padding:6px; background:rgba(212,168,75,0.08); border:1px solid rgba(212,168,75,0.35); border-radius:6px; color:${CH_GOLD_BRIGHT}; font-family:inherit; font-size:10px; font-weight:800; cursor:pointer;">${label}</button>`;
@@ -4739,7 +4755,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       <div style="font-size:9.5px; color:${owner ? CH_PINK : CH_DIM}; letter-spacing:0.5px;">
         ${owner
           ? 'Program this dock&apos;s robot. Custom = a step loop it walks and speaks.'
-          : 'Only the room owner can program this robot.'}
+          : deed
+            ? 'Your deed lets you set this robot to take a module apart. Its other routines need edit rights in this room.'
+            : 'Only the room owner can program this robot.'}
       </div>
       <div style="font-size:9px; color:#33404E; border-top:1px solid rgba(212,168,75,0.12); padding-top:8px;">
         SSF ROBOT CONSOLE v1 · one robot per dock · syncs to everyone in the room
@@ -4752,7 +4770,9 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       setRobotVoiceEnabled(!isRobotVoiceEnabled());
       render();
     });
-    if (!owner) return;
+    // 🔧 The deed holder's controls (above) are wired for them too; the
+    // script below stays the owner gate's.
+    if (!owner && !deed) return;
     // 🤖 STOP/START: toggle parked, preserving routine + script (and the
     // 🔧 module a Disassemble robot is on: parked, it leaves the crew, and
     // START puts it back).
@@ -4760,7 +4780,7 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
       const c = readRobotConfig(deps.itemId);
       // 🔧 Re-checked at the click, like the pick: the gate or the robot's
       // config may have changed since the draw.
-      if (startResumesDisassembly(c) && !mayTakeApart()) {
+      if (!mayPark(c)) {
         render();
         return;
       }
@@ -4777,6 +4797,11 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         // Keep any authored script AND the parked state when switching routines.
         const c = readRobotConfig(deps.itemId);
         const to = b.dataset.routine as RobotRoutine;
+        // 🔧 Re-checked at the click: the gates may have changed since the draw.
+        if (!mayRoutine(to)) {
+          render();
+          return;
+        }
         // 🚀 Re-checked at the click: the route may have started since the
         // render ("Captain of this ship's route: stop the route first").
         const refused = consoleRoutineRefusal({
@@ -4798,6 +4823,8 @@ export function createRobotDockUI(deps: RobotDockUIDeps): DeviceUI {
         });
       });
     });
+    // The script is the owner gate's alone.
+    if (!owner) return;
     panel.querySelectorAll<HTMLButtonElement>('[data-add]').forEach((b) => {
       b.addEventListener('click', () => {
         const kind = b.dataset.add;

@@ -383,6 +383,21 @@ describe('what a room can take apart', () => {
     expect(removalBlocker(input(doors), 'room-b')).toBeNull();
   });
 
+  it("waits while this room's doors can't all be read", () => {
+    const doors = hub();
+    // A capped read (more records than a snapshot keeps, which a peer could
+    // have flooded) may leave out a door to the module: one the end would
+    // leave unsealed, or a berth to it.
+    const capped = "this room's doors can't all be read; it has too many door records";
+    const partial = input(doors, { doorsPartial: true });
+    expect(removalBlocker(partial, 'room-b')).toBe(capped);
+    expect(disassemblyCandidates(partial)[0]).toMatchObject({ roomId: 'room-b', blocked: capped });
+    // What the module itself says still comes first.
+    expect(removalBlocker(partial, 'room-c')).toBe('it belongs to Sam');
+    // Read whole, it can come off.
+    expect(removalBlocker(input(doors, { doorsPartial: false }), 'room-b')).toBeNull();
+  });
+
   it('seals every door of this room joined to the module', () => {
     const doors = hub();
     doors.set('d:2', pairing('room-b'));
@@ -1439,7 +1454,7 @@ describe('the deed takes a module apart (source scan)', () => {
 
   it('sets a robot to a module for the deed holder alone, checked again at the click', () => {
     const devices = source('devices.ts');
-    expect(devices).toContain('const mayTakeApart = (): boolean => deps.canEdit() && (deps.holdsDeed?.() ?? true);');
+    expect(devices).toContain('const mayTakeApart = (): boolean => (deps.holdsDeed ? deps.holdsDeed() : deps.canEdit());');
     const wire = between(devices, 'const wireDisassemblyPicks = ', 'const redrawDisassembly = ');
     const click = wire.indexOf("addEventListener('click'");
     expect(click).toBeGreaterThan(-1);
@@ -1451,12 +1466,40 @@ describe('the deed takes a module apart (source scan)', () => {
 
   it('puts a stopped robot back on its module for the deed holder alone, checked again at the click', () => {
     const devices = source('devices.ts');
-    expect(devices).toContain('const parkUsable = owner && (!startResumesDisassembly(cfg) || mayTakeApart());');
+    const mayPark = between(devices, 'const mayPark = (cfg: RobotConfig | null | undefined): boolean =>', ';\n');
+    expect(mayPark).toContain('startResumesDisassembly(cfg)\n      ? mayTakeApart()\n');
+    expect(devices).toContain('const parkUsable = mayPark(cfg);');
     expect(devices).toContain("<button data-park=\"1\" ${parkUsable ? '' : 'disabled'}");
     const park = between(devices, "panel.querySelector<HTMLButtonElement>('[data-park]')", 'wireDisassemblyPicks();');
-    const recheck = park.indexOf('if (startResumesDisassembly(c) && !mayTakeApart())');
+    const recheck = park.indexOf('if (!mayPark(c))');
     expect(recheck).toBeGreaterThan(-1);
     expect(recheck).toBeLessThan(park.indexOf('writeRobotConfig('));
+  });
+
+  it('lets an owner back on a fresh player id take a module apart, by the deed alone', () => {
+    // The owner gate knows only the player id; the deed (isDeedHolder) knows
+    // the identity key too. The Disassemble routine, its pick and its
+    // STOP/START take the deed; everything else stays the owner gate's.
+    const devices = source('devices.ts');
+    expect(devices).toContain(
+      "const mayRoutine = (to: RobotRoutine): boolean => deps.canEdit() || (to === 'disassemble' && mayTakeApart());",
+    );
+    expect(between(devices, 'const mayPark = (cfg: RobotConfig | null | undefined): boolean =>', ';\n'))
+      .toContain(": deps.canEdit() || (cfg?.routine === 'disassemble' && mayTakeApart())");
+    const dock = between(devices, 'export function createRobotDockUI(', '// ── 🚏📋 DEPARTURES BOARD console');
+    const render = between(dock, 'const render = (): void => {', '\n  return {\n    mount(host: HTMLElement): void {');
+    expect(render).toContain('const usable = mayRoutine(r) && (on || !captain);');
+    // Wired for the deed holder too, each re-checked at its click; the
+    // script's controls for the owner gate alone.
+    const wired = render.indexOf('if (!owner && !deed) return;');
+    expect(wired).toBeGreaterThan(-1);
+    expect(wired).toBeLessThan(render.indexOf("panel.querySelector<HTMLButtonElement>('[data-park]')"));
+    const routines = between(render, "panel.querySelectorAll<HTMLButtonElement>('[data-routine]')", 'if (!owner) return;');
+    const recheck = routines.indexOf('if (!mayRoutine(to))');
+    expect(recheck).toBeGreaterThan(-1);
+    expect(recheck).toBeLessThan(routines.indexOf('writeRobotConfig('));
+    const script = render.indexOf("panel.querySelectorAll<HTMLButtonElement>('[data-add]')");
+    expect(render.lastIndexOf('if (!owner) return;', script)).toBeGreaterThan(render.indexOf("'[data-routine]'"));
   });
 
   it("never takes having minted a module for owning it", () => {
@@ -1497,6 +1540,17 @@ describe('the deed takes a module apart (source scan)', () => {
 
 /** The robots' door is world.ts's to pick, which these tests cannot run. */
 describe('where the robots work (source scan)', () => {
+  it('reads the doors whole, and ends nothing on a capped read', () => {
+    const input = between(source('world.ts'), 'private disassemblyInput(', '\n  }');
+    expect(input).toContain('const whole = readAllDoorsIfComplete();');
+    expect(input).toContain('doors: whole ?? readAllDoors(),');
+    expect(input).toContain('...(whole ? {} : { doorsPartial: true }),');
+    const finish = between(source('world.ts'), 'private finishDisassembly(', 'private workPost(');
+    const held = finish.indexOf('if (input.doorsPartial) return false;');
+    expect(held).toBeGreaterThan(-1);
+    expect(held).toBeLessThan(finish.indexOf('doorsJoinedTo('));
+  });
+
   it("works at a door that still joins the module, the job's own first", () => {
     const body = between(source('world.ts'), 'private updateDisassembly(', 'private finishDisassembly(');
     expect(body).toContain('doorsJoinedTo(doorsNow, job.roomId)');

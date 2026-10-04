@@ -96,6 +96,7 @@ import { subscribeFurniture, readAllFurniture } from "./furnitureDoc";
 import {
   subscribeDoors,
   readAllDoors,
+  readAllDoorsIfComplete,
   writeDoorPairing,
   deleteDoorPairing,
   reapOrphanPairings,
@@ -5323,10 +5324,15 @@ export class World {
 
   /** 🔧 What every disassembly check reads, as of now (disassembly.ts). */
   private disassemblyInput(): CandidateInput {
+    // The room's doors read whole, or a capped read flagged as partial: a
+    // door to the module it left out would stay unsealed (removalBlocker
+    // holds the job).
+    const whole = readAllDoorsIfComplete();
     return {
       atlas: readAtlas(),
       hereRoomId: World.activeRoomId(),
-      doors: readAllDoors(),
+      doors: whole ?? readAllDoors(),
+      ...(whole ? {} : { doorsPartial: true }),
       playerId: getPlayerId(),
       identityPub: getIdentityPub(),
       welcomeRoomId: currentStation()?.welcomeRoomId ?? null,
@@ -5419,6 +5425,9 @@ export class World {
   /** 🔧 End a job whose labor ran out at `due`. True when the job changed. */
   private finishDisassembly(job: DisassemblyJob, due: number): boolean {
     const input = this.disassemblyInput();
+    // Nothing is decided on a capped read of the doors, not even that none
+    // joins the module now: the job holds until they read whole.
+    if (input.doorsPartial) return false;
     const joined = doorsJoinedTo(input, job.roomId);
     if (joined.length === 0) {
       // Disconnected some other way first: nothing here to take off. (Or it
