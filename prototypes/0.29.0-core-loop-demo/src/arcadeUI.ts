@@ -2,9 +2,12 @@
  * 🕹 arcadeUI — the panel at the cabinet (a DeviceUI, the TV panel's shell):
  * what is on the cabinet, PLAYER ONE (INSERT COIN · STAND UP · the owner's
  * EJECT), the owner's shelf, and the owner's LOAD A GAME block — a file from
- * their own disk (SOVEREIGN) or a link any player can fetch (CONVENIENCE),
- * the core, and where the emulator's own files come from. The game itself
- * runs in the stage (arcadeStage.ts) that INSERT COIN opens.
+ * their own disk (SOVEREIGN) or a link: one on this station's node or this
+ * page's own origin (SOVEREIGN — all a serverless-only build takes, the
+ * default: sovereignty.ts), or any server a player's browser can reach
+ * (CONVENIENCE, with the lanes on) — the core, and where the emulator's own
+ * files come from. The game itself runs in the stage (arcadeStage.ts) that
+ * INSERT COIN opens.
  *
  * Every state change goes through arcadeDoc; this module renders and asks.
  * Peer strings are escaped before they reach innerHTML (the #116 lesson).
@@ -21,6 +24,8 @@ import {
 } from './arcadeDoc';
 import type { ArcadeCore, ArcadeGame } from './arcadeDoc';
 import { rememberLocalRom, romAcceptList, EMULATOR_FETCH_COMMAND } from './arcadeEmulator';
+import { urlConsent, urlRefusal } from './tvConsent';
+import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
 
 const GOLD = '#d4a84b';
@@ -131,6 +136,13 @@ function draftGame(): { game: ArcadeGame; file: File | null } | { error: string 
   }
   const parsed = parseRomUrl(draftUrl);
   if (!parsed) return { error: draftUrl.trim() ? 'That is not a link the cabinet can fetch.' : 'Pick a file, or paste a link.' };
+  // A link no player's browser would fetch does not go on: another server,
+  // in a serverless-only build (tvConsent's rule, the TV's). A private
+  // host is each viewer's own call at the stage — the owner's node may be
+  // another player's too.
+  if (urlConsent(parsed.url) === 'refuse' && urlRefusal(parsed.url) === 'server-off') {
+    return { error: `That link is on another server — ${SERVERLESS_ONLY}: a link on this station's node or this page's own origin goes on the cabinet.` };
+  }
   const core = draftCore || parsed.core;
   if (!core) return { error: 'Pick a core for this link.' };
   return { game: { name: parsed.name, core, url: parsed.url, size: 0 }, file: null };
@@ -179,6 +191,9 @@ function renderPanel(itemId: string, deps: ArcadeDeviceDeps): string {
     <option value="" ${draftCore ? '' : 'selected'}>CORE — picked from the file's extension</option>
     ${ARCADE_CORES.map((c) => `<option value="${c.core}" ${c.core === draftCore ? 'selected' : ''}>${esc(c.label)}</option>`).join('')}
   </select>`;
+  // Serverless only, the build default: a link is one on this station's
+  // node or this page's own origin, and the CDN is not offered.
+  const lanesOn = convenienceLanesEnabled();
   const load = owner ? section('LOAD A GAME', `
     <label style="display:flex; flex-direction:column; gap:4px; font-size:10px; color:${GOLD_BRIGHT};">
       <span>📁 YOUR OWN FILE ${laneBadge('SOVEREIGN')}</span>
@@ -186,8 +201,8 @@ function renderPanel(itemId: string, deps: ArcadeDeviceDeps): string {
       ${draftFile ? `<span style="color:${GREEN};">✓ ${esc(draftFile.name)}</span>` : ''}
     </label>
     <label style="display:flex; flex-direction:column; gap:4px; font-size:10px; color:${GOLD_BRIGHT};">
-      <span>🔗 A LINK ANY PLAYER CAN FETCH ${laneBadge('CONVENIENCE')}</span>
-      <input type="text" data-arcade-url="1" placeholder="https://…/game.nes (CORS-clean)" autocomplete="off" value="${esc(draftUrl)}" style="${INPUT_CSS}">
+      <span>🔗 ${lanesOn ? 'A LINK ANY PLAYER CAN FETCH' : 'A LINK ON THIS STATION\'S NODE OR THIS ORIGIN'} ${laneBadge(lanesOn ? 'CONVENIENCE' : 'SOVEREIGN')}</span>
+      <input type="text" data-arcade-url="1" placeholder="${lanesOn ? 'https://…/game.nes (CORS-clean)' : 'http://127.0.0.1:…/blob/… or a path on this origin'}" autocomplete="off" value="${esc(draftUrl)}" style="${INPUT_CSS}">
     </label>
     ${cores}
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
@@ -198,9 +213,11 @@ function renderPanel(itemId: string, deps: ArcadeDeviceDeps): string {
     <div style="font-size:9px; color:${DIM}; letter-spacing:1.5px; margin-top:4px;">EMULATOR FILES</div>
     <div style="display:flex; gap:6px; flex-wrap:wrap;">
       ${smallButton('data-arcade-data="station"', `${rec.data === 'station' ? '✓ ' : ''}THIS STATION`, true, rec.data === 'station')} ${laneBadge('SOVEREIGN')}
-      ${smallButton('data-arcade-data="cdn"', `${rec.data === 'cdn' ? '✓ ' : ''}cdn.emulatorjs.org`, true, rec.data === 'cdn')} ${laneBadge('CONVENIENCE')}
+      ${lanesOn ? `${smallButton('data-arcade-data="cdn"', `${rec.data === 'cdn' ? '✓ ' : ''}cdn.emulatorjs.org`, true, rec.data === 'cdn')} ${laneBadge('CONVENIENCE')}` : ''}
     </div>
-    <div style="font-size:9px; color:${DIM}; line-height:1.4;">This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it) — but under the CDN the emulator's own code reads the file, so each P1 is asked before their copy goes to it; THIS STATION's files keep it on their machine.</div>
+    <div style="font-size:9px; color:${DIM}; line-height:1.4;">${lanesOn
+      ? `This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) or the public CDN. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it) — but under the CDN the emulator's own code reads the file, so each P1 is asked before their copy goes to it; THIS STATION's files keep it on their machine.`
+      : `This station's own copy (<span style="color:${GREEN};">${esc(EMULATOR_FETCH_COMMAND)}</span>, then rebuild) — ${esc(SERVERLESS_ONLY)}, so the public CDN is not offered. A game from your disk is never sent to another player (each P1 brings their own copy until the blob lane carries it), and the emulator runs under a policy that reaches this origin and the player's own node, nothing else.`}</div>
   `) : '';
 
   return `

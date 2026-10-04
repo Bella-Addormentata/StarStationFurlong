@@ -28,8 +28,15 @@
  */
 
 import type { TvSource } from './tvDoc';
+import { convenienceLanesEnabled, sourceKindAllowed } from './sovereignty';
 
 export type MediaConsent = 'ok' | 'ask' | 'refuse';
+
+/** Why a 'refuse' is a refuse, for the words on the screen: the lane is
+ *  off in this build; the link is on another server and this build plays
+ *  serverless sources only; the host is inside a private network; or the
+ *  link is not a URL at all. */
+export type ConsentRefusal = 'lane-off' | 'server-off' | 'private' | 'bad';
 
 /** The product's own lanes: where the start screen's tiles fetch from. */
 const PRODUCT_ORIGINS: ReadonlySet<string> = new Set([
@@ -53,6 +60,12 @@ function normalizeOrigin(s: string): string | null {
  *  is the viewer's own machine serving the viewer: no asking. */
 export function setOwnMediaOrigins(origins: readonly string[]): void {
   ownOrigins = new Set(origins.map(normalizeOrigin).filter((o): o is string => o !== null));
+}
+
+/** The origins setOwnMediaOrigins registered, normalized — for an allow-list
+ *  handed to a frame that fetches on the viewer's behalf (the cabinet's). */
+export function ownMediaOrigins(): string[] {
+  return [...ownOrigins];
 }
 
 /** The viewer pressed PLAY FROM <host>: that origin is fine for the rest of
@@ -116,9 +129,11 @@ function isPrivateIPv6(ip: string): boolean {
 
 /** May this viewer's browser fetch `url` now — the one answer for any
  *  peer-written http(s) URL the room can hand this browser (a TV source, an
- *  arcade game's link): yes for the page's own origin, its identified node
- *  and the product's lanes; ask first for any other public origin; never
- *  for a host inside this viewer's own networks. */
+ *  arcade game's link): yes for the page's own origin and its identified
+ *  node; never for a host inside this viewer's own networks; and for any
+ *  other server, yes for the product's lanes and ask first for the rest
+ *  with the convenience lanes on, never with them off — the build default
+ *  (sovereignty.ts): serverless sources only. */
 export function urlConsent(url: string): MediaConsent {
   const origin = normalizeOrigin(url);
   if (!origin) return 'refuse';
@@ -130,12 +145,41 @@ export function urlConsent(url: string): MediaConsent {
     return 'refuse';
   }
   if (isPrivateHost(host)) return 'refuse';
+  // Serverless only: a third-party server is a server, whoever runs it.
+  // The product's origins and PLAY FROM <host> exist only with the
+  // convenience lanes on.
+  if (!convenienceLanesEnabled()) return 'refuse';
   if (PRODUCT_ORIGINS.has(origin) || accepted.has(origin)) return 'ok';
   return 'ask';
 }
 
-/** May this viewer's browser fetch `source` now: yes, ask first, or never. */
+/** The reason behind a 'refuse' from urlConsent, for the words on the
+ *  screen. */
+export function urlRefusal(url: string): ConsentRefusal {
+  const origin = normalizeOrigin(url);
+  if (!origin) return 'bad';
+  let host: string;
+  try {
+    host = new URL(origin).hostname;
+  } catch {
+    return 'bad';
+  }
+  if (isPrivateHost(host)) return 'private';
+  return convenienceLanesEnabled() ? 'bad' : 'server-off';
+}
+
+/** May this viewer's browser fetch `source` now: yes, ask first, or never.
+ *  The product's own lanes (YouTube, the archive embed) are fetched from
+ *  their own origins by their own players: yes with the convenience lanes
+ *  on, never with them off (sovereignty.ts). */
 export function mediaConsent(source: TvSource): MediaConsent {
-  if (source.kind !== 'url') return 'ok'; // the product's own lanes
+  if (source.kind !== 'url') return sourceKindAllowed(source.kind) ? 'ok' : 'refuse';
   return urlConsent(source.url);
+}
+
+/** The reason behind a 'refuse' from mediaConsent, for the words on the
+ *  screen. */
+export function consentRefusal(source: TvSource): ConsentRefusal {
+  if (source.kind !== 'url') return 'lane-off';
+  return urlRefusal(source.url);
 }

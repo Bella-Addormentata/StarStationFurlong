@@ -37,8 +37,9 @@ import {
   romAcceptList, EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
 import type { EmulatorHandle } from './arcadeEmulator';
-import { acceptMediaOrigin, urlConsent } from './tvConsent';
+import { acceptMediaOrigin, ownMediaOrigins, urlConsent, urlRefusal } from './tvConsent';
 import type { MediaConsent } from './tvConsent';
+import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
 import { showHint } from './hud';
 
@@ -249,7 +250,8 @@ function stageTick(): void {
 }
 
 /** FETCH <game> FROM <host>? — or NOT FETCHED HERE for a host inside a
- *  private network, which no button can override. The TV's ask, for a ROM. */
+ *  private network, which no button can override, and for any other
+ *  server in a serverless-only build. The TV's ask, for a ROM. */
 function urlConsentNotice(t: Stage, game: ArcadeGame, consent: Exclude<MediaConsent, 'ok'>): void {
   let host = game.url;
   let origin = game.url;
@@ -259,8 +261,13 @@ function urlConsentNotice(t: Stage, game: ArcadeGame, consent: Exclude<MediaCons
     origin = u.origin;
   } catch { /* shown as it is */ }
   if (consent === 'refuse') {
-    showNotice(t, 'NOT FETCHED HERE',
-      `<b>${escapeHtml(host || 'this link')}</b> is inside a private network — nobody in the room can ask your browser to fetch from there. The owner can put the game on a link any player can reach, or on this station's own node.`);
+    const why = urlRefusal(game.url);
+    const where = convenienceLanesEnabled() ? 'a link any player can reach, or on this station\'s own node' : 'this station\'s own node, or on this page\'s own origin';
+    showNotice(t, 'NOT FETCHED HERE', why === 'server-off'
+      ? `<b>${escapeHtml(host || 'this link')}</b> is another server, and ${escapeHtml(SERVERLESS_ONLY)}: a game on this station's node or this page's own origin plays here. The owner can put the game on ${where}, or bring the file.`
+      : why === 'private'
+        ? `<b>${escapeHtml(host || 'this link')}</b> is inside a private network — nobody in the room can ask your browser to fetch from there. The owner can put the game on ${where}.`
+        : `<b>${escapeHtml(host || 'this link')}</b> is not a link this browser can fetch. The owner can put the game on ${where}.`);
     return;
   }
   showNotice(t, `FETCH ${game.name.toUpperCase()} FROM ${escapeHtml(host).toUpperCase()}?`,
@@ -354,6 +361,8 @@ async function mountGame(t: Stage, game: ArcadeGame, data: EmulatorData, key: st
     pathToData: path,
     volume: 0.7,
     isolated: emulatorIsolated(path),
+    // The station lane's policy: this origin and the viewer's own node.
+    allowOrigins: ownMediaOrigins(),
   }, (ev) => {
     if (stage !== t || t.mounted !== key) return;
     if (ev.type === 'frame-ready') t.phase = 'loading';

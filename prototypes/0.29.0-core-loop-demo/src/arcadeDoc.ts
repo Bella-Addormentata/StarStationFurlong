@@ -39,7 +39,8 @@
  * THE OWNER CURATES: the shelf (the cabinet's menu), the game on the
  * cabinet, and where the emulator's own files come from — this station's
  * /emulatorjs/ (SOVEREIGN, fetched by scripts/fetch-emulatorjs.mjs) or
- * cdn.emulatorjs.org (CONVENIENCE, an opt-in per cabinet). A game is an
+ * cdn.emulatorjs.org (CONVENIENCE, an opt-in per cabinet that exists only
+ * in a build with the convenience lanes on: sovereignty.ts). A game is an
  * http(s) URL any P1 can fetch, or a file on the player's own disk (url '')
  * — then every P1 brings their own copy, until the blob lane (spike #18)
  * carries it. P1 may put a SHELF game on the cabinet; only the owner adds.
@@ -55,6 +56,8 @@
  */
 
 import * as Y from 'yjs';
+import { convenienceLanesEnabled, SERVERLESS_ONLY } from './sovereignty';
+import { ownMediaOrigins } from './tvConsent';
 
 // ── Tunables ─────────────────────────────────────────────────────────────────
 
@@ -368,7 +371,10 @@ export function readCuration(itemId: string): CabinetCuration {
   return {
     game: sanitizeGame(raw.game),
     shelf,
-    data: raw.data === 'cdn' ? 'cdn' : 'station',
+    // Serverless only (sovereignty.ts): a record that says `cdn` — written
+    // by a build with the convenience lanes on, or by any peer — reads as
+    // the station's own files here. The CDN is a server, whoever opted in.
+    data: raw.data === 'cdn' && convenienceLanesEnabled() ? 'cdn' : 'station',
     seq: counter(raw.seq),
   };
 }
@@ -539,10 +545,14 @@ export function removeFromShelf(itemId: string, index: number): ArcadeAction {
   return { ok: true };
 }
 
-/** Where the emulator's own files come from (the owner's call, per cabinet). */
+/** Where the emulator's own files come from (the owner's call, per cabinet).
+ *  The CDN is an opt-in the build has to allow (sovereignty.ts). */
 export function setEmulatorData(itemId: string, data: EmulatorData): ArcadeAction {
   const gate = ownerGate();
   if (!gate.ok) return gate;
+  if (data === 'cdn' && !convenienceLanesEnabled()) {
+    return { ok: false, error: `The CDN lane is off in this build — ${SERVERLESS_ONLY}.` };
+  }
   const rec = readCuration(itemId);
   write(cabinetKey(itemId), { ...rec, data: data === 'cdn' ? 'cdn' : 'station', seq: bump(rec.seq) } satisfies CabinetCuration);
   return { ok: true };
@@ -573,7 +583,9 @@ export type ArcadeLane = 'SOVEREIGN' | 'CONVENIENCE';
 export function gameLane(g: ArcadeGame): ArcadeLane {
   if (!g.url) return 'SOVEREIGN';
   try {
-    const h = new URL(g.url).hostname;
+    const u = new URL(g.url);
+    if (ownMediaOrigins().includes(u.origin)) return 'SOVEREIGN'; // this page's origin, or the viewer's own node
+    const h = u.hostname;
     return h === '127.0.0.1' || h === 'localhost' || h === '[::1]' ? 'SOVEREIGN' : 'CONVENIENCE';
   } catch {
     return 'CONVENIENCE';

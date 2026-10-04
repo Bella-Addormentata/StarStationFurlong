@@ -13,15 +13,21 @@
  * The emulator's own files come from one of two places, the owner's call
  * per cabinet (arcadeDoc's `data`): THIS STATION's /emulatorjs/data/ —
  * fetched by scripts/fetch-emulatorjs.mjs, never vendored (size), the
- * SOVEREIGN lane — or cdn.emulatorjs.org, the CONVENIENCE lane. Neither is
- * bundled, so a fresh checkout shows NOT PROVISIONED with the command, not
- * a blank screen: probeEmulatorData looks before the frame mounts.
+ * SOVEREIGN lane — or cdn.emulatorjs.org, the CONVENIENCE lane, which a
+ * build offers only with the convenience lanes on (sovereignty.ts; off by
+ * default: serverless sources only). Neither is bundled, so a fresh
+ * checkout shows NOT PROVISIONED with the command, not a blank screen:
+ * probeEmulatorData looks before the frame mounts. On the station lane the
+ * frame is same-origin and unsandboxed, so it is handed a content-security
+ * policy instead (emulatorFrameUrl → frame.html): its code reaches this
+ * origin and the viewer's own node, nothing else.
  *
  * DOM-free except mountEmulatorFrame; the path and probe maths are tested.
  */
 
 import { gameId, ARCADE_CORES } from './arcadeDoc';
 import type { ArcadeCore, ArcadeGame, EmulatorData } from './arcadeDoc';
+import { convenienceLanesEnabled } from './sovereignty';
 
 export const EMULATOR_CDN_DATA = 'https://cdn.emulatorjs.org/stable/data/';
 export const EMULATOR_FETCH_COMMAND = 'npm run fetch:emulatorjs';
@@ -94,6 +100,10 @@ export interface EmulatorConfig {
    *  files are trusted and keep the same origin (so the canvas stays
    *  reachable for the spectator lane). */
   isolated: boolean;
+  /** Origins beyond the frame's own that its policy lets it fetch from —
+   *  the viewer's own node (tvConsent's own media origins). Station lane
+   *  only; the isolated lane has the sandbox for a wall. */
+  allowOrigins: readonly string[];
 }
 
 /** Whether engine files at `pathToData` come from another origin than the
@@ -108,6 +118,31 @@ export function emulatorIsolated(
   } catch {
     return true;
   }
+}
+
+/** An origin as a content-security policy source: http(s), host, port —
+ *  no path, no space, quote or semicolon that could end the directive. */
+const CSP_ORIGIN = /^https?:\/\/[A-Za-z0-9.\-:[\]]+$/;
+
+/** The frame's URL for a config. On the station lane (same origin, no
+ *  sandbox) the frame is told so, with the origins its content-security
+ *  policy may fetch from beyond its own — the viewer's own node — reduced
+ *  to http(s) origins here (frame.html checks them again before they enter
+ *  its policy). The isolated lane (the CDN, lanes on only) runs in an
+ *  opaque origin and gets the plain URL: its engine comes from its own
+ *  origin, and the sandbox is its wall. */
+export function emulatorFrameUrl(config: Pick<EmulatorConfig, 'isolated' | 'allowOrigins'>, frameUrl = arcadeFrameUrl()): string {
+  if (config.isolated) return frameUrl;
+  const allow = new Set<string>();
+  for (const o of config.allowOrigins) {
+    let origin = '';
+    try {
+      origin = new URL(o).origin;
+    } catch { /* not a URL: not an origin */ }
+    if (CSP_ORIGIN.test(origin)) allow.add(origin);
+  }
+  const sep = frameUrl.includes('?') ? '&' : '?';
+  return `${frameUrl}${sep}lane=station&allow=${encodeURIComponent([...allow].join(' '))}`;
 }
 
 export type EmulatorEvent =
@@ -142,7 +177,7 @@ export function mountEmulatorFrame(
   // CDN code runs, and cannot read this page, its storage or its DOM. Only
   // messages cross (and they are matched to this frame's window below).
   if (config.isolated) iframe.setAttribute('sandbox', 'allow-scripts allow-forms allow-pointer-lock allow-popups');
-  iframe.src = frameUrl;
+  iframe.src = emulatorFrameUrl(config, frameUrl);
   let alive = true;
   let configured = false;
   const origin = window.location.origin;
@@ -211,7 +246,7 @@ export function emulatorErrorText(why: string, data: EmulatorData): { title: str
   if (why === 'loader' || why === 'timeout') {
     return data === 'cdn'
       ? { title: 'CDN.EMULATORJS.ORG DID NOT ANSWER', hint: 'The CONVENIENCE lane is down or blocked here. The owner can switch the cabinet to THIS STATION after fetching the files.' }
-      : { title: 'EMULATOR FILES NOT PROVISIONED', hint: `This station has no /emulatorjs/ yet. Run ${EMULATOR_FETCH_COMMAND} in the prototype and rebuild, or the owner can opt the cabinet into the CDN (CONVENIENCE).` };
+      : { title: 'EMULATOR FILES NOT PROVISIONED', hint: `This station has no /emulatorjs/ yet. Run ${EMULATOR_FETCH_COMMAND} in the prototype and rebuild${convenienceLanesEnabled() ? ', or the owner can opt the cabinet into the CDN (CONVENIENCE)' : ''}.` };
   }
   if (why === 'unreachable') return { title: 'THE EMULATOR FILES ARE UNREACHABLE', hint: 'The station answered with an error. Try again in a moment.' };
   if (why === 'frame') return { title: 'THE ARCADE FRAME DID NOT LOAD', hint: 'public/arcade/frame.html is missing from this build.' };

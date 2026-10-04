@@ -4,8 +4,10 @@
  * lapse, stand up, the owner's kick), the shape-checked reads that survive
  * a peer's garbage, the parsing, and the attract card's view.
  */
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
+import { setConvenienceLanesForTest } from './sovereignty';
+import { setOwnMediaOrigins } from './tvConsent';
 import {
   addToShelf, arcadePageId, arcadeScreenView, bindArcadeDoc, cabinetKey, coreForName, coreLabel,
   countPlay, gameId, gameLane, iAmP1, insertCoin, mayEjectP1, maySit, parseRomUrl, pickFromShelf, putOnCabinet,
@@ -40,7 +42,9 @@ beforeEach(() => {
   setArcadePageId('tab-a');
   iAm(ALICE, 'Alice');
   bindArcadeDoc(doc);
+  setConvenienceLanesForTest(true); // the full gate; the serverless-only default has its own case below
 });
+afterEach(() => { setConvenienceLanesForTest(null); });
 
 describe('reads', () => {
   it('defaults when nothing is written, and survives a peer\'s garbage', () => {
@@ -132,10 +136,18 @@ describe('games', () => {
     expect(gameId({ ...TETRIS, size: 40_977 })).not.toBe(gameId(TETRIS));
   });
 
-  it('gameLane: the player\'s own disk and loopback are sovereign, the web is convenience', () => {
+  it('gameLane: the player\'s own disk, loopback and this page\'s own origins are sovereign, the web is convenience', () => {
     expect(gameLane(TETRIS)).toBe('SOVEREIGN');
     expect(gameLane({ ...PACMAN, url: 'http://127.0.0.1:8080/blob/abc' })).toBe('SOVEREIGN');
     expect(gameLane(PACMAN)).toBe('CONVENIENCE');
+    expect(gameLane({ ...PACMAN, url: 'https://station.example/roms/pacman.zip' })).toBe('CONVENIENCE');
+    setOwnMediaOrigins(['https://station.example']);
+    try {
+      expect(gameLane({ ...PACMAN, url: 'https://station.example/roms/pacman.zip' })).toBe('SOVEREIGN');
+      expect(gameLane(PACMAN)).toBe('CONVENIENCE');
+    } finally {
+      setOwnMediaOrigins([]);
+    }
   });
 });
 
@@ -154,6 +166,20 @@ describe('the owner curates', () => {
     expect(takeOffCabinet(CAB)).toEqual({ ok: true });
     expect(readCabinet(CAB).game).toBeNull();
     expect(readCabinet(CAB).seq).toBe(3);
+  });
+
+  it('serverless only (the build default): the CDN is not offered, and a record that says so reads as the station', () => {
+    owner = true;
+    expect(setEmulatorData(CAB, 'cdn')).toEqual({ ok: true }); // written with the lanes on
+    expect(readCabinet(CAB).data).toBe('cdn');
+    setConvenienceLanesForTest(false);
+    expect(readCabinet(CAB).data).toBe('station'); // the same record, read by a serverless-only build
+    const r = setEmulatorData(CAB, 'cdn');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.error).toMatch(/serverless/);
+    expect(setEmulatorData(CAB, 'station')).toEqual({ ok: true });
+    setConvenienceLanesForTest(true);
+    expect(readCabinet(CAB).data).toBe('station'); // the owner's write stands
   });
 
   it('the shelf dedupes, keeps the newest on top, and holds ARCADE_SHELF_MAX', () => {

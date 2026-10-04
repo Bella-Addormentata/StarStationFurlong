@@ -25,7 +25,8 @@ import {
 } from './tvDoc';
 import type { TvSource } from './tvDoc';
 import { registerTvPlayerOfRecord } from './tvSession';
-import { acceptMediaOrigin, mediaConsent, mediaOrigin } from './tvConsent';
+import { acceptMediaOrigin, consentRefusal, mediaConsent, mediaOrigin } from './tvConsent';
+import { SERVERLESS_ONLY } from './sovereignty';
 import { escapeHtml } from './htmlEscape';
 
 // ── YouTube IFrame API ───────────────────────────────────────────────────────
@@ -628,8 +629,20 @@ function showConsentNotice(t: Theatre, source: TvSource, consent: 'ask' | 'refus
   let host = origin;
   try { host = new URL(origin).host; } catch { /* shown as it is */ }
   if (consent === 'refuse') {
-    showNotice(t, `<div>NOT PLAYED HERE</div>
+    // Why, in the words of the gate: a lane this build does not offer, a
+    // link on another server in a serverless-only build, or a private host
+    // (sovereignty.ts, tvConsent.ts).
+    const why = consentRefusal(source);
+    if (why === 'lane-off') {
+      showNotice(t, `<div>NOT IN THIS BUILD</div>
+      <div class="tv-theatre-lane">the ${escapeHtml(sourceLane(source))} lane is off — ${escapeHtml(SERVERLESS_ONLY)}: a file on your own origin or this station's node, and the lanes to come</div>`);
+    } else if (why === 'server-off') {
+      showNotice(t, `<div>NOT IN THIS BUILD</div>
+      <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is another server — ${escapeHtml(SERVERLESS_ONLY)}: a link on your own origin or this station's node plays here</div>`);
+    } else {
+      showNotice(t, `<div>NOT PLAYED HERE</div>
       <div class="tv-theatre-lane">${escapeHtml(host || 'this link')} is inside a private network — nobody in the room can ask your browser to fetch from there</div>`);
+    }
     return;
   }
   // The button under the finger stays — the same ask every tick is one ask —

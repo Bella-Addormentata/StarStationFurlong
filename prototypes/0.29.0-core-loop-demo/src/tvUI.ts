@@ -23,6 +23,8 @@ import type { TvSource } from './tvDoc';
 import { escapeHtml } from './htmlEscape';
 import { tvPlayerCanSeek, tvPlayerPositionMs } from './tvSession';
 import type { RoomPlayer } from './tvSession';
+import { consentRefusal, mediaConsent } from './tvConsent';
+import { convenienceLanesEnabled, sourceKindAllowed, SERVERLESS_ONLY } from './sovereignty';
 
 const GOLD = '#d4a84b';
 const GOLD_BRIGHT = '#F0C060';
@@ -296,12 +298,22 @@ const TILES: Tile[] = [
   { key: 'karaoke', icon: '🎤', label: 'KARAOKE', lane: 'SOVEREIGN', hint: 'MP3+G, with the mic on the audio lane', live: false },
 ];
 
+/** The tiles this build offers (sovereignty.ts): the centralized lanes only
+ *  with the convenience lanes on — and without them the URL tile is labelled
+ *  for what it plays here, a file on the viewer's own origins. */
+function visibleTiles(): Tile[] {
+  if (convenienceLanesEnabled()) return TILES;
+  return TILES.filter((t) => sourceKindAllowed(t.key)).map((t) => t.key === 'url'
+    ? { ...t, lane: 'SOVEREIGN', hint: `paste a link to an mp4 / webm on this station's node or your own origin — ${SERVERLESS_ONLY}` }
+    : t);
+}
+
 const SCHEDULE_CHOICES: Array<{ label: string; minutes: number }> = [
   { label: '+5 MIN', minutes: 5 }, { label: '+15 MIN', minutes: 15 }, { label: '+30 MIN', minutes: 30 }, { label: '+1 H', minutes: 60 },
 ];
 
 let phoneSubscribed = false;
-let activeTile = 'youtube';
+let activeTile = '';
 let phoneClockTimer = 0;
 let phoneHtml = '';
 
@@ -486,7 +498,9 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <div class="phone-access-note">Pick up the remote to choose what plays. Anyone standing at the set can press its power and volume buttons.</div>
     </div>`;
   }
-  const tiles = TILES.map((t) => {
+  const offered = visibleTiles();
+  if (!offered.some((t) => t.key === activeTile)) activeTile = offered[0]!.key;
+  const tiles = offered.map((t) => {
     const on = t.key === activeTile;
     return `<button type="button" data-tv-tile="${t.key}" ${t.live ? '' : 'disabled'} title="${esc(t.hint)}" style="
       display:flex; flex-direction:column; align-items:center; gap:3px; padding:8px 4px;
@@ -495,7 +509,7 @@ function renderRemoteSection(tv: { id: string; label: string }, deps: TvPhoneDep
       <span style="font-size:16px;">${t.icon}</span><span>${t.label}</span>${laneBadge(t.lane)}${t.live ? '' : `<span style="font-size:7px; color:${DIM};">NOT YET PROVISIONED</span>`}
     </button>`;
   }).join('');
-  const tile = TILES.find((t) => t.key === activeTile) ?? TILES[0]!;
+  const tile = offered.find((t) => t.key === activeTile) ?? offered[0]!;
   // A start-only source (archive.org's own player) offers no transport, and
   // a mounted player that cannot seek (a live stream) offers no ±10 s: a
   // target the holder cannot apply would only be beaten back over.
@@ -580,6 +594,22 @@ function wireTvApp(host: HTMLElement, deps: TvPhoneDeps): void {
     const parsed = parseTvSource(text);
     if (!parsed) {
       feedback(text.trim() ? 'That is not a link the TV can play.' : 'Paste a link first.');
+      return null;
+    }
+    // Serverless only (sovereignty.ts): a lane this build does not offer,
+    // or a link on another server, is refused here with the reason, not
+    // written into the room for every viewer's theatre to refuse.
+    if (!sourceKindAllowed(parsed.kind)) {
+      feedback(`${parsed.kind === 'youtube' ? 'YouTube' : 'archive.org'} is off here — ${SERVERLESS_ONLY}.`);
+      return null;
+    }
+    if (parsed.kind === 'url' && mediaConsent(parsed) === 'refuse') {
+      const why = consentRefusal(parsed);
+      feedback(why === 'server-off'
+        ? `That link is on another server — ${SERVERLESS_ONLY}: a link on this station's node or your own origin plays here.`
+        : why === 'private'
+          ? 'That host is inside a private network: nobody in the room can ask a browser to fetch from there.'
+          : 'That is not a link the TV can play.');
       return null;
     }
     const gen = ++resolveGen;

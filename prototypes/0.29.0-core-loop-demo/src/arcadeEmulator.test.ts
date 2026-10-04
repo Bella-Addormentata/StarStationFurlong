@@ -4,12 +4,15 @@
  * showing a blank screen, the words for each failure, and the page's memory
  * of the player's own files.
  */
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import {
-  allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorIsolated,
-  localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom, romAcceptList, EMULATOR_CDN_DATA,
-  EMULATOR_FETCH_COMMAND,
+  allowLocalRomExposure, arcadeFrameUrl, emulatorDataLane, emulatorDataPath, emulatorErrorText, emulatorFrameUrl,
+  emulatorIsolated, localRomExposureAllowed, localRomFor, probeEmulatorData, rememberLocalRom, romAcceptList,
+  EMULATOR_CDN_DATA, EMULATOR_FETCH_COMMAND,
 } from './arcadeEmulator';
+import { setConvenienceLanesForTest } from './sovereignty';
+
+afterEach(() => { setConvenienceLanesForTest(null); });
 
 const res = (status: number, type = 'application/javascript'): Response =>
   ({
@@ -56,14 +59,31 @@ describe('where the emulator files come from', () => {
     expect(await probeEmulatorData('http://localhost/emulatorjs/data/', answering(res(200)), 'http://localhost')).toBe('ok');
   });
 
-  it('says what to do about each failure', () => {
+  it('says what to do about each failure — and offers the CDN only in a build that has it', () => {
     expect(emulatorErrorText('loader', 'station').hint).toContain(EMULATOR_FETCH_COMMAND);
     expect(emulatorErrorText('timeout', 'station').title).toBe('EMULATOR FILES NOT PROVISIONED');
+    setConvenienceLanesForTest(true);
+    expect(emulatorErrorText('loader', 'station').hint).toContain('CDN');
+    setConvenienceLanesForTest(false);
+    expect(emulatorErrorText('loader', 'station').hint).not.toContain('CDN');
     expect(emulatorErrorText('loader', 'cdn').title).toContain('CDN');
     expect(emulatorErrorText('unreachable', 'station').title).toContain('UNREACHABLE');
     expect(emulatorErrorText('frame', 'station').title).toContain('FRAME');
     expect(emulatorErrorText('game', 'station').title).toContain('GAME');
     expect(emulatorErrorText('something odd', 'station')).toEqual({ title: 'THE CABINET FAULTED', hint: 'something odd' });
+  });
+
+  it('tells the frame its lane and, on the station lane, the origins its policy may reach — http(s) origins only', () => {
+    expect(emulatorFrameUrl({ isolated: true, allowOrigins: ['http://127.0.0.1:8080'] }, '/arcade/frame.html')).toBe('/arcade/frame.html');
+    expect(emulatorFrameUrl({ isolated: false, allowOrigins: [] }, '/arcade/frame.html')).toBe('/arcade/frame.html?lane=station&allow=');
+    expect(emulatorFrameUrl({ isolated: false, allowOrigins: [] }, '/f.html?x=1')).toBe('/f.html?x=1&lane=station&allow=');
+    const offered = [
+      'http://localhost:4173', 'http://127.0.0.1:8080/blob/x', 'http://127.0.0.1:8080', 'tauri://localhost',
+      'javascript:alert(1)', 'not an origin', "http://evil;script-src 'unsafe-inline'", 'http://evil;x', 'ws://x',
+    ];
+    const u = new URL(emulatorFrameUrl({ isolated: false, allowOrigins: offered }, 'http://localhost:4173/arcade/frame.html'));
+    expect(u.searchParams.get('lane')).toBe('station');
+    expect(u.searchParams.get('allow')).toBe('http://localhost:4173 http://127.0.0.1:8080');
   });
 
   it('remembers the player\'s own files by game, and lists every extension a core takes', () => {
