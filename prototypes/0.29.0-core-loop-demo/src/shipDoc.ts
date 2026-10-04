@@ -1075,13 +1075,18 @@ export function writeStationBerth(stationId: string, rec: BerthMemoryRecord | nu
  * its own (the flight record's). Kept first-hand in this room
  * (completeArrival, shipArrival.keepRestPlace), so every install reads the
  * same place, whatever station moves it has heard of. A docked ship with none
- * follows its station.
+ * follows its station. 🚏 `open`: where a ferry route's timetable left the
+ * ship with no dock (shipArrival.restAtRouteEnd), on the route's untrimmed
+ * copy of its end stop, in open orbit until a dock carries it: beside a
+ * station there only while no trim moves that station off the place's own
+ * orbit (shipArrival.shipPlaceId).
  */
 export interface RestPlace {
   at: string;
   since: number;
   docks?: string[];
   from?: string;
+  open?: true;
 }
 
 /** Most dock doors a rest record names: every door record a complete
@@ -1094,6 +1099,7 @@ export function isRestPlace(v: unknown): v is RestPlace {
   const r = v as Partial<RestPlace>;
   if (!isBoundedString(r.at) || !adriftPlace(r.at) || !isFlightTime(r.since)) return false;
   if (r.from !== undefined && !isBoundedString(r.from)) return false;
+  if (r.open !== undefined && r.open !== true) return false;
   if (r.docks === undefined) return true;
   return Array.isArray(r.docks) && r.docks.length <= MAX_REST_DOCKS
     && r.docks.every((d) => typeof d === 'string' && isAcceptableDoorKey(d));
@@ -1108,6 +1114,7 @@ export function readRestPlace(): RestPlace | null {
   if (raw.docks && raw.docks.length > 0) out.docks = [...new Set(raw.docks)];
   // Station ids are per install: read another install's as ours.
   if (raw.from !== undefined) out.from = localStationId(raw.from);
+  if (raw.open === true) out.open = true;
   return out;
 }
 
@@ -1124,6 +1131,7 @@ export function writeRestPlace(rest: RestPlace | null): boolean {
     since: rest.since,
     ...(rest.docks?.length ? { docks: [...rest.docks] } : {}),
     ...(rest.from !== undefined ? { from: rest.from } : {}),
+    ...(rest.open === true ? { open: true as const } : {}),
   };
   // Station ids are per install: the shared record names the station it
   // rests beside by its welcome room, as the flight record does (keeping

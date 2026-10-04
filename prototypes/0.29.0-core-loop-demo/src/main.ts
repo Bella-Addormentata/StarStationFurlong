@@ -1332,11 +1332,13 @@ function shipStationsHere(roomId: string): string[] {
  * berth room, or a room the directory lists one of its gates in), so the
  * timetable and the keeper always agree on "docked at this stop". 🛟 Each
  * dock carries its door, so a pairing on any door but the route's port
- * holds the stay (pilotRoute.LiveDockAt.held, A5 Rights).
+ * holds the stay (pilotRoute.LiveDockAt.held, A5 Rights). Only the room's
+ * own doors, each read past the snapshot's cap (doorsDoc.readPhysicalDoors):
+ * a peer's flood can neither hide the ferry's dock nor pass for one.
  */
 function shipRouteLiveDock(): LiveDockAt {
   const docks: Array<{ roomId: string; dockedAt: number; doorId: string }> = [];
-  for (const [doorId, rec] of readAllDoors()) {
+  for (const [doorId, rec] of readPhysicalDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (rec.transient !== true && !isDockChain(rec.segments)) continue;
     let roomId = "";
@@ -1395,10 +1397,12 @@ const routeKeeper = createRouteKeeper({
   // those this player may release (a dock port is UNDOCKed, never deleted).
   // 🚚 As DETACH does (PR 174): a tombstone, once no station move holds the
   // berth, by the moves its far room knows too (docking.ts detachLegacyBerth).
+  // From what DEPART casts off (doorsDoc.readAllDoorsWithPhysical): a flood
+  // never hides a real door's berth from it.
   detachGuestBerths: () => {
     const ds = world?.dockingSystem;
     if (!ds) return;
-    for (const [doorId, rec] of readAllDoors()) {
+    for (const [doorId, rec] of readAllDoorsWithPhysical()) {
       if (rec.paired !== true) continue;
       if (rec.transient !== true && !isDockChain(rec.segments)) continue;
       if (ds.doorHasPort(doorId) || !ds.canOperateDock(doorId)) continue;
@@ -1442,14 +1446,16 @@ function stationGateOf(roomId: string, doorId: string | undefined): number | und
  * port is not docked there, else the gate it is docked at when the station
  * records (or the stop itself) name one. The same station test as the
  * keeper and the timetable (shipRouteLiveDock), so a gate-change dock in
- * another room of the stop counts.
+ * another room of the stop counts. The port read by name, past the
+ * snapshot's cap (doorsDoc.readDoor), as the captain's line reads it
+ * (shipPilot.readPilotDock).
  */
 function shipRoutePortDock(now: number): { gate?: number } | null {
   const route = readShipRoute();
   const f = route ? readRouteFlight(now) : null;
   const stop = f ? route?.stops[f.stopIndex] : undefined;
   if (!route || !stop) return null;
-  const rec = readAllDoors().get(route.shipPort);
+  const rec = readDoor(route.shipPort);
   if (!rec || rec.paired !== true || !rec.connectedRoomAddress) return null;
   let farRoom = "";
   try {
@@ -1544,6 +1550,8 @@ const boardWalkCaches = new Map<string, RouteWalkCache>();
  * own test. A ferry is docked here by this room's own docks (the far dock
  * write puts a ship's DOCK in the berth room's doc): its route port's
  * pairing gives the gate, and a pairing on another of its doors holds it.
+ * Only this room's own doors, each read past the snapshot's cap
+ * (doorsDoc.readPhysicalDoors), so a flood never hides a ferry's dock.
  */
 function departureBoardFor(itemId: string): BoardView {
   const now = Date.now();
@@ -1555,7 +1563,7 @@ function departureBoardFor(itemId: string): BoardView {
   const same = sameStationReader();
   const gates = readDockGates();
   const docks = new Map<string, BoardDock[]>();
-  for (const [doorId, rec] of readAllDoors()) {
+  for (const [doorId, rec] of readPhysicalDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (rec.transient !== true && !isDockChain(rec.segments)) continue;
     let ship = "";

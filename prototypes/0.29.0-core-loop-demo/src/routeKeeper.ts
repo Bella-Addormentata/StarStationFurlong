@@ -112,7 +112,7 @@
 
 import { isDockChain } from './adapter';
 import { dockAnswerOf, gateAdmits, type DockAnswer, type DockOpOptions, type DockPortState, type DockRefusal } from './dockRules';
-import { readAllDoors, writeDoorTombstone } from './doorsDoc';
+import { readPhysicalDoors, writeDoorTombstone } from './doorsDoc';
 import {
   CLOCK_AHEAD_MS,
   GUARD_BAND_MS,
@@ -970,10 +970,13 @@ export function directoryStationFor(stop: RouteStop): StationDestination | null 
 }
 
 /** The ship's live berth docks: each paired door that is a dock or a guest
- *  berth (the timetable's live-dock input), by far room and stamp. */
+ *  berth (the timetable's live-dock input), by far room and stamp. Only the
+ *  room's own doors, each read past the snapshot's cap
+ *  (doorsDoc.readPhysicalDoors): a peer's flood can neither hide a dock from
+ *  the keeper nor pass for one. */
 function liveBerthDocks(): Array<{ doorId: string; roomId: string; dockedAt: number }> {
   const out: Array<{ doorId: string; roomId: string; dockedAt: number }> = [];
-  for (const [doorId, rec] of readAllDoors()) {
+  for (const [doorId, rec] of readPhysicalDoors()) {
     if (rec.paired !== true || !rec.connectedRoomAddress) continue;
     if (rec.transient !== true && !isDockChain(rec.segments)) continue;
     const roomId = roomOf(rec.connectedRoomAddress);

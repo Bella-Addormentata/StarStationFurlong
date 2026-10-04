@@ -26,6 +26,7 @@ import {
 import {
   readAllDoorsIfComplete, readDoor, readPhysicalDoors, writeDoorTombstone, type DockBerthMemory, type DoorRecord,
 } from './doorsDoc';
+import { orbitForSlot, stationOrbit } from './orbits';
 import { atlasComponent, readAtlas, roomIdFromSeed } from './stationAtlas';
 import { dockLockedByMove, roomMovesKnown, stationLeftFrom } from './stationMove';
 import {
@@ -358,7 +359,9 @@ function gateOf(berth: StationBerth): { gate?: number } {
  *   destination's once it has arrived), once the station has left that place;
  * - at rest (docked, by the record), where its rest record leaves it
  *   (shipDoc.RestPlace, restingPlace), once no station it rests beside is
- *   there. A docked ship with no rest record follows its station.
+ *   there (🚏 one a ferry route left in open orbit, `open`: once none is
+ *   there on that place's own orbit, untrimmed). A docked ship with no rest
+ *   record follows its station.
  * A ship in open orbit by its record is there, unless a dock has held it
  * since (docked by hand: its rest record), wherever that took it.
  */
@@ -375,8 +378,12 @@ export function shipPlaceId(
     const resting = restingPlace(rest, now, stations);
     // A dock it names still holds it (one a capped scan of the doors missed).
     if ('heldBy' in resting) return resting.heldBy ?? rec.locationId;
-    // Beside its own station, or the one it last let go of, while that is there.
-    const beside = [listed, resting.from].find((st) => isAt(st, resting.at, now));
+    // Beside its own station, or the one it last let go of, while that is
+    // there. 🚏 Left in open orbit by a ferry route, the ship is on that
+    // place's own orbit: beside a station there only while no trim moves it
+    // off that orbit, or the far view would draw the ship on the trimmed one.
+    const beside = [listed, resting.from]
+      .find((st) => isAt(st, resting.at, now) && (rest.open !== true || onSlotOrbit(st)));
     return beside ? beside.id : resting.at;
   }
   const keptAt = rec.status === 'redocking' ? rec.destinationAt
@@ -400,6 +407,14 @@ function isAt(station: StationRecord | null | undefined, placeId: string, now: n
   const place = adriftPlace(placeId);
   return !!station && !!place && !stationInTransit(station, now)
     && planetById(station.planetId).id === place.planetId && station.orbitSlot === place.orbitSlot;
+}
+
+/** Does `station` fly its slot's own orbit, with no trim moving it off it
+ *  (orbits.stationOrbit)? */
+function onSlotOrbit(station: StationRecord): boolean {
+  const flown = stationOrbit(station);
+  const slot = orbitForSlot(station.planetId, station.orbitSlot);
+  return flown.radiusKm === slot.radiusKm && flown.phase0 === slot.phase0;
 }
 
 /** Where a station orbits, as an open-orbit place. */
@@ -763,9 +778,10 @@ export function restBeside(locationId: string, now: number, docks: string[]): vo
  *  dock, it is where the timetable left it: on the route's copy of the stop
  *  (`end`, shipRoute.settleRouteFlight's), which the stop's station may have
  *  left for another planet or slot (the keeper passes that berth). So it
- *  rests there, not at the station's new place, and is beside the station
- *  again only while that is back on that orbit (shipPlaceId). No copy: as
- *  restBeside. */
+ *  rests there, not at the station's new place, in open orbit (`open`) as
+ *  the timetable's stay had it (untrimmed, until a dock carries it): beside
+ *  the station only while that is on that place's own orbit, its slot's with
+ *  no trim (shipPlaceId). No copy: as restBeside. */
 export function restAtRouteEnd(
   locationId: string,
   end: { planetId: string; orbitSlot: number } | null,
@@ -776,7 +792,8 @@ export function restAtRouteEnd(
     restBeside(locationId, now, docks);
     return;
   }
-  if (!writeRestPlace({ at: adriftAt(planetById(end.planetId).id, end.orbitSlot), since: Math.floor(now) })) writeRestPlace(null);
+  const rest = { at: adriftAt(planetById(end.planetId).id, end.orbitSlot), since: Math.floor(now), open: true as const };
+  if (!writeRestPlace(rest)) writeRestPlace(null);
 }
 
 /** 🚚 What an arrival re-points its port with before the DOCK (`memory`,

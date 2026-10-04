@@ -40,7 +40,7 @@ import type { FarBody, FarLayout, FarShipInput, FarStationInput, FrozenCourses }
 import { readStore } from './planetSummary';
 import { isPinMove, moveTransitPointAt } from './stationMove';
 import { isShipReady } from './devices';
-import { readAllDoors } from './doorsDoc';
+import { readPhysicalDoors } from './doorsDoc';
 import { shipDocBound } from './shipDoc';
 // 🚏 A ferry route's leg is flown by its timetable, never written to the
 // stored flight (robot pilot routes, build notes A4): the resolved flight.
@@ -278,11 +278,13 @@ function readSource(now: number): Source {
     // station: it waits on the route's copy of the stop, where its leg in
     // ended and its next leg leaves from, untrimmed as they are, whether or
     // not the stop's station is still there (the keeper passes a berth its
-    // station has left). Only a live dock puts it on the station's orbit.
+    // station has left). Only a live dock puts it on the station's orbit:
+    // one on the room's own doors, each read past the snapshot's cap, as the
+    // room resolver reads it (doorsDoc.readPhysicalDoors).
     if (!aboard && !adrift && places && !places.to) {
       const stay = routeStayOffList(
         places,
-        dockedStationFor(roomId, readAllDoors().values(), atlas, all) !== null,
+        dockedStationFor(roomId, readPhysicalDoors().values(), atlas, all) !== null,
         (id) => planetById(id).id,
       );
       adrift = stay && routeStayPlace(stay);

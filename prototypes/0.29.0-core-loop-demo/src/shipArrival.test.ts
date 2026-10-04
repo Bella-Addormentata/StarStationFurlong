@@ -1363,6 +1363,10 @@ describe('where a ship with no live dock is', () => {
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 'furlong-station' })).toBe(true);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 7 })).toBe(false);
     expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, from: 'x'.repeat(129) })).toBe(false);
+    // 🚏 In open orbit where a ferry route left it: only ever `true`.
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, open: true })).toBe(true);
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, open: false })).toBe(false);
+    expect(isRestPlace({ at: adriftAt('planet-aris', 2), since: 5, open: 'yes' })).toBe(false);
   });
 
   it('keeps where DEPART casts off from and flies to, through the flight only', () => {
