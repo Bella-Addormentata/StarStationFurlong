@@ -10,8 +10,8 @@
  * stationAtlas gossips layout:
  *
  *   - per station: its record (name, planet, slot, berth door, and any fields
- *     a newer build adds, carried through untouched), its latest trim and its
- *     latest move to another planet;
+ *     a newer build adds, carried through untouched), its gates, its latest
+ *     trim and its latest move to another planet;
  *   - per ship: its name, planet and flight (status, from, to, times).
  *
  * Three levels, not full-atlas gossip:
@@ -30,10 +30,18 @@
  * Credential rule (stationAtlas.ts): no pass or seed travels here. A berth
  * door is a door name, not a key.
  *
- * Merge: newest `updatedAt` wins a station's record, newest `at` wins its
- * trim (a trim is one burn, written whole). The first client to publish a
- * station whose slot it only DERIVED sets that slot for everyone; a saved
- * record's owner can move it later with a newer stamp.
+ * Merge (mergeStation): a record an install saved (it carries `ownerId`)
+ * stands over one nobody owns; between two installs' records the smaller
+ * install id stands (ownerRank); between one install's records the newer
+ * `updatedAt` wins, so a saved record's owner can move it later; between
+ * records nobody owns the FIRST published stands, so the first client to
+ * publish a station whose slot it only DERIVED sets that slot for everyone.
+ * Same-moment ties settle on the canonical JSON. A trim stands only on the
+ * orbit the standing record flies: a room's later reading wins over its
+ * earlier one, else the trim further along its line, then the later
+ * (newerTrim, by stationKeeping.isNewerTrim). Gates merge room by room: each
+ * room's gates come from the summary that stamped that room later
+ * (newerBerths).
  */
 
 import * as Y from 'yjs';
