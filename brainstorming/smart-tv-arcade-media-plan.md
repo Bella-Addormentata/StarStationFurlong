@@ -548,7 +548,10 @@ Nobody in a room can spend another viewer's bandwidth or disk unasked. The same 
 station library (§7).
 
 **Step 2 — the live lane.** `new VideoFrame(canvasOrVideo, {timestamp})` →
-WebCodecs `VideoEncoder` / `AudioEncoder` (Opus) → **end-to-end encryption in
+WebCodecs `VideoEncoder` / `AudioEncoder` (Opus), each chunk's bytes
+carrying its timestamp, its type and its decoder-configuration generation
+in the authenticated header below (`copyTo()` gives the bytes alone) →
+**end-to-end encryption in
 the sender's page** → WebTransport unidirectional streams, one per video
 frame, each carrying one signed frame and verified whole; 20 ms Opus frames
 (or a batch of three) as datagrams, one signed frame or batch per datagram
@@ -561,7 +564,9 @@ renderer (the hole-punch spike touches the same file), or, until it lands,
 an equivalent uploader on r167: each decoded `VideoFrame` drawn into an
 `OffscreenCanvas` behind a `CanvasTexture`, one copy a frame, enough at
 arcade resolution — and viewers'
-`AudioDecoder` (Opus) → a 60–120 ms jitter buffer → the Web Audio graph,
+`AudioDecoder` (Opus), both decoders configured from the signed
+`media-config` message (below) → a 60–120 ms jitter buffer ordered by the
+chunks' timestamps → the Web Audio graph,
 spatialised at the source's position. A keyframe every ~2 s plus
 keyframe-on-request.
 
@@ -586,9 +591,23 @@ share a nonce space under one key — one key with two independent encoder
 counters would reuse a nonce, which breaks the AEAD outright. The
 associated data is the header exactly as it goes on the wire, fixed to
 the byte: version (1) ‖ source (32) ‖
-leg (1) ‖ key epoch (4, big-endian) ‖ counter (8, big-endian) ‖ flags (1,
-bit 0 the keyframe) — 47 bytes — and the signature below covers that
-header and the ciphertext with its tag. The source is an INSTANCE, never
+leg (1) ‖ key epoch (4, big-endian) ‖ counter (8, big-endian) ‖ timestamp
+(8, big-endian: the chunk's WebCodecs `timestamp` in microseconds on the
+source's one capture clock, which both legs share) ‖ config (2, big-endian:
+the generation of the decoder configuration the frame decodes under) ‖
+flags (1: bit 0 the keyframe, bit 1 a batch) — 57 bytes — and the
+signature below covers that header and the ciphertext with its tag. The
+counter is for the nonce, the replay window and loss, never for time:
+`copyTo()` hands the page encoded bytes only, and a chunk's timestamp, its
+type and the decoder's configuration travel beside them or a receiver
+cannot rebuild an `EncodedAudioChunk` or `EncodedVideoChunk` at all — so
+the timestamp is here, authenticated with the rest: the jitter buffer
+orders by it, a pause is a gap in it rather than a slip, a screen share's
+irregular frames keep their own times, and audio meets video by
+subtraction on the shared clock (a batch carries its first chunk's
+timestamp; the rest follow at the Opus frame duration each packet's TOC
+byte states); the keyframe bit is the chunk's type; and the configuration
+goes on the reliable lane, below, named by its generation. The source is an INSTANCE, never
 the sender's key: one identity may publish voice, a screen share and an
 arcade feed at once, and each is its own source with its own subscriber
 set, media key, epochs and counters — `source = BLAKE3(sender key ‖ room
@@ -596,7 +615,22 @@ set, media key, epochs and counters — `source = BLAKE3(sender key ‖ room
 source announcement on the control plane, which binds the id to the
 sender key, the room, the kind and the nonce; a frame's signature is
 verified against the key that announcement names, resolved once per
-source and never read from the header. A leg's counter is the SENDER's for
+source and never read from the header. The DECODER CONFIGURATION travels
+the same way, not in the frame: a signed `media-config` message per
+(source, leg, generation) on the reliable lane — for video the codec
+string, the coded width and height and, where the codec wants one, the
+`description` bytes; for audio `opus`, the sample rate, the channel count
+and the Opus head beyond two channels — signed by the sender's identity
+key like the announcement, forwarded verbatim by every hub, naming the
+counter of the first frame it governs; the generation rises on every
+reconfiguration (a resolution change, a codec change), which always begins
+at a keyframe, so a decoder is reset on a frame it can start from; a
+receiver holding frames of a generation it has no configuration for waits
+the jitter window for the message and then drops them; a `media-config`
+that fails its signature is dropped and counted against the link like a
+frame; and senders use codecs whose keyframes are self-describing (VP8,
+VP9, AV1, H.264 in Annex-B form), so a keyframe and its configuration are
+all a late joiner needs. A leg's counter is the SENDER's for
 the whole epoch, never the encoder's: it lives outside the encoder and
 survives every pause, restart and reconfiguration (§9 and spike #21 restart
 encoders for the first subscriber), so a restarted encoder goes on from the
@@ -740,12 +774,12 @@ and stream state under every rate ceiling here; and a stream whose bytes
 pass the ceiling is reset at that byte, the frame never assembled), and
 packet-rate and byte-rate ceilings per source with
 a short burst allowance, per tier and counted on the WIRE — the tier's
-codec rate plus the per-frame overhead (the 47-byte header, the 16-byte
-tag and the 64-byte signature: 127 bytes a frame, 51 kbps at 50 frames a
+codec rate plus the per-frame overhead (the 57-byte header, the 16-byte
+tag and the 64-byte signature: 137 bytes a frame, 55 kbps at 50 frames a
 second, more than voice itself, which is why three Opus frames may ride
 one header, tag and signature, framed by a count-and-length table inside
-the plaintext) plus a fifth: about 100 kbps for the 32
-kbps voice tier and about 215 kbps for the 128 kbps music tier signed
+the plaintext) plus a fifth: about 105 kbps for the 32
+kbps voice tier and about 220 kbps for the 128 kbps music tier signed
 frame by frame, a third of the overhead when batched, and 50 frames a
 second plus the batch allowance either way; video the same way from its
 tier's rate —
@@ -767,9 +801,9 @@ link is that hub's own doing and the member re-homes rather than keep a
 link that lies. A member or hub that floods invalid or oversized frames
 spends its own link's budget, costs verification only up to it, and takes
 no honest source down; a valid source past its tier is throttled to the
-tier on every link, the ceilings being the tier's, not an estimate's. The cost is 127 bytes a
-frame — the 64-byte signature, the 47-byte header and the 16-byte tag:
-about 51 kbps on a 20 ms Opus stream, more than voice itself and still a
+tier on every link, the ceilings being the tier's, not an estimate's. The cost is 137 bytes a
+frame — the 64-byte signature, the 57-byte header and the 16-byte tag:
+about 55 kbps on a 20 ms Opus stream, more than voice itself and still a
 tenth of an arcade-resolution stream — and some eighty verifications a
 second per source, a few milliseconds of CPU; a sender may sign a batch of
 up to three Opus frames (60 ms) under one header, tag and signature for a
