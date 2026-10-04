@@ -3152,13 +3152,21 @@ const buildAirHockeyTable = (ctx: BuildCtx): void => {
   // preset × observer combinations is 3.03 : 1 — above the floor for
   // everyone, everywhere.
   //
-  // The cost, stated: this paints the mouth ~5.3 cm INBOARD of the plane that
-  // actually scores (AH_PUCK_R is 0.055, so roughly one puck radius). The
-  // texture is decoration — goals are judged from the constants in
-  // games/airHockey.ts, never from these pixels — so nothing is mis-scored,
-  // but a player sighting down the paint is sighting a hair short of the line.
-  // Worth it to keep the mark legible at all; not worth hiding.
-  const goalLineInset = 18; // px on the 512 x 848 felt ≈ 5.3 cm, inside the crease
+  // The cost, stated: this paints the mouth 7.7 cm INBOARD of the plane that
+  // actually scores — 1.40 puck radii, not one. The inset below is 18 px, but
+  // it is measured from the BOUNDARY STROKE, and that stroke is itself 8 px in
+  // from the texture edge, so the paint stands 26 px off the edge. The edge is
+  // what scores: a goal needs the puck's centre at ±(AH_HALF_L + AH_PUCK_R),
+  // i.e. the puck fully across z = ±AH_HALF_L, which is exactly where this
+  // texture stops. The texture is decoration — goals are judged from the
+  // constants in games/airHockey.ts, never from these pixels — so nothing is
+  // mis-scored, but a player sighting down the paint is sighting ~1.4 puck
+  // radii short of the line. Worth it to keep the mark legible at all; not
+  // worth hiding, and not worth understating — which the earlier wording did,
+  // by quoting the 18 px from the right arithmetic and the wrong baseline.
+  // airHockeyFelt.test.ts now measures this off the real draw calls, so the
+  // paragraph cannot drift away from the paint a second time.
+  const goalLineInset = 18; // px from the boundary stroke; 26 px from the plane
   /** Paint the playfield in the CURRENT skin. Re-run by setTheme. */
   const drawFelt = (): void => {
     c2d.fillStyle = hexCss(theme.feltBase);
